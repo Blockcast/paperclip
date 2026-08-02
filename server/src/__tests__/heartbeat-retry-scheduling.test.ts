@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { and, eq, inArray, sql } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   agents,
   agentWakeupRequests,
@@ -9,6 +9,7 @@ import {
   companies,
   createDb,
   executionWorkspaces,
+  githubCommitStatusDeliveries,
   heartbeatRunEvents,
   heartbeatRuns,
   issueRelations,
@@ -30,6 +31,7 @@ import {
   MAX_TURN_CONTINUATION_RETRY_REASON,
   MAX_TURN_CONTINUATION_WAKE_REASON,
   heartbeatService,
+  isRetryableInteractionContinuationInfrastructureFailure,
   shouldScheduleAutomaticRunRetry,
 } from "../services/heartbeat.js";
 
@@ -174,6 +176,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     resultJson?: Record<string, unknown> | null;
     adapterType?: string;
     agentName?: string;
+    contextSnapshot?: Record<string, unknown>;
   }) {
     const adapterType = input.adapterType ?? "codex_local";
     const agentName = input.agentName ?? (adapterType === "claude_local" ? "ClaudeCoder" : "CodexCoder");
@@ -222,7 +225,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
             }
           : {}),
       },
-      contextSnapshot: {
+      contextSnapshot: input.contextSnapshot ?? {
         issueId: randomUUID(),
         wakeReason: "issue_assigned",
       },
@@ -382,6 +385,82 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       .where(eq(heartbeatRuns.retryOfRunId, runId))
       .then((rows) => rows.find((row) => row.scheduledRetryReason === "transient_failure") ?? null);
   }
+
+  it("clears parked retry error metadata when claiming a queued local run", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const issueId = randomUUID();
+    const now = new Date("2026-07-30T03:30:00.000Z");
+
+    await seedQueuedRunFixture({
+      companyId,
+      agentId,
+      runId,
+      now,
+      contextSnapshot: {
+        issueId,
+        wakeReason: "issue_assigned",
+      },
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({
+        error: "provider capacity retry parked",
+        errorCode: "rate_limit_exhausted",
+        scheduledRetryAt: now,
+        scheduledRetryAttempt: 2,
+        scheduledRetryReason: "ccrotate_capacity",
+      })
+      .where(eq(heartbeatRuns.id, runId));
+
+    let observedClaim = false;
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      const [claimed] = await db
+        .select({
+          status: heartbeatRuns.status,
+          error: heartbeatRuns.error,
+          errorCode: heartbeatRuns.errorCode,
+          scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
+          scheduledRetryAttempt: heartbeatRuns.scheduledRetryAttempt,
+          scheduledRetryReason: heartbeatRuns.scheduledRetryReason,
+        })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId));
+
+      expect(claimed).toMatchObject({
+        status: "running",
+        error: null,
+        errorCode: null,
+        scheduledRetryAt: now,
+        scheduledRetryAttempt: 2,
+        scheduledRetryReason: "ccrotate_capacity",
+      });
+      observedClaim = true;
+
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        summary: "ok",
+        resultJson: { summary: "ok", result: "ok" },
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    await heartbeat.__test_executeRunForTesting(runId);
+    expect(observedClaim).toBe(true);
+
+    const finished = await heartbeat.getRun(runId);
+    expect(finished).toMatchObject({
+      status: "succeeded",
+      error: null,
+      errorCode: null,
+      scheduledRetryAttempt: 2,
+      scheduledRetryReason: "ccrotate_capacity",
+    });
+  });
 
   async function expectPlainPrReviewFailureSchedulesRetry(errorCode: "adapter_failed" | "process_lost") {
     const companyId = randomUUID();
@@ -810,6 +889,20 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
     expect(issue?.executionRunId).toBe(scheduled.run.id);
+  });
+
+  it("does not retry the permanent claude_k8s agent-home workspace failure", () => {
+    expect(
+      isRetryableInteractionContinuationInfrastructureFailure({
+        error: "workspace validation failed before dispatch",
+        errorCode: "workspace_validation_failed",
+        resultJson: {
+          workspaceValidation: {
+            reason: "k8s_agent_home_git_bootstrap_unsupported",
+          },
+        },
+      }),
+    ).toBe(false);
   });
 
   it("coalesces duplicate accepted interaction continuation infra retry schedules", async () => {
@@ -1434,6 +1527,24 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     ).toBe(false);
   });
 
+  it("retries reviewer-verification outages only in a PR-review context", () => {
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "pr_review_verification_unavailable",
+        resultJson: {},
+        contextSnapshot: { taskKey: "pr_review:Blockcast/onprem-k8s:1817" },
+      }),
+    ).toBe(true);
+
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "pr_review_verification_unavailable",
+        resultJson: {},
+        contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
+      }),
+    ).toBe(false);
+  });
+
   it("does not retry plain adapter failures when the wake is not an idempotent PR review", () => {
     expect(
       shouldScheduleAutomaticRunRetry({
@@ -1638,6 +1749,114 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       ).toBe(false);
     },
   );
+
+  // BLO-17456: when a PR-review chain exhausts, the reviewer never posts its
+  // required status, so the PR sits on "Expected — waiting for status" forever.
+  // These drive the real exhaustion path (no mocks): loadConfig() reads
+  // process.env at call time, so setting the context here exercises the wiring
+  // end to end. The GitHub write itself is now handled by a durable outbox so
+  // the heartbeat only needs to prove that the delivery request was persisted.
+  describe("exhausted PR-review gate status", () => {
+    const GATE_CONTEXT_ENV = "PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT";
+    const HEAD_SHA = "45eb633e348a826f43dc68b0c25fe83a96300cea";
+    let priorGateContext: string | undefined;
+
+    beforeEach(() => {
+      priorGateContext = process.env[GATE_CONTEXT_ENV];
+    });
+
+    afterEach(() => {
+      if (priorGateContext === undefined) delete process.env[GATE_CONTEXT_ENV];
+      else process.env[GATE_CONTEXT_ENV] = priorGateContext;
+    });
+
+    async function exhaustPrReviewRun(contextSnapshot: Record<string, unknown>) {
+      const runId = randomUUID();
+      const now = new Date();
+      await seedRetryFixture({
+        runId,
+        companyId: randomUUID(),
+        agentId: randomUUID(),
+        now,
+        errorCode: "pr_review_output_missing",
+        scheduledRetryAttempt: 2,
+        contextSnapshot,
+      });
+      const outcome = await heartbeat.scheduleBoundedRetry(runId, {
+        now,
+        retryReason: "transient_failure",
+        wakeReason: "github_pr_synchronized",
+        maxAttempts: 2,
+        delayMs: 1_000,
+      });
+      expect(outcome).toMatchObject({ outcome: "retry_exhausted" });
+      const events = await db
+        .select({ message: heartbeatRunEvents.message, payload: heartbeatRunEvents.payload })
+        .from(heartbeatRunEvents)
+        .where(eq(heartbeatRunEvents.runId, runId))
+        .orderBy(sql`${heartbeatRunEvents.id} asc`);
+      return { events, runId };
+    }
+
+    const prReviewSnapshot = {
+      wakeReason: "github_pr_synchronized",
+      githubPrNumber: 7,
+      githubRepoFullName: "Blockcast/hang",
+      githubHeadSha: HEAD_SHA,
+      githubPrUrl: "https://github.com/Blockcast/hang/pull/7",
+    };
+
+    it("queues the gate-status delivery on exhaustion when a context is configured", async () => {
+      process.env[GATE_CONTEXT_ENV] = "review/ally-complete";
+      const { events, runId } = await exhaustPrReviewRun(prReviewSnapshot);
+      const [delivery] = await db
+        .select()
+        .from(githubCommitStatusDeliveries)
+        .where(eq(githubCommitStatusDeliveries.context, "review/ally-complete"));
+
+      expect(events.at(-2)?.message).toContain("Bounded retry exhausted");
+      const statusEvent = events.at(-1);
+      expect(statusEvent?.message).toContain("Queued PR-review gate status failure delivery for review/ally-complete");
+      expect(statusEvent?.payload).toMatchObject({
+        deliveryId: delivery?.id,
+        deliveryStatus: "queued",
+        statusContext: "review/ally-complete",
+        repoFullName: "Blockcast/hang",
+        prNumber: 7,
+        headSha: HEAD_SHA,
+      });
+      expect(delivery).toMatchObject({
+        sourceRunId: runId,
+        repoFullName: "Blockcast/hang",
+        sha: HEAD_SHA,
+        status: "queued",
+      });
+    });
+
+    it("writes no gate-status event when no context is configured (ships inert)", async () => {
+      delete process.env[GATE_CONTEXT_ENV];
+      const { events } = await exhaustPrReviewRun(prReviewSnapshot);
+
+      expect(events.at(-1)?.message).toContain("Bounded retry exhausted");
+      expect(events.some((e) => e.message.includes("gate status"))).toBe(false);
+    });
+
+    it("writes no gate-status event for a non-PR-review run even when configured", async () => {
+      process.env[GATE_CONTEXT_ENV] = "review/ally-complete";
+      const { events } = await exhaustPrReviewRun({ issueId: randomUUID(), wakeReason: "issue_assigned" });
+
+      expect(events.at(-1)?.message).toContain("Bounded retry exhausted");
+      expect(events.some((e) => e.message.includes("gate status"))).toBe(false);
+    });
+
+    it("writes no gate-status event when the wake carried no head SHA", async () => {
+      process.env[GATE_CONTEXT_ENV] = "review/ally-complete";
+      const { events } = await exhaustPrReviewRun({ ...prReviewSnapshot, githubHeadSha: undefined });
+
+      expect(events.at(-1)?.message).toContain("Bounded retry exhausted");
+      expect(events.some((e) => e.message.includes("gate status"))).toBe(false);
+    });
+  });
 
   it.each([
     {

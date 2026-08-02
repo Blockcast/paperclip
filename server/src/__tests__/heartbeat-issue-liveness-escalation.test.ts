@@ -949,6 +949,117 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     expect(blockerEvent?.details).toMatchObject({ blockerIssueIds: [blockerIssueId] });
   });
 
+  it("does not strand a zero-pre-existing-blocker source in blocked when the escalation edge would cycle", async () => {
+    await enableAutoRecovery();
+    const companyId = randomUUID();
+    const managerId = randomUUID();
+    const issueId = randomUUID();
+    const escalationIssueId = randomUUID();
+    const issuePrefix = `Z${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: managerId,
+      companyId,
+      name: "CTO",
+      role: "cto",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: false } },
+      permissions: {},
+    });
+
+    // Source issue is in_review with no assignee and no pre-existing
+    // blockers of its own -- the self-referential "in_review_without_action_path"
+    // finding treats the issue as both the source and its own recovery
+    // issue, so this is the shape that hits the cycle fallback with an
+    // empty blockerIds set.
+    const issueTimestamp = new Date(Date.now() - 25 * 60 * 60 * 1000);
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Stuck in review with no owner",
+      status: "in_review",
+      priority: "medium",
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+      createdAt: issueTimestamp,
+      updatedAt: issueTimestamp,
+      lastActivityAt: issueTimestamp,
+    });
+
+    // An already-open escalation for this leaf, discovered via fingerprint
+    // (a malformed originId keeps it out of the openRecoveryIssues waiting-path
+    // set, mirroring the legacy-key regression above) so the review finding
+    // still fires instead of being suppressed.
+    await db.insert(issues).values({
+      id: escalationIssueId,
+      companyId,
+      title: "Existing liveness unblock work",
+      status: "todo",
+      priority: "high",
+      parentId: issueId,
+      assigneeAgentId: managerId,
+      issueNumber: 2,
+      identifier: `${issuePrefix}-2`,
+      originKind: "harness_liveness_escalation",
+      originId: "malformed-legacy-incident-key",
+      originFingerprint: [
+        "harness_liveness_leaf",
+        companyId,
+        "in_review_without_action_path",
+        issueId,
+      ].join(":"),
+    });
+    // Craft the cycle: the source issue already blocks the escalation issue
+    // (e.g. left over from an earlier partial recovery), so adding the
+    // reverse edge -- escalation blocks source -- forms a 2-cycle. The
+    // source has no *other* blockers of its own.
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId,
+      relatedIssueId: escalationIssueId,
+      type: "blocks",
+    });
+
+    const result = await heartbeatSvc.reconcileIssueGraphLiveness();
+
+    expect(result.findings).toBe(1);
+    expect(result.existingEscalations).toBe(1);
+
+    const [sourceAfter] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(sourceAfter?.status).toBe("in_review");
+
+    const persistedBlockers = await db
+      .select({ blockerIssueId: issueRelations.issueId })
+      .from(issueRelations)
+      .where(eq(issueRelations.relatedIssueId, issueId));
+    expect(persistedBlockers).toHaveLength(0);
+
+    const preservedEdge = await db
+      .select({ blockerIssueId: issueRelations.issueId })
+      .from(issueRelations)
+      .where(eq(issueRelations.relatedIssueId, escalationIssueId));
+    expect(preservedEdge.map((row) => row.blockerIssueId)).toEqual([issueId]);
+
+    const blockerEvent = await db
+      .select({ details: activityLog.details })
+      .from(activityLog)
+      .where(and(
+        eq(activityLog.companyId, companyId),
+        eq(activityLog.action, "issue.blockers.updated"),
+        eq(activityLog.entityId, issueId),
+      ))
+      .then((rows) => rows.at(-1));
+    expect(blockerEvent).toBeUndefined();
+  });
+
   it("skips budget-blocked direct owners and assigns recovery to the manager fallback", async () => {
     await enableAutoRecovery();
     const { companyId, managerId, coderId, blockedIssueId, blockerIssueId } = await seedBlockedChain();

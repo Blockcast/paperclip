@@ -19,6 +19,7 @@ const {
   fakeServer,
   heartbeatServiceFactoryMock,
   heartbeatServiceMock,
+  loadAuthCapabilitiesMock,
   loadConfigMock,
   resolveHeartbeatSchedulingSuppressionMock,
   routineServiceFactoryMock,
@@ -31,6 +32,10 @@ const {
   const createDbMock = vi.fn(() => ({}) as never);
   const detectPortMock = vi.fn(async (port: number) => port);
   const deriveAuthTrustedOriginsMock = vi.fn(() => []);
+  const loadAuthCapabilitiesMock = vi.fn(() => ({
+    emailPasswordEnabled: true,
+    oidcProviders: [],
+  }));
   const resolveHeartbeatSchedulingSuppressionMock = vi.fn(() => ({
     suppressed: false,
     reason: null,
@@ -60,6 +65,8 @@ const {
     scanSilentActiveRuns: vi.fn(async () => ({ created: 0, escalated: 0 })),
     sweepStaleIssueLocks: vi.fn(async () => ({ cleared: 0 })),
     reconcileProductivityReviews: vi.fn(async () => ({ created: 0, updated: 0, failed: 0 })),
+    reconcileResolvedBlockerDependents: vi.fn(async () => ({ woken: 0, failed: 0 })),
+    reconcileFailedWakeDispatches: vi.fn(async () => ({ recovered: 0, exhausted: 0 })),
     sweepExpiredRuntimeStatuses: vi.fn(() => 0),
     tickTimers: vi.fn(async () => ({ checked: 0, enqueued: 0, skipped: 0 })),
   };
@@ -100,6 +107,7 @@ const {
     fakeServer,
     heartbeatServiceFactoryMock,
     heartbeatServiceMock,
+    loadAuthCapabilitiesMock,
     loadConfigMock,
     resolveHeartbeatSchedulingSuppressionMock,
     routineServiceFactoryMock,
@@ -139,6 +147,11 @@ function buildTestConfig(overrides: Record<string, unknown> = {}) {
     storageS3Endpoint: undefined,
     storageS3Prefix: "",
     storageS3ForcePathStyle: false,
+    githubAppId: "3966421",
+    githubAppInstallationId: "12345678",
+    githubAppPrivateKey: "-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----",
+    githubPrReviewerAgentIds: [],
+    prReviewerBotLogin: "allyblockcast[bot]",
     feedbackExportBackendUrl: "https://telemetry.example.com",
     feedbackExportBackendToken: "telemetry-token",
     heartbeatSchedulerEnabled: false,
@@ -278,11 +291,13 @@ vi.mock("../auth/better-auth.js", () => ({
   createBetterAuthHandler: vi.fn(() => undefined),
   createBetterAuthInstance: createBetterAuthInstanceMock,
   deriveAuthTrustedOrigins: deriveAuthTrustedOriginsMock,
+  loadAuthCapabilities: loadAuthCapabilitiesMock,
   resolveBetterAuthSession: vi.fn(async () => null),
   resolveBetterAuthSessionFromHeaders: vi.fn(async () => null),
 }));
 
 import { startServer } from "../index.js";
+import { logger } from "../middleware/logger.js";
 
 describe("startServer feedback export wiring", () => {
   beforeEach(() => {
@@ -308,6 +323,46 @@ describe("startServer feedback export wiring", () => {
       storageService: { id: "storage-service" },
       serverPort: 3210,
     });
+  });
+
+  it("warns when PR-reviewer App identity is configured without GitHub App credentials", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      githubAppId: "",
+      githubAppInstallationId: "",
+      githubAppPrivateKey: "",
+      githubPrReviewerAgentIds: ["reviewer-agent"],
+      prReviewerBotLogin: "allyblockcast[bot]",
+    }));
+
+    await startServer();
+
+    expect(logger.warn).toHaveBeenCalledWith(
+      {
+        configuredLogin: "allyblockcast[bot]",
+        missingCredentials: ["GITHUB_APP_ID", "GITHUB_APP_INSTALLATION_ID", "GITHUB_APP_PRIVATE_KEY"],
+      },
+      "GitHub App credentials are required to verify PR-review evidence; missing credentials will fail reviewer completion closed",
+    );
+  });
+
+  it("does not warn about missing PR-review GitHub App credentials when no PR-reviewer agent is configured", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      githubAppId: "",
+      githubAppInstallationId: "",
+      githubAppPrivateKey: "",
+      githubPrReviewerAgentIds: [],
+      prReviewerBotLogin: "allyblockcast[bot]",
+    }));
+
+    await startServer();
+
+    expect(logger.warn).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        configuredLogin: "allyblockcast[bot]",
+        missingCredentials: expect.any(Array),
+      }),
+      "GitHub App credentials are required to verify PR-review evidence; missing credentials will fail reviewer completion closed",
+    );
   });
 
   it("keeps routine ticks and setup cleanup active when heartbeat scheduling is suppressed", async () => {
@@ -404,6 +459,30 @@ describe("startServer feedback export wiring", () => {
 
     expect(heartbeatServiceMock.promoteDueScheduledRetries).toHaveBeenCalledTimes(1);
     expect(heartbeatServiceMock.resumeQueuedRuns).toHaveBeenCalledTimes(1);
+  });
+
+  it("starts listening while queued-run recovery continues in the background", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+    let finishQueuedRunRecovery: (() => void) | null = null;
+    heartbeatServiceMock.resumeQueuedRuns.mockImplementationOnce(
+      () => new Promise<void>((resolve) => {
+        finishQueuedRunRecovery = resolve;
+      }),
+    );
+
+    const started = await startServer();
+
+    expect(started.server).toBe(fakeServer);
+    expect(fakeServer.listen).toHaveBeenCalledTimes(1);
+    expect(heartbeatServiceMock.reconcileStrandedAssignedIssues).not.toHaveBeenCalled();
+
+    finishQueuedRunRecovery?.();
+    await vi.waitFor(() => {
+      expect(heartbeatServiceMock.reconcileStrandedAssignedIssues).toHaveBeenCalledTimes(1);
+    });
   });
 
   it("runs the periodic stale-lock sweep independently of other recovery failures", async () => {

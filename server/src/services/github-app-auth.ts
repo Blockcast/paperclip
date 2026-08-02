@@ -13,9 +13,9 @@
  * tokens** from the GitHub App creds (`paperclip-github-app-creds`, surfaced via
  * GITHUB_APP_ID / GITHUB_APP_INSTALLATION_ID / GITHUB_APP_PRIVATE_KEY). Uses only
  * node:crypto for the RS256 App JWT — no extra dependency. When creds are absent
- * every entrypoint degrades to null/`{error}`, so callers fall back to the
- * pre-existing heuristic result (the feature is purely additive and can only
- * rescue a false `missing`, never downgrade a success).
+ * every entrypoint degrades to null/`{error}`. Callers distinguish an
+ * unavailable verification service from a definitive missing-evidence result,
+ * but neither outcome can authorize a locally claimed review.
  */
 import { createSign } from "node:crypto";
 
@@ -51,6 +51,44 @@ export function normalizeGithubLogin(login: string): string {
     .trim();
 }
 
+function exactGithubLogin(login: string): string {
+  return login.trim().toLowerCase().replace(/^@/, "");
+}
+
+/** Return the slug from an unambiguous GitHub App login, or null for a user login. */
+export function githubReviewerAppSlug(configuredLogin: string): string | null {
+  const configured = exactGithubLogin(configuredLogin);
+  if (configured.startsWith("app/")) {
+    return configured.slice("app/".length) || null;
+  }
+  if (configured.endsWith("[bot]")) {
+    return configured.slice(0, -"[bot]".length) || null;
+  }
+  return null;
+}
+
+/**
+ * Match only the configured GitHub App identity. GitHub can expose that App as
+ * either `<slug>[bot]` or `app/<slug>` depending on the API surface, but the
+ * bare `<slug>` user seat is a distinct principal and must never count as the
+ * reviewer bot.
+ */
+export function githubReviewerIdentityMatches(login: string, configuredLogin: string): boolean {
+  const candidate = exactGithubLogin(login);
+  const appSlug = githubReviewerAppSlug(configuredLogin);
+  if (!candidate || !appSlug) return false;
+
+  // GitHub usernames cannot contain `[`/`]` or `/`, so a user account cannot
+  // register either accepted App representation and collide with this match.
+  return candidate === `${appSlug}[bot]` || candidate === `app/${appSlug}`;
+}
+
+function githubReviewerApprovalSeatMatches(login: string, configuredLogin: string): boolean {
+  const candidate = exactGithubLogin(login);
+  const appSlug = githubReviewerAppSlug(configuredLogin);
+  return Boolean(candidate && appSlug && candidate === appSlug);
+}
+
 /**
  * Mint an RS256 GitHub App JWT (valid ~9 min). Returns null when the App id or
  * private key is unconfigured.
@@ -82,18 +120,62 @@ export function _resetInstallationTokenCache(): void {
   cachedInstallationToken = null;
 }
 
+export type GitHubInstallationTokenResult =
+  | { ok: true; token: string }
+  | { ok: false; retryable: boolean; reason: string; statusCode?: number };
+
+function isRetryableGithubHttpStatus(status: number): boolean {
+  return status === 408 || status === 409 || status === 429 || status >= 500;
+}
+
+type ClassifiedGithubHttpFailure = { retryable: boolean; reason: string };
+
+async function githubRateLimitSignal(res: Response): Promise<boolean> {
+  const retryAfter = res.headers?.get("retry-after");
+  if (retryAfter && retryAfter.trim().length > 0) return true;
+  if (res.headers?.get("x-ratelimit-remaining") === "0") return true;
+
+  const body = await res.json().catch(() => null) as unknown;
+  const bodyText = JSON.stringify(body ?? "").toLowerCase();
+  return bodyText.includes("rate limit") || bodyText.includes("secondary rate limit") || bodyText.includes("abuse detection");
+}
+
+async function classifyGithubHttpFailure(prefix: string, res: Response): Promise<ClassifiedGithubHttpFailure> {
+  if (res.status === 403 && await githubRateLimitSignal(res)) {
+    return { retryable: true, reason: `${prefix}_rate_limited` };
+  }
+  const status = res.status;
+  if (isRetryableGithubHttpStatus(status)) {
+    return { retryable: true, reason: `${prefix}_http_${status}` };
+  }
+  return { retryable: false, reason: `${prefix}_http_${status}` };
+}
+
+export function githubAppCredentialsConfigured(): boolean {
+  const cfg = loadConfig();
+  return Boolean(
+    cfg.githubAppId.trim() &&
+    cfg.githubAppInstallationId.trim() &&
+    cfg.githubAppPrivateKey.trim(),
+  );
+}
+
 /**
  * Return a cached or freshly-minted installation access token, or null when
  * creds are absent or the GitHub API call fails.
  */
-export async function getInstallationToken(nowMs: number = Date.now()): Promise<string | null> {
+export async function getInstallationTokenResult(nowMs: number = Date.now()): Promise<GitHubInstallationTokenResult> {
   if (cachedInstallationToken && cachedInstallationToken.expiresAtMs - TOKEN_REFRESH_SKEW_MS > nowMs) {
-    return cachedInstallationToken.token;
+    return { ok: true, token: cachedInstallationToken.token };
   }
   const cfg = loadConfig();
   const installationId = cfg.githubAppInstallationId.trim();
   const jwt = mintAppJwt(nowMs);
-  if (!jwt || !installationId) return null;
+  if (!githubAppCredentialsConfigured()) {
+    return { ok: false, retryable: false, reason: "missing_github_app_credentials" };
+  }
+  if (!jwt) return { ok: false, retryable: false, reason: "invalid_github_app_private_key" };
+  if (!installationId) return { ok: false, retryable: false, reason: "missing_github_app_installation_id" };
 
   const url = `${gitHubApiBase(GITHUB_HOST)}/app/installations/${installationId}/access_tokens`;
   let res: Response;
@@ -103,18 +185,26 @@ export async function getInstallationToken(nowMs: number = Date.now()): Promise<
       headers: { ...GITHUB_API_HEADERS, authorization: `Bearer ${jwt}` },
     });
   } catch {
-    return null;
+    return { ok: false, retryable: true, reason: "github_app_token_fetch_failed" };
   }
-  if (!res.ok) return null;
+  if (!res.ok) {
+    const classified = await classifyGithubHttpFailure("github_app_token", res);
+    return { ok: false, ...classified, statusCode: res.status };
+  }
   const body = (await res.json().catch(() => null)) as { token?: string; expires_at?: string } | null;
-  if (!body?.token) return null;
+  if (!body?.token) return { ok: false, retryable: true, reason: "github_app_token_missing" };
 
   const parsedExpiry = body.expires_at ? Date.parse(body.expires_at) : NaN;
   cachedInstallationToken = {
     token: body.token,
     expiresAtMs: Number.isFinite(parsedExpiry) ? parsedExpiry : nowMs + 30 * 60 * 1000,
   };
-  return cachedInstallationToken.token;
+  return { ok: true, token: cachedInstallationToken.token };
+}
+
+export async function getInstallationToken(nowMs: number = Date.now()): Promise<string | null> {
+  const result = await getInstallationTokenResult(nowMs);
+  return result.ok ? result.token : null;
 }
 
 export type ReviewerEvidenceResult =
@@ -192,11 +282,14 @@ function consolidatedReviewHead(body: string): string | null {
 
 /**
  * Authoritatively check whether the reviewer bot left a review or comment for
- * THIS PR head on GitHub. Used to rescue a false `pr_review_output_missing`.
+ * THIS PR head on GitHub before a claimed PR-review run can complete.
  *
  * Found when either:
  *  - a review authored by the bot has `commit_id === headSha` (precise: reviewed
  *    this exact head), or
+ *  - an APPROVED review authored by the same-slug user seat has the canonical
+ *    consolidated-review body and exactly one standalone full-SHA `Reviewed head:`
+ *    attestation (covers GitHub's App-self-review restriction), or
  *  - an issue comment authored by the bot has the canonical consolidated-review
  *    heading and exactly one standalone full-SHA `Reviewed head:` attestation
  *    (covers comment-mode reviews on bot-authored PRs, which carry no commit_id).
@@ -209,10 +302,10 @@ function consolidatedReviewHead(body: string): string | null {
  * of (or "identical" to) the wake head; "behind"/"diverged" are rejected, so a
  * genuinely-unreviewed newer head still flags. Bounded by MAX_AT_OR_NEWER_COMPARES.
  *
- * Returns `{error}` on missing creds / token / any non-OK or failed reviews/
- * comments fetch so the caller can fall back to the heuristic verdict. (A failed
- * `compare` only skips that candidate — the second pass is purely additive and can
- * never downgrade a verdict.)
+ * Returns `{error}` on invalid configuration, missing creds/token, or any non-OK
+ * or failed reviews/comments fetch. Callers fail completion closed with a
+ * retryable verification-unavailable error. A failed `compare` only skips that
+ * candidate because the second pass is additive and cannot downgrade a verdict.
  */
 export async function githubHasReviewerEvidenceForPr(input: {
   repoFullName: string;
@@ -220,8 +313,9 @@ export async function githubHasReviewerEvidenceForPr(input: {
   headSha: string | null;
 }): Promise<ReviewerEvidenceResult> {
   const cfg = loadConfig();
-  const botLogin = normalizeGithubLogin(cfg.prReviewerBotLogin);
+  const botLogin = cfg.prReviewerBotLogin.trim();
   if (!botLogin) return { error: "no_bot_login" };
+  if (!githubReviewerAppSlug(botLogin)) return { error: "bot_login_not_app_form" };
 
   const token = await getInstallationToken();
   if (!token) return { error: "no_token" };
@@ -246,14 +340,36 @@ export async function githubHasReviewerEvidenceForPr(input: {
     for (let page = 1; page <= 10; page += 1) {
       const url = `${apiBase}/repos/${input.repoFullName}/pulls/${input.prNumber}/reviews?per_page=100&page=${page}`;
       const res = await ghFetch(url, { headers });
-      if (!res.ok) return { error: `reviews_http_${res.status}` };
-      const batch = (await res.json()) as Array<{ user?: { login?: string }; commit_id?: string | null }>;
+      if (!res.ok) {
+        const classified = await classifyGithubHttpFailure("reviews", res);
+        return { error: classified.reason };
+      }
+      const batch = (await res.json()) as Array<{
+        user?: { login?: string };
+        commit_id?: string | null;
+        state?: string | null;
+        body?: string | null;
+      }>;
       for (const review of batch) {
-        if (normalizeGithubLogin(review.user?.login ?? "") !== botLogin) continue;
-        if (!headSha) return { found: true, via: "review" };
+        const authorLogin = review.user?.login ?? "";
         const commitId = headShaHex(review.commit_id);
-        if (commitId === headSha) return { found: true, via: "review" };
-        if (commitId) reviewCandidates.push(commitId);
+        if (githubReviewerIdentityMatches(authorLogin, botLogin)) {
+          if (!headSha) return { found: true, via: "review" };
+          if (commitId === headSha) return { found: true, via: "review" };
+          if (commitId) reviewCandidates.push(commitId);
+          continue;
+        }
+        if (githubReviewerApprovalSeatMatches(authorLogin, botLogin)) {
+          if ((review.state ?? "").toUpperCase() !== "APPROVED") continue;
+          const reviewedHead = consolidatedReviewHead(review.body ?? "");
+          if (!reviewedHead) continue;
+          if (!headSha) return { found: true, via: "review" };
+          if (reviewedHead === headSha) return { found: true, via: "review" };
+          // Formal user-seat approvals are trusted only from the dedicated
+          // reviewer pipeline's canonical body. The at-or-newer fallback still
+          // proves this self-attested SHA is a real descendant before crediting it.
+          reviewCandidates.push(reviewedHead);
+        }
       }
       if (batch.length < 100) break;
     }
@@ -269,10 +385,13 @@ export async function githubHasReviewerEvidenceForPr(input: {
       for (let page = 1; page <= 10; page += 1) {
         const url = `${apiBase}/repos/${input.repoFullName}/issues/${input.prNumber}/comments?per_page=100&page=${page}`;
         const res = await ghFetch(url, { headers });
-        if (!res.ok) return { error: `comments_http_${res.status}` };
+        if (!res.ok) {
+          const classified = await classifyGithubHttpFailure("comments", res);
+          return { error: classified.reason };
+        }
         const batch = (await res.json()) as Array<{ user?: { login?: string }; body?: string }>;
         for (const comment of batch) {
-          if (normalizeGithubLogin(comment.user?.login ?? "") !== botLogin) continue;
+          if (!githubReviewerIdentityMatches(comment.user?.login ?? "", botLogin)) continue;
           const rawBody = comment.body ?? "";
           const reviewedHead = consolidatedReviewHead(rawBody);
           if (!reviewedHead) continue;
@@ -339,6 +458,153 @@ export async function githubListIssueCommentBodies(input: {
   } catch {
     return null;
   }
+}
+
+export type GitHubCommitStatusState = "error" | "failure" | "pending" | "success";
+
+export type GitHubCommitStatusPostResult =
+  | { ok: true; statusCode: number }
+  | { ok: false; retryable: boolean; reason: string; statusCode?: number };
+
+export type GitHubCommitStatusLookupResult =
+  | {
+      ok: true;
+      status: {
+        state: GitHubCommitStatusState;
+        context: string;
+        createdAt: string | null;
+        targetUrl: string | null;
+      } | null;
+    }
+  | { ok: false; retryable: boolean; reason: string; statusCode?: number };
+
+function asCommitStatusFailure(result: Extract<GitHubInstallationTokenResult, { ok: false }>): GitHubCommitStatusPostResult {
+  return {
+    ok: false,
+    retryable: result.retryable,
+    reason: result.reason,
+    ...(result.statusCode ? { statusCode: result.statusCode } : {}),
+  };
+}
+
+/**
+ * Read the latest commit status for a single context. The REST list is sorted
+ * here by created_at so callers do not depend on GitHub response ordering.
+ */
+export async function githubGetLatestCommitStatusForContext(input: {
+  repoFullName: string;
+  sha: string;
+  context: string;
+}): Promise<GitHubCommitStatusLookupResult> {
+  const token = await getInstallationTokenResult();
+  if (!token.ok) return asCommitStatusFailure(token) as GitHubCommitStatusLookupResult;
+  const headers = { ...GITHUB_API_HEADERS, authorization: `Bearer ${token.token}` };
+  const apiBase = gitHubApiBase(GITHUB_HOST);
+  try {
+    const candidates: Array<{
+      state: GitHubCommitStatusState;
+      context: string;
+      createdAt: string | null;
+      targetUrl: string | null;
+    }> = [];
+    for (let page = 1; page <= 10; page += 1) {
+      const url = `${apiBase}/repos/${input.repoFullName}/commits/${input.sha}/statuses?per_page=100&page=${page}`;
+      const res = await ghFetch(url, { headers });
+      if (!res.ok) {
+        const classified = await classifyGithubHttpFailure("commit_status_read", res);
+        return { ok: false, ...classified, statusCode: res.status };
+      }
+      const body = (await res.json().catch(() => [])) as Array<{
+        context?: string;
+        state?: string;
+        created_at?: string | null;
+        target_url?: string | null;
+      }>;
+      candidates.push(
+        ...body
+          .filter((status) => status.context === input.context)
+          .map((status) => ({
+            state: status.state as GitHubCommitStatusState,
+            context: status.context ?? "",
+            createdAt: typeof status.created_at === "string" ? status.created_at : null,
+            targetUrl: typeof status.target_url === "string" ? status.target_url : null,
+          }))
+          .filter((status) =>
+            status.state === "error" ||
+            status.state === "failure" ||
+            status.state === "pending" ||
+            status.state === "success",
+          ),
+      );
+      if (body.length < 100) break;
+    }
+    candidates.sort((left, right) => {
+      const leftTime = left.createdAt ? Date.parse(left.createdAt) : 0;
+      const rightTime = right.createdAt ? Date.parse(right.createdAt) : 0;
+      return rightTime - leftTime;
+    });
+    return { ok: true, status: candidates[0] ?? null };
+  } catch {
+    return { ok: false, retryable: true, reason: "commit_status_read_fetch_failed" };
+  }
+}
+
+/**
+ * Post a commit status as the GitHub App with a classified result so callers
+ * can retry transient failures and surface permanent configuration/permission
+ * failures separately.
+ */
+export async function githubPostCommitStatusDetailed(input: {
+  repoFullName: string;
+  sha: string;
+  context: string;
+  state: GitHubCommitStatusState;
+  description?: string;
+  targetUrl?: string | null;
+}): Promise<GitHubCommitStatusPostResult> {
+  const token = await getInstallationTokenResult();
+  if (!token.ok) return asCommitStatusFailure(token);
+  const headers = {
+    ...GITHUB_API_HEADERS,
+    authorization: `Bearer ${token.token}`,
+    "content-type": "application/json",
+  };
+  const apiBase = gitHubApiBase(GITHUB_HOST);
+  try {
+    const url = `${apiBase}/repos/${input.repoFullName}/statuses/${input.sha}`;
+    const res = await ghFetch(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        state: input.state,
+        context: input.context,
+        // GitHub truncates at 140 chars; trim here so the message we intend is
+        // the message that lands rather than an arbitrary server-side cut.
+        ...(input.description ? { description: input.description.slice(0, 140) } : {}),
+        ...(input.targetUrl ? { target_url: input.targetUrl } : {}),
+      }),
+    });
+    if (res.ok) return { ok: true, statusCode: res.status };
+    const classified = await classifyGithubHttpFailure("commit_status_write", res);
+    return { ok: false, ...classified, statusCode: res.status };
+  } catch {
+    return { ok: false, retryable: true, reason: "commit_status_write_fetch_failed" };
+  }
+}
+
+/**
+ * Boolean compatibility wrapper for existing call sites.
+ */
+export async function githubPostCommitStatus(input: {
+  repoFullName: string;
+  sha: string;
+  context: string;
+  state: GitHubCommitStatusState;
+  description?: string;
+  targetUrl?: string | null;
+}): Promise<boolean> {
+  const result = await githubPostCommitStatusDetailed(input);
+  return result.ok;
 }
 
 /**

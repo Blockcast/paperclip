@@ -4,10 +4,12 @@ import { clampIssueRequestDepth } from "@paperclipai/shared";
 import {
   activityLog,
   agents,
+  approvals,
   companies,
   companyMemberships,
   costEvents,
   heartbeatRuns,
+  issueApprovals,
   issueComments,
   issueRelations,
   issues,
@@ -27,6 +29,13 @@ import { RECOVERY_ORIGIN_KINDS } from "./recovery/origins.js";
 export const PRODUCTIVITY_REVIEW_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.issueProductivityReview;
 export const DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS = 10;
 export const DEFAULT_PRODUCTIVITY_REVIEW_LONG_ACTIVE_HOURS = 6;
+// How long a linked `pending` approval may suppress the `long_active_duration` trigger.
+// Must stay comfortably above the long-active threshold or the gate would expire before it
+// ever engages — `buildThresholds` clamps overrides up to `longActiveMs` to enforce that.
+// Past this age the gate has itself become the stuck thing: an approval nobody
+// has decided in a day is exactly the condition the detector exists to surface, so the
+// suppression lapses and reviews resume.
+export const DEFAULT_PRODUCTIVITY_REVIEW_APPROVAL_GATE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 export const DEFAULT_PRODUCTIVITY_REVIEW_HIGH_CHURN_HOURLY = 10;
 export const DEFAULT_PRODUCTIVITY_REVIEW_HIGH_CHURN_SIX_HOURS = 30;
 export const DEFAULT_PRODUCTIVITY_REVIEW_RESOLVED_SNOOZE_MS = 6 * 60 * 60 * 1000;
@@ -62,6 +71,7 @@ type ProductivityReviewTrigger = "no_comment_streak" | "long_active_duration" | 
 type ProductivityReviewThresholds = {
   noCommentStreakRuns: number;
   longActiveMs: number;
+  approvalGateMaxAgeMs: number;
   highChurnHourly: number;
   highChurnSixHours: number;
   resolvedSnoozeMs: number;
@@ -89,6 +99,14 @@ type ProductivityReviewEvidence = {
   commentCountLastHour: number;
   commentCountLastSixHours: number;
   elapsedMs: number | null;
+  monitorGating: {
+    gatedMs: number;
+    unattendedMs: number;
+    lapsedAt: Date | null;
+    priorLapseAt: Date | null;
+    armedUntil: Date | null;
+    gatedIsUpperBound: boolean;
+  } | null;
   latestRuns: HeartbeatRunRow[];
   latestComments: Array<typeof issueComments.$inferSelect>;
   costCents: number;
@@ -111,6 +129,17 @@ type MonitorScheduledSuppression = {
   generatedAt: Date;
 };
 
+type ApprovalGatedSuppression = {
+  trigger: "long_active_duration";
+  triggerReasons: string[];
+  sourceIssue: IssueRow;
+  sourceAgent: AgentRow;
+  elapsedMs: number | null;
+  approvalGate: { approvalId: string; approvalStatus: string; approvalType: string };
+  thresholds: ProductivityReviewThresholds;
+  generatedAt: Date;
+};
+
 type EnqueueWakeup = (
   agentId: string,
   opts?: {
@@ -125,6 +154,11 @@ type EnqueueWakeup = (
 ) => Promise<unknown | null>;
 
 const MONITOR_SCHEDULED_SUPPRESSION_ACTORS = new Set(["assignee", "board"]);
+
+// A linked approval in one of these statuses means the issue's next move belongs to a human.
+// Deliberately `pending` only: `revision_requested` hands the ball back to the *agent*, so a
+// long-active review there is legitimate and should still fire.
+const APPROVAL_GATE_SUPPRESSION_STATUSES = ["pending"] as const;
 
 type ProductivityReviewServiceDeps = {
   enqueueWakeup?: EnqueueWakeup;
@@ -206,10 +240,106 @@ function deliberateFutureMonitor(issue: IssueRow, now: Date) {
   return { monitorNextCheckAt, monitorScheduledBy };
 }
 
+/**
+ * Splits an active episode into the portion an armed monitor was accounting for
+ * and the portion nobody was watching, so a manager adjudicating a
+ * `long_active_duration` review can tell a deliberate monitor-gated wait from an
+ * unattended stall without cross-checking the source issue.
+ *
+ * Derived from the server-owned monitor columns rather than a full monitor
+ * history, so `gatedMs` is an upper bound: re-arm gaps inside the covered span
+ * are counted as gated. Where that bound is the whole episode — a monitor still
+ * armed, whose arm time no column records — the result sets
+ * `gatedIsUpperBound` so the manager-facing line carries the qualifier too.
+ * This is reporting only — it does not gate whether the review fires.
+ */
+function monitorGatingBreakdown(issue: IssueRow, activeStartedAt: Date | null, elapsedMs: number | null, now: Date) {
+  if (elapsedMs === null || !activeStartedAt) return null;
+  const armedUntil = coerceDate(issue.monitorNextCheckAt);
+  const lastTriggeredAt = coerceDate(issue.monitorLastTriggeredAt);
+
+  // Still armed for a future check. There is no arm-time column, so a monitor
+  // armed seconds ago is indistinguishable from one armed at `activeStartedAt`
+  // and the whole episode is attributed to gating — flagged as an upper bound,
+  // because reporting it flat would tell a manager that a 15h stall was fully
+  // accounted for when only the last 90s provably was.
+  if (armedUntil && armedUntil.getTime() > now.getTime()) {
+    return {
+      gatedMs: elapsedMs,
+      unattendedMs: 0,
+      lapsedAt: null,
+      priorLapseAt: null,
+      armedUntil,
+      gatedIsUpperBound: true,
+    };
+  }
+
+  // A monitor ran at some point and has since lapsed. Coverage ended at the
+  // later of its last trigger and its last scheduled check.
+  const lapseCandidates = [lastTriggeredAt, armedUntil].filter((d): d is Date => Boolean(d));
+  if (lapseCandidates.length === 0) {
+    return {
+      gatedMs: 0,
+      unattendedMs: elapsedMs,
+      lapsedAt: null,
+      priorLapseAt: null,
+      armedUntil: null,
+      gatedIsUpperBound: false,
+    };
+  }
+  const lapsedAt = new Date(Math.max(...lapseCandidates.map((d) => d.getTime())));
+
+  // Coverage that ended before this episode began belongs to a prior episode:
+  // none of this episode was gated, and calling it an in-episode lapse would
+  // print a timestamp from before `activeStartedAt`.
+  if (lapsedAt.getTime() <= activeStartedAt.getTime()) {
+    return {
+      gatedMs: 0,
+      unattendedMs: elapsedMs,
+      lapsedAt: null,
+      priorLapseAt: lapsedAt,
+      armedUntil: null,
+      gatedIsUpperBound: false,
+    };
+  }
+
+  const gatedMs = Math.min(elapsedMs, lapsedAt.getTime() - activeStartedAt.getTime());
+  return {
+    gatedMs,
+    unattendedMs: Math.max(0, elapsedMs - gatedMs),
+    lapsedAt,
+    priorLapseAt: null,
+    armedUntil: null,
+    gatedIsUpperBound: false,
+  };
+}
+
+function formatMonitorGating(gating: NonNullable<ProductivityReviewEvidence["monitorGating"]>) {
+  // An upper-bound gated figure implies a lower-bound unattended figure; both
+  // carry a qualifier so neither half of the split reads as measured.
+  const gated = `${gating.gatedIsUpperBound ? "≤" : ""}${msToHuman(gating.gatedMs)} monitor-gated`;
+  const unattended = `${gating.gatedIsUpperBound ? "≥" : ""}${msToHuman(gating.unattendedMs)} unattended`;
+  const split = `${gated}, ${unattended}`;
+  if (gating.armedUntil) {
+    return `${split} (monitor armed until ${gating.armedUntil.toISOString()}; arm time is not recorded, so monitor-gated time is an upper bound)`;
+  }
+  if (gating.lapsedAt) return `${split} (monitor lapsed at ${gating.lapsedAt.toISOString()}, never re-armed)`;
+  if (gating.priorLapseAt) {
+    return `${split} (no monitor armed during this episode; previous monitor lapsed at ${gating.priorLapseAt.toISOString()}, before it began)`;
+  }
+  return `${split} (no monitor armed during this episode)`;
+}
+
 function isMonitorScheduledSuppression(
-  value: ProductivityReviewEvidence | MonitorScheduledSuppression,
+  value: ProductivityReviewEvidence | MonitorScheduledSuppression | ApprovalGatedSuppression,
 ): value is MonitorScheduledSuppression {
   return "monitorNextCheckAt" in value;
+}
+
+function isApprovalGatedSuppression(
+  value: ProductivityReviewEvidence | MonitorScheduledSuppression | ApprovalGatedSuppression,
+): value is ApprovalGatedSuppression {
+  return "approvalGate" in value;
 }
 
 function isRoutineOriginRun(run: HeartbeatRunRow): boolean {
@@ -219,15 +349,32 @@ function isRoutineOriginRun(run: HeartbeatRunRow): boolean {
 }
 
 function buildThresholds(overrides?: Partial<ProductivityReviewThresholds>): ProductivityReviewThresholds {
+  const longActiveMs = readPositiveInteger(
+    overrides?.longActiveMs ?? DEFAULT_PRODUCTIVITY_REVIEW_LONG_ACTIVE_HOURS * 60 * 60 * 1000,
+    DEFAULT_PRODUCTIVITY_REVIEW_LONG_ACTIVE_HOURS * 60 * 60 * 1000,
+  );
+  const requestedApprovalGateMaxAgeMs = readPositiveInteger(
+    overrides?.approvalGateMaxAgeMs ?? DEFAULT_PRODUCTIVITY_REVIEW_APPROVAL_GATE_MAX_AGE_MS,
+    DEFAULT_PRODUCTIVITY_REVIEW_APPROVAL_GATE_MAX_AGE_MS,
+  );
+  // The gate is only reachable while it outlives the trigger it suppresses: a gate that expires
+  // at or before `longActiveMs` is already stale by the time the first long-active review would
+  // fire, silently disabling the feature. The two are read independently above, so an override
+  // pair can violate the invariant the constant's comment states — clamp instead of trusting it.
+  const approvalGateMaxAgeMs = Math.max(requestedApprovalGateMaxAgeMs, longActiveMs);
+  if (approvalGateMaxAgeMs !== requestedApprovalGateMaxAgeMs) {
+    logger.warn(
+      { requestedApprovalGateMaxAgeMs, longActiveMs, approvalGateMaxAgeMs },
+      "productivity review approvalGateMaxAgeMs was at or below longActiveMs; clamped so the approval gate can engage",
+    );
+  }
   return {
     noCommentStreakRuns: readPositiveInteger(
       overrides?.noCommentStreakRuns ?? DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
       DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
     ),
-    longActiveMs: readPositiveInteger(
-      overrides?.longActiveMs ?? DEFAULT_PRODUCTIVITY_REVIEW_LONG_ACTIVE_HOURS * 60 * 60 * 1000,
-      DEFAULT_PRODUCTIVITY_REVIEW_LONG_ACTIVE_HOURS * 60 * 60 * 1000,
-    ),
+    longActiveMs,
+    approvalGateMaxAgeMs,
     highChurnHourly: readPositiveInteger(
       overrides?.highChurnHourly ?? DEFAULT_PRODUCTIVITY_REVIEW_HIGH_CHURN_HOURLY,
       DEFAULT_PRODUCTIVITY_REVIEW_HIGH_CHURN_HOURLY,
@@ -291,6 +438,13 @@ function formatTrigger(trigger: ProductivityReviewTrigger) {
   if (trigger === "high_churn") return "High churn";
   return "Long active duration";
 }
+
+/**
+ * Either the pooled handle or an open transaction. Helpers that participate in
+ * the BLO-3737 refresh-throttle critical section accept this so the read and the
+ * write land on the same connection (and therefore inside the same advisory lock).
+ */
+type DbOrTx = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
 
 export function productivityReviewService(db: Db, deps?: ProductivityReviewServiceDeps) {
   const issuesSvc = issueService(db);
@@ -377,22 +531,6 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       .orderBy(desc(issues.updatedAt))
       .limit(1)
       .then((rows) => rows[0] ?? null);
-  }
-
-  async function findLatestRefreshCommentAt(companyId: string, reviewIssueId: string) {
-    return db
-      .select({ createdAt: issueComments.createdAt })
-      .from(issueComments)
-      .where(
-        and(
-          eq(issueComments.companyId, companyId),
-          eq(issueComments.issueId, reviewIssueId),
-          sql`${issueComments.body} like ${`${PRODUCTIVITY_REVIEW_REFRESH_COMMENT_PREFIX}%`}`,
-        ),
-      )
-      .orderBy(desc(issueComments.createdAt))
-      .limit(1)
-      .then((rows) => rows[0]?.createdAt ?? null);
   }
 
   async function findRecentResolvedProductivityReview(
@@ -532,8 +670,8 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     return streak;
   }
 
-  async function getRefreshCommentState(companyId: string, reviewIssueId: string) {
-    return db
+  async function getRefreshCommentState(companyId: string, reviewIssueId: string, executor: DbOrTx = db) {
+    return executor
       .select({
         count: sql<number>`count(*)::int`,
         latestCreatedAt: sql<Date | null>`max(${issueComments.createdAt})`,
@@ -555,13 +693,18 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       });
   }
 
-  async function addRefreshComment(reviewIssueId: string, body: string, generatedAt: Date) {
-    const comment = await issuesSvc.addComment(reviewIssueId, body, {});
-    await db
+  async function addRefreshComment(
+    reviewIssueId: string,
+    body: string,
+    generatedAt: Date,
+    executor: DbOrTx = db,
+  ) {
+    const comment = await issuesSvc.addComment(reviewIssueId, body, {}, undefined, executor);
+    await executor
       .update(issueComments)
       .set({ createdAt: generatedAt, updatedAt: generatedAt })
       .where(eq(issueComments.id, comment.id));
-    await db
+    await executor
       .update(issues)
       .set({ updatedAt: generatedAt })
       .where(eq(issues.id, reviewIssueId));
@@ -603,6 +746,64 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       )
       .orderBy(desc(issues.updatedAt))
       .limit(5);
+  }
+
+  // A gate only suppresses while it is still plausibly live. `deliberateFutureMonitor` gets this
+  // for free (a monitor whose `nextCheckAt` has passed stops suppressing); approvals carry no
+  // expiry column, so the bound is applied to the oldest pending linked approval. New pending
+  // approvals do not reset the source issue's gate window while an older gate is still open.
+  async function findOpenApprovalGate(
+    companyId: string,
+    issueId: string,
+    now: Date,
+    maxAgeMs: number,
+  ) {
+    const oldestAllowedCreatedAt = new Date(now.getTime() - maxAgeMs);
+    const rows = await db
+      .select({
+        approvalId: approvals.id,
+        approvalStatus: approvals.status,
+        approvalType: approvals.type,
+        approvalCreatedAt: approvals.createdAt,
+      })
+      .from(issueApprovals)
+      .innerJoin(approvals, eq(issueApprovals.approvalId, approvals.id))
+      .where(
+        and(
+          eq(issueApprovals.companyId, companyId),
+          eq(issueApprovals.issueId, issueId),
+          inArray(approvals.status, [...APPROVAL_GATE_SUPPRESSION_STATUSES]),
+        ),
+      )
+      .orderBy(asc(approvals.createdAt), asc(approvals.id))
+      .limit(1);
+    const oldestPending = rows[0] ?? null;
+    if (!oldestPending) return null;
+    return oldestPending.approvalCreatedAt >= oldestAllowedCreatedAt ? oldestPending : null;
+  }
+
+  async function recordApprovalGatedSuppression(suppression: ApprovalGatedSuppression) {
+    const details = {
+      source: "productivity_review.reconcile",
+      sourceIssueId: suppression.sourceIssue.id,
+      trigger: suppression.trigger,
+      suppressedBy: "approval_pending",
+      approvalId: suppression.approvalGate.approvalId,
+      approvalStatus: suppression.approvalGate.approvalStatus,
+      approvalType: suppression.approvalGate.approvalType,
+      elapsedMs: suppression.elapsedMs,
+    };
+    await logActivity(db, {
+      companyId: suppression.sourceIssue.companyId,
+      actorType: "system",
+      actorId: "system",
+      agentId: suppression.sourceIssue.assigneeAgentId,
+      action: "issue.productivity_review_suppressed",
+      entityType: "issue",
+      entityId: suppression.sourceIssue.id,
+      details,
+    });
+    logger.info(details, "productivity review long_active_duration suppressed by pending approval gate");
   }
 
   async function recordMonitorScheduledSuppression(suppression: MonitorScheduledSuppression) {
@@ -683,6 +884,12 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       const sourceIssue = sourceIssueById.get(review.originId) ?? null;
       if (!sourceIssue) continue;
       if (sourceIssue.companyId !== review.companyId) continue;
+      // Deliberately monitor-only. An approval gate suppresses *new* reviews but never closes one
+      // that already fired: the approval that would justify the close is creatable by the very
+      // agent under review (`POST /companies/:companyId/approvals` resolves `requestedByAgentId`
+      // from an agent actor and hard-codes `status: "pending"`), so honouring it here would let a
+      // flagged agent retire its own oversight artifact. A monitor is set by the assignee or the
+      // board through a server-owned column and self-expires, which is why it keeps this path.
       const monitor = deliberateFutureMonitor(sourceIssue, now);
       if (!monitor) continue;
 
@@ -751,7 +958,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     sourceAgent: AgentRow,
     thresholds: ProductivityReviewThresholds,
     now: Date,
-  ): Promise<ProductivityReviewEvidence | MonitorScheduledSuppression | null> {
+  ): Promise<ProductivityReviewEvidence | MonitorScheduledSuppression | ApprovalGatedSuppression | null> {
     const oneHourAgo = new Date(now.getTime() - 60 * 60 * 1000);
     const sixHoursAgo = new Date(now.getTime() - 6 * 60 * 60 * 1000);
 
@@ -862,6 +1069,36 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
 
     const routineOnlySamplingWindow = latestRuns.length > 0 && latestRuns.every(isRoutineOriginRun);
 
+    // Only `long_active_duration` is suppressible by a human gate. `no_comment_streak` and
+    // `high_churn` stay live: an agent burning runs against a gate it cannot clear is exactly
+    // the waste worth reviewing, and a gate does not excuse silent runs.
+    //
+    // The suppression is deliberately bounded and forward-only: it lapses once the approval ages
+    // past `approvalGateMaxAgeMs`, and it never closes a review that already fired (see
+    // `closeOpenSuppressedMonitorReviews`). Both limits exist because the reviewed agent can
+    // create the approval itself, so the gate delays oversight at most one window and cannot
+    // erase it.
+    if (trigger === "long_active_duration") {
+      const approvalGate = await findOpenApprovalGate(
+        sourceIssue.companyId,
+        sourceIssue.id,
+        now,
+        thresholds.approvalGateMaxAgeMs,
+      );
+      if (approvalGate) {
+        return {
+          trigger,
+          triggerReasons,
+          sourceIssue,
+          sourceAgent,
+          elapsedMs,
+          approvalGate,
+          thresholds,
+          generatedAt: now,
+        };
+      }
+    }
+
     const monitor = deliberateFutureMonitor(sourceIssue, now);
     if (trigger === "long_active_duration" && monitor) {
       return {
@@ -892,6 +1129,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       commentCountLastHour: assigneeRunCommentCountLastHour,
       commentCountLastSixHours: assigneeRunCommentCountLastSixHours,
       elapsedMs,
+      monitorGating: monitorGatingBreakdown(sourceIssue, activeStartedAt, elapsedMs, now),
       latestRuns: latestRuns.slice(0, 5),
       latestComments,
       costCents: costRow.costCents,
@@ -1000,6 +1238,9 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       `- Active queued/running/scheduled runs: ${evidence.activeRunCount}`,
       `- No-comment completed-run streak: ${evidence.noCommentStreak}`,
       `- Current active elapsed time: ${msToHuman(evidence.elapsedMs)}`,
+      ...(evidence.monitorGating
+        ? [`- Elapsed accounting: ${formatMonitorGating(evidence.monitorGating)}`]
+        : []),
       `- Runs in rolling windows: ${evidence.runCountLastHour}/1h, ${evidence.runCountLastSixHours}/6h`,
       `- Assignee run-linked comments total/window: ${evidence.commentCount} total, ${evidence.commentCountLastHour}/1h, ${evidence.commentCountLastSixHours}/6h`,
       `- Cost events total: ${evidence.costCents} cents`,
@@ -1048,6 +1289,9 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       `- Reasons: ${evidence.triggerReasons.join("; ")}`,
       `- No-comment streak: ${evidence.noCommentStreak}`,
       `- Runs/assignee comments: ${evidence.runCountLastHour}/${evidence.commentCountLastHour} in 1h, ${evidence.runCountLastSixHours}/${evidence.commentCountLastSixHours} in 6h`,
+      ...(evidence.monitorGating
+        ? [`- Elapsed accounting: ${formatMonitorGating(evidence.monitorGating)}`]
+        : []),
       `- Next action: ${evidence.nextAction ? truncateInline(evidence.nextAction, 300) : "none recorded"}`,
     ].join("\n");
   }
@@ -1076,28 +1320,54 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       // skip the addComment so the review thread doesn't accumulate
       // ~identical "evidence refreshed" comments. The previous run
       // is reused as the {kind:"existing"} outcome.
-      const refreshState = await getRefreshCommentState(evidence.sourceIssue.companyId, existing.id);
-      const lastRefreshAt = refreshState.latestCreatedAt ?? existing.createdAt;
+      //
+      // BLO-3737: read-then-write across two statements let concurrent
+      // reconciles (the 30s scheduler overlapping itself) both observe the
+      // pre-write state and both pass the gate — BLO-3277 accumulated 14
+      // refreshes in 6 minutes that way. Hold a transaction-scoped advisory
+      // lock keyed on the review issue for the whole check-then-append, so
+      // the second reconcile blocks until the first commits and then sees
+      // its comment. `pg_advisory_xact_lock` waits rather than failing and
+      // is released on commit/rollback, so no unlock bookkeeping is needed.
       const effectiveRefreshIntervalMs = Math.max(
         PRODUCTIVITY_REVIEW_MIN_REFRESH_INTERVAL_MS,
         opts.thresholds.refreshIntervalMs,
       );
-      if (
-        refreshState.count >= opts.thresholds.maxRefreshComments ||
-        evidence.generatedAt.getTime() - lastRefreshAt.getTime() < effectiveRefreshIntervalMs
-      ) {
+      const refreshOutcome = await db.transaction(async (tx) => {
+        await tx.execute(
+          sql`select pg_advisory_xact_lock(hashtextextended(${evidence.sourceIssue.companyId} || ':' || ${existing.id}, 0))`,
+        );
+
+        const refreshState = await getRefreshCommentState(evidence.sourceIssue.companyId, existing.id, tx);
+        const lastRefreshAt = refreshState.latestCreatedAt ?? existing.createdAt;
+        if (
+          refreshState.count >= opts.thresholds.maxRefreshComments ||
+          evidence.generatedAt.getTime() - lastRefreshAt.getTime() < effectiveRefreshIntervalMs
+        ) {
+          return { throttled: true as const, lastRefreshAt };
+        }
+
+        await addRefreshComment(
+          existing.id,
+          buildRefreshComment(evidence, opts.prefix),
+          evidence.generatedAt,
+          tx,
+        );
+        return { throttled: false as const, lastRefreshAt };
+      });
+
+      if (refreshOutcome.throttled) {
         logger.debug(
           {
             reviewIssueId: existing.id,
             sourceIssueId: evidence.sourceIssue.id,
-            lastRefreshAt: lastRefreshAt.toISOString(),
+            lastRefreshAt: refreshOutcome.lastRefreshAt.toISOString(),
             minIntervalMs: effectiveRefreshIntervalMs,
           },
           "productivity review refresh throttled: previous refresh within hard-floor window",
         );
         return { kind: "existing" as const, reviewIssueId: existing.id };
       }
-      await addRefreshComment(existing.id, buildRefreshComment(evidence, opts.prefix), evidence.generatedAt);
       await logActivity(db, {
         companyId: evidence.sourceIssue.companyId,
         actorType: "system",
@@ -1138,6 +1408,23 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     }
 
     const ownerAgentId = await resolveReviewOwnerAgentId(evidence.sourceIssue, evidence.sourceAgent);
+    // Never open an unassigned review. It was already a dead row — the wake
+    // below is gated on `ownerAgentId`, so nothing would ever work it — and
+    // since BLO-19094 it is also a privilege-escalation hook: an open review
+    // grants its assignee issue:comment/issue:mutate on the SOURCE issue, and
+    // an issue with no agent assignee is mutable by any company agent
+    // (`allow_company_agent`). Together those let any agent self-assign the
+    // dangling review and inherit mutation rights on an issue it has no
+    // relationship to. Skipping creation keeps the grant reachable only by the
+    // reviewer the harness actually chose.
+    if (!ownerAgentId) {
+      logger.warn({
+        companyId: evidence.sourceIssue.companyId,
+        issueId: evidence.sourceIssue.id,
+        trigger: evidence.trigger,
+      }, "productivity review skipped: no invokable, in-budget review owner could be resolved");
+      return { kind: "skipped" as const, reviewIssueId: null };
+    }
     let review: Awaited<ReturnType<typeof issuesSvc.create>>;
     try {
       review = await issuesSvc.create(evidence.sourceIssue.companyId, {
@@ -1358,6 +1645,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       escalated: 0,
       optedOut: 0,
       monitorScheduledSuppressed: 0,
+      approvalGatedSuppressed: 0,
       closedSuppressedMonitorReviews: 0,
       creationCapped: 0,
       noActionSuppressed: 0,
@@ -1392,6 +1680,11 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       const evidence = await collectEvidence(candidate, sourceAgent, thresholds, now);
       if (!evidence) {
         result.skipped += 1;
+        continue;
+      }
+      if (isApprovalGatedSuppression(evidence)) {
+        await recordApprovalGatedSuppression(evidence);
+        result.approvalGatedSuppressed += 1;
         continue;
       }
       if (isMonitorScheduledSuppression(evidence)) {
@@ -1471,7 +1764,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     if (!sourceIssue || !sourceAgent || !openReview) return { held: false as const };
     if (sourceAgent.companyId !== input.companyId) return { held: false as const };
     const evidence = await collectEvidence(sourceIssue, sourceAgent, thresholds, now);
-    if (!evidence || isMonitorScheduledSuppression(evidence)) {
+    if (!evidence || isMonitorScheduledSuppression(evidence) || isApprovalGatedSuppression(evidence)) {
       return { held: false as const };
     }
     if (!isSoftStopTrigger(evidence.trigger) || evidence.routineOnlySamplingWindow) {

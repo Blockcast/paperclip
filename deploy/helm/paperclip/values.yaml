@@ -158,9 +158,10 @@ secret:
 
 # -- GitHub App creds for server-side installation-token minting. Lets the API
 # authoritatively verify (via the GitHub API) that a PR-review run actually left
-# a review/comment before flagging it `pr_review_output_missing` (BLO-10448).
-# Disabled by default — the verification is inert without it and runs fall back
-# to the text heuristic. Enable on deployments where the referenced secret exists.
+# a review/comment before completing it (BLO-10448). Deployments that run the PR
+# reviewer must enable this; missing credentials warn at API startup and fail
+# review completion closed.
+# Disabled by default for deployments that do not use the reviewer workflow.
 githubApp:
   # -- Mount the GitHub App creds into the API env and enable GitHub-verified PR-review evidence.
   enabled: false
@@ -170,8 +171,14 @@ githubApp:
   appIdKey: app_id
   installationIdKey: installation_id
   privateKeyKey: private_key.pem
-  # -- GitHub login of the reviewer bot used to filter reviews/comments. Empty -> server default ("allyblockcast[bot]").
+  # -- GitHub App login used to filter reviews/comments. Must be `<slug>[bot]` or `app/<slug>`; bare user logins are rejected. Empty -> server default ("allyblockcast[bot]").
   reviewerBotLogin: ""
+  # -- Commit-status context to FAIL when a PR-review run exhausts its automatic
+  # retries (e.g. "review/ally-complete"). A required status that is never posted
+  # reads as "Expected — waiting for status" forever, so an exhausted reviewer
+  # chain silently wedges the PR. Empty (default) -> the server posts no status.
+  # Requires the App to hold `statuses: write` on the target repos.
+  prReviewGateStatusContext: ""
 
 # -- Pod spec knobs.
 pod:
@@ -253,6 +260,46 @@ probes:
         - name: Host
           value: 127.0.0.1:3100
     periodSeconds: 10
+    failureThreshold: 30
+
+# -- Worker StatefulSet probe configuration. The worker serves the same
+# `/healthz` endpoint as the API tier; probing HTTP prevents Kubernetes from
+# routing API-to-worker requests before the worker is actually listening.
+workerProbes:
+  # -- Worker liveness probe.
+  liveness:
+    httpGet:
+      path: /healthz
+      port: http
+      httpHeaders:
+        - name: Host
+          value: 127.0.0.1:3100
+    initialDelaySeconds: 30
+    periodSeconds: 30
+    timeoutSeconds: 5
+    failureThreshold: 3
+  # -- Worker readiness probe.
+  readiness:
+    httpGet:
+      path: /healthz
+      port: http
+      httpHeaders:
+        - name: Host
+          value: 127.0.0.1:3100
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+  # -- Worker startup probe.
+  startup:
+    httpGet:
+      path: /healthz
+      port: http
+      httpHeaders:
+        - name: Host
+          value: 127.0.0.1:3100
+    periodSeconds: 10
+    timeoutSeconds: 5
     failureThreshold: 30
 
 # -- Node selector.
@@ -345,6 +392,16 @@ prometheusRule:
   unschedulablePodThreshold: 0
   # -- How long agent pods must stay Unschedulable before warning (transient blips self-resolve; this catches sustained starvation).
   unschedulableFor: 15m
+  # -- Rolling window for the GitHub review-request dead-letter rate (BLO-18859). Any dead-lettered delivery in this window fires; the counter is flat at zero in steady state.
+  githubDeliveryDeadLetterWindow: 30m
+  # -- How long a non-zero dead-letter rate must persist before firing. Kept short: a dead-lettered delivery is already terminal, so there is nothing to self-resolve.
+  githubDeliveryDeadLetterFor: 5m
+  # -- Rolling window for outage-like terminal suppression of GitHub review-request wakes (BLO-18859).
+  githubDeliverySuppressionWindow: 30m
+  # -- How long outage-like suppression must persist before firing. Same reasoning as the dead-letter alert: suppression is terminal, nothing self-resolves.
+  githubDeliverySuppressionFor: 5m
+  # -- Prometheus regex of suppression causes that mean an outage rather than a deliberate decline (BLO-18859). Expected policy declines (company.inactive, heartbeat.cooldown.active, heartbeat.disabled, heartbeat.wakeOnDemand.disabled, budget.blocked, agent.not_invokable, heartbeat.worktree_execution_cutoff, issue_tree_hold_active) are excluded so they never page. `other` is included: it is the bucket for a skip reason missing from KNOWN_GITHUB_SUPPRESSION_CAUSES, and an untriaged cause is not a known-good decline.
+  githubDeliverySuppressionOutageCauses: "heartbeat.scheduling_suppressed|dispatch_rejected|other"
   # -- Additional PrometheusRule groups appended verbatim.
   additionalGroups: []
 

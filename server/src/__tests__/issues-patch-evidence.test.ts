@@ -5,6 +5,7 @@ import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
+  agents,
   companies,
   createDb,
   issueComments,
@@ -43,6 +44,7 @@ describeEmbeddedPostgres("PATCH /issues/:id evidence gate", () => {
     await db.delete(activityLog);
     await db.delete(issues);
     await db.delete(labels);
+    await db.delete(agents);
     await db.delete(companies);
   });
 
@@ -66,6 +68,7 @@ describeEmbeddedPostgres("PATCH /issues/:id evidence gate", () => {
     const companyId = randomUUID();
     const issueId = randomUUID();
     const labelId = randomUUID();
+    const agentId = randomUUID();
     const prefix = `EG${companyId.replaceAll("-", "").slice(0, 6).toUpperCase()}`;
 
     await db.insert(companies).values({
@@ -80,6 +83,17 @@ describeEmbeddedPostgres("PATCH /issues/:id evidence gate", () => {
       name: "frontend",
       color: "#000000",
     });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "EvidenceBot",
+      role: "engineer",
+      status: "running",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
     await db.insert(issues).values({
       id: issueId,
       companyId,
@@ -92,7 +106,17 @@ describeEmbeddedPostgres("PATCH /issues/:id evidence gate", () => {
     });
     await db.insert(issueLabels).values({ issueId, labelId, companyId });
 
-    return { companyId, issueId };
+    return { companyId, issueId, agentId, labelId };
+  }
+
+  /**
+   * An UNLABELED issue, plus an unattached `frontend` label the caller can
+   * apply in the same PATCH that moves the status.
+   */
+  async function seedUnlabeledIssue(status: "in_progress" | "in_review" = "in_progress") {
+    const seeded = await seedFrontendIssue(status);
+    await db.delete(issueLabels).where(eq(issueLabels.issueId, seeded.issueId));
+    return seeded;
   }
 
   it("rejects a computed block with the structured 422 contract and rolls back", async () => {
@@ -155,4 +179,276 @@ describeEmbeddedPostgres("PATCH /issues/:id evidence gate", () => {
       lastEvidenceVerdict: null,
     });
   });
+
+  // BLO-19047 Defect A: the gate used to run only on the in_review TRANSITION,
+  // so an agent following the documented remediation loop ("add the missing
+  // evidence, comment again, re-send in_review") got a 200 with a stale verdict
+  // and no way to tell "gate ran and still fails" from "gate never ran".
+  describe("in_review -> in_review re-evaluation", () => {
+    const COMPLETE_FRONTEND_EVIDENCE = [
+      "![desktop](./shot_desktop_1440x900.png)",
+      "![mobile](./shot_mobile_390x844.png)",
+      "https://github.com/Blockcast/paperclip/pull/999",
+      "",
+      "| Criterion | Status |",
+      "|---|---|",
+      "| desktop works | ✅ |",
+      "| mobile works | ✅ |",
+      "| tests pass | ✅ |",
+    ].join("\n");
+
+    it("re-evaluates and records a verdict when status is re-sent as in_review", async () => {
+      const { issueId } = await seedFrontendIssue("in_review");
+
+      const response = await request(createApp())
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_review" });
+
+      // 200 because a re-evaluation never rejects, but the verdict is now
+      // recorded rather than left frozen at null.
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+      expect(response.body.lastEvidenceVerdict).toMatchObject({ verdict: "block" });
+      expect(response.body.lastEvidenceVerdictEvaluatedAt).toBeTruthy();
+    });
+
+    it("clears a stale failing verdict once the missing evidence is posted", async () => {
+      const { companyId, issueId, agentId } = await seedFrontendIssue("in_review");
+      // Freeze a failing verdict, as the original in_review transition would.
+      await db
+        .update(issues)
+        .set({
+          lastEvidenceVerdict: { verdict: "block", missing: ["screenshot:1440x900"] } as any,
+          lastEvidenceVerdictEvaluatedAt: new Date("2026-07-30T11:48:19.000Z"),
+        })
+        .where(eq(issues.id, issueId));
+      await db.insert(issueComments).values({
+        companyId,
+        issueId,
+        body: COMPLETE_FRONTEND_EVIDENCE,
+        authorAgentId: agentId,
+        authorUserId: null,
+        createdAt: new Date(),
+      });
+
+      const response = await request(createApp())
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_review" });
+
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+      expect(response.body.lastEvidenceVerdict).toMatchObject({
+        verdict: "pass",
+        missing: [],
+      });
+      // The frozen 11:48:19Z evaluation must have been superseded.
+      expect(
+        new Date(response.body.lastEvidenceVerdictEvaluatedAt).getTime(),
+      ).toBeGreaterThan(new Date("2026-07-30T11:48:19.000Z").getTime());
+    });
+
+    it("never rejects a re-evaluation, even when the verdict is block", async () => {
+      const { issueId } = await seedFrontendIssue("in_review");
+
+      const response = await request(createApp())
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_review", title: "Still under review" });
+
+      // A real transition into in_review with this evidence is a 422 (see the
+      // first test in this file). Re-sending it on an already-in_review issue
+      // must not start failing unrelated patches.
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+      expect(response.body).toMatchObject({
+        status: "in_review",
+        title: "Still under review",
+      });
+    });
+
+    it("keeps durable landing evidence that has aged out of the comment window", async () => {
+      // done-gate.ts reads the STORED verdict's allDetected as the standing
+      // record that a PR was attached. The evaluator only scans the 10 newest
+      // agent comments, so a re-evaluation must not erase that record just
+      // because the thread grew — that would fail a later `done` transition
+      // with no_execution_run_and_no_pr_evidence on an issue that did ship.
+      const { companyId, issueId, agentId } = await seedFrontendIssue("in_review");
+      await db
+        .update(issues)
+        .set({
+          lastEvidenceVerdict: {
+            verdict: "pass",
+            missing: [],
+            allDetected: ["pr-link", "landing-artifact", "checklist:done-when"],
+          } as any,
+          lastEvidenceVerdictEvaluatedAt: new Date("2026-07-30T11:48:19.000Z"),
+        })
+        .where(eq(issues.id, issueId));
+      // 12 newer comments with no PR link push the original out of the window.
+      for (let i = 0; i < 12; i += 1) {
+        await db.insert(issueComments).values({
+          companyId,
+          issueId,
+          body: `review note ${i}`,
+          authorAgentId: agentId,
+          authorUserId: null,
+          createdAt: new Date(Date.parse("2026-07-30T12:00:00.000Z") + i * 1000),
+        });
+      }
+
+      const response = await request(createApp())
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_review" });
+
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+      // Freshly computed fields reflect the current window...
+      expect(response.body.lastEvidenceVerdict).toMatchObject({ verdict: "block" });
+      // ...but the durable landing fact survives.
+      expect(response.body.lastEvidenceVerdict.allDetected).toEqual(
+        expect.arrayContaining(["pr-link", "landing-artifact"]),
+      );
+    });
+  });
+
+  // BLO-19047 (Ally review of PR #840): the gate ran against the labels stored
+  // in the DB, but `syncIssueLabels` runs later inside the update transaction.
+  // A patch that set the status AND the labels in one call was therefore judged
+  // under the PRE-patch policy, then persisted the new labels — a single call
+  // could take on the stricter frontend requirements while being graded by the
+  // unlabeled fallback.
+  describe("combined status + labelIds patches", () => {
+    const CHECKLIST_ONLY_EVIDENCE = [
+      "https://github.com/Blockcast/paperclip/pull/1001",
+      "",
+      "| Criterion | Status |",
+      "|---|---|",
+      "| desktop works | \u2705 |",
+      "| mobile works | \u2705 |",
+      "| tests pass | \u2705 |",
+    ].join("\n");
+
+    it("applies the incoming label policy on an in_review transition", async () => {
+      const { companyId, issueId, agentId, labelId } = await seedUnlabeledIssue();
+      // Enough for the unlabeled fallback, but NOT for `frontend`, which also
+      // demands 1440x900 and 390x844 screenshots.
+      await db.insert(issueComments).values({
+        companyId,
+        issueId,
+        body: CHECKLIST_ONLY_EVIDENCE,
+        authorAgentId: agentId,
+        authorUserId: null,
+        createdAt: new Date(),
+      });
+
+      const response = await request(createApp())
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_review", labelIds: [labelId] });
+
+      // Judged as `frontend`, so the screenshots are missing and it is blocked.
+      expect(response.status, JSON.stringify(response.body)).toBe(422);
+      expect(response.body.missing).toEqual(
+        expect.arrayContaining(["screenshot:1440x900", "screenshot:390x844"]),
+      );
+      // The whole patch rolled back: neither the status nor the label landed.
+      const [persisted] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(persisted).toMatchObject({ status: "in_progress" });
+      const attached = await db
+        .select()
+        .from(issueLabels)
+        .where(eq(issueLabels.issueId, issueId));
+      expect(attached).toHaveLength(0);
+    });
+
+    it("records a re-evaluation verdict against the incoming labels", async () => {
+      const { companyId, issueId, agentId, labelId } = await seedUnlabeledIssue("in_review");
+      await db.insert(issueComments).values({
+        companyId,
+        issueId,
+        body: CHECKLIST_ONLY_EVIDENCE,
+        authorAgentId: agentId,
+        authorUserId: null,
+        createdAt: new Date(),
+      });
+
+      const response = await request(createApp())
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_review", labelIds: [labelId] });
+
+      // A re-evaluation never rejects, but the recorded verdict must match the
+      // policy the returned issue actually carries.
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+      expect(response.body.labelIds).toEqual([labelId]);
+      expect(response.body.lastEvidenceVerdict).toMatchObject({
+        verdict: "block",
+        unlabeledFallback: false,
+      });
+      expect(response.body.lastEvidenceVerdict.missing).toEqual(
+        expect.arrayContaining(["screenshot:1440x900"]),
+      );
+    });
+
+    it("re-evaluates when labels are applied after an issue already entered in_review", async () => {
+      const { companyId, issueId, agentId, labelId } = await seedUnlabeledIssue();
+      await db.insert(issueComments).values({
+        companyId,
+        issueId,
+        body: CHECKLIST_ONLY_EVIDENCE,
+        authorAgentId: agentId,
+        authorUserId: null,
+        createdAt: new Date(),
+      });
+
+      const inReview = await request(createApp())
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_review" });
+      expect(inReview.status, JSON.stringify(inReview.body)).toBe(200);
+      expect(inReview.body.lastEvidenceVerdict).toMatchObject({
+        verdict: "pass",
+        unlabeledFallback: true,
+      });
+
+      const labeled = await request(createApp())
+        .patch(`/api/issues/${issueId}`)
+        .send({ labelIds: [labelId] });
+
+      expect(labeled.status, JSON.stringify(labeled.body)).toBe(200);
+      expect(labeled.body.labelIds).toEqual([labelId]);
+      expect(labeled.body.lastEvidenceVerdict).toMatchObject({
+        verdict: "block",
+        unlabeledFallback: false,
+      });
+      expect(labeled.body.lastEvidenceVerdict.missing).toEqual(
+        expect.arrayContaining(["screenshot:1440x900", "screenshot:390x844"]),
+      );
+    });
+
+    it("uses the unlabeled fallback when the patch REMOVES every label", async () => {
+      const { companyId, issueId, agentId } = await seedFrontendIssue();
+      await db.insert(issueComments).values({
+        companyId,
+        issueId,
+        body: CHECKLIST_ONLY_EVIDENCE,
+        authorAgentId: agentId,
+        authorUserId: null,
+        createdAt: new Date(),
+      });
+
+      const response = await request(createApp())
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_review", labelIds: [] });
+
+      // Stripping `frontend` in the same call drops the screenshot demand, so
+      // the checklist + PR link clear the unlabeled fallback.
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+      expect(response.body.lastEvidenceVerdict).toMatchObject({ unlabeledFallback: true });
+    });
+
+    it("reports the label error, not missing-evidence, for an invalid labelId", async () => {
+      const { issueId } = await seedUnlabeledIssue();
+
+      const response = await request(createApp())
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_review", labelIds: [randomUUID()] });
+
+      expect(response.status).toBe(422);
+      expect(JSON.stringify(response.body)).toContain("labels are invalid");
+    });
+  });
+
 });

@@ -12,10 +12,65 @@
 # so non-agent uses of the image (or a build where the secret was never
 # mounted) are unaffected — this is not a hard dependency on the file
 # existing.
+#
+# A second, volume-free delivery path exists for credentials bound per-agent
+# rather than mounted fleet-wide: see PAPERCLIP_GITHUB_TOKEN_VALUE below.
 set -eu
 
 TOKEN_FILE="${PAPERCLIP_GITHUB_TOKEN_FILE:-/paperclip/.secrets/github-token/token}"
 REAL_GH="${GH_TOKEN_WRAPPER_REAL_GH:-/usr/bin/gh.real}"
+
+# PAPERCLIP_GITHUB_TOKEN_VALUE carries a token *value* rather than a path, for
+# credentials delivered by the scoped secret-binding path (per-agent /
+# per-project env bindings) instead of by a mounted secret volume. It exists so
+# a credential can be given to specific agents without mounting it into every
+# agent pod: the k8s adapters propagate every main-container secret volume into
+# every Job pod with no agent or tenant filter (BLO-18927, BLO-18970), so a
+# volume-delivered secret is necessarily fleet-wide.
+#
+# Precedence: value > file. Both are *explicit caller selections* of an identity
+# for one invocation — the same trust model the FILE variable already had, since
+# a caller could always point that at a file it wrote. This is deliberately NOT
+# GH_TOKEN: the override below must keep clobbering GH_TOKEN unconditionally
+# (BLO-13241), so GH_TOKEN cannot double as an input without reopening that bug.
+if [ "${PAPERCLIP_GITHUB_TOKEN_VALUE+x}" = x ]; then
+  # Trim surrounding whitespace only — a secret that arrives via a templated
+  # env binding routinely picks up a trailing newline, and tabs/spaces are just
+  # as likely as CR/LF from a YAML block scalar. Deliberately a trim rather than
+  # a delete: `tr -d` would silently splice "ghu_aaa\nbbb" into the single
+  # plausible-looking token "ghu_aaabbb" and authenticate as nobody-in-
+  # particular, which is the failure mode this whole branch exists to avoid.
+  TOKEN="${PAPERCLIP_GITHUB_TOKEN_VALUE}"
+  while :; do
+    case "${TOKEN}" in
+      [[:space:]]*) TOKEN="${TOKEN#?}" ;;
+      *[[:space:]]) TOKEN="${TOKEN%?}" ;;
+      *) break ;;
+    esac
+  done
+
+  # Both rejections below must exit rather than fall through to the token file
+  # or to the real binary: a malformed binding is a misconfiguration, and
+  # continuing would run `gh` under whatever ambient GH_TOKEN/GITHUB_TOKEN the
+  # caller happened to inherit — an unintended identity, silently.
+  if [ -z "${TOKEN}" ]; then
+    echo "gh-token-wrapper: PAPERCLIP_GITHUB_TOKEN_VALUE is set but holds only whitespace; refusing to run with ambient auth" >&2
+    exit 64
+  fi
+  case "${TOKEN}" in
+    *[[:space:]]*)
+      # No GitHub token format contains whitespace, so this is either a
+      # concatenation of two values or a corrupted binding. Refuse rather than
+      # guess which half was meant. The value itself is never echoed.
+      echo "gh-token-wrapper: PAPERCLIP_GITHUB_TOKEN_VALUE contains embedded whitespace; refusing to guess at the intended token" >&2
+      exit 64
+      ;;
+  esac
+
+  export GH_TOKEN="${TOKEN}"
+  export GITHUB_TOKEN="${TOKEN}"
+  exec "${REAL_GH}" "$@"
+fi
 
 if [ -r "${TOKEN_FILE}" ]; then
   TOKEN="$(tr -d '\r\n' < "${TOKEN_FILE}" 2>/dev/null || true)"

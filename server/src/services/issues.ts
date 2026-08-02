@@ -66,6 +66,7 @@ import {
   issueCommentPresentationSchema,
   isUuidLike,
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
+  SYSTEM_ISSUE_DOCUMENT_KEYS,
 } from "@paperclipai/shared";
 import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
 import { incrementBlockerResolvedWakeMetric } from "./blocker-resolved-wake-metrics.js";
@@ -353,6 +354,44 @@ function assertExplicitPinnedWorktreeIssueRunnable(input: {
       workspaceWorktreeRequiresProjectDetails(),
     );
   }
+}
+
+// Two deliberately different questions about the same three fields. Collapsing
+// them into one `!= null` predicate regressed recovery escalation once already
+// (PR #811), so they stay separate and each call site picks explicitly.
+//
+// Did the caller *mention* any workspace field? An explicit `null` counts.
+// Passing all three as null is how a caller opts OUT of inheriting a parent's
+// execution workspace — recovery/service.ts does exactly that for a liveness
+// escalation it parents to the recovery issue, to stop the escalation adopting
+// the blocker's checkout. The inheritance-suppression sites must therefore read
+// null as a real override, or that opt-out silently stops working.
+function hasExplicitExecutionWorkspaceOverride(input: {
+  executionWorkspaceId?: string | null;
+  executionWorkspacePreference?: string | null;
+  executionWorkspaceSettings?: unknown;
+}) {
+  return (
+    input.executionWorkspaceId !== undefined ||
+    input.executionWorkspacePreference !== undefined ||
+    input.executionWorkspaceSettings !== undefined
+  );
+}
+
+// Did the caller supply an actual workspace *value*? Explicit nulls do not
+// count. Sole-led-project inference keys off this one, because the board/UI
+// intake path serializes explicit nulls and must still get inference — that
+// intake case is the whole point of BLO-18760.
+function hasExecutionWorkspaceIntent(input: {
+  executionWorkspaceId?: string | null;
+  executionWorkspacePreference?: string | null;
+  executionWorkspaceSettings?: unknown;
+}) {
+  return (
+    input.executionWorkspaceId != null ||
+    input.executionWorkspacePreference != null ||
+    input.executionWorkspaceSettings != null
+  );
 }
 
 function readStringFromRecord(record: unknown, key: string) {
@@ -678,6 +717,10 @@ type IssueActiveRunRow = {
   startedAt: Date | null;
   finishedAt: Date | null;
   createdAt: Date;
+  // BLO-19001: liveness signals, so a consumer can tell a run that is actually
+  // holding this issue from one that has been silent long enough to be stale.
+  lastOutputAt: Date | null;
+  lastUsefulActionAt: Date | null;
 };
 type IssueScheduledRetryRow = {
   runId: string;
@@ -1839,10 +1882,272 @@ async function withIssueLabels(dbOrTx: any, rows: IssueRow[]): Promise<IssueWith
 }
 
 /**
+ * Shapes that record a DURABLE fact ("a PR/commit was attached to this issue"),
+ * as opposed to a fact about the current comment window.
+ */
+const DURABLE_LANDING_SHAPES = ["pr-link", "landing-artifact"] as const;
+
+/**
+ * Carry forward durable landing evidence when re-evaluating an already-in_review
+ * issue.
+ *
+ * The evaluator only scans the 10 most recent agent comments, so once ten
+ * comments accumulate after the one bearing the PR link, a fresh evaluation
+ * reports `allDetected: []`. On the in_review TRANSITION that is the honest
+ * answer and it is what gets stored. But `done-gate.ts` reads the STORED
+ * verdict's `allDetected` as the standing record that a PR was ever attached
+ * (`hasPrLinkEvidence`), so letting a re-evaluation overwrite it would make an
+ * issue that legitimately shipped a PR fail its later `done` transition with
+ * `no_execution_run_and_no_pr_evidence` purely because the comment thread grew.
+ * Before BLO-19047 the re-evaluation was a no-op, so the transition-time verdict
+ * was durable by accident; this keeps it durable on purpose.
+ *
+ * Only `allDetected` is merged — `verdict`, `missing` and `requiredFound` stay
+ * exactly as freshly computed, which is the whole point of re-evaluating.
+ *
+ * Note (BLO-19081): the done gate's third evidence path — a run-attributed
+ * durable artifact, see `fetchDurableArtifactEvidence` below — deliberately does
+ * NOT rely on this carry-forward. It queries the artifact rows live at close
+ * time, so it has no comment-window to age out of and nothing to preserve. If
+ * you add a fourth shape, prefer that pattern over widening
+ * `DURABLE_LANDING_SHAPES`: a live row is a stronger record than a cached
+ * verdict field, which is only needed for shapes scraped from comment text.
+ */
+function preserveDurableLandingEvidence<T extends { allDetected?: unknown }>(
+  fresh: T,
+  stored: unknown,
+): T {
+  const storedDetected = (stored as { allDetected?: unknown } | null)?.allDetected;
+  if (!Array.isArray(storedDetected)) return fresh;
+  const freshDetected = Array.isArray(fresh.allDetected) ? fresh.allDetected : [];
+  const carried = DURABLE_LANDING_SHAPES.filter(
+    (shape) => storedDetected.includes(shape) && !freshDetected.includes(shape),
+  );
+  if (carried.length === 0) return fresh;
+  return { ...fresh, allDetected: [...freshDetected, ...carried] };
+}
+
+/**
+ * Work-product types that count as a durable, inspectable deliverable for the
+ * done gate. Deliberately narrow: `pull_request` / `branch` / `commit` are
+ * already covered by the pr-link path, and `preview_url` / `runtime_service`
+ * describe ephemeral infrastructure rather than a reviewable artifact.
+ */
+const DURABLE_ARTIFACT_WORK_PRODUCT_TYPES = ["artifact", "document"] as const;
+const UUID_SQL_SOURCE =
+  "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}";
+const UUID_SQL_PATTERN = `^${UUID_SQL_SOURCE}$`;
+const ATTACHMENT_CONTENT_URL_SQL_PATTERN = `^/api/attachments/${UUID_SQL_SOURCE}/content(\\?download=1)?$`;
+
+function hasTrustedOrPromotedSourceTrust(sourceTrustColumn: any): SQL {
+  return or(
+    isNull(sourceTrustColumn as any),
+    sql`${sourceTrustColumn}->>'disposition' = 'promoted'`,
+  )!;
+}
+
+function hasInspectableWorkProductUrlLocator(): SQL {
+  return or(
+    // External artifact URLs are accepted as reviewer-openable locators. The
+    // server deliberately does not resolve them here because that would create
+    // SSRF surface; internal attachment URLs resolve against same-issue rows.
+    sql`${issueWorkProducts.url} ~* '^https?://[^[:space:]]+$'`,
+    sql`case
+      when ${issueWorkProducts.url} ~* ${ATTACHMENT_CONTENT_URL_SQL_PATTERN}
+      then exists (
+        select 1
+        from issue_attachments durable_url_attachment
+        where durable_url_attachment.company_id = ${issueWorkProducts.companyId}
+          and durable_url_attachment.issue_id = ${issueWorkProducts.issueId}
+          and (
+            ${issueWorkProducts.url} = '/api/attachments/' || durable_url_attachment.id::text || '/content'
+            or ${issueWorkProducts.url} = '/api/attachments/' || durable_url_attachment.id::text || '/content?download=1'
+          )
+      )
+      else false
+    end`,
+  )!;
+}
+
+function hasInspectableWorkProductLocator(issueId: string): SQL {
+  return or(
+    hasInspectableWorkProductUrlLocator(),
+    and(
+      sql`jsonb_typeof(${issueWorkProducts.metadata}->'resourceRef') = 'object'`,
+      sql`${issueWorkProducts.metadata}->'resourceRef'->>'kind' = 'workspace_file'`,
+      sql`${issueWorkProducts.metadata}->'resourceRef'->>'issueId' = ${issueId}`,
+      sql`${issueWorkProducts.metadata}->'resourceRef'->>'workspaceKind' in ('execution_workspace', 'project_workspace')`,
+      sql`${issueWorkProducts.metadata}->'resourceRef'->>'relativePath' ~ '[^[:space:]]'`,
+      sql`${issueWorkProducts.metadata}->'resourceRef'->>'displayPath' ~ '[^[:space:]]'`,
+      sql`case
+        when ${issueWorkProducts.metadata}->'resourceRef'->>'workspaceId' ~* ${UUID_SQL_PATTERN}
+        then (
+          (
+            ${issueWorkProducts.metadata}->'resourceRef'->>'workspaceKind' = 'execution_workspace'
+            and exists (
+              select 1
+              from execution_workspaces durable_execution_workspace
+              where durable_execution_workspace.id = (${issueWorkProducts.metadata}->'resourceRef'->>'workspaceId')::uuid
+                and durable_execution_workspace.company_id = ${issueWorkProducts.companyId}
+                and durable_execution_workspace.source_issue_id = ${issueWorkProducts.issueId}
+            )
+          )
+          or (
+            ${issueWorkProducts.metadata}->'resourceRef'->>'workspaceKind' = 'project_workspace'
+            and exists (
+              select 1
+              from project_workspaces durable_project_workspace
+              where durable_project_workspace.id = (${issueWorkProducts.metadata}->'resourceRef'->>'workspaceId')::uuid
+                and durable_project_workspace.company_id = ${issueWorkProducts.companyId}
+            )
+          )
+        )
+        else false
+      end`,
+    )!,
+    sql`case
+      when ${issueWorkProducts.metadata}->>'attachmentId' ~* ${UUID_SQL_PATTERN}
+      then exists (
+        select 1
+        from issue_attachments durable_attachment
+        where durable_attachment.id = (${issueWorkProducts.metadata}->>'attachmentId')::uuid
+          and durable_attachment.company_id = ${issueWorkProducts.companyId}
+          and durable_attachment.issue_id = ${issueWorkProducts.issueId}
+          and ${issueWorkProducts.metadata}->>'contentPath' = '/api/attachments/' || durable_attachment.id::text || '/content'
+          and ${issueWorkProducts.metadata}->>'openPath' = '/api/attachments/' || durable_attachment.id::text || '/content'
+          and ${issueWorkProducts.metadata}->>'downloadPath' = '/api/attachments/' || durable_attachment.id::text || '/content?download=1'
+      )
+      else false
+    end`,
+    sql`case
+      when ${issueWorkProducts.metadata}->>'documentId' ~* ${UUID_SQL_PATTERN}
+      then exists (
+        select 1
+        from issue_documents durable_issue_document
+        inner join documents durable_document
+          on durable_document.id = durable_issue_document.document_id
+        inner join document_revisions durable_revision
+          on durable_revision.id = durable_document.latest_revision_id
+        where durable_document.id = (${issueWorkProducts.metadata}->>'documentId')::uuid
+          and durable_issue_document.company_id = ${issueWorkProducts.companyId}
+          and durable_issue_document.issue_id = ${issueWorkProducts.issueId}
+          and durable_issue_document.key not in (${DONE_GATE_NON_QUALIFYING_DOCUMENT_KEY_SQL_LIST})
+          and (durable_document.source_trust is null or durable_document.source_trust->>'disposition' = 'promoted')
+          and durable_revision.created_by_run_id is not null
+          and durable_revision.body ~ '[^[:space:]]'
+      )
+      else false
+    end`,
+    sql`exists (
+      select 1
+      from issue_documents durable_issue_document
+      inner join documents durable_document
+        on durable_document.id = durable_issue_document.document_id
+      inner join document_revisions durable_revision
+        on durable_revision.id = durable_document.latest_revision_id
+      where durable_issue_document.company_id = ${issueWorkProducts.companyId}
+        and durable_issue_document.issue_id = ${issueWorkProducts.issueId}
+        and durable_issue_document.key = ${issueWorkProducts.metadata}->>'documentKey'
+        and durable_issue_document.key not in (${DONE_GATE_NON_QUALIFYING_DOCUMENT_KEY_SQL_LIST})
+        and (durable_document.source_trust is null or durable_document.source_trust->>'disposition' = 'promoted')
+        and durable_revision.created_by_run_id is not null
+        and durable_revision.body ~ '[^[:space:]]'
+    )`,
+  )!;
+}
+
+/**
+ * Document keys that must NOT satisfy the done gate.
+ *
+ * `plan` is authored at the START of the work, so accepting it would let every
+ * issue that was ever planned self-certify completion — the plan is a statement
+ * of intent, not a deliverable. The system keys are scaffolding the platform
+ * writes on the agent's behalf (`continuation-summary` is emitted automatically
+ * when a run hands off), so neither is evidence the agent produced anything.
+ */
+const DONE_GATE_NON_QUALIFYING_DOCUMENT_KEYS: readonly string[] = [
+  ...SYSTEM_ISSUE_DOCUMENT_KEYS,
+  "plan",
+];
+const DONE_GATE_NON_QUALIFYING_DOCUMENT_KEY_SQL_LIST = sql.join(
+  DONE_GATE_NON_QUALIFYING_DOCUMENT_KEYS.map((key) => sql`${key}`),
+  sql`, `,
+);
+
+/**
+ * Does this issue carry a durable artifact that a real run produced? (BLO-19081)
+ *
+ * See the docblock in `done-gate.ts` for why this exists and why it is not a
+ * hole in the gate. Two qualifying shapes, both requiring run attribution:
+ *
+ *  - an issue document (excluding plan/system keys) whose latest revision has a
+ *    non-empty body, is stamped `createdByRunId`, and is trusted or promoted;
+ *  - an active, trusted-or-promoted, inspectable `artifact`/`document` work
+ *    product stamped `createdByRunId`.
+ *
+ * `createdByRunId` is validated against the authenticated actor's run context in
+ * the route layer, so an agent cannot attribute evidence to another run.
+ *
+ * Call this LAZILY — only when the cheaper gate checks have already decided to
+ * block — so the common update path pays no extra query.
+ */
+async function fetchDurableArtifactEvidence(dbOrTx: any, issueId: string, companyId: string): Promise<boolean> {
+  const [documentRows, workProductRows] = await Promise.all([
+    dbOrTx
+      .select({ key: issueDocuments.key })
+      .from(issueDocuments)
+      .innerJoin(documents, eq(issueDocuments.documentId, documents.id))
+      .innerJoin(documentRevisions, eq(documentRevisions.id, documents.latestRevisionId))
+      .where(
+        and(
+          eq(issueDocuments.companyId, companyId),
+          eq(issueDocuments.issueId, issueId),
+          notInArray(issueDocuments.key, [...DONE_GATE_NON_QUALIFYING_DOCUMENT_KEYS]),
+          hasTrustedOrPromotedSourceTrust(documents.sourceTrust),
+          isNotNull(documentRevisions.createdByRunId),
+          // Must contain at least one non-whitespace character. A body of
+          // spaces, tabs or newlines is as empty as `''` and would otherwise
+          // be the cheapest way to satisfy the gate with no deliverable.
+          // NOT `length(trim(...)) > 0` — Postgres `trim`/`btrim` strips only
+          // SPACES by default, so "\n\t" survives it and passes. Deliberately
+          // not a minimum length beyond blank either: an arbitrary threshold
+          // invites padding, and the substantive check is a reviewer opening
+          // the artifact.
+          sql`${documentRevisions.body} ~ '[^[:space:]]'`,
+        ),
+      )
+      .limit(1)
+      .for("update", { of: [issueDocuments, documents] }),
+    dbOrTx
+      .select({ id: issueWorkProducts.id })
+      .from(issueWorkProducts)
+      .where(
+        and(
+          eq(issueWorkProducts.companyId, companyId),
+          eq(issueWorkProducts.issueId, issueId),
+          inArray(issueWorkProducts.type, [...DURABLE_ARTIFACT_WORK_PRODUCT_TYPES]),
+          eq(issueWorkProducts.status, "active"),
+          hasTrustedOrPromotedSourceTrust(issueWorkProducts.sourceTrust),
+          isNotNull(issueWorkProducts.createdByRunId),
+          hasInspectableWorkProductLocator(issueId),
+        ),
+      )
+      .limit(1)
+      .for("update"),
+  ]);
+  return documentRows.length > 0 || workProductRows.length > 0;
+}
+
+/**
  * Evidence-gate fetcher (BLO-4824 / BLO-4461). Loads the data the pure
  * evaluator needs: issue labels, the 10 most-recent comments, any recent
  * operator overrides, and any work_products. Caller supplies the description
  * (already on the existing row in the PATCH handler, no need to re-select).
+ *
+ * `effectiveLabelNames` overrides the labels read from the DB. A PATCH may
+ * carry `labelIds` alongside the status change, and `syncIssueLabels` only runs
+ * later inside the update transaction — so the stored rows are the PRE-patch
+ * labels and evaluating against them applies the wrong policy. (BLO-19047)
  */
 async function fetchEvidenceForIssue(
   dbOrTx: any,
@@ -1850,6 +2155,7 @@ async function fetchEvidenceForIssue(
   description: string | null,
   previousDescription: string | null = description,
   now: Date = new Date(),
+  effectiveLabelNames: Array<{ name: string }> | null = null,
 ): Promise<EvidenceFetchResult> {
   const [recentComments, operatorOverrideComments, workProductRows, labelsByIssueId, descriptionHistory] = await Promise.all([
     dbOrTx
@@ -1911,7 +2217,7 @@ async function fetchEvidenceForIssue(
     description,
     doneWhenBulletsRemoved:
       countDoneWhenBullets(description ?? "") === 0 && hadPriorDoneWhenBullets,
-    labels: issueLabels.map((l: { name: string }) => ({ name: l.name })),
+    labels: effectiveLabelNames ?? issueLabels.map((l: { name: string }) => ({ name: l.name })),
     comments: recentComments as EvidenceFetchResult["comments"],
     operatorOverrideComments: operatorOverrideComments as EvidenceFetchResult["operatorOverrideComments"],
     workProducts: workProductRows as EvidenceFetchResult["workProducts"],
@@ -1967,6 +2273,7 @@ const SYSTEM_HARNESS_CHILD_ORIGIN_KINDS: string[] = [
 const PRODUCTIVITY_REVIEW_TERMINAL_STATUSES = ["done", "cancelled"];
 const PRODUCTIVITY_REVIEW_ACTIVITY_ACTIONS = [
   "issue.productivity_review_created",
+  "issue.productivity_review_source_mutation",
   "issue.productivity_review_updated",
 ];
 const PRODUCTIVITY_REVIEW_TRIGGERS: readonly IssueProductivityReviewTrigger[] = [
@@ -2050,20 +2357,26 @@ type IssueBlockerAttentionAgentRow = {
   status: string;
 };
 
+function activeRunMapKey(companyId: string, runId: string) {
+  return `${companyId}:${runId}`;
+}
+
 async function activeRunMapForIssues(
   dbOrTx: any,
-  issueRows: IssueWithLabels[],
+  issueRows: Array<Pick<IssueRow, "companyId" | "executionRunId">>,
 ): Promise<Map<string, IssueActiveRunRow>> {
   const map = new Map<string, IssueActiveRunRow>();
   const runIds = issueRows
     .map((row) => row.executionRunId)
     .filter((id): id is string => id != null);
   if (runIds.length === 0) return map;
+  const companyIds = [...new Set(issueRows.map((row) => row.companyId))];
 
   for (const runIdChunk of chunkList([...new Set(runIds)], ISSUE_LIST_RELATED_QUERY_CHUNK_SIZE)) {
     const rows = await dbOrTx
       .select({
         id: heartbeatRuns.id,
+        companyId: heartbeatRuns.companyId,
         status: heartbeatRuns.status,
         agentId: heartbeatRuns.agentId,
         invocationSource: heartbeatRuns.invocationSource,
@@ -2071,17 +2384,21 @@ async function activeRunMapForIssues(
         startedAt: heartbeatRuns.startedAt,
         finishedAt: heartbeatRuns.finishedAt,
         createdAt: heartbeatRuns.createdAt,
+        lastOutputAt: heartbeatRuns.lastOutputAt,
+        lastUsefulActionAt: heartbeatRuns.lastUsefulActionAt,
       })
       .from(heartbeatRuns)
       .where(
         and(
           inArray(heartbeatRuns.id, runIdChunk),
+          inArray(heartbeatRuns.companyId, companyIds),
           inArray(heartbeatRuns.status, ACTIVE_RUN_STATUSES),
         ),
       );
 
     for (const row of rows) {
-      map.set(row.id, row);
+      const { companyId, ...activeRun } = row;
+      map.set(activeRunMapKey(companyId, row.id), activeRun);
     }
   }
   return map;
@@ -2444,10 +2761,20 @@ async function listIssueBlockerAttentionMap(
   companyId: string,
   issueRows: IssueBlockerAttentionInputNode[],
 ): Promise<Map<string, IssueBlockerAttention>> {
-  const roots = issueRows.filter((row) => row.companyId === companyId && row.status === "blocked");
+  const companyIssueRows = issueRows.filter((row) => row.companyId === companyId);
+  const dependencyReadinessMap = await listIssueDependencyReadinessMap(
+    dbOrTx,
+    companyId,
+    companyIssueRows.map((row) => row.id),
+  );
+  const roots = companyIssueRows.filter((row) =>
+    !BLOCKER_ATTENTION_CHILD_TERMINAL_STATUSES.includes(row.status) &&
+    (row.status === "blocked" || (dependencyReadinessMap.get(row.id)?.unresolvedBlockerCount ?? 0) > 0),
+  );
+  const rootIds = new Set(roots.map((root) => root.id));
   const attentionMap = new Map<string, IssueBlockerAttention>();
   for (const row of issueRows) {
-    if (row.status !== "blocked") {
+    if (!rootIds.has(row.id)) {
       attentionMap.set(row.id, createIssueBlockerAttention());
     }
   }
@@ -2819,8 +3146,31 @@ async function listIssueBlockerAttentionMap(
   for (const root of roots) {
     const rootNodeIds = nodeIdsByRoot.get(root.id) ?? new Set([root.id]);
     const rootTraversalTruncated = truncatedRootIds.has(root.id);
-    const topLevelEdges = (edgesByIssueId.get(root.id) ?? []).filter((edge) => nodesById.get(edge.blockerIssueId)?.status !== "done");
+    const dependencyReadiness = dependencyReadinessMap.get(root.id);
+    const unresolvedBlockerIssueIds = new Set(
+      dependencyReadiness?.unresolvedBlockerIssueIds ?? [],
+    );
+    const pendingFinalizeBlockerCount = new Set(
+      dependencyReadiness?.pendingFinalizeBlockerIssueIds ?? [],
+    ).size;
+    const topLevelEdges = (edgesByIssueId.get(root.id) ?? []).filter((edge) => {
+      if (unresolvedBlockerIssueIds.has(edge.blockerIssueId)) return true;
+      const blockerNode = nodesById.get(edge.blockerIssueId);
+      return (
+        blockerNode?.parentId === root.id &&
+        !BLOCKER_ATTENTION_CHILD_TERMINAL_STATUSES.includes(blockerNode.status)
+      );
+    });
     if (topLevelEdges.length === 0) {
+      if (pendingFinalizeBlockerCount > 0) {
+        attentionMap.set(root.id, createIssueBlockerAttention({
+          state: "covered",
+          reason: "active_dependency",
+          unresolvedBlockerCount: pendingFinalizeBlockerCount,
+          coveredBlockerCount: pendingFinalizeBlockerCount,
+        }));
+        continue;
+      }
       attentionMap.set(root.id, createIssueBlockerAttention({
         state: "needs_attention",
         reason: "attention_required",
@@ -2832,9 +3182,10 @@ async function listIssueBlockerAttentionMap(
       edge,
       result: classifyPath(edge.blockerIssueId, new Set([root.id]), rootNodeIds, rootTraversalTruncated),
     }));
-    const coveredBlockerCount = classified.filter((entry) => entry.result.covered).length;
+    const classifiedCoveredBlockerCount = classified.filter((entry) => entry.result.covered).length;
+    const coveredBlockerCount = classifiedCoveredBlockerCount + pendingFinalizeBlockerCount;
     const stalledBlockerCount = classified.filter((entry) => entry.result.stalled).length;
-    const attentionBlockerCount = classified.length - coveredBlockerCount - stalledBlockerCount;
+    const attentionBlockerCount = classified.length - classifiedCoveredBlockerCount - stalledBlockerCount;
     const hardAttentionEntry = classified.find((entry) => !entry.result.covered && !entry.result.stalled);
     const stalledEntry = classified.find((entry) => entry.result.stalled);
     const sampleEntry = hardAttentionEntry ?? stalledEntry ?? classified[0] ?? null;
@@ -2853,7 +3204,8 @@ async function listIssueBlockerAttentionMap(
       reason = "stalled_review";
     } else {
       state = "covered";
-      reason = topLevelEdges.every((edge) => nodesById.get(edge.blockerIssueId)?.parentId === root.id)
+      reason = pendingFinalizeBlockerCount === 0 &&
+        topLevelEdges.every((edge) => nodesById.get(edge.blockerIssueId)?.parentId === root.id)
         ? "active_child"
         : "active_dependency";
     }
@@ -2861,7 +3213,7 @@ async function listIssueBlockerAttentionMap(
     attentionMap.set(root.id, createIssueBlockerAttention({
       state,
       reason,
-      unresolvedBlockerCount: topLevelEdges.length,
+      unresolvedBlockerCount: topLevelEdges.length + pendingFinalizeBlockerCount,
       coveredBlockerCount,
       stalledBlockerCount,
       attentionBlockerCount,
@@ -2948,7 +3300,7 @@ function withActiveRuns(
 ): IssueWithLabelsAndRun[] {
   return issueRows.map((row) => ({
     ...row,
-    activeRun: row.executionRunId ? (runMap.get(row.executionRunId) ?? null) : null,
+    activeRun: row.executionRunId ? (runMap.get(activeRunMapKey(row.companyId, row.executionRunId)) ?? null) : null,
   }));
 }
 
@@ -4353,6 +4705,16 @@ export function issueService(db: Db) {
     }
   }
 
+  function issueCommentIdempotencyAuthorScope(actor: { agentId?: string | null; userId?: string | null }) {
+    if (actor.agentId) {
+      return and(eq(issueComments.authorAgentId, actor.agentId), isNull(issueComments.authorUserId));
+    }
+    if (actor.userId) {
+      return and(eq(issueComments.authorUserId, actor.userId), isNull(issueComments.authorAgentId));
+    }
+    return and(isNull(issueComments.authorAgentId), isNull(issueComments.authorUserId));
+  }
+
   function redactIssueComment<T extends {
     body: string;
     authorType?: string | null;
@@ -4774,6 +5136,33 @@ export function issueService(db: Db) {
         companyId,
       })),
     );
+  }
+
+  /**
+   * Label NAMES for an explicit `labelIds` patch, validated against the company.
+   *
+   * The evidence gate keys its policy off label names, and it runs before the
+   * update transaction that calls `syncIssueLabels`. Reading names from the DB
+   * at gate time therefore yields the labels the issue is moving AWAY from.
+   * Validation is duplicated from `assertValidLabelIds` deliberately: it has to
+   * happen before the gate so an invalid-label patch reports the label error
+   * rather than a misleading `missing-evidence`. (BLO-19047)
+   */
+  async function resolveLabelNames(
+    dbOrTx: any,
+    companyId: string,
+    labelIds: string[],
+  ): Promise<Array<{ name: string }>> {
+    const deduped = [...new Set(labelIds)];
+    if (deduped.length === 0) return [];
+    const rows = await dbOrTx
+      .select({ name: labels.name })
+      .from(labels)
+      .where(and(eq(labels.companyId, companyId), inArray(labels.id, deduped)));
+    if (rows.length !== deduped.length) {
+      throw unprocessable("One or more labels are invalid for this company");
+    }
+    return rows.map((row: { name: string }) => ({ name: row.name }));
   }
 
   async function getIssueRelationSummaryMap(
@@ -5896,6 +6285,30 @@ export function issueService(db: Db) {
 
     getByIdentifier: async (identifier: string) => {
       return getIssueByIdentifier(identifier);
+    },
+
+    /**
+     * The queued-or-running run recorded for this issue, or null.
+     *
+     * BLO-19001: single-issue counterpart to the `activeRun` the list paths
+     * attach via `withActiveRuns`. `getById` deliberately stays lean, so the
+     * issue-detail route composes this in alongside its other enrichments.
+     *
+     * Null covers "no run recorded", "the recorded run belongs to another
+     * company", and "the recorded run has already
+     * terminalized" — `activeRunMapForIssues` only returns rows whose status is
+     * in ACTIVE_RUN_STATUSES. That is the distinction a caller needs: a stale
+     * `executionRunId` left behind by a finished run reads as not-held, while a
+     * live sibling run reads as present. A queued run is present but does not
+     * yet hold a worktree; callers should use `isRunHoldingIssue` for that
+     * stricter cede decision.
+     */
+    getActiveRun: async (
+      issue: Pick<IssueRow, "companyId" | "executionRunId">,
+    ): Promise<IssueActiveRunRow | null> => {
+      if (!issue.executionRunId) return null;
+      const map = await activeRunMapForIssues(db, [issue]);
+      return map.get(activeRunMapKey(issue.companyId, issue.executionRunId)) ?? null;
     },
 
     /**
@@ -7112,12 +7525,9 @@ export function issueService(db: Db) {
         ...issueData
       } = data;
       const inheritStrategyOnly = executionWorkspaceInheritanceMode === "strategy_only";
-      const hasExplicitExecutionWorkspaceOverride =
-        issueData.executionWorkspaceId !== undefined ||
-        issueData.executionWorkspacePreference !== undefined ||
-        issueData.executionWorkspaceSettings !== undefined;
+      const hasExplicitWorkspaceOverride = hasExplicitExecutionWorkspaceOverride(issueData);
       const inheritedPreRealizationWorkspaceSettings =
-        inheritStrategyOnly && !hasExplicitExecutionWorkspaceOverride
+        inheritStrategyOnly && !hasExplicitWorkspaceOverride
           ? buildPreRealizationExecutionWorkspaceSettings(parent.executionWorkspaceSettings)
           : null;
       let child = await issueService(db).create(parent.companyId, {
@@ -7558,10 +7968,8 @@ export function issueService(db: Db) {
         const workspaceInheritanceIssueId = skipExecutionWorkspaceInheritance
           ? null
           : inheritExecutionWorkspaceFromIssueId ?? issueData.parentId ?? null;
-        const hasExplicitExecutionWorkspaceOverride =
-          issueData.executionWorkspaceId !== undefined ||
-          issueData.executionWorkspacePreference !== undefined ||
-          issueData.executionWorkspaceSettings !== undefined;
+        const hasExplicitWorkspaceOverride = hasExplicitExecutionWorkspaceOverride(issueData);
+        const hasWorkspaceIntent = hasExecutionWorkspaceIntent(issueData);
         if (workspaceInheritanceIssueId) {
           const workspaceSource = await getWorkspaceInheritanceIssue(tx, companyId, workspaceInheritanceIssueId);
           if (issueData.projectId == null && workspaceSource.projectId) {
@@ -7572,7 +7980,7 @@ export function issueService(db: Db) {
           }
           if (
             isolatedWorkspacesEnabled &&
-            !hasExplicitExecutionWorkspaceOverride &&
+            !hasExplicitWorkspaceOverride &&
             workspaceSource.executionWorkspaceId
           ) {
             const sourceWorkspace = await tx
@@ -7600,6 +8008,114 @@ export function issueService(db: Db) {
         if (issueData.projectId == null && executionWorkspaceId) {
           const workspace = await assertValidExecutionWorkspace(companyId, null, executionWorkspaceId, tx);
           issueData.projectId = workspace.projectId;
+        }
+        // Note for the inference below: reaching it with `projectId == null` PROVES both
+        // workspace *ids* are also null, so it needs no separate guard against those two.
+        // `execution_workspaces.project_id` and `project_workspaces.project_id` are both
+        // `NOT NULL` (packages/db/src/schema/execution_workspaces.ts:20,
+        // project_workspaces.ts:19; DDL in migrations/0035_marvelous_satana.sql, never
+        // relaxed since). So each block above either assigns a non-null projectId or
+        // throws — a *projectless* explicit/inherited workspace is not a representable
+        // state. Raised twice in review (PR #811) as a case where inference would fight
+        // the re-validation at ~7729 and fail the create; recorded here because the
+        // reasoning is non-local and the counterexample is unwritable as a test.
+        //
+        // This argument is about the two workspace *ids* ONLY, and does not extend to
+        // `executionWorkspacePreference` / `executionWorkspaceSettings`: those carry
+        // workspace intent with no project attached, nothing above resolves a project
+        // from them, and they DO reach the inference with `projectId` null. They get a
+        // real guard — see policy note 4 below. Don't read this paragraph as "no
+        // workspace guard is ever needed here."
+        // BLO-18760: an issue created with none of the inheritance signals
+        // above (no parent, no explicit workspace) is *born* with
+        // projectId: null and, on its first run, falls back onto the
+        // per-agent fallback workspace — a long-lived, shared directory that
+        // can accumulate a real (but unrelated, concurrently-touched) git
+        // checkout from past work, making a local `git clone --shared` from
+        // it a coin-flip to fail with a fatal git error before the agent
+        // ever starts. Give the issue a real managed checkout instead of
+        // leaving it workspace-less, but only when the signal is
+        // unambiguous: exactly one non-archived project the assignee leads.
+        // Anything murkier (no assignee, no lead project, or more than one
+        // candidate) is left alone rather than guessing at which repo the
+        // agent meant.
+        //
+        // Two policy decisions encoded here, both deliberate (Ally review, PR #811):
+        //
+        // 1. `== null` treats an *explicit* `projectId: null` the same as omitting the
+        //    field. This is required, not incidental: the board/UI create path posts an
+        //    explicit null, which is precisely the intake case BLO-18760 exists to fix.
+        //    Honoring explicit null as "definitely no project" would make this a no-op
+        //    for the only caller that matters. A caller that genuinely wants a
+        //    workspace-less issue can still get one by leaving the issue unassigned, or
+        //    by assigning an agent with no (or an ambiguous) lead project.
+        //
+        // 2. `archivedAt` is the ONLY exclusion. A `completed` or `paused` project stays
+        //    a candidate on purpose — what the issue inherits is the project's git
+        //    checkout, and that checkout is just as valid on a finished project as an
+        //    active one. Project status describes the *work*, not the repo. Archived is
+        //    excluded because archival is the one signal that the checkout itself is no
+        //    longer maintained.
+        //
+        // 3. Root creates ONLY. A child whose parent is *intentionally* projectless must
+        //    stay projectless rather than be inferred onto its assignee's led project:
+        //    projectId carries the default goal, the execution-workspace policy, and the
+        //    repository, so inferring here would silently split parent and child across
+        //    all three — a child quietly doing work against a different repo than the
+        //    parent it reports into. Both guards are load-bearing and neither implies the
+        //    other: `workspaceInheritanceIssueId` is null when a caller passes
+        //    `skipExecutionWorkspaceInheritance` even though a parent exists (the
+        //    `inheritStrategyOnly` sub-issue path does exactly this), and it is non-null
+        //    for an explicit `inheritExecutionWorkspaceFromIssueId` with no parent at all.
+        //    Intake — the case BLO-18760 exists to fix — has neither.
+        //
+        // 4. No explicit workspace intent. `executionWorkspacePreference` /
+        //    `executionWorkspaceSettings` carry workspace intent without carrying a
+        //    project, so unlike a workspace *id* (whose `project_id` is NOT NULL, and
+        //    which the two blocks above already resolve a project from) they can reach
+        //    here with `projectId` still null. Inferring under them would not just add a
+        //    project — it would silently pull in that project's default goal, project
+        //    workspace, and repository, and would convert a deliberate error into a
+        //    success: a projectless `isolated_workspace` request is meant to fail
+        //    `assertExplicitPinnedWorktreeIssueRunnable` (WORKSPACE_WORKTREE_REQUIRES_PROJECT),
+        //    and inference would instead quietly bind it to whichever project the
+        //    assignee happens to lead. A caller who names a workspace mode has said
+        //    something about where this runs; honour it and let the validation speak.
+        //    Nullable API payloads are not workspace intent: explicit null workspace
+        //    fields mean "no workspace override" and follow the same inference path as
+        //    omitted fields, matching `projectId: null` above. That null-tolerance is
+        //    scoped to THIS guard — hence `hasExecutionWorkspaceIntent` here versus
+        //    `hasExplicitExecutionWorkspaceOverride` at the two inheritance sites above.
+        //    Do not re-merge them: for inheritance, explicit nulls are a deliberate
+        //    opt-out ("do not adopt the parent's workspace") and must keep suppressing
+        //    it. Collapsing both onto `!= null` regressed exactly that and let a
+        //    liveness escalation adopt its blocker's checkout.
+        //    Intake sends none of these fields, so the fix still fires where it matters.
+        //    Inert when `enableIsolatedWorkspaces` is off, and correctly so: create()
+        //    deletes all three fields in that mode, so the flag is already false — and
+        //    the same setting gates assertExplicitPinnedWorktreeIssueRunnable, so there
+        //    is no rejection left to preserve.
+        if (
+          issueData.projectId == null &&
+          issueData.assigneeAgentId &&
+          issueData.parentId == null &&
+          workspaceInheritanceIssueId == null &&
+          !hasWorkspaceIntent
+        ) {
+          const ledProjects = await tx
+            .select({ id: projects.id })
+            .from(projects)
+            .where(
+              and(
+                eq(projects.companyId, companyId),
+                eq(projects.leadAgentId, issueData.assigneeAgentId),
+                isNull(projects.archivedAt),
+              ),
+            )
+            .limit(2);
+          if (ledProjects.length === 1) {
+            issueData.projectId = ledProjects[0].id;
+          }
         }
         const projectGoalId = await getProjectDefaultGoalId(tx, companyId, issueData.projectId);
         // Cache the project policy lookup for this insert. Both the
@@ -7845,6 +8361,31 @@ export function issueService(db: Db) {
         blockedByIssueIds?: string[];
         actorAgentId?: string | null;
         actorUserId?: string | null;
+        /**
+         * BLO-18797: optimistic-concurrency guard. When set, the row must still
+         * carry this status at write time or the update is rejected with 409.
+         * Callers that authorized a mutation *because of* the row's current
+         * status must pass it — the authorization check reads a snapshot loaded
+         * by the route, and READ COMMITTED lets a concurrent writer (an
+         * assignee checkout, say) land between that read and this write. The
+         * status equality is repeated in the UPDATE's WHERE clause, not just
+         * asserted against `existing`, because only the WHERE is re-evaluated
+         * against the latest row version when the statement blocks on a
+         * concurrent transaction.
+         */
+        expectedCurrentStatus?: string;
+        /**
+         * BLO-18797: the same optimistic-concurrency guard for the assignee.
+         * `allow_manager_chain` is granted *because* the row's assignee is a
+         * report of the actor, so the assignee is an authorization-relevant
+         * snapshot field exactly like the status: a reassignment that lands
+         * between the route's read and this write would leave the actor
+         * clearing an unrelated agent's blockers under a grant that no longer
+         * holds. Pinned in the UPDATE's WHERE clause for the same reason as
+         * the status — only the WHERE is re-evaluated against the latest row
+         * version when the statement blocks on a concurrent transaction.
+         */
+        expectedCurrentAssigneeAgentId?: string | null;
       },
       dbOrTx: any = db,
       // BLO-18643 follow-up: an optional compare-and-swap guard on the write itself.
@@ -7871,8 +8412,28 @@ export function issueService(db: Db) {
         blockedByIssueIds,
         actorAgentId,
         actorUserId,
+        expectedCurrentStatus,
+        expectedCurrentAssigneeAgentId,
         ...issueData
       } = data;
+
+      if (expectedCurrentStatus !== undefined && existing.status !== expectedCurrentStatus) {
+        throw conflict("Issue status changed before the update could be applied", {
+          issueId: id,
+          expectedStatus: expectedCurrentStatus,
+          currentStatus: existing.status,
+        });
+      }
+      if (
+        expectedCurrentAssigneeAgentId !== undefined &&
+        existing.assigneeAgentId !== expectedCurrentAssigneeAgentId
+      ) {
+        throw conflict("Issue assignee changed before the update could be applied", {
+          issueId: id,
+          expectedAssigneeAgentId: expectedCurrentAssigneeAgentId,
+          currentAssigneeAgentId: existing.assigneeAgentId,
+        });
+      }
       const experimental = await instanceSettings.getExperimental();
       const isolatedWorkspacesEnabled = experimental.enableIsolatedWorkspaces;
       if (!isolatedWorkspacesEnabled) {
@@ -7885,20 +8446,41 @@ export function issueService(db: Db) {
         assertTransition(existing.status, issueData.status);
       }
 
+      // Labels the issue will HAVE once this patch lands. Both gates below run
+      // before `runUpdate`'s transaction, and `syncIssueLabels` runs inside it,
+      // so a combined `{ status: "in_review", labelIds: [frontend] }` on an
+      // unlabeled issue would otherwise be judged under the unlabeled fallback
+      // and only then acquire the stricter frontend policy — recording a
+      // pass/warn against a policy the issue no longer has, and letting a
+      // single call sidestep the requirements its new labels demand.
+      // (BLO-19047 review)
+      const effectiveLabelNames =
+        nextLabelIds === undefined
+          ? null
+          : await resolveLabelNames(dbOrTx, existing.companyId, nextLabelIds);
+
       // Done-execution gate (narrated-completion hardening, instance flag
       // `enableDoneExecutionGate`, default off). Blocks an agent self-marking
-      // an issue `done` when no real execution run ever occurred and no
-      // pr-link evidence was recorded — the failure mode where agents post
-      // "## Done" via the board API without shipping code. Never gates human
-      // actors. See server/src/services/done-gate.ts.
+      // an issue `done` when no real execution run ever occurred, no pr-link
+      // evidence was recorded, and no run-attributed durable artifact exists —
+      // the failure mode where agents post "## Done" via the board API without
+      // shipping code. Never gates human actors. See done-gate.ts.
+      //
+      // Both expensive lookups (the evidence refresh and the durable-artifact
+      // query) run ONLY once the cheap checks have already decided to block, so
+      // the ordinary update path is unaffected. `hasDurableArtifactEvidence:
+      // false` in the pre-check is what makes that laziness correct: it can
+      // only cause us to look harder, never to skip a block.
       let doneTransitionEvidenceVerdict: Awaited<ReturnType<typeof runEvidenceGate>> | null = null;
       let doneGateEvidenceVerdict = existing.lastEvidenceVerdict;
+      let doneGateNeedsDurableArtifactCheck = false;
       const doneGateInput = {
         fromStatus: existing.status,
         toStatus: issueData.status,
         existingExecutionRunId: existing.executionRunId,
         lastEvidenceVerdict: doneGateEvidenceVerdict,
         isAgentActor: actorAgentId != null,
+        hasDurableArtifactEvidence: false,
       };
       if (experimental.enableDoneExecutionGate && shouldBlockNarratedDone(doneGateInput)) {
         try {
@@ -7909,6 +8491,7 @@ export function issueService(db: Db) {
               issueData.description !== undefined ? issueData.description : existing.description,
               existing.description,
               now,
+              effectiveLabelNames,
             ),
             id,
           );
@@ -7922,22 +8505,14 @@ export function issueService(db: Db) {
             "done-execution gate: evidence refresh failed; preserving block posture",
           );
         }
-      }
-
-      if (
-        experimental.enableDoneExecutionGate &&
-        shouldBlockNarratedDone({
+        doneGateNeedsDurableArtifactCheck = shouldBlockNarratedDone({
           fromStatus: existing.status,
           toStatus: issueData.status,
           existingExecutionRunId: existing.executionRunId,
           lastEvidenceVerdict: doneGateEvidenceVerdict,
           isAgentActor: actorAgentId != null,
-        })
-      ) {
-        throw unprocessable(
-          "Issue cannot be marked done without execution evidence (no execution run and no pr-link evidence)",
-          { reason: "no_execution_run_and_no_pr_evidence", issueId: id },
-        );
+          hasDurableArtifactEvidence: false,
+        });
       }
 
       const patch: Partial<typeof issues.$inferInsert> = {
@@ -8038,10 +8613,24 @@ export function issueService(db: Db) {
 
       // Evaluation failures remain fail-open, but a computed block verdict
       // rejects every new transition to in_review.
-      if (
-        issueData.status === "in_review" &&
-        existing.status !== "in_review"
-      ) {
+      //
+      // The gate re-evaluates on EVERY patch that carries `status: "in_review"`,
+      // including in_review → in_review. It used to be transition-only, which
+      // silently froze `lastEvidenceVerdict` at its first evaluation: an agent
+      // following the documented remediation loop ("add the missing evidence,
+      // comment again, re-send in_review") got a 200 with an unchanged stale
+      // verdict and no way to tell "gate ran and still fails" from "gate never
+      // ran" — the same silent-no-op class as BLO-18790. (BLO-19047)
+      //
+      // Only a real transition INTO in_review can throw. A re-evaluation on an
+      // already-in_review issue refreshes the recorded verdict but never
+      // rejects the patch, so unrelated edits (labels, description, assignee)
+      // to an in_review issue cannot start failing with a 422.
+      const shouldRunInReviewEvidenceGate =
+        issueData.status === "in_review" ||
+        (nextLabelIds !== undefined && existing.status === "in_review");
+      if (shouldRunInReviewEvidenceGate) {
+        const isInReviewTransition = issueData.status === "in_review" && existing.status !== "in_review";
         let inReviewVerdict: Awaited<ReturnType<typeof runEvidenceGate>> | null = null;
         try {
           const verdict = await runEvidenceGate(
@@ -8051,11 +8640,14 @@ export function issueService(db: Db) {
               issueData.description !== undefined ? issueData.description : existing.description,
               existing.description,
               now,
+              effectiveLabelNames,
             ),
             id,
           );
           inReviewVerdict = verdict;
-          patch.lastEvidenceVerdict = verdict;
+          patch.lastEvidenceVerdict = isInReviewTransition
+            ? verdict
+            : preserveDurableLandingEvidence(verdict, existing.lastEvidenceVerdict);
           patch.lastEvidenceVerdictEvaluatedAt = new Date(verdict.evaluatedAt);
           logger.info(
             {
@@ -8068,8 +8660,11 @@ export function issueService(db: Db) {
               diagnostics: verdict.diagnostics,
               overridden: verdict.overridden,
               overrideReason: verdict.overrideReason,
+              inReviewTransition: isInReviewTransition,
             },
-            `evidence-gate: ${verdict.verdict} on in_review transition`,
+            `evidence-gate: ${verdict.verdict} on ${
+              isInReviewTransition ? "in_review transition" : "in_review re-evaluation"
+            }`,
           );
         } catch (err) {
           logger.warn(
@@ -8081,7 +8676,7 @@ export function issueService(db: Db) {
           );
         }
 
-        if (inReviewVerdict?.verdict === "block") {
+        if (isInReviewTransition && inReviewVerdict?.verdict === "block") {
           throw unprocessable("missing-evidence", {
             code: "missing-evidence",
             missing: inReviewVerdict.missing,
@@ -8132,21 +8727,81 @@ export function issueService(db: Db) {
           projectGoalId: nextProjectGoalId,
           defaultGoalId: defaultCompanyGoal?.id ?? null,
         });
-        const expectedPredicates = [eq(issues.id, id)];
-        if (options?.expectedStatus) {
-          expectedPredicates.push(inArray(issues.status, options.expectedStatus));
+        if (doneGateNeedsDurableArtifactCheck) {
+          let doneGateHasDurableArtifact = false;
+          try {
+            doneGateHasDurableArtifact = await fetchDurableArtifactEvidence(tx, id, existing.companyId);
+          } catch (err) {
+            logger.warn(
+              {
+                issueId: id,
+                err: err instanceof Error ? err.message : String(err),
+              },
+              "done-execution gate: durable-artifact lookup failed; returning retryable error",
+            );
+            throw new HttpError(503, "Done-gate durable artifact evidence lookup failed", {
+              reason: "done_gate_evidence_lookup_failed",
+              issueId: id,
+              retryable: true,
+            });
+          }
+          if (
+            shouldBlockNarratedDone({
+              fromStatus: existing.status,
+              toStatus: issueData.status,
+              existingExecutionRunId: existing.executionRunId,
+              lastEvidenceVerdict: doneGateEvidenceVerdict,
+              isAgentActor: actorAgentId != null,
+              hasDurableArtifactEvidence: doneGateHasDurableArtifact,
+            })
+          ) {
+            throw unprocessable(
+              "Issue cannot be marked done without execution evidence (no execution run, no pr-link evidence, and no run-attributed durable artifact). Attach a PR link, or write the deliverable to an issue document (PUT /api/issues/:id/documents/:key) before closing — a comment body is not sufficient.",
+              { reason: "no_execution_run_and_no_pr_evidence", issueId: id },
+            );
+          }
         }
-        if (options?.expectedUpdatedAt) {
-          expectedPredicates.push(eq(issues.updatedAt, options.expectedUpdatedAt));
-        }
-
+        const routeWritePreconditions = [
+          ...(expectedCurrentStatus === undefined ? [] : [eq(issues.status, expectedCurrentStatus)]),
+          ...(expectedCurrentAssigneeAgentId === undefined
+            ? []
+            : [
+                expectedCurrentAssigneeAgentId === null
+                  ? isNull(issues.assigneeAgentId)
+                  : eq(issues.assigneeAgentId, expectedCurrentAssigneeAgentId),
+              ]),
+        ];
+        const writePreconditions = [
+          ...routeWritePreconditions,
+          ...(options?.expectedStatus === undefined ? [] : [inArray(issues.status, options.expectedStatus)]),
+          ...(options?.expectedUpdatedAt === undefined ? [] : [eq(issues.updatedAt, options.expectedUpdatedAt)]),
+        ];
         const updated = await tx
           .update(issues)
           .set(patch)
-          .where(and(...expectedPredicates))
+          .where(
+            writePreconditions.length === 0
+              ? eq(issues.id, id)
+              : and(eq(issues.id, id), ...writePreconditions),
+          )
           .returning()
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
-        if (!updated) return null;
+        if (!updated) {
+          // With a precondition set, zero matched rows means a concurrent writer
+          // changed an authorization-relevant field after the snapshot check
+          // above — the precondition genuinely failed, so surface 409 rather
+          // than the 404 that a bare `return null` would produce.
+          if (routeWritePreconditions.length > 0) {
+            throw conflict("Issue changed before the update could be applied", {
+              issueId: id,
+              ...(expectedCurrentStatus === undefined ? {} : { expectedStatus: expectedCurrentStatus }),
+              ...(expectedCurrentAssigneeAgentId === undefined
+                ? {}
+                : { expectedAssigneeAgentId: expectedCurrentAssigneeAgentId }),
+            });
+          }
+          return null;
+        }
         if (
           (updated.status === "done" || updated.status === "cancelled") &&
           existing.status !== updated.status
@@ -9257,6 +9912,42 @@ export function issueService(db: Db) {
       });
     },
 
+    getCommentByIdempotencyKey: async (
+      issueId: string,
+      idempotencyKey: string,
+      actor: { agentId?: string | null; userId?: string | null },
+      dbOrTx: any = db,
+    ) => {
+      const comment = await dbOrTx
+        .select()
+        .from(issueComments)
+        .where(and(
+          eq(issueComments.issueId, issueId),
+          eq(issueComments.idempotencyKey, idempotencyKey),
+          issueCommentIdempotencyAuthorScope(actor),
+          isNull(issueComments.deletedAt),
+        ))
+        .then((rows: Array<typeof issueComments.$inferSelect>) => rows[0] ?? null);
+      if (!comment) return null;
+
+      const currentUserRedactionOptions = {
+        enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
+      };
+      return redactIssueComment(comment, currentUserRedactionOptions.enabled);
+    },
+
+    markCommentIdempotencyProcessed: async (commentId: string, dbOrTx: any = db) => {
+      await dbOrTx
+        .update(issueComments)
+        .set({ idempotencyProcessedAt: new Date() })
+        .where(and(
+          eq(issueComments.id, commentId),
+          isNotNull(issueComments.idempotencyKey),
+          isNull(issueComments.idempotencyProcessedAt),
+          isNull(issueComments.deletedAt),
+        ));
+    },
+
     addComment: async (
       issueId: string,
       body: string,
@@ -9265,6 +9956,7 @@ export function issueService(db: Db) {
         authorType?: IssueCommentAuthorType | null;
         presentation?: IssueCommentPresentation | null;
         metadata?: IssueCommentMetadata | null;
+        idempotencyKey?: string | null;
         sourceTrust?: typeof issueComments.$inferInsert.sourceTrust;
         createdAt?: Date | string | null;
       },
@@ -9289,7 +9981,7 @@ export function issueService(db: Db) {
       const presentation = issueCommentPresentationSchema.nullable().parse(options?.presentation ?? null);
       const metadata = issueCommentMetadataSchema.nullable().parse(options?.metadata ?? null);
       const createdAt = options?.createdAt ? new Date(options.createdAt) : null;
-      const [comment] = await dbOrTx
+      const [insertedComment] = await dbOrTx
         .insert(issueComments)
         .values({
           companyId: issue.companyId,
@@ -9298,13 +9990,37 @@ export function issueService(db: Db) {
           authorUserId: actor.userId ?? null,
           authorType,
           createdByRunId: actor.runId ?? null,
+          idempotencyKey: options?.idempotencyKey ?? null,
           body: redactedBody,
           presentation,
           metadata,
           sourceTrust: options?.sourceTrust ?? null,
           ...(createdAt && !Number.isNaN(createdAt.getTime()) ? { createdAt } : {}),
         })
+        .onConflictDoNothing()
         .returning();
+
+      const comment = insertedComment ?? (options?.idempotencyKey
+        ? await dbOrTx
+            .select()
+            .from(issueComments)
+            .where(and(
+              eq(issueComments.issueId, issueId),
+              eq(issueComments.idempotencyKey, options.idempotencyKey),
+              issueCommentIdempotencyAuthorScope(actor),
+              isNull(issueComments.deletedAt),
+            ))
+            .then((rows: Array<typeof issueComments.$inferSelect>) => rows[0] ?? null)
+        : null);
+
+      if (!comment) throw conflict("Issue comment idempotency conflict");
+
+      if (!insertedComment) {
+        return {
+          ...redactIssueComment(comment, currentUserRedactionOptions.enabled),
+          deduplicated: true as const,
+        };
+      }
 
       // Update issue's updatedAt so comment activity is reflected in recency sorting
       await dbOrTx

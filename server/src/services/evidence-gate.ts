@@ -197,11 +197,16 @@ function detectChecklistDoneWhen(
 ): boolean {
   if (!issueDescription) {
     // No description = no acceptance criteria to map against. The shape is
-    // undetectable, not satisfied — `evaluateEvidence` drops it from the
-    // required set when inapplicable, so returning false here cannot block;
-    // it just keeps `evidenceFound` honest. (Previously this returned a
-    // vacuous `true`, which let unlabeled issues with no criteria reach a
-    // `pass` verdict with zero artifacts.)
+    // undetectable, and it stays REQUIRED: an issue with no criteria at all
+    // should not reach in_review, so this reports `missing` and (unlabeled)
+    // `warn` / (labeled) `block`. (Previously this returned a vacuous `true`,
+    // which let unlabeled issues with no criteria reach a `pass` verdict with
+    // zero artifacts.)
+    //
+    // NB: this comment used to claim `evaluateEvidence` drops the shape from
+    // the required set when inapplicable. It does not, and never did — it only
+    // adds a diagnostic. The false claim cost a debugging cycle in BLO-19047;
+    // the remedy is to fix the description, not to weaken the requirement.
     return false;
   }
   const doneWhenBullets = countDoneWhenBullets(issueDescription);
@@ -229,15 +234,187 @@ function detectChecklistDoneWhen(
   return taggedRowCount >= doneWhenBullets;
 }
 
+/**
+ * Headings that introduce a per-criterion acceptance list. `Done when` was
+ * the only recognized spelling until BLO-19047, which made the shape
+ * unsatisfiable for every issue written to the company issue-creation policy
+ * (that policy mandates `## Acceptance criteria`).
+ *
+ * Matched case-insensitively at any heading depth including `#`. The trailing
+ * `\b` keeps a prose line that merely starts with the same words from matching,
+ * and `[ \t]*` (rather than `\s*`) keeps the gap from spanning a newline.
+ */
+const DONE_WHEN_HEADING_SOURCE =
+  "^(#{1,6})[ \\t]*(?:Done when|Acceptance criteria|Success criteria|Exit criteria)\\b";
+
+/** Any line terminator JS regex `^`/`$` recognize, including a bare CR. */
+const LINE_BREAK_RE = /\r?\n|\r/;
+
+/**
+ * A candidate fence line: at most three leading spaces (four or more is an
+ * indented code block, not a fence), the run of fence characters, then the
+ * remainder of the line. Group 1 is the run, group 2 the remainder.
+ */
+const FENCE_LINE_RE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
+
+/**
+ * True when a candidate line opens a fence.
+ *
+ * The remainder is the info string. CommonMark forbids a backtick inside a
+ * backtick fence's info string, which is what keeps an inline code span such
+ * as ```` ```code``` is inline ```` from being read as an opener.
+ */
+function isOpeningFence(match: RegExpExecArray): boolean {
+  return !(match[1][0] === "`" && match[2].includes("`"));
+}
+
+/**
+ * True when a candidate line closes the currently-open fence.
+ *
+ * A closer must use the same fence character, be at least as long as the
+ * opener, and carry NOTHING but trailing whitespace. Accepting a closer with
+ * trailing text (the pre-BLO-19047 behaviour, which reused the opener pattern
+ * for both roles) ended the block early, so the rest of a pasted template —
+ * headings and placeholder bullets included — leaked out of the fence and fed
+ * the criteria count.
+ */
+function isClosingFence(match: RegExpExecArray | null, fence: string): boolean {
+  if (!match) return false;
+  return (
+    match[1][0] === fence[0] &&
+    match[1].length >= fence.length &&
+    match[2].trim() === ""
+  );
+}
+
+/**
+ * Blank out fenced-code-block CONTENT, preserving line structure.
+ *
+ * Without this, a heading inside a pasted template or example fence counts as
+ * the issue's own criteria section. That is not hypothetical: the company
+ * issue-creation policy ships a fenced `## Acceptance criteria` template, so a
+ * description that quotes the template would have its criteria count taken from
+ * the template's placeholder bullets. (BLO-19047)
+ *
+ * An unterminated fence runs to the end of the document, per CommonMark.
+ */
+function stripFencedCodeBlocks(markdown: string): string {
+  let fence: string | null = null;
+  return markdown
+    .split(LINE_BREAK_RE)
+    .map((line) => {
+      const match = FENCE_LINE_RE.exec(line);
+      if (fence !== null) {
+        if (isClosingFence(match, fence)) fence = null;
+        // Blank the closer too: it is part of the block, not content.
+        return "";
+      }
+      if (match && isOpeningFence(match)) {
+        fence = match[1];
+        return "";
+      }
+      return line;
+    })
+    .join("\n");
+}
+
+/** A recognized criteria section and the span it occupies in the scrubbed text. */
+type CriteriaSection = { start: number; end: number; body: string };
+
+/**
+ * Every recognized criteria section, in document order.
+ *
+ * A section runs to the next heading of the SAME depth or shallower, so
+ * `### Functional` sub-groups under `## Acceptance criteria` stay inside the
+ * section instead of truncating it.
+ */
+function doneWhenSections(description: string): CriteriaSection[] {
+  const scrubbed = stripFencedCodeBlocks(description);
+  const headingRe = new RegExp(DONE_WHEN_HEADING_SOURCE, "gim");
+  const sections: CriteriaSection[] = [];
+  let match: RegExpExecArray | null;
+  while ((match = headingRe.exec(scrubbed)) !== null) {
+    const depth = match[1].length;
+    const rest = scrubbed.slice(match.index);
+    const headingLineEnd = rest.search(LINE_BREAK_RE);
+    // A heading on the final line with nothing after it has an empty body.
+    const bodyStart =
+      headingLineEnd === -1 ? scrubbed.length : match.index + headingLineEnd + 1;
+    const nextSiblingHeading = scrubbed
+      .slice(bodyStart)
+      .search(new RegExp(`^#{1,${depth}}[ \\t]`, "m"));
+    const bodyEnd =
+      nextSiblingHeading === -1 ? scrubbed.length : bodyStart + nextSiblingHeading;
+    sections.push({ start: match.index, end: bodyEnd, body: scrubbed.slice(bodyStart, bodyEnd) });
+    // Zero-length matches are impossible here (the pattern requires a `#`), but
+    // guard anyway so a future edit cannot spin this loop forever.
+    if (headingRe.lastIndex <= match.index) headingRe.lastIndex = match.index + 1;
+  }
+  return sections;
+}
+
+/**
+ * Recognized sections that are not nested inside another recognized section.
+ *
+ * A deeper synonym heading under a shallower one (`### Success criteria` inside
+ * `## Acceptance criteria`) describes the SAME criteria the outer section
+ * already contains, so counting both would double it.
+ */
+function outermostDoneWhenSections(description: string): CriteriaSection[] {
+  const sections = doneWhenSections(description);
+  return sections.filter(
+    (section, index) =>
+      !sections.some(
+        (other, otherIndex) =>
+          otherIndex !== index && other.start < section.start && section.end <= other.end,
+      ),
+  );
+}
+
+/** True when the description carries a criteria heading the gate recognizes. */
+export function hasDoneWhenHeading(description: string): boolean {
+  return doneWhenSections(description).length > 0;
+}
+
+function doneWhenBulletKeys(body: string): string[] {
+  return Array.from(
+    body.matchAll(/^[-*]\s+(.*)$/gm),
+    (match, index) => {
+      const normalized = (match[1] ?? "").trim().replace(/\s+/g, " ").toLowerCase();
+      return normalized ? `text:${normalized}` : `empty:${index}`;
+    },
+  );
+}
+
 export function countDoneWhenBullets(description: string): number {
-  const doneWhenIdx = description.search(/^##+\s*Done when\b/im);
-  if (doneWhenIdx === -1) return 0;
-  const rest = description.slice(doneWhenIdx);
-  // Stop at next heading.
-  const nextHeading = rest.slice(2).search(/^##+\s/m);
-  const section = nextHeading === -1 ? rest : rest.slice(0, nextHeading + 2);
-  const bullets = section.match(/^[-*]\s+/gm);
-  return bullets ? bullets.length : 0;
+  // SUM every top-level recognized section rather than taking the first one
+  // that has bullets. Taking the first non-empty section under-counted a
+  // description carrying more than one real criteria list, and the count was
+  // not monotonic: prepending `## Acceptance criteria\n- placeholder` to an
+  // existing multi-item `## Done when` dropped the required evidence-row count
+  // to one without tripping the `doneWhenBulletsRemoved` tamper signal, so the
+  // checklist passed while most criteria stayed unverified. Summing cannot
+  // decrease when another non-empty synonym section is added. (BLO-19047)
+  //
+  // A section with no bullets contributes 0, which is what keeps a pointer
+  // section ("## Acceptance criteria / See the Done when list below.") from
+  // shadowing the real list — the original reason for the first-non-empty rule.
+  //
+  // Sibling synonym sections can repeat the same checklist under another name
+  // (`## Acceptance criteria` followed by `## Success criteria`). Count each
+  // normalized bullet text once so the synonym does not inflate the required
+  // evidence-row count, while still counting genuinely distinct criteria across
+  // multiple sections.
+  let total = 0;
+  const seen = new Set<string>();
+  for (const { body } of outermostDoneWhenSections(description)) {
+    for (const key of doneWhenBulletKeys(body)) {
+      if (seen.has(key)) continue;
+      seen.add(key);
+      total += 1;
+    }
+  }
+  return total;
 }
 
 function detectTestOutput(text: string): boolean {
@@ -446,6 +623,15 @@ export function evaluateEvidence(
     !!input.issue.description && countDoneWhenBullets(input.issue.description) > 0;
   if (!doneWhenApplicable && required.includes("checklist:done-when")) {
     diagnostics.push(input.issue.description ? "missing-done-when-bullets" : "missing-description");
+    // Name the remedy, but only when it is actually the remedy. `missing:
+    // ["checklist:done-when"]` on its own reads as "attach more evidence", and
+    // no comment can ever satisfy this shape — the fix is in the DESCRIPTION.
+    // Emit this ONLY when no recognized heading exists, so we never tell an
+    // agent to rename a heading that is already correct but whose bullets the
+    // counter didn't find. (BLO-19047)
+    if (input.issue.description && !hasDoneWhenHeading(input.issue.description)) {
+      diagnostics.push("no-done-when-heading");
+    }
   }
   const requiredDoneWhenBulletsRemoved =
     input.doneWhenBulletsRemoved && required.includes("checklist:done-when");

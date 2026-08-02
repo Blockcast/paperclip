@@ -80,7 +80,7 @@ import {
 } from "@paperclipai/db";
 import { conflict, HttpError, notFound } from "../errors.js";
 import { logger } from "../middleware/logger.js";
-import { runWithTransientDbRetry } from "../lib/db-retry.js";
+import { describeDbError, isDbError, runWithTransientDbRetry } from "../lib/db-retry.js";
 import { publishLiveEvent } from "./live-events.js";
 import { normalizeResponsibleUserDenialCode } from "./responsible-user-denial-run-outcomes.js";
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
@@ -88,6 +88,7 @@ import {
   deleteAgentJobExact,
   deleteAgentJobsForRun,
   deleteAgentPodExact,
+  captureAgentJobFailureDiagnostics,
   hasActiveJobForAgent,
   indexUniqueAgentJobRunStatuses,
   listAgentJobRunStatuses,
@@ -168,6 +169,8 @@ import {
 } from "./issue-rewake-throttle.js";
 import { logActivity, publishPluginDomainEvent, type LogActivityInput } from "./activity-log.js";
 import { githubHasReviewerEvidenceForPr } from "./github-app-auth.js";
+import { loadConfig } from "../config.js";
+import { enqueueGithubCommitStatusDelivery } from "./github-status-delivery-outbox.js";
 import {
   ensureReferencedSharedDocsMaterialized,
   normalizeInstructionsEntryFile,
@@ -206,6 +209,7 @@ import {
   isVerifiedIssueTreeControlInteractionWake,
   issueTreeControlService,
 } from "./issue-tree-control.js";
+import { RUN_STALE_SILENCE_MS } from "./issue-run-holding.js";
 import {
   continuationSummaryParksExecutor,
   getIssueContinuationSummaryDocument,
@@ -249,6 +253,11 @@ import {
   recordOrphanedManagedPodReaped,
   recordProcessLost,
   recordProcessLostLivenessNull,
+  recordGithubReviewRequestDelivery,
+  recordGithubReviewRequestSuppressed,
+  GITHUB_SUPPRESSION_CAUSE_DISPATCH_REJECTED,
+  GITHUB_SUPPRESSION_CAUSE_SCHEDULED_RETRY_GATE,
+  setGithubReviewRequestDeadLetterUnresolved,
   setExternalLifecycleRunningRuns,
 } from "./metrics.js";
 import { runQuotaExhaustedHook } from "./quota-exhausted-hook.js";
@@ -398,7 +407,7 @@ const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 50;
  * misconfigured `maxConcurrentRuns` cannot alone blow past what the cluster
  * is provisioned to run for one agent concurrently.
  */
-const EXTERNAL_LIFECYCLE_SLOT_CAPACITY = 5;
+const EXTERNAL_LIFECYCLE_SLOT_CAPACITY = 8;
 const STALE_QUEUED_MAINTENANCE_WAKE_MAX_AGE_MS = 30 * 60 * 1000;
 const STALE_QUEUED_MAINTENANCE_WAKE_BATCH_SIZE = 250;
 const STALE_QUEUED_MAINTENANCE_WAKE_REASONS = [
@@ -418,6 +427,7 @@ const PAPERCLIP_HARNESS_CHECKOUT_KEY = "paperclipHarnessCheckedOut";
 const DETACHED_PROCESS_ERROR_CODE = "process_detached";
 const REPO_ONLY_CWD_SENTINEL = "/__paperclip_repo_only__";
 const MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS = 10 * 60 * 1000;
+const STRICT_GIT_CHECKOUT_PROBE_TIMEOUT_DEFAULT_MS = 5_000;
 const MAX_INLINE_WAKE_COMMENTS = 8;
 const MAX_INLINE_WAKE_COMMENT_BODY_CHARS = 4_000;
 const MAX_INLINE_WAKE_COMMENT_BODY_TOTAL_CHARS = 12_000;
@@ -481,11 +491,52 @@ const RATE_LIMIT_HEARTBEAT_RETRY_MAX_ATTEMPTS = 12;
 // poll interval lets the sweep re-check capacity soon. PEN-382.
 export const CCROTATE_CAPACITY_DEFAULT_RETRY_DELAY_MS = 5 * 60 * 1000;
 export const CCROTATE_CAPACITY_RETRY_REASON = "ccrotate_capacity";
+
+/**
+ * Context-snapshot key holding how many GitHub review-request *deliveries* a
+ * single `scheduled_retry` run will settle (BLO-18859 review follow-up).
+ *
+ * A capacity deferral counts `deferred` once per delivery, but same-task-key
+ * deliveries coalesce onto one run — so without this tally the promoter's
+ * single `queued` would leave N-1 deliveries permanently stranded between
+ * `received` and `queued`, which is exactly the shape real loss has.
+ */
+export const GITHUB_REVIEW_DELIVERY_COUNT_KEY = "githubReviewDeliveryCount";
+
+/**
+ * Upper bound applied when replaying {@link GITHUB_REVIEW_DELIVERY_COUNT_KEY}
+ * into counter increments. The value is derived from committed rows, so a
+ * corrupt or hand-edited snapshot must not be able to spin the promoter.
+ */
+const GITHUB_REVIEW_DELIVERY_COUNT_MAX = 1000;
+
+/**
+ * Read a coalesced-delivery tally off a run snapshot, clamped to
+ * `[1, GITHUB_REVIEW_DELIVERY_COUNT_MAX]`. Absent/garbage means "one delivery",
+ * which is what every run written before this key existed represents.
+ */
+export function readGithubReviewDeliveryCount(snapshot: Record<string, unknown>): number {
+  const raw = snapshot[GITHUB_REVIEW_DELIVERY_COUNT_KEY];
+  const parsed = typeof raw === "number" ? raw : Number.parseInt(String(raw ?? ""), 10);
+  if (!Number.isFinite(parsed) || parsed < 1) return 1;
+  return Math.min(Math.floor(parsed), GITHUB_REVIEW_DELIVERY_COUNT_MAX);
+}
+
 function readIntegerEnv(name: string, fallback: number): number {
   const raw = process.env[name];
   if (raw == null || raw.trim() === "") return fallback;
   const parsed = Number.parseInt(raw, 10);
   return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function strictGitCheckoutProbeTimeoutMs(): number {
+  return Math.max(
+    100,
+    readIntegerEnv(
+      "PAPERCLIP_STRICT_GIT_CHECKOUT_PROBE_TIMEOUT_MS",
+      STRICT_GIT_CHECKOUT_PROBE_TIMEOUT_DEFAULT_MS,
+    ),
+  );
 }
 
 const K8S_CCROTATE_IN_RUN_RETRY_MAX_ATTEMPTS = Math.max(
@@ -553,6 +604,17 @@ const GIT_SENSITIVE_LOCAL_ADAPTER_TYPES = new Set([
   "opencode_local",
   "pi_local",
 ]);
+// BLO-18147: claude_k8s pods bootstrap their own git workspace in-pod by
+// locally `git clone --shared`-ing from the adapter's resolved cwd (confirmed
+// live from a running pod's entrypoint). When no project or session
+// workspace is available, that cwd falls back to the shared, actively-
+// mutated per-agent AGENT_HOME directory on the same storage-sensitive
+// cephfs PVC implicated in BLO-17793; a clone failure there surfaces as
+// git's raw exit 128 and kills the container before `claude` even starts,
+// burning Job backoff budget instead of a recoverable error. Scoped to
+// claude_k8s only — opencode_k8s pods were observed healthy through the same
+// incident window (BLO-18145) and are not known to share this bootstrap path.
+const K8S_GIT_SENSITIVE_ADAPTER_TYPES = new Set(["claude_k8s"]);
 export const MAX_TURN_CONTINUATION_RETRY_REASON = "max_turns_continuation";
 export const MAX_TURN_CONTINUATION_WAKE_REASON = "max_turns_continuation_retry";
 const MAX_TURN_CONTINUATION_DEFAULT_MAX_ATTEMPTS = 2;
@@ -618,6 +680,11 @@ function readHeartbeatRunErrorFamily(
     return "provider_quota";
   }
   if (run.errorCode === "codex_transient_upstream" || run.errorCode === "claude_transient_upstream") {
+    return "transient_upstream";
+  }
+  // BLO-18285: the server-side classification of a hint-less provider 503/529
+  // on the k8s adapters, which never run the local adapters' transient parser.
+  if (run.errorCode === "provider_transient_upstream") {
     return "transient_upstream";
   }
   if (run.errorCode === "k8s_concurrent_run_blocked") {
@@ -707,7 +774,10 @@ export function shouldScheduleAutomaticRunRetry(
   // instead of the platform just trying again. Bounded-retry it like the other
   // pr_review-scoped recoverable failures above so a transient posting glitch
   // self-heals instead of silently stranding the exact-head gate.
-  if (run.errorCode === "pr_review_output_missing") {
+  if (
+    run.errorCode === "pr_review_output_missing" ||
+    run.errorCode === "pr_review_verification_unavailable"
+  ) {
     return isPrReviewRetryContext(parseObject(run.contextSnapshot));
   }
 
@@ -849,10 +919,20 @@ function isSpawnLikeFailureMessage(value: unknown) {
   return /failed to start command|spawn\b|\bENOENT\b/i.test(value);
 }
 
-function isRetryableInteractionContinuationInfrastructureFailure(
+export function isRetryableInteractionContinuationInfrastructureFailure(
   run: Pick<typeof heartbeatRuns.$inferSelect, "error" | "errorCode" | "resultJson">,
 ) {
-  if (run.errorCode === WORKSPACE_VALIDATION_FAILURE_CODE || run.errorCode === "process_lost") {
+  if (run.errorCode === WORKSPACE_VALIDATION_FAILURE_CODE) {
+    const workspaceValidation = parseObject(parseObject(run.resultJson).workspaceValidation);
+    if (
+      readNonEmptyString(workspaceValidation.reason) ===
+      "k8s_agent_home_git_bootstrap_unsupported"
+    ) {
+      return false;
+    }
+    return true;
+  }
+  if (run.errorCode === "process_lost") {
     return true;
   }
 
@@ -926,7 +1006,10 @@ const EXTERNAL_LIFECYCLE_ADAPTERS = new Set([
 // Jobs immediately; this threshold only applies when that probe returns
 // null. Kept generous so a slow probe + a healthy long-running Claude
 // session don't collide.
-const EXTERNAL_LIFECYCLE_STALE_MS = 15 * 60 * 1000;
+// Shared with issue-run-holding.ts for one named 15-minute slot-accounting
+// threshold. Issue/worktree ownership stays more conservative: a running row
+// holds its issue until it reaches a terminal/missing lifecycle state.
+const EXTERNAL_LIFECYCLE_STALE_MS = RUN_STALE_SILENCE_MS;
 // External-lifecycle adapters create a DB run before the adapter.invoke event
 // is appended. Startup and periodic reapers can overlap that setup window;
 // give slow pre-run hooks and kube Job creation time to reach adapter.invoke.
@@ -942,8 +1025,8 @@ const EXTERNAL_LIFECYCLE_PRE_ADAPTER_STALE_MS = 5 * 60 * 1000;
 // every tick. Aging closes this in two bounded steps: after
 // STARVATION_STATUS_BOOST_MS waited, forgive the todo/in_progress status
 // penalty (lets it tie same-priority in_progress work); after
-// STARVATION_FULL_ESCALATION_MS, force top-of-queue so it cannot be starved
-// indefinitely regardless of what else is queued.
+// STARVATION_FULL_ESCALATION_MS, promote it ahead of routine work while
+// preserving ranks 0-1 for explicit critical issues.
 const STARVATION_STATUS_BOOST_MS = 30 * 60 * 1000;
 const STARVATION_FULL_ESCALATION_MS = 2 * 60 * 60 * 1000;
 // BLO-16253 follow-up: a recovery/wake_owner run (contextSnapshot.recoveryActionId
@@ -1921,6 +2004,45 @@ async function isGitCheckout(cwd: string | null | undefined) {
     .catch(() => false);
 }
 
+async function pathIsAbsent(cwd: string): Promise<boolean> {
+  try {
+    await fs.lstat(cwd);
+    return false;
+  } catch (error: unknown) {
+    return (error as NodeJS.ErrnoException)?.code === "ENOENT";
+  }
+}
+
+// Unlike isGitCheckout(), this does not fail open: a probe error that isn't
+// positively identifiable as "cwd is not a git checkout" (missing directory,
+// or git's own "not a git repository" fatal) is treated as "could be a
+// checkout". That covers the storage-layer failures (permission denied,
+// stale handle, I/O error, timeout) BLO-18147 exists to guard against —
+// those must reject dispatch, not silently wave it through because the probe
+// itself couldn't complete. Uses try/await rather than .then/.catch because
+// execFile can throw synchronously (e.g. ENOTDIR when cwd is not a
+// directory) before returning a promise to chain onto.
+async function probeGitCheckoutStateStrict(
+  cwd: string,
+): Promise<"checkout" | "not_a_checkout" | "indeterminate"> {
+  try {
+    const result = await execFile("git", ["rev-parse", "--show-toplevel"], {
+      cwd,
+      timeout: strictGitCheckoutProbeTimeoutMs(),
+    });
+    return readNonEmptyString(result.stdout) ? "checkout" : "indeterminate";
+  } catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
+      return await pathIsAbsent(cwd) ? "not_a_checkout" : "indeterminate";
+    }
+    const stderr = typeof (error as { stderr?: unknown })?.stderr === "string"
+      ? (error as { stderr: string }).stderr
+      : "";
+    if (/not a git repository/i.test(stderr)) return "not_a_checkout";
+    return "indeterminate";
+  }
+}
+
 function sameResolvedPath(left: string | null | undefined, right: string | null | undefined) {
   const leftPath = readNonEmptyString(left);
   const rightPath = readNonEmptyString(right);
@@ -2053,9 +2175,49 @@ export async function assertGitSensitiveAdapterWorkspaceValid(input: {
   executionWorkspace: RealizedExecutionWorkspace;
   persistedExecutionWorkspace: ExecutionWorkspace | null;
   executionTarget: unknown;
+  k8sRunIsolation?: { isolationMode: "shared" | "run" | "workspace" } | null;
   environmentDriver?: string | null;
   leaseMetadata?: unknown;
 }) {
+  const k8sIssue = input.issue;
+  const effectiveCwd = readNonEmptyString(input.executionWorkspace.cwd);
+  const agentFallbackCwd = resolveDefaultAgentWorkspaceDir(input.agentId);
+  // claude_k8s only clones the source checkout for per-run isolation. Key the
+  // invariant on that effective source path, not the resolver label: a missing
+  // project cwd can retain source="project_primary" while falling back here.
+  if (
+    K8S_GIT_SENSITIVE_ADAPTER_TYPES.has(input.adapterType) &&
+    k8sIssue &&
+    input.k8sRunIsolation?.isolationMode === "run" &&
+    !input.resolvedWorkspace.realizationFailure &&
+    effectiveCwd !== null &&
+    path.resolve(effectiveCwd) === path.resolve(agentFallbackCwd)
+  ) {
+    // Deliberately not isGitCheckout(): that helper fails open (any probe
+    // error -> false), which would wave a storage-layer probe failure
+    // straight through to dispatch and reproduce the exact exit-128 this
+    // guard exists to prevent. Reject dispatch unless the probe positively
+    // confirms the fallback cwd is NOT a git checkout.
+    const gitProbeState = await probeGitCheckoutStateStrict(effectiveCwd);
+    if (gitProbeState !== "not_a_checkout") {
+      throw new WorkspaceValidationFailure(
+        `Issue ${k8sIssue.identifier ?? k8sIssue.id} has no usable project or session execution workspace. Refusing to dispatch ${input.adapterType} run isolation from the shared agent-home fallback cwd "${effectiveCwd}" because its in-pod git bootstrap clones locally from this checkout and can exit 128 under storage pressure. Bind a project or execution workspace to this issue before retrying.`,
+        {
+          workspaceValidation: {
+            reason: "k8s_agent_home_git_bootstrap_unsupported",
+            adapterType: input.adapterType,
+            issueId: k8sIssue?.id ?? null,
+            issueIdentifier: k8sIssue?.identifier ?? null,
+            resolvedWorkspaceSource: input.resolvedWorkspace.source,
+            resolvedWorkspaceCwd: effectiveCwd,
+            isolationMode: input.k8sRunIsolation.isolationMode,
+            gitProbeState,
+          },
+        },
+      );
+    }
+  }
+
   if (!GIT_SENSITIVE_LOCAL_ADAPTER_TYPES.has(input.adapterType)) return;
 
   const executionTargetKind = readNonEmptyString((input.executionTarget as { kind?: unknown } | null)?.kind) ?? "local";
@@ -2073,9 +2235,7 @@ export async function assertGitSensitiveAdapterWorkspaceValid(input: {
     readNonEmptyString(leaseMetadata.remoteCwd) ??
     readNonEmptyString(leaseProviderMetadata.remoteCwd);
 
-  const effectiveCwd = readNonEmptyString(input.executionWorkspace.cwd);
   const persistedCwd = readNonEmptyString(input.persistedExecutionWorkspace?.cwd);
-  const agentFallbackCwd = resolveDefaultAgentWorkspaceDir(input.agentId);
   const workspaceExpectation =
     Boolean(issue.projectWorkspaceId) ||
     Boolean(resolvedWorkspace.workspaceId) ||
@@ -2962,6 +3122,149 @@ function looksLikeRetryableDeadlineExceeded(value: unknown): boolean {
   return typeof value === "string" && /(?:deadline[_\s-]*exceeded|upstream request timeout|gateway timeout|504\b)/i.test(value);
 }
 
+// BLO-18285: a transient provider fault that carries NO reset hint — gateway
+// 503 / "Service temporarily unavailable" / `server_error` / 529 overloaded.
+// There is no retry-after or capacity-reset horizon to honor, so the fix is
+// the retry horizon itself: the in-process SDK burns all 10 attempts in ~4
+// minutes, which is far short of a real gateway brownout (tens of minutes to
+// hours). Untagged, such a run finalizes as a plain `adapter_failed` with a
+// null errorFamily, so readTransientRecoveryContractFromRun returns null,
+// shouldScheduleAutomaticRunRetry returns false, no `scheduled_retry` row is
+// written, `hasActiveExecutionPath` finds nothing on the next sweep, and the
+// issue is escalated to `stranded_assigned_issue` and flipped to `blocked`.
+// (Live proof: BLO-18138 run 05d8c03e — 10/10 retries, error_status 503,
+// error "server_error", no hint, permanent strand.)
+//
+// The local adapters already classify this shape (claude-local's
+// CLAUDE_TRANSIENT_UPSTREAM_RE, codex-local's CODEX_TRANSIENT_UPSTREAM_RE),
+// but the k8s adapters do not run that parser server-side, so on claude_k8s /
+// opencode_k8s the fault reaches heartbeat finalization untagged. Recognizing
+// it here tags it `transient_upstream`, which routes it into the bounded
+// exponential curve (2m/10m/30m/2h ≈ 2h42m) and parks the issue in an explicit
+// `scheduled_retry` waiting posture that the strand sweep skips.
+//
+// Deliberately narrower than the adapter regexes: rate-limit / 429 / quota text
+// is excluded because isRateLimitExhausted already owns that family, and its
+// flat 90s curve is the correct schedule there (the ccrotate gate, not backoff,
+// decides when a closed account window reopens). Only no-hint server-fault
+// shapes land here.
+const TRANSIENT_UPSTREAM_STATUS_CODES = new Set(["503", "529"]);
+const TRANSIENT_UPSTREAM_TEXT_KEYS = ["result", "message", "error", "summary"] as const;
+const TRANSIENT_UPSTREAM_TEXT_PATTERNS = [
+  /API Error:\s*(?:503|529)\b/i,
+  /service\s+(?:is\s+)?(?:temporarily\s+)?unavailable/i,
+  /temporarily\s+unavailable/i,
+  /server\s+overloaded/i,
+  /overloaded_error/i,
+  /\bserver_error\b/i,
+];
+
+// BLO-19879: the penstock gateway answers `400 {"code":"allocation_missing"}`
+// when it routes a request to a BYOS vault node that does not serve the
+// requested provider. Despite the 4xx status this is a *gateway-side routing*
+// fault, not a malformed request: the same payload succeeds as soon as a
+// provider-capable node is back in the active set. On 2026-07-31, while the
+// only anthropic-capable node (`blockcast-omar`, replicas: 1) was unavailable
+// 16:50–17:20Z, provider-blind failover sent anthropic traffic to
+// `blockcast-sfo12` (PENSTOCK_VAULT_PROVIDERS=openai,codex) and stranded 80
+// runs as terminal `adapter_failed` — 70.5% of all failed runs in the burst.
+//
+// This MUST be tested before the authoritative-status short-circuit in
+// isHintlessTransientUpstreamFault: these runs carry api_error_status=400, so
+// a TRANSIENT_UPSTREAM_TEXT_PATTERNS entry alone would never be reached and
+// would be a silent no-op.
+//
+// Matched on the machine-readable `code`, not the prose, so a reworded gateway
+// message cannot silently drop it back to terminal. Scoped to this one code
+// rather than 400s generally — a genuine bad request must still fail fast
+// instead of burning the full 2m/10m/30m/2h retry curve.
+const GATEWAY_ALLOCATION_FAULT_PATTERN = /^\s*(?:API Error:\s*400\b[^{]*)?\{[\s\S]*"code"\s*:\s*"allocation_missing"/i;
+const GATEWAY_ALLOCATION_FAULT_TEXT_KEYS = ["result", "error"] as const;
+
+function looksLikeGatewayAllocationFault(value: unknown): boolean {
+  if (typeof value !== "string") return false;
+  return GATEWAY_ALLOCATION_FAULT_PATTERN.test(value);
+}
+
+function looksLikeTransientUpstreamText(value: unknown): boolean {
+  if (typeof value !== "string") return false;
+  return TRANSIENT_UPSTREAM_TEXT_PATTERNS.some((re) => re.test(value));
+}
+
+function normalizeHttpStatusCode(value: unknown): string | null {
+  const parsed =
+    typeof value === "number"
+      ? value
+      : typeof value === "string" && value.trim().length > 0
+        ? Number(value.trim())
+        : NaN;
+  if (!Number.isInteger(parsed) || parsed < 100 || parsed > 599) return null;
+  return String(parsed);
+}
+
+function allocationFaultStatusGate(resultJson: Record<string, unknown> | null | undefined): "allow" | "deny" {
+  if (!resultJson) return "allow";
+  let hasAuthoritativeStatus = false;
+  for (const key of ["api_error_status", "error_status"] as const) {
+    const status = normalizeHttpStatusCode(resultJson[key]);
+    if (status == null) continue;
+    if (status === "400") return "allow";
+    hasAuthoritativeStatus = true;
+  }
+  return hasAuthoritativeStatus ? "deny" : "allow";
+}
+
+export function isHintlessTransientUpstreamFault(
+  resultJson: Record<string, unknown> | null | undefined,
+  opts?: { errorMessage?: string | null },
+): boolean {
+  // BLO-19879: checked first, above the authoritative-status short-circuit
+  // below, because the gateway allocation fault carries a 400 and would
+  // otherwise be rejected before any text matching runs. Still require an
+  // actual 400 when resultJson carries an authoritative status, and match only
+  // gateway-shaped payload text so agent-authored prose that merely quotes the
+  // literal cannot turn terminal 401/403/etc. failures into scheduled retries.
+  //
+  // BLO-20343: the status gate covers `errorMessage` too, not just the
+  // resultJson keys, so the same bytes classify the same way whichever field
+  // carries them. Reaching the difference needs contradictory adapter state (an
+  // errorMessage opening with a 400 gateway payload while resultJson reports an
+  // authoritative non-400), which has no known producer — `api_error_status` is
+  // only ever read here, straight off the SDK's final result event. Resolved
+  // toward `deny` because every status that reaches it is one the retry curve
+  // cannot help: 401/403 will not self-heal, 500 is deliberately terminal, and
+  // 429 belongs to the rate-limit family's flat curve.
+  if (allocationFaultStatusGate(resultJson) === "allow") {
+    if (resultJson) {
+      for (const key of GATEWAY_ALLOCATION_FAULT_TEXT_KEYS) {
+        if (looksLikeGatewayAllocationFault(resultJson[key])) return true;
+      }
+    }
+    if (looksLikeGatewayAllocationFault(opts?.errorMessage)) return true;
+  }
+
+  // Two status surfaces: the Claude SDK's final result event uses
+  // `api_error_status`, while the per-attempt `api_retry` events that precede
+  // an exhausted retry budget use `error_status` — the latter is the field the
+  // BLO-18138 run actually carried, so matching only the former misses it.
+  let hasAuthoritativeStatus = false;
+  for (const key of ["api_error_status", "error_status"] as const) {
+    const status = normalizeHttpStatusCode(resultJson?.[key]);
+    if (status == null) continue;
+    if (TRANSIENT_UPSTREAM_STATUS_CODES.has(status)) return true;
+    hasAuthoritativeStatus = true;
+  }
+  if (hasAuthoritativeStatus) return false;
+
+  if (resultJson) {
+    for (const key of TRANSIENT_UPSTREAM_TEXT_KEYS) {
+      if (looksLikeTransientUpstreamText(resultJson[key])) return true;
+    }
+  }
+
+  return looksLikeTransientUpstreamText(opts?.errorMessage);
+}
+
 function retryNotBeforeDelayMs(value: unknown, now = Date.now()): number | null {
   if (!(typeof value === "string" || typeof value === "number" || value instanceof Date)) return null;
   const parsed = new Date(value).getTime();
@@ -2973,6 +3276,83 @@ function retryAfterDelayMs(value: unknown): number | null {
   const parsed = typeof value === "number" ? value : typeof value === "string" ? Number.parseFloat(value) : NaN;
   if (!Number.isFinite(parsed) || parsed < 0) return null;
   return Math.ceil(parsed * 1000);
+}
+
+// BLO-18278: a provider capacity 429 tells us exactly when to come back, but on
+// the k8s adapters it says so in PROSE, inside the error message:
+//
+//   API Error: Request rejected (429) · BYOS provider capacity for 'anthropic'
+//   is temporarily unavailable; capacity may reset at 2026-07-26T21:29:59.782Z;
+//   retry in 9571s
+//
+// Nothing was reading that. claude-local/codex-local parse it adapter-side
+// (claude-local/src/server/parse.ts) and hand back a structured `retryNotBefore`,
+// but the shipped claude_k8s / opencode_k8s adapter bundles contain no
+// occurrence of `retryNotBefore`, `capacity may reset`, `resume_at`, or
+// `retry_after` at all — so on those adapters the horizon reached heartbeat
+// finalization as text and was dropped. `retryNotBefore` persisted null,
+// readTransientRetryNotBeforeFromRun returned null, and the hint-honoring
+// branch in scheduleBoundedRetryForRun (which already overrides `dueAt` with an
+// advertised reset, uncapped) was unreachable. The run therefore took the
+// rate-limit family's flat 90s hop — ~18x short of the 9571s the provider
+// asked for — so every attempt landed inside the same closed window until the
+// Job hit BackoffLimitExceeded and the issue was stranded. Live proof: run
+// 9727eaf0-9cea-461d-9101-f833f8de29fe.
+//
+// Parsing it here, server-side, is deliberately where the fix goes: it is the
+// one point every adapter's output funnels through, so it covers the k8s
+// bundles we do not build without duplicating the local adapters' parser.
+const PROVIDER_CAPACITY_RESET_AT_PATTERN =
+  /(?:\b(?:resume_at|retry_not_before|retryNotBefore)\b[\\'"\s]*[:=][\\'"\s]*|\b(?:capacity\s+)?may\s+reset\s+at\s+)(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))/i;
+const PROVIDER_CAPACITY_RETRY_IN_PATTERN = /\bretry\s+in\s+(\d+(?:\.\d+)?)\s*(?:s\b|secs?\b|seconds?\b)/i;
+
+// An advertised horizon further out than this is treated as unusable rather
+// than parked on: a bad parse (or a provider bug) must not silently sideline an
+// issue for days. 24h comfortably covers real capacity windows — the observed
+// fault asked for ~2h40m — while bounding the blast radius of a wrong read.
+const PROVIDER_CAPACITY_MAX_HORIZON_MS = 24 * 60 * 60 * 1000;
+
+export function parseProviderCapacityResetHorizon(
+  input: { resultJson?: Record<string, unknown> | null; errorMessage?: string | null },
+  now = Date.now(),
+): Date | null {
+  const resultJson = input.resultJson ?? null;
+  const candidates: unknown[] = [input.errorMessage];
+  if (resultJson) {
+    for (const key of ["result", "message", "error", "summary"] as const) {
+      candidates.push(resultJson[key]);
+    }
+  }
+
+  for (const candidate of candidates) {
+    if (typeof candidate !== "string") continue;
+
+    // An absolute timestamp is authoritative when present: it survives any
+    // delay between the provider emitting the fault and us finalizing the run,
+    // whereas the relative "retry in Ns" is only correct at emission time.
+    const absolute = candidate.match(PROVIDER_CAPACITY_RESET_AT_PATTERN)?.[1];
+    if (absolute) {
+      const parsed = new Date(absolute).getTime();
+      if (Number.isFinite(parsed) && parsed > now && parsed - now <= PROVIDER_CAPACITY_MAX_HORIZON_MS) {
+        return new Date(parsed);
+      }
+      // A parsed-but-unusable absolute horizon (already elapsed, or absurdly
+      // far out) is a deliberate no-hint answer for THIS field rather than a
+      // reason to fall back to the relative form in the same string, which
+      // would disagree with it.
+      continue;
+    }
+
+    const relativeSeconds = candidate.match(PROVIDER_CAPACITY_RETRY_IN_PATTERN)?.[1];
+    if (relativeSeconds) {
+      const seconds = Number.parseFloat(relativeSeconds);
+      if (Number.isFinite(seconds) && seconds > 0 && seconds * 1000 <= PROVIDER_CAPACITY_MAX_HORIZON_MS) {
+        return new Date(now + Math.ceil(seconds * 1000));
+      }
+    }
+  }
+
+  return null;
 }
 
 function zeroTokenUsage(usage: { inputTokens?: number; outputTokens?: number; cachedInputTokens?: number } | undefined) {
@@ -5799,6 +6179,89 @@ function normalizeInteractionContinuationWakeContext(
   clearInteractionContinuationWakeContext(contextSnapshot);
 }
 
+// BLO-19118: the GitHub PR block describes ONE pull request. It is not a bag of
+// independent fields — `githubPrReviewBody` only means anything alongside the
+// `githubPrNumber`/`githubHeadSha` it arrived with. Coalescing merges snapshots
+// field-by-field, so any key the incoming wake does not re-supply survives from
+// the previous one; for two wakes about *different* PRs that silently welds one
+// PR's review onto another PR's identity.
+//
+// That is not hypothetical: a wake is routed to an issue by the BLO- refs in the
+// PR body, so two PRs that both mention BLO-x resolve to the same issue, hence
+// the same coalescing task key. Observed 2026-07-30 — a `ready_for_review` for
+// #837 inherited #824's review body (head bfc470e, a different branch entirely)
+// because `ready_for_review` carries no review fields of its own. The agent is
+// then told "the findings are on YOUR pull request" about a review of someone
+// else's diff.
+const GITHUB_PR_CONTEXT_KEYS = [
+  "githubPrNumber",
+  "githubRepoFullName",
+  "githubPrTitle",
+  "githubPrUrl",
+  "githubEventUrl",
+  "githubHeadSha",
+  "githubEvent",
+  "githubDeliveryId",
+  "githubCommentId",
+  "githubCommentUrl",
+  "githubReviewUrl",
+  "githubReviewFeedbackCommentId",
+  "githubPrAuthorLogin",
+  "githubPaperclipIdentifiers",
+  "githubPrReviewBody",
+  "githubPrReviewState",
+  "githubPrReviewAuthorLogin",
+  "githubPrReviewRequestBody",
+  "githubPrReviewRequestAuthorLogin",
+  "githubReviewFeedbackActionable",
+  "prRole",
+  "reviewKind",
+] as const;
+
+function readGithubPrIdentity(contextSnapshot: Record<string, unknown>) {
+  const raw = contextSnapshot.githubPrNumber;
+  const prNumber =
+    typeof raw === "number" && Number.isFinite(raw)
+      ? raw
+      : typeof raw === "string" && raw.trim().length > 0 && Number.isFinite(Number(raw))
+        ? Number(raw)
+        : null;
+  if (prNumber === null) return null;
+  return `${readNonEmptyString(contextSnapshot.githubRepoFullName) ?? "unknown-repo"}#${prNumber}`;
+}
+
+function readGithubPrScopedWakeCommentIds(contextSnapshot: Record<string, unknown>) {
+  const ids = new Set<string>();
+  const githubCommentId = readNonEmptyString(contextSnapshot.githubCommentId);
+  if (githubCommentId) ids.add(githubCommentId);
+  const reviewFeedbackCommentId = readNonEmptyString(contextSnapshot.githubReviewFeedbackCommentId);
+  if (reviewFeedbackCommentId) ids.add(reviewFeedbackCommentId);
+
+  const paperclipWake = parseObject(contextSnapshot[PAPERCLIP_WAKE_PAYLOAD_KEY]);
+  const comments = Array.isArray(paperclipWake.comments) ? paperclipWake.comments : [];
+  const identity = readGithubPrIdentity(contextSnapshot);
+  for (const rawComment of comments) {
+    const comment = parseObject(rawComment);
+    const metadata = parseObject(comment.metadata);
+    if (readNonEmptyString(metadata.kind) !== "github_pr_review_feedback") continue;
+    const metadataIdentity = readGithubPrIdentity({
+      githubRepoFullName: metadata.repoFullName,
+      githubPrNumber: metadata.prNumber,
+    });
+    if (identity !== null && metadataIdentity !== null && metadataIdentity !== identity) continue;
+    const commentId = readNonEmptyString(comment.id);
+    if (commentId) ids.add(commentId);
+  }
+
+  return ids;
+}
+
+function preserveNonGithubPrWakeCommentIds(contextSnapshot: Record<string, unknown>) {
+  const githubPrScopedCommentIds = readGithubPrScopedWakeCommentIds(contextSnapshot);
+  if (githubPrScopedCommentIds.size === 0) return extractWakeCommentIds(contextSnapshot);
+  return extractWakeCommentIds(contextSnapshot).filter((commentId) => !githubPrScopedCommentIds.has(commentId));
+}
+
 type AcceptedPlanWakeRoutingDecision = {
   otherActiveClaimIssueId: string;
   otherActiveClaimIdentifier: string | null;
@@ -5861,6 +6324,25 @@ export function mergeCoalescedContextSnapshot(
     ...existing,
     ...incoming,
   };
+  // BLO-19118: when the incoming wake names a different pull request, every
+  // inherited GitHub field describes the wrong artifact. Drop the block as a
+  // unit instead of letting the spread above carry over whichever keys the
+  // incoming wake happens not to re-supply. Keys the incoming wake DID supply
+  // are its own and stay. Same PR — or a non-PR wake, which leaves the block
+  // untouched — keeps the previous behaviour.
+  // NOTE: `parseObject` returns `existingRaw` itself when it is already an
+  // object, so this must edit `merged` (freshly created) and never `existing`.
+  const incomingPrIdentity = readGithubPrIdentity(incoming);
+  const existingPrIdentity = readGithubPrIdentity(existing);
+  const isDifferentGithubPr =
+    incomingPrIdentity !== null &&
+    existingPrIdentity !== null &&
+    incomingPrIdentity !== existingPrIdentity;
+  if (isDifferentGithubPr) {
+    for (const key of GITHUB_PR_CONTEXT_KEYS) {
+      if (!(key in incoming)) delete merged[key];
+    }
+  }
   if (existing.forceFreshSession === true || incoming.forceFreshSession === true) {
     merged.forceFreshSession = true;
   }
@@ -5868,7 +6350,9 @@ export function mergeCoalescedContextSnapshot(
   for (const key of ["issueId", "taskId", "taskKey"] as const) {
     merged[key] = readNonEmptyString(incoming[key]) ?? readNonEmptyString(existing[key]) ?? merged[key];
   }
-  const mergedCommentIds = mergeWakeCommentIds(existing, incoming);
+  const mergedCommentIds = isDifferentGithubPr
+    ? mergeWakeCommentIds(preserveNonGithubPrWakeCommentIds(existing), incoming)
+    : mergeWakeCommentIds(existing, incoming);
   if (mergedCommentIds.length > 0) {
     const latestCommentId = mergedCommentIds[mergedCommentIds.length - 1];
     merged[WAKE_COMMENT_IDS_KEY] = mergedCommentIds;
@@ -5876,6 +6360,11 @@ export function mergeCoalescedContextSnapshot(
     merged.wakeCommentId = latestCommentId;
     // The merged context should carry canonical comment ids; the next wake will
     // regenerate any structured payload from those ids.
+    delete merged[PAPERCLIP_WAKE_PAYLOAD_KEY];
+  } else if (isDifferentGithubPr) {
+    delete merged[WAKE_COMMENT_IDS_KEY];
+    delete merged.commentId;
+    delete merged.wakeCommentId;
     delete merged[PAPERCLIP_WAKE_PAYLOAD_KEY];
   }
   if (!hasInteractionContinuationWakeContext(incoming)) {
@@ -6268,7 +6757,9 @@ async function coalesceQueuedGithubStateWake(input: {
     })
     .where(and(eq(heartbeatRuns.id, existingRun.id), eq(heartbeatRuns.status, "queued")))
     .returning()
-    .then((rows) => rows[0] ?? existingRun);
+    .then((rows) => rows[0] ?? null);
+
+  if (!mergedRun) return null;
 
   let coalescedEventCount: number | null = null;
   if (mergedRun.wakeupRequestId) {
@@ -6378,7 +6869,9 @@ async function coalescePendingTaskScopeWake(input: {
       ),
     )
     .returning()
-    .then((rows) => rows[0] ?? existingRun);
+    .then((rows) => rows[0] ?? null);
+
+  if (!mergedRun) return null;
 
   if (mergedRun.wakeupRequestId) {
     await input.tx
@@ -6478,6 +6971,100 @@ export function derivePaperclipPrReview(contextSnapshot: Record<string, unknown>
     // before accepting a "skipped as self-review" summary.
     prAuthorLogin: readNonEmptyString(contextSnapshot.githubPrAuthorLogin),
   };
+}
+
+type GithubReviewerEvidenceVerification =
+  | { status: "found"; via: "review" | "comment"; repoFullName: string; prNumber: number; headSha: string | null }
+  | { status: "not_found"; repoFullName: string; prNumber: number; headSha: string | null }
+  | { status: "unavailable"; reason: string; repoFullName: string | null; prNumber: number | null; headSha: string | null };
+
+async function verifyGithubReviewerEvidence(
+  contextSnapshot: Record<string, unknown> | null | undefined,
+): Promise<GithubReviewerEvidenceVerification> {
+  const prReview = derivePaperclipPrReview(contextSnapshot);
+  if (!prReview?.repoFullName || prReview.prNumber === null) {
+    return {
+      status: "unavailable",
+      reason: "missing_pr_target",
+      repoFullName: prReview?.repoFullName ?? null,
+      prNumber: prReview?.prNumber ?? null,
+      headSha: prReview?.headSha ?? null,
+    };
+  }
+
+  try {
+    const verified = await githubHasReviewerEvidenceForPr({
+      repoFullName: prReview.repoFullName,
+      prNumber: prReview.prNumber,
+      headSha: prReview.headSha,
+    });
+    if ("error" in verified) {
+      return {
+        status: "unavailable",
+        reason: verified.error,
+        repoFullName: prReview.repoFullName,
+        prNumber: prReview.prNumber,
+        headSha: prReview.headSha,
+      };
+    }
+    return {
+      status: verified.found ? "found" : "not_found",
+      ...(verified.found ? { via: verified.via } : {}),
+      repoFullName: prReview.repoFullName,
+      prNumber: prReview.prNumber,
+      headSha: prReview.headSha,
+    } as GithubReviewerEvidenceVerification;
+  } catch {
+    return {
+      status: "unavailable",
+      reason: "verification_threw",
+      repoFullName: prReview.repoFullName,
+      prNumber: prReview.prNumber,
+      headSha: prReview.headSha,
+    };
+  }
+}
+
+function unavailablePrReviewVerification(reason: string) {
+  return {
+    status: "missing" as const,
+    errorCode: "pr_review_verification_unavailable",
+    errorMessage:
+      `PR reviewer evidence could not be verified with GitHub (${reason}); retrying without trusting the local completion claim`,
+  };
+}
+
+/**
+ * Resolve where to post the "reviewer never finished" commit status for a run
+ * whose bounded retry chain just exhausted, or null when no status should be
+ * written. (BLO-17456)
+ *
+ * A required status context that is never posted renders as "Expected —
+ * waiting for status to be reported" indefinitely: branch protection blocks the
+ * PR and nothing signals the result is never coming. Failing the context turns
+ * that silent wedge into a visible red check. GitHub keeps the latest status
+ * per (sha, context), so a later real result from the context owner overwrites
+ * it — this is not terminal for the PR.
+ *
+ * Returns null unless ALL of the following hold, because a status posted to the
+ * wrong place is worse than one not posted at all:
+ *  - an operator opted in by configuring a context name (this server does not
+ *    own the branch-protection rule, so it must not invent one);
+ *  - the run is a PR-review run (`derivePaperclipPrReview`);
+ *  - the wake carried a repo AND an exact head SHA — statuses are per-commit,
+ *    so a guessed SHA would fail an unrelated commit.
+ */
+export function resolvePrReviewGateStatusTarget(
+  contextSnapshot: Record<string, unknown> | null | undefined,
+  gateContext: string,
+): { repoFullName: string; sha: string; context: string; prNumber: number; prUrl: string | null } | null {
+  const context = gateContext.trim();
+  if (!context) return null;
+  const prReview = derivePaperclipPrReview(contextSnapshot);
+  if (!prReview) return null;
+  const { repoFullName, headSha, prNumber, prUrl } = prReview;
+  if (!repoFullName || !headSha) return null;
+  return { repoFullName, sha: headSha, context, prNumber, prUrl: prUrl ?? null };
 }
 
 const PR_REVIEW_OUTPUT_EVIDENCE_MAX_CHARS = 240_000;
@@ -6793,6 +7380,67 @@ export function evaluatePrReviewCompletionEvidence(
     errorMessage:
       "PR reviewer run exited successfully but did not leave durable evidence of a posted review or intentional skip",
   };
+}
+
+// Reviewer wake reasons that must refresh review work for the current head:
+// an @ally comment / requested_reviewer, the draft->ready toggle, and a PR
+// synchronize push. Contrast with github_pr_opened/reopened, where a wake
+// already in flight genuinely covers the event.
+const EXPLICIT_PR_REVIEW_REQUEST_WAKE_REASONS = new Set([
+  "github_pr_review_requested",
+  "github_pr_ready_for_review",
+  "github_pr_synchronized",
+]);
+
+// BLO-18953: an explicit review request must never be absorbed into a review
+// run that is already RUNNING for the same PR. The reviewer task key is
+// PR-scoped and carries no head sha (deliberately: it also scopes the reviewer
+// affinity lookup, the withPrReviewerTaskLock serialization, and the
+// cancel-on-close sweep), so same-scope coalescing cannot tell "the run about
+// to start will read this head" from "the run already reviewing an older head
+// will never re-read head". Coalescing into a `queued` run is benign — that run
+// reads head when it starts. Coalescing into a `running` one silently drops the
+// request: observed on Blockcast/pim-multicast-gateway#1888 (human @ally
+// comment), Blockcast/paperclip#822 (ready_for_review), and synchronize pushes
+// that arrived while a previous-head review was already running.
+//
+// Head-sha comparison is NOT a workable discriminator here: the issue_comment
+// branch of resolveEventContext never populates headSha (GitHub's issue_comment
+// payload has no PR head), so the most common request path would compare
+// null-to-null and coalesce anyway.
+function isExplicitPrReviewRequestWake(contextSnapshot: Record<string, unknown> | null | undefined) {
+  const review = derivePaperclipPrReview(contextSnapshot);
+  if (!review || review.prRole !== "reviewer") return false;
+  return EXPLICIT_PR_REVIEW_REQUEST_WAKE_REASONS.has(review.wakeReason);
+}
+
+/**
+ * Decides whether a wake that finds a same-task-scope run already RUNNING must
+ * get its own queued follow-up run instead of being absorbed into that run.
+ *
+ * Extracted from enqueueWakeup so the property can be asserted directly: the
+ * in-situ path applies zombie filtering afterwards, which makes a DB-only
+ * `running` row (no live process) fall through for unrelated reasons and would
+ * render an end-to-end assertion vacuous.
+ *
+ * Returns false when a same-scope QUEUED run exists — that run has not started
+ * and will read the current head when it does, so absorbing into it is both
+ * correct and the desired rapid-event coalescing.
+ */
+export function shouldQueueFollowupInsteadOfAbsorbingIntoRunningRun(input: {
+  hasRunningSameScopeRun: boolean;
+  hasQueuedSameScopeRun: boolean;
+  contextSnapshot: Record<string, unknown> | null | undefined;
+  wakeCommentId: string | null;
+}): boolean {
+  if (!input.hasRunningSameScopeRun || input.hasQueuedSameScopeRun) return false;
+  return (
+    isExplicitPrReviewRequestWake(input.contextSnapshot) ||
+    shouldQueueFollowupForRunningIssueWake({
+      contextSnapshot: input.contextSnapshot,
+      wakeCommentId: input.wakeCommentId,
+    })
+  );
 }
 
 function isCrossPrReviewWakeForActiveRun(input: {
@@ -7113,7 +7761,13 @@ export function buildPaperclipTaskMarkdown(input: {
     if (prReview.eventUrl && prReview.eventUrl !== prReview.prUrl) {
       lines.push(`- GitHub event URL: ${quoteTaskScalar(prReview.eventUrl)}`);
     }
-    if (prReview.headSha) lines.push(`- Head SHA: ${quoteTaskScalar(prReview.headSha)}`);
+    // BLO-19118: this is the head GitHub reported when the webhook fired, not
+    // the head now. A wake can sit queued for tens of minutes (observed: 30+),
+    // and the author may push in that window — trusting it verbatim makes the
+    // agent diff a superseded commit. Say so, so the run re-resolves.
+    if (prReview.headSha) {
+      lines.push(`- Head SHA at wake time: ${quoteTaskScalar(prReview.headSha)} (may be superseded — confirm the current head before diffing or checking out)`);
+    }
     if (prReview.event) lines.push(`- GitHub event: ${quoteTaskScalar(prReview.event)}`);
     if (prReview.prRole === "author") {
       const reviewerLabel = prReview.reviewAuthorLogin ?? "A reviewer";
@@ -7128,9 +7782,19 @@ export function buildPaperclipTaskMarkdown(input: {
       if (prReview.reviewBody) {
         lines.push("", "Latest review body:", fenceTaskText(prReview.reviewBody));
       }
+      // BLO-19067: the closing instruction must agree with the review state.
+      // It used to unconditionally say "push a follow-up commit addressing
+      // them", so an APPROVED review told the author to make an implementation
+      // pass that has no findings to act on. A no-op push invalidates the
+      // approval it just earned and restarts CI, looping for hours.
+      const normalizedReviewState = prReview.reviewState?.trim().toLowerCase().replace(/-/g, "_") ?? null;
+      const commonClosing =
+        "Do NOT close the PR or self-approve. The PR's status is your responsibility this run; don't bounce to inbox-only mode.";
       lines.push(
         "",
-        "Read the latest review on the PR above (use `gh pr view` / `gh api` if the body is missing here). If the findings are correct, push a follow-up commit addressing them. If they are wrong or out of scope, reply on the PR with rationale. Do NOT close the PR or self-approve. The PR's status is your responsibility this run; don't bounce to inbox-only mode.",
+        normalizedReviewState === "approved"
+          ? `Read the latest review on the PR above (use \`gh pr view\` / \`gh api\` if the body is missing here). It APPROVED your PR, so no implementation pass is required: do NOT push a no-op or invented follow-up commit, because any new push invalidates this approval and restarts CI. Act on a note only if it identifies a real defect; otherwise proceed to merge once required checks pass. ${commonClosing}`
+          : `Read the latest review on the PR above (use \`gh pr view\` / \`gh api\` if the body is missing here). If the findings are correct, push a follow-up commit addressing them. If they are wrong or out of scope, reply on the PR with rationale. ${commonClosing}`,
       );
     } else {
       lines.push(
@@ -7586,6 +8250,24 @@ export interface HeartbeatServiceOptions {
    */
   workerBootAt?: Date;
   runtimeEnv?: Record<string, string | undefined>;
+  /**
+   * Test-only concurrency hook: fired after the scheduler has read a due
+   * scheduled_retry row and immediately before the conditional UPDATE that
+   * promotes or cancels it.
+   */
+  beforeScheduledRetryPromotionUpdateForTest?: (
+    run: typeof heartbeatRuns.$inferSelect,
+    now: Date,
+  ) => Promise<void> | void;
+  /**
+   * Test-only concurrency hook: fired inside the capacity-defer transaction
+   * after coalescePendingTaskScopeWake() has returned a still-deferred run and
+   * immediately before the conditional GitHub delivery-tally UPDATE. Lets a
+   * test wedge a concurrent promotion into that exact window (BLO-18859).
+   */
+  beforeGithubReviewCoalescedTallyUpdateForTest?: (
+    run: typeof heartbeatRuns.$inferSelect,
+  ) => Promise<void> | void;
 }
 
 function isTruthyRuntimeEnvValue(value: string | undefined) {
@@ -7880,6 +8562,54 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }),
     });
     return interaction.id;
+  }
+
+  /**
+   * Queue the configured PR-review gate status failure for a run whose bounded
+   * retry chain just exhausted, so a never-arriving required check stops reading
+   * as "still waiting". The outbox owns evidence re-checks, retry, and final
+   * delivery logging; the heartbeat lifecycle only records that the work was
+   * durably queued. (BLO-17456)
+   */
+  async function queueExhaustedPrReviewGateStatus(
+    run: typeof heartbeatRuns.$inferSelect,
+    contextSnapshot: Record<string, unknown>,
+  ) {
+    const target = resolvePrReviewGateStatusTarget(
+      contextSnapshot,
+      loadConfig().prReviewGateStatusContext,
+    );
+    if (!target) return;
+
+    const delivery = await enqueueGithubCommitStatusDelivery(db, {
+      companyId: run.companyId,
+      sourceRunId: run.id,
+      repoFullName: target.repoFullName,
+      sha: target.sha,
+      context: target.context,
+      state: "failure",
+      description: "Paperclip reviewer run exhausted its automatic retries; no review was posted.",
+      targetUrl: target.prUrl,
+      prNumber: target.prNumber,
+      prUrl: target.prUrl,
+    });
+    await appendRunEvent(run, await nextRunEventSeq(run.id), {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "info",
+      message:
+        delivery.status === "queued" || delivery.status === "processing"
+          ? `Queued PR-review gate status failure delivery for ${target.context} on ${target.repoFullName}@${target.sha.slice(0, 7)} after retry exhaustion`
+          : `PR-review gate status failure delivery for ${target.context} on ${target.repoFullName}@${target.sha.slice(0, 7)} is already ${delivery.status}`,
+      payload: {
+        deliveryId: delivery.id,
+        deliveryStatus: delivery.status,
+        statusContext: target.context,
+        repoFullName: target.repoFullName,
+        prNumber: target.prNumber,
+        headSha: target.sha,
+      },
+    });
   }
 
   async function escalatePlanApprovalResumeFailureNeedsAttention(input: {
@@ -11798,6 +12528,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     if (!cancelled) return null;
 
+    // Same terminal accounting as the in-transaction promotion gate: this
+    // cancel ends a run a GitHub delivery may be parked on, so settle the
+    // `deferred` it was counted under (BLO-18859 review follow-up). Reached
+    // only when a row was actually cancelled, so a lost race increments
+    // nothing.
+    const gateGithubReviewReason = githubPrReviewWakeReasonFromRunSnapshot(
+      parseObject(cancelled.contextSnapshot),
+    );
+    if (gateGithubReviewReason !== null) {
+      const settledDeliveries = readGithubReviewDeliveryCount(parseObject(cancelled.contextSnapshot));
+      for (let i = 0; i < settledDeliveries; i++) {
+        recordGithubReviewRequestSuppressed({
+          reason: gateGithubReviewReason,
+          cause: GITHUB_SUPPRESSION_CAUSE_SCHEDULED_RETRY_GATE,
+        });
+      }
+    }
+
     if (cancelled.wakeupRequestId) {
       await db
         .update(agentWakeupRequests)
@@ -11967,6 +12715,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             .returning()
             .then((rows) => rows[0] ?? null);
           if (exhausted) {
+            // The capacity pool never recovered inside the retry budget, so a
+            // GitHub delivery parked here is lost for real, not merely late:
+            // the run is cancelled and nothing re-drives it. That is the same
+            // user-visible outcome as an exhausted dispatch chain — a posted
+            // trigger with no review — so it settles as `dead_lettered` and
+            // pages via the existing dead-letter alert, rather than as a
+            // policy suppression (BLO-18859 review follow-up).
+            const exhaustedSnapshot = parseObject(exhausted.contextSnapshot);
+            const exhaustedGithubReviewReason =
+              githubPrReviewWakeReasonFromRunSnapshot(exhaustedSnapshot);
+            if (exhaustedGithubReviewReason !== null) {
+              // Per delivery, not per run: every delivery that coalesced onto
+              // this run was counted `deferred`, and all of them die with it.
+              const lostDeliveries = readGithubReviewDeliveryCount(exhaustedSnapshot);
+              for (let i = 0; i < lostDeliveries; i++) {
+                recordGithubReviewRequestDelivery({
+                  state: "dead_lettered",
+                  reason: exhaustedGithubReviewReason,
+                });
+              }
+            }
             await appendRunEvent(exhausted, await nextRunEventSeq(exhausted.id), {
               eventType: "lifecycle",
               stream: "system",
@@ -12172,6 +12941,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     const promotionIssueId = readNonEmptyString(contextSnapshot.issueId);
+    await options.beforeScheduledRetryPromotionUpdateForTest?.(dueRun, now);
     const atomicPromotion = await db.transaction(async (tx) => {
       let promotionGate: BlockedScheduledRetryGate | null = null;
 
@@ -12292,6 +13062,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .update(heartbeatRuns)
         .set({
           status: "queued",
+          error: null,
+          errorCode: null,
           updatedAt: now,
         })
         .where(
@@ -12307,6 +13079,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
 
     if (atomicPromotion.outcome === "gate_suppressed") {
+      // Terminal sibling of the `promoted` increment below: the run is
+      // `cancelled`, so a delivery counted `deferred` at dispatch would
+      // otherwise never reach a settled state (BLO-18859 review follow-up).
+      // The gate family is policy, not outage, so it lands on a cause the
+      // suppression-outage alert deliberately does not select.
+      const gateContextSnapshot = parseObject(atomicPromotion.run.contextSnapshot);
+      const gateGithubReviewReason = githubPrReviewWakeReasonFromRunSnapshot(gateContextSnapshot);
+      if (gateGithubReviewReason !== null) {
+        const settledDeliveries = readGithubReviewDeliveryCount(gateContextSnapshot);
+        for (let i = 0; i < settledDeliveries; i++) {
+          recordGithubReviewRequestSuppressed({
+            reason: gateGithubReviewReason,
+            cause: GITHUB_SUPPRESSION_CAUSE_SCHEDULED_RETRY_GATE,
+          });
+        }
+      }
       await appendRunEvent(atomicPromotion.run, await nextRunEventSeq(atomicPromotion.run.id), {
         eventType: "lifecycle",
         stream: "system",
@@ -12334,6 +13122,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     if (promoted.scheduledRetryReason === DEP_BLOCKED_RETRY_REASON) {
       incrementDepBlockedMetric("dep_blocked_promoted");
+    }
+
+    // BLO-18859 review follow-up: close out the `deferred` this run was counted
+    // under when the capacity gate parked it. The delivery was late, not lost,
+    // and until this increment existed a successfully-delayed review sat at
+    // `received=1, deferred=1, queued=0` forever — indistinguishable from loss.
+    //
+    // Exactly-once per *delivery*, which is the granularity the rest of the
+    // funnel uses: the promoting UPDATE is conditional on the row still being
+    // `scheduled_retry`, so a concurrent promoter's UPDATE matches no rows and
+    // returns null above — and every delivery that coalesced onto this run
+    // bumped the tally as it was counted `deferred`. Replaying the tally here
+    // is what keeps `received = queued + suppressed + dead_lettered + in-flight`
+    // closed when N deliveries settle as one run.
+    const promotedContextSnapshot = parseObject(promoted.contextSnapshot);
+    const promotedGithubReviewReason = githubPrReviewWakeReasonFromRunSnapshot(promotedContextSnapshot);
+    if (promotedGithubReviewReason !== null) {
+      const settledDeliveries = readGithubReviewDeliveryCount(promotedContextSnapshot);
+      for (let i = 0; i < settledDeliveries; i++) {
+        recordGithubReviewRequestDelivery({ state: "queued", reason: promotedGithubReviewReason });
+      }
     }
 
     await appendRunEvent(promoted, await nextRunEventSeq(promoted.id), {
@@ -12449,6 +13258,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           );
         });
       }
+      // BLO-17456: a PR-review chain that exhausts here leaves its required
+      // status context unposted, so the PR sits on "Expected — waiting for
+      // status" with nothing signalling that no result is coming. Queue a
+      // durable status delivery so stale writes are guarded by a final
+      // GitHub-evidence read and transient GitHub/token failures can retry.
+      // Opt-in and swallowed so status delivery can never alter exhaustion
+      // handling.
+      await queueExhaustedPrReviewGateStatus(run, contextSnapshot).catch((error) => {
+        logger.warn(
+          { err: error, runId: run.id },
+          "failed to queue exhausted PR-review gate status",
+        );
+      });
       return {
         outcome: "retry_exhausted" as const,
         attempt: nextAttempt,
@@ -13618,6 +14440,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .update(heartbeatRuns)
           .set({
             status: "running",
+            error: null,
+            errorCode: null,
             responsibleUserId,
             startedAt: run.startedAt ?? claimedAt,
             updatedAt: claimedAt,
@@ -14213,6 +15037,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return trimmed.length > 500 ? `${trimmed.slice(0, 499)}…` : trimmed;
   }
 
+  /**
+   * Last-resort reason for an agent we are about to latch into `error` with
+   * nothing to say about why (BLO-19085).
+   *
+   * `status: error` + `errorReason: null` is the worst state this service can
+   * produce: the agent stops, and the record carries no diagnosis, so nothing
+   * surfaces the cause and no operator can act. OCMBackendEngineer sat that way
+   * for ~15h on 2026-07-30 because the external-runtime reconciler dropped a
+   * reason it was already holding. Callers passing a real reason is the fix;
+   * this is the floor under them, so a future caller that forgets still leaves
+   * a trail back to the run.
+   */
+  function fallbackAgentErrorReason(
+    outcome: "failed" | "timed_out" | string,
+    options?: { errorCode?: string | null; runId?: string | null },
+  ): string {
+    const parts = [`unknown ${outcome} failure: the finalizing path supplied no reason`];
+    if (options?.errorCode) parts.push(`errorCode ${options.errorCode}`);
+    parts.push(options?.runId ? `see run ${options.runId}` : "no run id was supplied either");
+    return parts.join("; ");
+  }
+
   async function finalizeAgentStatus(
     agentId: string,
     outcome: "succeeded" | "interrupted" | "failed" | "cancelled" | "timed_out",
@@ -14221,6 +15067,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       keepIdleOnFailure?: boolean;
       errorCode?: string | null;
       retryNotBefore?: Date | null;
+      /** Run that drove this transition, so a fallback reason can point at it. */
+      runId?: string | null;
     },
   ) {
     const existing = await getAgent(agentId);
@@ -14267,7 +15115,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // Persist a human-readable reason on the agent record when it enters
         // error so operators see it on the agent page without digging into run
         // events; clear it whenever the agent leaves error.
-        errorReason: nextStatus === "error" ? truncateAgentErrorReason(failureReason) : null,
+        //
+        // BLO-19085: never write `error` with a null reason. If the caller gave
+        // us nothing usable, synthesize one that names the outcome and points at
+        // the run, so the agent page always answers "why did this stop?".
+        errorReason:
+          nextStatus === "error"
+            ? (truncateAgentErrorReason(failureReason) ??
+              truncateAgentErrorReason(
+                fallbackAgentErrorReason(outcome, {
+                  errorCode: options?.errorCode,
+                  runId: options?.runId,
+                }),
+              ))
+            : null,
         lastHeartbeatAt: new Date(),
         updatedAt: new Date(),
       })
@@ -14627,6 +15488,33 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
   }
 
+  /**
+   * Best-effort capture of the failed Job's pod-level terminal state.
+   *
+   * The Job `Failed` condition only ever says "backoff limit reached" — it names
+   * no container and carries no exit code — so without this a recurrence leaves
+   * no evidence once the pod is GC'd. Never throws and never blocks
+   * finalization; a null result simply means the run record keeps the
+   * Job-level fields it always had.
+   */
+  async function captureFailedJobContainerDiagnostics(
+    run: Pick<typeof heartbeatRuns.$inferSelect, "id">,
+    jobStatus: AgentJobRunStatus | null,
+  ) {
+    try {
+      const jobName = readNonEmptyString(jobStatus?.name) ??
+        readNonEmptyString((await getActiveExternalRuntimeReservation(db, run.id))?.jobName);
+      if (!jobName) return null;
+      return await captureAgentJobFailureDiagnostics(jobName);
+    } catch (error) {
+      logger.warn(
+        { runId: run.id, error: error instanceof Error ? error.message : String(error) },
+        "failed-Job container diagnostics capture failed; finalizing without them",
+      );
+      return null;
+    }
+  }
+
   async function finalizeExternalLifecycleTerminalRun(input: {
     run: typeof heartbeatRuns.$inferSelect;
     adapterType: string;
@@ -14636,34 +15524,61 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     staleKill?: boolean;
   }) {
     let preserveRecordedOutcome = false;
+    let prReviewIncompleteOverride: {
+      errorCode: string;
+      errorMessage: string;
+    } | null = null;
     if (!input.staleKill && !input.jobStatus) {
       let reviewEvidence = evaluatePrReviewCompletionEvidence(
         parseObject(input.run.contextSnapshot),
         { resultJson: parseObject(input.run.resultJson) },
       );
-      if (reviewEvidence.status === "missing") {
-        try {
-          const prReview = derivePaperclipPrReview(parseObject(input.run.contextSnapshot));
-          if (prReview?.repoFullName && prReview.prNumber !== null) {
-            const verified = await githubHasReviewerEvidenceForPr({
-              repoFullName: prReview.repoFullName,
-              prNumber: prReview.prNumber,
-              headSha: prReview.headSha,
-            });
-            if ("found" in verified && verified.found) {
-              reviewEvidence = { status: "posted_review" };
-            }
-          }
-        } catch {
-          // GitHub verification is additive; failures retain the local missing verdict.
+      const claimedReview =
+        reviewEvidence.status === "posted_review" || reviewEvidence.status === "already_reviewed";
+      if (reviewEvidence.status === "missing" || claimedReview) {
+        const verification = await verifyGithubReviewerEvidence(
+          parseObject(input.run.contextSnapshot),
+        );
+        await appendRunEvent(input.run, await nextRunEventSeq(input.run.id), {
+          eventType: "lifecycle",
+          stream: "system",
+          level: verification.status === "unavailable" ? "warn" : "info",
+          message:
+            verification.status === "found"
+              ? `GitHub-verified ${verification.via} by the reviewer App during missing-Job recovery`
+              : `GitHub reviewer-evidence check did not preserve missing-Job recovery: ${verification.status === "unavailable" ? verification.reason : "no_evidence_found"}`,
+          payload: {
+            repoFullName: verification.repoFullName,
+            prNumber: verification.prNumber,
+            headSha: verification.headSha,
+            outcome: verification.status,
+            ...(verification.status === "found" ? { via: verification.via } : {}),
+            ...(verification.status === "unavailable" ? { reason: verification.reason } : {}),
+          },
+        });
+        if (verification.status === "found") {
+          reviewEvidence = { status: "posted_review" };
+        } else if (verification.status === "unavailable") {
+          reviewEvidence = unavailablePrReviewVerification(verification.reason);
+        } else if (claimedReview) {
+          reviewEvidence = {
+            status: "missing",
+            errorCode: "pr_review_output_missing",
+            errorMessage:
+              "PR reviewer run claimed a posted review, but GitHub has no exact-head review from a trusted reviewer identity",
+          };
         }
       }
+      prReviewIncompleteOverride =
+        reviewEvidence.status === "missing" || reviewEvidence.status === "auth_expired"
+          ? reviewEvidence
+          : null;
       preserveRecordedOutcome = reviewEvidence.status === "posted_review" ||
         reviewEvidence.status === "already_reviewed" ||
         reviewEvidence.status === "archived_repo_skipped" ||
         reviewEvidence.status === "self_review_skipped";
     }
-    const terminalOutcome = input.staleKill
+    const baseTerminalOutcome = input.staleKill
       ? {
           status: "failed" as const,
           wakeupStatus: "failed" as const,
@@ -14676,10 +15591,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           jobMessage: input.jobStatus?.message ?? null,
         }
       : externalLifecycleTerminalOutcome(input.jobStatus, preserveRecordedOutcome);
+    const terminalOutcome =
+      baseTerminalOutcome && prReviewIncompleteOverride && !input.staleKill
+        ? {
+            ...baseTerminalOutcome,
+            errorCode: prReviewIncompleteOverride.errorCode,
+            error: prReviewIncompleteOverride.errorMessage,
+          }
+        : baseTerminalOutcome;
     if (!terminalOutcome) return false;
 
     const adapterInvocationStarted = terminalOutcome.errorCode === "job_failed"
       ? await hasAdapterInvocationEvent(input.run.id)
+      : null;
+
+    // Read the pod's terminal container state while the pod still exists. This
+    // is the only point in the lifecycle where it is still available.
+    const containerDiagnostics = terminalOutcome.errorCode === "job_failed"
+      ? await captureFailedJobContainerDiagnostics(input.run, input.jobStatus)
       : null;
 
     const resultJson = mergeRunStopMetadataForAgent(
@@ -14694,6 +15623,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             jobReason: terminalOutcome.jobReason,
             jobMessage: terminalOutcome.jobMessage,
             ...(adapterInvocationStarted !== null ? { adapterInvocationStarted } : {}),
+            ...(containerDiagnostics ? { containerDiagnostics } : {}),
           },
         },
         errorCode: terminalOutcome.errorCode,
@@ -14798,7 +15728,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         reason: terminalOutcome.errorCode ?? terminalOutcome.status,
       });
     }
-    await finalizeAgentStatus(input.run.agentId, terminalOutcome.status);
+    // BLO-19085: pass the reason we already computed. Omitting it latched the
+    // agent into `error` with `errorReason: null` while the very same
+    // `terminalOutcome` (e.g. "External lifecycle Job is missing while heartbeat
+    // run is still running" / job_missing) sat on the run record one frame away.
+    await finalizeAgentStatus(input.run.agentId, terminalOutcome.status, terminalOutcome.error, {
+      errorCode: terminalOutcome.errorCode,
+      runId: input.run.id,
+    });
     const promotedRunDispatched = await releaseIssueExecutionAndPromote(finalizedRun);
     await handleRunLivenessContinuation(finalizedRun);
     if (finalizationAgent) {
@@ -15046,14 +15983,47 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .from(externalRuntimeReservations)
       .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, externalRuntimeReservations.runId))
       .where(
-        or(
-          eq(externalRuntimeReservations.state, "release_pending"),
-          and(
-            inArray(externalRuntimeReservations.state, ["reserved", "launching"]),
-            isNull(externalRuntimeReservations.expectedJobName),
-            isNull(externalRuntimeReservations.jobName),
-            isNull(externalRuntimeReservations.jobUid),
-            inArray(heartbeatRuns.status, [...HEARTBEAT_RUN_TERMINAL_STATUSES]),
+        and(
+          isNull(externalRuntimeReservations.releasedAt),
+          or(
+            eq(externalRuntimeReservations.state, "release_pending"),
+            and(
+              inArray(externalRuntimeReservations.state, ["reserved", "launching"]),
+              isNull(externalRuntimeReservations.expectedJobName),
+              isNull(externalRuntimeReservations.jobName),
+              isNull(externalRuntimeReservations.jobUid),
+              inArray(heartbeatRuns.status, [...HEARTBEAT_RUN_TERMINAL_STATUSES]),
+            ),
+            // BLO-18995: an *identified* reservation (a Job name was recorded)
+            // whose run reached a terminal status without the normal
+            // finalize-time release running — the canonical case is
+            // `drainRunningRunsForShutdown` marking a running run
+            // `interrupted` on SIGTERM, which never releases the reservation.
+            // The two branches above cannot see it: it is not
+            // `release_pending`, and it is `launched` with a non-null
+            // `jobName`. The row then keeps `released_at IS NULL` forever and
+            // the partial unique index
+            // `external_runtime_reservations_active_slot_idx (agent_id,
+            // slot_id) WHERE released_at IS NULL` blocks that slot
+            // permanently, so every worker restart with a run in flight
+            // ratchets the agent's effective concurrency down by one. Observed
+            // in production: four agents each stuck a slot for 1-5 days (Ally
+            // 4/5 slots, Release Engineer 1/2).
+            //
+            // Selecting the row here is safe because it does not release it:
+            // the loop below still verifies the recorded Job is genuinely gone
+            // or finished (exact `readAgentJobRunStatusByName` lookup plus
+            // jobUid identity match) and skips any reservation whose Job is
+            // still `active`. A Job that outlives the worker therefore keeps
+            // its slot until it actually terminates.
+            and(
+              inArray(externalRuntimeReservations.state, ["reserved", "launching", "launched"]),
+              or(
+                isNotNull(externalRuntimeReservations.jobName),
+                isNotNull(externalRuntimeReservations.jobUid),
+              ),
+              inArray(heartbeatRuns.status, [...HEARTBEAT_RUN_TERMINAL_STATUSES]),
+            ),
           ),
         ),
       );
@@ -15990,7 +16960,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // once the mint is committed (so a failed/aborted setRunStatus never
       // over-counts). Split by adapter + error-string bucket + the durable
       // classification, all bounded.
-      let finalizedRun = await setRunStatus(run.id, "failed", {
+      const finalizedRunWrite = await setRunStatusIfRunning(run.id, "failed", {
         error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
         errorCode: "process_lost",
         finishedAt: now,
@@ -16013,12 +16983,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             : result;
         })(),
       });
+      if (!finalizedRunWrite.updated || !finalizedRunWrite.run) {
+        // Another reap invocation won the terminal transition for this run.
+        // Do not duplicate process_lost metrics, retries, wakeup finalization,
+        // run events, or issue-promotion side effects.
+        if (finalizedRunWrite.run?.status !== "running") {
+          runningProcesses.delete(run.id);
+          activeRunExecutions.delete(run.id);
+        }
+        continue;
+      }
+      let finalizedRun = finalizedRunWrite.run;
       await setWakeupStatus(run.wakeupRequestId, "failed", {
         finishedAt: now,
         error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
       });
-      if (!finalizedRun) finalizedRun = await getRun(run.id);
-      if (!finalizedRun) continue;
       // BLO-16184: the process_lost mint is now committed for this run -- count it
       // (bounded adapter + error-string bucket + durable classification).
       recordProcessLost({
@@ -16054,7 +17033,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         status: finalizedRun.status,
         failureReason: finalizedRun.error ?? undefined,
       });
-      await finalizeAgentStatus(run.agentId, "failed");
+      // BLO-19085: `baseMessage` is the process_lost diagnosis already written
+      // to the run record; pass it through so the agent record carries it too
+      // instead of latching into `error` with a null reason.
+      await finalizeAgentStatus(run.agentId, "failed", baseMessage, {
+        errorCode: "process_lost",
+        runId: run.id,
+      });
 
       let retriedRun: typeof heartbeatRuns.$inferSelect | null = null;
       let promotedRunDispatched = false;
@@ -16731,13 +17716,34 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           waitedMs: number,
           isRecoveryWake: boolean,
         ): number => {
-          if (!hasId) return 10;
+          if (!hasId) {
+            // BLO-18995: issue-less runs (every GitHub PR-review wake) used to
+            // return a flat 10 here, *above* the aging escalation below, so the
+            // BLO-16253 anti-starvation floor was unreachable for the entire
+            // class. Every dependency-ready issue-bound run ranks
+            // `priorityRank * 2 + statusBonus` ∈ [0,9], so even a `low`-priority
+            // `todo` (7) permanently outranked an arbitrarily old PR review.
+            // Escalate aged issue-less runs to 2: they outrank routine medium/
+            // low work while preserving ranks 0-1 for explicit critical issue
+            // work. The PR-review fairness promotion above remains the bounded
+            // path for an aged review to jump even critical work.
+            return waitedMs >= STARVATION_FULL_ESCALATION_MS ? 2 : 10;
+          }
+          // NB: the aging escalation below stays *underneath* this `!ready`
+          // check on purpose. A dependency-blocked run must never escalate to
+          // the front of the queue no matter how long it has waited, because it
+          // cannot run yet.
           if (!ready) return 12 + issueRunPriorityRank(issue?.priority);
           const escalationFloorMs = isRecoveryWake
             ? STARVATION_RECOVERY_ESCALATION_MS
             : STARVATION_FULL_ESCALATION_MS;
-          if (waitedMs >= escalationFloorMs) return 0;
           const priorityRank = issueRunPriorityRank(issue?.priority);
+          // Aging must guarantee progress without erasing the emergency lane.
+          // Aged non-critical issue work joins rank 2 alongside aged issue-less
+          // work, ahead of routine medium/low work but behind critical ranks
+          // 0-1. Critical work itself still ages to rank 0 for FIFO ordering
+          // within that tier.
+          if (waitedMs >= escalationFloorMs) return priorityRank === 0 ? 0 : 2;
           const statusBonus =
             issue?.status === "in_progress" || waitedMs >= STARVATION_STATUS_BOOST_MS ? 0 : 1;
           return priorityRank * 2 + statusBonus;
@@ -16767,13 +17773,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // Per-issue dedupe: if a queued run targets an issue that already has a
       // running sibling (this iteration's claim OR a prior tick's still-running
       // run), suppress it instead of letting two dispatches race for the same
-      // k8s Job slot. Cross-agent and null-issueId (autonomous) runs are
-      // unaffected — withAgentStartLock already scopes this to one agent and
-      // the gate only fires when issueId is present. Stale runs are excluded
-      // (consistent with Fix #1 above) so a queued retry for a stale issue
-      // can proceed once the stale run's job is gone.
+      // k8s Job slot/worktree. Cross-agent and null-issueId (autonomous) runs
+      // are unaffected — withAgentStartLock already scopes this to one agent
+      // and the gate only fires when issueId is present. Unlike the slot gate
+      // above, issue ownership is not released merely because a running row has
+      // been silent for 15 minutes; an external Job can be quiet and still edit
+      // its shared worktree. Reaper/lifecycle checks must move the old run out
+      // of "running" before a queued same-issue retry can proceed.
       const inFlightIssueIds = new Set<string>();
-      for (const row of nonStaleRunningRuns) {
+      for (const row of runningRunRows) {
         const id = readNonEmptyString(parseObject(row.contextSnapshot).issueId);
         if (id) inFlightIssueIds.add(id);
       }
@@ -17856,6 +18864,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             name: agent.name,
             companyId: agent.companyId,
           },
+          executionWorkspaceId: plannedExecutionWorkspaceId,
           heartbeatRunId: run.id,
           enableWorkspaceBranchReconcileForward:
             resolvedInstanceSettings.experimental.enableWorkspaceBranchReconcileForward,
@@ -18625,6 +19634,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         executionWorkspace,
         persistedExecutionWorkspace,
         executionTarget,
+        k8sRunIsolation,
         environmentDriver: selectedEnvironment.driver,
         leaseMetadata: activeEnvironmentLease.lease.metadata,
       });
@@ -19146,6 +20156,45 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               ) {
                 break;
               }
+              // BLO-18278: if the provider advertised a reset the in-run loop
+              // cannot outlast, stop here instead of spending the remaining
+              // attempts inside a window that is still closed. The whole budget
+              // is MAX_ATTEMPTS x MAX_DELAY, and each attempt relaunches the
+              // agent Job — which is how the observed 9571s horizon became a
+              // BackoffLimitExceeded strand rather than a wait. Breaking out
+              // finalizes the run as rate_limit_exhausted carrying
+              // `retryNotBefore`, and scheduleBoundedRetryForRun then parks a
+              // `scheduled_retry` row AT the advertised reset (that override is
+              // uncapped, unlike this loop's 10-min clamp). `scheduled_retry` is
+              // a live execution path to hasActiveExecutionPath, so the strand
+              // sweep leaves the issue alone.
+              const inRunHorizonBudgetMs =
+                (K8S_CCROTATE_IN_RUN_RETRY_MAX_ATTEMPTS - ccrotateRetryAttempt) *
+                K8S_CCROTATE_IN_RUN_RETRY_MAX_DELAY_MS;
+              const advertisedResetAt = parseProviderCapacityResetHorizon({
+                resultJson: adapterResult.resultJson,
+                errorMessage: adapterResult.errorMessage,
+              });
+              if (advertisedResetAt && advertisedResetAt.getTime() - Date.now() > inRunHorizonBudgetMs) {
+                await appendRunEvent(currentRun, seq++, {
+                  eventType: "lifecycle",
+                  stream: "system",
+                  level: "warn",
+                  message:
+                    "provider advertised a capacity reset beyond the in-run retry budget; deferring to a scheduled retry at that reset",
+                  payload: {
+                    advertisedResetAt: advertisedResetAt.toISOString(),
+                    inRunHorizonBudgetMs,
+                    attemptsUsed: ccrotateRetryAttempt,
+                    maxAttempts: K8S_CCROTATE_IN_RUN_RETRY_MAX_ATTEMPTS,
+                  },
+                });
+                await onLog(
+                  "stderr",
+                  `[paperclip] Provider capacity resets at ${advertisedResetAt.toISOString()}, beyond this run's retry budget; deferring to a scheduled retry.\n`,
+                );
+                break;
+              }
               ccrotateRetryAttempt += 1;
               const retryDelayMs = k8sCcrotateRetryDelayMs(adapterResult);
               if (externalRuntimeReservation) {
@@ -19354,64 +20403,77 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       } else if (outcome === "failed" && looksRateLimited) {
         rateLimitExhaustedOverride = true;
       }
+      // BLO-18285: hint-less provider 503/529. Only ever downgrades an already
+      // -failed run — unlike the rate-limit overrides above it never flips
+      // `succeeded` to `failed`, because a run that finished its work while a
+      // 503 merely appeared in tool output did do the work and must not be
+      // re-dispatched. Yields to the rate-limit families (429 owns its own flat
+      // curve) and to any adapter that already tagged a family itself, so the
+      // local adapters' richer verdict always wins.
+      const transientUpstreamOverride =
+        outcome === "failed" &&
+        !rateLimitExhaustedOverride &&
+        !providerThrottledNoProgressOverride &&
+        !adapterResult.errorFamily &&
+        isHintlessTransientUpstreamFault(adapterResult.resultJson, {
+          errorMessage: adapterResult.errorMessage,
+        });
+      // BLO-18278: recover the capacity-reset horizon a throttle fault stated in
+      // prose. Only consulted when the adapter did not already hand back a
+      // structured `retryNotBefore` (claude-local/codex-local do), and only for
+      // the throttle families — a horizon quoted inside some unrelated failure's
+      // tool output must not push that failure's retry into next week.
+      const providerCapacityResetAt =
+        (rateLimitExhaustedOverride || providerThrottledNoProgressOverride) && !adapterResult.retryNotBefore
+          ? parseProviderCapacityResetHorizon({
+              resultJson: adapterResult.resultJson,
+              errorMessage: adapterResult.errorMessage,
+            })
+          : null;
+      const effectiveRetryNotBefore =
+        adapterResult.retryNotBefore ?? providerCapacityResetAt?.toISOString() ?? null;
       let prReviewCompletionEvidence = outcome === "succeeded"
         ? evaluatePrReviewCompletionEvidence(context, {
           resultJson: adapterResult.resultJson ?? null,
           summary: adapterResult.summary ?? null,
         })
         : { status: "not_applicable" as const };
-      // BLO-10448: the evidence guard above is a text heuristic over the agent's
-      // free-text summary and misfires on legitimate runs (idempotency skips,
-      // comment-mode reviews) — the PR WAS reviewed but the phrasing wasn't
-      // matched, flagging a false pr_review_output_missing. Before keeping that
-      // verdict, authoritatively check GitHub for a reviewer-bot review/comment at
-      // THIS head. Only rescues a false `missing`; any error / unconfigured creds /
-      // not-found leaves the heuristic verdict intact (safe, additive fallback).
-      if (prReviewCompletionEvidence.status === "missing") {
-        try {
-          const prReview = derivePaperclipPrReview(context);
-          if (prReview && prReview.repoFullName && prReview.prNumber !== null) {
-            const verified = await githubHasReviewerEvidenceForPr({
-              repoFullName: prReview.repoFullName,
-              prNumber: prReview.prNumber,
-              headSha: prReview.headSha,
-            });
-            if ("found" in verified && verified.found) {
-              await appendRunEvent(run, await nextRunEventSeq(run.id), {
-                eventType: "lifecycle",
-                stream: "system",
-                level: "info",
-                message: `GitHub-verified ${verified.via} by the reviewer bot on ${prReview.repoFullName}#${prReview.prNumber}; suppressing false pr_review_output_missing`,
-                payload: {
-                  repoFullName: prReview.repoFullName,
-                  prNumber: prReview.prNumber,
-                  headSha: prReview.headSha,
-                  via: verified.via,
-                },
-              });
-              prReviewCompletionEvidence = { status: "posted_review" as const };
-            } else {
-              // BLO-10878: the non-rescue path used to be silent, making residual
-              // false `pr_review_output_missing` unclassifiable. Record why the
-              // GitHub check did not rescue (a specific `{error}` code, or genuine
-              // not-found) so the remaining residual is diagnosable from events.
-              await appendRunEvent(run, await nextRunEventSeq(run.id), {
-                eventType: "lifecycle",
-                stream: "system",
-                level: "info",
-                message: `GitHub reviewer-evidence check kept pr_review_output_missing on ${prReview.repoFullName}#${prReview.prNumber}: ${"error" in verified ? verified.error : "no_evidence_found"}`,
-                payload: {
-                  repoFullName: prReview.repoFullName,
-                  prNumber: prReview.prNumber,
-                  headSha: prReview.headSha,
-                  outcome: "error" in verified ? verified.error : "not_found",
-                },
-              });
-            }
-          }
-        } catch {
-          // Verification is best-effort; on any unexpected fault we keep the
-          // heuristic `missing` verdict (unchanged pre-BLO-10448 behavior).
+      // BLO-10448/BLO-19573: GitHub is authoritative for both missing evidence
+      // and local "posted/already reviewed" claims. The latter must not complete
+      // a task when the side effect came from an ineligible user-seat identity.
+      const claimedReview =
+        prReviewCompletionEvidence.status === "posted_review" ||
+        prReviewCompletionEvidence.status === "already_reviewed";
+      if (prReviewCompletionEvidence.status === "missing" || claimedReview) {
+        const verification = await verifyGithubReviewerEvidence(context);
+        await appendRunEvent(run, await nextRunEventSeq(run.id), {
+          eventType: "lifecycle",
+          stream: "system",
+          level: verification.status === "unavailable" ? "warn" : "info",
+          message:
+            verification.status === "found"
+              ? `GitHub-verified ${verification.via} by the reviewer App on ${verification.repoFullName}#${verification.prNumber}`
+              : `GitHub reviewer-evidence check rejected PR-review completion${verification.repoFullName && verification.prNumber !== null ? ` on ${verification.repoFullName}#${verification.prNumber}` : ""}: ${verification.status === "unavailable" ? verification.reason : "no_evidence_found"}`,
+          payload: {
+            repoFullName: verification.repoFullName,
+            prNumber: verification.prNumber,
+            headSha: verification.headSha,
+            outcome: verification.status,
+            ...(verification.status === "found" ? { via: verification.via } : {}),
+            ...(verification.status === "unavailable" ? { reason: verification.reason } : {}),
+          },
+        });
+        if (verification.status === "found") {
+          prReviewCompletionEvidence = { status: "posted_review" as const };
+        } else if (verification.status === "unavailable") {
+          prReviewCompletionEvidence = unavailablePrReviewVerification(verification.reason);
+        } else if (claimedReview) {
+          prReviewCompletionEvidence = {
+            status: "missing",
+            errorCode: "pr_review_output_missing",
+            errorMessage:
+              "PR reviewer run claimed a posted review, but GitHub has no exact-head review from a trusted reviewer identity",
+          };
         }
       }
       const prReviewIncompleteOverride =
@@ -19463,6 +20525,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ? "provider_throttled_no_progress"
           : prReviewIncompleteOverride
             ? prReviewIncompleteOverride.errorCode
+            // BLO-18285: name the fault only where the code would otherwise be
+            // the anonymous "adapter_failed" fallback. A specific adapter code
+            // (or a silent-failure verdict) is the more precise diagnosis and
+            // is left intact — the errorFamily tag below is what actually
+            // drives the retry, so the schedule is unaffected either way.
+            : transientUpstreamOverride && !adapterResult.errorCode && !silentFailureMessage
+              ? "provider_transient_upstream"
             : outcome === "timed_out"
           ? "timeout"
           : outcome === "cancelled"
@@ -19551,6 +20620,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               resultJson: {
                 ...parseObject(adapterResult.resultJson),
                 configFreshness: configFreshnessResultMetadata,
+                // BLO-18278: keep the provenance of a prose-recovered horizon so
+                // the strand comment can name the reset instant, and so a wrong
+                // parse is debuggable from the persisted run rather than only
+                // from the raw log. Set here, inside `resultJson`, because
+                // mergeAdapterRecoveryMetadata only forwards errorFamily and
+                // retryNotBefore — any other key passed alongside them is
+                // dropped.
+                ...(providerCapacityResetAt
+                  ? { providerCapacityResetAt: providerCapacityResetAt.toISOString() }
+                  : {}),
                 ...(prReviewIncompleteOverride
                   ? {
                     prReviewOutputGate: {
@@ -19564,10 +20643,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               // right schedule curve. rate_limit_exhausted -> flat 90s retry
               // (gate decides if pool has capacity); generic adapter-reported
               // transient_upstream -> exponential backoff.
+              // BLO-18285: a hint-less provider 503/529 on a k8s adapter also
+              // gets transient_upstream, so it takes the exponential curve
+              // (2m/10m/30m/2h) instead of finalizing untagged and stranding.
               errorFamily: rateLimitExhaustedOverride || providerThrottledNoProgressOverride
                 ? "rate_limit_exhausted"
+                : transientUpstreamOverride
+                  ? "transient_upstream"
                 : (adapterResult.errorFamily ?? null),
-              retryNotBefore: adapterResult.retryNotBefore ?? null,
+              retryNotBefore: effectiveRetryNotBefore,
               ...(providerThrottledNoProgressOverride ? { providerThrottleNoProgress: true } : {}),
             }),
             modelProfileApplication,
@@ -19798,7 +20882,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       );
     } catch (err) {
       const message = redactCurrentUserText(
-        err instanceof Error ? err.message : "Unknown adapter failure",
+        // BLO-19085: a drizzle write failure's `message` is the "Failed query"
+        // wrapper with every bind param inlined — the agent's whole stdout
+        // stream — while the SQLSTATE that actually explains it hangs off
+        // `.cause`. Persisting `err.message` stored 605KB of params and no
+        // diagnosis. describeDbError keeps the cause and drops the params;
+        // non-database errors fall through to their own message unchanged.
+        isDbError(err)
+          ? describeDbError(err, "run finalization db write failed")
+          : err instanceof Error
+            ? err.message
+            : "Unknown adapter failure",
         await getCurrentUserRedactionOptions(),
       );
       const workspaceValidationFailure = isWorkspaceValidationFailure(err) ? err : null;
@@ -19940,7 +21034,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // Setup code before adapter.execute threw (e.g. ensureRuntimeState, resolveWorkspaceForRun).
           // The inner catch did not fire, so we must record the failure here.
           const message = redactCurrentUserText(
-            outerErr instanceof Error ? outerErr.message : "Unknown setup failure",
+            // BLO-19085: same db-write-failure shaping as the inner catch.
+            isDbError(outerErr)
+              ? describeDbError(outerErr, "run setup db write failed")
+              : outerErr instanceof Error
+                ? outerErr.message
+                : "Unknown setup failure",
             await getCurrentUserRedactionOptions(),
           );
           // A missing secret/env binding is a known pre-dispatch configuration gap,
@@ -21024,7 +22123,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return true;
   }
 
-  async function enqueueWakeup(agentId: string, opts: WakeupOptions = {}) {
+  async function enqueueWakeup(
+    agentId: string,
+    opts: WakeupOptions = {},
+    suppression?: WakeSuppressionOutcome,
+  ) {
     const source = opts.source ?? "on_demand";
     const triggerDetail = opts.triggerDetail ?? null;
     const contextSnapshot: Record<string, unknown> = { ...(opts.contextSnapshot ?? {}) };
@@ -21065,6 +22168,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         finishedAt: new Date(),
         ...patch,
       });
+      // Recorded only after the insert commits, so a caller reading the sink
+      // never attributes a suppression to a row that does not exist. Every
+      // `return null` gate below and the two skip-then-throw gates
+      // (`budget.blocked`, `agent.not_invokable`) funnel through here, which is
+      // what lets `wakeupWithDispatchRetry` and the reconciler label the
+      // terminal `suppressed` metric with a real cause instead of guessing
+      // from the outcome shape (BLO-18859 review follow-up).
+      if (suppression) suppression.durableSkipReason = skipReason;
     };
     const writeSkippedHeartbeatRequest = async (skipReason: string, details: Record<string, unknown>) => {
       await writeSkippedRequest(skipReason, {
@@ -21277,14 +22388,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const resumeAtIso = gateResult.resumeAt ? gateResult.resumeAt.toISOString() : null;
       const scheduledRetryAt =
         gateResult.resumeAt ?? new Date(Date.now() + CCROTATE_CAPACITY_DEFAULT_RETRY_DELAY_MS);
-      const retryContextSnapshot = {
+      // BLO-18859 review follow-up: a capacity deferral is late, not lost — but
+      // only if whoever promotes this run can still tell which delivery it
+      // settles. Derive the label here, where `opts` is in hand and the exact
+      // same predicate the `deferred` increment used can be applied, rather
+      // than re-deriving it at promotion from snapshot fields the receiver
+      // happens to have set. Null for every non-GitHub wake, so the promoter
+      // stays scoped to this funnel.
+      const githubReviewWakeReason = githubPrReviewWakeReason({ reason, payload });
+      const retryContextSnapshotBase = {
         ...enrichedContextSnapshot,
         wakeSource: source,
         wakeTriggerDetail: triggerDetail,
         penstockProvider: gateResult.provider,
         penstockModel: gateResult.model,
+        ...(githubReviewWakeReason !== null ? { githubReviewWakeReason } : {}),
         ...(resumeAtIso ? { penstockResumeAt: resumeAtIso } : {}),
       };
+      const retryContextSnapshot = githubReviewWakeReason !== null
+        ? { ...retryContextSnapshotBase, [GITHUB_REVIEW_DELIVERY_COUNT_KEY]: 1 }
+        : retryContextSnapshotBase;
 
       return db.transaction(async (tx) => {
         await tx.execute(
@@ -21299,15 +22422,81 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           triggerDetail,
           reason,
           payload,
-          contextSnapshot: retryContextSnapshot,
+          contextSnapshot: retryContextSnapshotBase,
           taskKey: effectiveTaskKey,
           requestedByActorType: opts.requestedByActorType,
           requestedByActorId: opts.requestedByActorId,
           idempotencyKey: opts.idempotencyKey,
         });
-        if (coalescedRun) return coalescedRun;
+        if (coalescedRun) {
+          if (coalescedRun.status === "queued") {
+            return { run: coalescedRun, coalesced: true, deferred: false };
+          }
+          // BLO-18859 review follow-up: this delivery was counted `deferred`
+          // like any other, but coalescing means it will be settled by a run
+          // that already exists — and the promoter emits one `queued` per run.
+          // Left alone, N same-key deliveries produce N `deferred` and a single
+          // `queued`, a permanent received-without-queued gap that reads as
+          // loss. The rest of the funnel counts per *delivery* (the inline
+          // webhook path records `queued` on a coalesced run too), so carry the
+          // tally on the run and let the promoter close all of them at once.
+          //
+          // Incremented in SQL rather than through the merged snapshot because
+          // mergeCoalescedContextSnapshot is a last-writer-wins spread: the
+          // incoming snapshot deliberately omits the count key so it cannot
+          // clobber the accumulated count before this bump.
+          if (githubReviewWakeReason === null) {
+            return { run: coalescedRun, coalesced: true, deferred: true };
+          }
+          // Ally review (c13ff527) raised a lookup-to-update race here: if a
+          // promoter flips the row to `queued` between the coalesce lookup and
+          // this UPDATE, the zero-row fallback below would return a stale
+          // `deferred: true` for a delivery the promoter can no longer settle.
+          // That window does not exist, and the reason is a lock rather than
+          // the status predicate, so it is worth writing down.
+          //
+          // coalescePendingTaskScopeWake ends in `UPDATE ... WHERE id = ? AND
+          // status IN ('queued','scheduled_retry') RETURNING`, and returns null
+          // -- never a stale row -- when that matches nothing. So a non-null
+          // `coalescedRun` means this transaction already holds the row's
+          // exclusive write lock, and holds it until commit. A promoter's own
+          // conditional UPDATE therefore blocks on us and cannot interleave.
+          // The three orderings, exhaustively:
+          //   - promoter arrives after us: it blocks here, then re-reads under
+          //     READ COMMITTED and settles the tally this bump committed.
+          //   - promoter promoted first: status is `queued`, still coalescible,
+          //     so the merge UPDATE matched and the `queued` branch above
+          //     returned `deferred: false`. Never reaches this line.
+          //   - promoter gate-cancelled first: `cancelled` is not coalescible,
+          //     the merge UPDATE matched nothing, coalesce returned null, and
+          //     we fell through to INSERT a fresh run carrying this delivery.
+          // `?? coalescedRun` is left as a defensive no-op for the impossible
+          // fourth case. Pinned by the concurrency test at
+          // heartbeat-wake-dispatch-retry.test.ts "holds the coalescing tally
+          // lock against a promoter racing the count update".
+          await options.beforeGithubReviewCoalescedTallyUpdateForTest?.(coalescedRun);
+          const bumped = await tx
+            .update(heartbeatRuns)
+            .set({
+              contextSnapshot: sql`jsonb_set(
+                coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb),
+                ${`{${GITHUB_REVIEW_DELIVERY_COUNT_KEY}}`}::text[],
+                to_jsonb(
+                  coalesce(
+                    nullif(${heartbeatRuns.contextSnapshot} ->> ${GITHUB_REVIEW_DELIVERY_COUNT_KEY}, '')::int,
+                    0
+                  ) + 1
+                )
+              )`,
+              updatedAt: new Date(),
+            })
+            .where(and(eq(heartbeatRuns.id, coalescedRun.id), eq(heartbeatRuns.status, "scheduled_retry")))
+            .returning()
+            .then((rows) => rows[0] ?? coalescedRun);
+          return { run: bumped, coalesced: true, deferred: true };
+        }
 
-        return tx
+        const created = await tx
           .insert(heartbeatRuns)
           .values({
             companyId: agent.companyId,
@@ -21331,6 +22520,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           })
           .returning()
           .then((rows) => rows[0]);
+        return { run: created, coalesced: false, deferred: true };
       });
     }
 
@@ -21383,7 +22573,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           adapter: agent.adapterType,
           provider: penstockGateResult.provider,
         });
-        await persistProviderCapacityRetry(penstockGateResult);
+        const capacityRetry = await persistProviderCapacityRetry(penstockGateResult);
+        if (!capacityRetry.deferred) return capacityRetry.run;
+        // Signal the deferral to the caller *after* the scheduled_retry run is
+        // committed, so nothing can read "deferred" for a retry that does not
+        // exist. This is the only `return null` below that leaves
+        // durableSkipReason null on purpose: no skipped row is written because
+        // the wake is not declined, just postponed (BLO-18859 review
+        // follow-up).
+        if (suppression) suppression.providerCapacityDeferred = true;
         return null;
       }
     }
@@ -22548,10 +23746,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const sameScopeRunningRun = activeRuns.find(
       (candidate) => candidate.status === "running" && isSameTaskScope(runTaskKey(candidate), effectiveTaskKey),
     );
-    const shouldQueueFollowupForRunningWake =
-      Boolean(sameScopeRunningRun) &&
-      !sameScopeQueuedRun &&
-      shouldQueueFollowupForRunningIssueWake({ contextSnapshot: enrichedContextSnapshot, wakeCommentId });
+    // BLO-18953: an explicit review request is never satisfied by a review
+    // already in flight against an older head, so it must not be absorbed into
+    // a running same-scope run. Queued/scheduled_retry coalescing is preserved:
+    // those runs read head when they start.
+    const explicitPrReviewRequestWake = isExplicitPrReviewRequestWake(enrichedContextSnapshot);
+    const shouldQueueFollowupForRunningWake = shouldQueueFollowupInsteadOfAbsorbingIntoRunningRun({
+      hasRunningSameScopeRun: Boolean(sameScopeRunningRun),
+      hasQueuedSameScopeRun: Boolean(sameScopeQueuedRun),
+      contextSnapshot: enrichedContextSnapshot,
+      wakeCommentId,
+    });
     const rawCoalescedTarget =
       sameScopeQueuedRun ??
       sameScopeScheduledRetryRun ??
@@ -22567,32 +23772,35 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         coalescedTargetRun.contextSnapshot,
         enrichedContextSnapshot,
       );
+      const observedStatus = coalescedTargetRun.status;
       const mergedRun = await db
         .update(heartbeatRuns)
         .set({
           contextSnapshot: mergedContextSnapshot,
           updatedAt: new Date(),
         })
-        .where(eq(heartbeatRuns.id, coalescedTargetRun.id))
+        .where(and(eq(heartbeatRuns.id, coalescedTargetRun.id), eq(heartbeatRuns.status, observedStatus)))
         .returning()
-        .then((rows) => rows[0] ?? coalescedTargetRun);
+        .then((rows) => rows[0] ?? null);
 
-      await db.insert(agentWakeupRequests).values({
-        companyId: agent.companyId,
-        agentId,
-        source,
-        triggerDetail,
-        reason,
-        payload,
-        status: "coalesced",
-        coalescedCount: 1,
-        requestedByActorType: opts.requestedByActorType ?? null,
-        requestedByActorId: opts.requestedByActorId ?? null,
-        idempotencyKey: opts.idempotencyKey ?? null,
-        runId: mergedRun.id,
-        finishedAt: new Date(),
-      });
-      return mergedRun;
+      if (mergedRun) {
+        await db.insert(agentWakeupRequests).values({
+          companyId: agent.companyId,
+          agentId,
+          source,
+          triggerDetail,
+          reason,
+          payload,
+          status: "coalesced",
+          coalescedCount: 1,
+          requestedByActorType: opts.requestedByActorType ?? null,
+          requestedByActorId: opts.requestedByActorId ?? null,
+          idempotencyKey: opts.idempotencyKey ?? null,
+          runId: mergedRun.id,
+          finishedAt: new Date(),
+        });
+        return mergedRun;
+      }
     }
 
     const queueOutcome = await db.transaction(async (tx) => {
@@ -22621,8 +23829,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // found after taking the agent lock was created while this enqueue was
         // waiting. It is therefore a live concurrency race, not a pre-existing
         // zombie. Merge into it unless this wake intentionally needs a new run
-        // boundary (for example, an issue-comment follow-up).
-        includeRunning: !sameScopeRunningRun && !shouldQueueFollowupForRunningWake,
+        // boundary (for example, an issue-comment follow-up, or an explicit PR
+        // review request that a run already reviewing this PR cannot satisfy —
+        // BLO-18953).
+        includeRunning:
+          !sameScopeRunningRun &&
+          !shouldQueueFollowupForRunningWake &&
+          !explicitPrReviewRequestWake,
       });
       if (coalescedTaskScopeRun) {
         return { kind: "coalesced" as const, run: coalescedTaskScopeRun };
@@ -22770,15 +23983,154 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   // backoff long after this request has returned.
   const WAKE_DISPATCH_RETRY_BACKOFF_MS = [300, 1200];
 
+  /**
+   * BLO-18859: is this wake a GitHub PR-review reviewer wake, and if so what
+   * reason did the receiver mint it under? Returns null for every other wake so
+   * the delivery counter stays scoped to the GitHub review-request funnel —
+   * `wakeupWithDispatchRetry` is the generic wake path used by every caller, so
+   * an unconditional increment here would count issue-assigned, monitor, and
+   * sweep wakes as "review-request deliveries".
+   *
+   * Keyed on the `payload.source === "github"` + `payload.reviewKind ===
+   * "pr_review"` pair the receiver already stamps (see the reviewer wake in
+   * routes/github-webhook.ts) rather than a new marker field, so it works
+   * unchanged for rows written before this change and for the reconciler, which
+   * only has the round-tripped `originalOpts` to go on.
+   */
+  function githubPrReviewWakeReason(opts: WakeupOptions | null | undefined): string | null {
+    const payload = opts?.payload as Record<string, unknown> | null | undefined;
+    if (!payload || typeof payload !== "object") return null;
+    if (payload.source !== "github" || payload.reviewKind !== "pr_review") return null;
+    // A matched wake with an absent/non-string reason still counts; the metric
+    // helper collapses it to the bounded "other" series.
+    return typeof opts?.reason === "string" ? opts.reason : "";
+  }
+
+  /**
+   * The `heartbeat_runs`-row sibling of {@link githubPrReviewWakeReason}, for
+   * the promotion path (BLO-18859 review follow-up).
+   *
+   * A provider-capacity deferral commits a `scheduled_retry` run and returns
+   * null, so the delivery is counted `deferred`. Whoever closes that deferral
+   * out — `promoteScheduledRetryRun` — has only the run row to go on: the
+   * capacity path writes no `agent_wakeup_requests` row (hence the null
+   * `wakeupRequestId`) and `WakeupOptions.payload` is never persisted on a run.
+   *
+   * Primary source is the `githubReviewWakeReason` that
+   * `persistProviderCapacityRetry` stamps at write time, so the promotion path
+   * settles exactly the deliveries the dispatch path deferred — one predicate,
+   * evaluated once, against the real payload.
+   *
+   * The receiver-stamped fallback exists for rows written before that stamp.
+   * It has to key on the snapshot's own spelling: `enrichWakeContextSnapshot`
+   * copies `reviewKind` off the payload but not `source`, and the webhook route
+   * writes the origin as `commentSource: "github"` — so `payload.source`, which
+   * {@link githubPrReviewWakeReason} keys on, is simply not present here.
+   */
+  function githubPrReviewWakeReasonFromRunSnapshot(
+    snapshot: Record<string, unknown>,
+  ): string | null {
+    if (typeof snapshot.githubReviewWakeReason === "string") {
+      return snapshot.githubReviewWakeReason;
+    }
+    if (snapshot.reviewKind !== "pr_review") return null;
+    const fromGithub =
+      snapshot.commentSource === "github"
+      || snapshot.source === "github"
+      || readNonEmptyString(snapshot.githubDeliveryId) !== null;
+    if (!fromGithub) return null;
+    // Mirrors githubPrReviewWakeReason: a matched wake with a missing reason
+    // still counts and collapses to the bounded "other" series.
+    return typeof snapshot.wakeReason === "string" ? snapshot.wakeReason : "";
+  }
+
+  /**
+   * Out-parameter through which {@link enqueueWakeup} tells its caller *why* it
+   * declined a wake (BLO-18859 review follow-up). Needed because the two shapes
+   * a decline arrives in — a `null` return and a thrown `HttpError` — both hide
+   * the gate that fired, while the durable `agent_wakeup_requests.reason` the
+   * gate wrote is exactly the label the suppression metric and its alert need.
+   * A sink is cheaper than widening `enqueueWakeup`'s return type, which is
+   * consumed as `run | null` by dozens of call sites that do not care.
+   *
+   * Stays `null` when a wake succeeds, or when it fails without any gate having
+   * written a durable skipped row.
+   *
+   * `providerCapacityDeferred` marks the one `return null` that is NOT a
+   * decline at all: the penstock/ccrotate capacity gate, which commits a
+   * `scheduled_retry` heartbeat run the scheduler re-drives later. It needs its
+   * own flag rather than a `durableSkipReason` string because it writes no
+   * `skipped` row — so without it the null return is indistinguishable from a
+   * durable skip, gets counted terminal `suppressed`, and (having no reason)
+   * lands on the `other` cause the outage alert pages on. A provider rate-limit
+   * would page as "reviews are being dropped".
+   */
+  type WakeSuppressionOutcome = {
+    durableSkipReason: string | null;
+    providerCapacityDeferred: boolean;
+  };
+
   async function wakeupWithDispatchRetry(agentId: string, opts: WakeupOptions = {}) {
+    const githubReviewReason = githubPrReviewWakeReason(opts);
+    // Filled in by enqueueWakeup's writeSkippedRequest when a gate declines the
+    // wake durably, so the terminal `suppressed` metric below carries the real
+    // cause. Reset per attempt: a transient retry re-runs every gate, and a
+    // stale reason from a previous attempt would mislabel this one.
+    const suppression: WakeSuppressionOutcome = {
+      durableSkipReason: null,
+      providerCapacityDeferred: false,
+    };
     let lastError: unknown;
     for (let attempt = 0; attempt <= WAKE_DISPATCH_RETRY_BACKOFF_MS.length; attempt++) {
+      suppression.durableSkipReason = null;
+      suppression.providerCapacityDeferred = false;
       try {
-        return await enqueueWakeup(agentId, opts);
+        const result = await enqueueWakeup(agentId, opts, suppression);
+        if (!result && githubReviewReason !== null) {
+          if (suppression.providerCapacityDeferred) {
+            // Late, not lost: a scheduled_retry run is committed and the
+            // scheduler re-drives it when provider capacity returns. Not
+            // terminal, so it must stay off the suppression counter the outage
+            // alert reads.
+            recordGithubReviewRequestDelivery({ state: "deferred", reason: githubReviewReason });
+          } else {
+            // enqueueWakeup declined rather than failed: a status="skipped" row is
+            // committed and no run exists. Terminal -- no reconciler pass re-arms
+            // a skipped row.
+            recordGithubReviewRequestSuppressed({
+              reason: githubReviewReason,
+              cause: suppression.durableSkipReason,
+            });
+          }
+        }
+        return result;
       } catch (err) {
         lastError = err;
-        if (err instanceof HttpError) throw err;
+        if (err instanceof HttpError) {
+          // A business-rule refusal is as terminal as a `null` return: nothing
+          // retries it here and nothing reconciles it later. Counting it keeps
+          // `received == queued + suppressed + dead_lettered` closed; without
+          // this an agent that goes non-invokable between reviewer selection
+          // and dispatch left `received = 1` with no terminal outcome forever
+          // (BLO-18859 review follow-up). `budget.blocked` and
+          // `agent.not_invokable` reach here having written a durable skipped
+          // row, so they carry their own cause; an unresolvable agent or
+          // responsible user writes none and falls back to `dispatch_rejected`.
+          if (githubReviewReason !== null) {
+            recordGithubReviewRequestSuppressed({
+              reason: githubReviewReason,
+              cause: suppression.durableSkipReason ?? GITHUB_SUPPRESSION_CAUSE_DISPATCH_REJECTED,
+            });
+          }
+          throw err;
+        }
         if (attempt < WAKE_DISPATCH_RETRY_BACKOFF_MS.length) {
+          // Counted before sleeping so the increment reflects the retry we are
+          // committed to, once per re-dispatch attempt. A business-rule
+          // HttpError returns above and is not a retry.
+          if (githubReviewReason !== null) {
+            recordGithubReviewRequestDelivery({ state: "retried", reason: githubReviewReason });
+          }
           await new Promise((resolve) => setTimeout(resolve, WAKE_DISPATCH_RETRY_BACKOFF_MS[attempt]));
         }
       }
@@ -22821,12 +24173,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           idempotencyKey: opts.idempotencyKey ?? null,
         });
       } else {
+        // Terminal loss: no durable row exists, so no reconciler pass will ever
+        // pick this wake up. This is the original "lost forever, no record"
+        // mode, so it is dead-lettered immediately rather than after retry
+        // exhaustion (BLO-18859).
+        if (githubReviewReason !== null) {
+          recordGithubReviewRequestDelivery({ state: "dead_lettered", reason: githubReviewReason });
+        }
         logger.error(
           { agentId, err: lastError },
           "wake dispatch retry exhausted and agent could not be resolved; dropping without a durable record",
         );
       }
     } catch (persistErr) {
+      // Same terminal loss as the no-agent branch above: the safety-net insert
+      // itself failed, so nothing will retry this wake.
+      if (githubReviewReason !== null) {
+        recordGithubReviewRequestDelivery({ state: "dead_lettered", reason: githubReviewReason });
+      }
       logger.error(
         { err: persistErr, agentId, originalErr: lastError },
         "failed to persist durable wake-dispatch-failed record after retry exhaustion",
@@ -22883,14 +24247,91 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       const attempts = (retryState.attempts ?? 0) + 1;
       const originalOpts = retryState.originalOpts ?? {};
+      // Recovered from the round-tripped originalOpts, so a row written before
+      // this change still classifies correctly on its next reconcile pass.
+      const githubReviewReason = githubPrReviewWakeReason(originalOpts);
 
+      // Each reconcile pass is one re-dispatch attempt, counted up-front so a
+      // pass that throws in an unexpected place still shows as a retry.
+      if (githubReviewReason !== null) {
+        recordGithubReviewRequestDelivery({ state: "retried", reason: githubReviewReason });
+      }
+
+      // Declared outside the try because the HttpError branch below needs the
+      // cause too: `agent.not_invokable` writes its durable skipped row and
+      // then throws.
+      const suppression: WakeSuppressionOutcome = {
+        durableSkipReason: null,
+        providerCapacityDeferred: false,
+      };
       try {
-        await enqueueWakeup(row.agentId, originalOpts);
+        const recoveredRun = await enqueueWakeup(row.agentId, originalOpts, suppression);
+        if (!recoveredRun) {
+          // enqueueWakeup declined the wake rather than failing it: it wrote a
+          // status="skipped" row and returned null. Marking the original row
+          // `dispatch_recovered` here would claim a run that does not exist,
+          // and incrementing `queued` would close the funnel arithmetic on a
+          // delivery that is in fact terminally undelivered. Use the existing
+          // superseded terminal state (the reconciler never re-arms it) and
+          // count `suppressed` so the funnel still balances honestly.
+          //
+          // The provider-capacity gate is the exception: it committed a
+          // `scheduled_retry` run, so this row genuinely IS superseded by that
+          // run — but the delivery is postponed, not declined, and counting it
+          // `suppressed` would both mislabel it and (having no skip reason)
+          // page the outage alert via the `other` cause on an ordinary provider
+          // rate-limit (BLO-18859 review follow-up).
+          await db
+            .update(agentWakeupRequests)
+            .set({
+              status: "dispatch_superseded",
+              error: suppression.providerCapacityDeferred
+                ? "re-dispatch was deferred by the provider-capacity gate (scheduled_retry run committed)"
+                : "re-dispatch was declined by a scheduling gate (enqueueWakeup returned null)",
+              finishedAt: now,
+              updatedAt: now,
+            })
+            .where(eq(agentWakeupRequests.id, row.id));
+          superseded += 1;
+          if (githubReviewReason !== null) {
+            if (suppression.providerCapacityDeferred) {
+              recordGithubReviewRequestDelivery({ state: "deferred", reason: githubReviewReason });
+            } else {
+              recordGithubReviewRequestSuppressed({
+                reason: githubReviewReason,
+                cause: suppression.durableSkipReason,
+              });
+            }
+          }
+          logger.warn(
+            {
+              agentId: row.agentId,
+              wakeupRequestId: row.id,
+              attempts,
+              cause: suppression.durableSkipReason,
+              providerCapacityDeferred: suppression.providerCapacityDeferred,
+            },
+            suppression.providerCapacityDeferred
+              ? "wake dispatch re-attempt was deferred by the provider-capacity gate; marking "
+                + "superseded in favour of the scheduled_retry run (BLO-18859)"
+              : "wake dispatch re-attempt was suppressed by a scheduling gate; marking superseded "
+                + "rather than recovered (BLO-18859)",
+          );
+          continue;
+        }
         await db
           .update(agentWakeupRequests)
           .set({ status: "dispatch_recovered", finishedAt: now, updatedAt: now })
           .where(eq(agentWakeupRequests.id, row.id));
         recovered += 1;
+        // The delivery reached the queued state after all, just later than the
+        // inline path. Counting it here keeps the funnel arithmetic closed
+        // (received = queued + suppressed + dead_lettered + in-flight chains);
+        // without it a reconciler-recovered delivery would leave a permanent
+        // phantom received-without-queued gap that reads as loss (BLO-18859).
+        if (githubReviewReason !== null) {
+          recordGithubReviewRequestDelivery({ state: "queued", reason: githubReviewReason });
+        }
       } catch (err) {
         if (err instanceof HttpError) {
           await db
@@ -22903,6 +24344,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             })
             .where(eq(agentWakeupRequests.id, row.id));
           superseded += 1;
+          // `dispatch_superseded` is terminal — the reconciler's query only
+          // picks up `dispatch_failed` rows, so nothing re-arms this one. Left
+          // uncounted, a reviewer whose agent went non-invokable between the
+          // original dispatch and this pass kept `received = 1` with no
+          // terminal outcome forever (BLO-18859 review follow-up).
+          if (githubReviewReason !== null) {
+            recordGithubReviewRequestSuppressed({
+              reason: githubReviewReason,
+              cause: suppression.durableSkipReason ?? GITHUB_SUPPRESSION_CAUSE_DISPATCH_REJECTED,
+            });
+          }
           continue;
         }
 
@@ -22917,6 +24369,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             })
             .where(eq(agentWakeupRequests.id, row.id));
           exhausted += 1;
+          // Terminal: the row is now dispatch_failed_exhausted and the
+          // reconciler never re-arms it, so this review request will never
+          // produce a run without operator action (BLO-18859).
+          if (githubReviewReason !== null) {
+            recordGithubReviewRequestDelivery({ state: "dead_lettered", reason: githubReviewReason });
+          }
           logger.error(
             { agentId: row.agentId, wakeupRequestId: row.id, attempts, err },
             "wake dispatch retry exhausted after max attempts; giving up (BLO-14395)",
@@ -22944,7 +24402,112 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
     }
 
+    await publishGithubReviewDeadLetterGauge(now);
+
     return { recovered, superseded, exhausted, stillFailing };
+  }
+
+  /**
+   * Recency window for {@link publishGithubReviewDeadLetterGauge}. A
+   * `dispatch_failed_exhausted` row is terminal and is never cleared, so an
+   * all-time count would climb monotonically and pin the alert on forever
+   * after the first dead letter. Bounding by `finishedAt` instead makes the
+   * gauge mean "dead letters that landed recently enough to still be worth
+   * acting on", which is the alertable question.
+   *
+   * Comfortably wider than the alert's own evaluation window so a dead letter
+   * cannot age out mid-`for` and resolve the alert before anyone sees it.
+   */
+  const GITHUB_DEAD_LETTER_GAUGE_WINDOW_MS = 24 * 60 * 60 * 1000;
+  const GITHUB_DEAD_LETTER_GAUGE_SCAN_LIMIT = 500;
+
+  /**
+   * Re-derive the unresolved GitHub review-request dead-letter gauge from
+   * committed `agent_wakeup_requests` rows (BLO-18859 review follow-up).
+   *
+   * Classification is done in JS through {@link githubPrReviewWakeReason} on
+   * the round-tripped `originalOpts` rather than by reaching into the JSON in
+   * SQL. The markers sit four levels deep
+   * (`payload.dispatchRetry.originalOpts.payload.source`), and a hand-written
+   * path expression here would be a second, silently-drifting copy of the
+   * predicate the increment sites use.
+   *
+   * Best-effort: a failure here must not break the reconcile pass, whose real
+   * job is re-driving dispatches. A stale gauge is worse than a fresh one but
+   * far better than a stalled retry chain.
+   */
+  async function publishGithubReviewDeadLetterGauge(now: Date) {
+    try {
+      const cutoff = new Date(now.getTime() - GITHUB_DEAD_LETTER_GAUGE_WINDOW_MS);
+      const byReason: Record<string, number> = {};
+
+      // Source 1: dispatch chains that burned their retry budget.
+      //
+      // The SQL pre-filter is a deliberate *superset* of the JS predicate: it
+      // only requires that the GitHub markers appear somewhere in the payload,
+      // and the authoritative classification still happens below. That keeps
+      // the single source of truth in `githubPrReviewWakeReason` while making
+      // sure unrelated exhausted wakes can no longer consume the row cap and
+      // hide real dead letters (BLO-18859 review follow-up). Newest-first
+      // ordering makes the cap drop the least actionable rows rather than an
+      // arbitrary set.
+      const rows = await db
+        .select({ payload: agentWakeupRequests.payload })
+        .from(agentWakeupRequests)
+        .where(
+          and(
+            eq(agentWakeupRequests.status, "dispatch_failed_exhausted"),
+            gte(agentWakeupRequests.finishedAt, cutoff),
+            sql`${agentWakeupRequests.payload}::text ilike '%github%'`,
+          ),
+        )
+        .orderBy(desc(agentWakeupRequests.finishedAt))
+        .limit(GITHUB_DEAD_LETTER_GAUGE_SCAN_LIMIT);
+
+      for (const row of rows) {
+        const payload = parseObject(row.payload);
+        const retryState = parseObject(payload.dispatchRetry) as { originalOpts?: WakeupOptions };
+        const reason = githubPrReviewWakeReason(retryState.originalOpts ?? {});
+        if (reason === null) continue;
+        byReason[reason] = (byReason[reason] ?? 0) + 1;
+      }
+
+      // Source 2: provider-capacity retries that outlived their budget.
+      //
+      // These never touch `agent_wakeup_requests` — the capacity path parks the
+      // delivery on a `scheduled_retry` heartbeat run and, when the pool never
+      // recovers, cancels that run. It is just as terminal as an exhausted
+      // dispatch chain (nothing re-drives a cancelled run) and increments the
+      // same `dead_lettered` counter, so omitting it here meant a restart
+      // before the first scrape — or during the alert's `for` window — silently
+      // erased the loss. Scoping to the capacity retry reason keeps ordinary
+      // operator cancellations out of the gauge.
+      const capacityRows = await db
+        .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.status, "cancelled"),
+            eq(heartbeatRuns.errorCode, "rate_limit_exhausted"),
+            eq(heartbeatRuns.scheduledRetryReason, CCROTATE_CAPACITY_RETRY_REASON),
+            gte(heartbeatRuns.finishedAt, cutoff),
+          ),
+        )
+        .orderBy(desc(heartbeatRuns.finishedAt))
+        .limit(GITHUB_DEAD_LETTER_GAUGE_SCAN_LIMIT);
+
+      for (const row of capacityRows) {
+        const snapshot = parseObject(row.contextSnapshot);
+        const reason = githubPrReviewWakeReasonFromRunSnapshot(snapshot);
+        if (reason === null) continue;
+        // One cancelled run can bury several coalesced deliveries.
+        byReason[reason] = (byReason[reason] ?? 0) + readGithubReviewDeliveryCount(snapshot);
+      }
+
+      setGithubReviewRequestDeadLetterUnresolved(byReason);
+    } catch (err) {
+      logger.warn({ err }, "failed to publish github review dead-letter gauge (BLO-18859)");
+    }
   }
 
   async function listProjectScopedRunIds(companyId: string, projectId: string) {

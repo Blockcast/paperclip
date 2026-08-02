@@ -17,18 +17,18 @@ import {
   secretService,
 } from "../services/index.js";
 import { assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
-import { redactEventPayload } from "../redaction.js";
+import { redactApprovalPayloadByType } from "../redaction.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { resolveApprovalWithSideEffects } from "../services/approval-resolution.js";
 
-function redactApprovalPayload<T extends { payload: Record<string, unknown> }>(approval: T): T {
+function redactApprovalPayload<T extends { type: string; payload: Record<string, unknown> }>(approval: T): T {
   return {
     ...approval,
-    payload: redactEventPayload(approval.payload) ?? {},
+    payload: redactApprovalPayloadByType(approval.type, approval.payload),
   };
 }
 
-function approvalResolutionResponse<T extends { payload: Record<string, unknown> }>(
+function approvalResolutionResponse<T extends { type: string; payload: Record<string, unknown> }>(
   approval: T,
   applied: boolean,
 ): T & { applied: boolean } {
@@ -152,8 +152,14 @@ export function approvalRoutes(
       ...approvalInput,
       payload: normalizedPayload,
       requestedByUserId: actor.actorType === "user" ? actor.actorId : null,
+      // An agent actor cannot nominate a different requester. The body field stays honoured for
+      // user actors (a human filing on an agent's behalf), but letting an agent set it would make
+      // `requestedByAgentId` unusable as an attribution signal — anything downstream that reasons
+      // about who asked for an approval could be pointed at an innocent agent.
       requestedByAgentId:
-        approvalInput.requestedByAgentId ?? (actor.actorType === "agent" ? actor.actorId : null),
+        actor.actorType === "agent"
+          ? actor.actorId
+          : (approvalInput.requestedByAgentId ?? null),
       status: "pending",
       decisionNote: null,
       decidedByUserId: null,

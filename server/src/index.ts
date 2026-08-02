@@ -78,6 +78,7 @@ import {
 import { BUNDLED_PLUGIN_PACKAGES } from "./bootstrap/bundled-plugin-packages.js";
 import { initTelemetry, getTelemetryClient } from "./telemetry.js";
 import { conflict } from "./errors.js";
+import { githubReviewerAppSlug } from "./services/github-app-auth.js";
 import { coordinateHeartbeatSchedulerShutdown } from "./shutdown.js";
 import type {
   InstanceDatabaseBackupRunResult,
@@ -257,6 +258,29 @@ export async function startServer(): Promise<StartedServer> {
   // connection or the HTTP server exists — see instrumentation.ts.
   await instrumentationReady;
   let config = loadConfig();
+  if (config.githubPrReviewerAgentIds.length > 0) {
+    if (!githubReviewerAppSlug(config.prReviewerBotLogin)) {
+      logger.warn(
+        { configuredLogin: config.prReviewerBotLogin || null },
+        "PAPERCLIP_PR_REVIEWER_BOT_LOGIN must use an App identity such as <slug>[bot] or app/<slug>; bare user logins cannot verify PR-review evidence",
+      );
+    } else {
+      const missingGithubAppCredentialNames = [
+        !config.githubAppId?.trim() ? "GITHUB_APP_ID" : null,
+        !config.githubAppInstallationId?.trim() ? "GITHUB_APP_INSTALLATION_ID" : null,
+        !config.githubAppPrivateKey?.trim() ? "GITHUB_APP_PRIVATE_KEY" : null,
+      ].filter((value): value is string => Boolean(value));
+      if (missingGithubAppCredentialNames.length > 0) {
+        logger.warn(
+          {
+            configuredLogin: config.prReviewerBotLogin,
+            missingCredentials: missingGithubAppCredentialNames,
+          },
+          "GitHub App credentials are required to verify PR-review evidence; missing credentials will fail reviewer completion closed",
+        );
+      }
+    }
+  }
   initTelemetry({ enabled: config.telemetryEnabled });
   if (process.env.PAPERCLIP_SECRETS_PROVIDER === undefined) {
     process.env.PAPERCLIP_SECRETS_PROVIDER = config.secretsProvider;
@@ -672,6 +696,10 @@ export async function startServer(): Promise<StartedServer> {
   }
   
   let authReady = config.deploymentMode === "local_trusted";
+  let authCapabilities: import("./auth/capabilities.js").AuthCapabilities = {
+    emailPasswordEnabled: true,
+    oidcProviders: [],
+  };
   let betterAuthHandler: RequestHandler | undefined;
   let resolveSession:
     | ((req: ExpressRequest) => Promise<BetterAuthSessionResult | null>)
@@ -695,6 +723,7 @@ export async function startServer(): Promise<StartedServer> {
       createBetterAuthHandler,
       createBetterAuthInstance,
       deriveAuthTrustedOrigins,
+      loadAuthCapabilities,
       resolveBetterAuthSession,
       resolveBetterAuthSessionFromHeaders,
     } = await import("./auth/better-auth.js");
@@ -717,6 +746,7 @@ export async function startServer(): Promise<StartedServer> {
       "Authenticated mode auth origin configuration",
     );
     const auth = createBetterAuthInstance(db as any, config, effectiveTrustedOrigins);
+    authCapabilities = loadAuthCapabilities();
     betterAuthHandler = createBetterAuthHandler(auth);
     resolveSession = (req) => resolveBetterAuthSession(auth, req);
     resolveSessionFromHeaders = (headers) => resolveBetterAuthSessionFromHeaders(auth, headers);
@@ -931,6 +961,7 @@ export async function startServer(): Promise<StartedServer> {
     allowedHostnames: config.allowedHostnames,
     bindHost: config.host,
     authReady,
+    authCapabilities,
     companyDeletionEnabled: config.companyDeletionEnabled,
     authPublicBaseUrl: config.authPublicBaseUrl ?? null,
     pluginMigrationDb: pluginMigrationDb as any,
@@ -1065,6 +1096,7 @@ export async function startServer(): Promise<StartedServer> {
   let prepareHotRestartShutdown: ((signal: "SIGINT" | "SIGTERM") => Promise<{ skipDrain: boolean }>) | null = null;
   let workerHeartbeat: ReturnType<typeof heartbeatService> | null = null;
   let heartbeatSchedulerStopped = false;
+  let heartbeatStartupRecoveryPending = false;
   let heartbeatSchedulerInterval: ReturnType<typeof setInterval> | null = null;
   const heartbeatSchedulerInFlight = new Set<Promise<void>>();
   const trackHeartbeatSchedulerWork = (work: Promise<unknown>) => {
@@ -1120,6 +1152,7 @@ export async function startServer(): Promise<StartedServer> {
         "heartbeat scheduling suppressed for this runtime instance",
       );
     } else {
+      heartbeatStartupRecoveryPending = true;
       const startupHeartbeatRecovery = (async () => {
         try {
           const reattachedExternalRuns = await heartbeat.resumeRunningExternalRuntimeRuns();
@@ -1238,9 +1271,10 @@ export async function startServer(): Promise<StartedServer> {
         }
       })().catch((err) => {
         logger.error({ err }, "startup heartbeat recovery failed");
+      }).finally(() => {
+        heartbeatStartupRecoveryPending = false;
       });
       trackHeartbeatSchedulerWork(startupHeartbeatRecovery);
-      await startupHeartbeatRecovery;
     }
 
     const setupCleanup = await environmentCustomImages.cleanupExpiredSetupSessions();
@@ -1258,7 +1292,7 @@ export async function startServer(): Promise<StartedServer> {
       // resolver (e.g. worktree run-execution opt-in). The gated work is still
       // wrapped in trackHeartbeatSchedulerWork with its own error handling.
       void (async () => {
-        if (heartbeatSchedulerStopped) return;
+        if (heartbeatSchedulerStopped || heartbeatStartupRecoveryPending) return;
         const sweptRuntimeStatuses = heartbeat.sweepExpiredRuntimeStatuses();
         if (sweptRuntimeStatuses > 0) {
           logger.info(
@@ -1579,29 +1613,6 @@ export async function startServer(): Promise<StartedServer> {
       { role: config.paperclipNodeRole },
       "skipping auto-install of bundled plugins (API tier — workers tier owns plugin lifecycle)",
     );
-  }
-
-  // BLO-6295 piece D — daily Microsoft Entra group reconciler. Gated on
-  // MICROSOFT_GROUP_RECONCILE_ENABLED=true; only the worker / all tier
-  // runs it so HA API replicas don't spin up parallel reconcilers.
-  if (
-    process.env.MICROSOFT_GROUP_RECONCILE_ENABLED === "true" &&
-    config.paperclipNodeRole !== "api"
-  ) {
-    void (async () => {
-      try {
-        const { startMicrosoftGroupReconciler } = await import(
-          "./services/microsoft-group-reconciler.js"
-        );
-        startMicrosoftGroupReconciler({ db: db as any });
-        logger.info(
-          { role: config.paperclipNodeRole },
-          "microsoft-group-reconciler started",
-        );
-      } catch (err) {
-        logger.warn({ err }, "microsoft-group-reconciler failed to start (non-fatal)");
-      }
-    })();
   }
 
   // Start Linear tunnel if Linear is connected and cloudflared is available.

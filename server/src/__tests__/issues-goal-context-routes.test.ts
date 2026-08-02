@@ -15,6 +15,7 @@ const mockIssueService = vi.hoisted(() => ({
   listProductivityReviews: vi.fn(),
   getCurrentScheduledRetry: vi.fn(),
   getActiveInboxArchiveFields: vi.fn(),
+  getActiveRun: vi.fn(),
   listAttachments: vi.fn(),
 }));
 
@@ -55,6 +56,11 @@ const mockFeedbackService = vi.hoisted(() => ({
 const mockHeartbeatService = vi.hoisted(() => ({
   wakeup: vi.fn(async () => undefined),
   reportRunActivity: vi.fn(async () => undefined),
+}));
+
+const mockIssueRecoveryActionService = vi.hoisted(() => ({
+  getActiveForIssue: vi.fn(async () => null),
+  listActiveForIssues: vi.fn(async () => new Map()),
 }));
 
 const mockInstanceSettingsService = vi.hoisted(() => ({
@@ -117,10 +123,7 @@ vi.mock("../services/index.js", () => ({
   heartbeatService: () => mockHeartbeatService,
   instanceSettingsService: () => mockInstanceSettingsService,
   issueApprovalService: () => ({}),
-  issueRecoveryActionService: () => ({
-    getActiveForIssue: vi.fn(async () => null),
-    listActiveForIssues: vi.fn(async () => new Map()),
-  }),
+  issueRecoveryActionService: () => mockIssueRecoveryActionService,
   issueThreadInteractionService: () => ({
     listForIssue: vi.fn(async () => []),
     expireRequestConfirmationsSupersededByComment: vi.fn(async () => []),
@@ -138,11 +141,11 @@ vi.mock("../services/execution-workspaces.js", () => ({
   executionWorkspaceService: () => mockExecutionWorkspaceService,
 }));
 
-function createApp() {
+function createApp(actor?: Record<string, unknown>) {
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
-    (req as any).actor = {
+    (req as any).actor = actor ?? {
       type: "board",
       userId: "local-board",
       companyIds: ["company-1"],
@@ -212,7 +215,10 @@ describe.sequential("issue goal context routes", () => {
     mockIssueService.listProductivityReviews.mockResolvedValue(new Map());
     mockIssueService.getCurrentScheduledRetry.mockResolvedValue(null);
     mockIssueService.getActiveInboxArchiveFields.mockResolvedValue({});
+    mockIssueService.getActiveRun.mockResolvedValue(null);
     mockIssueService.listAttachments.mockResolvedValue([]);
+    mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(null);
+    mockIssueRecoveryActionService.listActiveForIssues.mockResolvedValue(new Map());
     mockDocumentsService.getIssueDocumentPayload.mockResolvedValue({});
     mockDocumentsService.getIssueDocumentByKey.mockResolvedValue(null);
     mockExecutionWorkspaceService.getById.mockResolvedValue(null);
@@ -368,7 +374,7 @@ describe.sequential("issue goal context routes", () => {
         updatedAt: new Date("2026-03-20T00:00:00Z"),
       },
     });
-    mockExecutionWorkspaceService.getById.mockResolvedValueOnce({
+    mockExecutionWorkspaceService.getById.mockResolvedValue({
       id: workspaceId,
       companyId: "company-1",
       projectId: legacyProjectLinkedIssue.projectId,
@@ -442,6 +448,146 @@ describe.sequential("issue goal context routes", () => {
     );
     expect(mockGoalService.getDefaultCompanyGoal).not.toHaveBeenCalled();
     expect(res.body.attachments).toEqual([]);
+  });
+
+  // BLO-19087: the mention wake tells an agent to read this thread and the
+  // heartbeat procedure tells it to "respond in comments if useful" — but on an
+  // issue assigned to someone else that reply is a 403. heartbeat-context is
+  // read at the start of the woken run, so it is the last honest moment to say
+  // so before the agent spends a call finding out.
+  describe("replyAuthorization (BLO-19087)", () => {
+    const mentionedAgentId = "99999999-9999-4999-8999-999999999999";
+    const assigneeAgentId = "33333333-3333-4333-8333-333333333333";
+
+    function agentActor(agentId: string, runId: string | null = "run-1") {
+      return { type: "agent", agentId, companyId: "company-1", source: "agent_key", runId };
+    }
+
+    it("warns a woken non-assignee agent that it cannot reply, and where to go", async () => {
+      mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+        allowed: input.action === "issue:read",
+        action: input.action,
+        reason: input.action === "issue:read" ? "allow_test" : "deny_missing_grant",
+        explanation: "Test.",
+      }));
+
+      const res = await request(createApp(agentActor(mentionedAgentId))).get(
+        "/api/issues/11111111-1111-4111-8111-111111111111/heartbeat-context",
+      );
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body.replyAuthorization).toMatchObject({
+        canComment: false,
+        reason: "deny_missing_grant",
+        boundary: "grant",
+      });
+      expect(res.body.replyAuthorization.remediation).toContain(`agent://${assigneeAgentId}`);
+      expect(res.body.replyAuthorization.remediation).toContain(`agent://${mentionedAgentId}`);
+    });
+
+    // The advertised verdict must come from the same decision the comment route
+    // enforces with — a re-derived copy is exactly how the wake/grant split
+    // arose. Assert it reports allow when the authorizer allows.
+    it("reports canComment when the authorizer allows the comment", async () => {
+      mockAccessService.decide.mockResolvedValue({
+        allowed: true,
+        action: "issue:comment",
+        reason: "allow_issue_mention_grant",
+        explanation: "Allowed by a mention-scoped issue comment grant.",
+      });
+
+      const res = await request(createApp(agentActor(mentionedAgentId))).get(
+        "/api/issues/11111111-1111-4111-8111-111111111111/heartbeat-context",
+      );
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body.replyAuthorization).toMatchObject({ canComment: true, remediation: null });
+    });
+
+    it("reports canComment for an active source-scoped recovery owner", async () => {
+      mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+        allowed: input.action === "issue:read",
+        action: input.action,
+        reason: input.action === "issue:read" ? "allow_test" : "deny_missing_grant",
+        explanation: "Test.",
+      }));
+      mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue({
+        ownerAgentId: mentionedAgentId,
+      });
+
+      const res = await request(createApp(agentActor(mentionedAgentId))).get(
+        "/api/issues/11111111-1111-4111-8111-111111111111/heartbeat-context",
+      );
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body.replyAuthorization).toMatchObject({
+        canComment: true,
+        reason: "allow_source_scoped_recovery_owner",
+        remediation: null,
+      });
+    });
+
+    it("reports canComment for the current execution run without a comment grant", async () => {
+      mockIssueService.getById.mockResolvedValue({
+        ...legacyProjectLinkedIssue,
+        status: "in_progress",
+        assigneeAgentId,
+        checkoutRunId: "run-1",
+      });
+      mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+        allowed: input.action === "issue:read",
+        action: input.action,
+        reason: input.action === "issue:read" ? "allow_test" : "deny_missing_grant",
+        explanation: "Test.",
+      }));
+
+      const res = await request(createApp(agentActor(assigneeAgentId))).get(
+        "/api/issues/11111111-1111-4111-8111-111111111111/heartbeat-context",
+      );
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body.replyAuthorization).toMatchObject({
+        canComment: true,
+        reason: "allow_current_issue_execution_run",
+        remediation: null,
+      });
+      expect(mockAccessService.decide).not.toHaveBeenCalledWith(expect.objectContaining({ action: "issue:comment" }));
+    });
+
+    it("reports the same missing run id denial enforced by comment writes", async () => {
+      mockIssueService.getById.mockResolvedValue({
+        ...legacyProjectLinkedIssue,
+        status: "in_progress",
+        assigneeAgentId,
+      });
+      mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+        allowed: true,
+        action: input.action,
+        reason: input.action === "issue:comment" ? "allow_explicit_grant" : "allow_test",
+        explanation: "Test.",
+      }));
+
+      const res = await request(createApp(agentActor(assigneeAgentId, null))).get(
+        "/api/issues/11111111-1111-4111-8111-111111111111/heartbeat-context",
+      );
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body.replyAuthorization).toMatchObject({
+        canComment: false,
+        reason: "deny_missing_run_id",
+        boundary: "run",
+      });
+      expect(res.body.replyAuthorization.remediation).toContain("active agent run id");
+    });
+
+    it("omits replyAuthorization for board actors, who are not wake targets", async () => {
+      const res = await request(createApp()).get(
+        "/api/issues/11111111-1111-4111-8111-111111111111/heartbeat-context",
+      );
+
+      expect(res.status).toBe(200);
+      expect(res.body.replyAuthorization).toBeNull();
+    });
   });
 
   it("preserves direct continuation summary lookup in GET /issues/:id/heartbeat-context", async () => {

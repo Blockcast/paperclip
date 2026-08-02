@@ -3,9 +3,7 @@ import {
   loadDexRbacConfig,
   parseIdTokenGroups,
   reconcileDexUser,
-  reconcileMicrosoftUser,
-  loadMicrosoftRbacConfig,
-} from "../auth/microsoft-rbac.js";
+} from "../auth/oidc-rbac.js";
 
 function makeJwt(payload: Record<string, unknown>): string {
   const header = Buffer.from(JSON.stringify({ alg: "RS256", typ: "JWT" })).toString("base64url");
@@ -30,10 +28,7 @@ describe("parseIdTokenGroups", () => {
     expect(parseIdTokenGroups(idToken)).toEqual([]);
   });
 
-  it("returns [] for a token with a non-array groups claim (overage indicator)", () => {
-    // When a user is in >200 groups, Entra returns `_claim_names` instead of
-    // an inline array. We treat that as "no groups" here — the daily Graph
-    // reconciler is responsible for over-200 cases.
+  it("returns [] for a token with a non-array groups claim", () => {
     const idToken = makeJwt({ sub: "u1", _claim_names: { groups: "src1" } });
     expect(parseIdTokenGroups(idToken)).toEqual([]);
   });
@@ -48,45 +43,6 @@ describe("parseIdTokenGroups", () => {
   it("filters non-string entries out of the groups array", () => {
     const idToken = makeJwt({ groups: ["980aeb78", 123, null, "675cb5f3"] });
     expect(parseIdTokenGroups(idToken)).toEqual(["980aeb78", "675cb5f3"]);
-  });
-});
-
-describe("loadMicrosoftRbacConfig", () => {
-  it("falls back to production defaults when env vars are unset", () => {
-    const saved = {
-      a: process.env.MICROSOFT_BLOCKCAST_COMPANY_ID,
-      b: process.env.MICROSOFT_SSH_USERS_GROUP_ID,
-      c: process.env.MICROSOFT_ADMIN_AGENTS_GROUP_ID,
-    };
-    delete process.env.MICROSOFT_BLOCKCAST_COMPANY_ID;
-    delete process.env.MICROSOFT_SSH_USERS_GROUP_ID;
-    delete process.env.MICROSOFT_ADMIN_AGENTS_GROUP_ID;
-    try {
-      const cfg = loadMicrosoftRbacConfig();
-      expect(cfg.blockcastCompanyId).toBe("aaced805-3491-4ee5-9b14-cdf70cb81d47");
-      expect(cfg.sshUsersGroupId).toBe("980aeb78-a886-4dae-98bb-7a9893d20706");
-      expect(cfg.adminAgentsGroupId).toBe("675cb5f3-4a94-4514-96d8-9899587b19ed");
-    } finally {
-      if (saved.a !== undefined) process.env.MICROSOFT_BLOCKCAST_COMPANY_ID = saved.a;
-      if (saved.b !== undefined) process.env.MICROSOFT_SSH_USERS_GROUP_ID = saved.b;
-      if (saved.c !== undefined) process.env.MICROSOFT_ADMIN_AGENTS_GROUP_ID = saved.c;
-    }
-  });
-
-  it("honors env overrides for staging tenants", () => {
-    process.env.MICROSOFT_BLOCKCAST_COMPANY_ID = "00000000-0000-0000-0000-000000000001";
-    process.env.MICROSOFT_SSH_USERS_GROUP_ID = "00000000-0000-0000-0000-000000000002";
-    process.env.MICROSOFT_ADMIN_AGENTS_GROUP_ID = "00000000-0000-0000-0000-000000000003";
-    try {
-      const cfg = loadMicrosoftRbacConfig();
-      expect(cfg.blockcastCompanyId).toBe("00000000-0000-0000-0000-000000000001");
-      expect(cfg.sshUsersGroupId).toBe("00000000-0000-0000-0000-000000000002");
-      expect(cfg.adminAgentsGroupId).toBe("00000000-0000-0000-0000-000000000003");
-    } finally {
-      delete process.env.MICROSOFT_BLOCKCAST_COMPANY_ID;
-      delete process.env.MICROSOFT_SSH_USERS_GROUP_ID;
-      delete process.env.MICROSOFT_ADMIN_AGENTS_GROUP_ID;
-    }
   });
 });
 
@@ -128,7 +84,7 @@ describe("loadDexRbacConfig", () => {
   });
 });
 
-describe("reconcileMicrosoftUser (mocked db)", () => {
+describe("reconcileDexUser (mocked db)", () => {
   function makeDb() {
     // Track inserts and existing rows via a simple in-memory store. The
     // shape mirrors what drizzle's chained API expects: select().from().
@@ -178,9 +134,12 @@ describe("reconcileMicrosoftUser (mocked db)", () => {
   }
 
   const cfg = {
+    providerId: "dex",
     blockcastCompanyId: "co-blockcast",
-    sshUsersGroupId: "g-ssh",
-    adminAgentsGroupId: "g-admin",
+    operatorGroupId: "g-ssh",
+    adminGroupId: "g-admin",
+    adminApprovalType: "dex_admin_elevation",
+    payloadSource: "dex_groups_claim",
   };
 
   it("inserts a new operator membership when user is in ssh-users", async () => {
@@ -190,7 +149,7 @@ describe("reconcileMicrosoftUser (mocked db)", () => {
     db.select = vi.fn(() => ({
       from: () => ({ where: () => ({ limit: () => [] }) }),
     }));
-    const result = await reconcileMicrosoftUser(db, "user-1", ["g-ssh"], cfg);
+    const result = await reconcileDexUser(db, "user-1", ["g-ssh"], cfg);
     expect(result.addedMembership).toBe(true);
     expect(result.pendingAdminElevation).toBe(false);
     expect(db.insert).toHaveBeenCalledTimes(1);
@@ -205,7 +164,7 @@ describe("reconcileMicrosoftUser (mocked db)", () => {
         }),
       }),
     }));
-    const result = await reconcileMicrosoftUser(db, "user-1", ["g-ssh"], cfg);
+    const result = await reconcileDexUser(db, "user-1", ["g-ssh"], cfg);
     expect(result.addedMembership).toBe(false);
     expect(db.insert).not.toHaveBeenCalled();
     expect(db.update).not.toHaveBeenCalled();
@@ -220,7 +179,7 @@ describe("reconcileMicrosoftUser (mocked db)", () => {
         }),
       }),
     }));
-    const result = await reconcileMicrosoftUser(db, "user-1", ["g-ssh"], cfg);
+    const result = await reconcileDexUser(db, "user-1", ["g-ssh"], cfg);
     expect(result.addedMembership).toBe(true);
     expect(db.update).toHaveBeenCalledTimes(1);
   });
@@ -230,7 +189,7 @@ describe("reconcileMicrosoftUser (mocked db)", () => {
     db.select = vi.fn(() => ({
       from: () => ({ where: () => ({ limit: () => [] }) }),
     }));
-    const result = await reconcileMicrosoftUser(db, "user-1", ["g-admin"], cfg);
+    const result = await reconcileDexUser(db, "user-1", ["g-admin"], cfg);
     expect(result.pendingAdminElevation).toBe(true);
     expect(result.addedMembership).toBe(false);
   });
@@ -242,7 +201,7 @@ describe("reconcileMicrosoftUser (mocked db)", () => {
         where: () => ({ limit: () => [{ id: "existing-approval" }] }),
       }),
     }));
-    const result = await reconcileMicrosoftUser(db, "user-1", ["g-admin"], cfg);
+    const result = await reconcileDexUser(db, "user-1", ["g-admin"], cfg);
     expect(result.pendingAdminElevation).toBe(false);
     expect(db.insert).not.toHaveBeenCalled();
   });
@@ -252,7 +211,7 @@ describe("reconcileMicrosoftUser (mocked db)", () => {
     db.select = vi.fn(() => ({
       from: () => ({ where: () => ({ limit: () => [] }) }),
     }));
-    const result = await reconcileMicrosoftUser(db, "user-1", ["g-other"], cfg);
+    const result = await reconcileDexUser(db, "user-1", ["g-other"], cfg);
     expect(result.addedMembership).toBe(false);
     expect(result.pendingAdminElevation).toBe(false);
     expect(db.insert).not.toHaveBeenCalled();

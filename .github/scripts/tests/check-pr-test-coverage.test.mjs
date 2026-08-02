@@ -23,6 +23,32 @@ test('passes when file under __tests__ is changed', () => {
   assert.equal(checkTestCoverage(makeFiles(['src/__tests__/qux.ts']), 'fix: bug').passed, true);
 });
 
+// The repo's Node-native suites are `*.test.mjs` — 38 of them, including this
+// checker's own tests. They were invisible to TEST_PATTERNS, so a PR whose only
+// tests used that convention was told "no test files detected" (BLO-18484).
+test('passes when .test.mjs file is changed', () => {
+  assert.equal(
+    checkTestCoverage(makeFiles(['scripts/gh-token-wrapper.test.mjs', 'Dockerfile.runtime']), 'fix: bug').passed,
+    true,
+  );
+});
+
+test('passes when .spec.cjs file is changed', () => {
+  assert.equal(checkTestCoverage(makeFiles(['scripts/thing.spec.cjs']), 'fix: bug').passed, true);
+});
+
+test('a .test.mjs file does not count as a source change on a docs: PR', () => {
+  // isSourceFile() excludes anything matching TEST_PATTERNS, so widening the
+  // patterns must also keep .test.mjs out of the docs/chore mismatch check.
+  assert.equal(checkTestCoverage(makeFiles(['README.md', 'scripts/x.test.mjs']), 'docs: update').passed, true);
+});
+
+test('a non-test .mjs file still counts as a source change on a docs: PR', () => {
+  const result = checkTestCoverage(makeFiles(['README.md', 'scripts/x.mjs']), 'docs: update');
+  assert.equal(result.passed, false);
+  assert.ok(result.failures[0].includes('source code changes'));
+});
+
 test('fails when fix: PR has no tests', () => {
   const result = checkTestCoverage(makeFiles(['src/foo.ts', 'src/bar.ts']), 'fix: bug');
   assert.equal(result.passed, false);

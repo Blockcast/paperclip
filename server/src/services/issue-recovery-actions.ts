@@ -1,4 +1,4 @@
-import { and, desc, eq, inArray } from "drizzle-orm";
+import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { issueRecoveryActions } from "@paperclipai/db";
 import type {
@@ -11,6 +11,7 @@ import type {
 
 export const ACTIVE_RECOVERY_ACTION_STATUSES = ["active", "escalated"] as const satisfies readonly IssueRecoveryActionStatus[];
 const MAX_UPSERT_RETRIES = 3;
+const SOURCE_SCOPED_WAKE_HORIZON_EVIDENCE_KEY = "sourceScopedWakeHorizonAt";
 
 type IssueRecoveryActionRow = typeof issueRecoveryActions.$inferSelect;
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
@@ -48,6 +49,33 @@ export type ResolveIssueRecoveryActionInput = {
   outcome: IssueRecoveryActionOutcome;
   resolutionNote?: string | null;
 };
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function toValidDate(value: unknown): Date | null {
+  if (value instanceof Date) return Number.isFinite(value.getTime()) ? value : null;
+  if (typeof value !== "string" && typeof value !== "number") return null;
+  const parsed = new Date(value);
+  return Number.isFinite(parsed.getTime()) ? parsed : null;
+}
+
+function readSourceScopedWakeHorizonAt(evidence: unknown): Date | null {
+  if (!isRecord(evidence)) return null;
+  return toValidDate(evidence[SOURCE_SCOPED_WAKE_HORIZON_EVIDENCE_KEY]);
+}
+
+function withSourceScopedWakeHorizonEvidence(
+  evidence: unknown,
+  wakeHorizonAt: Date | null,
+): Record<string, unknown> {
+  const next = isRecord(evidence) ? { ...evidence } : {};
+  if (wakeHorizonAt) {
+    next[SOURCE_SCOPED_WAKE_HORIZON_EVIDENCE_KEY] = wakeHorizonAt.toISOString();
+  }
+  return next;
+}
 
 function toReadModel(row: IssueRecoveryActionRow): IssueRecoveryAction {
   return {
@@ -188,6 +216,53 @@ export function issueRecoveryActionService(db: Db) {
     const now = new Date();
     const ownerType = input.ownerType ?? (input.ownerAgentId ? "agent" : "board");
     if (existing) {
+      // BLO-18996: this UPDATE overwrites `ownerAgentId` in place while carrying
+      // `attemptCount` forward, so a reassigned owner inherited the previous owner's spent
+      // budget and — once it was over `maxAttempts` — was never woken at all. The action
+      // then sat open and undischargeable, which is the exact deadlock this issue is about.
+      //
+      // Reset on a change of OWNER, not of fingerprint. The wake budget counts "times we
+      // woke this agent about this action", so the agent is the thing the count belongs to,
+      // and replacing the agent is what has to start a fresh sequence. The fingerprint is
+      // the wrong key even though it reads like the natural one: the stranded fingerprint
+      // ends in `issue.assigneeAgentId`, and escalation itself reassigns the issue to the
+      // recovery owner, so the fingerprint changes on EVERY sweep of an unresolved failure.
+      // Keying on it would reset the counter every sweep and the budget would never
+      // exhaust — silently reinstating the unbounded re-fire loop the budget exists to stop.
+      // (Verified: across two consecutive escalations of one unresolved issue the
+      // fingerprint's assignee segment changes while `ownerAgentId` holds steady.)
+      //
+      // Computed in the same UPDATE as the owner write, so no sweep can observe a new owner
+      // carrying an old counter.
+      const isNewOwnerSequence = (input.ownerAgentId ?? null) !== existing.ownerAgentId;
+      const existingTimeoutAt = toValidDate(existing.timeoutAt);
+      const inputMaxAttempts = input.maxAttempts ?? null;
+      const existingWakeHorizonAt = readSourceScopedWakeHorizonAt(existing.evidence);
+      // ROLLOUT NOTE: the `existing.maxAttempts !== null ? existingTimeoutAt : null` arm is the
+      // backfill for rows written before the evidence key existed. A row that is already
+      // mid-ownerless-phase at deploy time has `maxAttempts: null` AND no evidence key, so it
+      // reads as never-bounded and re-arms its horizon once on the first owned sweep after
+      // rollout. That is self-healing and bounded to a single extra horizon window; it is
+      // expected at deploy and is NOT a recurrence of the flap this code fixes. Distinguish
+      // them by count: the bug re-armed on EVERY ownerless flap, the backfill re-arms once.
+      const carriedWakeHorizonAt = existingWakeHorizonAt ?? (existing.maxAttempts !== null ? existingTimeoutAt : null);
+      // BLO-18996 (review follow-up): the row is long-lived and can gain a budget it did not
+      // have when its `timeoutAt` was written, so "preserve the horizon" has to start
+      // counting from the sweep that STARTS the bound, not from whatever wrote the column
+      // first. An unbounded row (`maxAttempts === null`) has no wake horizon — any value in
+      // `timeoutAt` there belongs to a different mechanism (the provider-quota scheduler's
+      // `retryAt`) and is typically already in the past by the time ownership arrives.
+      // Inheriting it would make `strandedRecoveryWakeAttemptsExhausted` true on the new
+      // owner's FIRST wake and reinstate the exact deadlock this ticket fixes.
+      //
+      // A later review found the inverse edge: after a bounded row temporarily loses every
+      // invokable owner, a sweep writes `maxAttempts: null` onto the same active row. That must
+      // not make the next owned sweep look newly bounded again. Persist the first wake horizon
+      // in evidence so "has ever been bounded" survives bounded -> ownerless -> bounded flaps.
+      const isNewlyBoundedSequence = carriedWakeHorizonAt === null && inputMaxAttempts !== null;
+      const wakeHorizonAt = isNewlyBoundedSequence
+        ? (input.timeoutAt ?? null)
+        : carriedWakeHorizonAt;
       const [updated] = await dbOrTx
         .update(issueRecoveryActions)
         .set({
@@ -201,13 +276,36 @@ export function issueRecoveryActionService(db: Db) {
           returnOwnerAgentId: input.returnOwnerAgentId ?? existing.returnOwnerAgentId,
           cause: input.cause,
           fingerprint: input.fingerprint,
-          evidence: input.evidence ?? existing.evidence,
+          evidence: withSourceScopedWakeHorizonEvidence(input.evidence ?? existing.evidence, wakeHorizonAt),
           nextAction: input.nextAction,
           wakePolicy: input.wakePolicy ?? null,
           monitorPolicy: input.monitorPolicy ?? null,
-          attemptCount: existing.attemptCount + 1,
-          maxAttempts: input.maxAttempts ?? null,
-          timeoutAt: input.timeoutAt ?? null,
+          attemptCount: isNewOwnerSequence ? 1 : existing.attemptCount + 1,
+          maxAttempts: inputMaxAttempts,
+          // BLO-18996: PRESERVE the existing horizon, once the row is actually bounded.
+          // `timeoutAt` is the one bound on this row that owner churn cannot reset, and it
+          // only has that property because the sweep does not rewrite it — every sweep
+          // re-derives `input.timeoutAt` from "now", so taking the input here on every pass
+          // would push the horizon forward and make it as useless as the attempt counter it
+          // exists to backstop. The read model widens `timeoutAt` to `Date | string`, so
+          // normalize before handing it back to drizzle.
+          //
+          // The exception is the transition INTO a bounded shape, and it is load-bearing.
+          // `timeoutAt` is shared with the provider-quota scheduler, which writes
+          // `timeoutAt = retryAt` on this row through a direct UPDATE while the row is still
+          // OWNERLESS and unbounded (`maxAttempts: null`). That is inert while it stays that
+          // way, because `strandedRecoveryWakeAttemptsExhausted` returns false for a null
+          // budget before it ever looks at the horizon. But the SAME active row later gains a
+          // manager-ladder owner and a budget when the quota-hit agent stops being invokable,
+          // and a quota `retryAt` is minutes out, so by then it is in the past. Blindly
+          // preserving it would exhaust the new owner on its first wake — the deadlock this
+          // ticket exists to fix, reintroduced through the back door. So on
+          // unbounded -> bounded, adopt the fresh wake horizon; thereafter never rewrite it.
+          // Staying unbounded still preserves, which keeps the quota `retryAt` intact and the
+          // `pr_review_non_convergence` caller (also `maxAttempts: null`) unaffected.
+          timeoutAt: inputMaxAttempts !== null
+            ? (wakeHorizonAt ?? input.timeoutAt ?? null)
+            : (existingTimeoutAt ?? input.timeoutAt ?? null),
           lastAttemptAt: input.lastAttemptAt ?? now,
           outcome: null,
           resolutionNote: null,
@@ -250,7 +348,10 @@ export function issueRecoveryActionService(db: Db) {
             returnOwnerAgentId: input.returnOwnerAgentId ?? null,
             cause: input.cause,
             fingerprint: input.fingerprint,
-            evidence: input.evidence ?? {},
+            evidence: withSourceScopedWakeHorizonEvidence(
+              input.evidence ?? {},
+              (input.maxAttempts ?? null) !== null ? (input.timeoutAt ?? null) : null,
+            ),
             nextAction: input.nextAction,
             wakePolicy: input.wakePolicy ?? null,
             monitorPolicy: input.monitorPolicy ?? null,
@@ -278,6 +379,37 @@ export function issueRecoveryActionService(db: Db) {
     dbOrTx: DbOrTransaction = db,
   ): Promise<IssueRecoveryAction> {
     return runExclusiveUpsert(input, () => upsertSourceScopedUnlocked(input, dbOrTx));
+  }
+
+  // BLO-18996 (review follow-up): give back an attempt that was reserved but never spent.
+  //
+  // `upsertSourceScoped` increments `attemptCount` as part of the escalation UPDATE, which
+  // commits on this service's own connection — NOT inside the caller's escalation
+  // transaction. So by the time the caller tries to wake the owner, the attempt is already
+  // durably spent, and a wake enqueue that reaches nobody leaves the budget consumed anyway.
+  // Five such sweeps would retire the action's whole budget without a single wake, and the
+  // exhaustion notice would then claim the owner had been woken five times.
+  //
+  // This is the compensating half of that reservation: the caller refunds whenever the
+  // enqueue woke nobody — both a throw and a null return, null being how `enqueueWakeup`
+  // reports its non-delivery paths (capacity deferral, tree hold, cooldown, disabled wake).
+  // So only wakes that actually reached the queue count against the budget. Floors at 0 so a
+  // refunded first attempt makes the next sweep's `existing.attemptCount + 1` land back on 1.
+  // Scoped to active statuses and matched on company so it cannot touch a resolved row.
+  async function releaseWakeAttempt(input: { companyId: string; actionId: string }): Promise<void> {
+    await db
+      .update(issueRecoveryActions)
+      .set({
+        attemptCount: sql`greatest(${issueRecoveryActions.attemptCount} - 1, 0)`,
+        updatedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(issueRecoveryActions.id, input.actionId),
+          eq(issueRecoveryActions.companyId, input.companyId),
+          inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
+        ),
+      );
   }
 
   async function resolveActiveForIssue(
@@ -323,5 +455,6 @@ export function issueRecoveryActionService(db: Db) {
     listActiveForIssues,
     resolveActiveForIssue,
     upsertSourceScoped,
+    releaseWakeAttempt,
   };
 }

@@ -90,8 +90,35 @@ describe("paperclip MCP tools", () => {
     expect(response.content[0]?.text).toContain("issue-1");
   });
 
-  it("maps paperclip_search_issues query to issue text search", async () => {
-    const fetchMock = vi.fn().mockResolvedValue(
+  it("forwards relational hydration and hierarchy filters on the issues list", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(mockJsonResponse([{ id: "issue-1" }]));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclipListIssues");
+    await tool.execute({
+      includeBlockedBy: true,
+      parentId: "22222222-2222-2222-2222-222222222222",
+    });
+
+    const [url] = fetchMock.mock.calls[0] as [string];
+    // Without these params reaching the server, agents cannot hydrate blockers or
+    // enumerate children at all, and an absent `blockedBy` reads as "no blockers".
+    expect(String(url)).toContain("includeBlockedBy=true");
+    expect(String(url)).toContain("parentId=22222222-2222-2222-2222-222222222222");
+  });
+
+  it("forwards descendantOf for subtree enumeration", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(mockJsonResponse([{ id: "issue-1" }]));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclipListIssues");
+    await tool.execute({ descendantOf: "33333333-3333-3333-3333-333333333333" });
+
+    const [url] = fetchMock.mock.calls[0] as [string];
+    expect(String(url)).toContain("descendantOf=33333333-3333-3333-3333-333333333333");
+  });
+
+  it("maps paperclip_search_issues query to issue text search", async () => {    const fetchMock = vi.fn().mockResolvedValue(
       mockJsonResponse([{ id: "issue-1", title: "CDN+ M0 rollout" }]),
     );
     vi.stubGlobal("fetch", fetchMock);
@@ -189,6 +216,7 @@ describe("paperclip MCP tools", () => {
       priority: "medium",
       assigneeAgentId: "22222222-2222-2222-2222-222222222222",
       requestDepth: 0,
+      allowDuplicate: false,
     });
   });
 
@@ -285,6 +313,27 @@ describe("paperclip MCP tools", () => {
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(response.content[0]?.text).toContain("http://127.0.0.1:5173");
+  });
+
+  it("withdraws an interaction through the issue-scoped withdraw route", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      mockJsonResponse({ id: "3f1c2b4e-0000-4000-8000-000000000001", status: "cancelled" }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclipWithdrawInteraction");
+    await tool.execute({
+      issueId: "PAP-1135",
+      interactionId: "3f1c2b4e-0000-4000-8000-000000000001",
+      reason: "Asked the wrong thing",
+    });
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(String(url)).toBe(
+      "http://localhost:3100/api/issues/PAP-1135/interactions/3f1c2b4e-0000-4000-8000-000000000001/withdraw",
+    );
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(String(init.body))).toEqual({ reason: "Asked the wrong thing" });
   });
 
   it("creates suggest_tasks interactions with the expected issue-scoped payload", async () => {

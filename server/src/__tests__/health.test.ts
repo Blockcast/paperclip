@@ -76,6 +76,37 @@ describe("GET /health", () => {
     expect(res.body).toEqual({ status: "ok", version: serverVersion, serverVersion: serverVersion, serverInfo: testServerInfo });
   }, 15_000);
 
+  it("exposes non-secret auth capabilities to anonymous login clients", async () => {
+    const app = express();
+    app.use((req, _res, next) => {
+      (req as any).actor = { type: "none", source: "none" };
+      next();
+    });
+    app.use("/health", healthRoutes(undefined, {
+      deploymentMode: "authenticated",
+      deploymentExposure: "public",
+      authReady: true,
+      authCapabilities: {
+        emailPasswordEnabled: false,
+        oidcProviders: ["dex"],
+      },
+      companyDeletionEnabled: false,
+      serverInfo: testServerInfo,
+    }));
+
+    const res = await request(app).get("/health");
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      status: "ok",
+      deploymentMode: "authenticated",
+      auth: {
+        emailPasswordEnabled: false,
+        oidcProviders: ["dex"],
+      },
+    });
+  });
+
   it("returns 200 when the database probe succeeds", async () => {
     const db = {
       execute: vi.fn().mockResolvedValue([{ "?column?": 1 }]),
