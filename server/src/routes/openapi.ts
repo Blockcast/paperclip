@@ -4976,6 +4976,9 @@ registry.registerPath({
   path: "/api/plugins/{pluginId}/config",
   tags: ["plugins"],
   summary: "Get company-scoped plugin config",
+  description:
+    "Requires instance admin. Secret-bearing values are returned as `__redacted__`; " +
+    "posting the response back unchanged preserves the stored secret.",
   request: {
     params: z.object({ pluginId: z.string() }),
     query: z.object({ companyId: z.string() }),
@@ -4988,6 +4991,9 @@ registry.registerPath({
   path: "/api/plugins/{pluginId}/config",
   tags: ["plugins"],
   summary: "Set company-scoped plugin config",
+  description:
+    "Requires instance admin. A field sent as `__redacted__` keeps its stored value; " +
+    "the sentinel is never persisted.",
   request: {
     params: z.object({ pluginId: z.string() }),
     body: jsonBody(z.object({ companyId: z.string(), configJson: z.record(z.unknown()) })),
@@ -5000,6 +5006,9 @@ registry.registerPath({
   path: "/api/plugins/{pluginId}/config/test",
   tags: ["plugins"],
   summary: "Test company-scoped plugin config",
+  description:
+    "Requires instance admin. Restores masked (`__redacted__`) fields from stored config " +
+    "before handing them to the plugin worker.",
   request: {
     params: z.object({ pluginId: z.string() }),
     body: jsonBody(z.object({ companyId: z.string(), configJson: z.record(z.unknown()) })),

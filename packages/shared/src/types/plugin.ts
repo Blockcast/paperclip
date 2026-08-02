@@ -54,6 +54,21 @@ export type JsonSchema = {
    * `x-paperclip-advanced` is not true.
    */
   "x-paperclip-group"?: string;
+  /**
+   * Marks a property as secret-bearing, so the host masks its value in every
+   * config API response and restores the stored value when an unchanged masked
+   * payload is posted back (BLO-20794).
+   *
+   * Use this to cover an ordinary `type: "string"` credential without moving it
+   * to `format: "secret-ref"`. The standard `writeOnly: true` keyword is
+   * honoured identically; prefer this marker when `writeOnly`'s other form
+   * semantics are unwanted.
+   *
+   * Setting it to `false` opts the property out of the host's key-name
+   * heuristic — use it for a field whose name looks credential-ish (`token`,
+   * `secret`, …) but whose value is not sensitive.
+   */
+  "x-paperclip-secret"?: boolean;
   [key: string]: unknown;
 };
 

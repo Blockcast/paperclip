@@ -78,6 +78,10 @@ import {
 } from "./authz.js";
 import { validateInstanceConfig } from "../services/plugin-config-validator.js";
 import {
+  maskPluginConfigJson,
+  mergeMaskedPluginConfig,
+} from "../services/plugin-config-masking.js";
+import {
   findLocalFolderDeclaration,
   getStoredLocalFolders,
   inspectPluginLocalFolder,
@@ -2515,11 +2519,23 @@ export function pluginRoutes(
    * Returns the `PluginConfig` record if one exists, or `null` if the plugin
    * has not yet been configured.
    *
+   * **Authority (BLO-20794):** instance admin, matching the POST write side.
+   * This row holds live plugin credentials, so reading it is at least as
+   * sensitive as writing it; the previous `assertBoardOrgAccess` gate let any
+   * board actor with one company membership read every plugin's secrets.
+   *
+   * **Masking:** secret-bearing values are replaced with `__redacted__` before
+   * the row leaves the process — defence in depth behind the authority gate,
+   * and what keeps the secret off an admin's screen and out of a browser cache.
+   * Secret *pointers* survive intact so the config form can still render the
+   * binding. POST restores anything echoed back unchanged, so a read/write
+   * round-trip is lossless (see `plugin-config-masking.ts`).
+   *
    * Response: `PluginConfig | null`
    * Errors: 404 if plugin not found
    */
   router.get("/plugins/:pluginId/config", async (req, res) => {
-    assertBoardOrgAccess(req);
+    assertInstanceAdmin(req);
     const { pluginId } = req.params;
     const companyId = requirePluginConfigCompanyId(req, req.query.companyId);
 
@@ -2530,7 +2546,16 @@ export function pluginRoutes(
     }
 
     const config = await registry.getConfig(plugin.id, companyId);
-    res.json(config);
+    if (!config) {
+      res.json(config);
+      return;
+    }
+
+    const schema = plugin.manifestJson?.instanceConfigSchema;
+    res.json({
+      ...config,
+      configJson: maskPluginConfigJson(config.configJson, schema),
+    });
   });
 
   /**
@@ -2577,11 +2602,22 @@ export function pluginRoutes(
       delete body.configJson.devUiUrl;
     }
 
+    // Restore any value the caller echoed back as the mask sentinel from the
+    // masked GET (BLO-20794). Must run before validation: `__redacted__` would
+    // otherwise fail a `pattern`/`minLength` constraint on the secret field, and
+    // must run before the secret-ref extraction so bindings are read from the
+    // real stored pointers.
+    const storedConfig = await registry.getConfig(plugin.id, companyId);
+    const configJson = mergeMaskedPluginConfig(
+      body.configJson,
+      storedConfig && typeof storedConfig === "object" ? storedConfig.configJson : null,
+    );
+
     // Validate configJson against the plugin's instanceConfigSchema (if declared).
     // This ensures CLI/API callers get the same validation the UI performs client-side.
     const schema = plugin.manifestJson?.instanceConfigSchema;
     if (schema && Object.keys(schema).length > 0) {
-      const validation = validateInstanceConfig(body.configJson, schema);
+      const validation = validateInstanceConfig(configJson, schema);
       if (!validation.valid) {
         res.status(400).json({
           error: "Configuration does not match the plugin's instanceConfigSchema",
@@ -2592,7 +2628,7 @@ export function pluginRoutes(
     }
 
     try {
-      const secretRefs = extractSecretRefBindingsFromConfig(body.configJson, schema);
+      const secretRefs = extractSecretRefBindingsFromConfig(configJson, schema);
       await validatePluginSecretRefsForCompany(companyId, secretRefs);
       await secretService(db).syncSecretRefsForTarget(
         companyId,
@@ -2603,14 +2639,14 @@ export function pluginRoutes(
 
       const result = await registry.upsertConfig(plugin.id, companyId, {
         companyId,
-        configJson: body.configJson,
+        configJson,
       });
       await logPluginMutationActivity(req, "plugin.config.updated", plugin.id, {
         pluginId: plugin.id,
         pluginKey: plugin.pluginKey,
         companyId,
         secretRefCount: secretRefs.length,
-        configKeyCount: Object.keys(body.configJson).length,
+        configKeyCount: Object.keys(configJson).length,
       });
 
       // Notify the running worker about the config change (PLUGIN_SPEC §25.4.4).
@@ -2622,7 +2658,7 @@ export function pluginRoutes(
           await bridgeDeps.workerManager.call(
             plugin.id,
             "configChanged",
-            { config: body.configJson, companyId },
+            { config: configJson, companyId },
           );
         } catch (rpcErr) {
           if (
@@ -2641,7 +2677,13 @@ export function pluginRoutes(
         }
       }
 
-      res.json(result);
+      // Mask the echo for the same reason the GET is masked — the persisted row
+      // holds plaintext and this response would otherwise hand it straight back.
+      res.json(
+        result
+          ? { ...result, configJson: maskPluginConfigJson(result.configJson, schema) }
+          : result,
+      );
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       res.status(400).json({ error: message });
@@ -2669,7 +2711,11 @@ export function pluginRoutes(
    * - 502 if the worker is unavailable
    */
   router.post("/plugins/:pluginId/config/test", async (req, res) => {
-    assertBoardOrgAccess(req);
+    // Instance admin, matching GET and POST on this resource (BLO-20794). This
+    // handler restores masked-out stored secrets before handing the config to
+    // the worker, so a lesser actor could otherwise post `__redacted__` and have
+    // the real credential exercised against a destination of their choosing.
+    assertInstanceAdmin(req);
 
     if (!bridgeDeps) {
       res.status(501).json({ error: "Plugin bridge is not enabled" });
@@ -2698,10 +2744,19 @@ export function pluginRoutes(
       return;
     }
 
+    // Same masked round-trip as the save path: testing an unmodified config
+    // read back from the masked GET must exercise the stored secret, not the
+    // sentinel.
+    const storedTestConfig = await registry.getConfig(plugin.id, companyId);
+    const testConfigJson = mergeMaskedPluginConfig(
+      body.configJson,
+      storedTestConfig && typeof storedTestConfig === "object" ? storedTestConfig.configJson : null,
+    );
+
     // Fast schema-level rejection before hitting the worker RPC.
     const schema = plugin.manifestJson?.instanceConfigSchema;
     if (schema && Object.keys(schema).length > 0) {
-      const validation = validateInstanceConfig(body.configJson, schema);
+      const validation = validateInstanceConfig(testConfigJson, schema);
       if (!validation.valid) {
         res.status(400).json({
           error: "Configuration does not match the plugin's instanceConfigSchema",
@@ -2712,13 +2767,13 @@ export function pluginRoutes(
     }
 
     try {
-      const secretRefs = extractSecretRefBindingsFromConfig(body.configJson, schema);
+      const secretRefs = extractSecretRefBindingsFromConfig(testConfigJson, schema);
       await validatePluginSecretRefsForCompany(companyId, secretRefs);
 
       const result = await bridgeDeps.workerManager.call(
         plugin.id,
         "validateConfig",
-        { config: body.configJson },
+        { config: testConfigJson },
       );
 
       // The worker returns PluginConfigValidationResult { ok, warnings?, errors? }
