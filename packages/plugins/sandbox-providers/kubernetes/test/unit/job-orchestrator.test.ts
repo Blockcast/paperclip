@@ -10,6 +10,65 @@ describe("createJob", () => {
     expect(create).toHaveBeenCalledWith({ namespace: "ns", body: jobManifest });
     expect(result.uid).toBe("abc-uid");
   });
+
+  // The guard itself is unit-tested, but without these the choke-point call in
+  // createJob could be deleted and the suite would stay green. Asserting the
+  // client was never touched is the point: a leaking manifest must not reach
+  // the API server at all, rather than being rejected after the fact.
+  it("refuses a leaking manifest before calling the Kubernetes client", async () => {
+    const create = vi.fn().mockResolvedValue({ metadata: { uid: "abc-uid" } });
+    const clients = { batch: { createNamespacedJob: create } };
+    const leaking = {
+      apiVersion: "batch/v1",
+      kind: "Job",
+      metadata: { name: "r-1", namespace: "ns" },
+      spec: {
+        template: {
+          spec: { containers: [{ name: "agent", env: [{ name: "ANTHROPIC_API_KEY", value: "sk-leak" }] }] },
+        },
+      },
+    };
+    await expect(createJob(clients as never, "ns", leaking)).rejects.toThrow(
+      /agent\.env\[ANTHROPIC_API_KEY\]/,
+    );
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it("refuses a manifest whose only leak is in an initContainer", async () => {
+    const create = vi.fn();
+    const clients = { batch: { createNamespacedJob: create } };
+    const leaking = {
+      apiVersion: "batch/v1",
+      kind: "Job",
+      spec: {
+        template: {
+          spec: { initContainers: [{ name: "init", env: [{ name: "MCP_CONFIG", value: "{}" }] }] },
+        },
+      },
+    };
+    await expect(createJob(clients as never, "ns", leaking)).rejects.toThrow(/init\.env\[MCP_CONFIG\]/);
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  // The allowlist is keyed on name *and* value. Allowlisting `HOME` by name
+  // alone would let a credential ride in under an approved name.
+  it("refuses an allowlisted env name carrying a non-allowlisted value", async () => {
+    const create = vi.fn();
+    const clients = { batch: { createNamespacedJob: create } };
+    const leaking = {
+      apiVersion: "batch/v1",
+      kind: "Job",
+      spec: {
+        template: {
+          spec: { containers: [{ name: "agent", env: [{ name: "HOME", value: "sk-ant-leak" }] }] },
+        },
+      },
+    };
+    await expect(createJob(clients as never, "ns", leaking)).rejects.toThrow(
+      /agent\.env\[HOME\] \(value-not-allowlisted\)/,
+    );
+    expect(create).not.toHaveBeenCalled();
+  });
 });
 
 describe("getJobStatus", () => {
