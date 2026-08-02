@@ -5669,9 +5669,21 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     // failures, so a bare `toHaveBeenCalled()` would pass even if we reclaimed
     // the wrong run. NB `mockDeleteAgentJobsForRun` is wired to
     // `deleteAgentJobExact` (see the vi.mock map above), which takes the
-    // {name, runId, uid} triple — matching the convention at :5147/:5178.
+    // {name, runId, uid} triple.
+    //
+    // Assert all three, not just `runId`. `deleteExactExternalRuntimeJob`
+    // (heartbeat.ts:15463-15477) re-reads the reservation itself and refuses
+    // with "mismatch" when either `jobName` or `jobUid` is absent, so a
+    // runId-only assertion would still pass if the reclaim silently resolved
+    // the wrong Job identity — precisely the exactly-once hazard this case
+    // exists to pin (BLO-19461 AC 3). The name/uid pair is what makes the
+    // k8s delete exact rather than agent-scoped.
     expect(mockDeleteAgentJobsForRun).toHaveBeenCalledWith(
-      expect.objectContaining({ runId: silentRunId }),
+      expect.objectContaining({
+        runId: silentRunId,
+        name: reservation.jobName,
+        uid: reservation.jobUid,
+      }),
     );
   });
 
