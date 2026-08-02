@@ -18079,6 +18079,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
   }
 
+  // BLO-20801: resolve which k8s Job run-id labels are terminal for this agent
+  // only. A stale or corrupt Job label carrying another agent's terminal run id
+  // must remain unknown and blocking for the current agent.
+  async function findTerminalHeartbeatRunIds(
+    agentId: string,
+    runIds: readonly string[],
+    companyId?: string,
+  ): Promise<ReadonlySet<string>> {
+    if (runIds.length === 0) return new Set();
+    const ownerConditions = companyId
+      ? and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.companyId, companyId))
+      : eq(heartbeatRuns.agentId, agentId);
+    const rows = await db
+      .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(and(inArray(heartbeatRuns.id, [...runIds]), ownerConditions));
+    const terminal = new Set<string>();
+    for (const row of rows) {
+      if (isHeartbeatRunTerminalStatus(row.status)) terminal.add(row.id);
+    }
+    return terminal;
+  }
+
   /**
    * BLO-20396 (review follow-up): re-dispatch after a pass that pruned invalid
    * rows but claimed nothing.
@@ -18295,7 +18318,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ? externalConcurrency.effectiveMaxConcurrentRuns
         : policy.maxConcurrentRuns;
       const hasActiveExternalJob = externalLifecycle
-        ? await hasActiveJobForAgent(agentId)
+        ? await hasActiveJobForAgent(agentId, {
+          isRunTerminal: (runIds) => findTerminalHeartbeatRunIds(agentId, runIds, agent.companyId),
+        })
         : false;
       // A live Job with no corresponding non-stale running row is an orphan or
       // terminating pod. Do not allocate a new slot until the reaper/kubelet
