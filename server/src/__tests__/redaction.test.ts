@@ -200,6 +200,45 @@ describe("sanitizeRecord value-shape gate (BLO-20810)", () => {
     expect(result?.Authorization).toBe(REDACTED_EVENT_VALUE);
   });
 
+  it("still redacts a multi-line PEM private key (whitespace must not exempt it)", () => {
+    const pem =
+      "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7VJTUt9Us8cKB\n-----END PRIVATE KEY-----";
+
+    const result = redactEventPayload({
+      ORC8R_PRIVATE_KEY: pem,
+      certifierPrivateKey: pem,
+    });
+
+    expect(result?.ORC8R_PRIVATE_KEY).toBe(REDACTED_EVENT_VALUE);
+    expect(result?.certifierPrivateKey).toBe(REDACTED_EVENT_VALUE);
+  });
+
+  it("still redacts a connection string carrying an inline password (URL shape must not exempt it)", () => {
+    const result = redactEventPayload({
+      connectionString: "postgres://app_user:hunter2@db.internal:5432/prod",
+    });
+
+    expect(result?.connectionString).toBe(REDACTED_EVENT_VALUE);
+  });
+
+  it("redacts a PEM key via redactAgentConfigPayload too", () => {
+    const pem = "-----BEGIN EC PRIVATE KEY-----\nMHcCAQEE...\n-----END EC PRIVATE KEY-----";
+
+    const result = redactAgentConfigPayload({ certifierPrivateKey: pem });
+
+    expect(result?.certifierPrivateKey).toBe(REDACTED_EVENT_VALUE);
+  });
+
+  it("still leaves a plain URL without embedded credentials readable under a secret-ish key", () => {
+    const result = redactEventPayload({
+      "links.PR_1898_app_authored": "https://github.com/Blockcast/paperclip/pull/1898",
+    });
+
+    expect(result?.["links.PR_1898_app_authored"]).toBe(
+      "https://github.com/Blockcast/paperclip/pull/1898",
+    );
+  });
+
   it("recurses into non-string values under a secret-ish key instead of nuking the whole structure", () => {
     const result = redactEventPayload({
       authorInfo: {

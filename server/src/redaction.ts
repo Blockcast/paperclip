@@ -186,6 +186,8 @@ function sanitizeCommandArgs(args: unknown[], options?: SanitizeOptions): unknow
 
 const OPAQUE_VALUE_SCHEME_PREFIX_RE = /^(?:bearer|basic|token)\s+/i;
 const URL_LIKE_VALUE_RE = /^[a-z][a-z0-9+.-]*:\/\//i;
+const PEM_BLOCK_RE = /-----BEGIN [A-Z0-9 ]+-----/;
+const URL_USERINFO_RE = /:\/\/[^/\s@]+:[^/\s@]+@/;
 
 /**
  * Whether a plain string sitting under a secret-ish-named key is itself
@@ -194,11 +196,20 @@ const URL_LIKE_VALUE_RE = /^[a-z][a-z0-9+.-]*:\/\//i;
  * contains "auth", "no_secrets_in_payload" contains "secret" (BLO-20810).
  * A real credential (optionally after a "Bearer "/"Basic "/"Token " scheme
  * prefix) is a single opaque token; natural-language prose and URLs are not.
+ *
+ * Two shapes are secret-shaped despite failing that opaque-token test, so
+ * they're checked before it: a PEM block is credential material that is
+ * *always* multi-line, and a URL carrying inline `user:pass@` userinfo (a
+ * connection string) is credential material that is by definition URL-like.
+ * Neither the whitespace exemption nor the URL exemption may swallow them
+ * (regression caught in PR review of this fix, on `PRIVATE_KEY`- and
+ * `connectionString`-named fields).
  */
 function looksLikeSecretValue(value: string): boolean {
   const trimmed = value.trim();
   if (trimmed.length === 0) return false;
-  if (URL_LIKE_VALUE_RE.test(trimmed)) return false;
+  if (PEM_BLOCK_RE.test(trimmed)) return true;
+  if (URL_LIKE_VALUE_RE.test(trimmed)) return URL_USERINFO_RE.test(trimmed);
   const withoutScheme = trimmed.replace(OPAQUE_VALUE_SCHEME_PREFIX_RE, "");
   if (withoutScheme.length === 0) return false;
   return !/\s/.test(withoutScheme);
