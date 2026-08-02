@@ -12,6 +12,25 @@ import type {
 export const ACTIVE_RECOVERY_ACTION_STATUSES = ["active", "escalated"] as const satisfies readonly IssueRecoveryActionStatus[];
 const MAX_UPSERT_RETRIES = 3;
 const SOURCE_SCOPED_WAKE_HORIZON_EVIDENCE_KEY = "sourceScopedWakeHorizonAt";
+const RECOVERY_HANDOFF_GRANT_ANCHOR_EVIDENCE_KEY = "recoveryHandoffGrantAnchorAt";
+
+// How long after a recovery transfer the previous owner keeps the comment-only
+// handoff channel opened by BLO-18906 / #827.
+//
+// #827 justified that widening as "state-bounded": active/escalated only, so
+// resolving or cancelling the action lapses it. Measured on 2026-07-31 that bound
+// is nearly inert — 0 of 119 active recovery actions had ever been resolved, and
+// the resulting grants ran to a median age of 9 days (p90 12d, max 51d) across 117
+// issues the grantee did not own. Nothing drains the queue (BLO-19124), so in
+// practice the grant never lapsed at all.
+//
+// 24h is chosen to cover the actual use case and little else: the channel exists so
+// the agent that was just taken off the issue can write down the diagnosis it is
+// still holding. That is a single wake's work, and an agent that has not posted its
+// handoff within a day no longer has a fresh diagnosis worth the standing access.
+// The value is intentionally here rather than inline at the authorization call site
+// so the grant's lifetime is tunable in one place (BLO-20263).
+export const RECOVERY_HANDOFF_COMMENT_GRANT_TTL_MS = 24 * 60 * 60 * 1000;
 
 type IssueRecoveryActionRow = typeof issueRecoveryActions.$inferSelect;
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
@@ -75,6 +94,65 @@ function withSourceScopedWakeHorizonEvidence(
     next[SOURCE_SCOPED_WAKE_HORIZON_EVIDENCE_KEY] = wakeHorizonAt.toISOString();
   }
   return next;
+}
+
+// The instant the handoff TTL runs from: the most recent transfer that took the
+// issue away from `previousOwnerAgentId`.
+//
+// This deliberately does NOT anchor on `lastAttemptAt`, which the AC for BLO-20263
+// offered as a candidate. `upsertSourceScopedUnlocked` rewrites `lastAttemptAt` on
+// EVERY sweep of an unresolved action (`lastAttemptAt: input.lastAttemptAt ?? now`),
+// so a TTL measured from it would be pushed forward for as long as the action stays
+// open — which is forever, per the same measurement that motivated the bound. That
+// would ship a TTL that never expires: strictly worse than no TTL, because it reads
+// as bounded.
+//
+// It is also not plain `createdAt`. The active row is REUSED across reassignments
+// (one active row per (company, issue) via `issue_recovery_actions_active_source_uq`),
+// and the sweep rewrites `previousOwnerAgentId` from the issue's current assignee.
+// So a row created 9 days ago can name a previous owner transferred away 10 minutes
+// ago; anchoring on `createdAt` would deny that agent the channel BLO-18906 exists
+// to give it, silently regressing #827 for exactly the case it was built for.
+//
+// Hence a dedicated anchor, refreshed only when `previousOwnerAgentId` actually
+// changes — i.e. on a real transfer, never on ordinary sweep churn. At most one
+// agent holds this grant on an issue at a time, for at most the TTL after the
+// transfer that named them. `createdAt` remains the read-side fallback for rows
+// written before this key existed.
+function readRecoveryHandoffGrantAnchorAt(evidence: unknown): Date | null {
+  if (!isRecord(evidence)) return null;
+  return toValidDate(evidence[RECOVERY_HANDOFF_GRANT_ANCHOR_EVIDENCE_KEY]);
+}
+
+function withRecoveryHandoffGrantAnchorEvidence(
+  evidence: unknown,
+  anchorAt: Date | null,
+): Record<string, unknown> {
+  const next = isRecord(evidence) ? { ...evidence } : {};
+  if (anchorAt) {
+    next[RECOVERY_HANDOFF_GRANT_ANCHOR_EVIDENCE_KEY] = anchorAt.toISOString();
+  }
+  return next;
+}
+
+/**
+ * Whether a recovery action's handoff comment grant is still inside its TTL.
+ *
+ * `createdAt` is the fallback anchor for rows written before the evidence key
+ * existed. Those are the 117 rows this ticket was filed about: all far older than
+ * the TTL, so they lapse on the first request after deploy, which is the point.
+ */
+export function recoveryHandoffGrantIsWithinTtl(input: {
+  evidence: unknown;
+  createdAt: Date | string | null;
+  now?: Date;
+}): boolean {
+  const anchorAt = readRecoveryHandoffGrantAnchorAt(input.evidence) ?? toValidDate(input.createdAt);
+  // No usable anchor at all (unparseable `createdAt` on a row with no evidence key)
+  // means we cannot show the grant is fresh, so it does not hold. Fail closed.
+  if (!anchorAt) return false;
+  const now = input.now ?? new Date();
+  return now.getTime() - anchorAt.getTime() <= RECOVERY_HANDOFF_COMMENT_GRANT_TTL_MS;
 }
 
 function toReadModel(row: IssueRecoveryActionRow): IssueRecoveryAction {
@@ -257,6 +335,18 @@ export function issueRecoveryActionService(db: Db) {
       const wakeHorizonAt = isNewlyBoundedSequence
         ? (input.timeoutAt ?? null)
         : carriedWakeHorizonAt;
+      // BLO-20263: refresh the handoff-grant anchor only when the transfer actually
+      // moves the issue away from a DIFFERENT agent than last time. Every sweep of an
+      // unresolved action passes `previousOwnerAgentId: issue.assigneeAgentId`, so
+      // taking the input unconditionally would re-anchor on each pass and the TTL
+      // would never expire — the same trap `timeoutAt` above documents for the wake
+      // horizon. Carrying null forward is deliberate: a pre-existing row keeps no
+      // anchor key and falls back to `createdAt` on the read side.
+      const nextPreviousOwnerAgentId = input.previousOwnerAgentId ?? existing.previousOwnerAgentId;
+      const isNewHandoffTransfer = nextPreviousOwnerAgentId !== existing.previousOwnerAgentId;
+      const handoffGrantAnchorAt = isNewHandoffTransfer
+        ? now
+        : readRecoveryHandoffGrantAnchorAt(existing.evidence);
       const [updated] = await db
         .update(issueRecoveryActions)
         .set({
@@ -266,11 +356,14 @@ export function issueRecoveryActionService(db: Db) {
           ownerType,
           ownerAgentId: input.ownerAgentId ?? null,
           ownerUserId: input.ownerUserId ?? null,
-          previousOwnerAgentId: input.previousOwnerAgentId ?? existing.previousOwnerAgentId,
+          previousOwnerAgentId: nextPreviousOwnerAgentId,
           returnOwnerAgentId: input.returnOwnerAgentId ?? existing.returnOwnerAgentId,
           cause: input.cause,
           fingerprint: input.fingerprint,
-          evidence: withSourceScopedWakeHorizonEvidence(input.evidence ?? existing.evidence, wakeHorizonAt),
+          evidence: withRecoveryHandoffGrantAnchorEvidence(
+            withSourceScopedWakeHorizonEvidence(input.evidence ?? existing.evidence, wakeHorizonAt),
+            handoffGrantAnchorAt,
+          ),
           nextAction: input.nextAction,
           wakePolicy: input.wakePolicy ?? null,
           monitorPolicy: input.monitorPolicy ?? null,
@@ -335,9 +428,13 @@ export function issueRecoveryActionService(db: Db) {
           returnOwnerAgentId: input.returnOwnerAgentId ?? null,
           cause: input.cause,
           fingerprint: input.fingerprint,
-          evidence: withSourceScopedWakeHorizonEvidence(
-            input.evidence ?? {},
-            (input.maxAttempts ?? null) !== null ? (input.timeoutAt ?? null) : null,
+          evidence: withRecoveryHandoffGrantAnchorEvidence(
+            withSourceScopedWakeHorizonEvidence(
+              input.evidence ?? {},
+              (input.maxAttempts ?? null) !== null ? (input.timeoutAt ?? null) : null,
+            ),
+            // Creating the row IS the transfer, so it anchors the TTL.
+            now,
           ),
           nextAction: input.nextAction,
           wakePolicy: input.wakePolicy ?? null,

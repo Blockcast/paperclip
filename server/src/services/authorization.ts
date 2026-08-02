@@ -28,7 +28,7 @@ import {
   resolveCoreTrustPreset,
   type TrustPresetResolution,
 } from "./trust-preset-resolver.js";
-import { ACTIVE_RECOVERY_ACTION_STATUSES } from "./issue-recovery-actions.js";
+import { ACTIVE_RECOVERY_ACTION_STATUSES, RECOVERY_HANDOFF_COMMENT_GRANT_TTL_MS, recoveryHandoffGrantIsWithinTtl } from "./issue-recovery-actions.js";
 import { RECOVERY_ORIGIN_KINDS } from "./recovery/origins.js";
 import { logger } from "../middleware/logger.js";
 
@@ -1442,6 +1442,13 @@ export function authorizationService(db: Db) {
   //   * state-bounded — only while the recovery action is active/escalated.
   //     Resolving or cancelling it lapses the grant, and a resolved row can
   //     never be revived (`upsertSourceScoped` only ever updates an active row).
+  //     Do not rely on this alone: measured across the live population, 0 of 119
+  //     active recovery actions had ever been resolved, so in practice this bound
+  //     never fires (BLO-19124 tracks the undrained queue).
+  //   * time-bounded  — and therefore the bound that actually binds. The grant
+  //     lapses `RECOVERY_HANDOFF_COMMENT_GRANT_TTL_MS` after the transfer that
+  //     opened it, independently of whether the action is ever resolved
+  //     (BLO-20263).
   //   * owner-bound   — the row's `ownerAgentId` must still be the issue's
   //     `assigneeAgentId`. A second reassignment away from the recovery owner
   //     lapses the grant too, so the channel only ever exists between the agent
@@ -1468,6 +1475,8 @@ export function authorizationService(db: Db) {
         kind: issueRecoveryActions.kind,
         cause: issueRecoveryActions.cause,
         ownerAgentId: issueRecoveryActions.ownerAgentId,
+        evidence: issueRecoveryActions.evidence,
+        createdAt: issueRecoveryActions.createdAt,
         assigneeAgentId: issues.assigneeAgentId,
       })
       .from(issueRecoveryActions)
@@ -1500,6 +1509,26 @@ export function authorizationService(db: Db) {
     // both shapes; keep it so the invariant survives a query rewrite.
     if (!row.ownerAgentId || row.ownerAgentId === input.actorAgentId) return false;
     if (row.assigneeAgentId !== row.ownerAgentId) return false;
+    // BLO-20263: time-bound the channel. #827 called this grant "state-bounded"
+    // because resolving or cancelling the action lapses it — but 0 of 119 active
+    // recovery actions had ever been resolved, so the bound never fired and the
+    // grant ran to a median of 9 days (max 51) across 117 issues. The TTL runs from
+    // the transfer and expires on its own, whether or not anything ever drains the
+    // recovery queue (BLO-19124).
+    if (!recoveryHandoffGrantIsWithinTtl({ evidence: row.evidence, createdAt: row.createdAt })) {
+      logger.info({
+        actorAgentId: input.actorAgentId,
+        issueId: input.issueId,
+        companyId: input.companyId,
+        recoveryActionId: row.id,
+        recoveryActionKind: row.kind,
+        recoveryOwnerAgentId: row.ownerAgentId,
+        requestedAction: input.action,
+        grant: "recovery_handoff_comment",
+        ttlMs: RECOVERY_HANDOFF_COMMENT_GRANT_TTL_MS,
+      }, "recovery handoff comment grant expired");
+      return false;
+    }
     logger.info({
       actorAgentId: input.actorAgentId,
       issueId: input.issueId,

@@ -239,6 +239,87 @@ describe("issueRecoveryActionService", () => {
     });
     expect(updates.at(-1)).toMatchObject({ timeoutAt: originalHorizon });
   });
+
+  // BLO-20263. The handoff comment grant's TTL is measured from this anchor, so if
+  // ordinary sweep churn refreshed it the grant would never expire — which is the
+  // failure mode the ticket exists to close, not a cosmetic detail.
+  it("re-anchors the handoff grant on a real transfer but not on sweep churn", async () => {
+    const staleAnchor = new Date("2026-05-01T00:00:00.000Z");
+    let row = makeRecoveryActionRow({
+      id: "existing-action",
+      previousOwnerAgentId: "agent-previous",
+      ownerAgentId: "agent-owner",
+      evidence: { latestRunId: "run-1", recoveryHandoffGrantAnchorAt: staleAnchor.toISOString() },
+    });
+    const updates: Record<string, unknown>[] = [];
+    const makeSelectQuery = () => ({
+      from() {
+        return this;
+      },
+      where() {
+        return this;
+      },
+      orderBy() {
+        return this;
+      },
+      limit() {
+        return Promise.resolve(row ? [row] : []);
+      },
+    });
+    const fakeDb = {
+      select: vi.fn(() => makeSelectQuery()),
+      update: vi.fn(() => ({
+        set: vi.fn((patch: Record<string, unknown>) => ({
+          where: vi.fn(() => ({
+            returning: vi.fn(async () => {
+              updates.push(patch);
+              row = { ...row, ...patch };
+              return [row];
+            }),
+          })),
+        })),
+      })),
+      insert: vi.fn(),
+    };
+    const svc = issueRecoveryActionService(fakeDb as never);
+    const sweep = (previousOwnerAgentId: string | null) => svc.upsertSourceScoped({
+      companyId: "company-1",
+      sourceIssueId: "source-1",
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: "agent-owner",
+      previousOwnerAgentId,
+      cause: "stranded_assigned_issue",
+      fingerprint: `source-scoped:fingerprint:${randomUUID()}`,
+      evidence: { latestRunId: "run-2" },
+      nextAction: "Hand the diagnosis to the recovery owner.",
+    });
+
+    // A re-sweep naming the SAME previous owner is not a new transfer. The anchor
+    // must survive it even though `evidence` is otherwise replaced wholesale and
+    // `lastAttemptAt` is pushed forward on this very write.
+    const resweep = await sweep("agent-previous");
+    expect(resweep.evidence).toMatchObject({
+      latestRunId: "run-2",
+      recoveryHandoffGrantAnchorAt: staleAnchor.toISOString(),
+    });
+    expect(updates.at(-1)?.lastAttemptAt).toBeInstanceOf(Date);
+
+    // An omitted previous owner carries the existing one forward, so it is also
+    // not a transfer and must not re-anchor.
+    const carried = await sweep(null);
+    expect(carried.evidence).toMatchObject({
+      recoveryHandoffGrantAnchorAt: staleAnchor.toISOString(),
+    });
+
+    // Handing the issue away from a DIFFERENT agent is a real transfer: that agent
+    // is owed a fresh channel, so the anchor moves to now.
+    const transferred = await sweep("agent-second-previous");
+    const anchor = (transferred.evidence as Record<string, unknown>).recoveryHandoffGrantAnchorAt;
+    expect(typeof anchor).toBe("string");
+    expect(new Date(anchor as string).getTime()).toBeGreaterThan(staleAnchor.getTime());
+    expect(transferred).toMatchObject({ previousOwnerAgentId: "agent-second-previous" });
+  });
 });
 
 if (!embeddedPostgresSupport.supported) {
