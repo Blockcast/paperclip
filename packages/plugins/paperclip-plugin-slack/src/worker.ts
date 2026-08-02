@@ -828,6 +828,20 @@ async function validateSlackConfig(
   return { ok: errors.length === 0, warnings, errors };
 }
 
+// Resolves the token a scheduled job should post with. Job handlers are
+// registered unconditionally in setup() (BLO-20959) so credential resolution
+// can't gate registration itself; this is the per-tick guard that keeps a
+// job from running with no token, warning once instead of throwing.
+function requireSlackToken(jobKey: string): string | null {
+  if (!pluginToken) {
+    pluginCtx.logger.warn(
+      `Slack job "${jobKey}" skipped — plugin not configured (missing slackTokenRef)`,
+    );
+    return null;
+  }
+  return pluginToken;
+}
+
 // --- Plugin definition ---
 const plugin = definePlugin({
   async setup(ctx) {
@@ -838,6 +852,291 @@ const plugin = definePlugin({
     if (config.paperclipBaseUrl) {
       setBaseUrl(config.paperclipBaseUrl);
     }
+
+    // =========================================================================
+    // Jobs
+    // =========================================================================
+    // Registered unconditionally, before the slackTokenRef check below, so a
+    // worker start with an unresolved config still leaves the scheduler with
+    // a handler for every jobKey in manifest.ts (BLO-20959). Each handler
+    // resolves its own token via requireSlackToken() and no-ops with a warn
+    // when the plugin isn't configured, rather than vanishing.
+    // Daily digest. Gate the work on `enableDailyDigest` inside the handler.
+    // Without this, instances that leave `enableDailyDigest` at its default
+    // (false) log a "No handler registered for job 'daily-digest'" error
+    // every day.
+    ctx.jobs.register("daily-digest", async () => {
+      if (!config.enableDailyDigest) return;
+      const token = requireSlackToken("daily-digest");
+      if (!token) return;
+      const companies = await listTargetCompanies(ctx);
+      for (const company of companies) {
+        const channelId = await resolveChannel(
+          ctx,
+          company.id,
+          config.defaultChannelId,
+        );
+        if (!channelId) continue;
+        const issues = await ctx.issues.list({
+          companyId: company.id,
+          limit: 200,
+          offset: 0,
+        });
+        const now = new Date();
+        const dayAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+        let tasksCompleted = 0;
+        let tasksCreated = 0;
+        for (const issue of issues) {
+          const updated = new Date(issue.updatedAt);
+          const created = new Date(issue.createdAt);
+          if (issue.status === "done" && updated >= dayAgo) tasksCompleted++;
+          if (created >= dayAgo) tasksCreated++;
+        }
+        const agents = await ctx.agents.list({
+          companyId: company.id,
+          limit: 100,
+          offset: 0,
+        });
+        const agentsActive = agents.filter(
+          (a) => a.status === "active" || a.status === "running",
+        ).length;
+        const dateKey = now.toISOString().slice(0, 10);
+        const dailyCost = await ctx.state.get({
+          scopeKind: "company",
+          scopeId: company.id,
+          stateKey: STATE_KEYS.dailyCost(dateKey),
+        });
+        const totalCost = dailyCost
+          ? String((dailyCost as number).toFixed(2))
+          : "0.00";
+        const topAgentCosts = await ctx.state.get({
+          scopeKind: "company",
+          scopeId: company.id,
+          stateKey: STATE_KEYS.dailyAgentCosts(dateKey),
+        });
+        let topAgent = "";
+        if (topAgentCosts && typeof topAgentCosts === "object") {
+          const costs = topAgentCosts as Record<string, number>;
+          let maxCost = 0;
+          for (const [name, cost] of Object.entries(costs)) {
+            if (cost > maxCost) {
+              maxCost = cost;
+              topAgent = name;
+            }
+          }
+        }
+        await postMessage(
+          ctx,
+          token,
+          channelId,
+          formatDailyDigest({
+            tasksCompleted,
+            tasksCreated,
+            agentsActive,
+            totalCost,
+            topAgent,
+          }),
+        );
+        // Clean up previous day's cost state
+        const yesterday = new Date(now.getTime() - 86400000)
+          .toISOString()
+          .slice(0, 10);
+        await ctx.state.delete({
+          scopeKind: "company",
+          scopeId: company.id,
+          stateKey: STATE_KEYS.dailyCost(yesterday),
+        });
+        await ctx.state.delete({
+          scopeKind: "company",
+          scopeId: company.id,
+          stateKey: STATE_KEYS.dailyAgentCosts(yesterday),
+        });
+      }
+      ctx.logger.info("Daily digest posted to Slack");
+      await ctx.metrics.write("slack.digest.sent", 1);
+    });
+    if (config.enableDailyDigest) {
+      // Accumulate costs
+      ctx.events.on("cost_event.created", async (event) => {
+        const payload = event.payload as Record<string, unknown>;
+        const cost = Number(payload.cost ?? 0);
+        if (cost <= 0) return;
+        const dateKey = new Date().toISOString().slice(0, 10);
+        const currentTotal = await ctx.state.get({
+          scopeKind: "company",
+          scopeId: event.companyId,
+          stateKey: STATE_KEYS.dailyCost(dateKey),
+        });
+        await ctx.state.set(
+          {
+            scopeKind: "company",
+            scopeId: event.companyId,
+            stateKey: STATE_KEYS.dailyCost(dateKey),
+          },
+          ((currentTotal as number | null) ?? 0) + cost,
+        );
+        const agentName = String(
+          payload.agentName ?? payload.name ?? event.entityId,
+        );
+        const agentCosts = await ctx.state.get({
+          scopeKind: "company",
+          scopeId: event.companyId,
+          stateKey: STATE_KEYS.dailyAgentCosts(dateKey),
+        });
+        const costs =
+          (agentCosts as Record<string, number> | null) ?? {};
+        costs[agentName] = (costs[agentName] ?? 0) + cost;
+        await ctx.state.set(
+          {
+            scopeKind: "company",
+            scopeId: event.companyId,
+            stateKey: STATE_KEYS.dailyAgentCosts(dateKey),
+          },
+          costs,
+        );
+      });
+      ctx.logger.info("Daily digest job registered (9am daily)");
+    }
+    // Escalation timeout job
+    ctx.jobs.register("check-escalation-timeouts", async () => {
+      const token = requireSlackToken("check-escalation-timeouts");
+      if (!token) return;
+      const companies = await listTargetCompanies(ctx);
+      const timeoutMs = config.escalationTimeoutMs ?? 900000;
+      const now = Date.now();
+      for (const company of companies) {
+        const openEscalationsRaw = await ctx.state.get({
+          scopeKind: "company",
+          scopeId: company.id,
+          stateKey: "escalation-records-index",
+        });
+        const escalationIds = Array.isArray(openEscalationsRaw)
+          ? (openEscalationsRaw as string[])
+          : [];
+        for (const escalationKey of escalationIds) {
+          const record = (await ctx.state.get({
+            scopeKind: "company",
+            scopeId: company.id,
+            stateKey: STATE_KEYS.escalationRecord(escalationKey),
+          })) as EscalationRecord | null;
+          if (!record || record.status !== "open") continue;
+          const createdAt = new Date(String(record.createdAt)).getTime();
+          if (now - createdAt < timeoutMs) continue;
+          const escalationId = String(record.id);
+          const defaultAction = config.escalationDefaultAction ?? "defer";
+          await ctx.state.set(
+            {
+              scopeKind: "company",
+              scopeId: company.id,
+              stateKey: STATE_KEYS.escalationRecord(escalationId),
+            },
+            {
+              ...record,
+              status: "timed_out",
+              resolvedAt: new Date().toISOString(),
+              resolvedBy: "system:timeout",
+            },
+          );
+          const channelId = await ctx.state.get({
+            scopeKind: "company",
+            scopeId: company.id,
+            stateKey: STATE_KEYS.escalationChannel(escalationId),
+          });
+          const threadTs = await ctx.state.get({
+            scopeKind: "company",
+            scopeId: company.id,
+            stateKey: STATE_KEYS.escalationTs(escalationId),
+          });
+          if (channelId && threadTs) {
+            await postMessage(
+              ctx,
+              token,
+              String(channelId),
+              {
+                text: `Escalation timed out - default action: ${defaultAction}`,
+                blocks: [
+                  {
+                    type: "section",
+                    text: {
+                      type: "mrkdwn",
+                      text: `:hourglass: *Escalation timed out*\nDefault action applied: \`${defaultAction}\``,
+                    },
+                  },
+                ],
+              },
+              { threadTs: String(threadTs) },
+            );
+          }
+          await ctx.metrics.write("slack.escalations.timed_out", 1, {
+            action: defaultAction,
+          });
+          ctx.logger.info("Escalation timed out", {
+            escalationId,
+            defaultAction,
+          });
+        }
+      }
+    });
+    // Phase 5: Check watches job
+    ctx.jobs.register("check-watches", async () => {
+      const token = requireSlackToken("check-watches");
+      if (!token) return;
+      const companies = await listTargetCompanies(ctx);
+      for (const company of companies) {
+        // Get recent events from state (populated by event listeners below)
+        const recentEventsRaw = await ctx.state.get({
+          scopeKind: "company",
+          scopeId: company.id,
+          stateKey: "recent-watch-events",
+        });
+        const recentEvents = Array.isArray(recentEventsRaw)
+          ? (recentEventsRaw as Array<{
+              eventType: string;
+              payload: Record<string, unknown>;
+            }>)
+          : [];
+        if (recentEvents.length > 0) {
+          await checkWatches(ctx, token, company.id, recentEvents);
+          // Clear after processing
+          await ctx.state.set(
+            {
+              scopeKind: "company",
+              scopeId: company.id,
+              stateKey: "recent-watch-events",
+            },
+            [],
+          );
+        }
+      }
+    });
+    // Commit reaction-staged approval decisions whose undo grace window has
+    // elapsed (BLO-8861 two-phase resolve). Backstop for reactors who add ✅/❌
+    // and never remove it; durable across worker restarts via the pending index.
+    ctx.jobs.register("commit-pending-approvals", async () => {
+      const token = requireSlackToken("commit-pending-approvals");
+      if (!token) return;
+      const companies = await listTargetCompanies(ctx);
+      for (const company of companies) {
+        try {
+          const { committed } = await commitDuePendingApprovals(ctx, token, {
+            companyId: company.id,
+            paperclipBaseUrl: config.paperclipBaseUrl,
+          });
+          if (committed > 0) {
+            ctx.logger.info("Committed due pending approval decisions", {
+              companyId: company.id,
+              committed,
+            });
+          }
+        } catch (err) {
+          ctx.logger.warn("Failed to commit pending approvals", {
+            companyId: company.id,
+            err,
+          });
+        }
+      }
+    });
+
     if (!config.slackTokenRef) {
       ctx.logger.warn("No slackTokenRef configured, notifications disabled");
       return;
@@ -1335,278 +1634,6 @@ const plugin = definePlugin({
       );
       ctx.logger.info("Updated Slack channel mapping", { companyId, channelId });
       return { ok: true };
-    });
-
-    // =========================================================================
-    // Jobs
-    // =========================================================================
-    // Daily digest. Register the handler unconditionally so the scheduler
-    // (driven by the manifest cron) finds it; gate the work on
-    // `enableDailyDigest` inside the handler. Without this, instances that
-    // leave `enableDailyDigest` at its default (false) log a
-    // "No handler registered for job 'daily-digest'" error every day.
-    ctx.jobs.register("daily-digest", async () => {
-      if (!config.enableDailyDigest) return;
-      const companies = await listTargetCompanies(ctx);
-      for (const company of companies) {
-        const channelId = await resolveChannel(
-          ctx,
-          company.id,
-          config.defaultChannelId,
-        );
-        if (!channelId) continue;
-        const issues = await ctx.issues.list({
-          companyId: company.id,
-          limit: 200,
-          offset: 0,
-        });
-        const now = new Date();
-        const dayAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000);
-        let tasksCompleted = 0;
-        let tasksCreated = 0;
-        for (const issue of issues) {
-          const updated = new Date(issue.updatedAt);
-          const created = new Date(issue.createdAt);
-          if (issue.status === "done" && updated >= dayAgo) tasksCompleted++;
-          if (created >= dayAgo) tasksCreated++;
-        }
-        const agents = await ctx.agents.list({
-          companyId: company.id,
-          limit: 100,
-          offset: 0,
-        });
-        const agentsActive = agents.filter(
-          (a) => a.status === "active" || a.status === "running",
-        ).length;
-        const dateKey = now.toISOString().slice(0, 10);
-        const dailyCost = await ctx.state.get({
-          scopeKind: "company",
-          scopeId: company.id,
-          stateKey: STATE_KEYS.dailyCost(dateKey),
-        });
-        const totalCost = dailyCost
-          ? String((dailyCost as number).toFixed(2))
-          : "0.00";
-        const topAgentCosts = await ctx.state.get({
-          scopeKind: "company",
-          scopeId: company.id,
-          stateKey: STATE_KEYS.dailyAgentCosts(dateKey),
-        });
-        let topAgent = "";
-        if (topAgentCosts && typeof topAgentCosts === "object") {
-          const costs = topAgentCosts as Record<string, number>;
-          let maxCost = 0;
-          for (const [name, cost] of Object.entries(costs)) {
-            if (cost > maxCost) {
-              maxCost = cost;
-              topAgent = name;
-            }
-          }
-        }
-        await postMessage(
-          ctx,
-          token,
-          channelId,
-          formatDailyDigest({
-            tasksCompleted,
-            tasksCreated,
-            agentsActive,
-            totalCost,
-            topAgent,
-          }),
-        );
-        // Clean up previous day's cost state
-        const yesterday = new Date(now.getTime() - 86400000)
-          .toISOString()
-          .slice(0, 10);
-        await ctx.state.delete({
-          scopeKind: "company",
-          scopeId: company.id,
-          stateKey: STATE_KEYS.dailyCost(yesterday),
-        });
-        await ctx.state.delete({
-          scopeKind: "company",
-          scopeId: company.id,
-          stateKey: STATE_KEYS.dailyAgentCosts(yesterday),
-        });
-      }
-      ctx.logger.info("Daily digest posted to Slack");
-      await ctx.metrics.write("slack.digest.sent", 1);
-    });
-    if (config.enableDailyDigest) {
-      // Accumulate costs
-      ctx.events.on("cost_event.created", async (event) => {
-        const payload = event.payload as Record<string, unknown>;
-        const cost = Number(payload.cost ?? 0);
-        if (cost <= 0) return;
-        const dateKey = new Date().toISOString().slice(0, 10);
-        const currentTotal = await ctx.state.get({
-          scopeKind: "company",
-          scopeId: event.companyId,
-          stateKey: STATE_KEYS.dailyCost(dateKey),
-        });
-        await ctx.state.set(
-          {
-            scopeKind: "company",
-            scopeId: event.companyId,
-            stateKey: STATE_KEYS.dailyCost(dateKey),
-          },
-          ((currentTotal as number | null) ?? 0) + cost,
-        );
-        const agentName = String(
-          payload.agentName ?? payload.name ?? event.entityId,
-        );
-        const agentCosts = await ctx.state.get({
-          scopeKind: "company",
-          scopeId: event.companyId,
-          stateKey: STATE_KEYS.dailyAgentCosts(dateKey),
-        });
-        const costs =
-          (agentCosts as Record<string, number> | null) ?? {};
-        costs[agentName] = (costs[agentName] ?? 0) + cost;
-        await ctx.state.set(
-          {
-            scopeKind: "company",
-            scopeId: event.companyId,
-            stateKey: STATE_KEYS.dailyAgentCosts(dateKey),
-          },
-          costs,
-        );
-      });
-      ctx.logger.info("Daily digest job registered (9am daily)");
-    }
-    // Escalation timeout job
-    ctx.jobs.register("check-escalation-timeouts", async () => {
-      const companies = await listTargetCompanies(ctx);
-      const timeoutMs = config.escalationTimeoutMs ?? 900000;
-      const now = Date.now();
-      for (const company of companies) {
-        const openEscalationsRaw = await ctx.state.get({
-          scopeKind: "company",
-          scopeId: company.id,
-          stateKey: "escalation-records-index",
-        });
-        const escalationIds = Array.isArray(openEscalationsRaw)
-          ? (openEscalationsRaw as string[])
-          : [];
-        for (const escalationKey of escalationIds) {
-          const record = (await ctx.state.get({
-            scopeKind: "company",
-            scopeId: company.id,
-            stateKey: STATE_KEYS.escalationRecord(escalationKey),
-          })) as EscalationRecord | null;
-          if (!record || record.status !== "open") continue;
-          const createdAt = new Date(String(record.createdAt)).getTime();
-          if (now - createdAt < timeoutMs) continue;
-          const escalationId = String(record.id);
-          const defaultAction = config.escalationDefaultAction ?? "defer";
-          await ctx.state.set(
-            {
-              scopeKind: "company",
-              scopeId: company.id,
-              stateKey: STATE_KEYS.escalationRecord(escalationId),
-            },
-            {
-              ...record,
-              status: "timed_out",
-              resolvedAt: new Date().toISOString(),
-              resolvedBy: "system:timeout",
-            },
-          );
-          const channelId = await ctx.state.get({
-            scopeKind: "company",
-            scopeId: company.id,
-            stateKey: STATE_KEYS.escalationChannel(escalationId),
-          });
-          const threadTs = await ctx.state.get({
-            scopeKind: "company",
-            scopeId: company.id,
-            stateKey: STATE_KEYS.escalationTs(escalationId),
-          });
-          if (channelId && threadTs) {
-            await postMessage(
-              ctx,
-              token,
-              String(channelId),
-              {
-                text: `Escalation timed out - default action: ${defaultAction}`,
-                blocks: [
-                  {
-                    type: "section",
-                    text: {
-                      type: "mrkdwn",
-                      text: `:hourglass: *Escalation timed out*\nDefault action applied: \`${defaultAction}\``,
-                    },
-                  },
-                ],
-              },
-              { threadTs: String(threadTs) },
-            );
-          }
-          await ctx.metrics.write("slack.escalations.timed_out", 1, {
-            action: defaultAction,
-          });
-          ctx.logger.info("Escalation timed out", {
-            escalationId,
-            defaultAction,
-          });
-        }
-      }
-    });
-    // Phase 5: Check watches job
-    ctx.jobs.register("check-watches", async () => {
-      const companies = await listTargetCompanies(ctx);
-      for (const company of companies) {
-        // Get recent events from state (populated by event listeners below)
-        const recentEventsRaw = await ctx.state.get({
-          scopeKind: "company",
-          scopeId: company.id,
-          stateKey: "recent-watch-events",
-        });
-        const recentEvents = Array.isArray(recentEventsRaw)
-          ? (recentEventsRaw as Array<{
-              eventType: string;
-              payload: Record<string, unknown>;
-            }>)
-          : [];
-        if (recentEvents.length > 0) {
-          await checkWatches(ctx, token, company.id, recentEvents);
-          // Clear after processing
-          await ctx.state.set(
-            {
-              scopeKind: "company",
-              scopeId: company.id,
-              stateKey: "recent-watch-events",
-            },
-            [],
-          );
-        }
-      }
-    });
-    // Commit reaction-staged approval decisions whose undo grace window has
-    // elapsed (BLO-8861 two-phase resolve). Backstop for reactors who add ✅/❌
-    // and never remove it; durable across worker restarts via the pending index.
-    ctx.jobs.register("commit-pending-approvals", async () => {
-      const companies = await listTargetCompanies(ctx);
-      for (const company of companies) {
-        try {
-          const { committed } = await commitDuePendingApprovals(ctx, token, {
-            companyId: company.id,
-            paperclipBaseUrl: config.paperclipBaseUrl,
-          });
-          if (committed > 0) {
-            ctx.logger.info("Committed due pending approval decisions", {
-              companyId: company.id,
-              committed,
-            });
-          }
-        } catch (err) {
-          ctx.logger.warn("Failed to commit pending approvals", {
-            companyId: company.id,
-            err,
-          });
-        }
-      }
     });
 
     // =========================================================================
