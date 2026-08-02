@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq, sql } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -73,6 +73,15 @@ describeEmbeddedPostgres("pipelineService", () => {
         .set({ status: "cancelled", finishedAt: new Date(), error: reason })
         .where(eq(agentWakeupRequests.id, run.wakeupRequestId));
     }
+    await db
+      .update(issues)
+      .set({
+        executionRunId: null,
+        executionAgentNameKey: null,
+        executionLockedAt: null,
+        checkoutRunId: null,
+      })
+      .where(eq(issues.executionRunId, runId));
     return cancelled ?? null;
   });
   const noopHeartbeat = { wakeup: async () => null, cancelRun };
@@ -1750,6 +1759,13 @@ describeEmbeddedPostgres("pipelineService", () => {
           .update(issues)
           .set({ status: "in_progress", executionRunId: heartbeatRunId })
           .where(eq(issues.id, issueId!));
+        await db.insert(agentWakeupRequests).values({
+          companyId: company.id,
+          agentId: routine.assigneeAgentId!,
+          source: "comment",
+          status: "deferred_issue_execution",
+          payload: { issueId },
+        });
       }
 
       await svc.transitionCase({
@@ -1790,11 +1806,98 @@ describeEmbeddedPostgres("pipelineService", () => {
           "Cancelled because the pipeline case left the automation issue's originating stage",
           expect.objectContaining({ errorCode: "pipeline_stage_exited" }),
         );
+        const [deferredWake] = await db
+          .select({ status: agentWakeupRequests.status })
+          .from(agentWakeupRequests)
+          .where(and(
+            eq(agentWakeupRequests.status, "cancelled"),
+            sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
+          ));
+        expect(deferredWake).toEqual({ status: "cancelled" });
       }
       expect(comments.map((comment) => comment.body)).toContain(
         `Pipeline case "Case ${caseKey}" (${caseKey}) left stage "Drafting". This stage-entry automation issue was cancelled because its work is no longer current.`,
       );
     }
+  });
+
+  it("commits stage retirement when running heartbeat teardown fails", async () => {
+    const company = await seedCompany();
+    const routine = await seedRoutine(company.id, "Failed stage teardown");
+    const failedCancel = vi.fn(async () => {
+      throw new Error("runtime teardown unavailable");
+    });
+    const failingSvc = pipelineService(db, { heartbeat: { wakeup: async () => null, cancelRun: failedCancel } });
+    const pipeline = await failingSvc.createPipeline({
+      companyId: company.id,
+      key: "failed-stage-teardown",
+      name: "Failed stage teardown",
+      actor: userActor,
+      stages: [
+        { key: "intake", name: "Intake", kind: "open" },
+        { key: "drafting", name: "Drafting", kind: "working", config: { onEnter: { type: "run_routine", routineId: routine.id } } },
+        { key: "review", name: "Review", kind: "working" },
+        { key: "done", name: "Done", kind: "done" },
+        { key: "cancelled", name: "Cancelled", kind: "cancelled" },
+      ],
+    });
+    const created = await failingSvc.ingestCase({
+      companyId: company.id,
+      pipelineId: pipeline.id,
+      caseKey: "failed-teardown",
+      title: "Failed teardown",
+      actor: userActor,
+    });
+    const entered = await failingSvc.transitionCase({
+      companyId: company.id,
+      caseId: created.case.id,
+      toStageKey: "drafting",
+      expectedVersion: created.case.version,
+      actor: userActor,
+    });
+    const issueId = entered.automationExecution.status === "succeeded"
+      ? entered.automationExecution.execution.executionIssueId!
+      : "";
+    const heartbeatRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: heartbeatRunId,
+      companyId: company.id,
+      agentId: routine.assigneeAgentId!,
+      status: "running",
+      invocationSource: "assignment",
+      contextSnapshot: { issueId },
+    });
+    await db
+      .update(issues)
+      .set({ status: "in_progress", executionRunId: heartbeatRunId })
+      .where(eq(issues.id, issueId));
+
+    const transitioned = await failingSvc.transitionCase({
+      companyId: company.id,
+      caseId: created.case.id,
+      toStageKey: "review",
+      expectedVersion: entered.case.version,
+      actor: userActor,
+    });
+
+    expect(transitioned.case.stageId).not.toBe(entered.case.stageId);
+    expect(failedCancel).toHaveBeenCalledWith(
+      heartbeatRunId,
+      expect.any(String),
+      expect.objectContaining({ errorCode: "pipeline_stage_exited" }),
+    );
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, heartbeatRunId));
+    const [failureActivity] = await db
+      .select({ action: activityLog.action })
+      .from(activityLog)
+      .where(and(
+        eq(activityLog.action, "heartbeat.cancel_failed"),
+        eq(activityLog.entityId, heartbeatRunId),
+      ));
+    expect(issue).toMatchObject({ status: "cancelled", executionRunId: heartbeatRunId });
+    expect(run!.status).toBe("running");
+    expect(failureActivity).toEqual({ action: "heartbeat.cancel_failed" });
   });
 
   it("retires the automation link without cancelling a repurposed issue", async () => {

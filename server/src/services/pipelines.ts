@@ -44,6 +44,7 @@ import {
   type RoutineRevisionSnapshotV1,
 } from "@paperclipai/shared";
 import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
+import { logger } from "../middleware/logger.js";
 import { routineService } from "./routines.js";
 import { secretService } from "./secrets.js";
 import type { IssueAssignmentWakeupDeps } from "./issue-assignment-wakeup.js";
@@ -2238,14 +2239,38 @@ export function pipelineService(db: Db, deps: { heartbeat?: PipelineHeartbeatDep
   async function cancelRetiredStageAutomationRuns(runIds: Iterable<string>) {
     if (!heartbeat.cancelRun) return;
     for (const runId of new Set(runIds)) {
-      await heartbeat.cancelRun(
-        runId,
-        "Cancelled because the pipeline case left the automation issue's originating stage",
-        {
-          errorCode: "pipeline_stage_exited",
-          eventMessage: "run cancelled after pipeline stage exit",
-        },
-      );
+      try {
+        await heartbeat.cancelRun(
+          runId,
+          "Cancelled because the pipeline case left the automation issue's originating stage",
+          {
+            errorCode: "pipeline_stage_exited",
+            eventMessage: "run cancelled after pipeline stage exit",
+          },
+        );
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        logger.warn({ err: error, runId }, "failed to cancel running stage automation after transition commit");
+        const run = await db
+          .select({ companyId: heartbeatRuns.companyId, issueId: heartbeatRuns.contextIssueId })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, runId))
+          .limit(1)
+          .then((rows) => rows[0] ?? null)
+          .catch(() => null);
+        if (run) {
+          await logActivity(db, {
+            companyId: run.companyId,
+            actorType: "system",
+            actorId: "pipelines",
+            action: "heartbeat.cancel_failed",
+            entityType: "heartbeat_run",
+            entityId: runId,
+            issueId: run.issueId,
+            details: { source: "pipeline_stage_exited", error: errorMessage },
+          }).catch(() => undefined);
+        }
+      }
     }
   }
 
@@ -2987,16 +3012,31 @@ export function pipelineService(db: Db, deps: { heartbeat?: PipelineHeartbeatDep
       return;
     }
 
+    const activeExecutionRun = row.issueExecutionRunId
+      ? await tx
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(and(
+          eq(heartbeatRuns.id, row.issueExecutionRunId),
+          eq(heartbeatRuns.companyId, input.companyId),
+        ))
+        .limit(1)
+        .then((rows) => rows[0] ?? null)
+      : null;
+    const preserveRunningGeneration = activeExecutionRun?.status === "running";
+
     const [cancelledIssue] = await tx
       .update(issues)
       .set({
         status: "cancelled",
         cancelledAt: now,
         completedAt: null,
-        checkoutRunId: null,
-        executionRunId: null,
-        executionAgentNameKey: null,
-        executionLockedAt: null,
+        checkoutRunId: preserveRunningGeneration && row.issueCheckoutRunId === row.issueExecutionRunId
+          ? row.issueCheckoutRunId
+          : null,
+        executionRunId: preserveRunningGeneration ? row.issueExecutionRunId : null,
+        executionAgentNameKey: preserveRunningGeneration ? undefined : null,
+        executionLockedAt: preserveRunningGeneration ? undefined : null,
         updatedAt: now,
       })
       .where(and(
@@ -3025,19 +3065,8 @@ export function pipelineService(db: Db, deps: { heartbeat?: PipelineHeartbeatDep
       });
     if (!cancelledIssue) return;
 
-    if (row.issueExecutionRunId) {
-      const activeRun = await tx
-        .select({ status: heartbeatRuns.status })
-        .from(heartbeatRuns)
-        .where(and(
-          eq(heartbeatRuns.id, row.issueExecutionRunId),
-          eq(heartbeatRuns.companyId, input.companyId),
-        ))
-        .limit(1)
-        .then((rows) => rows[0] ?? null);
-      if (activeRun?.status === "running") {
-        input.runningRunIdsToCancel?.add(row.issueExecutionRunId);
-      }
+    if (preserveRunningGeneration && row.issueExecutionRunId) {
+      input.runningRunIdsToCancel?.add(row.issueExecutionRunId);
     }
 
     const cancelledRuns = await tx
@@ -3069,6 +3098,19 @@ export function pipelineService(db: Db, deps: { heartbeat?: PipelineHeartbeatDep
         })
         .where(inArray(agentWakeupRequests.id, wakeupRequestIds));
     }
+    await tx
+      .update(agentWakeupRequests)
+      .set({
+        status: "cancelled",
+        finishedAt: now,
+        error: "Cancelled because the pipeline case left the automation issue's originating stage",
+        updatedAt: now,
+      })
+      .where(and(
+        eq(agentWakeupRequests.companyId, input.companyId),
+        eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        sql`${agentWakeupRequests.payload} ->> 'issueId' = ${cancelledIssue.id}`,
+      ));
     await tx.insert(issueComments).values({
       companyId: input.companyId,
       issueId: cancelledIssue.id,
