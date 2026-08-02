@@ -1002,4 +1002,49 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
       executionRunId: null,
     });
   });
+
+  it("does not return idempotent checkout success when the existing owner run finalizes", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Existing checkout owner finalized while waiting",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: currentRunId,
+      executionRunId: currentRunId,
+      executionAgentNameKey: "test-agent",
+      executionLockedAt: new Date(),
+    });
+
+    let releaseIssueLock!: () => void;
+    let issueLockHeld!: () => void;
+    const issueLockHeldPromise = new Promise<void>((resolve) => { issueLockHeld = resolve; });
+    const releaseIssueLockPromise = new Promise<void>((resolve) => { releaseIssueLock = resolve; });
+    const lockTransaction = db.transaction(async (tx) => {
+      await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, issueId)).for("update");
+      issueLockHeld();
+      await releaseIssueLockPromise;
+    });
+
+    await issueLockHeldPromise;
+    const checkoutPromise = issueService(db).checkout(
+      issueId,
+      agentId,
+      ["todo", "backlog", "blocked"],
+      currentRunId,
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "succeeded", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, currentRunId));
+
+    releaseIssueLock();
+    await expect(checkoutPromise).rejects.toMatchObject({ status: 409 });
+    await lockTransaction;
+  });
 });

@@ -14555,6 +14555,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           if (!lockedIssue) return null;
 
           if (autoCheckoutWake) {
+            const blockerRows = await tx
+              .select({ id: issueRelations.issueId })
+              .from(issueRelations)
+              .where(
+                and(
+                  eq(issueRelations.companyId, claimed.companyId),
+                  eq(issueRelations.relatedIssueId, claimedIssueId),
+                  eq(issueRelations.type, "blocks"),
+                ),
+              )
+              .orderBy(asc(issueRelations.issueId));
+            const blockerIssueIds = blockerRows.map((row) => row.id);
+            if (blockerIssueIds.length > 0) {
+              await tx.execute(
+                sql`SELECT ${issues.id} FROM ${issues}
+                    WHERE ${and(
+                      eq(issues.companyId, claimed.companyId),
+                      inArray(issues.id, blockerIssueIds),
+                    )}
+                    ORDER BY ${issues.id}
+                    FOR UPDATE`,
+              );
+            }
             const lockedReadiness = await issuesSvc.listDependencyReadiness(
               claimed.companyId,
               [claimedIssueId],

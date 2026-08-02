@@ -9337,10 +9337,26 @@ export function issueService(db: Db) {
         current.status === "in_progress" &&
         sameRunLock(current.checkoutRunId, checkoutRunId)
       ) {
-        const row = await db.select().from(issues).where(eq(issues.id, id)).then((rows) => rows[0] ?? null);
-        if (!row) throw notFound("Issue not found");
-        const [enriched] = await withIssueLabels(db, [row]);
-        return enriched;
+        const row = await withLockedIssueCheckoutExecution(id, checkoutRunId, agentId, now, async (tx) =>
+          tx
+            .select()
+            .from(issues)
+            .where(
+              and(
+                eq(issues.id, id),
+                eq(issues.assigneeAgentId, agentId),
+                eq(issues.status, "in_progress"),
+                checkoutRunId
+                  ? eq(issues.checkoutRunId, checkoutRunId)
+                  : isNull(issues.checkoutRunId),
+              ),
+            )
+            .then((rows) => rows[0] ?? null)
+        );
+        if (row) {
+          const [enriched] = await withIssueLabels(db, [row]);
+          return enriched;
+        }
       }
 
       // If an executionRunId is blocking checkout but its run is dead, clear it and retry
