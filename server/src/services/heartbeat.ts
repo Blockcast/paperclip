@@ -11221,6 +11221,36 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     patch: Partial<typeof heartbeatRuns.$inferInsert> | undefined,
     label: string,
   ) {
+    const statusPatch =
+      expectedStatus === "running"
+        ? {
+            status: sql`case
+              when ${heartbeatRuns.resultJson} ->> 'pipelineStageExitCancellationRequestedAt' is not null
+                then 'cancelled'
+              else ${status}
+            end`,
+            ...patch,
+            error: sql`case
+              when ${heartbeatRuns.resultJson} ->> 'pipelineStageExitCancellationRequestedAt' is not null
+                then 'Cancelled because the pipeline case left the automation issue''s originating stage'
+              else ${patch?.error ?? null}
+            end`,
+            errorCode: sql`case
+              when ${heartbeatRuns.resultJson} ->> 'pipelineStageExitCancellationRequestedAt' is not null
+                then 'pipeline_stage_exited'
+              else ${patch?.errorCode ?? null}
+            end`,
+            resultJson: sql`case
+              when ${heartbeatRuns.resultJson} ->> 'pipelineStageExitCancellationRequestedAt' is not null
+                then coalesce(${patch?.resultJson ?? null}::jsonb, '{}'::jsonb) || jsonb_build_object(
+                  'pipelineStageExitCancellationRequestedAt',
+                  ${heartbeatRuns.resultJson} -> 'pipelineStageExitCancellationRequestedAt'
+                )
+              else ${patch?.resultJson ?? null}::jsonb
+            end`,
+          }
+        : { status, ...patch };
+
     // BLO-16998: same transient-retry rationale as setRunStatus — the guarded
     // finalize UPDATE is idempotent (status set-by-id, gated on the expected
     // current status) so replaying it on a transient failure is safe.
@@ -11228,7 +11258,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       () =>
         db
           .update(heartbeatRuns)
-          .set({ status, ...patch, updatedAt: new Date() })
+          .set({ ...statusPatch, updatedAt: new Date() })
           .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, expectedStatus)))
           .returning()
           .then((rows) => rows[0] ?? null),
@@ -21875,7 +21905,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       let outcome: RunSessionOutcome;
       let silentFailureMessage: string | null = null;
       const latestRun = await getRun(run.id);
-      if (isHeartbeatRunTerminalStatus(latestRun?.status)) {
+      const stageExitCancellationRequested = typeof parseObject(latestRun?.resultJson)
+        .pipelineStageExitCancellationRequestedAt === "string";
+      if (stageExitCancellationRequested) {
+        outcome = "cancelled";
+      } else if (isHeartbeatRunTerminalStatus(latestRun?.status)) {
         outcome = latestRun.status;
       } else if (adapterResult.timedOut) {
         outcome = "timed_out";
@@ -22021,7 +22055,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         : prReviewIncompleteOverride
           ? prReviewIncompleteOverride.errorMessage
         : outcome === "cancelled"
-          ? (latestRun?.error ?? adapterResult.errorMessage ?? "Cancelled")
+          ? (stageExitCancellationRequested
+              ? "Cancelled because the pipeline case left the automation issue's originating stage"
+              : latestRun?.error ?? adapterResult.errorMessage ?? "Cancelled")
           : outcome === "succeeded"
             ? null
             : redactCurrentUserText(
@@ -22046,7 +22082,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             : outcome === "timed_out"
           ? "timeout"
           : outcome === "cancelled"
-            ? (latestRun?.errorCode ?? "cancelled")
+            ? (stageExitCancellationRequested ? "pipeline_stage_exited" : latestRun?.errorCode ?? "cancelled")
             : outcome === "failed"
               ? (silentFailureMessage
                   ? "silent_failure"
@@ -22199,15 +22235,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         );
         return;
       }
+      if (persistedRunWrite.run?.errorCode === "pipeline_stage_exited") {
+        outcome = "cancelled";
+      }
 
       let persistedRun = persistedRunWrite.run;
       if (persistedRun) {
         persistedRun = await classifyAndPersistRunLiveness(persistedRun, persistedResultJson) ?? persistedRun;
       }
 
-      await setWakeupStatus(run.wakeupRequestId, outcome === "succeeded" ? "completed" : status, {
+      const persistedStatus = persistedRunWrite.run?.status ?? status;
+      await setWakeupStatus(run.wakeupRequestId, outcome === "succeeded" ? "completed" : persistedStatus, {
         finishedAt: new Date(),
-        error: runErrorMessage,
+        error: persistedRunWrite.run?.error ?? runErrorMessage,
       });
 
       const finalizedRun = persistedRun ?? (await getRun(run.id));
@@ -22218,7 +22258,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           level: outcome === "succeeded" ? "info" : "error",
           message: `run ${outcome}`,
           payload: {
-            status,
+            status: persistedStatus,
             exitCode: adapterResult.exitCode,
           },
         });
