@@ -6,6 +6,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { and, eq, sql } from "drizzle-orm";
 import {
   agents,
+  approvals,
   companies,
   companySecretBindings,
   companySecretProviderConfigs,
@@ -18,6 +19,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { agentService } from "../services/agents.ts";
+import { approvalService } from "../services/approvals.ts";
 import { secretService } from "../services/secrets.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -48,6 +50,7 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
     await db.delete(companySecretVersions);
     await db.delete(companySecrets);
     await db.delete(companySecretProviderConfigs);
+    await db.delete(approvals);
     await db.delete(agents);
     await db.delete(companies);
   });
@@ -333,6 +336,63 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
         role: "reviewer",
         runtimeConfig: { heartbeat: { maxConcurrentRuns: 12, wakeOnDemand: true } },
       },
+    });
+  });
+
+  it("preserves concurrent runtime changes through the production hire approval path", async () => {
+    const companyId = await seedCompany();
+    const agentId = await seedAgentRow(companyId, {
+      name: "Production Approval Race",
+      status: "pending_approval",
+      adapterType: "opencode_k8s",
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 15, wakeOnDemand: false } },
+    });
+    const requestedRuntimeConfig = {
+      heartbeat: { maxConcurrentRuns: 15, wakeOnDemand: false },
+    };
+    const approvalId = randomUUID();
+    await db.insert(approvals).values({
+      id: approvalId,
+      companyId,
+      type: "hire_agent",
+      status: "pending",
+      requestedByUserId: "requester",
+      payload: {
+        agentId,
+        name: "Production Approval Race",
+        role: "engineer",
+        adapterType: "opencode_k8s",
+        adapterConfig: {},
+        runtimeConfig: requestedRuntimeConfig,
+        budgetMonthlyCents: 0,
+        requestedConfigurationSnapshot: {
+          adapterType: "opencode_k8s",
+          adapterConfig: {},
+          runtimeConfig: requestedRuntimeConfig,
+        },
+      },
+      updatedAt: new Date(),
+    });
+
+    let pendingApproval!: ReturnType<ReturnType<typeof approvalService>["approve"]>;
+    let settled = false;
+    await db.transaction(async (tx) => {
+      await tx.execute(sql`select ${agents.id} from ${agents} where ${agents.id} = ${agentId} for update`);
+      pendingApproval = approvalService(db).approve(approvalId, "board-user", "Approved");
+      void pendingApproval.finally(() => {
+        settled = true;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(settled).toBe(false);
+      await tx.update(agents).set({
+        runtimeConfig: { heartbeat: { maxConcurrentRuns: 12, wakeOnDemand: true } },
+      }).where(eq(agents.id, agentId));
+    });
+
+    await expect(pendingApproval).resolves.toMatchObject({ applied: true });
+    await expect(agentService(db).getById(agentId)).resolves.toMatchObject({
+      status: "idle",
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 12, wakeOnDemand: true } },
     });
   });
 

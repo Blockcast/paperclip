@@ -270,6 +270,46 @@ function mergeRuntimeConfigPatch(
   return merged;
 }
 
+function mergeApprovedRuntimeConfig(
+  currentRuntimeConfig: unknown,
+  requestedRuntimeConfig: Record<string, unknown>,
+  approvedRuntimeConfig: Record<string, unknown>,
+): Record<string, unknown> {
+  const current = isPlainRecord(currentRuntimeConfig) ? currentRuntimeConfig : {};
+  const merged = { ...current };
+  const keys = new Set([
+    ...Object.keys(requestedRuntimeConfig),
+    ...Object.keys(approvedRuntimeConfig),
+  ]);
+
+  for (const key of keys) {
+    const requestedHasKey = Object.prototype.hasOwnProperty.call(requestedRuntimeConfig, key);
+    const approvedHasKey = Object.prototype.hasOwnProperty.call(approvedRuntimeConfig, key);
+    if (requestedHasKey && approvedHasKey && jsonEqual(requestedRuntimeConfig[key], approvedRuntimeConfig[key])) {
+      continue;
+    }
+    if (!approvedHasKey) {
+      delete merged[key];
+      continue;
+    }
+    if (
+      requestedHasKey
+      && isPlainRecord(requestedRuntimeConfig[key])
+      && isPlainRecord(approvedRuntimeConfig[key])
+    ) {
+      merged[key] = mergeApprovedRuntimeConfig(
+        current[key],
+        requestedRuntimeConfig[key],
+        approvedRuntimeConfig[key],
+      );
+      continue;
+    }
+    merged[key] = approvedRuntimeConfig[key];
+  }
+
+  return merged;
+}
+
 function diffConfigSnapshot(
   before: AgentConfigSnapshot,
   after: AgentConfigSnapshot,
@@ -916,10 +956,19 @@ export function agentService(db: Db) {
           );
         }
         const nextAdapterType = (patch.adapterType ?? existing.adapterType) as string;
+        const requestedSnapshot = approvedPayload && isPlainRecord(approvedPayload.requestedConfigurationSnapshot)
+          ? approvedPayload.requestedConfigurationSnapshot
+          : null;
+        const requestedRuntimeConfig = requestedSnapshot && isPlainRecord(requestedSnapshot.runtimeConfig)
+          ? requestedSnapshot.runtimeConfig
+          : null;
+        const approvedRuntimeConfig = isPlainRecord(patch.runtimeConfig) ? patch.runtimeConfig : null;
         const normalizedRuntimeConfig = normalizeExternalLifecycleRuntimeConfig(
           nextAdapterType,
-          Object.prototype.hasOwnProperty.call(patch, "runtimeConfig")
-            ? mergeRuntimeConfigPatch(existing.runtimeConfig, patch.runtimeConfig)
+          approvedRuntimeConfig
+            ? requestedRuntimeConfig
+              ? mergeApprovedRuntimeConfig(existing.runtimeConfig, requestedRuntimeConfig, approvedRuntimeConfig)
+              : mergeRuntimeConfigPatch(existing.runtimeConfig, approvedRuntimeConfig)
             : existing.runtimeConfig,
         );
         if (
