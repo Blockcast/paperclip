@@ -2580,6 +2580,16 @@ export function pluginLoader(
       tools: 0,
     };
 
+    // Retry counters live at function scope so the failure handler can record
+    // how the plugin got here. The activation log line is written once, at
+    // activation time, and had already scrolled out of retention by the time
+    // BLO-20410 was investigated 9 hours later — `lastError` was the only
+    // surviving evidence, and a bare timeout string cannot distinguish boot
+    // contention (retries exhausted) from a real fault (failed closed
+    // immediately).
+    let sdkRaceAttempt = 0;
+    let transientAttempt = 0;
+
     // Guard: runtime services must exist (callers already checked)
     if (!runtimeServices) {
       return {
@@ -2711,8 +2721,6 @@ export function pluginLoader(
       // (module not found, cheap to retry) and a transient startup failure such
       // as the 60s `initialize` timeout (BLO-20410, expensive to retry). They
       // are counted separately so exhausting one does not consume the other.
-      let sdkRaceAttempt = 0;
-      let transientAttempt = 0;
       for (;;) {
         try {
           if (workerManager.getWorker(pluginId)) {
@@ -2904,14 +2912,28 @@ export function pluginLoader(
       }
 
       log.error(
-        { pluginId, pluginKey, err: errorMessage },
+        { pluginId, pluginKey, err: errorMessage, sdkRaceAttempt, transientAttempt },
         "plugin-loader: failed to activate plugin",
       );
 
-      // Mark the plugin as errored in the database so it is not retried
-      // automatically on next startup without operator intervention.
+      // Record how the plugin reached this state alongside the error itself.
+      // `lastError` outlives log retention, so it carries the one fact the logs
+      // cannot: whether retries were spent (contention) or the failure was
+      // terminal on the first attempt (a real fault). See BLO-20410.
+      const retrySuffix =
+        sdkRaceAttempt > 0 || transientAttempt > 0
+          ? ` (after ${transientAttempt} transient and ${sdkRaceAttempt} sdk-install-race retries)`
+          : " (failed closed on first attempt; not classified as transient)";
+
+      // Mark the plugin as errored in the database. Transient failures are
+      // retried above before reaching this point (BLO-20410); anything that
+      // lands here has either exhausted its retry budget or is a fault we
+      // deliberately do not retry, so it still requires operator intervention.
       try {
-        await lifecycleManager.markError(pluginId, `Activation failed: ${errorMessage}`);
+        await lifecycleManager.markError(
+          pluginId,
+          `Activation failed: ${errorMessage}${retrySuffix}`,
+        );
       } catch (markErr) {
         log.error(
           {
