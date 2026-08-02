@@ -55,6 +55,31 @@ async function createApp(db: Db, companyId: string, userId: string) {
   return app;
 }
 
+async function createAgentApp(db: Db, companyId: string, agentId: string) {
+  const { accessRoutes } = await import("../routes/access.js");
+  const app = express();
+  app.use(express.json());
+  app.use((req, _res, next) => {
+    req.actor = {
+      type: "agent",
+      agentId,
+      companyId,
+      source: "agent_jwt",
+    };
+    next();
+  });
+  app.use("/api", accessRoutes(db, {
+    deploymentMode: "authenticated",
+    deploymentExposure: "private",
+    bindHost: "127.0.0.1",
+    allowedHostnames: [],
+  }));
+  app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    res.status(err.status ?? 500).json({ error: err.message ?? "Internal server error" });
+  });
+  return app;
+}
+
 async function seedCompanyOwnerAndAgent(db: Db) {
   const company = await db
     .insert(companies)
@@ -260,6 +285,23 @@ describeEmbeddedPostgres("additive agent grant route", () => {
         eq(principalPermissionGrants.permissionKey, "agents:configure"),
       ));
     expect(foreignGrant).toHaveLength(0);
+  });
+
+  it("rejects agent callers even when they hold the company management grant", async () => {
+    const { company, agent } = await seedCompanyOwnerAndAgent(db);
+    await db.insert(principalPermissionGrants).values({
+      companyId: company.id,
+      principalType: "agent",
+      principalId: agent.id,
+      permissionKey: "users:manage_permissions",
+    });
+
+    const response = await request(await createAgentApp(db, company.id, agent.id))
+      .patch(`/api/companies/${company.id}/agents/${agent.id}/grants`)
+      .send({ operation: "add", permissionKey: "agents:configure" });
+
+    expect(response.status, JSON.stringify(response.body)).toBe(403);
+    expect(response.body.error).toBe("Board access required");
   });
 
   it("leaves the human-member permission replacement route unchanged", async () => {
