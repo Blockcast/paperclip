@@ -238,27 +238,53 @@ test("PaperclipPrReviewWakeTerminalFailed is pr_review-scoped, gauge-keyed, and 
   ) ?? [];
   assert.ok(expr, "terminal-failed alert must render an expr");
 
-  // Pin the scope selector. Dropping it would sum scope="other" too, and
-  // ordinary issue wakes that failed are re-driven by the issue's own
-  // lifecycle -- paging on those trains the operator to ignore this alert.
+  // Pin the scope selector AND the age gauge.
+  //
+  // Scope: dropping the selector would sum scope="other" too, and ordinary
+  // issue wakes that failed are re-driven by the issue's own lifecycle --
+  // paging on those trains the operator to ignore this alert.
+  //
+  // Age gauge: this must threshold
+  // paperclip_agent_wakeup_terminal_failed_oldest_age_seconds, NOT a summed
+  // count under a long `for:`. A `for:` clause measures how long the
+  // EXPRESSION has been continuously true, not how long any one row has been
+  // failed. With `sum(..._unresolved{scope="pr_review"}) > 0` and `for: 30m`,
+  // two different short failures overlapping by a single scrape hold the sum
+  // non-zero across the whole window: A carries it 29 minutes, B arrives as A
+  // clears, the expression never goes false, and B pages about a minute old
+  // while the annotation claims thirty. Splitting on error_code does not help,
+  // because the expression sums that label away. The age gauge carries the
+  // server-computed per-row age, so the threshold means what it says.
   assert.match(
     expr,
-    /^sum\(paperclip_agent_wakeup_terminal_failed_unresolved\{scope="pr_review"\}\) > 0$/,
-    "terminal-failed alert must select only scope=pr_review and fire on a strictly positive gauge",
+    /^max\(paperclip_agent_wakeup_terminal_failed_oldest_age_seconds\{scope="pr_review"\}\) > (\d+)$/,
+    "terminal-failed alert must threshold the per-row age gauge for scope=pr_review, "
+      + "not a summed count under a long `for:`",
   );
 
-  // The gauge is zero-initialized across the whole label grid, so `> 0` is the
-  // silent-in-steady-state guarantee. `>= 0` would fire permanently.
-  assert.doesNotMatch(expr, />=\s*0/, "must not fire on a zero-valued gauge");
+  const [, ageThreshold] = expr.match(/> (\d+)$/) ?? [];
+  // The gauge is zero-initialized and reset to 0 for a scope with no
+  // unresolved rows, so a strictly-positive threshold is the
+  // silent-in-steady-state guarantee. `> 0` would page on a row that failed
+  // one second ago.
+  assert.ok(
+    Number(ageThreshold) > 0,
+    "age threshold must be strictly positive so a zero-valued gauge is silent",
+  );
+  // Past the 45m HARD_STALE window would be ideal but 30m is the tuned start
+  // per the issue AC; anything at or under the 10m second bounded-retry step
+  // would race a retry that has not yet written its successor rows.
+  assert.ok(
+    Number(ageThreshold) >= 1800,
+    `age threshold ${ageThreshold}s must be at least 1800s (30m) per the BLO-20255 AC`,
+  );
 
   const [, forWindow] = rendered.match(
     /alert: PaperclipPrReviewWakeTerminalFailed[\s\S]*?\n\s+for: (.+)\n/,
   ) ?? [];
-  // The `for` window is load-bearing for the "a retried row must not page"
-  // guarantee: the BLO-18030 bounded retry's first two steps are 2m and 10m
-  // (BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS), and a retried row leaves the
-  // gauge via the successor-wake exclusion. Anything at or under 10m would race
-  // the retry and page on work that is actively being re-driven.
+  // `for:` is now scrape-flap tolerance ONLY -- the ageing lives in the
+  // threshold above. It must stay short: a long `for:` here would stack on top
+  // of the age threshold and delay the page well past the intended window.
   assert.ok(forWindow, "terminal-failed alert must render a for window");
   const forMinutes = /^(\d+)m$/.test(forWindow.trim())
     ? Number(forWindow.trim().slice(0, -1))
@@ -266,8 +292,9 @@ test("PaperclipPrReviewWakeTerminalFailed is pr_review-scoped, gauge-keyed, and 
       ? Number(forWindow.trim().slice(0, -1)) * 60
       : null;
   assert.ok(
-    forMinutes !== null && forMinutes > 10,
-    `for window ${forWindow} must exceed the 10m second bounded-retry step so a retried row cannot page`,
+    forMinutes !== null && forMinutes > 0 && forMinutes <= 10,
+    `for window ${forWindow} must be a short scrape-flap tolerance (<= 10m); `
+      + "the ageing belongs in the age-gauge threshold, not here",
   );
 
   // The runbook link is the operator's decision procedure (re-review vs

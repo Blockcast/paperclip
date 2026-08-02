@@ -1,8 +1,21 @@
 # Terminal-failed agent wakeups (a PR review that will never run)
 
-Source: `server/src/services/heartbeat.ts` (`publishAgentWakeupTerminalFailedGauge`), `server/src/services/metrics.ts` (`AGENT_WAKEUP_TERMINAL_FAILED_UNRESOLVED_METRIC`)
-Trigger: alert `PaperclipPrReviewWakeTerminalFailed` — `paperclip_agent_wakeup_terminal_failed_unresolved{scope="pr_review"} > 0` for 30m
+Source: `server/src/services/heartbeat.ts` (`publishAgentWakeupTerminalFailedGauge`), `server/src/services/metrics.ts` (`AGENT_WAKEUP_TERMINAL_FAILED_UNRESOLVED_METRIC`, `AGENT_WAKEUP_TERMINAL_FAILED_OLDEST_AGE_METRIC`)
+Trigger: alert `PaperclipPrReviewWakeTerminalFailed` — `max(paperclip_agent_wakeup_terminal_failed_oldest_age_seconds{scope="pr_review"}) > 1800` for 5m
 Owner: Platform / SRE (gstack)
+
+Two series back this alert, and it matters which one you read:
+
+- `paperclip_agent_wakeup_terminal_failed_oldest_age_seconds{scope}` — **what the
+  alert thresholds.** Age in seconds of the oldest unresolved terminal-`failed`
+  row in that scope; 0 when there are none. The ageing lives here rather than in
+  a Prometheus `for:` clause because `for:` measures how long the *expression*
+  has been continuously true, not how long any one row has been failed — two
+  short failures overlapping by a single scrape would keep a summed count true
+  across the window and page for a row seconds old.
+- `paperclip_agent_wakeup_terminal_failed_unresolved{error_code,scope}` — the
+  **count**, broken down by `error_code`. This is what you triage with; it does
+  not decide whether the alert fires.
 
 ## The invariant
 
@@ -130,16 +143,41 @@ of the gauge's 24h recency window by themselves.
 ## Verifying the signal is live
 
 ```
+paperclip_agent_wakeup_terminal_failed_oldest_age_seconds{scope="pr_review"}
 sum(paperclip_agent_wakeup_terminal_failed_unresolved{scope="pr_review"})
 ```
 
-The series is zero-initialized across the full `(error_code, scope)` grid at
-process start, so a healthy fleet renders **0**, not "No data". If you see "No
-data", the scrape is broken or the reconcile pass is not running — that is a
-different and worse problem than the alert firing.
+Both series are zero-initialized at process start — the count across the full
+`(error_code, scope)` grid, the age across both scopes — so a healthy fleet
+renders **0**, not "No data". If you see "No data", the scrape is broken or the
+reconcile pass is not running — that is a different and worse problem than the
+alert firing.
+
+The age series is also explicitly rewritten to 0 for a scope with no unresolved
+rows on every reconcile pass. That is what lets the alert resolve: a gauge left
+untouched when the last failure clears would freeze above the threshold and page
+forever.
+
+### Where the rule actually runs
+
+The chart copy at `deploy/helm/paperclip/templates/prometheusrule.yaml` **does
+not deploy on Blockcast** (`prometheusRule.enabled: false` in
+`values.blockcast.yaml` — `paperclip-ci-deploy` has no RBAC on
+`prometheusrules.monitoring.coreos.com`). The rule that fires in production
+lives in `Blockcast/onprem-k8s`, in both lockstep-enforced files:
+`monitoring/prometheus-configmap.yaml` (key `paperclip-runtime-alerts.rules.yml`,
+authoritative) and `paperclip/paperclip-runtime-alerts-prometheusrule.yaml`
+(CRD documentation copy). Added by Blockcast/onprem-k8s#1946.
+
+Merging that is **not** deploying it: the `monitoring-rules` Argo app syncs
+manually, a gate that once stranded 15 merged alerts for 8 days (BLO-19095).
+Confirm the rule is in the live ConfigMap and in Prometheus `/api/v1/rules`
+before treating this alert as production observability.
 
 ## References
 
 - `runbooks/README.md` — index
 - BLO-20255 (this alert), BLO-18030 / PR #900 (the bounded retry), BLO-18859
   (the sibling dead-letter alert and the zero-initialization lesson)
+- Blockcast/onprem-k8s#1946 — the production rule
+- BLO-19095 — the manual Argo sync gate that stands between merge and deploy

@@ -293,6 +293,35 @@ export const AGENT_WAKEUP_TERMINAL_FAILED_UNRESOLVED_METRIC =
   "paperclip_agent_wakeup_terminal_failed_unresolved";
 
 /**
+ * Age, in seconds, of the OLDEST unresolved terminal-`failed` wake in each
+ * scope — 0 when the scope has none (BLO-20255).
+ *
+ * This exists because a Prometheus `for:` clause cannot express the condition
+ * the alert actually needs. `for:` measures how long the *expression* has been
+ * continuously true, not how long any individual row has been failed, and the
+ * alert expression sums rows together. So with
+ * `sum(..._unresolved{scope="pr_review"}) > 0` and `for: 30m`, two different
+ * short-lived failures overlapping by a single scrape keep the sum non-zero
+ * across the whole window: failure A holds it up for 29 minutes, B appears as A
+ * is resolved, the expression never goes false, and B pages after roughly one
+ * minute while the annotation claims a row has sat failed for thirty. Rotating
+ * `error_code` values do not save it either, since the expression sums that
+ * label away.
+ *
+ * Publishing the age as its own gauge moves the ageing into data the server
+ * already knows exactly (`now - finishedAt` of a row that survived the
+ * successor exclusion), so the rule can threshold on a real per-row age and use
+ * `for:` only for the thing it is good at — tolerating a scrape or two of
+ * flapping.
+ *
+ * `scope`-only labels, deliberately: `error_code` is a triage breakdown for the
+ * count, and adding it here would let a scope's oldest row hide behind a
+ * younger row of a different code.
+ */
+export const AGENT_WAKEUP_TERMINAL_FAILED_OLDEST_AGE_METRIC =
+  "paperclip_agent_wakeup_terminal_failed_oldest_age_seconds";
+
+/**
  * Bounded `error_code` allow-list for
  * {@link AGENT_WAKEUP_TERMINAL_FAILED_UNRESOLVED_METRIC}.
  *
@@ -725,6 +754,7 @@ let githubReviewRequestDelivery: Counter<"state" | "reason"> | null = null;
 let githubReviewRequestSuppression: Counter<"cause" | "reason"> | null = null;
 let githubReviewRequestDeadLetterUnresolved: Gauge<"reason"> | null = null;
 let agentWakeupTerminalFailedUnresolved: Gauge<"error_code" | "scope"> | null = null;
+let agentWakeupTerminalFailedOldestAge: Gauge<"scope"> | null = null;
 let authRequest: Counter<"operation" | "outcome"> | null = null;
 
 function ensureRegistry(): {
@@ -745,6 +775,7 @@ function ensureRegistry(): {
   githubReviewRequestSuppressionCounter: Counter<"cause" | "reason">;
   githubReviewRequestDeadLetterUnresolvedGauge: Gauge<"reason">;
   agentWakeupTerminalFailedUnresolvedGauge: Gauge<"error_code" | "scope">;
+  agentWakeupTerminalFailedOldestAgeGauge: Gauge<"scope">;
   authRequestCounter: Counter<"operation" | "outcome">;
 } {
   if (
@@ -765,6 +796,7 @@ function ensureRegistry(): {
     || !githubReviewRequestSuppression
     || !githubReviewRequestDeadLetterUnresolved
     || !agentWakeupTerminalFailedUnresolved
+    || !agentWakeupTerminalFailedOldestAge
     || !authRequest
   ) {
     registry = new Registry();
@@ -992,6 +1024,28 @@ function ensureRegistry(): {
         agentWakeupTerminalFailedUnresolved.set({ error_code: errorCode, scope }, 0);
       }
     }
+    agentWakeupTerminalFailedOldestAge = new Gauge({
+      name: AGENT_WAKEUP_TERMINAL_FAILED_OLDEST_AGE_METRIC,
+      help:
+        "Age in seconds of the OLDEST agent_wakeup_requests row still sitting in the "
+        + "terminal status='failed' state for this scope, with no successor wake for the "
+        + "same taskKey, re-derived on every wake-dispatch reconcile pass (BLO-20255). 0 "
+        + "means the scope has no unresolved terminal-failed wake. Alert on THIS rather "
+        + "than on a `for:` clause over "
+        + AGENT_WAKEUP_TERMINAL_FAILED_UNRESOLVED_METRIC
+        + ": `for:` measures continuity of the expression, not the age of any one row, so "
+        + "two short failures overlapping by a single scrape keep a summed expression "
+        + "true and page for a row that is only seconds old. This gauge carries the real "
+        + "per-row age, so the rule can threshold it directly and use `for:` only to ride "
+        + "out scrape flapping. Labeled by scope only -- adding error_code would let a "
+        + "scope's oldest row hide behind a younger row of another code.",
+      labelNames: ["scope"],
+      registers: [registry],
+    });
+    // Zero-initialize both scopes for the same absent-vs-zero reason as above.
+    for (const scope of TERMINAL_FAILED_WAKE_SCOPES) {
+      agentWakeupTerminalFailedOldestAge.set({ scope }, 0);
+    }
     authRequest = new Counter({
       name: AUTH_REQUEST_METRIC,
       help:
@@ -1027,6 +1081,7 @@ function ensureRegistry(): {
     githubReviewRequestSuppressionCounter: githubReviewRequestSuppression,
     githubReviewRequestDeadLetterUnresolvedGauge: githubReviewRequestDeadLetterUnresolved,
     agentWakeupTerminalFailedUnresolvedGauge: agentWakeupTerminalFailedUnresolved,
+    agentWakeupTerminalFailedOldestAgeGauge: agentWakeupTerminalFailedOldestAge,
     authRequestCounter: authRequest,
   };
 }
@@ -1379,6 +1434,36 @@ export function setAgentWakeupTerminalFailedUnresolved(
   }
 }
 
+/**
+ * Publish the oldest unresolved terminal-`failed` wake age per scope
+ * (BLO-20255). Same rewrite-of-durable-state contract as
+ * {@link setAgentWakeupTerminalFailedUnresolved}: called once per reconcile
+ * pass with the full set, and every scope absent from `entries` is explicitly
+ * reset to 0.
+ *
+ * That reset is the part with teeth. If a scope's series were merely left
+ * alone once its last failure cleared, the age would freeze at whatever it
+ * last was — permanently above any threshold the alert uses, so the page would
+ * never resolve. Writing 0 is what lets the alert clear.
+ */
+export function setAgentWakeupTerminalFailedOldestAgeSeconds(
+  entries: ReadonlyArray<{ scope: string | null | undefined; ageSeconds: number }>,
+): void {
+  const gauge = ensureRegistry().agentWakeupTerminalFailedOldestAgeGauge;
+  const oldestByScope = new Map<string, number>();
+  for (const entry of entries) {
+    // Same collapse as the count gauge: an unrecognized scope becomes `other`
+    // rather than minting a new series.
+    const scope = entry.scope === "pr_review" ? "pr_review" : "other";
+    const ageSeconds = Number.isFinite(entry.ageSeconds) ? Math.max(0, entry.ageSeconds) : 0;
+    const current = oldestByScope.get(scope);
+    if (current === undefined || ageSeconds > current) oldestByScope.set(scope, ageSeconds);
+  }
+  for (const scope of TERMINAL_FAILED_WAKE_SCOPES) {
+    gauge.set({ scope }, oldestByScope.get(scope) ?? 0);
+  }
+}
+
 export function recordAuthRequest(input: {
   operation: string | null | undefined;
   outcome: string | null | undefined;
@@ -1434,6 +1519,7 @@ export function __resetMetricsForTest(): void {
   githubReviewRequestSuppression = null;
   githubReviewRequestDeadLetterUnresolved = null;
   agentWakeupTerminalFailedUnresolved = null;
+  agentWakeupTerminalFailedOldestAge = null;
   authRequest = null;
   resetDepBlockedMetrics();
   resetBlockerResolvedWakeMetrics();

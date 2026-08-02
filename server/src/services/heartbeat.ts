@@ -3,7 +3,7 @@ import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
-import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNotNull, isNull, lt, lte, ne, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNotNull, isNull, lt, lte, ne, not, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
@@ -259,6 +259,7 @@ import {
   GITHUB_SUPPRESSION_CAUSE_SCHEDULED_RETRY_GATE,
   setGithubReviewRequestDeadLetterUnresolved,
   setAgentWakeupTerminalFailedUnresolved,
+  setAgentWakeupTerminalFailedOldestAgeSeconds,
   terminalFailedWakeScopeForTaskKey,
   setExternalLifecycleRunningRuns,
 } from "./metrics.js";
@@ -24522,7 +24523,75 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * acting on".
    */
   const TERMINAL_FAILED_WAKE_GAUGE_WINDOW_MS = 24 * 60 * 60 * 1000;
-  const TERMINAL_FAILED_WAKE_GAUGE_SCAN_LIMIT = 500;
+
+  /**
+   * Per-scope scan budget for {@link publishAgentWakeupTerminalFailedGauge}.
+   *
+   * The cap is applied PER SCOPE, with a separate query each, and that split is
+   * load-bearing rather than cosmetic. A single global `limit` ordered by
+   * `finishedAt desc` is resolved by Postgres before anything in this function
+   * can look at `payload->>'taskKey'`, so the scope a row belongs to is not yet
+   * known when rows are discarded. One noisy hour of ordinary wake failures
+   * would then evict an older unresolved `pr_review` failure from the candidate
+   * set and drive the alertable series to zero — the alert would go quiet
+   * exactly when the fleet is least healthy. Giving `pr_review` its own budget
+   * means non-review volume, however large, cannot consume it.
+   *
+   * `other` is dashboard-only (nothing pages on it), so its budget exists to
+   * bound the query rather than to guarantee completeness.
+   */
+  const TERMINAL_FAILED_WAKE_GAUGE_SCAN_LIMIT_PR_REVIEW = 500;
+  const TERMINAL_FAILED_WAKE_GAUGE_SCAN_LIMIT_OTHER = 500;
+
+  /**
+   * Wake statuses that prove a taskKey was genuinely picked back up.
+   *
+   * This MUST stay a positive allowlist. The predicate started life as
+   * `ne(status, "failed")`, which silently treated every other terminal state
+   * as proof of a re-drive: a successor written `skipped` by scheduling
+   * suppression or a policy gate, or a queued retry that later became
+   * `cancelled` / `dispatch_failed_exhausted` / `dispatch_superseded`, would
+   * stamp a newer timestamp and suppress the original failure forever. None of
+   * those states means a review ran, and the requirement this gauge exists to
+   * serve is that a lost review stays alertable until an active or successful
+   * successor exists. A negative check can only ever be as correct as the
+   * status vocabulary was on the day it was written — a new terminal status
+   * added anywhere in the codebase would silently join the "counts as coverage"
+   * set. A positive list fails the safe way instead: an unknown status is not
+   * coverage, so the worst case is an alert that fires and gets triaged.
+   *
+   * Live values mirror IDEMPOTENT_REVIEWER_WAKE_STATUSES in
+   * `routes/github-webhook.ts`, plus `completed` as the successful terminal.
+   * `coalesced` is deliberately NOT here: it means this request was folded into
+   * another in-flight wake, and that other row is itself either live (so it
+   * matches this list on its own) or terminal-failed (so it is a candidate in
+   * its own right). Counting `coalesced` as coverage would let two rows vouch
+   * for each other while no review ever ran.
+   */
+  const TERMINAL_FAILED_WAKE_SUCCESSOR_WAKE_STATUSES = [
+    "queued",
+    "claimed",
+    "running",
+    "scheduled",
+    "deferred_issue_execution",
+    "completed",
+  ] as const;
+
+  /**
+   * Run statuses that prove a taskKey was picked back up. Same positive-list
+   * reasoning as {@link TERMINAL_FAILED_WAKE_SUCCESSOR_WAKE_STATUSES}: the
+   * live set is `SUCCESSFUL_RUN_HANDOFF_LIVE_RUN_STATUSES`
+   * (`services/successful-run-handoff-state.ts`) plus `succeeded`. Every member
+   * of HEARTBEAT_RUN_TERMINAL_STATUSES except `succeeded` — `failed`,
+   * `cancelled`, `timed_out`, `interrupted` — is excluded, because a run that
+   * ended in any of those did not post a review.
+   */
+  const TERMINAL_FAILED_WAKE_SUCCESSOR_RUN_STATUSES = [
+    "queued",
+    "running",
+    "scheduled_retry",
+    "succeeded",
+  ] as const;
 
   /**
    * Re-derive the unresolved terminal-`failed` wake gauge from committed
@@ -24560,27 +24629,43 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     try {
       const cutoff = new Date(now.getTime() - TERMINAL_FAILED_WAKE_GAUGE_WINDOW_MS);
       const wakeTaskKey = sql<string | null>`${agentWakeupRequests.payload} ->> 'taskKey'`;
+      // Scope must be decided in SQL, not in JS, so that the per-scope `limit`
+      // discards rows from the scope it is budgeting rather than from whichever
+      // scope happened to be older. Kept byte-identical in meaning to
+      // terminalFailedWakeScopeForTaskKey(): a `pr_review:` prefix, and a null
+      // taskKey falling to `other`. `like` (not `ilike`) because the webhook
+      // writes the prefix literally.
+      const isPrReviewTaskKey = sql<boolean>`coalesce(${wakeTaskKey} like 'pr\\_review:%', false)`;
 
-      const rows = await db
-        .select({
-          id: agentWakeupRequests.id,
-          finishedAt: agentWakeupRequests.finishedAt,
-          taskKey: wakeTaskKey,
-          errorCode: heartbeatRuns.errorCode,
-        })
-        .from(agentWakeupRequests)
-        .leftJoin(heartbeatRuns, eq(heartbeatRuns.id, agentWakeupRequests.runId))
-        .where(
-          and(
-            eq(agentWakeupRequests.status, "failed"),
-            gte(agentWakeupRequests.finishedAt, cutoff),
-          ),
-        )
-        .orderBy(desc(agentWakeupRequests.finishedAt))
-        .limit(TERMINAL_FAILED_WAKE_GAUGE_SCAN_LIMIT);
+      const selectCandidates = async (scope: "pr_review" | "other", limit: number) =>
+        db
+          .select({
+            id: agentWakeupRequests.id,
+            finishedAt: agentWakeupRequests.finishedAt,
+            taskKey: wakeTaskKey,
+            errorCode: heartbeatRuns.errorCode,
+          })
+          .from(agentWakeupRequests)
+          .leftJoin(heartbeatRuns, eq(heartbeatRuns.id, agentWakeupRequests.runId))
+          .where(
+            and(
+              eq(agentWakeupRequests.status, "failed"),
+              gte(agentWakeupRequests.finishedAt, cutoff),
+              scope === "pr_review" ? isPrReviewTaskKey : not(isPrReviewTaskKey),
+            ),
+          )
+          .orderBy(desc(agentWakeupRequests.finishedAt))
+          .limit(limit);
+
+      const [prReviewRows, otherRows] = await Promise.all([
+        selectCandidates("pr_review", TERMINAL_FAILED_WAKE_GAUGE_SCAN_LIMIT_PR_REVIEW),
+        selectCandidates("other", TERMINAL_FAILED_WAKE_GAUGE_SCAN_LIMIT_OTHER),
+      ]);
+      const rows = [...prReviewRows, ...otherRows];
 
       if (rows.length === 0) {
         setAgentWakeupTerminalFailedUnresolved([]);
+        setAgentWakeupTerminalFailedOldestAgeSeconds([]);
         return;
       }
 
@@ -24625,10 +24710,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         //    this the gauge silently suppresses the very rows it exists to
         //    surface.
         //
-        // 2. `ne(status, "failed")` -- a successor that ALSO ended terminal
-        //    `failed` is not a re-drive, it is a second failure. Counting it as
-        //    coverage would hide a PR-review chain that is failing repeatedly,
-        //    which is precisely the pathology worth paging on.
+        // 2. A positive status allowlist -- NOT `ne(status, "failed")`. See
+        //    TERMINAL_FAILED_WAKE_SUCCESSOR_WAKE_STATUSES: a successor that
+        //    ended `skipped`, `cancelled`, `dispatch_failed_exhausted`,
+        //    `dispatch_superseded` or `failed` did not run a review, and
+        //    treating its timestamp as coverage would bury the original
+        //    failure permanently.
         const candidateIds = rows.map((row) => row.id);
         const successorWakes = await db
           .select({
@@ -24641,7 +24728,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               inArray(wakeTaskKey, taskKeys),
               gt(agentWakeupRequests.requestedAt, oldestFinishedAt),
               notInArray(agentWakeupRequests.id, candidateIds),
-              ne(agentWakeupRequests.status, "failed"),
+              inArray(agentWakeupRequests.status, [
+                ...TERMINAL_FAILED_WAKE_SUCCESSOR_WAKE_STATUSES,
+              ]),
             ),
           )
           .groupBy(wakeTaskKey);
@@ -24657,7 +24746,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             and(
               inArray(heartbeatRuns.contextTaskKey, taskKeys),
               gt(heartbeatRuns.createdAt, oldestFinishedAt),
-              ne(heartbeatRuns.status, "failed"),
+              inArray(heartbeatRuns.status, [...TERMINAL_FAILED_WAKE_SUCCESSOR_RUN_STATUSES]),
             ),
           )
           .groupBy(heartbeatRuns.contextTaskKey);
@@ -24665,6 +24754,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
 
       const counts = new Map<string, { errorCode: string | null; scope: string; count: number }>();
+      // Oldest surviving failure per scope, in seconds. This is what the alert
+      // thresholds on -- see setAgentWakeupTerminalFailedOldestAgeSeconds for
+      // why a Prometheus `for:` cannot express "one row has been failed for
+      // 30m".
+      const oldestAgeSecondsByScope = new Map<string, number>();
       for (const row of rows) {
         const finishedAt = row.finishedAt;
         if (row.taskKey && finishedAt) {
@@ -24679,9 +24773,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const existing = counts.get(key);
         if (existing) existing.count += 1;
         else counts.set(key, { errorCode, scope, count: 1 });
+
+        if (finishedAt) {
+          // Clamped at 0 so a row finishing a scrape into the future (clock
+          // skew between the app and the DB) cannot publish a negative age
+          // that reads as "brand new" forever.
+          const ageSeconds = Math.max(0, Math.floor((now.getTime() - finishedAt.getTime()) / 1000));
+          const currentOldest = oldestAgeSecondsByScope.get(scope);
+          if (currentOldest === undefined || ageSeconds > currentOldest) {
+            oldestAgeSecondsByScope.set(scope, ageSeconds);
+          }
+        }
       }
 
       setAgentWakeupTerminalFailedUnresolved([...counts.values()]);
+      setAgentWakeupTerminalFailedOldestAgeSeconds(
+        [...oldestAgeSecondsByScope].map(([scope, ageSeconds]) => ({ scope, ageSeconds })),
+      );
     } catch (err) {
       logger.warn({ err }, "failed to publish terminal-failed wake gauge (BLO-20255)");
     }

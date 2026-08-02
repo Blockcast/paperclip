@@ -21,6 +21,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 import { agents, agentWakeupRequests, companies, createDb, heartbeatRuns } from "@paperclipai/db";
 import { heartbeatService } from "../services/heartbeat.js";
 import {
+  AGENT_WAKEUP_TERMINAL_FAILED_OLDEST_AGE_METRIC,
   AGENT_WAKEUP_TERMINAL_FAILED_UNRESOLVED_METRIC,
   __resetMetricsForTest,
   getMetricsRegistry,
@@ -113,6 +114,63 @@ describeEmbeddedPostgres("terminal-failed wake gauge (BLO-20255)", () => {
 
   async function gaugeTotal(filter?: { errorCode?: string; scope?: string }) {
     return (await gaugeSeries(filter)).reduce((sum, entry) => sum + entry.value, 0);
+  }
+
+  /** Oldest-unresolved-age series for a scope, in seconds. */
+  async function oldestAgeSeconds(scope: string) {
+    const metric = getMetricsRegistry().getSingleMetric(
+      AGENT_WAKEUP_TERMINAL_FAILED_OLDEST_AGE_METRIC,
+    );
+    expect(
+      metric,
+      `${AGENT_WAKEUP_TERMINAL_FAILED_OLDEST_AGE_METRIC} must be registered`,
+    ).toBeTruthy();
+    const data = (await metric!.get()) as {
+      values: Array<{ labels: Record<string, string>; value: number }>;
+    };
+    const match = data.values.find((entry) => entry.labels.scope === scope);
+    expect(match, `expected an oldest-age series for scope=${scope}`).toBeTruthy();
+    return match!.value;
+  }
+
+  /** Seed a successor wake row for PR_TASK_KEY at a given status. */
+  async function seedSuccessorWake(opts: {
+    companyId: string;
+    agentId: string;
+    status: string;
+    requestedAt: Date;
+    taskKey?: string;
+  }) {
+    await db.insert(agentWakeupRequests).values({
+      id: randomUUID(),
+      companyId: opts.companyId,
+      agentId: opts.agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "github_pr_synchronized",
+      status: opts.status,
+      requestedAt: opts.requestedAt,
+      payload: { taskKey: opts.taskKey ?? PR_TASK_KEY },
+    });
+  }
+
+  /** Seed a successor run row for PR_TASK_KEY at a given status. */
+  async function seedSuccessorRun(opts: {
+    companyId: string;
+    agentId: string;
+    status: string;
+    createdAt: Date;
+  }) {
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId: opts.companyId,
+      agentId: opts.agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: opts.status,
+      createdAt: opts.createdAt,
+      contextSnapshot: { taskKey: PR_TASK_KEY },
+    });
   }
 
   /** Seed a committed terminal `failed` wake row, with an optional run carrying the errorCode. */
@@ -367,5 +425,330 @@ describeEmbeddedPostgres("terminal-failed wake gauge (BLO-20255)", () => {
     expect(
       await gaugeTotal({ errorCode: "external_lifecycle_stale_killed", scope: "pr_review" }),
     ).toBe(2);
+  });
+
+  // ---------------------------------------------------------------------------
+  // Successor-status allowlist (BLO-20255 review round 2).
+  //
+  // The predicate was `ne(status, "failed")`, which treated EVERY other status
+  // as proof the review was picked back up. None of the statuses below mean a
+  // review ran, and each one carries a newer timestamp than the failure, so
+  // each would have silently suppressed the alert forever. These are table-
+  // driven so adding a newly-discovered non-coverage status is one line.
+  // ---------------------------------------------------------------------------
+  const NON_COVERAGE_WAKE_STATUSES = [
+    // Written by scheduling suppression or a policy gate. The wake was
+    // declined, not run.
+    "skipped",
+    // A queued retry that was later cancelled -- e.g. its issue went terminal.
+    "cancelled",
+    // The dispatch chain burned its retry budget. This is MORE broken than the
+    // row it would be silencing.
+    "dispatch_failed_exhausted",
+    // A newer wake replaced this one; the replacement is its own row and is
+    // judged on its own status.
+    "dispatch_superseded",
+    // Folded into another in-flight wake. That other row either matches the
+    // allowlist itself or is a candidate in its own right -- letting two rows
+    // vouch for each other is exactly the loop to avoid.
+    "coalesced",
+  ] as const;
+
+  for (const status of NON_COVERAGE_WAKE_STATUSES) {
+    it(`keeps the row alertable when the only successor WAKE ended '${status}'`, async () => {
+      const { agentId, companyId } = await seedCompanyAndAgent();
+      const now = new Date();
+      const failedAt = new Date(now.getTime() - 3_600_000);
+      await seedFailedWake({
+        companyId,
+        agentId,
+        finishedAt: failedAt,
+        taskKey: PR_TASK_KEY,
+        errorCode: "external_lifecycle_stale_killed",
+      });
+      await seedSuccessorWake({
+        companyId,
+        agentId,
+        status,
+        requestedAt: new Date(failedAt.getTime() + 30_000),
+      });
+
+      await heartbeat.reconcileFailedWakeDispatches(now);
+
+      expect(await gaugeTotal({ scope: "pr_review" })).toBe(1);
+      // And the age must still be published, or the alert would read 0 and
+      // stay silent even though the count is right.
+      expect(await oldestAgeSeconds("pr_review")).toBeGreaterThanOrEqual(3_500);
+    });
+  }
+
+  const NON_COVERAGE_RUN_STATUSES = ["cancelled", "failed", "timed_out", "interrupted"] as const;
+
+  for (const status of NON_COVERAGE_RUN_STATUSES) {
+    it(`keeps the row alertable when the only successor RUN ended '${status}'`, async () => {
+      const { agentId, companyId } = await seedCompanyAndAgent();
+      const now = new Date();
+      const failedAt = new Date(now.getTime() - 3_600_000);
+      await seedFailedWake({
+        companyId,
+        agentId,
+        finishedAt: failedAt,
+        taskKey: PR_TASK_KEY,
+        errorCode: "external_lifecycle_stale_killed",
+      });
+      await seedSuccessorRun({
+        companyId,
+        agentId,
+        status,
+        createdAt: new Date(failedAt.getTime() + 120_000),
+      });
+
+      await heartbeat.reconcileFailedWakeDispatches(now);
+
+      expect(await gaugeTotal({ scope: "pr_review" })).toBe(1);
+    });
+  }
+
+  // The positive half of the same contract: the statuses that DO mean the work
+  // was picked back up must still clear the gauge, or tightening the predicate
+  // would have traded a false negative for a false positive.
+  const COVERAGE_WAKE_STATUSES = [
+    "queued",
+    "claimed",
+    "running",
+    "scheduled",
+    "deferred_issue_execution",
+    "completed",
+  ] as const;
+
+  for (const status of COVERAGE_WAKE_STATUSES) {
+    it(`drops the row when a successor WAKE is '${status}'`, async () => {
+      const { agentId, companyId } = await seedCompanyAndAgent();
+      const now = new Date();
+      const failedAt = new Date(now.getTime() - 3_600_000);
+      await seedFailedWake({
+        companyId,
+        agentId,
+        finishedAt: failedAt,
+        taskKey: PR_TASK_KEY,
+        errorCode: "external_lifecycle_stale_killed",
+      });
+      await seedSuccessorWake({
+        companyId,
+        agentId,
+        status,
+        requestedAt: new Date(failedAt.getTime() + 30_000),
+      });
+
+      await heartbeat.reconcileFailedWakeDispatches(now);
+
+      expect(await gaugeTotal({ scope: "pr_review" })).toBe(0);
+      expect(await oldestAgeSeconds("pr_review")).toBe(0);
+    });
+  }
+
+  const COVERAGE_RUN_STATUSES = ["queued", "running", "scheduled_retry", "succeeded"] as const;
+
+  for (const status of COVERAGE_RUN_STATUSES) {
+    it(`drops the row when a successor RUN is '${status}'`, async () => {
+      const { agentId, companyId } = await seedCompanyAndAgent();
+      const now = new Date();
+      const failedAt = new Date(now.getTime() - 3_600_000);
+      await seedFailedWake({
+        companyId,
+        agentId,
+        finishedAt: failedAt,
+        taskKey: PR_TASK_KEY,
+        errorCode: "external_lifecycle_stale_killed",
+      });
+      await seedSuccessorRun({
+        companyId,
+        agentId,
+        status,
+        createdAt: new Date(failedAt.getTime() + 120_000),
+      });
+
+      await heartbeat.reconcileFailedWakeDispatches(now);
+
+      expect(await gaugeTotal({ scope: "pr_review" })).toBe(0);
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Per-row ageing (BLO-20255 review round 2).
+  // ---------------------------------------------------------------------------
+
+  it("publishes the age of the OLDEST unresolved row, not the newest", async () => {
+    const { agentId, companyId } = await seedCompanyAndAgent();
+    const now = new Date();
+    await seedFailedWake({
+      companyId,
+      agentId,
+      finishedAt: new Date(now.getTime() - 7_200_000),
+      taskKey: PR_TASK_KEY,
+      errorCode: "external_lifecycle_stale_killed",
+    });
+    await seedFailedWake({
+      companyId,
+      agentId,
+      finishedAt: new Date(now.getTime() - 60_000),
+      taskKey: PR_TASK_KEY,
+      errorCode: "external_lifecycle_stale_killed",
+    });
+
+    await heartbeat.reconcileFailedWakeDispatches(now);
+
+    const age = await oldestAgeSeconds("pr_review");
+    expect(age).toBeGreaterThanOrEqual(7_100);
+    expect(age).toBeLessThan(7_300);
+  });
+
+  it("does not report a stale age once every row is covered (the alert must resolve)", async () => {
+    // A gauge that is merely left alone when the last failure clears would
+    // freeze above the threshold and page forever. The setter rewrites every
+    // scope to 0 precisely so this resolves.
+    const { agentId, companyId } = await seedCompanyAndAgent();
+    const now = new Date();
+    const failedAt = new Date(now.getTime() - 7_200_000);
+    await seedFailedWake({
+      companyId,
+      agentId,
+      finishedAt: failedAt,
+      taskKey: PR_TASK_KEY,
+      errorCode: "external_lifecycle_stale_killed",
+    });
+
+    await heartbeat.reconcileFailedWakeDispatches(now);
+    expect(await oldestAgeSeconds("pr_review")).toBeGreaterThan(0);
+
+    await seedSuccessorWake({
+      companyId,
+      agentId,
+      status: "queued",
+      requestedAt: new Date(failedAt.getTime() + 30_000),
+    });
+
+    await heartbeat.reconcileFailedWakeDispatches(now);
+    expect(await oldestAgeSeconds("pr_review")).toBe(0);
+  });
+
+  it("does not let failure turnover fake a sustained age (the `for:`-continuity bug)", async () => {
+    // The exact shape a `for: 30m` over a summed count gets wrong: failure A is
+    // old, gets covered, and a BRAND NEW failure B appears in the same pass. A
+    // summed-count expression never goes false across the handover, so `for:`
+    // treats the pair as one continuously-true 30m episode and pages on B while
+    // B is a minute old. The age gauge is per-row, so it must drop to B's real
+    // age here.
+    const { agentId, companyId } = await seedCompanyAndAgent();
+    const now = new Date();
+    const oldFailedAt = new Date(now.getTime() - 7_200_000);
+    await seedFailedWake({
+      companyId,
+      agentId,
+      finishedAt: oldFailedAt,
+      taskKey: PR_TASK_KEY,
+      errorCode: "external_lifecycle_stale_killed",
+    });
+
+    await heartbeat.reconcileFailedWakeDispatches(now);
+    expect(await oldestAgeSeconds("pr_review")).toBeGreaterThan(7_000);
+
+    // A covers; B is a different PR that just failed.
+    await seedSuccessorWake({
+      companyId,
+      agentId,
+      status: "queued",
+      requestedAt: new Date(oldFailedAt.getTime() + 30_000),
+    });
+    const otherTaskKey = "pr_review:Blockcast/paperclip:919";
+    await seedFailedWake({
+      companyId,
+      agentId,
+      finishedAt: new Date(now.getTime() - 60_000),
+      taskKey: otherTaskKey,
+      errorCode: "job_failed",
+    });
+
+    await heartbeat.reconcileFailedWakeDispatches(now);
+
+    // The count is still 1, which is exactly why a count-plus-`for:` rule
+    // cannot tell these two situations apart.
+    expect(await gaugeTotal({ scope: "pr_review" })).toBe(1);
+    const age = await oldestAgeSeconds("pr_review");
+    expect(age).toBeGreaterThanOrEqual(50);
+    expect(age).toBeLessThan(120);
+  });
+
+  // ---------------------------------------------------------------------------
+  // Per-scope scan budget (BLO-20255 review round 2).
+  // ---------------------------------------------------------------------------
+
+  it("still counts a failed row with NO taskKey at all, under scope=other", async () => {
+    // Splitting the candidate scan into per-scope queries introduced a new way
+    // to lose rows: a null taskKey satisfies neither `like 'pr_review:%'` nor a
+    // naive negation of it under SQL three-valued logic, so a null-unaware
+    // split would drop this whole class from BOTH queries silently. The scope
+    // predicate coalesces to false precisely so these land in `other`, which
+    // matches terminalFailedWakeScopeForTaskKey(null). A row with no taskKey is
+    // the least monitorable row there is -- dropping it is the opposite of what
+    // this gauge is for.
+    const { agentId, companyId } = await seedCompanyAndAgent();
+    const now = new Date();
+    await seedFailedWake({
+      companyId,
+      agentId,
+      finishedAt: new Date(now.getTime() - 60_000),
+      taskKey: null,
+      errorCode: "job_failed",
+    });
+
+    await heartbeat.reconcileFailedWakeDispatches(now);
+
+    expect(await gaugeTotal({ errorCode: "job_failed", scope: "other" })).toBe(1);
+    expect(await gaugeTotal({ scope: "pr_review" })).toBe(0);
+  });
+
+  it("does not let a flood of newer scope=other failures crowd out an older pr_review one", async () => {
+    // A single global `limit ... order by finished_at desc` is resolved by
+    // Postgres before this code can look at the taskKey, so the scope a row
+    // belongs to is unknown at the moment rows are discarded. With one shared
+    // budget, enough newer ordinary failures evict the older PR-review row and
+    // the alertable series silently reads 0 -- the alert going quiet precisely
+    // when the fleet is least healthy. Separate per-scope queries make that
+    // impossible.
+    //
+    // 520 > TERMINAL_FAILED_WAKE_GAUGE_SCAN_LIMIT_OTHER (500), so the flood
+    // would consume a shared cap outright.
+    const { agentId, companyId } = await seedCompanyAndAgent();
+    const now = new Date();
+    await seedFailedWake({
+      companyId,
+      agentId,
+      finishedAt: new Date(now.getTime() - 7_200_000),
+      taskKey: PR_TASK_KEY,
+      errorCode: "external_lifecycle_stale_killed",
+    });
+
+    const flood = Array.from({ length: 520 }, (_unused, index) => ({
+      id: randomUUID(),
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "heartbeat_timer",
+      status: "failed",
+      // All NEWER than the pr_review row, so a desc-ordered shared cap takes
+      // them first.
+      finishedAt: new Date(now.getTime() - 60_000 + index),
+      payload: { taskKey: `issue:crowd-${index}` },
+    }));
+    for (let offset = 0; offset < flood.length; offset += 100) {
+      await db.insert(agentWakeupRequests).values(flood.slice(offset, offset + 100));
+    }
+
+    await heartbeat.reconcileFailedWakeDispatches(now);
+
+    expect(await gaugeTotal({ scope: "pr_review" })).toBe(1);
+    expect(await oldestAgeSeconds("pr_review")).toBeGreaterThan(7_000);
   });
 });
