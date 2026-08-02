@@ -4627,7 +4627,7 @@ export function issueService(db: Db) {
       .for("update", { of: heartbeatRuns })
       .then((rows) => rows[0] ?? null);
 
-    if (row?.status !== "running" || row.runAgentId !== agentId) return { patch: {} };
+    if (row?.status !== "running" || row.runAgentId !== agentId) return null;
     return {
       patch: {
         executionRunId: checkoutRunId,
@@ -4644,7 +4644,7 @@ export function issueService(db: Db) {
     now: Date,
     operation: (
       tx: Parameters<Parameters<Db["transaction"]>[0]>[0],
-      checkoutExecutionPatch: Awaited<ReturnType<typeof runningCheckoutExecutionPatch>>["patch"],
+      checkoutExecutionPatch: NonNullable<Awaited<ReturnType<typeof runningCheckoutExecutionPatch>>>["patch"],
     ) => Promise<T>,
   ) {
     return db.transaction(async (tx) => {
@@ -4657,6 +4657,7 @@ export function issueService(db: Db) {
       if (!lockedIssue) return null;
 
       const checkoutExecution = await runningCheckoutExecutionPatch(tx, checkoutRunId, agentId, now);
+      if (!checkoutExecution) return null;
       return operation(tx, checkoutExecution.patch);
     });
   }

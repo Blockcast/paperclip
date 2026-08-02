@@ -14520,8 +14520,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               eq(issues.executionRunId, claimed.retryOfRunId),
             )
           : or(isNull(issues.executionRunId), eq(issues.executionRunId, claimed.id));
+      const autoCheckoutWake = isAutoCheckoutWakeReason(claimedWakeReason);
       const autoCheckoutIssueStatusCondition = (
-        isAutoCheckoutWakeReason(claimedWakeReason) && issueDependencyReadyForAutoCheckout
+        autoCheckoutWake && issueDependencyReadyForAutoCheckout
       )
         ? and(
             eq(issues.assigneeAgentId, claimed.agentId),
@@ -14552,6 +14553,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             .for("update")
             .then((rows) => rows[0] ?? null);
           if (!lockedIssue) return null;
+
+          if (autoCheckoutWake) {
+            const lockedReadiness = await issuesSvc.listDependencyReadiness(
+              claimed.companyId,
+              [claimedIssueId],
+              tx,
+            );
+            if ((lockedReadiness.get(claimedIssueId)?.unresolvedBlockerCount ?? 0) > 0) return null;
+          }
 
           const lockedRun = await tx
             .select({ status: heartbeatRuns.status })

@@ -5417,11 +5417,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(lockedIssue?.executionRunId).toBe(activeRunId);
   });
 
-  it("counts old in-flight assignment recovery reservations against the per-agent cap", async () => {
+  it("expires abandoned assignment recovery reservations before applying the per-agent cap", async () => {
     const { companyId, agentId } = await seedAssignedTodoNoRunFixture({
       agentStatus: "running",
     });
-    const oldReservationTime = new Date(Date.now() - 10 * 60_000);
+    const oldReservationTime = new Date(Date.now() - 2 * 60 * 60_000);
     await db.insert(agentWakeupRequests).values(
       Array.from({ length: ISSUE_ASSIGNMENT_RECOVERY_PER_AGENT_SWEEP_LIMIT }, () => ({
         companyId,
@@ -5437,12 +5437,17 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     const result = await heartbeat.reconcileStrandedAssignedIssues();
 
-    expect(result.assignmentDispatched).toBe(0);
+    expect(result.assignmentDispatched).toBe(1);
     const recoveryRuns = await db
       .select({ id: heartbeatRuns.id })
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.agentId, agentId));
-    expect(recoveryRuns).toHaveLength(0);
+    expect(recoveryRuns).toHaveLength(1);
+    const staleReservations = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.status, "assignment_recovery_capacity_reserved"));
+    expect(staleReservations).toHaveLength(0);
   });
 
   it("does not duplicate initial assigned todo dispatch when a queued wake already exists", async () => {
@@ -5517,7 +5522,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         triggerDetail: "first",
         status: "queued",
         wakeupRequestId: olderWakeupId,
-        contextSnapshot: { issueId },
+        contextSnapshot: { issueId, wakeReason: "issue_assigned" },
         createdAt: olderTime,
         updatedAt: olderTime,
       },
@@ -5529,7 +5534,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         triggerDetail: "second",
         status: "queued",
         wakeupRequestId: newerWakeupId,
-        contextSnapshot: { issueId },
+        contextSnapshot: { issueId, wakeReason: "issue_assigned" },
         createdAt: newerTime,
         updatedAt: newerTime,
       },
