@@ -165,7 +165,7 @@ describeEmbeddedPostgres("heartbeat ccrotate capacity-defer → scheduled retry"
 
   it("coalesces concurrent capacity deferrals for one task across service instances", async () => {
     const { agentId } = await seedAgent();
-    const taskKey = "pr_review:Blockcast/linux-amt:123";
+    const taskKey = "pr_review:blockcast/linux-amt:123";
     const penstockAvailabilityGate = denyingGateAtBarrier(2);
     const firstApi = heartbeatService(db, {
       penstockAvailabilityGate,

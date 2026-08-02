@@ -29,9 +29,11 @@ import {
 } from "../services/pr-review-duplicate-issue-guard.js";
 
 const REPO = "Blockcast/pim-multicast-gateway";
+const NORMALIZED_REPO = REPO.toLowerCase();
 const PR_NUMBER = 1911;
 const PR_URL = `https://github.com/${REPO}/pull/${PR_NUMBER}`;
-const TASK_KEY = `pr_review:${REPO}:${PR_NUMBER}`;
+const NORMALIZED_PR_URL = `https://github.com/${NORMALIZED_REPO}/pull/${PR_NUMBER}`;
+const TASK_KEY = `pr_review:${NORMALIZED_REPO}:${PR_NUMBER}`;
 
 describe("pr review duplicate issue guard (pure helpers)", () => {
   it("builds the same task key the GitHub webhook writes to context_task_key", () => {
@@ -53,9 +55,18 @@ describe("pr review duplicate issue guard (pure helpers)", () => {
         `See ${PR_URL} and http://www.github.com/Blockcast/paperclip/pull/925 and ${PR_URL} again`,
       ),
     ).toEqual([
-      { repoFullName: REPO, prNumber: PR_NUMBER },
-      { repoFullName: "Blockcast/paperclip", prNumber: 925 },
+      { repoFullName: NORMALIZED_REPO, prNumber: PR_NUMBER },
+      { repoFullName: "blockcast/paperclip", prNumber: 925 },
     ]);
+  });
+
+  it("normalizes GitHub repository casing when parsing and keying PR refs", () => {
+    const mixedCaseUrl = "https://github.com/BLOCKCAST/PiM-Multicast-Gateway/pull/1911";
+    expect(parsePullRequestRefs(mixedCaseUrl)).toEqual([
+      { repoFullName: NORMALIZED_REPO, prNumber: PR_NUMBER },
+    ]);
+    expect(buildPrReviewTaskKey({ repoFullName: "BLOCKCAST/PiM-Multicast-Gateway", prNumber: PR_NUMBER }))
+      .toBe(TASK_KEY);
   });
 
   it("ignores a bare #N with no repo, and non-PR or non-GitHub URLs", () => {
@@ -198,11 +209,11 @@ describeEmbeddedPostgres("issue create PR-review duplicate guard routes", () => 
     // The error has to be actionable enough that the filing agent can recover
     // without reading the source — name the marker path and the live run.
     expect(res.body.remediation).toContain("<!-- paperclip:review-request -->");
-    expect(res.body.remediation).toContain(PR_URL);
-    expect(res.body.error).toContain(`${REPO}#${PR_NUMBER}`);
+    expect(res.body.remediation).toContain(NORMALIZED_PR_URL);
+    expect(res.body.error).toContain(`${NORMALIZED_REPO}#${PR_NUMBER}`);
     expect(res.body.details).toMatchObject({
       taskKey: TASK_KEY,
-      repoFullName: REPO,
+      repoFullName: NORMALIZED_REPO,
       prNumber: PR_NUMBER,
       existingRunId: run.id,
       existingRunStatus: "queued",
@@ -268,13 +279,79 @@ describeEmbeddedPostgres("issue create PR-review duplicate guard routes", () => 
     const { companyId, reviewer, app } = await setup();
     await seedReviewRun(companyId, reviewer.id, {
       status: "queued",
-      taskKey: `pr_review:${REPO}:9999`,
+      taskKey: `pr_review:${NORMALIZED_REPO}:9999`,
     });
 
     await request(app)
       .post(`/api/companies/${companyId}/issues`)
       .send(reviewIssueBody(reviewer.id))
       .expect(201);
+  });
+
+  it("rejects when the live review is already running on another configured reviewer", async () => {
+    const companyId = await seedCompany();
+    const reviewerA = await seedAgent(companyId, "Ally A");
+    const reviewerB = await seedAgent(companyId, "Ally B");
+    configureReviewer(reviewerA.id, reviewerB.id);
+    await seedReviewRun(companyId, reviewerA.id, { status: "running" });
+
+    const res = await request(createApp())
+      .post(`/api/companies/${companyId}/issues`)
+      .send(reviewIssueBody(reviewerB.id))
+      .expect(409);
+
+    expect(res.body.code).toBe(DUPLICATE_PR_REVIEW_ISSUE_ERROR_CODE);
+    expect(res.body.details).toMatchObject({
+      taskKey: TASK_KEY,
+      repoFullName: NORMALIZED_REPO,
+      prNumber: PR_NUMBER,
+      existingRunStatus: "running",
+    });
+  });
+
+  it("rejects lowercased PR URLs against already-live mixed-case task keys", async () => {
+    const { companyId, reviewer, app } = await setup();
+    const legacyTaskKey = `pr_review:${REPO}:${PR_NUMBER}`;
+    const run = await seedReviewRun(companyId, reviewer.id, {
+      status: "queued",
+      taskKey: legacyTaskKey,
+    });
+
+    const res = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send(reviewIssueBody(reviewer.id, {
+        title: "Review lowercased permalink",
+        description: `Please review ${NORMALIZED_PR_URL}`,
+      }))
+      .expect(409);
+
+    expect(res.body.details).toMatchObject({
+      taskKey: legacyTaskKey,
+      repoFullName: NORMALIZED_REPO,
+      prNumber: PR_NUMBER,
+      existingRunId: run.id,
+    });
+  });
+
+  it("replays an idempotent create before applying the duplicate-review rejection", async () => {
+    const { companyId, reviewer, app } = await setup();
+    const idempotencyKey = `review-request-${randomUUID()}`;
+    const body = reviewIssueBody(reviewer.id, { idempotencyKey });
+
+    const created = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send(body)
+      .expect(201);
+    await seedReviewRun(companyId, reviewer.id, { status: "queued" });
+
+    const replayed = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send(body)
+      .expect(200);
+
+    expect(replayed.body.id).toBe(created.body.id);
+    expect(replayed.body.deduplicated).toBe(true);
+    expect(replayed.body.deduplicationReason).toBe("idempotency_key");
   });
 
   it("accepts a fresh review request once the previous run is terminal", async () => {

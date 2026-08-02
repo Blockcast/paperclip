@@ -7877,16 +7877,6 @@ export function issueService(db: Db) {
       }
       if (data.assigneeAgentId) {
         await assertAssignableAgent(db, companyId, data.assigneeAgentId, { kind: "work" });
-        // Guarded here rather than in routes/issues.ts so every create path is
-        // covered — POST /issues, POST /issues/:id/children, and the
-        // accepted-plan decomposition bulk create all funnel through here
-        // (BLO-20526).
-        await assertNotDuplicatePrReviewIssue(db, {
-          companyId,
-          assigneeAgentId: data.assigneeAgentId,
-          title: issueData.title,
-          description: issueData.description,
-        });
       }
       if (data.assigneeUserId) {
         await assertAssignableUser(companyId, data.assigneeUserId);
@@ -7971,6 +7961,20 @@ export function issueService(db: Db) {
           const [enriched] = await withIssueLabels(tx, [existingIssue]);
           const [withRelations] = await withIssueRelationSummaries(companyId, [enriched], tx);
           return withRelations;
+        }
+        if (issueData.assigneeAgentId) {
+          // Guarded here rather than in routes/issues.ts so every create path is
+          // covered — POST /issues, POST /issues/:id/children, and the
+          // accepted-plan decomposition bulk create all funnel through here.
+          // It runs after idempotency/recent-title replay so a successful create
+          // keeps replaying as the same issue instead of turning into a hard
+          // rejection if a live PR review appears between attempts (BLO-20526).
+          await assertNotDuplicatePrReviewIssue(tx, {
+            companyId,
+            assigneeAgentId: issueData.assigneeAgentId,
+            title: issueData.title,
+            description: issueData.description,
+          });
         }
 
         const defaultCompanyGoal = await getDefaultCompanyGoal(tx, companyId);

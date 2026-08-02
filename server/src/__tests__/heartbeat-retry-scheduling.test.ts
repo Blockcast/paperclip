@@ -799,7 +799,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         errorCode: "process_lost",
         resultJson: {},
         contextSnapshot: {
-          taskKey: "pr_review:Blockcast/paperclip:976",
+          taskKey: "pr_review:blockcast/paperclip:976",
           wakeReason: "process_lost_retry",
         },
       }),
@@ -1483,7 +1483,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       shouldScheduleAutomaticRunRetry({
         errorCode: "pr_review_output_missing",
         resultJson: {},
-        contextSnapshot: { taskKey: "pr_review:Blockcast/pim-multicast-gateway:1656" },
+        contextSnapshot: { taskKey: "pr_review:blockcast/pim-multicast-gateway:1656" },
       }),
     ).toBe(true);
 
@@ -1532,7 +1532,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       shouldScheduleAutomaticRunRetry({
         errorCode: "pr_review_verification_unavailable",
         resultJson: {},
-        contextSnapshot: { taskKey: "pr_review:Blockcast/onprem-k8s:1817" },
+        contextSnapshot: { taskKey: "pr_review:blockcast/onprem-k8s:1817" },
       }),
     ).toBe(true);
 
@@ -1594,7 +1594,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       shouldScheduleAutomaticRunRetry({
         errorCode: "adapter_failed",
         resultJson: {},
-        contextSnapshot: { taskKey: "pr_review:Blockcast/ally:888" },
+        contextSnapshot: { taskKey: "pr_review:blockcast/ally:888" },
       }),
     ).toBe(true);
   });
@@ -1640,7 +1640,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       shouldScheduleAutomaticRunRetry({
         errorCode: "k8s_concurrent_run_blocked",
         resultJson: {},
-        contextSnapshot: { taskKey: "pr_review:Blockcast/ally:100" },
+        contextSnapshot: { taskKey: "pr_review:blockcast/ally:100" },
       }),
     ).toBe(true);
   });
@@ -1724,7 +1724,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         shouldScheduleAutomaticRunRetry({
           errorCode,
           resultJson: {},
-          contextSnapshot: { taskKey: "pr_review:Blockcast/Network-Operator-Portal:408" },
+          contextSnapshot: { taskKey: "pr_review:blockcast/network-operator-portal:408" },
         }),
       ).toBe(true);
     },

@@ -72,7 +72,7 @@ describeEmbeddedPostgres("heartbeat adapter-resolution guard", () => {
       invocationSource: "automation",
       status: "queued",
       triggerDetail: "github_pr_review_requested",
-      contextSnapshot: { reviewKind: "pr_review", taskKey: "pr_review:Blockcast/paperclip:297" },
+      contextSnapshot: { reviewKind: "pr_review", taskKey: "pr_review:blockcast/paperclip:297" },
       updatedAt: new Date(),
       createdAt: new Date(),
     });

@@ -86,6 +86,7 @@ import { describeDbError, isDbError, runWithTransientDbRetry } from "../lib/db-r
 import { publishLiveEvent } from "./live-events.js";
 import { canClaimPrReviewTask } from "./pr-review-dispatch-lock.js";
 import { normalizeResponsibleUserDenialCode } from "./responsible-user-denial-run-outcomes.js";
+import { normalizePrReviewRepoFullName } from "./pr-review-duplicate-issue-guard.js";
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
 import {
   deleteAgentJobExact,
@@ -4976,7 +4977,9 @@ function derivePaperclipPrTaskKey(
   const prNumber = readPrNumberFromWakeContext(contextSnapshot, payload);
   if (prNumber === null) return null;
 
-  const repoFullName = readPrRepoFullNameFromWakeContext(contextSnapshot, payload) ?? "unknown";
+  const repoFullName = normalizePrReviewRepoFullName(
+    readPrRepoFullNameFromWakeContext(contextSnapshot, payload) ?? "unknown",
+  );
 
   return `pr_review:${repoFullName}:${prNumber}`;
 }
