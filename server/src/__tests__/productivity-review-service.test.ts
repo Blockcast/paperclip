@@ -411,6 +411,84 @@ describeEmbeddedPostgres("productivity review service", () => {
       expect(description).toContain("The second signal is already present");
     });
 
+    it("counts a fresh draft PR as concrete progress", async () => {
+      // AC4 asks that an issue whose PR was pushed to in the last 6h is not
+      // reported as having zero progress, and draws no line at drafts. An
+      // assignee pushing to a draft is working; excluding drafts recreates the
+      // exact false negative this issue exists to remove.
+      const now = new Date("2026-04-30T12:00:00.000Z");
+      const seeded = await seedIssueWithPullRequest({
+        prUpdatedAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+        status: "draft",
+      });
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+      });
+
+      const service = productivityReviewService(db);
+      await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+      const description = (await listProductivityReviews(seeded.companyId))[0]?.description ?? "";
+      expect(description).toContain("`draft`");
+      expect(description).toContain("progress-eligible");
+      expect(description).not.toContain("not progress-eligible");
+      expect(description).toContain("The second signal is already present");
+    });
+
+    it("does not let a newer closed PR mask an older PR that is still open", async () => {
+      // Two PRs on one issue: the newest is closed-unmerged, an older one is
+      // still open and fresh. Selecting the newest PR and only then testing
+      // eligibility reports zero progress on an issue that plainly has some.
+      const now = new Date("2026-04-30T12:00:00.000Z");
+      const freshOpenAt = new Date(now.getTime() - 2 * 60 * 60 * 1000);
+      const newerClosedAt = new Date(now.getTime() - 1 * 60 * 60 * 1000);
+
+      // #806 (open) is seeded by the helper; #807 (closed) is newer.
+      const seeded = await seedIssueWithPullRequest({ prUpdatedAt: freshOpenAt });
+      await db.insert(issueWorkProducts).values({
+        companyId: seeded.companyId,
+        issueId: seeded.issueId,
+        type: "pull_request",
+        provider: "github",
+        externalId: "Blockcast/paperclip#807",
+        title: "Superseded attempt",
+        url: "https://github.com/Blockcast/paperclip/pull/807",
+        status: "closed",
+        metadata: {
+          source: "github_pull_request_webhook",
+          sourceEventOrder: 20,
+          sourceEventTimestampMs: newerClosedAt.getTime(),
+        },
+        sourceTrust: PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST,
+        createdAt: newerClosedAt,
+        updatedAt: newerClosedAt,
+      });
+
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+      });
+
+      const service = productivityReviewService(db);
+      await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+      const description = (await listProductivityReviews(seeded.companyId))[0]?.description ?? "";
+      // Newest overall is still reported as the linked PR...
+      expect(description).toContain("Linked pull request: https://github.com/Blockcast/paperclip/pull/807");
+      // ...but the fresh open PR is surfaced on its own line and drives the verdict.
+      expect(description).toContain(
+        "Newest progress-eligible pull request: https://github.com/Blockcast/paperclip/pull/806",
+      );
+      expect(description).toContain("The second signal is already present");
+    });
+
     it("reads a delayed first delivery as stale by GitHub event time, not DB receipt time", async () => {
       // A first webhook delivery can land long after the PR event (retry,
       // backfill, outage drain). The row then inserts with `updatedAt = now`,

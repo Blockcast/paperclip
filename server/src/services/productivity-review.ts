@@ -107,7 +107,18 @@ type PullRequestEvidence = {
   ageMs: number;
 };
 
-const PRODUCTIVITY_REVIEW_PROGRESS_PR_STATUSES = new Set(["ready_for_review", "merged"]);
+/**
+ * PR states that count as concrete progress for a productivity verdict.
+ *
+ * `draft` is included deliberately: AC4 requires that an issue whose PR was
+ * pushed to in the last 6h is not reported as having zero progress, and it does
+ * not carve out drafts. Keeping a PR in draft is a normal working state here --
+ * it is how an author signals "not ready for review yet" -- so an assignee
+ * actively pushing to a draft is doing exactly the work this signal exists to
+ * make visible. `closed` (unmerged) is the sole exclusion: an abandoned PR is
+ * not progress.
+ */
+const PRODUCTIVITY_REVIEW_PROGRESS_PR_STATUSES = new Set(["draft", "ready_for_review", "merged"]);
 const PRODUCTIVITY_REVIEW_WEBHOOK_PR_METADATA_SOURCE = PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE;
 
 /**
@@ -161,6 +172,12 @@ type ProductivityReviewEvidence = {
    * open PR was indistinguishable from one doing nothing.
    */
   latestPullRequest: PullRequestEvidence | null;
+  /**
+   * Newest PR on the issue that is in a progress-eligible state, which is not
+   * necessarily `latestPullRequest`: a newer closed-unmerged PR would otherwise
+   * mask an older one that is still fresh and open.
+   */
+  progressPullRequest: PullRequestEvidence | null;
   thresholds: ProductivityReviewThresholds;
   generatedAt: Date;
   routineOnlySamplingWindow: boolean;
@@ -404,6 +421,26 @@ function formatPullRequestEvidence(pr: PullRequestEvidence | null) {
     ? "progress-eligible"
     : "not progress-eligible";
   return `${ref} \`${pr.status}\`, last activity ${pr.updatedAt.toISOString()} (${msToHuman(pr.ageMs)} ago, ${freshness}, ${progress})`;
+}
+
+/**
+ * Render the progress-eligible PR as its own line when it is *not* the newest
+ * PR on the issue. Without this the evidence pack would show only the newest
+ * one -- typically a closed PR -- and a manager reading it would have no way to
+ * see the fresh open PR that the progress verdict is actually resting on.
+ */
+function formatMaskedProgressPullRequestLines(
+  evidence: Pick<ProductivityReviewEvidence, "latestPullRequest" | "progressPullRequest">,
+) {
+  const { latestPullRequest, progressPullRequest } = evidence;
+  if (!progressPullRequest) return [];
+  const isSameRow = latestPullRequest !== null
+    && latestPullRequest.externalId !== null
+    && latestPullRequest.externalId === progressPullRequest.externalId;
+  if (isSameRow) return [];
+  return [
+    `- Newest progress-eligible pull request: ${formatPullRequestEvidence(progressPullRequest)}`,
+  ];
 }
 
 function isMonitorScheduledSuppression(
@@ -1125,6 +1162,49 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       noCommentStreak += 1;
     }
 
+    /**
+     * Newest webhook-written PR work product on the source issue, optionally
+     * restricted to progress-eligible states. The eligibility filter is applied
+     * *in the query* so that "newest" is evaluated within the filtered set --
+     * see the call sites for why filtering after the fact is wrong.
+     */
+    const selectLatestPullRequestRow = (opts?: { progressEligibleOnly?: boolean }) =>
+      db
+        .select({
+          title: issueWorkProducts.title,
+          url: issueWorkProducts.url,
+          status: issueWorkProducts.status,
+          externalId: issueWorkProducts.externalId,
+          updatedAt: issueWorkProducts.updatedAt,
+          sourceEventTimestampMs: sql<string | number | null>`case
+            when ${issueWorkProducts.metadata}->>'sourceEventTimestampMs' ~ '^[0-9]+$'
+              then (${issueWorkProducts.metadata}->>'sourceEventTimestampMs')::bigint
+            else null
+          end`,
+        })
+        .from(issueWorkProducts)
+        .where(
+          and(
+            eq(issueWorkProducts.companyId, sourceIssue.companyId),
+            eq(issueWorkProducts.issueId, sourceIssue.id),
+            eq(issueWorkProducts.provider, "github"),
+            eq(issueWorkProducts.type, "pull_request"),
+            isNotNull(issueWorkProducts.externalId),
+            isNotNull(issueWorkProducts.url),
+            sql`${issueWorkProducts.metadata}->>'source' = ${PRODUCTIVITY_REVIEW_WEBHOOK_PR_METADATA_SOURCE}`,
+            sql`${issueWorkProducts.sourceTrust}->>'promotedByActorType' = 'system'`,
+            sql`${issueWorkProducts.sourceTrust}->>'promotedByActorId' = ${PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID}`,
+            // Driven off the same constant the in-process check uses, so the
+            // two definitions of "progress-eligible" cannot drift apart.
+            ...(opts?.progressEligibleOnly
+              ? [inArray(issueWorkProducts.status, [...PRODUCTIVITY_REVIEW_PROGRESS_PR_STATUSES])]
+              : []),
+          ),
+        )
+        .orderBy(desc(pullRequestEffectiveEventAtSql))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+
     const [
       runCountLastHour,
       runCountLastSixHours,
@@ -1134,6 +1214,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       latestComments,
       costRow,
       latestPullRequestRow,
+      progressPullRequestRow,
     ] = await Promise.all([
       countIssueRunsSince(sourceIssue.companyId, sourceAgent.id, sourceIssue.id, oneHourAgo),
       countIssueRunsSince(sourceIssue.companyId, sourceAgent.id, sourceIssue.id, sixHoursAgo),
@@ -1170,36 +1251,15 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       // (retry, backfill, outage drain) inserts with `updatedAt = now` and would
       // advertise an already-stale PR as fresh progress for another day. Falls
       // back to `updatedAt` only for rows with no recorded source timestamp.
-      db
-        .select({
-          title: issueWorkProducts.title,
-          url: issueWorkProducts.url,
-          status: issueWorkProducts.status,
-          externalId: issueWorkProducts.externalId,
-          updatedAt: issueWorkProducts.updatedAt,
-          sourceEventTimestampMs: sql<string | number | null>`case
-            when ${issueWorkProducts.metadata}->>'sourceEventTimestampMs' ~ '^[0-9]+$'
-              then (${issueWorkProducts.metadata}->>'sourceEventTimestampMs')::bigint
-            else null
-          end`,
-        })
-        .from(issueWorkProducts)
-        .where(
-          and(
-            eq(issueWorkProducts.companyId, sourceIssue.companyId),
-            eq(issueWorkProducts.issueId, sourceIssue.id),
-            eq(issueWorkProducts.provider, "github"),
-            eq(issueWorkProducts.type, "pull_request"),
-            isNotNull(issueWorkProducts.externalId),
-            isNotNull(issueWorkProducts.url),
-            sql`${issueWorkProducts.metadata}->>'source' = ${PRODUCTIVITY_REVIEW_WEBHOOK_PR_METADATA_SOURCE}`,
-            sql`${issueWorkProducts.sourceTrust}->>'promotedByActorType' = 'system'`,
-            sql`${issueWorkProducts.sourceTrust}->>'promotedByActorId' = ${PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID}`,
-          ),
-        )
-        .orderBy(desc(pullRequestEffectiveEventAtSql))
-        .limit(1)
-        .then((rows) => rows[0] ?? null),
+      selectLatestPullRequestRow(),
+      // Newest *progress-eligible* PR, queried separately rather than filtered
+      // out of the row above. Picking the newest PR first and only then testing
+      // eligibility lets a newer closed-unmerged PR mask an older PR that is
+      // still fresh and open, reporting zero progress on an issue that has
+      // some -- the exact false negative this issue exists to remove. The two
+      // rows are usually the same row; they diverge only when the newest PR is
+      // closed.
+      selectLatestPullRequestRow({ progressEligibleOnly: true }),
     ]);
 
     const activeRunCount = latestRuns.filter((run) =>
@@ -1210,24 +1270,27 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       ? Math.max(0, now.getTime() - activeStartedAt.getTime())
       : null;
 
-    const latestPullRequest: PullRequestEvidence | null = latestPullRequestRow
-      ? (() => {
-        // Prefer the GitHub event time; `updatedAt` is only a fallback for rows
-        // written before the source timestamp was recorded.
-        const sourceMs = Number(latestPullRequestRow.sourceEventTimestampMs);
-        const eventAt = Number.isFinite(sourceMs) && latestPullRequestRow.sourceEventTimestampMs !== null
-          ? new Date(sourceMs)
-          : latestPullRequestRow.updatedAt;
-        return {
-          title: latestPullRequestRow.title,
-          url: latestPullRequestRow.url ?? null,
-          status: latestPullRequestRow.status,
-          externalId: latestPullRequestRow.externalId ?? null,
-          updatedAt: eventAt,
-          ageMs: Math.max(0, now.getTime() - eventAt.getTime()),
-        };
-      })()
-      : null;
+    const toPullRequestEvidence = (
+      row: typeof latestPullRequestRow,
+    ): PullRequestEvidence | null => {
+      if (!row) return null;
+      // Prefer the GitHub event time; `updatedAt` is only a fallback for rows
+      // written before the source timestamp was recorded.
+      const sourceMs = Number(row.sourceEventTimestampMs);
+      const eventAt = Number.isFinite(sourceMs) && row.sourceEventTimestampMs !== null
+        ? new Date(sourceMs)
+        : row.updatedAt;
+      return {
+        title: row.title,
+        url: row.url ?? null,
+        status: row.status,
+        externalId: row.externalId ?? null,
+        updatedAt: eventAt,
+        ageMs: Math.max(0, now.getTime() - eventAt.getTime()),
+      };
+    };
+    const latestPullRequest = toPullRequestEvidence(latestPullRequestRow);
+    const progressPullRequest = toPullRequestEvidence(progressPullRequestRow);
 
     const noComment = noCommentStreak >= thresholds.noCommentStreakRuns;
     const longActive = elapsedMs !== null && elapsedMs >= thresholds.longActiveMs;
@@ -1320,6 +1383,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         .map((run) => ({ runId: run.id, usageJson: run.usageJson ?? null })),
       nextAction: latestRuns.find((run) => run.nextAction)?.nextAction ?? null,
       latestPullRequest,
+      progressPullRequest,
       thresholds,
       generatedAt: now,
       routineOnlySamplingWindow,
@@ -1426,6 +1490,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       `- Assignee run-linked comments total/window: ${evidence.commentCount} total, ${evidence.commentCountLastHour}/1h, ${evidence.commentCountLastSixHours}/6h`,
       `- Cost events total: ${evidence.costCents} cents`,
       `- Linked pull request: ${formatPullRequestEvidence(evidence.latestPullRequest)}`,
+      ...formatMaskedProgressPullRequestLines(evidence),
       `- Current next action: ${evidence.nextAction ? truncateInline(evidence.nextAction, 500) : "none recorded"}`,
       "",
       "## Thresholds",
@@ -1453,10 +1518,10 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       "- An assignee run-linked comment in the last 6h that contains a `Next action:` line",
       "- A non-stale PR/MR link in the source issue's evidence (created or updated in the last 24h)",
       "- A recent test result, artifact commit, or workspace deliverable in the last 6h",
-      ...(isProgressPullRequest(evidence.latestPullRequest)
+      ...(isProgressPullRequest(evidence.progressPullRequest)
         ? [
           "",
-          `> The second signal is already present: ${formatPullRequestEvidence(evidence.latestPullRequest)}.`,
+          `> The second signal is already present: ${formatPullRequestEvidence(evidence.progressPullRequest)}.`,
           "> PR activity is recorded from the GitHub webhook, so this is deliverable progress even",
           "> when the run/comment counters above read zero.",
         ]
@@ -1484,6 +1549,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         : []),
       `- Next action: ${evidence.nextAction ? truncateInline(evidence.nextAction, 300) : "none recorded"}`,
       `- Linked pull request: ${formatPullRequestEvidence(evidence.latestPullRequest)}`,
+      ...formatMaskedProgressPullRequestLines(evidence),
     ].join("\n");
   }
 

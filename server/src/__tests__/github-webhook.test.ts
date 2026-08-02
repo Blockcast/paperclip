@@ -1644,9 +1644,10 @@ describeEmbeddedPostgres("github-webhook route", () => {
 
     it("accepts a same-second reopened event after a closed PR", async () => {
       // GitHub's `pull_request.updated_at` is second-granular, so a rapid
-      // close-then-reopen can carry an identical timestamp. Rank alone cannot
-      // order these: `reopened` ranks 10 and `closed` ranks 20, so a pure
-      // rank tie-break drops the reopen and leaves the PR reading `closed`.
+      // close-then-reopen can carry an identical timestamp. Plain lifecycle
+      // rank cannot order these -- a reopen moves *backwards* from `closed` --
+      // so reopen-type actions are ranked above `closed` for tie-breaking,
+      // which is what keeps the pair from resolving to `closed`.
       const { issueId } = await seedIssueWithIdentifier("BLO-40020");
       const app = buildApp();
 
@@ -1678,6 +1679,9 @@ describeEmbeddedPostgres("github-webhook route", () => {
     });
 
     it("applies a distinct same-second push instead of retaining stale head metadata", async () => {
+      // Two same-second pushes are equal-rank, so the winner is settled by the
+      // content tie-break rather than by arrival order. The reverse-delivery
+      // twin below asserts both orders land on this same head.
       const { issueId } = await seedIssueWithIdentifier("BLO-40021");
       const app = buildApp();
 
@@ -1705,6 +1709,72 @@ describeEmbeddedPostgres("github-webhook route", () => {
         headSha: "second-head",
         lastEventAction: "synchronize",
       });
+    });
+
+    it("converges on the same state when a same-second close/reopen pair is delivered in reverse", async () => {
+      // The convergence half of the test above. GitHub gives us no field that
+      // orders two same-second events, so the outcome must depend on the set of
+      // events, not on which delivery happened to arrive first. Reverse the
+      // order and the row must still read `ready_for_review`.
+      const { issueId } = await seedIssueWithIdentifier("BLO-40023");
+      const app = buildApp();
+
+      await postPr(app, prPayload({
+        action: "reopened",
+        identifier: "BLO-40023",
+        number: 4263,
+        headSha: "reverse-reopen-head",
+        updatedAt: "2026-04-30T10:00:00Z",
+      }), "wp-reverse-reopen-1");
+      await postPr(app, prPayload({
+        action: "closed",
+        identifier: "BLO-40023",
+        number: 4263,
+        merged: false,
+        updatedAt: "2026-04-30T10:00:00Z",
+      }), "wp-reverse-reopen-2");
+
+      const rows = await db
+        .select({ status: issueWorkProducts.status, metadata: issueWorkProducts.metadata })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.status).toBe("ready_for_review");
+      expect(rows[0]?.metadata).toMatchObject({
+        headSha: "reverse-reopen-head",
+        lastEventAction: "reopened",
+      });
+    });
+
+    it("converges on the same push when two same-second pushes are delivered in reverse", async () => {
+      // Same property for equal-rank events. The forward-order test above ends
+      // on `second-head`; delivering the two pushes the other way round must
+      // not end on `first-head`, or the recorded head is decided by webhook
+      // arrival order.
+      const { issueId } = await seedIssueWithIdentifier("BLO-40024");
+      const app = buildApp();
+
+      await postPr(app, prPayload({
+        action: "synchronize",
+        identifier: "BLO-40024",
+        number: 4264,
+        headSha: "second-head",
+        updatedAt: "2026-04-30T10:00:00Z",
+      }), "wp-reverse-push-1");
+      await postPr(app, prPayload({
+        action: "opened",
+        identifier: "BLO-40024",
+        number: 4264,
+        headSha: "first-head",
+        updatedAt: "2026-04-30T10:00:00Z",
+      }), "wp-reverse-push-2");
+
+      const rows = await db
+        .select({ metadata: issueWorkProducts.metadata })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.metadata).toMatchObject({ headSha: "second-head" });
     });
 
     it("does not let a same-second stray event un-merge a merged PR", async () => {

@@ -1,4 +1,5 @@
 import { and, desc, eq, isNotNull, sql } from "drizzle-orm";
+import type { SQL } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { issueWorkProducts } from "@paperclipai/db";
 import type { IssueWorkProduct } from "@paperclipai/shared";
@@ -110,20 +111,6 @@ export function workProductService(db: Db) {
       // webhook's best-effort catch swallowed, silently disabling every PR
       // work-product write.
       const nowSql = sql`${now.toISOString()}::timestamptz`;
-      const incomingSourceEventOrder = sql<number>`case
-        when excluded.metadata->>'sourceEventOrder' ~ '^[0-9]+$'
-          then (excluded.metadata->>'sourceEventOrder')::int
-        when excluded.status = 'merged' then 30
-        when excluded.status = 'closed' then 20
-        else 10
-      end`;
-      const existingSourceEventOrder = sql<number>`case
-        when ${issueWorkProducts.metadata}->>'sourceEventOrder' ~ '^[0-9]+$'
-          then (${issueWorkProducts.metadata}->>'sourceEventOrder')::int
-        when ${issueWorkProducts.status} = 'merged' then 30
-        when ${issueWorkProducts.status} = 'closed' then 20
-        else 10
-      end`;
       const incomingSourceEventTimestampMs = sql<number | null>`case
         when excluded.metadata->>'sourceEventTimestampMs' ~ '^[0-9]+$'
           then (excluded.metadata->>'sourceEventTimestampMs')::bigint
@@ -134,32 +121,63 @@ export function workProductService(db: Db) {
           then (${issueWorkProducts.metadata}->>'sourceEventTimestampMs')::bigint
         else null
       end`;
-      const incomingIsReopen = sql`excluded.metadata->>'lastEventAction' in ('reopened', 'ready_for_review')`;
-      // Distinguishes a genuinely distinct delivery from an exact redelivery.
-      // GitHub's `pull_request.updated_at` is second-granular, so two real
-      // events (a rapid `closed` -> `reopened`, or two pushes) can share a
-      // timestamp; only the payload tells them apart.
-      const contentDiffers = sql`(
-        excluded.metadata is distinct from ${issueWorkProducts.metadata}
-        or excluded.status is distinct from ${issueWorkProducts.status}
-        or excluded.url is distinct from ${issueWorkProducts.url}
-        or excluded.title is distinct from ${issueWorkProducts.title}
+      // Rank for events that cannot be ordered by source timestamp -- same
+      // second, or a legacy row written before the timestamp was recorded.
+      //
+      // `reopened`/`ready_for_review` sit deliberately ABOVE `closed` rather
+      // than at their nonterminal rank. GitHub's `pull_request.updated_at` is
+      // second-granular, so a rapid close-then-reopen carries one timestamp and
+      // no field in the payload recovers the true order. Ranking the reopen
+      // higher makes the pair converge on "open" whichever way the two
+      // deliveries arrive, instead of letting arrival order decide. `merged`
+      // stays on top and absorbing, so no same-second stray event un-merges a
+      // PR.
+      const tieRank = (
+        statusExpr: SQL | typeof issueWorkProducts.status,
+        metadataExpr: SQL | typeof issueWorkProducts.metadata,
+      ) => sql<number>`case
+        when ${statusExpr} = 'merged' then 30
+        when ${metadataExpr}->>'lastEventAction' in ('reopened', 'ready_for_review') then 25
+        when ${statusExpr} = 'closed' then 20
+        else 10
+      end`;
+      const incomingTieRank = tieRank(sql`excluded.status`, sql`excluded.metadata`);
+      const existingTieRank = tieRank(issueWorkProducts.status, issueWorkProducts.metadata);
+      // Total order over same-rank payloads, so two distinct same-second events
+      // (typically two pushes) resolve to the same row regardless of which is
+      // delivered first. This is a *stability* rule, not a causality claim: at
+      // equal rank and equal timestamp the source carries no evidence of which
+      // event came first, so the tie is settled by content instead of by
+      // arrival. Equal keys mean the two payloads are indistinguishable on
+      // every field this row stores, so rejecting the incoming one is what
+      // keeps redeliveries idempotent and preserves `updatedAt`.
+      const contentKey = (
+        statusExpr: SQL | typeof issueWorkProducts.status,
+        titleExpr: SQL | typeof issueWorkProducts.title,
+        urlExpr: SQL | typeof issueWorkProducts.url,
+        metadataExpr: SQL | typeof issueWorkProducts.metadata,
+      ) => sql<string>`concat_ws(
+        chr(1),
+        coalesce(${metadataExpr}->>'headSha', ''),
+        coalesce(${statusExpr}, ''),
+        coalesce(${titleExpr}, ''),
+        coalesce(${urlExpr}, '')
       )`;
-      // Tie-break for events that cannot be strictly ordered by source
-      // timestamp: same second, or a legacy row written before the timestamp
-      // was recorded. Three admissible ways to win, in order:
-      //   1. a higher lifecycle rank (nonterminal -> closed -> merged);
-      //   2. a reopen, which legitimately moves *backwards* in rank
-      //      (closed -> ready_for_review) -- but never off `merged`, which is
-      //      absorbing, so a same-second stray event cannot un-merge a PR;
-      //   3. equal rank carrying different content, i.e. a distinct
-      //      same-second event such as a second push. Exact redeliveries have
-      //      identical content and are rejected here, which is what keeps the
-      //      upsert idempotent and preserves `updatedAt`.
+      const incomingContentKey = contentKey(
+        sql`excluded.status`,
+        sql`excluded.title`,
+        sql`excluded.url`,
+        sql`excluded.metadata`,
+      );
+      const existingContentKey = contentKey(
+        issueWorkProducts.status,
+        issueWorkProducts.title,
+        issueWorkProducts.url,
+        issueWorkProducts.metadata,
+      );
       const tieBreak = sql`(
-        ${incomingSourceEventOrder} > ${existingSourceEventOrder}
-        or (${incomingIsReopen} and ${existingSourceEventOrder} <> 30)
-        or (${incomingSourceEventOrder} = ${existingSourceEventOrder} and ${contentDiffers})
+        ${incomingTieRank} > ${existingTieRank}
+        or (${incomingTieRank} = ${existingTieRank} and ${incomingContentKey} > ${existingContentKey})
       )`;
       const acceptIncoming = sql`case
         when ${incomingSourceEventTimestampMs} is not null and ${existingSourceEventTimestampMs} is not null

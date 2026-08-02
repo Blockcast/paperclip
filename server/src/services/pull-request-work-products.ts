@@ -65,6 +65,14 @@ export function pullRequestWorkProductStatus(
   return "ready_for_review";
 }
 
+/**
+ * Lifecycle rank of a PR state, recorded on the row for readability.
+ *
+ * NOT the tie-break the upsert uses: `work-products.ts` derives its own rank
+ * from `status` + `lastEventAction` so that a reopen can outrank a close, which
+ * a status-only scale cannot express. Changing the numbers here does not change
+ * conflict resolution.
+ */
 export function pullRequestWorkProductSourceEventOrder(
   status: IssueWorkProduct["status"] | string,
 ): number {
