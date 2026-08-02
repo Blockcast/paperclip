@@ -37,6 +37,13 @@ test("API deployment hard-enforces node spread by default (BLO-20901)", () => {
   assert.match(rendered, /maxSkew: 1/);
   assert.match(rendered, /minDomains: 2/);
   assert.match(rendered, /whenUnsatisfiable: DoNotSchedule/);
+  // Scopes the skew calculation to one ReplicaSet revision at a time, so a
+  // rollout starting from an already-skewed fleet doesn't wedge the surge
+  // pod Pending. Without this, old-RS and new-RS pods count together.
+  assert.match(
+    rendered,
+    /topologySpreadConstraints:[\s\S]*?matchLabelKeys:[\s\S]*?- pod-template-hash/,
+  );
   // The hard constraint must target the API pods specifically, not every
   // paperclip component, or it would also constrain the worker StatefulSet's
   // label surface by accident.

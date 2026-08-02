@@ -139,6 +139,21 @@ test('fails with a bare Paperclip identifier and no Fixes/Closes/Refs keyword', 
   assert.equal(result.passed, false);
 });
 
+test('fails when the Paperclip identifier runs into trailing garbage', () => {
+  const result = checkLinkedIssue('Refs BLO-20901junk', 'fix: bug');
+  assert.equal(result.passed, false);
+});
+
+test('fails when the Paperclip identifier is followed by a dot and more text', () => {
+  const result = checkLinkedIssue('Refs BLO-1.evil', 'fix: bug');
+  assert.equal(result.passed, false);
+});
+
+test('passes when the Paperclip identifier is followed by end-of-sentence punctuation', () => {
+  assert.equal(checkLinkedIssue('Refs BLO-20901.', 'fix: bug').passed, true);
+  assert.equal(checkLinkedIssue('Refs BLO-20901,', 'fix: bug').passed, true);
+});
+
 // Prefix-aware skip behavior
 
 test('skips check for docs: prefix', () => {
