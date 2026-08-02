@@ -301,6 +301,41 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
     });
   });
 
+  it("activates from the locked pending-agent runtime without losing a concurrent update", async () => {
+    const companyId = await seedCompany();
+    const agentId = await seedAgentRow(companyId, {
+      name: "Concurrent Pending Activation",
+      status: "pending_approval",
+      adapterType: "opencode_k8s",
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 15, wakeOnDemand: false } },
+    });
+    const service = agentService(db);
+
+    let pendingActivation!: ReturnType<typeof service.activatePendingApproval>;
+    let settled = false;
+    await db.transaction(async (tx) => {
+      await tx.execute(sql`select ${agents.id} from ${agents} where ${agents.id} = ${agentId} for update`);
+      pendingActivation = service.activatePendingApproval(agentId, { role: "reviewer" });
+      void pendingActivation.finally(() => {
+        settled = true;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(settled).toBe(false);
+      await tx.update(agents).set({
+        runtimeConfig: { heartbeat: { maxConcurrentRuns: 12, wakeOnDemand: true } },
+      }).where(eq(agents.id, agentId));
+    });
+
+    await expect(pendingActivation).resolves.toMatchObject({
+      activated: true,
+      agent: {
+        status: "idle",
+        role: "reviewer",
+        runtimeConfig: { heartbeat: { maxConcurrentRuns: 12, wakeOnDemand: true } },
+      },
+    });
+  });
+
   it("creates agent secret bindings when a new agent persists secret_ref env", async () => {
     const companyId = await seedCompany();
     const secrets = secretService(db);

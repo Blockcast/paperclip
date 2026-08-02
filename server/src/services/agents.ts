@@ -894,6 +894,7 @@ export function agentService(db: Db) {
     activatePendingApproval: async (id: string, approvedPayload?: Record<string, unknown> | null) => {
       const activatedAgent = await db.transaction(async (tx) => {
         const txDb = tx as unknown as Db;
+        await tx.execute(sql`select ${agents.id} from ${agents} where ${agents.id} = ${id} for update`);
         const existing = await agentService(txDb).getById(id);
         if (!existing || existing.status !== "pending_approval") return null;
         const approvedPatch = approvedPayload ? configPatchFromApprovalPayload(approvedPayload) : {};
@@ -918,7 +919,7 @@ export function agentService(db: Db) {
         const normalizedRuntimeConfig = normalizeExternalLifecycleRuntimeConfig(
           nextAdapterType,
           Object.prototype.hasOwnProperty.call(patch, "runtimeConfig")
-            ? patch.runtimeConfig
+            ? mergeRuntimeConfigPatch(existing.runtimeConfig, patch.runtimeConfig)
             : existing.runtimeConfig,
         );
         if (
