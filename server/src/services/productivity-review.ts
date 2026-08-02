@@ -898,23 +898,19 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
 
       let suppressedBy: "terminal_source" | "monitor_scheduled" | null = null;
       let suppressionDetails: Record<string, unknown> = {};
-      // A terminal source outranks the monitor attribution: it retires the review outright,
-      // whereas a future monitor only defers the one alarm that reads elapsed time. Applies to
-      // every trigger — all three measure in-flight behaviour, so a finished episode moots them
-      // all — and deliberately does not require a known trigger, so a review whose creation entry
-      // has aged out of the activity log is still swept on source status alone.
-      //
-      // This does close a review that already fired, which the approval gate below is barred from
-      // doing, because the two are not the same kind of claim. A `pending` approval is free for
-      // the reviewed agent to mint and commits it to nothing. Terminating the source issue costs
-      // the agent the work item itself: it cannot both keep working the issue and silence the
-      // review, `done` is subject to terminal-status hygiene, and `cancelled` abandons the work.
-      // The close is audit-only in the BLO-6243 sense — the activity-log entry keeps an
-      // attributed, permanently observable trace of which source status retired the review.
-      if (isTerminalIssueStatus(sourceIssue.status)) {
+      // A `done` source can retire an already-open long-active review: the work
+      // episode finished under the terminal-status evidence gate, so the
+      // elapsed-time alarm no longer needs manager adjudication. This does not
+      // extend to `cancelled`; an assignee can abandon and later restore their
+      // own source issue, so cancellation must not retire its oversight
+      // artifact. It also does not extend to historical/accountability triggers
+      // (`no_comment_streak`, `high_churn`) or missing provenance: completion
+      // does not invalidate those signals, and unknown trigger semantics fail
+      // closed.
+      if (trigger === "long_active_duration" && sourceIssue.status === "done") {
         suppressedBy = "terminal_source";
         suppressionDetails = { sourceStatus: sourceIssue.status };
-      } else if (trigger === "long_active_duration") {
+      } else if (trigger === "long_active_duration" && !isTerminalIssueStatus(sourceIssue.status)) {
         // Deliberately monitor-only. An approval gate suppresses *new* reviews but never closes one
         // that already fired: the approval that would justify the close is creatable by the very
         // agent under review (`POST /companies/:companyId/approvals` resolves `requestedByAgentId`
@@ -932,10 +928,26 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       }
       if (!suppressedBy) continue;
 
-      await db
+      const closePredicates = [
+        eq(issues.id, review.id),
+        notInArray(issues.status, ["done", "cancelled"]),
+      ];
+      if (suppressedBy === "terminal_source") {
+        closePredicates.push(sql`exists (
+          select 1
+          from issues source_issue
+          where source_issue.id = ${sourceIssue.id}
+            and source_issue.company_id = ${review.companyId}
+            and source_issue.status = 'done'
+        )`);
+      }
+      const closed = await db
         .update(issues)
         .set({ status: "done", completedAt: now, updatedAt: now })
-        .where(eq(issues.id, review.id));
+        .where(and(...closePredicates))
+        .returning({ id: issues.id });
+      if (closed.length === 0) continue;
+
       await logActivity(db, {
         companyId: review.companyId,
         actorType: "system",
