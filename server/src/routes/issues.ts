@@ -346,10 +346,14 @@ export async function findCreateIssueDuplicateCandidates(
 }
 
 type ReservedPostgresSql = {
+  begin?: (fn: (sql: ReservedPostgresSql) => unknown) => Promise<unknown>;
   release: () => void;
+  options?: unknown;
+  unsafe: (query: string) => PromiseLike<unknown>;
 };
 
 type ReservablePostgresClient = {
+  options: unknown;
   reserve: () => Promise<ReservedPostgresSql>;
 };
 
@@ -365,7 +369,7 @@ async function withReservedCreateIssueAdvisoryDb<T>(
   fn: (db: Db) => Promise<T>,
 ): Promise<T> {
   const client = getReservablePostgresClient(db);
-  if (!client) return fn(db);
+  if (!client) return db.transaction((tx) => fn(tx as unknown as Db));
 
   let timer: ReturnType<typeof setTimeout> | undefined;
   const reservePromise = client.reserve();
@@ -385,10 +389,21 @@ async function withReservedCreateIssueAdvisoryDb<T>(
   }
 
   try {
+    // postgres.js reserve() omits runtime options and begin() despite ReservedSql extending Sql.
+    reserved.options = client.options;
+    reserved.begin = async (transaction) => transaction(reserved);
     const reservedDb = createDbFromPostgresClient(
       reserved as unknown as Parameters<typeof createDbFromPostgresClient>[0],
     );
-    return await fn(reservedDb);
+    await reserved.unsafe("BEGIN");
+    try {
+      const result = await fn(reservedDb);
+      await reserved.unsafe("COMMIT");
+      return result;
+    } catch (err) {
+      await reserved.unsafe("ROLLBACK");
+      throw err;
+    }
   } finally {
     reserved.release();
   }
@@ -418,23 +433,21 @@ function scheduleDuplicateCandidateShownActivity(input: {
         timeoutMs,
         "issue duplicate candidate consumption event",
         async (advisoryDb) => {
-          await advisoryDb.transaction(async (tx) => {
-            await tx.execute(sql`select set_config('statement_timeout', ${String(timeoutMs)}, true)`);
-            await (input.opts.createIssueDuplicateCandidateActivityWriter ?? logActivity)(tx as unknown as Db, {
-              companyId: input.companyId,
-              actorType: input.actor.actorType,
-              actorId: input.actor.actorId,
-              agentId: input.actor.agentId,
-              runId: input.actor.runId,
-              agentApiKeyId: input.actor.agentApiKeyId,
-              action: "issue.duplicate_candidates_shown",
-              entityType: "company",
-              entityId: input.companyId,
-              details: {
-                identifier: input.issue.identifier,
-                duplicateCandidates: input.duplicateCandidates.map(({ identifier, score }) => ({ identifier, score })),
-              },
-            });
+          await advisoryDb.execute(sql`select set_config('statement_timeout', ${String(timeoutMs)}, true)`);
+          await (input.opts.createIssueDuplicateCandidateActivityWriter ?? logActivity)(advisoryDb, {
+            companyId: input.companyId,
+            actorType: input.actor.actorType,
+            actorId: input.actor.actorId,
+            agentId: input.actor.agentId,
+            runId: input.actor.runId,
+            agentApiKeyId: input.actor.agentApiKeyId,
+            action: "issue.duplicate_candidates_shown",
+            entityType: "company",
+            entityId: input.companyId,
+            details: {
+              identifier: input.issue.identifier,
+              duplicateCandidates: input.duplicateCandidates.map(({ identifier, score }) => ({ identifier, score })),
+            },
           });
         },
       ),
@@ -8559,13 +8572,11 @@ export function issueRoutes(
         ?? ISSUE_CREATE_DUPLICATE_CANDIDATE_TIMEOUT_MS;
       duplicateCandidates = await raceCreateIssueDuplicateCandidateLookup(
         withReservedCreateIssueAdvisoryDb(db, lookupTimeoutMs, "issue duplicate candidate lookup", async (advisoryDb) => {
-          const canReadCompanyScope = await advisoryDb.transaction(async (tx) => {
-            await tx.execute(sql`select set_config('statement_timeout', ${String(lookupTimeoutMs)}, true)`);
-            return (opts.createIssueDuplicateCandidateCompanyScopeReader
-              ?? ((scopedDb, scopedReq, scopedCompanyId) => (
-                actorCanReadCompanyScope(scopedReq, scopedCompanyId, scopedDb)
-              )))(tx as unknown as Db, req, companyId);
-          });
+          await advisoryDb.execute(sql`select set_config('statement_timeout', ${String(lookupTimeoutMs)}, true)`);
+          const canReadCompanyScope = await (opts.createIssueDuplicateCandidateCompanyScopeReader
+            ?? ((scopedDb, scopedReq, scopedCompanyId) => (
+              actorCanReadCompanyScope(scopedReq, scopedCompanyId, scopedDb)
+            )))(advisoryDb, req, companyId);
           return (opts.createIssueDuplicateCandidateLookup ?? findCreateIssueDuplicateCandidates)(advisoryDb, companyId, {
             id: issue.id,
             identifier: issue.identifier,
