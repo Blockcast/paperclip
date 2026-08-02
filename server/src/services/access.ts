@@ -651,6 +651,66 @@ export function accessService(db: Db) {
       .orderBy(principalPermissionGrants.permissionKey);
   }
 
+  async function updatePrincipalGrant(
+    companyId: string,
+    principalType: PrincipalType,
+    principalId: string,
+    input: GrantInput & { operation: "add" | "remove" },
+    grantedByUserId: string | null,
+  ) {
+    return db.transaction(async (tx) => {
+      let changed = false;
+      if (input.operation === "remove") {
+        const removed = await tx
+          .delete(principalPermissionGrants)
+          .where(
+            and(
+              eq(principalPermissionGrants.companyId, companyId),
+              eq(principalPermissionGrants.principalType, principalType),
+              eq(principalPermissionGrants.principalId, principalId),
+              eq(principalPermissionGrants.permissionKey, input.permissionKey),
+            ),
+          )
+          .returning({ id: principalPermissionGrants.id });
+        changed = removed.length > 0;
+      } else {
+        const added = await tx
+          .insert(principalPermissionGrants)
+          .values({
+            companyId,
+            principalType,
+            principalId,
+            permissionKey: input.permissionKey,
+            scope: input.scope ?? null,
+            grantedByUserId,
+          })
+          .onConflictDoNothing({
+            target: [
+              principalPermissionGrants.companyId,
+              principalPermissionGrants.principalType,
+              principalPermissionGrants.principalId,
+              principalPermissionGrants.permissionKey,
+            ],
+          })
+          .returning({ id: principalPermissionGrants.id });
+        changed = added.length > 0;
+      }
+
+      const grants = await tx
+        .select()
+        .from(principalPermissionGrants)
+        .where(
+          and(
+            eq(principalPermissionGrants.companyId, companyId),
+            eq(principalPermissionGrants.principalType, principalType),
+            eq(principalPermissionGrants.principalId, principalId),
+          ),
+        )
+        .orderBy(principalPermissionGrants.permissionKey);
+      return { changed, grants };
+    });
+  }
+
   async function setPrincipalPermission(
     companyId: string,
     principalType: PrincipalType,
@@ -800,6 +860,7 @@ export function accessService(db: Db) {
     setUserCompanyAccess,
     setPrincipalGrants,
     listPrincipalGrants,
+    updatePrincipalGrant,
     setPrincipalPermission,
     updateMember,
   };

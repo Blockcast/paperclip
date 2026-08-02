@@ -147,6 +147,7 @@ import {
   updateCompanyMemberWithPermissionsSchema,
   archiveCompanyMemberSchema,
   updateMemberPermissionsSchema,
+  updateAgentGrantSchema,
   updateUserCompanyAccessSchema,
   // Instance settings
   patchInstanceSettingsSchema,
@@ -726,6 +727,7 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "PATCH /api/companies/{companyId}/members/{memberId}/role-and-grants",
   "POST /api/companies/{companyId}/members/{memberId}/archive",
   "PATCH /api/companies/{companyId}/members/{memberId}/permissions",
+  "PATCH /api/companies/{companyId}/agents/{agentId}/grants",
   "GET /api/companies/{companyId}/user-directory",
   "GET /api/companies/{companyId}/pr-review-queue",
   "POST /api/execution-workspaces/{id}/reconcile-branch",
@@ -3515,6 +3517,18 @@ registry.registerPath({
     body: jsonBody(updateMemberPermissionsSchema),
   },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "patch",
+  path: "/api/companies/{companyId}/agents/{agentId}/grants",
+  tags: ["access"],
+  summary: "Add or remove one explicit agent permission grant",
+  request: {
+    params: z.object({ companyId: z.string(), agentId: z.string() }),
+    body: jsonBody(updateAgentGrantSchema),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
 });
 
 registry.registerPath({

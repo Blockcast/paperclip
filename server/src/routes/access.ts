@@ -45,6 +45,7 @@ import {
   updateCompanyMemberSchema,
   archiveCompanyMemberSchema,
   updateMemberPermissionsSchema,
+  updateAgentGrantSchema,
   updateUserCompanyAccessSchema,
   PERMISSION_KEYS,
   isUuidLike,
@@ -4942,6 +4943,49 @@ export function accessRoutes(
       if (!member) throw notFound("Member not found");
       res.json(member);
     }
+  );
+
+  router.patch(
+    "/companies/:companyId/agents/:agentId/grants",
+    validate(updateAgentGrantSchema),
+    async (req, res) => {
+      const companyId = req.params.companyId as string;
+      const agentId = req.params.agentId as string;
+      if (req.actor.type !== "board") throw forbidden("Board access required");
+      await assertCompanyPermission(req, companyId, "users:manage_permissions");
+
+      const agent = await agents.getById(agentId);
+      if (!agent || agent.companyId !== companyId) throw notFound("Agent not found");
+
+      const result = await access.updatePrincipalGrant(
+        companyId,
+        "agent",
+        agentId,
+        req.body,
+        req.actor.userId ?? null,
+      );
+      await logActivity(db, {
+        companyId,
+        actorType: "user",
+        actorId: req.actor.userId ?? "board",
+        action: `agent.permission_grant_${req.body.operation === "add" ? "added" : "removed"}`,
+        entityType: "agent",
+        entityId: agentId,
+        details: {
+          permissionKey: req.body.permissionKey,
+          scope: req.body.scope ?? null,
+          changed: result.changed,
+        },
+      });
+
+      const membership = await access.getMembership(companyId, "agent", agentId);
+      res.json({
+        agentId,
+        companyId,
+        membership,
+        grants: result.grants,
+      });
+    },
   );
 
   router.post(
