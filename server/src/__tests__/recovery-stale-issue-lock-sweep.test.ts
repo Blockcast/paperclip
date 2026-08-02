@@ -7,6 +7,7 @@ import {
   agents,
   companies,
   createDb,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
   issueRelations,
@@ -49,6 +50,11 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     await db.delete(activityLog);
     await db.delete(issueTreeHolds);
     await db.delete(issues);
+    // Must precede heartbeatRuns: the promotion tests drive
+    // promoteDueScheduledRetries, which writes heartbeat_run_events, and the FK
+    // heartbeat_run_events_run_id_heartbeat_runs_id_fk otherwise blocks the
+    // delete and fails whichever test happens to run next.
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(agents);
@@ -914,6 +920,7 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     agentId: string;
     // Most-recent genuine activity on the holder run.
     lastOutputAt: Date | null;
+    lastUsefulActionAt?: Date | null;
     startedAt?: Date | null;
     lockedAt: Date;
     // The wedge shape claims checkout + execution together.
@@ -932,6 +939,7 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       // the no-signal case these tests need to exercise.
       startedAt: "startedAt" in input ? input.startedAt : new Date(Date.now() - 8 * 60 * 60 * 1000),
       lastOutputAt: input.lastOutputAt,
+      ...("lastUsefulActionAt" in input ? { lastUsefulActionAt: input.lastUsefulActionAt } : {}),
       ...(input.updatedAt ? { updatedAt: input.updatedAt } : {}),
     });
     await db.insert(issues).values({
@@ -994,6 +1002,56 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     expect(details?.reason).toBe("running_lock_silent");
     expect(details?.runningLockTimeoutMs).toBe(2 * 60 * 60 * 1000);
     expect(details?.runningLockSilentMs).toBeGreaterThanOrEqual(3 * 60 * 60 * 1000);
+  });
+
+  it("preserves a holder whose useful-action stamp is stale but whose output is fresh (BLO-19848)", async () => {
+    // The three activity columns are independent stamps, not a priority chain.
+    // A `??` chain returns the FIRST non-null, so a 5h-old lastUsefulActionAt
+    // masked a 1-minute-old lastOutputAt and classified a demonstrably live run
+    // as silent — clearing the lock out from under it. Both the pre-transaction
+    // scan and the in-transaction revalidation must select the NEWEST stamp.
+    const { companyId, agentId } = await seed();
+    const { wedgedRunId, issueId } = await seedWedgedRunningIssue({
+      companyId,
+      agentId,
+      lastOutputAt: new Date(Date.now() - 60 * 1000),
+      lastUsefulActionAt: new Date(Date.now() - 5 * 60 * 60 * 1000),
+      startedAt: new Date(Date.now() - 9 * 60 * 60 * 1000),
+      lockedAt: new Date(Date.now() - 9 * 60 * 60 * 1000),
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.sweepStaleIssueLocks();
+
+    expect(result.cleared).toBe(0);
+    const row = await db
+      .select({
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({ checkoutRunId: wedgedRunId, executionRunId: wedgedRunId });
+  });
+
+  it("still clears when every activity stamp is past the bound (BLO-19848)", async () => {
+    // Companion to the test above: taking the max must not make the sweep
+    // unreachable whenever lastUsefulActionAt happens to be populated.
+    const { companyId, agentId } = await seed();
+    const { issueId } = await seedWedgedRunningIssue({
+      companyId,
+      agentId,
+      lastOutputAt: new Date(Date.now() - 3 * 60 * 60 * 1000),
+      lastUsefulActionAt: new Date(Date.now() - 4 * 60 * 60 * 1000),
+      lockedAt: new Date(Date.now() - 9 * 60 * 60 * 1000),
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.sweepStaleIssueLocks();
+
+    expect(result.cleared).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
   });
 
   it("preserves a long-running holder that is still producing output (BLO-19941)", async () => {
@@ -1260,6 +1318,47 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       .where(eq(heartbeatRuns.id, wedgedRunId))
       .then((rows) => rows[0]);
     expect(run?.status).toBe("queued");
+  });
+
+  it("re-reads running-holder output inside the sweep transaction before clearing (BLO-19848)", async () => {
+    // Transaction-path companion to the timestamp-ordering regression. The
+    // holder looks silent to the pre-transaction scan, then emits output while
+    // the sweep is in flight — leaving lastUsefulActionAt stale. The
+    // in-transaction revalidation must select the newest stamp too, or it
+    // clears the lock of a run that just proved it is alive.
+    const { companyId, agentId } = await seed();
+    const { issueId, wedgedRunId } = await seedWedgedRunningIssue({
+      companyId,
+      agentId,
+      lastOutputAt: new Date(Date.now() - 3 * 60 * 60 * 1000),
+      lastUsefulActionAt: new Date(Date.now() - 5 * 60 * 60 * 1000),
+      lockedAt: new Date(Date.now() - 9 * 60 * 60 * 1000),
+    });
+
+    const heartbeat = heartbeatService(db, {
+      beforeStaleIssueLockSweepClearForTest: async (issue) => {
+        if (issue.id !== issueId) return;
+        await db
+          .update(heartbeatRuns)
+          .set({ lastOutputAt: new Date() })
+          .where(eq(heartbeatRuns.id, wedgedRunId));
+      },
+    });
+    const result = await heartbeat.sweepStaleIssueLocks();
+
+    expect(result.cleared).toBe(0);
+    const row = await db
+      .select({
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+        executionLockedAt: issues.executionLockedAt,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row?.checkoutRunId).toBe(wedgedRunId);
+    expect(row?.executionRunId).toBe(wedgedRunId);
+    expect(row?.executionLockedAt).not.toBeNull();
   });
 
   it("re-reads scheduled_retry deadline inside the sweep transaction before clearing (BLO-19848)", async () => {

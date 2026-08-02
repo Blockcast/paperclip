@@ -138,11 +138,14 @@ const SCHEDULED_RETRY_REASONS_REQUIRING_CONTINUOUS_ISSUE_LOCK = new Set([
 // `running` is neither missing nor terminal, so isCleanable() is false forever
 // and — unlike the pre-claim case — executionLockedAt cannot be the basis: a
 // healthy 4h run legitimately holds a 4h-old lock. Age must therefore be
-// measured against the run's own most-recent *genuine* activity
-// (lastUsefulActionAt > lastOutputAt > startedAt), which is exactly the metric
-// the dispatcher's slot gate uses (`nonStaleRunningRuns`,
-// heartbeat.ts:17162-17171) and the reaper's own silence test
-// (`persistedSignalRef`, heartbeat.ts:16283-16289). Deliberately NOT updatedAt:
+// measured against the run's own most-recent *genuine* activity — the newest of
+// lastUsefulActionAt / lastOutputAt / startedAt, NOT the first non-null of them
+// (see latestRunActivityAt below). That is the same metric the dispatcher's slot
+// gate uses (`nonStaleRunningRuns`, heartbeat.ts:17560-17569) and the reaper's
+// own silence test (`persistedSignalRef`, heartbeat.ts:16672-16682), though both
+// of those still coalesce by priority rather than taking the max — BLO-20775,
+// kept out of this change because it alters reap/dispatch behaviour.
+// Deliberately NOT updatedAt:
 // review/recovery churn bumps it every ~minute and would shield a dead run
 // forever (BLO-8827, and the reaper's own note at heartbeat.ts:16444-16448).
 //
@@ -160,6 +163,22 @@ const SCHEDULED_RETRY_REASONS_REQUIRING_CONTINUOUS_ISSUE_LOCK = new Set([
 // `queued` holder may legitimately be waiting on capacity, whereas a `running`
 // holder has already had its liveness independently evaluated every ~30s.
 export const STALE_RUNNING_ISSUE_LOCK_MS = 2 * 60 * 60 * 1000;
+// The activity columns are independent stamps, not a priority chain: a run can
+// emit output without recording a useful action, so lastUsefulActionAt may be
+// hours older than lastOutputAt on a perfectly live run. Selecting the *newest*
+// valid timestamp is therefore the only safe reading — a `??` chain returns the
+// first non-null, which lets a stale lastUsefulActionAt mask recent output and
+// classify a live run as silent. Mirrors silenceStartedAtForRun() below, and
+// matches nonLiveExecutionHoldSince()'s latestDate() in productivity-review.ts.
+// NaN dates are dropped rather than propagated, so one bad row cannot poison
+// the comparison into never tripping.
+function latestRunActivityAt(...values: Array<Date | string | null | undefined>) {
+  const times = values
+    .map((value) => (value == null ? null : value instanceof Date ? value : new Date(value)))
+    .filter((value): value is Date => value !== null && !Number.isNaN(value.getTime()))
+    .map((value) => value.getTime());
+  return times.length > 0 ? new Date(Math.max(...times)) : null;
+}
 const ACTIVE_RUN_OUTPUT_EVIDENCE_TAIL_BYTES = 8 * 1024;
 // BLO-7113: re-fire suppression for `stale_active_run_evaluation` wrappers.
 // When the underlying `runs.status='running'` row is the canonical
@@ -7861,7 +7880,11 @@ export function recoveryService(
       // A `running` row that has not stamped any signal yet is anomalous, but it
       // is also the shape of a run mid-claim, so fall back to the lock timestamp
       // rather than clearing a lock that was taken seconds ago.
-      return run.lastUsefulActionAt ?? run.lastOutputAt ?? run.startedAt ?? lockedAt;
+      return latestRunActivityAt(
+        run.lastUsefulActionAt,
+        run.lastOutputAt,
+        run.startedAt,
+      ) ?? lockedAt;
     };
     const isRunningLockSilent = (runId: string | null, lockedAt: Date | null) => {
       const basis = runningLockStaleBasis(runId, lockedAt);
@@ -7992,7 +8015,12 @@ export function recoveryService(
           if (!runId) return null;
           const run = currentRunById.get(runId);
           if (run?.status !== "running") return null;
-          return run.lastUsefulActionAt ?? run.lastOutputAt ?? run.startedAt ?? lockedAt;
+          // Newest signal, not first non-null — see latestRunActivityAt.
+          return latestRunActivityAt(
+            run.lastUsefulActionAt,
+            run.lastOutputAt,
+            run.startedAt,
+          ) ?? lockedAt;
         };
         const currentRunningLockSilent = (runId: string | null, lockedAt: Date | null) => {
           const basis = currentRunningLockStaleBasis(runId, lockedAt);
