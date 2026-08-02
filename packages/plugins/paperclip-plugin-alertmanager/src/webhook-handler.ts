@@ -9,7 +9,12 @@
 
 import { timingSafeEqual } from "node:crypto";
 import type { PluginContext, PluginWebhookInput } from "@paperclipai/plugin-sdk";
-import { ACCEPTED_SCHEMA_VERSIONS, STATE_KEYS, WEBHOOK_KEYS } from "./constants.js";
+import {
+  ACCEPTED_SCHEMA_VERSIONS,
+  WEBHOOK_KEYS,
+  alertStateRef,
+  legacyInstanceAlertStateRef,
+} from "./constants.js";
 import {
   alertMatchesLabelFilter,
   buildIssueDescription,
@@ -32,6 +37,28 @@ export class WebhookUnauthorizedError extends Error {
   constructor(message = "unauthorized") {
     super(message);
     this.name = "WebhookUnauthorizedError";
+  }
+}
+
+/**
+ * Raised after the per-alert loop when at least one alert in the batch could not
+ * be processed, so that the delivery fails and Alertmanager retries it.
+ *
+ * Alerts are caught individually to keep batch isolation — one poisoned alert
+ * must not abandon its siblings — but "isolated" must not become "acknowledged".
+ * Returning normally makes the host record `success` and answer HTTP 200
+ * (`server/src/routes/plugins.ts` "Step 8"), which ends Alertmanager's retries
+ * for a delivery that produced no durable issue or state row.
+ */
+export class AlertDeliveryIncompleteError extends Error {
+  readonly fingerprints: readonly string[];
+
+  constructor(fingerprints: readonly string[]) {
+    super(
+      `${fingerprints.length} alert(s) in this delivery could not be processed (${fingerprints.join(", ")}) — failing the delivery so Alertmanager retries`,
+    );
+    this.name = "AlertDeliveryIncompleteError";
+    this.fingerprints = fingerprints;
   }
 }
 
@@ -97,6 +124,45 @@ export function isAlertmanagerPayload(
 }
 
 /**
+ * Read a fingerprint's dedup row from its owning company's scope, migrating a
+ * pre-BLO-20467 instance-scoped row on first sight.
+ *
+ * The migration is gated on `paperclipCompanyId`: a legacy row is adopted only
+ * by the company whose issue it actually tracks. A row belonging to another
+ * tenant is ignored (and left in place), which is precisely the cross-tenant
+ * reuse this change exists to stop. Without the read-through, every alert
+ * firing at upgrade time would look new — duplicating live issues and orphaning
+ * the originals so their resolution could never close them.
+ */
+async function readAlertState(
+  ctx: PluginContext,
+  companyId: string,
+  fingerprint: string,
+): Promise<{ ref: ReturnType<typeof alertStateRef>; record: AlertStateRecord | null }> {
+  const ref = alertStateRef(companyId, fingerprint);
+  const scoped = (await ctx.state.get(ref)) as AlertStateRecord | null;
+  if (scoped) return { ref, record: scoped };
+
+  const legacyRef = legacyInstanceAlertStateRef(fingerprint);
+  const legacy = (await ctx.state.get(legacyRef)) as AlertStateRecord | null;
+  if (legacy && legacy.paperclipCompanyId === companyId) {
+    await ctx.state.set(ref, legacy);
+    try {
+      await ctx.state.delete(legacyRef);
+    } catch (err) {
+      // The scoped copy is already durable, so the migration has taken effect;
+      // a stale legacy row is inert (only this company could ever adopt it, and
+      // it will never be read again now that the scoped row exists).
+      ctx.logger.warn(
+        `paperclip-plugin-alertmanager: migrated alert ${fingerprint} to company scope but could not remove the legacy row: ${String(err)}`,
+      );
+    }
+    return { ref, record: legacy };
+  }
+  return { ref, record: null };
+}
+
+/**
  * §8.1 — first time we see a fingerprint, create an issue. On re-fire, just
  * bump `lastFiredAt` and re-emit the firing event. On re-fire after a manual
  * close, re-open the existing issue (§8.3 option A).
@@ -106,11 +172,33 @@ export async function handleFiring(
   config: AlertmanagerPluginConfig,
   alert: AlertmanagerAlert,
 ): Promise<void> {
-  const stateRef = {
-    scopeKind: "instance" as const,
-    stateKey: STATE_KEYS.alert(alert.fingerprint),
-  };
-  const existing = (await ctx.state.get(stateRef)) as AlertStateRecord | null;
+  // Resolved up front because it now scopes the state read, not just issue
+  // creation. Without it there is no namespace to look in, so a delivery that
+  // could not have created an issue anyway is dropped here instead of after a
+  // guaranteed-miss lookup.
+  const companyId = config.defaultCompanyId;
+  if (!companyId) {
+    ctx.logger.warn(
+      `Cannot track alert ${alert.fingerprint}: defaultCompanyId not configured`,
+    );
+    return;
+  }
+  const { ref: stateRef, record: stateRecord } = await readAlertState(
+    ctx,
+    companyId,
+    alert.fingerprint,
+  );
+  // BLO-20467: `issues.create` below commits before its `state.set`, so a
+  // state-store failure in between leaves a real issue with no state row. That
+  // delivery now fails (rather than being acknowledged), so Alertmanager
+  // retries it — and a retry that trusted the state miss would file a *second*
+  // issue for the same fingerprint, turning a repeating state-store outage into
+  // a duplicate-issue storm. Reconciling against the issue the previous attempt
+  // already created is what makes the retry idempotent.
+  //
+  // This is the same `state ?? recover-from-issue` fallback the resolved path
+  // has always used; only the firing path was missing it.
+  const existing = stateRecord ?? (await recoverStateFromIssue(ctx, config, alert));
   const nowIso = new Date().toISOString();
   const alertname = alert.labels.alertname ?? "UnnamedAlert";
   const severity = alert.labels.severity ?? "unknown";
@@ -193,15 +281,8 @@ export async function handleFiring(
     return;
   }
 
-  // First time we've seen this fingerprint — create a new issue.
-  const companyId = config.defaultCompanyId;
-  if (!companyId) {
-    ctx.logger.warn(
-      `Cannot create issue for alert ${alert.fingerprint}: defaultCompanyId not configured`,
-    );
-    return;
-  }
-
+  // First time we've seen this fingerprint — create a new issue. `companyId` is
+  // already resolved and non-empty; it scoped the state read above.
   const { assigneeUserId, assigneeAgentId, resolution } =
     await resolveAssigneeUserId(ctx, alert, config.ownerMap);
   const issueRouteResolution = resolveIssueRoute(alert, config.issueRouteMap);
@@ -322,16 +403,37 @@ export async function handleFiring(
  * §8.2 — alert cleared. If we have state for the fingerprint, close or
  * comment per `autoCloseOnResolve`. If not, log and drop.
  */
+async function ensureResolutionComment(
+  ctx: PluginContext,
+  issueId: string,
+  companyId: string,
+  resolvedAt: string,
+) {
+  const body = `Alert resolved at ${resolvedAt}.`;
+  const comments = await ctx.issues.listComments(issueId, companyId);
+  if (comments.some((comment) => comment.body === body)) return;
+  await ctx.issues.createComment(issueId, body, companyId);
+}
+
 export async function handleResolved(
   ctx: PluginContext,
   config: AlertmanagerPluginConfig,
   alert: AlertmanagerAlert,
 ): Promise<void> {
-  const stateRef = {
-    scopeKind: "instance" as const,
-    stateKey: STATE_KEYS.alert(alert.fingerprint),
-  };
-  const stateRecord = (await ctx.state.get(stateRef)) as AlertStateRecord | null;
+  // Same scoping rule as handleFiring: without a company there is no namespace
+  // to look in, and `recoverStateFromIssue` could not query either.
+  const companyId = config.defaultCompanyId;
+  if (!companyId) {
+    ctx.logger.warn(
+      `Cannot resolve alert ${alert.fingerprint}: defaultCompanyId not configured`,
+    );
+    return;
+  }
+  const { ref: stateRef, record: stateRecord } = await readAlertState(
+    ctx,
+    companyId,
+    alert.fingerprint,
+  );
   const existing = stateRecord ?? (await recoverStateFromIssue(ctx, config, alert));
   if (!existing) {
     ctx.logger.info(
@@ -343,29 +445,24 @@ export async function handleResolved(
   const resolvedAt = alert.endsAt || new Date().toISOString();
   const alertname = existing.alertname;
 
-  try {
-    if (config.autoCloseOnResolve !== false) {
-      const issue = await ctx.issues.get(
+  if (config.autoCloseOnResolve !== false) {
+    const issue = await ctx.issues.get(
+      existing.paperclipIssueId,
+      existing.paperclipCompanyId,
+    );
+    if (issue && issue.status !== "done" && issue.status !== "cancelled") {
+      await ctx.issues.update(
         existing.paperclipIssueId,
-        existing.paperclipCompanyId,
-      );
-      if (issue && issue.status !== "done" && issue.status !== "cancelled") {
-        await ctx.issues.update(
-          existing.paperclipIssueId,
-          { status: "cancelled" },
-          existing.paperclipCompanyId,
-        );
-      }
-    } else {
-      await ctx.issues.createComment(
-        existing.paperclipIssueId,
-        `Alert resolved at ${resolvedAt}.`,
+        { status: "cancelled" },
         existing.paperclipCompanyId,
       );
     }
-  } catch (err) {
-    ctx.logger.warn(
-      `Failed to apply resolution to issue ${existing.paperclipIssueId}: ${String(err)}`,
+  } else {
+    await ensureResolutionComment(
+      ctx,
+      existing.paperclipIssueId,
+      existing.paperclipCompanyId,
+      resolvedAt,
     );
   }
 
@@ -375,13 +472,7 @@ export async function handleResolved(
   // exhausted because the alert kept firing, not because the underlying
   // issue's status policy says so, so a resolved alert means its membership
   // in the shared cover is done either way.
-  try {
-    await recordSourceResolvedAndCloseCovers(ctx, existing.paperclipCompanyId, existing.paperclipIssueId);
-  } catch (err) {
-    ctx.logger.warn(
-      `Failed to record resolution against escalation covers for issue ${existing.paperclipIssueId}: ${String(err)}`,
-    );
-  }
+  await recordSourceResolvedAndCloseCovers(ctx, existing.paperclipCompanyId, existing.paperclipIssueId);
 
   const updated: AlertStateRecord = {
     ...existing,
@@ -436,6 +527,21 @@ async function recoverStateFromIssue(
     firstSeenAt: alert.startsAt || new Date().toISOString(),
     lastFiredAt: alert.startsAt || new Date().toISOString(),
     resolvedAt: null,
+    // BLO-20467: arm the ladder on the recovered record. The firing path now
+    // adopts this when state was lost, and the re-fire branch carries these
+    // fields through unchanged for a still-firing alert — so leaving them unset
+    // would silently disarm escalation for exactly the alert whose state we
+    // just had to reconstruct. Ladder progress made before the state loss is
+    // not recoverable from the issue, so this restarts the ladder rather than
+    // resuming it: a late page beats no page. Inert on the resolved path, which
+    // overwrites both fields.
+    nextEscalationAt: (() => {
+      const delay = escalationDeadlineMs(alert, config);
+      return delay === null ? null : new Date(Date.now() + delay).toISOString();
+    })(),
+    escalationAttempt: 0,
+    escalationComplete: false,
+    escalationIntervalMs: escalationDeadlineMs(alert, config),
   };
 }
 
@@ -443,7 +549,14 @@ async function recoverStateFromIssue(
  * Top-level webhook handler. Pure-ish: takes ctx + config + token + input,
  * returns void. Throws `WebhookUnauthorizedError` when the bearer token
  * fails verification — the worker's onWebhook re-throws this so the host
- * can surface a 401 / drop the delivery.
+ * can surface a 401 / drop the delivery. Throws `AlertDeliveryIncompleteError`
+ * when any alert in the batch failed to process, so the host records the
+ * delivery `failed` and Alertmanager retries it.
+ *
+ * Returning normally is an acknowledgement: it makes the host answer HTTP 200
+ * and ends Alertmanager's retries. Only do that when the delivery needs no
+ * retry — a malformed or unsupported-version payload, or a filtered alert —
+ * never when something that could succeed later has failed.
  */
 export async function handleWebhook(
   ctx: PluginContext,
@@ -485,6 +598,8 @@ export async function handleWebhook(
     return;
   }
 
+  const failedFingerprints: string[] = [];
+
   for (const alert of body.alerts) {
     if (!alertMatchesLabelFilter(alert, config.acceptOnlyLabels)) {
       await ctx.metrics.write("alertmanager.webhook.filtered", 1, {
@@ -505,14 +620,36 @@ export async function handleWebhook(
         );
       }
     } catch (err) {
-      // Spec §5.2 step 3: log + 200 on schema mismatch; same principle
-      // here — don't let a single bad alert poison the whole batch.
+      // Catch per alert so one failure cannot abandon the rest of the batch —
+      // but record it, because the delivery is NOT complete. Spec §5.2 step 3's
+      // "log + 200" applies to a *malformed payload*, which is handled above and
+      // is permanent; these failures are issue-RPC, state-store, event, and
+      // metric errors, which are transient. Swallowing them answered HTTP 200,
+      // so Alertmanager stopped retrying and the alert was destroyed with no
+      // durable issue or state row — the same silent-loss class as the outage
+      // this plugin already suffered (BLO-20467).
       ctx.logger.error(
         `paperclip-plugin-alertmanager: error processing alert ${alert.fingerprint}: ${String(err)}`,
       );
-      await ctx.metrics.write("alertmanager.alert.error", 1, {
-        alertname: alert.labels.alertname ?? "unknown",
-      });
+      failedFingerprints.push(alert.fingerprint);
+      try {
+        await ctx.metrics.write("alertmanager.alert.error", 1, {
+          alertname: alert.labels.alertname ?? "unknown",
+        });
+      } catch (metricErr) {
+        // Telemetry is best-effort; a metrics outage must not be the thing that
+        // aborts the remaining alerts. The delivery already counts as failed.
+        ctx.logger.error(
+          `paperclip-plugin-alertmanager: failed to record alert error metric for ${alert.fingerprint}: ${String(metricErr)}`,
+        );
+      }
     }
+  }
+
+  if (failedFingerprints.length > 0) {
+    // Replaying the whole batch is safe: handleFiring/handleResolved both key
+    // off the stored per-fingerprint alert state, so alerts that already
+    // succeeded update their existing issue rather than filing a duplicate.
+    throw new AlertDeliveryIncompleteError(failedFingerprints);
   }
 }

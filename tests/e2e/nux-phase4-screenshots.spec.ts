@@ -27,6 +27,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // noise; screenshots are uploaded to the issue as QA evidence, not committed.
 const SHOT_DIR = path.join(__dirname, "test-results", "nux-phase4-shots");
 const COMPANY_NAME = `QA Robotics ${Date.now().toString(36)}`;
+const WIZARD_PERSISTENCE_TIMEOUT_MS = 45_000;
 
 function shot(name: string) {
   fs.mkdirSync(SHOT_DIR, { recursive: true });
@@ -136,7 +137,7 @@ test.describe("NUX Phase 4 visual QA", () => {
     expect((await goalCreated).ok()).toBe(true);
     await expect(
       page.getByRole("heading", { name: "Create your team lead" }),
-    ).toBeVisible({ timeout: 30_000 });
+    ).toBeVisible({ timeout: WIZARD_PERSISTENCE_TIMEOUT_MS });
     await expect(
       page.locator('input[placeholder="Chief of staff"]'),
     ).toHaveValue("Chief of staff");

@@ -405,21 +405,21 @@ export async function autoConfigureAlertmanagerFromEnv(ctx: BootstrapContext): P
 
     const config = (await configRes.json()) as { configJson?: Record<string, unknown> | null };
     const existing = config?.configJson ?? {};
-    // Operator already wired the production secret-ref path; respect it instead
-    // of stamping the inline env value back on top every restart.
-    const usesSecretRef =
-      typeof existing.webhookTokenRef === "string" && existing.webhookTokenRef.length > 0;
+    // The worker-side secret-ref path fails closed until host-side verification
+    // exists, so an env-provided token should repair even ref-only configs by
+    // adding the enabled inline token. Keep the ref in place as metadata for a
+    // future host-side verifier, but do not let it suppress bootstrap.
     const nextConfig = {
       ...existing,
       defaultCompanyId:
         typeof existing.defaultCompanyId === "string" && existing.defaultCompanyId.length > 0
           ? existing.defaultCompanyId
           : companyId,
-      ...(usesSecretRef ? {} : { webhookToken }),
+      webhookToken,
     };
     if (
       nextConfig.defaultCompanyId === existing.defaultCompanyId &&
-      (usesSecretRef || existing.webhookToken === webhookToken)
+      existing.webhookToken === webhookToken
     ) return;
 
     await ctx.fetchInternal(`${ctx.baseUrl}/api/plugins/${amPlugin.id}/config`, {
