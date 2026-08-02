@@ -3,7 +3,7 @@ import { mkdirSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import {
   agents,
   companies,
@@ -73,6 +73,28 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
     return companyId;
   }
 
+  async function seedAgentRow(
+    companyId: string,
+    overrides: Partial<typeof agents.$inferInsert>,
+  ) {
+    const id = randomUUID();
+    await db.insert(agents).values({
+      id,
+      companyId,
+      name: `Agent ${id.slice(0, 8)}`,
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+      spentMonthlyCents: 0,
+      lastHeartbeatAt: null,
+      ...overrides,
+    });
+    return id;
+  }
+
   it("enforces external-lifecycle concurrency at the persistence boundary", async () => {
     const companyId = await seedCompany();
     const agents = agentService(db);
@@ -135,6 +157,91 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
     expect(switched).toMatchObject({
       adapterType: "opencode_k8s",
       runtimeConfig: { heartbeat: { maxConcurrentRuns: 15 } },
+    });
+  });
+
+  it("normalizes missing external-lifecycle concurrency on service update and activation", async () => {
+    const companyId = await seedCompany();
+    const service = agentService(db);
+
+    const externalId = await seedAgentRow(companyId, {
+      name: "Legacy External",
+      adapterType: "opencode_k8s",
+      runtimeConfig: {},
+    });
+    const updated = await service.update(externalId, { runtimeConfig: {} });
+    expect(updated).toMatchObject({
+      adapterType: "opencode_k8s",
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 16 } },
+    });
+
+    const switchId = await seedAgentRow(companyId, {
+      name: "Legacy Local",
+      adapterType: "codex_local",
+      runtimeConfig: {},
+    });
+    const switched = await service.update(switchId, { adapterType: "opencode_k8s" });
+    expect(switched).toMatchObject({
+      adapterType: "opencode_k8s",
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 16 } },
+    });
+
+    const pendingId = await seedAgentRow(companyId, {
+      name: "Pending External",
+      status: "pending_approval",
+      adapterType: "opencode_k8s",
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 15 } },
+    });
+    const activated = await service.activatePendingApproval(pendingId, { runtimeConfig: {} });
+    expect(activated).toMatchObject({
+      activated: true,
+      agent: {
+        adapterType: "opencode_k8s",
+        runtimeConfig: { heartbeat: { maxConcurrentRuns: 16 } },
+      },
+    });
+  });
+
+  it("validates external-lifecycle concurrency against the locked row after concurrent updates", async () => {
+    const companyId = await seedCompany();
+    const agentId = await seedAgentRow(companyId, {
+      name: "Concurrent Local",
+      adapterType: "codex_local",
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 15 } },
+    });
+
+    let pendingUpdate!: Promise<{ status: "resolved"; value: unknown } | { status: "rejected"; error: unknown }>;
+    await db.transaction(async (tx) => {
+      await tx.execute(sql`select ${agents.id} from ${agents} where ${agents.id} = ${agentId} for update`);
+      pendingUpdate = agentService(db)
+        .update(agentId, { adapterType: "opencode_k8s" })
+        .then(
+          (value) => ({ status: "resolved" as const, value }),
+          (error) => ({ status: "rejected" as const, error }),
+        );
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      await tx
+        .update(agents)
+        .set({
+          runtimeConfig: { heartbeat: { maxConcurrentRuns: 50 } },
+          updatedAt: new Date(),
+        })
+        .where(eq(agents.id, agentId));
+    });
+
+    const result = await pendingUpdate;
+    expect(result.status).toBe("rejected");
+    if (result.status !== "rejected") return;
+    expect(result.error).toMatchObject({ status: 422 });
+
+    const row = await db
+      .select({ adapterType: agents.adapterType, runtimeConfig: agents.runtimeConfig })
+      .from(agents)
+      .where(eq(agents.id, agentId))
+      .then((rows) => rows[0]);
+    expect(row).toMatchObject({
+      adapterType: "codex_local",
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 50 } },
     });
   });
 

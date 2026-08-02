@@ -217,6 +217,26 @@ function assertExternalLifecycleConcurrencyPolicy(adapterType: string, runtimeCo
   }
 }
 
+function normalizeExternalLifecycleRuntimeConfig(
+  adapterType: string,
+  runtimeConfig: unknown,
+): Record<string, unknown> {
+  const normalizedRuntimeConfig = isPlainRecord(runtimeConfig) ? { ...runtimeConfig } : {};
+  if (!EXTERNAL_LIFECYCLE_ADAPTER_TYPE_SET.has(adapterType)) {
+    return normalizedRuntimeConfig;
+  }
+
+  const heartbeat = isPlainRecord(normalizedRuntimeConfig.heartbeat)
+    ? { ...normalizedRuntimeConfig.heartbeat }
+    : {};
+  if (parseFiniteNumberLike(heartbeat.maxConcurrentRuns) == null) {
+    heartbeat.maxConcurrentRuns = EXTERNAL_LIFECYCLE_MAX_CONCURRENT_RUNS;
+  }
+  normalizedRuntimeConfig.heartbeat = heartbeat;
+  assertExternalLifecycleConcurrencyPolicy(adapterType, normalizedRuntimeConfig);
+  return normalizedRuntimeConfig;
+}
+
 function normalizeRuntimeConfigForNewAgent(
   runtimeConfig: unknown,
   adapterType: string,
@@ -231,8 +251,7 @@ function normalizeRuntimeConfigForNewAgent(
       : AGENT_DEFAULT_MAX_CONCURRENT_RUNS;
   }
   normalizedRuntimeConfig.heartbeat = heartbeat;
-  assertExternalLifecycleConcurrencyPolicy(adapterType, normalizedRuntimeConfig);
-  return normalizedRuntimeConfig;
+  return normalizeExternalLifecycleRuntimeConfig(adapterType, normalizedRuntimeConfig);
 }
 
 function diffConfigSnapshot(
@@ -569,20 +588,63 @@ export function agentService(db: Db) {
       );
     }
 
-    const shouldRecordRevision = Boolean(options?.recordRevision) && hasConfigPatchFields(normalizedPatch);
-    const beforeConfig = shouldRecordRevision ? buildConfigSnapshot(existing) : null;
-
     return db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
+      await tx.execute(sql`select ${agents.id} from ${agents} where ${agents.id} = ${id} for update`);
+      const locked = await tx
+        .select()
+        .from(agents)
+        .where(eq(agents.id, id))
+        .then((rows) => rows[0] ?? null);
+      if (!locked) return null;
+
+      if (locked.status === "terminated" && data.status && data.status !== "terminated") {
+        throw conflict("Terminated agents cannot be resumed");
+      }
+      if (
+        locked.status === "pending_approval" &&
+        data.status &&
+        data.status !== "pending_approval" &&
+        data.status !== "terminated"
+      ) {
+        throw conflict("Pending approval agents cannot be activated directly");
+      }
+      if (locked.status === "pending_approval" && !options?.allowPendingApprovalConfigUpdate) {
+        const changedFields = changedPendingApprovalConfigFields(locked as typeof agents.$inferSelect, data);
+        if (changedFields.length > 0) {
+          throw conflict("Pending approval agent configuration cannot be changed before board approval", {
+            code: "pending_approval_agent_config_frozen",
+            agentId: id,
+            fields: changedFields,
+          });
+        }
+      }
+
+      const txPatch = { ...normalizedPatch };
+      if (
+        Object.prototype.hasOwnProperty.call(txPatch, "adapterType")
+        || Object.prototype.hasOwnProperty.call(txPatch, "runtimeConfig")
+      ) {
+        const nextAdapterType = (txPatch.adapterType ?? locked.adapterType) as string;
+        txPatch.runtimeConfig = normalizeExternalLifecycleRuntimeConfig(
+          nextAdapterType,
+          Object.prototype.hasOwnProperty.call(txPatch, "runtimeConfig")
+            ? txPatch.runtimeConfig
+            : locked.runtimeConfig,
+        );
+      }
+
+      const shouldRecordRevision = Boolean(options?.recordRevision) && hasConfigPatchFields(txPatch);
+      const beforeConfig = shouldRecordRevision ? buildConfigSnapshot(locked) : null;
       const updated = await tx
         .update(agents)
-        .set({ ...normalizedPatch, updatedAt: new Date() })
+        .set({ ...txPatch, updatedAt: new Date() })
         .where(eq(agents.id, id))
         .returning()
         .then((rows) => rows[0] ?? null);
       if (!updated) return null;
 
-      if (Object.prototype.hasOwnProperty.call(normalizedPatch, "adapterConfig")) {
+      if (Object.prototype.hasOwnProperty.call(txPatch, "adapterConfig")) {
         await syncAgentSecretBindings(updated, txDb);
       }
 
@@ -846,10 +908,19 @@ export function agentService(db: Db) {
             (patch.role ?? existing.role) as string,
           );
         }
-        assertExternalLifecycleConcurrencyPolicy(
-          (patch.adapterType ?? existing.adapterType) as string,
-          patch.runtimeConfig ?? existing.runtimeConfig,
+        const nextAdapterType = (patch.adapterType ?? existing.adapterType) as string;
+        const normalizedRuntimeConfig = normalizeExternalLifecycleRuntimeConfig(
+          nextAdapterType,
+          Object.prototype.hasOwnProperty.call(patch, "runtimeConfig")
+            ? patch.runtimeConfig
+            : existing.runtimeConfig,
         );
+        if (
+          Object.prototype.hasOwnProperty.call(patch, "runtimeConfig")
+          || EXTERNAL_LIFECYCLE_ADAPTER_TYPE_SET.has(nextAdapterType)
+        ) {
+          patch.runtimeConfig = normalizedRuntimeConfig;
+        }
         const updated = await tx
           .update(agents)
           .set({ ...patch, status: "idle", updatedAt: new Date() })

@@ -127,6 +127,17 @@ const externalAdapter: ServerAdapterModule = {
   }),
 };
 
+const opencodeK8sAdapter: ServerAdapterModule = {
+  ...externalAdapter,
+  type: "opencode_k8s",
+  testEnvironment: async () => ({
+    adapterType: "opencode_k8s",
+    status: "pass",
+    checks: [],
+    testedAt: new Date(0).toISOString(),
+  }),
+};
+
 const missingAdapterType = "missing_adapter_validation_test";
 
 async function createApp() {
@@ -272,12 +283,16 @@ describe("agent routes adapter validation", () => {
       ...(await mockAgentService.getById()),
       ...patch,
     }));
+    const { registerServerAdapter } = await import("../adapters/index.js");
     await unregisterTestAdapter("external_test");
+    await unregisterTestAdapter("opencode_k8s");
     await unregisterTestAdapter(missingAdapterType);
+    registerServerAdapter(opencodeK8sAdapter);
   });
 
   afterEach(async () => {
     await unregisterTestAdapter("external_test");
+    await unregisterTestAdapter("opencode_k8s");
     await unregisterTestAdapter(missingAdapterType);
   });
 
@@ -366,6 +381,51 @@ describe("agent routes adapter validation", () => {
 
     expect(res.status, JSON.stringify(res.body)).toBe(422);
     expect(mockAgentService.update).not.toHaveBeenCalled();
+  });
+
+  it("normalizes empty runtime updates for existing external-lifecycle agents", async () => {
+    mockAgentService.getById.mockResolvedValue({
+      ...(await mockAgentService.getById()),
+      adapterType: "opencode_k8s",
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 15, wakeOnDemand: true } },
+    });
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl)
+        .patch("/api/agents/11111111-1111-4111-8111-111111111111")
+        .send({ runtimeConfig: {} }),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockAgentService.update.mock.calls.at(-1)?.[1]).toEqual(expect.objectContaining({
+      runtimeConfig: expect.objectContaining({
+        heartbeat: expect.objectContaining({ maxConcurrentRuns: 16 }),
+      }),
+    }));
+  });
+
+  it("normalizes partial runtime updates for external-lifecycle agents without a concurrency field", async () => {
+    mockAgentService.getById.mockResolvedValue({
+      ...(await mockAgentService.getById()),
+      adapterType: "opencode_k8s",
+      runtimeConfig: {},
+    });
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl)
+        .patch("/api/agents/11111111-1111-4111-8111-111111111111")
+        .send({ runtimeConfig: { heartbeat: { wakeOnDemand: true } } }),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockAgentService.update.mock.calls.at(-1)?.[1]).toEqual(expect.objectContaining({
+      runtimeConfig: expect.objectContaining({
+        heartbeat: expect.objectContaining({
+          maxConcurrentRuns: 16,
+          wakeOnDemand: true,
+        }),
+      }),
+    }));
   });
 
   it("does not inject CODEX_HOME or OPENAI_API_KEY when creating a keyless codex_local agent", async () => {

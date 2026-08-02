@@ -1297,6 +1297,26 @@ export function agentRoutes(
     }
   }
 
+  function normalizeExternalLifecycleRuntimeConfig(
+    adapterType: string,
+    runtimeConfig: unknown,
+  ): Record<string, unknown> {
+    const parsedRuntimeConfig = asRecord(runtimeConfig);
+    const normalizedRuntimeConfig = parsedRuntimeConfig ? { ...parsedRuntimeConfig } : {};
+    if (!EXTERNAL_LIFECYCLE_ADAPTER_TYPE_SET.has(adapterType)) {
+      return normalizedRuntimeConfig;
+    }
+
+    const parsedHeartbeat = asRecord(normalizedRuntimeConfig.heartbeat);
+    const heartbeat = parsedHeartbeat ? { ...parsedHeartbeat } : {};
+    if (parseNumberLike(heartbeat.maxConcurrentRuns) == null) {
+      heartbeat.maxConcurrentRuns = EXTERNAL_LIFECYCLE_MAX_CONCURRENT_RUNS;
+    }
+    normalizedRuntimeConfig.heartbeat = heartbeat;
+    assertExternalLifecycleConcurrencyPolicy(adapterType, normalizedRuntimeConfig);
+    return normalizedRuntimeConfig;
+  }
+
   function normalizeNewAgentRuntimeConfig(runtimeConfig: unknown, adapterType: string): Record<string, unknown> {
     const parsedRuntimeConfig = asRecord(runtimeConfig);
     const normalizedRuntimeConfig = parsedRuntimeConfig ? { ...parsedRuntimeConfig } : {};
@@ -1313,7 +1333,7 @@ export function agentRoutes(
     }
 
     normalizedRuntimeConfig.heartbeat = heartbeat;
-    return normalizedRuntimeConfig;
+    return normalizeExternalLifecycleRuntimeConfig(adapterType, normalizedRuntimeConfig);
   }
 
   function mergeRuntimeConfigPatchForAgentUpdate(
@@ -3352,10 +3372,16 @@ export function agentRoutes(
       assertNoAgentRuntimeConfigAdapterConfigMutation(req, requestedRuntimeConfig);
     }
     if (requestedRuntimeConfig || requestedAdapterType !== existing.adapterType) {
-      assertExternalLifecycleConcurrencyPolicy(
+      requestedRuntimeConfig = normalizeExternalLifecycleRuntimeConfig(
         requestedAdapterType,
         requestedRuntimeConfig ?? existing.runtimeConfig,
       );
+      if (
+        hasOwn(patchData, "runtimeConfig")
+        || EXTERNAL_LIFECYCLE_ADAPTER_TYPE_SET.has(requestedAdapterType)
+      ) {
+        patchData.runtimeConfig = requestedRuntimeConfig;
+      }
     }
     const touchesAdapterConfiguration =
       hasOwn(patchData, "adapterType") ||
