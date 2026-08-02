@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { APPROVAL_TYPES } from "../constants.js";
+import { APPROVAL_STATUSES, APPROVAL_TYPES } from "../constants.js";
 import { multilineTextSchema } from "./text.js";
 
 const approvalTitleMessage =
@@ -18,9 +18,34 @@ export const createApprovalSchema = z.object({
   requestedByAgentId: z.string().uuid().optional().nullable(),
   payload: approvalPayloadSchema,
   issueIds: z.array(z.string().uuid()).optional(),
+  idempotencyKey: z
+    .string()
+    .trim()
+    .min(1)
+    .max(255)
+    .describe(
+      "Dedupe token. A second create with the same key, from the same requester, while the first is still undecided replays the original approval instead of filing a duplicate.",
+    )
+    .optional()
+    .nullable(),
 });
 
 export type CreateApproval = z.infer<typeof createApprovalSchema>;
+
+/**
+ * Query parameters for listing approvals. `view=summary` omits the `payload` body,
+ * which is what makes a pre-file existence check cheap enough to be worth doing.
+ */
+export const listApprovalsQuerySchema = z.object({
+  status: z.enum(APPROVAL_STATUSES).optional(),
+  type: z.enum(APPROVAL_TYPES).optional(),
+  issueId: z.string().uuid().optional(),
+  requestedByAgentId: z.string().uuid().optional(),
+  idempotencyKey: z.string().trim().min(1).max(255).optional(),
+  view: z.enum(["full", "summary", "count"]).optional().default("full"),
+});
+
+export type ListApprovalsQuery = z.infer<typeof listApprovalsQuerySchema>;
 
 export const resolveApprovalSchema = z.object({
   decisionNote: multilineTextSchema.optional().nullable(),

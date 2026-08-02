@@ -509,11 +509,29 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     ),
     makeTool(
       "paperclipListApprovals",
-      "List approvals in a company",
-      z.object({ companyId: companyIdOptional, status: z.string().optional() }),
-      async ({ companyId, status }) => {
+      "List approvals in a company. Default view=full returns whole payload bodies and is expensive (hundreds of KB on a busy queue). Before filing a new approval, check for an existing one with view=count or view=summary — summary omits payload and returns a derived, always-populated `label` per row, so a duplicate check costs a fraction of a re-file. Filter by type, issueId, requestedByAgentId, or idempotencyKey to narrow further.",
+      z.object({
+        companyId: companyIdOptional,
+        status: z.string().optional(),
+        type: z.string().optional(),
+        issueId: z.string().uuid().optional().describe("Only approvals linked to this issue"),
+        requestedByAgentId: z.string().uuid().optional(),
+        idempotencyKey: z
+          .string()
+          .optional()
+          .describe("Exact-match probe for a key you are about to reuse"),
+        view: z
+          .enum(["full", "summary", "count"])
+          .optional()
+          .describe("full (default, includes payload) | summary (no payload, adds label) | count"),
+      }),
+      async ({ companyId, ...query }) => {
         const resolved = await client.resolveCompany({ override: companyId });
-        const qs = status ? `?status=${encodeURIComponent(status)}` : "";
+        const params = new URLSearchParams();
+        for (const [key, value] of Object.entries(query)) {
+          if (value !== undefined && value !== null) params.set(key, String(value));
+        }
+        const qs = params.size > 0 ? `?${params.toString()}` : "";
         return client.requestJson("GET", `/companies/${resolved}/approvals${qs}`, {
           companyId: resolved,
         });
@@ -521,7 +539,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     ),
     makeTool(
       "paperclipCreateApproval",
-      "Create a board approval request, optionally linked to one or more issues",
+      "Create a board approval request, optionally linked to one or more issues. Pass idempotencyKey (a stable token derived from the ask itself, e.g. \"rotate-creds:BLO-18969\") so a retry replays the original instead of filing a duplicate: the response then carries deduplicated:true and a statusReadback line telling you the original is still pending. A pending approval emits nothing on its own, so use that readback — or paperclipListApprovals with view=count — instead of re-filing to find out.",
       createApprovalToolSchema,
       async ({ companyId, ...body }) => {
         const resolved = await client.resolveCompany({ override: companyId });

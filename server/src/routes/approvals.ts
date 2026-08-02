@@ -4,6 +4,7 @@ import { heartbeatRuns, type Db } from "@paperclipai/db";
 import {
   addApprovalCommentSchema,
   createApprovalSchema,
+  listApprovalsQuerySchema,
   requestApprovalRevisionSchema,
   resolveApprovalSchema,
   resubmitApprovalSchema,
@@ -119,7 +120,34 @@ export function approvalRoutes(
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     if (!(await assertApprovalAccessAllowed(req, res, companyId))) return;
-    const status = req.query.status as string | undefined;
+
+    const parsed = listApprovalsQuerySchema.safeParse(req.query);
+    if (!parsed.success) {
+      res.status(400).json({ error: "Invalid query", details: parsed.error.flatten() });
+      return;
+    }
+    const { view, status, type, issueId, requestedByAgentId, idempotencyKey } = parsed.data;
+
+    // `count` and `summary` exist so that checking whether an ask is already filed is
+    // cheaper than filing it again. The default `full` view is unchanged.
+    if (view === "count") {
+      const count = await svc.countBy(companyId, { status, type, requestedByAgentId });
+      res.json({ count });
+      return;
+    }
+
+    if (view === "summary") {
+      const rows = await svc.listSummary(companyId, {
+        status,
+        type,
+        issueId,
+        requestedByAgentId,
+        idempotencyKey,
+      });
+      res.json(rows);
+      return;
+    }
+
     const result = await svc.list(companyId, status);
     res.json(result.map((approval) => redactApprovalPayload(approval)));
   });
@@ -162,7 +190,7 @@ export function approvalRoutes(
     }
 
     const actor = getActorInfo(req);
-    const approval = await svc.create(companyId, {
+    const { approval, deduplicated } = await svc.createWithIdempotency(companyId, {
       ...approvalInput,
       payload: normalizedPayload,
       requestedByUserId: actor.actorType === "user" ? actor.actorId : null,
@@ -181,11 +209,37 @@ export function approvalRoutes(
       updatedAt: new Date(),
     });
 
+    // Issue links are applied on both paths. The insert is onConflictDoNothing, so
+    // re-linking the same issues is a no-op, and a retry that names a new issue still
+    // gets it attached rather than silently losing it. What must NOT repeat is the
+    // approval row and the activity log below — the latter is what puts a card in
+    // front of a human, and re-notifying about an ask the board has already been shown
+    // is the exact harm this ticket is about.
     if (uniqueIssueIds.length > 0) {
       await issueApprovalsSvc.linkManyForApproval(approval.id, uniqueIssueIds, {
         agentId: actor.agentId,
         userId: actor.actorType === "user" ? actor.actorId : null,
       });
+    }
+
+    // A replay is not a new filing. Answer with the original plus a readback so the
+    // requester learns it is still pending without having to file again to find out —
+    // silence is otherwise indistinguishable from "not yet decided", which is what
+    // makes retrying the only way to get information, and the queue flood downstream.
+    if (deduplicated) {
+      const pendingForMs = Date.now() - new Date(approval.createdAt).getTime();
+      res.status(200).json({
+        ...redactApprovalPayload(approval),
+        deduplicated: true,
+        deduplicationReason: "idempotency_key",
+        pendingSince: approval.createdAt,
+        pendingForMs,
+        statusReadback:
+          `Approval ${approval.id} (${approval.type}) is still ${approval.status}, filed ` +
+          `${new Date(approval.createdAt).toISOString()} (${Math.floor(pendingForMs / 60000)} min ago). ` +
+          `No duplicate was created.`,
+      });
+      return;
     }
 
     // Surface the approval's human-facing title/description in the activity
