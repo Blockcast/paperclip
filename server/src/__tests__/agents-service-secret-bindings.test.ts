@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { and, eq, sql } from "drizzle-orm";
 import {
   agents,
@@ -21,6 +21,12 @@ import {
 import { agentService } from "../services/agents.ts";
 import { approvalService } from "../services/approvals.ts";
 import { secretService } from "../services/secrets.js";
+
+const mockEnsureBuiltInAgent = vi.hoisted(() => vi.fn());
+
+vi.mock("../services/built-in-agents.js", () => ({
+  builtInAgentService: () => ({ ensure: mockEnsureBuiltInAgent }),
+}));
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -46,6 +52,7 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
   }, 120_000);
 
   afterEach(async () => {
+    mockEnsureBuiltInAgent.mockReset();
     await db.delete(companySecretBindings);
     await db.delete(companySecretVersions);
     await db.delete(companySecrets);
@@ -476,6 +483,104 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
       status: "pending_approval",
       runtimeConfig: { heartbeat: { maxConcurrentRuns: 15 } },
     });
+  });
+
+  it("does not reconcile built-in files before approval database work commits", async () => {
+    const companyId = await seedCompany();
+    const agentId = await seedAgentRow(companyId, {
+      name: "Built-in Approval Rollback",
+      status: "pending_approval",
+      adapterType: "codex_local",
+    });
+    const approvalId = randomUUID();
+    await db.insert(approvals).values({
+      id: approvalId,
+      companyId,
+      type: "hire_agent",
+      status: "pending",
+      requestedByUserId: "requester",
+      payload: {
+        agentId,
+        name: "Built-in Approval Rollback",
+        role: "engineer",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        budgetMonthlyCents: 5000,
+        sourceBuiltInAgentKey: "briefs",
+      },
+      updatedAt: new Date(),
+    });
+    await db.execute(sql`
+      alter table budget_policies
+      add constraint test_reject_approved_hire_budget check (amount < 1)
+    `);
+
+    try {
+      await expect(
+        approvalService(db).approve(approvalId, "board-user", "Approved"),
+      ).rejects.toThrow();
+
+      expect(mockEnsureBuiltInAgent).not.toHaveBeenCalled();
+      await expect(approvalService(db).getById(approvalId)).resolves.toMatchObject({
+        status: "pending",
+      });
+      await expect(agentService(db).getById(agentId)).resolves.toMatchObject({
+        status: "pending_approval",
+        budgetMonthlyCents: 0,
+      });
+    } finally {
+      await db.execute(sql`
+        alter table budget_policies
+        drop constraint test_reject_approved_hire_budget
+      `);
+    }
+  });
+
+  it("retries built-in reconciliation after the approval transaction commits", async () => {
+    const companyId = await seedCompany();
+    const agentId = await seedAgentRow(companyId, {
+      name: "Built-in Reconciliation Retry",
+      status: "pending_approval",
+      adapterType: "codex_local",
+    });
+    const approvalId = randomUUID();
+    await db.insert(approvals).values({
+      id: approvalId,
+      companyId,
+      type: "hire_agent",
+      status: "pending",
+      requestedByUserId: "requester",
+      payload: {
+        agentId,
+        name: "Built-in Reconciliation Retry",
+        role: "engineer",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        budgetMonthlyCents: 0,
+        sourceBuiltInAgentKey: "briefs",
+      },
+      updatedAt: new Date(),
+    });
+    mockEnsureBuiltInAgent
+      .mockRejectedValueOnce(new Error("injected filesystem failure"))
+      .mockResolvedValueOnce(undefined);
+
+    await expect(
+      approvalService(db).approve(approvalId, "board-user", "Approved"),
+    ).rejects.toThrow("injected filesystem failure");
+    await expect(approvalService(db).getById(approvalId)).resolves.toMatchObject({
+      status: "approved",
+    });
+    await expect(agentService(db).getById(agentId)).resolves.toMatchObject({
+      status: "idle",
+    });
+
+    await expect(
+      approvalService(db).approve(approvalId, "board-user", "Approved"),
+    ).resolves.toMatchObject({ applied: false });
+    expect(mockEnsureBuiltInAgent).toHaveBeenCalledTimes(2);
   });
 
   it("creates agent secret bindings when a new agent persists secret_ref env", async () => {

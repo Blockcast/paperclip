@@ -26,12 +26,11 @@ export function approvalService(db: Db) {
   async function reconcileApprovedBuiltInAgent(
     companyId: string,
     payload: Record<string, unknown>,
-    dbClient: Db = db,
   ) {
     const sourceBuiltInAgentKey = typeof payload.sourceBuiltInAgentKey === "string" ? payload.sourceBuiltInAgentKey : null;
     if (!sourceBuiltInAgentKey) return;
     const { builtInAgentService } = await import("./built-in-agents.js");
-    await builtInAgentService(dbClient).ensure(companyId, sourceBuiltInAgentKey);
+    await builtInAgentService(db).ensure(companyId, sourceBuiltInAgentKey);
   }
 
   async function getExistingApproval(id: string, dbClient: Db = db) {
@@ -145,7 +144,6 @@ export function approvalService(db: Db) {
           const payloadAgentId = typeof payload.agentId === "string" ? payload.agentId : null;
           if (payloadAgentId) {
             await txAgentsSvc.activatePendingApproval(payloadAgentId, payload);
-            await reconcileApprovedBuiltInAgent(updated.companyId, payload, txDb);
             hireApprovedAgentId = payloadAgentId;
           } else {
             const created = await txAgentsSvc.create(updated.companyId, {
@@ -192,6 +190,13 @@ export function approvalService(db: Db) {
 
         return { approval: updated, applied, hireApprovedAgentId };
       });
+
+      if (result.approval.type === "hire_agent") {
+        const payload = result.approval.payload as Record<string, unknown>;
+        if (typeof payload.agentId === "string") {
+          await reconcileApprovedBuiltInAgent(result.approval.companyId, payload);
+        }
+      }
 
       if (result.hireApprovedAgentId) {
         void notifyHireApproved(db, {
