@@ -225,6 +225,11 @@ export function collectSecretBearingPaths(
  * disclosing it, and dropping them would break the config form's binding
  * picker. Any non-pointer value at a declared-secret path is masked whatever its
  * type, so an unexpected shape cannot leak through.
+ *
+ * A *declared* secret is masked wholesale, because the author said so
+ * explicitly. A field the heuristic merely suspects is treated more gently: its
+ * structure survives and only the string leaves beneath it are masked, so
+ * `credentials: { user, pass }` keeps its shape while `pass` is covered.
  */
 export function maskPluginConfigJson(
   configJson: unknown,
@@ -233,24 +238,31 @@ export function maskPluginConfigJson(
   if (!isPlainRecord(configJson)) return configJson;
   const { secret, exempt } = collectSecretBearingPaths(schema);
 
-  function maskRecord(record: Record<string, unknown>, prefix: string): Record<string, unknown> {
+  function maskRecord(
+    record: Record<string, unknown>,
+    prefix: string,
+    inSecretContainer: boolean,
+  ): Record<string, unknown> {
     const result: Record<string, unknown> = {};
     for (const [key, value] of Object.entries(record)) {
       const path = prefix ? `${prefix}.${key}` : key;
-      result[key] = maskValue(key, value, path);
+      result[key] = maskValue(key, value, path, inSecretContainer);
     }
     return result;
   }
 
-  function maskValue(key: string, value: unknown, path: string): unknown {
+  function maskValue(
+    key: string,
+    value: unknown,
+    path: string,
+    inSecretContainer: boolean,
+  ): unknown {
     // A pointer names a secret without disclosing it — keep it, minus baggage.
     if (isSecretPointerCandidate(value)) {
       return sanitizeSecretPointer(value) ?? PLUGIN_CONFIG_SECRET_MASK;
     }
 
-    const declared = secret.has(path);
-
-    if (declared) {
+    if (secret.has(path)) {
       // A bare UUID at a declared-secret path is a legacy binding (see
       // `coerceLegacySecretRef`), i.e. a pointer, not a credential.
       if (typeof value === "string" && isUuidSecretRef(value)) return value;
@@ -258,23 +270,32 @@ export function maskPluginConfigJson(
       return PLUGIN_CONFIG_SECRET_MASK;
     }
 
-    if (isPlainRecord(value)) return maskRecord(value, path);
+    // An explicit `x-paperclip-secret: false` wins over the heuristic, and over
+    // a suspicious ancestor.
+    const suspect = exempt.has(path)
+      ? false
+      : inSecretContainer || matchesSecretFieldName(key);
+
+    if (isPlainRecord(value)) return maskRecord(value, path, suspect);
 
     if (Array.isArray(value)) {
-      return value.map((entry, index) =>
-        isPlainRecord(entry) ? maskRecord(entry, `${path}.${index}`) : entry,
-      );
+      return value.map((entry, index) => {
+        if (isPlainRecord(entry)) return maskRecord(entry, `${path}.${index}`, suspect);
+        if (suspect && typeof entry === "string" && entry.length > 0) {
+          return PLUGIN_CONFIG_SECRET_MASK;
+        }
+        return entry;
+      });
     }
 
-    // Undeclared field: fall back to the key-name heuristic, strings only.
-    if (typeof value === "string" && value.length > 0 && !exempt.has(path) && matchesSecretFieldName(key)) {
+    if (suspect && typeof value === "string" && value.length > 0) {
       return PLUGIN_CONFIG_SECRET_MASK;
     }
 
     return value;
   }
 
-  return maskRecord(configJson, "");
+  return maskRecord(configJson, "", false);
 }
 
 /**

@@ -254,3 +254,59 @@ describe("mergeMaskedPluginConfig", () => {
     expect(merged).toEqual(stored);
   });
 });
+
+describe("maskPluginConfigJson — credential-shaped containers", () => {
+  it("masks string leaves inside a credential-named object while keeping its shape", () => {
+    const masked = maskPluginConfigJson({ credentials: { user: "svc", pass: SECRET, port: 8443 } });
+
+    expect(masked).toEqual({
+      credentials: { user: PLUGIN_CONFIG_SECRET_MASK, pass: PLUGIN_CONFIG_SECRET_MASK, port: 8443 },
+    });
+    expect(JSON.stringify(masked)).not.toContain(SECRET);
+  });
+
+  it("masks strings in a credential-named array", () => {
+    const masked = maskPluginConfigJson({ tokens: [SECRET, "second"] });
+
+    expect(masked).toEqual({ tokens: [PLUGIN_CONFIG_SECRET_MASK, PLUGIN_CONFIG_SECRET_MASK] });
+  });
+
+  it("does not let suspicion leak into unrelated sibling subtrees", () => {
+    const masked = maskPluginConfigJson({
+      credentials: { pass: SECRET },
+      transport: { endpoint: "https://example.com" },
+    });
+
+    expect(masked).toEqual({
+      credentials: { pass: PLUGIN_CONFIG_SECRET_MASK },
+      transport: { endpoint: "https://example.com" },
+    });
+  });
+
+  it("lets an explicit exemption override a suspicious ancestor", () => {
+    const masked = maskPluginConfigJson(
+      { credentials: { scheme: "basic", pass: SECRET } },
+      {
+        type: "object",
+        properties: {
+          credentials: {
+            type: "object",
+            properties: { scheme: { type: "string", "x-paperclip-secret": false } },
+          },
+        },
+      },
+    );
+
+    expect(masked).toEqual({
+      credentials: { scheme: "basic", pass: PLUGIN_CONFIG_SECRET_MASK },
+    });
+  });
+
+  it("round-trips a credential container losslessly", () => {
+    const stored = { credentials: { user: "svc", pass: SECRET }, endpoint: "https://example.com" };
+    const masked = maskPluginConfigJson(stored) as Record<string, unknown>;
+
+    expect(JSON.stringify(masked)).not.toContain(SECRET);
+    expect(mergeMaskedPluginConfig(JSON.parse(JSON.stringify(masked)), stored)).toEqual(stored);
+  });
+});
