@@ -875,6 +875,8 @@ type DependabotAlertContext = {
   vulnerableRange: string | null;
   patchedVersion: string | null;
   alertUrl: string | null;
+  dismissalReason: string | null;
+  dismissalComment: string | null;
 };
 
 // created: brand-new advisory match; reintroduced: a previously-fixed alert
@@ -907,6 +909,14 @@ function resolveDependabotAlertContext(
   const dependency = alert.dependency as Record<string, unknown> | undefined;
   const pkg = (vulnerability?.package ?? dependency?.package) as Record<string, unknown> | undefined;
   const firstPatched = vulnerability?.first_patched_version as Record<string, unknown> | undefined;
+  const dismissalReason =
+    typeof alert.dismissed_reason === "string" && alert.dismissed_reason.trim()
+      ? alert.dismissed_reason.trim()
+      : null;
+  const dismissalComment =
+    typeof alert.dismissed_comment === "string" && alert.dismissed_comment.trim()
+      ? alert.dismissed_comment.trim()
+      : null;
   const severity =
     typeof vulnerability?.severity === "string"
       ? vulnerability.severity
@@ -926,6 +936,8 @@ function resolveDependabotAlertContext(
     vulnerableRange: (vulnerability?.vulnerable_version_range as string | undefined) ?? null,
     patchedVersion: (firstPatched?.identifier as string | undefined) ?? null,
     alertUrl: (alert.html_url as string | undefined) ?? null,
+    dismissalReason,
+    dismissalComment,
   };
 }
 
@@ -1074,11 +1086,21 @@ function buildDependabotTerminalReceipt(input: {
   const alertUrl =
     input.alert.alertUrl ??
     `https://github.com/${input.repoFullName}/security/dependabot/${input.alert.alertNumber}`;
+  const dismissalEvidence =
+    input.alert.action === "dismissed" || input.alert.action === "auto_dismissed"
+      ? [
+          `- Dismissal reason: ${input.alert.dismissalReason ? JSON.stringify(input.alert.dismissalReason) : "not provided in the webhook payload"}`,
+          ...(input.alert.dismissalComment
+            ? [`- Dismissal comment: ${JSON.stringify(input.alert.dismissalComment)}`]
+            : []),
+        ]
+      : [];
   return [
     "[github-dependabot-receipt] Terminal Dependabot state received through the HMAC-verified GitHub webhook.",
     `- Repository: \`${input.repoFullName}\``,
     `- Alert: [#${input.alert.alertNumber}](${alertUrl})`,
     `- Action: \`${input.alert.action}\``,
+    ...dismissalEvidence,
     `- GitHub delivery: \`${input.deliveryId ?? "unavailable"}\``,
     "- Evidence path: delivered `dependabot_alert` webhook; no Dependabot REST or GraphQL query was used.",
   ].join("\n");
@@ -1095,6 +1117,9 @@ async function recordDependabotTerminalReceipt(
     deliveryId: string | null;
   },
 ): Promise<void> {
+  const hasCompleteTerminalEvidence =
+    input.alert.action === "fixed" ||
+    Boolean(input.alert.dismissalReason || input.alert.dismissalComment);
   let issue = await findOpenDependabotAlertIssue(db, input.companyId, input.originId);
   if (!issue) {
     issue = await db
@@ -1121,12 +1146,14 @@ async function recordDependabotTerminalReceipt(
         receiptBody,
         "",
         "## Acceptance criteria",
-        `- Dependabot alert #${input.alert.alertNumber} is recorded in a terminal state from a permitted webhook delivery.`,
+        ...(input.alert.action === "fixed"
+          ? [`- Dependabot alert #${input.alert.alertNumber} is recorded as fixed from a permitted webhook delivery.`]
+          : [`- Dependabot alert #${input.alert.alertNumber} has a documented dismissal reason or comment from a permitted webhook delivery.`]),
         "",
         "## Verifying signal",
-        `- GitHub delivery \`${input.deliveryId ?? "unavailable"}\` is preserved in the system comment on this issue.`,
+        `- GitHub delivery \`${input.deliveryId ?? "unavailable"}\` and its terminal evidence are preserved in the system comment on this issue.`,
       ].join("\n"),
-      status: "done",
+      status: hasCompleteTerminalEvidence ? "done" : "todo",
       priority: DEPENDABOT_SEVERITY_TO_ISSUE_PRIORITY[input.alert.severity] ?? "medium",
       assigneeAgentId: input.assigneeAgentId,
       originKind: GITHUB_DEPENDABOT_ALERT_ORIGIN_KIND,
@@ -1163,11 +1190,13 @@ async function recordDependabotTerminalReceipt(
         alertNumber: input.alert.alertNumber,
         action: input.alert.action,
         deliveryId: input.deliveryId,
+        dismissalReason: input.alert.dismissalReason,
+        dismissalComment: input.alert.dismissalComment,
       } as never,
     });
   }
 
-  if (issue.status !== "done") {
+  if (hasCompleteTerminalEvidence && issue.status !== "done") {
     await issueService(db).update(issue.id, { status: "done" });
   }
 }

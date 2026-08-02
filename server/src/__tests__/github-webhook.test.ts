@@ -1137,6 +1137,20 @@ describe("github-webhook pure helpers", () => {
         }),
       ).toMatchObject({ action, alertNumber: 7, severity: "critical" });
     }
+
+    expect(
+      __test_resolveDependabotAlertContext({
+        action: "dismissed",
+        alert: {
+          number: 8,
+          dismissed_reason: "tolerable_risk",
+          dismissed_comment: "Not reachable in production.",
+        },
+      }),
+    ).toMatchObject({
+      dismissalReason: "tolerable_risk",
+      dismissalComment: "Not reachable in production.",
+    });
   });
 
   it("returns null for dependabot payloads without a numeric alert number", () => {
@@ -3995,12 +4009,66 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(receipts[0]!.body).toContain("no Dependabot REST or GraphQL query was used");
   });
 
+  it("records dismissal evidence before closing a Dependabot alert issue", async () => {
+    const { agentId } = await seedCompanyAndAgent({ agentName: "Release Engineer" });
+    const app = buildApp({ dependabotAgentId: agentId });
+    const dismissed = dependabotPayload("high", "dismissed");
+    Object.assign(dismissed.alert, {
+      dismissed_reason: "tolerable_risk",
+      dismissed_comment: "The vulnerable code path is not used in production.",
+    });
+
+    await postDependabot(app, dependabotPayload("high", "created"), "delivery-created");
+    await postDependabot(app, dismissed, "delivery-dismissed");
+
+    const [issue] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.originId, "github-dependabot:Blockcast/paperclip#58"));
+    expect(issue?.description).toContain("a documented dismissal reason is recorded");
+    expect(issue?.status).toBe("done");
+
+    const [receipt] = await db
+      .select()
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.issueId, issue!.id),
+          sql`${issueComments.metadata}->>'kind' = 'github_dependabot_terminal_receipt'`,
+        ),
+      );
+    expect(receipt?.body).toContain('Dismissal reason: "tolerable_risk"');
+    expect(receipt?.body).toContain(
+      'Dismissal comment: "The vulnerable code path is not used in production."',
+    );
+    expect(receipt?.metadata).toMatchObject({
+      dismissalReason: "tolerable_risk",
+      dismissalComment: "The vulnerable code path is not used in production.",
+    });
+  });
+
+  it("keeps a dismissed Dependabot alert issue open when the webhook has no documented reason", async () => {
+    const { agentId } = await seedCompanyAndAgent({ agentName: "Release Engineer" });
+    const app = buildApp({ dependabotAgentId: agentId });
+
+    await postDependabot(app, dependabotPayload("high", "created"), "delivery-created");
+    await postDependabot(app, dependabotPayload("high", "dismissed"), "delivery-dismissed");
+
+    const [issue] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.originId, "github-dependabot:Blockcast/paperclip#58"));
+    expect(issue?.status).not.toBe("done");
+  });
+
   it("creates a durable closed receipt issue for an orphan terminal delivery", async () => {
     const { agentId } = await seedCompanyAndAgent({ agentName: "Release Engineer" });
     const app = buildApp({ dependabotAgentId: agentId });
 
-    await postDependabot(app, dependabotPayload("high", "dismissed", 1591), "delivery-dismissed");
-    await postDependabot(app, dependabotPayload("high", "dismissed", 1591), "delivery-dismissed");
+    const dismissed = dependabotPayload("high", "dismissed", 1591);
+    Object.assign(dismissed.alert, { dismissed_reason: "not_used" });
+    await postDependabot(app, dismissed, "delivery-dismissed");
+    await postDependabot(app, dismissed, "delivery-dismissed");
     const [issue] = await db
       .select()
       .from(issues)
