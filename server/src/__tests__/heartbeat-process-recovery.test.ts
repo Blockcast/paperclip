@@ -5384,9 +5384,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       })),
     ]);
 
-    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    await Promise.all([
+      heartbeat.reconcileStrandedAssignedIssues(),
+      heartbeat.reconcileStrandedAssignedIssues(),
+    ]);
 
-    expect(result.assignmentDispatched).toBe(ISSUE_ASSIGNMENT_RECOVERY_PER_AGENT_SWEEP_LIMIT * 2);
     const firstAgentQueuedRuns = await db
       .select()
       .from(heartbeatRuns)

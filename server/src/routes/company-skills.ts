@@ -696,7 +696,6 @@ export function companySkillRoutes(db: Db) {
       cancelHarnessIssue: async (issueId) => {
         const issue = await issues.getById(issueId);
         if (!issue || issue.companyId !== companyId) return;
-        await cancelLiveHarnessIssueRuns(companyId, issueId);
         if (issue.status !== "done" && issue.status !== "cancelled") {
           await issues.update(issueId, {
             status: "cancelled",
@@ -704,6 +703,7 @@ export function companySkillRoutes(db: Db) {
             actorUserId: actor.actorType === "user" ? actor.actorId : null,
           });
         }
+        await cancelLiveHarnessIssueRuns(companyId, issueId);
       },
     });
     if (!result) {

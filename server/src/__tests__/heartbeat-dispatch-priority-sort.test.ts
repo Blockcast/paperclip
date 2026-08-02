@@ -142,7 +142,7 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     await tempDb?.cleanup();
   });
 
-  it("claims an assigned todo issue before auto-checkout starts (BLO-20088 regression)", async () => {
+  it("claims an assigned todo issue through auto-checkout (BLO-20088 regression)", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const issueId = randomUUID();
@@ -237,7 +237,7 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
         .then((rows) => rows[0] ?? null);
 
       expect(lockedIssue).toEqual({
-        status: "todo",
+        status: "in_progress",
         executionRunId: runId,
       });
     } finally {

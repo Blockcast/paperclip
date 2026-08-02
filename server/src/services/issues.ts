@@ -4624,7 +4624,7 @@ export function issueService(db: Db) {
       .from(heartbeatRuns)
       .leftJoin(agents, and(eq(agents.companyId, heartbeatRuns.companyId), eq(agents.id, heartbeatRuns.agentId)))
       .where(eq(heartbeatRuns.id, checkoutRunId))
-      .for("update")
+      .for("update", { of: heartbeatRuns })
       .then((rows) => rows[0] ?? null);
 
     if (row?.status !== "running" || row.runAgentId !== agentId) return { patch: {} };

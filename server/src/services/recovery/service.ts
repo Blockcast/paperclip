@@ -107,6 +107,8 @@ export const DEFAULT_LIVENESS_REESCALATION_COOLDOWN_MS = 60 * 60 * 1000;
 // behind a holder that may never start.
 export const STALE_PRE_CLAIM_ISSUE_LOCK_MS = 6 * 60 * 60 * 1000;
 export const ISSUE_ASSIGNMENT_RECOVERY_PER_AGENT_SWEEP_LIMIT = 5;
+const ASSIGNMENT_RECOVERY_CAPACITY_RESERVATION_STATUS = "assignment_recovery_capacity_reserved";
+const ASSIGNMENT_RECOVERY_CAPACITY_RESERVATION_TTL_MS = 5 * 60 * 1000;
 // BLO-19941: the same backstop, for a holder wedged at `running`.
 //
 // `running` is neither missing nor terminal, so isCleanable() is false forever
@@ -1689,7 +1691,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     agentId: string,
     enqueue: () => Promise<T | null | undefined>,
   ): Promise<T | null> {
-    return db.transaction(async (tx) => {
+    // Reserve under the cross-replica lock, then release the transaction's
+    // connection before enqueueWakeup acquires its own connection.
+    const reservationId = await db.transaction(async (tx) => {
       await tx.execute(
         sql`select pg_advisory_xact_lock(hashtextextended(${issue.companyId} || ':assignment_recovery:' || ${agentId}, 0))`,
       );
@@ -1708,12 +1712,48 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         ))
         .then((rows) => Number(rows[0]?.count ?? 0));
 
-      if (liveAssignmentRecoveryRuns >= ISSUE_ASSIGNMENT_RECOVERY_PER_AGENT_SWEEP_LIMIT) {
+      const activeReservations = await tx
+        .select({ count: sql<number>`count(*)::int` })
+        .from(agentWakeupRequests)
+        .where(and(
+          eq(agentWakeupRequests.companyId, issue.companyId),
+          eq(agentWakeupRequests.agentId, agentId),
+          eq(agentWakeupRequests.status, ASSIGNMENT_RECOVERY_CAPACITY_RESERVATION_STATUS),
+          gte(
+            agentWakeupRequests.createdAt,
+            new Date(Date.now() - ASSIGNMENT_RECOVERY_CAPACITY_RESERVATION_TTL_MS),
+          ),
+        ))
+        .then((rows) => Number(rows[0]?.count ?? 0));
+
+      if (
+        liveAssignmentRecoveryRuns + activeReservations >=
+        ISSUE_ASSIGNMENT_RECOVERY_PER_AGENT_SWEEP_LIMIT
+      ) {
         return null;
       }
 
-      return await enqueue() ?? null;
+      return tx
+        .insert(agentWakeupRequests)
+        .values({
+          companyId: issue.companyId,
+          agentId,
+          source: "automation",
+          triggerDetail: "system",
+          reason: "issue_assignment_recovery_capacity_reservation",
+          status: ASSIGNMENT_RECOVERY_CAPACITY_RESERVATION_STATUS,
+        })
+        .returning({ id: agentWakeupRequests.id })
+        .then((rows) => rows[0]?.id ?? null);
     });
+
+    if (!reservationId) return null;
+
+    try {
+      return await enqueue() ?? null;
+    } finally {
+      await db.delete(agentWakeupRequests).where(eq(agentWakeupRequests.id, reservationId));
+    }
   }
 
   async function isInvocationBudgetBlocked(issue: typeof issues.$inferSelect, agentId: string) {
