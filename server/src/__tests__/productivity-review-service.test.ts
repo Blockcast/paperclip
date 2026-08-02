@@ -875,6 +875,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     status: "scheduled_retry" | "queued" | "running" | "succeeded";
     lockedAt: Date;
     lastOutputAt?: Date | null;
+    lastUsefulActionAt?: Date | null;
     finishedAt?: Date | null;
   }) {
     const runId = randomUUID();
@@ -886,6 +887,7 @@ describeEmbeddedPostgres("productivity review service", () => {
       invocationSource: "assignment",
       startedAt: null,
       lastOutputAt: input.lastOutputAt ?? null,
+      lastUsefulActionAt: input.lastUsefulActionAt ?? null,
       finishedAt: input.finishedAt ?? null,
       contextSnapshot: { issueId: input.issueId, taskId: input.issueId },
     });
@@ -971,15 +973,61 @@ describeEmbeddedPostgres("productivity review service", () => {
       issueId: seeded.issueId,
       status: "running",
       lockedAt: episodeStart,
-      // Last output 3h ago — past the 2h silence bound, so the episode is
-      // truncated there: 4h attributable, under the 6h threshold.
-      lastOutputAt: new Date(now.getTime() - 3 * 60 * 60 * 1000),
+      // Last output 4h ago — past the 2h silence bound, so the episode is
+      // truncated at the silence deadline: 5h attributable, under the 6h threshold.
+      lastOutputAt: new Date(now.getTime() - 4 * 60 * 60 * 1000),
     });
     const service = productivityReviewService(db);
 
     const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
 
     expect(result.created).toBe(0);
+  });
+
+  it("keeps long_active_duration monotonic just past the running silence boundary (BLO-19848)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const episodeStart = new Date(now.getTime() - 7 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: episodeStart });
+    await pinExecutionRun({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      status: "running",
+      lockedAt: episodeStart,
+      // One minute past the 2h silence boundary still leaves nearly the full
+      // seven-hour episode attributable. The clamp must not jump backward to
+      // the raw last signal and erase the whole grace period.
+      lastOutputAt: new Date(now.getTime() - 2 * 60 * 60 * 1000 - 60_000),
+    });
+    const service = productivityReviewService(db);
+
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+  });
+
+  it("uses the newest execution signal instead of field priority for running holders (BLO-19848)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const episodeStart = new Date(now.getTime() - 7 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: episodeStart });
+    await pinExecutionRun({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      status: "running",
+      lockedAt: episodeStart,
+      lastUsefulActionAt: new Date(now.getTime() - 4 * 60 * 60 * 1000),
+      lastOutputAt: new Date(now.getTime() - 10 * 60 * 1000),
+    });
+    const service = productivityReviewService(db);
+
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `long_active_duration`");
   });
 
   it("suppresses long-active productivity reviews for deliberate future monitor waits", async () => {

@@ -1139,10 +1139,12 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     agentId: string;
     lockedAt: Date;
     scheduledRetryAt: Date;
+    scheduledRetryReason?: string | null;
     sameRunHoldsCheckout?: boolean;
   }) {
     const wedgedRunId = randomUUID();
     const issueId = randomUUID();
+    const scheduledRetryReason = input.scheduledRetryReason ?? "ccrotate_capacity";
     await db.insert(heartbeatRuns).values({
       id: wedgedRunId,
       companyId: input.companyId,
@@ -1152,7 +1154,8 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       startedAt: null,
       scheduledRetryAt: input.scheduledRetryAt,
       scheduledRetryAttempt: 1,
-      scheduledRetryReason: "ccrotate_capacity",
+      scheduledRetryReason,
+      contextSnapshot: { issueId, taskId: issueId, retryReason: scheduledRetryReason },
     });
     await db.insert(issues).values({
       id: issueId,
@@ -1222,6 +1225,76 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0]);
     expect(row?.executionRunId).toBeNull();
+  });
+
+  it.each([
+    "max_turns_continuation",
+    "capacity_blocked",
+    "job_failed",
+  ])("preserves and promotes lock-required scheduled_retry holders (%s)", async (scheduledRetryReason) => {
+    const { companyId, agentId } = await seed();
+    const { issueId, wedgedRunId } = await seedWedgedScheduledRetryIssue({
+      companyId,
+      agentId,
+      lockedAt: new Date(Date.now() - 13 * 60 * 60 * 1000),
+      scheduledRetryAt: new Date(Date.now() - 60_000),
+      scheduledRetryReason,
+    });
+
+    const heartbeat = heartbeatService(db, { skipQueuedRunDispatch: true });
+    const sweep = await heartbeat.sweepStaleIssueLocks();
+
+    expect(sweep.cleared).toBe(0);
+    const locked = await db
+      .select({ executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(locked?.executionRunId).toBe(wedgedRunId);
+
+    const promotion = await heartbeat.promoteDueScheduledRetries(new Date());
+    expect(promotion.runIds).toContain(wedgedRunId);
+    const run = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, wedgedRunId))
+      .then((rows) => rows[0]);
+    expect(run?.status).toBe("queued");
+  });
+
+  it("re-reads scheduled_retry deadline inside the sweep transaction before clearing (BLO-19848)", async () => {
+    const { companyId, agentId } = await seed();
+    const { issueId, wedgedRunId } = await seedWedgedScheduledRetryIssue({
+      companyId,
+      agentId,
+      lockedAt: new Date(Date.now() - 8 * 60 * 60 * 1000),
+      scheduledRetryAt: new Date(Date.now() - 7 * 60 * 60 * 1000),
+    });
+
+    const heartbeat = heartbeatService(db, {
+      beforeStaleIssueLockSweepClearForTest: async (issue) => {
+        if (issue.id !== issueId) return;
+        await db
+          .update(heartbeatRuns)
+          .set({ scheduledRetryAt: new Date(Date.now() + 3 * 24 * 60 * 60 * 1000) })
+          .where(eq(heartbeatRuns.id, wedgedRunId));
+      },
+    });
+    const result = await heartbeat.sweepStaleIssueLocks();
+
+    expect(result.cleared).toBe(0);
+    const row = await db
+      .select({
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+        executionLockedAt: issues.executionLockedAt,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row?.checkoutRunId).toBe(wedgedRunId);
+    expect(row?.executionRunId).toBe(wedgedRunId);
+    expect(row?.executionLockedAt).not.toBeNull();
   });
 
   it("does not clear a scheduled_retry lock held by a different live checkout run (BLO-19848)", async () => {

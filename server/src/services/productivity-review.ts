@@ -243,6 +243,14 @@ function coerceDate(value: Date | string | null | undefined) {
   return value instanceof Date ? value : new Date(value);
 }
 
+function latestDate(...values: Array<Date | string | null | undefined>) {
+  const dates = values
+    .map(coerceDate)
+    .filter((value): value is Date => !!value && !Number.isNaN(value.getTime()));
+  if (dates.length === 0) return null;
+  return new Date(Math.max(...dates.map((date) => date.getTime())));
+}
+
 /**
  * BLO-19848: the moment an issue's execution stopped being attributable to a
  * live run, or null while the current holder is genuinely live.
@@ -265,10 +273,10 @@ function coerceDate(value: Date | string | null | undefined) {
  * dispatcher's slot gate use) rather than on `updatedAt`, which review and
  * recovery churn would otherwise keep fresh forever (BLO-8827).
  *
- * Returns the clamp point — the run's last genuine signal — so the episode is
- * truncated at the last moment work was actually observed rather than dropped
- * to zero. An issue with no execution holder at all returns null and keeps
- * full wall-clock accounting: that is an unowned `in_progress` issue, which is
+ * Returns the clamp point — the last moment still attributable to the run — so
+ * the episode is truncated when live work stopped rather than dropped to zero.
+ * An issue with no execution holder at all returns null and keeps full
+ * wall-clock accounting: that is an unowned `in_progress` issue, which is
  * genuine stalling and exactly what the trigger should still catch.
  */
 function nonLiveExecutionHoldSince(
@@ -281,16 +289,17 @@ function nonLiveExecutionHoldSince(
   // attributable moment rather than trusting an unverifiable holder.
   if (!executionRun) return coerceDate(issue.executionLockedAt);
 
-  const lastSignal =
-    coerceDate(executionRun.lastUsefulActionAt) ??
-    coerceDate(executionRun.lastOutputAt) ??
-    coerceDate(executionRun.startedAt) ??
-    coerceDate(issue.executionLockedAt);
+  const lastSignal = latestDate(
+    executionRun.lastUsefulActionAt,
+    executionRun.lastOutputAt,
+    executionRun.startedAt,
+    issue.executionLockedAt,
+  );
 
   if (executionRun.status === "running") {
     if (!lastSignal) return null; // mid-claim; do not truncate on a bare row
     return now.getTime() - lastSignal.getTime() >= NON_LIVE_EXECUTION_SILENCE_MS
-      ? lastSignal
+      ? new Date(lastSignal.getTime() + NON_LIVE_EXECUTION_SILENCE_MS)
       : null;
   }
 

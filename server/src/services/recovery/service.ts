@@ -106,8 +106,8 @@ export const DEFAULT_LIVENESS_REESCALATION_COOLDOWN_MS = 60 * 60 * 1000;
 // the run — it only stops subsequent wakes for the issue from being parked
 // behind a holder that may never start.
 export const STALE_PRE_CLAIM_ISSUE_LOCK_MS = 6 * 60 * 60 * 1000;
-// BLO-19848: absolute ceiling on how long ANY pre-claim holder may pin an
-// issue's execution lock, measured from executionLockedAt.
+// BLO-19848: absolute ceiling on how long a safely reacquirable pre-claim
+// holder may pin an issue's execution lock, measured from executionLockedAt.
 //
 // The `scheduled_retry` branch of isPreClaimLockExpired measures staleness from
 // the run's own scheduledRetryAt so that a deliberately parked retry is not
@@ -121,10 +121,18 @@ export const STALE_PRE_CLAIM_ISSUE_LOCK_MS = 6 * 60 * 60 * 1000;
 // 12h = the 6h pre-claim bound plus one full 6h grace period past the lock
 // timestamp. A retry scheduled inside that horizon still gets its full
 // deadline-relative window; one scheduled beyond it is reclaimed at 12h. As with
-// every other branch here, clearing the lock does not cancel the run — the
-// claim-time update is guarded by `or(isNull(executionRunId), eq(..., self))`,
-// so a retry that does eventually fire simply re-acquires.
+// every other safe-reacquire branch here, clearing the lock does not cancel the
+// run — the claim-time update is guarded by
+// `or(isNull(executionRunId), eq(..., self))`, so a retry that does eventually
+// fire simply re-acquires.
 export const MAX_PRE_CLAIM_ISSUE_LOCK_MS = 2 * STALE_PRE_CLAIM_ISSUE_LOCK_MS;
+// Keep in sync with heartbeat.ts requiresIssueExecutionRetryLock(). These
+// retry kinds must retain issue.executionRunId through promotion.
+const SCHEDULED_RETRY_REASONS_REQUIRING_CONTINUOUS_ISSUE_LOCK = new Set([
+  "max_turns_continuation",
+  "capacity_blocked",
+  "job_failed",
+]);
 // BLO-19941: the same backstop, for a holder wedged at `running`.
 //
 // `running` is neither missing nor terminal, so isCleanable() is false forever
@@ -1169,7 +1177,20 @@ function buildLivenessOriginalIssueComment(finding: IssueLivenessFinding, escala
   ].join("\n");
 }
 
-export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup }) {
+export function recoveryService(
+  db: Db,
+  deps: {
+    enqueueWakeup: RecoveryWakeup;
+    beforeStaleIssueLockSweepClearForTest?: (
+      issue: {
+        id: string;
+        checkoutRunId: string | null;
+        executionRunId: string | null;
+        executionLockedAt: Date | null;
+      },
+    ) => Promise<void> | void;
+  },
+) {
   const issuesSvc = issueService(db);
   const recoveryActionsSvc = issueRecoveryActionService(db);
   const treeControlSvc = issueTreeControlService(db);
@@ -7746,6 +7767,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
               id: heartbeatRuns.id,
               status: heartbeatRuns.status,
               scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
+              scheduledRetryReason: heartbeatRuns.scheduledRetryReason,
               startedAt: heartbeatRuns.startedAt,
               lastOutputAt: heartbeatRuns.lastOutputAt,
               lastUsefulActionAt: heartbeatRuns.lastUsefulActionAt,
@@ -7756,6 +7778,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     const runById = new Map<string, {
       status: string;
       scheduledRetryAt: Date | null;
+      scheduledRetryReason: string | null;
       startedAt: Date | null;
       lastOutputAt: Date | null;
       lastUsefulActionAt: Date | null;
@@ -7798,13 +7821,21 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         return Date.now() - lockedAt.getTime() >= STALE_PRE_CLAIM_ISSUE_LOCK_MS;
       }
       if (run?.status === "scheduled_retry") {
+        if (
+          SCHEDULED_RETRY_REASONS_REQUIRING_CONTINUOUS_ISSUE_LOCK.has(
+            run.scheduledRetryReason ?? "",
+          )
+        ) {
+          return false;
+        }
         // Scheduled retries are intentionally parked until their retry deadline.
         // Only clear them once that deadline itself has gone stale; provider
         // capacity retries may be scheduled far into the future.
         //
         // BLO-19848: but cap the hold. scheduledRetryAt is unbounded and
         // re-parkable, so a deadline-relative window alone lets a holder pin the
-        // lock indefinitely. Whichever bound trips first wins.
+        // lock indefinitely. For retry reasons that can safely reacquire, whichever
+        // bound trips first wins.
         const staleBasis = run.scheduledRetryAt ?? lockedAt;
         return (
           Date.now() - staleBasis.getTime() >= STALE_PRE_CLAIM_ISSUE_LOCK_MS ||
@@ -7873,6 +7904,118 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       if (!isCleanable(issue.executionRunId) && !executionLockExpired) continue;
 
       const sweepOutcome = await db.transaction(async (tx) => {
+        await deps.beforeStaleIssueLockSweepClearForTest?.(issue);
+
+        const currentIssue = await tx
+          .select({
+            id: issues.id,
+            companyId: issues.companyId,
+            assigneeAgentId: issues.assigneeAgentId,
+            responsibleUserId: issues.responsibleUserId,
+            checkoutRunId: issues.checkoutRunId,
+            executionRunId: issues.executionRunId,
+            executionLockedAt: issues.executionLockedAt,
+          })
+          .from(issues)
+          .where(eq(issues.id, issue.id))
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+
+        if (!currentIssue) return null;
+        if (currentIssue.checkoutRunId !== issue.checkoutRunId) return null;
+        if (currentIssue.executionRunId !== issue.executionRunId) return null;
+        if ((currentIssue.executionLockedAt?.getTime() ?? null) !== (issue.executionLockedAt?.getTime() ?? null)) {
+          return null;
+        }
+
+        const currentReferencedRunIds = [
+          ...new Set(
+            [currentIssue.checkoutRunId, currentIssue.executionRunId]
+              .filter((id): id is string => !!id),
+          ),
+        ];
+        const currentRunRows =
+          currentReferencedRunIds.length > 0
+            ? await tx
+                .select({
+                  id: heartbeatRuns.id,
+                  status: heartbeatRuns.status,
+                  scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
+                  scheduledRetryReason: heartbeatRuns.scheduledRetryReason,
+                  startedAt: heartbeatRuns.startedAt,
+                  lastOutputAt: heartbeatRuns.lastOutputAt,
+                  lastUsefulActionAt: heartbeatRuns.lastUsefulActionAt,
+                })
+                .from(heartbeatRuns)
+                .where(inArray(heartbeatRuns.id, currentReferencedRunIds))
+                .for("update")
+            : [];
+        const currentRunById = new Map<string, {
+          status: string;
+          scheduledRetryAt: Date | null;
+          scheduledRetryReason: string | null;
+          startedAt: Date | null;
+          lastOutputAt: Date | null;
+          lastUsefulActionAt: Date | null;
+        }>();
+        for (const row of currentRunRows) currentRunById.set(row.id, row);
+
+        const currentIsCleanable = (runId: string | null) => {
+          if (!runId) return true;
+          const run = currentRunById.get(runId);
+          if (!run) return true;
+          return TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status);
+        };
+        const currentPreClaimLockExpired = (runId: string | null, lockedAt: Date | null) => {
+          if (!runId || !lockedAt) return false;
+          const run = currentRunById.get(runId);
+          if (run?.status === "queued") {
+            return Date.now() - lockedAt.getTime() >= STALE_PRE_CLAIM_ISSUE_LOCK_MS;
+          }
+          if (run?.status === "scheduled_retry") {
+            if (
+              SCHEDULED_RETRY_REASONS_REQUIRING_CONTINUOUS_ISSUE_LOCK.has(
+                run.scheduledRetryReason ?? "",
+              )
+            ) {
+              return false;
+            }
+            const staleBasis = run.scheduledRetryAt ?? lockedAt;
+            return (
+              Date.now() - staleBasis.getTime() >= STALE_PRE_CLAIM_ISSUE_LOCK_MS ||
+              Date.now() - lockedAt.getTime() >= MAX_PRE_CLAIM_ISSUE_LOCK_MS
+            );
+          }
+          return false;
+        };
+        const currentRunningLockStaleBasis = (runId: string | null, lockedAt: Date | null) => {
+          if (!runId) return null;
+          const run = currentRunById.get(runId);
+          if (run?.status !== "running") return null;
+          return run.lastUsefulActionAt ?? run.lastOutputAt ?? run.startedAt ?? lockedAt;
+        };
+        const currentRunningLockSilent = (runId: string | null, lockedAt: Date | null) => {
+          const basis = currentRunningLockStaleBasis(runId, lockedAt);
+          if (!basis) return false;
+          return Date.now() - basis.getTime() >= STALE_RUNNING_ISSUE_LOCK_MS;
+        };
+        const currentExecutionLockExpired = currentPreClaimLockExpired(
+          currentIssue.executionRunId,
+          currentIssue.executionLockedAt,
+        ) || currentRunningLockSilent(
+          currentIssue.executionRunId,
+          currentIssue.executionLockedAt,
+        );
+        const currentCheckoutHeldBySameExpiredRun = currentExecutionLockExpired
+          && currentIssue.checkoutRunId != null
+          && currentIssue.checkoutRunId === currentIssue.executionRunId;
+        if (!currentIsCleanable(currentIssue.checkoutRunId) && !currentCheckoutHeldBySameExpiredRun) {
+          return null;
+        }
+        if (!currentIsCleanable(currentIssue.executionRunId) && !currentExecutionLockExpired) {
+          return null;
+        }
+
         const clearedAt = new Date();
         const updated = await tx
           .update(issues)
@@ -7885,15 +8028,15 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           })
           .where(
             and(
-              eq(issues.id, issue.id),
-              issue.checkoutRunId
-                ? eq(issues.checkoutRunId, issue.checkoutRunId)
+              eq(issues.id, currentIssue.id),
+              currentIssue.checkoutRunId
+                ? eq(issues.checkoutRunId, currentIssue.checkoutRunId)
                 : isNull(issues.checkoutRunId),
-              issue.executionRunId
-                ? eq(issues.executionRunId, issue.executionRunId)
+              currentIssue.executionRunId
+                ? eq(issues.executionRunId, currentIssue.executionRunId)
                 : isNull(issues.executionRunId),
-              issue.executionLockedAt
-                ? eq(issues.executionLockedAt, issue.executionLockedAt)
+              currentIssue.executionLockedAt
+                ? eq(issues.executionLockedAt, currentIssue.executionLockedAt)
                 : isNull(issues.executionLockedAt),
             ),
           )
