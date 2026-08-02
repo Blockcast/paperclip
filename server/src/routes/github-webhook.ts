@@ -1138,6 +1138,20 @@ async function recordDependabotTerminalReceipt(
   }
   const receiptBody = buildDependabotTerminalReceipt(input);
 
+  if (!issue && !hasCompleteTerminalEvidence) {
+    await recordDependabotWebhookDiagnostic(db, {
+      companyId: input.companyId,
+      assigneeAgentId: input.assigneeAgentId,
+      event: "dependabot_alert",
+      deliveryId: input.deliveryId,
+      action: input.alert.action,
+      repoFullName: input.repoFullName,
+      reason: `Terminal Dependabot ${input.alert.action} delivery for alert #${input.alert.alertNumber} did not include a documented dismissal reason, so it was recorded as a diagnostic instead of reserving the active alert issue key.\n\n${receiptBody}`,
+      alertNumber: input.alert.alertNumber,
+    });
+    return;
+  }
+
   if (!issue) {
     issue = await issueService(db).create(input.companyId, {
       title: `Dependabot terminal receipt: ${input.repoFullName}#${input.alert.alertNumber} ${input.alert.action}`,

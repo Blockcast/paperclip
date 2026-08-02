@@ -4125,6 +4125,50 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(receipts).toHaveLength(1);
   });
 
+  it("records an incomplete orphan terminal dismissal as diagnostic before a reintroduced remediation issue", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent({ agentName: "Release Engineer" });
+    const app = buildApp({ dependabotAgentId: agentId });
+    const originId = "github-dependabot:Blockcast/paperclip#1593";
+
+    await postDependabot(app, dependabotPayload("high", "dismissed", 1593), "delivery-orphan-dismissed");
+
+    const orphanAlertIssues = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(eq(issues.originId, originId));
+    expect(orphanAlertIssues).toHaveLength(0);
+
+    const [diagnostic] = await db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, "github_dependabot_webhook_diagnostic"),
+          eq(issues.originId, "dependabot_alert:delivery-orphan-dismissed"),
+        ),
+      );
+    expect(diagnostic?.status).toBe("todo");
+    expect(diagnostic?.description).toContain("did not include a documented dismissal reason");
+
+    const reintroduced = await postDependabot(
+      app,
+      dependabotPayload("high", "reintroduced", 1593),
+      "delivery-reintroduced",
+    );
+    expect(reintroduced.body).toMatchObject({ dependabotWakeFired: true });
+
+    const [issue] = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.originKind, "github_dependabot_alert"), eq(issues.originId, originId)));
+    expect(issue?.status).toBe("todo");
+    expect(issue?.title).toContain("vitest");
+    expect(issue?.description).toContain("Vulnerable range: < 3.2.6");
+    expect(issue?.description).toContain("Patched version: 3.2.6");
+    expect(issue?.description).not.toContain("terminal receipt");
+  });
+
   it("records terminal receipts below the remediation severity floor", async () => {
     const { agentId } = await seedCompanyAndAgent({ agentName: "Release Engineer" });
     const app = buildApp({ dependabotAgentId: agentId });
