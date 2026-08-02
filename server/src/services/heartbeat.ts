@@ -17650,12 +17650,39 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   const dispatchHeadRescanDemandByAgent = new Set<string>();
   const dispatchResumeCapRetryTimersByAgent = new Map<string, ReturnType<typeof setTimeout>>();
 
+  /**
+   * How many queue-selection critical sections have executed, process-wide.
+   *
+   * Only read by tests. A self-rearming continuation chain is invisible to
+   * ordinary assertions — it claims nothing, mutates nothing and drains no
+   * queue, so its only symptom is that passes never stop. Counting them lets
+   * the regression assert quiescence as a number instead of waiting for a
+   * timeout, which is the difference between failing in a second and hanging
+   * the suite.
+   */
+  let dispatchCriticalSectionCount = 0;
+
+  /**
+   * Detached passes that continue a bounded scan this dispatcher already owns.
+   *
+   * Deliberately does NOT include `resume_head_rescan_after_coalesced_demand`.
+   * Suppressing that reason's coalesced demand stops the self-rearm loop but
+   * silently DROPS the rescan whenever it coalesces, stranding the row the
+   * rescan exists to rescue (it fails "honours dispatch demand that arrived
+   * before the first pass installed its cursor"). The loop is broken instead by
+   * consuming the marker at its point of use — see `dispatchHeadRescanDemandByAgent`
+   * at the scan cursor read.
+   */
+  const RESUME_CONTINUATION_REASONS: ReadonlySet<string> = new Set([
+    "resume_bounded_scan",
+    "resume_bounded_scan_after_cap",
+  ]);
+
   /** Run one more dispatch pass for `agentId`, detached from this critical section. */
   function scheduleDetachedDispatchPass(agentId: string, reason: string) {
     const pass = runDetachedFromAgentStartLock(() =>
       startNextQueuedRunForAgent(agentId, {
-        resumeContinuation:
-          reason === "resume_bounded_scan" || reason === "resume_bounded_scan_after_cap",
+        resumeContinuation: RESUME_CONTINUATION_REASONS.has(reason),
       }).catch((err) => {
         logger.error(
           { err, agentId, reason },
@@ -17709,7 +17736,50 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if ((await getSchedulingSuppression()).suppressed) return [];
     const cutoff = await getWorktreeExecutionCutoff();
 
-    return withAgentStartLock(agentId, async () => {
+    /**
+     * Set inside the critical section, acted on AFTER the lock is released.
+     *
+     * BLO-20396 (sixth review follow-up): scheduling the head rescan from
+     * *inside* the section made it re-arm itself forever. The detached pass
+     * leaves the AsyncLocalStorage context but not the lock REGISTRATION, and
+     * it only awaits scheduling suppression and the worktree cutoff before
+     * reaching `withAgentStartLock` — so it routinely arrived while the
+     * scheduling pass still held the lock, coalesced, and fired
+     * `onCoalescedDemand`, which re-added the very marker the rescan had just
+     * consumed. The next pass then exhausted, found the marker set, scheduled
+     * another rescan, and the cycle ran with no external wake driving it:
+     * measured at ~216 dispatch passes per idle second on an EMPTY queue.
+     *
+     * Deferring past the release is Ally's second suggested remedy and the
+     * better one. Suppressing the coalesced demand instead (flagging the reason
+     * as a continuation) also stops the loop, but it silently drops the rescan
+     * whenever it DOES coalesce, which strands exactly the row that
+     * "honours dispatch demand that arrived before the first pass installed its
+     * cursor" exists to protect. Deferring keeps the rescan real: by the time it
+     * is enqueued this pass no longer holds the lock, so it runs as a genuine
+     * top-level pass from the head. If a concurrent pass has since taken the
+     * lock, coalescing into it is CORRECT rather than lossy — the cursor was
+     * cleared before we got here, so any pass now starts from the head and
+     * satisfies the same demand.
+     */
+    let deferHeadRescanAfterRelease = false;
+
+    const dispatchedRuns = await withAgentStartLock(agentId, async () => {
+      dispatchCriticalSectionCount += 1;
+      /**
+       * Snapshot head-rescan demand BEFORE the first await, so this pass can
+       * only ever discharge demand that predates it.
+       *
+       * Demand recorded while this pass is already running must NOT be
+       * discharged by it: a bounded pass reads a prefix and installs a cursor,
+       * so a row inserted after it read its head batch is invisible to it. That
+       * is the starvation case `onCoalescedDemand` documents and the reason it
+       * does not suppress demand from a pass that started at the head. Consuming
+       * on `has()` at the cursor read instead of on this snapshot silently ate
+       * the coalesced wake in "honours dispatch demand that arrived before the
+       * first pass installed its cursor" and stranded the row.
+       */
+      const hadHeadRescanDemandAtStart = dispatchHeadRescanDemandByAgent.has(agentId);
       if (dispatchStopped) return [];
       let agent = await getAgent(agentId);
       if (!agent) return [];
@@ -17838,6 +17908,30 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // ceiling throttles how much one pass reads instead of capping how far
       // into the queue dispatch can ever see.
       const resumeState = dispatchResumeCursorByAgent.get(agentId) ?? null;
+      /**
+       * Discharge head-rescan demand HERE, where it is actually satisfied.
+       *
+       * BLO-20396 (sixth review follow-up). The marker used to be consumed by
+       * the pass that SCHEDULED a rescan, which made the rescan re-arm itself:
+       * the detached pass leaves the AsyncLocalStorage context but not the lock
+       * registration, so it coalesced back against the section that scheduled
+       * it, `onCoalescedDemand` re-added the marker it had just consumed, the
+       * next pass exhausted and scheduled another — forever, with no external
+       * wake. Measured at ~216 dispatch passes per idle second on an EMPTY
+       * queue before this change.
+       *
+       * A pass with no cursor that ALSO predates the demand starts at the head
+       * after the demand was recorded, which is precisely what it asks for, so
+       * consuming it here is both correct and terminating:
+       * nothing can consume-then-rearm, and a rescan that gets coalesced away
+       * loses nothing because the marker stays set until some pass genuinely
+       * starts at the head. Mid-chain passes hold a cursor and so leave the
+       * marker alone, preserving the existing design in which demand is held
+       * across a resume chain and honoured once the chain reaches the end.
+       */
+      if (!resumeState && hadHeadRescanDemandAtStart) {
+        dispatchHeadRescanDemandByAgent.delete(agentId);
+      }
       let scanCursor: { createdAt: Date; id: string } | null = resumeState
         ? { createdAt: resumeState.createdAt, id: resumeState.id }
         : null;
@@ -18130,10 +18224,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const needsHeadRescan = dispatchHeadRescanDemandByAgent.has(agentId);
         if (scanExhausted || !scanCursor) {
           dispatchResumeCursorByAgent.delete(agentId);
-          dispatchHeadRescanDemandByAgent.delete(agentId);
           clearDelayedResumeCapRetry(agentId);
+          // The marker is NOT cleared here — the rescan below consumes it when
+          // it actually starts at the head. `needsHeadRescan` is therefore true
+          // only for demand this pass did not already discharge at its start.
           if (needsHeadRescan) {
-            scheduleDetachedDispatchPass(agentId, "resume_head_rescan_after_coalesced_demand");
+            // Deferred, not scheduled here — see `deferHeadRescanAfterRelease`.
+            deferHeadRescanAfterRelease = true;
             return true;
           }
           return false;
@@ -18448,6 +18545,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
       },
     });
+
+    // The lock is released by now: `runExclusively` clears `runningByAgent` in
+    // its `finally`, which runs before the await above resolves. So this pass
+    // runs at top level from the head instead of coalescing back into the
+    // section that scheduled it. See `deferHeadRescanAfterRelease`.
+    if (deferHeadRescanAfterRelease) {
+      scheduleDetachedDispatchPass(agentId, "resume_head_rescan_after_coalesced_demand");
+    }
+    return dispatchedRuns;
   }
 
   async function deferRunForK8sIsolationConflict(
@@ -25848,6 +25954,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
      * semantics. Do not call from production code.
      */
     __test_executeRunForTesting: (runId: string) => executeRun(runId),
+
+    /**
+     * Test-only count of queue-selection critical sections executed so far.
+     * Snapshot it, drive dispatch, snapshot again to assert the continuation
+     * chain terminated. See `dispatchCriticalSectionCount`. Not for production.
+     */
+    __test_dispatchCriticalSectionCount: () => dispatchCriticalSectionCount,
     // Override-aware scheduling-suppression check (honors the worktree
     // run-execution experimental setting). Callers outside the service that
     // gate on suppression should prefer this over the env-only resolver.

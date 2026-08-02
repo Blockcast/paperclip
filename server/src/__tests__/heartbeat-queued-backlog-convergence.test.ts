@@ -1299,4 +1299,123 @@ describeEmbeddedPostgres("queued backlog convergence (BLO-20396)", () => {
     adapter.disarm();
     await heartbeat.drainInFlightExecutions(60_000);
   }, 600_000);
+
+  it("quiesces after the trailing head rescan instead of re-arming itself", async () => {
+    // BLO-20396 (sixth review follow-up). The head rescan used to re-arm the
+    // marker it was scheduled to discharge, so dispatch never stopped.
+    //
+    // The cycle: `advanceOrClearResumeCursor` consumes the head-rescan marker
+    // and calls `scheduleDetachedDispatchPass(..., "resume_head_rescan_...")`
+    // from INSIDE the critical section. That pass detaches from the ALS
+    // context but not from the lock registration, and it only awaits
+    // scheduling suppression and the worktree cutoff before reaching
+    // `withAgentStartLock` — so it routinely arrives while the scheduling
+    // pass still holds the lock, coalesces, and fires `onCoalescedDemand`.
+    // That handler re-added the marker for any reason not flagged as a
+    // continuation, and the head-rescan reason was not flagged. The coalesced
+    // pass then exhausted, found the marker set again, scheduled another head
+    // rescan, and repeated forever with no external wake driving it.
+    //
+    // Why the existing coverage missed it: the loop claims nothing, prunes
+    // nothing and drains nothing, so every row-level assertion still passes.
+    // Its only symptom is passes that never stop, which `drainInFlightExecutions`
+    // absorbs by timing out silently. So this asserts on the pass COUNT.
+    //
+    // Fixture shape: dependency-blocked rows only. The claim gate refuses them
+    // without counting a terminal prune, so the pass reaches
+    // `finishPassWithoutClaims` with no prune follow-up to muddy the signal.
+    // Once the gate cancels them the queue is empty, and an empty queue still
+    // reaches the same bookkeeping — which is the point. A dispatcher spinning
+    // on an EMPTY queue is the pathology in its purest form.
+    const { companyId, agentId } = await seedDeepClaimableBacklog({
+      maxConcurrentRuns: 2,
+      issuelessRows: 0,
+    });
+
+    const blockerIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: blockerIssueId,
+      companyId,
+      title: "Never-done blocker",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      issueNumber: 95_000,
+      identifier: `${companyId.slice(0, 4).toUpperCase()}-95000`,
+      startedAt: new Date(),
+    });
+    for (let i = 0; i < 3; i += 1) {
+      const issueId = randomUUID();
+      const runId = randomUUID();
+      const wakeId = randomUUID();
+      const at = new Date(Date.now() - 12 * 60 * 60 * 1000 + i * 1000);
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: `Blocked ${i}`,
+        status: "todo",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        issueNumber: 95_100 + i,
+        identifier: `${companyId.slice(0, 4).toUpperCase()}-${95_100 + i}`,
+      });
+      await db.insert(issueRelations).values({
+        companyId,
+        issueId: blockerIssueId,
+        relatedIssueId: issueId,
+        type: "blocks",
+      });
+      await db.insert(agentWakeupRequests).values({
+        id: wakeId,
+        companyId,
+        agentId,
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "issue_assigned",
+        payload: { issueId },
+        status: "queued",
+        runId,
+        requestedAt: at,
+        updatedAt: at,
+      });
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "queued",
+        wakeupRequestId: wakeId,
+        contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+        createdAt: at,
+        updatedAt: at,
+      });
+    }
+
+    const before = heartbeat.__test_dispatchCriticalSectionCount();
+
+    // Both in ONE tick: the lock is published before the callback body runs, so
+    // the second call finds it held, coalesces, and records exactly one unit of
+    // head-rescan demand. That is the single seed this test allows.
+    await Promise.all([heartbeat.resumeQueuedRuns(), heartbeat.resumeQueuedRuns()]);
+    await heartbeat.drainInFlightExecutions(5_000);
+
+    const settled = heartbeat.__test_dispatchCriticalSectionCount();
+
+    // Nothing further is driving dispatch: no wake, no completion, no insert.
+    // A correct dispatcher is now idle. Give a self-rearming chain room to
+    // prove itself, then confirm the counter did not move.
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    await heartbeat.drainInFlightExecutions(5_000);
+    const afterIdle = heartbeat.__test_dispatchCriticalSectionCount();
+
+    expect(afterIdle).toBe(settled);
+
+    // And the seeded demand cost a bounded number of passes, not an escalating
+    // chain that merely happened to be between iterations at each sample.
+    expect(settled - before).toBeLessThanOrEqual(6);
+
+    await stopBacklog(agentId);
+    await heartbeat.drainInFlightExecutions(30_000);
+  }, 120_000);
 });

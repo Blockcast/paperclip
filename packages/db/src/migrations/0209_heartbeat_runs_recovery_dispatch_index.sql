@@ -51,15 +51,48 @@
 -- definition is rejected rather than silently accepted. Empty databases (tests,
 -- bootstrap) build it inline, where there is nothing to block.
 --
--- On the predicate check: the key-column list is compared exactly, but the
--- WHERE clause is verified structurally (normalized whitespace, required
--- components) rather than against one hardcoded pretty-printed string. An exact
--- match would have to hardcode PostgreSQL's chosen parenthesization and cast
--- annotations for a two-clause AND; guessing that wrong fails the migration for
--- an operator who precreated the index correctly, which is a worse outcome than
--- a check that accepts an equivalent rendering. The components asserted still
--- reject a name-squatting index, a wrong-column index, and a wrong-constant
--- index, which is what this guard is for.
+-- On the predicate check: the key-column list is compared exactly, and so is
+-- the WHERE clause — but only after both sides are pushed through the SAME
+-- canonicalization (delete every whitespace character, every `::cast`
+-- annotation and every parenthesis). Comparing the raw rendering against one
+-- hardcoded pretty-printed string would be brittle: PostgreSQL picks its own
+-- parenthesization and cast annotations, and guessing them wrong fails the
+-- migration for an operator who precreated the index CORRECTLY. Canonicalizing
+-- removes exactly those degrees of freedom and nothing else, so an equivalent
+-- rendering still passes while the comparison stays exact.
+--
+-- Case is deliberately NOT folded away. `=` on text is case-sensitive, so
+-- `... = 'ISSUE_RECOVERY_ACTION'` is a predicate that matches no row at all and
+-- would leave the lane reading a permanently empty index; lowercasing before
+-- comparing would make that typo look identical to the real thing. Keeping case
+-- costs nothing legitimate, because pg_get_expr renders keywords upper (AND)
+-- and identifiers lower, which is exactly how the expected string is written.
+--
+-- This replaced a check that asserted three independent LIKE substring matches
+-- (`status = 'queued'`, the `->> 'source'` extraction, the
+-- 'issue_recovery_action' constant). That shape is fail-OPEN: it proves the
+-- tokens are PRESENT, not that they are combined the way the lane needs. Both
+-- of these satisfy all three substring checks and are wrong:
+--
+--   status = 'queued' OR (context_snapshot ->> 'source') = 'issue_recovery_action'
+--     -- indexes every queued row, restoring the whole-queue walk 0209 removes
+--   status = 'queued' AND (context_snapshot ->> 'source') <> 'issue_recovery_action'
+--     -- indexes the complement: the lane's own rows are the ones left out
+--
+-- and so does the canonical predicate with any extra clause ANDed on, and so
+-- does a wrong-CASE constant. Equality against the canonical form is
+-- fail-CLOSED instead: the expected token stream contains `and`, two `=` and
+-- the exact constant spellings, so an `OR`, a `<>`/`!=`, an added clause or a
+-- miscased literal cannot reproduce it. Deleting parentheses is safe precisely
+-- BECAUSE the expected form contains no OR — with a single AND there is no
+-- operator precedence left for them to disambiguate, so they carry no meaning
+-- to lose.
+--
+-- When the check does reject, the exception reports the canonicalized predicate
+-- it found beside the one it wanted (and the raw rendering in DETAIL), so an
+-- unanticipated rendering difference is diagnosable from the failure text
+-- instead of being a blind wall — which was the original objection to matching
+-- the predicate exactly.
 --
 -- For reference, `pg_get_expr(indpred, indrelid, TRUE)` was MEASURED on a real
 -- PostgreSQL after this migration ran (not assumed) as:
@@ -68,19 +101,49 @@
 --
 -- Note it parenthesizes the second operand but not the first, and annotates
 -- both the operator's argument and its result with ::text — which is exactly
--- the kind of detail a hand-written expected string tends to get wrong.
+-- the kind of detail a hand-written expected string tends to get wrong, and
+-- exactly what the canonicalization erases before comparing.
 -- paperclip:migration-safety-ignore large-create-index-not-concurrently: guarded below so non-empty databases must precreate the index concurrently.
 DO $$
 DECLARE
-  normalized_predicate text;
+  raw_predicate text;
+  canonical_predicate text;
+  canonical_expected text;
 BEGIN
   IF to_regclass('public.heartbeat_runs_recovery_dispatch_idx') IS NOT NULL THEN
-    SELECT regexp_replace(
-             coalesce(pg_get_expr(index_metadata.indpred, index_metadata.indrelid, TRUE), ''),
-             '\s+', ' ', 'g')
-      INTO normalized_predicate
+    SELECT coalesce(pg_get_expr(index_metadata.indpred, index_metadata.indrelid, TRUE), '')
+      INTO raw_predicate
       FROM pg_index AS index_metadata
      WHERE index_metadata.indexrelid = to_regclass('public.heartbeat_runs_recovery_dispatch_idx');
+
+    -- Run the found predicate and the definition this migration creates through
+    -- one shared canonicalization so the comparison below can be an equality
+    -- test: drop `::cast` annotations (optionally schema-qualified), drop
+    -- parentheses, drop all whitespace. Every token that carries meaning — the
+    -- operators, the AND, the column, the constants — survives, CASE INCLUDED.
+    -- Case is deliberately NOT folded: `=` on text is case-sensitive in
+    -- PostgreSQL, so an index predicated on 'ISSUE_RECOVERY_ACTION' matches
+    -- zero rows and would hand the lane a permanently empty index. Folding case
+    -- would make that typo indistinguishable from the real predicate. Nothing
+    -- legitimate is lost by keeping case: pg_get_expr renders keywords upper
+    -- (AND) and identifiers lower, which is how the expected string below is
+    -- written, and the migration test asserts both halves of that empirically.
+    SELECT
+      max(canonical.predicate) FILTER (WHERE candidate.kind = 'found'),
+      max(canonical.predicate) FILTER (WHERE candidate.kind = 'expected')
+      INTO canonical_predicate, canonical_expected
+      FROM (VALUES
+              ('found', coalesce(raw_predicate, '')),
+              ('expected',
+               'status = ''queued'' AND (context_snapshot ->> ''source'') = ''issue_recovery_action''')
+           ) AS candidate(kind, expression)
+      CROSS JOIN LATERAL (
+        SELECT regexp_replace(
+                 regexp_replace(
+                   translate(candidate.expression, '()', ''),
+                   '::(?:[a-zA-Z_][a-zA-Z0-9_]*\.)?[a-zA-Z_][a-zA-Z0-9_]*', '', 'g'),
+                 '\s+', '', 'g')
+      ) AS canonical(predicate);
 
     IF NOT EXISTS (
       SELECT 1
@@ -101,14 +164,16 @@ BEGIN
           ORDER BY key_position
         ) = ARRAY['agent_id', 'created_at', 'id']
         AND index_metadata.indoption = '0 0 0'::int2vector
-        AND normalized_predicate LIKE '%status = ''queued''%'
-        AND normalized_predicate LIKE '%context_snapshot ->> ''source''%'
-        AND normalized_predicate LIKE '%''issue_recovery_action''%'
+        AND canonical_predicate = canonical_expected
     )
     THEN
       RAISE EXCEPTION USING
         MESSAGE = 'migration 0209 found an invalid or incorrectly defined prerequisite index',
-        HINT = 'Run DROP INDEX CONCURRENTLY IF EXISTS heartbeat_runs_recovery_dispatch_idx; then CREATE INDEX CONCURRENTLY heartbeat_runs_recovery_dispatch_idx ON heartbeat_runs USING btree (agent_id, created_at, id) WHERE status = ''queued'' AND (context_snapshot ->> ''source'') = ''issue_recovery_action''; then retry migrations.';
+        DETAIL = format('index predicate as rendered by PostgreSQL: %L', coalesce(raw_predicate, '')),
+        HINT = format(
+          'Run DROP INDEX CONCURRENTLY IF EXISTS heartbeat_runs_recovery_dispatch_idx; then CREATE INDEX CONCURRENTLY heartbeat_runs_recovery_dispatch_idx ON heartbeat_runs USING btree (agent_id, created_at, id) WHERE status = ''queued'' AND (context_snapshot ->> ''source'') = ''issue_recovery_action''; then retry migrations. Canonicalized predicate found: %L; expected: %L (canonicalization drops casts, parentheses and whitespace; case is significant).',
+          coalesce(canonical_predicate, ''),
+          coalesce(canonical_expected, ''));
     END IF;
   ELSE
     IF EXISTS (SELECT 1 FROM "heartbeat_runs" LIMIT 1) THEN
