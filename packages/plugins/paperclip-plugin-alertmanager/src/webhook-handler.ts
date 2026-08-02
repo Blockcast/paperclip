@@ -32,7 +32,6 @@ import {
 import {
   aggregateKeyForAlert,
   bindAggregateIssue,
-  completeAggregateReopen,
   getAggregate,
   joinAggregate,
   resolveAggregateMember,
@@ -302,30 +301,18 @@ export async function handleFiring(
       if (candidateIssueId !== existingIssueId) supersededLegacyIssueId = candidateIssueId;
     }
     if (supersededLegacyIssueId) {
-      const legacyIssue = await ctx.issues.get(supersededLegacyIssueId, companyId);
-      await recordSourceResolvedAndCloseCovers(
+      await retireSupersededIssue(
         ctx,
         companyId,
         supersededLegacyIssueId,
+        aggregate.aggregateKey,
+        existingIssueId,
+        alertname,
+        severity,
       );
-      if (legacyIssue && legacyIssue.status !== "done" && legacyIssue.status !== "cancelled") {
-        await ctx.issues.update(
-          supersededLegacyIssueId,
-          { status: "cancelled" },
-          companyId,
-        );
-        ctx.logger.info(
-          `Alertmanager: cancelled superseded legacy issue ${supersededLegacyIssueId}; aggregate ${aggregate.aggregateKey} is bound to ${existingIssueId}`,
-        );
-        await ctx.metrics.write("alertmanager.aggregate.legacy_issue_superseded", 1, {
-          alertname,
-          severity,
-        });
-      }
     }
     // Re-fire: refresh body and reopen a terminal aggregate issue.
     const newDescription = buildIssueDescription(alert);
-    let issueSynchronized = false;
     try {
       const issue = await ctx.issues.get(
         existingIssueId,
@@ -352,16 +339,11 @@ export async function handleFiring(
           existingCompanyId,
         );
       }
-      issueSynchronized = Boolean(issue);
     } catch (err) {
       ctx.logger.warn(
         `Failed to re-sync existing issue ${existingIssueId} on re-fire: ${String(err)}`,
       );
     }
-    if (issueSynchronized && (ctx as Partial<PluginContext>).db) {
-      await completeAggregateReopen(ctx, companyId, aggregate.aggregateKey);
-    }
-
     const lifecycleState = aggregateState ?? existing;
     const updated: AlertStateRecord = {
       paperclipIssueId: existingIssueId,
@@ -863,7 +845,15 @@ async function recoverStateFromIssue(
       assigneeAgentId: issue.assigneeAgentId ?? undefined,
     });
     if (issueId !== issue.id) {
-      await ctx.issues.update(issue.id, { status: "cancelled" }, companyId);
+      await retireSupersededIssue(
+        ctx,
+        companyId,
+        issue.id,
+        aggregateKey,
+        issueId,
+        alert.labels.alertname ?? "UnnamedAlert",
+        alert.labels.severity ?? "unknown",
+      );
       boundIssue = (await ctx.issues.get(issueId, companyId)) ?? issue;
     }
   }
@@ -895,6 +885,28 @@ async function recoverStateFromIssue(
     escalationComplete: false,
     escalationIntervalMs: escalationDeadlineMs(alert, config),
   };
+}
+
+async function retireSupersededIssue(
+  ctx: PluginContext,
+  companyId: string,
+  issueId: string,
+  aggregateKey: string,
+  authoritativeIssueId: string,
+  alertname: string,
+  severity: string,
+): Promise<void> {
+  const issue = await ctx.issues.get(issueId, companyId);
+  await recordSourceResolvedAndCloseCovers(ctx, companyId, issueId);
+  if (!issue || issue.status === "done" || issue.status === "cancelled") return;
+  await ctx.issues.update(issueId, { status: "cancelled" }, companyId);
+  ctx.logger.info(
+    `Alertmanager: cancelled superseded legacy issue ${issueId}; aggregate ${aggregateKey} is bound to ${authoritativeIssueId}`,
+  );
+  await ctx.metrics.write("alertmanager.aggregate.legacy_issue_superseded", 1, {
+    alertname,
+    severity,
+  });
 }
 
 /**

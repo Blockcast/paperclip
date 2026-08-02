@@ -1,11 +1,15 @@
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import {
+  claimPendingAggregateReopens,
   claimPendingAggregateResolutions,
   completeAggregateReopen,
   completeAggregateResolution,
-  listAggregateReopenWork,
+  listFinalizedAggregateWork,
+  markFinalizedAggregateReconciled,
   releaseAggregateResolution,
+  renewAggregateReopenClaim,
   renewAggregateResolutionClaim,
+  type AggregateFinalizedWork,
   type AggregateReopenWork,
   type AggregateResolutionWork,
 } from "./aggregate-store.js";
@@ -86,7 +90,7 @@ export async function applyAggregateResolution(
     work.resolvedAt,
   );
   if (completion === "firing") {
-    await repairAggregateReopen(ctx, config, work, work.claim);
+    await reconcileAggregateReopens(ctx, config, true);
     return completion;
   }
   if (completion === "completed") {
@@ -103,13 +107,20 @@ async function repairAggregateReopen(
   ctx: PluginContext,
   config: AlertmanagerPluginConfig,
   work: AggregateReopenWork,
-  claim?: string,
-): Promise<void> {
+): Promise<"completed" | "superseded"> {
   const issueId = work.paperclipIssueId;
-  if (!issueId) return;
+  if (!issueId) return "superseded";
   const issue = await ctx.issues.get(issueId, work.companyId);
   if (!issue) {
     throw new Error(`Cannot repair aggregate ${work.aggregateKey}: issue ${issueId} is missing`);
+  }
+  if (!(await renewAggregateReopenClaim(
+    ctx,
+    work.companyId,
+    work.aggregateKey,
+    work.claim,
+  ))) {
+    return "superseded";
   }
   if (config.autoCloseOnResolve !== false) {
     if (issue.status === "done" || issue.status === "cancelled") {
@@ -130,8 +141,59 @@ async function repairAggregateReopen(
     work.alertname,
     config,
   );
-  await completeAggregateReopen(ctx, work.companyId, work.aggregateKey, claim);
+  if (!(await completeAggregateReopen(
+    ctx,
+    work.companyId,
+    work.aggregateKey,
+    work.claim,
+  ))) {
+    return "superseded";
+  }
   ctx.logger.info(`Alertmanager: repaired re-fire for aggregate ${work.aggregateKey}`);
+  return "completed";
+}
+
+async function reconcileAggregateReopens(
+  ctx: PluginContext,
+  config: AlertmanagerPluginConfig,
+  throwOnFailure = false,
+): Promise<void> {
+  const companyId = config.defaultCompanyId;
+  if (!companyId) return;
+  for (const work of await claimPendingAggregateReopens(ctx, companyId)) {
+    try {
+      await repairAggregateReopen(ctx, config, work);
+    } catch (err) {
+      await releaseAggregateResolution(ctx, companyId, work.aggregateKey, work.claim);
+      ctx.logger.warn(
+        `Alertmanager: failed to repair aggregate ${work.aggregateKey}: ${String(err)}`,
+      );
+      if (throwOnFailure) throw err;
+    }
+  }
+}
+
+async function enforceFinalizedAggregate(
+  ctx: PluginContext,
+  config: AlertmanagerPluginConfig,
+  work: AggregateFinalizedWork,
+): Promise<void> {
+  const issueId = work.paperclipIssueId;
+  if (!issueId) return;
+  if (config.autoCloseOnResolve !== false) {
+    const issue = await ctx.issues.get(issueId, work.companyId);
+    if (issue && issue.status !== "done" && issue.status !== "cancelled") {
+      await ctx.issues.update(issueId, { status: "cancelled" }, work.companyId);
+    }
+  } else {
+    await ensureComment(
+      ctx,
+      work.companyId,
+      issueId,
+      `Alert resolved at ${work.resolvedAt}.`,
+    );
+  }
+  await markFinalizedAggregateReconciled(ctx, work.companyId, work.aggregateKey);
 }
 
 async function ensureComment(
@@ -151,21 +213,17 @@ export async function reconcileAggregateLifecycle(
 ): Promise<void> {
   const companyId = config.defaultCompanyId;
   if (!companyId) return;
-  for (const work of await listAggregateReopenWork(ctx, companyId)) {
-    try {
-      await repairAggregateReopen(
-        ctx,
-        config,
-        work,
-        work.resolutionClaim ?? undefined,
-      );
-    } catch (err) {
-      ctx.logger.warn(
-        `Alertmanager: failed to repair aggregate ${work.aggregateKey}: ${String(err)}`,
-      );
-    }
-  }
+  await reconcileAggregateReopens(ctx, config);
   for (const work of await claimPendingAggregateResolutions(ctx, companyId)) {
     await applyAggregateResolution(ctx, config, work);
+  }
+  for (const work of await listFinalizedAggregateWork(ctx, companyId)) {
+    try {
+      await enforceFinalizedAggregate(ctx, config, work);
+    } catch (err) {
+      ctx.logger.warn(
+        `Alertmanager: failed to enforce finalized aggregate ${work.aggregateKey}: ${String(err)}`,
+      );
+    }
   }
 }

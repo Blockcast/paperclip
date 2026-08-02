@@ -19,7 +19,13 @@ export interface AggregateResolutionWork extends AlertAggregateRecord {
   resolvedAt: string;
 }
 
-export type AggregateReopenWork = AlertAggregateRecord;
+export interface AggregateReopenWork extends AlertAggregateRecord {
+  claim: string;
+}
+
+export interface AggregateFinalizedWork extends AlertAggregateRecord {
+  resolvedAt: string;
+}
 
 interface AggregateRow {
   aggregate_key: string;
@@ -31,6 +37,7 @@ interface AggregateRow {
   assignee_agent_id: string | null;
   reopen_required: boolean;
   resolution_claim: string | null;
+  final_resolved_at?: string | null;
 }
 
 function table(ctx: Pick<PluginContext, "db">, name: string): string {
@@ -351,6 +358,7 @@ export async function claimPendingAggregateResolutions(
           AND cardinality(active_fingerprints) = 0
           AND (
             resolution_claim IS NULL OR
+            resolution_generation <> generation OR
             resolution_claimed_at < now() - interval '5 minutes'
           )
         ORDER BY updated_at
@@ -381,50 +389,133 @@ export async function claimPendingAggregateResolutions(
   }));
 }
 
-export async function listAggregateReopenWork(
+export async function claimPendingAggregateReopens(
   ctx: Pick<PluginContext, "db">,
   companyId: string,
   limit = 50,
 ): Promise<AggregateReopenWork[]> {
   const aggregates = table(ctx, "alert_aggregates");
-  const rows = await ctx.db.query<AggregateRow>(
-    `SELECT aggregate_key, company_id, paperclip_issue_id, alertname, severity,
-            assignee_user_id, assignee_agent_id, reopen_required, resolution_claim
-       FROM ${aggregates}
+  const claim = randomUUID();
+  const rows = await ctx.db.query<AggregateRow & { resolution_claim: string }>(
+    `WITH candidates AS (
+       SELECT aggregate_key
+         FROM ${aggregates}
+        WHERE company_id = $1
+          AND paperclip_issue_id IS NOT NULL
+          AND reopen_required
+          AND cardinality(active_fingerprints) > 0
+          AND (
+            resolution_claim IS NULL OR
+            resolution_generation <> generation OR
+            resolution_claimed_at < now() - interval '5 minutes'
+          )
+        ORDER BY updated_at
+        LIMIT $2
+        FOR UPDATE SKIP LOCKED
+     )
+     UPDATE ${aggregates} AS aggregate
+        SET resolution_claim = $3,
+            resolution_claimed_at = now(),
+            resolution_generation = aggregate.generation,
+            updated_at = now()
+       FROM candidates
+      WHERE aggregate.company_id = $1
+        AND aggregate.aggregate_key = candidates.aggregate_key
+     RETURNING aggregate.aggregate_key, aggregate.company_id,
+       aggregate.paperclip_issue_id, aggregate.alertname, aggregate.severity,
+       aggregate.assignee_user_id, aggregate.assignee_agent_id,
+       aggregate.reopen_required, aggregate.resolution_claim`,
+    [companyId, limit, claim],
+  );
+  return rows.map((row) => ({ ...fromRow(row), claim: row.resolution_claim }));
+}
+
+export async function renewAggregateReopenClaim(
+  ctx: Pick<PluginContext, "db">,
+  companyId: string,
+  aggregateKey: string,
+  claim: string,
+): Promise<boolean> {
+  const aggregates = table(ctx, "alert_aggregates");
+  const renewed = await ctx.db.execute(
+    `UPDATE ${aggregates}
+        SET resolution_claimed_at = now(), updated_at = now()
       WHERE company_id = $1
-        AND paperclip_issue_id IS NOT NULL
+        AND aggregate_key = $2
+        AND resolution_claim = $3
+        AND resolution_generation = generation
         AND reopen_required
         AND cardinality(active_fingerprints) > 0
-        AND (
-          resolution_claim IS NULL OR
-          resolution_claimed_at < now() - interval '5 minutes'
-        )
-      ORDER BY updated_at
-      LIMIT $2`,
-    [companyId, limit],
+    `,
+    [companyId, aggregateKey, claim],
   );
-  return rows.map(fromRow);
+  return renewed.rowCount === 1;
 }
 
 export async function completeAggregateReopen(
   ctx: Pick<PluginContext, "db">,
   companyId: string,
   aggregateKey: string,
-  claim?: string,
-): Promise<void> {
+  claim: string,
+): Promise<boolean> {
   const aggregates = table(ctx, "alert_aggregates");
-  await ctx.db.execute(
+  const completed = await ctx.db.execute(
     `UPDATE ${aggregates}
-        SET reopen_required = false,
-            resolution_claim = NULL,
+        -- Keep reopen_required sticky while this generation is active. A
+        -- superseded close RPC can resume after any finite lease expires.
+        SET resolution_claim = NULL,
             resolution_claimed_at = NULL,
             resolution_generation = NULL,
             updated_at = now()
       WHERE company_id = $1
         AND aggregate_key = $2
-        AND cardinality(active_fingerprints) > 0
-        AND ${claim ? "resolution_claim = $3" : "resolution_claim IS NULL"}`,
-    claim ? [companyId, aggregateKey, claim] : [companyId, aggregateKey],
+        AND resolution_claim = $3
+        AND resolution_generation = generation
+        AND reopen_required
+        AND cardinality(active_fingerprints) > 0`,
+    [companyId, aggregateKey, claim],
+  );
+  return completed.rowCount === 1;
+}
+
+export async function listFinalizedAggregateWork(
+  ctx: Pick<PluginContext, "db">,
+  companyId: string,
+  limit = 50,
+): Promise<AggregateFinalizedWork[]> {
+  const aggregates = table(ctx, "alert_aggregates");
+  // final_resolved_at is the durable desired state. Re-enforcing it repairs a
+  // stale reopen worker even if that worker dies immediately after its RPC.
+  const rows = await ctx.db.query<AggregateRow & { final_resolved_at: string }>(
+    `SELECT aggregate_key, company_id, paperclip_issue_id, alertname, severity,
+            assignee_user_id, assignee_agent_id, reopen_required, resolution_claim,
+            final_resolved_at::text
+       FROM ${aggregates}
+      WHERE company_id = $1
+        AND paperclip_issue_id IS NOT NULL
+        AND final_resolved_at IS NOT NULL
+        AND cardinality(active_fingerprints) = 0
+      ORDER BY updated_at
+      LIMIT $2`,
+    [companyId, limit],
+  );
+  return rows.map((row) => ({ ...fromRow(row), resolvedAt: row.final_resolved_at }));
+}
+
+export async function markFinalizedAggregateReconciled(
+  ctx: Pick<PluginContext, "db">,
+  companyId: string,
+  aggregateKey: string,
+): Promise<void> {
+  const aggregates = table(ctx, "alert_aggregates");
+  await ctx.db.execute(
+    `UPDATE ${aggregates}
+        SET updated_at = now()
+      WHERE company_id = $1
+        AND aggregate_key = $2
+        AND final_resolved_at IS NOT NULL
+        AND cardinality(active_fingerprints) = 0`,
+    [companyId, aggregateKey],
   );
 }
 

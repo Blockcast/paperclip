@@ -250,11 +250,12 @@ const mkCtx = (): { ctx: PluginContext; mocks: MockClients } => {
         if (sql.includes("SET resolution_claimed_at = now()")) {
           const [companyId, key, claim] = params as string[];
           const aggregate = aggregates.get(`${companyId}:${key}`);
+          const active = ((aggregate?.active_fingerprints as string[]) ?? []).length > 0;
           const valid = Boolean(
             aggregate &&
               aggregate.resolution_claim === claim &&
               aggregate.resolution_generation === aggregate.generation &&
-              ((aggregate.active_fingerprints as string[]) ?? []).length === 0,
+              (sql.includes("AND reopen_required") ? active && aggregate.reopen_required : !active),
           );
           if (valid) aggregate!.resolution_claimed_at = new Date().toISOString();
           return { rowCount: valid ? 1 : 0 };
@@ -262,7 +263,13 @@ const mkCtx = (): { ctx: PluginContext; mocks: MockClients } => {
         if (sql.includes("SET resolution_claim = NULL") && sql.includes("resolution_claim = $3")) {
           const [companyId, key, claim] = params as string[];
           const aggregate = aggregates.get(`${companyId}:${key}`);
-          if (!aggregate || aggregate.resolution_claim !== claim) return { rowCount: 0 };
+          const active = ((aggregate?.active_fingerprints as string[]) ?? []).length > 0;
+          if (
+            !aggregate ||
+            aggregate.resolution_claim !== claim ||
+            (sql.includes("AND reopen_required") &&
+              (!active || !aggregate.reopen_required || aggregate.resolution_generation !== aggregate.generation))
+          ) return { rowCount: 0 };
           aggregate.resolution_claim = null;
           aggregate.resolution_claimed_at = null;
           aggregate.resolution_generation = null;
@@ -320,19 +327,23 @@ const mkCtx = (): { ctx: PluginContext; mocks: MockClients } => {
         }
         if (sql.includes("WITH candidates AS")) {
           const claim = params[2] as string;
+          const reopening = sql.includes("AND reopen_required");
           const rows = [...aggregates.values()].filter(
             (aggregate) =>
               aggregate.company_id === companyId &&
               aggregate.paperclip_issue_id &&
               !aggregate.final_resolved_at &&
-              ((aggregate.active_fingerprints as string[]) ?? []).length === 0 &&
-              !aggregate.resolution_claim,
+              (((aggregate.active_fingerprints as string[]) ?? []).length > 0) === reopening &&
+              (!reopening || aggregate.reopen_required) &&
+              (!aggregate.resolution_claim ||
+                aggregate.resolution_generation !== aggregate.generation ||
+                mocks.db.allowClaimSteal),
           );
           return rows.map((aggregate) => {
             aggregate.resolution_claim = claim;
             aggregate.resolution_claimed_at = new Date().toISOString();
             aggregate.resolution_generation = aggregate.generation;
-            aggregate.reopen_required = false;
+            if (!reopening) aggregate.reopen_required = false;
             return {
               ...aggregate,
               resolved_at:
@@ -341,6 +352,15 @@ const mkCtx = (): { ctx: PluginContext; mocks: MockClients } => {
           });
         }
         if (sql.includes("FROM") && sql.includes("alert_aggregates")) {
+          if (sql.includes("final_resolved_at IS NOT NULL")) {
+            return [...aggregates.values()].filter(
+              (aggregate) =>
+                aggregate.company_id === companyId &&
+                aggregate.paperclip_issue_id &&
+                aggregate.final_resolved_at &&
+                ((aggregate.active_fingerprints as string[]) ?? []).length === 0,
+            );
+          }
           if (sql.includes("AND reopen_required")) {
             return [...aggregates.values()].filter(
               (aggregate) =>
@@ -1762,20 +1782,31 @@ describe("handleWebhook — aggregate lifecycle", () => {
     });
     mocks.issues.get.mockImplementation(async (issueId: string) => ({ id: issueId, status: "todo" }));
 
-    for (const alert of [alertA, alertB]) {
-      await handleWebhook(
+    await Promise.all([alertA, alertB].map((alert) =>
+      handleWebhook(
         ctx,
         baseConfig(),
         TOKEN,
         baseInput({ parsedBody: baseEnvelope({ alerts: [alert] }) }),
-      );
-    }
+      ),
+    ));
 
     expect(mocks.issues.create).not.toHaveBeenCalled();
     expect(mocks.issues.update).toHaveBeenCalledWith(
       "legacy-b",
       { status: "cancelled" },
       "company-1",
+    );
+    const cleanupCall = mocks.db.execute.mock.calls.findIndex(
+      ([sql, params]) =>
+        String(sql).includes("COALESCE(resolved_at, now())") && params[0] === "legacy-b",
+    );
+    const cancelCall = mocks.issues.update.mock.calls.findIndex(
+      ([issueId, patch]) => issueId === "legacy-b" && patch.status === "cancelled",
+    );
+    expect(cleanupCall).toBeGreaterThan(-1);
+    expect(mocks.db.execute.mock.invocationCallOrder[cleanupCall]).toBeLessThan(
+      mocks.issues.update.mock.invocationCallOrder[cancelCall]!,
     );
     expect(await mocks.state.get({
       scopeKind: "company",
@@ -1924,6 +1955,120 @@ describe("handleWebhook — aggregate lifecycle", () => {
     expect(mocks.issues.update).not.toHaveBeenCalled();
   });
 
+  it("repairs a close claimant that stalls after renewal and crashes after cancellation", async () => {
+    const { ctx, mocks } = mkCtx();
+    const alert = aggregateAlerts()[0];
+    const aggregate = await joinAggregate(ctx, "company-1", alert);
+    await bindAggregateIssue(ctx, "company-1", aggregate.aggregateKey, "issue-1", {});
+    const resolution = await resolveAggregateMember(
+      ctx,
+      "company-1",
+      aggregate.aggregateKey,
+      alert.fingerprint,
+      "2026-04-29T10:00:00Z",
+    );
+    let issueStatus = "todo";
+    let releaseClose!: () => void;
+    let markCloseStarted!: () => void;
+    const closeStarted = new Promise<void>((resolve) => { markCloseStarted = resolve; });
+    const closeGate = new Promise<void>((resolve) => { releaseClose = resolve; });
+    let firstClose = true;
+    mocks.issues.get.mockImplementation(async () => ({ id: "issue-1", status: issueStatus }));
+    mocks.issues.update.mockImplementation(async (_issueId, patch) => {
+      if (patch.status === "cancelled" && firstClose) {
+        firstClose = false;
+        markCloseStarted();
+        await closeGate;
+        issueStatus = "cancelled";
+        throw new Error("worker died after stale close");
+      }
+      issueStatus = patch.status ?? issueStatus;
+      return { id: "issue-1", status: issueStatus };
+    });
+
+    const oldClose = applyAggregateResolution(ctx, baseConfig({ autoCloseOnResolve: true }), {
+      ...aggregate,
+      paperclipIssueId: "issue-1",
+      claim: resolution.finalResolutionClaim!,
+      resolvedAt: "2026-04-29T10:00:00Z",
+    });
+    await closeStarted;
+    await joinAggregate(ctx, "company-1", {
+      ...alert,
+      startsAt: "2026-04-29T11:00:00Z",
+    });
+    mocks.db.allowClaimSteal = true;
+    await reconcileAggregateLifecycle(ctx, baseConfig({ autoCloseOnResolve: true }));
+    releaseClose();
+
+    await expect(oldClose).resolves.toBe("failed");
+    expect(issueStatus).toBe("cancelled");
+    await reconcileAggregateLifecycle(ctx, baseConfig({ autoCloseOnResolve: true }));
+    expect(issueStatus).toBe("todo");
+  });
+
+  it("re-closes an issue when a stale reopen resumes after final resolution", async () => {
+    const { ctx, mocks } = mkCtx();
+    const alert = aggregateAlerts()[0];
+    const aggregate = await joinAggregate(ctx, "company-1", alert);
+    await bindAggregateIssue(ctx, "company-1", aggregate.aggregateKey, "issue-1", {});
+    await resolveAggregateMember(
+      ctx,
+      "company-1",
+      aggregate.aggregateKey,
+      alert.fingerprint,
+      "2026-04-29T10:00:00Z",
+    );
+    await joinAggregate(ctx, "company-1", {
+      ...alert,
+      startsAt: "2026-04-29T11:00:00Z",
+    });
+    mocks.db.allowClaimSteal = true;
+    let issueStatus = "cancelled";
+    let releaseReopen!: () => void;
+    let markReopenStarted!: () => void;
+    const reopenStarted = new Promise<void>((resolve) => { markReopenStarted = resolve; });
+    const reopenGate = new Promise<void>((resolve) => { releaseReopen = resolve; });
+    let firstReopen = true;
+    mocks.issues.get.mockImplementation(async () => ({ id: "issue-1", status: issueStatus }));
+    mocks.issues.update.mockImplementation(async (_issueId, patch) => {
+      if (patch.status === "todo" && firstReopen) {
+        firstReopen = false;
+        markReopenStarted();
+        await reopenGate;
+      }
+      issueStatus = patch.status ?? issueStatus;
+      return { id: "issue-1", status: issueStatus };
+    });
+
+    const staleReopen = reconcileAggregateLifecycle(
+      ctx,
+      baseConfig({ autoCloseOnResolve: true }),
+    );
+    await reopenStarted;
+    const finalResolution = await resolveAggregateMember(
+      ctx,
+      "company-1",
+      aggregate.aggregateKey,
+      alert.fingerprint,
+      "2026-04-29T12:00:00Z",
+    );
+    await applyAggregateResolution(ctx, baseConfig({ autoCloseOnResolve: true }), {
+      ...aggregate,
+      paperclipIssueId: "issue-1",
+      claim: finalResolution.finalResolutionClaim!,
+      resolvedAt: "2026-04-29T12:00:00Z",
+    });
+    releaseReopen();
+    await staleReopen;
+
+    expect(mocks.issues.update.mock.calls.map(([, patch]) => patch.status)).toEqual([
+      "todo",
+      "cancelled",
+    ]);
+    expect(issueStatus).toBe("cancelled");
+  });
+
   it("ignores a delayed resolution from the firing generation before a re-fire", async () => {
     const { ctx, mocks } = mkCtx();
     const alert = aggregateAlerts()[0];
@@ -1969,7 +2114,7 @@ describe("handleWebhook — aggregate lifecycle", () => {
     );
   });
 
-  it("repairs escalation-cover membership before clearing a re-fire marker", async () => {
+  it("repairs escalation-cover membership before releasing the reopen claim", async () => {
     const { ctx, mocks } = mkCtx();
     const alert = aggregateAlerts()[0];
     await handleWebhook(
@@ -2012,11 +2157,12 @@ describe("handleWebhook — aggregate lifecycle", () => {
     const coverRepairCall = mocks.db.execute.mock.calls.findIndex(([sql]) =>
       String(sql).includes("SET resolved_at = NULL"),
     );
-    const markerClearCall = mocks.db.execute.mock.calls.findIndex(([sql]) =>
-      String(sql).includes("SET reopen_required = false"),
+    const claimReleaseCall = mocks.db.execute.mock.calls.findIndex(([sql]) =>
+      String(sql).includes("SET resolution_claim = NULL") &&
+      String(sql).includes("AND reopen_required"),
     );
     expect(coverRepairCall).toBeGreaterThan(-1);
-    expect(markerClearCall).toBeGreaterThan(coverRepairCall);
+    expect(claimReleaseCall).toBeGreaterThan(coverRepairCall);
   });
 
   it("keeps re-fire repair pending when the bound issue is missing", async () => {
@@ -2109,10 +2255,14 @@ describe("handleWebhook — aggregate lifecycle", () => {
       TOKEN,
       baseInput({ parsedBody: baseEnvelope({ alerts: [alert] }) }),
     );
-    mocks.issues.get.mockResolvedValue({ id: "issue-1", status: "todo" });
+    let issueStatus = "todo";
+    mocks.issues.get.mockImplementation(async () => ({ id: "issue-1", status: issueStatus }));
     mocks.issues.update
       .mockRejectedValueOnce(new Error("transient update failure"))
-      .mockResolvedValue({ id: "issue-1" });
+      .mockImplementationOnce(async (_issueId, patch) => {
+        issueStatus = patch.status ?? issueStatus;
+        return { id: "issue-1", status: issueStatus };
+      });
     const resolved = { ...alert, status: "resolved" as const, endsAt: "2026-04-29T10:00:00Z" };
     const input = baseInput({
       parsedBody: baseEnvelope({ status: "resolved", alerts: [resolved] }),
