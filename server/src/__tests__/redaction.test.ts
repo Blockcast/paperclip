@@ -257,6 +257,75 @@ describe("sanitizeRecord value-shape gate (BLO-20810)", () => {
       REDACTED_EVENT_VALUE,
     ]);
   });
+
+  // Important finding (#943 review): a single-word identity under an
+  // ambiguous tier-2 key ("author" contains "auth") is not credential-shaped
+  // — only whitespace was ever checked before, so short opaque-looking words
+  // like "octocat" were redacted despite carrying no secret.
+  it("does not redact a one-word identity value or an array of them under an ambiguous key", () => {
+    const result = redactEventPayload({
+      author: "octocat",
+      authors: ["alice", "bob"],
+    });
+
+    expect(result?.author).toBe("octocat");
+    expect(result?.authors).toEqual(["alice", "bob"]);
+  });
+
+  // Critical 2 (#943 review): the object branch of the old
+  // `sanitizeSecretMatchedValue` delegated to `sanitizeRecord`, which re-tested
+  // each child by its OWN key name and silently dropped the parent's
+  // sensitivity — `{ authorization: { value: "ghp_...", current: "..." } }`
+  // leaked both fields because neither child key ("value"/"current") is
+  // itself secret-shaped. `authorization` is a Tier-1 stem, so every
+  // descendant leaf must be redacted regardless of the child's own key name.
+  it("inherits tier-1 sensitivity into object descendants regardless of the child's own key name", () => {
+    const result = redactEventPayload({
+      authorization: { value: "ghp_1234567890abcdefghijklmnopqrstuvwxyz", current: "some-other-detail" },
+    });
+
+    expect(result?.authorization).toEqual({
+      value: REDACTED_EVENT_VALUE,
+      current: REDACTED_EVENT_VALUE,
+    });
+  });
+
+  // Critical 1 (#943 review): the old URL exemption treated ANY url-shaped
+  // value without inline `user:pass@` userinfo as safe, so a presigned or
+  // signed-query URL under a secret-ish key displayed in full. Tier-1 keys
+  // close most of this by being unconditional (apiKey below never even
+  // reaches the value-shape test); this also pins the narrow credential test
+  // itself for a Tier-2 key carrying a signed URL.
+  it("still redacts a presigned/signed-query URL under a secret-ish key", () => {
+    const result = redactEventPayload({
+      apiKey: "https://hooks.slack.test/services/T000/B000/signed-webhook-value",
+      base_url: "https://example.test/callback?token=abc123def456",
+    });
+
+    expect(result?.apiKey).toBe(REDACTED_EVENT_VALUE);
+    expect(result?.base_url).toBe(REDACTED_EVENT_VALUE);
+  });
+
+  // Ally review (#943): a spaced passphrase or cookie value was exempted by
+  // the old whitespace check. Both key stems are Tier-1 now, so the value
+  // shape never matters.
+  it("still redacts a spaced passphrase and a spaced cookie value", () => {
+    const result = redactEventPayload({
+      password: "correct horse battery staple",
+      sessionCookie: "session id=abc123; path=/; secure flag set",
+    });
+
+    expect(result?.password).toBe(REDACTED_EVENT_VALUE);
+    expect(result?.sessionCookie).toBe(REDACTED_EVENT_VALUE);
+  });
+
+  it("still redacts a long opaque token under an ambiguous key even without a known prefix", () => {
+    const result = redactEventPayload({
+      userAuthContext: "a1B2c3D4e5F6g7H8i9J0k1L2m3N4",
+    });
+
+    expect(result?.userAuthContext).toBe(REDACTED_EVENT_VALUE);
+  });
 });
 
 describe("redactApprovalPayloadForDisplay (BLO-20810)", () => {

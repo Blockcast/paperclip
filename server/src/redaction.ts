@@ -1,10 +1,36 @@
 import { redactCommandText } from "@paperclipai/adapter-utils";
 import { envBindingSecretRefSchema, envBindingUserSecretRefSchema } from "@paperclipai/shared";
 
-const SECRET_FIELD_NAME_PATTERN =
-  String.raw`[A-Za-z0-9_-]*(?:api[-_]?key|access[-_]?token|auth(?:_?token)?|token|authorization|bearer|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring|base[-_]?url)[A-Za-z0-9_-]*`;
+/**
+ * Tier 1: key-name stems with no ambiguous benign reading (BLO-20810 / CEO
+ * design constraint on #943). Any key matching one of these is redacted
+ * unconditionally — no value gate, inherited by every descendant of the
+ * matched value (object and array alike). A `credential`- or `password`-named
+ * field is never prose; the tradeoff this accepts is that a field that merely
+ * *contains* one of these words (e.g. `decision_3_traffic_ops_credential`)
+ * keeps redacting even when the ask itself isn't secret material — the filer
+ * is told which fields were scrubbed at create time (`redactedFields`) and
+ * restates them in a comment instead.
+ */
+const SECRET_TIER1_STEMS =
+  String.raw`api[-_]?key|access[-_]?token|auth(?:orization|[-_]?token)|bearer|token|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring`;
 
-const SECRET_PAYLOAD_KEY_RE = new RegExp(SECRET_FIELD_NAME_PATTERN, "i");
+/**
+ * Tier 2: substrings that collide with ordinary words — bare `auth` catches
+ * `author`/`authored`, bare `secret` catches sentence-shaped names like
+ * `no_secrets_in_payload`, and `base_url` is a benign config field that
+ * happens to contain `url`-adjacent text. These get a narrow positive
+ * credential test (`looksLikeCredentialValue`) rather than unconditional
+ * redaction, so `ask_2_author_identity` survives but `ask_2_author_identity:
+ * "ghp_..."` still redacts.
+ */
+const SECRET_TIER2_STEMS = String.raw`auth|secret|base[-_]?url`;
+
+const SECRET_FIELD_NAME_PATTERN =
+  String.raw`[A-Za-z0-9_-]*(?:${SECRET_TIER1_STEMS}|${SECRET_TIER2_STEMS})[A-Za-z0-9_-]*`;
+
+const SECRET_TIER1_KEY_RE = new RegExp(String.raw`[A-Za-z0-9_-]*(?:${SECRET_TIER1_STEMS})[A-Za-z0-9_-]*`, "i");
+const SECRET_TIER2_KEY_RE = new RegExp(String.raw`[A-Za-z0-9_-]*(?:${SECRET_TIER2_STEMS})[A-Za-z0-9_-]*`, "i");
 const COMMAND_PAYLOAD_KEY_RE =
   /(^command$|^cmd$|command[-_]?line|resolved[-_]?command|PAPERCLIP_RESOLVED_COMMAND)/i;
 const COMMAND_ARGS_PAYLOAD_KEY_RE = /^(commandArgs|command_?args|argv)$/i;
@@ -188,49 +214,83 @@ const OPAQUE_VALUE_SCHEME_PREFIX_RE = /^(?:bearer|basic|token)\s+/i;
 const URL_LIKE_VALUE_RE = /^[a-z][a-z0-9+.-]*:\/\//i;
 const PEM_BLOCK_RE = /-----BEGIN [A-Z0-9 ]+-----/;
 const URL_USERINFO_RE = /:\/\/[^/\s@]+:[^/\s@]+@/;
+const URL_CREDENTIAL_QUERY_RE = /[?&](?:token|sig|signature|api[-_]?key|access[-_]?token|auth|x-amz-signature)=/i;
+const KNOWN_SECRET_PREFIX_RE = /^(?:sk-|sk_live_|pk_live_|ghp_|gho_|ghu_|ghs_|ghr_|xox[baprs]-|AKIA|glpat-|gsk_)/i;
+const JWT_LIKE_VALUE_RE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
+const MIN_OPAQUE_TOKEN_LENGTH = 20;
 
 /**
- * Whether a plain string sitting under a secret-ish-named key is itself
- * opaque/credential-shaped, as opposed to prose or a link that merely lives
- * under a key whose name happens to contain a trigger substring — "author"
- * contains "auth", "no_secrets_in_payload" contains "secret" (BLO-20810).
- * A real credential (optionally after a "Bearer "/"Basic "/"Token " scheme
- * prefix) is a single opaque token; natural-language prose and URLs are not.
+ * Tier 2's value gate (BLO-20810 / CEO design constraint on #943 review). This
+ * is a *positive* credential test, not a benign-shape allowlist — the earlier
+ * version of this function ("does it look like prose?") let real credentials
+ * through whenever they happened to contain whitespace (a spaced passphrase)
+ * or a scheme (a presigned/webhook URL, a Postgres DSN), because those are
+ * properties real credentials can have too. Classify the *value* as
+ * credential-shaped by matching known secret prefixes, JWT shape, PEM
+ * blocks, URL userinfo/credential query params, or (as a backstop for
+ * unrecognized formats) a long single opaque token — rather than inferring
+ * "not a credential" from the absence of those properties.
  *
- * Two shapes are secret-shaped despite failing that opaque-token test, so
- * they're checked before it: a PEM block is credential material that is
- * *always* multi-line, and a URL carrying inline `user:pass@` userinfo (a
- * connection string) is credential material that is by definition URL-like.
- * Neither the whitespace exemption nor the URL exemption may swallow them
- * (regression caught in PR review of this fix, on `PRIVATE_KEY`- and
- * `connectionString`-named fields).
+ * A short single word ("octocat", "alice") is common under ambiguous
+ * tier-2 keys like `author`/`authors` and is deliberately NOT treated as
+ * credential-shaped (BLO-20810 Important finding) — real secrets this
+ * function must catch either carry a recognizable prefix/shape or are long
+ * enough that `MIN_OPAQUE_TOKEN_LENGTH` catches them.
  */
-function looksLikeSecretValue(value: string): boolean {
+function looksLikeCredentialValue(value: string): boolean {
   const trimmed = value.trim();
   if (trimmed.length === 0) return false;
   if (PEM_BLOCK_RE.test(trimmed)) return true;
-  if (URL_LIKE_VALUE_RE.test(trimmed)) return URL_USERINFO_RE.test(trimmed);
+  if (URL_LIKE_VALUE_RE.test(trimmed)) {
+    return URL_USERINFO_RE.test(trimmed) || URL_CREDENTIAL_QUERY_RE.test(trimmed);
+  }
+  if (OPAQUE_VALUE_SCHEME_PREFIX_RE.test(trimmed)) return true;
   const withoutScheme = trimmed.replace(OPAQUE_VALUE_SCHEME_PREFIX_RE, "");
   if (withoutScheme.length === 0) return false;
-  return !/\s/.test(withoutScheme);
+  if (KNOWN_SECRET_PREFIX_RE.test(withoutScheme)) return true;
+  if (JWT_LIKE_VALUE_RE.test(withoutScheme)) return true;
+  if (/\s/.test(withoutScheme)) return false;
+  return withoutScheme.length >= MIN_OPAQUE_TOKEN_LENGTH;
 }
 
 /**
  * Applies key-based redaction to a value already known to sit under a
  * secret-ish-named key, without assuming the value is a bare string —
- * recurses into arrays/objects so a name collision on the parent key (e.g.
- * `ask_2_author_identity`, `links.PR_1898_app_authored`) doesn't destroy
- * structured or non-opaque content nested beneath it.
+ * recurses into arrays *and* objects so a name collision on the parent key
+ * (e.g. `ask_2_author_identity`, `links.PR_1898_app_authored`) doesn't
+ * destroy structured or non-opaque content nested beneath it, and so a
+ * genuinely secret parent (e.g. `authorization: { value, current }`) keeps
+ * every descendant leaf covered by the same tier rather than falling back to
+ * ordinary key-name matching on the child's own key (BLO-20810 / #943 review
+ * Critical 2 — the object branch used to delegate to `sanitizeRecord`, which
+ * re-tested each child key from scratch and silently dropped the parent's
+ * sensitivity; the array branch never had that bug, so array and object must
+ * take the same path here).
+ *
+ * `tier === 1` mirrors the unconditional Tier-1 key match: every string leaf
+ * is redacted regardless of shape. `tier === 2` applies the narrow
+ * credential test (`looksLikeCredentialValue`) at every leaf.
  */
-function sanitizeSecretMatchedValue(value: unknown, options?: SanitizeOptions): unknown {
+function sanitizeSecretMatchedValue(value: unknown, options: SanitizeOptions | undefined, tier: 1 | 2): unknown {
+  if (isSecretRefBinding(value) || isUserSecretRefBinding(value)) {
+    return sanitizeValue(value, options);
+  }
+  if (isPlainBinding(value)) {
+    return { type: "plain", value: REDACTED_EVENT_VALUE };
+  }
   if (typeof value === "string") {
-    return looksLikeSecretValue(value) ? REDACTED_EVENT_VALUE : value;
+    if (tier === 1) return REDACTED_EVENT_VALUE;
+    return looksLikeCredentialValue(value) ? REDACTED_EVENT_VALUE : value;
   }
   if (Array.isArray(value)) {
-    return value.map((entry) => sanitizeSecretMatchedValue(entry, options));
+    return value.map((entry) => sanitizeSecretMatchedValue(entry, options, tier));
   }
   if (isPlainObject(value)) {
-    return sanitizeRecord(value, options);
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value)) {
+      out[k] = sanitizeSecretMatchedValue(v, options, tier);
+    }
+    return out;
   }
   return value;
 }
@@ -250,20 +310,12 @@ export function sanitizeRecord(record: Record<string, unknown>, options?: Saniti
       redacted[key] = redactSensitiveText(value);
       continue;
     }
-    if (SECRET_PAYLOAD_KEY_RE.test(key)) {
-      if (isSecretRefBinding(value)) {
-        redacted[key] = sanitizeValue(value, options);
-        continue;
-      }
-      if (isUserSecretRefBinding(value)) {
-        redacted[key] = sanitizeValue(value, options);
-        continue;
-      }
-      if (isPlainBinding(value)) {
-        redacted[key] = { type: "plain", value: REDACTED_EVENT_VALUE };
-        continue;
-      }
-      redacted[key] = sanitizeSecretMatchedValue(value, options);
+    if (SECRET_TIER1_KEY_RE.test(key)) {
+      redacted[key] = sanitizeSecretMatchedValue(value, options, 1);
+      continue;
+    }
+    if (SECRET_TIER2_KEY_RE.test(key)) {
+      redacted[key] = sanitizeSecretMatchedValue(value, options, 2);
       continue;
     }
     if (typeof value === "string" && JWT_VALUE_RE.test(value)) {
