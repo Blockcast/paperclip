@@ -98,12 +98,15 @@ describe("jobBlocksDispatch (BLO-20801)", () => {
     expect(jobBlocksDispatch(job, new Set(["run-terminal"]))).toBe(false);
   });
 
-  it("does not block on any status shape once the Job's run-id is terminal, even a genuinely active one", () => {
-    // The terminal DB row is the source of truth for BLO-20801's crash-recovery
-    // case; a stale/lagging Job status must not override it. Real liveness for
-    // a straggling pod is covered separately by the terminating-pod probe.
+  it("still blocks on a genuinely active Job even once its run-id is terminal in the DB", () => {
+    // Regression guard (PR #946 review): a terminal DB row is not proof the
+    // Job's controller has stopped -- process_lost is minted on ambiguous/
+    // lost-visibility conditions, not confirmed pod death. A Job Kubernetes
+    // reports as active > 0 right now is real, live evidence that must never
+    // be waived by the DB row alone, or dispatch could admit a second run
+    // while the old Job can still execute.
     const job = jobWithRunLabel("run-terminal", { active: 1, succeeded: 0, failed: 0 });
-    expect(jobBlocksDispatch(job, new Set(["run-terminal"]))).toBe(false);
+    expect(jobBlocksDispatch(job, new Set(["run-terminal"]))).toBe(true);
   });
 
   it("still blocks on a live Job mapped to a live (non-terminal) run", () => {
