@@ -2221,13 +2221,22 @@ export async function assertGitSensitiveAdapterWorkspaceValid(input: {
   const cwdIsWorkspaceLessFallback =
     cwdIsAgentHomeFallback ||
     sameResolvedPath(effectiveCwd, resolveAgentEmptyWorkspaceSourceDir(input.agentId));
+  // Gate on the *path*, not just the "agent_home" label, or a resumed run
+  // walks straight past this probe. Only the first workspace-less run carries
+  // source="agent_home": that cwd is then persisted into the task session, and
+  // every resume resolves it back as source="task_session" (the session branch
+  // accepts any existing dir that isUnsafeSessionWorkspaceCwd doesn't flag, and
+  // it only flags system roots). A label-only gate would therefore probe run 1
+  // and skip runs 2..n on the identical directory — so if it ever acquired a
+  // `.git`, the resumed run would hand claude_k8s the unsafe clone source this
+  // guard exists to refuse, breaking the BLO-18147 fail-closed invariant.
   if (
     K8S_GIT_SENSITIVE_ADAPTER_TYPES.has(input.adapterType) &&
     k8sIssue &&
     input.k8sRunIsolation?.isolationMode === "run" &&
     !input.resolvedWorkspace.realizationFailure &&
     effectiveCwd !== null &&
-    (cwdIsAgentHomeFallback || input.resolvedWorkspace.source === "agent_home")
+    (cwdIsWorkspaceLessFallback || input.resolvedWorkspace.source === "agent_home")
   ) {
     // Deliberately not isGitCheckout(): that helper fails open (any probe
     // error -> false), which would wave a storage-layer probe failure

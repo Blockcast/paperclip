@@ -865,6 +865,15 @@ describe("assertGitSensitiveAdapterWorkspaceValid rejects unsafe claude_k8s boot
   it("still probes the repo-less fallback source, which is not the agent-home path", async () => {
     const emptySourceCwd = resolveAgentEmptyWorkspaceSourceDir(agentId);
     expect(path.resolve(emptySourceCwd)).not.toBe(path.resolve(fallbackCwd));
+    // Lock the sibling invariant executably, not just "differs from": git
+    // resolves a repository by walking *up*, so nesting this under the
+    // checkout-bearing agent home would make the pod's `rev-parse --verify
+    // HEAD` succeed against the parent and silently reintroduce the clone.
+    // A later path cleanup must fail here rather than in the field.
+    expect(path.resolve(emptySourceCwd).startsWith(`${path.resolve(fallbackCwd)}${path.sep}`)).toBe(
+      false,
+    );
+    expect(path.dirname(path.resolve(emptySourceCwd))).not.toBe(path.resolve(fallbackCwd));
     // A repo-less source is exactly the state the resolver hands over: the
     // probe confirms not_a_checkout, so dispatch proceeds and the pod's own
     // `rev-parse --verify HEAD` fails into its non-fatal empty-workspace
@@ -898,6 +907,44 @@ describe("assertGitSensitiveAdapterWorkspaceValid rejects unsafe claude_k8s boot
             source: "agent_home",
           },
         }),
+        "k8s_agent_home_git_bootstrap_unsupported",
+        "Refusing to dispatch claude_k8s run isolation from the fallback cwd",
+      );
+    } finally {
+      await fs.rm(emptySourceCwd, { recursive: true, force: true });
+    }
+  });
+
+  // BLO-18760 follow-up: only the *first* workspace-less run carries
+  // source="agent_home". That cwd is persisted into the task session, so every
+  // resume resolves the identical directory back as source="task_session".
+  // Gating the probe on the label alone would cover run 1 and skip runs 2..n,
+  // letting a resumed run hand claude_k8s a clone source that had since
+  // acquired a `.git` — the exact fail-closed invariant BLO-18147 established.
+  it("still probes the repo-less fallback source when a resumed run relabels it task_session", async () => {
+    const emptySourceCwd = resolveAgentEmptyWorkspaceSourceDir(agentId);
+    const resumedInput = () =>
+      fallbackInput({
+        resolvedWorkspace: buildResolvedWorkspace({ cwd: emptySourceCwd, source: "task_session" }),
+        executionWorkspace: {
+          ...buildWorkspaceValidationInput().executionWorkspace,
+          baseCwd: emptySourceCwd,
+          cwd: emptySourceCwd,
+          source: "task_session",
+        },
+      });
+
+    await fs.mkdir(emptySourceCwd, { recursive: true });
+    try {
+      // Still clean on resume: the probe confirms not_a_checkout and the run
+      // proceeds, so this guard does not park otherwise-healthy resumptions.
+      await expect(assertGitSensitiveAdapterWorkspaceValid(resumedInput())).resolves.toBeUndefined();
+
+      // ...but once it acquires a checkout the resumed run must be refused too,
+      // not just the first one.
+      await runGit(emptySourceCwd, ["init"]);
+      await expectWorkspaceValidationFailure(
+        resumedInput(),
         "k8s_agent_home_git_bootstrap_unsupported",
         "Refusing to dispatch claude_k8s run isolation from the fallback cwd",
       );
