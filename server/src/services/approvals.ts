@@ -1,6 +1,7 @@
 import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { approvalComments, approvals, issueApprovals } from "@paperclipai/db";
+import { APPROVAL_UNDECIDED_STATUSES } from "@paperclipai/shared";
 import { notFound, unprocessable } from "../errors.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { agentService } from "./agents.js";
@@ -12,7 +13,10 @@ export function approvalService(db: Db) {
   const agentsSvc = agentService(db);
   const budgets = budgetService(db);
   const instanceSettings = instanceSettingsService(db);
-  const canResolveStatuses = new Set(["pending", "revision_requested"]);
+  // Single source of truth shared with the partial unique indexes on
+  // approvals.idempotency_key. If these drift, an idempotent replay becomes a raw
+  // unique-violation 500 instead of returning the original.
+  const canResolveStatuses = new Set<string>(APPROVAL_UNDECIDED_STATUSES);
   const resolvableStatuses = Array.from(canResolveStatuses);
   type ApprovalRecord = typeof approvals.$inferSelect;
   type ResolutionResult = { approval: ApprovalRecord; applied: boolean };

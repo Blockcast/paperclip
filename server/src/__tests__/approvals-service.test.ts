@@ -1,4 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import fs from "node:fs";
+import path from "node:path";
+import url from "node:url";
+import { APPROVAL_UNDECIDED_STATUSES } from "@paperclipai/shared";
 import { approvalService } from "../services/approvals.js";
 
 const mockAgentService = vi.hoisted(() => ({
@@ -287,5 +291,44 @@ describe("approvalService createWithIdempotency", () => {
 
     expect(res.deduplicated).toBe(false);
     expect(stub.inserts[0]?.idempotencyKey).toBeNull();
+  });
+});
+
+describe("approval undecided-status scope stays bound across all three sites", () => {
+  // The migration is frozen history and the drizzle schema must mirror it verbatim,
+  // so neither can import the constant — an eager cross-package import at schema
+  // module scope would also take the whole db schema down if it ever failed to
+  // resolve, which is a worse failure than the drift it prevents. So the binding is
+  // asserted here instead: if someone widens APPROVAL_UNDECIDED_STATUSES without a
+  // follow-up migration, the partial index scope and the create-side dedupe lookup
+  // silently diverge, and a replay that should return the original becomes a raw
+  // unique-violation 500.
+  function repoFile(relative: string) {
+    const here = path.dirname(url.fileURLToPath(import.meta.url));
+    return fs.readFileSync(path.resolve(here, "../../..", relative), "utf8");
+  }
+
+  function normalize(clause: string) {
+    return (clause.match(/'[^']+'/g) ?? []).sort().join(",");
+  }
+
+  const expected = [...APPROVAL_UNDECIDED_STATUSES].map((s) => `'${s}'`).sort().join(",");
+
+  it("matches the status set hardcoded in migration 0208", () => {
+    const migration = repoFile("packages/db/src/migrations/0208_approval_create_idempotency.sql");
+    const clauses = migration.match(/"status" IN \(([^)]*)\)/g) ?? [];
+    expect(clauses.length, "migration 0208 no longer scopes its indexes by status").toBe(2);
+    for (const clause of clauses) {
+      expect(normalize(clause), `migration clause drifted: ${clause}`).toBe(expected);
+    }
+  });
+
+  it("matches the status set hardcoded in the drizzle schema indexes", () => {
+    const schema = repoFile("packages/db/src/schema/approvals.ts");
+    const clauses = schema.match(/\$\{table\.status\} IN \(([^)]*)\)/g) ?? [];
+    expect(clauses.length, "approvals schema no longer scopes its indexes by status").toBe(2);
+    for (const clause of clauses) {
+      expect(normalize(clause), `schema clause drifted: ${clause}`).toBe(expected);
+    }
   });
 });
