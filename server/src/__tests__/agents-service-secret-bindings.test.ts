@@ -436,6 +436,48 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
     expect(activated?.runtimeConfig).not.toHaveProperty("heartbeat.wakeOnDemand");
   });
 
+  it("rolls back approval resolution when legacy activation validation fails", async () => {
+    const companyId = await seedCompany();
+    const agentId = await seedAgentRow(companyId, {
+      name: "Legacy Approval Above External Limit",
+      status: "pending_approval",
+      adapterType: "opencode_k8s",
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 15 } },
+    });
+    const approvalId = randomUUID();
+    await db.insert(approvals).values({
+      id: approvalId,
+      companyId,
+      type: "hire_agent",
+      status: "pending",
+      requestedByUserId: "requester",
+      payload: {
+        agentId,
+        name: "Legacy Approval Above External Limit",
+        role: "engineer",
+        adapterType: "opencode_k8s",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { maxConcurrentRuns: 17 } },
+        budgetMonthlyCents: 0,
+      },
+      updatedAt: new Date(),
+    });
+
+    await expect(
+      approvalService(db).approve(approvalId, "board-user", "Approved"),
+    ).rejects.toMatchObject({ status: 422 });
+
+    await expect(approvalService(db).getById(approvalId)).resolves.toMatchObject({
+      status: "pending",
+      decidedByUserId: null,
+      decidedAt: null,
+    });
+    await expect(agentService(db).getById(agentId)).resolves.toMatchObject({
+      status: "pending_approval",
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 15 } },
+    });
+  });
+
   it("creates agent secret bindings when a new agent persists secret_ref env", async () => {
     const companyId = await seedCompany();
     const secrets = secretService(db);
