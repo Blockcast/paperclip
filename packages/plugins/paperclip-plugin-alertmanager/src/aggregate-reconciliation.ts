@@ -5,6 +5,7 @@ import {
   completeAggregateResolution,
   listAggregateReopenWork,
   releaseAggregateResolution,
+  renewAggregateResolutionClaim,
   type AggregateReopenWork,
   type AggregateResolutionWork,
 } from "./aggregate-store.js";
@@ -24,10 +25,26 @@ export async function applyAggregateResolution(
   try {
     if (config.autoCloseOnResolve !== false) {
       const issue = await ctx.issues.get(issueId, work.companyId);
+      if (!(await renewAggregateResolutionClaim(
+        ctx,
+        work.companyId,
+        work.aggregateKey,
+        work.claim,
+      ))) {
+        return "firing";
+      }
       if (issue && issue.status !== "done" && issue.status !== "cancelled") {
         await ctx.issues.update(issueId, { status: "cancelled" }, work.companyId);
       }
     } else {
+      if (!(await renewAggregateResolutionClaim(
+        ctx,
+        work.companyId,
+        work.aggregateKey,
+        work.claim,
+      ))) {
+        return "firing";
+      }
       await ensureComment(
         ctx,
         work.companyId,

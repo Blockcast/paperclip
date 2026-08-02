@@ -27,6 +27,7 @@ import { resolveIssueRoute } from "./issue-route-resolver.js";
 import { resolveAssigneeUserId, resolveFallbackAgentId } from "./owner-resolver.js";
 import {
   escalationDeadlineMs,
+  recordSourceResolvedAndCloseCovers,
 } from "./escalation.js";
 import {
   aggregateKeyForAlert,
@@ -302,6 +303,11 @@ export async function handleFiring(
     }
     if (supersededLegacyIssueId) {
       const legacyIssue = await ctx.issues.get(supersededLegacyIssueId, companyId);
+      await recordSourceResolvedAndCloseCovers(
+        ctx,
+        companyId,
+        supersededLegacyIssueId,
+      );
       if (legacyIssue && legacyIssue.status !== "done" && legacyIssue.status !== "cancelled") {
         await ctx.issues.update(
           supersededLegacyIssueId,
@@ -618,7 +624,11 @@ export async function handleResolved(
         alert.fingerprint,
         resolvedAt,
       )
-    : { memberKnown: false, finalResolutionClaim: null };
+    : {
+        memberKnown: false,
+        resolutionAccepted: false,
+        finalResolutionClaim: null,
+      };
   const aggregate = (ctx as Partial<PluginContext>).db
     ? await getAggregate(ctx, configuredCompanyId, aggregateKey)
     : null;
@@ -626,6 +636,15 @@ export async function handleResolved(
     ctx.logger.info(
       `Alertmanager: resolved for unknown fingerprint ${alert.fingerprint}, dropping`,
     );
+    return;
+  }
+  if (resolution.memberKnown && !resolution.resolutionAccepted) {
+    ctx.logger.info(
+      `Alertmanager: stale resolution for ${alert.fingerprint} at ${resolvedAt}, dropping`,
+    );
+    await ctx.metrics.write("alertmanager.aggregate.stale_resolution", 1, {
+      alertname: alert.labels.alertname ?? "unknown",
+    });
     return;
   }
   let issueId = aggregate?.paperclipIssueId ?? existing?.paperclipIssueId;

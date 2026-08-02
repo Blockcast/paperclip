@@ -84,11 +84,19 @@ function isCoverDedupConflict(err: unknown): boolean {
 async function upsertOpenMember(ctx: PluginContext, coverIssueId: string, alertIssueId: string): Promise<boolean> {
   const ns = ctx.db.namespace;
   const result = await ctx.db.execute(
-    `INSERT INTO ${q(ns, MEMBERS_TABLE)} (id, cover_issue_id, alert_issue_id)
-     VALUES ($1, $2, $3)
+    `WITH available_cover AS (
+       SELECT cover_issue_id FROM ${q(ns, COVERS_TABLE)}
+        WHERE cover_issue_id = $2
+          AND closing_claimed_at IS NULL
+          AND cancelled_at IS NULL
+        FOR UPDATE
+     )
+     INSERT INTO ${q(ns, MEMBERS_TABLE)} (id, cover_issue_id, alert_issue_id)
+     SELECT $1, cover_issue_id, $3 FROM available_cover
      ON CONFLICT (cover_issue_id, alert_issue_id)
      DO UPDATE SET resolved_at = NULL, updated_at = now()
-     WHERE ${q(ns, MEMBERS_TABLE)}.resolved_at IS NOT NULL`,
+     WHERE ${q(ns, MEMBERS_TABLE)}.resolved_at IS NOT NULL
+       AND EXISTS (SELECT 1 FROM available_cover)`,
     [randomUUID(), coverIssueId, alertIssueId],
   );
   return result.rowCount > 0;
@@ -188,6 +196,15 @@ async function createCover(
         [retained.id, companyId, fingerprint],
       );
       const attached = await upsertOpenMember(ctx, retained.id, issue.id);
+      const [cover] = await ctx.db.query<{
+        closing_claimed_at: string | null;
+        cancelled_at: string | null;
+      }>(
+        `SELECT closing_claimed_at, cancelled_at FROM ${q(ns, COVERS_TABLE)}
+          WHERE cover_issue_id = $1`,
+        [retained.id],
+      );
+      if (cover?.closing_claimed_at || cover?.cancelled_at) continue;
       if (attached) {
         await ctx.issues.createComment(
           retained.id,
@@ -198,6 +215,9 @@ async function createCover(
       return;
     }
   }
+  throw new Error(
+    `Cannot attach ${issue.id} to escalation cover ${fingerprint}: the retained cover is closing`,
+  );
 }
 
 /**

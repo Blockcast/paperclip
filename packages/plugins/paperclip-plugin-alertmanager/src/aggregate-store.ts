@@ -78,13 +78,13 @@ export async function joinAggregate(
         updated_at = now()
       RETURNING company_id, aggregate_key
     )
-    INSERT INTO ${members}
+    INSERT INTO ${members} AS member
        (company_id, aggregate_key, fingerprint, firing, first_seen_at, last_fired_at, resolved_at)
-    SELECT company_id, aggregate_key, $5, true, $6, now(), NULL
+    SELECT company_id, aggregate_key, $5, true, $6::timestamptz, $6::timestamptz, NULL
       FROM activated_aggregate
     ON CONFLICT (company_id, aggregate_key, fingerprint) DO UPDATE SET
       firing = true,
-      last_fired_at = now(),
+      last_fired_at = GREATEST(member.last_fired_at, EXCLUDED.last_fired_at),
       resolved_at = NULL`,
     [aggregateKey, companyId, alertname, severity, alert.fingerprint, firedAt],
   );
@@ -153,7 +153,11 @@ export async function resolveAggregateMember(
   aggregateKey: string,
   fingerprint: string,
   resolvedAt: string,
-): Promise<{ memberKnown: boolean; finalResolutionClaim: string | null }> {
+): Promise<{
+  memberKnown: boolean;
+  resolutionAccepted: boolean;
+  finalResolutionClaim: string | null;
+}> {
   const aggregates = table(ctx, "alert_aggregates");
   const members = table(ctx, "alert_members");
   const claim = randomUUID();
@@ -208,7 +212,14 @@ export async function resolveAggregateMember(
             updated_at = now()
        WHERE aggregate.company_id = $1
          AND aggregate.aggregate_key = $2
-        AND (
+         AND EXISTS (
+           SELECT 1 FROM ${members} AS member
+            WHERE member.company_id = aggregate.company_id
+              AND member.aggregate_key = aggregate.aggregate_key
+              AND member.fingerprint = $3
+              AND member.last_fired_at <= $5::timestamptz
+         )
+         AND (
           $3 = ANY(aggregate.active_fingerprints) OR
           EXISTS (
             SELECT 1 FROM ${members} AS member
@@ -231,12 +242,42 @@ export async function resolveAggregateMember(
     [companyId, aggregateKey, fingerprint, claim, resolvedAt],
   );
   if (!elected) {
-    return { memberKnown: false, finalResolutionClaim: null };
+    const [member] = await ctx.db.query<{ present: boolean }>(
+      `SELECT true AS present FROM ${members}
+        WHERE company_id = $1 AND aggregate_key = $2 AND fingerprint = $3`,
+      [companyId, aggregateKey, fingerprint],
+    );
+    return {
+      memberKnown: Boolean(member),
+      resolutionAccepted: false,
+      finalResolutionClaim: null,
+    };
   }
   return {
     memberKnown: true,
+    resolutionAccepted: true,
     finalResolutionClaim: elected.resolution_claim === claim ? claim : null,
   };
+}
+
+export async function renewAggregateResolutionClaim(
+  ctx: Pick<PluginContext, "db">,
+  companyId: string,
+  aggregateKey: string,
+  claim: string,
+): Promise<boolean> {
+  const aggregates = table(ctx, "alert_aggregates");
+  const renewed = await ctx.db.execute(
+    `UPDATE ${aggregates}
+        SET resolution_claimed_at = now(), updated_at = now()
+      WHERE company_id = $1
+        AND aggregate_key = $2
+        AND resolution_claim = $3
+        AND resolution_generation = generation
+        AND cardinality(active_fingerprints) = 0`,
+    [companyId, aggregateKey, claim],
+  );
+  return renewed.rowCount === 1;
 }
 
 export async function completeAggregateResolution(
