@@ -64,6 +64,7 @@ const BLO_18278_ERROR_MESSAGE = (resetIso: string) =>
 // What the SDK's final event carries for this fault. `api_error_status` 429 is
 // the surface isRateLimitExhausted keys on.
 const BLO_18278_RESULT_JSON = { api_error_status: 429 } as const;
+const PROVIDER_CAPACITY_RESET_PROVENANCE_SOURCE = "server_parse_provider_capacity_horizon";
 
 describe("parseProviderCapacityResetHorizon", () => {
   const now = Date.parse("2026-07-26T18:50:31.000Z");
@@ -204,8 +205,10 @@ describeEmbeddedPostgres("provider 429 advertising a capacity reset honors that 
       testEnvironment: testEnvironment(HINTED_429_TEST_ADAPTER),
     });
 
-    // Control: the same 429 with the capacity horizon stripped — the shape we
-    // get when the provider rejects without advertising a reset.
+    // Control: the same 429 with the capacity horizon stripped from the server
+    // parse surfaces — the shape we get when the provider rejects without
+    // advertising a reset. It deliberately tries to smuggle persisted reset
+    // fields through adapter-owned resultJson; finalization must strip them.
     registerServerAdapter({
       type: UNHINTED_429_TEST_ADAPTER,
       execute: async () => ({
@@ -213,7 +216,15 @@ describeEmbeddedPostgres("provider 429 advertising a capacity reset honors that 
         signal: null,
         timedOut: false,
         errorMessage: "API Error: Request rejected (429) · provider capacity temporarily unavailable",
-        resultJson: { ...BLO_18278_RESULT_JSON } as Record<string, unknown>,
+        resultJson: {
+          ...BLO_18278_RESULT_JSON,
+          providerCapacityResetAt: advertisedResetIso,
+          providerCapacityResetProvenance: {
+            source: PROVIDER_CAPACITY_RESET_PROVENANCE_SOURCE,
+            errorFamily: "rate_limit_exhausted",
+            observedStatusCode: 429,
+          },
+        } as Record<string, unknown>,
       }),
       testEnvironment: testEnvironment(UNHINTED_429_TEST_ADAPTER),
     });
@@ -292,6 +303,13 @@ describeEmbeddedPostgres("provider 429 advertising a capacity reset honors that 
     expect(resultJson?.retryNotBefore).toBe(advertisedResetIso);
     expect(resultJson?.transientRetryNotBefore).toBe(advertisedResetIso);
     expect(resultJson?.providerCapacityResetAt).toBe(advertisedResetIso);
+    expect(resultJson?.providerCapacityResetProvenance).toEqual({
+      source: PROVIDER_CAPACITY_RESET_PROVENANCE_SOURCE,
+      errorFamily: "rate_limit_exhausted",
+      observedStatusCode: 429,
+      observedStatusField: "api_error_status",
+      observedCause: "rate_limit_exhausted",
+    });
 
     await expect
       .poll(() => countRetriesOf(run!.id), { timeout: 5_000, interval: 50 })
@@ -332,6 +350,7 @@ describeEmbeddedPostgres("provider 429 advertising a capacity reset honors that 
     const resultJson = failedRun?.resultJson as Record<string, unknown> | null;
     expect(resultJson?.retryNotBefore ?? null).toBeNull();
     expect(resultJson?.providerCapacityResetAt ?? null).toBeNull();
+    expect(resultJson?.providerCapacityResetProvenance ?? null).toBeNull();
 
     await expect
       .poll(() => countRetriesOf(run!.id), { timeout: 5_000, interval: 50 })

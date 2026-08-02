@@ -3469,6 +3469,7 @@ function retryAfterDelayMs(value: unknown): number | null {
 const PROVIDER_CAPACITY_RESET_AT_PATTERN =
   /(?:\b(?:resume_at|retry_not_before|retryNotBefore)\b[\\'"\s]*[:=][\\'"\s]*|\b(?:capacity\s+)?may\s+reset\s+at\s+)(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))/i;
 const PROVIDER_CAPACITY_RETRY_IN_PATTERN = /\bretry\s+in\s+(\d+(?:\.\d+)?)\s*(?:s\b|secs?\b|seconds?\b)/i;
+const PROVIDER_CAPACITY_RESET_PROVENANCE_SOURCE = "server_parse_provider_capacity_horizon";
 
 // An advertised horizon further out than this is treated as unusable rather
 // than parked on: a bad parse (or a provider bug) must not silently sideline an
@@ -3517,6 +3518,26 @@ export function parseProviderCapacityResetHorizon(
   }
 
   return null;
+}
+
+function readProviderCapacityResetStatusEvidence(
+  resultJson: Record<string, unknown> | null | undefined,
+): { field: "api_error_status" | "error_status"; statusCode: number } | null {
+  for (const field of ["api_error_status", "error_status"] as const) {
+    const status = normalizeHttpStatusCode(resultJson?.[field]);
+    if (status == null) continue;
+    return { field, statusCode: Number(status) };
+  }
+  return null;
+}
+
+function stripAdapterProviderCapacityResetMetadata(
+  resultJson: Record<string, unknown> | null | undefined,
+): Record<string, unknown> {
+  const sanitized = { ...parseObject(resultJson) };
+  delete sanitized.providerCapacityResetAt;
+  delete sanitized.providerCapacityResetProvenance;
+  return sanitized;
 }
 
 function zeroTokenUsage(usage: { inputTokens?: number; outputTokens?: number; cachedInputTokens?: number } | undefined) {
@@ -21924,22 +21945,38 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             } as Record<string, unknown>)
           : null;
 
+      const adapterResultJsonForPersistence = stripAdapterProviderCapacityResetMetadata(
+        adapterResult.resultJson,
+      );
+      const providerCapacityResetStatusEvidence = providerCapacityResetAt
+        ? readProviderCapacityResetStatusEvidence(adapterResult.resultJson)
+        : null;
       const persistedResultJson = mergeHeartbeatRunResultJson(
         mergeRunStopMetadataForAgent(agent, outcome, {
           resultJson: mergeModelProfileRunMetadata(
             mergeAdapterRecoveryMetadata({
               resultJson: {
-                ...parseObject(adapterResult.resultJson),
+                ...adapterResultJsonForPersistence,
                 configFreshness: configFreshnessResultMetadata,
                 // BLO-18278: keep the provenance of a prose-recovered horizon so
                 // the strand comment can name the reset instant, and so a wrong
                 // parse is debuggable from the persisted run rather than only
-                // from the raw log. Set here, inside `resultJson`, because
-                // mergeAdapterRecoveryMetadata only forwards errorFamily and
-                // retryNotBefore — any other key passed alongside them is
-                // dropped.
+                // from the raw log. Adapter-owned capacity-reset fields were
+                // stripped above; the paired provenance discriminator below is
+                // written only by this server path.
                 ...(providerCapacityResetAt
-                  ? { providerCapacityResetAt: providerCapacityResetAt.toISOString() }
+                  ? {
+                      providerCapacityResetAt: providerCapacityResetAt.toISOString(),
+                      providerCapacityResetProvenance: {
+                        source: PROVIDER_CAPACITY_RESET_PROVENANCE_SOURCE,
+                        errorFamily: "rate_limit_exhausted",
+                        observedStatusCode: providerCapacityResetStatusEvidence?.statusCode ?? null,
+                        observedStatusField: providerCapacityResetStatusEvidence?.field ?? null,
+                        observedCause: rateLimitExhaustedOverride
+                          ? "rate_limit_exhausted"
+                          : "provider_throttled_no_progress",
+                      },
+                    }
                   : {}),
                 ...(prReviewIncompleteOverride
                   ? {
