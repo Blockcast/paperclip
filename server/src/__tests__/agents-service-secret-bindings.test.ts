@@ -611,6 +611,97 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
     expect(mockNotifyHireApproved).toHaveBeenCalledTimes(1);
   });
 
+  it("persists a generated built-in agent id for post-commit retries", async () => {
+    const companyId = await seedCompany();
+    const approvalId = randomUUID();
+    await db.insert(approvals).values({
+      id: approvalId,
+      companyId,
+      type: "hire_agent",
+      status: "pending",
+      requestedByUserId: "requester",
+      payload: {
+        name: "Generated Built-in Retry",
+        role: "engineer",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        budgetMonthlyCents: 0,
+        sourceBuiltInAgentKey: "briefs",
+      },
+      updatedAt: new Date(),
+    });
+    mockEnsureBuiltInAgent
+      .mockRejectedValueOnce(new Error("injected filesystem failure"))
+      .mockResolvedValueOnce(undefined);
+
+    await expect(
+      approvalService(db).approve(approvalId, "board-user", "Approved"),
+    ).rejects.toThrow("injected filesystem failure");
+    const approved = await approvalService(db).getById(approvalId);
+    expect(approved).toMatchObject({
+      status: "approved",
+      payload: { agentId: expect.any(String) },
+    });
+    expect(mockNotifyHireApproved).not.toHaveBeenCalled();
+
+    await expect(
+      approvalService(db).approve(approvalId, "board-user", "Approved"),
+    ).resolves.toMatchObject({ applied: false });
+    expect(mockEnsureBuiltInAgent).toHaveBeenCalledTimes(2);
+    expect(mockNotifyHireApproved).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not redeliver a claimed notification after post-hook persistence fails", async () => {
+    const companyId = await seedCompany();
+    const agentId = await seedAgentRow(companyId, {
+      name: "Built-in Notification Claim",
+      status: "pending_approval",
+      adapterType: "codex_local",
+    });
+    const approvalId = randomUUID();
+    await db.insert(approvals).values({
+      id: approvalId,
+      companyId,
+      type: "hire_agent",
+      status: "pending",
+      requestedByUserId: "requester",
+      payload: {
+        agentId,
+        name: "Built-in Notification Claim",
+        role: "engineer",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        budgetMonthlyCents: 0,
+        sourceBuiltInAgentKey: "briefs",
+      },
+      updatedAt: new Date(),
+    });
+    mockEnsureBuiltInAgent.mockResolvedValue(undefined);
+    await db.execute(sql`
+      alter table activity_log
+      add constraint test_reject_hire_completion
+      check (action <> 'approval.hire_post_commit_completed')
+    `);
+
+    try {
+      await expect(
+        approvalService(db).approve(approvalId, "board-user", "Approved"),
+      ).rejects.toThrow();
+      expect(mockNotifyHireApproved).toHaveBeenCalledTimes(1);
+
+      await expect(
+        approvalService(db).approve(approvalId, "board-user", "Approved"),
+      ).resolves.toMatchObject({ applied: false });
+      expect(mockEnsureBuiltInAgent).toHaveBeenCalledTimes(1);
+      expect(mockNotifyHireApproved).toHaveBeenCalledTimes(1);
+    } finally {
+      await db.execute(sql`
+        alter table activity_log
+        drop constraint test_reject_hire_completion
+      `);
+    }
+  });
+
   it("creates agent secret bindings when a new agent persists secret_ref env", async () => {
     const companyId = await seedCompany();
     const secrets = secretService(db);

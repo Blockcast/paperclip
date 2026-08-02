@@ -39,42 +39,59 @@ export function approvalService(db: Db) {
     agentId: string,
     approvedAt: Date,
   ) {
-    await db.transaction(async (tx) => {
+    const shouldNotify = await db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
       await tx.execute(sql`select ${approvals.id} from ${approvals} where ${approvals.id} = ${approval.id} for update`);
-      const completed = await txDb
+      const notificationClaim = await txDb
         .select({ id: activityLog.id })
         .from(activityLog)
         .where(
           and(
             eq(activityLog.companyId, approval.companyId),
-            eq(activityLog.action, "approval.hire_post_commit_completed"),
+            inArray(activityLog.action, [
+              "approval.hire_notification_claimed",
+              "approval.hire_post_commit_completed",
+            ]),
             eq(activityLog.entityType, "approval"),
             eq(activityLog.entityId, approval.id),
           ),
         )
         .then((rows) => rows[0] ?? null);
-      if (completed) return;
+      if (notificationClaim) return false;
 
       const payload = approval.payload as Record<string, unknown>;
       await reconcileApprovedBuiltInAgent(txDb, approval.companyId, payload);
-      await notifyHireApproved(txDb, {
-        companyId: approval.companyId,
-        agentId,
-        source: "approval",
-        sourceId: approval.id,
-        approvedAt,
-      });
       await txDb.insert(activityLog).values({
         companyId: approval.companyId,
         actorType: "system",
         actorId: "approval_service",
-        action: "approval.hire_post_commit_completed",
+        action: "approval.hire_notification_claimed",
         entityType: "approval",
         entityId: approval.id,
         agentId,
         details: { sourceBuiltInAgentKey: payload.sourceBuiltInAgentKey },
       });
+      return true;
+    });
+
+    if (!shouldNotify) return;
+
+    await notifyHireApproved(db, {
+      companyId: approval.companyId,
+      agentId,
+      source: "approval",
+      sourceId: approval.id,
+      approvedAt,
+    });
+    await db.insert(activityLog).values({
+      companyId: approval.companyId,
+      actorType: "system",
+      actorId: "approval_service",
+      action: "approval.hire_post_commit_completed",
+      entityType: "approval",
+      entityId: approval.id,
+      agentId,
+      details: { sourceBuiltInAgentKey: (approval.payload as Record<string, unknown>).sourceBuiltInAgentKey },
     });
   }
 
@@ -183,6 +200,7 @@ export function approvalService(db: Db) {
           txDb,
         );
 
+        let approval = updated;
         let hireApprovedAgentId: string | null = null;
         if (applied && updated.type === "hire_agent") {
           const payload = updated.payload as Record<string, unknown>;
@@ -214,6 +232,15 @@ export function approvalService(db: Db) {
               lastHeartbeatAt: null,
             });
             hireApprovedAgentId = created?.id ?? null;
+            if (hireApprovedAgentId) {
+              const persistedPayload = { ...payload, agentId: hireApprovedAgentId };
+              approval = await txDb
+                .update(approvals)
+                .set({ payload: persistedPayload, updatedAt: new Date() })
+                .where(eq(approvals.id, updated.id))
+                .returning()
+                .then((rows) => rows[0] ?? { ...updated, payload: persistedPayload });
+            }
           }
           if (hireApprovedAgentId) {
             const budgetMonthlyCents =
@@ -233,7 +260,7 @@ export function approvalService(db: Db) {
           }
         }
 
-        return { approval: updated, applied, hireApprovedAgentId };
+        return { approval, applied, hireApprovedAgentId };
       });
 
       const payload = result.approval.payload as Record<string, unknown>;
