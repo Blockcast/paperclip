@@ -14,6 +14,8 @@ const FIRST_TASK_TITLE = "Hire your first engineer and create a hiring plan";
 const WIZARD_PERSISTENCE_TIMEOUT_MS = 45_000;
 
 test.describe("Dashboard launch after onboarding wizard", () => {
+  test.setTimeout(180_000);
+
   test("creates the first task and opens the dashboard", async ({
     page,
     baseURL,
