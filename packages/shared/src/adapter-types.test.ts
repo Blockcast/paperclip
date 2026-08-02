@@ -18,7 +18,7 @@ describe("dynamic adapter type validation schemas", () => {
     ).toBe("external_adapter");
   });
 
-  it("accepts 15 heartbeat slots and rejects values above the supported maximum", () => {
+  it("preserves the shared concurrency range for local and external adapters", () => {
     const runtimeConfig = { heartbeat: { maxConcurrentRuns: 15 } };
 
     expect(
@@ -29,6 +29,13 @@ describe("dynamic adapter type validation schemas", () => {
       }).runtimeConfig,
     ).toEqual(runtimeConfig);
     expect(updateAgentSchema.parse({ runtimeConfig }).runtimeConfig).toEqual(runtimeConfig);
+    expect(createAgentSchema.parse({
+      name: "Local Concurrent Agent",
+      adapterType: "codex_local",
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: HEARTBEAT_POLICY_MAX_CONCURRENT_MAX } },
+    }).runtimeConfig).toEqual({
+      heartbeat: { maxConcurrentRuns: HEARTBEAT_POLICY_MAX_CONCURRENT_MAX },
+    });
 
     const unsupported = {
       runtimeConfig: {

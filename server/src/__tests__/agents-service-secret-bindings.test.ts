@@ -73,6 +73,71 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
     return companyId;
   }
 
+  it("enforces external-lifecycle concurrency at the persistence boundary", async () => {
+    const companyId = await seedCompany();
+    const agents = agentService(db);
+    const base = {
+      role: "engineer" as const,
+      status: "idle" as const,
+      adapterConfig: {},
+      spentMonthlyCents: 0,
+      lastHeartbeatAt: null,
+    };
+
+    const external = await agents.create(companyId, {
+      ...base,
+      name: "External Default",
+      adapterType: "opencode_k8s",
+      runtimeConfig: {},
+    });
+    expect(external.runtimeConfig).toMatchObject({
+      heartbeat: { maxConcurrentRuns: 16 },
+    });
+
+    const local = await agents.create(companyId, {
+      ...base,
+      name: "Local High Concurrency",
+      adapterType: "codex_local",
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 50 } },
+    });
+    expect(local.runtimeConfig).toMatchObject({
+      heartbeat: { maxConcurrentRuns: 50 },
+    });
+
+    await expect(agents.create(companyId, {
+      ...base,
+      name: "External Over Cap",
+      adapterType: "opencode_k8s",
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 17 } },
+    })).rejects.toMatchObject({ status: 422 });
+    await expect(agents.update(external.id, {
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 17 } },
+    })).rejects.toMatchObject({ status: 422 });
+    await expect(agents.update(local.id, {
+      adapterType: "opencode_k8s",
+    })).rejects.toMatchObject({ status: 422 });
+
+    const pending = await agents.create(companyId, {
+      ...base,
+      name: "Pending External",
+      status: "pending_approval",
+      adapterType: "opencode_k8s",
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 15 } },
+    });
+    await expect(agents.activatePendingApproval(pending.id, {
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 17 } },
+    })).rejects.toMatchObject({ status: 422 });
+
+    const switched = await agents.update(local.id, {
+      adapterType: "opencode_k8s",
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 15 } },
+    });
+    expect(switched).toMatchObject({
+      adapterType: "opencode_k8s",
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 15 } },
+    });
+  });
+
   it("creates agent secret bindings when a new agent persists secret_ref env", async () => {
     const companyId = await seedCompany();
     const secrets = secretService(db);

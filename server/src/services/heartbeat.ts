@@ -30,6 +30,8 @@ import {
 import {
   HEARTBEAT_POLICY_COOLDOWN_MAX_SEC,
   HEARTBEAT_POLICY_COOLDOWN_MIN_SEC,
+  EXTERNAL_LIFECYCLE_ADAPTER_TYPES,
+  EXTERNAL_LIFECYCLE_MAX_CONCURRENT_RUNS,
   HEARTBEAT_POLICY_INTERVAL_MAX_SEC,
   HEARTBEAT_POLICY_INTERVAL_MIN_SEC,
   HEARTBEAT_POLICY_MAX_CONCURRENT_MAX,
@@ -407,7 +409,7 @@ const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 50;
  * misconfigured `maxConcurrentRuns` cannot alone blow past what the cluster
  * is provisioned to run for one agent concurrently.
  */
-const EXTERNAL_LIFECYCLE_SLOT_CAPACITY = 16;
+const EXTERNAL_LIFECYCLE_SLOT_CAPACITY = EXTERNAL_LIFECYCLE_MAX_CONCURRENT_RUNS;
 const STALE_QUEUED_MAINTENANCE_WAKE_MAX_AGE_MS = 30 * 60 * 1000;
 const STALE_QUEUED_MAINTENANCE_WAKE_BATCH_SIZE = 250;
 const STALE_QUEUED_MAINTENANCE_WAKE_REASONS = [
@@ -1044,10 +1046,7 @@ const SESSIONED_LOCAL_ADAPTERS = new Set([
   "opencode_local",
   "pi_local",
 ]);
-const EXTERNAL_LIFECYCLE_ADAPTERS = new Set([
-  "claude_k8s",
-  "opencode_k8s",
-]);
+const EXTERNAL_LIFECYCLE_ADAPTERS = new Set<string>(EXTERNAL_LIFECYCLE_ADAPTER_TYPES);
 // Fallback staleness window for external-lifecycle (k8s Job) runs when the
 // kube API is unavailable (local dev, RBAC misconfig, transient failure).
 // In-cluster the reaper uses listLiveAgentJobRunIds() to identify dead

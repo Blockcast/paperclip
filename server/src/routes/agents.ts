@@ -32,6 +32,10 @@ import {
   LOW_TRUST_REVIEW_PRESET,
 } from "@paperclipai/shared";
 import {
+  EXTERNAL_LIFECYCLE_ADAPTER_TYPES,
+  EXTERNAL_LIFECYCLE_MAX_CONCURRENT_RUNS,
+} from "@paperclipai/shared/validators/agent";
+import {
   resolvePaperclipInstanceRootForAdapter,
   readPaperclipSkillSyncPreference,
   writePaperclipSkillSyncPreference,
@@ -118,6 +122,7 @@ import {
 
 const RUN_LOG_DEFAULT_LIMIT_BYTES = 256_000;
 const RUN_LOG_MAX_LIMIT_BYTES = 1024 * 1024;
+const EXTERNAL_LIFECYCLE_ADAPTER_TYPE_SET = new Set<string>(EXTERNAL_LIFECYCLE_ADAPTER_TYPES);
 
 // Sentinel substituted into adapter_config.env values by redactAgentSecrets()
 // on the GET response. A naive UI/operator round-trip (read agent, edit, save)
@@ -1281,7 +1286,18 @@ export function agentRoutes(
     };
   }
 
-  function normalizeNewAgentRuntimeConfig(runtimeConfig: unknown): Record<string, unknown> {
+  function assertExternalLifecycleConcurrencyPolicy(adapterType: string, runtimeConfig: unknown) {
+    if (!EXTERNAL_LIFECYCLE_ADAPTER_TYPE_SET.has(adapterType)) return;
+    const heartbeat = asRecord(asRecord(runtimeConfig)?.heartbeat);
+    const maxConcurrentRuns = parseNumberLike(heartbeat?.maxConcurrentRuns);
+    if (maxConcurrentRuns !== null && maxConcurrentRuns > EXTERNAL_LIFECYCLE_MAX_CONCURRENT_RUNS) {
+      throw unprocessable(
+        `heartbeat.maxConcurrentRuns must not exceed ${EXTERNAL_LIFECYCLE_MAX_CONCURRENT_RUNS} for external-lifecycle adapters`,
+      );
+    }
+  }
+
+  function normalizeNewAgentRuntimeConfig(runtimeConfig: unknown, adapterType: string): Record<string, unknown> {
     const parsedRuntimeConfig = asRecord(runtimeConfig);
     const normalizedRuntimeConfig = parsedRuntimeConfig ? { ...parsedRuntimeConfig } : {};
     const parsedHeartbeat = asRecord(normalizedRuntimeConfig.heartbeat);
@@ -1291,7 +1307,9 @@ export function agentRoutes(
       heartbeat.enabled = false;
     }
     if (parseNumberLike(heartbeat.maxConcurrentRuns) == null) {
-      heartbeat.maxConcurrentRuns = AGENT_DEFAULT_MAX_CONCURRENT_RUNS;
+      heartbeat.maxConcurrentRuns = EXTERNAL_LIFECYCLE_ADAPTER_TYPE_SET.has(adapterType)
+        ? EXTERNAL_LIFECYCLE_MAX_CONCURRENT_RUNS
+        : AGENT_DEFAULT_MAX_CONCURRENT_RUNS;
     }
 
     normalizedRuntimeConfig.heartbeat = heartbeat;
@@ -2712,10 +2730,12 @@ export function agentRoutes(
       adapterType: hireInput.adapterType,
       adapterConfig: desiredSkillAssignment.adapterConfig,
     });
+    const requestedRuntimeConfig = normalizeNewAgentRuntimeConfig(hireInput.runtimeConfig, hireInput.adapterType);
+    assertExternalLifecycleConcurrencyPolicy(hireInput.adapterType, requestedRuntimeConfig);
     const normalizedRuntimeConfig = await normalizeRuntimeConfigAdapterConfigsForPersistence(
       companyId,
       hireInput.adapterType,
-      normalizeNewAgentRuntimeConfig(hireInput.runtimeConfig),
+      requestedRuntimeConfig,
       normalizedAdapterConfig,
     );
     const normalizedHireInput = {
@@ -2925,10 +2945,12 @@ export function agentRoutes(
       adapterType: createInput.adapterType,
       adapterConfig: desiredSkillAssignment.adapterConfig,
     });
+    const requestedRuntimeConfig = normalizeNewAgentRuntimeConfig(createInput.runtimeConfig, createInput.adapterType);
+    assertExternalLifecycleConcurrencyPolicy(createInput.adapterType, requestedRuntimeConfig);
     const normalizedRuntimeConfig = await normalizeRuntimeConfigAdapterConfigsForPersistence(
       companyId,
       createInput.adapterType,
-      normalizeNewAgentRuntimeConfig(createInput.runtimeConfig),
+      requestedRuntimeConfig,
       normalizedAdapterConfig,
     );
     await assertAgentEnvironmentSelection(companyId, createInput.adapterType, createInput.defaultEnvironmentId);
@@ -3328,6 +3350,12 @@ export function agentRoutes(
         mergeRuntimeConfigPatchForAgentUpdate(existing.runtimeConfig, runtimeConfig),
       );
       assertNoAgentRuntimeConfigAdapterConfigMutation(req, requestedRuntimeConfig);
+    }
+    if (requestedRuntimeConfig || requestedAdapterType !== existing.adapterType) {
+      assertExternalLifecycleConcurrencyPolicy(
+        requestedAdapterType,
+        requestedRuntimeConfig ?? existing.runtimeConfig,
+      );
     }
     const touchesAdapterConfiguration =
       hasOwn(patchData, "adapterType") ||

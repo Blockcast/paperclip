@@ -34,6 +34,10 @@ import {
   type AgentEligibilityAgent,
   type AgentApiKeyScope,
 } from "@paperclipai/shared";
+import {
+  EXTERNAL_LIFECYCLE_ADAPTER_TYPES,
+  EXTERNAL_LIFECYCLE_MAX_CONCURRENT_RUNS,
+} from "@paperclipai/shared/validators/agent";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import { syncAgentAdapterEnvBindings } from "./agent-secret-bindings.js";
 import { normalizeAgentPermissions } from "./agent-permissions.js";
@@ -96,6 +100,8 @@ interface AgentShortnameRow {
 interface AgentShortnameCollisionOptions {
   excludeAgentId?: string | null;
 }
+
+const EXTERNAL_LIFECYCLE_ADAPTER_TYPE_SET = new Set<string>(EXTERNAL_LIFECYCLE_ADAPTER_TYPES);
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -198,15 +204,34 @@ function parseFiniteNumberLike(value: unknown): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-function normalizeRuntimeConfigForNewAgent(runtimeConfig: unknown): Record<string, unknown> {
+function assertExternalLifecycleConcurrencyPolicy(adapterType: string, runtimeConfig: unknown) {
+  if (!EXTERNAL_LIFECYCLE_ADAPTER_TYPE_SET.has(adapterType)) return;
+  const heartbeat = isPlainRecord(runtimeConfig) && isPlainRecord(runtimeConfig.heartbeat)
+    ? runtimeConfig.heartbeat
+    : {};
+  const maxConcurrentRuns = parseFiniteNumberLike(heartbeat.maxConcurrentRuns);
+  if (maxConcurrentRuns !== null && maxConcurrentRuns > EXTERNAL_LIFECYCLE_MAX_CONCURRENT_RUNS) {
+    throw unprocessable(
+      `heartbeat.maxConcurrentRuns must not exceed ${EXTERNAL_LIFECYCLE_MAX_CONCURRENT_RUNS} for external-lifecycle adapters`,
+    );
+  }
+}
+
+function normalizeRuntimeConfigForNewAgent(
+  runtimeConfig: unknown,
+  adapterType: string,
+): Record<string, unknown> {
   const normalizedRuntimeConfig = isPlainRecord(runtimeConfig) ? { ...runtimeConfig } : {};
   const heartbeat = isPlainRecord(normalizedRuntimeConfig.heartbeat)
     ? { ...normalizedRuntimeConfig.heartbeat }
     : {};
   if (parseFiniteNumberLike(heartbeat.maxConcurrentRuns) == null) {
-    heartbeat.maxConcurrentRuns = AGENT_DEFAULT_MAX_CONCURRENT_RUNS;
+    heartbeat.maxConcurrentRuns = EXTERNAL_LIFECYCLE_ADAPTER_TYPE_SET.has(adapterType)
+      ? EXTERNAL_LIFECYCLE_MAX_CONCURRENT_RUNS
+      : AGENT_DEFAULT_MAX_CONCURRENT_RUNS;
   }
   normalizedRuntimeConfig.heartbeat = heartbeat;
+  assertExternalLifecycleConcurrencyPolicy(adapterType, normalizedRuntimeConfig);
   return normalizedRuntimeConfig;
 }
 
@@ -534,6 +559,15 @@ export function agentService(db: Db) {
         { adapterType: (normalizedPatch.adapterType ?? existing.adapterType) as string },
       );
     }
+    if (
+      Object.prototype.hasOwnProperty.call(normalizedPatch, "adapterType")
+      || Object.prototype.hasOwnProperty.call(normalizedPatch, "runtimeConfig")
+    ) {
+      assertExternalLifecycleConcurrencyPolicy(
+        (normalizedPatch.adapterType ?? existing.adapterType) as string,
+        normalizedPatch.runtimeConfig ?? existing.runtimeConfig,
+      );
+    }
 
     const shouldRecordRevision = Boolean(options?.recordRevision) && hasConfigPatchFields(normalizedPatch);
     const beforeConfig = shouldRecordRevision ? buildConfigSnapshot(existing) : null;
@@ -609,8 +643,8 @@ export function agentService(db: Db) {
 
       const role = data.role ?? "general";
       const normalizedPermissions = normalizeAgentPermissions(data.permissions, role);
-      const runtimeConfig = normalizeRuntimeConfigForNewAgent(data.runtimeConfig);
       const adapterType = data.adapterType ?? "process";
+      const runtimeConfig = normalizeRuntimeConfigForNewAgent(data.runtimeConfig, adapterType);
       const adapterConfig = isPlainRecord(data.adapterConfig)
         ? await secretsSvc.normalizeAdapterConfigForPersistence(companyId, data.adapterConfig, { adapterType })
         : {};
@@ -812,6 +846,10 @@ export function agentService(db: Db) {
             (patch.role ?? existing.role) as string,
           );
         }
+        assertExternalLifecycleConcurrencyPolicy(
+          (patch.adapterType ?? existing.adapterType) as string,
+          patch.runtimeConfig ?? existing.runtimeConfig,
+        );
         const updated = await tx
           .update(agents)
           .set({ ...patch, status: "idle", updatedAt: new Date() })

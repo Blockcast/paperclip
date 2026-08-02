@@ -22,7 +22,9 @@ export const HEARTBEAT_POLICY_INTERVAL_MAX_SEC = 86_400;
 export const HEARTBEAT_POLICY_COOLDOWN_MIN_SEC = 0;
 export const HEARTBEAT_POLICY_COOLDOWN_MAX_SEC = 3_600;
 export const HEARTBEAT_POLICY_MAX_CONCURRENT_MIN = 1;
-export const HEARTBEAT_POLICY_MAX_CONCURRENT_MAX = 16;
+export const HEARTBEAT_POLICY_MAX_CONCURRENT_MAX = 50;
+export const EXTERNAL_LIFECYCLE_MAX_CONCURRENT_RUNS = 16;
+export const EXTERNAL_LIFECYCLE_ADAPTER_TYPES = ["claude_k8s", "opencode_k8s"] as const;
 
 export const heartbeatPresetSchema = z.enum(["economic", "balanced", "aggressive"]);
 export type HeartbeatPreset = z.infer<typeof heartbeatPresetSchema>;
