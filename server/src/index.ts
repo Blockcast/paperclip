@@ -1161,6 +1161,33 @@ export async function startServer(): Promise<StartedServer> {
     } else {
       heartbeatStartupRecoveryPending = true;
       const startupHeartbeatRecovery = (async () => {
+        // BLO-19722: finish any worker-crash recovery a previous crash could
+        // not. These rows are already terminal (`interrupted` /
+        // `worker_crashed`), so the orphan reaper below can never find them —
+        // it only scans `running`. Without this pass nothing would ever
+        // release the issue execution locks they still hold.
+        //
+        // First, deliberately: a crash-marked run may still own an issue's
+        // execution lock, and both the reattach and reap passes below make
+        // ownership decisions that should see the post-recovery state. It is
+        // bounded by batch size, and each run is claimed with a durable,
+        // expiring lease, so a slow or partly-failing backlog cannot stall
+        // startup — whatever is left is picked up next start.
+        try {
+          const crashRecovery = await heartbeat.reconcileWorkerCrashedRuns();
+          if (crashRecovery.reconciledRunIds.length > 0 || crashRecovery.unresolvedRunIds.length > 0) {
+            logger.warn(
+              crashRecovery,
+              "startup worker-crash recovery reconciliation complete",
+            );
+          }
+        } catch (err) {
+          logger.error(
+            { err },
+            "startup worker-crash recovery reconciliation failed - crash-marked runs stay unrecovered until the next start",
+          );
+        }
+
         try {
           const reattachedExternalRuns = await heartbeat.resumeRunningExternalRuntimeRuns();
           if (reattachedExternalRuns > 0) {

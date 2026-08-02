@@ -44,6 +44,25 @@ export const heartbeatRuns = pgTable(
       onDelete: "set null",
     }),
     processLossRetryCount: integer("process_loss_retry_count").notNull().default(0),
+    // BLO-19722: set once worker-crash recovery has completed every *required*
+    // cleanup step for this run. It is the durable completion marker
+    // `reconcileWorkerCrashedRuns` selects on, and it cannot be inferred from
+    // the existence of a retry child: recovery deliberately completes *without*
+    // a retry when the agent is not invokable, and conversely commits the retry
+    // before the finalization steps that follow it. Only ever written by that
+    // recovery path. See migration 0208.
+    crashRecoveryCompletedAt: timestamp("crash_recovery_completed_at", { withTimezone: true }),
+    // Poison-row backoff. Candidates are drained oldest-first and the batch is
+    // capped, so a run whose required cleanup permanently fails would otherwise
+    // sit at the head of that order and freeze recovery of every newer run.
+    // Recording attempts and a next-attempt time lets such a row fall out of
+    // the candidate window while staying visibly *unresolved* — completion is
+    // never stamped just to drain the batch. Nullable with no default so the
+    // ADD COLUMN stays rewrite-free on this large table; readers coalesce to 0,
+    // as `processLossRetryCount` already is elsewhere.
+    crashRecoveryAttempts: integer("crash_recovery_attempts"),
+    crashRecoveryNextAttemptAt: timestamp("crash_recovery_next_attempt_at", { withTimezone: true }),
+    crashRecoveryLastError: text("crash_recovery_last_error"),
     scheduledRetryAt: timestamp("scheduled_retry_at", { withTimezone: true }),
     scheduledRetryAttempt: integer("scheduled_retry_attempt").notNull().default(0),
     scheduledRetryReason: text("scheduled_retry_reason"),
@@ -114,5 +133,20 @@ export const heartbeatRuns = pgTable(
       table.companyId,
       table.createdAt.desc(),
     ),
+    // BLO-19722: serves the startup crash-recovery candidate scan, which is
+    // bounded by batch size and ordered oldest-first rather than by wall time.
+    // The partial predicate keeps this index near-empty in steady state — only
+    // crash-marked runs whose recovery has not completed are members, and every
+    // recovered run leaves the index — so the common "nothing to reconcile"
+    // start is an empty index probe.
+    //
+    // On a populated database this index is created out of band with
+    // `CREATE INDEX CONCURRENTLY` (see migration 0209); recovery is correct
+    // without it, degrading to a sequential scan that still finds every
+    // candidate. Declared here so drizzle's schema diff stays clean and so
+    // fresh/bootstrap databases get it automatically.
+    crashRecoveryPendingIdx: index("heartbeat_runs_crash_recovery_pending_idx")
+      .on(table.finishedAt, table.id)
+      .where(sql`${table.errorCode} = 'worker_crashed' and ${table.crashRecoveryCompletedAt} is null`),
   }),
 );
