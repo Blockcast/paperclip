@@ -14,22 +14,26 @@
  * The guard fires only on a genuine collision — all three must hold:
  *   1. the assignee is a configured PR reviewer (PAPERCLIP_PR_REVIEWER_AGENT_IDS),
  *   2. the issue text resolves to a canonical GitHub PR URL, and
- *   3. that exact PR already has a queued/running review run on that reviewer.
+ *   3. that exact PR already has a queued/running review run in the configured
+ *      reviewer pool.
  *
  * Keying on the collision rather than on the assignee is deliberate: issues
  * about the reviewer's own tooling stay creatable, and creator identity is
  * useless as a signal here (68% of the measured duplicates were attributed to
  * a user rather than to the filing agent).
  *
- * Failure direction is open. An unparseable reference, a casing mismatch, or a
- * lookup error lets the issue through — a duplicate review issue is a cost
- * problem, whereas wrongly blocking issue creation is a correctness problem.
+ * Failure direction is open. An unparseable reference or lookup error lets the
+ * issue through — a duplicate review issue is a cost problem, whereas wrongly
+ * blocking issue creation is a correctness problem.
  */
 import { type Db, heartbeatRuns } from "@paperclipai/db";
-import { and, desc, eq, inArray } from "drizzle-orm";
+import { and, desc, eq, inArray, or, sql } from "drizzle-orm";
 import { readGithubPrReviewerAgentIds } from "../config.js";
 import { conflict } from "../errors.js";
 import { logger } from "../middleware/logger.js";
+
+type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
+type DuplicatePrReviewIssueGuardDb = Pick<Db | DbTransaction, "select">;
 
 /**
  * A review is "already live" while its run is queued or in flight. Mirrors
@@ -69,6 +73,10 @@ export type PullRequestRef = {
   prNumber: number;
 };
 
+export function normalizePrReviewRepoFullName(repoFullName: string): string {
+  return repoFullName.trim().toLowerCase();
+}
+
 /**
  * Mirror of `buildPrReviewerTaskKey` (server/src/routes/github-webhook.ts).
  * The two MUST produce byte-identical keys or this guard silently stops
@@ -76,7 +84,7 @@ export type PullRequestRef = {
  * server/src/__tests__/issue-create-pr-review-duplicate-routes.test.ts.
  */
 export function buildPrReviewTaskKey(ref: PullRequestRef): string {
-  return `pr_review:${ref.repoFullName}:${ref.prNumber}`;
+  return `pr_review:${normalizePrReviewRepoFullName(ref.repoFullName)}:${ref.prNumber}`;
 }
 
 /** Extracts unique canonical GitHub PR references from free text. */
@@ -94,7 +102,7 @@ export function parsePullRequestRefs(...texts: Array<string | null | undefined>)
       // not a real PR and must not be normalized into one.
       if (!Number.isSafeInteger(prNumber) || prNumber <= 0) continue;
       if (String(prNumber) !== rawNumber) continue;
-      const ref: PullRequestRef = { repoFullName: `${owner}/${repo}`, prNumber };
+      const ref: PullRequestRef = { repoFullName: normalizePrReviewRepoFullName(`${owner}/${repo}`), prNumber };
       const key = buildPrReviewTaskKey(ref);
       if (!seen.has(key)) seen.set(key, ref);
       if (seen.size >= MAX_SCANNED_PULL_REQUEST_REFS) return [...seen.values()];
@@ -121,12 +129,12 @@ export type DuplicatePrReviewIssueOptions = {
 };
 
 /**
- * Throws 409 when `candidate` duplicates a live PR review on the same
- * reviewer. Returns silently in every other case, including on lookup
+ * Throws 409 when `candidate` duplicates a live PR review in the configured
+ * reviewer pool. Returns silently in every other case, including on lookup
  * failure — see the fail-open note in the module header.
  */
 export async function assertNotDuplicatePrReviewIssue(
-  db: Db,
+  db: DuplicatePrReviewIssueGuardDb,
   candidate: DuplicatePrReviewIssueCandidate,
   options: DuplicatePrReviewIssueOptions = {},
 ): Promise<void> {
@@ -153,13 +161,17 @@ export async function assertNotDuplicatePrReviewIssue(
       .from(heartbeatRuns)
       .where(
         and(
-          // company_id + agent_id + context_task_key matches
+          // The canonical equality leg matches
           // idx_heartbeat_runs_company_agent_context_task_key_created
-          // (migration 0104), so this stays a bounded index probe on the
-          // issue-creation hot path.
+          // (migration 0104). The lower() leg is a temporary compatibility
+          // bridge for already-live mixed-case keys written before the task-key
+          // producer normalized GitHub repo identity.
           eq(heartbeatRuns.companyId, candidate.companyId),
-          eq(heartbeatRuns.agentId, assigneeAgentId),
-          inArray(heartbeatRuns.contextTaskKey, taskKeys),
+          inArray(heartbeatRuns.agentId, reviewerAgentIds),
+          or(
+            inArray(heartbeatRuns.contextTaskKey, taskKeys),
+            inArray(sql`lower(${heartbeatRuns.contextTaskKey})`, taskKeys),
+          ),
           inArray(heartbeatRuns.status, [...LIVE_PR_REVIEW_RUN_STATUSES]),
         ),
       )
@@ -175,8 +187,8 @@ export async function assertNotDuplicatePrReviewIssue(
 
   if (!liveRun) return;
 
-  const matchedRef =
-    refs.find((ref) => buildPrReviewTaskKey(ref) === liveRun.contextTaskKey) ?? refs[0];
+  const matchedRunTaskKey = liveRun.contextTaskKey?.toLowerCase() ?? null;
+  const matchedRef = refs.find((ref) => buildPrReviewTaskKey(ref) === matchedRunTaskKey) ?? refs[0];
   const prUrl = `https://github.com/${matchedRef.repoFullName}/pull/${matchedRef.prNumber}`;
   const waitingMinutes = Math.max(0, Math.round((Date.now() - liveRun.createdAt.getTime()) / 60_000));
 

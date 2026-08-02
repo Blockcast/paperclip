@@ -36,7 +36,7 @@ import {
   issueComments,
   issues,
 } from "@paperclipai/db";
-import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import { heartbeatService, type HeartbeatServiceOptions } from "../services/heartbeat.js";
 import { issueService } from "../services/issues.js";
 import {
@@ -62,6 +62,7 @@ import {
   enrichAuthoredLocForRow,
   type RecordMergedPullRequestInput,
 } from "../services/issue-pull-requests.js";
+import { normalizePrReviewRepoFullName } from "../services/pr-review-duplicate-issue-guard.js";
 
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type PrReviewerSelectionDb = Pick<Db | DbTransaction, "select">;
@@ -1470,7 +1471,7 @@ function buildPrReviewerWakeIdempotencyKey(
   context: ResolvedEventContext & { prNumber: number },
   deliveryId: string | null,
 ) {
-  const repo = context.repoFullName ?? "unknown";
+  const repo = normalizePrReviewRepoFullName(context.repoFullName ?? "unknown");
   if (typeof context.prNumber !== "number") {
     logger.error(
       {
@@ -1521,7 +1522,7 @@ function buildPrReviewerWakeIdempotencyKey(
 // stay stable across heads for one PR. Head-awareness for review requests lives
 // in heartbeat's coalescing decision instead (BLO-18953).
 function buildPrReviewerTaskKey(context: ResolvedEventContext & { prNumber: number }) {
-  const repo = context.repoFullName ?? "unknown";
+  const repo = normalizePrReviewRepoFullName(context.repoFullName ?? "unknown");
   return `pr_review:${repo}:${context.prNumber}`;
 }
 
@@ -1658,7 +1659,10 @@ async function findActivePrReviewerForTask(
         inArray(heartbeatRuns.agentId, [...configuredAgentIds]),
         inArray(heartbeatRuns.status, ["queued", "running"]),
         inArray(agents.status, ["idle", "running"]),
-        eq(heartbeatRuns.contextTaskKey, taskKey),
+        or(
+          eq(heartbeatRuns.contextTaskKey, taskKey),
+          sql`lower(${heartbeatRuns.contextTaskKey}) = ${taskKey}`,
+        ),
       ),
     )
     .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
