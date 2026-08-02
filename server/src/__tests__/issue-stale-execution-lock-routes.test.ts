@@ -20,6 +20,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
+import { issueService } from "../services/issues.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -921,6 +922,69 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
       assigneeAgentId: otherAgentId,
       checkoutRunId: currentRunId,
       executionRunId: currentRunId,
+    });
+  });
+
+  it("does not stamp executionRunId when checkout's actor run finalizes while waiting on the issue row", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Checkout run finalized while waiting",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: null,
+      executionRunId: null,
+      executionAgentNameKey: null,
+      executionLockedAt: null,
+    });
+
+    let releaseIssueLock!: () => void;
+    let issueLockHeld!: () => void;
+    const issueLockHeldPromise = new Promise<void>((resolve) => {
+      issueLockHeld = resolve;
+    });
+    const releaseIssueLockPromise = new Promise<void>((resolve) => {
+      releaseIssueLock = resolve;
+    });
+    const lockTransaction = db.transaction(async (tx) => {
+      await tx
+        .select({ id: issues.id })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .for("update");
+      issueLockHeld();
+      await releaseIssueLockPromise;
+    });
+
+    await issueLockHeldPromise;
+    const checkoutPromise = issueService(db).checkout(
+      issueId,
+      agentId,
+      ["todo", "backlog", "blocked"],
+      currentRunId,
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await db
+      .update(heartbeatRuns)
+      .set({
+        status: "succeeded",
+        finishedAt: new Date(),
+      })
+      .where(eq(heartbeatRuns.id, currentRunId));
+
+    releaseIssueLock();
+    const checkedOut = await checkoutPromise;
+    await lockTransaction;
+
+    expect(checkedOut).toMatchObject({
+      id: issueId,
+      status: "in_progress",
+      checkoutRunId: currentRunId,
+      executionRunId: null,
     });
   });
 });

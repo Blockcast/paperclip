@@ -142,6 +142,111 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     await tempDb?.cleanup();
   });
 
+  it("claims an assigned todo issue before auto-checkout starts (BLO-20088 regression)", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const wakeId = randomUUID();
+    const runId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "TestCo",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "TestAgent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Assigned todo work",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+    });
+
+    await db.insert(agentWakeupRequests).values({
+      id: wakeId,
+      companyId,
+      agentId,
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId },
+      status: "queued",
+      runId,
+    });
+
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "queued",
+      wakeupRequestId: wakeId,
+      contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+    });
+
+    let releaseAdapter: (() => void) | null = null;
+    const adapterStarted = new Promise<void>((resolve) => {
+      mockAdapterExecute.mockImplementationOnce(async () => {
+        resolve();
+        await new Promise<void>((release) => {
+          releaseAdapter = release;
+        });
+        return {
+          exitCode: 0,
+          signal: null as string | null,
+          timedOut: false,
+          errorMessage: null as string | null,
+          resultJson: { exitCode: 0 },
+          provider: "test",
+          model: "test-model",
+        };
+      });
+    });
+
+    const resumePromise = heartbeat.resumeQueuedRuns();
+    try {
+      await adapterStarted;
+
+      const lockedIssue = await db
+        .select({
+          status: issues.status,
+          executionRunId: issues.executionRunId,
+        })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0] ?? null);
+
+      expect(lockedIssue).toEqual({
+        status: "todo",
+        executionRunId: runId,
+      });
+    } finally {
+      releaseAdapter?.();
+      await resumePromise;
+      await heartbeat.drainInFlightExecutions(10_000);
+    }
+  });
+
   it("dispatches high-priority todo ahead of low-priority in_progress (BLO-12990 regression)", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();

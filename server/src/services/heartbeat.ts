@@ -6002,11 +6002,14 @@ export function shouldAutoCheckoutIssueForWake(input: {
   }
 
   const wakeReason = readNonEmptyString(input.contextSnapshot?.wakeReason);
+  return isAutoCheckoutWakeReason(wakeReason);
+}
+
+function isAutoCheckoutWakeReason(wakeReason: string | null | undefined) {
   if (!wakeReason) return false;
   if (wakeReason === "issue_comment_mentioned") return false;
   if (wakeReason === "source_scoped_recovery_action") return false;
   if (wakeReason.startsWith("execution_")) return false;
-
   return true;
 }
 
@@ -14347,6 +14350,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     const context = parseObject(run.contextSnapshot);
+    let issueDependencyReadyForAutoCheckout = true;
     if (isK8sIsolationRetryDeferred(context)) {
       return null;
     }
@@ -14406,6 +14410,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const dependencyReadiness = await issuesSvc.listDependencyReadiness(run.companyId, [issueId]);
       const readiness = dependencyReadiness.get(issueId);
       const unresolvedBlockerCount = readiness?.unresolvedBlockerCount ?? 0;
+      issueDependencyReadyForAutoCheckout = unresolvedBlockerCount === 0;
       if (unresolvedBlockerCount > 0 && !allowsIssueInteractionWake(context)) {
         await cancelQueuedRunForBlockedDependencies(run, issueId, readiness?.unresolvedBlockerIssueIds ?? []);
         logger.info({ runId: run.id, issueId, unresolvedBlockerCount }, "claimQueuedRun: cancelled blocked queued run");
@@ -14515,9 +14520,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               eq(issues.executionRunId, claimed.retryOfRunId),
             )
           : or(isNull(issues.executionRunId), eq(issues.executionRunId, claimed.id));
+      const autoCheckoutIssueStatusCondition = (
+        isAutoCheckoutWakeReason(claimedWakeReason) && issueDependencyReadyForAutoCheckout
+      )
+        ? and(
+            eq(issues.assigneeAgentId, claimed.agentId),
+            inArray(issues.status, ["todo", "backlog", "blocked"]),
+            sql`coalesce(${issues.executionState} ->> 'status', '') <> 'pending'`,
+          )
+        : undefined;
       const issueStatusCondition = requiresInProgressIssueRetry(claimedRetryReason)
         ? eq(issues.status, "in_progress")
-        : inArray(issues.status, ["in_progress", "in_review"]);
+        : autoCheckoutIssueStatusCondition
+          ? or(inArray(issues.status, ["in_progress", "in_review"]), autoCheckoutIssueStatusCondition)
+          : inArray(issues.status, ["in_progress", "in_review"]);
       const issueActorCondition = or(
         eq(issues.assigneeAgentId, claimed.agentId),
         and(
