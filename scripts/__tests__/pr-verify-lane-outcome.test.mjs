@@ -66,11 +66,16 @@ test("verify step exits non-zero and annotates a real lane failure distinctly fr
   assert.doesNotMatch(result.stdout, /::error title=verify: lane cancelled::/);
 });
 
-test("verify step reports failure, not cancellation, when a run has both a failed and a cancelled lane", () => {
+test("verify step annotates both a real failure and a cancellation when a run has both", () => {
   const result = runVerifyStep({ build: "failure", general_tests: "cancelled" });
   assert.notEqual(result.status, 0);
+  // BLO-20867 AC-3 / PR #964 review: a cancelled lane must never be hidden
+  // behind a failed one — both are real, distinct outcomes and each gets its
+  // own annotation so the cancellation isn't misattributed to the diff.
   assert.match(result.stdout, /::error title=verify: lane failure::/);
-  assert.doesNotMatch(result.stdout, /::error title=verify: lane cancelled::/);
+  assert.match(result.stdout, /build/);
+  assert.match(result.stdout, /::error title=verify: lane cancelled::/);
+  assert.match(result.stdout, /general_tests/);
 });
 
 test("verify step annotates a skipped lane as an unmet dependency, not a failure", () => {
@@ -82,18 +87,18 @@ test("verify step annotates a skipped lane as an unmet dependency, not a failure
   assert.doesNotMatch(result.stdout, /::error title=verify: lane failure::/);
 });
 
-test("verify step reports skipped, not cancelled, when a run has both a skipped and a cancelled lane", () => {
+test("verify step annotates both a skipped and a cancelled lane when a run has both", () => {
   const result = runVerifyStep({ worktree_install: "skipped", general_tests: "cancelled" });
   assert.notEqual(result.status, 0);
   assert.match(result.stdout, /::error title=verify: lane skipped::/);
-  assert.doesNotMatch(result.stdout, /::error title=verify: lane cancelled::/);
+  assert.match(result.stdout, /::error title=verify: lane cancelled::/);
 });
 
-test("verify step reports failure, not skipped, when a run has both a failed and a skipped lane", () => {
+test("verify step annotates both a real failure and a skipped lane when a run has both", () => {
   const result = runVerifyStep({ build: "failure", worktree_install: "skipped" });
   assert.notEqual(result.status, 0);
   assert.match(result.stdout, /::error title=verify: lane failure::/);
-  assert.doesNotMatch(result.stdout, /::error title=verify: lane skipped::/);
+  assert.match(result.stdout, /::error title=verify: lane skipped::/);
 });
 
 test("verify step exits non-zero for an unrecognized result and treats it as a failure", () => {

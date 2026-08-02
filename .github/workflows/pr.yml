@@ -360,8 +360,15 @@ jobs:
       # than `failure`. A plain `test "$X" = "success"` makes every one of
       # these look like an identical failing required check, so authors
       # misattribute the outcome to their own diff. Separate them here so the
-      # annotation on this job says which one actually happened:
-      #   - failure:   the lane ran and reported a real problem with the diff.
+      # annotation on this job says which ones actually happened — a run can
+      # have more than one non-success category at once (e.g. one lane
+      # genuinely failed while another was evicted), so every category with
+      # at least one lane in it gets its own annotation instead of only the
+      # first one checked:
+      #   - failure:   the lane ran and reported a result other than success.
+      #     Often a real problem with the diff, but a lane can also report
+      #     failure due to its own setup/runner trouble — check that lane's
+      #     logs rather than assuming the diff is at fault.
       #   - cancelled: the lane was interrupted before it produced a result —
       #     possibly a CI infrastructure interruption (see BLO-20867), but
       #     also possibly a manual cancellation or another cause this job
@@ -395,18 +402,24 @@ jobs:
             esac
           done
 
+          any_non_success=0
+
           if [ "${#failed_lanes[@]}" -gt 0 ]; then
-            echo "::error title=verify: lane failure::Upstream lane(s) failed: ${failed_lanes[*]}. This reflects a real problem with the PR diff — check that lane's own logs."
-            exit 1
+            echo "::error title=verify: lane failure::Upstream lane(s) reported failure: ${failed_lanes[*]}. This may reflect a real problem with the PR diff, but a lane can also fail due to its own setup or runner trouble — check that lane's own logs before assuming the diff is at fault."
+            any_non_success=1
           fi
 
           if [ "${#skipped_lanes[@]}" -gt 0 ]; then
             echo "::error title=verify: lane skipped::Upstream lane(s) did not run: ${skipped_lanes[*]}. GitHub Actions skips a lane when a job it needs (typically 'policy') did not succeed — check that dependency's logs, not this lane's."
-            exit 1
+            any_non_success=1
           fi
 
           if [ "${#cancelled_lanes[@]}" -gt 0 ]; then
             echo "::error title=verify: lane cancelled::Upstream lane(s) were CANCELLED, not failed: ${cancelled_lanes[*]}. This is not a report of a defect in this PR's diff — the lane was interrupted before it could produce a result (possible causes include a CI infrastructure interruption, see BLO-20867, or a manual cancellation). Re-run the job to get a real result."
+            any_non_success=1
+          fi
+
+          if [ "$any_non_success" -eq 1 ]; then
             exit 1
           fi
 
