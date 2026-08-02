@@ -2,10 +2,11 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { and, eq, sql } from "drizzle-orm";
 import {
   agents,
+  activityLog,
   approvals,
   companies,
   companySecretBindings,
@@ -56,9 +57,14 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
     db = createDb(started.connectionString);
   }, 120_000);
 
+  beforeEach(() => {
+    mockNotifyHireApproved.mockResolvedValue(undefined);
+  });
+
   afterEach(async () => {
     mockEnsureBuiltInAgent.mockReset();
     mockNotifyHireApproved.mockReset();
+    await db.delete(activityLog);
     await db.delete(companySecretBindings);
     await db.delete(companySecretVersions);
     await db.delete(companySecrets);
@@ -569,20 +575,33 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
       },
       updatedAt: new Date(),
     });
+    let rejectReconciliation!: (error: Error) => void;
     mockEnsureBuiltInAgent
-      .mockRejectedValueOnce(new Error("injected filesystem failure"))
+      .mockImplementationOnce(
+        () => new Promise<void>((_resolve, reject) => {
+          rejectReconciliation = reject;
+        }),
+      )
       .mockResolvedValueOnce(undefined);
     mockNotifyHireApproved.mockResolvedValue(undefined);
 
-    await expect(
-      approvalService(db).approve(approvalId, "board-user", "Approved"),
-    ).rejects.toThrow("injected filesystem failure");
+    const firstApproval = approvalService(db).approve(approvalId, "board-user", "Approved");
+    await vi.waitFor(() => expect(mockEnsureBuiltInAgent).toHaveBeenCalledTimes(1));
+    expect(mockNotifyHireApproved).not.toHaveBeenCalled();
+    rejectReconciliation(new Error("injected filesystem failure"));
+    await expect(firstApproval).rejects.toThrow("injected filesystem failure");
     await expect(approvalService(db).getById(approvalId)).resolves.toMatchObject({
       status: "approved",
     });
     await expect(agentService(db).getById(agentId)).resolves.toMatchObject({
       status: "idle",
     });
+    expect(mockNotifyHireApproved).not.toHaveBeenCalled();
+
+    await expect(
+      approvalService(db).approve(approvalId, "board-user", "Approved"),
+    ).resolves.toMatchObject({ applied: false });
+    expect(mockEnsureBuiltInAgent).toHaveBeenCalledTimes(2);
     expect(mockNotifyHireApproved).toHaveBeenCalledTimes(1);
 
     await expect(

@@ -1,6 +1,6 @@
 import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { approvalComments, approvals } from "@paperclipai/db";
+import { activityLog, approvalComments, approvals } from "@paperclipai/db";
 import { notFound, unprocessable } from "../errors.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { agentService } from "./agents.js";
@@ -24,13 +24,58 @@ export function approvalService(db: Db) {
   }
 
   async function reconcileApprovedBuiltInAgent(
+    dbClient: Db,
     companyId: string,
     payload: Record<string, unknown>,
   ) {
     const sourceBuiltInAgentKey = typeof payload.sourceBuiltInAgentKey === "string" ? payload.sourceBuiltInAgentKey : null;
     if (!sourceBuiltInAgentKey) return;
     const { builtInAgentService } = await import("./built-in-agents.js");
-    await builtInAgentService(db).ensure(companyId, sourceBuiltInAgentKey);
+    await builtInAgentService(dbClient).ensure(companyId, sourceBuiltInAgentKey);
+  }
+
+  async function completeApprovedBuiltInHire(
+    approval: ApprovalRecord,
+    agentId: string,
+    approvedAt: Date,
+  ) {
+    await db.transaction(async (tx) => {
+      const txDb = tx as unknown as Db;
+      await tx.execute(sql`select ${approvals.id} from ${approvals} where ${approvals.id} = ${approval.id} for update`);
+      const completed = await txDb
+        .select({ id: activityLog.id })
+        .from(activityLog)
+        .where(
+          and(
+            eq(activityLog.companyId, approval.companyId),
+            eq(activityLog.action, "approval.hire_post_commit_completed"),
+            eq(activityLog.entityType, "approval"),
+            eq(activityLog.entityId, approval.id),
+          ),
+        )
+        .then((rows) => rows[0] ?? null);
+      if (completed) return;
+
+      const payload = approval.payload as Record<string, unknown>;
+      await reconcileApprovedBuiltInAgent(txDb, approval.companyId, payload);
+      await notifyHireApproved(txDb, {
+        companyId: approval.companyId,
+        agentId,
+        source: "approval",
+        sourceId: approval.id,
+        approvedAt,
+      });
+      await txDb.insert(activityLog).values({
+        companyId: approval.companyId,
+        actorType: "system",
+        actorId: "approval_service",
+        action: "approval.hire_post_commit_completed",
+        entityType: "approval",
+        entityId: approval.id,
+        agentId,
+        details: { sourceBuiltInAgentKey: payload.sourceBuiltInAgentKey },
+      });
+    });
   }
 
   async function getExistingApproval(id: string, dbClient: Db = db) {
@@ -191,7 +236,21 @@ export function approvalService(db: Db) {
         return { approval: updated, applied, hireApprovedAgentId };
       });
 
-      if (result.hireApprovedAgentId) {
+      const payload = result.approval.payload as Record<string, unknown>;
+      const payloadAgentId = typeof payload.agentId === "string" ? payload.agentId : null;
+      const approvedAgentId = result.hireApprovedAgentId ?? payloadAgentId;
+      const isBuiltInHire =
+        result.approval.type === "hire_agent" &&
+        typeof payload.sourceBuiltInAgentKey === "string" &&
+        approvedAgentId !== null;
+
+      if (isBuiltInHire) {
+        await completeApprovedBuiltInHire(
+          result.approval,
+          approvedAgentId,
+          result.approval.decidedAt ?? now,
+        );
+      } else if (result.hireApprovedAgentId) {
         void notifyHireApproved(db, {
           companyId: result.approval.companyId,
           agentId: result.hireApprovedAgentId,
@@ -199,13 +258,6 @@ export function approvalService(db: Db) {
           sourceId: id,
           approvedAt: now,
         }).catch(() => {});
-      }
-
-      if (result.approval.type === "hire_agent") {
-        const payload = result.approval.payload as Record<string, unknown>;
-        if (typeof payload.agentId === "string") {
-          await reconcileApprovedBuiltInAgent(result.approval.companyId, payload);
-        }
       }
 
       return { approval: result.approval, applied: result.applied };
