@@ -3,7 +3,7 @@ import { drizzle as drizzlePg } from "drizzle-orm/postgres-js";
 import { migrate as migratePg } from "drizzle-orm/postgres-js/migrator";
 import { readFile, readdir } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
-import postgres from "postgres";
+import postgres, { type Sql } from "postgres";
 import * as schema from "./schema/index.js";
 import { registerTrackedClient } from "./embedded-test-client-registry.js";
 
@@ -51,6 +51,10 @@ export function createDb(url: string) {
   // Inert in production; only embedded test databases register their URL so
   // their pools can be closed before the server stops (see registry module).
   registerTrackedClient(url, sql);
+  return createDbFromPostgresClient(sql);
+}
+
+export function createDbFromPostgresClient(sql: Sql) {
   return drizzlePg(sql, { schema });
 }
 
