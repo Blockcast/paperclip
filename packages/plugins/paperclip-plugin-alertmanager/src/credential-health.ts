@@ -11,6 +11,14 @@
  * here gives `onHealth()` something real to report without ever touching
  * config itself.
  *
+ * Recorded from BOTH sides of that resolution, because it has two exits:
+ * `webhook-handler.ts` records the token it was handed on a delivery that got
+ * through, and `config-scope.ts` records the failures that throw before
+ * `handleWebhook` is ever called (a configured `webhookTokenRef`, which fails
+ * closed on this build, and a company with no stored config at all). Recording
+ * only the first left `onHealth()` reporting `ok` for a company rejecting 100%
+ * of deliveries — the precise blind spot this module exists to close.
+ *
  * The signal is about CONFIGURATION, not authentication: it fires when the
  * company's config resolved no usable credential at all, never when a
  * request merely presented the wrong one. Recording on presented-token
