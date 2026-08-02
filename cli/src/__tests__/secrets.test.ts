@@ -7,6 +7,7 @@ import {
   buildInlineMigrationSecretName,
   buildMigratedAgentEnv,
   collectInlineSecretMigrationCandidates,
+  collectSkippedPlausiblySensitiveEnvKeys,
   parseSecretsInclude,
   registerSecretCommands,
   toPlainEnvValue,
@@ -163,6 +164,10 @@ describe("secrets CLI helpers", () => {
           adapterConfig: {
             env: {
               ANTHROPIC_API_KEY: "sk-ant-test",
+              WEBFLOW_BOT_CONTROL_TOKEN: "webflow-token",
+              ORC8R_CERTIFIER_TOKEN: "orc8r-token",
+              GENERIC_TOKEN: "generic-token",
+              EMPTY_TOKEN: "   ",
               GH_TOKEN: {
                 type: "plain",
                 value: "ghp-test",
@@ -198,11 +203,51 @@ describe("secrets CLI helpers", () => {
       {
         agentId: "agent-12345678",
         agentName: "Coder",
+        envKey: "WEBFLOW_BOT_CONTROL_TOKEN",
+        secretName: "agent_agent-12_webflow_bot_control_token",
+        existingSecretId: null,
+      },
+      {
+        agentId: "agent-12345678",
+        agentName: "Coder",
+        envKey: "ORC8R_CERTIFIER_TOKEN",
+        secretName: "agent_agent-12_orc8r_certifier_token",
+        existingSecretId: null,
+      },
+      {
+        agentId: "agent-12345678",
+        agentName: "Coder",
+        envKey: "GENERIC_TOKEN",
+        secretName: "agent_agent-12_generic_token",
+        existingSecretId: null,
+      },
+      {
+        agentId: "agent-12345678",
+        agentName: "Coder",
         envKey: "GH_TOKEN",
         secretName: "agent_agent-12_gh_token",
         existingSecretId: "secret-gh-token",
       },
     ]);
+  });
+
+  it("reports credential-shaped values skipped by the key heuristic", () => {
+    const rows = collectSkippedPlausiblySensitiveEnvKeys([
+      agent({
+        adapterConfig: {
+          env: {
+            CONFIG: "ghp_0123456789abcdef0123456789abcdef",
+            PATH: "/usr/bin",
+            EMPTY_VALUE: "  ",
+          },
+        },
+      }),
+    ]);
+
+    expect(rows).toEqual([
+      { agentId: "agent-12345678", agentName: "Coder", envKey: "CONFIG" },
+    ]);
+    expect(JSON.stringify(rows)).not.toContain("ghp_");
   });
 
   it("builds migrated env bindings without preserving secret values", () => {

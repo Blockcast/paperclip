@@ -696,7 +696,7 @@ describe("resolveExecutionRunAdapterConfig", () => {
       issueId: "issue-1",
       executionRunConfig: {
         env: {
-          OPENAI_API_KEY: "inline-secret",
+          FOO_TOKEN: "inline-secret",
         },
       },
       projectEnv: null,

@@ -1,5 +1,11 @@
 export { agentAdapterTypeSchema, optionalAgentAdapterTypeSchema } from "./adapter-type.js";
 export {
+  SENSITIVE_ENV_KEY_RE,
+  isPlausiblySensitiveEnvValue,
+  isSensitiveEnv,
+  isSensitiveEnvKey,
+} from "./sensitive-env.js";
+export {
   getAgentOrgChainHealth,
   getAgentWorkEligibility,
   isAgentAssignableToWork,

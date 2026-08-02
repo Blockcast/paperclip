@@ -38,6 +38,7 @@ import {
   createSecretProviderConfigSchema,
   deriveProjectUrlKey,
   envBindingSchema,
+  isSensitiveEnvKey,
   isUuidLike,
   normalizeAgentUrlKey,
   secretProviderConfigPayloadSchema,
@@ -64,8 +65,6 @@ import { authorizationDeniedDetails, authorizationService } from "./authorizatio
 import { findActiveServerAdapter } from "../adapters/index.js";
 
 const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
-const SENSITIVE_ENV_KEY_RE =
-  /(api[-_]?key|access[-_]?token|auth(?:_?token)?|authorization|bearer|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring)/i;
 const REDACTED_SENTINEL = "***REDACTED***";
 const COMING_SOON_SECRET_PROVIDERS: ReadonlySet<SecretProvider> = new Set([
   "gcp_secret_manager",
@@ -480,10 +479,6 @@ type SecretResolutionErrorCode =
 function asRecord(value: unknown): Record<string, unknown> | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
   return value as Record<string, unknown>;
-}
-
-function isSensitiveEnvKey(key: string) {
-  return SENSITIVE_ENV_KEY_RE.test(key);
 }
 
 function normalizeSecretKey(input: string) {

@@ -11,6 +11,7 @@ import {
   MODEL_PROFILE_KEYS,
   PROVIDER_QUOTA_MONITOR_SERVICE_NAME,
   envBindingSchema,
+  isSensitiveEnvKey,
   isEnvironmentDriverSupportedForAdapter,
   type BillingType,
   type CostStatus,
@@ -1317,9 +1318,6 @@ export function requiresPushCapabilityPreflight(input: {
     && hasGithubPrWorkflowSkill(input.explicitRunScopedSkillKeys);
 }
 
-const LOW_TRUST_SENSITIVE_ENV_KEY_RE =
-  /(api[-_]?key|access[-_]?token|auth(?:_?token)?|authorization|bearer|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring)/i;
-
 function isPaperclipRuntimeEnvKey(key: string) {
   return key.startsWith("PAPERCLIP_");
 }
@@ -1434,7 +1432,7 @@ function assertLowTrustEnvConfigAllowed(envValue: unknown, source: string) {
     // explicitly so a low-trust run cannot inline one; it must use a
     // secret_ref. Safe to add with this PR because the key is new here — no
     // existing config can be relying on the inline form.
-    if (isPlainBinding && (LOW_TRUST_SENSITIVE_ENV_KEY_RE.test(key) || isAgentScopeOnlyEnvKey(key))) {
+    if (isPlainBinding && (isSensitiveEnvKey(key) || isAgentScopeOnlyEnvKey(key))) {
       throw new HttpError(422, `Low-trust execution cannot use inline sensitive env value ${source}.${key}`, {
         code: "low_trust_inline_sensitive_env_denied",
       });
