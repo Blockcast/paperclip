@@ -974,6 +974,10 @@ const plugin = definePlugin({
       const companies = await listTargetCompanies(ctx);
       let posted = false;
       for (const company of companies) {
+        // Check the flag before resolving anything. Secret resolution draws on
+        // a shared budget, so a company that has the digest switched off should
+        // not cost one every day just to be skipped.
+        if (!(await isDailyDigestEnabled(ctx, company.id))) continue;
         const scope = await resolveCompanyJobScope(
           ctx,
           company.id,
@@ -981,7 +985,6 @@ const plugin = definePlugin({
         );
         if (!scope) continue;
         const { config, token } = scope;
-        if (!config.enableDailyDigest) continue;
         const channelId = await resolveChannel(
           ctx,
           company.id,
