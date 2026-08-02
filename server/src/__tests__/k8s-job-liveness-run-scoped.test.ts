@@ -92,7 +92,16 @@ function terminalJob(runId: string, status: { active?: number; succeeded?: numbe
 
 /** The identity-checked re-read `deleteStaleTerminalJob` performs before deleting. */
 function mockRereadAs(status: { active?: number; succeeded?: number; failed?: number } | null, runId: string) {
-  mockReadNamespacedJob.mockResolvedValue(terminalJob(runId, status));
+  mockReadNamespacedJob.mockResolvedValueOnce(terminalJob(runId, status));
+}
+
+/**
+ * The confirmation re-read `deleteStaleTerminalJob` performs *after* issuing
+ * the delete (BLO-20801 review round 3) -- queued to resolve on the call
+ * immediately following `mockRereadAs`'s pre-delete read.
+ */
+function mockConfirmDeleted() {
+  mockReadNamespacedJob.mockRejectedValueOnce({ statusCode: 404 });
 }
 
 describe("hasActiveJobForAgent run-id awareness (BLO-20801)", () => {
@@ -114,6 +123,7 @@ describe("hasActiveJobForAgent run-id awareness (BLO-20801)", () => {
     mockListNamespacedJob.mockResolvedValue({ items: [terminalJob("run-terminal", null)] });
     mockRereadAs(null, "run-terminal");
     mockDeleteNamespacedJob.mockResolvedValue({});
+    mockConfirmDeleted();
 
     const result = await hasActiveJobForAgent(AGENT_ID, {
       isRunTerminal: async () => new Set(["run-terminal"]),
@@ -130,6 +140,7 @@ describe("hasActiveJobForAgent run-id awareness (BLO-20801)", () => {
     mockListNamespacedJob.mockResolvedValue({ items: [terminalJob("run-terminal", { active: 0, succeeded: 0, failed: 0 })] });
     mockRereadAs({ active: 0, succeeded: 0, failed: 0 }, "run-terminal");
     mockDeleteNamespacedJob.mockResolvedValue({});
+    mockConfirmDeleted();
 
     const result = await hasActiveJobForAgent(AGENT_ID, {
       isRunTerminal: async () => new Set(["run-terminal"]),
@@ -268,5 +279,44 @@ describe("hasActiveJobForAgent run-id awareness (BLO-20801)", () => {
     });
 
     expect(result).toBe(true);
+  });
+
+  it("fails closed when an accepted DELETE has not actually removed the Job by the time the retry budget is exhausted", async () => {
+    // Ally review (PR #946, round 3): a successful DELETE response with
+    // Background propagation only means the request was accepted -- the Job
+    // can still be present (e.g. pending finalizers) when dispatch would
+    // otherwise trust the waiver. Every confirmation re-read here keeps
+    // returning the Job present and inactive, so the retry budget must
+    // exhaust and fail closed rather than treating the accepted DELETE call
+    // itself as proof of removal.
+    mockListNamespacedJob.mockResolvedValue({ items: [terminalJob("run-terminal", null)] });
+    mockReadNamespacedJob.mockResolvedValue(terminalJob("run-terminal", null));
+    mockDeleteNamespacedJob.mockResolvedValue({});
+
+    const result = await hasActiveJobForAgent(AGENT_ID, {
+      isRunTerminal: async () => new Set(["run-terminal"]),
+    });
+
+    expect(result).toBe(true);
+    expect(mockDeleteNamespacedJob).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails closed when the Job's controller creates a pod after an accepted DELETE but before removal is confirmed", async () => {
+    // Ally review (PR #946, round 3): the DELETE call succeeding does not
+    // stop the Job's controller reconciliation mid-flight. If the
+    // confirmation re-read observes a newly active pod, that's real live
+    // evidence and must block exactly like the pre-delete "delayed pod
+    // creation" case, not be masked by the earlier accepted DELETE.
+    mockListNamespacedJob.mockResolvedValue({ items: [terminalJob("run-terminal", null)] });
+    mockRereadAs(null, "run-terminal");
+    mockReadNamespacedJob.mockResolvedValueOnce(terminalJob("run-terminal", { active: 1, succeeded: 0, failed: 0 }));
+    mockDeleteNamespacedJob.mockResolvedValue({});
+
+    const result = await hasActiveJobForAgent(AGENT_ID, {
+      isRunTerminal: async () => new Set(["run-terminal"]),
+    });
+
+    expect(result).toBe(true);
+    expect(mockDeleteNamespacedJob).toHaveBeenCalledTimes(1);
   });
 });
