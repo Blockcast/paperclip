@@ -252,8 +252,8 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
   it("does not claim an assigned todo issue when a blocker is added while claim waits", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
-    const issueId = randomUUID();
-    const blockerIssueId = randomUUID();
+    const issueId = "00000000-0000-4000-8000-000000000001";
+    const blockerIssueId = "ffffffff-ffff-4fff-8fff-ffffffffffff";
     const wakeId = randomUUID();
     const runId = randomUUID();
     const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
@@ -337,15 +337,20 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
 
     await issueLockHeldPromise;
     const resumePromise = heartbeat.resumeQueuedRuns();
+    let runReachedRunning = false;
     for (let attempt = 0; attempt < 100; attempt += 1) {
       const status = await db
         .select({ status: heartbeatRuns.status })
         .from(heartbeatRuns)
         .where(eq(heartbeatRuns.id, runId))
         .then((rows) => rows[0]?.status);
-      if (status === "running") break;
+      if (status === "running") {
+        runReachedRunning = true;
+        break;
+      }
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
+    expect(runReachedRunning).toBe(true);
 
     await db.update(issues).set({ status: "todo" }).where(eq(issues.id, blockerIssueId));
     releaseIssueLock();

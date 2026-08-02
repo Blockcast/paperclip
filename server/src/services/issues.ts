@@ -5375,14 +5375,15 @@ export function issueService(db: Db) {
       throw unprocessable("Issue cannot be blocked by itself");
     }
 
+    const lockedIssueIds = [issueId, ...deduped].sort();
+    await dbOrTx.execute(
+      sql`SELECT ${issues.id} FROM ${issues}
+          WHERE ${and(eq(issues.companyId, companyId), inArray(issues.id, lockedIssueIds))}
+          ORDER BY ${issues.id}
+          FOR UPDATE`,
+    );
+
     if (deduped.length > 0) {
-      const lockedIssueIds = [issueId, ...deduped].sort();
-      await dbOrTx.execute(
-        sql`SELECT ${issues.id} FROM ${issues}
-            WHERE ${and(eq(issues.companyId, companyId), inArray(issues.id, lockedIssueIds))}
-            ORDER BY ${issues.id}
-            FOR UPDATE`,
-      );
       const relatedIssues = await dbOrTx
         .select({ id: issues.id })
         .from(issues)
@@ -8661,16 +8662,6 @@ export function issueService(db: Db) {
       if (patch.status === "in_progress" && !nextAssigneeAgentId && !nextAssigneeUserId) {
         throw unprocessable("in_progress issues require an assignee");
       }
-      if (patch.status === "in_progress") {
-        const unresolvedBlockerIssueIds = blockedByIssueIds !== undefined
-          ? await listUnresolvedBlockerIssueIds(dbOrTx, existing.companyId, blockedByIssueIds)
-          : (
-              await listIssueDependencyReadinessMap(dbOrTx, existing.companyId, [id])
-            ).get(id)?.unresolvedBlockerIssueIds ?? [];
-        if (unresolvedBlockerIssueIds.length > 0) {
-          throw unprocessable("Issue is blocked by unresolved blockers", { unresolvedBlockerIssueIds });
-        }
-      }
       const shouldValidateNextAssignee =
         Boolean(nextAssigneeAgentId) &&
         (issueData.assigneeAgentId !== undefined || patch.status === "in_progress");
@@ -8843,6 +8834,25 @@ export function issueService(db: Db) {
             },
             tx,
           );
+        } else if (patch.status === "in_progress") {
+          const currentBlockerIssueIds = await tx
+            .select({ id: issueRelations.issueId })
+            .from(issueRelations)
+            .where(
+              and(
+                eq(issueRelations.companyId, existing.companyId),
+                eq(issueRelations.relatedIssueId, id),
+                eq(issueRelations.type, "blocks"),
+              ),
+            )
+            .then((rows: Array<{ id: string }>) => rows.map((row) => row.id));
+          const lockedIssueIds = [id, ...currentBlockerIssueIds].sort();
+          await tx.execute(
+            sql`SELECT ${issues.id} FROM ${issues}
+                WHERE ${and(eq(issues.companyId, existing.companyId), inArray(issues.id, lockedIssueIds))}
+                ORDER BY ${issues.id}
+                FOR UPDATE`,
+          );
         }
         const defaultCompanyGoal = await getDefaultCompanyGoal(tx, existing.companyId);
         const [currentProjectGoalId, nextProjectGoalId] = await Promise.all([
@@ -8907,6 +8917,16 @@ export function issueService(db: Db) {
                   : eq(issues.assigneeAgentId, expectedCurrentAssigneeAgentId),
               ]),
         ];
+        if (patch.status === "in_progress") {
+          const unresolvedBlockerIssueIds = blockedByIssueIds !== undefined
+            ? await listUnresolvedBlockerIssueIds(tx, existing.companyId, blockedByIssueIds)
+            : (
+                await listIssueDependencyReadinessMap(tx, existing.companyId, [id])
+              ).get(id)?.unresolvedBlockerIssueIds ?? [];
+          if (unresolvedBlockerIssueIds.length > 0) {
+            throw unprocessable("Issue is blocked by unresolved blockers", { unresolvedBlockerIssueIds });
+          }
+        }
         const updated = await tx
           .update(issues)
           .set(patch)
