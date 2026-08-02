@@ -660,6 +660,7 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
       }),
     ));
     const app = createApp({
+      createIssueDuplicateCandidateActivityWriter: async () => {},
       createIssueDuplicateCandidateCorpusFilter: async (rows) => (
         rows.filter((row) => row.projectId === allowedProject.id)
       ),
@@ -712,6 +713,7 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
       where company_id = ${companyId}
     `);
     const app = createApp({
+      createIssueDuplicateCandidateActivityWriter: async () => {},
       createIssueDuplicateCandidateCorpusFilter: async (rows) => (
         rows.filter((row) => row.projectId === allowedProject.id)
       ),
