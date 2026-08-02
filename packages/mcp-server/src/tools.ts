@@ -24,6 +24,10 @@ export interface ToolDefinition {
   schema: z.AnyZodObject;
   execute: (input: Record<string, unknown>) => Promise<{
     content: Array<{ type: "text"; text: string }>;
+    // Set by formatErrorResponse. Must be declared here or the flag is
+    // structurally dropped on the way to server.tool() and every failure
+    // reaches the agent looking like a success (BLO-18466).
+    isError?: boolean;
   }>;
 }
 
