@@ -3531,6 +3531,30 @@ function readProviderCapacityResetStatusEvidence(
   return null;
 }
 
+// Mirror of the recovery reader's instant guard. Adapters that hand back a
+// structured `retryNotBefore` (claude-local/codex-local) skip the prose parser
+// above, so before this they reached recovery carrying no provenance at all and
+// were forced into the generic rate-limit/quota wording — throwing away a 429
+// diagnosis we can actually substantiate. Such a horizon may earn the server
+// provenance marker, but it is adapter-controlled text, so it is re-derived
+// here rather than trusted: only a bare full-string ISO instant inside the same
+// forward horizon parseProviderCapacityResetHorizon accepts survives, and it is
+// re-emitted canonically so no adapter formatting reaches an issue comment.
+const PROVIDER_CAPACITY_RESET_INSTANT_PATTERN =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
+
+export function canonicalizeAdapterCapacityResetInstant(
+  value: unknown,
+  now = Date.now(),
+): Date | null {
+  const raw = typeof value === "string" ? value.trim() : null;
+  if (!raw || !PROVIDER_CAPACITY_RESET_INSTANT_PATTERN.test(raw)) return null;
+  const parsed = Date.parse(raw);
+  if (!Number.isFinite(parsed)) return null;
+  if (parsed <= now || parsed - now > PROVIDER_CAPACITY_MAX_HORIZON_MS) return null;
+  return new Date(parsed);
+}
+
 function stripAdapterProviderCapacityResetMetadata(
   resultJson: Record<string, unknown> | null | undefined,
 ): Record<string, unknown> {
@@ -21754,14 +21778,33 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // prose. Only consulted when the adapter did not already hand back a
       // structured `retryNotBefore` (claude-local/codex-local do), and only for
       // the throttle families — a horizon quoted inside some unrelated failure's
-      // tool output must not push that failure's retry into next week.
+      // tool output must not push that failure's retry into next week. The
+      // structured case is not unhandled: it is picked up a few lines down.
+      const providerCapacityThrottleOverride =
+        rateLimitExhaustedOverride || providerThrottledNoProgressOverride;
       const providerCapacityResetAt =
-        (rateLimitExhaustedOverride || providerThrottledNoProgressOverride) && !adapterResult.retryNotBefore
+        providerCapacityThrottleOverride && !adapterResult.retryNotBefore
           ? parseProviderCapacityResetHorizon({
               resultJson: adapterResult.resultJson,
               errorMessage: adapterResult.errorMessage,
             })
           : null;
+      const providerCapacityResetStatusEvidence = providerCapacityThrottleOverride
+        ? readProviderCapacityResetStatusEvidence(adapterResult.resultJson)
+        : null;
+      // The structured counterpart of the prose horizon above. Gated on the
+      // server having actually observed a 429 on this result: the throttle
+      // families also fire for 401 cap-windows and legacy quota signals, and a
+      // `retryNotBefore` alone never implies a capacity 429 — that asymmetry is
+      // the whole reason the read side distrusts a bare hint.
+      const structuredProviderCapacityResetAt =
+        providerCapacityThrottleOverride &&
+        !providerCapacityResetAt &&
+        providerCapacityResetStatusEvidence?.statusCode === 429
+          ? canonicalizeAdapterCapacityResetInstant(adapterResult.retryNotBefore)
+          : null;
+      const persistedProviderCapacityResetAt =
+        providerCapacityResetAt ?? structuredProviderCapacityResetAt;
       const effectiveRetryNotBefore =
         adapterResult.retryNotBefore ?? providerCapacityResetAt?.toISOString() ?? null;
       let prReviewCompletionEvidence = outcome === "succeeded"
@@ -21948,9 +21991,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const adapterResultJsonForPersistence = stripAdapterProviderCapacityResetMetadata(
         adapterResult.resultJson,
       );
-      const providerCapacityResetStatusEvidence = providerCapacityResetAt
-        ? readProviderCapacityResetStatusEvidence(adapterResult.resultJson)
-        : null;
       const persistedResultJson = mergeHeartbeatRunResultJson(
         mergeRunStopMetadataForAgent(agent, outcome, {
           resultJson: mergeModelProfileRunMetadata(
@@ -21958,15 +21998,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               resultJson: {
                 ...adapterResultJsonForPersistence,
                 configFreshness: configFreshnessResultMetadata,
-                // BLO-18278: keep the provenance of a prose-recovered horizon so
+                // BLO-18278: keep the provenance of the recovered horizon so
                 // the strand comment can name the reset instant, and so a wrong
                 // parse is debuggable from the persisted run rather than only
                 // from the raw log. Adapter-owned capacity-reset fields were
                 // stripped above; the paired provenance discriminator below is
-                // written only by this server path.
-                ...(providerCapacityResetAt
+                // written only by this server path, from either the prose
+                // parser or a 429-substantiated structured hint.
+                ...(persistedProviderCapacityResetAt
                   ? {
-                      providerCapacityResetAt: providerCapacityResetAt.toISOString(),
+                      providerCapacityResetAt: persistedProviderCapacityResetAt.toISOString(),
                       providerCapacityResetProvenance: {
                         source: PROVIDER_CAPACITY_RESET_PROVENANCE_SOURCE,
                         errorFamily: "rate_limit_exhausted",
@@ -21975,6 +22016,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                         observedCause: rateLimitExhaustedOverride
                           ? "rate_limit_exhausted"
                           : "provider_throttled_no_progress",
+                        horizonSource: providerCapacityResetAt
+                          ? "server_prose_parse"
+                          : "adapter_structured_retry_not_before",
                       },
                     }
                   : {}),

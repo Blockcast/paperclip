@@ -27,6 +27,12 @@ const RESET_ISO = "2026-07-26T21:29:59.782Z";
 // bounds old instants from creation time and future instants from finish time.
 const RUN_CREATED_AT = new Date("2026-07-26T18:50:31.000Z");
 const RUN_FINISHED_AT = new Date("2026-07-26T18:51:11.000Z");
+// The summary is tense-sensitive: a horizon only supports "waiting on that
+// reset" while it is still ahead of the sweep that reads it. Both read times
+// are stated explicitly so these cases assert wording rather than inheriting a
+// wall clock that silently drifts past the fixture and flips every assertion.
+const SWEEP_WHILE_OPEN = Date.parse("2026-07-26T21:00:00.000Z");
+const SWEEP_AFTER_RESET = Date.parse("2026-07-27T04:00:00.000Z");
 const SERVER_429_PROVENANCE = {
   source: "server_parse_provider_capacity_horizon",
   errorFamily: "rate_limit_exhausted",
@@ -71,6 +77,7 @@ describe("summarizeRunFailureForIssueComment — provider capacity 429", () => {
           providerCapacityResetProvenance: SERVER_429_PROVENANCE,
         },
       }),
+      SWEEP_WHILE_OPEN,
     );
 
     expect(summary).toContain("429");
@@ -126,6 +133,7 @@ describe("summarizeRunFailureForIssueComment — provider capacity 429", () => {
         errorCode: "rate_limit_exhausted",
         resultJson: { errorFamily: "rate_limit_exhausted", retryNotBefore: RESET_ISO },
       }),
+      SWEEP_WHILE_OPEN,
     );
     expect(summary).toContain(RESET_ISO);
     expect(summary).toContain("rate-limit/quota window");
@@ -295,8 +303,66 @@ describe("summarizeRunFailureForIssueComment — provider capacity 429", () => {
     expect(summary).toContain("429");
   });
 
-  it("still summarizes a plain failure with no resultJson", () => {
+  // Recovery sweeps run on their own cadence and routinely read a run that
+  // failed hours earlier. An unconditional "waiting on that reset … self-healing"
+  // then tells agents to sit out a window that already reopened — the same
+  // misdiagnosis this summarizer exists to prevent, pointed the other way.
+  it("reports an elapsed window as historical context, not as a live wait", () => {
     const summary = summarizeRunFailureForIssueComment(
+      run({
+        errorCode: "job_failed",
+        error: "External lifecycle Job failed: BackoffLimitExceeded",
+        resultJson: {
+          errorFamily: "rate_limit_exhausted",
+          providerCapacityResetAt: RESET_ISO,
+          providerCapacityResetProvenance: SERVER_429_PROVENANCE,
+        },
+      }),
+      SWEEP_AFTER_RESET,
+    );
+    // The window is still named — it is real evidence about what killed the run.
+    expect(summary).toContain("429");
+    expect(summary).toContain(RESET_ISO);
+    // ...but it must not be presented as the current blocker.
+    expect(summary).toContain("elapsed");
+    expect(summary).not.toContain("self-healing");
+    expect(summary).not.toContain("waiting on that reset");
+  });
+
+  it("reports an elapsed bare-hint window as historical context too", () => {
+    const summary = summarizeRunFailureForIssueComment(
+      run({
+        errorCode: "rate_limit_exhausted",
+        resultJson: { errorFamily: "rate_limit_exhausted", retryNotBefore: RESET_ISO },
+      }),
+      SWEEP_AFTER_RESET,
+    );
+    expect(summary).toContain(RESET_ISO);
+    expect(summary).toContain("rate-limit/quota window");
+    expect(summary).toContain("elapsed");
+    expect(summary).not.toContain("self-healing");
+    expect(summary).not.toContain("429");
+  });
+
+  it("treats the reset instant itself as no longer open", () => {
+    // Boundary: at exactly resetAt the window has reopened, so the issue is no
+    // longer waiting on it.
+    const summary = summarizeRunFailureForIssueComment(
+      run({
+        errorCode: "job_failed",
+        resultJson: {
+          errorFamily: "rate_limit_exhausted",
+          providerCapacityResetAt: RESET_ISO,
+          providerCapacityResetProvenance: SERVER_429_PROVENANCE,
+        },
+      }),
+      Date.parse(RESET_ISO),
+    );
+    expect(summary).toContain("elapsed");
+    expect(summary).not.toContain("self-healing");
+  });
+
+  it("still summarizes a plain failure with no resultJson", () => {    const summary = summarizeRunFailureForIssueComment(
       run({ errorCode: "job_failed", error: "External lifecycle Job failed: BackoffLimitExceeded" }),
     );
     expect(summary).toContain("job_failed");
