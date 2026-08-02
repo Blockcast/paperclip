@@ -326,6 +326,62 @@ describe("sanitizeRecord value-shape gate (BLO-20810)", () => {
 
     expect(result?.userAuthContext).toBe(REDACTED_EVENT_VALUE);
   });
+
+  // Residual finding (#943 review, post-tiering): `auth`/`secret` as a whole
+  // token in a short key (<=2 tokens) is an ordinary credential field name,
+  // not the "author"/"no_secrets_in_payload" collision Tier 2 exists for —
+  // it must not fall through `looksLikeCredentialValue`'s length/shape gate
+  // just because the value happens to be short.
+  it("redacts a short value under a real auth/secret field name regardless of length or shape", () => {
+    const result = redactEventPayload({
+      secret: "hunter2",
+      client_secret: "s3cr3t99",
+      webhook_secret: "abc123XY",
+      auth: "pw12345",
+      clientSecret: "another-short-one",
+    });
+
+    expect(result?.secret).toBe(REDACTED_EVENT_VALUE);
+    expect(result?.client_secret).toBe(REDACTED_EVENT_VALUE);
+    expect(result?.webhook_secret).toBe(REDACTED_EVENT_VALUE);
+    expect(result?.auth).toBe(REDACTED_EVENT_VALUE);
+    expect(result?.clientSecret).toBe(REDACTED_EVENT_VALUE);
+  });
+
+  it("does not promote base_url, or sentence-shaped/multi-token keys, to tier 1", () => {
+    const input = {
+      base_url: "short",
+      author: "octocat",
+      authors: ["alice", "bob"],
+      ask_2_author_identity: "PR #1898 was authored by the app account, not a human.",
+      no_secrets_in_payload: "No secret values are present in this payload.",
+    };
+
+    expect(redactEventPayload(structuredClone(input))).toEqual(input);
+  });
+
+  // Critical (#943 review, post-tiering): a Tier-2 parent (`authorInfo`
+  // contains "auth" but isn't a Tier-1 stem) used to suppress every child's
+  // own classification, so `password`/`apiKey`/`token` — all Tier-1 stems —
+  // leaked wholesale underneath it. A child's own tier must win when it's
+  // stronger than the inherited one.
+  it("redacts tier-1 child keys unconditionally even beneath an ambiguous tier-2 parent", () => {
+    const result = redactEventPayload({
+      authorInfo: {
+        password: "hunter2",
+        apiKey: "abc123",
+        token: "short-token",
+        note: "Verified via GitHub App identity.",
+      },
+    });
+
+    expect(result?.authorInfo).toEqual({
+      password: REDACTED_EVENT_VALUE,
+      apiKey: REDACTED_EVENT_VALUE,
+      token: REDACTED_EVENT_VALUE,
+      note: "Verified via GitHub App identity.",
+    });
+  });
 });
 
 describe("redactApprovalPayloadForDisplay (BLO-20810)", () => {

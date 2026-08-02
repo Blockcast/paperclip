@@ -31,6 +31,46 @@ const SECRET_FIELD_NAME_PATTERN =
 
 const SECRET_TIER1_KEY_RE = new RegExp(String.raw`[A-Za-z0-9_-]*(?:${SECRET_TIER1_STEMS})[A-Za-z0-9_-]*`, "i");
 const SECRET_TIER2_KEY_RE = new RegExp(String.raw`[A-Za-z0-9_-]*(?:${SECRET_TIER2_STEMS})[A-Za-z0-9_-]*`, "i");
+
+/**
+ * `auth`/`secret` are Tier 2 because they collide with ordinary words
+ * (`author`, `no_secrets_in_payload`), but as a *whole token* in a short key
+ * they're never that collision — `secret`, `client_secret`, `webhook_secret`,
+ * `auth` are ordinary credential field names, not prose. Promote those to
+ * Tier 1 so a short value under them (`{ secret: "hunter2" }`) doesn't fall
+ * through `looksLikeCredentialValue`'s length/shape gate (BLO-20810 residual
+ * finding, #943 review). `author`/`authors` keep Tier 2 because "auth" isn't
+ * a whole token in them; `base_url` is excluded on purpose — it is two
+ * tokens but never itself a credential value.
+ */
+const AMBIGUOUS_PROMOTABLE_TOKENS = new Set(["auth", "secret"]);
+
+function keyTokens(key: string): string[] {
+  return key
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .split(/[_\-\s]+/)
+    .filter(Boolean)
+    .map((token) => token.toLowerCase());
+}
+
+function promotesTier2ToTier1(key: string): boolean {
+  const tokens = keyTokens(key);
+  return tokens.length > 0 && tokens.length <= 2 && tokens.some((token) => AMBIGUOUS_PROMOTABLE_TOKENS.has(token));
+}
+
+/**
+ * Single source of truth for a key's tier, used both for the top-level scan
+ * in `sanitizeRecord` and to re-evaluate object children in
+ * `sanitizeSecretMatchedValue` — a Tier-2 parent must not suppress a child
+ * key that independently classifies as Tier 1 (BLO-20810 / #943 review
+ * Critical: `{ authorInfo: { password: "hunter2" } }` used to inherit
+ * `authorInfo`'s Tier 2 all the way down and never re-test `password`).
+ */
+function classifyKeyTier(key: string): 1 | 2 | null {
+  if (SECRET_TIER1_KEY_RE.test(key)) return 1;
+  if (SECRET_TIER2_KEY_RE.test(key)) return promotesTier2ToTier1(key) ? 1 : 2;
+  return null;
+}
 const COMMAND_PAYLOAD_KEY_RE =
   /(^command$|^cmd$|command[-_]?line|resolved[-_]?command|PAPERCLIP_RESOLVED_COMMAND)/i;
 const COMMAND_ARGS_PAYLOAD_KEY_RE = /^(commandArgs|command_?args|argv)$/i;
@@ -260,16 +300,20 @@ function looksLikeCredentialValue(value: string): boolean {
  * (e.g. `ask_2_author_identity`, `links.PR_1898_app_authored`) doesn't
  * destroy structured or non-opaque content nested beneath it, and so a
  * genuinely secret parent (e.g. `authorization: { value, current }`) keeps
- * every descendant leaf covered by the same tier rather than falling back to
- * ordinary key-name matching on the child's own key (BLO-20810 / #943 review
+ * every descendant leaf covered by *at least* the parent's tier — a neutral
+ * child key doesn't downgrade it — while a child key that independently
+ * classifies as a *stronger* tier than the parent (e.g. `password` under the
+ * ambiguous `authorInfo`) is redacted unconditionally rather than inheriting
+ * the parent's weaker narrow-value-test tier (BLO-20810 / #943 review
  * Critical 2 — the object branch used to delegate to `sanitizeRecord`, which
  * re-tested each child key from scratch and silently dropped the parent's
- * sensitivity; the array branch never had that bug, so array and object must
- * take the same path here).
+ * sensitivity in the other direction; the array branch never had that bug,
+ * so array and object must take the same path here).
  *
  * `tier === 1` mirrors the unconditional Tier-1 key match: every string leaf
  * is redacted regardless of shape. `tier === 2` applies the narrow
- * credential test (`looksLikeCredentialValue`) at every leaf.
+ * credential test (`looksLikeCredentialValue`) at every leaf, unless a child
+ * key itself resolves to Tier 1.
  */
 function sanitizeSecretMatchedValue(value: unknown, options: SanitizeOptions | undefined, tier: 1 | 2): unknown {
   if (isSecretRefBinding(value) || isUserSecretRefBinding(value)) {
@@ -288,7 +332,12 @@ function sanitizeSecretMatchedValue(value: unknown, options: SanitizeOptions | u
   if (isPlainObject(value)) {
     const out: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(value)) {
-      out[k] = sanitizeSecretMatchedValue(v, options, tier);
+      // A child key's own classification only ever strengthens the
+      // inherited tier (min(1, 2) = 1), never weakens it — a neutral child
+      // (`value`, `current`) keeps the parent's tier, exactly as before.
+      const childTier = classifyKeyTier(k);
+      const effectiveTier = childTier !== null && childTier < tier ? childTier : tier;
+      out[k] = sanitizeSecretMatchedValue(v, options, effectiveTier);
     }
     return out;
   }
@@ -310,12 +359,9 @@ export function sanitizeRecord(record: Record<string, unknown>, options?: Saniti
       redacted[key] = redactSensitiveText(value);
       continue;
     }
-    if (SECRET_TIER1_KEY_RE.test(key)) {
-      redacted[key] = sanitizeSecretMatchedValue(value, options, 1);
-      continue;
-    }
-    if (SECRET_TIER2_KEY_RE.test(key)) {
-      redacted[key] = sanitizeSecretMatchedValue(value, options, 2);
+    const keyTier = classifyKeyTier(key);
+    if (keyTier !== null) {
+      redacted[key] = sanitizeSecretMatchedValue(value, options, keyTier);
       continue;
     }
     if (typeof value === "string" && JWT_VALUE_RE.test(value)) {
