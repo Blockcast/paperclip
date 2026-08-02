@@ -8358,6 +8358,7 @@ export interface HeartbeatServiceOptions {
       reason: string;
       resumeContinuation: boolean;
       suppressHeadRescanDemand: boolean;
+      suppressCriticalLaneHeadRescanDemand: boolean;
     },
   ) => void;
   /** Test-only hook fired when a detached queued-dispatch pass is scheduled. */
@@ -8368,6 +8369,13 @@ export interface HeartbeatServiceOptions {
       suppressCriticalLaneHeadRescanDemand: boolean;
     },
   ) => void;
+  /**
+   * Test-only barrier after a detached continuation is scheduled but before
+   * the scheduling pass releases the per-agent start lock.
+   */
+  afterQueuedDispatchContinuationScheduledForTest?: (
+    input: { agentId: string; reason: string },
+  ) => Promise<void> | void;
 }
 
 function isTruthyRuntimeEnvValue(value: string | undefined) {
@@ -17952,7 +17960,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .from(heartbeatRuns)
           .where(and(
             eq(heartbeatRuns.agentId, agentId),
-            eq(heartbeatRuns.status, "queued"),
+            // Keep the partial-index predicate a SQL literal. postgres.js uses
+            // prepared statements by default; a bound status parameter can
+            // receive a generic plan that cannot imply `status = 'queued'`.
+            sql`${heartbeatRuns.status} = 'queued'`,
             cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined,
             // Keyset cursor. created_at alone is not unique (bulk wake fan-out
             // stamps identical timestamps), so the id tiebreak is what keeps
@@ -18110,7 +18121,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .from(heartbeatRuns)
           .where(and(
             eq(heartbeatRuns.agentId, agentId),
-            eq(heartbeatRuns.status, "queued"),
+            sql`${heartbeatRuns.status} = 'queued'`,
             cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined,
             criticalLaneCursor
               ? sql`(${heartbeatRuns.createdAt}, ${heartbeatRuns.id}) > (${criticalLaneCursor.createdAt.toISOString()}::timestamptz, ${criticalLaneCursor.id}::uuid)`
@@ -18173,11 +18184,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         dispatchCriticalLaneCursorByAgent.delete(agentId);
         dispatchCriticalLaneHeadRescanDemandByAgent.delete(agentId);
         scheduleDetachedDispatchPass(agentId, "resume_critical_lane");
+        await options.afterQueuedDispatchContinuationScheduledForTest?.({
+          agentId,
+          reason: "resume_critical_lane",
+        });
         return [];
       }
       if (!foundReadyCritical && !criticalLaneExhausted && criticalLaneCursor) {
         dispatchCriticalLaneCursorByAgent.set(agentId, criticalLaneCursor);
         scheduleDetachedDispatchPass(agentId, "resume_critical_lane");
+        await options.afterQueuedDispatchContinuationScheduledForTest?.({
+          agentId,
+          reason: "resume_critical_lane",
+        });
         return [];
       }
       dispatchCriticalLaneCursorByAgent.delete(agentId);
@@ -18196,7 +18215,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .from(heartbeatRuns)
         .where(and(
           eq(heartbeatRuns.agentId, agentId),
-          eq(heartbeatRuns.status, "queued"),
+          sql`${heartbeatRuns.status} = 'queued'`,
           cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined,
           sql`${heartbeatRuns.contextSnapshot} ->> 'source' = 'issue_recovery_action'`,
           sql`${heartbeatRuns.contextSnapshot} ->> 'recoveryActionId' is not null`,
@@ -18608,6 +18627,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           reason: dispatchPassOptions.reason ?? "direct",
           resumeContinuation: dispatchPassOptions.resumeContinuation === true,
           suppressHeadRescanDemand: dispatchPassOptions.suppressHeadRescanDemand === true,
+          suppressCriticalLaneHeadRescanDemand:
+            dispatchPassOptions.suppressCriticalLaneHeadRescanDemand === true,
         });
         if (!dispatchPassOptions.suppressCriticalLaneHeadRescanDemand) {
           dispatchCriticalLaneHeadRescanDemandByAgent.add(agentId);

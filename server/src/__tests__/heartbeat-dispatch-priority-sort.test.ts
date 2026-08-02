@@ -1799,6 +1799,19 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
       reason: string;
       suppressCriticalLaneHeadRescanDemand: boolean;
     }> = [];
+    const criticalContinuationCoalesced: Array<{
+      reason: string;
+      resumeContinuation: boolean;
+      suppressCriticalLaneHeadRescanDemand: boolean;
+    }> = [];
+    let releaseSchedulingPass = () => {};
+    const schedulingPassHeld = new Promise<void>((resolve) => {
+      releaseSchedulingPass = resolve;
+    });
+    let observeCoalescedContinuation = () => {};
+    const coalescedContinuationObserved = new Promise<void>((resolve) => {
+      observeCoalescedContinuation = resolve;
+    });
     const boundedHeartbeat = heartbeatService(db, {
       penstockGate: allowPenstockGate,
       queuedRunDispatchBounds: { scanLimit: 2, maxScanBatches: 1, maxResumePasses: 5 },
@@ -1810,6 +1823,19 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
               event.suppressCriticalLaneHeadRescanDemand,
           });
         }
+      },
+      afterQueuedDispatchContinuationScheduledForTest: async (event) => {
+        if (event.reason === "resume_critical_lane") await schedulingPassHeld;
+      },
+      onQueuedDispatchCoalescedDemandForTest: (event) => {
+        if (event.reason !== "resume_critical_lane") return;
+        criticalContinuationCoalesced.push({
+          reason: event.reason,
+          resumeContinuation: event.resumeContinuation,
+          suppressCriticalLaneHeadRescanDemand:
+            event.suppressCriticalLaneHeadRescanDemand,
+        });
+        observeCoalescedContinuation();
       },
     });
 
@@ -1927,7 +1953,10 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
       };
     });
 
-    await boundedHeartbeat.resumeQueuedRuns();
+    const initialDispatch = boundedHeartbeat.resumeQueuedRuns();
+    await coalescedContinuationObserved;
+    releaseSchedulingPass();
+    await initialDispatch;
     await waitForRunToSettle(boundedHeartbeat, runnableCriticalRunId, 60_000);
 
     expect(dispatchedRunIds[0]).toBe(runnableCriticalRunId);
@@ -1939,6 +1968,11 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
         suppressCriticalLaneHeadRescanDemand: true,
       })),
     );
+    expect(criticalContinuationCoalesced).toContainEqual({
+      reason: "resume_critical_lane",
+      resumeContinuation: true,
+      suppressCriticalLaneHeadRescanDemand: true,
+    });
     await boundedHeartbeat.drainInFlightExecutions(60_000);
   }, 120_000);
 
