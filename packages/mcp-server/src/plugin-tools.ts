@@ -16,10 +16,24 @@ interface PluginToolDescriptor {
   pluginId?: string;
 }
 
+/**
+ * Result payload returned by `POST /api/plugins/tools/execute`. Mirrors the
+ * server-side `ToolExecutionResult` in
+ * `server/src/services/plugin-tool-registry.ts`, whose `result` is the plugin
+ * SDK's `ToolResult` (`packages/plugins/sdk/src/types.ts`).
+ *
+ * There is no top-level `ok` discriminator: a plugin tool reports failure by
+ * setting `result.error`, and the route still answers HTTP 200 (BLO-18466).
+ */
 interface PluginToolExecuteResponse {
-  ok: boolean;
-  result?: unknown;
-  error?: { code?: string; message?: string; details?: unknown };
+  pluginId?: string;
+  toolName?: string;
+  result?: {
+    content?: string;
+    data?: unknown;
+    /** If present, the tool call failed. */
+    error?: string;
+  };
 }
 
 /**
@@ -151,9 +165,14 @@ function buildPluginToolDefinition(
             includeRunId: true,
           },
         );
-        if (result?.ok === false) {
+        // A failing plugin tool answers HTTP 200 with `result.error` set, so
+        // `requestJson` does not throw and the catch below never sees it. Route
+        // it through `formatErrorResponse` or the agent receives a failed tool
+        // call as a success whose payload merely mentions an error (BLO-18466).
+        const pluginError = result?.result?.error;
+        if (typeof pluginError === "string" && pluginError.length > 0) {
           return formatErrorResponse(
-            new Error(result.error?.message ?? `Plugin tool ${tool.name} failed`),
+            new Error(`Plugin tool ${tool.name} failed: ${pluginError}`),
           );
         }
         return formatTextResponse(result?.result ?? result);
