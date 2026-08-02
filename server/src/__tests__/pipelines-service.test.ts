@@ -1903,6 +1903,10 @@ describeEmbeddedPostgres("pipelineService", () => {
     expect(run!.resultJson).toMatchObject({ pipelineStageExitCancellationRequestedAt: expect.any(String) });
     expect(failureActivity).toEqual({ action: "heartbeat.cancel_failed" });
 
+    await db
+      .update(issues)
+      .set({ executionRunId: null, executionAgentNameKey: null, executionLockedAt: null })
+      .where(eq(issues.id, issueId));
     const retryHeartbeat = heartbeatService(db);
     await retryHeartbeat.wakeup(routine.assigneeAgentId!, {
       source: "comment",
@@ -1919,11 +1923,102 @@ describeEmbeddedPostgres("pipelineService", () => {
       reason: "pipeline_stage_exit_cancellation_pending",
     });
 
+    await db
+      .update(issues)
+      .set({ executionRunId: null, executionAgentNameKey: null, executionLockedAt: null })
+      .where(eq(issues.id, issueId));
     await retryHeartbeat.sweepStaleIssueLocks();
     [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, heartbeatRunId));
     const [recoveredIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
     expect(run).toMatchObject({ status: "cancelled", errorCode: "pipeline_stage_exited" });
     expect(recoveredIssue).toMatchObject({ status: "cancelled", executionRunId: null });
+  });
+
+  it("marks a queued run that becomes running during stage retirement", async () => {
+    const company = await seedCompany();
+    const routine = await seedRoutine(company.id, "Queued claim race");
+    const pipeline = await svc.createPipeline({
+      companyId: company.id,
+      key: "queued-claim-race",
+      name: "Queued claim race",
+      actor: userActor,
+      stages: [
+        { key: "intake", name: "Intake", kind: "open" },
+        { key: "drafting", name: "Drafting", kind: "working", config: { onEnter: { type: "run_routine", routineId: routine.id } } },
+        { key: "review", name: "Review", kind: "working" },
+        { key: "done", name: "Done", kind: "done" },
+        { key: "cancelled", name: "Cancelled", kind: "cancelled" },
+      ],
+    });
+    const created = await svc.ingestCase({
+      companyId: company.id,
+      pipelineId: pipeline.id,
+      caseKey: "queued-claim-race",
+      title: "Queued claim race",
+      actor: userActor,
+    });
+    const entered = await svc.transitionCase({
+      companyId: company.id,
+      caseId: created.case.id,
+      toStageKey: "drafting",
+      expectedVersion: created.case.version,
+      actor: userActor,
+    });
+    const issueId = entered.automationExecution.status === "succeeded"
+      ? entered.automationExecution.execution.executionIssueId!
+      : "";
+    const heartbeatRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: heartbeatRunId,
+      companyId: company.id,
+      agentId: routine.assigneeAgentId!,
+      status: "queued",
+      invocationSource: "assignment",
+      contextSnapshot: { issueId },
+    });
+    await db
+      .update(issues)
+      .set({ executionRunId: heartbeatRunId })
+      .where(eq(issues.id, issueId));
+    await db.execute(sql`
+      create function test_claim_pipeline_run_during_retirement() returns trigger as $$
+      begin
+        update heartbeat_runs
+        set status = 'running', started_at = now(), updated_at = now()
+        where id = '${sql.raw(heartbeatRunId)}' and status = 'queued';
+        return new;
+      end;
+      $$ language plpgsql;
+      create trigger test_claim_pipeline_run_during_retirement
+      after update of status on issues
+      for each row
+      when (new.id = '${sql.raw(issueId)}' and new.status = 'cancelled')
+      execute function test_claim_pipeline_run_during_retirement();
+    `);
+    try {
+      await svc.transitionCase({
+        companyId: company.id,
+        caseId: created.case.id,
+        toStageKey: "review",
+        expectedVersion: entered.case.version,
+        actor: userActor,
+      });
+    } finally {
+      await db.execute(sql`drop trigger if exists test_claim_pipeline_run_during_retirement on issues`);
+      await db.execute(sql`drop function if exists test_claim_pipeline_run_during_retirement()`);
+    }
+
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, heartbeatRunId));
+    expect(run).toMatchObject({
+      status: "cancelled",
+      errorCode: "pipeline_stage_exited",
+      resultJson: { pipelineStageExitCancellationRequestedAt: expect.any(String) },
+    });
+    expect(cancelRun).toHaveBeenCalledWith(
+      heartbeatRunId,
+      expect.any(String),
+      expect.objectContaining({ errorCode: "pipeline_stage_exited" }),
+    );
   });
 
   it("retires the automation link without cancelling a repurposed issue", async () => {
@@ -2258,6 +2353,78 @@ describeEmbeddedPostgres("pipelineService", () => {
       retiredAt: null,
       retiredReason: null,
     });
+  });
+
+  it("does not let an older retry replace a newer active automation attempt", async () => {
+    const company = await seedCompany();
+    const routine = await seedRoutine(company.id, "Attempt ownership");
+    const pipeline = await svc.createPipeline({
+      companyId: company.id,
+      key: "attempt-ownership",
+      name: "Attempt ownership",
+      actor: userActor,
+      stages: [
+        { key: "drafting", name: "Drafting", kind: "working", config: { onEnter: { type: "run_routine", routineId: routine.id } } },
+        { key: "done", name: "Done", kind: "done" },
+        { key: "cancelled", name: "Cancelled", kind: "cancelled" },
+      ],
+    });
+    const entered = await svc.ingestCase({
+      companyId: company.id,
+      pipelineId: pipeline.id,
+      caseKey: "attempt-ownership",
+      title: "Attempt ownership",
+      actor: userActor,
+    });
+    const olderAttempt = entered.automationLedger!;
+    const issueId = entered.automationExecution.status === "succeeded"
+      ? entered.automationExecution.execution.executionIssueId!
+      : "";
+    const [newerEvent] = await db.insert(pipelineCaseEvents).values({
+      companyId: company.id,
+      caseId: entered.case.id,
+      type: "automation_retry_requested",
+      actorType: "system",
+      toStageId: entered.case.stageId,
+      payload: { reorderedAttempt: true },
+    }).returning();
+    const [newerAttempt] = await db.insert(pipelineAutomationExecutions).values({
+      companyId: company.id,
+      caseId: entered.case.id,
+      automationId: olderAttempt.automationId,
+      triggeringEventId: newerEvent!.id,
+      routineId: routine.id,
+      status: "succeeded",
+      executionIssueId: issueId,
+    }).returning();
+    await db
+      .update(pipelineCaseIssueLinks)
+      .set({ automationAttemptId: newerAttempt!.id })
+      .where(eq(pipelineCaseIssueLinks.caseId, entered.case.id));
+    await db
+      .update(pipelineAutomationExecutions)
+      .set({ status: "failed", executionIssueId: null, error: "delayed older attempt" })
+      .where(eq(pipelineAutomationExecutions.id, olderAttempt.id));
+
+    const retried = await svc.retryAutomation({
+      companyId: company.id,
+      caseId: entered.case.id,
+      automationId: olderAttempt.automationId,
+      actor: userActor,
+    });
+
+    expect(retried.status).toBe("failed");
+    const [link] = await db
+      .select()
+      .from(pipelineCaseIssueLinks)
+      .where(eq(pipelineCaseIssueLinks.caseId, entered.case.id));
+    expect(link).toMatchObject({
+      automationAttemptId: newerAttempt!.id,
+      retiredAt: null,
+      retiredReason: null,
+    });
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(issue!.status).toBe("todo");
   });
 
   it("retires stage automation when stage deletion moves its case", async () => {

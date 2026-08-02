@@ -17695,14 +17695,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const pendingStageExitCancellations = await db
       .select({ id: heartbeatRuns.id })
       .from(heartbeatRuns)
-      .innerJoin(
-        issues,
-        and(
-          eq(issues.companyId, heartbeatRuns.companyId),
-          eq(issues.executionRunId, heartbeatRuns.id),
-          eq(issues.status, "cancelled"),
-        ),
-      )
       .where(and(
         eq(heartbeatRuns.status, "running"),
         sql`${heartbeatRuns.resultJson} ->> 'pipelineStageExitCancellationRequestedAt' is not null`,
@@ -24340,28 +24332,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           activeExecutionRun = null;
         }
 
-        if (
-          issue.status === "cancelled" &&
-          activeExecutionRun?.status === "running" &&
-          readNonEmptyString(parseObject(activeExecutionRun.resultJson).pipelineStageExitCancellationRequestedAt)
-        ) {
-          await tx.insert(agentWakeupRequests).values({
-            companyId: agent.companyId,
-            agentId,
-            source,
-            triggerDetail,
-            reason: "pipeline_stage_exit_cancellation_pending",
-            payload,
-            status: "skipped",
-            requestedByActorType: opts.requestedByActorType ?? null,
-            requestedByActorId: opts.requestedByActorId ?? null,
-            idempotencyKey: opts.idempotencyKey ?? null,
-            finishedAt: new Date(),
-          });
-          if (suppression) suppression.durableSkipReason = "pipeline_stage_exit_cancellation_pending";
-          return { kind: "skipped" as const };
-        }
-
         // A queued/scheduled run holding the lock for an agent that is
         // no longer the issue's assignee is stale by design — the issue
         // has been re-routed (e.g. blocked → in_review with a different
@@ -24466,6 +24436,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 .where(eq(issues.id, issue.id));
             }
           }
+        }
+
+        if (
+          issue.status === "cancelled" &&
+          activeExecutionRun?.status === "running" &&
+          readNonEmptyString(parseObject(activeExecutionRun.resultJson).pipelineStageExitCancellationRequestedAt)
+        ) {
+          await tx.insert(agentWakeupRequests).values({
+            companyId: agent.companyId,
+            agentId,
+            source,
+            triggerDetail,
+            reason: "pipeline_stage_exit_cancellation_pending",
+            payload,
+            status: "skipped",
+            requestedByActorType: opts.requestedByActorType ?? null,
+            requestedByActorId: opts.requestedByActorId ?? null,
+            idempotencyKey: opts.idempotencyKey ?? null,
+            finishedAt: new Date(),
+          });
+          if (suppression) suppression.durableSkipReason = "pipeline_stage_exit_cancellation_pending";
+          return { kind: "skipped" as const };
         }
 
         const dependencyReadiness = await issuesSvc.listDependencyReadiness(
