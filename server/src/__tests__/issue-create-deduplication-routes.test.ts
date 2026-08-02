@@ -124,6 +124,32 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
     return project;
   }
 
+  async function waitUntil(assertion: () => void | Promise<void>, timeoutMs = 1_000) {
+    const deadline = Date.now() + timeoutMs;
+    let lastError: unknown;
+    while (Date.now() < deadline) {
+      try {
+        await assertion();
+        return;
+      } catch (error) {
+        lastError = error;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+    }
+    if (lastError) throw lastError;
+    await assertion();
+  }
+
+  async function waitForActivityEvents(companyId: string, action: string, expectedCount: number) {
+    let rows: Array<typeof activityLog.$inferSelect> = [];
+    await waitUntil(async () => {
+      rows = (await db.select().from(activityLog).where(eq(activityLog.companyId, companyId)))
+        .filter((event) => event.action === action);
+      expect(rows).toHaveLength(expectedCount);
+    });
+    return rows;
+  }
+
   it("replays the existing issue for the same company idempotency key", async () => {
     const companyId = await seedCompany();
     const parent = await seedParent(companyId);
@@ -312,17 +338,12 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
       .expect(201);
     expect(explicitlyAllowed.body.duplicateCandidates).not.toEqual([]);
 
-    const activityEvents = await db
-      .select()
-      .from(activityLog)
-      .where(eq(activityLog.companyId, companyId));
-    const consumptionEvents = activityEvents.filter(
-      (event) => event.action === "issue.duplicate_candidates_shown"
-        && event.details?.identifier === response.body.identifier,
+    const shownEvents = await waitForActivityEvents(companyId, "issue.duplicate_candidates_shown", 2);
+    const activityEvents = await db.select().from(activityLog).where(eq(activityLog.companyId, companyId));
+    const consumptionEvents = shownEvents.filter(
+      (event) => event.details?.identifier === response.body.identifier,
     );
     expect(consumptionEvents).toHaveLength(1);
-    expect(activityEvents.filter((event) => event.action === "issue.duplicate_candidates_shown"))
-      .toHaveLength(2);
     expect(consumptionEvents[0]).toMatchObject({
       entityType: "company",
       entityId: companyId,
@@ -378,9 +399,19 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
       status: "todo",
       priority: "medium",
     });
+    let writerStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      writerStarted = resolve;
+    });
+    let releaseWriter!: () => void;
+    const release = new Promise<void>((resolve) => {
+      releaseWriter = resolve;
+    });
     const app = createApp({
-      createIssueDuplicateCandidateActivityWriter: () => new Promise<never>(() => {}),
-      createIssueDuplicateCandidateActivityTimeoutMs: 10,
+      createIssueDuplicateCandidateActivityWriter: async () => {
+        writerStarted();
+        await release;
+      },
     });
 
     const subject = monitorFilings[1]!;
@@ -391,6 +422,8 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
 
     expect(response.body.duplicateCandidates).not.toEqual([]);
     expect(await db.select().from(issues).where(eq(issues.id, response.body.id))).toHaveLength(1);
+    await started;
+    releaseWriter();
   });
 
   it("cancels a blocked advisory consumption telemetry write", async () => {
@@ -471,6 +504,132 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
 
     expect(response.body.duplicateCandidates).toEqual([]);
     expect(lookupAborted).toBe(true);
+    const activityEvents = await db.select().from(activityLog).where(eq(activityLog.companyId, companyId));
+    expect(activityEvents.filter((event) => event.action === "issue.duplicate_candidates_shown")).toHaveLength(0);
+  });
+
+  it("skips advisory lookup when connection reservation exceeds the deadline", async () => {
+    const companyId = await seedCompany();
+    const client = (db as typeof db & {
+      $client: { reserve: () => Promise<{ release: () => void }> };
+    }).$client;
+    const originalReserve = client.reserve.bind(client);
+    let lookupStarted = false;
+    let releaseLateReservation!: () => void;
+    let lateReservationReleased = false;
+    client.reserve = () => new Promise((resolve) => {
+      releaseLateReservation = () => resolve({
+        release: () => {
+          lateReservationReleased = true;
+        },
+      });
+    });
+    const app = createApp({
+      createIssueDuplicateCandidateTimeoutMs: 10,
+      createIssueDuplicateCandidateLookup: async () => {
+        lookupStarted = true;
+        return [{ identifier: "DUP-1", title: "Duplicate", score: 0.99 }];
+      },
+    });
+
+    try {
+      const response = await request(app)
+        .post(`/api/companies/${companyId}/issues`)
+        .send({ title: "Create without queued advisory lookup" })
+        .expect(201);
+
+      expect(response.body.duplicateCandidates).toEqual([]);
+      expect(lookupStarted).toBe(false);
+      releaseLateReservation();
+      await waitUntil(() => expect(lateReservationReleased).toBe(true));
+    } finally {
+      client.reserve = originalReserve;
+    }
+  });
+
+  it("skips advisory telemetry when connection reservation exceeds the deadline", async () => {
+    const companyId = await seedCompany();
+    const candidate = monitorFilings[0]!;
+    await db.insert(issues).values({
+      companyId,
+      identifier: candidate.identifier,
+      title: candidate.title,
+      description: candidate.description,
+      status: "todo",
+      priority: "medium",
+    });
+    const client = (db as typeof db & {
+      $client: { reserve: () => Promise<{ release: () => void }> };
+    }).$client;
+    const originalReserve = client.reserve.bind(client);
+    let reserveCalls = 0;
+    let telemetryWriterCalled = false;
+    let releaseLateReservation!: () => void;
+    let lateReservationReleased = false;
+    client.reserve = () => {
+      reserveCalls += 1;
+      if (reserveCalls === 1) return originalReserve();
+      return new Promise((resolve) => {
+        releaseLateReservation = () => resolve({
+          release: () => {
+            lateReservationReleased = true;
+          },
+        });
+      });
+    };
+    const app = createApp({
+      createIssueDuplicateCandidateActivityTimeoutMs: 10,
+      createIssueDuplicateCandidateActivityWriter: async () => {
+        telemetryWriterCalled = true;
+      },
+    });
+    const subject = monitorFilings[1]!;
+
+    try {
+      const response = await request(app)
+        .post(`/api/companies/${companyId}/issues`)
+        .send({ title: subject.title, description: subject.description })
+        .expect(201);
+
+      expect(response.body.duplicateCandidates).not.toEqual([]);
+      await waitUntil(() => expect(reserveCalls).toBeGreaterThanOrEqual(2));
+      expect(telemetryWriterCalled).toBe(false);
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      releaseLateReservation();
+      await waitUntil(() => expect(lateReservationReleased).toBe(true));
+      expect(await db.select().from(activityLog).where(eq(activityLog.companyId, companyId)))
+        .not.toEqual(expect.arrayContaining([
+          expect.objectContaining({ action: "issue.duplicate_candidates_shown" }),
+        ]));
+    } finally {
+      client.reserve = originalReserve;
+    }
+  });
+
+  it("does not record duplicate-candidate telemetry when the create path fails after lookup", async () => {
+    const companyId = await seedCompany();
+    const candidate = monitorFilings[0]!;
+    await db.insert(issues).values({
+      companyId,
+      identifier: candidate.identifier,
+      title: candidate.title,
+      description: candidate.description,
+      status: "todo",
+      priority: "medium",
+    });
+    const app = createApp({
+      createIssueBeforeResponseHook: async () => {
+        throw new Error("late create side effect failed");
+      },
+    });
+    const subject = monitorFilings[1]!;
+
+    await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ title: subject.title, description: subject.description })
+      .expect(500);
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
     const activityEvents = await db.select().from(activityLog).where(eq(activityLog.companyId, companyId));
     expect(activityEvents.filter((event) => event.action === "issue.duplicate_candidates_shown")).toHaveLength(0);
   });
