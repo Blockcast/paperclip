@@ -2,10 +2,23 @@ import { z } from "zod";
 import { APPROVAL_TYPES } from "../constants.js";
 import { multilineTextSchema } from "./text.js";
 
+const approvalPayloadSchema = z.record(z.string(), z.unknown()).superRefine((payload, ctx) => {
+  const title = payload.title;
+  if (typeof title !== "string" || title.trim().length === 0) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["title"],
+      message:
+        "payload.title is required and must be a non-empty, non-whitespace string. " +
+        "Include a short, human-readable payload.title so the card is decidable in the board queue.",
+    });
+  }
+});
+
 export const createApprovalSchema = z.object({
   type: z.enum(APPROVAL_TYPES),
   requestedByAgentId: z.string().uuid().optional().nullable(),
-  payload: z.record(z.string(), z.unknown()),
+  payload: approvalPayloadSchema,
   issueIds: z.array(z.string().uuid()).optional(),
 });
 
