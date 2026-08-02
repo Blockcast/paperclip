@@ -5460,7 +5460,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     await heartbeat.resumeQueuedRuns();
 
     const run = await heartbeat.getRun(queuedRunId);
-    expect(mockHasActiveJobForAgent).toHaveBeenCalledWith(agentId);
+    expect(mockHasActiveJobForAgent).toHaveBeenCalledWith(
+      agentId,
+      expect.objectContaining({ isRunTerminal: expect.any(Function) }),
+    );
     expect(run?.status).toBe("queued");
     expect(mockAdapterExecute.mock.calls.some(([ctx]) => ctx.runId === queuedRunId)).toBe(false);
   });
