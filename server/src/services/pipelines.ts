@@ -3370,8 +3370,30 @@ export function pipelineService(db: Db, deps: { heartbeat?: PipelineHeartbeatDep
         if (!link) {
           throw new Error(`Routine run ${run.id} returned an execution issue whose case link was repurposed`);
         }
+        const currentStageEntry = await txDb
+          .select({
+            id: pipelineCaseEvents.id,
+            payload: pipelineCaseEvents.payload,
+          })
+          .from(pipelineCaseEvents)
+          .where(and(
+            eq(pipelineCaseEvents.companyId, execution.companyId),
+            eq(pipelineCaseEvents.caseId, execution.caseId),
+            inArray(pipelineCaseEvents.type, ["ingested", "transitioned"]),
+            eq(pipelineCaseEvents.toStageId, current.case.stageId),
+          ))
+          .orderBy(desc(pipelineCaseEvents.createdAt), desc(pipelineCaseEvents.id))
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        const currentStageEntryAttemptId = currentStageEntry?.payload && typeof currentStageEntry.payload === "object"
+          ? (currentStageEntry.payload as Record<string, unknown>).retryAttemptId
+          : null;
         if (
-          (current.case.stageId !== detail.stage.id || current.case.version !== detail.case.version)
+          current.case.stageId !== detail.stage.id ||
+          (
+            currentStageEntry?.id !== execution.triggeringEventId &&
+            currentStageEntryAttemptId !== execution.id
+          )
         ) {
           await retireStageAutomationLink(txDb, {
             companyId: execution.companyId,
@@ -5012,6 +5034,17 @@ export function pipelineService(db: Db, deps: { heartbeat?: PipelineHeartbeatDep
         const issueIdsToCancel = input.cleanup.cancelLinkedAutomationIssues
           ? effects.linkedAutomationIssueIds
           : [];
+        if (input.scope === "previous_stage" && detail.case.stageId !== plan.targetStageRow.id) {
+          await retireStageAutomationForExitedStage(tx, {
+            companyId: input.companyId,
+            caseId: detail.case.id,
+            caseTitle: detail.case.title,
+            caseKey: detail.case.caseKey,
+            stageId: detail.stage.id,
+            stageName: detail.stage.name,
+            runningRunIdsToCancel,
+          });
+        }
         if (issueIdsToCancel.length > 0) {
           const cancelledIssues = await tx
             .update(issues)
@@ -5089,15 +5122,6 @@ export function pipelineService(db: Db, deps: { heartbeat?: PipelineHeartbeatDep
               targetStageId: plan.targetStageRow.id,
               targetStageKey: plan.targetStageRow.key,
             },
-          });
-          await retireStageAutomationForExitedStage(tx, {
-            companyId: input.companyId,
-            caseId: detail.case.id,
-            caseTitle: detail.case.title,
-            caseKey: detail.case.caseKey,
-            stageId: detail.stage.id,
-            stageName: detail.stage.name,
-            runningRunIdsToCancel,
           });
         }
         await writeCaseEvent(tx, {

@@ -2364,6 +2364,69 @@ describeEmbeddedPostgres("pipelineService", () => {
     expect(link).toMatchObject({ retiredReason: "stage_exited" });
   });
 
+  it("keeps a delayed automation attachment after a same-stage content edit", async () => {
+    const company = await seedCompany();
+    const routine = await seedRoutine(company.id, "Delayed content edit");
+    let releaseWake!: () => void;
+    let markWakeStarted!: () => void;
+    const wakeStarted = new Promise<void>((resolve) => { markWakeStarted = resolve; });
+    const wakeReleased = new Promise<void>((resolve) => { releaseWake = resolve; });
+    const delayedSvc = pipelineService(db, {
+      heartbeat: {
+        wakeup: async () => {
+          markWakeStarted();
+          await wakeReleased;
+          return null;
+        },
+      },
+    });
+    const pipeline = await delayedSvc.createPipeline({
+      companyId: company.id,
+      key: "delayed-content-edit",
+      name: "Delayed content edit",
+      actor: userActor,
+      stages: [
+        { key: "intake", name: "Intake", kind: "open" },
+        { key: "drafting", name: "Drafting", kind: "working", config: { onEnter: { type: "run_routine", routineId: routine.id } } },
+        { key: "done", name: "Done", kind: "done" },
+        { key: "cancelled", name: "Cancelled", kind: "cancelled" },
+      ],
+    });
+    const created = await delayedSvc.ingestCase({
+      companyId: company.id,
+      pipelineId: pipeline.id,
+      caseKey: "same-stage-edit",
+      title: "Same-stage edit",
+      actor: userActor,
+    });
+    const entering = delayedSvc.transitionCase({
+      companyId: company.id,
+      caseId: created.case.id,
+      toStageKey: "drafting",
+      expectedVersion: created.case.version,
+      actor: userActor,
+    });
+    await wakeStarted;
+    const [draftingCase] = await db.select().from(pipelineCases).where(eq(pipelineCases.id, created.case.id));
+    await delayedSvc.patchCaseContent({
+      companyId: company.id,
+      caseId: created.case.id,
+      summary: "Edited while automation dispatch was in flight",
+      expectedVersion: draftingCase!.version,
+      actor: userActor,
+    });
+    releaseWake();
+    const entered = await entering;
+    const issueId = entered.automationExecution.status === "succeeded"
+      ? entered.automationExecution.execution.executionIssueId!
+      : "";
+
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    const [link] = await db.select().from(pipelineCaseIssueLinks).where(eq(pipelineCaseIssueLinks.issueId, issueId));
+    expect(issue!.status).toBe("todo");
+    expect(link).toMatchObject({ retiredAt: null, retiredReason: null });
+  });
+
   it("refuses to attach an automation issue that became terminal while dispatch was in flight", async () => {
     const company = await seedCompany();
     const routine = await seedRoutine(company.id, "Terminal attachment");
@@ -2833,6 +2896,24 @@ describeEmbeddedPostgres("pipelineService", () => {
       role: "automation",
       automationAttemptId: reviewAttempt!.id,
     });
+    const runningReviewRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runningReviewRunId,
+      companyId: company.id,
+      agentId: routine.assigneeAgentId!,
+      status: "running",
+      invocationSource: "assignment",
+      contextSnapshot: { issueId: reviewIssue!.id },
+    });
+    await db.update(issues)
+      .set({
+        status: "in_progress",
+        executionRunId: runningReviewRunId,
+        checkoutRunId: runningReviewRunId,
+        executionAgentNameKey: "pipeline-agent",
+        executionLockedAt: new Date(),
+      })
+      .where(eq(issues.id, reviewIssue!.id));
 
     const retry = await svc.retryStageAutomation({
       companyId: company.id,
@@ -2843,7 +2924,7 @@ describeEmbeddedPostgres("pipelineService", () => {
       cleanup: {
         retireDirectChildren: true,
         retireDescendants: true,
-        cancelLinkedAutomationIssues: false,
+        cancelLinkedAutomationIssues: true,
       },
       actor: userActor,
     });
@@ -2885,6 +2966,11 @@ describeEmbeddedPostgres("pipelineService", () => {
       .where(eq(pipelineCaseIssueLinks.issueId, reviewIssue!.id));
     expect(retiredReviewIssue!.status).toBe("cancelled");
     expect(retiredReviewLink).toMatchObject({ retiredReason: "stage_exited" });
+    expect(cancelRun).toHaveBeenCalledWith(
+      runningReviewRunId,
+      expect.stringContaining("pipeline case left"),
+      expect.objectContaining({ errorCode: "pipeline_stage_exited" }),
+    );
     const events = await svc.listCaseEvents(company.id, parent.case.id);
     expect(events.filter((pipelineEvent) => pipelineEvent.type === "children_terminal")).toHaveLength(2);
   });
