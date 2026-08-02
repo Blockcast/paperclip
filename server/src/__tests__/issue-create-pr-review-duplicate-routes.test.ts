@@ -83,6 +83,19 @@ describe("pr review duplicate issue guard (pure helpers)", () => {
     expect(parsePullRequestRefs(`https://github.com/${REPO}/pull/0`)).toEqual([]);
   });
 
+  it("requires a real boundary after the PR number", () => {
+    // "/pull/1911abc" is malformed or belongs to some other scheme; resolving it
+    // to PR 1911 would hard-reject a create over text that never referenced it.
+    expect(parsePullRequestRefs(`https://github.com/${REPO}/pull/${PR_NUMBER}abc`)).toEqual([]);
+    expect(parsePullRequestRefs(`https://github.com/${REPO}/pull/${PR_NUMBER}-old`)).toEqual([]);
+    // Legitimate trailing context must still parse.
+    for (const suffix of ["", "/files", "#issuecomment-5154854829", ")", ".", " at head abc"]) {
+      expect(parsePullRequestRefs(`${PR_URL}${suffix}`)).toEqual([
+        { repoFullName: NORMALIZED_REPO, prNumber: PR_NUMBER },
+      ]);
+    }
+  });
+
   it("is not corrupted by regex lastIndex state across calls", () => {
     const text = `${PR_URL} ${PR_URL.replace("1911", "1912")}`;
     expect(parsePullRequestRefs(text)).toHaveLength(2);
@@ -428,5 +441,27 @@ describeEmbeddedPostgres("issue create PR-review duplicate guard routes", () => 
     } finally {
       delete process.env.PAPERCLIP_DISABLE_PR_REVIEW_DUPLICATE_GUARD;
     }
+  });
+
+  it("still creates the issue when the guard lookup itself errors", async () => {
+    // The guard documents fail-open, but it runs inside the issue-creation
+    // transaction: a statement error there aborts the whole transaction, so
+    // merely catching it would leave every later statement failing with 25P02
+    // and the create would still 500. Renaming the table out from under the
+    // lookup forces a real SQL error on exactly that query; the create must
+    // still succeed, which only holds while the lookup is savepoint-isolated.
+    const { companyId, reviewer, app } = await setup();
+    await db.execute(sql`alter table heartbeat_runs rename to heartbeat_runs_hidden`);
+    let res: request.Response;
+    try {
+      res = await request(app)
+        .post(`/api/companies/${companyId}/issues`)
+        .send(reviewIssueBody(reviewer.id));
+    } finally {
+      await db.execute(sql`alter table heartbeat_runs_hidden rename to heartbeat_runs`);
+    }
+
+    expect(res.status).toBe(201);
+    expect(await db.select().from(issues).where(eq(issues.companyId, companyId))).toHaveLength(1);
   });
 });

@@ -57,7 +57,7 @@ const PR_NUMBER = 1656;
 // Real head SHAs from the BLO-17456 incident this test replays.
 const OLD_HEAD = "a24708eac27007d4de3280e37b2a887467025146";
 const NEW_HEAD = "0cbd6523c2d308e581295b4bf217d8c0b77d5679";
-const TASK_KEY = `pr_review:${REPO}:${PR_NUMBER}`;
+const TASK_KEY = `pr_review:${REPO.toLowerCase()}:${PR_NUMBER}`;
 const FRESH_HEAD_DELIVERY_ID = "delivery-fresh-head";
 const FULL_SHA_PATTERN = /^[0-9a-f]{40}$/;
 const REVIEWED_HEAD_PATTERN =
