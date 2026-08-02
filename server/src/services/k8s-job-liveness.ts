@@ -826,9 +826,29 @@ export async function hasActiveJobForAgent(
           .filter((runId): runId is string => Boolean(runId)),
       ),
     ];
-    const terminalRunIds = candidateRunIds.length > 0 && options?.isRunTerminal
-      ? await options.isRunTerminal(candidateRunIds)
-      : new Set<string>();
+    // The DB lookup is deliberately isolated from the outer try/catch below:
+    // that catch means "the kube API is unreachable" and fails OPEN (dispatch
+    // proceeds). A rejected isRunTerminal after Kubernetes already returned an
+    // active Job is the opposite situation -- kube is fine, we just can't
+    // confirm the run is terminal -- so it must fail CLOSED (treat every
+    // candidate Job as non-terminal, i.e. still blocking) instead of being
+    // swallowed into the fail-open path.
+    let terminalRunIds: ReadonlySet<string> = new Set<string>();
+    if (candidateRunIds.length > 0 && options?.isRunTerminal) {
+      try {
+        terminalRunIds = await options.isRunTerminal(candidateRunIds);
+      } catch (error) {
+        logger.warn(
+          {
+            agentId,
+            runIds: candidateRunIds,
+            error: error instanceof Error ? error.message : String(error),
+          },
+          "k8s job-liveness isRunTerminal callback failed; treating all candidate Jobs as non-terminal",
+        );
+        terminalRunIds = new Set<string>();
+      }
+    }
     const hasActiveJob = items.some((job) => jobBlocksDispatch(job, terminalRunIds));
     if (hasActiveJob) {
       return true;
