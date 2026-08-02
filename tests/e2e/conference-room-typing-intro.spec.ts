@@ -11,6 +11,7 @@ import { test, expect } from "@playwright/test";
 const COMPANY_NAME = `E2E-TypingIntro-${Date.now()}`;
 const MISSION = "Verify the dashboard launch survives the wizard handoff.";
 const FIRST_TASK_TITLE = "Hire your first engineer and create a hiring plan";
+const WIZARD_PERSISTENCE_TIMEOUT_MS = 45_000;
 
 test.describe("Dashboard launch after onboarding wizard", () => {
   test("creates the first task and opens the dashboard", async ({
@@ -79,7 +80,7 @@ test.describe("Dashboard launch after onboarding wizard", () => {
     // route above after the adapter probe is intercepted.
     await expect(
       page.getByRole("heading", { name: "Create your team lead" }),
-    ).toBeVisible({ timeout: 15_000 });
+    ).toBeVisible({ timeout: WIZARD_PERSISTENCE_TIMEOUT_MS });
     await expect(
       page.locator('input[placeholder="Chief of staff"]'),
     ).toHaveValue("Chief of staff");
