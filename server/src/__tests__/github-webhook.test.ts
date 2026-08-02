@@ -1121,10 +1121,10 @@ describe("github-webhook pure helpers", () => {
 
     expect(description).toContain("Remediation path:");
     expect(description).toContain("Dismissal path:");
-    expect(description).toContain("For the remediation path");
-    expect(description).toContain("For the dismissal path");
+    expect(description).toContain("A GitHub alert-state receipt is sufficient but not required");
+    expect(description).toContain("terminal dismissal webhook receipt");
     expect(description).toMatch(
-      /^1\. The remediation PR merges into the default branch of `Blockcast\/paperclip`, AND the default-branch manifest `packages\/mcp-gateway\/package\.json` resolves vitest at 3\.2\.6 or newer\.$/m,
+      /^1\. The default-branch manifest `packages\/mcp-gateway\/package\.json` in `Blockcast\/paperclip` resolves vitest at 3\.2\.6 or newer, outside the vulnerable range < 3\.2\.6, with advisory GHSA-5xrq-8626-4rwp \/ CVE-2026-47429 cited in the evidence\.$/m,
     );
   });
 
@@ -1137,6 +1137,20 @@ describe("github-webhook pure helpers", () => {
         }),
       ).toMatchObject({ action, alertNumber: 7, severity: "critical" });
     }
+
+    expect(
+      __test_resolveDependabotAlertContext({
+        action: "dismissed",
+        alert: {
+          number: 8,
+          dismissed_reason: "tolerable_risk",
+          dismissed_comment: "Not reachable in production.",
+        },
+      }),
+    ).toMatchObject({
+      dismissalReason: "tolerable_risk",
+      dismissalComment: "Not reachable in production.",
+    });
   });
 
   it("returns null for dependabot payloads without a numeric alert number", () => {
@@ -3818,7 +3832,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
   // can satisfy. That misreading blocked an already-remediated high-severity CVE
   // for six days. These assertions pin the disambiguated wording so the
   // disjunction cannot be flattened back into prose.
-  it("states the verifying signal as an explicit any-one-of checklist and scopes the REST note", async () => {
+  it("keeps Dependabot acceptance criteria consistent with agent-executable closure evidence", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent({ agentName: "Release Engineer" });
     const app = buildApp({ dependabotAgentId: agentId });
 
@@ -3833,21 +3847,29 @@ describeEmbeddedPostgres("github-webhook route", () => {
 
     // All three sufficient branches survive, each on its own numbered line.
     expect(description).toContain("Any ONE of the following is sufficient and complete evidence");
-    expect(description).toMatch(/^1\. The remediation PR merges into the default branch/m);
-    expect(description).toMatch(/^2\. .*shows `state: fixed`\.$/m);
-    expect(description).toMatch(/^3\. .*shows `state: dismissed`/m);
-    // Branch 1 names the concrete manifest + patched version, so it is actionable
-    // without re-deriving anything from the alert page.
+    expect(description).toMatch(/^1\. The default-branch manifest/m);
+    expect(description).toMatch(/^2\. .*shows `state: fixed` for advisory GHSA-5xrq-8626-4rwp \/ CVE-2026-47429\.$/m);
     expect(description).toMatch(
-      /^1\. The remediation PR merges into the default branch of `Blockcast\/paperclip`, AND the default-branch manifest `packages\/mcp-gateway\/package\.json` resolves vitest at 3\.2\.6 or newer\.$/m,
+      /^3\. A documented dismissal reason is recorded, and either a terminal dismissal webhook receipt on this issue or .*shows `state: dismissed` for advisory GHSA-5xrq-8626-4rwp \/ CVE-2026-47429\.$/m,
+    );
+    // Branch 1 names the same concrete closure fields as remediation acceptance,
+    // so it is actionable without re-deriving anything from the alert page.
+    expect(description).toMatch(
+      /^1\. The default-branch manifest `packages\/mcp-gateway\/package\.json` in `Blockcast\/paperclip` resolves vitest at 3\.2\.6 or newer, outside the vulnerable range < 3\.2\.6, with advisory GHSA-5xrq-8626-4rwp \/ CVE-2026-47429 cited in the evidence\.$/m,
     );
 
     // Acceptance criteria split remediation from dismissal instead of implying
     // the dismissal path also needs a merged PR.
     expect(description).toContain("Remediation path:");
     expect(description).toContain("Dismissal path:");
-    expect(description).toContain("For the remediation path");
-    expect(description).toContain("For the dismissal path");
+    expect(description).toMatch(
+      /^- Remediation path: the default-branch manifest `packages\/mcp-gateway\/package\.json` in `Blockcast\/paperclip` resolves vitest at 3\.2\.6 or newer, outside the vulnerable range < 3\.2\.6, and the evidence cites advisory GHSA-5xrq-8626-4rwp \/ CVE-2026-47429\. A GitHub alert-state receipt is sufficient but not required\.$/m,
+    );
+    expect(description).toMatch(
+      /^- Dismissal path: a documented dismissal reason is recorded, and either a terminal dismissal webhook receipt on this issue or direct terminal-state observation from GitHub shows the alert is dismissed for advisory GHSA-5xrq-8626-4rwp \/ CVE-2026-47429\.$/m,
+    );
+    expect(description).not.toContain("alert's state on GitHub moves to `fixed`");
+    expect(description).not.toContain("alert's state on GitHub is `dismissed`");
 
     // The two sentences that directly refute the misreading.
     expect(description).toContain("Do NOT require a screenshot of the alert page");
@@ -3860,8 +3882,10 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(description).toContain("It is NOT an evidentiary standard");
     expect(description).toContain("does not forbid the repository contents API or GraphQL");
 
-    // The alert-state acceptance criterion must not read as an evidence demand.
-    expect(description).toContain("observing it directly is optional");
+    // Preserve the operational prohibition verbatim while changing closure criteria.
+    expect(description).toContain(
+      "Every field under **Alert** above comes from this delivery's GitHub webhook payload. Do NOT call the GitHub Dependabot Alerts REST API to re-derive them: some repositories return `403 Dependabot alerts are disabled for this repository` on that endpoint even though the webhook still fires. Treat that 403 as expected and work from this issue instead of chasing the API.",
+    );
   });
 
   it("does not wake below the severity floor (default high)", async () => {
@@ -3985,12 +4009,98 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(receipts[0]!.body).toContain("no Dependabot REST or GraphQL query was used");
   });
 
+  it("records dismissal evidence before closing a Dependabot alert issue", async () => {
+    const { agentId } = await seedCompanyAndAgent({ agentName: "Release Engineer" });
+    const app = buildApp({ dependabotAgentId: agentId });
+    const dismissed = dependabotPayload("high", "dismissed");
+    Object.assign(dismissed.alert, {
+      dismissed_reason: "tolerable_risk",
+      dismissed_comment: "The vulnerable code path is not used in production.",
+    });
+
+    await postDependabot(app, dependabotPayload("high", "created"), "delivery-created");
+    await postDependabot(app, dismissed, "delivery-dismissed");
+
+    const [issue] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.originId, "github-dependabot:Blockcast/paperclip#58"));
+    expect(issue?.description).toContain("a documented dismissal reason is recorded");
+    expect(issue?.status).toBe("done");
+
+    const [receipt] = await db
+      .select()
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.issueId, issue!.id),
+          sql`${issueComments.metadata}->>'kind' = 'github_dependabot_terminal_receipt'`,
+        ),
+      );
+    expect(receipt?.body).toContain('Dismissal reason: "tolerable_risk"');
+    expect(receipt?.body).toContain(
+      'Dismissal comment: "The vulnerable code path is not used in production."',
+    );
+    expect(receipt?.metadata).toMatchObject({
+      dismissalReason: "tolerable_risk",
+      dismissalComment: "The vulnerable code path is not used in production.",
+    });
+  });
+
+  it("keeps a dismissed Dependabot alert issue open when the webhook has no documented reason", async () => {
+    const { agentId } = await seedCompanyAndAgent({ agentName: "Release Engineer" });
+    const app = buildApp({ dependabotAgentId: agentId });
+
+    await postDependabot(app, dependabotPayload("high", "created"), "delivery-created");
+    await postDependabot(app, dependabotPayload("high", "dismissed"), "delivery-dismissed");
+
+    const [issue] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.originId, "github-dependabot:Blockcast/paperclip#58"));
+    expect(issue?.status).not.toBe("done");
+  });
+
+  it("keeps a dismissed Dependabot alert issue open when the webhook only has a comment", async () => {
+    const { agentId } = await seedCompanyAndAgent({ agentName: "Release Engineer" });
+    const app = buildApp({ dependabotAgentId: agentId });
+    const dismissed = dependabotPayload("high", "dismissed");
+    Object.assign(dismissed.alert, {
+      dismissed_comment: "The vulnerable code path is not used in production.",
+    });
+
+    await postDependabot(app, dependabotPayload("high", "created"), "delivery-created");
+    await postDependabot(app, dismissed, "delivery-dismissed");
+
+    const [issue] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.originId, "github-dependabot:Blockcast/paperclip#58"));
+    expect(issue?.status).not.toBe("done");
+
+    const [receipt] = await db
+      .select()
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.issueId, issue!.id),
+          sql`${issueComments.metadata}->>'kind' = 'github_dependabot_terminal_receipt'`,
+        ),
+      );
+    expect(receipt?.body).toContain("Dismissal reason: not provided in the webhook payload");
+    expect(receipt?.body).toContain(
+      'Dismissal comment: "The vulnerable code path is not used in production."',
+    );
+  });
+
   it("creates a durable closed receipt issue for an orphan terminal delivery", async () => {
     const { agentId } = await seedCompanyAndAgent({ agentName: "Release Engineer" });
     const app = buildApp({ dependabotAgentId: agentId });
 
-    await postDependabot(app, dependabotPayload("high", "dismissed", 1591), "delivery-dismissed");
-    await postDependabot(app, dependabotPayload("high", "dismissed", 1591), "delivery-dismissed");
+    const dismissed = dependabotPayload("high", "dismissed", 1591);
+    Object.assign(dismissed.alert, { dismissed_reason: "not_used" });
+    await postDependabot(app, dismissed, "delivery-dismissed");
+    await postDependabot(app, dismissed, "delivery-dismissed");
     const [issue] = await db
       .select()
       .from(issues)
@@ -3999,6 +4109,10 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(issue?.status).toBe("done");
     expect(issue?.title).toContain("terminal receipt");
     expect(issue?.description).toContain("delivery-dismissed");
+    expect(issue?.description).toContain(
+      "has a documented dismissal reason from a permitted webhook delivery",
+    );
+    expect(issue?.description).not.toContain("dismissal reason or comment");
     const receiptIssues = await db
       .select({ id: issues.id })
       .from(issues)
@@ -4009,6 +4123,50 @@ describeEmbeddedPostgres("github-webhook route", () => {
       .from(issueComments)
       .where(sql`${issueComments.metadata}->>'kind' = 'github_dependabot_terminal_receipt'`);
     expect(receipts).toHaveLength(1);
+  });
+
+  it("records an incomplete orphan terminal dismissal as diagnostic before a reintroduced remediation issue", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent({ agentName: "Release Engineer" });
+    const app = buildApp({ dependabotAgentId: agentId });
+    const originId = "github-dependabot:Blockcast/paperclip#1593";
+
+    await postDependabot(app, dependabotPayload("high", "dismissed", 1593), "delivery-orphan-dismissed");
+
+    const orphanAlertIssues = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(eq(issues.originId, originId));
+    expect(orphanAlertIssues).toHaveLength(0);
+
+    const [diagnostic] = await db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, "github_dependabot_webhook_diagnostic"),
+          eq(issues.originId, "dependabot_alert:delivery-orphan-dismissed"),
+        ),
+      );
+    expect(diagnostic?.status).toBe("todo");
+    expect(diagnostic?.description).toContain("did not include a documented dismissal reason");
+
+    const reintroduced = await postDependabot(
+      app,
+      dependabotPayload("high", "reintroduced", 1593),
+      "delivery-reintroduced",
+    );
+    expect(reintroduced.body).toMatchObject({ dependabotWakeFired: true });
+
+    const [issue] = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.originKind, "github_dependabot_alert"), eq(issues.originId, originId)));
+    expect(issue?.status).toBe("todo");
+    expect(issue?.title).toContain("vitest");
+    expect(issue?.description).toContain("Vulnerable range: < 3.2.6");
+    expect(issue?.description).toContain("Patched version: 3.2.6");
+    expect(issue?.description).not.toContain("terminal receipt");
   });
 
   it("records terminal receipts below the remediation severity floor", async () => {
