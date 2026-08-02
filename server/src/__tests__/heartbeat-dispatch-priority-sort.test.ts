@@ -23,7 +23,7 @@
  * because it was the only candidate in the queue.
  */
 import { randomUUID } from "node:crypto";
-import { eq, inArray } from "drizzle-orm";
+import { eq, inArray, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
@@ -400,7 +400,7 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
         id: blockerIssueId,
         companyId,
         title: "Pre-existing blocker",
-        status: "todo",
+        status: "done",
         priority: "high",
         issueNumber: 1,
         identifier: `${issuePrefix}-1`,
@@ -454,6 +454,7 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     });
     const relationWriter = db.transaction(async (tx) => {
       await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, blockerIssueId)).for("update");
+      await tx.update(issues).set({ status: "todo" }).where(eq(issues.id, blockerIssueId));
       blockerLockHeld();
       await releaseRelationWriterPromise;
       await issueService(db).update(issueId, { blockedByIssueIds: [blockerIssueId] }, tx);
@@ -461,17 +462,29 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
 
     await blockerLockHeldPromise;
     const resumePromise = heartbeat.resumeQueuedRuns();
-    for (let attempt = 0; attempt < 100; attempt += 1) {
-      const status = await db
-        .select({ status: heartbeatRuns.status })
-        .from(heartbeatRuns)
-        .where(eq(heartbeatRuns.id, runId))
-        .then((rows) => rows[0]?.status);
-      if (status === "running") break;
-      await new Promise((resolve) => setTimeout(resolve, 10));
+    let claimWaitedForIssueLock = false;
+    try {
+      const lockWaitDeadline = Date.now() + 60_000;
+      while (Date.now() < lockWaitDeadline) {
+        const waitingRows = await db.execute(sql<{ waiting: boolean }>`
+          select exists (
+            select 1
+            from pg_stat_activity
+            where datname = current_database()
+              and pid <> pg_backend_pid()
+              and wait_event_type = 'Lock'
+          ) as waiting
+        `);
+        if (Array.from(waitingRows)[0]?.waiting) {
+          claimWaitedForIssueLock = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      expect(claimWaitedForIssueLock).toBe(true);
+    } finally {
+      releaseRelationWriter();
     }
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    releaseRelationWriter();
 
     await expect(relationWriter).resolves.toBeUndefined();
     await expect(resumePromise).resolves.toBeUndefined();
