@@ -8,7 +8,10 @@ import {
   type AggregateReopenWork,
   type AggregateResolutionWork,
 } from "./aggregate-store.js";
-import { recordSourceResolvedAndCloseCovers } from "./escalation.js";
+import {
+  recordSourceFiringAndRepairCovers,
+  recordSourceResolvedAndCloseCovers,
+} from "./escalation.js";
 import type { AlertmanagerPluginConfig } from "./types.js";
 
 export async function applyAggregateResolution(
@@ -87,9 +90,12 @@ async function repairAggregateReopen(
 ): Promise<void> {
   const issueId = work.paperclipIssueId;
   if (!issueId) return;
+  const issue = await ctx.issues.get(issueId, work.companyId);
+  if (!issue) {
+    throw new Error(`Cannot repair aggregate ${work.aggregateKey}: issue ${issueId} is missing`);
+  }
   if (config.autoCloseOnResolve !== false) {
-    const issue = await ctx.issues.get(issueId, work.companyId);
-    if (issue && (issue.status === "done" || issue.status === "cancelled")) {
+    if (issue.status === "done" || issue.status === "cancelled") {
       await ctx.issues.update(issueId, { status: "todo" }, work.companyId);
     }
   } else {
@@ -100,6 +106,13 @@ async function repairAggregateReopen(
       "Alert is firing again; the prior aggregate-resolution comment is no longer current.",
     );
   }
+  await recordSourceFiringAndRepairCovers(
+    ctx,
+    work.companyId,
+    issueId,
+    work.alertname,
+    config,
+  );
   await completeAggregateReopen(ctx, work.companyId, work.aggregateKey, claim);
   ctx.logger.info(`Alertmanager: repaired re-fire for aggregate ${work.aggregateKey}`);
 }

@@ -1589,6 +1589,59 @@ describe("handleWebhook — aggregate lifecycle", () => {
     ]);
   });
 
+  it("cancels a superseded legacy issue when two existing fingerprints adopt one aggregate", async () => {
+    const { ctx, mocks } = mkCtx();
+    const [alertA, alertB] = aggregateAlerts();
+    const legacyRecord = (issueId: string, alert: AlertmanagerAlert): AlertStateRecord => ({
+      paperclipIssueId: issueId,
+      paperclipCompanyId: "company-1",
+      assigneeUserId: null,
+      assigneeAgentId: "agent-fallback",
+      alertname: alert.labels.alertname ?? "unknown",
+      severity: alert.labels.severity ?? "unknown",
+      firstSeenAt: alert.startsAt,
+      lastFiredAt: alert.startsAt,
+      resolvedAt: null,
+    });
+    await mocks.state.set(
+      { scopeKind: "company", scopeId: "company-1", stateKey: `alert:${alertA.fingerprint}` },
+      legacyRecord("legacy-issue-a", alertA),
+    );
+    await mocks.state.set(
+      { scopeKind: "company", scopeId: "company-1", stateKey: `alert:${alertB.fingerprint}` },
+      legacyRecord("legacy-issue-b", alertB),
+    );
+    mocks.issues.get.mockImplementation(async (issueId: string) => ({
+      id: issueId,
+      status: "todo",
+    }));
+
+    await handleWebhook(
+      ctx,
+      baseConfig(),
+      TOKEN,
+      baseInput({ parsedBody: baseEnvelope({ alerts: [alertA] }) }),
+    );
+    await handleWebhook(
+      ctx,
+      baseConfig(),
+      TOKEN,
+      baseInput({ parsedBody: baseEnvelope({ alerts: [alertB] }) }),
+    );
+
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+    expect(mocks.issues.update).toHaveBeenCalledWith(
+      "legacy-issue-b",
+      { status: "cancelled" },
+      "company-1",
+    );
+    expect(await mocks.state.get({
+      scopeKind: "company",
+      scopeId: "company-1",
+      stateKey: `alert:${alertB.fingerprint}`,
+    })).toEqual(expect.objectContaining({ paperclipIssueId: "legacy-issue-a" }));
+  });
+
   it("keeps identical aggregate keys isolated by company", async () => {
     const { ctx, mocks } = mkCtx();
     const alert = aggregateAlerts()[0];
@@ -1644,6 +1697,89 @@ describe("handleWebhook — aggregate lifecycle", () => {
         'alert-aggregate:company-1:alert-aggregate:v1:["HindsightConsolidationStalled",null]',
     });
     expect(aggregateState).toEqual(expect.objectContaining({ resolvedAt: null }));
+  });
+
+  it("repairs escalation-cover membership before clearing a re-fire marker", async () => {
+    const { ctx, mocks } = mkCtx();
+    const alert = aggregateAlerts()[0];
+    await handleWebhook(
+      ctx,
+      baseConfig({ autoCloseOnResolve: true }),
+      TOKEN,
+      baseInput({ parsedBody: baseEnvelope({ alerts: [alert] }) }),
+    );
+    const query = mocks.db.query.getMockImplementation()!;
+    mocks.db.query.mockImplementation(async (sql: string, params: unknown[] = []) => {
+      if (sql.includes("SELECT true AS present") && sql.includes("alert_escalation_cover_members")) {
+        return [{ present: true }];
+      }
+      return query(sql, params);
+    });
+    const execute = mocks.db.execute.getMockImplementation()!;
+    mocks.db.execute.mockImplementation(async (sql: string, params: unknown[] = []) => {
+      if (sql.includes("SET resolved_at = NULL") && sql.includes("alert_escalation_cover_members")) {
+        return { rowCount: 1 };
+      }
+      return execute(sql, params);
+    });
+    mocks.issues.get.mockResolvedValue({ id: "issue-1", status: "cancelled" });
+    mocks.db.beforeComplete = async () => {
+      await joinAggregate(ctx, "company-1", alert);
+    };
+
+    const resolved = {
+      ...alert,
+      status: "resolved" as const,
+      endsAt: "2026-04-29T10:00:00Z",
+    };
+    await handleWebhook(
+      ctx,
+      baseConfig({ autoCloseOnResolve: true }),
+      TOKEN,
+      baseInput({ parsedBody: baseEnvelope({ status: "resolved", alerts: [resolved] }) }),
+    );
+
+    const coverRepairCall = mocks.db.execute.mock.calls.findIndex(([sql]) =>
+      String(sql).includes("SET resolved_at = NULL"),
+    );
+    const markerClearCall = mocks.db.execute.mock.calls.findIndex(([sql]) =>
+      String(sql).includes("SET reopen_required = false"),
+    );
+    expect(coverRepairCall).toBeGreaterThan(-1);
+    expect(markerClearCall).toBeGreaterThan(coverRepairCall);
+  });
+
+  it("keeps re-fire repair pending when the bound issue is missing", async () => {
+    const { ctx, mocks } = mkCtx();
+    const alert = aggregateAlerts()[0];
+    await handleWebhook(
+      ctx,
+      baseConfig({ autoCloseOnResolve: true }),
+      TOKEN,
+      baseInput({ parsedBody: baseEnvelope({ alerts: [alert] }) }),
+    );
+    mocks.issues.get
+      .mockResolvedValueOnce({ id: "issue-1", status: "todo" })
+      .mockResolvedValue(null);
+    mocks.db.beforeComplete = async () => {
+      await joinAggregate(ctx, "company-1", alert);
+    };
+    const resolved = {
+      ...alert,
+      status: "resolved" as const,
+      endsAt: "2026-04-29T10:00:00Z",
+    };
+
+    await expect(handleWebhook(
+      ctx,
+      baseConfig({ autoCloseOnResolve: true }),
+      TOKEN,
+      baseInput({ parsedBody: baseEnvelope({ status: "resolved", alerts: [resolved] }) }),
+    )).rejects.toBeInstanceOf(AlertDeliveryIncompleteError);
+
+    expect(mocks.db.execute.mock.calls.some(([sql]) =>
+      String(sql).includes("SET reopen_required = false"),
+    )).toBe(false);
   });
 
   it("repairs a re-fire after the resolving worker dies following issue closure", async () => {

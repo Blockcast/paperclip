@@ -316,6 +316,32 @@ export async function recordSourceResolvedAndCloseCovers(
 }
 
 /**
+ * Restores cover tracking when aggregate resolution raced a source re-fire.
+ * Only sources that previously reached a cover are eligible; createCover then
+ * reopens a healthy membership or converges on a fresh cover if the old one is
+ * already closing or cancelled.
+ */
+export async function recordSourceFiringAndRepairCovers(
+  ctx: PluginContext,
+  companyId: string,
+  alertIssueId: string,
+  alertname: string,
+  config: AlertmanagerPluginConfig,
+): Promise<void> {
+  const ns = ctx.db.namespace;
+  const [priorMembership] = await ctx.db.query<{ present: boolean }>(
+    `SELECT true AS present FROM ${q(ns, MEMBERS_TABLE)} WHERE alert_issue_id = $1 LIMIT 1`,
+    [alertIssueId],
+  );
+  if (!priorMembership) return;
+  const issue = await ctx.issues.get(alertIssueId, companyId);
+  if (!issue) {
+    throw new Error(`Cannot repair escalation cover for missing issue ${alertIssueId}`);
+  }
+  await createCover(ctx, issue, companyId, alertname, config, new Date());
+}
+
+/**
  * Sweep backstop for the durable-retry requirement: a cover whose closing
  * claim succeeded but whose terminal transition never completed (a crash or
  * transient failure — including a failed `createComment`, BLO-16120 PR #662

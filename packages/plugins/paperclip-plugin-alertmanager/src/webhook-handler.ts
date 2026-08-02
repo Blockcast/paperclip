@@ -279,6 +279,27 @@ export async function handleFiring(
     aggregate.paperclipIssueId ?? existing?.paperclipIssueId ?? null;
   const existingCompanyId = existing?.paperclipCompanyId ?? aggregate.companyId;
   if (existingIssueId) {
+    const supersededLegacyIssueId =
+      aggregate.paperclipIssueId && stateRecord?.paperclipIssueId !== aggregate.paperclipIssueId
+        ? stateRecord?.paperclipIssueId
+        : null;
+    if (supersededLegacyIssueId) {
+      const legacyIssue = await ctx.issues.get(supersededLegacyIssueId, companyId);
+      if (legacyIssue && legacyIssue.status !== "done" && legacyIssue.status !== "cancelled") {
+        await ctx.issues.update(
+          supersededLegacyIssueId,
+          { status: "cancelled" },
+          companyId,
+        );
+        ctx.logger.info(
+          `Alertmanager: cancelled superseded legacy issue ${supersededLegacyIssueId}; aggregate ${aggregate.aggregateKey} is bound to ${existingIssueId}`,
+        );
+        await ctx.metrics.write("alertmanager.aggregate.legacy_issue_superseded", 1, {
+          alertname,
+          severity,
+        });
+      }
+    }
     if (!aggregate.paperclipIssueId) {
       await bindAggregateIssue(ctx, companyId, aggregate.aggregateKey, existingIssueId, {
         assigneeUserId: existing?.assigneeUserId ?? undefined,
