@@ -1402,4 +1402,73 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
 
     expect(dispatchedRunIds[0]).toBe(freshRunId);
   });
+
+  it("claims at most 15 available slots across concurrent dispatch attempts", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issuePrefix = `C${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    let releaseExecutions!: () => void;
+    const executionGate = new Promise<void>((resolve) => {
+      releaseExecutions = resolve;
+    });
+    const runIds = Array.from({ length: 20 }, () => randomUUID());
+    const now = new Date();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "ConcurrentDispatchTestCo",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "ConcurrentDispatchTestAgent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 15 } },
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values(runIds.map((id, index) => ({
+      id,
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "queued" as const,
+      contextSnapshot: { wakeReason: "concurrency_regression" },
+      createdAt: new Date(now.getTime() + index),
+      updatedAt: now,
+    })));
+
+    mockAdapterExecute.mockImplementation(async () => {
+      await executionGate;
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        resultJson: { exitCode: 0 },
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    try {
+      await Promise.all(Array.from({ length: 20 }, () => heartbeat.resumeQueuedRuns()));
+
+      const activeRuns = await db
+        .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(inArray(heartbeatRuns.id, runIds));
+      expect(activeRuns.filter((run) => run.status === "running")).toHaveLength(15);
+      expect(activeRuns.filter((run) => run.status === "queued")).toHaveLength(5);
+    } finally {
+      releaseExecutions();
+      await heartbeat.drainInFlightExecutions(10_000);
+    }
+  });
 });
