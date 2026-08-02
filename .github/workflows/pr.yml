@@ -353,17 +353,59 @@ jobs:
     timeout-minutes: 5
 
     steps:
-      - name: Fail if any split verify lane failed
+      # BLO-21078: a GitHub-side cancellation of a live runner mid-job (not
+      # a code failure) used to reach this step as a bare `test ... = success`
+      # exit-1, so `gh pr checks` rendered it identically to a real test
+      # failure and PR authors spent a cycle disproving a break they didn't
+      # cause. Name cancelled lanes separately from failed ones so that
+      # signal survives into the check's own output.
+      - name: Report split verify lane results
         env:
           TYPECHECK_RELEASE_REGISTRY_RESULT: ${{ needs.typecheck_release_registry.result }}
           GENERAL_TESTS_RESULT: ${{ needs.general_tests.result }}
           WORKTREE_INSTALL_RESULT: ${{ needs.worktree_install.result }}
           BUILD_RESULT: ${{ needs.build.result }}
         run: |
-          test "$TYPECHECK_RELEASE_REGISTRY_RESULT" = "success"
-          test "$GENERAL_TESTS_RESULT" = "success"
-          test "$WORKTREE_INSTALL_RESULT" = "success"
-          test "$BUILD_RESULT" = "success"
+          declare -A lane_results=(
+            ["Typecheck + Release Registry"]="$TYPECHECK_RELEASE_REGISTRY_RESULT"
+            ["General tests"]="$GENERAL_TESTS_RESULT"
+            ["Worktree install"]="$WORKTREE_INSTALL_RESULT"
+            ["Build"]="$BUILD_RESULT"
+          )
+          cancelled_lanes=()
+          failed_lanes=()
+          for lane in "Typecheck + Release Registry" "General tests" "Worktree install" "Build"; do
+            result="${lane_results[$lane]}"
+            case "$result" in
+              success) ;;
+              cancelled) cancelled_lanes+=("$lane") ;;
+              *) failed_lanes+=("$lane ($result)") ;;
+            esac
+          done
+
+          if [ ${#cancelled_lanes[@]} -eq 0 ] && [ ${#failed_lanes[@]} -eq 0 ]; then
+            echo "All split verify lanes succeeded." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          {
+            if [ ${#cancelled_lanes[@]} -gt 0 ]; then
+              echo "### :octagonal_sign: Cancelled (infra/runner kill, not a test failure)"
+              printf -- '- %s\n' "${cancelled_lanes[@]}"
+            fi
+            if [ ${#failed_lanes[@]} -gt 0 ]; then
+              echo "### :x: Failed"
+              printf -- '- %s\n' "${failed_lanes[@]}"
+            fi
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+          if [ ${#failed_lanes[@]} -gt 0 ]; then
+            echo "::error::verify failed: ${failed_lanes[*]} did not succeed."
+          fi
+          if [ ${#cancelled_lanes[@]} -gt 0 ]; then
+            echo "::error::verify failed because these lanes were CANCELLED (runner/infra kill, not attributable to this PR's diff): ${cancelled_lanes[*]}. Re-run before investigating your changes."
+          fi
+          exit 1
 
   build:
     name: Build

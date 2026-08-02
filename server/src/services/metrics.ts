@@ -353,6 +353,51 @@ export function normalizeGithubSuppressionCause(cause: string | null | undefined
     : UNKNOWN_GITHUB_SUPPRESSION_CAUSE;
 }
 
+/**
+ * Terminal-conclusion counter for GitHub Actions `workflow_run` completions
+ * received over the webhook (BLO-21078). Exists to make a fleet-wide mass
+ * runner-kill visible as a metric instead of only as a wave of misattributed
+ * red checks: on 2026-08-02 19:34–19:57Z, GitHub gracefully cancelled
+ * multiple in-flight `PR` workflow runs across unrelated PRs/branches (post
+ * steps still ran, ruling out an ARC/k8s runner death) with no ARC event
+ * spike and no repo-side cancel automation to explain it — the incident had
+ * no metric surface at all, so the only way to notice it was an author
+ * manually reading job conclusions.
+ *
+ * One increment per completed `workflow_run` webhook delivery, labeled only
+ * by the bounded `conclusion` (see {@link KNOWN_WORKFLOW_RUN_CONCLUSIONS}).
+ * Deliberately excludes repo/workflow name to keep cardinality fixed at
+ * `KNOWN_WORKFLOW_RUN_CONCLUSIONS.length + 1` regardless of fleet growth —
+ * this counter's whole job is "how many terminal runs of each kind arrived
+ * recently", which `increase(...{conclusion="cancelled"}[window])` answers
+ * without either label. A sustained burst of `cancelled` (as opposed to the
+ * `failure` rate, which is ordinary background noise) is the alerting
+ * signal — see the `PaperclipGithubWorkflowRunMassCancellation` rule.
+ */
+export const GITHUB_WORKFLOW_RUN_CONCLUSION_METRIC = "paperclip_github_workflow_run_conclusion_total";
+
+export const KNOWN_WORKFLOW_RUN_CONCLUSIONS = [
+  "success",
+  "failure",
+  "cancelled",
+  "skipped",
+  "timed_out",
+  "action_required",
+  "neutral",
+  "stale",
+  "startup_failure",
+] as const;
+
+export const UNKNOWN_WORKFLOW_RUN_CONCLUSION = "other";
+
+const knownWorkflowRunConclusionSet: ReadonlySet<string> = new Set(KNOWN_WORKFLOW_RUN_CONCLUSIONS);
+
+export function normalizeWorkflowRunConclusion(conclusion: string | null | undefined): string {
+  return typeof conclusion === "string" && knownWorkflowRunConclusionSet.has(conclusion)
+    ? conclusion
+    : UNKNOWN_WORKFLOW_RUN_CONCLUSION;
+}
+
 export const KNOWN_AUTH_OPERATIONS = [
   "oidc_start",
   "oidc_callback",
@@ -624,6 +669,7 @@ let orphanedManagedPodReaped: Counter<"adapter"> | null = null;
 let githubReviewRequestDelivery: Counter<"state" | "reason"> | null = null;
 let githubReviewRequestSuppression: Counter<"cause" | "reason"> | null = null;
 let githubReviewRequestDeadLetterUnresolved: Gauge<"reason"> | null = null;
+let githubWorkflowRunConclusion: Counter<"conclusion"> | null = null;
 let authRequest: Counter<"operation" | "outcome"> | null = null;
 
 function ensureRegistry(): {
@@ -643,6 +689,7 @@ function ensureRegistry(): {
   githubReviewRequestDeliveryCounter: Counter<"state" | "reason">;
   githubReviewRequestSuppressionCounter: Counter<"cause" | "reason">;
   githubReviewRequestDeadLetterUnresolvedGauge: Gauge<"reason">;
+  githubWorkflowRunConclusionCounter: Counter<"conclusion">;
   authRequestCounter: Counter<"operation" | "outcome">;
 } {
   if (
@@ -662,6 +709,7 @@ function ensureRegistry(): {
     || !githubReviewRequestDelivery
     || !githubReviewRequestSuppression
     || !githubReviewRequestDeadLetterUnresolved
+    || !githubWorkflowRunConclusion
     || !authRequest
   ) {
     registry = new Registry();
@@ -851,6 +899,20 @@ function ensureRegistry(): {
     for (const reason of [...KNOWN_GITHUB_WAKE_REASONS, UNKNOWN_GITHUB_WAKE_REASON]) {
       githubReviewRequestDeadLetterUnresolved.set({ reason }, 0);
     }
+    githubWorkflowRunConclusion = new Counter({
+      name: GITHUB_WORKFLOW_RUN_CONCLUSION_METRIC,
+      help:
+        "Count of completed GitHub Actions workflow_run webhook deliveries, labeled by "
+        + "bounded conclusion (BLO-21078). One increment per completed run regardless of "
+        + "whether it matched a paperclip identifier. `increase(...{conclusion=\"cancelled\"}"
+        + "[window])` catches a fleet-wide mass-cancellation wave; ordinary `failure` is "
+        + "background noise and must not trip that alert.",
+      labelNames: ["conclusion"],
+      registers: [registry],
+    });
+    for (const conclusion of [...KNOWN_WORKFLOW_RUN_CONCLUSIONS, UNKNOWN_WORKFLOW_RUN_CONCLUSION]) {
+      githubWorkflowRunConclusion.inc({ conclusion }, 0);
+    }
     authRequest = new Counter({
       name: AUTH_REQUEST_METRIC,
       help:
@@ -885,6 +947,7 @@ function ensureRegistry(): {
     githubReviewRequestDeliveryCounter: githubReviewRequestDelivery,
     githubReviewRequestSuppressionCounter: githubReviewRequestSuppression,
     githubReviewRequestDeadLetterUnresolvedGauge: githubReviewRequestDeadLetterUnresolved,
+    githubWorkflowRunConclusionCounter: githubWorkflowRunConclusion,
     authRequestCounter: authRequest,
   };
 }
@@ -1192,6 +1255,18 @@ export function setGithubReviewRequestDeadLetterUnresolved(byReason: Record<stri
   }
 }
 
+/**
+ * Record one completed GitHub Actions `workflow_run` webhook delivery
+ * (BLO-21078). Call exactly once per completed run, regardless of whether it
+ * matched a paperclip identifier — the counter's job is fleet-wide visibility
+ * into conclusion mix, not per-issue attribution.
+ */
+export function recordGithubWorkflowRunConclusion(conclusion: string | null | undefined): string {
+  const label = normalizeWorkflowRunConclusion(conclusion);
+  ensureRegistry().githubWorkflowRunConclusionCounter.inc({ conclusion: label });
+  return label;
+}
+
 export function recordAuthRequest(input: {
   operation: string | null | undefined;
   outcome: string | null | undefined;
@@ -1246,6 +1321,7 @@ export function __resetMetricsForTest(): void {
   githubReviewRequestDelivery = null;
   githubReviewRequestSuppression = null;
   githubReviewRequestDeadLetterUnresolved = null;
+  githubWorkflowRunConclusion = null;
   authRequest = null;
   resetDepBlockedMetrics();
   resetBlockerResolvedWakeMetrics();
