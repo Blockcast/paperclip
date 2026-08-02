@@ -604,8 +604,16 @@ export function summarizeRunFailureForIssueComment(run: LatestIssueRun, now = Da
   // failed hours earlier, so an unconditional present-tense "waiting on that
   // reset … self-healing" tells agents to sit out a window that already
   // reopened — the exact misdiagnosis this summary exists to prevent, pointed
-  // the other way. Past the instant, the throttle is history: name it as
-  // context and send the reader looking for a cause after it.
+  // the other way.
+  //
+  // But an elapsed horizon is not proof the window reopened either. The instant
+  // is the provider's own estimate, and the write-side parser deliberately
+  // accepts tentative wording ("capacity may reset at …", "retry in …"); a
+  // throttle can be extended past the instant it advertised. So past the
+  // horizon we claim only that the horizon elapsed and that current capacity
+  // must be rechecked. Asserting "the cause is something after it" would trade
+  // one confident misdiagnosis for another — sending the reader hunting a new
+  // blocker while the original throttle is still the live one.
   const capacityReset = readProviderCapacityResetAt(run);
   if (capacityReset) {
     const suffix = errorCode ? ` (surfaced as \`${errorCode}\`)` : "";
@@ -617,9 +625,10 @@ export function summarizeRunFailureForIssueComment(run: LatestIssueRun, now = Da
     return windowStillOpen
       ? ` Latest retry failure: ${cause}${suffix}. This is transient and self-healing; ` +
           `the issue is waiting on that reset, not on a broken runtime.`
-      : ` Latest retry failure: ${cause}${suffix}. That window has since elapsed, so the ` +
-          `throttle is historical context rather than the current blocker; if this issue is ` +
-          `still stalled, the cause is something after ${capacityReset.resetAt}.`;
+      : ` Latest retry failure: ${cause}${suffix}. That advertised horizon has since elapsed, ` +
+          `but the provider only ever advertised it as an estimate and a throttle can be ` +
+          `extended past it — recheck current provider capacity before either waiting on this ` +
+          `window or diagnosing a different blocker.`;
   }
 
   // Prefer the JSON `"message": "..."` field if the error body is a JSON

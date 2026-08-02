@@ -307,7 +307,7 @@ describe("summarizeRunFailureForIssueComment — provider capacity 429", () => {
   // failed hours earlier. An unconditional "waiting on that reset … self-healing"
   // then tells agents to sit out a window that already reopened — the same
   // misdiagnosis this summarizer exists to prevent, pointed the other way.
-  it("reports an elapsed window as historical context, not as a live wait", () => {
+  it("stops presenting an elapsed window as a live wait", () => {
     const summary = summarizeRunFailureForIssueComment(
       run({
         errorCode: "job_failed",
@@ -329,7 +329,7 @@ describe("summarizeRunFailureForIssueComment — provider capacity 429", () => {
     expect(summary).not.toContain("waiting on that reset");
   });
 
-  it("reports an elapsed bare-hint window as historical context too", () => {
+  it("stops presenting an elapsed bare-hint window as a live wait too", () => {
     const summary = summarizeRunFailureForIssueComment(
       run({
         errorCode: "rate_limit_exhausted",
@@ -342,6 +342,37 @@ describe("summarizeRunFailureForIssueComment — provider capacity 429", () => {
     expect(summary).toContain("elapsed");
     expect(summary).not.toContain("self-healing");
     expect(summary).not.toContain("429");
+  });
+
+  // An elapsed horizon proves only that the *advertised* instant passed. The
+  // write-side parser accepts tentative provider wording ("capacity may reset
+  // at …", "retry in …"), so a prolonged or extended throttle can still be the
+  // live blocker afterwards. Claiming the cause is necessarily something later
+  // sends recovery hunting a second, non-existent fault — the same overclaim as
+  // the live-wait branch, aimed the other way. Pin the non-conclusive wording.
+  it("does not claim an elapsed window proves the provider reopened", () => {
+    for (const resultJson of [
+      {
+        errorFamily: "rate_limit_exhausted",
+        providerCapacityResetAt: RESET_ISO,
+        providerCapacityResetProvenance: SERVER_429_PROVENANCE,
+      },
+      { errorFamily: "rate_limit_exhausted", retryNotBefore: RESET_ISO },
+    ]) {
+      const summary = summarizeRunFailureForIssueComment(
+        run({ errorCode: "job_failed", resultJson }),
+        SWEEP_AFTER_RESET,
+      );
+
+      // It must direct the reader to recheck capacity rather than assume it.
+      expect(summary).toMatch(/recheck current provider capacity/i);
+
+      // It must NOT assert the throttle is over, or that the real cause
+      // necessarily postdates the advertised instant.
+      expect(summary).not.toMatch(/the cause is something after/i);
+      expect(summary).not.toMatch(/historical context/i);
+      expect(summary).not.toMatch(/rather than the current blocker/i);
+    }
   });
 
   it("treats the reset instant itself as no longer open", () => {
