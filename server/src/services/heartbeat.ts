@@ -1177,7 +1177,9 @@ function stripPaperclipRuntimeEnvFromAdapterConfig(config: Record<string, unknow
 // identity every `gh` invocation runs as, or park whitespace there and fail
 // them all with exit 64. Environment, project and routine env are overlaid
 // *after* agent-scope resolution (see below), so without this filter the
-// lowest-trust writer would win, not the highest.
+// lowest-trust writer would win, not the highest. The issue-level adapter
+// override reaches the same key by a second route, one overlay earlier — see
+// withAgentScopedEnvProvenance.
 //
 // Before BLO-18927 the `PAPERCLIP_` prefix gave this protection for free at
 // every scope. Renaming the key out of that namespace was necessary to reach
@@ -1204,6 +1206,45 @@ function stripLowerScopeEnvBindings(envValue: unknown): Record<string, unknown> 
     ),
   );
   return Object.keys(filtered).length > 0 ? filtered : null;
+}
+
+// Restores agent provenance for AGENT_SCOPE_ONLY_ENV_KEYS after the overlay
+// spread in mergeModelProfileAdapterConfig, whose result is handed to
+// resolveExecutionRunAdapterConfig as `executionRunConfig` — i.e. treated
+// wholesale as agent scope, and filtered there only for `PAPERCLIP_*`.
+//
+// Two properties of that merge break the agent-only boundary without this:
+//
+//   - `issueAdapterConfig` is issue.assigneeAdapterOverrides.adapterConfig.
+//     parseIssueAssigneeAdapterOverrides accepts arbitrary keys, and any actor
+//     able to create or patch the issue can set them. It is overlaid last.
+//   - the overlays are a *shallow* spread, so an overlay carrying `env` at all
+//     replaces the agent's `env` wholesale instead of merging into it.
+//
+// So an issue override could both introduce a seat token the agent never had
+// (selecting the identity every `gh` invocation authenticates as) and drop one
+// the agent did have. Post-condition established here: every
+// AGENT_SCOPE_ONLY_ENV_KEY present in the merged env holds exactly the
+// baseConfig value, and any the baseConfig lacks is absent. That closes both
+// directions.
+//
+// Note this also ignores the key when it arrives via modelProfile.adapterConfig,
+// which can be agent-provenanced (configSource "agent_runtime"). Deliberate: the
+// key resolves from the agent's primary config and nowhere else, so there is one
+// place to audit rather than one per profile.
+function withAgentScopedEnvProvenance(
+  merged: Record<string, unknown>,
+  baseConfig: Record<string, unknown>,
+): Record<string, unknown> {
+  // Reference-equal means no overlay supplied `env`, so nothing was displaced.
+  if (merged.env === baseConfig.env) return merged;
+  const env = Object.fromEntries(
+    Object.entries(parseObject(merged.env)).filter(([key]) => !isAgentScopeOnlyEnvKey(key)),
+  );
+  for (const [key, value] of Object.entries(parseObject(baseConfig.env))) {
+    if (isAgentScopeOnlyEnvKey(key)) env[key] = value;
+  }
+  return { ...merged, env };
 }
 
 function assertLowTrustEnvConfigAllowed(envValue: unknown, source: string) {
@@ -3902,11 +3943,12 @@ export function mergeModelProfileAdapterConfig(input: {
   modelProfile: ModelProfileApplication;
   issueAdapterConfig: Record<string, unknown> | null | undefined;
 }): Record<string, unknown> {
-  return {
+  const merged = {
     ...input.baseConfig,
     ...(input.modelProfile.adapterConfig ?? {}),
     ...(input.issueAdapterConfig ?? {}),
   };
+  return withAgentScopedEnvProvenance(merged, input.baseConfig);
 }
 
 function modelProfileRunMetadata(
