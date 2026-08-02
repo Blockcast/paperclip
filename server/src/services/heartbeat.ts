@@ -1197,10 +1197,14 @@ const WORKER_CRASH_RECOVERY_CLAIM_TTL_MS = 10 * 60 * 1000;
 const WORKER_CRASH_RECOVERY_ERROR_MAX_CHARS = 500;
 
 function workerCrashRecoveryBackoffMs(attempts: number): number {
-  const exponent = Math.max(0, attempts - 1);
-  // Math.min before the multiply cannot overflow: 2**exponent is capped first.
-  const scale = Math.min(2 ** Math.min(exponent, 32), WORKER_CRASH_RECOVERY_BACKOFF_MAX_MS);
-  return Math.min(WORKER_CRASH_RECOVERY_BACKOFF_BASE_MS * scale, WORKER_CRASH_RECOVERY_BACKOFF_MAX_MS);
+  // Cap the exponent, not the resulting scale: 2**31 * five minutes already
+  // exceeds the six-hour ceiling by orders of magnitude, so the exponent bound
+  // exists purely to keep the intermediate finite. Clamping the scale against a
+  // *millisecond* ceiling — as an earlier version did — compared a unitless
+  // multiplier to a duration; it happened to clamp correctly but only by
+  // accident of the constants.
+  const exponent = Math.min(Math.max(0, attempts - 1), 31);
+  return Math.min(WORKER_CRASH_RECOVERY_BACKOFF_BASE_MS * 2 ** exponent, WORKER_CRASH_RECOVERY_BACKOFF_MAX_MS);
 }
 
 function describeRecoveryError(error: unknown): string {
