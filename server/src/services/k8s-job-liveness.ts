@@ -681,6 +681,73 @@ export async function deleteAgentJobExact(
   }
 }
 
+/**
+ * BLO-20801: `jobBlocksDispatch` waives a Job whose run-id is DB-terminal
+ * and whose snapshot showed no active pods (missing status, or
+ * active/succeeded/failed all zero) -- but that snapshot is a separate,
+ * earlier read than whatever the dispatch gate does next, and the Job's
+ * controller can create/retry a pod at any point in between (it has not
+ * been told to stop). Closing that window means removing the Job itself
+ * rather than trusting the stale read: this re-reads the Job immediately
+ * before deleting and refuses to delete (returns "still-active") if it has
+ * since gained an active pod, so a Job that raced to real work is never
+ * killed. Callers must treat every outcome other than "deleted"/"missing"
+ * as still-blocking (fail closed) -- this is a stricter, purpose-built
+ * sibling of `deleteAgentJobExact` and does not change that function's
+ * existing reaper call sites.
+ */
+export async function deleteStaleTerminalJob(
+  identity: ExactAgentJobIdentity,
+): Promise<"deleted" | "missing" | "still-active" | "mismatch" | null> {
+  const state = initClient();
+  if (state.kind !== "ready") return null;
+  try {
+    const job = await state.batchApi.readNamespacedJob(
+      { name: identity.name, namespace: PAPERCLIP_K8S_NAMESPACE },
+      requestOptionsWithTimeout(),
+    );
+    const labels = job.metadata?.labels;
+    if (
+      job.metadata?.uid !== identity.uid
+      || labels?.[RUN_ID_LABEL] !== identity.runId
+      || labels?.[AGENT_ID_LABEL] !== identity.agentId
+    ) {
+      logger.error(
+        {
+          identity,
+          observed: {
+            uid: job.metadata?.uid ?? null,
+            runId: labels?.[RUN_ID_LABEL] ?? null,
+            agentId: labels?.[AGENT_ID_LABEL] ?? null,
+          },
+        },
+        "refusing to delete k8s Job whose persisted identity does not match (BLO-20801 stale-terminal cleanup)",
+      );
+      return "mismatch";
+    }
+    if ((job.status?.active ?? 0) > 0) {
+      return "still-active";
+    }
+    await state.batchApi.deleteNamespacedJob(
+      {
+        name: identity.name,
+        namespace: PAPERCLIP_K8S_NAMESPACE,
+        propagationPolicy: "Background",
+        body: { preconditions: { uid: identity.uid } },
+      },
+      requestOptionsWithTimeout(),
+    );
+    return "deleted";
+  } catch (error) {
+    if (isKubernetesNotFoundError(error)) return "missing";
+    logger.warn(
+      { identity, error: error instanceof Error ? error.message : String(error) },
+      "stale-terminal k8s Job deletion failed (BLO-20801)",
+    );
+    return null;
+  }
+}
+
 export async function deleteAgentPodExact(identity: {
   name: string;
   uid: string;
@@ -770,21 +837,33 @@ export function classifyManagedAgentPod(pod: k8s.V1Pod): ManagedAgentPod | null 
  * (no run-id awareness), so a Job that survives a worker crash after its run
  * was already stamped terminal in the DB blocks dispatch for the full
  * `EXTERNAL_LIFECYCLE_HARD_STALE_MS` reaper ceiling. A Job whose `runId`
- * label is in `terminalRunIds` is known-terminal at the DB layer and must not
- * count as active, regardless of its own (possibly stale/zeroed/missing)
- * status subresource. Jobs with no run-id label, or whose run-id is not in
+ * label is in `terminalRunIds` is known-terminal at the DB layer, but that
+ * DB status is NOT proof the Job's controller has stopped doing work: the
+ * `process_lost` mint (heartbeat.ts reap loop) fires on ambiguous/lost-
+ * visibility conditions, not a confirmed pod death (a confirmed exact-name
+ * 404 finalizes as `job_missing`, a different, non-terminal-by-this-fn
+ * path). So a Job Kubernetes currently reports as `active > 0` is real,
+ * live evidence that must never be waived by the DB row -- doing so would
+ * let dispatch admit a second run while the old Job can still execute,
+ * which is exactly the double-execution/RWO-PVC-multi-attach hazard this
+ * gate exists to prevent. The terminal-run waiver therefore only applies to
+ * the two false-positive shapes the ticket targets -- a Job whose status
+ * subresource has not been populated yet, and a Job with
+ * active/succeeded/failed all zero -- both of which report zero *current*
+ * active pods. Jobs with no run-id label, or whose run-id is not in
  * `terminalRunIds` (live, unknown, or the caller opted out of the lookup),
  * fall through to the original status-counter heuristic unchanged.
  */
 export function jobBlocksDispatch(job: k8s.V1Job, terminalRunIds: ReadonlySet<string>): boolean {
+  const status = job.status;
+  const active = status?.active ?? 0;
+  if (active > 0) return true;
   const runId = job.metadata?.labels?.[RUN_ID_LABEL]?.trim() || null;
   if (runId && terminalRunIds.has(runId)) return false;
-  const status = job.status;
   if (!status) return true;
-  const active = status.active ?? 0;
   const succeeded = status.succeeded ?? 0;
   const failed = status.failed ?? 0;
-  return active > 0 || (succeeded === 0 && failed === 0);
+  return succeeded === 0 && failed === 0;
 }
 
 export type HasActiveJobForAgentOptions = {
@@ -802,6 +881,15 @@ export type HasActiveJobForAgentOptions = {
  * the given agent in the paperclip namespace. Returns false when the kube API
  * is unavailable (not in cluster, RBAC missing, transient error) so the
  * caller can degrade to DB-only in-flight detection.
+ *
+ * Side effect (BLO-20801, only when `options.isRunTerminal` is supplied): a
+ * Job waived purely because its run-id maps to a DB-terminal run is deleted
+ * (identity-checked, with a live re-check immediately before deleting) so
+ * its controller cannot create/retry a pod during the window the DB row's
+ * terminal status does not, by itself, prove closed. This mirrors the
+ * cleanup the 45-minute reaper already performs for the same reason, just
+ * triggered as soon as dispatch observes the waiver instead of waiting out
+ * the reaper's ceiling.
  */
 export async function hasActiveJobForAgent(
   agentId: string,
@@ -852,6 +940,47 @@ export async function hasActiveJobForAgent(
     const hasActiveJob = items.some((job) => jobBlocksDispatch(job, terminalRunIds));
     if (hasActiveJob) {
       return true;
+    }
+
+    // BLO-20801: a Job that reaches here only by way of the terminal-run
+    // waiver (its own status showed no active pods, but its run-id maps to
+    // a DB-terminal run) is not proven dead -- its controller could
+    // create/retry a pod any time after the read above. Delete the exact
+    // stale Job before trusting the waiver, and fail CLOSED (still block)
+    // unless the delete confirms the Job is gone. deleteStaleTerminalJob
+    // re-checks liveness immediately before deleting, so a Job that raced
+    // to genuinely active in the interim is left alone rather than killed.
+    // Genuinely completed Jobs (succeeded/failed > 0) don't reach this
+    // loop -- jobBlocksDispatch already resolves those to non-blocking on
+    // their own status, independent of terminalRunIds.
+    const staleWaivedJobs = items.filter((job) => {
+      const runId = job.metadata?.labels?.[RUN_ID_LABEL]?.trim() || null;
+      if (!runId || !terminalRunIds.has(runId)) return false;
+      const status = job.status;
+      if (!status) return true;
+      const succeeded = status.succeeded ?? 0;
+      const failed = status.failed ?? 0;
+      return succeeded === 0 && failed === 0;
+    });
+    for (const job of staleWaivedJobs) {
+      const runId = job.metadata?.labels?.[RUN_ID_LABEL]?.trim() || "";
+      const name = job.metadata?.name;
+      const uid = job.metadata?.uid;
+      if (!name || !uid) {
+        logger.warn(
+          { agentId, runId },
+          "BLO-20801: stale-terminal Job missing name/uid, cannot identity-check a deletion; failing closed",
+        );
+        return true;
+      }
+      const outcome = await deleteStaleTerminalJob({ name, uid, runId, agentId });
+      if (outcome !== "deleted" && outcome !== "missing") {
+        logger.debug(
+          { agentId, runId, name, outcome },
+          "BLO-20801: stale-terminal Job cleanup did not confirm removal; failing closed",
+        );
+        return true;
+      }
     }
 
     // A just-deleted Job can already look terminal while its Pod is still
