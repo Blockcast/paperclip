@@ -41,6 +41,7 @@ import {
   recordProcessLostLivenessNull,
   setExternalLifecycleRunningRuns,
   EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_METRIC,
+  EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_LAST_METRIC,
   KNOWN_EXTERNAL_LIFECYCLE_TERMINAL_STATUSES,
   UNKNOWN_EXTERNAL_LIFECYCLE_TERMINAL_STATUS,
   computeExternalLifecycleSilenceGapSeconds,
@@ -718,6 +719,36 @@ describe("computeExternalLifecycleSilenceGapSeconds + recordExternalLifecycleRun
     expect(body).toContain(
       `${EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_METRIC}_bucket{le="60",adapter="claude_k8s",status="succeeded"} 0`,
     );
+    // Companion last-value gauge (BLO-20815 review follow-up): the histogram alone
+    // cannot answer "what was the max", so this observation must also land on the
+    // gauge at the same labels/value so max_over_time(...[7d]) can recover it.
+    expect(body).toContain(`# TYPE ${EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_LAST_METRIC} gauge`);
+    expect(body).toContain(
+      `${EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_LAST_METRIC}{adapter="claude_k8s",status="succeeded"} 300`,
+    );
+  });
+
+  it("overwrites the last-value gauge with each new observation regardless of direction (last-write, not running max)", async () => {
+    recordExternalLifecycleRunSilenceGap({
+      adapter: "claude_k8s",
+      status: "succeeded",
+      run: { lastUsefulActionAt: t0, lastOutputAt: null, startedAt: null },
+      finalizedAt: new Date(t0.getTime() + 1_800_000),
+    });
+    recordExternalLifecycleRunSilenceGap({
+      adapter: "claude_k8s",
+      status: "succeeded",
+      run: { lastUsefulActionAt: t0, lastOutputAt: null, startedAt: null },
+      finalizedAt: new Date(t0.getTime() + 90_000),
+    });
+    const { body } = await renderMetrics();
+    // The gauge itself only ever exposes the most recent value (90s, smaller
+    // than the prior 1800s) — the max is recovered at query time via
+    // max_over_time over Prometheus's already-scraped sample history, not by
+    // this gauge holding a running maximum in-process.
+    expect(body).toContain(
+      `${EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_LAST_METRIC}{adapter="claude_k8s",status="succeeded"} 90`,
+    );
   });
 
   it("collapses an off-list adapter and status to bounded fallbacks", async () => {
@@ -744,6 +775,9 @@ describe("computeExternalLifecycleSilenceGapSeconds + recordExternalLifecycleRun
     const { body } = await renderMetrics();
     expect(body).not.toContain(
       `${EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_METRIC}_count{adapter="claude_k8s",status="cancelled"}`,
+    );
+    expect(body).not.toContain(
+      `${EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_LAST_METRIC}{adapter="claude_k8s",status="cancelled"}`,
     );
   });
 });
