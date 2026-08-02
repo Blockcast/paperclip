@@ -460,20 +460,80 @@ function summarizeAgentCapabilities(agent: typeof agents.$inferSelect | null | u
 // the throttle fault (see parseProviderCapacityResetHorizon). Read from the
 // run's own resultJson so the strand comment can attribute the stall to the
 // provider window rather than to whatever terminal symptom got recorded last.
-// Returns the ISO string only when this really was a throttle family — a bare
-// `retryNotBefore` on some other family is not a capacity 429.
-function readProviderCapacityResetAt(run: NonNullable<LatestIssueRun>): string | null {
+//
+// `run.resultJson` is NOT a trusted server-authored record. Heartbeat
+// finalization builds it as `{ ...parseObject(adapterResult.resultJson), ... }`
+// — the adapter's own object is spread FIRST, and the server's canonical
+// `providerCapacityResetAt` is layered on top only when it actually parsed a
+// horizon (throttle override + no structured retryNotBefore + prose match). On
+// every other run an adapter-supplied `providerCapacityResetAt` key survives
+// verbatim. Since summarizeRunFailureForIssueComment interpolates the result
+// straight into an issue comment, reading it as free text reopened exactly the
+// hole PR #4600 closed by routing adapter blobs through `redactSensitiveText`:
+// arbitrary adapter text — secrets, internal hostnames, injected markdown —
+// reaching the issue thread uncapped and unredacted.
+//
+// So: gate on the throttle family FIRST, then accept only a bare, bounded
+// ISO-8601 instant, re-emitted canonically. Anything else returns null and the
+// run falls through to the generic redacted summary. A spoofed `errorFamily`
+// therefore buys an attacker a plausible timestamp and nothing else.
+const PROVIDER_CAPACITY_THROTTLE_FAMILIES = new Set(["rate_limit_exhausted", "provider_quota"]);
+
+// Full-string match — no surrounding prose, markdown, or newlines survive it.
+// Mirrors the shape parseProviderCapacityResetHorizon captures on the write side.
+const PROVIDER_CAPACITY_RESET_INSTANT_PATTERN =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
+
+// The horizon was advertised during the run that recorded it, and the write side
+// caps an accepted horizon at 24h past emission. Bounding the read symmetrically
+// around the run's own creation instant rejects garbage (epoch-0, year-9999, a
+// timestamp lifted from unrelated tool output) without rejecting the real thing,
+// which is routinely already in the past by the time the strand comment is built.
+const PROVIDER_CAPACITY_RESET_MAX_SKEW_MS = 24 * 60 * 60 * 1000;
+
+function canonicalizeCapacityResetInstant(value: unknown, runCreatedAt: Date | null): string | null {
+  const raw = readNonEmptyString(value)?.trim();
+  if (!raw) return null;
+  if (!PROVIDER_CAPACITY_RESET_INSTANT_PATTERN.test(raw)) return null;
+  const parsed = Date.parse(raw);
+  if (!Number.isFinite(parsed)) return null;
+  const anchor = runCreatedAt?.getTime();
+  if (anchor !== undefined && Number.isFinite(anchor)) {
+    if (Math.abs(parsed - anchor) > PROVIDER_CAPACITY_RESET_MAX_SKEW_MS) return null;
+  }
+  return new Date(parsed).toISOString();
+}
+
+type ProviderCapacityResetRead = {
+  resetAt: string;
+  // True only when the instant carries real 429-capacity provenance, i.e. the
+  // server's own `providerCapacityResetAt`, which finalization writes solely
+  // from parseProviderCapacityResetHorizon under a throttle override. A bare
+  // `retryNotBefore` does NOT qualify: `rate_limit_exhausted` is set by
+  // isRateLimitExhausted() for "429, 401-cap, or 'you've hit your limit' cap
+  // text" (heartbeat.ts), and `provider_quota` is a legacy adapter quota
+  // signal — neither implies a 429 capacity event, so neither may be reported
+  // as one.
+  is429Capacity: boolean;
+};
+
+function readProviderCapacityResetAt(
+  run: NonNullable<LatestIssueRun>,
+): ProviderCapacityResetRead | null {
   const resultJson = parseObject(run.resultJson);
-  const explicit = readNonEmptyString(resultJson.providerCapacityResetAt);
-  if (explicit) return explicit;
 
   const family = readNonEmptyString(resultJson.errorFamily);
-  if (family !== "rate_limit_exhausted" && family !== "provider_quota") return null;
-  return (
-    readNonEmptyString(resultJson.retryNotBefore) ??
-    readNonEmptyString(resultJson.transientRetryNotBefore) ??
-    null
-  );
+  if (!family || !PROVIDER_CAPACITY_THROTTLE_FAMILIES.has(family)) return null;
+
+  const createdAt = run.createdAt instanceof Date ? run.createdAt : null;
+
+  const explicit = canonicalizeCapacityResetInstant(resultJson.providerCapacityResetAt, createdAt);
+  if (explicit) return { resetAt: explicit, is429Capacity: true };
+
+  const advertised =
+    canonicalizeCapacityResetInstant(resultJson.retryNotBefore, createdAt) ??
+    canonicalizeCapacityResetInstant(resultJson.transientRetryNotBefore, createdAt);
+  return advertised ? { resetAt: advertised, is429Capacity: false } : null;
 }
 
 export function summarizeRunFailureForIssueComment(run: LatestIssueRun) {
@@ -488,14 +548,22 @@ export function summarizeRunFailureForIssueComment(run: LatestIssueRun) {
   // BackoffLimitExceeded — describes the symptom (the Job gave up) and reads
   // as an infrastructure fault, which repeatedly sent readers looking at the
   // cluster instead of at a provider window that had already reopened on its
-  // own. Naming the 429 and the instant is the difference between "our Job
+  // own. Naming the window and the instant is the difference between "our Job
   // broke" and "the provider was closed until 21:29:59Z".
-  const capacityResetAt = readProviderCapacityResetAt(run);
-  if (capacityResetAt) {
+  //
+  // Only the explicit server-parsed horizon may be called a 429: the throttle
+  // families also cover 401 cap-windows and legacy quota signals, so a bare
+  // advertised `retryNotBefore` gets the honest "rate-limit/quota window"
+  // phrasing instead of a status code we cannot substantiate.
+  const capacityReset = readProviderCapacityResetAt(run);
+  if (capacityReset) {
     const suffix = errorCode ? ` (surfaced as \`${errorCode}\`)` : "";
+    const cause = capacityReset.is429Capacity
+      ? `provider capacity throttle (429) — the provider advertised a capacity reset at ${capacityReset.resetAt}`
+      : `provider rate-limit/quota window — the provider advertised availability no earlier than ${capacityReset.resetAt}`;
     return (
-      ` Latest retry failure: provider capacity throttle (429) — the provider advertised a capacity reset at ` +
-      `${capacityResetAt}${suffix}. This is transient and self-healing; the issue is waiting on that reset, not on a broken runtime.`
+      ` Latest retry failure: ${cause}${suffix}. This is transient and self-healing; ` +
+      `the issue is waiting on that reset, not on a broken runtime.`
     );
   }
 
