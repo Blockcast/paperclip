@@ -7571,6 +7571,35 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(issue?.status).toBe("blocked");
   });
 
+  it("does not clear a reconfigured adapter session after a typed OpenCode failure", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      runErrorCode: "session_unavailable",
+      runError: "Session unavailable",
+      adapterType: "opencode_k8s",
+    });
+    await db.update(agents).set({ adapterType: "claude_k8s" }).where(eq(agents.id, agentId));
+    await db.insert(agentTaskSessions).values({
+      companyId,
+      agentId,
+      adapterType: "claude_k8s",
+      taskKey: issueId,
+      sessionParamsJson: { sessionId: "healthy-claude-session" },
+      sessionDisplayId: "healthy-claude-session",
+    });
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.zeroTokenSessionResetRetried).toBe(0);
+    expect(result.escalated).toBe(1);
+    await expect(
+      db.select().from(agentTaskSessions).where(eq(agentTaskSessions.agentId, agentId)),
+    ).resolves.toHaveLength(1);
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("blocked");
+  });
+
   it("blocks an exhausted ordinary session-unavailable chain without starting a reset chain", async () => {
     const { agentId, issueId } = await seedStrandedIssueFixture({
       status: "in_progress",

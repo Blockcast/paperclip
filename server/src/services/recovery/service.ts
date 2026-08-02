@@ -5282,7 +5282,7 @@ export function recoveryService(
     return retryRun ?? queued;
   }
 
-  function legacySessionUnavailableAdapterMismatch(input: {
+  function sessionUnavailableAdapterMismatch(input: {
     latestRun: LatestIssueRun;
     agent: typeof agents.$inferSelect | null;
   }): { historicalAdapterType: string; currentAdapterType: string } | null {
@@ -5292,24 +5292,26 @@ export function recoveryService(
     if (
       !historicalAdapterType ||
       !currentAdapterType ||
-      !isLegacySessionUnavailableAdapterMismatch({
-        run: { ...input.latestRun, adapterType: historicalAdapterType },
-        currentAdapterType,
-      })
+      historicalAdapterType === currentAdapterType ||
+      (input.latestRun.errorCode?.trim() !== "session_unavailable" &&
+        !isLegacySessionUnavailableAdapterMismatch({
+          run: { ...input.latestRun, adapterType: historicalAdapterType },
+          currentAdapterType,
+        }))
     ) {
       return null;
     }
     return { historicalAdapterType, currentAdapterType };
   }
 
-  function buildLegacySessionUnavailableAdapterMismatchComment(input: {
+  function buildSessionUnavailableAdapterMismatchComment(input: {
     previousStatus: "todo" | "in_progress";
     historicalAdapterType: string;
     currentAdapterType: string;
   }) {
     const verb = input.previousStatus === "todo" ? "dispatch" : "continuation";
     return (
-      `Paperclip detected a legacy \`Session unavailable\` ${verb} failure from ` +
+      `Paperclip detected a \`Session unavailable\` ${verb} failure from ` +
       `\`${input.historicalAdapterType}\`, but the assigned agent now uses ` +
       `\`${input.currentAdapterType}\`. This run is not eligible for the OpenCode ` +
       "session-reset path, and retrying it under the new adapter would reclassify stale " +
@@ -5948,6 +5950,32 @@ export function recoveryService(
           continue;
         }
 
+        const todoSessionUnavailableAdapterMismatch =
+          sessionUnavailableAdapterMismatch({ latestRun, agent });
+        if (todoSessionUnavailableAdapterMismatch) {
+          if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, latestRun)) {
+            // BLO-8050: operator just unblocked; skip re-escalation on stale evidence.
+            result.skipped += 1;
+            continue;
+          }
+          const updated = await escalateStrandedAssignedIssue({
+            issue,
+            previousStatus: "todo",
+            latestRun,
+            comment: buildSessionUnavailableAdapterMismatchComment({
+              previousStatus: "todo",
+              ...todoSessionUnavailableAdapterMismatch,
+            }),
+          });
+          if (updated) {
+            result.escalated += 1;
+            result.issueIds.push(issue.id);
+          } else {
+            result.skipped += 1;
+          }
+          continue;
+        }
+
         if (
           latestRun.agentId === agentId &&
           isZeroTokenStartupFailureRun({
@@ -5982,32 +6010,6 @@ export function recoveryService(
           const retried = await resetSessionAndRetryZeroTokenFailure({ issue, agent, latestRun });
           if (retried) {
             result.zeroTokenSessionResetRetried += 1;
-            result.issueIds.push(issue.id);
-          } else {
-            result.skipped += 1;
-          }
-          continue;
-        }
-
-        const todoSessionUnavailableAdapterMismatch =
-          legacySessionUnavailableAdapterMismatch({ latestRun, agent });
-        if (todoSessionUnavailableAdapterMismatch) {
-          if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, latestRun)) {
-            // BLO-8050: operator just unblocked; skip re-escalation on stale evidence.
-            result.skipped += 1;
-            continue;
-          }
-          const updated = await escalateStrandedAssignedIssue({
-            issue,
-            previousStatus: "todo",
-            latestRun,
-            comment: buildLegacySessionUnavailableAdapterMismatchComment({
-              previousStatus: "todo",
-              ...todoSessionUnavailableAdapterMismatch,
-            }),
-          });
-          if (updated) {
-            result.escalated += 1;
             result.issueIds.push(issue.id);
           } else {
             result.skipped += 1;
@@ -6232,6 +6234,31 @@ export function recoveryService(
         }
         continue;
       }
+      const continuationSessionUnavailableAdapterMismatch =
+        sessionUnavailableAdapterMismatch({ latestRun, agent });
+      if (continuationSessionUnavailableAdapterMismatch) {
+        if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, latestRun)) {
+          // BLO-8050: operator just unblocked; skip re-escalation on stale evidence.
+          result.skipped += 1;
+          continue;
+        }
+        const updated = await escalateStrandedAssignedIssue({
+          issue,
+          previousStatus: "in_progress",
+          latestRun,
+          comment: buildSessionUnavailableAdapterMismatchComment({
+            previousStatus: "in_progress",
+            ...continuationSessionUnavailableAdapterMismatch,
+          }),
+        });
+        if (updated) {
+          result.escalated += 1;
+          result.issueIds.push(issue.id);
+        } else {
+          result.skipped += 1;
+        }
+        continue;
+      }
       if (
         latestRun?.agentId === agentId &&
         isZeroTokenStartupFailureRun({
@@ -6266,31 +6293,6 @@ export function recoveryService(
         const retried = await resetSessionAndRetryZeroTokenFailure({ issue, agent, latestRun });
         if (retried) {
           result.zeroTokenSessionResetRetried += 1;
-          result.issueIds.push(issue.id);
-        } else {
-          result.skipped += 1;
-        }
-        continue;
-      }
-      const continuationSessionUnavailableAdapterMismatch =
-        legacySessionUnavailableAdapterMismatch({ latestRun, agent });
-      if (continuationSessionUnavailableAdapterMismatch) {
-        if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, latestRun)) {
-          // BLO-8050: operator just unblocked; skip re-escalation on stale evidence.
-          result.skipped += 1;
-          continue;
-        }
-        const updated = await escalateStrandedAssignedIssue({
-          issue,
-          previousStatus: "in_progress",
-          latestRun,
-          comment: buildLegacySessionUnavailableAdapterMismatchComment({
-            previousStatus: "in_progress",
-            ...continuationSessionUnavailableAdapterMismatch,
-          }),
-        });
-        if (updated) {
-          result.escalated += 1;
           result.issueIds.push(issue.id);
         } else {
           result.skipped += 1;
