@@ -346,9 +346,20 @@ jobs:
 
   verify:
     # Preserve the legacy required-check name while the underlying work runs in parallel.
+    # BLO-20869: verify_serialized_server is included here (not made required on its
+    # own) so a cancelled/skipped/never-scheduled serialized shard fails this required
+    # check instead of being invisible to the merge gate. See the issue for the
+    # measured latency tradeoff of folding a ~90-minute job into the required path.
     name: verify
     if: ${{ always() }}
-    needs: [typecheck_release_registry, general_tests, worktree_install, build]
+    needs:
+      [
+        typecheck_release_registry,
+        general_tests,
+        worktree_install,
+        build,
+        verify_serialized_server,
+      ]
     runs-on: arc-light
     timeout-minutes: 5
 
@@ -359,11 +370,13 @@ jobs:
           GENERAL_TESTS_RESULT: ${{ needs.general_tests.result }}
           WORKTREE_INSTALL_RESULT: ${{ needs.worktree_install.result }}
           BUILD_RESULT: ${{ needs.build.result }}
+          VERIFY_SERIALIZED_SERVER_RESULT: ${{ needs.verify_serialized_server.result }}
         run: |
           test "$TYPECHECK_RELEASE_REGISTRY_RESULT" = "success"
           test "$GENERAL_TESTS_RESULT" = "success"
           test "$WORKTREE_INSTALL_RESULT" = "success"
           test "$BUILD_RESULT" = "success"
+          test "$VERIFY_SERIALIZED_SERVER_RESULT" = "success"
 
   build:
     name: Build
