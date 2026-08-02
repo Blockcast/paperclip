@@ -2961,6 +2961,20 @@ export function pipelineService(db: Db, deps: { heartbeat?: PipelineHeartbeatDep
       runningRunIdsToCancel?: Set<string>;
     },
   ) {
+    const candidate = await tx
+      .select({ issueId: pipelineCaseIssueLinks.issueId })
+      .from(pipelineCaseIssueLinks)
+      .where(and(
+        eq(pipelineCaseIssueLinks.id, input.linkId),
+        eq(pipelineCaseIssueLinks.companyId, input.companyId),
+        eq(pipelineCaseIssueLinks.role, "automation"),
+        isNull(pipelineCaseIssueLinks.retiredAt),
+      ))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (!candidate) return;
+
+    await tx.execute(sql`select id from ${issues} where ${issues.id} = ${candidate.issueId} for update`);
     const row = await tx
       .select({
         issueId: issues.id,
@@ -2991,7 +3005,6 @@ export function pipelineService(db: Db, deps: { heartbeat?: PipelineHeartbeatDep
       .then((rows) => rows[0] ?? null);
     if (!row) return;
 
-    await tx.execute(sql`select id from ${issues} where ${issues.id} = ${row.issueId} for update`);
     const now = nowDate();
     const [retiredLink] = await tx
       .update(pipelineCaseIssueLinks)
@@ -3080,25 +3093,27 @@ export function pipelineService(db: Db, deps: { heartbeat?: PipelineHeartbeatDep
         sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${cancelledIssue.id}`,
       ))
       .returning({ wakeupRequestId: heartbeatRuns.wakeupRequestId });
-    if (row.issueExecutionRunId) {
-      const [runningRun] = await tx
-        .update(heartbeatRuns)
-        .set({
-          resultJson: sql`jsonb_set(
-            coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb),
-            '{pipelineStageExitCancellationRequestedAt}',
-            to_jsonb(${now.toISOString()}::text),
-            true
-          )`,
-          updatedAt: now,
-        })
-        .where(and(
-          eq(heartbeatRuns.id, row.issueExecutionRunId),
-          eq(heartbeatRuns.companyId, input.companyId),
-          eq(heartbeatRuns.status, "running"),
-        ))
-        .returning({ id: heartbeatRuns.id });
-      if (runningRun) input.runningRunIdsToCancel?.add(runningRun.id);
+    const runningRuns = await tx
+      .update(heartbeatRuns)
+      .set({
+        resultJson: sql`jsonb_set(
+          coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb),
+          '{pipelineStageExitCancellationRequestedAt}',
+          to_jsonb(${now.toISOString()}::text),
+          true
+        )`,
+        updatedAt: now,
+      })
+      .where(and(
+        eq(heartbeatRuns.companyId, input.companyId),
+        eq(heartbeatRuns.status, "running"),
+        row.issueExecutionRunId
+          ? eq(heartbeatRuns.id, row.issueExecutionRunId)
+          : eq(heartbeatRuns.contextIssueId, row.issueId),
+      ))
+      .returning({ id: heartbeatRuns.id });
+    for (const runningRun of runningRuns) {
+      input.runningRunIdsToCancel?.add(runningRun.id);
     }
     const wakeupRequestIds = cancelledRuns
       .map((run) => run.wakeupRequestId)
