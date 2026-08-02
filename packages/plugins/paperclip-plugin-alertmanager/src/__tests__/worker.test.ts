@@ -9,6 +9,7 @@
 
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import {
+  AlertDeliveryIncompleteError,
   WebhookUnauthorizedError,
   handleWebhook,
   verifyBearerToken,
@@ -115,8 +116,8 @@ interface MockClients {
     get: ReturnType<typeof vi.fn>;
     create: ReturnType<typeof vi.fn>;
     update: ReturnType<typeof vi.fn>;
-    createComment: ReturnType<typeof vi.fn>;
     listComments: ReturnType<typeof vi.fn>;
+    createComment: ReturnType<typeof vi.fn>;
   };
   agents: { list: ReturnType<typeof vi.fn> };
   events: { emit: ReturnType<typeof vi.fn> };
@@ -134,6 +135,8 @@ const mkCtx = (): { ctx: PluginContext; mocks: MockClients } => {
   const aggregates = new Map<string, Record<string, unknown>>();
   const members = new Map<string, { firing: boolean }>();
   const stateValues = new Map<string, unknown>();
+  const stateKey = (ref: { scopeKind: string; scopeId?: string; stateKey: string }) =>
+    `${ref.scopeKind}:${ref.scopeId ?? ""}:${ref.stateKey}`;
   const mocks: MockClients = {
     db: {
       namespace: "alertmanager_test",
@@ -322,12 +325,12 @@ const mkCtx = (): { ctx: PluginContext; mocks: MockClients } => {
       }),
     },
     state: {
-      get: vi.fn(async ({ stateKey }: { stateKey: string }) => stateValues.get(stateKey) ?? null),
-      set: vi.fn(async ({ stateKey }: { stateKey: string }, value: unknown) => {
-        stateValues.set(stateKey, value);
+      get: vi.fn(async (ref: { scopeKind: string; scopeId?: string; stateKey: string }) => stateValues.get(stateKey(ref)) ?? null),
+      set: vi.fn(async (ref: { scopeKind: string; scopeId?: string; stateKey: string }, value: unknown) => {
+        stateValues.set(stateKey(ref), value);
       }),
-      delete: vi.fn(async ({ stateKey }: { stateKey: string }) => {
-        stateValues.delete(stateKey);
+      delete: vi.fn(async (ref: { scopeKind: string; scopeId?: string; stateKey: string }) => {
+        stateValues.delete(stateKey(ref));
       }),
     },
     users: {
@@ -339,8 +342,8 @@ const mkCtx = (): { ctx: PluginContext; mocks: MockClients } => {
       get: vi.fn(async () => null),
       create: vi.fn(async () => ({ id: "issue-1" })),
       update: vi.fn(async () => ({ id: "issue-1" })),
-      createComment: vi.fn(async () => ({ id: "comment-1" })),
       listComments: vi.fn(async () => []),
+      createComment: vi.fn(async () => ({ id: "comment-1" })),
     },
     agents: {
       list: vi.fn(async () => [
@@ -495,9 +498,13 @@ describe("handleWebhook — firing first time", () => {
     expect(createArgs.description).toContain("[Dashboard](https://grafana/d/cilium)");
     expect(createArgs.description).toContain("[Runbook](https://wiki/runbooks/cilium-drops)");
 
-    // State row written
+    // State row written, scoped to the company that owns the issue (BLO-20467)
     expect(mocks.state.set).toHaveBeenCalledWith(
-      { scopeKind: "instance", stateKey: "alert:9a3b1e4c5f6d7890" },
+      {
+        scopeKind: "company",
+        scopeId: "company-1",
+        stateKey: "alert:9a3b1e4c5f6d7890",
+      },
       expect.objectContaining({
         paperclipIssueId: "issue-1",
         paperclipCompanyId: "company-1",
@@ -590,7 +597,11 @@ describe("handleWebhook — firing first time", () => {
     expect(createArgs.assigneeAgentId).toBe(BLOCKCAST_PHYSICAL_INFRA_AGENT_ID);
     expect(createArgs.assigneeUserId).toBeUndefined();
     expect(mocks.state.set).toHaveBeenCalledWith(
-      { scopeKind: "instance", stateKey: "alert:physical-bmc-1" },
+      {
+        scopeKind: "company",
+        scopeId: "company-1",
+        stateKey: "alert:physical-bmc-1",
+      },
       expect.objectContaining({
         assigneeAgentId: BLOCKCAST_PHYSICAL_INFRA_AGENT_ID,
         assigneeUserId: null,
@@ -844,6 +855,10 @@ describe("handleWebhook — resolved", () => {
 
     await handleWebhook(ctx, config, TOKEN, baseInput({ parsedBody: envelope }));
 
+    expect(mocks.issues.listComments).toHaveBeenCalledWith(
+      "issue-existing",
+      "company-1",
+    );
     expect(mocks.issues.createComment).toHaveBeenCalledWith(
       "issue-existing",
       "Alert resolved at 2026-04-29T10:00:00Z.",
@@ -853,6 +868,50 @@ describe("handleWebhook — resolved", () => {
     expect(mocks.events.emit).toHaveBeenCalledWith(
       "alertmanager.alert.resolved",
       "company-1",
+      expect.objectContaining({
+        paperclipIssueId: "issue-existing",
+        resolvedAt: "2026-04-29T10:00:00Z",
+      }),
+    );
+  });
+
+  it("does not duplicate an existing resolved comment on retry", async () => {
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ autoCloseOnResolve: false });
+    const existing: AlertStateRecord = {
+      paperclipIssueId: "issue-existing",
+      paperclipCompanyId: "company-1",
+      assigneeUserId: null,
+      assigneeAgentId: null,
+      alertname: "CiliumPolicyDropsHigh",
+      severity: "critical",
+      firstSeenAt: "2026-04-29T08:00:00Z",
+      lastFiredAt: "2026-04-29T08:00:00Z",
+      resolvedAt: null,
+    };
+    mocks.state.get.mockResolvedValueOnce(existing);
+    mocks.issues.listComments.mockResolvedValueOnce([
+      { body: "Alert resolved at 2026-04-29T10:00:00Z." },
+    ]);
+
+    const resolvedAlert = baseAlert({
+      status: "resolved",
+      endsAt: "2026-04-29T10:00:00Z",
+    });
+    const envelope = baseEnvelope({
+      status: "resolved",
+      alerts: [resolvedAlert],
+    });
+
+    await handleWebhook(ctx, config, TOKEN, baseInput({ parsedBody: envelope }));
+
+    expect(mocks.issues.createComment).not.toHaveBeenCalled();
+    expect(mocks.state.set).toHaveBeenCalledWith(
+      {
+        scopeKind: "company",
+        scopeId: "company-1",
+        stateKey: "alert:9a3b1e4c5f6d7890",
+      },
       expect.objectContaining({
         paperclipIssueId: "issue-existing",
         resolvedAt: "2026-04-29T10:00:00Z",
@@ -894,6 +953,129 @@ describe("handleWebhook — resolved", () => {
       "company-1",
     );
     expect(mocks.issues.createComment).not.toHaveBeenCalled();
+  });
+
+  it("fails the delivery without marking resolved when issue cancellation fails", async () => {
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ autoCloseOnResolve: true });
+    const existing: AlertStateRecord = {
+      paperclipIssueId: "issue-existing",
+      paperclipCompanyId: "company-1",
+      assigneeUserId: null,
+      assigneeAgentId: null,
+      alertname: "CiliumPolicyDropsHigh",
+      severity: "critical",
+      firstSeenAt: "2026-04-29T08:00:00Z",
+      lastFiredAt: "2026-04-29T08:00:00Z",
+      resolvedAt: null,
+    };
+    mocks.state.get.mockResolvedValueOnce(existing);
+    mocks.issues.get.mockResolvedValueOnce({ id: "issue-existing", status: "todo" });
+    mocks.issues.update.mockRejectedValueOnce(new Error("issues.update RPC unavailable"));
+
+    const resolvedAlert = baseAlert({
+      status: "resolved",
+      endsAt: "2026-04-29T10:00:00Z",
+    });
+    const envelope = baseEnvelope({
+      status: "resolved",
+      alerts: [resolvedAlert],
+    });
+
+    await expect(
+      handleWebhook(ctx, config, TOKEN, baseInput({ parsedBody: envelope })),
+    ).rejects.toBeInstanceOf(AlertDeliveryIncompleteError);
+    expect(mocks.state.set).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ resolvedAt: "2026-04-29T10:00:00Z" }),
+    );
+  });
+
+  it("fails the delivery without marking resolved when the resolution comment fails", async () => {
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ autoCloseOnResolve: false });
+    const existing: AlertStateRecord = {
+      paperclipIssueId: "issue-existing",
+      paperclipCompanyId: "company-1",
+      assigneeUserId: null,
+      assigneeAgentId: null,
+      alertname: "CiliumPolicyDropsHigh",
+      severity: "critical",
+      firstSeenAt: "2026-04-29T08:00:00Z",
+      lastFiredAt: "2026-04-29T08:00:00Z",
+      resolvedAt: null,
+    };
+    mocks.state.get.mockResolvedValueOnce(existing);
+    mocks.issues.createComment.mockRejectedValueOnce(
+      new Error("issues.createComment RPC unavailable"),
+    );
+
+    const resolvedAlert = baseAlert({
+      status: "resolved",
+      endsAt: "2026-04-29T10:00:00Z",
+    });
+    const envelope = baseEnvelope({
+      status: "resolved",
+      alerts: [resolvedAlert],
+    });
+
+    await expect(
+      handleWebhook(ctx, config, TOKEN, baseInput({ parsedBody: envelope })),
+    ).rejects.toBeInstanceOf(AlertDeliveryIncompleteError);
+    expect(mocks.issues.listComments).toHaveBeenCalledWith(
+      "issue-existing",
+      "company-1",
+    );
+    expect(mocks.state.set).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ resolvedAt: "2026-04-29T10:00:00Z" }),
+    );
+  });
+
+  it("fails the delivery without marking resolved when cover cleanup fails", async () => {
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ autoCloseOnResolve: false });
+    const existing: AlertStateRecord = {
+      paperclipIssueId: "issue-existing",
+      paperclipCompanyId: "company-1",
+      assigneeUserId: null,
+      assigneeAgentId: null,
+      alertname: "CiliumPolicyDropsHigh",
+      severity: "critical",
+      firstSeenAt: "2026-04-29T08:00:00Z",
+      lastFiredAt: "2026-04-29T08:00:00Z",
+      resolvedAt: null,
+    };
+    mocks.state.get.mockResolvedValueOnce(existing);
+    const execute = mocks.db.execute.getMockImplementation()!;
+    mocks.db.execute.mockImplementation(async (...args) => {
+      if (String(args[0]).includes("alert_escalation_cover_members")) {
+        throw new Error("cover DB unavailable");
+      }
+      return execute(...args);
+    });
+
+    const resolvedAlert = baseAlert({
+      status: "resolved",
+      endsAt: "2026-04-29T10:00:00Z",
+    });
+    const envelope = baseEnvelope({
+      status: "resolved",
+      alerts: [resolvedAlert],
+    });
+
+    await expect(
+      handleWebhook(ctx, config, TOKEN, baseInput({ parsedBody: envelope })),
+    ).rejects.toBeInstanceOf(AlertDeliveryIncompleteError);
+    expect(mocks.issues.createComment).toHaveBeenCalledWith(
+      "issue-existing",
+      "Alert resolved at 2026-04-29T10:00:00Z.",
+      "company-1",
+    );
+    expect(mocks.state.set).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ resolvedAt: "2026-04-29T10:00:00Z" }),
+    );
   });
 
   it("cancels the issue when autoCloseOnResolve is omitted", async () => {
@@ -980,7 +1162,11 @@ describe("handleWebhook — resolved", () => {
       expect.objectContaining({ paperclipIssueId: "issue-existing" }),
     );
     expect(mocks.state.set).toHaveBeenCalledWith(
-      { scopeKind: "instance", stateKey: "alert:9a3b1e4c5f6d7890" },
+      {
+        scopeKind: "company",
+        scopeId: "company-1",
+        stateKey: "alert:9a3b1e4c5f6d7890",
+      },
       expect.objectContaining({
         paperclipIssueId: "issue-existing",
         paperclipCompanyId: "company-1",
@@ -1453,6 +1639,7 @@ describe("handleWebhook — aggregate lifecycle", () => {
       expect.anything(),
     );
     const aggregateState = await mocks.state.get({
+      scopeKind: "instance",
       stateKey:
         'alert-aggregate:company-1:alert-aggregate:v1:["HindsightConsolidationStalled",null]',
     });
@@ -1484,14 +1671,14 @@ describe("handleWebhook — aggregate lifecycle", () => {
       endsAt: "2026-04-29T10:00:00Z",
     };
 
-    await handleWebhook(
+    await expect(handleWebhook(
       ctx,
       baseConfig({ autoCloseOnResolve: true }),
       TOKEN,
       baseInput({
         parsedBody: baseEnvelope({ status: "resolved", alerts: [resolved] }),
       }),
-    );
+    )).rejects.toBeInstanceOf(AlertDeliveryIncompleteError);
     mocks.issues.update.mockImplementation(async (_id, patch) => {
       issueStatus = patch.status;
       return { id: "issue-1", status: issueStatus };
@@ -1525,7 +1712,9 @@ describe("handleWebhook — aggregate lifecycle", () => {
       parsedBody: baseEnvelope({ status: "resolved", alerts: [resolved] }),
     });
 
-    await handleWebhook(ctx, baseConfig({ autoCloseOnResolve: true }), TOKEN, input);
+    await expect(
+      handleWebhook(ctx, baseConfig({ autoCloseOnResolve: true }), TOKEN, input),
+    ).rejects.toBeInstanceOf(AlertDeliveryIncompleteError);
     await reconcileAggregateLifecycle(
       ctx,
       baseConfig({ autoCloseOnResolve: true }),
@@ -1613,5 +1802,349 @@ describe("handleWebhook — aggregate lifecycle", () => {
       { status: "cancelled" },
       expect.objectContaining({ status: "todo" }),
     ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BLO-20467 — per-company alert state.
+//
+// These use a Map-backed state store keyed by the full serialized ScopeKey
+// rather than `vi.fn(async () => null)`, because the bug under test is
+// specifically that two tenants resolved to the SAME key. A mock that always
+// returns null cannot express a collision, so it would pass either way.
+// ---------------------------------------------------------------------------
+
+const mkStatefulCtx = (): { ctx: PluginContext; mocks: MockClients; store: Map<string, unknown> } => {
+  const { ctx, mocks } = mkCtx();
+  const store = new Map<string, unknown>();
+  const keyOf = (ref: { scopeKind: string; scopeId?: string; stateKey: string }) =>
+    `${ref.scopeKind}/${ref.scopeId ?? "-"}/${ref.stateKey}`;
+  mocks.state.get.mockImplementation(async (ref) => store.get(keyOf(ref)) ?? null);
+  mocks.state.set.mockImplementation(async (ref, value) => {
+    store.set(keyOf(ref), value);
+  });
+  mocks.state.delete.mockImplementation(async (ref) => {
+    store.delete(keyOf(ref));
+  });
+  return { ctx, mocks, store };
+};
+
+describe("BLO-20467 — alert state is namespaced per company", () => {
+  it("two tenants reporting the SAME fingerprint each get their own issue", async () => {
+    const { ctx, mocks } = mkStatefulCtx();
+    // Same alert, same fingerprint — routine when two tenants run the same
+    // alerting rules off the same upstream dashboards.
+    const alert = baseAlert();
+    const envelope = baseEnvelope({ alerts: [alert] });
+
+    mocks.issues.create.mockImplementationOnce(async () => ({ id: "issue-A" }));
+    await handleWebhook(
+      ctx,
+      baseConfig({ defaultCompanyId: "company-A" }),
+      TOKEN,
+      baseInput({ companyId: "company-A", parsedBody: envelope }),
+    );
+
+    mocks.issues.create.mockImplementationOnce(async () => ({ id: "issue-B" }));
+    await handleWebhook(
+      ctx,
+      baseConfig({ defaultCompanyId: "company-B" }),
+      TOKEN,
+      baseInput({ companyId: "company-B", parsedBody: envelope }),
+    );
+
+    // Before the fix, B found A's instance-scoped row and took the re-fire
+    // branch: one issue total, filed under A, and B's alert never tracked.
+    expect(mocks.issues.create).toHaveBeenCalledTimes(2);
+    expect(mocks.issues.create.mock.calls[0][0].companyId).toBe("company-A");
+    expect(mocks.issues.create.mock.calls[1][0].companyId).toBe("company-B");
+
+    expect(mocks.state.set).toHaveBeenCalledWith(
+      { scopeKind: "company", scopeId: "company-A", stateKey: `alert:${alert.fingerprint}` },
+      expect.objectContaining({ paperclipIssueId: "issue-A", paperclipCompanyId: "company-A" }),
+    );
+    expect(mocks.state.set).toHaveBeenCalledWith(
+      { scopeKind: "company", scopeId: "company-B", stateKey: `alert:${alert.fingerprint}` },
+      expect.objectContaining({ paperclipIssueId: "issue-B", paperclipCompanyId: "company-B" }),
+    );
+  });
+
+  it("one tenant's resolution cannot close another tenant's issue on a shared fingerprint", async () => {
+    const { ctx, mocks } = mkStatefulCtx();
+    const alert = baseAlert();
+
+    mocks.issues.create.mockImplementationOnce(async () => ({ id: "issue-A" }));
+    await handleWebhook(
+      ctx,
+      baseConfig({ defaultCompanyId: "company-A" }),
+      TOKEN,
+      baseInput({ companyId: "company-A", parsedBody: baseEnvelope({ alerts: [alert] }) }),
+    );
+
+    // Company B resolves the same fingerprint. B has no record of it, and must
+    // not reach for A's. `issues.list` returns [] so recoverStateFromIssue —
+    // which is already company-scoped — finds nothing either.
+    //
+    // issues.get must return an OPEN issue: handleResolved only calls update
+    // when the looked-up issue exists and is still open, so leaving the default
+    // `null` here would make the assertions below pass even with the bug.
+    mocks.issues.get.mockImplementation(async () => ({ id: "issue-A", status: "todo" }));
+    const resolvedEnvelope = baseEnvelope({
+      status: "resolved",
+      alerts: [{ ...alert, status: "resolved", endsAt: "2026-04-29T10:00:00Z" }],
+    });
+    await handleWebhook(
+      ctx,
+      baseConfig({ defaultCompanyId: "company-B", autoCloseOnResolve: true }),
+      TOKEN,
+      baseInput({ companyId: "company-B", parsedBody: resolvedEnvelope }),
+    );
+
+    expect(mocks.issues.update).not.toHaveBeenCalled();
+    expect(mocks.issues.createComment).not.toHaveBeenCalled();
+  });
+
+  it("adopts a pre-upgrade instance-scoped row for the company that owns it", async () => {
+    const { ctx, mocks, store } = mkStatefulCtx();
+    const alert = baseAlert();
+    // A row written by the old build, before state was company-scoped.
+    const legacy: AlertStateRecord = {
+      paperclipIssueId: "issue-legacy",
+      paperclipCompanyId: "company-1",
+      assigneeUserId: null,
+      assigneeAgentId: null,
+      alertname: "CiliumPolicyDropsHigh",
+      severity: "critical",
+      firstSeenAt: "2026-04-29T08:00:00Z",
+      lastFiredAt: "2026-04-29T08:00:00Z",
+      resolvedAt: null,
+    };
+    store.set(`instance/-/alert:${alert.fingerprint}`, legacy);
+    mocks.issues.get.mockImplementation(async () => ({ id: "issue-legacy", status: "todo" }));
+
+    await handleWebhook(ctx, baseConfig(), TOKEN, baseInput());
+
+    // Treated as a re-fire of the tracked issue, NOT as a brand-new alert.
+    // Without the read-through, every alert firing across the upgrade would
+    // duplicate its issue and orphan the original.
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+    expect(store.get(`company/company-1/alert:${alert.fingerprint}`)).toBeTruthy();
+    // Legacy row removed so it cannot be re-adopted later.
+    expect(store.has(`instance/-/alert:${alert.fingerprint}`)).toBe(false);
+  });
+
+  it("refuses to adopt a legacy row belonging to a different company", async () => {
+    const { ctx, mocks, store } = mkStatefulCtx();
+    const alert = baseAlert();
+    const legacy: AlertStateRecord = {
+      paperclipIssueId: "issue-other-tenant",
+      paperclipCompanyId: "company-OTHER",
+      assigneeUserId: null,
+      assigneeAgentId: null,
+      alertname: "CiliumPolicyDropsHigh",
+      severity: "critical",
+      firstSeenAt: "2026-04-29T08:00:00Z",
+      lastFiredAt: "2026-04-29T08:00:00Z",
+      resolvedAt: null,
+    };
+    store.set(`instance/-/alert:${alert.fingerprint}`, legacy);
+
+    await handleWebhook(ctx, baseConfig(), TOKEN, baseInput());
+
+    // company-1 files its own issue and never touches company-OTHER's.
+    expect(mocks.issues.create).toHaveBeenCalledTimes(1);
+    expect(mocks.issues.create.mock.calls[0][0].companyId).toBe("company-1");
+    expect(mocks.issues.update).not.toHaveBeenCalled();
+    // The other tenant's row is left exactly where it was.
+    expect(store.get(`instance/-/alert:${alert.fingerprint}`)).toEqual(legacy);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Delivery acknowledgement semantics
+//
+// Regression cover for BLO-20467: the per-alert catch swallowed downstream
+// failures and returned normally, so the host recorded `success` + HTTP 200 and
+// Alertmanager stopped retrying a delivery that produced no durable issue or
+// state row. Batch isolation is preserved — siblings still run — but the
+// delivery must FAIL so the alert survives.
+// ---------------------------------------------------------------------------
+
+describe("handleWebhook — delivery acknowledgement", () => {
+  const twoAlertEnvelope = () =>
+    baseEnvelope({
+      alerts: [
+        baseAlert({ fingerprint: "aaaa1111" }),
+        baseAlert({ fingerprint: "bbbb2222" }),
+      ],
+    });
+
+  it("rejects the delivery when issue creation fails", async () => {
+    const { ctx } = mkCtx();
+    (ctx as unknown as MockClients).issues.create.mockRejectedValue(
+      new Error("issues.create RPC unavailable"),
+    );
+
+    await expect(
+      handleWebhook(ctx, baseConfig(), TOKEN, baseInput()),
+    ).rejects.toBeInstanceOf(AlertDeliveryIncompleteError);
+  });
+
+  it("rejects the delivery when persisting alert state fails", async () => {
+    const { ctx } = mkCtx();
+    (ctx as unknown as MockClients).state.set.mockRejectedValue(
+      new Error("plugin state store unavailable"),
+    );
+
+    await expect(
+      handleWebhook(ctx, baseConfig(), TOKEN, baseInput()),
+    ).rejects.toBeInstanceOf(AlertDeliveryIncompleteError);
+  });
+
+  it("still processes sibling alerts, then fails the delivery naming only the failed one", async () => {
+    // Batch isolation and non-acknowledgement are both required; a fix that
+    // aborted the loop on first failure would pass the assertions above and
+    // still regress the behaviour this catch exists for.
+    const { ctx, mocks } = mkCtx();
+    // Fail the first alert only; the mapper owns title construction, so drive
+    // the failure off call order rather than asserting on issue fields here.
+    let call = 0;
+    mocks.issues.create.mockImplementation(async () => {
+      call += 1;
+      if (call === 1) throw new Error("issues.create RPC unavailable");
+      return { id: "issue-ok" };
+    });
+
+    const err = await handleWebhook(
+      ctx,
+      baseConfig(),
+      TOKEN,
+      baseInput({ parsedBody: twoAlertEnvelope() }),
+    ).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(AlertDeliveryIncompleteError);
+    // The second alert was still attempted despite the first one failing.
+    expect(mocks.issues.create).toHaveBeenCalledTimes(2);
+    expect((err as AlertDeliveryIncompleteError).fingerprints).toEqual(["aaaa1111"]);
+  });
+
+  it("acknowledges (returns) when every alert succeeds", async () => {
+    const { ctx } = mkCtx();
+    await expect(
+      handleWebhook(ctx, baseConfig(), TOKEN, baseInput({ parsedBody: twoAlertEnvelope() })),
+    ).resolves.toBeUndefined();
+  });
+
+  it("still acknowledges a malformed payload — permanent, so retrying is pointless", async () => {
+    const { ctx } = mkCtx();
+    await expect(
+      handleWebhook(ctx, baseConfig(), TOKEN, baseInput({ parsedBody: { nope: true } })),
+    ).resolves.toBeUndefined();
+  });
+
+  it("does not let a metrics outage abort the remaining alerts", async () => {
+    const { ctx, mocks } = mkCtx();
+    mocks.issues.create.mockRejectedValue(new Error("issues.create RPC unavailable"));
+    mocks.metrics.write.mockRejectedValue(new Error("metrics sink unavailable"));
+
+    const err = await handleWebhook(
+      ctx,
+      baseConfig(),
+      TOKEN,
+      baseInput({ parsedBody: twoAlertEnvelope() }),
+    ).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(AlertDeliveryIncompleteError);
+    expect((err as AlertDeliveryIncompleteError).fingerprints).toEqual([
+      "aaaa1111",
+      "bbbb2222",
+    ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BLO-20467 — a retried delivery must not duplicate the issue the failed
+// attempt already created.
+//
+// `issues.create` commits before its `state.set`. Once a lost alert stopped
+// being acknowledged, a state-store failure between those two calls started
+// producing a *retry* — and a retry that trusted the state miss would file a
+// second issue for the same fingerprint. Under a repeating state-store outage
+// that is an unbounded duplicate-issue storm, so this is a regression guard on
+// the fix for silent loss, not an independent nicety.
+//
+// Both tests drive the handler TWICE; a single invocation cannot observe the
+// duplicate at all. They also fail only the `alert:` write rather than "the
+// first state.set" — the firing path writes an owner-email cache entry first
+// and swallows its failure, so a blanket `mockRejectedValueOnce` is absorbed
+// there, the delivery succeeds, and the test passes against unfixed code.
+// ---------------------------------------------------------------------------
+describe("BLO-20467 — firing retries are idempotent across create/state-write", () => {
+  /** Stateful ctx whose *alert-state* writes fail while `fail.on` is true. */
+  const mkFlakyStateCtx = () => {
+    const { ctx, mocks, store } = mkStatefulCtx();
+    const fail = { on: true };
+    const prior = mocks.state.set.getMockImplementation()!;
+    mocks.state.set.mockImplementation(async (ref: { stateKey: string }, value: unknown) => {
+      if (fail.on && ref.stateKey.startsWith("alert:")) {
+        throw new Error("plugin state store unavailable");
+      }
+      return prior(ref, value);
+    });
+    return { ctx, mocks, store, fail };
+  };
+
+  const liveIssue = [
+    { id: "issue-from-attempt-1", status: "todo", assigneeUserId: null, assigneeAgentId: null },
+  ];
+
+  it("adopts the issue the failed attempt created instead of filing a second one", async () => {
+    const { ctx, mocks, fail } = mkFlakyStateCtx();
+    const input = baseInput({ parsedBody: baseEnvelope({ alerts: [baseAlert()] }) });
+    mocks.issues.create.mockResolvedValue({ id: "issue-from-attempt-1" });
+
+    // Attempt 1: the issue commits, then its state write fails.
+    await expect(handleWebhook(ctx, baseConfig(), TOKEN, input)).rejects.toBeInstanceOf(
+      AlertDeliveryIncompleteError,
+    );
+    expect(mocks.issues.create).toHaveBeenCalledTimes(1);
+
+    // Attempt 2 is Alertmanager's retry. The state store is still empty — the
+    // write that would have populated it is exactly what failed — so the only
+    // way to avoid a duplicate is to reconcile against the existing issue.
+    fail.on = false;
+    mocks.issues.list.mockResolvedValue(liveIssue);
+    await handleWebhook(ctx, baseConfig(), TOKEN, input);
+
+    expect(mocks.issues.create).toHaveBeenCalledTimes(1);
+    // The retry must also leave durable state behind, or every later delivery
+    // repeats this reconciliation and the ladder never arms.
+    expect(mocks.state.set).toHaveBeenLastCalledWith(
+      expect.objectContaining({ scopeKind: "company", stateKey: "alert:9a3b1e4c5f6d7890" }),
+      expect.objectContaining({ paperclipIssueId: "issue-from-attempt-1", resolvedAt: null }),
+    );
+  });
+
+  it("arms the escalation ladder on the adopted record", async () => {
+    // Recovery rebuilds the record from the issue, which carries no ladder
+    // fields, and the re-fire branch passes them through unchanged. Leaving
+    // them unset would silently disarm escalation for exactly the alert whose
+    // state was lost — dedup still works, so the assertions above pass either
+    // way and cannot catch this.
+    const { ctx, mocks, fail } = mkFlakyStateCtx();
+    const input = baseInput({ parsedBody: baseEnvelope({ alerts: [baseAlert()] }) });
+    mocks.issues.create.mockResolvedValue({ id: "issue-from-attempt-1" });
+
+    await handleWebhook(ctx, baseConfig(), TOKEN, input).catch(() => {});
+    fail.on = false;
+    mocks.issues.list.mockResolvedValue(liveIssue);
+    await handleWebhook(ctx, baseConfig(), TOKEN, input);
+
+    const persisted = mocks.state.set.mock.calls.at(-1)?.[1] as {
+      nextEscalationAt: string | null;
+      escalationComplete?: boolean;
+    };
+    expect(persisted.nextEscalationAt).toEqual(expect.any(String));
+    expect(persisted.escalationComplete).toBe(false);
   });
 });

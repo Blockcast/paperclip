@@ -43,6 +43,21 @@ export async function applyAggregateResolution(
     return "failed";
   }
 
+  try {
+    await recordSourceResolvedAndCloseCovers(ctx, work.companyId, issueId);
+  } catch (err) {
+    await releaseAggregateResolution(
+      ctx,
+      work.companyId,
+      work.aggregateKey,
+      work.claim,
+    );
+    ctx.logger.warn(
+      `Failed to record resolution against escalation covers for issue ${issueId}: ${String(err)}`,
+    );
+    return "failed";
+  }
+
   const completion = await completeAggregateResolution(
     ctx,
     work.companyId,
@@ -55,13 +70,6 @@ export async function applyAggregateResolution(
     return completion;
   }
   if (completion === "completed") {
-    try {
-      await recordSourceResolvedAndCloseCovers(ctx, work.companyId, issueId);
-    } catch (err) {
-      ctx.logger.warn(
-        `Failed to record resolution against escalation covers for issue ${issueId}: ${String(err)}`,
-      );
-    }
     ctx.logger.info(`Alertmanager: final resolution for aggregate ${work.aggregateKey}`);
     await ctx.metrics.write("alertmanager.aggregate.final_resolved", 1, {
       alertname: work.alertname,

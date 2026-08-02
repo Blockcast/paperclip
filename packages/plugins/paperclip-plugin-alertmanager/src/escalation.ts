@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
-import { DEFAULT_COVER_DEDUP_WINDOW_MINUTES, DEFAULT_ESCALATION_DEADLINE_MINUTES, STATE_KEYS } from "./constants.js";
+import { DEFAULT_COVER_DEDUP_WINDOW_MINUTES, DEFAULT_ESCALATION_DEADLINE_MINUTES, STATE_KEYS, alertStateRef } from "./constants.js";
 import { resolveIssueRoute } from "./issue-route-resolver.js";
 import { ORIGIN_KIND, type AlertmanagerAlert, type AlertmanagerPluginConfig, type AlertStateRecord } from "./types.js";
 
@@ -380,10 +380,7 @@ async function advanceIssueLadder(
     stateKey: STATE_KEYS.aggregate(companyId, issue.originId),
   };
   const aggregateState = await ctx.state.get(aggregateRef) as AlertStateRecord | null;
-  const legacyRef = {
-    scopeKind: "instance" as const,
-    stateKey: STATE_KEYS.alert(issue.originId),
-  };
+  const legacyRef = alertStateRef(companyId, issue.originId);
   const ref = aggregateState ? aggregateRef : legacyRef;
   const state = aggregateState ?? await ctx.state.get(legacyRef) as AlertStateRecord | null;
   if (!state || state.resolvedAt || state.escalationComplete || !state.nextEscalationAt || Date.parse(state.nextEscalationAt) > now.getTime()) return;

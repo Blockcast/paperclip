@@ -25,6 +25,43 @@ export const STATE_KEYS = {
 } as const;
 
 /**
+ * Scope key for a fingerprint's dedup row (BLO-20467).
+ *
+ * Scoped to the company the tracked issue lives in, NOT `instance`. Alertmanager
+ * fingerprints are derived from alert labels, so two independent tenants running
+ * the same alert rules routinely produce the *same* fingerprint. Under the old
+ * instance scope those collided in one namespace: a firing delivery for company
+ * B would find company A's record and update/re-open A's issue instead of
+ * creating B's, and a B resolution would close A's issue.
+ *
+ * `companyId` here is the company the issue is filed into — the same
+ * `config.defaultCompanyId` that `recoverStateFromIssue` and the escalation
+ * sweep already use as their tenant boundary. Keying on it keeps the module
+ * internally consistent: everything that can reach a record can also construct
+ * its scope. Each tenant resolves it from its own config row, so one tenant
+ * cannot address another's namespace.
+ */
+export function alertStateRef(companyId: string, fingerprint: string) {
+  return {
+    scopeKind: "company" as const,
+    scopeId: companyId,
+    stateKey: STATE_KEYS.alert(fingerprint),
+  };
+}
+
+/**
+ * Pre-BLO-20467 location of the same row: instance scope, shared by every
+ * tenant. Read only to migrate a record into its owning company's scope, and
+ * only when the record itself says it belongs to that company.
+ */
+export function legacyInstanceAlertStateRef(fingerprint: string) {
+  return {
+    scopeKind: "instance" as const,
+    stateKey: STATE_KEYS.alert(fingerprint),
+  };
+}
+
+/**
  * Default severity → priority map. Operators can override via
  * `config.severityToPriority`.
  */

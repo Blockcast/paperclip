@@ -36,7 +36,7 @@ const manifest: PaperclipPluginManifestV1 = {
     // Operator-visible signal
     "metrics.write",
     "activity.log.write",
-    // Secret-ref resolution for the bearer token
+    // Reserved for host-side secret-ref bearer verification once supported.
     "secrets.read-ref",
     // Webhook entrypoint (the plugin is webhook-driven)
     "webhooks.receive",
@@ -62,20 +62,20 @@ const manifest: PaperclipPluginManifestV1 = {
         type: "string",
         title: "Default company id",
         description:
-          "Company that receives alerts when no company-routing label is present.",
+          "Company that receives alerts when no company-routing label is present. Defaults to the company the delivery authenticated as; setting it to a different company is rejected.",
       },
       webhookTokenRef: {
         type: "string",
         format: "secret-ref",
-        title: "Webhook bearer token (secret reference)",
+        title: "Webhook bearer token (secret reference, disabled)",
         description:
-          "Static bearer token Alertmanager sends in the Authorization header. Strongly recommended; without it the webhook endpoint is unauthenticated.",
+          "Disabled in the worker webhook path until the host can verify secret refs before invoking public plugin code. Configure webhookToken instead on this build.",
       },
       webhookToken: {
         type: "string",
-        title: "Webhook bearer token (inline, dev only)",
+        title: "Webhook bearer token",
         description:
-          "Inline bearer token — only for local development. Use webhookTokenRef in production.",
+          "Static bearer token Alertmanager sends in the Authorization header. This is the only enabled worker-side token mechanism on this build.",
       },
       acceptOnlyLabels: {
         type: "object",
@@ -156,11 +156,11 @@ const manifest: PaperclipPluginManifestV1 = {
       },
     },
     // No fields are schema-required: the bootstrap auto-config endpoint
-    // posts a partial config (e.g. only webhookTokenRef) and the worker
-    // tolerates a missing defaultCompanyId — it warns at setup() and
-    // rejects per-alert in webhook-handler.ts. Forcing defaultCompanyId
-    // here previously broke fresh deploys until an operator wrote it
-    // by hand.
+    // posts a partial config (e.g. only webhookToken). A missing
+    // defaultCompanyId is filled in from the delivering company at
+    // resolve time (config-scope.ts), so a fresh deploy files alerts
+    // correctly without an operator writing it by hand. Forcing it here
+    // previously broke fresh deploys outright.
     required: [],
   },
   webhooks: [
