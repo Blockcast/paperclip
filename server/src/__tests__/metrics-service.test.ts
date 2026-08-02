@@ -40,6 +40,12 @@ import {
   recordProcessLost,
   recordProcessLostLivenessNull,
   setExternalLifecycleRunningRuns,
+  EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_METRIC,
+  KNOWN_EXTERNAL_LIFECYCLE_TERMINAL_STATUSES,
+  UNKNOWN_EXTERNAL_LIFECYCLE_TERMINAL_STATUS,
+  computeExternalLifecycleSilenceGapSeconds,
+  normalizeExternalLifecycleTerminalStatus,
+  recordExternalLifecycleRunSilenceGap,
 } from "../services/metrics.js";
 import {
   getDepBlockedMetric,
@@ -616,5 +622,128 @@ describe("recordProcessLostLivenessNull (BLO-16184 denominator #2)", () => {
     recordProcessLostLivenessNull();
     body = (await renderMetrics()).body;
     expect(body).toContain(`${PROCESS_LOST_LIVENESS_NULL_METRIC} 2`);
+  });
+});
+
+describe("computeExternalLifecycleSilenceGapSeconds + recordExternalLifecycleRunSilenceGap (BLO-20815)", () => {
+  const t0 = new Date("2026-08-01T00:00:00.000Z");
+
+  it("registers the histogram so /metrics carries its TYPE line before any event", async () => {
+    const { body } = await renderMetrics();
+    expect(body).toContain(`# TYPE ${EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_METRIC} histogram`);
+  });
+
+  it("uses lastUsefulActionAt when present, ignoring the older lastOutputAt/startedAt", () => {
+    const finalizedAt = new Date(t0.getTime() + 130_000);
+    const gap = computeExternalLifecycleSilenceGapSeconds(
+      {
+        lastUsefulActionAt: t0,
+        lastOutputAt: new Date(t0.getTime() - 60_000),
+        startedAt: new Date(t0.getTime() - 3_600_000),
+      },
+      finalizedAt,
+    );
+    expect(gap).toBe(130);
+  });
+
+  it("falls back to lastOutputAt when lastUsefulActionAt is absent", () => {
+    const finalizedAt = new Date(t0.getTime() + 900_000);
+    const gap = computeExternalLifecycleSilenceGapSeconds(
+      {
+        lastUsefulActionAt: null,
+        lastOutputAt: t0,
+        startedAt: new Date(t0.getTime() - 3_600_000),
+      },
+      finalizedAt,
+    );
+    expect(gap).toBe(900);
+  });
+
+  it("falls back to startedAt when both lastUsefulActionAt and lastOutputAt are absent", () => {
+    const finalizedAt = new Date(t0.getTime() + 2_700_000);
+    const gap = computeExternalLifecycleSilenceGapSeconds(
+      { lastUsefulActionAt: null, lastOutputAt: null, startedAt: t0 },
+      finalizedAt,
+    );
+    expect(gap).toBe(2700);
+  });
+
+  it("returns null when no signal timestamp is available at all (never-started cancelled run)", () => {
+    const gap = computeExternalLifecycleSilenceGapSeconds(
+      { lastUsefulActionAt: null, lastOutputAt: null, startedAt: null },
+      new Date(t0.getTime() + 60_000),
+    );
+    expect(gap).toBeNull();
+  });
+
+  it("clamps to 0 rather than going negative under clock skew", () => {
+    const gap = computeExternalLifecycleSilenceGapSeconds(
+      { lastUsefulActionAt: t0, lastOutputAt: null, startedAt: null },
+      new Date(t0.getTime() - 5_000),
+    );
+    expect(gap).toBe(0);
+  });
+
+  it("keeps every known terminal status and collapses the rest to 'other'", () => {
+    for (const status of KNOWN_EXTERNAL_LIFECYCLE_TERMINAL_STATUSES) {
+      expect(normalizeExternalLifecycleTerminalStatus(status)).toBe(status);
+    }
+    for (const bad of ["interrupted", "queued", "running", "", null, undefined]) {
+      expect(normalizeExternalLifecycleTerminalStatus(bad as string)).toBe(
+        UNKNOWN_EXTERNAL_LIFECYCLE_TERMINAL_STATUS,
+      );
+    }
+  });
+
+  it("observes the histogram at the expected labels and value for each precedence branch", async () => {
+    const labels = recordExternalLifecycleRunSilenceGap({
+      adapter: "claude_k8s",
+      status: "succeeded",
+      run: { lastUsefulActionAt: t0, lastOutputAt: null, startedAt: null },
+      finalizedAt: new Date(t0.getTime() + 300_000),
+    });
+    expect(labels).toEqual({ adapter: "claude_k8s", status: "succeeded", silenceGapSeconds: 300 });
+    const { body } = await renderMetrics();
+    expect(body).toContain(
+      `${EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_METRIC}_sum{adapter="claude_k8s",status="succeeded"} 300`,
+    );
+    expect(body).toContain(
+      `${EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_METRIC}_count{adapter="claude_k8s",status="succeeded"} 1`,
+    );
+    // The 300s observation must fall in the 300 bucket and every larger bucket,
+    // and must NOT be counted in the 60s bucket below it.
+    expect(body).toContain(
+      `${EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_METRIC}_bucket{le="300",adapter="claude_k8s",status="succeeded"} 1`,
+    );
+    expect(body).toContain(
+      `${EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_METRIC}_bucket{le="60",adapter="claude_k8s",status="succeeded"} 0`,
+    );
+  });
+
+  it("collapses an off-list adapter and status to bounded fallbacks", async () => {
+    recordExternalLifecycleRunSilenceGap({
+      adapter: "codex_local",
+      status: "interrupted",
+      run: { lastUsefulActionAt: null, lastOutputAt: null, startedAt: t0 },
+      finalizedAt: new Date(t0.getTime() + 60_000),
+    });
+    const { body } = await renderMetrics();
+    expect(body).toContain(
+      `${EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_METRIC}_count{adapter="other",status="other"} 1`,
+    );
+  });
+
+  it("records nothing for a run with no signal timestamp at all", async () => {
+    const result = recordExternalLifecycleRunSilenceGap({
+      adapter: "claude_k8s",
+      status: "cancelled",
+      run: { lastUsefulActionAt: null, lastOutputAt: null, startedAt: null },
+      finalizedAt: t0,
+    });
+    expect(result).toBeNull();
+    const { body } = await renderMetrics();
+    expect(body).not.toContain(
+      `${EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_METRIC}_count{adapter="claude_k8s",status="cancelled"}`,
+    );
   });
 });
