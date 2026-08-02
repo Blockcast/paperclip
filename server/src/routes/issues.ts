@@ -7,6 +7,7 @@ import type { Db } from "@paperclipai/db";
 import {
   activityLog,
   agents,
+  createDbFromPostgresClient,
   documents,
   executionWorkspaces,
   heartbeatRuns,
@@ -342,6 +343,111 @@ export async function findCreateIssueDuplicateCandidates(
     title: candidate.title,
     score: candidate.score,
   }));
+}
+
+type ReservedPostgresSql = {
+  release: () => void;
+};
+
+type ReservablePostgresClient = {
+  reserve: () => Promise<ReservedPostgresSql>;
+};
+
+function getReservablePostgresClient(db: Db): ReservablePostgresClient | null {
+  const client = (db as Db & { $client?: Partial<ReservablePostgresClient> }).$client;
+  return typeof client?.reserve === "function" ? client as ReservablePostgresClient : null;
+}
+
+async function withReservedCreateIssueAdvisoryDb<T>(
+  db: Db,
+  timeoutMs: number,
+  operation: string,
+  fn: (db: Db) => Promise<T>,
+): Promise<T> {
+  const client = getReservablePostgresClient(db);
+  if (!client) return fn(db);
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const reservePromise = client.reserve();
+  const timeout = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), timeoutMs);
+  });
+  const reserved = await Promise.race([reservePromise, timeout]);
+  if (timer !== undefined) clearTimeout(timer);
+
+  if (!reserved) {
+    void reservePromise
+      .then((lateReserved) => lateReserved.release())
+      .catch((err) => {
+        logger.warn({ err }, `${operation} database connection reservation failed after timeout`);
+      });
+    throw new Error(`${operation} skipped because no database connection was available within ${timeoutMs}ms`);
+  }
+
+  try {
+    const reservedDb = createDbFromPostgresClient(
+      reserved as unknown as Parameters<typeof createDbFromPostgresClient>[0],
+    );
+    return await fn(reservedDb);
+  } finally {
+    reserved.release();
+  }
+}
+
+function scheduleDuplicateCandidateShownActivity(input: {
+  db: Db;
+  res: Response;
+  opts: {
+    createIssueDuplicateCandidateActivityWriter?: typeof logActivity;
+    createIssueDuplicateCandidateActivityTimeoutMs?: number;
+  };
+  companyId: string;
+  issue: { id: string; identifier: string | null };
+  actor: ReturnType<typeof getActorInfo>;
+  duplicateCandidates: CreateIssueDuplicateCandidate[];
+}) {
+  if (input.duplicateCandidates.length === 0) return;
+
+  input.res.once("finish", () => {
+    if (input.res.statusCode < 200 || input.res.statusCode >= 300) return;
+    const timeoutMs = input.opts.createIssueDuplicateCandidateActivityTimeoutMs
+      ?? ISSUE_CREATE_DUPLICATE_CANDIDATE_ACTIVITY_TIMEOUT_MS;
+    void raceCreateIssueDuplicateCandidateLookup(
+      withReservedCreateIssueAdvisoryDb(
+        input.db,
+        timeoutMs,
+        "issue duplicate candidate consumption event",
+        async (advisoryDb) => {
+          await advisoryDb.transaction(async (tx) => {
+            await tx.execute(sql`select set_config('statement_timeout', ${String(timeoutMs)}, true)`);
+            await (input.opts.createIssueDuplicateCandidateActivityWriter ?? logActivity)(tx as unknown as Db, {
+              companyId: input.companyId,
+              actorType: input.actor.actorType,
+              actorId: input.actor.actorId,
+              agentId: input.actor.agentId,
+              runId: input.actor.runId,
+              agentApiKeyId: input.actor.agentApiKeyId,
+              action: "issue.duplicate_candidates_shown",
+              entityType: "company",
+              entityId: input.companyId,
+              details: {
+                identifier: input.issue.identifier,
+                duplicateCandidates: input.duplicateCandidates.map(({ identifier, score }) => ({ identifier, score })),
+              },
+            });
+          });
+        },
+      ),
+      timeoutMs,
+      undefined,
+      "issue duplicate candidate consumption event",
+    ).catch((err) => {
+      logger.warn(
+        { err, companyId: input.companyId, issueId: input.issue.id, issueIdentifier: input.issue.identifier },
+        "issue duplicate candidate consumption event failed; continuing successful create",
+      );
+    });
+  });
 }
 
 const MAX_ISSUE_COMMENT_LIMIT = 500;
@@ -2815,6 +2921,7 @@ export function issueRoutes(
     createIssueDuplicateCandidateActivityWriter?: typeof logActivity;
     createIssueDuplicateCandidateActivityTimeoutMs?: number;
     createIssueDuplicateCandidateCorpusFilter?: CreateIssueDuplicateCandidateCorpusFilter;
+    createIssueBeforeResponseHook?: () => Promise<void>;
   } = {},
 ) {
   const router = Router();
@@ -8448,31 +8555,32 @@ export function issueRoutes(
     let duplicateCandidates: CreateIssueDuplicateCandidate[] = [];
     try {
       const lookupAbortController = new AbortController();
-      duplicateCandidates = await raceCreateIssueDuplicateCandidateLookup((async () => {
-        const canReadCompanyScope = await db.transaction(async (tx) => {
-          await tx.execute(sql`select set_config(
-            'statement_timeout',
-            ${String(opts.createIssueDuplicateCandidateTimeoutMs
-              ?? ISSUE_CREATE_DUPLICATE_CANDIDATE_TIMEOUT_MS)},
-            true
-          )`);
-          return (opts.createIssueDuplicateCandidateCompanyScopeReader
-            ?? ((scopedDb, scopedReq, scopedCompanyId) => (
-              actorCanReadCompanyScope(scopedReq, scopedCompanyId, scopedDb)
-            )))(tx as unknown as Db, req, companyId);
-        });
-        return (opts.createIssueDuplicateCandidateLookup ?? findCreateIssueDuplicateCandidates)(db, companyId, {
-          id: issue.id,
-          identifier: issue.identifier,
-          title: issue.title,
-          description: issue.description,
-        }, opts.createIssueDuplicateCandidateCorpusFilter
-          ?? (canReadCompanyScope
-            ? undefined
-            : (rows, signal, scopedDb) => filterIssuesForActor(req, rows, signal, scopedDb)),
-        lookupAbortController.signal,
-        opts.createIssueDuplicateCandidateTimeoutMs);
-      })(), opts.createIssueDuplicateCandidateTimeoutMs, () => lookupAbortController.abort());
+      const lookupTimeoutMs = opts.createIssueDuplicateCandidateTimeoutMs
+        ?? ISSUE_CREATE_DUPLICATE_CANDIDATE_TIMEOUT_MS;
+      duplicateCandidates = await raceCreateIssueDuplicateCandidateLookup(
+        withReservedCreateIssueAdvisoryDb(db, lookupTimeoutMs, "issue duplicate candidate lookup", async (advisoryDb) => {
+          const canReadCompanyScope = await advisoryDb.transaction(async (tx) => {
+            await tx.execute(sql`select set_config('statement_timeout', ${String(lookupTimeoutMs)}, true)`);
+            return (opts.createIssueDuplicateCandidateCompanyScopeReader
+              ?? ((scopedDb, scopedReq, scopedCompanyId) => (
+                actorCanReadCompanyScope(scopedReq, scopedCompanyId, scopedDb)
+              )))(tx as unknown as Db, req, companyId);
+          });
+          return (opts.createIssueDuplicateCandidateLookup ?? findCreateIssueDuplicateCandidates)(advisoryDb, companyId, {
+            id: issue.id,
+            identifier: issue.identifier,
+            title: issue.title,
+            description: issue.description,
+          }, opts.createIssueDuplicateCandidateCorpusFilter
+            ?? (canReadCompanyScope
+              ? undefined
+              : (rows, signal, scopedDb) => filterIssuesForActor(req, rows, signal, scopedDb)),
+          lookupAbortController.signal,
+          lookupTimeoutMs);
+        }),
+        lookupTimeoutMs,
+        () => lookupAbortController.abort(),
+      );
     } catch (err) {
       logger.warn(
         { err, companyId, issueId: issue.id, issueIdentifier: issue.identifier },
@@ -8521,45 +8629,6 @@ export function issueRoutes(
         }),
       },
     });
-
-    if (duplicateCandidates.length > 0) {
-      try {
-        await raceCreateIssueDuplicateCandidateLookup(
-          db.transaction(async (tx) => {
-            await tx.execute(sql`select set_config(
-              'statement_timeout',
-              ${String(opts.createIssueDuplicateCandidateActivityTimeoutMs
-                ?? ISSUE_CREATE_DUPLICATE_CANDIDATE_ACTIVITY_TIMEOUT_MS)},
-              true
-            )`);
-            await (opts.createIssueDuplicateCandidateActivityWriter ?? logActivity)(tx as unknown as Db, {
-              companyId,
-              actorType: actor.actorType,
-              actorId: actor.actorId,
-              agentId: actor.agentId,
-              runId: actor.runId,
-              agentApiKeyId: actor.agentApiKeyId,
-              action: "issue.duplicate_candidates_shown",
-              entityType: "company",
-              entityId: companyId,
-              details: {
-                identifier: issue.identifier,
-                duplicateCandidates: duplicateCandidates.map(({ identifier, score }) => ({ identifier, score })),
-              },
-            });
-          }),
-          opts.createIssueDuplicateCandidateActivityTimeoutMs
-            ?? ISSUE_CREATE_DUPLICATE_CANDIDATE_ACTIVITY_TIMEOUT_MS,
-          undefined,
-          "issue duplicate candidate consumption event",
-        );
-      } catch (err) {
-        logger.warn(
-          { err, companyId, issueId: issue.id, issueIdentifier: issue.identifier },
-          "issue duplicate candidate consumption event failed; continuing successful create",
-        );
-      }
-    }
 
     if (executionPolicy?.monitor) {
       await logActivity(db, {
@@ -8615,6 +8684,17 @@ export function issueRoutes(
       requestedByActorId: actor.actorId,
     });
     await queueTaskWatchdogEvaluation(issue, actor.runId);
+    await opts.createIssueBeforeResponseHook?.();
+
+    scheduleDuplicateCandidateShownActivity({
+      db,
+      res,
+      opts,
+      companyId,
+      issue,
+      actor,
+      duplicateCandidates,
+    });
 
     res.status(201).json({
       ...issue,
