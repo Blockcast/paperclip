@@ -7,6 +7,7 @@ import {
   classifyManagedAgentPod,
   indexUniqueAgentJobRunStatuses,
   isActiveOrTerminatingAgentPod,
+  jobBlocksDispatch,
   matchExactAgentJob,
   pickDiagnosticPod,
   readContainerDiagnostic,
@@ -59,6 +60,65 @@ describe("classifyAgentJobRunStatus", () => {
       reason: null,
       message: null,
     });
+  });
+});
+
+function jobWithRunLabel(
+  runId: string | null,
+  status?: { active?: number; succeeded?: number; failed?: number } | null,
+): V1Job {
+  return {
+    metadata: {
+      name: "job-1",
+      uid: "uid-1",
+      labels: runId ? { "paperclip.io/run-id": runId } : {},
+    },
+    status: status === null ? undefined : { active: 0, succeeded: 0, failed: 0, ...status },
+  } as unknown as V1Job;
+}
+
+describe("jobBlocksDispatch (BLO-20801)", () => {
+  it("blocks on a Job with no status subresource when its run is not known terminal", () => {
+    const job = jobWithRunLabel("run-live", null);
+    expect(jobBlocksDispatch(job, new Set())).toBe(true);
+  });
+
+  it("no longer blocks on a Job with no status subresource once its run is terminal in the DB", () => {
+    const job = jobWithRunLabel("run-terminal", null);
+    expect(jobBlocksDispatch(job, new Set(["run-terminal"]))).toBe(false);
+  });
+
+  it("blocks on a Job with active/succeeded/failed all zero when its run is not known terminal", () => {
+    const job = jobWithRunLabel("run-live", { active: 0, succeeded: 0, failed: 0 });
+    expect(jobBlocksDispatch(job, new Set())).toBe(true);
+  });
+
+  it("no longer blocks on a Job with all-zero counters once its run is terminal in the DB", () => {
+    const job = jobWithRunLabel("run-terminal", { active: 0, succeeded: 0, failed: 0 });
+    expect(jobBlocksDispatch(job, new Set(["run-terminal"]))).toBe(false);
+  });
+
+  it("does not block on any status shape once the Job's run-id is terminal, even a genuinely active one", () => {
+    // The terminal DB row is the source of truth for BLO-20801's crash-recovery
+    // case; a stale/lagging Job status must not override it. Real liveness for
+    // a straggling pod is covered separately by the terminating-pod probe.
+    const job = jobWithRunLabel("run-terminal", { active: 1, succeeded: 0, failed: 0 });
+    expect(jobBlocksDispatch(job, new Set(["run-terminal"]))).toBe(false);
+  });
+
+  it("still blocks on a live Job mapped to a live (non-terminal) run", () => {
+    const job = jobWithRunLabel("run-live", { active: 1, succeeded: 0, failed: 0 });
+    expect(jobBlocksDispatch(job, new Set(["some-other-terminal-run"]))).toBe(true);
+  });
+
+  it("treats a Job with no run-id label as unaffected by the terminal-run set", () => {
+    const job = jobWithRunLabel(null, null);
+    expect(jobBlocksDispatch(job, new Set(["run-terminal"]))).toBe(true);
+  });
+
+  it("does not block a genuinely completed Job (succeeded, no active) regardless of terminal-run set", () => {
+    const job = jobWithRunLabel("run-live", { active: 0, succeeded: 1, failed: 0 });
+    expect(jobBlocksDispatch(job, new Set())).toBe(false);
   });
 });
 
