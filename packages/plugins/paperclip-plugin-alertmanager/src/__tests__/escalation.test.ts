@@ -299,11 +299,26 @@ describe("alert escalation", () => {
 
   it("clears the escalation schedule when an alert resolves", async () => {
     const state = { paperclipIssueId: "issue-1", paperclipCompanyId: "company-1", assigneeUserId: null, assigneeAgentId: "engineer", alertname: "SyntheticAlert", severity: "critical", firstSeenAt: "x", lastFiredAt: "x", resolvedAt: null, nextEscalationAt: "2026-07-11T01:00:00Z", escalationAttempt: 1 };
-    const mocks = { state: { get: vi.fn(async () => state), set: vi.fn(async () => undefined) }, issues: { get: vi.fn(async () => ({ id: "issue-1", status: "todo" })), update: vi.fn(async () => ({})), createComment: vi.fn() }, events: { emit: vi.fn() }, metrics: { write: vi.fn() }, logger: { info: vi.fn(), warn: vi.fn() } };
+    const mocks = {
+      state: { get: vi.fn(async () => state), set: vi.fn(async () => undefined) },
+      issues: {
+        get: vi.fn(async () => ({ id: "issue-1", status: "todo" })),
+        update: vi.fn(async () => ({})),
+        createComment: vi.fn(),
+      },
+      db: {
+        namespace: "alertmanager",
+        execute: vi.fn(async () => ({ rowCount: 0 })),
+        query: vi.fn(async () => []),
+      },
+      events: { emit: vi.fn() },
+      metrics: { write: vi.fn() },
+      logger: { info: vi.fn(), warn: vi.fn() },
+    };
     await handleResolved(mocks as unknown as PluginContext, config(), { ...alert(), status: "resolved", endsAt: "2026-07-11T02:00:00Z" });
     expect(mocks.state.set).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ escalationComplete: true, nextEscalationAt: null }));
-    // no `ctx.db` on this mock — the cover cascade must be swallowed, not crash the resolve.
-    expect(mocks.logger.warn).toHaveBeenCalled();
+    expect(mocks.db.execute).toHaveBeenCalled();
+    expect(mocks.logger.warn).not.toHaveBeenCalled();
   });
 
   it("advances the ladder and posts exactly one comment even when the wake is refused", async () => {

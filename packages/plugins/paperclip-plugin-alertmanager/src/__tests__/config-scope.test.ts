@@ -22,7 +22,7 @@ import type { PluginContext } from "@paperclipai/plugin-sdk";
 
 const COMPANY_A = "aaced805-3491-4ee5-9b14-cdf70cb81d47";
 const TOKEN = "a".repeat(64);
-const SECRET_REF = { type: "secret_ref" as const, secretId: "6ec73a80-dead-beef-0000-000000000001" };
+const SECRET_REF = "6ec73a80-dead-beef-0000-000000000001";
 
 const mkCtx = (overrides: {
   configByCompany?: Record<string, Record<string, unknown>>;
@@ -66,44 +66,42 @@ describe("isEmptyConfig", () => {
 
 describe("resolveWebhookToken", () => {
   it("returns the inline dev-mode token when no ref is set", async () => {
-    const { ctx } = mkCtx();
+    const { ctx, mocks } = mkCtx();
     await expect(resolveWebhookToken(ctx, inlineConfig(), COMPANY_A)).resolves.toBe(TOKEN);
+    expect(mocks.secrets.resolve).not.toHaveBeenCalled();
   });
 
-  it("resolves a secret ref scoped to the delivering company", async () => {
+  it("fails closed for secret refs without consuming secret-resolution capacity", async () => {
     const { ctx, mocks } = mkCtx({ resolveSecret: async () => TOKEN });
-    const config = { webhookTokenRef: SECRET_REF } as unknown as AlertmanagerPluginConfig;
-
-    await expect(resolveWebhookToken(ctx, config, COMPANY_A)).resolves.toBe(TOKEN);
-    expect(mocks.secrets.resolve).toHaveBeenCalledWith(SECRET_REF, { companyId: COMPANY_A });
-  });
-
-  it("fails RETRYABLY when a configured ref cannot be resolved", async () => {
-    // Regression: this used to return null, which `handleWebhook` reports as
-    // WebhookUnauthorizedError. Failing to load the expected token is not
-    // evidence that the presented token is wrong — reporting it as
-    // `unauthorized` writes a false auth-failure metric and buries the real
-    // secrets error. Transient and permanent resolve failures are treated
-    // alike because the host collapses both to a JSON-RPC INTERNAL_ERROR with
-    // no status to classify on.
-    const { ctx, mocks } = mkCtx({
-      resolveSecret: async () => {
-        throw new Error('Invalid secret reference for plugin. Use { type: "secret_ref", secretId }');
-      },
-    });
-    const config = { webhookTokenRef: "bare-uuid-string" } as unknown as AlertmanagerPluginConfig;
+    const config = { webhookTokenRef: SECRET_REF } as AlertmanagerPluginConfig;
 
     await expect(resolveWebhookToken(ctx, config, COMPANY_A)).rejects.toThrow(
       CompanyScopeUnavailableError,
     );
+    expect(mocks.secrets.resolve).not.toHaveBeenCalled();
     expect(mocks.logger.error).toHaveBeenCalled();
   });
 
-  it("propagates a secret-provider outage out of resolveCompanyScope so the delivery is retried", async () => {
-    // Boundary test: the failure must survive the whole scope-resolution path,
-    // not just the leaf helper, because that is what reaches onWebhook and
-    // decides the host's delivery status.
-    const { ctx } = mkCtx({
+  it("uses an inline token without touching a configured ref", async () => {
+    const { ctx, mocks } = mkCtx({
+      resolveSecret: async () => {
+        throw new Error("secret provider must not be reached from public auth");
+      },
+    });
+    const config = {
+      webhookToken: TOKEN,
+      webhookTokenRef: SECRET_REF,
+    } as AlertmanagerPluginConfig;
+
+    await expect(resolveWebhookToken(ctx, config, COMPANY_A)).resolves.toBe(TOKEN);
+    expect(mocks.secrets.resolve).not.toHaveBeenCalled();
+  });
+
+  it("propagates unsupported secret-ref config out of resolveCompanyScope without resolving it", async () => {
+    // Secret refs require host-side verification before the worker is invoked.
+    // Resolving them here lets unauthenticated public requests spend the
+    // shared per-company secret-resolution budget before bearer verification.
+    const { ctx, mocks } = mkCtx({
       configByCompany: {
         [COMPANY_A]: { defaultCompanyId: COMPANY_A, webhookTokenRef: SECRET_REF },
       },
@@ -115,6 +113,7 @@ describe("resolveWebhookToken", () => {
     await expect(resolveCompanyScope(ctx, COMPANY_A)).rejects.toThrow(
       CompanyScopeUnavailableError,
     );
+    expect(mocks.secrets.resolve).not.toHaveBeenCalled();
   });
 
   it("warns and returns null when neither token nor ref is configured", async () => {

@@ -52,8 +52,8 @@ Configured per-instance via the host's plugin settings UI. Schema lives in
 | Key                  | Type    | Required | Notes |
 |----------------------|---------|----------|-------|
 | `defaultCompanyId`   | string  | no       | Company that receives alerts when no routing label is set. Defaults to the delivering company; must match it when set. |
-| `webhookTokenRef`    | secret-ref | recommended | Static bearer token. AM sends `Authorization: Bearer <token>`. |
-| `webhookToken`       | string  | dev only | Inline token; use `webhookTokenRef` in production. |
+| `webhookToken`       | string  | for accepted deliveries | Static bearer token. AM sends `Authorization: Bearer <token>`. |
+| `webhookTokenRef`    | secret-ref | no       | Disabled in the worker webhook path until the host can verify secret refs before invoking public plugin code. Configured refs fail closed. |
 | `acceptOnlyLabels`   | object  | no       | Accept-only label filter, e.g. `{ paperclip: "true" }`. |
 | `severityToPriority` | object  | no       | Override the default severity map. |
 | `autoCloseOnResolve` | boolean | no       | Defaults to true (status → cancelled). Set false for comment-only. |
@@ -83,7 +83,7 @@ route:
 
 ```yaml
 defaultCompanyId: 11111111-1111-1111-1111-111111111111
-webhookTokenRef: paperclip-alertmanager-token  # secret UUID, not the raw value
+webhookToken: "<same bearer token Alertmanager sends>"
 acceptOnlyLabels:
   paperclip: "true"
 severityToPriority:
@@ -195,17 +195,21 @@ ending in `_url` is ignored.
 
 ## Security
 
-- **Always set `webhookTokenRef` in production.** Without a token the
+- **Always set `webhookToken`.** Without a token the
   webhook endpoint rejects every request — there is no "open" mode.
+- **Do not configure `webhookTokenRef` on this build.** Secret refs require a
+  host-side verifier so invalid public requests cannot spend shared
+  secret-resolution capacity before authentication. Until that host path exists,
+  configured refs fail closed and deliveries are retried instead of accepted.
 - **IP allowlist at ingress** as defense in depth. Alertmanager pods reschedule on
   restart and their pod IP changes; allowlist the namespace's pod CIDR
   rather than per-pod IPs.
 - **mTLS is the V2 upgrade path** for stronger mutual auth (spec §11 Q4).
   Static bearer is V1 because it's the lowest-friction way to get rolling.
-- The bearer token is kept in worker memory only — never written to plugin
-  state, never logged. It is resolved **per delivery**, not cached, so a
-  rotated secret takes effect on the next request and a restart can never
-  leave the worker holding a stale (or absent) token.
+- The bearer token is read from the delivering company's config **per
+  delivery** and is never written to plugin state or logs. A config update takes
+  effect on the next request, and a restart can never leave the worker holding a
+  stale (or absent) token.
 
 ### Config is resolved per delivery, per company
 
@@ -293,13 +297,9 @@ the old one (or vice versa):
    `monitoring/alertmanager-receivers` key `bearer-token`. AM picks up the
    change automatically on its next config reload (`POST /-/reload` if
    you want to force it).
-3. Rotate the paperclip secret-store entry referenced by
-   `webhookTokenRef`. Use the secrets REST API
-   (`POST /api/companies/:companyId/secrets/:secretId/rotate`) or, if you
-   have direct DB access and the `local_encrypted` master key, append a
-   new `company_secret_versions` row and bump
-   `company_secrets.latest_version`. Plugin worker re-resolves on next
-   webhook delivery — no restart needed.
+3. Update the plugin instance config `webhookToken` to the same new value.
+   The worker reads company config on each webhook delivery, so no worker
+   restart is required.
 4. (Defense in depth) Patch the second K8s `Secret`
    `paperclip/paperclip-alertmanager-webhook-token` so the env-driven
    `autoConfigureAlertmanagerFromEnv` bootstrap helper can re-seed a

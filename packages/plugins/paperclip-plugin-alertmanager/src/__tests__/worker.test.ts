@@ -106,7 +106,13 @@ interface MockClients {
     get: ReturnType<typeof vi.fn>;
     create: ReturnType<typeof vi.fn>;
     update: ReturnType<typeof vi.fn>;
+    listComments: ReturnType<typeof vi.fn>;
     createComment: ReturnType<typeof vi.fn>;
+  };
+  db: {
+    namespace: string;
+    execute: ReturnType<typeof vi.fn>;
+    query: ReturnType<typeof vi.fn>;
   };
   events: { emit: ReturnType<typeof vi.fn> };
   metrics: { write: ReturnType<typeof vi.fn> };
@@ -135,7 +141,13 @@ const mkCtx = (): { ctx: PluginContext; mocks: MockClients } => {
       get: vi.fn(async () => null),
       create: vi.fn(async () => ({ id: "issue-1" })),
       update: vi.fn(async () => ({ id: "issue-1" })),
+      listComments: vi.fn(async () => []),
       createComment: vi.fn(async () => ({ id: "comment-1" })),
+    },
+    db: {
+      namespace: "alertmanager",
+      execute: vi.fn(async () => ({ rowCount: 0 })),
+      query: vi.fn(async () => []),
     },
     events: { emit: vi.fn(async () => {}) },
     metrics: { write: vi.fn(async () => {}) },
@@ -639,6 +651,10 @@ describe("handleWebhook — resolved", () => {
 
     await handleWebhook(ctx, config, TOKEN, baseInput({ parsedBody: envelope }));
 
+    expect(mocks.issues.listComments).toHaveBeenCalledWith(
+      "issue-existing",
+      "company-1",
+    );
     expect(mocks.issues.createComment).toHaveBeenCalledWith(
       "issue-existing",
       "Alert resolved at 2026-04-29T10:00:00Z.",
@@ -648,6 +664,50 @@ describe("handleWebhook — resolved", () => {
     expect(mocks.events.emit).toHaveBeenCalledWith(
       "alertmanager.alert.resolved",
       "company-1",
+      expect.objectContaining({
+        paperclipIssueId: "issue-existing",
+        resolvedAt: "2026-04-29T10:00:00Z",
+      }),
+    );
+  });
+
+  it("does not duplicate an existing resolved comment on retry", async () => {
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ autoCloseOnResolve: false });
+    const existing: AlertStateRecord = {
+      paperclipIssueId: "issue-existing",
+      paperclipCompanyId: "company-1",
+      assigneeUserId: null,
+      assigneeAgentId: null,
+      alertname: "CiliumPolicyDropsHigh",
+      severity: "critical",
+      firstSeenAt: "2026-04-29T08:00:00Z",
+      lastFiredAt: "2026-04-29T08:00:00Z",
+      resolvedAt: null,
+    };
+    mocks.state.get.mockResolvedValueOnce(existing);
+    mocks.issues.listComments.mockResolvedValueOnce([
+      { body: "Alert resolved at 2026-04-29T10:00:00Z." },
+    ]);
+
+    const resolvedAlert = baseAlert({
+      status: "resolved",
+      endsAt: "2026-04-29T10:00:00Z",
+    });
+    const envelope = baseEnvelope({
+      status: "resolved",
+      alerts: [resolvedAlert],
+    });
+
+    await handleWebhook(ctx, config, TOKEN, baseInput({ parsedBody: envelope }));
+
+    expect(mocks.issues.createComment).not.toHaveBeenCalled();
+    expect(mocks.state.set).toHaveBeenCalledWith(
+      {
+        scopeKind: "company",
+        scopeId: "company-1",
+        stateKey: "alert:9a3b1e4c5f6d7890",
+      },
       expect.objectContaining({
         paperclipIssueId: "issue-existing",
         resolvedAt: "2026-04-29T10:00:00Z",
@@ -689,6 +749,123 @@ describe("handleWebhook — resolved", () => {
       "company-1",
     );
     expect(mocks.issues.createComment).not.toHaveBeenCalled();
+  });
+
+  it("fails the delivery without marking resolved when issue cancellation fails", async () => {
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ autoCloseOnResolve: true });
+    const existing: AlertStateRecord = {
+      paperclipIssueId: "issue-existing",
+      paperclipCompanyId: "company-1",
+      assigneeUserId: null,
+      assigneeAgentId: null,
+      alertname: "CiliumPolicyDropsHigh",
+      severity: "critical",
+      firstSeenAt: "2026-04-29T08:00:00Z",
+      lastFiredAt: "2026-04-29T08:00:00Z",
+      resolvedAt: null,
+    };
+    mocks.state.get.mockResolvedValueOnce(existing);
+    mocks.issues.get.mockResolvedValueOnce({ id: "issue-existing", status: "todo" });
+    mocks.issues.update.mockRejectedValueOnce(new Error("issues.update RPC unavailable"));
+
+    const resolvedAlert = baseAlert({
+      status: "resolved",
+      endsAt: "2026-04-29T10:00:00Z",
+    });
+    const envelope = baseEnvelope({
+      status: "resolved",
+      alerts: [resolvedAlert],
+    });
+
+    await expect(
+      handleWebhook(ctx, config, TOKEN, baseInput({ parsedBody: envelope })),
+    ).rejects.toBeInstanceOf(AlertDeliveryIncompleteError);
+    expect(mocks.state.set).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ resolvedAt: "2026-04-29T10:00:00Z" }),
+    );
+  });
+
+  it("fails the delivery without marking resolved when the resolution comment fails", async () => {
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ autoCloseOnResolve: false });
+    const existing: AlertStateRecord = {
+      paperclipIssueId: "issue-existing",
+      paperclipCompanyId: "company-1",
+      assigneeUserId: null,
+      assigneeAgentId: null,
+      alertname: "CiliumPolicyDropsHigh",
+      severity: "critical",
+      firstSeenAt: "2026-04-29T08:00:00Z",
+      lastFiredAt: "2026-04-29T08:00:00Z",
+      resolvedAt: null,
+    };
+    mocks.state.get.mockResolvedValueOnce(existing);
+    mocks.issues.createComment.mockRejectedValueOnce(
+      new Error("issues.createComment RPC unavailable"),
+    );
+
+    const resolvedAlert = baseAlert({
+      status: "resolved",
+      endsAt: "2026-04-29T10:00:00Z",
+    });
+    const envelope = baseEnvelope({
+      status: "resolved",
+      alerts: [resolvedAlert],
+    });
+
+    await expect(
+      handleWebhook(ctx, config, TOKEN, baseInput({ parsedBody: envelope })),
+    ).rejects.toBeInstanceOf(AlertDeliveryIncompleteError);
+    expect(mocks.issues.listComments).toHaveBeenCalledWith(
+      "issue-existing",
+      "company-1",
+    );
+    expect(mocks.state.set).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ resolvedAt: "2026-04-29T10:00:00Z" }),
+    );
+  });
+
+  it("fails the delivery without marking resolved when cover cleanup fails", async () => {
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ autoCloseOnResolve: false });
+    const existing: AlertStateRecord = {
+      paperclipIssueId: "issue-existing",
+      paperclipCompanyId: "company-1",
+      assigneeUserId: null,
+      assigneeAgentId: null,
+      alertname: "CiliumPolicyDropsHigh",
+      severity: "critical",
+      firstSeenAt: "2026-04-29T08:00:00Z",
+      lastFiredAt: "2026-04-29T08:00:00Z",
+      resolvedAt: null,
+    };
+    mocks.state.get.mockResolvedValueOnce(existing);
+    mocks.db.execute.mockRejectedValueOnce(new Error("cover DB unavailable"));
+
+    const resolvedAlert = baseAlert({
+      status: "resolved",
+      endsAt: "2026-04-29T10:00:00Z",
+    });
+    const envelope = baseEnvelope({
+      status: "resolved",
+      alerts: [resolvedAlert],
+    });
+
+    await expect(
+      handleWebhook(ctx, config, TOKEN, baseInput({ parsedBody: envelope })),
+    ).rejects.toBeInstanceOf(AlertDeliveryIncompleteError);
+    expect(mocks.issues.createComment).toHaveBeenCalledWith(
+      "issue-existing",
+      "Alert resolved at 2026-04-29T10:00:00Z.",
+      "company-1",
+    );
+    expect(mocks.state.set).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ resolvedAt: "2026-04-29T10:00:00Z" }),
+    );
   });
 
   it("cancels the issue when autoCloseOnResolve is omitted", async () => {

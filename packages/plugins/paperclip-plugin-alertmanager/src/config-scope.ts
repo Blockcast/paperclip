@@ -76,39 +76,19 @@ export function isEmptyConfig(
 }
 
 /**
- * Resolve the bearer token this company's webhook endpoint should accept.
- *
- * Resolved per delivery rather than cached: the SDK contract for
- * `ctx.secrets.resolve` is that secret values "must never be cached or written
- * to logs, config, or other persistent storage" — and a cached token is
- * exactly what let a worker restart silently disable auth for every company.
- *
- * `webhookTokenRef` is the production posture; `webhookToken` is the
- * documented dev-mode inline fallback.
+ * Resolve the inline bearer token this company's webhook endpoint should accept.
  *
  * Returns `null` ONLY when this company has configured no credential at all.
  * That is a determinate answer — nothing can authenticate against an endpoint
  * with no token — so the caller is right to reject the delivery.
  *
- * A *failure to resolve* a configured ref is a different thing entirely, and is
- * raised rather than returned. `ctx.secrets.resolve` is typed `Promise<string>`
- * and signals every failure by throwing, so a caught error means we do not know
- * what the expected token is. Not knowing the expected credential is not
- * evidence that the presented one is wrong: reporting it as `unauthorized`
- * writes a false `alertmanager.webhook.unauthorized` metric — the exact signal
- * an operator reads as "someone is sending bad credentials" — and records
- * "unauthorized" on the delivery row instead of the real secrets error, sending
- * an incident investigation in the wrong direction.
- *
- * Transient (provider outage) and permanent (malformed ref) failures are
- * deliberately treated alike, because they are not distinguishable here: the
- * host collapses every worker→host handler error to a JSON-RPC
- * `INTERNAL_ERROR` with only a message string (`plugin-worker-manager.ts`
- * `errorCodeForWorkerHostError`), discarding the originating HTTP status. Given
- * that, failing retryably is the safe default in both directions — a permanent
- * misconfiguration surfaces as repeated `failed` deliveries carrying the real
- * error text, which is louder and more diagnostic than a silent 401, while a
- * transient outage keeps the alert alive.
+ * `webhookTokenRef` is intentionally not resolved in the worker's public
+ * webhook path. Invalid public deliveries would otherwise force one
+ * `ctx.secrets.resolve` operation before authentication, letting unauthenticated
+ * traffic spend the shared secret-resolution budget. A secret-ref production
+ * posture needs a host-side verifier that can authenticate before invoking the
+ * worker. Until that exists, secret refs fail closed and inline tokens remain
+ * the only enabled worker-side authentication mechanism.
  */
 export async function resolveWebhookToken(
   ctx: PluginContext,
@@ -116,19 +96,15 @@ export async function resolveWebhookToken(
   companyId?: string,
 ): Promise<string | null> {
   const forCompany = companyId ? ` for company ${companyId}` : "";
-  if (config.webhookTokenRef) {
-    try {
-      return await ctx.secrets.resolve(config.webhookTokenRef, { companyId });
-    } catch (err) {
-      ctx.logger.error(
-        `paperclip-plugin-alertmanager: failed to resolve webhookTokenRef${forCompany}: ${String(err)}`,
-      );
-      throw new CompanyScopeUnavailableError(
-        `could not resolve webhookTokenRef${forCompany}: ${String(err)}`,
-      );
-    }
-  }
   if (config.webhookToken) return config.webhookToken;
+  if (config.webhookTokenRef) {
+    ctx.logger.error(
+      `paperclip-plugin-alertmanager: webhookTokenRef is configured${forCompany}, but secret-ref webhook auth requires host-side verification before the worker is invoked`,
+    );
+    throw new CompanyScopeUnavailableError(
+      `webhookTokenRef${forCompany} requires host-side webhook verification`,
+    );
+  }
   ctx.logger.warn(
     `paperclip-plugin-alertmanager: no webhookToken or webhookTokenRef configured${forCompany} — webhook endpoint will reject every request`,
   );
@@ -143,8 +119,8 @@ export interface CompanyScope {
 /**
  * Raised when this delivery's company scope could not be established for a
  * reason that may not still hold on a retry — a failed config RPC, a company
- * with no stored config yet, or a configured `webhookTokenRef` that could not
- * be resolved.
+ * with no stored config yet, or a configured `webhookTokenRef` on a build that
+ * requires host-side verification before secret refs can be used safely.
  *
  * It must propagate out of `onWebhook`. Returning normally makes the host record
  * the delivery `success` and answer HTTP 200 (`server/src/routes/plugins.ts`

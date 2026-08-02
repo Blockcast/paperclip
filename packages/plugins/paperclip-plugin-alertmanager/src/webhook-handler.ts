@@ -403,6 +403,18 @@ export async function handleFiring(
  * §8.2 — alert cleared. If we have state for the fingerprint, close or
  * comment per `autoCloseOnResolve`. If not, log and drop.
  */
+async function ensureResolutionComment(
+  ctx: PluginContext,
+  issueId: string,
+  companyId: string,
+  resolvedAt: string,
+) {
+  const body = `Alert resolved at ${resolvedAt}.`;
+  const comments = await ctx.issues.listComments(issueId, companyId);
+  if (comments.some((comment) => comment.body === body)) return;
+  await ctx.issues.createComment(issueId, body, companyId);
+}
+
 export async function handleResolved(
   ctx: PluginContext,
   config: AlertmanagerPluginConfig,
@@ -433,29 +445,24 @@ export async function handleResolved(
   const resolvedAt = alert.endsAt || new Date().toISOString();
   const alertname = existing.alertname;
 
-  try {
-    if (config.autoCloseOnResolve !== false) {
-      const issue = await ctx.issues.get(
+  if (config.autoCloseOnResolve !== false) {
+    const issue = await ctx.issues.get(
+      existing.paperclipIssueId,
+      existing.paperclipCompanyId,
+    );
+    if (issue && issue.status !== "done" && issue.status !== "cancelled") {
+      await ctx.issues.update(
         existing.paperclipIssueId,
-        existing.paperclipCompanyId,
-      );
-      if (issue && issue.status !== "done" && issue.status !== "cancelled") {
-        await ctx.issues.update(
-          existing.paperclipIssueId,
-          { status: "cancelled" },
-          existing.paperclipCompanyId,
-        );
-      }
-    } else {
-      await ctx.issues.createComment(
-        existing.paperclipIssueId,
-        `Alert resolved at ${resolvedAt}.`,
+        { status: "cancelled" },
         existing.paperclipCompanyId,
       );
     }
-  } catch (err) {
-    ctx.logger.warn(
-      `Failed to apply resolution to issue ${existing.paperclipIssueId}: ${String(err)}`,
+  } else {
+    await ensureResolutionComment(
+      ctx,
+      existing.paperclipIssueId,
+      existing.paperclipCompanyId,
+      resolvedAt,
     );
   }
 
@@ -465,13 +472,7 @@ export async function handleResolved(
   // exhausted because the alert kept firing, not because the underlying
   // issue's status policy says so, so a resolved alert means its membership
   // in the shared cover is done either way.
-  try {
-    await recordSourceResolvedAndCloseCovers(ctx, existing.paperclipCompanyId, existing.paperclipIssueId);
-  } catch (err) {
-    ctx.logger.warn(
-      `Failed to record resolution against escalation covers for issue ${existing.paperclipIssueId}: ${String(err)}`,
-    );
-  }
+  await recordSourceResolvedAndCloseCovers(ctx, existing.paperclipCompanyId, existing.paperclipIssueId);
 
   const updated: AlertStateRecord = {
     ...existing,
