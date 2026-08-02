@@ -85,6 +85,7 @@ describeEmbeddedPostgres("heartbeat worker-crash marking and recovery convergenc
     beforeProcessLossRetryEnqueueForTest?: (run: typeof heartbeatRuns.$inferSelect) => Promise<void> | void;
     afterRunEventAppendedInTransactionForTest?: (run: typeof heartbeatRuns.$inferSelect) => Promise<void> | void;
     beforeCrashRecoveryTerminalWriteForTest?: (run: typeof heartbeatRuns.$inferSelect) => Promise<void> | void;
+    beforeCrashRecoveryAgentLoadForTest?: (run: typeof heartbeatRuns.$inferSelect) => Promise<void> | void;
     workerCrashRecoveryProviderTimeoutMsForTest?: number;
   } = {}) {
     // skipQueuedRunDispatch keeps issue promotion from spawning background
@@ -869,5 +870,126 @@ describeEmbeddedPostgres("heartbeat worker-crash marking and recovery convergenc
     expect(afterNewer.crashRecoveryNextAttemptAt!.getTime()).toBe(
       batchStart.getTime() + 2 * STALL_MS + BACKOFF_BASE_MS,
     );
+  });
+
+  // ---- (i) a failed REQUIRED pre-retry step must stop the retry ------------
+
+  it("does not queue a retry while required pre-retry cleanup is still incomplete", async () => {
+    // `wakeup_cancel` and `environment_leases` each retire a claim the dead run
+    // still holds on a resource the retry is about to take over. Recording them
+    // `incomplete` withholds the completion marker, but a withheld marker only
+    // schedules a replay — it does not retract a retry that has already been
+    // created. So before this fix, a lease left `active` (or a wakeup left
+    // `queued`) still produced a replacement run: queued against an environment
+    // the dead run had not released, and racing a wake that was still runnable.
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const run = await seedCrashMarkedRun({ companyId, agentId, finishedAt: new Date(Date.now() - 60_000) });
+    const issueId = "33333333-3333-3333-3333-333333333333";
+    await db
+      .update(heartbeatRuns)
+      .set({ contextSnapshot: { issueId } })
+      .where(eq(heartbeatRuns.id, run.id));
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Pre-retry cleanup gate issue",
+      status: "in_progress",
+      executionRunId: run.id,
+      executionLockedAt: new Date(Date.now() - 60_000),
+    });
+
+    const broken = service({ environmentRuntime: failingEnvironmentRuntime() });
+    const first = await broken.reconcileWorkerCrashedRuns();
+
+    expect(first.reconciledRunIds).toEqual([]);
+    expect(first.unresolvedRunIds).toEqual([run.id]);
+    const afterFailure = await readRun(run.id);
+    expect(afterFailure.crashRecoveryLastError).toContain("environment_leases");
+    // The load-bearing assertion: no replacement run exists yet.
+    expect(await retriesOf(run.id)).toHaveLength(0);
+    // And the issue lock is still the original run's — not released, and not
+    // handed to a retry that was deliberately not created.
+    const [issueAfterFailure] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(issueAfterFailure!.executionRunId).toBe(run.id);
+
+    // Once the provider is healthy the replay creates the retry exactly once.
+    const healthy = service();
+    const second = await healthy.reconcileWorkerCrashedRuns({
+      now: new Date(afterFailure.crashRecoveryNextAttemptAt!.getTime() + 1000),
+    });
+
+    expect(second.reconciledRunIds).toEqual([run.id]);
+    const retries = await retriesOf(run.id);
+    expect(retries).toHaveLength(1);
+    const [issueAfterRecovery] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(issueAfterRecovery!.executionRunId).toBe(retries[0]!.id);
+  });
+
+  // ---- (j) the stale-lock sweeper racing the issue-lock hand-over ----------
+
+  it("does not report the retry as owning an issue lock the sweeper cleared first", async () => {
+    // `sweepStaleIssueLocks` treats a lock held by a terminal run as cleanable,
+    // and a crash-marked run is `interrupted` — terminal for the whole duration
+    // of its own recovery. Run concurrently with reconciliation it can clear the
+    // lock in the window between terminalizing the run and handing the lock to
+    // the retry. That hand-over is a guarded UPDATE
+    // (`execution_run_id = <original run>`), so it silently matches zero rows —
+    // yet `enqueueProcessLossRetry` still reported `created`, and recovery then
+    // recorded `issue_release: skipped ("retry owns the issue lock")` for a lock
+    // the retry never acquired, leaving the issue stranded.
+    //
+    // Forced overlap rather than hopeful concurrency: clearing the lock from the
+    // pre-enqueue hook lands it exactly in the window, every run.
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const run = await seedCrashMarkedRun({ companyId, agentId, finishedAt: new Date(Date.now() - 60_000) });
+    const issueId = "44444444-4444-4444-4444-444444444444";
+    await db
+      .update(heartbeatRuns)
+      .set({ contextSnapshot: { issueId } })
+      .where(eq(heartbeatRuns.id, run.id));
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Sweeper overlap issue",
+      status: "in_progress",
+      checkoutRunId: run.id,
+      executionRunId: run.id,
+      executionLockedAt: new Date(Date.now() - 60_000),
+    });
+
+    let sweptOnce = false;
+    const raced = service({
+      beforeProcessLossRetryEnqueueForTest: async () => {
+        if (sweptOnce) return;
+        sweptOnce = true;
+        // Stand in for the sweeper clearing this terminal run's execution lock.
+        await db
+          .update(issues)
+          .set({ executionRunId: null, executionLockedAt: null })
+          .where(eq(issues.id, issueId));
+      },
+    });
+
+    const result = await raced.reconcileWorkerCrashedRuns();
+
+    expect(sweptOnce).toBe(true);
+    const retries = await retriesOf(run.id);
+    expect(retries).toHaveLength(1);
+
+    const [issueAfter] = await db.select().from(issues).where(eq(issues.id, issueId));
+    // The guarded hand-over cannot have landed — it filters on a lock that no
+    // longer pointed at `run`, so the retry does not own the issue.
+    expect(issueAfter!.executionRunId).not.toBe(retries[0]!.id);
+
+    // The discriminating assertion. Pre-fix, recovery inferred ownership from
+    // the retry merely existing and recorded `issue_release: skipped`, so the
+    // release never ran and this stayed pinned to the dead run. Post-fix the
+    // release runs — it is a no-op on the execution lock we no longer hold, but
+    // it still clears this run's stale checkout and runs promotion.
+    expect(issueAfter!.checkoutRunId).toBeNull();
+
+    // Still converges: no orphan replay, no poison row.
+    expect(result.reconciledRunIds).toEqual([run.id]);
+    expect((await readRun(run.id)).crashRecoveryCompletedAt).not.toBeNull();
   });
 });

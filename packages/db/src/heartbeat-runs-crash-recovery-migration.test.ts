@@ -197,6 +197,58 @@ describeEmbeddedPostgres("heartbeat-run crash-recovery migration phases", () => 
     });
   }, 120_000);
 
+  it("keeps phase A durable when 0209 raises on a genuinely pre-0208 database, so the repair hint is followable", async () => {
+    // Review round 3 argued that 0209's malformed-index RAISE rolls phase A
+    // back, leaving the hinted `CREATE INDEX CONCURRENTLY` referencing a column
+    // that no longer exists — an unfollowable instruction. That is true of
+    // drizzle's own migrator, which wraps every pending file in ONE
+    // transaction, but it is not the migrator this repo runs. Production goes
+    // `pnpm db:migrate` -> packages/db/src/migrate.ts -> applyPendingMigrations
+    // -> applyPendingMigrationsManually, which opens a transaction PER FILE and
+    // commits that file's history row before starting the next. drizzle's
+    // batch migrator is reached only on an empty database with no journal,
+    // where this branch cannot fire because the table is empty.
+    //
+    // This test pins that difference, because the hint's correctness depends on
+    // it: if the runner is ever switched to the batch migrator, phase A stops
+    // surviving and this fails, which is the signal to reorder the hint.
+    //
+    // Setup is genuinely pre-0208 — no crash_recovery_* columns at all. The
+    // malformed index therefore cannot reference one, so it is a same-name
+    // index over a predicate that is buildable without them.
+    const { database, sql } = await freshDatabase("paperclip-crash-recovery-pre0208-malformed-");
+    await seedOneRun(sql);
+    await rewindToPre0208(sql);
+    expect(await presentColumns(sql)).toEqual([]);
+    await sql.unsafe(`
+      CREATE INDEX ${INDEX_NAME}
+      ON heartbeat_runs USING btree (id)
+      WHERE error_code = 'worker_crashed'
+    `);
+
+    const failure = await applyPendingMigrations(database.connectionString).catch(
+      (error: unknown) => error as { message?: string; hint?: string },
+    );
+    expect(failure.message).toBe(`migration 0209 found an invalid or incorrectly defined ${INDEX_NAME}`);
+
+    // The load-bearing fact: phase A committed in its own transaction and the
+    // 0209 raise did not take it with it.
+    expect(await presentColumns(sql)).toEqual([...CRASH_COLUMNS].sort());
+    expect(failure.hint).toContain(`DROP INDEX CONCURRENTLY IF EXISTS ${INDEX_NAME}`);
+
+    // So the hint can be followed exactly as written, in its stated order.
+    await sql.unsafe(`DROP INDEX IF EXISTS ${INDEX_NAME}`);
+    await sql.unsafe(`
+      CREATE INDEX CONCURRENTLY IF NOT EXISTS ${INDEX_NAME}
+      ON heartbeat_runs USING btree (finished_at, id)
+      WHERE error_code = 'worker_crashed' AND crash_recovery_completed_at IS NULL
+    `);
+    await applyPendingMigrations(database.connectionString);
+
+    expect((await inspectMigrations(database.connectionString)).status).toBe("upToDate");
+    expect(await indexExists(sql)).toBe(true);
+  }, 120_000);
+
   it("rejects a same-type crash-recovery column that carries a default", async () => {
     // Phase A adds every column with `ADD COLUMN IF NOT EXISTS`, so a
     // pre-existing column of the *same type* survives untouched with whatever

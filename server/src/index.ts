@@ -1394,7 +1394,20 @@ export async function startServer(): Promise<StartedServer> {
           // else revisits it short of another full restart. Running this on
           // the same tick as the other periodic reconcilers below closes
           // that gap without waiting on a restart.
-          trackHeartbeatSchedulerWork(heartbeat
+          // Serialized with the stale-lock sweeper below, deliberately.
+          // Reconciliation terminalizes the crashed run and then hands its
+          // issue lock to the retry as two separate statements; the sweeper
+          // treats any lock held by a terminal run as cleanable, so run
+          // concurrently it can clear that lock in between. The hand-over is
+          // guarded and now reports having matched zero rows, but the cheaper
+          // fix is not to create the window: neither pass is latency-sensitive
+          // and both are idempotent, so awaiting one before starting the other
+          // costs a tick and removes the interleaving entirely.
+          //
+          // Still tracked as scheduler work — `trackHeartbeatSchedulerWork`
+          // returns void, so awaiting it directly would drop this pass from the
+          // shutdown drain set. Track the promise, then await that same promise.
+          const crashReconciliation = heartbeat
             .reconcileWorkerCrashedRuns()
             .then((result) => {
               if (result.reconciledRunIds.length > 0 || result.unresolvedRunIds.length > 0) {
@@ -1403,8 +1416,11 @@ export async function startServer(): Promise<StartedServer> {
             })
             .catch((err) => {
               logger.error({ err }, "periodic worker-crash recovery reconciliation failed");
-            }));
+            });
+          trackHeartbeatSchedulerWork(crashReconciliation);
+          await crashReconciliation;
 
+          if (heartbeatSchedulerStopped) return;
           trackHeartbeatSchedulerWork(heartbeat
             .sweepStaleIssueLocks()
             .then((swept) => {

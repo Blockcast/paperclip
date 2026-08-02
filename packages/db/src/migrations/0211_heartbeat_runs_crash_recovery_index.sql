@@ -72,6 +72,16 @@ BEGIN
               '\s+', ' ', 'g'
             ) = 'error_code = ''worker_crashed''::text AND crash_recovery_completed_at IS NULL'
     ) THEN
+      -- Safe to raise, and the hint is followable as written: this repo's
+      -- runner (`applyPendingMigrations` -> `applyPendingMigrationsManually`,
+      -- packages/db/src/client.ts) wraps each migration FILE in its own
+      -- transaction and commits its history row before starting the next, so
+      -- phase A's columns are already durable by the time this raises. The
+      -- `crash_recovery_completed_at` the recreate below references therefore
+      -- exists. Pinned by the "phase A survives a 0209 raise" migration test --
+      -- if the runner is ever switched to drizzle's batch migrator (which does
+      -- wrap all pending files in ONE transaction), that test fails and this
+      -- hint must be reordered to drop -> rerun migrations -> create index.
       RAISE EXCEPTION USING
         MESSAGE = 'migration 0211 found an invalid or incorrectly defined heartbeat_runs_crash_recovery_pending_idx',
         HINT = 'Run DROP INDEX CONCURRENTLY IF EXISTS heartbeat_runs_crash_recovery_pending_idx; then recreate it with CREATE INDEX CONCURRENTLY heartbeat_runs_crash_recovery_pending_idx ON heartbeat_runs USING btree (finished_at, id) WHERE error_code = ''worker_crashed'' AND crash_recovery_completed_at IS NULL; then retry migrations.';

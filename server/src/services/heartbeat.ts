@@ -25,10 +25,20 @@ type HeartbeatDbExecutor = Db | HeartbeatTx;
  * return.
  */
 type ProcessLossRetryResult =
-  /** A new retry run was queued by this call. */
-  | { kind: "created"; run: typeof heartbeatRuns.$inferSelect }
+  /**
+   * A new retry run was queued by this call.
+   *
+   * `issueLockOwnedByRetry` reports whether the retry actually ends up holding
+   * the issue's execution lock. It is NOT implied by the retry existing: the
+   * hand-over is a guarded UPDATE (`execution_run_id = <original run>`) and the
+   * stale-issue-lock sweeper treats the crash-marked original — `interrupted`,
+   * therefore terminal — as cleanable for the whole duration of recovery. If
+   * the sweeper clears the lock first, the guarded UPDATE matches zero rows and
+   * the retry owns nothing. Callers must not infer ownership from `kind`.
+   */
+  | { kind: "created"; run: typeof heartbeatRuns.$inferSelect; issueLockOwnedByRetry: boolean }
   /** A retry already existed (or was created concurrently); we adopted it. */
-  | { kind: "adopted"; run: typeof heartbeatRuns.$inferSelect }
+  | { kind: "adopted"; run: typeof heartbeatRuns.$inferSelect; issueLockOwnedByRetry: boolean }
   /** No retry, on purpose: no actor could run it. Recovery is still complete. */
   | { kind: "suppressed"; reason: string };
 
@@ -12400,6 +12410,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     now: Date,
   ): Promise<ProcessLossRetryResult> {
     await options.beforeProcessLossRetryEnqueueForTest?.(run);
+
+    // Hoisted above the dedupe fast path: every run-bearing return below has to
+    // report issue-lock ownership, including the one that returns before the
+    // retry is built. Parsing the snapshot is pure, so moving it costs nothing.
+    const issueIdForLock = readNonEmptyString(parseObject(run.contextSnapshot).issueId);
+
+    // The retry owns the issue only if the issue's execution lock actually
+    // points at it *now*. Read it rather than assuming the hand-over landed —
+    // see `ProcessLossRetryResult`. A run with no issue has no lock to own.
+    const issueLockOwnedBy = async (retryRunId: string) => {
+      if (!issueIdForLock) return false;
+      const rows = await db
+        .select({ id: issues.id })
+        .from(issues)
+        .where(and(
+          eq(issues.id, issueIdForLock),
+          eq(issues.companyId, run.companyId),
+          eq(issues.executionRunId, retryRunId),
+        ));
+      return rows.length > 0;
+    };
+
     const existingRetry = await db
       .select()
       .from(heartbeatRuns)
@@ -12418,7 +12450,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           retryRunStatus: existingRetry.status,
         },
       });
-      return { kind: "adopted", run: existingRetry };
+      return { kind: "adopted", run: existingRetry, issueLockOwnedByRetry: await issueLockOwnedBy(existingRetry.id) };
     }
 
     const invokability = await getAgentInvokability(agent);
@@ -12487,7 +12519,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .orderBy(asc(heartbeatRuns.createdAt))
         .limit(1)
         .then((rows) => rows[0] ?? null);
-      if (racedRetry) return { retryRun: racedRetry, created: false as const };
+      if (racedRetry) return { retryRun: racedRetry, created: false as const, issueLockTransferred: false };
 
       const wakeupRequest = await tx
         .insert(agentWakeupRequests)
@@ -12544,8 +12576,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         })
         .where(eq(heartbeatRuns.id, run.id));
 
+      // Guarded on `execution_run_id = run.id`, so it is a no-op if the issue's
+      // lock has already moved on — most likely cleared by `sweepStaleIssueLocks`,
+      // which sees the crash-marked original as terminal and therefore cleanable
+      // for the whole of recovery. Capture whether it landed: reporting `created`
+      // while this matched zero rows is what let recovery record that the retry
+      // owned a lock it never acquired.
+      let issueLockTransferred = false;
       if (issueId) {
-        await tx
+        const transferred = await tx
           .update(issues)
           .set({
             checkoutRunId: null,
@@ -12554,10 +12593,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             executionLockedAt: now,
             updatedAt: now,
           })
-          .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId), eq(issues.executionRunId, run.id)));
+          .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId), eq(issues.executionRunId, run.id)))
+          .returning({ id: issues.id });
+        issueLockTransferred = transferred.length > 0;
       }
 
-      return { retryRun, created: true as const };
+      return { retryRun, created: true as const, issueLockTransferred };
     });
 
     // The loser of the advisory-lock race adopts the winner's retry and skips
@@ -12576,7 +12617,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           retryRunStatus: queued.retryRun.status,
         },
       });
-      return { kind: "adopted", run: queued.retryRun };
+      return { kind: "adopted", run: queued.retryRun, issueLockOwnedByRetry: await issueLockOwnedBy(queued.retryRun.id) };
     }
 
     publishLiveEvent({
@@ -12601,7 +12642,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       },
     });
 
-    return { kind: "created", run: queued.retryRun };
+    return { kind: "created", run: queued.retryRun, issueLockOwnedByRetry: queued.issueLockTransferred };
   }
 
   function toHotRestartIntentRun(input: {
@@ -13141,13 +13182,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       return outcome;
     };
 
+    // Both steps below are REQUIRED *and* must happen before a retry exists —
+    // each one retires a claim the dead run still holds on a resource the
+    // retry is about to take over. Recording them `incomplete` withholds the
+    // completion marker, but that alone does not undo a retry already created
+    // further down: backing off the marker replays the recovery, it does not
+    // retract the replacement run. So a failure here has to *stop* the enqueue,
+    // not merely be noted alongside it.
+    let preRetryCleanupIncomplete = false;
+
     // REQUIRED. A wakeup left `queued` can be picked up again for a run that no
-    // longer exists.
+    // longer exists — and if a retry has meanwhile been queued, that stale wake
+    // dispatches a second live run beside it.
     try {
       await setWakeupStatus(run.wakeupRequestId, "cancelled", { finishedAt: now, error: null });
       record("wakeup_cancel", { kind: "done" });
     } catch (error) {
       logger.warn({ err: error, runId: run.id }, "failed to cancel wakeup for crash-interrupted run");
+      preRetryCleanupIncomplete = true;
       record("wakeup_cancel", { kind: "incomplete", detail: describeRecoveryError(error) });
     }
 
@@ -13178,6 +13230,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ? { kind: "done" }
         : { kind: "incomplete", detail: leaseRelease.failureReason ?? "lease left active" },
     );
+    if (!leaseRelease.fullyReleased) preRetryCleanupIncomplete = true;
 
     // A missing agent row and a *failure to read* the agents table are opposite
     // outcomes that `getAgent`'s `run | null` return conflates. No row means no
@@ -13207,14 +13260,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // retry the original recovery deliberately withheld once the agent became
     // invokable again.
     let retry: typeof heartbeatRuns.$inferSelect | null = null;
+    let retryOwnsIssueLock = false;
     let retryEnqueueIncomplete = false;
-    if (agent && !agentLoadFailed) {
+    if (preRetryCleanupIncomplete) {
+      // Deliberately not attempted. The old wake is still runnable and/or the
+      // old environment is still reserved; queueing the replacement now would
+      // race a second dispatch against it or hand it an environment the dead
+      // run has not let go of. The blocking step is already `incomplete`, so
+      // the row is backed off and the whole recovery — this enqueue included —
+      // replays once the cleanup succeeds.
+      record("retry_enqueue", {
+        kind: "skipped",
+        detail: "deferred: required pre-retry cleanup incomplete",
+      });
+    } else if (agent && !agentLoadFailed) {
       try {
         const result = await enqueueProcessLossRetry(run, agent, now);
         if (result.kind === "suppressed") {
           record("retry_enqueue", { kind: "skipped", detail: `suppressed: ${result.reason}` });
         } else {
           retry = result.run;
+          retryOwnsIssueLock = result.issueLockOwnedByRetry;
           record("retry_enqueue", { kind: "done" });
         }
       } catch (error) {
@@ -13243,14 +13309,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // and the replay will create one. Note this is deliberately NOT the
     // `agent === null` case: a genuinely missing agent row means no actor can
     // ever retry, so releasing is the correct terminal outcome there.
-    if (retryEnqueueIncomplete || agentLoadFailed) {
+    // A deferred enqueue (required pre-retry cleanup incomplete) is the same
+    // situation again: no retry exists yet, but one is still owed, so the lock
+    // must stay put until the replay creates it.
+    if (retryEnqueueIncomplete || agentLoadFailed || preRetryCleanupIncomplete) {
       record("issue_release", {
         kind: "skipped",
-        detail: agentLoadFailed
-          ? "agent_load incomplete; lock left until a retry exists"
-          : "retry_enqueue incomplete; lock left until a retry exists",
+        detail: preRetryCleanupIncomplete
+          ? "pre-retry cleanup incomplete; lock left until a retry exists"
+          : agentLoadFailed
+            ? "agent_load incomplete; lock left until a retry exists"
+            : "retry_enqueue incomplete; lock left until a retry exists",
       });
-    } else if (!retry) {
+    } else if (!retry || !retryOwnsIssueLock) {
+      // `!retryOwnsIssueLock` is the sweeper race: a retry exists, but the
+      // guarded hand-over matched zero rows because the issue's lock had
+      // already been cleared out from under the terminal original. Skipping
+      // release here on the strength of the retry merely existing is what
+      // recorded ownership that was never acquired. Releasing is the safe
+      // action either way — it is a no-op on a lock we no longer hold, and it
+      // still runs the promotion that hands the issue to the next queued run.
       try {
         await releaseIssueExecutionAndPromote(run);
         record("issue_release", { kind: "done" });
