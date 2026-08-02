@@ -86,7 +86,11 @@ import { describeDbError, isDbError, runWithTransientDbRetry } from "../lib/db-r
 import { publishLiveEvent } from "./live-events.js";
 import { canClaimPrReviewTask } from "./pr-review-dispatch-lock.js";
 import { normalizeResponsibleUserDenialCode } from "./responsible-user-denial-run-outcomes.js";
-import { normalizePrReviewRepoFullName } from "./pr-review-duplicate-issue-guard.js";
+import {
+  matchesTaskKey,
+  normalizePrReviewRepoFullName,
+  taskKeysMatch,
+} from "./pr-review-duplicate-issue-guard.js";
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
 import {
   deleteAgentJobExact,
@@ -6870,7 +6874,9 @@ function runTaskKey(run: typeof heartbeatRuns.$inferSelect) {
 }
 
 function isSameTaskScope(left: string | null, right: string | null) {
-  return (left ?? null) === (right ?? null);
+  // Shared with the SQL predicate so the execution path and the coalescing
+  // query agree about legacy mixed-case pr_review keys during the transition.
+  return taskKeysMatch(left, right);
 }
 
 function isGithubStateChangeWake(contextSnapshot: Record<string, unknown> | null | undefined) {
@@ -7015,7 +7021,9 @@ async function coalescePendingTaskScopeWake(input: {
         eq(heartbeatRuns.companyId, input.companyId),
         eq(heartbeatRuns.agentId, input.agentId),
         inArray(heartbeatRuns.status, coalescibleStatuses),
-        eq(heartbeatRuns.contextTaskKey, input.taskKey),
+        // Shared casing-compatibility predicate: a normalized pr_review key must
+        // still coalesce into a legacy mixed-case run while those drain.
+        matchesTaskKey(heartbeatRuns.contextTaskKey, input.taskKey),
       ),
     )
     .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
@@ -26324,7 +26332,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           and(
             eq(heartbeatRuns.agentId, agentId),
             inArray(heartbeatRuns.status, TASK_SCOPE_COALESCIBLE_RUN_STATUSES),
-            eq(heartbeatRuns.contextTaskKey, taskKey),
+            // Same casing-compatibility predicate as coalescing: the close/draft
+            // sweep must still cancel a legacy mixed-case run for this PR.
+            matchesTaskKey(heartbeatRuns.contextTaskKey, taskKey),
           ),
         )
         .returning();

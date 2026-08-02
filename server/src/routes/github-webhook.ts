@@ -36,7 +36,7 @@ import {
   issueComments,
   issues,
 } from "@paperclipai/db";
-import { and, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { heartbeatService, type HeartbeatServiceOptions } from "../services/heartbeat.js";
 import { issueService } from "../services/issues.js";
 import {
@@ -59,7 +59,7 @@ import {
   enrichAuthoredLocForRow,
   type RecordMergedPullRequestInput,
 } from "../services/issue-pull-requests.js";
-import { normalizePrReviewRepoFullName } from "../services/pr-review-duplicate-issue-guard.js";
+import { matchesTaskKey, normalizePrReviewRepoFullName } from "../services/pr-review-duplicate-issue-guard.js";
 
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type PrReviewerSelectionDb = Pick<Db | DbTransaction, "select">;
@@ -1525,10 +1525,7 @@ async function findActivePrReviewerForTask(
         inArray(heartbeatRuns.agentId, [...configuredAgentIds]),
         inArray(heartbeatRuns.status, ["queued", "running"]),
         inArray(agents.status, ["idle", "running"]),
-        or(
-          eq(heartbeatRuns.contextTaskKey, taskKey),
-          sql`lower(${heartbeatRuns.contextTaskKey}) = ${taskKey}`,
-        ),
+        matchesTaskKey(heartbeatRuns.contextTaskKey, taskKey),
       ),
     )
     .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))

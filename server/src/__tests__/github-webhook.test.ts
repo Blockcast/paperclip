@@ -1916,8 +1916,14 @@ describeEmbeddedPostgres("github-webhook route", () => {
       .from(heartbeatRuns)
       .where(inArray(heartbeatRuns.agentId, [firstReviewerId, secondReviewerId]));
     expect(runs).toHaveLength(1);
+    // Which member of the pool wins the initial tie is a sha256(taskKey)
+    // spreading detail, not the property under test — asserting a specific id
+    // re-breaks this test every time the task key's spelling changes. What must
+    // hold is that the follow-up delivery lands on whoever already owns the PR,
+    // producing exactly one run carrying the newest head.
+    const owningReviewerId = runs[0]!.agentId;
+    expect([firstReviewerId, secondReviewerId]).toContain(owningReviewerId);
     expect(runs[0]).toMatchObject({
-      agentId: firstReviewerId,
       contextSnapshot: expect.objectContaining({
         taskKey: "pr_review:blockcast/magma:976",
         githubPrNumber: 976,
@@ -1934,7 +1940,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
       .from(agentWakeupRequests)
       .where(inArray(agentWakeupRequests.agentId, [firstReviewerId, secondReviewerId]));
     expect(wakes).toHaveLength(2);
-    expect(wakes.every((wake) => wake.agentId === firstReviewerId)).toBe(true);
+    expect(wakes.every((wake) => wake.agentId === owningReviewerId)).toBe(true);
     expect(wakes).toContainEqual(expect.objectContaining({
       status: "coalesced",
       idempotencyKey:

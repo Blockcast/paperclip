@@ -25,15 +25,28 @@
  * Failure direction is open. An unparseable reference or lookup error lets the
  * issue through — a duplicate review issue is a cost problem, whereas wrongly
  * blocking issue creation is a correctness problem.
+ *
+ * KNOWN AND ACCEPTED GAP: this check is not serialized against the webhook's
+ * `withPrReviewerTaskLock`. A webhook holding that lock with its wake
+ * transaction still uncommitted is invisible to us under READ COMMITTED, so a
+ * create racing that exact window is allowed and the duplicate survives. That
+ * is deliberate. Closing it means taking the PR-scope advisory lock inside the
+ * issue-creation transaction, which already holds the title and idempotency
+ * advisory locks (services/issues.ts) — up to MAX_SCANNED_PULL_REQUEST_REFS of
+ * them for one issue — and would couple every issue create in the product to
+ * webhook dispatch latency, in a lock order opposite to the webhook's. Paying
+ * deadlock risk and head-of-line blocking on the hottest write path to close a
+ * millisecond window in a best-effort cost guard is the wrong trade: the racing
+ * duplicate costs one issue, and the next attempt is rejected normally.
  */
 import { type Db, heartbeatRuns } from "@paperclipai/db";
-import { and, desc, eq, inArray, or, sql } from "drizzle-orm";
+import { type Column, type SQL, and, desc, eq, inArray, or, sql } from "drizzle-orm";
 import { readGithubPrReviewerAgentIds } from "../config.js";
 import { conflict } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
-type DuplicatePrReviewIssueGuardDb = Pick<Db | DbTransaction, "select">;
+type DuplicatePrReviewIssueGuardDb = Pick<DbTransaction, "select" | "transaction">;
 
 /**
  * A review is "already live" while its run is queued or in flight. Mirrors
@@ -48,9 +61,13 @@ const LIVE_PR_REVIEW_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as 
  * "#1911" cannot be resolved to a repo, so matching it would risk rejecting a
  * legitimate issue that happens to share a number with a busy PR in some other
  * repo. The residual 1% is accepted load, not a correctness gap.
+ *
+ * The trailing lookahead requires a real boundary after the number so that
+ * "/pull/1911abc" does not silently resolve to PR 1911 and hard-reject a create
+ * over a malformed or unrelated reference.
  */
 const GITHUB_PULL_REQUEST_URL_PATTERN =
-  /https?:\/\/(?:www\.)?github\.com\/([A-Za-z0-9._-]+)\/([A-Za-z0-9._-]+)\/pull\/(\d+)/gi;
+  /https?:\/\/(?:www\.)?github\.com\/([A-Za-z0-9._-]+)\/([A-Za-z0-9._-]+)\/pull\/(\d+)(?![\w-])/gi;
 
 /** Bounds the work done on a hostile or pathological description. */
 const MAX_SCANNED_PULL_REQUEST_REFS = 20;
@@ -75,6 +92,61 @@ export type PullRequestRef = {
 
 export function normalizePrReviewRepoFullName(repoFullName: string): string {
   return repoFullName.trim().toLowerCase();
+}
+
+/** Prefix identifying a task key that is scoped to one GitHub pull request. */
+const PR_REVIEW_TASK_KEY_PREFIX = "pr_review:";
+
+export function isPrReviewTaskKey(taskKey: string): boolean {
+  return taskKey.startsWith(PR_REVIEW_TASK_KEY_PREFIX);
+}
+
+/**
+ * The single compatibility predicate for matching a live `context_task_key`.
+ *
+ * GitHub owner/repo identity is case-insensitive, so the task-key producers now
+ * lowercase it. Runs enqueued before that change carry mixed-case keys (every
+ * `Blockcast/*` repo produced one), and they stay live for as long as their
+ * review takes to drain. Byte-exact equality would therefore let a newly
+ * normalized wake queue *beside* the legacy run it should have coalesced into —
+ * and would let the cancel-on-close sweep miss it — for the whole rollout
+ * window.
+ *
+ * Every equality check against a live task key must go through here so the
+ * transition is uniform: affinity lookup, coalescing, cancellation, and this
+ * module's own duplicate lookup. Non-PR keys keep plain `IN (…)` equality, so
+ * unrelated task scopes see no behavioural or planner change. Once no
+ * mixed-case `pr_review:%` rows remain, the `lower()` leg can be dropped.
+ */
+export function matchesAnyTaskKey(column: Column, taskKeys: readonly string[]): SQL {
+  const exact = [...new Set(taskKeys)];
+  const legacyCasingCandidates = [
+    ...new Set(exact.filter(isPrReviewTaskKey).map((taskKey) => taskKey.toLowerCase())),
+  ];
+  const exactLeg = inArray(column, exact);
+  if (legacyCasingCandidates.length === 0) return exactLeg;
+  const legacyCasingLeg = inArray(sql`lower(${column})`, legacyCasingCandidates);
+  return or(exactLeg, legacyCasingLeg) ?? exactLeg;
+}
+
+/** Single-key form of {@link matchesAnyTaskKey}. */
+export function matchesTaskKey(column: Column, taskKey: string): SQL {
+  return matchesAnyTaskKey(column, [taskKey]);
+}
+
+/**
+ * In-memory counterpart of {@link matchesAnyTaskKey}, for the execution-path
+ * checks that compare task keys already loaded into JS rather than in SQL.
+ * Must stay behaviourally identical to the SQL form or the two paths disagree
+ * about whether a legacy run is the same scope.
+ */
+export function taskKeysMatch(left: string | null | undefined, right: string | null | undefined): boolean {
+  const a = left ?? null;
+  const b = right ?? null;
+  if (a === b) return true;
+  if (a === null || b === null) return false;
+  if (!isPrReviewTaskKey(a) || !isPrReviewTaskKey(b)) return false;
+  return a.toLowerCase() === b.toLowerCase();
 }
 
 /**
@@ -151,32 +223,37 @@ export async function assertNotDuplicatePrReviewIssue(
   const taskKeys = refs.map(buildPrReviewTaskKey);
   let liveRun: { id: string; status: string; contextTaskKey: string | null; createdAt: Date } | undefined;
   try {
-    [liveRun] = await db
-      .select({
-        id: heartbeatRuns.id,
-        status: heartbeatRuns.status,
-        contextTaskKey: heartbeatRuns.contextTaskKey,
-        createdAt: heartbeatRuns.createdAt,
-      })
-      .from(heartbeatRuns)
-      .where(
-        and(
-          // The canonical equality leg matches
-          // idx_heartbeat_runs_company_agent_context_task_key_created
-          // (migration 0104). The lower() leg is a temporary compatibility
-          // bridge for already-live mixed-case keys written before the task-key
-          // producer normalized GitHub repo identity.
-          eq(heartbeatRuns.companyId, candidate.companyId),
-          inArray(heartbeatRuns.agentId, reviewerAgentIds),
-          or(
-            inArray(heartbeatRuns.contextTaskKey, taskKeys),
-            inArray(sql`lower(${heartbeatRuns.contextTaskKey})`, taskKeys),
+    // The caller hands us the in-flight issue-creation transaction, so a failed
+    // statement here would abort *that* transaction: catching the error would
+    // only make every later statement fail with 25P02 and the create would 500
+    // anyway. Running the lookup in a nested transaction scopes the damage to a
+    // SAVEPOINT that rolls back cleanly, which is what makes the documented
+    // fail-open behaviour real rather than nominal.
+    liveRun = await db.transaction(async (scoped) => {
+      const [row] = await scoped
+        .select({
+          id: heartbeatRuns.id,
+          status: heartbeatRuns.status,
+          contextTaskKey: heartbeatRuns.contextTaskKey,
+          createdAt: heartbeatRuns.createdAt,
+        })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            // The exact leg matches
+            // idx_heartbeat_runs_company_agent_context_task_key_created
+            // (migration 0104); matchesAnyTaskKey adds the shared lower() leg
+            // that bridges already-live mixed-case keys.
+            eq(heartbeatRuns.companyId, candidate.companyId),
+            inArray(heartbeatRuns.agentId, reviewerAgentIds),
+            matchesAnyTaskKey(heartbeatRuns.contextTaskKey, taskKeys),
+            inArray(heartbeatRuns.status, [...LIVE_PR_REVIEW_RUN_STATUSES]),
           ),
-          inArray(heartbeatRuns.status, [...LIVE_PR_REVIEW_RUN_STATUSES]),
-        ),
-      )
-      .orderBy(desc(heartbeatRuns.createdAt))
-      .limit(1);
+        )
+        .orderBy(desc(heartbeatRuns.createdAt))
+        .limit(1);
+      return row;
+    });
   } catch (error) {
     logger.warn(
       { err: error, companyId: candidate.companyId, assigneeAgentId, taskKeys },
