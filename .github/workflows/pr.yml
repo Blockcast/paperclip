@@ -404,6 +404,11 @@ jobs:
 
   verify_serialized_server:
     name: Verify serialized server suites (${{ matrix.shard_label }})
+    # BLO-20869 probe only, not part of the shipped fix: force this job to
+    # report `skipped` regardless of general_tests's outcome, standing in for
+    # the never-scheduled/cancelled/skipped cases without waiting on a real
+    # ~90-minute run or an actual ARC outage.
+    if: false
     needs: [policy, general_tests]
     runs-on: default
     timeout-minutes: 90
