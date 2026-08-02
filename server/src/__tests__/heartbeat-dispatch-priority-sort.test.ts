@@ -1413,7 +1413,24 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     const runnableRunId = randomUUID();
     const issuePrefix = `D${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
     const baseCreatedAt = new Date(Date.now() - 90 * 60 * 1000);
-    const blockedCount = 20_000;
+    // BLO-20396: reaching the resume cap costs
+    // `scanLimit * maxScanBatches * maxResumePasses` queued rows. With the
+    // production bounds (200 * 10 * 10) that is 20,000 runs plus their issues,
+    // wakes and dependency rows — ~80k inserts, which blew this test past its
+    // 180s budget and made the serialized shard the slowest job in CI.
+    //
+    // A dedicated service with narrowed bounds reproduces the SAME geometry at
+    // 1/250th the size: `blockedCount` is still exactly the cap product, so the
+    // runnable row still sits immediately past the boundary the cap forces the
+    // chain to yield at. Shrinking the world rather than raising the timeout
+    // keeps the cap arithmetic itself under test.
+    const dispatchBounds = { scanLimit: 20, maxScanBatches: 2, maxResumePasses: 2 };
+    const blockedCount =
+      dispatchBounds.scanLimit * dispatchBounds.maxScanBatches * dispatchBounds.maxResumePasses;
+    const cappedHeartbeat = heartbeatService(db, {
+      penstockGate: allowPenstockGate,
+      queuedRunDispatchBounds: dispatchBounds,
+    });
 
     await db.insert(companies).values({
       id: companyId,
@@ -1557,10 +1574,14 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
       };
     });
 
-    await heartbeat.resumeQueuedRuns();
-    const runnableRun = await waitForRunToSettle(heartbeat, runnableRunId, 120_000);
+    await cappedHeartbeat.resumeQueuedRuns();
+    const runnableRun = await waitForRunToSettle(cappedHeartbeat, runnableRunId, 120_000);
 
     expect(dispatchedRunIds).toContain(runnableRunId);
     expect(runnableRun?.status).not.toBe("queued");
+
+    // Scoped instance: drain it here so its in-flight work cannot outlive the
+    // test and race the shared afterEach cleanup.
+    await cappedHeartbeat.drainInFlightExecutions(60_000);
   }, 180_000);
 });

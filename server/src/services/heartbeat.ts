@@ -8287,6 +8287,26 @@ export interface HeartbeatServiceOptions {
   workerBootAt?: Date;
   runtimeEnv?: Record<string, string | undefined>;
   /**
+   * BLO-20396: test-only overrides for the queued-run dispatch bounds
+   * (`QUEUED_RUN_DISPATCH_SCAN_LIMIT`, `_MAX_SCAN_BATCHES`,
+   * `_MAX_RESUME_PASSES`). Production never sets these.
+   *
+   * These three bounds multiply: reaching the resume cap requires
+   * `scanLimit * maxScanBatches * maxResumePasses` queued rows, so with the
+   * production values a test that wants to observe cap behaviour has to seed
+   * 20,000 runs (plus their issues, wakes and dependency rows — ~80k rows).
+   * That fixture, not the dispatch logic, is what pushed
+   * `heartbeat-dispatch-priority-sort` past its 180s budget and made the
+   * serialized CI shard the slowest job in the pipeline. Shrinking the world
+   * instead of the assertion keeps the test exercising the same code path,
+   * including the cap arithmetic itself, which a raised timeout would not.
+   */
+  queuedRunDispatchBounds?: {
+    scanLimit?: number;
+    maxScanBatches?: number;
+    maxResumePasses?: number;
+  };
+  /**
    * Test-only concurrency hook: fired after the scheduler has read a due
    * scheduled_retry row and immediately before the conditional UPDATE that
    * promotes or cancels it.
@@ -8336,6 +8356,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
   });
   const runtimeEnv = options.runtimeEnv ?? process.env;
+  // BLO-20396: resolved once per service. Production passes nothing and gets the
+  // module constants; only tests narrow these (see HeartbeatServiceOptions).
+  const queuedRunDispatchScanLimit =
+    options.queuedRunDispatchBounds?.scanLimit ?? QUEUED_RUN_DISPATCH_SCAN_LIMIT;
+  const queuedRunDispatchMaxScanBatches =
+    options.queuedRunDispatchBounds?.maxScanBatches ?? QUEUED_RUN_DISPATCH_MAX_SCAN_BATCHES;
+  const queuedRunDispatchMaxResumePasses =
+    options.queuedRunDispatchBounds?.maxResumePasses ?? QUEUED_RUN_DISPATCH_MAX_RESUME_PASSES;
   const inWorktreeRuntime = isTruthyRuntimeEnvValue(runtimeEnv.PAPERCLIP_IN_WORKTREE);
   // Preview worktree instances suppress the run engine by default. Users can lift
   // that per-worktree via the `enableWorktreeRunExecution` experimental setting
@@ -17804,7 +17832,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       let scannedBatches = 0;
       let scanExhausted = false;
 
-      while (scannedBatches < QUEUED_RUN_DISPATCH_MAX_SCAN_BATCHES) {
+      while (scannedBatches < queuedRunDispatchMaxScanBatches) {
         scannedBatches += 1;
         // Annotated rather than inferred: `scanCursor` is assigned from this
         // batch's last row, so control-flow analysis would otherwise chase
@@ -17827,14 +17855,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               : undefined,
           ))
           .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
-          .limit(QUEUED_RUN_DISPATCH_SCAN_LIMIT);
+          .limit(queuedRunDispatchScanLimit);
         if (batch.length === 0) {
           scanExhausted = true;
           break;
         }
         const lastScannedRun = batch[batch.length - 1]!;
         scanCursor = { createdAt: lastScannedRun.createdAt, id: lastScannedRun.id };
-        if (batch.length < QUEUED_RUN_DISPATCH_SCAN_LIMIT) scanExhausted = true;
+        if (batch.length < queuedRunDispatchScanLimit) scanExhausted = true;
 
         const batchIssueIds = [...new Set(
           batch
@@ -17980,7 +18008,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           notInArray(issues.status, [...TERMINAL_ISSUE_STATUSES]),
         ))
         .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
-        .limit(QUEUED_RUN_DISPATCH_SCAN_LIMIT);
+        .limit(queuedRunDispatchScanLimit);
 
       // Lane B — recovery-action wakes. Recovery-ness is a property of the RUN,
       // not of the issue, so this needs no join at all: the agent's queued rows
@@ -18002,7 +18030,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           sql`${heartbeatRuns.contextSnapshot} ->> 'recoveryActionId' is not null`,
         ))
         .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
-        .limit(QUEUED_RUN_DISPATCH_SCAN_LIMIT);
+        .limit(queuedRunDispatchScanLimit);
 
       const recoveryIssueIdsToLoad = new Set<string>();
       for (const run of recoveryLaneRows) {
@@ -18056,8 +18084,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           {
             agentId,
             scannedBatches,
-            scanLimit: QUEUED_RUN_DISPATCH_SCAN_LIMIT,
-            maxScanBatches: QUEUED_RUN_DISPATCH_MAX_SCAN_BATCHES,
+            scanLimit: queuedRunDispatchScanLimit,
+            maxScanBatches: queuedRunDispatchMaxScanBatches,
             candidates: queuedRuns.length,
           },
           "startNextQueuedRunForAgent: hit the batch bound before exhausting the queued backlog; some rows were not examined this pass",
@@ -18104,14 +18132,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           return false;
         }
         const passes = (resumeState?.passes ?? 0) + 1;
-        if (passes >= QUEUED_RUN_DISPATCH_MAX_RESUME_PASSES) {
+        if (passes >= queuedRunDispatchMaxResumePasses) {
           logger.error(
             {
               agentId,
               passes,
-              maxResumePasses: QUEUED_RUN_DISPATCH_MAX_RESUME_PASSES,
-              scannedRows: passes * QUEUED_RUN_DISPATCH_SCAN_LIMIT
-                * QUEUED_RUN_DISPATCH_MAX_SCAN_BATCHES,
+              maxResumePasses: queuedRunDispatchMaxResumePasses,
+              scannedRows: passes * queuedRunDispatchScanLimit
+                * queuedRunDispatchMaxScanBatches,
             },
             "startNextQueuedRunForAgent: queued backlog still unclaimable after the resume cap; delaying bounded scan continuation",
           );
