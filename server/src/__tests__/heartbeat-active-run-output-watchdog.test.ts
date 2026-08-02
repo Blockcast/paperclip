@@ -602,6 +602,47 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     expect(run?.status).toBe("succeeded");
   });
 
+  it("does not deadlock source-resolved folding against process-loss retry enqueue", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const { companyId, issueId, runId } = await seedRunningRun({
+      now,
+      ageMs: ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS + 60_000,
+      sourceStatus: "done",
+      sameRunTerminalEvidence: "activity",
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({ processPid: 999_999_999 })
+      .where(eq(heartbeatRuns.id, runId));
+
+    let releaseIssueLock!: () => void;
+    let issueLockHeld!: () => void;
+    const issueLockHeldPromise = new Promise<void>((resolve) => {
+      issueLockHeld = resolve;
+    });
+    const releaseIssueLockPromise = new Promise<void>((resolve) => {
+      releaseIssueLock = resolve;
+    });
+    const lockTransaction = db.transaction(async (tx) => {
+      await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, issueId)).for("update");
+      issueLockHeld();
+      await releaseIssueLockPromise;
+    });
+
+    await issueLockHeldPromise;
+    const foldPromise = heartbeat.scanSilentActiveRuns({ now, companyId });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const reapPromise = heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    releaseIssueLock();
+
+    await expect(lockTransaction).resolves.toBeUndefined();
+    const [foldResult, reapResult] = await Promise.all([foldPromise, reapPromise]);
+    expect(foldResult.folded + reapResult.reaped).toBe(1);
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(["succeeded", "failed"]).toContain(run?.status);
+  });
+
   it("still escalates terminal source issues without same-run terminal evidence", async () => {
     const now = new Date("2026-04-22T20:00:00.000Z");
     const { companyId, runId } = await seedRunningRun({

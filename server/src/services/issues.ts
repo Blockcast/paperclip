@@ -8831,6 +8831,19 @@ export function issueService(db: Db) {
       }
 
       const runUpdate = async (tx: any) => {
+        // Acquire the relation set in canonical UUID order before updating the target row.
+        if (blockedByIssueIds !== undefined) {
+          await syncBlockedByIssueIds(
+            id,
+            existing.companyId,
+            blockedByIssueIds,
+            {
+              agentId: actorAgentId ?? null,
+              userId: actorUserId ?? null,
+            },
+            tx,
+          );
+        }
         const defaultCompanyGoal = await getDefaultCompanyGoal(tx, existing.companyId);
         const [currentProjectGoalId, nextProjectGoalId] = await Promise.all([
           getProjectDefaultGoalId(tx, existing.companyId, existing.projectId),
@@ -8928,18 +8941,6 @@ export function issueService(db: Db) {
         }
         if (nextLabelIds !== undefined) {
           await syncIssueLabels(updated.id, existing.companyId, nextLabelIds, tx);
-        }
-        if (blockedByIssueIds !== undefined) {
-          await syncBlockedByIssueIds(
-            updated.id,
-            existing.companyId,
-            blockedByIssueIds,
-            {
-              agentId: actorAgentId ?? null,
-              userId: actorUserId ?? null,
-            },
-            tx,
-          );
         }
         if (
           issueData.executionWorkspaceSettings !== undefined &&

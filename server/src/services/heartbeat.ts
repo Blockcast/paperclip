@@ -11987,6 +11987,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const responsibleUserId = await resolveResponsibleUserIdForRunContext(run, retryContextSnapshot);
 
     const queued = await db.transaction(async (tx) => {
+      // Transactions touching both ownership rows always lock issue before run.
+      if (issueId) {
+        await tx
+          .select({ id: issues.id })
+          .from(issues)
+          .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
+          .for("update");
+      }
+      await tx
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId)))
+        .for("update");
+
       const wakeupRequest = await tx
         .insert(agentWakeupRequests)
         .values({
@@ -14696,14 +14710,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       let claimedIssueLock: Pick<typeof issues.$inferSelect, "id" | "executionRunId"> | null = null;
       try {
         claimedIssueLock = await db.transaction(async (tx) => {
-          const lockedIssue = await tx
-            .select({ id: issues.id })
-            .from(issues)
-            .where(and(eq(issues.id, claimedIssueId), eq(issues.companyId, claimed.companyId)))
-            .for("update")
-            .then((rows) => rows[0] ?? null);
-          if (!lockedIssue) return null;
-
+          let blockerIssueIds: string[] = [];
           if (autoCheckoutWake) {
             const blockerRows = await tx
               .select({ id: issueRelations.issueId })
@@ -14716,18 +14723,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 ),
               )
               .orderBy(asc(issueRelations.issueId));
-            const blockerIssueIds = blockerRows.map((row) => row.id);
-            if (blockerIssueIds.length > 0) {
-              await tx.execute(
-                sql`SELECT ${issues.id} FROM ${issues}
-                    WHERE ${and(
-                      eq(issues.companyId, claimed.companyId),
-                      inArray(issues.id, blockerIssueIds),
-                    )}
-                    ORDER BY ${issues.id}
-                    FOR UPDATE`,
-              );
-            }
+            blockerIssueIds = blockerRows.map((row) => row.id);
+          }
+          // Relation writers lock this same complete set in UUID order.
+          const issueIdsToLock = [...new Set([claimedIssueId, ...blockerIssueIds])].sort();
+          const lockedIssues = await tx.execute(
+            sql`SELECT ${issues.id} FROM ${issues}
+                WHERE ${and(
+                  eq(issues.companyId, claimed.companyId),
+                  inArray(issues.id, issueIdsToLock),
+                )}
+                ORDER BY ${issues.id}
+                FOR UPDATE`,
+          );
+          if (lockedIssues.length !== issueIdsToLock.length) return null;
+
+          if (autoCheckoutWake) {
             const lockedReadiness = await issuesSvc.listDependencyReadiness(
               claimed.companyId,
               [claimedIssueId],
