@@ -1121,10 +1121,10 @@ describe("github-webhook pure helpers", () => {
 
     expect(description).toContain("Remediation path:");
     expect(description).toContain("Dismissal path:");
-    expect(description).toContain("For the remediation path");
-    expect(description).toContain("For the dismissal path");
+    expect(description).toContain("A GitHub alert-state receipt is sufficient but not required");
+    expect(description).toContain("terminal dismissal webhook receipt");
     expect(description).toMatch(
-      /^1\. The remediation PR merges into the default branch of `Blockcast\/paperclip`, AND the default-branch manifest `packages\/mcp-gateway\/package\.json` resolves vitest at 3\.2\.6 or newer\.$/m,
+      /^1\. The remediation PR merges into the default branch of `Blockcast\/paperclip`, AND the default-branch manifest `packages\/mcp-gateway\/package\.json` resolves vitest at 3\.2\.6 or newer, with advisory GHSA-5xrq-8626-4rwp \/ CVE-2026-47429 cited in the evidence\.$/m,
     );
   });
 
@@ -3818,7 +3818,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
   // can satisfy. That misreading blocked an already-remediated high-severity CVE
   // for six days. These assertions pin the disambiguated wording so the
   // disjunction cannot be flattened back into prose.
-  it("states the verifying signal as an explicit any-one-of checklist and scopes the REST note", async () => {
+  it("keeps Dependabot acceptance criteria consistent with agent-executable closure evidence", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent({ agentName: "Release Engineer" });
     const app = buildApp({ dependabotAgentId: agentId });
 
@@ -3834,20 +3834,24 @@ describeEmbeddedPostgres("github-webhook route", () => {
     // All three sufficient branches survive, each on its own numbered line.
     expect(description).toContain("Any ONE of the following is sufficient and complete evidence");
     expect(description).toMatch(/^1\. The remediation PR merges into the default branch/m);
-    expect(description).toMatch(/^2\. .*shows `state: fixed`\.$/m);
-    expect(description).toMatch(/^3\. .*shows `state: dismissed`/m);
+    expect(description).toMatch(/^2\. .*shows `state: fixed` for advisory GHSA-5xrq-8626-4rwp \/ CVE-2026-47429\.$/m);
+    expect(description).toMatch(/^3\. .*shows `state: dismissed` for advisory GHSA-5xrq-8626-4rwp \/ CVE-2026-47429/m);
     // Branch 1 names the concrete manifest + patched version, so it is actionable
     // without re-deriving anything from the alert page.
     expect(description).toMatch(
-      /^1\. The remediation PR merges into the default branch of `Blockcast\/paperclip`, AND the default-branch manifest `packages\/mcp-gateway\/package\.json` resolves vitest at 3\.2\.6 or newer\.$/m,
+      /^1\. The remediation PR merges into the default branch of `Blockcast\/paperclip`, AND the default-branch manifest `packages\/mcp-gateway\/package\.json` resolves vitest at 3\.2\.6 or newer, with advisory GHSA-5xrq-8626-4rwp \/ CVE-2026-47429 cited in the evidence\.$/m,
     );
 
     // Acceptance criteria split remediation from dismissal instead of implying
     // the dismissal path also needs a merged PR.
     expect(description).toContain("Remediation path:");
     expect(description).toContain("Dismissal path:");
-    expect(description).toContain("For the remediation path");
-    expect(description).toContain("For the dismissal path");
+    expect(description).toMatch(
+      /^- Remediation path: the default-branch manifest `packages\/mcp-gateway\/package\.json` in `Blockcast\/paperclip` resolves vitest at 3\.2\.6 or newer, outside the vulnerable range < 3\.2\.6, and the evidence cites advisory GHSA-5xrq-8626-4rwp \/ CVE-2026-47429\. A GitHub alert-state receipt is sufficient but not required\.$/m,
+    );
+    expect(description).toContain("terminal dismissal webhook receipt");
+    expect(description).not.toContain("alert's state on GitHub moves to `fixed`");
+    expect(description).not.toContain("alert's state on GitHub is `dismissed`");
 
     // The two sentences that directly refute the misreading.
     expect(description).toContain("Do NOT require a screenshot of the alert page");
@@ -3860,8 +3864,10 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(description).toContain("It is NOT an evidentiary standard");
     expect(description).toContain("does not forbid the repository contents API or GraphQL");
 
-    // The alert-state acceptance criterion must not read as an evidence demand.
-    expect(description).toContain("observing it directly is optional");
+    // Preserve the operational prohibition verbatim while changing closure criteria.
+    expect(description).toContain(
+      "Every field under **Alert** above comes from this delivery's GitHub webhook payload. Do NOT call the GitHub Dependabot Alerts REST API to re-derive them: some repositories return `403 Dependabot alerts are disabled for this repository` on that endpoint even though the webhook still fires. Treat that 403 as expected and work from this issue instead of chasing the API.",
+    );
   });
 
   it("does not wake below the severity floor (default high)", async () => {
