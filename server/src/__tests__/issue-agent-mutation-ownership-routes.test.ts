@@ -333,12 +333,20 @@ function deniedWriteLookupLimitStub(
     ? "aggregate"
     : null;
   return vi.fn((count: number) => ({
-    then: async (resolve: (rows: unknown[]) => unknown) => {
-      if (!lookupKind) return resolve([]);
-      stub.onLookup?.(where, lookupKind);
-      const fallbackRows = lookupKind === "exact" ? stub.recentRows ?? [] : stub.aggregateRows ?? [];
-      const rows = stub.rowsFor ? stub.rowsFor(where, lookupKind) : fallbackRows;
-      return resolve(rows.slice(0, count));
+    // Must honour `reject`: a thenable that only ever calls `resolve` leaves an
+    // awaiting caller hung forever when the stub throws, so a failure test would
+    // "pass" on a dangling promise instead of on the abort it means to assert.
+    then: async (resolve: (rows: unknown[]) => unknown, reject?: (err: unknown) => unknown) => {
+      try {
+        if (!lookupKind) return resolve([]);
+        stub.onLookup?.(where, lookupKind);
+        const fallbackRows = lookupKind === "exact" ? stub.recentRows ?? [] : stub.aggregateRows ?? [];
+        const rows = stub.rowsFor ? stub.rowsFor(where, lookupKind) : fallbackRows;
+        return resolve(rows.slice(0, count));
+      } catch (err) {
+        if (reject) return reject(err);
+        throw err;
+      }
     },
   }));
 }
@@ -416,11 +424,22 @@ function createRunContextDb(
     };
     return query;
   };
+  const select = vi.fn((selection: Record<string, unknown> = {}) => ({
+    from: vi.fn(() => buildQuery(selection)),
+  }));
+  // The aggregate bound is enforced inside `db.transaction` under an advisory
+  // lock, so the stub transaction has to be a usable executor — an empty object
+  // would make every recording path throw and silently record nothing, turning
+  // the cap tests green for the wrong reason.
+  const tx = {
+    execute: vi.fn(async () => undefined),
+    select,
+    insert: vi.fn(() => ({ values: vi.fn(async () => undefined) })),
+  };
   return {
-    transaction: async (callback: (tx: Record<string, never>) => Promise<unknown>) => callback({}),
-    select: vi.fn((selection: Record<string, unknown> = {}) => ({
-      from: vi.fn(() => buildQuery(selection)),
-    })),
+    transaction: async (callback: (tx: unknown) => Promise<unknown>) => callback(tx),
+    execute: tx.execute,
+    select,
   };
 }
 
@@ -1768,6 +1787,51 @@ describe("agent issue mutation checkout ownership", () => {
       expect(mockIssueService.update).not.toHaveBeenCalled();
     });
 
+    // Ally review: the sibling recovery-handoff refusal directly above records,
+    // this one did not — so a recovery owner sending `reopen`/`resume` lost its
+    // attempted comment entirely, which is the exact loss AC3 exists to stop.
+    // The body is the recoverable evidence here: the refusal is about the
+    // status intent, not about the prose the owner was trying to leave.
+    it("records the recovery-owner comment-only refusal so the attempted body survives", async () => {
+      denyCommentGrantEverywhere();
+      mockIssueService.getById.mockResolvedValue(makeIssue({
+        status: "blocked",
+        checkoutRunId: ownerRunId,
+        executionRunId: ownerRunId,
+      }) as never);
+      mockIssueService.getDependencyReadiness.mockResolvedValue({
+        unresolvedBlockerCount: 0,
+        unresolvedBlockerIssueIds: [],
+      } as never);
+      mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(
+        makeRecoveryAction({ ownerAgentId: peerAgentId }) as never,
+      );
+
+      const res = await request(await createApp(recoveryOwnerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "Discharge evidence that must not be lost.", resume: true, apiKey: "sk-should-be-redacted" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe("Recovery owner grant is comment-only");
+
+      const call = mockLogActivity.mock.calls.find(
+        ([, entry]) => (entry as { action?: string }).action === "issue_write_denied",
+      );
+      expect(call, "expected an issue_write_denied record for the recovery-owner refusal").toBeTruthy();
+      const details = (call![1] as { details: Record<string, unknown> }).details;
+      expect(details).toMatchObject({
+        attemptedAction: "issue:mutate",
+        reason: "deny_recovery_owner_comment_only",
+        responseStatus: 403,
+        quarantined: true,
+      });
+      // Bounded + redacted, same contract as every other recorded denial.
+      const serialized = JSON.stringify(details);
+      expect(serialized).toContain("Discharge evidence that must not be lost.");
+      expect(serialized).not.toContain("sk-should-be-redacted");
+      expect(Buffer.byteLength(serialized, "utf8")).toBeLessThanOrEqual(16000);
+    });
+
     // The refusal must not swallow the grant's actual purpose: a plain comment on a
     // `blocked` source issue — the exact discharge path BLO-18996 exists to restore —
     // still has to land.
@@ -2520,7 +2584,7 @@ describe("agent issue mutation checkout ownership", () => {
     responseStatus: number;
     payloadFingerprint: string;
     createdAt: Date;
-  }>[] = []) {
+  }>[] = [], options: { failAggregateLookup?: boolean } = {}) {
     const recorded: {
       id: string;
       attemptedAction: string;
@@ -2561,6 +2625,9 @@ describe("agent issue mutation checkout ownership", () => {
       rowsFor: (where, kind) => {
         const params = collectSqlParams(where);
         if (kind === "aggregate") {
+          // Models an unhealthy database on the one query that enforces the
+          // bound. Recording must drop rather than insert unbounded.
+          if (options.failAggregateLookup) throw new Error("simulated aggregate bound lookup failure");
           return recentRows(where).map((row) => ({ deniedWriteId: row.id }));
         }
         const duplicate = recorded.some((row) => params.includes(row.attemptedAction)
@@ -2649,6 +2716,18 @@ describe("agent issue mutation checkout ownership", () => {
 
     expect(recorded).toHaveLength(5);
     expect(new Set(recorded.map((row) => row.payloadFingerprint)).size).toBe(5);
+  });
+
+  // The aggregate bound is the only thing capping how much payload a denied
+  // actor can cause to be written, so when it cannot be evaluated the record
+  // has to drop. The previous shape caught the failure and inserted anyway,
+  // which disabled the bound exactly when the database was unhealthy.
+  it("records nothing when the aggregate bound lookup fails", async () => {
+    const { recorded, denyPatch } = cheapRecoveryDedupeHarness([], { failAggregateLookup: true });
+
+    await denyPatch("denied diagnosis while the bound is unavailable");
+
+    expect(recorded, "a denial must not be recorded when its bound cannot be enforced").toHaveLength(0);
   });
 
   it("does not let out-of-window denied-write rows trip the aggregate cap", async () => {
@@ -3819,11 +3898,21 @@ describe("agent issue mutation checkout ownership", () => {
         };
         return query;
       };
+      const select = vi.fn((selection: Record<string, unknown> = {}) => ({
+        from: vi.fn(() => buildQuery(selection)),
+      }));
+      // Denial recording enforces its aggregate bound inside `db.transaction`
+      // and fails closed, so a stub transaction that hands back an unusable
+      // executor records nothing at all — see the top-level factory.
+      const tx = {
+        execute: vi.fn(async () => undefined),
+        select,
+        insert: vi.fn(() => ({ values: vi.fn(async () => undefined) })),
+      };
       return {
-        transaction: async (callback: (tx: Record<string, never>) => Promise<unknown>) => callback({}),
-        select: vi.fn((selection: Record<string, unknown> = {}) => ({
-          from: vi.fn(() => buildQuery(selection)),
-        })),
+        transaction: async (callback: (tx: unknown) => Promise<unknown>) => callback(tx),
+        execute: tx.execute,
+        select,
       };
     }
 

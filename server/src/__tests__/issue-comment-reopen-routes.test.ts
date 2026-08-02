@@ -39,9 +39,7 @@ const mockAgentService = vi.hoisted(() => ({
 const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
 const mockTxInsertValues = vi.hoisted(() => vi.fn(async () => undefined));
 const mockTxInsert = vi.hoisted(() => vi.fn(() => ({ values: mockTxInsertValues })));
-const mockTx = vi.hoisted(() => ({
-  insert: mockTxInsert,
-}));
+const mockTxExecute = vi.hoisted(() => vi.fn(async () => undefined));
 const mockDbSelectOrderBy = vi.hoisted(() => vi.fn(async () => []));
 const mockDbSelectLimit = vi.hoisted(() => vi.fn(() => ({
   then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
@@ -55,6 +53,15 @@ const mockDbSelectWhere = vi.hoisted(() => vi.fn(() => ({
 })));
 const mockDbSelectFrom = vi.hoisted(() => vi.fn(() => ({ where: mockDbSelectWhere })));
 const mockDbSelect = vi.hoisted(() => vi.fn(() => ({ from: mockDbSelectFrom })));
+// Denied-write recording enforces its aggregate bound inside `db.transaction`
+// under an advisory lock and fails closed, so the transaction executor has to
+// support `execute` (the lock) and `select` (the bound) — otherwise nothing is
+// ever recorded and every denial-recording assertion here fails.
+const mockTx = vi.hoisted(() => ({
+  insert: mockTxInsert,
+  execute: mockTxExecute,
+  select: mockDbSelect,
+}));
 const mockDb = vi.hoisted(() => ({
   select: mockDbSelect,
   transaction: vi.fn(async (fn: (tx: typeof mockTx) => Promise<unknown>) => fn(mockTx)),
@@ -680,8 +687,10 @@ describe.sequential("issue comment reopen routes", () => {
     // on the activity log with its target and the payload the actor tried
     // to send, so the content is recoverable rather than lost to the
     // transcript when no other writable surface (e.g. a GitHub PR) exists.
+    // Written through `mockTx`, not `mockDb`: the aggregate bound and the
+    // insert share one advisory-locked transaction so the cap cannot be raced.
     expect(mockLogActivity).toHaveBeenCalledWith(
-      mockDb,
+      mockTx,
       expect.objectContaining({
         action: "issue_write_denied",
         entityType: "issue",
@@ -695,7 +704,7 @@ describe.sequential("issue comment reopen routes", () => {
       }),
     );
     expect(mockLogActivity).toHaveBeenCalledWith(
-      mockDb,
+      mockTx,
       expect.objectContaining({
         action: "issue_write_denied",
         entityType: "issue",
