@@ -17516,6 +17516,33 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   async function sweepStaleIssueLocks() {
+    const pendingStageExitCancellations = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .innerJoin(
+        issues,
+        and(
+          eq(issues.companyId, heartbeatRuns.companyId),
+          eq(issues.executionRunId, heartbeatRuns.id),
+          eq(issues.status, "cancelled"),
+        ),
+      )
+      .where(and(
+        eq(heartbeatRuns.status, "running"),
+        sql`${heartbeatRuns.resultJson} ->> 'pipelineStageExitCancellationRequestedAt' is not null`,
+      ));
+    for (const run of pendingStageExitCancellations) {
+      await cancelRunInternal(
+        run.id,
+        "Cancelled because the pipeline case left the automation issue's originating stage",
+        {
+          errorCode: "pipeline_stage_exited",
+          eventMessage: "run cancelled after pipeline stage exit",
+        },
+      ).catch((error) => {
+        logger.warn({ err: error, runId: run.id }, "failed to reconcile pending pipeline stage-exit cancellation");
+      });
+    }
     return recovery.sweepStaleIssueLocks();
   }
 
@@ -24131,6 +24158,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
         if (activeExecutionRun && await cancelStaleScheduledRetry(activeExecutionRun)) {
           activeExecutionRun = null;
+        }
+
+        if (
+          issue.status === "cancelled" &&
+          activeExecutionRun?.status === "running" &&
+          readNonEmptyString(parseObject(activeExecutionRun.resultJson).pipelineStageExitCancellationRequestedAt)
+        ) {
+          await tx.insert(agentWakeupRequests).values({
+            companyId: agent.companyId,
+            agentId,
+            source,
+            triggerDetail,
+            reason: "pipeline_stage_exit_cancellation_pending",
+            payload,
+            status: "skipped",
+            requestedByActorType: opts.requestedByActorType ?? null,
+            requestedByActorId: opts.requestedByActorId ?? null,
+            idempotencyKey: opts.idempotencyKey ?? null,
+            finishedAt: new Date(),
+          });
+          if (suppression) suppression.durableSkipReason = "pipeline_stage_exit_cancellation_pending";
+          return { kind: "skipped" as const };
         }
 
         // A queued/scheduled run holding the lock for an agent that is

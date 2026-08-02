@@ -3066,6 +3066,22 @@ export function pipelineService(db: Db, deps: { heartbeat?: PipelineHeartbeatDep
     if (!cancelledIssue) return;
 
     if (preserveRunningGeneration && row.issueExecutionRunId) {
+      await tx
+        .update(heartbeatRuns)
+        .set({
+          resultJson: sql`jsonb_set(
+            coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb),
+            '{pipelineStageExitCancellationRequestedAt}',
+            to_jsonb(${now.toISOString()}::text),
+            true
+          )`,
+          updatedAt: now,
+        })
+        .where(and(
+          eq(heartbeatRuns.id, row.issueExecutionRunId),
+          eq(heartbeatRuns.companyId, input.companyId),
+          eq(heartbeatRuns.status, "running"),
+        ));
       input.runningRunIdsToCancel?.add(row.issueExecutionRunId);
     }
 
