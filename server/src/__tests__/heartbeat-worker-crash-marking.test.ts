@@ -657,4 +657,137 @@ describeEmbeddedPostgres("heartbeat worker-crash marking and recovery convergenc
       unsubscribe();
     }
   });
+
+  // ---- (i) a transient agent-load failure must not release the issue lock ---
+
+  it("does not release the issue execution lock when the agent load fails transiently", async () => {
+    // Sibling of (f), one step earlier in the same recovery. A thrown
+    // `getAgent` leaves `agent` null, so the retry-enqueue block never runs:
+    // `retry` is null but `retryEnqueueIncomplete` is false. Keying the
+    // release on `!retry` alone therefore dropped the issue's execution lock
+    // even though a retry is still owed and the replay will create one — the
+    // same detached-retry-beside-promoted-work hazard (f) covers, reached by a
+    // different path and NOT caught by (f)'s assertions.
+    const issueId = "22222222-2222-2222-2222-222222222222";
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const run = await seedCrashMarkedRun({ companyId, agentId, finishedAt: new Date(Date.now() - 60_000) });
+    await db
+      .update(heartbeatRuns)
+      .set({ contextSnapshot: { issueId } })
+      .where(eq(heartbeatRuns.id, run.id));
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Crash-recovery agent-load lock test issue",
+      status: "in_progress",
+      executionRunId: run.id,
+      executionLockedAt: new Date(Date.now() - 60_000),
+    });
+
+    const failing = service({
+      beforeCrashRecoveryAgentLoadForTest: () => {
+        throw new Error("agent read timed out");
+      },
+    });
+    const first = await failing.reconcileWorkerCrashedRuns();
+
+    expect(first.reconciledRunIds).toEqual([]);
+    expect(first.unresolvedRunIds).toEqual([run.id]);
+    const afterFailure = await readRun(run.id);
+    expect(afterFailure.crashRecoveryCompletedAt).toBeNull();
+    expect(afterFailure.crashRecoveryLastError).toContain("agent_load");
+    expect(await retriesOf(run.id)).toHaveLength(0);
+
+    // The assertion that fails pre-fix: the lock is still the original run's,
+    // not released to a fresh checkout that would race the owed retry.
+    const [issueAfterFailure] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(issueAfterFailure!.executionRunId).toBe(run.id);
+
+    // Replay with a healthy agent load: the retry is created and takes the lock.
+    const healthy = service();
+    const second = await healthy.reconcileWorkerCrashedRuns({
+      now: new Date(afterFailure.crashRecoveryNextAttemptAt!.getTime() + 1000),
+    });
+
+    expect(second.reconciledRunIds).toEqual([run.id]);
+    const retries = await retriesOf(run.id);
+    expect(retries).toHaveLength(1);
+    const [issueAfterRecovery] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(issueAfterRecovery!.executionRunId).toBe(retries[0]!.id);
+  });
+
+  // ---- (j) a failed terminal write must report the run unresolved ----------
+
+  it("reports the run unresolved when the terminal bookkeeping write itself fails", async () => {
+    // Every recovery step can succeed and the recovery still not be durable:
+    // if the final completion UPDATE throws, `crash_recovery_completed_at`
+    // stays null. The catch used to swallow that and return `completed: true`,
+    // so the caller logged the run as reconciled while the row remained a
+    // candidate — a reconciliation that never happened, reported as done.
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const run = await seedCrashMarkedRun({ companyId, agentId, finishedAt: new Date(Date.now() - 60_000) });
+
+    const heartbeat = service({
+      beforeCrashRecoveryTerminalWriteForTest: () => {
+        throw new Error("connection terminated during completion write");
+      },
+    });
+    const result = await heartbeat.reconcileWorkerCrashedRuns();
+
+    // Pre-fix this run appears in reconciledRunIds despite nothing persisting.
+    expect(result.reconciledRunIds).toEqual([]);
+    expect(result.unresolvedRunIds).toEqual([run.id]);
+    expect(await readRun(run.id).then((r) => r.crashRecoveryCompletedAt)).toBeNull();
+  });
+
+  // ---- (k) ownership is decided by finish order, not creation order --------
+
+  it("leaves the agent status of an older-created but later-finished run intact", async () => {
+    // The gap (d) does not cover. (d)'s newer run is created *after* the
+    // crash-marked owner, which the original guard's `created_at >
+    // owner.created_at` conjunct happened to catch. An overlapping run that
+    // started BEFORE the owner and outlived it is equally the current owner of
+    // the agent's derived state, but fails that creation-order test — so the
+    // whole NOT EXISTS found nothing and the stale replay wrote anyway.
+    const { companyId, agentId } = await seedCompanyAndAgent({ agentStatus: "error" });
+    await db
+      .update(agents)
+      .set({ errorReason: "overlapping run failed: provider rejected the request" })
+      .where(eq(agents.id, agentId));
+
+    // Created first, finished last.
+    const overlapping = await insertRun({ companyId, agentId, status: "failed" });
+    const stale = await seedCrashMarkedRun({
+      companyId,
+      agentId,
+      finishedAt: new Date(Date.now() - 24 * 60 * 60 * 1000),
+    });
+
+    // Pin both orderings explicitly rather than relying on insert timing:
+    // overlapping.created_at < stale.created_at (so the old conjunct excludes
+    // it) and overlapping.finished_at > stale.finished_at (so it genuinely
+    // owns the derived state).
+    const staleFinishedAt = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    await db
+      .update(heartbeatRuns)
+      .set({ createdAt: new Date(Date.now() - 48 * 60 * 60 * 1000), finishedAt: new Date(Date.now() - 60_000) })
+      .where(eq(heartbeatRuns.id, overlapping.id));
+    await db
+      .update(heartbeatRuns)
+      .set({ createdAt: new Date(Date.now() - 36 * 60 * 60 * 1000), finishedAt: staleFinishedAt })
+      .where(eq(heartbeatRuns.id, stale.id));
+
+    const heartbeat = service();
+    await heartbeat.reconcileWorkerCrashedRuns();
+
+    // Pre-fix: flipped to `idle` with errorReason nulled, silently discarding
+    // the overlapping run's outcome.
+    const [agent] = await db.select().from(agents).where(eq(agents.id, agentId));
+    expect(agent!.status).toBe("error");
+    expect(agent!.errorReason).toContain("overlapping run failed");
+
+    // Declining to write is a `superseded` finalization, not a failure, so the
+    // run is still stamped and does not replay at every startup.
+    expect(await readRun(stale.id).then((r) => r.crashRecoveryCompletedAt)).not.toBeNull();
+  });
 });
