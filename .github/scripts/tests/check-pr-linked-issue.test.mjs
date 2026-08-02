@@ -80,6 +80,65 @@ test('fails when #NNN is part of a word (no space before)', () => {
   assert.equal(result.passed, false);
 });
 
+// Paperclip control-plane issue identifiers (e.g. BLO-20901) — no GitHub
+// issue counterpart, so the #NNN forms above never match these PRs.
+
+test('passes with "Refs BLO-NNNN" (bare form)', () => {
+  assert.equal(checkLinkedIssue('Refs BLO-20901', 'fix: something').passed, true);
+});
+
+test('passes with "Refs: [BLO-NNNN](url)" (colon + markdown link)', () => {
+  assert.equal(
+    checkLinkedIssue(
+      'Refs: [BLO-20901](https://paperclip.blockcast.net/BLO/issues/BLO-20901)',
+      'fix: something'
+    ).passed,
+    true
+  );
+});
+
+test('passes with "Fixes BLO-NNNN" (case-insensitive prefix)', () => {
+  assert.equal(checkLinkedIssue('fixes blo-456', 'fix: something').passed, true);
+});
+
+test('passes with a bare Paperclip issue backlink URL', () => {
+  assert.equal(
+    checkLinkedIssue(
+      'See https://paperclip.blockcast.net/BLO/issues/BLO-20901 for context.',
+      'fix: bug'
+    ).passed,
+    true
+  );
+});
+
+test('passes with a Paperclip issue backlink URL followed by punctuation', () => {
+  assert.equal(
+    checkLinkedIssue('(https://paperclip.blockcast.net/BLO/issues/BLO-20901).', 'fix: bug').passed,
+    true
+  );
+});
+
+test('fails when the Paperclip issue URL is embedded inside another host', () => {
+  const result = checkLinkedIssue(
+    'See https://evil.example/https://paperclip.blockcast.net/BLO/issues/BLO-20901',
+    'fix: bug'
+  );
+  assert.equal(result.passed, false);
+});
+
+test('fails when the Paperclip issue URL continues into another host', () => {
+  const result = checkLinkedIssue(
+    'See https://paperclip.blockcast.net/BLO/issues/BLO-20901.evil.example',
+    'fix: bug'
+  );
+  assert.equal(result.passed, false);
+});
+
+test('fails with a bare Paperclip identifier and no Fixes/Closes/Refs keyword', () => {
+  const result = checkLinkedIssue('Related to BLO-20901 somehow', 'fix: bug');
+  assert.equal(result.passed, false);
+});
+
 // Prefix-aware skip behavior
 
 test('skips check for docs: prefix', () => {
