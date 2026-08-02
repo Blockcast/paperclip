@@ -234,7 +234,9 @@ describe("gemini remote execution", () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-gemini-sandbox-"));
     cleanupDirs.push(rootDir);
     const workspaceDir = path.join(rootDir, "workspace");
+    const remoteWorkspaceDir = path.join(rootDir, "remote-workspace");
     await mkdir(workspaceDir, { recursive: true });
+    await mkdir(remoteWorkspaceDir, { recursive: true });
 
     const geminiOutput = [
       JSON.stringify({ type: "system", subtype: "init", session_id: "gemini-session-2", model: "gemini-2.5-pro" }),
@@ -246,15 +248,30 @@ describe("gemini remote execution", () => {
         stats: { input_tokens: 1, cached_input_tokens: 0, output_tokens: 1 },
       }),
     ].join("\n");
-    const runnerExecute = vi.fn(async (input: { command: string; args?: string[] }) => ({
-      exitCode: 0,
-      signal: null,
-      timedOut: false,
-      stdout: input.command === "gemini" ? geminiOutput : "",
-      stderr: "",
-      pid: 321,
-      startedAt: new Date().toISOString(),
-    }));
+    const runnerExecute = vi.fn(async (input: { command: string; args?: string[]; env?: Record<string, string>; stdin?: string }) => {
+      if (input.command === "gemini") {
+        return {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          stdout: geminiOutput,
+          stderr: "",
+          pid: 321,
+          startedAt: new Date().toISOString(),
+        };
+      }
+      const actual = await vi.importActual<typeof import("@paperclipai/adapter-utils/server-utils")>(
+        "@paperclipai/adapter-utils/server-utils",
+      );
+      return actual.runChildProcess("gemini-sandbox-fixture", input.command, input.args ?? [], {
+        cwd: remoteWorkspaceDir,
+        env: input.env ?? {},
+        stdin: input.stdin,
+        timeoutSec: 30,
+        graceSec: 5,
+        onLog: async () => {},
+      });
+    });
 
     await execute({
       runId: "run-sandbox-1",
@@ -288,7 +305,7 @@ describe("gemini remote execution", () => {
         kind: "remote",
         transport: "sandbox",
         providerKey: "kubernetes",
-        remoteCwd: "/remote/workspace",
+        remoteCwd: remoteWorkspaceDir,
         runner: { execute: runnerExecute },
       },
       onLog: async () => {},
