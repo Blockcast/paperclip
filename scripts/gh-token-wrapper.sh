@@ -21,12 +21,15 @@ TOKEN_FILE="${PAPERCLIP_GITHUB_TOKEN_FILE:-/paperclip/.secrets/github-token/toke
 REAL_GH="${GH_TOKEN_WRAPPER_REAL_GH:-/usr/bin/gh.real}"
 
 # GH_SEAT_TOKEN_VALUE carries a token *value* rather than a path, for
-# credentials delivered by the scoped secret-binding path (per-agent /
-# per-project env bindings) instead of by a mounted secret volume. It exists so
-# a credential can be given to specific agents without mounting it into every
-# agent pod: the k8s adapters propagate every main-container secret volume into
-# every Job pod with no agent or tenant filter (BLO-18927, BLO-18970), so a
-# volume-delivered secret is necessarily fleet-wide.
+# credentials delivered by the scoped secret-binding path (agent-scoped env
+# bindings only) instead of by a mounted secret volume. Project, environment and
+# routine scope are NOT delivery routes for this key: AGENT_SCOPE_ONLY_ENV_KEYS
+# (server/src/services/heartbeat.ts) strips it from all three, so that a
+# lower-trust writer cannot select the identity every `gh` call runs as.
+# It exists so a credential can be given to specific agents without mounting it
+# into every agent pod: the k8s adapters propagate every main-container secret
+# volume into every Job pod with no agent or tenant filter (BLO-18927,
+# BLO-18970), so a volume-delivered secret is necessarily fleet-wide.
 #
 # The name deliberately does NOT start with `PAPERCLIP_`. Do not "fix" it for
 # consistency with the FILE variable below — the prefix is load-bearing in the
