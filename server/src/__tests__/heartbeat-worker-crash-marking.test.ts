@@ -9,6 +9,7 @@ import {
   externalRuntimeReservations,
   heartbeatRunEvents,
   heartbeatRuns,
+  issues,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -50,8 +51,9 @@ describeEmbeddedPostgres("heartbeat worker-crash marking and recovery convergenc
   afterEach(async () => {
     // runningProcesses is module-level and shared across service instances.
     runningProcesses.clear();
-    // FK order: events reference runs reference agents reference companies, and
-    // reservations reference runs.
+    // FK order: issues reference runs and companies; events reference runs
+    // reference agents reference companies; reservations reference runs.
+    await db.delete(issues);
     await db.delete(heartbeatRunEvents);
     await db.delete(externalRuntimeReservations);
     await db.delete(heartbeatRuns);
@@ -430,5 +432,135 @@ describeEmbeddedPostgres("heartbeat worker-crash marking and recovery convergenc
 
     const [agent] = await db.select().from(agents).where(eq(agents.id, agentId));
     expect(agent!.status).toBe("paused");
+  });
+
+  // ---- (e) a stale recovery's terminal write cannot clobber a fresher claim -
+
+  it("does not let a stale recovery's terminal write clobber a fresher claim's bookkeeping", async () => {
+    // The durable claim (test (a) above) prevents two replicas from recovering
+    // the same run *concurrently*. It does not, by itself, protect the two
+    // terminal writes that follow it: recovery makes an unbounded provider RPC,
+    // so a call that outlives its own claim lease can still be mid-flight when
+    // a fresher claim has already won the row and moved it forward. Before
+    // BLO-20822's CAS fix, both terminal writes were unconditional
+    // `where(eq(id, run.id))`, so whichever call's write lands *last* wins —
+    // even a stale one whose lease has long since expired.
+    //
+    // Replica A is parked (healthy otherwise) past its own lease. While it is
+    // parked, replica B reclaims the row (the lease has expired) and fails a
+    // required step, correctly leaving the row unresolved with a backoff. A is
+    // then released and finishes successfully, and attempts its own terminal
+    // "complete" write — which must lose to B's fresher bookkeeping rather than
+    // falsely marking a genuinely-unresolved run complete.
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const run = await seedCrashMarkedRun({ companyId, agentId, finishedAt: new Date(Date.now() - 60_000) });
+
+    let releaseA: () => void;
+    const parked = new Promise<void>((resolve) => { releaseA = resolve; });
+    let enteredA: () => void;
+    const hasParked = new Promise<void>((resolve) => { enteredA = resolve; });
+
+    const replicaA = service({
+      environmentRuntime: {
+        releaseRunLeases: async () => {
+          enteredA();
+          await parked;
+          return [];
+        },
+      } as unknown as HeartbeatEnvironmentRuntime,
+    });
+    const replicaB = service({ environmentRuntime: failingEnvironmentRuntime() });
+
+    const t0 = new Date();
+    const aPromise = replicaA.reconcileWorkerCrashedRuns({ now: t0, maxRuns: 1 });
+    await hasParked;
+
+    // A has claimed by now; read back the lease it claimed so B's `now` is
+    // guaranteed past it regardless of the exact TTL constant.
+    const claimedByA = await readRun(run.id);
+    expect(claimedByA.crashRecoveryNextAttemptAt).not.toBeNull();
+    const t1 = new Date(claimedByA.crashRecoveryNextAttemptAt!.getTime() + 1000);
+
+    const b = await replicaB.reconcileWorkerCrashedRuns({ now: t1, maxRuns: 1 });
+    expect(b.unresolvedRunIds).toEqual([run.id]);
+    const afterB = await readRun(run.id);
+    expect(afterB.crashRecoveryCompletedAt).toBeNull();
+    expect(afterB.crashRecoveryLastError).toContain("environment_leases");
+    const bBackoffLease = afterB.crashRecoveryNextAttemptAt;
+    expect(bBackoffLease).not.toBeNull();
+
+    releaseA!();
+    const a = await aPromise;
+    // A completed every step locally, but its terminal write lost the CAS —
+    // it must not report a completion the persisted row does not reflect.
+    expect(a.reconciledRunIds).toEqual([]);
+
+    const final = await readRun(run.id);
+    // The core regression assertion: B's real "still unresolved" finding must
+    // survive A's late, stale write. Pre-fix this is stamped non-null instead,
+    // permanently hiding a run whose environment lease was never released.
+    expect(final.crashRecoveryCompletedAt).toBeNull();
+    expect(final.crashRecoveryLastError).toContain("environment_leases");
+    expect(final.crashRecoveryNextAttemptAt?.getTime()).toBe(bBackoffLease!.getTime());
+  });
+
+  // ---- (f) a failed retry enqueue must not release the issue lock early ----
+
+  it("does not release the issue execution lock when retry enqueue fails, and releases it once retry succeeds", async () => {
+    // `enqueueProcessLossRetry` failing outright (not `suppressed`, a thrown
+    // error) is REQUIRED and leaves the whole recovery incomplete. Before
+    // BLO-20822, the issue-release branch keyed only on `!retry` — true for
+    // both "suppressed" and "threw" — so a failed enqueue still released and
+    // promoted the issue's execution lock. A different agent could then claim
+    // the issue before the retry that was supposed to own it existed.
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const run = await seedCrashMarkedRun({ companyId, agentId, finishedAt: new Date(Date.now() - 60_000) });
+    await db
+      .update(heartbeatRuns)
+      .set({ contextSnapshot: { issueId: "11111111-1111-1111-1111-111111111111" } })
+      .where(eq(heartbeatRuns.id, run.id));
+    await db.insert(issues).values({
+      id: "11111111-1111-1111-1111-111111111111",
+      companyId,
+      title: "Crash-recovery lock test issue",
+      status: "in_progress",
+      executionRunId: run.id,
+      executionLockedAt: new Date(Date.now() - 60_000),
+    });
+
+    const failing = service({
+      beforeProcessLossRetryEnqueueForTest: async () => {
+        throw new Error("enqueue RPC unreachable");
+      },
+    });
+    const first = await failing.reconcileWorkerCrashedRuns();
+
+    expect(first.reconciledRunIds).toEqual([]);
+    expect(first.unresolvedRunIds).toEqual([run.id]);
+    const afterFailure = await readRun(run.id);
+    expect(afterFailure.crashRecoveryCompletedAt).toBeNull();
+    expect(afterFailure.crashRecoveryLastError).toContain("retry_enqueue");
+    expect(await retriesOf(run.id)).toHaveLength(0);
+
+    // The lock must still be held by the original run — not released, and not
+    // yet re-pointed at a retry that does not exist.
+    const [issueAfterFailure] = await db.select().from(issues).where(eq(issues.id, "11111111-1111-1111-1111-111111111111"));
+    expect(issueAfterFailure!.executionRunId).toBe(run.id);
+
+    // Next pass, enqueue succeeds: the whole recovery (including the
+    // previously-skipped release) replays and completes.
+    const healthy = service();
+    const second = await healthy.reconcileWorkerCrashedRuns({
+      now: new Date(afterFailure.crashRecoveryNextAttemptAt!.getTime() + 1000),
+    });
+
+    expect(second.reconciledRunIds).toEqual([run.id]);
+    const retries = await retriesOf(run.id);
+    expect(retries).toHaveLength(1);
+    const [issueAfterRecovery] = await db.select().from(issues).where(eq(issues.id, "11111111-1111-1111-1111-111111111111"));
+    // The retry re-points the lock at itself (enqueueProcessLossRetry's own
+    // update), not a bare release — the point under test is only that this
+    // did not happen prematurely on the failed pass above.
+    expect(issueAfterRecovery!.executionRunId).toBe(retries[0]!.id);
   });
 });

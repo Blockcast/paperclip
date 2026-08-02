@@ -45,6 +45,7 @@ const {
     resumeRunningExternalRuntimeRuns: vi.fn(async () => 0),
     stopDispatch: vi.fn(),
     reconcileHotRestartAdoption: vi.fn(async () => ({ mode: "none" })),
+    reconcileWorkerCrashedRuns: vi.fn(async () => ({ reconciledRunIds: [], retryRunIds: [], unresolvedRunIds: [] })),
     reapOrphanedRuns: vi.fn(async () => ({ reaped: 0, runIds: [] })),
     promoteDueScheduledRetries: vi.fn(async () => ({ promoted: 0, runIds: [] })),
     resumeQueuedRuns: vi.fn(async () => undefined),
@@ -510,6 +511,41 @@ describe("startServer feedback export wiring", () => {
       await Promise.resolve();
 
       expect(heartbeatServiceMock.sweepStaleIssueLocks).toHaveBeenCalledTimes(1);
+    } finally {
+      setIntervalSpy.mockRestore();
+    }
+  });
+
+  // BLO-20822: a startup-only pass misses a lease left by a recoverer that
+  // died mid-cleanup on this replica's own previous life — a replica that
+  // restarts immediately runs its startup pass before that lease expires and
+  // skips the row, and nothing revisits it short of another full restart.
+  // Pre-fix, `reconcileWorkerCrashedRuns` was called only once, from the
+  // startup recovery sequence; this pins that it also runs on the recurring
+  // scheduler tick.
+  it("runs worker-crash reconciliation on the periodic scheduler tick, not just at startup", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+    let intervalCallback: (() => void) | null = null;
+    const setIntervalSpy = vi
+      .spyOn(globalThis, "setInterval")
+      .mockImplementation(((callback: () => void) => {
+        intervalCallback = callback;
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      }) as typeof setInterval);
+
+    try {
+      await startServer();
+      expect(heartbeatServiceMock.reconcileWorkerCrashedRuns).toHaveBeenCalledTimes(1);
+      heartbeatServiceMock.reconcileWorkerCrashedRuns.mockClear();
+
+      intervalCallback?.();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(heartbeatServiceMock.reconcileWorkerCrashedRuns).toHaveBeenCalledTimes(1);
     } finally {
       setIntervalSpy.mockRestore();
     }

@@ -8579,6 +8579,16 @@ export interface HeartbeatServiceOptions {
   beforeQueuedDispatchRefusalStatusReadForTest?: (
     run: typeof heartbeatRuns.$inferSelect,
   ) => Promise<void> | void;
+  /**
+   * Test-only failure injection: fired at the start of `enqueueProcessLossRetry`,
+   * before any DB work. Throwing here simulates the enqueue itself failing —
+   * otherwise not reachable from the public test surface — so
+   * `recoverCrashInterruptedRun`'s "retry_enqueue incomplete, so issue_release
+   * must not run" gate (BLO-20822) can be exercised deterministically.
+   */
+  beforeProcessLossRetryEnqueueForTest?: (
+    run: typeof heartbeatRuns.$inferSelect,
+  ) => Promise<void> | void;
 }
 
 function isTruthyRuntimeEnvValue(value: string | undefined) {
@@ -11775,7 +11785,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // transaction that allocated `seq`, so allocation and append share one
     // owner. Defaults to the pool, which is every pre-existing caller.
     executor: HeartbeatDbExecutor = db,
-  ) {
+  ): Promise<{ publish: () => void }> {
     const eventAt = new Date();
     const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
     const sanitizedMessage = event.message
@@ -11809,40 +11819,54 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       payload: sanitizedPayload,
     });
 
-    publishLiveEvent({
-      companyId: run.companyId,
-      type: "heartbeat.run.event",
-      payload: {
-        runId: run.id,
-        agentId: run.agentId,
-        issueId,
-        seq,
-        eventType: event.eventType,
-        stream: event.stream ?? null,
-        level: event.level ?? null,
-        color: event.color ?? null,
-        message: sanitizedMessage ?? null,
-        currentToolName: progress?.currentToolName ?? null,
-        lastAssistantSnippet: progress?.lastAssistantSnippet ?? null,
-        lastEventAt: (progress?.lastEventAt ?? eventAt).toISOString(),
-        payload: sanitizedPayload ?? null,
-      },
-    });
-    if (progress && isHeartbeatRunRuntimeStatusActive(run.status)) {
-      const status = setHeartbeatRunRuntimeStatus({
+    const publish = () => {
+      publishLiveEvent({
         companyId: run.companyId,
-        issueId,
-        agentId: run.agentId,
-        runId: run.id,
-        phase: progress.phase,
-        message: progress.message,
-        updatedAt: eventAt,
-        currentToolName: progress.currentToolName,
-        lastAssistantSnippet: progress.lastAssistantSnippet,
-        lastEventAt: progress.lastEventAt,
+        type: "heartbeat.run.event",
+        payload: {
+          runId: run.id,
+          agentId: run.agentId,
+          issueId,
+          seq,
+          eventType: event.eventType,
+          stream: event.stream ?? null,
+          level: event.level ?? null,
+          color: event.color ?? null,
+          message: sanitizedMessage ?? null,
+          currentToolName: progress?.currentToolName ?? null,
+          lastAssistantSnippet: progress?.lastAssistantSnippet ?? null,
+          lastEventAt: (progress?.lastEventAt ?? eventAt).toISOString(),
+          payload: sanitizedPayload ?? null,
+        },
       });
-      if (status) publishHeartbeatRunRuntimeProgress(status);
+      if (progress && isHeartbeatRunRuntimeStatusActive(run.status)) {
+        const status = setHeartbeatRunRuntimeStatus({
+          companyId: run.companyId,
+          issueId,
+          agentId: run.agentId,
+          runId: run.id,
+          phase: progress.phase,
+          message: progress.message,
+          updatedAt: eventAt,
+          currentToolName: progress.currentToolName,
+          lastAssistantSnippet: progress.lastAssistantSnippet,
+          lastEventAt: progress.lastEventAt,
+        });
+        if (status) publishHeartbeatRunRuntimeProgress(status);
+      }
+    };
+
+    // BLO-19722: a caller that passes an explicit executor is writing inside
+    // its own transaction (see `appendRunEventAtomicSeq` below) and owns when
+    // to publish. Publishing here, before that transaction commits, would let
+    // a rollback leave subscribers holding a phantom event for a row that was
+    // never durably written. The default pooled executor autocommits the
+    // insert above before this line runs, so every pre-existing caller (which
+    // never passes an executor) keeps publishing immediately.
+    if (executor === db) {
+      publish();
     }
+    return { publish };
   }
 
   async function nextRunEventSeq(runId: string) {
@@ -11886,7 +11910,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       payload?: Record<string, unknown>;
     },
   ) {
-    await db.transaction(async (tx) => {
+    // BLO-19722: publish is deferred out of the transaction and invoked here,
+    // after `db.transaction` has committed — see the comment on
+    // `appendRunEvent`'s `publish` closure for why publishing inside the
+    // still-open transaction would risk a phantom event on rollback.
+    const { publish } = await db.transaction(async (tx) => {
       await tx.execute(
         sql`select pg_advisory_xact_lock(hashtextextended(${`heartbeat-run-event-seq:${run.id}`}, 0))`,
       );
@@ -11894,8 +11922,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .select({ maxSeq: sql<number | null>`max(${heartbeatRunEvents.seq})` })
         .from(heartbeatRunEvents)
         .where(eq(heartbeatRunEvents.runId, run.id));
-      await appendRunEvent(run, Number(row?.maxSeq ?? 0) + 1, event, tx);
+      return appendRunEvent(run, Number(row?.maxSeq ?? 0) + 1, event, tx);
     });
+    publish();
   }
 
   async function persistRunProcessMetadata(
@@ -12267,6 +12296,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     agent: typeof agents.$inferSelect,
     now: Date,
   ): Promise<ProcessLossRetryResult> {
+    await options.beforeProcessLossRetryEnqueueForTest?.(run);
     const existingRetry = await db
       .select()
       .from(heartbeatRuns)
@@ -12957,12 +12987,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     //
     // `crashRecoveryAttempts` is incremented here, at claim time, so an attempt
     // is counted even if the process dies before recording an outcome.
+    //
+    // `claimLeaseUntil` is also the CAS token the two terminal writes below
+    // check against. The claim UPDATE above is itself a compare-and-set on
+    // `id`, but the two writes that follow it were, before BLO-20822's
+    // follow-up, unconditional `where(eq(id, run.id))` — safe only if this
+    // call is guaranteed to finish inside its own lease. It is not: the
+    // cleanup below makes a provider RPC with no bound on it. If that RPC
+    // outlives `WORKER_CRASH_RECOVERY_CLAIM_TTL_MS`, a fresher claim can win
+    // the row out from under this call, and an unconditional terminal write
+    // would then clobber that fresher attempt's bookkeeping with this stale
+    // one's.
     const attempts = (run.crashRecoveryAttempts ?? 0) + 1;
+    const claimLeaseUntil = new Date(now.getTime() + WORKER_CRASH_RECOVERY_CLAIM_TTL_MS);
     const claimed = await db
       .update(heartbeatRuns)
       .set({
         crashRecoveryAttempts: attempts,
-        crashRecoveryNextAttemptAt: new Date(now.getTime() + WORKER_CRASH_RECOVERY_CLAIM_TTL_MS),
+        crashRecoveryNextAttemptAt: claimLeaseUntil,
         updatedAt: now,
       })
       .where(and(
@@ -13037,6 +13079,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // retry the original recovery deliberately withheld once the agent became
     // invokable again.
     let retry: typeof heartbeatRuns.$inferSelect | null = null;
+    let retryEnqueueIncomplete = false;
     if (agent && !agentLoadFailed) {
       try {
         const result = await enqueueProcessLossRetry(run, agent, now);
@@ -13048,6 +13091,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
       } catch (error) {
         logger.warn({ err: error, runId: run.id }, "failed to enqueue crash-interrupted run retry");
+        retryEnqueueIncomplete = true;
         record("retry_enqueue", { kind: "incomplete", detail: describeRecoveryError(error) });
       }
     }
@@ -13056,7 +13100,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // itself on the non-invokable path while every caller *also* released on a
     // falsy return, so this ran twice. Releasing is required only when no retry
     // owns the issue — a retry already re-points the execution lock at itself.
-    if (!retry) {
+    //
+    // A failed `retry_enqueue` above is *also* a falsy `retry`, but it must
+    // not take this branch: releasing now would let a fresh checkout claim
+    // the issue before the retry that is meant to own it exists, and this
+    // whole recovery is already incomplete and will be replayed in full
+    // (including this release) once a later attempt succeeds at enqueueing
+    // the retry.
+    if (retryEnqueueIncomplete) {
+      record("issue_release", { kind: "skipped", detail: "retry_enqueue incomplete; lock left until a retry exists" });
+    } else if (!retry) {
       try {
         await releaseIssueExecutionAndPromote(run);
         record("issue_release", { kind: "done" });
@@ -13113,6 +13166,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .filter((step) => step.outcome.kind === "incomplete")
       .map((step) => `${step.name}: ${step.outcome.kind === "incomplete" ? step.outcome.detail : ""}`);
 
+    // Both terminal writes below are guarded by `claimLeaseUntil`, not just
+    // `id`: if this call outlived its lease (see the comment at the claim
+    // above), a fresher claim already rewrote `crashRecoveryNextAttemptAt`
+    // for its own attempt, and the CAS fails with zero rows rather than
+    // clobbering it. `supersededStamp` records that so the returned
+    // `completed` doesn't claim a durable stamp that didn't happen.
+    let supersededStamp = false;
     try {
       if (incompleteSteps.length === 0) {
         // Last write, deliberately: the durable "every required step ran"
@@ -13121,7 +13181,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // only pass that can find it. Best-effort — if this write is the one
         // that dies, the run stays a candidate and the (idempotent) cleanup is
         // simply replayed next startup.
-        await db
+        const stamped = await db
           .update(heartbeatRuns)
           .set({
             crashRecoveryCompletedAt: now,
@@ -13129,23 +13189,46 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             crashRecoveryLastError: null,
             updatedAt: now,
           })
-          .where(eq(heartbeatRuns.id, run.id));
+          .where(and(
+            eq(heartbeatRuns.id, run.id),
+            eq(heartbeatRuns.crashRecoveryNextAttemptAt, claimLeaseUntil),
+          ))
+          .returning({ id: heartbeatRuns.id });
+        if (stamped.length === 0) {
+          supersededStamp = true;
+          logger.warn(
+            { runId: run.id, attempts },
+            "worker-crash recovery completion superseded by a newer claim; leaving the newer attempt's bookkeeping in place",
+          );
+        }
       } else {
         // Explicitly NOT stamped. The row stays unresolved and visible, but its
         // claim lease is extended into a backoff so it stops occupying a slot
         // in the oldest-first batch.
-        await db
+        const backedOff = await db
           .update(heartbeatRuns)
           .set({
             crashRecoveryNextAttemptAt: new Date(now.getTime() + workerCrashRecoveryBackoffMs(attempts)),
             crashRecoveryLastError: describeRecoveryError(incompleteSteps.join("; ")),
             updatedAt: now,
           })
-          .where(eq(heartbeatRuns.id, run.id));
-        logger.warn(
-          { runId: run.id, attempts, incompleteSteps },
-          "worker-crash recovery left required cleanup unresolved; backing off",
-        );
+          .where(and(
+            eq(heartbeatRuns.id, run.id),
+            eq(heartbeatRuns.crashRecoveryNextAttemptAt, claimLeaseUntil),
+          ))
+          .returning({ id: heartbeatRuns.id });
+        if (backedOff.length === 0) {
+          supersededStamp = true;
+          logger.warn(
+            { runId: run.id, attempts, incompleteSteps },
+            "worker-crash recovery backoff superseded by a newer claim; leaving the newer attempt's bookkeeping in place",
+          );
+        } else {
+          logger.warn(
+            { runId: run.id, attempts, incompleteSteps },
+            "worker-crash recovery left required cleanup unresolved; backing off",
+          );
+        }
       }
     } catch (error) {
       logger.warn({ err: error, runId: run.id }, "failed to persist crash recovery progress");
@@ -13154,7 +13237,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return {
       retryRunId: retry?.id ?? null,
       claimed: true,
-      completed: incompleteSteps.length === 0,
+      completed: incompleteSteps.length === 0 && !supersededStamp,
       incompleteSteps,
     };
   }
@@ -27239,10 +27322,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // gate on suppression should prefer this over the env-only resolver.
     resolveSchedulingSuppression: getSchedulingSuppression,
     drainRunningRunsForShutdown,
-    // BLO-19722. `markRunsInterruptedByWorkerCrash` is wired in as the crash
-    // guard's `onCrash` callback at the process entrypoint;
-    // `reconcileWorkerCrashedRuns` runs once at startup to finish any recovery
-    // a previous crash could not.
+    // BLO-19722. `markRunsInterruptedByWorkerCrash` is meant to be wired in
+    // as the crash guard's `onCrash` callback at the process entrypoint, but
+    // that wiring rides with PR A (`installProcessCrashGuard`, #925/#949) and
+    // does not exist yet at this head — the only caller today is
+    // `heartbeat-worker-crash-marking.test.ts`. Until that commit lands,
+    // crash-time marking never runs; `reconcileWorkerCrashedRuns` (both at
+    // startup and on the periodic tick, see index.ts) is what recovers a
+    // crash's runs in the meantime.
     markRunsInterruptedByWorkerCrash,
     reconcileWorkerCrashedRuns,
 

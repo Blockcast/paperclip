@@ -1386,6 +1386,25 @@ export async function startServer(): Promise<StartedServer> {
 
         if (heartbeatSchedulerStopped) return;
         if (!(await heartbeat.resolveSchedulingSuppression()).suppressed) {
+          // BLO-20822: a startup-only pass misses a lease left by a recoverer
+          // that died mid-cleanup on *this* replica's previous life — an
+          // immediately-restarting replacement's own startup pass runs
+          // before that lease expires and skips the row (see
+          // `reconcileWorkerCrashedRuns`'s poison-row filter), and nothing
+          // else revisits it short of another full restart. Running this on
+          // the same tick as the other periodic reconcilers below closes
+          // that gap without waiting on a restart.
+          trackHeartbeatSchedulerWork(heartbeat
+            .reconcileWorkerCrashedRuns()
+            .then((result) => {
+              if (result.reconciledRunIds.length > 0 || result.unresolvedRunIds.length > 0) {
+                logger.warn({ ...result }, "periodic worker-crash recovery reconciliation complete");
+              }
+            })
+            .catch((err) => {
+              logger.error({ err }, "periodic worker-crash recovery reconciliation failed");
+            }));
+
           trackHeartbeatSchedulerWork(heartbeat
             .sweepStaleIssueLocks()
             .then((swept) => {
