@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
-import { DEFAULT_COVER_DEDUP_WINDOW_MINUTES, DEFAULT_ESCALATION_DEADLINE_MINUTES, alertStateRef } from "./constants.js";
+import { DEFAULT_COVER_DEDUP_WINDOW_MINUTES, DEFAULT_ESCALATION_DEADLINE_MINUTES, STATE_KEYS, alertStateRef } from "./constants.js";
 import { resolveIssueRoute } from "./issue-route-resolver.js";
 import { ORIGIN_KIND, type AlertmanagerAlert, type AlertmanagerPluginConfig, type AlertStateRecord } from "./types.js";
 
@@ -84,11 +84,19 @@ function isCoverDedupConflict(err: unknown): boolean {
 async function upsertOpenMember(ctx: PluginContext, coverIssueId: string, alertIssueId: string): Promise<boolean> {
   const ns = ctx.db.namespace;
   const result = await ctx.db.execute(
-    `INSERT INTO ${q(ns, MEMBERS_TABLE)} (id, cover_issue_id, alert_issue_id)
-     VALUES ($1, $2, $3)
+    `WITH available_cover AS (
+       SELECT cover_issue_id FROM ${q(ns, COVERS_TABLE)}
+        WHERE cover_issue_id = $2
+          AND closing_claimed_at IS NULL
+          AND cancelled_at IS NULL
+        FOR UPDATE
+     )
+     INSERT INTO ${q(ns, MEMBERS_TABLE)} (id, cover_issue_id, alert_issue_id)
+     SELECT $1, cover_issue_id, $3 FROM available_cover
      ON CONFLICT (cover_issue_id, alert_issue_id)
      DO UPDATE SET resolved_at = NULL, updated_at = now()
-     WHERE ${q(ns, MEMBERS_TABLE)}.resolved_at IS NOT NULL`,
+     WHERE ${q(ns, MEMBERS_TABLE)}.resolved_at IS NOT NULL
+       AND EXISTS (SELECT 1 FROM available_cover)`,
     [randomUUID(), coverIssueId, alertIssueId],
   );
   return result.rowCount > 0;
@@ -188,6 +196,15 @@ async function createCover(
         [retained.id, companyId, fingerprint],
       );
       const attached = await upsertOpenMember(ctx, retained.id, issue.id);
+      const [cover] = await ctx.db.query<{
+        closing_claimed_at: string | null;
+        cancelled_at: string | null;
+      }>(
+        `SELECT closing_claimed_at, cancelled_at FROM ${q(ns, COVERS_TABLE)}
+          WHERE cover_issue_id = $1`,
+        [retained.id],
+      );
+      if (cover?.closing_claimed_at || cover?.cancelled_at) continue;
       if (attached) {
         await ctx.issues.createComment(
           retained.id,
@@ -198,6 +215,9 @@ async function createCover(
       return;
     }
   }
+  throw new Error(
+    `Cannot attach ${issue.id} to escalation cover ${fingerprint}: the retained cover is closing`,
+  );
 }
 
 /**
@@ -316,6 +336,32 @@ export async function recordSourceResolvedAndCloseCovers(
 }
 
 /**
+ * Restores cover tracking when aggregate resolution raced a source re-fire.
+ * Only sources that previously reached a cover are eligible; createCover then
+ * reopens a healthy membership or converges on a fresh cover if the old one is
+ * already closing or cancelled.
+ */
+export async function recordSourceFiringAndRepairCovers(
+  ctx: PluginContext,
+  companyId: string,
+  alertIssueId: string,
+  alertname: string,
+  config: AlertmanagerPluginConfig,
+): Promise<void> {
+  const ns = ctx.db.namespace;
+  const [priorMembership] = await ctx.db.query<{ present: boolean }>(
+    `SELECT true AS present FROM ${q(ns, MEMBERS_TABLE)} WHERE alert_issue_id = $1 LIMIT 1`,
+    [alertIssueId],
+  );
+  if (!priorMembership) return;
+  const issue = await ctx.issues.get(alertIssueId, companyId);
+  if (!issue) {
+    throw new Error(`Cannot repair escalation cover for missing issue ${alertIssueId}`);
+  }
+  await createCover(ctx, issue, companyId, alertname, config, new Date());
+}
+
+/**
  * Sweep backstop for the durable-retry requirement: a cover whose closing
  * claim succeeded but whose terminal transition never completed (a crash or
  * transient failure — including a failed `createComment`, BLO-16120 PR #662
@@ -375,8 +421,14 @@ async function advanceIssueLadder(
   now: Date,
 ): Promise<void> {
   if (["done", "cancelled"].includes(issue.status) || !issue.originId) return;
-  const ref = alertStateRef(companyId, issue.originId);
-  const state = await ctx.state.get(ref) as AlertStateRecord | null;
+  const aggregateRef = {
+    scopeKind: "instance" as const,
+    stateKey: STATE_KEYS.aggregate(companyId, issue.originId),
+  };
+  const aggregateState = await ctx.state.get(aggregateRef) as AlertStateRecord | null;
+  const legacyRef = alertStateRef(companyId, issue.originId);
+  const ref = aggregateState ? aggregateRef : legacyRef;
+  const state = aggregateState ?? await ctx.state.get(legacyRef) as AlertStateRecord | null;
   if (!state || state.resolvedAt || state.escalationComplete || !state.nextEscalationAt || Date.parse(state.nextEscalationAt) > now.getTime()) return;
   const hold = holdUntil(await ctx.issues.listComments(issue.id, companyId));
   if (hold && hold > now.getTime()) {

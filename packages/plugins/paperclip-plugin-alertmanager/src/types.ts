@@ -109,6 +109,8 @@ export interface AlertmanagerPluginConfig {
    * their own. Defaults to `DEFAULT_COVER_DEDUP_WINDOW_MINUTES`.
    */
   coverDedupWindowMinutes?: number;
+  /** Named agent used when no user owner route resolves. Required for safe intake. */
+  fallbackAgentName?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -184,6 +186,7 @@ export interface AlertStateRecord {
    * recomputable in the sweep because alert labels are not persisted.
    */
   escalationIntervalMs?: number | null;
+  aggregateKey?: string;
 }
 
 /**

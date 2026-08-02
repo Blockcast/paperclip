@@ -167,6 +167,28 @@ export async function resolveAssigneeUserId(
   return { assigneeUserId, assigneeAgentId: undefined, resolution };
 }
 
+export async function resolveFallbackAgentId(
+  ctx: Pick<PluginContext, "agents" | "logger">,
+  companyId: string,
+  fallbackAgentName: string | undefined,
+): Promise<string | undefined> {
+  const target = fallbackAgentName?.trim().toLowerCase();
+  if (!target) return undefined;
+  // The host obtains one company-wide snapshot before applying an optional
+  // window. Omitting the window avoids cross-page drift from its unordered list.
+  const agents = await ctx.agents.list({ companyId });
+  const matches = agents.filter(
+    (agent) => agent.name.trim().toLowerCase() === target,
+  );
+  if (matches.length !== 1) {
+    ctx.logger.warn(
+      `Fallback agent "${fallbackAgentName}" resolved to ${matches.length} agents; refusing ownerless issue creation`,
+    );
+    return undefined;
+  }
+  return matches[0]?.id;
+}
+
 function normalizeEmail(email: string): string {
   return email.trim().toLowerCase();
 }

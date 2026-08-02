@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   resolveAssigneeUserId,
+  resolveFallbackAgentId,
   resolveOwnerEmail,
   resolveOwnerUserId,
 } from "../owner-resolver.js";
@@ -363,6 +364,52 @@ describe("resolveOwnerUserId — caching behaviour", () => {
     expect(await resolveOwnerUserId(ctx, "   ")).toBeUndefined();
     expect(state.get).not.toHaveBeenCalled();
     expect(users.findByEmail).not.toHaveBeenCalled();
+  });
+});
+
+describe("resolveFallbackAgentId — exhaustive lookup", () => {
+  it("finds a sole exact-name match in one unwindowed snapshot", async () => {
+    const allAgents = Array.from({ length: 200 }, (_, index) => ({
+      id: `other-${index}`,
+      name: `Other ${index}`,
+    })).concat([{ id: "fallback", name: "Alert Fallback" }]);
+    const agents = {
+      list: vi.fn().mockResolvedValueOnce(allAgents),
+    };
+    const logger = { warn: vi.fn() };
+
+    await expect(
+      resolveFallbackAgentId(
+        { agents, logger } as unknown as Parameters<typeof resolveFallbackAgentId>[0],
+        "company-1",
+        "Alert Fallback",
+      ),
+    ).resolves.toBe("fallback");
+    expect(agents.list).toHaveBeenCalledWith({ companyId: "company-1" });
+  });
+
+  it("fails closed when the snapshot contains duplicate exact-name matches", async () => {
+    const allAgents = [
+      { id: "first", name: "Alert Fallback" },
+      ...Array.from({ length: 199 }, (_, index) => ({
+        id: `other-${index}`,
+        name: `Other ${index}`,
+      })),
+      { id: "second", name: "alert fallback" },
+    ];
+    const agents = {
+      list: vi.fn().mockResolvedValueOnce(allAgents),
+    };
+    const logger = { warn: vi.fn() };
+
+    await expect(
+      resolveFallbackAgentId(
+        { agents, logger } as unknown as Parameters<typeof resolveFallbackAgentId>[0],
+        "company-1",
+        "Alert Fallback",
+      ),
+    ).resolves.toBeUndefined();
+    expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("resolved to 2 agents"));
   });
 });
 

@@ -15,6 +15,9 @@ export const WEBHOOK_KEYS = {
 export const STATE_KEYS = {
   /** Per-fingerprint dedup row. See spec §6. */
   alert: (fingerprint: string) => `alert:${fingerprint}`,
+  /** Company-scoped lifecycle and escalation state for one aggregate issue. */
+  aggregate: (companyId: string, aggregateKey: string) =>
+    `alert-aggregate:${companyId}:${aggregateKey}`,
   /** Per-email cached Paperclip user id (positive cache). Empty string = negative cache. */
   ownerByEmail: (email: string) => `owner-by-email:${email}`,
   /** Mirror of config.ownerMap — editable from UI without re-deploying. */
@@ -235,6 +238,7 @@ export const DEFAULT_CONFIG: AlertmanagerPluginConfig = {
   issueRouteMap: DEFAULT_ISSUE_ROUTE_MAP,
   escalationDeadlineMinutes: DEFAULT_ESCALATION_DEADLINE_MINUTES,
   coverDedupWindowMinutes: DEFAULT_COVER_DEDUP_WINDOW_MINUTES,
+  fallbackAgentName: "",
 };
 
 /**

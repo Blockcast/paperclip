@@ -22,6 +22,7 @@ import {
 } from "@paperclipai/plugin-sdk";
 import { handleWebhook } from "./webhook-handler.js";
 import { runAlertEscalationSweep } from "./escalation.js";
+import { reconcileAggregateLifecycle } from "./aggregate-reconciliation.js";
 import {
   buildConfig,
   isEmptyConfig,
@@ -113,6 +114,7 @@ export const plugin = definePlugin({
         );
         return;
       }
+      await reconcileAggregateLifecycle(ctx, pluginConfig);
       await runAlertEscalationSweep(ctx, pluginConfig);
     });
     ctx.logger.info("paperclip-plugin-alertmanager started");

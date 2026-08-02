@@ -4,6 +4,39 @@ Date: 2026-04-29
 Status: Draft / scope spec — not yet implemented
 Owner: TBD
 
+## 2026-08-01 intake and aggregation amendment
+
+The shipped intake contract now differs from the original per-fingerprint V1
+design below:
+
+- `paperclip_issue: "false"` opts out before all issue/state side effects, and
+  `severity=info` is below the issue-creation floor by default.
+- Owner routing still prefers label, owner-map, and annotation email routes.
+  When none resolves, `fallbackAgentName` must identify exactly one company
+  agent. Missing or ambiguous fallback configuration fails closed; ownerless
+  issue creation is no longer allowed.
+- The canonical aggregate/origin key is
+  `alert-aggregate:v1:[<alertname>,<paperclip_dedupe_domain-or-null>]`.
+  Multiple fingerprints under that key share one issue and durable member
+  records. The last firing member atomically claims final resolution. A re-fire
+  rejoins the aggregate and reopens a completed issue.
+- Rules that require the resource-level identity from
+  [BLO-10274](/BLO/issues/BLO-10274) set `paperclip_dedupe_domain` to a stable
+  resource value. This makes the intentional exception explicit rather than
+  replacing the resource-level contract globally.
+- Accepted severity mapping remains `critical → critical`, `warning → high`,
+  and unknown/custom → `medium`, subject to operator overrides. The retained
+  `info → medium` map is unreachable while the default creation floor applies.
+
+The intended channel precision is at least 70% actionable (14-day cancellation
+rate at or below 30%), versus [BLO-20576](/BLO/issues/BLO-20576)'s 73.6%
+cancellation baseline. If the first 14-day cohort remains above 36.8%, disable
+the noisiest rules with `paperclip_issue: "false"`, recalibrate thresholds and
+aggregate domains, and require a replay before restoring issue creation. The
+independent filing of [BLO-20576](/BLO/issues/BLO-20576) and
+[BLO-20589](/BLO/issues/BLO-20589) by two CEO sweeps within 36 minutes is the
+measured redundant-work amplification this consolidation is intended to stop.
+
 ## 1. Background & motivation
 
 On 2026-04-29 we hit a registry image-pull outage on the on-prem k8s cluster.

@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import { COVER_ORIGIN, escalationDeadlineMs, recordSourceResolvedAndCloseCovers, runAlertEscalationSweep } from "../escalation.js";
 import { handleFiring, handleResolved } from "../webhook-handler.js";
-import { DEFAULT_ISSUE_ROUTE_MAP } from "../constants.js";
+import { DEFAULT_COVER_DEDUP_WINDOW_MINUTES, DEFAULT_ISSUE_ROUTE_MAP } from "../constants.js";
 import { ORIGIN_KIND } from "../types.js";
 import type { AlertmanagerAlert, AlertmanagerPluginConfig, AlertStateRecord } from "../types.js";
 
@@ -77,6 +77,10 @@ function buildFakeAlertmanagerStore() {
       const text = sql.replace(/\s+/g, " ").trim();
       if (text.includes("ON CONFLICT (cover_issue_id, alert_issue_id)")) {
         const [id, coverIssueId, alertIssueId] = params as [string, string, string];
+        const cover = covers.get(coverIssueId);
+        if (!cover || cover.closing_claimed_at !== null || cover.cancelled_at !== null) {
+          return { rowCount: 0 };
+        }
         const key = `${coverIssueId}:${alertIssueId}`;
         const existing = members.get(key);
         if (!existing) {
@@ -155,6 +159,14 @@ function buildFakeAlertmanagerStore() {
         const cover = covers.get(coverIssueId);
         return cover ? [{ closing_claimed_at: cover.closing_claimed_at, resolution_comment_posted_at: cover.resolution_comment_posted_at, cancelled_at: cover.cancelled_at }] as T[] : [];
       }
+      if (text.startsWith("SELECT closing_claimed_at, cancelled_at")) {
+        const [coverIssueId] = params as [string];
+        const cover = covers.get(coverIssueId);
+        return cover ? [{
+          closing_claimed_at: cover.closing_claimed_at,
+          cancelled_at: cover.cancelled_at,
+        }] as T[] : [];
+      }
       if (text.includes("closing_claimed_at IS NOT NULL AND cancelled_at IS NULL")) {
         const [companyId] = params as [string];
         return [...covers.values()]
@@ -165,13 +177,22 @@ function buildFakeAlertmanagerStore() {
     },
   };
 
-  return { issuesList, issuesCreate, db, coverIssuesById, covers, members, openMemberCount };
+  return {
+    issuesList,
+    issuesCreate,
+    db,
+    coverIssuesById,
+    openCoverIdByFingerprint,
+    covers,
+    members,
+    openMemberCount,
+  };
 }
 
 function sweepContext(state: AlertStateRecord, reportsTo: string | null = "cto", store = buildFakeAlertmanagerStore()) {
   const issue = {
     id: "issue-1", identifier: "BLO-1", title: "Alert", status: "todo", priority: "critical",
-    originId: "fp-1", assigneeAgentId: "engineer", projectId: null, goalId: null,
+    originId: state.aggregateKey ?? "fp-1", assigneeAgentId: "engineer", projectId: null, goalId: null,
   };
   const mocks = {
     state: { get: vi.fn(async () => state), set: vi.fn(async () => undefined) },
@@ -212,6 +233,33 @@ describe("alert escalation", () => {
     const second = sweepContext({ ...due, escalationAttempt: 1 });
     await runAlertEscalationSweep(second.ctx, config(), new Date("2026-07-11T01:00:00Z"));
     expect(second.mocks.issues.update).toHaveBeenCalledWith("issue-1", { assigneeAgentId: "cto", assigneeUserId: null }, "company-1");
+  });
+
+  it("reads aggregate-owned state for aggregate issue origins", async () => {
+    const aggregateKey = 'alert-aggregate:v1:["SyntheticAlert",null]';
+    const due = {
+      paperclipIssueId: "issue-1",
+      paperclipCompanyId: "company-1",
+      assigneeUserId: null,
+      assigneeAgentId: "engineer",
+      alertname: "SyntheticAlert",
+      severity: "critical",
+      firstSeenAt: "x",
+      lastFiredAt: "x",
+      resolvedAt: null,
+      nextEscalationAt: "2026-07-11T00:00:00Z",
+      escalationAttempt: 0,
+      aggregateKey,
+    };
+    const { ctx, mocks } = sweepContext(due);
+
+    await runAlertEscalationSweep(ctx, config(), new Date("2026-07-11T01:00:00Z"));
+
+    expect(mocks.state.get).toHaveBeenCalledWith({
+      scopeKind: "instance",
+      stateKey: `alert-aggregate:company-1:${aggregateKey}`,
+    });
+    expect(mocks.issues.requestWakeup).toHaveBeenCalledTimes(1);
   });
 
   it("re-arms each rung a full deadline interval out, not one sweep tick", async () => {
@@ -297,6 +345,40 @@ describe("alert escalation", () => {
     expect(store.members.get(`${newCoverRow!.cover_issue_id}:issue-1`)?.resolved_at).toBeNull();
   });
 
+  it("does not reattach to a closing cover that still occupies the current dedupe slot", async () => {
+    const now = new Date("2026-07-11T01:00:00Z");
+    const state = { paperclipIssueId: "issue-1", paperclipCompanyId: "company-1", assigneeUserId: null, assigneeAgentId: "engineer", alertname: "SyntheticAlert", severity: "critical", firstSeenAt: "x", lastFiredAt: "x", resolvedAt: null, nextEscalationAt: "2026-07-11T00:00:00Z", escalationAttempt: 1 };
+    const store = buildFakeAlertmanagerStore();
+    const bucket = Math.floor(
+      now.getTime() / (DEFAULT_COVER_DEDUP_WINDOW_MINUTES * 60_000),
+    );
+    const fingerprint = `cover:SyntheticAlert:${bucket}`;
+    store.coverIssuesById.set("cover-closing", { id: "cover-closing", status: "todo" });
+    store.openCoverIdByFingerprint.set(fingerprint, "cover-closing");
+    store.covers.set("cover-closing", { cover_issue_id: "cover-closing", company_id: "company-1", dedup_fingerprint: fingerprint, closing_claimed_at: "2026-07-11T00:55:00Z", resolution_comment_posted_at: null, cancelled_at: null });
+    store.members.set("cover-closing:issue-1", { id: randomUUID(), cover_issue_id: "cover-closing", alert_issue_id: "issue-1", resolved_at: "2026-07-10T00:00:00Z" });
+    const first = sweepContext(state, null, store);
+
+    await runAlertEscalationSweep(first.ctx, config(), now);
+
+    expect(store.members.get("cover-closing:issue-1")?.resolved_at).not.toBeNull();
+    expect(first.mocks.state.set).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ escalationComplete: true }),
+    );
+    expect(store.covers.get("cover-closing")?.cancelled_at).not.toBeNull();
+
+    store.coverIssuesById.get("cover-closing")!.status = "cancelled";
+    store.openCoverIdByFingerprint.delete(fingerprint);
+    const second = sweepContext(state, null, store);
+    await runAlertEscalationSweep(second.ctx, config(), now);
+
+    expect(second.mocks.issues.create).toHaveBeenCalledTimes(1);
+    expect([...store.members.values()].some((member) =>
+      member.cover_issue_id !== "cover-closing" && member.resolved_at === null,
+    )).toBe(true);
+  });
+
   it("clears the escalation schedule when an alert resolves", async () => {
     const state = { paperclipIssueId: "issue-1", paperclipCompanyId: "company-1", assigneeUserId: null, assigneeAgentId: "engineer", alertname: "SyntheticAlert", severity: "critical", firstSeenAt: "x", lastFiredAt: "x", resolvedAt: null, nextEscalationAt: "2026-07-11T01:00:00Z", escalationAttempt: 1 };
     const mocks = {
@@ -306,18 +388,12 @@ describe("alert escalation", () => {
         update: vi.fn(async () => ({})),
         createComment: vi.fn(),
       },
-      db: {
-        namespace: "alertmanager",
-        execute: vi.fn(async () => ({ rowCount: 0 })),
-        query: vi.fn(async () => []),
-      },
       events: { emit: vi.fn() },
       metrics: { write: vi.fn() },
       logger: { info: vi.fn(), warn: vi.fn() },
     };
     await handleResolved(mocks as unknown as PluginContext, config(), { ...alert(), status: "resolved", endsAt: "2026-07-11T02:00:00Z" });
     expect(mocks.state.set).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ escalationComplete: true, nextEscalationAt: null }));
-    expect(mocks.db.execute).toHaveBeenCalled();
     expect(mocks.logger.warn).not.toHaveBeenCalled();
   });
 
