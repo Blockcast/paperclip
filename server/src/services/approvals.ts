@@ -5,10 +5,19 @@ import { APPROVAL_UNDECIDED_STATUSES } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { logActivity, type LogActivityInput } from "./activity-log.js";
+import { REDACTED_EVENT_VALUE, redactApprovalPayloadByType } from "../redaction.js";
 import { agentService } from "./agents.js";
 import { budgetService } from "./budgets.js";
 import { notifyHireApproved } from "./hire-hook.js";
 import { instanceSettingsService } from "./instance-settings.js";
+
+type ApprovalListFilters = {
+  status?: string;
+  type?: string;
+  issueId?: string;
+  requestedByAgentId?: string;
+  idempotencyKey?: string;
+};
 
 export function approvalService(db: Db) {
   const agentsSvc = agentService(db);
@@ -20,12 +29,64 @@ export function approvalService(db: Db) {
   const resolvableStatuses = Array.from(canResolveStatuses);
   type ApprovalRecord = typeof approvals.$inferSelect;
   type ResolutionResult = { approval: ApprovalRecord; applied: boolean };
+  type CreateWithIdempotencyOptions = {
+    afterCreate?: (txDb: Db, approval: ApprovalRecord) => Promise<void>;
+  };
 
   function redactApprovalComment<T extends { body: string }>(comment: T, censorUsernameInLogs: boolean): T {
     return {
       ...comment,
       body: redactCurrentUserText(comment.body, { enabled: censorUsernameInLogs }),
     };
+  }
+
+  function normalizeListFilters(filters?: string | ApprovalListFilters): ApprovalListFilters {
+    return typeof filters === "string" ? { status: filters } : (filters ?? {});
+  }
+
+  function approvalListConditions(companyId: string, filters: ApprovalListFilters = {}) {
+    const conditions = [eq(approvals.companyId, companyId)];
+    if (filters.status) conditions.push(eq(approvals.status, filters.status));
+    if (filters.type) conditions.push(eq(approvals.type, filters.type));
+    if (filters.requestedByAgentId) {
+      conditions.push(eq(approvals.requestedByAgentId, filters.requestedByAgentId));
+    }
+    if (filters.idempotencyKey) {
+      conditions.push(eq(approvals.idempotencyKey, filters.idempotencyKey));
+    }
+    if (filters.issueId) {
+      conditions.push(
+        sql`EXISTS (SELECT 1 FROM ${issueApprovals} WHERE ${issueApprovals.approvalId} = ${approvals.id} AND ${issueApprovals.issueId} = ${filters.issueId})`,
+      );
+    }
+    return conditions;
+  }
+
+  function readSafeLabel(value: unknown) {
+    if (typeof value !== "string") return null;
+    const trimmed = value.trim();
+    if (!trimmed || trimmed === REDACTED_EVENT_VALUE) return null;
+    return trimmed;
+  }
+
+  function deriveSummaryLabel(row: {
+    id: string;
+    type: string;
+    title: unknown;
+    summary: unknown;
+    description: unknown;
+  }) {
+    const redacted = redactApprovalPayloadByType(row.type, {
+      title: row.title,
+      summary: row.summary,
+      description: row.description,
+    });
+    return (
+      readSafeLabel(redacted.title) ??
+      readSafeLabel(redacted.summary) ??
+      readSafeLabel(redacted.description) ??
+      `${row.type} ${row.id.slice(0, 8)}`
+    );
   }
 
   async function reconcileApprovedBuiltInAgent(
@@ -142,9 +203,8 @@ export function approvalService(db: Db) {
   }
 
   return {
-    list: (companyId: string, status?: string) => {
-      const conditions = [eq(approvals.companyId, companyId)];
-      if (status) conditions.push(eq(approvals.status, status));
+    list: (companyId: string, filters?: string | ApprovalListFilters) => {
+      const conditions = approvalListConditions(companyId, normalizeListFilters(filters));
       return db.select().from(approvals).where(and(...conditions));
     },
 
@@ -158,28 +218,9 @@ export function approvalService(db: Db) {
      */
     listSummary: async (
       companyId: string,
-      filters: {
-        status?: string;
-        type?: string;
-        issueId?: string;
-        requestedByAgentId?: string;
-        idempotencyKey?: string;
-      } = {},
+      filters: ApprovalListFilters = {},
     ) => {
-      const conditions = [eq(approvals.companyId, companyId)];
-      if (filters.status) conditions.push(eq(approvals.status, filters.status));
-      if (filters.type) conditions.push(eq(approvals.type, filters.type));
-      if (filters.requestedByAgentId) {
-        conditions.push(eq(approvals.requestedByAgentId, filters.requestedByAgentId));
-      }
-      if (filters.idempotencyKey) {
-        conditions.push(eq(approvals.idempotencyKey, filters.idempotencyKey));
-      }
-      if (filters.issueId) {
-        conditions.push(
-          sql`EXISTS (SELECT 1 FROM ${issueApprovals} WHERE ${issueApprovals.approvalId} = ${approvals.id} AND ${issueApprovals.issueId} = ${filters.issueId})`,
-        );
-      }
+      const conditions = approvalListConditions(companyId, filters);
 
       const rows = await db
         .select({
@@ -191,34 +232,25 @@ export function approvalService(db: Db) {
           idempotencyKey: approvals.idempotencyKey,
           createdAt: approvals.createdAt,
           decidedAt: approvals.decidedAt,
-          // Derived label. `payload->>'title'` can be the literal "***REDACTED***"
-          // (the field-name redactor, tracked separately on BLO-20810), and it can be
-          // absent entirely, so fall back through summary and finally to a synthetic
-          // identifier. A human triaging the queue always gets something to read.
-          label: sql<string>`COALESCE(
-            NULLIF(NULLIF(${approvals.payload} ->> 'title', ''), '***REDACTED***'),
-            NULLIF(NULLIF(${approvals.payload} ->> 'summary', ''), '***REDACTED***'),
-            NULLIF(NULLIF(${approvals.payload} ->> 'description', ''), '***REDACTED***'),
-            ${approvals.type} || ' ' || left(${approvals.id}::text, 8)
-          )`,
+          title: sql<string | null>`${approvals.payload} ->> 'title'`,
+          summary: sql<string | null>`${approvals.payload} ->> 'summary'`,
+          description: sql<string | null>`${approvals.payload} ->> 'description'`,
         })
         .from(approvals)
         .where(and(...conditions))
         .orderBy(asc(approvals.createdAt));
 
-      return rows;
+      return rows.map(({ title, summary, description, ...row }) => ({
+        ...row,
+        label: deriveSummaryLabel({ ...row, title, summary, description }),
+      }));
     },
 
     countBy: async (
       companyId: string,
-      filters: { status?: string; type?: string; requestedByAgentId?: string } = {},
+      filters: ApprovalListFilters = {},
     ) => {
-      const conditions = [eq(approvals.companyId, companyId)];
-      if (filters.status) conditions.push(eq(approvals.status, filters.status));
-      if (filters.type) conditions.push(eq(approvals.type, filters.type));
-      if (filters.requestedByAgentId) {
-        conditions.push(eq(approvals.requestedByAgentId, filters.requestedByAgentId));
-      }
+      const conditions = approvalListConditions(companyId, filters);
       const rows = await db
         .select({ count: sql<number>`count(*)::int` })
         .from(approvals)
@@ -268,54 +300,66 @@ export function approvalService(db: Db) {
     createWithIdempotency: async (
       companyId: string,
       data: Omit<typeof approvals.$inferInsert, "companyId">,
+      options: CreateWithIdempotencyOptions = {},
     ): Promise<{ approval: ApprovalRecord; deduplicated: boolean }> => {
       const idempotencyKey = typeof data.idempotencyKey === "string"
         ? data.idempotencyKey.trim() || null
         : null;
+      const requestedByAgentId = data.requestedByAgentId ?? null;
+      const requestedByUserId = data.requestedByUserId ?? null;
 
-      if (!idempotencyKey) {
-        const approval = await db
+      if (requestedByAgentId && requestedByUserId) {
+        throw unprocessable("Approval requester must be either an agent or a user, not both");
+      }
+
+      async function insertNew(client: Db, normalizedKey: string | null) {
+        const approval = await client
           .insert(approvals)
-          .values({ ...data, companyId, idempotencyKey: null })
+          .values({ ...data, companyId, idempotencyKey: normalizedKey })
           .returning()
           .then((rows) => rows[0]);
+        await options.afterCreate?.(client, approval);
         return { approval, deduplicated: false };
+      }
+
+      if (!idempotencyKey) {
+        if (options.afterCreate) {
+          return db.transaction(async (tx) => insertNew(tx as unknown as Db, null));
+        }
+        return insertNew(db, null);
       }
 
       // The requester identity that scopes the key. Exactly one of these is set by the
       // route; scoping to the requester means two agents filing similar asks never
       // collide, while one agent retrying always does.
-      const requesterColumn = data.requestedByAgentId
+      const requesterColumn = requestedByAgentId
         ? approvals.requestedByAgentId
         : approvals.requestedByUserId;
-      const requesterValue = data.requestedByAgentId ?? data.requestedByUserId ?? null;
+      const requesterValue = requestedByAgentId ?? requestedByUserId ?? null;
+
+      if (!requesterValue) {
+        throw unprocessable("Approval idempotency key requires an authenticated requester");
+      }
 
       return db.transaction(async (tx) => {
         const guardKey = `approval-create:idempotency:${companyId}:${requesterValue ?? "anonymous"}:${idempotencyKey}`;
         await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${guardKey}, 0))`);
 
-        if (requesterValue !== null) {
-          const existing = await tx
-            .select()
-            .from(approvals)
-            .where(
-              and(
-                eq(approvals.companyId, companyId),
-                eq(approvals.idempotencyKey, idempotencyKey),
-                eq(requesterColumn, requesterValue),
-                inArray(approvals.status, resolvableStatuses),
-              ),
-            )
-            .limit(1);
-          if (existing[0]) return { approval: existing[0], deduplicated: true };
-        }
+        const existing = await tx
+          .select()
+          .from(approvals)
+          .where(
+            and(
+              eq(approvals.companyId, companyId),
+              eq(approvals.idempotencyKey, idempotencyKey),
+              eq(requesterColumn, requesterValue),
+              inArray(approvals.status, resolvableStatuses),
+            ),
+          )
+          .limit(1);
+        if (existing[0]) return { approval: existing[0], deduplicated: true };
 
-        const approval = await tx
-          .insert(approvals)
-          .values({ ...data, companyId, idempotencyKey })
-          .returning()
-          .then((rows) => rows[0]);
-        return { approval, deduplicated: false };
+        return insertNew(tx as unknown as Db, idempotencyKey);
       });
     },
 

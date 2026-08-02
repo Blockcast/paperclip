@@ -40,6 +40,10 @@ type ApprovalRecord = {
   status: string;
   payload: Record<string, unknown>;
   requestedByAgentId: string | null;
+  requestedByUserId: string | null;
+  idempotencyKey?: string | null;
+  createdAt?: Date;
+  decidedAt?: Date | null;
 };
 
 function createApproval(status: string): ApprovalRecord {
@@ -51,6 +55,7 @@ function createApproval(status: string): ApprovalRecord {
     status,
     payload: { agentId: "agent-1" },
     requestedByAgentId: "requester-1",
+    requestedByUserId: null,
   };
 }
 
@@ -583,6 +588,47 @@ describe("approvalService createWithIdempotency", () => {
     expect(JSON.stringify(lockCall)).toContain("pg_advisory_xact_lock");
   });
 
+  it("rejects an idempotent create with both requester identities set", async () => {
+    const stub = createTxStub([[]]);
+    const svc = approvalService(stub.db as any);
+
+    await expect(
+      svc.createWithIdempotency("company-1", {
+        ...baseInput,
+        requestedByUserId: "user-1",
+      } as any),
+    ).rejects.toThrow("either an agent or a user");
+
+    expect(stub.db.transaction).not.toHaveBeenCalled();
+    expect(stub.inserts).toHaveLength(0);
+  });
+
+  it("runs first-filing side effects inside the idempotent create transaction", async () => {
+    const stub = createTxStub([[]]);
+    const svc = approvalService(stub.db as any);
+    const afterCreate = vi.fn(async () => undefined);
+
+    await svc.createWithIdempotency("company-1", baseInput as any, { afterCreate });
+
+    expect(afterCreate).toHaveBeenCalledWith(
+      stub.tx,
+      expect.objectContaining({ id: "approval-1" }),
+    );
+  });
+
+  it("does not rerun first-filing side effects when an idempotent create replays", async () => {
+    const existing = { ...baseInput, id: "approval-original", companyId: "company-1" };
+    const stub = createTxStub([[existing as any]]);
+    const svc = approvalService(stub.db as any);
+    const afterCreate = vi.fn(async () => undefined);
+
+    const result = await svc.createWithIdempotency("company-1", baseInput as any, { afterCreate });
+
+    expect(result.deduplicated).toBe(true);
+    expect(afterCreate).not.toHaveBeenCalled();
+    expect(stub.inserts).toHaveLength(0);
+  });
+
   it("does not dedupe when no idempotency key is supplied", async () => {
     const stub = createTxStub([[]]);
     const svc = approvalService(stub.db as any);
@@ -610,6 +656,50 @@ describe("approvalService createWithIdempotency", () => {
 
     expect(res.deduplicated).toBe(false);
     expect(stub.inserts[0]?.idempotencyKey).toBeNull();
+  });
+});
+
+describe("approvalService listSummary", () => {
+  it("derives labels from redacted payload snippets instead of raw payload text", async () => {
+    const row = {
+      id: "approval-secret",
+      type: "request_board_approval",
+      status: "pending",
+      requestedByAgentId: "agent-1",
+      requestedByUserId: null,
+      idempotencyKey: "rotate-creds",
+      createdAt: new Date("2026-08-02T00:00:00.000Z"),
+      decidedAt: null,
+      title: "aaa.bbb.ccc",
+      summary: "Rotate credentials",
+      description: "fallback",
+    };
+    const orderBy = vi.fn(async () => [row]);
+    const where = vi.fn(() => ({ orderBy }));
+    const from = vi.fn(() => ({ where }));
+    const select = vi.fn(() => ({ from }));
+    const svc = approvalService({ select } as any);
+
+    const result = await svc.listSummary("company-1", {
+      status: "pending",
+      idempotencyKey: "rotate-creds",
+    });
+
+    expect(result).toEqual([
+      {
+        id: "approval-secret",
+        type: "request_board_approval",
+        status: "pending",
+        requestedByAgentId: "agent-1",
+        requestedByUserId: null,
+        idempotencyKey: "rotate-creds",
+        createdAt: new Date("2026-08-02T00:00:00.000Z"),
+        decidedAt: null,
+        label: "Rotate credentials",
+      },
+    ]);
+    expect(result[0]).not.toHaveProperty("title");
+    expect(result[0]?.label).not.toBe("aaa.bbb.ccc");
   });
 });
 
