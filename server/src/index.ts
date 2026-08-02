@@ -1785,7 +1785,10 @@ export async function startServer(): Promise<StartedServer> {
       // await the exporter's final batch is dropped on exit.
       await shutdownInstrumentation();
 
-      process.exit(0);
+      // A fatal error can arrive while the asynchronous shutdown work above is
+      // still draining. The crash guard records that by setting exitCode = 1;
+      // do not let the graceful continuation overwrite it with a clean exit.
+      process.exit(process.exitCode ?? 0);
     };
 
     process.once("SIGINT", () => {
