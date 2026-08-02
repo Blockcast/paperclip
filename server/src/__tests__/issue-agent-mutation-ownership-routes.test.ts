@@ -2581,7 +2581,12 @@ describe("agent issue mutation checkout ownership", () => {
       expect.any(Object),
     );
     expect(mockDocumentService.upsertIssueDocument).toHaveBeenCalled();
-    expect(mockWorkProductService.update).toHaveBeenCalledWith("product-1", { title: "Updated product" });
+    // `sourceTrust: null` is the actor-write provenance restamp (BLO-19566): an
+    // actor edit never inherits the system trust a webhook-written row carries.
+    expect(mockWorkProductService.update).toHaveBeenCalledWith("product-1", {
+      title: "Updated product",
+      sourceTrust: null,
+    });
   });
 
   it("preserves board mutations on active checkouts", async () => {
@@ -3254,6 +3259,27 @@ describe("agent issue mutation checkout ownership", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(403);
     expect(res.body.error).toBe("createdByRunId must match the authenticated agent run");
     expect(mockWorkProductService.update).not.toHaveBeenCalled();
+  });
+
+  it("clears webhook provenance when an actor updates a work product (BLO-19566)", async () => {
+    // Productivity review treats a PR row carrying system webhook source-trust
+    // as progress-eligible evidence, keyed on `updatedAt`. Conditionally
+    // spreading the actor's resolved trust left that system stamp in place on
+    // an actor edit while the update refreshed `updatedAt`, so an assignee
+    // could PATCH a stale webhook row into fresh, trusted evidence about their
+    // own issue. An actor write now always restamps provenance.
+    const app = await createApp(ownerActor());
+
+    const res = await request(app).patch("/api/work-products/product-1").send({
+      status: "merged",
+      url: "https://github.com/Blockcast/paperclip/pull/999",
+    });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockWorkProductService.update).toHaveBeenCalledWith(
+      "product-1",
+      expect.objectContaining({ sourceTrust: null }),
+    );
   });
 
   it("rejects board-created work products with a foreign-company run id", async () => {

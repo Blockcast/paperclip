@@ -7795,7 +7795,17 @@ export function issueRoutes(
     const sourceTrust = await sourceTrustForActorWrite(issue, actor);
     const product = await workProductsSvc.update(id, {
       ...patch,
-      ...(sourceTrust ? { sourceTrust } : {}),
+      // BLO-19566: an actor edit never *inherits* provenance -- it restamps it
+      // with the actor's own resolution, which is null at standard trust.
+      //
+      // Webhook-written PR rows carry system source-trust, and productivity
+      // review treats exactly those rows as progress-eligible evidence keyed on
+      // `updatedAt`. Conditionally spreading `sourceTrust` left the system stamp
+      // in place on an actor write while `update()` refreshed `updatedAt`, so an
+      // assignee could PATCH a stale webhook row and manufacture fresh, trusted
+      // evidence about their own issue. Clearing it demotes the row to an
+      // ordinary actor-authored work product, which the review ignores.
+      sourceTrust: sourceTrust ?? null,
     });
     if (!product) {
       res.status(404).json({ error: "Work product not found" });

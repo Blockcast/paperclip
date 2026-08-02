@@ -411,6 +411,59 @@ describeEmbeddedPostgres("productivity review service", () => {
       expect(description).toContain("The second signal is already present");
     });
 
+    it("reads a delayed first delivery as stale by GitHub event time, not DB receipt time", async () => {
+      // A first webhook delivery can land long after the PR event (retry,
+      // backfill, outage drain). The row then inserts with `updatedAt = now`,
+      // so aging off `updatedAt` advertises an already-dead PR as fresh
+      // progress for another 24h. Age must come from the GitHub event time.
+      const now = new Date("2026-04-30T12:00:00.000Z");
+      const seeded = await seedAssignedIssue();
+      const threeDaysAgoMs = now.getTime() - 3 * 24 * 60 * 60 * 1000;
+      await db.insert(issueWorkProducts).values({
+        companyId: seeded.companyId,
+        issueId: seeded.issueId,
+        type: "pull_request",
+        provider: "github",
+        externalId: "Blockcast/paperclip#806",
+        title: "Widen the authz grant",
+        url: "https://github.com/Blockcast/paperclip/pull/806",
+        status: "ready_for_review",
+        metadata: {
+          source: "github_pull_request_webhook",
+          sourceEventOrder: 10,
+          sourceEventTimestamp: new Date(threeDaysAgoMs).toISOString(),
+          sourceEventTimestampMs: threeDaysAgoMs,
+        },
+        sourceTrust: PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST,
+        createdByRunId: null,
+        // Receipt time is "now" -- the delayed delivery.
+        createdAt: now,
+        updatedAt: now,
+      });
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+      });
+
+      const service = productivityReviewService(db);
+      await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+      const description = (await listProductivityReviews(seeded.companyId))[0]?.description ?? "";
+      const prLine = description.split("\n").find((line) => line.includes("Linked pull request:")) ?? "";
+      expect(prLine).not.toBe("");
+      // Aged from the GitHub event time (3d), not the "now" receipt time.
+      // Asserted on the PR line specifically: the manager's verdict criteria
+      // quote the phrase "non-stale" too, so a whole-description match would
+      // pass regardless of what this line says.
+      expect(prLine).toContain("2026-04-27T12:00:00.000Z");
+      expect(prLine).toContain(", stale,");
+      expect(prLine).not.toContain("non-stale");
+      expect(description).not.toContain("The second signal is already present");
+    });
+
     it("ignores actor-authored GitHub PR rows without webhook provenance", async () => {
       const now = new Date("2026-04-30T12:00:00.000Z");
       const seeded = await seedAssignedIssue();

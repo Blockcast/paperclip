@@ -101,6 +101,7 @@ type PullRequestEvidence = {
   url: string | null;
   status: string;
   externalId: string | null;
+  /** GitHub event time of the newest PR event (not DB receipt time). */
   updatedAt: Date;
   /** Age of the newest PR event at evidence-collection time. */
   ageMs: number;
@@ -108,6 +109,21 @@ type PullRequestEvidence = {
 
 const PRODUCTIVITY_REVIEW_PROGRESS_PR_STATUSES = new Set(["ready_for_review", "merged"]);
 const PRODUCTIVITY_REVIEW_WEBHOOK_PR_METADATA_SOURCE = PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE;
+
+/**
+ * Effective chronology for a PR work product: the GitHub event time the row was
+ * built from, falling back to DB receipt time only when the row predates that
+ * field. Used for both "which PR is newest" and "how old is it" so a delayed
+ * delivery cannot present a stale PR as fresh (BLO-19566).
+ */
+const pullRequestEffectiveEventAtSql = sql`coalesce(
+  case
+    when ${issueWorkProducts.metadata}->>'sourceEventTimestampMs' ~ '^[0-9]+$'
+      then to_timestamp((${issueWorkProducts.metadata}->>'sourceEventTimestampMs')::bigint / 1000.0)
+    else null
+  end,
+  ${issueWorkProducts.updatedAt}
+)`;
 
 type ProductivityReviewEvidence = {
   trigger: ProductivityReviewTrigger;
@@ -1147,8 +1163,13 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         .where(and(eq(costEvents.companyId, sourceIssue.companyId), eq(costEvents.issueId, sourceIssue.id)))
         .then((rows) => rows[0] ?? { costCents: 0 }),
       // BLO-19566 AC4: newest PR linked to this issue. Written by the GitHub
-      // webhook on every pull_request event, so `updatedAt` tracks the last
-      // push/state change and answers "has this PR moved recently?".
+      // webhook on every pull_request event.
+      //
+      // Ordered and aged by the *GitHub* event time, not `updatedAt`. The row's
+      // `updatedAt` is DB receipt time, so a first delivery that arrives late
+      // (retry, backfill, outage drain) inserts with `updatedAt = now` and would
+      // advertise an already-stale PR as fresh progress for another day. Falls
+      // back to `updatedAt` only for rows with no recorded source timestamp.
       db
         .select({
           title: issueWorkProducts.title,
@@ -1156,6 +1177,11 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           status: issueWorkProducts.status,
           externalId: issueWorkProducts.externalId,
           updatedAt: issueWorkProducts.updatedAt,
+          sourceEventTimestampMs: sql<string | number | null>`case
+            when ${issueWorkProducts.metadata}->>'sourceEventTimestampMs' ~ '^[0-9]+$'
+              then (${issueWorkProducts.metadata}->>'sourceEventTimestampMs')::bigint
+            else null
+          end`,
         })
         .from(issueWorkProducts)
         .where(
@@ -1171,7 +1197,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
             sql`${issueWorkProducts.sourceTrust}->>'promotedByActorId' = ${PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID}`,
           ),
         )
-        .orderBy(desc(issueWorkProducts.updatedAt))
+        .orderBy(desc(pullRequestEffectiveEventAtSql))
         .limit(1)
         .then((rows) => rows[0] ?? null),
     ]);
@@ -1185,14 +1211,22 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       : null;
 
     const latestPullRequest: PullRequestEvidence | null = latestPullRequestRow
-      ? {
-        title: latestPullRequestRow.title,
-        url: latestPullRequestRow.url ?? null,
-        status: latestPullRequestRow.status,
-        externalId: latestPullRequestRow.externalId ?? null,
-        updatedAt: latestPullRequestRow.updatedAt,
-        ageMs: Math.max(0, now.getTime() - latestPullRequestRow.updatedAt.getTime()),
-      }
+      ? (() => {
+        // Prefer the GitHub event time; `updatedAt` is only a fallback for rows
+        // written before the source timestamp was recorded.
+        const sourceMs = Number(latestPullRequestRow.sourceEventTimestampMs);
+        const eventAt = Number.isFinite(sourceMs) && latestPullRequestRow.sourceEventTimestampMs !== null
+          ? new Date(sourceMs)
+          : latestPullRequestRow.updatedAt;
+        return {
+          title: latestPullRequestRow.title,
+          url: latestPullRequestRow.url ?? null,
+          status: latestPullRequestRow.status,
+          externalId: latestPullRequestRow.externalId ?? null,
+          updatedAt: eventAt,
+          ageMs: Math.max(0, now.getTime() - eventAt.getTime()),
+        };
+      })()
       : null;
 
     const noComment = noCommentStreak >= thresholds.noCommentStreakRuns;

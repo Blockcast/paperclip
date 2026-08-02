@@ -103,6 +103,13 @@ export function workProductService(db: Db) {
       >,
     ) => {
       const now = new Date();
+      // Bound as an ISO string with an explicit cast, NOT as a JS `Date`.
+      // postgres.js cannot infer a parameter type for a Date interpolated into
+      // a raw `sql` fragment (as opposed to a drizzle-mapped column value), and
+      // throws ERR_INVALID_ARG_TYPE "Received an instance of Date" -- which the
+      // webhook's best-effort catch swallowed, silently disabling every PR
+      // work-product write.
+      const nowSql = sql`${now.toISOString()}::timestamptz`;
       const incomingSourceEventOrder = sql<number>`case
         when excluded.metadata->>'sourceEventOrder' ~ '^[0-9]+$'
           then (excluded.metadata->>'sourceEventOrder')::int
@@ -128,19 +135,40 @@ export function workProductService(db: Db) {
         else null
       end`;
       const incomingIsReopen = sql`excluded.metadata->>'lastEventAction' in ('reopened', 'ready_for_review')`;
+      // Distinguishes a genuinely distinct delivery from an exact redelivery.
+      // GitHub's `pull_request.updated_at` is second-granular, so two real
+      // events (a rapid `closed` -> `reopened`, or two pushes) can share a
+      // timestamp; only the payload tells them apart.
+      const contentDiffers = sql`(
+        excluded.metadata is distinct from ${issueWorkProducts.metadata}
+        or excluded.status is distinct from ${issueWorkProducts.status}
+        or excluded.url is distinct from ${issueWorkProducts.url}
+        or excluded.title is distinct from ${issueWorkProducts.title}
+      )`;
+      // Tie-break for events that cannot be strictly ordered by source
+      // timestamp: same second, or a legacy row written before the timestamp
+      // was recorded. Three admissible ways to win, in order:
+      //   1. a higher lifecycle rank (nonterminal -> closed -> merged);
+      //   2. a reopen, which legitimately moves *backwards* in rank
+      //      (closed -> ready_for_review) -- but never off `merged`, which is
+      //      absorbing, so a same-second stray event cannot un-merge a PR;
+      //   3. equal rank carrying different content, i.e. a distinct
+      //      same-second event such as a second push. Exact redeliveries have
+      //      identical content and are rejected here, which is what keeps the
+      //      upsert idempotent and preserves `updatedAt`.
+      const tieBreak = sql`(
+        ${incomingSourceEventOrder} > ${existingSourceEventOrder}
+        or (${incomingIsReopen} and ${existingSourceEventOrder} <> 30)
+        or (${incomingSourceEventOrder} = ${existingSourceEventOrder} and ${contentDiffers})
+      )`;
       const acceptIncoming = sql`case
         when ${incomingSourceEventTimestampMs} is not null and ${existingSourceEventTimestampMs} is not null
-          then ${incomingSourceEventTimestampMs} > ${existingSourceEventTimestampMs}
-            or (
-              ${incomingSourceEventTimestampMs} = ${existingSourceEventTimestampMs}
-              and ${incomingSourceEventOrder} > ${existingSourceEventOrder}
-            )
-        when ${incomingSourceEventTimestampMs} is not null and ${existingSourceEventTimestampMs} is null
-          then ${incomingSourceEventOrder} > ${existingSourceEventOrder}
-            or (${existingSourceEventOrder} = 10 and ${incomingSourceEventOrder} = 10)
-            or ${incomingIsReopen}
-        else ${incomingSourceEventOrder} > ${existingSourceEventOrder}
-          or ${incomingIsReopen}
+          then case
+            when ${incomingSourceEventTimestampMs} > ${existingSourceEventTimestampMs} then true
+            when ${incomingSourceEventTimestampMs} < ${existingSourceEventTimestampMs} then false
+            else ${tieBreak}
+          end
+        else ${tieBreak}
       end`;
       const row = await db
         .insert(issueWorkProducts)
@@ -169,7 +197,7 @@ export function workProductService(db: Db) {
             summary: sql`case when ${acceptIncoming} then excluded.summary else ${issueWorkProducts.summary} end`,
             metadata: sql`case when ${acceptIncoming} then excluded.metadata else ${issueWorkProducts.metadata} end`,
             sourceTrust: sql`case when ${acceptIncoming} then excluded.source_trust else ${issueWorkProducts.sourceTrust} end`,
-            updatedAt: sql`case when ${acceptIncoming} then ${now} else ${issueWorkProducts.updatedAt} end`,
+            updatedAt: sql`case when ${acceptIncoming} then ${nowSql} else ${issueWorkProducts.updatedAt} end`,
           },
         })
         .returning()

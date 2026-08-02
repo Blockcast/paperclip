@@ -1628,6 +1628,100 @@ describeEmbeddedPostgres("github-webhook route", () => {
       });
     });
 
+    it("accepts a same-second reopened event after a closed PR", async () => {
+      // GitHub's `pull_request.updated_at` is second-granular, so a rapid
+      // close-then-reopen can carry an identical timestamp. Rank alone cannot
+      // order these: `reopened` ranks 10 and `closed` ranks 20, so a pure
+      // rank tie-break drops the reopen and leaves the PR reading `closed`.
+      const { issueId } = await seedIssueWithIdentifier("BLO-40020");
+      const app = buildApp();
+
+      await postPr(app, prPayload({
+        action: "closed",
+        identifier: "BLO-40020",
+        number: 4260,
+        merged: false,
+        updatedAt: "2026-04-30T10:00:00Z",
+      }), "wp-same-second-reopen-1");
+      await postPr(app, prPayload({
+        action: "reopened",
+        identifier: "BLO-40020",
+        number: 4260,
+        headSha: "same-second-reopen-head",
+        updatedAt: "2026-04-30T10:00:00Z",
+      }), "wp-same-second-reopen-2");
+
+      const rows = await db
+        .select({ status: issueWorkProducts.status, metadata: issueWorkProducts.metadata })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.status).toBe("ready_for_review");
+      expect(rows[0]?.metadata).toMatchObject({
+        headSha: "same-second-reopen-head",
+        lastEventAction: "reopened",
+      });
+    });
+
+    it("applies a distinct same-second push instead of retaining stale head metadata", async () => {
+      const { issueId } = await seedIssueWithIdentifier("BLO-40021");
+      const app = buildApp();
+
+      await postPr(app, prPayload({
+        action: "opened",
+        identifier: "BLO-40021",
+        number: 4261,
+        headSha: "first-head",
+        updatedAt: "2026-04-30T10:00:00Z",
+      }), "wp-same-second-push-1");
+      await postPr(app, prPayload({
+        action: "synchronize",
+        identifier: "BLO-40021",
+        number: 4261,
+        headSha: "second-head",
+        updatedAt: "2026-04-30T10:00:00Z",
+      }), "wp-same-second-push-2");
+
+      const rows = await db
+        .select({ metadata: issueWorkProducts.metadata })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.metadata).toMatchObject({
+        headSha: "second-head",
+        lastEventAction: "synchronize",
+      });
+    });
+
+    it("does not let a same-second stray event un-merge a merged PR", async () => {
+      // `merged` is absorbing: the same-second reopen allowance must not become
+      // a path for demoting a terminal merge.
+      const { issueId } = await seedIssueWithIdentifier("BLO-40022");
+      const app = buildApp();
+
+      await postPr(app, prPayload({
+        action: "closed",
+        identifier: "BLO-40022",
+        number: 4262,
+        merged: true,
+        updatedAt: "2026-04-30T10:00:00Z",
+      }), "wp-same-second-merged-1");
+      await postPr(app, prPayload({
+        action: "reopened",
+        identifier: "BLO-40022",
+        number: 4262,
+        headSha: "post-merge-head",
+        updatedAt: "2026-04-30T10:00:00Z",
+      }), "wp-same-second-merged-2");
+
+      const rows = await db
+        .select({ status: issueWorkProducts.status })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.status).toBe("merged");
+    });
+
     it("ignores delayed equal-rank deliveries instead of refreshing PR liveness", async () => {
       const { issueId } = await seedIssueWithIdentifier("BLO-40009");
       const app = buildApp();
