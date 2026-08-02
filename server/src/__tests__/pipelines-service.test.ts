@@ -8,6 +8,7 @@ import {
   companies,
   createDb,
   executionWorkspaces,
+  heartbeatRunEvents,
   heartbeatRuns,
   instanceSettings,
   issueComments,
@@ -36,6 +37,7 @@ import {
 } from "../services/pipelines.ts";
 import { routineService } from "../services/routines.ts";
 import { instanceSettingsService } from "../services/instance-settings.ts";
+import { heartbeatService } from "../services/heartbeat.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -105,6 +107,7 @@ describeEmbeddedPostgres("pipelineService", () => {
     await db.delete(issueComments);
     await db.delete(activityLog);
     await db.delete(routineRuns);
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(issues);
@@ -1887,7 +1890,7 @@ describeEmbeddedPostgres("pipelineService", () => {
       expect.objectContaining({ errorCode: "pipeline_stage_exited" }),
     );
     const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
-    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, heartbeatRunId));
+    let [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, heartbeatRunId));
     const [failureActivity] = await db
       .select({ action: activityLog.action })
       .from(activityLog)
@@ -1897,7 +1900,30 @@ describeEmbeddedPostgres("pipelineService", () => {
       ));
     expect(issue).toMatchObject({ status: "cancelled", executionRunId: heartbeatRunId });
     expect(run!.status).toBe("running");
+    expect(run!.resultJson).toMatchObject({ pipelineStageExitCancellationRequestedAt: expect.any(String) });
     expect(failureActivity).toEqual({ action: "heartbeat.cancel_failed" });
+
+    const retryHeartbeat = heartbeatService(db);
+    await retryHeartbeat.wakeup(routine.assigneeAgentId!, {
+      source: "comment",
+      contextSnapshot: { issueId },
+      requestedByActorType: "user",
+      requestedByActorId: "board-user",
+    });
+    const [suppressedWake] = await db
+      .select({ status: agentWakeupRequests.status, reason: agentWakeupRequests.reason })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.reason, "pipeline_stage_exit_cancellation_pending"));
+    expect(suppressedWake).toEqual({
+      status: "skipped",
+      reason: "pipeline_stage_exit_cancellation_pending",
+    });
+
+    await retryHeartbeat.sweepStaleIssueLocks();
+    [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, heartbeatRunId));
+    const [recoveredIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(run).toMatchObject({ status: "cancelled", errorCode: "pipeline_stage_exited" });
+    expect(recoveredIssue).toMatchObject({ status: "cancelled", executionRunId: null });
   });
 
   it("retires the automation link without cancelling a repurposed issue", async () => {
