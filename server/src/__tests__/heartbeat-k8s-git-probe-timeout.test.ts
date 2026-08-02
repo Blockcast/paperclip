@@ -1,7 +1,9 @@
+import { execFile as execFileCallback } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
@@ -14,7 +16,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { cleanupHeartbeatTestState } from "./helpers/cleanup-heartbeat-test-state.js";
-import { resolveDefaultAgentWorkspaceDir } from "../home-paths.js";
+import { resolveAgentEmptyWorkspaceSourceDir, resolveDefaultAgentWorkspaceDir } from "../home-paths.js";
 import { heartbeatService } from "../services/heartbeat.js";
 
 const adapterExecute = vi.hoisted(() =>
@@ -81,6 +83,8 @@ if (!embeddedPostgresSupport.supported) {
     `Skipping embedded Postgres k8s git probe timeout tests on this host: ${embeddedPostgresSupport.reason ?? "unsupported environment"}`,
   );
 }
+
+const execFile = promisify(execFileCallback);
 
 async function waitForRunToFinish(
   heartbeat: ReturnType<typeof heartbeatService>,
@@ -202,7 +206,7 @@ describeEmbeddedPostgres("claude_k8s agent-home git probe timeout", () => {
         errorCode: "workspace_validation_failed",
       });
       expect(failed?.error).toContain(
-        "Refusing to dispatch claude_k8s run isolation from the shared agent-home fallback cwd",
+        "Refusing to dispatch claude_k8s run isolation from the fallback cwd",
       );
       expect(failed?.resultJson).toMatchObject({
         workspaceValidation: expect.objectContaining({
@@ -218,6 +222,89 @@ describeEmbeddedPostgres("claude_k8s agent-home git probe timeout", () => {
       else process.env.PAPERCLIP_STRICT_GIT_CHECKOUT_PROBE_TIMEOUT_MS = previousTimeout;
       await fs.rm(fakeBin, { recursive: true, force: true });
       await fs.rm(fallbackCwd, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  // BLO-18760: the intake case. An issue born with projectId: null and
+  // executionWorkspaceId: null used to resolve onto the persistent per-agent
+  // dir, which carries a real `.git` from unrelated prior runs — so the pod's
+  // `git clone --shared` bootstrap exited 128, or (post-BLO-18147) the guard
+  // above refused dispatch and parked the issue with no wake path. It now
+  // resolves onto a repo-less source, so the guard's probe passes and the run
+  // actually dispatches; the pod's own `rev-parse --verify HEAD` then fails
+  // into its non-fatal empty-workspace branch.
+  it("dispatches a projectless claude_k8s run from the repo-less fallback source", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const agentHomeCwd = resolveDefaultAgentWorkspaceDir(agentId);
+    const emptySourceCwd = resolveAgentEmptyWorkspaceSourceDir(agentId);
+
+    try {
+      // Reproduce the field precondition exactly: the persistent agent home is
+      // a real checkout. Before this fix that is what the run would have been
+      // handed, and the guard would have refused.
+      await fs.mkdir(agentHomeCwd, { recursive: true });
+      await execFile("git", ["init"], { cwd: agentHomeCwd });
+
+      await db.insert(companies).values({
+        id: companyId,
+        name: "K8s Repo-less Fallback Co",
+        issuePrefix: "KRF",
+        requireBoardApprovalForNewAgents: false,
+        defaultResponsibleUserId: "responsible-user",
+      });
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: "Claude K8s Repoless",
+        role: "engineer",
+        status: "idle",
+        adapterType: "claude_k8s",
+        adapterConfig: {},
+        runtimeConfig: {
+          heartbeat: {
+            enabled: true,
+            wakeOnDemand: true,
+            concurrencyEnabled: true,
+            maxConcurrentRuns: 2,
+          },
+        },
+        permissions: {},
+      });
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Board-filed work with no project",
+        status: "in_progress",
+        workMode: "standard",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        issueNumber: 1,
+        identifier: "KRF-1",
+      });
+
+      const run = await heartbeat.wakeup(agentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_commented",
+        contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_commented" },
+      });
+      expect(run).not.toBeNull();
+
+      const finished = await waitForRunToFinish(heartbeat, run!.id, 15_000);
+      // The whole point: no workspace_validation_failed park, and the adapter
+      // is actually reached rather than the run dying during bootstrap.
+      expect(finished?.errorCode).not.toBe("workspace_validation_failed");
+      expect(adapterExecute).toHaveBeenCalled();
+      // ...and it launched from the repo-less source, not the checkout-bearing
+      // agent home.
+      await expect(
+        execFile("git", ["rev-parse", "--verify", "HEAD"], { cwd: emptySourceCwd }),
+      ).rejects.toThrow();
+    } finally {
+      await fs.rm(agentHomeCwd, { recursive: true, force: true });
+      await fs.rm(emptySourceCwd, { recursive: true, force: true });
     }
   }, 120_000);
 });

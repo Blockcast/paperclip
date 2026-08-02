@@ -8,7 +8,7 @@ import type { agents } from "@paperclipai/db";
 import { sessionCodec as codexSessionCodec } from "@paperclipai/adapter-codex-local/server";
 import { logger } from "../middleware/logger.js";
 import { KNOWN_ISOLATION_MODES } from "../services/metrics.js";
-import { resolveDefaultAgentWorkspaceDir } from "../home-paths.js";
+import { resolveAgentEmptyWorkspaceSourceDir, resolveDefaultAgentWorkspaceDir } from "../home-paths.js";
 import {
   applyPersistedExecutionWorkspaceConfig,
   assertGitSensitiveAdapterWorkspaceValid,
@@ -18,6 +18,7 @@ import {
   buildEffectiveRunSessionConfigMetadata,
   buildEffectiveRunWorkspaceConfigMetadata,
   buildK8sRunIsolationDescriptor,
+  shouldUseRepoLessFallbackWorkspaceSource,
   buildWorkspaceConfigFreshnessOperation,
   computeK8sIsolationRetryDelayMs,
   computeSessionCompactionReason,
@@ -758,6 +759,32 @@ describe("assertGitSensitiveAdapterWorkspaceValid", () => {
   });
 });
 
+// BLO-18760: which runs get the repo-less workspace-less fallback source.
+describe("shouldUseRepoLessFallbackWorkspaceSource", () => {
+  it("applies only to cloning adapters under run isolation", () => {
+    // The bug's population: claude_k8s bootstraps by cloning its resolved cwd,
+    // and only `run` isolation uses that cwd purely as a clone source.
+    expect(
+      shouldUseRepoLessFallbackWorkspaceSource({ adapterType: "claude_k8s", k8sIsolationMode: "run" }),
+    ).toBe(true);
+
+    // shared/workspace isolation launch *from* the agent home, so it must stay
+    // the persistent directory or warm-session continuity breaks.
+    for (const mode of ["shared", "workspace", null, undefined] as const) {
+      expect(
+        shouldUseRepoLessFallbackWorkspaceSource({ adapterType: "claude_k8s", k8sIsolationMode: mode }),
+      ).toBe(false);
+    }
+
+    // Adapters that do not clone their cwd are unaffected.
+    for (const adapterType of ["opencode_k8s", "codex_local", "claude_local", "", null, undefined] as const) {
+      expect(
+        shouldUseRepoLessFallbackWorkspaceSource({ adapterType, k8sIsolationMode: "run" }),
+      ).toBe(false);
+    }
+  });
+});
+
 describe("assertGitSensitiveAdapterWorkspaceValid rejects unsafe claude_k8s bootstrap", () => {
   const agentId = "blo-18147-test-agent";
   const fallbackCwd = resolveDefaultAgentWorkspaceDir(agentId);
@@ -799,7 +826,7 @@ describe("assertGitSensitiveAdapterWorkspaceValid rejects unsafe claude_k8s boot
     await expectWorkspaceValidationFailure(
       fallbackInput(),
       "k8s_agent_home_git_bootstrap_unsupported",
-      "Refusing to dispatch claude_k8s run isolation from the shared agent-home fallback cwd",
+      "Refusing to dispatch claude_k8s run isolation from the fallback cwd",
     );
   });
 
@@ -811,7 +838,7 @@ describe("assertGitSensitiveAdapterWorkspaceValid rejects unsafe claude_k8s boot
         resolvedWorkspace: buildResolvedWorkspace({ cwd: fallbackCwd, source: "project_primary" }),
       }),
       "k8s_agent_home_git_bootstrap_unsupported",
-      "Refusing to dispatch claude_k8s run isolation from the shared agent-home fallback cwd",
+      "Refusing to dispatch claude_k8s run isolation from the fallback cwd",
     );
   });
 
@@ -830,6 +857,55 @@ describe("assertGitSensitiveAdapterWorkspaceValid rejects unsafe claude_k8s boot
     await expect(assertGitSensitiveAdapterWorkspaceValid(fallbackInput())).resolves.toBeUndefined();
   });
 
+  // BLO-18760: the workspace-less fallback now resolves to a repo-less
+  // sibling dir instead of the persistent agent home, so the guard's cwd
+  // path-equality test no longer matches. It must keep probing that source by
+  // its "agent_home" label — otherwise the fix would silently disable the
+  // guard rather than satisfy it.
+  it("still probes the repo-less fallback source, which is not the agent-home path", async () => {
+    const emptySourceCwd = resolveAgentEmptyWorkspaceSourceDir(agentId);
+    expect(path.resolve(emptySourceCwd)).not.toBe(path.resolve(fallbackCwd));
+    // A repo-less source is exactly the state the resolver hands over: the
+    // probe confirms not_a_checkout, so dispatch proceeds and the pod's own
+    // `rev-parse --verify HEAD` fails into its non-fatal empty-workspace
+    // branch instead of exiting 128.
+    await fs.mkdir(emptySourceCwd, { recursive: true });
+    try {
+      await expect(
+        assertGitSensitiveAdapterWorkspaceValid(
+          fallbackInput({
+            resolvedWorkspace: buildResolvedWorkspace({ cwd: emptySourceCwd, source: "agent_home" }),
+            executionWorkspace: {
+              ...buildWorkspaceValidationInput().executionWorkspace,
+              baseCwd: emptySourceCwd,
+              cwd: emptySourceCwd,
+              source: "agent_home",
+            },
+          }),
+        ),
+      ).resolves.toBeUndefined();
+
+      // ...and if that directory ever acquires a checkout, the guard must
+      // still refuse rather than hand the pod a clone source.
+      await runGit(emptySourceCwd, ["init"]);
+      await expectWorkspaceValidationFailure(
+        fallbackInput({
+          resolvedWorkspace: buildResolvedWorkspace({ cwd: emptySourceCwd, source: "agent_home" }),
+          executionWorkspace: {
+            ...buildWorkspaceValidationInput().executionWorkspace,
+            baseCwd: emptySourceCwd,
+            cwd: emptySourceCwd,
+            source: "agent_home",
+          },
+        }),
+        "k8s_agent_home_git_bootstrap_unsupported",
+        "Refusing to dispatch claude_k8s run isolation from the fallback cwd",
+      );
+    } finally {
+      await fs.rm(emptySourceCwd, { recursive: true, force: true });
+    }
+  });
+
   it("rejects when the git checkout probe fails indeterminately instead of confirming a non-checkout", async () => {
     await fs.mkdir(path.dirname(fallbackCwd), { recursive: true });
     // A regular file at the fallback cwd path makes the "git rev-parse" probe
@@ -841,7 +917,7 @@ describe("assertGitSensitiveAdapterWorkspaceValid rejects unsafe claude_k8s boot
     await expectWorkspaceValidationFailure(
       fallbackInput(),
       "k8s_agent_home_git_bootstrap_unsupported",
-      "Refusing to dispatch claude_k8s run isolation from the shared agent-home fallback cwd",
+      "Refusing to dispatch claude_k8s run isolation from the fallback cwd",
     );
   });
 
@@ -859,7 +935,7 @@ describe("assertGitSensitiveAdapterWorkspaceValid rejects unsafe claude_k8s boot
       await expectWorkspaceValidationFailure(
         fallbackInput(),
         "k8s_agent_home_git_bootstrap_unsupported",
-        "Refusing to dispatch claude_k8s run isolation from the shared agent-home fallback cwd",
+        "Refusing to dispatch claude_k8s run isolation from the fallback cwd",
       );
       expect(Date.now() - startedAt).toBeLessThan(1_500);
     } finally {
@@ -882,7 +958,7 @@ describe("assertGitSensitiveAdapterWorkspaceValid rejects unsafe claude_k8s boot
       await expectWorkspaceValidationFailure(
         fallbackInput(),
         "k8s_agent_home_git_bootstrap_unsupported",
-        "Refusing to dispatch claude_k8s run isolation from the shared agent-home fallback cwd",
+        "Refusing to dispatch claude_k8s run isolation from the fallback cwd",
       );
     } finally {
       if (previousPath === undefined) delete process.env.PATH;
