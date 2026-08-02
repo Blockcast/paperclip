@@ -336,13 +336,19 @@ export function issueRecoveryActionService(db: Db) {
         ? (input.timeoutAt ?? null)
         : carriedWakeHorizonAt;
       // BLO-20263: refresh the handoff-grant anchor only when the transfer actually
-      // moves the issue away from a DIFFERENT agent than last time. Every sweep of an
-      // unresolved action passes `previousOwnerAgentId: issue.assigneeAgentId`, so
-      // taking the input unconditionally would re-anchor on each pass and the TTL
-      // would never expire — the same trap `timeoutAt` above documents for the wake
-      // horizon. Carrying null forward is deliberate: a pre-existing row keeps no
-      // anchor key and falls back to `createdAt` on the read side.
-      const nextPreviousOwnerAgentId = input.previousOwnerAgentId ?? existing.previousOwnerAgentId;
+      // moves the issue away from a different source agent. Every sweep passes
+      // `previousOwnerAgentId: issue.assigneeAgentId`, and the prior recovery sweep
+      // reassigns that source issue to `existing.ownerAgentId`. When the input names
+      // that owner, this is recovery seeing its own reassignment, not a fresh handoff
+      // subject. Keep the original previous owner and anchor so recovery-driven
+      // CTO/CEO/manager churn cannot turn the TTL into a sliding window.
+      const inputPreviousOwnerAgentId = input.previousOwnerAgentId ?? existing.previousOwnerAgentId;
+      const isRecoveryDrivenOwnerChurn = input.previousOwnerAgentId !== null &&
+        input.previousOwnerAgentId !== undefined &&
+        input.previousOwnerAgentId === existing.ownerAgentId;
+      const nextPreviousOwnerAgentId = isRecoveryDrivenOwnerChurn
+        ? existing.previousOwnerAgentId
+        : inputPreviousOwnerAgentId;
       const isNewHandoffTransfer = nextPreviousOwnerAgentId !== existing.previousOwnerAgentId;
       const handoffGrantAnchorAt = isNewHandoffTransfer
         ? now
