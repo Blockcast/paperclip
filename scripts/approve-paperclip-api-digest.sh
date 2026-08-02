@@ -93,7 +93,10 @@ for attempt in $(seq 1 "$MAX_ROTATE_ATTEMPTS"); do
   # rollback target instead of two. Anything malformed is discarded here rather
   # than carried forward: the policy would ignore it anyway, and leaving it in
   # place would consume a slot the same way.
-  mapfile -t existing < <(
+  existing=()
+  while IFS= read -r entry; do
+    existing+=("$entry")
+  done < <(
     printf '%s\n' "$current_raw" \
       | tr -d '\r' \
       | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \

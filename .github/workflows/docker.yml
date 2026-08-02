@@ -439,6 +439,29 @@ jobs:
           fi
           echo "approve_script=${script}" >> "$GITHUB_OUTPUT"
 
+      - name: Render and validate deploy chart
+        env:
+          DIGEST: ${{ steps.artifact.outputs.digest }}
+          NS: ${{ vars.PAPERCLIP_NAMESPACE || 'paperclip' }}
+          RELEASE: ${{ vars.PAPERCLIP_HELM_RELEASE || 'paperclip' }}
+          TAG: sha-${{ steps.target.outputs.short }}-k8s-vendored
+        run: |
+          set -euo pipefail
+          [[ "${DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]
+          expected_image="harbor.blockcast.net/paperclip/paperclip@${DIGEST}"
+          rendered=$(helm template "${RELEASE}" ./deploy/helm/paperclip \
+            -n "${NS}" \
+            -f deploy/helm/paperclip/values.blockcast.yaml \
+            --set image.tag="${TAG}" \
+            --set-string image.digest="${DIGEST}")
+          rendered_images=$(printf '%s\n' "${rendered}" | awk \
+            '$1 == "image:" { gsub(/["'\''"]/, "", $2); if ($2 ~ /^harbor\.blockcast\.net\/paperclip\/paperclip([:@]|$)/) print $2 }')
+          if [ -z "${rendered_images}" ] || [ -n "$(printf '%s\n' "${rendered_images}" | grep -Fvx "${expected_image}" || true)" ]; then
+            echo "Chart did not render every Paperclip workload as ${expected_image}:" >&2
+            printf '%s\n' "${rendered_images:-<none>}" >&2
+            exit 1
+          fi
+
       - name: Approve deploy digest at admission time
         env:
           APPROVER_KUBECONFIG: ${{ secrets.KUBECONFIG_PAPERCLIP_RELEASE_APPROVER }}
@@ -471,6 +494,7 @@ jobs:
           # of a follow-up chmod so the file is never briefly world-readable.
           trap 'rm -rf "${approver_dir}"' EXIT
           (umask 077; printf '%s' "${APPROVER_KUBECONFIG}" > "${approver_kubeconfig}")
+          unset APPROVER_KUBECONFIG
 
           KUBECONFIG="${approver_kubeconfig}" \
             "${APPROVE_SCRIPT}" "${DIGEST}" | tee "${approval_log}"
@@ -495,19 +519,6 @@ jobs:
           set -euo pipefail
           [[ "${DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]
           echo "rolling out ${TAG}@${DIGEST} to ${NS}/${RELEASE}"
-          expected_image="harbor.blockcast.net/paperclip/paperclip@${DIGEST}"
-          rendered=$(helm template "${RELEASE}" ./deploy/helm/paperclip \
-            -n "${NS}" \
-            -f deploy/helm/paperclip/values.blockcast.yaml \
-            --set image.tag="${TAG}" \
-            --set-string image.digest="${DIGEST}")
-          rendered_images=$(printf '%s\n' "${rendered}" | awk \
-            '$1 == "image:" { gsub(/["'\''"]/, "", $2); if ($2 ~ /^harbor\.blockcast\.net\/paperclip\/paperclip([:@]|$)/) print $2 }')
-          if [ -z "${rendered_images}" ] || [ -n "$(printf '%s\n' "${rendered_images}" | grep -Fvx "${expected_image}" || true)" ]; then
-            echo "Chart did not render every Paperclip workload as ${expected_image}:" >&2
-            printf '%s\n' "${rendered_images:-<none>}" >&2
-            exit 1
-          fi
           # --timeout bumped 10m → 30m on 2026-05-23 after rev 316 + several
           # prior revs hit "context deadline exceeded" while the cluster was
           # in apiserver/kubelet-latency cascade (control-plane nodes at

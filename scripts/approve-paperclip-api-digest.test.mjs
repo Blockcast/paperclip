@@ -256,9 +256,15 @@ test("the deploy workflow calls the script rather than re-inlining the rotation"
   // disk, so the trap has to be armed before the secret is written.
   const trapAt = step.indexOf("trap 'rm -rf");
   const writeAt = step.indexOf('printf \'%s\' "${APPROVER_KUBECONFIG}"');
+  const unsetAt = step.indexOf("unset APPROVER_KUBECONFIG");
+  const invokeAt = step.indexOf('"${APPROVE_SCRIPT}" "${DIGEST}"');
   assert.notEqual(trapAt, -1, "the step must install an EXIT trap for the approver credential");
   assert.notEqual(writeAt, -1, "the step must write the approver kubeconfig");
   assert.ok(trapAt < writeAt, "the EXIT trap must be armed before the credential reaches disk");
+  assert.notEqual(unsetAt, -1, "the step must unset the raw approver secret after writing the kubeconfig");
+  assert.notEqual(invokeAt, -1, "the step must invoke the committed script");
+  assert.ok(writeAt < unsetAt, "the raw approver secret must stay available until the kubeconfig is materialized");
+  assert.ok(unsetAt < invokeAt, "the raw approver secret must not be inherited by the approval script");
 
   // A fixed path is opened through any symlink already sitting at that name.
   // arc-deploy is a self-hosted pool, so residue from an earlier workload could
@@ -285,9 +291,15 @@ test("the approval step runs tooling from the trusted workflow revision", () => 
   const workflow = readFileSync(WORKFLOW, "utf8");
 
   const checkoutAt = workflow.indexOf("- name: Checkout release tooling at trusted revision");
+  const preflightAt = workflow.indexOf("- name: Render and validate deploy chart");
   const approveAt = workflow.indexOf("- name: Approve deploy digest at admission time");
+  const helmAt = workflow.indexOf("- name: helm upgrade");
   assert.notEqual(checkoutAt, -1, "docker.yml must check out release tooling separately");
+  assert.notEqual(preflightAt, -1, "docker.yml must validate the rendered chart before approval");
+  assert.notEqual(helmAt, -1, "docker.yml must still perform the Helm rollout");
   assert.ok(checkoutAt < approveAt, "the tooling checkout must precede the approval step");
+  assert.ok(preflightAt < approveAt, "chart rendering must be validated before mutating the admission allowlist");
+  assert.ok(approveAt < helmAt, "Helm rollout must remain after admission approval");
 
   const checkout = workflow.slice(checkoutAt, approveAt);
   assert.match(
@@ -313,5 +325,25 @@ test("the approval step runs tooling from the trusted workflow revision", () => 
     approveStep.slice(0, approveStep.search(/^ {6}- name: /m) || undefined),
     /\.\/scripts\/approve-paperclip-api-digest\.sh/,
     "the approval step must not execute the script out of the deploy checkout",
+  );
+
+  const preflightStep = workflow.slice(preflightAt, approveAt);
+  assert.match(
+    preflightStep,
+    /helm template "\$\{RELEASE\}" \.\/deploy\/helm\/paperclip/,
+    "the side-effect-free preflight must render the target chart",
+  );
+  assert.match(
+    preflightStep,
+    /Chart did not render every Paperclip workload as \$\{expected_image\}/,
+    "the preflight must validate rendered Paperclip images before approval",
+  );
+
+  const helmStep = workflow.slice(helmAt);
+  const helmStepBody = helmStep.slice(0, helmStep.search(/^ {6}- name: /m) || undefined);
+  assert.doesNotMatch(
+    helmStepBody,
+    /helm template "\$\{RELEASE\}" \.\/deploy\/helm\/paperclip/,
+    "chart rendering must not wait until after admission approval",
   );
 });
