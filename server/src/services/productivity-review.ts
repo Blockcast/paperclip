@@ -62,6 +62,17 @@ export const PRODUCTIVITY_REVIEW_MIN_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 // Marker set on heartbeat-run contextSnapshot.source by routine dispatches; see
 // queueIssueAssignmentWakeup callers in routines.ts (`contextSource: "routine.dispatch"`).
 const ROUTINE_DISPATCH_CONTEXT_SOURCE = "routine.dispatch";
+// BLO-21003: `monitorNextCheckAt` lapsing is not proof its wake has been serviced.
+// Dispatch (scheduler tick pickup, K8s Job creation, pod scheduling/image pull) is
+// asynchronous, and a reconcile pass can land inside that gap: on BLO-19772 the
+// monitor came due at 17:10:00.000Z, this service evaluated the source at
+// 17:10:00.601Z (601ms into the gap), and the wake was not actually serviced until
+// 17:10:29.739Z. Grace covers a full extra scheduler tick beyond the default
+// `heartbeatSchedulerIntervalMs` (30_000ms, see config.ts) past the due time, so a
+// reconcile pass landing in that window reads as a still-pending wake rather than
+// an unattended stall. A monitor lapsed past this window is genuinely
+// unsupervised and still triggers review, unchanged from today.
+export const MONITOR_LAPSE_SERVICE_GRACE_MS = 60_000;
 
 type IssueRow = typeof issues.$inferSelect;
 type AgentRow = typeof agents.$inferSelect;
@@ -191,6 +202,17 @@ function msToHuman(ms: number | null) {
   return `${hours}h ${minutes % 60}m`;
 }
 
+// BLO-21003 AC3: `msToHuman` floors anything under 60s to `0m`, which reads as
+// "measured and zero" rather than "sub-minute and unmeasured at this
+// resolution". A caller reporting a genuinely nonzero sub-minute duration (e.g.
+// `monitorGatingBreakdown`'s `unattendedMs`) should say so with a real unit
+// instead. Zero itself is left as `0m` — that value is accurate, not floored.
+function msToHumanFine(ms: number | null) {
+  if (ms === null) return "unknown";
+  if (ms > 0 && ms < 60_000) return `${Math.max(1, Math.round(ms / 1000))}s`;
+  return msToHuman(ms);
+}
+
 function issueUiLink(issue: { identifier: string | null; id: string }, prefix: string) {
   const label = issue.identifier ?? issue.id;
   return `[${label}](/${prefix}/issues/${label})`;
@@ -239,7 +261,14 @@ function isTerminalIssueStatus(status: string | null | undefined) {
 function deliberateFutureMonitor(issue: IssueRow, now: Date) {
   const monitorNextCheckAt = coerceDate(issue.monitorNextCheckAt);
   const monitorScheduledBy = issue.monitorScheduledBy;
-  if (!monitorNextCheckAt || monitorNextCheckAt.getTime() <= now.getTime()) return null;
+  if (!monitorNextCheckAt) return null;
+  // BLO-21003: a monitor that lapsed within the last MONITOR_LAPSE_SERVICE_GRACE_MS
+  // is treated the same as one still strictly in the future — its wake may simply
+  // not have been serviced yet. `monitorNextCheckAt` is cleared to null once the
+  // wake is actually triggered (see buildIssueMonitorTriggeredPatch), so this
+  // window only ever covers the narrow due-but-not-yet-cleared gap, not a
+  // genuinely lapsed monitor.
+  if (monitorNextCheckAt.getTime() <= now.getTime() - MONITOR_LAPSE_SERVICE_GRACE_MS) return null;
   if (!monitorScheduledBy || !MONITOR_SCHEDULED_SUPPRESSION_ACTORS.has(monitorScheduledBy)) return null;
   return { monitorNextCheckAt, monitorScheduledBy };
 }
@@ -321,8 +350,8 @@ function monitorGatingBreakdown(issue: IssueRow, activeStartedAt: Date | null, e
 function formatMonitorGating(gating: NonNullable<ProductivityReviewEvidence["monitorGating"]>) {
   // An upper-bound gated figure implies a lower-bound unattended figure; both
   // carry a qualifier so neither half of the split reads as measured.
-  const gated = `${gating.gatedIsUpperBound ? "≤" : ""}${msToHuman(gating.gatedMs)} monitor-gated`;
-  const unattended = `${gating.gatedIsUpperBound ? "≥" : ""}${msToHuman(gating.unattendedMs)} unattended`;
+  const gated = `${gating.gatedIsUpperBound ? "≤" : ""}${msToHumanFine(gating.gatedMs)} monitor-gated`;
+  const unattended = `${gating.gatedIsUpperBound ? "≥" : ""}${msToHumanFine(gating.unattendedMs)} unattended`;
   const split = `${gated}, ${unattended}`;
   if (gating.armedUntil) {
     return `${split} (monitor armed until ${gating.armedUntil.toISOString()}; arm time is not recorded, so monitor-gated time is an upper bound)`;
