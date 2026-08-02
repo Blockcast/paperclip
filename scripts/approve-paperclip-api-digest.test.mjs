@@ -118,7 +118,7 @@ process.stdout.write(
  * Run the real script against a stub cluster.
  * @returns {{status:number, stdout:string, stderr:string, window:string[]}}
  */
-function approve(digestArg, { current, absent = false, conflicts = 0, tamperOnWrite } = {}) {
+function approve(digestArg, { current, absent = false, conflicts = 0, tamperOnWrite, env = {} } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "paperclip-approve-"));
   const statePath = join(dir, "state.json");
   const state = {
@@ -141,6 +141,7 @@ function approve(digestArg, { current, absent = false, conflicts = 0, tamperOnWr
       PATH: `${dir}:${process.env.PATH}`,
       STUB_STATE: statePath,
       PAPERCLIP_APPROVAL_ROTATE_ATTEMPTS: "3",
+      ...env,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -153,6 +154,33 @@ function approve(digestArg, { current, absent = false, conflicts = 0, tamperOnWr
 
 test("prepends the new digest and evicts the oldest at the 3-entry bound", { skip }, () => {
   const { status, window } = approve(D, { current: [A, B, C].join("\n") });
+  assert.equal(status, 0);
+  assert.deepEqual(window, [D, A, B]);
+});
+
+// The window size is enforced by CEL in the admission policy, which this script
+// cannot read. It used to be an override (`${PAPERCLIP_MAX_APPROVED_DIGESTS:-3}`)
+// that also fed the post-write guard, so raising it moved the check that exists
+// to catch exactly that: the script wrote a 4-entry ring, compared it against
+// the same raised 4, and reported "Approved. 4 digest(s) in the window." while
+// the policy — still bounded at 3 — answered by denying *every* rollout. A
+// widened writer bound is a hard outage, never a widened policy, so a
+// disagreeing value must be refused before the ring is touched.
+test("refuses a window bound that disagrees with the policy, leaving the ring intact", { skip }, () => {
+  const { status, stderr, window } = approve(D, {
+    current: [A, B, C].join("\n"),
+    env: { PAPERCLIP_MAX_APPROVED_DIGESTS: "4" },
+  });
+  assert.equal(status, 2, "a disagreeing bound must be refused, not honoured");
+  assert.match(stderr, /disagrees with the/);
+  assert.deepEqual(window, [A, B, C], "the approval ring must be untouched on refusal");
+});
+
+test("accepts a bound that agrees with the policy", { skip }, () => {
+  const { status, window } = approve(D, {
+    current: [A, B, C].join("\n"),
+    env: { PAPERCLIP_MAX_APPROVED_DIGESTS: "3" },
+  });
   assert.equal(status, 0);
   assert.deepEqual(window, [D, A, B]);
 });
@@ -249,6 +277,17 @@ test("the deploy workflow calls the script rather than re-inlining the rotation"
     step,
     /kubectl .*(patch|replace) configmap|head -n "\$\{MAX_APPROVED\}"/,
     "the step must not reimplement the rotation inline",
+  );
+
+  // The bound belongs to the admission policy, so the workflow must not carry a
+  // second copy of it. A value here can only ever agree (redundant) or disagree
+  // (a ring the policy denies outright); the script owns it as a constant.
+  // Scoped to an actual env assignment so the step may still explain *why* it
+  // does not set one.
+  assert.doesNotMatch(
+    step,
+    /^\s*PAPERCLIP_MAX_APPROVED_DIGESTS\s*:/m,
+    "the workflow must not pin the approval window size; the script owns that constant",
   );
 
   // The approver is the higher-privilege of the two credentials this job

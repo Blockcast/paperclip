@@ -31,7 +31,24 @@ DATA_KEY="approvedDigests"
 # Must stay in lockstep with the `maxApprovedApiDigests` CEL variable in
 # onprem-k8s paperclip/paperclip-public-tools.yaml. The policy denies everything
 # if the list is longer, so a drift here is a hard outage, not a silent widening.
-MAX_APPROVED_DIGESTS="${PAPERCLIP_MAX_APPROVED_DIGESTS:-3}"
+#
+# Deliberately a constant and not an override. This script runs with the
+# approver credential, which cannot read the cluster-scoped policy to check
+# itself, and the window guard at the bottom of this file compares against this
+# same number — so an override raises the bound *and* moves the guard that
+# exists to catch exactly that, reporting "Approved. 4 digest(s) in the window."
+# while leaving the ring in a state the policy answers by denying every rollout.
+# Raising the writer-side bound never widens the policy; it only breaks it.
+readonly MAX_APPROVED_DIGESTS=3
+
+if [[ -n "${PAPERCLIP_MAX_APPROVED_DIGESTS:-}" \
+      && "$PAPERCLIP_MAX_APPROVED_DIGESTS" != "$MAX_APPROVED_DIGESTS" ]]; then
+  echo "refusing to approve: PAPERCLIP_MAX_APPROVED_DIGESTS=${PAPERCLIP_MAX_APPROVED_DIGESTS} disagrees with the" >&2
+  echo "${MAX_APPROVED_DIGESTS}-entry window the admission policy enforces. Raising the writer-side bound does not" >&2
+  echo "widen the policy; it makes the policy deny every rollout. Change the maxApprovedApiDigests CEL" >&2
+  echo "variable in onprem-k8s paperclip/paperclip-public-tools.yaml and this constant together." >&2
+  exit 2
+fi
 
 usage() {
   echo "usage: $0 sha256:<64 lowercase hex>" >&2

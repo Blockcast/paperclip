@@ -467,10 +467,12 @@ jobs:
           APPROVER_KUBECONFIG: ${{ secrets.KUBECONFIG_PAPERCLIP_RELEASE_APPROVER }}
           DIGEST: ${{ steps.artifact.outputs.digest }}
           APPROVE_SCRIPT: ${{ steps.tooling.outputs.approve_script }}
-          # Must match maxApprovedApiDigests in the admission policy. The policy
-          # denies every rollout if the window is longer, so this is a hard
-          # ceiling rather than a preference.
-          PAPERCLIP_MAX_APPROVED_DIGESTS: '3'
+          # The approval window size is deliberately NOT set here. It is a
+          # readonly constant inside the approval script, kept in lockstep with
+          # maxApprovedApiDigests in the admission policy; a workflow-side value
+          # could only ever disagree with the policy, and the script refuses a
+          # disagreeing PAPERCLIP_MAX_APPROVED_DIGESTS rather than writing a ring
+          # the policy answers by denying every rollout.
         run: |
           set -euo pipefail
           if [ -z "${APPROVER_KUBECONFIG}" ]; then
