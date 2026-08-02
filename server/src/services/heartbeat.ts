@@ -142,7 +142,11 @@ import { getTelemetryClient } from "../telemetry.js";
 import { companySkillService } from "./company-skills.js";
 import { budgetService, type BudgetEnforcementScope } from "./budgets.js";
 import { secretService, type MissingRuntimeBinding } from "./secrets.js";
-import { resolveDefaultAgentWorkspaceDir, resolveManagedProjectWorkspaceDir } from "../home-paths.js";
+import {
+  resolveAgentEmptyWorkspaceSourceDir,
+  resolveDefaultAgentWorkspaceDir,
+  resolveManagedProjectWorkspaceDir,
+} from "../home-paths.js";
 import {
   buildHeartbeatRunIssueComment,
   HEARTBEAT_RUN_RESULT_OUTPUT_MAX_CHARS,
@@ -615,6 +619,67 @@ const GIT_SENSITIVE_LOCAL_ADAPTER_TYPES = new Set([
 // claude_k8s only — opencode_k8s pods were observed healthy through the same
 // incident window (BLO-18145) and are not known to share this bootstrap path.
 const K8S_GIT_SENSITIVE_ADAPTER_TYPES = new Set(["claude_k8s"]);
+
+// BLO-18760: does the workspace-less fallback need a repo-less clone source?
+//
+// Only for the adapters that bootstrap by cloning their resolved cwd, and only
+// under `run` isolation — the one mode where that cwd is used *solely* as a
+// clone source (the pod's workspace/home/session/cache roots are all ephemeral
+// per-run paths). Under `shared` and `workspace` isolation the agent home is
+// the live working directory and must stay persistent, so those keep it.
+export function shouldUseRepoLessFallbackWorkspaceSource(input: {
+  adapterType: string | null | undefined;
+  k8sIsolationMode: "shared" | "run" | "workspace" | null | undefined;
+}): boolean {
+  const adapterType = readNonEmptyString(input.adapterType);
+  if (!adapterType) return false;
+  return K8S_GIT_SENSITIVE_ADAPTER_TYPES.has(adapterType) && input.k8sIsolationMode === "run";
+}
+
+// BLO-18760 (review follow-up): is a saved session cwd the workspace-less
+// fallback dir belonging to the *other* k8s isolation mode?
+//
+// The session cwd is persisted per (agent, adapter, task) and replayed on every
+// resume, but isolation is decided per *run*. The saved-cwd early return in
+// `resolveWorkspaceForRun` is otherwise screened only by
+// `isUnsafeSessionWorkspaceCwd`, which rejects system temp roots and knows
+// nothing about isolation — so a cwd chosen under one mode is silently
+// inherited by a run in the other. Both directions break:
+//
+//   shared -> run:  the persistent agent home (carrying a real `.git` from
+//     unrelated prior runs) returns as `task_session`, the repo-less selection
+//     never runs, and the BLO-18147 dispatch guard parks the run — re-opening,
+//     via a resumed session, the exact strand BLO-18760 closes.
+//
+//   run -> shared:  a shared run adopts `empty-workspaces/<agent>` as its *live*
+//     working directory and writes a `.git` into it. That directory's
+//     repo-less-ness is an invariant introduced by BLO-18760 and is load-bearing
+//     for every later run-isolated launch, which the same guard would then park.
+//     The session/workspace mismatch check downstream fires only after
+//     `executionWorkspace` is realized, so it does not prevent the inheritance,
+//     and the breakage surfaces on a later, different run.
+//
+// Deliberately narrow: true only for the two workspace-less fallback dirs. Any
+// other resumable cwd — project workspace, per-run worktree, operator branch —
+// is left alone, so warm-session continuity for workspace-bound issues is
+// unaffected.
+export function isWorkspaceLessFallbackCwdForOtherIsolationMode(input: {
+  sessionCwd: string | null | undefined;
+  agentId: string;
+  adapterType: string | null | undefined;
+  k8sIsolationMode: "shared" | "run" | "workspace" | null | undefined;
+}): boolean {
+  const sessionCwd = readNonEmptyString(input.sessionCwd);
+  if (!sessionCwd) return false;
+  const useRepoLessFallbackSource = shouldUseRepoLessFallbackWorkspaceSource({
+    adapterType: input.adapterType,
+    k8sIsolationMode: input.k8sIsolationMode,
+  });
+  const mismatchedFallbackDir = useRepoLessFallbackSource
+    ? resolveDefaultAgentWorkspaceDir(input.agentId)
+    : resolveAgentEmptyWorkspaceSourceDir(input.agentId);
+  return sameResolvedPath(sessionCwd, mismatchedFallbackDir);
+}
 export const MAX_TURN_CONTINUATION_RETRY_REASON = "max_turns_continuation";
 export const MAX_TURN_CONTINUATION_WAKE_REASON = "max_turns_continuation_retry";
 const MAX_TURN_CONTINUATION_DEFAULT_MAX_ATTEMPTS = 2;
@@ -2196,13 +2261,38 @@ export async function assertGitSensitiveAdapterWorkspaceValid(input: {
   // claude_k8s only clones the source checkout for per-run isolation. Key the
   // invariant on that effective source path, not the resolver label: a missing
   // project cwd can retain source="project_primary" while falling back here.
+  //
+  // BLO-18760: also cover source="agent_home" by label. That fallback now
+  // resolves to a repo-less sibling dir rather than the persistent agent home,
+  // so a path-only check would silently stop probing it. Probing it is the
+  // point — the run is allowed through precisely *because* the probe confirms
+  // "not_a_checkout", so if that directory ever acquires a `.git` we park
+  // instead of handing the pod a clone source that can exit 128.
+  const cwdIsAgentHomeFallback =
+    effectiveCwd !== null && path.resolve(effectiveCwd) === path.resolve(agentFallbackCwd);
+  // BLO-18760: the repo-less fallback source is a second directory that means
+  // "this run resolved no project or session workspace". Every check keyed on
+  // the agent-home path must treat it the same way, or the new path silently
+  // escapes guards the old one was subject to.
+  const cwdIsWorkspaceLessFallback =
+    cwdIsAgentHomeFallback ||
+    sameResolvedPath(effectiveCwd, resolveAgentEmptyWorkspaceSourceDir(input.agentId));
+  // Gate on the *path*, not just the "agent_home" label, or a resumed run
+  // walks straight past this probe. Only the first workspace-less run carries
+  // source="agent_home": that cwd is then persisted into the task session, and
+  // every resume resolves it back as source="task_session" (the session branch
+  // accepts any existing dir that isUnsafeSessionWorkspaceCwd doesn't flag, and
+  // it only flags system roots). A label-only gate would therefore probe run 1
+  // and skip runs 2..n on the identical directory — so if it ever acquired a
+  // `.git`, the resumed run would hand claude_k8s the unsafe clone source this
+  // guard exists to refuse, breaking the BLO-18147 fail-closed invariant.
   if (
     K8S_GIT_SENSITIVE_ADAPTER_TYPES.has(input.adapterType) &&
     k8sIssue &&
     input.k8sRunIsolation?.isolationMode === "run" &&
     !input.resolvedWorkspace.realizationFailure &&
     effectiveCwd !== null &&
-    path.resolve(effectiveCwd) === path.resolve(agentFallbackCwd)
+    (cwdIsWorkspaceLessFallback || input.resolvedWorkspace.source === "agent_home")
   ) {
     // Deliberately not isGitCheckout(): that helper fails open (any probe
     // error -> false), which would wave a storage-layer probe failure
@@ -2212,7 +2302,7 @@ export async function assertGitSensitiveAdapterWorkspaceValid(input: {
     const gitProbeState = await probeGitCheckoutStateStrict(effectiveCwd);
     if (gitProbeState !== "not_a_checkout") {
       throw new WorkspaceValidationFailure(
-        `Issue ${k8sIssue.identifier ?? k8sIssue.id} has no usable project or session execution workspace. Refusing to dispatch ${input.adapterType} run isolation from the shared agent-home fallback cwd "${effectiveCwd}" because its in-pod git bootstrap clones locally from this checkout and can exit 128 under storage pressure. Bind a project or execution workspace to this issue before retrying.`,
+        `Issue ${k8sIssue.identifier ?? k8sIssue.id} has no usable project or session execution workspace. Refusing to dispatch ${input.adapterType} run isolation from the fallback cwd "${effectiveCwd}" because its in-pod git bootstrap clones locally from this checkout and can exit 128 under storage pressure (git probe: ${gitProbeState}). This directory is expected to contain no git repository; remove the checkout under it, or bind a project or execution workspace to this issue, before retrying.`,
         {
           workspaceValidation: {
             reason: "k8s_agent_home_git_bootstrap_unsupported",
@@ -2338,7 +2428,7 @@ export async function assertGitSensitiveAdapterWorkspaceValid(input: {
     );
   }
 
-  if (workspaceExpectation && effectiveCwd && sameResolvedPath(effectiveCwd, agentFallbackCwd)) {
+  if (workspaceExpectation && effectiveCwd && cwdIsWorkspaceLessFallback) {
     fail(
       "fallback_agent_home_cwd",
       `Issue ${issue.identifier ?? issue.id} expected a project workspace, but ${input.adapterType} would launch from agent fallback cwd "${effectiveCwd}".`,
@@ -4405,7 +4495,15 @@ export function resolveRuntimeSessionParamsForWorkspace(input: {
     };
   }
   const fallbackAgentHomeCwd = resolveDefaultAgentWorkspaceDir(agentId);
-  if (path.resolve(previousCwd) !== path.resolve(fallbackAgentHomeCwd)) {
+  // BLO-18760: a workspace-less run can now have parked its session on the
+  // repo-less fallback source instead of the agent home. Both mean "this
+  // session has no real checkout behind it", so both must rebind once a
+  // project workspace becomes available — otherwise the session stays pinned
+  // to an empty directory forever.
+  const previousCwdIsWorkspaceLessFallback =
+    path.resolve(previousCwd) === path.resolve(fallbackAgentHomeCwd) ||
+    path.resolve(previousCwd) === path.resolve(resolveAgentEmptyWorkspaceSourceDir(agentId));
+  if (!previousCwdIsWorkspaceLessFallback) {
     return {
       sessionParams: previousSessionParams,
       warning: null as string | null,
@@ -10301,7 +10399,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     agent: typeof agents.$inferSelect,
     context: Record<string, unknown>,
     previousSessionParams: Record<string, unknown> | null,
-    opts?: { useProjectWorkspace?: boolean | null },
+    opts?: { useProjectWorkspace?: boolean | null; k8sIsolationMode?: "shared" | "run" | "workspace" | null },
   ): Promise<ResolvedWorkspaceForRun> {
     const issueId = readNonEmptyString(context.issueId) ?? readNonEmptyString(context.taskId);
     const contextProjectId = readNonEmptyString(context.projectId);
@@ -10512,9 +10610,33 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
     }
 
+    // BLO-18760: which workspace-less fallback dir does *this* run want? Decided
+    // before the saved-session early return below, because that return has to be
+    // screened against it — see the isolation-mismatch check.
+    const useRepoLessFallbackSource = shouldUseRepoLessFallbackWorkspaceSource({
+      adapterType: agent.adapterType,
+      k8sIsolationMode: opts?.k8sIsolationMode ?? null,
+    });
+    const agentHomeFallbackDir = resolveDefaultAgentWorkspaceDir(agent.id);
+    const repoLessFallbackDir = resolveAgentEmptyWorkspaceSourceDir(agent.id);
+
     const sessionCwd = readNonEmptyString(previousSessionParams?.cwd);
     const sessionCwdLooksUnsafe = isUnsafeSessionWorkspaceCwd(sessionCwd);
-    if (sessionCwd && !sessionCwdLooksUnsafe) {
+
+    // BLO-18760 (review follow-up): the saved-session early return below is
+    // isolation-blind — `isUnsafeSessionWorkspaceCwd` screens system temp roots
+    // only. Decline a saved cwd that is the workspace-less fallback dir of the
+    // *other* isolation mode, in both directions; see
+    // `isWorkspaceLessFallbackCwdForOtherIsolationMode` for why each direction
+    // breaks. Every other resumable cwd is untouched.
+    const sessionCwdIsMismatchedFallback = isWorkspaceLessFallbackCwdForOtherIsolationMode({
+      sessionCwd,
+      agentId: agent.id,
+      adapterType: agent.adapterType,
+      k8sIsolationMode: opts?.k8sIsolationMode ?? null,
+    });
+
+    if (sessionCwd && !sessionCwdLooksUnsafe && !sessionCwdIsMismatchedFallback) {
       const sessionCwdExists = await fs
         .stat(sessionCwd)
         .then((stats) => stats.isDirectory())
@@ -10533,24 +10655,52 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
     }
 
-    const cwd = resolveDefaultAgentWorkspaceDir(agent.id);
+    // BLO-18760: an issue with no project and no resumable session used to
+    // fall back to the persistent per-agent workspace dir. For claude_k8s
+    // under `run` isolation that directory is a *clone source*, and it has
+    // usually accumulated a real `.git` from unrelated prior runs — so the
+    // pod's `git clone --shared` bootstrap either exits 128 under cephfs
+    // pressure or is refused dispatch by the BLO-18147 guard, which parks the
+    // issue with no wake path. Hand those runs a repo-less source instead:
+    // the pod's `rev-parse --verify HEAD` then fails and its existing
+    // non-fatal `else` branch gives the run a clean empty workspace. Issues
+    // that never touch a repo now execute instead of stranding, and the
+    // guard below still probes this path rather than being bypassed.
+    //
+    // Deliberately narrow: only the adapters whose in-pod bootstrap clones
+    // (K8S_GIT_SENSITIVE_ADAPTER_TYPES) and only under `run` isolation, where
+    // the pod's home/session/workspace roots are already ephemeral per-run
+    // paths and this cwd serves *only* as the clone source. `shared` and
+    // `workspace` isolation keep the persistent agent home, so warm-session
+    // continuity is untouched.
+    const cwd = useRepoLessFallbackSource ? repoLessFallbackDir : agentHomeFallbackDir;
     await fs.mkdir(cwd, { recursive: true });
     const warnings: string[] = [];
+    const fallbackSuffix = useRepoLessFallbackSource
+      ? ` Using repo-less fallback workspace "${cwd}" for this run; it starts empty.`
+      : ` Using fallback workspace "${cwd}" for this run.`;
     if (sessionCwd && sessionCwdLooksUnsafe) {
       warnings.push(
-        `Saved session workspace "${sessionCwd}" points at a system temp root and was rejected as untrusted. Using fallback workspace "${cwd}" for this run.`,
+        `Saved session workspace "${sessionCwd}" points at a system temp root and was rejected as untrusted.${fallbackSuffix}`,
+      );
+    } else if (sessionCwd && sessionCwdIsMismatchedFallback) {
+      // Name the real cause: the directory exists and is readable, we declined it
+      // on purpose because it belongs to the other isolation mode.
+      warnings.push(
+        `Saved session workspace "${sessionCwd}" is the workspace-less fallback for a different k8s isolation mode ` +
+          `(this run resolves isolation as "${opts?.k8sIsolationMode ?? "unset"}") and was not reused.${fallbackSuffix}`,
       );
     } else if (sessionCwd) {
       warnings.push(
-        `Saved session workspace "${sessionCwd}" is not available. Using fallback workspace "${cwd}" for this run.`,
+        `Saved session workspace "${sessionCwd}" is not available.${fallbackSuffix}`,
       );
     } else if (resolvedProjectId) {
       warnings.push(
-        `No project workspace directory is currently available for this issue. Using fallback workspace "${cwd}" for this run.`,
+        `No project workspace directory is currently available for this issue.${fallbackSuffix}`,
       );
     } else {
       warnings.push(
-        `No project or prior session workspace was available. Using fallback workspace "${cwd}" for this run.`,
+        `No project or prior session workspace was available.${fallbackSuffix}`,
       );
     }
     return {
@@ -18780,7 +18930,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           agent,
           context,
           previousSessionParams,
-          { useProjectWorkspace: requestedExecutionWorkspaceMode !== "agent_default" },
+          {
+            useProjectWorkspace: requestedExecutionWorkspaceMode !== "agent_default",
+            k8sIsolationMode: k8sIsolationIdentity?.isolationMode ?? null,
+          },
         ),
     });
     // Fail loud when the run explicitly targeted a non-primary project
