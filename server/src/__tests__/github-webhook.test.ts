@@ -56,6 +56,7 @@ import {
   __resetMetricsForTest,
   getMetricsRegistry,
 } from "../services/metrics.js";
+import { PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID } from "../services/pull-request-work-products.js";
 
 /**
  * Sum {@link GITHUB_REVIEW_REQUEST_DELIVERY_METRIC} across every `reason`
@@ -1409,7 +1410,16 @@ describeEmbeddedPostgres("github-webhook route", () => {
       draft?: boolean;
       merged?: boolean;
       headSha?: string;
+      updatedAt?: string;
     }) {
+      const defaultUpdatedAtByAction: Record<string, string> = {
+        opened: "2026-04-30T10:00:00Z",
+        synchronize: "2026-04-30T10:05:00Z",
+        ready_for_review: "2026-04-30T10:10:00Z",
+        converted_to_draft: "2026-04-30T10:10:00Z",
+        closed: "2026-04-30T10:15:00Z",
+        reopened: "2026-04-30T10:20:00Z",
+      };
       return {
         action: opts.action,
         pull_request: {
@@ -1417,6 +1427,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
           title: opts.title === undefined ? `Fix ${opts.identifier}` : opts.title,
           body: null,
           html_url: `https://github.com/Blockcast/paperclip/pull/${opts.number ?? 4242}`,
+          updated_at: opts.updatedAt ?? defaultUpdatedAtByAction[opts.action] ?? "2026-04-30T10:00:00Z",
           draft: opts.draft ?? false,
           merged: opts.merged ?? false,
           head: { ref: `fix/${opts.identifier.toLowerCase()}`, sha: opts.headSha ?? "head-one" },
@@ -1463,6 +1474,13 @@ describeEmbeddedPostgres("github-webhook route", () => {
       expect(rows[0]?.metadata).toMatchObject({
         source: "github_pull_request_webhook",
         sourceEventOrder: 10,
+        sourceEventTimestamp: "2026-04-30T10:00:00.000Z",
+      });
+      expect(rows[0]?.sourceTrust).toMatchObject({
+        preset: "standard",
+        disposition: "promoted",
+        promotedByActorType: "system",
+        promotedByActorId: PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID,
       });
     });
 
@@ -1479,7 +1497,13 @@ describeEmbeddedPostgres("github-webhook route", () => {
 
       await postPr(
         app,
-        prPayload({ action: "synchronize", identifier: "BLO-40002", number: 4243, headSha: "head-two" }),
+        prPayload({
+          action: "synchronize",
+          identifier: "BLO-40002",
+          number: 4243,
+          headSha: "head-two",
+          updatedAt: "2026-04-30T10:15:00Z",
+        }),
         "wp-seq-2",
       );
 
@@ -1527,9 +1551,15 @@ describeEmbeddedPostgres("github-webhook route", () => {
           number: 4247,
           merged: true,
           headSha: "merge-head",
+          updatedAt: "2026-04-30T10:20:00Z",
         }),
         "wp-order-2",
       );
+      const afterMerge = await db
+        .select({ updatedAt: issueWorkProducts.updatedAt })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId))
+        .then((rows) => rows[0]);
       await postPr(
         app,
         prPayload({
@@ -1537,12 +1567,17 @@ describeEmbeddedPostgres("github-webhook route", () => {
           identifier: "BLO-40006",
           number: 4247,
           headSha: "stale-sync-head",
+          updatedAt: "2026-04-30T10:10:00Z",
         }),
         "wp-order-3",
       );
 
       const rows = await db
-        .select({ status: issueWorkProducts.status, metadata: issueWorkProducts.metadata })
+        .select({
+          status: issueWorkProducts.status,
+          metadata: issueWorkProducts.metadata,
+          updatedAt: issueWorkProducts.updatedAt,
+        })
         .from(issueWorkProducts)
         .where(eq(issueWorkProducts.issueId, issueId));
       expect(rows).toHaveLength(1);
@@ -1552,6 +1587,125 @@ describeEmbeddedPostgres("github-webhook route", () => {
         lastEventAction: "closed",
         sourceEventOrder: 30,
       });
+      expect(rows[0]?.updatedAt.getTime()).toBe(afterMerge?.updatedAt.getTime());
+    });
+
+    it("accepts a newer reopened event after a closed PR", async () => {
+      const { issueId } = await seedIssueWithIdentifier("BLO-40008");
+      const app = buildApp();
+
+      await postPr(app, prPayload({
+        action: "opened",
+        identifier: "BLO-40008",
+        number: 4249,
+        updatedAt: "2026-04-30T10:00:00Z",
+      }), "wp-reopen-1");
+      await postPr(app, prPayload({
+        action: "closed",
+        identifier: "BLO-40008",
+        number: 4249,
+        merged: false,
+        updatedAt: "2026-04-30T10:10:00Z",
+      }), "wp-reopen-2");
+      await postPr(app, prPayload({
+        action: "reopened",
+        identifier: "BLO-40008",
+        number: 4249,
+        headSha: "reopened-head",
+        updatedAt: "2026-04-30T10:20:00Z",
+      }), "wp-reopen-3");
+
+      const rows = await db
+        .select({ status: issueWorkProducts.status, metadata: issueWorkProducts.metadata })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.status).toBe("ready_for_review");
+      expect(rows[0]?.metadata).toMatchObject({
+        headSha: "reopened-head",
+        lastEventAction: "reopened",
+        sourceEventTimestamp: "2026-04-30T10:20:00.000Z",
+      });
+    });
+
+    it("ignores delayed equal-rank deliveries instead of refreshing PR liveness", async () => {
+      const { issueId } = await seedIssueWithIdentifier("BLO-40009");
+      const app = buildApp();
+
+      await postPr(app, prPayload({
+        action: "opened",
+        identifier: "BLO-40009",
+        number: 4250,
+        headSha: "opened-head",
+        updatedAt: "2026-04-30T10:00:00Z",
+      }), "wp-equal-rank-1");
+      await postPr(app, prPayload({
+        action: "synchronize",
+        identifier: "BLO-40009",
+        number: 4250,
+        headSha: "newer-sync-head",
+        updatedAt: "2026-04-30T10:20:00Z",
+      }), "wp-equal-rank-2");
+      const afterNewerSync = await db
+        .select({ updatedAt: issueWorkProducts.updatedAt })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId))
+        .then((rows) => rows[0]);
+
+      await postPr(app, prPayload({
+        action: "synchronize",
+        identifier: "BLO-40009",
+        number: 4250,
+        headSha: "stale-sync-head",
+        updatedAt: "2026-04-30T10:05:00Z",
+      }), "wp-equal-rank-3");
+
+      const rows = await db
+        .select({
+          metadata: issueWorkProducts.metadata,
+          updatedAt: issueWorkProducts.updatedAt,
+        })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.metadata).toMatchObject({
+        headSha: "newer-sync-head",
+        lastEventAction: "synchronize",
+        sourceEventTimestamp: "2026-04-30T10:20:00.000Z",
+      });
+      expect(rows[0]?.updatedAt.getTime()).toBe(afterNewerSync?.updatedAt.getTime());
+    });
+
+    it("does not refresh updatedAt for an exact webhook redelivery", async () => {
+      const { issueId } = await seedIssueWithIdentifier("BLO-40010");
+      const app = buildApp();
+      const payload = prPayload({
+        action: "synchronize",
+        identifier: "BLO-40010",
+        number: 4251,
+        headSha: "same-head",
+        updatedAt: "2026-04-30T10:30:00Z",
+      });
+
+      await postPr(app, payload, "wp-redelivery-1");
+      const afterFirst = await db
+        .select({ updatedAt: issueWorkProducts.updatedAt })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId))
+        .then((rows) => rows[0]);
+
+      await postPr(app, payload, "wp-redelivery-2");
+
+      const rows = await db
+        .select({ metadata: issueWorkProducts.metadata, updatedAt: issueWorkProducts.updatedAt })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.metadata).toMatchObject({
+        headSha: "same-head",
+        sourceEventTimestamp: "2026-04-30T10:30:00.000Z",
+      });
+      expect(rows[0]?.updatedAt.getTime()).toBe(afterFirst?.updatedAt.getTime());
     });
 
     it("keeps updating a previously linked PR row after the identifier is removed", async () => {
@@ -1610,6 +1764,50 @@ describeEmbeddedPostgres("github-webhook route", () => {
         lastEventAction: "closed",
         sourceEventOrder: 30,
       });
+    });
+
+    it("does not treat actor-created PR rows as previous webhook links", async () => {
+      const { companyId, issueId } = await seedIssueWithIdentifier("BLO-40011");
+      const app = buildApp();
+      await db.insert(issueWorkProducts).values({
+        companyId,
+        issueId,
+        type: "pull_request",
+        provider: "github",
+        externalId: "Blockcast/paperclip#4252",
+        title: "Actor-authored PR claim",
+        url: "https://github.com/Blockcast/paperclip/pull/4252",
+        status: "ready_for_review",
+        metadata: { source: "manual", headSha: "manual-head" },
+        sourceTrust: null,
+      });
+
+      const res = await postPr(
+        app,
+        prPayload({
+          action: "synchronize",
+          identifier: "no-ticket",
+          number: 4252,
+          title: "Retitled without paperclip id",
+          headSha: "webhook-head",
+          updatedAt: "2026-04-30T10:45:00Z",
+        }),
+        "wp-manual-link-1",
+      );
+
+      expect(res.status).toBe(200);
+      expect(res.body).toMatchObject({ ignored: "no_paperclip_identifier" });
+      const rows = await db
+        .select({
+          metadata: issueWorkProducts.metadata,
+          sourceTrust: issueWorkProducts.sourceTrust,
+          updatedAt: issueWorkProducts.updatedAt,
+        })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.metadata).toEqual({ source: "manual", headSha: "manual-head" });
+      expect(rows[0]?.sourceTrust).toBeNull();
     });
 
     it("records a draft PR as draft rather than ready_for_review", async () => {

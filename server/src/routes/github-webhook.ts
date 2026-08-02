@@ -63,6 +63,8 @@ import {
 import { workProductService } from "../services/work-products.js";
 import {
   buildPullRequestWorkProductFields,
+  PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE,
+  PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID,
   pullRequestExternalId,
 } from "../services/pull-request-work-products.js";
 
@@ -506,6 +508,7 @@ interface ResolvedEventContext {
   // deliberately NOT captured: the link keys on the BLO- ref, never the author.
   prMerged?: boolean;
   prMergedAt?: string | null;
+  prUpdatedAt?: string | null;
   prAdditions?: number | null;
   prDeletions?: number | null;
   prBranch?: string | null;
@@ -853,6 +856,7 @@ function resolveEventContext(
         // pulls/{n}/files fetch (enrichment), so it is not read here.
         prMerged: action === "closed" ? merged : undefined,
         prMergedAt: readStringField(pr, "merged_at"),
+        prUpdatedAt: readStringField(pr, "updated_at"),
         prAdditions: typeof pr?.additions === "number" ? (pr.additions as number) : null,
         prDeletions: typeof pr?.deletions === "number" ? (pr.deletions as number) : null,
         prBranch: (head?.ref as string | undefined) ?? null,
@@ -2357,6 +2361,9 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
             eq(issueWorkProducts.provider, "github"),
             eq(issueWorkProducts.type, "pull_request"),
             eq(issueWorkProducts.externalId, pullRequestWorkProductExternalId),
+            sql`${issueWorkProducts.metadata}->>'source' = ${PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE}`,
+            sql`${issueWorkProducts.sourceTrust}->>'promotedByActorType' = 'system'`,
+            sql`${issueWorkProducts.sourceTrust}->>'promotedByActorId' = ${PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID}`,
           ),
         )
       : [];
@@ -2468,6 +2475,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
         prDraft: context.prDraft,
         prMerged: context.prMerged,
         prMergedAt: context.prMergedAt ?? null,
+        prUpdatedAt: context.prUpdatedAt ?? null,
         action: context.prAction ?? "",
       });
       const workProducts = workProductService(db);
@@ -2482,6 +2490,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
               url: fields.url,
               status: fields.status,
               metadata: fields.metadata,
+              sourceTrust: fields.sourceTrust,
             },
           );
           workProductsUpserted += 1;

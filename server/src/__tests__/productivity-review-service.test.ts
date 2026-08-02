@@ -31,6 +31,7 @@ import {
 } from "../services/productivity-review.js";
 import { logActivity } from "../services/activity-log.js";
 import { RECOVERY_ORIGIN_KINDS } from "../services/recovery/origins.js";
+import { PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST } from "../services/pull-request-work-products.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -324,6 +325,7 @@ describeEmbeddedPostgres("productivity review service", () => {
         metadata: opts.metadata === undefined
           ? { source: "github_pull_request_webhook", sourceEventOrder: 10 }
           : opts.metadata,
+        sourceTrust: PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST,
         createdByRunId: opts.createdByRunId ?? null,
         createdAt: opts.prUpdatedAt,
         updatedAt: opts.prUpdatedAt,
@@ -430,6 +432,39 @@ describeEmbeddedPostgres("productivity review service", () => {
         status: "ready_for_review",
         metadata: { source: "manual" },
         createdByRunId: runs[0]?.id ?? null,
+        createdAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+        updatedAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+      });
+
+      const service = productivityReviewService(db);
+      await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+      const description = (await listProductivityReviews(seeded.companyId))[0]?.description ?? "";
+      expect(description).toContain("Linked pull request: none recorded");
+      expect(description).not.toContain("The second signal is already present");
+    });
+
+    it("ignores rows that spoof webhook metadata without server provenance", async () => {
+      const now = new Date("2026-04-30T12:00:00.000Z");
+      const seeded = await seedAssignedIssue();
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+      });
+      await db.insert(issueWorkProducts).values({
+        companyId: seeded.companyId,
+        issueId: seeded.issueId,
+        type: "pull_request",
+        provider: "github",
+        externalId: "Blockcast/paperclip#806",
+        title: "Spoofed webhook PR claim",
+        url: "https://github.com/Blockcast/paperclip/pull/806",
+        status: "ready_for_review",
+        metadata: { source: "github_pull_request_webhook", sourceEventOrder: 10 },
+        sourceTrust: null,
         createdAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
         updatedAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
       });

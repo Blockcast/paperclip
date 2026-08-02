@@ -117,7 +117,31 @@ export function workProductService(db: Db) {
         when ${issueWorkProducts.status} = 'closed' then 20
         else 10
       end`;
-      const acceptIncoming = sql`${incomingSourceEventOrder} >= ${existingSourceEventOrder}`;
+      const incomingSourceEventTimestampMs = sql<number | null>`case
+        when excluded.metadata->>'sourceEventTimestampMs' ~ '^[0-9]+$'
+          then (excluded.metadata->>'sourceEventTimestampMs')::bigint
+        else null
+      end`;
+      const existingSourceEventTimestampMs = sql<number | null>`case
+        when ${issueWorkProducts.metadata}->>'sourceEventTimestampMs' ~ '^[0-9]+$'
+          then (${issueWorkProducts.metadata}->>'sourceEventTimestampMs')::bigint
+        else null
+      end`;
+      const incomingIsReopen = sql`excluded.metadata->>'lastEventAction' in ('reopened', 'ready_for_review')`;
+      const acceptIncoming = sql`case
+        when ${incomingSourceEventTimestampMs} is not null and ${existingSourceEventTimestampMs} is not null
+          then ${incomingSourceEventTimestampMs} > ${existingSourceEventTimestampMs}
+            or (
+              ${incomingSourceEventTimestampMs} = ${existingSourceEventTimestampMs}
+              and ${incomingSourceEventOrder} > ${existingSourceEventOrder}
+            )
+        when ${incomingSourceEventTimestampMs} is not null and ${existingSourceEventTimestampMs} is null
+          then ${incomingSourceEventOrder} > ${existingSourceEventOrder}
+            or (${existingSourceEventOrder} = 10 and ${incomingSourceEventOrder} = 10)
+            or ${incomingIsReopen}
+        else ${incomingSourceEventOrder} > ${existingSourceEventOrder}
+          or ${incomingIsReopen}
+      end`;
       const row = await db
         .insert(issueWorkProducts)
         .values({
@@ -144,6 +168,7 @@ export function workProductService(db: Db) {
             status: sql`case when ${acceptIncoming} then excluded.status else ${issueWorkProducts.status} end`,
             summary: sql`case when ${acceptIncoming} then excluded.summary else ${issueWorkProducts.summary} end`,
             metadata: sql`case when ${acceptIncoming} then excluded.metadata else ${issueWorkProducts.metadata} end`,
+            sourceTrust: sql`case when ${acceptIncoming} then excluded.source_trust else ${issueWorkProducts.sourceTrust} end`,
             updatedAt: sql`case when ${acceptIncoming} then ${now} else ${issueWorkProducts.updatedAt} end`,
           },
         })

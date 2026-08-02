@@ -1,4 +1,4 @@
-import type { IssueWorkProduct } from "@paperclipai/shared";
+import type { IssueWorkProduct, SourceTrustMetadata } from "@paperclipai/shared";
 
 /**
  * Pure mapping from a GitHub `pull_request` webhook event to the fields of the
@@ -18,6 +18,7 @@ export interface PullRequestWorkProductInput {
   prDraft?: boolean;
   prMerged?: boolean;
   prMergedAt?: string | null;
+  prUpdatedAt?: string | null;
   /** GitHub `action` from the pull_request event. */
   action: string;
 }
@@ -28,9 +29,17 @@ export interface PullRequestWorkProductFields {
   url: string | null;
   status: IssueWorkProduct["status"];
   metadata: Record<string, unknown>;
+  sourceTrust: SourceTrustMetadata;
 }
 
 export const PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE = "github_pull_request_webhook";
+export const PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID = "github_pull_request_webhook";
+export const PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST: SourceTrustMetadata = {
+  preset: "standard",
+  disposition: "promoted",
+  promotedByActorType: "system",
+  promotedByActorId: PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID,
+};
 
 /**
  * Stable identity for a PR row: one PR in one repo. Deliberately excludes the
@@ -69,6 +78,10 @@ export function buildPullRequestWorkProductFields(
 ): PullRequestWorkProductFields {
   const title = input.prTitle?.trim();
   const status = pullRequestWorkProductStatus(input);
+  const sourceEventTimestampMs = input.prUpdatedAt ? Date.parse(input.prUpdatedAt) : NaN;
+  const sourceEventTimestamp = Number.isFinite(sourceEventTimestampMs)
+    ? new Date(sourceEventTimestampMs).toISOString()
+    : null;
   return {
     externalId: pullRequestExternalId(input.repoFullName, input.prNumber),
     // `title` is NOT NULL on the row; fall back to the canonical PR ref so a
@@ -81,6 +94,8 @@ export function buildPullRequestWorkProductFields(
     metadata: {
       source: PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE,
       sourceEventOrder: pullRequestWorkProductSourceEventOrder(status),
+      sourceEventTimestamp,
+      sourceEventTimestampMs: sourceEventTimestamp === null ? null : sourceEventTimestampMs,
       repoFullName: input.repoFullName,
       prNumber: input.prNumber,
       headSha: input.headSha ?? null,
@@ -90,5 +105,6 @@ export function buildPullRequestWorkProductFields(
       mergedAt: input.prMergedAt ?? null,
       lastEventAction: input.action,
     },
+    sourceTrust: PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST,
   };
 }

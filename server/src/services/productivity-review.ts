@@ -26,6 +26,10 @@ import {
   withRecoveryModelProfileHint,
 } from "./recovery/model-profile-hint.js";
 import { RECOVERY_ORIGIN_KINDS } from "./recovery/origins.js";
+import {
+  PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE,
+  PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID,
+} from "./pull-request-work-products.js";
 
 export const PRODUCTIVITY_REVIEW_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.issueProductivityReview;
 export const DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS = 10;
@@ -103,7 +107,7 @@ type PullRequestEvidence = {
 };
 
 const PRODUCTIVITY_REVIEW_PROGRESS_PR_STATUSES = new Set(["ready_for_review", "merged"]);
-const PRODUCTIVITY_REVIEW_WEBHOOK_PR_METADATA_SOURCE = "github_pull_request_webhook";
+const PRODUCTIVITY_REVIEW_WEBHOOK_PR_METADATA_SOURCE = PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE;
 
 type ProductivityReviewEvidence = {
   trigger: ProductivityReviewTrigger;
@@ -1112,6 +1116,8 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
             isNotNull(issueWorkProducts.externalId),
             isNotNull(issueWorkProducts.url),
             sql`${issueWorkProducts.metadata}->>'source' = ${PRODUCTIVITY_REVIEW_WEBHOOK_PR_METADATA_SOURCE}`,
+            sql`${issueWorkProducts.sourceTrust}->>'promotedByActorType' = 'system'`,
+            sql`${issueWorkProducts.sourceTrust}->>'promotedByActorId' = ${PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID}`,
           ),
         )
         .orderBy(desc(issueWorkProducts.updatedAt))

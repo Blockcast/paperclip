@@ -6,6 +6,7 @@
 import { describe, expect, it } from "vitest";
 import {
   buildPullRequestWorkProductFields,
+  PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID,
   pullRequestExternalId,
   pullRequestWorkProductStatus,
 } from "../services/pull-request-work-products.js";
@@ -46,6 +47,7 @@ describe("buildPullRequestWorkProductFields", () => {
     prUrl: "https://github.com/Blockcast/paperclip/pull/905",
     headSha: "24e7b6bd",
     prBranch: "cto/blo-19566",
+    prUpdatedAt: "2026-04-30T10:15:00Z",
     action: "synchronize",
   };
 
@@ -61,6 +63,14 @@ describe("buildPullRequestWorkProductFields", () => {
       headSha: "24e7b6bd",
       branch: "cto/blo-19566",
       lastEventAction: "synchronize",
+      sourceEventTimestamp: "2026-04-30T10:15:00.000Z",
+      sourceEventTimestampMs: Date.parse("2026-04-30T10:15:00Z"),
+    });
+    expect(fields.sourceTrust).toMatchObject({
+      preset: "standard",
+      disposition: "promoted",
+      promotedByActorType: "system",
+      promotedByActorId: PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID,
     });
   });
 
