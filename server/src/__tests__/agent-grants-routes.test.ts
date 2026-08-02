@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -302,6 +302,46 @@ describeEmbeddedPostgres("additive agent grant route", () => {
 
     expect(response.status, JSON.stringify(response.body)).toBe(403);
     expect(response.body.error).toBe("Board access required");
+  });
+
+  it("rolls back the grant when its audit record cannot be persisted", async () => {
+    const { company, ownerId, agent } = await seedCompanyOwnerAndAgent(db);
+    await db.execute(sql`
+      CREATE FUNCTION reject_agent_grant_audit() RETURNS trigger AS $$
+      BEGIN
+        IF NEW.action = 'agent.permission_grant_added' THEN
+          RAISE EXCEPTION 'forced audit failure';
+        END IF;
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql
+    `);
+    await db.execute(sql`
+      CREATE TRIGGER reject_agent_grant_audit
+      BEFORE INSERT ON activity_log
+      FOR EACH ROW EXECUTE FUNCTION reject_agent_grant_audit()
+    `);
+
+    try {
+      const response = await request(await createApp(db, company.id, ownerId))
+        .patch(`/api/companies/${company.id}/agents/${agent.id}/grants`)
+        .send({ operation: "add", permissionKey: "agents:configure" });
+
+      expect(response.status, JSON.stringify(response.body)).toBe(500);
+      const grants = await db
+        .select()
+        .from(principalPermissionGrants)
+        .where(and(
+          eq(principalPermissionGrants.companyId, company.id),
+          eq(principalPermissionGrants.principalType, "agent"),
+          eq(principalPermissionGrants.principalId, agent.id),
+          eq(principalPermissionGrants.permissionKey, "agents:configure"),
+        ));
+      expect(grants).toHaveLength(0);
+    } finally {
+      await db.execute(sql`DROP TRIGGER IF EXISTS reject_agent_grant_audit ON activity_log`);
+      await db.execute(sql`DROP FUNCTION IF EXISTS reject_agent_grant_audit()`);
+    }
   });
 
   it("leaves the human-member permission replacement route unchanged", async () => {

@@ -4963,20 +4963,19 @@ export function accessRoutes(
         agentId,
         req.body,
         req.actor.userId ?? null,
-      );
-      await logActivity(db, {
-        companyId,
-        actorType: "user",
-        actorId: req.actor.userId ?? "board",
-        action: `agent.permission_grant_${req.body.operation === "add" ? "added" : "removed"}`,
-        entityType: "agent",
-        entityId: agentId,
-        details: {
-          permissionKey: req.body.permissionKey,
-          scope: req.body.scope ?? null,
-          changed: result.changed,
+        {
+          companyId,
+          actorType: "user",
+          actorId: req.actor.userId ?? "board",
+          action: `agent.permission_grant_${req.body.operation === "add" ? "added" : "removed"}`,
+          entityType: "agent",
+          entityId: agentId,
+          details: {
+            permissionKey: req.body.permissionKey,
+            scope: req.body.scope ?? null,
+          },
         },
-      });
+      );
 
       const membership = await access.getMembership(companyId, "agent", agentId);
       res.json({

@@ -9,6 +9,7 @@ import {
 import type { PermissionKey, PrincipalType } from "@paperclipai/shared";
 import { conflict } from "../errors.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
+import { logActivity, type LogActivityInput } from "./activity-log.js";
 import { authorizationService, type AuthorizationActor, type AuthorizationResource } from "./authorization.js";
 import { ensureHumanRoleDefaultGrants } from "./principal-access-compatibility.js";
 
@@ -657,6 +658,7 @@ export function accessService(db: Db) {
     principalId: string,
     input: GrantInput & { operation: "add" | "remove" },
     grantedByUserId: string | null,
+    activity: LogActivityInput,
   ) {
     return db.transaction(async (tx) => {
       let changed = false;
@@ -695,6 +697,14 @@ export function accessService(db: Db) {
           .returning({ id: principalPermissionGrants.id });
         changed = added.length > 0;
       }
+
+      await logActivity(tx as unknown as Db, {
+        ...activity,
+        details: {
+          ...activity.details,
+          changed,
+        },
+      });
 
       const grants = await tx
         .select()
