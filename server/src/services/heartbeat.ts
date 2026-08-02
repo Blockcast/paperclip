@@ -14515,6 +14515,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               eq(issues.executionRunId, claimed.retryOfRunId),
             )
           : or(isNull(issues.executionRunId), eq(issues.executionRunId, claimed.id));
+      const issueStatusCondition = requiresInProgressIssueRetry(claimedRetryReason)
+        ? eq(issues.status, "in_progress")
+        : inArray(issues.status, ["in_progress", "in_review"]);
       const issueActorCondition = or(
         eq(issues.assigneeAgentId, claimed.agentId),
         and(
@@ -14526,6 +14529,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       let claimedIssueLock: Pick<typeof issues.$inferSelect, "id" | "executionRunId"> | null = null;
       try {
         claimedIssueLock = await db.transaction(async (tx) => {
+          const lockedIssue = await tx
+            .select({ id: issues.id })
+            .from(issues)
+            .where(and(eq(issues.id, claimedIssueId), eq(issues.companyId, claimed.companyId)))
+            .for("update")
+            .then((rows) => rows[0] ?? null);
+          if (!lockedIssue) return null;
+
           const lockedRun = await tx
             .select({ status: heartbeatRuns.status })
             .from(heartbeatRuns)
@@ -14548,6 +14559,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 eq(issues.companyId, claimed.companyId),
                 // Mention/context runs can touch an issue, but only the current assignee
                 // or execution-review participant owns the issue execution lock shown as the active run.
+                issueStatusCondition,
                 issueActorCondition,
                 executionRunClaimCondition,
               ),

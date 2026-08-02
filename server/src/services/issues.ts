@@ -4612,7 +4612,7 @@ export function issueService(db: Db) {
     agentId: string,
     now: Date,
   ) {
-    if (!checkoutRunId) return {};
+    if (!checkoutRunId) return { patch: {} };
 
     const row = await db
       .select({
@@ -4625,11 +4625,25 @@ export function issueService(db: Db) {
       .where(eq(heartbeatRuns.id, checkoutRunId))
       .then((rows) => rows[0] ?? null);
 
-    if (row?.status !== "running" || row.runAgentId !== agentId) return {};
+    if (row?.status !== "running" || row.runAgentId !== agentId) return { patch: {} };
     return {
-      executionRunId: checkoutRunId,
-      executionAgentNameKey: normalizeAgentNameKey(row.agentName),
-      executionLockedAt: now,
+      patch: {
+        executionRunId: checkoutRunId,
+        executionAgentNameKey: normalizeAgentNameKey(row.agentName),
+        executionLockedAt: now,
+      },
+      condition: exists(
+        db
+          .select({ id: heartbeatRuns.id })
+          .from(heartbeatRuns)
+          .where(
+            and(
+              eq(heartbeatRuns.id, checkoutRunId),
+              eq(heartbeatRuns.agentId, agentId),
+              eq(heartbeatRuns.status, "running"),
+            ),
+          ),
+      ),
     };
   }
 
@@ -9064,7 +9078,11 @@ export function issueService(db: Db) {
       await assertAssignableAgent(db, issueCompany.companyId, agentId, { kind: "work" });
 
       const now = new Date();
-      const checkoutExecutionPatch = await runningCheckoutExecutionPatch(checkoutRunId, agentId, now);
+      const checkoutExecution = await runningCheckoutExecutionPatch(checkoutRunId, agentId, now);
+      const checkoutExecutionPatch = checkoutExecution.patch;
+      const checkoutExecutionCondition = "condition" in checkoutExecution
+        ? checkoutExecution.condition
+        : undefined;
       const activePauseHold = await treeControlSvc.getActivePauseHoldGate(issueCompany.companyId, id);
       if (
         activePauseHold &&
@@ -9143,6 +9161,7 @@ export function issueService(db: Db) {
               ? or(isNull(issues.assigneeAgentId), sameRunAssigneeCondition, activeRecoveryOwnerCondition)
               : or(isNull(issues.assigneeAgentId), sameRunAssigneeCondition),
             executionLockCondition,
+            checkoutExecutionCondition,
           ),
         )
         .returning()
@@ -9211,6 +9230,7 @@ export function issueService(db: Db) {
               eq(issues.assigneeAgentId, agentId),
               isNull(issues.checkoutRunId),
               or(isNull(issues.executionRunId), eq(issues.executionRunId, checkoutRunId)),
+              checkoutExecutionCondition,
             ),
           )
           .returning()
@@ -9275,6 +9295,7 @@ export function issueService(db: Db) {
                 inArray(issues.status, expectedStatuses),
                 eq(issues.executionRunId, current.executionRunId),
                 or(isNull(issues.assigneeAgentId), eq(issues.assigneeAgentId, agentId)),
+                checkoutExecutionCondition,
               ),
             )
             .returning()
@@ -9323,6 +9344,7 @@ export function issueService(db: Db) {
                 eq(issues.id, id),
                 inArray(issues.status, expectedStatuses),
                 isNull(issues.executionRunId),
+                checkoutExecutionCondition,
               ),
             )
             .returning()
