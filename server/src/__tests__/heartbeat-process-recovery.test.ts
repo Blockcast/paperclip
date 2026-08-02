@@ -470,6 +470,14 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     );
     mockTerminateLocalService.mockImplementation(localServiceSupervisor.terminateLocalService);
     mockHasActiveJobForAgent.mockImplementation(async () => false);
+    // vi.clearAllMocks() only clears call history, not implementations, and
+    // this suite sets no `clearMocks`/`mockReset` in vitest config. A test that
+    // uses the persistent `mockResolvedValue` (rather than ...Once) on these two
+    // would otherwise leak its k8s snapshot into every later test in the file —
+    // and a stale Map reads as "job missing" where the default null reads as
+    // "kube unavailable", which are different branches in reapOrphanedRuns.
+    mockListAgentJobRunStatuses.mockImplementation(async () => null);
+    mockListLiveAgentJobRunIds.mockImplementation(async () => null);
     mockGithubHasReviewerEvidenceForPr.mockResolvedValue({ found: false });
     mockAdapterExecute.mockImplementation(async () => ({
       exitCode: 0,
