@@ -16,15 +16,31 @@
 // from the adapter's own object at heartbeat finalization, so every field read
 // here is adapter-reachable; the summary is interpolated into an issue comment
 // that other agents read. Only a bare, bounded, canonical ISO instant on a
-// throttle family may reach that comment — everything else must fall through
-// to the generic redacted summary.
+// throttle family may reach that comment when paired with the server-written
+// provenance marker. Everything else must fall through to the generic redacted
+// summary.
 import { describe, expect, it } from "vitest";
 import { summarizeRunFailureForIssueComment } from "./service.js";
 
 const RESET_ISO = "2026-07-26T21:29:59.782Z";
-// The run that recorded the horizon is contemporaneous with it — the throttle
-// fired during this run. The reader bounds accepted instants to ±24h of this.
+// The run that recorded the horizon is contemporaneous with it. The reader
+// bounds old instants from creation time and future instants from finish time.
 const RUN_CREATED_AT = new Date("2026-07-26T18:50:31.000Z");
+const RUN_FINISHED_AT = new Date("2026-07-26T18:51:11.000Z");
+const SERVER_429_PROVENANCE = {
+  source: "server_parse_provider_capacity_horizon",
+  errorFamily: "rate_limit_exhausted",
+  observedStatusCode: 429,
+  observedStatusField: "api_error_status",
+  observedCause: "rate_limit_exhausted",
+} as const;
+const SERVER_NON_429_PROVENANCE = {
+  source: "server_parse_provider_capacity_horizon",
+  errorFamily: "rate_limit_exhausted",
+  observedStatusCode: null,
+  observedStatusField: null,
+  observedCause: "provider_throttled_no_progress",
+} as const;
 
 function run(overrides: Record<string, unknown>) {
   return {
@@ -38,6 +54,7 @@ function run(overrides: Record<string, unknown>) {
     resultJson: null,
     usageJson: null,
     createdAt: RUN_CREATED_AT,
+    finishedAt: RUN_FINISHED_AT,
     ...overrides,
   } as Parameters<typeof summarizeRunFailureForIssueComment>[0];
 }
@@ -51,6 +68,7 @@ describe("summarizeRunFailureForIssueComment — provider capacity 429", () => {
         resultJson: {
           errorFamily: "rate_limit_exhausted",
           providerCapacityResetAt: RESET_ISO,
+          providerCapacityResetProvenance: SERVER_429_PROVENANCE,
         },
       }),
     );
@@ -62,6 +80,39 @@ describe("summarizeRunFailureForIssueComment — provider capacity 429", () => {
     expect(summary).not.toContain("BackoffLimitExceeded");
     // ...but the terminal code is still recoverable for anyone debugging.
     expect(summary).toContain("job_failed");
+  });
+
+  it("ignores same-family adapter-spoofed providerCapacityResetAt without server provenance", () => {
+    const summary = summarizeRunFailureForIssueComment(
+      run({
+        errorCode: "job_failed",
+        error: "External lifecycle Job failed: BackoffLimitExceeded",
+        resultJson: {
+          errorFamily: "rate_limit_exhausted",
+          providerCapacityResetAt: RESET_ISO,
+        },
+      }),
+    );
+    expect(summary).toContain("job_failed");
+    expect(summary).not.toContain(RESET_ISO);
+    expect(summary).not.toContain("429");
+    expect(summary).not.toContain("self-healing");
+  });
+
+  it("uses neutral rate-limit wording for a server horizon without observed 429 status", () => {
+    const summary = summarizeRunFailureForIssueComment(
+      run({
+        errorCode: "provider_throttled_no_progress",
+        resultJson: {
+          errorFamily: "rate_limit_exhausted",
+          providerCapacityResetAt: RESET_ISO,
+          providerCapacityResetProvenance: SERVER_NON_429_PROVENANCE,
+        },
+      }),
+    );
+    expect(summary).toContain(RESET_ISO);
+    expect(summary).toContain("rate-limit/quota window");
+    expect(summary).not.toContain("429");
   });
 
   it("derives the instant from retryNotBefore, but does not call it a 429", () => {
@@ -139,7 +190,11 @@ describe("summarizeRunFailureForIssueComment — provider capacity 429", () => {
       run({
         errorCode: "job_failed",
         error: "External lifecycle Job failed: BackoffLimitExceeded",
-        resultJson: { errorFamily: "rate_limit_exhausted", providerCapacityResetAt: injected },
+        resultJson: {
+          errorFamily: "rate_limit_exhausted",
+          providerCapacityResetAt: injected,
+          providerCapacityResetProvenance: SERVER_429_PROVENANCE,
+        },
       }),
     );
     expect(summary).not.toContain("SYSTEM");
@@ -158,6 +213,7 @@ describe("summarizeRunFailureForIssueComment — provider capacity 429", () => {
         resultJson: {
           errorFamily: "provider_quota",
           providerCapacityResetAt: "reset at sk-ant-api03-DEADBEEFDEADBEEFDEADBEEF",
+          providerCapacityResetProvenance: SERVER_429_PROVENANCE,
         },
       }),
     );
@@ -174,6 +230,7 @@ describe("summarizeRunFailureForIssueComment — provider capacity 429", () => {
         resultJson: {
           errorFamily: "rate_limit_exhausted",
           providerCapacityResetAt: `capacity may reset at ${RESET_ISO} on host db-prod-7.internal`,
+          providerCapacityResetProvenance: SERVER_429_PROVENANCE,
         },
       }),
     );
@@ -190,7 +247,11 @@ describe("summarizeRunFailureForIssueComment — provider capacity 429", () => {
         run({
           errorCode: "job_failed",
           error: "External lifecycle Job failed: BackoffLimitExceeded",
-          resultJson: { errorFamily: "rate_limit_exhausted", providerCapacityResetAt: bogus },
+          resultJson: {
+            errorFamily: "rate_limit_exhausted",
+            providerCapacityResetAt: bogus,
+            providerCapacityResetProvenance: SERVER_429_PROVENANCE,
+          },
         }),
       );
       expect(summary).not.toContain(bogus);
@@ -207,10 +268,30 @@ describe("summarizeRunFailureForIssueComment — provider capacity 429", () => {
         resultJson: {
           errorFamily: "rate_limit_exhausted",
           providerCapacityResetAt: "2026-07-26T23:29:59.782+02:00",
+          providerCapacityResetProvenance: SERVER_429_PROVENANCE,
         },
       }),
     );
     expect(summary).toContain(RESET_ISO);
+    expect(summary).toContain("429");
+  });
+
+  it("accepts a server-authored horizon within 24h of a multi-hour run's finish time", () => {
+    const finishedAt = new Date("2026-07-26T22:00:00.000Z");
+    const resetAt = new Date(finishedAt.getTime() + 23 * 60 * 60 * 1000).toISOString();
+    const summary = summarizeRunFailureForIssueComment(
+      run({
+        errorCode: "job_failed",
+        createdAt: new Date("2026-07-26T18:00:00.000Z"),
+        finishedAt,
+        resultJson: {
+          errorFamily: "rate_limit_exhausted",
+          providerCapacityResetAt: resetAt,
+          providerCapacityResetProvenance: SERVER_429_PROVENANCE,
+        },
+      }),
+    );
+    expect(summary).toContain(resetAt);
     expect(summary).toContain("429");
   });
 

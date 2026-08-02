@@ -325,7 +325,17 @@ type ResolvedDependencyWakeBackstopOptions = {
 
 type LatestIssueRun = Pick<
   typeof heartbeatRuns.$inferSelect,
-  "id" | "agentId" | "status" | "error" | "errorCode" | "contextSnapshot" | "livenessState" | "resultJson" | "usageJson" | "createdAt"
+  | "id"
+  | "agentId"
+  | "status"
+  | "error"
+  | "errorCode"
+  | "contextSnapshot"
+  | "livenessState"
+  | "resultJson"
+  | "usageJson"
+  | "createdAt"
+  | "finishedAt"
 > | null;
 type SuccessfulLatestIssueRun = NonNullable<LatestIssueRun> & { status: "succeeded" };
 
@@ -461,23 +471,14 @@ function summarizeAgentCapabilities(agent: typeof agents.$inferSelect | null | u
 // run's own resultJson so the strand comment can attribute the stall to the
 // provider window rather than to whatever terminal symptom got recorded last.
 //
-// `run.resultJson` is NOT a trusted server-authored record. Heartbeat
-// finalization builds it as `{ ...parseObject(adapterResult.resultJson), ... }`
-// — the adapter's own object is spread FIRST, and the server's canonical
-// `providerCapacityResetAt` is layered on top only when it actually parsed a
-// horizon (throttle override + no structured retryNotBefore + prose match). On
-// every other run an adapter-supplied `providerCapacityResetAt` key survives
-// verbatim. Since summarizeRunFailureForIssueComment interpolates the result
-// straight into an issue comment, reading it as free text reopened exactly the
-// hole PR #4600 closed by routing adapter blobs through `redactSensitiveText`:
-// arbitrary adapter text — secrets, internal hostnames, injected markdown —
-// reaching the issue thread uncapped and unredacted.
-//
-// So: gate on the throttle family FIRST, then accept only a bare, bounded
-// ISO-8601 instant, re-emitted canonically. Anything else returns null and the
-// run falls through to the generic redacted summary. A spoofed `errorFamily`
-// therefore buys an attacker a plausible timestamp and nothing else.
+// `run.resultJson` starts as adapter-owned data, and summarizeRunFailureForIssueComment
+// interpolates selected fields into an issue comment other agents read. The
+// `providerCapacityResetAt` path is therefore trusted only when heartbeat
+// finalization also wrote the paired server provenance key after stripping any
+// adapter-supplied copy. Without that discriminator, a spoofed adapter result
+// could relabel an ordinary failure as a self-healing capacity window.
 const PROVIDER_CAPACITY_THROTTLE_FAMILIES = new Set(["rate_limit_exhausted", "provider_quota"]);
+const PROVIDER_CAPACITY_RESET_PROVENANCE_SOURCE = "server_parse_provider_capacity_horizon";
 
 // Full-string match — no surrounding prose, markdown, or newlines survive it.
 // Mirrors the shape parseProviderCapacityResetHorizon captures on the write side.
@@ -485,23 +486,62 @@ const PROVIDER_CAPACITY_RESET_INSTANT_PATTERN =
   /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
 
 // The horizon was advertised during the run that recorded it, and the write side
-// caps an accepted horizon at 24h past emission. Bounding the read symmetrically
-// around the run's own creation instant rejects garbage (epoch-0, year-9999, a
-// timestamp lifted from unrelated tool output) without rejecting the real thing,
-// which is routinely already in the past by the time the strand comment is built.
+// caps an accepted horizon at 24h past finalization. Bound the read lower side
+// by run creation and the upper side by run finish (falling back to creation)
+// so long-running jobs can still report a horizon parsed near the end.
 const PROVIDER_CAPACITY_RESET_MAX_SKEW_MS = 24 * 60 * 60 * 1000;
 
-function canonicalizeCapacityResetInstant(value: unknown, runCreatedAt: Date | null): string | null {
+type ProviderCapacityResetBounds = {
+  lowerBoundAt: Date | null;
+  upperBoundAt: Date | null;
+};
+
+function readCapacityResetBounds(run: NonNullable<LatestIssueRun>): ProviderCapacityResetBounds {
+  const createdAt = run.createdAt instanceof Date ? run.createdAt : null;
+  const finishedAt = run.finishedAt instanceof Date ? run.finishedAt : null;
+  return { lowerBoundAt: createdAt, upperBoundAt: finishedAt ?? createdAt };
+}
+
+function canonicalizeCapacityResetInstant(value: unknown, bounds: ProviderCapacityResetBounds): string | null {
   const raw = readNonEmptyString(value)?.trim();
   if (!raw) return null;
   if (!PROVIDER_CAPACITY_RESET_INSTANT_PATTERN.test(raw)) return null;
   const parsed = Date.parse(raw);
   if (!Number.isFinite(parsed)) return null;
-  const anchor = runCreatedAt?.getTime();
-  if (anchor !== undefined && Number.isFinite(anchor)) {
-    if (Math.abs(parsed - anchor) > PROVIDER_CAPACITY_RESET_MAX_SKEW_MS) return null;
+
+  const lowerAnchor = bounds.lowerBoundAt?.getTime();
+  if (lowerAnchor !== undefined && Number.isFinite(lowerAnchor)) {
+    if (parsed < lowerAnchor - PROVIDER_CAPACITY_RESET_MAX_SKEW_MS) return null;
+  }
+  const upperAnchor = bounds.upperBoundAt?.getTime();
+  if (upperAnchor !== undefined && Number.isFinite(upperAnchor)) {
+    if (parsed > upperAnchor + PROVIDER_CAPACITY_RESET_MAX_SKEW_MS) return null;
   }
   return new Date(parsed).toISOString();
+}
+
+function normalizeHttpStatusCode(value: unknown): number | null {
+  const parsed =
+    typeof value === "number"
+      ? value
+      : typeof value === "string" && value.trim().length > 0
+        ? Number(value.trim())
+        : NaN;
+  if (!Number.isInteger(parsed) || parsed < 100 || parsed > 599) return null;
+  return parsed;
+}
+
+function readProviderCapacityResetProvenance(resultJson: Record<string, unknown>) {
+  const provenance = parseObject(resultJson.providerCapacityResetProvenance);
+  if (readNonEmptyString(provenance.source) !== PROVIDER_CAPACITY_RESET_PROVENANCE_SOURCE) {
+    return null;
+  }
+  const family = readNonEmptyString(provenance.errorFamily);
+  if (!family || !PROVIDER_CAPACITY_THROTTLE_FAMILIES.has(family)) return null;
+  return {
+    errorFamily: family,
+    observedStatusCode: normalizeHttpStatusCode(provenance.observedStatusCode),
+  };
 }
 
 type ProviderCapacityResetRead = {
@@ -525,14 +565,17 @@ function readProviderCapacityResetAt(
   const family = readNonEmptyString(resultJson.errorFamily);
   if (!family || !PROVIDER_CAPACITY_THROTTLE_FAMILIES.has(family)) return null;
 
-  const createdAt = run.createdAt instanceof Date ? run.createdAt : null;
+  const bounds = readCapacityResetBounds(run);
 
-  const explicit = canonicalizeCapacityResetInstant(resultJson.providerCapacityResetAt, createdAt);
-  if (explicit) return { resetAt: explicit, is429Capacity: true };
+  const provenance = readProviderCapacityResetProvenance(resultJson);
+  const explicit = provenance
+    ? canonicalizeCapacityResetInstant(resultJson.providerCapacityResetAt, bounds)
+    : null;
+  if (explicit) return { resetAt: explicit, is429Capacity: provenance?.observedStatusCode === 429 };
 
   const advertised =
-    canonicalizeCapacityResetInstant(resultJson.retryNotBefore, createdAt) ??
-    canonicalizeCapacityResetInstant(resultJson.transientRetryNotBefore, createdAt);
+    canonicalizeCapacityResetInstant(resultJson.retryNotBefore, bounds) ??
+    canonicalizeCapacityResetInstant(resultJson.transientRetryNotBefore, bounds);
   return advertised ? { resetAt: advertised, is429Capacity: false } : null;
 }
 
@@ -1301,6 +1344,7 @@ export function recoveryService(
     resultJson: heartbeatRuns.resultJson,
     usageJson: heartbeatRuns.usageJson,
     createdAt: heartbeatRuns.createdAt,
+    finishedAt: heartbeatRuns.finishedAt,
   } as const;
 
   async function getLatestIssueRun(companyId: string, issueId: string): Promise<LatestIssueRun> {
@@ -1457,6 +1501,7 @@ export function recoveryService(
         resultJson: heartbeatRuns.resultJson,
         usageJson: heartbeatRuns.usageJson,
         createdAt: heartbeatRuns.createdAt,
+        finishedAt: heartbeatRuns.finishedAt,
       })
       .from(heartbeatRuns)
       .where(
@@ -1678,6 +1723,7 @@ export function recoveryService(
         resultJson: heartbeatRuns.resultJson,
         usageJson: heartbeatRuns.usageJson,
         createdAt: heartbeatRuns.createdAt,
+        finishedAt: heartbeatRuns.finishedAt,
       })
       .from(heartbeatRuns)
       .where(
