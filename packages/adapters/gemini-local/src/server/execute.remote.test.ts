@@ -249,6 +249,7 @@ describe("gemini remote execution", () => {
       }),
     ].join("\n");
     const runnerExecute = vi.fn(async (input: { command: string; args?: string[]; env?: Record<string, string>; stdin?: string }) => {
+      const script = (input.args ?? []).join(" ");
       if (input.command === "gemini") {
         return {
           exitCode: 0,
@@ -259,6 +260,20 @@ describe("gemini remote execution", () => {
           pid: 321,
           startedAt: new Date().toISOString(),
         };
+      }
+      if (input.command === "sh" && script.includes("command -v") && script.includes("gemini")) {
+        return {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          stdout: "/usr/local/bin/gemini\n",
+          stderr: "",
+          pid: 320,
+          startedAt: new Date().toISOString(),
+        };
+      }
+      if (input.command !== "sh" || (!script.includes(".paperclip-runtime") && !script.includes("tar"))) {
+        throw new Error(`Unexpected sandbox fixture command: ${input.command} ${script}`);
       }
       const actual = await vi.importActual<typeof import("@paperclipai/adapter-utils/server-utils")>(
         "@paperclipai/adapter-utils/server-utils",
@@ -319,6 +334,7 @@ describe("gemini remote execution", () => {
     expect(settingsWrite).toContain("gemini-api-key");
     // The managed HOME lives under the per-run runtime root, never a real home.
     expect(settingsWrite).toContain(".paperclip-runtime");
+    expect(runnerScripts.some((script) => script.includes("npm install"))).toBe(false);
   });
 
   it("resumes saved Gemini sessions for remote SSH execution only when the identity matches", async () => {
