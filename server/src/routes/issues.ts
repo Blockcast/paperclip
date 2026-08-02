@@ -4506,6 +4506,30 @@ export function issueRoutes(
       creatorOrManagerChainDecision &&
       isCreatorOrManagerChainRecoveryPatch(issue, req.body as Record<string, unknown>)
     ) {
+      // BLO-20385: the patch shape *mandates* `blockedByIssueIds: []`, and that
+      // empty array is then applied — so admitting the bypass on an issue that
+      // still has live blockers does not merely unpark it, it silently deletes
+      // dependency edges the actor could not otherwise remove. The shape check
+      // above only inspects the request body; it never looked at the issue's
+      // actual blockers. Unparking a row whose blockers are all terminal is the
+      // intended use and stays allowed (clearing those stale edges is the
+      // point). Refuse when any blocker is unresolved, and say so explicitly
+      // rather than reusing the opaque boundary 403 — an unexplained deny on
+      // this path already cost a full diagnostic cycle once.
+      const readiness = await svc.getDependencyReadiness(issue.id);
+      if (readiness.unresolvedBlockerCount > 0) {
+        res.status(409).json({
+          error:
+            "Cannot unpark an issue that still has unresolved blockers: this patch shape clears blockedByIssueIds and would delete live dependency edges",
+          details: {
+            issueId: issue.id,
+            reason: "delegate_recovery_unresolved_blockers",
+            unresolvedBlockerCount: readiness.unresolvedBlockerCount,
+            unresolvedBlockerIssueIds: readiness.unresolvedBlockerIssueIds,
+          },
+        });
+        return false;
+      }
       return true;
     }
     if (creatorOrManagerChainDecision && !options.allowCreatorOrManagerChainOwnership) {

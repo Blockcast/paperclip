@@ -2878,6 +2878,76 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
+  // BLO-20385: the patch shape mandates `blockedByIssueIds: []` and that empty
+  // array is applied, so admitting it on an issue with live blockers deletes
+  // dependency edges the actor could not otherwise remove. Probed in production
+  // on BLO-18946: a 200 silently dropped a live edge to a still-blocked issue.
+  it.each(commentGrantMutationDenialCases)(
+    "refuses the delegate recovery patch when blockers are unresolved, for a %s comment grant holder",
+    async (_kind, agentRows, issueOverrides) => {
+      useProductionIssueAuthorization(agentRows);
+      mockIssueService.getById.mockResolvedValue(
+        makeIssue({ status: "blocked", assigneeAgentId: ownerAgentId, ...issueOverrides }),
+      );
+      const liveBlockerId = "11111111-1111-4111-8111-111111111111";
+      mockIssueService.getDependencyReadiness.mockResolvedValue({
+        issueId,
+        blockerIssueIds: [liveBlockerId],
+        unresolvedBlockerCount: 1,
+        unresolvedBlockerIssueIds: [liveBlockerId],
+        pendingFinalizeBlockerIssueIds: [],
+        allBlockersDone: false,
+        isDependencyReady: false,
+      });
+
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "todo", blockedByIssueIds: [] });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body.details).toMatchObject({
+        reason: "delegate_recovery_unresolved_blockers",
+        unresolvedBlockerCount: 1,
+        unresolvedBlockerIssueIds: [liveBlockerId],
+      });
+      // The edge must survive: no write may reach the service at all.
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(commentGrantMutationDenialCases)(
+    "still unparks past stale terminal blocker edges for a %s comment grant holder",
+    async (_kind, agentRows, issueOverrides) => {
+      useProductionIssueAuthorization(agentRows);
+      const stored = makeIssue({ status: "blocked", assigneeAgentId: ownerAgentId, ...issueOverrides });
+      mockIssueService.getById.mockResolvedValue(stored);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...stored,
+        ...patch,
+      }));
+      // Edges exist but every one is terminal: clearing these is the whole point
+      // of the recovery patch and must keep working.
+      mockIssueService.getDependencyReadiness.mockResolvedValue({
+        issueId,
+        blockerIssueIds: ["22222222-2222-4222-8222-222222222222"],
+        unresolvedBlockerCount: 0,
+        unresolvedBlockerIssueIds: [],
+        pendingFinalizeBlockerIssueIds: [],
+        allBlockersDone: true,
+        isDependencyReady: true,
+      });
+
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "todo", blockedByIssueIds: [] });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      const [, patch] = mockIssueService.update.mock.calls.at(-1) as [string, Record<string, unknown>];
+      expect(patch).toMatchObject({ status: "todo", expectedCurrentStatus: "blocked" });
+      expect(patch.blockedByIssueIds).toEqual([]);
+    },
+  );
+
   it("surfaces 409 when the issue stops being blocked before the delegate recovery write lands", async () => {
     useProductionIssueAuthorization([
       makeAgent(peerAgentId),
