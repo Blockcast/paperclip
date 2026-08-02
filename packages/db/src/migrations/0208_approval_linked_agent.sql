@@ -34,43 +34,32 @@ WHERE approval."id"::text = activity."entity_id"
 --> statement-breakpoint
 -- Hire approvals filed through the generic POST /api/approvals route log
 -- `approval.created` without `linkedAgentId` and carry no `sourceBuiltInAgentKey`,
--- so neither backfill above matches them. Bind those straight from
--- `payload.agentId` whenever it still resolves to a pending hire in the same
--- company: that preserves the pre-column behaviour (approve activates the agent,
--- reject terminates it) and makes the row withdrawable. A row whose agent is
--- already claimed by another approval is left unbound rather than encoding an
--- ambiguous many-to-one binding.
-UPDATE "approvals" AS approval
-SET "linked_agent_id" = agent."id"
-FROM "agents" AS agent
-WHERE approval."type" = 'hire_agent'
-  AND approval."linked_agent_id" IS NULL
-  AND approval."status" IN ('pending', 'revision_requested')
-  AND approval."company_id" = agent."company_id"
-  AND (approval."payload" ->> 'agentId') = agent."id"::text
-  AND agent."status" = 'pending_approval'
-  AND NOT EXISTS (
-    SELECT 1
-    FROM "approvals" AS other
-    WHERE other."id" <> approval."id"
-      AND (
-        other."linked_agent_id" = agent."id"
-        OR (
-          other."type" = 'hire_agent'
-          AND other."company_id" = approval."company_id"
-          AND other."status" IN ('pending', 'revision_requested')
-          AND (other."payload" ->> 'agentId') = agent."id"::text
-        )
-      )
-  );
---> statement-breakpoint
--- Whatever is still unbound but carries a `payload.agentId` points at an agent
--- that is gone, already activated or terminated, or claimed by another approval,
--- so there is no pending hire left to clean up. Drop the stale reference: it
--- leaves withdrawal on the clean no-cleanup path instead of failing 409 forever,
--- and approval falls through to creating the agent the row describes rather than
--- silently activating nothing. Only undecided rows are rewritten; decided rows
--- keep the reference as history.
+-- so neither backfill above matches them. They are deliberately LEFT UNBOUND.
+--
+-- `payload` is caller-controlled: `createApprovalSchema` accepts `hire_agent` with
+-- a free-form payload, so a historical row's `payload.agentId` is an unverified
+-- claim, not server-attested evidence of what this approval created. Promoting it
+-- into `linked_agent_id` would launder that claim into the one field the service
+-- treats as trusted -- and withdrawal, which is requester-scoped by design, uses
+-- exactly that field to decide which agent to terminate and revoke keys for. A
+-- requester who once filed a hire approval naming somebody else's pending agent
+-- would be handed destructive control over it by this migration. Only the two
+-- backfills above bind, because both corroborate against server-written
+-- `activity_log` evidence.
+--
+-- Unbound payload-only rows fall through to the neutralisation below, which is
+-- the non-destructive reconciliation: they lose the stale reference and become
+-- withdrawable with no cleanup. The cost is that approving such a row creates the
+-- agent it describes rather than activating a pre-existing pending one, leaving
+-- that agent orphaned in `pending_approval`. That is recoverable by hand; wrongly
+-- terminating a live agent is not, so this fails safe in the recoverable
+-- direction.
+--
+-- So: drop the stale reference from anything still unbound. Withdrawal then takes
+-- the clean no-cleanup path instead of failing 409 forever, and approval falls
+-- through to creating the agent the row describes rather than silently activating
+-- nothing. Only undecided rows are rewritten; decided rows keep the reference as
+-- history.
 UPDATE "approvals"
 SET "payload" = "payload" - 'agentId'
 WHERE "type" = 'hire_agent'

@@ -218,6 +218,40 @@ describe("approvalService.findOpenHireApprovalForAgent", () => {
   });
 });
 
+describe("approvalService.requestRevision", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockAgentService.terminate.mockResolvedValue(undefined);
+  });
+
+  it("moves a pending approval to revision_requested", async () => {
+    const revisionRequested = { ...createApproval("revision_requested") };
+    const dbStub = createDbStub([[createApproval("pending")]], [revisionRequested]);
+
+    const svc = approvalService(dbStub.db as any);
+    const result = await svc.requestRevision("approval-1", "board-user", "needs a tighter scope");
+
+    expect(result.status).toBe("revision_requested");
+  });
+
+  it("does not resurrect an approval that was withdrawn mid-flight", async () => {
+    // The interleaving that matters: the pending check above passes, a
+    // withdrawal commits (terminating the linked hire agent), and only then does
+    // this UPDATE run. Without the status guard it would overwrite `withdrawn`
+    // back to `revision_requested`, leaving an approval that reads as open but
+    // whose agent has already been terminated and its API keys revoked.
+    const dbStub = createDbStub(
+      [[createApproval("pending")], [createApproval("withdrawn")]],
+      [],
+    );
+
+    const svc = approvalService(dbStub.db as any);
+    await expect(
+      svc.requestRevision("approval-1", "board-user", "needs a tighter scope"),
+    ).rejects.toMatchObject({ status: 422 });
+  });
+});
+
 describe("approvalService.withdraw", () => {
   beforeEach(() => {
     vi.clearAllMocks();

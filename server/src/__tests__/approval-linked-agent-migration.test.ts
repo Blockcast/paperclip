@@ -27,7 +27,7 @@ describeEmbeddedPostgres("approval linked-agent migration", () => {
     await tempDb?.cleanup();
   });
 
-  it("backfills every legacy hire row class and neutralises the ones it cannot bind", async () => {
+  it("binds only server-attested legacy hire rows and neutralises the rest", async () => {
     const connectionString = tempDb!.connectionString;
     const legacyDb = createDb(connectionString);
     const companyId = randomUUID();
@@ -52,14 +52,28 @@ describeEmbeddedPostgres("approval linked-agent migration", () => {
       agentStatus: "pending_approval",
       bind: true,
     };
-    // Backfill #3: the generic POST /api/approvals route records neither, so the
-    // payload reference is the only thing left to bind from.
+    // The generic POST /api/approvals route records neither a built-in key nor an
+    // activity binding, so `payload.agentId` is the only reference -- and it is
+    // caller-supplied, so the migration deliberately refuses to bind from it.
+    // The row is neutralised instead: withdrawable, but with no cleanup.
     const genericPending = {
       kind: "genericPending" as const,
       agentId: randomUUID(),
       approvalId: randomUUID(),
       agentStatus: "pending_approval",
-      bind: true,
+      bind: false,
+    };
+    // The attack the refusal above exists to stop: a requester crafts a hire
+    // approval whose payload names somebody else's pending agent. If the
+    // migration promoted that claim into `linked_agent_id`, the requester could
+    // withdraw its own approval and terminate an agent it never created.
+    const craftedVictimAgentId = randomUUID();
+    const craftedTarget = {
+      kind: "craftedTarget" as const,
+      agentId: craftedVictimAgentId,
+      approvalId: randomUUID(),
+      agentStatus: "pending_approval",
+      bind: false,
     };
     // Unbindable: the referenced agent is no longer a pending hire, so there is
     // nothing to clean up and the stale reference has to be dropped instead.
@@ -153,7 +167,7 @@ describeEmbeddedPostgres("approval linked-agent migration", () => {
       { status: "pending", approvalId: activityLinked.approvalId, linkedAgentId: activityLinked.agentId },
     );
 
-    for (const testCase of [genericPending, genericStale, ...ambiguous]) {
+    for (const testCase of [genericPending, genericStale, craftedTarget, ...ambiguous]) {
       await seedAgent(testCase.agentId, testCase.agentStatus, null);
       await seedApproval(
         testCase.approvalId,
@@ -167,7 +181,7 @@ describeEmbeddedPostgres("approval linked-agent migration", () => {
     const migrated = await db.select().from(approvals).where(eq(approvals.companyId, companyId));
     const byId = new Map(migrated.map((approval) => [approval.id, approval]));
 
-    const allCases = [...builtIn, activityLinked, genericPending, genericStale, ...ambiguous];
+    const allCases = [...builtIn, activityLinked, genericPending, genericStale, craftedTarget, ...ambiguous];
     expect(
       allCases.map((testCase) => {
         const row = byId.get(testCase.approvalId);
@@ -195,13 +209,15 @@ describeEmbeddedPostgres("approval linked-agent migration", () => {
     await svc.approve(builtIn[0]!.approvalId, "board-user", "approved");
     await svc.reject(builtIn[1]!.approvalId, "board-user", "rejected");
     await svc.withdraw(builtIn[2]!.approvalId, "withdrawn", withdrawActor);
-    // The classes the prior test never exercised: each must reach the same
+    // The classes the prior test never exercised: bound rows must reach the same
     // terminate-on-withdraw behaviour as the built-in rows.
     await svc.withdraw(activityLinked.approvalId, "withdrawn", withdrawActor);
-    await svc.withdraw(genericPending.approvalId, "withdrawn", withdrawActor);
     // Unbound rows must withdraw cleanly rather than throwing 409, and must not
-    // terminate the agent they used to point at.
+    // terminate the agent they used to point at. `craftedTarget` is the security
+    // case: its victim must survive the requester withdrawing its own approval.
+    await svc.withdraw(genericPending.approvalId, "withdrawn", withdrawActor);
     await svc.withdraw(genericStale.approvalId, "withdrawn", withdrawActor);
+    await svc.withdraw(craftedTarget.approvalId, "withdrawn", withdrawActor);
     await svc.withdraw(ambiguous[0]!.approvalId, "withdrawn", withdrawActor);
 
     const resultingAgents = await db.select().from(agents).where(eq(agents.companyId, companyId));
@@ -211,8 +227,11 @@ describeEmbeddedPostgres("approval linked-agent migration", () => {
         expect.objectContaining({ id: builtIn[1]!.agentId, status: "terminated" }),
         expect.objectContaining({ id: builtIn[2]!.agentId, status: "terminated" }),
         expect.objectContaining({ id: activityLinked.agentId, status: "terminated" }),
-        expect.objectContaining({ id: genericPending.agentId, status: "terminated" }),
+        // Never bound, so withdrawal had nothing to clean up: still pending.
+        expect.objectContaining({ id: genericPending.agentId, status: "pending_approval" }),
         expect.objectContaining({ id: genericStale.agentId, status: "idle" }),
+        // The whole point: a crafted payload cannot terminate its target.
+        expect.objectContaining({ id: craftedVictimAgentId, status: "pending_approval" }),
         expect.objectContaining({ id: ambiguousAgentId, status: "pending_approval" }),
       ]),
     );

@@ -24,6 +24,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { agentService } from "../services/agents.js";
+import { approvalService } from "../services/approvals.js";
 import { companyService } from "../services/companies.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -185,6 +186,43 @@ describeEmbeddedPostgres("cleanup removal services", () => {
       .from(approvals)
       .where(eq(approvals.id, approvalId));
     expect(approval).toEqual({ linkedAgentId: null, requestedByAgentId: null });
+  });
+
+  it("leaves an open hire approval withdrawable after its pending agent is deleted", async () => {
+    // Nulling `linked_agent_id` alone strands the caller-supplied
+    // `payload.agentId`, and the strict binding check then refuses the
+    // withdrawal with a 409 that no retry can satisfy -- the approval would be
+    // stuck open forever with no agent left to decide it against.
+    const { agentId, companyId } = await seedFixture();
+    const approvalId = randomUUID();
+
+    await db.insert(approvals).values({
+      id: approvalId,
+      companyId,
+      type: "hire_agent",
+      linkedAgentId: agentId,
+      requestedByAgentId: null,
+      requestedByUserId: null,
+      status: "pending",
+      payload: { agentId, name: "CodexCoder" },
+    });
+
+    await agentService(db).remove(agentId);
+
+    const [neutralised] = await db
+      .select({ linkedAgentId: approvals.linkedAgentId, payload: approvals.payload })
+      .from(approvals)
+      .where(eq(approvals.id, approvalId));
+    expect(neutralised.linkedAgentId).toBeNull();
+    expect(neutralised.payload).not.toHaveProperty("agentId");
+    // The rest of the payload is preserved -- only the dangling id is dropped.
+    expect(neutralised.payload).toMatchObject({ name: "CodexCoder" });
+
+    const withdrawn = await approvalService(db).withdraw(approvalId, "hire agent was deleted", {
+      userId: "user-1",
+      activity: { actorType: "user", actorId: "user-1", agentId: null },
+    });
+    expect(withdrawn.status).toBe("withdrawn");
   });
 
   it("removes issue read states and activity rows before deleting the company", async () => {

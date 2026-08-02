@@ -23,6 +23,12 @@ const ACTIVITY_ACTION_TO_PLUGIN_EVENT: Readonly<Record<string, PluginEventType>>
   approval_approved: "approval.decided",
   approval_rejected: "approval.decided",
   approval_revision_requested: "approval.decided",
+  // A withdrawal is a terminal transition out of `pending` exactly like the three
+  // above, so plugin mirrors must see it or they keep showing the approval as
+  // open forever. There is no dedicated `approval.withdrawn` plugin event; adding
+  // one would break existing subscribers that already treat `approval.decided` as
+  // "this approval left the queue", so it maps onto that.
+  approval_withdrawn: "approval.decided",
   budget_soft_threshold_crossed: "budget.incident.opened",
   budget_hard_threshold_crossed: "budget.incident.opened",
   budget_incident_resolved: "budget.incident.resolved",

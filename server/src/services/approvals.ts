@@ -268,7 +268,12 @@ export function approvalService(db: Db) {
       }
 
       const now = new Date();
-      return db
+      // Status-guarded for the same reason withdrawal is: the check above is a
+      // separate statement, so a withdrawal committing in between would otherwise
+      // be overwritten back to `revision_requested` -- and withdrawal has by then
+      // already terminated the linked hire agent, leaving an "open" approval whose
+      // agent is gone. Losing the race must be a no-op, not a silent resurrection.
+      const updated = await db
         .update(approvals)
         .set({
           status: "revision_requested",
@@ -277,9 +282,19 @@ export function approvalService(db: Db) {
           decidedAt: now,
           updatedAt: now,
         })
-        .where(eq(approvals.id, id))
+        .where(and(eq(approvals.id, id), eq(approvals.status, "pending")))
         .returning()
-        .then((rows) => rows[0]);
+        .then((rows) => rows[0] ?? null);
+
+      if (!updated) {
+        const latest = await getExistingApproval(id);
+        throw unprocessable("Only pending approvals can request revision", {
+          approvalId: id,
+          status: latest.status,
+        });
+      }
+
+      return updated;
     },
 
     resubmit: async (id: string, payload?: Record<string, unknown>) => {
