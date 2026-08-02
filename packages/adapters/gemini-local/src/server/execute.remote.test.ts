@@ -1,6 +1,7 @@
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { buildSandboxNpmInstallCommand } from "@paperclipai/adapter-utils";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const {
@@ -237,6 +238,11 @@ describe("gemini remote execution", () => {
     const remoteWorkspaceDir = path.join(rootDir, "remote-workspace");
     await mkdir(workspaceDir, { recursive: true });
     await mkdir(remoteWorkspaceDir, { recursive: true });
+    const managedRuntimeDir = path.join(remoteWorkspaceDir, ".paperclip-runtime", "gemini");
+    const actualServerUtils = await vi.importActual<typeof import("@paperclipai/adapter-utils/server-utils")>(
+      "@paperclipai/adapter-utils/server-utils",
+    );
+    const runFixtureProcess = vi.fn(actualServerUtils.runChildProcess);
 
     const geminiOutput = [
       JSON.stringify({ type: "system", subtype: "init", session_id: "gemini-session-2", model: "gemini-2.5-pro" }),
@@ -249,7 +255,7 @@ describe("gemini remote execution", () => {
       }),
     ].join("\n");
     const runnerExecute = vi.fn(async (input: { command: string; args?: string[]; env?: Record<string, string>; stdin?: string }) => {
-      const script = (input.args ?? []).join(" ");
+      const script = input.args?.[1] ?? "";
       if (input.command === "gemini") {
         return {
           exitCode: 0,
@@ -261,7 +267,10 @@ describe("gemini remote execution", () => {
           startedAt: new Date().toISOString(),
         };
       }
-      if (input.command === "sh" && script.includes("command -v") && script.includes("gemini")) {
+      if (
+        input.command === "sh" &&
+        (script === "command -v 'gemini'" || script === "command -v 'gemini' >/dev/null 2>&1")
+      ) {
         return {
           exitCode: 0,
           signal: null,
@@ -272,13 +281,22 @@ describe("gemini remote execution", () => {
           startedAt: new Date().toISOString(),
         };
       }
-      if (input.command !== "sh" || (!script.includes(".paperclip-runtime") && !script.includes("tar"))) {
+      const isManagedSettingsWrite =
+        script.includes(path.join(managedRuntimeDir, ".gemini", "settings.json")) &&
+        script.includes("printf '%s'");
+      const isWorkspaceTransfer =
+        script.includes(managedRuntimeDir) &&
+        (
+          script === `mkdir -p '${managedRuntimeDir}'` ||
+          script.includes("workspace-upload.tar") ||
+          script.includes("workspace-download.tar") ||
+          script.includes("skills-upload.tar") ||
+          script.includes(path.join(managedRuntimeDir, "skills"))
+        );
+      if (input.command !== "sh" || (!isManagedSettingsWrite && !isWorkspaceTransfer)) {
         throw new Error(`Unexpected sandbox fixture command: ${input.command} ${script}`);
       }
-      const actual = await vi.importActual<typeof import("@paperclipai/adapter-utils/server-utils")>(
-        "@paperclipai/adapter-utils/server-utils",
-      );
-      return actual.runChildProcess("gemini-sandbox-fixture", input.command, input.args ?? [], {
+      return runFixtureProcess("gemini-sandbox-fixture", input.command, input.args ?? [], {
         cwd: remoteWorkspaceDir,
         env: input.env ?? {},
         stdin: input.stdin,
@@ -287,6 +305,13 @@ describe("gemini remote execution", () => {
         onLog: async () => {},
       });
     });
+
+    const installCommand = buildSandboxNpmInstallCommand("@google/gemini-cli");
+    await expect(runnerExecute({ command: "sh", args: ["-c", installCommand] })).rejects.toThrow(
+      "Unexpected sandbox fixture command",
+    );
+    expect(runFixtureProcess).not.toHaveBeenCalled();
+    runnerExecute.mockClear();
 
     await execute({
       runId: "run-sandbox-1",
