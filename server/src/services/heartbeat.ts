@@ -18079,9 +18079,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
   }
 
-  // BLO-20801: resolve which k8s Job run-id labels are terminal for this agent
-  // only. A stale or corrupt Job label carrying another agent's terminal run id
-  // must remain unknown and blocking for the current agent.
+  // BLO-20801: resolves which of a set of k8s Job run-id labels are already
+  // terminal in the DB, so a surviving Job from a crashed worker cannot block
+  // dispatch for an agent that has already been recovered at the DB level.
+  // Bound to the agent (and company, where known) whose Jobs are being
+  // evaluated -- a candidate run-id is only ever trusted as "terminal" when
+  // it actually belongs to that agent. A stale/corrupt/misconfigured Job
+  // carrying this agent's agent-id label but a run-id that resolves to some
+  // OTHER agent's terminal run must not waive this agent's dispatch fence;
+  // such a run-id is simply absent from the result and falls through to the
+  // conservative (non-terminal, still-blocking) path.
   async function findTerminalHeartbeatRunIds(
     agentId: string,
     runIds: readonly string[],

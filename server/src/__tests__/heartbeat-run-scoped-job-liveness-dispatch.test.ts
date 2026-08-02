@@ -247,4 +247,71 @@ describeEmbeddedPostgres("startNextQueuedRunForAgent run-id-aware job liveness (
     expect(row?.status).toBe("queued");
     expect(mockAdapterExecute).not.toHaveBeenCalled();
   });
+
+  it("still blocks dispatch when a Job's run-id label belongs to a DIFFERENT agent's terminal run (identity fence)", async () => {
+    // PR #946 review: findTerminalHeartbeatRunIds must not treat a run-id as
+    // terminal-and-safe-to-waive just because the UUID matches some row in
+    // the table -- it must also belong to the agent whose Jobs are being
+    // evaluated. A stale/corrupt/misconfigured Job carrying agent A's
+    // agent-id label but agent B's (terminal) run-id must stay blocking for
+    // agent A.
+    const { queuedRunId } = await seedExternalLifecycleAgentWithTerminalRuns();
+
+    // A second, unrelated agent+company with its own terminal run.
+    const otherCompanyId = randomUUID();
+    const otherAgentId = randomUUID();
+    const otherAgentTerminalRunId = randomUUID();
+    await db.insert(companies).values({
+      id: otherCompanyId,
+      name: "OtherCo",
+      issuePrefix: `O${otherCompanyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: otherAgentId,
+      companyId: otherCompanyId,
+      name: "OtherAgent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: otherAgentTerminalRunId,
+      companyId: otherCompanyId,
+      agentId: otherAgentId,
+      invocationSource: "heartbeat",
+      triggerDetail: "timer",
+      status: "failed",
+      errorCode: "process_lost",
+      contextSnapshot: {},
+      startedAt: new Date(Date.now() - 60 * 60 * 1000),
+      finishedAt: new Date(Date.now() - 50 * 60 * 1000),
+    });
+
+    // Simulates a mislabeled/stale Job on the first agent carrying the
+    // OTHER agent's terminal run-id.
+    mockHasActiveJobForAgent.mockImplementation(async (_agentId: string, options?: {
+      isRunTerminal?: (runIds: readonly string[]) => Promise<ReadonlySet<string>>;
+    }) => {
+      const terminal = options?.isRunTerminal
+        ? await options.isRunTerminal([otherAgentTerminalRunId])
+        : new Set<string>();
+      return !terminal.has(otherAgentTerminalRunId);
+    });
+
+    await heartbeat.resumeQueuedRuns();
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    const [row] = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, queuedRunId));
+
+    expect(row?.status).toBe("queued");
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+  });
 });
