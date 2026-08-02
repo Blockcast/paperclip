@@ -14,13 +14,13 @@
 # existing.
 #
 # A second, volume-free delivery path exists for credentials bound per-agent
-# rather than mounted fleet-wide: see PAPERCLIP_GITHUB_TOKEN_VALUE below.
+# rather than mounted fleet-wide: see GH_SEAT_TOKEN_VALUE below.
 set -eu
 
 TOKEN_FILE="${PAPERCLIP_GITHUB_TOKEN_FILE:-/paperclip/.secrets/github-token/token}"
 REAL_GH="${GH_TOKEN_WRAPPER_REAL_GH:-/usr/bin/gh.real}"
 
-# PAPERCLIP_GITHUB_TOKEN_VALUE carries a token *value* rather than a path, for
+# GH_SEAT_TOKEN_VALUE carries a token *value* rather than a path, for
 # credentials delivered by the scoped secret-binding path (per-agent /
 # per-project env bindings) instead of by a mounted secret volume. It exists so
 # a credential can be given to specific agents without mounting it into every
@@ -28,19 +28,42 @@ REAL_GH="${GH_TOKEN_WRAPPER_REAL_GH:-/usr/bin/gh.real}"
 # every Job pod with no agent or tenant filter (BLO-18927, BLO-18970), so a
 # volume-delivered secret is necessarily fleet-wide.
 #
+# The name deliberately does NOT start with `PAPERCLIP_`. Do not "fix" it for
+# consistency with the FILE variable below — the prefix is load-bearing in the
+# opposite direction. `isPaperclipRuntimeEnvKey` (server/src/services/
+# heartbeat.ts) strips every `PAPERCLIP_*` key out of adapter, environment,
+# project and routine env, and agent-scope binding resolution reads that
+# already-stripped config. A `PAPERCLIP_`-prefixed name is therefore
+# unreachable from the very binding path this branch exists to serve: it would
+# be silently deleted server-side and fall through to the file branch with no
+# error anywhere. That guard is correct and must stay — it stops user config
+# overriding paperclip's own runtime env — so the credential moves out of its
+# namespace instead. See BLO-18927 step 2.
+#
+# The FILE variable keeps its `PAPERCLIP_` prefix on purpose, for the same
+# reason inverted: it selects a path on disk, and being strippable is what
+# stops project/environment config from redirecting the file branch.
+#
 # Precedence: value > file. Both are *explicit caller selections* of an identity
 # for one invocation — the same trust model the FILE variable already had, since
-# a caller could always point that at a file it wrote. This is deliberately NOT
-# GH_TOKEN: the override below must keep clobbering GH_TOKEN unconditionally
-# (BLO-13241), so GH_TOKEN cannot double as an input without reopening that bug.
-if [ "${PAPERCLIP_GITHUB_TOKEN_VALUE+x}" = x ]; then
+# a caller could always point that at a file it wrote. Note the widened reach
+# that follows from the rename: a non-`PAPERCLIP_` key can now be set from
+# project/environment/routine env, not just agent scope. That is a downgrade
+# vector, not an escalation one — it can only swap in a credential the setter
+# already holds, never read the mounted one — but it does mean `gh` identity
+# selection is only as tight as write access to those env scopes.
+#
+# This is deliberately NOT GH_TOKEN: the override below must keep clobbering
+# GH_TOKEN unconditionally (BLO-13241), so GH_TOKEN cannot double as an input
+# without reopening that bug.
+if [ "${GH_SEAT_TOKEN_VALUE+x}" = x ]; then
   # Trim surrounding whitespace only — a secret that arrives via a templated
   # env binding routinely picks up a trailing newline, and tabs/spaces are just
   # as likely as CR/LF from a YAML block scalar. Deliberately a trim rather than
   # a delete: `tr -d` would silently splice "ghu_aaa\nbbb" into the single
   # plausible-looking token "ghu_aaabbb" and authenticate as nobody-in-
   # particular, which is the failure mode this whole branch exists to avoid.
-  TOKEN="${PAPERCLIP_GITHUB_TOKEN_VALUE}"
+  TOKEN="${GH_SEAT_TOKEN_VALUE}"
   while :; do
     case "${TOKEN}" in
       [[:space:]]*) TOKEN="${TOKEN#?}" ;;
@@ -54,7 +77,7 @@ if [ "${PAPERCLIP_GITHUB_TOKEN_VALUE+x}" = x ]; then
   # continuing would run `gh` under whatever ambient GH_TOKEN/GITHUB_TOKEN the
   # caller happened to inherit — an unintended identity, silently.
   if [ -z "${TOKEN}" ]; then
-    echo "gh-token-wrapper: PAPERCLIP_GITHUB_TOKEN_VALUE is set but holds only whitespace; refusing to run with ambient auth" >&2
+    echo "gh-token-wrapper: GH_SEAT_TOKEN_VALUE is set but holds only whitespace; refusing to run with ambient auth" >&2
     exit 64
   fi
   case "${TOKEN}" in
@@ -62,7 +85,7 @@ if [ "${PAPERCLIP_GITHUB_TOKEN_VALUE+x}" = x ]; then
       # No GitHub token format contains whitespace, so this is either a
       # concatenation of two values or a corrupted binding. Refuse rather than
       # guess which half was meant. The value itself is never echoed.
-      echo "gh-token-wrapper: PAPERCLIP_GITHUB_TOKEN_VALUE contains embedded whitespace; refusing to guess at the intended token" >&2
+      echo "gh-token-wrapper: GH_SEAT_TOKEN_VALUE contains embedded whitespace; refusing to guess at the intended token" >&2
       exit 64
       ;;
   esac
