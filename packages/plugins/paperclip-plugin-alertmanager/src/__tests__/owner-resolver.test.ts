@@ -368,16 +368,13 @@ describe("resolveOwnerUserId — caching behaviour", () => {
 });
 
 describe("resolveFallbackAgentId — exhaustive lookup", () => {
-  it("finds a sole exact-name match beyond the first page", async () => {
-    const firstPage = Array.from({ length: 200 }, (_, index) => ({
+  it("finds a sole exact-name match in one unwindowed snapshot", async () => {
+    const allAgents = Array.from({ length: 200 }, (_, index) => ({
       id: `other-${index}`,
       name: `Other ${index}`,
-    }));
+    })).concat([{ id: "fallback", name: "Alert Fallback" }]);
     const agents = {
-      list: vi
-        .fn()
-        .mockResolvedValueOnce(firstPage)
-        .mockResolvedValueOnce([{ id: "fallback", name: "Alert Fallback" }]),
+      list: vi.fn().mockResolvedValueOnce(allAgents),
     };
     const logger = { warn: vi.fn() };
 
@@ -388,26 +385,20 @@ describe("resolveFallbackAgentId — exhaustive lookup", () => {
         "Alert Fallback",
       ),
     ).resolves.toBe("fallback");
-    expect(agents.list).toHaveBeenNthCalledWith(2, {
-      companyId: "company-1",
-      limit: 200,
-      offset: 200,
-    });
+    expect(agents.list).toHaveBeenCalledWith({ companyId: "company-1" });
   });
 
-  it("fails closed when a duplicate exact-name match exists on a later page", async () => {
-    const firstPage = [
+  it("fails closed when the snapshot contains duplicate exact-name matches", async () => {
+    const allAgents = [
       { id: "first", name: "Alert Fallback" },
       ...Array.from({ length: 199 }, (_, index) => ({
         id: `other-${index}`,
         name: `Other ${index}`,
       })),
+      { id: "second", name: "alert fallback" },
     ];
     const agents = {
-      list: vi
-        .fn()
-        .mockResolvedValueOnce(firstPage)
-        .mockResolvedValueOnce([{ id: "second", name: "alert fallback" }]),
+      list: vi.fn().mockResolvedValueOnce(allAgents),
     };
     const logger = { warn: vi.fn() };
 

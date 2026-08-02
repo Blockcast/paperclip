@@ -8,10 +8,12 @@ CREATE TABLE plugin_alertmanager_184163d1ba.alert_aggregates (
   assignee_agent_id text,
   resolution_claim text,
   resolution_claimed_at timestamptz,
+  resolution_requested_at timestamptz,
   generation bigint NOT NULL DEFAULT 0,
   resolution_generation bigint,
   active_fingerprints text[] NOT NULL DEFAULT '{}',
   final_resolved_at timestamptz,
+  reopen_required boolean NOT NULL DEFAULT false,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (company_id, aggregate_key)

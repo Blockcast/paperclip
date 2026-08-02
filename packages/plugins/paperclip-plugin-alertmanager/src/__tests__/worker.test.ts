@@ -28,6 +28,7 @@ import type {
 } from "../types.js";
 import type { PluginContext, PluginWebhookInput } from "@paperclipai/plugin-sdk";
 import { joinAggregate } from "../aggregate-store.js";
+import { reconcileAggregateLifecycle } from "../aggregate-reconciliation.js";
 
 // ---------------------------------------------------------------------------
 // Test fixtures
@@ -115,6 +116,7 @@ interface MockClients {
     create: ReturnType<typeof vi.fn>;
     update: ReturnType<typeof vi.fn>;
     createComment: ReturnType<typeof vi.fn>;
+    listComments: ReturnType<typeof vi.fn>;
   };
   agents: { list: ReturnType<typeof vi.fn> };
   events: { emit: ReturnType<typeof vi.fn> };
@@ -140,6 +142,11 @@ const mkCtx = (): { ctx: PluginContext; mocks: MockClients } => {
           const [key, companyId, alertname, severity, fingerprint] = params as string[];
           const aggregateId = `${companyId}:${key}`;
           const current = aggregates.get(aggregateId);
+          const reopenRequired = Boolean(
+            current?.reopen_required ||
+              current?.resolution_claim ||
+              current?.final_resolved_at,
+          );
           aggregates.set(aggregateId, {
             aggregate_key: key,
             company_id: companyId,
@@ -149,7 +156,11 @@ const mkCtx = (): { ctx: PluginContext; mocks: MockClients } => {
             assignee_user_id: current?.assignee_user_id ?? null,
             assignee_agent_id: current?.assignee_agent_id ?? null,
             final_resolved_at: null,
-            resolution_claim: null,
+            resolution_claim: current?.resolution_claim ?? null,
+            resolution_claimed_at: current?.resolution_claimed_at ?? null,
+            resolution_generation: current?.resolution_generation ?? null,
+            resolution_requested_at: current?.resolution_requested_at ?? null,
+            reopen_required: reopenRequired,
             generation: Number(current?.generation ?? 0) + (current ? 1 : 0),
             active_fingerprints: current
               ? Array.from(
@@ -201,6 +212,9 @@ const mkCtx = (): { ctx: PluginContext; mocks: MockClients } => {
             !aggregate.final_resolved_at
           ) {
             aggregate.resolution_claim = claim;
+            aggregate.resolution_claimed_at = new Date().toISOString();
+            aggregate.resolution_generation = aggregate.generation;
+            aggregate.resolution_requested_at = params[4];
           }
           return { rowCount: 1 };
         }
@@ -218,13 +232,70 @@ const mkCtx = (): { ctx: PluginContext; mocks: MockClients } => {
           }
           aggregate.final_resolved_at = resolvedAt;
           aggregate.resolution_claim = null;
+          aggregate.reopen_required = false;
+          return { rowCount: 1 };
+        }
+        if (sql.includes("SET resolution_claim = NULL") && sql.includes("resolution_claim = $3")) {
+          const [companyId, key, claim] = params as string[];
+          const aggregate = aggregates.get(`${companyId}:${key}`);
+          if (!aggregate || aggregate.resolution_claim !== claim) return { rowCount: 0 };
+          aggregate.resolution_claim = null;
+          aggregate.resolution_claimed_at = null;
+          aggregate.resolution_generation = null;
+          return { rowCount: 1 };
+        }
+        if (sql.includes("SET reopen_required = false")) {
+          const [companyId, key, claim] = params as string[];
+          const aggregate = aggregates.get(`${companyId}:${key}`);
+          if (!aggregate || !((aggregate.active_fingerprints as string[])?.length > 0)) {
+            return { rowCount: 0 };
+          }
+          if (
+            (claim && aggregate.resolution_claim !== claim) ||
+            (!claim && aggregate.resolution_claim)
+          ) {
+            return { rowCount: 0 };
+          }
+          aggregate.reopen_required = false;
+          aggregate.resolution_claim = null;
           return { rowCount: 1 };
         }
         return { rowCount: 0 };
       }),
       query: vi.fn(async (sql: string, params: unknown[] = []) => {
         const [companyId, key, fingerprint] = params as string[];
+        if (sql.includes("WITH candidates AS")) {
+          const claim = params[2] as string;
+          const rows = [...aggregates.values()].filter(
+            (aggregate) =>
+              aggregate.company_id === companyId &&
+              aggregate.paperclip_issue_id &&
+              !aggregate.final_resolved_at &&
+              ((aggregate.active_fingerprints as string[]) ?? []).length === 0 &&
+              !aggregate.resolution_claim,
+          );
+          return rows.map((aggregate) => {
+            aggregate.resolution_claim = claim;
+            aggregate.resolution_claimed_at = new Date().toISOString();
+            aggregate.resolution_generation = aggregate.generation;
+            aggregate.reopen_required = false;
+            return {
+              ...aggregate,
+              resolved_at:
+                aggregate.resolution_requested_at ?? new Date().toISOString(),
+            };
+          });
+        }
         if (sql.includes("FROM") && sql.includes("alert_aggregates")) {
+          if (sql.includes("AND reopen_required")) {
+            return [...aggregates.values()].filter(
+              (aggregate) =>
+                aggregate.company_id === companyId &&
+                aggregate.reopen_required &&
+                ((aggregate.active_fingerprints as string[]) ?? []).length > 0 &&
+                !aggregate.resolution_claim,
+            );
+          }
           const aggregate = aggregates.get(`${companyId}:${key}`);
           if (sql.includes("cardinality(active_fingerprints)")) {
             return aggregate
@@ -269,6 +340,7 @@ const mkCtx = (): { ctx: PluginContext; mocks: MockClients } => {
       create: vi.fn(async () => ({ id: "issue-1" })),
       update: vi.fn(async () => ({ id: "issue-1" })),
       createComment: vi.fn(async () => ({ id: "comment-1" })),
+      listComments: vi.fn(async () => []),
     },
     agents: {
       list: vi.fn(async () => [
@@ -1387,6 +1459,54 @@ describe("handleWebhook — aggregate lifecycle", () => {
     expect(aggregateState).toEqual(expect.objectContaining({ resolvedAt: null }));
   });
 
+  it("repairs a re-fire after the resolving worker dies following issue closure", async () => {
+    const { ctx, mocks } = mkCtx();
+    const alert = aggregateAlerts()[0];
+    await handleWebhook(
+      ctx,
+      baseConfig({ autoCloseOnResolve: true }),
+      TOKEN,
+      baseInput({ parsedBody: baseEnvelope({ alerts: [alert] }) }),
+    );
+    let issueStatus = "todo";
+    mocks.issues.get.mockImplementation(async () => ({
+      id: "issue-1",
+      status: issueStatus,
+    }));
+    mocks.issues.update.mockImplementationOnce(async () => {
+      issueStatus = "cancelled";
+      await joinAggregate(ctx, "company-1", alert);
+      throw new Error("worker died after external close");
+    });
+    const resolved = {
+      ...alert,
+      status: "resolved" as const,
+      endsAt: "2026-04-29T10:00:00Z",
+    };
+
+    await handleWebhook(
+      ctx,
+      baseConfig({ autoCloseOnResolve: true }),
+      TOKEN,
+      baseInput({
+        parsedBody: baseEnvelope({ status: "resolved", alerts: [resolved] }),
+      }),
+    );
+    mocks.issues.update.mockImplementation(async (_id, patch) => {
+      issueStatus = patch.status;
+      return { id: "issue-1", status: issueStatus };
+    });
+    await reconcileAggregateLifecycle(
+      ctx,
+      baseConfig({ autoCloseOnResolve: true }),
+    );
+
+    expect(issueStatus).toBe("todo");
+    expect(mocks.logger.info).toHaveBeenCalledWith(
+      expect.stringContaining("repaired re-fire"),
+    );
+  });
+
   it("retries final resolution for an already-resolved member", async () => {
     const { ctx, mocks } = mkCtx();
     const alert = aggregateAlerts()[0];
@@ -1406,14 +1526,59 @@ describe("handleWebhook — aggregate lifecycle", () => {
     });
 
     await handleWebhook(ctx, baseConfig({ autoCloseOnResolve: true }), TOKEN, input);
-    mocks.db.allowClaimSteal = true;
-    await handleWebhook(ctx, baseConfig({ autoCloseOnResolve: true }), TOKEN, input);
+    await reconcileAggregateLifecycle(
+      ctx,
+      baseConfig({ autoCloseOnResolve: true }),
+    );
 
     expect(mocks.issues.update).toHaveBeenCalledTimes(2);
     expect(mocks.metrics.write).toHaveBeenCalledWith(
       "alertmanager.aggregate.final_resolved",
       1,
       expect.objectContaining({ alertname: "HindsightConsolidationStalled" }),
+    );
+  });
+
+  it("allows a resolved legacy info alert through the creation floor", async () => {
+    const { ctx, mocks } = mkCtx();
+    const alert = baseAlert({
+      fingerprint: "legacy-info",
+      status: "resolved",
+      labels: { alertname: "LegacyInfo", severity: "info" },
+      endsAt: "2026-04-29T10:00:00Z",
+    });
+    await mocks.state.set(
+      { scopeKind: "instance", stateKey: "alert:legacy-info" },
+      {
+        paperclipIssueId: "legacy-issue",
+        paperclipCompanyId: "company-1",
+        alertname: "LegacyInfo",
+        severity: "info",
+        firstSeenAt: "2026-04-29T09:00:00Z",
+        lastFiredAt: "2026-04-29T09:00:00Z",
+        resolvedAt: null,
+      },
+    );
+    mocks.issues.get.mockResolvedValue({ id: "legacy-issue", status: "todo" });
+
+    await handleWebhook(
+      ctx,
+      baseConfig({ autoCloseOnResolve: true }),
+      TOKEN,
+      baseInput({
+        parsedBody: baseEnvelope({ status: "resolved", alerts: [alert] }),
+      }),
+    );
+
+    expect(mocks.issues.update).toHaveBeenCalledWith(
+      "legacy-issue",
+      { status: "cancelled" },
+      "company-1",
+    );
+    expect(mocks.metrics.write).not.toHaveBeenCalledWith(
+      "alertmanager.webhook.below_issue_floor",
+      expect.anything(),
+      expect.anything(),
     );
   });
 

@@ -23,6 +23,7 @@ import {
 import { DEFAULT_ISSUE_ROUTE_MAP, DEFAULT_OWNER_MAP } from "./constants.js";
 import { handleWebhook } from "./webhook-handler.js";
 import { runAlertEscalationSweep } from "./escalation.js";
+import { reconcileAggregateLifecycle } from "./aggregate-reconciliation.js";
 import type {
   AlertmanagerPluginConfig,
   IssueRouteMap,
@@ -124,7 +125,10 @@ export const plugin = definePlugin({
     const rawConfig = await ctx.config.get();
     await applyConfig(ctx, rawConfig as unknown as AlertmanagerPluginConfig);
     ctx.jobs.register("check-alert-escalations", async () => {
-      if (pluginConfig) await runAlertEscalationSweep(ctx, pluginConfig);
+      if (pluginConfig) {
+        await reconcileAggregateLifecycle(ctx, pluginConfig);
+        await runAlertEscalationSweep(ctx, pluginConfig);
+      }
     });
     ctx.logger.info("paperclip-plugin-alertmanager started");
   },
