@@ -9,6 +9,8 @@ describe("sensitive env detection", () => {
     "WEBFLOW_BOT_CONTROL_TOKEN",
     "ORC8R_CERTIFIER_TOKEN",
     "GENERIC_TOKEN",
+    "GHTOKEN",
+    "CONTROLTOKEN",
     "LINEAR_API_KEY",
     "OCM_QA_WALLET_PRIVATE_KEY_BASE58",
   ])("recognizes %s as a sensitive key", (key) => {
