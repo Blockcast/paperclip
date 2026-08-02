@@ -185,6 +185,23 @@ spec:
           annotations:
             summary: "Paperclip GitHub review-request wakes suppressed by an outage-like cause (reviews are being dropped)"
             description: "At least one GitHub review-request reviewer wake was terminally suppressed in the last {{ .Values.prometheusRule.githubDeliverySuppressionWindow }} with an outage-like cause ({{ .Values.prometheusRule.githubDeliverySuppressionOutageCauses }}) (BLO-18859). Suppressed means the wake was declined rather than dispatched: no run exists and nothing will re-arm it, so the PR has a posted trigger and no review — the same user-visible outcome as a dead-letter. Check the `cause` label first. `heartbeat.scheduling_suppressed` means the fleet-wide scheduling-suppression flag is on: if that is not a deliberate maintenance window, clear it (this is the mode that silently strands every review). `dispatch_rejected` means the dispatch path threw a business-rule HttpError with no durable skipped row — an unresolvable agent or responsible user; waiting will not fix it. `other` means the server emitted a skip reason missing from KNOWN_GITHUB_SUPPRESSION_CAUSES in services/metrics.ts: find it with `select reason, count(*) from agent_wakeup_requests where status = 'skipped' and created_at > now() - interval '1 hour' group by 1 order by 2 desc`, then either add it to the allow-list as an expected decline or fix the cause. Expected declines (company.inactive, heartbeat.cooldown.active, heartbeat.disabled, heartbeat.wakeOnDemand.disabled, budget.blocked, agent.not_invokable, heartbeat.worktree_execution_cutoff, issue_tree_hold_active) are excluded from this selector by default and are visible on the same counter for context."
+        # BLO-21078: mirrors the authoritative copy in
+        # Blockcast/onprem-k8s monitoring/prometheus-configmap.yaml (key
+        # paperclip-runtime-alerts.rules.yml) and its CRD copy
+        # paperclip/paperclip-runtime-alerts-prometheusrule.yaml — see those
+        # files for the full incident writeup and threshold-tuning caveat.
+        # This chart copy renders nowhere live (prometheusRule.enabled is
+        # false on Blockcast, see the file header); kept only for coherence.
+        - alert: PaperclipGithubWorkflowRunMassCancellation
+          expr: |
+            sum(increase(paperclip_github_workflow_run_conclusion_total{conclusion="cancelled"}[15m])) >= 3
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: "GitHub Actions is mass-cancelling workflow runs (3+ cancelled in 15m)"
+            description: "At least 3 workflow_run webhook deliveries concluded `cancelled` in the last 15m (BLO-21078). See the onprem-k8s authoritative copy of this rule for the full runbook."
+            runbook_url: "/BLO/issues/BLO-21078"
     {{- with .Values.prometheusRule.additionalGroups }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
