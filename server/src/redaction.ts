@@ -260,6 +260,28 @@ const JWT_LIKE_VALUE_RE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
 const MIN_OPAQUE_TOKEN_LENGTH = 20;
 
 /**
+ * A URL's total length trivially exceeds any opaque-token threshold, so a
+ * whole-string length backstop is useless for URLs — nearly every real URL
+ * would trip it (CTO finding, #943 review). Gate per path segment instead:
+ * an ordinary URL's segments (`pull`, `1898`, `Blockcast`) are short, while a
+ * capability/webhook URL that embeds its credential directly in the path
+ * (no `user:pass@`, no `?token=`) puts the whole secret in a single segment,
+ * e.g. `https://hooks.slack.test/services/T000/B000/<opaque-secret>`.
+ */
+function hasOpaqueUrlPathSegment(pathname: string): boolean {
+  return pathname.split("/").some((rawSegment) => {
+    if (!rawSegment) return false;
+    let segment = rawSegment;
+    try {
+      segment = decodeURIComponent(rawSegment);
+    } catch {
+      // Malformed percent-encoding: judge the raw segment as-is.
+    }
+    return !/\s/.test(segment) && segment.length >= MIN_OPAQUE_TOKEN_LENGTH;
+  });
+}
+
+/**
  * Tier 2's value gate (BLO-20810 / CEO design constraint on #943 review). This
  * is a *positive* credential test, not a benign-shape allowlist — the earlier
  * version of this function ("does it look like prose?") let real credentials
@@ -267,9 +289,10 @@ const MIN_OPAQUE_TOKEN_LENGTH = 20;
  * or a scheme (a presigned/webhook URL, a Postgres DSN), because those are
  * properties real credentials can have too. Classify the *value* as
  * credential-shaped by matching known secret prefixes, JWT shape, PEM
- * blocks, URL userinfo/credential query params, or (as a backstop for
- * unrecognized formats) a long single opaque token — rather than inferring
- * "not a credential" from the absence of those properties.
+ * blocks, URL userinfo/credential query params, a path-embedded opaque
+ * segment, or (as a backstop for unrecognized formats) a long single opaque
+ * token — rather than inferring "not a credential" from the absence of those
+ * properties.
  *
  * A short single word ("octocat", "alice") is common under ambiguous
  * tier-2 keys like `author`/`authors` and is deliberately NOT treated as
@@ -282,7 +305,12 @@ function looksLikeCredentialValue(value: string): boolean {
   if (trimmed.length === 0) return false;
   if (PEM_BLOCK_RE.test(trimmed)) return true;
   if (URL_LIKE_VALUE_RE.test(trimmed)) {
-    return URL_USERINFO_RE.test(trimmed) || URL_CREDENTIAL_QUERY_RE.test(trimmed);
+    if (URL_USERINFO_RE.test(trimmed) || URL_CREDENTIAL_QUERY_RE.test(trimmed)) return true;
+    try {
+      return hasOpaqueUrlPathSegment(new URL(trimmed).pathname);
+    } catch {
+      return false;
+    }
   }
   if (OPAQUE_VALUE_SCHEME_PREFIX_RE.test(trimmed)) return true;
   const withoutScheme = trimmed.replace(OPAQUE_VALUE_SCHEME_PREFIX_RE, "");
