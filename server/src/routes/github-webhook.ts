@@ -890,6 +890,8 @@ type DependabotAlertContext = {
   vulnerableRange: string | null;
   patchedVersion: string | null;
   alertUrl: string | null;
+  dismissalReason: string | null;
+  dismissalComment: string | null;
 };
 
 // created: brand-new advisory match; reintroduced: a previously-fixed alert
@@ -922,6 +924,14 @@ function resolveDependabotAlertContext(
   const dependency = alert.dependency as Record<string, unknown> | undefined;
   const pkg = (vulnerability?.package ?? dependency?.package) as Record<string, unknown> | undefined;
   const firstPatched = vulnerability?.first_patched_version as Record<string, unknown> | undefined;
+  const dismissalReason =
+    typeof alert.dismissed_reason === "string" && alert.dismissed_reason.trim()
+      ? alert.dismissed_reason.trim()
+      : null;
+  const dismissalComment =
+    typeof alert.dismissed_comment === "string" && alert.dismissed_comment.trim()
+      ? alert.dismissed_comment.trim()
+      : null;
   const severity =
     typeof vulnerability?.severity === "string"
       ? vulnerability.severity
@@ -941,6 +951,8 @@ function resolveDependabotAlertContext(
     vulnerableRange: (vulnerability?.vulnerable_version_range as string | undefined) ?? null,
     patchedVersion: (firstPatched?.identifier as string | undefined) ?? null,
     alertUrl: (alert.html_url as string | undefined) ?? null,
+    dismissalReason,
+    dismissalComment,
   };
 }
 
@@ -994,16 +1006,14 @@ function buildDependabotAlertIssueBody(input: {
     ...(alert.summary ? ["", alert.summary] : []),
     "",
     "## Acceptance criteria",
-    `- Remediation path: the vulnerable ${alert.packageName ?? "dependency"} in \`${repoFullName}\` is bumped to ${alert.patchedVersion ?? "a patched version"} and lands via a merged PR.`,
-    "- Dismissal path: the Dependabot alert is explicitly dismissed with a documented reason.",
-    "- For the remediation path, the Dependabot alert's state on GitHub moves to `fixed`. GitHub does this on its own once the remediation lands; observing it directly is optional — see **Verifying signal**.",
-    "- For the dismissal path, the Dependabot alert's state on GitHub is `dismissed`, together with the documented dismissal reason.",
+    `- Remediation path: the default-branch manifest${alert.manifestPath ? ` \`${alert.manifestPath}\`` : ""} in \`${repoFullName}\` resolves ${alert.packageName ?? "the dependency"} at ${alert.patchedVersion ?? "a patched version"} or newer, outside the vulnerable range ${alert.vulnerableRange ?? "reported above"}, and the evidence cites advisory ${advisory}. A GitHub alert-state receipt is sufficient but not required.`,
+    `- Dismissal path: a documented dismissal reason is recorded, and either a terminal dismissal webhook receipt on this issue or direct terminal-state observation from GitHub shows the alert is dismissed for advisory ${advisory}.`,
     "",
     "## Verifying signal",
     "Any ONE of the following is sufficient and complete evidence. You do not need all of them, and none of them is mandatory on its own:",
-    `1. The remediation PR merges into the default branch of \`${repoFullName}\`, AND the default-branch manifest${alert.manifestPath ? ` \`${alert.manifestPath}\`` : ""} resolves ${alert.packageName ?? "the dependency"} at ${alert.patchedVersion ?? "a patched version"} or newer.`,
-    `2. ${alertUrl} shows \`state: fixed\`.`,
-    `3. ${alertUrl} shows \`state: dismissed\`, together with the documented dismissal reason.`,
+    `1. The default-branch manifest${alert.manifestPath ? ` \`${alert.manifestPath}\`` : ""} in \`${repoFullName}\` resolves ${alert.packageName ?? "the dependency"} at ${alert.patchedVersion ?? "a patched version"} or newer, outside the vulnerable range ${alert.vulnerableRange ?? "reported above"}, with advisory ${advisory} cited in the evidence.`,
+    `2. ${alertUrl} shows \`state: fixed\` for advisory ${advisory}.`,
+    `3. A documented dismissal reason is recorded, and either a terminal dismissal webhook receipt on this issue or ${alertUrl} shows \`state: dismissed\` for advisory ${advisory}.`,
     "",
     "Branch 1 is fully agent-executable through the repository contents API and is the expected path. Do NOT require a screenshot of the alert page, and do NOT treat an authenticated-UI observation as the only admissible evidence: branches 2 and 3 are alternatives to branch 1, never prerequisites for it.",
     "",
@@ -1091,11 +1101,21 @@ function buildDependabotTerminalReceipt(input: {
   const alertUrl =
     input.alert.alertUrl ??
     `https://github.com/${input.repoFullName}/security/dependabot/${input.alert.alertNumber}`;
+  const dismissalEvidence =
+    input.alert.action === "dismissed" || input.alert.action === "auto_dismissed"
+      ? [
+          `- Dismissal reason: ${input.alert.dismissalReason ? JSON.stringify(input.alert.dismissalReason) : "not provided in the webhook payload"}`,
+          ...(input.alert.dismissalComment
+            ? [`- Dismissal comment: ${JSON.stringify(input.alert.dismissalComment)}`]
+            : []),
+        ]
+      : [];
   return [
     "[github-dependabot-receipt] Terminal Dependabot state received through the HMAC-verified GitHub webhook.",
     `- Repository: \`${input.repoFullName}\``,
     `- Alert: [#${input.alert.alertNumber}](${alertUrl})`,
     `- Action: \`${input.alert.action}\``,
+    ...dismissalEvidence,
     `- GitHub delivery: \`${input.deliveryId ?? "unavailable"}\``,
     "- Evidence path: delivered `dependabot_alert` webhook; no Dependabot REST or GraphQL query was used.",
   ].join("\n");
@@ -1112,6 +1132,8 @@ async function recordDependabotTerminalReceipt(
     deliveryId: string | null;
   },
 ): Promise<void> {
+  const hasCompleteTerminalEvidence =
+    input.alert.action === "fixed" || Boolean(input.alert.dismissalReason);
   let issue = await findOpenDependabotAlertIssue(db, input.companyId, input.originId);
   if (!issue) {
     issue = await db
@@ -1131,6 +1153,20 @@ async function recordDependabotTerminalReceipt(
   }
   const receiptBody = buildDependabotTerminalReceipt(input);
 
+  if (!issue && !hasCompleteTerminalEvidence) {
+    await recordDependabotWebhookDiagnostic(db, {
+      companyId: input.companyId,
+      assigneeAgentId: input.assigneeAgentId,
+      event: "dependabot_alert",
+      deliveryId: input.deliveryId,
+      action: input.alert.action,
+      repoFullName: input.repoFullName,
+      reason: `Terminal Dependabot ${input.alert.action} delivery for alert #${input.alert.alertNumber} did not include a documented dismissal reason, so it was recorded as a diagnostic instead of reserving the active alert issue key.\n\n${receiptBody}`,
+      alertNumber: input.alert.alertNumber,
+    });
+    return;
+  }
+
   if (!issue) {
     issue = await issueService(db).create(input.companyId, {
       title: `Dependabot terminal receipt: ${input.repoFullName}#${input.alert.alertNumber} ${input.alert.action}`,
@@ -1138,12 +1174,14 @@ async function recordDependabotTerminalReceipt(
         receiptBody,
         "",
         "## Acceptance criteria",
-        `- Dependabot alert #${input.alert.alertNumber} is recorded in a terminal state from a permitted webhook delivery.`,
+        ...(input.alert.action === "fixed"
+          ? [`- Dependabot alert #${input.alert.alertNumber} is recorded as fixed from a permitted webhook delivery.`]
+          : [`- Dependabot alert #${input.alert.alertNumber} has a documented dismissal reason from a permitted webhook delivery.`]),
         "",
         "## Verifying signal",
-        `- GitHub delivery \`${input.deliveryId ?? "unavailable"}\` is preserved in the system comment on this issue.`,
+        `- GitHub delivery \`${input.deliveryId ?? "unavailable"}\` and its terminal evidence are preserved in the system comment on this issue.`,
       ].join("\n"),
-      status: "done",
+      status: hasCompleteTerminalEvidence ? "done" : "todo",
       priority: DEPENDABOT_SEVERITY_TO_ISSUE_PRIORITY[input.alert.severity] ?? "medium",
       assigneeAgentId: input.assigneeAgentId,
       originKind: GITHUB_DEPENDABOT_ALERT_ORIGIN_KIND,
@@ -1180,11 +1218,13 @@ async function recordDependabotTerminalReceipt(
         alertNumber: input.alert.alertNumber,
         action: input.alert.action,
         deliveryId: input.deliveryId,
+        dismissalReason: input.alert.dismissalReason,
+        dismissalComment: input.alert.dismissalComment,
       } as never,
     });
   }
 
-  if (issue.status !== "done") {
+  if (hasCompleteTerminalEvidence && issue.status !== "done") {
     await issueService(db).update(issue.id, { status: "done" });
   }
 }

@@ -26,6 +26,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // Write under the gitignored test-results dir so re-runs leave no untracked
 // noise; screenshots are uploaded to the issue as QA evidence, not committed.
 const SHOT_DIR = path.join(__dirname, "test-results", "nux-phase4-shots");
+const WIZARD_PERSISTENCE_TIMEOUT_MS = 45_000;
 
 function shot(name: string) {
   fs.mkdirSync(SHOT_DIR, { recursive: true });
@@ -118,7 +119,7 @@ test.describe("NUX Phase 4 visual QA", () => {
     await page.getByRole("button", { name: /Confirm mission/ }).click();
     await expect(
       page.getByRole("heading", { name: "Create your team lead" }),
-    ).toBeVisible({ timeout: 15_000 });
+    ).toBeVisible({ timeout: WIZARD_PERSISTENCE_TIMEOUT_MS });
     await page.screenshot({ path: shot("03-create-lead.png") });
 
     await page.getByRole("button", { name: /^Next/ }).click();

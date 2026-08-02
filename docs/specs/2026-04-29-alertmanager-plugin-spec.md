@@ -745,21 +745,18 @@ sync into plugin state. V3 = pluggable resolver protocol.
 
 ### Q4 — Webhook authentication
 
-**Status: Resolved (V1) — live cluster runs `webhookTokenRef`-only auth.**
-Static bearer is the V1 design. The manifest schema supports both
-`webhookTokenRef` (paperclip secrets-store UUID, production posture) and
-`webhookToken` (inline string, dev-mode fallback); the Alertmanager side
-reads its credential from the K8s `alertmanager-receivers` Secret via
-`credentials_file`. The live cluster's `plugin_config.config_json` carries
-`webhookTokenRef` only — the inline `webhookToken` was stripped on
-2026-04-30 after the bootstrap-fix image landed (see commit history;
-the `autoConfigureAlertmanagerFromEnv` helper now short-circuits when an
-operator has wired the secret-ref path).
+**Status: V1 static bearer, worker-side inline token only.** The manifest
+schema still contains `webhookTokenRef`, but current worker builds fail closed
+when it is configured. Resolving a secret ref inside the public webhook worker
+would spend the shared company/plugin secret-resolution budget before bearer
+verification, so secret-ref auth must move behind a host-side verifier before
+that path is re-enabled. The Alertmanager side still reads its credential from
+the K8s `alertmanager-receivers` Secret via `credentials_file`; the plugin side
+uses the matching `webhookToken` value in company config.
 
 The bearer therefore lives in three places that must rotate together:
 
-1. `company_secrets` row in paperclip's own DB (single source of truth
-   resolved through `ctx.secrets.resolve()`).
+1. Plugin company config `webhookToken` (current worker-side verifier).
 2. K8s `monitoring/alertmanager-receivers` Secret (mounted by AM as
    `credentials_file`).
 3. K8s `paperclip/paperclip-alertmanager-webhook-token` Secret (env-
