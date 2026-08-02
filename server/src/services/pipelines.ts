@@ -47,6 +47,7 @@ import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
 import { routineService } from "./routines.js";
 import { secretService } from "./secrets.js";
 import type { IssueAssignmentWakeupDeps } from "./issue-assignment-wakeup.js";
+import { heartbeatService } from "./heartbeat.js";
 import { logActivity } from "./activity-log.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
 import { authorizationService } from "./authorization.js";
@@ -2223,11 +2224,30 @@ async function descendantCaseIds(db: PipelineDb, companyId: string, rootCaseIds:
   return Array.from(result).map((row) => String((row as { id: string }).id));
 }
 
-export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeupDeps } = {}) {
-  const routinesSvc = routineService(db, { heartbeat: deps.heartbeat });
+type PipelineHeartbeatDeps = IssueAssignmentWakeupDeps & {
+  cancelRun?: ReturnType<typeof heartbeatService>["cancelRun"];
+};
+
+export function pipelineService(db: Db, deps: { heartbeat?: PipelineHeartbeatDeps } = {}) {
+  const heartbeat: PipelineHeartbeatDeps = deps.heartbeat ?? heartbeatService(db);
+  const routinesSvc = routineService(db, { heartbeat });
   const outputsSvc = pipelineCaseOutputsService(db);
   const authorization = authorizationService(db);
   const secretsSvc = secretService(db);
+
+  async function cancelRetiredStageAutomationRuns(runIds: Iterable<string>) {
+    if (!heartbeat.cancelRun) return;
+    for (const runId of new Set(runIds)) {
+      await heartbeat.cancelRun(
+        runId,
+        "Cancelled because the pipeline case left the automation issue's originating stage",
+        {
+          errorCode: "pipeline_stage_exited",
+          eventMessage: "run cancelled after pipeline stage exit",
+        },
+      );
+    }
+  }
 
   async function assertRoutineInCompany(companyId: string, routineId: string) {
     const routine = await db
@@ -2913,6 +2933,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       caseTitle: string;
       caseKey: string;
       stageName: string;
+      runningRunIdsToCancel?: Set<string>;
     },
   ) {
     const row = await tx
@@ -3004,6 +3025,21 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       });
     if (!cancelledIssue) return;
 
+    if (row.issueExecutionRunId) {
+      const activeRun = await tx
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(and(
+          eq(heartbeatRuns.id, row.issueExecutionRunId),
+          eq(heartbeatRuns.companyId, input.companyId),
+        ))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (activeRun?.status === "running") {
+        input.runningRunIdsToCancel?.add(row.issueExecutionRunId);
+      }
+    }
+
     const cancelledRuns = await tx
       .update(heartbeatRuns)
       .set({
@@ -3054,6 +3090,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       caseKey: string;
       stageId: string;
       stageName: string;
+      runningRunIdsToCancel?: Set<string>;
     },
   ) {
     const stageAutomationLinks = await tx
@@ -3081,6 +3118,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
         caseTitle: input.caseTitle,
         caseKey: input.caseKey,
         stageName: input.stageName,
+        runningRunIdsToCancel: input.runningRunIdsToCancel,
       });
     }
   }
@@ -3194,6 +3232,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
         );
       }
       const executionIssueId = run.linkedIssueId;
+      const runningRunIdsToCancel = new Set<string>();
       const updated = await db.transaction(async (tx) => {
         const txDb = tx as unknown as PipelineDb;
         const current = await getCaseWithStageForUpdateOrThrow(txDb, execution.companyId, execution.caseId);
@@ -3261,10 +3300,12 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
             caseTitle: current.case.title,
             caseKey: current.case.caseKey,
             stageName: detail.stage.name,
+            runningRunIdsToCancel,
           });
         }
         return updatedExecution!;
       });
+      await cancelRetiredStageAutomationRuns(runningRunIdsToCancel);
       await writeCaseEvent(db, {
         companyId: execution.companyId,
         caseId: execution.caseId,
@@ -3345,6 +3386,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       expectedVersion?: number;
       leaseToken?: string | null;
       actor: PipelineActor;
+      runningRunIdsToCancel?: Set<string>;
     },
   ) {
     if (input.fields !== undefined) assertJsonSize(input.fields, "fields");
@@ -3419,7 +3461,9 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
         terminalChildDelta: terminalDelta,
       });
       if (isTerminalKind(current.terminalKind)) {
-        await handleChildrenTerminal(tx, input.companyId, input.parentCaseId);
+        await handleChildrenTerminal(tx, input.companyId, input.parentCaseId, undefined, {
+          runningRunIdsToCancel: input.runningRunIdsToCancel,
+        });
       }
     }
     if (materialChanged) {
@@ -3450,6 +3494,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       automationLedgers?: Array<typeof pipelineAutomationExecutions.$inferSelect>;
       autoAdvanceVisitedStageIds?: Set<string>;
       skipChildrenTerminalGate?: boolean;
+      runningRunIdsToCancel?: Set<string>;
     },
   ) {
     if (input.transitionClass === "auto" && input.actor.type !== "system") {
@@ -3547,6 +3592,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
         caseKey: current.caseKey,
         stageId: fromStage.id,
         stageName: fromStage.name,
+        runningRunIdsToCancel: input.runningRunIdsToCancel,
       });
     }
     if (forcedTransition) {
@@ -3584,7 +3630,9 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       await handleBlockersResolved(tx, input.companyId, current.id);
     }
     if (!wasTerminal && isTerminal) {
-      await handleChildrenTerminal(tx, input.companyId, current.parentCaseId, input.automationLedgers);
+      await handleChildrenTerminal(tx, input.companyId, current.parentCaseId, input.automationLedgers, {
+        runningRunIdsToCancel: input.runningRunIdsToCancel,
+      });
     }
     if (!isTerminal) {
       await maybeAutoAdvanceOnStageEntry(tx, {
@@ -3593,6 +3641,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
         stage: toStage,
         automationLedgers: input.automationLedgers,
         visitedStageIds: input.autoAdvanceVisitedStageIds,
+        runningRunIdsToCancel: input.runningRunIdsToCancel,
       });
     }
     return { case: updated, event, automationLedger: ledger };
@@ -3610,6 +3659,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       stage: typeof pipelineStages.$inferSelect;
       automationLedgers?: Array<typeof pipelineAutomationExecutions.$inferSelect>;
       visitedStageIds?: Set<string>;
+      runningRunIdsToCancel?: Set<string>;
     },
   ) {
     const gate = childrenGateConfig(stageConfig(input.stage));
@@ -3634,6 +3684,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
         reason: "children_terminal",
         automationLedgers: input.automationLedgers,
         autoAdvanceVisitedStageIds: visited,
+        runningRunIdsToCancel: input.runningRunIdsToCancel,
       });
     } catch (error) {
       // Best-effort: an unsatisfied gate (drift, approval) on the chained
@@ -3647,7 +3698,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
     companyId: string,
     parentCaseId: string | null | undefined,
     automationLedgers?: Array<typeof pipelineAutomationExecutions.$inferSelect>,
-    options: { allowExplicitZeroChildrenPass?: boolean } = {},
+    options: { allowExplicitZeroChildrenPass?: boolean; runningRunIdsToCancel?: Set<string> } = {},
   ) {
     const ancestors = await getAncestorCases(tx, companyId, parentCaseId);
     for (const ancestor of ancestors) {
@@ -3693,6 +3744,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
           transitionClass: "auto",
           reason: "children_terminal",
           automationLedgers,
+          runningRunIdsToCancel: options.runningRunIdsToCancel,
         });
       } catch (error) {
         // Best-effort: an unsatisfied gate (drift, approval, blocker) on the
@@ -4042,7 +4094,8 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       moveCasesToStageId?: string | null;
       actor?: PipelineActor;
     }) {
-      return db.transaction(async (tx) => {
+      const runningRunIdsToCancel = new Set<string>();
+      const result = await db.transaction(async (tx) => {
         await getPipelineOrThrow(tx, input.companyId, input.pipelineId);
         const stage = await getStageOrThrow(tx, input.pipelineId, input.stageId);
         const targetStage = input.moveCasesToStageId
@@ -4097,12 +4150,15 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
               caseKey: movedCase.caseKey,
               stageId: stage.id,
               stageName: stage.name,
+              runningRunIdsToCancel,
             });
             if (!wasTerminal && movedCase.terminalKind === "done") {
               await handleBlockersResolved(tx, input.companyId, movedCase.id);
             }
             if (!wasTerminal && isTerminal) {
-              await handleChildrenTerminal(tx, input.companyId, previous?.parentCaseId);
+              await handleChildrenTerminal(tx, input.companyId, previous?.parentCaseId, undefined, {
+                runningRunIdsToCancel,
+              });
             }
           }
         }
@@ -4120,6 +4176,8 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
         }
         return { deleted: true };
       });
+      await cancelRetiredStageAutomationRuns(runningRunIdsToCancel);
+      return result;
     },
 
     async createTransition(input: { companyId: string; pipelineId: string; fromStageId: string; toStageId: string; label?: string | null }) {
@@ -4541,11 +4599,14 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
         });
       }
       if (!replayingCompletedBreakdown && items.length === 0 && config.waitForPieces && config.whenFinishedMoveTo) {
+        const runningRunIdsToCancel = new Set<string>();
         await db.transaction(async (tx) => {
           await handleChildrenTerminal(tx, input.companyId, detail.case.id, undefined, {
             allowExplicitZeroChildrenPass: true,
+            runningRunIdsToCancel,
           });
         });
+        await cancelRetiredStageAutomationRuns(runningRunIdsToCancel);
         parent = await getCaseOrThrow(db, input.companyId, detail.case.id);
       }
 
@@ -4569,10 +4630,13 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       leaseToken?: string | null;
       actor: PipelineActor;
     }) {
-      return db.transaction(async (tx) => {
-        const result = await patchCaseContentInTransaction(tx, input);
+      const runningRunIdsToCancel = new Set<string>();
+      const result = await db.transaction(async (tx) => {
+        const result = await patchCaseContentInTransaction(tx, { ...input, runningRunIdsToCancel });
         return result.case;
       });
+      await cancelRetiredStageAutomationRuns(runningRunIdsToCancel);
+      return result;
     },
 
     async acknowledgeDrift(input: {
@@ -4698,7 +4762,13 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       skipChildrenTerminalGate?: boolean;
     }) {
       const automationLedgers: Array<typeof pipelineAutomationExecutions.$inferSelect> = [];
-      const result = await db.transaction((tx) => transitionCaseInTransaction(tx, { ...input, automationLedgers }));
+      const runningRunIdsToCancel = new Set<string>();
+      const result = await db.transaction((tx) => transitionCaseInTransaction(tx, {
+        ...input,
+        automationLedgers,
+        runningRunIdsToCancel,
+      }));
+      await cancelRetiredStageAutomationRuns(runningRunIdsToCancel);
       const automationExecutions = await executeAutomationLedgers(automationLedgers, { type: "system" });
       if (result.automationLedger) {
         return {
@@ -4751,6 +4821,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       cleanup: PipelineAutomationRetryCleanupOptions;
       actor: PipelineActor;
     }) {
+      const runningRunIdsToCancel = new Set<string>();
       const result = await db.transaction(async (tx) => {
         const detail = await getCaseWithStageForUpdateOrThrow(tx, input.companyId, input.caseId);
         if (detail.case.version !== input.expectedVersion) {
@@ -4855,7 +4926,9 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
             parentCaseId,
             terminalChildDelta,
           });
-          await handleChildrenTerminal(tx, input.companyId, parentCaseId);
+          await handleChildrenTerminal(tx, input.companyId, parentCaseId, undefined, {
+            runningRunIdsToCancel,
+          });
         }
         const issueIdsToCancel = input.cleanup.cancelLinkedAutomationIssues
           ? effects.linkedAutomationIssueIds
@@ -4945,6 +5018,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
             caseKey: detail.case.caseKey,
             stageId: detail.stage.id,
             stageName: detail.stage.name,
+            runningRunIdsToCancel,
           });
         }
         await writeCaseEvent(tx, {
@@ -4973,6 +5047,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
           },
         };
       });
+      await cancelRetiredStageAutomationRuns(runningRunIdsToCancel);
       const automationExecution = await executeAutomationLedger(result.ledger.id, input.actor);
       const { targetStageRow: _targetStageRow, automationRoutineId: _automationRoutineId, ...plan } = result.plan;
       return {
@@ -5079,6 +5154,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       reason?: string | null;
       leaseToken?: string | null;
     }) {
+      const runningRunIdsToCancel = new Set<string>();
       const result = await db.transaction(async (tx) => {
         const { case: existing } = await getCaseWithStageOrThrow(tx, input.companyId, input.caseId);
         const suggestion = existing.pendingSuggestion;
@@ -5113,6 +5189,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
           suggestionId: input.suggestionId,
           reason: input.reason,
           automationLedgers,
+          runningRunIdsToCancel,
         });
         await writeCaseEvent(tx, {
           companyId: input.companyId,
@@ -5123,6 +5200,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
         });
         return { ...transition, automationLedgers };
       });
+      await cancelRetiredStageAutomationRuns(runningRunIdsToCancel);
       if ("automationLedgers" in result) {
         const automationExecutions = await executeAutomationLedgers(result.automationLedgers, { type: "system" });
         if (result.automationLedger) {
@@ -5158,6 +5236,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       actor: PipelineActor;
     }) {
       const automationLedgers: Array<typeof pipelineAutomationExecutions.$inferSelect> = [];
+      const runningRunIdsToCancel = new Set<string>();
       const result = await db.transaction(async (tx) => {
         const detail = await getCaseWithStageOrThrow(tx, input.companyId, input.caseId);
         if (detail.stage.kind !== "review") {
@@ -5185,6 +5264,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
             expectedVersion,
             leaseToken: input.leaseToken,
             actor: input.actor,
+            runningRunIdsToCancel,
           });
           expectedVersion = updated.case.version;
           updateEvent = updated.event;
@@ -5199,6 +5279,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
           reason: input.reason,
           actor: input.actor,
           automationLedgers,
+          runningRunIdsToCancel,
         });
         const reviewEvent = await writeCaseEvent(tx, {
           companyId: input.companyId,
@@ -5219,6 +5300,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
         });
         return { ...transitioned, updateEvent, reviewEvent };
       });
+      await cancelRetiredStageAutomationRuns(runningRunIdsToCancel);
       const automationExecutions = await executeAutomationLedgers(automationLedgers, { type: "system" });
       if (result.automationLedger) {
         return {

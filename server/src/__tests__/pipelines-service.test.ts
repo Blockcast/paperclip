@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { eq, sql } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
   agentWakeupRequests,
@@ -52,7 +52,30 @@ describeEmbeddedPostgres("pipelineService", () => {
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
 
   const userActor: PipelineActor = { type: "user", userId: "board-user" };
-  const noopHeartbeat = { wakeup: async () => null };
+  const cancelRun = vi.fn(async (runId: string, reason?: string, options?: { errorCode?: string }) => {
+    const [run] = await db
+      .select({ wakeupRequestId: heartbeatRuns.wakeupRequestId })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId));
+    const [cancelled] = await db
+      .update(heartbeatRuns)
+      .set({
+        status: "cancelled",
+        finishedAt: new Date(),
+        error: reason,
+        errorCode: options?.errorCode ?? "cancelled",
+      })
+      .where(eq(heartbeatRuns.id, runId))
+      .returning();
+    if (run?.wakeupRequestId) {
+      await db
+        .update(agentWakeupRequests)
+        .set({ status: "cancelled", finishedAt: new Date(), error: reason })
+        .where(eq(agentWakeupRequests.id, run.wakeupRequestId));
+    }
+    return cancelled ?? null;
+  });
+  const noopHeartbeat = { wakeup: async () => null, cancelRun };
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-pipelines-service-");
@@ -61,6 +84,7 @@ describeEmbeddedPostgres("pipelineService", () => {
   }, 60_000);
 
   afterEach(async () => {
+    cancelRun.mockClear();
     await db.delete(pipelineAutomationExecutions);
     await db.delete(pipelineCaseBlockers);
     await db.delete(pipelineCaseIssueLinks);
@@ -1680,9 +1704,10 @@ describeEmbeddedPostgres("pipelineService", () => {
       ],
     });
 
-    for (const [caseKey, targetStage, heartbeatStatus] of [
-      ["review-exit", "review", "queued"],
-      ["terminal-exit", "done", "scheduled_retry"],
+    for (const [caseKey, targetStage, heartbeatStatus, expectedWakeupStatus] of [
+      ["review-exit", "review", "queued", "skipped"],
+      ["terminal-exit", "done", "scheduled_retry", "skipped"],
+      ["running-exit", "review", "running", "cancelled"],
     ] as const) {
       const created = await svc.ingestCase({
         companyId: company.id,
@@ -1720,6 +1745,12 @@ describeEmbeddedPostgres("pipelineService", () => {
         wakeupRequestId,
         contextSnapshot: { issueId },
       });
+      if (heartbeatStatus === "running") {
+        await db
+          .update(issues)
+          .set({ status: "in_progress", executionRunId: heartbeatRunId })
+          .where(eq(issues.id, issueId!));
+      }
 
       await svc.transitionCase({
         companyId: company.id,
@@ -1752,7 +1783,14 @@ describeEmbeddedPostgres("pipelineService", () => {
       expect(link!.retiredAt).not.toBeNull();
       expect(link!.retiredReason).toBe("stage_exited");
       expect(heartbeatRun).toEqual({ status: "cancelled", errorCode: "pipeline_stage_exited" });
-      expect(wakeupRequest!.status).toBe("skipped");
+      expect(wakeupRequest!.status).toBe(expectedWakeupStatus);
+      if (heartbeatStatus === "running") {
+        expect(cancelRun).toHaveBeenCalledWith(
+          heartbeatRunId,
+          "Cancelled because the pipeline case left the automation issue's originating stage",
+          expect.objectContaining({ errorCode: "pipeline_stage_exited" }),
+        );
+      }
       expect(comments.map((comment) => comment.body)).toContain(
         `Pipeline case "Case ${caseKey}" (${caseKey}) left stage "Drafting". This stage-entry automation issue was cancelled because its work is no longer current.`,
       );
