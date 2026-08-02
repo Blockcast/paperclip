@@ -3,7 +3,9 @@
 import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { ApprovalPayloadRenderer, approvalLabel } from "./ApprovalPayload";
+import { ApprovalPayloadRenderer, approvalLabel, approvalSubject } from "./ApprovalPayload";
+import { ApprovalCard } from "./ApprovalCard";
+import type { Approval } from "@paperclipai/shared";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
@@ -84,5 +86,66 @@ describe("ApprovalPayloadRenderer", () => {
     act(() => {
       root.unmount();
     });
+  });
+});
+
+describe("blank payload.title fallback (BLO-21032)", () => {
+  const untitledPayload = {
+    title: null,
+    summary: "Human decision needed: coordinated disclosure for an unpatched auth bypass.",
+    decision_requested: ["Do we disclose? (recommended: yes)"],
+  };
+
+  it("approvalSubject falls back to summary when payload.title is null", () => {
+    expect(approvalSubject(untitledPayload)).toBe(
+      "Human decision needed: coordinated disclosure for an unpatched auth bypass.",
+    );
+  });
+
+  it("approvalLabel is non-blank for a null-title, summary-only payload", () => {
+    expect(approvalLabel("request_board_approval", untitledPayload)).toBe(
+      "Board Approval: Human decision needed: coordinated disclosure for an unpatched auth bypass.",
+    );
+  });
+
+  it("approvalLabel falls back to the approval type when neither title nor summary is present", () => {
+    expect(approvalLabel("request_board_approval", {})).toBe("Board Approval");
+    expect(approvalLabel("request_board_approval", null)).toBe("Board Approval");
+  });
+
+  it("ApprovalCard renders a non-blank heading for a card with payload.title = null", () => {
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+
+    const approval: Approval = {
+      id: "2141dc60-b081-4d2c-9633-3a5f5d569561",
+      companyId: "company-1",
+      type: "request_board_approval",
+      requestedByAgentId: null,
+      requestedByUserId: null,
+      status: "pending",
+      payload: untitledPayload,
+      decisionNote: null,
+      decidedByUserId: null,
+      decidedAt: null,
+      createdAt: new Date("2026-08-02T05:52:24.279Z"),
+      updatedAt: new Date("2026-08-02T05:52:24.275Z"),
+    };
+
+    act(() => {
+      root.render(<ApprovalCard approval={approval} requesterAgent={null} />);
+    });
+
+    const heading = container.querySelector("h3");
+    expect(heading?.textContent?.trim()).not.toBe("");
+    expect(heading?.textContent).toContain(
+      "Human decision needed: coordinated disclosure for an unpatched auth bypass.",
+    );
+
+    act(() => {
+      root.unmount();
+    });
+    container.remove();
   });
 });
