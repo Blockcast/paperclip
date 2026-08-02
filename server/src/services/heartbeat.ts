@@ -14497,6 +14497,34 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     const issueId = readNonEmptyString(context.issueId);
+    // The scan and readiness collectors UUID-screen this value so one malformed
+    // row cannot abort a whole dispatch pass. Screening alone, though, leaves
+    // the row itself queued forever: it is skipped by every batch lookup, then
+    // reaches the single-issue readiness call below, which still binds it to a
+    // uuid column and raises 22P02 on every pass for as long as the row exists.
+    // An id that cannot be a uuid can never resolve to an issue, so prune it
+    // here instead — this ticket's contract is that invalid queued rows
+    // converge to zero, not merely that they stop being fatal. CAS on
+    // status='queued' so concurrent passes yield one transition and one event.
+    if (issueId && !UUID_PATTERN.test(issueId)) {
+      const now = new Date();
+      const outcome = await setRunStatusIfQueued(run.id, "cancelled", {
+        finishedAt: now,
+        error: `Queued run context references an unparseable issue id: ${issueId}`,
+        errorCode: "invalid_context_issue_id",
+      });
+      if (outcome.updated) {
+        await setWakeupStatus(run.wakeupRequestId, "skipped", {
+          finishedAt: now,
+          error: "Queued run context references an unparseable issue id",
+        });
+        logger.warn(
+          { runId: run.id, agentId: run.agentId, issueId },
+          "claimQueuedRun: cancelled queued run with an unparseable context issue id",
+        );
+      }
+      return null;
+    }
     if (issueId) {
       const activePauseHold = await treeControlSvc.getActivePauseHoldGate(run.companyId, issueId);
       const treeHoldInteractionWake = activePauseHold && await isVerifiedIssueTreeControlInteractionWake(db, {
