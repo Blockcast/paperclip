@@ -11,7 +11,8 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../
 const statefulSetPath = path.join(repoRoot, "deploy/helm/paperclip/templates/statefulset.yaml");
 const opencodeBin = path.join(repoRoot, "server/node_modules/.bin/opencode");
 const IDLE_WINDOW_MS = 610_000;
-const CALLER_TIMEOUT_MS = 100;
+const CALLER_TIMEOUT_MS = 2_000;
+const CALLER_TIMEOUT_TOLERANCE_MS = 500;
 
 type SeedEntry = { type: "http" | "sse"; url: string };
 type JsonRpcMessage = {
@@ -462,8 +463,13 @@ describe("opencode_k8s production k8s-ro connector after idle", () => {
       { tool: "nodes_list", status: "timed_out", atMs: IDLE_WINDOW_MS },
     ]);
     expect(currentMcp.timeoutObservedMs()).not.toBeNull();
-    expect(currentMcp.timeoutObservedMs()!).toBeLessThan(CALLER_TIMEOUT_MS + 1_000);
+    expect(currentMcp.timeoutObservedMs()!).toBeGreaterThanOrEqual(
+      CALLER_TIMEOUT_MS - CALLER_TIMEOUT_TOLERANCE_MS,
+    );
+    expect(currentMcp.timeoutObservedMs()!).toBeLessThanOrEqual(
+      CALLER_TIMEOUT_MS + CALLER_TIMEOUT_TOLERANCE_MS,
+    );
     expect(currentRun.stdout).toContain("MCP error -32001: Request timed out");
     console.info("[k8s-ro regression] post-idle Pod/PVC/Event/Node passed in one OpenCode session; timeout bounded");
-  }, 60_000);
+  }, 75_000);
 });
