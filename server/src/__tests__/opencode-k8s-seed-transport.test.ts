@@ -429,7 +429,11 @@ describe("opencode_k8s production k8s-ro connector after idle", () => {
 
     const seed = readK8sRoSeed();
     expect(seed.type).toBe("http");
-    expect(new URL(seed.url).pathname).toBe("/mcp");
+    const seedUrl = new URL(seed.url);
+    expect(seedUrl.protocol).toBe("http:");
+    expect(seedUrl.hostname).toBe("kubernetes-mcp-server-readonly.paperclip.svc.cluster.local");
+    expect(seedUrl.port).toBe("8080");
+    expect(seedUrl.pathname).toBe("/mcp");
     const currentMcp = await startK8sMcpFixture();
     const currentPlan: PlannedCall[] = [
       { tool: "pods_list_in_namespace", arguments: { namespace: "hindsight" } },
@@ -450,7 +454,7 @@ describe("opencode_k8s production k8s-ro connector after idle", () => {
       },
     );
     const currentRun = await runOpenCode(
-      new URL(new URL(seed.url).pathname, currentMcp.baseUrl).toString(),
+      new URL(seedUrl.pathname, currentMcp.baseUrl).toString(),
       currentModel.baseUrl,
     );
     expectOneOpenCodeSession(currentRun.stdout);
