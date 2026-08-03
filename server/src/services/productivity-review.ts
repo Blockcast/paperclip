@@ -173,6 +173,7 @@ const MONITOR_SCHEDULED_SUPPRESSION_ACTORS = new Set(["assignee", "board"]);
 const APPROVAL_GATE_SUPPRESSION_STATUSES = ["pending"] as const;
 
 type ProductivityReviewServiceDeps = {
+  beforeCollectEvidence?: (sourceIssue: IssueRow) => Promise<void> | void;
   enqueueWakeup?: EnqueueWakeup;
   beforeCreateOrUpdateReview?: (evidence: ProductivityReviewEvidence) => Promise<void> | void;
 };
@@ -277,6 +278,14 @@ function monitorHasFreshWakeClaim(issue: IssueRow, now: Date) {
   return monitorWakeRequestedAt.getTime() > now.getTime() - ISSUE_MONITOR_WAKE_CLAIM_TTL_MS
     ? monitorWakeRequestedAt
     : null;
+}
+
+function issueCanReceiveMonitorDispatch(issue: IssueRow) {
+  return Boolean(
+    !issue.assigneeUserId &&
+      issue.assigneeAgentId &&
+      ["in_progress", "in_review"].includes(issue.status),
+  );
 }
 
 function deliberatePendingMonitor(
@@ -542,6 +551,15 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       .select()
       .from(agents)
       .where(eq(agents.id, agentId))
+      .then((rows) => rows[0] ?? null);
+  }
+
+  async function getCurrentIssue(sourceIssue: IssueRow) {
+    return db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, sourceIssue.companyId), eq(issues.id, sourceIssue.id)))
+      .limit(1)
       .then((rows) => rows[0] ?? null);
   }
 
@@ -1054,6 +1072,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     const monitorNextCheckAt = coerceDate(sourceIssue.monitorNextCheckAt);
     if (!monitorNextCheckAt || monitorNextCheckAt.getTime() > now.getTime()) return 0;
     if (!isMonitorSuppressionActor(sourceIssue.monitorScheduledBy)) return 0;
+    if (!issueCanReceiveMonitorDispatch(sourceIssue)) return 0;
 
     const staleClaimThreshold = new Date(now.getTime() - ISSUE_MONITOR_WAKE_CLAIM_TTL_MS);
     const duePosition = await db
@@ -1065,7 +1084,18 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           eq(companies.status, "active"),
           sql`${issues.monitorNextCheckAt} is not null`,
           lte(issues.monitorNextCheckAt, now),
-          lte(issues.monitorNextCheckAt, monitorNextCheckAt),
+          or(
+            lt(issues.monitorNextCheckAt, monitorNextCheckAt),
+            and(
+              eq(issues.monitorNextCheckAt, monitorNextCheckAt),
+              lt(issues.updatedAt, sourceIssue.updatedAt),
+            ),
+            and(
+              eq(issues.monitorNextCheckAt, monitorNextCheckAt),
+              eq(issues.updatedAt, sourceIssue.updatedAt),
+              lte(issues.id, sourceIssue.id),
+            ),
+          ),
           isNull(issues.assigneeUserId),
           sql`${issues.assigneeAgentId} is not null`,
           inArray(issues.status, ["in_progress", "in_review"]),
@@ -1077,9 +1107,33 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       )
       .then((rows) => Number(rows[0]?.count ?? 0));
     if (duePosition <= 0) return 0;
+    if (duePosition === 1) return 0;
 
     const dispatchTicks = Math.max(1, Math.ceil(duePosition / thresholds.monitorDispatchBatchSize));
-    return dispatchTicks * thresholds.monitorSchedulerIntervalMs + ISSUE_MONITOR_WAKE_CLAIM_TTL_MS;
+    const dueAgeMs = now.getTime() - monitorNextCheckAt.getTime();
+    // The source is still behind live due rows, so compare against an absolute
+    // service deadline from "now plus remaining dispatch time" instead of
+    // shrinking grace as earlier batches drain.
+    return dueAgeMs + dispatchTicks * thresholds.monitorSchedulerIntervalMs + ISSUE_MONITOR_WAKE_CLAIM_TTL_MS;
+  }
+
+  async function currentPendingMonitorForReviewSuppression(
+    sourceIssue: IssueRow,
+    now: Date,
+    thresholds: ProductivityReviewThresholds,
+  ) {
+    const currentIssue = await getCurrentIssue(sourceIssue);
+    if (!currentIssue || !issueCanReceiveMonitorDispatch(currentIssue)) return null;
+
+    const direct = deliberatePendingMonitor(currentIssue, now, thresholds);
+    if (direct) return direct;
+
+    return deliberatePendingMonitor(
+      currentIssue,
+      now,
+      thresholds,
+      await monitorBacklogGraceMs(currentIssue, now, thresholds),
+    );
   }
 
   async function countIssueRunsSince(companyId: string, agentId: string, issueId: string, since: Date) {
@@ -1262,15 +1316,10 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       }
     }
 
-    let monitor = deliberatePendingMonitor(sourceIssue, now, thresholds);
-    if (trigger === "long_active_duration" && !monitor) {
-      monitor = deliberatePendingMonitor(
-        sourceIssue,
-        now,
-        thresholds,
-        await monitorBacklogGraceMs(sourceIssue, now, thresholds),
-      );
-    }
+    const monitor =
+      trigger === "long_active_duration"
+        ? await currentPendingMonitorForReviewSuppression(sourceIssue, now, thresholds)
+        : null;
     if (trigger === "long_active_duration" && monitor) {
       return {
         trigger,
@@ -1852,6 +1901,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         result.skipped += 1;
         continue;
       }
+      await deps?.beforeCollectEvidence?.(candidate);
       const evidence = await collectEvidence(candidate, sourceAgent, thresholds, now);
       if (!evidence) {
         result.skipped += 1;
