@@ -98,6 +98,52 @@ describe("isHintlessTransientUpstreamFault", () => {
     expect(isHintlessTransientUpstreamFault(null, { errorMessage: "TypeError: x is not a function" })).toBe(false);
   });
 
+  // BLO-19909 (a). `server_error` is Anthropic's own type name for a 500, and
+  // BLO-18285 deliberately made 500 terminal. Standing alone with NO status
+  // field, it is not evidence of a brownout, so it must not inherit the ~2h42m
+  // curve. Paired with a 503/529 the status branch already claims it, which is
+  // the "must be paired with a status" rule these cases pin.
+  //
+  // This block FAILS against f569128b (the #859 merge): there `\bserver_error\b`
+  // was a standalone text pattern, so every hint-less case below returned true.
+  it("leaves a hint-less bare server_error terminal", () => {
+    expect(isHintlessTransientUpstreamFault({ error: "server_error" })).toBe(false);
+    expect(isHintlessTransientUpstreamFault({ message: "server_error" })).toBe(false);
+    expect(isHintlessTransientUpstreamFault(null, { errorMessage: "server_error" })).toBe(false);
+    // Same payload as the live BLO-18138 run with its status field stripped:
+    // without the 503 there is nothing left that says "brownout".
+    expect(
+      isHintlessTransientUpstreamFault({
+        subtype: "api_retry",
+        attempt: 10,
+        max_retries: 10,
+        error: "server_error",
+      }),
+    ).toBe(false);
+  });
+
+  it("still classifies server_error transient when it is paired with a 503/529", () => {
+    expect(isHintlessTransientUpstreamFault({ error_status: 503, error: "server_error" })).toBe(true);
+    expect(isHintlessTransientUpstreamFault({ api_error_status: 529, error: "server_error" })).toBe(true);
+  });
+
+  // BLO-19909 (b). claude-local's parse.ts sets `resultJson = finalResult`
+  // verbatim, so `resultJson.result` is the SDK final-result event's text — the
+  // agent's own prose. A run that fails for an unrelated reason after the agent
+  // wrote about a 503 must not inherit the retry curve and be skipped by the
+  // strand sweep for ~2h42m. Same for `summary`, which is derived from it.
+  it("ignores agent-authored prose in result/summary that merely mentions a 503", () => {
+    const prose =
+      "I checked the deploy: the gateway returned API Error: 503 Service temporarily unavailable " +
+      "at 16:52Z, but it recovered. The failure here is an assertion in the migration test.";
+    expect(isHintlessTransientUpstreamFault({ result: prose })).toBe(false);
+    expect(isHintlessTransientUpstreamFault({ summary: prose })).toBe(false);
+    expect(isHintlessTransientUpstreamFault({ result: prose, is_error: false })).toBe(false);
+    expect(
+      isHintlessTransientUpstreamFault({ result: "the upstream was overloaded_error earlier" }),
+    ).toBe(false);
+  });
+
   // The rate-limit family owns 429/quota and uses a flat 90s curve, because the
   // ccrotate gate (not backoff) decides when a closed account window reopens.
   // Widening this predicate into that territory would swap the correct schedule
@@ -440,7 +486,6 @@ describeEmbeddedPostgres("hint-less gateway 503 does not strand", () => {
 
   it("classifies the fault and schedules a bounded retry instead of stranding", async () => {
     const { agentId } = await seedAgent(HINTLESS_503_TEST_ADAPTER);
-    const startedAt = Date.now();
 
     const run = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
     expect(run).not.toBeNull();
@@ -484,10 +529,21 @@ describeEmbeddedPostgres("hint-less gateway 503 does not strand", () => {
     // honor, the horizon itself is the fix. First hop is 2m ±25% jitter, and
     // the full chain runs 2m/10m/30m/2h — materially past the ~4 minutes the
     // in-process SDK retries covered before the run died.
+    //
+    // BLO-19909: anchored at the failed run's `finishedAt`, NOT at the
+    // pre-invoke wall clock. `computeBoundedTransientHeartbeatRetrySchedule`
+    // sets `dueAt = <scheduling time> + delayMs`, and scheduling happens at
+    // finalization, so measuring from before `invoke` folded the run's own wall
+    // time into the delay and pushed it against the 150s jitter ceiling — only
+    // ~6s of headroom under a loaded embedded-Postgres run. Anchoring here
+    // leaves only the finalize→schedule gap (milliseconds) inside the window,
+    // so the ±25% bounds can be asserted tightly instead of widened.
     const firstDelayMs = BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS[0];
-    const scheduledInMs = (retryRun?.scheduledRetryAt?.getTime() ?? 0) - startedAt;
-    expect(scheduledInMs).toBeGreaterThan(firstDelayMs * 0.7);
-    expect(scheduledInMs).toBeLessThan(firstDelayMs * 1.3);
+    const finishedAtMs = failedRun?.finishedAt?.getTime() ?? 0;
+    expect(finishedAtMs).toBeGreaterThan(0);
+    const scheduledInMs = (retryRun?.scheduledRetryAt?.getTime() ?? 0) - finishedAtMs;
+    expect(scheduledInMs).toBeGreaterThan(firstDelayMs * 0.75);
+    expect(scheduledInMs).toBeLessThanOrEqual(firstDelayMs * 1.25 + 5_000);
 
     const totalHorizonMs = BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.reduce((a, b) => a + b, 0);
     expect(totalHorizonMs).toBeGreaterThan(30 * 60 * 1000);
