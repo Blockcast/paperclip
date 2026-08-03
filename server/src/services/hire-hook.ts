@@ -24,7 +24,7 @@ export interface NotifyHireApprovedInput {
 export async function notifyHireApproved(
   db: Db,
   input: NotifyHireApprovedInput,
-): Promise<boolean> {
+): Promise<void> {
   const { companyId, agentId, source, sourceId } = input;
   const approvedAt = input.approvedAt ?? new Date();
 
@@ -36,14 +36,14 @@ export async function notifyHireApproved(
 
   if (!row) {
     logger.warn({ companyId, agentId, source, sourceId }, "hire hook: agent not found in company, skipping");
-    return false;
+    return;
   }
 
   const adapterType = row.adapterType ?? "process";
   const adapter = findActiveServerAdapter(adapterType);
   const onHireApproved = adapter?.onHireApproved;
   if (!onHireApproved) {
-    return true;
+    return;
   }
 
   const payload: HireApprovedPayload = {
@@ -52,7 +52,6 @@ export async function notifyHireApproved(
     agentName: row.name,
     adapterType,
     source,
-    idempotencyKey: `${source}:${sourceId}`,
     sourceId,
     approvedAt: approvedAt.toISOString(),
     message: HIRE_APPROVED_MESSAGE,
@@ -66,72 +65,49 @@ export async function notifyHireApproved(
   try {
     const result = await onHireApproved(payload, adapterConfig);
     if (result.ok) {
-      try {
-        await logActivity(db, {
-          companyId,
-          actorType: "system",
-          actorId: "hire_hook",
-          action: "hire_hook.succeeded",
-          entityType: "agent",
-          entityId: agentId,
-          details: { source, sourceId, adapterType },
-        });
-      } catch (err) {
-        logger.error(
-          { err, companyId, agentId, adapterType, source, sourceId },
-          "hire hook: failed to record successful delivery",
-        );
-      }
-      return true;
+      await logActivity(db, {
+        companyId,
+        actorType: "system",
+        actorId: "hire_hook",
+        action: "hire_hook.succeeded",
+        entityType: "agent",
+        entityId: agentId,
+        details: { source, sourceId, adapterType },
+      });
+      return;
     }
 
     logger.warn(
       { companyId, agentId, adapterType, source, sourceId, error: result.error, detail: result.detail },
       "hire hook: adapter returned failure",
     );
-    try {
-      await logActivity(db, {
-        companyId,
-        actorType: "system",
-        actorId: "hire_hook",
-        action: "hire_hook.failed",
-        entityType: "agent",
-        entityId: agentId,
-        details: { source, sourceId, adapterType, error: result.error, detail: result.detail },
-      });
-    } catch (err) {
-      logger.error(
-        { err, companyId, agentId, adapterType, source, sourceId },
-        "hire hook: failed to record unsuccessful delivery",
-      );
-    }
-    return false;
+    await logActivity(db, {
+      companyId,
+      actorType: "system",
+      actorId: "hire_hook",
+      action: "hire_hook.failed",
+      entityType: "agent",
+      entityId: agentId,
+      details: { source, sourceId, adapterType, error: result.error, detail: result.detail },
+    });
   } catch (err) {
     logger.error(
       { err, companyId, agentId, adapterType, source, sourceId },
       "hire hook: adapter threw",
     );
-    try {
-      await logActivity(db, {
-        companyId,
-        actorType: "system",
-        actorId: "hire_hook",
-        action: "hire_hook.error",
-        entityType: "agent",
-        entityId: agentId,
-        details: {
-          source,
-          sourceId,
-          adapterType,
-          error: err instanceof Error ? err.message : String(err),
-        },
-      });
-    } catch (activityError) {
-      logger.error(
-        { err: activityError, companyId, agentId, adapterType, source, sourceId },
-        "hire hook: failed to record delivery error",
-      );
-    }
-    return false;
+    await logActivity(db, {
+      companyId,
+      actorType: "system",
+      actorId: "hire_hook",
+      action: "hire_hook.error",
+      entityType: "agent",
+      entityId: agentId,
+      details: {
+        source,
+        sourceId,
+        adapterType,
+        error: err instanceof Error ? err.message : String(err),
+      },
+    });
   }
 }

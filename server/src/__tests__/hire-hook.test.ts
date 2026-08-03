@@ -39,10 +39,9 @@ afterEach(() => {
 
 describe("notifyHireApproved", () => {
   it("writes success activity when adapter hook returns ok", async () => {
-    const onHireApproved = vi.fn().mockResolvedValue({ ok: true });
     vi.mocked(findActiveServerAdapter).mockReturnValue({
       type: "openclaw_gateway",
-      onHireApproved,
+      onHireApproved: vi.fn().mockResolvedValue({ ok: true }),
     } as any);
 
     const db = mockDbWithAgent({
@@ -59,16 +58,7 @@ describe("notifyHireApproved", () => {
         source: "approval",
         sourceId: "ap1",
       }),
-    ).resolves.toBe(true);
-
-    expect(onHireApproved).toHaveBeenCalledWith(
-      expect.objectContaining({
-        source: "approval",
-        sourceId: "ap1",
-        idempotencyKey: "approval:ap1",
-      }),
-      expect.anything(),
-    );
+    ).resolves.toBeUndefined();
 
     expect(logActivity).toHaveBeenCalledWith(
       expect.anything(),
@@ -78,32 +68,6 @@ describe("notifyHireApproved", () => {
         details: expect.objectContaining({ source: "approval", sourceId: "ap1", adapterType: "openclaw_gateway" }),
       }),
     );
-  });
-
-  it("reports delivery success when success activity persistence fails", async () => {
-    const onHireApproved = vi.fn().mockResolvedValue({ ok: true });
-    vi.mocked(findActiveServerAdapter).mockReturnValue({
-      type: "openclaw_gateway",
-      onHireApproved,
-    } as any);
-    vi.mocked(logActivity).mockRejectedValueOnce(new Error("activity write failed"));
-
-    const db = mockDbWithAgent({
-      id: "a1",
-      companyId: "c1",
-      name: "OpenClaw Agent",
-      adapterType: "openclaw_gateway",
-    });
-
-    await expect(
-      notifyHireApproved(db, {
-        companyId: "c1",
-        agentId: "a1",
-        source: "approval",
-        sourceId: "ap1",
-      }),
-    ).resolves.toBe(true);
-    expect(onHireApproved).toHaveBeenCalledTimes(1);
   });
 
   it("does nothing when agent is not found", async () => {
@@ -122,7 +86,7 @@ describe("notifyHireApproved", () => {
         source: "join_request",
         sourceId: "jr1",
       }),
-    ).resolves.toBe(false);
+    ).resolves.toBeUndefined();
 
     expect(findActiveServerAdapter).not.toHaveBeenCalled();
   });
@@ -144,7 +108,7 @@ describe("notifyHireApproved", () => {
         source: "approval",
         sourceId: "ap1",
       }),
-    ).resolves.toBe(true);
+    ).resolves.toBeUndefined();
 
     expect(findActiveServerAdapter).toHaveBeenCalledWith("process");
     expect(logActivity).not.toHaveBeenCalled();
@@ -155,7 +119,6 @@ describe("notifyHireApproved", () => {
       type: "openclaw_gateway",
       onHireApproved: vi.fn().mockResolvedValue({ ok: false, error: "HTTP 500", detail: { status: 500 } }),
     } as any);
-    vi.mocked(logActivity).mockRejectedValueOnce(new Error("activity write failed"));
 
     const db = mockDbWithAgent({
       id: "a1",
@@ -171,7 +134,7 @@ describe("notifyHireApproved", () => {
         source: "join_request",
         sourceId: "jr1",
       }),
-    ).resolves.toBe(false);
+    ).resolves.toBeUndefined();
 
     expect(logActivity).toHaveBeenCalledWith(
       expect.anything(),
@@ -188,7 +151,6 @@ describe("notifyHireApproved", () => {
       type: "openclaw_gateway",
       onHireApproved: vi.fn().mockRejectedValue(new Error("Network error")),
     } as any);
-    vi.mocked(logActivity).mockRejectedValueOnce(new Error("activity write failed"));
 
     const db = mockDbWithAgent({
       id: "a1",
@@ -204,7 +166,7 @@ describe("notifyHireApproved", () => {
         source: "join_request",
         sourceId: "jr1",
       }),
-    ).resolves.toBe(false);
+    ).resolves.toBeUndefined();
 
     expect(logActivity).toHaveBeenCalledWith(
       expect.anything(),

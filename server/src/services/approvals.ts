@@ -1,14 +1,12 @@
-import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { activityLog, approvalComments, approvals } from "@paperclipai/db";
+import { approvalComments, approvals } from "@paperclipai/db";
 import { notFound, unprocessable } from "../errors.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { agentService } from "./agents.js";
 import { budgetService } from "./budgets.js";
 import { notifyHireApproved } from "./hire-hook.js";
 import { instanceSettingsService } from "./instance-settings.js";
-
-const HIRE_NOTIFICATION_CLAIM_LEASE_MS = 5 * 60_000;
 
 export function approvalService(db: Db) {
   const agentsSvc = agentService(db);
@@ -34,158 +32,6 @@ export function approvalService(db: Db) {
     if (!sourceBuiltInAgentKey) return;
     const { builtInAgentService } = await import("./built-in-agents.js");
     await builtInAgentService(dbClient).ensure(companyId, sourceBuiltInAgentKey);
-  }
-
-  async function completeApprovedBuiltInHire(
-    approval: ApprovalRecord,
-    agentId: string,
-    approvedAt: Date,
-  ) {
-    const claim = await db.transaction(async (tx) => {
-      const txDb = tx as unknown as Db;
-      await tx.execute(sql`select ${approvals.id} from ${approvals} where ${approvals.id} = ${approval.id} for update`);
-      const completed = await txDb
-        .select({ id: activityLog.id })
-        .from(activityLog)
-        .where(
-          and(
-            eq(activityLog.companyId, approval.companyId),
-            eq(activityLog.action, "approval.hire_post_commit_completed"),
-            eq(activityLog.entityType, "approval"),
-            eq(activityLog.entityId, approval.id),
-          ),
-        )
-        .then((rows) => rows[0] ?? null);
-      if (completed) return null;
-
-      const latestClaimEvent = await txDb
-        .select({ action: activityLog.action, createdAt: activityLog.createdAt })
-        .from(activityLog)
-        .where(
-          and(
-            eq(activityLog.companyId, approval.companyId),
-            inArray(activityLog.action, [
-              "approval.hire_notification_claimed",
-              "approval.hire_notification_claim_released",
-            ]),
-            eq(activityLog.entityType, "approval"),
-            eq(activityLog.entityId, approval.id),
-          ),
-        )
-        .orderBy(desc(activityLog.createdAt))
-        .limit(1)
-        .then((rows) => rows[0] ?? null);
-      if (
-        latestClaimEvent?.action === "approval.hire_notification_claimed" &&
-        latestClaimEvent.createdAt.getTime() > Date.now() - HIRE_NOTIFICATION_CLAIM_LEASE_MS
-      ) {
-        return null;
-      }
-
-      const payload = approval.payload as Record<string, unknown>;
-      const claimCreatedAt = new Date(
-        Math.max(Date.now(), (latestClaimEvent?.createdAt.getTime() ?? 0) + 1),
-      );
-      return txDb
-        .insert(activityLog)
-        .values({
-          companyId: approval.companyId,
-          actorType: "system",
-          actorId: "approval_service",
-          action: "approval.hire_notification_claimed",
-          entityType: "approval",
-          entityId: approval.id,
-          agentId,
-          createdAt: claimCreatedAt,
-          details: {
-            sourceBuiltInAgentKey: payload.sourceBuiltInAgentKey,
-            leaseMs: HIRE_NOTIFICATION_CLAIM_LEASE_MS,
-          },
-        })
-        .returning({ id: activityLog.id, createdAt: activityLog.createdAt })
-        .then((rows) => rows[0]!);
-    });
-
-    if (!claim) return;
-
-    const payload = approval.payload as Record<string, unknown>;
-    const releaseClaim = () =>
-      db.transaction(async (tx) => {
-        const txDb = tx as unknown as Db;
-        await tx.execute(
-          sql`select ${approvals.id} from ${approvals} where ${approvals.id} = ${approval.id} for update`,
-        );
-        const latestEvent = await txDb
-          .select({
-            id: activityLog.id,
-            action: activityLog.action,
-            createdAt: activityLog.createdAt,
-          })
-          .from(activityLog)
-          .where(
-            and(
-              eq(activityLog.companyId, approval.companyId),
-              inArray(activityLog.action, [
-                "approval.hire_notification_claimed",
-                "approval.hire_notification_claim_released",
-              ]),
-              eq(activityLog.entityType, "approval"),
-              eq(activityLog.entityId, approval.id),
-            ),
-          )
-          .orderBy(desc(activityLog.createdAt))
-          .limit(1)
-          .then((rows) => rows[0] ?? null);
-        if (latestEvent?.action !== "approval.hire_notification_claimed" || latestEvent.id !== claim.id) {
-          return;
-        }
-        await txDb.insert(activityLog).values({
-          companyId: approval.companyId,
-          actorType: "system",
-          actorId: "approval_service",
-          action: "approval.hire_notification_claim_released",
-          entityType: "approval",
-          entityId: approval.id,
-          agentId,
-          createdAt: new Date(Math.max(Date.now(), latestEvent.createdAt.getTime() + 1)),
-          details: { claimId: claim.id, sourceBuiltInAgentKey: payload.sourceBuiltInAgentKey },
-        });
-      });
-
-    try {
-      await reconcileApprovedBuiltInAgent(db, approval.companyId, payload);
-    } catch (error) {
-      await releaseClaim();
-      throw error;
-    }
-
-    let delivered: boolean;
-    try {
-      delivered = await notifyHireApproved(db, {
-        companyId: approval.companyId,
-        agentId,
-        source: "approval",
-        sourceId: approval.id,
-        approvedAt,
-      });
-    } catch (error) {
-      await releaseClaim();
-      throw error;
-    }
-    if (!delivered) {
-      await releaseClaim();
-      return;
-    }
-    await db.insert(activityLog).values({
-      companyId: approval.companyId,
-      actorType: "system",
-      actorId: "approval_service",
-      action: "approval.hire_post_commit_completed",
-      entityType: "approval",
-      entityId: approval.id,
-      agentId,
-      details: { sourceBuiltInAgentKey: payload.sourceBuiltInAgentKey },
-    });
   }
 
   async function getExistingApproval(id: string, dbClient: Db = db) {
@@ -364,13 +210,10 @@ export function approvalService(db: Db) {
         typeof payload.sourceBuiltInAgentKey === "string" &&
         approvedAgentId !== null;
 
-      if (isBuiltInHire) {
-        await completeApprovedBuiltInHire(
-          result.approval,
-          approvedAgentId,
-          result.approval.decidedAt ?? now,
-        );
-      } else if (result.hireApprovedAgentId) {
+      if (result.applied && isBuiltInHire) {
+        await reconcileApprovedBuiltInAgent(db, result.approval.companyId, payload);
+      }
+      if (result.hireApprovedAgentId) {
         void notifyHireApproved(db, {
           companyId: result.approval.companyId,
           agentId: result.hireApprovedAgentId,
