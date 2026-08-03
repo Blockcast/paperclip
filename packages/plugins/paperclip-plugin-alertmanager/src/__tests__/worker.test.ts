@@ -1315,6 +1315,30 @@ describe("handleWebhook — creation policy", () => {
     );
   });
 
+  it("acknowledges a firing info alert when floor telemetry fails", async () => {
+    const { ctx, mocks } = mkCtx();
+    mocks.metrics.write.mockRejectedValueOnce(new Error("metrics unavailable"));
+    const alert = baseAlert({
+      labels: { alertname: "InformationalAlert", severity: "info" },
+      annotations: {},
+    });
+
+    await expect(
+      handleWebhook(
+        ctx,
+        baseConfig(),
+        TOKEN,
+        baseInput({ parsedBody: baseEnvelope({ alerts: [alert] }) }),
+      ),
+    ).resolves.toBeUndefined();
+
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+    expect(mocks.state.set).not.toHaveBeenCalled();
+    expect(mocks.logger.error).toHaveBeenCalledWith(
+      expect.stringContaining("failed to record issue floor metric"),
+    );
+  });
+
   it.each(["label", "annotation"])(
     "honors paperclip_issue=false from the %s before every state side effect",
     async (source) => {
@@ -1346,6 +1370,33 @@ describe("handleWebhook — creation policy", () => {
       );
     },
   );
+
+  it("acknowledges an opted-out alert when opt-out telemetry fails", async () => {
+    const { ctx, mocks } = mkCtx();
+    mocks.metrics.write.mockRejectedValueOnce(new Error("metrics unavailable"));
+    const alert = baseAlert({
+      labels: {
+        alertname: "OptedOutAlert",
+        severity: "critical",
+        paperclip_issue: "false",
+      },
+    });
+
+    await expect(
+      handleWebhook(
+        ctx,
+        baseConfig(),
+        TOKEN,
+        baseInput({ parsedBody: baseEnvelope({ alerts: [alert] }) }),
+      ),
+    ).resolves.toBeUndefined();
+
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+    expect(mocks.state.set).not.toHaveBeenCalled();
+    expect(mocks.logger.error).toHaveBeenCalledWith(
+      expect.stringContaining("failed to record issue opt-out metric"),
+    );
+  });
 
   it("honors annotation opt-out when the label explicitly enables issue creation", async () => {
     const { ctx, mocks } = mkCtx();

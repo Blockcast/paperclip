@@ -321,10 +321,16 @@ export async function handleFiring(
     ctx.logger.info(
       `Alertmanager: ${alertname} is below the issue creation floor (severity=info)`,
     );
-    await ctx.metrics.write("alertmanager.webhook.below_issue_floor", 1, {
-      alertname,
-      severity: "info",
-    });
+    try {
+      await ctx.metrics.write("alertmanager.webhook.below_issue_floor", 1, {
+        alertname,
+        severity: "info",
+      });
+    } catch (metricErr) {
+      ctx.logger.error(
+        `paperclip-plugin-alertmanager: failed to record issue floor metric for ${alert.fingerprint}: ${String(metricErr)}`,
+      );
+    }
     return;
   }
 
@@ -747,9 +753,15 @@ export async function handleWebhook(
         ctx.logger.info(
           `Alertmanager: ${alertname} opted out via paperclip_issue=false`,
         );
-        await ctx.metrics.write("alertmanager.webhook.issue_opt_out", 1, {
-          alertname,
-        });
+        try {
+          await ctx.metrics.write("alertmanager.webhook.issue_opt_out", 1, {
+            alertname,
+          });
+        } catch (metricErr) {
+          ctx.logger.error(
+            `paperclip-plugin-alertmanager: failed to record issue opt-out metric for ${alert.fingerprint}: ${String(metricErr)}`,
+          );
+        }
         continue;
       }
       if (status === "firing") {
