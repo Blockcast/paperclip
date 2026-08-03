@@ -23,7 +23,7 @@
  * because it was the only candidate in the queue.
  */
 import { randomUUID } from "node:crypto";
-import { eq, inArray } from "drizzle-orm";
+import { eq, inArray, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
@@ -2227,18 +2227,20 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
   }, 120_000);
 
   it.each([
-    { lane: "critical", resumeReason: "resume_critical_lane" },
-    { lane: "recovery", resumeReason: "resume_recovery_lane" },
+    { lane: "critical" },
+    { lane: "recovery" },
   ] as const)(
     "resumes the $lane lane past an external slot claim refusal",
-    async ({ lane, resumeReason }) => {
+    async ({ lane }) => {
       const companyId = randomUUID();
       const agentId = randomUUID();
       const staleSlotRunId = randomUUID();
       const refusedIssueId = randomUUID();
+      const olderEmergencyIssueId = randomUUID();
       const ordinaryIssueId = randomUUID();
       const deeperIssueId = randomUUID();
       const refusedRunId = randomUUID();
+      const olderEmergencyRunId = randomUUID();
       const ordinaryRunId = randomUUID();
       const deeperRunId = randomUUID();
       const issuePrefix = `S${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
@@ -2247,9 +2249,12 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
 
       const boundedHeartbeat = heartbeatService(db, {
         penstockGate: allowPenstockGate,
-        queuedRunDispatchBounds: { scanLimit: 1, maxScanBatches: 1, maxResumePasses: 5 },
+        queuedRunDispatchBounds: { scanLimit: 4, maxScanBatches: 1, maxResumePasses: 5 },
         afterQueuedDispatchContinuationScheduledForTest: async (event) => {
-          if (event.reason !== resumeReason || releasedStaleSlot) return;
+          if (
+            (event.reason !== "resume_critical_lane" && event.reason !== "resume_recovery_lane")
+            || releasedStaleSlot
+          ) return;
           releasedStaleSlot = true;
           await db
             .update(externalRuntimeReservations)
@@ -2287,11 +2292,21 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
           id: refusedIssueId,
           companyId,
           title: `Slot-refused ${lane} work`,
-          status: "todo",
-          priority: lane === "critical" ? "critical" : "medium",
+          status: "in_progress",
+          priority: "critical",
           assigneeAgentId: agentId,
           issueNumber: 1,
           identifier: `${issuePrefix}-1`,
+        },
+        {
+          id: olderEmergencyIssueId,
+          companyId,
+          title: "Older lower-ranked critical work",
+          status: "todo",
+          priority: "critical",
+          assigneeAgentId: agentId,
+          issueNumber: 2,
+          identifier: `${issuePrefix}-2`,
         },
         {
           id: ordinaryIssueId,
@@ -2300,8 +2315,8 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
           status: "todo",
           priority: "low",
           assigneeAgentId: agentId,
-          issueNumber: 2,
-          identifier: `${issuePrefix}-2`,
+          issueNumber: 3,
+          identifier: `${issuePrefix}-3`,
         },
         {
           id: deeperIssueId,
@@ -2310,8 +2325,8 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
           status: "todo",
           priority: lane === "critical" ? "critical" : "medium",
           assigneeAgentId: agentId,
-          issueNumber: 3,
-          identifier: `${issuePrefix}-3`,
+          issueNumber: 4,
+          identifier: `${issuePrefix}-4`,
         },
       ]);
 
@@ -2347,9 +2362,10 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
       });
 
       const queued = [
-        { runId: refusedRunId, issueId: refusedIssueId, offset: 0, emergency: true },
-        { runId: ordinaryRunId, issueId: ordinaryIssueId, offset: 1, emergency: false },
-        { runId: deeperRunId, issueId: deeperIssueId, offset: 2, emergency: true },
+        { runId: olderEmergencyRunId, issueId: olderEmergencyIssueId, offset: 0, emergency: false },
+        { runId: refusedRunId, issueId: refusedIssueId, offset: 1, emergency: true },
+        { runId: ordinaryRunId, issueId: ordinaryIssueId, offset: 2, emergency: false },
+        { runId: deeperRunId, issueId: deeperIssueId, offset: 3, emergency: true },
       ];
       for (const { runId, issueId, offset, emergency } of queued) {
         const wakeId = randomUUID();
@@ -2404,15 +2420,151 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
       });
 
       await boundedHeartbeat.resumeQueuedRuns();
+      await waitForRunToSettle(boundedHeartbeat, olderEmergencyRunId, 60_000);
       await waitForRunToSettle(boundedHeartbeat, deeperRunId, 60_000);
 
       expect(releasedStaleSlot).toBe(true);
-      expect(dispatchedRunIds[0]).toBe(deeperRunId);
+      expect(dispatchedRunIds[0]).toBe(olderEmergencyRunId);
+      expect((await boundedHeartbeat.getRun(olderEmergencyRunId))?.status).not.toBe("queued");
       expect((await boundedHeartbeat.getRun(deeperRunId))?.status).not.toBe("queued");
       await boundedHeartbeat.drainInFlightExecutions(60_000);
     },
     180_000,
   );
+
+  it("advances emergency keysets past default-generated sub-millisecond timestamps", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const blockerIssueId = randomUUID();
+    const blockedIssueId = randomUUID();
+    const runnableIssueId = randomUUID();
+    const blockedRunId = randomUUID();
+    const runnableRunId = randomUUID();
+    const blockedWakeId = randomUUID();
+    const runnableWakeId = randomUUID();
+    const issuePrefix = `U${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const cursorEvents: string[] = [];
+    const boundedHeartbeat = heartbeatService(db, {
+      penstockGate: allowPenstockGate,
+      queuedRunDispatchBounds: { scanLimit: 1, maxScanBatches: 1, maxResumePasses: 5 },
+      onQueuedDispatchScheduledForTest: ({ reason }) => cursorEvents.push(reason),
+    });
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "SubmillisecondCursorCo",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "SubmillisecondCursorAgent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    await db.insert(issues).values([
+      {
+        id: blockerIssueId,
+        companyId,
+        title: "Unresolved blocker",
+        status: "in_progress",
+        priority: "critical",
+        assigneeAgentId: agentId,
+        issueNumber: 1,
+        identifier: `${issuePrefix}-1`,
+      },
+      {
+        id: blockedIssueId,
+        companyId,
+        title: "Blocked critical head",
+        status: "todo",
+        priority: "critical",
+        assigneeAgentId: agentId,
+        issueNumber: 2,
+        identifier: `${issuePrefix}-2`,
+      },
+      {
+        id: runnableIssueId,
+        companyId,
+        title: "Runnable critical tail",
+        status: "todo",
+        priority: "critical",
+        assigneeAgentId: agentId,
+        issueNumber: 3,
+        identifier: `${issuePrefix}-3`,
+      },
+    ]);
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerIssueId,
+      relatedIssueId: blockedIssueId,
+      type: "blocks",
+    });
+
+    await db.insert(agentWakeupRequests).values({
+      id: blockedWakeId,
+      companyId,
+      agentId,
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId: blockedIssueId },
+      status: "queued",
+      runId: blockedRunId,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: blockedRunId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "queued",
+      wakeupRequestId: blockedWakeId,
+      contextSnapshot: { issueId: blockedIssueId, wakeReason: "issue_assigned" },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 2));
+    await db.insert(agentWakeupRequests).values({
+      id: runnableWakeId,
+      companyId,
+      agentId,
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId: runnableIssueId },
+      status: "queued",
+      runId: runnableRunId,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runnableRunId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "queued",
+      wakeupRequestId: runnableWakeId,
+      contextSnapshot: { issueId: runnableIssueId, wakeReason: "issue_assigned" },
+    });
+
+    const timestampRows = await db.execute(sql<{ createdAtText: string }>`
+      select created_at::text as "createdAtText"
+      from ${heartbeatRuns}
+      where id = ${blockedRunId}::uuid
+    `);
+    expect(timestampRows[0]?.createdAtText).toMatch(/\.\d{4,}/);
+
+    await boundedHeartbeat.resumeQueuedRuns();
+    const runnableRun = await waitForRunToSettle(boundedHeartbeat, runnableRunId, 60_000);
+
+    expect(cursorEvents).toContain("resume_critical_lane");
+    expect(runnableRun?.status).not.toBe("queued");
+    await boundedHeartbeat.drainInFlightExecutions(60_000);
+  }, 120_000);
 
   it("skips malformed persisted issue ids in UUID batch lookups", async () => {
     const companyId = randomUUID();

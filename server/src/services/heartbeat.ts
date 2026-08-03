@@ -17862,21 +17862,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * deeper than one pass may read. See the scan loop for why this has to
    * survive across passes.
    */
+  type DispatchCursor = { createdAt: string; id: string };
+  type DispatchRun = typeof heartbeatRuns.$inferSelect & {
+    dispatchCreatedAtCursor: string;
+  };
+  const dispatchRunSelection = {
+    ...getTableColumns(heartbeatRuns),
+    dispatchCreatedAtCursor: sql<string>`${heartbeatRuns.createdAt}::text`.as(
+      "dispatch_created_at_cursor",
+    ),
+  } as const;
   const dispatchResumeCursorByAgent = new Map<
     string,
-    { createdAt: Date; id: string; passes: number }
+    DispatchCursor & { passes: number }
   >();
   const dispatchHeadRescanDemandByAgent = new Set<string>();
-  const dispatchCriticalLaneCursorByAgent = new Map<
-    string,
-    { createdAt: Date; id: string }
-  >();
+  const dispatchCriticalLaneCursorByAgent = new Map<string, DispatchCursor>();
   const dispatchCriticalLaneHeadRescanDemandByAgent = new Set<string>();
-  const dispatchRecoveryLaneCursorByAgent = new Map<
-    string,
-    { createdAt: Date; id: string }
-  >();
+  const dispatchRecoveryLaneCursorByAgent = new Map<string, DispatchCursor>();
   const dispatchRecoveryLaneHeadRescanDemandByAgent = new Set<string>();
+  const dispatchDeferredRunIdsByAgent = new Map<string, Set<string>>();
   const dispatchResumeCapRetryTimersByAgent = new Map<string, ReturnType<typeof setTimeout>>();
 
   /** Run one more dispatch pass for `agentId`, detached from this critical section. */
@@ -18113,7 +18118,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // ceiling throttles how much one pass reads instead of capping how far
       // into the queue dispatch can ever see.
       const resumeState = dispatchResumeCursorByAgent.get(agentId) ?? null;
-      let scanCursor: { createdAt: Date; id: string } | null = resumeState
+      const deferredRunIds = dispatchDeferredRunIdsByAgent.get(agentId) ?? null;
+      let scanCursor: DispatchCursor | null = resumeState
         ? { createdAt: resumeState.createdAt, id: resumeState.id }
         : null;
       let scannedBatches = 0;
@@ -18124,8 +18130,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // Annotated rather than inferred: `scanCursor` is assigned from this
         // batch's last row, so control-flow analysis would otherwise chase
         // `batch` -> `scanCursor` -> `batch` and give up with an implicit any.
-        const batch: Array<typeof heartbeatRuns.$inferSelect> = await db
-          .select()
+        const batch: DispatchRun[] = await db
+          .select(dispatchRunSelection)
           .from(heartbeatRuns)
           .where(and(
             eq(heartbeatRuns.agentId, agentId),
@@ -18141,7 +18147,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             // `sql` template there is no column mapper, and postgres-js rejects
             // a bare Date at bind time.
             scanCursor
-              ? sql`(${heartbeatRuns.createdAt}, ${heartbeatRuns.id}) > (${scanCursor.createdAt.toISOString()}::timestamptz, ${scanCursor.id}::uuid)`
+              ? sql`(${heartbeatRuns.createdAt}, ${heartbeatRuns.id}) > (${scanCursor.createdAt}::timestamptz, ${scanCursor.id}::uuid)`
+              : undefined,
+            deferredRunIds?.size
+              ? notInArray(heartbeatRuns.id, [...deferredRunIds])
               : undefined,
           ))
           .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
@@ -18151,7 +18160,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           break;
         }
         const lastScannedRun = batch[batch.length - 1]!;
-        scanCursor = { createdAt: lastScannedRun.createdAt, id: lastScannedRun.id };
+        scanCursor = {
+          createdAt: lastScannedRun.dispatchCreatedAtCursor,
+          id: lastScannedRun.id,
+        };
         if (batch.length < queuedRunDispatchScanLimit) scanExhausted = true;
 
         const batchIssueIds = [...new Set(
@@ -18223,16 +18235,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       const queuedRunIds = new Set(queuedRuns.map((run) => run.id));
       type EmergencyLaneCursors = {
-        critical?: { createdAt: Date; id: string };
-        recovery?: { createdAt: Date; id: string };
+        critical?: DispatchCursor | null;
+        recovery?: DispatchCursor | null;
       };
       const emergencyLaneCursorsByRunId = new Map<string, EmergencyLaneCursors>();
       const markEmergencyLaneRun = (
         run: typeof heartbeatRuns.$inferSelect,
         lane: keyof EmergencyLaneCursors,
+        resumeAfter: DispatchCursor | null,
       ) => {
         const lanes = emergencyLaneCursorsByRunId.get(run.id) ?? {};
-        lanes[lane] = { createdAt: run.createdAt, id: run.id };
+        lanes[lane] = resumeAfter;
         emergencyLaneCursorsByRunId.set(run.id, lanes);
       };
       /**
@@ -18298,15 +18311,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // critical rows hide a newer runnable critical row forever.
       while (criticalLaneBatches < queuedRunDispatchMaxScanBatches) {
         criticalLaneBatches += 1;
+        const batchStartCursor = criticalLaneCursor;
         const batch = await db
-          .select()
+          .select(dispatchRunSelection)
           .from(heartbeatRuns)
           .where(and(
             eq(heartbeatRuns.agentId, agentId),
             sql`${heartbeatRuns.status} = 'queued'`,
             cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined,
             criticalLaneCursor
-              ? sql`(${heartbeatRuns.createdAt}, ${heartbeatRuns.id}) > (${criticalLaneCursor.createdAt.toISOString()}::timestamptz, ${criticalLaneCursor.id}::uuid)`
+              ? sql`(${heartbeatRuns.createdAt}, ${heartbeatRuns.id}) > (${criticalLaneCursor.createdAt}::timestamptz, ${criticalLaneCursor.id}::uuid)`
+              : undefined,
+            deferredRunIds?.size
+              ? notInArray(heartbeatRuns.id, [...deferredRunIds])
               : undefined,
           ))
           .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
@@ -18318,7 +18335,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
         const lastCritical = batch[batch.length - 1]!;
         criticalLaneCursor = {
-          createdAt: lastCritical.createdAt,
+          createdAt: lastCritical.dispatchCreatedAtCursor,
           id: lastCritical.id,
         };
         if (batch.length < queuedRunDispatchScanLimit) criticalLaneExhausted = true;
@@ -18349,6 +18366,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           const issue = issueId ? criticalIssueById.get(issueId) : null;
           return issue ? [{ run, issue }] : [];
         });
+        for (const { run } of criticalBatch) {
+          markEmergencyLaneRun(run, "critical", batchStartCursor);
+        }
         criticalLaneRows.push(...criticalBatch);
 
         const criticalRuns = criticalBatch.map(({ run }) => run);
@@ -18409,8 +18429,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       while (recoveryLaneBatches < queuedRunDispatchMaxScanBatches) {
         recoveryLaneBatches += 1;
+        const batchStartCursor = recoveryLaneCursor;
         const batch = await db
-          .select()
+          .select(dispatchRunSelection)
           .from(heartbeatRuns)
           .where(and(
             eq(heartbeatRuns.agentId, agentId),
@@ -18419,7 +18440,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             sql`${heartbeatRuns.contextSnapshot} ->> 'source' = 'issue_recovery_action'`,
             sql`${heartbeatRuns.contextSnapshot} ->> 'recoveryActionId' is not null`,
             recoveryLaneCursor
-              ? sql`(${heartbeatRuns.createdAt}, ${heartbeatRuns.id}) > (${recoveryLaneCursor.createdAt.toISOString()}::timestamptz, ${recoveryLaneCursor.id}::uuid)`
+              ? sql`(${heartbeatRuns.createdAt}, ${heartbeatRuns.id}) > (${recoveryLaneCursor.createdAt}::timestamptz, ${recoveryLaneCursor.id}::uuid)`
+              : undefined,
+            deferredRunIds?.size
+              ? notInArray(heartbeatRuns.id, [...deferredRunIds])
               : undefined,
           ))
           .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
@@ -18429,7 +18453,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           break;
         }
         const lastRun = batch[batch.length - 1]!;
-        recoveryLaneCursor = { createdAt: lastRun.createdAt, id: lastRun.id };
+        recoveryLaneCursor = {
+          createdAt: lastRun.dispatchCreatedAtCursor,
+          id: lastRun.id,
+        };
         if (batch.length < queuedRunDispatchScanLimit) recoveryLaneExhausted = true;
 
         const issueIdsToLoad = new Set<string>();
@@ -18455,6 +18482,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           return Boolean(issue && !TERMINAL_ISSUE_STATUSES.has(issue.status));
         });
         recoveryLaneRows.push(...candidates);
+        for (const run of candidates) {
+          markEmergencyLaneRun(run, "recovery", batchStartCursor);
+        }
         const batchReadiness = await listQueuedRunDependencyReadiness(agent.companyId, candidates);
         for (const [issueId, readiness] of batchReadiness) dependencyReadiness.set(issueId, readiness);
         foundReadyRecovery = candidates.some((run) => {
@@ -18497,7 +18527,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
       for (const { run, issue } of criticalLaneRows) {
         issueById.set(issue.id, issue);
-        markEmergencyLaneRun(run, "critical");
         admitToPriorityLane(run);
       }
       for (const run of recoveryLaneRows) {
@@ -18506,7 +18535,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // inner join dropped those too; the claim-time gate still handles them.
         const issue = issueId ? issueById.get(issueId) : null;
         if (!issue || TERMINAL_ISSUE_STATUSES.has(issue.status)) continue;
-        markEmergencyLaneRun(run, "recovery");
         admitToPriorityLane(run);
       }
       if (priorityLaneRuns.length > 0) {
@@ -18616,9 +18644,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
 
       /** Settle this pass's continuation bookkeeping exactly once. */
-      const finishPassWithoutClaims = () => {
-        if (advanceOrClearResumeCursor(0)) return;
+      const finishPassWithoutClaims = (): boolean => {
+        if (advanceOrClearResumeCursor(0)) return true;
         scheduleFollowUpDispatchAfterPrune(agentId, prunedTerminalIssueRuns);
+        return prunedTerminalIssueRuns > 0;
       };
       if (prunedTerminalIssueRuns > 0) {
         logger.info(
@@ -18627,7 +18656,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         );
       }
       if (queuedRuns.length === 0) {
-        finishPassWithoutClaims();
+        if (!finishPassWithoutClaims()) dispatchDeferredRunIdsByAgent.delete(agentId);
         return [];
       }
 
@@ -18799,31 +18828,44 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
         // A dependency-ready emergency row can still fail atomic admission
         // without leaving the queue, e.g. an external-runtime slot conflict.
-        // Resume all dispatch scans past that row so the follow-up cannot
-        // rediscover the same refused head candidate and hide deeper emergency
-        // work behind it again.
-        dispatchResumeCursorByAgent.set(agentId, {
-          createdAt: run.createdAt,
-          id: run.id,
-          passes: resumeState?.passes ?? 0,
-        });
-        if (laneCursors.critical) {
-          dispatchCriticalLaneCursorByAgent.set(agentId, laneCursors.critical);
+        // Re-read from the boundary before the page containing this candidate.
+        // Dispatch ranking is intentionally independent of keyset order, so
+        // advancing to the refused run itself could skip older, lower-ranked
+        // emergency work from the same page. Exclude only the refused row while
+        // this continuation chain looks for another claim.
+        const refusedRunIds = dispatchDeferredRunIdsByAgent.get(agentId) ?? new Set<string>();
+        refusedRunIds.add(run.id);
+        dispatchDeferredRunIdsByAgent.set(agentId, refusedRunIds);
+        if (resumeState) {
+          dispatchResumeCursorByAgent.set(agentId, resumeState);
+        } else {
+          dispatchResumeCursorByAgent.delete(agentId);
+        }
+        if (Object.hasOwn(laneCursors, "critical")) {
+          if (laneCursors.critical) {
+            dispatchCriticalLaneCursorByAgent.set(agentId, laneCursors.critical);
+          } else {
+            dispatchCriticalLaneCursorByAgent.delete(agentId);
+          }
           scheduleDetachedDispatchPass(agentId, "resume_critical_lane");
           await options.afterQueuedDispatchContinuationScheduledForTest?.({
             agentId,
             reason: "resume_critical_lane",
           });
         }
-        if (laneCursors.recovery) {
-          dispatchRecoveryLaneCursorByAgent.set(agentId, laneCursors.recovery);
+        if (Object.hasOwn(laneCursors, "recovery")) {
+          if (laneCursors.recovery) {
+            dispatchRecoveryLaneCursorByAgent.set(agentId, laneCursors.recovery);
+          } else {
+            dispatchRecoveryLaneCursorByAgent.delete(agentId);
+          }
           scheduleDetachedDispatchPass(agentId, "resume_recovery_lane");
           await options.afterQueuedDispatchContinuationScheduledForTest?.({
             agentId,
             reason: "resume_recovery_lane",
           });
         }
-        return Boolean(laneCursors.critical || laneCursors.recovery);
+        return Object.hasOwn(laneCursors, "critical") || Object.hasOwn(laneCursors, "recovery");
       };
       const launchClaimedRuns = () => {
         for (const claimedRun of claimedRuns) {
@@ -18878,7 +18920,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         return claimedRuns;
       }
       if (claimedRuns.length === 0) {
-        finishPassWithoutClaims();
+        if (!finishPassWithoutClaims()) dispatchDeferredRunIdsByAgent.delete(agentId);
         return [];
       }
       // Settle continuation bookkeeping for a pass that DID claim. A pass that
@@ -18886,6 +18928,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // re-triggers dispatch. A pass that filled only some of them schedules a
       // cursor continuation instead; see advanceOrClearResumeCursor.
       advanceOrClearResumeCursor(claimedRuns.length);
+      dispatchDeferredRunIdsByAgent.delete(agentId);
       launchClaimedRuns();
       return claimedRuns;
     }, {
