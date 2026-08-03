@@ -222,6 +222,41 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
     });
   });
 
+  it("clamps inherited legacy external concurrency while rejecting explicit over-cap requests", async () => {
+    const companyId = await seedCompany();
+    const service = agentService(db);
+
+    const externalId = await seedAgentRow(companyId, {
+      name: "Legacy Default External",
+      adapterType: "opencode_k8s",
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 20, wakeOnDemand: false } },
+    });
+    const updated = await service.update(externalId, {
+      runtimeConfig: { heartbeat: { wakeOnDemand: true } },
+    });
+    expect(updated).toMatchObject({
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 16, wakeOnDemand: true } },
+    });
+    await expect(service.update(externalId, {
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 20 } },
+    })).rejects.toMatchObject({ status: 422 });
+
+    const pendingId = await seedAgentRow(companyId, {
+      name: "Legacy Default Pending External",
+      status: "pending_approval",
+      adapterType: "opencode_k8s",
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 20 } },
+    });
+    await expect(service.activatePendingApproval(pendingId, {
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 20 } },
+    })).resolves.toMatchObject({
+      activated: true,
+      agent: {
+        runtimeConfig: { heartbeat: { maxConcurrentRuns: 16 } },
+      },
+    });
+  });
+
   it("validates external-lifecycle concurrency against the locked row after concurrent updates", async () => {
     const companyId = await seedCompany();
     const agentId = await seedAgentRow(companyId, {

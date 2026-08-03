@@ -204,6 +204,17 @@ function parseFiniteNumberLike(value: unknown): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function heartbeatMaxConcurrentRuns(runtimeConfig: unknown): number | null {
+  if (!isPlainRecord(runtimeConfig) || !isPlainRecord(runtimeConfig.heartbeat)) return null;
+  return parseFiniteNumberLike(runtimeConfig.heartbeat.maxConcurrentRuns);
+}
+
+function requestsHeartbeatMaxConcurrentRuns(runtimeConfig: unknown): boolean {
+  return isPlainRecord(runtimeConfig)
+    && isPlainRecord(runtimeConfig.heartbeat)
+    && Object.prototype.hasOwnProperty.call(runtimeConfig.heartbeat, "maxConcurrentRuns");
+}
+
 function assertExternalLifecycleConcurrencyPolicy(adapterType: string, runtimeConfig: unknown) {
   if (!EXTERNAL_LIFECYCLE_ADAPTER_TYPE_SET.has(adapterType)) return;
   const heartbeat = isPlainRecord(runtimeConfig) && isPlainRecord(runtimeConfig.heartbeat)
@@ -220,6 +231,7 @@ function assertExternalLifecycleConcurrencyPolicy(adapterType: string, runtimeCo
 function normalizeExternalLifecycleRuntimeConfig(
   adapterType: string,
   runtimeConfig: unknown,
+  options?: { clampInheritedLegacyConcurrency?: boolean },
 ): Record<string, unknown> {
   const normalizedRuntimeConfig = isPlainRecord(runtimeConfig) ? { ...runtimeConfig } : {};
   if (!EXTERNAL_LIFECYCLE_ADAPTER_TYPE_SET.has(adapterType)) {
@@ -229,7 +241,13 @@ function normalizeExternalLifecycleRuntimeConfig(
   const heartbeat = isPlainRecord(normalizedRuntimeConfig.heartbeat)
     ? { ...normalizedRuntimeConfig.heartbeat }
     : {};
-  if (parseFiniteNumberLike(heartbeat.maxConcurrentRuns) == null) {
+  const maxConcurrentRuns = parseFiniteNumberLike(heartbeat.maxConcurrentRuns);
+  if (maxConcurrentRuns == null) {
+    heartbeat.maxConcurrentRuns = EXTERNAL_LIFECYCLE_MAX_CONCURRENT_RUNS;
+  } else if (
+    maxConcurrentRuns > EXTERNAL_LIFECYCLE_MAX_CONCURRENT_RUNS
+    && options?.clampInheritedLegacyConcurrency
+  ) {
     heartbeat.maxConcurrentRuns = EXTERNAL_LIFECYCLE_MAX_CONCURRENT_RUNS;
   }
   normalizedRuntimeConfig.heartbeat = heartbeat;
@@ -672,11 +690,20 @@ export function agentService(db: Db) {
         || Object.prototype.hasOwnProperty.call(txPatch, "runtimeConfig")
       ) {
         const nextAdapterType = (txPatch.adapterType ?? locked.adapterType) as string;
+        const requestedRuntimeConfig = Object.prototype.hasOwnProperty.call(txPatch, "runtimeConfig")
+          ? txPatch.runtimeConfig
+          : undefined;
         txPatch.runtimeConfig = normalizeExternalLifecycleRuntimeConfig(
           nextAdapterType,
-          Object.prototype.hasOwnProperty.call(txPatch, "runtimeConfig")
-            ? mergeRuntimeConfigPatch(locked.runtimeConfig, txPatch.runtimeConfig)
+          requestedRuntimeConfig !== undefined
+            ? mergeRuntimeConfigPatch(locked.runtimeConfig, requestedRuntimeConfig)
             : locked.runtimeConfig,
+          {
+            clampInheritedLegacyConcurrency:
+              EXTERNAL_LIFECYCLE_ADAPTER_TYPE_SET.has(locked.adapterType)
+              && EXTERNAL_LIFECYCLE_ADAPTER_TYPE_SET.has(nextAdapterType)
+              && !requestsHeartbeatMaxConcurrentRuns(requestedRuntimeConfig),
+          },
         );
       }
 
@@ -963,13 +990,23 @@ export function agentService(db: Db) {
           ? requestedSnapshot.runtimeConfig
           : null;
         const approvedRuntimeConfig = isPlainRecord(patch.runtimeConfig) ? patch.runtimeConfig : null;
+        const candidateRuntimeConfig = approvedRuntimeConfig
+          ? requestedRuntimeConfig
+            ? mergeApprovedRuntimeConfig(existing.runtimeConfig, requestedRuntimeConfig, approvedRuntimeConfig)
+            : approvedRuntimeConfig
+          : existing.runtimeConfig;
+        const existingMaxConcurrentRuns = heartbeatMaxConcurrentRuns(existing.runtimeConfig);
         const normalizedRuntimeConfig = normalizeExternalLifecycleRuntimeConfig(
           nextAdapterType,
-          approvedRuntimeConfig
-            ? requestedRuntimeConfig
-              ? mergeApprovedRuntimeConfig(existing.runtimeConfig, requestedRuntimeConfig, approvedRuntimeConfig)
-              : approvedRuntimeConfig
-            : existing.runtimeConfig,
+          candidateRuntimeConfig,
+          {
+            clampInheritedLegacyConcurrency:
+              EXTERNAL_LIFECYCLE_ADAPTER_TYPE_SET.has(existing.adapterType)
+              && EXTERNAL_LIFECYCLE_ADAPTER_TYPE_SET.has(nextAdapterType)
+              && existingMaxConcurrentRuns !== null
+              && existingMaxConcurrentRuns > EXTERNAL_LIFECYCLE_MAX_CONCURRENT_RUNS
+              && existingMaxConcurrentRuns === heartbeatMaxConcurrentRuns(candidateRuntimeConfig),
+          },
         );
         if (
           Object.prototype.hasOwnProperty.call(patch, "runtimeConfig")
