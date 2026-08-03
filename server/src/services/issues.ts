@@ -4597,6 +4597,29 @@ function isAlertEscalationCoverDedupConflict(error: unknown): boolean {
   return false;
 }
 
+function isAlertmanagerAggregateCreationConflict(error: unknown): boolean {
+  const seen = new Set<unknown>();
+  let current = error;
+  while (current && typeof current === "object" && !seen.has(current)) {
+    seen.add(current);
+    const maybe = current as {
+      code?: string;
+      constraint?: string;
+      constraint_name?: string;
+      cause?: unknown;
+    };
+    const constraint = maybe.constraint ?? maybe.constraint_name;
+    if (
+      maybe.code === "23505" &&
+      constraint === "issues_active_alertmanager_aggregate_creation_uq"
+    ) {
+      return true;
+    }
+    current = maybe.cause;
+  }
+  return false;
+}
+
 export function issueService(db: Db) {
   const instanceSettings = instanceSettingsService(db);
   const treeControlSvc = issueTreeControlService(db);
@@ -8346,6 +8369,12 @@ export function issueService(db: Db) {
           // alertmanager plugin can distinguish "I lost the race" from a
           // real failure and attach itself to the winning cover instead.
           throw conflict("Alert escalation cover conflict", {
+            companyId,
+            originFingerprint: issueData.originFingerprint,
+          });
+        }
+        if (isAlertmanagerAggregateCreationConflict(err)) {
+          throw conflict("Alertmanager aggregate creation conflict", {
             companyId,
             originFingerprint: issueData.originFingerprint,
           });

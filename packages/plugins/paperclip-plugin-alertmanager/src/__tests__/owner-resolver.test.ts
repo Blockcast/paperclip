@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   resolveAssigneeUserId,
+  resolveFallbackAgentId,
   resolveOwnerEmail,
   resolveOwnerUserId,
 } from "../owner-resolver.js";
@@ -363,6 +364,46 @@ describe("resolveOwnerUserId — caching behaviour", () => {
     expect(await resolveOwnerUserId(ctx, "   ")).toBeUndefined();
     expect(state.get).not.toHaveBeenCalled();
     expect(users.findByEmail).not.toHaveBeenCalled();
+  });
+});
+
+describe("resolveFallbackAgentId", () => {
+  it("finds one exact named agent from an unwindowed company snapshot", async () => {
+    const agents = {
+      list: vi.fn(async () => [
+        { id: "agent-1", name: "Other Agent" },
+        { id: "agent-fallback", name: " Alert Fallback " },
+      ]),
+    };
+    const logger = { warn: vi.fn() };
+
+    await expect(
+      resolveFallbackAgentId(
+        { agents, logger } as unknown as Parameters<typeof resolveFallbackAgentId>[0],
+        "company-1",
+        "alert fallback",
+      ),
+    ).resolves.toBe("agent-fallback");
+    expect(agents.list).toHaveBeenCalledWith({ companyId: "company-1" });
+  });
+
+  it("fails closed when the exact name is missing or ambiguous", async () => {
+    const agents = {
+      list: vi.fn(async () => [
+        { id: "agent-1", name: "Alert Fallback" },
+        { id: "agent-2", name: "alert fallback" },
+      ]),
+    };
+    const logger = { warn: vi.fn() };
+    const ctx = { agents, logger } as unknown as Parameters<typeof resolveFallbackAgentId>[0];
+
+    await expect(
+      resolveFallbackAgentId(ctx, "company-1", "Alert Fallback"),
+    ).resolves.toBeUndefined();
+    await expect(
+      resolveFallbackAgentId(ctx, "company-1", "Missing Agent"),
+    ).resolves.toBeUndefined();
+    expect(logger.warn).toHaveBeenCalledTimes(2);
   });
 });
 

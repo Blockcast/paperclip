@@ -17,6 +17,14 @@ See `docs/specs/2026-04-29-alertmanager-plugin-spec.md` for the full design.
   delivery (constant-time compare).
 - Parses the AM v2 envelope, drops malformed / unsupported-version payloads
   with a 200 (so AM doesn't retry-storm).
+- Drops firing `severity=info` alerts before issue or state mutation and honors
+  `paperclip_issue: "false"` at every severity.
+- Assigns the configured exact `fallbackAgentName` when owner and issue-route
+  resolution find nobody. Missing or ambiguous fallback configuration fails
+  closed instead of creating an ownerless issue.
+- Deduplicates open issue creation by alertname and optional
+  `paperclip_dedupe_domain`. A database unique index makes concurrent first
+  deliveries attach to one winner.
 - Deduplicates by `alert.fingerprint` per spec §5.3 — re-fires bump the
   state row and refresh the issue body, they don't create a second issue.
 - Re-opens issues the plugin auto-cancelled on resolve when the same
@@ -58,6 +66,7 @@ Configured per-instance via the host's plugin settings UI. Schema lives in
 | `severityToPriority` | object  | no       | Override the default severity map. |
 | `autoCloseOnResolve` | boolean | no       | Defaults to true (status → cancelled). Set false for comment-only. |
 | `ownerMap`           | object  | no       | `{ <labelKey>: { <labelValue>: <email> } }`. |
+| `fallbackAgentName`  | string  | conditionally | Exact agent name used when no mapped owner or issue route resolves. Ownerless creation is refused if this is missing or ambiguous. |
 | `issueRouteMap`      | object  | no       | `{ <labelKey>: { <labelValue>: { projectId, goalId, assigneeAgentId, status } } }`. |
 
 ### Example `AlertmanagerConfig` YAML
@@ -102,6 +111,7 @@ ownerMap:
   team:
     platform:   alice@blockcast.net
     networking: ned@blockcast.net
+fallbackAgentName: Alert Triage
 issueRouteMap:
   class:
     physical_infra_proxmox:
@@ -162,7 +172,10 @@ First hit wins:
 1. `alert.labels.paperclip_assignee_email`
 2. `ownerMap[<label>][<value>]` matched against `alert.labels`
 3. `alert.annotations.paperclip_assignee_email`
-4. unassigned
+4. the exact configured `fallbackAgentName`
+
+If no mapped user, issue-route assignee, or unique fallback agent resolves, the
+delivery emits `alertmanager.owner.fallback_failed` and creates no issue.
 
 Resolved emails are looked up against `ctx.users.findByEmail` and cached
 per email in plugin state (`owner-by-email:<email>`). Negative results are
@@ -176,6 +189,34 @@ cached too (empty string) so a missing user doesn't cause repeated lookups.
 | warning  | high     |
 | info     | medium   |
 | (other)  | medium   |
+
+`info` remains explicit for compatibility, but the firing creation floor runs
+first, so it creates no new issue. Accepted `critical`, `warning`, and custom
+severities continue through this mapping.
+
+### Aggregate creation identity
+
+The canonical creation key is
+`alert-aggregate:v1:[<alertname>,<paperclip_dedupe_domain-or-null>]` and is
+stored in `originFingerprint`. Without an explicit domain, distinct label sets
+for one alertname converge on one open issue. Set `paperclip_dedupe_domain` as a
+label or annotation when a rule intentionally needs separate resource domains.
+
+The host enforces one open row per company and aggregate key with
+`issues_active_alertmanager_aggregate_creation_uq`. A concurrent loser reads the
+winning issue, points its normal per-fingerprint state at that issue, and emits
+`alertmanager.aggregate.joined`. This is creation-only dedupe: existing
+resolution, close, and same-fingerprint re-fire behavior is unchanged. The
+lifecycle half will define shared-member resolution and aggregate reopen rules.
+
+### Channel precision policy
+
+The target is at least 70% actionable issues, measured as a 14-day cancellation
+rate at or below 30%. The pre-change baseline from
+[BLO-20576](/BLO/issues/BLO-20576) is 73.6% cancelled. If the first 14-day
+cohort remains above 36.8% cancelled, opt the noisiest rules out with
+`paperclip_issue: "false"`, recalibrate their thresholds and dedupe domains,
+and require a replay before restoring issue creation.
 
 ### Observability drill-in links
 

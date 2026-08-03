@@ -232,6 +232,7 @@ export const DEFAULT_CONFIG: AlertmanagerPluginConfig = {
   severityToPriority: DEFAULT_SEVERITY_TO_PRIORITY,
   autoCloseOnResolve: true,
   ownerMap: DEFAULT_OWNER_MAP,
+  fallbackAgentName: "",
   issueRouteMap: DEFAULT_ISSUE_ROUTE_MAP,
   escalationDeadlineMinutes: DEFAULT_ESCALATION_DEADLINE_MINUTES,
   coverDedupWindowMinutes: DEFAULT_COVER_DEDUP_WINDOW_MINUTES,

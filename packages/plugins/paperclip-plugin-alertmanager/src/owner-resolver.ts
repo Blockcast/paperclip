@@ -136,10 +136,30 @@ export async function resolveOwnerUserId(
   }
 }
 
+export async function resolveFallbackAgentId(
+  ctx: Pick<PluginContext, "agents" | "logger">,
+  companyId: string,
+  configuredName: string | undefined,
+): Promise<string | undefined> {
+  const nameKey = configuredName?.trim().toLowerCase();
+  if (!nameKey) return undefined;
+
+  const agents = await ctx.agents.list({ companyId });
+  const matches = agents.filter(
+    (agent) => agent.name.trim().toLowerCase() === nameKey,
+  );
+  if (matches.length === 1) return matches[0]?.id;
+
+  ctx.logger.warn(
+    `Fallback agent "${configuredName?.trim()}" resolved to ${matches.length} agents; refusing ownerless issue creation`,
+  );
+  return undefined;
+}
+
 /**
  * Combined helper: resolve email from alert → cached Paperclip user id.
- * Returns undefined when nothing matches; the caller should still create the
- * issue (unassigned) per §7.7 step 5.
+ * Returns undefined when nothing matches; the caller must resolve the named
+ * fallback agent before creating an issue.
  */
 export async function resolveAssigneeUserId(
   ctx: Pick<PluginContext, "users" | "state" | "logger">,

@@ -96,6 +96,8 @@ export interface AlertmanagerPluginConfig {
    * Per-instance owner map. e.g. `{ team: { platform: "alice@blockcast.net" }}`.
    */
   ownerMap?: OwnerMap;
+  /** Exact named agent used when owner and issue-route resolution produce no assignee. */
+  fallbackAgentName?: string;
   /**
    * Per-instance issue route map. Matches alert labels and applies project,
    * goal, status, and queue defaults to created issues.

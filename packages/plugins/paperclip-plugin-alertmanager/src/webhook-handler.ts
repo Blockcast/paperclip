@@ -23,7 +23,8 @@ import {
   severityToPriority,
 } from "./issue-mapping.js";
 import { resolveIssueRoute } from "./issue-route-resolver.js";
-import { resolveAssigneeUserId } from "./owner-resolver.js";
+import { resolveAssigneeUserId, resolveFallbackAgentId } from "./owner-resolver.js";
+import { aggregateKeyForAlert } from "./aggregate-key.js";
 import { escalationDeadlineMs, recordSourceResolvedAndCloseCovers } from "./escalation.js";
 import {
   ORIGIN_KIND,
@@ -60,6 +61,16 @@ export class AlertDeliveryIncompleteError extends Error {
     this.name = "AlertDeliveryIncompleteError";
     this.fingerprints = fingerprints;
   }
+}
+
+function isAggregateCreationConflict(err: unknown): boolean {
+  const message =
+    err instanceof Error
+      ? err.message
+      : typeof err === "object" && err !== null && typeof (err as { message?: unknown }).message === "string"
+        ? (err as { message: string }).message
+        : String(err);
+  return message.includes("Alertmanager aggregate creation conflict");
 }
 
 function nonEmptyString(value: string | null | undefined): string | undefined {
@@ -298,16 +309,35 @@ export async function handleFiring(
   const routeAssigneeUserId = routeHasAssigneeUserId
     ? nonEmptyString(issueRoute?.assigneeUserId ?? undefined)
     : undefined;
-  const createAssigneeAgentId = ownerOverride
+  let createAssigneeAgentId = ownerOverride
     ? assigneeAgentId
     : routeAssigneeAgentId ?? assigneeAgentId;
-  const createAssigneeUserId = createAssigneeAgentId
+  let createAssigneeUserId = createAssigneeAgentId
     ? undefined
     : ownerOverride
       ? assigneeUserId
       : routeHasAssigneeUserId
         ? routeAssigneeUserId
         : assigneeUserId;
+  if (!createAssigneeAgentId && !createAssigneeUserId) {
+    createAssigneeAgentId = await resolveFallbackAgentId(
+      ctx,
+      companyId,
+      config.fallbackAgentName,
+    );
+  }
+  if (!createAssigneeAgentId && !createAssigneeUserId) {
+    ctx.logger.warn(
+      `Cannot create issue for ${alertname}: fallbackAgentName is missing, invalid, or ambiguous`,
+    );
+    await ctx.metrics.write("alertmanager.owner.fallback_failed", 1, {
+      alertname,
+      severity,
+    });
+    throw new Error(
+      `Fallback owner resolution failed for ${alertname}; refusing ownerless issue creation`,
+    );
+  }
   const routeProjectId = nonEmptyString(issueRoute?.projectId);
   const routeGoalId = nonEmptyString(issueRoute?.goalId);
   const routeStatus = issueRoute?.status;
@@ -332,26 +362,51 @@ export async function handleFiring(
 
   const billingCode = alert.labels.billing_code ?? null;
 
-  const issue = await ctx.issues.create({
-    companyId,
-    title,
-    description,
-    priority,
-    originKind: ORIGIN_KIND,
-    originId: alert.fingerprint,
-    ...(routeProjectId ? { projectId: routeProjectId } : {}),
-    ...(routeGoalId ? { goalId: routeGoalId } : {}),
-    ...(routeStatus ? { status: routeStatus } : {}),
-    ...(createAssigneeUserId ? { assigneeUserId: createAssigneeUserId } : {}),
-    ...(createAssigneeAgentId ? { assigneeAgentId: createAssigneeAgentId } : {}),
-    ...(billingCode ? { billingCode } : {}),
-  });
+  const aggregateKey = aggregateKeyForAlert(alert);
+  let created = true;
+  let issue;
+  try {
+    issue = await ctx.issues.create({
+      companyId,
+      title,
+      description,
+      priority,
+      originKind: ORIGIN_KIND,
+      originId: alert.fingerprint,
+      originFingerprint: aggregateKey,
+      ...(routeProjectId ? { projectId: routeProjectId } : {}),
+      ...(routeGoalId ? { goalId: routeGoalId } : {}),
+      ...(routeStatus ? { status: routeStatus } : {}),
+      ...(createAssigneeUserId ? { assigneeUserId: createAssigneeUserId } : {}),
+      ...(createAssigneeAgentId ? { assigneeAgentId: createAssigneeAgentId } : {}),
+      ...(billingCode ? { billingCode } : {}),
+    });
+  } catch (err) {
+    if (!isAggregateCreationConflict(err)) throw err;
+    const retained = (await ctx.issues.list({
+      companyId,
+      originKind: ORIGIN_KIND,
+      originFingerprint: aggregateKey,
+      limit: 20,
+    })).find((candidate) =>
+      candidate.status !== "done" && candidate.status !== "cancelled"
+    );
+    if (!retained) throw err;
+    issue = retained;
+    created = false;
+  }
+  const effectiveAssigneeUserId = created
+    ? createAssigneeUserId ?? null
+    : issue.assigneeUserId ?? null;
+  const effectiveAssigneeAgentId = created
+    ? createAssigneeAgentId ?? null
+    : issue.assigneeAgentId ?? null;
 
   const record: AlertStateRecord = {
     paperclipIssueId: issue.id,
     paperclipCompanyId: companyId,
-    assigneeUserId: createAssigneeUserId ?? null,
-    assigneeAgentId: createAssigneeAgentId ?? null,
+    assigneeUserId: effectiveAssigneeUserId,
+    assigneeAgentId: effectiveAssigneeAgentId,
     alertname,
     severity,
     firstSeenAt: alert.startsAt || nowIso,
@@ -374,24 +429,35 @@ export async function handleFiring(
     labels: alert.labels,
     annotations: alert.annotations,
     paperclipIssueId: issue.id,
-    assigneeUserId: createAssigneeUserId ?? null,
-    assigneeAgentId: createAssigneeAgentId ?? null,
-    reFired: false,
+    assigneeUserId: effectiveAssigneeUserId,
+    assigneeAgentId: effectiveAssigneeAgentId,
+    reFired: !created,
   });
 
   await ctx.activity.log({
     companyId,
-    message: `Alertmanager: created issue for firing alert "${alertname}" (severity=${severity})`,
+    message: created
+      ? `Alertmanager: created issue for firing alert "${alertname}" (severity=${severity})`
+      : `Alertmanager: attached firing alert "${alertname}" to aggregate issue (severity=${severity})`,
     entityType: "issue",
     entityId: issue.id,
     metadata: {
       fingerprint: alert.fingerprint,
+      aggregateKey,
+      created,
       assigneeResolutionSource: resolution.source,
       issueRouteSource: issueRouteResolution.source
         ? `${issueRouteResolution.source.labelKey}=${issueRouteResolution.source.labelValue}`
         : "no-match",
     },
   });
+
+  if (!created) {
+    await ctx.metrics.write("alertmanager.aggregate.joined", 1, {
+      alertname,
+      severity,
+    });
+  }
 
   await ctx.metrics.write("alertmanager.firing.handled", 1, {
     alertname,
@@ -609,6 +675,32 @@ export async function handleWebhook(
     }
 
     const status = effectiveAlertStatus(alert, body);
+    const alertname = alert.labels.alertname ?? "unknown";
+    const optedOut = (
+      alert.labels.paperclip_issue ?? alert.annotations.paperclip_issue
+    )?.trim().toLowerCase() === "false";
+    if (optedOut) {
+      ctx.logger.info(
+        `Alertmanager: ${alertname} opted out via paperclip_issue=false`,
+      );
+      await ctx.metrics.write("alertmanager.webhook.issue_opt_out", 1, {
+        alertname,
+      });
+      continue;
+    }
+    if (
+      status === "firing" &&
+      (alert.labels.severity ?? "").trim().toLowerCase() === "info"
+    ) {
+      ctx.logger.info(
+        `Alertmanager: ${alertname} is below the issue creation floor (severity=info)`,
+      );
+      await ctx.metrics.write("alertmanager.webhook.below_issue_floor", 1, {
+        alertname,
+        severity: "info",
+      });
+      continue;
+    }
     try {
       if (status === "firing") {
         await handleFiring(ctx, config, alert);

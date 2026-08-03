@@ -79,6 +79,7 @@ const baseConfig = (
   severityToPriority: { critical: "critical", warning: "high", info: "medium" },
   autoCloseOnResolve: false,
   ownerMap: { team: { platform: "alice@example.com" } },
+  fallbackAgentName: "Alert Fallback",
   ...overrides,
 });
 
@@ -101,6 +102,7 @@ const baseInput = (
 interface MockClients {
   state: { get: ReturnType<typeof vi.fn>; set: ReturnType<typeof vi.fn>; delete: ReturnType<typeof vi.fn> };
   users: { get: ReturnType<typeof vi.fn>; findByEmail: ReturnType<typeof vi.fn> };
+  agents: { list: ReturnType<typeof vi.fn> };
   issues: {
     list: ReturnType<typeof vi.fn>;
     get: ReturnType<typeof vi.fn>;
@@ -135,6 +137,9 @@ const mkCtx = (): { ctx: PluginContext; mocks: MockClients } => {
     users: {
       get: vi.fn(async () => null),
       findByEmail: vi.fn(async () => null),
+    },
+    agents: {
+      list: vi.fn(async () => [{ id: "agent-fallback", name: "Alert Fallback" }]),
     },
     issues: {
       list: vi.fn(async () => []),
@@ -332,13 +337,29 @@ describe("handleWebhook — firing first time", () => {
     );
   });
 
-  it("creates the issue unassigned when no owner resolves", async () => {
+  it("assigns the named fallback agent when no owner resolves", async () => {
     const { ctx, mocks } = mkCtx();
     const config = baseConfig({ ownerMap: {} });
     await handleWebhook(ctx, config, TOKEN, baseInput());
     expect(mocks.issues.create).toHaveBeenCalledTimes(1);
     const createArgs = mocks.issues.create.mock.calls[0][0];
     expect(createArgs.assigneeUserId).toBeUndefined();
+    expect(createArgs.assigneeAgentId).toBe("agent-fallback");
+  });
+
+  it("fails closed when the fallback agent configuration is missing", async () => {
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ ownerMap: {}, fallbackAgentName: undefined });
+    await expect(
+      handleWebhook(ctx, config, TOKEN, baseInput()),
+    ).rejects.toBeInstanceOf(AlertDeliveryIncompleteError);
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+    expect(mocks.state.set).not.toHaveBeenCalled();
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.owner.fallback_failed",
+      1,
+      { alertname: "CiliumPolicyDropsHigh", severity: "critical" },
+    );
   });
 
   it("forwards billing_code label to ctx.issues.create", async () => {
@@ -347,7 +368,7 @@ describe("handleWebhook — firing first time", () => {
     const alert = baseAlert({
       labels: {
         alertname: "X",
-        severity: "info",
+        severity: "warning",
         billing_code: "cost-ctr-7",
       },
       annotations: {},
@@ -1036,7 +1057,7 @@ describe("handleWebhook — acceptOnlyLabels filter", () => {
     const alert = baseAlert({
       labels: {
         alertname: "Watchdog",
-        severity: "info",
+        severity: "warning",
         paperclip: "true",
       },
     });
@@ -1126,7 +1147,7 @@ describe("handleWebhook — owner resolution fallback chain", () => {
     const alert = baseAlert({
       labels: {
         alertname: "X",
-        severity: "info",
+        severity: "warning",
         team: "platform",
         paperclip_assignee_email: "bob@example.com",
       },
@@ -1161,7 +1182,7 @@ describe("handleWebhook — owner resolution fallback chain", () => {
       name: "Carol",
     });
     const alert = baseAlert({
-      labels: { alertname: "X", severity: "info" },
+      labels: { alertname: "X", severity: "warning" },
       annotations: { paperclip_assignee_email: "carol@example.com" },
     });
     const envelope = baseEnvelope({ alerts: [alert] });
@@ -1170,11 +1191,11 @@ describe("handleWebhook — owner resolution fallback chain", () => {
     expect(createArgs.assigneeUserId).toBe("user-carol");
   });
 
-  it("creates the issue unassigned when nothing resolves", async () => {
+  it("uses the named fallback agent when nothing resolves", async () => {
     const { ctx, mocks } = mkCtx();
     const config = baseConfig({ ownerMap: {} });
     const alert = baseAlert({
-      labels: { alertname: "X", severity: "info" },
+      labels: { alertname: "X", severity: "warning" },
       annotations: {},
     });
     const envelope = baseEnvelope({ alerts: [alert] });
@@ -1182,6 +1203,133 @@ describe("handleWebhook — owner resolution fallback chain", () => {
     expect(mocks.users.findByEmail).not.toHaveBeenCalled();
     const createArgs = mocks.issues.create.mock.calls[0][0];
     expect(createArgs.assigneeUserId).toBeUndefined();
+    expect(createArgs.assigneeAgentId).toBe("agent-fallback");
+  });
+});
+
+describe("handleWebhook — creation policy", () => {
+  it("drops firing info alerts before owner, issue, state, event, or activity side effects", async () => {
+    const { ctx, mocks } = mkCtx();
+    const alert = baseAlert({
+      labels: { alertname: "InformationalAlert", severity: "info" },
+      annotations: {},
+    });
+    await handleWebhook(
+      ctx,
+      baseConfig(),
+      TOKEN,
+      baseInput({ parsedBody: baseEnvelope({ alerts: [alert] }) }),
+    );
+
+    expect(mocks.agents.list).not.toHaveBeenCalled();
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+    expect(mocks.state.set).not.toHaveBeenCalled();
+    expect(mocks.events.emit).not.toHaveBeenCalled();
+    expect(mocks.activity.log).not.toHaveBeenCalled();
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.webhook.below_issue_floor",
+      1,
+      { alertname: "InformationalAlert", severity: "info" },
+    );
+  });
+
+  it.each(["label", "annotation"])(
+    "honors paperclip_issue=false from the %s before every state side effect",
+    async (source) => {
+      const { ctx, mocks } = mkCtx();
+      const alert = baseAlert({
+        labels: {
+          alertname: "OptedOutAlert",
+          severity: "critical",
+          ...(source === "label" ? { paperclip_issue: " FALSE " } : {}),
+        },
+        annotations: source === "annotation" ? { paperclip_issue: " false " } : {},
+      });
+      await handleWebhook(
+        ctx,
+        baseConfig(),
+        TOKEN,
+        baseInput({ parsedBody: baseEnvelope({ alerts: [alert] }) }),
+      );
+
+      expect(mocks.agents.list).not.toHaveBeenCalled();
+      expect(mocks.issues.create).not.toHaveBeenCalled();
+      expect(mocks.state.set).not.toHaveBeenCalled();
+      expect(mocks.events.emit).not.toHaveBeenCalled();
+      expect(mocks.activity.log).not.toHaveBeenCalled();
+      expect(mocks.metrics.write).toHaveBeenCalledWith(
+        "alertmanager.webhook.issue_opt_out",
+        1,
+        { alertname: "OptedOutAlert" },
+      );
+    },
+  );
+
+  it("attaches concurrent first deliveries to the unique aggregate winner", async () => {
+    const { ctx, mocks } = mkCtx();
+    let createCalls = 0;
+    mocks.issues.create.mockImplementation(async () => {
+      createCalls += 1;
+      if (createCalls === 1) return { id: "issue-winner" };
+      throw new Error("Alertmanager aggregate creation conflict");
+    });
+    mocks.issues.list.mockImplementation(async (input) =>
+      input.originFingerprint
+        ? [{ id: "issue-winner", status: "todo", assigneeAgentId: "agent-fallback" }]
+        : [],
+    );
+    const first = baseAlert({ fingerprint: "series-1" });
+    const second = baseAlert({ fingerprint: "series-2" });
+    const third = baseAlert({ fingerprint: "series-3" });
+
+    await Promise.all([
+      handleWebhook(
+        ctx,
+        baseConfig(),
+        TOKEN,
+        baseInput({ parsedBody: baseEnvelope({ alerts: [first] }) }),
+      ),
+      handleWebhook(
+        ctx,
+        baseConfig(),
+        TOKEN,
+        baseInput({ parsedBody: baseEnvelope({ alerts: [second] }) }),
+      ),
+      handleWebhook(
+        ctx,
+        baseConfig(),
+        TOKEN,
+        baseInput({ parsedBody: baseEnvelope({ alerts: [third] }) }),
+      ),
+    ]);
+
+    expect(mocks.issues.create).toHaveBeenCalledTimes(3);
+    expect(mocks.issues.create.mock.calls[0][0].originFingerprint).toBe(
+      'alert-aggregate:v1:["CiliumPolicyDropsHigh",null]',
+    );
+    expect(mocks.issues.create.mock.calls[1][0].originFingerprint).toBe(
+      'alert-aggregate:v1:["CiliumPolicyDropsHigh",null]',
+    );
+    expect(mocks.issues.create.mock.calls[2][0].originFingerprint).toBe(
+      'alert-aggregate:v1:["CiliumPolicyDropsHigh",null]',
+    );
+    expect(mocks.state.set).toHaveBeenCalledWith(
+      expect.objectContaining({ stateKey: "alert:series-1" }),
+      expect.objectContaining({ paperclipIssueId: "issue-winner" }),
+    );
+    expect(mocks.state.set).toHaveBeenCalledWith(
+      expect.objectContaining({ stateKey: "alert:series-2" }),
+      expect.objectContaining({ paperclipIssueId: "issue-winner" }),
+    );
+    expect(mocks.state.set).toHaveBeenCalledWith(
+      expect.objectContaining({ stateKey: "alert:series-3" }),
+      expect.objectContaining({ paperclipIssueId: "issue-winner" }),
+    );
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.aggregate.joined",
+      1,
+      { alertname: "CiliumPolicyDropsHigh", severity: "critical" },
+    );
   });
 });
 
