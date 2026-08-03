@@ -9,6 +9,7 @@ const runtimeDockerfile = readFileSync(path.join(repoRoot, "Dockerfile.runtime")
 const dockerWorkflow = readFileSync(path.join(repoRoot, ".github/workflows/docker.yml"), "utf8");
 const dockerAgentWorkflow = readFileSync(path.join(repoRoot, ".github/workflows/docker-agent.yml"), "utf8");
 const dockerDesignerWorkflow = readFileSync(path.join(repoRoot, ".github/workflows/docker-designer.yml"), "utf8");
+const prWorkflow = readFileSync(path.join(repoRoot, ".github/workflows/pr.yml"), "utf8");
 const agentRuntimeImagesWorkflow = readFileSync(
   path.join(repoRoot, ".github/workflows/agent-runtime-images.yml"),
   "utf8",
@@ -28,6 +29,9 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
     expect(runtimeDockerfile).toContain('"opencode-ai@${OPENCODE_AI_VERSION}"');
     expect(runtimeDockerfile).toContain('test "$(opencode --version)" = "${OPENCODE_AI_VERSION}"');
     expect(runtimeDockerfile).not.toMatch(/npm install[^\n]*\sopencode-ai(?:\s|\\)/);
+    expect(prWorkflow).toContain("opencode_responses_replay:");
+    expect(prWorkflow).toContain("OPENCODE_REPLAY_BINARY=");
+    expect(prWorkflow).toContain("node scripts/smoke/opencode-responses-replay.mjs");
   });
 
   it("vendors the claude_k8s adapter commit with runtime isolation, Penstock retry hints, Opus 5, and run-cwd diagnostics", () => {

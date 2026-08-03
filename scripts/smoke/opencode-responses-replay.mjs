@@ -8,6 +8,11 @@ const EXPECTED_OUTPUT = "framed Responses replay completed";
 const SECRET_INSTRUCTION = "INSTRUCTION_SHOULD_NOT_LEAK_7f3d";
 const SECRET_CREDENTIAL = "sk-fixture-SHOULD_NOT_LEAK-c82a";
 const SECRET_SCHEMA = "TOOL_SCHEMA_SHOULD_NOT_LEAK_51be";
+const SECRET_MARKERS = [
+  SECRET_INSTRUCTION,
+  SECRET_CREDENTIAL,
+  SECRET_SCHEMA,
+];
 const MAX_CAPTURE_BYTES = 16 * 1024;
 const MAX_REQUEST_BYTES = 1024 * 1024;
 
@@ -249,8 +254,20 @@ const runOpenCode = (binary, cwd, config, message) =>
     let stdoutBytes = 0;
     let totalBytes = 0;
     let overflow = false;
+    let leakedSecret = false;
+    let scanTail = Buffer.alloc(0);
+    const maxSecretBytes = Math.max(
+      ...SECRET_MARKERS.map((secret) => Buffer.byteLength(secret)),
+    );
     const capture = (chunk, stream) => {
       totalBytes += chunk.length;
+      const scanBuffer = Buffer.concat([scanTail, chunk]);
+      leakedSecret ||= SECRET_MARKERS.some((secret) =>
+        scanBuffer.includes(Buffer.from(secret)),
+      );
+      scanTail = scanBuffer.subarray(
+        Math.max(0, scanBuffer.length - maxSecretBytes + 1),
+      );
       const remaining = MAX_CAPTURE_BYTES - capturedBytes;
       if (remaining > 0) {
         const slice = chunk.subarray(0, remaining);
@@ -283,6 +300,7 @@ const runOpenCode = (binary, cwd, config, message) =>
         stdout: Buffer.concat(stdout).toString("utf8"),
         totalBytes,
         overflow,
+        leakedSecret,
       });
     });
   });
@@ -314,7 +332,10 @@ const assertRedactedAndBounded = (result) => {
       `malformed replay diagnostics exceeded ${MAX_CAPTURE_BYTES} bytes`,
     );
   }
-  for (const secret of [SECRET_INSTRUCTION, SECRET_CREDENTIAL, SECRET_SCHEMA]) {
+  if (result.leakedSecret) {
+    throw new Error("malformed replay diagnostics leaked fixture secrets");
+  }
+  for (const secret of SECRET_MARKERS) {
     if (result.output.includes(secret))
       throw new Error("malformed replay diagnostics leaked fixture secrets");
   }
@@ -354,11 +375,7 @@ const summarizeStdoutTypes = (stdout) =>
         if (event.type !== "error")
           return `${event.type ?? "unknown"}:${event.part?.state?.status ?? ""}`;
         let detail = JSON.stringify(event.error ?? event.message ?? "");
-        for (const secret of [
-          SECRET_INSTRUCTION,
-          SECRET_CREDENTIAL,
-          SECRET_SCHEMA,
-        ]) {
+        for (const secret of SECRET_MARKERS) {
           detail = detail.replaceAll(secret, "[redacted]");
         }
         return `error:${detail.slice(0, 300)}`;
@@ -380,11 +397,7 @@ const assertPersistedStateRedacted = async (root) => {
       }
       if (!entry.isFile()) continue;
       const content = await readFile(target);
-      for (const secret of [
-        SECRET_INSTRUCTION,
-        SECRET_CREDENTIAL,
-        SECRET_SCHEMA,
-      ]) {
+      for (const secret of SECRET_MARKERS) {
         if (content.includes(Buffer.from(secret))) {
           throw new Error(
             `malformed replay persisted fixture secrets in ${path.relative(root, target)}`,
