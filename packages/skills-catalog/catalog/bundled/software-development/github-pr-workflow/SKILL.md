@@ -81,6 +81,18 @@ it across:
 - **Map the advice below onto the repo's headings rather than dropping it.** The
   section names change; what a reviewer needs to see does not.
 
+Paperclip repos commonly enforce `.github/PULL_REQUEST_TEMPLATE.md`. For
+implementation PRs, fill `## Thinking Path`,
+`## Linked Issues or Issue Description`, `## What Changed`, `## Verification`,
+`## Risks`, `## Model Used`, and `## Checklist`; include `Fixes: #123`,
+`Closes #123`, or `Refs #123` when an issue exists, or a real in-PR issue
+description when it does not. Search GitHub for duplicate or related PRs before
+opening the PR, and check this line exactly:
+
+```md
+- [x] I have searched GitHub for duplicate or related PRs and linked them above
+```
+
 **Run the gate locally before you push.** A repo that enforces a template almost
 always ships the checker as a script that CI merely invokes, so the same verdict
 is available in a second instead of costing a push, a red check, and a rewrite:
@@ -115,6 +127,16 @@ mangling backticks and newlines on the way through.
 ```
 
 Skip the `Risk and rollback` section only for clearly trivial PRs (typos, docs).
+
+## commitperclip pre-review gates
+
+Paperclip repositories run `commitperclip PR Review` before Ally or a human reviewer should spend time on the PR. Missing template sections, a missing linked issue/issue description, or an unchecked dedup-search checkbox wastes a review cycle and blocks that gate.
+
+Before requesting or re-requesting review:
+
+- Confirm the PR body still matches `.github/PULL_REQUEST_TEMPLATE.md` if the repo has one.
+- Confirm the dedup-search checkbox is present and checked after you searched the GitHub PR list.
+- Confirm `commitperclip PR Review` and related quality gates are passing, or update the PR body and wait/rerun them before pinging Ally or another reviewer.
 
 ## Verification evidence
 

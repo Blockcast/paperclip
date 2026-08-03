@@ -7,6 +7,8 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { catalogManifest, catalogSkills, resolveCatalogSkillRef } from "./index.js";
 
+const sourceDir = path.dirname(fileURLToPath(import.meta.url));
+
 const EXPECTED_BUNDLED_KEYS = [
   "paperclipai/bundled/docs/doc-maintenance",
   "paperclipai/bundled/paperclip-operations/issue-triage",
@@ -382,6 +384,14 @@ describe("shipped skills catalog", () => {
     expect(resolveCatalogSkillRef(sample.id)).toMatchObject({ key: sample.key });
     expect(resolveCatalogSkillRef(sample.key)).toMatchObject({ key: sample.key });
     expect(resolveCatalogSkillRef(sample.slug)).toMatchObject({ key: sample.key });
+  });
+
+  it("keeps the GitHub PR workflow aligned with Paperclip review gates", () => {
+    const markdown = readFileSync(GITHUB_PR_WORKFLOW_SKILL, "utf8");
+
+    expect(markdown).toContain(".github/PULL_REQUEST_TEMPLATE.md");
+    expect(markdown).toContain("- [x] I have searched GitHub for duplicate or related PRs and linked them above");
+    expect(markdown).toContain("commitperclip PR Review");
   });
 
   it("keeps the Ramp wrapper fail-closed on mixed-provenance playbooks", () => {
