@@ -3286,15 +3286,37 @@ function looksLikeRetryableDeadlineExceeded(value: unknown): boolean {
 // flat 90s curve is the correct schedule there (the ccrotate gate, not backoff,
 // decides when a closed account window reopens). Only no-hint server-fault
 // shapes land here.
+//
+// BLO-19909: `server_error` is NOT among the text patterns below, even though
+// the BLO-18138 payload carried it. It is Anthropic's own type name for a 500 —
+// the status BLO-18285 deliberately kept terminal — so standing alone, with no
+// status field at all, it is not evidence of a brownout. Paired with a 503/529
+// it needs no pattern: the status branch returns true before any text is
+// scanned. That is the "require it to be paired with a status" rule, expressed
+// by omission rather than by a second condition.
 const TRANSIENT_UPSTREAM_STATUS_CODES = new Set(["503", "529"]);
-const TRANSIENT_UPSTREAM_TEXT_KEYS = ["result", "message", "error", "summary"] as const;
+
+// BLO-19909: machine-authored error fields ONLY. `result` and `summary` are
+// model-authored: claude-local's parse.ts sets `resultJson = finalResult`
+// verbatim, so `resultJson.result` is the SDK final-result event's text — the
+// agent's own prose — and `summary` is derived from it. A run that fails for an
+// unrelated reason after the agent wrote "the gateway returned a 503 earlier"
+// would otherwise inherit the ~2h42m retry curve and be skipped by the strand
+// sweep for that window. The genuine fault text still reaches this predicate
+// through `errorMessage` (scanned below) and through `error` / `message`, which
+// the SDK and the adapters populate, not the model.
+//
+// The BLO-19879 allocation-fault scan deliberately keeps `result` in its own key
+// set: its pattern is anchored at the start of the string and matches a
+// structured `{"code":"allocation_missing"}` payload, which prose quoting the
+// literal cannot satisfy.
+const TRANSIENT_UPSTREAM_TEXT_KEYS = ["message", "error"] as const;
 const TRANSIENT_UPSTREAM_TEXT_PATTERNS = [
   /API Error:\s*(?:503|529)\b/i,
   /service\s+(?:is\s+)?(?:temporarily\s+)?unavailable/i,
   /temporarily\s+unavailable/i,
   /server\s+overloaded/i,
   /overloaded_error/i,
-  /\bserver_error\b/i,
 ];
 
 // BLO-19879: the penstock gateway answers `400 {"code":"allocation_missing"}`
