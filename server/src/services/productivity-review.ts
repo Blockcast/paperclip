@@ -1076,6 +1076,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     if (!issueCanReceiveMonitorDispatch(sourceIssue)) return 0;
 
     const staleClaimThreshold = new Date(now.getTime() - ISSUE_MONITOR_WAKE_CLAIM_TTL_MS);
+    const staleClaimCutoff = staleClaimThreshold.toISOString();
     const precedesSource = or(
       lt(issues.monitorNextCheckAt, monitorNextCheckAt),
       and(
@@ -1088,8 +1089,16 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         lt(issues.id, sourceIssue.id),
       ),
     );
-    const duePosition = await db
-      .select({ count: sql<number>`count(*)::int` })
+    const queueState = await db
+      .select({
+        duePosition: sql<number>`count(*)::int`,
+        latestFreshPredecessorClaimedAt: sql<Date | null>`
+          max(${issues.monitorWakeRequestedAt}) filter (
+            where ${issues.id} <> ${sourceIssue.id}
+              and ${issues.monitorWakeRequestedAt} >= ${staleClaimCutoff}::timestamptz
+          )
+        `,
+      })
       .from(issues)
       .innerJoin(companies, eq(companies.id, issues.companyId))
       .where(
@@ -1099,6 +1108,11 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           lte(issues.monitorNextCheckAt, now),
           or(
             precedesSource,
+            and(
+              sql`${issues.id} <> ${sourceIssue.id}`,
+              eq(issues.monitorNextCheckAt, monitorNextCheckAt),
+              gte(issues.monitorWakeRequestedAt, staleClaimThreshold),
+            ),
             and(
               eq(issues.id, sourceIssue.id),
               or(
@@ -1112,16 +1126,19 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           inArray(issues.status, ["in_progress", "in_review"]),
         ),
       )
-      .then((rows) => Number(rows[0]?.count ?? 0));
+      .then((rows) => rows[0] ?? null);
+    const duePosition = Number(queueState?.duePosition ?? 0);
     if (duePosition <= 0) return 0;
     if (duePosition === 1) return 0;
 
     const dispatchTicks = Math.max(1, Math.ceil(duePosition / thresholds.monitorDispatchBatchSize));
-    const dueAgeMs = now.getTime() - monitorNextCheckAt.getTime();
-    // The source is still behind live due rows, so compare against an absolute
-    // service deadline from "now plus remaining dispatch time" instead of
-    // shrinking grace as earlier batches drain.
-    return dueAgeMs + dispatchTicks * thresholds.monitorSchedulerIntervalMs + ISSUE_MONITOR_WAKE_CLAIM_TTL_MS;
+    const dispatchDeadlineMs =
+      dispatchTicks * thresholds.monitorSchedulerIntervalMs + ISSUE_MONITOR_WAKE_CLAIM_TTL_MS;
+    const latestFreshPredecessorClaimedAt = coerceDate(queueState?.latestFreshPredecessorClaimedAt);
+    const freshPredecessorDeadlineMs = latestFreshPredecessorClaimedAt
+      ? latestFreshPredecessorClaimedAt.getTime() - monitorNextCheckAt.getTime() + ISSUE_MONITOR_WAKE_CLAIM_TTL_MS
+      : 0;
+    return Math.max(dispatchDeadlineMs, freshPredecessorDeadlineMs);
   }
 
   async function currentPendingMonitorForReviewSuppression(
@@ -1661,6 +1678,30 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       }, "productivity review skipped: no invokable, in-budget review owner could be resolved");
       return { kind: "skipped" as const, reviewIssueId: null };
     }
+
+    if (evidence.trigger === "long_active_duration") {
+      const monitor = await currentPendingMonitorForReviewSuppression(
+        evidence.sourceIssue,
+        evidence.generatedAt,
+        opts.thresholds,
+      );
+      if (monitor) {
+        await recordMonitorScheduledSuppression({
+          trigger: evidence.trigger,
+          triggerReasons: evidence.triggerReasons,
+          sourceIssue: evidence.sourceIssue,
+          sourceAgent: evidence.sourceAgent,
+          elapsedMs: evidence.elapsedMs,
+          monitorNextCheckAt: monitor.monitorNextCheckAt,
+          monitorScheduledBy: monitor.monitorScheduledBy,
+          monitorWakeRequestedAt: monitor.monitorWakeRequestedAt,
+          thresholds: evidence.thresholds,
+          generatedAt: evidence.generatedAt,
+        });
+        return { kind: "monitor_suppressed" as const, reviewIssueId: null };
+      }
+    }
+
     let review: Awaited<ReturnType<typeof issuesSvc.create>>;
     try {
       review = await issuesSvc.create(evidence.sourceIssue.companyId, {
@@ -1961,6 +2002,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         if (outcome.kind === "created") result.created += 1;
         else if (outcome.kind === "updated") result.updated += 1;
         else if (outcome.kind === "skipped") result.skipped += 1;
+        else if (outcome.kind === "monitor_suppressed") result.monitorScheduledSuppressed += 1;
         else if (outcome.kind === "creation_capped") result.creationCapped += 1;
         else if (outcome.kind === "no_action_suppressed") result.noActionSuppressed += 1;
         else result.existing += 1;
