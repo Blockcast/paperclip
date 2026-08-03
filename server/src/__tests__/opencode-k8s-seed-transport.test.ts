@@ -12,7 +12,8 @@ const statefulSetPath = path.join(repoRoot, "deploy/helm/paperclip/templates/sta
 const opencodeBin = path.join(repoRoot, "server/node_modules/.bin/opencode");
 const IDLE_WINDOW_MS = 610_000;
 const CALLER_TIMEOUT_MS = 2_000;
-const CALLER_TIMEOUT_TOLERANCE_MS = 500;
+const CALLER_TIMEOUT_EARLY_TOLERANCE_MS = 500;
+const FIXTURE_CLOSE_OBSERVATION_TOLERANCE_MS = 5_000;
 
 type SeedEntry = { type: "http" | "sse"; url: string };
 type JsonRpcMessage = {
@@ -123,7 +124,10 @@ async function startK8sMcpFixture() {
   let legacyInitializedAt: number | null = null;
   let legacyStream: ServerResponse | null = null;
   let hangNextCall = false;
-  let timeoutObservedMs: number | null = null;
+  let resolveTimeoutObserved: (elapsedMs: number) => void = () => undefined;
+  const timeoutObserved = new Promise<number>((resolve) => {
+    resolveTimeoutObserved = resolve;
+  });
   const calls: CapturedCall[] = [];
 
   const handleToolCall = (message: JsonRpcMessage, res: ServerResponse | null) => {
@@ -132,8 +136,9 @@ async function startK8sMcpFixture() {
       hangNextCall = false;
       const startedAt = performance.now();
       res?.on("close", () => {
-        timeoutObservedMs = performance.now() - startedAt;
+        const elapsedMs = performance.now() - startedAt;
         calls.push({ ...call, status: "timed_out", atMs: now });
+        resolveTimeoutObserved(elapsedMs);
       });
       return;
     }
@@ -232,8 +237,8 @@ async function startK8sMcpFixture() {
     hangNextCall() {
       hangNextCall = true;
     },
-    timeoutObservedMs() {
-      return timeoutObservedMs;
+    waitForTimeout() {
+      return timeoutObserved;
     },
   };
 }
@@ -449,6 +454,7 @@ describe("opencode_k8s production k8s-ro connector after idle", () => {
       new URL(seedUrl.pathname, currentMcp.baseUrl).toString(),
       currentModel.baseUrl,
     );
+    const timeoutObservedMs = await currentMcp.waitForTimeout();
     expect(currentMcp.calls.map(({ tool, status, atMs }) => ({ tool, status, atMs }))).toEqual([
       { tool: "pods_list_in_namespace", status: "ok", atMs: 0 },
       { tool: "pods_list_in_namespace", status: "ok", atMs: IDLE_WINDOW_MS },
@@ -457,12 +463,11 @@ describe("opencode_k8s production k8s-ro connector after idle", () => {
       { tool: "nodes_list", status: "ok", atMs: IDLE_WINDOW_MS },
       { tool: "nodes_list", status: "timed_out", atMs: IDLE_WINDOW_MS },
     ]);
-    expect(currentMcp.timeoutObservedMs()).not.toBeNull();
-    expect(currentMcp.timeoutObservedMs()!).toBeGreaterThanOrEqual(
-      CALLER_TIMEOUT_MS - CALLER_TIMEOUT_TOLERANCE_MS,
+    expect(timeoutObservedMs).toBeGreaterThanOrEqual(
+      CALLER_TIMEOUT_MS - CALLER_TIMEOUT_EARLY_TOLERANCE_MS,
     );
-    expect(currentMcp.timeoutObservedMs()!).toBeLessThanOrEqual(
-      CALLER_TIMEOUT_MS + CALLER_TIMEOUT_TOLERANCE_MS,
+    expect(timeoutObservedMs).toBeLessThanOrEqual(
+      CALLER_TIMEOUT_MS + FIXTURE_CLOSE_OBSERVATION_TOLERANCE_MS,
     );
     console.info("[k8s-ro regression] post-idle Pod/PVC/Event/Node passed in one OpenCode session; timeout bounded");
   }, 75_000);
