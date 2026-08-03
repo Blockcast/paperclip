@@ -72,7 +72,8 @@ import {
   writeShutdownBreadcrumb,
   writeShutdownBreadcrumbsBounded,
 } from "./shutdown-log.js";
-import { installProcessCrashGuard, type ProcessCrashGuardHandle } from "./process-crash-guard.js";
+import { type ProcessCrashGuardHandle } from "./process-crash-guard.js";
+import { installWorkerCrashGuard, registerCrashTimeRunMarker } from "./crash-run-marking.js";
 import { maybePersistWorktreeRuntimePorts } from "./worktree-config.js";
 import { plugins } from "@paperclipai/db";
 import {
@@ -1128,6 +1129,11 @@ export async function startServer(): Promise<StartedServer> {
       coldBootReattachGraceMs: EXTERNAL_LIFECYCLE_COLD_BOOT_REATTACH_GRACE_MS,
     });
     workerHeartbeat = heartbeat;
+    // BLO-19722 AC 2/3: hand the entrypoint crash guard a way to terminalize
+    // this worker's in-flight runs before the process dies. Registered here
+    // rather than passed at install time because the guard is installed before
+    // this service exists (see `markInFlightRunsForWorkerCrash`).
+    registerCrashTimeRunMarker((reason) => heartbeat.markRunsInterruptedByWorkerCrash({ reason }));
     drainHeartbeatRunsForShutdown = heartbeat.drainRunningRunsForShutdown;
     prepareHotRestartShutdown = heartbeat.prepareHotRestartShutdown;
     const environmentCustomImages = environmentCustomImageService(db as any, { pluginWorkerManager });
@@ -1908,14 +1914,13 @@ if (isMainModule(import.meta.url)) {
   // always does. It also covers strictly more: everything `startServer()` does
   // before its own body reached the old install point is now guarded too.
   //
-  // No `onCrash` hook is passed here, and that is deliberate rather than an
-  // omission. The guard already serialises the full `.cause` chain, writes a
-  // stderr breadcrumb and exits non-zero on its own, which is all of BLO-19722
-  // AC 1. Crash-time marking of this worker's in-flight runs (AC 2/3) needs
-  // `markRunsInterruptedByWorkerCrash` and lands with the crash-recovery
-  // change; it plugs in as an injected `onCrash` callback, which is why this
-  // module keeps no dependency edge on the heartbeat service.
-  mainProcessCrashGuard = installProcessCrashGuard({ logger });
+  // `installWorkerCrashGuard` attaches crash-time run marking, so this worker's
+  // in-flight runs are terminalized with a reason naming the crash instead of
+  // being rediscovered minutes later as `job_missing` (BLO-19722 AC 2/3). The
+  // hook resolves the heartbeat service lazily — it does not exist yet at this
+  // point — which is why `process-crash-guard.ts` keeps no dependency edge on
+  // the heartbeat service and receives the behaviour by injection instead.
+  mainProcessCrashGuard = installWorkerCrashGuard();
 
   void startServer().catch((err) => {
     logger.error({ err }, "Paperclip server failed to start");

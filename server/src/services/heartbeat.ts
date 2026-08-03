@@ -27566,14 +27566,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // gate on suppression should prefer this over the env-only resolver.
     resolveSchedulingSuppression: getSchedulingSuppression,
     drainRunningRunsForShutdown,
-    // BLO-19722. `markRunsInterruptedByWorkerCrash` is meant to be wired in
-    // as the crash guard's `onCrash` callback at the process entrypoint, but
-    // that wiring rides with PR A (`installProcessCrashGuard`, #925/#949) and
-    // does not exist yet at this head — the only caller today is
-    // `heartbeat-worker-crash-marking.test.ts`. Until that commit lands,
-    // crash-time marking never runs; `reconcileWorkerCrashedRuns` (both at
-    // startup and on the periodic tick, see index.ts) is what recovers a
-    // crash's runs in the meantime.
+    // BLO-19722 AC 2/3. Wired at the process entrypoint as the crash guard's
+    // `onCrash` callback — `index.ts` registers a marker closure over this
+    // function when it builds the service, and `installProcessCrashGuard`
+    // invokes it (raced against a timeout) before exiting non-zero.
+    //
+    // Crash-time marking is best-effort by construction: the guard's budget can
+    // expire and the DB is frequently the very thing that just died.
+    // `reconcileWorkerCrashedRuns` is the durable half — it closes at the next
+    // startup, and on the periodic tick, whatever a crash could not finish.
     markRunsInterruptedByWorkerCrash,
     reconcileWorkerCrashedRuns,
 
