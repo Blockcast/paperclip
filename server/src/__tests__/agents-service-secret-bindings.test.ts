@@ -55,6 +55,16 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string) {
   });
 }
 
+function deferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((done, fail) => {
+    resolve = done;
+    reject = fail;
+  });
+  return { promise, resolve, reject };
+}
+
 describeEmbeddedPostgres("agent service secret binding sync", () => {
   let stopDb: (() => Promise<void>) | null = null;
   let db!: ReturnType<typeof createDb>;
@@ -741,19 +751,30 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
         updatedAt: new Date(),
       });
     }
-    mockEnsureBuiltInAgent.mockResolvedValue(undefined);
+    const releaseReconciliation = deferred();
+    mockEnsureBuiltInAgent.mockImplementation(() => releaseReconciliation.promise);
     mockNotifyHireApproved.mockResolvedValue(true);
     const service = approvalService(db);
 
-    const results = await withTimeout(
-      Promise.all(
-        approvalIds.map((approvalId) =>
-          service.approve(approvalId, "board-user", "Approved"),
-        ),
+    const approvals = Promise.all(
+      approvalIds.map((approvalId) =>
+        service.approve(approvalId, "board-user", "Approved"),
       ),
-      5_000,
-      "concurrent built-in approvals",
     );
+
+    try {
+      await vi.waitFor(() => expect(mockEnsureBuiltInAgent).toHaveBeenCalledTimes(10));
+      const unrelatedQuery = db
+        .select({ count: sql<number>`count(*)::int` })
+        .from(companies);
+      await expect(
+        withTimeout(unrelatedQuery, 500, "unrelated query during blocked built-in reconciliation"),
+      ).resolves.toEqual([{ count: 1 }]);
+    } finally {
+      releaseReconciliation.resolve();
+    }
+
+    const results = await withTimeout(approvals, 5_000, "concurrent built-in approvals");
 
     expect(results).toHaveLength(10);
     expect(results.every((result) => result.applied)).toBe(true);
