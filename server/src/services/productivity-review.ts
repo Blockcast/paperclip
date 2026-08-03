@@ -174,6 +174,7 @@ const APPROVAL_GATE_SUPPRESSION_STATUSES = ["pending"] as const;
 
 type ProductivityReviewServiceDeps = {
   beforeCollectEvidence?: (sourceIssue: IssueRow) => Promise<void> | void;
+  beforeMonitorBacklogGrace?: (sourceIssue: IssueRow) => Promise<void> | void;
   enqueueWakeup?: EnqueueWakeup;
   beforeCreateOrUpdateReview?: (evidence: ProductivityReviewEvidence) => Promise<void> | void;
 };
@@ -1075,6 +1076,18 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     if (!issueCanReceiveMonitorDispatch(sourceIssue)) return 0;
 
     const staleClaimThreshold = new Date(now.getTime() - ISSUE_MONITOR_WAKE_CLAIM_TTL_MS);
+    const precedesSource = or(
+      lt(issues.monitorNextCheckAt, monitorNextCheckAt),
+      and(
+        eq(issues.monitorNextCheckAt, monitorNextCheckAt),
+        lt(issues.updatedAt, sourceIssue.updatedAt),
+      ),
+      and(
+        eq(issues.monitorNextCheckAt, monitorNextCheckAt),
+        eq(issues.updatedAt, sourceIssue.updatedAt),
+        lt(issues.id, sourceIssue.id),
+      ),
+    );
     const duePosition = await db
       .select({ count: sql<number>`count(*)::int` })
       .from(issues)
@@ -1085,24 +1098,18 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           sql`${issues.monitorNextCheckAt} is not null`,
           lte(issues.monitorNextCheckAt, now),
           or(
-            lt(issues.monitorNextCheckAt, monitorNextCheckAt),
+            precedesSource,
             and(
-              eq(issues.monitorNextCheckAt, monitorNextCheckAt),
-              lt(issues.updatedAt, sourceIssue.updatedAt),
-            ),
-            and(
-              eq(issues.monitorNextCheckAt, monitorNextCheckAt),
-              eq(issues.updatedAt, sourceIssue.updatedAt),
-              lte(issues.id, sourceIssue.id),
+              eq(issues.id, sourceIssue.id),
+              or(
+                isNull(issues.monitorWakeRequestedAt),
+                lt(issues.monitorWakeRequestedAt, staleClaimThreshold),
+              ),
             ),
           ),
           isNull(issues.assigneeUserId),
           sql`${issues.assigneeAgentId} is not null`,
           inArray(issues.status, ["in_progress", "in_review"]),
-          or(
-            isNull(issues.monitorWakeRequestedAt),
-            lt(issues.monitorWakeRequestedAt, staleClaimThreshold),
-          ),
         ),
       )
       .then((rows) => Number(rows[0]?.count ?? 0));
@@ -1128,11 +1135,19 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     const direct = deliberatePendingMonitor(currentIssue, now, thresholds);
     if (direct) return direct;
 
+    await deps?.beforeMonitorBacklogGrace?.(currentIssue);
+    const backlogGraceMs = await monitorBacklogGraceMs(currentIssue, now, thresholds);
+    const latestIssue = await getCurrentIssue(sourceIssue);
+    if (!latestIssue || !issueCanReceiveMonitorDispatch(latestIssue)) return null;
+
+    const latestDirect = deliberatePendingMonitor(latestIssue, now, thresholds);
+    if (latestDirect) return latestDirect;
+
     return deliberatePendingMonitor(
-      currentIssue,
+      latestIssue,
       now,
       thresholds,
-      await monitorBacklogGraceMs(currentIssue, now, thresholds),
+      backlogGraceMs,
     );
   }
 
