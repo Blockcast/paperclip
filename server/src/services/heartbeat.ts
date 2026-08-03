@@ -101,6 +101,7 @@ import {
   type ManagedAgentPod,
 } from "./k8s-job-liveness.js";
 import { getActiveAgentIds } from "./agent-roster.js";
+import { tryLockIssueMonitorQueue } from "./issue-monitor-queue-lock.js";
 import { processPendingImageBumpForAgent } from "./agent-image-bump.js";
 import {
   buildProcessLossCapture,
@@ -10096,6 +10097,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const staleClaimThreshold = new Date(now.getTime() - 5 * 60 * 1000);
     const claimed = await db.transaction(async (tx) => {
+      if (!await tryLockIssueMonitorQueue(tx)) return null;
       const [updated] = await tx
         .update(issues)
         .set({
@@ -10165,6 +10167,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     for (const due of dueMonitors) {
       const claimed = await db.transaction(async (tx) => {
+        if (!await tryLockIssueMonitorQueue(tx)) return null;
         const [updated] = await tx
           .update(issues)
           .set({
@@ -26440,6 +26443,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
      * semantics. Do not call from production code.
      */
     __test_executeRunForTesting: (runId: string) => executeRun(runId),
+    __test_tickDueIssueMonitors: (now?: Date) => tickDueIssueMonitors(now),
     // Override-aware scheduling-suppression check (honors the worktree
     // run-execution experimental setting). Callers outside the service that
     // gate on suppression should prefer this over the env-only resolver.

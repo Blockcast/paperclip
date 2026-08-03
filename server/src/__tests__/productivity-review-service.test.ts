@@ -29,6 +29,7 @@ import {
   PRODUCTIVITY_REVIEW_REFRESH_COMMENT_PREFIX,
   productivityReviewService,
 } from "../services/productivity-review.js";
+import { heartbeatService } from "../services/heartbeat.js";
 import { logActivity } from "../services/activity-log.js";
 import { RECOVERY_ORIGIN_KINDS } from "../services/recovery/origins.js";
 
@@ -39,6 +40,28 @@ if (!embeddedPostgresSupport.supported) {
   console.warn(
     `Skipping embedded Postgres productivity review tests on this host: ${embeddedPostgresSupport.reason ?? "unsupported environment"}`,
   );
+}
+
+function deferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((done, fail) => {
+    resolve = done;
+    reject = fail;
+  });
+  return { promise, resolve, reject };
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string) {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) => {
+      timeout = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    }),
+  ]).finally(() => {
+    if (timeout) clearTimeout(timeout);
+  });
 }
 
 describeEmbeddedPostgres("productivity review service", () => {
@@ -1598,6 +1621,68 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(result.created).toBe(0);
     expect(result.monitorScheduledSuppressed).toBe(1);
     expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  it("does not block monitor claims behind final review issue creation", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const monitorNextCheckAt = new Date(now.getTime() - 10 * 60_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt,
+      monitorScheduledBy: "assignee",
+    });
+    const predecessorId = randomUUID();
+    await db.insert(issues).values({
+      id: predecessorId,
+      companyId: seeded.companyId,
+      title: "Predecessor waiting while review creates",
+      status: "in_review" as const,
+      priority: "medium" as const,
+      assigneeAgentId: seeded.coderId,
+      monitorNextCheckAt,
+      monitorScheduledBy: "assignee" as const,
+      issueNumber: 20,
+      identifier: `${seeded.issuePrefix}-20`,
+      createdAt: seeded.createdAt,
+      updatedAt: new Date(seeded.createdAt.getTime() - 1_000),
+    });
+
+    const finalRevalidationEntered = deferred();
+    const releaseReviewCreation = deferred();
+    const reconcile = productivityReviewService(db, {
+      async afterFinalMonitorSuppressionRevalidation(evidence) {
+        if (evidence.sourceIssue.id !== seeded.issueId) return;
+        finalRevalidationEntered.resolve();
+        await releaseReviewCreation.promise;
+      },
+    }).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: {
+        monitorLapseServiceGraceMs: 60_000,
+        monitorSchedulerIntervalMs: 60_000,
+        monitorDispatchBatchSize: 50,
+      },
+    });
+
+    await finalRevalidationEntered.promise;
+    const tick = await withTimeout(
+      heartbeatService(db).__test_tickDueIssueMonitors(now),
+      500,
+      "issue monitor tick",
+    );
+    expect(tick.triggered).toBe(0);
+
+    const [predecessorDuringReview] = await db
+      .select({ monitorWakeRequestedAt: issues.monitorWakeRequestedAt })
+      .from(issues)
+      .where(eq(issues.id, predecessorId));
+    expect(predecessorDuringReview?.monitorWakeRequestedAt).toBeNull();
+
+    releaseReviewCreation.resolve();
+    const result = await reconcile;
+    expect(result.created).toBe(1);
   });
 
   // Negative control for BLO-21003: a monitor that lapsed well past the
