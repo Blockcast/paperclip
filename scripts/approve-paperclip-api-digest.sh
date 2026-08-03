@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Vendored from Blockcast/onprem-k8s at 702b5b55525a3b1ba9312fcb4e94b6f61add623f.
+# Vendored from Blockcast/onprem-k8s at cedac5c69fe6870e66250ce187c6d108bc0592ba.
 # Authorize one immutable Paperclip API image digest at admission time (BLO-19955).
 #
 # Rotates the bounded approval window in
@@ -13,6 +13,7 @@
 #
 # Usage:
 #   PAPERCLIP_DEPLOY_KUBECONFIG=/path/to/deploy.kubeconfig \
+#     PAPERCLIP_APPROVED_SERVER_PLAN_OUT=/path/to/approved-deployment.json \
 #     scripts/approve-paperclip-api-digest.sh sha256:<64 hex> planned-deployment.yaml
 #
 # The exact manifest that will be deployed must carry
@@ -823,6 +824,14 @@ fi
 # From here on, success intentionally leaves the rollout lock active for the
 # next release to retire after observing this exact plan marker live.
 lock_cleanup_armed=""
+
+# A release workflow that sets this receives the exact server-normalized object
+# whose canonical hash was persisted in the lock. Applying this object directly
+# prevents a package manager's three-way merge from preserving live-only drift
+# and producing a Deployment that can never satisfy lock completion.
+if [[ -n "${PAPERCLIP_APPROVED_SERVER_PLAN_OUT:-}" ]]; then
+  (umask 077; printf '%s\n' "$server_plan_json" >"$PAPERCLIP_APPROVED_SERVER_PLAN_OUT")
+fi
 
 echo "Approved and admission-ready. ${final_count} digest(s) in the window."
 echo "Approval lock remains on ${DIGEST} until Deployment/${DEPLOYMENT} rolls out a"

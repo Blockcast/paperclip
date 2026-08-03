@@ -409,7 +409,9 @@ jobs:
           ref: ${{ github.workflow_sha }}
           path: .release-tooling
           fetch-depth: 1
-          sparse-checkout: scripts/approve-paperclip-api-digest.sh
+          sparse-checkout: |
+            scripts/approve-paperclip-api-digest.sh
+            scripts/stamp-paperclip-api-approval-plan.sh
           sparse-checkout-cone-mode: false
 
       - name: Verify release tooling revision
@@ -433,11 +435,13 @@ jobs:
             exit 1
           fi
           script="$(pwd)/.release-tooling/scripts/approve-paperclip-api-digest.sh"
-          if [ ! -f "${script}" ]; then
-            echo "Approval script missing from trusted revision ${expected}" >&2
+          stamper="$(pwd)/.release-tooling/scripts/stamp-paperclip-api-approval-plan.sh"
+          if [ ! -x "${script}" ] || [ ! -x "${stamper}" ]; then
+            echo "Approval release tooling missing or non-executable at trusted revision ${expected}" >&2
             exit 1
           fi
           echo "approve_script=${script}" >> "$GITHUB_OUTPUT"
+          echo "stamp_script=${stamper}" >> "$GITHUB_OUTPUT"
 
       - name: Render, stamp, and validate deploy plan
         id: plan
@@ -446,6 +450,7 @@ jobs:
           NS: ${{ vars.PAPERCLIP_NAMESPACE || 'paperclip' }}
           RELEASE: ${{ vars.PAPERCLIP_HELM_RELEASE || 'paperclip' }}
           TAG: sha-${{ steps.target.outputs.short }}-k8s-vendored
+          STAMP_SCRIPT: ${{ steps.tooling.outputs.stamp_script }}
         run: |
           set -euo pipefail
           [[ "${DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]
@@ -495,7 +500,7 @@ jobs:
             --show-only templates/deployment-api.yaml \
             --set image.tag="${TAG}" \
             --set-string image.digest="${DIGEST}" \
-            --set-string api.approvalPlanSha256="${marker}" \
+            | PAPERCLIP_APPROVAL_PLAN_SHA256="${marker}" "${STAMP_SCRIPT}" \
             | kubectl create --dry-run=client -n "${NS}" -o json -f - > "${plan}"
 
           jq -e --arg key "${marker_key}" --arg marker "${marker}" --arg image "${expected_image}" --arg namespace "${NS}" '
@@ -526,12 +531,14 @@ jobs:
           echo "path=${plan}" >> "$GITHUB_OUTPUT"
           echo "marker=${marker}" >> "$GITHUB_OUTPUT"
 
-      - name: Approve deploy digest at admission time
+      - name: Approve exact deploy plan at admission time
+        id: approval
         env:
           APPROVER_KUBECONFIG: ${{ secrets.KUBECONFIG_PAPERCLIP_RELEASE_APPROVER }}
           DIGEST: ${{ steps.artifact.outputs.digest }}
           APPROVE_SCRIPT: ${{ steps.tooling.outputs.approve_script }}
           DEPLOY_PLAN: ${{ steps.plan.outputs.path }}
+          NS: ${{ vars.PAPERCLIP_NAMESPACE || 'paperclip' }}
           # The approval window size is deliberately NOT set here. It is a
           # readonly constant inside the approval script, kept in lockstep with
           # maxApprovedApiDigests in the admission policy; a workflow-side value
@@ -556,6 +563,7 @@ jobs:
           approver_kubeconfig="${approver_dir}/kubeconfig"
           approval_log="${approver_dir}/approval.log"
           deploy_kubeconfig="${KUBECONFIG}"
+          approved_server_plan="$(mktemp "${RUNNER_TEMP}/paperclip-api-approved.XXXXXXXX.json")"
 
           # Arm the cleanup BEFORE the credential reaches disk, so a kubectl/jq
           # failure exiting under `set -e` cannot leave it behind. umask instead
@@ -566,7 +574,19 @@ jobs:
 
           KUBECONFIG="${approver_kubeconfig}" \
             PAPERCLIP_DEPLOY_KUBECONFIG="${deploy_kubeconfig}" \
+            PAPERCLIP_DEPLOY_NAMESPACE="${NS}" \
+            PAPERCLIP_APPROVED_SERVER_PLAN_OUT="${approved_server_plan}" \
             "${APPROVE_SCRIPT}" "${DIGEST}" "${DEPLOY_PLAN}" | tee "${approval_log}"
+
+          jq -e --arg namespace "${NS}" --arg digest "${DIGEST}" '
+            .apiVersion == "apps/v1" and
+            .kind == "Deployment" and
+            .metadata.namespace == $namespace and
+            .metadata.name == "paperclip-api" and
+            (.metadata.resourceVersion | type == "string" and length > 0) and
+            (.spec.template.spec.containers | all(.image == ("harbor.blockcast.net/paperclip/paperclip@" + $digest)))
+          ' "${approved_server_plan}" >/dev/null
+          echo "server_plan_path=${approved_server_plan}" >> "$GITHUB_OUTPUT"
 
           {
             echo "### Admission approval"
@@ -585,10 +605,28 @@ jobs:
           RELEASE: ${{ vars.PAPERCLIP_HELM_RELEASE || 'paperclip' }}
           TAG: sha-${{ steps.target.outputs.short }}-k8s-vendored
           PLAN_MARKER: ${{ steps.plan.outputs.marker }}
+          APPROVED_SERVER_PLAN: ${{ steps.approval.outputs.server_plan_path }}
+          STAMP_SCRIPT: ${{ steps.tooling.outputs.stamp_script }}
+          PAPERCLIP_APPROVAL_PLAN_SHA256: ${{ steps.plan.outputs.marker }}
         run: |
           set -euo pipefail
           [[ "${DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]
           echo "rolling out ${TAG}@${DIGEST} to ${NS}/${RELEASE}"
+          reconcile_approved_api_plan() {
+            local live_resource_version reconciled
+            live_resource_version="$(kubectl -n "${NS}" get deployment paperclip-api -o jsonpath='{.metadata.resourceVersion}')"
+            reconciled="$(mktemp "${RUNNER_TEMP}/paperclip-api-reconciled.XXXXXXXX.json")"
+            jq --arg resource_version "${live_resource_version}" \
+              '.metadata.resourceVersion = $resource_version' \
+              "${APPROVED_SERVER_PLAN}" > "${reconciled}"
+            kubectl -n "${NS}" replace -f "${reconciled}"
+          }
+
+          # Land the exact server-normalized object whose hash the approval lock
+          # carries. Helm then records and updates the complete release using the
+          # same trusted post-renderer. Reconcile once more afterwards so a
+          # three-way merge cannot preserve live-only drift in the API object.
+          reconcile_approved_api_plan
           # --timeout bumped 10m → 30m on 2026-05-23 after rev 316 + several
           # prior revs hit "context deadline exceeded" while the cluster was
           # in apiserver/kubelet-latency cascade (control-plane nodes at
@@ -603,8 +641,10 @@ jobs:
             -f deploy/helm/paperclip/values.blockcast.yaml \
             --set image.tag="${TAG}" \
             --set-string image.digest="${DIGEST}" \
-            --set-string api.approvalPlanSha256="${PLAN_MARKER}" \
+            --post-renderer "${STAMP_SCRIPT}" \
             --wait --timeout 30m
+          reconcile_approved_api_plan
+          kubectl -n "${NS}" rollout status deployment/paperclip-api --timeout=30m
           helm -n "${NS}" list | head -3
           kubectl -n "${NS}" get pod -l app.kubernetes.io/name=paperclip \
             -o custom-columns=NAME:.metadata.name,IMAGE:.spec.containers[0].image,READY:.status.containerStatuses[0].ready,RESTARTS:.status.containerStatuses[0].restartCount

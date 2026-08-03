@@ -10,9 +10,9 @@
 // i.e. the canonical full Deployment with the marker itself removed. The marker
 // therefore cannot be produced inside the Helm template — it would have to hash
 // a document containing its own value. The release job instead renders the
-// chart TWICE: once unstamped to obtain the hash, then again with
-// `--set api.approvalPlanSha256=<hash>` to produce the manifest it both hands
-// to the approve script and deploys.
+// chart TWICE: once unstamped to obtain the hash, then again through a trusted
+// post-renderer that adds the marker. The post-renderer works for historical
+// target charts that predate api.approvalPlanSha256.
 //
 // That scheme is sound if and only if stamping changes NOTHING ELSE in the
 // rendered output. If it did, the hash taken from render #1 would not match the
@@ -55,6 +55,26 @@ function renderApiDeployment(extraArgs = []) {
   );
   // kubectl is the YAML->JSON reader here purely so the comparison below is
   // structural rather than textual; --dry-run=client needs no cluster.
+  return JSON.parse(
+    execFileSync("kubectl", ["create", "--dry-run=client", "-o", "json", "-f", "-"], {
+      input: yaml,
+      encoding: "utf8",
+      stdio: ["pipe", "pipe", "ignore"],
+    }),
+  );
+}
+
+function stampApiDeployment(deployment, marker = SAMPLE) {
+  const yaml = execFileSync(
+    "bash",
+    ["scripts/stamp-paperclip-api-approval-plan.sh"],
+    {
+      cwd: repoRoot,
+      encoding: "utf8",
+      input: JSON.stringify(deployment),
+      env: { ...process.env, PAPERCLIP_APPROVAL_PLAN_SHA256: marker },
+    },
+  );
   return JSON.parse(
     execFileSync("kubectl", ["create", "--dry-run=client", "-o", "json", "-f", "-"], {
       input: yaml,
@@ -126,6 +146,22 @@ test("stamping the marker changes nothing else in the rendered Deployment", () =
     unstamped,
     "stamped render minus the marker must equal the unstamped render, or the hash " +
       "computed from render #1 cannot match what the approve script recomputes from render #2",
+  );
+});
+
+test("trusted post-renderer stamps an unstamped legacy chart without other changes", () => {
+  const unstamped = renderApiDeployment();
+  const stamped = stampApiDeployment(unstamped);
+
+  assert.equal(stamped.spec.template.metadata.annotations[MARKER], SAMPLE);
+  assert.deepEqual(stripMarker(stamped), unstamped);
+});
+
+test("trusted post-renderer rejects a conflicting marker", () => {
+  const chartStamped = renderApiDeployment([`--set`, `api.approvalPlanSha256=${SAMPLE}`]);
+  assert.throws(
+    () => stampApiDeployment(chartStamped, "b".repeat(64)),
+    /already carries a different approval-plan marker/,
   );
 });
 

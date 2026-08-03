@@ -125,7 +125,7 @@ test("Docker deploy approves the exact stamped plan before Helm mutates producti
   const deployJob = getDeployJobBlock();
   const tooling = deployJob.indexOf("name: Checkout release tooling at trusted revision");
   const plan = deployJob.indexOf("name: Render, stamp, and validate deploy plan");
-  const approve = deployJob.indexOf("name: Approve deploy digest at admission time");
+  const approve = deployJob.indexOf("name: Approve exact deploy plan at admission time");
   const upgrade = deployJob.indexOf("name: helm upgrade");
 
   assert.ok(tooling >= 0 && tooling < plan, "trusted approval tooling must be resolved first");
@@ -133,7 +133,7 @@ test("Docker deploy approves the exact stamped plan before Helm mutates producti
   assert.ok(approve < upgrade, "admission approval must complete before Helm upgrade");
   assert.match(deployJob, /ref: \$\{\{ github\.workflow_sha \}\}/);
   assert.match(deployJob, /--show-only templates\/deployment-api\.yaml/);
-  assert.match(deployJob, /--set-string api\.approvalPlanSha256="\$\{marker\}"/);
+  assert.match(deployJob, /PAPERCLIP_APPROVAL_PLAN_SHA256="\$\{marker\}" "\$\{STAMP_SCRIPT\}"/);
   assert.match(deployJob, /DEPLOY_PLAN: \$\{\{ steps\.plan\.outputs\.path \}\}/);
   assert.match(
     deployJob,
@@ -145,8 +145,16 @@ test("Docker deploy approves the exact stamped plan before Helm mutates producti
   );
   assert.match(
     deployJob,
-    /--set-string api\.approvalPlanSha256="\$\{PLAN_MARKER\}"/,
+    /PAPERCLIP_DEPLOY_NAMESPACE="\$\{NS\}"/,
   );
+  assert.match(deployJob, /PAPERCLIP_APPROVED_SERVER_PLAN_OUT="\$\{approved_server_plan\}"/);
+  assert.match(deployJob, /--post-renderer "\$\{STAMP_SCRIPT\}"/);
+  assert.equal(
+    deployJob.match(/reconcile_approved_api_plan/g)?.length,
+    3,
+    "the exact-plan helper must be defined once and run before and after Helm",
+  );
+  assert.match(deployJob, /kubectl -n "\$\{NS\}" replace -f "\$\{reconciled\}"/);
 });
 
 test("Docker deploy confines and cleans up the release-approver credential", () => {
