@@ -339,7 +339,11 @@ ARG CLAUDE_K8S_REF=3ad33702052f357ec2b31b7d3051e89ed1ed4875
 # adapter tests and typecheck pass.
 # Bumped 2026-08-04 to 42384fd: merge #50 onto the exact-current-Job fix, so
 # both lifecycle-Job exclusion and anthropic/claude-opus-5 support are present.
-ARG OPENCODE_K8S_REF=42384fdef5780ccdfbfba67c1a60feebd7ffb87c
+# Bumped 2026-08-06 to 0b0d098 (BLO-18137): treat deleting nonterminal Jobs as
+# live concurrency blockers while preserving exact current-Job self-exclusion
+# and Opus 5 support. PR kkroo/paperclip-adapter-opencode-k8s#54; focused
+# guard tests, typecheck, and full adapter suite 604/604 pass.
+ARG OPENCODE_K8S_REF=0b0d0989fbc4d464a65757151444f4b1d3da3784
 
 # Pack paperclip's in-tree adapter-utils so the bundled adapters consume
 # the workspace version (may include exports newer than the latest

@@ -6,8 +6,9 @@ const dockerfile = readFileSync(new URL("../Dockerfile", import.meta.url), "utf8
 const opencodeRefMatch = dockerfile.match(/^ARG OPENCODE_K8S_REF=([0-9a-f]{40})$/m);
 
 test("Dockerfile pins opencode_k8s to the Opus 5-capable adapter", () => {
-  assert.equal(opencodeRefMatch?.[1], "3ab75fb6893d3f2eed26b38a830f1a48bd1f35c0");
+  assert.equal(opencodeRefMatch?.[1], "0b0d0989fbc4d464a65757151444f4b1d3da3784");
   assert.match(dockerfile, /add anthropic\/claude-opus-5/);
+  assert.match(dockerfile, /treat deleting nonterminal Jobs as/);
   assert.match(dockerfile, /mount a per-agent\s*\n# \/runtime-cache emptyDir/);
   assert.match(dockerfile, /kkroo\/paperclip-adapter-opencode-k8s#29/);
   assert.match(dockerfile, /reserve the runtime-cache env keys/);
