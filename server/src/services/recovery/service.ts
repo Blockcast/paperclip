@@ -105,6 +105,12 @@ export const DEFAULT_LIVENESS_REESCALATION_COOLDOWN_MS = 60 * 60 * 1000;
 // heavily backlogged agent. Clearing the lock does not cancel or deprioritize
 // the run — it only stops subsequent wakes for the issue from being parked
 // behind a holder that may never start.
+//
+// BLO-21309: this is a bound on how long the *lock* is held, deliberately
+// independent of how far out a `scheduled_retry` holder's `scheduledRetryAt` is.
+// A `ccrotate_capacity` park takes its horizon from the provider's capacity
+// reset and is routinely days away; letting that horizon set the lock lifetime
+// took the issue out of service for the whole park, for its own assignee.
 export const STALE_PRE_CLAIM_ISSUE_LOCK_MS = 6 * 60 * 60 * 1000;
 // BLO-19941: the same backstop, for a holder wedged at `running`.
 //
@@ -7779,11 +7785,33 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         return Date.now() - lockedAt.getTime() >= STALE_PRE_CLAIM_ISSUE_LOCK_MS;
       }
       if (run?.status === "scheduled_retry") {
-        // Scheduled retries are intentionally parked until their retry deadline.
-        // Only clear them once that deadline itself has gone stale; provider
-        // capacity retries may be scheduled far into the future.
-        const staleBasis = run.scheduledRetryAt ?? lockedAt;
-        return Date.now() - staleBasis.getTime() >= STALE_PRE_CLAIM_ISSUE_LOCK_MS;
+        // BLO-21309: measured from `lockedAt`, exactly like the `queued` branch
+        // above — NOT from `scheduledRetryAt`.
+        //
+        // This used to key off `run.scheduledRetryAt ?? lockedAt`, on the theory
+        // that a parked retry holds a legitimate future claim and should keep its
+        // lock until that deadline goes stale. But `scheduledRetryAt` is set from
+        // the *provider's* capacity-reset horizon, so a `ccrotate_capacity` retry
+        // is routinely parked days out — and since the basis was in the future,
+        // `now - basis` was negative and this returned false for the entire park.
+        // Effective lock lifetime became `scheduledRetryAt + 6h` rather than 6h.
+        //
+        // Nothing else could release it either: `scheduled_retry` is not in
+        // TERMINAL_HEARTBEAT_RUN_STATUSES, so isCleanable(), clearStaleExecutionLock()
+        // and clearCheckoutRunIfTerminal() all decline, and every route that can
+        // force a release is board-only. Net effect on BLO-20983: the *assignee*
+        // could not set status or re-arm its own monitor for ~4 days, from a live
+        // run, while `executionState` reported `idle` and `activeRun` was null.
+        //
+        // Clearing early is safe, and for the same reason the `queued` case is:
+        // promoteDueScheduledRetry's UPDATE is conditioned only on the run row
+        // (`status='scheduled_retry' and scheduledRetryAt <= now`) and never reads
+        // the issue lock, and claimQueuedRun re-stamps under
+        // `or(isNull(executionRunId), eq(executionRunId, claimed.id))` — so the
+        // retry still fires and simply re-acquires. If a fresh run has taken the
+        // issue in the meantime, the retry declines to claim and is cancelled,
+        // which is the correct outcome: live work outranks a days-old continuation.
+        return Date.now() - lockedAt.getTime() >= STALE_PRE_CLAIM_ISSUE_LOCK_MS;
       }
       return false;
     };
@@ -7817,6 +7845,14 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         issue.executionRunId,
         issue.executionLockedAt,
       );
+      // BLO-21309: distinguishes a parked-retry release from an unclaimed-`queued`
+      // release in the audit trail below. Both go through the same 6h bound, but
+      // only this one implies a provider-capacity park whose `scheduledRetryAt`
+      // may still be days out, so an operator reading `issue.stale_lock_cleared`
+      // can tell that the retry is expected to re-acquire later.
+      const parkedRetryLockExpired = issue.executionRunId != null
+        && runById.get(issue.executionRunId)?.status === "scheduled_retry"
+        && isPreClaimLockExpired(issue.executionRunId, issue.executionLockedAt);
       const executionLockExpired = isPreClaimLockExpired(
         issue.executionRunId,
         issue.executionLockedAt,
@@ -8152,6 +8188,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           // BLO-19941 adds the third case: a holder wedged at `running`.
           reason: runningLockSilent
             ? "running_lock_silent"
+            : parkedRetryLockExpired
+            ? "parked_retry_lock_expired"
             : executionLockExpired
             ? "pre_claim_lock_expired"
             : "run_terminal_or_missing",
@@ -8165,6 +8203,18 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
                 return basis ? Date.now() - basis.getTime() : null;
               })(),
               runningLockTimeoutMs: STALE_RUNNING_ISSUE_LOCK_MS,
+            }
+            : parkedRetryLockExpired
+            ? {
+              // The park is not cancelled by this release — surfacing the
+              // horizon it will re-acquire at is the point (BLO-21309).
+              parkedRetryLockHeldMs: issue.executionLockedAt
+                ? Date.now() - issue.executionLockedAt.getTime()
+                : null,
+              parkedRetryLockTimeoutMs: STALE_PRE_CLAIM_ISSUE_LOCK_MS,
+              parkedRetryScheduledRetryAt: issue.executionRunId
+                ? runById.get(issue.executionRunId)?.scheduledRetryAt?.toISOString() ?? null
+                : null,
             }
             : executionLockExpired
             ? {
