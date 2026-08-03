@@ -53,7 +53,7 @@ import {
   githubPostIssueComment,
 } from "../services/github-app-auth.js";
 import { recoveryService } from "../services/recovery/service.js";
-import { recordGithubReviewRequestDelivery } from "../services/metrics.js";
+import { recordGithubReviewRequestDelivery, recordGithubWorkflowRunConclusion } from "../services/metrics.js";
 import {
   recordMergedPullRequest,
   enrichAuthoredLocForRow,
@@ -1922,6 +1922,18 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
         );
       },
     });
+
+    // BLO-21078: fleet-wide visibility into workflow_run conclusions, so a
+    // mass-cancellation wave (GitHub cancelling live runners mid-job across
+    // unrelated PRs, as opposed to an ordinary per-PR `failure`) is a metric
+    // instead of something only noticed by an author reading job conclusions.
+    // `context` is only non-null here for a *completed* workflow_run (see the
+    // `action !== "completed"` guard in resolveEventContext's workflow_run
+    // case) — exactly the terminal event this counter wants once per run.
+    if (eventName === "workflow_run" && context) {
+      const workflowRun = payload.workflow_run as Record<string, unknown> | undefined;
+      recordGithubWorkflowRunConclusion(readStringField(workflowRun, "conclusion"));
+    }
 
     // A closed or newly-drafted PR cannot produce useful reviewer work. Retire
     // every queued or scheduled-retry run for its stable task scope so it does

@@ -28,15 +28,20 @@ import {
   recordIsolatedRunStarted,
   renderMetrics,
   EXTERNAL_LIFECYCLE_RUNNING_RUNS_METRIC,
+  GITHUB_WORKFLOW_RUN_CONCLUSION_METRIC,
   KNOWN_PROCESS_LOSS_CLASSIFICATIONS,
+  KNOWN_WORKFLOW_RUN_CONCLUSIONS,
   PROCESS_LOST_LIVENESS_NULL_METRIC,
   PROCESS_LOST_TOTAL_METRIC,
   UNKNOWN_EXTERNAL_ADAPTER,
   UNKNOWN_PROCESS_LOSS_CLASSIFICATION,
   UNKNOWN_PROCESS_LOST_BUCKET,
+  UNKNOWN_WORKFLOW_RUN_CONCLUSION,
   normalizeExternalAdapter,
   normalizeProcessLossClassification,
   normalizeProcessLostBucket,
+  normalizeWorkflowRunConclusion,
+  recordGithubWorkflowRunConclusion,
   recordProcessLost,
   recordProcessLostLivenessNull,
   setExternalLifecycleRunningRuns,
@@ -583,6 +588,41 @@ describe("recordProcessLost + renderMetrics (BLO-16184 numerator)", () => {
     expect(body).toContain(
       `${PROCESS_LOST_TOTAL_METRIC}{adapter="claude_k8s",error_bucket="server_restart",classification="started_job_absent"} 3`,
     );
+  });
+});
+
+describe("recordGithubWorkflowRunConclusion (BLO-21078 mass-cancellation detector numerator)", () => {
+  it("registers the counter so /metrics carries its TYPE line before any event", async () => {
+    const { body } = await renderMetrics();
+    expect(body).toContain(`# TYPE ${GITHUB_WORKFLOW_RUN_CONCLUSION_METRIC} counter`);
+  });
+
+  it("keeps every known conclusion and collapses the rest to other", () => {
+    for (const c of KNOWN_WORKFLOW_RUN_CONCLUSIONS) {
+      expect(normalizeWorkflowRunConclusion(c)).toBe(c);
+    }
+    for (const bad of ["queued", "in_progress", "", null, undefined]) {
+      expect(normalizeWorkflowRunConclusion(bad as string)).toBe(UNKNOWN_WORKFLOW_RUN_CONCLUSION);
+    }
+  });
+
+  it("accumulates repeated cancelled conclusions into the same bounded series", async () => {
+    for (let i = 0; i < 4; i++) {
+      recordGithubWorkflowRunConclusion("cancelled");
+    }
+    const { body } = await renderMetrics();
+    expect(body).toContain(`${GITHUB_WORKFLOW_RUN_CONCLUSION_METRIC}{conclusion="cancelled"} 4`);
+    // Ordinary failure conclusions land on a distinct series -- this is what
+    // lets the mass-cancellation alert key on "cancelled" alone without also
+    // tripping on the background rate of real test failures.
+    expect(body).toContain(`${GITHUB_WORKFLOW_RUN_CONCLUSION_METRIC}{conclusion="failure"} 0`);
+  });
+
+  it("collapses a conclusion outside the bounded set instead of growing cardinality", async () => {
+    const label = recordGithubWorkflowRunConclusion("action_required_v2_unknown");
+    expect(label).toBe(UNKNOWN_WORKFLOW_RUN_CONCLUSION);
+    const { body } = await renderMetrics();
+    expect(body).toContain(`${GITHUB_WORKFLOW_RUN_CONCLUSION_METRIC}{conclusion="other"} 1`);
   });
 });
 
