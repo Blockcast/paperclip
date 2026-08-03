@@ -108,6 +108,29 @@ function ActiveEmptyReviewCountObserver() {
   return showReview ? <ReviewQueueCard emptyState="reassure" /> : null;
 }
 
+function ActiveInFlightReviewCountObserver() {
+  const [showReview, setShowReview] = useState(false);
+  const query = useQuery({
+    queryKey: queryKeys.tools.actionRequests("company-1", "pending"),
+    queryFn: () => listActionRequestsMock("company-1", "pending"),
+    staleTime: 30_000,
+  });
+
+  useEffect(() => {
+    if (query.fetchStatus === "fetching") setShowReview(true);
+  }, [query.fetchStatus]);
+
+  return showReview ? <ReviewQueueCard emptyState="reassure" /> : null;
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
 describe("ReviewQueueCard", () => {
   let container: HTMLDivElement;
   let root: ReturnType<typeof createRoot>;
@@ -199,6 +222,39 @@ describe("ReviewQueueCard", () => {
           <ActiveEmptyReviewCountObserver />
         </QueryClientProvider>,
       );
+    });
+
+    await vi.waitFor(() => {
+      expect(listActionRequestsMock).toHaveBeenCalledTimes(2);
+      expect(buttonContaining("Allow once")).toBeTruthy();
+    });
+  });
+
+  it("waits for an in-flight shared fetch before spending the mount refetch", async () => {
+    const firstFetch = deferred<{ actionRequests: ReturnType<typeof pendingRequest>[] }>();
+    listActionRequestsMock
+      .mockImplementationOnce(() => firstFetch.promise)
+      .mockResolvedValue({ actionRequests: [pendingRequest()] });
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 30_000 } },
+    });
+
+    root = createRoot(container);
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={client}>
+          <ActiveInFlightReviewCountObserver />
+        </QueryClientProvider>,
+      );
+    });
+
+    await vi.waitFor(() => {
+      expect(listActionRequestsMock).toHaveBeenCalledTimes(1);
+    });
+
+    await act(async () => {
+      firstFetch.resolve({ actionRequests: [] });
+      await firstFetch.promise;
     });
 
     await vi.waitFor(() => {

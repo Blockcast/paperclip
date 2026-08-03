@@ -45,8 +45,8 @@ export function ReviewQueueCard({
 
   useEffect(() => {
     if (!selectedCompanyId || didRefetchOnMountForCompany.current === selectedCompanyId) return;
-    didRefetchOnMountForCompany.current = selectedCompanyId;
     if (query.dataUpdatedAt === 0 || query.fetchStatus === "fetching") return;
+    didRefetchOnMountForCompany.current = selectedCompanyId;
     void query.refetch();
   }, [query.dataUpdatedAt, query.fetchStatus, query.refetch, selectedCompanyId]);
 
