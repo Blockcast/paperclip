@@ -276,7 +276,7 @@ function strictFutureMonitor(issue: IssueRow, now: Date) {
 function monitorHasFreshWakeClaim(issue: IssueRow, now: Date) {
   const monitorWakeRequestedAt = coerceDate(issue.monitorWakeRequestedAt);
   if (!monitorWakeRequestedAt) return null;
-  return monitorWakeRequestedAt.getTime() > now.getTime() - ISSUE_MONITOR_WAKE_CLAIM_TTL_MS
+  return monitorWakeRequestedAt.getTime() >= now.getTime() - ISSUE_MONITOR_WAKE_CLAIM_TTL_MS
     ? monitorWakeRequestedAt
     : null;
 }

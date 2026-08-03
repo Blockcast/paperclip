@@ -23,6 +23,7 @@ import {
   DEFAULT_PRODUCTIVITY_REVIEW_MAX_REFRESH_COMMENTS,
   DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
   DEFAULT_PRODUCTIVITY_REVIEW_REFRESH_INTERVAL_MS,
+  ISSUE_MONITOR_WAKE_CLAIM_TTL_MS,
   PRODUCTIVITY_REVIEW_MIN_REFRESH_INTERVAL_MS,
   PRODUCTIVITY_REVIEW_ORIGIN_KIND,
   PRODUCTIVITY_REVIEW_REFRESH_COMMENT_PREFIX,
@@ -1223,6 +1224,40 @@ describeEmbeddedPostgres("productivity review service", () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const monitorNextCheckAt = new Date(now.getTime() - 10 * 60_000);
     const monitorWakeRequestedAt = new Date(now.getTime() - 4 * 60_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt,
+      monitorScheduledBy: "assignee",
+      monitorWakeRequestedAt,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+    });
+
+    expect(result.created).toBe(0);
+    expect(result.monitorScheduledSuppressed).toBe(1);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+
+    const activities = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.action, "issue.productivity_review_suppressed"));
+    expect(activities).toHaveLength(1);
+    expect(activities[0]?.details).toMatchObject({
+      suppressedBy: "monitor_scheduled",
+      monitorNextCheckAt: monitorNextCheckAt.toISOString(),
+      monitorWakeRequestedAt: monitorWakeRequestedAt.toISOString(),
+    });
+  });
+
+  it("suppresses a lapsed monitor claimed exactly at the scheduler claim TTL boundary", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const monitorNextCheckAt = new Date(now.getTime() - 10 * 60_000);
+    const monitorWakeRequestedAt = new Date(now.getTime() - ISSUE_MONITOR_WAKE_CLAIM_TTL_MS);
     const seeded = await seedAssignedIssue({
       status: "in_progress",
       startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
