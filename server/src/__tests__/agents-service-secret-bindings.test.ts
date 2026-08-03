@@ -413,6 +413,59 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
     });
   });
 
+  it("rolls back approval when the pending agent changes state before activation", async () => {
+    const companyId = await seedCompany();
+    const agentId = await seedAgentRow(companyId, {
+      name: "Concurrent Termination",
+      status: "pending_approval",
+      adapterType: "opencode_k8s",
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 15 } },
+    });
+    const approvalId = randomUUID();
+    await db.insert(approvals).values({
+      id: approvalId,
+      companyId,
+      type: "hire_agent",
+      status: "pending",
+      requestedByUserId: "requester",
+      payload: {
+        agentId,
+        name: "Concurrent Termination",
+        role: "engineer",
+        adapterType: "opencode_k8s",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { maxConcurrentRuns: 15 } },
+        budgetMonthlyCents: 5000,
+      },
+      updatedAt: new Date(),
+    });
+
+    let pendingApproval!: ReturnType<ReturnType<typeof approvalService>["approve"]>;
+    await db.transaction(async (tx) => {
+      await tx.execute(sql`select ${agents.id} from ${agents} where ${agents.id} = ${agentId} for update`);
+      pendingApproval = approvalService(db).approve(approvalId, "board-user", "Approved");
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      await tx.update(agents).set({ status: "terminated" }).where(eq(agents.id, agentId));
+    });
+
+    await expect(pendingApproval).rejects.toMatchObject({
+      status: 409,
+      details: {
+        code: "pending_approval_agent_not_activatable",
+        agentId,
+      },
+    });
+    await expect(approvalService(db).getById(approvalId)).resolves.toMatchObject({
+      status: "pending",
+      decidedByUserId: null,
+      decidedAt: null,
+    });
+    await expect(agentService(db).getById(agentId)).resolves.toMatchObject({
+      status: "terminated",
+    });
+    expect(mockNotifyHireApproved).not.toHaveBeenCalled();
+  });
+
   it("keeps legacy approval runtime payloads as full replacements", async () => {
     const companyId = await seedCompany();
     const agentId = await seedAgentRow(companyId, {

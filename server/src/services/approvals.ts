@@ -1,7 +1,7 @@
 import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { approvalComments, approvals } from "@paperclipai/db";
-import { notFound, unprocessable } from "../errors.js";
+import { conflict, notFound, unprocessable } from "../errors.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { agentService } from "./agents.js";
 import { budgetService } from "./budgets.js";
@@ -145,7 +145,13 @@ export function approvalService(db: Db) {
           const payload = updated.payload as Record<string, unknown>;
           const payloadAgentId = typeof payload.agentId === "string" ? payload.agentId : null;
           if (payloadAgentId) {
-            await txAgentsSvc.activatePendingApproval(payloadAgentId, payload);
+            const activation = await txAgentsSvc.activatePendingApproval(payloadAgentId, payload);
+            if (!activation?.activated) {
+              throw conflict("Pending agent could not be activated", {
+                code: "pending_approval_agent_not_activatable",
+                agentId: payloadAgentId,
+              });
+            }
             hireApprovedAgentId = payloadAgentId;
           } else {
             const created = await txAgentsSvc.create(updated.companyId, {
