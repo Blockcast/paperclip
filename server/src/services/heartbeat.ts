@@ -10157,7 +10157,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ),
         ),
       )
-      .orderBy(asc(issues.monitorNextCheckAt), asc(issues.updatedAt))
+      .orderBy(asc(issues.monitorNextCheckAt), asc(issues.updatedAt), asc(issues.id))
       .limit(50);
 
     let triggered = 0;
