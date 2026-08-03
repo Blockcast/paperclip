@@ -262,4 +262,25 @@ describe("ReviewQueueCard", () => {
       expect(buttonContaining("Allow once")).toBeTruthy();
     });
   });
+
+  it("refreshes an empty mounted queue so externally-created pending requests appear", async () => {
+    listActionRequestsMock.mockResolvedValue({ actionRequests: [] });
+
+    await render();
+
+    await vi.waitFor(() => {
+      expect(listActionRequestsMock).toHaveBeenCalledTimes(2);
+      expect(document.body.textContent).toContain("Nothing is waiting for your OK right now.");
+    });
+
+    listActionRequestsMock.mockResolvedValue({ actionRequests: [pendingRequest()] });
+
+    await vi.waitFor(
+      () => {
+        expect(listActionRequestsMock).toHaveBeenCalledTimes(3);
+        expect(buttonContaining("Allow once")).toBeTruthy();
+      },
+      { timeout: 3_500 },
+    );
+  });
 });
