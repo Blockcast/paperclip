@@ -362,6 +362,28 @@ describe("handleWebhook — firing first time", () => {
     );
   });
 
+  it("joins an active aggregate winner before requiring fallback ownership", async () => {
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ ownerMap: {}, fallbackAgentName: undefined });
+    mocks.issues.list.mockImplementation(async (input) =>
+      input.originFingerprint && input.status === "in_progress"
+        ? [{ id: "issue-winner", status: "in_progress", assigneeAgentId: "agent-owner" }]
+        : [],
+    );
+
+    await handleWebhook(ctx, config, TOKEN, baseInput());
+
+    expect(mocks.agents.list).not.toHaveBeenCalled();
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+    expect(mocks.state.set).toHaveBeenCalledWith(
+      expect.any(Object),
+      expect.objectContaining({
+        paperclipIssueId: "issue-winner",
+        assigneeAgentId: "agent-owner",
+      }),
+    );
+  });
+
   it("forwards billing_code label to ctx.issues.create", async () => {
     const { ctx, mocks } = mkCtx();
     const config = baseConfig();
@@ -1356,8 +1378,43 @@ describe("handleWebhook — creation policy", () => {
     );
   });
 
+  it("isolates a malformed opt-out value and still handles valid sibling alerts", async () => {
+    const { ctx, mocks } = mkCtx();
+    const malformed = baseAlert({
+      fingerprint: "malformed-policy",
+      labels: {
+        alertname: "MalformedPolicyAlert",
+        severity: "critical",
+        paperclip_issue: false as unknown as string,
+      },
+    });
+    const valid = baseAlert({ fingerprint: "valid-sibling" });
+
+    await expect(
+      handleWebhook(
+        ctx,
+        baseConfig(),
+        TOKEN,
+        baseInput({ parsedBody: baseEnvelope({ alerts: [malformed, valid] }) }),
+      ),
+    ).rejects.toMatchObject({ fingerprints: ["malformed-policy"] });
+
+    expect(mocks.issues.create).toHaveBeenCalledTimes(1);
+    expect(mocks.issues.create.mock.calls[0][0].originId).toBe("valid-sibling");
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.alert.error",
+      1,
+      { alertname: "MalformedPolicyAlert" },
+    );
+  });
+
   it("attaches concurrent first deliveries to the unique aggregate winner", async () => {
     const { ctx, mocks } = mkCtx();
+    mocks.users.findByEmail.mockResolvedValue({
+      id: "user-owner",
+      email: "alice@example.com",
+      name: "Alice",
+    });
     let createCalls = 0;
     mocks.issues.create.mockImplementation(async () => {
       createCalls += 1;
@@ -1420,6 +1477,38 @@ describe("handleWebhook — creation policy", () => {
       "alertmanager.aggregate.joined",
       1,
       { alertname: "CiliumPolicyDropsHigh", severity: "critical" },
+    );
+  });
+
+  it("finds an active conflict winner behind more than 20 terminal issues", async () => {
+    const { ctx, mocks } = mkCtx();
+    mocks.issues.create.mockRejectedValueOnce(
+      new Error("Alertmanager aggregate creation conflict"),
+    );
+    const terminalIssues = Array.from({ length: 25 }, (_, index) => ({
+      id: `terminal-${index}`,
+      status: index % 2 === 0 ? "done" : "cancelled",
+    }));
+    mocks.issues.list.mockImplementation(async (input) => {
+      if (!input.originFingerprint) return [];
+      if (input.status === "done" || input.status === "cancelled") return terminalIssues;
+      if (input.status === "blocked") {
+        return [{ id: "issue-winner", status: "blocked", assigneeAgentId: "agent-owner" }];
+      }
+      return [];
+    });
+
+    await handleWebhook(ctx, baseConfig(), TOKEN, baseInput());
+
+    expect(mocks.state.set).toHaveBeenCalledWith(
+      expect.any(Object),
+      expect.objectContaining({ paperclipIssueId: "issue-winner" }),
+    );
+    expect(mocks.issues.list).toHaveBeenCalledWith(
+      expect.objectContaining({ status: "blocked", limit: 1 }),
+    );
+    expect(mocks.issues.list).not.toHaveBeenCalledWith(
+      expect.objectContaining({ status: "done" }),
     );
   });
 });

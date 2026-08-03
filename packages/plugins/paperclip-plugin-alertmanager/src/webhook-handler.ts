@@ -63,6 +63,31 @@ export class AlertDeliveryIncompleteError extends Error {
   }
 }
 
+async function findActiveAggregateIssue(
+  ctx: PluginContext,
+  companyId: string,
+  aggregateKey: string,
+) {
+  const activeStatuses = [
+    "backlog",
+    "todo",
+    "in_progress",
+    "in_review",
+    "blocked",
+  ] as const;
+  for (const status of activeStatuses) {
+    const [issue] = await ctx.issues.list({
+      companyId,
+      originKind: ORIGIN_KIND,
+      originFingerprint: aggregateKey,
+      status,
+      limit: 1,
+    });
+    if (issue) return issue;
+  }
+  return null;
+}
+
 function isAggregateCreationConflict(err: unknown): boolean {
   const message =
     err instanceof Error
@@ -305,6 +330,7 @@ export async function handleFiring(
 
   // First time we've seen this fingerprint — create a new issue. `companyId` is
   // already resolved and non-empty; it scoped the state read above.
+  const aggregateKey = aggregateKeyForAlert(alert);
   const { assigneeUserId, assigneeAgentId, resolution } =
     await resolveAssigneeUserId(ctx, alert, config.ownerMap);
   const issueRouteResolution = resolveIssueRoute(alert, config.issueRouteMap);
@@ -330,14 +356,18 @@ export async function handleFiring(
       : routeHasAssigneeUserId
         ? routeAssigneeUserId
         : assigneeUserId;
+  let retainedIssue = null;
   if (!createAssigneeAgentId && !createAssigneeUserId) {
-    createAssigneeAgentId = await resolveFallbackAgentId(
-      ctx,
-      companyId,
-      config.fallbackAgentName,
-    );
+    retainedIssue = await findActiveAggregateIssue(ctx, companyId, aggregateKey);
+    if (!retainedIssue) {
+      createAssigneeAgentId = await resolveFallbackAgentId(
+        ctx,
+        companyId,
+        config.fallbackAgentName,
+      );
+    }
   }
-  if (!createAssigneeAgentId && !createAssigneeUserId) {
+  if (!retainedIssue && !createAssigneeAgentId && !createAssigneeUserId) {
     ctx.logger.warn(
       `Cannot create issue for ${alertname}: fallbackAgentName is missing, invalid, or ambiguous`,
     );
@@ -373,38 +403,36 @@ export async function handleFiring(
 
   const billingCode = alert.labels.billing_code ?? null;
 
-  const aggregateKey = aggregateKeyForAlert(alert);
-  let created = true;
-  let issue;
-  try {
-    issue = await ctx.issues.create({
-      companyId,
-      title,
-      description,
-      priority,
-      originKind: ORIGIN_KIND,
-      originId: alert.fingerprint,
-      originFingerprint: aggregateKey,
-      ...(routeProjectId ? { projectId: routeProjectId } : {}),
-      ...(routeGoalId ? { goalId: routeGoalId } : {}),
-      ...(routeStatus ? { status: routeStatus } : {}),
-      ...(createAssigneeUserId ? { assigneeUserId: createAssigneeUserId } : {}),
-      ...(createAssigneeAgentId ? { assigneeAgentId: createAssigneeAgentId } : {}),
-      ...(billingCode ? { billingCode } : {}),
-    });
-  } catch (err) {
-    if (!isAggregateCreationConflict(err)) throw err;
-    const retained = (await ctx.issues.list({
-      companyId,
-      originKind: ORIGIN_KIND,
-      originFingerprint: aggregateKey,
-      limit: 20,
-    })).find((candidate) =>
-      candidate.status !== "done" && candidate.status !== "cancelled"
-    );
-    if (!retained) throw err;
-    issue = retained;
-    created = false;
+  let created = retainedIssue === null;
+  let issue = retainedIssue;
+  if (!issue) {
+    try {
+      issue = await ctx.issues.create({
+        companyId,
+        title,
+        description,
+        priority,
+        originKind: ORIGIN_KIND,
+        originId: alert.fingerprint,
+        originFingerprint: aggregateKey,
+        ...(routeProjectId ? { projectId: routeProjectId } : {}),
+        ...(routeGoalId ? { goalId: routeGoalId } : {}),
+        ...(routeStatus ? { status: routeStatus } : {}),
+        ...(createAssigneeUserId ? { assigneeUserId: createAssigneeUserId } : {}),
+        ...(createAssigneeAgentId ? { assigneeAgentId: createAssigneeAgentId } : {}),
+        ...(billingCode ? { billingCode } : {}),
+      });
+    } catch (err) {
+      if (!isAggregateCreationConflict(err)) throw err;
+      const retained = await findActiveAggregateIssue(
+        ctx,
+        companyId,
+        aggregateKey,
+      );
+      if (!retained) throw err;
+      issue = retained;
+      created = false;
+    }
   }
   const effectiveAssigneeUserId = created
     ? createAssigneeUserId ?? null
@@ -687,20 +715,31 @@ export async function handleWebhook(
 
     const status = effectiveAlertStatus(alert, body);
     const alertname = alert.labels.alertname ?? "unknown";
-    const optedOut = [
-      alert.labels.paperclip_issue,
-      alert.annotations.paperclip_issue,
-    ].some((value) => value?.trim().toLowerCase() === "false");
-    if (optedOut) {
-      ctx.logger.info(
-        `Alertmanager: ${alertname} opted out via paperclip_issue=false`,
-      );
-      await ctx.metrics.write("alertmanager.webhook.issue_opt_out", 1, {
-        alertname,
-      });
-      continue;
-    }
     try {
+      const policyValues = [
+        alert.labels.paperclip_issue,
+        alert.annotations.paperclip_issue,
+      ];
+      if (
+        policyValues.some(
+          (value) => value !== undefined && typeof value !== "string",
+        )
+      ) {
+        throw new Error("paperclip_issue must be a string when provided");
+      }
+      const optedOut = policyValues.some(
+        (value) =>
+          typeof value === "string" && value.trim().toLowerCase() === "false",
+      );
+      if (optedOut) {
+        ctx.logger.info(
+          `Alertmanager: ${alertname} opted out via paperclip_issue=false`,
+        );
+        await ctx.metrics.write("alertmanager.webhook.issue_opt_out", 1, {
+          alertname,
+        });
+        continue;
+      }
       if (status === "firing") {
         await handleFiring(ctx, config, alert);
       } else if (status === "resolved") {
