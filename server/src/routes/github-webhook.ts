@@ -1930,9 +1930,17 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
     // `context` is only non-null here for a *completed* workflow_run (see the
     // `action !== "completed"` guard in resolveEventContext's workflow_run
     // case) — exactly the terminal event this counter wants once per run.
+    // Pass the run's id/attempt so a GitHub redelivery of this same
+    // completion (at-least-once delivery) doesn't double-count.
     if (eventName === "workflow_run" && context) {
       const workflowRun = payload.workflow_run as Record<string, unknown> | undefined;
-      recordGithubWorkflowRunConclusion(readStringField(workflowRun, "conclusion"));
+      const runId = workflowRun?.id as number | string | undefined;
+      recordGithubWorkflowRunConclusion(
+        readStringField(workflowRun, "conclusion"),
+        runId !== undefined
+          ? { runId, runAttempt: workflowRun?.run_attempt as number | string | undefined }
+          : undefined,
+      );
     }
 
     // A closed or newly-drafted PR cannot produce useful reviewer work. Retire
