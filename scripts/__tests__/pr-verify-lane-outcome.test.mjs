@@ -64,6 +64,22 @@ test("verify step passes when every lane succeeds", () => {
   assert.equal(result.status, 0);
 });
 
+for (const [laneResult, annotation] of [
+  ["failure", "failure"],
+  ["skipped", "skipped"],
+  ["cancelled", "cancelled"],
+]) {
+  test(`verify step rejects an OpenCode Responses replay ${laneResult}`, () => {
+    const result = runVerifyStep({ opencode_responses_replay: laneResult });
+    assert.notEqual(result.status, 0);
+    assert.match(
+      result.stdout,
+      new RegExp(`::error title=verify: lane ${annotation}::`),
+    );
+    assert.match(result.stdout, /opencode_responses_replay/);
+  });
+}
+
 test("verify step exits non-zero and annotates a cancelled lane without asserting a specific cause", () => {
   const result = runVerifyStep({ general_tests: "cancelled" });
   assert.notEqual(result.status, 0);

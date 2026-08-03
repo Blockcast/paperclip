@@ -356,16 +356,14 @@ const configFor = (port) => ({
 
 const assertRedactedAndBounded = (result) => {
   if (Buffer.byteLength(result.output) > MAX_CAPTURE_BYTES || result.overflow) {
-    throw new Error(
-      `malformed replay diagnostics exceeded ${MAX_CAPTURE_BYTES} bytes`,
-    );
+    throw new Error(`replay diagnostics exceeded ${MAX_CAPTURE_BYTES} bytes`);
   }
   if (result.leakedSecret) {
-    throw new Error("malformed replay diagnostics leaked fixture secrets");
+    throw new Error("replay diagnostics leaked fixture secrets");
   }
   for (const secret of SECRET_MARKERS) {
     if (result.output.includes(secret))
-      throw new Error("malformed replay diagnostics leaked fixture secrets");
+      throw new Error("replay diagnostics leaked fixture secrets");
   }
 };
 
@@ -481,13 +479,17 @@ const main = async () => {
       }
     });
     const successPort = await listen(successServer);
-    const success = await runOpenCode(
-      binary,
-      root,
-      configFor(successPort),
-      "Run the framed replay fixture.",
-    );
-    await close(successServer);
+    let success;
+    try {
+      success = await runOpenCode(
+        binary,
+        root,
+        configFor(successPort),
+        "Run the framed replay fixture.",
+      );
+    } finally {
+      await close(successServer);
+    }
     if (
       success.code !== 0 ||
       success.signal ||
@@ -501,6 +503,7 @@ const main = async () => {
     }
     if (success.output.includes("JSON parsing failed"))
       throw new Error("intermediate frame reached final JSON parser");
+    assertRedactedAndBounded(success);
     assertExactAssistantOutput(success.stdout);
 
     const malformedPayload = `${frame({
@@ -516,13 +519,17 @@ const main = async () => {
       reply.end(malformedPayload);
     });
     const malformedPort = await listen(malformedServer);
-    const malformed = await runOpenCode(
-      binary,
-      root,
-      configFor(malformedPort),
-      "Run the malformed replay fixture.",
-    );
-    await close(malformedServer);
+    let malformed;
+    try {
+      malformed = await runOpenCode(
+        binary,
+        root,
+        configFor(malformedPort),
+        "Run the malformed replay fixture.",
+      );
+    } finally {
+      await close(malformedServer);
+    }
     if (malformed.code === 0 || malformed.signal) {
       throw new Error(
         `malformed replay was not rejected deterministically: exit=${malformed.code}`,
