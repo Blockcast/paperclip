@@ -565,7 +565,10 @@ describe("handleWebhook — dedup on re-fire", () => {
       resolvedAt: null,
     };
     mocks.state.get.mockResolvedValueOnce(existing);
-    mocks.issues.get.mockResolvedValueOnce({ id: "issue-existing", status: "in_progress" });
+    mocks.issues.get.mockResolvedValueOnce({
+      id: "issue-existing",
+      status: "in_progress",
+    });
 
     await handleWebhook(ctx, config, TOKEN, baseInput());
 
@@ -582,6 +585,63 @@ describe("handleWebhook — dedup on re-fire", () => {
       "alertmanager.firing.deduped",
       1,
       { alertname: "CiliumPolicyDropsHigh", severity: "critical" },
+    );
+  });
+
+  it("preserves same-fingerprint re-fire behavior for a legacy info alert", async () => {
+    const { ctx, mocks } = mkCtx();
+    const existing: AlertStateRecord = {
+      paperclipIssueId: "issue-existing",
+      paperclipCompanyId: "company-1",
+      assigneeUserId: "user-42",
+      assigneeAgentId: null,
+      alertname: "LegacyInformationalAlert",
+      severity: "info",
+      firstSeenAt: "2026-04-29T08:00:00Z",
+      lastFiredAt: "2026-04-29T08:00:00Z",
+      resolvedAt: null,
+    };
+    mocks.state.get.mockResolvedValueOnce(existing);
+    mocks.issues.get.mockResolvedValueOnce({
+      id: "issue-existing",
+      status: "in_progress",
+    });
+    const alert = baseAlert({
+      fingerprint: "legacy-info-1",
+      labels: { alertname: "LegacyInformationalAlert", severity: "info" },
+    });
+
+    await handleWebhook(
+      ctx,
+      baseConfig(),
+      TOKEN,
+      baseInput({ parsedBody: baseEnvelope({ alerts: [alert] }) }),
+    );
+
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+    expect(mocks.issues.update).toHaveBeenCalledWith(
+      "issue-existing",
+      expect.objectContaining({ description: expect.any(String) }),
+      "company-1",
+    );
+    expect(mocks.state.set).toHaveBeenCalledWith(
+      expect.any(Object),
+      expect.objectContaining({ lastFiredAt: expect.any(String), resolvedAt: null }),
+    );
+    expect(mocks.events.emit).toHaveBeenCalledWith(
+      "alertmanager.alert.firing",
+      "company-1",
+      expect.objectContaining({ fingerprint: "legacy-info-1", reFired: true }),
+    );
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.firing.deduped",
+      1,
+      { alertname: "LegacyInformationalAlert", severity: "info" },
+    );
+    expect(mocks.metrics.write).not.toHaveBeenCalledWith(
+      "alertmanager.webhook.below_issue_floor",
+      expect.any(Number),
+      expect.any(Object),
     );
   });
 
@@ -1264,6 +1324,37 @@ describe("handleWebhook — creation policy", () => {
       );
     },
   );
+
+  it("honors annotation opt-out when the label explicitly enables issue creation", async () => {
+    const { ctx, mocks } = mkCtx();
+    const alert = baseAlert({
+      labels: {
+        alertname: "ConflictingOptOutAlert",
+        severity: "critical",
+        paperclip_issue: "true",
+      },
+      annotations: { paperclip_issue: " false " },
+    });
+
+    await handleWebhook(
+      ctx,
+      baseConfig(),
+      TOKEN,
+      baseInput({ parsedBody: baseEnvelope({ alerts: [alert] }) }),
+    );
+
+    expect(mocks.agents.list).not.toHaveBeenCalled();
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+    expect(mocks.state.get).not.toHaveBeenCalled();
+    expect(mocks.state.set).not.toHaveBeenCalled();
+    expect(mocks.events.emit).not.toHaveBeenCalled();
+    expect(mocks.activity.log).not.toHaveBeenCalled();
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.webhook.issue_opt_out",
+      1,
+      { alertname: "ConflictingOptOutAlert" },
+    );
+  });
 
   it("attaches concurrent first deliveries to the unique aggregate winner", async () => {
     const { ctx, mocks } = mkCtx();

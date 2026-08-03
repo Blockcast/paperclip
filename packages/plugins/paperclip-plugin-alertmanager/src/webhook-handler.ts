@@ -292,6 +292,17 @@ export async function handleFiring(
     return;
   }
 
+  if ((alert.labels.severity ?? "").trim().toLowerCase() === "info") {
+    ctx.logger.info(
+      `Alertmanager: ${alertname} is below the issue creation floor (severity=info)`,
+    );
+    await ctx.metrics.write("alertmanager.webhook.below_issue_floor", 1, {
+      alertname,
+      severity: "info",
+    });
+    return;
+  }
+
   // First time we've seen this fingerprint — create a new issue. `companyId` is
   // already resolved and non-empty; it scoped the state read above.
   const { assigneeUserId, assigneeAgentId, resolution } =
@@ -676,28 +687,16 @@ export async function handleWebhook(
 
     const status = effectiveAlertStatus(alert, body);
     const alertname = alert.labels.alertname ?? "unknown";
-    const optedOut = (
-      alert.labels.paperclip_issue ?? alert.annotations.paperclip_issue
-    )?.trim().toLowerCase() === "false";
+    const optedOut = [
+      alert.labels.paperclip_issue,
+      alert.annotations.paperclip_issue,
+    ].some((value) => value?.trim().toLowerCase() === "false");
     if (optedOut) {
       ctx.logger.info(
         `Alertmanager: ${alertname} opted out via paperclip_issue=false`,
       );
       await ctx.metrics.write("alertmanager.webhook.issue_opt_out", 1, {
         alertname,
-      });
-      continue;
-    }
-    if (
-      status === "firing" &&
-      (alert.labels.severity ?? "").trim().toLowerCase() === "info"
-    ) {
-      ctx.logger.info(
-        `Alertmanager: ${alertname} is below the issue creation floor (severity=info)`,
-      );
-      await ctx.metrics.write("alertmanager.webhook.below_issue_floor", 1, {
-        alertname,
-        severity: "info",
       });
       continue;
     }
