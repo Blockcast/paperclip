@@ -41,7 +41,7 @@ export function approvalService(db: Db) {
     agentId: string,
     approvedAt: Date,
   ) {
-    const shouldNotify = await db.transaction(async (tx) => {
+    const claim = await db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
       await tx.execute(sql`select ${approvals.id} from ${approvals} where ${approvals.id} = ${approval.id} for update`);
       const completed = await txDb
@@ -56,15 +56,18 @@ export function approvalService(db: Db) {
           ),
         )
         .then((rows) => rows[0] ?? null);
-      if (completed) return false;
+      if (completed) return null;
 
-      const latestClaim = await txDb
-        .select({ createdAt: activityLog.createdAt })
+      const latestClaimEvent = await txDb
+        .select({ action: activityLog.action, createdAt: activityLog.createdAt })
         .from(activityLog)
         .where(
           and(
             eq(activityLog.companyId, approval.companyId),
-            eq(activityLog.action, "approval.hire_notification_claimed"),
+            inArray(activityLog.action, [
+              "approval.hire_notification_claimed",
+              "approval.hire_notification_claim_released",
+            ]),
             eq(activityLog.entityType, "approval"),
             eq(activityLog.entityId, approval.id),
           ),
@@ -72,39 +75,101 @@ export function approvalService(db: Db) {
         .orderBy(desc(activityLog.createdAt))
         .limit(1)
         .then((rows) => rows[0] ?? null);
-      if (latestClaim && latestClaim.createdAt.getTime() > Date.now() - HIRE_NOTIFICATION_CLAIM_LEASE_MS) {
-        return false;
+      if (
+        latestClaimEvent?.action === "approval.hire_notification_claimed" &&
+        latestClaimEvent.createdAt.getTime() > Date.now() - HIRE_NOTIFICATION_CLAIM_LEASE_MS
+      ) {
+        return null;
       }
 
       const payload = approval.payload as Record<string, unknown>;
-      if (!latestClaim) {
-        await reconcileApprovedBuiltInAgent(txDb, approval.companyId, payload);
-      }
-      await txDb.insert(activityLog).values({
-        companyId: approval.companyId,
-        actorType: "system",
-        actorId: "approval_service",
-        action: "approval.hire_notification_claimed",
-        entityType: "approval",
-        entityId: approval.id,
-        agentId,
-        details: {
-          sourceBuiltInAgentKey: payload.sourceBuiltInAgentKey,
-          leaseMs: HIRE_NOTIFICATION_CLAIM_LEASE_MS,
-        },
-      });
-      return true;
+      const claimCreatedAt = new Date(
+        Math.max(Date.now(), (latestClaimEvent?.createdAt.getTime() ?? 0) + 1),
+      );
+      return txDb
+        .insert(activityLog)
+        .values({
+          companyId: approval.companyId,
+          actorType: "system",
+          actorId: "approval_service",
+          action: "approval.hire_notification_claimed",
+          entityType: "approval",
+          entityId: approval.id,
+          agentId,
+          createdAt: claimCreatedAt,
+          details: {
+            sourceBuiltInAgentKey: payload.sourceBuiltInAgentKey,
+            leaseMs: HIRE_NOTIFICATION_CLAIM_LEASE_MS,
+          },
+        })
+        .returning({ id: activityLog.id, createdAt: activityLog.createdAt })
+        .then((rows) => rows[0]!);
     });
 
-    if (!shouldNotify) return;
+    if (!claim) return;
 
-    await notifyHireApproved(db, {
+    const payload = approval.payload as Record<string, unknown>;
+    const releaseClaim = () =>
+      db.transaction(async (tx) => {
+        const txDb = tx as unknown as Db;
+        await tx.execute(
+          sql`select ${approvals.id} from ${approvals} where ${approvals.id} = ${approval.id} for update`,
+        );
+        const latestEvent = await txDb
+          .select({
+            id: activityLog.id,
+            action: activityLog.action,
+            createdAt: activityLog.createdAt,
+          })
+          .from(activityLog)
+          .where(
+            and(
+              eq(activityLog.companyId, approval.companyId),
+              inArray(activityLog.action, [
+                "approval.hire_notification_claimed",
+                "approval.hire_notification_claim_released",
+              ]),
+              eq(activityLog.entityType, "approval"),
+              eq(activityLog.entityId, approval.id),
+            ),
+          )
+          .orderBy(desc(activityLog.createdAt))
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (latestEvent?.action !== "approval.hire_notification_claimed" || latestEvent.id !== claim.id) {
+          return;
+        }
+        await txDb.insert(activityLog).values({
+          companyId: approval.companyId,
+          actorType: "system",
+          actorId: "approval_service",
+          action: "approval.hire_notification_claim_released",
+          entityType: "approval",
+          entityId: approval.id,
+          agentId,
+          createdAt: new Date(Math.max(Date.now(), latestEvent.createdAt.getTime() + 1)),
+          details: { claimId: claim.id, sourceBuiltInAgentKey: payload.sourceBuiltInAgentKey },
+        });
+      });
+
+    try {
+      await reconcileApprovedBuiltInAgent(db, approval.companyId, payload);
+    } catch (error) {
+      await releaseClaim();
+      throw error;
+    }
+
+    const delivered = await notifyHireApproved(db, {
       companyId: approval.companyId,
       agentId,
       source: "approval",
       sourceId: approval.id,
       approvedAt,
     });
+    if (!delivered) {
+      await releaseClaim();
+      return;
+    }
     await db.insert(activityLog).values({
       companyId: approval.companyId,
       actorType: "system",
@@ -113,7 +178,7 @@ export function approvalService(db: Db) {
       entityType: "approval",
       entityId: approval.id,
       agentId,
-      details: { sourceBuiltInAgentKey: (approval.payload as Record<string, unknown>).sourceBuiltInAgentKey },
+      details: { sourceBuiltInAgentKey: payload.sourceBuiltInAgentKey },
     });
   }
 

@@ -24,7 +24,7 @@ export interface NotifyHireApprovedInput {
 export async function notifyHireApproved(
   db: Db,
   input: NotifyHireApprovedInput,
-): Promise<void> {
+): Promise<boolean> {
   const { companyId, agentId, source, sourceId } = input;
   const approvedAt = input.approvedAt ?? new Date();
 
@@ -36,14 +36,14 @@ export async function notifyHireApproved(
 
   if (!row) {
     logger.warn({ companyId, agentId, source, sourceId }, "hire hook: agent not found in company, skipping");
-    return;
+    return false;
   }
 
   const adapterType = row.adapterType ?? "process";
   const adapter = findActiveServerAdapter(adapterType);
   const onHireApproved = adapter?.onHireApproved;
   if (!onHireApproved) {
-    return;
+    return true;
   }
 
   const payload: HireApprovedPayload = {
@@ -66,16 +66,23 @@ export async function notifyHireApproved(
   try {
     const result = await onHireApproved(payload, adapterConfig);
     if (result.ok) {
-      await logActivity(db, {
-        companyId,
-        actorType: "system",
-        actorId: "hire_hook",
-        action: "hire_hook.succeeded",
-        entityType: "agent",
-        entityId: agentId,
-        details: { source, sourceId, adapterType },
-      });
-      return;
+      try {
+        await logActivity(db, {
+          companyId,
+          actorType: "system",
+          actorId: "hire_hook",
+          action: "hire_hook.succeeded",
+          entityType: "agent",
+          entityId: agentId,
+          details: { source, sourceId, adapterType },
+        });
+      } catch (err) {
+        logger.error(
+          { err, companyId, agentId, adapterType, source, sourceId },
+          "hire hook: failed to record successful delivery",
+        );
+      }
+      return true;
     }
 
     logger.warn(
@@ -91,6 +98,7 @@ export async function notifyHireApproved(
       entityId: agentId,
       details: { source, sourceId, adapterType, error: result.error, detail: result.detail },
     });
+    return false;
   } catch (err) {
     logger.error(
       { err, companyId, agentId, adapterType, source, sourceId },
@@ -110,5 +118,6 @@ export async function notifyHireApproved(
         error: err instanceof Error ? err.message : String(err),
       },
     });
+    return false;
   }
 }

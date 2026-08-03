@@ -58,7 +58,7 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
   }, 120_000);
 
   beforeEach(() => {
-    mockNotifyHireApproved.mockResolvedValue(undefined);
+    mockNotifyHireApproved.mockResolvedValue(true);
   });
 
   afterEach(async () => {
@@ -583,10 +583,21 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
         }),
       )
       .mockResolvedValueOnce(undefined);
-    mockNotifyHireApproved.mockResolvedValue(undefined);
+    mockNotifyHireApproved.mockResolvedValue(true);
 
     const firstApproval = approvalService(db).approve(approvalId, "board-user", "Approved");
     await vi.waitFor(() => expect(mockEnsureBuiltInAgent).toHaveBeenCalledTimes(1));
+    await expect(
+      db
+        .select({ action: activityLog.action })
+        .from(activityLog)
+        .where(
+          and(
+            eq(activityLog.entityId, approvalId),
+            eq(activityLog.action, "approval.hire_notification_claimed"),
+          ),
+        ),
+    ).resolves.toHaveLength(1);
     expect(mockNotifyHireApproved).not.toHaveBeenCalled();
     rejectReconciliation(new Error("injected filesystem failure"));
     await expect(firstApproval).rejects.toThrow("injected filesystem failure");
@@ -743,13 +754,74 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
     await expect(
       approvalService(db).approve(approvalId, "board-user", "Approved"),
     ).resolves.toMatchObject({ applied: false });
-    expect(mockEnsureBuiltInAgent).not.toHaveBeenCalled();
+    expect(mockEnsureBuiltInAgent).toHaveBeenCalledTimes(1);
     expect(mockNotifyHireApproved).toHaveBeenCalledTimes(1);
 
     await expect(
       approvalService(db).approve(approvalId, "board-user", "Approved"),
     ).resolves.toMatchObject({ applied: false });
     expect(mockNotifyHireApproved).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries notification after an unsuccessful hook result", async () => {
+    const companyId = await seedCompany();
+    const agentId = await seedAgentRow(companyId, {
+      name: "Built-in Hook Retry",
+      status: "pending_approval",
+      adapterType: "codex_local",
+    });
+    const approvalId = randomUUID();
+    await db.insert(approvals).values({
+      id: approvalId,
+      companyId,
+      type: "hire_agent",
+      status: "pending",
+      requestedByUserId: "requester",
+      payload: {
+        agentId,
+        name: "Built-in Hook Retry",
+        role: "engineer",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        budgetMonthlyCents: 0,
+        sourceBuiltInAgentKey: "briefs",
+      },
+      updatedAt: new Date(),
+    });
+    mockEnsureBuiltInAgent.mockResolvedValue(undefined);
+    mockNotifyHireApproved.mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+
+    await expect(
+      approvalService(db).approve(approvalId, "board-user", "Approved"),
+    ).resolves.toMatchObject({ applied: true });
+    await expect(
+      db
+        .select({ id: activityLog.id })
+        .from(activityLog)
+        .where(
+          and(
+            eq(activityLog.entityId, approvalId),
+            eq(activityLog.action, "approval.hire_post_commit_completed"),
+          ),
+        ),
+    ).resolves.toHaveLength(0);
+
+    await expect(
+      approvalService(db).approve(approvalId, "board-user", "Approved"),
+    ).resolves.toMatchObject({ applied: false });
+    expect(mockEnsureBuiltInAgent).toHaveBeenCalledTimes(2);
+    expect(mockNotifyHireApproved).toHaveBeenCalledTimes(2);
+    await expect(
+      db
+        .select({ id: activityLog.id })
+        .from(activityLog)
+        .where(
+          and(
+            eq(activityLog.entityId, approvalId),
+            eq(activityLog.action, "approval.hire_post_commit_completed"),
+          ),
+        ),
+    ).resolves.toHaveLength(1);
   });
 
   it("creates agent secret bindings when a new agent persists secret_ref env", async () => {

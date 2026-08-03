@@ -59,7 +59,7 @@ describe("notifyHireApproved", () => {
         source: "approval",
         sourceId: "ap1",
       }),
-    ).resolves.toBeUndefined();
+    ).resolves.toBe(true);
 
     expect(onHireApproved).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -80,6 +80,32 @@ describe("notifyHireApproved", () => {
     );
   });
 
+  it("reports delivery success when success activity persistence fails", async () => {
+    const onHireApproved = vi.fn().mockResolvedValue({ ok: true });
+    vi.mocked(findActiveServerAdapter).mockReturnValue({
+      type: "openclaw_gateway",
+      onHireApproved,
+    } as any);
+    vi.mocked(logActivity).mockRejectedValueOnce(new Error("activity write failed"));
+
+    const db = mockDbWithAgent({
+      id: "a1",
+      companyId: "c1",
+      name: "OpenClaw Agent",
+      adapterType: "openclaw_gateway",
+    });
+
+    await expect(
+      notifyHireApproved(db, {
+        companyId: "c1",
+        agentId: "a1",
+        source: "approval",
+        sourceId: "ap1",
+      }),
+    ).resolves.toBe(true);
+    expect(onHireApproved).toHaveBeenCalledTimes(1);
+  });
+
   it("does nothing when agent is not found", async () => {
     const db = {
       select: () => ({
@@ -96,7 +122,7 @@ describe("notifyHireApproved", () => {
         source: "join_request",
         sourceId: "jr1",
       }),
-    ).resolves.toBeUndefined();
+    ).resolves.toBe(false);
 
     expect(findActiveServerAdapter).not.toHaveBeenCalled();
   });
@@ -118,7 +144,7 @@ describe("notifyHireApproved", () => {
         source: "approval",
         sourceId: "ap1",
       }),
-    ).resolves.toBeUndefined();
+    ).resolves.toBe(true);
 
     expect(findActiveServerAdapter).toHaveBeenCalledWith("process");
     expect(logActivity).not.toHaveBeenCalled();
@@ -144,7 +170,7 @@ describe("notifyHireApproved", () => {
         source: "join_request",
         sourceId: "jr1",
       }),
-    ).resolves.toBeUndefined();
+    ).resolves.toBe(false);
 
     expect(logActivity).toHaveBeenCalledWith(
       expect.anything(),
@@ -176,7 +202,7 @@ describe("notifyHireApproved", () => {
         source: "join_request",
         sourceId: "jr1",
       }),
-    ).resolves.toBeUndefined();
+    ).resolves.toBe(false);
 
     expect(logActivity).toHaveBeenCalledWith(
       expect.anything(),
