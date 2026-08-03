@@ -309,7 +309,7 @@ jobs:
           NS: ${{ vars.PAPERCLIP_NAMESPACE || 'paperclip' }}
         run: |
           set -e
-          which helm kubectl
+          which helm kubectl jq ruby sha256sum
           helm version --short
           kubectl auth whoami -o yaml
           kubectl -n "$NS" get statefulset paperclip -o jsonpath='{.spec.replicas}{"\n"}'
@@ -369,10 +369,78 @@ jobs:
             echo "- Image: \`${image}@${digest}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # Pin the manifest digest resolved above so the image inspected for the
-      # approved commit is exactly the image Kubernetes pulls. The committed
-      # tag remains the readable source reference for non-CI deploys.
-      - name: helm upgrade
+      # Authorize this exact digest at admission time before rolling it out
+      # (BLO-19955). The ValidatingAdmissionPolicy paperclip-api-image-approval
+      # reads its approved-digest list from
+      # ConfigMap/paperclip-api-approved-images via paramRef, so without this
+      # step helm upgrade is denied.
+      #
+      # The rotation itself lives in scripts/approve-paperclip-api-digest.sh and
+      # is deliberately NOT reimplemented here. An inline copy drifted from the
+      # committed script once already (it lacked the optimistic-concurrency
+      # guard, so two concurrent releases could silently clobber each other's
+      # approval), and only the script is covered by
+      # the real-apiserver suite in Blockcast/onprem-k8s. One implementation,
+      # one reviewed protocol.
+      #
+      # This uses a SEPARATE credential from the deploy kubeconfig on purpose.
+      # KUBECONFIG_PAPERCLIP_CI_DEPLOY has exact-name get access to the approval
+      # ConfigMap because ValidatingAdmissionPolicy parameter resolution checks
+      # that permission as the request user. It has no mutation/list/watch
+      # access. The approver credential is bound to a Role over exactly one
+      # ConfigMap name and holds no cluster-scoped permission.
+      # The release tooling runs from the TRUSTED workflow revision, not from the
+      # checkout above. That checkout is `target_sha` — an operator-supplied
+      # commit, which for a rollback is an arbitrary historical revision of this
+      # repo. Executing a script out of it with the release-approver credential
+      # would mean the credential runs whatever that commit happened to contain:
+      # a rollback to before this script existed dies on `No such file or
+      # directory`, and a rollback onto a commit carrying a later-reverted
+      # version silently runs that old code against the live approval object.
+      #
+      # github.workflow_sha is the commit the currently-executing workflow file
+      # came from, so the script and the workflow step invoking it are always the
+      # same revision and neither is chosen by the deploy requester. The target
+      # checkout stays in place: the Helm chart and application artifact must
+      # still come from the historical commit being rolled out.
+      - name: Checkout release tooling at trusted revision
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .release-tooling
+          fetch-depth: 1
+          sparse-checkout: scripts/approve-paperclip-api-digest.sh
+          sparse-checkout-cone-mode: false
+
+      - name: Verify release tooling revision
+        id: tooling
+        env:
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          # Assert rather than assume, matching "Verify target commit" above: if
+          # the context is ever empty or the checkout silently resolves
+          # elsewhere, fail here instead of approving a digest with tooling of
+          # unknown provenance.
+          expected=$(printf '%s' "${WORKFLOW_SHA}" | tr '[:upper:]' '[:lower:]')
+          if [[ ! "${expected}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "github.workflow_sha is not a full commit SHA: '${WORKFLOW_SHA}'" >&2
+            exit 1
+          fi
+          actual=$(git -C .release-tooling rev-parse HEAD | tr '[:upper:]' '[:lower:]')
+          if [ "${actual}" != "${expected}" ]; then
+            echo "Release tooling resolved to ${actual}, expected ${expected}" >&2
+            exit 1
+          fi
+          script="$(pwd)/.release-tooling/scripts/approve-paperclip-api-digest.sh"
+          if [ ! -f "${script}" ]; then
+            echo "Approval script missing from trusted revision ${expected}" >&2
+            exit 1
+          fi
+          echo "approve_script=${script}" >> "$GITHUB_OUTPUT"
+
+      - name: Render, stamp, and validate deploy plan
+        id: plan
         env:
           DIGEST: ${{ steps.artifact.outputs.digest }}
           NS: ${{ vars.PAPERCLIP_NAMESPACE || 'paperclip' }}
@@ -381,7 +449,6 @@ jobs:
         run: |
           set -euo pipefail
           [[ "${DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]
-          echo "rolling out ${TAG}@${DIGEST} to ${NS}/${RELEASE}"
           expected_image="harbor.blockcast.net/paperclip/paperclip@${DIGEST}"
           rendered=$(helm template "${RELEASE}" ./deploy/helm/paperclip \
             -n "${NS}" \
@@ -395,6 +462,133 @@ jobs:
             printf '%s\n' "${rendered_images:-<none>}" >&2
             exit 1
           fi
+
+          marker_key="paperclip.blockcast.net/approval-plan-sha256"
+          unstamped="${RUNNER_TEMP}/paperclip-api-unstamped.json"
+          plan="${RUNNER_TEMP}/paperclip-api-plan.json"
+
+          helm template "${RELEASE}" ./deploy/helm/paperclip \
+            -n "${NS}" \
+            -f deploy/helm/paperclip/values.blockcast.yaml \
+            --show-only templates/deployment-api.yaml \
+            --set image.tag="${TAG}" \
+            --set-string image.digest="${DIGEST}" \
+            | kubectl create --dry-run=client -n "${NS}" -o json -f - > "${unstamped}"
+
+          canonical_unstamped=$(jq -cS --arg key "${marker_key}" '
+            del(.spec.template.metadata.annotations[$key])
+            | if ((.spec.template.metadata.annotations // {}) | length) == 0
+              then del(.spec.template.metadata.annotations)
+              else .
+              end
+            | if ((.spec.template.metadata // {}) | length) == 0
+              then del(.spec.template.metadata)
+              else .
+              end
+          ' "${unstamped}")
+          marker=$(printf '%s' "${canonical_unstamped}" | sha256sum | awk '{print $1}')
+          [[ "${marker}" =~ ^[0-9a-f]{64}$ ]]
+
+          helm template "${RELEASE}" ./deploy/helm/paperclip \
+            -n "${NS}" \
+            -f deploy/helm/paperclip/values.blockcast.yaml \
+            --show-only templates/deployment-api.yaml \
+            --set image.tag="${TAG}" \
+            --set-string image.digest="${DIGEST}" \
+            --set-string api.approvalPlanSha256="${marker}" \
+            | kubectl create --dry-run=client -n "${NS}" -o json -f - > "${plan}"
+
+          jq -e --arg key "${marker_key}" --arg marker "${marker}" --arg image "${expected_image}" --arg namespace "${NS}" '
+            .apiVersion == "apps/v1" and
+            .kind == "Deployment" and
+            .metadata.namespace == $namespace and
+            .metadata.name == "paperclip-api" and
+            .spec.template.metadata.annotations[$key] == $marker and
+            (.spec.template.spec.containers | all(.image == $image))
+          ' "${plan}" >/dev/null
+
+          canonical_stamped=$(jq -cS --arg key "${marker_key}" '
+            del(.spec.template.metadata.annotations[$key])
+            | if ((.spec.template.metadata.annotations // {}) | length) == 0
+              then del(.spec.template.metadata.annotations)
+              else .
+              end
+            | if ((.spec.template.metadata // {}) | length) == 0
+              then del(.spec.template.metadata)
+              else .
+              end
+          ' "${plan}")
+          if [ "${canonical_stamped}" != "${canonical_unstamped}" ]; then
+            echo "Stamped deployment changed beyond ${marker_key}; refusing approval" >&2
+            exit 1
+          fi
+
+          echo "path=${plan}" >> "$GITHUB_OUTPUT"
+          echo "marker=${marker}" >> "$GITHUB_OUTPUT"
+
+      - name: Approve deploy digest at admission time
+        env:
+          APPROVER_KUBECONFIG: ${{ secrets.KUBECONFIG_PAPERCLIP_RELEASE_APPROVER }}
+          DIGEST: ${{ steps.artifact.outputs.digest }}
+          APPROVE_SCRIPT: ${{ steps.tooling.outputs.approve_script }}
+          DEPLOY_PLAN: ${{ steps.plan.outputs.path }}
+          # The approval window size is deliberately NOT set here. It is a
+          # readonly constant inside the approval script, kept in lockstep with
+          # maxApprovedApiDigests in the admission policy; a workflow-side value
+          # could only ever disagree with the policy, and the script refuses a
+          # disagreeing PAPERCLIP_MAX_APPROVED_DIGESTS rather than writing a ring
+          # the policy answers by denying every rollout.
+        run: |
+          set -euo pipefail
+          if [ -z "${APPROVER_KUBECONFIG}" ]; then
+            echo "KUBECONFIG_PAPERCLIP_RELEASE_APPROVER is not set in the paperclip-production environment." >&2
+            echo "Admission will deny this rollout until the approver credential is provisioned." >&2
+            exit 1
+          fi
+
+          # mktemp -d, not a fixed path: `> "$RUNNER_TEMP/.kube/approver"`
+          # follows a pre-existing symlink at that name, and arc-deploy is a
+          # self-hosted pool, so residue from an earlier workload could redirect
+          # this write — the higher-privilege credential of the two this job
+          # handles — somewhere it survives. mktemp creates a fresh 0700
+          # directory or fails; it never opens something that already exists.
+          approver_dir="$(mktemp -d "${RUNNER_TEMP}/approver.XXXXXXXX")"
+          approver_kubeconfig="${approver_dir}/kubeconfig"
+          approval_log="${approver_dir}/approval.log"
+          deploy_kubeconfig="${KUBECONFIG}"
+
+          # Arm the cleanup BEFORE the credential reaches disk, so a kubectl/jq
+          # failure exiting under `set -e` cannot leave it behind. umask instead
+          # of a follow-up chmod so the file is never briefly world-readable.
+          trap 'rm -rf "${approver_dir}"' EXIT
+          (umask 077; printf '%s' "${APPROVER_KUBECONFIG}" > "${approver_kubeconfig}")
+          unset APPROVER_KUBECONFIG
+
+          KUBECONFIG="${approver_kubeconfig}" \
+            PAPERCLIP_DEPLOY_KUBECONFIG="${deploy_kubeconfig}" \
+            "${APPROVE_SCRIPT}" "${DIGEST}" "${DEPLOY_PLAN}" | tee "${approval_log}"
+
+          {
+            echo "### Admission approval"
+            echo '```'
+            cat "${approval_log}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Pin the manifest digest resolved above so the image inspected for the
+      # approved commit is exactly the image Kubernetes pulls. The committed
+      # tag remains the readable source reference for non-CI deploys.
+      - name: helm upgrade
+        env:
+          DIGEST: ${{ steps.artifact.outputs.digest }}
+          NS: ${{ vars.PAPERCLIP_NAMESPACE || 'paperclip' }}
+          RELEASE: ${{ vars.PAPERCLIP_HELM_RELEASE || 'paperclip' }}
+          TAG: sha-${{ steps.target.outputs.short }}-k8s-vendored
+          PLAN_MARKER: ${{ steps.plan.outputs.marker }}
+        run: |
+          set -euo pipefail
+          [[ "${DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "rolling out ${TAG}@${DIGEST} to ${NS}/${RELEASE}"
           # --timeout bumped 10m → 30m on 2026-05-23 after rev 316 + several
           # prior revs hit "context deadline exceeded" while the cluster was
           # in apiserver/kubelet-latency cascade (control-plane nodes at
@@ -409,6 +603,7 @@ jobs:
             -f deploy/helm/paperclip/values.blockcast.yaml \
             --set image.tag="${TAG}" \
             --set-string image.digest="${DIGEST}" \
+            --set-string api.approvalPlanSha256="${PLAN_MARKER}" \
             --wait --timeout 30m
           helm -n "${NS}" list | head -3
           kubectl -n "${NS}" get pod -l app.kubernetes.io/name=paperclip \

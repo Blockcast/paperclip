@@ -158,3 +158,20 @@ test("a malformed marker fails the render instead of shipping a plan the approve
     /approvalPlanSha256 must be 64 lowercase hex/,
   );
 });
+
+for (const releaseMarker of [undefined, SAMPLE]) {
+  test(`pod.annotations cannot inject the reserved marker when the release marker is ${releaseMarker ? "set" : "unset"}`, () => {
+    const args = [
+      `--set`,
+      `pod.annotations.paperclip\\.blockcast\\.net/approval-plan-sha256=${"b".repeat(64)}`,
+    ];
+    if (releaseMarker) {
+      args.push(`--set`, `api.approvalPlanSha256=${releaseMarker}`);
+    }
+
+    assert.throws(
+      () => renderApiDeployment(args),
+      /pod\.annotations must not set reserved key paperclip\.blockcast\.net\/approval-plan-sha256/,
+    );
+  });
+}

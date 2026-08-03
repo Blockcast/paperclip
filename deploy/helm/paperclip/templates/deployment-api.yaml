@@ -62,6 +62,9 @@ spec:
       diffing a stamped render against an unstamped one.
       */}}
       {{- $podAnnotations := deepCopy (.Values.pod.annotations | default dict) }}
+      {{- if hasKey $podAnnotations "paperclip.blockcast.net/approval-plan-sha256" }}
+      {{- fail "pod.annotations must not set reserved key paperclip.blockcast.net/approval-plan-sha256; use api.approvalPlanSha256 through the release workflow" }}
+      {{- end }}
       {{- with .Values.api.approvalPlanSha256 }}
       {{- if not (regexMatch "^[0-9a-f]{64}$" .) }}
       {{- fail (printf "api.approvalPlanSha256 must be 64 lowercase hex characters, got %q" .) }}

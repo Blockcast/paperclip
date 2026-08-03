@@ -120,3 +120,43 @@ test("Docker deploy binds Helm to the digest built for the approved SHA", () => 
   assert.match(imageHelper, /if \.Values\.image\.digest/);
   assert.match(imageHelper, /printf "%s@%s" \.Values\.image\.repository \.Values\.image\.digest/);
 });
+
+test("Docker deploy approves the exact stamped plan before Helm mutates production", () => {
+  const deployJob = getDeployJobBlock();
+  const tooling = deployJob.indexOf("name: Checkout release tooling at trusted revision");
+  const plan = deployJob.indexOf("name: Render, stamp, and validate deploy plan");
+  const approve = deployJob.indexOf("name: Approve deploy digest at admission time");
+  const upgrade = deployJob.indexOf("name: helm upgrade");
+
+  assert.ok(tooling >= 0 && tooling < plan, "trusted approval tooling must be resolved first");
+  assert.ok(plan < approve, "the side-effect-free stamped plan must validate before approval");
+  assert.ok(approve < upgrade, "admission approval must complete before Helm upgrade");
+  assert.match(deployJob, /ref: \$\{\{ github\.workflow_sha \}\}/);
+  assert.match(deployJob, /--show-only templates\/deployment-api\.yaml/);
+  assert.match(deployJob, /--set-string api\.approvalPlanSha256="\$\{marker\}"/);
+  assert.match(deployJob, /DEPLOY_PLAN: \$\{\{ steps\.plan\.outputs\.path \}\}/);
+  assert.match(
+    deployJob,
+    /"\$\{APPROVE_SCRIPT\}" "\$\{DIGEST\}" "\$\{DEPLOY_PLAN\}"/,
+  );
+  assert.match(
+    deployJob,
+    /PAPERCLIP_DEPLOY_KUBECONFIG="\$\{deploy_kubeconfig\}"/,
+  );
+  assert.match(
+    deployJob,
+    /--set-string api\.approvalPlanSha256="\$\{PLAN_MARKER\}"/,
+  );
+});
+
+test("Docker deploy confines and cleans up the release-approver credential", () => {
+  const deployJob = getDeployJobBlock();
+  const write = deployJob.indexOf('printf \'%s\' "${APPROVER_KUBECONFIG}"');
+  const unset = deployJob.indexOf("unset APPROVER_KUBECONFIG");
+  const invoke = deployJob.indexOf('"${APPROVE_SCRIPT}" "${DIGEST}" "${DEPLOY_PLAN}"');
+
+  assert.match(deployJob, /approver_dir="\$\(mktemp -d/);
+  assert.match(deployJob, /trap 'rm -rf "\$\{approver_dir\}"' EXIT/);
+  assert.ok(write >= 0 && write < unset, "the secret must be materialized before its env value is unset");
+  assert.ok(unset < invoke, "the raw secret must not be inherited by the approval script");
+});
