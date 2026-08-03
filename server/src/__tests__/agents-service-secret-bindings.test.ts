@@ -43,6 +43,18 @@ if (!embeddedPostgresSupport.supported) {
   );
 }
 
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string) {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) => {
+      timeout = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    }),
+  ]).finally(() => {
+    if (timeout) clearTimeout(timeout);
+  });
+}
+
 describeEmbeddedPostgres("agent service secret binding sync", () => {
   let stopDb: (() => Promise<void>) | null = null;
   let db!: ReturnType<typeof createDb>;
@@ -697,6 +709,56 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
     ).resolves.toMatchObject({ applied: false });
     expect(mockEnsureBuiltInAgent).toHaveBeenCalledTimes(2);
     expect(mockNotifyHireApproved).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not starve the database pool when concurrent built-in approvals fill it", async () => {
+    const companyId = await seedCompany();
+    const approvalIds: string[] = [];
+    for (let index = 0; index < 10; index += 1) {
+      const agentId = await seedAgentRow(companyId, {
+        name: `Built-in Pool Saturation ${index}`,
+        status: "pending_approval",
+        adapterType: "codex_local",
+      });
+      const approvalId = randomUUID();
+      approvalIds.push(approvalId);
+      await db.insert(approvals).values({
+        id: approvalId,
+        companyId,
+        type: "hire_agent",
+        status: "pending",
+        requestedByUserId: "requester",
+        payload: {
+          agentId,
+          name: `Built-in Pool Saturation ${index}`,
+          role: "engineer",
+          adapterType: "codex_local",
+          adapterConfig: {},
+          runtimeConfig: {},
+          budgetMonthlyCents: 0,
+          sourceBuiltInAgentKey: "briefs",
+        },
+        updatedAt: new Date(),
+      });
+    }
+    mockEnsureBuiltInAgent.mockResolvedValue(undefined);
+    mockNotifyHireApproved.mockResolvedValue(true);
+    const service = approvalService(db);
+
+    const results = await withTimeout(
+      Promise.all(
+        approvalIds.map((approvalId) =>
+          service.approve(approvalId, "board-user", "Approved"),
+        ),
+      ),
+      5_000,
+      "concurrent built-in approvals",
+    );
+
+    expect(results).toHaveLength(10);
+    expect(results.every((result) => result.applied)).toBe(true);
+    expect(mockEnsureBuiltInAgent).toHaveBeenCalledTimes(10);
+    expect(mockNotifyHireApproved).toHaveBeenCalledTimes(10);
   });
 
   it("retries reconciliation when failure shares a timestamp with its claim", async () => {
