@@ -935,7 +935,7 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
   });
 
   it("fences a live built-in reconciliation attempt after its claim lease", async () => {
-    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
     vi.setSystemTime(new Date("2026-08-03T00:00:00.000Z"));
     const companyId = await seedCompany();
     const agentId = await seedAgentRow(companyId, {
@@ -968,13 +968,15 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
       }),
     );
 
-    const firstApproval = approvalService(db).approve(approvalId, "board-user", "Approved");
+    const firstService = approvalService(db);
+    const secondService = approvalService(db);
+    const firstApproval = firstService.approve(approvalId, "board-user", "Approved");
     await vi.waitFor(() => expect(mockEnsureBuiltInAgent).toHaveBeenCalledTimes(1));
 
-    vi.setSystemTime(new Date("2026-08-03T00:05:01.000Z"));
+    await vi.advanceTimersByTimeAsync(5 * 60_000 + 1000);
 
     await expect(
-      approvalService(db).approve(approvalId, "board-user", "Approved"),
+      secondService.approve(approvalId, "board-user", "Approved"),
     ).resolves.toMatchObject({ applied: false });
     expect(mockEnsureBuiltInAgent).toHaveBeenCalledTimes(1);
     expect(mockNotifyHireApproved).not.toHaveBeenCalled();
@@ -986,7 +988,7 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
   });
 
   it("does not redeliver a live built-in hire notification after its prior lease window", async () => {
-    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
     vi.setSystemTime(new Date("2026-08-03T00:00:00.000Z"));
     const companyId = await seedCompany();
     const agentId = await seedAgentRow(companyId, {
@@ -1020,13 +1022,15 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
       }),
     );
 
-    const firstApproval = approvalService(db).approve(approvalId, "board-user", "Approved");
+    const firstService = approvalService(db);
+    const secondService = approvalService(db);
+    const firstApproval = firstService.approve(approvalId, "board-user", "Approved");
     await vi.waitFor(() => expect(mockNotifyHireApproved).toHaveBeenCalledTimes(1));
 
-    vi.setSystemTime(new Date("2026-08-03T00:05:01.000Z"));
+    await vi.advanceTimersByTimeAsync(5 * 60_000 + 1000);
 
     await expect(
-      approvalService(db).approve(approvalId, "board-user", "Approved"),
+      secondService.approve(approvalId, "board-user", "Approved"),
     ).resolves.toMatchObject({ applied: false });
     expect(mockNotifyHireApproved).toHaveBeenCalledTimes(1);
 

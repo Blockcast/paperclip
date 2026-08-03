@@ -11,7 +11,7 @@ import { instanceSettingsService } from "./instance-settings.js";
 
 const HIRE_RECONCILIATION_CLAIM_LEASE_MS = 5 * 60_000;
 const HIRE_NOTIFICATION_CLAIM_LEASE_MS = 5 * 60_000;
-const activeBuiltInHireAttemptLocks = new Set<string>();
+const HIRE_CLAIM_RENEWAL_INTERVAL_MS = 60_000;
 
 export function approvalService(db: Db) {
   const agentsSvc = agentService(db);
@@ -45,19 +45,21 @@ export function approvalService(db: Db) {
     approvedAt: Date,
   ) {
     const payload = approval.payload as Record<string, unknown>;
-    const reconciliation = await withBuiltInHireAttemptLock(approval, "reconciliation", async () => {
-      const reconciliationClaim = await claimBuiltInHireReconciliation(approval, agentId, payload);
-      if (!reconciliationClaim) return;
-      try {
-        await reconcileApprovedBuiltInAgent(db, approval.companyId, payload);
-        await completeBuiltInHireReconciliation(approval, agentId, payload, reconciliationClaim.attemptId);
-      } catch (error) {
-        await releaseBuiltInHireReconciliationClaim(approval, agentId, payload, reconciliationClaim.attemptId);
-        throw error;
-      }
-    });
-    if (!reconciliation.locked) {
-      return;
+    const reconciliationClaim = await claimBuiltInHireReconciliation(approval, agentId, payload);
+    if (!reconciliationClaim) return;
+    try {
+      await withBuiltInHireClaimLeaseRenewal(
+        "reconciliation",
+        approval,
+        agentId,
+        payload,
+        reconciliationClaim.attemptId,
+        () => reconcileApprovedBuiltInAgent(db, approval.companyId, payload),
+      );
+      await completeBuiltInHireReconciliation(approval, agentId, payload, reconciliationClaim.attemptId);
+    } catch (error) {
+      await releaseBuiltInHireReconciliationClaim(approval, agentId, payload, reconciliationClaim.attemptId);
+      throw error;
     }
 
     await deliverBuiltInHireNotification(approval, agentId, approvedAt, payload);
@@ -69,18 +71,31 @@ export function approvalService(db: Db) {
     );
   }
 
-  async function withBuiltInHireAttemptLock<T>(
-    approval: ApprovalRecord,
+  async function withBuiltInHireClaimLeaseRenewal<T>(
     kind: "reconciliation" | "notification",
+    approval: ApprovalRecord,
+    agentId: string,
+    payload: Record<string, unknown>,
+    attemptId: string,
     task: () => Promise<T>,
-  ): Promise<{ locked: true; value: T } | { locked: false }> {
-    const lockKey = `paperclip:approval:${kind}:${approval.id}`;
-    if (activeBuiltInHireAttemptLocks.has(lockKey)) return { locked: false };
-    activeBuiltInHireAttemptLocks.add(lockKey);
+  ): Promise<T> {
+    let stopped = false;
+    const renew = async () => {
+      if (stopped) return;
+      if (kind === "reconciliation") {
+        await renewBuiltInHireReconciliationClaim(approval, agentId, payload, attemptId);
+      } else {
+        await renewBuiltInHireNotificationClaim(approval, agentId, payload, attemptId);
+      }
+    };
+    const timer = setInterval(() => {
+      void renew().catch(() => {});
+    }, HIRE_CLAIM_RENEWAL_INTERVAL_MS);
     try {
-      return { locked: true as const, value: await task() };
+      return await task();
     } finally {
-      activeBuiltInHireAttemptLocks.delete(lockKey);
+      stopped = true;
+      clearInterval(timer);
     }
   }
 
@@ -377,6 +392,42 @@ export function approvalService(db: Db) {
     });
   }
 
+  async function renewBuiltInHireReconciliationClaim(
+    approval: ApprovalRecord,
+    agentId: string,
+    payload: Record<string, unknown>,
+    attemptId: string,
+  ) {
+    await db.transaction(async (tx) => {
+      const txDb = tx as unknown as Db;
+      await lockApproval(txDb, approval.id);
+      if (await hasBuiltInHireReconciliationCompleted(txDb, approval)) return;
+      const latest = await latestBuiltInHireReconciliationActivity(txDb, approval);
+      if (
+        latest?.action !== "approval.hire_reconciliation_started" ||
+        activityAttemptId(latest.details) !== attemptId
+      ) {
+        return;
+      }
+      await txDb.insert(activityLog).values({
+        companyId: approval.companyId,
+        actorType: "system",
+        actorId: "approval_service",
+        action: "approval.hire_reconciliation_started",
+        entityType: "approval",
+        entityId: approval.id,
+        agentId,
+        details: {
+          attemptId,
+          leaseMs: HIRE_RECONCILIATION_CLAIM_LEASE_MS,
+          renewed: true,
+          sourceBuiltInAgentKey: payload.sourceBuiltInAgentKey,
+        },
+        createdAt: new Date(),
+      });
+    });
+  }
+
   async function releaseBuiltInHireReconciliationClaim(
     approval: ApprovalRecord,
     agentId: string,
@@ -483,6 +534,42 @@ export function approvalService(db: Db) {
     });
   }
 
+  async function renewBuiltInHireNotificationClaim(
+    approval: ApprovalRecord,
+    agentId: string,
+    payload: Record<string, unknown>,
+    attemptId: string,
+  ) {
+    await db.transaction(async (tx) => {
+      const txDb = tx as unknown as Db;
+      await lockApproval(txDb, approval.id);
+      if (await hasBuiltInHireNotificationDelivered(txDb, approval, agentId)) return;
+      const latest = await latestBuiltInHireNotificationActivity(txDb, approval);
+      if (
+        latest?.action !== "approval.hire_notification_started" ||
+        activityAttemptId(latest.details) !== attemptId
+      ) {
+        return;
+      }
+      await txDb.insert(activityLog).values({
+        companyId: approval.companyId,
+        actorType: "system",
+        actorId: "approval_service",
+        action: "approval.hire_notification_started",
+        entityType: "approval",
+        entityId: approval.id,
+        agentId,
+        details: {
+          attemptId,
+          leaseMs: HIRE_NOTIFICATION_CLAIM_LEASE_MS,
+          renewed: true,
+          sourceBuiltInAgentKey: payload.sourceBuiltInAgentKey,
+        },
+        createdAt: new Date(),
+      });
+    });
+  }
+
   async function releaseBuiltInHireNotificationClaim(
     approval: ApprovalRecord,
     agentId: string,
@@ -519,31 +606,36 @@ export function approvalService(db: Db) {
     approvedAt: Date,
     payload: Record<string, unknown>,
   ) {
-    await withBuiltInHireAttemptLock(approval, "notification", async () => {
-      const claim = await claimBuiltInHireNotification(approval, agentId, payload);
-      if (!claim) return;
+    const claim = await claimBuiltInHireNotification(approval, agentId, payload);
+    if (!claim) return;
 
-      let delivered = false;
-      try {
-        delivered = await notifyHireApproved(db, {
+    let delivered = false;
+    try {
+      delivered = await withBuiltInHireClaimLeaseRenewal(
+        "notification",
+        approval,
+        agentId,
+        payload,
+        claim.attemptId,
+        () => notifyHireApproved(db, {
           companyId: approval.companyId,
           agentId,
           source: "approval",
           sourceId: approval.id,
           approvedAt,
-        });
-      } catch (error) {
-        await releaseBuiltInHireNotificationClaim(approval, agentId, payload, claim.attemptId);
-        throw error;
-      }
-      if (!delivered) {
-        await releaseBuiltInHireNotificationClaim(approval, agentId, payload, claim.attemptId);
-        return;
-      }
+        }),
+      );
+    } catch (error) {
+      await releaseBuiltInHireNotificationClaim(approval, agentId, payload, claim.attemptId);
+      throw error;
+    }
+    if (!delivered) {
+      await releaseBuiltInHireNotificationClaim(approval, agentId, payload, claim.attemptId);
+      return;
+    }
 
-      await markBuiltInHireNotificationSucceeded(db, approval, agentId, payload, claim.attemptId);
-      await completeBuiltInHireNotification(approval, agentId, payload, claim.attemptId);
-    });
+    await markBuiltInHireNotificationSucceeded(db, approval, agentId, payload, claim.attemptId);
+    await completeBuiltInHireNotification(approval, agentId, payload, claim.attemptId);
   }
 
   async function getExistingApproval(id: string, dbClient: Db = db) {
