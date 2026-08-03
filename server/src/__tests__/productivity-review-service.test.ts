@@ -1138,6 +1138,70 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(review?.description).toContain("Primary trigger: `long_active_duration`");
   });
 
+  it("does not renew backlog grace forever behind repeated predecessor claims", async () => {
+    const firstPass = new Date("2026-04-28T12:00:00.000Z");
+    const monitorNextCheckAt = new Date(firstPass.getTime() - 10 * 60_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(firstPass.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt,
+      monitorScheduledBy: "assignee",
+    });
+    const predecessorId = randomUUID();
+    await db.insert(issues).values({
+      id: predecessorId,
+      companyId: seeded.companyId,
+      title: "Repeatedly claimed predecessor monitor",
+      status: "in_review" as const,
+      priority: "medium" as const,
+      assigneeAgentId: seeded.coderId,
+      monitorNextCheckAt,
+      monitorScheduledBy: "assignee" as const,
+      monitorWakeRequestedAt: new Date(firstPass.getTime() - 4 * 60_000),
+      issueNumber: 20,
+      identifier: `${seeded.issuePrefix}-20`,
+      createdAt: seeded.createdAt,
+      updatedAt: new Date(seeded.createdAt.getTime() - 1_000),
+    });
+
+    const first = await productivityReviewService(db).reconcileProductivityReviews({
+      now: firstPass,
+      companyId: seeded.companyId,
+      thresholds: {
+        monitorLapseServiceGraceMs: 60_000,
+        monitorSchedulerIntervalMs: 60_000,
+        monitorDispatchBatchSize: 50,
+      },
+    });
+
+    expect(first.created).toBe(0);
+    expect(first.monitorScheduledSuppressed).toBe(1);
+
+    const secondPass = new Date(firstPass.getTime() + 10 * 60_000);
+    await db
+      .update(issues)
+      .set({
+        monitorWakeRequestedAt: new Date(secondPass.getTime() - 30_000),
+        updatedAt: new Date(secondPass.getTime() - 30_000),
+      })
+      .where(eq(issues.id, predecessorId));
+
+    const second = await productivityReviewService(db).reconcileProductivityReviews({
+      now: secondPass,
+      companyId: seeded.companyId,
+      thresholds: {
+        monitorLapseServiceGraceMs: 60_000,
+        monitorSchedulerIntervalMs: 60_000,
+        monitorDispatchBatchSize: 50,
+      },
+    });
+
+    expect(second.created).toBe(1);
+    expect(second.monitorScheduledSuppressed).toBe(0);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+  });
+
   it("suppresses a lapsed monitor claimed by the scheduler after candidate selection", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const monitorNextCheckAt = new Date(now.getTime() - 10 * 60_000);
@@ -1383,6 +1447,47 @@ describeEmbeddedPostgres("productivity review service", () => {
 
     const result = await productivityReviewService(db, {
       async beforeCreateOrUpdateReview(evidence) {
+        if (evidence.sourceIssue.id !== seeded.issueId) return;
+        await db
+          .update(issues)
+          .set({ monitorWakeRequestedAt, updatedAt: monitorWakeRequestedAt })
+          .where(eq(issues.id, seeded.issueId));
+      },
+    }).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+    });
+
+    expect(result.created).toBe(0);
+    expect(result.monitorScheduledSuppressed).toBe(1);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+
+    const activities = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.action, "issue.productivity_review_suppressed"));
+    expect(activities).toHaveLength(1);
+    expect(activities[0]?.details).toMatchObject({
+      suppressedBy: "monitor_scheduled",
+      monitorNextCheckAt: monitorNextCheckAt.toISOString(),
+      monitorWakeRequestedAt: monitorWakeRequestedAt.toISOString(),
+    });
+  });
+
+  it("guards monitor suppression after final revalidation until issue insert", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const monitorNextCheckAt = new Date(now.getTime() - 10 * 60_000);
+    const monitorWakeRequestedAt = new Date(now.getTime() - 30_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt,
+      monitorScheduledBy: "assignee",
+    });
+
+    const result = await productivityReviewService(db, {
+      async beforeCreateReviewIssueInsert(evidence) {
         if (evidence.sourceIssue.id !== seeded.issueId) return;
         await db
           .update(issues)

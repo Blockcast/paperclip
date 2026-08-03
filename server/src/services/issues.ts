@@ -787,6 +787,7 @@ type IssueUserContextInput = {
 };
 type ProjectGoalReader = Pick<Db, "select">;
 type DbReader = Pick<Db, "select">;
+type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type IssueCreateInput = Omit<typeof issues.$inferInsert, "companyId"> & {
   labelIds?: string[];
   blockedByIssueIds?: string[];
@@ -809,6 +810,7 @@ type IssueCreateInput = Omit<typeof issues.$inferInsert, "companyId"> & {
   idempotencyKey?: string | null;
   allowDuplicate?: boolean;
   onDeduplicated?: (reason: "idempotency_key" | "recent_open_title") => void;
+  beforeInsert?: (tx: DbTransaction) => Promise<void> | void;
 };
 type IssueChildCreateInput = IssueCreateInput & {
   acceptanceCriteria?: string[];
@@ -7860,6 +7862,7 @@ export function issueService(db: Db) {
         idempotencyKey: rawIdempotencyKey,
         allowDuplicate,
         onDeduplicated,
+        beforeInsert,
         ...issueData
       } = data;
       const isolatedWorkspacesEnabled = (await instanceSettings.getExperimental()).enableIsolatedWorkspaces;
@@ -8258,6 +8261,7 @@ export function issueService(db: Db) {
           }),
         );
 
+        await beforeInsert?.(tx);
         const [issue] = await tx.insert(issues).values(values).returning();
 
         // When the identifier was minted by Linear (companies.identifier_provider
