@@ -18,6 +18,7 @@ import {
 import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
 import { budgetService } from "./budgets.js";
+import { lockIssueMonitorQueue } from "./issue-monitor-queue-lock.js";
 import { issueService } from "./issues.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import {
@@ -184,6 +185,7 @@ type ProductivityReviewServiceDeps = {
   enqueueWakeup?: EnqueueWakeup;
   beforeCreateOrUpdateReview?: (evidence: ProductivityReviewEvidence) => Promise<void> | void;
   beforeCreateReviewIssueInsert?: (evidence: ProductivityReviewEvidence) => Promise<void> | void;
+  afterFinalMonitorSuppressionRevalidation?: (evidence: ProductivityReviewEvidence) => Promise<void> | void;
 };
 
 class MonitorSuppressedBeforeCreateError extends Error {
@@ -1096,7 +1098,6 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     now: Date,
     thresholds: ProductivityReviewThresholds,
     dbClient: DbOrTx = db,
-    opts?: { lockQueueRows?: boolean },
   ) {
     const monitorNextCheckAt = coerceDate(sourceIssue.monitorNextCheckAt);
     if (!monitorNextCheckAt || monitorNextCheckAt.getTime() > now.getTime()) return 0;
@@ -1140,15 +1141,6 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       sql`${issues.assigneeAgentId} is not null`,
       inArray(issues.status, ["in_progress", "in_review"]),
     );
-    if (opts?.lockQueueRows) {
-      await dbClient
-        .select({ id: issues.id })
-        .from(issues)
-        .innerJoin(companies, eq(companies.id, issues.companyId))
-        .where(queueFilter)
-        .for("update", { of: [issues] });
-    }
-
     const queueState = await dbClient
       .select({
         duePosition: sql<number>`count(*)::int`,
@@ -1188,8 +1180,14 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     now: Date,
     thresholds: ProductivityReviewThresholds,
     dbClient: DbOrTx = db,
-    opts?: { lockSource?: boolean; lockQueueRows?: boolean; runBacklogHook?: boolean },
+    opts?: { lockSource?: boolean; lockMonitorQueue?: boolean; runBacklogHook?: boolean },
   ) {
+    if (opts?.lockMonitorQueue) {
+      // Coordinate with heartbeat's monitor-claim update without locking the predecessor row set.
+      // Heartbeat uses a non-blocking try-lock, so slow issue identifier providers cannot stall
+      // the scheduler behind this final create-window guard.
+      await lockIssueMonitorQueue(dbClient);
+    }
     const currentIssue = await getCurrentIssue(sourceIssue, dbClient, { forUpdate: opts?.lockSource });
     if (!currentIssue || !issueCanReceiveMonitorDispatch(currentIssue)) return null;
 
@@ -1199,13 +1197,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     if (opts?.runBacklogHook !== false) {
       await deps?.beforeMonitorBacklogGrace?.(currentIssue);
     }
-    const backlogGraceMs = await monitorBacklogGraceMs(
-      currentIssue,
-      now,
-      thresholds,
-      dbClient,
-      { lockQueueRows: opts?.lockQueueRows },
-    );
+    const backlogGraceMs = await monitorBacklogGraceMs(currentIssue, now, thresholds, dbClient);
     const latestIssue = await getCurrentIssue(sourceIssue, dbClient);
     if (!latestIssue || !issueCanReceiveMonitorDispatch(latestIssue)) return null;
 
@@ -1779,9 +1771,10 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
             evidence.generatedAt,
             opts.thresholds,
             tx,
-            { lockSource: true, lockQueueRows: true, runBacklogHook: false },
+            { lockSource: true, lockMonitorQueue: true, runBacklogHook: false },
           );
           if (monitor) throw new MonitorSuppressedBeforeCreateError(monitor);
+          await deps?.afterFinalMonitorSuppressionRevalidation?.(evidence);
         },
       });
     } catch (error) {
