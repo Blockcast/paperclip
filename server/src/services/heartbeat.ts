@@ -18222,6 +18222,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
 
       const queuedRunIds = new Set(queuedRuns.map((run) => run.id));
+      type EmergencyLaneCursors = {
+        critical?: { createdAt: Date; id: string };
+        recovery?: { createdAt: Date; id: string };
+      };
+      const emergencyLaneCursorsByRunId = new Map<string, EmergencyLaneCursors>();
+      const markEmergencyLaneRun = (
+        run: typeof heartbeatRuns.$inferSelect,
+        lane: keyof EmergencyLaneCursors,
+      ) => {
+        const lanes = emergencyLaneCursorsByRunId.get(run.id) ?? {};
+        lanes[lane] = { createdAt: run.createdAt, id: run.id };
+        emergencyLaneCursorsByRunId.set(run.id, lanes);
+      };
       /**
        * Priority lane: a `critical` or recovery-action row must be rankable
        * even when it sits outside the window this pass scanned.
@@ -18484,6 +18497,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
       for (const { run, issue } of criticalLaneRows) {
         issueById.set(issue.id, issue);
+        markEmergencyLaneRun(run, "critical");
         admitToPriorityLane(run);
       }
       for (const run of recoveryLaneRows) {
@@ -18492,6 +18506,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // inner join dropped those too; the claim-time gate still handles them.
         const issue = issueId ? issueById.get(issueId) : null;
         if (!issue || TERMINAL_ISSUE_STATUSES.has(issue.status)) continue;
+        markEmergencyLaneRun(run, "recovery");
         admitToPriorityLane(run);
       }
       if (priorityLaneRuns.length > 0) {
@@ -18768,6 +18783,65 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
 
       const claimedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
+      let scheduledEmergencyContinuationAfterRefusal = false;
+      const scheduleEmergencyContinuationForStillQueuedRun = async (
+        run: typeof heartbeatRuns.$inferSelect,
+      ) => {
+        const laneCursors = emergencyLaneCursorsByRunId.get(run.id);
+        if (!laneCursors) return false;
+        const current = await db
+          .select({ status: heartbeatRuns.status })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, run.id))
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (current?.status !== "queued") return false;
+
+        // A dependency-ready emergency row can still fail atomic admission
+        // without leaving the queue, e.g. an external-runtime slot conflict.
+        // Resume all dispatch scans past that row so the follow-up cannot
+        // rediscover the same refused head candidate and hide deeper emergency
+        // work behind it again.
+        dispatchResumeCursorByAgent.set(agentId, {
+          createdAt: run.createdAt,
+          id: run.id,
+          passes: resumeState?.passes ?? 0,
+        });
+        if (laneCursors.critical) {
+          dispatchCriticalLaneCursorByAgent.set(agentId, laneCursors.critical);
+          scheduleDetachedDispatchPass(agentId, "resume_critical_lane");
+          await options.afterQueuedDispatchContinuationScheduledForTest?.({
+            agentId,
+            reason: "resume_critical_lane",
+          });
+        }
+        if (laneCursors.recovery) {
+          dispatchRecoveryLaneCursorByAgent.set(agentId, laneCursors.recovery);
+          scheduleDetachedDispatchPass(agentId, "resume_recovery_lane");
+          await options.afterQueuedDispatchContinuationScheduledForTest?.({
+            agentId,
+            reason: "resume_recovery_lane",
+          });
+        }
+        return Boolean(laneCursors.critical || laneCursors.recovery);
+      };
+      const launchClaimedRuns = () => {
+        for (const claimedRun of claimedRuns) {
+          // BLO-20396: detach from the start-lock context. executeRun is launched
+          // here but outlives the critical section, and on completion it calls
+          // startNextQueuedRunForAgent again to pick up the next queued run. If
+          // it inherited this pass's held-agent set that follow-up dispatch would
+          // look re-entrant and be coalesced away, stalling the queue.
+          const execution = runDetachedFromAgentStartLock(() =>
+            executeRun(claimedRun.id).catch((err) => {
+              logger.error({ err, runId: claimedRun.id }, "queued heartbeat execution failed");
+            }));
+          inFlightExecutions.add(execution);
+          void execution.finally(() => {
+            inFlightExecutions.delete(execution);
+          });
+        }
+      };
       for (const queuedRun of prioritizedRuns) {
         if (claimedRuns.length >= availableSlots) break;
         if (dispatchStopped) break;
@@ -18787,9 +18861,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           continue;
         }
         const claimed = await claimQueuedRun(queuedRun, companyAgents);
-        if (!claimed) continue;
+        if (!claimed) {
+          if (await scheduleEmergencyContinuationForStillQueuedRun(queuedRun)) {
+            scheduledEmergencyContinuationAfterRefusal = true;
+            break;
+          }
+          continue;
+        }
         claimedRuns.push(claimed);
         if (queuedIssueId) inFlightIssueIds.add(queuedIssueId);
+      }
+      if (scheduledEmergencyContinuationAfterRefusal) {
+        if (claimedRuns.length > 0) {
+          launchClaimedRuns();
+        }
+        return claimedRuns;
       }
       if (claimedRuns.length === 0) {
         finishPassWithoutClaims();
@@ -18800,22 +18886,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // re-triggers dispatch. A pass that filled only some of them schedules a
       // cursor continuation instead; see advanceOrClearResumeCursor.
       advanceOrClearResumeCursor(claimedRuns.length);
-
-      for (const claimedRun of claimedRuns) {
-        // BLO-20396: detach from the start-lock context. executeRun is launched
-        // here but outlives the critical section, and on completion it calls
-        // startNextQueuedRunForAgent again to pick up the next queued run. If
-        // it inherited this pass's held-agent set that follow-up dispatch would
-        // look re-entrant and be coalesced away, stalling the queue.
-        const execution = runDetachedFromAgentStartLock(() =>
-          executeRun(claimedRun.id).catch((err) => {
-            logger.error({ err, runId: claimedRun.id }, "queued heartbeat execution failed");
-          }));
-        inFlightExecutions.add(execution);
-        void execution.finally(() => {
-          inFlightExecutions.delete(execution);
-        });
-      }
+      launchClaimedRuns();
       return claimedRuns;
     }, {
       // BLO-20396: a nested (reap → promote → dispatch) or coalesced call does

@@ -30,6 +30,7 @@ import {
   agentWakeupRequests,
   companies,
   createDb,
+  externalRuntimeReservations,
   heartbeatRuns,
   issueRelations,
   issues,
@@ -2224,6 +2225,194 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     expect(dispatchedRunIds[0]).toBe(recoveryRunId);
     await boundedHeartbeat.drainInFlightExecutions(60_000);
   }, 120_000);
+
+  it.each([
+    { lane: "critical", resumeReason: "resume_critical_lane" },
+    { lane: "recovery", resumeReason: "resume_recovery_lane" },
+  ] as const)(
+    "resumes the $lane lane past an external slot claim refusal",
+    async ({ lane, resumeReason }) => {
+      const companyId = randomUUID();
+      const agentId = randomUUID();
+      const staleSlotRunId = randomUUID();
+      const refusedIssueId = randomUUID();
+      const ordinaryIssueId = randomUUID();
+      const deeperIssueId = randomUUID();
+      const refusedRunId = randomUUID();
+      const ordinaryRunId = randomUUID();
+      const deeperRunId = randomUUID();
+      const issuePrefix = `S${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+      const baseCreatedAt = new Date(Date.now() - 5 * 60 * 1000);
+      let releasedStaleSlot = false;
+
+      const boundedHeartbeat = heartbeatService(db, {
+        penstockGate: allowPenstockGate,
+        queuedRunDispatchBounds: { scanLimit: 1, maxScanBatches: 1, maxResumePasses: 5 },
+        afterQueuedDispatchContinuationScheduledForTest: async (event) => {
+          if (event.reason !== resumeReason || releasedStaleSlot) return;
+          releasedStaleSlot = true;
+          await db
+            .update(externalRuntimeReservations)
+            .set({
+              state: "released",
+              releasedAt: new Date(),
+              releaseReason: "test_slot_released",
+              updatedAt: new Date(),
+            })
+            .where(eq(externalRuntimeReservations.runId, staleSlotRunId));
+        },
+      });
+
+      await db.insert(companies).values({
+        id: companyId,
+        name: `ExternalSlot${lane}Co`,
+        issuePrefix,
+        requireBoardApprovalForNewAgents: false,
+        defaultResponsibleUserId: "responsible-user",
+      });
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: `ExternalSlot${lane}Agent`,
+        role: "engineer",
+        status: "idle",
+        adapterType: "claude_k8s",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { enabled: true, wakeOnDemand: true, maxConcurrentRuns: 1 } },
+        permissions: {},
+      });
+
+      await db.insert(issues).values([
+        {
+          id: refusedIssueId,
+          companyId,
+          title: `Slot-refused ${lane} work`,
+          status: "todo",
+          priority: lane === "critical" ? "critical" : "medium",
+          assigneeAgentId: agentId,
+          issueNumber: 1,
+          identifier: `${issuePrefix}-1`,
+        },
+        {
+          id: ordinaryIssueId,
+          companyId,
+          title: "Ordinary work between emergency candidates",
+          status: "todo",
+          priority: "low",
+          assigneeAgentId: agentId,
+          issueNumber: 2,
+          identifier: `${issuePrefix}-2`,
+        },
+        {
+          id: deeperIssueId,
+          companyId,
+          title: `Deeper ${lane} work`,
+          status: "todo",
+          priority: lane === "critical" ? "critical" : "medium",
+          assigneeAgentId: agentId,
+          issueNumber: 3,
+          identifier: `${issuePrefix}-3`,
+        },
+      ]);
+
+      await db.insert(heartbeatRuns).values({
+        id: staleSlotRunId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "succeeded",
+        contextSnapshot: {},
+        startedAt: new Date(baseCreatedAt.getTime() - 60_000),
+        finishedAt: new Date(baseCreatedAt.getTime() - 30_000),
+        createdAt: new Date(baseCreatedAt.getTime() - 60_000),
+        updatedAt: new Date(baseCreatedAt.getTime() - 30_000),
+      });
+      await db.insert(externalRuntimeReservations).values({
+        companyId,
+        agentId,
+        runId: staleSlotRunId,
+        slotId: 0,
+        state: "launched",
+        jobName: `paperclip-agent-${staleSlotRunId}`,
+        jobUid: randomUUID(),
+        isolationMode: "run",
+        isolationKey: `run:${staleSlotRunId}`,
+        isolationBoundAt: new Date(baseCreatedAt.getTime() - 60_000),
+        reservedAt: new Date(baseCreatedAt.getTime() - 60_000),
+        launchingAt: new Date(baseCreatedAt.getTime() - 60_000),
+        launchedAt: new Date(baseCreatedAt.getTime() - 30_000),
+        createdAt: new Date(baseCreatedAt.getTime() - 60_000),
+        updatedAt: new Date(baseCreatedAt.getTime() - 30_000),
+      });
+
+      const queued = [
+        { runId: refusedRunId, issueId: refusedIssueId, offset: 0, emergency: true },
+        { runId: ordinaryRunId, issueId: ordinaryIssueId, offset: 1, emergency: false },
+        { runId: deeperRunId, issueId: deeperIssueId, offset: 2, emergency: true },
+      ];
+      for (const { runId, issueId, offset, emergency } of queued) {
+        const wakeId = randomUUID();
+        const recoveryActionId = randomUUID();
+        const createdAt = new Date(baseCreatedAt.getTime() + offset);
+        const isRecovery = lane === "recovery" && emergency;
+        await db.insert(agentWakeupRequests).values({
+          id: wakeId,
+          companyId,
+          agentId,
+          source: "assignment",
+          triggerDetail: "system",
+          reason: isRecovery ? "source_scoped_recovery_action" : "issue_assigned",
+          payload: isRecovery ? { issueId, recoveryActionId } : { issueId },
+          status: "queued",
+          runId,
+          requestedAt: createdAt,
+          updatedAt: createdAt,
+        });
+        await db.insert(heartbeatRuns).values({
+          id: runId,
+          companyId,
+          agentId,
+          invocationSource: "assignment",
+          triggerDetail: "system",
+          status: "queued",
+          wakeupRequestId: wakeId,
+          contextSnapshot: {
+            issueId,
+            wakeReason: isRecovery ? "source_scoped_recovery_action" : "issue_assigned",
+            ...(isRecovery
+              ? { source: "issue_recovery_action", recoveryActionId }
+              : {}),
+          },
+          createdAt,
+          updatedAt: createdAt,
+        });
+      }
+
+      const dispatchedRunIds: string[] = [];
+      mockAdapterExecute.mockImplementation(async (args: { runId: string }) => {
+        dispatchedRunIds.push(args.runId);
+        return {
+          exitCode: 0,
+          signal: null as string | null,
+          timedOut: false,
+          errorMessage: null as string | null,
+          resultJson: { exitCode: 0 },
+          provider: "test",
+          model: "test-model",
+        };
+      });
+
+      await boundedHeartbeat.resumeQueuedRuns();
+      await waitForRunToSettle(boundedHeartbeat, deeperRunId, 60_000);
+
+      expect(releasedStaleSlot).toBe(true);
+      expect(dispatchedRunIds[0]).toBe(deeperRunId);
+      expect((await boundedHeartbeat.getRun(deeperRunId))?.status).not.toBe("queued");
+      await boundedHeartbeat.drainInFlightExecutions(60_000);
+    },
+    180_000,
+  );
 
   it("skips malformed persisted issue ids in UUID batch lookups", async () => {
     const companyId = randomUUID();
