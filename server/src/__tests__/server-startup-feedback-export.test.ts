@@ -507,10 +507,13 @@ describe("startServer feedback export wiring", () => {
       );
 
       intervalCallback?.();
-      await Promise.resolve();
-      await Promise.resolve();
-
-      expect(heartbeatServiceMock.sweepStaleIssueLocks).toHaveBeenCalledTimes(1);
+      // `vi.waitFor` rather than a fixed number of `await Promise.resolve()`
+      // hops: the sweep is reached after several awaits inside the tick, and
+      // counting microtasks makes this fail whenever a reconciler is added
+      // ahead of it (BLO-20822 did exactly that). The property under test is
+      // that the sweep still runs despite an unrelated recovery rejection —
+      // not how many microtasks it takes to get there.
+      await vi.waitFor(() => expect(heartbeatServiceMock.sweepStaleIssueLocks).toHaveBeenCalledTimes(1));
     } finally {
       setIntervalSpy.mockRestore();
     }
@@ -542,10 +545,9 @@ describe("startServer feedback export wiring", () => {
       heartbeatServiceMock.reconcileWorkerCrashedRuns.mockClear();
 
       intervalCallback?.();
-      await Promise.resolve();
-      await Promise.resolve();
-
-      expect(heartbeatServiceMock.reconcileWorkerCrashedRuns).toHaveBeenCalledTimes(1);
+      await vi.waitFor(() =>
+        expect(heartbeatServiceMock.reconcileWorkerCrashedRuns).toHaveBeenCalledTimes(1),
+      );
     } finally {
       setIntervalSpy.mockRestore();
     }
