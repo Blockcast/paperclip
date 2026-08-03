@@ -42,7 +42,10 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { allocateIdentifier } from "../services/identifier-allocator.js";
+import {
+  allocateIdentifier,
+  LinearIssueCreateUnconfirmedError,
+} from "../services/identifier-allocator.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -283,6 +286,71 @@ describeEmbeddedPostgres("allocateFromLinear (happy path, mocked fetch + secrets
     const recoveryBody = JSON.parse(fetchSpy!.mock.calls[2]![1]!.body as string);
     expect(recoveryBody.query).toMatch(/query IssueById/);
     expect(recoveryBody.variables.id).toBe("reserved-review-id");
+  });
+
+  it("keeps the same idempotency key after an unconfirmed IssueCreate outcome", async () => {
+    const { company } = await seedLinearConfigured({});
+
+    fetchSpy!
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ data: { issue: null } }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            errors: [{ message: "timeout after upstream create", path: ["issueCreate"] }],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ data: { issue: null } }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            data: {
+              issue: {
+                id: "reserved-review-id",
+                identifier: "BLO-5555",
+                url: "https://linear.app/blockc/issue/BLO-5555/title-slug",
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+      );
+
+    await expect(
+      allocateIdentifier({
+        db,
+        companyId: company.id,
+        title: "ambiguous create with delayed lookup visibility",
+        linearIssueIdempotencyKey: "reserved-review-id",
+      }),
+    ).rejects.toBeInstanceOf(LinearIssueCreateUnconfirmedError);
+
+    const retry = await allocateIdentifier({
+      db,
+      companyId: company.id,
+      title: "ambiguous create with delayed lookup visibility",
+      linearIssueIdempotencyKey: "reserved-review-id",
+    });
+
+    expect(retry.identifier).toBe("BLO-5555");
+    expect(retry.externalIssueId).toBe("reserved-review-id");
+    expect(retry.createdLinearSideIssue).toBe(false);
+    expect(fetchSpy).toHaveBeenCalledTimes(4);
+    const firstCreateBody = JSON.parse(fetchSpy!.mock.calls[1]![1]!.body as string);
+    expect(firstCreateBody.variables.input.id).toBe("reserved-review-id");
+    const retryLookupBody = JSON.parse(fetchSpy!.mock.calls[3]![1]!.body as string);
+    expect(retryLookupBody.variables.id).toBe("reserved-review-id");
   });
 
   it("omits description from the IssueCreate input when caller doesn't provide one", async () => {

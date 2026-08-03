@@ -21,7 +21,11 @@ import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
 import { budgetService } from "./budgets.js";
-import { allocateIdentifier, deleteLinearIssueForCompany } from "./identifier-allocator.js";
+import {
+  allocateIdentifier,
+  deleteLinearIssueForCompany,
+  LinearIssueCreateUnconfirmedError,
+} from "./identifier-allocator.js";
 import { withIssueMonitorQueueLock } from "./issue-monitor-queue-lock.js";
 import { issueService } from "./issues.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
@@ -68,6 +72,12 @@ export const PRODUCTIVITY_REVIEW_REFRESH_COMMENT_PREFIX = "Productivity review e
 const PRODUCTIVITY_REVIEW_CREATED_ACTION = "issue.productivity_review_created";
 const PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_ENQUEUED_ACTION =
   "issue.productivity_review_assignment_wake_enqueued";
+const PRODUCTIVITY_REVIEW_DURABLE_WAKE_REQUEST_STATUSES = [
+  "queued",
+  "claimed",
+  "coalesced",
+  "deferred_issue_execution",
+] as const;
 // BLO-3281 AC2 hard floor: even if the detector scan cadence is faster
 // than this, the refresh-evidence-comment path stays throttled at 5 min.
 // Defends against the 2026-05-05 incident on BLO-3277 (14 refreshes in
@@ -803,6 +813,9 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         return { review: updated, finalized: true };
       });
     } catch (error) {
+      if (error instanceof LinearIssueCreateUnconfirmedError) {
+        throw error;
+      }
       if (createdLinearIssueId) {
         await deleteLinearIssueForCompany(db, input.review.companyId, createdLinearIssueId).catch(() => {});
       }
@@ -1049,6 +1062,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           eq(agentWakeupRequests.companyId, input.companyId),
           eq(agentWakeupRequests.agentId, input.agentId),
           eq(agentWakeupRequests.idempotencyKey, input.idempotencyKey),
+          inArray(agentWakeupRequests.status, [...PRODUCTIVITY_REVIEW_DURABLE_WAKE_REQUEST_STATUSES]),
         ),
       )
       .limit(1)
@@ -1105,7 +1119,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       }
 
       if (!wakeAlreadyProcessed && deps?.enqueueWakeup) {
-        await deps.enqueueWakeup(ownerAgentId, {
+        const wake = await deps.enqueueWakeup(ownerAgentId, {
           source: "assignment",
           triggerDetail: "system",
           reason: "issue_assigned",
@@ -1126,7 +1140,11 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
             productivityReviewTrigger: evidence.trigger,
           }, "status_only"),
         });
-        wakeAlreadyProcessed = true;
+        wakeAlreadyProcessed = Boolean(wake) || await hasAssignmentWakeRequest(tx, {
+          companyId: evidence.sourceIssue.companyId,
+          agentId: ownerAgentId,
+          idempotencyKey: wakeIdempotencyKey,
+        });
       }
 
       if (wakeAlreadyProcessed && !wakeMarkerExists && deps?.enqueueWakeup) {

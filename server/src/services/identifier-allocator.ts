@@ -32,6 +32,19 @@ type IdentifierAllocatorDb = Pick<Db, "select" | "update">;
 const LINEAR_PLUGIN_KEY = "paperclip-plugin-linear";
 const LINEAR_GRAPHQL_URL = "https://api.linear.app/graphql";
 
+export class LinearIssueCreateUnconfirmedError extends Error {
+  constructor(
+    readonly issueIdempotencyKey: string,
+    cause: unknown,
+  ) {
+    super(
+      `Linear IssueCreate outcome is unconfirmed for idempotency key ${issueIdempotencyKey}; retry with the same key`,
+      { cause },
+    );
+    this.name = "LinearIssueCreateUnconfirmedError";
+  }
+}
+
 export interface AllocateIdentifierInput {
   /** Drizzle handle. Pass the active transaction when called from inside one. */
   db: IdentifierAllocatorDb;
@@ -175,11 +188,20 @@ async function allocateFromLinear(
     });
   } catch (error) {
     if (linearIssueIdempotencyKey) {
-      const existing = await getLinearIssueById({
-        apiKey: cfg.apiKey,
-        issueId: linearIssueIdempotencyKey,
-      }).catch(() => null);
+      let existing: CreatedLinearIssue | null = null;
+      try {
+        existing = await getLinearIssueById({
+          apiKey: cfg.apiKey,
+          issueId: linearIssueIdempotencyKey,
+        });
+      } catch (lookupError) {
+        throw new LinearIssueCreateUnconfirmedError(
+          linearIssueIdempotencyKey,
+          lookupError instanceof Error ? lookupError : error,
+        );
+      }
       if (existing) return allocationFromLinearIssue(existing, false);
+      throw new LinearIssueCreateUnconfirmedError(linearIssueIdempotencyKey, error);
     }
     throw error;
   }

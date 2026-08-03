@@ -1821,7 +1821,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     const result = await productivityReviewService(db, {
       async enqueueWakeup(agentId, opts) {
         wakeups.push({ agentId, opts });
-        return null;
+        return { id: randomUUID() };
       },
     }).reconcileProductivityReviews({
       now,
@@ -1877,7 +1877,7 @@ describeEmbeddedPostgres("productivity review service", () => {
       },
       async enqueueWakeup(agentId, opts) {
         wakeups.push({ agentId, opts });
-        return null;
+        return { id: randomUUID() };
       },
     });
 
@@ -1926,7 +1926,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     const service = productivityReviewService(db, {
       async enqueueWakeup(agentId, opts) {
         wakeups.push({ agentId, opts });
-        return null;
+        return { id: randomUUID() };
       },
     });
 
@@ -1952,6 +1952,53 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(second.created).toBe(0);
     expect(second.existing).toBe(1);
     expect(wakeups).toHaveLength(1);
+    expect(await countReviewActivity(reviewId, "issue.productivity_review_created")).toBe(1);
+    expect(await countReviewActivity(reviewId, "issue.productivity_review_assignment_wake_enqueued")).toBe(1);
+  });
+
+  it("retries finalized review assignment wake after a null enqueue result", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const createdAt = new Date(now.getTime() - 60_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt: new Date(now.getTime() - 10 * 60 * 1000),
+      monitorScheduledBy: "assignee",
+    });
+    const reviewId = await insertProductivityReview({
+      seeded,
+      createdAt,
+      issueNumber: 2,
+      identifier: `${seeded.issuePrefix}-2`,
+    });
+
+    const wakeups: Array<{ agentId: string; opts: unknown }> = [];
+    let enqueueAttempts = 0;
+    const service = productivityReviewService(db, {
+      async enqueueWakeup(agentId, opts) {
+        wakeups.push({ agentId, opts });
+        enqueueAttempts += 1;
+        return enqueueAttempts === 1 ? null : { id: randomUUID() };
+      },
+    });
+
+    const first = await service.reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+    });
+    expect(first.created).toBe(1);
+    expect(wakeups).toHaveLength(1);
+    expect(await countReviewActivity(reviewId, "issue.productivity_review_created")).toBe(1);
+    expect(await countReviewActivity(reviewId, "issue.productivity_review_assignment_wake_enqueued")).toBe(0);
+
+    const second = await service.reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+    });
+    expect(second.created).toBe(1);
+    expect(wakeups).toHaveLength(2);
     expect(await countReviewActivity(reviewId, "issue.productivity_review_created")).toBe(1);
     expect(await countReviewActivity(reviewId, "issue.productivity_review_assignment_wake_enqueued")).toBe(1);
   });
