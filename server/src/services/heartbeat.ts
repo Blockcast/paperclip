@@ -18342,9 +18342,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const batchReadiness = await listQueuedRunDependencyReadiness(agent.companyId, criticalRuns);
         for (const [issueId, readiness] of batchReadiness) dependencyReadiness.set(issueId, readiness);
         for (const { issue } of criticalBatch) issueById.set(issue.id, issue);
+        // Dependency-ready is not necessarily claimable: isolation retries
+        // remain queued until their retry timestamp. Keep paging past them so
+        // a deferred head row cannot hide runnable emergency work.
         foundReadyCritical = criticalRuns.some((run) => {
-          const issueId = readNonEmptyString(parseObject(run.contextSnapshot).issueId);
-          return Boolean(issueId && (batchReadiness.get(issueId)?.isDependencyReady ?? true));
+          const snapshot = parseObject(run.contextSnapshot);
+          const issueId = readNonEmptyString(snapshot.issueId);
+          return Boolean(
+            issueId
+            && (batchReadiness.get(issueId)?.isDependencyReady ?? true)
+            && !isK8sIsolationRetryDeferred(snapshot, dispatchNow)
+          );
         });
         if (foundReadyCritical || criticalLaneExhausted) break;
       }
@@ -18437,8 +18445,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const batchReadiness = await listQueuedRunDependencyReadiness(agent.companyId, candidates);
         for (const [issueId, readiness] of batchReadiness) dependencyReadiness.set(issueId, readiness);
         foundReadyRecovery = candidates.some((run) => {
-          const issueId = readNonEmptyString(parseObject(run.contextSnapshot).issueId);
-          return Boolean(issueId && (batchReadiness.get(issueId)?.isDependencyReady ?? true));
+          const snapshot = parseObject(run.contextSnapshot);
+          const issueId = readNonEmptyString(snapshot.issueId);
+          return Boolean(
+            issueId
+            && (batchReadiness.get(issueId)?.isDependencyReady ?? true)
+            && !isK8sIsolationRetryDeferred(snapshot, dispatchNow)
+          );
         });
         if (foundReadyRecovery || recoveryLaneExhausted) break;
       }

@@ -1425,11 +1425,15 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     // chain to yield at. Shrinking the world rather than raising the timeout
     // keeps the cap arithmetic itself under test.
     const dispatchBounds = { scanLimit: 20, maxScanBatches: 2, maxResumePasses: 2 };
+    const dispatchEvents: string[] = [];
     const blockedCount =
       dispatchBounds.scanLimit * dispatchBounds.maxScanBatches * dispatchBounds.maxResumePasses;
     const cappedHeartbeat = heartbeatService(db, {
       penstockGate: allowPenstockGate,
       queuedRunDispatchBounds: dispatchBounds,
+      onQueuedDispatchScheduledForTest: ({ reason }) => {
+        dispatchEvents.push(reason);
+      },
     });
 
     await db.insert(companies).values({
@@ -1529,7 +1533,7 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
       companyId,
       title: "Runnable work behind the resume cap",
       status: "todo",
-      priority: "critical",
+      priority: "medium",
       assigneeAgentId: agentId,
       issueNumber: blockedCount + 2,
       identifier: `${issuePrefix}-${blockedCount + 2}`,
@@ -1562,6 +1566,7 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
 
     const dispatchedRunIds: string[] = [];
     mockAdapterExecute.mockImplementation(async (args: { runId: string }) => {
+      dispatchEvents.push(`dispatch:${args.runId}`);
       dispatchedRunIds.push(args.runId);
       return {
         exitCode: 0,
@@ -1579,6 +1584,10 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
 
     expect(dispatchedRunIds).toContain(runnableRunId);
     expect(runnableRun?.status).not.toBe("queued");
+    expect(dispatchEvents).toContain("resume_bounded_scan_after_cap");
+    expect(dispatchEvents.indexOf("resume_bounded_scan_after_cap")).toBeLessThan(
+      dispatchEvents.indexOf(`dispatch:${runnableRunId}`),
+    );
 
     // Scoped instance: drain it here so its in-flight work cannot outlive the
     // test and race the shared afterEach cleanup.
@@ -1785,12 +1794,13 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     }
   }, 180_000);
 
-  it("pages past dependency-blocked critical rows before claiming lower-priority work", async () => {
+  it("pages past blocked and isolation-deferred critical rows before lower-priority work", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const blockerIssueId = randomUUID();
     const lowIssueId = randomUUID();
     const blockedCriticalIssueIds = [randomUUID(), randomUUID()];
+    const deferredCriticalIssueIds = [randomUUID(), randomUUID()];
     const runnableCriticalIssueId = randomUUID();
     const runnableCriticalRunId = randomUUID();
     const issuePrefix = `C${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
@@ -1899,6 +1909,16 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
         issueNumber: index + 3,
         identifier: `${issuePrefix}-${index + 3}`,
       })),
+      ...deferredCriticalIssueIds.map((id, index) => ({
+        id,
+        companyId,
+        title: `Isolation-deferred critical ${index + 1}`,
+        status: "todo" as const,
+        priority: "critical" as const,
+        assigneeAgentId: agentId,
+        issueNumber: index + 5,
+        identifier: `${issuePrefix}-${index + 5}`,
+      })),
       {
         id: runnableCriticalIssueId,
         companyId,
@@ -1906,8 +1926,8 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
         status: "todo",
         priority: "critical",
         assigneeAgentId: agentId,
-        issueNumber: 5,
-        identifier: `${issuePrefix}-5`,
+        issueNumber: 7,
+        identifier: `${issuePrefix}-7`,
       },
     ]);
     await db.insert(issueRelations).values(blockedCriticalIssueIds.map((relatedIssueId) => ({
@@ -1917,7 +1937,12 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
       type: "blocks" as const,
     })));
 
-    const queuedIssues = [lowIssueId, ...blockedCriticalIssueIds, runnableCriticalIssueId];
+    const queuedIssues = [
+      lowIssueId,
+      ...blockedCriticalIssueIds,
+      ...deferredCriticalIssueIds,
+      runnableCriticalIssueId,
+    ];
     for (const [index, issueId] of queuedIssues.entries()) {
       const runId = issueId === runnableCriticalIssueId ? runnableCriticalRunId : randomUUID();
       const wakeId = randomUUID();
@@ -1943,7 +1968,14 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
         triggerDetail: "system",
         status: "queued",
         wakeupRequestId: wakeId,
-        contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_assigned" },
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "issue_assigned",
+          ...(deferredCriticalIssueIds.includes(issueId)
+            ? { paperclipK8sIsolationRetryAt: new Date(Date.now() + 60 * 60_000).toISOString() }
+            : {}),
+        },
         createdAt,
         updatedAt: createdAt,
       });
@@ -1990,12 +2022,13 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     await boundedHeartbeat.drainInFlightExecutions(60_000);
   }, 120_000);
 
-  it("pages past invalid and blocked recovery rows before ordinary work", async () => {
+  it("pages past invalid, blocked, and isolation-deferred recovery rows before ordinary work", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const blockerIssueId = randomUUID();
     const terminalIssueId = randomUUID();
     const blockedIssueId = randomUUID();
+    const deferredIssueIds = [randomUUID(), randomUUID()];
     const recoveryIssueId = randomUUID();
     const ordinaryIssueId = randomUUID();
     const recoveryRunId = randomUUID();
@@ -2052,20 +2085,30 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
         companyId,
         title: "Blocked recovery target",
         status: "todo",
-        priority: "critical",
+        priority: "medium",
         assigneeAgentId: agentId,
         issueNumber: 3,
         identifier: `${issuePrefix}-3`,
       },
+      ...deferredIssueIds.map((id, index) => ({
+        id,
+        companyId,
+        title: `Isolation-deferred recovery ${index + 1}`,
+        status: "todo" as const,
+        priority: "medium" as const,
+        assigneeAgentId: agentId,
+        issueNumber: index + 4,
+        identifier: `${issuePrefix}-${index + 4}`,
+      })),
       {
         id: recoveryIssueId,
         companyId,
         title: "Runnable recovery beyond invalid pages",
         status: "todo",
-        priority: "critical",
+        priority: "medium",
         assigneeAgentId: agentId,
-        issueNumber: 4,
-        identifier: `${issuePrefix}-4`,
+        issueNumber: 6,
+        identifier: `${issuePrefix}-6`,
       },
       {
         id: ordinaryIssueId,
@@ -2074,8 +2117,8 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
         status: "todo",
         priority: "low",
         assigneeAgentId: agentId,
-        issueNumber: 5,
-        identifier: `${issuePrefix}-5`,
+        issueNumber: 7,
+        identifier: `${issuePrefix}-7`,
       },
     ]);
     await db.insert(issueRelations).values({
@@ -2090,6 +2133,7 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
       randomUUID(),
       terminalIssueId,
       blockedIssueId,
+      ...deferredIssueIds,
       recoveryIssueId,
     ];
     for (const [index, issueId] of recoveryIssueIds.entries()) {
@@ -2123,6 +2167,9 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
           wakeReason: "source_scoped_recovery_action",
           source: "issue_recovery_action",
           recoveryActionId,
+          ...(deferredIssueIds.includes(issueId)
+            ? { paperclipK8sIsolationRetryAt: new Date(Date.now() + 60 * 60_000).toISOString() }
+            : {}),
         },
         createdAt,
         updatedAt: createdAt,
