@@ -57,6 +57,7 @@ export const DEFAULT_HEARTBEAT_SCHEDULER_INTERVAL_MS = 30_000;
 export const DEFAULT_PRODUCTIVITY_REVIEW_MONITOR_LAPSE_SERVICE_GRACE_MS =
   DEFAULT_HEARTBEAT_SCHEDULER_INTERVAL_MS + ISSUE_MONITOR_WAKE_CLAIM_TTL_MS;
 
+const PRODUCTIVITY_REVIEW_RESERVATION_STALE_MS = 5 * 60 * 1000;
 const TERMINAL_RUN_STATUSES = ["succeeded", "interrupted", "failed", "cancelled", "timed_out"] as const;
 const ACTIVE_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const MAX_CANDIDATE_ISSUES = 250;
@@ -979,6 +980,58 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     return comment;
   }
 
+  async function finishCreatedProductivityReview(
+    review: Pick<IssueRow, "id">,
+    evidence: ProductivityReviewEvidence,
+    ownerAgentId: string,
+  ) {
+    await db
+      .update(issues)
+      .set({ createdAt: evidence.generatedAt, updatedAt: evidence.generatedAt })
+      .where(eq(issues.id, review.id));
+
+    await logActivity(db, {
+      companyId: evidence.sourceIssue.companyId,
+      actorType: "system",
+      actorId: "system",
+      action: "issue.productivity_review_created",
+      entityType: "issue",
+      entityId: review.id,
+      agentId: ownerAgentId,
+      details: {
+        source: "productivity_review.reconcile",
+        sourceIssueId: evidence.sourceIssue.id,
+        trigger: evidence.trigger,
+        noCommentStreak: evidence.noCommentStreak,
+        runCountLastHour: evidence.runCountLastHour,
+        commentCountLastHour: evidence.commentCountLastHour,
+      },
+    });
+
+    if (ownerAgentId && deps?.enqueueWakeup) {
+      await deps.enqueueWakeup(ownerAgentId, {
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "issue_assigned",
+        payload: withRecoveryModelProfileHint({
+          issueId: review.id,
+          sourceIssueId: evidence.sourceIssue.id,
+          trigger: evidence.trigger,
+        }, "status_only"),
+        requestedByActorType: "system",
+        requestedByActorId: "productivity_review",
+        contextSnapshot: withRecoveryModelProfileHint({
+          issueId: review.id,
+          taskId: review.id,
+          wakeReason: "issue_assigned",
+          source: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+          sourceIssueId: evidence.sourceIssue.id,
+          productivityReviewTrigger: evidence.trigger,
+        }, "status_only"),
+      });
+    }
+  }
+
   async function findOpenProductivityReviewEscalation(companyId: string, sourceIssueId: string) {
     return db
       .select({ id: issues.id })
@@ -1749,12 +1802,54 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     const existing = await findOpenProductivityReview(evidence.sourceIssue.companyId, evidence.sourceIssue.id);
     if (existing) {
       if (existing.identifier == null && existing.issueNumber == null) {
+        const reservationAgeMs = evidence.generatedAt.getTime() - existing.updatedAt.getTime();
+        if (reservationAgeMs < PRODUCTIVITY_REVIEW_RESERVATION_STALE_MS) {
+          logger.info(
+            {
+              reviewIssueId: existing.id,
+              sourceIssueId: evidence.sourceIssue.id,
+              reservationAgeMs,
+            },
+            "productivity review create skipped: reservation is still finalizing",
+          );
+          return { kind: "existing" as const, reviewIssueId: existing.id };
+        }
+        if (!existing.assigneeAgentId) {
+          logger.warn(
+            {
+              reviewIssueId: existing.id,
+              sourceIssueId: evidence.sourceIssue.id,
+              reservationAgeMs,
+            },
+            "productivity review reservation recovery skipped: reservation has no assignee agent",
+          );
+          return { kind: "existing" as const, reviewIssueId: existing.id };
+        }
+        const finalized = await finalizeReservedProductivityReviewIssue({
+          review: existing,
+          title: existing.title,
+          description: existing.description ?? buildReviewMarkdown(evidence, opts.prefix),
+          generatedAt: evidence.generatedAt,
+        });
+        await finishCreatedProductivityReview(finalized, evidence, existing.assigneeAgentId);
         logger.info(
+          {
+            reviewIssueId: finalized.id,
+            sourceIssueId: evidence.sourceIssue.id,
+            reservationAgeMs,
+          },
+          "productivity review reservation recovered and finalized",
+        );
+        return { kind: "created" as const, reviewIssueId: finalized.id };
+      }
+
+      if (existing.identifier == null || existing.issueNumber == null) {
+        logger.warn(
           {
             reviewIssueId: existing.id,
             sourceIssueId: evidence.sourceIssue.id,
           },
-          "productivity review create skipped: reservation is still finalizing",
+          "productivity review existing row is partially finalized",
         );
         return { kind: "existing" as const, reviewIssueId: existing.id };
       }
@@ -1958,51 +2053,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       if (!raced) throw error;
       return { kind: "existing" as const, reviewIssueId: raced.id };
     }
-    await db
-      .update(issues)
-      .set({ createdAt: evidence.generatedAt, updatedAt: evidence.generatedAt })
-      .where(eq(issues.id, review.id));
-
-    await logActivity(db, {
-      companyId: evidence.sourceIssue.companyId,
-      actorType: "system",
-      actorId: "system",
-      action: "issue.productivity_review_created",
-      entityType: "issue",
-      entityId: review.id,
-      agentId: ownerAgentId,
-      details: {
-        source: "productivity_review.reconcile",
-        sourceIssueId: evidence.sourceIssue.id,
-        trigger: evidence.trigger,
-        noCommentStreak: evidence.noCommentStreak,
-        runCountLastHour: evidence.runCountLastHour,
-        commentCountLastHour: evidence.commentCountLastHour,
-      },
-    });
-
-    if (ownerAgentId && deps?.enqueueWakeup) {
-      await deps.enqueueWakeup(ownerAgentId, {
-        source: "assignment",
-        triggerDetail: "system",
-        reason: "issue_assigned",
-        payload: withRecoveryModelProfileHint({
-          issueId: review.id,
-          sourceIssueId: evidence.sourceIssue.id,
-          trigger: evidence.trigger,
-        }, "status_only"),
-        requestedByActorType: "system",
-        requestedByActorId: "productivity_review",
-        contextSnapshot: withRecoveryModelProfileHint({
-          issueId: review.id,
-          taskId: review.id,
-          wakeReason: "issue_assigned",
-          source: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
-          sourceIssueId: evidence.sourceIssue.id,
-          productivityReviewTrigger: evidence.trigger,
-        }, "status_only"),
-      });
-    }
+    await finishCreatedProductivityReview(review, evidence, ownerAgentId);
 
     return { kind: "created" as const, reviewIssueId: review.id };
   }

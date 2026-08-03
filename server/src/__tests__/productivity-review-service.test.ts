@@ -1745,6 +1745,66 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(reviews[0]?.identifier).toBe(`${seeded.issuePrefix}-2`);
   });
 
+  it("recovers a stale reserved review without an identifier", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const reservedAt = new Date(now.getTime() - 10 * 60_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt: new Date(now.getTime() - 10 * 60 * 1000),
+      monitorScheduledBy: "assignee",
+    });
+    const reviewId = randomUUID();
+    await db.insert(issues).values({
+      id: reviewId,
+      companyId: seeded.companyId,
+      title: "Review productivity for reserved source",
+      description: "Reserved before identifier allocation",
+      status: "todo",
+      priority: "medium",
+      parentId: seeded.issueId,
+      assigneeAgentId: seeded.managerId,
+      originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+      originId: seeded.issueId,
+      originFingerprint: `productivity-review:${seeded.issueId}`,
+      requestDepth: 1,
+      createdAt: reservedAt,
+      updatedAt: reservedAt,
+      lastActivityAt: reservedAt,
+    });
+
+    const wakeups: Array<{ agentId: string; opts: unknown }> = [];
+    const result = await productivityReviewService(db, {
+      async enqueueWakeup(agentId, opts) {
+        wakeups.push({ agentId, opts });
+        return null;
+      },
+    }).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+    });
+
+    expect(result.created).toBe(1);
+    expect(result.monitorScheduledSuppressed).toBe(0);
+    const [review] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, reviewId));
+    expect(review?.identifier).toBe(`${seeded.issuePrefix}-2`);
+    expect(review?.issueNumber).toBe(2);
+    expect(review?.updatedAt.toISOString()).toBe(now.toISOString());
+    expect(wakeups).toHaveLength(1);
+    expect(wakeups[0]?.agentId).toBe(seeded.managerId);
+
+    const activities = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.action, "issue.productivity_review_created"));
+    expect(activities).toHaveLength(1);
+    expect(activities[0]?.entityId).toBe(reviewId);
+  });
+
   // Negative control for BLO-21003: a monitor that lapsed well past the
   // lapse-to-service grace window, with no pending wake, is genuinely
   // unsupervised and must still fire exactly as it does today. Without this
