@@ -168,6 +168,48 @@ describe("github-webhook pure helpers", () => {
     expect(resolveOwningPaperclipIdentifiers({})).toEqual({ owning: [] });
   });
 
+  it("treats a markdown-bulleted owning reference as owning -- the PR template's own house style (BLO-20886)", () => {
+    // .github/PULL_REQUEST_TEMPLATE.md renders "## Linked Issues or Issue
+    // Description" as a bullet list, so real PR bodies in this repo write
+    // `- Refs: BLO-1`, not a bare `Refs: BLO-1` line. An earlier revision of
+    // this rule anchored the keyword to the start of the line and therefore
+    // matched nothing on the majority of real bodies, failing every such PR
+    // closed to `no_owning_reference` and dropping an author wake that should
+    // have been delivered. Each of these is a real formatting shape.
+    for (const body of [
+      "- Refs: BLO-1",
+      "* Refs: BLO-1",
+      "+ Fixes: BLO-1",
+      "1. Closes: BLO-1",
+      "  - Resolves: BLO-1", // indented sub-bullet
+      "- Refs: [BLO-1](https://paperclip.blockcast.net/BLO/issues/BLO-1)", // markdown link
+    ]) {
+      expect(resolveOwningPaperclipIdentifiers({ body })).toEqual({ owning: ["BLO-1"] });
+    }
+
+    // A bulleted Related: is still never owning -- the list marker must not
+    // become a way to smuggle an informational mention into the owning tier.
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: "- Related: BLO-2, BLO-3" }),
+    ).toEqual({ owning: [] });
+
+    // PR #953's body verbatim (trimmed to the section that matters): a
+    // bulleted `Refs:` owner alongside a bulleted `Related:` list. This is the
+    // shape the live misroute actually had -- the pre-existing test above uses
+    // a synthesized bare-line form that does not reproduce it.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: [
+          "## Linked Issues or Issue Description",
+          "",
+          "- Refs: [BLO-19132](https://paperclip.blockcast.net/BLO/issues/BLO-19132)",
+          "- Supersedes: #945",
+          "- Related: [BLO-20810](https://paperclip.blockcast.net/BLO/issues/BLO-20810), [BLO-20129](https://paperclip.blockcast.net/BLO/issues/BLO-20129), [BLO-19079](https://paperclip.blockcast.net/BLO/issues/BLO-19079)",
+        ].join("\n"),
+      }),
+    ).toEqual({ owning: ["BLO-19132"] });
+  });
+
 
   it("rejects payloads with bad signatures and accepts ones with good signatures", () => {
     const secret = "test-webhook-secret-do-not-use-in-prod";

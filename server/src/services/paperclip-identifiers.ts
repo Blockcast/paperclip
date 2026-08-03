@@ -76,8 +76,18 @@ export function resolveLinkSourceForIdentifier(
 // counts as an ownership claim; a bare mention (including under `Related:`)
 // never does. The colon is optional -- existing PR bodies in this repo use
 // both "Closes: BLO-1" and the natural-language "Closes BLO-1 and BLO-2".
+//
+// A leading markdown list marker is also optional, and that is load-bearing
+// rather than cosmetic: .github/PULL_REQUEST_TEMPLATE.md renders its
+// "## Linked Issues or Issue Description" section as a bullet list, so the
+// repo's own house style for an owning reference is `- Refs: BLO-1`, not a
+// bare `Refs: BLO-1` line. PR #953 -- the live misroute this rule exists to
+// fix -- writes exactly `- Refs: [BLO-19132](...)`. Without the marker the
+// body tier silently matches nothing on the majority of real PR bodies and
+// every such PR fails closed to `no_owning_reference`, dropping an author
+// wake that should have been delivered to its owner.
 const OWNING_REFERENCE_LABEL_PATTERN =
-  /^[ \t]*(?:fix(?:e[sd])?|clos(?:e[sd]?)|resolv(?:e[sd]?)|refs?)[ \t]*:?[ \t]+(.+)$/gim;
+  /^[ \t]*(?:[-*+]|\d{1,3}[.)])?[ \t]*(?:fix(?:e[sd])?|clos(?:e[sd]?)|resolv(?:e[sd]?)|refs?)[ \t]*:?[ \t]+(.+)$/gim;
 
 /** Identifiers that appear on a labeled owning-reference line in `body` (see above). */
 export function extractOwningLabeledIdentifiers(body: string | null | undefined): string[] {
