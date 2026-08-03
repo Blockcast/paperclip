@@ -3140,6 +3140,55 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     const after = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
     expect(after.title).toBe("Human changed ownership context");
   });
+
+  // BLO-18829 regression. The rejection test above seeds an explicit, millisecond-aligned
+  // `updatedAt` ("...T12:00:00.000Z"), so its round-trip through a JS `Date` is lossless --
+  // which hides the fact that Postgres stores `timestamp with time zone` at MICROSECOND
+  // precision while drizzle reads it back as a millisecond `Date`. It also only asserts the
+  // negative direction, so a CAS that rejects *every* write passes it just as happily as a
+  // correct one.
+  //
+  // This is the positive case, on a row whose updated_at came from `defaultNow()` and
+  // therefore carries sub-millisecond digits: with nothing intervening, the guarded write
+  // MUST land. Before the date_trunc fix it never did, which silently disabled stranded
+  // escalation entirely.
+  it("update() with expectedUpdatedAt still applies when nothing intervened on a defaultNow() row", async () => {
+    const companyId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    // No explicit updatedAt: let defaultNow() supply a microsecond-precision value.
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Fresh snapshot",
+      status: "in_progress",
+      priority: "medium",
+    });
+
+    const storedMicros = await db
+      .execute(sql`select to_char(updated_at, 'US') as us from issues where id = ${issueId}`)
+      .then((res: any) => String((res.rows ?? res)[0].us));
+    // Guard the guard: if this ever stops carrying sub-millisecond digits the test has
+    // stopped exercising the precision asymmetry it exists to pin.
+    expect(storedMicros.endsWith("000")).toBe(false);
+
+    const observed = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+
+    const result = await svc.update(
+      issueId,
+      { status: "blocked" },
+      db,
+      { expectedStatus: ["in_progress"], expectedUpdatedAt: observed.updatedAt },
+    );
+
+    expect(result).not.toBeNull();
+    expect(result?.status).toBe("blocked");
+  });
 });
 
 describeEmbeddedPostgres("issueService.create workspace inheritance", () => {

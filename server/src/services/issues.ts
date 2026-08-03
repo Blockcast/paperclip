@@ -8774,7 +8774,29 @@ export function issueService(db: Db) {
         const writePreconditions = [
           ...routeWritePreconditions,
           ...(options?.expectedStatus === undefined ? [] : [inArray(issues.status, options.expectedStatus)]),
-          ...(options?.expectedUpdatedAt === undefined ? [] : [eq(issues.updatedAt, options.expectedUpdatedAt)]),
+          // BLO-18829: compare at millisecond resolution, NOT with a bare `eq`.
+          // `issues.updated_at` is `timestamp with time zone`, which Postgres stores at
+          // microsecond precision, but drizzle reads it into a JS `Date` -- millisecond
+          // precision. So the value a caller can observe is a *truncation* of the value
+          // on disk, and `eq(updated_at, observed)` is unsatisfiable for any row whose
+          // updated_at carries sub-millisecond digits. That is every row still holding a
+          // `defaultNow()`/`now()` value, which made the escalation CAS in
+          // `escalateStrandedAssignedIssue` fail unconditionally: the sentinel threw, the
+          // transaction rolled back, and stranded issues silently stopped escalating
+          // altogether (no recovery action, no monitor, no owner wake) -- the permanent
+          // under-escalation outcome BLO-18829 AC-3 exists to forbid.
+          //
+          // Expressed as a half-open millisecond range rather than `date_trunc(...) = $1`
+          // so the comparison goes through drizzle's typed timestamp operators -- a raw
+          // `sql` fragment loses the column type and postgres.js then refuses to bind a
+          // JS Date ("must be of type string or Buffer, received Date"). This form is
+          // also index-friendly on issues_company_updated_idx.
+          ...(options?.expectedUpdatedAt === undefined
+            ? []
+            : [
+                gte(issues.updatedAt, options.expectedUpdatedAt),
+                lt(issues.updatedAt, new Date(options.expectedUpdatedAt.getTime() + 1)),
+              ]),
         ];
         const updated = await tx
           .update(issues)
