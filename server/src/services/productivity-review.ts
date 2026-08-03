@@ -223,6 +223,7 @@ type ProductivityReviewServiceDeps = {
   beforeCreateReviewIssueInsert?: (evidence: ProductivityReviewEvidence) => Promise<void> | void;
   beforeFinalMonitorSuppressionRevalidation?: (evidence: ProductivityReviewEvidence) => Promise<void> | void;
   afterFinalMonitorReviewReservation?: (evidence: ProductivityReviewEvidence, review: IssueRow) => Promise<void> | void;
+  beforeStaleReservationRecoveryFinalize?: (review: IssueRow, sourceIssue: IssueRow) => Promise<void> | void;
 };
 
 class MonitorSuppressedBeforeCreateError extends Error {
@@ -750,6 +751,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
             goalId: input.evidence.sourceIssue.goalId,
             billingCode: input.evidence.sourceIssue.billingCode,
             assigneeAgentId: input.ownerAgentId,
+            createdByAgentId: input.evidence.sourceAgent.id,
             assigneeAdapterOverrides: recoveryAssigneeAdapterOverrides("status_only"),
             responsibleUserId:
               input.evidence.sourceIssue.responsibleUserId ??
@@ -2656,20 +2658,25 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         }
         continue;
       }
-      const sourceAgent = sourceIssue.assigneeAgentId ? await getAgent(sourceIssue.assigneeAgentId) : null;
-      const reviewability = sourceIssue.assigneeAgentId
-        ? await evaluateSourceReviewability(sourceIssue, sourceIssue.assigneeAgentId)
+      const reservationSourceAgentId = review.createdByAgentId ??
+        (sourceIssue.updatedAt.getTime() <= review.updatedAt.getTime() ? sourceIssue.assigneeAgentId : null);
+      const sourceAgent = reservationSourceAgentId ? await getAgent(reservationSourceAgentId) : null;
+      const currentSourceAgent = sourceIssue.assigneeAgentId ? await getAgent(sourceIssue.assigneeAgentId) : null;
+      const reviewability = reservationSourceAgentId
+        ? await evaluateSourceReviewability(sourceIssue, reservationSourceAgentId)
         : { reviewable: false, terminal: isTerminalIssueStatus(sourceIssue.status), status: sourceIssue.status };
-      const currentReviewOwnerId = sourceAgent
-        ? await resolveReviewOwnerAgentId(sourceIssue, sourceAgent)
+      const currentReviewOwnerId = currentSourceAgent
+        ? await resolveReviewOwnerAgentId(sourceIssue, currentSourceAgent)
         : null;
       const retiredReason =
         reviewability.terminal ? "terminal_source" :
         !sourceAgent || sourceAgent.companyId !== sourceIssue.companyId ? "missing_source_agent" :
+        sourceIssue.assigneeAgentId &&
+          (!currentSourceAgent || currentSourceAgent.companyId !== sourceIssue.companyId) ? "missing_source_agent" :
+        currentReviewOwnerId && currentReviewOwnerId !== review.assigneeAgentId ? "review_owner_changed" :
         !reviewability.reviewable ||
           await isProductivityReviewDescendant(sourceIssue) ||
           isProductivityReviewOptedOut(sourceIssue) ? "unreviewable_source" :
-        currentReviewOwnerId !== review.assigneeAgentId ? "review_owner_changed" :
         null;
       if (retiredReason) {
         const retired = await retireStaleProductivityReviewReservation({
@@ -2688,6 +2695,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       }
 
       try {
+        await deps?.beforeStaleReservationRecoveryFinalize?.(review, sourceIssue);
         const finalized = await finalizeReservedProductivityReviewIssue({
           review,
           title: review.title,

@@ -164,7 +164,7 @@ async function allocateFromLinear(
   // caller's compensating-delete handler ignores this (we did not create
   // the Linear issue and must not delete it on tx rollback).
   if (linkedLinearIssue) {
-    return allocationFromLinearIssue(linkedLinearIssue, false, "linkedLinearIssue");
+    return allocationFromLinearIssue(linkedLinearIssue, false);
   }
 
   const cfg = await getLinearConfigForCompany(db, companyId);

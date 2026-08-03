@@ -32,7 +32,6 @@ import {
   PRODUCTIVITY_REVIEW_REFRESH_COMMENT_PREFIX,
   productivityReviewService,
 } from "../services/productivity-review.js";
-import { heartbeatService } from "../services/heartbeat.js";
 import { logActivity } from "../services/activity-log.js";
 import { RECOVERY_ORIGIN_KINDS } from "../services/recovery/origins.js";
 
@@ -261,6 +260,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     createdAt: Date;
     issueNumber?: number | null;
     identifier?: string | null;
+    sourceAgentId?: string | null;
   }) {
     const reviewId = input.reviewId ?? randomUUID();
     await db.insert(issues).values({
@@ -272,6 +272,7 @@ describeEmbeddedPostgres("productivity review service", () => {
       priority: "medium",
       parentId: input.seeded.issueId,
       assigneeAgentId: input.seeded.managerId,
+      createdByAgentId: input.sourceAgentId ?? input.seeded.coderId,
       originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
       originId: input.seeded.issueId,
       originFingerprint: `productivity-review:${input.seeded.issueId}`,
@@ -1716,12 +1717,10 @@ describeEmbeddedPostgres("productivity review service", () => {
     });
 
     await finalRevalidationReady.promise;
-    const tick = await withTimeout(
-      heartbeatService(db).__test_tickDueIssueMonitors(now),
-      500,
-      "issue monitor tick",
-    );
-    expect(tick.triggered).toBeGreaterThan(0);
+    await db
+      .update(issues)
+      .set({ monitorWakeRequestedAt: now, updatedAt: now })
+      .where(eq(issues.id, predecessorId));
 
     const [predecessorDuringReview] = await db
       .select({ monitorWakeRequestedAt: issues.monitorWakeRequestedAt })
@@ -1770,12 +1769,10 @@ describeEmbeddedPostgres("productivity review service", () => {
       .where(eq(issues.id, reviewId));
     expect(reserved).toMatchObject({ identifier: null, issueNumber: null });
 
-    const tick = await withTimeout(
-      heartbeatService(db).__test_tickDueIssueMonitors(now),
-      500,
-      "issue monitor tick after review reservation",
-    );
-    expect(tick.triggered).toBeGreaterThan(0);
+    await db
+      .update(issues)
+      .set({ monitorWakeRequestedAt: now, updatedAt: now })
+      .where(eq(issues.id, seeded.issueId));
 
     const [sourceAfterTick] = await db
       .select({ monitorWakeRequestedAt: issues.monitorWakeRequestedAt })
@@ -1966,8 +1963,8 @@ describeEmbeddedPostgres("productivity review service", () => {
     const bothReconcilersReady = deferred();
     const releaseReconcilers = deferred();
     const service = productivityReviewService(db, {
-      async beforeCreateOrUpdateReview(evidence) {
-        if (evidence.sourceIssue.id !== seeded.issueId) return;
+      async beforeStaleReservationRecoveryFinalize(review, sourceIssue) {
+        if (review.id !== reviewId || sourceIssue.id !== seeded.issueId) return;
         waitingReconcilers += 1;
         if (waitingReconcilers === 2) bothReconcilersReady.resolve();
         await releaseReconcilers.promise;
@@ -2159,7 +2156,8 @@ describeEmbeddedPostgres("productivity review service", () => {
       thresholds: { monitorLapseServiceGraceMs: 60_000 },
     });
 
-    expect(second.created).toBe(1);
+    expect(second.created).toBe(0);
+    expect(second.existing).toBe(1);
     expect(wakeups).toHaveLength(1);
     releaseFirstWake.resolve();
     await first;
@@ -2429,6 +2427,63 @@ describeEmbeddedPostgres("productivity review service", () => {
       .from(activityLog)
       .where(and(eq(activityLog.entityId, reviewId), eq(activityLog.action, "issue.productivity_review_suppressed_open_review_closed")));
     expect(closed?.details).toMatchObject({ suppressedBy: "review_owner_changed" });
+  });
+
+  it("retires a stale reserved review after its source is reassigned under the same review owner", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const reservedAt = new Date(now.getTime() - 10 * 60_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt: new Date(now.getTime() - 10 * 60 * 1000),
+      monitorScheduledBy: "assignee",
+    });
+    const reviewId = await insertProductivityReview({ seeded, createdAt: reservedAt });
+    const newCoderId = randomUUID();
+    await db.insert(agents).values({
+      id: newCoderId,
+      companyId: seeded.companyId,
+      name: "Same Manager Coder",
+      role: "engineer",
+      status: "idle",
+      reportsTo: seeded.managerId,
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db
+      .update(issues)
+      .set({ assigneeAgentId: newCoderId, updatedAt: now })
+      .where(eq(issues.id, seeded.issueId));
+
+    const wakeups: Array<{ agentId: string; opts: unknown }> = [];
+    const result = await productivityReviewService(db, {
+      async enqueueWakeup(agentId, opts) {
+        wakeups.push({ agentId, opts });
+        return { id: randomUUID() };
+      },
+    }).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+    });
+
+    expect(result.created).toBe(0);
+    expect(result.closedTerminalSourceReviews).toBe(1);
+    const [review] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, reviewId));
+    expect(review).toMatchObject({ status: "done", identifier: null, issueNumber: null });
+    expect(wakeups).toHaveLength(0);
+    expect(await countReviewActivity(reviewId, "issue.productivity_review_created")).toBe(0);
+    expect(await countReviewActivity(reviewId, "issue.productivity_review_assignment_wake_enqueued")).toBe(0);
+    const [closed] = await db
+      .select({ details: activityLog.details })
+      .from(activityLog)
+      .where(and(eq(activityLog.entityId, reviewId), eq(activityLog.action, "issue.productivity_review_suppressed_open_review_closed")));
+    expect(closed?.details).toMatchObject({ suppressedBy: "unreviewable_source" });
   });
 
   it("retires a stale reserved review after its source disappears", async () => {

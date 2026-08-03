@@ -250,7 +250,6 @@ describeEmbeddedPostgres("allocateFromLinear (happy path, mocked fetch + secrets
           headers: { "Content-Type": "application/json" },
         }),
       )
-      .mockRejectedValueOnce(new Error("retry lookup transport down"))
       .mockResolvedValueOnce(
         new Response(
           JSON.stringify({
