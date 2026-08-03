@@ -88,6 +88,7 @@ export {
   resolveHeartbeatSchedulingSuppression,
 } from "./heartbeat.js";
 export {
+  ISSUE_MONITOR_WAKE_CLAIM_TTL_MS,
   productivityReviewService,
   PRODUCTIVITY_REVIEW_ORIGIN_KIND,
 } from "./productivity-review.js";

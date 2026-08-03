@@ -47,6 +47,8 @@ export const DEFAULT_PRODUCTIVITY_REVIEW_MAX_REFRESH_COMMENTS = 3;
 export const DEFAULT_PRODUCTIVITY_REVIEW_CREATION_WINDOW_MS = 24 * 60 * 60 * 1000;
 export const DEFAULT_PRODUCTIVITY_REVIEW_MAX_CREATIONS_PER_WINDOW = 1;
 export const DEFAULT_PRODUCTIVITY_REVIEW_MAX_CONSECUTIVE_NO_ACTION_REVIEWS = 3;
+export const ISSUE_MONITOR_WAKE_CLAIM_TTL_MS = 5 * 60 * 1000;
+export const DEFAULT_PRODUCTIVITY_REVIEW_MONITOR_LAPSE_SERVICE_GRACE_MS = ISSUE_MONITOR_WAKE_CLAIM_TTL_MS;
 
 const TERMINAL_RUN_STATUSES = ["succeeded", "interrupted", "failed", "cancelled", "timed_out"] as const;
 const ACTIVE_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
@@ -62,17 +64,9 @@ export const PRODUCTIVITY_REVIEW_MIN_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 // Marker set on heartbeat-run contextSnapshot.source by routine dispatches; see
 // queueIssueAssignmentWakeup callers in routines.ts (`contextSource: "routine.dispatch"`).
 const ROUTINE_DISPATCH_CONTEXT_SOURCE = "routine.dispatch";
-// BLO-21003: `monitorNextCheckAt` lapsing is not proof its wake has been serviced.
-// Dispatch (scheduler tick pickup, K8s Job creation, pod scheduling/image pull) is
-// asynchronous, and a reconcile pass can land inside that gap: on BLO-19772 the
-// monitor came due at 17:10:00.000Z, this service evaluated the source at
-// 17:10:00.601Z (601ms into the gap), and the wake was not actually serviced until
-// 17:10:29.739Z. Grace covers a full extra scheduler tick beyond the default
-// `heartbeatSchedulerIntervalMs` (30_000ms, see config.ts) past the due time, so a
-// reconcile pass landing in that window reads as a still-pending wake rather than
-// an unattended stall. A monitor lapsed past this window is genuinely
-// unsupervised and still triggers review, unchanged from today.
-export const MONITOR_LAPSE_SERVICE_GRACE_MS = 60_000;
+// Back-compat export for existing tests/imports. New logic reads the threshold
+// value so the worker can derive it from scheduler cadence and dispatch TTL.
+export const MONITOR_LAPSE_SERVICE_GRACE_MS = DEFAULT_PRODUCTIVITY_REVIEW_MONITOR_LAPSE_SERVICE_GRACE_MS;
 
 type IssueRow = typeof issues.$inferSelect;
 type AgentRow = typeof agents.$inferSelect;
@@ -93,6 +87,7 @@ type ProductivityReviewThresholds = {
   creationWindowMs: number;
   maxCreationsPerWindow: number;
   maxConsecutiveNoActionReviews: number;
+  monitorLapseServiceGraceMs: number;
 };
 
 type ProductivityReviewEvidence = {
@@ -136,6 +131,7 @@ type MonitorScheduledSuppression = {
   elapsedMs: number | null;
   monitorNextCheckAt: Date;
   monitorScheduledBy: string;
+  monitorWakeRequestedAt: Date | null;
   thresholds: ProductivityReviewThresholds;
   generatedAt: Date;
 };
@@ -258,19 +254,44 @@ function isTerminalIssueStatus(status: string | null | undefined) {
   return status === "done" || status === "cancelled";
 }
 
-function deliberateFutureMonitor(issue: IssueRow, now: Date) {
+function isMonitorSuppressionActor(value: string | null | undefined): value is string {
+  return Boolean(value && MONITOR_SCHEDULED_SUPPRESSION_ACTORS.has(value));
+}
+
+function strictFutureMonitor(issue: IssueRow, now: Date) {
   const monitorNextCheckAt = coerceDate(issue.monitorNextCheckAt);
   const monitorScheduledBy = issue.monitorScheduledBy;
-  if (!monitorNextCheckAt) return null;
-  // BLO-21003: a monitor that lapsed within the last MONITOR_LAPSE_SERVICE_GRACE_MS
-  // is treated the same as one still strictly in the future — its wake may simply
-  // not have been serviced yet. `monitorNextCheckAt` is cleared to null once the
-  // wake is actually triggered (see buildIssueMonitorTriggeredPatch), so this
-  // window only ever covers the narrow due-but-not-yet-cleared gap, not a
-  // genuinely lapsed monitor.
-  if (monitorNextCheckAt.getTime() <= now.getTime() - MONITOR_LAPSE_SERVICE_GRACE_MS) return null;
-  if (!monitorScheduledBy || !MONITOR_SCHEDULED_SUPPRESSION_ACTORS.has(monitorScheduledBy)) return null;
+  if (!monitorNextCheckAt || monitorNextCheckAt.getTime() <= now.getTime()) return null;
+  if (!isMonitorSuppressionActor(monitorScheduledBy)) return null;
   return { monitorNextCheckAt, monitorScheduledBy };
+}
+
+function monitorHasFreshWakeClaim(issue: IssueRow, now: Date) {
+  const monitorWakeRequestedAt = coerceDate(issue.monitorWakeRequestedAt);
+  if (!monitorWakeRequestedAt) return null;
+  return monitorWakeRequestedAt.getTime() > now.getTime() - ISSUE_MONITOR_WAKE_CLAIM_TTL_MS
+    ? monitorWakeRequestedAt
+    : null;
+}
+
+function deliberatePendingMonitor(issue: IssueRow, now: Date, thresholds: ProductivityReviewThresholds) {
+  const future = strictFutureMonitor(issue, now);
+  if (future) return { ...future, monitorWakeRequestedAt: null };
+
+  const monitorNextCheckAt = coerceDate(issue.monitorNextCheckAt);
+  const monitorScheduledBy = issue.monitorScheduledBy;
+  if (!monitorNextCheckAt || !isMonitorSuppressionActor(monitorScheduledBy)) return null;
+
+  // BLO-21003: `monitorNextCheckAt` lapsing is not proof its wake has been
+  // serviced. For new-review suppression, keep treating it as pending while
+  // either (a) the scheduler-derived grace has not elapsed, or (b) the monitor
+  // dispatcher has a fresh durable claim (`monitorWakeRequestedAt`). The close
+  // path intentionally does not use this helper because resolving an already
+  // open review would start the resolved-review snooze before dispatch succeeds.
+  const dueAgeMs = now.getTime() - monitorNextCheckAt.getTime();
+  const monitorWakeRequestedAt = monitorHasFreshWakeClaim(issue, now);
+  if (dueAgeMs > thresholds.monitorLapseServiceGraceMs && !monitorWakeRequestedAt) return null;
+  return { monitorNextCheckAt, monitorScheduledBy, monitorWakeRequestedAt };
 }
 
 /**
@@ -447,6 +468,10 @@ function buildThresholds(overrides?: Partial<ProductivityReviewThresholds>): Pro
     maxConsecutiveNoActionReviews: readPositiveInteger(
       overrides?.maxConsecutiveNoActionReviews ?? DEFAULT_PRODUCTIVITY_REVIEW_MAX_CONSECUTIVE_NO_ACTION_REVIEWS,
       DEFAULT_PRODUCTIVITY_REVIEW_MAX_CONSECUTIVE_NO_ACTION_REVIEWS,
+    ),
+    monitorLapseServiceGraceMs: readPositiveInteger(
+      overrides?.monitorLapseServiceGraceMs ?? DEFAULT_PRODUCTIVITY_REVIEW_MONITOR_LAPSE_SERVICE_GRACE_MS,
+      DEFAULT_PRODUCTIVITY_REVIEW_MONITOR_LAPSE_SERVICE_GRACE_MS,
     ),
   };
 }
@@ -847,6 +872,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       suppressedBy: "monitor_scheduled",
       monitorNextCheckAt: suppression.monitorNextCheckAt.toISOString(),
       monitorScheduledBy: suppression.monitorScheduledBy,
+      monitorWakeRequestedAt: suppression.monitorWakeRequestedAt?.toISOString() ?? null,
       elapsedMs: suppression.elapsedMs,
     };
     await logActivity(db, {
@@ -946,7 +972,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         // from an agent actor and hard-codes `status: "pending"`), so honouring it here would let a
         // flagged agent retire its own oversight artifact. A monitor is set by the assignee or the
         // board through a server-owned column and self-expires, which is why it keeps this path.
-        const monitor = deliberateFutureMonitor(sourceIssue, now);
+        const monitor = strictFutureMonitor(sourceIssue, now);
         if (monitor) {
           suppressedBy = "monitor_scheduled";
           suppressionDetails = {
@@ -1179,7 +1205,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       }
     }
 
-    const monitor = deliberateFutureMonitor(sourceIssue, now);
+    const monitor = deliberatePendingMonitor(sourceIssue, now, thresholds);
     if (trigger === "long_active_duration" && monitor) {
       return {
         trigger,
@@ -1189,6 +1215,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         elapsedMs,
         monitorNextCheckAt: monitor.monitorNextCheckAt,
         monitorScheduledBy: monitor.monitorScheduledBy,
+        monitorWakeRequestedAt: monitor.monitorWakeRequestedAt,
         thresholds,
         generatedAt: now,
       };
