@@ -3530,7 +3530,12 @@ registry.registerPath({
   method: "get",
   path: "/api/cli-auth/me",
   tags: ["access"],
-  summary: "Get current CLI auth session",
+  summary: "Introspect the calling identity (board user or agent)",
+  description:
+    "Resolves the caller's own identity. Answers for board actors and for agent "
+    + "actors. `userId` is a board user id only when `source` is a board source; when "
+    + "`source` matches /^agent(_|$)/ it is an AGENT id and `user` is null, so clients "
+    + "must discriminate on `source` before treating `userId` as a person.",
   responses: { 200: r.ok(), 401: r.unauthorized },
 });
 
