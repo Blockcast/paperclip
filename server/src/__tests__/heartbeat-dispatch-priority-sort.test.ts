@@ -2586,7 +2586,7 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
       name: "ClaimLaunchFailureAgent",
       role: "engineer",
       status: "idle",
-      adapterType: "claude_k8s",
+      adapterType: "codex_local",
       adapterConfig: {},
       runtimeConfig: { heartbeat: { enabled: true, wakeOnDemand: true, maxConcurrentRuns: 2 } },
       permissions: {},
@@ -2663,11 +2663,13 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
       };
     });
 
-    await boundedHeartbeat.resumeQueuedRuns();
+    await expect(boundedHeartbeat.resumeQueuedRuns()).rejects.toThrow(
+      "injected refusal status read failure",
+    );
     await waitForRunToSettle(boundedHeartbeat, firstRunId, 60_000);
 
     expect(injectedFailure).toBe(true);
-    expect(dispatchedRunIds).toContain(firstRunId);
+    expect(dispatchedRunIds.filter((runId) => runId === firstRunId)).toEqual([firstRunId]);
     await boundedHeartbeat.drainInFlightExecutions(60_000);
   }, 120_000);
 
