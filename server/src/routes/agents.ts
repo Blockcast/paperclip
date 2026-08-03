@@ -263,6 +263,18 @@ function readLiveRunsQueryInt(value: unknown, max: number, fallback = 0) {
   return Math.min(max, Math.trunc(parsed));
 }
 
+/**
+ * BLO-20396: normalize a value that drizzle types as a timestamp but does not
+ * actually decode. Raw `sql<...>` aggregates (min/max over a timestamp column)
+ * bypass PgTimestamp.mapFromDriverValue, so postgres-js hands back the wire
+ * string. Returns null for null/unparseable input rather than an Invalid Date.
+ */
+function toDateOrNull(value: Date | string | null | undefined): Date | null {
+  if (value === null || value === undefined) return null;
+  const parsed = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
 function readRunIssueId(context: Record<string, unknown> | null) {
   const directIssueId = context?.issueId;
   if (typeof directIssueId === "string" && isUuidLike(directIssueId)) return directIssueId;
@@ -4043,7 +4055,7 @@ export function agentRoutes(
           agentName: agentsTable.name,
           activeCount: sql<number>`count(*)::int`,
           queuedCount: sql<number>`count(*) filter (where ${heartbeatRuns.status} in ('queued', 'scheduled_retry'))::int`,
-          oldestQueuedAt: sql<Date | null>`min(${heartbeatRuns.createdAt}) filter (where ${heartbeatRuns.status} in ('queued', 'scheduled_retry'))`,
+          oldestQueuedAt: sql<Date | string | null>`min(${heartbeatRuns.createdAt}) filter (where ${heartbeatRuns.status} in ('queued', 'scheduled_retry'))`,
         })
         .from(heartbeatRuns)
         .innerJoin(agentsTable, eq(heartbeatRuns.agentId, agentsTable.id))
@@ -4116,7 +4128,12 @@ export function agentRoutes(
         agentId: summary.agentId,
         agentName: summary.agentName,
         queuedCount: summary.queuedCount,
-        oldestQueuedAt: summary.oldestQueuedAt,
+        // BLO-20396: coerce at the boundary. `sql<Date | null>` only sets the
+        // compile-time generic — drizzle's postgres-js driver runs
+        // mapFromDriverValue for real column references, not for raw
+        // expressions, so this aggregate arrives as a timestamp *string* and
+        // calling .getTime() on it later 500s the whole endpoint.
+        oldestQueuedAt: toDateOrNull(summary.oldestQueuedAt),
         runs: [],
       });
     }
