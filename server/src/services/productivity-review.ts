@@ -3,6 +3,7 @@ import type { Db } from "@paperclipai/db";
 import { clampIssueRequestDepth } from "@paperclipai/shared";
 import {
   activityLog,
+  agentWakeupRequests,
   agents,
   approvals,
   companies,
@@ -64,6 +65,9 @@ const MAX_CANDIDATE_ISSUES = 250;
 const MAX_RUNS_FOR_STREAK = 100;
 const MAX_PARENT_WALK_DEPTH = 25;
 export const PRODUCTIVITY_REVIEW_REFRESH_COMMENT_PREFIX = "Productivity review evidence refreshed.";
+const PRODUCTIVITY_REVIEW_CREATED_ACTION = "issue.productivity_review_created";
+const PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_ENQUEUED_ACTION =
+  "issue.productivity_review_assignment_wake_enqueued";
 // BLO-3281 AC2 hard floor: even if the detector scan cadence is faster
 // than this, the refresh-evidence-comment path stays throttled at 5 min.
 // Defends against the 2026-05-05 incident on BLO-3277 (14 refreshes in
@@ -170,6 +174,7 @@ type EnqueueWakeup = (
     triggerDetail?: "manual" | "ping" | "callback" | "system";
     reason?: string | null;
     payload?: Record<string, unknown> | null;
+    idempotencyKey?: string | null;
     requestedByActorType?: "user" | "agent" | "system";
     requestedByActorId?: string | null;
     contextSnapshot?: Record<string, unknown>;
@@ -201,6 +206,10 @@ class MonitorSuppressedBeforeCreateError extends Error {
 
 function productivityReviewFingerprint(sourceIssueId: string) {
   return `productivity-review:${sourceIssueId}`;
+}
+
+function productivityReviewAssignmentWakeIdempotencyKey(reviewIssueId: string) {
+  return `productivity-review-created:${reviewIssueId}`;
 }
 
 function productivityReviewEscalationFingerprint(sourceIssueId: string) {
@@ -731,7 +740,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     title: string;
     description: string;
     generatedAt: Date;
-  }) {
+  }): Promise<{ review: IssueRow; finalized: boolean }> {
     let createdLinearIssueId: string | null = null;
     try {
       return await db.transaction(async (tx) => {
@@ -746,7 +755,9 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           .limit(1)
           .then((rows) => rows[0] ?? null);
         if (!current) throw new Error(`Reserved productivity review ${input.review.id} disappeared before finalization`);
-        if (current.identifier && current.issueNumber != null) return current;
+        if (current.identifier && current.issueNumber != null) {
+          return { review: current, finalized: false };
+        }
         if (current.identifier || current.issueNumber != null) {
           throw new Error(`Reserved productivity review ${input.review.id} is partially finalized`);
         }
@@ -756,6 +767,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           companyId: input.review.companyId,
           title: input.title,
           description: input.description,
+          linearIssueIdempotencyKey: input.review.id,
         });
         if (allocation.createdLinearSideIssue && allocation.externalIssueId) {
           createdLinearIssueId = allocation.externalIssueId;
@@ -788,7 +800,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           });
         }
 
-        return updated;
+        return { review: updated, finalized: true };
       });
     } catch (error) {
       if (createdLinearIssueId) {
@@ -980,56 +992,161 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     return comment;
   }
 
+  async function hasIssueActivity(
+    executor: DbOrTx,
+    input: { companyId: string; issueId: string; action: string },
+  ) {
+    return executor
+      .select({ id: activityLog.id })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, input.companyId),
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, input.issueId),
+          eq(activityLog.action, input.action),
+        ),
+      )
+      .limit(1)
+      .then((rows) => Boolean(rows[0]));
+  }
+
+  async function insertIssueActivityIfMissing(
+    executor: DbOrTx,
+    input: {
+      companyId: string;
+      issueId: string;
+      action: string;
+      agentId?: string | null;
+      details?: Record<string, unknown> | null;
+      createdAt: Date;
+    },
+  ) {
+    if (await hasIssueActivity(executor, input)) return false;
+    await executor.insert(activityLog).values({
+      companyId: input.companyId,
+      actorType: "system",
+      actorId: "system",
+      action: input.action,
+      entityType: "issue",
+      entityId: input.issueId,
+      agentId: input.agentId ?? null,
+      details: input.details ?? null,
+      createdAt: input.createdAt,
+    });
+    return true;
+  }
+
+  async function hasAssignmentWakeRequest(
+    executor: DbOrTx,
+    input: { companyId: string; agentId: string; idempotencyKey: string },
+  ) {
+    return executor
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.companyId, input.companyId),
+          eq(agentWakeupRequests.agentId, input.agentId),
+          eq(agentWakeupRequests.idempotencyKey, input.idempotencyKey),
+        ),
+      )
+      .limit(1)
+      .then((rows) => Boolean(rows[0]));
+  }
+
   async function finishCreatedProductivityReview(
     review: Pick<IssueRow, "id">,
     evidence: ProductivityReviewEvidence,
     ownerAgentId: string,
-  ) {
-    await db
-      .update(issues)
-      .set({ createdAt: evidence.generatedAt, updatedAt: evidence.generatedAt })
-      .where(eq(issues.id, review.id));
+  ): Promise<{ createdActivityInserted: boolean; assignmentWakeProcessed: boolean }> {
+    const wakeIdempotencyKey = productivityReviewAssignmentWakeIdempotencyKey(review.id);
+    return db.transaction(async (tx) => {
+      await tx.execute(
+        sql`select pg_advisory_xact_lock(hashtextextended(${`productivity-review-finish:${review.id}`}, 0))`,
+      );
 
-    await logActivity(db, {
-      companyId: evidence.sourceIssue.companyId,
-      actorType: "system",
-      actorId: "system",
-      action: "issue.productivity_review_created",
-      entityType: "issue",
-      entityId: review.id,
-      agentId: ownerAgentId,
-      details: {
-        source: "productivity_review.reconcile",
-        sourceIssueId: evidence.sourceIssue.id,
-        trigger: evidence.trigger,
-        noCommentStreak: evidence.noCommentStreak,
-        runCountLastHour: evidence.runCountLastHour,
-        commentCountLastHour: evidence.commentCountLastHour,
-      },
-    });
-
-    if (ownerAgentId && deps?.enqueueWakeup) {
-      await deps.enqueueWakeup(ownerAgentId, {
-        source: "assignment",
-        triggerDetail: "system",
-        reason: "issue_assigned",
-        payload: withRecoveryModelProfileHint({
-          issueId: review.id,
+      const createdActivityInserted = await insertIssueActivityIfMissing(tx, {
+        companyId: evidence.sourceIssue.companyId,
+        issueId: review.id,
+        action: PRODUCTIVITY_REVIEW_CREATED_ACTION,
+        agentId: ownerAgentId,
+        createdAt: evidence.generatedAt,
+        details: {
+          source: "productivity_review.reconcile",
           sourceIssueId: evidence.sourceIssue.id,
           trigger: evidence.trigger,
-        }, "status_only"),
-        requestedByActorType: "system",
-        requestedByActorId: "productivity_review",
-        contextSnapshot: withRecoveryModelProfileHint({
-          issueId: review.id,
-          taskId: review.id,
-          wakeReason: "issue_assigned",
-          source: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
-          sourceIssueId: evidence.sourceIssue.id,
-          productivityReviewTrigger: evidence.trigger,
-        }, "status_only"),
+          noCommentStreak: evidence.noCommentStreak,
+          runCountLastHour: evidence.runCountLastHour,
+          commentCountLastHour: evidence.commentCountLastHour,
+        },
       });
-    }
+
+      if (createdActivityInserted) {
+        await tx
+          .update(issues)
+          .set({ createdAt: evidence.generatedAt, updatedAt: evidence.generatedAt })
+          .where(eq(issues.id, review.id));
+      }
+
+      let assignmentWakeProcessed = false;
+      const wakeMarkerExists = await hasIssueActivity(tx, {
+        companyId: evidence.sourceIssue.companyId,
+        issueId: review.id,
+        action: PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_ENQUEUED_ACTION,
+      });
+      let wakeAlreadyProcessed = wakeMarkerExists;
+      if (!wakeAlreadyProcessed && deps?.enqueueWakeup) {
+        wakeAlreadyProcessed = await hasAssignmentWakeRequest(tx, {
+          companyId: evidence.sourceIssue.companyId,
+          agentId: ownerAgentId,
+          idempotencyKey: wakeIdempotencyKey,
+        });
+      }
+
+      if (!wakeAlreadyProcessed && deps?.enqueueWakeup) {
+        await deps.enqueueWakeup(ownerAgentId, {
+          source: "assignment",
+          triggerDetail: "system",
+          reason: "issue_assigned",
+          idempotencyKey: wakeIdempotencyKey,
+          payload: withRecoveryModelProfileHint({
+            issueId: review.id,
+            sourceIssueId: evidence.sourceIssue.id,
+            trigger: evidence.trigger,
+          }, "status_only"),
+          requestedByActorType: "system",
+          requestedByActorId: "productivity_review",
+          contextSnapshot: withRecoveryModelProfileHint({
+            issueId: review.id,
+            taskId: review.id,
+            wakeReason: "issue_assigned",
+            source: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+            sourceIssueId: evidence.sourceIssue.id,
+            productivityReviewTrigger: evidence.trigger,
+          }, "status_only"),
+        });
+        wakeAlreadyProcessed = true;
+      }
+
+      if (wakeAlreadyProcessed && !wakeMarkerExists && deps?.enqueueWakeup) {
+        assignmentWakeProcessed = await insertIssueActivityIfMissing(tx, {
+          companyId: evidence.sourceIssue.companyId,
+          issueId: review.id,
+          action: PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_ENQUEUED_ACTION,
+          agentId: ownerAgentId,
+          createdAt: evidence.generatedAt,
+          details: {
+            source: "productivity_review.reconcile",
+            sourceIssueId: evidence.sourceIssue.id,
+            trigger: evidence.trigger,
+            idempotencyKey: wakeIdempotencyKey,
+          },
+        });
+      }
+
+      return { createdActivityInserted, assignmentWakeProcessed };
+    });
   }
 
   async function findOpenProductivityReviewEscalation(companyId: string, sourceIssueId: string) {
@@ -1831,16 +1948,25 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           description: existing.description ?? buildReviewMarkdown(evidence, opts.prefix),
           generatedAt: evidence.generatedAt,
         });
-        await finishCreatedProductivityReview(finalized, evidence, existing.assigneeAgentId);
+        const finish = await finishCreatedProductivityReview(
+          finalized.review,
+          evidence,
+          existing.assigneeAgentId,
+        );
         logger.info(
           {
-            reviewIssueId: finalized.id,
+            reviewIssueId: finalized.review.id,
             sourceIssueId: evidence.sourceIssue.id,
             reservationAgeMs,
+            finalized: finalized.finalized,
+            createdActivityInserted: finish.createdActivityInserted,
+            assignmentWakeProcessed: finish.assignmentWakeProcessed,
           },
           "productivity review reservation recovered and finalized",
         );
-        return { kind: "created" as const, reviewIssueId: finalized.id };
+        return finalized.finalized || finish.createdActivityInserted || finish.assignmentWakeProcessed
+          ? { kind: "created" as const, reviewIssueId: finalized.review.id }
+          : { kind: "existing" as const, reviewIssueId: finalized.review.id };
       }
 
       if (existing.identifier == null || existing.issueNumber == null) {
@@ -1852,6 +1978,22 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           "productivity review existing row is partially finalized",
         );
         return { kind: "existing" as const, reviewIssueId: existing.id };
+      }
+
+      if (existing.assigneeAgentId) {
+        const finish = await finishCreatedProductivityReview(existing, evidence, existing.assigneeAgentId);
+        if (finish.createdActivityInserted || finish.assignmentWakeProcessed) {
+          logger.info(
+            {
+              reviewIssueId: existing.id,
+              sourceIssueId: evidence.sourceIssue.id,
+              createdActivityInserted: finish.createdActivityInserted,
+              assignmentWakeProcessed: finish.assignmentWakeProcessed,
+            },
+            "productivity review finalized side effects replayed",
+          );
+          return { kind: "created" as const, reviewIssueId: existing.id };
+        }
       }
 
       // BLO-3281 AC2: hard-floor refresh interval. Even when the
@@ -2012,7 +2154,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           title: reviewTitle,
           description: reviewDescription,
           generatedAt: evidence.generatedAt,
-        }) as Awaited<ReturnType<typeof issuesSvc.create>>;
+        }).then((finalized) => finalized.review) as Awaited<ReturnType<typeof issuesSvc.create>>;
       } else {
         review = await issuesSvc.create(evidence.sourceIssue.companyId, {
           title: reviewTitle,

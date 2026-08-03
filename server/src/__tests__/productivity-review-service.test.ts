@@ -250,6 +250,50 @@ describeEmbeddedPostgres("productivity review service", () => {
       .orderBy(issueComments.createdAt);
   }
 
+  async function insertProductivityReview(input: {
+    seeded: Awaited<ReturnType<typeof seedAssignedIssue>>;
+    reviewId?: string;
+    createdAt: Date;
+    issueNumber?: number | null;
+    identifier?: string | null;
+  }) {
+    const reviewId = input.reviewId ?? randomUUID();
+    await db.insert(issues).values({
+      id: reviewId,
+      companyId: input.seeded.companyId,
+      title: "Review productivity for reserved source",
+      description: "Reserved before identifier allocation",
+      status: "todo",
+      priority: "medium",
+      parentId: input.seeded.issueId,
+      assigneeAgentId: input.seeded.managerId,
+      originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+      originId: input.seeded.issueId,
+      originFingerprint: `productivity-review:${input.seeded.issueId}`,
+      requestDepth: 1,
+      issueNumber: input.issueNumber ?? null,
+      identifier: input.identifier ?? null,
+      createdAt: input.createdAt,
+      updatedAt: input.createdAt,
+      lastActivityAt: input.createdAt,
+    });
+    return reviewId;
+  }
+
+  async function countReviewActivity(reviewId: string, action: string) {
+    return db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, reviewId),
+          eq(activityLog.action, action),
+        ),
+      )
+      .then((rows) => Number(rows[0]?.count ?? 0));
+  }
+
   async function listProductivityReviewEscalations(companyId: string) {
     return db
       .select()
@@ -1796,6 +1840,9 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(review?.updatedAt.toISOString()).toBe(now.toISOString());
     expect(wakeups).toHaveLength(1);
     expect(wakeups[0]?.agentId).toBe(seeded.managerId);
+    expect(wakeups[0]?.opts).toMatchObject({
+      idempotencyKey: `productivity-review-created:${reviewId}`,
+    });
 
     const activities = await db
       .select()
@@ -1803,6 +1850,110 @@ describeEmbeddedPostgres("productivity review service", () => {
       .where(eq(activityLog.action, "issue.productivity_review_created"));
     expect(activities).toHaveLength(1);
     expect(activities[0]?.entityId).toBe(reviewId);
+    expect(await countReviewActivity(reviewId, "issue.productivity_review_assignment_wake_enqueued")).toBe(1);
+  });
+
+  it("recovers a stale reserved review only once when reconcilers race", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const reservedAt = new Date(now.getTime() - 10 * 60_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt: new Date(now.getTime() - 10 * 60 * 1000),
+      monitorScheduledBy: "assignee",
+    });
+    const reviewId = await insertProductivityReview({ seeded, createdAt: reservedAt });
+
+    const wakeups: Array<{ agentId: string; opts: unknown }> = [];
+    let waitingReconcilers = 0;
+    const bothReconcilersReady = deferred();
+    const releaseReconcilers = deferred();
+    const service = productivityReviewService(db, {
+      async beforeCreateOrUpdateReview(evidence) {
+        if (evidence.sourceIssue.id !== seeded.issueId) return;
+        waitingReconcilers += 1;
+        if (waitingReconcilers === 2) bothReconcilersReady.resolve();
+        await releaseReconcilers.promise;
+      },
+      async enqueueWakeup(agentId, opts) {
+        wakeups.push({ agentId, opts });
+        return null;
+      },
+    });
+
+    const first = service.reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+    });
+    const second = service.reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+    });
+    await bothReconcilersReady.promise;
+    releaseReconcilers.resolve();
+
+    const results = await Promise.all([first, second]);
+    expect(results[0].created + results[1].created).toBe(1);
+    expect(results[0].existing + results[1].existing).toBe(1);
+    expect(wakeups).toHaveLength(1);
+    expect(await countReviewActivity(reviewId, "issue.productivity_review_created")).toBe(1);
+    expect(await countReviewActivity(reviewId, "issue.productivity_review_assignment_wake_enqueued")).toBe(1);
+
+    const [review] = await db.select().from(issues).where(eq(issues.id, reviewId));
+    expect(review?.identifier).toBe(`${seeded.issuePrefix}-2`);
+    expect(review?.issueNumber).toBe(2);
+  });
+
+  it("replays missing finalized review side effects without duplicating them", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const createdAt = new Date(now.getTime() - 60_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt: new Date(now.getTime() - 10 * 60 * 1000),
+      monitorScheduledBy: "assignee",
+    });
+    const reviewId = await insertProductivityReview({
+      seeded,
+      createdAt,
+      issueNumber: 2,
+      identifier: `${seeded.issuePrefix}-2`,
+    });
+
+    const wakeups: Array<{ agentId: string; opts: unknown }> = [];
+    const service = productivityReviewService(db, {
+      async enqueueWakeup(agentId, opts) {
+        wakeups.push({ agentId, opts });
+        return null;
+      },
+    });
+
+    const replayed = await service.reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+    });
+    expect(replayed.created).toBe(1);
+    expect(replayed.failed).toBe(0);
+    expect(wakeups).toHaveLength(1);
+    expect(wakeups[0]?.opts).toMatchObject({
+      idempotencyKey: `productivity-review-created:${reviewId}`,
+    });
+    expect(await countReviewActivity(reviewId, "issue.productivity_review_created")).toBe(1);
+    expect(await countReviewActivity(reviewId, "issue.productivity_review_assignment_wake_enqueued")).toBe(1);
+
+    const second = await service.reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+    });
+    expect(second.created).toBe(0);
+    expect(second.existing).toBe(1);
+    expect(wakeups).toHaveLength(1);
+    expect(await countReviewActivity(reviewId, "issue.productivity_review_created")).toBe(1);
+    expect(await countReviewActivity(reviewId, "issue.productivity_review_assignment_wake_enqueued")).toBe(1);
   });
 
   // Negative control for BLO-21003: a monitor that lapsed well past the

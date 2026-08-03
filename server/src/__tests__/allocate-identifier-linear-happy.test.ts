@@ -157,6 +157,134 @@ describeEmbeddedPostgres("allocateFromLinear (happy path, mocked fetch + secrets
     expect(body.variables.input.description).toBe("optional body");
   });
 
+  it("reuses an existing Linear issue with the supplied idempotency key", async () => {
+    const { company } = await seedLinearConfigured({});
+
+    fetchSpy!.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          data: {
+            issue: {
+              id: "reserved-review-id",
+              identifier: "BLO-2222",
+              url: "https://linear.app/blockc/issue/BLO-2222/title-slug",
+            },
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+
+    const result = await allocateIdentifier({
+      db,
+      companyId: company.id,
+      title: "reuse existing linear issue",
+      linearIssueIdempotencyKey: "reserved-review-id",
+    });
+
+    expect(result.source).toBe("linear");
+    expect(result.identifier).toBe("BLO-2222");
+    expect(result.issueNumber).toBe(2222);
+    expect(result.externalIssueId).toBe("reserved-review-id");
+    expect(result.createdLinearSideIssue).toBe(false);
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    const body = JSON.parse(fetchSpy!.mock.calls[0]![1]!.body as string);
+    expect(body.query).toMatch(/query IssueById/);
+    expect(body.variables.id).toBe("reserved-review-id");
+  });
+
+  it("sends the idempotency key as IssueCreateInput.id when no Linear issue exists yet", async () => {
+    const { company } = await seedLinearConfigured({});
+
+    fetchSpy!
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ data: { issue: null } }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            data: {
+              issueCreate: {
+                success: true,
+                issue: {
+                  id: "reserved-review-id",
+                  identifier: "BLO-3333",
+                  url: "https://linear.app/blockc/issue/BLO-3333/title-slug",
+                },
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+      );
+
+    const result = await allocateIdentifier({
+      db,
+      companyId: company.id,
+      title: "create with stable id",
+      linearIssueIdempotencyKey: "reserved-review-id",
+    });
+
+    expect(result.createdLinearSideIssue).toBe(true);
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    const createBody = JSON.parse(fetchSpy!.mock.calls[1]![1]!.body as string);
+    expect(createBody.query).toMatch(/mutation IssueCreate/);
+    expect(createBody.variables.input.id).toBe("reserved-review-id");
+    expect(createBody.variables.input.title).toBe("create with stable id");
+  });
+
+  it("recovers an ambiguous IssueCreate failure by looking up the idempotency key", async () => {
+    const { company } = await seedLinearConfigured({});
+
+    fetchSpy!
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ data: { issue: null } }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            errors: [{ message: "upstream timeout after create", path: ["issueCreate"] }],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            data: {
+              issue: {
+                id: "reserved-review-id",
+                identifier: "BLO-4444",
+                url: "https://linear.app/blockc/issue/BLO-4444/title-slug",
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+      );
+
+    const result = await allocateIdentifier({
+      db,
+      companyId: company.id,
+      title: "ambiguous create",
+      linearIssueIdempotencyKey: "reserved-review-id",
+    });
+
+    expect(result.identifier).toBe("BLO-4444");
+    expect(result.createdLinearSideIssue).toBe(false);
+    expect(fetchSpy).toHaveBeenCalledTimes(3);
+    const recoveryBody = JSON.parse(fetchSpy!.mock.calls[2]![1]!.body as string);
+    expect(recoveryBody.query).toMatch(/query IssueById/);
+    expect(recoveryBody.variables.id).toBe("reserved-review-id");
+  });
+
   it("omits description from the IssueCreate input when caller doesn't provide one", async () => {
     const { company } = await seedLinearConfigured({});
 
