@@ -374,13 +374,21 @@ async function runOpenCode(mcpUrl: string, modelUrl: string) {
       watchdogExpired = true;
       child.kill("SIGKILL");
     }, 30_000);
-    child.on("error", reject);
-    child.on("exit", (code) => {
+    let settled = false;
+    const settle = (action: () => void) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(watchdog);
-      if (watchdogExpired) {
-        reject(new Error(`OpenCode regression timed out\nstdout:\n${stdout}\nstderr:\n${stderr}`));
-      } else if (code === 0) resolve({ stdout, stderr });
-      else reject(new Error(`OpenCode exited ${code}\nstdout:\n${stdout}\nstderr:\n${stderr}`));
+      action();
+    };
+    child.once("error", (error) => settle(() => reject(error)));
+    child.once("close", (code) => {
+      settle(() => {
+        if (watchdogExpired) {
+          reject(new Error(`OpenCode regression timed out\nstdout:\n${stdout}\nstderr:\n${stderr}`));
+        } else if (code === 0) resolve({ stdout, stderr });
+        else reject(new Error(`OpenCode exited ${code}\nstdout:\n${stdout}\nstderr:\n${stderr}`));
+      });
     });
   });
 }
