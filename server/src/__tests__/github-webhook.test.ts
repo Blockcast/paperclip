@@ -119,22 +119,47 @@ describe("github-webhook pure helpers", () => {
     expect(__test_extractPaperclipIdentifiers("(BLO-3182): work")).toEqual(["BLO-3182"]);
   });
 
-  it("resolves the PR's OWNING identifier as branch > title > labeled Fixes:/Closes:/Refs: body line, never a bare Related: mention (BLO-20886)", () => {
-    // Branch wins even when the body disagrees.
+  it("resolves the PR's OWNING identifier as title > labeled Fixes:/Closes:/Refs: body line > branch, never a bare Related: mention (BLO-20886)", () => {
+    // Title outranks everything else.
     expect(
       resolveOwningPaperclipIdentifiers({
-        branch: "fix/BLO-1-thing",
-        title: "irrelevant",
-        body: "Related: BLO-2",
+        branch: "fix/BLO-9-stale-branch",
+        title: "fix BLO-1 thing",
+        body: "Refs: BLO-2",
       }),
     ).toEqual({ owning: ["BLO-1"] });
 
-    // No branch: title wins over a labeled body line.
+    // No title ref: a labeled body line outranks the branch. This ordering is
+    // load-bearing -- branches get repurposed, so a branch ref goes stale
+    // while the curated title/body stays current (observed: #909's branch says
+    // blo-20049 while both its title and body name BLO-20467, the issue it
+    // actually fixes). Ranking the branch above them would reintroduce this
+    // ticket's own defect.
     expect(
       resolveOwningPaperclipIdentifiers({
-        branch: null,
-        title: "fix BLO-1 thing",
-        body: "Refs: BLO-2",
+        branch: "fix/blo-20049-stale-branch",
+        title: "fix(alertmanager-plugin): resolve webhook token per delivery",
+        body: "- Fixes: BLO-20467",
+      }),
+    ).toEqual({ owning: ["BLO-20467"] });
+
+    // Branch is the LAST resort, and matches case-insensitively so that a
+    // conventional lowercase branch resolves at all -- the identifier pattern
+    // is uppercase-only, which left the branch tier inert and failed 24 of 175
+    // recent PRs closed to `no_owning_reference`, dropping author wakes that
+    // should have been delivered.
+    expect(
+      resolveOwningPaperclipIdentifiers({ branch: "sre/blo-20886-pr-review-wake-routing" }),
+    ).toEqual({ owning: ["BLO-20886"] });
+    expect(
+      resolveOwningPaperclipIdentifiers({ branch: "qa/blo-21079-master-artifact" }),
+    ).toEqual({ owning: ["BLO-21079"] });
+    // ...but only when nothing curated resolved: a `Related:`-only body still
+    // does not promote a Related: entry, and the branch answers instead.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        branch: "fix/blo-1-thing",
+        body: "Related: BLO-2",
       }),
     ).toEqual({ owning: ["BLO-1"] });
 

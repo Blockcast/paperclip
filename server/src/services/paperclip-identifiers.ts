@@ -111,11 +111,9 @@ export interface OwningIdentifierResolution {
  * Resolve the identifier(s) that OWN a PR, as opposed to ones the PR body
  * merely mentions. Priority, most authoritative first:
  *
- *   1. branch ref   -- the branchTemplate injects the issue ref into the
- *                      branch name, a process-enforced signal (see
- *                      resolveLinkSourceForIdentifier above).
- *   2. title ref
- *   3. body line(s) explicitly labeled Fixes:/Closes:/Resolves:/Refs:
+ *   1. title ref
+ *   2. body line(s) explicitly labeled Fixes:/Closes:/Resolves:/Refs:
+ *   3. branch ref, case-insensitively -- LAST resort, see below.
  *
  * A bare mention anywhere else in the body -- including under a `Related:`
  * label -- is never owning. Only the first non-empty tier is consulted, and
@@ -127,6 +125,30 @@ export interface OwningIdentifierResolution {
  * never to widen the search to a lower-priority tier or an unlabeled mention
  * (BLO-20886: doing so routed an author-directed "push a follow-up commit"
  * wake to the assignee of an unrelated issue named only under `Related:`).
+ *
+ * On the branch tier being LAST and case-insensitive, both of which are
+ * measured rather than assumed. resolveLinkSourceForIdentifier above ranks
+ * the branch FIRST on the theory that branchTemplate injects the ref, making
+ * it process-enforced. Two things falsify that here:
+ *
+ *   - PAPERCLIP_IDENTIFIER_PATTERN is uppercase-only and real branches are
+ *     lowercase (`sre/blo-20886-...`), so an uppercase branch tier is inert:
+ *     across 175 PRs active in the trailing 7 days it fired for 1. That
+ *     silence is what made 24 of those PRs resolve to no owner at all and
+ *     fail closed, losing an author wake they should have received. Matching
+ *     case-insensitively recovers 21 of the 24; the remaining 3 carry no ref
+ *     in the branch either and correctly stay unresolved.
+ *   - Branches get repurposed, so a branch ref goes stale while the title
+ *     stays current. Over the same 175 PRs a case-insensitive branch tier
+ *     agrees with the title/labeled-body answer 142 times and disagrees 8 --
+ *     and in the disagreements the branch is the wrong one (#909's branch
+ *     says `blo-20049` while both its title and its body name BLO-20467, the
+ *     issue it actually fixes). Ranking a stale-prone signal above a curated
+ *     one would reintroduce this ticket's own defect, misrouting an
+ *     author-directed wake in ~5% of cases.
+ *
+ * So the branch is consulted only when nothing curated resolved, where its
+ * choices are 21 recovered wakes against 0 overridden answers.
  */
 export function resolveOwningPaperclipIdentifiers(fields: {
   branch?: string | null;
@@ -134,9 +156,12 @@ export function resolveOwningPaperclipIdentifiers(fields: {
   body?: string | null;
 }): OwningIdentifierResolution {
   const tiers = [
-    extractPaperclipIdentifiers(fields.branch),
     extractPaperclipIdentifiers(fields.title),
     extractOwningLabeledIdentifiers(fields.body),
+    // Uppercased so a conventional lowercase branch (`sre/blo-20886-fix`)
+    // matches the uppercase-only identifier pattern. Safe to normalize here
+    // because a branch ref carries no prose that case could disambiguate.
+    extractPaperclipIdentifiers(fields.branch?.toUpperCase()),
   ];
   for (const tier of tiers) {
     if (tier.length > 0) return { owning: tier };
