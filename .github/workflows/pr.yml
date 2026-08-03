@@ -456,6 +456,7 @@ jobs:
         typecheck_release_registry,
         general_tests,
         worktree_install,
+        opencode_responses_replay,
         build,
         verify_serialized_server,
       ]
@@ -489,6 +490,7 @@ jobs:
           TYPECHECK_RELEASE_REGISTRY_RESULT: ${{ needs.typecheck_release_registry.result }}
           GENERAL_TESTS_RESULT: ${{ needs.general_tests.result }}
           WORKTREE_INSTALL_RESULT: ${{ needs.worktree_install.result }}
+          OPENCODE_RESPONSES_REPLAY_RESULT: ${{ needs.opencode_responses_replay.result }}
           BUILD_RESULT: ${{ needs.build.result }}
           VERIFY_SERIALIZED_SERVER_RESULT: ${{ needs.verify_serialized_server.result }}
         run: |
@@ -497,6 +499,7 @@ jobs:
             [typecheck_release_registry]="$TYPECHECK_RELEASE_REGISTRY_RESULT"
             [general_tests]="$GENERAL_TESTS_RESULT"
             [worktree_install]="$WORKTREE_INSTALL_RESULT"
+            [opencode_responses_replay]="$OPENCODE_RESPONSES_REPLAY_RESULT"
             [build]="$BUILD_RESULT"
             [verify_serialized_server]="$VERIFY_SERIALIZED_SERVER_RESULT"
           )
