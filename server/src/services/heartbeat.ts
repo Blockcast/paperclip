@@ -8417,6 +8417,12 @@ export interface HeartbeatServiceOptions {
     maxResumePasses?: number;
   };
   /**
+   * Overrides the new-review grace for monitor wakes whose `monitorNextCheckAt`
+   * is due but not yet cleared. The worker derives this from scheduler cadence
+   * plus the monitor dispatch claim TTL; tests can set it directly.
+   */
+  productivityReviewMonitorLapseGraceMs?: number;
+  /**
    * Test-only concurrency hook: fired after the scheduler has read a due
    * scheduled_retry row and immediately before the conditional UPDATE that
    * promotes or cancels it.
@@ -17568,7 +17574,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   async function reconcileProductivityReviews(opts?: { now?: Date; companyId?: string }) {
-    return productivityReviews.reconcileProductivityReviews({ ...opts, issueCreatedAtGte: await getWorktreeExecutionCutoff() });
+    return productivityReviews.reconcileProductivityReviews({
+      ...opts,
+      thresholds: options.productivityReviewMonitorLapseGraceMs
+        ? { monitorLapseServiceGraceMs: options.productivityReviewMonitorLapseGraceMs }
+        : undefined,
+      issueCreatedAtGte: await getWorktreeExecutionCutoff(),
+    });
   }
 
   // Sweep companion to the becameDone edge in routes/issues.ts. The edge wakes
