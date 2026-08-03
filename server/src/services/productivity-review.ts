@@ -141,6 +141,12 @@ type MonitorScheduledSuppression = {
   generatedAt: Date;
 };
 
+type PendingMonitorForReviewSuppression = {
+  monitorNextCheckAt: Date;
+  monitorScheduledBy: string;
+  monitorWakeRequestedAt: Date | null;
+};
+
 type ApprovalGatedSuppression = {
   trigger: "long_active_duration";
   triggerReasons: string[];
@@ -177,7 +183,14 @@ type ProductivityReviewServiceDeps = {
   beforeMonitorBacklogGrace?: (sourceIssue: IssueRow) => Promise<void> | void;
   enqueueWakeup?: EnqueueWakeup;
   beforeCreateOrUpdateReview?: (evidence: ProductivityReviewEvidence) => Promise<void> | void;
+  beforeCreateReviewIssueInsert?: (evidence: ProductivityReviewEvidence) => Promise<void> | void;
 };
+
+class MonitorSuppressedBeforeCreateError extends Error {
+  constructor(readonly monitor: PendingMonitorForReviewSuppression) {
+    super("productivity review source monitor became pending before issue insert");
+  }
+}
 
 function productivityReviewFingerprint(sourceIssueId: string) {
   return `productivity-review:${sourceIssueId}`;
@@ -294,7 +307,7 @@ function deliberatePendingMonitor(
   now: Date,
   thresholds: ProductivityReviewThresholds,
   backlogGraceMs = 0,
-) {
+): PendingMonitorForReviewSuppression | null {
   const future = strictFutureMonitor(issue, now);
   if (future) return { ...future, monitorWakeRequestedAt: null };
 
@@ -555,8 +568,21 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       .then((rows) => rows[0] ?? null);
   }
 
-  async function getCurrentIssue(sourceIssue: IssueRow) {
-    return db
+  async function getCurrentIssue(
+    sourceIssue: IssueRow,
+    dbClient: DbOrTx = db,
+    opts?: { forUpdate?: boolean },
+  ) {
+    if (opts?.forUpdate) {
+      await dbClient.execute(sql`
+        select ${issues.id}
+        from ${issues}
+        where ${issues.companyId} = ${sourceIssue.companyId}
+          and ${issues.id} = ${sourceIssue.id}
+        for update
+      `);
+    }
+    return dbClient
       .select()
       .from(issues)
       .where(and(eq(issues.companyId, sourceIssue.companyId), eq(issues.id, sourceIssue.id)))
@@ -1069,6 +1095,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     sourceIssue: IssueRow,
     now: Date,
     thresholds: ProductivityReviewThresholds,
+    dbClient: DbOrTx = db,
   ) {
     const monitorNextCheckAt = coerceDate(sourceIssue.monitorNextCheckAt);
     if (!monitorNextCheckAt || monitorNextCheckAt.getTime() > now.getTime()) return 0;
@@ -1089,7 +1116,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         lt(issues.id, sourceIssue.id),
       ),
     );
-    const queueState = await db
+    const queueState = await dbClient
       .select({
         duePosition: sql<number>`count(*)::int`,
         latestFreshPredecessorClaimedAt: sql<Date | null>`
@@ -1135,8 +1162,14 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     const dispatchDeadlineMs =
       dispatchTicks * thresholds.monitorSchedulerIntervalMs + ISSUE_MONITOR_WAKE_CLAIM_TTL_MS;
     const latestFreshPredecessorClaimedAt = coerceDate(queueState?.latestFreshPredecessorClaimedAt);
+    // Fresh predecessor claims can prove a real dispatch is still in service, but later reclaims
+    // must not keep extending this source's suppression window indefinitely.
+    const freshClaimDeadlineCapMs = dispatchDeadlineMs + ISSUE_MONITOR_WAKE_CLAIM_TTL_MS;
     const freshPredecessorDeadlineMs = latestFreshPredecessorClaimedAt
-      ? latestFreshPredecessorClaimedAt.getTime() - monitorNextCheckAt.getTime() + ISSUE_MONITOR_WAKE_CLAIM_TTL_MS
+      ? Math.min(
+        latestFreshPredecessorClaimedAt.getTime() - monitorNextCheckAt.getTime() + ISSUE_MONITOR_WAKE_CLAIM_TTL_MS,
+        freshClaimDeadlineCapMs,
+      )
       : 0;
     return Math.max(dispatchDeadlineMs, freshPredecessorDeadlineMs);
   }
@@ -1145,16 +1178,20 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     sourceIssue: IssueRow,
     now: Date,
     thresholds: ProductivityReviewThresholds,
+    dbClient: DbOrTx = db,
+    opts?: { lockSource?: boolean; runBacklogHook?: boolean },
   ) {
-    const currentIssue = await getCurrentIssue(sourceIssue);
+    const currentIssue = await getCurrentIssue(sourceIssue, dbClient, { forUpdate: opts?.lockSource });
     if (!currentIssue || !issueCanReceiveMonitorDispatch(currentIssue)) return null;
 
     const direct = deliberatePendingMonitor(currentIssue, now, thresholds);
     if (direct) return direct;
 
-    await deps?.beforeMonitorBacklogGrace?.(currentIssue);
-    const backlogGraceMs = await monitorBacklogGraceMs(currentIssue, now, thresholds);
-    const latestIssue = await getCurrentIssue(sourceIssue);
+    if (opts?.runBacklogHook !== false) {
+      await deps?.beforeMonitorBacklogGrace?.(currentIssue);
+    }
+    const backlogGraceMs = await monitorBacklogGraceMs(currentIssue, now, thresholds, dbClient);
+    const latestIssue = await getCurrentIssue(sourceIssue, dbClient);
     if (!latestIssue || !issueCanReceiveMonitorDispatch(latestIssue)) return null;
 
     const latestDirect = deliberatePendingMonitor(latestIssue, now, thresholds);
@@ -1704,6 +1741,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
 
     let review: Awaited<ReturnType<typeof issuesSvc.create>>;
     try {
+      await deps?.beforeCreateReviewIssueInsert?.(evidence);
       review = await issuesSvc.create(evidence.sourceIssue.companyId, {
         title: `Review productivity for ${evidence.sourceIssue.identifier ?? evidence.sourceIssue.title}`,
         description: buildReviewMarkdown(evidence, opts.prefix),
@@ -1719,8 +1757,35 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         originId: evidence.sourceIssue.id,
         originFingerprint: productivityReviewFingerprint(evidence.sourceIssue.id),
         requestDepth: clampIssueRequestDepth(evidence.sourceIssue.requestDepth + 1),
+        beforeInsert: async (tx) => {
+          if (evidence.trigger !== "long_active_duration") return;
+          const monitor = await currentPendingMonitorForReviewSuppression(
+            evidence.sourceIssue,
+            evidence.generatedAt,
+            opts.thresholds,
+            tx,
+            { lockSource: true, runBacklogHook: false },
+          );
+          if (monitor) throw new MonitorSuppressedBeforeCreateError(monitor);
+        },
       });
     } catch (error) {
+      if (error instanceof MonitorSuppressedBeforeCreateError) {
+        const monitor = error.monitor;
+        await recordMonitorScheduledSuppression({
+          trigger: "long_active_duration",
+          triggerReasons: evidence.triggerReasons,
+          sourceIssue: evidence.sourceIssue,
+          sourceAgent: evidence.sourceAgent,
+          elapsedMs: evidence.elapsedMs,
+          monitorNextCheckAt: monitor.monitorNextCheckAt,
+          monitorScheduledBy: monitor.monitorScheduledBy,
+          monitorWakeRequestedAt: monitor.monitorWakeRequestedAt,
+          thresholds: evidence.thresholds,
+          generatedAt: evidence.generatedAt,
+        });
+        return { kind: "monitor_suppressed" as const, reviewIssueId: null };
+      }
       if (!isActiveProductivityReviewUniqueConflict(error)) throw error;
       const raced = await findOpenProductivityReview(evidence.sourceIssue.companyId, evidence.sourceIssue.id);
       if (!raced) throw error;
