@@ -1378,7 +1378,7 @@ describe("handleWebhook — creation policy", () => {
     );
   });
 
-  it("isolates a malformed opt-out value and still handles valid sibling alerts", async () => {
+  it("permanently rejects a malformed opt-out value and handles valid siblings", async () => {
     const { ctx, mocks } = mkCtx();
     const malformed = baseAlert({
       fingerprint: "malformed-policy",
@@ -1390,19 +1390,21 @@ describe("handleWebhook — creation policy", () => {
     });
     const valid = baseAlert({ fingerprint: "valid-sibling" });
 
-    await expect(
-      handleWebhook(
-        ctx,
-        baseConfig(),
-        TOKEN,
-        baseInput({ parsedBody: baseEnvelope({ alerts: [malformed, valid] }) }),
-      ),
-    ).rejects.toMatchObject({ fingerprints: ["malformed-policy"] });
+    await handleWebhook(
+      ctx,
+      baseConfig(),
+      TOKEN,
+      baseInput({ parsedBody: baseEnvelope({ alerts: [malformed, valid] }) }),
+    );
 
     expect(mocks.issues.create).toHaveBeenCalledTimes(1);
     expect(mocks.issues.create.mock.calls[0][0].originId).toBe("valid-sibling");
+    expect(mocks.state.set).not.toHaveBeenCalledWith(
+      expect.objectContaining({ stateKey: "alert:malformed-policy" }),
+      expect.anything(),
+    );
     expect(mocks.metrics.write).toHaveBeenCalledWith(
-      "alertmanager.alert.error",
+      "alertmanager.alert.malformed",
       1,
       { alertname: "MalformedPolicyAlert" },
     );

@@ -725,7 +725,19 @@ export async function handleWebhook(
           (value) => value !== undefined && typeof value !== "string",
         )
       ) {
-        throw new Error("paperclip_issue must be a string when provided");
+        ctx.logger.warn(
+          `paperclip-plugin-alertmanager: dropping alert ${alert.fingerprint} because paperclip_issue must be a string when provided`,
+        );
+        try {
+          await ctx.metrics.write("alertmanager.alert.malformed", 1, {
+            alertname,
+          });
+        } catch (metricErr) {
+          ctx.logger.error(
+            `paperclip-plugin-alertmanager: failed to record malformed alert metric for ${alert.fingerprint}: ${String(metricErr)}`,
+          );
+        }
+        continue;
       }
       const optedOut = policyValues.some(
         (value) =>
