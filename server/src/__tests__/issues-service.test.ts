@@ -6473,7 +6473,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     ).rejects.toMatchObject({ status: 422 });
   });
 
-  it("rechecks blockers after a concurrent relation update wins the target lock", async () => {
+  it("waits for an in-flight blocker insertion before promoting to in_progress", async () => {
     const companyId = randomUUID();
     const assigneeAgentId = randomUUID();
     const blockerId = "00000000-0000-4000-8000-000000000001";
@@ -6507,14 +6507,16 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
       },
     ]);
 
-    const rowLocked = deferred<void>();
-    const releaseRow = deferred<void>();
-    const lockTransaction = db.transaction(async (tx) => {
-      await tx.execute(sql`select ${issues.id} from ${issues} where ${issues.id} = ${blockedId} for update`);
-      rowLocked.resolve();
-      await releaseRow.promise;
+    const blockerLockKey = `paperclip:issue-blockers:${companyId}:${blockedId}`;
+    const relationWriterReady = deferred<void>();
+    const releaseRelationWriter = deferred<void>();
+    const relationUpdate = db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${blockerLockKey}, 0))`);
+      relationWriterReady.resolve();
+      await releaseRelationWriter.promise;
+      await svc.update(blockedId, { blockedByIssueIds: [blockerId] }, tx);
     });
-    await rowLocked.promise;
+    await relationWriterReady.promise;
 
     const waitForBlockedTransactions = async (expected: number) => {
       const deadline = Date.now() + 10_000;
@@ -6532,13 +6534,12 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
       throw new Error(`Timed out waiting for ${expected} blocked transactions`);
     };
 
-    const relationUpdate = svc.update(blockedId, { blockedByIssueIds: [blockerId] });
-    await waitForBlockedTransactions(1);
     const promotion = svc.update(blockedId, { status: "in_progress" });
-    await waitForBlockedTransactions(2);
-
-    releaseRow.resolve();
-    await lockTransaction;
+    try {
+      await waitForBlockedTransactions(1);
+    } finally {
+      releaseRelationWriter.resolve();
+    }
     await relationUpdate;
     await expect(promotion).rejects.toMatchObject({ status: 422 });
 
@@ -6548,6 +6549,86 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
       .where(eq(issues.id, blockedId))
       .then((rows) => rows[0] ?? null);
     expect(row?.status).toBe("todo");
+  });
+
+  it("waits for an in-flight blocker insertion before checkout", async () => {
+    const companyId = randomUUID();
+    const assigneeAgentId = randomUUID();
+    const blockerId = randomUUID();
+    const blockedId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Concurrent checkout blocker readiness",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: assigneeAgentId,
+      companyId,
+      name: "ConcurrentCheckoutAgent",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values([
+      { id: blockerId, companyId, title: "Late checkout blocker", status: "todo", priority: "medium" },
+      {
+        id: blockedId,
+        companyId,
+        title: "Checkout candidate",
+        status: "todo",
+        priority: "medium",
+        assigneeAgentId,
+      },
+    ]);
+
+    const blockerLockKey = `paperclip:issue-blockers:${companyId}:${blockedId}`;
+    const relationWriterReady = deferred<void>();
+    const releaseRelationWriter = deferred<void>();
+    const relationUpdate = db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${blockerLockKey}, 0))`);
+      relationWriterReady.resolve();
+      await releaseRelationWriter.promise;
+      await svc.update(blockedId, { blockedByIssueIds: [blockerId] }, tx);
+    });
+    await relationWriterReady.promise;
+
+    const checkout = svc.checkout(blockedId, assigneeAgentId, ["todo"], null);
+    try {
+      const deadline = Date.now() + 10_000;
+      let checkoutWaitedForRelationWriter = false;
+      while (Date.now() < deadline) {
+        const waitingRows = await db.execute(sql<{ waiting: boolean }>`
+          select exists (
+            select 1
+            from pg_stat_activity
+            where datname = current_database()
+              and pid <> pg_backend_pid()
+              and wait_event_type = 'Lock'
+          ) as waiting
+        `);
+        if (Array.from(waitingRows)[0]?.waiting) {
+          checkoutWaitedForRelationWriter = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      expect(checkoutWaitedForRelationWriter).toBe(true);
+    } finally {
+      releaseRelationWriter.resolve();
+    }
+
+    await relationUpdate;
+    await expect(checkout).rejects.toMatchObject({ status: 422 });
+    const row = await db
+      .select({ status: issues.status, checkoutRunId: issues.checkoutRunId })
+      .from(issues)
+      .where(eq(issues.id, blockedId))
+      .then((rows) => rows[0] ?? null);
+    expect(row).toEqual({ status: "todo", checkoutRunId: null });
   });
 
   it("allows a deliberate blocked to todo promotion when the latest agent comment awaits user input", async () => {

@@ -4607,6 +4607,16 @@ export function issueService(db: Db) {
   const instanceSettings = instanceSettingsService(db);
   const treeControlSvc = issueTreeControlService(db);
 
+  async function lockIssueBlockerRelations(
+    dbOrTx: Pick<Db, "execute">,
+    companyId: string,
+    issueId: string,
+  ) {
+    await dbOrTx.execute(
+      sql`select pg_advisory_xact_lock(hashtextextended(${`paperclip:issue-blockers:${companyId}:${issueId}`}, 0))`,
+    );
+  }
+
   async function runningCheckoutExecutionPatch(
     dbOrTx: Pick<Db, "select">,
     checkoutRunId: string | null,
@@ -4639,6 +4649,7 @@ export function issueService(db: Db) {
 
   async function withLockedIssueCheckoutExecution<T>(
     issueId: string,
+    companyId: string,
     checkoutRunId: string | null,
     agentId: string,
     now: Date,
@@ -4648,6 +4659,7 @@ export function issueService(db: Db) {
     ) => Promise<T>,
   ) {
     return db.transaction(async (tx) => {
+      await lockIssueBlockerRelations(tx, companyId, issueId);
       const lockedIssue = await tx
         .select({ id: issues.id })
         .from(issues)
@@ -4655,6 +4667,12 @@ export function issueService(db: Db) {
         .for("update")
         .then((rows) => rows[0] ?? null);
       if (!lockedIssue) return null;
+
+      const dependencyReadiness = await listIssueDependencyReadinessMap(tx, companyId, [issueId]);
+      const unresolvedBlockerIssueIds = dependencyReadiness.get(issueId)?.unresolvedBlockerIssueIds ?? [];
+      if (unresolvedBlockerIssueIds.length > 0) {
+        throw unprocessable("Issue is blocked by unresolved blockers", { unresolvedBlockerIssueIds });
+      }
 
       const checkoutExecution = await runningCheckoutExecutionPatch(tx, checkoutRunId, agentId, now);
       if (!checkoutExecution) return null;
@@ -5381,9 +5399,7 @@ export function issueService(db: Db) {
       throw unprocessable("Issue cannot be blocked by itself");
     }
 
-    await dbOrTx.execute(
-      sql`select pg_advisory_xact_lock(hashtextextended(${`paperclip:issue-blockers:${companyId}:${issueId}`}, 0))`,
-    );
+    await lockIssueBlockerRelations(dbOrTx, companyId, issueId);
 
     const lockedIssueIds = [issueId, ...deduped].sort();
     await dbOrTx.execute(
@@ -8845,6 +8861,7 @@ export function issueService(db: Db) {
             tx,
           );
         } else if (patch.status === "in_progress") {
+          await lockIssueBlockerRelations(tx, existing.companyId, id);
           const currentBlockerIssueIds = await tx
             .select({ id: issueRelations.issueId })
             .from(issueRelations)
@@ -9153,12 +9170,6 @@ export function issueService(db: Db) {
         }
       }
 
-      const dependencyReadiness = await listIssueDependencyReadinessMap(db, issueCompany.companyId, [id]);
-      const unresolvedBlockerIssueIds = dependencyReadiness.get(id)?.unresolvedBlockerIssueIds ?? [];
-      if (unresolvedBlockerIssueIds.length > 0) {
-        throw unprocessable("Issue is blocked by unresolved blockers", { unresolvedBlockerIssueIds });
-      }
-
       const sameRunAssigneeCondition = checkoutRunId
         ? and(
           eq(issues.assigneeAgentId, agentId),
@@ -9183,7 +9194,7 @@ export function issueService(db: Db) {
             ),
         )
         : undefined;
-      const updated = await withLockedIssueCheckoutExecution(id, checkoutRunId, agentId, now, async (
+      const updated = await withLockedIssueCheckoutExecution(id, issueCompany.companyId, checkoutRunId, agentId, now, async (
         tx,
         checkoutExecutionPatch,
       ) =>
@@ -9262,7 +9273,7 @@ export function issueService(db: Db) {
         checkoutRunId
       ) {
         const adoptionNow = new Date();
-        const adopted = await withLockedIssueCheckoutExecution(id, checkoutRunId, agentId, adoptionNow, async (
+        const adopted = await withLockedIssueCheckoutExecution(id, issueCompany.companyId, checkoutRunId, agentId, adoptionNow, async (
           tx,
           checkoutExecutionPatch,
         ) =>
@@ -9322,7 +9333,7 @@ export function issueService(db: Db) {
         const stale = await isTerminalOrMissingHeartbeatRun(expectedExecutionRunId);
         if (stale) {
           const now = new Date();
-          const adopted = await withLockedIssueCheckoutExecution(id, checkoutRunId, agentId, now, async (
+          const adopted = await withLockedIssueCheckoutExecution(id, issueCompany.companyId, checkoutRunId, agentId, now, async (
             tx,
             checkoutExecutionPatch,
           ) => {
@@ -9368,7 +9379,7 @@ export function issueService(db: Db) {
         current.status === "in_progress" &&
         sameRunLock(current.checkoutRunId, checkoutRunId)
       ) {
-        const row = await withLockedIssueCheckoutExecution(id, checkoutRunId, agentId, now, async (tx) =>
+        const row = await withLockedIssueCheckoutExecution(id, issueCompany.companyId, checkoutRunId, agentId, now, async (tx) =>
           tx
             .select()
             .from(issues)
@@ -9399,7 +9410,7 @@ export function issueService(db: Db) {
         const cleared = await clearStaleExecutionLock(id, current.executionRunId);
         if (cleared) {
           const now = new Date();
-          const retried = await withLockedIssueCheckoutExecution(id, checkoutRunId, agentId, now, async (
+          const retried = await withLockedIssueCheckoutExecution(id, issueCompany.companyId, checkoutRunId, agentId, now, async (
             tx,
             checkoutExecutionPatch,
           ) =>
