@@ -1893,7 +1893,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     ]);
     const reviewId = await insertProductivityReview({ seeded, createdAt: reservedAt });
     const fetchSpy = vi.spyOn(globalThis, "fetch");
-    fetchSpy.mockResolvedValue(
+    fetchSpy.mockImplementation(async () =>
       new Response(
         JSON.stringify({
           data: {
