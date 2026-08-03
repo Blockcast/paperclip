@@ -170,10 +170,15 @@ async function allocateFromLinear(
   const cfg = await getLinearConfigForCompany(db, companyId);
 
   if (linearIssueIdempotencyKey) {
-    const existing = await getLinearIssueById({
-      apiKey: cfg.apiKey,
-      issueId: linearIssueIdempotencyKey,
-    });
+    let existing: CreatedLinearIssue | null = null;
+    try {
+      existing = await getLinearIssueById({
+        apiKey: cfg.apiKey,
+        issueId: linearIssueIdempotencyKey,
+      });
+    } catch (lookupError) {
+      throw new LinearIssueCreateUnconfirmedError(linearIssueIdempotencyKey, lookupError);
+    }
     if (existing) return allocationFromLinearIssue(existing, false);
   }
 

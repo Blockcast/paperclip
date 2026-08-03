@@ -250,6 +250,7 @@ describeEmbeddedPostgres("allocateFromLinear (happy path, mocked fetch + secrets
           headers: { "Content-Type": "application/json" },
         }),
       )
+      .mockRejectedValueOnce(new Error("retry lookup transport down"))
       .mockResolvedValueOnce(
         new Response(
           JSON.stringify({
@@ -312,6 +313,7 @@ describeEmbeddedPostgres("allocateFromLinear (happy path, mocked fetch + secrets
           headers: { "Content-Type": "application/json" },
         }),
       )
+      .mockRejectedValueOnce(new Error("retry lookup transport down"))
       .mockResolvedValueOnce(
         new Response(
           JSON.stringify({
@@ -336,6 +338,15 @@ describeEmbeddedPostgres("allocateFromLinear (happy path, mocked fetch + secrets
       }),
     ).rejects.toBeInstanceOf(LinearIssueCreateUnconfirmedError);
 
+    await expect(
+      allocateIdentifier({
+        db,
+        companyId: company.id,
+        title: "ambiguous create with delayed lookup visibility",
+        linearIssueIdempotencyKey: "reserved-review-id",
+      }),
+    ).rejects.toBeInstanceOf(LinearIssueCreateUnconfirmedError);
+
     const retry = await allocateIdentifier({
       db,
       companyId: company.id,
@@ -346,10 +357,10 @@ describeEmbeddedPostgres("allocateFromLinear (happy path, mocked fetch + secrets
     expect(retry.identifier).toBe("BLO-5555");
     expect(retry.externalIssueId).toBe("reserved-review-id");
     expect(retry.createdLinearSideIssue).toBe(false);
-    expect(fetchSpy).toHaveBeenCalledTimes(4);
+    expect(fetchSpy).toHaveBeenCalledTimes(5);
     const firstCreateBody = JSON.parse(fetchSpy!.mock.calls[1]![1]!.body as string);
     expect(firstCreateBody.variables.input.id).toBe("reserved-review-id");
-    const retryLookupBody = JSON.parse(fetchSpy!.mock.calls[3]![1]!.body as string);
+    const retryLookupBody = JSON.parse(fetchSpy!.mock.calls[4]![1]!.body as string);
     expect(retryLookupBody.variables.id).toBe("reserved-review-id");
   });
 

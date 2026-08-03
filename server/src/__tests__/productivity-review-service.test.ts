@@ -3,6 +3,7 @@ import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
+  agentWakeupRequests,
   agents,
   approvals,
   companies,
@@ -1999,6 +2000,114 @@ describeEmbeddedPostgres("productivity review service", () => {
     });
     expect(second.created).toBe(1);
     expect(wakeups).toHaveLength(2);
+    expect(await countReviewActivity(reviewId, "issue.productivity_review_created")).toBe(1);
+    expect(await countReviewActivity(reviewId, "issue.productivity_review_assignment_wake_enqueued")).toBe(1);
+  });
+
+  it("treats a completed assignment wake request as durable delivery evidence", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const createdAt = new Date(now.getTime() - 60_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt: new Date(now.getTime() - 10 * 60 * 1000),
+      monitorScheduledBy: "assignee",
+    });
+    const reviewId = await insertProductivityReview({
+      seeded,
+      createdAt,
+      issueNumber: 2,
+      identifier: `${seeded.issuePrefix}-2`,
+    });
+    await db.insert(activityLog).values({
+      companyId: seeded.companyId,
+      actorType: "system",
+      actorId: "system",
+      action: "issue.productivity_review_created",
+      entityType: "issue",
+      entityId: reviewId,
+      agentId: seeded.managerId,
+      details: {
+        source: "productivity_review.reconcile",
+        sourceIssueId: seeded.issueId,
+        trigger: "long_active_duration",
+      },
+      createdAt,
+    });
+    await db.insert(agentWakeupRequests).values({
+      companyId: seeded.companyId,
+      agentId: seeded.managerId,
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      status: "completed",
+      idempotencyKey: `productivity-review-created:${reviewId}`,
+      requestedByActorType: "system",
+      requestedByActorId: "productivity_review",
+      requestedAt: createdAt,
+      finishedAt: createdAt,
+      createdAt,
+      updatedAt: createdAt,
+    });
+
+    const wakeups: Array<{ agentId: string; opts: unknown }> = [];
+    const service = productivityReviewService(db, {
+      async enqueueWakeup(agentId, opts) {
+        wakeups.push({ agentId, opts });
+        throw new Error("completed wake should be reused");
+      },
+    });
+
+    const replayed = await service.reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+    });
+    expect(replayed.created).toBe(1);
+    expect(wakeups).toHaveLength(0);
+    expect(await countReviewActivity(reviewId, "issue.productivity_review_created")).toBe(1);
+    expect(await countReviewActivity(reviewId, "issue.productivity_review_assignment_wake_enqueued")).toBe(1);
+  });
+
+  it("recovers a stale reserved review after its source leaves the candidate set", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const reservedAt = new Date(now.getTime() - 10 * 60_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt: new Date(now.getTime() - 10 * 60 * 1000),
+      monitorScheduledBy: "assignee",
+    });
+    const reviewId = await insertProductivityReview({ seeded, createdAt: reservedAt });
+    await db
+      .update(issues)
+      .set({ status: "done", completedAt: new Date(now.getTime() - 60_000), updatedAt: now })
+      .where(eq(issues.id, seeded.issueId));
+
+    const wakeups: Array<{ agentId: string; opts: unknown }> = [];
+    const result = await productivityReviewService(db, {
+      async enqueueWakeup(agentId, opts) {
+        wakeups.push({ agentId, opts });
+        return { id: randomUUID() };
+      },
+    }).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+    });
+
+    expect(result.scanned).toBe(0);
+    expect(result.created).toBe(1);
+    const [review] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, reviewId));
+    expect(review?.identifier).toBe(`${seeded.issuePrefix}-2`);
+    expect(review?.issueNumber).toBe(2);
+    expect(wakeups).toHaveLength(1);
+    expect(wakeups[0]?.opts).toMatchObject({
+      idempotencyKey: `productivity-review-created:${reviewId}`,
+    });
     expect(await countReviewActivity(reviewId, "issue.productivity_review_created")).toBe(1);
     expect(await countReviewActivity(reviewId, "issue.productivity_review_assignment_wake_enqueued")).toBe(1);
   });

@@ -77,6 +77,7 @@ const PRODUCTIVITY_REVIEW_DURABLE_WAKE_REQUEST_STATUSES = [
   "claimed",
   "coalesced",
   "deferred_issue_execution",
+  "completed",
 ] as const;
 // BLO-3281 AC2 hard floor: even if the detector scan cadence is faster
 // than this, the refresh-evidence-comment path stays throttled at 5 min.
@@ -146,6 +147,16 @@ type ProductivityReviewEvidence = {
   generatedAt: Date;
   routineOnlySamplingWindow: boolean;
 };
+
+type ProductivityReviewFinishEvidence = Pick<
+  ProductivityReviewEvidence,
+  | "sourceIssue"
+  | "generatedAt"
+  | "trigger"
+  | "noCommentStreak"
+  | "runCountLastHour"
+  | "commentCountLastHour"
+>;
 
 type MonitorScheduledSuppression = {
   trigger: "long_active_duration";
@@ -1071,7 +1082,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
 
   async function finishCreatedProductivityReview(
     review: Pick<IssueRow, "id">,
-    evidence: ProductivityReviewEvidence,
+    evidence: ProductivityReviewFinishEvidence,
     ownerAgentId: string,
   ): Promise<{ createdActivityInserted: boolean; assignmentWakeProcessed: boolean }> {
     const wakeIdempotencyKey = productivityReviewAssignmentWakeIdempotencyKey(review.id);
@@ -2218,6 +2229,132 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     return { kind: "created" as const, reviewIssueId: review.id };
   }
 
+  function reservationRecoveryFinishEvidence(
+    sourceIssue: IssueRow,
+    generatedAt: Date,
+  ): ProductivityReviewFinishEvidence {
+    return {
+      sourceIssue,
+      generatedAt,
+      trigger: "long_active_duration",
+      noCommentStreak: 0,
+      runCountLastHour: 0,
+      commentCountLastHour: 0,
+    };
+  }
+
+  async function recoverStaleReservedProductivityReviews(input: {
+    now: Date;
+    companyId?: string;
+  }) {
+    const staleCutoff = new Date(input.now.getTime() - PRODUCTIVITY_REVIEW_RESERVATION_STALE_MS);
+    const reservedReviews = await db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          input.companyId ? eq(issues.companyId, input.companyId) : undefined,
+          eq(issues.originKind, PRODUCTIVITY_REVIEW_ORIGIN_KIND),
+          visibleIssueCondition(),
+          notInArray(issues.status, ["done", "cancelled"]),
+          isNull(issues.identifier),
+          isNull(issues.issueNumber),
+          lt(issues.updatedAt, staleCutoff),
+        ),
+      )
+      .orderBy(asc(issues.updatedAt), asc(issues.id))
+      .limit(MAX_CANDIDATE_ISSUES);
+
+    const result = {
+      created: 0,
+      existing: 0,
+      failed: 0,
+      reviewIssueIds: [] as string[],
+      failedIssueIds: [] as string[],
+      recoveredSourceIssueIds: new Set<string>(),
+    };
+
+    for (const review of reservedReviews) {
+      if (!review.originId) {
+        result.existing += 1;
+        continue;
+      }
+      result.recoveredSourceIssueIds.add(review.originId);
+      if (!review.assigneeAgentId) {
+        logger.warn(
+          {
+            reviewIssueId: review.id,
+            sourceIssueId: review.originId,
+          },
+          "productivity review reservation recovery skipped: reservation has no assignee agent",
+        );
+        result.existing += 1;
+        continue;
+      }
+
+      const sourceIssue = await db
+        .select()
+        .from(issues)
+        .where(and(eq(issues.companyId, review.companyId), eq(issues.id, review.originId)))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (!sourceIssue) {
+        logger.warn(
+          {
+            reviewIssueId: review.id,
+            sourceIssueId: review.originId,
+          },
+          "productivity review reservation recovery skipped: source issue disappeared",
+        );
+        result.existing += 1;
+        continue;
+      }
+
+      try {
+        const finalized = await finalizeReservedProductivityReviewIssue({
+          review,
+          title: review.title,
+          description: review.description ?? `Review productivity for ${sourceIssue.identifier ?? sourceIssue.title}`,
+          generatedAt: input.now,
+        });
+        const finish = await finishCreatedProductivityReview(
+          finalized.review,
+          reservationRecoveryFinishEvidence(sourceIssue, input.now),
+          review.assigneeAgentId,
+        );
+        if (finalized.finalized || finish.createdActivityInserted || finish.assignmentWakeProcessed) {
+          result.created += 1;
+          result.reviewIssueIds.push(finalized.review.id);
+        } else {
+          result.existing += 1;
+        }
+        logger.info(
+          {
+            reviewIssueId: finalized.review.id,
+            sourceIssueId: sourceIssue.id,
+            finalized: finalized.finalized,
+            createdActivityInserted: finish.createdActivityInserted,
+            assignmentWakeProcessed: finish.assignmentWakeProcessed,
+          },
+          "productivity review stale reservation recovered before source candidate filtering",
+        );
+      } catch (err) {
+        result.failed += 1;
+        result.failedIssueIds.push(sourceIssue.id);
+        logger.warn(
+          {
+            err,
+            reviewIssueId: review.id,
+            sourceIssueId: sourceIssue.id,
+          },
+          "productivity review stale reservation recovery failed",
+        );
+      }
+    }
+
+    return result;
+  }
+
   async function createProductivityReviewEscalation(input: {
     sourceIssue: IssueRow;
     priorReviewCount: number;
@@ -2339,25 +2476,8 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
   }) {
     const now = opts?.now ?? new Date();
     const thresholds = buildThresholds(opts?.thresholds);
-    const candidates = await db
-      .select()
-      .from(issues)
-      .where(
-        and(
-          opts?.companyId ? eq(issues.companyId, opts.companyId) : undefined,
-          visibleIssueCondition(),
-          isNull(issues.assigneeUserId),
-          inArray(issues.status, ["todo", "in_progress"]),
-          sql`${issues.assigneeAgentId} is not null`,
-          sql`${issues.originKind} <> ${PRODUCTIVITY_REVIEW_ORIGIN_KIND}`,
-          opts?.issueCreatedAtGte ? gte(issues.createdAt, opts.issueCreatedAtGte) : undefined,
-        ),
-      )
-      .orderBy(asc(issues.updatedAt), asc(issues.id))
-      .limit(MAX_CANDIDATE_ISSUES);
-
     const result = {
-      scanned: candidates.length,
+      scanned: 0,
       created: 0,
       updated: 0,
       existing: 0,
@@ -2381,8 +2501,39 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     result.closedSuppressedMonitorReviews = closedSuppressed.monitorScheduled;
     result.closedTerminalSourceReviews = closedSuppressed.terminalSource;
 
+    const recoveredReservations = await recoverStaleReservedProductivityReviews({
+      now,
+      companyId: opts?.companyId,
+    });
+    result.created += recoveredReservations.created;
+    result.existing += recoveredReservations.existing;
+    result.failed += recoveredReservations.failed;
+    result.reviewIssueIds.push(...recoveredReservations.reviewIssueIds);
+    result.failedIssueIds.push(...recoveredReservations.failedIssueIds);
+
+    const candidates = await db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          opts?.companyId ? eq(issues.companyId, opts.companyId) : undefined,
+          visibleIssueCondition(),
+          isNull(issues.assigneeUserId),
+          inArray(issues.status, ["todo", "in_progress"]),
+          sql`${issues.assigneeAgentId} is not null`,
+          sql`${issues.originKind} <> ${PRODUCTIVITY_REVIEW_ORIGIN_KIND}`,
+          opts?.issueCreatedAtGte ? gte(issues.createdAt, opts.issueCreatedAtGte) : undefined,
+        ),
+      )
+      .orderBy(asc(issues.updatedAt), asc(issues.id))
+      .limit(MAX_CANDIDATE_ISSUES);
+    result.scanned = candidates.length;
+
     const prefixCache = new Map<string, string>();
     for (const candidate of candidates) {
+      if (recoveredReservations.recoveredSourceIssueIds.has(candidate.id)) {
+        continue;
+      }
       if (!candidate.assigneeAgentId) {
         result.skipped += 1;
         continue;
