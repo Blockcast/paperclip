@@ -27673,10 +27673,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // Override-aware scheduling-suppression check (honors the worktree
     // run-execution experimental setting). Callers outside the service that
     // gate on suppression should prefer this over the env-only resolver.
-    resolveSchedulingSuppression: getSchedulingSuppression,
-    drainRunningRunsForShutdown,
+      resolveSchedulingSuppression: getSchedulingSuppression,
+      drainRunningRunsForShutdown,
+     // BLO-19722 AC 2/3. Wired at the process entrypoint as the crash guard's
+    // `onCrash` callback — `index.ts` registers a marker closure over this
+    // function when it builds the service, and `installProcessCrashGuard`
+    // invokes it (raced against a timeout) before exiting non-zero.
+    //
+    // Crash-time marking is best-effort by construction: the guard's budget can
+    // expire and the DB is frequently the very thing that just died.
+    // `reconcileWorkerCrashedRuns` is the durable half — it closes at the next
+    // startup, and on the periodic tick, whatever a crash could not finish.
+     markRunsInterruptedByWorkerCrash,
+     reconcileWorkerCrashedRuns,
 
-    promoteDueScheduledRetries,
+     promoteDueScheduledRetries,
     retryScheduledRetryNow,
 
     resumeQueuedRuns,
