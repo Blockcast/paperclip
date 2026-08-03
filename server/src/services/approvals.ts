@@ -13,7 +13,25 @@ const HIRE_RECONCILIATION_CLAIM_LEASE_MS = 5 * 60_000;
 const HIRE_NOTIFICATION_CLAIM_LEASE_MS = 5 * 60_000;
 const HIRE_CLAIM_RENEWAL_INTERVAL_MS = 60_000;
 
-export function approvalService(db: Db) {
+type BuiltInHireClaimKind = "reconciliation" | "notification";
+type BuiltInHireClaimGuard = {
+  assertOwned: (opts?: { afterSideEffect?: boolean }) => Promise<void>;
+};
+
+type ApprovalServiceDeps = {
+  beforeBuiltInHireReconciliationSideEffect?: (input: {
+    approval: typeof approvals.$inferSelect;
+    agentId: string;
+    attemptId: string;
+  }) => Promise<void> | void;
+  beforeBuiltInHireNotificationSideEffect?: (input: {
+    approval: typeof approvals.$inferSelect;
+    agentId: string;
+    attemptId: string;
+  }) => Promise<void> | void;
+};
+
+export function approvalService(db: Db, deps?: ApprovalServiceDeps) {
   const agentsSvc = agentService(db);
   const instanceSettings = instanceSettingsService(db);
   const canResolveStatuses = new Set(["pending", "revision_requested"]);
@@ -54,7 +72,16 @@ export function approvalService(db: Db) {
         agentId,
         payload,
         reconciliationClaim.attemptId,
-        () => reconcileApprovedBuiltInAgent(db, approval.companyId, payload),
+        async (claim) => {
+          await deps?.beforeBuiltInHireReconciliationSideEffect?.({
+            approval,
+            agentId,
+            attemptId: reconciliationClaim.attemptId,
+          });
+          await claim.assertOwned();
+          await reconcileApprovedBuiltInAgent(db, approval.companyId, payload);
+          await claim.assertOwned();
+        },
       );
       await completeBuiltInHireReconciliation(approval, agentId, payload, reconciliationClaim.attemptId);
     } catch (error) {
@@ -72,27 +99,53 @@ export function approvalService(db: Db) {
   }
 
   async function withBuiltInHireClaimLeaseRenewal<T>(
-    kind: "reconciliation" | "notification",
+    kind: BuiltInHireClaimKind,
     approval: ApprovalRecord,
     agentId: string,
     payload: Record<string, unknown>,
     attemptId: string,
-    task: () => Promise<T>,
+    task: (claim: BuiltInHireClaimGuard) => Promise<T>,
   ): Promise<T> {
     let stopped = false;
+    let ownershipLost = false;
+    let renewalError: unknown = null;
+    const markOwnershipLost = (error?: unknown) => {
+      ownershipLost = true;
+      if (error !== undefined && renewalError === null) {
+        renewalError = error;
+      }
+    };
     const renew = async () => {
-      if (stopped) return;
+      if (stopped || ownershipLost) return;
+      let renewed: boolean;
       if (kind === "reconciliation") {
-        await renewBuiltInHireReconciliationClaim(approval, agentId, payload, attemptId);
+        renewed = await renewBuiltInHireReconciliationClaim(approval, agentId, payload, attemptId);
       } else {
-        await renewBuiltInHireNotificationClaim(approval, agentId, payload, attemptId);
+        renewed = await renewBuiltInHireNotificationClaim(approval, agentId, payload, attemptId);
+      }
+      if (!renewed) {
+        markOwnershipLost();
       }
     };
     const timer = setInterval(() => {
-      void renew().catch(() => {});
+      void renew().catch((error) => markOwnershipLost(error));
     }, HIRE_CLAIM_RENEWAL_INTERVAL_MS);
+    const claim: BuiltInHireClaimGuard = {
+      assertOwned: async (opts) => {
+        if (ownershipLost) {
+          throw builtInHireClaimLostError(kind, renewalError);
+        }
+        const owned = await hasCurrentBuiltInHireClaim(kind, approval, agentId, attemptId, {
+          ignoreNotificationDeliveryEvidence: kind === "notification" && Boolean(opts?.afterSideEffect),
+        });
+        if (!owned) {
+          markOwnershipLost();
+          throw builtInHireClaimLostError(kind);
+        }
+      },
+    };
     try {
-      return await task();
+      return await task(claim);
     } finally {
       stopped = true;
       clearInterval(timer);
@@ -108,6 +161,13 @@ export function approvalService(db: Db) {
   function activityAttemptId(details: unknown) {
     const attemptId = activityDetails(details).attemptId;
     return typeof attemptId === "string" ? attemptId : null;
+  }
+
+  function builtInHireClaimLostError(kind: BuiltInHireClaimKind, cause?: unknown) {
+    return conflict(
+      `Built-in hire ${kind} claim was lost before the side effect could be completed`,
+      cause instanceof Error ? { cause: cause.message } : undefined,
+    );
   }
 
   async function hasApprovalActivity(
@@ -289,6 +349,35 @@ export function approvalService(db: Db) {
     );
   }
 
+  async function hasCurrentBuiltInHireClaim(
+    kind: BuiltInHireClaimKind,
+    approval: ApprovalRecord,
+    agentId: string,
+    attemptId: string,
+    opts?: { ignoreNotificationDeliveryEvidence?: boolean },
+  ) {
+    return db.transaction(async (tx) => {
+      const txDb = tx as unknown as Db;
+      await lockApproval(txDb, approval.id);
+      if (kind === "reconciliation") {
+        if (await hasBuiltInHireReconciliationCompleted(txDb, approval)) return false;
+        const latest = await latestBuiltInHireReconciliationActivity(txDb, approval);
+        return (
+          latest?.action === "approval.hire_reconciliation_started" &&
+          activityAttemptId(latest.details) === attemptId
+        );
+      }
+      if (!opts?.ignoreNotificationDeliveryEvidence && await hasBuiltInHireNotificationDelivered(txDb, approval, agentId)) {
+        return false;
+      }
+      const latest = await latestBuiltInHireNotificationActivity(txDb, approval);
+      return (
+        latest?.action === "approval.hire_notification_started" &&
+        activityAttemptId(latest.details) === attemptId
+      );
+    });
+  }
+
   async function markBuiltInHireNotificationDelivered(
     dbClient: Db,
     approval: ApprovalRecord,
@@ -398,16 +487,16 @@ export function approvalService(db: Db) {
     payload: Record<string, unknown>,
     attemptId: string,
   ) {
-    await db.transaction(async (tx) => {
+    return db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
       await lockApproval(txDb, approval.id);
-      if (await hasBuiltInHireReconciliationCompleted(txDb, approval)) return;
+      if (await hasBuiltInHireReconciliationCompleted(txDb, approval)) return false;
       const latest = await latestBuiltInHireReconciliationActivity(txDb, approval);
       if (
         latest?.action !== "approval.hire_reconciliation_started" ||
         activityAttemptId(latest.details) !== attemptId
       ) {
-        return;
+        return false;
       }
       await txDb.insert(activityLog).values({
         companyId: approval.companyId,
@@ -425,6 +514,7 @@ export function approvalService(db: Db) {
         },
         createdAt: new Date(),
       });
+      return true;
     });
   }
 
@@ -540,16 +630,16 @@ export function approvalService(db: Db) {
     payload: Record<string, unknown>,
     attemptId: string,
   ) {
-    await db.transaction(async (tx) => {
+    return db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
       await lockApproval(txDb, approval.id);
-      if (await hasBuiltInHireNotificationDelivered(txDb, approval, agentId)) return;
+      if (await hasBuiltInHireNotificationDelivered(txDb, approval, agentId)) return false;
       const latest = await latestBuiltInHireNotificationActivity(txDb, approval);
       if (
         latest?.action !== "approval.hire_notification_started" ||
         activityAttemptId(latest.details) !== attemptId
       ) {
-        return;
+        return false;
       }
       await txDb.insert(activityLog).values({
         companyId: approval.companyId,
@@ -567,6 +657,7 @@ export function approvalService(db: Db) {
         },
         createdAt: new Date(),
       });
+      return true;
     });
   }
 
@@ -617,13 +708,23 @@ export function approvalService(db: Db) {
         agentId,
         payload,
         claim.attemptId,
-        () => notifyHireApproved(db, {
-          companyId: approval.companyId,
-          agentId,
-          source: "approval",
-          sourceId: approval.id,
-          approvedAt,
-        }),
+        async (claimGuard) => {
+          await deps?.beforeBuiltInHireNotificationSideEffect?.({
+            approval,
+            agentId,
+            attemptId: claim.attemptId,
+          });
+          await claimGuard.assertOwned();
+          const result = await notifyHireApproved(db, {
+            companyId: approval.companyId,
+            agentId,
+            source: "approval",
+            sourceId: approval.id,
+            approvedAt,
+          });
+          await claimGuard.assertOwned({ afterSideEffect: true });
+          return result;
+        },
       );
     } catch (error) {
       await releaseBuiltInHireNotificationClaim(approval, agentId, payload, claim.attemptId);

@@ -140,6 +140,20 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
     return id;
   }
 
+  async function countApprovalActivity(approvalId: string, action: string) {
+    return db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.entityType, "approval"),
+          eq(activityLog.entityId, approvalId),
+          eq(activityLog.action, action),
+        ),
+      )
+      .then((rows) => Number(rows[0]?.count ?? 0));
+  }
+
   it("enforces external-lifecycle concurrency at the persistence boundary", async () => {
     const companyId = await seedCompany();
     const agents = agentService(db);
@@ -1037,6 +1051,118 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
     resolveNotification(true);
     await expect(firstApproval).resolves.toMatchObject({ applied: true });
     expect(mockNotifyHireApproved).toHaveBeenCalledTimes(1);
+  });
+
+  it("fences stale built-in reconciliation owners before the side effect after renewal loss", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
+    const startedAt = new Date("2026-08-03T00:00:00.000Z");
+    vi.setSystemTime(startedAt);
+    const companyId = await seedCompany();
+    const agentId = await seedAgentRow(companyId, {
+      name: "Built-in Stale Reconciliation",
+      status: "pending_approval",
+      adapterType: "codex_local",
+    });
+    const approvalId = randomUUID();
+    await db.insert(approvals).values({
+      id: approvalId,
+      companyId,
+      type: "hire_agent",
+      status: "pending",
+      requestedByUserId: "requester",
+      payload: {
+        agentId,
+        name: "Built-in Stale Reconciliation",
+        role: "engineer",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        budgetMonthlyCents: 0,
+        sourceBuiltInAgentKey: "briefs",
+      },
+      updatedAt: new Date(),
+    });
+
+    const firstPausedBeforeSideEffect = deferred();
+    const releaseFirst = deferred();
+    const firstService = approvalService(db, {
+      async beforeBuiltInHireReconciliationSideEffect(input) {
+        if (input.approval.id !== approvalId) return;
+        firstPausedBeforeSideEffect.resolve();
+        await releaseFirst.promise;
+      },
+    });
+    const firstApproval = firstService.approve(approvalId, "board-user", "Approved");
+    await firstPausedBeforeSideEffect.promise;
+
+    vi.setSystemTime(new Date(startedAt.getTime() + 5 * 60_000 + 1000));
+    await expect(
+      approvalService(db).approve(approvalId, "board-user", "Approved"),
+    ).resolves.toMatchObject({ applied: false });
+    expect(mockEnsureBuiltInAgent).toHaveBeenCalledTimes(1);
+    expect(mockNotifyHireApproved).toHaveBeenCalledTimes(1);
+
+    releaseFirst.resolve();
+    await expect(firstApproval).rejects.toThrow("Built-in hire reconciliation claim was lost");
+    expect(mockEnsureBuiltInAgent).toHaveBeenCalledTimes(1);
+    expect(mockNotifyHireApproved).toHaveBeenCalledTimes(1);
+    expect(await countApprovalActivity(approvalId, "approval.hire_reconciliation_completed")).toBe(1);
+    expect(await countApprovalActivity(approvalId, "approval.hire_notification_delivered")).toBe(1);
+  });
+
+  it("fences stale built-in notification owners before delivery after renewal loss", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
+    const startedAt = new Date("2026-08-03T00:00:00.000Z");
+    vi.setSystemTime(startedAt);
+    const companyId = await seedCompany();
+    const agentId = await seedAgentRow(companyId, {
+      name: "Built-in Stale Notification",
+      status: "pending_approval",
+      adapterType: "codex_local",
+    });
+    const approvalId = randomUUID();
+    await db.insert(approvals).values({
+      id: approvalId,
+      companyId,
+      type: "hire_agent",
+      status: "pending",
+      requestedByUserId: "requester",
+      payload: {
+        agentId,
+        name: "Built-in Stale Notification",
+        role: "engineer",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        budgetMonthlyCents: 0,
+        sourceBuiltInAgentKey: "briefs",
+      },
+      updatedAt: new Date(),
+    });
+
+    const firstPausedBeforeDelivery = deferred();
+    const releaseFirst = deferred();
+    const firstService = approvalService(db, {
+      async beforeBuiltInHireNotificationSideEffect(input) {
+        if (input.approval.id !== approvalId) return;
+        firstPausedBeforeDelivery.resolve();
+        await releaseFirst.promise;
+      },
+    });
+    const firstApproval = firstService.approve(approvalId, "board-user", "Approved");
+    await firstPausedBeforeDelivery.promise;
+
+    vi.setSystemTime(new Date(startedAt.getTime() + 5 * 60_000 + 1000));
+    await expect(
+      approvalService(db).approve(approvalId, "board-user", "Approved"),
+    ).resolves.toMatchObject({ applied: false });
+    expect(mockEnsureBuiltInAgent).toHaveBeenCalledTimes(1);
+    expect(mockNotifyHireApproved).toHaveBeenCalledTimes(1);
+
+    releaseFirst.resolve();
+    await expect(firstApproval).rejects.toThrow("Built-in hire notification claim was lost");
+    expect(mockEnsureBuiltInAgent).toHaveBeenCalledTimes(1);
+    expect(mockNotifyHireApproved).toHaveBeenCalledTimes(1);
+    expect(await countApprovalActivity(approvalId, "approval.hire_reconciliation_completed")).toBe(1);
+    expect(await countApprovalActivity(approvalId, "approval.hire_notification_delivered")).toBe(1);
   });
 
   it("recovers an abandoned built-in hire notification claim after its lease", async () => {
