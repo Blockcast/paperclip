@@ -48,7 +48,6 @@ import {
   environmentCustomImageService,
   heartbeatService,
   instanceSettingsService,
-  ISSUE_MONITOR_WAKE_CLAIM_TTL_MS,
   reconcileBuiltInAgentsOnStartup,
   reconcileCloudUpstreamRunsOnStartup,
   reconcileCodexLocalManagedHomesOnStartup,
@@ -1127,7 +1126,7 @@ export async function startServer(): Promise<StartedServer> {
       pluginWorkerManager,
       paperclipNodeRole: config.paperclipNodeRole,
       coldBootReattachGraceMs: EXTERNAL_LIFECYCLE_COLD_BOOT_REATTACH_GRACE_MS,
-      productivityReviewMonitorLapseGraceMs: config.heartbeatSchedulerIntervalMs + ISSUE_MONITOR_WAKE_CLAIM_TTL_MS,
+      productivityReviewMonitorSchedulerIntervalMs: config.heartbeatSchedulerIntervalMs,
     });
     workerHeartbeat = heartbeat;
     drainHeartbeatRunsForShutdown = heartbeat.drainRunningRunsForShutdown;

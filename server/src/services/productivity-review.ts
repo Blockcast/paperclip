@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, gte, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, inArray, isNull, lt, lte, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { clampIssueRequestDepth } from "@paperclipai/shared";
 import {
@@ -48,7 +48,10 @@ export const DEFAULT_PRODUCTIVITY_REVIEW_CREATION_WINDOW_MS = 24 * 60 * 60 * 100
 export const DEFAULT_PRODUCTIVITY_REVIEW_MAX_CREATIONS_PER_WINDOW = 1;
 export const DEFAULT_PRODUCTIVITY_REVIEW_MAX_CONSECUTIVE_NO_ACTION_REVIEWS = 3;
 export const ISSUE_MONITOR_WAKE_CLAIM_TTL_MS = 5 * 60 * 1000;
-export const DEFAULT_PRODUCTIVITY_REVIEW_MONITOR_LAPSE_SERVICE_GRACE_MS = ISSUE_MONITOR_WAKE_CLAIM_TTL_MS;
+export const ISSUE_MONITOR_DISPATCH_BATCH_SIZE = 50;
+export const DEFAULT_HEARTBEAT_SCHEDULER_INTERVAL_MS = 30_000;
+export const DEFAULT_PRODUCTIVITY_REVIEW_MONITOR_LAPSE_SERVICE_GRACE_MS =
+  DEFAULT_HEARTBEAT_SCHEDULER_INTERVAL_MS + ISSUE_MONITOR_WAKE_CLAIM_TTL_MS;
 
 const TERMINAL_RUN_STATUSES = ["succeeded", "interrupted", "failed", "cancelled", "timed_out"] as const;
 const ACTIVE_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
@@ -88,6 +91,8 @@ type ProductivityReviewThresholds = {
   maxCreationsPerWindow: number;
   maxConsecutiveNoActionReviews: number;
   monitorLapseServiceGraceMs: number;
+  monitorSchedulerIntervalMs: number;
+  monitorDispatchBatchSize: number;
 };
 
 type ProductivityReviewEvidence = {
@@ -274,7 +279,12 @@ function monitorHasFreshWakeClaim(issue: IssueRow, now: Date) {
     : null;
 }
 
-function deliberatePendingMonitor(issue: IssueRow, now: Date, thresholds: ProductivityReviewThresholds) {
+function deliberatePendingMonitor(
+  issue: IssueRow,
+  now: Date,
+  thresholds: ProductivityReviewThresholds,
+  backlogGraceMs = 0,
+) {
   const future = strictFutureMonitor(issue, now);
   if (future) return { ...future, monitorWakeRequestedAt: null };
 
@@ -290,7 +300,8 @@ function deliberatePendingMonitor(issue: IssueRow, now: Date, thresholds: Produc
   // open review would start the resolved-review snooze before dispatch succeeds.
   const dueAgeMs = now.getTime() - monitorNextCheckAt.getTime();
   const monitorWakeRequestedAt = monitorHasFreshWakeClaim(issue, now);
-  if (dueAgeMs > thresholds.monitorLapseServiceGraceMs && !monitorWakeRequestedAt) return null;
+  const effectiveGraceMs = Math.max(thresholds.monitorLapseServiceGraceMs, backlogGraceMs);
+  if (dueAgeMs > effectiveGraceMs && !monitorWakeRequestedAt) return null;
   return { monitorNextCheckAt, monitorScheduledBy, monitorWakeRequestedAt };
 }
 
@@ -403,6 +414,14 @@ function isRoutineOriginRun(run: HeartbeatRunRow): boolean {
 }
 
 function buildThresholds(overrides?: Partial<ProductivityReviewThresholds>): ProductivityReviewThresholds {
+  const monitorSchedulerIntervalMs = readPositiveInteger(
+    overrides?.monitorSchedulerIntervalMs ?? DEFAULT_HEARTBEAT_SCHEDULER_INTERVAL_MS,
+    DEFAULT_HEARTBEAT_SCHEDULER_INTERVAL_MS,
+  );
+  const monitorDispatchBatchSize = readPositiveInteger(
+    overrides?.monitorDispatchBatchSize ?? ISSUE_MONITOR_DISPATCH_BATCH_SIZE,
+    ISSUE_MONITOR_DISPATCH_BATCH_SIZE,
+  );
   const longActiveMs = readPositiveInteger(
     overrides?.longActiveMs ?? DEFAULT_PRODUCTIVITY_REVIEW_LONG_ACTIVE_HOURS * 60 * 60 * 1000,
     DEFAULT_PRODUCTIVITY_REVIEW_LONG_ACTIVE_HOURS * 60 * 60 * 1000,
@@ -470,9 +489,11 @@ function buildThresholds(overrides?: Partial<ProductivityReviewThresholds>): Pro
       DEFAULT_PRODUCTIVITY_REVIEW_MAX_CONSECUTIVE_NO_ACTION_REVIEWS,
     ),
     monitorLapseServiceGraceMs: readPositiveInteger(
-      overrides?.monitorLapseServiceGraceMs ?? DEFAULT_PRODUCTIVITY_REVIEW_MONITOR_LAPSE_SERVICE_GRACE_MS,
-      DEFAULT_PRODUCTIVITY_REVIEW_MONITOR_LAPSE_SERVICE_GRACE_MS,
+      overrides?.monitorLapseServiceGraceMs ?? monitorSchedulerIntervalMs + ISSUE_MONITOR_WAKE_CLAIM_TTL_MS,
+      monitorSchedulerIntervalMs + ISSUE_MONITOR_WAKE_CLAIM_TTL_MS,
     ),
+    monitorSchedulerIntervalMs,
+    monitorDispatchBatchSize,
   };
 }
 
@@ -1025,6 +1046,42 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     return { monitorScheduled: closedMonitorScheduled, terminalSource: closedTerminalSource };
   }
 
+  async function monitorBacklogGraceMs(
+    sourceIssue: IssueRow,
+    now: Date,
+    thresholds: ProductivityReviewThresholds,
+  ) {
+    const monitorNextCheckAt = coerceDate(sourceIssue.monitorNextCheckAt);
+    if (!monitorNextCheckAt || monitorNextCheckAt.getTime() > now.getTime()) return 0;
+    if (!isMonitorSuppressionActor(sourceIssue.monitorScheduledBy)) return 0;
+
+    const staleClaimThreshold = new Date(now.getTime() - ISSUE_MONITOR_WAKE_CLAIM_TTL_MS);
+    const duePosition = await db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(issues)
+      .innerJoin(companies, eq(companies.id, issues.companyId))
+      .where(
+        and(
+          eq(companies.status, "active"),
+          sql`${issues.monitorNextCheckAt} is not null`,
+          lte(issues.monitorNextCheckAt, now),
+          lte(issues.monitorNextCheckAt, monitorNextCheckAt),
+          isNull(issues.assigneeUserId),
+          sql`${issues.assigneeAgentId} is not null`,
+          inArray(issues.status, ["in_progress", "in_review"]),
+          or(
+            isNull(issues.monitorWakeRequestedAt),
+            lt(issues.monitorWakeRequestedAt, staleClaimThreshold),
+          ),
+        ),
+      )
+      .then((rows) => Number(rows[0]?.count ?? 0));
+    if (duePosition <= 0) return 0;
+
+    const dispatchTicks = Math.max(1, Math.ceil(duePosition / thresholds.monitorDispatchBatchSize));
+    return dispatchTicks * thresholds.monitorSchedulerIntervalMs + ISSUE_MONITOR_WAKE_CLAIM_TTL_MS;
+  }
+
   async function countIssueRunsSince(companyId: string, agentId: string, issueId: string, since: Date) {
     return db
       .select({ count: sql<number>`count(*)::int` })
@@ -1205,7 +1262,15 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       }
     }
 
-    const monitor = deliberatePendingMonitor(sourceIssue, now, thresholds);
+    let monitor = deliberatePendingMonitor(sourceIssue, now, thresholds);
+    if (trigger === "long_active_duration" && !monitor) {
+      monitor = deliberatePendingMonitor(
+        sourceIssue,
+        now,
+        thresholds,
+        await monitorBacklogGraceMs(sourceIssue, now, thresholds),
+      );
+    }
     if (trigger === "long_active_duration" && monitor) {
       return {
         trigger,
