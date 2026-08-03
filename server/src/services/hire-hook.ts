@@ -24,9 +24,31 @@ export interface NotifyHireApprovedInput {
 export async function notifyHireApproved(
   db: Db,
   input: NotifyHireApprovedInput,
-): Promise<void> {
+): Promise<boolean> {
   const { companyId, agentId, source, sourceId } = input;
   const approvedAt = input.approvedAt ?? new Date();
+
+  const recordActivity = async (
+    action: "hire_hook.succeeded" | "hire_hook.failed" | "hire_hook.error",
+    details: Record<string, unknown>,
+  ) => {
+    try {
+      await logActivity(db, {
+        companyId,
+        actorType: "system",
+        actorId: "hire_hook",
+        action,
+        entityType: "agent",
+        entityId: agentId,
+        details,
+      });
+    } catch (err) {
+      logger.error(
+        { err, companyId, agentId, source, sourceId, action },
+        "hire hook: failed to record delivery activity",
+      );
+    }
+  };
 
   const row = await db
     .select()
@@ -36,14 +58,14 @@ export async function notifyHireApproved(
 
   if (!row) {
     logger.warn({ companyId, agentId, source, sourceId }, "hire hook: agent not found in company, skipping");
-    return;
+    return false;
   }
 
   const adapterType = row.adapterType ?? "process";
   const adapter = findActiveServerAdapter(adapterType);
   const onHireApproved = adapter?.onHireApproved;
   if (!onHireApproved) {
-    return;
+    return true;
   }
 
   const payload: HireApprovedPayload = {
@@ -52,6 +74,7 @@ export async function notifyHireApproved(
     agentName: row.name,
     adapterType,
     source,
+    idempotencyKey: `${source}:${sourceId}`,
     sourceId,
     approvedAt: approvedAt.toISOString(),
     message: HIRE_APPROVED_MESSAGE,
@@ -65,49 +88,33 @@ export async function notifyHireApproved(
   try {
     const result = await onHireApproved(payload, adapterConfig);
     if (result.ok) {
-      await logActivity(db, {
-        companyId,
-        actorType: "system",
-        actorId: "hire_hook",
-        action: "hire_hook.succeeded",
-        entityType: "agent",
-        entityId: agentId,
-        details: { source, sourceId, adapterType },
-      });
-      return;
+      await recordActivity("hire_hook.succeeded", { source, sourceId, adapterType });
+      return true;
     }
 
     logger.warn(
       { companyId, agentId, adapterType, source, sourceId, error: result.error, detail: result.detail },
       "hire hook: adapter returned failure",
     );
-    await logActivity(db, {
-      companyId,
-      actorType: "system",
-      actorId: "hire_hook",
-      action: "hire_hook.failed",
-      entityType: "agent",
-      entityId: agentId,
-      details: { source, sourceId, adapterType, error: result.error, detail: result.detail },
+    await recordActivity("hire_hook.failed", {
+      source,
+      sourceId,
+      adapterType,
+      error: result.error,
+      detail: result.detail,
     });
+    return false;
   } catch (err) {
     logger.error(
       { err, companyId, agentId, adapterType, source, sourceId },
       "hire hook: adapter threw",
     );
-    await logActivity(db, {
-      companyId,
-      actorType: "system",
-      actorId: "hire_hook",
-      action: "hire_hook.error",
-      entityType: "agent",
-      entityId: agentId,
-      details: {
-        source,
-        sourceId,
-        adapterType,
-        error: err instanceof Error ? err.message : String(err),
-      },
+    await recordActivity("hire_hook.error", {
+      source,
+      sourceId,
+      adapterType,
+      error: err instanceof Error ? err.message : String(err),
     });
+    return false;
   }
 }

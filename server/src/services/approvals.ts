@@ -1,12 +1,16 @@
-import { and, asc, eq, inArray, sql } from "drizzle-orm";
+import { randomUUID } from "node:crypto";
+import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { approvalComments, approvals } from "@paperclipai/db";
+import { activityLog, approvalComments, approvals } from "@paperclipai/db";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { agentService } from "./agents.js";
 import { budgetService } from "./budgets.js";
 import { notifyHireApproved } from "./hire-hook.js";
 import { instanceSettingsService } from "./instance-settings.js";
+
+const HIRE_RECONCILIATION_CLAIM_LEASE_MS = 5 * 60_000;
+const HIRE_NOTIFICATION_CLAIM_LEASE_MS = 5 * 60_000;
 
 export function approvalService(db: Db) {
   const agentsSvc = agentService(db);
@@ -32,6 +36,485 @@ export function approvalService(db: Db) {
     if (!sourceBuiltInAgentKey) return;
     const { builtInAgentService } = await import("./built-in-agents.js");
     await builtInAgentService(dbClient).ensure(companyId, sourceBuiltInAgentKey);
+  }
+
+  async function completeApprovedBuiltInHire(
+    approval: ApprovalRecord,
+    agentId: string,
+    approvedAt: Date,
+  ) {
+    const payload = approval.payload as Record<string, unknown>;
+    const reconciliation = await withBuiltInHireAttemptLock(approval, "reconciliation", async () => {
+      const reconciliationClaim = await claimBuiltInHireReconciliation(approval, agentId, payload);
+      if (!reconciliationClaim) return;
+      try {
+        await reconcileApprovedBuiltInAgent(db, approval.companyId, payload);
+        await completeBuiltInHireReconciliation(approval, agentId, payload, reconciliationClaim.attemptId);
+      } catch (error) {
+        await releaseBuiltInHireReconciliationClaim(approval, agentId, payload, reconciliationClaim.attemptId);
+        throw error;
+      }
+    });
+    if (!reconciliation.locked) {
+      return;
+    }
+
+    await deliverBuiltInHireNotification(approval, agentId, approvedAt, payload);
+  }
+
+  async function lockApproval(tx: Parameters<Parameters<Db["transaction"]>[0]>[0], approvalId: string) {
+    await tx.execute(sql`select ${approvals.id} from ${approvals} where ${approvals.id} = ${approvalId} for update`);
+  }
+
+  async function withBuiltInHireAttemptLock<T>(
+    approval: ApprovalRecord,
+    kind: "reconciliation" | "notification",
+    task: () => Promise<T>,
+  ): Promise<{ locked: true; value: T } | { locked: false }> {
+    const lockKey = `paperclip:approval:${kind}:${approval.id}`;
+    return db.transaction(async (tx) => {
+      const rows = await tx.execute(
+        sql`select pg_try_advisory_xact_lock(hashtextextended(${lockKey}, 0)) as acquired`,
+      );
+      const row = Array.isArray(rows) ? rows[0] : null;
+      if (
+        !row ||
+        typeof row !== "object" ||
+        (row as Record<string, unknown>).acquired !== true
+      ) {
+        return { locked: false as const };
+      }
+      return { locked: true as const, value: await task() };
+    });
+  }
+
+  function activityDetails(details: unknown) {
+    return typeof details === "object" && details !== null && !Array.isArray(details)
+      ? details as Record<string, unknown>
+      : {};
+  }
+
+  function activityAttemptId(details: unknown) {
+    const attemptId = activityDetails(details).attemptId;
+    return typeof attemptId === "string" ? attemptId : null;
+  }
+
+  async function hasApprovalActivity(
+    dbClient: Db,
+    approval: ApprovalRecord,
+    action: string,
+  ) {
+    return dbClient
+      .select({ id: activityLog.id })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, approval.companyId),
+          eq(activityLog.action, action),
+          eq(activityLog.entityType, "approval"),
+          eq(activityLog.entityId, approval.id),
+        ),
+      )
+      .limit(1)
+      .then((rows) => Boolean(rows[0]));
+  }
+
+  async function latestApprovalActivity(
+    dbClient: Db,
+    approval: ApprovalRecord,
+    actions: string[],
+  ) {
+    return dbClient
+      .select({
+        id: activityLog.id,
+        action: activityLog.action,
+        createdAt: activityLog.createdAt,
+        details: activityLog.details,
+      })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, approval.companyId),
+          inArray(activityLog.action, actions),
+          eq(activityLog.entityType, "approval"),
+          eq(activityLog.entityId, approval.id),
+        ),
+      )
+      .orderBy(desc(activityLog.createdAt), desc(activityLog.id))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+  }
+
+  async function latestBuiltInHireNotificationActivity(
+    dbClient: Db,
+    approval: ApprovalRecord,
+  ) {
+    return dbClient
+      .select({
+        id: activityLog.id,
+        action: activityLog.action,
+        createdAt: activityLog.createdAt,
+        details: activityLog.details,
+      })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, approval.companyId),
+          inArray(activityLog.action, [
+            "approval.hire_notification_started",
+            "approval.hire_notification_succeeded",
+            "approval.hire_notification_failed",
+          ]),
+          eq(activityLog.entityType, "approval"),
+          eq(activityLog.entityId, approval.id),
+        ),
+      )
+      .orderBy(
+        desc(activityLog.createdAt),
+        desc(sql<number>`case ${activityLog.action}
+          when 'approval.hire_notification_succeeded' then 3
+          when 'approval.hire_notification_failed' then 2
+          when 'approval.hire_notification_started' then 1
+          else 0
+        end`),
+        desc(activityLog.id),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+  }
+
+  async function insertApprovalActivityIfMissing(
+    dbClient: Db,
+    approval: ApprovalRecord,
+    action: string,
+    agentId: string,
+    details: Record<string, unknown>,
+  ) {
+    if (await hasApprovalActivity(dbClient, approval, action)) return;
+    await dbClient.insert(activityLog).values({
+      companyId: approval.companyId,
+      actorType: "system",
+      actorId: "approval_service",
+      action,
+      entityType: "approval",
+      entityId: approval.id,
+      agentId,
+      details,
+      createdAt: new Date(),
+    });
+  }
+
+  async function hasSuccessfulHireHookActivity(
+    dbClient: Db,
+    approval: ApprovalRecord,
+    agentId: string,
+  ) {
+    return dbClient
+      .select({ id: activityLog.id })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, approval.companyId),
+          eq(activityLog.action, "hire_hook.succeeded"),
+          eq(activityLog.entityType, "agent"),
+          eq(activityLog.entityId, agentId),
+          sql`${activityLog.details} ->> 'source' = 'approval'`,
+          sql`${activityLog.details} ->> 'sourceId' = ${approval.id}`,
+        ),
+      )
+      .limit(1)
+      .then((rows) => Boolean(rows[0]));
+  }
+
+  async function hasBuiltInHireReconciliationCompleted(dbClient: Db, approval: ApprovalRecord) {
+    return hasApprovalActivity(dbClient, approval, "approval.hire_reconciliation_completed");
+  }
+
+  async function hasBuiltInHireNotificationDelivered(
+    dbClient: Db,
+    approval: ApprovalRecord,
+    agentId: string,
+  ) {
+    return Boolean(
+      await hasApprovalActivity(dbClient, approval, "approval.hire_notification_delivered") ||
+        await hasApprovalActivity(dbClient, approval, "approval.hire_post_commit_completed") ||
+        await hasSuccessfulHireHookActivity(dbClient, approval, agentId)
+    );
+  }
+
+  async function markBuiltInHireNotificationDelivered(
+    dbClient: Db,
+    approval: ApprovalRecord,
+    agentId: string,
+    payload: Record<string, unknown>,
+  ) {
+    const details = { sourceBuiltInAgentKey: payload.sourceBuiltInAgentKey };
+    await insertApprovalActivityIfMissing(
+      dbClient,
+      approval,
+      "approval.hire_notification_delivered",
+      agentId,
+      details,
+    );
+    await insertApprovalActivityIfMissing(
+      dbClient,
+      approval,
+      "approval.hire_post_commit_completed",
+      agentId,
+      details,
+    );
+  }
+
+  async function markBuiltInHireNotificationSucceeded(
+    dbClient: Db,
+    approval: ApprovalRecord,
+    agentId: string,
+    payload: Record<string, unknown>,
+    attemptId: string,
+  ) {
+    await insertApprovalActivityIfMissing(
+      dbClient,
+      approval,
+      "approval.hire_notification_succeeded",
+      agentId,
+      { attemptId, sourceBuiltInAgentKey: payload.sourceBuiltInAgentKey },
+    );
+  }
+
+  async function claimBuiltInHireReconciliation(
+    approval: ApprovalRecord,
+    agentId: string,
+    payload: Record<string, unknown>,
+  ) {
+    const attemptId = randomUUID();
+    return db.transaction(async (tx) => {
+      const txDb = tx as unknown as Db;
+      await lockApproval(tx, approval.id);
+
+      if (await hasBuiltInHireReconciliationCompleted(txDb, approval)) return null;
+      const latest = await latestApprovalActivity(txDb, approval, [
+        "approval.hire_reconciliation_started",
+        "approval.hire_reconciliation_failed",
+      ]);
+      if (
+        latest?.action === "approval.hire_reconciliation_started" &&
+        latest.createdAt.getTime() > Date.now() - HIRE_RECONCILIATION_CLAIM_LEASE_MS
+      ) {
+        return null;
+      }
+
+      await txDb.insert(activityLog).values({
+        companyId: approval.companyId,
+        actorType: "system",
+        actorId: "approval_service",
+        action: "approval.hire_reconciliation_started",
+        entityType: "approval",
+        entityId: approval.id,
+        agentId,
+        details: {
+          attemptId,
+          leaseMs: HIRE_RECONCILIATION_CLAIM_LEASE_MS,
+          sourceBuiltInAgentKey: payload.sourceBuiltInAgentKey,
+        },
+        createdAt: new Date(),
+      });
+      return { attemptId };
+    });
+  }
+
+  async function completeBuiltInHireReconciliation(
+    approval: ApprovalRecord,
+    agentId: string,
+    payload: Record<string, unknown>,
+    attemptId: string,
+  ) {
+    await db.transaction(async (tx) => {
+      const txDb = tx as unknown as Db;
+      await lockApproval(tx, approval.id);
+      const latest = await latestApprovalActivity(txDb, approval, [
+        "approval.hire_reconciliation_started",
+        "approval.hire_reconciliation_failed",
+      ]);
+      if (
+        latest?.action !== "approval.hire_reconciliation_started" ||
+        activityAttemptId(latest.details) !== attemptId
+      ) {
+        throw conflict("Built-in hire reconciliation claim was superseded");
+      }
+      await insertApprovalActivityIfMissing(
+        txDb,
+        approval,
+        "approval.hire_reconciliation_completed",
+        agentId,
+        { attemptId, sourceBuiltInAgentKey: payload.sourceBuiltInAgentKey },
+      );
+    });
+  }
+
+  async function releaseBuiltInHireReconciliationClaim(
+    approval: ApprovalRecord,
+    agentId: string,
+    payload: Record<string, unknown>,
+    attemptId: string,
+  ) {
+    await db.transaction(async (tx) => {
+      const txDb = tx as unknown as Db;
+      await lockApproval(tx, approval.id);
+      const latest = await latestApprovalActivity(txDb, approval, [
+        "approval.hire_reconciliation_started",
+        "approval.hire_reconciliation_failed",
+      ]);
+      if (
+        latest?.action !== "approval.hire_reconciliation_started" ||
+        activityAttemptId(latest.details) !== attemptId
+      ) {
+        return;
+      }
+      await txDb.insert(activityLog).values({
+        companyId: approval.companyId,
+        actorType: "system",
+        actorId: "approval_service",
+        action: "approval.hire_reconciliation_failed",
+        entityType: "approval",
+        entityId: approval.id,
+        agentId,
+        details: { attemptId, sourceBuiltInAgentKey: payload.sourceBuiltInAgentKey },
+        createdAt: new Date(),
+      });
+    });
+  }
+
+  async function claimBuiltInHireNotification(
+    approval: ApprovalRecord,
+    agentId: string,
+    payload: Record<string, unknown>,
+  ) {
+    const attemptId = randomUUID();
+    return db.transaction(async (tx) => {
+      const txDb = tx as unknown as Db;
+      await lockApproval(tx, approval.id);
+      if (!await hasBuiltInHireReconciliationCompleted(txDb, approval)) return null;
+      if (await hasBuiltInHireNotificationDelivered(txDb, approval, agentId)) {
+        await markBuiltInHireNotificationDelivered(txDb, approval, agentId, payload);
+        return null;
+      }
+
+      const latest = await latestBuiltInHireNotificationActivity(txDb, approval);
+      if (latest?.action === "approval.hire_notification_succeeded") {
+        const attemptId = activityAttemptId(latest.details);
+        if (attemptId) {
+          await markBuiltInHireNotificationDelivered(txDb, approval, agentId, payload);
+        }
+        return null;
+      }
+      if (
+        latest?.action === "approval.hire_notification_started" &&
+        latest.createdAt.getTime() > Date.now() - HIRE_NOTIFICATION_CLAIM_LEASE_MS
+      ) {
+        return null;
+      }
+
+      await txDb.insert(activityLog).values({
+        companyId: approval.companyId,
+        actorType: "system",
+        actorId: "approval_service",
+        action: "approval.hire_notification_started",
+        entityType: "approval",
+        entityId: approval.id,
+        agentId,
+        details: {
+          attemptId,
+          leaseMs: HIRE_NOTIFICATION_CLAIM_LEASE_MS,
+          sourceBuiltInAgentKey: payload.sourceBuiltInAgentKey,
+        },
+        createdAt: new Date(),
+      });
+      return { attemptId };
+    });
+  }
+
+  async function completeBuiltInHireNotification(
+    approval: ApprovalRecord,
+    agentId: string,
+    payload: Record<string, unknown>,
+    attemptId: string,
+  ) {
+    await db.transaction(async (tx) => {
+      const txDb = tx as unknown as Db;
+      await lockApproval(tx, approval.id);
+      if (await hasBuiltInHireNotificationDelivered(txDb, approval, agentId)) {
+        await markBuiltInHireNotificationDelivered(txDb, approval, agentId, payload);
+        return;
+      }
+      const latest = await latestBuiltInHireNotificationActivity(txDb, approval);
+      if (
+        (
+          latest?.action !== "approval.hire_notification_started" &&
+          latest?.action !== "approval.hire_notification_succeeded"
+        ) ||
+        activityAttemptId(latest.details) !== attemptId
+      ) {
+        throw conflict("Built-in hire notification claim was superseded");
+      }
+      await markBuiltInHireNotificationDelivered(txDb, approval, agentId, payload);
+    });
+  }
+
+  async function releaseBuiltInHireNotificationClaim(
+    approval: ApprovalRecord,
+    agentId: string,
+    payload: Record<string, unknown>,
+    attemptId: string,
+  ) {
+    await db.transaction(async (tx) => {
+      const txDb = tx as unknown as Db;
+      await lockApproval(tx, approval.id);
+      const latest = await latestBuiltInHireNotificationActivity(txDb, approval);
+      if (
+        latest?.action !== "approval.hire_notification_started" ||
+        activityAttemptId(latest.details) !== attemptId
+      ) {
+        return;
+      }
+      await txDb.insert(activityLog).values({
+        companyId: approval.companyId,
+        actorType: "system",
+        actorId: "approval_service",
+        action: "approval.hire_notification_failed",
+        entityType: "approval",
+        entityId: approval.id,
+        agentId,
+        details: { attemptId, sourceBuiltInAgentKey: payload.sourceBuiltInAgentKey },
+        createdAt: new Date(),
+      });
+    });
+  }
+
+  async function deliverBuiltInHireNotification(
+    approval: ApprovalRecord,
+    agentId: string,
+    approvedAt: Date,
+    payload: Record<string, unknown>,
+  ) {
+    await withBuiltInHireAttemptLock(approval, "notification", async () => {
+      const claim = await claimBuiltInHireNotification(approval, agentId, payload);
+      if (!claim) return;
+
+      const delivered = await notifyHireApproved(db, {
+        companyId: approval.companyId,
+        agentId,
+        source: "approval",
+        sourceId: approval.id,
+        approvedAt,
+      });
+      if (!delivered) {
+        await releaseBuiltInHireNotificationClaim(approval, agentId, payload, claim.attemptId);
+        return;
+      }
+
+      await markBuiltInHireNotificationSucceeded(db, approval, agentId, payload, claim.attemptId);
+      await completeBuiltInHireNotification(approval, agentId, payload, claim.attemptId);
+    });
   }
 
   async function getExistingApproval(id: string, dbClient: Db = db) {
@@ -216,10 +699,13 @@ export function approvalService(db: Db) {
         typeof payload.sourceBuiltInAgentKey === "string" &&
         approvedAgentId !== null;
 
-      if (result.applied && isBuiltInHire) {
-        await reconcileApprovedBuiltInAgent(db, result.approval.companyId, payload);
-      }
-      if (result.hireApprovedAgentId) {
+      if (isBuiltInHire) {
+        await completeApprovedBuiltInHire(
+          result.approval,
+          approvedAgentId,
+          result.approval.decidedAt ?? now,
+        );
+      } else if (result.hireApprovedAgentId) {
         void notifyHireApproved(db, {
           companyId: result.approval.companyId,
           agentId: result.hireApprovedAgentId,
