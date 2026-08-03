@@ -2522,10 +2522,16 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     };
   }
 
-  async function retireTerminalSourceProductivityReviewReservation(input: {
+  async function retireStaleProductivityReviewReservation(input: {
     review: IssueRow;
-    sourceIssue: IssueRow;
+    sourceIssue: IssueRow | null;
     now: Date;
+    reason:
+      | "missing_source"
+      | "terminal_source"
+      | "unreviewable_source"
+      | "missing_source_agent"
+      | "review_owner_changed";
   }) {
     const [retired] = await db
       .update(issues)
@@ -2553,10 +2559,11 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       agentId: input.review.assigneeAgentId,
       details: {
         source: "productivity_review.reconcile",
-        sourceIssueId: input.sourceIssue.id,
+        sourceIssueId: input.sourceIssue?.id ?? input.review.originId,
         trigger: "long_active_duration",
-        suppressedBy: "terminal_source",
-        sourceStatus: input.sourceIssue.status,
+        suppressedBy: input.reason,
+        sourceStatus: input.sourceIssue?.status ?? null,
+        sourceMissing: !input.sourceIssue,
         reservationRecovered: true,
       },
     });
@@ -2591,25 +2598,40 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       failed: 0,
       reviewIssueIds: [] as string[],
       failedIssueIds: [] as string[],
-      retiredTerminalSource: 0,
+      retiredStaleReservation: 0,
       recoveredSourceIssueIds: new Set<string>(),
     };
 
     for (const review of reservedReviews) {
       if (!review.originId) {
-        result.existing += 1;
+        const retired = await retireStaleProductivityReviewReservation({
+          review,
+          sourceIssue: null,
+          now: input.now,
+          reason: "missing_source",
+        });
+        if (retired) {
+          result.retiredStaleReservation += 1;
+          result.reviewIssueIds.push(review.id);
+        } else {
+          result.existing += 1;
+        }
         continue;
       }
       result.recoveredSourceIssueIds.add(review.originId);
       if (!review.assigneeAgentId) {
-        logger.warn(
-          {
-            reviewIssueId: review.id,
-            sourceIssueId: review.originId,
-          },
-          "productivity review reservation recovery skipped: reservation has no assignee agent",
-        );
-        result.existing += 1;
+        const retired = await retireStaleProductivityReviewReservation({
+          review,
+          sourceIssue: null,
+          now: input.now,
+          reason: "review_owner_changed",
+        });
+        if (retired) {
+          result.retiredStaleReservation += 1;
+          result.reviewIssueIds.push(review.id);
+        } else {
+          result.existing += 1;
+        }
         continue;
       }
 
@@ -2620,24 +2642,44 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         .limit(1)
         .then((rows) => rows[0] ?? null);
       if (!sourceIssue) {
-        logger.warn(
-          {
-            reviewIssueId: review.id,
-            sourceIssueId: review.originId,
-          },
-          "productivity review reservation recovery skipped: source issue disappeared",
-        );
-        result.existing += 1;
+        const retired = await retireStaleProductivityReviewReservation({
+          review,
+          sourceIssue: null,
+          now: input.now,
+          reason: "missing_source",
+        });
+        if (retired) {
+          result.retiredStaleReservation += 1;
+          result.reviewIssueIds.push(review.id);
+        } else {
+          result.existing += 1;
+        }
         continue;
       }
-      if (isTerminalIssueStatus(sourceIssue.status)) {
-        const retired = await retireTerminalSourceProductivityReviewReservation({
+      const sourceAgent = sourceIssue.assigneeAgentId ? await getAgent(sourceIssue.assigneeAgentId) : null;
+      const reviewability = sourceIssue.assigneeAgentId
+        ? await evaluateSourceReviewability(sourceIssue, sourceIssue.assigneeAgentId)
+        : { reviewable: false, terminal: isTerminalIssueStatus(sourceIssue.status), status: sourceIssue.status };
+      const currentReviewOwnerId = sourceAgent
+        ? await resolveReviewOwnerAgentId(sourceIssue, sourceAgent)
+        : null;
+      const retiredReason =
+        reviewability.terminal ? "terminal_source" :
+        !sourceAgent || sourceAgent.companyId !== sourceIssue.companyId ? "missing_source_agent" :
+        !reviewability.reviewable ||
+          await isProductivityReviewDescendant(sourceIssue) ||
+          isProductivityReviewOptedOut(sourceIssue) ? "unreviewable_source" :
+        currentReviewOwnerId !== review.assigneeAgentId ? "review_owner_changed" :
+        null;
+      if (retiredReason) {
+        const retired = await retireStaleProductivityReviewReservation({
           review,
           sourceIssue,
           now: input.now,
+          reason: retiredReason,
         });
         if (retired) {
-          result.retiredTerminalSource += 1;
+          result.retiredStaleReservation += 1;
           result.reviewIssueIds.push(review.id);
         } else {
           result.existing += 1;
@@ -2843,7 +2885,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     result.created += recoveredReservations.created;
     result.existing += recoveredReservations.existing;
     result.failed += recoveredReservations.failed;
-    result.closedTerminalSourceReviews += recoveredReservations.retiredTerminalSource;
+    result.closedTerminalSourceReviews += recoveredReservations.retiredStaleReservation;
     result.reviewIssueIds.push(...recoveredReservations.reviewIssueIds);
     result.failedIssueIds.push(...recoveredReservations.failedIssueIds);
 

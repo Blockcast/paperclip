@@ -2316,6 +2316,173 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(await countReviewActivity(reviewId, "issue.productivity_review_suppressed_open_review_closed")).toBe(1);
   });
 
+  it("retires a stale reserved review after its source leaves candidate status", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const reservedAt = new Date(now.getTime() - 10 * 60_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt: new Date(now.getTime() - 10 * 60 * 1000),
+      monitorScheduledBy: "assignee",
+    });
+    const reviewId = await insertProductivityReview({ seeded, createdAt: reservedAt });
+    await db
+      .update(issues)
+      .set({ status: "in_review", updatedAt: now })
+      .where(eq(issues.id, seeded.issueId));
+
+    const wakeups: Array<{ agentId: string; opts: unknown }> = [];
+    const result = await productivityReviewService(db, {
+      async enqueueWakeup(agentId, opts) {
+        wakeups.push({ agentId, opts });
+        return { id: randomUUID() };
+      },
+    }).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+    });
+
+    expect(result.created).toBe(0);
+    expect(result.closedTerminalSourceReviews).toBe(1);
+    const [review] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, reviewId));
+    expect(review).toMatchObject({ status: "done", identifier: null, issueNumber: null });
+    expect(wakeups).toHaveLength(0);
+    expect(await countReviewActivity(reviewId, "issue.productivity_review_created")).toBe(0);
+    expect(await countReviewActivity(reviewId, "issue.productivity_review_assignment_wake_enqueued")).toBe(0);
+    const [closed] = await db
+      .select({ details: activityLog.details })
+      .from(activityLog)
+      .where(and(eq(activityLog.entityId, reviewId), eq(activityLog.action, "issue.productivity_review_suppressed_open_review_closed")));
+    expect(closed?.details).toMatchObject({ suppressedBy: "unreviewable_source", sourceStatus: "in_review" });
+  });
+
+  it("retires a stale reserved review after its source review owner changes", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const reservedAt = new Date(now.getTime() - 10 * 60_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt: new Date(now.getTime() - 10 * 60 * 1000),
+      monitorScheduledBy: "assignee",
+    });
+    const reviewId = await insertProductivityReview({ seeded, createdAt: reservedAt });
+    const newManagerId = randomUUID();
+    const newCoderId = randomUUID();
+    await db.insert(agents).values([
+      {
+        id: newManagerId,
+        companyId: seeded.companyId,
+        name: "New CTO",
+        role: "cto",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: newCoderId,
+        companyId: seeded.companyId,
+        name: "New Coder",
+        role: "engineer",
+        status: "idle",
+        reportsTo: newManagerId,
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+    await db
+      .update(issues)
+      .set({ assigneeAgentId: newCoderId, updatedAt: now })
+      .where(eq(issues.id, seeded.issueId));
+
+    const wakeups: Array<{ agentId: string; opts: unknown }> = [];
+    const result = await productivityReviewService(db, {
+      async enqueueWakeup(agentId, opts) {
+        wakeups.push({ agentId, opts });
+        return { id: randomUUID() };
+      },
+    }).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+    });
+
+    expect(result.created).toBe(0);
+    expect(result.closedTerminalSourceReviews).toBe(1);
+    const [review] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, reviewId));
+    expect(review).toMatchObject({ status: "done", identifier: null, issueNumber: null });
+    expect(wakeups).toHaveLength(0);
+    expect(await countReviewActivity(reviewId, "issue.productivity_review_created")).toBe(0);
+    expect(await countReviewActivity(reviewId, "issue.productivity_review_assignment_wake_enqueued")).toBe(0);
+    const [closed] = await db
+      .select({ details: activityLog.details })
+      .from(activityLog)
+      .where(and(eq(activityLog.entityId, reviewId), eq(activityLog.action, "issue.productivity_review_suppressed_open_review_closed")));
+    expect(closed?.details).toMatchObject({ suppressedBy: "review_owner_changed" });
+  });
+
+  it("retires a stale reserved review after its source disappears", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const reservedAt = new Date(now.getTime() - 10 * 60_000);
+    const seeded = await seedAssignedIssue({
+      status: "done",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    const missingSourceId = randomUUID();
+    const reviewId = await insertProductivityReview({ seeded, createdAt: reservedAt });
+    await db
+      .update(issues)
+      .set({
+        parentId: null,
+        originId: missingSourceId,
+        originFingerprint: `productivity-review:${missingSourceId}`,
+        updatedAt: reservedAt,
+      })
+      .where(eq(issues.id, reviewId));
+
+    const wakeups: Array<{ agentId: string; opts: unknown }> = [];
+    const result = await productivityReviewService(db, {
+      async enqueueWakeup(agentId, opts) {
+        wakeups.push({ agentId, opts });
+        return { id: randomUUID() };
+      },
+    }).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+    });
+
+    expect(result.created).toBe(0);
+    expect(result.closedTerminalSourceReviews).toBe(1);
+    const [review] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, reviewId));
+    expect(review).toMatchObject({ status: "done", identifier: null, issueNumber: null });
+    expect(wakeups).toHaveLength(0);
+    expect(await countReviewActivity(reviewId, "issue.productivity_review_created")).toBe(0);
+    expect(await countReviewActivity(reviewId, "issue.productivity_review_assignment_wake_enqueued")).toBe(0);
+    const [closed] = await db
+      .select({ details: activityLog.details })
+      .from(activityLog)
+      .where(and(eq(activityLog.entityId, reviewId), eq(activityLog.action, "issue.productivity_review_suppressed_open_review_closed")));
+    expect(closed?.details).toMatchObject({
+      suppressedBy: "missing_source",
+      sourceIssueId: missingSourceId,
+      sourceMissing: true,
+    });
+  });
+
   // Negative control for BLO-21003: a monitor that lapsed well past the
   // lapse-to-service grace window, with no pending wake, is genuinely
   // unsupervised and must still fire exactly as it does today. Without this
