@@ -25,6 +25,7 @@ const mockBoardAuthService = vi.hoisted(() => ({
   listBoardApiKeys: vi.fn(),
   createNamedBoardApiKey: vi.fn(),
   getBoardApiKeyForUser: vi.fn(),
+  refreshBoardApiKeyExpiry: vi.fn(),
 }));
 
 const mockLogActivity = vi.hoisted(() => vi.fn());
@@ -493,6 +494,70 @@ describe.sequential("cli auth routes", () => {
       expiresAt: "2026-08-01T00:00:00.000Z",
     });
     expect(mockBoardAuthService.resolveBoardAccess).not.toHaveBeenCalled();
+  });
+
+  // The onprem-k8s MCP auth proxy introspects /cli-auth/me and gates on an
+  // `agent:<uuid>` tier comparing `userId` to an agent id, so agent actors must
+  // resolve here. See server/src/routes/access.ts for the consumer contract.
+  for (const source of ["agent_jwt", "agent_key"] as const) {
+    it.sequential(`answers /cli-auth/me for an ${source} agent actor`, async () => {
+      const app = await createApp({
+        type: "agent",
+        agentId: "d2ade02d-112c-4da2-b61f-2301254a154c",
+        companyId: "company-9",
+        // agent_key actors carry a key id; it must not leak into the response.
+        keyId: source === "agent_key" ? "agent-key-9" : undefined,
+        runId: "run-9",
+        source,
+      });
+
+      const res = await request(app).get("/api/cli-auth/me");
+
+      expect(res.status, res.text || JSON.stringify(res.body)).toBe(200);
+      expect(res.body).toEqual({
+        user: null,
+        userId: "d2ade02d-112c-4da2-b61f-2301254a154c",
+        isInstanceAdmin: false,
+        companyIds: ["company-9"],
+        memberships: [],
+        source,
+        keyId: null,
+        expiresAt: null,
+      });
+      // The proxy's agent tier is `/^agent(_|$)/.test(identity.source)`.
+      expect(res.body.source).toMatch(/^agent(_|$)/);
+      expect(res.body.companyIds.length).toBeGreaterThan(0);
+    });
+  }
+
+  it.sequential("keeps /cli-auth/refresh board-only for agent actors", async () => {
+    const app = await createApp({
+      type: "agent",
+      agentId: "d2ade02d-112c-4da2-b61f-2301254a154c",
+      companyId: "company-9",
+      source: "agent_jwt",
+    });
+
+    const res = await request(app).post("/api/cli-auth/refresh");
+
+    expect(res.status, res.text || JSON.stringify(res.body)).toBe(401);
+    expect(mockBoardAuthService.refreshBoardApiKeyExpiry).not.toHaveBeenCalled();
+  });
+
+  it.sequential("rejects /cli-auth/me for an unauthenticated actor", async () => {
+    const app = await createApp({ type: "none", source: "none" });
+
+    const res = await request(app).get("/api/cli-auth/me");
+
+    expect(res.status).toBe(401);
+  });
+
+  it.sequential("rejects /cli-auth/me for an agent actor with no agent id", async () => {
+    const app = await createApp({ type: "agent", companyId: "company-9", source: "agent_jwt" });
+
+    const res = await request(app).get("/api/cli-auth/me");
+
+    expect(res.status).toBe(401);
   });
 
   it.sequential("creates a named board API key and logs audit activity", async () => {
