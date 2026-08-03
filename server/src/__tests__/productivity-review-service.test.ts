@@ -965,7 +965,48 @@ describeEmbeddedPostgres("productivity review service", () => {
     const result = await productivityReviewService(db).reconcileProductivityReviews({
       now,
       companyId: seeded.companyId,
-      thresholds: { monitorLapseServiceGraceMs: 2 * 60_000 },
+      thresholds: { monitorSchedulerIntervalMs: 2 * 60_000 },
+    });
+
+    expect(result.created).toBe(0);
+    expect(result.monitorScheduledSuppressed).toBe(1);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  it("suppresses a due monitor still waiting behind the scheduler dispatch batch", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const monitorNextCheckAt = new Date(now.getTime() - 6 * 60_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt,
+      monitorScheduledBy: "assignee",
+    });
+    await db.insert(issues).values(
+      Array.from({ length: 50 }, (_, index) => ({
+        id: randomUUID(),
+        companyId: seeded.companyId,
+        title: `Earlier due monitor ${index + 1}`,
+        status: "in_review" as const,
+        priority: "medium" as const,
+        assigneeAgentId: seeded.coderId,
+        monitorNextCheckAt: new Date(now.getTime() - 7 * 60_000),
+        monitorScheduledBy: "assignee" as const,
+        issueNumber: index + 20,
+        identifier: `${seeded.issuePrefix}-${index + 20}`,
+        createdAt: seeded.createdAt,
+        updatedAt: seeded.createdAt,
+      })),
+    );
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: {
+        monitorLapseServiceGraceMs: 60_000,
+        monitorSchedulerIntervalMs: 60_000,
+        monitorDispatchBatchSize: 50,
+      },
     });
 
     expect(result.created).toBe(0);

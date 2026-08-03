@@ -8418,10 +8418,11 @@ export interface HeartbeatServiceOptions {
   };
   /**
    * Overrides the new-review grace for monitor wakes whose `monitorNextCheckAt`
-   * is due but not yet cleared. The worker derives this from scheduler cadence
-   * plus the monitor dispatch claim TTL; tests can set it directly.
+   * is due but not yet cleared. The worker derives the effective grace from this
+   * scheduler cadence, due-monitor batch position, and monitor dispatch claim
+   * TTL; tests can set it directly.
    */
-  productivityReviewMonitorLapseGraceMs?: number;
+  productivityReviewMonitorSchedulerIntervalMs?: number;
   /**
    * Test-only concurrency hook: fired after the scheduler has read a due
    * scheduled_retry row and immediately before the conditional UPDATE that
@@ -17576,8 +17577,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   async function reconcileProductivityReviews(opts?: { now?: Date; companyId?: string }) {
     return productivityReviews.reconcileProductivityReviews({
       ...opts,
-      thresholds: options.productivityReviewMonitorLapseGraceMs
-        ? { monitorLapseServiceGraceMs: options.productivityReviewMonitorLapseGraceMs }
+      thresholds: options.productivityReviewMonitorSchedulerIntervalMs
+        ? { monitorSchedulerIntervalMs: options.productivityReviewMonitorSchedulerIntervalMs }
         : undefined,
       issueCreatedAtGte: await getWorktreeExecutionCutoff(),
     });
