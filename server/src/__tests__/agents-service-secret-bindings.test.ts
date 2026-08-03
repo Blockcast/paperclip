@@ -770,7 +770,7 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
     mockNotifyHireApproved.mockResolvedValue(true);
     const service = approvalService(db);
 
-    const approvals = Promise.all(
+    const approvalResults = Promise.all(
       approvalIds.map((approvalId) =>
         service.approve(approvalId, "board-user", "Approved"),
       ),
@@ -788,7 +788,7 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
       releaseReconciliation.resolve();
     }
 
-    const results = await withTimeout(approvals, 5_000, "concurrent built-in approvals");
+    const results = await withTimeout(approvalResults, 5_000, "concurrent built-in approvals");
 
     expect(results).toHaveLength(10);
     expect(results.every((result) => result.applied)).toBe(true);
