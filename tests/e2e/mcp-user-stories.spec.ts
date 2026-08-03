@@ -430,6 +430,11 @@ test.describe.serial("MCP prod Phase 5a user-story harness", () => {
       for (const value of ["first", "second"]) {
         const pending = await testCall(request, connectionId, scout, "sheets:update_cell", { cell: "B1", value });
         expect(pending.decision).toBe("ask_first");
+        await page.goto(`/${seed.prefix}/apps/${connectionId}/review`);
+        await expect(page.getByRole("button", { name: "Allow once" })).toBeVisible({
+          timeout: 30_000,
+        });
+        await screenshot(page, "US-9", `review-pending-${value}`);
         await approveActionRequest(request, seed.companyId, pending.actionRequestId!);
         await pollTestCall(request, connectionId, pending.actionRequestId!, "done");
         await page.goto(`/${seed.prefix}/apps/${connectionId}/review`);

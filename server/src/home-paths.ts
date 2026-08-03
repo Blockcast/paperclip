@@ -55,6 +55,30 @@ export function resolveDefaultAgentWorkspaceDir(agentId: string): string {
   return path.resolve(resolvePaperclipInstanceRoot(), "workspaces", trimmed);
 }
 
+// BLO-18760: repo-less source checkout for k8s per-run isolation.
+//
+// The per-agent workspace dir above is persistent and accumulates a real
+// `.git` from unrelated prior runs. claude_k8s pods bootstrap by
+// `git clone --shared`-ing from their resolved cwd, so an issue with no
+// project/session workspace lands on that dirty directory and either exits
+// 128 under cephfs pressure or (post-BLO-18147) is refused dispatch outright.
+//
+// This is a deliberate SIBLING of "workspaces/", never a child: git resolves a
+// repository by walking *up* the tree, so nesting this under the agent home
+// would make `rev-parse --verify HEAD` succeed against the parent and defeat
+// the whole point. Nothing writes here — under `run` isolation the pod's
+// workspace/home/session/cache roots all live in the ephemeral
+// /runtime-cache/paperclip-runs/<runId> tree and this path is only ever read
+// as a clone source — so one stable dir per agent stays empty and avoids
+// leaking an inode per run.
+export function resolveAgentEmptyWorkspaceSourceDir(agentId: string): string {
+  const trimmed = agentId.trim();
+  if (!PATH_SEGMENT_RE.test(trimmed)) {
+    throw new Error(`Invalid agent id for workspace path '${agentId}'.`);
+  }
+  return path.resolve(resolvePaperclipInstanceRoot(), "empty-workspaces", trimmed);
+}
+
 function sanitizeFriendlyPathSegment(value: string | null | undefined, fallback = "_default"): string {
   const trimmed = value?.trim() ?? "";
   if (!trimmed) return fallback;

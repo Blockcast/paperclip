@@ -8,7 +8,7 @@ import type { agents } from "@paperclipai/db";
 import { sessionCodec as codexSessionCodec } from "@paperclipai/adapter-codex-local/server";
 import { logger } from "../middleware/logger.js";
 import { KNOWN_ISOLATION_MODES } from "../services/metrics.js";
-import { resolveDefaultAgentWorkspaceDir } from "../home-paths.js";
+import { resolveAgentEmptyWorkspaceSourceDir, resolveDefaultAgentWorkspaceDir } from "../home-paths.js";
 import {
   applyPersistedExecutionWorkspaceConfig,
   assertGitSensitiveAdapterWorkspaceValid,
@@ -18,6 +18,7 @@ import {
   buildEffectiveRunSessionConfigMetadata,
   buildEffectiveRunWorkspaceConfigMetadata,
   buildK8sRunIsolationDescriptor,
+  shouldUseRepoLessFallbackWorkspaceSource,
   buildWorkspaceConfigFreshnessOperation,
   computeK8sIsolationRetryDelayMs,
   computeSessionCompactionReason,
@@ -25,6 +26,7 @@ import {
   deriveTaskKeyWithHeartbeatFallback,
   evaluatePreferredProjectWorkspaceRealization,
   isNonPrimaryWorkspaceTarget,
+  isWorkspaceLessFallbackCwdForOtherIsolationMode,
   isK8sIsolationRetryDeferred,
   logK8sGuardDecision,
   resolveProjectPrimaryWorkspaceId,
@@ -758,6 +760,120 @@ describe("assertGitSensitiveAdapterWorkspaceValid", () => {
   });
 });
 
+// BLO-18760: which runs get the repo-less workspace-less fallback source.
+describe("shouldUseRepoLessFallbackWorkspaceSource", () => {
+  it("applies only to cloning adapters under run isolation", () => {
+    // The bug's population: claude_k8s bootstraps by cloning its resolved cwd,
+    // and only `run` isolation uses that cwd purely as a clone source.
+    expect(
+      shouldUseRepoLessFallbackWorkspaceSource({ adapterType: "claude_k8s", k8sIsolationMode: "run" }),
+    ).toBe(true);
+
+    // shared/workspace isolation launch *from* the agent home, so it must stay
+    // the persistent directory or warm-session continuity breaks.
+    for (const mode of ["shared", "workspace", null, undefined] as const) {
+      expect(
+        shouldUseRepoLessFallbackWorkspaceSource({ adapterType: "claude_k8s", k8sIsolationMode: mode }),
+      ).toBe(false);
+    }
+
+    // Adapters that do not clone their cwd are unaffected.
+    for (const adapterType of ["opencode_k8s", "codex_local", "claude_local", "", null, undefined] as const) {
+      expect(
+        shouldUseRepoLessFallbackWorkspaceSource({ adapterType, k8sIsolationMode: "run" }),
+      ).toBe(false);
+    }
+  });
+});
+
+// BLO-18760 (review follow-up): the saved-session cwd early return in
+// `resolveWorkspaceForRun` is screened only by `isUnsafeSessionWorkspaceCwd`,
+// which knows about system temp roots and nothing about isolation. The session
+// cwd is persisted per (agent, adapter, task) and replayed on every resume,
+// while isolation is decided per *run* — so without this predicate a cwd chosen
+// under one mode is silently inherited by a run in the other.
+describe("isWorkspaceLessFallbackCwdForOtherIsolationMode", () => {
+  const agentId = "blo-18760-isolation-mismatch-agent";
+  const agentHomeDir = resolveDefaultAgentWorkspaceDir(agentId);
+  const repoLessDir = resolveAgentEmptyWorkspaceSourceDir(agentId);
+  const check = (
+    sessionCwd: string | null | undefined,
+    k8sIsolationMode: "shared" | "run" | "workspace" | null | undefined,
+    adapterType: string | null | undefined = "claude_k8s",
+  ) =>
+    isWorkspaceLessFallbackCwdForOtherIsolationMode({
+      sessionCwd,
+      agentId,
+      adapterType,
+      k8sIsolationMode,
+    });
+
+  it("declines the persistent agent home when the run wants a repo-less source (shared -> run)", () => {
+    // The agent home carries a real `.git` from unrelated prior runs. Reused
+    // here it would skip the repo-less selection entirely and get the run
+    // parked by the BLO-18147 dispatch guard — re-opening the strand this
+    // change exists to close, just reached via a resumed session.
+    expect(check(agentHomeDir, "run")).toBe(true);
+  });
+
+  it("declines the repo-less source when the run wants the agent home (run -> shared)", () => {
+    // The decisive direction: a shared run would adopt empty-workspaces/<agent>
+    // as its *live* cwd and write a `.git` into it, destroying the repo-less
+    // invariant every later run-isolated launch depends on. The downstream
+    // session/workspace mismatch check fires only after executionWorkspace is
+    // realized, so it cannot prevent this inheritance.
+    for (const mode of ["shared", "workspace", null, undefined] as const) {
+      expect(check(repoLessDir, mode)).toBe(true);
+    }
+  });
+
+  it("allows each fallback dir under the mode that actually selects it", () => {
+    // Not a blanket ban on the fallback dirs — only on crossing modes.
+    expect(check(repoLessDir, "run")).toBe(false);
+    expect(check(agentHomeDir, "shared")).toBe(false);
+    expect(check(agentHomeDir, "workspace")).toBe(false);
+  });
+
+  it("leaves every other resumable cwd alone", () => {
+    // AC #3: workspace-bound issues must not regress. Project workspaces,
+    // per-run worktrees and operator branches are none of our business, and
+    // neither is another agent's fallback dir.
+    const otherAgentHome = resolveDefaultAgentWorkspaceDir("some-other-agent");
+    const otherAgentRepoLess = resolveAgentEmptyWorkspaceSourceDir("some-other-agent");
+    for (const cwd of [
+      "/paperclip/instances/default/projects/acme/checkout",
+      "/runtime-cache/paperclip-runs/run-123/workspace",
+      otherAgentHome,
+      otherAgentRepoLess,
+      "",
+      null,
+      undefined,
+    ]) {
+      for (const mode of ["run", "shared", "workspace", null] as const) {
+        expect(check(cwd, mode)).toBe(false);
+      }
+    }
+  });
+
+  it("is inert for adapters that do not take the repo-less path", () => {
+    // Non-cloning adapters never select empty-workspaces, so their saved agent
+    // home stays reusable under every mode. Their repo-less dir is still
+    // declined: nothing should ever be running live out of it.
+    for (const adapterType of ["opencode_k8s", "codex_local", "claude_local", null] as const) {
+      expect(check(agentHomeDir, "run", adapterType)).toBe(false);
+      expect(check(repoLessDir, "run", adapterType)).toBe(true);
+    }
+  });
+
+  it("normalizes paths rather than comparing raw strings", () => {
+    // A trailing slash or a `..` hop is the same directory; the screen must not
+    // be defeated by however the cwd happened to be serialized into the session.
+    expect(check(`${repoLessDir}/`, "shared")).toBe(true);
+    expect(check(path.join(repoLessDir, "..", path.basename(repoLessDir)), "shared")).toBe(true);
+    expect(check(`${agentHomeDir}/`, "run")).toBe(true);
+  });
+});
+
 describe("assertGitSensitiveAdapterWorkspaceValid rejects unsafe claude_k8s bootstrap", () => {
   const agentId = "blo-18147-test-agent";
   const fallbackCwd = resolveDefaultAgentWorkspaceDir(agentId);
@@ -799,7 +915,7 @@ describe("assertGitSensitiveAdapterWorkspaceValid rejects unsafe claude_k8s boot
     await expectWorkspaceValidationFailure(
       fallbackInput(),
       "k8s_agent_home_git_bootstrap_unsupported",
-      "Refusing to dispatch claude_k8s run isolation from the shared agent-home fallback cwd",
+      "Refusing to dispatch claude_k8s run isolation from the fallback cwd",
     );
   });
 
@@ -811,7 +927,7 @@ describe("assertGitSensitiveAdapterWorkspaceValid rejects unsafe claude_k8s boot
         resolvedWorkspace: buildResolvedWorkspace({ cwd: fallbackCwd, source: "project_primary" }),
       }),
       "k8s_agent_home_git_bootstrap_unsupported",
-      "Refusing to dispatch claude_k8s run isolation from the shared agent-home fallback cwd",
+      "Refusing to dispatch claude_k8s run isolation from the fallback cwd",
     );
   });
 
@@ -830,6 +946,102 @@ describe("assertGitSensitiveAdapterWorkspaceValid rejects unsafe claude_k8s boot
     await expect(assertGitSensitiveAdapterWorkspaceValid(fallbackInput())).resolves.toBeUndefined();
   });
 
+  // BLO-18760: the workspace-less fallback now resolves to a repo-less
+  // sibling dir instead of the persistent agent home, so the guard's cwd
+  // path-equality test no longer matches. It must keep probing that source by
+  // its "agent_home" label — otherwise the fix would silently disable the
+  // guard rather than satisfy it.
+  it("still probes the repo-less fallback source, which is not the agent-home path", async () => {
+    const emptySourceCwd = resolveAgentEmptyWorkspaceSourceDir(agentId);
+    expect(path.resolve(emptySourceCwd)).not.toBe(path.resolve(fallbackCwd));
+    // Lock the sibling invariant executably, not just "differs from": git
+    // resolves a repository by walking *up*, so nesting this under the
+    // checkout-bearing agent home would make the pod's `rev-parse --verify
+    // HEAD` succeed against the parent and silently reintroduce the clone.
+    // A later path cleanup must fail here rather than in the field.
+    expect(path.resolve(emptySourceCwd).startsWith(`${path.resolve(fallbackCwd)}${path.sep}`)).toBe(
+      false,
+    );
+    expect(path.dirname(path.resolve(emptySourceCwd))).not.toBe(path.resolve(fallbackCwd));
+    // A repo-less source is exactly the state the resolver hands over: the
+    // probe confirms not_a_checkout, so dispatch proceeds and the pod's own
+    // `rev-parse --verify HEAD` fails into its non-fatal empty-workspace
+    // branch instead of exiting 128.
+    await fs.mkdir(emptySourceCwd, { recursive: true });
+    try {
+      await expect(
+        assertGitSensitiveAdapterWorkspaceValid(
+          fallbackInput({
+            resolvedWorkspace: buildResolvedWorkspace({ cwd: emptySourceCwd, source: "agent_home" }),
+            executionWorkspace: {
+              ...buildWorkspaceValidationInput().executionWorkspace,
+              baseCwd: emptySourceCwd,
+              cwd: emptySourceCwd,
+              source: "agent_home",
+            },
+          }),
+        ),
+      ).resolves.toBeUndefined();
+
+      // ...and if that directory ever acquires a checkout, the guard must
+      // still refuse rather than hand the pod a clone source.
+      await runGit(emptySourceCwd, ["init"]);
+      await expectWorkspaceValidationFailure(
+        fallbackInput({
+          resolvedWorkspace: buildResolvedWorkspace({ cwd: emptySourceCwd, source: "agent_home" }),
+          executionWorkspace: {
+            ...buildWorkspaceValidationInput().executionWorkspace,
+            baseCwd: emptySourceCwd,
+            cwd: emptySourceCwd,
+            source: "agent_home",
+          },
+        }),
+        "k8s_agent_home_git_bootstrap_unsupported",
+        "Refusing to dispatch claude_k8s run isolation from the fallback cwd",
+      );
+    } finally {
+      await fs.rm(emptySourceCwd, { recursive: true, force: true });
+    }
+  });
+
+  // BLO-18760 follow-up: only the *first* workspace-less run carries
+  // source="agent_home". That cwd is persisted into the task session, so every
+  // resume resolves the identical directory back as source="task_session".
+  // Gating the probe on the label alone would cover run 1 and skip runs 2..n,
+  // letting a resumed run hand claude_k8s a clone source that had since
+  // acquired a `.git` — the exact fail-closed invariant BLO-18147 established.
+  it("still probes the repo-less fallback source when a resumed run relabels it task_session", async () => {
+    const emptySourceCwd = resolveAgentEmptyWorkspaceSourceDir(agentId);
+    const resumedInput = () =>
+      fallbackInput({
+        resolvedWorkspace: buildResolvedWorkspace({ cwd: emptySourceCwd, source: "task_session" }),
+        executionWorkspace: {
+          ...buildWorkspaceValidationInput().executionWorkspace,
+          baseCwd: emptySourceCwd,
+          cwd: emptySourceCwd,
+          source: "task_session",
+        },
+      });
+
+    await fs.mkdir(emptySourceCwd, { recursive: true });
+    try {
+      // Still clean on resume: the probe confirms not_a_checkout and the run
+      // proceeds, so this guard does not park otherwise-healthy resumptions.
+      await expect(assertGitSensitiveAdapterWorkspaceValid(resumedInput())).resolves.toBeUndefined();
+
+      // ...but once it acquires a checkout the resumed run must be refused too,
+      // not just the first one.
+      await runGit(emptySourceCwd, ["init"]);
+      await expectWorkspaceValidationFailure(
+        resumedInput(),
+        "k8s_agent_home_git_bootstrap_unsupported",
+        "Refusing to dispatch claude_k8s run isolation from the fallback cwd",
+      );
+    } finally {
+      await fs.rm(emptySourceCwd, { recursive: true, force: true });
+    }
+  });
+
   it("rejects when the git checkout probe fails indeterminately instead of confirming a non-checkout", async () => {
     await fs.mkdir(path.dirname(fallbackCwd), { recursive: true });
     // A regular file at the fallback cwd path makes the "git rev-parse" probe
@@ -841,7 +1053,7 @@ describe("assertGitSensitiveAdapterWorkspaceValid rejects unsafe claude_k8s boot
     await expectWorkspaceValidationFailure(
       fallbackInput(),
       "k8s_agent_home_git_bootstrap_unsupported",
-      "Refusing to dispatch claude_k8s run isolation from the shared agent-home fallback cwd",
+      "Refusing to dispatch claude_k8s run isolation from the fallback cwd",
     );
   });
 
@@ -859,7 +1071,7 @@ describe("assertGitSensitiveAdapterWorkspaceValid rejects unsafe claude_k8s boot
       await expectWorkspaceValidationFailure(
         fallbackInput(),
         "k8s_agent_home_git_bootstrap_unsupported",
-        "Refusing to dispatch claude_k8s run isolation from the shared agent-home fallback cwd",
+        "Refusing to dispatch claude_k8s run isolation from the fallback cwd",
       );
       expect(Date.now() - startedAt).toBeLessThan(1_500);
     } finally {
@@ -882,7 +1094,7 @@ describe("assertGitSensitiveAdapterWorkspaceValid rejects unsafe claude_k8s boot
       await expectWorkspaceValidationFailure(
         fallbackInput(),
         "k8s_agent_home_git_bootstrap_unsupported",
-        "Refusing to dispatch claude_k8s run isolation from the shared agent-home fallback cwd",
+        "Refusing to dispatch claude_k8s run isolation from the fallback cwd",
       );
     } finally {
       if (previousPath === undefined) delete process.env.PATH;

@@ -51,9 +51,9 @@ Configured per-instance via the host's plugin settings UI. Schema lives in
 
 | Key                  | Type    | Required | Notes |
 |----------------------|---------|----------|-------|
-| `defaultCompanyId`   | string  | yes      | Company that receives alerts when no routing label is set. |
-| `webhookTokenRef`    | secret-ref | recommended | Static bearer token. AM sends `Authorization: Bearer <token>`. |
-| `webhookToken`       | string  | dev only | Inline token; use `webhookTokenRef` in production. |
+| `defaultCompanyId`   | string  | no       | Company that receives alerts when no routing label is set. Defaults to the delivering company; must match it when set. |
+| `webhookToken`       | string  | for accepted deliveries | Static bearer token. AM sends `Authorization: Bearer <token>`. |
+| `webhookTokenRef`    | secret-ref | no       | Disabled in the worker webhook path until the host can verify secret refs before invoking public plugin code. Configured refs fail closed. |
 | `acceptOnlyLabels`   | object  | no       | Accept-only label filter, e.g. `{ paperclip: "true" }`. |
 | `severityToPriority` | object  | no       | Override the default severity map. |
 | `autoCloseOnResolve` | boolean | no       | Defaults to true (status → cancelled). Set false for comment-only. |
@@ -83,7 +83,7 @@ route:
 
 ```yaml
 defaultCompanyId: 11111111-1111-1111-1111-111111111111
-webhookTokenRef: paperclip-alertmanager-token  # secret UUID, not the raw value
+webhookToken: "<same bearer token Alertmanager sends>"
 acceptOnlyLabels:
   paperclip: "true"
 severityToPriority:
@@ -195,15 +195,93 @@ ending in `_url` is ignored.
 
 ## Security
 
-- **Always set `webhookTokenRef` in production.** Without a token the
+- **Always set `webhookToken`.** Without a token the
   webhook endpoint rejects every request — there is no "open" mode.
+- **Do not configure `webhookTokenRef` on this build.** Secret refs require a
+  host-side verifier so invalid public requests cannot spend shared
+  secret-resolution capacity before authentication. Until that host path exists,
+  configured refs fail closed and deliveries are retried instead of accepted.
 - **IP allowlist at ingress** as defense in depth. Alertmanager pods reschedule on
   restart and their pod IP changes; allowlist the namespace's pod CIDR
   rather than per-pod IPs.
 - **mTLS is the V2 upgrade path** for stronger mutual auth (spec §11 Q4).
   Static bearer is V1 because it's the lowest-friction way to get rolling.
-- The bearer token is kept in worker memory only — never written to plugin
-  state, never logged.
+- The bearer token is read from the delivering company's config **per
+  delivery** and is never written to plugin state or logs. A config update takes
+  effect on the next request, and a restart can never leave the worker holding a
+  stale (or absent) token.
+
+### Config is resolved per delivery, per company
+
+Plugin config is company-scoped, and `setup()` has no company context — so the
+host hands every worker an **empty** bootstrap config, on single- and
+multi-company instances alike (`plugin-loader.ts`: "Workers receive an empty
+bootstrap config and must use `ctx.config.get(companyId)` at runtime"). On a
+multi-company instance you will also see:
+
+```
+plugin-loader: multiple company configs; legacy bootstrap scope disabled  {configuredCompanyCount: 3}
+```
+
+`ctx.config.get()` with no argument therefore returns `{}`. Webhook deliveries
+carry the host-selected `companyId`, and this plugin resolves both config and
+bearer token from it per request (`src/config-scope.ts`).
+
+There is deliberately **no fallback** to the `setup()` snapshot. The module
+globals are only ever populated by `onConfigChanged`, which the host fires per
+company without telling the worker which company it was — so they hold
+"whichever company saved config last". Serving that to a different company's
+delivery would check the request against the wrong tenant's bearer token and
+then file the resulting issues under the wrong tenant's `defaultCompanyId`.
+
+A company whose config cannot be read, or which has none stored, gets its
+delivery **failed** (502), not dropped. Returning normally would make the host
+record the delivery `success` and answer 200, which tells Alertmanager the alert
+was accepted and stops it retrying — so a transient config-RPC blip would
+destroy the alert rather than delay it. The one case that is still dropped is a
+delivery carrying no `companyId` at all, because no retry can supply one.
+
+The delivering company is also **authoritative over `defaultCompanyId`**. The
+host chose that tenant by matching the endpoint key, so it is an authenticated
+fact; the stored `defaultCompanyId` is an operator-typed string inside that
+tenant's own row. When the row omits it, it is filled in from the delivering
+company. When it names a *different* company, the delivery is failed rather
+than honoured — otherwise the issue calls target a tenant outside this
+invocation's scope, the host denies them, and `handleWebhook`'s per-alert catch
+swallows the denial, producing a 200 with no issue filed anywhere.
+
+### Alert state is scoped per company
+
+The per-fingerprint dedup row lives in **company** scope
+(`{scopeKind: "company", scopeId, stateKey: "alert:<fingerprint>"}` — see
+`alertStateRef` in `src/constants.ts`), keyed on the company the tracked issue is
+filed into.
+
+It used to live in `instance` scope, shared by every tenant. Alertmanager
+fingerprints are derived from alert labels, so two tenants running the same alert
+rules routinely produce the *same* fingerprint: company B's firing delivery would
+find company A's row and update/re-open A's issue instead of creating B's, and a
+B resolution would close A's issue.
+
+Rows written by an older build are read through and migrated into their owning
+company's scope on first sight, gated on the row's own `paperclipCompanyId` — so
+a row is only ever adopted by the company whose issue it actually tracks.
+
+**If you are writing another plugin, do not resolve credentials in `setup()`.**
+Doing so fails in a way that hides itself: saving config fires
+`onConfigChanged` and re-hydrates the cached value, so the fault disappears the
+moment you touch config and returns at the next worker restart with no config
+change to blame. Diagnosed in BLO-20049, where it rejected 100% of alert
+deliveries with `502 unauthorized` while the stored config was perfectly valid;
+it then recurred twice more (BLO-20467) for a combined ~3h15m of dead alerting.
+
+Known limitation: the `check-alert-escalations` sweep still reads those module
+globals, so it sweeps exactly one company — whichever saved config last — and
+stays idle after a restart until an `onConfigChanged` supplies a scope. Both are
+logged when they happen rather than failing silently. Fixing it properly needs a
+host API to enumerate a plugin's configured companies, which `PluginConfigClient`
+does not expose today (BLO-20595). Delivery is unaffected.
+
 
 ### Bearer rotation in a Kubernetes deployment
 
@@ -219,13 +297,9 @@ the old one (or vice versa):
    `monitoring/alertmanager-receivers` key `bearer-token`. AM picks up the
    change automatically on its next config reload (`POST /-/reload` if
    you want to force it).
-3. Rotate the paperclip secret-store entry referenced by
-   `webhookTokenRef`. Use the secrets REST API
-   (`POST /api/companies/:companyId/secrets/:secretId/rotate`) or, if you
-   have direct DB access and the `local_encrypted` master key, append a
-   new `company_secret_versions` row and bump
-   `company_secrets.latest_version`. Plugin worker re-resolves on next
-   webhook delivery — no restart needed.
+3. Update the plugin instance config `webhookToken` to the same new value.
+   The worker reads company config on each webhook delivery, so no worker
+   restart is required.
 4. (Defense in depth) Patch the second K8s `Secret`
    `paperclip/paperclip-alertmanager-webhook-token` so the env-driven
    `autoConfigureAlertmanagerFromEnv` bootstrap helper can re-seed a

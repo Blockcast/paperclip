@@ -144,7 +144,11 @@ import { getTelemetryClient } from "../telemetry.js";
 import { companySkillService } from "./company-skills.js";
 import { budgetService, type BudgetEnforcementScope } from "./budgets.js";
 import { secretService, type MissingRuntimeBinding } from "./secrets.js";
-import { resolveDefaultAgentWorkspaceDir, resolveManagedProjectWorkspaceDir } from "../home-paths.js";
+import {
+  resolveAgentEmptyWorkspaceSourceDir,
+  resolveDefaultAgentWorkspaceDir,
+  resolveManagedProjectWorkspaceDir,
+} from "../home-paths.js";
 import {
   buildHeartbeatRunIssueComment,
   HEARTBEAT_RUN_RESULT_OUTPUT_MAX_CHARS,
@@ -665,6 +669,67 @@ const GIT_SENSITIVE_LOCAL_ADAPTER_TYPES = new Set([
 // claude_k8s only — opencode_k8s pods were observed healthy through the same
 // incident window (BLO-18145) and are not known to share this bootstrap path.
 const K8S_GIT_SENSITIVE_ADAPTER_TYPES = new Set(["claude_k8s"]);
+
+// BLO-18760: does the workspace-less fallback need a repo-less clone source?
+//
+// Only for the adapters that bootstrap by cloning their resolved cwd, and only
+// under `run` isolation — the one mode where that cwd is used *solely* as a
+// clone source (the pod's workspace/home/session/cache roots are all ephemeral
+// per-run paths). Under `shared` and `workspace` isolation the agent home is
+// the live working directory and must stay persistent, so those keep it.
+export function shouldUseRepoLessFallbackWorkspaceSource(input: {
+  adapterType: string | null | undefined;
+  k8sIsolationMode: "shared" | "run" | "workspace" | null | undefined;
+}): boolean {
+  const adapterType = readNonEmptyString(input.adapterType);
+  if (!adapterType) return false;
+  return K8S_GIT_SENSITIVE_ADAPTER_TYPES.has(adapterType) && input.k8sIsolationMode === "run";
+}
+
+// BLO-18760 (review follow-up): is a saved session cwd the workspace-less
+// fallback dir belonging to the *other* k8s isolation mode?
+//
+// The session cwd is persisted per (agent, adapter, task) and replayed on every
+// resume, but isolation is decided per *run*. The saved-cwd early return in
+// `resolveWorkspaceForRun` is otherwise screened only by
+// `isUnsafeSessionWorkspaceCwd`, which rejects system temp roots and knows
+// nothing about isolation — so a cwd chosen under one mode is silently
+// inherited by a run in the other. Both directions break:
+//
+//   shared -> run:  the persistent agent home (carrying a real `.git` from
+//     unrelated prior runs) returns as `task_session`, the repo-less selection
+//     never runs, and the BLO-18147 dispatch guard parks the run — re-opening,
+//     via a resumed session, the exact strand BLO-18760 closes.
+//
+//   run -> shared:  a shared run adopts `empty-workspaces/<agent>` as its *live*
+//     working directory and writes a `.git` into it. That directory's
+//     repo-less-ness is an invariant introduced by BLO-18760 and is load-bearing
+//     for every later run-isolated launch, which the same guard would then park.
+//     The session/workspace mismatch check downstream fires only after
+//     `executionWorkspace` is realized, so it does not prevent the inheritance,
+//     and the breakage surfaces on a later, different run.
+//
+// Deliberately narrow: true only for the two workspace-less fallback dirs. Any
+// other resumable cwd — project workspace, per-run worktree, operator branch —
+// is left alone, so warm-session continuity for workspace-bound issues is
+// unaffected.
+export function isWorkspaceLessFallbackCwdForOtherIsolationMode(input: {
+  sessionCwd: string | null | undefined;
+  agentId: string;
+  adapterType: string | null | undefined;
+  k8sIsolationMode: "shared" | "run" | "workspace" | null | undefined;
+}): boolean {
+  const sessionCwd = readNonEmptyString(input.sessionCwd);
+  if (!sessionCwd) return false;
+  const useRepoLessFallbackSource = shouldUseRepoLessFallbackWorkspaceSource({
+    adapterType: input.adapterType,
+    k8sIsolationMode: input.k8sIsolationMode,
+  });
+  const mismatchedFallbackDir = useRepoLessFallbackSource
+    ? resolveDefaultAgentWorkspaceDir(input.agentId)
+    : resolveAgentEmptyWorkspaceSourceDir(input.agentId);
+  return sameResolvedPath(sessionCwd, mismatchedFallbackDir);
+}
 export const MAX_TURN_CONTINUATION_RETRY_REASON = "max_turns_continuation";
 export const MAX_TURN_CONTINUATION_WAKE_REASON = "max_turns_continuation_retry";
 const MAX_TURN_CONTINUATION_DEFAULT_MAX_ATTEMPTS = 2;
@@ -2232,13 +2297,38 @@ export async function assertGitSensitiveAdapterWorkspaceValid(input: {
   // claude_k8s only clones the source checkout for per-run isolation. Key the
   // invariant on that effective source path, not the resolver label: a missing
   // project cwd can retain source="project_primary" while falling back here.
+  //
+  // BLO-18760: also cover source="agent_home" by label. That fallback now
+  // resolves to a repo-less sibling dir rather than the persistent agent home,
+  // so a path-only check would silently stop probing it. Probing it is the
+  // point — the run is allowed through precisely *because* the probe confirms
+  // "not_a_checkout", so if that directory ever acquires a `.git` we park
+  // instead of handing the pod a clone source that can exit 128.
+  const cwdIsAgentHomeFallback =
+    effectiveCwd !== null && path.resolve(effectiveCwd) === path.resolve(agentFallbackCwd);
+  // BLO-18760: the repo-less fallback source is a second directory that means
+  // "this run resolved no project or session workspace". Every check keyed on
+  // the agent-home path must treat it the same way, or the new path silently
+  // escapes guards the old one was subject to.
+  const cwdIsWorkspaceLessFallback =
+    cwdIsAgentHomeFallback ||
+    sameResolvedPath(effectiveCwd, resolveAgentEmptyWorkspaceSourceDir(input.agentId));
+  // Gate on the *path*, not just the "agent_home" label, or a resumed run
+  // walks straight past this probe. Only the first workspace-less run carries
+  // source="agent_home": that cwd is then persisted into the task session, and
+  // every resume resolves it back as source="task_session" (the session branch
+  // accepts any existing dir that isUnsafeSessionWorkspaceCwd doesn't flag, and
+  // it only flags system roots). A label-only gate would therefore probe run 1
+  // and skip runs 2..n on the identical directory — so if it ever acquired a
+  // `.git`, the resumed run would hand claude_k8s the unsafe clone source this
+  // guard exists to refuse, breaking the BLO-18147 fail-closed invariant.
   if (
     K8S_GIT_SENSITIVE_ADAPTER_TYPES.has(input.adapterType) &&
     k8sIssue &&
     input.k8sRunIsolation?.isolationMode === "run" &&
     !input.resolvedWorkspace.realizationFailure &&
     effectiveCwd !== null &&
-    path.resolve(effectiveCwd) === path.resolve(agentFallbackCwd)
+    (cwdIsWorkspaceLessFallback || input.resolvedWorkspace.source === "agent_home")
   ) {
     // Deliberately not isGitCheckout(): that helper fails open (any probe
     // error -> false), which would wave a storage-layer probe failure
@@ -2248,7 +2338,7 @@ export async function assertGitSensitiveAdapterWorkspaceValid(input: {
     const gitProbeState = await probeGitCheckoutStateStrict(effectiveCwd);
     if (gitProbeState !== "not_a_checkout") {
       throw new WorkspaceValidationFailure(
-        `Issue ${k8sIssue.identifier ?? k8sIssue.id} has no usable project or session execution workspace. Refusing to dispatch ${input.adapterType} run isolation from the shared agent-home fallback cwd "${effectiveCwd}" because its in-pod git bootstrap clones locally from this checkout and can exit 128 under storage pressure. Bind a project or execution workspace to this issue before retrying.`,
+        `Issue ${k8sIssue.identifier ?? k8sIssue.id} has no usable project or session execution workspace. Refusing to dispatch ${input.adapterType} run isolation from the fallback cwd "${effectiveCwd}" because its in-pod git bootstrap clones locally from this checkout and can exit 128 under storage pressure (git probe: ${gitProbeState}). This directory is expected to contain no git repository; remove the checkout under it, or bind a project or execution workspace to this issue, before retrying.`,
         {
           workspaceValidation: {
             reason: "k8s_agent_home_git_bootstrap_unsupported",
@@ -2374,7 +2464,7 @@ export async function assertGitSensitiveAdapterWorkspaceValid(input: {
     );
   }
 
-  if (workspaceExpectation && effectiveCwd && sameResolvedPath(effectiveCwd, agentFallbackCwd)) {
+  if (workspaceExpectation && effectiveCwd && cwdIsWorkspaceLessFallback) {
     fail(
       "fallback_agent_home_cwd",
       `Issue ${issue.identifier ?? issue.id} expected a project workspace, but ${input.adapterType} would launch from agent fallback cwd "${effectiveCwd}".`,
@@ -4441,7 +4531,15 @@ export function resolveRuntimeSessionParamsForWorkspace(input: {
     };
   }
   const fallbackAgentHomeCwd = resolveDefaultAgentWorkspaceDir(agentId);
-  if (path.resolve(previousCwd) !== path.resolve(fallbackAgentHomeCwd)) {
+  // BLO-18760: a workspace-less run can now have parked its session on the
+  // repo-less fallback source instead of the agent home. Both mean "this
+  // session has no real checkout behind it", so both must rebind once a
+  // project workspace becomes available — otherwise the session stays pinned
+  // to an empty directory forever.
+  const previousCwdIsWorkspaceLessFallback =
+    path.resolve(previousCwd) === path.resolve(fallbackAgentHomeCwd) ||
+    path.resolve(previousCwd) === path.resolve(resolveAgentEmptyWorkspaceSourceDir(agentId));
+  if (!previousCwdIsWorkspaceLessFallback) {
     return {
       sessionParams: previousSessionParams,
       warning: null as string | null,
@@ -8357,8 +8455,29 @@ export interface HeartbeatServiceOptions {
       reason: string;
       resumeContinuation: boolean;
       suppressHeadRescanDemand: boolean;
+      suppressCriticalLaneHeadRescanDemand: boolean;
+      suppressRecoveryLaneHeadRescanDemand: boolean;
     },
   ) => void;
+  /** Test-only hook fired when a detached queued-dispatch pass is scheduled. */
+  onQueuedDispatchScheduledForTest?: (
+    input: {
+      agentId: string;
+      reason: string;
+      suppressCriticalLaneHeadRescanDemand: boolean;
+    },
+  ) => void;
+  /**
+   * Test-only barrier after a detached continuation is scheduled but before
+   * the scheduling pass releases the per-agent start lock.
+   */
+  afterQueuedDispatchContinuationScheduledForTest?: (
+    input: { agentId: string; reason: string },
+  ) => Promise<void> | void;
+  /** Test-only failure injection immediately before refusal status re-read. */
+  beforeQueuedDispatchRefusalStatusReadForTest?: (
+    run: typeof heartbeatRuns.$inferSelect,
+  ) => Promise<void> | void;
 }
 
 function isTruthyRuntimeEnvValue(value: string | undefined) {
@@ -10386,7 +10505,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     agent: typeof agents.$inferSelect,
     context: Record<string, unknown>,
     previousSessionParams: Record<string, unknown> | null,
-    opts?: { useProjectWorkspace?: boolean | null },
+    opts?: { useProjectWorkspace?: boolean | null; k8sIsolationMode?: "shared" | "run" | "workspace" | null },
   ): Promise<ResolvedWorkspaceForRun> {
     const issueId = readNonEmptyString(context.issueId) ?? readNonEmptyString(context.taskId);
     const contextProjectId = readNonEmptyString(context.projectId);
@@ -10597,9 +10716,33 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
     }
 
+    // BLO-18760: which workspace-less fallback dir does *this* run want? Decided
+    // before the saved-session early return below, because that return has to be
+    // screened against it — see the isolation-mismatch check.
+    const useRepoLessFallbackSource = shouldUseRepoLessFallbackWorkspaceSource({
+      adapterType: agent.adapterType,
+      k8sIsolationMode: opts?.k8sIsolationMode ?? null,
+    });
+    const agentHomeFallbackDir = resolveDefaultAgentWorkspaceDir(agent.id);
+    const repoLessFallbackDir = resolveAgentEmptyWorkspaceSourceDir(agent.id);
+
     const sessionCwd = readNonEmptyString(previousSessionParams?.cwd);
     const sessionCwdLooksUnsafe = isUnsafeSessionWorkspaceCwd(sessionCwd);
-    if (sessionCwd && !sessionCwdLooksUnsafe) {
+
+    // BLO-18760 (review follow-up): the saved-session early return below is
+    // isolation-blind — `isUnsafeSessionWorkspaceCwd` screens system temp roots
+    // only. Decline a saved cwd that is the workspace-less fallback dir of the
+    // *other* isolation mode, in both directions; see
+    // `isWorkspaceLessFallbackCwdForOtherIsolationMode` for why each direction
+    // breaks. Every other resumable cwd is untouched.
+    const sessionCwdIsMismatchedFallback = isWorkspaceLessFallbackCwdForOtherIsolationMode({
+      sessionCwd,
+      agentId: agent.id,
+      adapterType: agent.adapterType,
+      k8sIsolationMode: opts?.k8sIsolationMode ?? null,
+    });
+
+    if (sessionCwd && !sessionCwdLooksUnsafe && !sessionCwdIsMismatchedFallback) {
       const sessionCwdExists = await fs
         .stat(sessionCwd)
         .then((stats) => stats.isDirectory())
@@ -10618,24 +10761,52 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
     }
 
-    const cwd = resolveDefaultAgentWorkspaceDir(agent.id);
+    // BLO-18760: an issue with no project and no resumable session used to
+    // fall back to the persistent per-agent workspace dir. For claude_k8s
+    // under `run` isolation that directory is a *clone source*, and it has
+    // usually accumulated a real `.git` from unrelated prior runs — so the
+    // pod's `git clone --shared` bootstrap either exits 128 under cephfs
+    // pressure or is refused dispatch by the BLO-18147 guard, which parks the
+    // issue with no wake path. Hand those runs a repo-less source instead:
+    // the pod's `rev-parse --verify HEAD` then fails and its existing
+    // non-fatal `else` branch gives the run a clean empty workspace. Issues
+    // that never touch a repo now execute instead of stranding, and the
+    // guard below still probes this path rather than being bypassed.
+    //
+    // Deliberately narrow: only the adapters whose in-pod bootstrap clones
+    // (K8S_GIT_SENSITIVE_ADAPTER_TYPES) and only under `run` isolation, where
+    // the pod's home/session/workspace roots are already ephemeral per-run
+    // paths and this cwd serves *only* as the clone source. `shared` and
+    // `workspace` isolation keep the persistent agent home, so warm-session
+    // continuity is untouched.
+    const cwd = useRepoLessFallbackSource ? repoLessFallbackDir : agentHomeFallbackDir;
     await fs.mkdir(cwd, { recursive: true });
     const warnings: string[] = [];
+    const fallbackSuffix = useRepoLessFallbackSource
+      ? ` Using repo-less fallback workspace "${cwd}" for this run; it starts empty.`
+      : ` Using fallback workspace "${cwd}" for this run.`;
     if (sessionCwd && sessionCwdLooksUnsafe) {
       warnings.push(
-        `Saved session workspace "${sessionCwd}" points at a system temp root and was rejected as untrusted. Using fallback workspace "${cwd}" for this run.`,
+        `Saved session workspace "${sessionCwd}" points at a system temp root and was rejected as untrusted.${fallbackSuffix}`,
+      );
+    } else if (sessionCwd && sessionCwdIsMismatchedFallback) {
+      // Name the real cause: the directory exists and is readable, we declined it
+      // on purpose because it belongs to the other isolation mode.
+      warnings.push(
+        `Saved session workspace "${sessionCwd}" is the workspace-less fallback for a different k8s isolation mode ` +
+          `(this run resolves isolation as "${opts?.k8sIsolationMode ?? "unset"}") and was not reused.${fallbackSuffix}`,
       );
     } else if (sessionCwd) {
       warnings.push(
-        `Saved session workspace "${sessionCwd}" is not available. Using fallback workspace "${cwd}" for this run.`,
+        `Saved session workspace "${sessionCwd}" is not available.${fallbackSuffix}`,
       );
     } else if (resolvedProjectId) {
       warnings.push(
-        `No project workspace directory is currently available for this issue. Using fallback workspace "${cwd}" for this run.`,
+        `No project workspace directory is currently available for this issue.${fallbackSuffix}`,
       );
     } else {
       warnings.push(
-        `No project or prior session workspace was available. Using fallback workspace "${cwd}" for this run.`,
+        `No project or prior session workspace was available.${fallbackSuffix}`,
       );
     }
     return {
@@ -17694,27 +17865,50 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * deeper than one pass may read. See the scan loop for why this has to
    * survive across passes.
    */
+  type DispatchCursor = { createdAt: string; id: string };
+  type DispatchRun = typeof heartbeatRuns.$inferSelect & {
+    dispatchCreatedAtCursor: string;
+  };
+  const dispatchRunSelection = {
+    ...getTableColumns(heartbeatRuns),
+    dispatchCreatedAtCursor: sql<string>`${heartbeatRuns.createdAt}::text`.as(
+      "dispatch_created_at_cursor",
+    ),
+  } as const;
   const dispatchResumeCursorByAgent = new Map<
     string,
-    { createdAt: Date; id: string; passes: number }
+    DispatchCursor & { passes: number }
   >();
   const dispatchHeadRescanDemandByAgent = new Set<string>();
-  const dispatchCriticalLaneCursorByAgent = new Map<
-    string,
-    { createdAt: Date; id: string }
-  >();
+  const dispatchCriticalLaneCursorByAgent = new Map<string, DispatchCursor>();
   const dispatchCriticalLaneHeadRescanDemandByAgent = new Set<string>();
+  const dispatchRecoveryLaneCursorByAgent = new Map<string, DispatchCursor>();
+  const dispatchRecoveryLaneHeadRescanDemandByAgent = new Set<string>();
+  const dispatchDeferredRunIdsByAgent = new Map<string, Set<string>>();
   const dispatchResumeCapRetryTimersByAgent = new Map<string, ReturnType<typeof setTimeout>>();
+  const dispatchAdmissionRetryTimersByAgent = new Map<string, ReturnType<typeof setTimeout>>();
 
   /** Run one more dispatch pass for `agentId`, detached from this critical section. */
   function scheduleDetachedDispatchPass(agentId: string, reason: string) {
+    options.onQueuedDispatchScheduledForTest?.({
+      agentId,
+      reason,
+      suppressCriticalLaneHeadRescanDemand: true,
+    });
     const pass = runDetachedFromAgentStartLock(() =>
       startNextQueuedRunForAgent(agentId, {
         resumeContinuation:
           reason === "resume_bounded_scan"
           || reason === "resume_bounded_scan_after_cap"
-          || reason === "resume_critical_lane",
+          || reason === "resume_critical_lane"
+          || reason === "resume_recovery_lane",
         suppressHeadRescanDemand: reason === "resume_head_rescan_after_coalesced_demand",
+        // This call is dispatcher-owned continuation work, not a new wake.
+        // If it coalesces with the pass that scheduled it, re-arming the
+        // an emergency-lane head marker makes every continuation restart from
+        // the head instead of advancing its saved cursor.
+        suppressCriticalLaneHeadRescanDemand: true,
+        suppressRecoveryLaneHeadRescanDemand: true,
         reason,
       }).catch((err) => {
         logger.error(
@@ -17744,18 +17938,49 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     dispatchResumeCapRetryTimersByAgent.set(agentId, timer);
   }
 
+  function clearDelayedAdmissionRetry(agentId: string) {
+    const timer = dispatchAdmissionRetryTimersByAgent.get(agentId);
+    if (!timer) return;
+    clearTimeout(timer);
+    dispatchAdmissionRetryTimersByAgent.delete(agentId);
+  }
+
+  function scheduleDelayedAdmissionRetry(agentId: string) {
+    if (dispatchAdmissionRetryTimersByAgent.has(agentId)) return;
+    const timer = setTimeout(() => {
+      dispatchAdmissionRetryTimersByAgent.delete(agentId);
+      dispatchDeferredRunIdsByAgent.delete(agentId);
+      scheduleDetachedDispatchPass(agentId, "retry_emergency_admission_refusal");
+    }, QUEUED_RUN_DISPATCH_RESUME_CAP_RETRY_DELAY_MS);
+    const maybeNodeTimer = timer as { unref?: () => void };
+    if (typeof maybeNodeTimer.unref === "function") maybeNodeTimer.unref();
+    dispatchAdmissionRetryTimersByAgent.set(agentId, timer);
+  }
+
   async function startNextQueuedRunForAgent(
     agentId: string,
     dispatchPassOptions: {
       resumeContinuation?: boolean;
       suppressHeadRescanDemand?: boolean;
+      suppressCriticalLaneHeadRescanDemand?: boolean;
+      suppressRecoveryLaneHeadRescanDemand?: boolean;
       reason?: string;
     } = {},
   ) {
     if (options.skipQueuedRunDispatch || dispatchStopped) return [];
-    if (dispatchPassOptions.reason !== "resume_critical_lane") {
-      dispatchCriticalLaneCursorByAgent.delete(agentId);
-      dispatchCriticalLaneHeadRescanDemandByAgent.delete(agentId);
+    if (
+      dispatchPassOptions.reason !== "resume_critical_lane"
+      && !dispatchPassOptions.suppressCriticalLaneHeadRescanDemand
+      && dispatchCriticalLaneCursorByAgent.has(agentId)
+    ) {
+      dispatchCriticalLaneHeadRescanDemandByAgent.add(agentId);
+    }
+    if (
+      dispatchPassOptions.reason !== "resume_recovery_lane"
+      && !dispatchPassOptions.suppressRecoveryLaneHeadRescanDemand
+      && dispatchRecoveryLaneCursorByAgent.has(agentId)
+    ) {
+      dispatchRecoveryLaneHeadRescanDemandByAgent.add(agentId);
     }
     if (
       !dispatchPassOptions.resumeContinuation
@@ -17916,7 +18141,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // ceiling throttles how much one pass reads instead of capping how far
       // into the queue dispatch can ever see.
       const resumeState = dispatchResumeCursorByAgent.get(agentId) ?? null;
-      let scanCursor: { createdAt: Date; id: string } | null = resumeState
+      const deferredRunIds = dispatchDeferredRunIdsByAgent.get(agentId) ?? null;
+      let scanCursor: DispatchCursor | null = resumeState
         ? { createdAt: resumeState.createdAt, id: resumeState.id }
         : null;
       let scannedBatches = 0;
@@ -17927,12 +18153,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // Annotated rather than inferred: `scanCursor` is assigned from this
         // batch's last row, so control-flow analysis would otherwise chase
         // `batch` -> `scanCursor` -> `batch` and give up with an implicit any.
-        const batch: Array<typeof heartbeatRuns.$inferSelect> = await db
-          .select()
+        const batch: DispatchRun[] = await db
+          .select(dispatchRunSelection)
           .from(heartbeatRuns)
           .where(and(
             eq(heartbeatRuns.agentId, agentId),
-            eq(heartbeatRuns.status, "queued"),
+            // Keep the partial-index predicate a SQL literal. postgres.js uses
+            // prepared statements by default; a bound status parameter can
+            // receive a generic plan that cannot imply `status = 'queued'`.
+            sql`${heartbeatRuns.status} = 'queued'`,
             cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined,
             // Keyset cursor. created_at alone is not unique (bulk wake fan-out
             // stamps identical timestamps), so the id tiebreak is what keeps
@@ -17941,7 +18170,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             // `sql` template there is no column mapper, and postgres-js rejects
             // a bare Date at bind time.
             scanCursor
-              ? sql`(${heartbeatRuns.createdAt}, ${heartbeatRuns.id}) > (${scanCursor.createdAt.toISOString()}::timestamptz, ${scanCursor.id}::uuid)`
+              ? sql`(${heartbeatRuns.createdAt}, ${heartbeatRuns.id}) > (${scanCursor.createdAt}::timestamptz, ${scanCursor.id}::uuid)`
+              : undefined,
+            deferredRunIds?.size
+              ? notInArray(heartbeatRuns.id, [...deferredRunIds])
               : undefined,
           ))
           .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
@@ -17951,7 +18183,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           break;
         }
         const lastScannedRun = batch[batch.length - 1]!;
-        scanCursor = { createdAt: lastScannedRun.createdAt, id: lastScannedRun.id };
+        scanCursor = {
+          createdAt: lastScannedRun.dispatchCreatedAtCursor,
+          id: lastScannedRun.id,
+        };
         if (batch.length < queuedRunDispatchScanLimit) scanExhausted = true;
 
         const batchIssueIds = [...new Set(
@@ -18022,6 +18257,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
 
       const queuedRunIds = new Set(queuedRuns.map((run) => run.id));
+      type EmergencyLaneCursors = {
+        critical?: DispatchCursor | null;
+        recovery?: DispatchCursor | null;
+      };
+      const emergencyLaneCursorsByRunId = new Map<string, EmergencyLaneCursors>();
+      const markEmergencyLaneRun = (
+        run: typeof heartbeatRuns.$inferSelect,
+        lane: keyof EmergencyLaneCursors,
+        resumeAfter: DispatchCursor | null,
+      ) => {
+        const lanes = emergencyLaneCursorsByRunId.get(run.id) ?? {};
+        lanes[lane] = resumeAfter;
+        emergencyLaneCursorsByRunId.set(run.id, lanes);
+      };
       /**
        * Priority lane: a `critical` or recovery-action row must be rankable
        * even when it sits outside the window this pass scanned.
@@ -18057,22 +18306,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
        */
       // Lane A — issues whose priority is `critical`.
       //
-      // Splitting this out of the OR is what makes it sargable on BOTH sides.
-      // `issues_company_priority_idx (company_id, priority)` already exists, but
-      // the combined lane's `priority = 'critical' OR <run-side recovery
-      // predicate>` made it unusable, so the planner fell back to reading the
-      // whole issue table. As its own predicate it drives from that index, and
-      // the critical issues in a company are few.
-      //
-      // The join moved to the STORED generated column `context_issue_id`
-      // (migration 0079), which `idx_heartbeat_runs_company_agent_context_issue_created`
-      // covers, so the runs side is indexed too. Note the cast direction:
-      // uuid -> text is total and safe. The tempting inverse,
-      // `issues.id = context_issue_id::uuid`, is a trap — it parses untrusted
-      // text per outer row, so one malformed `issueId` anywhere in the queue
-      // raises `invalid input syntax for type uuid` and takes dispatch down for
-      // that agent. A `~` guard in WHERE does not fix it, because nothing
-      // orders it before the join condition.
+      // Scan a bounded, indexed page of this agent's queued runs first, then
+      // resolve that page's UUID-screened issue ids by primary key. Filtering
+      // `priority = 'critical'` in a join made LIMIT bound output rather than
+      // work: when there was no critical match PostgreSQL still inspected the
+      // agent's entire queue while the strict start lock was held. This
+      // two-step shape caps every pass at SCAN_LIMIT rows and the saved keyset
+      // cursor preserves the any-depth critical-work guarantee across passes.
       const criticalLaneRows: Array<{
         run: typeof heartbeatRuns.$inferSelect;
         issue: { id: string; status: string; priority: string | null };
@@ -18094,32 +18334,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // critical rows hide a newer runnable critical row forever.
       while (criticalLaneBatches < queuedRunDispatchMaxScanBatches) {
         criticalLaneBatches += 1;
+        const batchStartCursor = criticalLaneCursor;
         const batch = await db
-          .select({
-            run: heartbeatRuns,
-            issue: {
-              id: issues.id,
-              status: issues.status,
-              priority: issues.priority,
-            },
-          })
+          .select(dispatchRunSelection)
           .from(heartbeatRuns)
-          .innerJoin(
-            issues,
-            and(
-              eq(issues.companyId, agent.companyId),
-              eq(heartbeatRuns.contextIssueId, sql`cast(${issues.id} as text)`),
-            ),
-          )
           .where(and(
             eq(heartbeatRuns.agentId, agentId),
-            eq(heartbeatRuns.status, "queued"),
+            sql`${heartbeatRuns.status} = 'queued'`,
             cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined,
             criticalLaneCursor
-              ? sql`(${heartbeatRuns.createdAt}, ${heartbeatRuns.id}) > (${criticalLaneCursor.createdAt.toISOString()}::timestamptz, ${criticalLaneCursor.id}::uuid)`
+              ? sql`(${heartbeatRuns.createdAt}, ${heartbeatRuns.id}) > (${criticalLaneCursor.createdAt}::timestamptz, ${criticalLaneCursor.id}::uuid)`
               : undefined,
-            eq(issues.priority, "critical"),
-            notInArray(issues.status, [...TERMINAL_ISSUE_STATUSES]),
+            deferredRunIds?.size
+              ? notInArray(heartbeatRuns.id, [...deferredRunIds])
+              : undefined,
           ))
           .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
           .limit(queuedRunDispatchScanLimit);
@@ -18128,37 +18356,81 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           break;
         }
 
-        criticalLaneRows.push(...batch);
         const lastCritical = batch[batch.length - 1]!;
         criticalLaneCursor = {
-          createdAt: lastCritical.run.createdAt,
-          id: lastCritical.run.id,
+          createdAt: lastCritical.dispatchCreatedAtCursor,
+          id: lastCritical.id,
         };
         if (batch.length < queuedRunDispatchScanLimit) criticalLaneExhausted = true;
 
-        const batchRuns = batch.map(({ run }) => run);
-        const batchReadiness = await listQueuedRunDependencyReadiness(agent.companyId, batchRuns);
-        for (const [issueId, readiness] of batchReadiness) dependencyReadiness.set(issueId, readiness);
-        for (const { issue } of batch) issueById.set(issue.id, issue);
-        foundReadyCritical = batchRuns.some((run) => {
+        const batchIssueIds = [...new Set(
+          batch
+            .map((run) => readNonEmptyString(parseObject(run.contextSnapshot).issueId))
+            .filter((issueId): issueId is string => Boolean(issueId && UUID_PATTERN.test(issueId))),
+        )];
+        const batchIssues = batchIssueIds.length === 0
+          ? []
+          : await db
+            .select({ id: issues.id, status: issues.status, priority: issues.priority })
+            .from(issues)
+            .where(and(
+              eq(issues.companyId, agent.companyId),
+              inArray(issues.id, batchIssueIds),
+            ));
+        const criticalIssueById = new Map(
+          batchIssues
+            .filter((issue) =>
+              issue.priority === "critical" && !TERMINAL_ISSUE_STATUSES.has(issue.status)
+            )
+            .map((issue) => [issue.id, issue]),
+        );
+        const criticalBatch = batch.flatMap((run) => {
           const issueId = readNonEmptyString(parseObject(run.contextSnapshot).issueId);
-          return Boolean(issueId && (batchReadiness.get(issueId)?.isDependencyReady ?? true));
+          const issue = issueId ? criticalIssueById.get(issueId) : null;
+          return issue ? [{ run, issue }] : [];
+        });
+        for (const { run } of criticalBatch) {
+          markEmergencyLaneRun(run, "critical", batchStartCursor);
+        }
+        criticalLaneRows.push(...criticalBatch);
+
+        const criticalRuns = criticalBatch.map(({ run }) => run);
+        const batchReadiness = await listQueuedRunDependencyReadiness(agent.companyId, criticalRuns);
+        for (const [issueId, readiness] of batchReadiness) dependencyReadiness.set(issueId, readiness);
+        for (const { issue } of criticalBatch) issueById.set(issue.id, issue);
+        // Dependency-ready is not necessarily claimable: isolation retries
+        // remain queued until their retry timestamp. Keep paging past them so
+        // a deferred head row cannot hide runnable emergency work.
+        foundReadyCritical = criticalRuns.some((run) => {
+          const snapshot = parseObject(run.contextSnapshot);
+          const issueId = readNonEmptyString(snapshot.issueId);
+          return Boolean(
+            issueId
+            && (batchReadiness.get(issueId)?.isDependencyReady ?? true)
+            && !isK8sIsolationRetryDeferred(snapshot, dispatchNow)
+          );
         });
         if (foundReadyCritical || criticalLaneExhausted) break;
       }
 
-      if (dispatchCriticalLaneHeadRescanDemandByAgent.has(agentId)) {
-        dispatchCriticalLaneCursorByAgent.delete(agentId);
-        dispatchCriticalLaneHeadRescanDemandByAgent.delete(agentId);
-        scheduleDetachedDispatchPass(agentId, "resume_critical_lane");
-        return [];
-      }
       if (!foundReadyCritical && !criticalLaneExhausted && criticalLaneCursor) {
         dispatchCriticalLaneCursorByAgent.set(agentId, criticalLaneCursor);
         scheduleDetachedDispatchPass(agentId, "resume_critical_lane");
+        await options.afterQueuedDispatchContinuationScheduledForTest?.({
+          agentId,
+          reason: "resume_critical_lane",
+        });
         return [];
       }
       dispatchCriticalLaneCursorByAgent.delete(agentId);
+      if (dispatchCriticalLaneHeadRescanDemandByAgent.delete(agentId)) {
+        scheduleDetachedDispatchPass(agentId, "resume_critical_lane");
+        await options.afterQueuedDispatchContinuationScheduledForTest?.({
+          agentId,
+          reason: "resume_critical_lane",
+        });
+        if (!foundReadyCritical) return [];
+      }
 
       // Lane B — recovery-action wakes. Recovery-ness is a property of the RUN,
       // not of the issue, so this needs no join at all: the agent's queued rows
@@ -18169,40 +18441,104 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // `LIMIT 200` applied BEFORE dispatch ranking, so more than 200 older
       // recovery rows could push a newer runnable critical row out of the lane
       // entirely — the exact priority inversion the lane exists to prevent.
-      const recoveryLaneRows = await db
-        .select()
-        .from(heartbeatRuns)
-        .where(and(
-          eq(heartbeatRuns.agentId, agentId),
-          eq(heartbeatRuns.status, "queued"),
-          cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined,
-          sql`${heartbeatRuns.contextSnapshot} ->> 'source' = 'issue_recovery_action'`,
-          sql`${heartbeatRuns.contextSnapshot} ->> 'recoveryActionId' is not null`,
-        ))
-        .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
-        .limit(queuedRunDispatchScanLimit);
-
-      const recoveryIssueIdsToLoad = new Set<string>();
-      for (const run of recoveryLaneRows) {
-        const issueId = readNonEmptyString(parseObject(run.contextSnapshot).issueId);
-        // UUID-screened in JS so a malformed id is a skipped row rather than a
-        // cast error inside the lookup.
-        if (!issueId || !UUID_PATTERN.test(issueId) || issueById.has(issueId)) continue;
-        recoveryIssueIdsToLoad.add(issueId);
+      const recoveryLaneRows: Array<typeof heartbeatRuns.$inferSelect> = [];
+      let recoveryLaneCursor = dispatchRecoveryLaneCursorByAgent.get(agentId) ?? null;
+      let recoveryLaneExhausted = false;
+      let foundReadyRecovery = false;
+      let recoveryLaneBatches = 0;
+      if (!recoveryLaneCursor) {
+        dispatchRecoveryLaneHeadRescanDemandByAgent.delete(agentId);
       }
-      if (recoveryIssueIdsToLoad.size > 0) {
-        const recoveryIssueRows = await db
-          .select({
-            id: issues.id,
-            status: issues.status,
-            priority: issues.priority,
-          })
-          .from(issues)
+
+      while (recoveryLaneBatches < queuedRunDispatchMaxScanBatches) {
+        recoveryLaneBatches += 1;
+        const batchStartCursor = recoveryLaneCursor;
+        const batch = await db
+          .select(dispatchRunSelection)
+          .from(heartbeatRuns)
           .where(and(
-            eq(issues.companyId, agent.companyId),
-            inArray(issues.id, [...recoveryIssueIdsToLoad]),
-          ));
-        for (const issueRow of recoveryIssueRows) issueById.set(issueRow.id, issueRow);
+            eq(heartbeatRuns.agentId, agentId),
+            sql`${heartbeatRuns.status} = 'queued'`,
+            cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined,
+            sql`${heartbeatRuns.contextSnapshot} ->> 'source' = 'issue_recovery_action'`,
+            sql`${heartbeatRuns.contextSnapshot} ->> 'recoveryActionId' is not null`,
+            recoveryLaneCursor
+              ? sql`(${heartbeatRuns.createdAt}, ${heartbeatRuns.id}) > (${recoveryLaneCursor.createdAt}::timestamptz, ${recoveryLaneCursor.id}::uuid)`
+              : undefined,
+            deferredRunIds?.size
+              ? notInArray(heartbeatRuns.id, [...deferredRunIds])
+              : undefined,
+          ))
+          .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
+          .limit(queuedRunDispatchScanLimit);
+        if (batch.length === 0) {
+          recoveryLaneExhausted = true;
+          break;
+        }
+        const lastRun = batch[batch.length - 1]!;
+        recoveryLaneCursor = {
+          createdAt: lastRun.dispatchCreatedAtCursor,
+          id: lastRun.id,
+        };
+        if (batch.length < queuedRunDispatchScanLimit) recoveryLaneExhausted = true;
+
+        const issueIdsToLoad = new Set<string>();
+        for (const run of batch) {
+          const issueId = readNonEmptyString(parseObject(run.contextSnapshot).issueId);
+          if (!issueId || !UUID_PATTERN.test(issueId) || issueById.has(issueId)) continue;
+          issueIdsToLoad.add(issueId);
+        }
+        if (issueIdsToLoad.size > 0) {
+          const issueRows = await db
+            .select({ id: issues.id, status: issues.status, priority: issues.priority })
+            .from(issues)
+            .where(and(
+              eq(issues.companyId, agent.companyId),
+              inArray(issues.id, [...issueIdsToLoad]),
+            ));
+          for (const issueRow of issueRows) issueById.set(issueRow.id, issueRow);
+        }
+
+        const candidates = batch.filter((run) => {
+          const issueId = readNonEmptyString(parseObject(run.contextSnapshot).issueId);
+          const issue = issueId ? issueById.get(issueId) : null;
+          return Boolean(issue && !TERMINAL_ISSUE_STATUSES.has(issue.status));
+        });
+        recoveryLaneRows.push(...candidates);
+        for (const run of candidates) {
+          markEmergencyLaneRun(run, "recovery", batchStartCursor);
+        }
+        const batchReadiness = await listQueuedRunDependencyReadiness(agent.companyId, candidates);
+        for (const [issueId, readiness] of batchReadiness) dependencyReadiness.set(issueId, readiness);
+        foundReadyRecovery = candidates.some((run) => {
+          const snapshot = parseObject(run.contextSnapshot);
+          const issueId = readNonEmptyString(snapshot.issueId);
+          return Boolean(
+            issueId
+            && (batchReadiness.get(issueId)?.isDependencyReady ?? true)
+            && !isK8sIsolationRetryDeferred(snapshot, dispatchNow)
+          );
+        });
+        if (foundReadyRecovery || recoveryLaneExhausted) break;
+      }
+
+      if (!foundReadyRecovery && !recoveryLaneExhausted && recoveryLaneCursor) {
+        dispatchRecoveryLaneCursorByAgent.set(agentId, recoveryLaneCursor);
+        scheduleDetachedDispatchPass(agentId, "resume_recovery_lane");
+        await options.afterQueuedDispatchContinuationScheduledForTest?.({
+          agentId,
+          reason: "resume_recovery_lane",
+        });
+        return [];
+      }
+      dispatchRecoveryLaneCursorByAgent.delete(agentId);
+      if (dispatchRecoveryLaneHeadRescanDemandByAgent.delete(agentId)) {
+        scheduleDetachedDispatchPass(agentId, "resume_recovery_lane");
+        await options.afterQueuedDispatchContinuationScheduledForTest?.({
+          agentId,
+          reason: "resume_recovery_lane",
+        });
+        if (!foundReadyRecovery) return [];
       }
 
       const priorityLaneRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
@@ -18331,9 +18667,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
 
       /** Settle this pass's continuation bookkeeping exactly once. */
-      const finishPassWithoutClaims = () => {
-        if (advanceOrClearResumeCursor(0)) return;
+      const finishPassWithoutClaims = (): boolean => {
+        if (advanceOrClearResumeCursor(0)) return true;
         scheduleFollowUpDispatchAfterPrune(agentId, prunedTerminalIssueRuns);
+        return prunedTerminalIssueRuns > 0;
       };
       if (prunedTerminalIssueRuns > 0) {
         logger.info(
@@ -18342,7 +18679,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         );
       }
       if (queuedRuns.length === 0) {
-        finishPassWithoutClaims();
+        if (!finishPassWithoutClaims() && dispatchDeferredRunIdsByAgent.has(agentId)) {
+          scheduleDelayedAdmissionRetry(agentId);
+        }
         return [];
       }
 
@@ -18498,31 +18837,126 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
 
       const claimedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
-      for (const queuedRun of prioritizedRuns) {
-        if (claimedRuns.length >= availableSlots) break;
-        if (dispatchStopped) break;
-        const queuedIssueId = readNonEmptyString(parseObject(queuedRun.contextSnapshot).issueId);
-        if (queuedIssueId && inFlightIssueIds.has(queuedIssueId)) {
-          // BLO-20396: only report the cancellation when this pass is the one
-          // that actually moved the row. Previously every overlapping pass
-          // logged it, which is why the same run ids appeared to be cancelled
-          // repeatedly.
-          const cancelled = await cancelQueuedRunForDuplicateDispatch(queuedRun, queuedIssueId);
-          if (cancelled) {
-            logger.info(
-              { runId: queuedRun.id, agentId, issueId: queuedIssueId },
-              "startNextQueuedRunForAgent: cancelled duplicate queued run for in-flight issue",
-            );
-          }
-          continue;
+      let scheduledEmergencyContinuationAfterRefusal = false;
+      const scheduleEmergencyContinuationForStillQueuedRun = async (
+        run: typeof heartbeatRuns.$inferSelect,
+      ) => {
+        const laneCursors = emergencyLaneCursorsByRunId.get(run.id);
+        if (!laneCursors) return false;
+        await options.beforeQueuedDispatchRefusalStatusReadForTest?.(run);
+        const current = await db
+          .select({ status: heartbeatRuns.status })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, run.id))
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (current?.status !== "queued") return false;
+
+        // A dependency-ready emergency row can still fail atomic admission
+        // without leaving the queue, e.g. an external-runtime slot conflict.
+        // Re-read from the boundary before the page containing this candidate.
+        // Dispatch ranking is intentionally independent of keyset order, so
+        // advancing to the refused run itself could skip older, lower-ranked
+        // emergency work from the same page. Exclude only the refused row while
+        // this continuation chain looks for another claim.
+        const refusedRunIds = dispatchDeferredRunIdsByAgent.get(agentId) ?? new Set<string>();
+        refusedRunIds.add(run.id);
+        dispatchDeferredRunIdsByAgent.set(agentId, refusedRunIds);
+        if (resumeState) {
+          dispatchResumeCursorByAgent.set(agentId, resumeState);
+        } else {
+          dispatchResumeCursorByAgent.delete(agentId);
         }
-        const claimed = await claimQueuedRun(queuedRun, companyAgents);
-        if (!claimed) continue;
-        claimedRuns.push(claimed);
-        if (queuedIssueId) inFlightIssueIds.add(queuedIssueId);
+        if (Object.hasOwn(laneCursors, "critical")) {
+          if (laneCursors.critical) {
+            dispatchCriticalLaneCursorByAgent.set(agentId, laneCursors.critical);
+          } else {
+            dispatchCriticalLaneCursorByAgent.delete(agentId);
+          }
+          scheduleDetachedDispatchPass(agentId, "resume_critical_lane");
+          await options.afterQueuedDispatchContinuationScheduledForTest?.({
+            agentId,
+            reason: "resume_critical_lane",
+          });
+        }
+        if (Object.hasOwn(laneCursors, "recovery")) {
+          if (laneCursors.recovery) {
+            dispatchRecoveryLaneCursorByAgent.set(agentId, laneCursors.recovery);
+          } else {
+            dispatchRecoveryLaneCursorByAgent.delete(agentId);
+          }
+          scheduleDetachedDispatchPass(agentId, "resume_recovery_lane");
+          await options.afterQueuedDispatchContinuationScheduledForTest?.({
+            agentId,
+            reason: "resume_recovery_lane",
+          });
+        }
+        return Object.hasOwn(laneCursors, "critical") || Object.hasOwn(laneCursors, "recovery");
+      };
+      let claimedRunsLaunched = false;
+      const launchClaimedRuns = () => {
+        if (claimedRunsLaunched) return;
+        claimedRunsLaunched = true;
+        for (const claimedRun of claimedRuns) {
+          // BLO-20396: detach from the start-lock context. executeRun is launched
+          // here but outlives the critical section, and on completion it calls
+          // startNextQueuedRunForAgent again to pick up the next queued run. If
+          // it inherited this pass's held-agent set that follow-up dispatch would
+          // look re-entrant and be coalesced away, stalling the queue.
+          const execution = runDetachedFromAgentStartLock(() =>
+            executeRun(claimedRun.id).catch((err) => {
+              logger.error({ err, runId: claimedRun.id }, "queued heartbeat execution failed");
+            }));
+          inFlightExecutions.add(execution);
+          void execution.finally(() => {
+            inFlightExecutions.delete(execution);
+          });
+        }
+      };
+      try {
+        for (const queuedRun of prioritizedRuns) {
+          if (claimedRuns.length >= availableSlots) break;
+          if (dispatchStopped) break;
+          const queuedIssueId = readNonEmptyString(parseObject(queuedRun.contextSnapshot).issueId);
+          if (queuedIssueId && inFlightIssueIds.has(queuedIssueId)) {
+            // BLO-20396: only report the cancellation when this pass is the one
+            // that actually moved the row. Previously every overlapping pass
+            // logged it, which is why the same run ids appeared to be cancelled
+            // repeatedly.
+            const cancelled = await cancelQueuedRunForDuplicateDispatch(queuedRun, queuedIssueId);
+            if (cancelled) {
+              logger.info(
+                { runId: queuedRun.id, agentId, issueId: queuedIssueId },
+                "startNextQueuedRunForAgent: cancelled duplicate queued run for in-flight issue",
+              );
+            }
+            continue;
+          }
+          const claimed = await claimQueuedRun(queuedRun, companyAgents);
+          if (!claimed) {
+            if (await scheduleEmergencyContinuationForStillQueuedRun(queuedRun)) {
+              scheduledEmergencyContinuationAfterRefusal = true;
+              break;
+            }
+            continue;
+          }
+          claimedRuns.push(claimed);
+          if (queuedIssueId) inFlightIssueIds.add(queuedIssueId);
+        }
+      } catch (err) {
+        launchClaimedRuns();
+        throw err;
+      }
+      if (scheduledEmergencyContinuationAfterRefusal) {
+        if (claimedRuns.length > 0) {
+          launchClaimedRuns();
+        }
+        return claimedRuns;
       }
       if (claimedRuns.length === 0) {
-        finishPassWithoutClaims();
+        if (!finishPassWithoutClaims() && dispatchDeferredRunIdsByAgent.has(agentId)) {
+          scheduleDelayedAdmissionRetry(agentId);
+        }
         return [];
       }
       // Settle continuation bookkeeping for a pass that DID claim. A pass that
@@ -18530,22 +18964,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // re-triggers dispatch. A pass that filled only some of them schedules a
       // cursor continuation instead; see advanceOrClearResumeCursor.
       advanceOrClearResumeCursor(claimedRuns.length);
-
-      for (const claimedRun of claimedRuns) {
-        // BLO-20396: detach from the start-lock context. executeRun is launched
-        // here but outlives the critical section, and on completion it calls
-        // startNextQueuedRunForAgent again to pick up the next queued run. If
-        // it inherited this pass's held-agent set that follow-up dispatch would
-        // look re-entrant and be coalesced away, stalling the queue.
-        const execution = runDetachedFromAgentStartLock(() =>
-          executeRun(claimedRun.id).catch((err) => {
-            logger.error({ err, runId: claimedRun.id }, "queued heartbeat execution failed");
-          }));
-        inFlightExecutions.add(execution);
-        void execution.finally(() => {
-          inFlightExecutions.delete(execution);
-        });
-      }
+      dispatchDeferredRunIdsByAgent.delete(agentId);
+      clearDelayedAdmissionRetry(agentId);
+      launchClaimedRuns();
       return claimedRuns;
     }, {
       // BLO-20396: a nested (reap → promote → dispatch) or coalesced call does
@@ -18586,8 +19007,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           reason: dispatchPassOptions.reason ?? "direct",
           resumeContinuation: dispatchPassOptions.resumeContinuation === true,
           suppressHeadRescanDemand: dispatchPassOptions.suppressHeadRescanDemand === true,
+          suppressCriticalLaneHeadRescanDemand:
+            dispatchPassOptions.suppressCriticalLaneHeadRescanDemand === true,
+          suppressRecoveryLaneHeadRescanDemand:
+            dispatchPassOptions.suppressRecoveryLaneHeadRescanDemand === true,
         });
-        dispatchCriticalLaneHeadRescanDemandByAgent.add(agentId);
+        if (!dispatchPassOptions.suppressCriticalLaneHeadRescanDemand) {
+          dispatchCriticalLaneHeadRescanDemandByAgent.add(agentId);
+        }
+        if (!dispatchPassOptions.suppressRecoveryLaneHeadRescanDemand) {
+          dispatchRecoveryLaneHeadRescanDemandByAgent.add(agentId);
+        }
         if (!dispatchPassOptions.resumeContinuation && !dispatchPassOptions.suppressHeadRescanDemand) {
           dispatchHeadRescanDemandByAgent.add(agentId);
         }
@@ -19468,7 +19898,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           agent,
           context,
           previousSessionParams,
-          { useProjectWorkspace: requestedExecutionWorkspaceMode !== "agent_default" },
+          {
+            useProjectWorkspace: requestedExecutionWorkspaceMode !== "agent_default",
+            k8sIsolationMode: k8sIsolationIdentity?.isolationMode ?? null,
+          },
         ),
     });
     // Fail loud when the run explicitly targeted a non-primary project
