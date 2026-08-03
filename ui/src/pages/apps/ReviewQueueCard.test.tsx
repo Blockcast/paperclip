@@ -2,7 +2,8 @@
 
 import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { useEffect, useState } from "react";
+import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { queryKeys } from "@/lib/queryKeys";
 import { ReviewQueueCard } from "./ReviewQueueCard";
@@ -92,6 +93,21 @@ function buttonContaining(text: string): HTMLButtonElement | undefined {
   ) as HTMLButtonElement | undefined;
 }
 
+function ActiveEmptyReviewCountObserver() {
+  const [showReview, setShowReview] = useState(false);
+  const query = useQuery({
+    queryKey: queryKeys.tools.actionRequests("company-1", "pending"),
+    queryFn: () => listActionRequestsMock("company-1", "pending"),
+    staleTime: 30_000,
+  });
+
+  useEffect(() => {
+    if (query.isSuccess) setShowReview(true);
+  }, [query.isSuccess]);
+
+  return showReview ? <ReviewQueueCard emptyState="reassure" /> : null;
+}
+
 describe("ReviewQueueCard", () => {
   let container: HTMLDivElement;
   let root: ReturnType<typeof createRoot>;
@@ -166,5 +182,28 @@ describe("ReviewQueueCard", () => {
 
     expect(listActionRequestsMock).toHaveBeenCalledWith("company-1", "pending");
     expect(buttonContaining("Allow once")).toBeTruthy();
+  });
+
+  it("refetches on mount when another active observer has fresh empty pending data", async () => {
+    listActionRequestsMock
+      .mockResolvedValueOnce({ actionRequests: [] })
+      .mockResolvedValue({ actionRequests: [pendingRequest()] });
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 30_000 } },
+    });
+
+    root = createRoot(container);
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={client}>
+          <ActiveEmptyReviewCountObserver />
+        </QueryClientProvider>,
+      );
+    });
+
+    await vi.waitFor(() => {
+      expect(listActionRequestsMock).toHaveBeenCalledTimes(2);
+      expect(buttonContaining("Allow once")).toBeTruthy();
+    });
   });
 });

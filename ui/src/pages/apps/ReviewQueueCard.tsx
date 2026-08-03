@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, Loader2, ShieldQuestion, X } from "lucide-react";
 import type { ToolActionRequestListItem } from "@paperclipai/shared";
@@ -32,15 +32,23 @@ export function ReviewQueueCard({
   heading?: string;
 }) {
   const { selectedCompanyId } = useCompany();
+  const didRefetchOnMountForCompany = useRef<string | null>(null);
 
   const query = useQuery({
     queryKey: queryKeys.tools.actionRequests(selectedCompanyId ?? "__none__", "pending"),
     queryFn: () => toolsApi.listActionRequests(selectedCompanyId!, "pending"),
     enabled: !!selectedCompanyId,
     staleTime: 0,
-    refetchOnMount: "always",
+    refetchOnMount: false,
     refetchInterval: 20_000,
   });
+
+  useEffect(() => {
+    if (!selectedCompanyId || didRefetchOnMountForCompany.current === selectedCompanyId) return;
+    didRefetchOnMountForCompany.current = selectedCompanyId;
+    if (query.dataUpdatedAt === 0 || query.fetchStatus === "fetching") return;
+    void query.refetch();
+  }, [query.dataUpdatedAt, query.fetchStatus, query.refetch, selectedCompanyId]);
 
   const items = useMemo(() => {
     const all = query.data?.actionRequests ?? [];
