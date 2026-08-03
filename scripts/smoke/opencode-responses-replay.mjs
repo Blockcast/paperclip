@@ -211,6 +211,43 @@ const summarizeCallItems = (value, items = []) => {
   return items;
 };
 
+const createSecretScanner = (secrets) => {
+  const markers = secrets.map((secret) => Buffer.from(secret));
+  const maxSecretBytes = Math.max(...markers.map((marker) => marker.length));
+  const tails = {
+    stdout: Buffer.alloc(0),
+    stderr: Buffer.alloc(0),
+  };
+
+  return (chunk, stream) => {
+    const scanBuffer = Buffer.concat([tails[stream], chunk]);
+    tails[stream] = scanBuffer.subarray(
+      Math.max(0, scanBuffer.length - maxSecretBytes + 1),
+    );
+    return markers.some((marker) => scanBuffer.includes(marker));
+  };
+};
+
+const assertSecretScannerHandlesInterleaving = () => {
+  const splitAt = Math.floor(SECRET_SCHEMA.length / 2);
+  const firstHalf = Buffer.from(SECRET_SCHEMA.slice(0, splitAt));
+  const secondHalf = Buffer.from(SECRET_SCHEMA.slice(splitAt));
+
+  const stdoutScanner = createSecretScanner([SECRET_SCHEMA]);
+  stdoutScanner(firstHalf, "stdout");
+  stdoutScanner(Buffer.from("interleaved stderr"), "stderr");
+  if (!stdoutScanner(secondHalf, "stdout")) {
+    throw new Error("secret scanner lost stdout boundary state");
+  }
+
+  const stderrScanner = createSecretScanner([SECRET_SCHEMA]);
+  stderrScanner(firstHalf, "stderr");
+  stderrScanner(Buffer.from("interleaved stdout"), "stdout");
+  if (!stderrScanner(secondHalf, "stderr")) {
+    throw new Error("secret scanner lost stderr boundary state");
+  }
+};
+
 const runOpenCode = (binary, cwd, config, message) =>
   new Promise((resolve, reject) => {
     const child = spawn(
@@ -255,19 +292,10 @@ const runOpenCode = (binary, cwd, config, message) =>
     let totalBytes = 0;
     let overflow = false;
     let leakedSecret = false;
-    let scanTail = Buffer.alloc(0);
-    const maxSecretBytes = Math.max(
-      ...SECRET_MARKERS.map((secret) => Buffer.byteLength(secret)),
-    );
+    const scanForSecrets = createSecretScanner(SECRET_MARKERS);
     const capture = (chunk, stream) => {
       totalBytes += chunk.length;
-      const scanBuffer = Buffer.concat([scanTail, chunk]);
-      leakedSecret ||= SECRET_MARKERS.some((secret) =>
-        scanBuffer.includes(Buffer.from(secret)),
-      );
-      scanTail = scanBuffer.subarray(
-        Math.max(0, scanBuffer.length - maxSecretBytes + 1),
-      );
+      leakedSecret ||= scanForSecrets(chunk, stream);
       const remaining = MAX_CAPTURE_BYTES - capturedBytes;
       if (remaining > 0) {
         const slice = chunk.subarray(0, remaining);
@@ -409,6 +437,7 @@ const assertPersistedStateRedacted = async (root) => {
 };
 
 const main = async () => {
+  assertSecretScannerHandlesInterleaving();
   const binary = process.env.OPENCODE_REPLAY_BINARY || "opencode";
   const root = await mkdtemp(path.join(tmpdir(), "opencode-responses-replay-"));
   await Promise.all(
