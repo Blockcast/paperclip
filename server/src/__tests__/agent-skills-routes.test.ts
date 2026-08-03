@@ -902,6 +902,27 @@ describe.sequential("agent skill routes", () => {
         }),
         expect.any(Object),
       );
+      expect(mockAgentInstructionsService.materializeManagedBundle).toHaveBeenCalledWith(
+        expect.any(Object),
+        expect.objectContaining({
+          "AGENTS.md": expect.stringContaining(".github/PULL_REQUEST_TEMPLATE.md"),
+        }),
+        expect.any(Object),
+      );
+      expect(mockAgentInstructionsService.materializeManagedBundle).toHaveBeenCalledWith(
+        expect.any(Object),
+        expect.objectContaining({
+          "AGENTS.md": expect.stringContaining("- [x] I have searched GitHub for duplicate or related PRs and linked them above"),
+        }),
+        expect.any(Object),
+      );
+      expect(mockAgentInstructionsService.materializeManagedBundle).toHaveBeenCalledWith(
+        expect.any(Object),
+        expect.objectContaining({
+          "AGENTS.md": expect.stringContaining("commitperclip PR Review"),
+        }),
+        expect.any(Object),
+      );
     });
   });
 
