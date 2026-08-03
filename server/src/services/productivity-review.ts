@@ -595,6 +595,13 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
   const issuesSvc = issueService(db);
   const budgets = budgetService(db);
 
+  async function currentDatabaseTime(executor: DbOrTx) {
+    const [row] = Array.from(await executor.execute(sql<{ now: Date | string }>`
+      select clock_timestamp() as "now"
+    `)) as Array<{ now: Date | string | null }>;
+    return coerceDate(row?.now) ?? new Date();
+  }
+
   async function getCompanyIssuePrefix(companyId: string) {
     return db
       .select({ issuePrefix: companies.issuePrefix })
@@ -769,6 +776,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     generatedAt: Date;
   }): Promise<{ review: IssueRow; finalized: boolean }> {
     let createdLinearIssueId: string | null = null;
+    let preserveReservation = false;
     try {
       return await db.transaction(async (tx) => {
         await tx.execute(
@@ -798,6 +806,9 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         });
         if (allocation.createdLinearSideIssue && allocation.externalIssueId) {
           createdLinearIssueId = allocation.externalIssueId;
+        }
+        if (allocation.source === "linear") {
+          preserveReservation = true;
         }
 
         const [updated] = await tx
@@ -830,7 +841,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         return { review: updated, finalized: true };
       });
     } catch (error) {
-      if (error instanceof LinearIssueCreateUnconfirmedError) {
+      if (error instanceof LinearIssueCreateUnconfirmedError || preserveReservation) {
         throw error;
       }
       if (createdLinearIssueId) {
@@ -1078,6 +1089,11 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     return typeof attemptId === "string" ? attemptId : null;
   }
 
+  function activityAttemptSequence(details: unknown) {
+    const attemptSequence = activityDetails(details).attemptSequence;
+    return typeof attemptSequence === "number" && Number.isFinite(attemptSequence) ? attemptSequence : 0;
+  }
+
   async function latestAssignmentWakeClaimActivity(
     executor: DbOrTx,
     input: { companyId: string; issueId: string },
@@ -1102,6 +1118,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       )
       .orderBy(
         desc(activityLog.createdAt),
+        desc(sql<number>`coalesce((${activityLog.details}->>'attemptSequence')::int, 0)`),
         desc(sql<number>`case ${activityLog.action}
           when ${PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_FAILED_ACTION} then 2
           when ${PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_STARTED_ACTION} then 1
@@ -1136,13 +1153,20 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     evidence: ProductivityReviewFinishEvidence,
     wakeIdempotencyKey: string,
     attemptId?: string,
+    attemptSequence?: number,
   ) {
     return {
       source: "productivity_review.reconcile",
       sourceIssueId: evidence.sourceIssue.id,
       trigger: evidence.trigger,
       idempotencyKey: wakeIdempotencyKey,
-      ...(attemptId ? { attemptId, leaseMs: PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_CLAIM_LEASE_MS } : {}),
+      ...(attemptId
+        ? {
+            attemptId,
+            attemptSequence: attemptSequence ?? 0,
+            leaseMs: PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_CLAIM_LEASE_MS,
+          }
+        : {}),
     };
   }
 
@@ -1180,11 +1204,13 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     ownerAgentId: string;
     wakeIdempotencyKey: string;
     attemptId: string;
+    attemptSequence: number;
   }) {
     await db.transaction(async (tx) => {
       await tx.execute(
         sql`select pg_advisory_xact_lock(hashtextextended(${`productivity-review-finish:${input.review.id}`}, 0))`,
       );
+      const claimNow = await currentDatabaseTime(tx);
       const latest = await latestAssignmentWakeClaimActivity(tx, {
         companyId: input.evidence.sourceIssue.companyId,
         issueId: input.review.id,
@@ -1203,8 +1229,13 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         entityType: "issue",
         entityId: input.review.id,
         agentId: input.ownerAgentId,
-        details: assignmentWakeDetails(input.evidence, input.wakeIdempotencyKey, input.attemptId),
-        createdAt: input.evidence.generatedAt,
+        details: assignmentWakeDetails(
+          input.evidence,
+          input.wakeIdempotencyKey,
+          input.attemptId,
+          input.attemptSequence,
+        ),
+        createdAt: claimNow,
       });
     });
   }
@@ -1215,12 +1246,14 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     ownerAgentId: string;
     wakeIdempotencyKey: string;
     attemptId: string;
+    attemptSequence: number;
     wake: unknown | null;
   }) {
     return db.transaction(async (tx) => {
       await tx.execute(
         sql`select pg_advisory_xact_lock(hashtextextended(${`productivity-review-finish:${input.review.id}`}, 0))`,
       );
+      const claimNow = await currentDatabaseTime(tx);
       const wakeMarkerExists = await hasIssueActivity(tx, {
         companyId: input.evidence.sourceIssue.companyId,
         issueId: input.review.id,
@@ -1253,8 +1286,13 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           entityType: "issue",
           entityId: input.review.id,
           agentId: input.ownerAgentId,
-          details: assignmentWakeDetails(input.evidence, input.wakeIdempotencyKey, input.attemptId),
-          createdAt: input.evidence.generatedAt,
+          details: assignmentWakeDetails(
+            input.evidence,
+            input.wakeIdempotencyKey,
+            input.attemptId,
+            input.attemptSequence,
+          ),
+          createdAt: claimNow,
         });
         return false;
       }
@@ -1264,7 +1302,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         issueId: input.review.id,
         action: PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_ENQUEUED_ACTION,
         agentId: input.ownerAgentId,
-        createdAt: input.evidence.generatedAt,
+        createdAt: claimNow,
         details: assignmentWakeDetails(input.evidence, input.wakeIdempotencyKey),
       });
     });
@@ -1308,7 +1346,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         return {
           createdActivityInserted,
           assignmentWakeProcessed: false,
-          wakeClaim: null as { attemptId: string } | null,
+          wakeClaim: null as { attemptId: string; attemptSequence: number } | null,
         };
       }
 
@@ -1321,7 +1359,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         return {
           createdActivityInserted,
           assignmentWakeProcessed: false,
-          wakeClaim: null as { attemptId: string } | null,
+          wakeClaim: null as { attemptId: string; attemptSequence: number } | null,
         };
       }
 
@@ -1342,26 +1380,28 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         return {
           createdActivityInserted,
           assignmentWakeProcessed,
-          wakeClaim: null as { attemptId: string } | null,
+          wakeClaim: null as { attemptId: string; attemptSequence: number } | null,
         };
       }
 
+      const claimNow = await currentDatabaseTime(tx);
       const latest = await latestAssignmentWakeClaimActivity(tx, {
         companyId: evidence.sourceIssue.companyId,
         issueId: review.id,
       });
       if (
         latest?.action === PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_STARTED_ACTION &&
-        latest.createdAt.getTime() > Date.now() - PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_CLAIM_LEASE_MS
+        latest.createdAt.getTime() > claimNow.getTime() - PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_CLAIM_LEASE_MS
       ) {
         return {
           createdActivityInserted,
           assignmentWakeProcessed: false,
-          wakeClaim: null as { attemptId: string } | null,
+          wakeClaim: null as { attemptId: string; attemptSequence: number } | null,
         };
       }
 
       const attemptId = randomUUID();
+      const attemptSequence = activityAttemptSequence(latest?.details) + 1;
       await tx.insert(activityLog).values({
         companyId: evidence.sourceIssue.companyId,
         actorType: "system",
@@ -1370,10 +1410,10 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         entityType: "issue",
         entityId: review.id,
         agentId: ownerAgentId,
-        details: assignmentWakeDetails(evidence, wakeIdempotencyKey, attemptId),
-        createdAt: evidence.generatedAt,
+        details: assignmentWakeDetails(evidence, wakeIdempotencyKey, attemptId, attemptSequence),
+        createdAt: claimNow,
       });
-      return { createdActivityInserted, assignmentWakeProcessed: false, wakeClaim: { attemptId } };
+      return { createdActivityInserted, assignmentWakeProcessed: false, wakeClaim: { attemptId, attemptSequence } };
     });
 
     if (!claim.wakeClaim || !deps?.enqueueWakeup) {
@@ -1396,6 +1436,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         ownerAgentId,
         wakeIdempotencyKey,
         attemptId: claim.wakeClaim.attemptId,
+        attemptSequence: claim.wakeClaim.attemptSequence,
       });
       throw error;
     }
@@ -1406,6 +1447,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       ownerAgentId,
       wakeIdempotencyKey,
       attemptId: claim.wakeClaim.attemptId,
+      attemptSequence: claim.wakeClaim.attemptSequence,
       wake,
     });
 
@@ -2480,6 +2522,47 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     };
   }
 
+  async function retireTerminalSourceProductivityReviewReservation(input: {
+    review: IssueRow;
+    sourceIssue: IssueRow;
+    now: Date;
+  }) {
+    const [retired] = await db
+      .update(issues)
+      .set({ status: "done", completedAt: input.now, updatedAt: input.now })
+      .where(
+        and(
+          eq(issues.companyId, input.review.companyId),
+          eq(issues.id, input.review.id),
+          eq(issues.originKind, PRODUCTIVITY_REVIEW_ORIGIN_KIND),
+          isNull(issues.issueNumber),
+          isNull(issues.identifier),
+          notInArray(issues.status, ["done", "cancelled"]),
+        ),
+      )
+      .returning({ id: issues.id });
+    if (!retired) return false;
+
+    await logActivity(db, {
+      companyId: input.review.companyId,
+      actorType: "system",
+      actorId: "system",
+      action: "issue.productivity_review_suppressed_open_review_closed",
+      entityType: "issue",
+      entityId: input.review.id,
+      agentId: input.review.assigneeAgentId,
+      details: {
+        source: "productivity_review.reconcile",
+        sourceIssueId: input.sourceIssue.id,
+        trigger: "long_active_duration",
+        suppressedBy: "terminal_source",
+        sourceStatus: input.sourceIssue.status,
+        reservationRecovered: true,
+      },
+    });
+    return true;
+  }
+
   async function recoverStaleReservedProductivityReviews(input: {
     now: Date;
     companyId?: string;
@@ -2508,6 +2591,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       failed: 0,
       reviewIssueIds: [] as string[],
       failedIssueIds: [] as string[],
+      retiredTerminalSource: 0,
       recoveredSourceIssueIds: new Set<string>(),
     };
 
@@ -2544,6 +2628,20 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           "productivity review reservation recovery skipped: source issue disappeared",
         );
         result.existing += 1;
+        continue;
+      }
+      if (isTerminalIssueStatus(sourceIssue.status)) {
+        const retired = await retireTerminalSourceProductivityReviewReservation({
+          review,
+          sourceIssue,
+          now: input.now,
+        });
+        if (retired) {
+          result.retiredTerminalSource += 1;
+          result.reviewIssueIds.push(review.id);
+        } else {
+          result.existing += 1;
+        }
         continue;
       }
 
@@ -2745,6 +2843,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     result.created += recoveredReservations.created;
     result.existing += recoveredReservations.existing;
     result.failed += recoveredReservations.failed;
+    result.closedTerminalSourceReviews += recoveredReservations.retiredTerminalSource;
     result.reviewIssueIds.push(...recoveredReservations.reviewIssueIds);
     result.failedIssueIds.push(...recoveredReservations.failedIssueIds);
 

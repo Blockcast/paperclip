@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { and, eq, sql } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { and, eq, inArray, sql } from "drizzle-orm";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
   agentWakeupRequests,
@@ -14,6 +14,8 @@ import {
   issueComments,
   issueRelations,
   issues,
+  plugins,
+  pluginState,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -75,6 +77,8 @@ describeEmbeddedPostgres("productivity review service", () => {
   });
 
   afterEach(async () => {
+    vi.restoreAllMocks();
+    await db.delete(plugins);
     await db.execute(sql.raw(`TRUNCATE TABLE "companies" CASCADE`));
   });
 
@@ -1854,6 +1858,98 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(await countReviewActivity(reviewId, "issue.productivity_review_assignment_wake_enqueued")).toBe(1);
   });
 
+  it("preserves a Linear-backed reservation when local finalization fails after lookup", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const reservedAt = new Date(now.getTime() - 10 * 60_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt: new Date(now.getTime() - 10 * 60 * 1000),
+      monitorScheduledBy: "assignee",
+    });
+    await db
+      .update(companies)
+      .set({ identifierProvider: "linear" })
+      .where(eq(companies.id, seeded.companyId));
+    const [plugin] = await db
+      .insert(plugins)
+      .values({
+        pluginKey: "paperclip-plugin-linear",
+        packageName: "@kkroo/paperclip-plugin-linear",
+        version: "0.9.3",
+        manifestJson: {} as never,
+      })
+      .returning();
+    await db.insert(pluginState).values([
+      {
+        pluginId: plugin.id,
+        scopeKind: "instance",
+        stateKey: "oauth-team-id",
+        valueJson: "linear-team-id",
+      },
+      {
+        pluginId: plugin.id,
+        scopeKind: "instance",
+        stateKey: "oauth-token",
+        valueJson: "linear-oauth-token",
+      },
+    ]);
+    const reviewId = await insertProductivityReview({ seeded, createdAt: reservedAt });
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    fetchSpy.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          data: {
+            issue: {
+              id: reviewId,
+              identifier: "LIN-7777",
+              url: "https://linear.app/blockc/issue/LIN-7777/title-slug",
+            },
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+    await db.execute(sql`
+      alter table linear_issue_links
+      add constraint test_reject_productivity_review_linear_link
+      check (false)
+    `);
+
+    try {
+      const failed = await productivityReviewService(db).reconcileProductivityReviews({
+        now,
+        companyId: seeded.companyId,
+        thresholds: { monitorLapseServiceGraceMs: 60_000 },
+      });
+      expect(failed.failed).toBe(1);
+      const [reserved] = await db
+        .select({ id: issues.id, identifier: issues.identifier, issueNumber: issues.issueNumber })
+        .from(issues)
+        .where(eq(issues.id, reviewId));
+      expect(reserved).toMatchObject({ id: reviewId, identifier: null, issueNumber: null });
+    } finally {
+      await db.execute(sql`
+        alter table linear_issue_links
+        drop constraint test_reject_productivity_review_linear_link
+      `);
+    }
+
+    const recovered = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+    });
+    expect(recovered.created).toBe(1);
+    const [review] = await db
+      .select({ id: issues.id, identifier: issues.identifier, issueNumber: issues.issueNumber })
+      .from(issues)
+      .where(eq(issues.id, reviewId));
+    expect(review).toMatchObject({ id: reviewId, identifier: "LIN-7777", issueNumber: 7777 });
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    fetchSpy.mockRestore();
+  });
+
   it("recovers a stale reserved review only once when reconcilers race", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const reservedAt = new Date(now.getTime() - 10 * 60_000);
@@ -1979,6 +2075,22 @@ describeEmbeddedPostgres("productivity review service", () => {
       async enqueueWakeup(agentId, opts) {
         wakeups.push({ agentId, opts });
         enqueueAttempts += 1;
+        if (enqueueAttempts === 2) {
+          await db
+            .update(activityLog)
+            .set({ createdAt: now })
+            .where(
+              and(
+                eq(activityLog.companyId, seeded.companyId),
+                eq(activityLog.entityType, "issue"),
+                eq(activityLog.entityId, reviewId),
+                inArray(activityLog.action, [
+                  "issue.productivity_review_assignment_wake_started",
+                  "issue.productivity_review_assignment_wake_failed",
+                ]),
+              ),
+            );
+        }
         return enqueueAttempts === 1 ? null : { id: randomUUID() };
       },
     });
@@ -2001,6 +2113,56 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(second.created).toBe(1);
     expect(wakeups).toHaveLength(2);
     expect(await countReviewActivity(reviewId, "issue.productivity_review_created")).toBe(1);
+    expect(await countReviewActivity(reviewId, "issue.productivity_review_assignment_wake_enqueued")).toBe(1);
+  });
+
+  it("does not treat a fresh assignment wake claim as expired after a long scan", async () => {
+    const scanStartedAt = new Date(Date.now() - 10 * 60_000);
+    const createdAt = new Date(scanStartedAt.getTime() - 60_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(scanStartedAt.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt: new Date(scanStartedAt.getTime() - 10 * 60 * 1000),
+      monitorScheduledBy: "assignee",
+    });
+    const reviewId = await insertProductivityReview({
+      seeded,
+      createdAt,
+      issueNumber: 2,
+      identifier: `${seeded.issuePrefix}-2`,
+    });
+
+    const wakeups: Array<{ agentId: string; opts: unknown }> = [];
+    const firstWakeStarted = deferred();
+    const releaseFirstWake = deferred();
+    const service = productivityReviewService(db, {
+      async enqueueWakeup(agentId, opts) {
+        wakeups.push({ agentId, opts });
+        if (wakeups.length === 1) {
+          firstWakeStarted.resolve();
+          await releaseFirstWake.promise;
+        }
+        return { id: randomUUID() };
+      },
+    });
+
+    const first = service.reconcileProductivityReviews({
+      now: scanStartedAt,
+      companyId: seeded.companyId,
+      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+    });
+    await firstWakeStarted.promise;
+
+    const second = await service.reconcileProductivityReviews({
+      now: scanStartedAt,
+      companyId: seeded.companyId,
+      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+    });
+
+    expect(second.created).toBe(1);
+    expect(wakeups).toHaveLength(1);
+    releaseFirstWake.resolve();
+    await first;
     expect(await countReviewActivity(reviewId, "issue.productivity_review_assignment_wake_enqueued")).toBe(1);
   });
 
@@ -2113,7 +2275,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(await countReviewActivity(reviewId, "issue.productivity_review_assignment_wake_enqueued")).toBe(1);
   });
 
-  it("recovers a stale reserved review after its source leaves the candidate set", async () => {
+  it("retires a stale reserved review after its source becomes terminal", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const reservedAt = new Date(now.getTime() - 10 * 60_000);
     const seeded = await seedAssignedIssue({
@@ -2141,19 +2303,17 @@ describeEmbeddedPostgres("productivity review service", () => {
     });
 
     expect(result.scanned).toBe(0);
-    expect(result.created).toBe(1);
+    expect(result.created).toBe(0);
+    expect(result.closedTerminalSourceReviews).toBe(1);
     const [review] = await db
       .select()
       .from(issues)
       .where(eq(issues.id, reviewId));
-    expect(review?.identifier).toBe(`${seeded.issuePrefix}-2`);
-    expect(review?.issueNumber).toBe(2);
-    expect(wakeups).toHaveLength(1);
-    expect(wakeups[0]?.opts).toMatchObject({
-      idempotencyKey: `productivity-review-created:${reviewId}`,
-    });
-    expect(await countReviewActivity(reviewId, "issue.productivity_review_created")).toBe(1);
-    expect(await countReviewActivity(reviewId, "issue.productivity_review_assignment_wake_enqueued")).toBe(1);
+    expect(review).toMatchObject({ status: "done", identifier: null, issueNumber: null });
+    expect(wakeups).toHaveLength(0);
+    expect(await countReviewActivity(reviewId, "issue.productivity_review_created")).toBe(0);
+    expect(await countReviewActivity(reviewId, "issue.productivity_review_assignment_wake_enqueued")).toBe(0);
+    expect(await countReviewActivity(reviewId, "issue.productivity_review_suppressed_open_review_closed")).toBe(1);
   });
 
   // Negative control for BLO-21003: a monitor that lapsed well past the
