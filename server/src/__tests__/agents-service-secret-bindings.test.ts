@@ -1109,6 +1109,60 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
     expect(await countApprovalActivity(approvalId, "approval.hire_notification_delivered")).toBe(1);
   });
 
+  it("does not duplicate built-in reconciliation while the prior side effect is still running", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
+    const startedAt = new Date("2026-08-03T00:00:00.000Z");
+    vi.setSystemTime(startedAt);
+    const companyId = await seedCompany();
+    const agentId = await seedAgentRow(companyId, {
+      name: "Built-in Running Reconciliation",
+      status: "pending_approval",
+      adapterType: "codex_local",
+    });
+    const approvalId = randomUUID();
+    await db.insert(approvals).values({
+      id: approvalId,
+      companyId,
+      type: "hire_agent",
+      status: "pending",
+      requestedByUserId: "requester",
+      payload: {
+        agentId,
+        name: "Built-in Running Reconciliation",
+        role: "engineer",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        budgetMonthlyCents: 0,
+        sourceBuiltInAgentKey: "briefs",
+      },
+      updatedAt: new Date(),
+    });
+
+    const firstInsideReconciliation = deferred();
+    const releaseFirst = deferred();
+    mockEnsureBuiltInAgent.mockImplementationOnce(async () => {
+      firstInsideReconciliation.resolve();
+      await releaseFirst.promise;
+    });
+
+    const firstApproval = approvalService(db).approve(approvalId, "board-user", "Approved");
+    await firstInsideReconciliation.promise;
+
+    vi.setSystemTime(new Date(startedAt.getTime() + 5 * 60_000 + 1000));
+    await expect(
+      approvalService(db).approve(approvalId, "board-user", "Approved"),
+    ).resolves.toMatchObject({ applied: false });
+    expect(mockEnsureBuiltInAgent).toHaveBeenCalledTimes(1);
+    expect(mockNotifyHireApproved).not.toHaveBeenCalled();
+
+    releaseFirst.resolve();
+    await expect(firstApproval).resolves.toMatchObject({ applied: true });
+    expect(mockEnsureBuiltInAgent).toHaveBeenCalledTimes(1);
+    expect(mockNotifyHireApproved).toHaveBeenCalledTimes(1);
+    expect(await countApprovalActivity(approvalId, "approval.hire_reconciliation_completed")).toBe(1);
+    expect(await countApprovalActivity(approvalId, "approval.hire_notification_delivered")).toBe(1);
+  });
+
   it("fences stale built-in notification owners before delivery after renewal loss", async () => {
     vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
     const startedAt = new Date("2026-08-03T00:00:00.000Z");
@@ -1159,6 +1213,62 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
 
     releaseFirst.resolve();
     await expect(firstApproval).rejects.toThrow("Built-in hire notification claim was lost");
+    expect(mockEnsureBuiltInAgent).toHaveBeenCalledTimes(1);
+    expect(mockNotifyHireApproved).toHaveBeenCalledTimes(1);
+    expect(await countApprovalActivity(approvalId, "approval.hire_reconciliation_completed")).toBe(1);
+    expect(await countApprovalActivity(approvalId, "approval.hire_notification_delivered")).toBe(1);
+  });
+
+  it("does not duplicate built-in notification while the prior delivery is still running", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
+    const startedAt = new Date("2026-08-03T00:00:00.000Z");
+    vi.setSystemTime(startedAt);
+    const companyId = await seedCompany();
+    const agentId = await seedAgentRow(companyId, {
+      name: "Built-in Running Notification",
+      status: "pending_approval",
+      adapterType: "codex_local",
+    });
+    const approvalId = randomUUID();
+    await db.insert(approvals).values({
+      id: approvalId,
+      companyId,
+      type: "hire_agent",
+      status: "pending",
+      requestedByUserId: "requester",
+      payload: {
+        agentId,
+        name: "Built-in Running Notification",
+        role: "engineer",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        budgetMonthlyCents: 0,
+        sourceBuiltInAgentKey: "briefs",
+      },
+      updatedAt: new Date(),
+    });
+
+    mockEnsureBuiltInAgent.mockResolvedValue(undefined);
+    const firstInsideNotification = deferred();
+    const releaseFirst = deferred();
+    mockNotifyHireApproved.mockImplementationOnce(async () => {
+      firstInsideNotification.resolve();
+      await releaseFirst.promise;
+      return true;
+    });
+
+    const firstApproval = approvalService(db).approve(approvalId, "board-user", "Approved");
+    await firstInsideNotification.promise;
+
+    vi.setSystemTime(new Date(startedAt.getTime() + 5 * 60_000 + 1000));
+    await expect(
+      approvalService(db).approve(approvalId, "board-user", "Approved"),
+    ).resolves.toMatchObject({ applied: false });
+    expect(mockEnsureBuiltInAgent).toHaveBeenCalledTimes(1);
+    expect(mockNotifyHireApproved).toHaveBeenCalledTimes(1);
+
+    releaseFirst.resolve();
+    await expect(firstApproval).resolves.toMatchObject({ applied: true });
     expect(mockEnsureBuiltInAgent).toHaveBeenCalledTimes(1);
     expect(mockNotifyHireApproved).toHaveBeenCalledTimes(1);
     expect(await countApprovalActivity(approvalId, "approval.hire_reconciliation_completed")).toBe(1);
