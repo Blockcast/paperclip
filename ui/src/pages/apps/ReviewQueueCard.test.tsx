@@ -4,6 +4,7 @@ import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { queryKeys } from "@/lib/queryKeys";
 import { ReviewQueueCard } from "./ReviewQueueCard";
 
 const listActionRequestsMock = vi.hoisted(() => vi.fn());
@@ -110,8 +111,9 @@ describe("ReviewQueueCard", () => {
     vi.clearAllMocks();
   });
 
-  async function render() {
-    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  async function render(
+    client = new QueryClient({ defaultOptions: { queries: { retry: false } } }),
+  ) {
     root = createRoot(container);
     await act(async () => {
       root.render(
@@ -149,5 +151,20 @@ describe("ReviewQueueCard", () => {
       { approvalThreshold: 1 },
     );
     expect(pushToastMock).toHaveBeenCalledWith(expect.objectContaining({ title: "Always allowed" }));
+  });
+
+  it("refetches on mount when a cached empty pending queue is still fresh", async () => {
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 30_000 } },
+    });
+    client.setQueryData(queryKeys.tools.actionRequests("company-1", "pending"), {
+      actionRequests: [],
+    });
+
+    await render(client);
+    await flushReact();
+
+    expect(listActionRequestsMock).toHaveBeenCalledWith("company-1", "pending");
+    expect(buttonContaining("Allow once")).toBeTruthy();
   });
 });

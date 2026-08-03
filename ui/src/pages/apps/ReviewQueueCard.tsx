@@ -37,6 +37,8 @@ export function ReviewQueueCard({
     queryKey: queryKeys.tools.actionRequests(selectedCompanyId ?? "__none__", "pending"),
     queryFn: () => toolsApi.listActionRequests(selectedCompanyId!, "pending"),
     enabled: !!selectedCompanyId,
+    staleTime: 0,
+    refetchOnMount: "always",
     refetchInterval: 20_000,
   });
 
