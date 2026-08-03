@@ -18,7 +18,7 @@ import {
 import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
 import { budgetService } from "./budgets.js";
-import { lockIssueMonitorQueue } from "./issue-monitor-queue-lock.js";
+import { withIssueMonitorQueueLock } from "./issue-monitor-queue-lock.js";
 import { issueService } from "./issues.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import {
@@ -185,7 +185,7 @@ type ProductivityReviewServiceDeps = {
   enqueueWakeup?: EnqueueWakeup;
   beforeCreateOrUpdateReview?: (evidence: ProductivityReviewEvidence) => Promise<void> | void;
   beforeCreateReviewIssueInsert?: (evidence: ProductivityReviewEvidence) => Promise<void> | void;
-  afterFinalMonitorSuppressionRevalidation?: (evidence: ProductivityReviewEvidence) => Promise<void> | void;
+  beforeFinalMonitorSuppressionRevalidation?: (evidence: ProductivityReviewEvidence) => Promise<void> | void;
 };
 
 class MonitorSuppressedBeforeCreateError extends Error {
@@ -1180,14 +1180,8 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     now: Date,
     thresholds: ProductivityReviewThresholds,
     dbClient: DbOrTx = db,
-    opts?: { lockSource?: boolean; lockMonitorQueue?: boolean; runBacklogHook?: boolean },
+    opts?: { lockSource?: boolean; runBacklogHook?: boolean },
   ) {
-    if (opts?.lockMonitorQueue) {
-      // Coordinate with heartbeat's monitor-claim update without locking the predecessor row set.
-      // Heartbeat uses a non-blocking try-lock, so slow issue identifier providers cannot stall
-      // the scheduler behind this final create-window guard.
-      await lockIssueMonitorQueue(dbClient);
-    }
     const currentIssue = await getCurrentIssue(sourceIssue, dbClient, { forUpdate: opts?.lockSource });
     if (!currentIssue || !issueCanReceiveMonitorDispatch(currentIssue)) return null;
 
@@ -1749,6 +1743,21 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     let review: Awaited<ReturnType<typeof issuesSvc.create>>;
     try {
       await deps?.beforeCreateReviewIssueInsert?.(evidence);
+      if (evidence.trigger === "long_active_duration") {
+        await deps?.beforeFinalMonitorSuppressionRevalidation?.(evidence);
+        const monitor = await db.transaction((tx) =>
+          withIssueMonitorQueueLock(tx, () =>
+            currentPendingMonitorForReviewSuppression(
+              evidence.sourceIssue,
+              evidence.generatedAt,
+              opts.thresholds,
+              tx,
+              { lockSource: true, runBacklogHook: false },
+            ),
+          ),
+        );
+        if (monitor) throw new MonitorSuppressedBeforeCreateError(monitor);
+      }
       review = await issuesSvc.create(evidence.sourceIssue.companyId, {
         title: `Review productivity for ${evidence.sourceIssue.identifier ?? evidence.sourceIssue.title}`,
         description: buildReviewMarkdown(evidence, opts.prefix),
@@ -1764,18 +1773,6 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         originId: evidence.sourceIssue.id,
         originFingerprint: productivityReviewFingerprint(evidence.sourceIssue.id),
         requestDepth: clampIssueRequestDepth(evidence.sourceIssue.requestDepth + 1),
-        beforeSideEffects: async (tx) => {
-          if (evidence.trigger !== "long_active_duration") return;
-          const monitor = await currentPendingMonitorForReviewSuppression(
-            evidence.sourceIssue,
-            evidence.generatedAt,
-            opts.thresholds,
-            tx,
-            { lockSource: true, lockMonitorQueue: true, runBacklogHook: false },
-          );
-          if (monitor) throw new MonitorSuppressedBeforeCreateError(monitor);
-          await deps?.afterFinalMonitorSuppressionRevalidation?.(evidence);
-        },
       });
     } catch (error) {
       if (error instanceof MonitorSuppressedBeforeCreateError) {

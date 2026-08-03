@@ -1648,12 +1648,12 @@ describeEmbeddedPostgres("productivity review service", () => {
       updatedAt: new Date(seeded.createdAt.getTime() - 1_000),
     });
 
-    const finalRevalidationEntered = deferred();
+    const finalRevalidationReady = deferred();
     const releaseReviewCreation = deferred();
     const reconcile = productivityReviewService(db, {
-      async afterFinalMonitorSuppressionRevalidation(evidence) {
+      async beforeFinalMonitorSuppressionRevalidation(evidence) {
         if (evidence.sourceIssue.id !== seeded.issueId) return;
-        finalRevalidationEntered.resolve();
+        finalRevalidationReady.resolve();
         await releaseReviewCreation.promise;
       },
     }).reconcileProductivityReviews({
@@ -1666,23 +1666,24 @@ describeEmbeddedPostgres("productivity review service", () => {
       },
     });
 
-    await finalRevalidationEntered.promise;
+    await finalRevalidationReady.promise;
     const tick = await withTimeout(
       heartbeatService(db).__test_tickDueIssueMonitors(now),
       500,
       "issue monitor tick",
     );
-    expect(tick.triggered).toBe(0);
+    expect(tick.triggered).toBeGreaterThan(0);
 
     const [predecessorDuringReview] = await db
       .select({ monitorWakeRequestedAt: issues.monitorWakeRequestedAt })
       .from(issues)
       .where(eq(issues.id, predecessorId));
-    expect(predecessorDuringReview?.monitorWakeRequestedAt).toBeNull();
+    expect(predecessorDuringReview?.monitorWakeRequestedAt?.toISOString()).toBe(now.toISOString());
 
     releaseReviewCreation.resolve();
     const result = await reconcile;
-    expect(result.created).toBe(1);
+    expect(result.created).toBe(0);
+    expect(result.monitorScheduledSuppressed).toBe(1);
   });
 
   // Negative control for BLO-21003: a monitor that lapsed well past the

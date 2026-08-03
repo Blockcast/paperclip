@@ -11,6 +11,14 @@ export async function lockIssueMonitorQueue(dbClient: AdvisoryLockDb) {
   );
 }
 
+export async function withIssueMonitorQueueLock<T>(
+  dbClient: AdvisoryLockDb,
+  task: () => Promise<T>,
+) {
+  await lockIssueMonitorQueue(dbClient);
+  return task();
+}
+
 export async function tryLockIssueMonitorQueue(dbClient: AdvisoryLockDb) {
   const rows = await dbClient.execute(
     sql`select pg_try_advisory_xact_lock(hashtextextended(${ISSUE_MONITOR_QUEUE_LOCK_KEY}, 0)) as acquired`,
