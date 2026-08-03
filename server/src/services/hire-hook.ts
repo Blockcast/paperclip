@@ -50,69 +50,83 @@ export async function notifyHireApproved(
     }
   };
 
-  const row = await db
-    .select()
-    .from(agents)
-    .where(and(eq(agents.id, agentId), eq(agents.companyId, companyId)))
-    .then((rows) => rows[0] ?? null);
-
-  if (!row) {
-    logger.warn({ companyId, agentId, source, sourceId }, "hire hook: agent not found in company, skipping");
-    return false;
-  }
-
-  const adapterType = row.adapterType ?? "process";
-  const adapter = findActiveServerAdapter(adapterType);
-  const onHireApproved = adapter?.onHireApproved;
-  if (!onHireApproved) {
-    return true;
-  }
-
-  const payload: HireApprovedPayload = {
-    companyId,
-    agentId,
-    agentName: row.name,
-    adapterType,
-    source,
-    idempotencyKey: `${source}:${sourceId}`,
-    sourceId,
-    approvedAt: approvedAt.toISOString(),
-    message: HIRE_APPROVED_MESSAGE,
-  };
-
-  const adapterConfig =
-    typeof row.adapterConfig === "object" && row.adapterConfig !== null && !Array.isArray(row.adapterConfig)
-      ? (row.adapterConfig as Record<string, unknown>)
-      : {};
-
   try {
-    const result = await onHireApproved(payload, adapterConfig);
-    if (result.ok) {
-      await recordActivity("hire_hook.succeeded", { source, sourceId, adapterType });
+    const row = await db
+      .select()
+      .from(agents)
+      .where(and(eq(agents.id, agentId), eq(agents.companyId, companyId)))
+      .then((rows) => rows[0] ?? null);
+
+    if (!row) {
+      logger.warn({ companyId, agentId, source, sourceId }, "hire hook: agent not found in company, skipping");
+      return false;
+    }
+
+    const adapterType = row.adapterType ?? "process";
+    const adapter = findActiveServerAdapter(adapterType);
+    const onHireApproved = adapter?.onHireApproved;
+    if (!onHireApproved) {
       return true;
     }
 
-    logger.warn(
-      { companyId, agentId, adapterType, source, sourceId, error: result.error, detail: result.detail },
-      "hire hook: adapter returned failure",
-    );
-    await recordActivity("hire_hook.failed", {
-      source,
-      sourceId,
+    const payload: HireApprovedPayload = {
+      companyId,
+      agentId,
+      agentName: row.name,
       adapterType,
-      error: result.error,
-      detail: result.detail,
-    });
-    return false;
+      source,
+      idempotencyKey: `${source}:${sourceId}`,
+      sourceId,
+      approvedAt: approvedAt.toISOString(),
+      message: HIRE_APPROVED_MESSAGE,
+    };
+
+    const adapterConfig =
+      typeof row.adapterConfig === "object" && row.adapterConfig !== null && !Array.isArray(row.adapterConfig)
+        ? (row.adapterConfig as Record<string, unknown>)
+        : {};
+
+    try {
+      const result = await onHireApproved(payload, adapterConfig);
+      if (result.ok) {
+        await recordActivity("hire_hook.succeeded", { source, sourceId, adapterType });
+        return true;
+      }
+
+      logger.warn(
+        { companyId, agentId, adapterType, source, sourceId, error: result.error, detail: result.detail },
+        "hire hook: adapter returned failure",
+      );
+      await recordActivity("hire_hook.failed", {
+        source,
+        sourceId,
+        adapterType,
+        error: result.error,
+        detail: result.detail,
+      });
+      return false;
+    } catch (err) {
+      logger.error(
+        { err, companyId, agentId, adapterType, source, sourceId },
+        "hire hook: adapter threw",
+      );
+      await recordActivity("hire_hook.error", {
+        source,
+        sourceId,
+        adapterType,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return false;
+    }
   } catch (err) {
     logger.error(
-      { err, companyId, agentId, adapterType, source, sourceId },
-      "hire hook: adapter threw",
+      { err, companyId, agentId, source, sourceId },
+      "hire hook: failed before adapter delivery",
     );
     await recordActivity("hire_hook.error", {
       source,
       sourceId,
-      adapterType,
+      stage: "pre_delivery",
       error: err instanceof Error ? err.message : String(err),
     });
     return false;

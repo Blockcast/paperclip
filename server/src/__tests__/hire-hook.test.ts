@@ -127,6 +127,35 @@ describe("notifyHireApproved", () => {
     expect(findActiveServerAdapter).not.toHaveBeenCalled();
   });
 
+  it("reports delivery failure when the agent lookup rejects", async () => {
+    const db = {
+      select: () => ({
+        from: () => ({
+          where: () => Promise.reject(new Error("read failed")),
+        }),
+      }),
+    } as unknown as Db;
+
+    await expect(
+      notifyHireApproved(db, {
+        companyId: "c1",
+        agentId: "a1",
+        source: "approval",
+        sourceId: "ap1",
+      }),
+    ).resolves.toBe(false);
+
+    expect(findActiveServerAdapter).not.toHaveBeenCalled();
+    expect(logActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "hire_hook.error",
+        entityId: "a1",
+        details: expect.objectContaining({ source: "approval", sourceId: "ap1", stage: "pre_delivery" }),
+      }),
+    );
+  });
+
   it("does nothing when adapter has no onHireApproved", async () => {
     vi.mocked(findActiveServerAdapter).mockReturnValue({ type: "process" } as any);
 

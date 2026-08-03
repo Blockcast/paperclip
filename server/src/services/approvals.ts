@@ -145,6 +145,42 @@ export function approvalService(db: Db) {
       .then((rows) => rows[0] ?? null);
   }
 
+  async function latestBuiltInHireReconciliationActivity(
+    dbClient: Db,
+    approval: ApprovalRecord,
+  ) {
+    return dbClient
+      .select({
+        id: activityLog.id,
+        action: activityLog.action,
+        createdAt: activityLog.createdAt,
+        details: activityLog.details,
+      })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, approval.companyId),
+          inArray(activityLog.action, [
+            "approval.hire_reconciliation_started",
+            "approval.hire_reconciliation_failed",
+          ]),
+          eq(activityLog.entityType, "approval"),
+          eq(activityLog.entityId, approval.id),
+        ),
+      )
+      .orderBy(
+        desc(activityLog.createdAt),
+        desc(sql<number>`case ${activityLog.action}
+          when 'approval.hire_reconciliation_failed' then 2
+          when 'approval.hire_reconciliation_started' then 1
+          else 0
+        end`),
+        desc(activityLog.id),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+  }
+
   async function latestBuiltInHireNotificationActivity(
     dbClient: Db,
     approval: ApprovalRecord,
@@ -292,10 +328,7 @@ export function approvalService(db: Db) {
       await lockApproval(tx, approval.id);
 
       if (await hasBuiltInHireReconciliationCompleted(txDb, approval)) return null;
-      const latest = await latestApprovalActivity(txDb, approval, [
-        "approval.hire_reconciliation_started",
-        "approval.hire_reconciliation_failed",
-      ]);
+      const latest = await latestBuiltInHireReconciliationActivity(txDb, approval);
       if (
         latest?.action === "approval.hire_reconciliation_started" &&
         latest.createdAt.getTime() > Date.now() - HIRE_RECONCILIATION_CLAIM_LEASE_MS
@@ -331,10 +364,7 @@ export function approvalService(db: Db) {
     await db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
       await lockApproval(tx, approval.id);
-      const latest = await latestApprovalActivity(txDb, approval, [
-        "approval.hire_reconciliation_started",
-        "approval.hire_reconciliation_failed",
-      ]);
+      const latest = await latestBuiltInHireReconciliationActivity(txDb, approval);
       if (
         latest?.action !== "approval.hire_reconciliation_started" ||
         activityAttemptId(latest.details) !== attemptId
@@ -360,10 +390,7 @@ export function approvalService(db: Db) {
     await db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
       await lockApproval(tx, approval.id);
-      const latest = await latestApprovalActivity(txDb, approval, [
-        "approval.hire_reconciliation_started",
-        "approval.hire_reconciliation_failed",
-      ]);
+      const latest = await latestBuiltInHireReconciliationActivity(txDb, approval);
       if (
         latest?.action !== "approval.hire_reconciliation_started" ||
         activityAttemptId(latest.details) !== attemptId
@@ -500,13 +527,19 @@ export function approvalService(db: Db) {
       const claim = await claimBuiltInHireNotification(approval, agentId, payload);
       if (!claim) return;
 
-      const delivered = await notifyHireApproved(db, {
-        companyId: approval.companyId,
-        agentId,
-        source: "approval",
-        sourceId: approval.id,
-        approvedAt,
-      });
+      let delivered = false;
+      try {
+        delivered = await notifyHireApproved(db, {
+          companyId: approval.companyId,
+          agentId,
+          source: "approval",
+          sourceId: approval.id,
+          approvedAt,
+        });
+      } catch (error) {
+        await releaseBuiltInHireNotificationClaim(approval, agentId, payload, claim.attemptId);
+        throw error;
+      }
       if (!delivered) {
         await releaseBuiltInHireNotificationClaim(approval, agentId, payload, claim.attemptId);
         return;

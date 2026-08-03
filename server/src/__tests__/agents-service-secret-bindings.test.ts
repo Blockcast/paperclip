@@ -699,6 +699,70 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
     expect(mockNotifyHireApproved).toHaveBeenCalledTimes(1);
   });
 
+  it("retries reconciliation when failure shares a timestamp with its claim", async () => {
+    const companyId = await seedCompany();
+    const agentId = await seedAgentRow(companyId, {
+      name: "Built-in Same Timestamp Reconciliation",
+      status: "idle",
+      adapterType: "codex_local",
+    });
+    const approvalId = randomUUID();
+    const sameCreatedAt = new Date();
+    await db.insert(approvals).values({
+      id: approvalId,
+      companyId,
+      type: "hire_agent",
+      status: "approved",
+      requestedByUserId: "requester",
+      decidedByUserId: "board-user",
+      decidedAt: new Date(),
+      payload: {
+        agentId,
+        name: "Built-in Same Timestamp Reconciliation",
+        role: "engineer",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        budgetMonthlyCents: 0,
+        sourceBuiltInAgentKey: "briefs",
+      },
+      updatedAt: new Date(),
+    });
+    await db.insert(activityLog).values([
+      {
+        id: "00000000-0000-4000-8000-000000000020",
+        companyId,
+        actorType: "system",
+        actorId: "approval_service",
+        action: "approval.hire_reconciliation_started",
+        entityType: "approval",
+        entityId: approvalId,
+        agentId,
+        details: { attemptId: "same-timestamp", sourceBuiltInAgentKey: "briefs" },
+        createdAt: sameCreatedAt,
+      },
+      {
+        id: "00000000-0000-4000-8000-000000000010",
+        companyId,
+        actorType: "system",
+        actorId: "approval_service",
+        action: "approval.hire_reconciliation_failed",
+        entityType: "approval",
+        entityId: approvalId,
+        agentId,
+        details: { attemptId: "same-timestamp", sourceBuiltInAgentKey: "briefs" },
+        createdAt: sameCreatedAt,
+      },
+    ]);
+    mockEnsureBuiltInAgent.mockResolvedValue(undefined);
+    mockNotifyHireApproved.mockResolvedValue(true);
+
+    await expect(
+      approvalService(db).approve(approvalId, "board-user", "Approved"),
+    ).resolves.toMatchObject({ applied: false });
+    expect(mockEnsureBuiltInAgent).toHaveBeenCalledTimes(1);
+    expect(mockNotifyHireApproved).toHaveBeenCalledTimes(1);
+  });
+
   it("persists a generated built-in agent id for post-commit retries", async () => {
     const companyId = await seedCompany();
     const approvalId = randomUUID();
@@ -1032,6 +1096,66 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
       approvalService(db).approve(approvalId, "board-user", "Approved"),
     ).resolves.toMatchObject({ applied: false });
     expect(mockNotifyHireApproved).not.toHaveBeenCalled();
+  });
+
+  it("releases a notification claim when delivery throws before returning", async () => {
+    const companyId = await seedCompany();
+    const agentId = await seedAgentRow(companyId, {
+      name: "Built-in Notification Throw",
+      status: "idle",
+      adapterType: "codex_local",
+    });
+    const approvalId = randomUUID();
+    await db.insert(approvals).values({
+      id: approvalId,
+      companyId,
+      type: "hire_agent",
+      status: "approved",
+      requestedByUserId: "requester",
+      decidedByUserId: "board-user",
+      decidedAt: new Date(),
+      payload: {
+        agentId,
+        name: "Built-in Notification Throw",
+        role: "engineer",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        budgetMonthlyCents: 0,
+        sourceBuiltInAgentKey: "briefs",
+      },
+      updatedAt: new Date(),
+    });
+    await db.insert(activityLog).values({
+      companyId,
+      actorType: "system",
+      actorId: "approval_service",
+      action: "approval.hire_reconciliation_completed",
+      entityType: "approval",
+      entityId: approvalId,
+      agentId,
+      details: { sourceBuiltInAgentKey: "briefs" },
+      createdAt: new Date(Date.now() - 10 * 60_000),
+    });
+    mockEnsureBuiltInAgent.mockResolvedValue(undefined);
+    mockNotifyHireApproved
+      .mockRejectedValueOnce(new Error("injected agent read failure"))
+      .mockResolvedValueOnce(true);
+
+    await expect(
+      approvalService(db).approve(approvalId, "board-user", "Approved"),
+    ).rejects.toThrow("injected agent read failure");
+    expect(mockEnsureBuiltInAgent).not.toHaveBeenCalled();
+    expect(mockNotifyHireApproved).toHaveBeenCalledTimes(1);
+
+    await expect(
+      approvalService(db).approve(approvalId, "board-user", "Approved"),
+    ).resolves.toMatchObject({ applied: false });
+    expect(mockNotifyHireApproved).toHaveBeenCalledTimes(2);
+
+    await expect(
+      approvalService(db).approve(approvalId, "board-user", "Approved"),
+    ).resolves.toMatchObject({ applied: false });
+    expect(mockNotifyHireApproved).toHaveBeenCalledTimes(2);
   });
 
   it("does not notify before the built-in reconciliation marker is persisted", async () => {
