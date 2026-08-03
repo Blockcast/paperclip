@@ -41,6 +41,7 @@ import {
   normalizeProcessLossClassification,
   normalizeProcessLostBucket,
   normalizeWorkflowRunConclusion,
+  normalizeWorkflowRunSupersession,
   recordGithubWorkflowRunConclusion,
   recordProcessLost,
   recordProcessLostLivenessNull,
@@ -608,21 +609,39 @@ describe("recordGithubWorkflowRunConclusion (BLO-21078 mass-cancellation detecto
 
   it("accumulates repeated cancelled conclusions into the same bounded series", async () => {
     for (let i = 0; i < 4; i++) {
-      recordGithubWorkflowRunConclusion("cancelled");
+      recordGithubWorkflowRunConclusion("cancelled", "none");
     }
     const { body } = await renderMetrics();
-    expect(body).toContain(`${GITHUB_WORKFLOW_RUN_CONCLUSION_METRIC}{conclusion="cancelled"} 4`);
+    expect(body).toContain(`${GITHUB_WORKFLOW_RUN_CONCLUSION_METRIC}{conclusion="cancelled",supersession="none"} 4`);
     // Ordinary failure conclusions land on a distinct series -- this is what
     // lets the mass-cancellation alert key on "cancelled" alone without also
     // tripping on the background rate of real test failures.
-    expect(body).toContain(`${GITHUB_WORKFLOW_RUN_CONCLUSION_METRIC}{conclusion="failure"} 0`);
+    expect(body).toContain(`${GITHUB_WORKFLOW_RUN_CONCLUSION_METRIC}{conclusion="failure",supersession="none"} 0`);
   });
 
   it("collapses a conclusion outside the bounded set instead of growing cardinality", async () => {
     const label = recordGithubWorkflowRunConclusion("action_required_v2_unknown");
     expect(label).toBe(UNKNOWN_WORKFLOW_RUN_CONCLUSION);
     const { body } = await renderMetrics();
-    expect(body).toContain(`${GITHUB_WORKFLOW_RUN_CONCLUSION_METRIC}{conclusion="other"} 1`);
+    expect(body).toContain(`${GITHUB_WORKFLOW_RUN_CONCLUSION_METRIC}{conclusion="other",supersession="none"} 1`);
+  });
+
+  it("keeps a superseded cancellation on a distinct series from an unexplained one", async () => {
+    recordGithubWorkflowRunConclusion("cancelled", "superseded");
+    recordGithubWorkflowRunConclusion("cancelled", "none");
+    recordGithubWorkflowRunConclusion("cancelled", "none");
+    const { body } = await renderMetrics();
+    // The mass-cancellation alert must key on supersession="none" alone --
+    // ordinary cancel-in-progress force-push churn lands on "superseded" and
+    // must not inflate the count the alert reads.
+    expect(body).toContain(`${GITHUB_WORKFLOW_RUN_CONCLUSION_METRIC}{conclusion="cancelled",supersession="superseded"} 1`);
+    expect(body).toContain(`${GITHUB_WORKFLOW_RUN_CONCLUSION_METRIC}{conclusion="cancelled",supersession="none"} 2`);
+  });
+
+  it("normalizes an unknown supersession value to none rather than growing cardinality", () => {
+    expect(normalizeWorkflowRunSupersession("something_else")).toBe("none");
+    expect(normalizeWorkflowRunSupersession(null)).toBe("none");
+    expect(normalizeWorkflowRunSupersession("superseded")).toBe("superseded");
   });
 });
 

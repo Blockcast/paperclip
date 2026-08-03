@@ -267,40 +267,6 @@ probes:
 # routing API-to-worker requests before the worker is actually listening.
 workerProbes:
   # -- Worker liveness probe.
-  #
-  # BLO-19722 — why this is deliberately laxer than `probes.liveness` above.
-  #
-  # What `/healthz` actually measures: nothing declares this route. No handler
-  # in `server/src` matches `/healthz` (the only one in the repo belongs to the
-  # MCP gateway), so the request falls through to the SPA catch-all at
-  # `server/src/app.ts:777-787`, which synchronously returns 200 + static HTML.
-  # It therefore probes exactly one thing — "is the event loop able to service
-  # a request right now" — and says nothing about database or heartbeat health.
-  #
-  # At the previous `timeoutSeconds: 5 / periodSeconds: 30 / failureThreshold: 3`
-  # a ~90s event-loop stall was enough for kubelet to kill the pod. That is not
-  # theoretical: on 2026-07-31 `Liveness probe failed: context deadline
-  # exceeded` on `paperclip-0` was followed ~5s later by every active
-  # `agent-opencode-*` pod dying with it. A busy heartbeat pass is not a wedged
-  # process, but this probe could not tell them apart.
-  #
-  # The asymmetry with the API tier is the point. An API replica is stateless
-  # and horizontally scaled, so killing one early is cheap. The worker is a
-  # singleton supervising every in-flight agent run, so a false kill orphans
-  # all of them — the exact failure this issue exists to stop. We therefore buy
-  # stall tolerance at the cost of slower detection of a true wedge:
-  # 6 × 30s ≈ 180s before a kill, versus ~90s previously.
-  #
-  # Not fixed here: making `/healthz` un-blockable. Node runs our request
-  # handling on one thread, so any in-process endpoint is blocked by whatever
-  # blocks the loop; a genuinely independent health responder needs a worker
-  # thread (or a sidecar) and is a larger change than this issue should carry.
-  # Widening with the rationale recorded is the other branch this issue allows.
-  #
-  # Latent landmine while we are here: because `/healthz` resolves via the SPA
-  # catch-all, a build serving no `ui-dist` (`app.ts:788-790` warns and skips
-  # the catch-all) would 404 every probe and CrashLoop the worker for a reason
-  # that has nothing to do with its health.
   liveness:
     httpGet:
       path: /healthz
@@ -310,13 +276,9 @@ workerProbes:
           value: 127.0.0.1:3100
     initialDelaySeconds: 30
     periodSeconds: 30
-    timeoutSeconds: 10
-    failureThreshold: 6
+    timeoutSeconds: 5
+    failureThreshold: 3
   # -- Worker readiness probe.
-  # Readiness gates the API-to-worker Service endpoint. Keep it tighter than
-  # liveness so API callers stop routing to a worker whose event loop is not
-  # answering promptly; during a long-but-recoverable stall the pod may stay
-  # alive while temporarily leaving the Service endpoints.
   readiness:
     httpGet:
       path: /healthz

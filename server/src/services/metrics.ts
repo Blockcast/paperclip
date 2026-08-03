@@ -364,15 +364,24 @@ export function normalizeGithubSuppressionCause(cause: string | null | undefined
  * no metric surface at all, so the only way to notice it was an author
  * manually reading job conclusions.
  *
- * One increment per completed `workflow_run` webhook delivery, labeled only
- * by the bounded `conclusion` (see {@link KNOWN_WORKFLOW_RUN_CONCLUSIONS}).
- * Deliberately excludes repo/workflow name to keep cardinality fixed at
- * `KNOWN_WORKFLOW_RUN_CONCLUSIONS.length + 1` regardless of fleet growth —
- * this counter's whole job is "how many terminal runs of each kind arrived
- * recently", which `increase(...{conclusion="cancelled"}[window])` answers
- * without either label. A sustained burst of `cancelled` (as opposed to the
- * `failure` rate, which is ordinary background noise) is the alerting
- * signal — see the `PaperclipGithubWorkflowRunMassCancellation` rule.
+ * One increment per completed `workflow_run` webhook delivery, labeled by
+ * the bounded `conclusion` (see {@link KNOWN_WORKFLOW_RUN_CONCLUSIONS}) and,
+ * for `cancelled` only, `supersession`. Deliberately excludes repo/workflow
+ * name to keep cardinality fixed regardless of fleet growth — this counter's
+ * whole job is "how many terminal runs of each kind arrived recently".
+ *
+ * `supersession` exists because `cancelled` alone is not incident signal:
+ * this repo's `pr.yml` sets `concurrency.cancel-in-progress: true`, so an
+ * ordinary force-push produces the identical conclusion (BLO-21078's own
+ * investigation clocked 101 of 196 cancellations in a 2026-08-01/08-02
+ * sample as exactly this, and confirmed the "every lane dies at once, red
+ * `verify`, unexpanded matrix names" shape it produces is indistinguishable
+ * from a genuine infra kill by shape alone). `supersession="superseded"`
+ * means a newer run on the same branch already existed when this run ended
+ * — see `recordGithubWorkflowRunConclusion`'s caller in github-webhook.ts
+ * for how that is determined. The mass-cancellation alert must key on
+ * `conclusion="cancelled",supersession="none"`, not `conclusion="cancelled"`
+ * alone — see the `PaperclipGithubWorkflowRunMassCancellation` rule.
  */
 export const GITHUB_WORKFLOW_RUN_CONCLUSION_METRIC = "paperclip_github_workflow_run_conclusion_total";
 
@@ -396,6 +405,20 @@ export function normalizeWorkflowRunConclusion(conclusion: string | null | undef
   return typeof conclusion === "string" && knownWorkflowRunConclusionSet.has(conclusion)
     ? conclusion
     : UNKNOWN_WORKFLOW_RUN_CONCLUSION;
+}
+
+// Only meaningful for conclusion="cancelled" — every other conclusion always
+// records "none" (there is no supersession question to ask of a run that
+// wasn't cancelled). Two values keeps this a flat cardinality multiplier of
+// 2 rather than an open-ended label.
+export const KNOWN_WORKFLOW_RUN_SUPERSESSIONS = ["none", "superseded"] as const;
+
+const knownWorkflowRunSupersessionSet: ReadonlySet<string> = new Set(KNOWN_WORKFLOW_RUN_SUPERSESSIONS);
+
+export function normalizeWorkflowRunSupersession(supersession: string | null | undefined): string {
+  return typeof supersession === "string" && knownWorkflowRunSupersessionSet.has(supersession)
+    ? supersession
+    : "none";
 }
 
 export const KNOWN_AUTH_OPERATIONS = [
@@ -669,7 +692,7 @@ let orphanedManagedPodReaped: Counter<"adapter"> | null = null;
 let githubReviewRequestDelivery: Counter<"state" | "reason"> | null = null;
 let githubReviewRequestSuppression: Counter<"cause" | "reason"> | null = null;
 let githubReviewRequestDeadLetterUnresolved: Gauge<"reason"> | null = null;
-let githubWorkflowRunConclusion: Counter<"conclusion"> | null = null;
+let githubWorkflowRunConclusion: Counter<"conclusion" | "supersession"> | null = null;
 let authRequest: Counter<"operation" | "outcome"> | null = null;
 
 function ensureRegistry(): {
@@ -689,7 +712,7 @@ function ensureRegistry(): {
   githubReviewRequestDeliveryCounter: Counter<"state" | "reason">;
   githubReviewRequestSuppressionCounter: Counter<"cause" | "reason">;
   githubReviewRequestDeadLetterUnresolvedGauge: Gauge<"reason">;
-  githubWorkflowRunConclusionCounter: Counter<"conclusion">;
+  githubWorkflowRunConclusionCounter: Counter<"conclusion" | "supersession">;
   authRequestCounter: Counter<"operation" | "outcome">;
 } {
   if (
@@ -903,15 +926,19 @@ function ensureRegistry(): {
       name: GITHUB_WORKFLOW_RUN_CONCLUSION_METRIC,
       help:
         "Count of completed GitHub Actions workflow_run webhook deliveries, labeled by "
-        + "bounded conclusion (BLO-21078). One increment per completed run regardless of "
-        + "whether it matched a paperclip identifier. `increase(...{conclusion=\"cancelled\"}"
-        + "[window])` catches a fleet-wide mass-cancellation wave; ordinary `failure` is "
-        + "background noise and must not trip that alert.",
-      labelNames: ["conclusion"],
+        + "bounded conclusion and, for cancelled, whether a newer run on the same branch "
+        + "already superseded it (BLO-21078). One increment per completed run regardless "
+        + "of whether it matched a paperclip identifier. "
+        + "`increase(...{conclusion=\"cancelled\",supersession=\"none\"}[window])` catches a "
+        + "fleet-wide mass-cancellation wave without also tripping on ordinary "
+        + "cancel-in-progress force-push churn, which carries supersession=\"superseded\".",
+      labelNames: ["conclusion", "supersession"],
       registers: [registry],
     });
     for (const conclusion of [...KNOWN_WORKFLOW_RUN_CONCLUSIONS, UNKNOWN_WORKFLOW_RUN_CONCLUSION]) {
-      githubWorkflowRunConclusion.inc({ conclusion }, 0);
+      for (const supersession of KNOWN_WORKFLOW_RUN_SUPERSESSIONS) {
+        githubWorkflowRunConclusion.inc({ conclusion, supersession }, 0);
+      }
     }
     authRequest = new Counter({
       name: AUTH_REQUEST_METRIC,
@@ -1259,12 +1286,21 @@ export function setGithubReviewRequestDeadLetterUnresolved(byReason: Record<stri
  * Record one completed GitHub Actions `workflow_run` webhook delivery
  * (BLO-21078). Call exactly once per completed run, regardless of whether it
  * matched a paperclip identifier — the counter's job is fleet-wide visibility
- * into conclusion mix, not per-issue attribution.
+ * into conclusion mix, not per-issue attribution. `supersession` is only
+ * meaningful when `conclusion` is `"cancelled"`; pass `"none"` (or omit) for
+ * every other conclusion.
  */
-export function recordGithubWorkflowRunConclusion(conclusion: string | null | undefined): string {
-  const label = normalizeWorkflowRunConclusion(conclusion);
-  ensureRegistry().githubWorkflowRunConclusionCounter.inc({ conclusion: label });
-  return label;
+export function recordGithubWorkflowRunConclusion(
+  conclusion: string | null | undefined,
+  supersession?: string | null,
+): string {
+  const conclusionLabel = normalizeWorkflowRunConclusion(conclusion);
+  const supersessionLabel = normalizeWorkflowRunSupersession(supersession);
+  ensureRegistry().githubWorkflowRunConclusionCounter.inc({
+    conclusion: conclusionLabel,
+    supersession: supersessionLabel,
+  });
+  return conclusionLabel;
 }
 
 export function recordAuthRequest(input: {

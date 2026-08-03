@@ -1724,6 +1724,12 @@ async function assertCanManageIssueMonitor(
     executionRunId?: string | null;
   },
   monitorChanged: boolean,
+  options: {
+    // Set only by `PATCH /issues/:id`, and only once
+    // `assertAgentIssueMutationAllowed` has already allowed this mutation via
+    // `allow_productivity_review_grant` (BLO-19723). See the call site.
+    productivityReviewOwnerAuthorized?: boolean;
+  } = {},
 ) {
   if (!monitorChanged) return;
   if (req.actor.type === "board") return;
@@ -1737,7 +1743,45 @@ async function assertCanManageIssueMonitor(
   }
   if (req.actor.type === "agent" && req.actor.agentId && req.actor.agentId === issue.assigneeAgentId) return;
   if (req.actor.type === "agent" && req.actor.agentId && isCurrentIssueExecutionRun(req, issue)) return;
-  throw forbidden("Only the assignee agent or a board user can manage issue monitors");
+  // BLO-19723: this guard is a *second* gate, independent of the authorization
+  // boundary. #853 (BLO-19094) taught `authorization.ts` that an open
+  // productivity review grants its owner `issue:mutate` on the source issue,
+  // but this check never consults grants — it tests the assignee relation
+  // directly. So a reviewer cleared the boundary and then bounced off here,
+  // and re-arming a wedged monitor is the single remedy that actually resumes
+  // stalled work. Observed live on 2026-08-01 (BLO-20426): after #853 shipped,
+  // the denial changed from `deny_missing_grant` to this guard's message,
+  // which is what localized the residual gap to this function.
+  //
+  // Deliberately narrow, mirroring #853:
+  //   * opt-in per route — only `PATCH /issues/:id` passes the flag, so
+  //     monitor writes folded into issue *creation*
+  //     (`POST /companies/:companyId/issues`, `POST /issues/:id/children`,
+  //     `POST /issues/:id/accepted-plan-decompositions`) and the forced wake
+  //     `POST /issues/:id/monitor/check-now` stay closed to a reviewer.
+  //   * derived, not re-queried — the caller may only set this after
+  //     `assertAgentIssueMutationAllowed` returned `allow_productivity_review_grant`,
+  //     so the grant predicate (open review, agent-scoped, relation-scoped,
+  //     server-stamped `originId`) stays in exactly one place.
+  //   * still behind `runtime:manage` above — the review grant substitutes for
+  //     the assignee *relation*, not for the runtime capability.
+  if (options.productivityReviewOwnerAuthorized) return;
+  throw forbidden(
+    "Only the assignee agent or a board user can manage issue monitors",
+    {
+      issueAssigneeAgentId: issue.assigneeAgentId ?? null,
+      actorAgentId: req.actor.type === "agent" ? req.actor.agentId ?? null : null,
+      // AC #2 (BLO-19723): say which relations satisfy this gate rather than
+      // returning a bare 403, so a reviewer that lands here knows the review
+      // grant is honoured on `PATCH /issues/:id` and nowhere else.
+      allowedRelations: [
+        "board user",
+        "the issue's assignee agent",
+        "the agent holding the issue's current execution run",
+        "the owner of an open productivity review of this issue (PATCH /issues/:id only)",
+      ],
+    },
+  );
 }
 
 function isCurrentIssueExecutionRun(
@@ -9099,6 +9143,16 @@ export function issueRoutes(
       existing.companyId,
       existing,
       req.body.executionPolicy !== undefined && monitorChanged,
+      {
+        // BLO-19723. Set from the audit record rather than re-running the grant
+        // predicate: `productivityReviewSourceMutationAudit.current` is written
+        // by `assertAgentIssueMutationAllowed` above (line ~8852) and is
+        // non-null only when this PATCH was authorized by
+        // `allow_productivity_review_grant`. If some other allow-path matched,
+        // the reason differs, the audit stays null, and this guard keeps its
+        // pre-existing behaviour — fail-closed.
+        productivityReviewOwnerAuthorized: productivityReviewSourceMutationAudit.current !== null,
+      },
     );
 
     const requestedExecutionStageStatus = typeof updateFields.status === "string" ? updateFields.status : undefined;
