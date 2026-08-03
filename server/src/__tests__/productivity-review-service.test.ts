@@ -1516,6 +1516,90 @@ describeEmbeddedPostgres("productivity review service", () => {
     });
   });
 
+  it("guards monitor suppression before Linear identifier side effects", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const monitorNextCheckAt = new Date(now.getTime() - 10 * 60_000);
+    const monitorWakeRequestedAt = new Date(now.getTime() - 30_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt,
+      monitorScheduledBy: "assignee",
+    });
+    await db
+      .update(companies)
+      .set({ identifierProvider: "linear" })
+      .where(eq(companies.id, seeded.companyId));
+
+    const result = await productivityReviewService(db, {
+      async beforeCreateReviewIssueInsert(evidence) {
+        if (evidence.sourceIssue.id !== seeded.issueId) return;
+        await db
+          .update(issues)
+          .set({ monitorWakeRequestedAt, updatedAt: monitorWakeRequestedAt })
+          .where(eq(issues.id, seeded.issueId));
+      },
+    }).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+    });
+
+    expect(result.failed).toBe(0);
+    expect(result.created).toBe(0);
+    expect(result.monitorScheduledSuppressed).toBe(1);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  it("revalidates fresh predecessor claims before review issue insert", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const monitorNextCheckAt = new Date(now.getTime() - 10 * 60_000);
+    const predecessorClaimedAt = new Date(now.getTime() - 30_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt,
+      monitorScheduledBy: "assignee",
+    });
+    const predecessorId = randomUUID();
+    await db.insert(issues).values({
+      id: predecessorId,
+      companyId: seeded.companyId,
+      title: "Fresh predecessor in final window",
+      status: "in_review" as const,
+      priority: "medium" as const,
+      assigneeAgentId: seeded.coderId,
+      monitorNextCheckAt,
+      monitorScheduledBy: "assignee" as const,
+      issueNumber: 20,
+      identifier: `${seeded.issuePrefix}-20`,
+      createdAt: seeded.createdAt,
+      updatedAt: new Date(seeded.createdAt.getTime() - 1_000),
+    });
+
+    const result = await productivityReviewService(db, {
+      async beforeCreateReviewIssueInsert(evidence) {
+        if (evidence.sourceIssue.id !== seeded.issueId) return;
+        await db
+          .update(issues)
+          .set({ monitorWakeRequestedAt: predecessorClaimedAt, updatedAt: predecessorClaimedAt })
+          .where(eq(issues.id, predecessorId));
+      },
+    }).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: {
+        monitorLapseServiceGraceMs: 60_000,
+        monitorSchedulerIntervalMs: 60_000,
+        monitorDispatchBatchSize: 50,
+      },
+    });
+
+    expect(result.created).toBe(0);
+    expect(result.monitorScheduledSuppressed).toBe(1);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
   // Negative control for BLO-21003: a monitor that lapsed well past the
   // lapse-to-service grace window, with no pending wake, is genuinely
   // unsupervised and must still fire exactly as it does today. Without this

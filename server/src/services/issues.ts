@@ -810,7 +810,7 @@ type IssueCreateInput = Omit<typeof issues.$inferInsert, "companyId"> & {
   idempotencyKey?: string | null;
   allowDuplicate?: boolean;
   onDeduplicated?: (reason: "idempotency_key" | "recent_open_title") => void;
-  beforeInsert?: (tx: DbTransaction) => Promise<void> | void;
+  beforeSideEffects?: (tx: DbTransaction) => Promise<void> | void;
 };
 type IssueChildCreateInput = IssueCreateInput & {
   acceptanceCriteria?: string[];
@@ -7862,7 +7862,7 @@ export function issueService(db: Db) {
         idempotencyKey: rawIdempotencyKey,
         allowDuplicate,
         onDeduplicated,
-        beforeInsert,
+        beforeSideEffects,
         ...issueData
       } = data;
       const isolatedWorkspacesEnabled = (await instanceSettings.getExperimental()).enableIsolatedWorkspaces;
@@ -8186,6 +8186,7 @@ export function issueService(db: Db) {
             executionWorkspaceSettings: issueData.executionWorkspaceSettings,
           });
         }
+        await beforeSideEffects?.(tx);
         // Identifier minting is delegated to allocateIdentifier(), which
         // dispatches on companies.identifier_provider. The paperclip-internal
         // path runs inside this same tx (atomic counter + insert); the
@@ -8261,7 +8262,6 @@ export function issueService(db: Db) {
           }),
         );
 
-        await beforeInsert?.(tx);
         const [issue] = await tx.insert(issues).values(values).returning();
 
         // When the identifier was minted by Linear (companies.identifier_provider

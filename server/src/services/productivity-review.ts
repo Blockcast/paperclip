@@ -1096,6 +1096,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     now: Date,
     thresholds: ProductivityReviewThresholds,
     dbClient: DbOrTx = db,
+    opts?: { lockQueueRows?: boolean },
   ) {
     const monitorNextCheckAt = coerceDate(sourceIssue.monitorNextCheckAt);
     if (!monitorNextCheckAt || monitorNextCheckAt.getTime() > now.getTime()) return 0;
@@ -1116,6 +1117,38 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         lt(issues.id, sourceIssue.id),
       ),
     );
+    const queueFilter = and(
+      eq(companies.status, "active"),
+      sql`${issues.monitorNextCheckAt} is not null`,
+      lte(issues.monitorNextCheckAt, now),
+      or(
+        precedesSource,
+        and(
+          sql`${issues.id} <> ${sourceIssue.id}`,
+          eq(issues.monitorNextCheckAt, monitorNextCheckAt),
+          gte(issues.monitorWakeRequestedAt, staleClaimThreshold),
+        ),
+        and(
+          eq(issues.id, sourceIssue.id),
+          or(
+            isNull(issues.monitorWakeRequestedAt),
+            lt(issues.monitorWakeRequestedAt, staleClaimThreshold),
+          ),
+        ),
+      ),
+      isNull(issues.assigneeUserId),
+      sql`${issues.assigneeAgentId} is not null`,
+      inArray(issues.status, ["in_progress", "in_review"]),
+    );
+    if (opts?.lockQueueRows) {
+      await dbClient
+        .select({ id: issues.id })
+        .from(issues)
+        .innerJoin(companies, eq(companies.id, issues.companyId))
+        .where(queueFilter)
+        .for("update", { of: [issues] });
+    }
+
     const queueState = await dbClient
       .select({
         duePosition: sql<number>`count(*)::int`,
@@ -1128,31 +1161,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       })
       .from(issues)
       .innerJoin(companies, eq(companies.id, issues.companyId))
-      .where(
-        and(
-          eq(companies.status, "active"),
-          sql`${issues.monitorNextCheckAt} is not null`,
-          lte(issues.monitorNextCheckAt, now),
-          or(
-            precedesSource,
-            and(
-              sql`${issues.id} <> ${sourceIssue.id}`,
-              eq(issues.monitorNextCheckAt, monitorNextCheckAt),
-              gte(issues.monitorWakeRequestedAt, staleClaimThreshold),
-            ),
-            and(
-              eq(issues.id, sourceIssue.id),
-              or(
-                isNull(issues.monitorWakeRequestedAt),
-                lt(issues.monitorWakeRequestedAt, staleClaimThreshold),
-              ),
-            ),
-          ),
-          isNull(issues.assigneeUserId),
-          sql`${issues.assigneeAgentId} is not null`,
-          inArray(issues.status, ["in_progress", "in_review"]),
-        ),
-      )
+      .where(queueFilter)
       .then((rows) => rows[0] ?? null);
     const duePosition = Number(queueState?.duePosition ?? 0);
     if (duePosition <= 0) return 0;
@@ -1179,7 +1188,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     now: Date,
     thresholds: ProductivityReviewThresholds,
     dbClient: DbOrTx = db,
-    opts?: { lockSource?: boolean; runBacklogHook?: boolean },
+    opts?: { lockSource?: boolean; lockQueueRows?: boolean; runBacklogHook?: boolean },
   ) {
     const currentIssue = await getCurrentIssue(sourceIssue, dbClient, { forUpdate: opts?.lockSource });
     if (!currentIssue || !issueCanReceiveMonitorDispatch(currentIssue)) return null;
@@ -1190,7 +1199,13 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     if (opts?.runBacklogHook !== false) {
       await deps?.beforeMonitorBacklogGrace?.(currentIssue);
     }
-    const backlogGraceMs = await monitorBacklogGraceMs(currentIssue, now, thresholds, dbClient);
+    const backlogGraceMs = await monitorBacklogGraceMs(
+      currentIssue,
+      now,
+      thresholds,
+      dbClient,
+      { lockQueueRows: opts?.lockQueueRows },
+    );
     const latestIssue = await getCurrentIssue(sourceIssue, dbClient);
     if (!latestIssue || !issueCanReceiveMonitorDispatch(latestIssue)) return null;
 
@@ -1757,14 +1772,14 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         originId: evidence.sourceIssue.id,
         originFingerprint: productivityReviewFingerprint(evidence.sourceIssue.id),
         requestDepth: clampIssueRequestDepth(evidence.sourceIssue.requestDepth + 1),
-        beforeInsert: async (tx) => {
+        beforeSideEffects: async (tx) => {
           if (evidence.trigger !== "long_active_duration") return;
           const monitor = await currentPendingMonitorForReviewSuppression(
             evidence.sourceIssue,
             evidence.generatedAt,
             opts.thresholds,
             tx,
-            { lockSource: true, runBacklogHook: false },
+            { lockSource: true, lockQueueRows: true, runBacklogHook: false },
           );
           if (monitor) throw new MonitorSuppressedBeforeCreateError(monitor);
         },
