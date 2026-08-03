@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { and, asc, desc, eq, gt, gte, inArray, isNull, lt, lte, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { clampIssueRequestDepth } from "@paperclipai/shared";
@@ -70,8 +71,13 @@ const MAX_RUNS_FOR_STREAK = 100;
 const MAX_PARENT_WALK_DEPTH = 25;
 export const PRODUCTIVITY_REVIEW_REFRESH_COMMENT_PREFIX = "Productivity review evidence refreshed.";
 const PRODUCTIVITY_REVIEW_CREATED_ACTION = "issue.productivity_review_created";
+const PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_STARTED_ACTION =
+  "issue.productivity_review_assignment_wake_started";
+const PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_FAILED_ACTION =
+  "issue.productivity_review_assignment_wake_failed";
 const PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_ENQUEUED_ACTION =
   "issue.productivity_review_assignment_wake_enqueued";
+const PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_CLAIM_LEASE_MS = 5 * 60 * 1000;
 const PRODUCTIVITY_REVIEW_DURABLE_WAKE_REQUEST_STATUSES = [
   "queued",
   "claimed",
@@ -1061,6 +1067,52 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     return true;
   }
 
+  function activityDetails(details: unknown) {
+    return typeof details === "object" && details !== null && !Array.isArray(details)
+      ? details as Record<string, unknown>
+      : {};
+  }
+
+  function activityAttemptId(details: unknown) {
+    const attemptId = activityDetails(details).attemptId;
+    return typeof attemptId === "string" ? attemptId : null;
+  }
+
+  async function latestAssignmentWakeClaimActivity(
+    executor: DbOrTx,
+    input: { companyId: string; issueId: string },
+  ) {
+    return executor
+      .select({
+        action: activityLog.action,
+        createdAt: activityLog.createdAt,
+        details: activityLog.details,
+      })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, input.companyId),
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, input.issueId),
+          inArray(activityLog.action, [
+            PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_STARTED_ACTION,
+            PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_FAILED_ACTION,
+          ]),
+        ),
+      )
+      .orderBy(
+        desc(activityLog.createdAt),
+        desc(sql<number>`case ${activityLog.action}
+          when ${PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_FAILED_ACTION} then 2
+          when ${PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_STARTED_ACTION} then 1
+          else 0
+        end`),
+        desc(activityLog.id),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+  }
+
   async function hasAssignmentWakeRequest(
     executor: DbOrTx,
     input: { companyId: string; agentId: string; idempotencyKey: string },
@@ -1080,13 +1132,151 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       .then((rows) => Boolean(rows[0]));
   }
 
+  function assignmentWakeDetails(
+    evidence: ProductivityReviewFinishEvidence,
+    wakeIdempotencyKey: string,
+    attemptId?: string,
+  ) {
+    return {
+      source: "productivity_review.reconcile",
+      sourceIssueId: evidence.sourceIssue.id,
+      trigger: evidence.trigger,
+      idempotencyKey: wakeIdempotencyKey,
+      ...(attemptId ? { attemptId, leaseMs: PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_CLAIM_LEASE_MS } : {}),
+    };
+  }
+
+  function assignmentWakeOptions(
+    review: Pick<IssueRow, "id">,
+    evidence: ProductivityReviewFinishEvidence,
+    wakeIdempotencyKey: string,
+  ): NonNullable<Parameters<EnqueueWakeup>[1]> {
+    return {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      idempotencyKey: wakeIdempotencyKey,
+      payload: withRecoveryModelProfileHint({
+        issueId: review.id,
+        sourceIssueId: evidence.sourceIssue.id,
+        trigger: evidence.trigger,
+      }, "status_only"),
+      requestedByActorType: "system",
+      requestedByActorId: "productivity_review",
+      contextSnapshot: withRecoveryModelProfileHint({
+        issueId: review.id,
+        taskId: review.id,
+        wakeReason: "issue_assigned",
+        source: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+        sourceIssueId: evidence.sourceIssue.id,
+        productivityReviewTrigger: evidence.trigger,
+      }, "status_only"),
+    };
+  }
+
+  async function failAssignmentWakeClaim(input: {
+    review: Pick<IssueRow, "id">;
+    evidence: ProductivityReviewFinishEvidence;
+    ownerAgentId: string;
+    wakeIdempotencyKey: string;
+    attemptId: string;
+  }) {
+    await db.transaction(async (tx) => {
+      await tx.execute(
+        sql`select pg_advisory_xact_lock(hashtextextended(${`productivity-review-finish:${input.review.id}`}, 0))`,
+      );
+      const latest = await latestAssignmentWakeClaimActivity(tx, {
+        companyId: input.evidence.sourceIssue.companyId,
+        issueId: input.review.id,
+      });
+      if (
+        latest?.action !== PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_STARTED_ACTION ||
+        activityAttemptId(latest.details) !== input.attemptId
+      ) {
+        return;
+      }
+      await tx.insert(activityLog).values({
+        companyId: input.evidence.sourceIssue.companyId,
+        actorType: "system",
+        actorId: "system",
+        action: PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_FAILED_ACTION,
+        entityType: "issue",
+        entityId: input.review.id,
+        agentId: input.ownerAgentId,
+        details: assignmentWakeDetails(input.evidence, input.wakeIdempotencyKey, input.attemptId),
+        createdAt: input.evidence.generatedAt,
+      });
+    });
+  }
+
+  async function completeAssignmentWakeClaim(input: {
+    review: Pick<IssueRow, "id">;
+    evidence: ProductivityReviewFinishEvidence;
+    ownerAgentId: string;
+    wakeIdempotencyKey: string;
+    attemptId: string;
+    wake: unknown | null;
+  }) {
+    return db.transaction(async (tx) => {
+      await tx.execute(
+        sql`select pg_advisory_xact_lock(hashtextextended(${`productivity-review-finish:${input.review.id}`}, 0))`,
+      );
+      const wakeMarkerExists = await hasIssueActivity(tx, {
+        companyId: input.evidence.sourceIssue.companyId,
+        issueId: input.review.id,
+        action: PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_ENQUEUED_ACTION,
+      });
+      if (wakeMarkerExists) return false;
+
+      const latest = await latestAssignmentWakeClaimActivity(tx, {
+        companyId: input.evidence.sourceIssue.companyId,
+        issueId: input.review.id,
+      });
+      if (
+        latest?.action !== PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_STARTED_ACTION ||
+        activityAttemptId(latest.details) !== input.attemptId
+      ) {
+        return false;
+      }
+
+      const wakeProcessed = Boolean(input.wake) || await hasAssignmentWakeRequest(tx, {
+        companyId: input.evidence.sourceIssue.companyId,
+        agentId: input.ownerAgentId,
+        idempotencyKey: input.wakeIdempotencyKey,
+      });
+      if (!wakeProcessed) {
+        await tx.insert(activityLog).values({
+          companyId: input.evidence.sourceIssue.companyId,
+          actorType: "system",
+          actorId: "system",
+          action: PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_FAILED_ACTION,
+          entityType: "issue",
+          entityId: input.review.id,
+          agentId: input.ownerAgentId,
+          details: assignmentWakeDetails(input.evidence, input.wakeIdempotencyKey, input.attemptId),
+          createdAt: input.evidence.generatedAt,
+        });
+        return false;
+      }
+
+      return insertIssueActivityIfMissing(tx, {
+        companyId: input.evidence.sourceIssue.companyId,
+        issueId: input.review.id,
+        action: PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_ENQUEUED_ACTION,
+        agentId: input.ownerAgentId,
+        createdAt: input.evidence.generatedAt,
+        details: assignmentWakeDetails(input.evidence, input.wakeIdempotencyKey),
+      });
+    });
+  }
+
   async function finishCreatedProductivityReview(
     review: Pick<IssueRow, "id">,
     evidence: ProductivityReviewFinishEvidence,
     ownerAgentId: string,
   ): Promise<{ createdActivityInserted: boolean; assignmentWakeProcessed: boolean }> {
     const wakeIdempotencyKey = productivityReviewAssignmentWakeIdempotencyKey(review.id);
-    return db.transaction(async (tx) => {
+    const claim = await db.transaction(async (tx) => {
       await tx.execute(
         sql`select pg_advisory_xact_lock(hashtextextended(${`productivity-review-finish:${review.id}`}, 0))`,
       );
@@ -1114,68 +1304,115 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           .where(eq(issues.id, review.id));
       }
 
-      let assignmentWakeProcessed = false;
+      if (!deps?.enqueueWakeup) {
+        return {
+          createdActivityInserted,
+          assignmentWakeProcessed: false,
+          wakeClaim: null as { attemptId: string } | null,
+        };
+      }
+
       const wakeMarkerExists = await hasIssueActivity(tx, {
         companyId: evidence.sourceIssue.companyId,
         issueId: review.id,
         action: PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_ENQUEUED_ACTION,
       });
-      let wakeAlreadyProcessed = wakeMarkerExists;
-      if (!wakeAlreadyProcessed && deps?.enqueueWakeup) {
-        wakeAlreadyProcessed = await hasAssignmentWakeRequest(tx, {
-          companyId: evidence.sourceIssue.companyId,
-          agentId: ownerAgentId,
-          idempotencyKey: wakeIdempotencyKey,
-        });
+      if (wakeMarkerExists) {
+        return {
+          createdActivityInserted,
+          assignmentWakeProcessed: false,
+          wakeClaim: null as { attemptId: string } | null,
+        };
       }
 
-      if (!wakeAlreadyProcessed && deps?.enqueueWakeup) {
-        const wake = await deps.enqueueWakeup(ownerAgentId, {
-          source: "assignment",
-          triggerDetail: "system",
-          reason: "issue_assigned",
-          idempotencyKey: wakeIdempotencyKey,
-          payload: withRecoveryModelProfileHint({
-            issueId: review.id,
-            sourceIssueId: evidence.sourceIssue.id,
-            trigger: evidence.trigger,
-          }, "status_only"),
-          requestedByActorType: "system",
-          requestedByActorId: "productivity_review",
-          contextSnapshot: withRecoveryModelProfileHint({
-            issueId: review.id,
-            taskId: review.id,
-            wakeReason: "issue_assigned",
-            source: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
-            sourceIssueId: evidence.sourceIssue.id,
-            productivityReviewTrigger: evidence.trigger,
-          }, "status_only"),
-        });
-        wakeAlreadyProcessed = Boolean(wake) || await hasAssignmentWakeRequest(tx, {
-          companyId: evidence.sourceIssue.companyId,
-          agentId: ownerAgentId,
-          idempotencyKey: wakeIdempotencyKey,
-        });
-      }
-
-      if (wakeAlreadyProcessed && !wakeMarkerExists && deps?.enqueueWakeup) {
-        assignmentWakeProcessed = await insertIssueActivityIfMissing(tx, {
+      const wakeAlreadyProcessed = await hasAssignmentWakeRequest(tx, {
+        companyId: evidence.sourceIssue.companyId,
+        agentId: ownerAgentId,
+        idempotencyKey: wakeIdempotencyKey,
+      });
+      if (wakeAlreadyProcessed) {
+        const assignmentWakeProcessed = await insertIssueActivityIfMissing(tx, {
           companyId: evidence.sourceIssue.companyId,
           issueId: review.id,
           action: PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_ENQUEUED_ACTION,
           agentId: ownerAgentId,
           createdAt: evidence.generatedAt,
-          details: {
-            source: "productivity_review.reconcile",
-            sourceIssueId: evidence.sourceIssue.id,
-            trigger: evidence.trigger,
-            idempotencyKey: wakeIdempotencyKey,
-          },
+          details: assignmentWakeDetails(evidence, wakeIdempotencyKey),
         });
+        return {
+          createdActivityInserted,
+          assignmentWakeProcessed,
+          wakeClaim: null as { attemptId: string } | null,
+        };
       }
 
-      return { createdActivityInserted, assignmentWakeProcessed };
+      const latest = await latestAssignmentWakeClaimActivity(tx, {
+        companyId: evidence.sourceIssue.companyId,
+        issueId: review.id,
+      });
+      if (
+        latest?.action === PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_STARTED_ACTION &&
+        latest.createdAt.getTime() > Date.now() - PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_CLAIM_LEASE_MS
+      ) {
+        return {
+          createdActivityInserted,
+          assignmentWakeProcessed: false,
+          wakeClaim: null as { attemptId: string } | null,
+        };
+      }
+
+      const attemptId = randomUUID();
+      await tx.insert(activityLog).values({
+        companyId: evidence.sourceIssue.companyId,
+        actorType: "system",
+        actorId: "system",
+        action: PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_STARTED_ACTION,
+        entityType: "issue",
+        entityId: review.id,
+        agentId: ownerAgentId,
+        details: assignmentWakeDetails(evidence, wakeIdempotencyKey, attemptId),
+        createdAt: evidence.generatedAt,
+      });
+      return { createdActivityInserted, assignmentWakeProcessed: false, wakeClaim: { attemptId } };
     });
+
+    if (!claim.wakeClaim || !deps?.enqueueWakeup) {
+      return {
+        createdActivityInserted: claim.createdActivityInserted,
+        assignmentWakeProcessed: claim.assignmentWakeProcessed,
+      };
+    }
+
+    let wake: unknown | null = null;
+    try {
+      wake = await deps.enqueueWakeup(
+        ownerAgentId,
+        assignmentWakeOptions(review, evidence, wakeIdempotencyKey),
+      );
+    } catch (error) {
+      await failAssignmentWakeClaim({
+        review,
+        evidence,
+        ownerAgentId,
+        wakeIdempotencyKey,
+        attemptId: claim.wakeClaim.attemptId,
+      });
+      throw error;
+    }
+
+    const assignmentWakeProcessed = await completeAssignmentWakeClaim({
+      review,
+      evidence,
+      ownerAgentId,
+      wakeIdempotencyKey,
+      attemptId: claim.wakeClaim.attemptId,
+      wake,
+    });
+
+    return {
+      createdActivityInserted: claim.createdActivityInserted,
+      assignmentWakeProcessed,
+    };
   }
 
   async function findOpenProductivityReviewEscalation(companyId: string, sourceIssueId: string) {

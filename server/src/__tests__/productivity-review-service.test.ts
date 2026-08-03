@@ -2069,6 +2069,50 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(await countReviewActivity(reviewId, "issue.productivity_review_assignment_wake_enqueued")).toBe(1);
   });
 
+  it("does not hold the review row lock while enqueueing assignment wake", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const createdAt = new Date(now.getTime() - 60_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt: new Date(now.getTime() - 10 * 60 * 1000),
+      monitorScheduledBy: "assignee",
+    });
+    const reviewId = await insertProductivityReview({
+      seeded,
+      createdAt,
+      issueNumber: 2,
+      identifier: `${seeded.issuePrefix}-2`,
+    });
+
+    const service = productivityReviewService(db, {
+      async enqueueWakeup() {
+        await db.transaction(async (tx) => {
+          await tx.execute(sql`
+            select ${issues.id}
+            from ${issues}
+            where ${issues.id} = ${reviewId}
+            for update
+          `);
+        });
+        return { id: randomUUID() };
+      },
+    });
+
+    await expect(
+      withTimeout(
+        service.reconcileProductivityReviews({
+          now,
+          companyId: seeded.companyId,
+          thresholds: { monitorLapseServiceGraceMs: 60_000 },
+        }),
+        1_000,
+        "productivity review wake enqueue row-lock replay",
+      ),
+    ).resolves.toMatchObject({ created: 1 });
+    expect(await countReviewActivity(reviewId, "issue.productivity_review_assignment_wake_enqueued")).toBe(1);
+  });
+
   it("recovers a stale reserved review after its source leaves the candidate set", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const reservedAt = new Date(now.getTime() - 10 * 60_000);
