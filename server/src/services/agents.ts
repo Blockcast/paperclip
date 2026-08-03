@@ -34,6 +34,10 @@ import {
   type AgentEligibilityAgent,
   type AgentApiKeyScope,
 } from "@paperclipai/shared";
+import {
+  EXTERNAL_LIFECYCLE_ADAPTER_TYPES,
+  EXTERNAL_LIFECYCLE_MAX_CONCURRENT_RUNS,
+} from "@paperclipai/shared/validators/agent";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import { syncAgentAdapterEnvBindings } from "./agent-secret-bindings.js";
 import { normalizeAgentPermissions } from "./agent-permissions.js";
@@ -96,6 +100,8 @@ interface AgentShortnameRow {
 interface AgentShortnameCollisionOptions {
   excludeAgentId?: string | null;
 }
+
+const EXTERNAL_LIFECYCLE_ADAPTER_TYPE_SET = new Set<string>(EXTERNAL_LIFECYCLE_ADAPTER_TYPES);
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -198,16 +204,128 @@ function parseFiniteNumberLike(value: unknown): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-function normalizeRuntimeConfigForNewAgent(runtimeConfig: unknown): Record<string, unknown> {
+function heartbeatMaxConcurrentRuns(runtimeConfig: unknown): number | null {
+  if (!isPlainRecord(runtimeConfig) || !isPlainRecord(runtimeConfig.heartbeat)) return null;
+  return parseFiniteNumberLike(runtimeConfig.heartbeat.maxConcurrentRuns);
+}
+
+function requestsHeartbeatMaxConcurrentRuns(runtimeConfig: unknown): boolean {
+  return isPlainRecord(runtimeConfig)
+    && isPlainRecord(runtimeConfig.heartbeat)
+    && Object.prototype.hasOwnProperty.call(runtimeConfig.heartbeat, "maxConcurrentRuns");
+}
+
+function assertExternalLifecycleConcurrencyPolicy(adapterType: string, runtimeConfig: unknown) {
+  if (!EXTERNAL_LIFECYCLE_ADAPTER_TYPE_SET.has(adapterType)) return;
+  const heartbeat = isPlainRecord(runtimeConfig) && isPlainRecord(runtimeConfig.heartbeat)
+    ? runtimeConfig.heartbeat
+    : {};
+  const maxConcurrentRuns = parseFiniteNumberLike(heartbeat.maxConcurrentRuns);
+  if (maxConcurrentRuns !== null && maxConcurrentRuns > EXTERNAL_LIFECYCLE_MAX_CONCURRENT_RUNS) {
+    throw unprocessable(
+      `heartbeat.maxConcurrentRuns must not exceed ${EXTERNAL_LIFECYCLE_MAX_CONCURRENT_RUNS} for external-lifecycle adapters`,
+    );
+  }
+}
+
+function normalizeExternalLifecycleRuntimeConfig(
+  adapterType: string,
+  runtimeConfig: unknown,
+  options?: { clampInheritedLegacyConcurrency?: boolean },
+): Record<string, unknown> {
+  const normalizedRuntimeConfig = isPlainRecord(runtimeConfig) ? { ...runtimeConfig } : {};
+  if (!EXTERNAL_LIFECYCLE_ADAPTER_TYPE_SET.has(adapterType)) {
+    return normalizedRuntimeConfig;
+  }
+
+  const heartbeat = isPlainRecord(normalizedRuntimeConfig.heartbeat)
+    ? { ...normalizedRuntimeConfig.heartbeat }
+    : {};
+  const maxConcurrentRuns = parseFiniteNumberLike(heartbeat.maxConcurrentRuns);
+  if (maxConcurrentRuns == null) {
+    heartbeat.maxConcurrentRuns = EXTERNAL_LIFECYCLE_MAX_CONCURRENT_RUNS;
+  } else if (
+    maxConcurrentRuns > EXTERNAL_LIFECYCLE_MAX_CONCURRENT_RUNS
+    && options?.clampInheritedLegacyConcurrency
+  ) {
+    heartbeat.maxConcurrentRuns = EXTERNAL_LIFECYCLE_MAX_CONCURRENT_RUNS;
+  }
+  normalizedRuntimeConfig.heartbeat = heartbeat;
+  assertExternalLifecycleConcurrencyPolicy(adapterType, normalizedRuntimeConfig);
+  return normalizedRuntimeConfig;
+}
+
+function normalizeRuntimeConfigForNewAgent(
+  runtimeConfig: unknown,
+  adapterType: string,
+): Record<string, unknown> {
   const normalizedRuntimeConfig = isPlainRecord(runtimeConfig) ? { ...runtimeConfig } : {};
   const heartbeat = isPlainRecord(normalizedRuntimeConfig.heartbeat)
     ? { ...normalizedRuntimeConfig.heartbeat }
     : {};
   if (parseFiniteNumberLike(heartbeat.maxConcurrentRuns) == null) {
-    heartbeat.maxConcurrentRuns = AGENT_DEFAULT_MAX_CONCURRENT_RUNS;
+    heartbeat.maxConcurrentRuns = EXTERNAL_LIFECYCLE_ADAPTER_TYPE_SET.has(adapterType)
+      ? EXTERNAL_LIFECYCLE_MAX_CONCURRENT_RUNS
+      : AGENT_DEFAULT_MAX_CONCURRENT_RUNS;
   }
   normalizedRuntimeConfig.heartbeat = heartbeat;
-  return normalizedRuntimeConfig;
+  return normalizeExternalLifecycleRuntimeConfig(adapterType, normalizedRuntimeConfig);
+}
+
+function mergeRuntimeConfigPatch(
+  existingRuntimeConfig: unknown,
+  requestedRuntimeConfig: unknown,
+): Record<string, unknown> {
+  const requested = isPlainRecord(requestedRuntimeConfig) ? requestedRuntimeConfig : {};
+  const merged = { ...requested };
+  if (isPlainRecord(requested.heartbeat)) {
+    const existingHeartbeat = isPlainRecord(existingRuntimeConfig)
+      && isPlainRecord(existingRuntimeConfig.heartbeat)
+      ? existingRuntimeConfig.heartbeat
+      : {};
+    merged.heartbeat = { ...existingHeartbeat, ...requested.heartbeat };
+  }
+  return merged;
+}
+
+function mergeApprovedRuntimeConfig(
+  currentRuntimeConfig: unknown,
+  requestedRuntimeConfig: Record<string, unknown>,
+  approvedRuntimeConfig: Record<string, unknown>,
+): Record<string, unknown> {
+  const current = isPlainRecord(currentRuntimeConfig) ? currentRuntimeConfig : {};
+  const merged = { ...current };
+  const keys = new Set([
+    ...Object.keys(requestedRuntimeConfig),
+    ...Object.keys(approvedRuntimeConfig),
+  ]);
+
+  for (const key of keys) {
+    const requestedHasKey = Object.prototype.hasOwnProperty.call(requestedRuntimeConfig, key);
+    const approvedHasKey = Object.prototype.hasOwnProperty.call(approvedRuntimeConfig, key);
+    if (requestedHasKey && approvedHasKey && jsonEqual(requestedRuntimeConfig[key], approvedRuntimeConfig[key])) {
+      continue;
+    }
+    if (!approvedHasKey) {
+      delete merged[key];
+      continue;
+    }
+    if (
+      requestedHasKey
+      && isPlainRecord(requestedRuntimeConfig[key])
+      && isPlainRecord(approvedRuntimeConfig[key])
+    ) {
+      merged[key] = mergeApprovedRuntimeConfig(
+        current[key],
+        requestedRuntimeConfig[key],
+        approvedRuntimeConfig[key],
+      );
+      continue;
+    }
+    merged[key] = approvedRuntimeConfig[key];
+  }
+
+  return merged;
 }
 
 function diffConfigSnapshot(
@@ -534,21 +652,72 @@ export function agentService(db: Db) {
         { adapterType: (normalizedPatch.adapterType ?? existing.adapterType) as string },
       );
     }
-
-    const shouldRecordRevision = Boolean(options?.recordRevision) && hasConfigPatchFields(normalizedPatch);
-    const beforeConfig = shouldRecordRevision ? buildConfigSnapshot(existing) : null;
-
     return db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
+      await tx.execute(sql`select ${agents.id} from ${agents} where ${agents.id} = ${id} for update`);
+      const locked = await tx
+        .select()
+        .from(agents)
+        .where(eq(agents.id, id))
+        .then((rows) => rows[0] ?? null);
+      if (!locked) return null;
+
+      if (locked.status === "terminated" && data.status && data.status !== "terminated") {
+        throw conflict("Terminated agents cannot be resumed");
+      }
+      if (
+        locked.status === "pending_approval" &&
+        data.status &&
+        data.status !== "pending_approval" &&
+        data.status !== "terminated"
+      ) {
+        throw conflict("Pending approval agents cannot be activated directly");
+      }
+      if (locked.status === "pending_approval" && !options?.allowPendingApprovalConfigUpdate) {
+        const changedFields = changedPendingApprovalConfigFields(locked as typeof agents.$inferSelect, data);
+        if (changedFields.length > 0) {
+          throw conflict("Pending approval agent configuration cannot be changed before board approval", {
+            code: "pending_approval_agent_config_frozen",
+            agentId: id,
+            fields: changedFields,
+          });
+        }
+      }
+
+      const txPatch = { ...normalizedPatch };
+      if (
+        Object.prototype.hasOwnProperty.call(txPatch, "adapterType")
+        || Object.prototype.hasOwnProperty.call(txPatch, "runtimeConfig")
+      ) {
+        const nextAdapterType = (txPatch.adapterType ?? locked.adapterType) as string;
+        const requestedRuntimeConfig = Object.prototype.hasOwnProperty.call(txPatch, "runtimeConfig")
+          ? txPatch.runtimeConfig
+          : undefined;
+        txPatch.runtimeConfig = normalizeExternalLifecycleRuntimeConfig(
+          nextAdapterType,
+          requestedRuntimeConfig !== undefined
+            ? mergeRuntimeConfigPatch(locked.runtimeConfig, requestedRuntimeConfig)
+            : locked.runtimeConfig,
+          {
+            clampInheritedLegacyConcurrency:
+              EXTERNAL_LIFECYCLE_ADAPTER_TYPE_SET.has(locked.adapterType)
+              && EXTERNAL_LIFECYCLE_ADAPTER_TYPE_SET.has(nextAdapterType)
+              && !requestsHeartbeatMaxConcurrentRuns(requestedRuntimeConfig),
+          },
+        );
+      }
+
+      const shouldRecordRevision = Boolean(options?.recordRevision) && hasConfigPatchFields(txPatch);
+      const beforeConfig = shouldRecordRevision ? buildConfigSnapshot(locked) : null;
       const updated = await tx
         .update(agents)
-        .set({ ...normalizedPatch, updatedAt: new Date() })
+        .set({ ...txPatch, updatedAt: new Date() })
         .where(eq(agents.id, id))
         .returning()
         .then((rows) => rows[0] ?? null);
       if (!updated) return null;
 
-      if (Object.prototype.hasOwnProperty.call(normalizedPatch, "adapterConfig")) {
+      if (Object.prototype.hasOwnProperty.call(txPatch, "adapterConfig")) {
         await syncAgentSecretBindings(updated, txDb);
       }
 
@@ -609,8 +778,8 @@ export function agentService(db: Db) {
 
       const role = data.role ?? "general";
       const normalizedPermissions = normalizeAgentPermissions(data.permissions, role);
-      const runtimeConfig = normalizeRuntimeConfigForNewAgent(data.runtimeConfig);
       const adapterType = data.adapterType ?? "process";
+      const runtimeConfig = normalizeRuntimeConfigForNewAgent(data.runtimeConfig, adapterType);
       const adapterConfig = isPlainRecord(data.adapterConfig)
         ? await secretsSvc.normalizeAdapterConfigForPersistence(companyId, data.adapterConfig, { adapterType })
         : {};
@@ -792,6 +961,7 @@ export function agentService(db: Db) {
     activatePendingApproval: async (id: string, approvedPayload?: Record<string, unknown> | null) => {
       const activatedAgent = await db.transaction(async (tx) => {
         const txDb = tx as unknown as Db;
+        await tx.execute(sql`select ${agents.id} from ${agents} where ${agents.id} = ${id} for update`);
         const existing = await agentService(txDb).getById(id);
         if (!existing || existing.status !== "pending_approval") return null;
         const approvedPatch = approvedPayload ? configPatchFromApprovalPayload(approvedPayload) : {};
@@ -811,6 +981,38 @@ export function agentService(db: Db) {
             patch.permissions,
             (patch.role ?? existing.role) as string,
           );
+        }
+        const nextAdapterType = (patch.adapterType ?? existing.adapterType) as string;
+        const requestedSnapshot = approvedPayload && isPlainRecord(approvedPayload.requestedConfigurationSnapshot)
+          ? approvedPayload.requestedConfigurationSnapshot
+          : null;
+        const requestedRuntimeConfig = requestedSnapshot && isPlainRecord(requestedSnapshot.runtimeConfig)
+          ? requestedSnapshot.runtimeConfig
+          : null;
+        const approvedRuntimeConfig = isPlainRecord(patch.runtimeConfig) ? patch.runtimeConfig : null;
+        const candidateRuntimeConfig = approvedRuntimeConfig
+          ? requestedRuntimeConfig
+            ? mergeApprovedRuntimeConfig(existing.runtimeConfig, requestedRuntimeConfig, approvedRuntimeConfig)
+            : approvedRuntimeConfig
+          : existing.runtimeConfig;
+        const existingMaxConcurrentRuns = heartbeatMaxConcurrentRuns(existing.runtimeConfig);
+        const normalizedRuntimeConfig = normalizeExternalLifecycleRuntimeConfig(
+          nextAdapterType,
+          candidateRuntimeConfig,
+          {
+            clampInheritedLegacyConcurrency:
+              EXTERNAL_LIFECYCLE_ADAPTER_TYPE_SET.has(existing.adapterType)
+              && EXTERNAL_LIFECYCLE_ADAPTER_TYPE_SET.has(nextAdapterType)
+              && existingMaxConcurrentRuns !== null
+              && existingMaxConcurrentRuns > EXTERNAL_LIFECYCLE_MAX_CONCURRENT_RUNS
+              && existingMaxConcurrentRuns === heartbeatMaxConcurrentRuns(candidateRuntimeConfig),
+          },
+        );
+        if (
+          Object.prototype.hasOwnProperty.call(patch, "runtimeConfig")
+          || EXTERNAL_LIFECYCLE_ADAPTER_TYPE_SET.has(nextAdapterType)
+        ) {
+          patch.runtimeConfig = normalizedRuntimeConfig;
         }
         const updated = await tx
           .update(agents)
