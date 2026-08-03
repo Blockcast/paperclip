@@ -331,6 +331,38 @@ jobs:
         if: always()
         run: git worktree remove --force "$RUNNER_TEMP/worktree-install-check" || true
 
+  opencode_responses_replay:
+    name: OpenCode Responses replay
+    needs: [policy]
+    runs-on: default
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Install the pinned OpenCode release
+        run: |
+          set -euo pipefail
+          version="$(node -e '
+            const source = require("node:fs").readFileSync("Dockerfile.runtime", "utf8");
+            const match = source.match(/^ARG OPENCODE_AI_VERSION=(\S+)$/m);
+            if (!match) process.exit(1);
+            process.stdout.write(match[1]);
+          ')"
+          npm install --prefix "$RUNNER_TEMP/opencode-replay" --omit=dev "opencode-ai@$version"
+          binary="$RUNNER_TEMP/opencode-replay/node_modules/.bin/opencode"
+          test "$("$binary" --version)" = "$version"
+          echo "OPENCODE_REPLAY_BINARY=$binary" >> "$GITHUB_ENV"
+
+      - name: Replay framed and malformed Responses streams
+        run: node scripts/smoke/opencode-responses-replay.mjs
+
   general_tests:
     name: General tests (${{ matrix.group_label }})
     needs: [policy]
