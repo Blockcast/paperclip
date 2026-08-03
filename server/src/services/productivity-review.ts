@@ -13,11 +13,14 @@ import {
   issueComments,
   issueRelations,
   issues,
+  linearIssueLinks,
   projects,
 } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
+import { assertAssignableAgent } from "./agent-assignability.js";
 import { budgetService } from "./budgets.js";
+import { allocateIdentifier, deleteLinearIssueForCompany } from "./identifier-allocator.js";
 import { withIssueMonitorQueueLock } from "./issue-monitor-queue-lock.js";
 import { issueService } from "./issues.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
@@ -186,6 +189,7 @@ type ProductivityReviewServiceDeps = {
   beforeCreateOrUpdateReview?: (evidence: ProductivityReviewEvidence) => Promise<void> | void;
   beforeCreateReviewIssueInsert?: (evidence: ProductivityReviewEvidence) => Promise<void> | void;
   beforeFinalMonitorSuppressionRevalidation?: (evidence: ProductivityReviewEvidence) => Promise<void> | void;
+  afterFinalMonitorReviewReservation?: (evidence: ProductivityReviewEvidence, review: IssueRow) => Promise<void> | void;
 };
 
 class MonitorSuppressedBeforeCreateError extends Error {
@@ -641,8 +645,12 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     return false;
   }
 
-  async function findOpenProductivityReview(companyId: string, sourceIssueId: string) {
-    return db
+  async function findOpenProductivityReview(
+    companyId: string,
+    sourceIssueId: string,
+    executor: DbOrTx = db,
+  ) {
+    return executor
       .select()
       .from(issues)
       .where(
@@ -657,6 +665,140 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       .orderBy(desc(issues.updatedAt))
       .limit(1)
       .then((rows) => rows[0] ?? null);
+  }
+
+  async function reserveLongActiveProductivityReviewIssue(input: {
+    evidence: ProductivityReviewEvidence;
+    thresholds: ProductivityReviewThresholds;
+    ownerAgentId: string;
+    title: string;
+    description: string;
+  }) {
+    return db.transaction((tx) =>
+      withIssueMonitorQueueLock(tx, async () => {
+        const monitor = await currentPendingMonitorForReviewSuppression(
+          input.evidence.sourceIssue,
+          input.evidence.generatedAt,
+          input.thresholds,
+          tx,
+          { lockSource: true, runBacklogHook: false },
+        );
+        if (monitor) throw new MonitorSuppressedBeforeCreateError(monitor);
+
+        const existing = await findOpenProductivityReview(
+          input.evidence.sourceIssue.companyId,
+          input.evidence.sourceIssue.id,
+          tx,
+        );
+        if (existing) return { kind: "existing" as const, review: existing };
+
+        const [review] = await tx
+          .insert(issues)
+          .values({
+            companyId: input.evidence.sourceIssue.companyId,
+            title: input.title,
+            description: input.description,
+            status: "todo",
+            priority: "medium",
+            parentId: input.evidence.sourceIssue.id,
+            projectId: input.evidence.sourceIssue.projectId,
+            projectWorkspaceId: input.evidence.sourceIssue.projectWorkspaceId,
+            goalId: input.evidence.sourceIssue.goalId,
+            billingCode: input.evidence.sourceIssue.billingCode,
+            assigneeAgentId: input.ownerAgentId,
+            assigneeAdapterOverrides: recoveryAssigneeAdapterOverrides("status_only"),
+            responsibleUserId:
+              input.evidence.sourceIssue.responsibleUserId ??
+              input.evidence.sourceIssue.createdByUserId,
+            originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+            originId: input.evidence.sourceIssue.id,
+            originFingerprint: productivityReviewFingerprint(input.evidence.sourceIssue.id),
+            requestDepth: clampIssueRequestDepth(input.evidence.sourceIssue.requestDepth + 1),
+            createdAt: input.evidence.generatedAt,
+            updatedAt: input.evidence.generatedAt,
+            lastActivityAt: input.evidence.generatedAt,
+          })
+          .returning();
+
+        return { kind: "reserved" as const, review };
+      })
+    );
+  }
+
+  async function finalizeReservedProductivityReviewIssue(input: {
+    review: IssueRow;
+    title: string;
+    description: string;
+    generatedAt: Date;
+  }) {
+    let createdLinearIssueId: string | null = null;
+    try {
+      return await db.transaction(async (tx) => {
+        await tx.execute(
+          sql`select pg_advisory_xact_lock(hashtextextended(${`productivity-review-finalize:${input.review.id}`}, 0))`,
+        );
+
+        const current = await tx
+          .select()
+          .from(issues)
+          .where(and(eq(issues.companyId, input.review.companyId), eq(issues.id, input.review.id)))
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (!current) throw new Error(`Reserved productivity review ${input.review.id} disappeared before finalization`);
+        if (current.identifier && current.issueNumber != null) return current;
+        if (current.identifier || current.issueNumber != null) {
+          throw new Error(`Reserved productivity review ${input.review.id} is partially finalized`);
+        }
+
+        const allocation = await allocateIdentifier({
+          db: tx,
+          companyId: input.review.companyId,
+          title: input.title,
+          description: input.description,
+        });
+        if (allocation.createdLinearSideIssue && allocation.externalIssueId) {
+          createdLinearIssueId = allocation.externalIssueId;
+        }
+
+        const [updated] = await tx
+          .update(issues)
+          .set({
+            issueNumber: allocation.issueNumber,
+            identifier: allocation.identifier,
+            updatedAt: input.generatedAt,
+          })
+          .where(
+            and(
+              eq(issues.companyId, input.review.companyId),
+              eq(issues.id, input.review.id),
+              isNull(issues.issueNumber),
+              isNull(issues.identifier),
+            ),
+          )
+          .returning();
+        if (!updated) throw new Error(`Reserved productivity review ${input.review.id} was finalized concurrently`);
+
+        if (allocation.source === "linear" && allocation.externalIssueId) {
+          await tx.insert(linearIssueLinks).values({
+            companyId: input.review.companyId,
+            paperclipIssueId: updated.id,
+            linearIssueId: allocation.externalIssueId,
+            linearIdentifier: allocation.identifier,
+          });
+        }
+
+        return updated;
+      });
+    } catch (error) {
+      if (createdLinearIssueId) {
+        await deleteLinearIssueForCompany(db, input.review.companyId, createdLinearIssueId).catch(() => {});
+      }
+      await db
+        .delete(issues)
+        .where(and(eq(issues.id, input.review.id), isNull(issues.issueNumber), isNull(issues.identifier)))
+        .catch(() => {});
+      throw error;
+    }
   }
 
   async function findRecentResolvedProductivityReview(
@@ -1606,6 +1748,17 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
 
     const existing = await findOpenProductivityReview(evidence.sourceIssue.companyId, evidence.sourceIssue.id);
     if (existing) {
+      if (existing.identifier == null && existing.issueNumber == null) {
+        logger.info(
+          {
+            reviewIssueId: existing.id,
+            sourceIssueId: evidence.sourceIssue.id,
+          },
+          "productivity review create skipped: reservation is still finalizing",
+        );
+        return { kind: "existing" as const, reviewIssueId: existing.id };
+      }
+
       // BLO-3281 AC2: hard-floor refresh interval. Even when the
       // scheduler triggers a re-scan inside the 5-min window, we
       // skip the addComment so the review thread doesn't accumulate
@@ -1741,39 +1894,48 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     }
 
     let review: Awaited<ReturnType<typeof issuesSvc.create>>;
+    const reviewTitle = `Review productivity for ${evidence.sourceIssue.identifier ?? evidence.sourceIssue.title}`;
+    const reviewDescription = buildReviewMarkdown(evidence, opts.prefix);
     try {
       await deps?.beforeCreateReviewIssueInsert?.(evidence);
       if (evidence.trigger === "long_active_duration") {
+        await assertAssignableAgent(db, evidence.sourceIssue.companyId, ownerAgentId, { kind: "work" });
         await deps?.beforeFinalMonitorSuppressionRevalidation?.(evidence);
-        const monitor = await db.transaction((tx) =>
-          withIssueMonitorQueueLock(tx, () =>
-            currentPendingMonitorForReviewSuppression(
-              evidence.sourceIssue,
-              evidence.generatedAt,
-              opts.thresholds,
-              tx,
-              { lockSource: true, runBacklogHook: false },
-            ),
-          ),
-        );
-        if (monitor) throw new MonitorSuppressedBeforeCreateError(monitor);
+        const reservation = await reserveLongActiveProductivityReviewIssue({
+          evidence,
+          thresholds: opts.thresholds,
+          ownerAgentId,
+          title: reviewTitle,
+          description: reviewDescription,
+        });
+        if (reservation.kind === "existing") {
+          return { kind: "existing" as const, reviewIssueId: reservation.review.id };
+        }
+        await deps?.afterFinalMonitorReviewReservation?.(evidence, reservation.review);
+        review = await finalizeReservedProductivityReviewIssue({
+          review: reservation.review,
+          title: reviewTitle,
+          description: reviewDescription,
+          generatedAt: evidence.generatedAt,
+        }) as Awaited<ReturnType<typeof issuesSvc.create>>;
+      } else {
+        review = await issuesSvc.create(evidence.sourceIssue.companyId, {
+          title: reviewTitle,
+          description: reviewDescription,
+          status: "todo",
+          priority: "high",
+          parentId: evidence.sourceIssue.id,
+          projectId: evidence.sourceIssue.projectId,
+          goalId: evidence.sourceIssue.goalId,
+          billingCode: evidence.sourceIssue.billingCode,
+          assigneeAgentId: ownerAgentId,
+          assigneeAdapterOverrides: recoveryAssigneeAdapterOverrides("status_only"),
+          originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+          originId: evidence.sourceIssue.id,
+          originFingerprint: productivityReviewFingerprint(evidence.sourceIssue.id),
+          requestDepth: clampIssueRequestDepth(evidence.sourceIssue.requestDepth + 1),
+        });
       }
-      review = await issuesSvc.create(evidence.sourceIssue.companyId, {
-        title: `Review productivity for ${evidence.sourceIssue.identifier ?? evidence.sourceIssue.title}`,
-        description: buildReviewMarkdown(evidence, opts.prefix),
-        status: "todo",
-        priority: evidence.trigger === "long_active_duration" ? "medium" : "high",
-        parentId: evidence.sourceIssue.id,
-        projectId: evidence.sourceIssue.projectId,
-        goalId: evidence.sourceIssue.goalId,
-        billingCode: evidence.sourceIssue.billingCode,
-        assigneeAgentId: ownerAgentId,
-        assigneeAdapterOverrides: recoveryAssigneeAdapterOverrides("status_only"),
-        originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
-        originId: evidence.sourceIssue.id,
-        originFingerprint: productivityReviewFingerprint(evidence.sourceIssue.id),
-        requestDepth: clampIssueRequestDepth(evidence.sourceIssue.requestDepth + 1),
-      });
     } catch (error) {
       if (error instanceof MonitorSuppressedBeforeCreateError) {
         const monitor = error.monitor;

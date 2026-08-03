@@ -1686,6 +1686,65 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(result.monitorScheduledSuppressed).toBe(1);
   });
 
+  it("does not let post-reservation monitor claims invalidate the reserved review", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const monitorNextCheckAt = new Date(now.getTime() - 10 * 60_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt,
+      monitorScheduledBy: "assignee",
+    });
+
+    const reservationReady = deferred<string>();
+    const releaseIdentifierAllocation = deferred();
+    const reconcile = productivityReviewService(db, {
+      async afterFinalMonitorReviewReservation(evidence, review) {
+        if (evidence.sourceIssue.id !== seeded.issueId) return;
+        reservationReady.resolve(review.id);
+        await releaseIdentifierAllocation.promise;
+      },
+    }).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: {
+        monitorLapseServiceGraceMs: 60_000,
+        monitorSchedulerIntervalMs: 60_000,
+        monitorDispatchBatchSize: 50,
+      },
+    });
+
+    const reviewId = await reservationReady.promise;
+    const [reserved] = await db
+      .select({ identifier: issues.identifier, issueNumber: issues.issueNumber })
+      .from(issues)
+      .where(eq(issues.id, reviewId));
+    expect(reserved).toMatchObject({ identifier: null, issueNumber: null });
+
+    const tick = await withTimeout(
+      heartbeatService(db).__test_tickDueIssueMonitors(now),
+      500,
+      "issue monitor tick after review reservation",
+    );
+    expect(tick.triggered).toBeGreaterThan(0);
+
+    const [sourceAfterTick] = await db
+      .select({ monitorWakeRequestedAt: issues.monitorWakeRequestedAt })
+      .from(issues)
+      .where(eq(issues.id, seeded.issueId));
+    expect(sourceAfterTick?.monitorWakeRequestedAt?.toISOString()).toBe(now.toISOString());
+
+    releaseIdentifierAllocation.resolve();
+    const result = await reconcile;
+    expect(result.created).toBe(1);
+    expect(result.monitorScheduledSuppressed).toBe(0);
+
+    const reviews = await listProductivityReviews(seeded.companyId);
+    expect(reviews).toHaveLength(1);
+    expect(reviews[0]?.id).toBe(reviewId);
+    expect(reviews[0]?.identifier).toBe(`${seeded.issuePrefix}-2`);
+  });
+
   // Negative control for BLO-21003: a monitor that lapsed well past the
   // lapse-to-service grace window, with no pending wake, is genuinely
   // unsupervised and must still fire exactly as it does today. Without this
