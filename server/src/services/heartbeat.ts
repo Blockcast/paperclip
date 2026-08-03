@@ -8475,6 +8475,10 @@ export interface HeartbeatServiceOptions {
   afterQueuedDispatchContinuationScheduledForTest?: (
     input: { agentId: string; reason: string },
   ) => Promise<void> | void;
+  /** Test-only failure injection immediately before refusal status re-read. */
+  beforeQueuedDispatchRefusalStatusReadForTest?: (
+    run: typeof heartbeatRuns.$inferSelect,
+  ) => Promise<void> | void;
 }
 
 function isTruthyRuntimeEnvValue(value: string | undefined) {
@@ -17883,6 +17887,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   const dispatchRecoveryLaneHeadRescanDemandByAgent = new Set<string>();
   const dispatchDeferredRunIdsByAgent = new Map<string, Set<string>>();
   const dispatchResumeCapRetryTimersByAgent = new Map<string, ReturnType<typeof setTimeout>>();
+  const dispatchAdmissionRetryTimersByAgent = new Map<string, ReturnType<typeof setTimeout>>();
 
   /** Run one more dispatch pass for `agentId`, detached from this critical section. */
   function scheduleDetachedDispatchPass(agentId: string, reason: string) {
@@ -17932,6 +17937,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const maybeNodeTimer = timer as { unref?: () => void };
     if (typeof maybeNodeTimer.unref === "function") maybeNodeTimer.unref();
     dispatchResumeCapRetryTimersByAgent.set(agentId, timer);
+  }
+
+  function clearDelayedAdmissionRetry(agentId: string) {
+    const timer = dispatchAdmissionRetryTimersByAgent.get(agentId);
+    if (!timer) return;
+    clearTimeout(timer);
+    dispatchAdmissionRetryTimersByAgent.delete(agentId);
+  }
+
+  function scheduleDelayedAdmissionRetry(agentId: string) {
+    if (dispatchAdmissionRetryTimersByAgent.has(agentId)) return;
+    const timer = setTimeout(() => {
+      dispatchAdmissionRetryTimersByAgent.delete(agentId);
+      dispatchDeferredRunIdsByAgent.delete(agentId);
+      scheduleDetachedDispatchPass(agentId, "retry_emergency_admission_refusal");
+    }, QUEUED_RUN_DISPATCH_RESUME_CAP_RETRY_DELAY_MS);
+    const maybeNodeTimer = timer as { unref?: () => void };
+    if (typeof maybeNodeTimer.unref === "function") maybeNodeTimer.unref();
+    dispatchAdmissionRetryTimersByAgent.set(agentId, timer);
   }
 
   async function startNextQueuedRunForAgent(
@@ -18656,7 +18680,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         );
       }
       if (queuedRuns.length === 0) {
-        if (!finishPassWithoutClaims()) dispatchDeferredRunIdsByAgent.delete(agentId);
+        if (!finishPassWithoutClaims() && dispatchDeferredRunIdsByAgent.has(agentId)) {
+          scheduleDelayedAdmissionRetry(agentId);
+        }
         return [];
       }
 
@@ -18818,6 +18844,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       ) => {
         const laneCursors = emergencyLaneCursorsByRunId.get(run.id);
         if (!laneCursors) return false;
+        await options.beforeQueuedDispatchRefusalStatusReadForTest?.(run);
         const current = await db
           .select({ status: heartbeatRuns.status })
           .from(heartbeatRuns)
@@ -18867,7 +18894,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
         return Object.hasOwn(laneCursors, "critical") || Object.hasOwn(laneCursors, "recovery");
       };
+      let claimedRunsLaunched = false;
       const launchClaimedRuns = () => {
+        if (claimedRunsLaunched) return;
+        claimedRunsLaunched = true;
         for (const claimedRun of claimedRuns) {
           // BLO-20396: detach from the start-lock context. executeRun is launched
           // here but outlives the critical section, and on completion it calls
@@ -18884,34 +18914,39 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           });
         }
       };
-      for (const queuedRun of prioritizedRuns) {
-        if (claimedRuns.length >= availableSlots) break;
-        if (dispatchStopped) break;
-        const queuedIssueId = readNonEmptyString(parseObject(queuedRun.contextSnapshot).issueId);
-        if (queuedIssueId && inFlightIssueIds.has(queuedIssueId)) {
-          // BLO-20396: only report the cancellation when this pass is the one
-          // that actually moved the row. Previously every overlapping pass
-          // logged it, which is why the same run ids appeared to be cancelled
-          // repeatedly.
-          const cancelled = await cancelQueuedRunForDuplicateDispatch(queuedRun, queuedIssueId);
-          if (cancelled) {
-            logger.info(
-              { runId: queuedRun.id, agentId, issueId: queuedIssueId },
-              "startNextQueuedRunForAgent: cancelled duplicate queued run for in-flight issue",
-            );
+      try {
+        for (const queuedRun of prioritizedRuns) {
+          if (claimedRuns.length >= availableSlots) break;
+          if (dispatchStopped) break;
+          const queuedIssueId = readNonEmptyString(parseObject(queuedRun.contextSnapshot).issueId);
+          if (queuedIssueId && inFlightIssueIds.has(queuedIssueId)) {
+            // BLO-20396: only report the cancellation when this pass is the one
+            // that actually moved the row. Previously every overlapping pass
+            // logged it, which is why the same run ids appeared to be cancelled
+            // repeatedly.
+            const cancelled = await cancelQueuedRunForDuplicateDispatch(queuedRun, queuedIssueId);
+            if (cancelled) {
+              logger.info(
+                { runId: queuedRun.id, agentId, issueId: queuedIssueId },
+                "startNextQueuedRunForAgent: cancelled duplicate queued run for in-flight issue",
+              );
+            }
+            continue;
           }
-          continue;
-        }
-        const claimed = await claimQueuedRun(queuedRun, companyAgents);
-        if (!claimed) {
-          if (await scheduleEmergencyContinuationForStillQueuedRun(queuedRun)) {
-            scheduledEmergencyContinuationAfterRefusal = true;
-            break;
+          const claimed = await claimQueuedRun(queuedRun, companyAgents);
+          if (!claimed) {
+            if (await scheduleEmergencyContinuationForStillQueuedRun(queuedRun)) {
+              scheduledEmergencyContinuationAfterRefusal = true;
+              break;
+            }
+            continue;
           }
-          continue;
+          claimedRuns.push(claimed);
+          if (queuedIssueId) inFlightIssueIds.add(queuedIssueId);
         }
-        claimedRuns.push(claimed);
-        if (queuedIssueId) inFlightIssueIds.add(queuedIssueId);
+      } catch (err) {
+        launchClaimedRuns();
+        throw err;
       }
       if (scheduledEmergencyContinuationAfterRefusal) {
         if (claimedRuns.length > 0) {
@@ -18920,7 +18955,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         return claimedRuns;
       }
       if (claimedRuns.length === 0) {
-        if (!finishPassWithoutClaims()) dispatchDeferredRunIdsByAgent.delete(agentId);
+        if (!finishPassWithoutClaims() && dispatchDeferredRunIdsByAgent.has(agentId)) {
+          scheduleDelayedAdmissionRetry(agentId);
+        }
         return [];
       }
       // Settle continuation bookkeeping for a pass that DID claim. A pass that
@@ -18929,6 +18966,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // cursor continuation instead; see advanceOrClearResumeCursor.
       advanceOrClearResumeCursor(claimedRuns.length);
       dispatchDeferredRunIdsByAgent.delete(agentId);
+      clearDelayedAdmissionRetry(agentId);
       launchClaimedRuns();
       return claimedRuns;
     }, {

@@ -2432,6 +2432,245 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     180_000,
   );
 
+  it("retries a lone emergency run after atomic admission refusal", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const runId = randomUUID();
+    const wakeId = randomUUID();
+    const staleSlotRunId = randomUUID();
+    const issuePrefix = `L${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const scheduledReasons: string[] = [];
+    let releasedSlot = false;
+    const boundedHeartbeat = heartbeatService(db, {
+      penstockGate: allowPenstockGate,
+      queuedRunDispatchBounds: { scanLimit: 1, maxScanBatches: 1, maxResumePasses: 5 },
+      onQueuedDispatchScheduledForTest: ({ reason }) => scheduledReasons.push(reason),
+      beforeQueuedDispatchPassForTest: async ({ reason }) => {
+        if (reason !== "retry_emergency_admission_refusal" || releasedSlot) return;
+        releasedSlot = true;
+        await db
+          .update(externalRuntimeReservations)
+          .set({ state: "released", releasedAt: new Date(), updatedAt: new Date() })
+          .where(eq(externalRuntimeReservations.runId, staleSlotRunId));
+      },
+    });
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "LoneAdmissionRetryCo",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "LoneAdmissionRetryAgent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { enabled: true, wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Lone refused critical work",
+      status: "todo",
+      priority: "critical",
+      assigneeAgentId: agentId,
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: staleSlotRunId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "succeeded",
+      contextSnapshot: {},
+      startedAt: new Date(Date.now() - 60_000),
+      finishedAt: new Date(Date.now() - 30_000),
+    });
+    await db.insert(externalRuntimeReservations).values({
+      companyId,
+      agentId,
+      runId: staleSlotRunId,
+      slotId: 0,
+      state: "launched",
+      jobName: `paperclip-agent-${staleSlotRunId}`,
+      jobUid: randomUUID(),
+      isolationMode: "run",
+      isolationKey: `run:${staleSlotRunId}`,
+      isolationBoundAt: new Date(Date.now() - 60_000),
+      reservedAt: new Date(Date.now() - 60_000),
+      launchingAt: new Date(Date.now() - 60_000),
+      launchedAt: new Date(Date.now() - 30_000),
+    });
+    await db.insert(agentWakeupRequests).values({
+      id: wakeId,
+      companyId,
+      agentId,
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId },
+      status: "queued",
+      runId,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "queued",
+      wakeupRequestId: wakeId,
+      contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+    });
+
+    const dispatchedRunIds: string[] = [];
+    mockAdapterExecute.mockImplementation(async (args: { runId: string }) => {
+      dispatchedRunIds.push(args.runId);
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        resultJson: { exitCode: 0 },
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    await boundedHeartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(boundedHeartbeat, runId, 60_000);
+
+    expect(releasedSlot).toBe(true);
+    expect(scheduledReasons).toContain("retry_emergency_admission_refusal");
+    expect(dispatchedRunIds).toContain(runId);
+    await boundedHeartbeat.drainInFlightExecutions(60_000);
+  }, 120_000);
+
+  it("launches earlier claims when a later refusal status read fails", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const firstIssueId = randomUUID();
+    const secondIssueId = randomUUID();
+    const firstRunId = randomUUID();
+    const secondRunId = randomUUID();
+    const issuePrefix = `F${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    let injectedFailure = false;
+    const boundedHeartbeat = heartbeatService(db, {
+      penstockGate: allowPenstockGate,
+      beforeQueuedDispatchRefusalStatusReadForTest: (run) => {
+        if (run.id !== secondRunId || injectedFailure) return;
+        injectedFailure = true;
+        throw new Error("injected refusal status read failure");
+      },
+    });
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "ClaimLaunchFailureCo",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "ClaimLaunchFailureAgent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { enabled: true, wakeOnDemand: true, maxConcurrentRuns: 2 } },
+      permissions: {},
+    });
+    await db.insert(issues).values([
+      {
+        id: firstIssueId,
+        companyId,
+        title: "First claim",
+        status: "in_progress",
+        priority: "critical",
+        assigneeAgentId: agentId,
+        issueNumber: 1,
+        identifier: `${issuePrefix}-1`,
+      },
+      {
+        id: secondIssueId,
+        companyId,
+        title: "Later refused claim",
+        status: "todo",
+        priority: "critical",
+        assigneeAgentId: agentId,
+        issueNumber: 2,
+        identifier: `${issuePrefix}-2`,
+      },
+    ]);
+    for (const [index, [runId, issueId]] of [[firstRunId, firstIssueId], [secondRunId, secondIssueId]].entries()) {
+      const wakeId = randomUUID();
+      const createdAt = new Date(Date.now() + index);
+      await db.insert(agentWakeupRequests).values({
+        id: wakeId,
+        companyId,
+        agentId,
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "issue_assigned",
+        payload: { issueId },
+        status: "queued",
+        runId,
+        requestedAt: createdAt,
+        updatedAt: createdAt,
+      });
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "queued",
+        wakeupRequestId: wakeId,
+        contextSnapshot: {
+          issueId,
+          wakeReason: "issue_assigned",
+          ...(runId === secondRunId
+            ? { paperclipK8sIsolationRetryAt: new Date(Date.now() + 60 * 60_000).toISOString() }
+            : {}),
+        },
+        createdAt,
+        updatedAt: createdAt,
+      });
+    }
+
+    const dispatchedRunIds: string[] = [];
+    mockAdapterExecute.mockImplementation(async (args: { runId: string }) => {
+      dispatchedRunIds.push(args.runId);
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        resultJson: { exitCode: 0 },
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    await boundedHeartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(boundedHeartbeat, firstRunId, 60_000);
+
+    expect(injectedFailure).toBe(true);
+    expect(dispatchedRunIds).toContain(firstRunId);
+    await boundedHeartbeat.drainInFlightExecutions(60_000);
+  }, 120_000);
+
   it("advances emergency keysets past default-generated sub-millisecond timestamps", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
