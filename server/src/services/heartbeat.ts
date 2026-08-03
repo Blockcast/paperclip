@@ -8092,7 +8092,35 @@ export function buildPaperclipTaskMarkdown(input: {
       lines.push(`- Head SHA at wake time: ${quoteTaskScalar(prReview.headSha)} (may be superseded — confirm the current head before diffing or checking out)`);
     }
     if (prReview.event) lines.push(`- GitHub event: ${quoteTaskScalar(prReview.event)}`);
-    if (prReview.prRole === "author") {
+    if (prReview.prRole === "author" && prReview.wakeReason === "github_pr_review_requested") {
+      // BLO-19522: a review REQUEST is not review feedback. The author wake
+      // still fires for it on purpose (a manager or peer may have requested
+      // review on someone else's PR — see the suppressAuthorWake comment in
+      // routes/github-webhook.ts for why suppressing it is the wrong trade),
+      // but it must not borrow the feedback directive below.
+      //
+      // It used to. `prRole: "author"` is set for every `github_pr_*` wake,
+      // and on this path reviewState/reviewBody/reviewAuthorLogin are all null
+      // (isActionableReviewFeedbackContext is false for review_requested), so
+      // the null-state branch asserted "A reviewer just posted findings on
+      // YOUR pull request" and told the author to push a follow-up commit —
+      // when no review existed at all. Observed three times across three repos
+      // (Network-Operator-Portal#604, paperclip#929, BLO-19722), each costing a
+      // full run, and the obvious action it steers toward is re-requesting the
+      // review, which re-posts the marker and spins the loop that the #583
+      // author-filter and PC#822's marker were both meant to keep closed.
+      const requesterLabel = prReview.requestCommentAuthorLogin ?? "Someone";
+      lines.push(
+        "",
+        "GitHub PR review request directive:",
+        `${requesterLabel} requested a review on YOUR pull request. This is a review REQUEST, not review feedback: no review has been submitted in response to it yet, and there are no findings to act on.`,
+        "The reviewer was woken separately by this same event — you do NOT need to request the review again. Re-posting a `<!-- paperclip:review-request -->` comment here would only re-trigger this wake.",
+        "If you were already waiting on this review, treat this run as a no-op: verify with `gh api repos/{owner}/{repo}/pulls/{n}/reviews` (and check for a comment-shaped `## Ally` review, which files no review object), then return to what you were doing. Act only on a review that actually exists.",
+      );
+      if (prReview.requestCommentBody) {
+        lines.push("", "The request comment:", fenceTaskText(prReview.requestCommentBody));
+      }
+    } else if (prReview.prRole === "author") {
       const reviewerLabel = prReview.reviewAuthorLogin ?? "A reviewer";
       const stateLabel = prReview.reviewState ? prReview.reviewState.toUpperCase() : null;
       lines.push(
