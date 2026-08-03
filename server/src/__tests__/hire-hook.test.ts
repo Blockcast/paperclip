@@ -155,6 +155,7 @@ describe("notifyHireApproved", () => {
       type: "openclaw_gateway",
       onHireApproved: vi.fn().mockResolvedValue({ ok: false, error: "HTTP 500", detail: { status: 500 } }),
     } as any);
+    vi.mocked(logActivity).mockRejectedValueOnce(new Error("activity write failed"));
 
     const db = mockDbWithAgent({
       id: "a1",
@@ -187,6 +188,7 @@ describe("notifyHireApproved", () => {
       type: "openclaw_gateway",
       onHireApproved: vi.fn().mockRejectedValue(new Error("Network error")),
     } as any);
+    vi.mocked(logActivity).mockRejectedValueOnce(new Error("activity write failed"));
 
     const db = mockDbWithAgent({
       id: "a1",

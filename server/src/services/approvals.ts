@@ -159,13 +159,19 @@ export function approvalService(db: Db) {
       throw error;
     }
 
-    const delivered = await notifyHireApproved(db, {
-      companyId: approval.companyId,
-      agentId,
-      source: "approval",
-      sourceId: approval.id,
-      approvedAt,
-    });
+    let delivered: boolean;
+    try {
+      delivered = await notifyHireApproved(db, {
+        companyId: approval.companyId,
+        agentId,
+        source: "approval",
+        sourceId: approval.id,
+        approvedAt,
+      });
+    } catch (error) {
+      await releaseClaim();
+      throw error;
+    }
     if (!delivered) {
       await releaseClaim();
       return;

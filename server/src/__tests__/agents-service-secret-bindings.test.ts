@@ -824,6 +824,46 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
     ).resolves.toHaveLength(1);
   });
 
+  it("releases the notification claim after an unexpected hook exception", async () => {
+    const companyId = await seedCompany();
+    const agentId = await seedAgentRow(companyId, {
+      name: "Built-in Hook Exception Retry",
+      status: "pending_approval",
+      adapterType: "codex_local",
+    });
+    const approvalId = randomUUID();
+    await db.insert(approvals).values({
+      id: approvalId,
+      companyId,
+      type: "hire_agent",
+      status: "pending",
+      requestedByUserId: "requester",
+      payload: {
+        agentId,
+        name: "Built-in Hook Exception Retry",
+        role: "engineer",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        budgetMonthlyCents: 0,
+        sourceBuiltInAgentKey: "briefs",
+      },
+      updatedAt: new Date(),
+    });
+    mockEnsureBuiltInAgent.mockResolvedValue(undefined);
+    mockNotifyHireApproved
+      .mockRejectedValueOnce(new Error("unexpected notification failure"))
+      .mockResolvedValueOnce(true);
+
+    await expect(
+      approvalService(db).approve(approvalId, "board-user", "Approved"),
+    ).rejects.toThrow("unexpected notification failure");
+    await expect(
+      approvalService(db).approve(approvalId, "board-user", "Approved"),
+    ).resolves.toMatchObject({ applied: false });
+    expect(mockEnsureBuiltInAgent).toHaveBeenCalledTimes(2);
+    expect(mockNotifyHireApproved).toHaveBeenCalledTimes(2);
+  });
+
   it("creates agent secret bindings when a new agent persists secret_ref env", async () => {
     const companyId = await seedCompany();
     const secrets = secretService(db);

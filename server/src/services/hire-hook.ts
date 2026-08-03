@@ -89,35 +89,49 @@ export async function notifyHireApproved(
       { companyId, agentId, adapterType, source, sourceId, error: result.error, detail: result.detail },
       "hire hook: adapter returned failure",
     );
-    await logActivity(db, {
-      companyId,
-      actorType: "system",
-      actorId: "hire_hook",
-      action: "hire_hook.failed",
-      entityType: "agent",
-      entityId: agentId,
-      details: { source, sourceId, adapterType, error: result.error, detail: result.detail },
-    });
+    try {
+      await logActivity(db, {
+        companyId,
+        actorType: "system",
+        actorId: "hire_hook",
+        action: "hire_hook.failed",
+        entityType: "agent",
+        entityId: agentId,
+        details: { source, sourceId, adapterType, error: result.error, detail: result.detail },
+      });
+    } catch (err) {
+      logger.error(
+        { err, companyId, agentId, adapterType, source, sourceId },
+        "hire hook: failed to record unsuccessful delivery",
+      );
+    }
     return false;
   } catch (err) {
     logger.error(
       { err, companyId, agentId, adapterType, source, sourceId },
       "hire hook: adapter threw",
     );
-    await logActivity(db, {
-      companyId,
-      actorType: "system",
-      actorId: "hire_hook",
-      action: "hire_hook.error",
-      entityType: "agent",
-      entityId: agentId,
-      details: {
-        source,
-        sourceId,
-        adapterType,
-        error: err instanceof Error ? err.message : String(err),
-      },
-    });
+    try {
+      await logActivity(db, {
+        companyId,
+        actorType: "system",
+        actorId: "hire_hook",
+        action: "hire_hook.error",
+        entityType: "agent",
+        entityId: agentId,
+        details: {
+          source,
+          sourceId,
+          adapterType,
+          error: err instanceof Error ? err.message : String(err),
+        },
+      });
+    } catch (activityError) {
+      logger.error(
+        { err: activityError, companyId, agentId, adapterType, source, sourceId },
+        "hire hook: failed to record delivery error",
+      );
+    }
     return false;
   }
 }
