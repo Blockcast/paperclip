@@ -888,7 +888,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       .from(issues)
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
-    expect(issue?.executionRunId).toBe(scheduled.run.id);
+    expect(issue?.executionRunId).toBeNull();
   });
 
   it("does not retry the permanent claude_k8s agent-home workspace failure", () => {
