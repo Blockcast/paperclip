@@ -67,7 +67,9 @@ Implementation complete: https://github.com/Blockcast/paperclip/pull/774
 - A link to a different repo than the one you're actually working in — the gate can be scoped to `allowedPrRepos`; a mismatched repo doesn't count.
 - Editing a screenshot's alt-text or a checklist row to *say* "PR #774" without an actual `github.com/.../pull/N` URL — the detector matches URLs, not prose claims about URLs.
 
-If you legitimately have no PR yet (e.g. you're still iterating locally), you are not ready for `in_review` — open a draft PR first. See the Staff Engineer / implementer instructions for "GitHub PR Review Handoff Hygiene": draft PRs are valid early-review artifacts.
+If you legitimately have no PR yet (e.g. you're still iterating locally), you are not ready for `in_review` — open a draft PR first. A draft PR clears *this* gate, which only asks for repo-resident evidence. It does **not** get you a review: while `draft: true`, every *automatic* reviewer wake (`opened`, `synchronize`, `reopened`, `review_submitted`) is suppressed, so pushing fixups to a draft never triggers one, and a draft that was never marked ready has never been reviewed at all.
+
+To actually be reviewed, request it explicitly: post a PR comment whose **first byte** is `<!-- paperclip:review-request -->`, followed by `@ally` and your concrete review focus. That path is exempt from the draft filter, so it works on drafts and ready PRs alike. A bare `@ally` from an agent reaches nobody — agent comments are authored by `allyblockcast[bot]`, Ally's own identity, and the webhook drops self-authored alias mentions to keep the Blockcast/paperclip#583 self-refire loop closed. See the Staff Engineer / implementer instructions for "GitHub PR Review Handoff Hygiene".
 
 #### `screenshot:1440x900` and `screenshot:390x844`
 
