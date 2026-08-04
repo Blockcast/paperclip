@@ -7,12 +7,20 @@ const lockfile = JSON.parse(
     "utf8",
   ),
 );
-const fastUri = lockfile.packages["node_modules/fast-uri"];
-
-assert.ok(fastUri, "designer lockfile missing fast-uri resolution");
-
-const [major, minor, patch] = fastUri.version.split(".").map(Number);
-assert.ok(
-  major > 3 || (major === 3 && (minor > 1 || (minor === 1 && patch >= 5))),
-  `designer lockfile resolved vulnerable fast-uri ${fastUri.version}`,
+const fastUriResolutions = Object.entries(lockfile.packages).filter(
+  ([path]) =>
+    path === "node_modules/fast-uri" || path.endsWith("/node_modules/fast-uri"),
 );
+
+assert.ok(
+  fastUriResolutions.length > 0,
+  "designer lockfile missing fast-uri resolution",
+);
+
+for (const [path, fastUri] of fastUriResolutions) {
+  const [major, minor, patch] = fastUri.version.split(".").map(Number);
+  assert.ok(
+    major > 3 || (major === 3 && (minor > 1 || (minor === 1 && patch >= 5))),
+    `designer lockfile ${path} resolved vulnerable fast-uri ${fastUri.version}`,
+  );
+}
