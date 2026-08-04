@@ -92,6 +92,9 @@ jobs:
       - name: Test PR test-coverage gate
         run: node --test ./.github/scripts/tests/check-pr-test-coverage.test.mjs
 
+      - name: Validate Designer fast-uri security floor
+        run: node ./scripts/designer-fast-uri-security.test.js
+
       - name: Setup Helm
         uses: azure/setup-helm@v4
         with:
