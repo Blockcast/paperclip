@@ -34,6 +34,12 @@ const mockIssueReferenceService = vi.hoisted(() => ({
 }));
 const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
 const mockGetActiveCompanyMembership = vi.hoisted(() => vi.fn(async () => ({ id: "membership-1" })));
+const mockCommentEffects = vi.hoisted(() => ({
+  enqueueCommentEffects: vi.fn(async () => undefined),
+  getEffectResult: vi.fn(async () => null),
+  hasCommentEffects: vi.fn(async () => true),
+  processCommentEffects: vi.fn(async () => true),
+}));
 
 const mockHeartbeatService = vi.hoisted(() => ({
   wakeup: vi.fn(async () => undefined),
@@ -115,6 +121,7 @@ function registerModuleMocks() {
     ...await vi.importActual<typeof import("../services/source-trust.js")>("../services/source-trust.js"),
     resolveActorSourceTrustForIssue: vi.fn(async () => null),
   }));
+  vi.doMock("../services/issue-comment-effects.js", () => mockCommentEffects);
   vi.doMock("../services/index.js", () => ({
     companyService: () => ({
       getById: vi.fn(async () => ({ id: "company-1", attachmentMaxBytes: 10 * 1024 * 1024 })),
@@ -192,7 +199,10 @@ async function createApp(actor: Record<string, unknown> = {
     (req as any).actor = actor;
     next();
   });
-  app.use("/api", issueRoutes({} as any, {} as any));
+  const db = {
+    transaction: vi.fn(async (callback: (tx: unknown) => Promise<unknown>) => callback({})),
+  };
+  app.use("/api", issueRoutes(db as any, {} as any));
   app.use(errorHandler);
   return app;
 }
@@ -244,6 +254,10 @@ describe("issue update comment wakeups", () => {
     mockIssueReferenceService.syncComment.mockResolvedValue(undefined);
     mockIssueReferenceService.syncDocument.mockResolvedValue(undefined);
     mockIssueReferenceService.syncIssue.mockResolvedValue(undefined);
+    mockCommentEffects.enqueueCommentEffects.mockResolvedValue(undefined);
+    mockCommentEffects.getEffectResult.mockResolvedValue(null);
+    mockCommentEffects.hasCommentEffects.mockResolvedValue(true);
+    mockCommentEffects.processCommentEffects.mockResolvedValue(true);
   });
 
   it("includes the new comment in assignment wakes from issue updates", async () => {
@@ -802,9 +816,9 @@ describe("issue update comment wakeups", () => {
       .mockResolvedValueOnce(null)
       .mockResolvedValueOnce(comment);
     mockIssueService.addComment.mockResolvedValue(comment);
-    mockIssueReferenceService.syncComment
+    mockCommentEffects.processCommentEffects
       .mockRejectedValueOnce(new Error("sync failed after insert"))
-      .mockResolvedValueOnce(undefined);
+      .mockResolvedValueOnce(true);
 
     const app = await createApp();
     const first = await request(app)
@@ -824,18 +838,9 @@ describe("issue update comment wakeups", () => {
     expect(second.status).toBe(200);
     expect(second.body).toMatchObject({ id: "comment-idempotent", deduplicated: true });
     expect(mockIssueService.addComment).toHaveBeenCalledTimes(1);
-    expect(mockIssueReferenceService.syncComment).toHaveBeenCalledTimes(2);
-    expect(mockLogActivity).toHaveBeenCalledTimes(1);
-    expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(1);
-    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
-      ASSIGNEE_AGENT_ID,
-      expect.objectContaining({
-        reason: "issue_commented",
-        idempotencyKey: "issue_comment:comment-idempotent:assignee:11111111-1111-4111-8111-111111111111",
-      }),
-    );
-    expect(mockIssueService.markCommentIdempotencyProcessed).toHaveBeenCalledTimes(1);
-    expect(mockIssueService.markCommentIdempotencyProcessed).toHaveBeenCalledWith("comment-idempotent");
+    expect(mockCommentEffects.enqueueCommentEffects).toHaveBeenCalledTimes(1);
+    expect(mockCommentEffects.processCommentEffects).toHaveBeenCalledTimes(2);
+    expect(mockIssueService.markCommentIdempotencyProcessed).not.toHaveBeenCalled();
   });
 
   it("does not route a plain-text agent name on a human-owned issue comment", async () => {

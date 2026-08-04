@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS "issue_comment_effects" (
 	"result" jsonb,
 	"attempts" integer DEFAULT 0 NOT NULL,
 	"last_error" text,
+	"claim_token" uuid,
 	"claimed_at" timestamp with time zone,
 	"claim_expires_at" timestamp with time zone,
 	"processed_at" timestamp with time zone,

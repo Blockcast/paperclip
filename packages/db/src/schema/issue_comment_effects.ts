@@ -70,6 +70,8 @@ export const issueCommentEffects = pgTable(
     result: jsonb("result").$type<Record<string, unknown> | null>(),
     attempts: integer("attempts").notNull().default(0),
     lastError: text("last_error"),
+    /** Ownership token; prevents a stale lease holder completing a reclaimed row. */
+    claimToken: uuid("claim_token"),
     claimedAt: timestamp("claimed_at", { withTimezone: true }),
     claimExpiresAt: timestamp("claim_expires_at", { withTimezone: true }),
     processedAt: timestamp("processed_at", { withTimezone: true }),
