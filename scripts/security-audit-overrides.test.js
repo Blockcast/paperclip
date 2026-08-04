@@ -75,7 +75,7 @@ async function main() {
     );
     assert.match(
       lockfile,
-      /jsdom@28\.1\.0[\s\S]*?undici: 7\.29\.0/,
+      /^  jsdom@28\.1\.0(?:\([^\n]*\))?:\n(?: {4,}[^\n]*\n)*?      undici: 7\.29\.0$/m,
       "jsdom must resolve undici 7.29.0",
     );
 
