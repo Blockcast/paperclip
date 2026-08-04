@@ -1187,6 +1187,65 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
       },
     );
 
+    it("reaps a context-less queued execution owner when a board user releases the issue", async () => {
+      const { companyId, agentId, failedRunId } = await seedCompanyAgentAndRuns();
+      const queuedExecutionRunId = await seedNeverStartedOwnerRun({
+        companyId,
+        agentId,
+        status: "queued",
+      });
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Board release with divergent owners",
+        status: "todo",
+        priority: "high",
+        assigneeAgentId: agentId,
+        checkoutRunId: failedRunId,
+        executionRunId: queuedExecutionRunId,
+        executionAgentNameKey: "codexcoder",
+        executionLockedAt: new Date(),
+      });
+
+      const response = await request(createApp(boardActor(companyId)))
+        .post(`/api/issues/${issueId}/release`)
+        .send();
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+
+      const issue = await db
+        .select({
+          status: issues.status,
+          assigneeAgentId: issues.assigneeAgentId,
+          checkoutRunId: issues.checkoutRunId,
+          executionRunId: issues.executionRunId,
+        })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]);
+      expect(issue).toEqual({
+        status: "todo",
+        assigneeAgentId: null,
+        checkoutRunId: null,
+        executionRunId: null,
+      });
+
+      const executionOwner = await db
+        .select({
+          status: heartbeatRuns.status,
+          contextSnapshot: heartbeatRuns.contextSnapshot,
+          errorCode: heartbeatRuns.errorCode,
+        })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, queuedExecutionRunId))
+        .then((rows) => rows[0]);
+      expect(executionOwner).toEqual({
+        status: "cancelled",
+        contextSnapshot: null,
+        errorCode: "issue_released",
+      });
+    });
+
     it("does not let a non-assignee release a non-in-progress issue", async () => {
       const { companyId, agentId, failedRunId, currentRunId } = await seedCompanyAgentAndRuns();
       const peerAgentId = randomUUID();
