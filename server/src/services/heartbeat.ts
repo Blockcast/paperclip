@@ -1189,6 +1189,15 @@ const EXTERNAL_LIFECYCLE_STALE_MS = RUN_STALE_SILENCE_MS;
 // BLO-19722: bounded so a pathological backlog cannot stall startup recovery
 // ahead of the reattach and reaper passes; the next start picks up the rest.
 const WORKER_CRASH_RECONCILE_MAX_RUNS = 200;
+// The batch cap above bounds ROWS, not TIME, and only time is what starves the
+// startup passes that queue behind this one. Each row can sit in a provider
+// release for `ENVIRONMENT_LEASE_RELEASE_TIMEOUT_MS`, so during a provider
+// outage a full 200-row batch is hours of serial waiting while external
+// reattachment, orphan reaping and queued-run resumption wait their turn. Two
+// minutes is comfortably more than a healthy full batch needs (releases resolve
+// in milliseconds when the provider is up) and short enough that a sick
+// provider costs one tick rather than a startup.
+const WORKER_CRASH_RECONCILE_BUDGET_MS = 2 * 60 * 1000;
 // Poison-row backoff. Candidates are drained oldest-first, so a run whose
 // *required* cleanup permanently fails would otherwise sit at the head of that
 // order and freeze recovery of every newer run. Backing a failing row off
@@ -13035,46 +13044,79 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const message = `Interrupted by worker process crash (${input.reason})`;
 
-    const markedRunIds: string[] = [];
+    // PHASE 1 — mark every owned run, in ONE statement, before recovering any of
+    // them. The ordering is the whole point of this function and is not a
+    // stylistic choice: the crash guard races a fixed exit budget, and
+    // `recoverCrashInterruptedRun` can spend minutes of it in a single provider
+    // release RPC. Interleaving mark-then-recover per run therefore let one slow
+    // first recovery consume the budget and leave every later run still
+    // `running` — which is precisely the `job_missing` misattribution this whole
+    // change exists to eliminate (BLO-19722 AC 2). Attribution is cheap and must
+    // never queue behind cleanup that is not.
+    //
+    // Batching is also strictly safer than the per-run loop it replaces: the
+    // guards are unchanged and now evaluated atomically. `status='running'`
+    // still prevents overwriting a run that reached a terminal state on its way
+    // out, and the `external_run_id` guard is still the second line of defence
+    // behind the adapter-type filter above (a local-adapter run somehow carrying
+    // an external id is not ours to terminalize).
+    //
+    // Anything left unrecovered below is not lost: `reconcileWorkerCrashedRuns`
+    // exists specifically to drain terminal `worker_crashed` rows on the next
+    // startup, and it is the reason marking-first is safe rather than merely
+    // faster.
+    const claimedRuns = await db
+      .update(heartbeatRuns)
+      .set({
+        status: "interrupted",
+        finishedAt: now,
+        error: message,
+        errorCode: "worker_crashed",
+        updatedAt: now,
+      })
+      .where(and(
+        inArray(heartbeatRuns.id, localRunIds),
+        eq(heartbeatRuns.status, "running"),
+        isNull(heartbeatRuns.externalRunId),
+      ))
+      .returning();
+
+    const markedRunIds = claimedRuns.map((run) => run.id);
     const retryRunIds: string[] = [];
 
-    for (const runId of localRunIds) {
-      // Claim one run at a time, gated on status='running' so we never overwrite
-      // a run that already reached a terminal state on its way out. The
-      // external_run_id guard is a second line of defence behind the
-      // adapter-type filter above: a local-adapter run that somehow carries an
-      // external id is not one we should be terminalizing either.
-      const claimed = await db
-        .update(heartbeatRuns)
-        .set({
-          status: "interrupted",
-          finishedAt: now,
-          error: message,
-          errorCode: "worker_crashed",
-          updatedAt: now,
-        })
-        .where(and(
-          eq(heartbeatRuns.id, runId),
-          eq(heartbeatRuns.status, "running"),
-          isNull(heartbeatRuns.externalRunId),
-        ))
-        .returning()
-        .then((rows) => rows[0] ?? null);
-      if (!claimed) continue;
-
-      markedRunIds.push(claimed.id);
-      const { retryRunId } = await recoverCrashInterruptedRun(claimed, {
-        reason: input.reason,
-        message,
-        clock,
-      });
-      if (retryRunId) retryRunIds.push(retryRunId);
+    if (markedRunIds.length > 0) {
+      // Emit attribution as soon as it is durable, not after recovery. If the
+      // budget expires mid-phase-2 the operator still has the crash-named
+      // reason and the full marked set in the log.
+      logger.warn(
+        { markedRunIds, reason: input.reason },
+        "marked local heartbeat runs interrupted by worker crash",
+      );
     }
 
-    if (markedRunIds.length > 0) {
+    // PHASE 2 — best-effort recovery with whatever budget is left. A throw here
+    // must not lose the marks already made, nor stop the remaining runs from
+    // being attempted, so each row is guarded individually.
+    for (const claimed of claimedRuns) {
+      try {
+        const { retryRunId } = await recoverCrashInterruptedRun(claimed, {
+          reason: input.reason,
+          message,
+          clock,
+        });
+        if (retryRunId) retryRunIds.push(retryRunId);
+      } catch (error) {
+        logger.warn(
+          { err: error, runId: claimed.id },
+          "crash-time recovery failed for marked run; left for startup reconciliation",
+        );
+      }
+    }
+
+    if (retryRunIds.length > 0) {
       logger.warn(
         { markedRunIds, retryRunIds },
-        "marked local heartbeat runs interrupted by worker crash",
+        "enqueued process-loss retries for worker-crashed runs",
       );
     }
 
@@ -13141,7 +13183,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // makes a provider RPC — no lock and no transaction may span that.
     //
     // `crashRecoveryAttempts` is incremented here, at claim time, so an attempt
-    // is counted even if the process dies before recording an outcome.
+    // is counted even if the process dies before recording an outcome. It is
+    // incremented FROM THE ROW (`coalesce(..., 0) + 1`) rather than from
+    // `run.crashRecoveryAttempts`, and the post-increment value is read back out
+    // of `RETURNING`. Computing an absolute value from the candidate snapshot
+    // was a lost update: candidates are drained serially oldest-first, so this
+    // row can sit behind slow earlier rows while a peer replica claims it,
+    // fails, and advances the durable counter. Writing the stale absolute value
+    // then rolls that counter *backwards*, and since the value feeds
+    // `workerCrashRecoveryBackoffMs`, the effect is to weaken or reset the
+    // exponential backoff protecting a row that is already failing repeatedly.
     //
     // `claimLeaseUntil` is also the CAS token the two terminal writes below
     // check against. The claim UPDATE above is itself a compare-and-set on
@@ -13153,12 +13204,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // the row out from under this call, and an unconditional terminal write
     // would then clobber that fresher attempt's bookkeeping with this stale
     // one's.
-    const attempts = (run.crashRecoveryAttempts ?? 0) + 1;
     const claimLeaseUntil = new Date(now.getTime() + WORKER_CRASH_RECOVERY_CLAIM_TTL_MS);
     const claimed = await db
       .update(heartbeatRuns)
       .set({
-        crashRecoveryAttempts: attempts,
+        crashRecoveryAttempts: sql`coalesce(${heartbeatRuns.crashRecoveryAttempts}, 0) + 1`,
         crashRecoveryNextAttemptAt: claimLeaseUntil,
         updatedAt: now,
       })
@@ -13175,6 +13225,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (!claimed) {
       return { retryRunId: null, claimed: false, completed: false, incompleteSteps: [] };
     }
+    // Authoritative post-increment count. Every backoff and log below reads this,
+    // never the pre-claim snapshot.
+    const attempts = claimed.crashRecoveryAttempts ?? 1;
 
     const steps: Array<{ name: string; outcome: CrashRecoveryStepOutcome }> = [];
     const record = (name: string, outcome: CrashRecoveryStepOutcome) => {
@@ -13496,22 +13549,39 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * crash in between would have made a genuinely unfinished row disappear from
    * this candidate set.
    *
-   * Deliberately NOT bounded by elapsed wall time. These rows are already
-   * terminal, so a `finishedAt >= since` cutoff would not defer the work, it
-   * would abandon it: an outage longer than the window would age the row out
-   * permanently while its issue lock still points at a dead run. Bounding is by
-   * batch size instead, oldest-first, so repeated passes make monotonic
-   * progress — with the backoff filter ensuring "oldest-first" cannot be
-   * captured by rows that will never succeed.
+   * Deliberately NOT bounded by a `finishedAt` cutoff. These rows are already
+   * terminal, so an age window would not defer the work, it would abandon it:
+   * an outage longer than the window would age the row out permanently while
+   * its issue lock still points at a dead run. Bounding is by batch size and by
+   * a wall-clock BUDGET instead, oldest-first, so repeated passes make
+   * monotonic progress — with the backoff filter ensuring "oldest-first" cannot
+   * be captured by rows that will never succeed.
+   *
+   * The budget is what bounds latency; the batch size does not. Each row can
+   * spend up to `ENVIRONMENT_LEASE_RELEASE_TIMEOUT_MS` in a provider release, so
+   * a full batch of 200 during a provider outage is hours of serial waiting.
+   * The startup caller runs this ahead of external reattachment, orphan
+   * reaping and queued-run resumption, so an unbounded drain here starves all
+   * of them. On budget exhaustion the pass stops cleanly and returns what it
+   * did; the untouched candidates keep their claim state and are picked up by
+   * the periodic pass or the next start. Stopping early is always safe —
+   * nothing here is all-or-nothing, and every row is individually claimed.
    */
-  async function reconcileWorkerCrashedRuns(options: { maxRuns?: number; now?: Date | (() => Date) } = {}): Promise<{
+  async function reconcileWorkerCrashedRuns(options: {
+    maxRuns?: number;
+    now?: Date | (() => Date);
+    budgetMs?: number;
+  } = {}): Promise<{
     reconciledRunIds: string[];
     retryRunIds: string[];
     unresolvedRunIds: string[];
+    budgetExhausted: boolean;
   }> {
     const clock = resolveCrashRecoveryClock(options.now);
     const now = clock();
     const maxRuns = options.maxRuns ?? WORKER_CRASH_RECONCILE_MAX_RUNS;
+    const budgetMs = options.budgetMs ?? WORKER_CRASH_RECONCILE_BUDGET_MS;
+    const deadline = now.getTime() + budgetMs;
 
     const candidates = await db
       .select()
@@ -13535,8 +13605,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const reconciledRunIds: string[] = [];
     const retryRunIds: string[] = [];
     const unresolvedRunIds: string[] = [];
+    let budgetExhausted = false;
 
     for (const run of candidates) {
+      // Budget is checked BEFORE each row, not after: a row already started is
+      // allowed to finish (abandoning it mid-recovery would leave exactly the
+      // partial state this pass exists to resolve), but no new provider wait is
+      // entered once the budget is gone.
+      if (clock().getTime() >= deadline) {
+        budgetExhausted = true;
+        break;
+      }
       // Ownership is decided by the atomic claim inside
       // `recoverCrashInterruptedRun`, not by a re-read here: a peer replica can
       // finish (or claim) this run at any point between the candidate scan and
@@ -13552,6 +13631,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (retryRunId) retryRunIds.push(retryRunId);
     }
 
+    if (budgetExhausted) {
+      logger.warn(
+        { budgetMs, candidates: candidates.length, processed: reconciledRunIds.length + unresolvedRunIds.length },
+        "worker-crash reconciliation stopped on wall-clock budget; remaining candidates deferred to the next pass",
+      );
+    }
+
     if (reconciledRunIds.length > 0 || unresolvedRunIds.length > 0) {
       logger.warn(
         { reconciledRunIds, retryRunIds, unresolvedRunIds },
@@ -13559,7 +13645,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       );
     }
 
-    return { reconciledRunIds, retryRunIds, unresolvedRunIds };
+    return { reconciledRunIds, retryRunIds, unresolvedRunIds, budgetExhausted };
   }
 
   async function drainRunningRunsForShutdown(signal: "SIGINT" | "SIGTERM", now = new Date()) {

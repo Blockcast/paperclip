@@ -1106,6 +1106,16 @@ export async function startServer(): Promise<StartedServer> {
   let heartbeatSchedulerStopped = false;
   let heartbeatStartupRecoveryPending = false;
   let heartbeatSchedulerInterval: ReturnType<typeof setInterval> | null = null;
+  // Single-flight latch for the crash-reconciliation → stale-lock-sweep pair
+  // (BLO-20822). Awaiting one before the other inside a single tick does NOT
+  // serialize them across ticks: `setInterval` starts the next callback on
+  // schedule regardless of whether the previous one has settled, and a
+  // reconciliation batch can easily outlive the interval. Without this latch,
+  // tick N+1's sweeper runs concurrently with tick N's reconciliation and can
+  // clear an issue lock in the window between reconciliation terminalizing the
+  // crashed run and handing that lock to the retry — exactly the interleaving
+  // the in-tick `await` was added to remove.
+  let crashReconcileSweepInFlight = false;
   const heartbeatSchedulerInFlight = new Set<Promise<void>>();
   const trackHeartbeatSchedulerWork = (work: Promise<unknown>) => {
     let tracked: Promise<void>;
@@ -1400,43 +1410,61 @@ export async function startServer(): Promise<StartedServer> {
           // else revisits it short of another full restart. Running this on
           // the same tick as the other periodic reconcilers below closes
           // that gap without waiting on a restart.
-          // Serialized with the stale-lock sweeper below, deliberately.
+          //
+          // Serialized with the stale-lock sweeper, deliberately.
           // Reconciliation terminalizes the crashed run and then hands its
           // issue lock to the retry as two separate statements; the sweeper
           // treats any lock held by a terminal run as cleanable, so run
           // concurrently it can clear that lock in between. The hand-over is
           // guarded and now reports having matched zero rows, but the cheaper
           // fix is not to create the window: neither pass is latency-sensitive
-          // and both are idempotent, so awaiting one before starting the other
-          // costs a tick and removes the interleaving entirely.
+          // and both are idempotent, so ordering one after the other removes
+          // the interleaving entirely.
           //
-          // Still tracked as scheduler work — `trackHeartbeatSchedulerWork`
-          // returns void, so awaiting it directly would drop this pass from the
-          // shutdown drain set. Track the promise, then await that same promise.
-          const crashReconciliation = heartbeat
-            .reconcileWorkerCrashedRuns()
-            .then((result) => {
-              if (result.reconciledRunIds.length > 0 || result.unresolvedRunIds.length > 0) {
-                logger.warn({ ...result }, "periodic worker-crash recovery reconciliation complete");
+          // That ordering has to hold ACROSS ticks, not just within one.
+          // `setInterval` fires the next callback on schedule whether or not
+          // the previous one settled, and a reconciliation batch can outlive
+          // the interval — so an in-tick `await` alone still let tick N+1's
+          // sweeper race tick N's reconciliation, recreating the exact window
+          // the ordering exists to close. `crashReconcileSweepInFlight` is the
+          // latch that actually enforces it; a tick that finds the pair still
+          // running simply skips it, because both passes are idempotent and
+          // the next tick will pick the work up.
+          //
+          // The pair is NOT awaited by the tick. Reconciliation drains a
+          // capped batch serially and each row can spend minutes in a provider
+          // release, so awaiting it here would let one provider outage starve
+          // orphan reaping, stale-lock cleanup and queued-run resumption below
+          // for hours. Those passes are independent of it and must keep their
+          // own cadence. It is still registered with
+          // `trackHeartbeatSchedulerWork` so shutdown drains it.
+          if (!crashReconcileSweepInFlight) {
+            crashReconcileSweepInFlight = true;
+            trackHeartbeatSchedulerWork((async () => {
+              try {
+                const result = await heartbeat.reconcileWorkerCrashedRuns();
+                if (result.reconciledRunIds.length > 0 || result.unresolvedRunIds.length > 0) {
+                  logger.warn({ ...result }, "periodic worker-crash recovery reconciliation complete");
+                }
+              } catch (err) {
+                logger.error({ err }, "periodic worker-crash recovery reconciliation failed");
               }
-            })
-            .catch((err) => {
-              logger.error({ err }, "periodic worker-crash recovery reconciliation failed");
-            });
-          trackHeartbeatSchedulerWork(crashReconciliation);
-          await crashReconciliation;
+
+              if (heartbeatSchedulerStopped) return;
+              try {
+                const swept = await heartbeat.sweepStaleIssueLocks();
+                if (swept.cleared > 0) {
+                  logger.warn({ ...swept }, "periodic stale-lock sweeper cleared issue locks");
+                }
+              } catch (err) {
+                logger.error({ err }, "periodic stale-lock sweeper failed");
+              }
+            })().finally(() => {
+              crashReconcileSweepInFlight = false;
+            }));
+          }
 
           if (heartbeatSchedulerStopped) return;
-          trackHeartbeatSchedulerWork(heartbeat
-            .sweepStaleIssueLocks()
-            .then((swept) => {
-              if (swept.cleared > 0) {
-                logger.warn({ ...swept }, "periodic stale-lock sweeper cleared issue locks");
-              }
-            })
-            .catch((err) => {
-              logger.error({ err }, "periodic stale-lock sweeper failed");
-            }));
 
           // Periodically reap orphaned runs (5-min staleness threshold) and make sure
           // persisted queued work is still being driven forward.

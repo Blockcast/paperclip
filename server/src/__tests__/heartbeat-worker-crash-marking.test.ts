@@ -229,6 +229,76 @@ describeEmbeddedPostgres("heartbeat worker-crash marking and recovery convergenc
     expect(agent!.errorReason ?? "").not.toContain("Job is missing");
   });
 
+  it("marks every owned run before recovering any of them, so a stalled first recovery cannot strand the rest", async () => {
+    // AC 2's actual failure mode, and the reason marking and recovery are two
+    // phases rather than one interleaved loop. The crash guard races a fixed
+    // exit budget, and a single `recoverCrashInterruptedRun` can spend minutes
+    // of it in one provider release. Pre-fix the loop was
+    // mark→recover→mark→recover, so the FIRST slow recovery consumed the budget
+    // and every later run was still `running` when the process died — later
+    // reconciled as `job_missing`, which is exactly the misattribution this
+    // issue exists to eliminate. Restoring the interleaved loop fails this:
+    // `second` reads `running` / errorCode null.
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const first = await insertRun({ companyId, agentId });
+    const second = await insertRun({ companyId, agentId });
+    markLiveInThisWorker(first.id);
+    markLiveInThisWorker(second.id);
+
+    // Stand in for the dying process's budget: the first recovery to run never
+    // returns, so nothing sequenced after it can execute.
+    let stalledRunId: string | null = null;
+    const heartbeat = service({
+      beforeCrashRecoveryTerminalWriteForTest: async (run) => {
+        if (stalledRunId === null) {
+          stalledRunId = run.id;
+          await new Promise(() => {});
+        }
+      },
+    });
+
+    const marking = heartbeat.markRunsInterruptedByWorkerCrash({ reason: "uncaughtException: boom" });
+    // Deliberately NOT awaited. In production this call does not get to finish:
+    // the crash guard races it against a fixed exit budget and the process dies
+    // mid-flight. What has to be true at that moment is that the marks are
+    // already COMMITTED — so that is what this polls for, while recovery is
+    // still wedged. Awaiting `marking` here would hang forever, which is
+    // precisely the budget-consuming stall being simulated.
+    marking.catch(() => {});
+    const deadline = Date.now() + 10_000;
+    let bothMarked = false;
+    while (Date.now() < deadline) {
+      const rows = await Promise.all([readRun(first.id), readRun(second.id)]);
+      if (rows.every((row) => row.status === "interrupted")) {
+        bothMarked = true;
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    expect(bothMarked).toBe(true);
+
+    // Both rows carry crash attribution, not just the one that got to recover.
+    for (const runId of [first.id, second.id]) {
+      const marked = await readRun(runId);
+      expect(marked.status).toBe("interrupted");
+      expect(marked.errorCode).toBe("worker_crashed");
+      expect(marked.error).toContain("worker process crash");
+      expect(marked.error).not.toContain("job_missing");
+    }
+
+    // And the stall was real — one row genuinely never finished recovering, so
+    // this passed because of the phase split and not because nothing blocked.
+    // The hook fires later than the marks by construction (it sits at the
+    // terminal write, deep inside phase 2), so it gets its own wait.
+    const stallDeadline = Date.now() + 10_000;
+    while (stalledRunId === null && Date.now() < stallDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    expect(stalledRunId).not.toBeNull();
+    const stalled = await readRun(stalledRunId!);
+    expect(stalled.crashRecoveryCompletedAt).toBeNull();
+  });
+
   it("leaves in-flight external-lifecycle runs running for restart reattach", async () => {
     const heartbeat = service();
     const { companyId, agentId } = await seedCompanyAndAgent({ adapterType: "claude_k8s" });
@@ -848,8 +918,19 @@ describeEmbeddedPostgres("heartbeat worker-crash marking and recovery convergenc
       },
     });
 
-    const result = await heartbeat.reconcileWorkerCrashedRuns({ now: clock });
+    // `budgetMs` is raised past this scenario's simulated stalls on purpose:
+    // this test is about per-claim clock isolation, and each row here burns
+    // STALL_MS (11 min) by design. Under the default wall-clock budget the
+    // second row would — correctly — never be reached, which is the property
+    // the dedicated budget test below asserts. Leaving the default here would
+    // silently convert this into a one-row test that could no longer catch the
+    // shared-clock regression it exists for.
+    const result = await heartbeat.reconcileWorkerCrashedRuns({
+      now: clock,
+      budgetMs: 60 * 60 * 1000,
+    });
     expect(result.unresolvedRunIds).toEqual([older.id, newer.id]);
+    expect(result.budgetExhausted).toBe(false);
 
     // The property that matters: every claim owns its row for a full TTL from
     // the moment it claimed it. Pre-fix the newer run scored -1 minute here.
@@ -870,6 +951,56 @@ describeEmbeddedPostgres("heartbeat worker-crash marking and recovery convergenc
     expect(afterNewer.crashRecoveryNextAttemptAt!.getTime()).toBe(
       batchStart.getTime() + 2 * STALL_MS + BACKOFF_BASE_MS,
     );
+  });
+
+  // ---- wall-clock budget bounds the drain ---------------------------------
+
+  it("stops draining candidates once the wall-clock budget is spent, leaving the rest claimable", async () => {
+    // The batch cap bounds ROWS; only a time budget bounds LATENCY. Each row can
+    // sit in a provider release for minutes, and startup runs this pass ahead of
+    // external reattachment, orphan reaping and queued-run resumption — so an
+    // unbounded drain during a provider outage starves all of them for hours.
+    // Reverting the deadline check in `reconcileWorkerCrashedRuns` makes this
+    // fail: both rows get processed and `budgetExhausted` reads false.
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const older = await seedCrashMarkedRun({
+      companyId,
+      agentId,
+      finishedAt: new Date(Date.now() - 60 * 60 * 1000),
+    });
+    const newer = await seedCrashMarkedRun({
+      companyId,
+      agentId,
+      finishedAt: new Date(Date.now() - 60_000),
+    });
+
+    let current = new Date("2026-08-02T12:00:00.000Z");
+    const clock = () => new Date(current);
+    const BUDGET_MS = 5 * 60 * 1000;
+    // One row overshoots the whole budget on its own — the provider-outage shape.
+    const SLOW_ROW_MS = BUDGET_MS + 60_000;
+
+    const heartbeat = service({
+      environmentRuntime: failingEnvironmentRuntime(),
+      beforeCrashRecoveryTerminalWriteForTest: async () => {
+        current = new Date(current.getTime() + SLOW_ROW_MS);
+      },
+    });
+
+    const result = await heartbeat.reconcileWorkerCrashedRuns({
+      now: clock,
+      budgetMs: BUDGET_MS,
+    });
+
+    // Oldest-first: the older row is the one that got in before the budget went.
+    expect(result.unresolvedRunIds).toEqual([older.id]);
+    expect(result.budgetExhausted).toBe(true);
+
+    // Deferred, not abandoned. The untouched row keeps a null completion marker
+    // and an unclaimed backoff field, so the next pass finds it as a candidate.
+    const skipped = await readRun(newer.id);
+    expect(skipped.crashRecoveryCompletedAt).toBeNull();
+    expect(skipped.crashRecoveryAttempts ?? 0).toBe(0);
   });
 
   // ---- (i) a failed REQUIRED pre-retry step must stop the retry ------------
