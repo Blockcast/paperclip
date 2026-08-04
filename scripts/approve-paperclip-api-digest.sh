@@ -821,10 +821,6 @@ if (( final_count > MAX_APPROVED_DIGESTS )); then
   exit 1
 fi
 
-# From here on, success intentionally leaves the rollout lock active for the
-# next release to retire after observing this exact plan marker live.
-lock_cleanup_armed=""
-
 # A release workflow that sets this receives the exact server-normalized object
 # whose canonical hash was persisted in the lock. Applying this object directly
 # prevents a package manager's three-way merge from preserving live-only drift
@@ -832,6 +828,11 @@ lock_cleanup_armed=""
 if [[ -n "${PAPERCLIP_APPROVED_SERVER_PLAN_OUT:-}" ]]; then
   (umask 077; printf '%s\n' "$server_plan_json" >"$PAPERCLIP_APPROVED_SERVER_PLAN_OUT")
 fi
+
+# From here on, success intentionally leaves the rollout lock active for the
+# next release to retire after observing this exact plan marker live. Keep
+# cleanup armed until the approved object has been handed off successfully.
+lock_cleanup_armed=""
 
 echo "Approved and admission-ready. ${final_count} digest(s) in the window."
 echo "Approval lock remains on ${DIGEST} until Deployment/${DEPLOYMENT} rolls out a"

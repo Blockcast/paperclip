@@ -500,7 +500,8 @@ jobs:
             --show-only templates/deployment-api.yaml \
             --set image.tag="${TAG}" \
             --set-string image.digest="${DIGEST}" \
-            | PAPERCLIP_APPROVAL_PLAN_SHA256="${marker}" "${STAMP_SCRIPT}" \
+            | PAPERCLIP_DEPLOY_NAMESPACE="${NS}" \
+              PAPERCLIP_APPROVAL_PLAN_SHA256="${marker}" "${STAMP_SCRIPT}" \
             | kubectl create --dry-run=client -n "${NS}" -o json -f - > "${plan}"
 
           jq -e --arg key "${marker_key}" --arg marker "${marker}" --arg image "${expected_image}" --arg namespace "${NS}" '
@@ -608,6 +609,7 @@ jobs:
           APPROVED_SERVER_PLAN: ${{ steps.approval.outputs.server_plan_path }}
           STAMP_SCRIPT: ${{ steps.tooling.outputs.stamp_script }}
           PAPERCLIP_APPROVAL_PLAN_SHA256: ${{ steps.plan.outputs.marker }}
+          PAPERCLIP_DEPLOY_NAMESPACE: ${{ vars.PAPERCLIP_NAMESPACE || 'paperclip' }}
         run: |
           set -euo pipefail
           [[ "${DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]

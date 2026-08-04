@@ -148,6 +148,8 @@ test("Docker deploy approves the exact stamped plan before Helm mutates producti
     /PAPERCLIP_DEPLOY_NAMESPACE="\$\{NS\}"/,
   );
   assert.match(deployJob, /PAPERCLIP_APPROVED_SERVER_PLAN_OUT="\$\{approved_server_plan\}"/);
+  assert.match(deployJob, /PAPERCLIP_DEPLOY_NAMESPACE="\$\{NS\}"[\s\\]+PAPERCLIP_APPROVAL_PLAN_SHA256/);
+  assert.match(deployJob, /PAPERCLIP_DEPLOY_NAMESPACE: \$\{\{ vars\.PAPERCLIP_NAMESPACE \|\| 'paperclip' \}\}/);
   assert.match(deployJob, /--post-renderer "\$\{STAMP_SCRIPT\}"/);
   assert.equal(
     deployJob.match(/reconcile_approved_api_plan/g)?.length,

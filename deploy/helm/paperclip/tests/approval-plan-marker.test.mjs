@@ -23,6 +23,7 @@
 import { execFileSync } from "node:child_process";
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -82,6 +83,17 @@ function stampApiDeployment(deployment, marker = SAMPLE) {
       stdio: ["pipe", "pipe", "ignore"],
     }),
   );
+}
+
+function markerFor(deployment) {
+  const canonical = execFileSync("jq", ["-cS", "."], {
+    input: JSON.stringify(stripMarker(deployment)),
+    encoding: "utf8",
+  }).trimEnd();
+  return execFileSync("sha256sum", [], {
+    input: canonical,
+    encoding: "utf8",
+  }).split(" ")[0];
 }
 
 // Mirrors CANONICAL_UNSTAMPED_PLAN in approve-paperclip-api-digest.sh, including
@@ -151,10 +163,22 @@ test("stamping the marker changes nothing else in the rendered Deployment", () =
 
 test("trusted post-renderer stamps an unstamped legacy chart without other changes", () => {
   const unstamped = renderApiDeployment();
-  const stamped = stampApiDeployment(unstamped);
+  const marker = markerFor(unstamped);
+  const stamped = stampApiDeployment(unstamped, marker);
 
-  assert.equal(stamped.spec.template.metadata.annotations[MARKER], SAMPLE);
+  assert.equal(stamped.spec.template.metadata.annotations[MARKER], marker);
   assert.deepEqual(stripMarker(stamped), unstamped);
+});
+
+test("trusted post-renderer rejects a Helm render that differs from the approved plan", () => {
+  const approved = renderApiDeployment();
+  const changed = structuredClone(approved);
+  changed.spec.replicas += 1;
+
+  assert.throws(
+    () => stampApiDeployment(changed, markerFor(approved)),
+    /does not match approved plan/,
+  );
 });
 
 test("trusted post-renderer rejects a conflicting marker", () => {
@@ -163,6 +187,18 @@ test("trusted post-renderer rejects a conflicting marker", () => {
     () => stampApiDeployment(chartStamped, "b".repeat(64)),
     /already carries a different approval-plan marker/,
   );
+});
+
+test("approval cleanup stays armed until the server-normalized plan handoff succeeds", () => {
+  const script = readFileSync(
+    path.join(repoRoot, "scripts/approve-paperclip-api-digest.sh"),
+    "utf8",
+  );
+  const handoff = script.indexOf('printf \'%s\\n\' "$server_plan_json" >"$PAPERCLIP_APPROVED_SERVER_PLAN_OUT"');
+  const disarm = script.indexOf('lock_cleanup_armed=""', handoff);
+
+  assert.notEqual(handoff, -1, "approval script must write the server-normalized plan");
+  assert.ok(disarm > handoff, "cleanup must remain armed until the plan handoff succeeds");
 });
 
 test("the invariant also holds when pod.annotations is already non-empty", () => {
