@@ -5240,6 +5240,8 @@ export function recoveryService(
     agent: typeof agents.$inferSelect;
     latestRun: NonNullable<LatestIssueRun>;
   }) {
+    const taskKey =
+      readNonEmptyString(parseObject(input.latestRun.contextSnapshot).taskKey) ?? input.issue.id;
     const scheduledRetryAttempt = Math.min(
       (input.latestRun.scheduledRetryAttempt ?? 0) + 1,
       SESSION_UNAVAILABLE_RECOVERY_MAX_ATTEMPTS,
@@ -5251,7 +5253,7 @@ export function recoveryService(
       retryReason: ZERO_TOKEN_SESSION_RESET_RETRY_REASON,
       source: "issue.zero_token_session_reset_recovery",
       retryOfRunId: input.latestRun?.id ?? null,
-      extraContext: { scheduledRetryAttempt },
+      extraContext: { scheduledRetryAttempt, taskKey },
     });
     if (!queued) return null;
 
@@ -5303,6 +5305,8 @@ export function recoveryService(
     if (snapshottedAdapterType || !input.latestRun.sessionIdBefore) {
       return snapshottedAdapterType;
     }
+    const taskKey =
+      readNonEmptyString(parseObject(input.latestRun.contextSnapshot).taskKey) ?? input.issue.id;
 
     return db
       .select({ adapterType: agentTaskSessions.adapterType })
@@ -5311,7 +5315,7 @@ export function recoveryService(
         and(
           eq(agentTaskSessions.companyId, input.issue.companyId),
           eq(agentTaskSessions.agentId, input.latestRun.agentId),
-          eq(agentTaskSessions.taskKey, input.issue.id),
+          eq(agentTaskSessions.taskKey, taskKey),
           eq(agentTaskSessions.sessionDisplayId, input.latestRun.sessionIdBefore),
         ),
       )

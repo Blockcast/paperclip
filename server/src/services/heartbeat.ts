@@ -22128,6 +22128,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }));
         }
         await recordZeroTokenCompletedRunStreak(agent);
+        let suppressImmediateRecovery = false;
         if (outcome === "failed" && isMaxTurnExhaustionRun(livenessRun)) {
           const policy = parseMaxTurnContinuationPolicy(agent);
           if (policy.enabled && policy.maxAttempts > 0) {
@@ -22150,10 +22151,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             });
           }
         } else if (outcome === "failed" && shouldScheduleAutomaticRunRetry(livenessRun)) {
-          await scheduleBoundedRetryForRun(livenessRun, agent, resolveAutomaticRunRetryOpts(livenessRun));
+          const automaticRetryResult = await scheduleBoundedRetryForRun(
+            livenessRun,
+            agent,
+            resolveAutomaticRunRetryOpts(livenessRun),
+          );
+          if (
+            livenessRun.errorCode === "session_unavailable" &&
+            automaticRetryResult.outcome === "retry_exhausted"
+          ) {
+            suppressImmediateRecovery = true;
+          }
         }
         const issueCommentPolicyResult = await finalizeIssueCommentPolicy(livenessRun, agent);
-        await releaseIssueExecutionAndPromote(livenessRun);
+        await releaseIssueExecutionAndPromote(
+          livenessRun,
+          suppressImmediateRecovery ? { suppressImmediateRecovery: true } : undefined,
+        );
         await handleRunLivenessContinuation(livenessRun);
         await handleSuccessfulRunHandoff(
           issueCommentPolicyResult.outcome === "retry_queued" || issueCommentPolicyResult.outcome === "retry_exhausted"
@@ -23114,7 +23128,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               and(
                 eq(agentTaskSessions.companyId, issue.companyId),
                 eq(agentTaskSessions.agentId, deferredAgent.id),
-                eq(agentTaskSessions.taskKey, issue.id),
+                eq(agentTaskSessions.taskKey, promotedTaskKey ?? issue.id),
                 eq(agentTaskSessions.adapterType, deferredAgent.adapterType),
               ),
             );
@@ -24865,6 +24879,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                   eq(agentWakeupRequests.agentId, agentId),
                   eq(agentWakeupRequests.status, "deferred_issue_execution"),
                   sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issue.id}`,
+                  hasInitialRetryMetadata
+                    ? and(
+                        sql`(${agentWakeupRequests.payload} -> ${DEFERRED_WAKE_CONTEXT_KEY} ->> 'retryOfRunId') is not distinct from ${opts.retryOfRunId ?? null}`,
+                        sql`(${agentWakeupRequests.payload} -> ${DEFERRED_WAKE_CONTEXT_KEY} ->> 'scheduledRetryAttempt') is not distinct from ${opts.scheduledRetryAttempt?.toString() ?? null}`,
+                      )
+                    : and(
+                        sql`${agentWakeupRequests.payload} -> ${DEFERRED_WAKE_CONTEXT_KEY} ->> 'retryOfRunId' is null`,
+                        sql`${agentWakeupRequests.payload} -> ${DEFERRED_WAKE_CONTEXT_KEY} ->> 'scheduledRetryAttempt' is null`,
+                      ),
                 ),
               )
               .orderBy(asc(agentWakeupRequests.requestedAt))
@@ -25152,7 +25175,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               and(
                 eq(agentTaskSessions.companyId, issue.companyId),
                 eq(agentTaskSessions.agentId, agent.id),
-                eq(agentTaskSessions.taskKey, issue.id),
+                eq(agentTaskSessions.taskKey, effectiveTaskKey ?? issue.id),
                 eq(agentTaskSessions.adapterType, agent.adapterType),
               ),
             );

@@ -7460,6 +7460,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       agentStatus: "error",
     });
 
+    const historicalTaskKey = randomUUID();
     const failedRun = await db
       .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
       .from(heartbeatRuns)
@@ -7469,7 +7470,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     await db
       .update(heartbeatRuns)
       .set({
-        contextSnapshot: legacyContextSnapshot,
+        contextSnapshot: { ...legacyContextSnapshot, taskKey: historicalTaskKey },
         sessionIdBefore: "stale-opencode-session",
       })
       .where(eq(heartbeatRuns.id, runId));
@@ -7478,7 +7479,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       companyId,
       agentId,
       adapterType: "opencode_k8s",
-      taskKey: issueId,
+      taskKey: historicalTaskKey,
       sessionParamsJson: { sessionId: "stale-opencode-session" },
       sessionDisplayId: "stale-opencode-session",
     });
@@ -7665,12 +7666,34 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   });
 
   it("does not reclassify a historical non-OpenCode failure after adapter reconfiguration", async () => {
-    const { agentId, issueId } = await seedStrandedIssueFixture({
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
       status: "in_progress",
       runStatus: "failed",
       runErrorCode: "adapter_failed",
       runError: "Session unavailable",
       adapterType: "claude_k8s",
+    });
+    const historicalTaskKey = randomUUID();
+    const failedRun = await db
+      .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0]!);
+    const { adapterType: _adapterType, ...legacyContextSnapshot } = failedRun.contextSnapshot ?? {};
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: { ...legacyContextSnapshot, taskKey: historicalTaskKey },
+        sessionIdBefore: "historical-claude-session",
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    await db.insert(agentTaskSessions).values({
+      companyId,
+      agentId,
+      adapterType: "claude_k8s",
+      taskKey: historicalTaskKey,
+      sessionParamsJson: { sessionId: "historical-claude-session" },
+      sessionDisplayId: "historical-claude-session",
     });
     await db.update(agents).set({ adapterType: "opencode_k8s" }).where(eq(agents.id, agentId));
 
