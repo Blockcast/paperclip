@@ -19066,6 +19066,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
   }
 
+  // BLO-21256: this pushes an already-claimed run backwards to
+  // queued/startedAt:null and nulls externalRunId, so it is only safe as long
+  // as `conflict` can never be raised once this run's own k8s Job has been
+  // created. That invariant holds today: ExternalRuntimeIsolationConflictError
+  // is thrown solely inside bindExternalRuntimeReservationIsolation()
+  // (external-runtime-reservations.ts), and only while the run's reservation
+  // is still isolationMode "pending"/"legacy" (the `replaceableBinding` gate)
+  // -- i.e. strictly before markExternalRuntimeReservationLaunching() /
+  // recordExpectedExternalRuntimeJobName() / recordExternalRuntimeJobIdentity()
+  // can ever stamp a Job onto it. Once bound, a further bind attempt on the
+  // same reservation either no-ops or throws a plain drift Error, never this
+  // type. Pinned by heartbeat-external-runtime-retry.test.ts's
+  // "cannot raise ExternalRuntimeIsolationConflictError for a run whose Job
+  // has already been created" case -- if a refactor moves isolation binding
+  // to after Job creation, or lets a bound reservation re-enter the throw
+  // path, that test fails before this function can strand a live Job.
   async function deferRunForK8sIsolationConflict(
     run: typeof heartbeatRuns.$inferSelect,
     conflict: ExternalRuntimeIsolationConflictError,
