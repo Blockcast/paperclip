@@ -1082,6 +1082,184 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     expect(starvedRun?.status).not.toBe("queued");
   });
 
+  it("dispatches a non-critical run past the absolute starvation floor ahead of fresh critical work (BLO-21792)", async () => {
+    // Regression for BLO-21792, and the deliberate inverse of the BLO-16554
+    // case directly above. That test pins the ROUTINE floor: a 3h-starved
+    // non-critical run escalates to rank 2 and must still yield to fresh
+    // critical work (ranks 0-1).
+    //
+    // Rank 2 never beats rank 0/1, so on an agent with a SUSTAINED supply of
+    // fresh critical work the routine escalation is necessary but not
+    // sufficient — the aged run loses every tick, with no upper bound on the
+    // wait. BLO-21116 measured that class stranded 5-16h in `queued`.
+    //
+    // Past STARVATION_ABSOLUTE_ESCALATION_MS (6h) a ready run of any priority
+    // escalates to -1 and takes the slot first. Same three-row shape and the
+    // same single effective slot as BLO-16554; only the starved run's age
+    // changes (3h -> 7h), and with it the expected dispatch order.
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runningIssueId = randomUUID();
+    const starvedIssueId = randomUUID();
+    const freshIssueId = randomUUID();
+    const issuePrefix = `X${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "AbsoluteStarvationFloorCo",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "SustainedCriticalPressureAgent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      // Same as BLO-16554: concurrencyEnabled omitted -> effective slots = 1,
+      // so dispatch order is directly observable from the claim sequence.
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 3 } },
+      permissions: {},
+    });
+
+    await db.insert(issues).values([
+      {
+        id: runningIssueId,
+        companyId,
+        title: "Other backlog work currently occupying the single slot",
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+        issueNumber: 1,
+        identifier: `${issuePrefix}-1`,
+        startedAt: new Date(),
+      },
+      {
+        id: starvedIssueId,
+        companyId,
+        title: "Non-critical work starved past the absolute floor",
+        status: "in_progress",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        issueNumber: 2,
+        identifier: `${issuePrefix}-2`,
+        startedAt: new Date(Date.now() - 7 * 60 * 60 * 1000),
+      },
+      {
+        id: freshIssueId,
+        companyId,
+        title: "Fresh critical-priority contender",
+        status: "in_progress",
+        priority: "critical",
+        assigneeAgentId: agentId,
+        issueNumber: 3,
+        identifier: `${issuePrefix}-3`,
+        startedAt: new Date(),
+      },
+    ]);
+
+    const runningRunId = randomUUID();
+    const starvedRunId = randomUUID();
+    const freshRunId = randomUUID();
+    // 7h > STARVATION_ABSOLUTE_ESCALATION_MS (6h). Deliberately NOT a recovery
+    // wake (no recoveryActionId / issue_recovery_action source): the point is
+    // that ordinary backlog work gets the bound, not just the fast-tracked
+    // recovery lane.
+    const starvedCreatedAt = new Date(Date.now() - 7 * 60 * 60 * 1000);
+    const freshCreatedAt = new Date();
+
+    await db.insert(heartbeatRuns).values([
+      {
+        id: runningRunId,
+        companyId,
+        agentId,
+        invocationSource: "heartbeat",
+        triggerDetail: "timer",
+        status: "running",
+        contextSnapshot: { issueId: runningIssueId, wakeReason: "heartbeat_timer" },
+        startedAt: new Date(),
+        lastOutputAt: new Date(),
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      },
+      {
+        id: starvedRunId,
+        companyId,
+        agentId,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status: "queued",
+        contextSnapshot: {
+          issueId: starvedIssueId,
+          wakeReason: "issue_continuation_needed",
+          source: "issue.continuation_recovery",
+        },
+        createdAt: starvedCreatedAt,
+        updatedAt: starvedCreatedAt,
+      },
+      {
+        id: freshRunId,
+        companyId,
+        agentId,
+        invocationSource: "heartbeat",
+        triggerDetail: "timer",
+        status: "queued",
+        contextSnapshot: { issueId: freshIssueId, wakeReason: "heartbeat_timer" },
+        createdAt: freshCreatedAt,
+        updatedAt: freshCreatedAt,
+      },
+    ]);
+
+    const dispatchedRunIds: string[] = [];
+    mockAdapterExecute.mockImplementation(async (args: { runId: string }) => {
+      dispatchedRunIds.push(args.runId);
+      return {
+        exitCode: 0,
+        signal: null as string | null,
+        timedOut: false,
+        errorMessage: null as string | null,
+        resultJson: { exitCode: 0 },
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    // The single effective slot is occupied, so nothing may dispatch yet.
+    await heartbeat.resumeQueuedRuns();
+    const stillQueued = await db
+      .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(inArray(heartbeatRuns.id, [starvedRunId, freshRunId]));
+    expect(stillQueued.every((row) => row.status === "queued")).toBe(true);
+    expect(dispatchedRunIds).toHaveLength(0);
+
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "succeeded", finishedAt: new Date(), updatedAt: new Date() })
+      .where(eq(heartbeatRuns.id, runningRunId));
+
+    await heartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(heartbeat, starvedRunId);
+    await waitForRunToSettle(heartbeat, freshRunId);
+
+    // The inversion: past the absolute floor the starved run goes FIRST, ahead
+    // of the fresh critical row that would win at any age below 6h.
+    expect(dispatchedRunIds[0]).toBe(starvedRunId);
+    // Critical work is delayed by one slot, never dropped.
+    expect(dispatchedRunIds).toContain(freshRunId);
+    expect(dispatchedRunIds.indexOf(freshRunId)).toBeGreaterThan(0);
+
+    const settledRuns = await db
+      .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(inArray(heartbeatRuns.id, [starvedRunId, freshRunId]));
+    expect(settledRuns.every((row) => row.status !== "queued")).toBe(true);
+  });
+
   it("dispatches critical issue work before an aged issue-less run without starving routine issue work (BLO-19337)", async () => {
     // Regression for BLO-18995: dispatchRank returned a flat `10` for any run
     // without an issueId *above* the STARVATION_* aging escalation, so that
