@@ -587,7 +587,27 @@ describeEmbeddedPostgres("queued backlog convergence (BLO-20396)", () => {
     await insertChunked(runRows, (chunk) => db.insert(heartbeatRuns).values(chunk));
 
     await heartbeat.resumeQueuedRuns();
-    await heartbeat.drainInFlightExecutions(120_000);
+    // BLO-20885: this drain budget is a hang guard, not an assertion about
+    // speed, so it must clear the slowest legitimate run by a wide margin. At
+    // 120s it did not: cancelling 2,010 dependency-blocked rows measured 80s of
+    // the budget on an unloaded CI shard and 144s on a loaded one, so the
+    // convergence assertion below started reporting a *timing* result — it
+    // failed whenever the shard happened to be busy, which is a property of the
+    // runner and not of the code under test. `drainInFlightExecutions` returns
+    // as soon as the in-flight set empties, so a wider bound costs nothing on a
+    // healthy run and only extends the genuinely-broken one.
+    //
+    // Raising it does not weaken what this test guards. The regression it
+    // exists to catch is non-convergence — a pass that rescans the identical
+    // 2,000-row prefix forever and therefore never reaches the runnable row at
+    // all. That fails at any budget; no amount of extra time rescues it. What
+    // the old bound could not distinguish was "never converges" from "converged
+    // slower than this arbitrary number", and only the first is a defect.
+    //
+    // 420s keeps ~180s of the enclosing 600s test timeout for fixture insert
+    // and the assertions, so a real hang still surfaces here rather than as a
+    // bare vitest timeout with no diagnostic.
+    await heartbeat.drainInFlightExecutions(420_000);
 
     // Reached via the resumed continuation, not by one pass scanning forever.
     const [runnableAfter] = await db
