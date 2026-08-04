@@ -64,12 +64,21 @@ import { matchesTaskKey, normalizePrReviewRepoFullName } from "../services/pr-re
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type PrReviewerSelectionDb = Pick<Db | DbTransaction, "select">;
 
-// Keep lock contention well below GitHub's webhook timeout. The winner holds
-// one pooled connection while heartbeat commits through another; createDb's
-// default pool satisfies the required minimum of two connections.
+// Keep lock contention well below GitHub's webhook timeout. If this bounded
+// serialization layer times out, dispatch falls back to the same idempotent,
+// durable wake path without the lock rather than dropping the request. The
+// winner holds one pooled connection while heartbeat commits through another;
+// createDb's default pool satisfies the required minimum of two.
 const PR_REVIEWER_TASK_LOCK_TIMEOUT_MS = 2_000;
 const PR_REVIEWER_TASK_LOCK_RETRY_MS = 25;
 const ACTIVE_PR_REVIEWER_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
+
+class PrReviewerTaskLockTimeoutError extends Error {
+  constructor() {
+    super("timed out acquiring PR reviewer task assignment lock");
+    this.name = "PrReviewerTaskLockTimeoutError";
+  }
+}
 
 export interface GithubWebhookConfig {
   /**
@@ -1599,7 +1608,7 @@ async function withPrReviewerTaskLock<T>(
     });
     if (outcome.acquired) return outcome.value;
     if (Date.now() >= deadline) {
-      throw new Error("timed out acquiring PR reviewer task assignment lock");
+      throw new PrReviewerTaskLockTimeoutError();
     }
     await new Promise((resolve) => setTimeout(resolve, PR_REVIEWER_TASK_LOCK_RETRY_MS));
   }
@@ -2091,7 +2100,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
         const idempotentStatuses = idempotentWakeStatuses(
           prReviewerWakeIdempotencyScope(context, deliveryId),
         );
-        return await withPrReviewerTaskLock(db, buildPrReviewerTaskLockKeys(context), async (tx) => {
+        const dispatchReviewerWake = async (tx: DbTransaction) => {
           // The wake insert commits through heartbeat's own transaction. Keep
           // this transaction-scoped lock held until that commit is visible so
           // concurrent first events for one PR re-check affinity instead of
@@ -2201,7 +2210,26 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
           // response body cannot claim reviewerWakeFired for a wake that did
           // not produce a run.
           return false;
-        });
+        };
+        try {
+          return await withPrReviewerTaskLock(
+            db,
+            buildPrReviewerTaskLockKeys(context),
+            dispatchReviewerWake,
+          );
+        } catch (err) {
+          if (!(err instanceof PrReviewerTaskLockTimeoutError)) throw err;
+          logger.warn(
+            {
+              agentIds: reviewerAgentIds,
+              event: eventName,
+              prNumber: context.prNumber,
+              repoFullName: context.repoFullName,
+            },
+            "github webhook reviewer lock timed out; dispatching through durable idempotent fallback",
+          );
+          return db.transaction(dispatchReviewerWake);
+        }
       } catch (err) {
         logger.error(
           {

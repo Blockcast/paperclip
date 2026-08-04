@@ -1737,6 +1737,64 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(runs).toHaveLength(1);
   });
 
+  it("durably queues a reviewer wake when issue creation holds the PR lock beyond the timeout", async () => {
+    const { agentId: reviewerId } = await seedCompanyAndAgent({ agentName: "Ally" });
+    const app = buildApp({ prReviewerAgentIds: [reviewerId] });
+    const taskKey = "pr_review:blockcast/paperclip:20526";
+    let releaseIssueCreate!: () => void;
+    let reportLockAcquired!: () => void;
+    const lockAcquired = new Promise<void>((resolve) => {
+      reportLockAcquired = resolve;
+    });
+    const release = new Promise<void>((resolve) => {
+      releaseIssueCreate = resolve;
+    });
+    const issueCreateTransaction = db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${taskKey}, 0))`);
+      reportLockAcquired();
+      await release;
+    });
+    await lockAcquired;
+
+    const payload = {
+      action: "opened",
+      pull_request: {
+        number: 20526,
+        title: "Do not lose a contended review wake",
+        body: null,
+        head: { ref: "cto/blo-20526" },
+      },
+      repository: { full_name: "Blockcast/paperclip" },
+    };
+    const { body, signature } = signedRequest(payload);
+    const send = () =>
+      request(app)
+        .post("/api/webhooks/github")
+        .set("x-github-event", "pull_request")
+        .set("x-hub-signature-256", signature)
+        .set("x-github-delivery", "delivery-blo-20526-lock-contention")
+        .set("content-type", "application/json")
+        .send(body);
+
+    const contended = await send();
+    expect(contended.status).toBe(200);
+    expect(contended.body.reviewerWakeFired).toBe(true);
+    const runs = await db
+      .select({ contextTaskKey: heartbeatRuns.contextTaskKey })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, reviewerId));
+    expect(runs).toEqual([{ contextTaskKey: "pr_review:Blockcast/paperclip:20526" }]);
+
+    releaseIssueCreate();
+    await issueCreateTransaction;
+
+    const redelivery = await send();
+    expect(redelivery.status).toBe(200);
+    expect(redelivery.body.reviewerWakeFired).toBe(false);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, reviewerId)))
+      .toHaveLength(1);
+  }, 10_000);
+
   it("counts a review-request delivery as received+queued once, and does not count a deduped replay (BLO-18859)", async () => {
     __resetMetricsForTest();
     const { agentId: reviewerId } = await seedCompanyAndAgent({ agentName: "Ally" });
