@@ -15,6 +15,11 @@ test("PR verification runs for merge-queue heads with event-appropriate diff SHA
     workflow,
     /PR_HEAD_SHA: \$\{\{ github\.event\.pull_request\.head\.sha \|\| github\.event\.merge_group\.head_sha \}\}/,
   );
+  assert.match(
+    workflow,
+    /if: >-\n          github\.event_name == 'pull_request' &&\n          github\.head_ref != 'chore\/refresh-lockfile'/,
+    "merge-group runs must not re-evaluate PR-only lockfile exemptions without author/branch metadata",
+  );
   assert.match(workflow, /\n  verify:\n/);
 });
 

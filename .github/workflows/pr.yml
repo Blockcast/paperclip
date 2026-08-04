@@ -44,6 +44,7 @@ jobs:
         # allyblockcast rename (the `ally` app slug was globally taken) so the
         # guard holds before and after the identity cutover.
         if: >-
+          github.event_name == 'pull_request' &&
           github.head_ref != 'chore/refresh-lockfile' &&
           github.event.pull_request.user.login != 'blockcast-ci-packages[bot]' &&
           github.event.pull_request.user.login != 'allyblockcast[bot]' &&
