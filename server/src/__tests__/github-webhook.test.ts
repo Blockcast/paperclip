@@ -235,6 +235,30 @@ describe("github-webhook pure helpers", () => {
     ).toEqual({ owning: ["BLO-19132"] });
   });
 
+  it("ignores owning-looking Markdown code and trailing non-owning labels (BLO-20886)", () => {
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: [
+          "```md",
+          "Refs: BLO-2",
+          "```",
+          "~~~",
+          "Fixes: BLO-3",
+          "~~~~",
+          "    Closes: BLO-4",
+          "\tResolves: BLO-5",
+          "Refs: BLO-1; Related: BLO-6",
+        ].join("\n"),
+      }),
+    ).toEqual({ owning: ["BLO-1"] });
+
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: "```\nRefs: BLO-2\n```\n    Fixes: BLO-3",
+      }),
+    ).toEqual({ owning: [] });
+  });
+
 
   it("rejects payloads with bad signatures and accepts ones with good signatures", () => {
     const secret = "test-webhook-secret-do-not-use-in-prod";
