@@ -26,7 +26,9 @@
  * issue through — a duplicate review issue is a cost problem, whereas wrongly
  * blocking issue creation is a correctness problem.
  *
- * KNOWN AND ACCEPTED GAP: this check is not serialized against the webhook's
+ * KNOWN AND ACCEPTED GAP (BLO-21790 — tracked there with its re-open trigger,
+ * so this is an explicit scope decision rather than an undocumented decline):
+ * this check is not serialized against the webhook's
  * `withPrReviewerTaskLock`. A webhook holding that lock with its wake
  * transaction still uncommitted is invisible to us under READ COMMITTED, so a
  * create racing that exact window is allowed and the duplicate survives. That
