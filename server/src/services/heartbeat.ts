@@ -12528,7 +12528,35 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .orderBy(asc(heartbeatRuns.createdAt))
         .limit(1)
         .then((rows) => rows[0] ?? null);
-      if (racedRetry) return { retryRun: racedRetry, created: false as const, issueLockTransferred: false };
+      if (racedRetry) {
+        return {
+          retryRun: racedRetry,
+          created: false as const,
+          issueLockTransferred: false,
+          issueLockUnavailable: false as const,
+        };
+      }
+
+      if (issueId) {
+        await tx.execute(sql`
+          select id from issues
+          where id = ${issueId} and company_id = ${run.companyId}
+          for update
+        `);
+        const issueLock = await tx
+          .select({ executionRunId: issues.executionRunId })
+          .from(issues)
+          .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
+          .then((rows) => rows[0] ?? null);
+        if (issueLock?.executionRunId !== run.id) {
+          return {
+            retryRun: null,
+            created: false as const,
+            issueLockTransferred: false,
+            issueLockUnavailable: true as const,
+          };
+        }
+      }
 
       const wakeupRequest = await tx
         .insert(agentWakeupRequests)
@@ -12607,8 +12635,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         issueLockTransferred = transferred.length > 0;
       }
 
-      return { retryRun, created: true as const, issueLockTransferred };
+      return {
+        retryRun,
+        created: true as const,
+        issueLockTransferred,
+        issueLockUnavailable: false as const,
+      };
     });
+
+    if (queued.issueLockUnavailable) {
+      return { kind: "suppressed", reason: "issue_lock_not_owned" };
+    }
 
     // The loser of the advisory-lock race adopts the winner's retry and skips
     // every side effect that belongs to *creating* one — no second live event,
@@ -13395,10 +13432,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // So the retry keeps what it was given and only orphaned siblings are
       // cleared. That is why this needs no separate transferred-lock ledger.
       try {
-        // `suppressPromotion` whenever a retry exists — including the zero-row
-        // hand-over, which is exactly the case the ownership check inside
-        // cannot see (a sweeper-cleared NULL lock is falsy there).
-        await releaseIssueExecutionAndPromote(run, { suppressPromotion: Boolean(retry) });
+        // A retry that owns the context lock is the continuation. If the lock
+        // disappeared before enqueue, no retry was created and the deferred
+        // wake must be promoted instead.
+        await releaseIssueExecutionAndPromote(run, { suppressPromotion: retryOwnsIssueLock });
         record("issue_release", { kind: "done" });
       } catch (error) {
         logger.warn({ err: error, runId: run.id }, "failed to release crash-interrupted issue execution lock");
@@ -13822,13 +13859,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       const retryResult = await enqueueProcessLossRetry(interrupted, agent, now);
       const retry = retryResult.kind === "suppressed" ? null : retryResult.run;
+      const retryOwnsIssueLock = retryResult.kind === "suppressed" ? false : retryResult.issueLockOwnedByRetry;
       // Release regardless of whether a retry exists (BLO-20822, Ally round 6).
       // The retry only ever takes over the *context* issue, so gating on its
       // existence left every other issue this run had locked pointing at a
       // terminal run. Safe post-hand-over: the clearing UPDATE is keyed on
       // `execution_run_id = <this run>`, which the transferred lock no longer
       // matches, and promotion bails when the context issue is owned by the retry.
-      await releaseIssueExecutionAndPromote(interrupted, { suppressPromotion: Boolean(retry) });
+      await releaseIssueExecutionAndPromote(interrupted, { suppressPromotion: retryOwnsIssueLock });
       if (retry) {
         retryRunIds.push(retry.id);
       }
@@ -18711,6 +18749,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
 
       let retriedRun: typeof heartbeatRuns.$inferSelect | null = null;
+      let retryOwnsIssueLock = false;
       let promotedRunDispatched = false;
       const retryAgent = await getAgent(run.agentId);
       if (shouldRetry) {
@@ -18721,22 +18760,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // when this function returned null. The difference is only that the
           // release now happens once, here, instead of also inside the callee.
           retriedRun = retryResult.kind === "suppressed" ? null : retryResult.run;
+          retryOwnsIssueLock = retryResult.kind === "suppressed" ? false : retryResult.issueLockOwnedByRetry;
         }
       } else if (retryAgent) {
         const scheduled = await scheduleInteractionContinuationInfrastructureRetryIfEligible(finalizedRun, retryAgent);
         retriedRun = scheduled?.outcome === "scheduled" ? scheduled.run : null;
+        retryOwnsIssueLock = Boolean(retriedRun);
       }
 
       // Release regardless of whether a retry exists (BLO-20822, Ally round 6):
       // the retry takes over only the context issue, so gating on its existence
       // stranded every sibling issue this run had locked. Promotion, however,
-      // stays gated on there being no retry (round 7) — a retry is the single
-      // intended continuation, and the ownership check inside cannot see the
-      // zero-row hand-over case. `promotedRunDispatched` is then false, which
-      // is the same value this call site saw before, so the
-      // `startNextQueuedRunForAgent` fallback below is unchanged.
+      // stays gated on the retry actually owning the context issue (round 7).
+      // If the original lock disappeared first, enqueue is suppressed and the
+      // deferred wake is the single continuation instead. When promotion is
+      // suppressed, `promotedRunDispatched` remains false, which is the same
+      // value this call site saw before, so the `startNextQueuedRunForAgent`
+      // fallback below is unchanged.
       promotedRunDispatched = await releaseIssueExecutionAndPromote(finalizedRun, {
-        suppressPromotion: Boolean(retriedRun),
+        suppressPromotion: retryOwnsIssueLock,
       });
       if (!opts?.suppressDispatchAfterReap && !promotedRunDispatched) {
         await startNextQueuedRunForAgent(run.agentId);
@@ -23917,9 +23959,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       /**
        * Clear this run's issue locks but do NOT promote a deferred wake.
        *
-       * Set by every caller that has just queued a process-loss retry: that
-       * retry is the single intended continuation, so promoting here would
-       * create a second runnable path for the same issue (BLO-20822).
+       * Set when a process-loss retry demonstrably owns the context issue lock:
+       * that retry is the single intended continuation, so promoting here
+       * would create a second runnable path for the same issue (BLO-20822).
        */
       suppressPromotion?: boolean;
     } = {},

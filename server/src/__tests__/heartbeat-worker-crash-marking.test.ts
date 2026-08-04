@@ -1058,16 +1058,15 @@ describeEmbeddedPostgres("heartbeat worker-crash marking and recovery convergenc
 
   // ---- (j) the stale-lock sweeper racing the issue-lock hand-over ----------
 
-  it("does not report the retry as owning an issue lock the sweeper cleared first", async () => {
+  it("does not create a retry after the sweeper cleared the issue lock", async () => {
     // `sweepStaleIssueLocks` treats a lock held by a terminal run as cleanable,
     // and a crash-marked run is `interrupted` — terminal for the whole duration
     // of its own recovery. Run concurrently with reconciliation it can clear the
     // lock in the window between terminalizing the run and handing the lock to
     // the retry. That hand-over is a guarded UPDATE
-    // (`execution_run_id = <original run>`), so it silently matches zero rows —
-    // yet `enqueueProcessLossRetry` still reported `created`, and recovery then
-    // recorded `issue_release: skipped ("retry owns the issue lock")` for a lock
-    // the retry never acquired, leaving the issue stranded.
+    // (`execution_run_id = <original run>`), so it silently matches zero rows.
+    // A retry created after that point cannot own the issue and must not become
+    // a detached runnable path.
     //
     // Forced overlap rather than hopeful concurrency: clearing the lock from the
     // pre-enqueue hook lands it exactly in the window, every run.
@@ -1105,18 +1104,13 @@ describeEmbeddedPostgres("heartbeat worker-crash marking and recovery convergenc
 
     expect(sweptOnce).toBe(true);
     const retries = await retriesOf(run.id);
-    expect(retries).toHaveLength(1);
+    expect(retries).toHaveLength(0);
 
     const [issueAfter] = await db.select().from(issues).where(eq(issues.id, issueId));
-    // The guarded hand-over cannot have landed — it filters on a lock that no
-    // longer pointed at `run`, so the retry does not own the issue.
-    expect(issueAfter!.executionRunId).not.toBe(retries[0]!.id);
+    expect(issueAfter!.executionRunId).toBeNull();
 
-    // The discriminating assertion. Pre-fix, recovery inferred ownership from
-    // the retry merely existing and recorded `issue_release: skipped`, so the
-    // release never ran and this stayed pinned to the dead run. Post-fix the
-    // release runs — it is a no-op on the execution lock we no longer hold, but
-    // it still clears this run's stale checkout and runs promotion.
+    // Cleanup still clears this run's stale checkout and may promote a deferred
+    // wake when one exists.
     expect(issueAfter!.checkoutRunId).toBeNull();
 
     // Still converges: no orphan replay, no poison row.
@@ -1152,6 +1146,13 @@ describeEmbeddedPostgres("heartbeat worker-crash marking and recovery convergenc
         executionLockedAt: new Date(Date.now() - 60_000),
       });
     }
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId,
+      source: "assignment",
+      status: "deferred_issue_execution",
+      payload: { issueId: contextIssueId },
+    });
 
     const result = await service().reconcileWorkerCrashedRuns();
 
@@ -1163,6 +1164,11 @@ describeEmbeddedPostgres("heartbeat worker-crash marking and recovery convergenc
     // which the transferred lock no longer matches.
     const [contextAfter] = await db.select().from(issues).where(eq(issues.id, contextIssueId));
     expect(contextAfter!.executionRunId).toBe(retries[0]!.id);
+    const [wakeAfter] = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.companyId, companyId));
+    expect(wakeAfter!.status).toBe("deferred_issue_execution");
 
     // The discriminating assertion: pre-fix this stayed pinned to the dead run.
     const [siblingAfter] = await db.select().from(issues).where(eq(issues.id, siblingIssueId));
@@ -1278,20 +1284,18 @@ describeEmbeddedPostgres("heartbeat worker-crash marking and recovery convergenc
     }
   });
 
-  // BLO-20822, Ally round 7: a zero-row hand-over must not leave TWO runnable
-  // execution paths for one issue.
+  // BLO-20822, Ally round 7/8: a zero-row hand-over must promote the deferred
+  // wake without leaving a detached process-loss retry beside it.
   //
-  // `enqueueProcessLossRetry` commits the retry even when its guarded
-  // context-lock transfer matches zero rows — the stale-lock sweeper can clear
-  // the terminal original's lock first — and reports that honestly as
-  // `issueLockOwnedByRetry: false`. Cleanup then finds the context issue
-  // unowned, and `releaseIssueExecutionAndPromote`'s ownership check is
+  // The stale-lock sweeper can clear the terminal original's context lock before
+  // `enqueueProcessLossRetry` attempts its guarded hand-over. Cleanup then finds
+  // the context issue unowned, and `releaseIssueExecutionAndPromote`'s check is
   // `issue.executionRunId && issue.executionRunId !== run.id`, so a
   // sweeper-cleared NULL is FALSY and passes straight through it. Pre-fix that
   // promoted a `deferred_issue_execution` wake into a second queued run holding
   // the issue lock, racing the retry. The round-6 zero-row test could not catch
   // this: it has no deferred wake, so it proved stale-checkout cleanup only.
-  it("does not promote a deferred wake alongside the retry when the hand-over matched zero rows", async () => {
+  it("promotes a deferred wake instead of creating a retry when the hand-over would match zero rows", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const run = await seedCrashMarkedRun({ companyId, agentId, finishedAt: new Date(Date.now() - 60_000) });
     const issueId = "77777777-7777-7777-7777-777777777777";
@@ -1336,19 +1340,21 @@ describeEmbeddedPostgres("heartbeat worker-crash marking and recovery convergenc
     expect(sweptOnce).toBe(true);
 
     const retries = await retriesOf(run.id);
-    expect(retries).toHaveLength(1);
+    expect(retries).toHaveLength(0);
 
     // The discriminating assertion: exactly ONE runnable path survives — the
-    // retry. Pre-fix the deferred wake was promoted into a second queued run.
+    // promoted deferred wake. Round 8 suppressed promotion after already
+    // creating a detached retry, which stranded ordinary queued dispatch.
     const allRuns = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
     const runnable = allRuns.filter((r) => r.status === "queued" || r.status === "running");
-    expect(runnable.map((r) => r.id)).toEqual([retries[0]!.id]);
+    expect(runnable).toHaveLength(1);
+    expect(runnable[0]!.retryOfRunId).toBeNull();
 
     const [wakeAfter] = await db
       .select()
       .from(agentWakeupRequests)
       .where(eq(agentWakeupRequests.companyId, companyId));
-    expect(wakeAfter!.status).toBe("deferred_issue_execution");
+    expect(wakeAfter!.status).toBe("queued");
 
     // Stale checkout is still cleared — suppressing promotion must not have
     // suppressed the lock cleanup that round 6 added.
