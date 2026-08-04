@@ -1057,7 +1057,11 @@ describeEmbeddedPostgres("queued backlog convergence (BLO-20396)", () => {
    * "test timed out" with no indication of which handshake never happened.
    * Naming the barrier turns that into a diagnosable failure.
    */
-  async function waitForBarrier(promise: Promise<void>, label: string, timeoutMs = 30_000) {
+  // Takes `Promise<unknown>` rather than `Promise<void>` so it can also bound a
+  // `Promise.all` over dispatch passes (Ally round 11). The resolved value is
+  // deliberately ignored; only settlement-or-timeout matters. Rejection still
+  // propagates, so bounding a settlement does not soften it into a pass.
+  async function waitForBarrier(promise: Promise<unknown>, label: string, timeoutMs = 30_000) {
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       await Promise.race([
@@ -1067,6 +1071,33 @@ describeEmbeddedPostgres("queued backlog convergence (BLO-20396)", () => {
             () => reject(new Error(`barrier "${label}" did not resolve within ${timeoutMs}ms`)),
             timeoutMs,
           );
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Bounded, non-throwing settlement for use inside `finally` (Ally round 11).
+   *
+   * `Promise.allSettled` over dispatch passes is unbounded: if a pass hangs, the
+   * await never returns, vitest fires the outer timeout, and because JS cannot
+   * unwind a pending await the drain below it never runs — which is precisely
+   * the leak the teardown exists to prevent. Bounding it makes the outer budget
+   * an upper bound instead of a hope.
+   *
+   * It must not throw: this runs on the failure path, and a throw here would
+   * replace the real assertion error with a teardown error.
+   */
+  async function settleWithinMs(promises: Array<Promise<unknown> | undefined>, timeoutMs: number) {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const live = promises.filter((p): p is Promise<unknown> => p !== undefined);
+    try {
+      await Promise.race([
+        Promise.allSettled(live),
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, timeoutMs);
         }),
       ]);
     } finally {
@@ -1464,7 +1495,16 @@ describeEmbeddedPostgres("queued backlog convergence (BLO-20396)", () => {
         diagnosticRemainingMs("second call coalesced into the first pass"),
       );
       releaseFirstPass();
-      await Promise.all([firstPass, coalescedPass]);
+      // Bounded by the same shared deadline as the barriers above (Ally round
+      // 11). Left unbounded, a hung dispatch pass parks the body here until the
+      // outer vitest timeout, which cannot unwind the await — so the `finally`
+      // never releases or drains the private service. `waitForBarrier` still
+      // propagates a genuine rejection, so this is a bound, not a softening.
+      await waitForBarrier(
+        Promise.all([firstPass, coalescedPass]),
+        "dispatch passes settled",
+        diagnosticRemainingMs("dispatch passes settled"),
+      );
 
       // Fixture precondition, asserted before the behavioural one so a fixture
       // breakdown ("the chain never reached a resumed pass") is distinguishable
@@ -1516,14 +1556,19 @@ describeEmbeddedPostgres("queued backlog convergence (BLO-20396)", () => {
       boundedHeartbeat.stopDispatch();
       // Settle the passes before draining, so one that rejected after the test had
       // already failed cannot resurface as an unhandled rejection in a later test.
-      await Promise.allSettled([firstPass, coalescedPass]);
+      // Bounded at 30s (Ally round 11): a hung pass must not consume the outer
+      // budget before the drain below runs. Non-throwing, so it cannot mask the
+      // real failure that brought us into this `finally`.
+      await settleWithinMs([firstPass, coalescedPass], 30_000);
       await boundedHeartbeat.drainInFlightExecutions(60_000);
     }
     // 180s, not 60s: the outer budget must exceed the worst-case diagnostic phase
-    // (30s, shared) PLUS the worst-case teardown (a 60s drain plus pass
-    // settlement), or vitest's timeout pre-empts the `finally` and the leak this
-    // test's teardown exists to contain escapes anyway. 180_000 matches the
-    // ceiling-resume case above rather than inventing a new constant.
+    // (30s, shared — now including dispatch-pass settlement) PLUS the worst-case
+    // teardown (30s bounded settlement + a 60s drain) = 120s, leaving 60s of
+    // headroom. Every wait on the path to the drain is bounded, so vitest's
+    // timeout can no longer pre-empt the `finally` and let the leak this
+    // teardown contains escape. 180_000 matches the ceiling-resume case above
+    // rather than inventing a new constant.
   }, 180_000);
 
   it("does not re-arm an internally scheduled head rescan when it coalesces", async () => {
