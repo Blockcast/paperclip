@@ -387,7 +387,7 @@ jobs:
     # Preserve the legacy required-check name while the underlying work runs in parallel.
     name: verify
     if: ${{ always() }}
-    needs: [typecheck_release_registry, general_tests, worktree_install, build]
+    needs: [typecheck_release_registry, general_tests, worktree_install, build, helm_chart]
     runs-on: arc-light
     timeout-minutes: 5
 
@@ -418,12 +418,14 @@ jobs:
           GENERAL_TESTS_RESULT: ${{ needs.general_tests.result }}
           WORKTREE_INSTALL_RESULT: ${{ needs.worktree_install.result }}
           BUILD_RESULT: ${{ needs.build.result }}
+          HELM_CHART_RESULT: ${{ needs.helm_chart.result }}
         run: |
           declare -A lane_results=(
             [typecheck_release_registry]="$TYPECHECK_RELEASE_REGISTRY_RESULT"
             [general_tests]="$GENERAL_TESTS_RESULT"
             [worktree_install]="$WORKTREE_INSTALL_RESULT"
             [build]="$BUILD_RESULT"
+            [helm_chart]="$HELM_CHART_RESULT"
           )
 
           cancelled_lanes=()

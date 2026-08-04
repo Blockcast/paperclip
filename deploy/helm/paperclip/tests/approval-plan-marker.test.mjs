@@ -158,3 +158,35 @@ test("a malformed marker fails the render instead of shipping a plan the approve
     /approvalPlanSha256 must be 64 lowercase hex/,
   );
 });
+
+// The marker key is release-controlled. Both collision cases below are silent
+// without the hasKey guard in deployment-api.yaml, and both break the two-pass
+// render in a way that only surfaces later, inside the approve script, as an
+// unexplained hash mismatch. The tests above use `example.com/team`, an
+// ordinary key, so they cannot catch either one.
+const podMarkerArg = [`--set`, `pod.annotations.${MARKER.replace(/\./g, "\\.")}=${SAMPLE}`];
+
+test("pod.annotations may not smuggle the marker in when api.approvalPlanSha256 is UNSET", () => {
+  // The dangerous case: this render is the one the release job hashes as
+  // "unstamped". A marker reaching it means the hash is taken over a document
+  // that already carries a marker, so the value the approve script recomputes
+  // from render #2 can never agree with it.
+  assert.throws(
+    () => renderApiDeployment(podMarkerArg),
+    /pod\.annotations must not set paperclip\.blockcast\.net\/approval-plan-sha256/,
+  );
+});
+
+test("pod.annotations may not silently lose to the release value when BOTH are set", () => {
+  // Previously `set` overwrote the caller's value and rendered successfully,
+  // reporting nothing. Conflicting intent must be an error, not a winner.
+  assert.throws(
+    () =>
+      renderApiDeployment([
+        ...podMarkerArg,
+        `--set`,
+        `api.approvalPlanSha256=${"b".repeat(64)}`,
+      ]),
+    /pod\.annotations must not set paperclip\.blockcast\.net\/approval-plan-sha256/,
+  );
+});

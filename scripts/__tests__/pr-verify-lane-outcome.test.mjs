@@ -35,6 +35,7 @@ function runVerifyStep(results) {
     GENERAL_TESTS_RESULT: results.general_tests ?? "success",
     WORKTREE_INSTALL_RESULT: results.worktree_install ?? "success",
     BUILD_RESULT: results.build ?? "success",
+    HELM_CHART_RESULT: results.helm_chart ?? "success",
   };
   return spawnSync("bash", ["-c", script], { env, encoding: "utf8" });
 }
@@ -106,4 +107,37 @@ test("verify step exits non-zero for an unrecognized result and treats it as a f
   assert.notEqual(result.status, 0);
   assert.match(result.stdout, /::error title=verify: lane failure::/);
   assert.match(result.stdout, /general_tests/);
+});
+
+// BLO-20733 / Ally review of PR #973: the `Helm chart` lane exists and runs, but
+// running is not gating. `verify` is the required context, so a lane it neither
+// `needs` nor asserts can go red beside a green required check. Both halves are
+// load-bearing and fail independently:
+//   - absent from `needs`  => `needs.helm_chart.result` renders EMPTY, and the
+//     lane silently never gates (the failure mode being closed here).
+//   - absent from the script => the result is collected and ignored.
+test("verify declares helm_chart as a dependency, so its result is actually populated", () => {
+  const needsMatch = workflow.match(/\n {2}verify:\n(?: {4}.*\n| *\n)*? {4}needs: \[([^\]]*)\]/);
+  assert.notEqual(needsMatch, null, "verify job must declare a needs list");
+
+  const needs = needsMatch[1].split(",").map((lane) => lane.trim());
+  assert.ok(
+    needs.includes("helm_chart"),
+    `verify.needs must include helm_chart or its result is always empty; got: ${needs.join(", ")}`,
+  );
+});
+
+test("verify step exits non-zero when the Helm chart lane fails", () => {
+  const result = runVerifyStep({ helm_chart: "failure" });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stdout, /::error title=verify: lane failure::/);
+  assert.match(result.stdout, /helm_chart/);
+});
+
+test("verify step reports a cancelled Helm chart lane as cancelled, not as a diff defect", () => {
+  const result = runVerifyStep({ helm_chart: "cancelled" });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stdout, /::error title=verify: lane cancelled::/);
+  assert.match(result.stdout, /helm_chart/);
+  assert.doesNotMatch(result.stdout, /::error title=verify: lane failure::/);
 });

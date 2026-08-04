@@ -60,13 +60,28 @@ spec:
       key is what preserves it, and
       deploy/helm/paperclip/tests/approval-plan-marker.test.mjs pins it by
       diffing a stamped render against an unstamped one.
+
+      The marker key is RELEASE-CONTROLLED, so pod.annotations may not carry it.
+      Without this guard the key has two silent failure modes, both of which
+      defeat the binding above. With api.approvalPlanSha256 unset, a value from
+      pod.annotations would be copied straight through -- stamping an
+      unvalidated marker into the render the release job treats as "unstamped",
+      so the hash it computes is taken over a document that already contains a
+      marker and can never match what the approve script recomputes. With it
+      set, `set` would silently overwrite the caller's value, hiding the
+      conflict rather than reporting it. Rejecting the key outright is the only
+      behaviour that keeps render #1 genuinely unstamped.
       */}}
+      {{- $markerKey := "paperclip.blockcast.net/approval-plan-sha256" }}
       {{- $podAnnotations := deepCopy (.Values.pod.annotations | default dict) }}
+      {{- if hasKey $podAnnotations $markerKey }}
+      {{- fail (printf "pod.annotations must not set %s: it is release-controlled and stamped from api.approvalPlanSha256" $markerKey) }}
+      {{- end }}
       {{- with .Values.api.approvalPlanSha256 }}
       {{- if not (regexMatch "^[0-9a-f]{64}$" .) }}
       {{- fail (printf "api.approvalPlanSha256 must be 64 lowercase hex characters, got %q" .) }}
       {{- end }}
-      {{- $_ := set $podAnnotations "paperclip.blockcast.net/approval-plan-sha256" . }}
+      {{- $_ := set $podAnnotations $markerKey . }}
       {{- end }}
       {{- with $podAnnotations }}
       annotations:
