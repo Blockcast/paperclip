@@ -54,6 +54,7 @@ function runVerifyStep(results) {
     GENERAL_TESTS_RESULT: results.general_tests ?? "success",
     WORKTREE_INSTALL_RESULT: results.worktree_install ?? "success",
     BUILD_RESULT: results.build ?? "success",
+    VERIFY_SERIALIZED_SERVER_RESULT: results.verify_serialized_server ?? "success",
   };
   return spawnSync("bash", ["-c", script], { env, encoding: "utf8" });
 }
@@ -102,6 +103,31 @@ test("verify step annotates both a real failure and a cancellation when a run ha
   assert.match(result.stdout, /build/);
   assert.match(result.stdout, /::error title=verify: lane cancelled::/);
   assert.match(result.stdout, /general_tests/);
+});
+
+// BLO-20869: verify_serialized_server must be treated exactly like the other
+// required lanes -- cancelled, skipped, or never-scheduled (which also reads
+// as "skipped" via `needs`) must all fail this required check instead of
+// being invisible to the merge gate.
+test("verify step fails when the serialized server suite is cancelled", () => {
+  const result = runVerifyStep({ verify_serialized_server: "cancelled" });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stdout, /::error title=verify: lane cancelled::/);
+  assert.match(result.stdout, /verify_serialized_server/);
+});
+
+test("verify step fails when the serialized server suite is skipped", () => {
+  const result = runVerifyStep({ verify_serialized_server: "skipped" });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stdout, /::error title=verify: lane skipped::/);
+  assert.match(result.stdout, /verify_serialized_server/);
+});
+
+test("verify step fails when the serialized server suite genuinely fails", () => {
+  const result = runVerifyStep({ verify_serialized_server: "failure" });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stdout, /::error title=verify: lane failure::/);
+  assert.match(result.stdout, /verify_serialized_server/);
 });
 
 test("verify step annotates a skipped lane as an unmet dependency, not a failure", () => {

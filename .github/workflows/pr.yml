@@ -405,9 +405,22 @@ jobs:
 
   verify:
     # Preserve the legacy required-check name while the underlying work runs in parallel.
+    # BLO-20869: verify_serialized_server is folded in here (rather than made
+    # required on its own) so a cancelled/skipped/never-scheduled serialized
+    # shard fails this required check instead of being invisible to the merge
+    # gate. See the issue for the measured latency tradeoff of putting a
+    # ~90-minute job on the required path this way.
     name: verify
     if: ${{ always() }}
-    needs: [helm_chart, typecheck_release_registry, general_tests, worktree_install, build]
+    needs:
+      [
+        helm_chart,
+        typecheck_release_registry,
+        general_tests,
+        worktree_install,
+        build,
+        verify_serialized_server,
+      ]
     runs-on: arc-light
     timeout-minutes: 5
 
@@ -439,6 +452,7 @@ jobs:
           GENERAL_TESTS_RESULT: ${{ needs.general_tests.result }}
           WORKTREE_INSTALL_RESULT: ${{ needs.worktree_install.result }}
           BUILD_RESULT: ${{ needs.build.result }}
+          VERIFY_SERIALIZED_SERVER_RESULT: ${{ needs.verify_serialized_server.result }}
         run: |
           declare -A lane_results=(
             [helm_chart]="$HELM_CHART_RESULT"
@@ -446,6 +460,7 @@ jobs:
             [general_tests]="$GENERAL_TESTS_RESULT"
             [worktree_install]="$WORKTREE_INSTALL_RESULT"
             [build]="$BUILD_RESULT"
+            [verify_serialized_server]="$VERIFY_SERIALIZED_SERVER_RESULT"
           )
 
           cancelled_lanes=()
