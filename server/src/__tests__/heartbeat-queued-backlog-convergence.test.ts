@@ -1105,6 +1105,25 @@ describeEmbeddedPostgres("queued backlog convergence (BLO-20396)", () => {
     }
   }
 
+  /**
+   * Best-effort teardown await bounded by wall clock. This intentionally swallows
+   * both rejections and timeouts because it runs after the test has already
+   * determined pass/fail and must not mask the primary assertion.
+   */
+  async function teardownWithinMs(promise: Promise<unknown>, timeoutMs: number) {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        promise.catch(() => undefined),
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, timeoutMs);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
   it("ranks a critical row globally, not just within the bounded scan window", async () => {
     // BLO-20396 (fourth review follow-up). Priority must not be scoped to the
     // SCAN_LIMIT * MAX_SCAN_BATCHES rows one pass may read. Collection walks the
@@ -1552,7 +1571,11 @@ describeEmbeddedPostgres("queued backlog convergence (BLO-20396)", () => {
       // budget before the drain below runs. Non-throwing, so it cannot mask the
       // real failure that brought us into this `finally`.
       await settleWithinMs([firstPass, coalescedPass], 30_000);
-      await boundedHeartbeat.drainInFlightExecutions(60_000);
+      // `drainInFlightExecutions(60_000)` checks its own deadline only before
+      // each allSettled loop. If the current in-flight promise never settles, the
+      // method cannot observe that deadline, so bound this cleanup step outside
+      // the drain as well.
+      await teardownWithinMs(boundedHeartbeat.drainInFlightExecutions(60_000), 60_000);
     }
     // 180s, not 60s: the outer budget must exceed the worst-case diagnostic phase
     // (30s, shared — now including dispatch-pass settlement) PLUS the worst-case
