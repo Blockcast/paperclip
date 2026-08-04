@@ -206,6 +206,7 @@ export function approvalRoutes(
           ? payloadObj.note
           : undefined;
 
+    const publishCreatedActivityRef: { current: (() => void) | null } = { current: null };
     const { approval, deduplicated } = await svc.createWithIdempotency(companyId, {
       ...approvalInput,
       payload: normalizedPayload,
@@ -229,7 +230,7 @@ export function approvalRoutes(
           });
         }
 
-        await logActivity(txDb, {
+        publishCreatedActivityRef.current = await logActivity(txDb, {
           companyId,
           actorType: actor.actorType,
           actorId: actor.actorId,
@@ -246,7 +247,7 @@ export function approvalRoutes(
               ? { description: approvalDescription }
               : {}),
           },
-        });
+        }, { deferPublish: true });
       },
     });
 
@@ -261,6 +262,8 @@ export function approvalRoutes(
         userId: actor.actorType === "user" ? actor.actorId : null,
       });
     }
+
+    publishCreatedActivityRef.current?.();
 
     // A replay is not a new filing. Answer with the original plus a readback so the
     // requester learns it is still pending without having to file again to find out —
