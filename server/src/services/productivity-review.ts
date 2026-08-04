@@ -393,6 +393,48 @@ function nonLiveExecutionHoldSince(
   return lastSignal;
 }
 
+/**
+ * BLO-19848 (review follow-up): the moment the current live execution segment
+ * began, when the holding run reached `running` by way of a park — or null when
+ * there is no park to exclude.
+ *
+ * `nonLiveExecutionHoldSince` only truncates the *tail* of an episode, so it
+ * stops helping the instant a parked holder resumes: the run is genuinely live
+ * again, the clamp goes away, and the entire parked interval is re-attributed to
+ * active work because elapsed is still measured from `issues.started_at`. That
+ * is the reported failure — a 6h50m park plus a 10m run still totals 7h and
+ * still trips `long_active_duration`, which is the same false positive this
+ * issue exists to remove, just reached by a different path.
+ *
+ * A promoted retry keeps its park on the row: promoteDueScheduledRetry flips
+ * `scheduled_retry` to `queued` writing only status/error/updatedAt
+ * (heartbeat.ts), and the subsequent claim preserves `startedAt`
+ * (`run.startedAt ?? claimedAt`). So `scheduledRetryAt` survives promotion as a
+ * durable record of when the park ended, and `startedAt` still points at the
+ * original, pre-park start. A `running` row carrying a past `scheduledRetryAt`
+ * therefore could not have been executing before that timestamp.
+ *
+ * Only consulted for `running` holders. While a run is still parked its
+ * `scheduledRetryAt` is the *future* due time, which says nothing about a live
+ * segment — that case is already handled by the tail clamp.
+ *
+ * This deliberately measures the current segment rather than summing every live
+ * segment across a multi-park episode: the row keeps only the most recent park
+ * boundary, so earlier live attempts are dropped. That under-counts, which is
+ * the safe direction for a trigger whose failure mode is firing on work that is
+ * not actually running; a genuinely long-running segment still fires, and the
+ * evidence block reports the excluded total alongside it.
+ */
+function liveSegmentStartedAt(executionRun: HeartbeatRunRow | null, now: Date): Date | null {
+  if (!executionRun || executionRun.status !== "running") return null;
+  const parkEndedAt = coerceDate(executionRun.scheduledRetryAt);
+  if (!parkEndedAt || Number.isNaN(parkEndedAt.getTime())) return null;
+  // A future deadline on a `running` row is contradictory; ignore rather than
+  // clamping the episode start into the future.
+  if (parkEndedAt.getTime() > now.getTime()) return null;
+  return parkEndedAt;
+}
+
 function isTerminalIssueStatus(status: string | null | undefined) {
   return status === "done" || status === "cancelled";
 }
@@ -2047,12 +2089,36 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     // Clamping below activeStartedAt collapses to 0 via Math.max — i.e. a holder
     // that went non-live before the episode began contributes no active time.
     const attributableEndAt = nonLiveHoldSince ?? now;
-    const nonLiveHoldMs = nonLiveHoldSince
-      ? Math.max(0, now.getTime() - nonLiveHoldSince.getTime())
-      : 0;
-    const elapsedMs = sourceIssue.status === "in_progress" && activeStartedAt
-      ? Math.max(0, attributableEndAt.getTime() - activeStartedAt.getTime())
+    // BLO-19848 (review follow-up): the tail clamp above is not enough on its
+    // own, because it only truncates a hold that is *still* open. A holder that
+    // parked and then resumed is live again, so nonLiveExecutionHoldSince
+    // correctly returns null — and the whole parked interval silently reverts to
+    // being counted, since elapsed is measured from activeStartedAt. A 6h50m
+    // park followed by a 10m run still reported 7h and still fired the trigger.
+    // Exclude the park from the front of the episode too. See
+    // liveSegmentStartedAt.
+    const liveSegmentStart = liveSegmentStartedAt(executionRun, now);
+    const attributableStartAt = activeStartedAt
+      && liveSegmentStart
+      && liveSegmentStart.getTime() > activeStartedAt.getTime()
+      ? liveSegmentStart
+      : activeStartedAt;
+    const elapsedMs = sourceIssue.status === "in_progress" && attributableStartAt
+      ? Math.max(0, attributableEndAt.getTime() - attributableStartAt.getTime())
       : null;
+    // Total wall-clock withheld from the trigger: the leading park plus the
+    // trailing non-live hold. Bounded by the episode so the two exclusions
+    // cannot report more than the episode actually spans.
+    const leadingParkMs = activeStartedAt && attributableStartAt
+      ? Math.max(0, attributableStartAt.getTime() - activeStartedAt.getTime())
+      : 0;
+    const trailingHoldMs = Math.max(0, now.getTime() - attributableEndAt.getTime());
+    const episodeMs = activeStartedAt
+      ? Math.max(0, now.getTime() - activeStartedAt.getTime())
+      : null;
+    const nonLiveHoldMs = episodeMs === null
+      ? trailingHoldMs
+      : Math.min(episodeMs, leadingParkMs + trailingHoldMs);
 
     const noComment = noCommentStreak >= thresholds.noCommentStreakRuns;
     const longActive = elapsedMs !== null && elapsedMs >= thresholds.longActiveMs;
@@ -2140,7 +2206,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       commentCountLastSixHours: assigneeRunCommentCountLastSixHours,
       elapsedMs,
       nonLiveHoldMs,
-      monitorGating: monitorGatingBreakdown(sourceIssue, activeStartedAt, elapsedMs, now),
+      monitorGating: monitorGatingBreakdown(sourceIssue, attributableStartAt, elapsedMs, now),
       latestRuns: latestRuns.slice(0, 5),
       latestComments,
       costCents: costRow.costCents,
@@ -2251,7 +2317,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       `- Current active elapsed time: ${msToHuman(evidence.elapsedMs)}`,
       ...(evidence.nonLiveHoldMs > 0
         ? [
-            `- Excluded as non-live execution hold: ${msToHuman(evidence.nonLiveHoldMs)} (issue's executionRunId pinned by a run that was not live; not counted toward the trigger — BLO-19848)`,
+            `- Excluded as non-live execution hold: ${msToHuman(evidence.nonLiveHoldMs)} (issue's executionRunId parked or pinned by a run that was not live; not counted toward the trigger — BLO-19848)`,
           ]
         : []),
       ...(evidence.monitorGating

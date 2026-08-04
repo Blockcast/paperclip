@@ -1429,7 +1429,12 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     expect(row?.executionLockedAt).not.toBeNull();
   });
 
-  it("re-reads scheduled_retry deadline inside the sweep transaction before clearing (BLO-19848)", async () => {
+  it("re-reads run state inside the sweep transaction before clearing (BLO-19848)", async () => {
+    // The decision must be made on the row as it exists under FOR UPDATE, not on
+    // the pre-transaction snapshot. The realistic race is the one the sweep
+    // exists to handle: a parked holder is promoted and starts running while the
+    // sweep is already in flight. Re-reading sees a live holder and declines;
+    // trusting the snapshot would strip the lock out from under a running run.
     const { companyId, agentId } = await seed();
     const { issueId, wedgedRunId } = await seedWedgedScheduledRetryIssue({
       companyId,
@@ -1443,7 +1448,7 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
         if (issue.id !== issueId) return;
         await db
           .update(heartbeatRuns)
-          .set({ scheduledRetryAt: new Date(Date.now() + 3 * 24 * 60 * 60 * 1000) })
+          .set({ status: "running", lastOutputAt: new Date() })
           .where(eq(heartbeatRuns.id, wedgedRunId));
       },
     });

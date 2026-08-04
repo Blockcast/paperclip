@@ -953,6 +953,8 @@ describeEmbeddedPostgres("productivity review service", () => {
     lastOutputAt?: Date | null;
     lastUsefulActionAt?: Date | null;
     finishedAt?: Date | null;
+    scheduledRetryAt?: Date | null;
+    scheduledRetryAttempt?: number;
   }) {
     const runId = randomUUID();
     await db.insert(heartbeatRuns).values({
@@ -965,6 +967,8 @@ describeEmbeddedPostgres("productivity review service", () => {
       lastOutputAt: input.lastOutputAt ?? null,
       lastUsefulActionAt: input.lastUsefulActionAt ?? null,
       finishedAt: input.finishedAt ?? null,
+      scheduledRetryAt: input.scheduledRetryAt ?? null,
+      scheduledRetryAttempt: input.scheduledRetryAttempt ?? 0,
       contextSnapshot: { issueId: input.issueId, taskId: input.issueId },
     });
     await db
@@ -1039,8 +1043,68 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(review?.description).toContain("Primary trigger: `long_active_duration`");
   });
 
-  it("excludes only the silent tail when a running holder goes quiet mid-episode (BLO-19848)", async () => {
+  // BLO-19848 review follow-up: the tail clamp alone regressed the moment a
+  // parked holder resumed. Once the run is `running` again it is genuinely
+  // live, so the clamp releases — and because elapsed was still measured from
+  // issues.started_at, the entire parked interval was re-attributed to active
+  // work. A long park plus a short run therefore still tripped the trigger,
+  // which is the same false positive by another route.
+  it("excludes a parked interval after the holder is promoted back to running (BLO-19848)", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
+    const episodeStart = new Date(now.getTime() - 7 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: episodeStart });
+    await pinExecutionRun({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      status: "running",
+      lockedAt: episodeStart,
+      // Parked for 6h50m, promoted 10m ago. promoteDueScheduledRetry writes only
+      // status/error/updatedAt, so scheduledRetryAt survives promotion as the
+      // record of when the park ended.
+      scheduledRetryAt: new Date(now.getTime() - 10 * 60 * 1000),
+      scheduledRetryAttempt: 1,
+      // Live right now — this is what releases the tail clamp.
+      lastOutputAt: new Date(now.getTime() - 60 * 1000),
+    });
+    const service = productivityReviewService(db);
+
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    // Only the 10m live segment is attributable, well under the 6h threshold.
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  it("still fires long_active_duration on a long live segment that followed a park (BLO-19848)", async () => {
+    // The over-correction guard for the case above: excluding the park must not
+    // excuse a live segment that is itself long enough to review.
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const episodeStart = new Date(now.getTime() - 14 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: episodeStart });
+    await pinExecutionRun({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      status: "running",
+      lockedAt: episodeStart,
+      // Parked for the first 7h, then running for the last 7h.
+      scheduledRetryAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      scheduledRetryAttempt: 1,
+      lastOutputAt: new Date(now.getTime() - 60 * 1000),
+    });
+    const service = productivityReviewService(db);
+
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+    // The excluded park is reported rather than silently dropped.
+    expect(review?.description).toContain("Excluded as non-live execution hold");
+  });
+
+  it("excludes only the silent tail when a running holder goes quiet mid-episode (BLO-19848)", async () => {    const now = new Date("2026-04-28T12:00:00.000Z");
     const episodeStart = new Date(now.getTime() - 7 * 60 * 60 * 1000);
     const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: episodeStart });
     await pinExecutionRun({

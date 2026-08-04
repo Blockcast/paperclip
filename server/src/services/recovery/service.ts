@@ -2445,6 +2445,28 @@ export function recoveryService(
       },
     };
     const finalizedRun = await db.transaction(async (tx) => {
+      // Lock order: issues before heartbeat_runs.
+      //
+      // sweepStaleIssueLocks takes `issues` FOR UPDATE and then `heartbeat_runs`
+      // FOR UPDATE; releaseIssueExecutionAndPromote likewise locks issues first
+      // and documents the ordering explicitly. This transaction used to update
+      // the run row first and the issue row last, so the two paths acquired the
+      // same two rows in opposite orders — and they contend on precisely the
+      // pair the sweep exists to reconcile: an execution lock whose holder is
+      // finalizing. Under that race Postgres aborts one side with
+      // deadlock_detected (40P01) instead of either completing, which is the
+      // failure the sweep is supposed to prevent.
+      //
+      // Taking the issue row up front removes the inversion without changing
+      // semantics: the conditional UPDATE below still no-ops when the lock has
+      // already moved to another run, and a missing issue row simply locks
+      // nothing, exactly as before.
+      await tx
+        .select({ id: issues.id })
+        .from(issues)
+        .where(and(eq(issues.id, input.sourceIssue.id), eq(issues.companyId, input.run.companyId)))
+        .for("update");
+
       const [updatedRun] = await tx
         .update(heartbeatRuns)
         .set({
