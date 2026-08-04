@@ -2440,6 +2440,76 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(authorWakes).toEqual([]);
   });
 
+  it("dedups a redelivery against a pre-normalization mixed-case idempotency key (BLO-20526 rollout regression)", async () => {
+    const reviewerAgentId = randomUUID();
+    const { companyId } = await seedCompanyAndAgent();
+    await db.insert(agents).values({
+      id: reviewerAgentId,
+      companyId,
+      name: "Ally",
+      role: "engineer",
+      status: "idle",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const app = buildApp({ prReviewerAgentId: reviewerAgentId });
+    const deliveryId = "delivery-redelivered-across-rollout";
+
+    // What a pod running the PRE-normalization build wrote for this delivery:
+    // the repo segment carries GitHub's mixed case. `queued` is an idempotent
+    // status, so the replay check must recognise this row and skip.
+    const legacyIdempotencyKey = `pr_review:Blockcast/paperclip:631:github_pr_synchronized:delivery:${deliveryId}`;
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId: reviewerAgentId,
+      source: "github",
+      reason: "github_pr_synchronized",
+      idempotencyKey: legacyIdempotencyKey,
+      status: "queued",
+      payload: { taskKey: "pr_review:Blockcast/paperclip:631" },
+    });
+
+    // GitHub reuses the delivery id when it retries a delivery, so this is the
+    // same request arriving again — now handled by a post-normalization pod.
+    const redelivery = signedRequest({
+      action: "synchronize",
+      pull_request: {
+        number: 631,
+        title: "feat(issues): reject duplicate PR-review issues",
+        body: null,
+        html_url: "https://github.com/Blockcast/paperclip/pull/631",
+        head: { ref: "cto/blo-20526-guard", sha: "5ec17d77" },
+      },
+      repository: { full_name: "Blockcast/paperclip" },
+    });
+    const res = await request(app)
+      .post("/api/webhooks/github")
+      .set("x-github-event", "pull_request")
+      .set("x-hub-signature-256", redelivery.signature)
+      .set("x-github-delivery", deliveryId)
+      .set("content-type", "application/json")
+      .send(redelivery.body);
+
+    expect(res.status).toBe(200);
+
+    // Byte-exact equality on the idempotency key makes the legacy row invisible,
+    // so the redelivery queues a SECOND review of the same head. Exactly one
+    // reviewer wake must exist, and it must still be the pre-rollout row.
+    const reviewerWakes = await db
+      .select({
+        idempotencyKey: agentWakeupRequests.idempotencyKey,
+        status: agentWakeupRequests.status,
+      })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, reviewerAgentId));
+    expect(reviewerWakes).toEqual([
+      { idempotencyKey: legacyIdempotencyKey, status: "queued" },
+    ]);
+  });
+
   it("does not permanently block reviewer wakes once a dispatch retry chain is exhausted (BLO-14395 regression)", async () => {
     const reviewerAgentId = randomUUID();
     const { companyId } = await seedCompanyAndAgent();

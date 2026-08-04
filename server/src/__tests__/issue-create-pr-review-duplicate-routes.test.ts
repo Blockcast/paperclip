@@ -21,7 +21,10 @@ import {
 import { actorMiddleware } from "../middleware/auth.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
-import { __test_buildPrReviewerTaskKey } from "../routes/github-webhook.js";
+import {
+  __test_buildPrReviewerTaskKey,
+  __test_buildPrReviewerTaskLockKeys,
+} from "../routes/github-webhook.js";
 import {
   DUPLICATE_PR_REVIEW_ISSUE_ERROR_CODE,
   buildPrReviewTaskKey,
@@ -46,6 +49,38 @@ describe("pr review duplicate issue guard (pure helpers)", () => {
     } as never);
     expect(buildPrReviewTaskKey({ repoFullName: REPO, prNumber: PR_NUMBER })).toBe(webhookKey);
     expect(webhookKey).toBe(TASK_KEY);
+  });
+
+  it("locks both the normalized and legacy-casing namespaces during rollout", () => {
+    // The advisory lock id is hashtextextended(taskKey, 0), so the key's
+    // SPELLING is the namespace. A pod on the pre-normalization build derives it
+    // from the raw mixed-case repo name; this build lowercases it. If the new
+    // build locked only its own spelling, the two would serialize on different
+    // ids and could dispatch the same PR concurrently for the whole rolling
+    // deployment — assigning two reviewers to one PR, the exact duplicate cost
+    // this change removes.
+    const lockKeys = __test_buildPrReviewerTaskLockKeys({
+      repoFullName: REPO,
+      prNumber: PR_NUMBER,
+    } as never);
+
+    expect(lockKeys).toContain(TASK_KEY);
+    expect(lockKeys).toContain(`pr_review:${REPO}:${PR_NUMBER}`);
+    // Sorted and deduped, so two peers contending for the same PR always
+    // acquire the pair in one order and cannot livelock on opposite halves.
+    expect(lockKeys).toEqual([...lockKeys].sort());
+    expect(new Set(lockKeys).size).toBe(lockKeys.length);
+  });
+
+  it("locks a single namespace when the repo name is already lowercase", () => {
+    // No legacy spelling exists for an all-lowercase repo, so the extra lock
+    // must not be taken — it would double advisory-lock traffic for nothing.
+    expect(
+      __test_buildPrReviewerTaskLockKeys({
+        repoFullName: NORMALIZED_REPO,
+        prNumber: PR_NUMBER,
+      } as never),
+    ).toEqual([TASK_KEY]);
   });
 
   it("extracts unique PR refs from title and description", () => {

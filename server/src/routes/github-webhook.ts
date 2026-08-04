@@ -1392,6 +1392,31 @@ function buildPrReviewerTaskKey(context: ResolvedEventContext & { prNumber: numb
   return `pr_review:${repo}:${context.prNumber}`;
 }
 
+/**
+ * Advisory-lock namespaces to hold while dispatching one PR's reviewer wake.
+ *
+ * The lock id is `hashtextextended(taskKey, 0)`, so changing the *spelling* of
+ * the task key changes the namespace. Pods running the pre-normalization build
+ * derive it from the raw, mixed-case `repoFullName` (`pr_review:Blockcast/…`)
+ * while this build derives it from the lowercased one. Locking only the
+ * normalized key would therefore let an old pod and a new pod dispatch the same
+ * PR concurrently for the whole rolling-deployment window — assigning two
+ * reviewers to one PR, which is precisely the duplicate cost this change exists
+ * to remove.
+ *
+ * So hold BOTH namespaces until no pre-normalization pod remains. Sorted, so
+ * every caller acquires the pair in one order and two peers contending for the
+ * same PR cannot livelock each other by grabbing opposite halves. Retire this
+ * alongside the `lower()` legs in pr-review-duplicate-issue-guard.
+ */
+function buildPrReviewerTaskLockKeys(
+  context: ResolvedEventContext & { prNumber: number },
+): string[] {
+  const normalized = buildPrReviewerTaskKey(context);
+  const legacyCasing = `pr_review:${context.repoFullName ?? "unknown"}:${context.prNumber}`;
+  return [...new Set([normalized, legacyCasing])].sort();
+}
+
 type PrReviewerWakeupOptions = NonNullable<Parameters<ReturnType<typeof heartbeatService>["wakeup"]>[1]> & {
   payload: Record<string, unknown> & { taskKey: string };
   contextSnapshot: Record<string, unknown> & { taskKey: string };
@@ -1535,25 +1560,34 @@ async function findActivePrReviewerForTask(
 
 async function withPrReviewerTaskLock<T>(
   db: Db,
-  taskKey: string,
+  taskKeys: readonly string[],
   action: (tx: DbTransaction) => Promise<T>,
 ): Promise<T> {
   const deadline = Date.now() + PR_REVIEWER_TASK_LOCK_TIMEOUT_MS;
+  // Sorted at the call site (buildPrReviewerTaskLockKeys); re-sorted here so a
+  // future caller passing an unordered pair still cannot invert the order.
+  const lockKeys = [...new Set(taskKeys)].sort();
+  if (lockKeys.length === 0) throw new Error("PR reviewer task lock requires at least one key");
 
   while (true) {
     // Do not block a pooled connection while another request owns the lock:
     // the winner needs a second connection for heartbeat's enqueue transaction.
     const outcome = await db.transaction(async (tx) => {
-      const rows = await tx.execute(
-        sql`select pg_try_advisory_xact_lock(hashtextextended(${taskKey}, 0)) as acquired`,
-      );
-      const row = Array.isArray(rows) ? rows[0] : null;
-      if (
-        !row ||
-        typeof row !== "object" ||
-        (row as Record<string, unknown>).acquired !== true
-      ) {
-        return { acquired: false as const };
+      // All-or-nothing: the locks are xact-scoped, so returning early releases
+      // whichever prefix we did acquire when this transaction ends. Partial
+      // ownership never escapes the retry loop.
+      for (const lockKey of lockKeys) {
+        const rows = await tx.execute(
+          sql`select pg_try_advisory_xact_lock(hashtextextended(${lockKey}, 0)) as acquired`,
+        );
+        const row = Array.isArray(rows) ? rows[0] : null;
+        if (
+          !row ||
+          typeof row !== "object" ||
+          (row as Record<string, unknown>).acquired !== true
+        ) {
+          return { acquired: false as const };
+        }
       }
       return { acquired: true as const, value: await action(tx) };
     });
@@ -2051,7 +2085,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
         const idempotentStatuses = idempotentWakeStatuses(
           prReviewerWakeIdempotencyScope(context, deliveryId),
         );
-        return await withPrReviewerTaskLock(db, reviewerTaskKey, async (tx) => {
+        return await withPrReviewerTaskLock(db, buildPrReviewerTaskLockKeys(context), async (tx) => {
           // The wake insert commits through heartbeat's own transaction. Keep
           // this transaction-scoped lock held until that commit is visible so
           // concurrent first events for one PR re-check affinity instead of
@@ -2062,7 +2096,20 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
             .where(
               and(
                 inArray(agentWakeupRequests.agentId, reviewerAgentIds),
-                eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
+                // Case-insensitive on the repo segment, for the same reason the
+                // task-key lookups are: rows written before the producer was
+                // normalized spell the repo in GitHub's mixed case, and this
+                // replay check is what stops a GitHub REDELIVERY of one event
+                // enqueueing a second review. Byte-exact equality would make
+                // every pre-rollout row invisible here, so a redelivery landing
+                // after deploy would queue a duplicate — worst exactly when the
+                // original run is already terminal and task-key coalescing has
+                // nothing live to catch it. Reviewer idempotency keys are
+                // `pr_review:<repo>:<n>:<suffix>`, so they carry the shared
+                // predicate's `pr_review:` prefix; the suffix segments (wake
+                // reason, numeric comment id, GitHub delivery uuid) are already
+                // lowercase, so folding case cannot merge two distinct requests.
+                matchesTaskKey(agentWakeupRequests.idempotencyKey, idempotencyKey),
                 inArray(agentWakeupRequests.status, idempotentStatuses),
               ),
             )
@@ -2780,6 +2827,7 @@ export const __test_buildPrReviewerWakeIdempotencyKey = buildPrReviewerWakeIdemp
 export const __test_prReviewerWakeIdempotencyScope = prReviewerWakeIdempotencyScope;
 export const __test_idempotentWakeStatuses = idempotentWakeStatuses;
 export const __test_buildPrReviewerTaskKey = buildPrReviewerTaskKey;
+export const __test_buildPrReviewerTaskLockKeys = buildPrReviewerTaskLockKeys;
 export const __test_buildDependabotAlertIssueBody = buildDependabotAlertIssueBody;
 export const __test_resolveDependabotAlertContext = resolveDependabotAlertContext;
 export const __test_hasActionablePrReviewFeedback = hasActionablePrReviewFeedback;
