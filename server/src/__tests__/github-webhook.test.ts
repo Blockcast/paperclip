@@ -4009,6 +4009,57 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(receipts[0]!.body).toContain("no Dependabot REST or GraphQL query was used");
   });
 
+  // BLO-19037: the receipt dedup guard was a read-then-insert -- two
+  // concurrent deliveries of the same event both observe "no existing
+  // receipt" before either writes, so both write. A *sequential* replay (the
+  // "records a terminal webhook receipt" test above, and the orphan-issue
+  // test below) does not exercise that window: each request's INSERT
+  // completes and commits before the next request runs its SELECT. Firing
+  // both requests through `Promise.all` interleaves them at the same await
+  // boundaries a second paperclip-api replica would race across.
+  it("dedupes concurrent replays of the same terminal delivery to a single receipt comment", async () => {
+    const { agentId } = await seedCompanyAndAgent({ agentName: "Release Engineer" });
+    const app = buildApp({ dependabotAgentId: agentId });
+
+    await postDependabot(app, dependabotPayload("critical", "created"), "delivery-created");
+
+    // Warm the connection pool to >=2 physical connections before racing.
+    // Every prior test in this suite runs its queries sequentially, so by
+    // this point the pool has settled on exactly one warm connection; firing
+    // only two concurrent requests here would let the first reuse that warm
+    // connection while the second cold-establishes a brand new one (tens of
+    // ms on embedded Postgres), which is slow enough that the first request
+    // always finishes before the second even starts its query -- masking the
+    // race instead of exercising it.
+    await Promise.all(Array.from({ length: 4 }, () => db.execute(sql`select 1`)));
+
+    const terminalPayload = dependabotPayload("critical", "fixed");
+    const [first, second] = await Promise.all([
+      postDependabot(app, terminalPayload, "delivery-fixed-concurrent"),
+      postDependabot(app, terminalPayload, "delivery-fixed-concurrent"),
+    ]);
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+
+    const [issue] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.originId, "github-dependabot:Blockcast/paperclip#58"));
+    expect(issue?.status).toBe("done");
+
+    const receipts = await db
+      .select()
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.issueId, issue!.id),
+          sql`${issueComments.metadata}->>'kind' = 'github_dependabot_terminal_receipt'`,
+        ),
+      );
+    expect(receipts).toHaveLength(1);
+    expect(receipts[0]!.body).toContain("GitHub delivery: `delivery-fixed-concurrent`");
+  });
+
   it("records dismissal evidence before closing a Dependabot alert issue", async () => {
     const { agentId } = await seedCompanyAndAgent({ agentName: "Release Engineer" });
     const app = buildApp({ dependabotAgentId: agentId });

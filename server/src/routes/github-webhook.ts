@@ -1176,24 +1176,22 @@ async function recordDependabotTerminalReceipt(
   }
 
   const externalKey = `${input.originId}:${input.alert.action}:${input.deliveryId ?? "no-delivery"}`;
-  const existingReceipt = await db
-    .select({ id: issueComments.id })
-    .from(issueComments)
-    .where(
-      and(
-        eq(issueComments.issueId, issue.id),
-        sql`${issueComments.metadata}->>'kind' = 'github_dependabot_terminal_receipt'`,
-        sql`${issueComments.metadata}->>'externalKey' = ${externalKey}`,
-      ),
-    )
-    .limit(1)
-    .then((rows) => rows[0] ?? null);
-
-  if (!existingReceipt) {
-    await db.insert(issueComments).values({
+  // BLO-19037: this used to be a read-then-insert (SELECT for an existing
+  // receipt, then INSERT if none was found) which is a check-then-write race
+  // across paperclip-api's replicas -- two concurrent deliveries of the same
+  // event can both observe "no existing receipt" before either writes.
+  // idempotencyKey rides the already-deployed partial unique index
+  // (issue_comments_issue_system_idempotency_idx on issueId+idempotencyKey,
+  // scoped to system comments) so the insert is a single atomic upsert:
+  // ON CONFLICT DO NOTHING makes the external key authoritative in the
+  // database rather than in application logic, independent of replica count.
+  await db
+    .insert(issueComments)
+    .values({
       companyId: input.companyId,
       issueId: issue.id,
       authorType: "system",
+      idempotencyKey: externalKey,
       body: receiptBody,
       metadata: {
         kind: "github_dependabot_terminal_receipt",
@@ -1206,8 +1204,8 @@ async function recordDependabotTerminalReceipt(
         dismissalReason: input.alert.dismissalReason,
         dismissalComment: input.alert.dismissalComment,
       } as never,
-    });
-  }
+    })
+    .onConflictDoNothing();
 
   if (hasCompleteTerminalEvidence && issue.status !== "done") {
     await issueService(db).update(issue.id, { status: "done" });
