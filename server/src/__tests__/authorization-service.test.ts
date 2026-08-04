@@ -2036,7 +2036,7 @@ describeEmbeddedPostgres("authorization service", () => {
     })).resolves.toMatchObject({ allowed: false, reason: "deny_low_trust_boundary" });
   });
 
-  it("allows active board-user comments to create mention-scoped issue grants", async () => {
+  it("requires an active board-user membership for mention-scoped issue grants", async () => {
     const company = await createCompany(db, "MentionCommentBoardGrant");
     const allowedProject = await createProject(db, company.id, "MentionBoardAllowed");
     const targetProject = await createProject(db, company.id, "MentionBoardTarget");
@@ -2060,13 +2060,6 @@ describeEmbeddedPostgres("authorization service", () => {
       assigneeAgentId: ownerAgent.id,
     });
     const boardUserId = `user-${randomUUID()}`;
-    await db.insert(companyMemberships).values({
-      companyId: company.id,
-      principalType: "user",
-      principalId: boardUserId,
-      status: "active",
-      membershipRole: "member",
-    });
     await db.insert(issueComments).values({
       companyId: company.id,
       issueId: issue.id,
@@ -2084,7 +2077,22 @@ describeEmbeddedPostgres("authorization service", () => {
       status: issue.status,
     } as const;
 
-    await expect(authorizationService(db).decide({
+    const authorization = authorizationService(db);
+    await expect(authorization.decide({
+      actor,
+      action: "issue:comment",
+      resource,
+    })).resolves.toMatchObject({ allowed: false });
+
+    await db.insert(companyMemberships).values({
+      companyId: company.id,
+      principalType: "user",
+      principalId: boardUserId,
+      status: "active",
+      membershipRole: "member",
+    });
+
+    await expect(authorization.decide({
       actor,
       action: "issue:comment",
       resource,

@@ -589,6 +589,26 @@ export function commentAuthorCanGrantIssueMention(input: {
   return input.authorUserIsActiveMember;
 }
 
+export function getActiveCompanyMembership(
+  db: Db,
+  companyId: string,
+  principalType: PrincipalType,
+  principalId: string,
+) {
+  return db
+    .select()
+    .from(companyMemberships)
+    .where(
+      and(
+        eq(companyMemberships.companyId, companyId),
+        eq(companyMemberships.principalType, principalType),
+        eq(companyMemberships.principalId, principalId),
+        eq(companyMemberships.status, "active"),
+      ),
+    )
+    .then((rows) => rows[0] ?? null);
+}
+
 // BLO-18152: a bare "outside this actor's authorization boundary" message
 // gives a rejected agent nothing to act on — it reads as "you are locked out
 // of this issue," which is only true for some of these reasons. Naming which
@@ -654,18 +674,7 @@ export function authorizationService(db: Db) {
     principalType: PrincipalType,
     principalId: string,
   ) {
-    return db
-      .select()
-      .from(companyMemberships)
-      .where(
-        and(
-          eq(companyMemberships.companyId, companyId),
-          eq(companyMemberships.principalType, principalType),
-          eq(companyMemberships.principalId, principalId),
-          eq(companyMemberships.status, "active"),
-        ),
-      )
-      .then((rows) => rows[0] ?? null);
+    return getActiveCompanyMembership(db, companyId, principalType, principalId);
   }
 
   async function loadResponsibleUserSnapshot(companyId: string, userId: string): Promise<ResponsibleUserSnapshot> {

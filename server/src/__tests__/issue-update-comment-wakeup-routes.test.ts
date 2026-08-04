@@ -32,6 +32,7 @@ const mockIssueReferenceService = vi.hoisted(() => ({
   syncIssue: vi.fn(async () => undefined),
 }));
 const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
+const mockGetActiveCompanyMembership = vi.hoisted(() => vi.fn(async () => ({ id: "membership-1" })));
 
 const mockHeartbeatService = vi.hoisted(() => ({
   wakeup: vi.fn(async () => undefined),
@@ -105,6 +106,10 @@ vi.mock("../services/index.js", () => ({
 }));
 
 function registerModuleMocks() {
+  vi.doMock("../services/authorization.js", async () => ({
+    ...await vi.importActual<typeof import("../services/authorization.js")>("../services/authorization.js"),
+    getActiveCompanyMembership: mockGetActiveCompanyMembership,
+  }));
   vi.doMock("../services/source-trust.js", async () => ({
     ...await vi.importActual<typeof import("../services/source-trust.js")>("../services/source-trust.js"),
     resolveActorSourceTrustForIssue: vi.fn(async () => null),
@@ -227,6 +232,7 @@ describe("issue update comment wakeups", () => {
     mockIssueService.listWakeableBlockedDependents.mockResolvedValue([]);
     mockIssueService.getWakeableParentAfterChildCompletion.mockResolvedValue(null);
     mockIssueService.getCurrentScheduledRetry.mockResolvedValue(null);
+    mockGetActiveCompanyMembership.mockResolvedValue({ id: "membership-1" });
     mockIssueReferenceService.diffIssueReferenceSummary.mockReturnValue({
       addedReferencedIssues: [],
       removedReferencedIssues: [],
@@ -617,7 +623,7 @@ describe("issue update comment wakeups", () => {
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 
-  it("routes a structured mentioned agent without making that agent the issue owner", async () => {
+  it("does not wake a structured mentioned agent for a local implicit actor without membership", async () => {
     const existing = makeIssue({
       assigneeAgentId: null,
       assigneeUserId: "local-board",
@@ -631,6 +637,7 @@ describe("issue update comment wakeups", () => {
       body: "[@QA](/agents/33333333-3333-4333-8333-333333333333) please inspect this",
     });
     mockIssueService.findMentionedAgents.mockResolvedValue([MENTIONED_AGENT_ID]);
+    mockGetActiveCompanyMembership.mockResolvedValue(null);
 
     const res = await request(await createApp())
       .post(`/api/issues/${existing.id}/comments`)
@@ -639,8 +646,41 @@ describe("issue update comment wakeups", () => {
       });
 
     expect(res.status).toBe(201);
-    await vi.waitFor(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(mockIssueService.findMentionedAgents).toHaveBeenCalled());
     expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalledWith(
+      MENTIONED_AGENT_ID,
+      expect.objectContaining({ reason: "issue_comment_mentioned" }),
+    );
+  });
+
+  it("routes a structured mentioned agent when the author has an active membership", async () => {
+    const existing = makeIssue({
+      assigneeAgentId: null,
+      assigneeUserId: "active-user",
+      status: "in_progress",
+    });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-structured-mention",
+      issueId: existing.id,
+      companyId: existing.companyId,
+      body: `[@QA](agent://${MENTIONED_AGENT_ID}) please inspect this`,
+    });
+    mockIssueService.findMentionedAgents.mockResolvedValue([MENTIONED_AGENT_ID]);
+
+    const res = await request(await createApp({
+      type: "board",
+      userId: "active-user",
+      companyIds: [existing.companyId],
+      source: "session",
+      isInstanceAdmin: false,
+    }))
+      .post(`/api/issues/${existing.id}/comments`)
+      .send({ body: `[@QA](agent://${MENTIONED_AGENT_ID}) please inspect this` });
+
+    expect(res.status).toBe(201);
+    await vi.waitFor(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(1));
     expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
       MENTIONED_AGENT_ID,
       expect.objectContaining({
@@ -660,6 +700,39 @@ describe("issue update comment wakeups", () => {
         }),
       }),
     );
+  });
+
+  it("applies mention grant wake eligibility to PATCH comments", async () => {
+    const existing = makeIssue({
+      assigneeAgentId: null,
+      assigneeUserId: "active-user",
+      status: "in_progress",
+    });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockResolvedValue(existing);
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-patch-assignee-mention",
+      issueId: existing.id,
+      companyId: existing.companyId,
+      body: `[@QA](agent://${MENTIONED_AGENT_ID}) please inspect this`,
+    });
+    mockIssueService.findMentionedAgents.mockResolvedValue([MENTIONED_AGENT_ID]);
+
+    const res = await request(await createApp({
+      type: "board",
+      userId: "active-user",
+      companyIds: [existing.companyId],
+      source: "session",
+      isInstanceAdmin: false,
+    }))
+      .patch(`/api/issues/${existing.id}`)
+      .send({ comment: `[@QA](agent://${MENTIONED_AGENT_ID}) please inspect this` });
+
+    expect(res.status).toBe(200);
+    await vi.waitFor(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      MENTIONED_AGENT_ID,
+      expect.objectContaining({ reason: "issue_comment_mentioned" }),
+    ));
   });
 
   it("does not wake a mentioned agent when an agent comment cannot grant reply access", async () => {
