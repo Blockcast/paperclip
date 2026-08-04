@@ -1,8 +1,10 @@
-import { and, asc, desc, eq, gt, gte, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
+import { randomUUID } from "node:crypto";
+import { and, asc, desc, eq, gt, gte, inArray, isNull, lt, lte, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { clampIssueRequestDepth } from "@paperclipai/shared";
 import {
   activityLog,
+  agentWakeupRequests,
   agents,
   approvals,
   companies,
@@ -13,11 +15,19 @@ import {
   issueComments,
   issueRelations,
   issues,
+  linearIssueLinks,
   projects,
 } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
+import { assertAssignableAgent } from "./agent-assignability.js";
 import { budgetService } from "./budgets.js";
+import {
+  allocateIdentifier,
+  deleteLinearIssueForCompany,
+  LinearIssueCreateUnconfirmedError,
+} from "./identifier-allocator.js";
+import { withIssueMonitorQueueLock } from "./issue-monitor-queue-lock.js";
 import { issueService } from "./issues.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import {
@@ -47,13 +57,34 @@ export const DEFAULT_PRODUCTIVITY_REVIEW_MAX_REFRESH_COMMENTS = 3;
 export const DEFAULT_PRODUCTIVITY_REVIEW_CREATION_WINDOW_MS = 24 * 60 * 60 * 1000;
 export const DEFAULT_PRODUCTIVITY_REVIEW_MAX_CREATIONS_PER_WINDOW = 1;
 export const DEFAULT_PRODUCTIVITY_REVIEW_MAX_CONSECUTIVE_NO_ACTION_REVIEWS = 3;
+export const ISSUE_MONITOR_WAKE_CLAIM_TTL_MS = 5 * 60 * 1000;
+export const ISSUE_MONITOR_DISPATCH_BATCH_SIZE = 50;
+export const DEFAULT_HEARTBEAT_SCHEDULER_INTERVAL_MS = 30_000;
+export const DEFAULT_PRODUCTIVITY_REVIEW_MONITOR_LAPSE_SERVICE_GRACE_MS =
+  DEFAULT_HEARTBEAT_SCHEDULER_INTERVAL_MS + ISSUE_MONITOR_WAKE_CLAIM_TTL_MS;
 
+const PRODUCTIVITY_REVIEW_RESERVATION_STALE_MS = 5 * 60 * 1000;
 const TERMINAL_RUN_STATUSES = ["succeeded", "interrupted", "failed", "cancelled", "timed_out"] as const;
 const ACTIVE_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const MAX_CANDIDATE_ISSUES = 250;
 const MAX_RUNS_FOR_STREAK = 100;
 const MAX_PARENT_WALK_DEPTH = 25;
 export const PRODUCTIVITY_REVIEW_REFRESH_COMMENT_PREFIX = "Productivity review evidence refreshed.";
+const PRODUCTIVITY_REVIEW_CREATED_ACTION = "issue.productivity_review_created";
+const PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_STARTED_ACTION =
+  "issue.productivity_review_assignment_wake_started";
+const PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_FAILED_ACTION =
+  "issue.productivity_review_assignment_wake_failed";
+const PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_ENQUEUED_ACTION =
+  "issue.productivity_review_assignment_wake_enqueued";
+const PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_CLAIM_LEASE_MS = 5 * 60 * 1000;
+const PRODUCTIVITY_REVIEW_DURABLE_WAKE_REQUEST_STATUSES = [
+  "queued",
+  "claimed",
+  "coalesced",
+  "deferred_issue_execution",
+  "completed",
+] as const;
 // BLO-3281 AC2 hard floor: even if the detector scan cadence is faster
 // than this, the refresh-evidence-comment path stays throttled at 5 min.
 // Defends against the 2026-05-05 incident on BLO-3277 (14 refreshes in
@@ -62,6 +93,9 @@ export const PRODUCTIVITY_REVIEW_MIN_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 // Marker set on heartbeat-run contextSnapshot.source by routine dispatches; see
 // queueIssueAssignmentWakeup callers in routines.ts (`contextSource: "routine.dispatch"`).
 const ROUTINE_DISPATCH_CONTEXT_SOURCE = "routine.dispatch";
+// Back-compat export for existing tests/imports. New logic reads the threshold
+// value so the worker can derive it from scheduler cadence and dispatch TTL.
+export const MONITOR_LAPSE_SERVICE_GRACE_MS = DEFAULT_PRODUCTIVITY_REVIEW_MONITOR_LAPSE_SERVICE_GRACE_MS;
 
 type IssueRow = typeof issues.$inferSelect;
 type AgentRow = typeof agents.$inferSelect;
@@ -82,6 +116,9 @@ type ProductivityReviewThresholds = {
   creationWindowMs: number;
   maxCreationsPerWindow: number;
   maxConsecutiveNoActionReviews: number;
+  monitorLapseServiceGraceMs: number;
+  monitorSchedulerIntervalMs: number;
+  monitorDispatchBatchSize: number;
 };
 
 type ProductivityReviewEvidence = {
@@ -117,6 +154,16 @@ type ProductivityReviewEvidence = {
   routineOnlySamplingWindow: boolean;
 };
 
+type ProductivityReviewFinishEvidence = Pick<
+  ProductivityReviewEvidence,
+  | "sourceIssue"
+  | "generatedAt"
+  | "trigger"
+  | "noCommentStreak"
+  | "runCountLastHour"
+  | "commentCountLastHour"
+>;
+
 type MonitorScheduledSuppression = {
   trigger: "long_active_duration";
   triggerReasons: string[];
@@ -125,8 +172,15 @@ type MonitorScheduledSuppression = {
   elapsedMs: number | null;
   monitorNextCheckAt: Date;
   monitorScheduledBy: string;
+  monitorWakeRequestedAt: Date | null;
   thresholds: ProductivityReviewThresholds;
   generatedAt: Date;
+};
+
+type PendingMonitorForReviewSuppression = {
+  monitorNextCheckAt: Date;
+  monitorScheduledBy: string;
+  monitorWakeRequestedAt: Date | null;
 };
 
 type ApprovalGatedSuppression = {
@@ -147,6 +201,7 @@ type EnqueueWakeup = (
     triggerDetail?: "manual" | "ping" | "callback" | "system";
     reason?: string | null;
     payload?: Record<string, unknown> | null;
+    idempotencyKey?: string | null;
     requestedByActorType?: "user" | "agent" | "system";
     requestedByActorId?: string | null;
     contextSnapshot?: Record<string, unknown>;
@@ -161,12 +216,28 @@ const MONITOR_SCHEDULED_SUPPRESSION_ACTORS = new Set(["assignee", "board"]);
 const APPROVAL_GATE_SUPPRESSION_STATUSES = ["pending"] as const;
 
 type ProductivityReviewServiceDeps = {
+  beforeCollectEvidence?: (sourceIssue: IssueRow) => Promise<void> | void;
+  beforeMonitorBacklogGrace?: (sourceIssue: IssueRow) => Promise<void> | void;
   enqueueWakeup?: EnqueueWakeup;
   beforeCreateOrUpdateReview?: (evidence: ProductivityReviewEvidence) => Promise<void> | void;
+  beforeCreateReviewIssueInsert?: (evidence: ProductivityReviewEvidence) => Promise<void> | void;
+  beforeFinalMonitorSuppressionRevalidation?: (evidence: ProductivityReviewEvidence) => Promise<void> | void;
+  afterFinalMonitorReviewReservation?: (evidence: ProductivityReviewEvidence, review: IssueRow) => Promise<void> | void;
+  beforeStaleReservationRecoveryFinalize?: (review: IssueRow, sourceIssue: IssueRow) => Promise<void> | void;
 };
+
+class MonitorSuppressedBeforeCreateError extends Error {
+  constructor(readonly monitor: PendingMonitorForReviewSuppression) {
+    super("productivity review source monitor became pending before issue insert");
+  }
+}
 
 function productivityReviewFingerprint(sourceIssueId: string) {
   return `productivity-review:${sourceIssueId}`;
+}
+
+function productivityReviewAssignmentWakeIdempotencyKey(reviewIssueId: string) {
+  return `productivity-review-created:${reviewIssueId}`;
 }
 
 function productivityReviewEscalationFingerprint(sourceIssueId: string) {
@@ -189,6 +260,17 @@ function msToHuman(ms: number | null) {
   const days = Math.floor(hours / 24);
   if (days > 0) return `${days}d ${hours % 24}h`;
   return `${hours}h ${minutes % 60}m`;
+}
+
+// BLO-21003 AC3: `msToHuman` floors anything under 60s to `0m`, which reads as
+// "measured and zero" rather than "sub-minute and unmeasured at this
+// resolution". A caller reporting a genuinely nonzero sub-minute duration (e.g.
+// `monitorGatingBreakdown`'s `unattendedMs`) should say so with a real unit
+// instead. Zero itself is left as `0m` — that value is accurate, not floored.
+function msToHumanFine(ms: number | null) {
+  if (ms === null) return "unknown";
+  if (ms > 0 && ms < 60_000) return `${Math.max(1, Math.round(ms / 1000))}s`;
+  return msToHuman(ms);
 }
 
 function issueUiLink(issue: { identifier: string | null; id: string }, prefix: string) {
@@ -236,12 +318,58 @@ function isTerminalIssueStatus(status: string | null | undefined) {
   return status === "done" || status === "cancelled";
 }
 
-function deliberateFutureMonitor(issue: IssueRow, now: Date) {
+function isMonitorSuppressionActor(value: string | null | undefined): value is string {
+  return Boolean(value && MONITOR_SCHEDULED_SUPPRESSION_ACTORS.has(value));
+}
+
+function strictFutureMonitor(issue: IssueRow, now: Date) {
   const monitorNextCheckAt = coerceDate(issue.monitorNextCheckAt);
   const monitorScheduledBy = issue.monitorScheduledBy;
   if (!monitorNextCheckAt || monitorNextCheckAt.getTime() <= now.getTime()) return null;
-  if (!monitorScheduledBy || !MONITOR_SCHEDULED_SUPPRESSION_ACTORS.has(monitorScheduledBy)) return null;
+  if (!isMonitorSuppressionActor(monitorScheduledBy)) return null;
   return { monitorNextCheckAt, monitorScheduledBy };
+}
+
+function monitorHasFreshWakeClaim(issue: IssueRow, now: Date) {
+  const monitorWakeRequestedAt = coerceDate(issue.monitorWakeRequestedAt);
+  if (!monitorWakeRequestedAt) return null;
+  return monitorWakeRequestedAt.getTime() >= now.getTime() - ISSUE_MONITOR_WAKE_CLAIM_TTL_MS
+    ? monitorWakeRequestedAt
+    : null;
+}
+
+function issueCanReceiveMonitorDispatch(issue: IssueRow) {
+  return Boolean(
+    !issue.assigneeUserId &&
+      issue.assigneeAgentId &&
+      ["in_progress", "in_review"].includes(issue.status),
+  );
+}
+
+function deliberatePendingMonitor(
+  issue: IssueRow,
+  now: Date,
+  thresholds: ProductivityReviewThresholds,
+  backlogGraceMs = 0,
+): PendingMonitorForReviewSuppression | null {
+  const future = strictFutureMonitor(issue, now);
+  if (future) return { ...future, monitorWakeRequestedAt: null };
+
+  const monitorNextCheckAt = coerceDate(issue.monitorNextCheckAt);
+  const monitorScheduledBy = issue.monitorScheduledBy;
+  if (!monitorNextCheckAt || !isMonitorSuppressionActor(monitorScheduledBy)) return null;
+
+  // BLO-21003: `monitorNextCheckAt` lapsing is not proof its wake has been
+  // serviced. For new-review suppression, keep treating it as pending while
+  // either (a) the scheduler-derived grace has not elapsed, or (b) the monitor
+  // dispatcher has a fresh durable claim (`monitorWakeRequestedAt`). The close
+  // path intentionally does not use this helper because resolving an already
+  // open review would start the resolved-review snooze before dispatch succeeds.
+  const dueAgeMs = now.getTime() - monitorNextCheckAt.getTime();
+  const monitorWakeRequestedAt = monitorHasFreshWakeClaim(issue, now);
+  const effectiveGraceMs = Math.max(thresholds.monitorLapseServiceGraceMs, backlogGraceMs);
+  if (dueAgeMs > effectiveGraceMs && !monitorWakeRequestedAt) return null;
+  return { monitorNextCheckAt, monitorScheduledBy, monitorWakeRequestedAt };
 }
 
 /**
@@ -321,8 +449,8 @@ function monitorGatingBreakdown(issue: IssueRow, activeStartedAt: Date | null, e
 function formatMonitorGating(gating: NonNullable<ProductivityReviewEvidence["monitorGating"]>) {
   // An upper-bound gated figure implies a lower-bound unattended figure; both
   // carry a qualifier so neither half of the split reads as measured.
-  const gated = `${gating.gatedIsUpperBound ? "≤" : ""}${msToHuman(gating.gatedMs)} monitor-gated`;
-  const unattended = `${gating.gatedIsUpperBound ? "≥" : ""}${msToHuman(gating.unattendedMs)} unattended`;
+  const gated = `${gating.gatedIsUpperBound ? "≤" : ""}${msToHumanFine(gating.gatedMs)} monitor-gated`;
+  const unattended = `${gating.gatedIsUpperBound ? "≥" : ""}${msToHumanFine(gating.unattendedMs)} unattended`;
   const split = `${gated}, ${unattended}`;
   if (gating.armedUntil) {
     return `${split} (monitor armed until ${gating.armedUntil.toISOString()}; arm time is not recorded, so monitor-gated time is an upper bound)`;
@@ -353,6 +481,14 @@ function isRoutineOriginRun(run: HeartbeatRunRow): boolean {
 }
 
 function buildThresholds(overrides?: Partial<ProductivityReviewThresholds>): ProductivityReviewThresholds {
+  const monitorSchedulerIntervalMs = readPositiveInteger(
+    overrides?.monitorSchedulerIntervalMs ?? DEFAULT_HEARTBEAT_SCHEDULER_INTERVAL_MS,
+    DEFAULT_HEARTBEAT_SCHEDULER_INTERVAL_MS,
+  );
+  const monitorDispatchBatchSize = readPositiveInteger(
+    overrides?.monitorDispatchBatchSize ?? ISSUE_MONITOR_DISPATCH_BATCH_SIZE,
+    ISSUE_MONITOR_DISPATCH_BATCH_SIZE,
+  );
   const longActiveMs = readPositiveInteger(
     overrides?.longActiveMs ?? DEFAULT_PRODUCTIVITY_REVIEW_LONG_ACTIVE_HOURS * 60 * 60 * 1000,
     DEFAULT_PRODUCTIVITY_REVIEW_LONG_ACTIVE_HOURS * 60 * 60 * 1000,
@@ -419,6 +555,12 @@ function buildThresholds(overrides?: Partial<ProductivityReviewThresholds>): Pro
       overrides?.maxConsecutiveNoActionReviews ?? DEFAULT_PRODUCTIVITY_REVIEW_MAX_CONSECUTIVE_NO_ACTION_REVIEWS,
       DEFAULT_PRODUCTIVITY_REVIEW_MAX_CONSECUTIVE_NO_ACTION_REVIEWS,
     ),
+    monitorLapseServiceGraceMs: readPositiveInteger(
+      overrides?.monitorLapseServiceGraceMs ?? monitorSchedulerIntervalMs + ISSUE_MONITOR_WAKE_CLAIM_TTL_MS,
+      monitorSchedulerIntervalMs + ISSUE_MONITOR_WAKE_CLAIM_TTL_MS,
+    ),
+    monitorSchedulerIntervalMs,
+    monitorDispatchBatchSize,
   };
 }
 
@@ -454,6 +596,13 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
   const issuesSvc = issueService(db);
   const budgets = budgetService(db);
 
+  async function currentDatabaseTime(executor: DbOrTx) {
+    const [row] = Array.from(await executor.execute(sql<{ now: Date | string }>`
+      select clock_timestamp() as "now"
+    `)) as Array<{ now: Date | string | null }>;
+    return coerceDate(row?.now) ?? new Date();
+  }
+
   async function getCompanyIssuePrefix(companyId: string) {
     return db
       .select({ issuePrefix: companies.issuePrefix })
@@ -467,6 +616,28 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       .select()
       .from(agents)
       .where(eq(agents.id, agentId))
+      .then((rows) => rows[0] ?? null);
+  }
+
+  async function getCurrentIssue(
+    sourceIssue: IssueRow,
+    dbClient: DbOrTx = db,
+    opts?: { forUpdate?: boolean },
+  ) {
+    if (opts?.forUpdate) {
+      await dbClient.execute(sql`
+        select ${issues.id}
+        from ${issues}
+        where ${issues.companyId} = ${sourceIssue.companyId}
+          and ${issues.id} = ${sourceIssue.id}
+        for update
+      `);
+    }
+    return dbClient
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, sourceIssue.companyId), eq(issues.id, sourceIssue.id)))
+      .limit(1)
       .then((rows) => rows[0] ?? null);
   }
 
@@ -519,8 +690,12 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     return false;
   }
 
-  async function findOpenProductivityReview(companyId: string, sourceIssueId: string) {
-    return db
+  async function findOpenProductivityReview(
+    companyId: string,
+    sourceIssueId: string,
+    executor: DbOrTx = db,
+  ) {
+    return executor
       .select()
       .from(issues)
       .where(
@@ -535,6 +710,151 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       .orderBy(desc(issues.updatedAt))
       .limit(1)
       .then((rows) => rows[0] ?? null);
+  }
+
+  async function reserveLongActiveProductivityReviewIssue(input: {
+    evidence: ProductivityReviewEvidence;
+    thresholds: ProductivityReviewThresholds;
+    ownerAgentId: string;
+    title: string;
+    description: string;
+  }) {
+    return db.transaction((tx) =>
+      withIssueMonitorQueueLock(tx, async () => {
+        const monitor = await currentPendingMonitorForReviewSuppression(
+          input.evidence.sourceIssue,
+          input.evidence.generatedAt,
+          input.thresholds,
+          tx,
+          { lockSource: true, runBacklogHook: false },
+        );
+        if (monitor) throw new MonitorSuppressedBeforeCreateError(monitor);
+
+        const existing = await findOpenProductivityReview(
+          input.evidence.sourceIssue.companyId,
+          input.evidence.sourceIssue.id,
+          tx,
+        );
+        if (existing) return { kind: "existing" as const, review: existing };
+
+        const [review] = await tx
+          .insert(issues)
+          .values({
+            companyId: input.evidence.sourceIssue.companyId,
+            title: input.title,
+            description: input.description,
+            status: "todo",
+            priority: "medium",
+            parentId: input.evidence.sourceIssue.id,
+            projectId: input.evidence.sourceIssue.projectId,
+            projectWorkspaceId: input.evidence.sourceIssue.projectWorkspaceId,
+            goalId: input.evidence.sourceIssue.goalId,
+            billingCode: input.evidence.sourceIssue.billingCode,
+            assigneeAgentId: input.ownerAgentId,
+            createdByAgentId: input.evidence.sourceAgent.id,
+            assigneeAdapterOverrides: recoveryAssigneeAdapterOverrides("status_only"),
+            responsibleUserId:
+              input.evidence.sourceIssue.responsibleUserId ??
+              input.evidence.sourceIssue.createdByUserId,
+            originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+            originId: input.evidence.sourceIssue.id,
+            originFingerprint: productivityReviewFingerprint(input.evidence.sourceIssue.id),
+            requestDepth: clampIssueRequestDepth(input.evidence.sourceIssue.requestDepth + 1),
+            createdAt: input.evidence.generatedAt,
+            updatedAt: input.evidence.generatedAt,
+            lastActivityAt: input.evidence.generatedAt,
+          })
+          .returning();
+
+        return { kind: "reserved" as const, review };
+      })
+    );
+  }
+
+  async function finalizeReservedProductivityReviewIssue(input: {
+    review: IssueRow;
+    title: string;
+    description: string;
+    generatedAt: Date;
+  }): Promise<{ review: IssueRow; finalized: boolean }> {
+    let createdLinearIssueId: string | null = null;
+    let preserveReservation = false;
+    try {
+      return await db.transaction(async (tx) => {
+        await tx.execute(
+          sql`select pg_advisory_xact_lock(hashtextextended(${`productivity-review-finalize:${input.review.id}`}, 0))`,
+        );
+
+        const current = await tx
+          .select()
+          .from(issues)
+          .where(and(eq(issues.companyId, input.review.companyId), eq(issues.id, input.review.id)))
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (!current) throw new Error(`Reserved productivity review ${input.review.id} disappeared before finalization`);
+        if (current.identifier && current.issueNumber != null) {
+          return { review: current, finalized: false };
+        }
+        if (current.identifier || current.issueNumber != null) {
+          throw new Error(`Reserved productivity review ${input.review.id} is partially finalized`);
+        }
+
+        const allocation = await allocateIdentifier({
+          db: tx,
+          companyId: input.review.companyId,
+          title: input.title,
+          description: input.description,
+          linearIssueIdempotencyKey: input.review.id,
+        });
+        if (allocation.createdLinearSideIssue && allocation.externalIssueId) {
+          createdLinearIssueId = allocation.externalIssueId;
+        }
+        if (allocation.source === "linear") {
+          preserveReservation = true;
+        }
+
+        const [updated] = await tx
+          .update(issues)
+          .set({
+            issueNumber: allocation.issueNumber,
+            identifier: allocation.identifier,
+            updatedAt: input.generatedAt,
+          })
+          .where(
+            and(
+              eq(issues.companyId, input.review.companyId),
+              eq(issues.id, input.review.id),
+              isNull(issues.issueNumber),
+              isNull(issues.identifier),
+            ),
+          )
+          .returning();
+        if (!updated) throw new Error(`Reserved productivity review ${input.review.id} was finalized concurrently`);
+
+        if (allocation.source === "linear" && allocation.externalIssueId) {
+          await tx.insert(linearIssueLinks).values({
+            companyId: input.review.companyId,
+            paperclipIssueId: updated.id,
+            linearIssueId: allocation.externalIssueId,
+            linearIdentifier: allocation.identifier,
+          });
+        }
+
+        return { review: updated, finalized: true };
+      });
+    } catch (error) {
+      if (error instanceof LinearIssueCreateUnconfirmedError || preserveReservation) {
+        throw error;
+      }
+      if (createdLinearIssueId) {
+        await deleteLinearIssueForCompany(db, input.review.companyId, createdLinearIssueId).catch(() => {});
+      }
+      await db
+        .delete(issues)
+        .where(and(eq(issues.id, input.review.id), isNull(issues.issueNumber), isNull(issues.identifier)))
+        .catch(() => {});
+      throw error;
+    }
   }
 
   async function findRecentResolvedProductivityReview(
@@ -715,6 +1035,430 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     return comment;
   }
 
+  async function hasIssueActivity(
+    executor: DbOrTx,
+    input: { companyId: string; issueId: string; action: string },
+  ) {
+    return executor
+      .select({ id: activityLog.id })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, input.companyId),
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, input.issueId),
+          eq(activityLog.action, input.action),
+        ),
+      )
+      .limit(1)
+      .then((rows) => Boolean(rows[0]));
+  }
+
+  async function insertIssueActivityIfMissing(
+    executor: DbOrTx,
+    input: {
+      companyId: string;
+      issueId: string;
+      action: string;
+      agentId?: string | null;
+      details?: Record<string, unknown> | null;
+      createdAt: Date;
+    },
+  ) {
+    if (await hasIssueActivity(executor, input)) return false;
+    await executor.insert(activityLog).values({
+      companyId: input.companyId,
+      actorType: "system",
+      actorId: "system",
+      action: input.action,
+      entityType: "issue",
+      entityId: input.issueId,
+      agentId: input.agentId ?? null,
+      details: input.details ?? null,
+      createdAt: input.createdAt,
+    });
+    return true;
+  }
+
+  function activityDetails(details: unknown) {
+    return typeof details === "object" && details !== null && !Array.isArray(details)
+      ? details as Record<string, unknown>
+      : {};
+  }
+
+  function activityAttemptId(details: unknown) {
+    const attemptId = activityDetails(details).attemptId;
+    return typeof attemptId === "string" ? attemptId : null;
+  }
+
+  function activityAttemptSequence(details: unknown) {
+    const attemptSequence = activityDetails(details).attemptSequence;
+    return typeof attemptSequence === "number" && Number.isFinite(attemptSequence) ? attemptSequence : 0;
+  }
+
+  async function latestAssignmentWakeClaimActivity(
+    executor: DbOrTx,
+    input: { companyId: string; issueId: string },
+  ) {
+    return executor
+      .select({
+        action: activityLog.action,
+        createdAt: activityLog.createdAt,
+        details: activityLog.details,
+      })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, input.companyId),
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, input.issueId),
+          inArray(activityLog.action, [
+            PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_STARTED_ACTION,
+            PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_FAILED_ACTION,
+          ]),
+        ),
+      )
+      .orderBy(
+        desc(activityLog.createdAt),
+        desc(sql<number>`coalesce((${activityLog.details}->>'attemptSequence')::int, 0)`),
+        desc(sql<number>`case ${activityLog.action}
+          when ${PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_FAILED_ACTION} then 2
+          when ${PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_STARTED_ACTION} then 1
+          else 0
+        end`),
+        desc(activityLog.id),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+  }
+
+  async function hasAssignmentWakeRequest(
+    executor: DbOrTx,
+    input: { companyId: string; agentId: string; idempotencyKey: string },
+  ) {
+    return executor
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.companyId, input.companyId),
+          eq(agentWakeupRequests.agentId, input.agentId),
+          eq(agentWakeupRequests.idempotencyKey, input.idempotencyKey),
+          inArray(agentWakeupRequests.status, [...PRODUCTIVITY_REVIEW_DURABLE_WAKE_REQUEST_STATUSES]),
+        ),
+      )
+      .limit(1)
+      .then((rows) => Boolean(rows[0]));
+  }
+
+  function assignmentWakeDetails(
+    evidence: ProductivityReviewFinishEvidence,
+    wakeIdempotencyKey: string,
+    attemptId?: string,
+    attemptSequence?: number,
+  ) {
+    return {
+      source: "productivity_review.reconcile",
+      sourceIssueId: evidence.sourceIssue.id,
+      trigger: evidence.trigger,
+      idempotencyKey: wakeIdempotencyKey,
+      ...(attemptId
+        ? {
+            attemptId,
+            attemptSequence: attemptSequence ?? 0,
+            leaseMs: PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_CLAIM_LEASE_MS,
+          }
+        : {}),
+    };
+  }
+
+  function assignmentWakeOptions(
+    review: Pick<IssueRow, "id">,
+    evidence: ProductivityReviewFinishEvidence,
+    wakeIdempotencyKey: string,
+  ): NonNullable<Parameters<EnqueueWakeup>[1]> {
+    return {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      idempotencyKey: wakeIdempotencyKey,
+      payload: withRecoveryModelProfileHint({
+        issueId: review.id,
+        sourceIssueId: evidence.sourceIssue.id,
+        trigger: evidence.trigger,
+      }, "status_only"),
+      requestedByActorType: "system",
+      requestedByActorId: "productivity_review",
+      contextSnapshot: withRecoveryModelProfileHint({
+        issueId: review.id,
+        taskId: review.id,
+        wakeReason: "issue_assigned",
+        source: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+        sourceIssueId: evidence.sourceIssue.id,
+        productivityReviewTrigger: evidence.trigger,
+      }, "status_only"),
+    };
+  }
+
+  async function failAssignmentWakeClaim(input: {
+    review: Pick<IssueRow, "id">;
+    evidence: ProductivityReviewFinishEvidence;
+    ownerAgentId: string;
+    wakeIdempotencyKey: string;
+    attemptId: string;
+    attemptSequence: number;
+  }) {
+    await db.transaction(async (tx) => {
+      await tx.execute(
+        sql`select pg_advisory_xact_lock(hashtextextended(${`productivity-review-finish:${input.review.id}`}, 0))`,
+      );
+      const claimNow = await currentDatabaseTime(tx);
+      const latest = await latestAssignmentWakeClaimActivity(tx, {
+        companyId: input.evidence.sourceIssue.companyId,
+        issueId: input.review.id,
+      });
+      if (
+        latest?.action !== PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_STARTED_ACTION ||
+        activityAttemptId(latest.details) !== input.attemptId
+      ) {
+        return;
+      }
+      await tx.insert(activityLog).values({
+        companyId: input.evidence.sourceIssue.companyId,
+        actorType: "system",
+        actorId: "system",
+        action: PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_FAILED_ACTION,
+        entityType: "issue",
+        entityId: input.review.id,
+        agentId: input.ownerAgentId,
+        details: assignmentWakeDetails(
+          input.evidence,
+          input.wakeIdempotencyKey,
+          input.attemptId,
+          input.attemptSequence,
+        ),
+        createdAt: claimNow,
+      });
+    });
+  }
+
+  async function completeAssignmentWakeClaim(input: {
+    review: Pick<IssueRow, "id">;
+    evidence: ProductivityReviewFinishEvidence;
+    ownerAgentId: string;
+    wakeIdempotencyKey: string;
+    attemptId: string;
+    attemptSequence: number;
+    wake: unknown | null;
+  }) {
+    return db.transaction(async (tx) => {
+      await tx.execute(
+        sql`select pg_advisory_xact_lock(hashtextextended(${`productivity-review-finish:${input.review.id}`}, 0))`,
+      );
+      const claimNow = await currentDatabaseTime(tx);
+      const wakeMarkerExists = await hasIssueActivity(tx, {
+        companyId: input.evidence.sourceIssue.companyId,
+        issueId: input.review.id,
+        action: PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_ENQUEUED_ACTION,
+      });
+      if (wakeMarkerExists) return false;
+
+      const latest = await latestAssignmentWakeClaimActivity(tx, {
+        companyId: input.evidence.sourceIssue.companyId,
+        issueId: input.review.id,
+      });
+      if (
+        latest?.action !== PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_STARTED_ACTION ||
+        activityAttemptId(latest.details) !== input.attemptId
+      ) {
+        return false;
+      }
+
+      const wakeProcessed = Boolean(input.wake) || await hasAssignmentWakeRequest(tx, {
+        companyId: input.evidence.sourceIssue.companyId,
+        agentId: input.ownerAgentId,
+        idempotencyKey: input.wakeIdempotencyKey,
+      });
+      if (!wakeProcessed) {
+        await tx.insert(activityLog).values({
+          companyId: input.evidence.sourceIssue.companyId,
+          actorType: "system",
+          actorId: "system",
+          action: PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_FAILED_ACTION,
+          entityType: "issue",
+          entityId: input.review.id,
+          agentId: input.ownerAgentId,
+          details: assignmentWakeDetails(
+            input.evidence,
+            input.wakeIdempotencyKey,
+            input.attemptId,
+            input.attemptSequence,
+          ),
+          createdAt: claimNow,
+        });
+        return false;
+      }
+
+      return insertIssueActivityIfMissing(tx, {
+        companyId: input.evidence.sourceIssue.companyId,
+        issueId: input.review.id,
+        action: PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_ENQUEUED_ACTION,
+        agentId: input.ownerAgentId,
+        createdAt: claimNow,
+        details: assignmentWakeDetails(input.evidence, input.wakeIdempotencyKey),
+      });
+    });
+  }
+
+  async function finishCreatedProductivityReview(
+    review: Pick<IssueRow, "id">,
+    evidence: ProductivityReviewFinishEvidence,
+    ownerAgentId: string,
+  ): Promise<{ createdActivityInserted: boolean; assignmentWakeProcessed: boolean }> {
+    const wakeIdempotencyKey = productivityReviewAssignmentWakeIdempotencyKey(review.id);
+    const claim = await db.transaction(async (tx) => {
+      await tx.execute(
+        sql`select pg_advisory_xact_lock(hashtextextended(${`productivity-review-finish:${review.id}`}, 0))`,
+      );
+
+      const createdActivityInserted = await insertIssueActivityIfMissing(tx, {
+        companyId: evidence.sourceIssue.companyId,
+        issueId: review.id,
+        action: PRODUCTIVITY_REVIEW_CREATED_ACTION,
+        agentId: ownerAgentId,
+        createdAt: evidence.generatedAt,
+        details: {
+          source: "productivity_review.reconcile",
+          sourceIssueId: evidence.sourceIssue.id,
+          trigger: evidence.trigger,
+          noCommentStreak: evidence.noCommentStreak,
+          runCountLastHour: evidence.runCountLastHour,
+          commentCountLastHour: evidence.commentCountLastHour,
+        },
+      });
+
+      if (createdActivityInserted) {
+        await tx
+          .update(issues)
+          .set({ createdAt: evidence.generatedAt, updatedAt: evidence.generatedAt })
+          .where(eq(issues.id, review.id));
+      }
+
+      if (!deps?.enqueueWakeup) {
+        return {
+          createdActivityInserted,
+          assignmentWakeProcessed: false,
+          wakeClaim: null as { attemptId: string; attemptSequence: number } | null,
+        };
+      }
+
+      const wakeMarkerExists = await hasIssueActivity(tx, {
+        companyId: evidence.sourceIssue.companyId,
+        issueId: review.id,
+        action: PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_ENQUEUED_ACTION,
+      });
+      if (wakeMarkerExists) {
+        return {
+          createdActivityInserted,
+          assignmentWakeProcessed: false,
+          wakeClaim: null as { attemptId: string; attemptSequence: number } | null,
+        };
+      }
+
+      const wakeAlreadyProcessed = await hasAssignmentWakeRequest(tx, {
+        companyId: evidence.sourceIssue.companyId,
+        agentId: ownerAgentId,
+        idempotencyKey: wakeIdempotencyKey,
+      });
+      if (wakeAlreadyProcessed) {
+        const assignmentWakeProcessed = await insertIssueActivityIfMissing(tx, {
+          companyId: evidence.sourceIssue.companyId,
+          issueId: review.id,
+          action: PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_ENQUEUED_ACTION,
+          agentId: ownerAgentId,
+          createdAt: evidence.generatedAt,
+          details: assignmentWakeDetails(evidence, wakeIdempotencyKey),
+        });
+        return {
+          createdActivityInserted,
+          assignmentWakeProcessed,
+          wakeClaim: null as { attemptId: string; attemptSequence: number } | null,
+        };
+      }
+
+      const claimNow = await currentDatabaseTime(tx);
+      const latest = await latestAssignmentWakeClaimActivity(tx, {
+        companyId: evidence.sourceIssue.companyId,
+        issueId: review.id,
+      });
+      if (
+        latest?.action === PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_STARTED_ACTION &&
+        latest.createdAt.getTime() > claimNow.getTime() - PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_CLAIM_LEASE_MS
+      ) {
+        return {
+          createdActivityInserted,
+          assignmentWakeProcessed: false,
+          wakeClaim: null as { attemptId: string; attemptSequence: number } | null,
+        };
+      }
+
+      const attemptId = randomUUID();
+      const attemptSequence = activityAttemptSequence(latest?.details) + 1;
+      await tx.insert(activityLog).values({
+        companyId: evidence.sourceIssue.companyId,
+        actorType: "system",
+        actorId: "system",
+        action: PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_STARTED_ACTION,
+        entityType: "issue",
+        entityId: review.id,
+        agentId: ownerAgentId,
+        details: assignmentWakeDetails(evidence, wakeIdempotencyKey, attemptId, attemptSequence),
+        createdAt: claimNow,
+      });
+      return { createdActivityInserted, assignmentWakeProcessed: false, wakeClaim: { attemptId, attemptSequence } };
+    });
+
+    if (!claim.wakeClaim || !deps?.enqueueWakeup) {
+      return {
+        createdActivityInserted: claim.createdActivityInserted,
+        assignmentWakeProcessed: claim.assignmentWakeProcessed,
+      };
+    }
+
+    let wake: unknown | null = null;
+    try {
+      wake = await deps.enqueueWakeup(
+        ownerAgentId,
+        assignmentWakeOptions(review, evidence, wakeIdempotencyKey),
+      );
+    } catch (error) {
+      await failAssignmentWakeClaim({
+        review,
+        evidence,
+        ownerAgentId,
+        wakeIdempotencyKey,
+        attemptId: claim.wakeClaim.attemptId,
+        attemptSequence: claim.wakeClaim.attemptSequence,
+      });
+      throw error;
+    }
+
+    const assignmentWakeProcessed = await completeAssignmentWakeClaim({
+      review,
+      evidence,
+      ownerAgentId,
+      wakeIdempotencyKey,
+      attemptId: claim.wakeClaim.attemptId,
+      attemptSequence: claim.wakeClaim.attemptSequence,
+      wake,
+    });
+
+    return {
+      createdActivityInserted: claim.createdActivityInserted,
+      assignmentWakeProcessed,
+    };
+  }
+
   async function findOpenProductivityReviewEscalation(companyId: string, sourceIssueId: string) {
     return db
       .select({ id: issues.id })
@@ -818,6 +1562,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       suppressedBy: "monitor_scheduled",
       monitorNextCheckAt: suppression.monitorNextCheckAt.toISOString(),
       monitorScheduledBy: suppression.monitorScheduledBy,
+      monitorWakeRequestedAt: suppression.monitorWakeRequestedAt?.toISOString() ?? null,
       elapsedMs: suppression.elapsedMs,
     };
     await logActivity(db, {
@@ -917,7 +1662,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         // from an agent actor and hard-codes `status: "pending"`), so honouring it here would let a
         // flagged agent retire its own oversight artifact. A monitor is set by the assignee or the
         // board through a server-owned column and self-expires, which is why it keeps this path.
-        const monitor = deliberateFutureMonitor(sourceIssue, now);
+        const monitor = strictFutureMonitor(sourceIssue, now);
         if (monitor) {
           suppressedBy = "monitor_scheduled";
           suppressionDetails = {
@@ -968,6 +1713,119 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       else closedMonitorScheduled += 1;
     }
     return { monitorScheduled: closedMonitorScheduled, terminalSource: closedTerminalSource };
+  }
+
+  async function monitorBacklogGraceMs(
+    sourceIssue: IssueRow,
+    now: Date,
+    thresholds: ProductivityReviewThresholds,
+    dbClient: DbOrTx = db,
+  ) {
+    const monitorNextCheckAt = coerceDate(sourceIssue.monitorNextCheckAt);
+    if (!monitorNextCheckAt || monitorNextCheckAt.getTime() > now.getTime()) return 0;
+    if (!isMonitorSuppressionActor(sourceIssue.monitorScheduledBy)) return 0;
+    if (!issueCanReceiveMonitorDispatch(sourceIssue)) return 0;
+
+    const staleClaimThreshold = new Date(now.getTime() - ISSUE_MONITOR_WAKE_CLAIM_TTL_MS);
+    const staleClaimCutoff = staleClaimThreshold.toISOString();
+    const precedesSource = or(
+      lt(issues.monitorNextCheckAt, monitorNextCheckAt),
+      and(
+        eq(issues.monitorNextCheckAt, monitorNextCheckAt),
+        lt(issues.updatedAt, sourceIssue.updatedAt),
+      ),
+      and(
+        eq(issues.monitorNextCheckAt, monitorNextCheckAt),
+        eq(issues.updatedAt, sourceIssue.updatedAt),
+        lt(issues.id, sourceIssue.id),
+      ),
+    );
+    const queueFilter = and(
+      eq(companies.status, "active"),
+      sql`${issues.monitorNextCheckAt} is not null`,
+      lte(issues.monitorNextCheckAt, now),
+      or(
+        precedesSource,
+        and(
+          sql`${issues.id} <> ${sourceIssue.id}`,
+          eq(issues.monitorNextCheckAt, monitorNextCheckAt),
+          gte(issues.monitorWakeRequestedAt, staleClaimThreshold),
+        ),
+        and(
+          eq(issues.id, sourceIssue.id),
+          or(
+            isNull(issues.monitorWakeRequestedAt),
+            lt(issues.monitorWakeRequestedAt, staleClaimThreshold),
+          ),
+        ),
+      ),
+      isNull(issues.assigneeUserId),
+      sql`${issues.assigneeAgentId} is not null`,
+      inArray(issues.status, ["in_progress", "in_review"]),
+    );
+    const queueState = await dbClient
+      .select({
+        duePosition: sql<number>`count(*)::int`,
+        latestFreshPredecessorClaimedAt: sql<Date | null>`
+          max(${issues.monitorWakeRequestedAt}) filter (
+            where ${issues.id} <> ${sourceIssue.id}
+              and ${issues.monitorWakeRequestedAt} >= ${staleClaimCutoff}::timestamptz
+          )
+        `,
+      })
+      .from(issues)
+      .innerJoin(companies, eq(companies.id, issues.companyId))
+      .where(queueFilter)
+      .then((rows) => rows[0] ?? null);
+    const duePosition = Number(queueState?.duePosition ?? 0);
+    if (duePosition <= 0) return 0;
+    if (duePosition === 1) return 0;
+
+    const dispatchTicks = Math.max(1, Math.ceil(duePosition / thresholds.monitorDispatchBatchSize));
+    const dispatchDeadlineMs =
+      dispatchTicks * thresholds.monitorSchedulerIntervalMs + ISSUE_MONITOR_WAKE_CLAIM_TTL_MS;
+    const latestFreshPredecessorClaimedAt = coerceDate(queueState?.latestFreshPredecessorClaimedAt);
+    // Fresh predecessor claims can prove a real dispatch is still in service, but later reclaims
+    // must not keep extending this source's suppression window indefinitely.
+    const freshClaimDeadlineCapMs = dispatchDeadlineMs + ISSUE_MONITOR_WAKE_CLAIM_TTL_MS;
+    const freshPredecessorDeadlineMs = latestFreshPredecessorClaimedAt
+      ? Math.min(
+        latestFreshPredecessorClaimedAt.getTime() - monitorNextCheckAt.getTime() + ISSUE_MONITOR_WAKE_CLAIM_TTL_MS,
+        freshClaimDeadlineCapMs,
+      )
+      : 0;
+    return Math.max(dispatchDeadlineMs, freshPredecessorDeadlineMs);
+  }
+
+  async function currentPendingMonitorForReviewSuppression(
+    sourceIssue: IssueRow,
+    now: Date,
+    thresholds: ProductivityReviewThresholds,
+    dbClient: DbOrTx = db,
+    opts?: { lockSource?: boolean; runBacklogHook?: boolean },
+  ) {
+    const currentIssue = await getCurrentIssue(sourceIssue, dbClient, { forUpdate: opts?.lockSource });
+    if (!currentIssue || !issueCanReceiveMonitorDispatch(currentIssue)) return null;
+
+    const direct = deliberatePendingMonitor(currentIssue, now, thresholds);
+    if (direct) return direct;
+
+    if (opts?.runBacklogHook !== false) {
+      await deps?.beforeMonitorBacklogGrace?.(currentIssue);
+    }
+    const backlogGraceMs = await monitorBacklogGraceMs(currentIssue, now, thresholds, dbClient);
+    const latestIssue = await getCurrentIssue(sourceIssue, dbClient);
+    if (!latestIssue || !issueCanReceiveMonitorDispatch(latestIssue)) return null;
+
+    const latestDirect = deliberatePendingMonitor(latestIssue, now, thresholds);
+    if (latestDirect) return latestDirect;
+
+    return deliberatePendingMonitor(
+      latestIssue,
+      now,
+      thresholds,
+      backlogGraceMs,
+    );
   }
 
   async function countIssueRunsSince(companyId: string, agentId: string, issueId: string, since: Date) {
@@ -1150,7 +2008,10 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       }
     }
 
-    const monitor = deliberateFutureMonitor(sourceIssue, now);
+    const monitor =
+      trigger === "long_active_duration"
+        ? await currentPendingMonitorForReviewSuppression(sourceIssue, now, thresholds)
+        : null;
     if (trigger === "long_active_duration" && monitor) {
       return {
         trigger,
@@ -1160,6 +2021,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         elapsedMs,
         monitorNextCheckAt: monitor.monitorNextCheckAt,
         monitorScheduledBy: monitor.monitorScheduledBy,
+        monitorWakeRequestedAt: monitor.monitorWakeRequestedAt,
         thresholds,
         generatedAt: now,
       };
@@ -1366,6 +2228,84 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
 
     const existing = await findOpenProductivityReview(evidence.sourceIssue.companyId, evidence.sourceIssue.id);
     if (existing) {
+      if (existing.identifier == null && existing.issueNumber == null) {
+        const reservationAgeMs = evidence.generatedAt.getTime() - existing.updatedAt.getTime();
+        if (reservationAgeMs < PRODUCTIVITY_REVIEW_RESERVATION_STALE_MS) {
+          logger.info(
+            {
+              reviewIssueId: existing.id,
+              sourceIssueId: evidence.sourceIssue.id,
+              reservationAgeMs,
+            },
+            "productivity review create skipped: reservation is still finalizing",
+          );
+          return { kind: "existing" as const, reviewIssueId: existing.id };
+        }
+        if (!existing.assigneeAgentId) {
+          logger.warn(
+            {
+              reviewIssueId: existing.id,
+              sourceIssueId: evidence.sourceIssue.id,
+              reservationAgeMs,
+            },
+            "productivity review reservation recovery skipped: reservation has no assignee agent",
+          );
+          return { kind: "existing" as const, reviewIssueId: existing.id };
+        }
+        const finalized = await finalizeReservedProductivityReviewIssue({
+          review: existing,
+          title: existing.title,
+          description: existing.description ?? buildReviewMarkdown(evidence, opts.prefix),
+          generatedAt: evidence.generatedAt,
+        });
+        const finish = await finishCreatedProductivityReview(
+          finalized.review,
+          evidence,
+          existing.assigneeAgentId,
+        );
+        logger.info(
+          {
+            reviewIssueId: finalized.review.id,
+            sourceIssueId: evidence.sourceIssue.id,
+            reservationAgeMs,
+            finalized: finalized.finalized,
+            createdActivityInserted: finish.createdActivityInserted,
+            assignmentWakeProcessed: finish.assignmentWakeProcessed,
+          },
+          "productivity review reservation recovered and finalized",
+        );
+        return finalized.finalized || finish.createdActivityInserted || finish.assignmentWakeProcessed
+          ? { kind: "created" as const, reviewIssueId: finalized.review.id }
+          : { kind: "existing" as const, reviewIssueId: finalized.review.id };
+      }
+
+      if (existing.identifier == null || existing.issueNumber == null) {
+        logger.warn(
+          {
+            reviewIssueId: existing.id,
+            sourceIssueId: evidence.sourceIssue.id,
+          },
+          "productivity review existing row is partially finalized",
+        );
+        return { kind: "existing" as const, reviewIssueId: existing.id };
+      }
+
+      if (existing.assigneeAgentId) {
+        const finish = await finishCreatedProductivityReview(existing, evidence, existing.assigneeAgentId);
+        if (finish.createdActivityInserted || finish.assignmentWakeProcessed) {
+          logger.info(
+            {
+              reviewIssueId: existing.id,
+              sourceIssueId: evidence.sourceIssue.id,
+              createdActivityInserted: finish.createdActivityInserted,
+              assignmentWakeProcessed: finish.assignmentWakeProcessed,
+            },
+            "productivity review finalized side effects replayed",
+          );
+          return { kind: "created" as const, reviewIssueId: existing.id };
+        }
+      }
+
       // BLO-3281 AC2: hard-floor refresh interval. Even when the
       // scheduler triggers a re-scan inside the 5-min window, we
       // skip the addComment so the review thread doesn't accumulate
@@ -1476,77 +2416,328 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       }, "productivity review skipped: no invokable, in-budget review owner could be resolved");
       return { kind: "skipped" as const, reviewIssueId: null };
     }
+
+    if (evidence.trigger === "long_active_duration") {
+      const monitor = await currentPendingMonitorForReviewSuppression(
+        evidence.sourceIssue,
+        evidence.generatedAt,
+        opts.thresholds,
+      );
+      if (monitor) {
+        await recordMonitorScheduledSuppression({
+          trigger: evidence.trigger,
+          triggerReasons: evidence.triggerReasons,
+          sourceIssue: evidence.sourceIssue,
+          sourceAgent: evidence.sourceAgent,
+          elapsedMs: evidence.elapsedMs,
+          monitorNextCheckAt: monitor.monitorNextCheckAt,
+          monitorScheduledBy: monitor.monitorScheduledBy,
+          monitorWakeRequestedAt: monitor.monitorWakeRequestedAt,
+          thresholds: evidence.thresholds,
+          generatedAt: evidence.generatedAt,
+        });
+        return { kind: "monitor_suppressed" as const, reviewIssueId: null };
+      }
+    }
+
     let review: Awaited<ReturnType<typeof issuesSvc.create>>;
+    const reviewTitle = `Review productivity for ${evidence.sourceIssue.identifier ?? evidence.sourceIssue.title}`;
+    const reviewDescription = buildReviewMarkdown(evidence, opts.prefix);
     try {
-      review = await issuesSvc.create(evidence.sourceIssue.companyId, {
-        title: `Review productivity for ${evidence.sourceIssue.identifier ?? evidence.sourceIssue.title}`,
-        description: buildReviewMarkdown(evidence, opts.prefix),
-        status: "todo",
-        priority: evidence.trigger === "long_active_duration" ? "medium" : "high",
-        parentId: evidence.sourceIssue.id,
-        projectId: evidence.sourceIssue.projectId,
-        goalId: evidence.sourceIssue.goalId,
-        billingCode: evidence.sourceIssue.billingCode,
-        assigneeAgentId: ownerAgentId,
-        assigneeAdapterOverrides: recoveryAssigneeAdapterOverrides("status_only"),
-        originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
-        originId: evidence.sourceIssue.id,
-        originFingerprint: productivityReviewFingerprint(evidence.sourceIssue.id),
-        requestDepth: clampIssueRequestDepth(evidence.sourceIssue.requestDepth + 1),
-      });
+      await deps?.beforeCreateReviewIssueInsert?.(evidence);
+      if (evidence.trigger === "long_active_duration") {
+        await assertAssignableAgent(db, evidence.sourceIssue.companyId, ownerAgentId, { kind: "work" });
+        await deps?.beforeFinalMonitorSuppressionRevalidation?.(evidence);
+        const reservation = await reserveLongActiveProductivityReviewIssue({
+          evidence,
+          thresholds: opts.thresholds,
+          ownerAgentId,
+          title: reviewTitle,
+          description: reviewDescription,
+        });
+        if (reservation.kind === "existing") {
+          return { kind: "existing" as const, reviewIssueId: reservation.review.id };
+        }
+        await deps?.afterFinalMonitorReviewReservation?.(evidence, reservation.review);
+        review = await finalizeReservedProductivityReviewIssue({
+          review: reservation.review,
+          title: reviewTitle,
+          description: reviewDescription,
+          generatedAt: evidence.generatedAt,
+        }).then((finalized) => finalized.review) as Awaited<ReturnType<typeof issuesSvc.create>>;
+      } else {
+        review = await issuesSvc.create(evidence.sourceIssue.companyId, {
+          title: reviewTitle,
+          description: reviewDescription,
+          status: "todo",
+          priority: "high",
+          parentId: evidence.sourceIssue.id,
+          projectId: evidence.sourceIssue.projectId,
+          goalId: evidence.sourceIssue.goalId,
+          billingCode: evidence.sourceIssue.billingCode,
+          assigneeAgentId: ownerAgentId,
+          assigneeAdapterOverrides: recoveryAssigneeAdapterOverrides("status_only"),
+          originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+          originId: evidence.sourceIssue.id,
+          originFingerprint: productivityReviewFingerprint(evidence.sourceIssue.id),
+          requestDepth: clampIssueRequestDepth(evidence.sourceIssue.requestDepth + 1),
+        });
+      }
     } catch (error) {
+      if (error instanceof MonitorSuppressedBeforeCreateError) {
+        const monitor = error.monitor;
+        await recordMonitorScheduledSuppression({
+          trigger: "long_active_duration",
+          triggerReasons: evidence.triggerReasons,
+          sourceIssue: evidence.sourceIssue,
+          sourceAgent: evidence.sourceAgent,
+          elapsedMs: evidence.elapsedMs,
+          monitorNextCheckAt: monitor.monitorNextCheckAt,
+          monitorScheduledBy: monitor.monitorScheduledBy,
+          monitorWakeRequestedAt: monitor.monitorWakeRequestedAt,
+          thresholds: evidence.thresholds,
+          generatedAt: evidence.generatedAt,
+        });
+        return { kind: "monitor_suppressed" as const, reviewIssueId: null };
+      }
       if (!isActiveProductivityReviewUniqueConflict(error)) throw error;
       const raced = await findOpenProductivityReview(evidence.sourceIssue.companyId, evidence.sourceIssue.id);
       if (!raced) throw error;
       return { kind: "existing" as const, reviewIssueId: raced.id };
     }
-    await db
-      .update(issues)
-      .set({ createdAt: evidence.generatedAt, updatedAt: evidence.generatedAt })
-      .where(eq(issues.id, review.id));
-
-    await logActivity(db, {
-      companyId: evidence.sourceIssue.companyId,
-      actorType: "system",
-      actorId: "system",
-      action: "issue.productivity_review_created",
-      entityType: "issue",
-      entityId: review.id,
-      agentId: ownerAgentId,
-      details: {
-        source: "productivity_review.reconcile",
-        sourceIssueId: evidence.sourceIssue.id,
-        trigger: evidence.trigger,
-        noCommentStreak: evidence.noCommentStreak,
-        runCountLastHour: evidence.runCountLastHour,
-        commentCountLastHour: evidence.commentCountLastHour,
-      },
-    });
-
-    if (ownerAgentId && deps?.enqueueWakeup) {
-      await deps.enqueueWakeup(ownerAgentId, {
-        source: "assignment",
-        triggerDetail: "system",
-        reason: "issue_assigned",
-        payload: withRecoveryModelProfileHint({
-          issueId: review.id,
-          sourceIssueId: evidence.sourceIssue.id,
-          trigger: evidence.trigger,
-        }, "status_only"),
-        requestedByActorType: "system",
-        requestedByActorId: "productivity_review",
-        contextSnapshot: withRecoveryModelProfileHint({
-          issueId: review.id,
-          taskId: review.id,
-          wakeReason: "issue_assigned",
-          source: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
-          sourceIssueId: evidence.sourceIssue.id,
-          productivityReviewTrigger: evidence.trigger,
-        }, "status_only"),
-      });
-    }
+    await finishCreatedProductivityReview(review, evidence, ownerAgentId);
 
     return { kind: "created" as const, reviewIssueId: review.id };
+  }
+
+  function reservationRecoveryFinishEvidence(
+    sourceIssue: IssueRow,
+    generatedAt: Date,
+  ): ProductivityReviewFinishEvidence {
+    return {
+      sourceIssue,
+      generatedAt,
+      trigger: "long_active_duration",
+      noCommentStreak: 0,
+      runCountLastHour: 0,
+      commentCountLastHour: 0,
+    };
+  }
+
+  async function retireStaleProductivityReviewReservation(input: {
+    review: IssueRow;
+    sourceIssue: IssueRow | null;
+    now: Date;
+    reason:
+      | "missing_source"
+      | "terminal_source"
+      | "unreviewable_source"
+      | "missing_source_agent"
+      | "review_owner_changed";
+  }) {
+    const [retired] = await db
+      .update(issues)
+      .set({ status: "done", completedAt: input.now, updatedAt: input.now })
+      .where(
+        and(
+          eq(issues.companyId, input.review.companyId),
+          eq(issues.id, input.review.id),
+          eq(issues.originKind, PRODUCTIVITY_REVIEW_ORIGIN_KIND),
+          isNull(issues.issueNumber),
+          isNull(issues.identifier),
+          notInArray(issues.status, ["done", "cancelled"]),
+        ),
+      )
+      .returning({ id: issues.id });
+    if (!retired) return false;
+
+    await logActivity(db, {
+      companyId: input.review.companyId,
+      actorType: "system",
+      actorId: "system",
+      action: "issue.productivity_review_suppressed_open_review_closed",
+      entityType: "issue",
+      entityId: input.review.id,
+      agentId: input.review.assigneeAgentId,
+      details: {
+        source: "productivity_review.reconcile",
+        sourceIssueId: input.sourceIssue?.id ?? input.review.originId,
+        trigger: "long_active_duration",
+        suppressedBy: input.reason,
+        sourceStatus: input.sourceIssue?.status ?? null,
+        sourceMissing: !input.sourceIssue,
+        reservationRecovered: true,
+      },
+    });
+    return true;
+  }
+
+  async function recoverStaleReservedProductivityReviews(input: {
+    now: Date;
+    companyId?: string;
+  }) {
+    const staleCutoff = new Date(input.now.getTime() - PRODUCTIVITY_REVIEW_RESERVATION_STALE_MS);
+    const reservedReviews = await db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          input.companyId ? eq(issues.companyId, input.companyId) : undefined,
+          eq(issues.originKind, PRODUCTIVITY_REVIEW_ORIGIN_KIND),
+          visibleIssueCondition(),
+          notInArray(issues.status, ["done", "cancelled"]),
+          isNull(issues.identifier),
+          isNull(issues.issueNumber),
+          lt(issues.updatedAt, staleCutoff),
+        ),
+      )
+      .orderBy(asc(issues.updatedAt), asc(issues.id))
+      .limit(MAX_CANDIDATE_ISSUES);
+
+    const result = {
+      created: 0,
+      existing: 0,
+      failed: 0,
+      reviewIssueIds: [] as string[],
+      failedIssueIds: [] as string[],
+      retiredStaleReservation: 0,
+      recoveredSourceIssueIds: new Set<string>(),
+    };
+
+    for (const review of reservedReviews) {
+      if (!review.originId) {
+        const retired = await retireStaleProductivityReviewReservation({
+          review,
+          sourceIssue: null,
+          now: input.now,
+          reason: "missing_source",
+        });
+        if (retired) {
+          result.retiredStaleReservation += 1;
+          result.reviewIssueIds.push(review.id);
+        } else {
+          result.existing += 1;
+        }
+        continue;
+      }
+      result.recoveredSourceIssueIds.add(review.originId);
+      if (!review.assigneeAgentId) {
+        const retired = await retireStaleProductivityReviewReservation({
+          review,
+          sourceIssue: null,
+          now: input.now,
+          reason: "review_owner_changed",
+        });
+        if (retired) {
+          result.retiredStaleReservation += 1;
+          result.reviewIssueIds.push(review.id);
+        } else {
+          result.existing += 1;
+        }
+        continue;
+      }
+
+      const sourceIssue = await db
+        .select()
+        .from(issues)
+        .where(and(eq(issues.companyId, review.companyId), eq(issues.id, review.originId)))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (!sourceIssue) {
+        const retired = await retireStaleProductivityReviewReservation({
+          review,
+          sourceIssue: null,
+          now: input.now,
+          reason: "missing_source",
+        });
+        if (retired) {
+          result.retiredStaleReservation += 1;
+          result.reviewIssueIds.push(review.id);
+        } else {
+          result.existing += 1;
+        }
+        continue;
+      }
+      const reservationSourceAgentId = review.createdByAgentId ??
+        (sourceIssue.updatedAt.getTime() <= review.updatedAt.getTime() ? sourceIssue.assigneeAgentId : null);
+      const sourceAgent = reservationSourceAgentId ? await getAgent(reservationSourceAgentId) : null;
+      const currentSourceAgent = sourceIssue.assigneeAgentId ? await getAgent(sourceIssue.assigneeAgentId) : null;
+      const reviewability = reservationSourceAgentId
+        ? await evaluateSourceReviewability(sourceIssue, reservationSourceAgentId)
+        : { reviewable: false, terminal: isTerminalIssueStatus(sourceIssue.status), status: sourceIssue.status };
+      const currentReviewOwnerId = currentSourceAgent
+        ? await resolveReviewOwnerAgentId(sourceIssue, currentSourceAgent)
+        : null;
+      const retiredReason =
+        reviewability.terminal ? "terminal_source" :
+        !sourceAgent || sourceAgent.companyId !== sourceIssue.companyId ? "missing_source_agent" :
+        sourceIssue.assigneeAgentId &&
+          (!currentSourceAgent || currentSourceAgent.companyId !== sourceIssue.companyId) ? "missing_source_agent" :
+        currentReviewOwnerId && currentReviewOwnerId !== review.assigneeAgentId ? "review_owner_changed" :
+        !reviewability.reviewable ||
+          await isProductivityReviewDescendant(sourceIssue) ||
+          isProductivityReviewOptedOut(sourceIssue) ? "unreviewable_source" :
+        null;
+      if (retiredReason) {
+        const retired = await retireStaleProductivityReviewReservation({
+          review,
+          sourceIssue,
+          now: input.now,
+          reason: retiredReason,
+        });
+        if (retired) {
+          result.retiredStaleReservation += 1;
+          result.reviewIssueIds.push(review.id);
+        } else {
+          result.existing += 1;
+        }
+        continue;
+      }
+
+      try {
+        await deps?.beforeStaleReservationRecoveryFinalize?.(review, sourceIssue);
+        const finalized = await finalizeReservedProductivityReviewIssue({
+          review,
+          title: review.title,
+          description: review.description ?? `Review productivity for ${sourceIssue.identifier ?? sourceIssue.title}`,
+          generatedAt: input.now,
+        });
+        const finish = await finishCreatedProductivityReview(
+          finalized.review,
+          reservationRecoveryFinishEvidence(sourceIssue, input.now),
+          review.assigneeAgentId,
+        );
+        if (finalized.finalized || finish.createdActivityInserted || finish.assignmentWakeProcessed) {
+          result.created += 1;
+          result.reviewIssueIds.push(finalized.review.id);
+        } else {
+          result.existing += 1;
+        }
+        logger.info(
+          {
+            reviewIssueId: finalized.review.id,
+            sourceIssueId: sourceIssue.id,
+            finalized: finalized.finalized,
+            createdActivityInserted: finish.createdActivityInserted,
+            assignmentWakeProcessed: finish.assignmentWakeProcessed,
+          },
+          "productivity review stale reservation recovered before source candidate filtering",
+        );
+      } catch (err) {
+        result.failed += 1;
+        result.failedIssueIds.push(sourceIssue.id);
+        logger.warn(
+          {
+            err,
+            reviewIssueId: review.id,
+            sourceIssueId: sourceIssue.id,
+          },
+          "productivity review stale reservation recovery failed",
+        );
+      }
+    }
+
+    return result;
   }
 
   async function createProductivityReviewEscalation(input: {
@@ -1670,25 +2861,8 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
   }) {
     const now = opts?.now ?? new Date();
     const thresholds = buildThresholds(opts?.thresholds);
-    const candidates = await db
-      .select()
-      .from(issues)
-      .where(
-        and(
-          opts?.companyId ? eq(issues.companyId, opts.companyId) : undefined,
-          visibleIssueCondition(),
-          isNull(issues.assigneeUserId),
-          inArray(issues.status, ["todo", "in_progress"]),
-          sql`${issues.assigneeAgentId} is not null`,
-          sql`${issues.originKind} <> ${PRODUCTIVITY_REVIEW_ORIGIN_KIND}`,
-          opts?.issueCreatedAtGte ? gte(issues.createdAt, opts.issueCreatedAtGte) : undefined,
-        ),
-      )
-      .orderBy(asc(issues.updatedAt), asc(issues.id))
-      .limit(MAX_CANDIDATE_ISSUES);
-
     const result = {
-      scanned: candidates.length,
+      scanned: 0,
       created: 0,
       updated: 0,
       existing: 0,
@@ -1712,8 +2886,40 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     result.closedSuppressedMonitorReviews = closedSuppressed.monitorScheduled;
     result.closedTerminalSourceReviews = closedSuppressed.terminalSource;
 
+    const recoveredReservations = await recoverStaleReservedProductivityReviews({
+      now,
+      companyId: opts?.companyId,
+    });
+    result.created += recoveredReservations.created;
+    result.existing += recoveredReservations.existing;
+    result.failed += recoveredReservations.failed;
+    result.closedTerminalSourceReviews += recoveredReservations.retiredStaleReservation;
+    result.reviewIssueIds.push(...recoveredReservations.reviewIssueIds);
+    result.failedIssueIds.push(...recoveredReservations.failedIssueIds);
+
+    const candidates = await db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          opts?.companyId ? eq(issues.companyId, opts.companyId) : undefined,
+          visibleIssueCondition(),
+          isNull(issues.assigneeUserId),
+          inArray(issues.status, ["todo", "in_progress"]),
+          sql`${issues.assigneeAgentId} is not null`,
+          sql`${issues.originKind} <> ${PRODUCTIVITY_REVIEW_ORIGIN_KIND}`,
+          opts?.issueCreatedAtGte ? gte(issues.createdAt, opts.issueCreatedAtGte) : undefined,
+        ),
+      )
+      .orderBy(asc(issues.updatedAt), asc(issues.id))
+      .limit(MAX_CANDIDATE_ISSUES);
+    result.scanned = candidates.length;
+
     const prefixCache = new Map<string, string>();
     for (const candidate of candidates) {
+      if (recoveredReservations.recoveredSourceIssueIds.has(candidate.id)) {
+        continue;
+      }
       if (!candidate.assigneeAgentId) {
         result.skipped += 1;
         continue;
@@ -1731,6 +2937,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         result.skipped += 1;
         continue;
       }
+      await deps?.beforeCollectEvidence?.(candidate);
       const evidence = await collectEvidence(candidate, sourceAgent, thresholds, now);
       if (!evidence) {
         result.skipped += 1;
@@ -1775,6 +2982,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         if (outcome.kind === "created") result.created += 1;
         else if (outcome.kind === "updated") result.updated += 1;
         else if (outcome.kind === "skipped") result.skipped += 1;
+        else if (outcome.kind === "monitor_suppressed") result.monitorScheduledSuppressed += 1;
         else if (outcome.kind === "creation_capped") result.creationCapped += 1;
         else if (outcome.kind === "no_action_suppressed") result.noActionSuppressed += 1;
         else result.existing += 1;

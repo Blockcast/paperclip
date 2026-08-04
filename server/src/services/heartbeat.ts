@@ -103,6 +103,7 @@ import {
   type ManagedAgentPod,
 } from "./k8s-job-liveness.js";
 import { getActiveAgentIds } from "./agent-roster.js";
+import { tryLockIssueMonitorQueue } from "./issue-monitor-queue-lock.js";
 import { processPendingImageBumpForAgent } from "./agent-image-bump.js";
 import {
   buildProcessLossCapture,
@@ -8438,6 +8439,13 @@ export interface HeartbeatServiceOptions {
     maxResumePasses?: number;
   };
   /**
+   * Overrides the new-review grace for monitor wakes whose `monitorNextCheckAt`
+   * is due but not yet cleared. The worker derives the effective grace from this
+   * scheduler cadence, due-monitor batch position, and monitor dispatch claim
+   * TTL; tests can set it directly.
+   */
+  productivityReviewMonitorSchedulerIntervalMs?: number;
+  /**
    * Test-only concurrency hook: fired after the scheduler has read a due
    * scheduled_retry row and immediately before the conditional UPDATE that
    * promotes or cancels it.
@@ -10110,6 +10118,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const staleClaimThreshold = new Date(now.getTime() - 5 * 60 * 1000);
     const claimed = await db.transaction(async (tx) => {
+      if (!await tryLockIssueMonitorQueue(tx)) return null;
       const [updated] = await tx
         .update(issues)
         .set({
@@ -10171,7 +10180,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ),
         ),
       )
-      .orderBy(asc(issues.monitorNextCheckAt), asc(issues.updatedAt))
+      .orderBy(asc(issues.monitorNextCheckAt), asc(issues.updatedAt), asc(issues.id))
       .limit(50);
 
     let triggered = 0;
@@ -10179,6 +10188,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     for (const due of dueMonitors) {
       const claimed = await db.transaction(async (tx) => {
+        if (!await tryLockIssueMonitorQueue(tx)) return null;
         const [updated] = await tx
           .update(issues)
           .set({
@@ -17589,7 +17599,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   async function reconcileProductivityReviews(opts?: { now?: Date; companyId?: string }) {
-    return productivityReviews.reconcileProductivityReviews({ ...opts, issueCreatedAtGte: await getWorktreeExecutionCutoff() });
+    return productivityReviews.reconcileProductivityReviews({
+      ...opts,
+      thresholds: options.productivityReviewMonitorSchedulerIntervalMs
+        ? { monitorSchedulerIntervalMs: options.productivityReviewMonitorSchedulerIntervalMs }
+        : undefined,
+      issueCreatedAtGte: await getWorktreeExecutionCutoff(),
+    });
   }
 
   // Sweep companion to the becameDone edge in routes/issues.ts. The edge wakes
@@ -26448,6 +26464,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
      * semantics. Do not call from production code.
      */
     __test_executeRunForTesting: (runId: string) => executeRun(runId),
+    __test_tickDueIssueMonitors: (now?: Date) => tickDueIssueMonitors(now),
     // Override-aware scheduling-suppression check (honors the worktree
     // run-execution experimental setting). Callers outside the service that
     // gate on suppression should prefer this over the env-only resolver.
