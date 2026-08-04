@@ -259,6 +259,72 @@ describe("github-webhook pure helpers", () => {
     ).toEqual({ owning: [] });
   });
 
+  it("falls back to a non-closing house-reference body line when title/keyword/branch all resolve nothing (BLO-21312)", () => {
+    // `github_pr_review_requested` arrives via `issue_comment`, whose payload
+    // carries no `pull_request.head.ref` -- `branch` is never populated on
+    // that path, so the case-insensitive branch tier (BLO-20886) is
+    // structurally unreachable there. These are the real house-label shapes
+    // observed on Blockcast/paperclip#931, #963, #976, #916.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: "Issue: https://paperclip.blockcast.net/BLO/issues/BLO-20172",
+      }),
+    ).toEqual({ owning: ["BLO-20172"] });
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: "- Paperclip task: [BLO-20396](https://paperclip.blockcast.net/BLO/issues/BLO-20396)",
+      }),
+    ).toEqual({ owning: ["BLO-20396"] });
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: "Paperclip QA task: https://paperclip.blockcast.net/BLO/issues/BLO-21079",
+      }),
+    ).toEqual({ owning: ["BLO-21079"] });
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: "Paperclip issue: https://paperclip.blockcast.net/BLO/issues/BLO-19771",
+      }),
+    ).toEqual({ owning: ["BLO-19771"] });
+
+    // Still never widens far enough to make a bare `Related:` mention owning,
+    // even alongside a house label elsewhere in the same body -- the
+    // BLO-20886 guarantee holds unchanged.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: "Related: BLO-1, BLO-2\nIssue: BLO-3\n",
+      }),
+    ).toEqual({ owning: ["BLO-3"] });
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: "Related: BLO-1, BLO-2\n" }),
+    ).toEqual({ owning: [] });
+
+    // Ranked below the closing-keyword tier: a Fixes:/Closes:/Refs: line
+    // still wins over a house label in the same body.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: "Fixes: BLO-1\nPaperclip issue: BLO-2\n",
+      }),
+    ).toEqual({ owning: ["BLO-1"] });
+
+    // Ranked below the branch tier too: on a `pull_request` event (branch
+    // populated), the measured branch answer still wins over an unmeasured
+    // house label in the same body.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        branch: "fix/blo-1-thing",
+        body: "Paperclip issue: BLO-2",
+      }),
+    ).toEqual({ owning: ["BLO-1"] });
+
+    // Title still outranks a house label.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        title: "fix BLO-1 thing",
+        body: "Paperclip issue: BLO-2",
+      }),
+    ).toEqual({ owning: ["BLO-1"] });
+  });
+
 
   it("rejects payloads with bad signatures and accepts ones with good signatures", () => {
     const secret = "test-webhook-secret-do-not-use-in-prod";
@@ -3311,6 +3377,89 @@ describeEmbeddedPostgres("github-webhook route", () => {
       .from(agentWakeupRequests)
       .where(eq(agentWakeupRequests.agentId, relatedOnly.agentId));
     expect(wakes).toHaveLength(0);
+  });
+
+  it("routes an issue_comment @ally-review author wake to a PR's owning issue named only by a house-reference label, not a Related: mention (BLO-21312)", async () => {
+    // github_pr_review_requested arrives via issue_comment, whose payload
+    // carries no pull_request.head.ref -- BLO-20886's branch-tier recovery
+    // can never reach this path. This PR's title and body carry no
+    // Fixes:/Closes:/Resolves:/Refs: line, only a "Paperclip issue:" house
+    // label (the real shape observed on Blockcast/paperclip#916) plus an
+    // unrelated Related: mention -- reproducing the gap and its guardrail in
+    // one payload. Both issues share the BLO prefix (as in the real PR body),
+    // so they're seeded under one company -- seedIssueWithIdentifier creates
+    // a fresh company per call and company issue_prefix is unique, so two
+    // BLO- calls would collide.
+    const { companyId } = await seedCompanyAndAgent();
+    async function seedBloIssue(identifier: string) {
+      const agentId = randomUUID();
+      const issueId = randomUUID();
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: `Agent-${identifier}`,
+        role: "engineer",
+        status: "idle",
+        adapterType: "claude_k8s",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Test issue",
+        status: "in_progress",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        issueNumber: Number(identifier.split("-")[1]),
+        identifier,
+      });
+      return { agentId, issueId };
+    }
+    const owner = await seedBloIssue("BLO-19771");
+    const relatedOnly = await seedBloIssue("BLO-20811");
+    const app = buildApp();
+    const payload = {
+      action: "created",
+      issue: {
+        number: 916,
+        title: "fix(pipelines): retire exited stage automation issues",
+        body: "## Linked Issues or Issue Description\n\nPaperclip issue: https://paperclip.blockcast.net/BLO/issues/BLO-19771\nRelated: BLO-20811\n",
+        html_url: "https://github.com/Blockcast/paperclip/pull/916",
+        pull_request: { url: "https://api.github.com/repos/Blockcast/paperclip/pulls/916" },
+        user: { login: "kkroo" },
+      },
+      comment: {
+        id: 5156328800,
+        body: "@ally review please",
+        html_url: "https://github.com/Blockcast/paperclip/pull/916#issuecomment-5156328800",
+        user: { login: "kkroo" },
+      },
+      repository: { full_name: "Blockcast/paperclip" },
+    };
+    const { body, signature } = signedRequest(payload);
+
+    const res = await request(app)
+      .post("/api/webhooks/github")
+      .set("x-github-event", "issue_comment")
+      .set("x-hub-signature-256", signature)
+      .set("x-github-delivery", "delivery-blo-21312-house-label")
+      .set("content-type", "application/json")
+      .send(body);
+
+    expect(res.status).toBe(200);
+    expect(res.body.wakes).toEqual([{ issueIdentifier: "BLO-19771", agentId: owner.agentId }]);
+    expect(res.body.skipped).not.toContainEqual(
+      expect.objectContaining({ reason: "no_owning_reference" }),
+    );
+
+    const allWakes = await db
+      .select({ agentId: agentWakeupRequests.agentId })
+      .from(agentWakeupRequests)
+      .where(inArray(agentWakeupRequests.agentId, [owner.agentId, relatedOnly.agentId]));
+    // Only the house-label owner was woken -- never the Related: mention.
+    expect(allWakes.map((w) => w.agentId)).toEqual([owner.agentId]);
   });
 
   it("dedupes an @ally comment redelivery on the author wake after it completed or was cancelled (BLO-18953)", async () => {

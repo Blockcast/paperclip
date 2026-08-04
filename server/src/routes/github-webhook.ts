@@ -761,7 +761,9 @@ function resolveEventContext(
       // Owning resolution deliberately excludes commentBody: the comment is
       // the @ally ASK that triggered this event, not an ownership claim about
       // the PR (see resolveOwningPaperclipIdentifiers). No branch tier here
-      // either -- issue_comment payloads don't carry pull_request.head.ref.
+      // either -- issue_comment payloads don't carry pull_request.head.ref --
+      // so this path relies on title, a closing-keyword body line, or (BLO-21312)
+      // a non-closing house-reference body line (Issue:/Paperclip task:/etc.).
       const owning = resolveOwningPaperclipIdentifiers({ title: issueTitle, body: issueBody });
       return {
         identifiers: extractPaperclipIdentifiers(issueTitle, issueBody, commentBody),
