@@ -3045,7 +3045,7 @@ describeEmbeddedPostgres("pipelineService", () => {
       actor: userActor,
     });
 
-    await svc.retryStageAutomation({
+    const retry = await svc.retryStageAutomation({
       companyId: company.id,
       caseId: parent.case.id,
       scope: "current_stage",
@@ -3057,6 +3057,17 @@ describeEmbeddedPostgres("pipelineService", () => {
       },
       actor: userActor,
     });
+
+    const [retryLink] = await db
+      .select()
+      .from(pipelineCaseIssueLinks)
+      .where(eq(pipelineCaseIssueLinks.automationAttemptId, retry.automationLedger.id));
+    const [retryIssue] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, retryLink!.issueId));
+    expect(retryLink).toMatchObject({ retiredAt: null, retiredReason: null });
+    expect(["done", "cancelled"]).not.toContain(retryIssue!.status);
 
     const [freshParent] = await db.select().from(pipelineCases).where(eq(pipelineCases.id, parent.case.id));
     const [freshChild] = await db.select().from(pipelineCases).where(eq(pipelineCases.id, child.case.id));

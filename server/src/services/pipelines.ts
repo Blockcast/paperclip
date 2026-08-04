@@ -3379,7 +3379,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: PipelineHeartbeatDep
           .where(and(
             eq(pipelineCaseEvents.companyId, execution.companyId),
             eq(pipelineCaseEvents.caseId, execution.caseId),
-            inArray(pipelineCaseEvents.type, ["ingested", "transitioned"]),
+            inArray(pipelineCaseEvents.type, ["ingested", "transitioned", "automation_retry_dispatched"]),
             eq(pipelineCaseEvents.toStageId, current.case.stageId),
           ))
           .orderBy(desc(pipelineCaseEvents.createdAt), desc(pipelineCaseEvents.id))
