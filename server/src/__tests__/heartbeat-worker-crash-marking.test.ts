@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import {
   agentWakeupRequests,
   agents,
@@ -1171,5 +1171,69 @@ describeEmbeddedPostgres("heartbeat worker-crash marking and recovery convergenc
 
     expect(result.reconciledRunIds).toEqual([run.id]);
     expect((await readRun(run.id)).crashRecoveryCompletedAt).not.toBeNull();
+  });
+
+  // BLO-21526: migration 0211 declines to build the candidate index inline on a
+  // populated table (an inline build would hold ACCESS EXCLUSIVE for its
+  // duration) and raises a NOTICE instead — which the production client
+  // swallows via `onnotice: () => {}`. So a populated deployment records 0211 as
+  // complete with the index absent and no visible signal. Without the index the
+  // oldest-first candidate scan is a sequential scan plus a top-N sort, which is
+  // fine once per process at startup but not every 30s on every scheduler
+  // replica. The periodic caller therefore passes `requireCandidateIndex`.
+  it("skips the periodic pass while the candidate index is missing, but never gates startup recovery", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const run = await seedCrashMarkedRun({ companyId, agentId, finishedAt: new Date(Date.now() - 60_000) });
+
+    // The embedded test database migrates against an empty `heartbeat_runs`, so
+    // 0211 builds the index inline. Drop it to reproduce a populated production
+    // database that took 0211's skip path.
+    await db.execute(sql`drop index if exists heartbeat_runs_crash_recovery_pending_idx`);
+
+    const svc = service();
+    const gated = await svc.reconcileWorkerCrashedRuns({ requireCandidateIndex: true });
+    expect(gated.skippedReason).toBe("candidate_index_missing");
+    expect(gated.reconciledRunIds).toEqual([]);
+    // Untouched, so it stays a candidate rather than being consumed or marked.
+    expect((await readRun(run.id)).crashRecoveryCompletedAt).toBeNull();
+
+    // Startup recovery is ungated — the primary recovery path must not depend
+    // on a deploy step that has not run yet.
+    const ungated = await svc.reconcileWorkerCrashedRuns();
+    expect(ungated.skippedReason).toBeUndefined();
+    expect(ungated.reconciledRunIds).toEqual([run.id]);
+    expect((await readRun(run.id)).crashRecoveryCompletedAt).not.toBeNull();
+
+    // Restore it: `afterEach` truncates rows but does not rebuild schema, so
+    // leaving it dropped would silently change what later tests exercise.
+    await db.execute(sql`
+      create index if not exists heartbeat_runs_crash_recovery_pending_idx
+        on heartbeat_runs using btree (finished_at, id)
+        where error_code = 'worker_crashed' and crash_recovery_completed_at is null
+    `);
+  });
+
+  it("re-enables the periodic pass once the candidate index is built online, without a restart", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const run = await seedCrashMarkedRun({ companyId, agentId, finishedAt: new Date(Date.now() - 60_000) });
+    await db.execute(sql`drop index if exists heartbeat_runs_crash_recovery_pending_idx`);
+
+    // Same service instance throughout: the presence probe must be re-run while
+    // the index is absent rather than cached, so the online build flips the pass
+    // on within one interval instead of waiting for a redeploy.
+    const svc = service();
+    expect((await svc.reconcileWorkerCrashedRuns({ requireCandidateIndex: true })).skippedReason).toBe(
+      "candidate_index_missing",
+    );
+
+    await db.execute(sql`
+      create index heartbeat_runs_crash_recovery_pending_idx
+        on heartbeat_runs using btree (finished_at, id)
+        where error_code = 'worker_crashed' and crash_recovery_completed_at is null
+    `);
+
+    const afterBuild = await svc.reconcileWorkerCrashedRuns({ requireCandidateIndex: true });
+    expect(afterBuild.skippedReason).toBeUndefined();
+    expect(afterBuild.reconciledRunIds).toEqual([run.id]);
   });
 });

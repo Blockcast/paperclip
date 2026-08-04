@@ -622,6 +622,74 @@ describe("startServer feedback export wiring", () => {
     }
   });
 
+  // BLO-20822: the reconciliation → stale-lock-sweep pair must stay ordered
+  // ACROSS ticks, not just within one. `setInterval` starts the next callback
+  // on schedule whether or not the previous settled, and a reconciliation batch
+  // can outlive the interval — so an in-tick `await` alone still lets tick N+1's
+  // sweeper race tick N's reconciliation, which is the exact window (lock
+  // cleared between terminalizing the crashed run and handing it to the retry)
+  // that the ordering exists to close. The test above proves the pair runs
+  // periodically but cannot tell a latched implementation from an unlatched one;
+  // this discriminates by parking the first reconciliation and firing a second
+  // tick underneath it.
+  it("does not start a second reconciliation or sweep while the first is still in flight", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+    let intervalCallback: (() => void) | null = null;
+    const setIntervalSpy = vi
+      .spyOn(globalThis, "setInterval")
+      .mockImplementation(((callback: () => void) => {
+        intervalCallback = callback;
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      }) as typeof setInterval);
+
+    let releaseReconciliation: (() => void) | null = null;
+    try {
+      await startServer();
+      heartbeatServiceMock.reconcileWorkerCrashedRuns.mockClear();
+      heartbeatServiceMock.sweepStaleIssueLocks.mockClear();
+
+      // Park the first reconciliation so the pair is still in flight when the
+      // next tick fires.
+      heartbeatServiceMock.reconcileWorkerCrashedRuns.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            releaseReconciliation = () =>
+              resolve({ reconciledRunIds: [], retryRunIds: [], unresolvedRunIds: [] });
+          }),
+      );
+
+      intervalCallback?.();
+      await vi.waitFor(() =>
+        expect(heartbeatServiceMock.reconcileWorkerCrashedRuns).toHaveBeenCalledTimes(1),
+      );
+
+      // Second tick, first still parked. Pre-latch this started a concurrent
+      // reconciliation; the sweep must not run either, since it is what would
+      // clear the lock out from under the parked reconciliation's hand-over.
+      intervalCallback?.();
+      await vi.waitFor(() =>
+        expect(heartbeatServiceMock.reconcileStrandedAssignedIssues).toHaveBeenCalled(),
+      );
+      expect(heartbeatServiceMock.reconcileWorkerCrashedRuns).toHaveBeenCalledTimes(1);
+      expect(heartbeatServiceMock.sweepStaleIssueLocks).not.toHaveBeenCalled();
+
+      // Once it drains, the pair completes and a later tick can run it again.
+      releaseReconciliation?.();
+      await vi.waitFor(() => expect(heartbeatServiceMock.sweepStaleIssueLocks).toHaveBeenCalledTimes(1));
+
+      intervalCallback?.();
+      await vi.waitFor(() =>
+        expect(heartbeatServiceMock.reconcileWorkerCrashedRuns).toHaveBeenCalledTimes(2),
+      );
+    } finally {
+      releaseReconciliation?.();
+      setIntervalSpy.mockRestore();
+    }
+  });
+
   it("refuses authenticated public startup without an external database URL", async () => {
     loadConfigMock.mockReturnValue(buildTestConfig({
       deploymentExposure: "public",

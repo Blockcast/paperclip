@@ -13541,6 +13541,61 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     };
   }
 
+  /** Latches once the candidate index is confirmed usable; see below. */
+  let crashRecoveryCandidateIndexReady = false;
+  /** One warning per process, not one per 30s tick. */
+  let crashRecoveryCandidateIndexWarned = false;
+
+  /**
+   * Is the partial index backing the oldest-first crash-recovery candidate scan
+   * present AND usable?
+   *
+   * `indisvalid`/`indisready` are checked, not just existence: a
+   * `CREATE INDEX CONCURRENTLY` that fails partway leaves an invalid index
+   * behind that the planner will not use, which would otherwise read here as
+   * "indexed" and re-enable the very scan this gate exists to prevent.
+   *
+   * Latches true once satisfied — an index cannot become invalid again without
+   * an operator dropping it, and that path takes a restart anyway.
+   */
+  async function crashRecoveryCandidateIndexPresent(): Promise<boolean> {
+    if (crashRecoveryCandidateIndexReady) return true;
+    try {
+      const rows = await db.execute(sql`
+        select 1
+        from pg_class c
+        join pg_index i on i.indexrelid = c.oid
+        where c.relname = 'heartbeat_runs_crash_recovery_pending_idx'
+          and c.relkind = 'i'
+          and i.indisvalid
+          and i.indisready
+        limit 1
+      `);
+      const present = Array.from(rows as unknown as Iterable<unknown>).length > 0;
+      if (present) {
+        crashRecoveryCandidateIndexReady = true;
+      } else if (!crashRecoveryCandidateIndexWarned) {
+        crashRecoveryCandidateIndexWarned = true;
+        // logger.warn, not the migration's RAISE NOTICE: the production client
+        // swallows notices, which is why this went unnoticed at all.
+        logger.warn(
+          {
+            index: "heartbeat_runs_crash_recovery_pending_idx",
+            remediation:
+              "CREATE INDEX CONCURRENTLY heartbeat_runs_crash_recovery_pending_idx ON heartbeat_runs USING btree (finished_at, id) WHERE error_code = 'worker_crashed' AND crash_recovery_completed_at IS NULL",
+          },
+          "worker-crash candidate index missing; periodic crash reconciliation is disabled until it is built online (startup recovery still runs)",
+        );
+      }
+      return present;
+    } catch (err) {
+      // Never let a catalog probe failure take out the caller. Treating this as
+      // "absent" only skips the periodic pass; startup recovery is ungated.
+      logger.warn({ err }, "failed to probe worker-crash candidate index; skipping periodic reconciliation this tick");
+      return false;
+    }
+  }
+
   /**
    * Startup reconciliation for runs that {@link markRunsInterruptedByWorkerCrash}
    * claimed but could not finish recovering before the crash budget expired
@@ -13581,12 +13636,38 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     maxRuns?: number;
     now?: Date | (() => Date);
     budgetMs?: number;
+    requireCandidateIndex?: boolean;
   } = {}): Promise<{
     reconciledRunIds: string[];
     retryRunIds: string[];
     unresolvedRunIds: string[];
     budgetExhausted: boolean;
+    skippedReason?: "candidate_index_missing";
   }> {
+    // BLO-20822 / BLO-21526: migration 0211 deliberately declines to build the
+    // candidate index inline on a populated table — a non-concurrent build
+    // there would take an ACCESS EXCLUSIVE lock on `heartbeat_runs` for the
+    // whole build. It raises a NOTICE instead, and the production client sets
+    // `onnotice: () => {}` (`packages/db/src/client.ts`), so the migration
+    // records as complete and the index is silently absent until the online
+    // `CREATE INDEX CONCURRENTLY` deploy step runs.
+    //
+    // Without the index the scan below is a sequential scan plus a top-N sort
+    // over a table that grows with every run — acceptable once per process at
+    // startup, but not every 30s on every scheduler replica. So the PERIODIC
+    // caller passes `requireCandidateIndex` and is skipped until the index
+    // exists; startup recovery is never gated, because that is the primary
+    // recovery path and its cost is bounded and one-off.
+    if (options.requireCandidateIndex && !(await crashRecoveryCandidateIndexPresent())) {
+      return {
+        reconciledRunIds: [],
+        retryRunIds: [],
+        unresolvedRunIds: [],
+        budgetExhausted: false,
+        skippedReason: "candidate_index_missing",
+      };
+    }
+
     const clock = resolveCrashRecoveryClock(options.now);
     const now = clock();
     const maxRuns = options.maxRuns ?? WORKER_CRASH_RECONCILE_MAX_RUNS;
