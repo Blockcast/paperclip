@@ -209,7 +209,33 @@ export async function resolveResponsibleUserIdForActivity(db: Db, input: LogActi
   return readNonEmptyString(company?.defaultResponsibleUserId);
 }
 
-export async function logActivity(db: Db, input: LogActivityInput) {
+/**
+ * Emits the side effects of a logged activity: the in-process live event and
+ * the cross-tier plugin outbox enqueue. Both escape any enclosing database
+ * transaction (the live emitter is in-memory; the outbox writes on its own
+ * `_outboxDb` handle), so a caller that logs inside a transaction must defer
+ * this until after commit — see `logActivity`'s `deferPublish` option.
+ */
+export type ActivityPublish = () => void;
+
+const NOOP_ACTIVITY_PUBLISH: ActivityPublish = () => {};
+
+/**
+ * Writes an activity_log row and publishes the corresponding live/plugin
+ * events.
+ *
+ * Pass `{ deferPublish: true }` when `db` is a transaction: publication is then
+ * returned to the caller instead of firing inline, so it can run after commit.
+ * Publishing inline from inside a transaction lets consumers race the row's
+ * visibility, and turns a later commit failure into a phantom event for an
+ * activity that never happened. The returned function is a no-op unless
+ * `deferPublish` was set, so existing callers can keep ignoring the result.
+ */
+export async function logActivity(
+  db: Db,
+  input: LogActivityInput,
+  options?: { deferPublish?: boolean },
+): Promise<ActivityPublish> {
   const currentUserRedactionOptions = {
     enabled: (await instanceSettingsService(db).getGeneral()).censorUsernameInLogs,
   };
@@ -231,23 +257,8 @@ export async function logActivity(db: Db, input: LogActivityInput) {
     details: redactedDetails,
   });
 
-  publishLiveEvent({
-    companyId: input.companyId,
-    type: "activity.logged",
-    payload: {
-      actorType: input.actorType,
-      actorId: input.actorId,
-      action: input.action,
-      entityType: input.entityType,
-      entityId: input.entityId,
-      agentId: input.agentId ?? null,
-      runId: input.runId ?? null,
-      responsibleUserId,
-      details: redactedDetails,
-    },
-  });
-
   const pluginEventType = eventTypeForActivityAction(input.action);
+  let pluginEvent: PluginEvent | null = null;
   if (pluginEventType) {
     // Event-only payload extras: merged into the emitted plugin event but never
     // written to the activity_log row above. We apply the current-user / PII
@@ -263,7 +274,7 @@ export async function logActivity(db: Db, input: LogActivityInput) {
           currentUserRedactionOptions,
         ) as Record<string, unknown>)
       : null;
-    const event: PluginEvent = {
+    pluginEvent = {
       eventId: randomUUID(),
       eventType: pluginEventType,
       occurredAt: new Date().toISOString(),
@@ -280,10 +291,35 @@ export async function logActivity(db: Db, input: LogActivityInput) {
         responsibleUserId,
       },
     };
-    if (input.atomicPluginEvent) {
-      await enqueuePluginDomainEventAtomically(db, event);
-    } else {
-      publishPluginDomainEvent(event);
-    }
   }
+
+  if (pluginEvent && input.atomicPluginEvent) {
+    await enqueuePluginDomainEventAtomically(db, pluginEvent);
+  }
+
+  const publish: ActivityPublish = () => {
+    publishLiveEvent({
+      companyId: input.companyId,
+      type: "activity.logged",
+      payload: {
+        actorType: input.actorType,
+        actorId: input.actorId,
+        action: input.action,
+        entityType: input.entityType,
+        entityId: input.entityId,
+        agentId: input.agentId ?? null,
+        runId: input.runId ?? null,
+        responsibleUserId,
+        details: redactedDetails,
+      },
+    });
+
+    if (pluginEvent && !input.atomicPluginEvent) {
+      publishPluginDomainEvent(pluginEvent);
+    }
+  };
+
+  if (options?.deferPublish) return publish;
+  publish();
+  return NOOP_ACTIVITY_PUBLISH;
 }

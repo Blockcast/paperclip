@@ -571,6 +571,135 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     expect(mockAdapterExecute.mock.calls.some(([ctx]) => ctx.runId === queuedRunId)).toBe(false);
   });
 
+  it("keeps a same-PR review follow-up queued while another review task is running", async () => {
+    const companyId = randomUUID();
+    const runningReviewerId = randomUUID();
+    const queuedReviewerId = randomUUID();
+    const blockedTaskKey = "pr_review:Blockcast/paperclip:123";
+    const otherTaskKey = "pr_review:Blockcast/paperclip:124";
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "ReviewDispatchCo",
+      issuePrefix: `R${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values([
+      {
+        id: runningReviewerId,
+        companyId,
+        name: "RunningReviewAgent",
+        role: "engineer",
+        status: "running",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 3 } },
+        permissions: {},
+      },
+      {
+        id: queuedReviewerId,
+        companyId,
+        name: "QueuedReviewAgent",
+        role: "engineer",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 3 } },
+        permissions: {},
+      },
+    ]);
+
+    const now = new Date();
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId: runningReviewerId,
+      invocationSource: "automation",
+      triggerDetail: "github_webhook",
+      status: "running",
+      contextSnapshot: {
+        taskKey: blockedTaskKey,
+        reviewKind: "pr_review",
+        wakeReason: "github_pr_review_requested",
+      },
+      startedAt: now,
+      lastOutputAt: now,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    const blockedWakeId = randomUUID();
+    const blockedRunId = randomUUID();
+    const otherWakeId = randomUUID();
+    const otherRunId = randomUUID();
+    await db.insert(agentWakeupRequests).values([
+      {
+        id: blockedWakeId,
+        companyId,
+        agentId: queuedReviewerId,
+        source: "automation",
+        triggerDetail: "github_webhook",
+        reason: "github_pr_review_requested",
+        status: "queued",
+        runId: blockedRunId,
+      },
+      {
+        id: otherWakeId,
+        companyId,
+        agentId: queuedReviewerId,
+        source: "automation",
+        triggerDetail: "github_webhook",
+        reason: "github_pr_review_requested",
+        status: "queued",
+        runId: otherRunId,
+      },
+    ]);
+    await db.insert(heartbeatRuns).values([
+      {
+        id: blockedRunId,
+        companyId,
+        agentId: queuedReviewerId,
+        invocationSource: "automation",
+        triggerDetail: "github_webhook",
+        status: "queued",
+        wakeupRequestId: blockedWakeId,
+        contextSnapshot: {
+          taskKey: blockedTaskKey,
+          reviewKind: "pr_review",
+          wakeReason: "github_pr_review_requested",
+        },
+      },
+      {
+        id: otherRunId,
+        companyId,
+        agentId: queuedReviewerId,
+        invocationSource: "automation",
+        triggerDetail: "github_webhook",
+        status: "queued",
+        wakeupRequestId: otherWakeId,
+        contextSnapshot: {
+          taskKey: otherTaskKey,
+          reviewKind: "pr_review",
+          wakeReason: "github_pr_review_requested",
+        },
+      },
+    ]);
+
+    mockAdapterExecute.mockClear();
+    await heartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(heartbeat, otherRunId);
+
+    const blockedRun = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, blockedRunId))
+      .then((rows) => rows[0] ?? null);
+    expect(blockedRun?.status).toBe("queued");
+    expect(mockAdapterExecute.mock.calls.some(([ctx]) => ctx.runId === blockedRunId)).toBe(false);
+    expect(mockAdapterExecute.mock.calls.some(([ctx]) => ctx.runId === otherRunId)).toBe(true);
+  });
+
   it("dispatches a long-starved low-priority todo run ahead of a fresh in_progress run (BLO-16253)", async () => {
     // Regression for BLO-16253: dispatchRank had no time component, so a
     // `todo` queued run could be starved forever behind a busy agent's

@@ -922,7 +922,12 @@ export function agentService(db: Db) {
           .update(issues)
           .set({ assigneeAgentId: null, createdByAgentId: null })
           .where(or(eq(issues.assigneeAgentId, id), eq(issues.createdByAgentId, id)));
-        await tx.delete(heartbeatRunEvents).where(eq(heartbeatRunEvents.agentId, id));
+        await tx.delete(heartbeatRunEvents).where(
+          or(
+            eq(heartbeatRunEvents.agentId, id),
+            sql`${heartbeatRunEvents.runId} in (select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.agentId} = ${id})`,
+          ),
+        );
         await tx.delete(agentTaskSessions).where(eq(agentTaskSessions.agentId, id));
         await tx.delete(activityLog).where(
           or(

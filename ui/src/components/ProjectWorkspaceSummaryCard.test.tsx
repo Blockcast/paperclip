@@ -33,6 +33,9 @@ function act(callback: () => void | Promise<void>) {
   return result;
 }
 
+/** Matches the auto-dismiss delay in CopyText.tsx. */
+const COPY_FEEDBACK_HIDE_MS = 1500;
+
 function createIssue(overrides: Partial<Issue> = {}): Issue {
   return {
     id: overrides.id ?? "issue-1",
@@ -119,6 +122,7 @@ describe("ProjectWorkspaceSummaryCard", () => {
 
   afterEach(() => {
     document.body.innerHTML = "";
+    vi.restoreAllMocks();
   });
 
   it("renders a stacked mobile-friendly summary with metadata labels and compact issue pills", () => {
@@ -217,6 +221,22 @@ describe("ProjectWorkspaceSummaryCard", () => {
   });
 
   it("copies branch and path from both text and icon controls with feedback", async () => {
+    // CopyText hides the "copied" tooltip via setTimeout(..., 1500) on wall-clock
+    // time. On a loaded CI runner more than 1500ms can elapse between the click
+    // and the assertion below, flipping the class to `opacity-0` and failing for
+    // reasons unrelated to the behaviour under test. Pin just that timer; every
+    // other timer stays real, because React's scheduler needs a working
+    // setTimeout to flush the state update the assertions depend on.
+    const realSetTimeout = globalThis.setTimeout;
+    vi.spyOn(globalThis, "setTimeout").mockImplementation(((
+      handler: TimerHandler,
+      timeout?: number,
+      ...args: unknown[]
+    ) => {
+      if (timeout === COPY_FEEDBACK_HIDE_MS) return 0;
+      return realSetTimeout(handler, timeout, ...args);
+    }) as typeof globalThis.setTimeout);
+
     const root = createRoot(container);
     const summary = createSummary({
       branchName: "PAP-1552-workspace-polish",
