@@ -13374,14 +13374,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             ? "agent_load incomplete; lock left until a retry exists"
             : "retry_enqueue incomplete; lock left until a retry exists",
       });
-    } else if (!retry || !retryOwnsIssueLock) {
-      // `!retryOwnsIssueLock` is the sweeper race: a retry exists, but the
-      // guarded hand-over matched zero rows because the issue's lock had
-      // already been cleared out from under the terminal original. Skipping
-      // release here on the strength of the retry merely existing is what
-      // recorded ownership that was never acquired. Releasing is the safe
-      // action either way — it is a no-op on a lock we no longer hold, and it
-      // still runs the promotion that hands the issue to the next queued run.
+    } else {
+      // Release unconditionally — including when the retry does own the context
+      // issue's lock (BLO-20822, Ally round 6).
+      //
+      // A single run can hold execution locks on MORE than one issue: the
+      // context issue from `svc.checkout`, plus any issue stamped by
+      // `enqueueWakeup`'s legacy-run fallback. `enqueueProcessLossRetry` only
+      // ever hands over the *context* issue, so `retryOwnsIssueLock` is a fact
+      // about one issue and says nothing about the others. Skipping the release
+      // on the strength of it left every sibling issue pointing at a terminal
+      // run — the precise "subsequent checkouts fail with 409 and the issue
+      // stays blocked forever" failure `releaseIssueExecutionAndPromote` was
+      // itself fixed to prevent, reintroduced one layer up.
+      //
+      // Calling it after a successful hand-over is safe, and deliberately so:
+      // its lock-clearing UPDATE is keyed on `execution_run_id = <this run>`,
+      // which a transferred lock no longer matches, and its promotion path
+      // bails at `issue.executionRunId !== run.id` on the pre-update snapshot.
+      // So the retry keeps what it was given and only orphaned siblings are
+      // cleared. That is why this needs no separate transferred-lock ledger.
       try {
         await releaseIssueExecutionAndPromote(run);
         record("issue_release", { kind: "done" });
@@ -13389,8 +13401,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         logger.warn({ err: error, runId: run.id }, "failed to release crash-interrupted issue execution lock");
         record("issue_release", { kind: "incomplete", detail: describeRecoveryError(error) });
       }
-    } else {
-      record("issue_release", { kind: "skipped", detail: `retry ${retry.id} owns the issue lock` });
     }
 
     // Best-effort audit. A missing lifecycle line is not worth replaying an
@@ -13403,7 +13413,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         message,
         payload: {
           reason,
-          ...(retry ? { retryRunId: retry.id } : {}),
+          ...(retry ? { retryRunId: retry.id, issueLockOwnedByRetry: retryOwnsIssueLock } : {}),
         },
       });
       record("lifecycle_event", { kind: "done" });
@@ -13710,9 +13720,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       const retryResult = await enqueueProcessLossRetry(interrupted, agent, now);
       const retry = retryResult.kind === "suppressed" ? null : retryResult.run;
-      if (!retry) {
-        await releaseIssueExecutionAndPromote(interrupted);
-      } else {
+      // Release regardless of whether a retry exists (BLO-20822, Ally round 6).
+      // The retry only ever takes over the *context* issue, so gating on its
+      // existence left every other issue this run had locked pointing at a
+      // terminal run. Safe post-hand-over: the clearing UPDATE is keyed on
+      // `execution_run_id = <this run>`, which the transferred lock no longer
+      // matches, and promotion bails when the context issue is owned by the retry.
+      await releaseIssueExecutionAndPromote(interrupted);
+      if (retry) {
         retryRunIds.push(retry.id);
       }
 
@@ -18610,9 +18625,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         retriedRun = scheduled?.outcome === "scheduled" ? scheduled.run : null;
       }
 
-      if (!retriedRun) {
-        promotedRunDispatched = await releaseIssueExecutionAndPromote(finalizedRun);
-      }
+      // Release regardless of whether a retry exists (BLO-20822, Ally round 6):
+      // the retry takes over only the context issue, so gating on its existence
+      // stranded every sibling issue this run had locked. When a retry does own
+      // the context lock, promotion bails on its own and this returns false —
+      // which is the same value this call site saw before, so the
+      // `startNextQueuedRunForAgent` fallback below is unchanged.
+      promotedRunDispatched = await releaseIssueExecutionAndPromote(finalizedRun);
       if (!opts?.suppressDispatchAfterReap && !promotedRunDispatched) {
         await startNextQueuedRunForAgent(run.agentId);
       }

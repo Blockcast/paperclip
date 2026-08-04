@@ -1123,4 +1123,53 @@ describeEmbeddedPostgres("heartbeat worker-crash marking and recovery convergenc
     expect(result.reconciledRunIds).toEqual([run.id]);
     expect((await readRun(run.id)).crashRecoveryCompletedAt).not.toBeNull();
   });
+
+  it("releases sibling issue locks even when the retry does take over the context issue", async () => {
+    // A run can hold execution locks on MORE than one issue: its context issue
+    // from `svc.checkout`, plus any issue stamped by `enqueueWakeup`'s
+    // legacy-run fallback. `enqueueProcessLossRetry` hands over only the
+    // context issue, so `issueLockOwnedByRetry` is a fact about one issue.
+    // Pre-fix, recovery read that single boolean as "the retry owns the lock"
+    // and skipped `releaseIssueExecutionAndPromote` entirely, leaving every
+    // sibling pointing at a terminal run — the same "checkout 409s forever"
+    // strand that function was itself fixed to prevent.
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const run = await seedCrashMarkedRun({ companyId, agentId, finishedAt: new Date(Date.now() - 60_000) });
+    const contextIssueId = "55555555-5555-5555-5555-555555555555";
+    const siblingIssueId = "66666666-6666-6666-6666-666666666666";
+    await db
+      .update(heartbeatRuns)
+      .set({ contextSnapshot: { issueId: contextIssueId } })
+      .where(eq(heartbeatRuns.id, run.id));
+    for (const [id, title] of [[contextIssueId, "Context issue"], [siblingIssueId, "Sibling issue"]] as const) {
+      await db.insert(issues).values({
+        id,
+        companyId,
+        title,
+        status: "in_progress",
+        checkoutRunId: run.id,
+        executionRunId: run.id,
+        executionLockedAt: new Date(Date.now() - 60_000),
+      });
+    }
+
+    const result = await service().reconcileWorkerCrashedRuns();
+
+    const retries = await retriesOf(run.id);
+    expect(retries).toHaveLength(1);
+
+    // The hand-over still lands and is NOT clobbered by the unconditional
+    // release: its clearing UPDATE is keyed on `execution_run_id = <this run>`,
+    // which the transferred lock no longer matches.
+    const [contextAfter] = await db.select().from(issues).where(eq(issues.id, contextIssueId));
+    expect(contextAfter!.executionRunId).toBe(retries[0]!.id);
+
+    // The discriminating assertion: pre-fix this stayed pinned to the dead run.
+    const [siblingAfter] = await db.select().from(issues).where(eq(issues.id, siblingIssueId));
+    expect(siblingAfter!.executionRunId).toBeNull();
+    expect(siblingAfter!.checkoutRunId).toBeNull();
+
+    expect(result.reconciledRunIds).toEqual([run.id]);
+    expect((await readRun(run.id)).crashRecoveryCompletedAt).not.toBeNull();
+  });
 });
