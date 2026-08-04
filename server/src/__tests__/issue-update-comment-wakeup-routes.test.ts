@@ -105,6 +105,10 @@ vi.mock("../services/index.js", () => ({
 }));
 
 function registerModuleMocks() {
+  vi.doMock("../services/source-trust.js", async () => ({
+    ...await vi.importActual<typeof import("../services/source-trust.js")>("../services/source-trust.js"),
+    resolveActorSourceTrustForIssue: vi.fn(async () => null),
+  }));
   vi.doMock("../services/index.js", () => ({
     companyService: () => ({
       getById: vi.fn(async () => ({ id: "company-1", attachmentMaxBytes: 10 * 1024 * 1024 })),
@@ -694,7 +698,7 @@ describe("issue update comment wakeups", () => {
     const existing = makeIssue({
       assigneeAgentId: ASSIGNEE_AGENT_ID,
       assigneeUserId: null,
-      status: "in_progress",
+      status: "todo",
     });
     mockIssueService.getById.mockResolvedValue(existing);
     mockIssueService.addComment.mockResolvedValue({
