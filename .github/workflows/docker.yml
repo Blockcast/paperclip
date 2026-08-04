@@ -665,14 +665,66 @@ jobs:
           # gave up at 10m. 30m absorbs that window without changing CI's
           # report-success semantics for healthy rollouts (which still
           # finish in ~30-90s). Investigate further if 30m proves too short.
+          helm_pid=""
+          stop_background_helm() {
+            if [ -n "${helm_pid}" ] && kill -0 "${helm_pid}" 2>/dev/null; then
+              kill "${helm_pid}" 2>/dev/null || true
+              wait "${helm_pid}" 2>/dev/null || true
+            fi
+          }
+          trap stop_background_helm EXIT
+
           helm upgrade "${RELEASE}" ./deploy/helm/paperclip \
             -n "${NS}" \
             -f deploy/helm/paperclip/values.blockcast.yaml \
             --set image.tag="${TAG}" \
             --set-string image.digest="${DIGEST}" \
             --post-renderer "${STAMP_SCRIPT}" \
-            --wait --timeout 30m
-          reconcile_approved_api_plan
+            --wait --timeout 30m &
+          helm_pid=$!
+
+          # Helm applies release resources before entering its wait loop. As
+          # soon as its approved marker reaches the API Deployment, replace the
+          # three-way-merged object with the exact server-normalized plan. Keep
+          # doing this even when Helm later fails on another resource so no
+          # marker-bearing intermediate Deployment is left live.
+          api_plan_reconciled=""
+          while kill -0 "${helm_pid}" 2>/dev/null; do
+            live_marker="$(kubectl -n "${NS}" get deployment paperclip-api \
+              -o jsonpath='{.spec.template.metadata.annotations.paperclip\.blockcast\.net/approval-plan-sha256}' \
+              2>/dev/null || true)"
+            if [ "${live_marker}" = "${PLAN_MARKER}" ]; then
+              reconcile_approved_api_plan
+              api_plan_reconciled=yes
+              break
+            fi
+            sleep 2
+          done
+
+          helm_status=0
+          wait "${helm_pid}" || helm_status=$?
+          helm_pid=""
+
+          # Cover the narrow race where Helm exits after applying the Deployment
+          # but before the polling loop observes its marker.
+          if [ -z "${api_plan_reconciled}" ]; then
+            live_marker="$(kubectl -n "${NS}" get deployment paperclip-api \
+              -o jsonpath='{.spec.template.metadata.annotations.paperclip\.blockcast\.net/approval-plan-sha256}' \
+              2>/dev/null || true)"
+            if [ "${live_marker}" = "${PLAN_MARKER}" ]; then
+              reconcile_approved_api_plan
+              api_plan_reconciled=yes
+            fi
+          fi
+          if [ -z "${api_plan_reconciled}" ]; then
+            echo "Helm never applied the approved API plan marker ${PLAN_MARKER}" >&2
+            exit 1
+          fi
+          if [ "${helm_status}" -ne 0 ]; then
+            echo "Helm upgrade failed with status ${helm_status} after exact API reconciliation" >&2
+            exit "${helm_status}"
+          fi
+
           kubectl -n "${NS}" rollout status deployment/paperclip-api --timeout=30m
 
           # Use the approver's canonical projection verbatim. Comparing the live

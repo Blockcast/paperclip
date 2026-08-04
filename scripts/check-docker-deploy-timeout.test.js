@@ -158,13 +158,20 @@ test("Docker deploy approves the exact stamped plan before Helm mutates producti
   assert.match(deployJob, /--post-renderer "\$\{STAMP_SCRIPT\}"/);
   assert.equal(
     deployJob.match(/reconcile_approved_api_plan/g)?.length,
-    2,
-    "the exact-plan helper must be defined once and run only after Helm",
+    3,
+    "the exact-plan helper must cover both the live Helm wait and its exit race",
   );
   assert.ok(
     deployJob.indexOf("helm upgrade \"${RELEASE}\"") <
       deployJob.lastIndexOf("reconcile_approved_api_plan"),
     "Helm must apply release dependencies before exact API reconciliation",
+  );
+  assert.match(deployJob, /--wait --timeout 30m &\n          helm_pid=\$!/);
+  assert.match(deployJob, /while kill -0 "\$\{helm_pid\}"/);
+  assert.ok(
+    deployJob.lastIndexOf("reconcile_approved_api_plan") <
+      deployJob.indexOf('if [ "${helm_status}" -ne 0 ]'),
+    "a marker-bearing Deployment must be reconciled before Helm failure is propagated",
   );
   assert.match(deployJob, /kubectl -n "\$\{NS\}" replace -f "\$\{reconciled\}"/);
   assert.match(deployJob, /with_entries\(select\(\(\.key \| release_controlled_metadata_key\) \| not\)\)/);
@@ -183,4 +190,22 @@ test("Docker deploy confines and cleans up the release-approver credential", () 
   assert.match(deployJob, /trap 'rm -rf "\$\{approver_dir\}"' EXIT/);
   assert.ok(write >= 0 && write < unset, "the secret must be materialized before its env value is unset");
   assert.ok(unset < invoke, "the raw secret must not be inherited by the approval script");
+});
+
+test("Docker deploy reconciles marker-bearing drift before propagating Helm failure", () => {
+  const deployJob = getDeployJobBlock();
+  const helmStart = deployJob.indexOf('helm upgrade "${RELEASE}"');
+  const markerObserved = deployJob.indexOf('if [ "${live_marker}" = "${PLAN_MARKER}" ]');
+  const reconcile = deployJob.indexOf("reconcile_approved_api_plan", markerObserved);
+  const helmWait = deployJob.indexOf('wait "${helm_pid}" || helm_status=$?');
+  const failedStatus = deployJob.indexOf('if [ "${helm_status}" -ne 0 ]');
+
+  assert.ok(helmStart >= 0 && helmStart < markerObserved);
+  assert.ok(markerObserved < reconcile, "the approved marker must gate exact reconciliation");
+  assert.ok(reconcile < helmWait, "live-only drift must be removed while Helm is still waiting");
+  assert.ok(helmWait < failedStatus, "Helm failure must be captured instead of exiting immediately");
+  assert.ok(
+    deployJob.lastIndexOf("reconcile_approved_api_plan", failedStatus) < failedStatus,
+    "the post-exit race path must reconcile before Helm failure is returned",
+  );
 });
