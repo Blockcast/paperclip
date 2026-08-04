@@ -181,7 +181,12 @@ import {
   evaluateIssueRewakeThrottle,
   isThrottleCandidateIssueRewake,
 } from "./issue-rewake-throttle.js";
-import { logActivity, publishPluginDomainEvent, type LogActivityInput } from "./activity-log.js";
+import {
+  logActivity,
+  publishPluginDomainEvent,
+  type ActivityPublish,
+  type LogActivityInput,
+} from "./activity-log.js";
 import { githubGetPullRequestGate, githubHasReviewerEvidenceForPr } from "./github-app-auth.js";
 import { loadConfig } from "../config.js";
 import { enqueueGithubCommitStatusDelivery } from "./github-status-delivery-outbox.js";
@@ -14625,6 +14630,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           outcome: "scheduled";
           run: typeof heartbeatRuns.$inferSelect;
           reusedExisting: boolean;
+          // Deferred publisher for the workspace-quarantine activity event
+          // logged inside this transaction, if any. Undefined when no
+          // quarantine occurred. Must be invoked only after the transaction
+          // commits — see the call site right after `db.transaction` below.
+          activityPublish?: ActivityPublish;
         }
       | {
           outcome: "not_scheduled";
@@ -14641,6 +14651,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         };
 
     const scheduleResult = await db.transaction(async (tx): Promise<ScheduledRetryTransactionResult> => {
+      let activityPublish: ActivityPublish | undefined;
       if (retryReason === INTERACTION_CONTINUATION_INFRA_RETRY_REASON) {
         if (issueId) {
           await tx.execute(
@@ -14955,9 +14966,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 eq(executionWorkspaces.companyId, run.companyId),
               ));
 
-            // This action has no plugin-event mapping, so no outbox write can
-            // escape the transaction; keep the default publication semantics.
-            await logActivity(tx as unknown as Db, {
+            activityPublish = await logActivity(tx as unknown as Db, {
               companyId: run.companyId,
               actorType: "system",
               actorId: "heartbeat",
@@ -14967,7 +14976,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               entityType: "execution_workspace",
               entityId: failedWorkspace.id,
               details: quarantine,
-            });
+            }, { deferPublish: true });
             detachWorkspaceFromIssue = issueWorkspace.executionWorkspaceId === failedExecutionWorkspaceId;
           }
         }
@@ -14995,8 +15004,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         outcome: "scheduled",
         run: scheduledRun,
         reusedExisting: false,
+        activityPublish,
       };
     });
+
+    // Reached only on commit; a rollback throws past this rather than
+    // falling through to it, so a quarantine event is never published for a
+    // transaction that didn't commit.
+    if (scheduleResult.outcome === "scheduled" && scheduleResult.activityPublish) {
+      try {
+        scheduleResult.activityPublish();
+      } catch (err) {
+        logger.warn(
+          { err, runId: run.id, issueId },
+          "failed to publish execution_workspace.workspace_validation_quarantined activity event",
+        );
+      }
+    }
 
     if (scheduleResult.outcome === "not_scheduled") {
       await appendRunEvent(run, await nextRunEventSeq(run.id), {
@@ -26964,9 +26988,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               idempotencyKey: opts.idempotencyKey ?? null,
               finishedAt: now,
             });
-            // This action has no plugin-event mapping, so no outbox write can
-            // escape the transaction; keep the default publication semantics.
-            await logActivity(tx as unknown as Db, {
+            const activityPublish = await logActivity(tx as unknown as Db, {
               companyId: issue.companyId,
               actorType: "system",
               actorId: "system",
@@ -26986,8 +27008,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 resolvedStrategy,
                 hasResolvablePriorSessionWorkspace,
               },
-            });
-            return { kind: "skipped" as const };
+            }, { deferPublish: true });
+            // Deferred: this "skipped" outcome carries the publisher out of the
+            // transaction rather than firing inline (see the `outcome.kind`
+            // switch right after `db.transaction` below), so a rollback throws
+            // past the publish call instead of falling through to it.
+            return { kind: "skipped" as const, activityPublish };
           }
         }
 
@@ -27505,6 +27531,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
         return { kind: "queued" as const, run: newRun };
       });
+
+      // Reached only on commit; a rollback throws past this rather than
+      // falling through to it, so the workspace-preflight-blocked activity
+      // event is never published for a transaction that didn't commit.
+      if ("activityPublish" in outcome && outcome.activityPublish) {
+        try {
+          outcome.activityPublish();
+        } catch (err) {
+          logger.warn(
+            { err, issueId, agentId },
+            "failed to publish issue.workspace_preflight_blocked activity event",
+          );
+        }
+      }
 
       if (outcome.kind === "deferred" || outcome.kind === "skipped" || outcome.kind === "dep_blocked_scheduled") return null;
       if (outcome.kind === "coalesced") {
