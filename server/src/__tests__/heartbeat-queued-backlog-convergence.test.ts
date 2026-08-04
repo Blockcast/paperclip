@@ -1051,6 +1051,29 @@ describeEmbeddedPostgres("queued backlog convergence (BLO-20396)", () => {
       .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "queued")));
   }
 
+  /**
+   * Await a test barrier under a deadline. A barrier that never resolves would
+   * otherwise park the test until vitest's own timeout, which reports as a bare
+   * "test timed out" with no indication of which handshake never happened.
+   * Naming the barrier turns that into a diagnosable failure.
+   */
+  async function waitForBarrier(promise: Promise<void>, label: string, timeoutMs = 30_000) {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        promise,
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(
+            () => reject(new Error(`barrier "${label}" did not resolve within ${timeoutMs}ms`)),
+            timeoutMs,
+          );
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
   it("ranks a critical row globally, not just within the bounded scan window", async () => {
     // BLO-20396 (fourth review follow-up). Priority must not be scoped to the
     // SCAN_LIMIT * MAX_SCAN_BATCHES rows one pass may read. Collection walks the
@@ -1386,47 +1409,59 @@ describeEmbeddedPostgres("queued backlog convergence (BLO-20396)", () => {
     // The second call must fold into the first pass while it is still scanning —
     // precisely the window in which no cursor exists yet.
     const firstPass = boundedHeartbeat.resumeQueuedRuns();
-    await firstPassEnteredPromise;
-    const coalescedPass = boundedHeartbeat.resumeQueuedRuns();
-    await directCoalescedPromise;
-    releaseFirstPass();
-    await Promise.all([firstPass, coalescedPass]);
+    let coalescedPass: Promise<unknown> | undefined;
+    try {
+      await waitForBarrier(firstPassEnteredPromise, "first direct pass entered");
+      coalescedPass = boundedHeartbeat.resumeQueuedRuns();
+      await waitForBarrier(directCoalescedPromise, "second call coalesced into the first pass");
+      releaseFirstPass();
+      await Promise.all([firstPass, coalescedPass]);
 
-    // Fixture precondition, asserted before the behavioural one so a fixture
-    // breakdown ("the chain never reached a resumed pass") is distinguishable
-    // from the regression this test guards ("the row was inserted and starved").
-    await vi.waitFor(() => expect(headRowInserted).toBe(true), { timeout: 30_000, interval: 25 });
+      // Fixture precondition, asserted before the behavioural one so a fixture
+      // breakdown ("the chain never reached a resumed pass") is distinguishable
+      // from the regression this test guards ("the row was inserted and starved").
+      await vi.waitFor(() => expect(headRowInserted).toBe(true), { timeout: 30_000, interval: 25 });
 
-    // 30s against a seven-row fixture is a very wide margin (the head rescan
-    // lands in well under a second), but it stays inside the 60s test budget so
-    // a regression fails on this assertion rather than as a bare test timeout.
-    expect(await adapter.waitForStarted(1, 30_000)).toBe(1);
-    expect(adapter.started[0]).toBe(headRunId);
+      // 30s against a seven-row fixture is a very wide margin (the head rescan
+      // lands in well under a second), but it stays inside the 60s test budget so
+      // a regression fails on this assertion rather than as a bare test timeout.
+      expect(await adapter.waitForStarted(1, 30_000)).toBe(1);
+      expect(adapter.started[0]).toBe(headRunId);
 
-    // The row must have been reached by the head rescan the coalesced demand
-    // armed — not by a prune follow-up, which would be an unrelated rescue and
-    // would leave the starvation bug uncovered.
-    expect(passReasons).toContain("resume_head_rescan_after_coalesced_demand");
-    expect(passReasons).not.toContain("pruned_invalid_rows");
+      // The row must have been reached by the head rescan the coalesced demand
+      // armed — not by a prune follow-up, which would be an unrelated rescue and
+      // would leave the starvation bug uncovered.
+      expect(passReasons).toContain("resume_head_rescan_after_coalesced_demand");
+      expect(passReasons).not.toContain("pruned_invalid_rows");
 
-    // Sanity that the fixture did what the scenario needs: the chain really did
-    // walk the whole backlog, rather than stalling early for some other reason.
-    const stillQueuedBlocked = await db
-      .select({ id: heartbeatRuns.id })
-      .from(heartbeatRuns)
-      .where(and(
-        eq(heartbeatRuns.agentId, agentId),
-        eq(heartbeatRuns.status, "queued"),
-        inArray(heartbeatRuns.id, backlogRuns.map((row) => row.id as string)),
-      ));
-    expect(stillQueuedBlocked).toHaveLength(0);
-
-    await stopBacklog(agentId);
-    adapter.disarm();
-    // This instance owns its own dispatch state and scheduled passes; stop it so
-    // nothing it scheduled can bleed into a later test in this file.
-    boundedHeartbeat.stopDispatch();
-    await boundedHeartbeat.drainInFlightExecutions(60_000);
+      // Sanity that the fixture did what the scenario needs: the chain really did
+      // walk the whole backlog, rather than stalling early for some other reason.
+      const stillQueuedBlocked = await db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(and(
+          eq(heartbeatRuns.agentId, agentId),
+          eq(heartbeatRuns.status, "queued"),
+          inArray(heartbeatRuns.id, backlogRuns.map((row) => row.id as string)),
+        ));
+      expect(stillQueuedBlocked).toHaveLength(0);
+    } finally {
+      // Teardown must be unconditional: this instance is not the shared one
+      // `afterEach` cleans, so a failed assertion would otherwise leave its gated
+      // executions and scheduled passes alive for the rest of the file.
+      // Release the barrier first — a failure above can leave the first pass
+      // parked on it, and everything below would then block behind it.
+      releaseFirstPass();
+      await stopBacklog(agentId);
+      adapter.disarm();
+      // This instance owns its own dispatch state and scheduled passes; stop it so
+      // nothing it scheduled can bleed into a later test in this file.
+      boundedHeartbeat.stopDispatch();
+      // Settle the passes before draining, so one that rejected after the test had
+      // already failed cannot resurface as an unhandled rejection in a later test.
+      await Promise.allSettled([firstPass, coalescedPass]);
+      await boundedHeartbeat.drainInFlightExecutions(60_000);
+    }
   }, 60_000);
 
   it("does not re-arm an internally scheduled head rescan when it coalesces", async () => {
