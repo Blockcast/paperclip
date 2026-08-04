@@ -773,11 +773,21 @@ export function agentService(db: Db) {
         // withdrawal with a 409 no retry can ever satisfy. Drop the stale
         // reference so withdrawal takes the clean no-cleanup path instead.
         // Undecided rows only -- decided rows keep the reference as history.
+        //
+        // Scoped to the removed agent's own company. `payload.agentId` is
+        // caller-controlled free-form JSON, so without this predicate any
+        // company could plant another company's agent id in a payload and have
+        // its approval rewritten when that foreign agent is deleted -- both a
+        // tenant-isolation break and an existence oracle for agents the caller
+        // cannot otherwise observe. The `linked_agent_id` arm is a trusted FK
+        // and same-company at every write site, so the predicate is a no-op
+        // there; it is the untrusted arm it constrains.
         await tx
           .update(approvals)
           .set({ payload: sql`${approvals.payload} - 'agentId'` })
           .where(
             and(
+              eq(approvals.companyId, existing.companyId),
               eq(approvals.type, "hire_agent"),
               inArray(approvals.status, ["pending", "revision_requested"]),
               or(

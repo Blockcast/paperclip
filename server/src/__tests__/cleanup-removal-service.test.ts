@@ -225,6 +225,72 @@ describeEmbeddedPostgres("cleanup removal services", () => {
     expect(withdrawn.status).toBe("withdrawn");
   });
 
+  it("does not touch a foreign company's approval that names the removed agent in its payload", async () => {
+    // `payload.agentId` is caller-controlled free-form JSON. Without a company
+    // predicate on the neutralisation update, company B could plant company A's
+    // agent id in its own approval payload and have that row rewritten when A
+    // deletes the agent -- a tenant-isolation break, and an existence oracle:
+    // B learns when a foreign agent it cannot otherwise observe was deleted.
+    const { agentId, companyId } = await seedFixture();
+    const foreign = await seedFixture();
+    const sameCompanyApprovalId = randomUUID();
+    const foreignApprovalId = randomUUID();
+
+    await db.insert(approvals).values({
+      id: sameCompanyApprovalId,
+      companyId,
+      type: "hire_agent",
+      linkedAgentId: agentId,
+      requestedByAgentId: null,
+      requestedByUserId: null,
+      status: "pending",
+      payload: { agentId, name: "CodexCoder" },
+    });
+
+    // Same shape, different tenant, and deliberately NOT linked -- the only
+    // thing tying it to the removed agent is the untrusted payload id.
+    await db.insert(approvals).values({
+      id: foreignApprovalId,
+      companyId: foreign.companyId,
+      type: "hire_agent",
+      linkedAgentId: null,
+      requestedByAgentId: null,
+      requestedByUserId: null,
+      status: "pending",
+      payload: { agentId, name: "PlantedByOtherTenant" },
+    });
+
+    const [foreignBefore] = await db
+      .select()
+      .from(approvals)
+      .where(eq(approvals.id, foreignApprovalId));
+
+    await agentService(db).remove(agentId);
+
+    const [foreignAfter] = await db
+      .select()
+      .from(approvals)
+      .where(eq(approvals.id, foreignApprovalId));
+    // Byte-for-byte: payload keeps the planted id, and no column moved
+    // (including `updated_at`, which would itself leak that a write occurred).
+    expect(foreignAfter).toEqual(foreignBefore);
+    expect(foreignAfter.payload).toMatchObject({ agentId, name: "PlantedByOtherTenant" });
+
+    // ...while the removed agent's own company is still cleaned up and withdrawable.
+    const [neutralised] = await db
+      .select({ linkedAgentId: approvals.linkedAgentId, payload: approvals.payload })
+      .from(approvals)
+      .where(eq(approvals.id, sameCompanyApprovalId));
+    expect(neutralised.linkedAgentId).toBeNull();
+    expect(neutralised.payload).not.toHaveProperty("agentId");
+
+    const withdrawn = await approvalService(db).withdraw(sameCompanyApprovalId, "hire agent was deleted", {
+      userId: "user-1",
+      activity: { actorType: "user", actorId: "user-1", agentId: null },
+    });
+    expect(withdrawn.status).toBe("withdrawn");
+  });
+
   it("removes issue read states and activity rows before deleting the company", async () => {
     const { companyId, issueId, runId } = await seedFixture();
     const documentId = randomUUID();
