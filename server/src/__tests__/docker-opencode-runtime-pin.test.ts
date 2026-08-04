@@ -135,6 +135,19 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
     expect(dockerAgentWorkflow).toContain("timeout-minutes: 90");
   });
 
+  it("gates agent rollout on a restricted-container screenshot smoke test", () => {
+    const smokeIndex = dockerAgentWorkflow.indexOf("Smoke test restricted headless screenshot");
+    const bumpIndex = dockerAgentWorkflow.indexOf("Bump agent image refs in cluster");
+
+    expect(smokeIndex).toBeGreaterThan(-1);
+    expect(smokeIndex).toBeLessThan(bumpIndex);
+    expect(dockerAgentWorkflow).toContain("--user 1000:1000");
+    expect(dockerAgentWorkflow).toContain("--security-opt no-new-privileges");
+    expect(dockerAgentWorkflow).toContain("--cap-drop ALL");
+    expect(dockerAgentWorkflow).toContain("--tmpfs /paperclip:rw,nosuid,size=16m");
+    expect(dockerAgentWorkflow).toContain("paperclip-browser-smoke");
+  });
+
   it("includes resolved upstream image digests in stable image identities", () => {
     expect(dockerWorkflow).toContain('RUNTIME_BASE_IMAGE=${{ steps.runtime.outputs.base_image }}');
     expect(dockerAgentWorkflow).toContain(

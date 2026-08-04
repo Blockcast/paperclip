@@ -229,6 +229,23 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
+      - name: Smoke test restricted headless screenshot
+        env:
+          AGENT_IMAGE: harbor.blockcast.net/paperclip-agent/paperclip-agent:sha-${{ steps.sha.outputs.short }}-k8s-vendored
+        run: |
+          set -euo pipefail
+          docker pull "$AGENT_IMAGE"
+          docker run --rm \
+            --user 1000:1000 \
+            --read-only \
+            --security-opt no-new-privileges \
+            --cap-drop ALL \
+            --tmpfs /paperclip:rw,nosuid,size=16m \
+            --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+            --env HOME=/tmp \
+            "$AGENT_IMAGE" \
+            paperclip-browser-smoke
+
       # BLO-4141: Auto-bump per-agent adapter_config.image so the freshly
       # built tag actually lands on running agents. Without this, the new
       # image sits in harbor unused until an operator manually PATCHes each

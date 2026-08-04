@@ -45,8 +45,12 @@ case "${1:-}" in
       printf 'label=agent-toolchain\n'
       printf 'runtime-image=%s\n' "$runtime_image"
       printf 'ffmpeg-image=%s\n' "$ffmpeg_image"
-      printf 'file=Dockerfile.agent-toolchain\n'
-      sha256_digest Dockerfile.agent-toolchain
+      for file in \
+        Dockerfile.agent-toolchain \
+        scripts/smoke/agent-browser-screenshot.sh; do
+        printf 'file=%s\n' "$file"
+        sha256_digest "$file"
+      done
     } | sha256_digest | cut -c1-20)"
     printf 'toolchain-%s\n' "$digest"
     ;;

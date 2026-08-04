@@ -5,6 +5,13 @@ set -e
 PUID=${USER_UID:-1000}
 PGID=${USER_GID:-1000}
 
+# /paperclip is a PVC in agent Jobs, so image-layer links below it are hidden.
+# Replace any ad hoc browser cached there with the image-pinned headless shell.
+if [ -x /usr/local/bin/google-chrome ]; then
+    mkdir -p /paperclip/bin
+    ln -sf /usr/local/bin/google-chrome /paperclip/bin/google-chrome
+fi
+
 # Without root we can neither remap the node user (usermod/groupmod/chown)
 # nor switch users (gosu needs CAP_SETUID/CAP_SETGID), so exec directly.
 # This covers Kubernetes restricted PodSecurity (runAsNonRoot + runAsUser)
