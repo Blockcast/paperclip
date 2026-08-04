@@ -8466,7 +8466,7 @@ export function issueService(db: Db) {
       const doneGateInput = {
         fromStatus: existing.status,
         toStatus: issueData.status,
-        existingExecutionRunId: existing.executionRunId,
+        existingCheckoutRunId: existing.checkoutRunId,
         lastEvidenceVerdict: doneGateEvidenceVerdict,
         isAgentActor: actorAgentId != null,
         hasDurableArtifactEvidence: false,
@@ -8497,7 +8497,7 @@ export function issueService(db: Db) {
         doneGateNeedsDurableArtifactCheck = shouldBlockNarratedDone({
           fromStatus: existing.status,
           toStatus: issueData.status,
-          existingExecutionRunId: existing.executionRunId,
+          existingCheckoutRunId: existing.checkoutRunId,
           lastEvidenceVerdict: doneGateEvidenceVerdict,
           isAgentActor: actorAgentId != null,
           hasDurableArtifactEvidence: false,
@@ -8738,7 +8738,7 @@ export function issueService(db: Db) {
             shouldBlockNarratedDone({
               fromStatus: existing.status,
               toStatus: issueData.status,
-              existingExecutionRunId: existing.executionRunId,
+              existingCheckoutRunId: existing.checkoutRunId,
               lastEvidenceVerdict: doneGateEvidenceVerdict,
               isAgentActor: actorAgentId != null,
               hasDurableArtifactEvidence: doneGateHasDurableArtifact,
