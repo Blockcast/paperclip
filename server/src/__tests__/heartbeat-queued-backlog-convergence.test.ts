@@ -141,7 +141,15 @@ describeEmbeddedPostgres("queued backlog convergence (BLO-20396)", () => {
       permissions: {},
     });
 
-    const baseTime = Date.now() - 6 * 60 * 60 * 1000;
+    // Aged past the 2h STARVATION_FULL_ESCALATION_MS floor (so non-critical
+    // rows rank 2, the regime these tests are about) but comfortably UNDER the
+    // 6h STARVATION_ABSOLUTE_ESCALATION_MS floor added by BLO-21792, past which
+    // a row of any priority outranks fresh critical work by design.
+    //
+    // This was `- 6 * 60 * 60 * 1000`, which placed the head of the prefix
+    // exactly ON the new floor, so whether a row crossed it depended on how long
+    // the multi-thousand-row insert below took.
+    const baseTime = Date.now() - 3 * 60 * 60 * 1000;
     let issueNumber = 0;
     const issueRows: Array<typeof issues.$inferInsert> = [];
     const wakeRows: Array<typeof agentWakeupRequests.$inferInsert> = [];
@@ -347,7 +355,15 @@ describeEmbeddedPostgres("queued backlog convergence (BLO-20396)", () => {
       permissions: {},
     });
 
-    const baseTime = Date.now() - 6 * 60 * 60 * 1000;
+    // Aged past the 2h STARVATION_FULL_ESCALATION_MS floor (so non-critical
+    // rows rank 2, the regime these tests are about) but comfortably UNDER the
+    // 6h STARVATION_ABSOLUTE_ESCALATION_MS floor added by BLO-21792, past which
+    // a row of any priority outranks fresh critical work by design.
+    //
+    // This was `- 6 * 60 * 60 * 1000`, which placed the head of the prefix
+    // exactly ON the new floor, so whether a row crossed it depended on how long
+    // the multi-thousand-row insert below took.
+    const baseTime = Date.now() - 3 * 60 * 60 * 1000;
     let issueNumber = 0;
     const issueRows: Array<typeof issues.$inferInsert> = [];
     const wakeRows: Array<typeof agentWakeupRequests.$inferInsert> = [];
@@ -658,7 +674,15 @@ describeEmbeddedPostgres("queued backlog convergence (BLO-20396)", () => {
       permissions: {},
     });
 
-    const baseTime = Date.now() - 6 * 60 * 60 * 1000;
+    // Aged past the 2h STARVATION_FULL_ESCALATION_MS floor (so non-critical
+    // rows rank 2, the regime these tests are about) but comfortably UNDER the
+    // 6h STARVATION_ABSOLUTE_ESCALATION_MS floor added by BLO-21792, past which
+    // a row of any priority outranks fresh critical work by design.
+    //
+    // This was `- 6 * 60 * 60 * 1000`, which placed the head of the prefix
+    // exactly ON the new floor, so whether a row crossed it depended on how long
+    // the multi-thousand-row insert below took.
+    const baseTime = Date.now() - 3 * 60 * 60 * 1000;
     let issueNumber = 0;
     const issueRows: Array<typeof issues.$inferInsert> = [];
     const wakeRows: Array<typeof agentWakeupRequests.$inferInsert> = [];

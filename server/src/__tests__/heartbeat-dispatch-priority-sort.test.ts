@@ -1563,6 +1563,200 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     }
   }, 180_000);
 
+  it("dispatches a row that crosses the absolute starvation floor AFTER the scan cursor passed it (BLO-21792 second review follow-up)", async () => {
+    // The test above proves the floor holds for rows that were ALREADY absolute
+    // when a pass ranked them. This one proves it holds for a row that becomes
+    // absolute later, which is where the first follow-up's cursor rewind leaked.
+    //
+    // That rewind keyed on the rank a row already had. A ready row scanned at
+    // 5h59m ranks 2, not ABSOLUTE_STARVATION_DISPATCH_RANK, so no rewind fired
+    // and the pass stored its cursor past the row. A minute later the row
+    // crossed the floor — but it now sat BEHIND the cursor, so no later pass
+    // re-read it, re-ranked it, or dispatched it. The absolute-starvation lane
+    // closes this by re-reading `createdAt <= now - 6h` from its own head every
+    // pass, so crossing the floor is sufficient on its own and where the cursor
+    // sits stops mattering.
+    //
+    // Geometry (scanLimit 2, one free slot, six queued rows):
+    //
+    //   window:  [ nearFloor (rank 2) , freshCriticalA (rank 0) ]
+    //   beyond:  [ freshCriticalB (0) , filler x3 ]
+    //
+    // freshCriticalA takes the only slot; nearFloor is never examined and the
+    // cursor advances past it. The adapter is then held open so no further pass
+    // can run until the test has slept nearFloor across the six-hour boundary.
+    //
+    // Pre-fix: nearFloor is invisible to every later pass until the forward scan
+    // runs off the end of the queue, so freshCriticalB overtakes it.
+    // Post-fix: the next pass finds nearFloor at rank -1 and dispatches it
+    // before freshCriticalB.
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issuePrefix = `X${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const SIX_HOURS_MS = 6 * 60 * 60 * 1000;
+    // Margin sized for insert + first-pass latency: nearFloor must still be
+    // UNDER the floor when pass 1 ranks it, or the geometry under test never
+    // forms. The precondition assertion below fails loudly if it is not.
+    const CROSSING_MARGIN_MS = 8_000;
+    const baseNow = Date.now();
+    const nearFloorCreatedAt = new Date(baseNow - SIX_HOURS_MS + CROSSING_MARGIN_MS);
+    const freshAt = new Date(baseNow);
+
+    const boundedHeartbeat = heartbeatService(db, {
+      penstockGate: allowPenstockGate,
+      queuedRunDispatchBounds: { scanLimit: 2, maxScanBatches: 1, maxResumePasses: 8 },
+    });
+
+    try {
+      await db.insert(companies).values({
+        id: companyId,
+        name: "AbsoluteFloorThresholdCrossingCo",
+        issuePrefix,
+        requireBoardApprovalForNewAgents: false,
+        defaultResponsibleUserId: "responsible-user",
+      });
+
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: "ThresholdCrossingAgent",
+        role: "engineer",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+        permissions: {},
+      });
+
+      const rows = [
+        { key: "nearFloor", priority: "medium", createdAt: nearFloorCreatedAt },
+        { key: "freshCriticalA", priority: "critical", createdAt: freshAt },
+        { key: "freshCriticalB", priority: "critical", createdAt: new Date(baseNow + 1) },
+        { key: "filler1", priority: "low", createdAt: new Date(baseNow + 2) },
+        { key: "filler2", priority: "low", createdAt: new Date(baseNow + 3) },
+        { key: "filler3", priority: "low", createdAt: new Date(baseNow + 4) },
+      ].map((row, index) => ({
+        ...row,
+        issueId: randomUUID(),
+        runId: randomUUID(),
+        issueNumber: index + 1,
+      }));
+      const runIdByKey = new Map(rows.map((row) => [row.key, row.runId]));
+
+      await db.insert(issues).values(rows.map((row) => ({
+        id: row.issueId,
+        companyId,
+        title: `Queued ${row.key}`,
+        status: "in_progress" as const,
+        priority: row.priority,
+        assigneeAgentId: agentId,
+        issueNumber: row.issueNumber,
+        identifier: `${issuePrefix}-${row.issueNumber}`,
+        startedAt: row.createdAt,
+      })));
+
+      for (const row of rows) {
+        const wakeId = randomUUID();
+        await db.insert(agentWakeupRequests).values({
+          id: wakeId,
+          companyId,
+          agentId,
+          source: "assignment",
+          triggerDetail: "system",
+          reason: "issue_assigned",
+          payload: { issueId: row.issueId },
+          status: "queued",
+          runId: row.runId,
+          requestedAt: row.createdAt,
+          updatedAt: row.createdAt,
+        });
+        await db.insert(heartbeatRuns).values({
+          id: row.runId,
+          companyId,
+          agentId,
+          invocationSource: "assignment",
+          triggerDetail: "system",
+          status: "queued",
+          wakeupRequestId: wakeId,
+          contextSnapshot: {
+            issueId: row.issueId,
+            taskId: row.issueId,
+            wakeReason: "issue_assigned",
+          },
+          createdAt: row.createdAt,
+          updatedAt: row.createdAt,
+        });
+      }
+
+      const dispatchedRunIds: string[] = [];
+      // Hold the FIRST dispatched run open. Completions are what re-trigger
+      // dispatch, so this pins the queue at exactly one elapsed pass and lets
+      // the test control what the clock reads when the second one runs.
+      let releaseFirstRun: (() => void) | null = null;
+      let announceFirstDispatch: (() => void) | null = null;
+      const firstRunGate = new Promise<void>((resolve) => { releaseFirstRun = resolve; });
+      const firstDispatch = new Promise<void>((resolve) => { announceFirstDispatch = resolve; });
+      mockAdapterExecute.mockImplementation(async (args: { runId: string }) => {
+        dispatchedRunIds.push(args.runId);
+        if (dispatchedRunIds.length === 1) {
+          announceFirstDispatch?.();
+          await firstRunGate;
+        }
+        return {
+          exitCode: 0,
+          signal: null as string | null,
+          timedOut: false,
+          errorMessage: null as string | null,
+          resultJson: { exitCode: 0 },
+          provider: "test",
+          model: "test-model",
+        };
+      });
+
+      await boundedHeartbeat.resumeQueuedRuns();
+      await firstDispatch;
+
+      // Precondition, not the assertion under test: pass 1 must have ranked
+      // nearFloor at 2 and given the slot to critical work. If this fails the
+      // row crossed the floor too early and the geometry never formed.
+      expect(dispatchedRunIds[0]).toBe(runIdByKey.get("freshCriticalA"));
+
+      // Cross the floor while nearFloor sits behind the stored resume cursor.
+      // Absolute deadline rather than a fixed sleep, so however long pass 1
+      // took, the row is unambiguously past six hours before the next pass.
+      const crossedAt = nearFloorCreatedAt.getTime() + SIX_HOURS_MS + 500;
+      while (Date.now() < crossedAt) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      releaseFirstRun?.();
+
+      const watched = ["nearFloor", "freshCriticalB"].map((key) => runIdByKey.get(key)!);
+      const deadline = Date.now() + 60_000;
+      while (
+        Date.now() < deadline
+        && !watched.every((runId) => dispatchedRunIds.includes(runId))
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      await boundedHeartbeat.drainInFlightExecutions(60_000);
+
+      const orderOf = (key: string) => dispatchedRunIds.indexOf(runIdByKey.get(key)!);
+      expect(orderOf("nearFloor")).toBeGreaterThanOrEqual(0);
+      expect(orderOf("freshCriticalB")).toBeGreaterThanOrEqual(0);
+      // The regression: having crossed the floor behind the cursor, nearFloor
+      // must still beat critical work the lanes pull in from beyond it.
+      expect(orderOf("nearFloor")).toBeLessThan(orderOf("freshCriticalB"));
+
+      const settled = await db
+        .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(inArray(heartbeatRuns.id, watched));
+      expect(settled.every((row) => row.status !== "queued")).toBe(true);
+    } finally {
+      await boundedHeartbeat.drainInFlightExecutions(60_000);
+    }
+  }, 180_000);
+
   it("dispatches critical issue work before an aged issue-less run without starving routine issue work (BLO-19337)", async () => {
     // Regression for BLO-18995: dispatchRank returned a flat `10` for any run
     // without an issueId *above* the STARVATION_* aging escalation, so that
