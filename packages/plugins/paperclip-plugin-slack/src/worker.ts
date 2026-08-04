@@ -1116,6 +1116,52 @@ const plugin = definePlugin({
         costs,
       );
     });
+    // Collect watchable events before the bootstrap credential gate below.
+    // Workers start with an empty bootstrap config, so registering these
+    // producers after that gate leaves check-watches permanently starved even
+    // though the scheduled consumer itself is registered and resolves company
+    // credentials at tick time (BLO-20959).
+    const watchableEvents = [
+      "issue.created",
+      "issue.updated",
+      "agent.run.failed",
+      "agent.run.finished",
+      "agent.status_changed",
+      "cost_event.created",
+      "approval.created",
+      "issue.thread_interaction.created",
+    ] as const;
+    for (const eventType of watchableEvents) {
+      ctx.events.on(eventType, async (event) => {
+        const recentEventsRaw = await ctx.state.get({
+          scopeKind: "company",
+          scopeId: event.companyId,
+          stateKey: "recent-watch-events",
+        });
+        const recentEvents = Array.isArray(recentEventsRaw)
+          ? (recentEventsRaw as Array<{
+              eventType: string;
+              payload: Record<string, unknown>;
+            }>)
+          : [];
+        // Keep last 100 events
+        recentEvents.push({
+          eventType: event.eventType,
+          payload: event.payload as Record<string, unknown>,
+        });
+        if (recentEvents.length > 100) {
+          recentEvents.splice(0, recentEvents.length - 100);
+        }
+        await ctx.state.set(
+          {
+            scopeKind: "company",
+            scopeId: event.companyId,
+            stateKey: "recent-watch-events",
+          },
+          recentEvents,
+        );
+      });
+    }
     // Escalation timeout job
     ctx.jobs.register("check-escalation-timeouts", async () => {
       const companies = await listTargetCompanies(ctx);
@@ -2027,48 +2073,6 @@ const plugin = definePlugin({
         );
       }
     });
-    // Collect events for watch checking (Phase 5)
-    const watchableEvents = [
-      "issue.created",
-      "issue.updated",
-      "agent.run.failed",
-      "agent.run.finished",
-      "agent.status_changed",
-      "cost_event.created",
-      "approval.created",
-      "issue.thread_interaction.created",
-    ] as const;
-    for (const eventType of watchableEvents) {
-      ctx.events.on(eventType, async (event) => {
-        const recentEventsRaw = await ctx.state.get({
-          scopeKind: "company",
-          scopeId: event.companyId,
-          stateKey: "recent-watch-events",
-        });
-        const recentEvents = Array.isArray(recentEventsRaw)
-          ? (recentEventsRaw as Array<{
-              eventType: string;
-              payload: Record<string, unknown>;
-            }>)
-          : [];
-        // Keep last 100 events
-        recentEvents.push({
-          eventType: event.eventType,
-          payload: event.payload as Record<string, unknown>,
-        });
-        if (recentEvents.length > 100) {
-          recentEvents.splice(0, recentEvents.length - 100);
-        }
-        await ctx.state.set(
-          {
-            scopeKind: "company",
-            scopeId: event.companyId,
-            stateKey: "recent-watch-events",
-          },
-          recentEvents,
-        );
-      });
-    }
     slackAdapter = new SlackAdapter(ctx, token);
 
     // Expose paperclip-user → slack-user mapping to this plugin's UI via

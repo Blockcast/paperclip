@@ -25,7 +25,15 @@ interface MkCtxOptions {
   companies?: Array<{ id: string }>;
   /** Secret resolution behaviour, keyed by ref. */
   secrets?: Record<string, string | Error>;
+  /** Initial plugin state, keyed as scopeKind:scopeId:stateKey. */
+  state?: Record<string, unknown>;
 }
+
+const stateId = (key: {
+  scopeKind: string;
+  scopeId: string;
+  stateKey: string;
+}) => `${key.scopeKind}:${key.scopeId}:${key.stateKey}`;
 
 const mkCtx = (options: MkCtxOptions = {}) => {
   const {
@@ -33,7 +41,9 @@ const mkCtx = (options: MkCtxOptions = {}) => {
     companyConfigs = {},
     companies = [],
     secrets = {},
+    state = {},
   } = options;
+  const storedState = new Map(Object.entries(state));
   const registeredJobs = new Map<string, (...args: unknown[]) => unknown>();
   const eventHandlers = new Map<string, (...args: unknown[]) => unknown>();
   const ctx: any = {
@@ -61,9 +71,29 @@ const mkCtx = (options: MkCtxOptions = {}) => {
         eventHandlers.set(eventType, fn);
       }),
     },
-    state: { get: vi.fn(async () => null), set: vi.fn(), delete: vi.fn() },
+    state: {
+      get: vi.fn(async (key: Parameters<typeof stateId>[0]) =>
+        storedState.get(stateId(key)) ?? null,
+      ),
+      set: vi.fn(async (key: Parameters<typeof stateId>[0], value: unknown) => {
+        storedState.set(stateId(key), value);
+      }),
+      delete: vi.fn(async (key: Parameters<typeof stateId>[0]) => {
+        storedState.delete(stateId(key));
+      }),
+    },
     issues: { list: vi.fn(async () => []) },
-    agents: { list: vi.fn(async () => []) },
+    agents: {
+      list: vi.fn(async () => []),
+      invoke: vi.fn(async () => ({ runId: "run-1" })),
+    },
+    http: {
+      fetch: vi.fn(async () => ({
+        status: 200,
+        headers: new Headers(),
+        json: async () => ({ ok: true, ts: "123.456" }),
+      })),
+    },
     metrics: { write: vi.fn() },
     tools: { register: vi.fn() },
     logger: {
@@ -73,7 +103,7 @@ const mkCtx = (options: MkCtxOptions = {}) => {
       debug: vi.fn(),
     },
   };
-  return { ctx, registeredJobs, eventHandlers };
+  return { ctx, registeredJobs, eventHandlers, storedState };
 };
 
 describe("worker setup() job registration (BLO-20959)", () => {
@@ -140,6 +170,69 @@ describe("worker setup() job registration (BLO-20959)", () => {
         stateKey: "recent-watch-events",
       }),
     );
+  });
+
+  it("captures a watchable event on empty bootstrap and the scheduled job performs the watch action", async () => {
+    const companyConfigs: Record<string, Record<string, unknown>> = {};
+    const { ctx, registeredJobs, eventHandlers, storedState } = mkCtx({
+      bootstrapConfig: {},
+      companyConfigs,
+      companies: [{ id: "company-1" }],
+      secrets: { "slack-token-ref": "xoxb-real-token" },
+      state: {
+        "instance:global:global-watches-list": [
+          {
+            id: "watch-1",
+            companyId: "company-1",
+            eventPattern: "issue.created",
+            prompt: "Investigate ${event.payload.title}",
+            agentId: "agent-1",
+            channelId: "C123",
+            createdAt: "2026-08-04T00:00:00.000Z",
+            triggerCount: 0,
+          },
+        ],
+      },
+    });
+
+    await plugin.definition.setup(ctx);
+
+    const issueCreated = eventHandlers.get("issue.created");
+    expect(issueCreated).toBeTypeOf("function");
+    await issueCreated!({
+      eventType: "issue.created",
+      companyId: "company-1",
+      entityId: "issue-1",
+      payload: { title: "broken relay" },
+    });
+    expect(
+      storedState.get("company:company-1:recent-watch-events"),
+    ).toEqual([
+      {
+        eventType: "issue.created",
+        payload: { title: "broken relay" },
+      },
+    ]);
+
+    // Company credentials become available without restarting the worker.
+    companyConfigs["company-1"] = { slackTokenRef: "slack-token-ref" };
+    await registeredJobs.get("check-watches")!();
+
+    expect(ctx.agents.invoke).toHaveBeenCalledWith(
+      "agent-1",
+      "company-1",
+      expect.objectContaining({
+        prompt: "Investigate broken relay",
+        reason: "Proactive watch trigger: issue.created",
+      }),
+    );
+    expect(ctx.http.fetch).toHaveBeenCalledWith(
+      "https://slack.com/api/chat.postMessage",
+      expect.objectContaining({ method: "POST" }),
+    );
+    expect(
+      storedState.get("company:company-1:recent-watch-events"),
+    ).toEqual([]);
   });
 
   it("skips only the unconfigured company and still serves a configured one", async () => {
