@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { AGENT_ROLE_LABELS, acceptInviteSchema, createAgentSchema, updateAgentSchema } from "./index.js";
+import { HEARTBEAT_POLICY_MAX_CONCURRENT_MAX } from "./validators/agent.js";
 
 describe("dynamic adapter type validation schemas", () => {
   it("accepts external adapter types in create/update agent schemas", () => {
@@ -15,6 +16,38 @@ describe("dynamic adapter type validation schemas", () => {
         adapterType: "external_adapter",
       }).adapterType,
     ).toBe("external_adapter");
+  });
+
+  it("preserves the shared concurrency range for local and external adapters", () => {
+    const runtimeConfig = { heartbeat: { maxConcurrentRuns: 15 } };
+
+    expect(
+      createAgentSchema.parse({
+        name: "Concurrent Agent",
+        adapterType: "opencode_k8s",
+        runtimeConfig,
+      }).runtimeConfig,
+    ).toEqual(runtimeConfig);
+    expect(updateAgentSchema.parse({ runtimeConfig }).runtimeConfig).toEqual(runtimeConfig);
+    expect(createAgentSchema.parse({
+      name: "Local Concurrent Agent",
+      adapterType: "codex_local",
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: HEARTBEAT_POLICY_MAX_CONCURRENT_MAX } },
+    }).runtimeConfig).toEqual({
+      heartbeat: { maxConcurrentRuns: HEARTBEAT_POLICY_MAX_CONCURRENT_MAX },
+    });
+
+    const unsupported = {
+      runtimeConfig: {
+        heartbeat: { maxConcurrentRuns: HEARTBEAT_POLICY_MAX_CONCURRENT_MAX + 1 },
+      },
+    };
+    expect(createAgentSchema.safeParse({
+      name: "Over-cap Agent",
+      adapterType: "opencode_k8s",
+      ...unsupported,
+    }).success).toBe(false);
+    expect(updateAgentSchema.safeParse(unsupported).success).toBe(false);
   });
 
   it("still rejects blank adapter types", () => {

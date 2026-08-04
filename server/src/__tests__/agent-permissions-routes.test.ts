@@ -638,7 +638,7 @@ describe.sequential("agent permission routes", () => {
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 
-  it("preserves full heartbeat policy when patching only external concurrency fields", async () => {
+  it("passes external concurrency fields sparsely for locked-row merging", async () => {
     const existingHeartbeat = {
       enabled: true,
       cooldownSec: 30,
@@ -687,7 +687,6 @@ describe.sequential("agent permission routes", () => {
       expect.objectContaining({
         runtimeConfig: {
           heartbeat: {
-            ...existingHeartbeat,
             maxConcurrentRuns: 1,
             concurrencyEnabled: false,
           },
