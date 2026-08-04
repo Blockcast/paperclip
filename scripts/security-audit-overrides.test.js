@@ -60,7 +60,7 @@ async function main() {
       `lockfile resolved vulnerable fast-uri ${major}.${minor}.${patch}`,
     );
     assertIncludes(lockfile, "undici@6.27.0:", "lockfile");
-    assertIncludes(lockfile, "undici@7.28.0:", "lockfile");
+    assertIncludes(lockfile, "undici@7.29.0:", "lockfile");
     assertIncludes(lockfile, "multer@2.2.0:", "lockfile");
     assertIncludes(lockfile, "'@babel/core@7.29.7':", "lockfile");
     assertIncludes(lockfile, "esbuild@0.28.1:", "lockfile");
@@ -75,8 +75,8 @@ async function main() {
     );
     assert.match(
       lockfile,
-      /jsdom@28\.1\.0[\s\S]*?undici: 7\.28\.0/,
-      "jsdom must resolve undici 7.28.0",
+      /jsdom@28\.1\.0[\s\S]*?undici: 7\.29\.0/,
+      "jsdom must resolve undici 7.29.0",
     );
 
     const audit = await runPnpm(["audit", "--prod", "--json"], fixtureRoot, true);
