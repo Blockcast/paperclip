@@ -668,7 +668,6 @@ export function translateGithubSeatTokenForExecutionTarget(input: {
   runtimeConfig: Record<string, unknown>;
   executionTarget: AdapterExecutionTarget | null | undefined;
 }): Record<string, unknown> {
-  if (input.executionTarget?.kind !== "remote") return input.runtimeConfig;
   const env = parseObject(input.runtimeConfig.env);
   const rawSeatToken = env[GH_SEAT_TOKEN_ENV_KEY];
   if (typeof rawSeatToken !== "string") return input.runtimeConfig;
@@ -19956,6 +19955,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       ...effectiveResolvedConfig,
       paperclipRuntimeSkills: runtimeSkillEntries,
     };
+    runtimeConfig = translateGithubSeatTokenForExecutionTarget({
+      runtimeConfig,
+      executionTarget: null,
+    });
     const latestAgentConfigRevision = await getLatestAgentConfigRevision(agent.companyId, agent.id);
     const sessionConfigMetadata = await buildEffectiveRunSessionConfigMetadata({
       adapterType: agent.adapterType,
@@ -20484,10 +20487,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const workspaceRealization = realizationResult.workspaceRealization;
     const executionTarget = realizationResult.executionTarget;
     const remoteExecution = realizationResult.remoteExecution;
-    runtimeConfig = translateGithubSeatTokenForExecutionTarget({
-      runtimeConfig,
-      executionTarget,
-    });
     if (!executionTarget || executionTarget.kind === "local") {
       try {
         runScratch = await prepareHeartbeatRunScratch({
