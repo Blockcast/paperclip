@@ -5,6 +5,24 @@ import { test } from "node:test";
 
 const workflow = readFileSync(new URL("../../.github/workflows/pr.yml", import.meta.url), "utf8");
 
+test("PR verification runs for merge-queue heads with event-appropriate diff SHAs", () => {
+  assert.match(workflow, /\n  merge_group:\n    types:\n      - checks_requested\n/);
+  assert.match(
+    workflow,
+    /PR_BASE_SHA: \$\{\{ github\.event\.pull_request\.base\.sha \|\| github\.event\.merge_group\.base_sha \}\}/,
+  );
+  assert.match(
+    workflow,
+    /PR_HEAD_SHA: \$\{\{ github\.event\.pull_request\.head\.sha \|\| github\.event\.merge_group\.head_sha \}\}/,
+  );
+  assert.match(
+    workflow,
+    /if: >-\n          github\.event_name == 'pull_request' &&\n          github\.head_ref != 'chore\/refresh-lockfile'/,
+    "merge-group runs must not re-evaluate PR-only lockfile exemptions without author/branch metadata",
+  );
+  assert.match(workflow, /\n  verify:\n/);
+});
+
 // BLO-20867: extract the actual `run:` shell script from the `verify` job's
 // "Fail if any split verify lane failed" step so this test exercises the real
 // script, not a re-implementation of it.
@@ -31,6 +49,7 @@ function runVerifyStep(results) {
   const script = getVerifyLaneScript();
   const env = {
     ...process.env,
+    HELM_CHART_RESULT: results.helm_chart ?? "success",
     TYPECHECK_RELEASE_REGISTRY_RESULT: results.typecheck_release_registry ?? "success",
     GENERAL_TESTS_RESULT: results.general_tests ?? "success",
     WORKTREE_INSTALL_RESULT: results.worktree_install ?? "success",
@@ -64,6 +83,13 @@ test("verify step exits non-zero and annotates a real lane failure distinctly fr
   assert.match(result.stdout, /::error title=verify: lane failure::/);
   assert.match(result.stdout, /build/);
   assert.doesNotMatch(result.stdout, /::error title=verify: lane cancelled::/);
+});
+
+test("verify step treats Helm chart failure as a required lane failure", () => {
+  const result = runVerifyStep({ helm_chart: "failure" });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stdout, /::error title=verify: lane failure::/);
+  assert.match(result.stdout, /helm_chart/);
 });
 
 test("verify step annotates both a real failure and a cancellation when a run has both", () => {
