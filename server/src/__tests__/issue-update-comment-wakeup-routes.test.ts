@@ -165,7 +165,13 @@ function registerModuleMocks() {
   }));
 }
 
-async function createApp() {
+async function createApp(actor: Record<string, unknown> = {
+  type: "board",
+  userId: "local-board",
+  companyIds: ["company-1"],
+  source: "local_implicit",
+  isInstanceAdmin: false,
+}) {
   const [{ errorHandler }, { issueRoutes }] = await Promise.all([
     vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
     vi.importActual<typeof import("../routes/issues.js")>("../routes/issues.js"),
@@ -173,13 +179,7 @@ async function createApp() {
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
-    (req as any).actor = {
-      type: "board",
-      userId: "local-board",
-      companyIds: ["company-1"],
-      source: "local_implicit",
-      isInstanceAdmin: false,
-    };
+    (req as any).actor = actor;
     next();
   });
   app.use("/api", issueRoutes({} as any, {} as any));
@@ -656,5 +656,68 @@ describe("issue update comment wakeups", () => {
         }),
       }),
     );
+  });
+
+  it("does not wake a mentioned agent when an agent comment cannot grant reply access", async () => {
+    const existing = makeIssue({
+      assigneeAgentId: ASSIGNEE_AGENT_ID,
+      assigneeUserId: null,
+      status: "in_progress",
+    });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-non-assignee-mention",
+      issueId: existing.id,
+      companyId: existing.companyId,
+      body: `[@QA](agent://${MENTIONED_AGENT_ID}) please inspect this`,
+    });
+    mockIssueService.findMentionedAgents.mockResolvedValue([MENTIONED_AGENT_ID]);
+
+    const res = await request(await createApp({
+      type: "agent",
+      agentId: PREVIOUS_AGENT_ID,
+      companyId: existing.companyId,
+      source: "agent_key",
+    }))
+      .post(`/api/issues/${existing.id}/comments`)
+      .send({ body: `[@QA](agent://${MENTIONED_AGENT_ID}) please inspect this` });
+
+    expect(res.status).toBe(201);
+    await vi.waitFor(() => expect(mockIssueService.findMentionedAgents).toHaveBeenCalled());
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalledWith(
+      MENTIONED_AGENT_ID,
+      expect.objectContaining({ reason: "issue_comment_mentioned" }),
+    );
+  });
+
+  it("wakes a mentioned agent when the issue assignee grants reply access", async () => {
+    const existing = makeIssue({
+      assigneeAgentId: ASSIGNEE_AGENT_ID,
+      assigneeUserId: null,
+      status: "in_progress",
+    });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-assignee-mention",
+      issueId: existing.id,
+      companyId: existing.companyId,
+      body: `[@QA](agent://${MENTIONED_AGENT_ID}) please inspect this`,
+    });
+    mockIssueService.findMentionedAgents.mockResolvedValue([MENTIONED_AGENT_ID]);
+
+    const res = await request(await createApp({
+      type: "agent",
+      agentId: ASSIGNEE_AGENT_ID,
+      companyId: existing.companyId,
+      source: "agent_key",
+    }))
+      .post(`/api/issues/${existing.id}/comments`)
+      .send({ body: `[@QA](agent://${MENTIONED_AGENT_ID}) please inspect this` });
+
+    expect(res.status).toBe(201);
+    await vi.waitFor(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      MENTIONED_AGENT_ID,
+      expect.objectContaining({ reason: "issue_comment_mentioned" }),
+    ));
   });
 });
