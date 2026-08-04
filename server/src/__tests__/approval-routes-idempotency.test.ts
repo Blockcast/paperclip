@@ -30,6 +30,7 @@ const mockSecretService = vi.hoisted(() => ({
   normalizeHireApprovalPayloadForPersistence: vi.fn(),
 }));
 
+const mockDeferredActivityPublish = vi.hoisted(() => vi.fn());
 const mockLogActivity = vi.hoisted(() => vi.fn());
 const mockAccessService = vi.hoisted(() => ({
   decide: vi.fn(),
@@ -152,7 +153,9 @@ describe("approval routes idempotent retries", () => {
     mockIssueApprovalService.listIssuesForApproval.mockReset();
     mockIssueApprovalService.linkManyForApproval.mockReset();
     mockSecretService.normalizeHireApprovalPayloadForPersistence.mockReset();
+    mockDeferredActivityPublish.mockReset();
     mockLogActivity.mockReset();
+    mockLogActivity.mockResolvedValue(mockDeferredActivityPublish);
     mockAccessService.decide.mockReset();
     mockAccessService.decide.mockResolvedValue({
       allowed: true,
@@ -162,7 +165,6 @@ describe("approval routes idempotent retries", () => {
     });
     mockHeartbeatService.wakeup.mockResolvedValue({ id: "wake-1" });
     mockIssueApprovalService.listIssuesForApproval.mockResolvedValue([{ id: "issue-1" }]);
-    mockLogActivity.mockResolvedValue(undefined);
   });
 
   it("does not emit duplicate approval side effects when approve is already resolved", async () => {
@@ -412,7 +414,9 @@ describe("approval routes idempotent retries", () => {
           issueIds: ["00000000-0000-0000-0000-000000000001"],
         }),
       }),
+      { deferPublish: true },
     );
+    expect(mockDeferredActivityPublish).toHaveBeenCalledTimes(1);
   });
 
   it("carries the payload `note` into details as description (note alias)", async () => {
@@ -450,7 +454,9 @@ describe("approval routes idempotent retries", () => {
           description: "needs board sign-off",
         }),
       }),
+      { deferPublish: true },
     );
+    expect(mockDeferredActivityPublish).toHaveBeenCalledTimes(1);
   });
 
   // `requestedByAgentId` is an attribution signal other subsystems reason about, so an agent must
@@ -676,6 +682,106 @@ describe("approval routes idempotent retries", () => {
     );
     // A genuinely new filing still notifies.
     expect(mockLogActivity).toHaveBeenCalled();
+    expect(mockDeferredActivityPublish).toHaveBeenCalledTimes(1);
+  });
+
+  it("flushes approval.created only after the create transaction returns", async () => {
+    const approval = {
+      id: "approval-deferred",
+      companyId: "company-1",
+      type: "request_board_approval",
+      requestedByAgentId: "agent-1",
+      requestedByUserId: null,
+      status: "pending",
+      payload: { title: "Review production deploy" },
+      idempotencyKey: "deploy-review",
+      decisionNote: null,
+      decidedByUserId: null,
+      decidedAt: null,
+      createdAt: new Date("2026-08-02T00:00:00.000Z"),
+      updatedAt: new Date("2026-08-02T00:00:00.000Z"),
+    };
+    const publish = vi.fn();
+    mockLogActivity.mockResolvedValueOnce(publish);
+    mockApprovalService.createWithIdempotency.mockImplementationOnce(
+      async (
+        _companyId: string,
+        _data: Record<string, unknown>,
+        options?: { afterCreate?: (txDb: unknown, approval: Record<string, unknown>) => Promise<void> },
+      ) => {
+        await options?.afterCreate?.({ tx: true }, approval);
+        expect(publish).not.toHaveBeenCalled();
+        return { approval, deduplicated: false };
+      },
+    );
+
+    const res = await request(await createAgentApp())
+      .post("/api/companies/company-1/approvals")
+      .send({
+        type: "request_board_approval",
+        payload: { title: "Review production deploy" },
+        idempotencyKey: "deploy-review",
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      { tx: true },
+      expect.objectContaining({
+        action: "approval.created",
+        entityId: "approval-deferred",
+      }),
+      { deferPublish: true },
+    );
+    expect(publish).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not flush deferred approval.created when the create transaction rejects", async () => {
+    const approval = {
+      id: "approval-rolled-back",
+      companyId: "company-1",
+      type: "request_board_approval",
+      requestedByAgentId: "agent-1",
+      requestedByUserId: null,
+      status: "pending",
+      payload: { title: "Review production deploy" },
+      idempotencyKey: "deploy-review",
+      decisionNote: null,
+      decidedByUserId: null,
+      decidedAt: null,
+      createdAt: new Date("2026-08-02T00:00:00.000Z"),
+      updatedAt: new Date("2026-08-02T00:00:00.000Z"),
+    };
+    const publish = vi.fn();
+    mockLogActivity.mockResolvedValueOnce(publish);
+    mockApprovalService.createWithIdempotency.mockImplementationOnce(
+      async (
+        _companyId: string,
+        _data: Record<string, unknown>,
+        options?: { afterCreate?: (txDb: unknown, approval: Record<string, unknown>) => Promise<void> },
+      ) => {
+        await options?.afterCreate?.({ tx: true }, approval);
+        throw new Error("rollback after activity logging");
+      },
+    );
+
+    const res = await request(await createAgentApp())
+      .post("/api/companies/company-1/approvals")
+      .send({
+        type: "request_board_approval",
+        payload: { title: "Review production deploy" },
+        idempotencyKey: "deploy-review",
+      });
+
+    expect(res.status).toBe(500);
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      { tx: true },
+      expect.objectContaining({
+        action: "approval.created",
+        entityId: "approval-rolled-back",
+      }),
+      { deferPublish: true },
+    );
+    expect(publish).not.toHaveBeenCalled();
   });
 
   it("serves a count-only listing with every accepted filter", async () => {

@@ -650,7 +650,7 @@ export type ApprovalStatus = (typeof APPROVAL_STATUSES)[number];
  *   1. the create-side dedupe lookup (`approvalService.createWithIdempotency`),
  *   2. the partial unique indexes on `approvals.idempotency_key`,
  *   3. which approvals can still be resolved.
- * Migration `0208_approval_create_idempotency.sql` hardcodes this set in SQL — it is
+ * Migration `0210_approval_create_idempotency.sql` hardcodes this set in SQL — it is
  * frozen history and cannot import, so a change here needs a follow-up migration.
  */
 export const APPROVAL_UNDECIDED_STATUSES = ["pending", "revision_requested"] as const;
