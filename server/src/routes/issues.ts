@@ -117,6 +117,7 @@ import {
   documentService,
   documentAnnotationService,
   logActivity,
+  type ActivityPublish,
   projectService,
   routineService,
   workProductService,
@@ -4160,6 +4161,7 @@ export function issueRoutes(
   }
 
   async function hasRecentDeniedIssueWriteLog(input: {
+    executor: Pick<typeof db, "select">;
     issue: { id: string; companyId: string };
     actorId: string;
     runId: string | null;
@@ -4169,7 +4171,7 @@ export function issueRoutes(
     payloadFingerprint: string;
   }) {
     const windowStart = new Date(Date.now() - DENIED_ISSUE_WRITE_DEDUPE_WINDOW_MS);
-    const [existing] = await db
+    const [existing] = await input.executor
       .select({ entityId: activityLog.entityId })
       .from(activityLog)
       .where(and(
@@ -4243,13 +4245,15 @@ export function issueRoutes(
       const payloadFingerprint = deniedIssueWritePayloadFingerprint(payload);
       const runId = req.actor.runId ?? null;
 
-      // Best-effort fast path only. A failure here is safe to ignore: the
-      // aggregate bound below is transactional and still caps what an exact
-      // repeat could add, so the worst case is a duplicate row inside the cap
-      // rather than an unbounded write.
+      // Unlocked fast path: skips the lock entirely for the common case of an
+      // exact repeat that is already durably recorded. It is not the bound —
+      // concurrent identical attempts all miss here, so the authoritative
+      // re-check runs inside the lock below. A failure is safe to ignore
+      // because of that re-check.
       let recentDuplicate = false;
       try {
         recentDuplicate = await hasRecentDeniedIssueWriteLog({
+          executor: db,
           issue,
           actorId: actorAgentId,
           runId,
@@ -4293,6 +4297,14 @@ export function issueRoutes(
       // denial waits and then counts the row the winner just wrote. The lock is
       // per-actor-per-issue, so it never serializes unrelated traffic.
       //
+      // The exact-repeat dedupe is re-checked *inside* that lock as well. The
+      // unlocked probe above cannot bound anything on its own: identical
+      // concurrent attempts all miss it, then serialize here and each insert,
+      // so a burst of one repeated denial could consume the whole aggregate
+      // budget and suppress later distinct recovery evidence. Re-checking under
+      // the lock collapses the burst to a single row and leaves the remaining
+      // capacity for genuinely new evidence.
+      //
       // Fail closed: any throw in here aborts the transaction and records
       // nothing. This is optional recovery telemetry, so losing a record is
       // strictly preferable to keeping an unbounded payload from an actor that
@@ -4300,20 +4312,36 @@ export function issueRoutes(
       const aggregateLockKey =
         `paperclip:issue-write-denied:${issue.companyId}:${actorAgentId}:${issue.id}`;
       try {
-        await db.transaction(async (tx) => {
+        // The transaction hands the publisher back rather than firing it:
+        // `activity.logged` and the plugin outbox both escape the transaction,
+        // so emitting inline lets a consumer read the event before the row is
+        // visible, and turns a rolled-back transaction into an event for a
+        // record that does not exist.
+        const publishRecorded = await db.transaction(async (tx): Promise<ActivityPublish | null> => {
           await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${aggregateLockKey}, 0))`);
+          const alreadyRecorded = await hasRecentDeniedIssueWriteLog({
+            executor: tx,
+            issue,
+            actorId: actorAgentId,
+            runId,
+            action,
+            reason: denial.reason,
+            responseStatus: denial.responseStatus,
+            payloadFingerprint,
+          });
+          if (alreadyRecorded) return null;
           const recentActorIssueRecords = await countRecentDeniedIssueWriteLogsForActorIssue({
             executor: tx,
             issue,
             actorId: actorAgentId,
           });
-          if (recentActorIssueRecords >= DENIED_ISSUE_WRITE_AGGREGATE_MAX_RECORDS) return;
+          if (recentActorIssueRecords >= DENIED_ISSUE_WRITE_AGGREGATE_MAX_RECORDS) return null;
           // A drizzle transaction is structurally a `Db` minus `$client`, which
           // `logActivity` never touches (it only selects and inserts). Cast here
           // rather than widening `logActivity` to `Db | DbTransaction`: that
           // signature is shared with `instanceSettingsService` and every other
           // `logActivity` caller, and this fix has no business moving them.
-          await logActivity(tx as unknown as typeof db, {
+          return await logActivity(tx as unknown as typeof db, {
             companyId: issue.companyId,
             actorType: "agent",
             actorId: actorAgentId,
@@ -4324,8 +4352,19 @@ export function issueRoutes(
             entityId: issue.id,
             issueId: issue.id,
             details,
-          });
+          }, { deferPublish: true });
         });
+        // Reached only on commit; a rollback throws straight past this.
+        try {
+          publishRecorded?.();
+        } catch (err) {
+          // Distinct from the catch below: the record itself is committed and
+          // recoverable, only its notification failed.
+          logger.warn(
+            { err, issueId: issue.id, action, reason: denial.reason },
+            "BLO-18614: recorded denied issue write but failed to publish its activity event",
+          );
+        }
       } catch (err) {
         logger.warn(
           { err, issueId: issue.id, action, reason: denial.reason },

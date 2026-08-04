@@ -702,6 +702,10 @@ describe.sequential("issue comment reopen routes", () => {
           payload: expect.objectContaining({ body: "I should not be allowed." }),
         }),
       }),
+      // Publication must be deferred past commit: `activity.logged` escapes the
+      // transaction, so an inline emit would race row visibility and survive a
+      // rollback as a phantom event.
+      { deferPublish: true },
     );
     expect(mockLogActivity).toHaveBeenCalledWith(
       mockTx,
@@ -711,6 +715,10 @@ describe.sequential("issue comment reopen routes", () => {
         entityId: "11111111-1111-4111-8111-111111111111",
         details: expect.objectContaining({ attemptedAction: "issue:mutate" }),
       }),
+      // Publication must be deferred past commit: `activity.logged` escapes the
+      // transaction, so an inline emit would race row visibility and survive a
+      // rollback as a phantom event.
+      { deferPublish: true },
     );
   });
 
@@ -783,7 +791,8 @@ describe.sequential("issue comment reopen routes", () => {
       explanation: "Peer agent is outside this low-trust boundary.",
     }));
     mockDbSelectLimit
-      // First request: exact-dedupe miss, then aggregate-count under the cap.
+      // First request: unlocked probe misses, the in-lock re-check misses too,
+      // then the aggregate count comes back under the cap.
       .mockImplementationOnce(() => ({
         then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
           Promise.resolve([]).then(onFulfilled, onRejected),
@@ -792,7 +801,12 @@ describe.sequential("issue comment reopen routes", () => {
         then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
           Promise.resolve([]).then(onFulfilled, onRejected),
       }))
-      // Second request: exact-dedupe hit, so aggregate-count is not queried.
+      .mockImplementationOnce(() => ({
+        then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+          Promise.resolve([]).then(onFulfilled, onRejected),
+      }))
+      // Second request: the unlocked probe hits, so it never takes the lock and
+      // neither the in-lock re-check nor the aggregate count is queried.
       .mockImplementationOnce(() => ({
         then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
           Promise.resolve([{ entityId: "11111111-1111-4111-8111-111111111111" }]).then(onFulfilled, onRejected),
@@ -1564,6 +1578,10 @@ describe.sequential("issue comment reopen routes", () => {
           quarantined: true,
         }),
       }),
+      // Publication must be deferred past commit: `activity.logged` escapes the
+      // transaction, so an inline emit would race row visibility and survive a
+      // rollback as a phantom event.
+      { deferPublish: true },
     );
   });
 
@@ -2165,6 +2183,10 @@ describe.sequential("issue comment reopen routes", () => {
           quarantined: true,
         }),
       }),
+      // Publication must be deferred past commit: `activity.logged` escapes the
+      // transaction, so an inline emit would race row visibility and survive a
+      // rollback as a phantom event.
+      { deferPublish: true },
     );
   });
 

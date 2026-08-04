@@ -1010,6 +1010,10 @@ describe("agent issue mutation checkout ownership", () => {
           quarantined: true,
         }),
       }),
+      // Publication must be deferred past commit: `activity.logged` escapes the
+      // transaction, so an inline emit would race row visibility and survive a
+      // rollback as a phantom event.
+      { deferPublish: true },
     );
   });
 
@@ -1202,6 +1206,10 @@ describe("agent issue mutation checkout ownership", () => {
             responseStatus: 403,
           }),
         }),
+        // Publication must be deferred past commit: `activity.logged` escapes the
+        // transaction, so an inline emit would race row visibility and survive a
+        // rollback as a phantom event.
+        { deferPublish: true },
       );
     }
   });
@@ -2559,6 +2567,10 @@ describe("agent issue mutation checkout ownership", () => {
           quarantined: true,
         }),
       }),
+      // Publication must be deferred past commit: `activity.logged` escapes the
+      // transaction, so an inline emit would race row visibility and survive a
+      // rollback as a phantom event.
+      { deferPublish: true },
     );
     const call = mockLogActivity.mock.calls.find(
       ([, entry]) => (entry as { action?: string }).action === "issue_write_denied"
@@ -3408,6 +3420,10 @@ describe("agent issue mutation checkout ownership", () => {
           }),
         }),
       }),
+      // Publication must be deferred past commit: `activity.logged` escapes the
+      // transaction, so an inline emit would race row visibility and survive a
+      // rollback as a phantom event.
+      { deferPublish: true },
     );
   });
 
