@@ -2814,7 +2814,7 @@ export function sanitizeRunLogChunkForStorage(
 const SYNTHETIC_KEEPALIVE_RUN_LOG_LINE_RE =
   /^\[paperclip\] keepalive\b.*\bjob\b.*\brunning \(\d+s since last output\)$/;
 const SYNTHETIC_REATTACH_RUN_LOG_LINE_RE =
-  /^(?:\[paperclip\]\s*)?reattach(?:ing|ed)\b.*\b(?:job|run)\b/i;
+  /^\[paperclip\] (?:Reattaching to orphaned Job \S+|Reattached to existing run \S+\.)$/;
 
 export function isSyntheticNonProgressRunLogChunk(chunk: string) {
   const lines = chunk
