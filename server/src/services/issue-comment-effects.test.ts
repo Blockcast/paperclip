@@ -9,9 +9,12 @@ import {
   getEffectResult,
   hasUnsettledEffects,
   listCommentsWithResumableEffects,
+  listSettledUnprocessedComments,
   listUnfinishedEffects,
   markCommentProcessedIfSettled,
+  processCommentEffects,
   releaseEffect,
+  renewEffectLease,
   resetLeaselessProcessing,
   MAX_EFFECT_ATTEMPTS,
 } from "./issue-comment-effects.js";
@@ -273,5 +276,121 @@ describeEmbeddedPostgres("issue comment effect ledger", () => {
       status: "processed",
       result: { addedReferencedIssues: ["BLO-1"] },
     });
+  }, 60_000);
+
+  it("renews a live claim so a slow-but-healthy worker is not reclaimed", async () => {
+    await seed();
+    await enqueueCommentEffects(db as never, { companyId, issueId, commentId, effects: intents });
+    const [effect] = await listUnfinishedEffects(db as never, commentId);
+    // Short lease so the sink legitimately outlives it.
+    const claimed = await claimEffect(db as never, effect.id, 40);
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    // Without renewal this row is now reclaimable even though its owner is alive.
+    expect(await renewEffectLease(db as never, effect.id, claimed!.claimToken!, 60_000)).toBe(true);
+    expect(await claimEffect(db as never, effect.id, 40)).toBeNull();
+    expect(await completeEffect(db as never, claimed!)).toBe(true);
+  }, 60_000);
+
+  it("tells a worker that lost its lease that completion did not land", async () => {
+    await seed();
+    await enqueueCommentEffects(db as never, { companyId, issueId, commentId, effects: intents });
+    const [effect] = await listUnfinishedEffects(db as never, commentId);
+    const original = await claimEffect(db as never, effect.id, 20);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    // The reconciler reclaims the expired row and becomes the real owner.
+    const reclaimer = await claimEffect(db as never, effect.id, 60_000);
+    expect(reclaimer).not.toBeNull();
+
+    // The original worker must learn it no longer owns the row rather than
+    // silently no-op'ing and walking on to later effects.
+    expect(await completeEffect(db as never, original!, { from: "stale" })).toBe(false);
+    expect(await renewEffectLease(db as never, effect.id, original!.claimToken!)).toBe(false);
+    expect(await releaseEffect(db as never, original!, new Error("stale"))).toBe(false);
+
+    const [row] = await db.select().from(issueCommentEffects).where(eq(issueCommentEffects.id, effect.id));
+    expect(row.status).toBe("processing");
+    expect(row.claimToken).toBe(reclaimer!.claimToken);
+    expect(row.result).toBeNull();
+  }, 60_000);
+
+  it("stops the pipeline on lost ownership instead of running later effects", async () => {
+    await seed();
+    await enqueueCommentEffects(db as never, { companyId, issueId, commentId, effects: intents });
+    const ordered = await listUnfinishedEffects(db as never, commentId);
+    const executed: string[] = [];
+
+    // The first sink outlives its lease and is reclaimed mid-flight. The loop
+    // must abandon the run at that point: continuing would execute
+    // comment_activity and wake alongside whoever now owns the first effect.
+    const settled = await processCommentEffects(
+      db as never,
+      commentId,
+      async (effect) => {
+        executed.push(effect.effectKind);
+        if (effect.effectKind === "references_sync") {
+          await new Promise((resolve) => setTimeout(resolve, 60));
+          await claimEffect(db as never, effect.id, 60_000);
+        }
+        return null;
+      },
+      20,
+    );
+
+    expect(settled).toBe(false);
+    expect(executed).toEqual(["references_sync"]);
+    const rows = await db.select().from(issueCommentEffects).where(eq(issueCommentEffects.commentId, commentId));
+    expect(rows.filter((row) => row.status === "processed")).toHaveLength(0);
+    const [comment] = await db.select().from(issueComments).where(eq(issueComments.id, commentId));
+    expect(comment.idempotencyProcessedAt).toBeNull();
+  }, 60_000);
+
+  it("settles a comment whose effects all finished under different owners", async () => {
+    await seed();
+    await enqueueCommentEffects(db as never, { companyId, issueId, commentId, effects: intents });
+    // Hand-off case: whoever completed the last effect was not the worker that
+    // would have run settlement, so idempotency_processed_at is still null while
+    // no row is left queued or lease-expired — invisible to the resumable query.
+    for (const effect of await listUnfinishedEffects(db as never, commentId)) {
+      const claimed = await claimEffect(db as never, effect.id);
+      await completeEffect(db as never, claimed!);
+    }
+    const [before] = await db.select().from(issueComments).where(eq(issueComments.id, commentId));
+    expect(before.idempotencyProcessedAt).toBeNull();
+    expect(await listCommentsWithResumableEffects(db as never, 10)).not.toContain(commentId);
+
+    // The settlement sweep is the only thing that can rescue it.
+    expect(await listSettledUnprocessedComments(db as never, 10)).toContain(commentId);
+    expect(await markCommentProcessedIfSettled(db as never, commentId)).toBe(true);
+    const [after] = await db.select().from(issueComments).where(eq(issueComments.id, commentId));
+    expect(after.idempotencyProcessedAt).not.toBeNull();
+    expect(await listSettledUnprocessedComments(db as never, 10)).not.toContain(commentId);
+  }, 60_000);
+
+  it("settles a comment whose effect exhausted its retries", async () => {
+    await seed();
+    await enqueueCommentEffects(db as never, { companyId, issueId, commentId, effects: intents });
+    const ordered = await listUnfinishedEffects(db as never, commentId);
+
+    // Burn one effect through every attempt so it parks `failed`.
+    for (let attempt = 0; attempt <= MAX_EFFECT_ATTEMPTS; attempt += 1) {
+      const claimed = await claimEffect(db as never, ordered[0].id);
+      if (!claimed) break;
+      await releaseEffect(db as never, claimed, new Error("poison"));
+    }
+    let [parked] = await db.select().from(issueCommentEffects).where(eq(issueCommentEffects.id, ordered[0].id));
+    expect(parked.status).toBe("failed");
+
+    // A parked effect is terminal and no query hands it out again. If it counted
+    // as outstanding, this comment could never settle and every replay would redo
+    // the whole pipeline forever.
+    for (const effect of ordered.slice(1)) {
+      const claimed = await claimEffect(db as never, effect.id);
+      await completeEffect(db as never, claimed!);
+    }
+    expect(await listCommentsWithResumableEffects(db as never, 10)).not.toContain(commentId);
+    expect(await markCommentProcessedIfSettled(db as never, commentId)).toBe(true);
+    const [comment] = await db.select().from(issueComments).where(eq(issueComments.id, commentId));
+    expect(comment.idempotencyProcessedAt).not.toBeNull();
   }, 60_000);
 });
