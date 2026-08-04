@@ -585,7 +585,8 @@ jobs:
             .kind == "Deployment" and
             .metadata.namespace == $namespace and
             .metadata.name == "paperclip-api" and
-            (.metadata.resourceVersion | type == "string" and length > 0) and
+            ((.metadata.resourceVersion == null) or
+              (.metadata.resourceVersion | type == "string" and length > 0)) and
             (.spec.template.spec.containers | all(.image == ("harbor.blockcast.net/paperclip/paperclip@" + $digest)))
           ' "${approved_server_plan}" >/dev/null
           echo "server_plan_path=${approved_server_plan}" >> "$GITHUB_OUTPUT"
@@ -617,39 +618,52 @@ jobs:
           [[ "${DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]
           echo "rolling out ${TAG}@${DIGEST} to ${NS}/${RELEASE}"
           reconcile_approved_api_plan() {
-            local live_json reconciled
-            live_json="$(kubectl -n "${NS}" get deployment paperclip-api -o json)"
+            local attempt live_json reconciled replace_err
             reconciled="$(mktemp "${RUNNER_TEMP}/paperclip-api-reconciled.XXXXXXXX.json")"
-            jq --slurpfile approved "${APPROVED_SERVER_PLAN}" '
-              def release_controlled_metadata_key:
-                startswith("app.kubernetes.io/") or
-                startswith("helm.sh/") or
-                startswith("meta.helm.sh/") or
-                startswith("paperclip.blockcast.net/");
-              . as $live |
-              $approved[0] as $plan |
-              ($live.metadata
-                | del(.managedFields, .uid, .creationTimestamp, .generation)) as $live_metadata |
-              $plan |
-              # Current live metadata wins for non-release fields (for example,
-              # a finalizer added after approval); controlled labels and
-              # annotations are rebuilt explicitly below from the plan.
-              .metadata = ($plan.metadata + $live_metadata) |
-              .metadata.labels = (
-                (($live.metadata.labels // {})
-                  | with_entries(select((.key | release_controlled_metadata_key) | not))) +
-                ($plan.metadata.labels // {})
-              ) |
-              .metadata.annotations = (
-                (($live.metadata.annotations // {})
-                  | with_entries(select((.key | release_controlled_metadata_key) | not))) +
-                ($plan.metadata.annotations // {})
-              ) |
-              if (.metadata.labels | length) == 0 then del(.metadata.labels) else . end |
-              if (.metadata.annotations | length) == 0 then del(.metadata.annotations) else . end |
-              .metadata.resourceVersion = $live.metadata.resourceVersion
-            ' <<<"${live_json}" > "${reconciled}"
-            kubectl -n "${NS}" replace -f "${reconciled}"
+            replace_err="$(mktemp "${RUNNER_TEMP}/paperclip-api-replace.XXXXXXXX.err")"
+            for attempt in $(seq 1 5); do
+              live_json="$(kubectl -n "${NS}" get deployment paperclip-api -o json)"
+              jq --slurpfile approved "${APPROVED_SERVER_PLAN}" '
+                def release_controlled_metadata_key:
+                  startswith("app.kubernetes.io/") or
+                  startswith("helm.sh/") or
+                  startswith("meta.helm.sh/") or
+                  startswith("paperclip.blockcast.net/");
+                . as $live |
+                $approved[0] as $plan |
+                ($live.metadata
+                  | del(.managedFields, .uid, .creationTimestamp, .generation)) as $live_metadata |
+                $plan |
+                # Current live metadata wins for non-release fields (for example,
+                # a finalizer added after approval); controlled labels and
+                # annotations are rebuilt explicitly below from the plan.
+                .metadata = ($plan.metadata + $live_metadata) |
+                .metadata.labels = (
+                  (($live.metadata.labels // {})
+                    | with_entries(select((.key | release_controlled_metadata_key) | not))) +
+                  ($plan.metadata.labels // {})
+                ) |
+                .metadata.annotations = (
+                  (($live.metadata.annotations // {})
+                    | with_entries(select((.key | release_controlled_metadata_key) | not))) +
+                  ($plan.metadata.annotations // {})
+                ) |
+                if (.metadata.labels | length) == 0 then del(.metadata.labels) else . end |
+                if (.metadata.annotations | length) == 0 then del(.metadata.annotations) else . end |
+                .metadata.resourceVersion = $live.metadata.resourceVersion
+              ' <<<"${live_json}" > "${reconciled}"
+              if kubectl -n "${NS}" replace -f "${reconciled}" 2>"${replace_err}"; then
+                return 0
+              fi
+              if ! grep -qiE 'conflict|object has been modified' "${replace_err}"; then
+                cat "${replace_err}" >&2
+                return 1
+              fi
+              sleep "${attempt}"
+            done
+            echo "Exact API reconciliation remained conflicted after 5 attempts" >&2
+            cat "${replace_err}" >&2
+            return 1
           }
 
           # Keep the pre-Helm phase side-effect-free so the API Deployment is not

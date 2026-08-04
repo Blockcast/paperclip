@@ -174,10 +174,27 @@ test("Docker deploy approves the exact stamped plan before Helm mutates producti
     "a marker-bearing Deployment must be reconciled before Helm failure is propagated",
   );
   assert.match(deployJob, /kubectl -n "\$\{NS\}" replace -f "\$\{reconciled\}"/);
+  assert.match(deployJob, /for attempt in \$\(seq 1 5\)/);
+  assert.match(deployJob, /grep -qiE 'conflict\|object has been modified'/);
+  assert.match(deployJob, /Exact API reconciliation remained conflicted after 5 attempts/);
   assert.match(deployJob, /with_entries\(select\(\(\.key \| release_controlled_metadata_key\) \| not\)\)/);
   assert.match(deployJob, /BEGIN CANONICAL_DEPLOYMENT_JQ/);
   assert.match(deployJob, /live_server_plan_sha256.*approved_server_plan_sha256/s);
   assert.match(deployJob, /\.spec\.template\.metadata\.annotations\["paperclip\.blockcast\.net\/approval-plan-sha256"\] == \$marker/);
+});
+
+test("Docker deploy accepts an approved create plan without resourceVersion", () => {
+  const deployJob = getDeployJobBlock();
+
+  assert.match(
+    deployJob,
+    /\(\(\.metadata\.resourceVersion == null\) or\s+\(\.metadata\.resourceVersion \| type == "string" and length > 0\)\)/,
+  );
+  assert.match(
+    deployJob,
+    /\.metadata\.resourceVersion = \$live\.metadata\.resourceVersion/,
+    "post-create reconciliation must bind the newly created live resourceVersion",
+  );
 });
 
 test("Docker deploy confines and cleans up the release-approver credential", () => {
