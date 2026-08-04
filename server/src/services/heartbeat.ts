@@ -329,6 +329,7 @@ import {
   type RuntimeStatusUpdate,
   type SessionCompactionPolicy,
 } from "@paperclipai/adapter-utils";
+import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import {
   readPaperclipSkillSyncPreference,
   UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
@@ -646,6 +647,9 @@ const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_WAKE_REASON = "execution_review_part
 const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_CAUSE = "execution_review_participant_recovery";
 const GITHUB_PR_WORKFLOW_SKILL_KEY = "paperclipai/bundled/software-development/github-pr-workflow";
 const GITHUB_PR_WORKFLOW_SKILL_SLUG = "github-pr-workflow";
+const GH_SEAT_TOKEN_ENV_KEY = "GH_SEAT_TOKEN_VALUE";
+const STANDARD_GITHUB_CREDENTIAL_ENV_KEYS = ["GH_TOKEN", "GITHUB_TOKEN"] as const;
+
 // GH_SEAT_TOKEN_VALUE is a first-class member of this contract, not an
 // afterthought: it is the *only* one of the three that can be delivered without
 // mounting a credential into every Job pod (BLO-18927). Omitting it meant an
@@ -655,7 +659,57 @@ const GITHUB_PR_WORKFLOW_SKILL_SLUG = "github-pr-workflow";
 // sensitive local adapters this preflight guards. Widening the accepted set is
 // safe: this gate asserts that *some* push credential is configured, it does
 // not authorize anything.
-export const PUSH_CAPABILITY_ENV_KEYS = ["GH_TOKEN", "GITHUB_TOKEN", "GH_SEAT_TOKEN_VALUE"] as const;
+export const PUSH_CAPABILITY_ENV_KEYS = [
+  ...STANDARD_GITHUB_CREDENTIAL_ENV_KEYS,
+  GH_SEAT_TOKEN_ENV_KEY,
+] as const;
+
+export function translateGithubSeatTokenForExecutionTarget(input: {
+  runtimeConfig: Record<string, unknown>;
+  executionTarget: AdapterExecutionTarget | null | undefined;
+}): Record<string, unknown> {
+  if (input.executionTarget?.kind !== "remote") return input.runtimeConfig;
+  const env = parseObject(input.runtimeConfig.env);
+  const rawSeatToken = env[GH_SEAT_TOKEN_ENV_KEY];
+  if (typeof rawSeatToken !== "string") return input.runtimeConfig;
+
+  const seatToken = rawSeatToken.trim();
+  if (!seatToken) {
+    throw new ConfigurationIncompleteFailure(
+      "configuration incomplete: GH_SEAT_TOKEN_VALUE is set but resolves to an empty GitHub credential.",
+      {
+        configurationIncomplete: {
+          reason: "github_seat_token_empty",
+          requiredEnvKeys: [...PUSH_CAPABILITY_ENV_KEYS],
+          requiredScopes: ["agent"],
+          missingBindings: [],
+        },
+      },
+    );
+  }
+  if (/\s/.test(seatToken)) {
+    throw new ConfigurationIncompleteFailure(
+      "configuration incomplete: GH_SEAT_TOKEN_VALUE contains embedded whitespace and cannot be translated safely.",
+      {
+        configurationIncomplete: {
+          reason: "github_seat_token_malformed",
+          requiredEnvKeys: [...PUSH_CAPABILITY_ENV_KEYS],
+          requiredScopes: ["agent"],
+          missingBindings: [],
+        },
+      },
+    );
+  }
+
+  return {
+    ...input.runtimeConfig,
+    env: {
+      ...env,
+      GH_TOKEN: seatToken,
+      GITHUB_TOKEN: seatToken,
+    },
+  };
+}
 // Keep this in sync with local adapters that require a git workspace before launch.
 const GIT_SENSITIVE_LOCAL_ADAPTER_TYPES = new Set([
   "claude_local",
@@ -1301,7 +1355,7 @@ function stripPaperclipRuntimeEnvFromAdapterConfig(config: Record<string, unknow
 //
 // Deliberately NOT folded into isPaperclipRuntimeEnvKey: that guard strips at
 // every scope including agent, which is precisely what this key must escape.
-const AGENT_SCOPE_ONLY_ENV_KEYS = new Set(["GH_SEAT_TOKEN_VALUE"]);
+const AGENT_SCOPE_ONLY_ENV_KEYS = new Set([GH_SEAT_TOKEN_ENV_KEY]);
 
 function isAgentScopeOnlyEnvKey(key: string) {
   return AGENT_SCOPE_ONLY_ENV_KEYS.has(key);
@@ -20430,6 +20484,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const workspaceRealization = realizationResult.workspaceRealization;
     const executionTarget = realizationResult.executionTarget;
     const remoteExecution = realizationResult.remoteExecution;
+    runtimeConfig = translateGithubSeatTokenForExecutionTarget({
+      runtimeConfig,
+      executionTarget,
+    });
     if (!executionTarget || executionTarget.kind === "local") {
       try {
         runScratch = await prepareHeartbeatRunScratch({
