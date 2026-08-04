@@ -175,7 +175,7 @@ import {
   isThrottleCandidateIssueRewake,
 } from "./issue-rewake-throttle.js";
 import { logActivity, publishPluginDomainEvent, type LogActivityInput } from "./activity-log.js";
-import { githubHasReviewerEvidenceForPr } from "./github-app-auth.js";
+import { githubGetPullRequestGate, githubHasReviewerEvidenceForPr } from "./github-app-auth.js";
 import { loadConfig } from "../config.js";
 import { enqueueGithubCommitStatusDelivery } from "./github-status-delivery-outbox.js";
 import {
@@ -2813,13 +2813,17 @@ export function sanitizeRunLogChunkForStorage(
 
 const SYNTHETIC_KEEPALIVE_RUN_LOG_LINE_RE =
   /^\[paperclip\] keepalive\b.*\bjob\b.*\brunning \(\d+s since last output\)$/;
+const SYNTHETIC_REATTACH_RUN_LOG_LINE_RE =
+  /^(?:\[paperclip\]\s*)?reattach(?:ing|ed)\b.*\b(?:job|run)\b/i;
 
 export function isSyntheticNonProgressRunLogChunk(chunk: string) {
   const lines = chunk
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter(Boolean);
-  return lines.length > 0 && lines.every((line) => SYNTHETIC_KEEPALIVE_RUN_LOG_LINE_RE.test(line));
+  return lines.length > 0 && lines.every((line) =>
+    SYNTHETIC_KEEPALIVE_RUN_LOG_LINE_RE.test(line) || SYNTHETIC_REATTACH_RUN_LOG_LINE_RE.test(line)
+  );
 }
 
 function normalizeHeartbeatIntervalSec(value: unknown, fallback: number) {
@@ -8614,7 +8618,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   });
   const workspaceOperationsSvc = workspaceOperationService(db);
   const reattachingExternalRuns = new Set<string>();
-  const externalRunReattachedAt = new Map<string, number>();
   // Tracks the promises spawned by `void executeRun(...)` calls in the
   // dispatcher (startNextQueuedRunForAgent) so tests can await
   // fire-and-forget chains before TRUNCATE-based cleanup. Without this
@@ -16129,7 +16132,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
     runningProcesses.delete(input.run.id);
     activeRunExecutions.delete(input.run.id);
-    externalRunReattachedAt.delete(input.run.id);
     await environmentsSvc.releaseLeasesForRun(
       input.run.id,
       terminalOutcome.status === "succeeded" ? "released" : "failed",
@@ -16154,22 +16156,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   function externalLifecycleRecentRefTime(
     run: Pick<
       typeof heartbeatRuns.$inferSelect,
-      "id" | "lastOutputAt" | "startedAt" | "createdAt" | "finishedAt"
+      "lastOutputAt" | "lastUsefulActionAt" | "startedAt" | "createdAt" | "finishedAt"
     >,
   ): number {
+    const liveProgressRef = runTimestampMs(run.lastUsefulActionAt) || runTimestampMs(run.lastOutputAt);
     return Math.max(
-      runTimestampMs(run.lastOutputAt),
+      liveProgressRef,
       runTimestampMs(run.finishedAt),
       runTimestampMs(run.startedAt),
       runTimestampMs(run.createdAt),
-      externalRunReattachedAt.get(run.id) ?? 0,
     );
   }
 
   function isExternalLifecycleRunInRecentGrace(
     run: Pick<
       typeof heartbeatRuns.$inferSelect,
-      "id" | "lastOutputAt" | "updatedAt" | "startedAt" | "createdAt" | "finishedAt"
+      "id" | "lastOutputAt" | "lastUsefulActionAt" | "updatedAt" | "startedAt" | "createdAt" | "finishedAt"
     >,
     now: Date,
     graceMs = EXTERNAL_LIFECYCLE_RECENT_RUN_GRACE_MS,
@@ -16629,9 +16631,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ? reconciled.job
         : await readAgentJobRunStatusByName(reservation.jobName);
       if (observed?.phase !== "active" || observed.uid !== reservation.jobUid) continue;
+      const prReview = derivePaperclipPrReview(parseObject(run.contextSnapshot));
+      if (prReview?.repoFullName) {
+        const gate = await githubGetPullRequestGate({
+          repoFullName: prReview.repoFullName,
+          prNumber: prReview.prNumber,
+        });
+        if (!("error" in gate) && gate.state === "closed") {
+          const reason = `External PR gate ${prReview.repoFullName}#${prReview.prNumber} is closed${gate.merged ? " and merged" : " without merge"}`;
+          await cancelRunInternal(run.id, reason, {
+            errorCode: "external_gate_terminal",
+            eventMessage: "external-lifecycle reattach skipped because external gate is terminal",
+            eventPayload: {
+              repoFullName: prReview.repoFullName,
+              prNumber: prReview.prNumber,
+              state: gate.state,
+              merged: gate.merged,
+            },
+          });
+          continue;
+        }
+      }
       resumed += 1;
       reattachingExternalRuns.add(run.id);
-      externalRunReattachedAt.set(run.id, Date.now());
       void executeRun(run.id)
         .catch((error) => {
           logger.error({ error, runId: run.id }, "failed to reattach external-runtime execution");
@@ -17023,17 +17045,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
       let confirmedMissingExternalJob = false;
       if (externalLifecycleRun && externalLifecycleStarted) {
-        const persistedSignalRef = run.lastUsefulActionAt
-          ? new Date(run.lastUsefulActionAt).getTime()
-          : run.lastOutputAt
-          ? new Date(run.lastOutputAt).getTime()
-          : run.startedAt
-          ? new Date(run.startedAt).getTime()
-          : 0;
-        const lastSignalRef = Math.max(
-          persistedSignalRef,
-          externalRunReattachedAt.get(run.id) ?? 0,
-        );
+        const lastSignalRef = externalLifecycleRecentRefTime(run);
         const isSilent = !lastSignalRef || now.getTime() - lastSignalRef >= EXTERNAL_LIFECYCLE_STALE_MS;
         // BLO-12996: a much longer floor that gates the *destructive* kill of a
         // still-active Job (vs. isSilent, which only gates non-destructive
@@ -20688,6 +20700,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .update(heartbeatRuns)
         .set({
           lastOutputAt: pendingOutputProgress.at,
+          lastUsefulActionAt: pendingOutputProgress.at,
           lastOutputSeq: pendingOutputProgress.seq,
           lastOutputStream: pendingOutputProgress.stream,
           lastOutputBytes: pendingOutputProgress.bytes,
@@ -22527,7 +22540,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             });
           }
           activeRunExecutions.delete(run.id);
-          externalRunReattachedAt.delete(run.id);
           // Skip dispatch when this run was cancelled. `cancelRunInternal`
           // already calls `startNextQueuedRunForAgent` when it cancels a run,
           // so the finally-block dispatch is a duplicate that races with the

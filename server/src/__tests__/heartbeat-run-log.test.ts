@@ -99,6 +99,13 @@ describe("isSyntheticNonProgressRunLogChunk", () => {
     ).toBe(true);
   });
 
+  it.each([
+    "[paperclip] Reattaching to orphaned Job agent-opencode-123\n",
+    "[paperclip] Reattached to existing run run-123.\n",
+  ])("recognizes external-runtime reattach output as synthetic", (chunk) => {
+    expect(isSyntheticNonProgressRunLogChunk(chunk)).toBe(true);
+  });
+
   it("does not classify real output as synthetic keepalive", () => {
     expect(isSyntheticNonProgressRunLogChunk("[paperclip] Starting workspace restore\n")).toBe(false);
     expect(
