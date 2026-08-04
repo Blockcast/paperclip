@@ -1434,6 +1434,59 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
         ]),
       );
     });
+
+    it("reaps a queued execution owner behind a terminal checkout owner on todo checkout", async () => {
+      const { companyId, agentId, failedRunId, currentRunId } = await seedCompanyAgentAndRuns();
+      const queuedExecutionRunId = await seedNeverStartedOwnerRun({
+        companyId,
+        agentId,
+        status: "queued",
+      });
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Terminal checkout with divergent queued execution owner",
+        status: "todo",
+        priority: "high",
+        assigneeAgentId: agentId,
+        checkoutRunId: failedRunId,
+        executionRunId: queuedExecutionRunId,
+        executionAgentNameKey: "codexcoder",
+        executionLockedAt: new Date(),
+      });
+
+      const response = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+        .post(`/api/issues/${issueId}/checkout`)
+        .send({ agentId, expectedStatuses: ["todo"] });
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+      expect(response.body).toMatchObject({
+        status: "in_progress",
+        checkoutRunId: currentRunId,
+        executionRunId: currentRunId,
+      });
+
+      const owners = await db
+        .select({
+          id: heartbeatRuns.id,
+          status: heartbeatRuns.status,
+          errorCode: heartbeatRuns.errorCode,
+        })
+        .from(heartbeatRuns)
+        .where(inArray(heartbeatRuns.id, [failedRunId, queuedExecutionRunId]));
+      expect(new Map(owners.map((owner) => [owner.id, {
+        status: owner.status,
+        errorCode: owner.errorCode,
+      }]))).toEqual(
+        new Map([
+          [failedRunId, { status: "failed", errorCode: null }],
+          [queuedExecutionRunId, {
+            status: "cancelled",
+            errorCode: "issue_execution_lock_reaped",
+          }],
+        ]),
+      );
+    });
   });
 
   it("allows only one concurrent decision from a participant whose assignee drifted", async () => {
