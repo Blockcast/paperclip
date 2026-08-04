@@ -17,6 +17,7 @@ import {
   issueExecutionDecisions,
   issueReadStates,
   issues,
+  pluginEventOutbox,
   routines,
 } from "@paperclipai/db";
 import {
@@ -48,6 +49,12 @@ describeEmbeddedPostgres("cleanup removal services", () => {
   afterEach(async () => {
     await db.delete(heartbeatRunEvents);
     await db.delete(activityLog);
+    // Withdrawal enqueues its plugin event through the caller's transaction, so
+    // these fixtures now leave real outbox rows behind. This teardown deletes
+    // tables directly rather than going through companyService.remove, which
+    // does purge the outbox (companies.ts) -- so it has to purge it too, or the
+    // company delete below trips the outbox FK.
+    await db.delete(pluginEventOutbox);
     await db.delete(issueReadStates);
     await db.delete(issueComments);
     await db.delete(issueExecutionDecisions);

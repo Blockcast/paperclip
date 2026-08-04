@@ -91,6 +91,32 @@ export function publishPluginDomainEvent(event: PluginEvent): void {
     );
 }
 
+/**
+ * Enqueue through the caller's own db handle -- typically an open transaction --
+ * and await it, so the outbox row commits or rolls back with the state change
+ * that produced it.
+ *
+ * `publishPluginDomainEvent` above writes through the module-global `_outboxDb`,
+ * a different connection from any caller transaction. That is fine for the
+ * common non-transactional caller, but inside a transaction it means the event
+ * commits independently: if the transaction then fails, the state change is
+ * undone while plugins have already been told it happened. For a terminal
+ * approval transition that phantom is durable and drives every plugin mirror.
+ *
+ * The tradeoff is deliberate: unlike the fire-and-forget path, a failed insert
+ * here fails the caller's transaction rather than being swallowed. That is the
+ * point -- we would rather refuse the withdrawal than report one that did not
+ * happen.
+ */
+async function enqueuePluginDomainEventAtomically(db: Db, event: PluginEvent): Promise<void> {
+  await db.insert(pluginEventOutbox).values({
+    eventId: event.eventId,
+    companyId: event.companyId,
+    eventType: event.eventType,
+    payload: event as unknown as Record<string, unknown>,
+  });
+}
+
 export interface LogActivityInput {
   companyId: string;
   actorType: "agent" | "user" | "system" | "plugin";
@@ -112,6 +138,16 @@ export interface LogActivityInput {
    * applied; the key-based secret scrubber is not (see logActivity for why).
    */
   pluginEventPayloadExtra?: Record<string, unknown> | null;
+  /**
+   * Enqueue the plugin domain event through the `db` handle passed to
+   * logActivity instead of the module-global outbox connection, and await it.
+   *
+   * Set this when calling logActivity inside a transaction whose rollback must
+   * also retract the plugin event -- otherwise the event commits independently
+   * and survives the rollback. See enqueuePluginDomainEventAtomically for the
+   * failure-semantics tradeoff this accepts.
+   */
+  atomicPluginEvent?: boolean;
 }
 
 function readNonEmptyString(value: unknown) {
@@ -244,6 +280,10 @@ export async function logActivity(db: Db, input: LogActivityInput) {
         responsibleUserId,
       },
     };
-    publishPluginDomainEvent(event);
+    if (input.atomicPluginEvent) {
+      await enqueuePluginDomainEventAtomically(db, event);
+    } else {
+      publishPluginDomainEvent(event);
+    }
   }
 }

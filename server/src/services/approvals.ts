@@ -426,6 +426,12 @@ export function approvalService(db: Db) {
           entityType: "approval",
           entityId: updated.id,
           details: { type: updated.type, reason },
+          // This transaction has already terminated the linked agent by the time
+          // we get here. If the commit then fails, the default fire-and-forget
+          // outbox write would still have told every plugin the approval was
+          // decided -- a durable phantom for an approval that is in fact still
+          // pending. Bind the event to this transaction so it retracts too.
+          atomicPluginEvent: true,
         });
 
         return updated;
