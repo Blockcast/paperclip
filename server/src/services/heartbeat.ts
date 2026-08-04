@@ -18707,6 +18707,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   const dispatchCriticalLaneHeadRescanDemandByAgent = new Set<string>();
   const dispatchRecoveryLaneCursorByAgent = new Map<string, DispatchCursor>();
   const dispatchRecoveryLaneHeadRescanDemandByAgent = new Set<string>();
+  // BLO-21792 (third review follow-up). Same idiom as the two lane cursors
+  // above: preserved when a pass pages the absolute-starvation lane without
+  // reaching a dependency-ready row, deleted once the lane exhausts so the
+  // next pass restarts from its head. Without it the lane re-reads the same
+  // oldest page forever, and a page of dependency-blocked aged rows masks
+  // every aged row behind it — see the lane itself for the full argument.
+  const dispatchAbsoluteLaneCursorByAgent = new Map<string, DispatchCursor>();
   const dispatchDeferredRunIdsByAgent = new Map<string, Set<string>>();
   const dispatchResumeCapRetryTimersByAgent = new Map<string, ReturnType<typeof setTimeout>>();
   const dispatchAdmissionRetryTimersByAgent = new Map<string, ReturnType<typeof setTimeout>>();
@@ -19383,7 +19390,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (!foundReadyRecovery) return [];
       }
 
-      // Lane C — absolute starvation floor. BLO-21792 (second review follow-up).
+      // Lane C — absolute starvation floor. BLO-21792 (second and third review
+      // follow-ups).
       //
       // Lanes A and B restart from their own head every pass, so an emergency
       // row is found however far the main scan's resume cursor has advanced.
@@ -19410,6 +19418,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // here), which is why that bookkeeping is gone rather than kept alongside:
       // one invariant, one mechanism, nothing to drift out of agreement.
       //
+      // The lane must also PAGE, and preserve its keyset cursor across passes,
+      // or a dependency-blocked prefix that never drains masks every aged row
+      // behind it — see the third-follow-up argument on the paging loop below.
+      //
       // Cost in a healthy queue is one indexed range probe over the same
       // (agent_id, status, created_at) dispatch index the other lanes use,
       // returning zero rows — the predicate matches nothing until something has
@@ -19419,46 +19431,78 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const absoluteFloorCutoff = new Date(
           dispatchNow.getTime() - STARVATION_ABSOLUTE_ESCALATION_MS,
         );
-        // ONE batch, deliberately — this lane does not page the way lanes A and
-        // B do, and the difference is load-bearing rather than a shortcut.
+        // This lane PAGES, exactly as lanes A and B do, and for exactly their
+        // reason. BLO-21792 (third review follow-up).
         //
-        // Those lanes hunt for a specific row (the runnable critical/recovery
-        // one) that can hide behind any number of blocked rows, so LIMIT cannot
-        // be their final boundary. This lane wants the OLDEST aged rows, and a
-        // single keyset-ordered page is exactly that — there is nothing better
-        // further in. It also only needs enough of them to fill the free slots.
+        // The previous revision read a single page and argued the page was
+        // guaranteed to drain, because "blocked rows are carried into the
+        // candidate pool where the claim gate cancels them". That was wrong.
+        // The claim loop breaks the moment `claimedRuns.length >= availableSlots`
+        // (see the `break` in the claim loop below), and a dependency-blocked
+        // row ranks `12 + priorityRank` — below every runnable row, so it sorts
+        // AFTER fresh critical work and the loop never reaches it. Under
+        // sustained critical arrivals it is therefore never examined, never
+        // cancelled, and never drains. It stays queued and keeps occupying this
+        // lane's oldest page forever, masking every aged row behind it — so a
+        // ready aged row at position `queuedRunDispatchScanLimit + 1`, already
+        // behind the main cursor, is invisible to every pass and its wait is
+        // unbounded again. Same guarantee, third leak: readiness is not
+        // indexed, so LIMIT cannot be this lane's final boundary either.
         //
-        // Paging to queuedRunDispatchMaxScanBatches instead would re-read up to
-        // 200 * 10 = 2,000 rows from head on EVERY pass for an agent carrying a
-        // deep aged backlog, which is precisely the BLO-21116 population this
-        // ticket serves — turning a fix for those agents into a per-pass cost
-        // regression for them. One page caps the addition at the size of a
-        // single main-scan batch.
+        // Paging past ineligible rows and preserving the keyset cursor across
+        // passes is what lanes A and B already do about identically-shaped
+        // masking, so this reuses that mechanism rather than adding a fourth.
+        // The cost objection that motivated the single page still holds and is
+        // still respected: in a healthy queue the predicate matches nothing and
+        // this is one indexed range probe returning zero rows, and the loop
+        // stops at the FIRST batch containing a dependency-ready row, so the
+        // deep-backlog agents this ticket serves pay for extra pages only while
+        // their aged head is genuinely unclaimable — precisely when the extra
+        // pages are what unblocks them.
         //
-        // Bounding this way cannot strand a ready aged row behind a page of
-        // blocked ones: the blocked rows are carried into the candidate pool
-        // where the claim gate cancels them (and terminal ones are pruned), so
-        // the head drains across passes, and the cursored main scan reaches
-        // anything behind them meanwhile. The lane is additive insurance for
-        // the cursor's blind spot, not the only path to these rows.
-        const batch: DispatchRun[] = await db
-          .select(dispatchRunSelection)
-          .from(heartbeatRuns)
-          .where(and(
-            eq(heartbeatRuns.agentId, agentId),
-            sql`${heartbeatRuns.status} = 'queued'`,
-            cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined,
-            // Mirrors `waitedMs >= STARVATION_ABSOLUTE_ESCALATION_MS` in
-            // dispatchRank, against the same `dispatchNow`, so the lane and the
-            // rank can never disagree about which rows are absolute.
-            lte(heartbeatRuns.createdAt, absoluteFloorCutoff),
-            deferredRunIds?.size
-              ? notInArray(heartbeatRuns.id, [...deferredRunIds])
-              : undefined,
-          ))
-          .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
-          .limit(queuedRunDispatchScanLimit);
-        if (batch.length > 0) {
+        // Unlike lanes A and B this does NOT abort the pass to continue in a
+        // detached one. Those lanes preempt because an unfound emergency row
+        // must not lose a slot to routine work. An aged row has already waited
+        // six hours; correctness here needs only that the lane keeps making
+        // forward progress across passes, not that it wins this one.
+        let absoluteLaneCursor = dispatchAbsoluteLaneCursorByAgent.get(agentId) ?? null;
+        let absoluteLaneExhausted = false;
+        let foundReadyAbsolute = false;
+        let absoluteLaneBatches = 0;
+        while (absoluteLaneBatches < queuedRunDispatchMaxScanBatches) {
+          absoluteLaneBatches += 1;
+          const batch: DispatchRun[] = await db
+            .select(dispatchRunSelection)
+            .from(heartbeatRuns)
+            .where(and(
+              eq(heartbeatRuns.agentId, agentId),
+              sql`${heartbeatRuns.status} = 'queued'`,
+              cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined,
+              // Mirrors `waitedMs >= STARVATION_ABSOLUTE_ESCALATION_MS` in
+              // dispatchRank, against the same `dispatchNow`, so the lane and the
+              // rank can never disagree about which rows are absolute.
+              lte(heartbeatRuns.createdAt, absoluteFloorCutoff),
+              absoluteLaneCursor
+                ? sql`(${heartbeatRuns.createdAt}, ${heartbeatRuns.id}) > (${absoluteLaneCursor.createdAt}::timestamptz, ${absoluteLaneCursor.id}::uuid)`
+                : undefined,
+              deferredRunIds?.size
+                ? notInArray(heartbeatRuns.id, [...deferredRunIds])
+                : undefined,
+            ))
+            .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
+            .limit(queuedRunDispatchScanLimit);
+          if (batch.length === 0) {
+            absoluteLaneExhausted = true;
+            break;
+          }
+
+          const lastAbsolute = batch[batch.length - 1]!;
+          absoluteLaneCursor = {
+            createdAt: lastAbsolute.dispatchCreatedAtCursor,
+            id: lastAbsolute.id,
+          };
+          if (batch.length < queuedRunDispatchScanLimit) absoluteLaneExhausted = true;
+
           const batchIssueIds = [...new Set(
             batch
               .map((run) => readNonEmptyString(parseObject(run.contextSnapshot).issueId))
@@ -19475,6 +19519,40 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             for (const issueRow of issueRows) issueById.set(issueRow.id, issueRow);
           }
           absoluteStarvationLaneRows.push(...batch);
+
+          const batchReadiness = await listQueuedRunDependencyReadiness(agent.companyId, batch);
+          for (const [issueId, readiness] of batchReadiness) dependencyReadiness.set(issueId, readiness);
+          // "Eligible" must mean the same thing the claim loop means, or the
+          // lane stops paging on a row that will not in fact be claimed and the
+          // masking survives in a narrower form. A row counts only if it has a
+          // live issue, is dependency-ready, and is not an isolation retry still
+          // waiting on its timestamp — the same three screens the claim path
+          // applies, matching how lane A defines `foundReadyCritical`.
+          foundReadyAbsolute = batch.some((run) => {
+            const snapshot = parseObject(run.contextSnapshot);
+            const issueId = readNonEmptyString(snapshot.issueId);
+            if (!issueId) return false;
+            const issue = issueById.get(issueId);
+            if (!issue || TERMINAL_ISSUE_STATUSES.has(issue.status)) return false;
+            return Boolean(
+              (batchReadiness.get(issueId)?.isDependencyReady ?? true)
+              && !isK8sIsolationRetryDeferred(snapshot, dispatchNow)
+            );
+          });
+          if (foundReadyAbsolute || absoluteLaneExhausted) break;
+        }
+
+        if (!foundReadyAbsolute && !absoluteLaneExhausted && absoluteLaneCursor) {
+          // Hit the per-pass page budget with the aged head still unclaimable.
+          // Resume beyond it next pass instead of re-reading it, so a finite
+          // blocked prefix cannot mask the rows behind it indefinitely.
+          dispatchAbsoluteLaneCursorByAgent.set(agentId, absoluteLaneCursor);
+        } else {
+          // Found something claimable, or walked the whole aged set. Either way
+          // the next pass starts from the lane's head again, so a row that was
+          // blocked when we paged past it is re-read once the set is re-walked
+          // and cannot be lost behind the cursor.
+          dispatchAbsoluteLaneCursorByAgent.delete(agentId);
         }
       }
 

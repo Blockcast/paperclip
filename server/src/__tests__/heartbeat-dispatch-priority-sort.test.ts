@@ -1757,6 +1757,275 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     }
   }, 180_000);
 
+  it("dispatches an aged row that a dependency-blocked prefix masked in the absolute-starvation lane (BLO-21792 third review follow-up)", async () => {
+    // The two tests above prove the absolute floor holds for rows the cursored
+    // main scan can still reach. This one covers the lane's own blind spot.
+    //
+    // Lane C used to read a single oldest page and assume it would drain,
+    // because blocked rows "are cancelled by the claim gate". They are not: the
+    // claim loop breaks the moment it fills the last slot, and a
+    // dependency-blocked row ranks 12+ — below fresh critical work — so under
+    // sustained critical arrivals it is never examined and never drains. It
+    // stays queued, keeps occupying the lane's only page, and masks every aged
+    // row behind it. A ready aged row past the page boundary that is ALSO
+    // behind the main resume cursor is then invisible to every code path, and
+    // its wait is unbounded again.
+    //
+    // Geometry (scanLimit 2, one batch per pass, one free slot):
+    //
+    //   aged, blocked forever : blockedA, blockedB, blockedC
+    //   aged, blocked -> ready: target        (unblocked only AFTER the main
+    //                                          resume cursor has passed it)
+    //   fresh critical        : a sustained supply, so slots never idle
+    //
+    // The main scan walks the aged prefix over the first passes while `target`
+    // is still blocked, leaving it behind the resume cursor. Unblocking it then
+    // makes it a six-hour-aged, dependency-ready row that only the lane can
+    // reach. Pre-fix the lane re-reads [blockedA, blockedB] forever and
+    // `target` never dispatches. Post-fix the lane pages past the blocked
+    // prefix, and resets to its head on exhaustion, so it reaches `target`.
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issuePrefix = `Y${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const SEVEN_HOURS_MS = 7 * 60 * 60 * 1000;
+    const baseNow = Date.now();
+
+    const boundedHeartbeat = heartbeatService(db, {
+      penstockGate: allowPenstockGate,
+      queuedRunDispatchBounds: { scanLimit: 2, maxScanBatches: 1, maxResumePasses: 64 },
+    });
+
+    try {
+      await db.insert(companies).values({
+        id: companyId,
+        name: "AbsoluteLaneMaskedPrefixCo",
+        issuePrefix,
+        requireBoardApprovalForNewAgents: false,
+        defaultResponsibleUserId: "responsible-user",
+      });
+
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: "MaskedPrefixAgent",
+        role: "engineer",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+        permissions: {},
+      });
+
+      // One open blocker issue backs every dependency-blocked row. Leaving it
+      // open is what keeps those rows unclaimable; resolving it is how `target`
+      // becomes ready mid-test.
+      const blockerIssueId = randomUUID();
+      const aged = (offsetMs: number) => new Date(baseNow - SEVEN_HOURS_MS + offsetMs);
+      const rows = [
+        { key: "blockedA", priority: "medium" as const, createdAt: aged(0), blocked: true },
+        { key: "blockedB", priority: "medium" as const, createdAt: aged(1), blocked: true },
+        { key: "blockedC", priority: "medium" as const, createdAt: aged(2), blocked: true },
+        { key: "target", priority: "medium" as const, createdAt: aged(3), blocked: true },
+        ...Array.from({ length: 12 }, (_, index) => ({
+          key: `freshCritical${index}`,
+          priority: "critical" as const,
+          createdAt: new Date(baseNow + index),
+          blocked: false,
+        })),
+      ].map((row, index) => ({
+        ...row,
+        issueId: randomUUID(),
+        runId: randomUUID(),
+        issueNumber: index + 2,
+      }));
+      const runIdByKey = new Map(rows.map((row) => [row.key, row.runId]));
+      const targetRunId = runIdByKey.get("target")!;
+      const targetIssueId = rows.find((row) => row.key === "target")!.issueId;
+      let nextIssueNumber = rows.length + 2;
+
+      await db.insert(issues).values([
+        {
+          id: blockerIssueId,
+          companyId,
+          title: "Blocker",
+          status: "in_progress" as const,
+          priority: "medium" as const,
+          issueNumber: 1,
+          identifier: `${issuePrefix}-1`,
+          responsibleUserId: "responsible-user",
+        },
+        ...rows.map((row) => ({
+          id: row.issueId,
+          companyId,
+          title: `Queued ${row.key}`,
+          status: "in_progress" as const,
+          priority: row.priority,
+          assigneeAgentId: agentId,
+          issueNumber: row.issueNumber,
+          identifier: `${issuePrefix}-${row.issueNumber}`,
+          startedAt: row.createdAt,
+          responsibleUserId: "responsible-user",
+        })),
+      ]);
+
+      await db.insert(issueRelations).values(
+        rows.filter((row) => row.blocked).map((row) => ({
+          companyId,
+          issueId: blockerIssueId,
+          relatedIssueId: row.issueId,
+          type: "blocks" as const,
+        })),
+      );
+
+      for (const row of rows) {
+        const wakeId = randomUUID();
+        await db.insert(agentWakeupRequests).values({
+          id: wakeId,
+          companyId,
+          agentId,
+          source: "assignment",
+          triggerDetail: "system",
+          reason: "issue_assigned",
+          payload: { issueId: row.issueId },
+          status: "queued",
+          runId: row.runId,
+          requestedAt: row.createdAt,
+          updatedAt: row.createdAt,
+        });
+        await db.insert(heartbeatRuns).values({
+          id: row.runId,
+          companyId,
+          agentId,
+          invocationSource: "assignment",
+          triggerDetail: "system",
+          status: "queued",
+          wakeupRequestId: wakeId,
+          contextSnapshot: {
+            issueId: row.issueId,
+            taskId: row.issueId,
+            wakeReason: "issue_assigned",
+          },
+          createdAt: row.createdAt,
+          updatedAt: row.createdAt,
+        });
+      }
+
+      const dispatchedRunIds: string[] = [];
+      mockAdapterExecute.mockImplementation(async (args: { runId: string }) => {
+        dispatchedRunIds.push(args.runId);
+        return {
+          exitCode: 0,
+          signal: null as string | null,
+          timedOut: false,
+          errorMessage: null as string | null,
+          resultJson: { exitCode: 0 },
+          provider: "test",
+          model: "test-model",
+        };
+      });
+
+      // A fresh critical arrival, inserted mid-test. Two of these per pass is
+      // what keeps the main forward scan permanently non-exhausted; see phase 2.
+      const arriveFreshCritical = async () => {
+        const issueId = randomUUID();
+        const runId = randomUUID();
+        const wakeId = randomUUID();
+        const issueNumber = nextIssueNumber++;
+        const createdAt = new Date(Date.now());
+        await db.insert(issues).values({
+          id: issueId,
+          companyId,
+          title: `Arrival ${issueNumber}`,
+          status: "in_progress" as const,
+          priority: "critical" as const,
+          assigneeAgentId: agentId,
+          issueNumber,
+          identifier: `${issuePrefix}-${issueNumber}`,
+          startedAt: createdAt,
+          responsibleUserId: "responsible-user",
+        });
+        await db.insert(agentWakeupRequests).values({
+          id: wakeId,
+          companyId,
+          agentId,
+          source: "assignment",
+          triggerDetail: "system",
+          reason: "issue_assigned",
+          payload: { issueId },
+          status: "queued",
+          runId,
+          requestedAt: createdAt,
+          updatedAt: createdAt,
+        });
+        await db.insert(heartbeatRuns).values({
+          id: runId,
+          companyId,
+          agentId,
+          invocationSource: "assignment",
+          triggerDetail: "system",
+          status: "queued",
+          wakeupRequestId: wakeId,
+          contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_assigned" },
+          createdAt,
+          updatedAt: createdAt,
+        });
+      };
+
+      // Phase 1 — let the main scan walk the aged prefix while every aged row is
+      // still blocked, so `target` ends up behind the resume cursor. A couple of
+      // fresh criticals dispatching is ample evidence the cursor has moved on.
+      await boundedHeartbeat.resumeQueuedRuns();
+      const phaseOneDeadline = Date.now() + 60_000;
+      while (Date.now() < phaseOneDeadline && dispatchedRunIds.length < 3) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        await boundedHeartbeat.resumeQueuedRuns();
+      }
+      // Precondition, not the assertion under test: the blocked rows must NOT
+      // have dispatched. If one did, the fixture failed to block them and the
+      // masking geometry never formed.
+      expect(dispatchedRunIds).not.toContain(targetRunId);
+      expect(dispatchedRunIds.length).toBeGreaterThanOrEqual(2);
+
+      // Phase 2 — `target` becomes dependency-ready while sitting behind the
+      // main cursor and behind the lane's first page. Only a lane that pages
+      // past the blocked prefix can still see it.
+      await db
+        .delete(issueRelations)
+        .where(and(
+          eq(issueRelations.companyId, companyId),
+          eq(issueRelations.relatedIssueId, targetIssueId),
+        ));
+
+      // SUSTAINED arrivals are load-bearing, not flavour. A pass consumes
+      // `scanLimit` (2) rows of forward scan; feeding it 2 new rows per pass
+      // keeps every batch full, so `scanExhausted` never latches, the resume
+      // cursor is never cleared, and the head rescan that would otherwise
+      // rediscover `target` never fires. Without this the finite queue drains,
+      // the scan exhausts, and the main scan rescues `target` on its own — which
+      // makes the test pass against the unfixed source and proves nothing.
+      const targetDeadline = Date.now() + 120_000;
+      while (Date.now() < targetDeadline && !dispatchedRunIds.includes(targetRunId)) {
+        await arriveFreshCritical();
+        await arriveFreshCritical();
+        await boundedHeartbeat.resumeQueuedRuns();
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      await boundedHeartbeat.drainInFlightExecutions(60_000);
+
+      // The regression: masked behind a dependency-blocked page AND behind the
+      // main resume cursor, the aged row must still be dispatched.
+      expect(dispatchedRunIds).toContain(targetRunId);
+
+      const [settled] = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, targetRunId));
+      expect(settled?.status).not.toBe("queued");
+    } finally {
+      await boundedHeartbeat.drainInFlightExecutions(60_000);
+    }
+  }, 240_000);
+
   it("dispatches critical issue work before an aged issue-less run without starving routine issue work (BLO-19337)", async () => {
     // Regression for BLO-18995: dispatchRank returned a flat `10` for any run
     // without an issueId *above* the STARVATION_* aging escalation, so that
