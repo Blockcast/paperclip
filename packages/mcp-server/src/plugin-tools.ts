@@ -170,9 +170,10 @@ function buildPluginToolDefinition(
         // it through `formatErrorResponse` or the agent receives a failed tool
         // call as a success whose payload merely mentions an error (BLO-18466).
         const pluginError = result?.result?.error;
-        if (typeof pluginError === "string" && pluginError.length > 0) {
+        if (typeof pluginError === "string") {
+          const diagnostic = pluginError.trim() ? `: ${pluginError.trim()}` : "";
           return formatErrorResponse(
-            new Error(`Plugin tool ${tool.name} failed: ${pluginError}`),
+            new Error(`Plugin tool ${tool.name} failed${diagnostic}`),
           );
         }
         return formatTextResponse(result?.result ?? result);

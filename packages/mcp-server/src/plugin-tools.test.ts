@@ -95,9 +95,10 @@ describe("plugin tool wrapper", () => {
     });
   });
 
-  // An empty-string `error` is not a failure signal under the SDK contract
-  // ("if present, indicates the tool call failed" — a blank string is not).
-  it("treats an empty error string as success rather than a failure", async () => {
+  // The SDK contract says an `error` field indicates failure when present; a
+  // blank diagnostic still needs to be an MCP error, just with a fallback
+  // message rather than an empty payload.
+  it("surfaces an empty-string plugin error as an MCP error with a fallback message", async () => {
     const { tool } = await loadToolWithExecuteResponse(
       mockJsonResponse({
         pluginId: "acme.linear",
@@ -108,7 +109,9 @@ describe("plugin tool wrapper", () => {
 
     const response = await tool.execute({ query: "open bugs" });
 
-    expect(response.isError).toBeUndefined();
+    expect(response.isError).toBe(true);
+    const payload = JSON.parse(response.content[0]!.text) as Record<string, unknown>;
+    expect(payload.error).toBe("Plugin tool acme.linear:search-issues failed");
   });
 
   it("surfaces a non-2xx execute response as an MCP error", async () => {
