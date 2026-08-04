@@ -9189,6 +9189,11 @@ export function issueService(db: Db) {
           assigneeUserId: null,
           checkoutRunId,
           executionRunId: checkoutRunId,
+          // BLO-19848: stamp the lock timestamp alongside the pointer. Without
+          // it sweepStaleIssueLocks' isPreClaimLockExpired bails on
+          // `if (!runId || !lockedAt) return false`, so a checkout-acquired lock
+          // whose run later parks at queued/scheduled_retry is never reclaimable.
+          executionLockedAt: now,
           status: "in_progress",
           startedAt: now,
           updatedAt: now,
@@ -9255,12 +9260,16 @@ export function issueService(db: Db) {
         (current.executionRunId == null || current.executionRunId === checkoutRunId) &&
         checkoutRunId
       ) {
+        const adoptedAt = new Date();
         const adopted = await db
           .update(issues)
           .set({
             checkoutRunId,
             executionRunId: checkoutRunId,
-            updatedAt: new Date(),
+            // BLO-19848: see the checkout site above — a lock pointer without a
+            // lock timestamp is unreclaimable by the stale-lock sweeper.
+            executionLockedAt: adoptedAt,
+            updatedAt: adoptedAt,
           })
           .where(
             and(
@@ -9369,6 +9378,8 @@ export function issueService(db: Db) {
               assigneeUserId: null,
               checkoutRunId,
               executionRunId: checkoutRunId,
+              // BLO-19848: see the checkout site above.
+              executionLockedAt: now,
               status: "in_progress",
               startedAt: now,
               updatedAt: now,
