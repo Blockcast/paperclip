@@ -20,7 +20,10 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { authorizationService } from "../services/authorization.js";
+import {
+  authorizationService,
+  commentAuthorCanGrantIssueMention,
+} from "../services/authorization.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -165,6 +168,30 @@ async function grantUserPermission(
     grantedByUserId: "owner",
   });
 }
+
+describe("comment mention grant predicate", () => {
+  it("matches wake eligibility to the author identities that can grant issue access", () => {
+    const base = {
+      mentionedAgentId: "mentioned-agent",
+      issueAssigneeAgentId: "assignee-agent",
+      authorUserIsActiveMember: false,
+    };
+
+    expect(commentAuthorCanGrantIssueMention({
+      ...base,
+      authorAgentId: "unrelated-agent",
+    })).toBe(false);
+    expect(commentAuthorCanGrantIssueMention({
+      ...base,
+      authorAgentId: "assignee-agent",
+    })).toBe(true);
+    expect(commentAuthorCanGrantIssueMention({
+      ...base,
+      authorAgentId: null,
+      authorUserIsActiveMember: true,
+    })).toBe(true);
+  });
+});
 
 describeEmbeddedPostgres("authorization service", () => {
   let db!: ReturnType<typeof createDb>;

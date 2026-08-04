@@ -576,6 +576,19 @@ export function authorizationDeniedDetails(decision: AuthorizationDecision) {
   };
 }
 
+export function commentAuthorCanGrantIssueMention(input: {
+  mentionedAgentId: string;
+  issueAssigneeAgentId: string | null;
+  authorAgentId: string | null;
+  authorUserIsActiveMember: boolean;
+}) {
+  if (input.authorAgentId) {
+    if (input.authorAgentId === input.mentionedAgentId) return false;
+    return input.issueAssigneeAgentId === input.authorAgentId;
+  }
+  return input.authorUserIsActiveMember;
+}
+
 // BLO-18152: a bare "outside this actor's authorization boundary" message
 // gives a rejected agent nothing to act on — it reads as "you are locked out
 // of this issue," which is only true for some of these reasons. Naming which
@@ -1338,23 +1351,6 @@ export function authorizationService(db: Db) {
     return isAgentInSubtree(db, companyId, managerAgentId, assigneeAgentId);
   }
 
-  function commentAuthorCanGrantIssueMention(input: {
-    mentionedAgentId: string;
-    issueAssigneeAgentId: string | null;
-    authorAgentId: string | null;
-    authorUserId: string | null;
-    activeAuthorUserIds: Set<string>;
-  }) {
-    if (input.authorAgentId) {
-      if (input.authorAgentId === input.mentionedAgentId) return false;
-      return input.issueAssigneeAgentId === input.authorAgentId;
-    }
-    if (input.authorUserId) {
-      return input.activeAuthorUserIds.has(input.authorUserId);
-    }
-    return false;
-  }
-
   async function agentHasMentionGrantOnIssue(input: {
     action: AuthorizationAction;
     companyId: string;
@@ -1399,8 +1395,9 @@ export function authorizationService(db: Db) {
         mentionedAgentId: input.actorAgentId,
         issueAssigneeAgentId: input.issueAssigneeAgentId,
         authorAgentId: row.authorAgentId,
-        authorUserId: row.authorUserId,
-        activeAuthorUserIds,
+        authorUserIsActiveMember: Boolean(
+          row.authorUserId && activeAuthorUserIds.has(row.authorUserId),
+        ),
       });
       if (authorCanGrant) {
         logger.info({
