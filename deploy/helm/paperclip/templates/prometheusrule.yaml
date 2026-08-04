@@ -48,6 +48,17 @@
       stranded 15 merged alerts — and is tracked on BLO-19095, not here. Merging
       an alert is not deploying it; confirm the live ConfigMap before treating
       any rule in this family as production observability.
+
+  STATUS of the BLO-20255 terminal-failed wake alert, same auditability rule:
+
+    - Added to both authoritative onprem-k8s files by Blockcast/onprem-k8s#1946
+      (branch cto/blo-20255-terminal-failed-wake-alert). Verify:
+        gh api repos/Blockcast/onprem-k8s/contents/monitoring/prometheus-configmap.yaml \
+          --jq '.content' | base64 -d | grep PaperclipPrReviewWakeTerminalFailed
+
+    - NOT yet merged and NOT yet live as of 2026-08-02. It reads a metric this
+      PR adds, so it is inert until both land. Same manual `monitoring-rules`
+      Argo sync gate as above applies afterwards.
 */}}
 {{- if .Values.prometheusRule.enabled }}
 apiVersion: monitoring.coreos.com/v1
@@ -185,6 +196,79 @@ spec:
           annotations:
             summary: "Paperclip GitHub review-request wakes suppressed by an outage-like cause (reviews are being dropped)"
             description: "At least one GitHub review-request reviewer wake was terminally suppressed in the last {{ .Values.prometheusRule.githubDeliverySuppressionWindow }} with an outage-like cause ({{ .Values.prometheusRule.githubDeliverySuppressionOutageCauses }}) (BLO-18859). Suppressed means the wake was declined rather than dispatched: no run exists and nothing will re-arm it, so the PR has a posted trigger and no review — the same user-visible outcome as a dead-letter. Check the `cause` label first. `heartbeat.scheduling_suppressed` means the fleet-wide scheduling-suppression flag is on: if that is not a deliberate maintenance window, clear it (this is the mode that silently strands every review). `dispatch_rejected` means the dispatch path threw a business-rule HttpError with no durable skipped row — an unresolvable agent or responsible user; waiting will not fix it. `other` means the server emitted a skip reason missing from KNOWN_GITHUB_SUPPRESSION_CAUSES in services/metrics.ts: find it with `select reason, count(*) from agent_wakeup_requests where status = 'skipped' and created_at > now() - interval '1 hour' group by 1 order by 2 desc`, then either add it to the allow-list as an expected decline or fix the cause. Expected declines (company.inactive, heartbeat.cooldown.active, heartbeat.disabled, heartbeat.wakeOnDemand.disabled, budget.blocked, agent.not_invokable, heartbeat.worktree_execution_cutoff, issue_tree_hold_active) are excluded from this selector by default and are visible on the same counter for context."
+    - name: paperclip-wake-terminal-failed
+      rules:
+        - alert: PaperclipPrReviewWakeTerminalFailed
+          # BLO-20255. A DIFFERENT terminal state from the dead-letter alert
+          # above, and the two do not overlap: `dispatch_failed_exhausted`
+          # means the dispatch chain burned its retry budget, whereas `failed`
+          # means the wake dispatched fine and the RUN died — a
+          # force-terminated Job, a failed Job, an adapter that threw.
+          # `reconcileFailedWakeDispatches` only ever selects `dispatch_failed`,
+          # so nothing re-drives a `failed` row and, before this rule, nothing
+          # surfaced one either.
+          #
+          # Gauge-only (no counter arm). Unlike the dead-letter case there is no
+          # process-local counter to OR against — every path that reaches this
+          # state leaves a durable row, so the re-derived gauge is complete on
+          # its own. It is recomputed from committed rows on every
+          # wake-dispatch reconcile pass, so it survives a restart and a pod
+          # replacement mid-`for`.
+          #
+          # Scoped to pr_review because that is the user-visible loss: the PR
+          # sits with a posted review trigger and no review, and no human is
+          # watching the wake table. Non-pr_review terminal failures are still
+          # published on the same gauge (scope="other") for the dashboard, but
+          # they are usually re-driven by the issue's own lifecycle and paging
+          # on them would train the operator to ignore this.
+          #
+          # Why this cannot page a retried row (BLO-18030 / PR #900): the gauge
+          # drops any row that has a successor wake for the same taskKey — a
+          # retry run carrying the same context_task_key, or a fresh webhook
+          # wake carrying the same payload taskKey. Both successor rows are
+          # written inside the SCHEDULING transaction, not when the retry
+          # fires: it inserts an agent_wakeup_requests row at status="queued"
+          # and a heartbeat_runs row at status="scheduled_retry" carrying the
+          # retry context snapshot. So a row that is going to be retried leaves
+          # this series the moment the retry is scheduled, and the guarantee
+          # holds for EVERY step of
+          # BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS ([2m, 10m, 30m, 2h]) —
+          # including the two that are longer than this `for`. Do not re-derive
+          # the threshold from those delays; they are unrelated.
+          #
+          # A successor that itself ended terminal `failed` is deliberately NOT
+          # counted as coverage — that is a second failure, not a re-drive, and
+          # a repeatedly-failing review chain is the most page-worthy shape
+          # here. More generally the successor check is a POSITIVE status
+          # allowlist (active or succeeded), not "anything but failed": a
+          # successor written `skipped` by a policy gate, or a queued retry that
+          # later went `cancelled` / `dispatch_failed_exhausted` /
+          # `dispatch_superseded`, never ran a review and must not silence this.
+          #
+          # Why this thresholds an AGE gauge instead of counting rows under a
+          # long `for:`. Prometheus `for:` measures how long the EXPRESSION has
+          # been continuously true, not how long any one row has been failed,
+          # and the natural count expression sums rows together. With
+          # `sum(..._unresolved{scope="pr_review"}) > 0` and `for: 30m`, two
+          # different short failures overlapping by one scrape keep the sum
+          # non-zero across the whole window: A holds it up for 29 minutes, B
+          # arrives as A clears, the expression never goes false, and B pages
+          # about a minute old while the annotation claims 30. Splitting by
+          # `error_code` does not help — the expression sums that label away.
+          # `paperclip_agent_wakeup_terminal_failed_oldest_age_seconds` carries
+          # the server-computed `now - finishedAt` of the oldest row that
+          # survived the successor exclusion, so the ageing is real data and
+          # `for:` is left doing only what it is good at: riding out a flapping
+          # scrape. The gauge is reset to 0 for a scope with no unresolved rows,
+          # which is what lets the alert resolve.
+          expr: max(paperclip_agent_wakeup_terminal_failed_oldest_age_seconds{scope="pr_review"}) > {{ .Values.prometheusRule.wakeTerminalFailedAgeSeconds }}
+          for: {{ .Values.prometheusRule.wakeTerminalFailedFor }}
+          labels:
+            severity: warning
+          annotations:
+            summary: "Paperclip PR-review wake is terminally failed and will never be retried"
+            description: "A pr_review-scoped agent_wakeup_requests row has been sitting at status='failed' for more than {{ .Values.prometheusRule.wakeTerminalFailedAgeSeconds }}s with no successor wake for the same taskKey (BLO-20255). The age is the server-computed age of the oldest such row, published as paperclip_agent_wakeup_terminal_failed_oldest_age_seconds; the companion count series paperclip_agent_wakeup_terminal_failed_unresolved{scope=\"pr_review\"} breaks the population down by error_code. This state is TERMINAL: reconcileFailedWakeDispatches only selects dispatch_failed, so nothing re-drives it, and the BLO-18030 bounded retry deliberately declines three cases so it can never double-post a review (the GitHub probe found an existing review, the probe threw or there was no PR context, or the run was not a pr_review context). The PR has a posted review trigger and no review. Break down by the `error_code` label on the count series to decide: it is joined from heartbeat_runs.error_code via agent_wakeup_requests.run_id, because the wake table has no error_code column of its own. `external_lifecycle_stale_killed` means the reviewer Job went silent past the 45m hard-stale window and was force-terminated. `job_failed` means the Job itself exited non-zero. `none` means there was no run row or no code recorded. `other` means a code missing from KNOWN_TERMINAL_FAILED_WAKE_ERROR_CODES in services/metrics.ts — triage it into that list. Query the rows with `select w.id, w.agent_id, w.reason, w.error, w.payload ->> 'taskKey' as task_key, r.error_code from agent_wakeup_requests w left join heartbeat_runs r on r.id = w.run_id where w.status = 'failed' and w.finished_at > now() - interval '24 hours' order by w.finished_at desc`. See the runbook for the re-review-vs-accept decision."
+            runbook_url: {{ .Values.prometheusRule.wakeTerminalFailedRunbookUrl | quote }}
     {{- with .Values.prometheusRule.additionalGroups }}
     {{- toYaml . | nindent 4 }}
     {{- end }}

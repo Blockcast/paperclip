@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { and, eq, sql } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { and, eq, inArray, sql } from "drizzle-orm";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
+  agentWakeupRequests,
   agents,
   approvals,
   companies,
@@ -13,6 +14,8 @@ import {
   issueComments,
   issueRelations,
   issues,
+  plugins,
+  pluginState,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -23,6 +26,7 @@ import {
   DEFAULT_PRODUCTIVITY_REVIEW_MAX_REFRESH_COMMENTS,
   DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
   DEFAULT_PRODUCTIVITY_REVIEW_REFRESH_INTERVAL_MS,
+  ISSUE_MONITOR_WAKE_CLAIM_TTL_MS,
   PRODUCTIVITY_REVIEW_MIN_REFRESH_INTERVAL_MS,
   PRODUCTIVITY_REVIEW_ORIGIN_KIND,
   PRODUCTIVITY_REVIEW_REFRESH_COMMENT_PREFIX,
@@ -40,6 +44,28 @@ if (!embeddedPostgresSupport.supported) {
   );
 }
 
+function deferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((done, fail) => {
+    resolve = done;
+    reject = fail;
+  });
+  return { promise, resolve, reject };
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string) {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) => {
+      timeout = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    }),
+  ]).finally(() => {
+    if (timeout) clearTimeout(timeout);
+  });
+}
+
 describeEmbeddedPostgres("productivity review service", () => {
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   let db: ReturnType<typeof createDb>;
@@ -50,6 +76,8 @@ describeEmbeddedPostgres("productivity review service", () => {
   });
 
   afterEach(async () => {
+    vi.restoreAllMocks();
+    await db.delete(plugins);
     await db.execute(sql.raw(`TRUNCATE TABLE "companies" CASCADE`));
   });
 
@@ -77,11 +105,12 @@ describeEmbeddedPostgres("productivity review service", () => {
   }
 
   async function seedAssignedIssue(opts?: {
-    status?: "todo" | "in_progress";
+    status?: "todo" | "in_progress" | "done" | "cancelled";
     startedAt?: Date;
     monitorNextCheckAt?: Date | null;
     monitorScheduledBy?: "assignee" | "board" | null;
     monitorLastTriggeredAt?: Date | null;
+    monitorWakeRequestedAt?: Date | null;
     parentId?: string | null;
     originKind?: string;
     executionPolicy?: Record<string, unknown> | null;
@@ -147,6 +176,7 @@ describeEmbeddedPostgres("productivity review service", () => {
       monitorNextCheckAt: opts?.monitorNextCheckAt ?? null,
       monitorScheduledBy: opts?.monitorScheduledBy ?? null,
       monitorLastTriggeredAt: opts?.monitorLastTriggeredAt ?? null,
+      monitorWakeRequestedAt: opts?.monitorWakeRequestedAt ?? null,
       executionPolicy: opts?.executionPolicy ?? null,
       createdAt,
       updatedAt: createdAt,
@@ -222,6 +252,52 @@ describeEmbeddedPostgres("productivity review service", () => {
         sql`${issueComments.body} like ${`${PRODUCTIVITY_REVIEW_REFRESH_COMMENT_PREFIX}%`}`,
       ))
       .orderBy(issueComments.createdAt);
+  }
+
+  async function insertProductivityReview(input: {
+    seeded: Awaited<ReturnType<typeof seedAssignedIssue>>;
+    reviewId?: string;
+    createdAt: Date;
+    issueNumber?: number | null;
+    identifier?: string | null;
+    sourceAgentId?: string | null;
+  }) {
+    const reviewId = input.reviewId ?? randomUUID();
+    await db.insert(issues).values({
+      id: reviewId,
+      companyId: input.seeded.companyId,
+      title: "Review productivity for reserved source",
+      description: "Reserved before identifier allocation",
+      status: "todo",
+      priority: "medium",
+      parentId: input.seeded.issueId,
+      assigneeAgentId: input.seeded.managerId,
+      createdByAgentId: input.sourceAgentId ?? input.seeded.coderId,
+      originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+      originId: input.seeded.issueId,
+      originFingerprint: `productivity-review:${input.seeded.issueId}`,
+      requestDepth: 1,
+      issueNumber: input.issueNumber ?? null,
+      identifier: input.identifier ?? null,
+      createdAt: input.createdAt,
+      updatedAt: input.createdAt,
+      lastActivityAt: input.createdAt,
+    });
+    return reviewId;
+  }
+
+  async function countReviewActivity(reviewId: string, action: string) {
+    return db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, reviewId),
+          eq(activityLog.action, action),
+        ),
+      )
+      .then((rows) => Number(rows[0]?.count ?? 0));
   }
 
   async function listProductivityReviewEscalations(companyId: string) {
@@ -1068,7 +1144,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     const seeded = await seedAssignedIssue({
       status: "in_progress",
       startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
-      monitorNextCheckAt: new Date(now.getTime() - 60_000),
+      monitorNextCheckAt: new Date(now.getTime() - 10 * 60_000),
       monitorScheduledBy: "assignee",
     });
 
@@ -1081,6 +1157,1612 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(result.monitorScheduledSuppressed).toBe(0);
     const [review] = await listProductivityReviews(seeded.companyId);
     expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+  });
+
+  // BLO-21003: the monitor came due seconds ago, but `monitorNextCheckAt` lapsing
+  // is not proof its wake was serviced — dispatch (tick pickup, K8s Job creation,
+  // pod scheduling) is asynchronous and a reconcile pass can land inside that gap
+  // (observed ~29s on BLO-19772). This must still suppress like a strictly-future
+  // monitor, not read as an unattended stall.
+  it("suppresses long-active productivity reviews for a monitor that lapsed seconds ago with its wake unserviced", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const monitorNextCheckAt = new Date(now.getTime() - 5_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt,
+      monitorScheduledBy: "assignee",
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(result.monitorScheduledSuppressed).toBe(1);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+
+    const activities = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.action, "issue.productivity_review_suppressed"));
+    expect(activities).toHaveLength(1);
+    expect(activities[0]?.details).toMatchObject({
+      suppressedBy: "monitor_scheduled",
+      monitorNextCheckAt: monitorNextCheckAt.toISOString(),
+      monitorScheduledBy: "assignee",
+      monitorWakeRequestedAt: null,
+    });
+  });
+
+  it("suppresses long-active reviews when scheduler-derived monitor grace is longer than one minute", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const monitorNextCheckAt = new Date(now.getTime() - 90_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt,
+      monitorScheduledBy: "assignee",
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: { monitorSchedulerIntervalMs: 2 * 60_000 },
+    });
+
+    expect(result.created).toBe(0);
+    expect(result.monitorScheduledSuppressed).toBe(1);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  it("suppresses a due monitor still waiting behind the scheduler dispatch batch", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const monitorNextCheckAt = new Date(now.getTime() - 6 * 60_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt,
+      monitorScheduledBy: "assignee",
+    });
+    await db.insert(issues).values(
+      Array.from({ length: 50 }, (_, index) => ({
+        id: randomUUID(),
+        companyId: seeded.companyId,
+        title: `Earlier due monitor ${index + 1}`,
+        status: "in_review" as const,
+        priority: "medium" as const,
+        assigneeAgentId: seeded.coderId,
+        monitorNextCheckAt: new Date(now.getTime() - 7 * 60_000),
+        monitorScheduledBy: "assignee" as const,
+        issueNumber: index + 20,
+        identifier: `${seeded.issuePrefix}-${index + 20}`,
+        createdAt: seeded.createdAt,
+        updatedAt: seeded.createdAt,
+      })),
+    );
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: {
+        monitorLapseServiceGraceMs: 60_000,
+        monitorSchedulerIntervalMs: 60_000,
+        monitorDispatchBatchSize: 50,
+      },
+    });
+
+    expect(result.created).toBe(0);
+    expect(result.monitorScheduledSuppressed).toBe(1);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  it("does not extend first-batch grace for later monitors with the same due timestamp", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const monitorNextCheckAt = new Date(now.getTime() - 6 * 60_000 - 1_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt,
+      monitorScheduledBy: "assignee",
+    });
+    await db.insert(issues).values(
+      Array.from({ length: 100 }, (_, index) => ({
+        id: randomUUID(),
+        companyId: seeded.companyId,
+        title: `Later equal-time monitor ${index + 1}`,
+        status: "in_review" as const,
+        priority: "medium" as const,
+        assigneeAgentId: seeded.coderId,
+        monitorNextCheckAt,
+        monitorScheduledBy: "assignee" as const,
+        issueNumber: index + 20,
+        identifier: `${seeded.issuePrefix}-${index + 20}`,
+        createdAt: seeded.createdAt,
+        updatedAt: new Date(seeded.createdAt.getTime() + (index + 1) * 1_000),
+      })),
+    );
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: {
+        monitorLapseServiceGraceMs: 6 * 60_000,
+        monitorSchedulerIntervalMs: 60_000,
+        monitorDispatchBatchSize: 50,
+      },
+    });
+
+    expect(result.created).toBe(1);
+    expect(result.monitorScheduledSuppressed).toBe(0);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+  });
+
+  it("suppresses a monitor still queued behind one remaining scheduler batch", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const monitorNextCheckAt = new Date(now.getTime() - 6 * 60_000 - 30_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt,
+      monitorScheduledBy: "assignee",
+    });
+    await db.insert(issues).values(
+      Array.from({ length: 50 }, (_, index) => ({
+        id: randomUUID(),
+        companyId: seeded.companyId,
+        title: `Remaining earlier monitor ${index + 1}`,
+        status: "in_review" as const,
+        priority: "medium" as const,
+        assigneeAgentId: seeded.coderId,
+        monitorNextCheckAt,
+        monitorScheduledBy: "assignee" as const,
+        issueNumber: index + 20,
+        identifier: `${seeded.issuePrefix}-${index + 20}`,
+        createdAt: seeded.createdAt,
+        updatedAt: new Date(seeded.createdAt.getTime() - (index + 1) * 1_000),
+      })),
+    );
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: {
+        monitorLapseServiceGraceMs: 6 * 60_000,
+        monitorSchedulerIntervalMs: 60_000,
+        monitorDispatchBatchSize: 50,
+      },
+    });
+
+    expect(result.created).toBe(0);
+    expect(result.monitorScheduledSuppressed).toBe(1);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  it("does not renew backlog grace forever behind a non-draining predecessor", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const monitorNextCheckAt = new Date(now.getTime() - 10 * 60_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt,
+      monitorScheduledBy: "assignee",
+    });
+    await db.insert(issues).values({
+      id: randomUUID(),
+      companyId: seeded.companyId,
+      title: "Non-draining predecessor monitor",
+      status: "in_review" as const,
+      priority: "medium" as const,
+      assigneeAgentId: seeded.coderId,
+      monitorNextCheckAt,
+      monitorScheduledBy: "assignee" as const,
+      issueNumber: 20,
+      identifier: `${seeded.issuePrefix}-20`,
+      createdAt: seeded.createdAt,
+      updatedAt: new Date(seeded.createdAt.getTime() - 1_000),
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: {
+        monitorLapseServiceGraceMs: 60_000,
+        monitorSchedulerIntervalMs: 60_000,
+        monitorDispatchBatchSize: 50,
+      },
+    });
+
+    expect(result.created).toBe(1);
+    expect(result.monitorScheduledSuppressed).toBe(0);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+  });
+
+  it("does not renew backlog grace forever behind repeated predecessor claims", async () => {
+    const firstPass = new Date("2026-04-28T12:00:00.000Z");
+    const monitorNextCheckAt = new Date(firstPass.getTime() - 10 * 60_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(firstPass.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt,
+      monitorScheduledBy: "assignee",
+    });
+    const predecessorId = randomUUID();
+    await db.insert(issues).values({
+      id: predecessorId,
+      companyId: seeded.companyId,
+      title: "Repeatedly claimed predecessor monitor",
+      status: "in_review" as const,
+      priority: "medium" as const,
+      assigneeAgentId: seeded.coderId,
+      monitorNextCheckAt,
+      monitorScheduledBy: "assignee" as const,
+      monitorWakeRequestedAt: new Date(firstPass.getTime() - 4 * 60_000),
+      issueNumber: 20,
+      identifier: `${seeded.issuePrefix}-20`,
+      createdAt: seeded.createdAt,
+      updatedAt: new Date(seeded.createdAt.getTime() - 1_000),
+    });
+
+    const first = await productivityReviewService(db).reconcileProductivityReviews({
+      now: firstPass,
+      companyId: seeded.companyId,
+      thresholds: {
+        monitorLapseServiceGraceMs: 60_000,
+        monitorSchedulerIntervalMs: 60_000,
+        monitorDispatchBatchSize: 50,
+      },
+    });
+
+    expect(first.created).toBe(0);
+    expect(first.monitorScheduledSuppressed).toBe(1);
+
+    const secondPass = new Date(firstPass.getTime() + 10 * 60_000);
+    await db
+      .update(issues)
+      .set({
+        monitorWakeRequestedAt: new Date(secondPass.getTime() - 30_000),
+        updatedAt: new Date(secondPass.getTime() - 30_000),
+      })
+      .where(eq(issues.id, predecessorId));
+
+    const second = await productivityReviewService(db).reconcileProductivityReviews({
+      now: secondPass,
+      companyId: seeded.companyId,
+      thresholds: {
+        monitorLapseServiceGraceMs: 60_000,
+        monitorSchedulerIntervalMs: 60_000,
+        monitorDispatchBatchSize: 50,
+      },
+    });
+
+    expect(second.created).toBe(1);
+    expect(second.monitorScheduledSuppressed).toBe(0);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+  });
+
+  it("suppresses a lapsed monitor claimed by the scheduler after candidate selection", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const monitorNextCheckAt = new Date(now.getTime() - 10 * 60_000);
+    const monitorWakeRequestedAt = new Date(now.getTime() - 4 * 60_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt,
+      monitorScheduledBy: "assignee",
+    });
+
+    const result = await productivityReviewService(db, {
+      async beforeCollectEvidence(sourceIssue) {
+        if (sourceIssue.id !== seeded.issueId) return;
+        await db
+          .update(issues)
+          .set({ monitorWakeRequestedAt, updatedAt: monitorWakeRequestedAt })
+          .where(eq(issues.id, seeded.issueId));
+      },
+    }).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+    });
+
+    expect(result.created).toBe(0);
+    expect(result.monitorScheduledSuppressed).toBe(1);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+
+    const activities = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.action, "issue.productivity_review_suppressed"));
+    expect(activities).toHaveLength(1);
+    expect(activities[0]?.details).toMatchObject({
+      suppressedBy: "monitor_scheduled",
+      monitorNextCheckAt: monitorNextCheckAt.toISOString(),
+      monitorWakeRequestedAt: monitorWakeRequestedAt.toISOString(),
+    });
+  });
+
+  it("suppresses a lapsed monitor claimed after the current-state read but before backlog counting", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const monitorNextCheckAt = new Date(now.getTime() - 10 * 60_000);
+    const monitorWakeRequestedAt = new Date(now.getTime() - 4 * 60_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt,
+      monitorScheduledBy: "assignee",
+    });
+
+    const result = await productivityReviewService(db, {
+      async beforeMonitorBacklogGrace(sourceIssue) {
+        if (sourceIssue.id !== seeded.issueId) return;
+        await db
+          .update(issues)
+          .set({ monitorWakeRequestedAt, updatedAt: monitorWakeRequestedAt })
+          .where(eq(issues.id, seeded.issueId));
+      },
+    }).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+    });
+
+    expect(result.created).toBe(0);
+    expect(result.monitorScheduledSuppressed).toBe(1);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+
+    const activities = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.action, "issue.productivity_review_suppressed"));
+    expect(activities).toHaveLength(1);
+    expect(activities[0]?.details).toMatchObject({
+      suppressedBy: "monitor_scheduled",
+      monitorNextCheckAt: monitorNextCheckAt.toISOString(),
+      monitorWakeRequestedAt: monitorWakeRequestedAt.toISOString(),
+    });
+  });
+
+  it("suppresses a source queued behind a fresh-claimed predecessor monitor", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const monitorNextCheckAt = new Date(now.getTime() - 10 * 60_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt,
+      monitorScheduledBy: "assignee",
+    });
+    await db.insert(issues).values({
+      id: randomUUID(),
+      companyId: seeded.companyId,
+      title: "Fresh claimed predecessor monitor",
+      status: "in_review" as const,
+      priority: "medium" as const,
+      assigneeAgentId: seeded.coderId,
+      monitorNextCheckAt,
+      monitorScheduledBy: "assignee" as const,
+      monitorWakeRequestedAt: new Date(now.getTime() - 4 * 60_000),
+      issueNumber: 20,
+      identifier: `${seeded.issuePrefix}-20`,
+      createdAt: seeded.createdAt,
+      updatedAt: new Date(seeded.createdAt.getTime() - 1_000),
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: {
+        monitorLapseServiceGraceMs: 60_000,
+        monitorSchedulerIntervalMs: 60_000,
+        monitorDispatchBatchSize: 50,
+      },
+    });
+
+    expect(result.created).toBe(0);
+    expect(result.monitorScheduledSuppressed).toBe(1);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  it("keeps equal-time fresh-claimed predecessors ahead after scheduler claim updates updatedAt", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const monitorNextCheckAt = new Date(now.getTime() - 10 * 60_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt,
+      monitorScheduledBy: "assignee",
+    });
+    await db.insert(issues).values(
+      Array.from({ length: 50 }, (_, index) => ({
+        id: randomUUID(),
+        companyId: seeded.companyId,
+        title: `Fresh claimed equal-time predecessor ${index + 1}`,
+        status: "in_review" as const,
+        priority: "medium" as const,
+        assigneeAgentId: seeded.coderId,
+        monitorNextCheckAt,
+        monitorScheduledBy: "assignee" as const,
+        monitorWakeRequestedAt: now,
+        issueNumber: index + 20,
+        identifier: `${seeded.issuePrefix}-${index + 20}`,
+        createdAt: seeded.createdAt,
+        updatedAt: now,
+      })),
+    );
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: {
+        monitorLapseServiceGraceMs: 60_000,
+        monitorSchedulerIntervalMs: 60_000,
+        monitorDispatchBatchSize: 50,
+      },
+    });
+
+    expect(result.created).toBe(0);
+    expect(result.monitorScheduledSuppressed).toBe(1);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  it("suppresses long-active reviews for a lapsed monitor with a fresh dispatch claim", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const monitorNextCheckAt = new Date(now.getTime() - 10 * 60_000);
+    const monitorWakeRequestedAt = new Date(now.getTime() - 4 * 60_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt,
+      monitorScheduledBy: "assignee",
+      monitorWakeRequestedAt,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+    });
+
+    expect(result.created).toBe(0);
+    expect(result.monitorScheduledSuppressed).toBe(1);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+
+    const activities = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.action, "issue.productivity_review_suppressed"));
+    expect(activities).toHaveLength(1);
+    expect(activities[0]?.details).toMatchObject({
+      suppressedBy: "monitor_scheduled",
+      monitorNextCheckAt: monitorNextCheckAt.toISOString(),
+      monitorWakeRequestedAt: monitorWakeRequestedAt.toISOString(),
+    });
+  });
+
+  it("suppresses a lapsed monitor claimed exactly at the scheduler claim TTL boundary", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const monitorNextCheckAt = new Date(now.getTime() - 10 * 60_000);
+    const monitorWakeRequestedAt = new Date(now.getTime() - ISSUE_MONITOR_WAKE_CLAIM_TTL_MS);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt,
+      monitorScheduledBy: "assignee",
+      monitorWakeRequestedAt,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+    });
+
+    expect(result.created).toBe(0);
+    expect(result.monitorScheduledSuppressed).toBe(1);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+
+    const activities = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.action, "issue.productivity_review_suppressed"));
+    expect(activities).toHaveLength(1);
+    expect(activities[0]?.details).toMatchObject({
+      suppressedBy: "monitor_scheduled",
+      monitorNextCheckAt: monitorNextCheckAt.toISOString(),
+      monitorWakeRequestedAt: monitorWakeRequestedAt.toISOString(),
+    });
+  });
+
+  it("revalidates monitor suppression after the final pre-create hook", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const monitorNextCheckAt = new Date(now.getTime() - 10 * 60_000);
+    const monitorWakeRequestedAt = new Date(now.getTime() - 30_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt,
+      monitorScheduledBy: "assignee",
+    });
+
+    const result = await productivityReviewService(db, {
+      async beforeCreateOrUpdateReview(evidence) {
+        if (evidence.sourceIssue.id !== seeded.issueId) return;
+        await db
+          .update(issues)
+          .set({ monitorWakeRequestedAt, updatedAt: monitorWakeRequestedAt })
+          .where(eq(issues.id, seeded.issueId));
+      },
+    }).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+    });
+
+    expect(result.created).toBe(0);
+    expect(result.monitorScheduledSuppressed).toBe(1);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+
+    const activities = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.action, "issue.productivity_review_suppressed"));
+    expect(activities).toHaveLength(1);
+    expect(activities[0]?.details).toMatchObject({
+      suppressedBy: "monitor_scheduled",
+      monitorNextCheckAt: monitorNextCheckAt.toISOString(),
+      monitorWakeRequestedAt: monitorWakeRequestedAt.toISOString(),
+    });
+  });
+
+  it("guards monitor suppression after final revalidation until issue insert", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const monitorNextCheckAt = new Date(now.getTime() - 10 * 60_000);
+    const monitorWakeRequestedAt = new Date(now.getTime() - 30_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt,
+      monitorScheduledBy: "assignee",
+    });
+
+    const result = await productivityReviewService(db, {
+      async beforeCreateReviewIssueInsert(evidence) {
+        if (evidence.sourceIssue.id !== seeded.issueId) return;
+        await db
+          .update(issues)
+          .set({ monitorWakeRequestedAt, updatedAt: monitorWakeRequestedAt })
+          .where(eq(issues.id, seeded.issueId));
+      },
+    }).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+    });
+
+    expect(result.created).toBe(0);
+    expect(result.monitorScheduledSuppressed).toBe(1);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+
+    const activities = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.action, "issue.productivity_review_suppressed"));
+    expect(activities).toHaveLength(1);
+    expect(activities[0]?.details).toMatchObject({
+      suppressedBy: "monitor_scheduled",
+      monitorNextCheckAt: monitorNextCheckAt.toISOString(),
+      monitorWakeRequestedAt: monitorWakeRequestedAt.toISOString(),
+    });
+  });
+
+  it("guards monitor suppression before Linear identifier side effects", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const monitorNextCheckAt = new Date(now.getTime() - 10 * 60_000);
+    const monitorWakeRequestedAt = new Date(now.getTime() - 30_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt,
+      monitorScheduledBy: "assignee",
+    });
+    await db
+      .update(companies)
+      .set({ identifierProvider: "linear" })
+      .where(eq(companies.id, seeded.companyId));
+
+    const result = await productivityReviewService(db, {
+      async beforeCreateReviewIssueInsert(evidence) {
+        if (evidence.sourceIssue.id !== seeded.issueId) return;
+        await db
+          .update(issues)
+          .set({ monitorWakeRequestedAt, updatedAt: monitorWakeRequestedAt })
+          .where(eq(issues.id, seeded.issueId));
+      },
+    }).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+    });
+
+    expect(result.failed).toBe(0);
+    expect(result.created).toBe(0);
+    expect(result.monitorScheduledSuppressed).toBe(1);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  it("revalidates fresh predecessor claims before review issue insert", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const monitorNextCheckAt = new Date(now.getTime() - 10 * 60_000);
+    const predecessorClaimedAt = new Date(now.getTime() - 30_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt,
+      monitorScheduledBy: "assignee",
+    });
+    const predecessorId = randomUUID();
+    await db.insert(issues).values({
+      id: predecessorId,
+      companyId: seeded.companyId,
+      title: "Fresh predecessor in final window",
+      status: "in_review" as const,
+      priority: "medium" as const,
+      assigneeAgentId: seeded.coderId,
+      monitorNextCheckAt,
+      monitorScheduledBy: "assignee" as const,
+      issueNumber: 20,
+      identifier: `${seeded.issuePrefix}-20`,
+      createdAt: seeded.createdAt,
+      updatedAt: new Date(seeded.createdAt.getTime() - 1_000),
+    });
+
+    const result = await productivityReviewService(db, {
+      async beforeCreateReviewIssueInsert(evidence) {
+        if (evidence.sourceIssue.id !== seeded.issueId) return;
+        await db
+          .update(issues)
+          .set({ monitorWakeRequestedAt: predecessorClaimedAt, updatedAt: predecessorClaimedAt })
+          .where(eq(issues.id, predecessorId));
+      },
+    }).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: {
+        monitorLapseServiceGraceMs: 60_000,
+        monitorSchedulerIntervalMs: 60_000,
+        monitorDispatchBatchSize: 50,
+      },
+    });
+
+    expect(result.created).toBe(0);
+    expect(result.monitorScheduledSuppressed).toBe(1);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  it("does not block monitor claims behind final review issue creation", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const monitorNextCheckAt = new Date(now.getTime() - 10 * 60_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt,
+      monitorScheduledBy: "assignee",
+    });
+    const predecessorId = randomUUID();
+    await db.insert(issues).values({
+      id: predecessorId,
+      companyId: seeded.companyId,
+      title: "Predecessor waiting while review creates",
+      status: "in_review" as const,
+      priority: "medium" as const,
+      assigneeAgentId: seeded.coderId,
+      monitorNextCheckAt,
+      monitorScheduledBy: "assignee" as const,
+      issueNumber: 20,
+      identifier: `${seeded.issuePrefix}-20`,
+      createdAt: seeded.createdAt,
+      updatedAt: new Date(seeded.createdAt.getTime() - 1_000),
+    });
+
+    const finalRevalidationReady = deferred();
+    const releaseReviewCreation = deferred();
+    const reconcile = productivityReviewService(db, {
+      async beforeFinalMonitorSuppressionRevalidation(evidence) {
+        if (evidence.sourceIssue.id !== seeded.issueId) return;
+        finalRevalidationReady.resolve();
+        await releaseReviewCreation.promise;
+      },
+    }).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: {
+        monitorLapseServiceGraceMs: 60_000,
+        monitorSchedulerIntervalMs: 60_000,
+        monitorDispatchBatchSize: 50,
+      },
+    });
+
+    await finalRevalidationReady.promise;
+    await db
+      .update(issues)
+      .set({ monitorWakeRequestedAt: now, updatedAt: now })
+      .where(eq(issues.id, predecessorId));
+
+    const [predecessorDuringReview] = await db
+      .select({ monitorWakeRequestedAt: issues.monitorWakeRequestedAt })
+      .from(issues)
+      .where(eq(issues.id, predecessorId));
+    expect(predecessorDuringReview?.monitorWakeRequestedAt?.toISOString()).toBe(now.toISOString());
+
+    releaseReviewCreation.resolve();
+    const result = await reconcile;
+    expect(result.created).toBe(0);
+    expect(result.monitorScheduledSuppressed).toBe(1);
+  });
+
+  it("does not let post-reservation monitor claims invalidate the reserved review", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const monitorNextCheckAt = new Date(now.getTime() - 10 * 60_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt,
+      monitorScheduledBy: "assignee",
+    });
+
+    const reservationReady = deferred<string>();
+    const releaseIdentifierAllocation = deferred();
+    const reconcile = productivityReviewService(db, {
+      async afterFinalMonitorReviewReservation(evidence, review) {
+        if (evidence.sourceIssue.id !== seeded.issueId) return;
+        reservationReady.resolve(review.id);
+        await releaseIdentifierAllocation.promise;
+      },
+    }).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: {
+        monitorLapseServiceGraceMs: 60_000,
+        monitorSchedulerIntervalMs: 60_000,
+        monitorDispatchBatchSize: 50,
+      },
+    });
+
+    const reviewId = await reservationReady.promise;
+    const [reserved] = await db
+      .select({ identifier: issues.identifier, issueNumber: issues.issueNumber })
+      .from(issues)
+      .where(eq(issues.id, reviewId));
+    expect(reserved).toMatchObject({ identifier: null, issueNumber: null });
+
+    await db
+      .update(issues)
+      .set({ monitorWakeRequestedAt: now, updatedAt: now })
+      .where(eq(issues.id, seeded.issueId));
+
+    const [sourceAfterTick] = await db
+      .select({ monitorWakeRequestedAt: issues.monitorWakeRequestedAt })
+      .from(issues)
+      .where(eq(issues.id, seeded.issueId));
+    expect(sourceAfterTick?.monitorWakeRequestedAt?.toISOString()).toBe(now.toISOString());
+
+    releaseIdentifierAllocation.resolve();
+    const result = await reconcile;
+    expect(result.created).toBe(1);
+    expect(result.monitorScheduledSuppressed).toBe(0);
+
+    const reviews = await listProductivityReviews(seeded.companyId);
+    expect(reviews).toHaveLength(1);
+    expect(reviews[0]?.id).toBe(reviewId);
+    expect(reviews[0]?.identifier).toBe(`${seeded.issuePrefix}-2`);
+  });
+
+  it("recovers a stale reserved review without an identifier", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const reservedAt = new Date(now.getTime() - 10 * 60_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt: new Date(now.getTime() - 10 * 60 * 1000),
+      monitorScheduledBy: "assignee",
+    });
+    const reviewId = randomUUID();
+    await db.insert(issues).values({
+      id: reviewId,
+      companyId: seeded.companyId,
+      title: "Review productivity for reserved source",
+      description: "Reserved before identifier allocation",
+      status: "todo",
+      priority: "medium",
+      parentId: seeded.issueId,
+      assigneeAgentId: seeded.managerId,
+      originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+      originId: seeded.issueId,
+      originFingerprint: `productivity-review:${seeded.issueId}`,
+      requestDepth: 1,
+      createdAt: reservedAt,
+      updatedAt: reservedAt,
+      lastActivityAt: reservedAt,
+    });
+
+    const wakeups: Array<{ agentId: string; opts: unknown }> = [];
+    const result = await productivityReviewService(db, {
+      async enqueueWakeup(agentId, opts) {
+        wakeups.push({ agentId, opts });
+        return { id: randomUUID() };
+      },
+    }).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+    });
+
+    expect(result.created).toBe(1);
+    expect(result.monitorScheduledSuppressed).toBe(0);
+    const [review] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, reviewId));
+    expect(review?.identifier).toBe(`${seeded.issuePrefix}-2`);
+    expect(review?.issueNumber).toBe(2);
+    expect(review?.updatedAt.toISOString()).toBe(now.toISOString());
+    expect(wakeups).toHaveLength(1);
+    expect(wakeups[0]?.agentId).toBe(seeded.managerId);
+    expect(wakeups[0]?.opts).toMatchObject({
+      idempotencyKey: `productivity-review-created:${reviewId}`,
+    });
+
+    const activities = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.action, "issue.productivity_review_created"));
+    expect(activities).toHaveLength(1);
+    expect(activities[0]?.entityId).toBe(reviewId);
+    expect(await countReviewActivity(reviewId, "issue.productivity_review_assignment_wake_enqueued")).toBe(1);
+  });
+
+  it("preserves a Linear-backed reservation when local finalization fails after lookup", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const reservedAt = new Date(now.getTime() - 10 * 60_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt: new Date(now.getTime() - 10 * 60 * 1000),
+      monitorScheduledBy: "assignee",
+    });
+    await db
+      .update(companies)
+      .set({ identifierProvider: "linear" })
+      .where(eq(companies.id, seeded.companyId));
+    const [plugin] = await db
+      .insert(plugins)
+      .values({
+        pluginKey: "paperclip-plugin-linear",
+        packageName: "@kkroo/paperclip-plugin-linear",
+        version: "0.9.3",
+        manifestJson: {} as never,
+      })
+      .returning();
+    await db.insert(pluginState).values([
+      {
+        pluginId: plugin.id,
+        scopeKind: "instance",
+        stateKey: "oauth-team-id",
+        valueJson: "linear-team-id",
+      },
+      {
+        pluginId: plugin.id,
+        scopeKind: "instance",
+        stateKey: "oauth-token",
+        valueJson: "linear-oauth-token",
+      },
+    ]);
+    const reviewId = await insertProductivityReview({ seeded, createdAt: reservedAt });
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    fetchSpy.mockImplementation(async () =>
+      new Response(
+        JSON.stringify({
+          data: {
+            issue: {
+              id: reviewId,
+              identifier: "LIN-7777",
+              url: "https://linear.app/blockc/issue/LIN-7777/title-slug",
+            },
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+    await db.execute(sql`
+      alter table linear_issue_links
+      add constraint test_reject_productivity_review_linear_link
+      check (false)
+    `);
+
+    try {
+      const failed = await productivityReviewService(db).reconcileProductivityReviews({
+        now,
+        companyId: seeded.companyId,
+        thresholds: { monitorLapseServiceGraceMs: 60_000 },
+      });
+      expect(failed.failed).toBe(1);
+      const [reserved] = await db
+        .select({ id: issues.id, identifier: issues.identifier, issueNumber: issues.issueNumber })
+        .from(issues)
+        .where(eq(issues.id, reviewId));
+      expect(reserved).toMatchObject({ id: reviewId, identifier: null, issueNumber: null });
+    } finally {
+      await db.execute(sql`
+        alter table linear_issue_links
+        drop constraint test_reject_productivity_review_linear_link
+      `);
+    }
+
+    const recovered = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+    });
+    expect(recovered.created).toBe(1);
+    const [review] = await db
+      .select({ id: issues.id, identifier: issues.identifier, issueNumber: issues.issueNumber })
+      .from(issues)
+      .where(eq(issues.id, reviewId));
+    expect(review).toMatchObject({ id: reviewId, identifier: "LIN-7777", issueNumber: 7777 });
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    fetchSpy.mockRestore();
+  });
+
+  it("recovers a stale reserved review only once when reconcilers race", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const reservedAt = new Date(now.getTime() - 10 * 60_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt: new Date(now.getTime() - 10 * 60 * 1000),
+      monitorScheduledBy: "assignee",
+    });
+    const reviewId = await insertProductivityReview({ seeded, createdAt: reservedAt });
+
+    const wakeups: Array<{ agentId: string; opts: unknown }> = [];
+    let waitingReconcilers = 0;
+    const bothReconcilersReady = deferred();
+    const releaseReconcilers = deferred();
+    const service = productivityReviewService(db, {
+      async beforeStaleReservationRecoveryFinalize(review, sourceIssue) {
+        if (review.id !== reviewId || sourceIssue.id !== seeded.issueId) return;
+        waitingReconcilers += 1;
+        if (waitingReconcilers === 2) bothReconcilersReady.resolve();
+        await releaseReconcilers.promise;
+      },
+      async enqueueWakeup(agentId, opts) {
+        wakeups.push({ agentId, opts });
+        return { id: randomUUID() };
+      },
+    });
+
+    const first = service.reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+    });
+    const second = service.reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+    });
+    await bothReconcilersReady.promise;
+    releaseReconcilers.resolve();
+
+    const results = await Promise.all([first, second]);
+    expect(results[0].created + results[1].created).toBe(1);
+    expect(results[0].existing + results[1].existing).toBe(1);
+    expect(wakeups).toHaveLength(1);
+    expect(await countReviewActivity(reviewId, "issue.productivity_review_created")).toBe(1);
+    expect(await countReviewActivity(reviewId, "issue.productivity_review_assignment_wake_enqueued")).toBe(1);
+
+    const [review] = await db.select().from(issues).where(eq(issues.id, reviewId));
+    expect(review?.identifier).toBe(`${seeded.issuePrefix}-2`);
+    expect(review?.issueNumber).toBe(2);
+  });
+
+  it("replays missing finalized review side effects without duplicating them", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const createdAt = new Date(now.getTime() - 60_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt: new Date(now.getTime() - 10 * 60 * 1000),
+      monitorScheduledBy: "assignee",
+    });
+    const reviewId = await insertProductivityReview({
+      seeded,
+      createdAt,
+      issueNumber: 2,
+      identifier: `${seeded.issuePrefix}-2`,
+    });
+
+    const wakeups: Array<{ agentId: string; opts: unknown }> = [];
+    const service = productivityReviewService(db, {
+      async enqueueWakeup(agentId, opts) {
+        wakeups.push({ agentId, opts });
+        return { id: randomUUID() };
+      },
+    });
+
+    const replayed = await service.reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+    });
+    expect(replayed.created).toBe(1);
+    expect(replayed.failed).toBe(0);
+    expect(wakeups).toHaveLength(1);
+    expect(wakeups[0]?.opts).toMatchObject({
+      idempotencyKey: `productivity-review-created:${reviewId}`,
+    });
+    expect(await countReviewActivity(reviewId, "issue.productivity_review_created")).toBe(1);
+    expect(await countReviewActivity(reviewId, "issue.productivity_review_assignment_wake_enqueued")).toBe(1);
+
+    const second = await service.reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+    });
+    expect(second.created).toBe(0);
+    expect(second.existing).toBe(1);
+    expect(wakeups).toHaveLength(1);
+    expect(await countReviewActivity(reviewId, "issue.productivity_review_created")).toBe(1);
+    expect(await countReviewActivity(reviewId, "issue.productivity_review_assignment_wake_enqueued")).toBe(1);
+  });
+
+  it("retries finalized review assignment wake after a null enqueue result", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const createdAt = new Date(now.getTime() - 60_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt: new Date(now.getTime() - 10 * 60 * 1000),
+      monitorScheduledBy: "assignee",
+    });
+    const reviewId = await insertProductivityReview({
+      seeded,
+      createdAt,
+      issueNumber: 2,
+      identifier: `${seeded.issuePrefix}-2`,
+    });
+
+    const wakeups: Array<{ agentId: string; opts: unknown }> = [];
+    let enqueueAttempts = 0;
+    const service = productivityReviewService(db, {
+      async enqueueWakeup(agentId, opts) {
+        wakeups.push({ agentId, opts });
+        enqueueAttempts += 1;
+        if (enqueueAttempts === 2) {
+          await db
+            .update(activityLog)
+            .set({ createdAt: now })
+            .where(
+              and(
+                eq(activityLog.companyId, seeded.companyId),
+                eq(activityLog.entityType, "issue"),
+                eq(activityLog.entityId, reviewId),
+                inArray(activityLog.action, [
+                  "issue.productivity_review_assignment_wake_started",
+                  "issue.productivity_review_assignment_wake_failed",
+                ]),
+              ),
+            );
+        }
+        return enqueueAttempts === 1 ? null : { id: randomUUID() };
+      },
+    });
+
+    const first = await service.reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+    });
+    expect(first.created).toBe(1);
+    expect(wakeups).toHaveLength(1);
+    expect(await countReviewActivity(reviewId, "issue.productivity_review_created")).toBe(1);
+    expect(await countReviewActivity(reviewId, "issue.productivity_review_assignment_wake_enqueued")).toBe(0);
+
+    const second = await service.reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+    });
+    expect(second.created).toBe(1);
+    expect(wakeups).toHaveLength(2);
+    expect(await countReviewActivity(reviewId, "issue.productivity_review_created")).toBe(1);
+    expect(await countReviewActivity(reviewId, "issue.productivity_review_assignment_wake_enqueued")).toBe(1);
+  });
+
+  it("does not treat a fresh assignment wake claim as expired after a long scan", async () => {
+    const scanStartedAt = new Date(Date.now() - 10 * 60_000);
+    const createdAt = new Date(scanStartedAt.getTime() - 60_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(scanStartedAt.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt: new Date(scanStartedAt.getTime() - 10 * 60 * 1000),
+      monitorScheduledBy: "assignee",
+    });
+    const reviewId = await insertProductivityReview({
+      seeded,
+      createdAt,
+      issueNumber: 2,
+      identifier: `${seeded.issuePrefix}-2`,
+    });
+
+    const wakeups: Array<{ agentId: string; opts: unknown }> = [];
+    const firstWakeStarted = deferred();
+    const releaseFirstWake = deferred();
+    const service = productivityReviewService(db, {
+      async enqueueWakeup(agentId, opts) {
+        wakeups.push({ agentId, opts });
+        if (wakeups.length === 1) {
+          firstWakeStarted.resolve();
+          await releaseFirstWake.promise;
+        }
+        return { id: randomUUID() };
+      },
+    });
+
+    const first = service.reconcileProductivityReviews({
+      now: scanStartedAt,
+      companyId: seeded.companyId,
+      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+    });
+    await firstWakeStarted.promise;
+
+    const second = await service.reconcileProductivityReviews({
+      now: scanStartedAt,
+      companyId: seeded.companyId,
+      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+    });
+
+    expect(second.created).toBe(0);
+    expect(second.existing).toBe(1);
+    expect(wakeups).toHaveLength(1);
+    releaseFirstWake.resolve();
+    await first;
+    expect(await countReviewActivity(reviewId, "issue.productivity_review_assignment_wake_enqueued")).toBe(1);
+  });
+
+  it("treats a completed assignment wake request as durable delivery evidence", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const createdAt = new Date(now.getTime() - 60_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt: new Date(now.getTime() - 10 * 60 * 1000),
+      monitorScheduledBy: "assignee",
+    });
+    const reviewId = await insertProductivityReview({
+      seeded,
+      createdAt,
+      issueNumber: 2,
+      identifier: `${seeded.issuePrefix}-2`,
+    });
+    await db.insert(activityLog).values({
+      companyId: seeded.companyId,
+      actorType: "system",
+      actorId: "system",
+      action: "issue.productivity_review_created",
+      entityType: "issue",
+      entityId: reviewId,
+      agentId: seeded.managerId,
+      details: {
+        source: "productivity_review.reconcile",
+        sourceIssueId: seeded.issueId,
+        trigger: "long_active_duration",
+      },
+      createdAt,
+    });
+    await db.insert(agentWakeupRequests).values({
+      companyId: seeded.companyId,
+      agentId: seeded.managerId,
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      status: "completed",
+      idempotencyKey: `productivity-review-created:${reviewId}`,
+      requestedByActorType: "system",
+      requestedByActorId: "productivity_review",
+      requestedAt: createdAt,
+      finishedAt: createdAt,
+      createdAt,
+      updatedAt: createdAt,
+    });
+
+    const wakeups: Array<{ agentId: string; opts: unknown }> = [];
+    const service = productivityReviewService(db, {
+      async enqueueWakeup(agentId, opts) {
+        wakeups.push({ agentId, opts });
+        throw new Error("completed wake should be reused");
+      },
+    });
+
+    const replayed = await service.reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+    });
+    expect(replayed.created).toBe(1);
+    expect(wakeups).toHaveLength(0);
+    expect(await countReviewActivity(reviewId, "issue.productivity_review_created")).toBe(1);
+    expect(await countReviewActivity(reviewId, "issue.productivity_review_assignment_wake_enqueued")).toBe(1);
+  });
+
+  it("does not hold the review row lock while enqueueing assignment wake", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const createdAt = new Date(now.getTime() - 60_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt: new Date(now.getTime() - 10 * 60 * 1000),
+      monitorScheduledBy: "assignee",
+    });
+    const reviewId = await insertProductivityReview({
+      seeded,
+      createdAt,
+      issueNumber: 2,
+      identifier: `${seeded.issuePrefix}-2`,
+    });
+
+    const service = productivityReviewService(db, {
+      async enqueueWakeup() {
+        await db.transaction(async (tx) => {
+          await tx.execute(sql`
+            select ${issues.id}
+            from ${issues}
+            where ${issues.id} = ${reviewId}
+            for update
+          `);
+        });
+        return { id: randomUUID() };
+      },
+    });
+
+    await expect(
+      withTimeout(
+        service.reconcileProductivityReviews({
+          now,
+          companyId: seeded.companyId,
+          thresholds: { monitorLapseServiceGraceMs: 60_000 },
+        }),
+        1_000,
+        "productivity review wake enqueue row-lock replay",
+      ),
+    ).resolves.toMatchObject({ created: 1 });
+    expect(await countReviewActivity(reviewId, "issue.productivity_review_assignment_wake_enqueued")).toBe(1);
+  });
+
+  it("retires a stale reserved review after its source becomes terminal", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const reservedAt = new Date(now.getTime() - 10 * 60_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt: new Date(now.getTime() - 10 * 60 * 1000),
+      monitorScheduledBy: "assignee",
+    });
+    const reviewId = await insertProductivityReview({ seeded, createdAt: reservedAt });
+    await db
+      .update(issues)
+      .set({ status: "done", completedAt: new Date(now.getTime() - 60_000), updatedAt: now })
+      .where(eq(issues.id, seeded.issueId));
+
+    const wakeups: Array<{ agentId: string; opts: unknown }> = [];
+    const result = await productivityReviewService(db, {
+      async enqueueWakeup(agentId, opts) {
+        wakeups.push({ agentId, opts });
+        return { id: randomUUID() };
+      },
+    }).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+    });
+
+    expect(result.scanned).toBe(0);
+    expect(result.created).toBe(0);
+    expect(result.closedTerminalSourceReviews).toBe(1);
+    const [review] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, reviewId));
+    expect(review).toMatchObject({ status: "done", identifier: null, issueNumber: null });
+    expect(wakeups).toHaveLength(0);
+    expect(await countReviewActivity(reviewId, "issue.productivity_review_created")).toBe(0);
+    expect(await countReviewActivity(reviewId, "issue.productivity_review_assignment_wake_enqueued")).toBe(0);
+    expect(await countReviewActivity(reviewId, "issue.productivity_review_suppressed_open_review_closed")).toBe(1);
+  });
+
+  it("retires a stale reserved review after its source leaves candidate status", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const reservedAt = new Date(now.getTime() - 10 * 60_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt: new Date(now.getTime() - 10 * 60 * 1000),
+      monitorScheduledBy: "assignee",
+    });
+    const reviewId = await insertProductivityReview({ seeded, createdAt: reservedAt });
+    await db
+      .update(issues)
+      .set({ status: "in_review", updatedAt: now })
+      .where(eq(issues.id, seeded.issueId));
+
+    const wakeups: Array<{ agentId: string; opts: unknown }> = [];
+    const result = await productivityReviewService(db, {
+      async enqueueWakeup(agentId, opts) {
+        wakeups.push({ agentId, opts });
+        return { id: randomUUID() };
+      },
+    }).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+    });
+
+    expect(result.created).toBe(0);
+    expect(result.closedTerminalSourceReviews).toBe(1);
+    const [review] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, reviewId));
+    expect(review).toMatchObject({ status: "done", identifier: null, issueNumber: null });
+    expect(wakeups).toHaveLength(0);
+    expect(await countReviewActivity(reviewId, "issue.productivity_review_created")).toBe(0);
+    expect(await countReviewActivity(reviewId, "issue.productivity_review_assignment_wake_enqueued")).toBe(0);
+    const [closed] = await db
+      .select({ details: activityLog.details })
+      .from(activityLog)
+      .where(and(eq(activityLog.entityId, reviewId), eq(activityLog.action, "issue.productivity_review_suppressed_open_review_closed")));
+    expect(closed?.details).toMatchObject({ suppressedBy: "unreviewable_source", sourceStatus: "in_review" });
+  });
+
+  it("retires a stale reserved review after its source review owner changes", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const reservedAt = new Date(now.getTime() - 10 * 60_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt: new Date(now.getTime() - 10 * 60 * 1000),
+      monitorScheduledBy: "assignee",
+    });
+    const reviewId = await insertProductivityReview({ seeded, createdAt: reservedAt });
+    const newManagerId = randomUUID();
+    const newCoderId = randomUUID();
+    await db.insert(agents).values([
+      {
+        id: newManagerId,
+        companyId: seeded.companyId,
+        name: "New CTO",
+        role: "cto",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: newCoderId,
+        companyId: seeded.companyId,
+        name: "New Coder",
+        role: "engineer",
+        status: "idle",
+        reportsTo: newManagerId,
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+    await db
+      .update(issues)
+      .set({ assigneeAgentId: newCoderId, updatedAt: now })
+      .where(eq(issues.id, seeded.issueId));
+
+    const wakeups: Array<{ agentId: string; opts: unknown }> = [];
+    const result = await productivityReviewService(db, {
+      async enqueueWakeup(agentId, opts) {
+        wakeups.push({ agentId, opts });
+        return { id: randomUUID() };
+      },
+    }).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+    });
+
+    expect(result.created).toBe(0);
+    expect(result.closedTerminalSourceReviews).toBe(1);
+    const [review] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, reviewId));
+    expect(review).toMatchObject({ status: "done", identifier: null, issueNumber: null });
+    expect(wakeups).toHaveLength(0);
+    expect(await countReviewActivity(reviewId, "issue.productivity_review_created")).toBe(0);
+    expect(await countReviewActivity(reviewId, "issue.productivity_review_assignment_wake_enqueued")).toBe(0);
+    const [closed] = await db
+      .select({ details: activityLog.details })
+      .from(activityLog)
+      .where(and(eq(activityLog.entityId, reviewId), eq(activityLog.action, "issue.productivity_review_suppressed_open_review_closed")));
+    expect(closed?.details).toMatchObject({ suppressedBy: "review_owner_changed" });
+  });
+
+  it("retires a stale reserved review after its source is reassigned under the same review owner", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const reservedAt = new Date(now.getTime() - 10 * 60_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt: new Date(now.getTime() - 10 * 60 * 1000),
+      monitorScheduledBy: "assignee",
+    });
+    const reviewId = await insertProductivityReview({ seeded, createdAt: reservedAt });
+    const newCoderId = randomUUID();
+    await db.insert(agents).values({
+      id: newCoderId,
+      companyId: seeded.companyId,
+      name: "Same Manager Coder",
+      role: "engineer",
+      status: "idle",
+      reportsTo: seeded.managerId,
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db
+      .update(issues)
+      .set({ assigneeAgentId: newCoderId, updatedAt: now })
+      .where(eq(issues.id, seeded.issueId));
+
+    const wakeups: Array<{ agentId: string; opts: unknown }> = [];
+    const result = await productivityReviewService(db, {
+      async enqueueWakeup(agentId, opts) {
+        wakeups.push({ agentId, opts });
+        return { id: randomUUID() };
+      },
+    }).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+    });
+
+    expect(result.created).toBe(0);
+    expect(result.closedTerminalSourceReviews).toBe(1);
+    const [review] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, reviewId));
+    expect(review).toMatchObject({ status: "done", identifier: null, issueNumber: null });
+    expect(wakeups).toHaveLength(0);
+    expect(await countReviewActivity(reviewId, "issue.productivity_review_created")).toBe(0);
+    expect(await countReviewActivity(reviewId, "issue.productivity_review_assignment_wake_enqueued")).toBe(0);
+    const [closed] = await db
+      .select({ details: activityLog.details })
+      .from(activityLog)
+      .where(and(eq(activityLog.entityId, reviewId), eq(activityLog.action, "issue.productivity_review_suppressed_open_review_closed")));
+    expect(closed?.details).toMatchObject({ suppressedBy: "unreviewable_source" });
+  });
+
+  it("retires a stale reserved review after its source disappears", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const reservedAt = new Date(now.getTime() - 10 * 60_000);
+    const seeded = await seedAssignedIssue({
+      status: "done",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    const missingSourceId = randomUUID();
+    const reviewId = await insertProductivityReview({ seeded, createdAt: reservedAt });
+    await db
+      .update(issues)
+      .set({
+        parentId: null,
+        originId: missingSourceId,
+        originFingerprint: `productivity-review:${missingSourceId}`,
+        updatedAt: reservedAt,
+      })
+      .where(eq(issues.id, reviewId));
+
+    const wakeups: Array<{ agentId: string; opts: unknown }> = [];
+    const result = await productivityReviewService(db, {
+      async enqueueWakeup(agentId, opts) {
+        wakeups.push({ agentId, opts });
+        return { id: randomUUID() };
+      },
+    }).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+    });
+
+    expect(result.created).toBe(0);
+    expect(result.closedTerminalSourceReviews).toBe(1);
+    const [review] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, reviewId));
+    expect(review).toMatchObject({ status: "done", identifier: null, issueNumber: null });
+    expect(wakeups).toHaveLength(0);
+    expect(await countReviewActivity(reviewId, "issue.productivity_review_created")).toBe(0);
+    expect(await countReviewActivity(reviewId, "issue.productivity_review_assignment_wake_enqueued")).toBe(0);
+    const [closed] = await db
+      .select({ details: activityLog.details })
+      .from(activityLog)
+      .where(and(eq(activityLog.entityId, reviewId), eq(activityLog.action, "issue.productivity_review_suppressed_open_review_closed")));
+    expect(closed?.details).toMatchObject({
+      suppressedBy: "missing_source",
+      sourceIssueId: missingSourceId,
+      sourceMissing: true,
+    });
+  });
+
+  // Negative control for BLO-21003: a monitor that lapsed well past the
+  // lapse-to-service grace window, with no pending wake, is genuinely
+  // unsupervised and must still fire exactly as it does today. Without this
+  // case, a fix that simply disabled the trigger (e.g. always suppressing)
+  // would pass the positive test above too.
+  it("still creates a long-active review when the monitor lapsed well past the service grace window", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt: new Date(now.getTime() - 10 * 60 * 1000),
+      monitorScheduledBy: "assignee",
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    expect(result.monitorScheduledSuppressed).toBe(0);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+  });
+
+  // BLO-21003 AC3: even outside the suppression window (monitor already
+  // triggered, `monitorNextCheckAt` cleared), a sub-minute nonzero unattended
+  // residue must not floor to `0m` — that reads as "measured and zero" rather
+  // than "sub-minute and real". Replays the BLO-19772 shape (14h10m elapsed,
+  // wake serviced ~29s after the monitor came due) but reports the residue
+  // directly as seconds instead of flooring it away.
+  it("reports a sub-minute unattended residue in seconds instead of flooring it to 0m", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const startedAt = new Date(now.getTime() - (14 * 60 + 10) * 60 * 1000);
+    const monitorLastTriggeredAt = new Date(now.getTime() - 45_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt,
+      monitorNextCheckAt: null,
+      monitorScheduledBy: "assignee",
+      monitorLastTriggeredAt,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    expect(result.monitorScheduledSuppressed).toBe(0);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain(
+      `- Elapsed accounting: 14h 9m monitor-gated, 45s unattended (monitor lapsed at ${monitorLastTriggeredAt.toISOString()}, never re-armed)`,
+    );
+    expect(review?.description).not.toContain("0m unattended");
   });
 
   it("reports the whole episode as unattended when no monitor was ever armed", async () => {
@@ -1264,6 +2946,61 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(review?.status).toBe("done");
   });
 
+  it("does not close an open long-active review for a recently lapsed monitor wake", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt: new Date(now.getTime() - 5_000),
+      monitorScheduledBy: "board",
+      monitorWakeRequestedAt: new Date(now.getTime() - 1_000),
+    });
+    const reviewId = randomUUID();
+    await db.insert(issues).values({
+      id: reviewId,
+      companyId: seeded.companyId,
+      title: "Review productivity for source",
+      status: "todo",
+      priority: "medium",
+      parentId: seeded.issueId,
+      originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+      originId: seeded.issueId,
+      originFingerprint: `productivity-review:${seeded.issueId}`,
+      issueNumber: 2,
+      identifier: `${seeded.issuePrefix}-2`,
+      createdAt: now,
+      updatedAt: now,
+    });
+    await logActivity(db, {
+      companyId: seeded.companyId,
+      actorType: "system",
+      actorId: "system",
+      action: "issue.productivity_review_created",
+      entityType: "issue",
+      entityId: reviewId,
+      details: {
+        trigger: "long_active_duration",
+        sourceIssueId: seeded.issueId,
+      },
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.closedSuppressedMonitorReviews).toBe(0);
+    expect(result.monitorScheduledSuppressed).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.status).toBe("todo");
+
+    const closures = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.action, "issue.productivity_review_suppressed_open_review_closed"));
+    expect(closures).toHaveLength(0);
+  });
+
   it("does not close open no-comment productivity reviews when the source has a deliberate future monitor", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const seeded = await seedAssignedIssue({
@@ -1306,6 +3043,284 @@ describeEmbeddedPostgres("productivity review service", () => {
       companyId: seeded.companyId,
     });
 
+    expect(result.closedSuppressedMonitorReviews).toBe(0);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.status).toBe("todo");
+  });
+
+  it("closes an open long-active productivity review once its source issue is done", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "done",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    const reviewId = randomUUID();
+    await db.insert(issues).values({
+      id: reviewId,
+      companyId: seeded.companyId,
+      title: "Review productivity for source",
+      status: "todo",
+      priority: "medium",
+      parentId: seeded.issueId,
+      originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+      originId: seeded.issueId,
+      originFingerprint: `productivity-review:${seeded.issueId}`,
+      issueNumber: 2,
+      identifier: `${seeded.issuePrefix}-2`,
+      createdAt: now,
+      updatedAt: now,
+    });
+    await logActivity(db, {
+      companyId: seeded.companyId,
+      actorType: "system",
+      actorId: "system",
+      action: "issue.productivity_review_created",
+      entityType: "issue",
+      entityId: reviewId,
+      details: {
+        trigger: "long_active_duration",
+        sourceIssueId: seeded.issueId,
+      },
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.closedTerminalSourceReviews).toBe(1);
+    expect(result.closedSuppressedMonitorReviews).toBe(0);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.status).toBe("done");
+    expect(review?.completedAt).toEqual(now);
+
+    const closeEntries = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.action, "issue.productivity_review_suppressed_open_review_closed"));
+    expect(closeEntries).toHaveLength(1);
+    expect(closeEntries[0]?.entityId).toBe(reviewId);
+    expect(closeEntries[0]?.details).toMatchObject({
+      suppressedBy: "terminal_source",
+      sourceStatus: "done",
+      sourceIssueId: seeded.issueId,
+    });
+  });
+
+  it("does not close a long-active productivity review when the source was cancelled", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "cancelled",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    const reviewId = randomUUID();
+    await db.insert(issues).values({
+      id: reviewId,
+      companyId: seeded.companyId,
+      title: "Review productivity for source",
+      status: "todo",
+      priority: "medium",
+      parentId: seeded.issueId,
+      originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+      originId: seeded.issueId,
+      originFingerprint: `productivity-review:${seeded.issueId}`,
+      issueNumber: 2,
+      identifier: `${seeded.issuePrefix}-2`,
+      createdAt: now,
+      updatedAt: now,
+    });
+    await logActivity(db, {
+      companyId: seeded.companyId,
+      actorType: "system",
+      actorId: "system",
+      action: "issue.productivity_review_created",
+      entityType: "issue",
+      entityId: reviewId,
+      details: {
+        trigger: "long_active_duration",
+        sourceIssueId: seeded.issueId,
+      },
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.closedTerminalSourceReviews).toBe(0);
+    expect(result.closedSuppressedMonitorReviews).toBe(0);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.status).toBe("todo");
+  });
+
+  it("does not close a done-source review whose trigger was not long_active_duration", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({ status: "done" });
+    const reviewId = randomUUID();
+    await db.insert(issues).values({
+      id: reviewId,
+      companyId: seeded.companyId,
+      title: "Review productivity for source",
+      status: "in_progress",
+      priority: "high",
+      parentId: seeded.issueId,
+      originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+      originId: seeded.issueId,
+      originFingerprint: `productivity-review:${seeded.issueId}`,
+      issueNumber: 2,
+      identifier: `${seeded.issuePrefix}-2`,
+      createdAt: now,
+      updatedAt: now,
+    });
+    await logActivity(db, {
+      companyId: seeded.companyId,
+      actorType: "system",
+      actorId: "system",
+      action: "issue.productivity_review_created",
+      entityType: "issue",
+      entityId: reviewId,
+      details: {
+        trigger: "no_comment_streak",
+        sourceIssueId: seeded.issueId,
+      },
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.closedTerminalSourceReviews).toBe(0);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.status).toBe("in_progress");
+  });
+
+  it("does not close a done-source review when creation trigger provenance is missing", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({ status: "done" });
+    const reviewId = randomUUID();
+    await db.insert(issues).values({
+      id: reviewId,
+      companyId: seeded.companyId,
+      title: "Review productivity for source",
+      status: "todo",
+      priority: "medium",
+      parentId: seeded.issueId,
+      originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+      originId: seeded.issueId,
+      originFingerprint: `productivity-review:${seeded.issueId}`,
+      issueNumber: 2,
+      identifier: `${seeded.issuePrefix}-2`,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.closedTerminalSourceReviews).toBe(0);
+    expect(result.closedSuppressedMonitorReviews).toBe(0);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.status).toBe("todo");
+  });
+
+  it("logs and counts a terminal-source close only once when reconcilers race", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "done",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    const reviewId = randomUUID();
+    await db.insert(issues).values({
+      id: reviewId,
+      companyId: seeded.companyId,
+      title: "Review productivity for source",
+      status: "todo",
+      priority: "medium",
+      parentId: seeded.issueId,
+      originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+      originId: seeded.issueId,
+      originFingerprint: `productivity-review:${seeded.issueId}`,
+      issueNumber: 2,
+      identifier: `${seeded.issuePrefix}-2`,
+      createdAt: now,
+      updatedAt: now,
+    });
+    await logActivity(db, {
+      companyId: seeded.companyId,
+      actorType: "system",
+      actorId: "system",
+      action: "issue.productivity_review_created",
+      entityType: "issue",
+      entityId: reviewId,
+      details: {
+        trigger: "long_active_duration",
+        sourceIssueId: seeded.issueId,
+      },
+    });
+
+    const [first, second] = await Promise.all([
+      productivityReviewService(db).reconcileProductivityReviews({
+        now,
+        companyId: seeded.companyId,
+      }),
+      productivityReviewService(db).reconcileProductivityReviews({
+        now,
+        companyId: seeded.companyId,
+      }),
+    ]);
+
+    expect(first.closedTerminalSourceReviews + second.closedTerminalSourceReviews).toBe(1);
+    const closeEntries = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.action, "issue.productivity_review_suppressed_open_review_closed"));
+    expect(closeEntries).toHaveLength(1);
+  });
+
+  it("leaves an open productivity review alone while its source issue is still active", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    const reviewId = randomUUID();
+    await db.insert(issues).values({
+      id: reviewId,
+      companyId: seeded.companyId,
+      title: "Review productivity for source",
+      status: "todo",
+      priority: "medium",
+      parentId: seeded.issueId,
+      originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+      originId: seeded.issueId,
+      originFingerprint: `productivity-review:${seeded.issueId}`,
+      issueNumber: 2,
+      identifier: `${seeded.issuePrefix}-2`,
+      createdAt: now,
+      updatedAt: now,
+    });
+    await logActivity(db, {
+      companyId: seeded.companyId,
+      actorType: "system",
+      actorId: "system",
+      action: "issue.productivity_review_created",
+      entityType: "issue",
+      entityId: reviewId,
+      details: {
+        trigger: "long_active_duration",
+        sourceIssueId: seeded.issueId,
+      },
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.closedTerminalSourceReviews).toBe(0);
     expect(result.closedSuppressedMonitorReviews).toBe(0);
     const [review] = await listProductivityReviews(seeded.companyId);
     expect(review?.status).toBe("todo");

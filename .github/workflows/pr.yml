@@ -4,9 +4,12 @@ on:
   pull_request:
     branches:
       - master
+  merge_group:
+    types:
+      - checks_requested
 
 concurrency:
-  group: pr-${{ github.event.pull_request.number }}
+  group: pr-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.run_id }}
   cancel-in-progress: true
 
 env:
@@ -14,6 +17,8 @@ env:
   RUSTC_WRAPPER: sccache
   CC: "sccache gcc"
   CXX: "sccache g++"
+  PR_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+  PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
 
 jobs:
   policy:
@@ -39,6 +44,7 @@ jobs:
         # allyblockcast rename (the `ally` app slug was globally taken) so the
         # guard holds before and after the identity cutover.
         if: >-
+          github.event_name == 'pull_request' &&
           github.head_ref != 'chore/refresh-lockfile' &&
           github.event.pull_request.user.login != 'blockcast-ci-packages[bot]' &&
           github.event.pull_request.user.login != 'allyblockcast[bot]' &&
@@ -46,7 +52,7 @@ jobs:
         run: |
           # Diff the PR branch against its merge base so recent base-branch commits
           # do not masquerade as changes made by the PR itself.
-          changed="$(git diff --name-only "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}")"
+          changed="$(git diff --name-only "$PR_BASE_SHA...$PR_HEAD_SHA")"
           if printf '%s\n' "$changed" | grep -qx 'pnpm-lock.yaml'; then
             echo "Do not commit pnpm-lock.yaml in pull requests. CI owns lockfile updates."
             exit 1
@@ -86,6 +92,20 @@ jobs:
       - name: Test PR test-coverage gate
         run: node --test ./.github/scripts/tests/check-pr-test-coverage.test.mjs
 
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.16.3
+
+      - name: Test Helm chart render suite (deploy/helm/paperclip)
+        # These render tests (topology-spread, probes, role-rbac, prometheus-rule,
+        # service-monitor, blockcast-auth, runtime-cache) previously ran nowhere in
+        # CI — a chart edit could silently break or regress any of them and every
+        # required check would stay green. BLO-20901's whole premise is that
+        # paperclip-api node spread is "enforced by scheduler policy, not left to
+        # chance"; that claim only holds if the test asserting it actually runs.
+        run: node --test deploy/helm/paperclip/tests/*.test.mjs
+
       - name: Test Ally review-consistency guard
         run: node --test ./scripts/check-ally-review-consistency.test.mjs
 
@@ -104,19 +124,22 @@ jobs:
       - name: Test devDependency install guard (NODE_ENV=production)
         run: node --test ./scripts/__tests__/npmrc-devdeps-guard.test.mjs
 
+      - name: Test verify job cancelled/skipped-vs-failed lane outcome
+        run: node --test ./scripts/__tests__/pr-verify-lane-outcome.test.mjs
+
       - name: Validate release package manifest
         run: node ./scripts/release-package-map.mjs check
 
       - name: Verify release package bootstrap for changed manifests
         run: |
-          mapfile -t changed_paths < <(git diff --name-only "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}")
-          PAPERCLIP_RELEASE_BOOTSTRAP_BASE_SHA="${{ github.event.pull_request.base.sha }}" \
+          mapfile -t changed_paths < <(git diff --name-only "$PR_BASE_SHA...$PR_HEAD_SHA")
+          PAPERCLIP_RELEASE_BOOTSTRAP_BASE_SHA="$PR_BASE_SHA" \
             node ./scripts/check-release-package-bootstrap.mjs "${changed_paths[@]}"
 
       - name: Validate dependency resolution when manifests change
         id: regen_lockfile
         run: |
-          changed="$(git diff --name-only "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}")"
+          changed="$(git diff --name-only "$PR_BASE_SHA...$PR_HEAD_SHA")"
           manifest_pattern='(^|/)package\.json$|^pnpm-workspace\.yaml$|^\.npmrc$|^pnpmfile\.(cjs|js|mjs)$'
           if printf '%s\n' "$changed" | grep -Eq "$manifest_pattern"; then
             pnpm install --lockfile-only --ignore-scripts --no-frozen-lockfile
@@ -137,6 +160,42 @@ jobs:
           path: pnpm-lock.yaml
           retention-days: 1
           if-no-files-found: error
+
+  # The chart tests under deploy/helm/paperclip/tests/ were never wired into any
+  # workflow -- 21 assertions about the manifests we actually ship (Penstock
+  # routing, ServiceMonitor RBAC, runtime caches, probes) that no CI run has ever
+  # executed. This job runs them, and gates the BLO-20733 approval-plan marker:
+  # the release channel's completion check is bound to a marker computed from an
+  # unstamped render, which is only sound while stamping perturbs nothing else.
+  #
+  # Deliberately its own job rather than a step in `policy`: it needs helm and
+  # kubectl, and a tooling regression in provisioning those should not take down
+  # the gate that every unrelated PR depends on.
+  helm_chart:
+    name: Helm chart
+    runs-on: arc-light
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Install helm
+        uses: azure/setup-helm@v4
+
+      # Only ever invoked as `kubectl create --dry-run=client -o json`, i.e. as
+      # an offline YAML reader so the render comparisons are structural rather
+      # than textual. No cluster credential is used or needed.
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Test Helm chart renders
+        run: node --test ./deploy/helm/paperclip/tests/*.test.mjs
 
   typecheck_release_registry:
     name: Typecheck + Release Registry
@@ -346,24 +405,96 @@ jobs:
 
   verify:
     # Preserve the legacy required-check name while the underlying work runs in parallel.
+    # BLO-20869: verify_serialized_server is folded in here (rather than made
+    # required on its own) so a cancelled/skipped/never-scheduled serialized
+    # shard fails this required check instead of being invisible to the merge
+    # gate. See the issue for the measured latency tradeoff of putting a
+    # ~90-minute job on the required path this way.
     name: verify
     if: ${{ always() }}
-    needs: [typecheck_release_registry, general_tests, worktree_install, build]
+    needs:
+      [
+        helm_chart,
+        typecheck_release_registry,
+        general_tests,
+        worktree_install,
+        build,
+        verify_serialized_server,
+      ]
     runs-on: arc-light
     timeout-minutes: 5
 
     steps:
+      # BLO-20867: an upstream lane can end up `cancelled` or `skipped` rather
+      # than `failure`. A plain `test "$X" = "success"` makes every one of
+      # these look like an identical failing required check, so authors
+      # misattribute the outcome to their own diff. Separate them here so the
+      # annotation on this job says which ones actually happened — a run can
+      # have more than one non-success category at once (e.g. one lane
+      # genuinely failed while another was evicted), so every category with
+      # at least one lane in it gets its own annotation instead of only the
+      # first one checked:
+      #   - failure:   the lane ran and reported a result other than success.
+      #     Often a real problem with the diff, but a lane can also report
+      #     failure due to its own setup/runner trouble — check that lane's
+      #     logs rather than assuming the diff is at fault.
+      #   - cancelled: the lane was interrupted before it produced a result —
+      #     possibly a CI infrastructure interruption (see BLO-20867), but
+      #     also possibly a manual cancellation or another cause this job
+      #     cannot distinguish from here. Not evidence of a diff problem.
+      #   - skipped:   the lane never ran because a dependency it needs
+      #     (typically `policy`) did not succeed. The defect, if any, is in
+      #     that dependency, not in this lane.
       - name: Fail if any split verify lane failed
         env:
+          HELM_CHART_RESULT: ${{ needs.helm_chart.result }}
           TYPECHECK_RELEASE_REGISTRY_RESULT: ${{ needs.typecheck_release_registry.result }}
           GENERAL_TESTS_RESULT: ${{ needs.general_tests.result }}
           WORKTREE_INSTALL_RESULT: ${{ needs.worktree_install.result }}
           BUILD_RESULT: ${{ needs.build.result }}
+          VERIFY_SERIALIZED_SERVER_RESULT: ${{ needs.verify_serialized_server.result }}
         run: |
-          test "$TYPECHECK_RELEASE_REGISTRY_RESULT" = "success"
-          test "$GENERAL_TESTS_RESULT" = "success"
-          test "$WORKTREE_INSTALL_RESULT" = "success"
-          test "$BUILD_RESULT" = "success"
+          declare -A lane_results=(
+            [helm_chart]="$HELM_CHART_RESULT"
+            [typecheck_release_registry]="$TYPECHECK_RELEASE_REGISTRY_RESULT"
+            [general_tests]="$GENERAL_TESTS_RESULT"
+            [worktree_install]="$WORKTREE_INSTALL_RESULT"
+            [build]="$BUILD_RESULT"
+            [verify_serialized_server]="$VERIFY_SERIALIZED_SERVER_RESULT"
+          )
+
+          cancelled_lanes=()
+          skipped_lanes=()
+          failed_lanes=()
+          for lane in "${!lane_results[@]}"; do
+            case "${lane_results[$lane]}" in
+              success) ;;
+              cancelled) cancelled_lanes+=("$lane") ;;
+              skipped) skipped_lanes+=("$lane") ;;
+              *) failed_lanes+=("$lane") ;;
+            esac
+          done
+
+          any_non_success=0
+
+          if [ "${#failed_lanes[@]}" -gt 0 ]; then
+            echo "::error title=verify: lane failure::Upstream lane(s) reported failure: ${failed_lanes[*]}. This may reflect a real problem with the PR diff, but a lane can also fail due to its own setup or runner trouble — check that lane's own logs before assuming the diff is at fault."
+            any_non_success=1
+          fi
+
+          if [ "${#skipped_lanes[@]}" -gt 0 ]; then
+            echo "::error title=verify: lane skipped::Upstream lane(s) did not run: ${skipped_lanes[*]}. GitHub Actions skips a lane when a job it needs (typically 'policy') did not succeed — check that dependency's logs, not this lane's."
+            any_non_success=1
+          fi
+
+          if [ "${#cancelled_lanes[@]}" -gt 0 ]; then
+            echo "::error title=verify: lane cancelled::Upstream lane(s) were CANCELLED, not failed: ${cancelled_lanes[*]}. This is not a report of a defect in this PR's diff — the lane was interrupted before it could produce a result (possible causes include a CI infrastructure interruption, see BLO-20867, or a manual cancellation). Re-run the job to get a real result."
+            any_non_success=1
+          fi
+
+          if [ "$any_non_success" -eq 1 ]; then
+            exit 1
+          fi
 
   build:
     name: Build

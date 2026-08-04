@@ -41,7 +41,37 @@ spec:
         {{- with .Values.pod.labels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
-      {{- with .Values.pod.annotations }}
+      {{- /*
+      BLO-20733: stamp the approval plan marker onto the POD TEMPLATE, so it is
+      part of the rolled-out spec rather than top-level metadata a config-only
+      edit could carry. scripts/approve-paperclip-api-digest.sh refuses any plan
+      whose template lacks it, records it on the in-flight lock, and its
+      ROLLOUT_COMPLETE_JQ requires the live template to carry this exact value
+      before retiring that lock -- so a healthy rollout of a DIFFERENT plan that
+      happens to reuse the approved digest can no longer retire it.
+
+      The marker's value is the SHA-256 of the canonical rendered Deployment
+      with this annotation removed, which is why it cannot be computed inside
+      the template (it would hash a document containing itself). The deploy job
+      renders once unstamped, hashes, then re-renders with the value set.
+
+      That two-pass scheme is only sound if setting this value changes NOTHING
+      ELSE in the rendered output. Keeping the stamp confined to this one merged
+      key is what preserves it, and
+      deploy/helm/paperclip/tests/approval-plan-marker.test.mjs pins it by
+      diffing a stamped render against an unstamped one.
+      */}}
+      {{- $podAnnotations := deepCopy (.Values.pod.annotations | default dict) }}
+      {{- if hasKey $podAnnotations "paperclip.blockcast.net/approval-plan-sha256" }}
+      {{- fail "pod.annotations must not set reserved key paperclip.blockcast.net/approval-plan-sha256; use api.approvalPlanSha256 through the release workflow" }}
+      {{- end }}
+      {{- with .Values.api.approvalPlanSha256 }}
+      {{- if not (regexMatch "^[0-9a-f]{64}$" .) }}
+      {{- fail (printf "api.approvalPlanSha256 must be 64 lowercase hex characters, got %q" .) }}
+      {{- end }}
+      {{- $_ := set $podAnnotations "paperclip.blockcast.net/approval-plan-sha256" . }}
+      {{- end }}
+      {{- with $podAnnotations }}
       annotations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
@@ -79,6 +109,34 @@ spec:
         {{- end }}
         {{- end }}
         {{- end }}
+      # Hard-enforced spread (BLO-20901): the preferred podAntiAffinity above
+      # is only a scheduler hint, which is exactly how both replicas ended up
+      # on one node during the 2026-08-02 outage. DoNotSchedule makes
+      # co-location impossible for pods of the SAME ReplicaSet (steady state:
+      # both live replicas, always) — mirrors the paperclip-mcp Deployment
+      # (same namespace, applied outside this chart), which stayed up during
+      # that outage by refusing to co-locate.
+      # `matchLabelKeys: [pod-template-hash]` scopes the skew calculation to
+      # one revision at a time so a rollout starting from a degraded
+      # (already-skewed) fleet doesn't wedge the surge pod Pending forever.
+      # Trade-off: during that transient rollout window an old-revision pod
+      # and the new-revision surge pod CAN share a node — the invariant only
+      # holds for same-revision pods, i.e. always in steady state, not
+      # necessarily for the few seconds/minutes a rollout is in flight.
+      # Safe against `nodeSelector` below spanning the full multi-node pool:
+      # DoNotSchedule only parks a replica Pending if fewer than minDomains
+      # nodes in that pool are Ready, not merely because two specific
+      # hostnames are unavailable.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          minDomains: 2
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          matchLabelKeys:
+            - pod-template-hash
+          labelSelector:
+            matchLabels:
+              {{- include "paperclip.apiSelectorLabels" . | nindent 14 }}
       {{- else }}
       {{- with .Values.affinity }}
       affinity:

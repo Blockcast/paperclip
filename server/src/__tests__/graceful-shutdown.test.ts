@@ -1,11 +1,77 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { EventEmitter } from "node:events";
+import fs from "node:fs";
 import { createServer, get as httpGet, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
+import os from "node:os";
+import path from "node:path";
 import type { Response } from "express";
 
 import { sseRegistry } from "../services/sse-registry.js";
 import { logShutdownSignal, writeShutdownBreadcrumb } from "../shutdown-log.js";
+
+/**
+ * Captures shutdown breadcrumbs by pointing the real write at a temp file.
+ *
+ * These tests used to stub `process.stderr.write`. That stopped being the sink
+ * when `shutdown-log.ts` moved to `fs.writeSync` on the raw fd — but the
+ * deeper problem is that stubbing the stream could never have caught the bug
+ * that motivated the move: a stub returns synchronously whether or not the
+ * underlying write is asynchronous, so "writes synchronously" passed for years
+ * against a write that libuv was queueing. Redirecting the fd instead means
+ * the assertions below observe bytes that a real `write(2)` has delivered, so
+ * `toHaveLength(1)` immediately after the call is now a genuine synchronicity
+ * claim. The out-of-process suite in `process-crash-guard-exit.test.ts` covers
+ * the other half — surviving a real `process.exit`.
+ */
+function createStderrCapture() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "shutdown-log-"));
+  const file = path.join(dir, "stderr.log");
+  const fd = fs.openSync(file, "a+");
+  const original = Object.getOwnPropertyDescriptor(process, "stderr");
+  let degraded = 0;
+
+  Object.defineProperty(process, "stderr", {
+    configurable: true,
+    value: {
+      fd,
+      // The stream path is the *degraded* branch now. Counting it is what
+      // makes this harness discriminating: if the implementation regressed to
+      // `process.stderr.write`, the bytes would still arrive here and every
+      // content assertion would pass — so the tests assert this stays 0.
+      write: (chunk: unknown) => {
+        degraded += 1;
+        fs.writeSync(fd, typeof chunk === "string" ? chunk : String(chunk));
+        return true;
+      },
+    },
+  });
+
+  return {
+    /** One entry per written line, trailing newline preserved. */
+    lines(): string[] {
+      const raw = fs.readFileSync(file, "utf8");
+      if (raw === "") return [];
+      return raw
+        .split("\n")
+        .slice(0, -1)
+        .map((line) => `${line}\n`);
+    },
+    /** Times the async stream fallback was used instead of the sync fd write. */
+    degradedWrites(): number {
+      return degraded;
+    },
+    restore(): void {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        /* already closed */
+      }
+      if (original) Object.defineProperty(process, "stderr", original);
+      fs.rmSync(dir, { recursive: true, force: true });
+    },
+  };
+}
 
 interface FakeRes extends EventEmitter {
   _written: string[];
@@ -244,37 +310,23 @@ describe("sseRegistry", () => {
 });
 
 describe("logShutdownSignal", () => {
-  // Capture process.stderr.write while the test runs. We can't replace pino
-  // (and don't want to), but stderr.write is the only path that's guaranteed
-  // synchronous on Linux when stdio is piped to kubelet — that's the whole
-  // point of this module.
-  let captured: string[];
-  let originalWrite: typeof process.stderr.write;
+  // Redirects the real stderr fd to a temp file — see `createStderrCapture`.
+  // `captured` reads back what an actual `write(2)` delivered, which is what
+  // makes the synchronicity assertion below meaningful.
+  let capture: ReturnType<typeof createStderrCapture>;
 
   beforeEach(() => {
-    captured = [];
-    originalWrite = process.stderr.write.bind(process.stderr);
-    process.stderr.write = ((chunk: unknown, ...rest: unknown[]) => {
-      const s = typeof chunk === "string" ? chunk : (chunk as Buffer).toString();
-      captured.push(s);
-      // Don't actually forward to stderr — the test output stays clean.
-      // Returning true is correct for non-flushed writes.
-      const cb = rest.find((arg) => typeof arg === "function") as
-        | ((err?: Error) => void)
-        | undefined;
-      if (cb) cb();
-      return true;
-    }) as typeof process.stderr.write;
+    capture = createStderrCapture();
   });
 
   afterEach(() => {
-    process.stderr.write = originalWrite;
+    capture.restore();
   });
 
   it("writes a single line containing the signal name to process.stderr", () => {
     logShutdownSignal("SIGTERM");
-    expect(captured.length).toBeGreaterThan(0);
-    const joined = captured.join("");
+    expect(capture.lines().length).toBeGreaterThan(0);
+    const joined = capture.lines().join("");
     expect(joined).toContain("SIGTERM");
     // The line is a meaningful breadcrumb — must mention shutdown.
     expect(joined.toLowerCase()).toContain("shutdown");
@@ -285,13 +337,15 @@ describe("logShutdownSignal", () => {
 
   it("writes synchronously — the line is in stderr BEFORE the function returns", () => {
     // This is the load-bearing guarantee. pino's async transport drops logs
-    // on process.exit; this module must not. Calling write must produce a
-    // captured entry before the next synchronous statement runs — no
-    // setImmediate / setTimeout / await tricks allowed in the implementation.
-    expect(captured).toHaveLength(0);
+    // on process.exit; this module must not. The bytes must be readable back
+    // off the fd before the next synchronous statement runs — no
+    // setImmediate / setTimeout / await tricks allowed in the implementation,
+    // and not via the async stream either (see degradedWrites).
+    expect(capture.lines()).toHaveLength(0);
     logShutdownSignal("SIGINT");
-    expect(captured).toHaveLength(1);
-    expect(captured[0]).toContain("SIGINT");
+    expect(capture.lines()).toHaveLength(1);
+    expect(capture.lines()[0]).toContain("SIGINT");
+    expect(capture.degradedWrites()).toBe(0);
   });
 
   it("escapes nothing — signal name appears verbatim", () => {
@@ -299,39 +353,28 @@ describe("logShutdownSignal", () => {
     // Easy regression: if someone wraps in JSON.stringify or adds quoting
     // later, the kubectl logs grep `Shutdown signal received | grep SIGTERM`
     // recipe in BLO-4137 stops matching.
-    expect(captured[0]).toMatch(/(^|[\s\W])SIGTERM([\s\W]|$)/);
+    expect(capture.lines()[0]).toMatch(/(^|[\s\W])SIGTERM([\s\W]|$)/);
   });
 });
 
 describe("writeShutdownBreadcrumb", () => {
-  // Same capture pattern as logShutdownSignal — these helpers share the same
-  // synchronous-stderr load-bearing guarantee. See that describe block above
-  // for the rationale.
-  let captured: string[];
-  let originalWrite: typeof process.stderr.write;
+  // Same fd-redirect harness as logShutdownSignal — these helpers share the
+  // same synchronous-stderr load-bearing guarantee. See that describe block
+  // above for the rationale.
+  let capture: ReturnType<typeof createStderrCapture>;
 
   beforeEach(() => {
-    captured = [];
-    originalWrite = process.stderr.write.bind(process.stderr);
-    process.stderr.write = ((chunk: unknown, ...rest: unknown[]) => {
-      const s = typeof chunk === "string" ? chunk : (chunk as Buffer).toString();
-      captured.push(s);
-      const cb = rest.find((arg) => typeof arg === "function") as
-        | ((err?: Error) => void)
-        | undefined;
-      if (cb) cb();
-      return true;
-    }) as typeof process.stderr.write;
+    capture = createStderrCapture();
   });
 
   afterEach(() => {
-    process.stderr.write = originalWrite;
+    capture.restore();
   });
 
   it("prefixes every line with [shutdown] and a trailing newline", () => {
     writeShutdownBreadcrumb("stopping embedded PostgreSQL (signal=SIGTERM)");
-    expect(captured.length).toBe(1);
-    const line = captured[0];
+    expect(capture.lines().length).toBe(1);
+    const line = capture.lines()[0];
     expect(line.startsWith("[shutdown] ")).toBe(true);
     expect(line.endsWith("\n")).toBe(true);
     expect(line).toContain("stopping embedded PostgreSQL");
@@ -339,18 +382,19 @@ describe("writeShutdownBreadcrumb", () => {
   });
 
   it("writes synchronously — captured BEFORE the function returns", () => {
-    // The load-bearing guarantee: each call must produce a stderr entry
-    // before the next synchronous statement runs. The trailing shutdown log
-    // lines exist precisely because pino's async transport drops late lines
-    // on process.exit; if this helper acquired async semantics it would
-    // re-introduce the gap.
-    expect(captured).toHaveLength(0);
+    // The load-bearing guarantee: each call must land bytes on the fd before
+    // the next synchronous statement runs. The trailing shutdown log lines
+    // exist precisely because pino's async transport drops late lines on
+    // process.exit; if this helper acquired async semantics — including by
+    // falling back to the stream — it would re-introduce the gap.
+    expect(capture.lines()).toHaveLength(0);
     writeShutdownBreadcrumb("step one");
-    expect(captured).toHaveLength(1);
+    expect(capture.lines()).toHaveLength(1);
     writeShutdownBreadcrumb("step two");
-    expect(captured).toHaveLength(2);
-    expect(captured[0]).toContain("step one");
-    expect(captured[1]).toContain("step two");
+    expect(capture.lines()).toHaveLength(2);
+    expect(capture.lines()[0]).toContain("step one");
+    expect(capture.lines()[1]).toContain("step two");
+    expect(capture.degradedWrites()).toBe(0);
   });
 
   it("logShutdownSignal shares the [shutdown] prefix so one grep recipe captures both", () => {
@@ -360,8 +404,8 @@ describe("writeShutdownBreadcrumb", () => {
     // cases over time.
     logShutdownSignal("SIGTERM");
     writeShutdownBreadcrumb("handler complete; exiting (signal=SIGTERM)");
-    expect(captured.length).toBe(2);
-    expect(captured.every((line) => line.startsWith("[shutdown] "))).toBe(true);
+    expect(capture.lines().length).toBe(2);
+    expect(capture.lines().every((line) => line.startsWith("[shutdown] "))).toBe(true);
   });
 
   it("does not escape — message payload appears verbatim for kubectl grep", () => {
@@ -369,7 +413,7 @@ describe("writeShutdownBreadcrumb", () => {
     //   `grep -F 'sseRegistry.drain failed'`
     // stop matching. Pin verbatim semantics.
     writeShutdownBreadcrumb("sseRegistry.drain failed: ECONNRESET");
-    expect(captured[0]).toContain("sseRegistry.drain failed: ECONNRESET");
-    expect(captured[0]).not.toContain('"');
+    expect(capture.lines()[0]).toContain("sseRegistry.drain failed: ECONNRESET");
+    expect(capture.lines()[0]).not.toContain('"');
   });
 });

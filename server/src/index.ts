@@ -67,7 +67,12 @@ import { createApiTierPluginWorkerManagerStub } from "./services/plugin-worker-m
 import { createStorageServiceFromConfig } from "./storage/index.js";
 import { printStartupBanner } from "./startup-banner.js";
 import { getBoardClaimWarningUrl, initializeBoardClaimChallenge } from "./board-claim.js";
-import { logShutdownSignal, writeShutdownBreadcrumb } from "./shutdown-log.js";
+import {
+  logShutdownSignal,
+  writeShutdownBreadcrumb,
+  writeShutdownBreadcrumbsBounded,
+} from "./shutdown-log.js";
+import { installProcessCrashGuard, type ProcessCrashGuardHandle } from "./process-crash-guard.js";
 import { maybePersistWorktreeRuntimePorts } from "./worktree-config.js";
 import { plugins } from "@paperclipai/db";
 import {
@@ -84,6 +89,8 @@ import type {
   InstanceDatabaseBackupRunResult,
   InstanceDatabaseBackupTrigger,
 } from "./routes/instance-database-backups.js";
+
+let mainProcessCrashGuard: ProcessCrashGuardHandle | undefined;
 
 async function autoInstallBundledPlugins(
   _db: import("@paperclipai/db").Db,
@@ -1119,6 +1126,7 @@ export async function startServer(): Promise<StartedServer> {
       pluginWorkerManager,
       paperclipNodeRole: config.paperclipNodeRole,
       coldBootReattachGraceMs: EXTERNAL_LIFECYCLE_COLD_BOOT_REATTACH_GRACE_MS,
+      productivityReviewMonitorSchedulerIntervalMs: config.heartbeatSchedulerIntervalMs,
     });
     workerHeartbeat = heartbeat;
     drainHeartbeatRunsForShutdown = heartbeat.drainRunningRunsForShutdown;
@@ -1767,7 +1775,7 @@ export async function startServer(): Promise<StartedServer> {
         }
       }
 
-      writeShutdownBreadcrumb(`handler complete; exiting (signal=${signal})`);
+      await writeShutdownBreadcrumbsBounded([`handler complete; exiting (signal=${signal})`]);
       logger.info({ signal }, "Shutdown handler complete; exiting");
 
       // Flush pino's async buffer before process.exit. Otherwise the trailing
@@ -1780,7 +1788,15 @@ export async function startServer(): Promise<StartedServer> {
       // await the exporter's final batch is dropped on exit.
       await shutdownInstrumentation();
 
-      process.exit(0);
+      // A fatal error can arrive while shutdown is draining. Once active, the
+      // crash guard owns process exit; wait for its bounded breadcrumb path so
+      // this graceful continuation cannot truncate the crash stack or exit line.
+      const crashExit = mainProcessCrashGuard?.waitForCrashExit();
+      if (crashExit) {
+        await crashExit;
+        return;
+      }
+      process.exit(process.exitCode ?? 0);
     };
 
     process.once("SIGINT", () => {
@@ -1811,6 +1827,35 @@ function isMainModule(metaUrl: string): boolean {
 }
 
 if (isMainModule(import.meta.url)) {
+  // BLO-19722: install the crash guard at the process entrypoint, before
+  // `startServer()` is even called.
+  //
+  // Why here and not inside `startServer()`. Without a handler, an unhandled
+  // async throw killed the worker with a bare stack — the motivating case is
+  // the postgres.js null-socket write (porsager/postgres#1154), thrown from a
+  // `setImmediate` callback inside the driver, where no `try`/`catch` of ours
+  // can reach it. One transient null socket took down the whole supervisor.
+  //
+  // `startServer()` is the wrong home for it on two counts. It is exported and
+  // called repeatedly in-process by the test suite (16 times in
+  // `server-startup-feedback-export.test.ts` alone), so installing there
+  // accumulates a `process` listener pair per call — and, far worse, arms a
+  // real `process.exit(1)` inside the test runner, where a single late-handled
+  // promise rejection would kill the worker mid-suite and surface as an
+  // unrelated flake. Installing under `isMainModule` means tests that import
+  // this module never arm it, while the deployed worker (`node dist/index.js`)
+  // always does. It also covers strictly more: everything `startServer()` does
+  // before its own body reached the old install point is now guarded too.
+  //
+  // No `onCrash` hook is passed here, and that is deliberate rather than an
+  // omission. The guard already serialises the full `.cause` chain, writes a
+  // stderr breadcrumb and exits non-zero on its own, which is all of BLO-19722
+  // AC 1. Crash-time marking of this worker's in-flight runs (AC 2/3) needs
+  // `markRunsInterruptedByWorkerCrash` and lands with the crash-recovery
+  // change; it plugs in as an injected `onCrash` callback, which is why this
+  // module keeps no dependency edge on the heartbeat service.
+  mainProcessCrashGuard = installProcessCrashGuard({ logger });
+
   void startServer().catch((err) => {
     logger.error({ err }, "Paperclip server failed to start");
     process.exit(1);

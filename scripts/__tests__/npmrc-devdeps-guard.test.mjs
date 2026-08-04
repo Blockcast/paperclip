@@ -100,5 +100,25 @@ test("pr.yml guards the install against an ambient NODE_ENV=production", () => {
     "The legacy required verify job must depend on worktree_install so the guard gates merges.",
   );
   assert.match(verifyBody, /WORKTREE_INSTALL_RESULT:\s*\${{\s*needs\.worktree_install\.result\s*}}/);
-  assert.match(verifyBody, /test "\$WORKTREE_INSTALL_RESULT" = "success"/);
+  // BLO-20867 replaced the flat `test "$X" = "success"` check with a
+  // lane_results map so cancelled/skipped/failed lanes get distinct
+  // annotations. The regression guard this test cares about — a failed
+  // worktree_install actually fails the required verify check — only holds
+  // if worktree_install is still fed into that map and any non-success,
+  // non-cancelled, non-skipped result still lands in failed_lanes.
+  assert.match(
+    verifyBody,
+    /\[worktree_install\]="\$WORKTREE_INSTALL_RESULT"/,
+    "verify's lane_results map must include worktree_install so a failed install fails the required check.",
+  );
+  assert.match(
+    verifyBody,
+    /\*\)\s*failed_lanes\+=\("\$lane"\)/,
+    "verify must still treat an unrecognized/failed lane result as a failure, not silently pass.",
+  );
+  assert.match(
+    verifyBody,
+    /if \[ "\$\{#failed_lanes\[@\]\}" -gt 0 \];\s*then[\s\S]*?exit 1/,
+    "verify must exit non-zero when any lane (including worktree_install) is in failed_lanes.",
+  );
 });
