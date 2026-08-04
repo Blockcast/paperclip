@@ -85,17 +85,35 @@ export function resolveLinkSourceForIdentifier(
 // fix -- writes exactly `- Refs: [BLO-19132](...)`. Without the marker the
 // body tier silently matches nothing on the majority of real PR bodies and
 // every such PR fails closed to `no_owning_reference`, dropping an author
-// wake that should have been delivered to its owner.
+// wake that should have been delivered to its owner. CommonMark permits up to
+// three leading spaces before a normal line; four spaces or a tab is code and
+// must not create ownership. Fenced code is excluded for the same reason.
 const OWNING_REFERENCE_LABEL_PATTERN =
-  /^[ \t]*(?:[-*+]|\d{1,3}[.)])?[ \t]*(?:fix(?:e[sd])?|clos(?:e[sd]?)|resolv(?:e[sd]?)|refs?)[ \t]*:?[ \t]+(.+)$/gim;
+  /^ {0,3}(?:[-*+]|\d{1,3}[.)])?[ \t]*(?:fix(?:e[sd])?|clos(?:e[sd]?)|resolv(?:e[sd]?)|refs?)[ \t]*:?[ \t]+(.+)$/i;
+const MARKDOWN_FENCE_PATTERN = /^ {0,3}(`{3,}|~{3,})/;
+const TRAILING_NON_OWNING_LABEL_PATTERN =
+  /(?:[;,][ \t]*|[ \t]+)(?:related|supersedes?|see[ \t]+also)[ \t]*:/i;
 
 /** Identifiers that appear on a labeled owning-reference line in `body` (see above). */
 export function extractOwningLabeledIdentifiers(body: string | null | undefined): string[] {
   if (!body) return [];
   const found = new Set<string>();
-  OWNING_REFERENCE_LABEL_PATTERN.lastIndex = 0;
-  for (const match of body.matchAll(OWNING_REFERENCE_LABEL_PATTERN)) {
-    const rest = match[1];
+  let fence: { marker: "`" | "~"; length: number } | null = null;
+  for (const line of body.split(/\r?\n/)) {
+    const fenceMatch = line.match(MARKDOWN_FENCE_PATTERN);
+    if (fenceMatch?.[1]) {
+      const marker = fenceMatch[1][0] as "`" | "~";
+      if (!fence) {
+        fence = { marker, length: fenceMatch[1].length };
+      } else if (marker === fence.marker && fenceMatch[1].length >= fence.length) {
+        fence = null;
+      }
+      continue;
+    }
+    if (fence || line.startsWith("\t") || line.startsWith("    ")) continue;
+
+    const match = line.match(OWNING_REFERENCE_LABEL_PATTERN);
+    const rest = match?.[1]?.split(TRAILING_NON_OWNING_LABEL_PATTERN, 1)[0];
     if (!rest) continue;
     for (const identifier of extractPaperclipIdentifiers(rest)) found.add(identifier);
   }
