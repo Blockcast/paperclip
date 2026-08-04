@@ -11136,7 +11136,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       typeof ctx.paperclipIssue === "object" && ctx.paperclipIssue !== null
         ? (ctx.paperclipIssue as Record<string, unknown>)
         : null;
-    publishPluginDomainEvent({
+    // Not transactional here, and this helper is sync: enqueue on the global
+    // handle and let it settle on its own. It never rejects.
+    void publishPluginDomainEvent({
       eventId: randomUUID(),
       eventType,
       occurredAt: new Date().toISOString(),
