@@ -18872,9 +18872,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // its shared worktree. Reaper/lifecycle checks must move the old run out
       // of "running" before a queued same-issue retry can proceed.
       const inFlightIssueIds = new Set<string>();
+      const inFlightPrReviewTaskKeys = new Set<string>();
       for (const row of runningRunRows) {
-        const id = readNonEmptyString(parseObject(row.contextSnapshot).issueId);
+        const snapshot = parseObject(row.contextSnapshot);
+        const id = readNonEmptyString(snapshot.issueId);
         if (id) inFlightIssueIds.add(id);
+        const taskKey = readNonEmptyString(snapshot.taskKey);
+        if (taskKey && isPrReviewRetryContext(snapshot)) {
+          inFlightPrReviewTaskKeys.add(taskKey);
+        }
       }
 
       const claimedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
@@ -18958,7 +18964,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         for (const queuedRun of prioritizedRuns) {
           if (claimedRuns.length >= availableSlots) break;
           if (dispatchStopped) break;
-          const queuedIssueId = readNonEmptyString(parseObject(queuedRun.contextSnapshot).issueId);
+          const queuedSnapshot = parseObject(queuedRun.contextSnapshot);
+          const queuedIssueId = readNonEmptyString(queuedSnapshot.issueId);
           if (queuedIssueId && inFlightIssueIds.has(queuedIssueId)) {
             // BLO-20396: only report the cancellation when this pass is the one
             // that actually moved the row. Previously every overlapping pass
@@ -18973,6 +18980,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             }
             continue;
           }
+          const queuedTaskKey = readNonEmptyString(queuedSnapshot.taskKey);
+          if (
+            queuedTaskKey &&
+            isPrReviewRetryContext(queuedSnapshot) &&
+            inFlightPrReviewTaskKeys.has(queuedTaskKey)
+          ) {
+            // Explicit review requests intentionally queue a follow-up while a
+            // review is running. Keep that row queued, but do not let it run
+            // concurrently with the review that already owns this PR task.
+            continue;
+          }
           const claimed = await claimQueuedRun(queuedRun, companyAgents);
           if (!claimed) {
             if (await scheduleEmergencyContinuationForStillQueuedRun(queuedRun)) {
@@ -18983,6 +19001,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
           claimedRuns.push(claimed);
           if (queuedIssueId) inFlightIssueIds.add(queuedIssueId);
+          if (queuedTaskKey && isPrReviewRetryContext(queuedSnapshot)) {
+            inFlightPrReviewTaskKeys.add(queuedTaskKey);
+          }
         }
       } catch (err) {
         launchClaimedRuns();
