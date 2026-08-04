@@ -48,8 +48,15 @@ async function main() {
       await readFile(join(fixtureRoot, "package.json"), "utf8"),
     );
     assert.equal(packageJson.pnpm.overrides["fast-uri"], "^3.1.3");
+    assert.equal(packageJson.pnpm.overrides["brace-expansion"], "5.0.9");
 
     const lockfile = await readFile(join(fixtureRoot, "pnpm-lock.yaml"), "utf8");
+    assertIncludes(lockfile, "brace-expansion@5.0.9:", "lockfile");
+    assert.equal(
+      /^  brace-expansion@(4\.|5\.0\.[0-8](?:[:(]))/m.test(lockfile),
+      false,
+      "lockfile must not resolve a vulnerable brace-expansion version",
+    );
     const fastUriResolution = lockfile.match(
       /^  fast-uri@(\d+)\.(\d+)\.(\d+):$/m,
     );
