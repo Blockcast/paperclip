@@ -167,6 +167,7 @@ import {
   authorizationBoundaryLabel,
   authorizationDeniedDetails,
   commentAuthorCanGrantIssueMention,
+  getActiveCompanyMembership,
 } from "../services/authorization.js";
 import { environmentService } from "../services/environments.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
@@ -10053,12 +10054,16 @@ export function issueRoutes(
           logger.warn({ err, issueId: id }, "failed to resolve @-mentions");
         }
 
+        const authorUserIsActiveMember = mentionedIds.length > 0 && actor.actorType === "user"
+          ? Boolean(await getActiveCompanyMembership(db, issue.companyId, "user", actor.actorId))
+          : false;
+
         for (const mentionedId of mentionedIds) {
           if (!commentAuthorCanGrantIssueMention({
             mentionedAgentId: mentionedId,
             issueAssigneeAgentId: issue.assigneeAgentId,
             authorAgentId: actor.actorType === "agent" ? actor.actorId : null,
-            authorUserIsActiveMember: actor.actorType === "user",
+            authorUserIsActiveMember,
           })) continue;
           addWakeup(mentionedId, {
             source: "automation",
@@ -11965,12 +11970,16 @@ export function issueRoutes(
         logger.warn({ err, issueId: id }, "failed to resolve @-mentions");
       }
 
+      const authorUserIsActiveMember = mentionedIds.length > 0 && actor.actorType === "user"
+        ? Boolean(await getActiveCompanyMembership(db, issue.companyId, "user", actor.actorId))
+        : false;
+
       for (const mentionedId of mentionedIds) {
         if (!commentAuthorCanGrantIssueMention({
           mentionedAgentId: mentionedId,
           issueAssigneeAgentId: currentIssue.assigneeAgentId,
           authorAgentId: actorIsAgent ? actor.actorId : null,
-          authorUserIsActiveMember: actor.actorType === "user",
+          authorUserIsActiveMember,
         })) continue;
         addWakeup(mentionedId, {
           source: "automation",
