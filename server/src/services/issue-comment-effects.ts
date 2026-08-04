@@ -1,5 +1,7 @@
+import { randomUUID } from "node:crypto";
 import { and, asc, eq, inArray, isNull, lt, ne, or, sql } from "drizzle-orm";
 import { issueComments, issueCommentEffects, type Db } from "@paperclipai/db";
+import { logger } from "../middleware/logger.js";
 
 /**
  * Durable effect ledger for the post-insert pipeline of an idempotent issue
@@ -22,6 +24,7 @@ export const COMMENT_EFFECT_KINDS = [
   "recovery_revalidation",
   "wake",
   "watchdog_evaluation",
+  "run_activity",
 ] as const;
 
 export type CommentEffectKind = (typeof COMMENT_EFFECT_KINDS)[number];
@@ -91,6 +94,15 @@ export async function listUnfinishedEffects(db: Db, commentId: string): Promise<
     .orderBy(asc(issueCommentEffects.seq));
 }
 
+export async function hasCommentEffects(db: Db, commentId: string): Promise<boolean> {
+  const rows = await db
+    .select({ id: issueCommentEffects.id })
+    .from(issueCommentEffects)
+    .where(eq(issueCommentEffects.commentId, commentId))
+    .limit(1);
+  return rows.length > 0;
+}
+
 /**
  * Take exclusive ownership of one effect.
  *
@@ -105,10 +117,12 @@ export async function claimEffect(
   leaseMs: number = DEFAULT_CLAIM_LEASE_MS,
 ): Promise<CommentEffectRow | null> {
   const now = new Date();
+  const claimToken = randomUUID();
   const rows = await db
     .update(issueCommentEffects)
     .set({
       status: "processing",
+      claimToken,
       claimedAt: now,
       claimExpiresAt: new Date(now.getTime() + leaseMs),
       attempts: sql`${issueCommentEffects.attempts} + 1`,
@@ -133,9 +147,11 @@ export async function claimEffect(
 /** Record an effect as done, optionally publishing a result for later effects. */
 export async function completeEffect(
   db: Db,
-  effectId: string,
+  effect: Pick<CommentEffectRow, "id" | "claimToken">,
   result?: Record<string, unknown> | null,
 ): Promise<void> {
+  const claimToken = effect.claimToken;
+  if (!claimToken) throw new Error("Cannot complete an unclaimed comment effect");
   const now = new Date();
   await db
     .update(issueCommentEffects)
@@ -144,10 +160,15 @@ export async function completeEffect(
       processedAt: now,
       updatedAt: now,
       claimExpiresAt: null,
+      claimToken: null,
       lastError: null,
       ...(result === undefined ? {} : { result }),
     })
-    .where(eq(issueCommentEffects.id, effectId));
+    .where(and(
+      eq(issueCommentEffects.id, effect.id),
+      eq(issueCommentEffects.status, "processing"),
+      eq(issueCommentEffects.claimToken, claimToken),
+    ));
 }
 
 /**
@@ -160,6 +181,8 @@ export async function releaseEffect(
   effect: CommentEffectRow,
   err: unknown,
 ): Promise<void> {
+  const claimToken = effect.claimToken;
+  if (!claimToken) throw new Error("Cannot release an unclaimed comment effect");
   const now = new Date();
   const giveUp = effect.attempts >= MAX_EFFECT_ATTEMPTS;
   await db
@@ -168,9 +191,14 @@ export async function releaseEffect(
       status: giveUp ? "failed" : "queued",
       lastError: String(err),
       claimExpiresAt: null,
+      claimToken: null,
       updatedAt: now,
     })
-    .where(eq(issueCommentEffects.id, effect.id));
+    .where(and(
+      eq(issueCommentEffects.id, effect.id),
+      eq(issueCommentEffects.status, "processing"),
+      eq(issueCommentEffects.claimToken, claimToken),
+    ));
 }
 
 /** Read a sibling effect's published result (e.g. the reference diff). */
@@ -194,10 +222,6 @@ export async function getEffectResult(
 /**
  * Mark the comment processed iff every one of its effects has settled.
  *
- * `failed` counts as settled: it is terminal after MAX_EFFECT_ATTEMPTS, and
- * leaving the comment unprocessed forever would make every later replay redo
- * the whole pipeline chasing an effect that will never succeed.
- *
  * Returns true when the comment is (now or already) processed.
  */
 export async function markCommentProcessedIfSettled(db: Db, commentId: string): Promise<boolean> {
@@ -207,7 +231,7 @@ export async function markCommentProcessedIfSettled(db: Db, commentId: string): 
     .where(
       and(
         eq(issueCommentEffects.commentId, commentId),
-        inArray(issueCommentEffects.status, ["queued", "processing"]),
+        ne(issueCommentEffects.status, "processed"),
       ),
     )
     .limit(1);
@@ -260,7 +284,7 @@ export async function listCommentsWithResumableEffects(
 export async function resetLeaselessProcessing(db: Db): Promise<number> {
   const rows = await db
     .update(issueCommentEffects)
-    .set({ status: "queued", updatedAt: new Date() })
+    .set({ status: "queued", claimToken: null, updatedAt: new Date() })
     .where(
       and(
         eq(issueCommentEffects.status, "processing"),
@@ -284,4 +308,55 @@ export async function hasUnsettledEffects(db: Db, commentId: string): Promise<bo
     )
     .limit(1);
   return rows.length > 0;
+}
+
+export async function processCommentEffects(
+  db: Db,
+  commentId: string,
+  execute: (effect: CommentEffectRow) => Promise<Record<string, unknown> | null | void>,
+): Promise<boolean> {
+  const effects = await listUnfinishedEffects(db, commentId);
+  for (const effect of effects) {
+    const claimed = await claimEffect(db, effect.id);
+    if (!claimed) return false;
+    try {
+      const result = await execute(claimed);
+      await completeEffect(db, claimed, result ?? null);
+    } catch (err) {
+      await releaseEffect(db, claimed, err);
+      throw err;
+    }
+  }
+  return markCommentProcessedIfSettled(db, commentId);
+}
+
+export function startIssueCommentEffectReconciler(
+  db: Db,
+  process: (commentId: string) => Promise<unknown>,
+  intervalMs: number = 1_000,
+): () => void {
+  let polling = false;
+  let stopped = false;
+  void resetLeaselessProcessing(db).catch((err) =>
+    logger.warn({ err }, "issue-comment-effects: stale-processing reset failed"));
+  const timer = setInterval(() => {
+    if (polling || stopped) return;
+    polling = true;
+    void listCommentsWithResumableEffects(db, 50)
+      .then(async (commentIds) => {
+        for (const commentId of commentIds) {
+          if (stopped) break;
+          await process(commentId).catch((err) =>
+            logger.warn({ err, commentId }, "issue-comment-effects: reconciliation failed"));
+        }
+      })
+      .finally(() => {
+        polling = false;
+      });
+  }, intervalMs);
+  timer.unref?.();
+  return () => {
+    stopped = true;
+    clearInterval(timer);
+  };
 }

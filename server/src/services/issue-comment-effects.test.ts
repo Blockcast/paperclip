@@ -145,14 +145,14 @@ describeEmbeddedPostgres("issue comment effect ledger", () => {
 
     for (const effect of queued.slice(0, 2)) {
       const claimed = await claimEffect(db as never, effect.id);
-      await completeEffect(db as never, claimed!.id);
+      await completeEffect(db as never, claimed!);
     }
     expect(await markCommentProcessedIfSettled(db as never, commentId)).toBe(false);
     const [partial] = await db.select().from(issueComments).where(eq(issueComments.id, commentId));
     expect(partial.idempotencyProcessedAt).toBeNull();
 
     const last = await claimEffect(db as never, queued[2]!.id);
-    await completeEffect(db as never, last!.id);
+    await completeEffect(db as never, last!);
     expect(await markCommentProcessedIfSettled(db as never, commentId)).toBe(true);
     const [settled] = await db.select().from(issueComments).where(eq(issueComments.id, commentId));
     expect(settled.idempotencyProcessedAt).not.toBeNull();
@@ -181,7 +181,7 @@ describeEmbeddedPostgres("issue comment effect ledger", () => {
     const reclaimed = await claimEffect(db as never, effect.id);
     expect(reclaimed).not.toBeNull();
     expect(reclaimed!.attempts).toBe(2);
-    await completeEffect(db as never, reclaimed!.id);
+    await completeEffect(db as never, reclaimed!);
 
     // A completed effect is never handed out again, so the side effect runs once.
     expect(await claimEffect(db as never, effect.id)).toBeNull();
@@ -234,6 +234,30 @@ describeEmbeddedPostgres("issue comment effect ledger", () => {
     expect(row.status).toBe("failed");
     expect(await claimEffect(db as never, effect.id)).toBeNull();
     expect(await hasUnsettledEffects(db as never, commentId)).toBe(true);
+    expect(await markCommentProcessedIfSettled(db as never, commentId)).toBe(false);
+  }, 60_000);
+
+  it("does not let a stale lease holder complete a reclaimed effect", async () => {
+    await seed();
+    await enqueueCommentEffects(db as never, { companyId, issueId, commentId, effects: [intents[0]] });
+    const [effect] = await listUnfinishedEffects(db as never, commentId);
+    const staleClaim = await claimEffect(db as never, effect.id, 1);
+    expect(staleClaim).not.toBeNull();
+    await db
+      .update(issueCommentEffects)
+      .set({ claimExpiresAt: new Date(Date.now() - 1_000) })
+      .where(eq(issueCommentEffects.id, effect.id));
+    const currentClaim = await claimEffect(db as never, effect.id);
+    expect(currentClaim?.claimToken).not.toBe(staleClaim?.claimToken);
+
+    await completeEffect(db as never, staleClaim!);
+    let [row] = await db.select().from(issueCommentEffects).where(eq(issueCommentEffects.id, effect.id));
+    expect(row.status).toBe("processing");
+    expect(row.claimToken).toBe(currentClaim?.claimToken);
+
+    await completeEffect(db as never, currentClaim!);
+    [row] = await db.select().from(issueCommentEffects).where(eq(issueCommentEffects.id, effect.id));
+    expect(row.status).toBe("processed");
   }, 60_000);
 
   it("publishes a result for a later effect to consume", async () => {
@@ -241,7 +265,7 @@ describeEmbeddedPostgres("issue comment effect ledger", () => {
     await enqueueCommentEffects(db as never, { companyId, issueId, commentId, effects: intents });
     const [sync] = await listUnfinishedEffects(db as never, commentId);
     const claimed = await claimEffect(db as never, sync.id);
-    await completeEffect(db as never, claimed!.id, { addedReferencedIssues: ["BLO-1"] });
+    await completeEffect(db as never, claimed!, { addedReferencedIssues: ["BLO-1"] });
 
     // comment_activity embeds the reference diff and cannot recompute it after
     // references_sync has already run, so the diff has to survive on the row.
