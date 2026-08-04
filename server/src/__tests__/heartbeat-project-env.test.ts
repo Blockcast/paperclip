@@ -467,17 +467,37 @@ describe("resolveExecutionRunAdapterConfig", () => {
       },
     );
 
-    it("keeps GH_SEAT_TOKEN_VALUE local-only so the wrapper owns local translation", () => {
+    it("translates GH_SEAT_TOKEN_VALUE into standard GitHub env for local runs too", () => {
+      const commandConfig = translateGithubSeatTokenForExecutionTarget({
+        runtimeConfig: {
+          env: {
+            GH_SEAT_TOKEN_VALUE: " ghu_local_seat\n",
+          },
+        },
+        executionTarget: { kind: "local" },
+      });
+
+      expect(commandConfig.env).toMatchObject({
+        GH_SEAT_TOKEN_VALUE: " ghu_local_seat\n",
+        GH_TOKEN: "ghu_local_seat",
+        GITHUB_TOKEN: "ghu_local_seat",
+      });
+    });
+
+    it.each([
+      ["blank", " \n\t "],
+      ["embedded whitespace", "ghu_local seat"],
+    ])("rejects a %s GH_SEAT_TOKEN_VALUE before target-specific setup", (_label, token) => {
       const runtimeConfig = {
         env: {
-          GH_SEAT_TOKEN_VALUE: "ghu_local_seat",
+          GH_SEAT_TOKEN_VALUE: token,
         },
       };
 
-      expect(translateGithubSeatTokenForExecutionTarget({
+      expect(() => translateGithubSeatTokenForExecutionTarget({
         runtimeConfig,
         executionTarget: { kind: "local" },
-      })).toBe(runtimeConfig);
+      })).toThrow(/GH_SEAT_TOKEN_VALUE/);
     });
 
     it("uses seat-token precedence over preexisting standard GitHub env on remote targets", () => {
