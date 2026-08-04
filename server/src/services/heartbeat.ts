@@ -1146,6 +1146,27 @@ const EXTERNAL_LIFECYCLE_PRE_ADAPTER_STALE_MS = 5 * 60 * 1000;
 // preserving ranks 0-1 for explicit critical issues.
 const STARVATION_STATUS_BOOST_MS = 30 * 60 * 1000;
 const STARVATION_FULL_ESCALATION_MS = 2 * 60 * 60 * 1000;
+// BLO-21792: the two steps above bound how long a run waits *behind routine
+// work*, but not how long it waits overall. Escalating to rank 2 deliberately
+// preserves ranks 0-1 for critical issues, so on an agent with a SUSTAINED
+// supply of fresh critical work exceeding maxConcurrentRuns, an aged
+// non-critical run loses every tick forever: rank 2 never beats the rank 0/1
+// of a critical row that was queued seconds ago. The escalation is necessary
+// but not sufficient, and nothing caps the resulting wait.
+//
+// This third floor is the cap. Past STARVATION_ABSOLUTE_ESCALATION_MS a ready
+// run of ANY priority escalates to -1 — above every routine rank including
+// critical — so worst-case wait is bounded for every tier rather than only for
+// tiers that happen to out-rank the incoming stream. Runs that reach it sort
+// among themselves by createdAt (the comparator's existing tiebreak), i.e.
+// strict FIFO, so this cannot itself introduce a new starvation order.
+//
+// It sits far above the routine floor on purpose: below it, behavior is
+// unchanged and fresh critical work still wins, which is what the BLO-16554 /
+// BLO-19337 regressions pin (both use 3h-old runs, comfortably under this).
+// Only genuinely pathological waits — the class BLO-21116 measured at 5-16h —
+// cross it.
+const STARVATION_ABSOLUTE_ESCALATION_MS = 6 * 60 * 60 * 1000;
 // BLO-16253 follow-up: a recovery/wake_owner run (contextSnapshot.recoveryActionId
 // set — see recovery/service.ts enqueueWakeup calls) represents an ALREADY-DETECTED
 // failure that needs the owner's attention now, not routine backlog grooming. The
@@ -18818,6 +18839,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // the front of the queue no matter how long it has waited, because it
         // cannot run yet.
         if (!ready) return 12 + issueRunPriorityRank(issue?.priority);
+        // BLO-21792: absolute anti-starvation ceiling. Checked BEFORE the
+        // priority-tiered floor below because it deliberately outranks it —
+        // this is the one case where non-critical work may pass fresh critical
+        // work, and only after a wait long enough that the alternative is an
+        // unbounded one. Kept under the `!ready` guard above: a
+        // dependency-blocked run must never jump the queue however long it has
+        // waited, since it still cannot run.
+        if (waitedMs >= STARVATION_ABSOLUTE_ESCALATION_MS) return -1;
         const escalationFloorMs = isRecoveryWake
           ? STARVATION_RECOVERY_ESCALATION_MS
           : STARVATION_FULL_ESCALATION_MS;
