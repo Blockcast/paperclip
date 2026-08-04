@@ -48,8 +48,15 @@ function createDbStub(selectResults: ApprovalRecord[][], updateResults: Approval
   const set = vi.fn(() => ({ where: updateWhere }));
   const update = vi.fn(() => ({ set }));
 
+  const db = { select, update } as {
+    select: typeof select;
+    update: typeof update;
+    transaction: (callback: (tx: unknown) => unknown) => unknown;
+  };
+  db.transaction = (callback) => callback(db);
+
   return {
-    db: { select, update },
+    db,
     selectWhere,
     returning,
   };

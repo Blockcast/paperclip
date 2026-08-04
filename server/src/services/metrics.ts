@@ -270,6 +270,135 @@ export const GITHUB_REVIEW_REQUEST_DEAD_LETTER_UNRESOLVED_METRIC =
   "paperclip_github_review_request_dead_letter_unresolved";
 
 /**
+ * Restart-safe gauge of `agent_wakeup_requests` rows sitting in the terminal
+ * `status = 'failed'` state (BLO-20255).
+ *
+ * This is a DIFFERENT terminal state from the one
+ * {@link GITHUB_REVIEW_REQUEST_DEAD_LETTER_UNRESOLVED_METRIC} covers, and the
+ * gap between them is exactly why this metric exists. `dispatch_failed_exhausted`
+ * means the *dispatch* chain burned its retry budget; `failed` means the wake
+ * dispatched fine and the **run** died (the Job was force-terminated, the Job
+ * failed, the adapter blew up). `reconcileFailedWakeDispatches` only ever
+ * selects `dispatch_failed`, so a `failed` row is never re-driven and never
+ * counted — it is terminal *and* invisible.
+ *
+ * BLO-18030 / PR #900 closed the retry half for one slice of this (a
+ * stale-killed `pr_review` run is now bounded-retried when a GitHub probe
+ * proves no review landed). Three cases deliberately stay terminal there so we
+ * never double-post a review: the probe found an existing review, the probe
+ * threw / there was no PR context, or the run was not `pr_review` at all. Those
+ * rows are correct to leave alone and wrong to leave unmonitored.
+ */
+export const AGENT_WAKEUP_TERMINAL_FAILED_UNRESOLVED_METRIC =
+  "paperclip_agent_wakeup_terminal_failed_unresolved";
+
+/**
+ * Age, in seconds, of the OLDEST unresolved terminal-`failed` wake in each
+ * scope — 0 when the scope has none (BLO-20255).
+ *
+ * This exists because a Prometheus `for:` clause cannot express the condition
+ * the alert actually needs. `for:` measures how long the *expression* has been
+ * continuously true, not how long any individual row has been failed, and the
+ * alert expression sums rows together. So with
+ * `sum(..._unresolved{scope="pr_review"}) > 0` and `for: 30m`, two different
+ * short-lived failures overlapping by a single scrape keep the sum non-zero
+ * across the whole window: failure A holds it up for 29 minutes, B appears as A
+ * is resolved, the expression never goes false, and B pages after roughly one
+ * minute while the annotation claims a row has sat failed for thirty. Rotating
+ * `error_code` values do not save it either, since the expression sums that
+ * label away.
+ *
+ * Publishing the age as its own gauge moves the ageing into data the server
+ * already knows exactly (`now - finishedAt` of a row that survived the
+ * successor exclusion), so the rule can threshold on a real per-row age and use
+ * `for:` only for the thing it is good at — tolerating a scrape or two of
+ * flapping.
+ *
+ * `scope`-only labels, deliberately: `error_code` is a triage breakdown for the
+ * count, and adding it here would let a scope's oldest row hide behind a
+ * younger row of a different code.
+ */
+export const AGENT_WAKEUP_TERMINAL_FAILED_OLDEST_AGE_METRIC =
+  "paperclip_agent_wakeup_terminal_failed_oldest_age_seconds";
+
+/**
+ * Bounded `error_code` allow-list for
+ * {@link AGENT_WAKEUP_TERMINAL_FAILED_UNRESOLVED_METRIC}.
+ *
+ * IMPORTANT: `agent_wakeup_requests` has **no** `error_code` column — only a
+ * free-text `error`. These codes live on `heartbeat_runs.error_code`, written
+ * by the same terminal-outcome path that sets the wake row to `failed`
+ * (`services/heartbeat.ts` `finalizeExternalLifecycleTerminalRun` sets the run
+ * errorCode and the wake `status`/`error` together). The gauge therefore joins
+ * the wake row to its run via `agent_wakeup_requests.run_id` to recover the
+ * label. Do not "simplify" this into a text match on the `error` prose: that
+ * string is human-facing and unversioned, and matching it would silently
+ * rebucket every row the first time someone rewords a message.
+ *
+ * An unlisted code collapses to {@link UNKNOWN_TERMINAL_FAILED_WAKE_ERROR_CODE}
+ * rather than growing the series set, so a new terminal code cannot blow up
+ * cardinality — it shows up as `other` and gets triaged into this list.
+ */
+export const KNOWN_TERMINAL_FAILED_WAKE_ERROR_CODES = [
+  "external_lifecycle_stale_killed",
+  "job_failed",
+  "job_missing",
+  "adapter_failed",
+  "process_lost",
+  "agent_not_found",
+] as const;
+
+export const UNKNOWN_TERMINAL_FAILED_WAKE_ERROR_CODE = "other";
+
+/**
+ * A wake row whose run never got far enough to record an errorCode at all —
+ * including the direct `.update()` sites that set `status='failed'` with no
+ * companion run (the "deferred wake could not be promoted" path). Kept
+ * distinct from `other`: `other` means "a code we have not triaged yet",
+ * `none` means "there was no code to read", and conflating them would hide
+ * which of the two is growing.
+ */
+export const TERMINAL_FAILED_WAKE_ERROR_CODE_NONE = "none";
+
+/**
+ * Whether the terminal wake was a PR review. Only `pr_review` is alerted on:
+ * a lost review is user-visible (the PR sits with a posted trigger and no
+ * review), whereas an ordinary issue wake that failed is usually re-driven by
+ * the issue's own lifecycle. Both are published so the gauge answers "how much
+ * terminal-failed wake is there in total", which is the question the alert's
+ * denominator needs.
+ *
+ * Derived from the wake row's own `payload->>'taskKey'`, which the GitHub
+ * webhook writes as `pr_review:<repo>:<prNumber>`
+ * (`routes/github-webhook.ts` `buildPrReviewerTaskKey`).
+ */
+export const TERMINAL_FAILED_WAKE_SCOPES = ["pr_review", "other"] as const;
+
+const knownTerminalFailedWakeErrorCodeSet: ReadonlySet<string> = new Set(
+  KNOWN_TERMINAL_FAILED_WAKE_ERROR_CODES,
+);
+
+/**
+ * `null`/absent maps to {@link TERMINAL_FAILED_WAKE_ERROR_CODE_NONE} (no run
+ * row, or a run that recorded no code); an unrecognized string maps to
+ * {@link UNKNOWN_TERMINAL_FAILED_WAKE_ERROR_CODE}.
+ */
+export function normalizeTerminalFailedWakeErrorCode(code: string | null | undefined): string {
+  if (typeof code !== "string" || code.length === 0) return TERMINAL_FAILED_WAKE_ERROR_CODE_NONE;
+  return knownTerminalFailedWakeErrorCodeSet.has(code)
+    ? code
+    : UNKNOWN_TERMINAL_FAILED_WAKE_ERROR_CODE;
+}
+
+/**
+ * A `pr_review:`-prefixed taskKey is the PR-review scope marker. Anything else
+ * — including a missing taskKey — is `other`.
+ */
+export function terminalFailedWakeScopeForTaskKey(taskKey: string | null | undefined): string {
+  return typeof taskKey === "string" && taskKey.startsWith("pr_review:") ? "pr_review" : "other";
+}
+
+/**
  * Bounded `cause` allow-list. Every entry except
  * {@link GITHUB_SUPPRESSION_CAUSE_DISPATCH_REJECTED} is a literal skip reason
  * `enqueueWakeup` writes to `agent_wakeup_requests.reason` on the durable
@@ -624,6 +753,8 @@ let orphanedManagedPodReaped: Counter<"adapter"> | null = null;
 let githubReviewRequestDelivery: Counter<"state" | "reason"> | null = null;
 let githubReviewRequestSuppression: Counter<"cause" | "reason"> | null = null;
 let githubReviewRequestDeadLetterUnresolved: Gauge<"reason"> | null = null;
+let agentWakeupTerminalFailedUnresolved: Gauge<"error_code" | "scope"> | null = null;
+let agentWakeupTerminalFailedOldestAge: Gauge<"scope"> | null = null;
 let authRequest: Counter<"operation" | "outcome"> | null = null;
 
 function ensureRegistry(): {
@@ -643,6 +774,8 @@ function ensureRegistry(): {
   githubReviewRequestDeliveryCounter: Counter<"state" | "reason">;
   githubReviewRequestSuppressionCounter: Counter<"cause" | "reason">;
   githubReviewRequestDeadLetterUnresolvedGauge: Gauge<"reason">;
+  agentWakeupTerminalFailedUnresolvedGauge: Gauge<"error_code" | "scope">;
+  agentWakeupTerminalFailedOldestAgeGauge: Gauge<"scope">;
   authRequestCounter: Counter<"operation" | "outcome">;
 } {
   if (
@@ -662,6 +795,8 @@ function ensureRegistry(): {
     || !githubReviewRequestDelivery
     || !githubReviewRequestSuppression
     || !githubReviewRequestDeadLetterUnresolved
+    || !agentWakeupTerminalFailedUnresolved
+    || !agentWakeupTerminalFailedOldestAge
     || !authRequest
   ) {
     registry = new Registry();
@@ -851,6 +986,66 @@ function ensureRegistry(): {
     for (const reason of [...KNOWN_GITHUB_WAKE_REASONS, UNKNOWN_GITHUB_WAKE_REASON]) {
       githubReviewRequestDeadLetterUnresolved.set({ reason }, 0);
     }
+    agentWakeupTerminalFailedUnresolved = new Gauge({
+      name: AGENT_WAKEUP_TERMINAL_FAILED_UNRESOLVED_METRIC,
+      help:
+        "Current count of agent_wakeup_requests rows sitting in the terminal "
+        + "status='failed' state within the recency window, with no successor wake for "
+        + "the same taskKey, re-derived from committed rows on every wake-dispatch "
+        + "reconcile pass (BLO-20255). Distinct from the dispatch dead-letter gauge "
+        + GITHUB_REVIEW_REQUEST_DEAD_LETTER_UNRESOLVED_METRIC
+        + ": 'failed' means the wake dispatched and the RUN died "
+        + "(Job force-terminated, Job failed, adapter threw), whereas "
+        + "dispatch_failed_exhausted means the dispatch chain itself burned its retry "
+        + "budget. reconcileFailedWakeDispatches only selects dispatch_failed, so a "
+        + "'failed' row is never re-driven -- it is terminal AND, before this gauge, "
+        + "invisible. `error_code` is joined from heartbeat_runs.error_code via "
+        + "agent_wakeup_requests.run_id (the wake table has no error_code column of its "
+        + "own); 'none' means no run row or no code recorded, 'other' means a code not "
+        + "yet in KNOWN_TERMINAL_FAILED_WAKE_ERROR_CODES. `scope` is 'pr_review' when the "
+        + "row's payload taskKey is pr_review:<repo>:<pr>. Rows the BLO-18030 bounded "
+        + "retry re-queued drop out via the successor-wake exclusion, so a retried row "
+        + "never shows here. In steady state this is flat at zero.",
+      labelNames: ["error_code", "scope"],
+      registers: [registry],
+    });
+    // Zero-initialize the full bounded grid, same absent-vs-zero reasoning as
+    // the dead-letter gauge above: a healthy fleet must render 0, not "No
+    // data", or a stalled reconciler is indistinguishable from a clean one.
+    // 8 codes x 2 scopes = 16 constant-zero series.
+    for (
+      const errorCode of [
+        ...KNOWN_TERMINAL_FAILED_WAKE_ERROR_CODES,
+        UNKNOWN_TERMINAL_FAILED_WAKE_ERROR_CODE,
+        TERMINAL_FAILED_WAKE_ERROR_CODE_NONE,
+      ]
+    ) {
+      for (const scope of TERMINAL_FAILED_WAKE_SCOPES) {
+        agentWakeupTerminalFailedUnresolved.set({ error_code: errorCode, scope }, 0);
+      }
+    }
+    agentWakeupTerminalFailedOldestAge = new Gauge({
+      name: AGENT_WAKEUP_TERMINAL_FAILED_OLDEST_AGE_METRIC,
+      help:
+        "Age in seconds of the OLDEST agent_wakeup_requests row still sitting in the "
+        + "terminal status='failed' state for this scope, with no successor wake for the "
+        + "same taskKey, re-derived on every wake-dispatch reconcile pass (BLO-20255). 0 "
+        + "means the scope has no unresolved terminal-failed wake. Alert on THIS rather "
+        + "than on a `for:` clause over "
+        + AGENT_WAKEUP_TERMINAL_FAILED_UNRESOLVED_METRIC
+        + ": `for:` measures continuity of the expression, not the age of any one row, so "
+        + "two short failures overlapping by a single scrape keep a summed expression "
+        + "true and page for a row that is only seconds old. This gauge carries the real "
+        + "per-row age, so the rule can threshold it directly and use `for:` only to ride "
+        + "out scrape flapping. Labeled by scope only -- adding error_code would let a "
+        + "scope's oldest row hide behind a younger row of another code.",
+      labelNames: ["scope"],
+      registers: [registry],
+    });
+    // Zero-initialize both scopes for the same absent-vs-zero reason as above.
+    for (const scope of TERMINAL_FAILED_WAKE_SCOPES) {
+      agentWakeupTerminalFailedOldestAge.set({ scope }, 0);
+    }
     authRequest = new Counter({
       name: AUTH_REQUEST_METRIC,
       help:
@@ -885,6 +1080,8 @@ function ensureRegistry(): {
     githubReviewRequestDeliveryCounter: githubReviewRequestDelivery,
     githubReviewRequestSuppressionCounter: githubReviewRequestSuppression,
     githubReviewRequestDeadLetterUnresolvedGauge: githubReviewRequestDeadLetterUnresolved,
+    agentWakeupTerminalFailedUnresolvedGauge: agentWakeupTerminalFailedUnresolved,
+    agentWakeupTerminalFailedOldestAgeGauge: agentWakeupTerminalFailedOldestAge,
     authRequestCounter: authRequest,
   };
 }
@@ -1192,6 +1389,81 @@ export function setGithubReviewRequestDeadLetterUnresolved(byReason: Record<stri
   }
 }
 
+/**
+ * Publish the current unresolved terminal-`failed` wake counts (BLO-20255).
+ * Called once per wake-dispatch reconcile pass with the full bounded set, so
+ * the gauge is a rewrite of durable state rather than a delta — a restarted
+ * process republishes the same value on its first pass instead of starting
+ * from a zero it can never climb back from.
+ *
+ * Every `(error_code, scope)` pair absent from `entries` is explicitly reset to
+ * 0, so a row that ages out of the recency window — or that a successor wake
+ * has since covered — drops the gauge instead of leaving a stale non-zero
+ * series alerting forever.
+ */
+export function setAgentWakeupTerminalFailedUnresolved(
+  entries: ReadonlyArray<{
+    errorCode: string | null | undefined;
+    scope: string | null | undefined;
+    count: number;
+  }>,
+): void {
+  const gauge = ensureRegistry().agentWakeupTerminalFailedUnresolvedGauge;
+  const normalized = new Map<string, number>();
+  for (const entry of entries) {
+    const errorCode = normalizeTerminalFailedWakeErrorCode(entry.errorCode);
+    // Anything not in the bounded scope set collapses to `other` rather than
+    // minting a new series.
+    const scope = entry.scope === "pr_review" ? "pr_review" : "other";
+    const key = `${errorCode} ${scope}`;
+    normalized.set(key, (normalized.get(key) ?? 0) + Math.max(0, entry.count));
+  }
+  for (
+    const errorCode of [
+      ...KNOWN_TERMINAL_FAILED_WAKE_ERROR_CODES,
+      UNKNOWN_TERMINAL_FAILED_WAKE_ERROR_CODE,
+      TERMINAL_FAILED_WAKE_ERROR_CODE_NONE,
+    ]
+  ) {
+    for (const scope of TERMINAL_FAILED_WAKE_SCOPES) {
+      gauge.set(
+        { error_code: errorCode, scope },
+        normalized.get(`${errorCode} ${scope}`) ?? 0,
+      );
+    }
+  }
+}
+
+/**
+ * Publish the oldest unresolved terminal-`failed` wake age per scope
+ * (BLO-20255). Same rewrite-of-durable-state contract as
+ * {@link setAgentWakeupTerminalFailedUnresolved}: called once per reconcile
+ * pass with the full set, and every scope absent from `entries` is explicitly
+ * reset to 0.
+ *
+ * That reset is the part with teeth. If a scope's series were merely left
+ * alone once its last failure cleared, the age would freeze at whatever it
+ * last was — permanently above any threshold the alert uses, so the page would
+ * never resolve. Writing 0 is what lets the alert clear.
+ */
+export function setAgentWakeupTerminalFailedOldestAgeSeconds(
+  entries: ReadonlyArray<{ scope: string | null | undefined; ageSeconds: number }>,
+): void {
+  const gauge = ensureRegistry().agentWakeupTerminalFailedOldestAgeGauge;
+  const oldestByScope = new Map<string, number>();
+  for (const entry of entries) {
+    // Same collapse as the count gauge: an unrecognized scope becomes `other`
+    // rather than minting a new series.
+    const scope = entry.scope === "pr_review" ? "pr_review" : "other";
+    const ageSeconds = Number.isFinite(entry.ageSeconds) ? Math.max(0, entry.ageSeconds) : 0;
+    const current = oldestByScope.get(scope);
+    if (current === undefined || ageSeconds > current) oldestByScope.set(scope, ageSeconds);
+  }
+  for (const scope of TERMINAL_FAILED_WAKE_SCOPES) {
+    gauge.set({ scope }, oldestByScope.get(scope) ?? 0);
+  }
+}
+
 export function recordAuthRequest(input: {
   operation: string | null | undefined;
   outcome: string | null | undefined;
@@ -1246,6 +1518,8 @@ export function __resetMetricsForTest(): void {
   githubReviewRequestDelivery = null;
   githubReviewRequestSuppression = null;
   githubReviewRequestDeadLetterUnresolved = null;
+  agentWakeupTerminalFailedUnresolved = null;
+  agentWakeupTerminalFailedOldestAge = null;
   authRequest = null;
   resetDepBlockedMetrics();
   resetBlockerResolvedWakeMetrics();

@@ -255,6 +255,23 @@ export async function bindExternalRuntimeReservationIsolation(
         throw new Error(`External runtime reservation for run ${input.runId} is no longer active`);
       }
       const pendingIsolationKey = `pending:${input.runId}`;
+      // BLO-21256: `replaceableBinding` is the ONLY gate standing between the
+      // legacyWriter check / UPDATE below (which can throw
+      // ExternalRuntimeIsolationConflictError) and a reservation that has
+      // already been bound to a real isolationMode. That matters because Job
+      // identity (expectedJobName/jobName) is never stamped onto a
+      // reservation until AFTER a bind call for it has succeeded without
+      // throwing (see markExternalRuntimeReservationLaunching /
+      // recordExpectedExternalRuntimeJobName / recordExternalRuntimeJobIdentity
+      // callers in heartbeat.ts) -- so by the time a run's own k8s Job can
+      // exist, `replaceableBinding` is already false for it, and this
+      // function can only no-op or throw the plain drift Error below, never
+      // the conflict error. deferRunForK8sIsolationConflict() in heartbeat.ts
+      // relies on this to avoid stranding a live Job when it reacts to
+      // ExternalRuntimeIsolationConflictError. Do not loosen this gate (e.g.
+      // to retry the legacyWriter/UPDATE path for an already-bound
+      // reservation) without re-proving that invariant --
+      // heartbeat-external-runtime-retry.test.ts pins it.
       const replaceableBinding =
         (existing.isolationMode === "pending" && existing.isolationKey === pendingIsolationKey) ||
         (existing.isolationMode === "legacy" && existing.isolationKey === `legacy:${input.runId}`);

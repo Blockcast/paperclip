@@ -32,6 +32,19 @@ type IdentifierAllocatorDb = Pick<Db, "select" | "update">;
 const LINEAR_PLUGIN_KEY = "paperclip-plugin-linear";
 const LINEAR_GRAPHQL_URL = "https://api.linear.app/graphql";
 
+export class LinearIssueCreateUnconfirmedError extends Error {
+  constructor(
+    readonly issueIdempotencyKey: string,
+    cause: unknown,
+  ) {
+    super(
+      `Linear IssueCreate outcome is unconfirmed for idempotency key ${issueIdempotencyKey}; retry with the same key`,
+      { cause },
+    );
+    this.name = "LinearIssueCreateUnconfirmedError";
+  }
+}
+
 export interface AllocateIdentifierInput {
   /** Drizzle handle. Pass the active transaction when called from inside one. */
   db: IdentifierAllocatorDb;
@@ -50,8 +63,14 @@ export interface AllocateIdentifierInput {
    * companies the hint is ignored here (allocator returns the next
    * paperclip-internal id); the caller still uses it to write the
    * linear_issue_links row.
-   */
+  */
   linkedLinearIssue?: { id: string; identifier: string };
+  /**
+   * Stable Linear issue id for create/retry paths that already have a durable
+   * local identity. When provided, retries first look up this Linear id and
+   * IssueCreate sends it as IssueCreateInput.id.
+   */
+  linearIssueIdempotencyKey?: string;
 }
 
 export interface AllocateIdentifierResult {
@@ -137,7 +156,7 @@ async function allocateFromPaperclip(
 async function allocateFromLinear(
   input: AllocateIdentifierInput,
 ): Promise<AllocateIdentifierResult> {
-  const { db, companyId, title, description, linkedLinearIssue } = input;
+  const { db, companyId, title, description, linkedLinearIssue, linearIssueIdempotencyKey } = input;
 
   // Mirror-import path: caller already has the Linear issue and is asking
   // us to bind to it rather than mint another. Skip IssueCreate entirely
@@ -145,41 +164,73 @@ async function allocateFromLinear(
   // caller's compensating-delete handler ignores this (we did not create
   // the Linear issue and must not delete it on tx rollback).
   if (linkedLinearIssue) {
-    const numMatch = linkedLinearIssue.identifier.match(/-(\d+)$/);
-    if (!numMatch) {
-      throw new Error(
-        `Unexpected Linear identifier format in linkedLinearIssue: ${linkedLinearIssue.identifier}`,
-      );
-    }
-    return {
-      identifier: linkedLinearIssue.identifier,
-      issueNumber: Number.parseInt(numMatch[1], 10),
-      source: "linear",
-      externalIssueId: linkedLinearIssue.id,
-      createdLinearSideIssue: false,
-    };
+    return allocationFromLinearIssue(linkedLinearIssue, false);
   }
 
   const cfg = await getLinearConfigForCompany(db, companyId);
-  const created = await createLinearIssue({
-    apiKey: cfg.apiKey,
-    teamId: cfg.teamId,
-    title,
-    description: description ?? undefined,
-  });
+
+  if (linearIssueIdempotencyKey) {
+    let existing: CreatedLinearIssue | null = null;
+    try {
+      existing = await getLinearIssueById({
+        apiKey: cfg.apiKey,
+        issueId: linearIssueIdempotencyKey,
+      });
+    } catch (lookupError) {
+      throw new LinearIssueCreateUnconfirmedError(linearIssueIdempotencyKey, lookupError);
+    }
+    if (existing) return allocationFromLinearIssue(existing, false);
+  }
+
+  let created: CreatedLinearIssue;
+  try {
+    created = await createLinearIssue({
+      apiKey: cfg.apiKey,
+      teamId: cfg.teamId,
+      title,
+      description: description ?? undefined,
+      idempotencyKey: linearIssueIdempotencyKey,
+    });
+  } catch (error) {
+    if (linearIssueIdempotencyKey) {
+      let existing: CreatedLinearIssue | null = null;
+      try {
+        existing = await getLinearIssueById({
+          apiKey: cfg.apiKey,
+          issueId: linearIssueIdempotencyKey,
+        });
+      } catch (lookupError) {
+        throw new LinearIssueCreateUnconfirmedError(
+          linearIssueIdempotencyKey,
+          lookupError instanceof Error ? lookupError : error,
+        );
+      }
+      if (existing) return allocationFromLinearIssue(existing, false);
+      throw new LinearIssueCreateUnconfirmedError(linearIssueIdempotencyKey, error);
+    }
+    throw error;
+  }
+  return allocationFromLinearIssue(created, true);
+}
+
+function allocationFromLinearIssue(
+  issue: Pick<CreatedLinearIssue, "id" | "identifier">,
+  createdLinearSideIssue: boolean,
+  sourceLabel = "Linear",
+): AllocateIdentifierResult {
   // Linear identifier is "TEAM-N"; extract the numeric suffix so the issues
   // row's issue_number column stays meaningful (and so existing reports that
   // group by issue_number keep working).
-  const numMatch = /-(\d+)$/.exec(created.identifier);
+  const numMatch = /-(\d+)$/.exec(issue.identifier);
   if (!numMatch) {
-    throw new Error(`Unexpected Linear identifier format: ${created.identifier}`);
+    throw new Error(`Unexpected ${sourceLabel} identifier format: ${issue.identifier}`);
   }
   return {
-    identifier: created.identifier,
+    identifier: issue.identifier,
     issueNumber: Number.parseInt(numMatch[1], 10),
     source: "linear",
-    externalIssueId: created.id,
-    createdLinearSideIssue: true,
+    externalIssueId: issue.id,
+    createdLinearSideIssue,
   };
 }
 
@@ -317,8 +368,9 @@ async function createLinearIssue(params: {
   teamId: string;
   title: string;
   description?: string;
+  idempotencyKey?: string;
 }): Promise<CreatedLinearIssue> {
-  const { apiKey, teamId, title, description } = params;
+  const { apiKey, teamId, title, description, idempotencyKey } = params;
   const response = await fetch(LINEAR_GRAPHQL_URL, {
     method: "POST",
     headers: {
@@ -338,6 +390,7 @@ async function createLinearIssue(params: {
       `,
       variables: {
         input: {
+          ...(idempotencyKey ? { id: idempotencyKey } : {}),
           teamId,
           title,
           ...(description ? { description } : {}),
@@ -361,6 +414,40 @@ async function createLinearIssue(params: {
     throw new Error(`Linear IssueCreate did not return an issue (success=false or null)`);
   }
   return issue;
+}
+
+async function getLinearIssueById(params: {
+  apiKey: string;
+  issueId: string;
+}): Promise<CreatedLinearIssue | null> {
+  const { apiKey, issueId } = params;
+  const response = await fetch(LINEAR_GRAPHQL_URL, {
+    method: "POST",
+    headers: {
+      Authorization: apiKey,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      query: `
+        query IssueById($id: String!) {
+          issue(id: $id) { id identifier url }
+        }
+      `,
+      variables: { id: issueId },
+    }),
+  });
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    throw new Error(`Linear IssueById HTTP ${response.status}: ${body.slice(0, 300)}`);
+  }
+  const json = (await response.json()) as {
+    errors?: unknown[];
+    data?: { issue?: CreatedLinearIssue | null };
+  };
+  if (Array.isArray(json.errors) && json.errors.length > 0) {
+    throw new Error(`Linear IssueById GraphQL errors: ${JSON.stringify(json.errors).slice(0, 500)}`);
+  }
+  return json.data?.issue ?? null;
 }
 
 // Compensating delete used by services/issues.ts when the issues-create tx
