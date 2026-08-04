@@ -29,9 +29,11 @@
  * Eligible creates take the normalized PR-scope advisory locks before the
  * issue-create title and idempotency locks. The webhook takes the same
  * normalized namespace as part of its compatibility lock set, so its wake
- * commit is visible before this guard reads. Acquiring these locks first keeps
- * the lock order consistent and avoids coupling unrelated issue creates to the
- * webhook path.
+ * commit is visible before this guard reads. During the compatibility rollout,
+ * production keeps this guard disabled until every webhook pod takes that
+ * normalized lock: arbitrary canonical GitHub casing cannot be reconstructed
+ * from a user-authored URL. Acquiring these locks first keeps the lock order
+ * consistent and avoids coupling unrelated issue creates to the webhook path.
  */
 import { type Db, heartbeatRuns } from "@paperclipai/db";
 import { type Column, type SQL, and, desc, eq, inArray, or, sql } from "drizzle-orm";
@@ -233,9 +235,10 @@ export async function lockPrReviewIssueScopes(
   const normalizedTaskKeys = guardTaskKeys(candidate, options);
   if (normalizedTaskKeys.length === 0) return;
 
-  // A pre-compatibility webhook pod locks only GitHub's source spelling. Keep
-  // that spelling alongside the normalized namespace so issue creation shares
-  // a lock with both old and current webhook transactions during rollout.
+  // Preserve source spelling as an additional compatibility lock for callers
+  // that copied GitHub's canonical URL. Production rollout still gates this
+  // guard until every webhook pod locks the normalized namespace because
+  // arbitrary canonical casing cannot be inferred from user-authored text.
   const sourceTaskKeys = parsePullRequestRefsWithCasing(
     true,
     candidate.title,
