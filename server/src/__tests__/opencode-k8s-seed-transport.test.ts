@@ -11,8 +11,9 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../
 const statefulSetPath = path.join(repoRoot, "deploy/helm/paperclip/templates/statefulset.yaml");
 const opencodeBin = path.join(repoRoot, "server/node_modules/.bin/opencode");
 const IDLE_WINDOW_MS = 610_000;
-const CALLER_TIMEOUT_MS = 2_000;
-const CALLER_TIMEOUT_EARLY_TOLERANCE_MS = 500;
+const OPENCODE_FALLBACK_TIMEOUT_MS = 1_000;
+const CALLER_TIMEOUT_MS = 10_000;
+const CALLER_TIMEOUT_EARLY_TOLERANCE_MS = 1_500;
 const FIXTURE_CLOSE_OBSERVATION_TOLERANCE_MS = 5_000;
 
 type SeedEntry = { type: "http" | "sse"; url: string };
@@ -463,6 +464,9 @@ describe("opencode_k8s production k8s-ro connector after idle", () => {
       { tool: "nodes_list", status: "ok", atMs: IDLE_WINDOW_MS },
       { tool: "nodes_list", status: "timed_out", atMs: IDLE_WINDOW_MS },
     ]);
+    expect(CALLER_TIMEOUT_MS - CALLER_TIMEOUT_EARLY_TOLERANCE_MS).toBeGreaterThan(
+      OPENCODE_FALLBACK_TIMEOUT_MS + FIXTURE_CLOSE_OBSERVATION_TOLERANCE_MS,
+    );
     expect(timeoutObservedMs).toBeGreaterThanOrEqual(
       CALLER_TIMEOUT_MS - CALLER_TIMEOUT_EARLY_TOLERANCE_MS,
     );
