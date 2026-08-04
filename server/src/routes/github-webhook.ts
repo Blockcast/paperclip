@@ -2207,14 +2207,15 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
           );
           continue;
         }
-        // BLO-21582: either every retry is exhausted, or this was not a
-        // lock-timeout so retrying would not help -- either way this
-        // delivery is lost BEFORE `received` was ever recorded a few lines
-        // up (that increment lives inside the lock-guarded closure). Record
-        // `dead_lettered` directly here so the BLO-18859 funnel invariant
-        // (received == queued + suppressed + dead_lettered) keeps holding
-        // instead of quietly under-counting `received`, and so the existing
-        // dead-letter alerting actually sees this class of loss.
+        // BLO-21582: an exhausted lock-acquisition timeout happens before the
+        // lock-guarded closure can record `received`. Preserve the BLO-18859
+        // funnel (`received == queued + suppressed + dead_lettered`) by
+        // recording the delivery's entry into the durable wake path before its
+        // terminal dead-letter. Do not do this for arbitrary errors: those may
+        // have been thrown after the closure's normal `received` increment.
+        if (err instanceof PrReviewerTaskLockTimeoutError) {
+          recordGithubReviewRequestDelivery({ state: "received", reason: context.wakeReason });
+        }
         recordGithubReviewRequestDelivery({ state: "dead_lettered", reason: context.wakeReason });
         logger.error(
           {

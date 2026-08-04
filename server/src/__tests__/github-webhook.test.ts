@@ -2615,7 +2615,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
     );
 
     it(
-      "records dead_lettered (never received) once every lock-acquisition retry is exhausted, without lying in the 200 response",
+      "records received and dead_lettered once every lock-acquisition retry is exhausted, without lying in the 200 response",
       async () => {
         const reviewerAgentId = randomUUID();
         const { companyId } = await seedCompanyAndAgent();
@@ -2650,7 +2650,9 @@ describeEmbeddedPostgres("github-webhook route", () => {
         };
         const { body, signature } = signedRequest(payload);
         const beforeDeadLettered = await deliveryCount("dead_lettered");
+        const beforeQueued = await deliveryCount("queued");
         const beforeReceived = await deliveryCount("received");
+        const beforeSuppressed = await deliveryCount("suppressed");
 
         const res = await request(app)
           .post("/api/webhooks/github")
@@ -2669,15 +2671,25 @@ describeEmbeddedPostgres("github-webhook route", () => {
         expect(res.status).toBe(200);
         expect(res.body).toMatchObject({ reviewerWakeFired: false });
 
-        // The regression: this delivery never reached the `received`
-        // increment (it lives inside the lock-guarded closure, which this
-        // delivery's attempts never entered), but it MUST now be counted as
-        // `dead_lettered` so the BLO-18859 funnel invariant
-        // (received == queued + suppressed + dead_lettered) keeps holding
-        // instead of a `received`-less delivery vanishing from the funnel
-        // entirely.
-        expect(await deliveryCount("received")).toBe(beforeReceived);
-        expect(await deliveryCount("dead_lettered")).toBe(beforeDeadLettered + 1);
+        // The regression: this delivery never reached the normal `received`
+        // increment inside the lock-guarded closure. The exhausted lock path
+        // must still record both the funnel entry and the terminal state, so
+        // the delivery does not disappear and the BLO-18859 equation keeps
+        // holding for this path's delta.
+        const afterDeadLettered = await deliveryCount("dead_lettered");
+        const afterQueued = await deliveryCount("queued");
+        const afterReceived = await deliveryCount("received");
+        const afterSuppressed = await deliveryCount("suppressed");
+
+        expect(afterReceived).toBe(beforeReceived + 1);
+        expect(afterDeadLettered).toBe(beforeDeadLettered + 1);
+        expect(afterQueued).toBe(beforeQueued);
+        expect(afterSuppressed).toBe(beforeSuppressed);
+        expect(afterReceived - beforeReceived).toBe(
+          afterQueued - beforeQueued
+            + (afterSuppressed - beforeSuppressed)
+            + (afterDeadLettered - beforeDeadLettered),
+        );
 
         const wakes = await db
           .select({ status: agentWakeupRequests.status })
