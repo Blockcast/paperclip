@@ -22,7 +22,7 @@ overrides:
   ip-address: ^10.1.1
   picomatch: ^4.0.4
   '@anthropic-ai/sdk': '>=0.91.1'
-  brace-expansion: 5.0.8
+  brace-expansion: 5.0.9
   '@tootallnate/once': ^2.0.1
   form-data: '>=4.0.6'
   '@babel/core': '>=7.29.7 <8'
@@ -45,9 +45,9 @@ overrides:
   '@lexical/utils': 0.46.0
 
 patchedDependencies:
-  brace-expansion@5.0.8:
-    hash: r6jlpyozhnruclqmskazqz3zcm
-    path: patches/brace-expansion@5.0.8.patch
+  brace-expansion@5.0.9:
+    hash: yzvloneeihtddj7j4e3qpeeoue
+    path: patches/brace-expansion@5.0.9.patch
   embedded-postgres@18.1.0-beta.16:
     hash: 55uhvnotpqyiy37rn3pqpukhei
     path: patches/embedded-postgres@18.1.0-beta.16.patch
@@ -5272,8 +5272,8 @@ packages:
   bowser@2.14.1:
     resolution: {integrity: sha512-tzPjzCxygAKWFOJP011oxFHs57HzIhOEracIgAePE4pqB3LikALKnSzUyU4MGs9/iCEUuHlAJTjTc5M+u7YEGg==}
 
-  brace-expansion@5.0.8:
-    resolution: {integrity: sha512-JZyDyq3D4AUifKTPOB7DELf6XsB3WdPuNxCtob1vFXPsSXhdAiHBWJ/tJ8HAc9aH84BK+5JFZLNkJKx3G9kzQg==}
+  brace-expansion@5.0.9:
+    resolution: {integrity: sha512-ScQ4IuvIEF1TMlP7Zt+vjJ//9zlPb2SDcxWxM3bk8s6t6GGdJ7KO1dCcTidOPJKePW30LE/2cT7wCyPho9/Wxg==}
     engines: {node: 20 || >=22}
 
   browserslist@4.28.1:
@@ -12928,7 +12928,7 @@ snapshots:
 
   bowser@2.14.1: {}
 
-  brace-expansion@5.0.8(patch_hash=r6jlpyozhnruclqmskazqz3zcm):
+  brace-expansion@5.0.9(patch_hash=yzvloneeihtddj7j4e3qpeeoue):
     dependencies:
       balanced-match: 4.0.4
 
@@ -14963,16 +14963,16 @@ snapshots:
 
   minimatch@10.2.5:
     dependencies:
-      brace-expansion: 5.0.8(patch_hash=r6jlpyozhnruclqmskazqz3zcm)
+      brace-expansion: 5.0.9(patch_hash=yzvloneeihtddj7j4e3qpeeoue)
 
   minimatch@3.1.5:
     dependencies:
-      brace-expansion: 5.0.8(patch_hash=r6jlpyozhnruclqmskazqz3zcm)
+      brace-expansion: 5.0.9(patch_hash=yzvloneeihtddj7j4e3qpeeoue)
     optional: true
 
   minimatch@9.0.9:
     dependencies:
-      brace-expansion: 5.0.8(patch_hash=r6jlpyozhnruclqmskazqz3zcm)
+      brace-expansion: 5.0.9(patch_hash=yzvloneeihtddj7j4e3qpeeoue)
 
   minimist@1.2.8: {}
 
