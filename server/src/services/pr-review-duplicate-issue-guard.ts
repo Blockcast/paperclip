@@ -153,7 +153,10 @@ export function buildPrReviewTaskKey(ref: PullRequestRef): string {
 }
 
 /** Extracts unique canonical GitHub PR references from free text. */
-export function parsePullRequestRefs(...texts: Array<string | null | undefined>): PullRequestRef[] {
+function parsePullRequestRefsWithCasing(
+  preserveRepoCasing: boolean,
+  ...texts: Array<string | null | undefined>
+): PullRequestRef[] {
   const seen = new Map<string, PullRequestRef>();
   for (const text of texts) {
     if (!text) continue;
@@ -167,13 +170,23 @@ export function parsePullRequestRefs(...texts: Array<string | null | undefined>)
       // not a real PR and must not be normalized into one.
       if (!Number.isSafeInteger(prNumber) || prNumber <= 0) continue;
       if (String(prNumber) !== rawNumber) continue;
-      const ref: PullRequestRef = { repoFullName: normalizePrReviewRepoFullName(`${owner}/${repo}`), prNumber };
-      const key = buildPrReviewTaskKey(ref);
+      const sourceRepoFullName = `${owner}/${repo}`;
+      const ref: PullRequestRef = {
+        repoFullName: preserveRepoCasing
+          ? sourceRepoFullName
+          : normalizePrReviewRepoFullName(sourceRepoFullName),
+        prNumber,
+      };
+      const key = `${ref.repoFullName}:${ref.prNumber}`;
       if (!seen.has(key)) seen.set(key, ref);
       if (seen.size >= MAX_SCANNED_PULL_REQUEST_REFS) return [...seen.values()];
     }
   }
   return [...seen.values()];
+}
+
+export function parsePullRequestRefs(...texts: Array<string | null | undefined>): PullRequestRef[] {
+  return parsePullRequestRefsWithCasing(false, ...texts);
 }
 
 function configuredPrReviewerAgentIds(override?: readonly string[]): string[] {
@@ -217,7 +230,18 @@ export async function lockPrReviewIssueScopes(
   candidate: DuplicatePrReviewIssueCandidate,
   options: DuplicatePrReviewIssueOptions = {},
 ): Promise<void> {
-  const taskKeys = [...new Set(guardTaskKeys(candidate, options))].sort();
+  const normalizedTaskKeys = guardTaskKeys(candidate, options);
+  if (normalizedTaskKeys.length === 0) return;
+
+  // A pre-compatibility webhook pod locks only GitHub's source spelling. Keep
+  // that spelling alongside the normalized namespace so issue creation shares
+  // a lock with both old and current webhook transactions during rollout.
+  const sourceTaskKeys = parsePullRequestRefsWithCasing(
+    true,
+    candidate.title,
+    candidate.description,
+  ).map((ref) => `pr_review:${ref.repoFullName}:${ref.prNumber}`);
+  const taskKeys = [...new Set([...normalizedTaskKeys, ...sourceTaskKeys])].sort();
   for (const taskKey of taskKeys) {
     await db.execute(sql`select pg_advisory_xact_lock(hashtextextended(${taskKey}, 0))`);
   }
