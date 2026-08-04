@@ -101,7 +101,10 @@ import {
   TERMINAL_HEARTBEAT_RUN_STATUSES,
 } from "./issue-execution-lock.js";
 import { instanceSettingsService } from "./instance-settings.js";
-import { assertNotDuplicatePrReviewIssue } from "./pr-review-duplicate-issue-guard.js";
+import {
+  assertNotDuplicatePrReviewIssue,
+  lockPrReviewIssueScopes,
+} from "./pr-review-duplicate-issue-guard.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { redactSensitiveText } from "../redaction.js";
 import { resolveIssueGoalId, resolveNextIssueGoalId } from "./issue-goal-fallback.js";
@@ -8526,6 +8529,18 @@ export function issueService(db: Db) {
         return await db.transaction(async (tx) => {
         const idempotencyKey = rawIdempotencyKey?.trim() || null;
         const normalizedTitle = normalizeCreateIssueTitle(issueData.title);
+        if (issueData.assigneeAgentId) {
+          // Acquire the PR scope before the title/idempotency locks below. The
+          // later duplicate check intentionally stays after replay so a prior
+          // successful create remains idempotent while the transaction lock
+          // makes any racing webhook wake visible first.
+          await lockPrReviewIssueScopes(tx, {
+            companyId,
+            assigneeAgentId: issueData.assigneeAgentId,
+            title: issueData.title,
+            description: issueData.description,
+          });
+        }
         if (allowDuplicate === false) {
           const titleGuardKey =
             `issue-create:title:${companyId}:${issueData.parentId ?? "root"}:${normalizedTitle}`;

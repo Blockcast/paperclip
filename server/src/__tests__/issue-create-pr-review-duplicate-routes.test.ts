@@ -268,6 +268,48 @@ describeEmbeddedPostgres("issue create PR-review duplicate guard routes", () => 
     expect(await db.select().from(issues).where(eq(issues.companyId, companyId))).toHaveLength(0);
   });
 
+  it("waits for a racing webhook wake to commit before checking for a duplicate", async () => {
+    const { companyId, reviewer, app } = await setup();
+    let releaseWebhook!: () => void;
+    let reportLockAcquired!: () => void;
+    const lockAcquired = new Promise<void>((resolve) => {
+      reportLockAcquired = resolve;
+    });
+    const release = new Promise<void>((resolve) => {
+      releaseWebhook = resolve;
+    });
+
+    const webhookTransaction = db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${TASK_KEY}, 0))`);
+      reportLockAcquired();
+      await release;
+      await tx.insert(heartbeatRuns).values({
+        companyId,
+        agentId: reviewer.id,
+        status: "queued",
+        contextSnapshot: { taskKey: TASK_KEY },
+      });
+    });
+    await lockAcquired;
+
+    const createRequest = request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send(reviewIssueBody(reviewer.id))
+      .then((response) => response);
+    await expect(
+      Promise.race([
+        createRequest.then(() => "settled"),
+        new Promise<string>((resolve) => setTimeout(() => resolve("waiting"), 100)),
+      ]),
+    ).resolves.toBe("waiting");
+
+    releaseWebhook();
+    await webhookTransaction;
+    const response = await createRequest;
+    expect(response.status).toBe(409);
+    expect(response.body.code).toBe(DUPLICATE_PR_REVIEW_ISSUE_ERROR_CODE);
+  });
+
   it("rejects when the PR URL appears only in the description", async () => {
     const { companyId, reviewer, app } = await setup();
     await seedReviewRun(companyId, reviewer.id);
