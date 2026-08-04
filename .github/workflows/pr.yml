@@ -92,6 +92,20 @@ jobs:
       - name: Test PR test-coverage gate
         run: node --test ./.github/scripts/tests/check-pr-test-coverage.test.mjs
 
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.16.3
+
+      - name: Test Helm chart render suite (deploy/helm/paperclip)
+        # These render tests (topology-spread, probes, role-rbac, prometheus-rule,
+        # service-monitor, blockcast-auth, runtime-cache) previously ran nowhere in
+        # CI — a chart edit could silently break or regress any of them and every
+        # required check would stay green. BLO-20901's whole premise is that
+        # paperclip-api node spread is "enforced by scheduler policy, not left to
+        # chance"; that claim only holds if the test asserting it actually runs.
+        run: node --test deploy/helm/paperclip/tests/*.test.mjs
+
       - name: Test Ally review-consistency guard
         run: node --test ./scripts/check-ally-review-consistency.test.mjs
 
