@@ -1374,6 +1374,7 @@ describeEmbeddedPostgres("queued backlog convergence (BLO-20396)", () => {
     });
     let heldFirstDirectPass = false;
     let headRowInserted = false;
+    let headRunStatusAtRescan: string | undefined;
     const passReasons: string[] = [];
     // scanLimit 2 / maxScanBatches 1 means one pass reads two rows, so the six
     // blocked rows guarantee at least one `resume_bounded_scan` pass between the
@@ -1400,6 +1401,24 @@ describeEmbeddedPostgres("queued backlog convergence (BLO-20396)", () => {
           headRowInserted = true;
           await insertHeadRow();
         }
+        // Causality, not co-occurrence (Ally round 10). `passReasons` containing
+        // the rescan reason AND `headRunId` having started can both hold without
+        // the rescan being what started it: a `resume_bounded_scan` that reset or
+        // ignored its cursor could claim the head row itself, after which an empty
+        // head rescan still satisfies both assertions and the test passes without
+        // proving the behaviour its name describes. Sampling the row's status at
+        // the START of the rescan pass closes that hole — if it is still queued
+        // here, the start that follows can only be attributed to this pass.
+        if (
+          event.reason === "resume_head_rescan_after_coalesced_demand"
+          && headRunStatusAtRescan === undefined
+        ) {
+          const [headRow] = await db
+            .select({ status: heartbeatRuns.status })
+            .from(heartbeatRuns)
+            .where(eq(heartbeatRuns.id, headRunId));
+          headRunStatusAtRescan = headRow?.status ?? "missing";
+        }
       },
       onQueuedDispatchCoalescedDemandForTest: (event) => {
         if (event.agentId === agentId && event.reason === "direct") directCoalesced();
@@ -1410,22 +1429,56 @@ describeEmbeddedPostgres("queued backlog convergence (BLO-20396)", () => {
     // precisely the window in which no cursor exists yet.
     const firstPass = boundedHeartbeat.resumeQueuedRuns();
     let coalescedPass: Promise<unknown> | undefined;
+    // Diagnostic waits share ONE deadline, and the outer budget is sized above
+    // diagnostics + teardown (Ally round 10). Previously four independent 30s
+    // waits (two barriers, `vi.waitFor`, `waitForStarted`) could consume 120s
+    // inside a 60s outer budget. That matters more than it looks: when vitest
+    // fires its own timeout, the test body is still parked on an `await`, and JS
+    // cannot unwind a pending await — so the `finally` below does not get to run,
+    // and a bare outer timeout resurfaces exactly the cross-test leak that
+    // `try/finally` was added to prevent. Round 9's verification injected a
+    // failing *assertion*, which exercises only the throw path, so it did not
+    // cover this door. A shared deadline bounds the whole diagnostic phase, and
+    // exhausting it raises a labelled error rather than a bare timeout.
+    const diagnosticBudgetMs = 30_000;
+    const diagnosticDeadline = Date.now() + diagnosticBudgetMs;
+    const diagnosticRemainingMs = (label: string) => {
+      const remaining = diagnosticDeadline - Date.now();
+      if (remaining <= 0) {
+        throw new Error(
+          `diagnostic budget of ${diagnosticBudgetMs}ms was exhausted before "${label}"`,
+        );
+      }
+      return remaining;
+    };
     try {
-      await waitForBarrier(firstPassEnteredPromise, "first direct pass entered");
+      await waitForBarrier(
+        firstPassEnteredPromise,
+        "first direct pass entered",
+        diagnosticRemainingMs("first direct pass entered"),
+      );
       coalescedPass = boundedHeartbeat.resumeQueuedRuns();
-      await waitForBarrier(directCoalescedPromise, "second call coalesced into the first pass");
+      await waitForBarrier(
+        directCoalescedPromise,
+        "second call coalesced into the first pass",
+        diagnosticRemainingMs("second call coalesced into the first pass"),
+      );
       releaseFirstPass();
       await Promise.all([firstPass, coalescedPass]);
 
       // Fixture precondition, asserted before the behavioural one so a fixture
       // breakdown ("the chain never reached a resumed pass") is distinguishable
       // from the regression this test guards ("the row was inserted and starved").
-      await vi.waitFor(() => expect(headRowInserted).toBe(true), { timeout: 30_000, interval: 25 });
+      await vi.waitFor(() => expect(headRowInserted).toBe(true), {
+        timeout: diagnosticRemainingMs("head row inserted"),
+        interval: 25,
+      });
 
-      // 30s against a seven-row fixture is a very wide margin (the head rescan
-      // lands in well under a second), but it stays inside the 60s test budget so
-      // a regression fails on this assertion rather than as a bare test timeout.
-      expect(await adapter.waitForStarted(1, 30_000)).toBe(1);
+      // The remaining shared budget against a seven-row fixture is a very wide
+      // margin (the head rescan lands in well under a second), and it now sits
+      // inside a budget that still leaves room for the teardown below, so a
+      // regression fails on this assertion rather than as a bare test timeout.
+      expect(await adapter.waitForStarted(1, diagnosticRemainingMs("head run started"))).toBe(1);
       expect(adapter.started[0]).toBe(headRunId);
 
       // The row must have been reached by the head rescan the coalesced demand
@@ -1433,6 +1486,10 @@ describeEmbeddedPostgres("queued backlog convergence (BLO-20396)", () => {
       // would leave the starvation bug uncovered.
       expect(passReasons).toContain("resume_head_rescan_after_coalesced_demand");
       expect(passReasons).not.toContain("pruned_invalid_rows");
+
+      // …and that rescan is what started it: the row was still queued when the
+      // pass began, so no earlier pass can account for the start above.
+      expect(headRunStatusAtRescan).toBe("queued");
 
       // Sanity that the fixture did what the scenario needs: the chain really did
       // walk the whole backlog, rather than stalling early for some other reason.
@@ -1462,7 +1519,12 @@ describeEmbeddedPostgres("queued backlog convergence (BLO-20396)", () => {
       await Promise.allSettled([firstPass, coalescedPass]);
       await boundedHeartbeat.drainInFlightExecutions(60_000);
     }
-  }, 60_000);
+    // 180s, not 60s: the outer budget must exceed the worst-case diagnostic phase
+    // (30s, shared) PLUS the worst-case teardown (a 60s drain plus pass
+    // settlement), or vitest's timeout pre-empts the `finally` and the leak this
+    // test's teardown exists to contain escapes anyway. 180_000 matches the
+    // ceiling-resume case above rather than inventing a new constant.
+  }, 180_000);
 
   it("does not re-arm an internally scheduled head rescan when it coalesces", async () => {
     // BLO-20396 (sixth review follow-up). A trailing head rescan is scheduled
