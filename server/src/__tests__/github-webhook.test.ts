@@ -2511,9 +2511,9 @@ describeEmbeddedPostgres("github-webhook route", () => {
   // contention across a second, independent DB connection (a fresh
   // `createDb(...)` pool -- `pg_advisory_xact_lock` only contends across
   // sessions) and assert the two outcomes the fix is meant to produce: a
-  // contention window shorter than the retry budget self-heals, and one that
-  // outlasts every retry is at least COUNTED as `dead_lettered` instead of
-  // vanishing with zero record anywhere.
+  // contention window shorter than the request-wide lock budget self-heals,
+  // and one that outlasts it is at least COUNTED as `dead_lettered` instead
+  // of vanishing with zero record anywhere.
   describe("reviewer wake lock contention (BLO-21582)", () => {
     let lockDb: ReturnType<typeof createDb>;
 
@@ -2566,9 +2566,11 @@ describeEmbeddedPostgres("github-webhook route", () => {
 
         const prNumber = 21582001;
         const taskKey = `pr_review:Blockcast/paperclip:${prNumber}`;
-        // Longer than the 2s single-attempt budget, short enough that
-        // attempt 2 (after the 300ms backoff) lands inside the still-held
-        // window and attempt 3 finds it free.
+        // Well inside the 4s request-wide lock budget (PR_REVIEWER_TASK_LOCK_BUDGET_MS
+        // in github-webhook.ts), with a wide margin either side so this is not
+        // coupled to the exact retry-poll cadence: the fix retries continuously
+        // against one deadline rather than in discrete backed-off attempts, so
+        // any release before the deadline self-heals.
         const release = await holdAdvisoryLock(taskKey, 2_300);
 
         const app = buildApp({ prReviewerAgentId: reviewerAgentId });
@@ -2633,9 +2635,10 @@ describeEmbeddedPostgres("github-webhook route", () => {
 
         const prNumber = 21582002;
         const taskKey = `pr_review:Blockcast/paperclip:${prNumber}`;
-        // Outlasts all 3 attempts and both backoffs (2000+300+2000+900+2000
-        // = 7200ms worst case): every retry must find the lock still held.
-        const release = await holdAdvisoryLock(taskKey, 7_800);
+        // Outlasts the 4s request-wide lock budget (PR_REVIEWER_TASK_LOCK_BUDGET_MS
+        // in github-webhook.ts) with a clear margin, so this delivery must
+        // exhaust the retry budget outright.
+        const release = await holdAdvisoryLock(taskKey, 4_600);
 
         const app = buildApp({ prReviewerAgentId: reviewerAgentId });
         const payload = {
@@ -2697,9 +2700,97 @@ describeEmbeddedPostgres("github-webhook route", () => {
           .where(eq(agentWakeupRequests.agentId, reviewerAgentId));
         expect(wakes).toHaveLength(0);
       },
-      20_000,
+      10_000,
+    );
+
+    it(
+      "treats lock exhaustion as a no-op, not a false dead-letter, when a concurrent duplicate delivery already produced the equivalent durable wake",
+      async () => {
+        const reviewerAgentId = randomUUID();
+        const { companyId } = await seedCompanyAndAgent();
+        await db.insert(agents).values({
+          id: reviewerAgentId,
+          companyId,
+          name: "Ally",
+          role: "engineer",
+          status: "idle",
+          adapterType: "claude_k8s",
+          adapterConfig: {},
+          runtimeConfig: {},
+          permissions: {},
+        });
+
+        const prNumber = 21582003;
+        const taskKey = `pr_review:Blockcast/paperclip:${prNumber}`;
+        const idempotencyKey = `pr_review:Blockcast/paperclip:${prNumber}:github_pr_opened`;
+
+        // Stands in for a concurrent duplicate delivery that won the lock and
+        // already committed the exact durable wake this delivery would have
+        // produced -- the scenario the unlocked recheck in the
+        // PrReviewerTaskLockTimeoutError branch exists to detect (BLO-21582
+        // review follow-up: "Add a concurrent same-idempotency-key test where
+        // one request succeeds while the other exhausts").
+        await db.insert(agentWakeupRequests).values({
+          companyId,
+          agentId: reviewerAgentId,
+          source: "github",
+          reason: "github_pr_opened",
+          idempotencyKey,
+          status: "queued",
+          payload: { taskKey },
+        });
+
+        // Outlasts the request-wide lock budget with a clear margin: this
+        // delivery must exhaust every lock-acquisition retry and hit the
+        // PrReviewerTaskLockTimeoutError catch, not the normal lock-guarded
+        // idempotency check (which the pre-existing row above would also
+        // satisfy, but that path isn't what this test exercises).
+        const release = await holdAdvisoryLock(taskKey, 4_600);
+
+        const app = buildApp({ prReviewerAgentId: reviewerAgentId });
+        const payload = {
+          action: "opened",
+          pull_request: {
+            number: prNumber,
+            title: "Reviewer wake lock exhaustion with an equivalent durable wake",
+            body: null,
+            head: { ref: "fix/blo-21582-equivalent-wake", sha: "lockequivsha" },
+          },
+          repository: { full_name: "Blockcast/paperclip" },
+        };
+        const { body, signature } = signedRequest(payload);
+        const beforeDeadLettered = await deliveryCount("dead_lettered");
+        const beforeQueued = await deliveryCount("queued");
+        const beforeReceived = await deliveryCount("received");
+        const beforeSuppressed = await deliveryCount("suppressed");
+
+        const res = await request(app)
+          .post("/api/webhooks/github")
+          .set("x-github-event", "pull_request")
+          .set("x-hub-signature-256", signature)
+          .set("x-github-delivery", "delivery-blo-21582-lock-equivalent-wake")
+          .set("content-type", "application/json")
+          .send(body);
+
+        release();
+
+        expect(res.status).toBe(200);
+        expect(res.body).toMatchObject({ reviewerWakeFired: false });
+
+        // The false-loss the review flagged: without the recheck, this would
+        // have recorded received+dead_lettered even though the equivalent
+        // wake is already durable. It must instead be the same silent no-op
+        // the lock-guarded duplicate-idempotency-key check produces -- no
+        // delivery-funnel metric moves at all.
+        expect(await deliveryCount("dead_lettered")).toBe(beforeDeadLettered);
+        expect(await deliveryCount("queued")).toBe(beforeQueued);
+        expect(await deliveryCount("received")).toBe(beforeReceived);
+        expect(await deliveryCount("suppressed")).toBe(beforeSuppressed);
+      },
+      10_000,
     );
   });
+
 
   it("re-reviews a PR after a fixup push even though the prior review completed (stale-head regression)", async () => {
 

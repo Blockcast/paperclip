@@ -66,7 +66,14 @@ type PrReviewerSelectionDb = Pick<Db | DbTransaction, "select">;
 // Keep lock contention well below GitHub's webhook timeout. The winner holds
 // one pooled connection while heartbeat commits through another; createDb's
 // default pool satisfies the required minimum of two connections.
-const PR_REVIEWER_TASK_LOCK_TIMEOUT_MS = 2_000;
+//
+// BLO-21582 review follow-up: this is now a single request-wide budget
+// (passed to withPrReviewerTaskLock as one deadline, not re-armed per
+// attempt) so the whole lock-acquisition sequence -- including pool
+// checkout/query time, which a bare `await db.transaction()` does not
+// otherwise bound -- cannot itself approach GitHub's response window and
+// trigger the redelivery-under-contention loop this path exists to absorb.
+const PR_REVIEWER_TASK_LOCK_BUDGET_MS = 4_000;
 const PR_REVIEWER_TASK_LOCK_RETRY_MS = 25;
 
 export interface GithubWebhookConfig {
@@ -1546,14 +1553,26 @@ class PrReviewerTaskLockTimeoutError extends Error {
 async function withPrReviewerTaskLock<T>(
   db: Db,
   taskKey: string,
+  deadline: number,
   action: (tx: DbTransaction) => Promise<T>,
 ): Promise<T> {
-  const deadline = Date.now() + PR_REVIEWER_TASK_LOCK_TIMEOUT_MS;
-
   while (true) {
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) {
+      throw new PrReviewerTaskLockTimeoutError(taskKey);
+    }
     // Do not block a pooled connection while another request owns the lock:
     // the winner needs a second connection for heartbeat's enqueue transaction.
-    const outcome = await db.transaction(async (tx) => {
+    //
+    // Race pool checkout + the lock probe against the remaining budget:
+    // `db.transaction()` alone does not respect `deadline` (a stalled pool
+    // checkout under contention could block well past it), so bound it
+    // explicitly here rather than only checking elapsed time after it
+    // resolves (BLO-21582 review follow-up). Attach a `.catch` so a
+    // transaction that eventually settles after we've stopped waiting on it
+    // doesn't surface as an unhandled rejection; it still commits or rolls
+    // back on its own connection, we've simply moved on.
+    const transactionPromise = db.transaction(async (tx) => {
       const rows = await tx.execute(
         sql`select pg_try_advisory_xact_lock(hashtextextended(${taskKey}, 0)) as acquired`,
       );
@@ -1567,12 +1586,48 @@ async function withPrReviewerTaskLock<T>(
       }
       return { acquired: true as const, value: await action(tx) };
     });
+    transactionPromise.catch((err) => {
+      logger.warn(
+        { err, taskKey },
+        "github webhook reviewer wake lock transaction settled after its retry budget was abandoned",
+      );
+    });
+    const outcome = await Promise.race([
+      transactionPromise,
+      new Promise<{ acquired: false }>((resolve) => {
+        setTimeout(() => resolve({ acquired: false }), remainingMs);
+      }),
+    ]);
     if (outcome.acquired) return outcome.value;
     if (Date.now() >= deadline) {
       throw new PrReviewerTaskLockTimeoutError(taskKey);
     }
     await new Promise((resolve) => setTimeout(resolve, PR_REVIEWER_TASK_LOCK_RETRY_MS));
   }
+}
+
+// Shared between the lock-guarded idempotency check inside
+// withPrReviewerTaskLock's closure and the unlocked recheck on lock
+// exhaustion below (BLO-21582 review follow-up) -- same query, same meaning,
+// just without the per-task serialization the locked read gets.
+async function findExistingPrReviewerWake(
+  db: PrReviewerSelectionDb,
+  reviewerAgentIds: string[],
+  idempotencyKey: string,
+  idempotentStatuses: string[],
+) {
+  return db
+    .select({ id: agentWakeupRequests.id, status: agentWakeupRequests.status })
+    .from(agentWakeupRequests)
+    .where(
+      and(
+        inArray(agentWakeupRequests.agentId, reviewerAgentIds),
+        eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
+        inArray(agentWakeupRequests.status, idempotentStatuses),
+      ),
+    )
+    .limit(1)
+    .then((rows) => rows[0] ?? null);
 }
 
 function prFeedbackBody(context: ResolvedEventContext): string | null {
@@ -2075,34 +2130,26 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       // anywhere, while this handler still answered GitHub 200 (so GitHub's
       // own redelivery-on-failure never fired either).
       //
-      // Bounded retry absorbs a transient contention window instead of
-      // stranding the PR on one unlucky timing; it is safe to re-run because
-      // the closure re-checks `existingWake` under a fresh lock attempt
-      // before doing anything (see below). Only a lock-timeout retries --
-      // an HttpError business-rule refusal or a genuine DB error propagate
-      // straight to the catch, matching the existing non-retry behavior for
-      // those (see the comment above the `wakeResult` check).
-      const REVIEWER_WAKE_LOCK_ATTEMPTS = 3;
-      const REVIEWER_WAKE_LOCK_RETRY_BACKOFF_MS = [300, 900];
-      for (let attempt = 0; attempt < REVIEWER_WAKE_LOCK_ATTEMPTS; attempt++) {
-        try {
-        return await withPrReviewerTaskLock(db, reviewerTaskKey, async (tx) => {
+      // A single request-wide budget (PR_REVIEWER_TASK_LOCK_BUDGET_MS) absorbs
+      // a transient contention window instead of stranding the PR on one
+      // unlucky timing, while staying well under GitHub's webhook response
+      // window -- see the comment on withPrReviewerTaskLock for how the
+      // budget is enforced end-to-end (review follow-up on an earlier
+      // 3-attempt x fresh-2s-each design that could reach ~7.2s and only
+      // bounded time *after* each pool checkout, not during it).
+      const lockDeadline = Date.now() + PR_REVIEWER_TASK_LOCK_BUDGET_MS;
+      try {
+        return await withPrReviewerTaskLock(db, reviewerTaskKey, lockDeadline, async (tx) => {
           // The wake insert commits through heartbeat's own transaction. Keep
           // this transaction-scoped lock held until that commit is visible so
           // concurrent first events for one PR re-check affinity instead of
           // assigning the same task to different reviewers.
-          const existingWake = await tx
-            .select({ id: agentWakeupRequests.id, status: agentWakeupRequests.status })
-            .from(agentWakeupRequests)
-            .where(
-              and(
-                inArray(agentWakeupRequests.agentId, reviewerAgentIds),
-                eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
-                inArray(agentWakeupRequests.status, idempotentStatuses),
-              ),
-            )
-            .limit(1)
-            .then((rows) => rows[0] ?? null);
+          const existingWake = await findExistingPrReviewerWake(
+            tx,
+            reviewerAgentIds,
+            idempotencyKey,
+            idempotentStatuses,
+          );
           if (existingWake) {
             logger.info(
               {
@@ -2186,41 +2233,74 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
           // not produce a run.
           return false;
         });
-       } catch (err) {
-        if (
-          err instanceof PrReviewerTaskLockTimeoutError &&
-          attempt < REVIEWER_WAKE_LOCK_ATTEMPTS - 1
-        ) {
-          logger.warn(
-            {
-              err,
-              attempt: attempt + 1,
-              maxAttempts: REVIEWER_WAKE_LOCK_ATTEMPTS,
-              event: eventName,
-              prNumber: context?.prNumber,
-              repoFullName: context?.repoFullName,
-            },
-            "github webhook reviewer wake lock attempt failed, retrying",
-          );
-          await new Promise((resolve) =>
-            setTimeout(resolve, REVIEWER_WAKE_LOCK_RETRY_BACKOFF_MS[attempt]),
-          );
-          continue;
-        }
-        // BLO-21582: an exhausted lock-acquisition timeout happens before the
-        // lock-guarded closure can record `received`. Preserve the BLO-18859
-        // funnel (`received == queued + suppressed + dead_lettered`) by
-        // recording the delivery's entry into the durable wake path before its
-        // terminal dead-letter. Do not do this for arbitrary errors: those may
-        // have been thrown after the closure's normal `received` increment.
+      } catch (err) {
         if (err instanceof PrReviewerTaskLockTimeoutError) {
+          // BLO-21582 review follow-up: lock exhaustion means this delivery
+          // never reached the lock-guarded idempotency/active-reviewer gates
+          // above, so we cannot assume the equivalent wake was actually
+          // lost -- a concurrent duplicate delivery for the same PR may have
+          // held the lock for the full budget and completed the exact wake
+          // this one would have produced, or no reviewer may have been
+          // active the whole time either way. An unlocked recheck can't
+          // fully replace the lock-guarded read (a wake committed a moment
+          // later still slips through), but it turns the common
+          // already-handled case into the same silent no-op the idempotency
+          // and no-active-reviewer gates use above instead of a false
+          // dead-letter alert, while contention with no such evidence still
+          // counts as loss below.
+          const equivalentWake = await findExistingPrReviewerWake(
+            db,
+            reviewerAgentIds,
+            idempotencyKey,
+            idempotentStatuses,
+          );
+          if (equivalentWake) {
+            logger.info(
+              {
+                equivalentWakeId: equivalentWake.id,
+                equivalentWakeStatus: equivalentWake.status,
+                idempotencyKey,
+                event: eventName,
+                deliveryId,
+                wakeReason: context.wakeReason,
+                prNumber: context.prNumber,
+                repoFullName: context.repoFullName,
+              },
+              "github webhook reviewer wake lock exhausted, but an equivalent wake is already durable: not counting as a lost wake",
+            );
+            return false;
+          }
+          const equivalentReviewerAgentId =
+            (await findActivePrReviewerForTask(db, reviewerAgentIds, reviewerTaskKey)) ??
+            (await selectPrReviewerAgentId(db, reviewerAgentIds, reviewerTaskKey));
+          if (!equivalentReviewerAgentId) {
+            logger.warn(
+              {
+                configuredReviewerCount: reviewerAgentIds.length,
+                event: eventName,
+                prNumber: context.prNumber,
+                repoFullName: context.repoFullName,
+              },
+              "github webhook reviewer wake lock exhausted, but no configured reviewer is active: not counting as a lost wake",
+            );
+            return false;
+          }
+          // BLO-21582: an exhausted lock-acquisition timeout happens before
+          // the lock-guarded closure can record `received`, and neither
+          // recheck above found an equivalent completed/no-op outcome.
+          // Preserve the BLO-18859 funnel
+          // (`received == queued + suppressed + dead_lettered`) by recording
+          // the delivery's entry into the durable wake path before its
+          // terminal dead-letter.
           recordGithubReviewRequestDelivery({ state: "received", reason: context.wakeReason });
         }
+        // Do not double-count `received` for an arbitrary (non-timeout)
+        // error: those are thrown from inside the closure, after its normal
+        // `received` increment already ran.
         recordGithubReviewRequestDelivery({ state: "dead_lettered", reason: context.wakeReason });
         logger.error(
           {
             err,
-            attempt: attempt + 1,
             agentIds: reviewerAgentIds,
             event: eventName,
             prNumber: context?.prNumber,
@@ -2229,13 +2309,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
           "github webhook reviewer wake failed",
         );
         return false;
-        }
       }
-      // Unreachable: every loop iteration above returns or continues: the
-      // last attempt's catch always falls through to the dead_lettered
-      // return since `attempt < REVIEWER_WAKE_LOCK_ATTEMPTS - 1` is false by
-      // then. Kept only to satisfy the function's return type.
-      return false;
     })();
 
     // Dependabot remediation wake. Like the reviewer wake, this targets a
