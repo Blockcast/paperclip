@@ -109,6 +109,34 @@ spec:
         {{- end }}
         {{- end }}
         {{- end }}
+      # Hard-enforced spread (BLO-20901): the preferred podAntiAffinity above
+      # is only a scheduler hint, which is exactly how both replicas ended up
+      # on one node during the 2026-08-02 outage. DoNotSchedule makes
+      # co-location impossible for pods of the SAME ReplicaSet (steady state:
+      # both live replicas, always) — mirrors the paperclip-mcp Deployment
+      # (same namespace, applied outside this chart), which stayed up during
+      # that outage by refusing to co-locate.
+      # `matchLabelKeys: [pod-template-hash]` scopes the skew calculation to
+      # one revision at a time so a rollout starting from a degraded
+      # (already-skewed) fleet doesn't wedge the surge pod Pending forever.
+      # Trade-off: during that transient rollout window an old-revision pod
+      # and the new-revision surge pod CAN share a node — the invariant only
+      # holds for same-revision pods, i.e. always in steady state, not
+      # necessarily for the few seconds/minutes a rollout is in flight.
+      # Safe against `nodeSelector` below spanning the full multi-node pool:
+      # DoNotSchedule only parks a replica Pending if fewer than minDomains
+      # nodes in that pool are Ready, not merely because two specific
+      # hostnames are unavailable.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          minDomains: 2
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          matchLabelKeys:
+            - pod-template-hash
+          labelSelector:
+            matchLabels:
+              {{- include "paperclip.apiSelectorLabels" . | nindent 14 }}
       {{- else }}
       {{- with .Values.affinity }}
       affinity:
