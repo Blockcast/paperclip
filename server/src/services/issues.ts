@@ -9994,7 +9994,7 @@ export function issueService(db: Db) {
         if (actorAgentId && existing.assigneeAgentId && existing.assigneeAgentId !== actorAgentId) {
           throw conflict("Only assignee can release issue");
         }
-        if (actorAgentId && existing.status === "in_progress" && existing.assigneeAgentId === actorAgentId) {
+        if (actorAgentId && (existing.checkoutRunId || existing.executionRunId)) {
           const ownerRunIds = [...new Set([
             existing.checkoutRunId,
             existing.executionRunId,
