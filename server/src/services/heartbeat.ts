@@ -13395,7 +13395,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // So the retry keeps what it was given and only orphaned siblings are
       // cleared. That is why this needs no separate transferred-lock ledger.
       try {
-        await releaseIssueExecutionAndPromote(run);
+        // `suppressPromotion` whenever a retry exists — including the zero-row
+        // hand-over, which is exactly the case the ownership check inside
+        // cannot see (a sweeper-cleared NULL lock is falsy there).
+        await releaseIssueExecutionAndPromote(run, { suppressPromotion: Boolean(retry) });
         record("issue_release", { kind: "done" });
       } catch (error) {
         logger.warn({ err: error, runId: run.id }, "failed to release crash-interrupted issue execution lock");
@@ -13541,9 +13544,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     };
   }
 
-  /** Latches once the candidate index is confirmed usable; see below. */
-  let crashRecoveryCandidateIndexReady = false;
-  /** One warning per process, not one per 30s tick. */
+  /**
+   * One warning per absence episode, not one per 30s tick. Re-armed the moment
+   * the index is seen present again, so a later drop or invalid rebuild is
+   * reported instead of being silenced by the earlier episode's warning.
+   */
   let crashRecoveryCandidateIndexWarned = false;
 
   /**
@@ -13555,17 +13560,30 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * behind that the planner will not use, which would otherwise read here as
    * "indexed" and re-enable the very scan this gate exists to prevent.
    *
-   * Latches true once satisfied — an index cannot become invalid again without
-   * an operator dropping it, and that path takes a restart anyway.
+   * The result is NOT cached (BLO-20822, Ally round 7). An earlier version
+   * latched `true` forever on the reasoning that "an index cannot become
+   * invalid again without an operator dropping it, and that path takes a
+   * restart anyway". That is simply wrong about Postgres: `DROP INDEX
+   * CONCURRENTLY` needs no restart, and a failed online rebuild can leave the
+   * index absent or invalid — so a latched worker would silently resume the
+   * sequential scan and top-N sort this gate exists to prevent, with no further
+   * catalog check ever. Revalidating on every periodic pass is Ally's own first
+   * remedy and needs no tunable: this is one indexed catalog lookup per
+   * scheduler tick per replica, which is noise next to the scan it guards
+   * against, and it makes the gate recover in BOTH directions.
+   *
+   * A probe FAILURE means we do not know, so it skips this one periodic tick
+   * (startup recovery is ungated) and the next tick asks again.
    */
   async function crashRecoveryCandidateIndexPresent(): Promise<boolean> {
-    if (crashRecoveryCandidateIndexReady) return true;
     try {
       const rows = await db.execute(sql`
         select 1
         from pg_class c
         join pg_index i on i.indexrelid = c.oid
+        join pg_namespace n on n.oid = c.relnamespace
         where c.relname = 'heartbeat_runs_crash_recovery_pending_idx'
+          and n.nspname = current_schema()
           and c.relkind = 'i'
           and i.indisvalid
           and i.indisready
@@ -13573,7 +13591,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       `);
       const present = Array.from(rows as unknown as Iterable<unknown>).length > 0;
       if (present) {
-        crashRecoveryCandidateIndexReady = true;
+        // Re-arm the warning so a later disappearance is reported again rather
+        // than being silenced by a warning issued before the index existed.
+        crashRecoveryCandidateIndexWarned = false;
       } else if (!crashRecoveryCandidateIndexWarned) {
         crashRecoveryCandidateIndexWarned = true;
         // logger.warn, not the migration's RAISE NOTICE: the production client
@@ -13584,13 +13604,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             remediation:
               "CREATE INDEX CONCURRENTLY heartbeat_runs_crash_recovery_pending_idx ON heartbeat_runs USING btree (finished_at, id) WHERE error_code = 'worker_crashed' AND crash_recovery_completed_at IS NULL",
           },
-          "worker-crash candidate index missing; periodic crash reconciliation is disabled until it is built online (startup recovery still runs)",
+          "worker-crash candidate index missing or invalid; periodic crash reconciliation is disabled until it is built online (startup recovery still runs)",
         );
       }
       return present;
     } catch (err) {
-      // Never let a catalog probe failure take out the caller. Treating this as
-      // "absent" only skips the periodic pass; startup recovery is ungated.
+      // Never let a catalog probe failure take out the caller, and never cache
+      // it: "we could not tell" is not evidence either way. Skips this periodic
+      // tick only; startup recovery is ungated.
       logger.warn({ err }, "failed to probe worker-crash candidate index; skipping periodic reconciliation this tick");
       return false;
     }
@@ -13807,7 +13828,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // terminal run. Safe post-hand-over: the clearing UPDATE is keyed on
       // `execution_run_id = <this run>`, which the transferred lock no longer
       // matches, and promotion bails when the context issue is owned by the retry.
-      await releaseIssueExecutionAndPromote(interrupted);
+      await releaseIssueExecutionAndPromote(interrupted, { suppressPromotion: Boolean(retry) });
       if (retry) {
         retryRunIds.push(retry.id);
       }
@@ -18708,11 +18729,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       // Release regardless of whether a retry exists (BLO-20822, Ally round 6):
       // the retry takes over only the context issue, so gating on its existence
-      // stranded every sibling issue this run had locked. When a retry does own
-      // the context lock, promotion bails on its own and this returns false —
-      // which is the same value this call site saw before, so the
+      // stranded every sibling issue this run had locked. Promotion, however,
+      // stays gated on there being no retry (round 7) — a retry is the single
+      // intended continuation, and the ownership check inside cannot see the
+      // zero-row hand-over case. `promotedRunDispatched` is then false, which
+      // is the same value this call site saw before, so the
       // `startNextQueuedRunForAgent` fallback below is unchanged.
-      promotedRunDispatched = await releaseIssueExecutionAndPromote(finalizedRun);
+      promotedRunDispatched = await releaseIssueExecutionAndPromote(finalizedRun, {
+        suppressPromotion: Boolean(retriedRun),
+      });
       if (!opts?.suppressDispatchAfterReap && !promotedRunDispatched) {
         await startNextQueuedRunForAgent(run.agentId);
       }
@@ -23887,7 +23912,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   async function releaseIssueExecutionAndPromote(
     run: typeof heartbeatRuns.$inferSelect,
-    options: { suppressImmediateRecovery?: boolean } = {},
+    options: {
+      suppressImmediateRecovery?: boolean;
+      /**
+       * Clear this run's issue locks but do NOT promote a deferred wake.
+       *
+       * Set by every caller that has just queued a process-loss retry: that
+       * retry is the single intended continuation, so promoting here would
+       * create a second runnable path for the same issue (BLO-20822).
+       */
+      suppressPromotion?: boolean;
+    } = {},
   ): Promise<boolean> {
     const runContext = parseObject(run.contextSnapshot);
     const contextIssueId = readNonEmptyString(runContext.issueId);
@@ -23991,6 +24026,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .where(
           and(eq(issues.companyId, run.companyId), eq(issues.checkoutRunId, run.id)),
         );
+
+      // Lock clearing is done; promotion is a separate decision (BLO-20822,
+      // Ally round 7). When a process-loss retry exists it IS the single
+      // intended continuation, so promoting a `deferred_issue_execution` wake
+      // here would queue a SECOND runnable path for the same issue.
+      //
+      // This is not hypothetical: `enqueueProcessLossRetry` commits the retry
+      // even when its guarded context-lock transfer matches zero rows (the
+      // stale-lock sweeper can clear the terminal original's lock first), and
+      // it reports that honestly as `issueLockOwnedByRetry: false`. The
+      // ownership check below is `issue.executionRunId && ... !== run.id`, so a
+      // lock the sweeper cleared to NULL is FALSY and sails straight through
+      // it — the retry ends up racing a promoted run. Callers that queued a
+      // retry pass `suppressPromotion` and this returns before that check.
+      if (options.suppressPromotion) return null;
 
       // Deferred-wake promotion is bound to a single primary issue: the run's context
       // issue when present, otherwise the first candidate we found (preserves the

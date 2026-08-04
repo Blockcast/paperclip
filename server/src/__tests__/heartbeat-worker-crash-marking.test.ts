@@ -1236,4 +1236,126 @@ describeEmbeddedPostgres("heartbeat worker-crash marking and recovery convergenc
     expect(afterBuild.skippedReason).toBeUndefined();
     expect(afterBuild.reconciledRunIds).toEqual([run.id]);
   });
+
+  // BLO-20822, Ally round 7: the gate must recover in BOTH directions. An
+  // earlier version latched `true` after one successful probe, justified as
+  // "an index cannot become invalid again without an operator dropping it, and
+  // that path takes a restart anyway" — which is wrong about Postgres.
+  // `DROP INDEX CONCURRENTLY` needs no restart, and a failed online rebuild can
+  // leave the index absent or invalid, so a latched worker would silently
+  // resume the sequential scan and top-N sort this gate exists to prevent, with
+  // no further catalog check ever. The absent→present test above cannot catch
+  // that, because a latch is indistinguishable from a re-probe on that path.
+  it("disables the periodic pass again after the candidate index is dropped online", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const first = await seedCrashMarkedRun({ companyId, agentId, finishedAt: new Date(Date.now() - 120_000) });
+
+    // Same service instance throughout, so a latched `true` from this first
+    // (index-present) pass would carry into the post-drop pass below.
+    const svc = service();
+    const withIndex = await svc.reconcileWorkerCrashedRuns({ requireCandidateIndex: true });
+    expect(withIndex.skippedReason).toBeUndefined();
+    expect(withIndex.reconciledRunIds).toEqual([first.id]);
+
+    const afterDrop = await seedCrashMarkedRun({ companyId, agentId, finishedAt: new Date(Date.now() - 60_000) });
+    await db.execute(sql`drop index if exists heartbeat_runs_crash_recovery_pending_idx`);
+    try {
+      // The discriminating assertion: pre-fix this returned undefined and
+      // scanned, because readiness had been latched by the pass above.
+      const gated = await svc.reconcileWorkerCrashedRuns({ requireCandidateIndex: true });
+      expect(gated.skippedReason).toBe("candidate_index_missing");
+      expect(gated.reconciledRunIds).toEqual([]);
+      expect((await readRun(afterDrop.id)).crashRecoveryCompletedAt).toBeNull();
+
+      // Startup recovery stays ungated, so the run is not stranded.
+      expect((await svc.reconcileWorkerCrashedRuns()).reconciledRunIds).toEqual([afterDrop.id]);
+    } finally {
+      await db.execute(sql`
+        create index if not exists heartbeat_runs_crash_recovery_pending_idx
+          on heartbeat_runs using btree (finished_at, id)
+          where error_code = 'worker_crashed' and crash_recovery_completed_at is null
+      `);
+    }
+  });
+
+  // BLO-20822, Ally round 7: a zero-row hand-over must not leave TWO runnable
+  // execution paths for one issue.
+  //
+  // `enqueueProcessLossRetry` commits the retry even when its guarded
+  // context-lock transfer matches zero rows — the stale-lock sweeper can clear
+  // the terminal original's lock first — and reports that honestly as
+  // `issueLockOwnedByRetry: false`. Cleanup then finds the context issue
+  // unowned, and `releaseIssueExecutionAndPromote`'s ownership check is
+  // `issue.executionRunId && issue.executionRunId !== run.id`, so a
+  // sweeper-cleared NULL is FALSY and passes straight through it. Pre-fix that
+  // promoted a `deferred_issue_execution` wake into a second queued run holding
+  // the issue lock, racing the retry. The round-6 zero-row test could not catch
+  // this: it has no deferred wake, so it proved stale-checkout cleanup only.
+  it("does not promote a deferred wake alongside the retry when the hand-over matched zero rows", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const run = await seedCrashMarkedRun({ companyId, agentId, finishedAt: new Date(Date.now() - 60_000) });
+    const issueId = "77777777-7777-7777-7777-777777777777";
+    await db
+      .update(heartbeatRuns)
+      .set({ contextSnapshot: { issueId } })
+      .where(eq(heartbeatRuns.id, run.id));
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Contended issue",
+      status: "in_progress",
+      checkoutRunId: run.id,
+      executionRunId: run.id,
+      executionLockedAt: new Date(Date.now() - 60_000),
+    });
+    // A wake parked behind this issue's execution lock — the thing promotion
+    // would turn into a second runnable path.
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId,
+      source: "assignment",
+      status: "deferred_issue_execution",
+      payload: { issueId },
+    });
+
+    let sweptOnce = false;
+    const raced = service({
+      beforeProcessLossRetryEnqueueForTest: async () => {
+        if (sweptOnce) return;
+        sweptOnce = true;
+        // Force the zero-row hand-over: the sweeper clears the lock in the
+        // window between terminalizing the run and handing it to the retry.
+        await db
+          .update(issues)
+          .set({ executionRunId: null, executionLockedAt: null })
+          .where(eq(issues.id, issueId));
+      },
+    });
+
+    const result = await raced.reconcileWorkerCrashedRuns();
+    expect(sweptOnce).toBe(true);
+
+    const retries = await retriesOf(run.id);
+    expect(retries).toHaveLength(1);
+
+    // The discriminating assertion: exactly ONE runnable path survives — the
+    // retry. Pre-fix the deferred wake was promoted into a second queued run.
+    const allRuns = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
+    const runnable = allRuns.filter((r) => r.status === "queued" || r.status === "running");
+    expect(runnable.map((r) => r.id)).toEqual([retries[0]!.id]);
+
+    const [wakeAfter] = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.companyId, companyId));
+    expect(wakeAfter!.status).toBe("deferred_issue_execution");
+
+    // Stale checkout is still cleared — suppressing promotion must not have
+    // suppressed the lock cleanup that round 6 added.
+    const [issueAfter] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(issueAfter!.checkoutRunId).toBeNull();
+
+    expect(result.reconciledRunIds).toEqual([run.id]);
+    expect((await readRun(run.id)).crashRecoveryCompletedAt).not.toBeNull();
+  });
 });
