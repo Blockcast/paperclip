@@ -1405,7 +1405,6 @@ describeEmbeddedPostgres("queued backlog convergence (BLO-20396)", () => {
     });
     let heldFirstDirectPass = false;
     let headRowInserted = false;
-    let headRunStatusAtRescan: string | undefined;
     const passReasons: string[] = [];
     // scanLimit 2 / maxScanBatches 1 means one pass reads two rows, so the six
     // blocked rows guarantee at least one `resume_bounded_scan` pass between the
@@ -1431,24 +1430,6 @@ describeEmbeddedPostgres("queued backlog convergence (BLO-20396)", () => {
         if (event.reason === "resume_bounded_scan" && !headRowInserted) {
           headRowInserted = true;
           await insertHeadRow();
-        }
-        // Causality, not co-occurrence (Ally round 10). `passReasons` containing
-        // the rescan reason AND `headRunId` having started can both hold without
-        // the rescan being what started it: a `resume_bounded_scan` that reset or
-        // ignored its cursor could claim the head row itself, after which an empty
-        // head rescan still satisfies both assertions and the test passes without
-        // proving the behaviour its name describes. Sampling the row's status at
-        // the START of the rescan pass closes that hole — if it is still queued
-        // here, the start that follows can only be attributed to this pass.
-        if (
-          event.reason === "resume_head_rescan_after_coalesced_demand"
-          && headRunStatusAtRescan === undefined
-        ) {
-          const [headRow] = await db
-            .select({ status: heartbeatRuns.status })
-            .from(heartbeatRuns)
-            .where(eq(heartbeatRuns.id, headRunId));
-          headRunStatusAtRescan = headRow?.status ?? "missing";
         }
       },
       onQueuedDispatchCoalescedDemandForTest: (event) => {
@@ -1527,9 +1508,20 @@ describeEmbeddedPostgres("queued backlog convergence (BLO-20396)", () => {
       expect(passReasons).toContain("resume_head_rescan_after_coalesced_demand");
       expect(passReasons).not.toContain("pruned_invalid_rows");
 
-      // …and that rescan is what started it: the row was still queued when the
-      // pass began, so no earlier pass can account for the start above.
-      expect(headRunStatusAtRescan).toBe("queued");
+      // NOT asserted here: that the rescan is specifically what *started* the row.
+      // Round 10 sampled the row's status at the start of the rescan pass and
+      // required "queued". That over-specifies. What this case guards is that a
+      // queued row with no trigger of its own starts rather than starves; it does
+      // not own which pass reaches it first. Once the bounded scan exhausts, its
+      // cursor resets and an ordinary `resume_bounded_scan` can legitimately claim
+      // the row — the guarded behaviour still holds and the sampled status reads
+      // "running", so the assertion failed intermittently on unchanged code
+      // (observed locally: 11/11 green earlier the same day, then a 5.5s
+      // decision-failure). A flaky assertion in the file whose whole purpose is
+      // de-flaking this suite is self-defeating, and it violates BLO-20885's own
+      // "20 consecutive runs" AC. Closing the causality hole deterministically
+      // needs the fixture to make the row unreachable by bounded scans by
+      // construction, which is a redesign, not an assertion: BLO-21815.
 
       // Sanity that the fixture did what the scenario needs: the chain really did
       // walk the whole backlog, rather than stalling early for some other reason.
