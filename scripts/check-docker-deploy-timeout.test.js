@@ -153,10 +153,19 @@ test("Docker deploy approves the exact stamped plan before Helm mutates producti
   assert.match(deployJob, /--post-renderer "\$\{STAMP_SCRIPT\}"/);
   assert.equal(
     deployJob.match(/reconcile_approved_api_plan/g)?.length,
-    3,
-    "the exact-plan helper must be defined once and run before and after Helm",
+    2,
+    "the exact-plan helper must be defined once and run only after Helm",
+  );
+  assert.ok(
+    deployJob.indexOf("helm upgrade \"${RELEASE}\"") <
+      deployJob.lastIndexOf("reconcile_approved_api_plan"),
+    "Helm must apply release dependencies before exact API reconciliation",
   );
   assert.match(deployJob, /kubectl -n "\$\{NS\}" replace -f "\$\{reconciled\}"/);
+  assert.match(deployJob, /with_entries\(select\(\(\.key \| release_controlled_metadata_key\) \| not\)\)/);
+  assert.match(deployJob, /BEGIN CANONICAL_DEPLOYMENT_JQ/);
+  assert.match(deployJob, /live_server_plan_sha256.*approved_server_plan_sha256/s);
+  assert.match(deployJob, /\.spec\.template\.metadata\.annotations\["paperclip\.blockcast\.net\/approval-plan-sha256"\] == \$marker/);
 });
 
 test("Docker deploy confines and cleans up the release-approver credential", () => {

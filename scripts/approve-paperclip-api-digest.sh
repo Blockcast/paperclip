@@ -670,12 +670,33 @@ for attempt in $(seq 1 "${PAPERCLIP_APPROVAL_PROBE_ATTEMPTS:-30}"); do
       sleep "$(( attempt < 5 ? 1 : 2 ))"
       continue
     fi
-    server_plan_candidate="$(jq \
+    server_plan_candidate="$(jq -n \
+      --argjson planned "$planned_json" \
+      --argjson live "$live_server_plan_json" \
       --arg resource_version "$live_resource_version" '
-        del(.metadata.managedFields, .metadata.uid, .metadata.creationTimestamp,
-            .metadata.generation, .status) |
+        def release_controlled_metadata_key:
+          startswith("app.kubernetes.io/") or
+          startswith("helm.sh/") or
+          startswith("meta.helm.sh/") or
+          startswith("paperclip.blockcast.net/");
+        ($live.metadata
+          | del(.managedFields, .uid, .creationTimestamp, .generation)) as $live_metadata |
+        $planned |
+        .metadata = ($live_metadata + $planned.metadata) |
+        .metadata.labels = (
+          (($live.metadata.labels // {})
+            | with_entries(select((.key | release_controlled_metadata_key) | not))) +
+          ($planned.metadata.labels // {})
+        ) |
+        .metadata.annotations = (
+          (($live.metadata.annotations // {})
+            | with_entries(select((.key | release_controlled_metadata_key) | not))) +
+          ($planned.metadata.annotations // {})
+        ) |
+        if (.metadata.labels | length) == 0 then del(.metadata.labels) else . end |
+        if (.metadata.annotations | length) == 0 then del(.metadata.annotations) else . end |
         .metadata.resourceVersion = $resource_version
-      ' <<<"$planned_json")"
+      ')"
     server_plan_verb=replace
   elif ! grep -qiE 'not[[:space:]]+found|notfound' "$server_plan_err"; then
     sleep "$(( attempt < 5 ? 1 : 2 ))"

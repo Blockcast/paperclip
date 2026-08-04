@@ -607,6 +607,7 @@ jobs:
           TAG: sha-${{ steps.target.outputs.short }}-k8s-vendored
           PLAN_MARKER: ${{ steps.plan.outputs.marker }}
           APPROVED_SERVER_PLAN: ${{ steps.approval.outputs.server_plan_path }}
+          APPROVE_SCRIPT: ${{ steps.tooling.outputs.approve_script }}
           STAMP_SCRIPT: ${{ steps.tooling.outputs.stamp_script }}
           PAPERCLIP_APPROVAL_PLAN_SHA256: ${{ steps.plan.outputs.marker }}
           PAPERCLIP_DEPLOY_NAMESPACE: ${{ vars.PAPERCLIP_NAMESPACE || 'paperclip' }}
@@ -615,20 +616,45 @@ jobs:
           [[ "${DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]
           echo "rolling out ${TAG}@${DIGEST} to ${NS}/${RELEASE}"
           reconcile_approved_api_plan() {
-            local live_resource_version reconciled
-            live_resource_version="$(kubectl -n "${NS}" get deployment paperclip-api -o jsonpath='{.metadata.resourceVersion}')"
+            local live_json reconciled
+            live_json="$(kubectl -n "${NS}" get deployment paperclip-api -o json)"
             reconciled="$(mktemp "${RUNNER_TEMP}/paperclip-api-reconciled.XXXXXXXX.json")"
-            jq --arg resource_version "${live_resource_version}" \
-              '.metadata.resourceVersion = $resource_version' \
-              "${APPROVED_SERVER_PLAN}" > "${reconciled}"
+            jq --slurpfile approved "${APPROVED_SERVER_PLAN}" '
+              def release_controlled_metadata_key:
+                startswith("app.kubernetes.io/") or
+                startswith("helm.sh/") or
+                startswith("meta.helm.sh/") or
+                startswith("paperclip.blockcast.net/");
+              . as $live |
+              $approved[0] as $plan |
+              ($live.metadata
+                | del(.managedFields, .uid, .creationTimestamp, .generation)) as $live_metadata |
+              $plan |
+              # Current live metadata wins for non-release fields (for example,
+              # a finalizer added after approval); controlled labels and
+              # annotations are rebuilt explicitly below from the plan.
+              .metadata = ($plan.metadata + $live_metadata) |
+              .metadata.labels = (
+                (($live.metadata.labels // {})
+                  | with_entries(select((.key | release_controlled_metadata_key) | not))) +
+                ($plan.metadata.labels // {})
+              ) |
+              .metadata.annotations = (
+                (($live.metadata.annotations // {})
+                  | with_entries(select((.key | release_controlled_metadata_key) | not))) +
+                ($plan.metadata.annotations // {})
+              ) |
+              if (.metadata.labels | length) == 0 then del(.metadata.labels) else . end |
+              if (.metadata.annotations | length) == 0 then del(.metadata.annotations) else . end |
+              .metadata.resourceVersion = $live.metadata.resourceVersion
+            ' <<<"${live_json}" > "${reconciled}"
             kubectl -n "${NS}" replace -f "${reconciled}"
           }
 
-          # Land the exact server-normalized object whose hash the approval lock
-          # carries. Helm then records and updates the complete release using the
-          # same trusted post-renderer. Reconcile once more afterwards so a
-          # three-way merge cannot preserve live-only drift in the API object.
-          reconcile_approved_api_plan
+          # Keep the pre-Helm phase side-effect-free so the API Deployment is not
+          # rolled out ahead of same-revision Secrets, ConfigMaps, or service
+          # accounts. The trusted post-renderer rejects any Helm API render that
+          # differs from the approved plan before Helm applies the release.
           # --timeout bumped 10m → 30m on 2026-05-23 after rev 316 + several
           # prior revs hit "context deadline exceeded" while the cluster was
           # in apiserver/kubelet-latency cascade (control-plane nodes at
@@ -647,6 +673,32 @@ jobs:
             --wait --timeout 30m
           reconcile_approved_api_plan
           kubectl -n "${NS}" rollout status deployment/paperclip-api --timeout=30m
+
+          # Use the approver's canonical projection verbatim. Comparing the live
+          # object with the handed-off server plan proves the lock can be retired
+          # by the next release and catches concurrent or admission-time drift.
+          canonical_jq="$(sed -n \
+            '/^# BEGIN CANONICAL_DEPLOYMENT_JQ$/,/^# END CANONICAL_DEPLOYMENT_JQ$/p' \
+            "${APPROVE_SCRIPT}" | sed '1d;$d')"
+          if [ -z "${canonical_jq}" ]; then
+            echo "Could not load canonical Deployment projection from ${APPROVE_SCRIPT}" >&2
+            exit 1
+          fi
+          approved_server_plan_sha256="$(jq -cS "${canonical_jq}" "${APPROVED_SERVER_PLAN}" \
+            | sha256sum | awk '{print $1}')"
+          live_json="$(kubectl -n "${NS}" get deployment paperclip-api -o json)"
+          live_server_plan_sha256="$(jq -cS "${canonical_jq}" <<<"${live_json}" \
+            | sha256sum | awk '{print $1}')"
+          if [ "${live_server_plan_sha256}" != "${approved_server_plan_sha256}" ]; then
+            echo "Live API plan ${live_server_plan_sha256} does not match approved server plan ${approved_server_plan_sha256}" >&2
+            exit 1
+          fi
+          jq -e \
+            --arg marker "${PLAN_MARKER}" \
+            --arg image "harbor.blockcast.net/paperclip/paperclip@${DIGEST}" '
+              .spec.template.metadata.annotations["paperclip.blockcast.net/approval-plan-sha256"] == $marker and
+              (.spec.template.spec.containers | all(.image == $image))
+            ' <<<"${live_json}" >/dev/null
           helm -n "${NS}" list | head -3
           kubectl -n "${NS}" get pod -l app.kubernetes.io/name=paperclip \
             -o custom-columns=NAME:.metadata.name,IMAGE:.spec.containers[0].image,READY:.status.containerStatuses[0].ready,RESTARTS:.status.containerStatuses[0].restartCount
