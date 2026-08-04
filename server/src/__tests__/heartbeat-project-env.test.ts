@@ -10,6 +10,7 @@ import {
   extractMentionedSkillIdsFromSources,
   requiresPushCapabilityPreflight,
   resolveExecutionRunAdapterConfig,
+  translateGithubSeatTokenForExecutionTarget,
 } from "../services/heartbeat.ts";
 
 describe("resolveExecutionRunAdapterConfig", () => {
@@ -337,12 +338,11 @@ describe("resolveExecutionRunAdapterConfig", () => {
 
   // Ally's finding: raw resolution preserving the key is necessary but not
   // sufficient. requiresPushCapabilityPreflight-gated runs assert a push
-  // credential is configured BEFORE any of the above executes, and that
-  // contract listed only GH_TOKEN/GITHUB_TOKEN — so an agent bound exactly as
-  // BLO-18927 step 3 intends was rejected as push_write_credential_missing and
-  // the wrapper never ran. This exercises the real production contract by
-  // importing PUSH_CAPABILITY_ENV_KEYS rather than restating it, so the test
-  // cannot drift away from the constant it is guarding.
+  // credential is configured before dispatch, while remote execution targets
+  // still need a stock-gh-compatible command env after secret resolution. These
+  // tests exercise the real production contract by importing
+  // PUSH_CAPABILITY_ENV_KEYS rather than restating it, so the tests cannot drift
+  // away from the constant they guard.
   describe("push-capability preflight", () => {
     const pushCapabilityBinding = {
       keys: [...PUSH_CAPABILITY_ENV_KEYS],
@@ -362,6 +362,28 @@ describe("resolveExecutionRunAdapterConfig", () => {
         manifest: [],
       })),
     });
+    const remoteTarget = (transport: "sandbox" | "ssh") =>
+      transport === "sandbox"
+        ? {
+            kind: "remote" as const,
+            transport,
+            remoteCwd: "/workspace",
+          }
+        : {
+            kind: "remote" as const,
+            transport,
+            remoteCwd: "/workspace",
+            spec: {
+              host: "devbox.example",
+              port: 22,
+              username: "paperclip",
+              remoteWorkspacePath: "/workspace",
+              privateKey: null,
+              knownHosts: null,
+              strictHostKeyChecking: false,
+              remoteCwd: "/workspace",
+            },
+          };
 
     it("gates on git-sensitive local adapters running the github-pr-workflow skill", () => {
       expect(requiresPushCapabilityPreflight({
@@ -392,6 +414,89 @@ describe("resolveExecutionRunAdapterConfig", () => {
       });
 
       expect(result.resolvedConfig.env).toHaveProperty("GH_SEAT_TOKEN_VALUE");
+    });
+
+    it.each(["sandbox", "ssh"] as const)(
+      "translates an agent-scoped GH_SEAT_TOKEN_VALUE into standard GitHub env for remote %s runs",
+      async (transport) => {
+        const resolveAdapterConfigForRuntime = vi.fn(async (_companyId, config: Record<string, unknown>) => ({
+          config: {
+            ...config,
+            env: {
+              ...(config.env as Record<string, unknown>),
+              GH_SEAT_TOKEN_VALUE: " ghu_remote_seat\n",
+            },
+          },
+          secretKeys: new Set(["GH_SEAT_TOKEN_VALUE"]),
+          manifest: [],
+        }));
+
+        const result = await resolveExecutionRunAdapterConfig({
+          companyId: "company-1",
+          agentId: "agent-1",
+          executionRunConfig: {
+            env: {
+              GH_SEAT_TOKEN_VALUE: {
+                type: "secret_ref",
+                secretId: "6f1c0c6e-6f2e-4a1e-9c2f-2b7d3a5e8c11",
+                version: "latest",
+              },
+            },
+          },
+          requiredScopedEnvBinding: pushCapabilityBinding,
+          secretsSvc: {
+            resolveAdapterConfigForRuntime,
+            resolveEnvBindings: vi.fn(async () => ({
+              env: {},
+              secretKeys: new Set<string>(),
+              manifest: [],
+            })),
+          } as any,
+        });
+
+        const commandConfig = translateGithubSeatTokenForExecutionTarget({
+          runtimeConfig: result.resolvedConfig,
+          executionTarget: remoteTarget(transport),
+        });
+
+        expect(commandConfig.env).toMatchObject({
+          GH_SEAT_TOKEN_VALUE: " ghu_remote_seat\n",
+          GH_TOKEN: "ghu_remote_seat",
+          GITHUB_TOKEN: "ghu_remote_seat",
+        });
+      },
+    );
+
+    it("keeps GH_SEAT_TOKEN_VALUE local-only so the wrapper owns local translation", () => {
+      const runtimeConfig = {
+        env: {
+          GH_SEAT_TOKEN_VALUE: "ghu_local_seat",
+        },
+      };
+
+      expect(translateGithubSeatTokenForExecutionTarget({
+        runtimeConfig,
+        executionTarget: { kind: "local" },
+      })).toBe(runtimeConfig);
+    });
+
+    it("uses seat-token precedence over preexisting standard GitHub env on remote targets", () => {
+      const commandConfig = translateGithubSeatTokenForExecutionTarget({
+        runtimeConfig: {
+          env: {
+            GH_SEAT_TOKEN_VALUE: "ghu_agent_seat",
+            GH_TOKEN: "ghu_project_token",
+            GITHUB_TOKEN: "ghu_project_token",
+          },
+        },
+        executionTarget: remoteTarget("sandbox"),
+      });
+
+      expect(commandConfig.env).toMatchObject({
+        GH_SEAT_TOKEN_VALUE: "ghu_agent_seat",
+        GH_TOKEN: "ghu_agent_seat",
+        GITHUB_TOKEN: "ghu_agent_seat",
+      });
     });
 
     it("still rejects a run with no push credential at any accepted key", async () => {
