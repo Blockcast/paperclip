@@ -60,14 +60,15 @@ import {
   type RecordMergedPullRequestInput,
 } from "../services/issue-pull-requests.js";
 import { matchesTaskKey, normalizePrReviewRepoFullName } from "../services/pr-review-duplicate-issue-guard.js";
+import { HttpError } from "../errors.js";
 
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type PrReviewerSelectionDb = Pick<Db | DbTransaction, "select">;
 
 // Keep lock contention well below GitHub's webhook timeout. If this bounded
-// serialization layer times out, dispatch falls back to the same idempotent,
-// durable wake path without the lock rather than dropping the request. The
-// winner holds one pooled connection while heartbeat commits through another;
+// serialization layer times out, return a retryable error rather than dispatch
+// outside the lock and violate the issue-create duplicate guard. The winner
+// holds one pooled connection while heartbeat commits through another;
 // createDb's default pool satisfies the required minimum of two.
 const PR_REVIEWER_TASK_LOCK_TIMEOUT_MS = 2_000;
 const PR_REVIEWER_TASK_LOCK_RETRY_MS = 25;
@@ -77,6 +78,15 @@ class PrReviewerTaskLockTimeoutError extends Error {
   constructor() {
     super("timed out acquiring PR reviewer task assignment lock");
     this.name = "PrReviewerTaskLockTimeoutError";
+  }
+}
+
+class PrReviewerTaskLockContentionError extends HttpError {
+  constructor() {
+    super(503, "PR reviewer dispatch is contended; retry this webhook delivery", {
+      code: "pr_reviewer_dispatch_contended",
+    });
+    this.name = "PrReviewerTaskLockContentionError";
   }
 }
 
@@ -2226,11 +2236,12 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
               prNumber: context.prNumber,
               repoFullName: context.repoFullName,
             },
-            "github webhook reviewer lock timed out; dispatching through durable idempotent fallback",
+            "github webhook reviewer lock timed out; asking GitHub to retry",
           );
-          return db.transaction(dispatchReviewerWake);
+          throw new PrReviewerTaskLockContentionError();
         }
       } catch (err) {
+        if (err instanceof PrReviewerTaskLockContentionError) throw err;
         logger.error(
           {
             err,

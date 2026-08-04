@@ -55,6 +55,8 @@ import {
   __resetMetricsForTest,
   getMetricsRegistry,
 } from "../services/metrics.js";
+import { issueService } from "../services/issues.js";
+import { errorHandler } from "../middleware/index.js";
 
 /**
  * Sum {@link GITHUB_REVIEW_REQUEST_DELIVERY_METRIC} across every `reason`
@@ -1209,6 +1211,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
         ...config.heartbeatOptions,
       },
     }));
+    app.use(errorHandler);
     return app;
   }
 
@@ -1737,38 +1740,51 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(runs).toHaveLength(1);
   });
 
-  it("durably queues a reviewer wake when issue creation holds the PR lock beyond the timeout", async () => {
-    const { agentId: reviewerId } = await seedCompanyAndAgent({ agentName: "Ally" });
+  it("returns a retryable error instead of bypassing an issue-create PR lock", async () => {
+    const { companyId, agentId: reviewerId } = await seedCompanyAndAgent({ agentName: "Ally" });
     const app = buildApp({ prReviewerAgentIds: [reviewerId] });
     const taskKey = "pr_review:blockcast/paperclip:20526";
     let releaseIssueCreate!: () => void;
-    let reportLockAcquired!: () => void;
-    const lockAcquired = new Promise<void>((resolve) => {
-      reportLockAcquired = resolve;
+    let reportGuardPassed!: () => void;
+    const guardPassed = new Promise<void>((resolve) => {
+      reportGuardPassed = resolve;
     });
     const release = new Promise<void>((resolve) => {
       releaseIssueCreate = resolve;
     });
-    const issueCreateTransaction = db.transaction(async (tx) => {
-      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${taskKey}, 0))`);
-      reportLockAcquired();
-      await release;
-    });
-    await lockAcquired;
-
-    const payload = {
-      action: "opened",
-      pull_request: {
-        number: 20526,
-        title: "Do not lose a contended review wake",
-        body: null,
-        head: { ref: "cto/blo-20526" },
+    const previousReviewerIds = process.env.PAPERCLIP_PR_REVIEWER_AGENT_IDS;
+    process.env.PAPERCLIP_PR_REVIEWER_AGENT_IDS = reviewerId;
+    const issueCreate = issueService(db).create(companyId, {
+      title: "Review Blockcast/paperclip PR #20526",
+      description: "Please review https://github.com/blockcast/paperclip/pull/20526.",
+      assigneeAgentId: reviewerId,
+      status: "todo",
+      priority: "medium",
+      beforeSideEffects: async () => {
+        reportGuardPassed();
+        await release;
       },
-      repository: { full_name: "Blockcast/paperclip" },
-    };
-    const { body, signature } = signedRequest(payload);
-    const send = () =>
-      request(app)
+    });
+    try {
+      await Promise.race([
+        guardPassed,
+        issueCreate.then(() => {
+          throw new Error("issue create committed before reaching the guarded pause");
+        }),
+      ]);
+
+      const payload = {
+        action: "opened",
+        pull_request: {
+          number: 20526,
+          title: "Do not lose a contended review wake",
+          body: null,
+          head: { ref: "cto/blo-20526" },
+        },
+        repository: { full_name: "Blockcast/paperclip" },
+      };
+      const { body, signature } = signedRequest(payload);
+      const contended = await request(app)
         .post("/api/webhooks/github")
         .set("x-github-event", "pull_request")
         .set("x-hub-signature-256", signature)
@@ -1776,23 +1792,37 @@ describeEmbeddedPostgres("github-webhook route", () => {
         .set("content-type", "application/json")
         .send(body);
 
-    const contended = await send();
-    expect(contended.status).toBe(200);
-    expect(contended.body.reviewerWakeFired).toBe(true);
-    const runs = await db
+      expect(contended.status).toBe(503);
+      expect(contended.body).toMatchObject({
+        code: "pr_reviewer_dispatch_contended",
+      });
+      expect(await db
+        .select({ contextTaskKey: heartbeatRuns.contextTaskKey })
+        .from(heartbeatRuns)
+        .where(and(
+          eq(heartbeatRuns.agentId, reviewerId),
+          sql`lower(${heartbeatRuns.contextTaskKey}) = ${taskKey}`,
+        )))
+        .toHaveLength(0);
+    } finally {
+      releaseIssueCreate();
+      try {
+        await issueCreate;
+      } finally {
+        if (previousReviewerIds === undefined) delete process.env.PAPERCLIP_PR_REVIEWER_AGENT_IDS;
+        else process.env.PAPERCLIP_PR_REVIEWER_AGENT_IDS = previousReviewerIds;
+      }
+    }
+
+    expect(await db.select().from(issues).where(eq(issues.companyId, companyId))).toHaveLength(1);
+    expect(await db
       .select({ contextTaskKey: heartbeatRuns.contextTaskKey })
       .from(heartbeatRuns)
-      .where(eq(heartbeatRuns.agentId, reviewerId));
-    expect(runs).toEqual([{ contextTaskKey: "pr_review:Blockcast/paperclip:20526" }]);
-
-    releaseIssueCreate();
-    await issueCreateTransaction;
-
-    const redelivery = await send();
-    expect(redelivery.status).toBe(200);
-    expect(redelivery.body.reviewerWakeFired).toBe(false);
-    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, reviewerId)))
-      .toHaveLength(1);
+      .where(and(
+        eq(heartbeatRuns.agentId, reviewerId),
+        sql`lower(${heartbeatRuns.contextTaskKey}) = ${taskKey}`,
+      )))
+      .toHaveLength(0);
   }, 10_000);
 
   it("counts a review-request delivery as received+queued once, and does not count a deduped replay (BLO-18859)", async () => {
