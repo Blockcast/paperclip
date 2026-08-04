@@ -103,6 +103,14 @@ export type HumanGatedIssue = {
   title: string;
   status: string;
   priority?: string | null;
+  /**
+   * The human this issue is gated on, or `null` when it is not human-gated.
+   *
+   * Optional in the type only so mis-mapped input can be inspected rather than
+   * rejected at the boundary; at runtime the *key* is required. An absent key is
+   * classified `malformed` (a mapping failure the module must not read as an
+   * all-clear), while an explicit `null` is a legitimate non-human-gated row.
+   */
   assigneeUserId?: string | null;
   /** Issue creation time (ISO-8601). The floor of the human clock. */
   createdAt: string;
@@ -231,6 +239,39 @@ export function escalateAfterDaysFor(
   return Math.max(...configured);
 }
 
+/**
+ * Validate the keys the *selection* filter itself reads, before that filter runs.
+ *
+ * {@link isHumanGatedOpenIssue} reads `assigneeUserId` and `status`. A mis-mapped
+ * row — whole-row snake_case, say — has neither, so the filter discards it as
+ * "not human-gated" and it lands in neither `scanned` nor `malformed`. The digest
+ * then reports a clean all-clear for input it could not read at all, which is the
+ * one thing this module exists to make impossible. Checking key *shape* one layer
+ * earlier is what keeps "nothing is overdue" distinguishable from "I could not
+ * read your input".
+ *
+ * This draws exactly the absent-key vs present-and-null distinction that
+ * {@link validateHumanGatedIssueClockInput} already draws for `lastHumanTouchAt`,
+ * applied one layer earlier: an *absent* `assigneeUserId` key is a mapping
+ * failure, while `assigneeUserId: null` is a legitimate non-human-gated row that
+ * stays filtered rather than reported.
+ */
+function validateHumanGatedIssueKeyShape(issue: HumanGatedIssue): string | null {
+  if (!Object.prototype.hasOwnProperty.call(issue, "assigneeUserId")) {
+    return "missing assigneeUserId; prompt input may be using assignee_user_id";
+  }
+  if (issue.assigneeUserId === undefined) {
+    return "assigneeUserId must be a user id or null";
+  }
+  if (!Object.prototype.hasOwnProperty.call(issue, "status")) {
+    return "missing status; prompt input may be using a mis-mapped column name";
+  }
+  if (typeof issue.status !== "string" || issue.status.length === 0) {
+    return "status must be a non-empty string";
+  }
+  return null;
+}
+
 function validateHumanGatedIssueClockInput(issue: HumanGatedIssue): string | null {
   if (!parseTimestamp(issue.createdAt)) {
     return "missing or unparseable createdAt";
@@ -254,6 +295,26 @@ function validateHumanGatedIssueClockInput(issue: HumanGatedIssue): string | nul
  * Selection is `assigneeUserId IS NOT NULL` and an open status. Ordering is
  * strictly oldest-human-touch first; ties break on priority then identifier so
  * the output is stable across runs and diffable week over week.
+ *
+ * Every row is key-shape checked *before* selection, so a mis-mapped batch is
+ * reported as `malformed` rather than filtered away into a false all-clear.
+ *
+ * ## Why there is no batch-level "input mapping is broken" heuristic
+ *
+ * The obvious cheap signal — `issues.length > 0 && scanned.length === 0 &&
+ * malformed.length === 0` — is wrong, because this module filters internally
+ * instead of trusting the caller to pre-filter. A well-formed batch that
+ * legitimately contains zero human-gated rows (every row closed, or assigned to
+ * an agent) produces exactly that state, so the heuristic cries wolf on healthy
+ * input; a digest that cries wolf gets muted, which is the failure this module
+ * exists to prevent.
+ *
+ * Narrowing it to "rows that passed key-shape validation but matched nothing"
+ * does not rescue it either: those legitimate rows *do* pass shape validation,
+ * so the narrowed form fires on precisely the same healthy batch. The per-row
+ * shape check above is the correct signal because it is positive evidence — it
+ * names which row failed and which key was missing — rather than an inference
+ * drawn from an absence that has two causes.
  */
 export function selectAgedHumanGatedIssues(
   issues: HumanGatedIssue[],
@@ -263,7 +324,21 @@ export function selectAgedHumanGatedIssues(
 
   const malformed: MalformedHumanGatedIssue[] = [];
   const scanned: AgedHumanGatedIssue[] = [];
-  for (const issue of issues.filter(isHumanGatedOpenIssue)) {
+  for (const issue of issues) {
+    // Key shape first. Selection reads `assigneeUserId` and `status`, so a
+    // mis-mapped row must be caught *before* the filter can silently discard it
+    // as "not human-gated" — see validateHumanGatedIssueKeyShape.
+    const shapeReason = validateHumanGatedIssueKeyShape(issue);
+    if (shapeReason) {
+      malformed.push({ issue, reason: shapeReason });
+      continue;
+    }
+    // Shape is trustworthy, so this filter is now a real selection decision
+    // rather than a mapping accident: `assigneeUserId: null` or a closed status
+    // is a legitimate non-human-gated row and is dropped without comment.
+    if (!isHumanGatedOpenIssue(issue)) {
+      continue;
+    }
     const malformedReason = validateHumanGatedIssueClockInput(issue);
     if (malformedReason) {
       malformed.push({ issue, reason: malformedReason });
@@ -401,7 +476,17 @@ export function formatHumanGatedAgeingSections(report: HumanGatedAgeingReport): 
   }
 
   if (report.totalOverThreshold === 0) {
-    lines.push("", "- None.");
+    // "None." is only an all-clear when every row was actually readable. With
+    // skipped rows in the batch, an unqualified "None." is the false all-clear
+    // this module exists to prevent, so say what the zero is scoped to.
+    if (report.malformed.length > 0) {
+      lines.push(
+        "",
+        `- None among the ${report.scanned.length} row${report.scanned.length === 1 ? "" : "s"} that parsed. The ${report.malformed.length} skipped row${report.malformed.length === 1 ? "" : "s"} above ${report.malformed.length === 1 ? "was" : "were"} not audited — this is not an all-clear.`,
+      );
+    } else {
+      lines.push("", "- None.");
+    }
     return lines.join("\n");
   }
 

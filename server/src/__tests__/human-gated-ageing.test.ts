@@ -390,3 +390,158 @@ describe("threshold and reporting", () => {
     ]);
   });
 });
+
+/**
+ * BLO-19777. The malformed-row guard originally ran *downstream* of
+ * `isHumanGatedOpenIssue`, which reads `assigneeUserId` and `status`. A
+ * mis-mapped row has neither, so the selection filter discarded it as "not
+ * human-gated" before the validator could see it: badly overdue rows landed in
+ * neither `scanned` nor `malformed`, and the digest published a clean all-clear
+ * for input it could not read.
+ *
+ * The suite missed this because every earlier malformed-input test renamed one
+ * field at a time, leaving the two selection keys intact. These tests rename the
+ * whole row.
+ */
+describe("mis-mapped input is caught before the selection filter (BLO-19777)", () => {
+  /** A hand-mapped SQL result that never got camelCased — every key renamed. */
+  function fullySnakeCaseRow(overrides: {
+    id: string;
+    identifier: string;
+    priority: string;
+    status: string;
+    createdAt: string;
+  }): HumanGatedIssue {
+    return {
+      id: overrides.id,
+      identifier: overrides.identifier,
+      title: `Issue ${overrides.id}`,
+      priority: overrides.priority,
+      assignee_user_id: "user-1",
+      issue_status: overrides.status,
+      created_at: overrides.createdAt,
+      last_human_touch_at: null,
+    } as unknown as HumanGatedIssue;
+  }
+
+  it("classifies a fully snake_case batch of overdue rows as malformed, not as an all-clear", () => {
+    const rows = [
+      fullySnakeCaseRow({
+        id: "snake-critical",
+        identifier: "BLO-AAA",
+        priority: "critical",
+        status: "in_review",
+        createdAt: daysAgo(200),
+      }),
+      fullySnakeCaseRow({
+        id: "snake-high",
+        identifier: "BLO-BBB",
+        priority: "high",
+        status: "todo",
+        createdAt: daysAgo(310),
+      }),
+    ];
+
+    const report = selectAgedHumanGatedIssues(rows, {
+      now: NOW,
+      escalateAfterDaysByPriority: DEFAULT_ESCALATE_AFTER_DAYS_BY_PRIORITY,
+    });
+
+    expect(report.malformed.length).toBeGreaterThan(0);
+    expect(report.malformed).toHaveLength(2);
+    expect(report.scanned).toEqual([]);
+    expect(report.malformed[0]?.reason).toContain("missing assigneeUserId");
+
+    const rendered = formatHumanGatedAgeingSections(report);
+    expect(rendered).toContain("Skipped 2 malformed human-gated rows");
+    expect(rendered).toContain("BLO-AAA");
+    expect(rendered).toContain("BLO-BBB");
+  });
+
+  it("does not publish a bare all-clear when rows were skipped", () => {
+    const report = selectAgedHumanGatedIssues(
+      [
+        fullySnakeCaseRow({
+          id: "snake",
+          identifier: "BLO-AAA",
+          priority: "critical",
+          status: "in_review",
+          createdAt: daysAgo(200),
+        }),
+      ],
+      { now: NOW, escalateAfterDaysByPriority: DEFAULT_ESCALATE_AFTER_DAYS_BY_PRIORITY },
+    );
+
+    const rendered = formatHumanGatedAgeingSections(report);
+    // The unqualified "- None." line is what made the mapping failure read as
+    // positive evidence of a clean input.
+    expect(rendered).not.toContain("- None.");
+    expect(rendered).toContain("not an all-clear");
+  });
+
+  it("catches a mis-mapped selection key even when the other one is intact", () => {
+    const missingAssignee = {
+      ...issue({ id: "no-assignee-key", createdAt: daysAgo(200) }),
+      assignee_user_id: "user-1",
+    } as HumanGatedIssue & { assignee_user_id: string };
+    delete (missingAssignee as { assigneeUserId?: string | null }).assigneeUserId;
+
+    const missingStatus = {
+      ...issue({ id: "no-status-key", createdAt: daysAgo(200) }),
+      issue_status: "todo",
+    } as HumanGatedIssue & { issue_status: string };
+    delete (missingStatus as { status?: string }).status;
+
+    const report = selectAgedHumanGatedIssues([missingAssignee, missingStatus], {
+      now: NOW,
+      escalateAfterDaysByPriority: flat(30),
+    });
+
+    expect(report.scanned).toEqual([]);
+    expect(report.malformed.map((entry) => entry.issue.id)).toEqual([
+      "no-assignee-key",
+      "no-status-key",
+    ]);
+    expect(report.malformed[0]?.reason).toContain("assignee_user_id");
+    expect(report.malformed[1]?.reason).toContain("missing status");
+  });
+
+  it("keeps a present-and-null assigneeUserId a legitimate non-human-gated row", () => {
+    // The absent-key vs present-and-null distinction: `assigneeUserId: null` is
+    // the correct steady state for work that is not human-gated, so it is
+    // filtered silently — never reported as a mapping failure.
+    const report = selectAgedHumanGatedIssues(
+      [
+        issue({ id: "not-human-gated", assigneeUserId: null, createdAt: daysAgo(200) }),
+        issue({ id: "human-gated", assigneeUserId: "user-1", lastHumanTouchAt: daysAgo(200) }),
+      ],
+      { now: NOW, escalateAfterDaysByPriority: flat(30) },
+    );
+
+    expect(report.malformed).toEqual([]);
+    expect(report.scanned.map((row) => row.id)).toEqual(["human-gated"]);
+  });
+
+  it("reports no mapping problem for a well-formed batch with zero human-gated rows", () => {
+    // Pins the false-positive guard: this is exactly the state a batch-level
+    // `input > 0 && scanned === 0 && malformed === 0` heuristic would have
+    // misread as broken input, including the variant narrowed to shape-valid
+    // rows — both of these rows pass shape validation.
+    const report = selectAgedHumanGatedIssues(
+      [
+        issue({ id: "unassigned", assigneeUserId: null, createdAt: daysAgo(200) }),
+        issue({ id: "closed", assigneeUserId: "user-1", status: "done", createdAt: daysAgo(310) }),
+      ],
+      { now: NOW, escalateAfterDaysByPriority: DEFAULT_ESCALATE_AFTER_DAYS_BY_PRIORITY },
+    );
+
+    expect(report.malformed).toHaveLength(0);
+    expect(report.scanned).toEqual([]);
+    expect(report.totalOverThreshold).toBe(0);
+
+    const rendered = formatHumanGatedAgeingSections(report);
+    expect(rendered).not.toContain("malformed human-gated row");
+    expect(rendered).not.toContain("fix the input mapping");
+    expect(rendered).toContain("- None.");
+  });
+});
