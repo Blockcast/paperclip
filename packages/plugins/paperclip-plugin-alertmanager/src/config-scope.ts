@@ -211,6 +211,17 @@ export async function resolveCompanyScope(
   }
   const config = buildConfig(raw as unknown as AlertmanagerPluginConfig);
 
+  // Resolve (and record) the credential BEFORE the routing check below.
+  // Credential validity and routing validity are independent faults, but the
+  // routing check used to run first and throw, so a company with a routing
+  // mismatch never reached this line at all: a company with no credential
+  // *and* a mismatch was invisible to health, and a company that fixed its
+  // credential but still had a stale mismatch could never clear a prior
+  // degraded entry, because the mismatch always threw before recording ran
+  // again (BLO-20572 review feedback on PR #948).
+  const token = await resolveWebhookToken(ctx, config, companyId);
+  recordCredentialResolution(companyId, token);
+
   // The host picked this delivery's tenant when it matched the endpoint key;
   // `defaultCompanyId` is just an operator-typed field inside that tenant's own
   // config row. Where they disagree, the host wins — it is the authenticated
@@ -229,17 +240,14 @@ export async function resolveCompanyScope(
     ctx.logger.error(
       `paperclip-plugin-alertmanager: company ${companyId} has defaultCompanyId=${config.defaultCompanyId} — refusing to file its alerts under another tenant`,
     );
-    // Also a permanent misconfiguration, but a routing one, not a credential
-    // one: this company may well have a perfectly good token. Recording it
-    // would make the health surface report "no webhook credential resolved"
-    // about a company that has one. Left for a separate routing-health signal.
+    // A permanent misconfiguration, but a routing one, not (necessarily) a
+    // credential one — the credential state above already recorded the truth
+    // for this company independent of this throw, so a good token isn't
+    // misreported as missing just because routing also failed.
     throw new CompanyScopeUnavailableError(
       `defaultCompanyId ${config.defaultCompanyId} does not match delivering company ${companyId}`,
     );
   }
 
-  return {
-    config,
-    token: await resolveWebhookToken(ctx, config, companyId),
-  };
+  return { config, token };
 }

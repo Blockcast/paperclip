@@ -355,6 +355,45 @@ describe("credential health from the scope-resolution path (BLO-20572)", () => {
     expect(getCredentialHealth()).toEqual({ status: "ok" });
   });
 
+  it("goes degraded when a company has BOTH a routing mismatch and no credential", async () => {
+    // The routing check used to run before credential resolution and throw
+    // first, so a company failing both checks at once never reached the
+    // recorder — health stayed "ok" for a company rejecting every delivery.
+    const { ctx } = mkCtx({
+      configByCompany: {
+        [COMPANY_A]: { defaultCompanyId: COMPANY_B },
+      },
+    });
+
+    await expect(resolveCompanyScope(ctx, COMPANY_A)).rejects.toThrow(
+      CompanyScopeUnavailableError,
+    );
+
+    expect(getCredentialHealth().status).toBe("degraded");
+    expect(getCredentialHealth().details).toEqual({ companyIds: [COMPANY_A] });
+  });
+
+  it("clears a stale degraded entry once the credential is fixed, even if a routing mismatch remains", async () => {
+    // A prior delivery recorded company A as missing a credential.
+    recordCredentialResolution(COMPANY_A, null);
+    expect(getCredentialHealth().status).toBe("degraded");
+
+    // The operator adds a valid inline token but never fixes the unrelated
+    // defaultCompanyId mismatch. The delivery still fails — routing is still
+    // wrong — but the credential fault is gone and must stop being reported.
+    const { ctx } = mkCtx({
+      configByCompany: {
+        [COMPANY_A]: { defaultCompanyId: COMPANY_B, webhookToken: TOKEN },
+      },
+    });
+
+    await expect(resolveCompanyScope(ctx, COMPANY_A)).rejects.toThrow(
+      CompanyScopeUnavailableError,
+    );
+
+    expect(getCredentialHealth()).toEqual({ status: "ok" });
+  });
+
   it("recovers once the company's credential is fixed, with no restart", async () => {
     const { ctx } = mkCtx({
       configByCompany: {
