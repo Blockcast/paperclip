@@ -323,6 +323,38 @@ describe("github-webhook pure helpers", () => {
         body: "Paperclip issue: BLO-2",
       }),
     ).toEqual({ owning: ["BLO-1"] });
+
+    // The colon is mandatory for this weaker tier (unlike the closing-keyword
+    // tier, where "Closes BLO-1" is unambiguous natural language). "Issue" is
+    // an ordinary noun that also starts ordinary sentences, so an optional
+    // colon here would treat prose as an ownership claim. Neither of these is
+    // a house label -- both must resolve to nothing.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: "Issue filed a related bug, see BLO-1",
+      }),
+    ).toEqual({ owning: [] });
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: "Issue description for BLO-2",
+      }),
+    ).toEqual({ owning: [] });
+
+    // A house-reference line carrying a second, explicitly different label on
+    // the SAME line must resolve only the house label's own direct value --
+    // the semicolon-separated Related: mention must not become owning just
+    // because it shares a line with a real house label (BLO-20886's
+    // guarantee applied to this new tier).
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: "Issue: BLO-1; Related: BLO-2",
+      }),
+    ).toEqual({ owning: ["BLO-1"] });
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: "Paperclip issue: BLO-1, Related: BLO-2",
+      }),
+    ).toEqual({ owning: ["BLO-1"] });
   });
 
 
