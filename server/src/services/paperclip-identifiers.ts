@@ -120,6 +120,42 @@ export function extractOwningLabeledIdentifiers(body: string | null | undefined)
   return Array.from(found);
 }
 
+// BLO-21312: `github_pr_review_requested` -- the exact wake reason BLO-20886
+// was filed over -- arrives via `issue_comment` (an `@ally review` mention),
+// not `pull_request`, and an issue_comment payload carries no
+// `pull_request.head.ref`: the branch tier below is structurally unavailable
+// on this path, not merely unmeasured, so the "match case-insensitively"
+// fix for the branch tier cannot reach it. Real PR bodies on this path
+// (#931, #963, #976, #916) name their owner with one of this repo's own
+// non-closing house labels instead of a GitHub closing keyword: `Issue:`,
+// `Paperclip task:`, `Paperclip issue:`, `Paperclip QA task:`.
+//
+// These are weaker ownership claims than a closing keyword -- an author
+// writing "Issue: filed a related bug, see BLO-1" is not asserting the PR
+// closes BLO-1 the way "Fixes: BLO-1" does -- so this tier is ranked below
+// BOTH the closing-keyword tier and the branch tier in
+// resolveOwningPaperclipIdentifiers. On `pull_request` events, which do
+// carry a branch, the already-measured branch tier still wins whenever it
+// resolves; this tier only ever activates when title, closing keyword, AND
+// branch are all empty -- on `issue_comment` events, where fields.branch is
+// never populated, that reduces to "title and closing keyword are both
+// empty", making this the issue_comment path's practical last resort.
+const HOUSE_REFERENCE_LABEL_PATTERN =
+  /^[ \t]*(?:[-*+]|\d{1,3}[.)])?[ \t]*(?:paperclip[ \t]+qa[ \t]+task|paperclip[ \t]+task|paperclip[ \t]+issue|issue)[ \t]*:?[ \t]+(.+)$/gim;
+
+/** Identifiers that appear on a labeled house-reference line in `body` (see above). */
+export function extractHouseReferenceLabeledIdentifiers(body: string | null | undefined): string[] {
+  if (!body) return [];
+  const found = new Set<string>();
+  HOUSE_REFERENCE_LABEL_PATTERN.lastIndex = 0;
+  for (const match of body.matchAll(HOUSE_REFERENCE_LABEL_PATTERN)) {
+    const rest = match[1];
+    if (!rest) continue;
+    for (const identifier of extractPaperclipIdentifiers(rest)) found.add(identifier);
+  }
+  return Array.from(found);
+}
+
 export interface OwningIdentifierResolution {
   // The PR's authoritative issue identifier(s) -- empty when none was found.
   owning: string[];
@@ -131,7 +167,11 @@ export interface OwningIdentifierResolution {
  *
  *   1. title ref
  *   2. body line(s) explicitly labeled Fixes:/Closes:/Resolves:/Refs:
- *   3. branch ref, case-insensitively -- LAST resort, see below.
+ *   3. branch ref, case-insensitively -- LAST resort among the two
+ *      process-signal tiers, see below.
+ *   4. body line(s) explicitly labeled with a non-closing house reference
+ *      (Issue:/Paperclip task:/Paperclip issue:/Paperclip QA task:) -- LAST
+ *      resort overall, see below (BLO-21312).
  *
  * A bare mention anywhere else in the body -- including under a `Related:`
  * label -- is never owning. Only the first non-empty tier is consulted, and
@@ -144,10 +184,11 @@ export interface OwningIdentifierResolution {
  * (BLO-20886: doing so routed an author-directed "push a follow-up commit"
  * wake to the assignee of an unrelated issue named only under `Related:`).
  *
- * On the branch tier being LAST and case-insensitive, both of which are
- * measured rather than assumed. resolveLinkSourceForIdentifier above ranks
- * the branch FIRST on the theory that branchTemplate injects the ref, making
- * it process-enforced. Two things falsify that here:
+ * On the branch tier being LAST among title/keyword/branch and case-
+ * insensitive, both of which are measured rather than assumed.
+ * resolveLinkSourceForIdentifier above ranks the branch FIRST on the theory
+ * that branchTemplate injects the ref, making it process-enforced. Two
+ * things falsify that here:
  *
  *   - PAPERCLIP_IDENTIFIER_PATTERN is uppercase-only and real branches are
  *     lowercase (`sre/blo-20886-...`), so an uppercase branch tier is inert:
@@ -167,6 +208,18 @@ export interface OwningIdentifierResolution {
  *
  * So the branch is consulted only when nothing curated resolved, where its
  * choices are 21 recovered wakes against 0 overridden answers.
+ *
+ * The house-reference tier (BLO-21312) exists for `github_pr_review_requested`
+ * wakes that arrive via `issue_comment` rather than `pull_request`: that
+ * payload shape carries no `pull_request.head.ref`, so `fields.branch` is
+ * never populated and tier 3 is structurally empty regardless of case-
+ * insensitivity. Real PR bodies on that path (#931, #963, #976, #916) name
+ * their owner with a non-closing house label instead of a GitHub closing
+ * keyword. That is a weaker ownership claim than `Fixes:`/`Closes:` -- it has
+ * not been measured the way the branch tier was -- so it is ranked below the
+ * branch tier too: for `pull_request` events (which do carry a branch), the
+ * measured branch tier still wins whenever it resolves, and this tier only
+ * activates when title, closing keyword, AND branch are all empty.
  */
 export function resolveOwningPaperclipIdentifiers(fields: {
   branch?: string | null;
@@ -180,6 +233,7 @@ export function resolveOwningPaperclipIdentifiers(fields: {
     // matches the uppercase-only identifier pattern. Safe to normalize here
     // because a branch ref carries no prose that case could disambiguate.
     extractPaperclipIdentifiers(fields.branch?.toUpperCase()),
+    extractHouseReferenceLabeledIdentifiers(fields.body),
   ];
   for (const tier of tiers) {
     if (tier.length > 0) return { owning: tier };
