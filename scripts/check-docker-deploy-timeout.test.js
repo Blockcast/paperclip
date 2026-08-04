@@ -198,14 +198,25 @@ test("Docker deploy reconciles marker-bearing drift before propagating Helm fail
   const markerObserved = deployJob.indexOf('if [ "${live_marker}" = "${PLAN_MARKER}" ]');
   const reconcile = deployJob.indexOf("reconcile_approved_api_plan", markerObserved);
   const helmWait = deployJob.indexOf('wait "${helm_pid}" || helm_status=$?');
+  const postWait = deployJob.indexOf('api_plan_reconciled=""', helmWait);
+  const postWaitMarker = deployJob.indexOf(
+    'if [ "${live_marker}" = "${PLAN_MARKER}" ]',
+    postWait,
+  );
+  const postWaitReconcile = deployJob.indexOf("reconcile_approved_api_plan", postWaitMarker);
   const failedStatus = deployJob.indexOf('if [ "${helm_status}" -ne 0 ]');
 
   assert.ok(helmStart >= 0 && helmStart < markerObserved);
   assert.ok(markerObserved < reconcile, "the approved marker must gate exact reconciliation");
   assert.ok(reconcile < helmWait, "live-only drift must be removed while Helm is still waiting");
   assert.ok(helmWait < failedStatus, "Helm failure must be captured instead of exiting immediately");
+  assert.ok(helmWait < postWait && postWait < postWaitMarker);
   assert.ok(
-    deployJob.lastIndexOf("reconcile_approved_api_plan", failedStatus) < failedStatus,
-    "the post-exit race path must reconcile before Helm failure is returned",
+    postWaitMarker < postWaitReconcile && postWaitReconcile < failedStatus,
+    "an identical pre-existing marker must not suppress post-Helm reconciliation",
+  );
+  assert.doesNotMatch(
+    deployJob.slice(helmWait, postWaitMarker),
+    /if \[ -z "\$\{api_plan_reconciled\}" \]/,
   );
 });

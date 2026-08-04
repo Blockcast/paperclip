@@ -705,16 +705,17 @@ jobs:
           wait "${helm_pid}" || helm_status=$?
           helm_pid=""
 
-          # Cover the narrow race where Helm exits after applying the Deployment
-          # but before the polling loop observes its marker.
-          if [ -z "${api_plan_reconciled}" ]; then
-            live_marker="$(kubectl -n "${NS}" get deployment paperclip-api \
-              -o jsonpath='{.spec.template.metadata.annotations.paperclip\.blockcast\.net/approval-plan-sha256}' \
-              2>/dev/null || true)"
-            if [ "${live_marker}" = "${PLAN_MARKER}" ]; then
-              reconcile_approved_api_plan
-              api_plan_reconciled=yes
-            fi
+          # Reconcile again after Helm exits even if the polling loop already did
+          # so. On an exact retry the deterministic marker may predate this Helm
+          # invocation; only this unconditional post-wait pass guarantees a later
+          # three-way merge or failure cannot strand live-only template drift.
+          api_plan_reconciled=""
+          live_marker="$(kubectl -n "${NS}" get deployment paperclip-api \
+            -o jsonpath='{.spec.template.metadata.annotations.paperclip\.blockcast\.net/approval-plan-sha256}' \
+            2>/dev/null || true)"
+          if [ "${live_marker}" = "${PLAN_MARKER}" ]; then
+            reconcile_approved_api_plan
+            api_plan_reconciled=yes
           fi
           if [ -z "${api_plan_reconciled}" ]; then
             echo "Helm never applied the approved API plan marker ${PLAN_MARKER}" >&2
