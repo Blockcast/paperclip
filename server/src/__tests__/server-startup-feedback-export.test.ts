@@ -553,6 +553,75 @@ describe("startServer feedback export wiring", () => {
     }
   });
 
+  // BLO-20822: the interval callback checks `heartbeatSchedulerStopped` before
+  // awaiting `resolveSchedulingSuppression`, but the callback itself is handed
+  // to `setInterval` and is NOT registered with `trackHeartbeatSchedulerWork`.
+  // So while it is suspended in that await, shutdown can set the flag, clear
+  // the interval, and find the in-flight set already empty — the drain barrier
+  // reports idle and shutdown proceeds. Pre-fix, when the await then resolved
+  // the callback took the single-flight latch and started crash reconciliation
+  // *after* that barrier, mutating runs and issue locks during shutdown.
+  it("does not start crash reconciliation when shutdown begins while the tick awaits suppression", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+    let intervalCallback: (() => void) | null = null;
+    const setIntervalSpy = vi
+      .spyOn(globalThis, "setInterval")
+      .mockImplementation(((callback: () => void) => {
+        intervalCallback = callback;
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      }) as typeof setInterval);
+    // `startServer` installs a `process.once("SIGTERM")` handler. Isolate this
+    // test's handler from any left by earlier tests in the file, and restore
+    // the originals afterwards.
+    const priorSigterm = process.listeners("SIGTERM");
+    process.removeAllListeners("SIGTERM");
+
+    try {
+      await startServer();
+      // Both also run once from the startup recovery sequence (index.ts:1257);
+      // clear so the assertions below only see post-shutdown activity.
+      heartbeatServiceMock.reconcileWorkerCrashedRuns.mockClear();
+      heartbeatServiceMock.sweepStaleIssueLocks.mockClear();
+
+      // Park the SECOND suppression resolve — the one gating the reconcile /
+      // sweep pair. The first (timer tick) resolves normally so the tick gets
+      // all the way to the reconcile gate, which is where the finding is.
+      let releaseSuppression: (() => void) | null = null;
+      resolveHeartbeatSchedulingSuppressionMock
+        .mockImplementationOnce(() => ({ suppressed: false, reason: null }))
+        .mockImplementationOnce(
+          () => new Promise((resolve) => {
+            releaseSuppression = () => resolve({ suppressed: false, reason: null });
+          }),
+        );
+
+      intervalCallback?.();
+      await vi.waitFor(() => expect(releaseSuppression).not.toBeNull());
+
+      // Shutdown begins while the tick is parked. `fakeServer.close` never
+      // invokes its callback, so the handler stops there — well after the
+      // scheduler flag is set, the interval cleared and the idle barrier passed.
+      process.emit("SIGTERM" as NodeJS.Signals);
+      await vi.waitFor(() => expect(fakeServer.close).toHaveBeenCalled());
+
+      releaseSuppression?.();
+      // Give the resumed tick more than enough turns to reach the latch.
+      for (let i = 0; i < 25; i += 1) await Promise.resolve();
+
+      expect(heartbeatServiceMock.reconcileWorkerCrashedRuns).not.toHaveBeenCalled();
+      expect(heartbeatServiceMock.sweepStaleIssueLocks).not.toHaveBeenCalled();
+    } finally {
+      setIntervalSpy.mockRestore();
+      process.removeAllListeners("SIGTERM");
+      for (const listener of priorSigterm) {
+        process.on("SIGTERM", listener as (...args: unknown[]) => void);
+      }
+    }
+  });
+
   it("refuses authenticated public startup without an external database URL", async () => {
     loadConfigMock.mockReturnValue(buildTestConfig({
       deploymentExposure: "public",

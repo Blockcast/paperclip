@@ -1351,7 +1351,17 @@ export async function startServer(): Promise<StartedServer> {
           );
         }
 
-        if (!(await heartbeat.resolveSchedulingSuppression()).suppressed) {
+        const timerSuppression = await heartbeat.resolveSchedulingSuppression();
+        // Re-check AFTER the await, not just before it (BLO-20822). This
+        // callback is handed to `setInterval` and is not itself registered with
+        // `trackHeartbeatSchedulerWork`, so while it is suspended here shutdown
+        // can set the flag, clear the interval, and find `heartbeatSchedulerInFlight`
+        // already empty — `waitForHeartbeatSchedulerIdle` then returns and the
+        // drain barrier is considered passed. When the await resolves we would
+        // register fresh work *after* that barrier, mutating runs and issue
+        // locks during shutdown. The pre-await check cannot cover this window.
+        if (heartbeatSchedulerStopped) return;
+        if (!timerSuppression.suppressed) {
           trackHeartbeatSchedulerWork(heartbeat
             .tickTimers(new Date())
             .then((result) => {
@@ -1401,7 +1411,15 @@ export async function startServer(): Promise<StartedServer> {
           }));
 
         if (heartbeatSchedulerStopped) return;
-        if (!(await heartbeat.resolveSchedulingSuppression()).suppressed) {
+        const reconcileSuppression = await heartbeat.resolveSchedulingSuppression();
+        // Same post-await re-check as the timer tick above (BLO-20822), and it
+        // matters more here: what follows takes the single-flight latch and
+        // starts crash reconciliation, which terminalizes runs and hands over
+        // issue locks. Starting that after `waitForHeartbeatSchedulerIdle` has
+        // already reported idle is precisely the mutation-during-shutdown the
+        // drain exists to prevent.
+        if (heartbeatSchedulerStopped) return;
+        if (!reconcileSuppression.suppressed) {
           // BLO-20822: a startup-only pass misses a lease left by a recoverer
           // that died mid-cleanup on *this* replica's previous life — an
           // immediately-restarting replacement's own startup pass runs
