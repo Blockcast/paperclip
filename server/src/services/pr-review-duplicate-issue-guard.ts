@@ -26,20 +26,12 @@
  * issue through — a duplicate review issue is a cost problem, whereas wrongly
  * blocking issue creation is a correctness problem.
  *
- * KNOWN AND ACCEPTED GAP (BLO-21790 — tracked there with its re-open trigger,
- * so this is an explicit scope decision rather than an undocumented decline):
- * this check is not serialized against the webhook's
- * `withPrReviewerTaskLock`. A webhook holding that lock with its wake
- * transaction still uncommitted is invisible to us under READ COMMITTED, so a
- * create racing that exact window is allowed and the duplicate survives. That
- * is deliberate. Closing it means taking the PR-scope advisory lock inside the
- * issue-creation transaction, which already holds the title and idempotency
- * advisory locks (services/issues.ts) — up to MAX_SCANNED_PULL_REQUEST_REFS of
- * them for one issue — and would couple every issue create in the product to
- * webhook dispatch latency, in a lock order opposite to the webhook's. Paying
- * deadlock risk and head-of-line blocking on the hottest write path to close a
- * millisecond window in a best-effort cost guard is the wrong trade: the racing
- * duplicate costs one issue, and the next attempt is rejected normally.
+ * Eligible creates take the normalized PR-scope advisory locks before the
+ * issue-create title and idempotency locks. The webhook takes the same
+ * normalized namespace as part of its compatibility lock set, so its wake
+ * commit is visible before this guard reads. Acquiring these locks first keeps
+ * the lock order consistent and avoids coupling unrelated issue creates to the
+ * webhook path.
  */
 import { type Db, heartbeatRuns } from "@paperclipai/db";
 import { type Column, type SQL, and, desc, eq, inArray, or, sql } from "drizzle-orm";
@@ -201,6 +193,36 @@ export type DuplicatePrReviewIssueOptions = {
   reviewerAgentIds?: readonly string[];
 };
 
+function guardTaskKeys(
+  candidate: DuplicatePrReviewIssueCandidate,
+  options: DuplicatePrReviewIssueOptions,
+): string[] {
+  const assigneeAgentId = candidate.assigneeAgentId?.trim();
+  if (!assigneeAgentId || guardDisabled()) return [];
+
+  const reviewerAgentIds = configuredPrReviewerAgentIds(options.reviewerAgentIds);
+  if (!reviewerAgentIds.includes(assigneeAgentId)) return [];
+
+  return parsePullRequestRefs(candidate.title, candidate.description).map(buildPrReviewTaskKey);
+}
+
+/**
+ * Serializes an eligible issue create with webhook dispatch for every PR it
+ * references. Call this before taking any other issue-create advisory lock;
+ * PostgreSQL holds these transaction-scoped locks through the later guard read
+ * and issue insert.
+ */
+export async function lockPrReviewIssueScopes(
+  db: Pick<DbTransaction, "execute">,
+  candidate: DuplicatePrReviewIssueCandidate,
+  options: DuplicatePrReviewIssueOptions = {},
+): Promise<void> {
+  const taskKeys = [...new Set(guardTaskKeys(candidate, options))].sort();
+  for (const taskKey of taskKeys) {
+    await db.execute(sql`select pg_advisory_xact_lock(hashtextextended(${taskKey}, 0))`);
+  }
+}
+
 /**
  * Throws 409 when `candidate` duplicates a live PR review in the configured
  * reviewer pool. Returns silently in every other case, including on lookup
@@ -212,16 +234,11 @@ export async function assertNotDuplicatePrReviewIssue(
   options: DuplicatePrReviewIssueOptions = {},
 ): Promise<void> {
   const assigneeAgentId = candidate.assigneeAgentId?.trim();
-  if (!assigneeAgentId) return;
-  if (guardDisabled()) return;
-
-  const reviewerAgentIds = configuredPrReviewerAgentIds(options.reviewerAgentIds);
-  if (!reviewerAgentIds.includes(assigneeAgentId)) return;
+  const taskKeys = guardTaskKeys(candidate, options);
+  if (!assigneeAgentId || taskKeys.length === 0) return;
 
   const refs = parsePullRequestRefs(candidate.title, candidate.description);
-  if (refs.length === 0) return;
-
-  const taskKeys = refs.map(buildPrReviewTaskKey);
+  const reviewerAgentIds = configuredPrReviewerAgentIds(options.reviewerAgentIds);
   let liveRun: { id: string; status: string; contextTaskKey: string | null; createdAt: Date } | undefined;
   try {
     // The caller hands us the in-flight issue-creation transaction, so a failed
