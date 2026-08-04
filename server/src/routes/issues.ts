@@ -181,6 +181,7 @@ import {
   commentAuthorCanGrantIssueMention,
   getActiveCompanyMembership,
 } from "../services/authorization.js";
+import { findWakeIdempotencyReceipt } from "../services/wake-idempotency.js";
 import { environmentService } from "../services/environments.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
 import { redactEventPayload, redactSensitiveText } from "../redaction.js";
@@ -4074,33 +4075,42 @@ export function issueRoutes(
         if (!actor) throw new Error("Comment activity effect is missing actor context");
         const referenceEffect = await getEffectResult(db, comment.id, "references_sync");
         const diff = referenceEffect?.result as any;
-        await logActivity(db, {
-          companyId: issue.companyId,
-          actorType: actor.actorType,
-          actorId: actor.actorId,
-          agentId: actor.agentId,
-          runId: actor.runId,
-          agentApiKeyId: actor.agentApiKeyId,
-          action: "issue.comment_added",
-          entityType: "issue",
-          entityId: issue.id,
-          details: {
-            commentId: comment.id,
-            bodySnippet: comment.body.slice(0, 120),
-            identifier: issue.identifier,
-            issueTitle: issue.title,
-            ...summarizeIssueReferenceActivityDetails({
-              addedReferencedIssues: (diff?.addedReferencedIssues ?? []).map(summarizeIssueRelationForActivity),
-              removedReferencedIssues: (diff?.removedReferencedIssues ?? []).map(summarizeIssueRelationForActivity),
-              currentReferencedIssues: (diff?.currentReferencedIssues ?? []).map(summarizeIssueRelationForActivity),
-            }),
-          },
-          pluginEventPayloadExtra: {
-            issueId: issue.id,
-            body: comment.body,
-            authorName: await resolveCommentAuthorName(actor as ReturnType<typeof getActorInfo>),
-          },
-        });
+        // The activity row and its plugin event must land together. The guard above
+        // treats the activity row as proof the event was emitted, so if the event
+        // were enqueued fire-and-forget and failed, the retry would skip this
+        // branch and the `issue.comment.created` event would be lost permanently.
+        // Committing both in one transaction makes the guard's premise true.
+        const publish = await db.transaction(async (tx) =>
+          logActivity(tx as unknown as typeof db, {
+            companyId: issue.companyId,
+            actorType: actor.actorType,
+            actorId: actor.actorId,
+            agentId: actor.agentId,
+            runId: actor.runId,
+            agentApiKeyId: actor.agentApiKeyId,
+            action: "issue.comment_added",
+            entityType: "issue",
+            entityId: issue.id,
+            details: {
+              commentId: comment.id,
+              bodySnippet: comment.body.slice(0, 120),
+              identifier: issue.identifier,
+              issueTitle: issue.title,
+              ...summarizeIssueReferenceActivityDetails({
+                addedReferencedIssues: (diff?.addedReferencedIssues ?? []).map(summarizeIssueRelationForActivity),
+                removedReferencedIssues: (diff?.removedReferencedIssues ?? []).map(summarizeIssueRelationForActivity),
+                currentReferencedIssues: (diff?.currentReferencedIssues ?? []).map(summarizeIssueRelationForActivity),
+              }),
+            },
+            pluginEventPayloadExtra: {
+              issueId: issue.id,
+              body: comment.body,
+              authorName: await resolveCommentAuthorName(actor as ReturnType<typeof getActorInfo>),
+            },
+          }, { deferPublish: true, enlistPluginOutbox: true }),
+        );
+        // Live fan-out only, after commit: durable delivery is already enqueued.
+        publish();
         return;
       }
       case "interaction_expiry": {
@@ -4129,7 +4139,27 @@ export function issueRoutes(
       case "wake": {
         const agentId = payload.agentId;
         if (typeof agentId !== "string" || !payload.wakeup) throw new Error("Wake effect payload is invalid");
-        await heartbeat.wakeup(agentId, payload.wakeup as IssueWakeupRequest);
+        const wakeup = payload.wakeup as IssueWakeupRequest;
+        // `heartbeat.wakeup` is the one sink here that is not naturally
+        // idempotent across "executed, then died before the ledger recorded it".
+        // Its own coalescing only merges a wake into a still-queued/running run,
+        // so once the first run finishes, a reclaim after lease expiry would
+        // create a SECOND run for one comment. The wake carries a deterministic
+        // idempotency key (`issue_comment:<commentId>:assignee|mention:<target>`),
+        // and an accepted wake request keeps that key on a row that outlives the
+        // run — so the key doubles as a durable receipt we can check first.
+        //
+        // Safe against the check-then-act race because effect claims serialize
+        // execution of this effect: only the claim holder reaches this line.
+        const idempotencyKey = wakeup.idempotencyKey;
+        if (typeof idempotencyKey === "string" && idempotencyKey.length > 0) {
+          const receipt = await findWakeIdempotencyReceipt(db, {
+            companyId: issue.companyId,
+            idempotencyKey,
+          });
+          if (receipt) return { wakeSkipped: "already_accepted", wakeupRequestId: receipt.id };
+        }
+        await heartbeat.wakeup(agentId, wakeup);
         return;
       }
       case "watchdog_evaluation":

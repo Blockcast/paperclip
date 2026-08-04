@@ -1041,7 +1041,7 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
   let stopGitHubStatusDeliveryOutbox: (() => void) | null = null;
   let stopPluginStatusCollector: (() => void) | null = null;
   let stopGithubReviewGateDeliveryWorker: (() => Promise<void>) | null = null;
-  let stopIssueCommentEffectReconciler: (() => void) | null = null;
+  let stopIssueCommentEffectReconciler: (() => Promise<void>) | null = null;
   if (appConfig.paperclipNodeRole === "api") {
     logger.info(
       { role: appConfig.paperclipNodeRole },
@@ -1089,7 +1089,7 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
     stopPluginEventOutbox?.();
     stopGitHubStatusDeliveryOutbox?.();
     stopPluginStatusCollector?.();
-    stopIssueCommentEffectReconciler?.();
+    await stopIssueCommentEffectReconciler?.();
     disableFeedbackExportFlushes();
     devWatcher?.close();
     viteHtmlRenderer?.dispose();

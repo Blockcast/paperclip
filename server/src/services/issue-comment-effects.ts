@@ -144,16 +144,59 @@ export async function claimEffect(
   return rows[0] ?? null;
 }
 
-/** Record an effect as done, optionally publishing a result for later effects. */
+/**
+ * Extend our lease on an in-flight effect.
+ *
+ * A sink that legitimately runs longer than one lease would otherwise be
+ * reclaimed and executed a second time concurrently. Renewal keeps a *healthy*
+ * slow worker's claim alive; a dead worker stops renewing and is still reclaimed
+ * on schedule, so crash recovery is unaffected.
+ *
+ * The new expiry is computed from `now()` on the database rather than from this
+ * process's clock: the lease is compared against database time by every other
+ * reader, so deriving it from a skewed local clock is what would make a renewal
+ * silently short (or never-expiring).
+ *
+ * Returns false when the claim token no longer matches — we have already lost
+ * ownership and must stop touching the row.
+ */
+export async function renewEffectLease(
+  db: Db,
+  effectId: string,
+  claimToken: string,
+  leaseMs: number = DEFAULT_CLAIM_LEASE_MS,
+): Promise<boolean> {
+  const rows = await db
+    .update(issueCommentEffects)
+    .set({
+      claimExpiresAt: sql`now() + make_interval(secs => ${leaseMs / 1000})`,
+      updatedAt: sql`now()`,
+    })
+    .where(and(
+      eq(issueCommentEffects.id, effectId),
+      eq(issueCommentEffects.status, "processing"),
+      eq(issueCommentEffects.claimToken, claimToken),
+    ))
+    .returning({ id: issueCommentEffects.id });
+  return rows.length > 0;
+}
+
+/**
+ * Record an effect as done, optionally publishing a result for later effects.
+ *
+ * Returns false when the CAS matched nothing, i.e. our lease expired and another
+ * worker reclaimed the row. The caller MUST treat that as lost ownership and
+ * stop: continuing to later effects would run them alongside the new owner.
+ */
 export async function completeEffect(
   db: Db,
   effect: Pick<CommentEffectRow, "id" | "claimToken">,
   result?: Record<string, unknown> | null,
-): Promise<void> {
+): Promise<boolean> {
   const claimToken = effect.claimToken;
   if (!claimToken) throw new Error("Cannot complete an unclaimed comment effect");
   const now = new Date();
-  await db
+  const rows = await db
     .update(issueCommentEffects)
     .set({
       status: "processed",
@@ -168,24 +211,29 @@ export async function completeEffect(
       eq(issueCommentEffects.id, effect.id),
       eq(issueCommentEffects.status, "processing"),
       eq(issueCommentEffects.claimToken, claimToken),
-    ));
+    ))
+    .returning({ id: issueCommentEffects.id });
+  return rows.length > 0;
 }
 
 /**
  * Release a failed claim back to `queued` so it is retried, or park it `failed`
  * once it has burned through MAX_EFFECT_ATTEMPTS. Parking is what stops a
  * genuinely poisonous effect from pinning a comment permanently unprocessed.
+ *
+ * Returns false when we had already lost ownership, so the caller does not
+ * report a retry it did not actually schedule.
  */
 export async function releaseEffect(
   db: Db,
   effect: CommentEffectRow,
   err: unknown,
-): Promise<void> {
+): Promise<boolean> {
   const claimToken = effect.claimToken;
   if (!claimToken) throw new Error("Cannot release an unclaimed comment effect");
   const now = new Date();
   const giveUp = effect.attempts >= MAX_EFFECT_ATTEMPTS;
-  await db
+  const rows = await db
     .update(issueCommentEffects)
     .set({
       status: giveUp ? "failed" : "queued",
@@ -198,7 +246,9 @@ export async function releaseEffect(
       eq(issueCommentEffects.id, effect.id),
       eq(issueCommentEffects.status, "processing"),
       eq(issueCommentEffects.claimToken, claimToken),
-    ));
+    ))
+    .returning({ id: issueCommentEffects.id });
+  return rows.length > 0;
 }
 
 /** Read a sibling effect's published result (e.g. the reference diff). */
@@ -222,6 +272,14 @@ export async function getEffectResult(
 /**
  * Mark the comment processed iff every one of its effects has settled.
  *
+ * `failed` counts as settled. It is terminal — the row is only parked there after
+ * MAX_EFFECT_ATTEMPTS, and no query will hand it out again — so treating it as
+ * outstanding would pin the comment unprocessed forever while `idempotency`
+ * replays redid the entire pipeline on every retry, chasing an effect that can
+ * never succeed. That is strictly worse than the pre-ledger behaviour. A parked
+ * effect is visible via its `failed` status and `last_error`; settlement is about
+ * "is any work still owed", and the answer for a parked effect is no.
+ *
  * Returns true when the comment is (now or already) processed.
  */
 export async function markCommentProcessedIfSettled(db: Db, commentId: string): Promise<boolean> {
@@ -231,7 +289,7 @@ export async function markCommentProcessedIfSettled(db: Db, commentId: string): 
     .where(
       and(
         eq(issueCommentEffects.commentId, commentId),
-        ne(issueCommentEffects.status, "processed"),
+        inArray(issueCommentEffects.status, ["queued", "processing"]),
       ),
     )
     .limit(1);
@@ -310,21 +368,86 @@ export async function hasUnsettledEffects(db: Db, commentId: string): Promise<bo
   return rows.length > 0;
 }
 
+/**
+ * Comments whose effects have all settled but whose `idempotency_processed_at`
+ * was never stamped.
+ *
+ * This is a real reachable state, not defensive padding: whenever a worker loses
+ * its lease mid-pipeline, the worker that finishes the last effect may not be the
+ * one that runs settlement, and the resumable-work query above cannot see the
+ * comment any more because no row is left `queued` or lease-expired. Without this
+ * sweep such a comment stays unprocessed forever and every later replay redoes
+ * the whole pipeline.
+ */
+export async function listSettledUnprocessedComments(
+  db: Db,
+  limit: number,
+): Promise<string[]> {
+  const rows = await db
+    .selectDistinct({ commentId: issueCommentEffects.commentId })
+    .from(issueCommentEffects)
+    .innerJoin(issueComments, eq(issueComments.id, issueCommentEffects.commentId))
+    .where(
+      and(
+        isNull(issueComments.idempotencyProcessedAt),
+        isNull(issueComments.deletedAt),
+        sql`not exists (
+          select 1 from ${issueCommentEffects} inner_effects
+          where inner_effects.comment_id = ${issueCommentEffects.commentId}
+            and inner_effects.status in ('queued', 'processing')
+        )`,
+      ),
+    )
+    .limit(limit);
+  return rows.map((row: { commentId: string }) => row.commentId);
+}
+
+/**
+ * Run every effect a comment still owes, in order, under a renewed lease.
+ *
+ * Returns false when the pipeline was not carried to settlement by *this* call —
+ * either another worker holds a claim, or ours expired mid-flight. That is not an
+ * error: the winning worker (or the reconciler) finishes the chain.
+ */
 export async function processCommentEffects(
   db: Db,
   commentId: string,
   execute: (effect: CommentEffectRow) => Promise<Record<string, unknown> | null | void>,
+  leaseMs: number = DEFAULT_CLAIM_LEASE_MS,
 ): Promise<boolean> {
   const effects = await listUnfinishedEffects(db, commentId);
   for (const effect of effects) {
-    const claimed = await claimEffect(db, effect.id);
+    const claimed = await claimEffect(db, effect.id, leaseMs);
+    // Someone else owns this effect. Stopping here (rather than skipping ahead)
+    // is what preserves execution order: later effects may read this one's result.
     if (!claimed) return false;
+    const claimToken = claimed.claimToken;
+    if (!claimToken) return false;
+
+    // Renew well inside the lease so one slow renewal round-trip cannot let it
+    // lapse. `lostOwnership` latches: once reclaimed we must not complete.
+    let lostOwnership = false;
+    const renewalTimer = setInterval(() => {
+      void renewEffectLease(db, claimed.id, claimToken, leaseMs)
+        .then((stillOwned) => {
+          if (!stillOwned) lostOwnership = true;
+        })
+        .catch((err) =>
+          logger.warn({ err, effectId: claimed.id }, "issue-comment-effects: lease renewal failed"));
+    }, Math.max(1_000, Math.floor(leaseMs / 3)));
+    renewalTimer.unref?.();
+
     try {
       const result = await execute(claimed);
-      await completeEffect(db, claimed, result ?? null);
+      if (lostOwnership) return false;
+      // The CAS is the authority, not `lostOwnership`: a reclaim can land between
+      // the last renewal and here, and only the write can tell us.
+      if (!await completeEffect(db, claimed, result ?? null)) return false;
     } catch (err) {
       await releaseEffect(db, claimed, err);
       throw err;
+    } finally {
+      clearInterval(renewalTimer);
     }
   }
   return markCommentProcessedIfSettled(db, commentId);
@@ -334,7 +457,8 @@ export function startIssueCommentEffectReconciler(
   db: Db,
   process: (commentId: string) => Promise<unknown>,
   intervalMs: number = 1_000,
-): () => void {
+): () => Promise<void> {
+  let pass: Promise<void> = Promise.resolve();
   let polling = false;
   let stopped = false;
   void resetLeaselessProcessing(db).catch((err) =>
@@ -342,21 +466,33 @@ export function startIssueCommentEffectReconciler(
   const timer = setInterval(() => {
     if (polling || stopped) return;
     polling = true;
-    void listCommentsWithResumableEffects(db, 50)
-      .then(async (commentIds) => {
-        for (const commentId of commentIds) {
-          if (stopped) break;
-          await process(commentId).catch((err) =>
-            logger.warn({ err, commentId }, "issue-comment-effects: reconciliation failed"));
-        }
-      })
+    pass = (async () => {
+      const resumable = await listCommentsWithResumableEffects(db, 50);
+      for (const commentId of resumable) {
+        if (stopped) break;
+        await process(commentId).catch((err) =>
+          logger.warn({ err, commentId }, "issue-comment-effects: reconciliation failed"));
+      }
+      // Comments whose effects all settled but that nobody stamped processed.
+      // Settlement only, no sink re-execution.
+      const stranded = await listSettledUnprocessedComments(db, 50);
+      for (const commentId of stranded) {
+        if (stopped) break;
+        await markCommentProcessedIfSettled(db, commentId).catch((err) =>
+          logger.warn({ err, commentId }, "issue-comment-effects: settlement sweep failed"));
+      }
+    })()
+      .catch((err) => logger.warn({ err }, "issue-comment-effects: reconciliation pass failed"))
       .finally(() => {
         polling = false;
       });
   }, intervalMs);
   timer.unref?.();
-  return () => {
+  // Awaitable so shutdown drains an in-flight pass instead of abandoning claims
+  // to lease expiry, which would replay work the pass had already done.
+  return async () => {
     stopped = true;
     clearInterval(timer);
+    await pass.catch(() => {});
   };
 }
