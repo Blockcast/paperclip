@@ -62,27 +62,42 @@ function eventTypeForActivityAction(action: string): PluginEventType | null {
  * in-process: the worker-tier poller (plugin-event-outbox.ts) is the sole
  * emitter, so events raised on any tier (notably the API tier, where plugins
  * are not loaded) reliably reach subscribed plugins. One writer + one emitter
- * ⇒ no double-delivery. Fire-and-forget to keep the signature synchronous.
+ * ⇒ no double-delivery.
+ *
+ * Pass `db` to write the outbox row on a specific handle. When that handle is a
+ * transaction the enqueue becomes atomic with it, so a rollback takes the
+ * pending event with it instead of leaving the worker to emit an event for a
+ * row that never committed. Omit it (or pass null) to use the boot-time global
+ * handle — correct for callers outside a transaction, and required for callers
+ * publishing *after* commit, where the transaction handle is already released.
+ *
+ * When a caller supplies an explicit handle, enqueue failures reject so an
+ * enclosing transaction fails as one atomic activity/outbox unit. Global-handle
+ * publication remains best-effort and only logs failures.
  */
-export function publishPluginDomainEvent(event: PluginEvent): void {
-  if (!_outboxDb) {
+export async function publishPluginDomainEvent(event: PluginEvent, db?: Db | null): Promise<void> {
+  const outboxDb = db ?? _outboxDb;
+  const enlisted = db != null;
+  if (!outboxDb) {
     logger.warn(
       { eventType: event.eventType, eventId: event.eventId },
       "plugin event outbox db not set; dropping event",
     );
     return;
   }
-  void _outboxDb
-    .insert(pluginEventOutbox)
-    .values({
-      eventId: event.eventId,
-      companyId: event.companyId,
-      eventType: event.eventType,
-      payload: event as unknown as Record<string, unknown>,
-    })
-    .catch((err) =>
-      logger.warn({ err, eventType: event.eventType }, "failed to enqueue plugin event to outbox"),
-    );
+  const insert = outboxDb.insert(pluginEventOutbox).values({
+    eventId: event.eventId,
+    companyId: event.companyId,
+    eventType: event.eventType,
+    payload: event as unknown as Record<string, unknown>,
+  });
+  if (enlisted) {
+    await insert;
+    return;
+  }
+  await insert.catch((err) =>
+    logger.warn({ err, eventType: event.eventType }, "failed to enqueue plugin event to outbox"),
+  );
 }
 
 export interface LogActivityInput {
@@ -169,10 +184,13 @@ export async function resolveResponsibleUserIdForActivity(db: Db, input: LogActi
 
 /**
  * Emits the side effects of a logged activity: the in-process live event and
- * the cross-tier plugin outbox enqueue. Both escape any enclosing database
- * transaction (the live emitter is in-memory; the outbox writes on its own
- * `_outboxDb` handle), so a caller that logs inside a transaction must defer
- * this until after commit — see `logActivity`'s `deferPublish` option.
+ * the cross-tier plugin outbox enqueue.
+ *
+ * The live emitter is in-memory and so always escapes an enclosing database
+ * transaction; a caller that logs inside one must defer publication until after
+ * commit to keep it honest — see `logActivity`'s `deferPublish` option. The
+ * outbox enqueue is written on the handle passed to `logActivity`, so it is
+ * already atomic with an enclosing transaction when published inline.
  */
 export type ActivityPublish = () => void;
 
@@ -188,6 +206,11 @@ const NOOP_ACTIVITY_PUBLISH: ActivityPublish = () => {};
  * visibility, and turns a later commit failure into a phantom event for an
  * activity that never happened. The returned function is a no-op unless
  * `deferPublish` was set, so existing callers can keep ignoring the result.
+ *
+ * A caller that logs inside a transaction and does NOT defer still gets a
+ * correct plugin outbox row: the enqueue runs on `db`, so it commits and rolls
+ * back with the activity row it describes. Only the in-memory live event
+ * escapes in that case, which `deferPublish` exists to close.
  */
 export async function logActivity(
   db: Db,
@@ -215,7 +238,11 @@ export async function logActivity(
     details: redactedDetails,
   });
 
-  const publish: ActivityPublish = () => {
+  // `outboxDb` selects the handle the plugin outbox row is written on: the
+  // caller's `db` when publishing inline (so the enqueue is atomic with any
+  // enclosing transaction), or null when publishing after commit, where that
+  // transaction handle is already released and the global must be used.
+  const emit = async (outboxDb: Db | null): Promise<void> => {
     publishLiveEvent({
       companyId: input.companyId,
       type: "activity.logged",
@@ -265,11 +292,16 @@ export async function logActivity(
           responsibleUserId,
         },
       };
-      publishPluginDomainEvent(event);
+      await publishPluginDomainEvent(event, outboxDb);
     }
   };
 
-  if (options?.deferPublish) return publish;
-  publish();
+  if (options?.deferPublish) {
+    // Runs after the caller commits, so `db` is spent: enqueue on the global.
+    return () => {
+      void emit(null);
+    };
+  }
+  await emit(db);
   return NOOP_ACTIVITY_PUBLISH;
 }
