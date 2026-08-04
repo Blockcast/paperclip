@@ -106,19 +106,18 @@ export function isPrReviewTaskKey(taskKey: string): boolean {
 /**
  * The single compatibility predicate for matching a live `context_task_key`.
  *
- * GitHub owner/repo identity is case-insensitive, so the task-key producers now
- * lowercase it. Runs enqueued before that change carry mixed-case keys (every
- * `Blockcast/*` repo produced one), and they stay live for as long as their
- * review takes to drain. Byte-exact equality would therefore let a newly
- * normalized wake queue *beside* the legacy run it should have coalesced into —
- * and would let the cancel-on-close sweep miss it — for the whole rollout
- * window.
+ * GitHub owner/repo identity is case-insensitive. The transition deploys this
+ * dual-read predicate before changing producers: old pods only understand the
+ * mixed-case GitHub spelling, while compatibility-aware pods understand both.
+ * Switching writes in the same deployment would be asymmetric and let an old
+ * pod miss a normalized row after the advisory lock is released.
  *
  * Every equality check against a live task key must go through here so the
  * transition is uniform: affinity lookup, coalescing, cancellation, and this
  * module's own duplicate lookup. Non-PR keys keep plain `IN (…)` equality, so
  * unrelated task scopes see no behavioural or planner change. Once no
- * mixed-case `pr_review:%` rows remain, the `lower()` leg can be dropped.
+ * old readers remain, producers can switch to normalized keys in a later
+ * release; after mixed-case rows drain, the `lower()` leg can be dropped.
  */
 export function matchesAnyTaskKey(column: Column, taskKeys: readonly string[]): SQL {
   const exact = [...new Set(taskKeys)];
@@ -152,10 +151,10 @@ export function taskKeysMatch(left: string | null | undefined, right: string | n
 }
 
 /**
- * Mirror of `buildPrReviewerTaskKey` (server/src/routes/github-webhook.ts).
- * The two MUST produce byte-identical keys or this guard silently stops
- * matching live review scopes — it is covered by an equivalence test in
- * server/src/__tests__/issue-create-pr-review-duplicate-routes.test.ts.
+ * Canonical counterpart of the phase-one legacy producer in
+ * `buildPrReviewerTaskKey` (server/src/routes/github-webhook.ts). They resolve
+ * to the same scope through `matchesAnyTaskKey`; byte identity is deliberately
+ * deferred until old readers have drained.
  */
 export function buildPrReviewTaskKey(ref: PullRequestRef): string {
   return `pr_review:${normalizePrReviewRepoFullName(ref.repoFullName)}:${ref.prNumber}`;

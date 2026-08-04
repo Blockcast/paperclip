@@ -203,13 +203,13 @@ describe("github-webhook pure helpers", () => {
     // taskKey controls reviewer affinity and queued-run coalescing. The
     // idempotency key is delivery-scoped so a coalesced push cannot poison
     // every future synchronize event for the PR.
-    expect(__test_buildPrReviewerTaskKey(ctx1)).toBe("pr_review:blockcast/paperclip:318");
+    expect(__test_buildPrReviewerTaskKey(ctx1)).toBe("pr_review:Blockcast/paperclip:318");
     expect(__test_buildPrReviewerTaskKey(ctx2)).toBe(__test_buildPrReviewerTaskKey(ctx1));
     expect(__test_buildPrReviewerWakeIdempotencyKey(ctx1, "delivery-push-2")).toBe(
-      "pr_review:blockcast/paperclip:318:github_pr_synchronized:delivery:delivery-push-2",
+      "pr_review:Blockcast/paperclip:318:github_pr_synchronized:delivery:delivery-push-2",
     );
     expect(__test_buildPrReviewerWakeIdempotencyKey(ctx2, "delivery-push-3")).toBe(
-      "pr_review:blockcast/paperclip:318:github_pr_synchronized:delivery:delivery-push-3",
+      "pr_review:Blockcast/paperclip:318:github_pr_synchronized:delivery:delivery-push-3",
     );
   });
 
@@ -381,7 +381,7 @@ describe("github-webhook pure helpers", () => {
     // blocked every later toggle on the PR forever. Delivery scoping keeps each
     // deliberate draft->ready transition its own request.
     expect(__test_buildPrReviewerWakeIdempotencyKey(firstToggle, "delivery-ready-1")).toBe(
-      "pr_review:blockcast/paperclip:822:github_pr_ready_for_review:delivery:delivery-ready-1",
+      "pr_review:Blockcast/paperclip:822:github_pr_ready_for_review:delivery:delivery-ready-1",
     );
     expect(__test_buildPrReviewerWakeIdempotencyKey(secondToggle, "delivery-ready-2")).not.toBe(
       __test_buildPrReviewerWakeIdempotencyKey(firstToggle, "delivery-ready-1"),
@@ -442,7 +442,7 @@ describe("github-webhook pure helpers", () => {
     }
     // @ts-expect-error – test fixture omits the prNumber field required by the narrow union
     expect(__test_buildPrReviewerWakeIdempotencyKey(ctx, "delivery-reopened")).toBe(
-      "pr_review:blockcast/magma:980:github_pr_reopened",
+      "pr_review:Blockcast/magma:980:github_pr_reopened",
     );
   });
 
@@ -489,10 +489,10 @@ describe("github-webhook pure helpers", () => {
       throw new Error("expected @ally PR comment to fire a reviewer wake");
     }
     expect(__test_buildPrReviewerTaskKey(ctx)).toBe(
-      "pr_review:blockcast/network-operator-portal:47",
+      "pr_review:Blockcast/Network-Operator-Portal:47",
     );
     expect(__test_buildPrReviewerWakeIdempotencyKey(ctx, "delivery-1")).toBe(
-      "pr_review:blockcast/network-operator-portal:47:github_pr_review_requested:comment:123456",
+      "pr_review:Blockcast/Network-Operator-Portal:47:github_pr_review_requested:comment:123456",
     );
   });
 
@@ -591,7 +591,7 @@ describe("github-webhook pure helpers", () => {
     // Comment-scoped idempotency: each distinct request comment gets its own
     // wake, so a later re-review request at a newer head is not swallowed.
     expect(__test_buildPrReviewerWakeIdempotencyKey(agentRequest, "delivery-agent-req")).toBe(
-      "pr_review:blockcast/paperclip:814:github_pr_review_requested:comment:4900000001",
+      "pr_review:Blockcast/paperclip:814:github_pr_review_requested:comment:4900000001",
     );
 
     // Marker may carry provenance attributes. It must still start at byte 0.
@@ -1474,7 +1474,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
     const reviewerRun = runs.find((run) => run.id !== activeRunId);
     expect(reviewerRun?.status).toBe("queued");
     expect(reviewerRun?.contextSnapshot).toMatchObject({
-      taskKey: "pr_review:blockcast/magma:976",
+      taskKey: "pr_review:Blockcast/magma:976",
       wakeReason: "github_pr_opened",
       wakeSource: "automation",
       wakeTriggerDetail: "system",
@@ -1500,7 +1500,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
       status: "queued",
       reason: "github_pr_opened",
       payload: expect.objectContaining({
-        taskKey: "pr_review:blockcast/magma:976",
+        taskKey: "pr_review:Blockcast/magma:976",
         source: "github",
         event: "pull_request",
         deliveryId: "delivery-blo-7457",
@@ -1511,7 +1511,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
     }));
   });
 
-  it("assigns PR review wakes to the least-loaded active reviewer", async () => {
+  it("counts scheduled retries when assigning to the least-loaded active reviewer", async () => {
     const { companyId, agentId: busyReviewerId } = await seedCompanyAndAgent({
       agentName: "Ally",
     });
@@ -1532,7 +1532,9 @@ describeEmbeddedPostgres("github-webhook route", () => {
       agentId: busyReviewerId,
       invocationSource: "automation",
       triggerDetail: "system",
-      status: "queued",
+      status: "scheduled_retry",
+      scheduledRetryAt: new Date(Date.now() + 5 * 60 * 1000),
+      scheduledRetryReason: "ccrotate_capacity",
       contextSnapshot: { taskKey: "pr_review:blockcast/magma:975" },
     });
 
@@ -1564,7 +1566,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
       .where(eq(heartbeatRuns.agentId, idleReviewerId));
     expect(assigned).toHaveLength(1);
     expect(assigned[0]?.contextSnapshot).toMatchObject({
-      taskKey: "pr_review:blockcast/magma:976",
+      taskKey: "pr_review:Blockcast/magma:976",
       githubPrNumber: 976,
     });
   });
@@ -1672,7 +1674,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(activeRuns).toContainEqual(
       expect.objectContaining({
         contextSnapshot: expect.objectContaining({
-          taskKey: "pr_review:blockcast/magma:976",
+          taskKey: "pr_review:Blockcast/magma:976",
         }),
       }),
     );
@@ -1925,7 +1927,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect([firstReviewerId, secondReviewerId]).toContain(owningReviewerId);
     expect(runs[0]).toMatchObject({
       contextSnapshot: expect.objectContaining({
-        taskKey: "pr_review:blockcast/magma:976",
+        taskKey: "pr_review:Blockcast/magma:976",
         githubPrNumber: 976,
         githubHeadSha: "second-head",
       }),
@@ -1944,8 +1946,93 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(wakes).toContainEqual(expect.objectContaining({
       status: "coalesced",
       idempotencyKey:
-        "pr_review:blockcast/magma:976:github_pr_synchronized:delivery:delivery-review-pool-affinity-synchronized",
+        "pr_review:Blockcast/magma:976:github_pr_synchronized:delivery:delivery-review-pool-affinity-synchronized",
     }));
+  });
+
+  it("keeps follow-up wakes with the reviewer whose PR run is scheduled for retry", async () => {
+    const { companyId, agentId: firstReviewerId } = await seedCompanyAndAgent({
+      agentName: "Ally",
+    });
+    const secondReviewerId = randomUUID();
+    await db.insert(agents).values({
+      id: secondReviewerId,
+      companyId,
+      name: "Ally 2",
+      role: "engineer",
+      status: "idle",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const taskKey = "pr_review:Blockcast/magma:977";
+    await db.insert(heartbeatRuns).values([
+      {
+        id: randomUUID(),
+        companyId,
+        agentId: firstReviewerId,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status: "scheduled_retry",
+        scheduledRetryAt: new Date(Date.now() + 5 * 60 * 1000),
+        scheduledRetryReason: "ccrotate_capacity",
+        contextSnapshot: {
+          taskKey,
+          reviewKind: "pr_review",
+          githubPrNumber: 977,
+          githubRepoFullName: "Blockcast/magma",
+        },
+      },
+      {
+        id: randomUUID(),
+        companyId,
+        agentId: firstReviewerId,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status: "queued",
+        contextSnapshot: { taskKey: "pr_review:Blockcast/other:1" },
+      },
+    ]);
+
+    const app = buildApp({ prReviewerAgentIds: [firstReviewerId, secondReviewerId] });
+    const delivery = signedRequest({
+      action: "synchronize",
+      pull_request: {
+        number: 977,
+        title: "Keep scheduled retry affinity",
+        body: null,
+        html_url: "https://github.com/Blockcast/magma/pull/977",
+        head: { ref: "review-pool-retry-affinity", sha: "second-head" },
+      },
+      repository: { full_name: "Blockcast/magma" },
+    });
+    const response = await request(app)
+      .post("/api/webhooks/github")
+      .set("x-github-event", "pull_request")
+      .set("x-hub-signature-256", delivery.signature)
+      .set("x-github-delivery", "delivery-review-pool-retry-affinity")
+      .set("content-type", "application/json")
+      .send(delivery.body);
+
+    expect(response.status).toBe(200);
+    expect(response.body.reviewerWakeFired).toBe(true);
+    const prRuns = await db
+      .select({ agentId: heartbeatRuns.agentId, status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.contextTaskKey, taskKey));
+    expect(prRuns).toEqual([{ agentId: firstReviewerId, status: "scheduled_retry" }]);
+    const [wake] = await db
+      .select({ agentId: agentWakeupRequests.agentId, status: agentWakeupRequests.status })
+      .from(agentWakeupRequests)
+      .where(
+        eq(
+          agentWakeupRequests.idempotencyKey,
+          "pr_review:Blockcast/magma:977:github_pr_synchronized:delivery:delivery-review-pool-retry-affinity",
+        ),
+      );
+    expect(wake).toEqual({ agentId: firstReviewerId, status: "coalesced" });
   });
 
   it("serializes concurrent first events for the same PR before assigning a reviewer", async () => {
@@ -2085,7 +2172,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(firstRes.status).toBe(200);
 
     const idempotencyKey =
-      "pr_review:blockcast/magma:991:github_pr_ready_for_review:delivery:delivery-ready-replay";
+      "pr_review:Blockcast/magma:991:github_pr_ready_for_review:delivery:delivery-ready-replay";
 
     const reviewerWakes = async () =>
       db
@@ -2189,9 +2276,9 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(reviewerWakes).toContainEqual(expect.objectContaining({
       status: "queued",
       reason: "github_pr_synchronized",
-      idempotencyKey: "pr_review:blockcast/magma:981:github_pr_synchronized:delivery:delivery-sync-1",
+      idempotencyKey: "pr_review:Blockcast/magma:981:github_pr_synchronized:delivery:delivery-sync-1",
       payload: expect.objectContaining({
-        taskKey: "pr_review:blockcast/magma:981",
+        taskKey: "pr_review:Blockcast/magma:981",
         source: "github",
         event: "pull_request",
         deliveryId: "delivery-sync-1",
@@ -2205,7 +2292,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(reviewerWakes).toContainEqual(expect.objectContaining({
       status: "coalesced",
       reason: "github_pr_synchronized",
-      idempotencyKey: "pr_review:blockcast/magma:981:github_pr_synchronized:delivery:delivery-sync-2",
+      idempotencyKey: "pr_review:Blockcast/magma:981:github_pr_synchronized:delivery:delivery-sync-2",
     }));
 
     const reviewerRuns = await db
@@ -2214,7 +2301,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
       .where(eq(heartbeatRuns.agentId, reviewerAgentId));
     expect(reviewerRuns).toHaveLength(1);
     expect(reviewerRuns[0]?.contextSnapshot).toMatchObject({
-      taskKey: "pr_review:blockcast/magma:981",
+      taskKey: "pr_review:Blockcast/magma:981",
       githubHeadSha: "push2sha",
       githubDeliveryId: "delivery-sync-2",
     });
@@ -2440,7 +2527,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(authorWakes).toEqual([]);
   });
 
-  it("dedups a redelivery against a pre-normalization mixed-case idempotency key (BLO-20526 rollout regression)", async () => {
+  it("dedups a legacy-spelled redelivery against a normalized idempotency key (BLO-20526 rollout regression)", async () => {
     const reviewerAgentId = randomUUID();
     const { companyId } = await seedCompanyAndAgent();
     await db.insert(agents).values({
@@ -2458,22 +2545,22 @@ describeEmbeddedPostgres("github-webhook route", () => {
     const app = buildApp({ prReviewerAgentId: reviewerAgentId });
     const deliveryId = "delivery-redelivered-across-rollout";
 
-    // What a pod running the PRE-normalization build wrote for this delivery:
-    // the repo segment carries GitHub's mixed case. `queued` is an idempotent
-    // status, so the replay check must recognise this row and skip.
-    const legacyIdempotencyKey = `pr_review:Blockcast/paperclip:631:github_pr_synchronized:delivery:${deliveryId}`;
+    // A normalized row can already exist from a canary or interrupted rollout.
+    // Phase-one producers retain the legacy spelling for old-reader safety, so
+    // the compatibility read must also work in this direction.
+    const normalizedIdempotencyKey = `pr_review:blockcast/paperclip:631:github_pr_synchronized:delivery:${deliveryId}`;
     await db.insert(agentWakeupRequests).values({
       companyId,
       agentId: reviewerAgentId,
       source: "github",
       reason: "github_pr_synchronized",
-      idempotencyKey: legacyIdempotencyKey,
+      idempotencyKey: normalizedIdempotencyKey,
       status: "queued",
-      payload: { taskKey: "pr_review:Blockcast/paperclip:631" },
+      payload: { taskKey: "pr_review:blockcast/paperclip:631" },
     });
 
     // GitHub reuses the delivery id when it retries a delivery, so this is the
-    // same request arriving again — now handled by a post-normalization pod.
+    // same request arriving again through the phase-one legacy producer.
     const redelivery = signedRequest({
       action: "synchronize",
       pull_request: {
@@ -2495,9 +2582,8 @@ describeEmbeddedPostgres("github-webhook route", () => {
 
     expect(res.status).toBe(200);
 
-    // Byte-exact equality on the idempotency key makes the legacy row invisible,
-    // so the redelivery queues a SECOND review of the same head. Exactly one
-    // reviewer wake must exist, and it must still be the pre-rollout row.
+    // Byte-exact equality makes the normalized row invisible to the legacy
+    // spelling and queues a SECOND review. Exactly one wake must remain.
     const reviewerWakes = await db
       .select({
         idempotencyKey: agentWakeupRequests.idempotencyKey,
@@ -2506,7 +2592,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
       .from(agentWakeupRequests)
       .where(eq(agentWakeupRequests.agentId, reviewerAgentId));
     expect(reviewerWakes).toEqual([
-      { idempotencyKey: legacyIdempotencyKey, status: "queued" },
+      { idempotencyKey: normalizedIdempotencyKey, status: "queued" },
     ]);
   });
 
@@ -2826,7 +2912,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(runs[0]).toMatchObject({
       status: "queued",
       contextSnapshot: expect.objectContaining({
-        taskKey: "pr_review:blockcast/magma:980",
+        taskKey: "pr_review:Blockcast/magma:980",
         wakeReason: "github_pr_reopened",
         wakeSource: "automation",
         wakeTriggerDetail: "system",
@@ -2853,7 +2939,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
       status: "queued",
       reason: "github_pr_reopened",
       payload: expect.objectContaining({
-        taskKey: "pr_review:blockcast/magma:980",
+        taskKey: "pr_review:Blockcast/magma:980",
         source: "github",
         event: "pull_request",
         deliveryId: "delivery-blo-7426",
@@ -2933,8 +3019,8 @@ describeEmbeddedPostgres("github-webhook route", () => {
       .from(agentWakeupRequests)
       .where(eq(agentWakeupRequests.agentId, agentId));
     expect(wakes.map((wake) => wake.idempotencyKey).sort()).toEqual([
-      "pr_review:blockcast/paperclip:1012:github_pr_review_submitted",
-      "pr_review:blockcast/paperclip:1013:github_pr_review_submitted",
+      "pr_review:Blockcast/paperclip:1012:github_pr_review_submitted",
+      "pr_review:Blockcast/paperclip:1013:github_pr_review_submitted",
     ]);
     expect(wakes.every((wake) => wake.reason === "github_pr_review_submitted")).toBe(true);
 
@@ -3005,7 +3091,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(runs[0]).toMatchObject({
       status: "queued",
       contextSnapshot: expect.objectContaining({
-        taskKey: "pr_review:blockcast/magma:1193",
+        taskKey: "pr_review:Blockcast/magma:1193",
         wakeReason: "github_pr_review_requested",
         githubCommentId: 4746466885,
       }),
@@ -3021,7 +3107,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(wakes).toHaveLength(1);
     expect(wakes[0]).toMatchObject({
       status: "queued",
-      idempotencyKey: "pr_review:blockcast/magma:1193:github_pr_review_requested:comment:4746466885",
+      idempotencyKey: "pr_review:Blockcast/magma:1193:github_pr_review_requested:comment:4746466885",
     });
   });
 
@@ -3326,7 +3412,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(reviewerWakes[0]).toMatchObject({
       reason: "github_pr_review_requested",
       idempotencyKey:
-        "pr_review:blockcast/paperclip:822:github_pr_review_requested:comment:4900000010",
+        "pr_review:Blockcast/paperclip:822:github_pr_review_requested:comment:4900000010",
     });
 
     // ...and exactly one author wake, carrying the author role.

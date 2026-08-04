@@ -69,6 +69,7 @@ type PrReviewerSelectionDb = Pick<Db | DbTransaction, "select">;
 // default pool satisfies the required minimum of two connections.
 const PR_REVIEWER_TASK_LOCK_TIMEOUT_MS = 2_000;
 const PR_REVIEWER_TASK_LOCK_RETRY_MS = 25;
+const ACTIVE_PR_REVIEWER_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 
 export interface GithubWebhookConfig {
   /**
@@ -1337,7 +1338,10 @@ function buildPrReviewerWakeIdempotencyKey(
   context: ResolvedEventContext & { prNumber: number },
   deliveryId: string | null,
 ) {
-  const repo = normalizePrReviewRepoFullName(context.repoFullName ?? "unknown");
+  // Phase one of the casing transition keeps writes readable by old pods.
+  // Compatibility reads and dual locks must deploy everywhere before a later
+  // release can safely normalize persisted keys.
+  const repo = context.repoFullName ?? "unknown";
   if (typeof context.prNumber !== "number") {
     logger.error(
       {
@@ -1388,7 +1392,9 @@ function buildPrReviewerWakeIdempotencyKey(
 // stay stable across heads for one PR. Head-awareness for review requests lives
 // in heartbeat's coalescing decision instead (BLO-18953).
 function buildPrReviewerTaskKey(context: ResolvedEventContext & { prNumber: number }) {
-  const repo = normalizePrReviewRepoFullName(context.repoFullName ?? "unknown");
+  // Keep the legacy spelling during the compatibility rollout. New pods can
+  // read either spelling; pre-normalization pods can only read this one.
+  const repo = context.repoFullName ?? "unknown";
   return `pr_review:${repo}:${context.prNumber}`;
 }
 
@@ -1396,15 +1402,13 @@ function buildPrReviewerTaskKey(context: ResolvedEventContext & { prNumber: numb
  * Advisory-lock namespaces to hold while dispatching one PR's reviewer wake.
  *
  * The lock id is `hashtextextended(taskKey, 0)`, so changing the *spelling* of
- * the task key changes the namespace. Pods running the pre-normalization build
- * derive it from the raw, mixed-case `repoFullName` (`pr_review:Blockcast/…`)
- * while this build derives it from the lowercased one. Locking only the
- * normalized key would therefore let an old pod and a new pod dispatch the same
- * PR concurrently for the whole rolling-deployment window — assigning two
- * reviewers to one PR, which is precisely the duplicate cost this change exists
- * to remove.
+ * the task key changes the namespace. Phase one keeps writing the raw,
+ * mixed-case `repoFullName` so old readers can still see new rows, but
+ * compatibility-aware pods lock both that namespace and the future normalized
+ * namespace. A later release can switch producers only after every pod can read
+ * and lock both spellings.
  *
- * So hold BOTH namespaces until no pre-normalization pod remains. Sorted, so
+ * Hold BOTH namespaces until no pre-normalization pod remains. Sorted, so
  * every caller acquires the pair in one order and two peers contending for the
  * same PR cannot livelock each other by grabbing opposite halves. Retire this
  * alongside the `lower()` legs in pr-review-duplicate-issue-guard.
@@ -1412,8 +1416,10 @@ function buildPrReviewerTaskKey(context: ResolvedEventContext & { prNumber: numb
 function buildPrReviewerTaskLockKeys(
   context: ResolvedEventContext & { prNumber: number },
 ): string[] {
-  const normalized = buildPrReviewerTaskKey(context);
-  const legacyCasing = `pr_review:${context.repoFullName ?? "unknown"}:${context.prNumber}`;
+  const legacyCasing = buildPrReviewerTaskKey(context);
+  const normalized =
+    `pr_review:${normalizePrReviewRepoFullName(context.repoFullName ?? "unknown")}` +
+    `:${context.prNumber}`;
   return [...new Set([normalized, legacyCasing])].sort();
 }
 
@@ -1512,7 +1518,7 @@ async function selectPrReviewerAgentId(
     .where(
       and(
         inArray(heartbeatRuns.agentId, activeAgentIds),
-        inArray(heartbeatRuns.status, ["queued", "running"]),
+        inArray(heartbeatRuns.status, [...ACTIVE_PR_REVIEWER_RUN_STATUSES]),
       ),
     )
     .groupBy(heartbeatRuns.agentId);
@@ -1548,7 +1554,7 @@ async function findActivePrReviewerForTask(
     .where(
       and(
         inArray(heartbeatRuns.agentId, [...configuredAgentIds]),
-        inArray(heartbeatRuns.status, ["queued", "running"]),
+        inArray(heartbeatRuns.status, [...ACTIVE_PR_REVIEWER_RUN_STATUSES]),
         inArray(agents.status, ["idle", "running"]),
         matchesTaskKey(heartbeatRuns.contextTaskKey, taskKey),
       ),
@@ -2097,14 +2103,12 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
               and(
                 inArray(agentWakeupRequests.agentId, reviewerAgentIds),
                 // Case-insensitive on the repo segment, for the same reason the
-                // task-key lookups are: rows written before the producer was
-                // normalized spell the repo in GitHub's mixed case, and this
-                // replay check is what stops a GitHub REDELIVERY of one event
-                // enqueueing a second review. Byte-exact equality would make
-                // every pre-rollout row invisible here, so a redelivery landing
-                // after deploy would queue a duplicate — worst exactly when the
-                // original run is already terminal and task-key coalescing has
-                // nothing live to catch it. Reviewer idempotency keys are
+                // task-key lookups are. Phase one retains legacy-spelled writes
+                // for old-reader safety, but normalized rows may already exist
+                // from a canary or interrupted rollout. Byte-exact equality
+                // would make those rows invisible and let a redelivery queue a
+                // duplicate — worst when the original run is terminal and task
+                // coalescing has nothing live to catch it. Reviewer keys are
                 // `pr_review:<repo>:<n>:<suffix>`, so they carry the shared
                 // predicate's `pr_review:` prefix; the suffix segments (wake
                 // reason, numeric comment id, GitHub delivery uuid) are already

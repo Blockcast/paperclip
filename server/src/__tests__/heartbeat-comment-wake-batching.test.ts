@@ -705,7 +705,7 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
     expect((runs[0]?.contextSnapshot as Record<string, unknown> | null)?.githubPrNumber).toBe(980);
     expect((runs[0]?.contextSnapshot as Record<string, unknown> | null)?.taskKey).toBeUndefined();
     expect((runs[1]?.contextSnapshot as Record<string, unknown> | null)?.githubPrNumber).toBe(86);
-    expect((runs[1]?.contextSnapshot as Record<string, unknown> | null)?.taskKey).toBe("pr_review:blockcast/nop:86");
+    expect((runs[1]?.contextSnapshot as Record<string, unknown> | null)?.taskKey).toBe("pr_review:Blockcast/nop:86");
   }, 120_000);
 
   it("promotes deferred comment wakes with their comments after the active run is cancelled", async () => {

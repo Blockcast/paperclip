@@ -1,14 +1,11 @@
 /**
  * BLO-20526 — rollout safety for the pr_review task-key casing transition.
  *
- * GitHub owner/repo identity is case-insensitive, so the task-key producers now
- * lowercase it. Every run enqueued before that change carries a mixed-case key
- * (`Blockcast/*` produced one on every repo we use) and stays live until its
- * review drains. During that window the two spellings must be treated as the
- * same scope everywhere, or a normalized wake queues *beside* the legacy run it
- * should have coalesced into — which is precisely the duplicate-run amplifier
- * this ticket exists to remove — and the cancel-on-close sweep leaves the
- * legacy run queued for a PR that has already closed.
+ * GitHub owner/repo identity is case-insensitive. Compatibility readers must
+ * understand both spellings before producers switch in a later release. During
+ * either phase the two spellings must be treated as the same scope everywhere,
+ * or one wake queues beside the run it should have coalesced into and the
+ * cancel-on-close sweep leaves work queued for a PR that already closed.
  */
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
@@ -29,7 +26,7 @@ import { heartbeatService } from "../services/heartbeat.ts";
 
 /** What the producer wrote before normalization landed. */
 const LEGACY_TASK_KEY = "pr_review:Blockcast/PiM-Multicast-Gateway:1911";
-/** What every producer writes now. */
+/** Candidate spelling for the later producer-normalization phase. */
 const NORMALIZED_TASK_KEY = "pr_review:blockcast/pim-multicast-gateway:1911";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();

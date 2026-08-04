@@ -88,7 +88,6 @@ import { canClaimPrReviewTask } from "./pr-review-dispatch-lock.js";
 import { normalizeResponsibleUserDenialCode } from "./responsible-user-denial-run-outcomes.js";
 import {
   matchesTaskKey,
-  normalizePrReviewRepoFullName,
   taskKeysMatch,
 } from "./pr-review-duplicate-issue-guard.js";
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
@@ -4981,9 +4980,10 @@ function derivePaperclipPrTaskKey(
   const prNumber = readPrNumberFromWakeContext(contextSnapshot, payload);
   if (prNumber === null) return null;
 
-  const repoFullName = normalizePrReviewRepoFullName(
-    readPrRepoFullNameFromWakeContext(contextSnapshot, payload) ?? "unknown",
-  );
+  // Casing compatibility is a two-phase rollout. Keep producing the legacy
+  // GitHub spelling until every reader understands both old and normalized
+  // keys; otherwise an old pod can miss a row written by a new pod.
+  const repoFullName = readPrRepoFullNameFromWakeContext(contextSnapshot, payload) ?? "unknown";
 
   return `pr_review:${repoFullName}:${prNumber}`;
 }

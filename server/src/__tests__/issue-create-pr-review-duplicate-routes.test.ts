@@ -29,6 +29,7 @@ import {
   DUPLICATE_PR_REVIEW_ISSUE_ERROR_CODE,
   buildPrReviewTaskKey,
   parsePullRequestRefs,
+  taskKeysMatch,
 } from "../services/pr-review-duplicate-issue-guard.js";
 
 const REPO = "Blockcast/pim-multicast-gateway";
@@ -39,16 +40,14 @@ const NORMALIZED_PR_URL = `https://github.com/${NORMALIZED_REPO}/pull/${PR_NUMBE
 const TASK_KEY = `pr_review:${NORMALIZED_REPO}:${PR_NUMBER}`;
 
 describe("pr review duplicate issue guard (pure helpers)", () => {
-  it("builds the same task key the GitHub webhook writes to context_task_key", () => {
-    // These two implementations live in different modules; if they ever drift
-    // the guard silently stops matching live review scopes and the amplifier
-    // comes back with no failing test. Pin the equivalence directly.
+  it("resolves the same scope as the legacy key the webhook writes during phase one", () => {
     const webhookKey = __test_buildPrReviewerTaskKey({
       repoFullName: REPO,
       prNumber: PR_NUMBER,
     } as never);
-    expect(buildPrReviewTaskKey({ repoFullName: REPO, prNumber: PR_NUMBER })).toBe(webhookKey);
-    expect(webhookKey).toBe(TASK_KEY);
+    expect(webhookKey).toBe(`pr_review:${REPO}:${PR_NUMBER}`);
+    expect(taskKeysMatch(buildPrReviewTaskKey({ repoFullName: REPO, prNumber: PR_NUMBER }), webhookKey))
+      .toBe(true);
   });
 
   it("locks both the normalized and legacy-casing namespaces during rollout", () => {
