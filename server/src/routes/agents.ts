@@ -32,6 +32,10 @@ import {
   LOW_TRUST_REVIEW_PRESET,
 } from "@paperclipai/shared";
 import {
+  EXTERNAL_LIFECYCLE_ADAPTER_TYPES,
+  EXTERNAL_LIFECYCLE_MAX_CONCURRENT_RUNS,
+} from "@paperclipai/shared/validators/agent";
+import {
   resolvePaperclipInstanceRootForAdapter,
   readPaperclipSkillSyncPreference,
   writePaperclipSkillSyncPreference,
@@ -118,6 +122,7 @@ import {
 
 const RUN_LOG_DEFAULT_LIMIT_BYTES = 256_000;
 const RUN_LOG_MAX_LIMIT_BYTES = 1024 * 1024;
+const EXTERNAL_LIFECYCLE_ADAPTER_TYPE_SET = new Set<string>(EXTERNAL_LIFECYCLE_ADAPTER_TYPES);
 
 // Sentinel substituted into adapter_config.env values by redactAgentSecrets()
 // on the GET response. A naive UI/operator round-trip (read agent, edit, save)
@@ -261,6 +266,18 @@ function readLiveRunsQueryInt(value: unknown, max: number, fallback = 0) {
   if (!Number.isFinite(parsed)) return fallback;
   if (parsed <= 0) return fallback;
   return Math.min(max, Math.trunc(parsed));
+}
+
+/**
+ * BLO-20396: normalize a value that drizzle types as a timestamp but does not
+ * actually decode. Raw `sql<...>` aggregates (min/max over a timestamp column)
+ * bypass PgTimestamp.mapFromDriverValue, so postgres-js hands back the wire
+ * string. Returns null for null/unparseable input rather than an Invalid Date.
+ */
+function toDateOrNull(value: Date | string | null | undefined): Date | null {
+  if (value === null || value === undefined) return null;
+  const parsed = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
 }
 
 function readRunIssueId(context: Record<string, unknown> | null) {
@@ -1269,7 +1286,38 @@ export function agentRoutes(
     };
   }
 
-  function normalizeNewAgentRuntimeConfig(runtimeConfig: unknown): Record<string, unknown> {
+  function assertExternalLifecycleConcurrencyPolicy(adapterType: string, runtimeConfig: unknown) {
+    if (!EXTERNAL_LIFECYCLE_ADAPTER_TYPE_SET.has(adapterType)) return;
+    const heartbeat = asRecord(asRecord(runtimeConfig)?.heartbeat);
+    const maxConcurrentRuns = parseNumberLike(heartbeat?.maxConcurrentRuns);
+    if (maxConcurrentRuns !== null && maxConcurrentRuns > EXTERNAL_LIFECYCLE_MAX_CONCURRENT_RUNS) {
+      throw unprocessable(
+        `heartbeat.maxConcurrentRuns must not exceed ${EXTERNAL_LIFECYCLE_MAX_CONCURRENT_RUNS} for external-lifecycle adapters`,
+      );
+    }
+  }
+
+  function normalizeExternalLifecycleRuntimeConfig(
+    adapterType: string,
+    runtimeConfig: unknown,
+  ): Record<string, unknown> {
+    const parsedRuntimeConfig = asRecord(runtimeConfig);
+    const normalizedRuntimeConfig = parsedRuntimeConfig ? { ...parsedRuntimeConfig } : {};
+    if (!EXTERNAL_LIFECYCLE_ADAPTER_TYPE_SET.has(adapterType)) {
+      return normalizedRuntimeConfig;
+    }
+
+    const parsedHeartbeat = asRecord(normalizedRuntimeConfig.heartbeat);
+    const heartbeat = parsedHeartbeat ? { ...parsedHeartbeat } : {};
+    if (parseNumberLike(heartbeat.maxConcurrentRuns) == null) {
+      heartbeat.maxConcurrentRuns = EXTERNAL_LIFECYCLE_MAX_CONCURRENT_RUNS;
+    }
+    normalizedRuntimeConfig.heartbeat = heartbeat;
+    assertExternalLifecycleConcurrencyPolicy(adapterType, normalizedRuntimeConfig);
+    return normalizedRuntimeConfig;
+  }
+
+  function normalizeNewAgentRuntimeConfig(runtimeConfig: unknown, adapterType: string): Record<string, unknown> {
     const parsedRuntimeConfig = asRecord(runtimeConfig);
     const normalizedRuntimeConfig = parsedRuntimeConfig ? { ...parsedRuntimeConfig } : {};
     const parsedHeartbeat = asRecord(normalizedRuntimeConfig.heartbeat);
@@ -1279,24 +1327,13 @@ export function agentRoutes(
       heartbeat.enabled = false;
     }
     if (parseNumberLike(heartbeat.maxConcurrentRuns) == null) {
-      heartbeat.maxConcurrentRuns = AGENT_DEFAULT_MAX_CONCURRENT_RUNS;
+      heartbeat.maxConcurrentRuns = EXTERNAL_LIFECYCLE_ADAPTER_TYPE_SET.has(adapterType)
+        ? EXTERNAL_LIFECYCLE_MAX_CONCURRENT_RUNS
+        : AGENT_DEFAULT_MAX_CONCURRENT_RUNS;
     }
 
     normalizedRuntimeConfig.heartbeat = heartbeat;
-    return normalizedRuntimeConfig;
-  }
-
-  function mergeRuntimeConfigPatchForAgentUpdate(
-    existingRuntimeConfig: unknown,
-    requestedRuntimeConfig: Record<string, unknown>,
-  ): Record<string, unknown> {
-    const mergedRuntimeConfig = { ...requestedRuntimeConfig };
-    const requestedHeartbeat = asRecord(requestedRuntimeConfig.heartbeat);
-    if (requestedHeartbeat) {
-      const existingHeartbeat = asRecord(asRecord(existingRuntimeConfig)?.heartbeat) ?? {};
-      mergedRuntimeConfig.heartbeat = { ...existingHeartbeat, ...requestedHeartbeat };
-    }
-    return mergedRuntimeConfig;
+    return normalizeExternalLifecycleRuntimeConfig(adapterType, normalizedRuntimeConfig);
   }
 
   function restoreRedactedRuntimeConfigValues(
@@ -2700,10 +2737,12 @@ export function agentRoutes(
       adapterType: hireInput.adapterType,
       adapterConfig: desiredSkillAssignment.adapterConfig,
     });
+    const requestedRuntimeConfig = normalizeNewAgentRuntimeConfig(hireInput.runtimeConfig, hireInput.adapterType);
+    assertExternalLifecycleConcurrencyPolicy(hireInput.adapterType, requestedRuntimeConfig);
     const normalizedRuntimeConfig = await normalizeRuntimeConfigAdapterConfigsForPersistence(
       companyId,
       hireInput.adapterType,
-      normalizeNewAgentRuntimeConfig(hireInput.runtimeConfig),
+      requestedRuntimeConfig,
       normalizedAdapterConfig,
     );
     const normalizedHireInput = {
@@ -2913,10 +2952,12 @@ export function agentRoutes(
       adapterType: createInput.adapterType,
       adapterConfig: desiredSkillAssignment.adapterConfig,
     });
+    const requestedRuntimeConfig = normalizeNewAgentRuntimeConfig(createInput.runtimeConfig, createInput.adapterType);
+    assertExternalLifecycleConcurrencyPolicy(createInput.adapterType, requestedRuntimeConfig);
     const normalizedRuntimeConfig = await normalizeRuntimeConfigAdapterConfigsForPersistence(
       companyId,
       createInput.adapterType,
-      normalizeNewAgentRuntimeConfig(createInput.runtimeConfig),
+      requestedRuntimeConfig,
       normalizedAdapterConfig,
     );
     await assertAgentEnvironmentSelection(companyId, createInput.adapterType, createInput.defaultEnvironmentId);
@@ -3313,7 +3354,7 @@ export function agentRoutes(
       }
       requestedRuntimeConfig = restoreRedactedRuntimeConfigValues(
         existing.runtimeConfig,
-        mergeRuntimeConfigPatchForAgentUpdate(existing.runtimeConfig, runtimeConfig),
+        runtimeConfig,
       );
       assertNoAgentRuntimeConfigAdapterConfigMutation(req, requestedRuntimeConfig);
     }
@@ -4043,7 +4084,7 @@ export function agentRoutes(
           agentName: agentsTable.name,
           activeCount: sql<number>`count(*)::int`,
           queuedCount: sql<number>`count(*) filter (where ${heartbeatRuns.status} in ('queued', 'scheduled_retry'))::int`,
-          oldestQueuedAt: sql<Date | null>`min(${heartbeatRuns.createdAt}) filter (where ${heartbeatRuns.status} in ('queued', 'scheduled_retry'))`,
+          oldestQueuedAt: sql<Date | string | null>`min(${heartbeatRuns.createdAt}) filter (where ${heartbeatRuns.status} in ('queued', 'scheduled_retry'))`,
         })
         .from(heartbeatRuns)
         .innerJoin(agentsTable, eq(heartbeatRuns.agentId, agentsTable.id))
@@ -4116,7 +4157,12 @@ export function agentRoutes(
         agentId: summary.agentId,
         agentName: summary.agentName,
         queuedCount: summary.queuedCount,
-        oldestQueuedAt: summary.oldestQueuedAt,
+        // BLO-20396: coerce at the boundary. `sql<Date | null>` only sets the
+        // compile-time generic — drizzle's postgres-js driver runs
+        // mapFromDriverValue for real column references, not for raw
+        // expressions, so this aggregate arrives as a timestamp *string* and
+        // calling .getTime() on it later 500s the whole endpoint.
+        oldestQueuedAt: toDateOrNull(summary.oldestQueuedAt),
         runs: [],
       });
     }
