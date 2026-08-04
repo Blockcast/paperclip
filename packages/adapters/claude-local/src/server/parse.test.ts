@@ -88,7 +88,7 @@ describe("isClaudeTransientUpstreamError", () => {
     );
   });
 
-  it("does not let app-level auth text override a Claude usage-limit result", () => {
+  it("does not let app-level auth text override a Claude provider-quota result", () => {
     const parsed = {
       type: "result",
       subtype: "success",
@@ -108,7 +108,8 @@ describe("isClaudeTransientUpstreamError", () => {
     });
 
     expect(detectClaudeLoginRequired({ parsed, stdout, stderr: "" }).requiresLogin).toBe(false);
-    expect(isClaudeTransientUpstreamError({ parsed, stdout })).toBe(true);
+    expect(isClaudeProviderQuotaError({ parsed, stdout })).toBe(true);
+    expect(isClaudeTransientUpstreamError({ parsed, stdout })).toBe(false);
   });
 
   it("classifies Anthropic API rate_limit_error and overloaded_error as transient", () => {
@@ -378,11 +379,10 @@ describe("detectClaudeLoginRequired", () => {
   });
 });
 
-describe("quota / transient classifier overlap", () => {
-  // Both classifiers match quota-style messages — callers must check
-  // isClaudeQuotaExhausted first so quota gets routed to the rotation hook
-  // instead of the transient retry schedule.
-  const overlappingQuotaMessages = [
+describe("quota / transient classifier precedence", () => {
+  // Provider quota must remain disjoint from transient upstream failures so
+  // callers rotate the exhausted account instead of consuming blind retries.
+  const providerQuotaMessages = [
     "You're out of extra usage · resets 4pm (America/Chicago)",
     "Claude usage limit reached. Resets at 2am (Europe/Warsaw).",
     "Usage limit reached.",
@@ -392,11 +392,12 @@ describe("quota / transient classifier overlap", () => {
     "Usage cap reached.",
   ];
 
-  for (const msg of overlappingQuotaMessages) {
-    it(`both classifiers match ${JSON.stringify(msg)} — quota must be checked first`, () => {
+  for (const msg of providerQuotaMessages) {
+    it(`classifies ${JSON.stringify(msg)} as provider quota, not transient`, () => {
       const parsed = { is_error: true, result: msg };
       expect(isClaudeQuotaExhausted(parsed)).toBe(true);
-      expect(isClaudeTransientUpstreamError({ parsed })).toBe(true);
+      expect(isClaudeProviderQuotaError({ parsed })).toBe(true);
+      expect(isClaudeTransientUpstreamError({ parsed })).toBe(false);
     });
   }
 
