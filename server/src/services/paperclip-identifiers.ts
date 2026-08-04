@@ -140,8 +140,34 @@ export function extractOwningLabeledIdentifiers(body: string | null | undefined)
 // branch are all empty -- on `issue_comment` events, where fields.branch is
 // never populated, that reduces to "title and closing keyword are both
 // empty", making this the issue_comment path's practical last resort.
+//
+// Unlike OWNING_REFERENCE_LABEL_PATTERN above, the colon here is MANDATORY,
+// not optional. The closing keywords (`Fixes`/`Closes`/`Resolves`/`Refs`) are
+// verbs that only ever start a labeled reference line, so "Closes BLO-1" is
+// unambiguous natural language. `Issue` is an ordinary noun that also starts
+// ordinary sentences -- "Issue filed a related bug, see BLO-1" and "Issue
+// description for BLO-2" are real English, not an ownership label -- so an
+// optional colon here would route a branchless wake off of prose that never
+// claimed ownership. Requiring the colon keeps this tier fail-closed on
+// prose while still matching every observed house-label shape, all of which
+// use a colon.
 const HOUSE_REFERENCE_LABEL_PATTERN =
-  /^[ \t]*(?:[-*+]|\d{1,3}[.)])?[ \t]*(?:paperclip[ \t]+qa[ \t]+task|paperclip[ \t]+task|paperclip[ \t]+issue|issue)[ \t]*:?[ \t]+(.+)$/gim;
+  /^[ \t]*(?:[-*+]|\d{1,3}[.)])?[ \t]*(?:paperclip[ \t]+qa[ \t]+task|paperclip[ \t]+task|paperclip[ \t]+issue|issue)[ \t]*:[ \t]+(.+)$/gim;
+
+// BLO-21312: a house-reference line can still carry a second, distinctly
+// labeled reference later on the SAME line -- `Issue: BLO-1; Related:
+// BLO-2` -- and a naive "extract every identifier in the captured remainder"
+// would resolve both, waking the assignee of BLO-2 even though it is
+// explicitly marked non-owning right there on the line. The captured
+// remainder is truncated at the first such secondary label so only the house
+// label's own direct reference value is ever treated as owning.
+const TRAILING_LABEL_REFERENCE_PATTERN =
+  /[;,|][ \t]*(?:fix(?:e[sd])?|clos(?:e[sd]?)|resolv(?:e[sd]?)|refs?|relate[ds]?|see[ \t]+also|paperclip[ \t]+qa[ \t]+task|paperclip[ \t]+task|paperclip[ \t]+issue|issue)[ \t]*:/i;
+
+function stripTrailingLabelReference(text: string): string {
+  const match = text.match(TRAILING_LABEL_REFERENCE_PATTERN);
+  return match && typeof match.index === "number" ? text.slice(0, match.index) : text;
+}
 
 /** Identifiers that appear on a labeled house-reference line in `body` (see above). */
 export function extractHouseReferenceLabeledIdentifiers(body: string | null | undefined): string[] {
@@ -151,7 +177,9 @@ export function extractHouseReferenceLabeledIdentifiers(body: string | null | un
   for (const match of body.matchAll(HOUSE_REFERENCE_LABEL_PATTERN)) {
     const rest = match[1];
     if (!rest) continue;
-    for (const identifier of extractPaperclipIdentifiers(rest)) found.add(identifier);
+    const directValue = stripTrailingLabelReference(rest);
+    if (!directValue) continue;
+    for (const identifier of extractPaperclipIdentifiers(directValue)) found.add(identifier);
   }
   return Array.from(found);
 }
