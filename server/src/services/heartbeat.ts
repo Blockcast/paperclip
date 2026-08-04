@@ -1167,10 +1167,10 @@ const STARVATION_FULL_ESCALATION_MS = 2 * 60 * 60 * 1000;
 // Only genuinely pathological waits — the class BLO-21116 measured at 5-16h —
 // cross it.
 const STARVATION_ABSOLUTE_ESCALATION_MS = 6 * 60 * 60 * 1000;
-// The rank an absolute-floor run escalates to. Named because two places need to
-// agree on it: dispatchRank assigns it, and the resume-cursor bookkeeping has to
-// recognise it to keep an unexamined absolute-floor row in front of the cursor
-// (see absoluteFloorRewind below). A bare `-1` in both spots would let one drift.
+// The rank an absolute-floor run escalates to. Named rather than a bare `-1` so
+// the one value that must outrank every routine rank — including the 0-1 the
+// critical lane produces — is stated once and greppable from the lane that
+// feeds it (see the absolute-starvation lane in startNextQueuedRunForAgent).
 const ABSOLUTE_STARVATION_DISPATCH_RANK = -1;
 // BLO-16253 follow-up: a recovery/wake_owner run (contextSnapshot.recoveryActionId
 // set — see recovery/service.ts enqueueWakeup calls) represents an ALREADY-DETECTED
@@ -18237,21 +18237,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         : null;
       let scannedBatches = 0;
       let scanExhausted = false;
-      /**
-       * Per-row "resume before this row" boundary for the main bounded scan.
-       *
-       * Same idiom the emergency lanes use via markEmergencyLaneRun: remember
-       * the cursor as it stood at the START of the batch that produced the row,
-       * so a later pass can re-read the page containing it. Keyed only for rows
-       * the main scan itself produced — a row admitted by the critical/recovery
-       * lane is absent here on purpose, because those lanes restart from their
-       * own head every pass and so need no help from this cursor.
-       */
-      const mainScanResumeCursorByRunId = new Map<string, DispatchCursor | null>();
 
       while (scannedBatches < queuedRunDispatchMaxScanBatches) {
         scannedBatches += 1;
-        const batchStartCursor = scanCursor;
         // Annotated rather than inferred: `scanCursor` is assigned from this
         // batch's last row, so control-flow analysis would otherwise chase
         // `batch` -> `scanCursor` -> `batch` and give up with an implicit any.
@@ -18353,10 +18341,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // proceed. They cannot crowd out runnable work: the dispatch rank puts
         // an unready run at `12 + priorityRank`, below everything runnable, and
         // collection no longer stops at a fixed candidate count.
-        for (const queuedRun of survivingRuns) {
-          queuedRuns.push(queuedRun);
-          mainScanResumeCursorByRunId.set(queuedRun.id, batchStartCursor);
-        }
+        for (const queuedRun of survivingRuns) queuedRuns.push(queuedRun);
 
         if (scanExhausted) break;
       }
@@ -18646,6 +18631,101 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (!foundReadyRecovery) return [];
       }
 
+      // Lane C — absolute starvation floor. BLO-21792 (second review follow-up).
+      //
+      // Lanes A and B restart from their own head every pass, so an emergency
+      // row is found however far the main scan's resume cursor has advanced.
+      // The absolute floor had no equivalent: it lived only in `dispatchRank`,
+      // which is applied to whichever rows the *cursored* main scan happens to
+      // read. That left a threshold-crossing hole the first follow-up's cursor
+      // rewind could not close, because the rewind keys on the rank a row
+      // already has:
+      //
+      //   A ready row scanned at 5h59m ranks 2, loses the last free slot to a
+      //   critical-lane row, and is never examined. Its rank is not
+      //   ABSOLUTE_STARVATION_DISPATCH_RANK yet, so no rewind fires and the
+      //   pass stores its cursor past the row. A minute later the row crosses
+      //   the floor — but it now sits BEHIND the cursor, so no later pass
+      //   re-reads it, re-ranks it, or dispatches it. Under arrivals that keep
+      //   the forward scan non-exhausted the head rescan never comes, and the
+      //   wait is unbounded again: the exact guarantee this ticket exists to
+      //   make.
+      //
+      // Keying a lane on `createdAt <= dispatchNow - STARVATION_ABSOLUTE_ESCALATION_MS`
+      // makes crossing the floor sufficient on its own — whether the row was
+      // examined before, and where the cursor sits, stop mattering. It also
+      // subsumes the rewind (an unexamined aged row is by definition matched
+      // here), which is why that bookkeeping is gone rather than kept alongside:
+      // one invariant, one mechanism, nothing to drift out of agreement.
+      //
+      // Cost in a healthy queue is one indexed range probe over the same
+      // (agent_id, status, created_at) dispatch index the other lanes use,
+      // returning zero rows — the predicate matches nothing until something has
+      // genuinely waited six hours.
+      const absoluteStarvationLaneRows: Array<typeof heartbeatRuns.$inferSelect> = [];
+      {
+        const absoluteFloorCutoff = new Date(
+          dispatchNow.getTime() - STARVATION_ABSOLUTE_ESCALATION_MS,
+        );
+        // ONE batch, deliberately — this lane does not page the way lanes A and
+        // B do, and the difference is load-bearing rather than a shortcut.
+        //
+        // Those lanes hunt for a specific row (the runnable critical/recovery
+        // one) that can hide behind any number of blocked rows, so LIMIT cannot
+        // be their final boundary. This lane wants the OLDEST aged rows, and a
+        // single keyset-ordered page is exactly that — there is nothing better
+        // further in. It also only needs enough of them to fill the free slots.
+        //
+        // Paging to queuedRunDispatchMaxScanBatches instead would re-read up to
+        // 200 * 10 = 2,000 rows from head on EVERY pass for an agent carrying a
+        // deep aged backlog, which is precisely the BLO-21116 population this
+        // ticket serves — turning a fix for those agents into a per-pass cost
+        // regression for them. One page caps the addition at the size of a
+        // single main-scan batch.
+        //
+        // Bounding this way cannot strand a ready aged row behind a page of
+        // blocked ones: the blocked rows are carried into the candidate pool
+        // where the claim gate cancels them (and terminal ones are pruned), so
+        // the head drains across passes, and the cursored main scan reaches
+        // anything behind them meanwhile. The lane is additive insurance for
+        // the cursor's blind spot, not the only path to these rows.
+        const batch: DispatchRun[] = await db
+          .select(dispatchRunSelection)
+          .from(heartbeatRuns)
+          .where(and(
+            eq(heartbeatRuns.agentId, agentId),
+            sql`${heartbeatRuns.status} = 'queued'`,
+            cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined,
+            // Mirrors `waitedMs >= STARVATION_ABSOLUTE_ESCALATION_MS` in
+            // dispatchRank, against the same `dispatchNow`, so the lane and the
+            // rank can never disagree about which rows are absolute.
+            lte(heartbeatRuns.createdAt, absoluteFloorCutoff),
+            deferredRunIds?.size
+              ? notInArray(heartbeatRuns.id, [...deferredRunIds])
+              : undefined,
+          ))
+          .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
+          .limit(queuedRunDispatchScanLimit);
+        if (batch.length > 0) {
+          const batchIssueIds = [...new Set(
+            batch
+              .map((run) => readNonEmptyString(parseObject(run.contextSnapshot).issueId))
+              .filter((issueId): issueId is string => Boolean(issueId && UUID_PATTERN.test(issueId))),
+          )];
+          if (batchIssueIds.length > 0) {
+            const issueRows = await db
+              .select({ id: issues.id, status: issues.status, priority: issues.priority })
+              .from(issues)
+              .where(and(
+                eq(issues.companyId, agent.companyId),
+                inArray(issues.id, batchIssueIds),
+              ));
+            for (const issueRow of issueRows) issueById.set(issueRow.id, issueRow);
+          }
+          absoluteStarvationLaneRows.push(...batch);
+        }
+      }
+
       const priorityLaneRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
       const admitToPriorityLane = (run: typeof heartbeatRuns.$inferSelect) => {
         if (queuedRunIds.has(run.id)) return;
@@ -18661,6 +18741,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const issueId = readNonEmptyString(parseObject(run.contextSnapshot).issueId);
         // A missing issue row means cross-company or deleted. The previous
         // inner join dropped those too; the claim-time gate still handles them.
+        const issue = issueId ? issueById.get(issueId) : null;
+        if (!issue || TERMINAL_ISSUE_STATUSES.has(issue.status)) continue;
+        admitToPriorityLane(run);
+      }
+      for (const run of absoluteStarvationLaneRows) {
+        // Same terminal/missing-issue screen as the recovery lane. An issue-less
+        // run is skipped outright: dispatchRank's absolute floor sits below its
+        // `hasId` branch, so such a run never reaches the absolute rank anyway,
+        // and aged PR-review wakes already have their own bounded fairness path
+        // in selectAgedPrReviewRunForFairDispatch.
+        const issueId = readNonEmptyString(parseObject(run.contextSnapshot).issueId);
         const issue = issueId ? issueById.get(issueId) : null;
         if (!issue || TERMINAL_ISSUE_STATUSES.has(issue.status)) continue;
         admitToPriorityLane(run);
@@ -18704,15 +18795,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
        *
        * Returns whether it scheduled a continuation, so the caller does not
        * also schedule the prune follow-up and double up.
-       *
-       * `absoluteFloorRewind`, when set, pins the stored cursor BEFORE an
-       * absolute-starvation row this pass never got to examine — see the
-       * absoluteFloorRewind computation at the claim loop for why.
        */
-      const advanceOrClearResumeCursor = (
-        claimedCount: number,
-        absoluteFloorRewind?: { cursor: DispatchCursor | null } | null,
-      ): boolean => {
+      const advanceOrClearResumeCursor = (claimedCount: number): boolean => {
         const needsHeadRescan = dispatchHeadRescanDemandByAgent.has(agentId);
         if (scanExhausted || !scanCursor) {
           dispatchResumeCursorByAgent.delete(agentId);
@@ -18725,46 +18809,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           return false;
         }
         if (claimedCount > 0) {
-          if (absoluteFloorRewind) {
-            /**
-             * BLO-21792 (first review follow-up): keep the absolute floor
-             * absolute ACROSS passes, not just within one window.
-             *
-             * Storing the end-of-window cursor here put any absolute-floor row
-             * this pass had no slot left to examine BEHIND the cursor. Nothing
-             * brought it back: the critical lane restarts from its own head
-             * every pass, so fresh rank-0/1 rows kept being merged in and
-             * dispatched from beyond this cursor, while the aged rank
-             * `ABSOLUTE_STARVATION_DISPATCH_RANK` rows waited for the forward
-             * scan to exhaust and trigger a head rescan. Under arrivals that
-             * keep the scan non-exhausted that never comes, so the wait was
-             * unbounded again — exactly what this ticket's floor exists to cap,
-             * and a hole in its global-FIFO claim.
-             *
-             * Rewinding to the boundary before the earliest such row makes the
-             * next pass re-read it first. This cannot pin the cursor and
-             * re-open prefix starvation, for two reasons. It only fires for
-             * rows the claim loop never EXAMINED (it stopped on capacity);
-             * a row that was examined and then pruned, deduped, or refused
-             * stays behind the cursor and keeps its own refusal continuation.
-             * And it only fires on a pass that filled every slot, which
-             * schedules no continuation — so the rewind changes only where the
-             * next completion-triggered pass starts reading, never how often
-             * dispatch runs.
-             */
-            if (absoluteFloorRewind.cursor) {
-              dispatchResumeCursorByAgent.set(agentId, {
-                ...absoluteFloorRewind.cursor,
-                passes: resumeState?.passes ?? 0,
-              });
-            } else {
-              // The row came from the first batch of a head-started pass; there
-              // is no boundary before it, so the next pass must start at head.
-              dispatchResumeCursorByAgent.delete(agentId);
-            }
-            clearDelayedResumeCapRetry(agentId);
-            return false;
-          }
           dispatchResumeCursorByAgent.set(agentId, { ...scanCursor, passes: resumeState?.passes ?? 0 });
           clearDelayedResumeCapRetry(agentId);
           /**
@@ -19081,13 +19125,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           });
         }
       };
-      let claimLoopStoppedOnCapacityAtIndex: number | null = null;
       try {
-        for (const [prioritizedIndex, queuedRun] of prioritizedRuns.entries()) {
-          if (claimedRuns.length >= availableSlots) {
-            claimLoopStoppedOnCapacityAtIndex = prioritizedIndex;
-            break;
-          }
+        for (const queuedRun of prioritizedRuns) {
+          if (claimedRuns.length >= availableSlots) break;
           if (dispatchStopped) break;
           const queuedSnapshot = parseObject(queuedRun.contextSnapshot);
           const queuedIssueId = readNonEmptyString(queuedSnapshot.issueId);
@@ -19151,35 +19191,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // re-triggers dispatch. A pass that filled only some of them schedules a
       // cursor continuation instead; see advanceOrClearResumeCursor.
       //
-      // BLO-21792 (first review follow-up): before advancing, find the oldest
-      // absolute-starvation row this pass stopped short of examining. Only rows
-      // past the capacity break count — everything before it was examined, and
-      // an examined-then-rejected row must stay behind the cursor so a stuck
-      // prefix cannot pin dispatch. Rows the emergency lanes contributed are
-      // skipped: they are absent from mainScanResumeCursorByRunId because those
-      // lanes re-read from their own head each pass already.
-      const absoluteFloorRewind = ((): { cursor: DispatchCursor | null } | null => {
-        if (claimLoopStoppedOnCapacityAtIndex === null) return null;
-        let earliest: typeof heartbeatRuns.$inferSelect | null = null;
-        for (const unexamined of prioritizedRuns.slice(claimLoopStoppedOnCapacityAtIndex)) {
-          if (dispatchRankByRunId.get(unexamined.id) !== ABSOLUTE_STARVATION_DISPATCH_RANK) continue;
-          if (!mainScanResumeCursorByRunId.has(unexamined.id)) continue;
-          // Oldest by the scan's own keyset order, so the rewind lands on the
-          // row the next pass should claim first rather than on whichever aged
-          // row the rank comparator happened to place earliest.
-          if (
-            !earliest
-            || unexamined.createdAt.getTime() < earliest.createdAt.getTime()
-            || (unexamined.createdAt.getTime() === earliest.createdAt.getTime()
-              && unexamined.id < earliest.id)
-          ) {
-            earliest = unexamined;
-          }
-        }
-        if (!earliest) return null;
-        return { cursor: mainScanResumeCursorByRunId.get(earliest.id) ?? null };
-      })();
-      advanceOrClearResumeCursor(claimedRuns.length, absoluteFloorRewind);
+      // BLO-21792: the cursor may legitimately advance past a still-queued row.
+      // That is safe for the absolute floor because the floor no longer depends
+      // on this cursor at all — the absolute-starvation lane above re-reads from
+      // its own head every pass, so a row that crosses the six-hour floor is
+      // picked up wherever the cursor happens to sit.
+      advanceOrClearResumeCursor(claimedRuns.length);
       dispatchDeferredRunIdsByAgent.delete(agentId);
       clearDelayedAdmissionRetry(agentId);
       launchClaimedRuns();
