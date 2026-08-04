@@ -59,6 +59,23 @@ async function main() {
       major > 3 || (major === 3 && (minor > 1 || (minor === 1 && patch >= 5))),
       `lockfile resolved vulnerable fast-uri ${major}.${minor}.${patch}`,
     );
+    const designerLockfile = JSON.parse(
+      await readFile(
+        join(fixtureRoot, "packages/services/designer/package-lock.json"),
+        "utf8",
+      ),
+    );
+    const [designerMajor, designerMinor, designerPatch] = designerLockfile.packages[
+      "node_modules/fast-uri"
+    ].version
+      .split(".")
+      .map(Number);
+    assert.ok(
+      designerMajor > 3 ||
+        (designerMajor === 3 &&
+          (designerMinor > 1 || (designerMinor === 1 && designerPatch >= 5))),
+      "designer lockfile resolved vulnerable fast-uri",
+    );
     assertIncludes(lockfile, "undici@6.27.0:", "lockfile");
     assertIncludes(lockfile, "undici@7.28.0:", "lockfile");
     assertIncludes(lockfile, "multer@2.2.0:", "lockfile");
