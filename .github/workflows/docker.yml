@@ -257,8 +257,9 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' && vars.PAPERCLIP_CI_DEPLOY == 'true' && github.ref == 'refs/heads/master' && needs.build-and-push.result == 'success' }}
     environment:
       name: paperclip-production
-    # Must exceed helm upgrade's --timeout 30m below, plus checkout/cleanup margin.
-    timeout-minutes: 40
+    # Covers the sequential 30m Helm wait and 30m post-reconcile rollout wait,
+    # plus checkout, approval, final verification, and cleanup margin.
+    timeout-minutes: 70
     concurrency:
       # Serialize deploys to the same target so a fast-followup push doesn't
       # race with an in-flight upgrade.

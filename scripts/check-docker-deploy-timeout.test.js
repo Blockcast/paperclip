@@ -27,20 +27,25 @@ function getBuildJobBlock() {
   return workflow.slice(start + startMarker.length, end);
 }
 
-test("Docker deploy job timeout exceeds Helm wait timeout", () => {
+test("Docker deploy job timeout covers every sequential rollout wait", () => {
   const deployJob = getDeployJobBlock();
   const jobTimeoutMatch = deployJob.match(/^    timeout-minutes:\s*(\d+)\s*$/m);
   const helmTimeoutMatch = deployJob.match(/--wait --timeout\s+(\d+)m\b/);
+  const rolloutTimeoutMatch = deployJob.match(
+    /rollout status deployment\/paperclip-api --timeout=(\d+)m\b/,
+  );
 
   assert.ok(jobTimeoutMatch, "deploy job must declare timeout-minutes");
   assert.ok(helmTimeoutMatch, "deploy job must set helm upgrade --wait --timeout");
+  assert.ok(rolloutTimeoutMatch, "deploy job must bound the post-reconcile rollout wait");
 
   const jobTimeoutMinutes = Number(jobTimeoutMatch[1]);
   const helmTimeoutMinutes = Number(helmTimeoutMatch[1]);
+  const rolloutTimeoutMinutes = Number(rolloutTimeoutMatch[1]);
 
   assert.ok(
-    jobTimeoutMinutes >= helmTimeoutMinutes + 5,
-    `job timeout (${jobTimeoutMinutes}m) must leave cleanup margin after Helm timeout (${helmTimeoutMinutes}m)`,
+    jobTimeoutMinutes >= helmTimeoutMinutes + rolloutTimeoutMinutes + 10,
+    `job timeout (${jobTimeoutMinutes}m) must cover Helm (${helmTimeoutMinutes}m) + rollout (${rolloutTimeoutMinutes}m) + 10m margin`,
   );
 });
 
