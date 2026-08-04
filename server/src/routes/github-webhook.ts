@@ -1532,6 +1532,17 @@ async function findActivePrReviewerForTask(
     .then((rows) => rows[0]?.agentId ?? null);
 }
 
+// BLO-21582: a distinct class (not a bare Error) so the reviewer-wake call
+// site can retry ONLY a lock-acquisition timeout -- never a business-rule
+// refusal (HttpError) or a genuine DB error surfacing through the same catch,
+// which retrying would just delay for no benefit.
+class PrReviewerTaskLockTimeoutError extends Error {
+  constructor(taskKey: string) {
+    super(`timed out acquiring PR reviewer task assignment lock for ${taskKey}`);
+    this.name = "PrReviewerTaskLockTimeoutError";
+  }
+}
+
 async function withPrReviewerTaskLock<T>(
   db: Db,
   taskKey: string,
@@ -1558,7 +1569,7 @@ async function withPrReviewerTaskLock<T>(
     });
     if (outcome.acquired) return outcome.value;
     if (Date.now() >= deadline) {
-      throw new Error("timed out acquiring PR reviewer task assignment lock");
+      throw new PrReviewerTaskLockTimeoutError(taskKey);
     }
     await new Promise((resolve) => setTimeout(resolve, PR_REVIEWER_TASK_LOCK_RETRY_MS));
   }
@@ -2034,22 +2045,47 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
         );
         return false;
       }
-      try {
-        const heartbeat = heartbeatService(db, {
-          pluginWorkerManager: config.pluginWorkerManager,
-          ...config.heartbeatOptions,
-        });
-        const reviewerWakeupOptions = buildPrReviewerWakeupOptions(context, eventName, deliveryId);
-        const reviewerTaskKey = reviewerWakeupOptions.payload.taskKey;
-        const idempotencyKey = reviewerWakeupOptions.idempotencyKey;
-        // taskKey scopes active-run coalescing; idempotencyKey scopes duplicate
-        // request rows for the same PR+reason before enqueueing.
-        // Request-scoped keys also dedup terminal completed/cancelled rows, so a
-        // GitHub redelivery of one event cannot re-run work that already ran or
-        // was retired by converted_to_draft (BLO-18953).
-        const idempotentStatuses = idempotentWakeStatuses(
-          prReviewerWakeIdempotencyScope(context, deliveryId),
-        );
+      const heartbeat = heartbeatService(db, {
+        pluginWorkerManager: config.pluginWorkerManager,
+        ...config.heartbeatOptions,
+      });
+      const reviewerWakeupOptions = buildPrReviewerWakeupOptions(context, eventName, deliveryId);
+      const reviewerTaskKey = reviewerWakeupOptions.payload.taskKey;
+      const idempotencyKey = reviewerWakeupOptions.idempotencyKey;
+      // taskKey scopes active-run coalescing; idempotencyKey scopes duplicate
+      // request rows for the same PR+reason before enqueueing.
+      // Request-scoped keys also dedup terminal completed/cancelled rows, so a
+      // GitHub redelivery of one event cannot re-run work that already ran or
+      // was retired by converted_to_draft (BLO-18953).
+      const idempotentStatuses = idempotentWakeStatuses(
+        prReviewerWakeIdempotencyScope(context, deliveryId),
+      );
+
+      // BLO-21582: withPrReviewerTaskLock can time out acquiring the per-PR
+      // advisory lock -- observed live in production during bursts of
+      // concurrent webhook deliveries, most plausibly because the lock
+      // holder is itself blocked acquiring the SECOND pooled connection
+      // `heartbeat.wakeup()` needs (see the comment on withPrReviewerTaskLock)
+      // and so never releases the lock within the budget. That throw used to
+      // land straight in the catch below and return false -- BEFORE the
+      // `received` counter a few lines down ever increments, so the loss was
+      // invisible to the entire BLO-18859 delivery funnel (not `received`,
+      // not `queued`, not `dead_lettered`): a review request that "routed
+      // correctly" per every webhook-side log vanished with zero record
+      // anywhere, while this handler still answered GitHub 200 (so GitHub's
+      // own redelivery-on-failure never fired either).
+      //
+      // Bounded retry absorbs a transient contention window instead of
+      // stranding the PR on one unlucky timing; it is safe to re-run because
+      // the closure re-checks `existingWake` under a fresh lock attempt
+      // before doing anything (see below). Only a lock-timeout retries --
+      // an HttpError business-rule refusal or a genuine DB error propagate
+      // straight to the catch, matching the existing non-retry behavior for
+      // those (see the comment above the `wakeResult` check).
+      const REVIEWER_WAKE_LOCK_ATTEMPTS = 3;
+      const REVIEWER_WAKE_LOCK_RETRY_BACKOFF_MS = [300, 900];
+      for (let attempt = 0; attempt < REVIEWER_WAKE_LOCK_ATTEMPTS; attempt++) {
+        try {
         return await withPrReviewerTaskLock(db, reviewerTaskKey, async (tx) => {
           // The wake insert commits through heartbeat's own transaction. Keep
           // this transaction-scoped lock held until that commit is visible so
@@ -2150,10 +2186,40 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
           // not produce a run.
           return false;
         });
-      } catch (err) {
+       } catch (err) {
+        if (
+          err instanceof PrReviewerTaskLockTimeoutError &&
+          attempt < REVIEWER_WAKE_LOCK_ATTEMPTS - 1
+        ) {
+          logger.warn(
+            {
+              err,
+              attempt: attempt + 1,
+              maxAttempts: REVIEWER_WAKE_LOCK_ATTEMPTS,
+              event: eventName,
+              prNumber: context?.prNumber,
+              repoFullName: context?.repoFullName,
+            },
+            "github webhook reviewer wake lock attempt failed, retrying",
+          );
+          await new Promise((resolve) =>
+            setTimeout(resolve, REVIEWER_WAKE_LOCK_RETRY_BACKOFF_MS[attempt]),
+          );
+          continue;
+        }
+        // BLO-21582: either every retry is exhausted, or this was not a
+        // lock-timeout so retrying would not help -- either way this
+        // delivery is lost BEFORE `received` was ever recorded a few lines
+        // up (that increment lives inside the lock-guarded closure). Record
+        // `dead_lettered` directly here so the BLO-18859 funnel invariant
+        // (received == queued + suppressed + dead_lettered) keeps holding
+        // instead of quietly under-counting `received`, and so the existing
+        // dead-letter alerting actually sees this class of loss.
+        recordGithubReviewRequestDelivery({ state: "dead_lettered", reason: context.wakeReason });
         logger.error(
           {
             err,
+            attempt: attempt + 1,
             agentIds: reviewerAgentIds,
             event: eventName,
             prNumber: context?.prNumber,
@@ -2162,7 +2228,13 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
           "github webhook reviewer wake failed",
         );
         return false;
+        }
       }
+      // Unreachable: every loop iteration above returns or continues: the
+      // last attempt's catch always falls through to the dead_lettered
+      // return since `attempt < REVIEWER_WAKE_LOCK_ATTEMPTS - 1` is false by
+      // then. Kept only to satisfy the function's return type.
+      return false;
     })();
 
     // Dependabot remediation wake. Like the reviewer wake, this targets a

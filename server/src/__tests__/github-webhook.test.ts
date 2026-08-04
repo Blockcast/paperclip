@@ -2503,7 +2503,194 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(queuedWakes[0]?.payload).toMatchObject({ headSha: "freshsha" });
   });
 
+  // BLO-21582: production evidence showed `withPrReviewerTaskLock` timing out
+  // (2s budget) under contention, and the failure landing in the outer catch
+  // BEFORE the `received` counter a few lines further in ever incremented --
+  // so the loss was invisible to the whole delivery funnel, not just
+  // `dead_lettered`. These two tests reproduce genuine advisory-lock
+  // contention across a second, independent DB connection (a fresh
+  // `createDb(...)` pool -- `pg_advisory_xact_lock` only contends across
+  // sessions) and assert the two outcomes the fix is meant to produce: a
+  // contention window shorter than the retry budget self-heals, and one that
+  // outlasts every retry is at least COUNTED as `dead_lettered` instead of
+  // vanishing with zero record anywhere.
+  describe("reviewer wake lock contention (BLO-21582)", () => {
+    let lockDb: ReturnType<typeof createDb>;
+
+    beforeAll(() => {
+      lockDb = createDb(tempDb!.connectionString);
+    });
+
+    afterAll(async () => {
+      await lockDb.$client.end();
+    });
+
+    async function holdAdvisoryLock(taskKey: string, holdMs: number) {
+      let releaseHeld: () => void = () => {};
+      const held = new Promise<void>((resolve) => {
+        releaseHeld = resolve;
+      });
+      const acquired = new Promise<void>((resolveAcquired, rejectAcquired) => {
+        void lockDb
+          .transaction(async (tx) => {
+            await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${taskKey}, 0))`);
+            resolveAcquired();
+            await held;
+          })
+          .catch(rejectAcquired);
+      });
+      await acquired;
+      const timer = setTimeout(releaseHeld, holdMs);
+      return () => {
+        clearTimeout(timer);
+        releaseHeld();
+      };
+    }
+
+    it(
+      "recovers a reviewer wake once a transient lock-holder releases within the retry budget",
+      async () => {
+        const reviewerAgentId = randomUUID();
+        const { companyId } = await seedCompanyAndAgent();
+        await db.insert(agents).values({
+          id: reviewerAgentId,
+          companyId,
+          name: "Ally",
+          role: "engineer",
+          status: "idle",
+          adapterType: "claude_k8s",
+          adapterConfig: {},
+          runtimeConfig: {},
+          permissions: {},
+        });
+
+        const prNumber = 21582001;
+        const taskKey = `pr_review:Blockcast/paperclip:${prNumber}`;
+        // Longer than the 2s single-attempt budget, short enough that
+        // attempt 2 (after the 300ms backoff) lands inside the still-held
+        // window and attempt 3 finds it free.
+        const release = await holdAdvisoryLock(taskKey, 2_300);
+
+        const app = buildApp({ prReviewerAgentId: reviewerAgentId });
+        const payload = {
+          action: "opened",
+          pull_request: {
+            number: prNumber,
+            title: "Reviewer wake lock contention regression",
+            body: null,
+            head: { ref: "fix/blo-21582-lock-contention", sha: "lockcontendsha" },
+          },
+          repository: { full_name: "Blockcast/paperclip" },
+        };
+        const { body, signature } = signedRequest(payload);
+        const before = await deliveryCount("dead_lettered");
+
+        const res = await request(app)
+          .post("/api/webhooks/github")
+          .set("x-github-event", "pull_request")
+          .set("x-hub-signature-256", signature)
+          .set("x-github-delivery", "delivery-blo-21582-lock-recovery")
+          .set("content-type", "application/json")
+          .send(body);
+
+        release();
+
+        expect(res.status).toBe(200);
+        expect(res.body).toMatchObject({ reviewerWakeFired: true });
+        expect(await deliveryCount("dead_lettered")).toBe(before);
+
+        const queuedWakes = await db
+          .select({ status: agentWakeupRequests.status })
+          .from(agentWakeupRequests)
+          .where(
+            and(
+              eq(agentWakeupRequests.agentId, reviewerAgentId),
+              eq(agentWakeupRequests.idempotencyKey, `pr_review:Blockcast/paperclip:${prNumber}:github_pr_opened`),
+              eq(agentWakeupRequests.status, "queued"),
+            ),
+          );
+        expect(queuedWakes).toHaveLength(1);
+      },
+      15_000,
+    );
+
+    it(
+      "records dead_lettered (never received) once every lock-acquisition retry is exhausted, without lying in the 200 response",
+      async () => {
+        const reviewerAgentId = randomUUID();
+        const { companyId } = await seedCompanyAndAgent();
+        await db.insert(agents).values({
+          id: reviewerAgentId,
+          companyId,
+          name: "Ally",
+          role: "engineer",
+          status: "idle",
+          adapterType: "claude_k8s",
+          adapterConfig: {},
+          runtimeConfig: {},
+          permissions: {},
+        });
+
+        const prNumber = 21582002;
+        const taskKey = `pr_review:Blockcast/paperclip:${prNumber}`;
+        // Outlasts all 3 attempts and both backoffs (2000+300+2000+900+2000
+        // = 7200ms worst case): every retry must find the lock still held.
+        const release = await holdAdvisoryLock(taskKey, 7_800);
+
+        const app = buildApp({ prReviewerAgentId: reviewerAgentId });
+        const payload = {
+          action: "opened",
+          pull_request: {
+            number: prNumber,
+            title: "Reviewer wake lock exhaustion regression",
+            body: null,
+            head: { ref: "fix/blo-21582-lock-exhaustion", sha: "lockexhaustsha" },
+          },
+          repository: { full_name: "Blockcast/paperclip" },
+        };
+        const { body, signature } = signedRequest(payload);
+        const beforeDeadLettered = await deliveryCount("dead_lettered");
+        const beforeReceived = await deliveryCount("received");
+
+        const res = await request(app)
+          .post("/api/webhooks/github")
+          .set("x-github-event", "pull_request")
+          .set("x-hub-signature-256", signature)
+          .set("x-github-delivery", "delivery-blo-21582-lock-exhaustion")
+          .set("content-type", "application/json")
+          .send(body);
+
+        release();
+
+        // The handler still answers GitHub 200 (matching every other
+        // suppression path in this route -- GitHub redelivery is not the
+        // backstop here), but MUST NOT claim reviewerWakeFired for a wake
+        // that never queued a run.
+        expect(res.status).toBe(200);
+        expect(res.body).toMatchObject({ reviewerWakeFired: false });
+
+        // The regression: this delivery never reached the `received`
+        // increment (it lives inside the lock-guarded closure, which this
+        // delivery's attempts never entered), but it MUST now be counted as
+        // `dead_lettered` so the BLO-18859 funnel invariant
+        // (received == queued + suppressed + dead_lettered) keeps holding
+        // instead of a `received`-less delivery vanishing from the funnel
+        // entirely.
+        expect(await deliveryCount("received")).toBe(beforeReceived);
+        expect(await deliveryCount("dead_lettered")).toBe(beforeDeadLettered + 1);
+
+        const wakes = await db
+          .select({ status: agentWakeupRequests.status })
+          .from(agentWakeupRequests)
+          .where(eq(agentWakeupRequests.agentId, reviewerAgentId));
+        expect(wakes).toHaveLength(0);
+      },
+      20_000,
+    );
+  });
+
   it("re-reviews a PR after a fixup push even though the prior review completed (stale-head regression)", async () => {
+
     const reviewerAgentId = randomUUID();
     const { companyId } = await seedCompanyAndAgent();
     await db.insert(agents).values({
