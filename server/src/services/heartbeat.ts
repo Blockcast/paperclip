@@ -84,6 +84,7 @@ import { conflict, HttpError, notFound } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import { describeDbError, isDbError, runWithTransientDbRetry } from "../lib/db-retry.js";
 import { publishLiveEvent } from "./live-events.js";
+import { canClaimPrReviewTask } from "./pr-review-dispatch-lock.js";
 import { normalizeResponsibleUserDenialCode } from "./responsible-user-denial-run-outcomes.js";
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
 import {
@@ -14790,26 +14791,48 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       issueContext: issueId ? await getIssueExecutionContext(run.companyId, issueId) : null,
       routineEnvContext: { routineId: null, env: null, responsibleUserId: null },
     });
+    const prReviewTaskKey = readNonEmptyString(context.taskKey) ?? run.contextTaskKey;
+    const exclusivePrReviewTaskKey = prReviewTaskKey && isPrReviewRetryContext(context)
+      ? prReviewTaskKey
+      : null;
     const initiallyClaimed = hasExternalLifecycle(agent.adapterType)
       ? (await claimRunWithExternalRuntimeSlotPool(
           db,
           run.id,
           claimedAt,
           resolveExternalLifecycleConcurrency(parseHeartbeatPolicy(agent)).effectiveMaxConcurrentRuns,
+          exclusivePrReviewTaskKey ? { exclusivePrReviewTaskKey } : {},
         ))?.run ?? null
+      : exclusivePrReviewTaskKey
+      ? await db.transaction(async (tx) => {
+          if (!(await canClaimPrReviewTask(tx, exclusivePrReviewTaskKey))) return null;
+          return tx
+            .update(heartbeatRuns)
+            .set({
+              status: "running",
+              error: null,
+              errorCode: null,
+              responsibleUserId,
+              startedAt: run.startedAt ?? claimedAt,
+              updatedAt: claimedAt,
+            })
+            .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
+            .returning()
+            .then((rows) => rows[0] ?? null);
+        })
       : await db
-          .update(heartbeatRuns)
-          .set({
-            status: "running",
-            error: null,
-            errorCode: null,
-            responsibleUserId,
-            startedAt: run.startedAt ?? claimedAt,
-            updatedAt: claimedAt,
-          })
-          .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
-          .returning()
-          .then((rows) => rows[0] ?? null);
+        .update(heartbeatRuns)
+        .set({
+          status: "running",
+          error: null,
+          errorCode: null,
+          responsibleUserId,
+          startedAt: run.startedAt ?? claimedAt,
+          updatedAt: claimedAt,
+        })
+        .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
+        .returning()
+        .then((rows) => rows[0] ?? null);
     const claimed = initiallyClaimed && hasExternalLifecycle(agent.adapterType)
       ? await db
           .update(heartbeatRuns)

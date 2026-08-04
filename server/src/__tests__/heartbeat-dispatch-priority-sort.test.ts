@@ -573,7 +573,8 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
 
   it("keeps a same-PR review follow-up queued while another review task is running", async () => {
     const companyId = randomUUID();
-    const agentId = randomUUID();
+    const runningReviewerId = randomUUID();
+    const queuedReviewerId = randomUUID();
     const blockedTaskKey = "pr_review:Blockcast/paperclip:123";
     const otherTaskKey = "pr_review:Blockcast/paperclip:124";
 
@@ -584,23 +585,36 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
       requireBoardApprovalForNewAgents: false,
       defaultResponsibleUserId: "responsible-user",
     });
-    await db.insert(agents).values({
-      id: agentId,
-      companyId,
-      name: "ReviewDispatchAgent",
-      role: "engineer",
-      status: "idle",
-      adapterType: "codex_local",
-      adapterConfig: {},
-      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 3 } },
-      permissions: {},
-    });
+    await db.insert(agents).values([
+      {
+        id: runningReviewerId,
+        companyId,
+        name: "RunningReviewAgent",
+        role: "engineer",
+        status: "running",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 3 } },
+        permissions: {},
+      },
+      {
+        id: queuedReviewerId,
+        companyId,
+        name: "QueuedReviewAgent",
+        role: "engineer",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 3 } },
+        permissions: {},
+      },
+    ]);
 
     const now = new Date();
     await db.insert(heartbeatRuns).values({
       id: randomUUID(),
       companyId,
-      agentId,
+      agentId: runningReviewerId,
       invocationSource: "automation",
       triggerDetail: "github_webhook",
       status: "running",
@@ -623,7 +637,7 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
       {
         id: blockedWakeId,
         companyId,
-        agentId,
+        agentId: queuedReviewerId,
         source: "automation",
         triggerDetail: "github_webhook",
         reason: "github_pr_review_requested",
@@ -633,7 +647,7 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
       {
         id: otherWakeId,
         companyId,
-        agentId,
+        agentId: queuedReviewerId,
         source: "automation",
         triggerDetail: "github_webhook",
         reason: "github_pr_review_requested",
@@ -645,7 +659,7 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
       {
         id: blockedRunId,
         companyId,
-        agentId,
+        agentId: queuedReviewerId,
         invocationSource: "automation",
         triggerDetail: "github_webhook",
         status: "queued",
@@ -659,7 +673,7 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
       {
         id: otherRunId,
         companyId,
-        agentId,
+        agentId: queuedReviewerId,
         invocationSource: "automation",
         triggerDetail: "github_webhook",
         status: "queued",
