@@ -631,13 +631,17 @@ jobs:
                   startswith("paperclip.blockcast.net/");
                 . as $live |
                 $approved[0] as $plan |
-                ($live.metadata
-                  | del(.managedFields, .uid, .creationTimestamp, .generation)) as $live_metadata |
-                $plan |
+                ($plan
+                  | del(.metadata.managedFields, .metadata.uid,
+                        .metadata.creationTimestamp, .metadata.generation,
+                        .metadata.resourceVersion, .status)) as $clean_plan |
+                ($live.metadata | del(.managedFields, .generation)) as $live_metadata |
+                $clean_plan |
                 # Current live metadata wins for non-release fields (for example,
-                # a finalizer added after approval); controlled labels and
-                # annotations are rebuilt explicitly below from the plan.
-                .metadata = ($plan.metadata + $live_metadata) |
+                # the real UID of a newly created Deployment or a finalizer added
+                # after approval); controlled labels and annotations are rebuilt
+                # explicitly below from the plan.
+                .metadata = ($clean_plan.metadata + $live_metadata) |
                 .metadata.labels = (
                   (($live.metadata.labels // {})
                     | with_entries(select((.key | release_controlled_metadata_key) | not))) +

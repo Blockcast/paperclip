@@ -195,6 +195,17 @@ test("Docker deploy accepts an approved create plan without resourceVersion", ()
     /\.metadata\.resourceVersion = \$live\.metadata\.resourceVersion/,
     "post-create reconciliation must bind the newly created live resourceVersion",
   );
+  assert.match(
+    deployJob,
+    /\$plan\s+\| del\(\.metadata\.managedFields, \.metadata\.uid,\s+\.metadata\.creationTimestamp, \.metadata\.generation,\s+\.metadata\.resourceVersion, \.status\)\) as \$clean_plan/,
+    "provisional identity returned by server dry-run create must be removed",
+  );
+  assert.match(
+    deployJob,
+    /\(\$live\.metadata \| del\(\.managedFields, \.generation\)\) as \$live_metadata/,
+    "the real live UID and creationTimestamp must survive reconciliation",
+  );
+  assert.match(deployJob, /\.metadata = \(\$clean_plan\.metadata \+ \$live_metadata\)/);
 });
 
 test("Docker deploy confines and cleans up the release-approver credential", () => {
