@@ -740,6 +740,11 @@ export const suggestTasksResultSchema = z.object({
   createdTasks: z.array(suggestTasksResultCreatedTaskSchema).max(50).optional(),
   skippedClientKeys: z.array(z.string().trim().min(1).max(120)).max(50).optional(),
   rejectionReason: z.string().trim().max(4000).nullable().optional(),
+  // Set when the card is withdrawn before anyone acted on it. Mirrors the
+  // `cancelled` / `cancellationReason` pair on askUserQuestionsResultSchema so
+  // every withdrawable kind records the reason in the same shape.
+  cancelled: z.literal(true).optional(),
+  cancellationReason: z.string().trim().max(4000).nullable().optional(),
 });
 
 export const askUserQuestionsQuestionOptionSchema = z.object({
@@ -994,7 +999,10 @@ export const requestConfirmationToolActionResultSchema = z.object({
 
 export const requestConfirmationResultSchema = z.object({
   version: z.literal(1),
-  outcome: z.enum(["accepted", "rejected", "superseded_by_comment", "stale_target"]),
+  // "cancelled" records a withdrawal by the creating agent (or a board user)
+  // while the card was still pending. request_item_verdicts already carries the
+  // same value, so the vocabulary stays consistent across kinds.
+  outcome: z.enum(["accepted", "rejected", "superseded_by_comment", "stale_target", "cancelled"]),
   reason: z.string().trim().max(4000).nullable().optional(),
   commentId: z.string().uuid().nullable().optional(),
   staleTarget: requestConfirmationTargetSchema.nullable().optional(),

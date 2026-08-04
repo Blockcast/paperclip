@@ -2,6 +2,7 @@ import { Readable } from "node:stream";
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { REDACTED_EVENT_VALUE } from "../redaction.js";
 
 const issueId = "11111111-1111-4111-8111-111111111111";
 const companyId = "22222222-2222-4222-8222-222222222222";
@@ -10,8 +11,6 @@ const peerAgentId = "44444444-4444-4444-8444-444444444444";
 const staleAgentId = "66666666-1111-4666-8666-666666666666";
 const ownerRunId = "55555555-5555-4555-8555-555555555555";
 const recoveryActionId = "77777777-7777-4777-8777-777777777777";
-const ceoAgentId = "99999999-9999-4999-8999-999999999999";
-const ceoRunId = "99999999-1111-4999-8999-999999999999";
 
 const mockIssueService = vi.hoisted(() => ({
   addComment: vi.fn(),
@@ -252,6 +251,8 @@ function makeIssue(overrides: Record<string, unknown> = {}) {
     executionPolicy: null,
     executionState: null,
     hiddenAt: null,
+    originKind: "manual",
+    originId: null,
     ...overrides,
   };
 }
@@ -300,10 +301,97 @@ function makeRecoveryAction(overrides: Record<string, unknown> = {}) {
   };
 }
 
+// Denied-write recovery issues two bounded activity-log lookups from the route:
+// an exact duplicate probe selecting `{ entityId }`, then an aggregate probe
+// selecting `{ deniedWriteId }` to cap varied payloads per actor/issue/window.
+//
+// The stub used to resolve `[]` unconditionally, which meant the dedupe
+// early-return never executed in CI at all. Because the lookup deliberately
+// fails open (a throw is caught and recording proceeds), a regression that broke
+// the exact or aggregate bounds — a renamed `details` key, a wrong column —
+// would have stayed green while silently recording without bound. `recentRows`
+// drives the exact duplicate branch; `aggregateRows` drives the varied-payload
+// cap branch; `onLookup` captures predicates so tests can assert the
+// discriminators they key on.
+type DeniedWriteLookupKind = "exact" | "aggregate";
+type DeniedWriteLookupStub = {
+  recentRows?: unknown[];
+  aggregateRows?: unknown[];
+  rowsFor?: (where: unknown, kind: DeniedWriteLookupKind) => unknown[];
+  onLookup?: (where: unknown, kind: DeniedWriteLookupKind) => void;
+};
+
+function deniedWriteLookupLimitStub(
+  selection: Record<string, unknown>,
+  where: unknown,
+  stub: DeniedWriteLookupStub,
+) {
+  const selectionKeys = Object.keys(selection);
+  const lookupKind: DeniedWriteLookupKind | null = selectionKeys.includes("entityId")
+    ? "exact"
+    : selectionKeys.includes("deniedWriteId")
+    ? "aggregate"
+    : null;
+  return vi.fn((count: number) => ({
+    // Must honour `reject`: a thenable that only ever calls `resolve` leaves an
+    // awaiting caller hung forever when the stub throws, so a failure test would
+    // "pass" on a dangling promise instead of on the abort it means to assert.
+    then: async (resolve: (rows: unknown[]) => unknown, reject?: (err: unknown) => unknown) => {
+      try {
+        if (!lookupKind) return resolve([]);
+        stub.onLookup?.(where, lookupKind);
+        const fallbackRows = lookupKind === "exact" ? stub.recentRows ?? [] : stub.aggregateRows ?? [];
+        const rows = stub.rowsFor ? stub.rowsFor(where, lookupKind) : fallbackRows;
+        return resolve(rows.slice(0, count));
+      } catch (err) {
+        if (reject) return reject(err);
+        throw err;
+      }
+    },
+  }));
+}
+
+// Drizzle keeps bound values as raw primitives inside `queryChunks` until the
+// dialect compiles the statement, so a predicate's parameters can be read back
+// without a database. Used to assert the dedupe key actually carries the fields
+// the recorded row exposes — if the two sides ever drift (one renamed, the other
+// not) dedupe silently stops matching, and only comparing them catches it.
+function collectSqlParams(node: unknown, out: unknown[] = []): unknown[] {
+  if (typeof node === "string") {
+    out.push(node);
+    for (const match of node.matchAll(/'([^']+)'/g)) out.push(match[1]);
+    return out;
+  }
+  if (typeof node === "number" || node instanceof Date) {
+    out.push(node);
+    return out;
+  }
+  if (!node || typeof node !== "object") return out;
+  if (Array.isArray(node)) {
+    for (const child of node) collectSqlParams(child, out);
+    return out;
+  }
+  const chunks = (node as { queryChunks?: unknown }).queryChunks;
+  if (Array.isArray(chunks)) {
+    for (const child of chunks) collectSqlParams(child, out);
+    return out;
+  }
+  const value = (node as { value?: unknown }).value;
+  if (Array.isArray(value)) {
+    for (const child of value) collectSqlParams(child, out);
+    return out;
+  }
+  if (typeof value === "string" || typeof value === "number" || value instanceof Date) {
+    collectSqlParams(value, out);
+  }
+  return out;
+}
+
 function createRunContextDb(
   contextSnapshot: Record<string, unknown> = {},
   runAgentOrRows: string | Record<string, unknown>[] = ownerAgentId,
   runId: string = ownerRunId,
+  deniedWriteLookup: DeniedWriteLookupStub = {},
 ) {
   const runRows = Array.isArray(runAgentOrRows)
     ? runAgentOrRows
@@ -325,21 +413,33 @@ function createRunContextDb(
     return [{ id: runAgentId, companyId: runAgentCompanyId, permissions: {}, role: "engineer", reportsTo: null }];
   };
   const buildQuery = (selection: Record<string, unknown>) => {
-    const whereResult = {
+    const makeWhereResult = (where: unknown) => ({
       orderBy: vi.fn(async () => []),
+      limit: deniedWriteLookupLimitStub(selection, where, deniedWriteLookup),
       then: async (resolve: (rows: unknown[]) => unknown) => resolve(rowsForSelection(selection)),
-    };
+    });
     const query = {
       innerJoin: vi.fn(() => query),
-      where: vi.fn(() => whereResult),
+      where: vi.fn((where: unknown) => makeWhereResult(where)),
     };
     return query;
   };
+  const select = vi.fn((selection: Record<string, unknown> = {}) => ({
+    from: vi.fn(() => buildQuery(selection)),
+  }));
+  // The aggregate bound is enforced inside `db.transaction` under an advisory
+  // lock, so the stub transaction has to be a usable executor — an empty object
+  // would make every recording path throw and silently record nothing, turning
+  // the cap tests green for the wrong reason.
+  const tx = {
+    execute: vi.fn(async () => undefined),
+    select,
+    insert: vi.fn(() => ({ values: vi.fn(async () => undefined) })),
+  };
   return {
-    transaction: async (callback: (tx: Record<string, never>) => Promise<unknown>) => callback({}),
-    select: vi.fn((selection: Record<string, unknown> = {}) => ({
-      from: vi.fn(() => buildQuery(selection)),
-    })),
+    transaction: async (callback: (tx: unknown) => Promise<unknown>) => callback(tx),
+    execute: tx.execute,
+    select,
   };
 }
 
@@ -392,16 +492,6 @@ function ownerActorFromSweepRun() {
   };
 }
 
-function ceoActor() {
-  return {
-    type: "agent",
-    agentId: ceoAgentId,
-    companyId,
-    source: "agent_key",
-    runId: ceoRunId,
-  };
-}
-
 function boardActor() {
   return {
     type: "board",
@@ -438,10 +528,21 @@ function createAuthorizationDecisionDb(input: { actor?: { agentId?: string | nul
   return {
     select: vi.fn((selection: Record<string, unknown> = {}) => ({
       from: vi.fn(() => ({
-        where: vi.fn(() => ({
-          then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
-            Promise.resolve(rowsForSelection(selection)).then(onFulfilled, onRejected),
-        })),
+        where: vi.fn(() => {
+          const settle = (
+            onFulfilled: (rows: unknown[]) => unknown,
+            onRejected?: (reason: unknown) => unknown,
+          ) => Promise.resolve(rowsForSelection(selection)).then(onFulfilled, onRejected);
+          // BLO-19094: the productivity-review source grant terminates its
+          // query with `.limit(1)` rather than awaiting the where() thenable
+          // directly, so the double has to offer both endings. Without this the
+          // whole issue:mutate branch throws "limit is not a function" and every
+          // route test using this double reports 500 instead of its real status.
+          return {
+            then: settle,
+            limit: vi.fn(() => ({ then: settle })),
+          };
+        }),
       })),
     })),
   };
@@ -504,6 +605,10 @@ describe("agent issue mutation checkout ownership", () => {
     vi.doUnmock("../middleware/index.js");
     registerRouteMocks();
     vi.clearAllMocks();
+    // `clearAllMocks` clears calls but keeps implementations, so a test that
+    // installs one on `logActivity` (see `cheapRecoveryDedupeHarness`) would
+    // otherwise leak it into every test that follows.
+    mockLogActivity.mockImplementation((async () => undefined) as never);
     mockAccessService.canUser.mockReset();
     mockAccessService.decide.mockReset();
     mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
@@ -887,6 +992,29 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockWorkProductService.update).not.toHaveBeenCalled();
     expect(mockStorageService.putFile).not.toHaveBeenCalled();
     expect(mockStorageService.deleteObject).not.toHaveBeenCalled();
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        companyId,
+        actorType: "agent",
+        actorId: peerAgentId,
+        action: "issue_write_denied",
+        entityType: "issue",
+        entityId: issueId,
+        issueId,
+        details: expect.objectContaining({
+          attemptedAction: "issue:mutate",
+          reason: "deny_active_checkout",
+          boundaryReason: "allow_company_agent",
+          responseStatus: 409,
+          quarantined: true,
+        }),
+      }),
+      // Publication must be deferred past commit: `activity.logged` escapes the
+      // transaction, so an inline emit would race row visibility and survive a
+      // rollback as a phantom event.
+      { deferPublish: true },
+    );
   });
 
   it("allows a source-scoped recovery owner to clear a stale blocked source issue", async () => {
@@ -1053,6 +1181,7 @@ describe("agent issue mutation checkout ownership", () => {
 
   it("refuses reopen/resume from a recovery handoff grant instead of transitioning a blocked issue", async () => {
     for (const transition of [{ reopen: true }, { resume: true }]) {
+      mockLogActivity.mockClear();
       mockIssueService.getById.mockResolvedValue(makeIssue({ status: "blocked", assigneeAgentId: peerAgentId }));
       mockAccessService.decide.mockImplementation(recoveryHandoffDecide);
 
@@ -1065,6 +1194,23 @@ describe("agent issue mutation checkout ownership", () => {
       expect(res.body.details).toMatchObject({ reason: "allow_recovery_handoff_grant" });
       expect(mockIssueService.addComment).not.toHaveBeenCalled();
       expect(mockIssueService.update).not.toHaveBeenCalled();
+      expect(mockLogActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue_write_denied",
+          entityType: "issue",
+          entityId: issueId,
+          details: expect.objectContaining({
+            attemptedAction: "issue:mutate",
+            reason: "deny_recovery_handoff_comment_only",
+            responseStatus: 403,
+          }),
+        }),
+        // Publication must be deferred past commit: `activity.logged` escapes the
+        // transaction, so an inline emit would race row visibility and survive a
+        // rollback as a phantom event.
+        { deferPublish: true },
+      );
     }
   });
 
@@ -1085,6 +1231,135 @@ describe("agent issue mutation checkout ownership", () => {
     const deleteRes = await request(await createApp(ownerActor()))
       .delete(`/api/issues/${issueId}`);
     expect(deleteRes.status, JSON.stringify(deleteRes.body)).toBe(403);
+    expect(mockIssueService.remove).not.toHaveBeenCalled();
+  });
+
+  // BLO-19094: a productivity review is assigned to a reviewer, but every
+  // remedy it can order (block / cancel / reassign / snooze) is a mutation of
+  // the SOURCE issue. Unlike the recovery handoff above, this grant therefore
+  // has to cover issue:mutate as well as issue:comment — a comment-only grant
+  // leaves the review able to detect and never able to fix.
+  const productivityReviewDecide = async (input: { action: string }) => ({
+    allowed: input.action === "issue:comment"
+      || input.action === "issue:mutate"
+      || input.action === "issue:read"
+      || input.action === "tasks:assign",
+    action: input.action,
+    reason: input.action === "issue:comment" || input.action === "issue:mutate"
+      ? "allow_productivity_review_grant"
+      : "allow_test_default",
+    explanation: "Allowed by an open productivity review the actor owns for this issue.",
+  });
+  const productivitySourceMutationAuditCalls = () =>
+    mockLogActivity.mock.calls.filter(([, entry]) =>
+      (entry as { action?: string }).action === "issue.productivity_review_source_mutation"
+    );
+
+  it("lets a productivity-review owner reassign a source issue pinned open by a paused assignee", async () => {
+    // The exact condition the review exists to catch: in_progress, held by an
+    // agent that will never run again to release it. Without the route-layer
+    // override this returns 409 "checked out by another agent" even once the
+    // authorization boundary allows the actor through.
+    //
+    // The paused assignee is mocked rather than merely asserted about because
+    // the point is that the route reaches the mutation WITHOUT the assignee
+    // ever running or being consulted for liveness. The DB-level paused/error
+    // coverage of the grant predicate itself lives in
+    // authorization-service.test.ts.
+    mockIssueService.getById.mockResolvedValue(makeIssue({
+      status: "in_progress",
+      assigneeAgentId: peerAgentId,
+    }));
+    mockAccessService.decide.mockImplementation(productivityReviewDecide);
+    mockAgentService.getById.mockResolvedValue(makeAgent(peerAgentId, { status: "paused" }));
+    mockAgentService.resolveByReference.mockResolvedValue({
+      ambiguous: false,
+      agent: makeAgent(ownerAgentId),
+    });
+
+    const res = await request(await createApp(ownerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "todo", assigneeAgentId: ownerAgentId });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      issueId,
+      expect.objectContaining({ status: "todo", assigneeAgentId: ownerAgentId }),
+    );
+    expect(productivitySourceMutationAuditCalls()).toHaveLength(1);
+    expect(productivitySourceMutationAuditCalls()[0]?.[1]).toMatchObject({
+      action: "issue.productivity_review_source_mutation",
+      entityId: issueId,
+      details: {
+        reviewerAgentId: ownerAgentId,
+        previousAssigneeAgentId: peerAgentId,
+        issueStatus: "in_progress",
+        changedFields: expect.arrayContaining(["status", "assigneeAgentId"]),
+      },
+    });
+    const auditCallIndex = mockLogActivity.mock.calls.findIndex(([, entry]) =>
+      (entry as { action?: string }).action === "issue.productivity_review_source_mutation"
+    );
+    expect(mockLogActivity.mock.invocationCallOrder[auditCallIndex]).toBeGreaterThan(
+      mockIssueService.update.mock.invocationCallOrder[0]!,
+    );
+  });
+
+  it("does not audit a productivity-review source mutation when the PATCH changes no issue fields", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({
+      status: "in_progress",
+      assigneeAgentId: peerAgentId,
+      title: "Owned active issue",
+    }));
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...makeIssue({
+        status: "in_progress",
+        assigneeAgentId: peerAgentId,
+        title: "Owned active issue",
+      }),
+      ...patch,
+    }));
+    mockAccessService.decide.mockImplementation(productivityReviewDecide);
+
+    const res = await request(await createApp(ownerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ title: "Owned active issue" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalled();
+    expect(productivitySourceMutationAuditCalls()).toHaveLength(0);
+  });
+
+  it("does not audit a productivity-review source mutation when the PATCH fails after authorization", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({
+      status: "in_progress",
+      assigneeAgentId: peerAgentId,
+    }));
+    mockIssueService.update.mockRejectedValueOnce(new Error("update failed"));
+    mockAccessService.decide.mockImplementation(productivityReviewDecide);
+
+    const res = await request(await createApp(ownerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "todo" });
+
+    expect(res.status).toBe(500);
+    expect(productivitySourceMutationAuditCalls()).toHaveLength(0);
+  });
+
+  it("keeps destructive routes closed to a productivity-review owner", async () => {
+    // Only PATCH /issues/:id opts into the reviewer override. DELETE shares the
+    // same mutation helper and must stay denied — an early return above the
+    // helper's per-route options is the bypass that sank PR #814.
+    mockIssueService.getById.mockResolvedValue(makeIssue({
+      status: "in_progress",
+      assigneeAgentId: peerAgentId,
+    }));
+    mockAccessService.decide.mockImplementation(productivityReviewDecide);
+
+    const deleteRes = await request(await createApp(ownerActor()))
+      .delete(`/api/issues/${issueId}`);
+
+    expect(deleteRes.status, JSON.stringify(deleteRes.body)).toBe(409);
     expect(mockIssueService.remove).not.toHaveBeenCalled();
   });
 
@@ -1238,6 +1513,377 @@ describe("agent issue mutation checkout ownership", () => {
     expect(res.body.error).toBe("Issue is outside this actor's authorization boundary (grant)");
     expect(res.body.details).toMatchObject({ reason: "deny_missing_grant", boundary: "grant" });
     expect(mockIssueService.addComment).not.toHaveBeenCalled();
+  });
+
+  // BLO-18996: the reported deadlock. A `stranded_assigned_issue` action named an owner
+  // who is not the source issue's assignee and whose run is checked out elsewhere, so
+  // `issue:comment` denied and the owner could not discharge the action it was woken
+  // for. The action stayed `active` and the sweep re-fired it indefinitely.
+  describe("source-scoped recovery owner comment grant (BLO-18996)", () => {
+    // The ordinary peer-agent fall-through: every allow-path missed, so `issue:comment`
+    // ends at `deny_missing_grant`. That is the one denial the recovery-owner grant may
+    // override; `denyCommentWithReason` below covers the ones it may not.
+    function denyCommentGrantEverywhere() {
+      denyCommentWithReason("deny_missing_grant");
+    }
+
+    // The owner's run id deliberately does not match the issue's checkout/execution run:
+    // that is the "checked out against a different issue" half of the reported shape, and
+    // it is what makes `isCurrentIssueExecutionRun` fall through to the boundary check.
+    const recoveryOwnerActor = () => peerActor({ runId: "9a9a9a9a-9a9a-4a9a-8a9a-9a9a9a9a9a9a" });
+
+    it("lets the owner of an active recovery action comment on its source issue", async () => {
+      denyCommentGrantEverywhere();
+      mockIssueService.getById.mockResolvedValue(makeIssue({
+        checkoutRunId: ownerRunId,
+        executionRunId: ownerRunId,
+      }) as never);
+      mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(
+        makeRecoveryAction({ ownerAgentId: peerAgentId }) as never,
+      );
+
+      const res = await request(await createApp(recoveryOwnerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "I cannot restore this; escalating." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(mockIssueService.addComment).toHaveBeenCalledWith(
+        issueId,
+        "I cannot restore this; escalating.",
+        expect.any(Object),
+        expect.any(Object),
+      );
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("still rejects an agent who is not the named recovery owner", async () => {
+      denyCommentGrantEverywhere();
+      mockIssueService.getById.mockResolvedValue(makeIssue({
+        checkoutRunId: ownerRunId,
+        executionRunId: ownerRunId,
+      }) as never);
+      mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(
+        makeRecoveryAction({ ownerAgentId: staleAgentId }) as never,
+      );
+
+      const res = await request(await createApp(recoveryOwnerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "Not my recovery action." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe("Issue is outside this actor's authorization boundary (grant)");
+      expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    });
+
+    it("does not admit a recovery action whose owner is unset", async () => {
+      denyCommentGrantEverywhere();
+      mockIssueService.getById.mockResolvedValue(makeIssue({
+        checkoutRunId: ownerRunId,
+        executionRunId: ownerRunId,
+      }) as never);
+      mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(
+        makeRecoveryAction({ ownerAgentId: null, ownerType: "board" }) as never,
+      );
+
+      const res = await request(await createApp(recoveryOwnerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "Board-owned action; not mine." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    });
+
+    // Ally's review of PR #837 (suggestion 2): the lookup ran unguarded inside the
+    // denial branch, so a transient failure surfaced as an unlabelled 500 instead of
+    // the ordinary 403 the caller would have received anyway. It must fail CLOSED —
+    // an unreadable action grants nothing — and stay diagnosable in logs via the
+    // `recovery_lookup_failed` discriminator the sibling checkout path already uses.
+    it("fails closed with a plain 403 when the recovery-action lookup errors", async () => {
+      denyCommentGrantEverywhere();
+      mockIssueService.getById.mockResolvedValue(makeIssue({
+        checkoutRunId: ownerRunId,
+        executionRunId: ownerRunId,
+      }) as never);
+      mockIssueRecoveryActionService.getActiveForIssue.mockRejectedValue(new Error("database timeout"));
+
+      const res = await request(await createApp(recoveryOwnerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "Owner comment during a lookup outage." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe("Issue is outside this actor's authorization boundary (grant)");
+      expect(mockIssueService.addComment).not.toHaveBeenCalled();
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    // Ally's review of PR #837: the admission originally sat in a bare
+    // `if (!boundaryDecision.allowed)`, so it overrode EVERY denial reason — a low-trust
+    // actor scoped to an explicit trust boundary could step outside it just by being the
+    // named owner of an active recovery action. The grant is now gated on the single
+    // ordinary peer-agent fall-through reason (`deny_missing_grant`), so a hard denial
+    // stays terminal. Each of these actors IS the named owner; only the reason differs.
+    function denyCommentWithReason(reason: string) {
+      mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+        allowed: input.action === "issue:read",
+        action: input.action,
+        reason: input.action === "issue:read" ? "allow_explicit_grant" : reason,
+        explanation: input.action === "issue:read" ? "Allowed by test read grant." : "Denied by test.",
+      }));
+    }
+
+    it.each([
+      ["deny_low_trust_boundary", "trust-boundary"],
+      ["deny_policy_restricted", "trust-boundary"],
+      ["deny_scope", "scope"],
+      ["deny_missing_membership", "membership"],
+      ["deny_company_boundary", "company-mismatch"],
+    ])("does not let the recovery owner grant override a %s denial", async (reason, label) => {
+      denyCommentWithReason(reason);
+      mockIssueService.getById.mockResolvedValue(makeIssue({
+        checkoutRunId: ownerRunId,
+        executionRunId: ownerRunId,
+      }) as never);
+      mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(
+        makeRecoveryAction({ ownerAgentId: peerAgentId }) as never,
+      );
+
+      const res = await request(await createApp(recoveryOwnerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "Owner of the action, but denied for a harder reason." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe(`Issue is outside this actor's authorization boundary (${label})`);
+      expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    });
+
+    // The complement of the case above: the grant must still do its job for the ordinary
+    // missing-grant denial, which is the deadlock this whole change exists to break.
+    it("still admits the recovery owner on the ordinary missing-grant denial", async () => {
+      denyCommentWithReason("deny_missing_grant");
+      mockIssueService.getById.mockResolvedValue(makeIssue({
+        checkoutRunId: ownerRunId,
+        executionRunId: ownerRunId,
+      }) as never);
+      mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(
+        makeRecoveryAction({ ownerAgentId: peerAgentId }) as never,
+      );
+
+      const res = await request(await createApp(recoveryOwnerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "Discharging the recovery action." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(mockIssueService.addComment).toHaveBeenCalled();
+    });
+
+    // The grant is comment-only on EVERY status, not just closed ones. `blocked` is the
+    // case that matters: it is what a source-scoped recovery action normally leaves its
+    // source issue in, `isExplicitResumeCapableStatus` accepts it, and the only guard that
+    // used to stand between the grant and a `blocked` -> `todo` transition was
+    // `assertExplicitResumeIntentAllowed` — a state/intent check, not an authorization one.
+    // `getDependencyReadiness` is pinned to zero unresolved blockers on purpose, so the
+    // refusal has to come from authorization rather than from the dependency 409
+    // incidentally covering for it. Asserting the consequence (no move to `todo`) rather
+    // than only the status code.
+    it.each([["blocked"], ["done"], ["cancelled"], ["todo"], ["in_progress"]])(
+      "does not let the recovery owner reopen a %s source issue via the comment grant",
+      async (status) => {
+        denyCommentGrantEverywhere();
+        mockIssueService.getById.mockResolvedValue(makeIssue({
+          status,
+          checkoutRunId: ownerRunId,
+          executionRunId: ownerRunId,
+        }) as never);
+        mockIssueService.getDependencyReadiness.mockResolvedValue({
+          unresolvedBlockerCount: 0,
+          unresolvedBlockerIssueIds: [],
+        } as never);
+        mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(
+          makeRecoveryAction({ ownerAgentId: peerAgentId }) as never,
+        );
+
+        const res = await request(await createApp(recoveryOwnerActor()))
+          .post(`/api/issues/${issueId}/comments`)
+          .send({ body: "Reopening this.", reopen: true });
+
+        expect(res.status, JSON.stringify(res.body)).toBe(403);
+        expect(res.body.error).toBe("Recovery owner grant is comment-only");
+        expect(res.body.details?.reason).toBe("allow_source_scoped_recovery_owner");
+        expect(mockIssueService.addComment).not.toHaveBeenCalled();
+        // The consequence the guard exists to prevent: the issue must not be carried to `todo`.
+        expect(mockIssueService.update).not.toHaveBeenCalled();
+      },
+    );
+
+    // THE test that proves the hole rather than the error string. The peer refusal inside
+    // `assertExplicitResumeIntentAllowed` ("Agent cannot request follow-up for another
+    // agent's issue", routes/issues.ts:4613) is what stopped the plain-peer cases above, so
+    // those only ever proved a message change. It is short-circuited by
+    // `hasActiveCheckoutManagementOverride` -> `tasks:manage_active_checkouts`, which is
+    // exactly the action `allow_manager_chain` is wired to — and the reported BLO-18996
+    // instance named the assignee's *manager* (the CEO) as recovery owner. Manager comments
+    // now receive that production grant before the recovery-owner fallback is considered, so
+    // this case must exercise the creator/manager comment-only guard. The plain-peer case above
+    // remains the end-to-end regression for `allow_source_scoped_recovery_owner`.
+    it("does not let a manager recovery owner reopen a blocked source issue to todo", async () => {
+      mockAccessService.decide.mockImplementation(async (input: { action: string }) => {
+        const allowed =
+          input.action === "issue:read" ||
+          input.action === "issue:comment" ||
+          input.action === "tasks:manage_active_checkouts";
+        return {
+          allowed,
+          action: input.action,
+          reason: input.action === "issue:comment" || input.action === "tasks:manage_active_checkouts"
+            ? "allow_manager_chain"
+            : allowed
+              ? "allow_explicit_grant"
+              : "deny_missing_grant",
+          explanation: allowed ? "Allowed by test manager override." : "Denied by test.",
+        };
+      });
+      mockIssueService.getById.mockResolvedValue(makeIssue({
+        status: "blocked",
+        checkoutRunId: ownerRunId,
+        executionRunId: ownerRunId,
+      }) as never);
+      mockIssueService.getDependencyReadiness.mockResolvedValue({
+        unresolvedBlockerCount: 0,
+        unresolvedBlockerIssueIds: [],
+      } as never);
+      mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(
+        makeRecoveryAction({ ownerAgentId: peerAgentId }) as never,
+      );
+
+      const res = await request(await createApp(recoveryOwnerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "Reopening this.", reopen: true });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe("Creator/manager comment grant is comment-only");
+      expect(res.body.details?.reason).toBe("allow_manager_chain");
+      // The consequence: the source issue must never be carried to `todo` by the grant.
+      expect(mockIssueService.update).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ status: "todo" }),
+      );
+    });
+
+    // `resume` is the other half of the same door; neutering only `reopen` would leave it open.
+    it("does not let the recovery owner resume a blocked source issue via the comment grant", async () => {
+      denyCommentGrantEverywhere();
+      mockIssueService.getById.mockResolvedValue(makeIssue({
+        status: "blocked",
+        checkoutRunId: ownerRunId,
+        executionRunId: ownerRunId,
+      }) as never);
+      mockIssueService.getDependencyReadiness.mockResolvedValue({
+        unresolvedBlockerCount: 0,
+        unresolvedBlockerIssueIds: [],
+      } as never);
+      mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(
+        makeRecoveryAction({ ownerAgentId: peerAgentId }) as never,
+      );
+
+      const res = await request(await createApp(recoveryOwnerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "Resuming this.", resume: true });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe("Recovery owner grant is comment-only");
+      expect(mockIssueService.addComment).not.toHaveBeenCalled();
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    // Ally review: the sibling recovery-handoff refusal directly above records,
+    // this one did not — so a recovery owner sending `reopen`/`resume` lost its
+    // attempted comment entirely, which is the exact loss AC3 exists to stop.
+    // The body is the recoverable evidence here: the refusal is about the
+    // status intent, not about the prose the owner was trying to leave.
+    it("records the recovery-owner comment-only refusal so the attempted body survives", async () => {
+      denyCommentGrantEverywhere();
+      mockIssueService.getById.mockResolvedValue(makeIssue({
+        status: "blocked",
+        checkoutRunId: ownerRunId,
+        executionRunId: ownerRunId,
+      }) as never);
+      mockIssueService.getDependencyReadiness.mockResolvedValue({
+        unresolvedBlockerCount: 0,
+        unresolvedBlockerIssueIds: [],
+      } as never);
+      mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(
+        makeRecoveryAction({ ownerAgentId: peerAgentId }) as never,
+      );
+
+      const res = await request(await createApp(recoveryOwnerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "Discharge evidence that must not be lost.", resume: true, apiKey: "sk-should-be-redacted" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe("Recovery owner grant is comment-only");
+
+      const call = mockLogActivity.mock.calls.find(
+        ([, entry]) => (entry as { action?: string }).action === "issue_write_denied",
+      );
+      expect(call, "expected an issue_write_denied record for the recovery-owner refusal").toBeTruthy();
+      const details = (call![1] as { details: Record<string, unknown> }).details;
+      expect(details).toMatchObject({
+        attemptedAction: "issue:mutate",
+        reason: "deny_recovery_owner_comment_only",
+        responseStatus: 403,
+        quarantined: true,
+      });
+      // Bounded + redacted, same contract as every other recorded denial.
+      const serialized = JSON.stringify(details);
+      expect(serialized).toContain("Discharge evidence that must not be lost.");
+      expect(serialized).not.toContain("sk-should-be-redacted");
+      expect(Buffer.byteLength(serialized, "utf8")).toBeLessThanOrEqual(16000);
+    });
+
+    // The refusal must not swallow the grant's actual purpose: a plain comment on a
+    // `blocked` source issue — the exact discharge path BLO-18996 exists to restore —
+    // still has to land.
+    it("still lets the recovery owner comment on a blocked source issue without reopen", async () => {
+      denyCommentGrantEverywhere();
+      mockIssueService.getById.mockResolvedValue(makeIssue({
+        status: "blocked",
+        checkoutRunId: ownerRunId,
+        executionRunId: ownerRunId,
+      }) as never);
+      mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(
+        makeRecoveryAction({ ownerAgentId: peerAgentId }) as never,
+      );
+
+      const res = await request(await createApp(recoveryOwnerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "I cannot restore this; escalating." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(mockIssueService.addComment).toHaveBeenCalled();
+    });
+
+    // Company isolation fires earlier than the grant (the issue is not even resolvable
+    // for a foreign-company actor), so the grant can never be the thing that admits one.
+    it("does not admit a cross-company actor through the recovery owner grant", async () => {
+      denyCommentGrantEverywhere();
+      mockIssueService.getById.mockResolvedValue(makeIssue({
+        checkoutRunId: ownerRunId,
+        executionRunId: ownerRunId,
+      }) as never);
+      mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(
+        makeRecoveryAction({ ownerAgentId: peerAgentId }) as never,
+      );
+
+      const res = await request(await createApp(peerActor({
+        companyId: "88888888-8888-4888-8888-888888888888",
+        runId: "9a9a9a9a-9a9a-4a9a-8a9a-9a9a9a9a9a9a",
+      })))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "Different company." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(404);
+      expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    });
   });
 
   // BLO-19087: an @-mention fires an `issue_comment_mentioned` wake with no gate
@@ -1440,88 +2086,6 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
-  // BLO-18163: a CEO-role actor patching only the coordination-metadata
-  // allowlist (blockedByIssueIds here) must bypass the "another agent owns
-  // this issue" ownership check below, since that check is exactly what
-  // previously left the CEO with no route to clear a stale blocker edge.
-  it("allows a CEO's coordination-metadata-only PATCH to bypass the assignee ownership check", async () => {
-    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "todo", assigneeAgentId: ownerAgentId }));
-    mockIssueService.getRelationSummaries.mockResolvedValue({ blockedBy: [], blocks: [] });
-    mockIssueService.update.mockResolvedValue(
-      makeIssue({ status: "todo", assigneeAgentId: ownerAgentId, blockedByIssueIds: [] }),
-    );
-    mockAccessService.decide.mockImplementation(async (input: { action: string; scope?: Record<string, unknown> }) => {
-      if (input.action === "issue:read") {
-        return { allowed: true, action: input.action, reason: "allow_company_agent", explanation: "read." };
-      }
-      if (input.action === "issue:mutate" && input.scope?.coordinationMetadataOnly === true) {
-        return { allowed: true, action: input.action, reason: "allow_ceo_coordination_metadata", explanation: "ceo." };
-      }
-      return { allowed: false, action: input.action, reason: "deny_missing_grant", explanation: "denied." };
-    });
-
-    const res = await request(await createApp(ceoActor()))
-      .patch(`/api/issues/${issueId}`)
-      .send({ blockedByIssueIds: [] });
-
-    expect(res.status, JSON.stringify(res.body)).toBe(200);
-    expect(mockIssueService.update).toHaveBeenCalled();
-  });
-
-  it("lets CEO coordination metadata bypass a foreign recovery-action owner guard", async () => {
-    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "todo", assigneeAgentId: ownerAgentId }));
-    mockIssueService.getRelationSummaries.mockResolvedValue({ blockedBy: [], blocks: [] });
-    mockIssueService.update.mockResolvedValue(
-      makeIssue({ status: "todo", assigneeAgentId: ownerAgentId, blockedByIssueIds: [] }),
-    );
-    mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(makeRecoveryAction({
-      ownerAgentId: staleAgentId,
-    }) as never);
-    mockAccessService.decide.mockImplementation(async (input: { action: string; scope?: Record<string, unknown> }) => {
-      if (input.action === "issue:read") {
-        return { allowed: true, action: input.action, reason: "allow_company_agent", explanation: "read." };
-      }
-      if (input.action === "issue:mutate" && input.scope?.coordinationMetadataOnly === true) {
-        return { allowed: true, action: input.action, reason: "allow_ceo_coordination_metadata", explanation: "ceo." };
-      }
-      return { allowed: false, action: input.action, reason: "deny_missing_grant", explanation: "denied." };
-    });
-
-    const res = await request(await createApp(ceoActor()))
-      .patch(`/api/issues/${issueId}`)
-      .send({ blockedByIssueIds: [] });
-
-    expect(res.status, JSON.stringify(res.body)).toBe(200);
-    expect(mockIssueService.update).toHaveBeenCalledWith(
-      issueId,
-      expect.objectContaining({
-        blockedByIssueIds: [],
-        actorAgentId: ceoAgentId,
-      }),
-    );
-  });
-
-  it("does not treat a body carrying work content as coordination-metadata-only, even for the CEO", async () => {
-    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "todo", assigneeAgentId: ownerAgentId }));
-    mockAccessService.decide.mockImplementation(async (input: { action: string; scope?: Record<string, unknown> }) => {
-      if (input.action === "issue:read") {
-        return { allowed: true, action: input.action, reason: "allow_company_agent", explanation: "read." };
-      }
-      if (input.action === "issue:mutate" && input.scope?.coordinationMetadataOnly === true) {
-        return { allowed: true, action: input.action, reason: "allow_ceo_coordination_metadata", explanation: "ceo." };
-      }
-      return { allowed: false, action: input.action, reason: "deny_missing_grant", explanation: "denied." };
-    });
-
-    const res = await request(await createApp(ceoActor()))
-      .patch(`/api/issues/${issueId}`)
-      .send({ blockedByIssueIds: [], title: "Rewritten by the CEO" });
-
-    expect(res.status, JSON.stringify(res.body)).toBe(403);
-    expect(res.body.error).toBe("Issue is outside this actor's authorization boundary (grant)");
-    expect(mockIssueService.update).not.toHaveBeenCalled();
-  });
-
   it("falls back to task assignment authorization when recovery checkout authorization lookup fails", async () => {
     mockIssueService.getById.mockResolvedValue(makeIssue({ status: "blocked", assigneeAgentId: ownerAgentId }));
     mockIssueRecoveryActionService.getActiveForIssue.mockRejectedValue(new Error("database timeout"));
@@ -1704,6 +2268,44 @@ describe("agent issue mutation checkout ownership", () => {
     expect(res.body.error).toBe("Agent run id required");
     expect(mockIssueService.assertCheckoutOwner).not.toHaveBeenCalled();
     expect(mockIssueService.addComment).not.toHaveBeenCalled();
+  });
+
+  it("records the missing-run-id comment denial so the assignee's own content stays recoverable", async () => {
+    // This denial fires only when the issue is in_progress AND assigned to the
+    // actor, so it is an authenticated agent commenting on its own active issue.
+    // It used to share a branch with `agent_auth_required` — which genuinely
+    // cannot be recorded, having no agentId to attribute — and so responded 401
+    // and dropped the body. A dropped 401 loses the comment exactly the way a
+    // dropped 403 does, and this is the payload most worth keeping.
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+      allowed: input.action === "issue:comment" || input.action === "issue:read",
+      action: input.action,
+      reason: "allow_test_default",
+      explanation: "Allowed by missing-run-id recording regression test.",
+    }));
+    const app = await createApp({ ...ownerActor(), runId: undefined });
+
+    const res = await request(app)
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ body: "diagnosis worth preserving" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(401);
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    const denied = mockLogActivity.mock.calls
+      .map(([, entry]) => entry as {
+        action?: string;
+        runId?: string | null;
+        details?: { attemptedAction?: string; reason?: string; responseStatus?: number; payload?: unknown };
+      })
+      .filter((entry) => entry.action === "issue_write_denied");
+    expect(denied, "the 401 comment denial must leave a recovery record").toHaveLength(1);
+    expect(denied[0].details).toMatchObject({
+      attemptedAction: "issue:comment",
+      reason: "deny_missing_run_id",
+      responseStatus: 401,
+    });
+    expect(denied[0].runId, "no run id is exactly why this denied").toBeNull();
+    expect(JSON.stringify(denied[0].details?.payload)).toContain("diagnosis worth preserving");
   });
 
   it("still enforces checkout run ownership for same-assignee state mutations", async () => {
@@ -1925,6 +2527,233 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueService.create).not.toHaveBeenCalled();
     expect(mockIssueService.createChild).not.toHaveBeenCalled();
     expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("records cheap status-only recovery profile PATCH denials with redacted payload", async () => {
+    const app = await createApp(
+      ownerActor(),
+      createRunContextDb({
+        modelProfile: "cheap",
+        recoveryIntent: "status_only",
+        allowDeliverableWork: false,
+        allowDocumentUpdates: false,
+        resumeRequiresNormalModel: true,
+      }),
+    );
+
+    const res = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        assigneeAdapterOverrides: { modelProfile: "cheap" },
+        comment: "Authorization: Bearer sk-cheap-secret-value",
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        companyId,
+        actorType: "agent",
+        actorId: ownerAgentId,
+        action: "issue_write_denied",
+        entityType: "issue",
+        entityId: issueId,
+        issueId,
+        details: expect.objectContaining({
+          attemptedAction: "issue:mutate",
+          reason: "deny_cheap_recovery_profile",
+          responseStatus: 403,
+          quarantined: true,
+        }),
+      }),
+      // Publication must be deferred past commit: `activity.logged` escapes the
+      // transaction, so an inline emit would race row visibility and survive a
+      // rollback as a phantom event.
+      { deferPublish: true },
+    );
+    const call = mockLogActivity.mock.calls.find(
+      ([, entry]) => (entry as { action?: string }).action === "issue_write_denied"
+        && (entry as { details?: { reason?: string } }).details?.reason === "deny_cheap_recovery_profile",
+    );
+    expect(call, "expected an issue_write_denied log entry for cheap profile denial").toBeTruthy();
+    const payload = (call![1] as { details: { payload: unknown } }).details.payload;
+    const serializedPayload = JSON.stringify(payload);
+    expect(serializedPayload).not.toContain("sk-cheap-secret-value");
+    expect(serializedPayload).toContain(REDACTED_EVENT_VALUE);
+  });
+
+  // Emulates the activity_log rows `hasRecentDeniedIssueWriteLog` reads back,
+  // applying the same discriminators its SQL predicate does: a stored row counts
+  // as a duplicate only when every value the predicate binds is present. So if
+  // the route stops keying on one of them, it stops suppressing here too — which
+  // is what makes these regression tests for the dedupe *key* and aggregate
+  // bound, not merely for the early-return.
+  function cheapRecoveryDedupeHarness(seedRows: Partial<{
+    id: string;
+    attemptedAction: string;
+    reason: string;
+    responseStatus: number;
+    payloadFingerprint: string;
+    createdAt: Date;
+  }>[] = [], options: { failAggregateLookup?: boolean } = {}) {
+    const recorded: {
+      id: string;
+      attemptedAction: string;
+      reason: string;
+      responseStatus: number;
+      payloadFingerprint: string;
+      createdAt: Date;
+    }[] = seedRows.map((row, index) => ({
+      id: row.id ?? `seed-denied-write-${index}`,
+      attemptedAction: row.attemptedAction ?? "issue:mutate",
+      reason: row.reason ?? "deny_cheap_recovery_profile",
+      responseStatus: row.responseStatus ?? 403,
+      payloadFingerprint: row.payloadFingerprint ?? `seed-payload-fingerprint-${index}`,
+      createdAt: row.createdAt ?? new Date(),
+    }));
+    const lookups: { kind: DeniedWriteLookupKind; params: unknown[] }[] = [];
+    mockLogActivity.mockImplementation((async (_db: unknown, entry: unknown) => {
+      const typed = entry as { action?: string; details?: Record<string, unknown> };
+      if (typed.action === "issue_write_denied" && typed.details) {
+        recorded.push({
+          id: `recorded-denied-write-${recorded.length}`,
+          attemptedAction: String(typed.details.attemptedAction),
+          reason: String(typed.details.reason),
+          responseStatus: Number(typed.details.responseStatus),
+          payloadFingerprint: String(typed.details.payloadFingerprint),
+          createdAt: new Date(),
+        });
+      }
+      return undefined;
+    }) as never);
+    const recentRows = (where: unknown) => {
+      const params = collectSqlParams(where);
+      const windowStart = params.find((param): param is Date => param instanceof Date) ?? new Date(0);
+      return recorded.filter((row) => row.createdAt >= windowStart);
+    };
+    const deniedWriteLookup: DeniedWriteLookupStub = {
+      onLookup: (where, kind) => lookups.push({ kind, params: collectSqlParams(where) }),
+      rowsFor: (where, kind) => {
+        const params = collectSqlParams(where);
+        if (kind === "aggregate") {
+          // Models an unhealthy database on the one query that enforces the
+          // bound. Recording must drop rather than insert unbounded.
+          if (options.failAggregateLookup) throw new Error("simulated aggregate bound lookup failure");
+          return recentRows(where).map((row) => ({ deniedWriteId: row.id }));
+        }
+        const duplicate = recorded.some((row) => params.includes(row.attemptedAction)
+          && params.includes(row.reason)
+          && params.includes(String(row.responseStatus))
+          && params.includes(row.payloadFingerprint)
+          && recentRows(where).includes(row));
+        return duplicate ? [{ entityId: issueId }] : [];
+      },
+    };
+    const cheapProfile = {
+      modelProfile: "cheap",
+      recoveryIntent: "status_only",
+      allowDeliverableWork: false,
+      allowDocumentUpdates: false,
+      resumeRequiresNormalModel: true,
+    };
+    const denyPatch = async (comment: string) => {
+      const app = await createApp(
+        ownerActor(),
+        createRunContextDb(cheapProfile, ownerAgentId, ownerRunId, deniedWriteLookup),
+      );
+      const res = await request(app)
+        .patch(`/api/issues/${issueId}`)
+        .send({ assigneeAdapterOverrides: { modelProfile: "cheap" }, comment });
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      return res;
+    };
+    return { recorded, lookups, denyPatch };
+  }
+
+  it("suppresses an exact repeat denial inside the window but records one whose payload differs", async () => {
+    const { recorded, denyPatch } = cheapRecoveryDedupeHarness();
+
+    await denyPatch("first denied diagnosis");
+    expect(recorded).toHaveLength(1);
+
+    // Same actor, run, target, action, reason and status, same body: a true
+    // repeat, and the only case dedupe should collapse.
+    await denyPatch("first denied diagnosis");
+    expect(recorded, "an identical repeat must not add a second recovery row").toHaveLength(1);
+
+    // Differing content is different recoverable evidence. AC3 exists to keep
+    // the payload, so this must record even though every other key matches.
+    await denyPatch("second, materially different diagnosis");
+    expect(recorded, "a denial with a different payload must still be recorded").toHaveLength(2);
+    expect(recorded[0].payloadFingerprint).not.toBe(recorded[1].payloadFingerprint);
+  });
+
+  it("keys the dedupe lookup on every discriminator it records", async () => {
+    const { recorded, lookups, denyPatch } = cheapRecoveryDedupeHarness();
+
+    await denyPatch("denied diagnosis");
+
+    expect(recorded).toHaveLength(1);
+    const [row] = recorded;
+    expect(row.reason).toBe("deny_cheap_recovery_profile");
+    expect(row.responseStatus).toBe(403);
+    expect(row.payloadFingerprint).toMatch(/^[\w-]{24}$/);
+
+    // The recorded row and the predicate must agree on both key names and
+    // values. Comparing them is the only thing that catches a rename on one
+    // side: the lookup fails open, so a predicate that silently matches nothing
+    // records without bound instead of erroring.
+    const exactLookup = lookups.find((lookup) => lookup.kind === "exact");
+    expect(exactLookup).toBeTruthy();
+    const params = exactLookup!.params;
+    expect(params).toContain("attemptedAction");
+    expect(params).toContain("reason");
+    expect(params).toContain("responseStatus");
+    expect(params).toContain("payloadFingerprint");
+    expect(params).toContain(row.attemptedAction);
+    expect(params).toContain(row.reason);
+    expect(params).toContain(String(row.responseStatus));
+    expect(params).toContain(row.payloadFingerprint);
+    expect(params, "dedupe must be scoped to the acting run").toContain(ownerRunId);
+    expect(params).toContain(issueId);
+  });
+
+  it("caps varied denied-write recovery rows for the same actor and issue inside the window", async () => {
+    const { recorded, denyPatch } = cheapRecoveryDedupeHarness();
+
+    for (let index = 0; index < 7; index += 1) {
+      await denyPatch(`distinct denied diagnosis ${index}`);
+    }
+
+    expect(recorded).toHaveLength(5);
+    expect(new Set(recorded.map((row) => row.payloadFingerprint)).size).toBe(5);
+  });
+
+  // The aggregate bound is the only thing capping how much payload a denied
+  // actor can cause to be written, so when it cannot be evaluated the record
+  // has to drop. The previous shape caught the failure and inserted anyway,
+  // which disabled the bound exactly when the database was unhealthy.
+  it("records nothing when the aggregate bound lookup fails", async () => {
+    const { recorded, denyPatch } = cheapRecoveryDedupeHarness([], { failAggregateLookup: true });
+
+    await denyPatch("denied diagnosis while the bound is unavailable");
+
+    expect(recorded, "a denial must not be recorded when its bound cannot be enforced").toHaveLength(0);
+  });
+
+  it("does not let out-of-window denied-write rows trip the aggregate cap", async () => {
+    const staleCreatedAt = new Date(Date.now() - (5 * 60_000) - 1_000);
+    const seedRows = Array.from({ length: 5 }, (_, index) => ({
+      id: `stale-denied-write-${index}`,
+      createdAt: staleCreatedAt,
+    }));
+    const { recorded, denyPatch } = cheapRecoveryDedupeHarness(seedRows);
+
+    await denyPatch("fresh denied diagnosis after stale aggregate rows");
+
+    expect(recorded).toHaveLength(6);
+    expect(recorded.at(-1)?.createdAt.getTime()).toBeGreaterThan(staleCreatedAt.getTime());
   });
 
   it("defaults agent-created root follow-up issues to inherit the current run workspace", async () => {
@@ -2570,6 +3399,32 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueService.assertCheckoutOwner).not.toHaveBeenCalled();
     expect(mockIssueService.update).not.toHaveBeenCalled();
     expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        companyId,
+        actorType: "agent",
+        actorId: peerAgentId,
+        action: "issue_write_denied",
+        entityType: "issue",
+        entityId: issueId,
+        issueId,
+        details: expect.objectContaining({
+          attemptedAction: "issue:mutate",
+          reason: "deny_assignee_mismatch",
+          boundaryReason: "allow_company_agent",
+          responseStatus: 403,
+          quarantined: true,
+          payload: expect.objectContaining({
+            title: `${status[0]!.toUpperCase()}${status.slice(1)} update`,
+          }),
+        }),
+      }),
+      // Publication must be deferred past commit: `activity.logged` escapes the
+      // transaction, so an inline emit would race row visibility and survive a
+      // rollback as a phantom event.
+      { deferPublish: true },
+    );
   });
 
   it("allows same-company agent mutations on unassigned in-progress issues", async () => {
@@ -3012,6 +3867,7 @@ describe("agent issue mutation checkout ownership", () => {
       watchdogIssueId?: string | null;
       ancestryParentId?: string | null;
       watchdogRows?: Record<string, unknown>[];
+      deniedWriteLookup?: DeniedWriteLookupStub;
     } = {}) {
       const watchedIssueId = options.watchedIssueId ?? issueId;
       const runRows = [{
@@ -3044,21 +3900,35 @@ describe("agent issue mutation checkout ownership", () => {
         return [{ id: peerAgentId, companyId, permissions: {}, role: "engineer", reportsTo: null }];
       };
       const buildQuery = (selection: Record<string, unknown>) => {
-        const whereResult = {
+        const makeWhereResult = (where: unknown) => ({
           orderBy: vi.fn(async () => []),
+          // Same `hasRecentDeniedIssueWriteLog` lookup as the top-level factory.
+          // It must not fall through to `rowsForSelection`, which would collide
+          // with the ancestry-row branch above via the shared "parentId" key.
+          limit: deniedWriteLookupLimitStub(selection, where, options.deniedWriteLookup ?? {}),
           then: async (resolve: (rows: unknown[]) => unknown) => resolve(rowsForSelection(selection)),
-        };
+        });
         const query = {
           innerJoin: vi.fn(() => query),
-          where: vi.fn(() => whereResult),
+          where: vi.fn((where: unknown) => makeWhereResult(where)),
         };
         return query;
       };
+      const select = vi.fn((selection: Record<string, unknown> = {}) => ({
+        from: vi.fn(() => buildQuery(selection)),
+      }));
+      // Denial recording enforces its aggregate bound inside `db.transaction`
+      // and fails closed, so a stub transaction that hands back an unusable
+      // executor records nothing at all — see the top-level factory.
+      const tx = {
+        execute: vi.fn(async () => undefined),
+        select,
+        insert: vi.fn(() => ({ values: vi.fn(async () => undefined) })),
+      };
       return {
-        transaction: async (callback: (tx: Record<string, never>) => Promise<unknown>) => callback({}),
-        select: vi.fn((selection: Record<string, unknown> = {}) => ({
-          from: vi.fn(() => buildQuery(selection)),
-        })),
+        transaction: async (callback: (tx: unknown) => Promise<unknown>) => callback(tx),
+        execute: tx.execute,
+        select,
       };
     }
 
@@ -3362,6 +4232,23 @@ describe("agent issue mutation checkout ownership", () => {
       expect(patchRes.body.error).toBe("Task-watchdog run context is not backed by an active persisted watchdog.");
       expect(mockIssueService.addComment).not.toHaveBeenCalled();
       expect(mockIssueService.update).not.toHaveBeenCalled();
+      const deniedWriteLogs = mockLogActivity.mock.calls
+        .map(([, entry]) => entry as { action?: string; details?: { attemptedAction?: string; reason?: string } })
+        .filter((entry) => entry.action === "issue_write_denied");
+      expect(deniedWriteLogs).toEqual([
+        expect.objectContaining({
+          details: expect.objectContaining({
+            attemptedAction: "issue:comment",
+            reason: "deny_task_watchdog_scope",
+          }),
+        }),
+        expect.objectContaining({
+          details: expect.objectContaining({
+            attemptedAction: "issue:mutate",
+            reason: "deny_task_watchdog_scope",
+          }),
+        }),
+      ]);
     });
   });
 

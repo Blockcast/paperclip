@@ -13,6 +13,11 @@ platform cannot resolve automatically. Each runbook should be:
 
 ## Index
 
+- [`agent-wakeup-terminal-failed.md`](agent-wakeup-terminal-failed.md) — a
+  PR-review wake left terminal at `agent_wakeup_requests.status='failed'`,
+  which nothing re-drives: decide re-review vs accept without double-posting a
+  review. Trigger: alert `PaperclipPrReviewWakeTerminalFailed`, or
+  `paperclip_agent_wakeup_terminal_failed_unresolved{scope="pr_review"} > 0`.
 - [`clear-polluted-ssh-workspace.md`](clear-polluted-ssh-workspace.md) —
   recover a stranded SSH-driven run whose workspace import is failing on a
   sibling task's leftover scratch state. Trigger: blocked issue auto-comment

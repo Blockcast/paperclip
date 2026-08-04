@@ -14,16 +14,31 @@ const generalServerShardDurations = loadShardDurations(
 const serverRoot = path.join(repoRoot, "server");
 const serverSrcDir = path.join(repoRoot, "server", "src");
 const serverTestsDir = path.join(repoRoot, "server", "src", "__tests__");
+// Every non-server project that CI must execute. This list is NOT derived from
+// the root vitest.config.ts `projects` array -- it is a second, independent
+// enumeration, and `--mode general` only ever runs `--project <name>` for the
+// names below. A package that is added to vitest.config.ts but not here is
+// therefore invisible to CI: it reports green because nothing ran it. That is
+// exactly how packages/mcp-server's suites went unexecuted (BLO-20076).
+// vitest-project-coverage.test.mjs holds the two lists in sync; add new
+// packages to BOTH files.
 const nonServerProjects = [
   "@paperclipai/shared",
   "@paperclipai/skills-catalog",
   "@paperclipai/db",
   "@paperclipai/adapter-utils",
+  "@paperclipai/adapter-claude-local",
   "@paperclipai/adapter-codex-local",
+  "@paperclipai/adapter-cursor-cloud",
+  "@paperclipai/adapter-cursor-local",
+  "@paperclipai/adapter-gemini-local",
+  "@paperclipai/adapter-grok-local",
   "@paperclipai/adapter-opencode-local",
+  "@paperclipai/adapter-pi-local",
   "@paperclipai/plugin-sdk",
   "@paperclipai/create-paperclip-plugin",
   "@paperclipai/mcp-external",
+  "@paperclipai/mcp-server",
   "@paperclipai/ui",
   "paperclipai",
 ];
@@ -434,6 +449,9 @@ if (options.dryRun) {
         shardCount: options.shardCount,
         group: options.group,
         availableGeneralGroups: generalGroupNames,
+        nonServerProjects,
+        generalWorkspacesAProjects,
+        generalWorkspacesBProjects,
         generalWorkspacesBVitestArgs: arcWorkspaceVitestArgs,
         serializedSuiteCount: routeTests.length,
         selectedSerializedSuites: serializedSuites.map((routeTest) => routeTest.repoPath),

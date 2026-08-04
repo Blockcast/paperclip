@@ -1,14 +1,14 @@
 import { describe, expect, it } from "vitest";
+import * as acPolicySweep from "../services/ac-policy-sweep.js";
 import {
-  formatAcPolicyCancelDashboardSections,
-  partitionAcPolicyCancelCandidates,
-  planAcPolicyAutoCancelBatch,
-  type AcPolicyCancelCandidate,
+  formatAcPolicyStaleDashboardSections,
+  partitionAcPolicyStaleCandidates,
+  type AcPolicyStaleCandidate,
 } from "../services/ac-policy-sweep.js";
 
-describe("AC-policy auto-cancel candidate partitioning", () => {
-  it("keeps only stale agent-owned work in auto-cancel-safe from a mixed candidate fixture", () => {
-    const candidates: AcPolicyCancelCandidate[] = [
+describe("AC-policy stale candidate partitioning (report-only)", () => {
+  it("routes stale agent-owned work to the report-only stale bucket from a mixed candidate fixture", () => {
+    const candidates: AcPolicyStaleCandidate[] = [
       {
         id: "stale-agent-owned",
         identifier: "BLO-1",
@@ -55,9 +55,9 @@ describe("AC-policy auto-cancel candidate partitioning", () => {
       },
     ];
 
-    const partitioned = partitionAcPolicyCancelCandidates(candidates);
+    const partitioned = partitionAcPolicyStaleCandidates(candidates);
 
-    expect(partitioned.autoCancelSafe.map((issue) => issue.id)).toEqual(["stale-agent-owned"]);
+    expect(partitioned.staleNonCompliant.map((issue) => issue.id)).toEqual(["stale-agent-owned"]);
     expect(partitioned.needsHumanTriage.map((issue) => issue.id)).toEqual([
       "user-assigned-board-ask",
       "productivity-review",
@@ -73,10 +73,32 @@ describe("AC-policy auto-cancel candidate partitioning", () => {
     expect(partitioned.needsHumanTriage.find((issue) => issue.id === "active-blocker")?.triageReasons).toEqual([
       "active_blocker_for_non_terminal_parent",
     ]);
+
+    // The whole point of revision 7: every candidate lands in one of two report-only
+    // buckets, and no candidate is anywhere else. Nothing is eligible for destruction.
+    expect(partitioned.staleNonCompliant.length + partitioned.needsHumanTriage.length).toBe(
+      candidates.length,
+    );
+  });
+
+  it("exposes no destruction path at all — no batch planner, no safety cap", () => {
+    // Regression guard for BLO-19484 / BLO-19487. The 2026-06-08 run of the retired
+    // step destroyed user-assigned strategic issue PCL-354. Reintroducing a batch
+    // planner requires a fresh CEO ruling, not a new export here.
+    expect(Object.keys(acPolicySweep).sort()).toEqual([
+      "classifyAcPolicyStaleCandidate",
+      "formatAcPolicyStaleDashboardSections",
+      "partitionAcPolicyStaleCandidates",
+    ]);
+
+    const partitioned = partitionAcPolicyStaleCandidates([
+      { id: "a", title: "Stale task", status: "todo", assigneeAgentId: "agent-1" },
+    ]) as Record<string, unknown>;
+    expect(Object.keys(partitioned).sort()).toEqual(["needsHumanTriage", "staleNonCompliant"]);
   });
 
   it("does not triage candidates that only block terminal parent work", () => {
-    const candidates: AcPolicyCancelCandidate[] = [
+    const candidates: AcPolicyStaleCandidate[] = [
       {
         id: "terminal-parent-blocker",
         identifier: "BLO-6",
@@ -87,14 +109,14 @@ describe("AC-policy auto-cancel candidate partitioning", () => {
       },
     ];
 
-    const partitioned = partitionAcPolicyCancelCandidates(candidates);
+    const partitioned = partitionAcPolicyStaleCandidates(candidates);
 
-    expect(partitioned.autoCancelSafe.map((issue) => issue.id)).toEqual(["terminal-parent-blocker"]);
+    expect(partitioned.staleNonCompliant.map((issue) => issue.id)).toEqual(["terminal-parent-blocker"]);
     expect(partitioned.needsHumanTriage).toEqual([]);
   });
 
   it("triages user-created board asks even when currently assigned to an agent", () => {
-    const candidates: AcPolicyCancelCandidate[] = [
+    const candidates: AcPolicyStaleCandidate[] = [
       {
         id: "user-created-agent-assigned",
         identifier: "BLO-15",
@@ -106,14 +128,14 @@ describe("AC-policy auto-cancel candidate partitioning", () => {
       },
     ];
 
-    const partitioned = partitionAcPolicyCancelCandidates(candidates);
+    const partitioned = partitionAcPolicyStaleCandidates(candidates);
 
-    expect(partitioned.autoCancelSafe).toEqual([]);
+    expect(partitioned.staleNonCompliant).toEqual([]);
     expect(partitioned.needsHumanTriage[0]?.triageReasons).toEqual(["user_owned_protected"]);
   });
 
-  it("triages blockers with missing parent status instead of destructively cancelling unknown dependency work", () => {
-    const candidates: AcPolicyCancelCandidate[] = [
+  it("triages blockers with missing parent status instead of assuming unknown dependency work is dead", () => {
+    const candidates: AcPolicyStaleCandidate[] = [
       {
         id: "unknown-parent-status",
         identifier: "BLO-8",
@@ -124,47 +146,14 @@ describe("AC-policy auto-cancel candidate partitioning", () => {
       },
     ];
 
-    const partitioned = partitionAcPolicyCancelCandidates(candidates);
+    const partitioned = partitionAcPolicyStaleCandidates(candidates);
 
-    expect(partitioned.autoCancelSafe).toEqual([]);
+    expect(partitioned.staleNonCompliant).toEqual([]);
     expect(partitioned.needsHumanTriage[0]?.triageReasons).toEqual(["active_blocker_for_non_terminal_parent"]);
   });
 
-  it("applies the destructive safety cap only to auto-cancel-safe candidates", () => {
-    const candidates: AcPolicyCancelCandidate[] = [
-      {
-        id: "safe-1",
-        identifier: "BLO-10",
-        title: "Stale task one",
-        status: "todo",
-        assigneeAgentId: "agent-1",
-      },
-      {
-        id: "safe-2",
-        identifier: "BLO-11",
-        title: "Stale task two",
-        status: "todo",
-        assigneeAgentId: "agent-1",
-      },
-      {
-        id: "triage-1",
-        identifier: "BLO-12",
-        title: "Board ask",
-        status: "todo",
-        assigneeUserId: "user-1",
-      },
-    ];
-
-    const plan = planAcPolicyAutoCancelBatch(candidates, 1);
-
-    expect(plan.cancelPaused).toBe(true);
-    expect(plan.autoCancelBatch).toEqual([]);
-    expect(plan.autoCancelSafe.map((issue) => issue.id)).toEqual(["safe-1", "safe-2"]);
-    expect(plan.needsHumanTriage.map((issue) => issue.id)).toEqual(["triage-1"]);
-  });
-
-  it("formats dashboard output with separate safe and triage sections", () => {
-    const candidates: AcPolicyCancelCandidate[] = [
+  it("formats dashboard output with two report-only sections and an explicit zero-cancellation line", () => {
+    const candidates: AcPolicyStaleCandidate[] = [
       {
         id: "safe-1",
         identifier: "BLO-13",
@@ -181,9 +170,67 @@ describe("AC-policy auto-cancel candidate partitioning", () => {
       },
     ];
 
-    expect(formatAcPolicyCancelDashboardSections(candidates)).toContain("### Auto-cancel-safe candidates (1)");
-    expect(formatAcPolicyCancelDashboardSections(candidates)).toContain("- BLO-13 (safe-1) - Stale task");
-    expect(formatAcPolicyCancelDashboardSections(candidates)).toContain("### Needs-human-triage candidates (1)");
-    expect(formatAcPolicyCancelDashboardSections(candidates)).toContain("- BLO-14 (triage-1) - Board ask (user_assigned)");
+    const output = formatAcPolicyStaleDashboardSections(candidates);
+
+    expect(output).toContain("### Stale non-compliant candidates — report only (1)");
+    expect(output).toContain("- BLO-13 (safe-1) - Stale task");
+    expect(output).toContain("### Needs-human-triage candidates — report only (1)");
+    expect(output).toContain("- BLO-14 (triage-1) - Board ask (user_assigned)");
+    expect(output).toContain("Issues cancelled by this sweep: 0");
+    // No bucket in the rendered dashboard may advertise eligibility for destruction.
+    expect(output.toLowerCase()).not.toContain("auto-cancel");
+  });
+
+  it("reports never-touched-by-a-human as its own condition, not as a large age", () => {
+    // BLO-19484 amendment: a null human clock is worse than merely stale and must stay
+    // visibly distinct. The clock itself is computed in human-gated-ageing.ts — this
+    // module only renders what it is handed, so the two never drift apart.
+    const output = formatAcPolicyStaleDashboardSections([
+      {
+        id: "never-touched",
+        identifier: "BLO-20",
+        title: "Never seen by a human",
+        status: "todo",
+        assigneeAgentId: "agent-1",
+        humanClockAt: null,
+      },
+      {
+        id: "touched",
+        identifier: "BLO-21",
+        title: "Seen once",
+        status: "todo",
+        assigneeAgentId: "agent-1",
+        humanClockAt: new Date("2026-05-04T10:00:00.000Z"),
+      },
+    ]);
+
+    expect(output).toContain("- BLO-20 (never-touched) - Never seen by a human [never touched by a human]");
+    expect(output).toContain("- BLO-21 (touched) - Seen once [last human touch 2026-05-04]");
+  });
+
+  it("omits the human-clock annotation entirely when the caller supplies no clock", () => {
+    const output = formatAcPolicyStaleDashboardSections([
+      { id: "no-clock", identifier: "BLO-22", title: "No clock supplied", status: "todo" },
+      { id: "undefined-clock", identifier: "BLO-23", title: "Undefined clock", status: "todo", humanClockAt: undefined },
+    ]);
+
+    expect(output).toContain("- BLO-22 (no-clock) - No clock supplied");
+    expect(output).toContain("- BLO-23 (undefined-clock) - Undefined clock");
+    expect(output).not.toContain("never touched by a human");
+  });
+
+  it("reports malformed human-clock values as unknown", () => {
+    const output = formatAcPolicyStaleDashboardSections([
+      {
+        id: "malformed-clock",
+        identifier: "BLO-24",
+        title: "Bad clock",
+        status: "todo",
+        humanClockAt: "not-a-date",
+      },
+    ]);
+
+    expect(output).toContain("- BLO-24 (malformed-clock) - Bad clock [human touch unknown]");
+    expect(output).not.toContain("never touched by a human");
   });
 });

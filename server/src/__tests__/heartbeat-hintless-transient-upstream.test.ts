@@ -98,6 +98,52 @@ describe("isHintlessTransientUpstreamFault", () => {
     expect(isHintlessTransientUpstreamFault(null, { errorMessage: "TypeError: x is not a function" })).toBe(false);
   });
 
+  // BLO-19909 (a). `server_error` is Anthropic's own type name for a 500, and
+  // BLO-18285 deliberately made 500 terminal. Standing alone with NO status
+  // field, it is not evidence of a brownout, so it must not inherit the ~2h42m
+  // curve. Paired with a 503/529 the status branch already claims it, which is
+  // the "must be paired with a status" rule these cases pin.
+  //
+  // This block FAILS against f569128b (the #859 merge): there `\bserver_error\b`
+  // was a standalone text pattern, so every hint-less case below returned true.
+  it("leaves a hint-less bare server_error terminal", () => {
+    expect(isHintlessTransientUpstreamFault({ error: "server_error" })).toBe(false);
+    expect(isHintlessTransientUpstreamFault({ message: "server_error" })).toBe(false);
+    expect(isHintlessTransientUpstreamFault(null, { errorMessage: "server_error" })).toBe(false);
+    // Same payload as the live BLO-18138 run with its status field stripped:
+    // without the 503 there is nothing left that says "brownout".
+    expect(
+      isHintlessTransientUpstreamFault({
+        subtype: "api_retry",
+        attempt: 10,
+        max_retries: 10,
+        error: "server_error",
+      }),
+    ).toBe(false);
+  });
+
+  it("still classifies server_error transient when it is paired with a 503/529", () => {
+    expect(isHintlessTransientUpstreamFault({ error_status: 503, error: "server_error" })).toBe(true);
+    expect(isHintlessTransientUpstreamFault({ api_error_status: 529, error: "server_error" })).toBe(true);
+  });
+
+  // BLO-19909 (b). claude-local's parse.ts sets `resultJson = finalResult`
+  // verbatim, so `resultJson.result` is the SDK final-result event's text — the
+  // agent's own prose. A run that fails for an unrelated reason after the agent
+  // wrote about a 503 must not inherit the retry curve and be skipped by the
+  // strand sweep for ~2h42m. Same for `summary`, which is derived from it.
+  it("ignores agent-authored prose in result/summary that merely mentions a 503", () => {
+    const prose =
+      "I checked the deploy: the gateway returned API Error: 503 Service temporarily unavailable " +
+      "at 16:52Z, but it recovered. The failure here is an assertion in the migration test.";
+    expect(isHintlessTransientUpstreamFault({ result: prose })).toBe(false);
+    expect(isHintlessTransientUpstreamFault({ summary: prose })).toBe(false);
+    expect(isHintlessTransientUpstreamFault({ result: prose, is_error: false })).toBe(false);
+    expect(
+      isHintlessTransientUpstreamFault({ result: "the upstream was overloaded_error earlier" }),
+    ).toBe(false);
+  });
+
   // The rate-limit family owns 429/quota and uses a flat 90s curve, because the
   // ccrotate gate (not backoff) decides when a closed account window reopens.
   // Widening this predicate into that territory would swap the correct schedule
@@ -126,6 +172,164 @@ describe("isHintlessTransientUpstreamFault", () => {
       isRetryableK8sCcrotateThrottleResult({
         errorMessage: BLO_18138_ERROR_MESSAGE,
         resultJson: BLO_18138_RESULT_JSON as unknown as Record<string, unknown>,
+      }),
+    ).toBe(false);
+  });
+});
+
+// BLO-19879 — the penstock gateway's `400 allocation_missing`.
+//
+// Same strand shape as BLO-18138 but reached by a different route: the status
+// is 4xx, so the run is not a brownout by status and master leaves it a
+// terminal `adapter_failed`. It is nonetheless transient — the gateway emits it
+// only while no BYOS vault node serving the requested provider is in the active
+// set, and the identical request succeeds once one returns.
+//
+// Live proof: on 2026-07-31, while `blockcast-omar` (the only node with
+// anthropic in PENSTOCK_VAULT_PROVIDERS, replicas: 1) was unavailable
+// 16:50–17:20Z, provider-blind failover routed anthropic traffic to
+// `blockcast-sfo12` (openai,codex). 83 runs hit this in 40h; 80 stranded.
+describe("isHintlessTransientUpstreamFault for the BLO-19879 gateway allocation fault", () => {
+  // Verbatim from heartbeat_runs for run d4344b4f (result_json), including the
+  // api_error_status: 400 that makes the ordering below load-bearing.
+  const BLO_19879_RESULT_JSON = {
+    api_error_status: 400,
+    result:
+      'API Error: 400 {"error":"No allocation configured for org \'org_penstock\' provider ' +
+      '\'anthropic\' on BYOS node \'blockcast-sfo12\'","code":"allocation_missing",' +
+      '"correlation_id":"a2a3dff4-75e5-4dbc-a6e5-9ce2b0f1c8d7"}',
+    is_error: true,
+  } as const;
+
+  it("classifies the real allocation_missing payload as transient", () => {
+    expect(isHintlessTransientUpstreamFault(BLO_19879_RESULT_JSON)).toBe(true);
+  });
+
+  it("matches when only an errorMessage survives", () => {
+    expect(
+      isHintlessTransientUpstreamFault(null, { errorMessage: BLO_19879_RESULT_JSON.result }),
+    ).toBe(true);
+  });
+
+  // The regression this fix exists to prevent. The authoritative-status
+  // short-circuit returns false for any status outside {503,529} BEFORE the
+  // text patterns are consulted, so a detector placed among those patterns
+  // would be dead code against a 400 and the strand would silently persist.
+  // Pinning a bare 400 alongside proves the ordering is what rescues this and
+  // that 4xx has not been broadly widened.
+  it("is not defeated by the 400 status short-circuit", () => {
+    expect(isHintlessTransientUpstreamFault({ api_error_status: 400 })).toBe(false);
+    expect(
+      isHintlessTransientUpstreamFault({
+        api_error_status: 400,
+        result: '{"code":"allocation_missing"}',
+      }),
+    ).toBe(true);
+  });
+
+  it("requires a 400 authoritative status before bypassing the status short-circuit", () => {
+    for (const status of [401, 403, 500] as const) {
+      expect(
+        isHintlessTransientUpstreamFault({
+          api_error_status: status,
+          result: 'API Error: 400 {"code":"allocation_missing"}',
+        }),
+      ).toBe(false);
+      expect(
+        isHintlessTransientUpstreamFault({
+          error_status: status,
+          result: '{"code":"allocation_missing"}',
+        }),
+      ).toBe(false);
+    }
+  });
+
+  // BLO-20343 — the input shape this feature shipped without coverage for.
+  //
+  // Before the fix the status gate wrapped only the resultJson scan, so an
+  // errorMessage carrying the identical bytes bypassed it and returned true
+  // while the resultJson form returned false. Reaching that split needs
+  // contradictory adapter state (a 400 gateway body alongside an authoritative
+  // non-400 status) and no producer was ever found, so this pins consistency
+  // rather than fixing an observed strand. `false` is the resolution: 401/403
+  // will not self-heal on a 2h curve, 500 is deliberately terminal above, and
+  // 429 belongs to the rate-limit family.
+  it("gates the errorMessage path on status exactly as it gates resultJson", () => {
+    const gatewayPayload = 'API Error: 400 {"error":"No allocation configured","code":"allocation_missing"}';
+
+    for (const status of [401, 403, 500] as const) {
+      expect(
+        isHintlessTransientUpstreamFault({ api_error_status: status }, { errorMessage: gatewayPayload }),
+      ).toBe(false);
+      expect(
+        isHintlessTransientUpstreamFault({ error_status: status }, { errorMessage: gatewayPayload }),
+      ).toBe(false);
+    }
+
+    // The property, stated directly: for one authoritative status the verdict
+    // must not depend on which field transports the payload.
+    for (const status of [400, 401, 403, 500] as const) {
+      expect(
+        isHintlessTransientUpstreamFault({ api_error_status: status }, { errorMessage: gatewayPayload }),
+      ).toBe(isHintlessTransientUpstreamFault({ api_error_status: status, result: gatewayPayload }));
+    }
+
+    // The gate must stay open for the two shapes that actually occur: the real
+    // fault (400) and an errorMessage with no resultJson to contradict it.
+    expect(
+      isHintlessTransientUpstreamFault({ api_error_status: 400 }, { errorMessage: gatewayPayload }),
+    ).toBe(true);
+    expect(isHintlessTransientUpstreamFault(null, { errorMessage: gatewayPayload })).toBe(true);
+    expect(isHintlessTransientUpstreamFault({}, { errorMessage: gatewayPayload })).toBe(true);
+  });
+
+  it("does not match allocation_missing quotes in free-text result surfaces", () => {
+    expect(
+      isHintlessTransientUpstreamFault({
+        api_error_status: 400,
+        result: 'While reviewing this PR I saw {"code":"allocation_missing"} in the incident notes.',
+      }),
+    ).toBe(false);
+    expect(
+      isHintlessTransientUpstreamFault({
+        api_error_status: 400,
+        message: '{"code":"allocation_missing"}',
+      }),
+    ).toBe(false);
+    expect(
+      isHintlessTransientUpstreamFault({
+        api_error_status: 400,
+        summary: '{"code":"allocation_missing"}',
+      }),
+    ).toBe(false);
+  });
+
+  // Matched on the machine-readable code, not the prose, so a reworded gateway
+  // message cannot silently drop the run back to a terminal strand.
+  it("keys on the error code rather than the message wording", () => {
+    expect(
+      isHintlessTransientUpstreamFault(null, {
+        errorMessage: 'API Error: 400 {"error":"totally different wording","code":"allocation_missing"}',
+      }),
+    ).toBe(true);
+    // A genuine bad request must still fail fast rather than burn the curve.
+    expect(
+      isHintlessTransientUpstreamFault(null, {
+        errorMessage: 'API Error: 400 {"error":"invalid model","code":"invalid_request_error"}',
+      }),
+    ).toBe(false);
+    // Prose mentioning the condition without the structured code is not a match.
+    expect(
+      isHintlessTransientUpstreamFault(null, { errorMessage: "no allocation configured" }),
+    ).toBe(false);
+  });
+
+  it("stays disjoint from the rate-limit family", () => {
+    expect(isRateLimitExhausted(BLO_19879_RESULT_JSON, { errorMessage: null })).toBe(false);
+    expect(
+      isRetryableK8sCcrotateThrottleResult({
+        errorMessage: BLO_19879_RESULT_JSON.result,
+        resultJson: BLO_19879_RESULT_JSON as unknown as Record<string, unknown>,
       }),
     ).toBe(false);
   });
@@ -282,7 +486,6 @@ describeEmbeddedPostgres("hint-less gateway 503 does not strand", () => {
 
   it("classifies the fault and schedules a bounded retry instead of stranding", async () => {
     const { agentId } = await seedAgent(HINTLESS_503_TEST_ADAPTER);
-    const startedAt = Date.now();
 
     const run = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
     expect(run).not.toBeNull();
@@ -326,10 +529,21 @@ describeEmbeddedPostgres("hint-less gateway 503 does not strand", () => {
     // honor, the horizon itself is the fix. First hop is 2m ±25% jitter, and
     // the full chain runs 2m/10m/30m/2h — materially past the ~4 minutes the
     // in-process SDK retries covered before the run died.
+    //
+    // BLO-19909: anchored at the failed run's `finishedAt`, NOT at the
+    // pre-invoke wall clock. `computeBoundedTransientHeartbeatRetrySchedule`
+    // sets `dueAt = <scheduling time> + delayMs`, and scheduling happens at
+    // finalization, so measuring from before `invoke` folded the run's own wall
+    // time into the delay and pushed it against the 150s jitter ceiling — only
+    // ~6s of headroom under a loaded embedded-Postgres run. Anchoring here
+    // leaves only the finalize→schedule gap (milliseconds) inside the window,
+    // so the ±25% bounds can be asserted tightly instead of widened.
     const firstDelayMs = BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS[0];
-    const scheduledInMs = (retryRun?.scheduledRetryAt?.getTime() ?? 0) - startedAt;
-    expect(scheduledInMs).toBeGreaterThan(firstDelayMs * 0.7);
-    expect(scheduledInMs).toBeLessThan(firstDelayMs * 1.3);
+    const finishedAtMs = failedRun?.finishedAt?.getTime() ?? 0;
+    expect(finishedAtMs).toBeGreaterThan(0);
+    const scheduledInMs = (retryRun?.scheduledRetryAt?.getTime() ?? 0) - finishedAtMs;
+    expect(scheduledInMs).toBeGreaterThan(firstDelayMs * 0.75);
+    expect(scheduledInMs).toBeLessThanOrEqual(firstDelayMs * 1.25 + 5_000);
 
     const totalHorizonMs = BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.reduce((a, b) => a + b, 0);
     expect(totalHorizonMs).toBeGreaterThan(30 * 60 * 1000);
