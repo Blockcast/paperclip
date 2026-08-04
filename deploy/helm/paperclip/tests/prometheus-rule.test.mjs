@@ -212,3 +212,97 @@ test("PaperclipGithubReviewRequestSuppressionOutage pages on outage-like causes 
     );
   }
 });
+
+test("PaperclipPrReviewWakeTerminalFailed is pr_review-scoped, gauge-keyed, and links its runbook (BLO-20255)", () => {
+  const rendered = execFileSync(
+    "helm",
+    [
+      "template",
+      "paperclip",
+      "deploy/helm/paperclip",
+      "--namespace",
+      "paperclip",
+      "-f",
+      "deploy/helm/paperclip/values.blockcast.yaml",
+      "--show-only",
+      "templates/prometheusrule.yaml",
+      "--set",
+      "prometheusRule.enabled=true",
+    ],
+    { cwd: repoRoot, encoding: "utf8" },
+  );
+
+  assert.match(rendered, /alert: PaperclipPrReviewWakeTerminalFailed/);
+  const [, expr] = rendered.match(
+    /alert: PaperclipPrReviewWakeTerminalFailed[\s\S]*?\n\s+expr: (.+)\n/,
+  ) ?? [];
+  assert.ok(expr, "terminal-failed alert must render an expr");
+
+  // Pin the scope selector AND the age gauge.
+  //
+  // Scope: dropping the selector would sum scope="other" too, and ordinary
+  // issue wakes that failed are re-driven by the issue's own lifecycle --
+  // paging on those trains the operator to ignore this alert.
+  //
+  // Age gauge: this must threshold
+  // paperclip_agent_wakeup_terminal_failed_oldest_age_seconds, NOT a summed
+  // count under a long `for:`. A `for:` clause measures how long the
+  // EXPRESSION has been continuously true, not how long any one row has been
+  // failed. With `sum(..._unresolved{scope="pr_review"}) > 0` and `for: 30m`,
+  // two different short failures overlapping by a single scrape hold the sum
+  // non-zero across the whole window: A carries it 29 minutes, B arrives as A
+  // clears, the expression never goes false, and B pages about a minute old
+  // while the annotation claims thirty. Splitting on error_code does not help,
+  // because the expression sums that label away. The age gauge carries the
+  // server-computed per-row age, so the threshold means what it says.
+  assert.match(
+    expr,
+    /^max\(paperclip_agent_wakeup_terminal_failed_oldest_age_seconds\{scope="pr_review"\}\) > (\d+)$/,
+    "terminal-failed alert must threshold the per-row age gauge for scope=pr_review, "
+      + "not a summed count under a long `for:`",
+  );
+
+  const [, ageThreshold] = expr.match(/> (\d+)$/) ?? [];
+  // The gauge is zero-initialized and reset to 0 for a scope with no
+  // unresolved rows, so a strictly-positive threshold is the
+  // silent-in-steady-state guarantee. `> 0` would page on a row that failed
+  // one second ago.
+  assert.ok(
+    Number(ageThreshold) > 0,
+    "age threshold must be strictly positive so a zero-valued gauge is silent",
+  );
+  // Past the 45m HARD_STALE window would be ideal but 30m is the tuned start
+  // per the issue AC; anything at or under the 10m second bounded-retry step
+  // would race a retry that has not yet written its successor rows.
+  assert.ok(
+    Number(ageThreshold) >= 1800,
+    `age threshold ${ageThreshold}s must be at least 1800s (30m) per the BLO-20255 AC`,
+  );
+
+  const [, forWindow] = rendered.match(
+    /alert: PaperclipPrReviewWakeTerminalFailed[\s\S]*?\n\s+for: (.+)\n/,
+  ) ?? [];
+  // `for:` is now scrape-flap tolerance ONLY -- the ageing lives in the
+  // threshold above. It must stay short: a long `for:` here would stack on top
+  // of the age threshold and delay the page well past the intended window.
+  assert.ok(forWindow, "terminal-failed alert must render a for window");
+  const forMinutes = /^(\d+)m$/.test(forWindow.trim())
+    ? Number(forWindow.trim().slice(0, -1))
+    : /^(\d+)h$/.test(forWindow.trim())
+      ? Number(forWindow.trim().slice(0, -1)) * 60
+      : null;
+  assert.ok(
+    forMinutes !== null && forMinutes > 0 && forMinutes <= 10,
+    `for window ${forWindow} must be a short scrape-flap tolerance (<= 10m); `
+      + "the ageing belongs in the age-gauge threshold, not here",
+  );
+
+  // The runbook link is the operator's decision procedure (re-review vs
+  // accept). This is the first paperclip alert to carry runbook_url; without
+  // the assertion a future edit drops it silently.
+  assert.match(
+    rendered,
+    /alert: PaperclipPrReviewWakeTerminalFailed[\s\S]*?runbook_url: "[^"]*runbooks\/agent-wakeup-terminal-failed\.md"/,
+    "terminal-failed alert must link the runbook from its annotation",
+  );
+});

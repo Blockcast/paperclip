@@ -117,6 +117,7 @@ describe("claude remote execution", () => {
           taskKey: null,
         },
         config: {
+          engine: "cli",
           command: "claude",
           env: {
             ANTHROPIC_BASE_URL: anthropicBaseUrl,
@@ -172,6 +173,7 @@ describe("claude remote execution", () => {
           taskKey: null,
         },
         config: {
+          engine: "cli",
           command: "claude",
           env: {
             ANTHROPIC_BASE_URL: anthropicBaseUrl,
@@ -225,6 +227,7 @@ describe("claude remote execution", () => {
         taskKey: null,
       },
       config: {
+        engine: "cli",
         command: "claude",
         instructionsFilePath: instructionsPath,
         env: {
@@ -279,7 +282,7 @@ describe("claude remote execution", () => {
       localDir: workspaceDir,
       remoteDir: managedRemoteWorkspace,
     }));
-    expect(syncDirectoryToSsh).toHaveBeenCalledTimes(1);
+    expect(syncDirectoryToSsh).toHaveBeenCalledTimes(2);
     expect(syncDirectoryToSsh).toHaveBeenCalledWith(expect.objectContaining({
       remoteDir: `${managedRemoteWorkspace}/.paperclip-runtime/claude/skills`,
       followSymlinks: true,
@@ -353,6 +356,7 @@ describe("claude remote execution", () => {
         taskKey: null,
       },
       config: {
+        engine: "cli",
         command: "claude",
       },
       context: {
@@ -421,6 +425,7 @@ describe("claude remote execution", () => {
         taskKey: null,
       },
       config: {
+        engine: "cli",
         command: "claude",
       },
       context: {
@@ -489,6 +494,7 @@ describe("claude remote execution", () => {
         taskKey: null,
       },
       config: {
+        engine: "cli",
         command: "claude",
       },
       context: {
@@ -553,6 +559,7 @@ describe("claude remote execution", () => {
         taskKey: null,
       },
       config: {
+        engine: "cli",
         command: "claude",
       },
       context: {

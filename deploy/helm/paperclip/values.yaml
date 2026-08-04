@@ -84,9 +84,25 @@ api:
   # `maxUnavailable: 0` gives zero-downtime rolls for HTTP traffic.
   maxSurge: 1
   maxUnavailable: 0
-  # -- Soft anti-affinity to spread API replicas across nodes. Falls back to
-  # co-located if the cluster has only one schedulable paperclip node.
+  # -- Spread API replicas across nodes: a hard `topologySpreadConstraints`
+  # (maxSkew 1, minDomains 2, whenUnsatisfiable DoNotSchedule) plus a soft
+  # podAntiAffinity preference. The hard constraint requires at least 2 Ready
+  # nodes matching `nodeSelector`; with only one, a second replica sits
+  # `Pending` rather than co-locating with the first (BLO-20901 — a `false`
+  # setting here, or a `nodeSelector`/`nodeAffinity` narrowed to fewer than 2
+  # eligible nodes, reintroduces the single-node-outage blast radius this
+  # exists to prevent).
   spreadAcrossNodes: true
+  # -- Approval plan marker (BLO-20733), stamped onto the API pod template as
+  # `paperclip.blockcast.net/approval-plan-sha256`. 64 lowercase hex, or empty
+  # to render no annotation (the default -- local and non-Blockcast deploys do
+  # not go through the admission approval channel).
+  #
+  # Set ONLY by the release job, and never by hand: the value is the SHA-256 of
+  # the canonical rendered Deployment with this annotation removed, so it can
+  # only be obtained by rendering the chart unstamped first. A hand-set value
+  # makes `approve-paperclip-api-digest.sh` refuse the plan.
+  approvalPlanSha256: ""
 
 # -- Kubernetes Service exposing the HTTP UI/API.
 service:
@@ -267,6 +283,40 @@ probes:
 # routing API-to-worker requests before the worker is actually listening.
 workerProbes:
   # -- Worker liveness probe.
+  #
+  # BLO-19722 — why this is deliberately laxer than `probes.liveness` above.
+  #
+  # What `/healthz` actually measures: nothing declares this route. No handler
+  # in `server/src` matches `/healthz` (the only one in the repo belongs to the
+  # MCP gateway), so the request falls through to the SPA catch-all at
+  # `server/src/app.ts:777-787`, which synchronously returns 200 + static HTML.
+  # It therefore probes exactly one thing — "is the event loop able to service
+  # a request right now" — and says nothing about database or heartbeat health.
+  #
+  # At the previous `timeoutSeconds: 5 / periodSeconds: 30 / failureThreshold: 3`
+  # a ~90s event-loop stall was enough for kubelet to kill the pod. That is not
+  # theoretical: on 2026-07-31 `Liveness probe failed: context deadline
+  # exceeded` on `paperclip-0` was followed ~5s later by every active
+  # `agent-opencode-*` pod dying with it. A busy heartbeat pass is not a wedged
+  # process, but this probe could not tell them apart.
+  #
+  # The asymmetry with the API tier is the point. An API replica is stateless
+  # and horizontally scaled, so killing one early is cheap. The worker is a
+  # singleton supervising every in-flight agent run, so a false kill orphans
+  # all of them — the exact failure this issue exists to stop. We therefore buy
+  # stall tolerance at the cost of slower detection of a true wedge:
+  # 6 × 30s ≈ 180s before a kill, versus ~90s previously.
+  #
+  # Not fixed here: making `/healthz` un-blockable. Node runs our request
+  # handling on one thread, so any in-process endpoint is blocked by whatever
+  # blocks the loop; a genuinely independent health responder needs a worker
+  # thread (or a sidecar) and is a larger change than this issue should carry.
+  # Widening with the rationale recorded is the other branch this issue allows.
+  #
+  # Latent landmine while we are here: because `/healthz` resolves via the SPA
+  # catch-all, a build serving no `ui-dist` (`app.ts:788-790` warns and skips
+  # the catch-all) would 404 every probe and CrashLoop the worker for a reason
+  # that has nothing to do with its health.
   liveness:
     httpGet:
       path: /healthz
@@ -276,9 +326,13 @@ workerProbes:
           value: 127.0.0.1:3100
     initialDelaySeconds: 30
     periodSeconds: 30
-    timeoutSeconds: 5
-    failureThreshold: 3
+    timeoutSeconds: 10
+    failureThreshold: 6
   # -- Worker readiness probe.
+  # Readiness gates the API-to-worker Service endpoint. Keep it tighter than
+  # liveness so API callers stop routing to a worker whose event loop is not
+  # answering promptly; during a long-but-recoverable stall the pod may stay
+  # alive while temporarily leaving the Service endpoints.
   readiness:
     httpGet:
       path: /healthz
@@ -400,6 +454,12 @@ prometheusRule:
   githubDeliverySuppressionWindow: 30m
   # -- How long outage-like suppression must persist before firing. Same reasoning as the dead-letter alert: suppression is terminal, nothing self-resolves.
   githubDeliverySuppressionFor: 5m
+  # -- How long a pr_review-scoped agent_wakeup_requests row may sit in terminal status='failed' before firing (BLO-20255). Expressed in SECONDS and compared against paperclip_agent_wakeup_terminal_failed_oldest_age_seconds, which carries the real per-row age. It is deliberately NOT a Prometheus `for:` duration: `for:` measures how long the alert EXPRESSION has been continuously true, so with a summed count two short failures overlapping by one scrape keep the expression true and page for a row seconds old. Retry safety does NOT depend on this value: a scheduled retry writes its successor wake ("queued") and successor run ("scheduled_retry") inside the scheduling transaction, so a row the BLO-18030 bounded retry re-queues clears the gauge immediately via the successor exclusion — at every step of BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS, including the 30m and 2h ones. Set past the 45m HARD_STALE window purely so the alert cannot fire on a row still inside its natural lifecycle.
+  wakeTerminalFailedAgeSeconds: 1800
+  # -- Scrape-flap tolerance only (BLO-20255). The ageing lives in wakeTerminalFailedAgeSeconds above; this just requires the threshold to hold across a couple of scrapes so a single bad scrape cannot page.
+  wakeTerminalFailedFor: 5m
+  # -- Runbook for the terminal-failed wake alert, linked from its annotation.
+  wakeTerminalFailedRunbookUrl: "https://github.com/Blockcast/paperclip/blob/master/runbooks/agent-wakeup-terminal-failed.md"
   # -- Prometheus regex of suppression causes that mean an outage rather than a deliberate decline (BLO-18859). Expected policy declines (company.inactive, heartbeat.cooldown.active, heartbeat.disabled, heartbeat.wakeOnDemand.disabled, budget.blocked, agent.not_invokable, heartbeat.worktree_execution_cutoff, issue_tree_hold_active) are excluded so they never page. `other` is included: it is the bucket for a skip reason missing from KNOWN_GITHUB_SUPPRESSION_CAUSES, and an untriaged cause is not a known-good decline.
   githubDeliverySuppressionOutageCauses: "heartbeat.scheduling_suppressed|dispatch_rejected|other"
   # -- Additional PrometheusRule groups appended verbatim.
