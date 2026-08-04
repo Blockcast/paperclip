@@ -61,9 +61,16 @@ spec:
       {{- with .Values.priorityClassName }}
       priorityClassName: {{ . }}
       {{- end }}
-      {{- if .Values.api.spreadAcrossNodes }}
+      {{- if or .Values.api.spreadAcrossNodes .Values.api.requireDifferentNodes }}
       affinity:
         podAntiAffinity:
+          {{- if .Values.api.requireDifferentNodes }}
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  {{- include "paperclip.apiSelectorLabels" . | nindent 18 }}
+              topologyKey: kubernetes.io/hostname
+          {{- else }}
           preferredDuringSchedulingIgnoredDuringExecution:
             - weight: 100
               podAffinityTerm:
@@ -71,6 +78,7 @@ spec:
                   matchLabels:
                     {{- include "paperclip.apiSelectorLabels" . | nindent 20 }}
                 topologyKey: kubernetes.io/hostname
+          {{- end }}
         {{- with .Values.affinity }}
         {{- range $key, $value := . }}
         {{- if ne $key "podAntiAffinity" }}

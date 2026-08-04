@@ -132,10 +132,11 @@ kubectl -n paperclip exec paperclip-0 -- \
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | affinity | object | `{}` | Affinity rules. |
-| api | object | `{"enabled":false,"maxSurge":1,"maxUnavailable":0,"replicas":2,"spreadAcrossNodes":true}` | HA API tier — splits the single-pod StatefulSet into a multi-replica HTTP API Deployment plus a singleton worker StatefulSet. When enabled, the workers tier owns the heartbeat scheduler + plugin workers + Linear tunnel + database backup; the API tier serves HTTP traffic only with `PAPERCLIP_NODE_ROLE=api` (so plugin operations 503 cleanly on it). See server/src/services/plugin-worker-manager-stub.ts. |
+| api | object | `{"enabled":false,"maxSurge":1,"maxUnavailable":0,"replicas":2,"requireDifferentNodes":false,"spreadAcrossNodes":true}` | HA API tier — splits the single-pod StatefulSet into a multi-replica HTTP API Deployment plus a singleton worker StatefulSet. When enabled, the workers tier owns the heartbeat scheduler + plugin workers + Linear tunnel + database backup; the API tier serves HTTP traffic only with `PAPERCLIP_NODE_ROLE=api` (so plugin operations 503 cleanly on it). See server/src/services/plugin-worker-manager-stub.ts. |
 | api.enabled | bool | `false` | Enable the API/worker split. When `false` (default) the chart behaves like the single-replica StatefulSet that ships with upstream paperclip — no migration impact for existing deploys. |
 | api.maxSurge | int | `1` | Rolling update budget for the API Deployment. `maxSurge: 1` + `maxUnavailable: 0` gives zero-downtime rolls for HTTP traffic. |
 | api.replicas | int | `2` | Number of API tier replicas. 2+ is the point of the split. Each replica runs `PAPERCLIP_NODE_ROLE=api`, no plugin workers, no scheduler. |
+| api.requireDifferentNodes | bool | `false` | Require API replicas to run on different nodes. Enable only when the eligible node pool has at least as many nodes as `replicas`. |
 | api.spreadAcrossNodes | bool | `true` | Soft anti-affinity to spread API replicas across nodes. Falls back to co-located if the cluster has only one schedulable paperclip node. |
 | env | object | `{"extra":[],"host":"0.0.0.0","instanceId":"default","port":3100,"serveUi":true}` | Paperclip runtime environment. |
 | env.extra | list | `[]` | Extra environment variables merged verbatim into the container spec. Example: `[{name: NODE_OPTIONS, value: --max-old-space-size=3072}]`. |

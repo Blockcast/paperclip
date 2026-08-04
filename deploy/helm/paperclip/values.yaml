@@ -87,6 +87,9 @@ api:
   # -- Soft anti-affinity to spread API replicas across nodes. Falls back to
   # co-located if the cluster has only one schedulable paperclip node.
   spreadAcrossNodes: true
+  # -- Require API replicas to run on different nodes. Enable only when the
+  # eligible node pool has at least as many nodes as `replicas`.
+  requireDifferentNodes: false
 
 # -- Kubernetes Service exposing the HTTP UI/API.
 service:

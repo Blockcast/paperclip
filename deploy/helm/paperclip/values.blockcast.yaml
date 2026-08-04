@@ -336,6 +336,9 @@ api:
   maxSurge: 1
   maxUnavailable: 0
   spreadAcrossNodes: true
+  # The workload=paperclip pool spans nine nodes. Keep both API replicas on
+  # different hosts so one node failure cannot remove every ready endpoint.
+  requireDifferentNodes: true
 
 # Service account must mount its bearer token so the k8s-Job adapters can
 # create Jobs / read Pod logs / patch Secrets via the in-cluster kubeconfig.
