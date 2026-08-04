@@ -130,6 +130,9 @@ jobs:
       - name: Validate release package manifest
         run: node ./scripts/release-package-map.mjs check
 
+      - name: Test ip-address security override
+        run: pnpm run test:ip-address-security-override
+
       - name: Verify release package bootstrap for changed manifests
         run: |
           mapfile -t changed_paths < <(git diff --name-only "$PR_BASE_SHA...$PR_HEAD_SHA")
