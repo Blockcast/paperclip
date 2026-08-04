@@ -1043,7 +1043,11 @@ function requiresIssueExecutionRetryLock(retryReason: string | null | undefined)
 }
 
 function requiresInProgressIssueRetry(retryReason: string | null | undefined) {
-  return requiresIssueExecutionRetryLock(retryReason);
+  return (
+    requiresIssueExecutionRetryLock(retryReason) &&
+    retryReason !== SESSION_UNAVAILABLE_HEARTBEAT_RETRY_REASON &&
+    retryReason !== ZERO_TOKEN_SESSION_RESET_RETRY_REASON
+  );
 }
 
 function isResolvedInteractionContinuationWakeContext(contextSnapshot: unknown) {
@@ -23077,6 +23081,44 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           });
         }
         const now = new Date();
+        const promotedRetryOfRunId = readNonEmptyString(promotedContextSnapshot.retryOfRunId);
+        const promotedScheduledRetryAttempt = promotedContextSnapshot.scheduledRetryAttempt;
+        if (readNonEmptyString(promotedContextSnapshot.retryReason) === ZERO_TOKEN_SESSION_RESET_RETRY_REASON) {
+          const latestIssueRunId = await tx
+            .select({ id: heartbeatRuns.id })
+            .from(heartbeatRuns)
+            .where(
+              and(
+                eq(heartbeatRuns.companyId, issue.companyId),
+                sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
+              ),
+            )
+            .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
+            .limit(1)
+            .then((rows) => rows[0]?.id ?? null);
+          if (!promotedRetryOfRunId || latestIssueRunId !== promotedRetryOfRunId) {
+            await tx
+              .update(agentWakeupRequests)
+              .set({
+                status: "cancelled",
+                finishedAt: now,
+                error: "Deferred session reset was superseded by newer issue execution",
+                updatedAt: now,
+              })
+              .where(eq(agentWakeupRequests.id, deferred.id));
+            continue;
+          }
+          await tx
+            .delete(agentTaskSessions)
+            .where(
+              and(
+                eq(agentTaskSessions.companyId, issue.companyId),
+                eq(agentTaskSessions.agentId, deferredAgent.id),
+                eq(agentTaskSessions.taskKey, issue.id),
+                eq(agentTaskSessions.adapterType, deferredAgent.adapterType),
+              ),
+            );
+        }
         const newRun = await tx
           .insert(heartbeatRuns)
           .values({
@@ -23090,6 +23132,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             responsibleUserId: promotedResponsibleUserId,
             sessionIdBefore: sessionBefore,
             continuationAttempt: promotedContinuationAttempt,
+            retryOfRunId: promotedRetryOfRunId,
+            scheduledRetryAttempt:
+              typeof promotedScheduledRetryAttempt === "number" &&
+              Number.isInteger(promotedScheduledRetryAttempt) &&
+              promotedScheduledRetryAttempt >= 0
+                ? promotedScheduledRetryAttempt
+                : undefined,
           })
           .returning()
           .then((rows) => rows[0]);
@@ -24773,6 +24822,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             return { kind: "coalesced" as const, run: mergedRun };
           }
 
+          if (
+            hasInitialRetryMetadata &&
+            activeExecutionRun.retryOfRunId === opts.retryOfRunId &&
+            activeExecutionRun.scheduledRetryAttempt === opts.scheduledRetryAttempt
+          ) {
+            await tx.insert(agentWakeupRequests).values({
+              companyId: agent.companyId,
+              agentId,
+              source,
+              triggerDetail,
+              reason: "retry_execution_duplicate",
+              payload,
+              status: "coalesced",
+              coalescedCount: 1,
+              requestedByActorType: opts.requestedByActorType ?? null,
+              requestedByActorId: opts.requestedByActorId ?? null,
+              idempotencyKey: opts.idempotencyKey ?? null,
+              runId: activeExecutionRun.id,
+              finishedAt: new Date(),
+            });
+            return { kind: "coalesced" as const, run: activeExecutionRun };
+          }
+
           const shouldDeferAgainstActiveRun =
             Boolean(availableActiveExecutionRun) ||
             (isSameExecutionAgent && shouldDeferCrossPrReviewWake && activeExecutionRun.status === "running");
@@ -25025,6 +25097,37 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           return { kind: "coalesced" as const, run: coalescedGithubStateRun };
         }
 
+        if (readNonEmptyString(enrichedContextSnapshot.retryReason) === ZERO_TOKEN_SESSION_RESET_RETRY_REASON) {
+          const latestIssueRunId = await tx
+            .select({ id: heartbeatRuns.id })
+            .from(heartbeatRuns)
+            .where(
+              and(
+                eq(heartbeatRuns.companyId, issue.companyId),
+                sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
+              ),
+            )
+            .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
+            .limit(1)
+            .then((rows) => rows[0]?.id ?? null);
+          if (!opts.retryOfRunId || latestIssueRunId !== opts.retryOfRunId) {
+            await tx.insert(agentWakeupRequests).values({
+              companyId: agent.companyId,
+              agentId,
+              source,
+              triggerDetail,
+              reason: "zero_token_session_reset_superseded",
+              payload,
+              status: "skipped",
+              requestedByActorType: opts.requestedByActorType ?? null,
+              requestedByActorId: opts.requestedByActorId ?? null,
+              idempotencyKey: opts.idempotencyKey ?? null,
+              finishedAt: new Date(),
+            });
+            return { kind: "skipped" as const };
+          }
+        }
+
         const wakeupRequest = await tx
           .insert(agentWakeupRequests)
           .values({
@@ -25041,6 +25144,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           })
           .returning()
           .then((rows) => rows[0]);
+
+        if (readNonEmptyString(enrichedContextSnapshot.retryReason) === ZERO_TOKEN_SESSION_RESET_RETRY_REASON) {
+          await tx
+            .delete(agentTaskSessions)
+            .where(
+              and(
+                eq(agentTaskSessions.companyId, issue.companyId),
+                eq(agentTaskSessions.agentId, agent.id),
+                eq(agentTaskSessions.taskKey, issue.id),
+                eq(agentTaskSessions.adapterType, agent.adapterType),
+              ),
+            );
+        }
 
         const newRun = await tx
           .insert(heartbeatRuns)

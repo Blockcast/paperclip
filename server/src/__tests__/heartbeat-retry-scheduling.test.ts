@@ -2095,6 +2095,34 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     },
   );
 
+  it.each(["session_unavailable", "zero_token_session_reset"] as const)(
+    "schedules %s retries for an assigned todo issue while retaining its execution lock",
+    async (retryReason) => {
+      const fixture = await seedMaxTurnFixture({ issueStatus: "todo" });
+      const scheduled = await heartbeat.scheduleBoundedRetry(fixture.runId, {
+        now: fixture.now,
+        retryReason,
+        wakeReason: `${retryReason}_retry`,
+        maxAttempts: 2,
+        delayMs: 1_000,
+      });
+
+      expect(scheduled.outcome).toBe("scheduled");
+      if (scheduled.outcome !== "scheduled") return;
+      expect(scheduled.run).toMatchObject({
+        status: "scheduled_retry",
+        scheduledRetryAttempt: 1,
+        scheduledRetryReason: retryReason,
+      });
+      const issue = await db
+        .select({ executionRunId: issues.executionRunId, status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, fixture.issueId))
+        .then((rows) => rows[0] ?? null);
+      expect(issue).toEqual({ executionRunId: scheduled.run.id, status: "todo" });
+    },
+  );
+
   it("rechecks the issue under lock in the same transaction that promotes an infrastructure retry", async () => {
     const fixture = await seedMaxTurnFixture();
     const scheduled = await heartbeat.scheduleBoundedRetry(fixture.runId, {

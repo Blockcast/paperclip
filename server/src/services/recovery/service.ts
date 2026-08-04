@@ -10,6 +10,7 @@ import {
 } from "@paperclipai/shared";
 import {
   agents,
+  agentTaskSessions,
   agentWakeupRequests,
   approvals,
   activityLog,
@@ -88,7 +89,6 @@ import {
   SESSION_UNAVAILABLE_RECOVERY_MAX_ATTEMPTS,
   ZERO_TOKEN_SESSION_RESET_RETRY_REASON,
 } from "./zero-token-startup-failure.js";
-import { clearAgentTaskSessions } from "./session-reset.js";
 
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["interrupted", "failed", "cancelled", "timed_out"] as const;
@@ -329,7 +329,7 @@ type ResolvedDependencyWakeBackstopOptions = {
 
 type LatestIssueRun = Pick<
   typeof heartbeatRuns.$inferSelect,
-  "id" | "agentId" | "status" | "error" | "errorCode" | "contextSnapshot" | "livenessState" | "resultJson" | "usageJson" | "scheduledRetryAttempt" | "createdAt"
+  "id" | "agentId" | "status" | "error" | "errorCode" | "contextSnapshot" | "livenessState" | "resultJson" | "usageJson" | "sessionIdBefore" | "scheduledRetryAttempt" | "createdAt"
 > | null;
 type SuccessfulLatestIssueRun = NonNullable<LatestIssueRun> & { status: "succeeded" };
 
@@ -1236,6 +1236,7 @@ export function recoveryService(
     livenessState: heartbeatRuns.livenessState,
     resultJson: heartbeatRuns.resultJson,
     usageJson: heartbeatRuns.usageJson,
+    sessionIdBefore: heartbeatRuns.sessionIdBefore,
     scheduledRetryAttempt: heartbeatRuns.scheduledRetryAttempt,
     createdAt: heartbeatRuns.createdAt,
   } as const;
@@ -1393,6 +1394,7 @@ export function recoveryService(
         livenessState: heartbeatRuns.livenessState,
         resultJson: heartbeatRuns.resultJson,
         usageJson: heartbeatRuns.usageJson,
+        sessionIdBefore: heartbeatRuns.sessionIdBefore,
         scheduledRetryAttempt: heartbeatRuns.scheduledRetryAttempt,
         createdAt: heartbeatRuns.createdAt,
       })
@@ -1615,6 +1617,7 @@ export function recoveryService(
         livenessState: heartbeatRuns.livenessState,
         resultJson: heartbeatRuns.resultJson,
         usageJson: heartbeatRuns.usageJson,
+        sessionIdBefore: heartbeatRuns.sessionIdBefore,
         scheduledRetryAttempt: heartbeatRuns.scheduledRetryAttempt,
         createdAt: heartbeatRuns.createdAt,
       })
@@ -5241,11 +5244,6 @@ export function recoveryService(
       (input.latestRun.scheduledRetryAttempt ?? 0) + 1,
       SESSION_UNAVAILABLE_RECOVERY_MAX_ATTEMPTS,
     );
-    await clearAgentTaskSessions(db, input.issue.companyId, input.agent.id, {
-      taskKey: input.issue.id,
-      adapterType: input.agent.adapterType,
-    });
-
     const queued = await enqueueStrandedIssueRecovery({
       issueId: input.issue.id,
       agentId: input.agent.id,
@@ -5273,9 +5271,12 @@ export function recoveryService(
   function sessionUnavailableAdapterMismatch(input: {
     latestRun: LatestIssueRun;
     agent: typeof agents.$inferSelect | null;
+    historicalAdapterType?: string | null;
   }): { historicalAdapterType: string; currentAdapterType: string } | null {
     if (!input.latestRun || !input.agent || input.latestRun.agentId !== input.agent.id) return null;
-    const historicalAdapterType = readNonEmptyString(parseObject(input.latestRun.contextSnapshot).adapterType);
+    const historicalAdapterType =
+      readNonEmptyString(input.historicalAdapterType) ??
+      readNonEmptyString(parseObject(input.latestRun.contextSnapshot).adapterType);
     const currentAdapterType = readNonEmptyString(input.agent.adapterType);
     if (
       !historicalAdapterType ||
@@ -5290,6 +5291,32 @@ export function recoveryService(
       return null;
     }
     return { historicalAdapterType, currentAdapterType };
+  }
+
+  async function resolveSessionUnavailableRunAdapterType(input: {
+    issue: typeof issues.$inferSelect;
+    latestRun: NonNullable<LatestIssueRun>;
+  }) {
+    const snapshottedAdapterType = readNonEmptyString(
+      parseObject(input.latestRun.contextSnapshot).adapterType,
+    );
+    if (snapshottedAdapterType || !input.latestRun.sessionIdBefore) {
+      return snapshottedAdapterType;
+    }
+
+    return db
+      .select({ adapterType: agentTaskSessions.adapterType })
+      .from(agentTaskSessions)
+      .where(
+        and(
+          eq(agentTaskSessions.companyId, input.issue.companyId),
+          eq(agentTaskSessions.agentId, input.latestRun.agentId),
+          eq(agentTaskSessions.taskKey, input.issue.id),
+          eq(agentTaskSessions.sessionDisplayId, input.latestRun.sessionIdBefore),
+        ),
+      )
+      .limit(1)
+      .then((rows) => readNonEmptyString(rows[0]?.adapterType));
   }
 
   function buildSessionUnavailableAdapterMismatchComment(input: {
@@ -5938,8 +5965,13 @@ export function recoveryService(
           continue;
         }
 
+        const todoHistoricalAdapterType = await resolveSessionUnavailableRunAdapterType({ issue, latestRun });
         const todoSessionUnavailableAdapterMismatch =
-          sessionUnavailableAdapterMismatch({ latestRun, agent });
+          sessionUnavailableAdapterMismatch({
+            latestRun,
+            agent,
+            historicalAdapterType: todoHistoricalAdapterType,
+          });
         if (todoSessionUnavailableAdapterMismatch) {
           if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, latestRun)) {
             // BLO-8050: operator just unblocked; skip re-escalation on stale evidence.
@@ -5968,7 +6000,7 @@ export function recoveryService(
           latestRun.agentId === agentId &&
           isZeroTokenStartupFailureRun({
             ...latestRun,
-            adapterType: readNonEmptyString(parseObject(latestRun.contextSnapshot).adapterType),
+            adapterType: todoHistoricalAdapterType,
           })
         ) {
           if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, latestRun)) {
@@ -6222,8 +6254,15 @@ export function recoveryService(
         }
         continue;
       }
+      const continuationHistoricalAdapterType = latestRun
+        ? await resolveSessionUnavailableRunAdapterType({ issue, latestRun })
+        : null;
       const continuationSessionUnavailableAdapterMismatch =
-        sessionUnavailableAdapterMismatch({ latestRun, agent });
+        sessionUnavailableAdapterMismatch({
+          latestRun,
+          agent,
+          historicalAdapterType: continuationHistoricalAdapterType,
+        });
       if (continuationSessionUnavailableAdapterMismatch) {
         if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, latestRun)) {
           // BLO-8050: operator just unblocked; skip re-escalation on stale evidence.
@@ -6251,7 +6290,7 @@ export function recoveryService(
         latestRun?.agentId === agentId &&
         isZeroTokenStartupFailureRun({
           ...latestRun,
-          adapterType: readNonEmptyString(parseObject(latestRun.contextSnapshot).adapterType),
+          adapterType: continuationHistoricalAdapterType,
         })
       ) {
         if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, latestRun)) {

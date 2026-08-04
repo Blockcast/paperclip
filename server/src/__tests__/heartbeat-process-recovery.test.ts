@@ -7451,7 +7451,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   });
 
   it("startup reconciliation clears a stale opencode_k8s session and queues immediate recovery", async () => {
-    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
       status: "in_progress",
       runStatus: "failed",
       runErrorCode: "adapter_failed",
@@ -7459,6 +7459,20 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       adapterType: "opencode_k8s",
       agentStatus: "error",
     });
+
+    const failedRun = await db
+      .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0]!);
+    const { adapterType: _adapterType, ...legacyContextSnapshot } = failedRun.contextSnapshot ?? {};
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: legacyContextSnapshot,
+        sessionIdBefore: "stale-opencode-session",
+      })
+      .where(eq(heartbeatRuns.id, runId));
 
     await db.insert(agentTaskSessions).values({
       companyId,
@@ -7482,15 +7496,30 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .from(agentWakeupRequests)
       .where(eq(agentWakeupRequests.agentId, agentId));
     expect(wakeRows.some((row) => row.reason === "issue_zero_token_session_reset")).toBe(true);
+    const retryRun = await db
+      .select({ retryOfRunId: heartbeatRuns.retryOfRunId })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.retryOfRunId, runId))
+      .then((rows) => rows[0] ?? null);
+    expect(retryRun?.retryOfRunId).toBe(runId);
   });
 
   it("accounts for a session reset attempt before a fast claimant can schedule another retry", async () => {
-    const { agentId, issueId } = await seedStrandedIssueFixture({
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
       status: "in_progress",
       runStatus: "failed",
       runErrorCode: "session_unavailable",
       runError: "Session unavailable",
       adapterType: "opencode_k8s",
+    });
+
+    await db.insert(agentTaskSessions).values({
+      companyId,
+      agentId,
+      adapterType: "opencode_k8s",
+      taskKey: issueId,
+      sessionParamsJson: { sessionId: "stale-racing-session" },
+      sessionDisplayId: "stale-racing-session",
     });
 
     let raced = false;
@@ -7504,6 +7533,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         if (raced || queuedRun.contextSnapshot?.retryReason !== "zero_token_session_reset") return;
         raced = true;
         observedAttempt = queuedRun.scheduledRetryAttempt;
+        await expect(
+          db.select().from(agentTaskSessions).where(eq(agentTaskSessions.agentId, agentId)),
+        ).resolves.toHaveLength(0);
 
         await db
           .update(issues)
