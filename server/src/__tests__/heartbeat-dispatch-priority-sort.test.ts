@@ -1260,6 +1260,180 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     expect(settledRuns.every((row) => row.status !== "queued")).toBe(true);
   });
 
+  it("keeps the absolute starvation floor ahead of fresh critical work across bounded scan windows (BLO-21792 review follow-up)", async () => {
+    // The test above proves the floor holds INSIDE one candidate window. This
+    // one proves it holds ACROSS windows, which is where the first cut of
+    // BLO-21792 leaked.
+    //
+    // The rank is computed over the rows a pass scanned, but the pass then
+    // stored its resume cursor at the END of that whole window. So when a
+    // window held more absolute-floor rows than the agent had free slots, every
+    // aged row the claim loop never reached ended up BEHIND the cursor, while
+    // the critical lane — which restarts from its own head every pass — kept
+    // merging in fresh rank-0 rows from beyond that cursor and dispatching
+    // them. The skipped aged rows only came back when the forward scan
+    // exhausted and triggered a head rescan, so under arrivals that keep it
+    // non-exhausted the wait was unbounded again: the exact defect the floor
+    // exists to cap.
+    //
+    // Geometry (scanLimit 2, one free slot, six queued rows):
+    //
+    //   window:  [ agedA (-1) , agedB (-1) ]   <- 2 aged rows, 1 slot
+    //   beyond:  [ freshCritical (0) , filler x3 ]
+    //
+    // agedA takes the slot; agedB is never examined. The fillers are what make
+    // this the non-exhausted case — without rows behind freshCritical the scan
+    // would exhaust, clear the cursor, and mask the bug.
+    //
+    // Pre-fix dispatch order: agedA, freshCritical, ... , agedB.
+    // Post-fix: agedA, agedB, freshCritical — global FIFO among aged rows, with
+    // critical work delayed by a bounded number of slots rather than jumping
+    // ahead of a row that has already waited past the absolute floor.
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issuePrefix = `A${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const agedAt = new Date(Date.now() - 7 * 60 * 60 * 1000);
+    const freshAt = new Date();
+
+    // scanLimit 2 + maxScanBatches 1 makes the first pass stop after exactly
+    // two rows with the cursor set and the scan NOT exhausted.
+    const boundedHeartbeat = heartbeatService(db, {
+      penstockGate: allowPenstockGate,
+      queuedRunDispatchBounds: { scanLimit: 2, maxScanBatches: 1, maxResumePasses: 8 },
+    });
+
+    try {
+      await db.insert(companies).values({
+        id: companyId,
+        name: "AbsoluteFloorAcrossWindowsCo",
+        issuePrefix,
+        requireBoardApprovalForNewAgents: false,
+        defaultResponsibleUserId: "responsible-user",
+      });
+
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: "BoundedWindowAgent",
+        role: "engineer",
+        status: "idle",
+        // codex_local is NOT external-lifecycle, so maxConcurrentRuns is used
+        // verbatim: exactly one slot, making the claim order observable.
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+        permissions: {},
+      });
+
+      // Ordered by createdAt, which is the scan's keyset order.
+      const rows = [
+        { key: "agedA", priority: "medium", createdAt: agedAt },
+        { key: "agedB", priority: "medium", createdAt: new Date(agedAt.getTime() + 1) },
+        { key: "freshCritical", priority: "critical", createdAt: freshAt },
+        { key: "filler1", priority: "low", createdAt: new Date(freshAt.getTime() + 1) },
+        { key: "filler2", priority: "low", createdAt: new Date(freshAt.getTime() + 2) },
+        { key: "filler3", priority: "low", createdAt: new Date(freshAt.getTime() + 3) },
+      ].map((row, index) => ({
+        ...row,
+        issueId: randomUUID(),
+        runId: randomUUID(),
+        issueNumber: index + 1,
+      }));
+      const runIdByKey = new Map(rows.map((row) => [row.key, row.runId]));
+
+      await db.insert(issues).values(rows.map((row) => ({
+        id: row.issueId,
+        companyId,
+        title: `Queued ${row.key}`,
+        status: "in_progress" as const,
+        priority: row.priority,
+        assigneeAgentId: agentId,
+        issueNumber: row.issueNumber,
+        identifier: `${issuePrefix}-${row.issueNumber}`,
+        startedAt: row.createdAt,
+      })));
+
+      for (const row of rows) {
+        const wakeId = randomUUID();
+        await db.insert(agentWakeupRequests).values({
+          id: wakeId,
+          companyId,
+          agentId,
+          source: "assignment",
+          triggerDetail: "system",
+          reason: "issue_assigned",
+          payload: { issueId: row.issueId },
+          status: "queued",
+          runId: row.runId,
+          requestedAt: row.createdAt,
+          updatedAt: row.createdAt,
+        });
+        await db.insert(heartbeatRuns).values({
+          id: row.runId,
+          companyId,
+          agentId,
+          invocationSource: "assignment",
+          triggerDetail: "system",
+          status: "queued",
+          wakeupRequestId: wakeId,
+          contextSnapshot: {
+            issueId: row.issueId,
+            taskId: row.issueId,
+            wakeReason: "issue_assigned",
+          },
+          createdAt: row.createdAt,
+          updatedAt: row.createdAt,
+        });
+      }
+
+      const dispatchedRunIds: string[] = [];
+      mockAdapterExecute.mockImplementation(async (args: { runId: string }) => {
+        dispatchedRunIds.push(args.runId);
+        return {
+          exitCode: 0,
+          signal: null as string | null,
+          timedOut: false,
+          errorMessage: null as string | null,
+          resultJson: { exitCode: 0 },
+          provider: "test",
+          model: "test-model",
+        };
+      });
+
+      // Each completion re-triggers dispatch, so one resumeQueuedRuns drains
+      // the queue through as many bounded passes as it takes. Wait for the
+      // three rows whose relative order is the assertion.
+      await boundedHeartbeat.resumeQueuedRuns();
+      const watched = ["agedA", "agedB", "freshCritical"].map((key) => runIdByKey.get(key)!);
+      const deadline = Date.now() + 60_000;
+      while (
+        Date.now() < deadline
+        && !watched.every((runId) => dispatchedRunIds.includes(runId))
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      await boundedHeartbeat.drainInFlightExecutions(60_000);
+
+      const orderOf = (key: string) => dispatchedRunIds.indexOf(runIdByKey.get(key)!);
+      // The oldest absolute-floor row still goes first, as within one window.
+      expect(orderOf("agedA")).toBe(0);
+      // The regression: the second aged row must NOT be overtaken by the fresh
+      // critical row that the critical lane pulls in from beyond the cursor.
+      expect(orderOf("agedB")).toBeGreaterThanOrEqual(0);
+      expect(orderOf("freshCritical")).toBeGreaterThanOrEqual(0);
+      expect(orderOf("agedB")).toBeLessThan(orderOf("freshCritical"));
+
+      // Critical work is delayed by the two aged rows, never dropped.
+      const settled = await db
+        .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(inArray(heartbeatRuns.id, watched));
+      expect(settled.every((row) => row.status !== "queued")).toBe(true);
+    } finally {
+      await boundedHeartbeat.drainInFlightExecutions(60_000);
+    }
+  }, 180_000);
+
   it("dispatches critical issue work before an aged issue-less run without starving routine issue work (BLO-19337)", async () => {
     // Regression for BLO-18995: dispatchRank returned a flat `10` for any run
     // without an issueId *above* the STARVATION_* aging escalation, so that
