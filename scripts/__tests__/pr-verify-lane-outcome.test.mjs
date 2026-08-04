@@ -5,6 +5,19 @@ import { test } from "node:test";
 
 const workflow = readFileSync(new URL("../../.github/workflows/pr.yml", import.meta.url), "utf8");
 
+test("PR verification runs for merge-queue heads with event-appropriate diff SHAs", () => {
+  assert.match(workflow, /\n  merge_group:\n    types:\n      - checks_requested\n/);
+  assert.match(
+    workflow,
+    /PR_BASE_SHA: \$\{\{ github\.event\.pull_request\.base\.sha \|\| github\.event\.merge_group\.base_sha \}\}/,
+  );
+  assert.match(
+    workflow,
+    /PR_HEAD_SHA: \$\{\{ github\.event\.pull_request\.head\.sha \|\| github\.event\.merge_group\.head_sha \}\}/,
+  );
+  assert.match(workflow, /\n  verify:\n/);
+});
+
 // BLO-20867: extract the actual `run:` shell script from the `verify` job's
 // "Fail if any split verify lane failed" step so this test exercises the real
 // script, not a re-implementation of it.

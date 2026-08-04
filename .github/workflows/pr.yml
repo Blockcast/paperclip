@@ -4,9 +4,12 @@ on:
   pull_request:
     branches:
       - master
+  merge_group:
+    types:
+      - checks_requested
 
 concurrency:
-  group: pr-${{ github.event.pull_request.number }}
+  group: pr-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.run_id }}
   cancel-in-progress: true
 
 env:
@@ -14,6 +17,8 @@ env:
   RUSTC_WRAPPER: sccache
   CC: "sccache gcc"
   CXX: "sccache g++"
+  PR_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+  PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
 
 jobs:
   policy:
@@ -46,7 +51,7 @@ jobs:
         run: |
           # Diff the PR branch against its merge base so recent base-branch commits
           # do not masquerade as changes made by the PR itself.
-          changed="$(git diff --name-only "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}")"
+          changed="$(git diff --name-only "$PR_BASE_SHA...$PR_HEAD_SHA")"
           if printf '%s\n' "$changed" | grep -qx 'pnpm-lock.yaml'; then
             echo "Do not commit pnpm-lock.yaml in pull requests. CI owns lockfile updates."
             exit 1
@@ -112,14 +117,14 @@ jobs:
 
       - name: Verify release package bootstrap for changed manifests
         run: |
-          mapfile -t changed_paths < <(git diff --name-only "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}")
-          PAPERCLIP_RELEASE_BOOTSTRAP_BASE_SHA="${{ github.event.pull_request.base.sha }}" \
+          mapfile -t changed_paths < <(git diff --name-only "$PR_BASE_SHA...$PR_HEAD_SHA")
+          PAPERCLIP_RELEASE_BOOTSTRAP_BASE_SHA="$PR_BASE_SHA" \
             node ./scripts/check-release-package-bootstrap.mjs "${changed_paths[@]}"
 
       - name: Validate dependency resolution when manifests change
         id: regen_lockfile
         run: |
-          changed="$(git diff --name-only "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}")"
+          changed="$(git diff --name-only "$PR_BASE_SHA...$PR_HEAD_SHA")"
           manifest_pattern='(^|/)package\.json$|^pnpm-workspace\.yaml$|^\.npmrc$|^pnpmfile\.(cjs|js|mjs)$'
           if printf '%s\n' "$changed" | grep -Eq "$manifest_pattern"; then
             pnpm install --lockfile-only --ignore-scripts --no-frozen-lockfile
