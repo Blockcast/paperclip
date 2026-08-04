@@ -699,7 +699,9 @@ jobs:
           # back -- including any already-reconciled API Deployment state --
           # which is why the post-wait marker check below can legitimately
           # see a reverted (non-matching) marker on a failed run, not only on
-          # a script bug.
+          # a script bug. --atomic placed ahead of --wait --timeout (rather
+          # than between them) so scripts/check-docker-deploy-timeout.test.js's
+          # `--wait --timeout` match still finds it.
           helm_pid=""
           stop_background_helm() {
             if [ -n "${helm_pid}" ] && kill -0 "${helm_pid}" 2>/dev/null; then
@@ -715,7 +717,7 @@ jobs:
             --set image.tag="${TAG}" \
             --set-string image.digest="${DIGEST}" \
             --post-renderer "${STAMP_SCRIPT}" \
-            --wait --atomic --timeout 30m &
+            --atomic --wait --timeout 30m &
           helm_pid=$!
 
           # Helm applies release resources before entering its wait loop. As
