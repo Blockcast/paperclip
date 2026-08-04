@@ -324,7 +324,73 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     expect(row?.executionRunId).toBe(queuedRunId);
   });
 
-  it("preserves a future scheduled retry even when its lock is older than the timeout", async () => {
+  it("clears a parked scheduled retry whose lock is older than the timeout (BLO-21309)", async () => {
+    // Replaces "preserves a future scheduled retry even when its lock is older
+    // than the timeout", which asserted the BLO-21309 bug: the staleness basis
+    // was the FUTURE scheduledRetryAt, so `now - basis` was negative and the
+    // lock survived the entire park. A ccrotate_capacity park is set from the
+    // provider's capacity-reset horizon (~4 days here), and for that whole
+    // window the issue's own assignee could not set status or re-arm its
+    // monitor. The lock bound must be independent of the retry horizon.
+    const { companyId, agentId } = await seed();
+    const retryRunId = randomUUID();
+    const issueId = randomUUID();
+    const scheduledRetryAt = new Date(Date.now() + 4 * 24 * 60 * 60 * 1000);
+    await db.insert(heartbeatRuns).values({
+      id: retryRunId,
+      companyId,
+      agentId,
+      status: "scheduled_retry",
+      invocationSource: "automation",
+      startedAt: null,
+      scheduledRetryAt,
+      scheduledRetryAttempt: 0,
+      scheduledRetryReason: "ccrotate_capacity",
+      errorCode: "rate_limit_exhausted",
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Parked ccrotate_capacity retry holding the lock",
+      status: "in_progress",
+      priority: "critical",
+      assigneeAgentId: agentId,
+      checkoutRunId: null,
+      executionRunId: retryRunId,
+      executionLockedAt: new Date(Date.now() - 7 * 60 * 60 * 1000),
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.sweepStaleIssueLocks();
+
+    expect(result.cleared).toBe(1);
+    expect(result.issueIds).toContain(issueId);
+    const row = await db
+      .select({
+        executionRunId: issues.executionRunId,
+        executionLockedAt: issues.executionLockedAt,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row?.executionRunId).toBeNull();
+    expect(row?.executionLockedAt).toBeNull();
+
+    // The park itself must survive: releasing the lock is not a cancellation,
+    // and the retry re-acquires via claimQueuedRun when it is finally claimed.
+    const retryRun = await db
+      .select({ status: heartbeatRuns.status, scheduledRetryAt: heartbeatRuns.scheduledRetryAt })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, retryRunId))
+      .then((rows) => rows[0]);
+    expect(retryRun?.status).toBe("scheduled_retry");
+    expect(retryRun?.scheduledRetryAt?.toISOString()).toBe(scheduledRetryAt.toISOString());
+  });
+
+  it("preserves a parked scheduled retry whose lock is still within the timeout (BLO-21309)", async () => {
+    // Keeps the bound a real bound rather than an immediate release, mirroring
+    // the BLO-18995 pairing for `queued`: a short rate-limit retry (flat ~90s
+    // curve) must never have its lock stripped out from under it.
     const { companyId, agentId } = await seed();
     const retryRunId = randomUUID();
     const issueId = randomUUID();
@@ -335,20 +401,20 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       status: "scheduled_retry",
       invocationSource: "automation",
       startedAt: null,
-      scheduledRetryAt: new Date(Date.now() + 60 * 60 * 1000),
+      scheduledRetryAt: new Date(Date.now() + 90 * 1000),
       scheduledRetryAttempt: 0,
       scheduledRetryReason: "ccrotate_capacity",
     });
     await db.insert(issues).values({
       id: issueId,
       companyId,
-      title: "Future scheduled retry",
+      title: "Freshly parked retry",
       status: "in_progress",
       priority: "critical",
       assigneeAgentId: agentId,
       checkoutRunId: null,
       executionRunId: retryRunId,
-      executionLockedAt: new Date(Date.now() - 7 * 60 * 60 * 1000),
+      executionLockedAt: new Date(Date.now() - 60 * 60 * 1000),
     });
 
     const heartbeat = heartbeatService(db);

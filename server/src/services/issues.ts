@@ -787,6 +787,7 @@ type IssueUserContextInput = {
 };
 type ProjectGoalReader = Pick<Db, "select">;
 type DbReader = Pick<Db, "select">;
+type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type IssueCreateInput = Omit<typeof issues.$inferInsert, "companyId"> & {
   labelIds?: string[];
   blockedByIssueIds?: string[];
@@ -809,6 +810,7 @@ type IssueCreateInput = Omit<typeof issues.$inferInsert, "companyId"> & {
   idempotencyKey?: string | null;
   allowDuplicate?: boolean;
   onDeduplicated?: (reason: "idempotency_key" | "recent_open_title") => void;
+  beforeSideEffects?: (tx: DbTransaction) => Promise<void> | void;
 };
 type IssueChildCreateInput = IssueCreateInput & {
   acceptanceCriteria?: string[];
@@ -7860,6 +7862,7 @@ export function issueService(db: Db) {
         idempotencyKey: rawIdempotencyKey,
         allowDuplicate,
         onDeduplicated,
+        beforeSideEffects,
         ...issueData
       } = data;
       const isolatedWorkspacesEnabled = (await instanceSettings.getExperimental()).enableIsolatedWorkspaces;
@@ -8183,6 +8186,7 @@ export function issueService(db: Db) {
             executionWorkspaceSettings: issueData.executionWorkspaceSettings,
           });
         }
+        await beforeSideEffects?.(tx);
         // Identifier minting is delegated to allocateIdentifier(), which
         // dispatches on companies.identifier_provider. The paperclip-internal
         // path runs inside this same tx (atomic counter + insert); the
@@ -8466,7 +8470,7 @@ export function issueService(db: Db) {
       const doneGateInput = {
         fromStatus: existing.status,
         toStatus: issueData.status,
-        existingExecutionRunId: existing.executionRunId,
+        existingCheckoutRunId: existing.checkoutRunId,
         lastEvidenceVerdict: doneGateEvidenceVerdict,
         isAgentActor: actorAgentId != null,
         hasDurableArtifactEvidence: false,
@@ -8497,7 +8501,7 @@ export function issueService(db: Db) {
         doneGateNeedsDurableArtifactCheck = shouldBlockNarratedDone({
           fromStatus: existing.status,
           toStatus: issueData.status,
-          existingExecutionRunId: existing.executionRunId,
+          existingCheckoutRunId: existing.checkoutRunId,
           lastEvidenceVerdict: doneGateEvidenceVerdict,
           isAgentActor: actorAgentId != null,
           hasDurableArtifactEvidence: false,
@@ -8738,7 +8742,7 @@ export function issueService(db: Db) {
             shouldBlockNarratedDone({
               fromStatus: existing.status,
               toStatus: issueData.status,
-              existingExecutionRunId: existing.executionRunId,
+              existingCheckoutRunId: existing.checkoutRunId,
               lastEvidenceVerdict: doneGateEvidenceVerdict,
               isAgentActor: actorAgentId != null,
               hasDurableArtifactEvidence: doneGateHasDurableArtifact,

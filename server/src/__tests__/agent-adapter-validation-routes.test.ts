@@ -127,6 +127,17 @@ const externalAdapter: ServerAdapterModule = {
   }),
 };
 
+const opencodeK8sAdapter: ServerAdapterModule = {
+  ...externalAdapter,
+  type: "opencode_k8s",
+  testEnvironment: async () => ({
+    adapterType: "opencode_k8s",
+    status: "pass",
+    checks: [],
+    testedAt: new Date(0).toISOString(),
+  }),
+};
+
 const missingAdapterType = "missing_adapter_validation_test";
 
 async function createApp() {
@@ -155,6 +166,11 @@ async function createApp() {
             requireBoardApprovalForNewAgents: false,
           },
         ]),
+      })),
+    })),
+    update: vi.fn(() => ({
+      set: vi.fn(() => ({
+        where: vi.fn(async () => []),
       })),
     })),
   };
@@ -272,12 +288,16 @@ describe("agent routes adapter validation", () => {
       ...(await mockAgentService.getById()),
       ...patch,
     }));
+    const { registerServerAdapter } = await import("../adapters/index.js");
     await unregisterTestAdapter("external_test");
+    await unregisterTestAdapter("opencode_k8s");
     await unregisterTestAdapter(missingAdapterType);
+    registerServerAdapter(opencodeK8sAdapter);
   });
 
   afterEach(async () => {
     await unregisterTestAdapter("external_test");
+    await unregisterTestAdapter("opencode_k8s");
     await unregisterTestAdapter(missingAdapterType);
   });
 
@@ -297,6 +317,173 @@ describe("agent routes adapter validation", () => {
 
     expect(res.status, JSON.stringify(res.body)).toBe(201);
     expect(res.body.adapterType).toBe("external_test");
+  });
+
+  it("enforces the external-lifecycle ceiling without narrowing local adapters", async () => {
+    const app = await createApp();
+    const rejected = await requestApp(app, (baseUrl) =>
+      request(baseUrl)
+        .post("/api/companies/company-1/agents")
+        .send({
+          name: "Over-cap K8s Agent",
+          adapterType: "opencode_k8s",
+          runtimeConfig: { heartbeat: { maxConcurrentRuns: 17 } },
+        }),
+    );
+    expect(rejected.status, JSON.stringify(rejected.body)).toBe(422);
+    expect(String(rejected.body.error ?? rejected.body.message ?? "")).toContain(
+      "must not exceed 16 for external-lifecycle adapters",
+    );
+
+    const accepted = await requestApp(app, (baseUrl) =>
+      request(baseUrl)
+        .post("/api/companies/company-1/agents")
+        .send({
+          name: "High-concurrency Local Agent",
+          adapterType: "codex_local",
+          runtimeConfig: { heartbeat: { maxConcurrentRuns: 50 } },
+        }),
+    );
+    expect(accepted.status, JSON.stringify(accepted.body)).toBe(201);
+    expect(mockAgentService.create.mock.calls.at(-1)?.[1]).toEqual(expect.objectContaining({
+      runtimeConfig: expect.objectContaining({
+        heartbeat: expect.objectContaining({ maxConcurrentRuns: 50 }),
+      }),
+    }));
+  });
+
+  it("defaults external-lifecycle agents to the effective ceiling", async () => {
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl)
+        .post("/api/companies/company-1/agents")
+        .send({
+          name: "Default K8s Agent",
+          adapterType: "opencode_k8s",
+        }),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockAgentService.create.mock.calls.at(-1)?.[1]).toEqual(expect.objectContaining({
+      runtimeConfig: expect.objectContaining({
+        heartbeat: expect.objectContaining({ maxConcurrentRuns: 16 }),
+      }),
+    }));
+  });
+
+  it("passes over-cap runtime updates to persistence validation", async () => {
+    mockAgentService.getById.mockResolvedValue({
+      ...(await mockAgentService.getById()),
+      adapterType: "opencode_k8s",
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 15 } },
+    });
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl)
+        .patch("/api/agents/11111111-1111-4111-8111-111111111111")
+        .send({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 17 } } }),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockAgentService.update.mock.calls.at(-1)?.[1]).toEqual({
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 17 } },
+    });
+  });
+
+  it("keeps empty runtime updates sparse for locked-row normalization", async () => {
+    mockAgentService.getById.mockResolvedValue({
+      ...(await mockAgentService.getById()),
+      adapterType: "opencode_k8s",
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 15, wakeOnDemand: true } },
+    });
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl)
+        .patch("/api/agents/11111111-1111-4111-8111-111111111111")
+        .send({ runtimeConfig: {} }),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockAgentService.update.mock.calls.at(-1)?.[1]).toEqual({ runtimeConfig: {} });
+  });
+
+  it("keeps partial heartbeat updates sparse for locked-row merging", async () => {
+    mockAgentService.getById.mockResolvedValue({
+      ...(await mockAgentService.getById()),
+      adapterType: "opencode_k8s",
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 15, wakeOnDemand: false } },
+    });
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl)
+        .patch("/api/agents/11111111-1111-4111-8111-111111111111")
+        .send({ runtimeConfig: { heartbeat: { wakeOnDemand: true } } }),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockAgentService.update.mock.calls.at(-1)?.[1]).toEqual({
+      runtimeConfig: { heartbeat: { wakeOnDemand: true } },
+    });
+  });
+
+  it("keeps adapter-only updates sparse so the service can use the locked runtime config", async () => {
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl)
+        .patch("/api/agents/11111111-1111-4111-8111-111111111111")
+        .send({ adapterType: "opencode_k8s" }),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockAgentService.update.mock.calls.at(-1)?.[1]).toEqual(expect.objectContaining({
+      adapterType: "opencode_k8s",
+    }));
+    expect(mockAgentService.update.mock.calls.at(-1)?.[1]).not.toHaveProperty("runtimeConfig");
+  });
+
+  it("does not overwrite a concurrent runtime update during an adapter-only route update", async () => {
+    mockAgentService.getById.mockResolvedValue({
+      ...(await mockAgentService.getById()),
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 15 } },
+    });
+    let lockedRuntimeConfig = { heartbeat: { maxConcurrentRuns: 15 } };
+    let signalUpdateStarted!: () => void;
+    const updateStarted = new Promise<void>((resolve) => {
+      signalUpdateStarted = resolve;
+    });
+    let releaseUpdate!: () => void;
+    const updateGate = new Promise<void>((resolve) => {
+      releaseUpdate = resolve;
+    });
+    mockAgentService.update.mockImplementationOnce(async (_id: string, patch: Record<string, unknown>) => {
+      signalUpdateStarted();
+      await updateGate;
+      const runtimeConfig = (patch.runtimeConfig as typeof lockedRuntimeConfig | undefined) ?? lockedRuntimeConfig;
+      const maxConcurrentRuns = runtimeConfig.heartbeat.maxConcurrentRuns;
+      if (patch.adapterType === "opencode_k8s" && maxConcurrentRuns > 16) {
+        const { unprocessable } = await import("../errors.js");
+        throw unprocessable("heartbeat.maxConcurrentRuns must not exceed 16 for external-lifecycle adapters");
+      }
+      return {
+        ...(await mockAgentService.getById()),
+        ...patch,
+        runtimeConfig,
+      };
+    });
+    const app = await createApp();
+    const response = requestApp(app, (baseUrl) =>
+      request(baseUrl)
+        .patch("/api/agents/11111111-1111-4111-8111-111111111111")
+        .send({ adapterType: "opencode_k8s" }),
+    );
+
+    await updateStarted;
+    lockedRuntimeConfig = { heartbeat: { maxConcurrentRuns: 50 } };
+    releaseUpdate();
+    const res = await response;
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(mockAgentService.update.mock.calls.at(-1)?.[1]).not.toHaveProperty("runtimeConfig");
   });
 
   it("does not inject CODEX_HOME or OPENAI_API_KEY when creating a keyless codex_local agent", async () => {

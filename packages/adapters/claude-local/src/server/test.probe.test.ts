@@ -101,7 +101,7 @@ describe("claude sandbox hello probe diagnostics", () => {
     expect(failed?.detail).not.toContain('"subtype":"init"');
   });
 
-  it("classifies rate-limit/overload failures as a transient warning, not a hard fail", async () => {
+  it("classifies provider quota failures as a warning, not a hard fail", async () => {
     probeResult.value = {
       exitCode: 1,
       stdout: [
@@ -119,7 +119,7 @@ describe("claude sandbox hello probe diagnostics", () => {
       environmentName: "Daytona",
     });
 
-    expect(result.checks.some((check) => check.code === "claude_hello_probe_transient_upstream")).toBe(true);
+    expect(result.checks.some((check) => check.code === "claude_hello_probe_provider_quota")).toBe(true);
     expect(result.checks.some((check) => check.code === "claude_hello_probe_failed")).toBe(false);
   });
 
