@@ -814,18 +814,6 @@ const TRANSIENT_INFRA_CONTINUATION_ERROR_CODES = new Set<string>([
   "process_lost",
 ]);
 
-// BLO-18106: `job_missing` is NOT unconditionally infra-class. The external
-// lifecycle Job can vanish *after* the adapter already performed non-idempotent
-// work (that is the whole subject of BLO-18106), so blind re-dispatch is unsafe.
-// Mirror the `job_failed` gate in shouldScheduleAutomaticRunRetry: treat it as
-// transient infra only when the reconciler durably proved invocation never began.
-// Absent/unknown evidence falls through to `default` — fail-safe by construction.
-function isNeverInvokedJobMissingRun(latestRun: LatestIssueRun) {
-  if (readNonEmptyString(latestRun?.errorCode) !== "job_missing") return false;
-  const recovery = parseObject(parseObject(latestRun?.resultJson).externalLifecycleRecovery);
-  return recovery.adapterInvocationStarted === false;
-}
-
 const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
   "agent_not_invokable",
   "agent_not_found",
@@ -1053,15 +1041,6 @@ export function classifyContinuationFailure(latestRun: LatestIssueRun): Continua
     return { kind: "non_retryable", maxAttempts: 0, baseBackoffMs: 0, errorCode };
   }
   if (errorCode && TRANSIENT_INFRA_CONTINUATION_ERROR_CODES.has(errorCode)) {
-    return {
-      kind: "transient_infra",
-      maxAttempts: CONTINUATION_RECOVERY_TRANSIENT_MAX_ATTEMPTS,
-      baseBackoffMs: CONTINUATION_RECOVERY_TRANSIENT_BASE_BACKOFF_MS,
-      errorCode,
-    };
-  }
-  // BLO-18106: evidence-gated, so it cannot live in the flat code set above.
-  if (isNeverInvokedJobMissingRun(latestRun)) {
     return {
       kind: "transient_infra",
       maxAttempts: CONTINUATION_RECOVERY_TRANSIENT_MAX_ATTEMPTS,

@@ -19,12 +19,6 @@ type Run = Parameters<typeof classifyContinuationFailure>[0];
 
 const run = (errorCode: string | null) => ({ errorCode } as unknown as Run);
 
-const jobMissingRun = (adapterInvocationStarted: unknown) =>
-  ({
-    errorCode: "job_missing",
-    resultJson: { externalLifecycleRecovery: { adapterInvocationStarted } },
-  } as unknown as Run);
-
 describe("BLO-18106: job_missing continuation recovery is evidence-gated", () => {
   it("work-class control: an ordinary run failure still escalates on the next attempt", () => {
     // The paired assertion the AC asks for. A work-class failure keeps the old
@@ -48,24 +42,17 @@ describe("BLO-18106: job_missing continuation recovery is evidence-gated", () =>
     expect(classifyContinuationFailure(run("budget_blocked")).kind).toBe("non_retryable");
   });
 
-  describe("job_missing is evidence-gated, not unconditionally infra-class", () => {
-    it("re-dispatches only when the reconciler proved the adapter never started", () => {
-      const c = classifyContinuationFailure(jobMissingRun(false));
-      expect(c.kind).toBe("transient_infra");
-      expect(c.maxAttempts).toBeGreaterThan(1);
+  it("keeps job_missing on the fail-safe path because production emits it only after invocation", () => {
+    expect(classifyContinuationFailure(run("job_missing"))).toMatchObject({
+      kind: "default",
+      maxAttempts: 1,
     });
 
-    it("does NOT re-dispatch when the adapter had already been invoked", () => {
-      // BLO-18106: the external lifecycle Job can vanish *after* a non-idempotent
-      // side effect. Re-running would duplicate that work, so this must stay on the
-      // escalate path even though the error code looks infra-shaped.
-      expect(classifyContinuationFailure(jobMissingRun(true)).kind).toBe("default");
-    });
-
-    it("fails safe when the invocation evidence is missing or not a boolean", () => {
-      expect(classifyContinuationFailure(jobMissingRun(undefined)).kind).toBe("default");
-      expect(classifyContinuationFailure(jobMissingRun("false")).kind).toBe("default");
-      expect(classifyContinuationFailure(run("job_missing")).kind).toBe("default");
+    // Pre-invocation disappearance is persisted as process_lost, which remains
+    // the reachable bounded-retry path for work that provably never started.
+    expect(classifyContinuationFailure(run("process_lost"))).toMatchObject({
+      kind: "transient_infra",
+      maxAttempts: 3,
     });
   });
 });

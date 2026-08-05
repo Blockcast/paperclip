@@ -258,6 +258,7 @@ import {
   INTERACTION_CONTINUATION_INFRA_WAKE_REASON,
   heartbeatService,
   redactDetectedSuccessfulRunProgressSummaryForBoard,
+  shouldScheduleAutomaticRunRetry,
 } from "../services/heartbeat.ts";
 import { setPluginEventBus, setPluginEventOutboxDb } from "../services/activity-log.js";
 import { pollOnce as drainPluginEventOutbox } from "../services/plugin-event-outbox.js";
@@ -1776,13 +1777,15 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const result = await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
 
     expect(result.runIds).toContain(runId);
-    expect(await heartbeat.getRun(runId)).toMatchObject({
+    const finalizedRun = await heartbeat.getRun(runId);
+    expect(finalizedRun).toMatchObject({
       status: "failed",
       errorCode: "job_missing",
       resultJson: {
         externalLifecycleRecovery: expect.objectContaining({ adapterInvocationStarted: true }),
       },
     });
+    expect(finalizedRun && shouldScheduleAutomaticRunRetry(finalizedRun)).toBe(false);
     const persistedReservation = await db
       .select()
       .from(externalRuntimeReservations)

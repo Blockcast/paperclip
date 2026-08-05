@@ -1036,24 +1036,12 @@ export function shouldScheduleAutomaticRunRetry(
     return isIssueRun || isPrReviewRetryContext(contextSnapshot);
   }
 
-  // A failed external-lifecycle Job may have performed non-idempotent work.
-  // Retry only when the reconciler durably proved adapter invocation never
+  // A failed or missing external-lifecycle Job may have performed non-idempotent
+  // work. Retry only when the reconciler durably proved adapter invocation never
   // began; lock/status gates alone cannot make partial external writes safe.
-  if (run.errorCode === "job_failed") {
+  if (run.errorCode === "job_failed" || run.errorCode === "job_missing") {
     const recovery = parseObject(parseObject(run.resultJson).externalLifecycleRecovery);
     return isIssueRun && recovery.adapterInvocationStarted === false;
-  }
-
-  // BLO-10448: scheduler-level transient infra failures where the agent pod
-  // never ran — the node pool was momentarily saturated (k8s_pod_schedule_failed:
-  // Unschedulable / image-pull / schedule-timeout) or the external-lifecycle Job
-  // vanished before completion (job_missing). The work never started, so re-queue
-  // pr_review wakes with bounded backoff to let the review land once capacity
-  // frees, instead of silently dropping it (observed on the Ally reviewer path:
-  // a single Unschedulable burst dropped a PR review with no retry). Non-PR wakes
-  // stay terminal, matching the k8s_concurrent_run_blocked leak guard above.
-  if (run.errorCode === "k8s_pod_schedule_failed" || run.errorCode === "job_missing") {
-    return isPrReviewRetryContext(parseObject(run.contextSnapshot));
   }
 
   if (run.errorCode !== "adapter_failed" && run.errorCode !== "process_lost") return false;

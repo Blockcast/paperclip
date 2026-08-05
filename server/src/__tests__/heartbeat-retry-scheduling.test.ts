@@ -1874,74 +1874,23 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     ).toBe(false);
   });
 
-  it("retries job_failed only when durable evidence proves adapter invocation never began", () => {
-    expect(
-      shouldScheduleAutomaticRunRetry({
-        errorCode: "job_failed",
-        resultJson: { externalLifecycleRecovery: { adapterInvocationStarted: false } },
-        contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
-      }),
-    ).toBe(true);
-    expect(
-      shouldScheduleAutomaticRunRetry({
-        errorCode: "job_failed",
-        resultJson: { externalLifecycleRecovery: { adapterInvocationStarted: true } },
-        contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
-      }),
-    ).toBe(false);
-    expect(
-      shouldScheduleAutomaticRunRetry({
-        errorCode: "job_failed",
-        resultJson: {},
-        contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
-      }),
-    ).toBe(false);
-    expect(
-      shouldScheduleAutomaticRunRetry({
-        errorCode: "job_failed",
-        resultJson: {},
-        contextSnapshot: { wakeReason: "heartbeat_timer" },
-      }),
-    ).toBe(false);
-    expect(
-      shouldScheduleAutomaticRunRetry({
-        errorCode: "job_failed",
-        resultJson: {},
-        contextSnapshot: null,
-      }),
-    ).toBe(false);
-    expect(JOB_FAILED_HEARTBEAT_RETRY_MAX_ATTEMPTS).toBe(4);
-  });
-
-  it("BLO-9147 AC2: CAPACITY_BLOCKED_HEARTBEAT_RETRY_MAX_ATTEMPTS exceeds rate-limit cap (12)", () => {
-    expect(CAPACITY_BLOCKED_HEARTBEAT_RETRY_MAX_ATTEMPTS).toBeGreaterThan(12);
-  });
-
-  // BLO-10448 — scheduler-level transient infra failures retry gate
-  it.each(["k8s_pod_schedule_failed", "job_missing"])(
-    "BLO-10448: retries %s on a pr_review wake (work never ran)",
+  it.each(["job_failed", "job_missing"])(
+    "retries %s only when durable evidence proves adapter invocation never began",
     (errorCode) => {
       expect(
         shouldScheduleAutomaticRunRetry({
           errorCode,
-          resultJson: {},
-          contextSnapshot: { wakeReason: "github_pr_opened", reviewKind: "pr_review", githubPrNumber: 408 },
+          resultJson: { externalLifecycleRecovery: { adapterInvocationStarted: false } },
+          contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
         }),
       ).toBe(true);
-      // thin snapshot (taskKey-only) — webhook-driven reviewer wakes get trimmed
       expect(
         shouldScheduleAutomaticRunRetry({
           errorCode,
-          resultJson: {},
-          contextSnapshot: { taskKey: "pr_review:Blockcast/Network-Operator-Portal:408" },
+          resultJson: { externalLifecycleRecovery: { adapterInvocationStarted: true } },
+          contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
         }),
-      ).toBe(true);
-    },
-  );
-
-  it.each(["k8s_pod_schedule_failed", "job_missing"])(
-    "BLO-10448: does NOT retry %s on non-PR wakes (BLO-7913 leak guard)",
-    (errorCode) => {
+      ).toBe(false);
       expect(
         shouldScheduleAutomaticRunRetry({
           errorCode,
@@ -1953,11 +1902,40 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         shouldScheduleAutomaticRunRetry({
           errorCode,
           resultJson: {},
-          contextSnapshot: {},
+          contextSnapshot: { wakeReason: "heartbeat_timer" },
         }),
       ).toBe(false);
+      expect(
+        shouldScheduleAutomaticRunRetry({
+          errorCode,
+          resultJson: {},
+          contextSnapshot: null,
+        }),
+      ).toBe(false);
+      expect(JOB_FAILED_HEARTBEAT_RETRY_MAX_ATTEMPTS).toBe(4);
     },
   );
+
+  it("BLO-9147 AC2: CAPACITY_BLOCKED_HEARTBEAT_RETRY_MAX_ATTEMPTS exceeds rate-limit cap (12)", () => {
+    expect(CAPACITY_BLOCKED_HEARTBEAT_RETRY_MAX_ATTEMPTS).toBeGreaterThan(12);
+  });
+
+  it("does not retry ambiguous k8s_pod_schedule_failed outcomes", () => {
+    for (const contextSnapshot of [
+      { wakeReason: "github_pr_opened", reviewKind: "pr_review", githubPrNumber: 408 },
+      { taskKey: "pr_review:Blockcast/Network-Operator-Portal:408" },
+      { issueId: randomUUID(), wakeReason: "issue_assigned" },
+      {},
+    ]) {
+      expect(
+        shouldScheduleAutomaticRunRetry({
+          errorCode: "k8s_pod_schedule_failed",
+          resultJson: {},
+          contextSnapshot,
+        }),
+      ).toBe(false);
+    }
+  });
 
   // BLO-17456: when a PR-review chain exhausts, the reviewer never posts its
   // required status, so the PR sits on "Expected — waiting for status" forever.
