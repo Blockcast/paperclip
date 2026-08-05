@@ -20,24 +20,26 @@ unsatisfied.
 
 The safe path depends on the PR author:
 
-1. If the PR is authored by `app/allyblockcast`, request a formal review from
-   the distinct `allyblockcast` User seat. The User must inspect the exact head
-   and submit the review through GitHub's review API. A replacement PR under
-   `kkroo` is not required merely to satisfy approval.
-2. If the PR is human-authored, use the same exact-head review path. The
-   `allyblockcast` User can satisfy the protected-team requirement after
-   reviewing the current head; App comments are supporting review evidence,
-   not a substitute for the formal User review.
-3. Never use the App's own comments as formal approval of an App-authored PR,
-   and never expose or distribute the User seat's credential. The credential
-   is reserved for formal review actions after the reviewer has inspected the
-   exact head and unresolved threads.
+1. If the PR is independently authored, obtain both reviews on the same exact
+   head SHA:
+   - an exact-head review from the `allyblockcast` GitHub App, which supplies
+     the evidence accepted by `review/ally-complete`; and
+   - a separate exact-head approval from the `allyblockcast` User seat, which
+     satisfies the singleton `Blockcast/onprem-k8s-ally-reviewer` team rule.
+2. If the PR is authored by `app/allyblockcast`, the App cannot review its own
+   PR. Reopen the exact intended diff under an independent author, link the
+   source PR and its review evidence, and obtain both reviews above on the
+   replacement PR's exact head.
+3. Do not treat App comments as a formal App review. Do not treat the User-seat
+   approval as satisfying `review/ally-complete`, or the App review as
+   satisfying the singleton-team approval. Never expose or distribute either
+   credential.
 
 The distinct GitHub User account named `allyblockcast` can satisfy the
 protected team approval when it is a member of
 `Blockcast/onprem-k8s-ally-reviewer`. That User is a real maintain-capable seat,
-not the `allyblockcast[bot]` App installation. GitHub therefore permits the User
-to review a PR authored by the App.
+not the `allyblockcast[bot]` App installation. Its approval is necessary but is
+not the App review consumed by `review/ally-complete`.
 
 ## Current routing evidence
 
@@ -52,23 +54,24 @@ that team plus the named security-path owners (`kkroo`, `eyad-hussein`, and
 `MohamedElmdary`). Do not preserve the earlier stale diagnosis that the team
 request was missing; that evidence was superseded.
 
-The remaining routing requirement is to send formal review work to the User
-seat. The Paperclip agent normally authors PRs as the App identity
-`allyblockcast[bot]`. A GitHub App cannot hold membership in the protected
-reviewer team or approve its own PR, while the separate `allyblockcast` User
-can provide the protected-team approval after reviewing the exact head.
+The remaining routing requirement is to collect two independent review
+artifacts on one immutable head. The Paperclip agent normally authors PRs as
+the App identity `allyblockcast[bot]`. Because the App cannot approve its own
+PR, those PRs require an independent-author replacement before the App can
+produce valid `review/ally-complete` evidence. The separate `allyblockcast`
+User then provides the protected-team approval on that same replacement head.
 
 ## Historical evidence
 
-`Blockcast/onprem-k8s` PR #1774 was authored by `app/allyblockcast` and merged
-on 2026-07-30 after review activity from the distinct `allyblockcast` User.
-That is the expected identity split: App authorship does not make a formal
-review from the separate User seat a self-review.
+Historical merges or approvals that predate the current gate are context, not
+proof that one identity can satisfy both requirements. Validate the current
+rules and check results on the candidate head instead of inferring the contract
+from an older merged PR.
 
-At the time of the BLO-21564 investigation, recent human-authored PRs were
-successfully approved by the `allyblockcast` User. App-authored PRs stalled
-when automation produced only App comments and never submitted a formal review
-through the User seat.
+At the time of the BLO-21564 investigation, independently authored PRs needed
+both an App exact-head review and a distinct `allyblockcast` User exact-head
+approval. App-authored PRs could not acquire the first artifact without being
+reopened under an independent author.
 
 ## Escalation template
 
@@ -79,8 +82,13 @@ When raising the Paperclip board approval, include:
 - Whether the PR author is `app/allyblockcast` or a human account.
 - The unresolved review-thread count and current required-check state.
 - A request for the `allyblockcast` User seat to inspect that exact head and
-  submit a formal approve or request-changes review. Do not request a carrier
-  PR solely to change the author identity.
+  submit a formal approve or request-changes review for the singleton-team
+  rule.
+- A separate request for an exact-head App review that satisfies
+  `review/ally-complete`.
+- For an App-authored source PR, the independent-author replacement URL and a
+  diff/evidence link back to the source. Avoid replacement PRs when authorship
+  already permits both reviews.
 
 See [BLO-21564](https://paperclip.blockcast.net/BLO/issues/BLO-21564) for the
 investigation trail.
