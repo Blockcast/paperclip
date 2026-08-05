@@ -193,6 +193,9 @@ describeEmbeddedPostgres("productivity review service", () => {
     now: Date;
     withRunComments?: boolean;
     contextSource?: string;
+    status?: string;
+    livenessState?: string | null;
+    usageJson?: Record<string, unknown> | null;
   }) {
     const runs: Array<typeof heartbeatRuns.$inferInsert> = [];
     for (let index = 0; index < input.count; index += 1) {
@@ -202,7 +205,7 @@ describeEmbeddedPostgres("productivity review service", () => {
         id: runId,
         companyId: input.companyId,
         agentId: input.agentId,
-        status: "succeeded",
+        status: input.status ?? "succeeded",
         invocationSource: "assignment",
         triggerDetail: "system",
         startedAt: createdAt,
@@ -210,7 +213,8 @@ describeEmbeddedPostgres("productivity review service", () => {
         contextSnapshot: input.contextSource
           ? { issueId: input.issueId, taskId: input.issueId, source: input.contextSource }
           : { issueId: input.issueId, taskId: input.issueId },
-        livenessState: "advanced",
+        livenessState: input.livenessState !== undefined ? input.livenessState : "advanced",
+        usageJson: input.usageJson !== undefined ? input.usageJson : undefined,
         nextAction: "Continue processing the next batch.",
         createdAt,
         updatedAt: createdAt,
@@ -367,9 +371,103 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(reviews[0]?.originId).toBe(seeded.issueId);
     expect(reviews[0]?.originFingerprint).toBe(`productivity-review:${seeded.issueId}`);
     expect(reviews[0]?.description).toContain("Primary trigger: `no_comment_streak`");
-    expect(reviews[0]?.description).toContain("No-comment completed-run streak: 10");
+    expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 10");
 
     expect(await listRefreshComments(reviews[0]!.id)).toHaveLength(0);
+  });
+
+  // BLO-21769: a run that crashlooped, hit an upstream 503 storm, was killed
+  // by provider capacity limits, or exhausted its retry budget never got a
+  // model turn. It must not be counted as "the agent ran and stayed silent" —
+  // it should surface as its own infra-owned trigger instead.
+  it("surfaces a streak of terminal never-executed runs under `runtime_failure_streak`, not `no_comment_streak` (BLO-21769)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+      status: "failed",
+      livenessState: "failed",
+      usageJson: null,
+    });
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const reviews = await listProductivityReviews(seeded.companyId);
+    expect(reviews).toHaveLength(1);
+    expect(reviews[0]?.description).toContain("Primary trigger: `runtime_failure_streak`");
+    expect(reviews[0]?.description).not.toContain("Primary trigger: `no_comment_streak`");
+    expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 0");
+    expect(reviews[0]?.description).toContain("Runtime-failure streak (terminal, never-executed runs): 10");
+    expect(reviews[0]?.description).toContain("Route to platform/SRE");
+    expect(reviews[0]?.description).not.toContain("Request decomposition");
+  });
+
+  it("excludes never-executed runs from the no-comment streak without breaking it — real silent completions still trip it (BLO-21769)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    // Most recent 3 runs never executed (infra failure). Older 10 runs
+    // genuinely succeeded and produced no comment. Pre-fix, all 13 terminal
+    // runs would count toward noCommentStreak. Post-fix, the 3 never-executed
+    // runs are skipped and the streak is measured over the 10 executed runs.
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 3,
+      now,
+      status: "failed",
+      livenessState: "failed",
+      usageJson: null,
+    });
+    const olderNow = new Date(now.getTime() - 4 * 60_000);
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now: olderNow,
+    });
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const reviews = await listProductivityReviews(seeded.companyId);
+    expect(reviews).toHaveLength(1);
+    expect(reviews[0]?.description).toContain("Primary trigger: `no_comment_streak`");
+    expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 10");
+    expect(reviews[0]?.description).toContain("Runtime-failure streak (terminal, never-executed runs): 3");
+  });
+
+  it("counts a failed run that produced token usage toward the no-comment streak — only zero-token failures are never-executed (BLO-21769 positive control)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+      status: "failed",
+      livenessState: "failed",
+      usageJson: { inputTokens: 500, outputTokens: 200 },
+    });
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const reviews = await listProductivityReviews(seeded.companyId);
+    expect(reviews).toHaveLength(1);
+    expect(reviews[0]?.description).toContain("Primary trigger: `no_comment_streak`");
+    expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 10");
+    expect(reviews[0]?.description).toContain("Runtime-failure streak (terminal, never-executed runs): 0");
   });
 
   // BLO-19094: an open review grants its assignee issue:comment/issue:mutate on
