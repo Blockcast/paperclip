@@ -315,6 +315,53 @@ describeEmbeddedPostgres("issue create PR-review duplicate guard routes", () => 
     });
   }
 
+  it("gives up on the PR scope lock rather than blocking issue creation indefinitely", async () => {
+    // The lock's other holder is the GitHub webhook. Waiting on it without a
+    // bound would put an unbounded blocking wait on the product's hottest write
+    // path, and enough concurrent waiters would exhaust the connection pool.
+    // Serialization is an optimization on a guard that is fail-open by design,
+    // so it must lose to issue creation, not the other way round.
+    const { companyId, reviewer, app } = await setup();
+    let releaseHolder!: () => void;
+    let reportLockAcquired!: () => void;
+    const lockAcquired = new Promise<void>((resolve) => {
+      reportLockAcquired = resolve;
+    });
+    const release = new Promise<void>((resolve) => {
+      releaseHolder = resolve;
+    });
+
+    // Holds the scope for longer than the guard's acquisition budget and, unlike
+    // the racing-webhook cases above, never commits a review run — so if the
+    // create does come through it is genuinely unserialized, not merely late.
+    const holder = db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${TASK_KEY}, 0))`);
+      reportLockAcquired();
+      await release;
+    });
+    await lockAcquired;
+
+    try {
+      const startedAt = Date.now();
+      const response = await request(app)
+        .post(`/api/companies/${companyId}/issues`)
+        .send(reviewIssueBody(reviewer.id));
+      const elapsedMs = Date.now() - startedAt;
+
+      // Fails open: no live review run exists, so the create is legitimate and
+      // must succeed even though the guard never got its lock.
+      expect(response.status).toBe(201);
+      // Bounded. Generous vs. the 1s budget so a slow CI runner cannot flake it,
+      // but far below "blocks until the holder commits" — which is unbounded and
+      // is what this pins against.
+      expect(elapsedMs).toBeLessThan(10_000);
+      expect(await db.select().from(issues).where(eq(issues.companyId, companyId))).toHaveLength(1);
+    } finally {
+      releaseHolder();
+      await holder;
+    }
+  }, 20_000);
+
   it("rejects when the PR URL appears only in the description", async () => {
     const { companyId, reviewer, app } = await setup();
     await seedReviewRun(companyId, reviewer.id);
