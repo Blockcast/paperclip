@@ -11221,6 +11221,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     patch: Partial<typeof heartbeatRuns.$inferInsert> | undefined,
     label: string,
   ) {
+    const hasResultJsonPatch = Object.prototype.hasOwnProperty.call(patch ?? {}, "resultJson");
+    const resultJsonPatchParam = hasResultJsonPatch
+      ? JSON.stringify(patch?.resultJson ?? null)
+      : null;
+    const normalResultJson = hasResultJsonPatch
+      ? sql`${resultJsonPatchParam}::jsonb`
+      : sql`${heartbeatRuns.resultJson}`;
+    const stageExitResultJson = hasResultJsonPatch
+      ? sql`coalesce(${resultJsonPatchParam}::jsonb, '{}'::jsonb)`
+      : sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb)`;
     const statusPatch =
       expectedStatus === "running"
         ? {
@@ -11242,11 +11252,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             end`,
             resultJson: sql`case
               when ${heartbeatRuns.resultJson} ->> 'pipelineStageExitCancellationRequestedAt' is not null
-                then coalesce(${patch?.resultJson ?? null}::jsonb, '{}'::jsonb) || jsonb_build_object(
+                then ${stageExitResultJson} || jsonb_build_object(
                   'pipelineStageExitCancellationRequestedAt',
                   ${heartbeatRuns.resultJson} -> 'pipelineStageExitCancellationRequestedAt'
                 )
-              else ${patch?.resultJson ?? null}::jsonb
+              else ${normalResultJson}
             end`,
           }
         : { status, ...patch };
