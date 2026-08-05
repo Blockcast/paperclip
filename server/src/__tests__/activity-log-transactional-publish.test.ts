@@ -140,11 +140,16 @@ describeEmbeddedPostgres("logActivity publication vs. an enclosing transaction",
     `));
 
     try {
-      await expect(
-        db.transaction(async (tx) => {
+      let rejection: unknown = null;
+      try {
+        await db.transaction(async (tx) => {
           await logActivity(tx as unknown as Db, activityInput(entityId));
-        }),
-      ).rejects.toThrow(/violates check constraint|plugin_event_outbox_reject_approval_created_test/);
+        });
+      } catch (err) {
+        rejection = err;
+      }
+      expect(rejection).toBeInstanceOf(Error);
+      expect((rejection as Error).message).toContain("plugin_event_outbox");
 
       expect(await db.select().from(activityLog)).toHaveLength(0);
       expect(await db.select().from(pluginEventOutbox)).toHaveLength(0);
