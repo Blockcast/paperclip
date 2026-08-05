@@ -451,6 +451,7 @@ jobs:
           NS: ${{ vars.PAPERCLIP_NAMESPACE || 'paperclip' }}
           RELEASE: ${{ vars.PAPERCLIP_HELM_RELEASE || 'paperclip' }}
           TAG: sha-${{ steps.target.outputs.short }}-k8s-vendored
+          COMMIT: ${{ steps.target.outputs.full }}
           STAMP_SCRIPT: ${{ steps.tooling.outputs.stamp_script }}
         run: |
           set -euo pipefail
@@ -479,6 +480,7 @@ jobs:
             --show-only templates/deployment-api.yaml \
             --set image.tag="${TAG}" \
             --set-string image.digest="${DIGEST}" \
+            --set-string api.deployedCommit="${COMMIT}" \
             | kubectl create --dry-run=client -n "${NS}" -o json -f - > "${unstamped}"
 
           canonical_unstamped=$(jq -cS --arg key "${marker_key}" '
@@ -501,6 +503,7 @@ jobs:
             --show-only templates/deployment-api.yaml \
             --set image.tag="${TAG}" \
             --set-string image.digest="${DIGEST}" \
+            --set-string api.deployedCommit="${COMMIT}" \
             | PAPERCLIP_DEPLOY_NAMESPACE="${NS}" \
               PAPERCLIP_APPROVAL_PLAN_SHA256="${marker}" "${STAMP_SCRIPT}" \
             | kubectl create --dry-run=client -n "${NS}" -o json -f - > "${plan}"
@@ -607,6 +610,7 @@ jobs:
           NS: ${{ vars.PAPERCLIP_NAMESPACE || 'paperclip' }}
           RELEASE: ${{ vars.PAPERCLIP_HELM_RELEASE || 'paperclip' }}
           TAG: sha-${{ steps.target.outputs.short }}-k8s-vendored
+          COMMIT: ${{ steps.target.outputs.full }}
           PLAN_MARKER: ${{ steps.plan.outputs.marker }}
           APPROVED_SERVER_PLAN: ${{ steps.approval.outputs.server_plan_path }}
           APPROVE_SCRIPT: ${{ steps.tooling.outputs.approve_script }}
@@ -697,6 +701,7 @@ jobs:
             -f deploy/helm/paperclip/values.blockcast.yaml \
             --set image.tag="${TAG}" \
             --set-string image.digest="${DIGEST}" \
+            --set-string api.deployedCommit="${COMMIT}" \
             --post-renderer "${STAMP_SCRIPT}" \
             --wait --timeout 30m &
           helm_pid=$!
