@@ -4784,10 +4784,35 @@ export function issueRoutes(
     return present;
   }
 
+  type CoordinationMetadataDecision = Awaited<ReturnType<typeof access.decide>>;
+
+  // BLO-19912: the outcome of the coordination-metadata gate.
+  //
+  // `null` (returned by `decideCoordinationMetadataPatch`) means the path never
+  // applied — wrong actor kind, wrong company, or the actor already holds
+  // ordinary mutation authority over this issue. Nothing was attempted, so
+  // there is nothing to record. A `refused` outcome means a coordinator did
+  // reach the gate and was turned away, which is the operator-visible signal
+  // that was previously missing.
+  type CoordinationMetadataOutcome =
+    | { kind: "allowed"; decision: CoordinationMetadataDecision }
+    | {
+      kind: "refused";
+      refusalReason: "execution_lock";
+      blockedFields: string[];
+      executionRunId: string;
+    }
+    | {
+      kind: "refused";
+      refusalReason: "authorization_denied";
+      authorizationReason: CoordinationMetadataDecision["reason"];
+    };
+
   // BLO-18289: decide whether this agent may take the coordination-metadata
   // path on this issue. Returns the authorization decision when the path is
-  // available, or null when it is not (caller then falls through to the
-  // ordinary, unchanged mutation boundary).
+  // available, a refusal when the actor reached the gate and was turned away,
+  // or null when the path never applied. In both non-`allowed` cases the caller
+  // falls through to the ordinary, unchanged mutation boundary.
   async function decideCoordinationMetadataPatch(
     req: Request,
     issue: {
@@ -4799,10 +4824,17 @@ export function issueRoutes(
       assigneeAgentId: string | null;
       assigneeUserId: string | null;
       blockedByIssueIds: string[] | null;
-      executionRunId?: string | null;
+      // BLO-19912: required, deliberately not `executionRunId?: string | null`.
+      // This is the field the execution-sensitive branch below keys on, and an
+      // optional declaration lets a future caller pass an object without it,
+      // have the gate read "no lock", and permit a parentId / projectId /
+      // projectWorkspaceId rebind on a *running* issue. That fails open, where
+      // the BLO-18289 blocker bug failed closed. `blockedByIssueIds` was
+      // tightened to required in b3a240ec for exactly this reason.
+      executionRunId: string | null;
     },
     fields: string[],
-  ) {
+  ): Promise<CoordinationMetadataOutcome | null> {
     if (req.actor.type !== "agent" || !req.actor.agentId) return null;
     if (req.actor.companyId !== issue.companyId) return null;
     // Self-owned and unassigned issues already have ordinary mutation
@@ -4811,9 +4843,12 @@ export function issueRoutes(
     // Rebinding execution context or adding blockers under a live execution
     // lock can silently strand another agent's run; refuse the coordination
     // path so the request falls through to the standard mutation boundary.
-    if (
-      issue.executionRunId &&
-      fields.some((field) => {
+    //
+    // `filter` rather than `some` only so the refusal record can name the
+    // offending fields; a non-empty filter is the same predicate as `some`, so
+    // which requests are refused is unchanged.
+    const executionBlockedFields = issue.executionRunId
+      ? fields.filter((field) => {
         if (field === "blockedByIssueIds") {
           return !coordinationBlockerPatchOnlyRemoves(
             issue.blockedByIssueIds,
@@ -4822,8 +4857,14 @@ export function issueRoutes(
         }
         return COORDINATION_METADATA_EXECUTION_SENSITIVE_FIELDS.has(field);
       })
-    ) {
-      return null;
+      : [];
+    if (issue.executionRunId && executionBlockedFields.length > 0) {
+      return {
+        kind: "refused",
+        refusalReason: "execution_lock",
+        blockedFields: executionBlockedFields,
+        executionRunId: issue.executionRunId,
+      };
     }
     const decision = await access.decide({
       actor: req.actor,
@@ -4846,7 +4887,122 @@ export function issueRoutes(
         assigneeUserId: issue.assigneeUserId,
       },
     });
-    return decision.allowed ? decision : null;
+    return decision.allowed
+      ? { kind: "allowed", decision }
+      : { kind: "refused", refusalReason: "authorization_denied", authorizationReason: decision.reason };
+  }
+
+  const COORDINATION_METADATA_REFUSAL_ACTION = "issue.coordination_metadata_refused";
+  const COORDINATION_METADATA_REFUSAL_DEDUPE_WINDOW_MS = 5 * 60_000;
+
+  async function hasRecentCoordinationMetadataRefusal(input: {
+    companyId: string;
+    actorId: string;
+    issueId: string;
+    refusalReason: string;
+    fieldsKey: string;
+  }) {
+    const windowStart = new Date(Date.now() - COORDINATION_METADATA_REFUSAL_DEDUPE_WINDOW_MS);
+    const [existing] = await db
+      .select({ entityId: activityLog.entityId })
+      .from(activityLog)
+      .where(and(
+        eq(activityLog.companyId, input.companyId),
+        eq(activityLog.actorType, "agent"),
+        eq(activityLog.actorId, input.actorId),
+        eq(activityLog.action, COORDINATION_METADATA_REFUSAL_ACTION),
+        eq(activityLog.entityType, "issue"),
+        eq(activityLog.entityId, input.issueId),
+        gte(activityLog.createdAt, windowStart),
+        sql`${activityLog.details} ->> 'refusalReason' = ${input.refusalReason}`,
+        sql`${activityLog.details} ->> 'fieldsKey' = ${input.fieldsKey}`,
+      ))
+      .limit(1);
+    return Boolean(existing);
+  }
+
+  // BLO-19912: the refusal counterpart to the `issue.coordination_metadata_updated`
+  // audit below. A coordinator that reached the gate and was turned away left no
+  // trace at all: the request fell through to the ordinary boundary, and an
+  // attempted workspace rebind or blocker addition against a live run — the
+  // thing an operator reviewing this authority most wants to see — was invisible.
+  // Same channel as the success path so both sides of the gate are queryable
+  // together.
+  //
+  // This records the *coordination path's* decision, not the request's final
+  // outcome: a refused actor can still be authorized further down by an
+  // unrelated path (checkout-management override, recovery-action owner), and
+  // the record stands either way.
+  //
+  // Deliberately not wrapped in the BLO-18614 advisory-lock + aggregate-cap
+  // machinery that bounds `issue_write_denied`. That cap exists because the
+  // denial record retains up to 16 KB of an unauthorized actor's payload; this
+  // record is fixed-shape and holds no caller-controlled content beyond the
+  // allowlisted field names, so the only thing to bound is row count and a
+  // dedupe window covers it. Unlike BLO-18614 it therefore fails *open* — if
+  // the dedupe probe throws, emit anyway, because losing a small security
+  // signal is worse than writing a duplicate row.
+  //
+  // Best-effort end to end: this is observability on an authorization decision
+  // that has already been made, so nothing here may change the outcome of the
+  // request.
+  async function recordRefusedCoordinationMetadataPatch(
+    req: Request,
+    issue: { id: string; companyId: string; identifier?: string | null; assigneeAgentId: string | null },
+    fields: string[],
+    outcome: Extract<CoordinationMetadataOutcome, { kind: "refused" }>,
+  ) {
+    if (req.actor.type !== "agent" || !req.actor.agentId) return;
+    const fieldsKey = [...fields].sort().join(",");
+    try {
+      const actor = getActorInfo(req);
+      let duplicate = false;
+      try {
+        duplicate = await hasRecentCoordinationMetadataRefusal({
+          companyId: issue.companyId,
+          actorId: actor.actorId,
+          issueId: issue.id,
+          refusalReason: outcome.refusalReason,
+          fieldsKey,
+        });
+      } catch (err) {
+        logger.warn(
+          { err, issueId: issue.id, refusalReason: outcome.refusalReason },
+          "BLO-19912: coordination-metadata refusal dedupe check failed; recording anyway",
+        );
+      }
+      if (duplicate) return;
+
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+        action: COORDINATION_METADATA_REFUSAL_ACTION,
+        entityType: "issue",
+        entityId: issue.id,
+        issueId: issue.id,
+        details: {
+          identifier: issue.identifier ?? null,
+          path: "coordination_metadata_allowlist",
+          outcome: "refused",
+          refusalReason: outcome.refusalReason,
+          fields,
+          fieldsKey,
+          assigneeAgentId: issue.assigneeAgentId,
+          ...(outcome.refusalReason === "execution_lock"
+            ? { blockedFields: outcome.blockedFields, executionRunId: outcome.executionRunId }
+            : { authorizationReason: outcome.authorizationReason }),
+        },
+      });
+    } catch (err) {
+      logger.warn(
+        { err, issueId: issue.id, refusalReason: outcome.refusalReason },
+        "BLO-19912: failed to record refused coordination-metadata patch",
+      );
+    }
   }
 
   function isCreatorOrManagerChainRecoveryPatch(
@@ -9380,7 +9536,7 @@ export function issueRoutes(
     if (coordinationMetadataFields?.includes("blockedByIssueIds")) {
       existingRelations = await svc.getRelationSummaries(existing.id);
     }
-    const coordinationMetadataDecision = coordinationMetadataFields
+    const coordinationMetadataOutcome = coordinationMetadataFields
       ? await decideCoordinationMetadataPatch(
         req,
         {
@@ -9390,6 +9546,20 @@ export function issueRoutes(
         coordinationMetadataFields,
       )
       : null;
+    const coordinationMetadataDecision = coordinationMetadataOutcome?.kind === "allowed"
+      ? coordinationMetadataOutcome.decision
+      : null;
+    // BLO-19912: record the refusal before the boundary check, which returns
+    // early on denial. The record is the trace of the coordination attempt
+    // itself and must survive whichever way the fall-through resolves.
+    if (coordinationMetadataOutcome?.kind === "refused" && coordinationMetadataFields) {
+      await recordRefusedCoordinationMetadataPatch(
+        req,
+        existing,
+        coordinationMetadataFields,
+        coordinationMetadataOutcome,
+      );
+    }
     if (!(await assertAgentIssueMutationAllowed(
       req,
       res,

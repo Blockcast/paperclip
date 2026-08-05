@@ -4643,5 +4643,120 @@ describe("agent issue mutation checkout ownership", () => {
       expect(res.status, JSON.stringify(res.body)).toBe(403);
       expect(mockIssueService.remove).not.toHaveBeenCalled();
     });
+
+    // BLO-19912. A refused coordination attempt used to fall through to the
+    // ordinary boundary and leave no trace of the coordination path at all, so
+    // a rebind attempted against a live run — the thing an operator reviewing
+    // this authority most wants to see — was invisible.
+    describe("refusal records", () => {
+      function refusalRecords() {
+        return mockLogActivity.mock.calls
+          .map(([, entry]) => entry as { action?: string; details?: Record<string, unknown> })
+          .filter((entry) => entry.action === "issue.coordination_metadata_refused");
+      }
+
+      it("records an execution-lock refusal with the actor, issue, fields, and holding run", async () => {
+        mockIssueService.getById.mockResolvedValue(
+          makeIssue({ status: "in_progress", assigneeAgentId: ownerAgentId, executionRunId: ownerRunId }),
+        );
+        mockAccessService.decide.mockImplementation(coordinationHolderDecide(true));
+
+        await request(await createApp(peerActor()))
+          .patch(`/api/issues/${issueId}`)
+          .send({ projectWorkspaceId: "99999999-9999-4999-8999-999999999999" });
+
+        expect(mockLogActivity).toHaveBeenCalledWith(
+          expect.anything(),
+          expect.objectContaining({
+            action: "issue.coordination_metadata_refused",
+            entityId: issueId,
+            agentId: peerAgentId,
+            details: expect.objectContaining({
+              path: "coordination_metadata_allowlist",
+              outcome: "refused",
+              refusalReason: "execution_lock",
+              fields: ["projectWorkspaceId"],
+              blockedFields: ["projectWorkspaceId"],
+              executionRunId: ownerRunId,
+              assigneeAgentId: ownerAgentId,
+            }),
+          }),
+        );
+      });
+
+      // The two refusals have different remedies — wait for the run to finish
+      // versus grant the actor tasks:assign — so an operator must be able to
+      // tell them apart from the record alone.
+      it("distinguishes an authorization denial from an execution-lock refusal", async () => {
+        mockIssueService.getById.mockResolvedValue(otherAgentsParkedIssue());
+        mockAccessService.decide.mockImplementation(coordinationHolderDecide(false));
+
+        await request(await createApp(peerActor()))
+          .patch(`/api/issues/${issueId}`)
+          .send({ blockedByIssueIds: [] });
+
+        expect(refusalRecords()).toEqual([
+          expect.objectContaining({
+            details: expect.objectContaining({
+              refusalReason: "authorization_denied",
+              authorizationReason: "deny_missing_grant",
+              fields: ["blockedByIssueIds"],
+            }),
+          }),
+        ]);
+        expect(refusalRecords()[0]?.details).not.toHaveProperty("executionRunId");
+      });
+
+      // The gate was never reached: the assignee already holds ordinary
+      // mutation authority, so there is no coordination attempt to record and
+      // logging one would drown the real signal.
+      it("does not record a refusal when the actor is the assignee", async () => {
+        mockIssueService.getById.mockResolvedValue(
+          makeIssue({ status: "todo", assigneeAgentId: ownerAgentId, executionRunId: null }),
+        );
+        mockAccessService.decide.mockImplementation(coordinationHolderDecide(false));
+
+        await request(await createApp(ownerActor()))
+          .patch(`/api/issues/${issueId}`)
+          .send({ priority: "low" });
+
+        expect(refusalRecords()).toEqual([]);
+      });
+
+      it("records no refusal when the coordination path is allowed", async () => {
+        mockIssueService.getById.mockResolvedValue(otherAgentsParkedIssue());
+        mockAccessService.decide.mockImplementation(coordinationHolderDecide(true));
+
+        await request(await createApp(peerActor()))
+          .patch(`/api/issues/${issueId}`)
+          .send({ blockedByIssueIds: [] })
+          .expect(200);
+
+        expect(refusalRecords()).toEqual([]);
+        expect(mockLogActivity).toHaveBeenCalledWith(
+          expect.anything(),
+          expect.objectContaining({ action: "issue.coordination_metadata_updated" }),
+        );
+      });
+
+      // Observability must never become a failure mode of the thing it
+      // observes: the refusal itself is an authorization decision that has
+      // already been made, so a logging fault leaves the outcome unchanged.
+      it("still refuses the write when recording the refusal fails", async () => {
+        mockIssueService.getById.mockResolvedValue(
+          makeIssue({ status: "in_progress", assigneeAgentId: ownerAgentId, executionRunId: ownerRunId }),
+        );
+        mockAccessService.decide.mockImplementation(coordinationHolderDecide(true));
+        mockLogActivity.mockRejectedValueOnce(new Error("activity log unavailable"));
+
+        const res = await request(await createApp(peerActor()))
+          .patch(`/api/issues/${issueId}`)
+          .send({ projectWorkspaceId: "99999999-9999-4999-8999-999999999999" });
+
+        expect(res.status, JSON.stringify(res.body)).toBeGreaterThanOrEqual(400);
+        expect(res.status, JSON.stringify(res.body)).toBeLessThan(500);
+        expect(mockIssueService.update).not.toHaveBeenCalled();
+      });
+    });
   });
 });
