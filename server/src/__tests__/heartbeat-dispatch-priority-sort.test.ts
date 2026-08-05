@@ -1795,6 +1795,57 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
       queuedRunDispatchBounds: { scanLimit: 2, maxScanBatches: 1, maxResumePasses: 64 },
     });
 
+    // Execution gate. Ally's review of this branch (PR #1022 comment
+    // 5191176696, Important finding 2) showed phase 2 below was
+    // timing-dependent: the mock resolved immediately, so a completion could
+    // trigger further dispatch passes that drained the arrivals the loop had
+    // just inserted before its next iteration ran. The forward scan could then
+    // reach the end of the queued set, `scanExhausted` would latch, the resume
+    // cursor would clear, and the MAIN scan would rediscover `target` via a
+    // head rescan -- with Lane C never paging at all. The case could therefore
+    // pass against pre-fix source, which makes it worthless as this issue's
+    // verifying signal.
+    //
+    // Holding each execution open makes slot release explicit rather than
+    // incidental, which is what removes the timing dependence. See phase 2.
+    //
+    // Declared OUTSIDE the try so the finally block can still release
+    // everything; `const` in the try block is not in scope there.
+    const heldExecutions = new Map<string, () => void>();
+    let gateExecutions = false;
+    const releaseOneExecution = () => {
+      for (const [runId, release] of heldExecutions) {
+        heldExecutions.delete(runId);
+        release();
+        return true;
+      }
+      return false;
+    };
+    const releaseAllExecutions = () => {
+      // Unblock everything, so the finally-block drain can never hang.
+      let released = releaseOneExecution();
+      while (released) {
+        released = releaseOneExecution();
+      }
+    };
+    const waitForHeldExecution = async (timeoutMs = 10_000) => {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline && heldExecutions.size === 0) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      return heldExecutions.size > 0;
+    };
+    const countQueuedRuns = async () => {
+      const queued = await db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(and(
+          eq(heartbeatRuns.companyId, companyId),
+          eq(heartbeatRuns.status, "queued"),
+        ));
+      return queued.length;
+    };
+
     try {
       await db.insert(companies).values({
         id: companyId,
@@ -1913,6 +1964,11 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
       const dispatchedRunIds: string[] = [];
       mockAdapterExecute.mockImplementation(async (args: { runId: string }) => {
         dispatchedRunIds.push(args.runId);
+        if (gateExecutions) {
+          await new Promise<void>((resolve) => {
+            heldExecutions.set(args.runId, resolve);
+          });
+        }
         return {
           exitCode: 0,
           signal: null as string | null,
@@ -1997,34 +2053,106 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
         ));
 
       // SUSTAINED arrivals are load-bearing, not flavour. A pass consumes
-      // `scanLimit` (2) rows of forward scan; feeding it 2 new rows per pass
-      // keeps every batch full, so `scanExhausted` never latches, the resume
-      // cursor is never cleared, and the head rescan that would otherwise
-      // rediscover `target` never fires. Without this the finite queue drains,
-      // the scan exhausts, and the main scan rescues `target` on its own — which
-      // makes the test pass against the unfixed source and proves nothing.
-      const targetDeadline = Date.now() + 120_000;
+      // `scanLimit` (2) rows of forward scan; if the queued set ever drains to
+      // within that window, `scanExhausted` latches, the resume cursor clears,
+      // and the head rescan rediscovers `target` through the MAIN scan -- which
+      // makes the case pass against the unfixed source and proves nothing.
+      //
+      // The previous version of this loop tried to arrange that by inserting
+      // two rows per iteration and sleeping. That was not sound: with the mock
+      // resolving immediately, completion-triggered passes could consume rows
+      // between iterations, so the arrival rate was never actually guaranteed
+      // to outrun the drain rate. Ally caught it; the fix is to stop relying on
+      // rates at all.
+      //
+      // Gated protocol -- one slot, one held execution, so the accounting is
+      // exact rather than statistical:
+      //
+      //   a. two fresh criticals are inserted while the only slot is OCCUPIED
+      //      and held, so no dispatch can consume them yet;
+      //   b. exactly one execution is then released, freeing exactly one slot;
+      //   c. whichever pass fills that slot -- ours below, or one triggered by
+      //      the completion itself -- can dispatch at most one row, because
+      //      maxConcurrentRuns is 1 and the new occupant is held too.
+      //
+      // Two rows in, at most one row out, per iteration. The queued set is
+      // therefore monotonically non-decreasing by construction, independent of
+      // any timing, so the bounded forward scan cannot reach its end. That is
+      // the precondition the assertion below records.
+      gateExecutions = true;
+      await boundedHeartbeat.resumeQueuedRuns();
+      expect(await waitForHeldExecution()).toBe(true);
+
+      let minQueuedDuringPhaseTwo = await countQueuedRuns();
+      const sampleQueuedDepth = async () => {
+        minQueuedDuringPhaseTwo = Math.min(minQueuedDuringPhaseTwo, await countQueuedRuns());
+      };
+      // 90s, not 120s. Phase 1 (60s) + phase 2 + the finally drain (60s) must
+      // fit inside the `it` timeout with room to spare, or a REGRESSION fails
+      // as an opaque "Test timed out" instead of reporting which assertion
+      // broke -- which is exactly what the pre-fix run below did at the old
+      // 60+120+60 = 240s budget. Measured post-fix the target dispatches within
+      // seconds (~16s for the whole case locally), so this is pure headroom.
+      const targetDeadline = Date.now() + 90_000;
       while (Date.now() < targetDeadline && !dispatchedRunIds.includes(targetRunId)) {
+        // Sample at the TROUGH -- after the previous iteration's dispatch has
+        // consumed a row and before this one's replacements land. Sampling
+        // after the inserts would measure the peak and flatter the assertion.
+        await sampleQueuedDepth();
+        // (a) replacements land while the slot is still occupied
         await arriveFreshCritical();
         await arriveFreshCritical();
+        // (b) free exactly one slot
+        releaseOneExecution();
+        // (c) let the freed slot be refilled, by our pass or a completion's
         await boundedHeartbeat.resumeQueuedRuns();
-        await new Promise((resolve) => setTimeout(resolve, 50));
+        await waitForHeldExecution(2_000);
+        await sampleQueuedDepth();
       }
+      // Capture the verdict BEFORE any teardown. This is load-bearing and was
+      // measured, not reasoned: releasing the gates lets the queue drain
+      // freely, and a drained queue is precisely the condition under which the
+      // main forward scan exhausts, clears its cursor, and rescues `target` on
+      // a head rescan -- with Lane C never paging. Asserting after the drain
+      // therefore passes against PRE-FIX source (observed: pre-fix passed in
+      // 215s once the `it` budget was raised enough to reach the assertion).
+      // The sustained-pressure window is the only interval in which the
+      // question this case exists to ask is even well-posed.
+      const targetDispatchedUnderSustainedPressure = dispatchedRunIds.includes(targetRunId);
+
+      releaseAllExecutions();
+      gateExecutions = false;
       await boundedHeartbeat.drainInFlightExecutions(60_000);
 
-      // The regression: masked behind a dependency-blocked page AND behind the
-      // main resume cursor, the aged row must still be dispatched.
-      expect(dispatchedRunIds).toContain(targetRunId);
+      // The precondition, now asserted rather than assumed: the queued set
+      // never fell within the forward scan's reach, so `target` cannot have
+      // been rescued by a head rescan after exhaustion. Without this the
+      // assertion below does not distinguish the lane from the main scan.
+      expect(minQueuedDuringPhaseTwo).toBeGreaterThan(2);
 
+      // The regression: masked behind a dependency-blocked page AND behind the
+      // main resume cursor, the aged row must still be dispatched -- while the
+      // pressure is still on.
+      expect(targetDispatchedUnderSustainedPressure).toBe(true);
+
+      // Secondary, and deliberately NOT the discriminating assertion: this runs
+      // after the drain, where pre-fix source also settles the row. It only
+      // guards against `target` being counted as dispatched while its run row
+      // was left stuck in `queued`. Do not promote it to the regression check.
       const [settled] = await db
         .select({ status: heartbeatRuns.status })
         .from(heartbeatRuns)
         .where(eq(heartbeatRuns.id, targetRunId));
       expect(settled?.status).not.toBe("queued");
     } finally {
+      releaseAllExecutions();
       await boundedHeartbeat.drainInFlightExecutions(60_000);
     }
-  }, 240_000);
+    // 300s so the worst case -- phase 1 (60s) + phase 2 (90s) + drain (60s) --
+    // still leaves headroom for the assertions to run and REPORT. At the old
+    // 240s this case failed as "Test timed out" against pre-fix source, which
+    // discriminates but says nothing about what broke.
+  }, 300_000);
 
   it("dispatches critical issue work before an aged issue-less run without starving routine issue work (BLO-19337)", async () => {
     // Regression for BLO-18995: dispatchRank returned a flat `10` for any run
