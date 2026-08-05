@@ -90,29 +90,102 @@ export function resolveLinkSourceForIdentifier(
 // must not create ownership. Fenced code is excluded for the same reason.
 const OWNING_REFERENCE_LABEL_PATTERN =
   /^ {0,3}(?:[-*+]|\d{1,3}[.)])?[ \t]*(?:fix(?:e[sd])?|clos(?:e[sd]?)|resolv(?:e[sd]?)|refs?)[ \t]*:?[ \t]+(.+)$/i;
-const MARKDOWN_FENCE_PATTERN = /^ {0,3}(`{3,}|~{3,})/;
+// Fenced code is what makes an example body safe to write: `Refs: BLO-1` inside
+// a code block DOCUMENTS the convention, it does not claim ownership. Two
+// perfectly ordinary Markdown forms defeated a root-level-only fence scanner,
+// and neither needs an adversarial author to appear:
+//
+//   - A fence nested in a list item (`- ```md`). The opening line starts with a
+//     list marker, so it never registered as a fence, leaving the indented
+//     `Refs:` line inside it visible to the label match. This repo's own issue
+//     bodies use exactly that shape to quote an example PR body.
+//   - A line inside an open fence that repeats the marker with an info string
+//     (``` js). CommonMark says a CLOSING fence may carry only whitespace after
+//     its marker run, so that line is content -- but a length-only comparison
+//     read it as the close, reopening the rest of the block to ownership.
+//
+// Both paths let an issue named only in an example capture an author-directed
+// "push a follow-up commit" wake, which is this ticket's defect reached through
+// the parser instead of the tier order. So: a fence opener is recognized after
+// an optional list marker, and a fence closes only on a same-or-longer marker
+// run followed by nothing but whitespace. Anything ambiguous keeps the fence
+// OPEN, which fails closed to "no owning reference" -- the safe direction,
+// since the caller then drops the wake or sends it to the reviewer rather than
+// guessing an owner.
+const MARKDOWN_FENCE_PATTERN = /^ {0,3}(?:[-*+]|\d{1,3}[.)])?[ \t]*(`{3,}|~{3,})(.*)$/;
 const TRAILING_NON_OWNING_LABEL_PATTERN =
   /(?:[;,][ \t]*|[ \t]+)(?:related|supersedes?|see[ \t]+also)[ \t]*:/i;
+
+/**
+ * Remove HTML-comment spans from one line, carrying `inComment` across lines.
+ *
+ * An HTML comment renders as nothing, so a `Refs:` line hidden inside one
+ * declares an owner that no human reading the PR can see -- recreating the
+ * wrong-assignee wake this module exists to prevent, with no visible cause to
+ * debug from. The opener and its `-->` routinely sit on different lines (the
+ * repo's own PULL_REQUEST_TEMPLATE.md ships multi-line instructional comments
+ * in every section), which is why the state has to survive the line loop.
+ * An unterminated `<!--` swallows the remainder of the body: fail closed.
+ */
+function stripHtmlComments(line: string, inComment: boolean): { visible: string; open: boolean } {
+  let visible = "";
+  let open = inComment;
+  let index = 0;
+  while (index < line.length) {
+    if (open) {
+      const end = line.indexOf("-->", index);
+      if (end === -1) return { visible, open: true };
+      open = false;
+      index = end + 3;
+      continue;
+    }
+    const start = line.indexOf("<!--", index);
+    if (start === -1) {
+      visible += line.slice(index);
+      break;
+    }
+    visible += line.slice(index, start);
+    open = true;
+    index = start + 4;
+  }
+  return { visible, open };
+}
 
 /** Identifiers that appear on a labeled owning-reference line in `body` (see above). */
 export function extractOwningLabeledIdentifiers(body: string | null | undefined): string[] {
   if (!body) return [];
   const found = new Set<string>();
   let fence: { marker: "`" | "~"; length: number } | null = null;
+  let htmlComment = false;
   for (const line of body.split(/\r?\n/)) {
-    const fenceMatch = line.match(MARKDOWN_FENCE_PATTERN);
-    if (fenceMatch?.[1]) {
-      const marker = fenceMatch[1][0] as "`" | "~";
-      if (!fence) {
-        fence = { marker, length: fenceMatch[1].length };
-      } else if (marker === fence.marker && fenceMatch[1].length >= fence.length) {
+    if (fence) {
+      const closeMatch = line.match(MARKDOWN_FENCE_PATTERN);
+      const closer = closeMatch?.[1];
+      if (
+        closer &&
+        closer[0] === fence.marker &&
+        closer.length >= fence.length &&
+        (closeMatch?.[2] ?? "").trim() === ""
+      ) {
         fence = null;
       }
       continue;
     }
-    if (fence || line.startsWith("\t") || line.startsWith("    ")) continue;
 
-    const match = line.match(OWNING_REFERENCE_LABEL_PATTERN);
+    // Comments are stripped before anything else looks at the line, so a fence
+    // marker or a `Refs:` label that exists only inside a comment is invisible
+    // here exactly as it is on the rendered PR.
+    const { visible, open } = stripHtmlComments(line, htmlComment);
+    htmlComment = open;
+
+    const fenceMatch = visible.match(MARKDOWN_FENCE_PATTERN);
+    if (fenceMatch?.[1]) {
+      fence = { marker: fenceMatch[1][0] as "`" | "~", length: fenceMatch[1].length };
+      continue;
+    }
+    if (line.startsWith("\t") || line.startsWith("    ")) continue;
+
+    const match = visible.match(OWNING_REFERENCE_LABEL_PATTERN);
     const rest = match?.[1]?.split(TRAILING_NON_OWNING_LABEL_PATTERN, 1)[0];
     if (!rest) continue;
     for (const identifier of extractPaperclipIdentifiers(rest)) found.add(identifier);
