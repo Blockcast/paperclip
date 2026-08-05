@@ -3196,6 +3196,7 @@ describe.sequential("issue comment reopen routes", () => {
         "11111111-1111-4111-8111-111111111111",
         expect.objectContaining({
           status: "done",
+          expectedCurrentStatus: "in_review",
           expectedCurrentExecutionPolicy: policy,
         }),
         mockTx,
@@ -4130,6 +4131,7 @@ describe.sequential("issue comment reopen routes", () => {
         "11111111-1111-4111-8111-111111111111",
         expect.objectContaining({
           status: "done",
+          expectedCurrentStatus: "in_review",
           expectedCurrentExecutionPolicy: policy,
         }),
         mockTx,

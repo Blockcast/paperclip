@@ -1873,12 +1873,14 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
 
       const persistedSnapshot = await db
         .select({
+          status: issues.status,
           executionState: issues.executionState,
           executionPolicy: issues.executionPolicy,
         })
         .from(issues)
         .where(eq(issues.id, issueId))
         .then((rows) => rows[0] as {
+          status: string;
           executionState: typeof executionState;
           executionPolicy: typeof executionPolicy;
         });
@@ -1905,11 +1907,13 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
       const secondState = firstWriter === "review_request" ? decisionState : reviewRequestState;
       await svc.update(issueId, {
         executionState: firstState,
+        expectedCurrentStatus: persistedSnapshot.status,
         expectedCurrentExecutionState: persistedSnapshot.executionState,
         expectedCurrentExecutionPolicy: persistedSnapshot.executionPolicy,
       });
       await expect(svc.update(issueId, {
         executionState: secondState,
+        expectedCurrentStatus: persistedSnapshot.status,
         expectedCurrentExecutionState: persistedSnapshot.executionState,
         expectedCurrentExecutionPolicy: persistedSnapshot.executionPolicy,
       })).rejects.toMatchObject({ status: 409 });
@@ -1920,6 +1924,172 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
         .where(eq(issues.id, issueId))
         .then((rows) => rows[0]);
       expect(row?.executionState).toEqual(firstState);
+    },
+  );
+
+  async function seedPendingReviewStageIssue(title: string) {
+    const { companyId, agentId } = await seedCompanyAgentAndRuns();
+    const issueId = randomUUID();
+    const stageId = randomUUID();
+    const executionPolicy = {
+      mode: "normal",
+      commentRequired: true,
+      stages: [{
+        id: stageId,
+        type: "review",
+        approvalsNeeded: 1,
+        participants: [{ type: "agent", agentId }],
+      }],
+    };
+    const executionState = {
+      status: "pending",
+      currentStageId: stageId,
+      currentStageIndex: 0,
+      currentStageType: "review",
+      currentParticipant: { type: "agent", agentId },
+      returnAssignee: { type: "agent", agentId },
+      completedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+      reviewRequest: null,
+    };
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title,
+      status: "in_review",
+      priority: "high",
+      assigneeAgentId: agentId,
+      executionPolicy,
+      executionState,
+    });
+    return { agentId, issueId, stageId, executionPolicy, executionState };
+  }
+
+  it.each(["review_request", "decision"] as const)(
+    "rejects a stale %s write after release commits first",
+    async (writer) => {
+      const seeded = await seedPendingReviewStageIssue(`Release wins before ${writer}`);
+      const persistedSnapshot = await db
+        .select({
+          status: issues.status,
+          executionState: issues.executionState,
+          executionPolicy: issues.executionPolicy,
+        })
+        .from(issues)
+        .where(eq(issues.id, seeded.issueId))
+        .then((rows) => rows[0] as {
+          status: string;
+          executionState: typeof seeded.executionState;
+          executionPolicy: typeof seeded.executionPolicy;
+        });
+      const nextState = writer === "review_request"
+        ? {
+            ...persistedSnapshot.executionState,
+            reviewRequest: { instructions: "Review after release." },
+          }
+        : {
+            ...persistedSnapshot.executionState,
+            status: "completed",
+            currentStageId: null,
+            currentStageIndex: null,
+            currentStageType: null,
+            currentParticipant: null,
+            returnAssignee: null,
+            completedStageIds: [seeded.stageId],
+            lastDecisionId: randomUUID(),
+            lastDecisionOutcome: "approved",
+            reviewRequest: null,
+          };
+
+      const svc = issueService(db);
+      await svc.release(seeded.issueId, seeded.agentId);
+
+      await expect(svc.update(seeded.issueId, {
+        ...(writer === "decision" ? { status: "done" as const } : {}),
+        executionState: nextState,
+        expectedCurrentStatus: persistedSnapshot.status,
+        expectedCurrentExecutionState: persistedSnapshot.executionState,
+        expectedCurrentExecutionPolicy: persistedSnapshot.executionPolicy,
+      })).rejects.toMatchObject({ status: 409 });
+
+      const row = await db
+        .select({
+          status: issues.status,
+          assigneeAgentId: issues.assigneeAgentId,
+          executionState: issues.executionState,
+        })
+        .from(issues)
+        .where(eq(issues.id, seeded.issueId))
+        .then((rows) => rows[0]);
+      expect(row).toEqual({
+        status: "todo",
+        assigneeAgentId: null,
+        executionState: persistedSnapshot.executionState,
+      });
+    },
+  );
+
+  it.each(["review_request", "decision"] as const)(
+    "keeps the issue released when release follows a current %s write",
+    async (writer) => {
+      const seeded = await seedPendingReviewStageIssue(`Release follows ${writer}`);
+      const persistedSnapshot = await db
+        .select({
+          status: issues.status,
+          executionState: issues.executionState,
+          executionPolicy: issues.executionPolicy,
+        })
+        .from(issues)
+        .where(eq(issues.id, seeded.issueId))
+        .then((rows) => rows[0] as {
+          status: string;
+          executionState: typeof seeded.executionState;
+          executionPolicy: typeof seeded.executionPolicy;
+        });
+      const nextState = writer === "review_request"
+        ? {
+            ...persistedSnapshot.executionState,
+            reviewRequest: { instructions: "Review before release." },
+          }
+        : {
+            ...persistedSnapshot.executionState,
+            status: "completed",
+            currentStageId: null,
+            currentStageIndex: null,
+            currentStageType: null,
+            currentParticipant: null,
+            returnAssignee: null,
+            completedStageIds: [seeded.stageId],
+            lastDecisionId: randomUUID(),
+            lastDecisionOutcome: "approved",
+            reviewRequest: null,
+          };
+
+      const svc = issueService(db);
+      await svc.update(seeded.issueId, {
+        ...(writer === "decision" ? { status: "done" as const } : {}),
+        executionState: nextState,
+        expectedCurrentStatus: persistedSnapshot.status,
+        expectedCurrentExecutionState: persistedSnapshot.executionState,
+        expectedCurrentExecutionPolicy: persistedSnapshot.executionPolicy,
+      });
+      await svc.release(seeded.issueId, seeded.agentId);
+
+      const row = await db
+        .select({
+          status: issues.status,
+          assigneeAgentId: issues.assigneeAgentId,
+          executionState: issues.executionState,
+        })
+        .from(issues)
+        .where(eq(issues.id, seeded.issueId))
+        .then((rows) => rows[0]);
+      expect(row).toEqual({
+        status: "todo",
+        assigneeAgentId: null,
+        executionState: nextState,
+      });
     },
   );
 

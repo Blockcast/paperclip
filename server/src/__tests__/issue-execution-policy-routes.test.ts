@@ -1431,6 +1431,9 @@ describe("issue execution policy routes", () => {
             lastDecisionOutcome: "approved",
             lastDecisionId: expect.any(String),
           }),
+          expectedCurrentStatus: "in_review",
+          expectedCurrentExecutionState: issue.executionState,
+          expectedCurrentExecutionPolicy: issue.executionPolicy,
         }),
         expect.anything(),
       );
@@ -1777,6 +1780,7 @@ describe("issue execution policy routes", () => {
         executionState: expect.objectContaining({
           reviewRequest: { instructions: "Check the concurrency behavior." },
         }),
+        expectedCurrentStatus: "in_review",
         expectedCurrentExecutionState: executionState,
         expectedCurrentExecutionPolicy: executionPolicy,
       }),

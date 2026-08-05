@@ -10175,6 +10175,7 @@ export function issueRoutes(
     const executionSnapshotPreconditions = updateFields.executionState === undefined
       ? {}
       : {
+          expectedCurrentStatus: existing.status,
           expectedCurrentExecutionState:
             existing.executionState && typeof existing.executionState === "object"
               ? existing.executionState
@@ -12650,6 +12651,7 @@ export function issueRoutes(
             );
             const updated = await svc.update(id, {
               ...updatePatch,
+              expectedCurrentStatus: currentIssue.status,
               expectedCurrentExecutionState:
                 currentIssue.executionState && typeof currentIssue.executionState === "object"
                   ? currentIssue.executionState
