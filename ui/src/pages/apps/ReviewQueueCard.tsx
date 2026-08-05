@@ -61,15 +61,6 @@ export function ReviewQueueCard({
     void query.refetch();
   }, [query.dataUpdatedAt, query.fetchStatus, query.refetch, selectedCompanyId]);
 
-  useEffect(() => {
-    if (!selectedCompanyId || items.length > 0) return;
-    if (query.dataUpdatedAt === 0 || query.fetchStatus === "fetching") return;
-    const timeout = window.setTimeout(() => {
-      void query.refetch();
-    }, VISIBLE_EMPTY_QUEUE_REFRESH_MS);
-    return () => window.clearTimeout(timeout);
-  }, [items.length, query.dataUpdatedAt, query.fetchStatus, query.refetch, selectedCompanyId]);
-
   if (!selectedCompanyId) return null;
   if (query.isLoading) return null;
 

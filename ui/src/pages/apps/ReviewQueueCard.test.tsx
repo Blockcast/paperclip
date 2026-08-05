@@ -83,7 +83,11 @@ function pendingRequest() {
 async function flushReact() {
   await act(async () => {
     await Promise.resolve();
-    await new Promise((resolve) => window.setTimeout(resolve, 0));
+    if (vi.isFakeTimers()) {
+      await vi.advanceTimersByTimeAsync(0);
+    } else {
+      await new Promise((resolve) => window.setTimeout(resolve, 0));
+    }
   });
 }
 
@@ -145,6 +149,7 @@ describe("ReviewQueueCard", () => {
 
   afterEach(() => {
     act(() => root?.unmount());
+    vi.useRealTimers();
     container.remove();
     document.body.innerHTML = "";
     vi.clearAllMocks();
@@ -264,6 +269,7 @@ describe("ReviewQueueCard", () => {
   });
 
   it("keeps refreshing an empty mounted queue so externally-created pending requests appear", async () => {
+    vi.useFakeTimers();
     let pendingCreated = false;
     listActionRequestsMock.mockImplementation(async () => ({
       actionRequests: pendingCreated ? [pendingRequest()] : [],
@@ -271,27 +277,34 @@ describe("ReviewQueueCard", () => {
 
     await render();
 
-    await vi.waitFor(() => {
-      expect(listActionRequestsMock).toHaveBeenCalledTimes(2);
-      expect(document.body.textContent).toContain("Nothing is waiting for your OK right now.");
-    });
+    expect(listActionRequestsMock).toHaveBeenCalledTimes(2);
+    expect(document.body.textContent).toContain("Nothing is waiting for your OK right now.");
 
-    await vi.waitFor(
-      () => {
-        expect(listActionRequestsMock.mock.calls.length).toBeGreaterThanOrEqual(3);
-        expect(document.body.textContent).toContain("Nothing is waiting for your OK right now.");
-      },
-      { timeout: 3_500 },
-    );
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    await flushReact();
+    expect(listActionRequestsMock).toHaveBeenCalledTimes(3);
+    expect(document.body.textContent).toContain("Nothing is waiting for your OK right now.");
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    await flushReact();
+    expect(listActionRequestsMock).toHaveBeenCalledTimes(4);
+    expect(document.body.textContent).toContain("Nothing is waiting for your OK right now.");
 
     pendingCreated = true;
 
-    await vi.waitFor(
-      () => {
-        expect(listActionRequestsMock.mock.calls.length).toBeGreaterThanOrEqual(4);
-        expect(buttonContaining("Allow once")).toBeTruthy();
-      },
-      { timeout: 3_500 },
-    );
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    await flushReact();
+    expect(listActionRequestsMock).toHaveBeenCalledTimes(5);
+    await vi.waitFor(() => expect(buttonContaining("Allow once")).toBeTruthy(), {
+      timeout: 500,
+      interval: 10,
+    });
+    expect(listActionRequestsMock).toHaveBeenCalledTimes(5);
   });
 });
