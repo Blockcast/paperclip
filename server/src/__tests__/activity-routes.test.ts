@@ -121,7 +121,7 @@ describe.sequential("activity routes", () => {
       action: undefined,
       limit: 100,
     });
-    expect(JSON.parse(res.headers["x-applied-filters"])).toEqual({
+    expect(JSON.parse(decodeURIComponent(res.headers["x-applied-filters"]))).toEqual({
       agentId: null,
       entityType: null,
       entityId: null,
@@ -171,7 +171,33 @@ describe.sequential("activity routes", () => {
     expect(res.body).toEqual([
       { id: "evt-1", action: "issue_write_denied", entityType: "issue", entityId: "issue-1" },
     ]);
-    expect(JSON.parse(res.headers["x-applied-filters"]).action).toBe("issue_write_denied");
+    expect(JSON.parse(decodeURIComponent(res.headers["x-applied-filters"])).action).toBe("issue_write_denied");
+  });
+
+  it("rejects an empty ?action= instead of silently returning the unfiltered feed", async () => {
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl).get("/api/companies/company-1/activity?action="),
+    );
+
+    expect(res.status).toBe(400);
+    expect(res.body.emptyParams).toEqual(["action"]);
+    expect(mockActivityService.list).not.toHaveBeenCalled();
+  });
+
+  it("filters company activity by a Unicode action without crashing on the response header", async () => {
+    mockActivityService.list.mockResolvedValue([]);
+
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl).get(`/api/companies/company-1/activity?action=${encodeURIComponent("☃")}`),
+    );
+
+    expect(res.status).toBe(200);
+    expect(mockActivityService.list).toHaveBeenCalledWith(
+      expect.objectContaining({ action: "☃" }),
+    );
+    expect(JSON.parse(decodeURIComponent(res.headers["x-applied-filters"])).action).toBe("☃");
   });
 
   it("does not silently return an unfiltered feed when the action filter yields zero matches", async () => {
