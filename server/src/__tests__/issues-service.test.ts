@@ -618,6 +618,151 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     };
   }
 
+  // BLO-20649: `checkout` promotes to `in_progress`; releasing the lock has to
+  // undo that promotion, or `in_progress` becomes a high-water mark of every
+  // issue any wake ever touched.
+  describe("checkout status restore", () => {
+    async function seedCheckoutFixture(status: "todo" | "backlog" | "blocked") {
+      const companyId = await seedAssignableAgentCompany();
+      const agentId = randomUUID();
+      await db.insert(agents).values(agentRow(companyId, { id: agentId, name: "RestoreCoder" }));
+      const issue = await svc.create(companyId, {
+        title: `Restore round trip from ${status}`,
+        description: null,
+        status,
+        priority: "medium",
+      });
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId,
+        agentId,
+        status: "running",
+        invocationSource: "manual",
+      });
+      return { companyId, agentId, issue, runId };
+    }
+
+    async function finishRun(runId: string, status = "succeeded") {
+      await db.update(heartbeatRuns).set({ status }).where(eq(heartbeatRuns.id, runId));
+    }
+
+    function readIssue(id: string) {
+      return db
+        .select({ status: issues.status, restore: issues.checkoutRestoreStatus })
+        .from(issues)
+        .where(eq(issues.id, id))
+        .then((rows) => rows[0]!);
+    }
+
+    it("returns a todo issue to todo when the run releases without advancing it", async () => {
+      const { agentId, issue, runId } = await seedCheckoutFixture("todo");
+
+      await svc.checkout(issue.id, agentId, ["todo"], runId);
+      expect(await readIssue(issue.id)).toMatchObject({ status: "in_progress", restore: "todo" });
+
+      await finishRun(runId);
+      await svc.clearCheckoutRunIfTerminal(issue.id);
+
+      expect(await readIssue(issue.id)).toMatchObject({ status: "todo", restore: null });
+    });
+
+    it("returns a backlog issue to backlog, not todo", async () => {
+      const { agentId, issue, runId } = await seedCheckoutFixture("backlog");
+
+      await svc.checkout(issue.id, agentId, ["backlog"], runId);
+      expect(await readIssue(issue.id)).toMatchObject({ status: "in_progress", restore: "backlog" });
+
+      await finishRun(runId);
+      await svc.clearCheckoutRunIfTerminal(issue.id);
+
+      expect(await readIssue(issue.id)).toMatchObject({ status: "backlog", restore: null });
+    });
+
+    it("keeps a status the run actually wrote", async () => {
+      const { agentId, issue, runId } = await seedCheckoutFixture("todo");
+
+      await svc.checkout(issue.id, agentId, ["todo"], runId);
+      await svc.update(issue.id, { status: "in_review" });
+      expect(await readIssue(issue.id)).toMatchObject({ status: "in_review", restore: null });
+
+      await finishRun(runId);
+      await svc.clearCheckoutRunIfTerminal(issue.id);
+
+      expect(await readIssue(issue.id)).toMatchObject({ status: "in_review", restore: null });
+    });
+
+    it("keeps an explicit in_progress write instead of resetting it", async () => {
+      const { agentId, issue, runId } = await seedCheckoutFixture("todo");
+
+      await svc.checkout(issue.id, agentId, ["todo"], runId);
+      // Re-asserting in_progress is a deliberate claim by the run, so it clears
+      // the marker and must survive the release.
+      await svc.update(issue.id, { status: "in_progress" });
+      expect(await readIssue(issue.id)).toMatchObject({ restore: null });
+
+      await finishRun(runId);
+      await svc.clearCheckoutRunIfTerminal(issue.id);
+
+      expect(await readIssue(issue.id)).toMatchObject({ status: "in_progress", restore: null });
+    });
+
+    it("does not reset while the checkout run is still live", async () => {
+      const { agentId, issue, runId } = await seedCheckoutFixture("todo");
+
+      await svc.checkout(issue.id, agentId, ["todo"], runId);
+      // Run is still `running`; both clear paths must decline.
+      await svc.clearExecutionRunIfTerminal(issue.id);
+      await svc.clearCheckoutRunIfTerminal(issue.id);
+
+      expect(await readIssue(issue.id)).toMatchObject({ status: "in_progress", restore: "todo" });
+    });
+
+    it("does not reset on execution-lock release while a live checkout still holds the row", async () => {
+      const { companyId, agentId, issue, runId } = await seedCheckoutFixture("todo");
+      await svc.checkout(issue.id, agentId, ["todo"], runId);
+
+      // Execution lock moves to a second, terminal run while the original
+      // checkout run keeps executing — a retry hand-off, not a release.
+      const retryRunId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: retryRunId,
+        companyId,
+        agentId,
+        status: "failed",
+        invocationSource: "manual",
+      });
+      await db
+        .update(issues)
+        .set({ executionRunId: retryRunId })
+        .where(eq(issues.id, issue.id));
+
+      await svc.clearExecutionRunIfTerminal(issue.id);
+
+      expect(await readIssue(issue.id)).toMatchObject({ status: "in_progress", restore: "todo" });
+    });
+
+    it("restores a pre-existing strand to todo when it is re-checked-out and released", async () => {
+      // Rows stranded before this fix carry no marker. Re-checkout adopts them
+      // with a `todo` marker so the backlog of strands drains instead of
+      // needing hand-demotion.
+      const { companyId, agentId, issue, runId } = await seedCheckoutFixture("todo");
+      await db
+        .update(issues)
+        .set({ status: "in_progress", assigneeAgentId: agentId, checkoutRestoreStatus: null })
+        .where(eq(issues.id, issue.id));
+
+      await svc.checkout(issue.id, agentId, ["todo", "in_progress"], runId);
+      expect(await readIssue(issue.id)).toMatchObject({ status: "in_progress", restore: "todo" });
+
+      await finishRun(runId);
+      await svc.clearCheckoutRunIfTerminal(issue.id);
+
+      expect(await readIssue(issue.id)).toMatchObject({ status: "todo", restore: null });
+      expect(companyId).toBeTruthy();
+    });
+  });
+
   it("rejects direct terminated assignees with structured conflict details", async () => {
     const companyId = await seedAssignableAgentCompany();
     const terminatedAgentId = randomUUID();

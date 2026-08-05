@@ -45,6 +45,12 @@ export const issues = pgTable(
     executionRunId: uuid("execution_run_id").references(() => heartbeatRuns.id, { onDelete: "set null" }),
     executionAgentNameKey: text("execution_agent_name_key"),
     executionLockedAt: timestamp("execution_locked_at", { withTimezone: true }),
+    // Status held immediately before `checkout` promoted this row to
+    // `in_progress`. A release that did not advance the issue restores it from
+    // here, so `in_progress` stops accumulating as a high-water mark. Null means
+    // there is no checkout promotion to undo — either the row was never checked
+    // out, or a run has since written a status of its own. See BLO-20649.
+    checkoutRestoreStatus: text("checkout_restore_status"),
     createdByAgentId: uuid("created_by_agent_id").references(() => agents.id),
     createdByUserId: text("created_by_user_id"),
     responsibleUserId: text("responsible_user_id"),

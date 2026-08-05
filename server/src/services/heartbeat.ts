@@ -201,6 +201,7 @@ import {
   WorkspaceRepoMismatchError,
 } from "./workspace-runtime.js";
 import { issueService } from "./issues.js";
+import { restoreCheckoutPromotedStatus } from "./issue-checkout-status.js";
 import { resolveStaleDependabotAlertWakeIssue } from "./dependabot-alert-issues.js";
 import { createToolGatewayService } from "./tool-gateway.js";
 import { toolAccessService } from "./tool-access.js";
@@ -12925,6 +12926,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             eq(issues.executionRunId, cancelled.id),
           ),
         );
+      // The gate cancelled this run before it could do anything, so undo the
+      // `in_progress` its checkout wrote (BLO-20649).
+      await restoreCheckoutPromotedStatus(db, gate.issueId);
     }
 
     await appendRunEvent(cancelled, await nextRunEventSeq(cancelled.id), {

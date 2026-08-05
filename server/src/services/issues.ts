@@ -71,6 +71,11 @@ import {
 } from "@paperclipai/shared";
 import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
 import { incrementBlockerResolvedWakeMetric } from "./blocker-resolved-wake-metrics.js";
+import {
+  checkoutRestoreStatusExpression,
+  restoreCheckoutPromotedStatus,
+  TERMINAL_HEARTBEAT_RUN_STATUS_VALUES,
+} from "./issue-checkout-status.js";
 import { logger } from "../middleware/logger.js";
 import { parseObject } from "../adapters/utils.js";
 import {
@@ -919,15 +924,9 @@ function sameRunLock(checkoutRunId: string | null, actorRunId: string | null) {
   return checkoutRunId == null;
 }
 
-export const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set([
-  "succeeded",
-  "interrupted",
-  "failed",
-  "error",
-  "adapter_failed",
-  "cancelled",
-  "timed_out",
-]);
+export const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set<string>(
+  TERMINAL_HEARTBEAT_RUN_STATUS_VALUES,
+);
 const STALE_ISSUE_CONTEXT_RUN_STATUSES = ["queued", "scheduled_retry"] as const;
 const ISSUE_LIST_DESCRIPTION_MAX_CHARS = 1200;
 
@@ -5787,6 +5786,8 @@ export function issueService(db: Db) {
         .returning({ id: issues.id })
         .then((rows) => rows[0] ?? null);
 
+      if (updated) await restoreCheckoutPromotedStatus(tx, issueId);
+
       return Boolean(updated);
     });
   }
@@ -5924,6 +5925,8 @@ export function issueService(db: Db) {
         )
         .returning({ id: issues.id })
         .then((rows) => rows[0] ?? null);
+
+      if (updated) await restoreCheckoutPromotedStatus(tx, issueId);
 
       return Boolean(updated);
     });
@@ -8611,6 +8614,15 @@ export function issueService(db: Db) {
         ...issueData,
         updatedAt: new Date(),
       };
+      // An explicit status write means a run (or a human) decided where this
+      // issue belongs, so there is no longer a checkout promotion to undo. Drop
+      // the restore marker and the automatic reset in
+      // `restoreCheckoutPromotedStatus` becomes a no-op — including for a
+      // deliberate write of `in_progress`, which must survive the run that set
+      // it. See BLO-20649.
+      if (issueData.status && issueData.checkoutRestoreStatus === undefined) {
+        patch.checkoutRestoreStatus = null;
+      }
       if (doneTransitionEvidenceVerdict) {
         patch.lastEvidenceVerdict = doneTransitionEvidenceVerdict;
         patch.lastEvidenceVerdictEvaluatedAt = new Date(doneTransitionEvidenceVerdict.evaluatedAt);
@@ -9195,6 +9207,7 @@ export function issueService(db: Db) {
           // whose run later parks at queued/scheduled_retry is never reclaimable.
           executionLockedAt: now,
           status: "in_progress",
+          checkoutRestoreStatus: checkoutRestoreStatusExpression,
           startedAt: now,
           updatedAt: now,
         })
