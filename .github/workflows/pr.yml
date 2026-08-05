@@ -24,10 +24,60 @@ jobs:
   policy:
     runs-on: arc-light
     timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: write
     outputs:
       lockfile_regenerated: ${{ steps.regen_lockfile.outputs.regenerated }}
 
     steps:
+      # BLO-21953: the workflow-level `concurrency.group` above is keyed on
+      # `merge_group.head_sha` for merge_group events. That SHA is the composed
+      # batch commit and is different on every re-stage, so `cancel-in-progress`
+      # never fires across a PR's successive merge-queue attempts -- superseded
+      # generations pile up and starve the shared runner pool (BLO-21953).
+      # There is no reliable way to derive a stable per-entry key from
+      # `merge_group.head_ref` using GitHub Actions expressions alone (no
+      # regex/split), so instead of fighting the concurrency key, ask the
+      # merge queue directly whether this run's head_sha is still a live
+      # entry, and self-cancel if it has already been superseded. Fails open
+      # (never blocks/fails the job) on any lookup or cancel error -- this is
+      # a load-shedding optimization, not a correctness gate.
+      - name: Cancel if superseded by merge-queue re-stage
+        if: github.event_name == 'merge_group'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          REPO_NAME: ${{ github.event.repository.name }}
+        run: |
+          set -uo pipefail
+          query='query($o:String!,$r:String!,$b:String!){ repository(owner:$o,name:$r){ mergeQueue(branch:$b){ entries(first:100){ nodes { headCommit { oid } } } } } }'
+          body="$(printf '{"query":%s,"variables":{"o":%s,"r":%s,"b":"master"}}' \
+            "$(jq -Rs . <<<"$query")" "$(jq -Rs . <<<"$REPO_OWNER")" "$(jq -Rs . <<<"$REPO_NAME")")"
+          resp="$(curl -sS -o /tmp/mq.json -w '%{http_code}' \
+            -H "Authorization: bearer $GH_TOKEN" \
+            -H "Content-Type: application/json" \
+            -X POST https://api.github.com/graphql \
+            -d "$body")"
+          if [ "$resp" != "200" ]; then
+            echo "::warning::merge-queue lookup failed (HTTP $resp) -- not cancelling (fail open)"
+            exit 0
+          fi
+          live="$(jq -r --arg sha "$HEAD_SHA" '(.data.repository.mergeQueue.entries.nodes // []) | map(.headCommit.oid) | index($sha) != null' /tmp/mq.json 2>/dev/null || echo true)"
+          if [ "$live" = "false" ]; then
+            echo "$HEAD_SHA is not a live merge-queue entry (superseded by a re-stage) -- cancelling this run"
+            cancel_resp="$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+              -H "Authorization: bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/actions/runs/${{ github.run_id }}/cancel")"
+            if [ "$cancel_resp" != "202" ]; then
+              echo "::warning::failed to cancel superseded run (HTTP $cancel_resp) -- continuing anyway"
+            fi
+          else
+            echo "$HEAD_SHA is a live merge-queue entry (or lookup was inconclusive) -- continuing"
+          fi
+
       - name: Checkout repository
         uses: actions/checkout@v6
         with:
@@ -438,9 +488,9 @@ jobs:
       # at least one lane in it gets its own annotation instead of only the
       # first one checked:
       #   - failure:   the lane ran and reported a result other than success.
-      #     Often a real problem with the diff, but a lane can also report
-      #     failure due to its own setup/runner trouble — check that lane's
-      #     logs rather than assuming the diff is at fault.
+      #     Often a real problem with the diff, but a lane can also fail due
+      #     to its own setup/runner trouble — check that lane's logs rather
+      #     than assuming the diff is at fault.
       #   - cancelled: the lane was interrupted before it produced a result —
       #     possibly a CI infrastructure interruption (see BLO-20867), but
       #     also possibly a manual cancellation or another cause this job
