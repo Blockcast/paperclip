@@ -180,10 +180,8 @@ jobs:
             ${{ steps.bases.outputs.toolchain_image }}
             harbor.blockcast.net/paperclip-agent/paperclip-agent-toolchain:latest
 
-      # Mirror the server image's tag scheme: `sha-<7>-k8s-vendored` per
-      # commit + `latest-k8s-vendored` floating tag on master. The
-      # adapter's `config.image` will pin a specific sha tag; `latest` is
-      # for ad-hoc pulls and devbox parity.
+      # Publish only the immutable candidate tag here. The floating tag is
+      # promoted to the verified digest after the restricted smoke passes.
       - name: Docker meta
         id: meta
         uses: docker/metadata-action@v6
@@ -192,9 +190,9 @@ jobs:
             harbor.blockcast.net/paperclip-agent/paperclip-agent
           tags: |
             type=raw,value=sha-${{ steps.sha.outputs.short }}-k8s-vendored
-            type=raw,value=latest-k8s-vendored,enable={{is_default_branch}}
 
       - name: Build and push
+        id: build
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -228,6 +226,34 @@ jobs:
           cache-to: type=registry,ref=harbor.blockcast.net/paperclip-agent/paperclip-agent:buildcache-v7,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Smoke test restricted headless screenshot
+        env:
+          AGENT_IMAGE: harbor.blockcast.net/paperclip-agent/paperclip-agent@${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker pull "$AGENT_IMAGE"
+          docker run --rm \
+            --user 1000:1000 \
+            --read-only \
+            --security-opt no-new-privileges \
+            --cap-drop ALL \
+            --tmpfs /paperclip:rw,nosuid,size=16m \
+            --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+            --env HOME=/tmp \
+            "$AGENT_IMAGE" \
+            paperclip-browser-smoke
+
+      - name: Promote verified agent image
+        env:
+          CANDIDATE_IMAGE: harbor.blockcast.net/paperclip-agent/paperclip-agent@${{ steps.build.outputs.digest }}
+          FLOATING_IMAGE: harbor.blockcast.net/paperclip-agent/paperclip-agent:latest-k8s-vendored
+          EXPECTED_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create --tag "$FLOATING_IMAGE" "$CANDIDATE_IMAGE"
+          promoted_digest=$(docker buildx imagetools inspect "$FLOATING_IMAGE" --format '{{json .Manifest.Digest}}' | tr -d '"')
+          test "$promoted_digest" = "$EXPECTED_DIGEST"
 
       # BLO-4141: Auto-bump per-agent adapter_config.image so the freshly
       # built tag actually lands on running agents. Without this, the new

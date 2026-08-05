@@ -115,6 +115,16 @@ describe("paperclip agent Dockerfile", () => {
     );
   });
 
+  it("pins and smoke tests a local headless screenshot browser", () => {
+    expect(dockerfileToolchain).toContain("ARG CHROME_HEADLESS_SHELL_VERSION=151.0.7922.71");
+    expect(dockerfileToolchain).toContain(
+      "ARG CHROME_HEADLESS_SHELL_SHA256=7dd9d23b46fa7a9bfa26f1af96f413e0514c32698f6a43a57e1ade48d88a6578",
+    );
+    expect(dockerfileToolchain).toContain("sha256sum -c -");
+    expect(dockerfileToolchain).toContain("/usr/local/bin/google-chrome");
+    expect(dockerfileToolchain).toContain("paperclip-browser-smoke");
+  });
+
   it("derives stable image tags from their declared inputs", () => {
     const script = path.join(repoRoot, "scripts/container-base-tag.sh");
     const runtimeBaseImage = `harbor.blockcast.net/paperclip/node@sha256:${"c".repeat(64)}`;
