@@ -4894,24 +4894,27 @@ export function issueRoutes(
 
   const COORDINATION_METADATA_REFUSAL_ACTION = "issue.coordination_metadata_refused";
   const COORDINATION_METADATA_REFUSAL_DEDUPE_WINDOW_MS = 5 * 60_000;
+  const COORDINATION_METADATA_REFUSAL_AGGREGATE_MAX_RECORDS = 5;
 
-  // Ally review of be5cd310d, finding 2. Keying the dedupe on
-  // (reason, fields) alone collapsed refusals that are materially different
-  // evidence: a lock refusal against a *different* holding run, or a denial
-  // whose `authorizationReason` changed because the boundary moved, both
-  // vanished as "duplicates" inside the window — losing exactly the transition
-  // an operator is watching for. Every component here is server-derived from a
-  // closed set (an allowlisted field name, a run id, a `deny_*` reason), so the
-  // signature space stays small even though it is now discriminating.
+  // Ally review of be5cd310d, finding 2, extended by its review of 5d985942b.
+  // Keying the dedupe on (reason, fields) alone collapsed refusals that are
+  // materially different evidence: a lock refusal against a *different* holding
+  // run, a denial whose `authorizationReason` changed because the boundary
+  // moved, or an otherwise identical denial after the issue was reassigned —
+  // all vanished as "duplicates" inside the window, losing exactly the
+  // transition an operator is watching for. `assigneeAgentId` belongs here
+  // because the coordination decision is assignment-sensitive: suppressing a
+  // post-reassignment refusal leaves the trail asserting stale ownership.
   function coordinationMetadataRefusalSignature(input: {
     runId: string | null;
     agentApiKeyId: string | null;
+    assigneeAgentId: string | null;
     fieldsKey: string;
     outcome: Extract<CoordinationMetadataOutcome, { kind: "refused" }>;
   }) {
     const base =
       `${input.outcome.refusalReason}|run=${input.runId ?? "none"}|key=${input.agentApiKeyId ?? "none"}` +
-      `|fields=${input.fieldsKey}`;
+      `|assignee=${input.assigneeAgentId ?? "none"}|fields=${input.fieldsKey}`;
     return input.outcome.refusalReason === "execution_lock"
       ? `${base}|lock=${input.outcome.executionRunId}|blocked=${[...input.outcome.blockedFields].sort().join(",")}`
       : `${base}|authz=${input.outcome.authorizationReason}`;
@@ -4942,6 +4945,29 @@ export function issueRoutes(
     return Boolean(existing);
   }
 
+  async function countRecentCoordinationMetadataRefusals(input: {
+    executor: Pick<typeof db, "select">;
+    companyId: string;
+    actorId: string;
+    issueId: string;
+  }) {
+    const windowStart = new Date(Date.now() - COORDINATION_METADATA_REFUSAL_DEDUPE_WINDOW_MS);
+    const rows = await input.executor
+      .select({ refusalId: activityLog.id })
+      .from(activityLog)
+      .where(and(
+        eq(activityLog.companyId, input.companyId),
+        eq(activityLog.actorType, "agent"),
+        eq(activityLog.actorId, input.actorId),
+        eq(activityLog.action, COORDINATION_METADATA_REFUSAL_ACTION),
+        eq(activityLog.entityType, "issue"),
+        eq(activityLog.entityId, input.issueId),
+        gte(activityLog.createdAt, windowStart),
+      ))
+      .limit(COORDINATION_METADATA_REFUSAL_AGGREGATE_MAX_RECORDS);
+    return rows.length;
+  }
+
   // BLO-19912: the refusal counterpart to the `issue.coordination_metadata_updated`
   // audit below. A coordinator that reached the gate and was turned away left no
   // trace at all: the request fell through to the ordinary boundary, and an
@@ -4967,11 +4993,16 @@ export function issueRoutes(
   // then. The lock is per-actor-per-issue, so it never serializes unrelated
   // traffic.
   //
-  // No aggregate cap, unlike BLO-18614: that cap exists because a denial record
-  // retains up to 16 KB of an attacker-controlled payload, so its distinct
-  // signatures are unbounded. Here every signature component is server-derived
-  // from a closed set, so distinct evidence is naturally bounded and capping it
-  // would only drop genuine signal.
+  // Ally review of 5d985942b, finding 1. The previous revision argued no
+  // aggregate cap was needed because every signature component is server-derived
+  // from a closed set. That is wrong, and the counterexample is `runId`: under
+  // agent-API-key auth `resolveRunAttribution` constrains the
+  // `X-Paperclip-Run-Id` header only to a run belonging to that agent
+  // (`server/src/middleware/auth.ts`), so an actor can cycle its own historical
+  // run ids and mint a fresh signature per request. The advisory lock bounds
+  // concurrent duplicates; it bounds nothing sequential. So the cap goes in,
+  // alongside — not instead of — the exact-signature dedupe, which still
+  // collapses genuinely repeated evidence.
   //
   // Best-effort end to end: this is observability on an authorization decision
   // that has already been made, so nothing here may change the outcome of the
@@ -4989,6 +5020,7 @@ export function issueRoutes(
       const refusalSignature = coordinationMetadataRefusalSignature({
         runId: actor.runId,
         agentApiKeyId: actor.agentApiKeyId,
+        assigneeAgentId: issue.assigneeAgentId,
         fieldsKey,
         outcome,
       });
@@ -5008,6 +5040,16 @@ export function issueRoutes(
           issueId: issue.id,
           refusalSignature,
         })) return null;
+        // Checked after the exact-signature dedupe so a repeated attempt
+        // collapses onto its existing row instead of consuming budget: a burst
+        // of one refusal must not evict the capacity that distinct evidence
+        // needs.
+        if (await countRecentCoordinationMetadataRefusals({
+          executor: tx,
+          companyId: issue.companyId,
+          actorId: actor.actorId,
+          issueId: issue.id,
+        }) >= COORDINATION_METADATA_REFUSAL_AGGREGATE_MAX_RECORDS) return null;
         // A drizzle transaction is structurally a `Db` minus `$client`, which
         // `logActivity` never touches. Same cast, and same reasoning, as
         // `recordDeniedIssueWrite`.

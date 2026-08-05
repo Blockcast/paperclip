@@ -36,6 +36,13 @@ if (!embeddedPostgresSupport.supported) {
 // sequential harness while remaining a plain race in production, so — exactly
 // as BLO-18614 concluded for `issue_write_denied` — the bound has to be proven
 // against a real database with requests genuinely in flight together.
+//
+// Ally's review of 5d985942b then showed the lock alone is not enough: `runId`
+// is part of the signature and is actor-churnable, so sequential distinct
+// signatures needed an aggregate cap too. Keep this mirrored with
+// COORDINATION_METADATA_REFUSAL_AGGREGATE_MAX_RECORDS in the route.
+const COORDINATION_REFUSAL_AGGREGATE_MAX_RECORDS = 5;
+
 describeEmbeddedPostgres("coordination-metadata refusal records (persistence path)", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
@@ -223,5 +230,82 @@ describeEmbeddedPostgres("coordination-metadata refusal records (persistence pat
     }
 
     expect(await refusalRows(companyId)).toHaveLength(0);
+  });
+
+  // Ally review of 5d985942b finding 1. `runId` is part of the signature and is
+  // actor-churnable: under agent-API-key auth the run header is validated only
+  // as *a* run belonging to that agent, so cycling historical run ids mints a
+  // fresh signature per request. The advisory lock bounds concurrent
+  // duplicates and does nothing about that, so the aggregate cap has to.
+  it("bounds an actor churning historical run ids to mint fresh signatures", async () => {
+    const { companyId, coordinatorAgentId, coordinatorRunId, issueId } =
+      await seedCoordinatorRefusedOnForeignIssue();
+
+    // Every one of these is a real run owned by this agent, so every one would
+    // pass the header's ownership check and produce a distinct signature.
+    const churnedRunIds = [coordinatorRunId];
+    for (let index = 0; index < 11; index += 1) {
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId,
+        agentId: coordinatorAgentId,
+        status: "completed",
+        invocationSource: "manual",
+        startedAt: new Date(),
+      });
+      churnedRunIds.push(runId);
+    }
+
+    for (const runId of churnedRunIds) {
+      const res = await request(createApp(agentActor(companyId, coordinatorAgentId, runId)))
+        .patch(`/api/issues/${issueId}`)
+        .send({ priority: "low" });
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+    }
+
+    const rows = await refusalRows(companyId);
+    expect(
+      rows.length,
+      `run-id churn must not amplify writes past the cap; got ${rows.length} rows from ${churnedRunIds.length} attempts`,
+    ).toBe(COORDINATION_REFUSAL_AGGREGATE_MAX_RECORDS);
+  });
+
+  // Ally review of 5d985942b finding 2. The coordination decision is
+  // assignment-sensitive, so an otherwise identical denial after a reassignment
+  // is new evidence: suppressing it leaves the trail asserting ownership that
+  // has already changed.
+  it("keeps a repeated refusal that follows a reassignment", async () => {
+    const { companyId, coordinatorAgentId, coordinatorRunId, issueId } =
+      await seedCoordinatorRefusedOnForeignIssue();
+    const app = createApp(agentActor(companyId, coordinatorAgentId, coordinatorRunId));
+    const nextAssigneeAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: nextAssigneeAgentId,
+      companyId,
+      name: "Next assignee",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const before = await request(app).patch(`/api/issues/${issueId}`).send({ priority: "low" });
+    expect(before.status, JSON.stringify(before.body)).toBe(403);
+
+    await db.update(issues).set({ assigneeAgentId: nextAssigneeAgentId }).where(eq(issues.id, issueId));
+
+    const after = await request(app).patch(`/api/issues/${issueId}`).send({ priority: "low" });
+    expect(after.status, JSON.stringify(after.body)).toBe(403);
+
+    const assignees = (await refusalRows(companyId))
+      .map((row) => (row.details as Record<string, unknown>).assigneeAgentId);
+    expect(
+      assignees.length,
+      "a refusal after reassignment is new evidence and must not collapse onto the previous owner's row",
+    ).toBe(2);
+    expect(new Set(assignees).size).toBe(2);
   });
 });
