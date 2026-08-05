@@ -13,6 +13,8 @@ export const ACTIVE_RECOVERY_ACTION_STATUSES = ["active", "escalated"] as const 
 const MAX_UPSERT_RETRIES = 3;
 const SOURCE_SCOPED_WAKE_HORIZON_EVIDENCE_KEY = "sourceScopedWakeHorizonAt";
 const RECOVERY_HANDOFF_GRANT_ANCHOR_EVIDENCE_KEY = "recoveryHandoffGrantAnchorAt";
+// Written by `buildStrandedRecoveryActionEvidence` in recovery/service.ts.
+const LATEST_RUN_AGENT_ID_EVIDENCE_KEY = "latestRunAgentId";
 
 // How long after a recovery transfer the previous owner keeps the comment-only
 // handoff channel opened by BLO-18906 / #827.
@@ -122,6 +124,22 @@ function withSourceScopedWakeHorizonEvidence(
 function readRecoveryHandoffGrantAnchorAt(evidence: unknown): Date | null {
   if (!isRecord(evidence)) return null;
   return toValidDate(evidence[RECOVERY_HANDOFF_GRANT_ANCHOR_EVIDENCE_KEY]);
+}
+
+/**
+ * The agent whose run actually failed, per the sweep's own evidence.
+ *
+ * This is the only field that separates the two shapes which both satisfy
+ * `input.previousOwnerAgentId === existing.ownerAgentId` — see the churn predicate
+ * in `upsertSourceScopedUnlocked`. Absent or malformed (legacy rows, and callers
+ * like `pr_review_non_convergence` that carry no run) reads as `null`, which the
+ * predicate treats as churn: that preserves the existing anchor rather than
+ * refreshing it, so an unidentifiable sweep can never extend a grant.
+ */
+function readLatestRunAgentId(evidence: unknown): string | null {
+  if (!isRecord(evidence)) return null;
+  const value = evidence[LATEST_RUN_AGENT_ID_EVIDENCE_KEY];
+  return typeof value === "string" && value.length > 0 ? value : null;
 }
 
 function withRecoveryHandoffGrantAnchorEvidence(
@@ -342,10 +360,32 @@ export function issueRecoveryActionService(db: Db) {
       // that owner, this is recovery seeing its own reassignment, not a fresh handoff
       // subject. Keep the original previous owner and anchor so recovery-driven
       // CTO/CEO/manager churn cannot turn the TTL into a sliding window.
+      //
+      // BLO-20263 (review follow-up): owner equality ALONE cannot decide that, because
+      // two different situations produce it and they want opposite outcomes:
+      //
+      //   1. Replay churn. A's run failed, recovery handed the issue to B and reassigned
+      //      it to B. The next sweep re-observes A's SAME failed run and passes the
+      //      current assignee B back as `previousOwnerAgentId`. B never ran, so B is not
+      //      a handoff subject — preserve A and A's anchor.
+      //   2. B genuinely failed after taking over. B ran, B's own run failed, and this
+      //      sweep routes ownership onward to C. Here B is exactly the agent losing
+      //      `allow_self` while holding the freshest diagnosis, so B must become the
+      //      grant subject with a fresh anchor — that is the whole point of #827.
+      //
+      // Both satisfy `input.previousOwnerAgentId === existing.ownerAgentId`. What
+      // separates them is WHOSE run failed: in (1) the failed run belongs to A, in (2)
+      // it belongs to B. So consult the run identity the sweep already records in its
+      // own evidence rather than inferring from owner identity, which cannot tell them
+      // apart. Unknown run agent reads as churn (fail closed: preserve, never refresh).
       const inputPreviousOwnerAgentId = input.previousOwnerAgentId ?? existing.previousOwnerAgentId;
+      const failedRunAgentId = readLatestRunAgentId(input.evidence);
+      const isFailedRunByCurrentOwner = failedRunAgentId !== null &&
+        failedRunAgentId === input.previousOwnerAgentId;
       const isRecoveryDrivenOwnerChurn = input.previousOwnerAgentId !== null &&
         input.previousOwnerAgentId !== undefined &&
-        input.previousOwnerAgentId === existing.ownerAgentId;
+        input.previousOwnerAgentId === existing.ownerAgentId &&
+        !isFailedRunByCurrentOwner;
       const nextPreviousOwnerAgentId = isRecoveryDrivenOwnerChurn
         ? existing.previousOwnerAgentId
         : inputPreviousOwnerAgentId;

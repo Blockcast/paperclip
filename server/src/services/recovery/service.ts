@@ -4052,6 +4052,11 @@ export function recoveryService(
       previousStatus: input.previousStatus,
       latestIssueStatus: input.issue.status,
       latestRunId: input.latestRun?.id ?? null,
+      // BLO-20263: whose run failed. `upsertSourceScoped` needs this to tell replay of an
+      // earlier agent's failure apart from a recovery owner that has since failed on its
+      // own run — owner identity alone reads identically in both, and the handoff grant
+      // must refresh for the second and not the first.
+      latestRunAgentId: input.latestRun?.agentId ?? null,
       latestRunStatus: input.latestRun?.status ?? null,
       latestRunErrorCode: input.latestRun?.errorCode ?? null,
       latestRunFailureSummary: summarizeRunFailureForIssueComment(input.latestRun),
