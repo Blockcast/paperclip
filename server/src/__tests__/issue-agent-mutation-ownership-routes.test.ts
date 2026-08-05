@@ -4681,6 +4681,9 @@ describe("agent issue mutation checkout ownership", () => {
               assigneeAgentId: ownerAgentId,
             }),
           }),
+          // Written inside the advisory-lock transaction, so publication has to
+          // be handed back and fired after commit rather than inline.
+          { deferPublish: true },
         );
       });
 
@@ -4742,19 +4745,31 @@ describe("agent issue mutation checkout ownership", () => {
       // Observability must never become a failure mode of the thing it
       // observes: the refusal itself is an authorization decision that has
       // already been made, so a logging fault leaves the outcome unchanged.
+      //
+      // Ally review of be5cd310d: asserting "some 4xx" would pass even if the
+      // denial contract drifted, so pin it against the status and body the same
+      // refusal produces with logging healthy.
       it("still refuses the write when recording the refusal fails", async () => {
-        mockIssueService.getById.mockResolvedValue(
-          makeIssue({ status: "in_progress", assigneeAgentId: ownerAgentId, executionRunId: ownerRunId }),
-        );
+        const lockedIssue = () =>
+          makeIssue({ status: "in_progress", assigneeAgentId: ownerAgentId, executionRunId: ownerRunId });
+        const rebind = { projectWorkspaceId: "99999999-9999-4999-8999-999999999999" };
+
+        mockIssueService.getById.mockResolvedValue(lockedIssue());
+        mockAccessService.decide.mockImplementation(coordinationHolderDecide(true));
+        const healthy = await request(await createApp(peerActor()))
+          .patch(`/api/issues/${issueId}`)
+          .send(rebind);
+
+        mockIssueService.getById.mockResolvedValue(lockedIssue());
         mockAccessService.decide.mockImplementation(coordinationHolderDecide(true));
         mockLogActivity.mockRejectedValueOnce(new Error("activity log unavailable"));
-
-        const res = await request(await createApp(peerActor()))
+        const withLoggingFault = await request(await createApp(peerActor()))
           .patch(`/api/issues/${issueId}`)
-          .send({ projectWorkspaceId: "99999999-9999-4999-8999-999999999999" });
+          .send(rebind);
 
-        expect(res.status, JSON.stringify(res.body)).toBeGreaterThanOrEqual(400);
-        expect(res.status, JSON.stringify(res.body)).toBeLessThan(500);
+        expect(healthy.status, JSON.stringify(healthy.body)).toBe(403);
+        expect(withLoggingFault.status, JSON.stringify(withLoggingFault.body)).toBe(healthy.status);
+        expect(withLoggingFault.body).toEqual(healthy.body);
         expect(mockIssueService.update).not.toHaveBeenCalled();
       });
     });

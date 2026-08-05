@@ -4895,15 +4895,37 @@ export function issueRoutes(
   const COORDINATION_METADATA_REFUSAL_ACTION = "issue.coordination_metadata_refused";
   const COORDINATION_METADATA_REFUSAL_DEDUPE_WINDOW_MS = 5 * 60_000;
 
+  // Ally review of be5cd310d, finding 2. Keying the dedupe on
+  // (reason, fields) alone collapsed refusals that are materially different
+  // evidence: a lock refusal against a *different* holding run, or a denial
+  // whose `authorizationReason` changed because the boundary moved, both
+  // vanished as "duplicates" inside the window — losing exactly the transition
+  // an operator is watching for. Every component here is server-derived from a
+  // closed set (an allowlisted field name, a run id, a `deny_*` reason), so the
+  // signature space stays small even though it is now discriminating.
+  function coordinationMetadataRefusalSignature(input: {
+    runId: string | null;
+    agentApiKeyId: string | null;
+    fieldsKey: string;
+    outcome: Extract<CoordinationMetadataOutcome, { kind: "refused" }>;
+  }) {
+    const base =
+      `${input.outcome.refusalReason}|run=${input.runId ?? "none"}|key=${input.agentApiKeyId ?? "none"}` +
+      `|fields=${input.fieldsKey}`;
+    return input.outcome.refusalReason === "execution_lock"
+      ? `${base}|lock=${input.outcome.executionRunId}|blocked=${[...input.outcome.blockedFields].sort().join(",")}`
+      : `${base}|authz=${input.outcome.authorizationReason}`;
+  }
+
   async function hasRecentCoordinationMetadataRefusal(input: {
+    executor: Pick<typeof db, "select">;
     companyId: string;
     actorId: string;
     issueId: string;
-    refusalReason: string;
-    fieldsKey: string;
+    refusalSignature: string;
   }) {
     const windowStart = new Date(Date.now() - COORDINATION_METADATA_REFUSAL_DEDUPE_WINDOW_MS);
-    const [existing] = await db
+    const [existing] = await input.executor
       .select({ entityId: activityLog.entityId })
       .from(activityLog)
       .where(and(
@@ -4914,8 +4936,7 @@ export function issueRoutes(
         eq(activityLog.entityType, "issue"),
         eq(activityLog.entityId, input.issueId),
         gte(activityLog.createdAt, windowStart),
-        sql`${activityLog.details} ->> 'refusalReason' = ${input.refusalReason}`,
-        sql`${activityLog.details} ->> 'fieldsKey' = ${input.fieldsKey}`,
+        sql`${activityLog.details} ->> 'refusalSignature' = ${input.refusalSignature}`,
       ))
       .limit(1);
     return Boolean(existing);
@@ -4934,14 +4955,23 @@ export function issueRoutes(
   // unrelated path (checkout-management override, recovery-action owner), and
   // the record stands either way.
   //
-  // Deliberately not wrapped in the BLO-18614 advisory-lock + aggregate-cap
-  // machinery that bounds `issue_write_denied`. That cap exists because the
-  // denial record retains up to 16 KB of an unauthorized actor's payload; this
-  // record is fixed-shape and holds no caller-controlled content beyond the
-  // allowlisted field names, so the only thing to bound is row count and a
-  // dedupe window covers it. Unlike BLO-18614 it therefore fails *open* — if
-  // the dedupe probe throws, emit anyway, because losing a small security
-  // signal is worse than writing a duplicate row.
+  // Ally review of be5cd310d, finding 1. Admission was an unlocked
+  // check-then-insert, which bounds nothing: concurrent refusals all miss the
+  // probe and all insert. The first revision of this comment claimed a bound it
+  // did not deliver and argued the record could therefore fail *open* on a
+  // probe failure. Both halves are withdrawn. Admission and insertion now run in
+  // one transaction serialized on an advisory lock keyed to
+  // (company, actor, issue) — the same shape `recordDeniedIssueWrite` uses, and
+  // for the same reason — and it fails *closed*, because a throw in here means
+  // the database is unhealthy and an unbounded insert path is worst precisely
+  // then. The lock is per-actor-per-issue, so it never serializes unrelated
+  // traffic.
+  //
+  // No aggregate cap, unlike BLO-18614: that cap exists because a denial record
+  // retains up to 16 KB of an attacker-controlled payload, so its distinct
+  // signatures are unbounded. Here every signature component is server-derived
+  // from a closed set, so distinct evidence is naturally bounded and capping it
+  // would only drop genuine signal.
   //
   // Best-effort end to end: this is observability on an authorization decision
   // that has already been made, so nothing here may change the outcome of the
@@ -4956,47 +4986,68 @@ export function issueRoutes(
     const fieldsKey = [...fields].sort().join(",");
     try {
       const actor = getActorInfo(req);
-      let duplicate = false;
-      try {
-        duplicate = await hasRecentCoordinationMetadataRefusal({
+      const refusalSignature = coordinationMetadataRefusalSignature({
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+        fieldsKey,
+        outcome,
+      });
+      const lockKey =
+        `paperclip:coordination-metadata-refused:${issue.companyId}:${actor.actorId}:${issue.id}`;
+      // The transaction hands the publisher back rather than firing it:
+      // `activity.logged` and the plugin outbox both escape the transaction, so
+      // emitting inline lets a consumer read the event before the row is
+      // visible, and turns a rolled-back transaction into an event for a record
+      // that does not exist.
+      const publishRecorded = await db.transaction(async (tx): Promise<ActivityPublish | null> => {
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`);
+        if (await hasRecentCoordinationMetadataRefusal({
+          executor: tx,
           companyId: issue.companyId,
           actorId: actor.actorId,
           issueId: issue.id,
-          refusalReason: outcome.refusalReason,
-          fieldsKey,
-        });
+          refusalSignature,
+        })) return null;
+        // A drizzle transaction is structurally a `Db` minus `$client`, which
+        // `logActivity` never touches. Same cast, and same reasoning, as
+        // `recordDeniedIssueWrite`.
+        return await logActivity(tx as unknown as typeof db, {
+          companyId: issue.companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          agentApiKeyId: actor.agentApiKeyId,
+          action: COORDINATION_METADATA_REFUSAL_ACTION,
+          entityType: "issue",
+          entityId: issue.id,
+          issueId: issue.id,
+          details: {
+            identifier: issue.identifier ?? null,
+            path: "coordination_metadata_allowlist",
+            outcome: "refused",
+            refusalReason: outcome.refusalReason,
+            fields,
+            fieldsKey,
+            refusalSignature,
+            assigneeAgentId: issue.assigneeAgentId,
+            ...(outcome.refusalReason === "execution_lock"
+              ? { blockedFields: outcome.blockedFields, executionRunId: outcome.executionRunId }
+              : { authorizationReason: outcome.authorizationReason }),
+          },
+        }, { deferPublish: true });
+      });
+      // Reached only on commit; a rollback throws straight past this.
+      try {
+        publishRecorded?.();
       } catch (err) {
+        // Distinct from the catch below: the record itself is committed and
+        // recoverable, only its notification failed.
         logger.warn(
           { err, issueId: issue.id, refusalReason: outcome.refusalReason },
-          "BLO-19912: coordination-metadata refusal dedupe check failed; recording anyway",
+          "BLO-19912: recorded a refused coordination-metadata patch but failed to publish its activity event",
         );
       }
-      if (duplicate) return;
-
-      await logActivity(db, {
-        companyId: issue.companyId,
-        actorType: actor.actorType,
-        actorId: actor.actorId,
-        agentId: actor.agentId,
-        runId: actor.runId,
-        agentApiKeyId: actor.agentApiKeyId,
-        action: COORDINATION_METADATA_REFUSAL_ACTION,
-        entityType: "issue",
-        entityId: issue.id,
-        issueId: issue.id,
-        details: {
-          identifier: issue.identifier ?? null,
-          path: "coordination_metadata_allowlist",
-          outcome: "refused",
-          refusalReason: outcome.refusalReason,
-          fields,
-          fieldsKey,
-          assigneeAgentId: issue.assigneeAgentId,
-          ...(outcome.refusalReason === "execution_lock"
-            ? { blockedFields: outcome.blockedFields, executionRunId: outcome.executionRunId }
-            : { authorizationReason: outcome.authorizationReason }),
-        },
-      });
     } catch (err) {
       logger.warn(
         { err, issueId: issue.id, refusalReason: outcome.refusalReason },
