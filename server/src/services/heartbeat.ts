@@ -3853,34 +3853,46 @@ function allocationFaultStatusGate(resultJson: Record<string, unknown> | null | 
   return hasAuthoritativeStatus ? "deny" : "allow";
 }
 
+// BLO-19879: checked first, above the authoritative-status short-circuit
+// below, because the gateway allocation fault carries a 400 and would
+// otherwise be rejected before any text matching runs. Still require an
+// actual 400 when resultJson carries an authoritative status, and match only
+// gateway-shaped payload text so agent-authored prose that merely quotes the
+// literal cannot turn terminal 401/403/etc. failures into scheduled retries.
+//
+// BLO-20343: the status gate covers `errorMessage` too, not just the
+// resultJson keys, so the same bytes classify the same way whichever field
+// carries them. Reaching the difference needs contradictory adapter state (an
+// errorMessage opening with a 400 gateway payload while resultJson reports an
+// authoritative non-400), which has no known producer — `api_error_status` is
+// only ever read here, straight off the SDK's final result event. Resolved
+// toward `deny` because every status that reaches it is one the retry curve
+// cannot help: 401/403 will not self-heal, 500 is deliberately terminal, and
+// 429 belongs to the rate-limit family's flat curve.
+//
+// Exported separately from isHintlessTransientUpstreamFault (BLO-21803) so the
+// finalize call site can test for this one specific shape without re-deriving
+// it, in order to distinguish a first occurrence (give BLO-19879's self-heal
+// chance) from a repeat within the same retry chain (see
+// repeatingGatewayAllocationFault below).
+export function isGatewayAllocationFault(
+  resultJson: Record<string, unknown> | null | undefined,
+  opts?: { errorMessage?: string | null },
+): boolean {
+  if (allocationFaultStatusGate(resultJson) !== "allow") return false;
+  if (resultJson) {
+    for (const key of GATEWAY_ALLOCATION_FAULT_TEXT_KEYS) {
+      if (looksLikeGatewayAllocationFault(resultJson[key])) return true;
+    }
+  }
+  return looksLikeGatewayAllocationFault(opts?.errorMessage);
+}
+
 export function isHintlessTransientUpstreamFault(
   resultJson: Record<string, unknown> | null | undefined,
   opts?: { errorMessage?: string | null },
 ): boolean {
-  // BLO-19879: checked first, above the authoritative-status short-circuit
-  // below, because the gateway allocation fault carries a 400 and would
-  // otherwise be rejected before any text matching runs. Still require an
-  // actual 400 when resultJson carries an authoritative status, and match only
-  // gateway-shaped payload text so agent-authored prose that merely quotes the
-  // literal cannot turn terminal 401/403/etc. failures into scheduled retries.
-  //
-  // BLO-20343: the status gate covers `errorMessage` too, not just the
-  // resultJson keys, so the same bytes classify the same way whichever field
-  // carries them. Reaching the difference needs contradictory adapter state (an
-  // errorMessage opening with a 400 gateway payload while resultJson reports an
-  // authoritative non-400), which has no known producer — `api_error_status` is
-  // only ever read here, straight off the SDK's final result event. Resolved
-  // toward `deny` because every status that reaches it is one the retry curve
-  // cannot help: 401/403 will not self-heal, 500 is deliberately terminal, and
-  // 429 belongs to the rate-limit family's flat curve.
-  if (allocationFaultStatusGate(resultJson) === "allow") {
-    if (resultJson) {
-      for (const key of GATEWAY_ALLOCATION_FAULT_TEXT_KEYS) {
-        if (looksLikeGatewayAllocationFault(resultJson[key])) return true;
-      }
-    }
-    if (looksLikeGatewayAllocationFault(opts?.errorMessage)) return true;
-  }
+  if (isGatewayAllocationFault(resultJson, opts)) return true;
 
   // Two status surfaces: the Claude SDK's final result event uses
   // `api_error_status`, while the per-attempt `api_retry` events that precede
@@ -24119,11 +24131,36 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // re-dispatched. Yields to the rate-limit families (429 owns its own flat
       // curve) and to any adapter that already tagged a family itself, so the
       // local adapters' richer verdict always wins.
+      //
+      // BLO-21803: the BLO-19879 gateway-allocation-fault branch inside
+      // isHintlessTransientUpstreamFault gives allocation_missing exactly the
+      // scenario it was built for — a brief provider-blind failover window —
+      // one bounded-retry chance to self-heal. Live reproductions (BLO-20725,
+      // BLO-19411) showed the SAME org/provider/node fault recurring on the
+      // very next attempt of the same chain, days apart: that is not the
+      // transient routing blip BLO-19879 documented, it is a standing
+      // provisioning gap ("no allocation configured"), and no amount of
+      // further retrying makes one appear. `run.scheduledRetryAttempt` names
+      // which attempt of its chain the JUST-FINISHED run represents (0/null
+      // for a first attempt, 1+ once it is itself already a scheduled retry),
+      // so gating on `>= 1` preserves the single self-heal attempt BLO-19879
+      // needs and only escalates a repeat.
+      const gatewayAllocationFault =
+        outcome === "failed" &&
+        !rateLimitExhaustedOverride &&
+        !providerThrottledNoProgressOverride &&
+        !adapterResult.errorFamily &&
+        isGatewayAllocationFault(adapterResult.resultJson, {
+          errorMessage: adapterResult.errorMessage,
+        });
+      const repeatingGatewayAllocationFault =
+        gatewayAllocationFault && (run.scheduledRetryAttempt ?? 0) >= 1;
       const transientUpstreamOverride =
         outcome === "failed" &&
         !rateLimitExhaustedOverride &&
         !providerThrottledNoProgressOverride &&
         !adapterResult.errorFamily &&
+        !repeatingGatewayAllocationFault &&
         isHintlessTransientUpstreamFault(adapterResult.resultJson, {
           errorMessage: adapterResult.errorMessage,
         });
@@ -24270,24 +24307,31 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ? "Run hit Anthropic rate limit (out of extra usage); scheduled for transient retry"
         : providerThrottledNoProgressOverride
           ? "Run hit provider throttle/deadline before any token usage; scheduled for transient retry"
-          : prReviewIncompleteOverride
-            ? prReviewIncompleteOverride.errorMessage
-            : emptyResultOverride
-              ? "Agent exited successfully but produced no result"
-              : outcome === "cancelled"
-                ? (latestRun?.error ?? adapterResult.errorMessage ?? "Cancelled")
-                : outcome === "succeeded"
-                  ? null
-                  : redactCurrentUserText(
-                      silentFailureMessage ?? adapterResult.errorMessage ?? (outcome === "timed_out" ? "Timed out" : "Adapter failed"),
-                      currentUserRedactionOptions,
-                    );
+          : repeatingGatewayAllocationFault
+            ? "Run repeated the penstock 400 allocation_missing gateway fault on a retry of its own chain " +
+              "(BLO-21803); this is a standing provisioning gap, not the transient routing blip BLO-19879 " +
+              "covers, so no further automatic retry was scheduled — check the BYOS allocation config for " +
+              "the org/provider/node named in the error"
+            : prReviewIncompleteOverride
+              ? prReviewIncompleteOverride.errorMessage
+              : emptyResultOverride
+                ? "Agent exited successfully but produced no result"
+                : outcome === "cancelled"
+                  ? (latestRun?.error ?? adapterResult.errorMessage ?? "Cancelled")
+                  : outcome === "succeeded"
+                    ? null
+                    : redactCurrentUserText(
+                        silentFailureMessage ?? adapterResult.errorMessage ?? (outcome === "timed_out" ? "Timed out" : "Adapter failed"),
+                        currentUserRedactionOptions,
+                      );
       const recordedResponsibleUserDenialCode =
         normalizeResponsibleUserDenialCode(latestRun?.errorCode);
       const runErrorCode = rateLimitExhaustedOverride
         ? "rate_limit_exhausted"
         : providerThrottledNoProgressOverride
           ? "provider_throttled_no_progress"
+        : repeatingGatewayAllocationFault
+          ? "allocation_missing_standing"
           : prReviewIncompleteOverride
             ? prReviewIncompleteOverride.errorCode
             : emptyResultOverride
