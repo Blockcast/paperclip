@@ -30,6 +30,7 @@ import { registerServerAdapter, unregisterServerAdapter } from "../adapters/inde
 import {
   BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS,
   heartbeatService,
+  isGatewayAllocationFault,
   isHintlessTransientUpstreamFault,
   isRateLimitExhausted,
   isRetryableK8sCcrotateThrottleResult,
@@ -335,6 +336,38 @@ describe("isHintlessTransientUpstreamFault for the BLO-19879 gateway allocation 
   });
 });
 
+// BLO-21803 — a repeat of the BLO-19879 gateway allocation fault within the
+// SAME retry chain is not the transient routing blip BLO-19879 documented.
+//
+// Live reproductions: BLO-20725's run chain and BLO-19411 run
+// 9aeeeb45-0700-4989-83bf-27c7cc058778 both hit `allocation_missing` for
+// org_penstock/anthropic/blockcast-omar on a run that was ITSELF already a
+// scheduled retry — i.e. the fault recurred after BLO-19879's bounded curve
+// already gave it one self-heal attempt. Left unhandled, isolated
+// `isGatewayAllocationFault` matches keep re-arming the bounded retry forever
+// (5-6+ scheduledRetryAttempt observed), burning retry budget on a standing
+// provisioning gap while the issue looks alive.
+describe("isGatewayAllocationFault", () => {
+  const BLO_19879_RESULT_JSON = {
+    api_error_status: 400,
+    result:
+      'API Error: 400 {"error":"No allocation configured for org \'org_penstock\' provider ' +
+      '\'anthropic\' on BYOS node \'blockcast-omar\'","code":"allocation_missing",' +
+      '"correlation_id":"01642b14-f519-4ca3-b465-db0bd57a36b9"}',
+    is_error: true,
+  } as const;
+
+  it("matches exactly the same shape isHintlessTransientUpstreamFault does", () => {
+    expect(isGatewayAllocationFault(BLO_19879_RESULT_JSON)).toBe(true);
+    expect(isHintlessTransientUpstreamFault(BLO_19879_RESULT_JSON)).toBe(true);
+  });
+
+  it("does not fire on an unrelated failure", () => {
+    expect(isGatewayAllocationFault(null)).toBe(false);
+    expect(isGatewayAllocationFault({ api_error_status: 500, error: "server_error" })).toBe(false);
+  });
+});
+
 describe("shouldScheduleAutomaticRunRetry for a hint-less transient upstream run", () => {
   const contextSnapshot = { issueId: randomUUID(), wakeReason: "issue_assigned" };
 
@@ -364,6 +397,22 @@ describe("shouldScheduleAutomaticRunRetry for a hint-less transient upstream run
     expect(
       shouldScheduleAutomaticRunRetry({
         errorCode: "adapter_failed",
+        resultJson: {},
+        contextSnapshot,
+      }),
+    ).toBe(false);
+  });
+
+  // BLO-21803: a repeat of the gateway allocation fault within the same
+  // retry chain is tagged `allocation_missing_standing` at the finalize call
+  // site instead of `provider_transient_upstream`, precisely so it lands
+  // here — no known errorFamily, no automatic retry. The escalation this
+  // routes to (stranded_assigned_issue -> blocked) is the human-actionable
+  // path a standing BYOS allocation gap needs, not another bounded retry.
+  it("does not retry a repeated gateway allocation fault", () => {
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "allocation_missing_standing",
         resultJson: {},
         contextSnapshot,
       }),
