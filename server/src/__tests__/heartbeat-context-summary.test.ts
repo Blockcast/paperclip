@@ -1091,6 +1091,86 @@ describe("mergeCoalescedContextSnapshot", () => {
     expect(merged.githubPrReviewAuthorLogin).toBe("ally");
   });
 
+  // BLO-22229. Reproduces the incident verbatim: a formal `kkroo` APPROVED
+  // review is still the active run's context when Ally posts a *comment*-
+  // shaped consolidated review carrying Critical findings on the SAME PR.
+  // github-webhook.ts's issue_comment branch never sets a `reviewState` (only
+  // a formal `pull_request_review` submission can), so the incoming wake
+  // supplies a new `githubPrReviewAuthorLogin` (the comment author) but no
+  // `githubPrReviewState` of its own. Before the fix, the naive `{...existing,
+  // ...incoming}` spread kept the OLD APPROVED state paired with the NEW
+  // comment author — composing a directive from two different GitHub events
+  // that together describe a review that never happened, and telling the
+  // author to merge a PR carrying unresolved Critical findings.
+  it("does not weld a stale reviewState onto a same-PR comment-shaped review (BLO-22229)", () => {
+    const merged = mergeCoalescedContextSnapshot(
+      {
+        issueId: "issue-1053",
+        wakeReason: "github_pr_review_submitted",
+        githubRepoFullName: "Blockcast/paperclip",
+        githubPrNumber: 1053,
+        githubHeadSha: "82f168065",
+        githubPrReviewBody: "LGTM.",
+        githubPrReviewState: "approved",
+        githubPrReviewAuthorLogin: "kkroo",
+        prRole: "author",
+      },
+      {
+        issueId: "issue-1053",
+        wakeReason: "github_pr_review_feedback",
+        githubRepoFullName: "Blockcast/paperclip",
+        githubPrNumber: 1053,
+        githubHeadSha: "82f168065",
+        githubPrReviewBody: "1 Critical + 2 Important findings.",
+        githubPrReviewAuthorLogin: "allyblockcast[bot]",
+        githubReviewFeedbackActionable: true,
+        prRole: "author",
+      },
+    );
+
+    // The incoming comment review's own fields win outright.
+    expect(merged.githubPrReviewBody).toBe("1 Critical + 2 Important findings.");
+    expect(merged.githubPrReviewAuthorLogin).toBe("allyblockcast[bot]");
+    // The prior formal review's state must NOT survive paired with this
+    // comment's author — it is cleared, not inherited, so the directive
+    // falls back to neutral "posted findings" wording instead of a false
+    // "state: APPROVED ... proceed to merge".
+    expect(merged.githubPrReviewState).toBeUndefined();
+  });
+
+  // Companion: a genuine second formal review (APPROVED -> CHANGES_REQUESTED
+  // on the same PR) must fully replace the prior review's state, not merge
+  // fields across the two submissions either.
+  it("a new formal review submission fully replaces the prior one's state (BLO-22229)", () => {
+    const merged = mergeCoalescedContextSnapshot(
+      {
+        issueId: "issue-1053",
+        wakeReason: "github_pr_review_submitted",
+        githubRepoFullName: "Blockcast/paperclip",
+        githubPrNumber: 1053,
+        githubPrReviewBody: "LGTM.",
+        githubPrReviewState: "approved",
+        githubPrReviewAuthorLogin: "kkroo",
+        prRole: "author",
+      },
+      {
+        issueId: "issue-1053",
+        wakeReason: "github_pr_review_submitted",
+        githubRepoFullName: "Blockcast/paperclip",
+        githubPrNumber: 1053,
+        githubPrReviewState: "changes_requested",
+        githubPrReviewAuthorLogin: "allyblockcast[bot]",
+        prRole: "author",
+      },
+    );
+
+    expect(merged.githubPrReviewState).toBe("changes_requested");
+    expect(merged.githubPrReviewAuthorLogin).toBe("allyblockcast[bot]");
+    // The new review carried no body — the old review's body must not survive
+    // paired with the new state/author.
+    expect(merged.githubPrReviewBody).toBeUndefined();
+  });
+
   // Same PR number, different repository — the identity key is (repo, number),
   // not the number alone.
   it("treats the same PR number in a different repo as a different PR", () => {
