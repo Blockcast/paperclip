@@ -429,6 +429,7 @@ export function pluginManagedAgentService(
     if (requiresApproval) {
       const approval = await approvalSvc.create(companyId, {
         type: "hire_agent",
+        linkedAgentId: created.id,
         requestedByAgentId: null,
         requestedByUserId: null,
         status: "pending",

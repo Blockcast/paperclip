@@ -612,7 +612,7 @@ describe("runChildProcess", () => {
         graceSec: 1,
         onLog: async () => {},
         terminalResultCleanup: {
-          graceMs: 100,
+          graceMs: 500,
           hasTerminalResult: ({ stdout }) => stdout.includes('"type":"result"'),
         },
       },

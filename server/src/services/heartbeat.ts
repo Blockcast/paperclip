@@ -8459,6 +8459,20 @@ export interface HeartbeatServiceOptions {
     now: Date,
   ) => Promise<void> | void;
   /**
+   * Test-only concurrency hook: fired after stale-lock sweep has selected a
+   * candidate and immediately before the sweep transaction re-validates the
+   * current issue/run rows. Lets tests mimic a concurrent scheduled_retry
+   * re-park without exposing recovery internals.
+   */
+  beforeStaleIssueLockSweepClearForTest?: (
+    issue: {
+      id: string;
+      checkoutRunId: string | null;
+      executionRunId: string | null;
+      executionLockedAt: Date | null;
+    },
+  ) => Promise<void> | void;
+  /**
    * Test-only concurrency hook: fired inside the capacity-defer transaction
    * after coalescePendingTaskScopeWake() has returned a still-deferred run and
    * immediately before the conditional GitHub delivery-tally UPDATE. Lets a
@@ -8645,7 +8659,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   };
   const budgets = budgetService(db, budgetHooks);
   const sweepWakePreflightGbrain = createServerGbrainClient();
-  const recovery = recoveryService(db, { enqueueWakeup });
+  const recovery = recoveryService(db, {
+    enqueueWakeup,
+    beforeStaleIssueLockSweepClearForTest: options.beforeStaleIssueLockSweepClearForTest,
+  });
 
   function isPlanApprovalConfirmationPayload(payload: unknown) {
     const target = parseObject(parseObject(payload).target);

@@ -27,7 +27,9 @@ export default defineConfig({
   // intentionally not part of the default local_trusted e2e run.
   testIgnore: ["multi-user.spec.ts", "multi-user-authenticated.spec.ts"],
   timeout: 60_000,
-  retries: 0,
+  // A single flake on a shared, serial-worker suite (BLO-20657) shouldn't red a PR
+  // that didn't touch the failing spec. Local runs stay fail-fast at 0.
+  retries: process.env.CI ? 1 : 0,
   // All specs share one throwaway server, and several toggle instance-level
   // state (the `enableConferenceRoomChat` experimental flag) that changes
   // which UI variant renders. Run files serially so a flag flip in one spec

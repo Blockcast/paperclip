@@ -24,6 +24,9 @@ export interface ToolDefinition {
   schema: z.AnyZodObject;
   execute: (input: Record<string, unknown>) => Promise<{
     content: Array<{ type: "text"; text: string }>;
+    // Set by formatErrorResponse. Keeping it in the declared return type makes
+    // MCP error propagation visible to implementers and tests (BLO-18466).
+    isError?: boolean;
   }>;
 }
 
