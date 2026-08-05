@@ -725,4 +725,44 @@ describe("paperclip MCP tools", () => {
     // Only the company-list call happened; no cross-company request was attempted.
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
+
+  // BLO-18466: a CEO PATCH denied with 403 came back success-shaped, so the
+  // caller read `priority` off the result, got nothing, and reported the
+  // priority as raised when the field had not moved. The denial must reach the
+  // agent as a failure, not as an object that merely lacks the field.
+  it("surfaces a denied paperclipUpdateIssue as an MCP error rather than a success", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      mockJsonResponse({ error: "deny_missing_grant", boundary: "grant" }, 403),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclipUpdateIssue");
+    const response = await tool.execute({
+      issueId: "75901b6e-8c97-40e1-8576-514de1f3f972",
+      priority: "critical",
+    });
+
+    expect(response.isError).toBe(true);
+
+    const payload = JSON.parse(response.content[0]!.text) as Record<string, unknown>;
+    expect(payload.status).toBe(403);
+    expect(payload.body).toMatchObject({ error: "deny_missing_grant" });
+    // The precise failure mode: no `priority` key to misread as "unchanged".
+    expect(payload).not.toHaveProperty("priority");
+  });
+
+  it("does not mark a successful paperclipUpdateIssue as an error", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      mockJsonResponse({ id: "75901b6e-8c97-40e1-8576-514de1f3f972", priority: "critical" }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await getTool("paperclipUpdateIssue").execute({
+      issueId: "75901b6e-8c97-40e1-8576-514de1f3f972",
+      priority: "critical",
+    });
+
+    expect(response.isError).toBeUndefined();
+    expect(JSON.parse(response.content[0]!.text)).toMatchObject({ priority: "critical" });
+  });
 });

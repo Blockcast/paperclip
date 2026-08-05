@@ -2798,6 +2798,7 @@ export function agentRoutes(
         ) ?? {};
       approval = await approvalsSvc.create(companyId, {
         type: "hire_agent",
+        linkedAgentId: agent.id,
         requestedByAgentId: actor.actorType === "agent" ? actor.actorId : null,
         requestedByUserId: actor.actorType === "user" ? actor.actorId : null,
         status: "pending",

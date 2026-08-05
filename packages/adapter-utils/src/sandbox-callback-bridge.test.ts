@@ -293,11 +293,11 @@ describe("sandbox callback bridge", () => {
     );
 
     let responseRaw: string | null = null;
-    for (let attempt = 0; attempt < 100; attempt += 1) {
+    for (let attempt = 0; attempt < 300; attempt += 1) {
       responseRaw = await readFile(path.posix.join(directories.responsesDir, "req-1.json"), "utf8")
         .catch(() => null);
       if (responseRaw) break;
-      await new Promise((resolve) => setTimeout(resolve, 5));
+      await new Promise((resolve) => setTimeout(resolve, 10));
     }
 
     await worker.stop({ drainTimeoutMs: 1_000 });

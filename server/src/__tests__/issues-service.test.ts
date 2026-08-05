@@ -5005,6 +5005,39 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     ).rejects.toMatchObject({ status: 422 });
   });
 
+  it("returns cycle validation instead of deadlocking concurrent reciprocal blocker updates", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    const issueA = randomUUID();
+    const issueB = randomUUID();
+    await db.insert(issues).values([
+      { id: issueA, companyId, title: "Issue A", status: "todo", priority: "medium" },
+      { id: issueB, companyId, title: "Issue B", status: "todo", priority: "medium" },
+    ]);
+
+    const results = await Promise.allSettled([
+      svc.update(issueA, { blockedByIssueIds: [issueB] }),
+      svc.update(issueB, { blockedByIssueIds: [issueA] }),
+    ]);
+    const fulfilled = results.filter((result) => result.status === "fulfilled");
+    const rejected = results.filter((result) => result.status === "rejected");
+
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    const rejection = rejected[0] as PromiseRejectedResult;
+    expect(String(rejection.reason?.message ?? rejection.reason)).not.toMatch(/deadlock/i);
+    expect(rejection.reason).toMatchObject({
+      status: 422,
+      message: "Blocking relations cannot contain cycles",
+    });
+  });
+
   it("only returns dependents once every blocker is done", async () => {
     const companyId = randomUUID();
     const assigneeAgentId = randomUUID();
@@ -7306,6 +7339,431 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
 
     expect(updated?.projectId).toBe(projectId);
     expect(updated?.projectWorkspaceId).toBe(projectWorkspaceId);
+  });
+
+  it("rejects a stale workspace-only update after a concurrent project reroute commits", async () => {
+    const companyId = randomUUID();
+    const projectAId = randomUUID();
+    const projectBId = randomUUID();
+    const workspaceAId = randomUUID();
+    const workspaceBId = randomUUID();
+    const issueId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(projects).values([
+      {
+        id: projectAId,
+        companyId,
+        name: "Workspace project A",
+        status: "in_progress",
+      },
+      {
+        id: projectBId,
+        companyId,
+        name: "Workspace project B",
+        status: "in_progress",
+      },
+    ]);
+
+    await db.insert(projectWorkspaces).values([
+      {
+        id: workspaceAId,
+        companyId,
+        projectId: projectAId,
+        name: "Primary workspace A",
+        isPrimary: true,
+      },
+      {
+        id: workspaceBId,
+        companyId,
+        projectId: projectBId,
+        name: "Primary workspace B",
+        isPrimary: true,
+      },
+    ]);
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      projectId: projectAId,
+      projectWorkspaceId: workspaceAId,
+      title: "Rerouted issue",
+      status: "todo",
+      priority: "medium",
+    });
+
+    const rerouteApplied = deferred<void>();
+    const releaseReroute = deferred<void>();
+    const reroute = db.transaction(async (tx) => {
+      await svc.update(issueId, {
+        projectId: projectBId,
+        projectWorkspaceId: workspaceBId,
+      }, tx);
+      rerouteApplied.resolve();
+      await releaseReroute.promise;
+    });
+
+    await rerouteApplied.promise;
+    const staleWorkspaceUpdate = svc.update(issueId, {
+      projectWorkspaceId: workspaceAId,
+    });
+    const staleWorkspaceExpectation = expect(staleWorkspaceUpdate).rejects.toMatchObject({
+      status: 422,
+      message: "Project workspace must belong to the selected project",
+    });
+
+    const lockWaitDeadline = Date.now() + 10_000;
+    let staleUpdateWaitingForLock = false;
+    while (Date.now() < lockWaitDeadline) {
+      const waitingRows = await db.execute(sql<{ waiting: boolean }>`
+        select exists (
+          select 1
+          from pg_stat_activity
+          where datname = current_database()
+            and pid <> pg_backend_pid()
+            and wait_event_type = 'Lock'
+            and query ~* 'select .* from .*issues.*for update'
+        ) as waiting
+      `);
+      if (Array.from(waitingRows)[0]?.waiting) {
+        staleUpdateWaitingForLock = true;
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    expect(staleUpdateWaitingForLock).toBe(true);
+    releaseReroute.resolve();
+
+    await reroute;
+    await staleWorkspaceExpectation;
+
+    const finalIssue = await db
+      .select({
+        projectId: issues.projectId,
+        projectWorkspaceId: issues.projectWorkspaceId,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(finalIssue).toEqual({
+      projectId: projectBId,
+      projectWorkspaceId: workspaceBId,
+    });
+  });
+
+  it("returns cycle validation instead of deadlocking concurrent reciprocal reparent updates", async () => {
+    const companyId = randomUUID();
+    const issueAId = randomUUID();
+    const issueBId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(issues).values([
+      {
+        id: issueAId,
+        companyId,
+        title: "Issue A",
+        status: "todo",
+        priority: "medium",
+      },
+      {
+        id: issueBId,
+        companyId,
+        title: "Issue B",
+        status: "todo",
+        priority: "medium",
+      },
+    ]);
+
+    const results = await Promise.allSettled([
+      svc.update(issueAId, { parentId: issueBId }),
+      svc.update(issueBId, { parentId: issueAId }),
+    ]);
+    const fulfilled = results.filter((result) => result.status === "fulfilled");
+    const rejected = results.filter((result) => result.status === "rejected");
+
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    const rejection = rejected[0] as PromiseRejectedResult;
+    expect(String(rejection.reason?.message ?? rejection.reason)).not.toMatch(/deadlock/i);
+    expect(rejection.reason).toMatchObject({
+      status: 422,
+      message: "Parent issue would create a cycle",
+    });
+  });
+
+  it("returns cycle validation instead of deadlocking intersecting multi-level reparent updates", async () => {
+    const companyId = randomUUID();
+    const issueAId = randomUUID();
+    const issueBId = randomUUID();
+    const issueXId = randomUUID();
+    const issueYId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(issues).values([
+      {
+        id: issueXId,
+        companyId,
+        title: "Issue X",
+        status: "todo",
+        priority: "medium",
+      },
+      {
+        id: issueYId,
+        companyId,
+        title: "Issue Y",
+        status: "todo",
+        priority: "medium",
+      },
+    ]);
+    await db.insert(issues).values([
+      {
+        id: issueAId,
+        companyId,
+        title: "Issue A",
+        status: "todo",
+        priority: "medium",
+        parentId: issueYId,
+      },
+      {
+        id: issueBId,
+        companyId,
+        title: "Issue B",
+        status: "todo",
+        priority: "medium",
+        parentId: issueXId,
+      },
+    ]);
+
+    const results = await Promise.allSettled([
+      svc.update(issueXId, { parentId: issueAId }),
+      svc.update(issueYId, { parentId: issueBId }),
+    ]);
+    const fulfilled = results.filter((result) => result.status === "fulfilled");
+    const rejected = results.filter((result) => result.status === "rejected");
+
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    const rejection = rejected[0] as PromiseRejectedResult;
+    expect(String(rejection.reason?.message ?? rejection.reason)).not.toMatch(/deadlock/i);
+    expect(rejection.reason).toMatchObject({
+      status: 422,
+      message: "Parent issue would create a cycle",
+    });
+  });
+
+  it("does not deadlock a combined parent and blocker update against a parent-only update", async () => {
+    const companyId = randomUUID();
+    const issuePId = randomUUID();
+    const issueQId = randomUUID();
+    const issueXId = randomUUID();
+    const issueYId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(issues).values([
+      {
+        id: issuePId,
+        companyId,
+        title: "Issue P",
+        status: "todo",
+        priority: "medium",
+      },
+      {
+        id: issueQId,
+        companyId,
+        title: "Issue Q",
+        status: "todo",
+        priority: "medium",
+      },
+      {
+        id: issueXId,
+        companyId,
+        title: "Issue X",
+        status: "todo",
+        priority: "medium",
+      },
+      {
+        id: issueYId,
+        companyId,
+        title: "Issue Y",
+        status: "todo",
+        priority: "medium",
+      },
+    ]);
+
+    const results = await Promise.allSettled([
+      svc.update(issueXId, { parentId: issuePId, blockedByIssueIds: [issueYId] }),
+      svc.update(issueYId, { parentId: issueQId }),
+    ]);
+
+    for (const result of results) {
+      if (result.status === "rejected") {
+        expect(String(result.reason?.message ?? result.reason)).not.toMatch(/deadlock/i);
+      }
+    }
+    expect(results.every((result) => result.status === "fulfilled")).toBe(true);
+
+    const [issueX, issueY] = await Promise.all([
+      svc.getById(issueXId),
+      svc.getById(issueYId),
+    ]);
+    expect(issueX?.parentId).toBe(issuePId);
+    expect(issueY?.parentId).toBe(issueQId);
+    await expect(svc.getRelationSummaries(issueXId)).resolves.toMatchObject({
+      blockedBy: [expect.objectContaining({ id: issueYId })],
+    });
+  });
+
+  it("does not deadlock a combined parent and blocker update against a blocker-only update", async () => {
+    const companyId = randomUUID();
+    const issuePId = randomUUID();
+    const issueXId = randomUUID();
+    const issueZId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(issues).values([
+      {
+        id: issuePId,
+        companyId,
+        title: "Issue P",
+        status: "todo",
+        priority: "medium",
+      },
+      {
+        id: issueXId,
+        companyId,
+        title: "Issue X",
+        status: "todo",
+        priority: "medium",
+      },
+      {
+        id: issueZId,
+        companyId,
+        title: "Issue Z",
+        status: "todo",
+        priority: "medium",
+      },
+    ]);
+
+    const results = await Promise.allSettled([
+      svc.update(issueXId, { parentId: issuePId, blockedByIssueIds: [issueZId] }),
+      svc.update(issuePId, { blockedByIssueIds: [issueZId] }),
+    ]);
+
+    for (const result of results) {
+      if (result.status === "rejected") {
+        expect(String(result.reason?.message ?? result.reason)).not.toMatch(/deadlock/i);
+      }
+    }
+    expect(results.every((result) => result.status === "fulfilled")).toBe(true);
+
+    const issueX = await svc.getById(issueXId);
+    expect(issueX?.parentId).toBe(issuePId);
+    await expect(svc.getRelationSummaries(issueXId)).resolves.toMatchObject({
+      blockedBy: [expect.objectContaining({ id: issueZId })],
+    });
+    await expect(svc.getRelationSummaries(issuePId)).resolves.toMatchObject({
+      blockedBy: [expect.objectContaining({ id: issueZId })],
+    });
+  });
+
+  it("does not deadlock a create-with-blockers against a combined parent and blocker update", async () => {
+    const companyId = randomUUID();
+    const issuePId = "00000000-0000-4000-8000-000000000001";
+    const issueXId = "00000000-0000-4000-8000-000000000002";
+    const issueZId = "00000000-0000-4000-8000-000000000004";
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(issues).values([
+      {
+        id: issuePId,
+        companyId,
+        title: "Issue P",
+        status: "todo",
+        priority: "medium",
+      },
+      {
+        id: issueXId,
+        companyId,
+        title: "Issue X",
+        status: "todo",
+        priority: "medium",
+      },
+      {
+        id: issueZId,
+        companyId,
+        title: "Issue Z",
+        status: "todo",
+        priority: "medium",
+      },
+    ]);
+
+    const results = await Promise.allSettled([
+      svc.update(issueXId, { parentId: issuePId, blockedByIssueIds: [issueZId] }),
+      svc.create(companyId, {
+        title: "New dependent",
+        status: "todo",
+        priority: "medium",
+        blockedByIssueIds: [issuePId, issueZId],
+      }),
+    ]);
+
+    for (const result of results) {
+      if (result.status === "rejected") {
+        expect(String(result.reason?.message ?? result.reason)).not.toMatch(/deadlock/i);
+      }
+    }
+    expect(results.every((result) => result.status === "fulfilled")).toBe(true);
+
+    const issueX = await svc.getById(issueXId);
+    expect(issueX?.parentId).toBe(issuePId);
+    await expect(svc.getRelationSummaries(issueXId)).resolves.toMatchObject({
+      blockedBy: [expect.objectContaining({ id: issueZId })],
+    });
+    const createResult = results[1];
+    expect(createResult.status).toBe("fulfilled");
+    const createdIssueId = createResult.status === "fulfilled" ? createResult.value.id : "";
+    await expect(svc.getRelationSummaries(createdIssueId)).resolves.toMatchObject({
+      blockedBy: [
+        expect.objectContaining({ id: issuePId }),
+        expect.objectContaining({ id: issueZId }),
+      ],
+    });
   });
 
   it("rejects updates that pin a projectless issue to an isolated git worktree", async () => {
