@@ -4057,4 +4057,214 @@ describeEmbeddedPostgres("productivity review service", () => {
     const [review] = await listProductivityReviews(seeded.companyId);
     expect(review?.requestDepth).toBe(MAX_ISSUE_REQUEST_DEPTH);
   });
+
+  // BLO-22061: `issues.started_at` is stamped at checkout and preserved across
+  // every run of the episode, so on its own the long-active clock measures how
+  // long the ISSUE has been in_progress, not how long any run has executed. An
+  // issue whose execution holder is still waiting for a dispatcher slot has
+  // executed for zero seconds; counting that wait reported queue latency as an
+  // agent failing to produce.
+  describe("long_active_duration is measured from actual dispatch (BLO-22061)", () => {
+    async function seedHolderRun(input: {
+      companyId: string;
+      agentId: string;
+      issueId: string;
+      status: "queued" | "running" | "scheduled_retry";
+      createdAt: Date;
+      startedAt?: Date | null;
+      lastOutputAt?: Date | null;
+    }) {
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId: input.companyId,
+        agentId: input.agentId,
+        status: input.status,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        startedAt: input.startedAt ?? null,
+        lastOutputAt: input.lastOutputAt ?? null,
+        contextSnapshot: { issueId: input.issueId, taskId: input.issueId },
+        createdAt: input.createdAt,
+        updatedAt: input.createdAt,
+      });
+      await db
+        .update(issues)
+        .set({ executionRunId: runId, executionLockedAt: input.createdAt })
+        .where(eq(issues.id, input.issueId));
+      return runId;
+    }
+
+    it("does not trigger when the only holder is a queued run that never dispatched", async () => {
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const eightHoursAgo = new Date(now.getTime() - 8 * 60 * 60 * 1000);
+      const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: eightHoursAgo });
+      await seedHolderRun({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        status: "queued",
+        createdAt: eightHoursAgo,
+        startedAt: null,
+      });
+
+      const result = await productivityReviewService(db).reconcileProductivityReviews({
+        now,
+        companyId: seeded.companyId,
+      });
+
+      expect(result.created).toBe(0);
+      expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+    });
+
+    it("still triggers when a genuinely running run has been executing past the threshold", async () => {
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const eightHoursAgo = new Date(now.getTime() - 8 * 60 * 60 * 1000);
+      const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: eightHoursAgo });
+      await seedHolderRun({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        status: "running",
+        createdAt: eightHoursAgo,
+        startedAt: eightHoursAgo,
+        // Recent output keeps the holder live, so the BLO-19848 tail clamp does
+        // not truncate the episode: this is a run that really has run for 8h.
+        lastOutputAt: new Date(now.getTime() - 60 * 1000),
+      });
+
+      const result = await productivityReviewService(db).reconcileProductivityReviews({
+        now,
+        companyId: seeded.companyId,
+      });
+
+      expect(result.created).toBe(1);
+      const [review] = await listProductivityReviews(seeded.companyId);
+      expect(review?.description).toContain("long_active_duration");
+    });
+
+    it("does not trigger when an unclaimed queued run exists without an execution lock", async () => {
+      // The reproducing case: the lock pointer is empty (lazy locking only stamps
+      // it at claim time, and the stale-lock sweep may have released it) while a
+      // queued run waits. The BLO-19848 clamp short-circuits on a null lock, so
+      // before this fix the trigger reverted to full wall-clock from started_at.
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const eightHoursAgo = new Date(now.getTime() - 8 * 60 * 60 * 1000);
+      const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: eightHoursAgo });
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        status: "queued",
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        startedAt: null,
+        contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+        createdAt: eightHoursAgo,
+        updatedAt: eightHoursAgo,
+      });
+
+      const result = await productivityReviewService(db).reconcileProductivityReviews({
+        now,
+        companyId: seeded.companyId,
+      });
+
+      expect(result.created).toBe(0);
+    });
+
+    it("still triggers for an abandoned in_progress issue with no execution path at all", async () => {
+      // The true positive the detector exists for: nothing owns the issue and
+      // nothing is queued. This must keep firing after the fix.
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const seeded = await seedAssignedIssue({
+        status: "in_progress",
+        startedAt: new Date(now.getTime() - 8 * 60 * 60 * 1000),
+      });
+
+      const result = await productivityReviewService(db).reconcileProductivityReviews({
+        now,
+        companyId: seeded.companyId,
+      });
+
+      expect(result.created).toBe(1);
+    });
+
+    it("counts a Next-action comment just past the trigger threshold as a progress signal", async () => {
+      // The 6h lookback used to coincide with the 6h trigger window, so a report
+      // written at the end of a working episode fell outside it — the reproducing
+      // case missed by 75 seconds. The lookback must be strictly wider.
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const thresholdMs = 6 * 60 * 60 * 1000;
+      const seeded = await seedAssignedIssue({
+        status: "in_progress",
+        startedAt: new Date(now.getTime() - 8 * 60 * 60 * 1000),
+      });
+      const commentAt = new Date(now.getTime() - (thresholdMs + 2 * 60 * 1000));
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        status: "succeeded",
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        startedAt: commentAt,
+        finishedAt: commentAt,
+        contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+        createdAt: commentAt,
+        updatedAt: commentAt,
+      });
+      await db.insert(issueComments).values({
+        companyId: seeded.companyId,
+        issueId: seeded.issueId,
+        authorAgentId: seeded.coderId,
+        createdByRunId: runId,
+        body: "Attempted the migration.\n\nNext action: land the follow-up PR.",
+        createdAt: commentAt,
+        updatedAt: commentAt,
+      });
+
+      const result = await productivityReviewService(db).reconcileProductivityReviews({
+        now,
+        companyId: seeded.companyId,
+      });
+
+      expect(result.created).toBe(1);
+      const [review] = await listProductivityReviews(seeded.companyId);
+      expect(review?.description).toContain("INSIDE the window — this signal is present");
+      expect(review?.description).toContain(commentAt.toISOString());
+    });
+
+    it("reports the children-driven wake path instead of calling a tracker unattended", async () => {
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const seeded = await seedAssignedIssue({
+        status: "in_progress",
+        startedAt: new Date(now.getTime() - 8 * 60 * 60 * 1000),
+      });
+      await db.insert(issues).values({
+        id: randomUUID(),
+        companyId: seeded.companyId,
+        title: "Child still in flight",
+        status: "in_progress",
+        priority: "medium",
+        assigneeAgentId: seeded.coderId,
+        parentId: seeded.issueId,
+        originKind: "manual",
+        issueNumber: 900,
+        identifier: `${seeded.issuePrefix}-900`,
+        createdAt: seeded.createdAt,
+        updatedAt: seeded.createdAt,
+      });
+
+      const result = await productivityReviewService(db).reconcileProductivityReviews({
+        now,
+        companyId: seeded.companyId,
+      });
+
+      expect(result.created).toBe(1);
+      const [review] = await listProductivityReviews(seeded.companyId);
+      expect(review?.description).toContain("children-driven wake path");
+      expect(review?.description).not.toContain("(no monitor armed during this episode)");
+    });
+  });
 });

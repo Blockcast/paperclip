@@ -46,6 +46,14 @@ export const DEFAULT_PRODUCTIVITY_REVIEW_LONG_ACTIVE_HOURS = 6;
 // has decided in a day is exactly the condition the detector exists to surface, so the
 // suppression lapses and reviews resume.
 export const DEFAULT_PRODUCTIVITY_REVIEW_APPROVAL_GATE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+// BLO-22061: how much wider than `longActiveMs` the "concrete progress signal"
+// lookback runs. The manager-decision block asks whether the assignee reported a
+// next action "recently"; when that window is the *same* 6h as the trigger, the
+// two edges coincide and a report written at the end of a working episode lands
+// just outside it. The reproducing case missed by 75 seconds. The lookback must
+// be strictly wider than the trigger window so a comment that provably predates
+// the alarm by less than the grace still reads as progress.
+export const DEFAULT_PRODUCTIVITY_REVIEW_PROGRESS_SIGNAL_GRACE_MS = 30 * 60 * 1000;
 export const DEFAULT_PRODUCTIVITY_REVIEW_HIGH_CHURN_HOURLY = 10;
 export const DEFAULT_PRODUCTIVITY_REVIEW_HIGH_CHURN_SIX_HOURS = 30;
 export const DEFAULT_PRODUCTIVITY_REVIEW_RESOLVED_SNOOZE_MS = 6 * 60 * 60 * 1000;
@@ -112,6 +120,7 @@ type ProductivityReviewTrigger = "no_comment_streak" | "long_active_duration" | 
 type ProductivityReviewThresholds = {
   noCommentStreakRuns: number;
   longActiveMs: number;
+  progressSignalGraceMs: number;
   approvalGateMaxAgeMs: number;
   highChurnHourly: number;
   highChurnSixHours: number;
@@ -147,6 +156,18 @@ type ProductivityReviewEvidence = {
   // executionRunId was pinned by a run that was not live. 0 when the holder is
   // live or absent.
   nonLiveHoldMs: number;
+  // BLO-22061: wall-clock a still-pending run has spent waiting for a dispatcher
+  // slot. Reported as its own bucket and never counted toward the trigger — an
+  // un-dispatched run has executed for zero seconds. 0 when the holder dispatched.
+  undispatchedQueueMs: number;
+  // BLO-22061: non-terminal children in flight on an issue with no monitor armed,
+  // i.e. a tracker whose wake path is `issue_children_completed` by design.
+  childrenDrivenWake: { openChildCount: number } | null;
+  // BLO-22061: lookback for the manager's "concrete progress signal" test, held
+  // strictly wider than `longActiveMs` so the two edges cannot coincide.
+  progressSignalLookbackMs: number;
+  progressSignalAt: Date | null;
+  hasRecentProgressSignal: boolean;
   monitorGating: {
     gatedMs: number;
     unattendedMs: number;
@@ -395,8 +416,9 @@ function nonLiveExecutionHoldSince(
 
 /**
  * BLO-19848 (review follow-up): the moment the current live execution segment
- * began, when the holding run reached `running` by way of a park — or null when
- * there is no park to exclude.
+ * began — the later of the holder's dispatch and the end of its most recent park
+ * (BLO-22061) — or null when the holder is not running and there is nothing to
+ * exclude.
  *
  * `nonLiveExecutionHoldSince` only truncates the *tail* of an episode, so it
  * stops helping the instant a parked holder resumes: the run is genuinely live
@@ -427,13 +449,78 @@ function nonLiveExecutionHoldSince(
  */
 function liveSegmentStartedAt(executionRun: HeartbeatRunRow | null, now: Date): Date | null {
   if (!executionRun || executionRun.status !== "running") return null;
+  // BLO-22061: a run cannot have been executing before it was dispatched.
+  // `issues.started_at` is stamped at checkout and then deliberately preserved
+  // across every subsequent run of the same episode (see checkoutIssue: "preserves
+  // the original startedAt when the issue is already in_progress"), so on its own
+  // it measures how long the *issue* has been `in_progress` — not how long any run
+  // has been executing. Anchoring on the holder's own dispatch time is what makes
+  // the trigger mean "one run has been going for N hours", which is the condition
+  // worth reviewing. `heartbeat_runs.started_at` is null until claim and preserved
+  // across retry promotion (`run.startedAt ?? claimedAt`), so it is a durable
+  // dispatch mark rather than a churn-sensitive column.
+  const dispatchedAt = coerceDate(executionRun.startedAt);
   const parkEndedAt = coerceDate(executionRun.scheduledRetryAt);
-  if (!parkEndedAt || Number.isNaN(parkEndedAt.getTime())) return null;
+  const candidates = [dispatchedAt, parkEndedAt].filter(
+    (value): value is Date =>
+      Boolean(value) && !Number.isNaN(value!.getTime()) && value!.getTime() <= now.getTime(),
+  );
   // A future deadline on a `running` row is contradictory; ignore rather than
-  // clamping the episode start into the future.
-  if (parkEndedAt.getTime() > now.getTime()) return null;
-  return parkEndedAt;
+  // clamping the episode start into the future (filtered above).
+  if (candidates.length === 0) return null;
+  return new Date(Math.max(...candidates.map((value) => value.getTime())));
 }
+
+/**
+ * BLO-22061: true when the issue's only execution evidence is a run that has
+ * never been dispatched.
+ *
+ * A `queued` / `scheduled_retry` run whose `started_at` is still null has not
+ * executed for a single second — it is waiting for a dispatcher slot. Counting
+ * its wait as "active duration" reports queue latency as an agent failing to
+ * produce, which is the reported defect: BLO-3606 was flagged for a "6h 7m active
+ * episode" whose holder had never started and had no run log at all, while the
+ * assignee was demonstrably delivering on the same issue throughout.
+ *
+ * `nonLiveExecutionHoldSince` already tail-clamps a parked holder, but it
+ * short-circuits to null the moment `issues.execution_run_id` is empty — and an
+ * un-dispatched run is exactly the case where the lock tends to be empty, because
+ * the lazy-locking model only stamps the pointer at claim time (and
+ * sweepStaleIssueLocks may have released a stale pre-claim lock). So the clamp
+ * disengages precisely when it is needed and the trigger reverts to full
+ * wall-clock from `issues.started_at`.
+ *
+ * Deliberately scoped to "no dispatched execution anywhere": an issue with *no*
+ * runs at all and an empty lock is a genuinely abandoned `in_progress` issue and
+ * must keep firing — that is the true positive this detector exists for. Only the
+ * presence of an un-dispatched, still-pending run suppresses the duration
+ * trigger, and the excluded wall-clock is reported as its own labelled bucket so
+ * a manager sees the queue wait rather than nothing.
+ */
+function undispatchedQueueHold(
+  executionRun: HeartbeatRunRow | null,
+  activeRuns: HeartbeatRunRow[],
+): { pendingRun: HeartbeatRunRow; queuedSince: Date | null } | null {
+  const isPending = (run: HeartbeatRunRow) =>
+    (run.status === "queued" || run.status === "scheduled_retry") && !coerceDate(run.startedAt);
+
+  // The named holder wins when there is one: it is the run the issue is waiting on.
+  if (executionRun) {
+    return isPending(executionRun)
+      ? { pendingRun: executionRun, queuedSince: coerceDate(executionRun.createdAt) }
+      : null;
+  }
+
+  // No lock. A dispatched run in the active set means execution really is under
+  // way (the pointer just is not stamped), so leave the episode alone.
+  if (activeRuns.some((run) => !isPending(run))) return null;
+  const pendingRun = activeRuns.find(isPending);
+  return pendingRun ? { pendingRun, queuedSince: coerceDate(pendingRun.createdAt) } : null;
+}
+
+/** BLO-22061: a run-linked comment reporting a next step, used as a progress signal. */
+const NEXT_ACTION_LINE_PATTERN = /^\s*(?:[-*>]\s*)?(?:\*\*|__)?next(?:\s+(?:action|step)s?)?(?:\*\*|__)?\s*[:\-—]/im;
+
 
 function isTerminalIssueStatus(status: string | null | undefined) {
   return status === "done" || status === "cancelled";
@@ -567,7 +654,10 @@ function monitorGatingBreakdown(issue: IssueRow, activeStartedAt: Date | null, e
   };
 }
 
-function formatMonitorGating(gating: NonNullable<ProductivityReviewEvidence["monitorGating"]>) {
+function formatMonitorGating(
+  gating: NonNullable<ProductivityReviewEvidence["monitorGating"]>,
+  childrenDrivenWake?: ProductivityReviewEvidence["childrenDrivenWake"],
+) {
   // An upper-bound gated figure implies a lower-bound unattended figure; both
   // carry a qualifier so neither half of the split reads as measured.
   const gated = `${gating.gatedIsUpperBound ? "≤" : ""}${msToHumanFine(gating.gatedMs)} monitor-gated`;
@@ -577,6 +667,14 @@ function formatMonitorGating(gating: NonNullable<ProductivityReviewEvidence["mon
     return `${split} (monitor armed until ${gating.armedUntil.toISOString()}; arm time is not recorded, so monitor-gated time is an upper bound)`;
   }
   if (gating.lapsedAt) return `${split} (monitor lapsed at ${gating.lapsedAt.toISOString()}, never re-armed)`;
+  // BLO-22061: on a children-driven tracker the absent monitor is the design, not
+  // a lapse. Name the real wake path instead of reporting the episode as unattended.
+  if (childrenDrivenWake) {
+    const prior = gating.priorLapseAt
+      ? `; previous monitor lapsed at ${gating.priorLapseAt.toISOString()}, before it began`
+      : "";
+    return `${split} (no monitor armed — children-driven wake path: ${childrenDrivenWake.openChildCount} non-terminal child issue(s) in flight, so this issue wakes on \`issue_children_completed\` rather than a monitor${prior})`;
+  }
   if (gating.priorLapseAt) {
     return `${split} (no monitor armed during this episode; previous monitor lapsed at ${gating.priorLapseAt.toISOString()}, before it began)`;
   }
@@ -635,6 +733,10 @@ function buildThresholds(overrides?: Partial<ProductivityReviewThresholds>): Pro
       DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
     ),
     longActiveMs,
+    progressSignalGraceMs: readPositiveInteger(
+      overrides?.progressSignalGraceMs ?? DEFAULT_PRODUCTIVITY_REVIEW_PROGRESS_SIGNAL_GRACE_MS,
+      DEFAULT_PRODUCTIVITY_REVIEW_PROGRESS_SIGNAL_GRACE_MS,
+    ),
     approvalGateMaxAgeMs,
     highChurnHourly: readPositiveInteger(
       overrides?.highChurnHourly ?? DEFAULT_PRODUCTIVITY_REVIEW_HIGH_CHURN_HOURLY,
@@ -2070,9 +2172,10 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         .then((rows) => rows[0] ?? { costCents: 0 }),
     ]);
 
-    const activeRunCount = latestRuns.filter((run) =>
+    const activeRuns = latestRuns.filter((run) =>
       ACTIVE_RUN_STATUSES.includes(run.status as (typeof ACTIVE_RUN_STATUSES)[number]),
-    ).length;
+    );
+    const activeRunCount = activeRuns.length;
     const activeStartedAt = sourceIssue.startedAt ?? sourceIssue.executionLockedAt ?? null;
     // BLO-19848: clamp the episode end to the last moment execution was
     // attributable to a live run, so a wedged holder cannot accrue "active"
@@ -2103,7 +2206,14 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       && liveSegmentStart.getTime() > activeStartedAt.getTime()
       ? liveSegmentStart
       : activeStartedAt;
-    const elapsedMs = sourceIssue.status === "in_progress" && attributableStartAt
+    // BLO-22061: an un-dispatched holder has executed for zero seconds, so there
+    // is no active duration to report. Null (not 0) so `longActive` below is
+    // false by construction and the trigger cannot fire on queue latency alone.
+    const undispatchedHold = undispatchedQueueHold(executionRun, activeRuns);
+    const undispatchedQueueMs = undispatchedHold?.queuedSince
+      ? Math.max(0, now.getTime() - undispatchedHold.queuedSince.getTime())
+      : 0;
+    const elapsedMs = sourceIssue.status === "in_progress" && attributableStartAt && !undispatchedHold
       ? Math.max(0, attributableEndAt.getTime() - attributableStartAt.getTime())
       : null;
     // Total wall-clock withheld from the trigger: the leading park plus the
@@ -2119,6 +2229,37 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     const nonLiveHoldMs = episodeMs === null
       ? trailingHoldMs
       : Math.min(episodeMs, leadingParkMs + trailingHoldMs);
+
+    // BLO-22061: the newest assignee run-linked comment that reports a next step,
+    // and whether it lands inside a lookback deliberately wider than the trigger
+    // window. `latestComments` is already ordered newest-first.
+    const progressSignalLookbackMs = thresholds.longActiveMs + thresholds.progressSignalGraceMs;
+    const progressSignalAt = coerceDate(
+      latestComments.find((comment) => NEXT_ACTION_LINE_PATTERN.test(comment.body ?? ""))?.createdAt,
+    );
+    const hasRecentProgressSignal = Boolean(
+      progressSignalAt && now.getTime() - progressSignalAt.getTime() <= progressSignalLookbackMs,
+    );
+
+    // BLO-22061: a tracker/epic advances on `issue_children_completed` wakes and
+    // deliberately arms no monitor, so "no monitor armed during this episode"
+    // describes its correct design rather than an unattended agent. Count the
+    // children still in flight so the evidence block can say which wake path the
+    // issue is actually on.
+    const openChildCount = await db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, sourceIssue.companyId),
+          eq(issues.parentId, sourceIssue.id),
+          notInArray(issues.status, ["done", "cancelled"]),
+        ),
+      )
+      .then((rows) => rows[0]?.count ?? 0);
+    const childrenDrivenWake = openChildCount > 0 && !coerceDate(sourceIssue.monitorNextCheckAt)
+      ? { openChildCount }
+      : null;
 
     const noComment = noCommentStreak >= thresholds.noCommentStreakRuns;
     const longActive = elapsedMs !== null && elapsedMs >= thresholds.longActiveMs;
@@ -2206,6 +2347,11 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       commentCountLastSixHours: assigneeRunCommentCountLastSixHours,
       elapsedMs,
       nonLiveHoldMs,
+      undispatchedQueueMs,
+      childrenDrivenWake,
+      progressSignalLookbackMs,
+      progressSignalAt,
+      hasRecentProgressSignal,
       monitorGating: monitorGatingBreakdown(sourceIssue, attributableStartAt, elapsedMs, now),
       latestRuns: latestRuns.slice(0, 5),
       latestComments,
@@ -2320,8 +2466,18 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
             `- Excluded as non-live execution hold: ${msToHuman(evidence.nonLiveHoldMs)} (issue's executionRunId parked or pinned by a run that was not live; not counted toward the trigger — BLO-19848)`,
           ]
         : []),
+      ...(evidence.undispatchedQueueMs > 0
+        ? [
+            `- Excluded as undispatched queue wait: ${msToHuman(evidence.undispatchedQueueMs)} (the issue's execution holder is still \`queued\`/\`scheduled_retry\` and has never been dispatched — it has executed for 0s, so this is queue latency, not active work, and does not count toward the trigger — BLO-22061)`,
+          ]
+        : []),
       ...(evidence.monitorGating
-        ? [`- Elapsed accounting: ${formatMonitorGating(evidence.monitorGating)}`]
+        ? [`- Elapsed accounting: ${formatMonitorGating(evidence.monitorGating, evidence.childrenDrivenWake)}`]
+        : []),
+      ...(evidence.childrenDrivenWake
+        ? [
+            `- Wake path: children-driven — ${evidence.childrenDrivenWake.openChildCount} non-terminal child issue(s) in flight and no monitor armed. A tracker/epic advances on \`issue_children_completed\` wakes and is *designed* to sit still while children move; absence of a monitor here is not evidence of an unattended agent (BLO-22061).`,
+          ]
         : []),
       `- Runs in rolling windows: ${evidence.runCountLastHour}/1h, ${evidence.runCountLastSixHours}/6h`,
       `- Assignee run-linked comments total/window: ${evidence.commentCount} total, ${evidence.commentCountLastHour}/1h, ${evidence.commentCountLastSixHours}/6h`,
@@ -2350,9 +2506,19 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       "## Manager Decision",
       "",
       "A \"Close as productive\" verdict requires at least ONE of the following concrete progress signals:",
-      "- An assignee run-linked comment in the last 6h that contains a `Next action:` line",
+      `- An assignee run-linked comment in the last ${msToHuman(evidence.progressSignalLookbackMs)} that contains a \`Next action:\` line${
+        evidence.progressSignalAt
+          ? ` — most recent such comment: ${evidence.progressSignalAt.toISOString()}${evidence.hasRecentProgressSignal ? " (INSIDE the window — this signal is present)" : " (outside the window)"}`
+          : " — none found in the sampled comments"
+      }`,
       "- A non-stale PR/MR link in the source issue's evidence (created or updated in the last 24h)",
-      "- A recent test result, artifact commit, or workspace deliverable in the last 6h",
+      `- A recent test result, artifact commit, or workspace deliverable in the last ${msToHuman(evidence.progressSignalLookbackMs)}`,
+      "",
+      // BLO-22061: the lookback is deliberately wider than the trigger window. When
+      // the two coincided, a report written at the end of a working episode landed
+      // just outside it — the reproducing case missed by 75 seconds and a
+      // demonstrably productive agent was flagged.
+      `(Lookback is the ${msToHuman(evidence.thresholds.longActiveMs)} trigger window plus a ${msToHuman(evidence.thresholds.progressSignalGraceMs)} grace band, so a report made just before the trigger fired still counts — BLO-22061.)`,
       "",
       "If none of these signals is present, the correct verdict is one of:",
       "- Request decomposition (the work is too large for a single heartbeat issue and needs to be split)",
@@ -2372,7 +2538,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       `- No-comment streak: ${evidence.noCommentStreak}`,
       `- Runs/assignee comments: ${evidence.runCountLastHour}/${evidence.commentCountLastHour} in 1h, ${evidence.runCountLastSixHours}/${evidence.commentCountLastSixHours} in 6h`,
       ...(evidence.monitorGating
-        ? [`- Elapsed accounting: ${formatMonitorGating(evidence.monitorGating)}`]
+        ? [`- Elapsed accounting: ${formatMonitorGating(evidence.monitorGating, evidence.childrenDrivenWake)}`]
         : []),
       `- Next action: ${evidence.nextAction ? truncateInline(evidence.nextAction, 300) : "none recorded"}`,
     ].join("\n");
