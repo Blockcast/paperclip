@@ -173,8 +173,9 @@ Skip the `Risk and rollback` section only for clearly trivial PRs (typos, docs).
 
 ## Which credential to use (authoring, reviewing, merging)
 
-You have two GitHub identities available, and which one **authors** your PR
-decides whether the PR can receive a formal review at all:
+Three GitHub-reachable credentials are mounted or reachable from an agent pod.
+Only the first is a sanctioned authoring credential; which one **authors** your
+PR decides whether the PR can receive a formal review at all:
 
 - **Default App-installation token** — identity `app/allyblockcast[bot]`. This is
   the **authoring identity**: commits, branch push, `gh pr create`, comments,
@@ -189,6 +190,21 @@ decides whether the PR can receive a formal review at all:
   when it is `APPROVED` and contains the canonical consolidated review body with
   exactly one exact-head `Reviewed head: <sha>` attestation. It is *not* an
   authoring credential.
+- **Cluster SSH key** — `/paperclip/.ssh/id_ed25519`, readable by any agent pod
+  that mounts the shared `/paperclip` PVC. It exists to reach cluster hosts
+  (`sfo12-public`, `home-residential`) per `/paperclip/.ssh/config` — that is its
+  only sanctioned use. It is *also* registered on a human's personal GitHub
+  **user** account (`kkroo`), an unintended side effect of that cluster
+  provisioning and not a GitHub authoring grant: `ssh -T git@github.com` with it
+  authenticates as that human, and it can push to every repo that account can
+  write — including repos entirely outside the App installation, where neither of
+  the two credentials above has any write path.
+
+  **Never use this key for any GitHub operation** — no `git push`, no
+  `git clone`/`fetch` over an `ssh://git@github.com` or `git@github.com:` remote,
+  no `ssh -T git@github.com`. A push made with it is attributed to that human's
+  account, not the agent, and is indistinguishable from one they made themselves.
+  See BLO-21854.
 
 GitHub forbids an identity from submitting a **formal review** (`APPROVE` /
 `REQUEST_CHANGES`) on a PR it authored, so the author and the reviewer must be
@@ -215,8 +231,9 @@ untrusted, and an App comment cannot satisfy a repository rule that explicitly
 requires a formal approval.
 
 **Author and push under the default App token. Never author or push a PR under
-the user-seat token.** No token selection is needed — the default `gh` and `git`
-credentials already are the App token.
+the user-seat token, and never over the cluster SSH key either.** No token
+selection is needed — the default `gh` and `git` credentials already are the App
+token, and GitHub operations never go over SSH in these pods.
 
 ### Why seat-authoring breaks review
 
@@ -470,3 +487,7 @@ caught.
 - Approving your own PR under the user-seat merge token to turn the review gate
   green. That is a forged review, not a merge unblock — see the credential rules
   above.
+- Reaching for the cluster SSH key (`/paperclip/.ssh/id_ed25519`) because the App
+  token lacks write access to some repo. A repo the App isn't installed on is a
+  permission gate, not a credential puzzle — the SSH key's GitHub registration is
+  a human's personal account, not a sanctioned bypass. Note the gap and escalate.

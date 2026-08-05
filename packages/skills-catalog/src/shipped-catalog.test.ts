@@ -426,6 +426,20 @@ describe("shipped skills catalog", () => {
     expect(content).toMatch(/Protected branch\s+rules not configured for this branch/);
   });
 
+  it("names the cluster SSH key in the credential model and forbids any GitHub use (BLO-21854)", async () => {
+    const content = await readFile(GITHUB_PR_WORKFLOW_SKILL, "utf8");
+
+    // /paperclip/.ssh/id_ed25519 authenticates to GitHub as a human's personal
+    // account (kkroo) as an unintended side effect of its cluster provisioning —
+    // the credential section must name it, its cluster-only scope, and the
+    // prohibition, so agents don't rediscover it as a surprise third authoring path.
+    expect(content).toContain("/paperclip/.ssh/id_ed25519");
+    expect(content).toContain("sfo12-public");
+    expect(content).toContain("home-residential");
+    expect(content).toContain("Never use this key for any GitHub operation");
+    expect(content).toContain("never over the cluster SSH key either");
+  });
+
   it("never selects a non-default credential in an authoring or review recipe", async () => {
     const content = await readFile(GITHUB_PR_WORKFLOW_SKILL, "utf8");
     const { authoringBlocks, violations } = credentialViolations(content);
