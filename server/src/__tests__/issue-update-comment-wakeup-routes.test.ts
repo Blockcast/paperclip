@@ -735,6 +735,81 @@ describe("issue update comment wakeups", () => {
     ));
   });
 
+  it("preserves the POST assignee wake when mention membership lookup fails", async () => {
+    const existing = makeIssue({
+      assigneeAgentId: ASSIGNEE_AGENT_ID,
+      assigneeUserId: null,
+      status: "in_progress",
+    });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-post-membership-failure",
+      issueId: existing.id,
+      companyId: existing.companyId,
+      body: `[@QA](agent://${MENTIONED_AGENT_ID}) please inspect this`,
+    });
+    mockIssueService.findMentionedAgents.mockResolvedValue([MENTIONED_AGENT_ID]);
+    mockGetActiveCompanyMembership.mockRejectedValue(new Error("membership unavailable"));
+
+    const res = await request(await createApp({
+      type: "board",
+      userId: "active-user",
+      companyIds: [existing.companyId],
+      source: "session",
+      isInstanceAdmin: false,
+    }))
+      .post(`/api/issues/${existing.id}/comments`)
+      .send({ body: `[@QA](agent://${MENTIONED_AGENT_ID}) please inspect this` });
+
+    expect(res.status).toBe(201);
+    await vi.waitFor(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      ASSIGNEE_AGENT_ID,
+      expect.objectContaining({ reason: "issue_commented" }),
+    ));
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalledWith(
+      MENTIONED_AGENT_ID,
+      expect.objectContaining({ reason: "issue_comment_mentioned" }),
+    );
+  });
+
+  it("preserves the PATCH assignee wake when mention membership lookup fails", async () => {
+    const existing = makeIssue({
+      assigneeAgentId: ASSIGNEE_AGENT_ID,
+      assigneeUserId: null,
+      status: "in_progress",
+    });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockResolvedValue(existing);
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-patch-membership-failure",
+      issueId: existing.id,
+      companyId: existing.companyId,
+      body: `[@QA](agent://${MENTIONED_AGENT_ID}) please inspect this`,
+    });
+    mockIssueService.findMentionedAgents.mockResolvedValue([MENTIONED_AGENT_ID]);
+    mockGetActiveCompanyMembership.mockRejectedValue(new Error("membership unavailable"));
+
+    const res = await request(await createApp({
+      type: "board",
+      userId: "active-user",
+      companyIds: [existing.companyId],
+      source: "session",
+      isInstanceAdmin: false,
+    }))
+      .patch(`/api/issues/${existing.id}`)
+      .send({ comment: `[@QA](agent://${MENTIONED_AGENT_ID}) please inspect this` });
+
+    expect(res.status).toBe(200);
+    await vi.waitFor(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      ASSIGNEE_AGENT_ID,
+      expect.objectContaining({ reason: "issue_commented" }),
+    ));
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalledWith(
+      MENTIONED_AGENT_ID,
+      expect.objectContaining({ reason: "issue_comment_mentioned" }),
+    );
+  });
+
   it("does not wake a mentioned agent when an agent comment cannot grant reply access", async () => {
     const existing = makeIssue({
       assigneeAgentId: ASSIGNEE_AGENT_ID,

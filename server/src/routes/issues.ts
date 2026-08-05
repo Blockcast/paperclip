@@ -11003,9 +11003,16 @@ export function issueRoutes(
           logger.warn({ err, issueId: id }, "failed to resolve @-mentions");
         }
 
-        const authorUserIsActiveMember = mentionedIds.length > 0 && actor.actorType === "user"
-          ? Boolean(await getActiveCompanyMembership(db, issue.companyId, "user", actor.actorId))
-          : false;
+        let authorUserIsActiveMember = false;
+        if (mentionedIds.length > 0 && actor.actorType === "user") {
+          try {
+            authorUserIsActiveMember = Boolean(
+              await getActiveCompanyMembership(db, issue.companyId, "user", actor.actorId),
+            );
+          } catch (err) {
+            logger.warn({ err, issueId: id }, "failed to resolve comment author membership for @-mentions");
+          }
+        }
 
         for (const mentionedId of mentionedIds) {
           if (!commentAuthorCanGrantIssueMention({
@@ -12951,9 +12958,16 @@ export function issueRoutes(
         logger.warn({ err, issueId: id }, "failed to resolve @-mentions");
       }
 
-      const authorUserIsActiveMember = mentionedIds.length > 0 && actor.actorType === "user"
-        ? Boolean(await getActiveCompanyMembership(db, issue.companyId, "user", actor.actorId))
-        : false;
+      let authorUserIsActiveMember = false;
+      if (mentionedIds.length > 0 && actor.actorType === "user") {
+        try {
+          authorUserIsActiveMember = Boolean(
+            await getActiveCompanyMembership(db, issue.companyId, "user", actor.actorId),
+          );
+        } catch (err) {
+          logger.warn({ err, issueId: id }, "failed to resolve comment author membership for @-mentions");
+        }
+      }
 
       for (const mentionedId of mentionedIds) {
         if (!commentAuthorCanGrantIssueMention({
