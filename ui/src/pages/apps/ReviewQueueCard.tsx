@@ -42,16 +42,12 @@ export function ReviewQueueCard({
     enabled: !!selectedCompanyId,
     staleTime: 0,
     refetchOnMount: false,
-    refetchInterval: (state) => {
-      const visibleItems = filterActionRequests(state.state.data?.actionRequests, connectionId);
-      return emptyState !== "hidden" && visibleItems.length === 0
-        ? VISIBLE_EMPTY_QUEUE_REFRESH_MS
-        : 20_000;
-    },
+    refetchInterval: 20_000,
   });
 
   const items = useMemo(() => {
-    return filterActionRequests(query.data?.actionRequests, connectionId);
+    const all = query.data?.actionRequests ?? [];
+    return connectionId ? all.filter((item) => item.connectionId === connectionId) : all;
   }, [query.data, connectionId]);
 
   useEffect(() => {
@@ -98,14 +94,6 @@ export function ReviewQueueCard({
       </div>
     </section>
   );
-}
-
-function filterActionRequests(
-  actionRequests: ToolActionRequestListItem[] | undefined,
-  connectionId?: string,
-) {
-  const all = actionRequests ?? [];
-  return connectionId ? all.filter((item) => item.connectionId === connectionId) : all;
 }
 
 function ReviewRow({ companyId, item }: { companyId: string; item: ToolActionRequestListItem }) {

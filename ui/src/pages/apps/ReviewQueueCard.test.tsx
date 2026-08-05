@@ -263,11 +263,8 @@ describe("ReviewQueueCard", () => {
     });
   });
 
-  it("keeps refreshing an empty mounted queue so externally-created pending requests appear", async () => {
-    let pendingCreated = false;
-    listActionRequestsMock.mockImplementation(async () => ({
-      actionRequests: pendingCreated ? [pendingRequest()] : [],
-    }));
+  it("refreshes an empty mounted queue so externally-created pending requests appear", async () => {
+    listActionRequestsMock.mockResolvedValue({ actionRequests: [] });
 
     await render();
 
@@ -276,19 +273,11 @@ describe("ReviewQueueCard", () => {
       expect(document.body.textContent).toContain("Nothing is waiting for your OK right now.");
     });
 
-    await vi.waitFor(
-      () => {
-        expect(listActionRequestsMock.mock.calls.length).toBeGreaterThanOrEqual(3);
-        expect(document.body.textContent).toContain("Nothing is waiting for your OK right now.");
-      },
-      { timeout: 3_500 },
-    );
-
-    pendingCreated = true;
+    listActionRequestsMock.mockResolvedValue({ actionRequests: [pendingRequest()] });
 
     await vi.waitFor(
       () => {
-        expect(listActionRequestsMock.mock.calls.length).toBeGreaterThanOrEqual(4);
+        expect(listActionRequestsMock).toHaveBeenCalledTimes(3);
         expect(buttonContaining("Allow once")).toBeTruthy();
       },
       { timeout: 3_500 },
