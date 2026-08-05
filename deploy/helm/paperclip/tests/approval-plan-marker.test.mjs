@@ -33,9 +33,11 @@ const repoRoot = path.resolve(
 );
 
 const MARKER = "paperclip.blockcast.net/approval-plan-sha256";
+const DEPLOYED_COMMIT = "paperclip.blockcast.net/deployed-commit";
 // Any 64-hex string exercises the plumbing; the real value is a SHA-256 the
 // release job computes from the unstamped render.
 const SAMPLE = "a".repeat(64);
+const SAMPLE_COMMIT = "0123456789abcdef0123456789abcdef01234567";
 
 function renderApiDeployment(extraArgs = []) {
   const yaml = execFileSync(
@@ -102,11 +104,15 @@ function markerFor(deployment) {
 // script prunes it, so the equivalence asserted here is the one it actually
 // computes. Keep the two in step.
 function stripMarker(deployment) {
+  return stripTemplateAnnotation(deployment, MARKER);
+}
+
+function stripTemplateAnnotation(deployment, key) {
   const stripped = structuredClone(deployment);
   const templateMeta = stripped.spec?.template?.metadata;
   if (!templateMeta?.annotations) return stripped;
 
-  delete templateMeta.annotations[MARKER];
+  delete templateMeta.annotations[key];
   if (Object.keys(templateMeta.annotations).length === 0) {
     delete templateMeta.annotations;
   }
@@ -123,6 +129,16 @@ test("no marker is stamped by default (non-Blockcast deploys skip the approval c
     rendered.spec.template.metadata.annotations?.[MARKER],
     undefined,
     "unset api.approvalPlanSha256 must render no marker annotation",
+  );
+});
+
+test("no deployed commit is stamped by default", () => {
+  const rendered = renderApiDeployment();
+
+  assert.equal(
+    rendered.spec.template.metadata.annotations?.[DEPLOYED_COMMIT],
+    undefined,
+    "unset api.deployedCommit must render no deployed-commit annotation",
   );
 });
 
@@ -143,6 +159,21 @@ test("the marker lands on the POD TEMPLATE, not top-level Deployment metadata", 
   );
 });
 
+test("the deployed commit lands on the POD TEMPLATE, not top-level Deployment metadata", () => {
+  const rendered = renderApiDeployment([`--set-string`, `api.deployedCommit=${SAMPLE_COMMIT}`]);
+
+  assert.equal(
+    rendered.spec.template.metadata.annotations[DEPLOYED_COMMIT],
+    SAMPLE_COMMIT,
+    "the deployed commit must be on spec.template.metadata.annotations so drift checks read the rolled-out pod spec",
+  );
+  assert.equal(
+    rendered.metadata.annotations?.[DEPLOYED_COMMIT],
+    undefined,
+    "the deployed commit must NOT be stamped on top-level Deployment metadata",
+  );
+});
+
 // The load-bearing test: without this, a two-pass render is unsound.
 test("stamping the marker changes nothing else in the rendered Deployment", () => {
   const unstamped = renderApiDeployment();
@@ -158,6 +189,22 @@ test("stamping the marker changes nothing else in the rendered Deployment", () =
     unstamped,
     "stamped render minus the marker must equal the unstamped render, or the hash " +
       "computed from render #1 cannot match what the approve script recomputes from render #2",
+  );
+});
+
+test("stamping the deployed commit changes nothing else in the rendered Deployment", () => {
+  const unstamped = renderApiDeployment();
+  const stamped = renderApiDeployment([`--set-string`, `api.deployedCommit=${SAMPLE_COMMIT}`]);
+
+  assert.notDeepEqual(
+    stamped,
+    unstamped,
+    "sanity: the deployed-commit render must actually differ, or this test proves nothing",
+  );
+  assert.deepEqual(
+    stripTemplateAnnotation(stamped, DEPLOYED_COMMIT),
+    unstamped,
+    "deployed-commit render minus the annotation must equal the unstamped render",
   );
 });
 
@@ -212,6 +259,8 @@ test("the invariant also holds when pod.annotations is already non-empty", () =>
     ...existing,
     `--set`,
     `api.approvalPlanSha256=${SAMPLE}`,
+    `--set-string`,
+    `api.deployedCommit=${SAMPLE_COMMIT}`,
   ]);
 
   assert.equal(
@@ -219,7 +268,7 @@ test("the invariant also holds when pod.annotations is already non-empty", () =>
     "paperclip",
     "stamping must not clobber pre-existing pod annotations",
   );
-  assert.deepEqual(stripMarker(stamped), unstamped);
+  assert.deepEqual(stripTemplateAnnotation(stripMarker(stamped), DEPLOYED_COMMIT), unstamped);
 });
 
 test("a malformed marker fails the render instead of shipping a plan the approver rejects", () => {
@@ -228,6 +277,13 @@ test("a malformed marker fails the render instead of shipping a plan the approve
   assert.throws(
     () => renderApiDeployment([`--set`, `api.approvalPlanSha256=not-a-sha`]),
     /approvalPlanSha256 must be 64 lowercase hex/,
+  );
+});
+
+test("a malformed deployed commit fails the render instead of stamping unverifiable drift evidence", () => {
+  assert.throws(
+    () => renderApiDeployment([`--set-string`, `api.deployedCommit=sha-not-a-full-commit`]),
+    /deployedCommit must be 40 lowercase hex/,
   );
 });
 
@@ -244,6 +300,23 @@ for (const releaseMarker of [undefined, SAMPLE]) {
     assert.throws(
       () => renderApiDeployment(args),
       /pod\.annotations must not set reserved key paperclip\.blockcast\.net\/approval-plan-sha256/,
+    );
+  });
+}
+
+for (const releaseCommit of [undefined, SAMPLE_COMMIT]) {
+  test(`pod.annotations cannot inject the reserved deployed-commit when the release commit is ${releaseCommit ? "set" : "unset"}`, () => {
+    const args = [
+      `--set`,
+      `pod.annotations.paperclip\\.blockcast\\.net/deployed-commit=${SAMPLE_COMMIT}`,
+    ];
+    if (releaseCommit) {
+      args.push(`--set-string`, `api.deployedCommit=${releaseCommit}`);
+    }
+
+    assert.throws(
+      () => renderApiDeployment(args),
+      /pod\.annotations must not set reserved key paperclip\.blockcast\.net\/deployed-commit/,
     );
   });
 }
