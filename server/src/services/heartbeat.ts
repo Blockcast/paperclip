@@ -14076,6 +14076,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               entityType: "execution_workspace",
               entityId: failedWorkspace.id,
               details: quarantine,
+            }, {
+              enlistPluginOutbox: true,
             });
             detachWorkspaceFromIssue = issueWorkspace.executionWorkspaceId === failedExecutionWorkspaceId;
           }
@@ -24618,6 +24620,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 resolvedStrategy,
                 hasResolvablePriorSessionWorkspace,
               },
+            }, {
+              enlistPluginOutbox: true,
             });
             return { kind: "skipped" as const };
           }

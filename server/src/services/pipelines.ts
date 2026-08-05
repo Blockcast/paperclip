@@ -3786,6 +3786,8 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
             routineRevisionId: routineWithRevision.latestRevisionId,
             routineRevisionNumber: routineWithRevision.latestRevisionNumber,
           },
+        }, {
+          enlistPluginOutbox: true,
         });
         return routineWithRevision;
       });

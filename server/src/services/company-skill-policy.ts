@@ -258,6 +258,8 @@ export function companySkillPolicyService(db: Db) {
           defaultEffect: policy.defaultEffect,
           ruleCount: policy.rules.length,
         },
+      }, {
+        enlistPluginOutbox: true,
       });
       return { ...policy, revision: nextRevision, materialized: true } satisfies EffectiveSkillPolicy;
     });
@@ -282,6 +284,8 @@ export function companySkillPolicyService(db: Db) {
           entityType: "company_skill_policy",
           entityId: input.companyId,
           details: { previousRevision: existing.revision, newRevision: 0 },
+        }, {
+          enlistPluginOutbox: true,
         });
       }
       return { ...OPEN_DEFAULT_POLICY, rules: [] };

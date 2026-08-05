@@ -4356,7 +4356,7 @@ export function issueRoutes(
         });
         // Reached only on commit; a rollback throws straight past this.
         try {
-          publishRecorded?.();
+          await publishRecorded?.();
         } catch (err) {
           // Distinct from the catch below: the record itself is committed and
           // recoverable, only its notification failed.

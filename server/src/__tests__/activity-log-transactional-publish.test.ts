@@ -87,7 +87,9 @@ describeEmbeddedPostgres("logActivity publication vs. an enclosing transaction",
 
     await expect(
       db.transaction(async (tx) => {
-        await logActivity(tx as unknown as Db, activityInput(entityId));
+        await logActivity(tx as unknown as Db, activityInput(entityId), {
+          enlistPluginOutbox: true,
+        });
         throw new Error("caller rolled back after logging activity");
       }),
     ).rejects.toThrow("caller rolled back after logging activity");
@@ -120,7 +122,9 @@ describeEmbeddedPostgres("logActivity publication vs. an enclosing transaction",
     const entityId = randomUUID();
 
     await db.transaction(async (tx) => {
-      await logActivity(tx as unknown as Db, activityInput(entityId));
+      await logActivity(tx as unknown as Db, activityInput(entityId), {
+        enlistPluginOutbox: true,
+      });
     });
 
     const outboxRows = await db.select().from(pluginEventOutbox);
@@ -143,7 +147,9 @@ describeEmbeddedPostgres("logActivity publication vs. an enclosing transaction",
       let rejection: unknown = null;
       try {
         await db.transaction(async (tx) => {
-          await logActivity(tx as unknown as Db, activityInput(entityId));
+          await logActivity(tx as unknown as Db, activityInput(entityId), {
+            enlistPluginOutbox: true,
+          });
         });
       } catch (err) {
         rejection = err;
@@ -152,6 +158,31 @@ describeEmbeddedPostgres("logActivity publication vs. an enclosing transaction",
       expect((rejection as Error).message).toContain("plugin_event_outbox");
 
       expect(await db.select().from(activityLog)).toHaveLength(0);
+      expect(await db.select().from(pluginEventOutbox)).toHaveLength(0);
+    } finally {
+      await db.execute(sql.raw(`
+        ALTER TABLE "plugin_event_outbox"
+        DROP CONSTRAINT IF EXISTS "${constraintName}"
+      `));
+    }
+  });
+
+  it("keeps ordinary Db outbox failures best-effort after the activity row commits", async () => {
+    const entityId = randomUUID();
+    const constraintName = "plugin_event_outbox_reject_plain_db_test";
+
+    await db.execute(sql.raw(`
+      ALTER TABLE "plugin_event_outbox"
+      ADD CONSTRAINT "${constraintName}"
+      CHECK ("event_type" <> '${PLUGIN_MAPPED_ACTION}')
+    `));
+
+    try {
+      await expect(logActivity(db, activityInput(entityId))).resolves.toEqual(expect.any(Function));
+
+      const activityRows = await db.select().from(activityLog);
+      expect(activityRows).toHaveLength(1);
+      expect(activityRows[0]?.entityId).toBe(entityId);
       expect(await db.select().from(pluginEventOutbox)).toHaveLength(0);
     } finally {
       await db.execute(sql.raw(`
@@ -175,7 +206,7 @@ describeEmbeddedPostgres("logActivity publication vs. an enclosing transaction",
       return deferred;
     });
 
-    publish();
+    await publish();
     // The deferred publish runs post-commit on the global handle, so poll for it.
     const deadline = Date.now() + 2_000;
     let outboxRows: Awaited<ReturnType<typeof db.select>> = [];
@@ -188,6 +219,24 @@ describeEmbeddedPostgres("logActivity publication vs. an enclosing transaction",
 
     expect(outboxRows).toHaveLength(1);
     expect(live.seen).toContain("activity.logged");
+  });
+
+  it("returns deferred live-event listener failures to the caller", async () => {
+    const entityId = randomUUID();
+    const publish = await db.transaction(async (tx) =>
+      logActivity(tx as unknown as Db, activityInput(entityId), {
+        deferPublish: true,
+      }),
+    );
+    const unsubscribe = subscribeCompanyLiveEvents(companyId, () => {
+      throw new Error("live listener exploded");
+    });
+
+    try {
+      await expect(publish()).rejects.toThrow("live listener exploded");
+    } finally {
+      unsubscribe();
+    }
   });
 
   it("still publishes inline for a caller outside any transaction", async () => {
