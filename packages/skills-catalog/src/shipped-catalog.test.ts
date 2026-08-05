@@ -411,6 +411,21 @@ describe("shipped skills catalog", () => {
     expect(content).toContain("Never submit a formal review under the user-seat token.");
   });
 
+  it("documents stacked PR constraints and retargeting before merge queue", async () => {
+    const content = await readFile(GITHUB_PR_WORKFLOW_SKILL, "utf8");
+
+    expect(content).toContain("Use stacked PRs only when a follow-up change truly depends");
+    expect(content).toContain("reviewed as an incremental diff against that base branch");
+    expect(content).toContain("Stack: parent #<number>");
+    expect(content).toMatch(/change base to\s+<default-branch>, reconcile child commits, verify final diff, request fresh\s+review/);
+    expect(content).toContain("change the child PR's configured base to");
+    expect(content).toContain("reconcile the child commits for the parent's");
+    expect(content).toContain("Verify the final base and diff before continuing");
+    expect(content).toContain("request a fresh exact-head review");
+    expect(content).toContain("after that fresh review/approval and the required checks are current");
+    expect(content).toMatch(/Protected branch\s+rules not configured for this branch/);
+  });
+
   it("never selects a non-default credential in an authoring or review recipe", async () => {
     const content = await readFile(GITHUB_PR_WORKFLOW_SKILL, "utf8");
     const { authoringBlocks, violations } = credentialViolations(content);

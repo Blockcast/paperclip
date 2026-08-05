@@ -174,7 +174,9 @@ WORKDIR /vendor
 # index-pack errors. Also appends a redacted failed-pod container log tail to
 # partial-run errors. PR kkroo/paperclip-adapter-claude-k8s#28; focused
 # execute/job-manifest suite 230/230 and typecheck pass.
-ARG CLAUDE_K8S_REF=c9b3b2c1c979d2db121f0c1129a06a38356678e7
+# Bumped 2026-08-04 to 3ad3370: exclude the exact current lifecycle Job from
+# live-Job concurrency conflicts while preserving distinct-Job exclusion.
+ARG CLAUDE_K8S_REF=3ad33702052f357ec2b31b7d3051e89ed1ed4875
 # Re-pinned 2026-06-14 to kkroo/paperclip-adapter-opencode-k8s master a533d11
 # (was 168688e): BLO-10448 — a transient k8s status-read error during the
 # completion poll was mislabeled as a deadline, surfacing as the bogus
@@ -335,7 +337,9 @@ ARG CLAUDE_K8S_REF=c9b3b2c1c979d2db121f0c1129a06a38356678e7
 # Bumped 2026-07-24 to 3ab75fb (#50): add anthropic/claude-opus-5 to the
 # static model picker and list-price fallback table. Focused pricing/static
 # adapter tests and typecheck pass.
-ARG OPENCODE_K8S_REF=3ab75fb6893d3f2eed26b38a830f1a48bd1f35c0
+# Bumped 2026-08-04 to 42384fd: merge #50 onto the exact-current-Job fix, so
+# both lifecycle-Job exclusion and anthropic/claude-opus-5 support are present.
+ARG OPENCODE_K8S_REF=42384fdef5780ccdfbfba67c1a60feebd7ffb87c
 
 # Pack paperclip's in-tree adapter-utils so the bundled adapters consume
 # the workspace version (may include exports newer than the latest

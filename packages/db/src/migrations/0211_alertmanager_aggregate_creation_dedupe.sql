@@ -39,20 +39,20 @@ BEGIN
     )
     THEN
       RAISE EXCEPTION USING
-        MESSAGE = 'migration 0210 found an invalid or incorrectly defined prerequisite index',
+        MESSAGE = 'migration 0211 found an invalid or incorrectly defined prerequisite index',
         HINT = 'Run DROP INDEX CONCURRENTLY IF EXISTS issues_active_alertmanager_aggregate_creation_uq; then CREATE UNIQUE INDEX CONCURRENTLY issues_active_alertmanager_aggregate_creation_uq ON issues USING btree (company_id, origin_kind, origin_fingerprint) WHERE origin_kind = ''plugin:paperclip-plugin-alertmanager'' AND origin_fingerprint <> ''default'' AND hidden_at IS NULL AND status NOT IN (''done'', ''cancelled''); then retry migrations.';
     END IF;
   ELSE
     IF EXISTS (SELECT 1 FROM "issues" LIMIT 1) THEN
       RAISE EXCEPTION USING
-        MESSAGE = 'migration 0210 requires online index precreation',
+        MESSAGE = 'migration 0211 requires online index precreation',
         HINT = 'Run CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS issues_active_alertmanager_aggregate_creation_uq ON issues USING btree (company_id, origin_kind, origin_fingerprint) WHERE origin_kind = ''plugin:paperclip-plugin-alertmanager'' AND origin_fingerprint <> ''default'' AND hidden_at IS NULL AND status NOT IN (''done'', ''cancelled''), then retry migrations.';
     END IF;
 
     LOCK TABLE "issues" IN SHARE MODE;
     IF EXISTS (SELECT 1 FROM "issues" LIMIT 1) THEN
       RAISE EXCEPTION USING
-        MESSAGE = 'migration 0210 requires online index precreation',
+        MESSAGE = 'migration 0211 requires online index precreation',
         HINT = 'Run CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS issues_active_alertmanager_aggregate_creation_uq ON issues USING btree (company_id, origin_kind, origin_fingerprint) WHERE origin_kind = ''plugin:paperclip-plugin-alertmanager'' AND origin_fingerprint <> ''default'' AND hidden_at IS NULL AND status NOT IN (''done'', ''cancelled''), then retry migrations.';
     END IF;
 

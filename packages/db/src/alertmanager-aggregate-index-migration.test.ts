@@ -8,7 +8,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./test-embedded-postgres.js";
 
-const MIGRATION_FILE = "0210_alertmanager_aggregate_creation_dedupe.sql";
+const MIGRATION_FILE = "0211_alertmanager_aggregate_creation_dedupe.sql";
 const INDEX_NAME = "issues_active_alertmanager_aggregate_creation_uq";
 const INDEX_DEFINITION =
   `ON issues USING btree (company_id, origin_kind, origin_fingerprint) ` +
@@ -60,7 +60,7 @@ describeEmbeddedPostgres("Alertmanager aggregate index migration", () => {
     await expect(
       applyPendingMigrations(database.connectionString),
     ).rejects.toMatchObject({
-      message: "migration 0210 requires online index precreation",
+      message: "migration 0211 requires online index precreation",
       hint: expect.stringContaining(
         `CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS ${INDEX_NAME}`,
       ),
@@ -106,7 +106,7 @@ describeEmbeddedPostgres("Alertmanager aggregate index migration", () => {
       applyPendingMigrations(database.connectionString),
     ).rejects.toMatchObject({
       message:
-        "migration 0210 found an invalid or incorrectly defined prerequisite index",
+        "migration 0211 found an invalid or incorrectly defined prerequisite index",
       hint: expect.stringContaining(
         `DROP INDEX CONCURRENTLY IF EXISTS ${INDEX_NAME}`,
       ),
