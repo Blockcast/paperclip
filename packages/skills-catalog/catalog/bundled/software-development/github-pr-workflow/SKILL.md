@@ -33,6 +33,30 @@ Ship a PR a reviewer can land without follow-up clarifying questions. The aim is
 - Confirm tests, typecheck, and lint pass locally. Note any deliberate skips in the PR body.
 - Remove debug prints, commented-out code, and `TODO` markers that are not tracked.
 
+## Stacked PRs for dependent work
+
+Use stacked PRs only when a follow-up change truly depends on another in-flight
+PR and splitting the work lets CI and review start earlier. Do not stack
+unrelated backlog items, dirty branches, or failing PRs just to put more work in
+flight, and keep the stack short enough that each reviewer can understand the
+incremental diff.
+
+Rules:
+- The parent PR targets the protected/default base (`master`, `main`, or the
+  repo's actual default branch). A child PR targets its parent branch and must be
+  reviewed as an incremental diff against that base branch.
+- The child PR body must name the stack relationship and the retargeting plan:
+  `Stack: parent #<number>`, `Base branch: <parent-branch>`, the dependency the
+  child needs from the parent, and `Retarget to <default-branch> after #<number>
+  merges`.
+- After the parent merges, immediately retarget or rebase the child onto the
+  default branch, rerun required checks, refresh the PR body if the diff changed,
+  and only then put it in the merge queue.
+- Do not approve or auto-merge a stacked child while its base branch is an
+  unprotected feature branch. GitHub may reject auto-merge with "Protected branch
+  rules not configured for this branch", and the approval can be wasted if the
+  retargeted diff changes.
+
 ## PR title
 
 - Imperative mood, under 70 characters.
