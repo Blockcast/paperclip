@@ -8501,7 +8501,7 @@ export function issueService(db: Db) {
       // freshness marker has moved on, zero rows match, the update is a no-op, and this
       // returns null exactly like "row missing" does today -- instead of
       // unconditionally overwriting whatever the row now says.
-      options?: { expectedStatus?: string[]; expectedUpdatedAt?: Date },
+      options?: { expectedStatus?: string[]; expectedUpdatedAt?: Date | string },
     ) => {
       const existing = await dbOrTx
         .select()
@@ -8938,8 +8938,12 @@ export function issueService(db: Db) {
         const casPreconditions = options?.expectedStatus?.length
           ? [inArray(issues.status, options.expectedStatus)]
           : [];
-        if (options?.expectedUpdatedAt) {
+        if (options?.expectedUpdatedAt instanceof Date) {
           casPreconditions.push(eq(issues.updatedAt, options.expectedUpdatedAt));
+        } else if (typeof options?.expectedUpdatedAt === "string") {
+          // Raw database token, used when the caller must preserve Postgres
+          // microseconds that a JavaScript Date would truncate.
+          casPreconditions.push(sql`${issues.updatedAt}::text = ${options.expectedUpdatedAt}`);
         }
         const writePreconditions = [...conflictPreconditions, ...casPreconditions];
         const updated = await tx
