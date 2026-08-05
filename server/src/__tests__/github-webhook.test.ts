@@ -2812,8 +2812,9 @@ describeEmbeddedPostgres("github-webhook route", () => {
     // exhausted (5 attempts, all failed) under the old stable key. Fresh
     // synchronize deliveries must not be blocked by that stale row.
     const staleIdempotencyKey = "pr_review:blockcast/paperclip:630:github_pr_synchronized";
+    // Canonical mixed-case: the phase-one producer preserves GitHub's spelling.
     const freshIdempotencyKey =
-      "pr_review:blockcast/paperclip:630:github_pr_synchronized:delivery:delivery-post-exhaustion";
+      "pr_review:Blockcast/paperclip:630:github_pr_synchronized:delivery:delivery-post-exhaustion";
     await db.insert(agentWakeupRequests).values({
       companyId,
       agentId: reviewerAgentId,
@@ -2881,8 +2882,9 @@ describeEmbeddedPostgres("github-webhook route", () => {
     // the old stable key. Fresh synchronize deliveries must not be blocked by
     // that stale row.
     const staleIdempotencyKey = "pr_review:blockcast/paperclip:813:github_pr_synchronized";
+    // Canonical mixed-case: the phase-one producer preserves GitHub's spelling.
     const freshIdempotencyKey =
-      "pr_review:blockcast/paperclip:813:github_pr_synchronized:delivery:delivery-fixup-after-completed-review";
+      "pr_review:Blockcast/paperclip:813:github_pr_synchronized:delivery:delivery-fixup-after-completed-review";
     await db.insert(agentWakeupRequests).values({
       companyId,
       agentId: reviewerAgentId,
@@ -2937,7 +2939,11 @@ describeEmbeddedPostgres("github-webhook route", () => {
       permissions: {},
     });
 
-    const idempotencyKey = "pr_review:blockcast/magma:1368:github_pr_opened";
+    // Phase-one producers keep GitHub's canonical mixed-case spelling, so this
+    // is the key the route actually writes. The seeded stale row below stays
+    // lowercase on purpose: it stands in for a row a normalized build wrote,
+    // and the compatibility read has to see across the two spellings.
+    const idempotencyKey = "pr_review:Blockcast/magma:1368:github_pr_opened";
     await db.insert(agentWakeupRequests).values({
       companyId,
       agentId: reviewerAgentId,
