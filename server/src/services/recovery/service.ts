@@ -699,6 +699,28 @@ function isCheckoutAdoptionCancelledRun(
   );
 }
 
+// BLO-19954: `routine_execution_duplicate_suppressed` is the dispatch layer's
+// own single-owner lock refusing a non-owner run of a routine configured
+// `concurrencyPolicy=always_enqueue` — the run's cancellation message says so
+// verbatim ("the owner run will continue the work"). It is benign, intentional
+// control flow, not a stranded assignment: nothing failed, there is no
+// runtime/adapter defect to repair, and no owner action can make this run
+// succeed (the lock is held by another issue's run by design). Escalating it
+// created a wake amplifier — one recovery action and one `wake_owner` per
+// routine fire, forever, on a routine that was never broken. See
+// `cancelClaimedRunForRoutineExecutionDuplicate` (heartbeat.ts) for where the
+// run itself is cancelled with this code.
+const ROUTINE_EXECUTION_DUPLICATE_SUPPRESSED_ERROR_CODE = "routine_execution_duplicate_suppressed";
+
+function isRoutineExecutionDuplicateSuppressedRun(
+  latestRun: LatestIssueRun,
+): latestRun is NonNullable<LatestIssueRun> {
+  return (
+    latestRun?.status === "cancelled" &&
+    readNonEmptyString(latestRun.errorCode) === ROUTINE_EXECUTION_DUPLICATE_SUPPRESSED_ERROR_CODE
+  );
+}
+
 function buildNonRetryableEscalationComment(input: {
   status: "todo" | "in_progress";
   latestRun: LatestIssueRun;
@@ -4945,6 +4967,65 @@ export function recoveryService(
     return updated;
   }
 
+  // BLO-19954: cancel a routine-execution issue whose only run was suppressed
+  // as a dispatch-lock duplicate, instead of escalating it. `cancelled` is the
+  // correct terminal status — the issue performed no scan and never will, the
+  // lock owner is already continuing the work — so there is nothing for a
+  // recovery owner to repair and no wake to raise.
+  async function cancelDuplicateSuppressedRoutineExecutionIssue(
+    issue: typeof issues.$inferSelect,
+    latestRun: LatestIssueRun,
+  ) {
+    return await db.transaction(async (tx) => {
+      await tx.execute(
+        sql`select pg_advisory_xact_lock(hashtextextended(${issue.companyId} || ':' || ${issue.id}, 0))`,
+      );
+
+      const [fresh] = await tx
+        .select()
+        .from(issues)
+        .where(eq(issues.id, issue.id))
+        .limit(1);
+      if (!fresh || isTerminalIssueStatus(fresh.status)) return null;
+
+      const updated = await issuesSvc.update(fresh.id, { status: "cancelled" }, tx);
+      if (!updated) return null;
+
+      await logActivity(db, {
+        companyId: fresh.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: null,
+        runId: null,
+        action: "issue.updated",
+        entityType: "issue",
+        entityId: fresh.id,
+        details: {
+          identifier: fresh.identifier,
+          status: "cancelled",
+          previousStatus: fresh.status,
+          source: "recovery.routine_execution_duplicate_suppressed",
+          latestRunId: latestRun?.id ?? null,
+          latestRunErrorCode: latestRun?.errorCode ?? null,
+        },
+      });
+
+      await issuesSvc.addComment(
+        fresh.id,
+        "Paperclip cancelled this routine-execution issue instead of escalating it to `blocked`. Its run was " +
+          `cancelled with \`${ROUTINE_EXECUTION_DUPLICATE_SUPPRESSED_ERROR_CODE}\` because another open ` +
+          "routine-execution issue already owns this dispatch lock. Under `always_enqueue` with a single-owner " +
+          "dispatcher, that is expected, intentional control flow — the lock owner continues the work. This issue " +
+          "performed no scan and never will, so no recovery action or owner wake was raised.",
+        {},
+        { authorType: "system" },
+        tx,
+      );
+
+      return updated;
+    });
+  }
+
   async function escalateStrandedAssignedIssue(input: {
     issue: typeof issues.$inferSelect;
     previousStatus: StrandedPreviousStatus;
@@ -4954,6 +5035,10 @@ export function recoveryService(
     recoveryOwnerAgentId?: string | null;
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
   }) {
+    if (isRoutineExecutionDuplicateSuppressedRun(input.latestRun)) {
+      return cancelDuplicateSuppressedRoutineExecutionIssue(input.issue, input.latestRun);
+    }
+
     if (isStrandedIssueRecoveryIssue(input.issue)) {
       return escalateStrandedRecoveryIssueInPlace({
         issue: input.issue,
