@@ -1634,6 +1634,172 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect(failedRun?.contextSnapshot).toMatchObject({ adapterType: "codex_local" });
   });
 
+  it("keeps session reset retries separate from ordinary retries with the same parent and attempt", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const rootRunId = randomUUID();
+    const activeRunId = randomUUID();
+    const issueId = randomUUID();
+    const now = new Date();
+    await seedQueuedRunFixture({
+      companyId,
+      agentId,
+      runId: activeRunId,
+      now,
+      contextSnapshot: {
+        issueId,
+        taskKey: issueId,
+        wakeReason: "session_unavailable_retry",
+        retryReason: "session_unavailable",
+      },
+    });
+    await db.insert(heartbeatRuns).values({
+      id: rootRunId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "failed",
+      errorCode: "session_unavailable",
+      error: "Session unavailable",
+      finishedAt: new Date(now.getTime() - 1_000),
+      contextSnapshot: { issueId, taskKey: issueId },
+      createdAt: new Date(now.getTime() - 1_000),
+      updatedAt: new Date(now.getTime() - 1_000),
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({
+        status: "running",
+        startedAt: now,
+        retryOfRunId: rootRunId,
+        scheduledRetryAttempt: 1,
+        scheduledRetryReason: "session_unavailable",
+      })
+      .where(eq(heartbeatRuns.id, activeRunId));
+    runningProcesses.set(activeRunId, {
+      child: {} as never,
+      graceSec: 0,
+      processGroupId: null,
+    });
+
+    try {
+      await heartbeat.wakeup(agentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_zero_token_session_reset",
+        payload: { issueId },
+        contextSnapshot: {
+          issueId,
+          taskKey: issueId,
+          retryOfRunId: rootRunId,
+          retryReason: "zero_token_session_reset",
+          scheduledRetryAttempt: 1,
+        },
+        retryOfRunId: rootRunId,
+        scheduledRetryAttempt: 1,
+      });
+
+      const wakeRows = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.agentId, agentId));
+      expect(wakeRows.some((row) => row.reason === "retry_execution_duplicate")).toBe(false);
+      const deferredReset = wakeRows.find((row) => row.status === "deferred_issue_execution");
+      expect(deferredReset).not.toBeNull();
+      const deferredContext = (
+        deferredReset?.payload as {
+          _paperclipWakeContext?: { retryReason?: string };
+        } | null
+      )?._paperclipWakeContext;
+      expect(deferredContext?.retryReason).toBe("zero_token_session_reset");
+    } finally {
+      runningProcesses.delete(activeRunId);
+    }
+  });
+
+  it("partitions deferred retries by family while coalescing exact duplicates", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const rootRunId = randomUUID();
+    const activeRunId = randomUUID();
+    const issueId = randomUUID();
+    const now = new Date();
+    await seedQueuedRunFixture({
+      companyId,
+      agentId,
+      runId: activeRunId,
+      now,
+      contextSnapshot: { issueId, taskKey: issueId, wakeReason: "issue_assigned" },
+    });
+    await db.insert(heartbeatRuns).values({
+      id: rootRunId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "failed",
+      errorCode: "session_unavailable",
+      error: "Session unavailable",
+      finishedAt: new Date(now.getTime() - 1_000),
+      contextSnapshot: { issueId, taskKey: issueId },
+      createdAt: new Date(now.getTime() - 1_000),
+      updatedAt: new Date(now.getTime() - 1_000),
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "running", startedAt: now })
+      .where(eq(heartbeatRuns.id, activeRunId));
+    runningProcesses.set(activeRunId, {
+      child: {} as never,
+      graceSec: 0,
+      processGroupId: null,
+    });
+
+    const enqueueRetry = (retryReason: "session_unavailable" | "zero_token_session_reset") =>
+      heartbeat.wakeup(agentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: `${retryReason}_retry`,
+        payload: { issueId },
+        contextSnapshot: {
+          issueId,
+          taskKey: issueId,
+          retryOfRunId: rootRunId,
+          retryReason,
+          scheduledRetryAttempt: 1,
+        },
+        retryOfRunId: rootRunId,
+        scheduledRetryAttempt: 1,
+      });
+
+    try {
+      await enqueueRetry("session_unavailable");
+      await enqueueRetry("session_unavailable");
+      await enqueueRetry("zero_token_session_reset");
+
+      const deferredRows = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.status, "deferred_issue_execution"));
+      expect(deferredRows).toHaveLength(2);
+      const deferredByReason = new Map(
+        deferredRows.map((row) => {
+          const context = (
+            row.payload as {
+              _paperclipWakeContext?: { retryReason?: string };
+            } | null
+          )?._paperclipWakeContext;
+          return [context?.retryReason, row] as const;
+        }),
+      );
+      expect(deferredByReason.get("session_unavailable")?.coalescedCount).toBe(1);
+      expect(deferredByReason.get("zero_token_session_reset")?.coalescedCount).toBe(0);
+    } finally {
+      runningProcesses.delete(activeRunId);
+    }
+  });
+
   it("does not queue generic recovery after the final session-unavailable attempt fails", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();

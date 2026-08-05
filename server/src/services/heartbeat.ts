@@ -23577,6 +23577,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       triggerDetail,
       payload,
     });
+    const initialRetryReason = readNonEmptyString(enrichedContextSnapshot.retryReason);
     let issueId = readNonEmptyString(enrichedContextSnapshot.issueId) ?? issueIdFromPayload;
 
     const agent = await getAgent(agentId);
@@ -24839,7 +24840,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           if (
             hasInitialRetryMetadata &&
             activeExecutionRun.retryOfRunId === opts.retryOfRunId &&
-            activeExecutionRun.scheduledRetryAttempt === opts.scheduledRetryAttempt
+            activeExecutionRun.scheduledRetryAttempt === opts.scheduledRetryAttempt &&
+            (
+              activeExecutionRun.scheduledRetryReason ??
+              readNonEmptyString(parseObject(activeExecutionRun.contextSnapshot).retryReason)
+            ) === initialRetryReason
           ) {
             await tx.insert(agentWakeupRequests).values({
               companyId: agent.companyId,
@@ -24883,6 +24888,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                     ? and(
                         sql`(${agentWakeupRequests.payload} -> ${DEFERRED_WAKE_CONTEXT_KEY} ->> 'retryOfRunId') is not distinct from ${opts.retryOfRunId ?? null}`,
                         sql`(${agentWakeupRequests.payload} -> ${DEFERRED_WAKE_CONTEXT_KEY} ->> 'scheduledRetryAttempt') is not distinct from ${opts.scheduledRetryAttempt?.toString() ?? null}`,
+                        sql`(${agentWakeupRequests.payload} -> ${DEFERRED_WAKE_CONTEXT_KEY} ->> 'retryReason') is not distinct from ${initialRetryReason}`,
                       )
                     : and(
                         sql`${agentWakeupRequests.payload} -> ${DEFERRED_WAKE_CONTEXT_KEY} ->> 'retryOfRunId' is null`,
