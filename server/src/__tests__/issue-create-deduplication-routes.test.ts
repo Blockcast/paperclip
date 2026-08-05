@@ -606,7 +606,7 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
     }
   });
 
-  it("does not record duplicate-candidate telemetry when the create path fails after lookup", async () => {
+  it("does not start advisory lookup when a required create side effect fails", async () => {
     const companyId = await seedCompany();
     const candidate = monitorFilings[0]!;
     await db.insert(issues).values({
@@ -617,7 +617,12 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
       status: "todo",
       priority: "medium",
     });
+    let lookupStarted = false;
     const app = createApp({
+      createIssueDuplicateCandidateLookup: async () => {
+        lookupStarted = true;
+        return [{ identifier: candidate.identifier, title: candidate.title, score: 0.99 }];
+      },
       createIssueBeforeResponseHook: async () => {
         throw new Error("late create side effect failed");
       },
@@ -630,6 +635,7 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
       .expect(500);
 
     await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(lookupStarted).toBe(false);
     const activityEvents = await db.select().from(activityLog).where(eq(activityLog.companyId, companyId));
     expect(activityEvents.filter((event) => event.action === "issue.duplicate_candidates_shown")).toHaveLength(0);
   });

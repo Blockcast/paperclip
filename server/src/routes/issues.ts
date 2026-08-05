@@ -9072,39 +9072,6 @@ export function issueRoutes(
       });
       return;
     }
-    let duplicateCandidates: CreateIssueDuplicateCandidate[] = [];
-    try {
-      const lookupAbortController = new AbortController();
-      const lookupTimeoutMs = opts.createIssueDuplicateCandidateTimeoutMs
-        ?? ISSUE_CREATE_DUPLICATE_CANDIDATE_TIMEOUT_MS;
-      duplicateCandidates = await raceCreateIssueDuplicateCandidateLookup(
-        withReservedCreateIssueAdvisoryDb(db, lookupTimeoutMs, "issue duplicate candidate lookup", async (advisoryDb) => {
-          await advisoryDb.execute(sql`select set_config('statement_timeout', ${String(lookupTimeoutMs)}, true)`);
-          const canReadCompanyScope = await (opts.createIssueDuplicateCandidateCompanyScopeReader
-            ?? ((scopedDb, scopedReq, scopedCompanyId) => (
-              actorCanReadCompanyScope(scopedReq, scopedCompanyId, scopedDb)
-            )))(advisoryDb, req, companyId);
-          return (opts.createIssueDuplicateCandidateLookup ?? findCreateIssueDuplicateCandidates)(advisoryDb, companyId, {
-            id: issue.id,
-            identifier: issue.identifier,
-            title: issue.title,
-            description: issue.description,
-          }, opts.createIssueDuplicateCandidateCorpusFilter
-            ?? (canReadCompanyScope
-              ? undefined
-              : (rows, signal, scopedDb) => filterIssuesForActor(req, rows, signal, scopedDb)),
-          lookupAbortController.signal,
-          lookupTimeoutMs);
-        }),
-        lookupTimeoutMs,
-        () => lookupAbortController.abort(),
-      );
-    } catch (err) {
-      logger.warn(
-        { err, companyId, issueId: issue.id, issueIdentifier: issue.identifier },
-        "issue duplicate candidate lookup failed; continuing create without advisories",
-      );
-    }
     await issueReferencesSvc.syncIssue(issue.id);
     await externalObjectsSvc.syncIssueSafely(issue.id);
     const referenceSummary = await issueReferencesSvc.listIssueReferenceSummary(issue.id);
@@ -9203,6 +9170,40 @@ export function issueRoutes(
     });
     await queueTaskWatchdogEvaluation(issue, actor.runId);
     await opts.createIssueBeforeResponseHook?.();
+
+    let duplicateCandidates: CreateIssueDuplicateCandidate[] = [];
+    try {
+      const lookupAbortController = new AbortController();
+      const lookupTimeoutMs = opts.createIssueDuplicateCandidateTimeoutMs
+        ?? ISSUE_CREATE_DUPLICATE_CANDIDATE_TIMEOUT_MS;
+      duplicateCandidates = await raceCreateIssueDuplicateCandidateLookup(
+        withReservedCreateIssueAdvisoryDb(db, lookupTimeoutMs, "issue duplicate candidate lookup", async (advisoryDb) => {
+          await advisoryDb.execute(sql`select set_config('statement_timeout', ${String(lookupTimeoutMs)}, true)`);
+          const canReadCompanyScope = await (opts.createIssueDuplicateCandidateCompanyScopeReader
+            ?? ((scopedDb, scopedReq, scopedCompanyId) => (
+              actorCanReadCompanyScope(scopedReq, scopedCompanyId, scopedDb)
+            )))(advisoryDb, req, companyId);
+          return (opts.createIssueDuplicateCandidateLookup ?? findCreateIssueDuplicateCandidates)(advisoryDb, companyId, {
+            id: issue.id,
+            identifier: issue.identifier,
+            title: issue.title,
+            description: issue.description,
+          }, opts.createIssueDuplicateCandidateCorpusFilter
+            ?? (canReadCompanyScope
+              ? undefined
+              : (rows, signal, scopedDb) => filterIssuesForActor(req, rows, signal, scopedDb)),
+          lookupAbortController.signal,
+          lookupTimeoutMs);
+        }),
+        lookupTimeoutMs,
+        () => lookupAbortController.abort(),
+      );
+    } catch (err) {
+      logger.warn(
+        { err, companyId, issueId: issue.id, issueIdentifier: issue.identifier },
+        "issue duplicate candidate lookup failed; continuing create without advisories",
+      );
+    }
 
     scheduleDuplicateCandidateShownActivity({
       db,
