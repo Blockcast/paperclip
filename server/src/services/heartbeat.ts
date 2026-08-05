@@ -975,6 +975,12 @@ export async function probeStaleKillReviewEvidence(
 export function shouldScheduleAutomaticRunRetry(
   run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson" | "contextSnapshot">,
 ) {
+  // These outcomes can follow non-idempotent external work. Reject them before
+  // reading merged result metadata, which may contain a stale transient family.
+  if (run.errorCode === "job_missing" || run.errorCode === "k8s_pod_schedule_failed") {
+    return false;
+  }
+
   // BLO-18030: a hard-stale-kill force-terminates a Job that was claimed but
   // silent past EXTERNAL_LIFECYCLE_HARD_STALE_MS. That left pr_review wakes with
   // no recovery whatsoever: the run is terminal with no bounded retry, and the

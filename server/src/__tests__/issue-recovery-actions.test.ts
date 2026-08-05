@@ -483,8 +483,45 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(await svc.getActiveForIssue(randomUUID(), sourceIssueId)).toBeNull();
   });
 
-  it("does not enqueue continuation work after an invoked external Job disappears", async () => {
+  it.each([
+    ["job_missing", "in_progress"],
+    ["job_missing", "todo"],
+    ["job_missing", "in_review"],
+    ["k8s_pod_schedule_failed", "in_progress"],
+    ["k8s_pod_schedule_failed", "todo"],
+    ["k8s_pod_schedule_failed", "in_review"],
+  ] as const)("does not enqueue recovery work after %s leaves an issue %s", async (errorCode, status) => {
     const { companyId, coderId, sourceIssueId } = await seedCompany();
+    if (status === "in_review") {
+      const stageId = randomUUID();
+      await db.update(issues).set({
+        status,
+        executionPolicy: {
+          mode: "normal",
+          commentRequired: true,
+          stages: [{
+            id: stageId,
+            type: "review",
+            approvalsNeeded: 1,
+            participants: [{ id: randomUUID(), type: "agent", agentId: coderId, userId: null }],
+          }],
+        },
+        executionState: {
+          status: "pending",
+          currentStageId: stageId,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: coderId, userId: null },
+          returnAssignee: { type: "agent", agentId: coderId, userId: null },
+          reviewRequest: null,
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+        },
+      }).where(eq(issues.id, sourceIssueId));
+    } else if (status === "todo") {
+      await db.update(issues).set({ status }).where(eq(issues.id, sourceIssueId));
+    }
     const runId = randomUUID();
     await db.insert(heartbeatRuns).values({
       id: runId,
@@ -493,7 +530,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       invocationSource: "automation",
       status: "failed",
       error: "External lifecycle Job is missing while heartbeat run is still running",
-      errorCode: "job_missing",
+      errorCode,
       resultJson: {
         externalLifecycleRecovery: { adapterInvocationStarted: true },
       },
@@ -506,11 +543,20 @@ describeEmbeddedPostgres("issue recovery actions", () => {
 
     const result = await recovery.reconcileStrandedAssignedIssues();
 
-    expect(result).toMatchObject({ continuationRequeued: 0, escalated: 1 });
-    expect(enqueueWakeup.mock.calls).not.toContainEqual([
-      coderId,
-      expect.objectContaining({ reason: "issue_continuation_needed" }),
-    ]);
+    expect(result).toMatchObject({
+      continuationRequeued: 0,
+      dispatchRequeued: 0,
+      reviewParticipantRequeued: 0,
+      escalated: 1,
+    });
+    expect(enqueueWakeup).toHaveBeenCalledTimes(1);
+    expect(enqueueWakeup.mock.calls[0]?.[1]).toMatchObject({
+      reason: "source_scoped_recovery_action",
+      contextSnapshot: {
+        allowDeliverableWork: false,
+        recoveryIntent: "status_only",
+      },
+    });
     const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
     expect(updatedIssue).toMatchObject({ status: "blocked" });
     const comments = await db

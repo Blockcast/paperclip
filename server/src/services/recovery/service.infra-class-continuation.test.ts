@@ -32,8 +32,8 @@ describe("BLO-18106: job_missing continuation recovery is evidence-gated", () =>
     // k8s_pod_schedule_failed can be emitted after the main container starts, so
     // it must not be replayed without stronger producer evidence.
     expect(classifyContinuationFailure(run("k8s_pod_schedule_failed"))).toMatchObject({
-      kind: "default",
-      maxAttempts: workClass.maxAttempts,
+      kind: "non_retryable",
+      maxAttempts: 0,
     });
   });
 

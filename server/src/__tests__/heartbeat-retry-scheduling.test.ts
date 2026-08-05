@@ -1926,6 +1926,19 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     ).toBe(false);
   });
 
+  it.each(["job_missing", "k8s_pod_schedule_failed"])(
+    "does not let stale transient metadata replay %s",
+    (errorCode) => {
+      expect(
+        shouldScheduleAutomaticRunRetry({
+          errorCode,
+          resultJson: { errorFamily: "transient_upstream" },
+          contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
+        }),
+      ).toBe(false);
+    },
+  );
+
   it("BLO-9147 AC2: CAPACITY_BLOCKED_HEARTBEAT_RETRY_MAX_ATTEMPTS exceeds rate-limit cap (12)", () => {
     expect(CAPACITY_BLOCKED_HEARTBEAT_RETRY_MAX_ATTEMPTS).toBeGreaterThan(12);
   });

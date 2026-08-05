@@ -824,6 +824,9 @@ const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
   // Production emits job_missing only after adapter.invoke, so continuation
   // replay could duplicate a durable external side effect.
   "job_missing",
+  // Adapters also use this after main-container startup failures, so scheduling
+  // failure alone does not prove that external work never began.
+  "k8s_pod_schedule_failed",
 ]);
 
 // A continuation cancelled with this code is a *deliberate wait* (the latest run
@@ -6045,6 +6048,31 @@ export function recoveryService(
           continue;
         }
 
+        const participantContinuationClassification = classifyContinuationFailure(participantLatestRun);
+        if (
+          isUnsuccessfulTerminalIssueRun(participantLatestRun) &&
+          participantContinuationClassification.kind === "non_retryable"
+        ) {
+          const failureSummary = summarizeRunFailureForIssueComment(participantLatestRun);
+          const updated = await escalateStrandedAssignedIssue({
+            issue,
+            previousStatus: "in_review",
+            latestRun: participantLatestRun,
+            recoveryOwnerAgentId: participantAgentId,
+            comment:
+              "Paperclip detected a non-retryable failure on the active review participant's run " +
+              `(\`${participantContinuationClassification.errorCode}\`). Skipping automatic retries and moving it to ` +
+              `\`blocked\` so it is visible for intervention.${failureSummary ?? ""}`,
+          });
+          if (updated) {
+            result.escalated += 1;
+            result.issueIds.push(issue.id);
+          } else {
+            result.skipped += 1;
+          }
+          continue;
+        }
+
         const participantAdapterFailureClassification = isUnsuccessfulTerminalIssueRun(participantLatestRun)
           ? classifyAdapterFailureForRecovery(participantLatestRun, recoveryNow)
           : null;
@@ -6186,6 +6214,27 @@ export function recoveryService(
 
         if (latestRun.status === "succeeded") {
           result.skipped += 1;
+          continue;
+        }
+
+        const assignmentContinuationClassification = classifyContinuationFailure(latestRun);
+        if (assignmentContinuationClassification.kind === "non_retryable") {
+          const failureSummary = summarizeRunFailureForIssueComment(latestRun);
+          const updated = await escalateStrandedAssignedIssue({
+            issue,
+            previousStatus: "todo",
+            latestRun,
+            comment:
+              "Paperclip detected a non-retryable failure on this assigned issue's latest run " +
+              `(\`${assignmentContinuationClassification.errorCode}\`). Skipping automatic retries and moving it to ` +
+              `\`blocked\` so it is visible for intervention.${failureSummary ?? ""}`,
+          });
+          if (updated) {
+            result.escalated += 1;
+            result.issueIds.push(issue.id);
+          } else {
+            result.skipped += 1;
+          }
           continue;
         }
 
