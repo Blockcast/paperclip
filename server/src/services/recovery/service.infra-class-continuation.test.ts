@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { classifyContinuationFailure } from "./service.js";
 
-// BLO-19889: infra-class run failures (the agent pod never ran) must not spend the
-// stranded-recovery budget or bounce the issue up the org chain.
+// Infra-class run failures must not spend the stranded-recovery budget or bounce
+// the issue up the org chain.
 //
 // Why classifyContinuationFailure is the right unit under test: its `maxAttempts` is
 // the sole gate on the escalation in reconcileStrandedAssignedIssues
@@ -25,16 +25,7 @@ const jobMissingRun = (adapterInvocationStarted: unknown) =>
     resultJson: { externalLifecycleRecovery: { adapterInvocationStarted } },
   } as unknown as Run);
 
-describe("BLO-19889: infra-class continuation failures do not spend recovery budget", () => {
-  it("k8s_pod_schedule_failed is infra-class: bounded retry, not a 1-attempt escalate", () => {
-    // 0/17 nodes available (Unschedulable / Insufficient cpu / untolerated taint).
-    // The pod never bound to a node, so the adapter was never invoked and there is
-    // no work product -- identical safety shape to process_lost.
-    const c = classifyContinuationFailure(run("k8s_pod_schedule_failed"));
-    expect(c.kind).toBe("transient_infra");
-    expect(c.maxAttempts).toBeGreaterThan(1);
-  });
-
+describe("BLO-18106: job_missing continuation recovery is evidence-gated", () => {
   it("work-class control: an ordinary run failure still escalates on the next attempt", () => {
     // The paired assertion the AC asks for. A work-class failure keeps the old
     // behavior -- one attempt, then escalateStrandedAssignedIssue (attempt burn +
@@ -44,9 +35,12 @@ describe("BLO-19889: infra-class continuation failures do not spend recovery bud
     expect(workClass.kind).toBe("default");
     expect(workClass.maxAttempts).toBe(1);
 
-    // ...and it is strictly cheaper to retry infra-class than work-class.
-    expect(classifyContinuationFailure(run("k8s_pod_schedule_failed")).maxAttempts)
-      .toBeGreaterThan(workClass.maxAttempts);
+    // k8s_pod_schedule_failed can be emitted after the main container starts, so
+    // it must not be replayed without stronger producer evidence.
+    expect(classifyContinuationFailure(run("k8s_pod_schedule_failed"))).toMatchObject({
+      kind: "default",
+      maxAttempts: workClass.maxAttempts,
+    });
   });
 
   it("non-retryable codes are unaffected by the infra-class widening", () => {

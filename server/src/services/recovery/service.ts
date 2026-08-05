@@ -812,18 +812,9 @@ const TRANSIENT_INFRA_CONTINUATION_ERROR_CODES = new Set<string>([
   // instead of the `default` single-attempt/instant-escalate path, so a lone
   // control-plane blip no longer strands the issue as `blocked`.
   "process_lost",
-  // BLO-19889: the agent pod was never scheduled onto a node (Unschedulable /
-  // image-pull / schedule-timeout), so the adapter was never invoked and no work
-  // product exists — the same "died before any model call" shape as process_lost
-  // above. Previously this fell through to `default` (1 attempt, no backoff), so a
-  // single node-pool saturation burst escalated the issue to `blocked` AND
-  // reassigned it up the org chain, for a cause no owner in that chain can act on.
-  // shouldScheduleAutomaticRunRetry only re-queues this code for pr_review wakes
-  // (heartbeat.ts), so before this entry an *issue* run had no retry engine at all.
-  "k8s_pod_schedule_failed",
 ]);
 
-// BLO-19889: `job_missing` is NOT unconditionally infra-class. The external
+// BLO-18106: `job_missing` is NOT unconditionally infra-class. The external
 // lifecycle Job can vanish *after* the adapter already performed non-idempotent
 // work (that is the whole subject of BLO-18106), so blind re-dispatch is unsafe.
 // Mirror the `job_failed` gate in shouldScheduleAutomaticRunRetry: treat it as
@@ -1069,7 +1060,7 @@ export function classifyContinuationFailure(latestRun: LatestIssueRun): Continua
       errorCode,
     };
   }
-  // BLO-19889: evidence-gated, so it cannot live in the flat code set above.
+  // BLO-18106: evidence-gated, so it cannot live in the flat code set above.
   if (isNeverInvokedJobMissingRun(latestRun)) {
     return {
       kind: "transient_infra",

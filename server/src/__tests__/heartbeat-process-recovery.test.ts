@@ -1749,7 +1749,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(run?.errorCode).toBe("process_lost");
   });
 
-  it("immediately reaps a fresh exact-missing Job after restart when no adapter owner remains", async () => {
+  it("immediately reaps a fresh exact-missing Job and records that adapter invocation started", async () => {
     const jobName = "agent-opencode-restart-missing";
     const { companyId, agentId, runId } = await seedRunFixture({
       adapterType: "opencode_k8s",
@@ -1779,6 +1779,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(await heartbeat.getRun(runId)).toMatchObject({
       status: "failed",
       errorCode: "job_missing",
+      resultJson: {
+        externalLifecycleRecovery: expect.objectContaining({ adapterInvocationStarted: true }),
+      },
     });
     const persistedReservation = await db
       .select()
