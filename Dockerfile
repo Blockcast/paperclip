@@ -344,7 +344,11 @@ ARG CLAUDE_K8S_REF=3ad33702052f357ec2b31b7d3051e89ed1ed4875
 # default off; fleet behavior unchanged until the canary flips it on).
 # Adapter suite 592 green + typecheck clean; plugin API validated against
 # the live opencode 1.15.12 runtime.
-ARG OPENCODE_K8S_REF=ff92362eaf44c9b964cf5926591492cde060e796
+# Bumped 2026-08-04 to 9ff4c4c: address Ally review on #52 -- disabled
+# canaries clean stale persistent guard artifacts, safe-helper allowlist no
+# longer masks helper+dump command chains, and unquoted sh/bash -c dumps are
+# blocked. Adapter suite 603 green + typecheck clean.
+ARG OPENCODE_K8S_REF=9ff4c4c666f2e35a77f5049e81ddfbafe8b62d5e
 
 # Pack paperclip's in-tree adapter-utils so the bundled adapters consume
 # the workspace version (may include exports newer than the latest
