@@ -21,7 +21,7 @@ install_browser_link() {
         echo "docker-entrypoint.sh: /paperclip/bin is not writable; browser link not installed" >&2
         return 0
     fi
-    if ! ln -sf "$browser" /paperclip/bin/google-chrome 2>/dev/null; then
+    if ! ln -sfn "$browser" /paperclip/bin/google-chrome 2>/dev/null; then
         echo "docker-entrypoint.sh: could not install browser link in /paperclip/bin" >&2
     fi
 }

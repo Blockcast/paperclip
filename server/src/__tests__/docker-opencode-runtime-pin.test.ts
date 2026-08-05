@@ -153,7 +153,9 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
     expect(dockerAgentWorkflow).toContain("--tmpfs /paperclip:rw,nosuid,size=16m");
     expect(dockerAgentWorkflow).toContain("paperclip-browser-smoke");
     expect(dockerAgentWorkflow).toContain("AGENT_IMAGE: harbor.blockcast.net/paperclip-agent/paperclip-agent@${{ steps.build.outputs.digest }}");
-    expect(dockerAgentWorkflow).toContain("docker buildx imagetools create --tag \"$FLOATING_IMAGE\" \"$CANDIDATE_IMAGE\"");
+    expect(dockerAgentWorkflow).toContain(
+      "docker buildx imagetools create --prefer-index=false --tag \"$FLOATING_IMAGE\" \"$CANDIDATE_IMAGE\"",
+    );
 
     const metadataBlock = dockerAgentWorkflow.slice(
       dockerAgentWorkflow.indexOf("name: Docker meta"),
@@ -168,6 +170,13 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
       'RUNTIME_BASE_IMAGE=${{ steps.bases.outputs.runtime_base_image }}',
     );
     expect(dockerAgentWorkflow).toContain('FFMPEG_IMAGE=${{ steps.bases.outputs.ffmpeg_image }}');
+    expect(dockerAgentWorkflow).toContain(
+      'ffmpeg_known_good_digest="sha256:be20fcc53b6ca777de62c004ea926bcbb044f766f942e0bbe0eac6ee419a06d1"',
+    );
+    expect(dockerAgentWorkflow).toContain(
+      'docker run --rm --entrypoint ffmpeg "$ffmpeg_image" -hide_banner -muxers',
+    );
+    expect(dockerAgentWorkflow).toContain("lacks moq_mmt; using last known-good publisher digest");
   });
 
   it("publishes agent runtime images to Harbor with a secondary GHA cache", () => {
