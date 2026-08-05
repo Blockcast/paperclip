@@ -1460,3 +1460,49 @@ describe.sequential("GET /api/plugins/alerts/plugin-health", () => {
     expect(mockRegistry.listByStatus).not.toHaveBeenCalled();
   });
 });
+
+// BLO-22120: these three plugin-state routes are board-only BY DESIGN.
+//
+// `assertBoardOrgAccess` -> `assertBoard` tests `req.actor.type`, not a grant, so no
+// agent identity can reach them and no grant widens them. The BLO-18556 hygiene
+// routine was rewritten (revision 3) to stop instructing an agent to call them; these
+// assertions keep that decision honest, so that widening the gate has to be a
+// deliberate edit to this file rather than a silent side effect.
+describe.sequential("plugin state routes stay board-only for agent actors (BLO-22120)", () => {
+  it.each([
+    ["enumerate plugin state", "get", "/api/plugins", undefined],
+    ["read bridge reverse mappings", "post", `/api/plugins/${pluginId}/bridge/data`, { key: "connection-status" }],
+    ["list plugin sync jobs", "get", `/api/plugins/${pluginId}/jobs`, undefined],
+  ] as const)("rejects an agent actor with 403 when it tries to %s", async (_label, method, path, body) => {
+    const call = vi.fn();
+    const { app } = await createApp(agentActor(), {}, {
+      bridgeDeps: { workerManager: { call } },
+    });
+
+    const res = method === "get"
+      ? await request(app).get(path)
+      : await request(app).post(path).send(body);
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toBe("Board access required");
+    expect(call).not.toHaveBeenCalled();
+    expect(mockRegistry.getById).not.toHaveBeenCalled();
+    expect(mockRegistry.listByStatus).not.toHaveBeenCalled();
+  });
+
+  // Pins gate ORDERING: with the deps unwired a board actor falls through to 501
+  // "not enabled". An agent never gets that far. If the 403 above ever became an
+  // artifact of missing deps rather than the board gate, this contrast would break.
+  it.each([
+    ["bridge data", "post", `/api/plugins/${pluginId}/bridge/data`, { key: "connection-status" }],
+    ["plugin jobs", "get", `/api/plugins/${pluginId}/jobs`, undefined],
+  ] as const)("board actor reaches the %s handler body (501) where an agent is stopped at the gate (403)", async (_label, method, path, body) => {
+    const { app } = await createApp(boardActor());
+
+    const res = method === "get"
+      ? await request(app).get(path)
+      : await request(app).post(path).send(body);
+
+    expect(res.status).toBe(501);
+  });
+});
