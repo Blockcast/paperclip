@@ -28,7 +28,7 @@ import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { buildPaperclipWakePayload } from "../services/heartbeat.js";
 import { computeIssueMonitorGateFingerprint } from "../services/issue-execution-policy.js";
-import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
+import { issueRecoveryActionService, recoveryHandoffGrantIsWithinTtl } from "../services/issue-recovery-actions.js";
 import { issueService } from "../services/issues.js";
 import { subscribeCompanyLiveEvents } from "../services/live-events.js";
 import { loadConfig } from "../config.js";
@@ -2188,6 +2188,230 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     }
 
     expect(enqueueWakeup.mock.calls.map((call) => call[0])).toEqual([emId, ctoId]);
+  });
+
+  it("re-anchors the handoff grant when the same agent is transferred away by a distinct failed run", async () => {
+    // BLO-22127 defect 2. Keying freshness solely on the grant SUBJECT changing misses a
+    // real second transfer of the same agent.
+    //
+    // Ownership can return to ENG out-of-band — a human reassignment, a manual takeback,
+    // anything that is not a recovery sweep — so nothing ever records an intervening
+    // `previousOwnerAgentId = EM`. When a DISTINCT ENG run then fails, the sweep passes
+    // `previousOwnerAgentId = ENG`, which already equals the recorded subject, so the
+    // transfer reads as churn and ENG keeps the anchor from the FIRST transfer. If that
+    // first anchor is already older than the TTL, ENG loses the handoff channel at the
+    // exact moment it has a fresh diagnosis to hand over — the deprivation #827 exists to
+    // prevent, reintroduced by the freshness rule rather than by the grant itself.
+    //
+    // The two halves of this test are byte-identical except for the failed run's ID, which
+    // is what proves the discriminator is load-bearing rather than incidental.
+    const companyId = randomUUID();
+    const ceoId = randomUUID();
+    const ctoId = randomUUID();
+    const emId = randomUUID();
+    const engId = randomUUID();
+    const sourceIssueId = randomUUID();
+    const prefix = `RA${companyId.replaceAll("-", "").slice(0, 6).toUpperCase()}`;
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Re-anchor Co",
+      issuePrefix: prefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+    const agentBase = {
+      companyId,
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    } as const;
+    await db.insert(agents).values([
+      { ...agentBase, id: ceoId, name: "CEO", role: "ceo" },
+      { ...agentBase, id: ctoId, name: "CTO", role: "cto", reportsTo: ceoId },
+      { ...agentBase, id: emId, name: "EM", role: "engineer", reportsTo: ctoId },
+      { ...agentBase, id: engId, name: "Eng", role: "engineer", reportsTo: emId },
+    ]);
+    await db.insert(issues).values({
+      id: sourceIssueId,
+      companyId,
+      title: "Same agent transferred away twice",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: engId,
+      issueNumber: 1,
+      identifier: `${prefix}-1`,
+    });
+
+    const enqueueWakeup = vi.fn<
+      (agentId: string, opts?: { payload?: unknown }) => Promise<{ id: string }>
+    >(async () => ({ id: randomUUID() }));
+    const recovery = recoveryService(db, { enqueueWakeup });
+    // Unlike the churn test's helper, the run ID is a parameter here: this test turns on
+    // the difference between a distinct failure and a replay of the same one.
+    const sweep = async (runAgentId: string, runId: string) => {
+      const [fresh] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      await recovery.escalateStrandedAssignedIssue({
+        issue: fresh!,
+        previousStatus: "in_progress",
+        latestRun: {
+          id: runId,
+          agentId: runAgentId,
+          status: "failed",
+          error: "adapter failed",
+          errorCode: "adapter_failed",
+          contextSnapshot: { retryReason: "issue_continuation_needed" },
+          livenessState: "needs_followup",
+          resultJson: null,
+          usageJson: null,
+          createdAt: new Date(),
+        },
+        comment: "Automatic continuation recovery failed.",
+      });
+    };
+    // Models the out-of-band return of ownership that makes this reachable. Recovery never
+    // sees it, so no sweep records `previousOwnerAgentId = EM` in between.
+    const returnIssueTo = async (agentId: string) => {
+      await db.update(issues).set({ assigneeAgentId: agentId }).where(eq(issues.id, sourceIssueId));
+    };
+    const handoffAnchor = (evidence: unknown) =>
+      (evidence as Record<string, unknown>).recoveryHandoffGrantAnchorAt;
+    const readAction = async () => {
+      const [row] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, sourceIssueId));
+      return row!;
+    };
+
+    const firstRunId = randomUUID();
+    const secondRunId = randomUUID();
+    const firstSweepAt = new Date("2026-08-02T01:00:00.000Z");
+    const secondSweepAt = new Date("2026-08-04T01:00:00.000Z");
+    const thirdSweepAt = new Date("2026-08-06T01:00:00.000Z");
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      // ENG fails; recovery transfers it away and reassigns the issue to EM.
+      vi.setSystemTime(firstSweepAt);
+      await sweep(engId, firstRunId);
+      const firstAction = await readAction();
+      expect(firstAction).toMatchObject({ previousOwnerAgentId: engId, ownerAgentId: emId });
+      expect(handoffAnchor(firstAction.evidence)).toBe(firstSweepAt.toISOString());
+
+      // Ownership returns to ENG without a sweep, then a DISTINCT ENG run fails.
+      await returnIssueTo(engId);
+      vi.setSystemTime(secondSweepAt);
+      await sweep(engId, secondRunId);
+      const secondAction = await readAction();
+      // The subject is unchanged — that is the point. It is a genuine second transfer all
+      // the same, so the anchor moves and the grant is live again for a fresh 24h.
+      expect(secondAction).toMatchObject({ previousOwnerAgentId: engId, ownerAgentId: emId });
+      expect(secondAction.evidence).toMatchObject({ latestRunId: secondRunId });
+      expect(handoffAnchor(secondAction.evidence)).toBe(secondSweepAt.toISOString());
+
+      // Same setup, same subject, SAME failed run: a replay, not a transfer. The anchor
+      // must hold, or the TTL becomes the sliding window BLO-20263 was filed to remove.
+      await returnIssueTo(engId);
+      vi.setSystemTime(thirdSweepAt);
+      await sweep(engId, secondRunId);
+      const thirdAction = await readAction();
+      expect(thirdAction).toMatchObject({ previousOwnerAgentId: engId, ownerAgentId: emId });
+      expect(handoffAnchor(thirdAction.evidence)).toBe(secondSweepAt.toISOString());
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("preserves a present-but-unparseable handoff anchor across a sweep instead of dropping it", async () => {
+    // BLO-22127 defect 1b, write side. `recoveryHandoffGrantIsWithinTtl` denies a grant
+    // whose anchor is present but unreadable. That is only durable if a sweep does not
+    // quietly delete the unreadable value: dropping it would rewrite "present but
+    // unparseable" (denied) into "absent" (falls back to `createdAt`), so ordinary churn
+    // would launder a fail-closed row back into a fail-open one.
+    const companyId = randomUUID();
+    const ceoId = randomUUID();
+    const ctoId = randomUUID();
+    const emId = randomUUID();
+    const engId = randomUUID();
+    const sourceIssueId = randomUUID();
+    const prefix = `UA${companyId.replaceAll("-", "").slice(0, 6).toUpperCase()}`;
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Unparseable Anchor Co",
+      issuePrefix: prefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+    const agentBase = {
+      companyId,
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    } as const;
+    await db.insert(agents).values([
+      { ...agentBase, id: ceoId, name: "CEO", role: "ceo" },
+      { ...agentBase, id: ctoId, name: "CTO", role: "cto", reportsTo: ceoId },
+      { ...agentBase, id: emId, name: "EM", role: "engineer", reportsTo: ctoId },
+      { ...agentBase, id: engId, name: "Eng", role: "engineer", reportsTo: emId },
+    ]);
+    await db.insert(issues).values({
+      id: sourceIssueId,
+      companyId,
+      title: "Unparseable handoff anchor survives churn",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: engId,
+      issueNumber: 1,
+      identifier: `${prefix}-1`,
+    });
+
+    const enqueueWakeup = vi.fn<
+      (agentId: string, opts?: { payload?: unknown }) => Promise<{ id: string }>
+    >(async () => ({ id: randomUUID() }));
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const sweep = async (runAgentId: string) => {
+      const [fresh] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      await recovery.escalateStrandedAssignedIssue({
+        issue: fresh!,
+        previousStatus: "in_progress",
+        latestRun: {
+          id: randomUUID(),
+          agentId: runAgentId,
+          status: "failed",
+          error: "adapter failed",
+          errorCode: "adapter_failed",
+          contextSnapshot: { retryReason: "issue_continuation_needed" },
+          livenessState: "needs_followup",
+          resultJson: null,
+          usageJson: null,
+          createdAt: new Date(),
+        },
+        comment: "Automatic continuation recovery failed.",
+      });
+    };
+    const readAction = async () => {
+      const [row] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, sourceIssueId));
+      return row!;
+    };
+
+    await sweep(engId);
+    const created = await readAction();
+    // Corrupt the anchor the way only an external writer could, then sweep as ordinary
+    // churn (ENG's same failure re-observed while the issue sits with EM).
+    await db
+      .update(issueRecoveryActions)
+      .set({ evidence: { ...(created.evidence as Record<string, unknown>), recoveryHandoffGrantAnchorAt: "not-a-date" } })
+      .where(eq(issueRecoveryActions.id, created.id));
+    await sweep(engId);
+
+    const swept = await readAction();
+    expect((swept.evidence as Record<string, unknown>).recoveryHandoffGrantAnchorAt).toBe("not-a-date");
+    expect(recoveryHandoffGrantIsWithinTtl({ evidence: swept.evidence, createdAt: swept.createdAt }))
+      .toBe(false);
   });
 
   it("bounds the wakes even when recovery ownership ping-pongs and never spends one owner's budget", async () => {

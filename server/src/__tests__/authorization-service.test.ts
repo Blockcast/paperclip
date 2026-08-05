@@ -1469,6 +1469,115 @@ describeEmbeddedPostgres("authorization service", () => {
       .resolves.toMatchObject({ allowed: true, reason: "allow_recovery_handoff_grant" });
   });
 
+  it("fails the recovery handoff grant closed on invalid temporal evidence", async () => {
+    // BLO-22127 defect 1. The TTL added by BLO-20263 was one-sided and treated a
+    // present-but-unreadable anchor as if the row had never claimed one. Both states are
+    // fail-OPEN in an authorization path: they degrade the bound back to the unbounded
+    // grant BLO-20263 was filed to remove.
+    const company = await createCompany(db, "RecoveryHandoffTtlEvidence");
+    const project = await createProject(db, company.id, "RecoveryHandoffTtlEvidenceTarget");
+    const previousOwner = await createAgent(db, company.id, { role: "engineer" });
+    const recoveryOwner = await createAgent(db, company.id, { role: "cto" });
+    const issue = await createIssue(db, company.id, {
+      title: "Recovery-transferred handoff target with unusable temporal evidence",
+      projectId: project.id,
+      assigneeAgentId: recoveryOwner.id,
+    });
+
+    const authorization = authorizationService(db);
+    const resource = {
+      type: "issue",
+      companyId: company.id,
+      issueId: issue.id,
+      projectId: issue.projectId,
+      assigneeAgentId: recoveryOwner.id,
+      status: "blocked",
+    } as const;
+    const commentDecision = (agentId: string) =>
+      authorization.decide({
+        actor: { type: "agent", agentId, companyId: company.id, source: "agent_key" },
+        action: "issue:comment",
+        resource,
+      });
+    const HOUR = 60 * 60 * 1000;
+
+    const [action] = await db.insert(issueRecoveryActions).values({
+      companyId: company.id,
+      sourceIssueId: issue.id,
+      kind: "stranded_assigned_issue",
+      status: "active",
+      ownerType: "agent",
+      ownerAgentId: recoveryOwner.id,
+      previousOwnerAgentId: previousOwner.id,
+      returnOwnerAgentId: previousOwner.id,
+      cause: "stranded_assigned_issue",
+      fingerprint: `fingerprint-${randomUUID()}`,
+      nextAction: "Hand the diagnosis to the recovery owner.",
+      evidence: { recoveryHandoffGrantAnchorAt: new Date(Date.now() - 1 * HOUR).toISOString() },
+    }).returning();
+    const setEvidence = async (evidence: Record<string, unknown>) => {
+      await db
+        .update(issueRecoveryActions)
+        .set({ evidence })
+        .where(eq(issueRecoveryActions.id, action!.id));
+    };
+
+    // Baseline: a readable, recent anchor still grants, so every denial below is
+    // attributable to the evidence under test and not to the surrounding fixture.
+    await expect(commentDecision(previousOwner.id))
+      .resolves.toMatchObject({ allowed: true, reason: "allow_recovery_handoff_grant" });
+
+    // (a) A future-dated anchor yields a NEGATIVE age, and negative trivially satisfies
+    // `<= TTL`. Unfixed, the grant holds until wall-clock catches up — here, for a year.
+    await setEvidence({
+      recoveryHandoffGrantAnchorAt: new Date(Date.now() + 365 * 24 * HOUR).toISOString(),
+    });
+    await expect(commentDecision(previousOwner.id))
+      .resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+
+    // Even one hour into the future: the bound is two-sided, not merely sanity-checked.
+    await setEvidence({ recoveryHandoffGrantAnchorAt: new Date(Date.now() + 1 * HOUR).toISOString() });
+    await expect(commentDecision(previousOwner.id))
+      .resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+
+    // (b) A present-but-unparseable anchor must NOT silently rebase onto `createdAt`.
+    // `createdAt` here is moments ago, so the unfixed `??` fallback returns a grant the
+    // row never claimed. The row is denied because its own stated anchor is unreadable.
+    await setEvidence({ recoveryHandoffGrantAnchorAt: "not-a-date" });
+    await expect(commentDecision(previousOwner.id))
+      .resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+
+    // A JSON null is *present*, not absent, so it is unreadable evidence too.
+    await setEvidence({ recoveryHandoffGrantAnchorAt: null });
+    await expect(commentDecision(previousOwner.id))
+      .resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+
+    // ...and the fallback is genuinely suppressed rather than coincidentally expired:
+    // pinning `createdAt` well inside the TTL still does not rescue the row.
+    await db
+      .update(issueRecoveryActions)
+      .set({ createdAt: new Date(Date.now() - 1 * HOUR) })
+      .where(eq(issueRecoveryActions.id, action!.id));
+    await setEvidence({ recoveryHandoffGrantAnchorAt: "not-a-date" });
+    await expect(commentDecision(previousOwner.id))
+      .resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+
+    // (c) An ABSENT key is the legacy shape and still falls back to `createdAt`. This is
+    // the line between the two: absent means "this row predates the anchor", present-
+    // but-unreadable means "this row claims an anchor we cannot verify".
+    await setEvidence({});
+    await expect(commentDecision(previousOwner.id))
+      .resolves.toMatchObject({ allowed: true, reason: "allow_recovery_handoff_grant" });
+
+    // The legacy fallback keeps its own upper bound.
+    await db
+      .update(issueRecoveryActions)
+      .set({ createdAt: new Date(Date.now() - 25 * HOUR) })
+      .where(eq(issueRecoveryActions.id, action!.id));
+    await expect(commentDecision(previousOwner.id))
+      .resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+  });
+
   it("does not open a recovery handoff channel when the escalation kept the previous owner assigned", async () => {
     const company = await createCompany(db, "RecoveryHandoffBoardOwned");
     const project = await createProject(db, company.id, "RecoveryHandoffBoardTarget");
