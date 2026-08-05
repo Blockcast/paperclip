@@ -233,7 +233,7 @@ requires a formal approval.
 **Author and push under the default App token. Never author or push a PR under
 the user-seat token, and never over the cluster SSH key either.** No token
 selection is needed — the default `gh` and `git` credentials already are the App
-token, and GitHub operations never go over SSH in these pods.
+token, and GitHub operations must never go over SSH in these pods.
 
 ### Why seat-authoring breaks review
 
