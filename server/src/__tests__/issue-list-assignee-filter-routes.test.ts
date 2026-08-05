@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
 import { eq } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { activityLog, agents, companies, companyMemberships, createDb, heartbeatRuns, issues, principalPermissionGrants } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -12,8 +12,8 @@ import { errorHandler } from "../middleware/index.js";
 import {
   __clearIssueListResponseCacheForTests,
   __getIssueListResponseCacheSizeForTests,
-  __resetIssueListResponseCacheMaxEntriesForTests,
-  __setIssueListResponseCacheMaxEntriesForTests,
+  __setIssueListResponseCacheEntryForTests,
+  ISSUE_LIST_SERVER_CACHE_MAX_ENTRIES,
   issueRoutes,
 } from "../routes/issues.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
@@ -551,56 +551,25 @@ describeEmbeddedPostgres("issue list routes assigneeAgentId filter", () => {
     expect(second.headers["x-paperclip-request-cache"]).toBe("hit");
   });
 
-  it(
-    "bounds compact issue-list server cache entries",
-    async () => {
-      const companyId = randomUUID();
-      const issueId = randomUUID();
+  it("bounds compact issue-list server cache entries", () => {
+    // Drive the exact same insert-and-trim path a real request takes
+    // (setIssueListResponseCacheEntry), but with synthetic entries inserted
+    // synchronously instead of 261 real HTTP round trips against Postgres.
+    // No DB, no HTTP, no awaits — nothing here can time out under a loaded
+    // runner, and there's no module-global override left to leak into a
+    // later test if it did.
+    const syntheticEntry = {
+      response: { kind: "compact" as const, body: [], etag: "test-etag", cacheControl: "no-store" },
+      expiresAt: Date.now() + 1_000,
+      staleUntil: Date.now() + 5_000,
+    };
 
-      await db.insert(companies).values({
-        id: companyId,
-        name: "Paperclip",
-        issuePrefix: uniqueIssuePrefix(),
-        requireBoardApprovalForNewAgents: false,
-      });
-      await seedCloudTenantMember(companyId);
-      await db.insert(issues).values({
-        id: issueId,
-        companyId,
-        title: "Bounded cache issue",
-        status: "todo",
-        priority: "medium",
-      });
+    for (let index = 0; index < ISSUE_LIST_SERVER_CACHE_MAX_ENTRIES + 5; index += 1) {
+      __setIssueListResponseCacheEntryForTests(`cache-key-${index}`, syntheticEntry);
+    }
 
-      const app = createApp(companyId);
-      const fixedNow = Date.now();
-      const nowSpy = vi.spyOn(Date, "now").mockReturnValue(fixedNow);
-      // Small injected bound so this stays a handful of round trips instead of
-      // scaling with the production cache size (previously 261 sequential
-      // requests, which blew vitest's 60s default under a loaded runner).
-      const testMaxEntries = 5;
-      __setIssueListResponseCacheMaxEntriesForTests(testMaxEntries);
-      let completedRequests = 0;
-      try {
-        for (let index = 0; index < testMaxEntries + 5; index += 1) {
-          const res = await request(app)
-            .get(`/api/companies/${companyId}/issues`)
-            .query({ view: "compact", limit: "20", q: `cache-key-${index}` });
-          expect(res.status, JSON.stringify(res.body)).toBe(200);
-          completedRequests += 1;
-        }
-
-        // Guard behind loop completion so a hypothetical timeout reports only
-        // the timeout, never a second, misleading cache-size assertion.
-        expect(completedRequests).toBe(testMaxEntries + 5);
-        expect(__getIssueListResponseCacheSizeForTests()).toBe(testMaxEntries);
-      } finally {
-        nowSpy.mockRestore();
-        __resetIssueListResponseCacheMaxEntriesForTests();
-      }
-    },
-    10_000,
-  );
+    expect(__getIssueListResponseCacheSizeForTests()).toBe(ISSUE_LIST_SERVER_CACHE_MAX_ENTRIES);
+  });
 
   it("logs request_storm_detected for identical in-flight compact issue-list fanout without query values", async () => {
     const companyId = randomUUID();
