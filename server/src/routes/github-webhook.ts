@@ -75,6 +75,17 @@ type PrReviewerSelectionDb = Pick<Db | DbTransaction, "select">;
 // trigger the redelivery-under-contention loop this path exists to absorb.
 const PR_REVIEWER_TASK_LOCK_BUDGET_MS = 4_000;
 const PR_REVIEWER_TASK_LOCK_RETRY_MS = 25;
+// Bounds the lock-exhaustion fallback recheck (findExistingPrReviewerWake /
+// findActivePrReviewerForTask / selectPrReviewerAgentId) that runs after
+// PR_REVIEWER_TASK_LOCK_BUDGET_MS is already spent. Those reads use the same
+// pool that just failed to check out a connection in time, so a saturated
+// pool can stall them exactly as it stalled the lock probe -- without a
+// bound of their own they would defeat the whole point of the budget above
+// (BLO-21582 review follow-up: "the fallback queries are outside the
+// deadline"). Small on purpose: these are single indexed-row reads, and a
+// timeout here just falls back to the pre-existing conservative default
+// (record the delivery as lost) rather than confirming a no-op.
+const PR_REVIEWER_TASK_LOCK_FALLBACK_BUDGET_MS = 1_000;
 
 export interface GithubWebhookConfig {
   /**
@@ -1564,46 +1575,106 @@ async function withPrReviewerTaskLock<T>(
     // Do not block a pooled connection while another request owns the lock:
     // the winner needs a second connection for heartbeat's enqueue transaction.
     //
-    // Race pool checkout + the lock probe against the remaining budget:
-    // `db.transaction()` alone does not respect `deadline` (a stalled pool
-    // checkout under contention could block well past it), so bound it
-    // explicitly here rather than only checking elapsed time after it
-    // resolves (BLO-21582 review follow-up). Attach a `.catch` so a
-    // transaction that eventually settles after we've stopped waiting on it
-    // doesn't surface as an unhandled rejection; it still commits or rolls
-    // back on its own connection, we've simply moved on.
+    // Race pool checkout + the lock probe -- and ONLY that -- against the
+    // remaining budget: `db.transaction()` alone does not respect `deadline`
+    // (a stalled pool checkout under contention could block well past it),
+    // so bound it explicitly here rather than only checking elapsed time
+    // after it resolves. `settleLockProbe` below fires the instant the probe
+    // query itself settles, before `action(tx)` ever runs, so the race can
+    // never observe a still-running `action` as "not acquired" (BLO-21582
+    // review follow-up: racing the whole transaction -- including
+    // `action(tx)` -- let the handler abandon a live transaction that could
+    // still commit a wake after the deadline had already been reported as a
+    // lock-acquisition failure, producing a false dead-letter AND a second,
+    // uncounted wake).
+    let settleLockProbe: (outcome: { acquired: boolean } | { error: unknown }) => void;
+    const lockProbeSettled = new Promise<{ acquired: boolean } | { error: unknown }>((resolve) => {
+      settleLockProbe = resolve;
+    });
     const transactionPromise = db.transaction(async (tx) => {
-      const rows = await tx.execute(
-        sql`select pg_try_advisory_xact_lock(hashtextextended(${taskKey}, 0)) as acquired`,
-      );
-      const row = Array.isArray(rows) ? rows[0] : null;
-      if (
-        !row ||
-        typeof row !== "object" ||
-        (row as Record<string, unknown>).acquired !== true
-      ) {
+      let acquired: boolean;
+      try {
+        const rows = await tx.execute(
+          sql`select pg_try_advisory_xact_lock(hashtextextended(${taskKey}, 0)) as acquired`,
+        );
+        const row = Array.isArray(rows) ? rows[0] : null;
+        acquired =
+          !!row && typeof row === "object" && (row as Record<string, unknown>).acquired === true;
+      } catch (error) {
+        settleLockProbe({ error });
+        throw error;
+      }
+      settleLockProbe({ acquired });
+      if (!acquired) {
         return { acquired: false as const };
       }
+      // The lock is ours from here on: no further racing against the
+      // deadline, even if `action` runs long. Abandoning this branch after
+      // this point would still let the transaction commit on its own
+      // connection with nobody accounting for the outcome.
       return { acquired: true as const, value: await action(tx) };
     });
+    const probeOutcome = await Promise.race([
+      lockProbeSettled,
+      new Promise<{ acquired: false }>((resolve) => {
+        setTimeout(() => resolve({ acquired: false }), remainingMs);
+      }),
+    ]);
+    if ("error" in probeOutcome) {
+      // The probe query itself failed (not a lock-acquisition timeout) --
+      // this is a genuine DB error, not ours to retry. Swallow the
+      // transaction's own rejection (same error, already surfaced here) so
+      // it doesn't also report as an unhandled rejection.
+      transactionPromise.catch(() => {});
+      throw probeOutcome.error;
+    }
+    if (probeOutcome.acquired) {
+      // Lock acquisition already resolved inside the transaction; await the
+      // in-flight `action(tx)` to completion instead of racing it further.
+      const outcome = (await transactionPromise) as { acquired: true; value: T };
+      return outcome.value;
+    }
+    // The probe did not settle within budget (most likely a stalled pool
+    // checkout): move on without waiting further, but log if the abandoned
+    // transaction eventually does settle so that's still observable. It
+    // still commits or rolls back on its own connection regardless of
+    // whether we're still waiting on it.
     transactionPromise.catch((err) => {
       logger.warn(
         { err, taskKey },
         "github webhook reviewer wake lock transaction settled after its retry budget was abandoned",
       );
     });
-    const outcome = await Promise.race([
-      transactionPromise,
-      new Promise<{ acquired: false }>((resolve) => {
-        setTimeout(() => resolve({ acquired: false }), remainingMs);
-      }),
-    ]);
-    if (outcome.acquired) return outcome.value;
     if (Date.now() >= deadline) {
       throw new PrReviewerTaskLockTimeoutError(taskKey);
     }
     await new Promise((resolve) => setTimeout(resolve, PR_REVIEWER_TASK_LOCK_RETRY_MS));
   }
+}
+
+// Sentinel distinct from any real query result (including `null`, which
+// `findExistingPrReviewerWake`/`findActivePrReviewerForTask` return to mean
+// "no row" -- a legitimate, confident answer that must NOT be confused with
+// "we don't know because the read didn't finish in time").
+const FALLBACK_RECHECK_TIMED_OUT = Symbol("pr-reviewer-wake-fallback-recheck-timed-out");
+
+// Bounds one lock-exhaustion fallback read against `deadlineMs` (BLO-21582
+// review follow-up). A timeout here must propagate as "unknown", not as a
+// false "confirmed no active reviewer" -- the caller has to keep that
+// distinction to avoid silently swallowing a real loss just because the
+// recheck itself couldn't get a connection in time.
+async function boundedFallbackRead<T>(
+  promise: Promise<T>,
+  deadlineMs: number,
+): Promise<T | typeof FALLBACK_RECHECK_TIMED_OUT> {
+  const remainingMs = deadlineMs - Date.now();
+  if (remainingMs <= 0) return FALLBACK_RECHECK_TIMED_OUT;
+  return Promise.race([
+    promise,
+    new Promise<typeof FALLBACK_RECHECK_TIMED_OUT>((resolve) => {
+      setTimeout(() => resolve(FALLBACK_RECHECK_TIMED_OUT), remainingMs);
+    }),
+  ]);
 }
 
 // Shared between the lock-guarded idempotency check inside
@@ -2248,13 +2319,36 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
           // and no-active-reviewer gates use above instead of a false
           // dead-letter alert, while contention with no such evidence still
           // counts as loss below.
-          const equivalentWake = await findExistingPrReviewerWake(
-            db,
-            reviewerAgentIds,
-            idempotencyKey,
-            idempotentStatuses,
+          //
+          // Both reads below are bounded by PR_REVIEWER_TASK_LOCK_FALLBACK_BUDGET_MS
+          // (BLO-21582 review follow-up): they share the same pool that just
+          // failed to check out a connection in time for the lock probe, so
+          // an unbounded synchronous read here could stall this response
+          // exactly as the lock probe did, defeating the deadline's whole
+          // purpose. A timeout is treated as "unknown" -- NOT as "confirmed
+          // no equivalent wake" / "confirmed no active reviewer" -- and falls
+          // straight through to the pre-existing conservative default below
+          // (record it as lost) rather than risking a false no-op on one side
+          // or an unbounded wait on the other.
+          const fallbackDeadline = lockDeadline + PR_REVIEWER_TASK_LOCK_FALLBACK_BUDGET_MS;
+          const equivalentWake = await boundedFallbackRead(
+            findExistingPrReviewerWake(db, reviewerAgentIds, idempotencyKey, idempotentStatuses),
+            fallbackDeadline,
           );
-          if (equivalentWake) {
+          if (equivalentWake === FALLBACK_RECHECK_TIMED_OUT) {
+            logger.warn(
+              {
+                taskKey: reviewerTaskKey,
+                event: eventName,
+                deliveryId,
+                wakeReason: context.wakeReason,
+                prNumber: context.prNumber,
+                repoFullName: context.repoFullName,
+              },
+              "github webhook reviewer wake lock-exhaustion recheck (existing wake) timed out waiting for a "
+                + "database read; recording the delivery as lost rather than risking an unbounded synchronous read",
+            );
+          } else if (equivalentWake) {
             logger.info(
               {
                 equivalentWakeId: equivalentWake.id,
@@ -2269,21 +2363,38 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
               "github webhook reviewer wake lock exhausted, but an equivalent wake is already durable: not counting as a lost wake",
             );
             return false;
-          }
-          const equivalentReviewerAgentId =
-            (await findActivePrReviewerForTask(db, reviewerAgentIds, reviewerTaskKey)) ??
-            (await selectPrReviewerAgentId(db, reviewerAgentIds, reviewerTaskKey));
-          if (!equivalentReviewerAgentId) {
-            logger.warn(
-              {
-                configuredReviewerCount: reviewerAgentIds.length,
-                event: eventName,
-                prNumber: context.prNumber,
-                repoFullName: context.repoFullName,
-              },
-              "github webhook reviewer wake lock exhausted, but no configured reviewer is active: not counting as a lost wake",
+          } else {
+            const equivalentReviewerAgentId = await boundedFallbackRead(
+              (async () =>
+                (await findActivePrReviewerForTask(db, reviewerAgentIds, reviewerTaskKey)) ??
+                (await selectPrReviewerAgentId(db, reviewerAgentIds, reviewerTaskKey)))(),
+              fallbackDeadline,
             );
-            return false;
+            if (equivalentReviewerAgentId === FALLBACK_RECHECK_TIMED_OUT) {
+              logger.warn(
+                {
+                  taskKey: reviewerTaskKey,
+                  event: eventName,
+                  deliveryId,
+                  wakeReason: context.wakeReason,
+                  prNumber: context.prNumber,
+                  repoFullName: context.repoFullName,
+                },
+                "github webhook reviewer wake lock-exhaustion recheck (active reviewer) timed out waiting for a "
+                  + "database read; recording the delivery as lost rather than risking an unbounded synchronous read",
+              );
+            } else if (!equivalentReviewerAgentId) {
+              logger.warn(
+                {
+                  configuredReviewerCount: reviewerAgentIds.length,
+                  event: eventName,
+                  prNumber: context.prNumber,
+                  repoFullName: context.repoFullName,
+                },
+                "github webhook reviewer wake lock exhausted, but no configured reviewer is active: not counting as a lost wake",
+              );
+              return false;
+            }
           }
           // BLO-21582: an exhausted lock-acquisition timeout happens before
           // the lock-guarded closure can record `received`, and neither

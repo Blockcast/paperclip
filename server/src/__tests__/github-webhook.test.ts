@@ -2547,6 +2547,35 @@ describeEmbeddedPostgres("github-webhook route", () => {
       };
     }
 
+    // Blocks any plain SELECT against `tableName` on the app's own `db` pool
+    // for up to `holdMs` -- unlike the advisory lock above (which only
+    // contends with itself), this simulates a genuinely stalled read on the
+    // exact query the lock-exhaustion fallback recheck issues, regardless of
+    // whether the real-world cause is pool-checkout starvation or something
+    // else blocking the connection (BLO-21582 review follow-up: "cover
+    // actual pool-checkout starvation, not only advisory-lock contention").
+    async function holdExclusiveTableLock(tableName: string, holdMs: number) {
+      let releaseHeld: () => void = () => {};
+      const held = new Promise<void>((resolve) => {
+        releaseHeld = resolve;
+      });
+      const acquired = new Promise<void>((resolveAcquired, rejectAcquired) => {
+        void lockDb
+          .transaction(async (tx) => {
+            await tx.execute(sql.raw(`LOCK TABLE "${tableName}" IN ACCESS EXCLUSIVE MODE`));
+            resolveAcquired();
+            await held;
+          })
+          .catch(rejectAcquired);
+      });
+      await acquired;
+      const timer = setTimeout(releaseHeld, holdMs);
+      return () => {
+        clearTimeout(timer);
+        releaseHeld();
+      };
+    }
+
     it(
       "recovers a reviewer wake once a transient lock-holder releases within the retry budget",
       async () => {
@@ -2788,6 +2817,199 @@ describeEmbeddedPostgres("github-webhook route", () => {
         expect(await deliveryCount("suppressed")).toBe(beforeSuppressed);
       },
       10_000,
+    );
+
+    it(
+      "awaits an in-flight wake to completion once the lock is already acquired, instead of abandoning " +
+        "it at the deadline (BLO-21582 review follow-up: racing action(tx) itself, not just the lock probe, " +
+        "could abandon a live transaction that later commits a wake the response already claimed was lost)",
+      async () => {
+        const reviewerAgentId = randomUUID();
+        const { companyId } = await seedCompanyAndAgent();
+        await db.insert(agents).values({
+          id: reviewerAgentId,
+          companyId,
+          name: "Ally",
+          role: "engineer",
+          status: "idle",
+          adapterType: "claude_k8s",
+          adapterConfig: {},
+          runtimeConfig: {},
+          permissions: {},
+        });
+
+        const prNumber = 21582004;
+
+        // No advisory-lock contention here at all: the lock probe resolves
+        // near-instantly. Instead, `heartbeat.wakeup()` -- which runs INSIDE
+        // the lock-guarded action, after the lock is already acquired -- is
+        // held open past PR_REVIEWER_TASK_LOCK_BUDGET_MS (4s in
+        // github-webhook.ts) by a penstock-availability gate that only
+        // resolves once the test releases it. The buggy version of
+        // withPrReviewerTaskLock raced the WHOLE transaction (lock probe +
+        // action) against the deadline, so it would abandon this still-live
+        // transaction at 4s and answer `reviewerWakeFired: false` --
+        // even though the action goes on to actually commit the wake a
+        // moment later, producing a false dead-letter and an uncounted
+        // extra `received`/`queued` pair after the response was already
+        // sent. The fix must instead await the action to completion once
+        // the lock is acquired, however long past the deadline it runs.
+        let releaseGate: () => void = () => {};
+        const gateBlocked = new Promise<void>((resolve) => {
+          releaseGate = resolve;
+        });
+        const delayedPenstockGate: NonNullable<GithubWebhookConfig["heartbeatOptions"]>["penstockAvailabilityGate"] = {
+          checkAdapter: async () => {
+            await gateBlocked;
+            return { allow: true };
+          },
+          _resetForTesting: () => {},
+        };
+
+        const app = buildApp({
+          prReviewerAgentId: reviewerAgentId,
+          heartbeatOptions: { penstockAvailabilityGate: delayedPenstockGate },
+        });
+        const payload = {
+          action: "opened",
+          pull_request: {
+            number: prNumber,
+            title: "Reviewer wake action-delayed-past-deadline regression",
+            body: null,
+            head: { ref: "fix/blo-21582-action-delay", sha: "actiondelaysha" },
+          },
+          repository: { full_name: "Blockcast/paperclip" },
+        };
+        const { body, signature } = signedRequest(payload);
+        const beforeDeadLettered = await deliveryCount("dead_lettered");
+        const beforeQueued = await deliveryCount("queued");
+        const beforeReceived = await deliveryCount("received");
+
+        const responsePromise = request(app)
+          .post("/api/webhooks/github")
+          .set("x-github-event", "pull_request")
+          .set("x-hub-signature-256", signature)
+          .set("x-github-delivery", "delivery-blo-21582-action-delay")
+          .set("content-type", "application/json")
+          .send(body);
+
+        // Release the gate well after PR_REVIEWER_TASK_LOCK_BUDGET_MS (4s)
+        // has elapsed. Only the fix under test -- not racing an
+        // already-acquired lock's action against the deadline -- lets this
+        // request wait that long and still resolve with the real outcome.
+        await new Promise((resolve) => setTimeout(resolve, 4_300));
+        releaseGate();
+
+        const res = await responsePromise;
+
+        expect(res.status).toBe(200);
+        expect(res.body).toMatchObject({ reviewerWakeFired: true });
+
+        // Exactly one terminal outcome: received -> queued, no dead-letter.
+        expect(await deliveryCount("received")).toBe(beforeReceived + 1);
+        expect(await deliveryCount("queued")).toBe(beforeQueued + 1);
+        expect(await deliveryCount("dead_lettered")).toBe(beforeDeadLettered);
+
+        const queuedWakes = await db
+          .select({ status: agentWakeupRequests.status })
+          .from(agentWakeupRequests)
+          .where(
+            and(
+              eq(agentWakeupRequests.agentId, reviewerAgentId),
+              eq(agentWakeupRequests.idempotencyKey, `pr_review:Blockcast/paperclip:${prNumber}:github_pr_opened`),
+              eq(agentWakeupRequests.status, "queued"),
+            ),
+          );
+        expect(queuedWakes).toHaveLength(1);
+
+        // No post-response mutation: the counters and the wake row are
+        // already final by the time the response was sent, so waiting
+        // longer must not move them again.
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        expect(await deliveryCount("received")).toBe(beforeReceived + 1);
+        expect(await deliveryCount("queued")).toBe(beforeQueued + 1);
+        expect(await deliveryCount("dead_lettered")).toBe(beforeDeadLettered);
+      },
+      15_000,
+    );
+
+    it(
+      "bounds the lock-exhaustion fallback recheck instead of stalling behind the same blocked connection, " +
+        "and still records the loss (BLO-21582 review follow-up: 'the fallback queries are outside the " +
+        "deadline... defeating the end-to-end bound')",
+      async () => {
+        const reviewerAgentId = randomUUID();
+        const { companyId } = await seedCompanyAndAgent();
+        await db.insert(agents).values({
+          id: reviewerAgentId,
+          companyId,
+          name: "Ally",
+          role: "engineer",
+          status: "idle",
+          adapterType: "claude_k8s",
+          adapterConfig: {},
+          runtimeConfig: {},
+          permissions: {},
+        });
+
+        const prNumber = 21582005;
+        const taskKey = `pr_review:Blockcast/paperclip:${prNumber}`;
+
+        // Force the lock-acquisition attempt to exhaust its own budget...
+        const releaseLock = await holdAdvisoryLock(taskKey, 8_000);
+        // ...and separately block the unlocked fallback recheck's own read
+        // (findExistingPrReviewerWake, which selects from
+        // agent_wakeup_requests) well past
+        // PR_REVIEWER_TASK_LOCK_FALLBACK_BUDGET_MS (1s) -- a stalled
+        // connection on that query, not more advisory-lock contention, is
+        // exactly the gap the review flagged.
+        const releaseTableLock = await holdExclusiveTableLock("agent_wakeup_requests", 8_000);
+
+        const app = buildApp({ prReviewerAgentId: reviewerAgentId });
+        const payload = {
+          action: "opened",
+          pull_request: {
+            number: prNumber,
+            title: "Reviewer wake fallback-recheck-timeout regression",
+            body: null,
+            head: { ref: "fix/blo-21582-fallback-timeout", sha: "fallbacktimeoutsha" },
+          },
+          repository: { full_name: "Blockcast/paperclip" },
+        };
+        const { body, signature } = signedRequest(payload);
+        const beforeDeadLettered = await deliveryCount("dead_lettered");
+        const beforeQueued = await deliveryCount("queued");
+        const beforeReceived = await deliveryCount("received");
+
+        const startedAt = Date.now();
+        let res;
+        try {
+          res = await request(app)
+            .post("/api/webhooks/github")
+            .set("x-github-event", "pull_request")
+            .set("x-hub-signature-256", signature)
+            .set("x-github-delivery", "delivery-blo-21582-fallback-timeout")
+            .set("content-type", "application/json")
+            .send(body);
+        } finally {
+          releaseLock();
+          releaseTableLock();
+        }
+        const elapsedMs = Date.now() - startedAt;
+
+        // Lock budget (4s) + fallback budget (1s) must bound the response
+        // well under the 8s the table lock and advisory lock are held for.
+        // Without the fallback bound, this would not resolve until ~8s.
+        expect(elapsedMs).toBeLessThan(7_000);
+
+        expect(res.status).toBe(200);
+        expect(res.body).toMatchObject({ reviewerWakeFired: false });
+
+        expect(await deliveryCount("received")).toBe(beforeReceived + 1);
+        expect(await deliveryCount("dead_lettered")).toBe(beforeDeadLettered + 1);
+        expect(await deliveryCount("queued")).toBe(beforeQueued);
+      },
+      15_000,
     );
   });
 
