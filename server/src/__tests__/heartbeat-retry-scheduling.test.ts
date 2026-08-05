@@ -1874,7 +1874,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     ).toBe(false);
   });
 
-  it.each(["job_failed", "job_missing"])(
+  it.each(["job_failed"])(
     "retries %s only when durable evidence proves adapter invocation never began",
     (errorCode) => {
       expect(
@@ -1915,6 +1915,16 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       expect(JOB_FAILED_HEARTBEAT_RETRY_MAX_ATTEMPTS).toBe(4);
     },
   );
+
+  it("does not retry job_missing even with synthetic never-invoked evidence", () => {
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "job_missing",
+        resultJson: { externalLifecycleRecovery: { adapterInvocationStarted: false } },
+        contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
+      }),
+    ).toBe(false);
+  });
 
   it("BLO-9147 AC2: CAPACITY_BLOCKED_HEARTBEAT_RETRY_MAX_ATTEMPTS exceeds rate-limit cap (12)", () => {
     expect(CAPACITY_BLOCKED_HEARTBEAT_RETRY_MAX_ATTEMPTS).toBeGreaterThan(12);

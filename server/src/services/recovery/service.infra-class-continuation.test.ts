@@ -42,10 +42,10 @@ describe("BLO-18106: job_missing continuation recovery is evidence-gated", () =>
     expect(classifyContinuationFailure(run("budget_blocked")).kind).toBe("non_retryable");
   });
 
-  it("keeps job_missing on the fail-safe path because production emits it only after invocation", () => {
+  it("makes job_missing non-retryable because production emits it only after invocation", () => {
     expect(classifyContinuationFailure(run("job_missing"))).toMatchObject({
-      kind: "default",
-      maxAttempts: 1,
+      kind: "non_retryable",
+      maxAttempts: 0,
     });
 
     // Pre-invocation disappearance is persisted as process_lost, which remains

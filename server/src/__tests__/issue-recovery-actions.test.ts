@@ -483,6 +483,43 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(await svc.getActiveForIssue(randomUUID(), sourceIssueId)).toBeNull();
   });
 
+  it("does not enqueue continuation work after an invoked external Job disappears", async () => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId: coderId,
+      invocationSource: "automation",
+      status: "failed",
+      error: "External lifecycle Job is missing while heartbeat run is still running",
+      errorCode: "job_missing",
+      resultJson: {
+        externalLifecycleRecovery: { adapterInvocationStarted: true },
+      },
+      contextSnapshot: { issueId: sourceIssueId },
+      startedAt: new Date("2026-07-26T13:45:00.000Z"),
+      finishedAt: new Date("2026-07-26T13:52:00.000Z"),
+    });
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result).toMatchObject({ continuationRequeued: 0, escalated: 1 });
+    expect(enqueueWakeup.mock.calls).not.toContainEqual([
+      coderId,
+      expect.objectContaining({ reason: "issue_continuation_needed" }),
+    ]);
+    const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(updatedIssue).toMatchObject({ status: "blocked" });
+    const comments = await db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, sourceIssueId));
+    expect(comments.some(({ body }) => body.includes("non-retryable failure"))).toBe(true);
+  });
+
   it("escalates stranded assigned work into a source action instead of a recovery issue", async () => {
     const { companyId, managerId, coderId, sourceIssue } = await seedCompany();
     // A DELIVERED wake returns the queued run. Null models one of `enqueueWakeup`'s

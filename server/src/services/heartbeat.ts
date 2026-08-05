@@ -1036,10 +1036,12 @@ export function shouldScheduleAutomaticRunRetry(
     return isIssueRun || isPrReviewRetryContext(contextSnapshot);
   }
 
-  // A failed or missing external-lifecycle Job may have performed non-idempotent
-  // work. Retry only when the reconciler durably proved adapter invocation never
-  // began; lock/status gates alone cannot make partial external writes safe.
-  if (run.errorCode === "job_failed" || run.errorCode === "job_missing") {
+  // A failed external-lifecycle Job may have performed non-idempotent work. Retry
+  // only when the reconciler durably proved adapter invocation never began;
+  // lock/status gates alone cannot make partial external writes safe. A missing
+  // Job is only produced after adapter.invoke and therefore never reaches this
+  // safe state; pre-invocation disappearance is process_lost instead.
+  if (run.errorCode === "job_failed") {
     const recovery = parseObject(parseObject(run.resultJson).externalLifecycleRecovery);
     return isIssueRun && recovery.adapterInvocationStarted === false;
   }

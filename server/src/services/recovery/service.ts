@@ -821,6 +821,9 @@ const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
   "budget_exhausted",
   "issue_paused",
   "issue_dependencies_blocked",
+  // Production emits job_missing only after adapter.invoke, so continuation
+  // replay could duplicate a durable external side effect.
+  "job_missing",
 ]);
 
 // A continuation cancelled with this code is a *deliberate wait* (the latest run
