@@ -34,6 +34,12 @@
  * normalized lock: arbitrary canonical GitHub casing cannot be reconstructed
  * from a user-authored URL. Acquiring these locks first keeps the lock order
  * consistent and avoids coupling unrelated issue creates to the webhook path.
+ *
+ * That acquisition is *bounded* and gives up rather than waiting (see
+ * lockPrReviewIssueScopes). Serialization is an optimization on a fail-open
+ * cost guard, so it never gets to outrank issue creation itself. The residual
+ * — one duplicate that slips through while the webhook's wake is still
+ * uncommitted — remains tracked as BLO-21790.
  */
 import { type Db, heartbeatRuns } from "@paperclipai/db";
 import { type Column, type SQL, and, desc, eq, inArray, or, sql } from "drizzle-orm";
@@ -222,10 +228,37 @@ function guardTaskKeys(
 }
 
 /**
+ * Upper bound on how long an issue create will wait for the PR-scope locks.
+ *
+ * The webhook holds these for one wake dispatch — two indexed selects plus
+ * heartbeat's enqueue transaction — so single-digit-millisecond holds are the
+ * steady state and this is ~1000x headroom. It exists only so a pathological
+ * holder cannot wedge issue creation, which is the product's hottest write
+ * path; see the fail-open note on lockPrReviewIssueScopes.
+ */
+const PR_REVIEW_ISSUE_LOCK_TIMEOUT_MS = 1_000;
+const PR_REVIEW_ISSUE_LOCK_RETRY_MS = 10;
+
+/**
  * Serializes an eligible issue create with webhook dispatch for every PR it
  * references. Call this before taking any other issue-create advisory lock;
  * PostgreSQL holds these transaction-scoped locks through the later guard read
  * and issue insert.
+ *
+ * Acquisition is bounded and fails open, in the same direction as the rest of
+ * this module. Waiting unboundedly here would put an *unbounded* blocking wait
+ * on every agent-assigned issue create, behind a lock whose other holder is the
+ * GitHub webhook — coupling the hottest write path to webhook dispatch latency,
+ * and with enough concurrent holders exhausting the connection pool. Giving up
+ * costs at most one duplicate issue (a cost problem, and exactly the residual
+ * tracked as BLO-21790); waiting forever costs issue creation itself (a
+ * correctness problem). `pg_try_advisory_xact_lock` never blocks and never
+ * errors, so this cannot poison the caller's transaction the way a
+ * `lock_timeout` on the blocking variant would.
+ *
+ * A give-up can leave a prefix of `taskKeys` held. That is deliberate and
+ * harmless: the success path holds the whole set for the same duration, so a
+ * prefix is strictly less blocking than the outcome we were aiming for.
  */
 export async function lockPrReviewIssueScopes(
   db: Pick<DbTransaction, "execute">,
@@ -245,9 +278,32 @@ export async function lockPrReviewIssueScopes(
     candidate.description,
   ).map((ref) => `pr_review:${ref.repoFullName}:${ref.prNumber}`);
   const taskKeys = [...new Set([...normalizedTaskKeys, ...sourceTaskKeys])].sort();
+
+  const deadline = Date.now() + PR_REVIEW_ISSUE_LOCK_TIMEOUT_MS;
   for (const taskKey of taskKeys) {
-    await db.execute(sql`select pg_advisory_xact_lock(hashtextextended(${taskKey}, 0))`);
+    while (!(await tryLockPrReviewScope(db, taskKey))) {
+      if (Date.now() >= deadline) {
+        logger.warn(
+          { taskKey, timeoutMs: PR_REVIEW_ISSUE_LOCK_TIMEOUT_MS },
+          "pr review duplicate guard gave up acquiring the PR scope lock; "
+            + "proceeding unserialized (BLO-21790)",
+        );
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, PR_REVIEW_ISSUE_LOCK_RETRY_MS));
+    }
   }
+}
+
+async function tryLockPrReviewScope(
+  db: Pick<DbTransaction, "execute">,
+  taskKey: string,
+): Promise<boolean> {
+  const rows = await db.execute(
+    sql`select pg_try_advisory_xact_lock(hashtextextended(${taskKey}, 0)) as acquired`,
+  );
+  const row = Array.isArray(rows) ? rows[0] : null;
+  return !!row && typeof row === "object" && (row as Record<string, unknown>).acquired === true;
 }
 
 /**
