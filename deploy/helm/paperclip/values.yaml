@@ -195,6 +195,16 @@ githubApp:
   # chain silently wedges the PR. Empty (default) -> the server posts no status.
   # Requires the App to hold `statuses: write` on the target repos.
   prReviewGateStatusContext: ""
+  # -- Commit-status context to FAIL when Ally's most recent consolidated-review
+  # COMMENT (not a formal pull_request_review — BLO-21907) posted since the PR's
+  # last push carries an unresolved Critical/Important finding. Ally cannot file
+  # a formal review on a self-authored PR, so without this a comment-shaped
+  # "before merge" finding has zero effect on reviewDecision / mergeStateStatus.
+  # Empty (default) -> the server posts no status. Setting this alone does not
+  # enforce anything: the named context must also be marked a required status
+  # check in branch protection (agent tokens get 403 reading protection, so
+  # that half is a human/org-admin step — see BLO-21907's manual checklist).
+  prCommentReviewGateStatusContext: ""
 
 # -- Pod spec knobs.
 pod:

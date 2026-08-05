@@ -52,6 +52,11 @@ import {
   githubListIssueCommentBodies,
   githubPostIssueComment,
 } from "../services/github-app-auth.js";
+import {
+  hasActionablePrReviewFeedback,
+  hasAllyConsolidatedReviewHeading,
+} from "../services/ally-review-detection.js";
+import { runPrCommentReviewGateCheck } from "../services/pr-comment-review-gate.js";
 import { recoveryService } from "../services/recovery/service.js";
 import { recordGithubReviewRequestDelivery } from "../services/metrics.js";
 import {
@@ -232,12 +237,10 @@ function hasAllyConsolidatedReviewHeader(body: string | null | undefined): boole
 // Ally's output, and no longer suppresses a real request. The heading/bold
 // prefix is optional so a format change on Ally's side does not silently lapse
 // the guard; only a mid-line prose reference is let through.
-const ALLY_CONSOLIDATED_REVIEW_HEADING_PATTERN =
-  /^[ \t]{0,3}(?:#{1,6}[ \t]+|\*\*[ \t]*)?Ally[ \t]*(?:—|–|-|:)[ \t]*Consolidated[ \t]+PR[ \t]+Review\b/im;
-
-function hasAllyConsolidatedReviewHeading(body: string | null | undefined): boolean {
-  return typeof body === "string" && ALLY_CONSOLIDATED_REVIEW_HEADING_PATTERN.test(body);
-}
+//
+// hasAllyConsolidatedReviewHeading itself now lives in
+// ally-review-detection.ts, shared with the comment-review gate service
+// (BLO-21907) so neither copy of the pattern can drift from the other.
 
 // Explicit "a Paperclip agent is asking for review" marker (BLO-18865).
 //
@@ -286,83 +289,10 @@ function hasPrReviewerAgentRequestMarker(body: string | null | undefined): boole
   return typeof body === "string" && PR_REVIEWER_AGENT_REQUEST_MARKER_PATTERN.test(body);
 }
 
-// Negation cues that flip an otherwise-actionable bare phrase into a confirmation
-// that nothing is required — e.g. Ally's COMMENTED, zero-finding review 4682219268
-// on TC PR #1115 said "Clean. No changes requested from this lens", which the bare
-// `changes\s+requested` phrase match flagged as actionable and bounced a fully
-// approved PR back to the implementer (BLO-15942). Scanned in the text immediately
-// preceding a match, bounded to NEGATION_LOOKBACK_WORDS words and stopping at
-// sentence punctuation, so a genuine, later occurrence of the phrase elsewhere in
-// the body still counts, and an unrelated earlier negation in the same long
-// sentence (e.g. "The docs aren't complete, changes requested for section 3.")
-// doesn't suppress it.
-const NEGATION_CUE_REGEX =
-  /\b(?:no|not|zero|none|never|without|isn't|aren't|doesn't|didn't|won't|cannot)\b/i;
-const NEGATION_LOOKBACK_WORDS = 8;
-
-// An uncounted "Critical Issues" / "Important Issues" findings section, matched
-// only where it starts a line — optionally behind markdown heading (`###`),
-// blockquote, bullet/ordered-list, or emphasis (`**`) decoration. See the call
-// site in hasActionablePrReviewFeedback for why the anchor is load-bearing.
-const UNCOUNTED_FINDINGS_HEADING_REGEX =
-  /^[ \t]*(?:[#>]+[ \t]*)?(?:(?:[-*+]|\d+[.)])[ \t]+)?[*_]*(?:Critical|Important)[ \t]+Issues\b(?![*_]*[ \t]*\()/im;
-
-// Returns true if `pattern` matches `text` at least once outside a negated context
-// (see NEGATION_CUE_REGEX). Used for bare-phrase heuristics ("changes requested")
-// that read very differently as "no changes requested" vs "please make the changes
-// requested".
-function hasNonNegatedMatch(text: string, pattern: RegExp): boolean {
-  const flags = pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`;
-  const regex = new RegExp(pattern.source, flags);
-  let match: RegExpExecArray | null;
-  while ((match = regex.exec(text)) !== null) {
-    const preceding = text.slice(0, match.index);
-    const sentenceStart = Math.max(preceding.lastIndexOf("."), preceding.lastIndexOf("\n")) + 1;
-    const sentenceLocal = preceding.slice(sentenceStart);
-    const lookback = sentenceLocal.trim().split(/\s+/).slice(-NEGATION_LOOKBACK_WORDS).join(" ");
-    if (!NEGATION_CUE_REGEX.test(lookback)) return true;
-    if (regex.lastIndex === match.index) regex.lastIndex += 1;
-  }
-  return false;
-}
-
-function hasActionablePrReviewFeedback(body: string | null | undefined, state?: string | null): boolean {
-  const normalizedState = state?.trim().toLowerCase();
-  if (normalizedState === "changes_requested" || normalizedState === "changes-requested") return true;
-  if (typeof body !== "string") return false;
-  const text = body.trim();
-  if (!text) return false;
-
-  // Ally's consolidated review buckets blocking findings under a severity
-  // heading with a count, e.g. "### Critical Issues (1)" or "### Important
-  // Issues (2)". Any bucket with a non-zero count is actionable. `matchAll`
-  // (not `match`) so a zero-count bucket ("Critical Issues (0)") appearing
-  // before a non-zero one doesn't mask it. NOTE: keep this list in sync with
-  // the reviewer's severity taxonomy — a review that flags "Critical Issues"
-  // must not slip through as non-actionable (the BLO-12541/#973 stall).
-  for (const bucket of text.matchAll(/\b(?:Critical|Important)\s+Issues\b[*_]*\s*\((\d+)\)/gi)) {
-    if (Number(bucket[1]) > 0) return true;
-  }
-  // Same headings without an explicit count still signal findings. Match the
-  // uncounted heading itself so any zero-count bucket, even for the same label,
-  // cannot mask a later uncounted findings section.
-  //
-  // Anchored to the start of a line (allowing markdown heading/list/emphasis
-  // decoration) because an unanchored match also fires on ordinary prose that
-  // says the opposite: Ally's APPROVED review on Network-Operator-Portal#591
-  // read "Looks good. No Critical or Important issues found.", whose trailing
-  // "Important issues" matched here and bounced a clean, approved PR back to
-  // its author (BLO-19067). A real findings section is always its own heading
-  // or list item, never mid-sentence.
-  if (UNCOUNTED_FINDINGS_HEADING_REGEX.test(text)) return true;
-  if (/^[ \t]*decision[ \t]*:[ \t]*changes_requested[ \t]*$/im.test(text)) return true;
-  if (hasNonNegatedMatch(text, /\bchanges\s+requested\b/i)) return true;
-  if (hasNonNegatedMatch(text, /\brequest(?:ed|s)?\s+changes\b/i)) return true;
-  // Match "before merge" and its inflections ("before merging/merged/merges").
-  // The bare `\bmerge\b` form silently missed "before merging" (#973).
-  if (/\bRecommended\s+Action\b[\s\S]{0,400}\bfix\b[\s\S]{0,400}\bbefore\s+merg(?:e|es|ed|ing)\b/i.test(text)) return true;
-  return false;
-}
+// Negation cues, findings-heading detection, and hasActionablePrReviewFeedback
+// itself now live in ally-review-detection.ts, shared with the comment-review
+// gate service (BLO-21907) so neither copy of these regexes can drift from
+// the other.
 
 function isActionablePrReviewComment(
   body: string | null | undefined,
@@ -1922,6 +1852,73 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
         );
       },
     });
+
+    // BLO-21907 comment-review gate: read the raw payload directly rather
+    // than `context`, so this runs independent of the Paperclip-identifier
+    // match and the actionable-feedback gating `resolveEventContext` applies
+    // for its own (unrelated) wake decision above. Two triggers:
+    //  - issue_comment: an Ally-consolidated-review-shaped comment, blocking
+    //    OR clean — a clean one clears a previously-posted failing status at
+    //    the same head.
+    //  - pull_request opened/synchronize/reopened: a fresh head appears with
+    //    no status of its own yet. Posting eagerly here is what stops a
+    //    configured-but-never-posted required context from reading as
+    //    "Expected — waiting for status" forever (the same failure mode
+    //    resolvePrReviewGateStatusTarget's docstring describes for BLO-17456).
+    // Always best-effort: never allowed to affect the wake/response path.
+    void (async () => {
+      try {
+        const repoFullNameForGate =
+          ((payload.repository as Record<string, unknown> | undefined)?.full_name as string | undefined) ?? null;
+        if (!repoFullNameForGate) return;
+
+        if (eventName === "issue_comment" && payload.action === "created") {
+          const issue = payload.issue as Record<string, unknown> | undefined;
+          const pullRequestMarker = issue?.pull_request as Record<string, unknown> | undefined;
+          const commentBody = (payload.comment as Record<string, unknown> | undefined)?.body as
+            | string
+            | undefined;
+          const prNumberForGate = (issue?.number as number | undefined) ?? null;
+          if (
+            issue &&
+            pullRequestMarker &&
+            typeof prNumberForGate === "number" &&
+            hasAllyConsolidatedReviewHeading(commentBody)
+          ) {
+            const result = await runPrCommentReviewGateCheck({
+              repoFullName: repoFullNameForGate,
+              prNumber: prNumberForGate,
+              prUrl: githubPrUrl(repoFullNameForGate, prNumberForGate, readStringField(issue, "html_url")),
+            });
+            logger[result.posted ? "info" : "warn"](
+              { deliveryId, repoFullName: repoFullNameForGate, prNumber: prNumberForGate, result },
+              "github webhook comment-review gate check (issue_comment)",
+            );
+          }
+        } else if (eventName === "pull_request") {
+          const action = payload.action as string | undefined;
+          if (action === "opened" || action === "synchronize" || action === "reopened") {
+            const pr = payload.pull_request as Record<string, unknown> | undefined;
+            const prNumberForGate = (pr?.number as number | undefined) ?? null;
+            const headShaForGate = (pr?.head as Record<string, unknown> | undefined)?.sha as string | undefined;
+            if (typeof prNumberForGate === "number" && typeof headShaForGate === "string") {
+              const result = await runPrCommentReviewGateCheck({
+                repoFullName: repoFullNameForGate,
+                prNumber: prNumberForGate,
+                headSha: headShaForGate,
+                prUrl: githubPrUrl(repoFullNameForGate, prNumberForGate, readStringField(pr, "html_url")),
+              });
+              logger[result.posted ? "info" : "warn"](
+                { deliveryId, repoFullName: repoFullNameForGate, prNumber: prNumberForGate, result },
+                "github webhook comment-review gate check (pull_request)",
+              );
+            }
+          }
+        }
+      } catch (err) {
+        logger.warn({ err, deliveryId, event: eventName }, "github webhook comment-review gate check threw (non-fatal)");
+      }
+    })();
 
     // A closed or newly-drafted PR cannot produce useful reviewer work. Retire
     // every queued or scheduled-retry run for its stable task scope so it does

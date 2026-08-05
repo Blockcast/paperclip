@@ -168,6 +168,15 @@ export interface Config {
   // the feature is opt-in per deployment because the context name belongs to
   // whoever owns the branch-protection rule, not to this server.
   prReviewGateStatusContext: string;
+  // Commit-status context to fail when Ally's most recent consolidated-review
+  // COMMENT (not a formal pull_request_review — see BLO-21907) posted since
+  // the PR's last push carries an unresolved Critical/Important finding. Ally
+  // cannot file a formal review on a self-authored PR, so a comment-shaped
+  // "before merge" finding otherwise has zero effect on reviewDecision /
+  // mergeStateStatus. Empty (the default) means the server posts no status —
+  // opt-in per deployment, same rationale as prReviewGateStatusContext: the
+  // context name belongs to whoever owns the branch-protection rule.
+  prCommentReviewGateStatusContext: string;
   telemetryEnabled: boolean;
 }
 
@@ -492,6 +501,9 @@ export function loadConfig(): Config {
     githubAppPrivateKey: (process.env.GITHUB_APP_PRIVATE_KEY ?? "").replace(/\\n/g, "\n"),
     prReviewerBotLogin: process.env.PAPERCLIP_PR_REVIEWER_BOT_LOGIN ?? "allyblockcast[bot]",
     prReviewGateStatusContext: (process.env.PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT ?? "").trim(),
+    prCommentReviewGateStatusContext: (
+      process.env.PAPERCLIP_PR_COMMENT_REVIEW_GATE_STATUS_CONTEXT ?? ""
+    ).trim(),
     telemetryEnabled: fileConfig?.telemetry?.enabled ?? true,
   };
 }

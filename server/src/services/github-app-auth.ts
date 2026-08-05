@@ -441,6 +441,22 @@ export async function githubHasReviewerEvidenceForPr(input: {
  * comment), so page 1 in GitHub's oldest-first order always contains its marker
  * once posted. (BLO-13353)
  */
+/**
+ * The PR's current head SHA. Webhook contexts derived from an `issue_comment`
+ * event carry no head SHA (comments aren't scoped to a commit), so callers
+ * that need one — e.g. the comment-review gate (BLO-21907), which must post
+ * its status against a real commit — resolve it here rather than guessing.
+ */
+export async function githubFetchPrHeadSha(input: {
+  repoFullName: string;
+  prNumber: number;
+}): Promise<string | null> {
+  const token = await getInstallationToken();
+  if (!token) return null;
+  const headers = { ...GITHUB_API_HEADERS, authorization: `Bearer ${token}` };
+  return fetchPrHeadSha(gitHubApiBase(GITHUB_HOST), input.repoFullName, input.prNumber, headers);
+}
+
 export async function githubListIssueCommentBodies(input: {
   repoFullName: string;
   prNumber: number;
@@ -455,6 +471,75 @@ export async function githubListIssueCommentBodies(input: {
     if (!res.ok) return null;
     const batch = (await res.json()) as Array<{ body?: string | null }>;
     return batch.map((c) => c.body ?? "");
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Full issue-comment records (login/body/createdAt), paginated. Unlike
+ * `githubListIssueCommentBodies` (page 1 only, bodies only — sufficient for a
+ * back-link presence check) this feeds the comment-review gate (BLO-21907),
+ * which must rank comments by time against the PR's last push and can't
+ * assume the relevant one is on page 1 of a long-lived PR's thread.
+ */
+export async function githubListIssueCommentsWithTimestamps(input: {
+  repoFullName: string;
+  prNumber: number;
+}): Promise<Array<{ login: string | null; body: string; createdAt: string }> | null> {
+  const token = await getInstallationToken();
+  if (!token) return null;
+  const headers = { ...GITHUB_API_HEADERS, authorization: `Bearer ${token}` };
+  const apiBase = gitHubApiBase(GITHUB_HOST);
+  const results: Array<{ login: string | null; body: string; createdAt: string }> = [];
+  try {
+    for (let page = 1; page <= 10; page += 1) {
+      const url = `${apiBase}/repos/${input.repoFullName}/issues/${input.prNumber}/comments?per_page=100&page=${page}`;
+      const res = await ghFetch(url, { headers });
+      if (!res.ok) return null;
+      const batch = (await res.json()) as Array<{
+        user?: { login?: string | null } | null;
+        body?: string | null;
+        created_at?: string | null;
+      }>;
+      for (const comment of batch) {
+        if (typeof comment.created_at !== "string") continue;
+        results.push({
+          login: comment.user?.login ?? null,
+          body: comment.body ?? "",
+          createdAt: comment.created_at,
+        });
+      }
+      if (batch.length < 100) break;
+    }
+    return results;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The head commit's committer timestamp, used as the PR's "last push" proxy
+ * (GitHub exposes no direct "PR last synchronized at" field). Not exact under
+ * a rebase/amend that preserves an old committer date, but the comment-review
+ * gate only needs an ordering boundary against comment `created_at`, and a
+ * push updates the head SHA whose own commit metadata this reads.
+ */
+export async function githubGetCommitCommittedAt(input: {
+  repoFullName: string;
+  sha: string;
+}): Promise<string | null> {
+  const token = await getInstallationToken();
+  if (!token) return null;
+  const headers = { ...GITHUB_API_HEADERS, authorization: `Bearer ${token}` };
+  const apiBase = gitHubApiBase(GITHUB_HOST);
+  try {
+    const url = `${apiBase}/repos/${input.repoFullName}/commits/${input.sha}`;
+    const res = await ghFetch(url, { headers });
+    if (!res.ok) return null;
+    const body = (await res.json()) as { commit?: { committer?: { date?: string | null } | null } };
+    const date = body.commit?.committer?.date;
+    return typeof date === "string" ? date : null;
   } catch {
     return null;
   }
