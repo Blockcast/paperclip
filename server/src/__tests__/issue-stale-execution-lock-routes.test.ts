@@ -877,4 +877,66 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
       executionRunId: currentRunId,
     });
   });
+
+  // BLO-19848 end-to-end: the assignee must be able to transition an issue whose
+  // executionRunId is pinned by a non-live run, without a board user or a manual
+  // reconciler. This is the BLO-18307 shape — checkout and execution both name
+  // one run parked at `scheduled_retry` — which returned 409 to three close
+  // attempts over ~1d7h while the issue's fix was already merged.
+  it("lets the assignee transition after the sweeper reclaims a scheduled_retry lock (BLO-19848)", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const wedgedRunId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: wedgedRunId,
+      companyId,
+      agentId,
+      status: "scheduled_retry",
+      invocationSource: "automation",
+      startedAt: null,
+      // Retry deadline itself went stale 7h ago, past the 6h pre-claim bound.
+      scheduledRetryAt: new Date(Date.now() - 7 * 60 * 60 * 1000),
+      scheduledRetryAttempt: 1,
+      scheduledRetryReason: "ccrotate_capacity",
+      createdAt: new Date("2026-01-01T00:00:30.000Z"),
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Wedged behind a scheduled retry",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: wedgedRunId,
+      executionRunId: wedgedRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date(Date.now() - 31 * 60 * 60 * 1000),
+    });
+
+    // Before the reconcile window elapses the lock is honoured, which is the
+    // intended behaviour — a parked retry is not reclaimed on sight.
+    const wedged = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "done" });
+    expect(wedged.status).toBe(409);
+    expect(wedged.body?.error ?? wedged.body?.message).toContain("Issue run ownership conflict");
+
+    const { heartbeatService } = await import("../services/heartbeat.ts");
+    const sweep = await heartbeatService(db).sweepStaleIssueLocks();
+    expect(sweep.cleared).toBe(1);
+
+    const recovered = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "done" });
+    expect(recovered.status, JSON.stringify(recovered.body)).toBe(200);
+    expect(recovered.body.status).toBe("done");
+
+    // The wedged run row is left alone — reclaiming the lock must not cancel it.
+    const run = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, wedgedRunId))
+      .then((rows) => rows[0]);
+    expect(run?.status).toBe("scheduled_retry");
+  });
 });

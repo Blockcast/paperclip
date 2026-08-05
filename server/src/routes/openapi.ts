@@ -76,6 +76,7 @@ import {
   resolveApprovalSchema,
   requestApprovalRevisionSchema,
   resubmitApprovalSchema,
+  withdrawApprovalSchema,
   addApprovalCommentSchema,
   // Cost / budget
   createCostEventSchema,
@@ -2920,6 +2921,25 @@ registry.registerPath({
     body: jsonBody(resubmitApprovalSchema),
   },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/approvals/{id}/withdraw",
+  tags: ["approvals"],
+  summary: "Withdraw an approval request (requesting agent or board)",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(withdrawApprovalSchema),
+  },
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+  },
 });
 
 registry.registerPath({

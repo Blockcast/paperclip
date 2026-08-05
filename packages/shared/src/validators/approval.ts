@@ -29,6 +29,17 @@ export const resubmitApprovalSchema = z.object({
 
 export type ResubmitApproval = z.infer<typeof resubmitApprovalSchema>;
 
+/**
+ * Withdrawal is the requester's own exit from the approval queue, so the reason
+ * is required rather than optional: a rescinded request must say why it became
+ * moot, otherwise the audit trail cannot distinguish it from an abandoned one.
+ */
+export const withdrawApprovalSchema = z.object({
+  reason: multilineTextSchema.pipe(z.string().trim().min(1)),
+});
+
+export type WithdrawApproval = z.infer<typeof withdrawApprovalSchema>;
+
 export const addApprovalCommentSchema = z.object({
   body: multilineTextSchema.pipe(z.string().min(1)),
 });

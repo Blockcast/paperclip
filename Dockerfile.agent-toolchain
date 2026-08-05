@@ -175,10 +175,31 @@ RUN curl -fsSL "https://github.com/int128/kubelogin/releases/download/${KUBELOGI
 # Designer + browser automation CLIs (ccrotate-designer-lease)
 # ---------------------------------------------------------------------------
 
+# Pin the purpose-built Chrome for Testing headless shell used for local UI
+# verification. Full Chrome 149 can render DOM in the restricted agent pod but
+# intermittently hangs in its screenshot/compositor path. The headless shell
+# avoids that desktop-only surface without broadening the pod security context.
+ARG CHROME_HEADLESS_SHELL_VERSION=151.0.7922.71
+ARG CHROME_HEADLESS_SHELL_SHA256=7dd9d23b46fa7a9bfa26f1af96f413e0514c32698f6a43a57e1ade48d88a6578
+RUN curl -fsSLo /tmp/chrome-headless-shell.zip \
+    "https://storage.googleapis.com/chrome-for-testing-public/${CHROME_HEADLESS_SHELL_VERSION}/linux64/chrome-headless-shell-linux64.zip" \
+  && printf '%s  %s\n' "${CHROME_HEADLESS_SHELL_SHA256}" /tmp/chrome-headless-shell.zip \
+       | sha256sum -c - \
+  && unzip -q /tmp/chrome-headless-shell.zip -d /opt \
+  && mv /opt/chrome-headless-shell-linux64 /opt/chrome-headless-shell \
+  && ln -s /opt/chrome-headless-shell/chrome-headless-shell /usr/local/bin/chrome-headless-shell \
+  && ln -s /opt/chrome-headless-shell/chrome-headless-shell /usr/local/bin/google-chrome \
+  && rm -f /tmp/chrome-headless-shell.zip \
+  && google-chrome --version | grep -Fq "${CHROME_HEADLESS_SHELL_VERSION}"
+
+COPY scripts/smoke/agent-browser-screenshot.sh /usr/local/bin/paperclip-browser-smoke
+RUN chmod 0755 /usr/local/bin/paperclip-browser-smoke
+ENV CHROME_BIN=/usr/local/bin/google-chrome
+
 # Bake designer + agent-browser globally at pinned versions. Drops the
 # 'npx -y' supply-chain dependency from the designer-loop skill (codex F6).
-# When CCROTATE_DESIGNER_LEASE_HOST is set, agents in this image use the
-# baked CLIs against a remote Chrome via CDP — no Chrome bundling required.
+# When CCROTATE_DESIGNER_LEASE_HOST is set, agents can still use the baked CLIs
+# against remote Chrome via CDP; the local shell is the deterministic fallback.
 ARG DESIGNER_VERSION=0.3.6
 ARG AGENT_BROWSER_VERSION=0.27.0
 RUN npm i -g \
@@ -297,4 +318,5 @@ RUN set -eu; \
     echo "ERROR: local ccrotate CLI leaked into paperclip-agent image at ${ccrotate_path}" >&2; \
     exit 1; \
   fi; \
-  echo "verified: local ccrotate CLI absent"
+  echo "verified: local ccrotate CLI absent"; \
+  paperclip-browser-smoke
