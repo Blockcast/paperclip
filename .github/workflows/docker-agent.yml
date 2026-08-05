@@ -143,7 +143,6 @@ jobs:
             exit 1
           fi
           ffmpeg_image="${ffmpeg_ref%:*}@${ffmpeg_digest}"
-
           # BLO-23128: pim-multicast-gateway's own runtime-stage moq_mmt
           # assertion (FFmpeg/Dockerfile) can report a false "CACHED" pass —
           # every layer up to and including that RUN step replayed from
@@ -184,7 +183,6 @@ jobs:
             fi
             echo "Using pinned fallback ffmpeg-publisher digest ${ffmpeg_fallback_digest}"
           fi
-
           toolchain_tag="$(scripts/container-base-tag.sh agent-toolchain "$runtime_image" "$ffmpeg_image")"
           toolchain_image="harbor.blockcast.net/paperclip-agent/paperclip-agent-toolchain:${toolchain_tag}"
           if docker buildx imagetools inspect "$runtime_image" >/dev/null 2>&1; then
