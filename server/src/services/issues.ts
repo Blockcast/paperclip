@@ -3248,6 +3248,7 @@ const issueListSelect = {
   // ~14% of pg CPU under list load with 66% of issues > 2KB description).
   description: sql<string | null>`substring(${issues.description}, 1, ${ISSUE_LIST_DESCRIPTION_MAX_CHARS})`,
   status: issues.status,
+  checkoutRestoreStatus: issues.checkoutRestoreStatus,
   workMode: issues.workMode,
   harnessKind: issues.harnessKind,
   priority: issues.priority,
