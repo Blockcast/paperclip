@@ -459,6 +459,53 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
   });
 
+  // BLO-19954: paired with the test above. A routine-execution issue whose
+  // only run was cancelled because another open routine-execution issue
+  // already owns the dispatch lock is benign, intentional control flow under
+  // `always_enqueue` + a single-owner dispatcher -- not a strand. It must
+  // reach a terminal `cancelled` status directly, with zero recovery actions
+  // and no owner wake, unlike the `adapter_failed` case above which still
+  // escalates to `blocked` with one recovery action and one wake.
+  it("cancels a duplicate-suppressed routine-execution run instead of creating a recovery action", async () => {
+    const { sourceIssue } = await seedCompany();
+    const enqueueWakeup = vi.fn<
+      (agentId: string, opts?: { payload?: unknown }) => Promise<{ id: string }>
+    >(async () => ({ id: randomUUID() }));
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const latestRun = {
+      id: randomUUID(),
+      agentId: sourceIssue.assigneeAgentId,
+      status: "cancelled",
+      error:
+        "Cancelled because another open routine execution issue already owns this dispatch lock; " +
+        "the owner run will continue the work",
+      errorCode: "routine_execution_duplicate_suppressed",
+      contextSnapshot: { retryReason: "issue_continuation_needed" },
+      livenessState: null,
+      resultJson: null,
+      usageJson: null,
+      createdAt: new Date(),
+    } as const;
+
+    const updated = await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun,
+      comment: "Automatic continuation recovery failed.",
+    });
+    expect(updated).toMatchObject({ status: "cancelled" });
+
+    const actionRows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+    expect(actionRows).toHaveLength(0);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+
+    const [finalIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
+    expect(finalIssue).toMatchObject({ status: "cancelled", assigneeAgentId: sourceIssue.assigneeAgentId });
+  });
+
   it.each([
     ["process_lost", undefined, "coder"],
     ["adapter_failed", "successful_run_missing_state", "coder"],
