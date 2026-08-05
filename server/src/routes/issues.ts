@@ -2393,6 +2393,20 @@ export function __clearIssueListResponseCacheForTests() {
   issueListResponseCache.clear();
 }
 
+let issueListResponseCacheMaxEntriesOverrideForTests: number | null = null;
+
+export function __setIssueListResponseCacheMaxEntriesForTests(maxEntries: number) {
+  issueListResponseCacheMaxEntriesOverrideForTests = maxEntries;
+}
+
+export function __resetIssueListResponseCacheMaxEntriesForTests() {
+  issueListResponseCacheMaxEntriesOverrideForTests = null;
+}
+
+function effectiveIssueListResponseCacheMaxEntries() {
+  return issueListResponseCacheMaxEntriesOverrideForTests ?? ISSUE_LIST_SERVER_CACHE_MAX_ENTRIES;
+}
+
 function shortHash(value: string): string {
   return createHash("sha256").update(value).digest("base64url").slice(0, 16);
 }
@@ -2519,7 +2533,8 @@ function touchIssueListResponseCacheEntry(key: string, entry: IssueListCacheEntr
 }
 
 function trimIssueListResponseCache() {
-  while (issueListResponseCache.size > ISSUE_LIST_SERVER_CACHE_MAX_ENTRIES) {
+  const maxEntries = effectiveIssueListResponseCacheMaxEntries();
+  while (issueListResponseCache.size > maxEntries) {
     const oldestKey = issueListResponseCache.keys().next().value as string | undefined;
     if (oldestKey === undefined) return;
     issueListResponseCache.delete(oldestKey);
