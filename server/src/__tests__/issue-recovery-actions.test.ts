@@ -526,7 +526,11 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       companyId,
       kind: "stranded_assigned_issue",
       status: "active",
-      previousOwnerAgentId: managerId,
+      // BLO-20263: the CODER, not the manager — see the longer note on the
+      // latest-run-IDs test above. Both sweeps replay the coder's own failed run, so
+      // the second sweep is recovery observing its own reassignment and must leave the
+      // grant subject alone. `managerId` here asserted the pre-fix behaviour.
+      previousOwnerAgentId: coderId,
       returnOwnerAgentId: managerId,
       cause: "stranded_assigned_issue",
       attemptCount: 2,
@@ -1232,7 +1236,15 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       companyId,
       kind: "stranded_assigned_issue",
       status: "active",
-      previousOwnerAgentId: managerId,
+      // BLO-20263: the CODER, not the manager. Both sweeps replay a failure of the
+      // coder's own run (`agentId: coderId` on both), and the second sweep only sees
+      // recovery's own reassignment of the issue to the manager. The manager never ran
+      // and never failed, so it is not a handoff subject and must not displace the
+      // coder — the agent that actually lost `allow_self`. This expectation previously
+      // read `managerId`, which encoded the sliding-anchor bug fixed on this branch.
+      // Note the run IDs differ across the two sweeps here: the discriminator is whose
+      // run failed, not which run, so a new run ID alone must not refresh the subject.
+      previousOwnerAgentId: coderId,
       returnOwnerAgentId: managerId,
       cause: "stranded_assigned_issue",
       attemptCount: 2,
@@ -1588,6 +1600,129 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .from(issues)
       .where(eq(issues.id, sourceIssueId));
     expect(sourceIssue?.assigneeAgentId).toBe(ctoId);
+  });
+
+  it("refreshes the handoff grant onto a recovery owner that fails on its own run", async () => {
+    // The companion to the churn test above, and the case owner identity alone cannot
+    // see. Both sweeps here pass `previousOwnerAgentId === existing.ownerAgentId`; the
+    // churn test's second sweep replays ENG's failure, this one has EM genuinely fail
+    // on its own run after taking over. Suppressing the refresh here would leave ENG as
+    // the grant subject on ENG's stale anchor while EM — the agent that just lost
+    // `allow_self` holding the freshest diagnosis — is routed away with no comment
+    // channel at all, which is the exact deprivation #827 exists to prevent.
+    const companyId = randomUUID();
+    const ceoId = randomUUID();
+    const ctoId = randomUUID();
+    const emId = randomUUID();
+    const engId = randomUUID();
+    const sourceIssueId = randomUUID();
+    const prefix = `HT${companyId.replaceAll("-", "").slice(0, 6).toUpperCase()}`;
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Handoff Takeover Co",
+      issuePrefix: prefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+    const agentBase = {
+      companyId,
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    } as const;
+    await db.insert(agents).values([
+      { ...agentBase, id: ceoId, name: "CEO", role: "ceo" },
+      { ...agentBase, id: ctoId, name: "CTO", role: "cto", reportsTo: ceoId },
+      { ...agentBase, id: emId, name: "EM", role: "engineer", reportsTo: ctoId },
+      { ...agentBase, id: engId, name: "Eng", role: "engineer", reportsTo: emId },
+    ]);
+    await db.insert(issues).values({
+      id: sourceIssueId,
+      companyId,
+      title: "Recovery owner failing on its own run earns the handoff grant",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: engId,
+      issueNumber: 1,
+      identifier: `${prefix}-1`,
+    });
+
+    const enqueueWakeup = vi.fn<
+      (agentId: string, opts?: { payload?: unknown }) => Promise<{ id: string }>
+    >(async () => ({ id: randomUUID() }));
+    const recovery = recoveryService(db, { enqueueWakeup });
+    // `runAgentId` is the whole point of this test: it is the only input that differs
+    // between replay churn and a newly failed recovery owner.
+    const sweep = async (runAgentId: string) => {
+      const [fresh] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      await recovery.escalateStrandedAssignedIssue({
+        issue: fresh!,
+        previousStatus: "in_progress",
+        latestRun: {
+          id: randomUUID(),
+          agentId: runAgentId,
+          status: "failed",
+          error: "adapter failed",
+          errorCode: "adapter_failed",
+          contextSnapshot: { retryReason: "issue_continuation_needed" },
+          livenessState: "needs_followup",
+          resultJson: null,
+          usageJson: null,
+          createdAt: new Date(),
+        },
+        comment: "Automatic continuation recovery failed.",
+      });
+    };
+    const handoffAnchor = (evidence: unknown) => {
+      expect(evidence && typeof evidence === "object" && !Array.isArray(evidence)).toBe(true);
+      return (evidence as Record<string, unknown>).recoveryHandoffGrantAnchorAt;
+    };
+    const readAction = async () => {
+      const [row] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, sourceIssueId));
+      return row!;
+    };
+
+    const firstSweepAt = new Date("2026-08-02T01:00:00.000Z");
+    const secondSweepAt = new Date("2026-08-02T05:00:00.000Z");
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      // A (ENG) fails; recovery hands the issue to B (EM) and reassigns it to B.
+      vi.setSystemTime(firstSweepAt);
+      await sweep(engId);
+      const firstAction = await readAction();
+      expect(firstAction).toMatchObject({
+        previousOwnerAgentId: engId,
+        ownerAgentId: emId,
+      });
+      expect(handoffAnchor(firstAction.evidence)).toBe(firstSweepAt.toISOString());
+      const [afterFirst] = await db
+        .select({ assigneeAgentId: issues.assigneeAgentId })
+        .from(issues)
+        .where(eq(issues.id, sourceIssueId));
+      expect(afterFirst?.assigneeAgentId).toBe(emId);
+
+      // B now fails on ITS OWN distinct run. The sweep still passes
+      // `previousOwnerAgentId = EM` (the current assignee) and `existing.ownerAgentId`
+      // is still EM — byte-identical to the churn case on owner identity alone.
+      vi.setSystemTime(secondSweepAt);
+      await sweep(emId);
+      const secondAction = await readAction();
+      expect(secondAction.evidence).toMatchObject({ latestRunAgentId: emId });
+      // B becomes the grant subject, on a fresh anchor, while ownership routes to C.
+      expect(secondAction).toMatchObject({
+        previousOwnerAgentId: emId,
+        ownerAgentId: ctoId,
+      });
+      expect(handoffAnchor(secondAction.evidence)).toBe(secondSweepAt.toISOString());
+    } finally {
+      vi.useRealTimers();
+    }
+
+    expect(enqueueWakeup.mock.calls.map((call) => call[0])).toEqual([emId, ctoId]);
   });
 
   it("bounds the wakes even when recovery ownership ping-pongs and never spends one owner's budget", async () => {
