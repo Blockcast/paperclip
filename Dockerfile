@@ -348,7 +348,10 @@ ARG CLAUDE_K8S_REF=3ad33702052f357ec2b31b7d3051e89ed1ed4875
 # canaries clean stale persistent guard artifacts, safe-helper allowlist no
 # longer masks helper+dump command chains, and unquoted sh/bash -c dumps are
 # blocked. Adapter suite 603 green + typecheck clean.
-ARG OPENCODE_K8S_REF=9ff4c4c666f2e35a77f5049e81ddfbafe8b62d5e
+# Bumped 2026-08-05 to 83197d4: parse the shell -c command-string before
+# positional arguments, closing sh -c env ignored / bash -c "env" ignored
+# wrapper bypasses. Focused env-guard suite 90/90, typecheck, and build pass.
+ARG OPENCODE_K8S_REF=83197d46b0784c941801165464d48aca1b979909
 
 # Pack paperclip's in-tree adapter-utils so the bundled adapters consume
 # the workspace version (may include exports newer than the latest
