@@ -306,7 +306,7 @@ import {
   recoveryAssigneeAdapterOverrides,
   withRecoveryModelProfileHint,
 } from "./recovery/model-profile-hint.js";
-import { recoveryService } from "./recovery/service.js";
+import { recoveryService, STALE_PRE_CLAIM_ISSUE_LOCK_MS } from "./recovery/service.js";
 import { productivityReviewService } from "./productivity-review.js";
 import { resolveRequiredSuccessfulRunHandoffOnValidPath } from "./successful-run-handoff-state.js";
 import { taskWatchdogService } from "./task-watchdogs.js";
@@ -17838,6 +17838,174 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return recovery.reconcileStrandedAssignedIssues({ issueCreatedAtGte: await getWorktreeExecutionCutoff() });
   }
 
+  // BLO-21621: a queued run can outlive the issue lock that named it. The
+  // lazy-locking model only stamps `issues.executionRunId` at CLAIM time
+  // (see claimQueuedRun's "Fix A" comment), so a still-`queued` run is
+  // normally unlocked — that alone is not a defect. The defect is a run that
+  // is *both* stale (queued well past any normal dispatch cadence) *and*
+  // detached (its own issue's checkout/execution lock no longer names it,
+  // whether because sweepStaleIssueLocks released a stale pre-claim lock or
+  // the pointer simply never got (re)stamped after the run's predecessor
+  // died). Once detached, nothing in the recovery apparatus ever looks at
+  // this specific row again: hasActiveExecutionPath and every sweep built on
+  // it treat *any* queued row referencing the issue as proof of life, with
+  // no staleness check, so the row is invisible to reconciliation while
+  // still occupying a live queue slot forever.
+  //
+  // Deliberately keyed on detachment, not age alone (BLO-21621 CEO review):
+  // an agent legitimately saturated at its concurrency ceiling can hold
+  // real queued work for hours while cycling slots, and that run's lock
+  // still names it the whole time — untouched here. Only a row whose lock
+  // pointer has moved on or gone empty is a candidate, so real backlog is
+  // never discarded for being merely old.
+  async function reconcileDetachedQueuedRuns(opts?: {
+    now?: Date;
+    companyId?: string;
+    limit?: number;
+    staleAfterMs?: number;
+  }) {
+    const now = opts?.now ?? new Date();
+    const limit = opts?.limit ?? 100;
+    // Reuses sweepStaleIssueLocks' own bound for "how long can a queued run
+    // hold its pre-claim lock" so the two sweeps agree on when a queued run
+    // stops being trustworthy evidence of life: a run cannot be genuinely
+    // detached before that sweep would have had a chance to release it.
+    const staleAfterMs = opts?.staleAfterMs ?? STALE_PRE_CLAIM_ISSUE_LOCK_MS;
+    const staleCutoff = new Date(now.getTime() - staleAfterMs);
+
+    const result = { scanned: 0, terminalized: 0, recovered: 0, skipped: 0, failed: 0 };
+
+    const candidates = await db
+      .select({
+        id: heartbeatRuns.id,
+        companyId: heartbeatRuns.companyId,
+        agentId: heartbeatRuns.agentId,
+        createdAt: heartbeatRuns.createdAt,
+        contextSnapshot: heartbeatRuns.contextSnapshot,
+        wakeupRequestId: heartbeatRuns.wakeupRequestId,
+        resultJson: heartbeatRuns.resultJson,
+      })
+      .from(heartbeatRuns)
+      .where(and(
+        sql`${heartbeatRuns.status} = 'queued'`,
+        lte(heartbeatRuns.createdAt, staleCutoff),
+        opts?.companyId ? eq(heartbeatRuns.companyId, opts.companyId) : undefined,
+      ))
+      .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
+      .limit(limit);
+    result.scanned = candidates.length;
+
+    for (const run of candidates) {
+      try {
+        const context = parseObject(run.contextSnapshot);
+        const issueId = readNonEmptyString(context.issueId);
+        if (!issueId || !UUID_PATTERN.test(issueId)) {
+          result.skipped += 1;
+          continue;
+        }
+
+        const issue = await db
+          .select({
+            id: issues.id,
+            companyId: issues.companyId,
+            status: issues.status,
+            assigneeAgentId: issues.assigneeAgentId,
+            executionRunId: issues.executionRunId,
+            checkoutRunId: issues.checkoutRunId,
+          })
+          .from(issues)
+          .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
+          .then((rows) => rows[0] ?? null);
+
+        // A missing or terminal issue is already handled by the dispatch-time
+        // terminal-issue prune (pruneStaleQueuedMaintenanceRunsForAgent /
+        // evaluateQueuedRunStaleness); nothing new to do here.
+        if (!issue || TERMINAL_ISSUE_STATUSES.has(issue.status)) {
+          result.skipped += 1;
+          continue;
+        }
+
+        // Still the recognized lock holder: this run is legitimately queued,
+        // not detached. Leave it — it may simply be waiting behind a full
+        // slot pool, which is expected and must not be terminalized.
+        const isDetached = issue.executionRunId !== run.id && issue.checkoutRunId !== run.id;
+        if (!isDetached) {
+          result.skipped += 1;
+          continue;
+        }
+
+        const staleForMs = now.getTime() - run.createdAt.getTime();
+        const cancelReason =
+          "Cancelled because this queued run detached from its source issue's execution lock and was never claimed";
+        const outcome = await setRunStatusIfQueued(run.id, "cancelled", {
+          finishedAt: now,
+          error: cancelReason,
+          errorCode: "queued_run_detached_from_issue",
+          resultJson: {
+            ...parseObject(run.resultJson),
+            stopReason: "queued_run_detached_from_issue",
+          },
+        });
+        if (!outcome.updated) {
+          // Lost the race (claimed, or reconciled by a concurrent pass) — the
+          // row is no longer detached-and-queued either way.
+          result.skipped += 1;
+          continue;
+        }
+        const cancelled = outcome.run;
+        result.terminalized += 1;
+
+        await setWakeupStatus(run.wakeupRequestId, "skipped", {
+          finishedAt: now,
+          error: cancelReason,
+        });
+
+        await appendRunEvent(cancelled, await nextRunEventSeq(cancelled.id), {
+          eventType: "lifecycle",
+          stream: "system",
+          level: "warn",
+          message: "Cancelled a detached queued run found by the BLO-21621 reconciliation sweep",
+          payload: { issueId, staleForMs },
+        });
+
+        // Only re-wake when nothing else currently claims the issue's lock.
+        // If some other run already owns it (live or itself stale), that
+        // pointer is this sweep's problem to leave alone — sweepStaleIssueLocks
+        // and reconcileStrandedAssignedIssues already own resolving it, and
+        // waking here on top would risk a second execution for one issue.
+        const agentId = issue.assigneeAgentId ?? run.agentId;
+        if (!issue.executionRunId && !issue.checkoutRunId && agentId) {
+          const recoveryRun = await enqueueWakeup(agentId, {
+            source: "automation",
+            triggerDetail: "system",
+            reason: "queued_run_detachment_recovery",
+            payload: { issueId, retryOfRunId: run.id },
+            contextSnapshot: {
+              issueId,
+              taskId: issueId,
+              wakeReason: "queued_run_detachment_recovery",
+              retryReason: "queued_run_detachment_recovery",
+              retryOfRunId: run.id,
+              source: "heartbeat.reconcile_detached_queued_runs",
+            },
+            idempotencyKey: `detached_queued_run_recovery:${run.id}`,
+          });
+          if (recoveryRun) result.recovered += 1;
+        }
+
+        logger.warn(
+          { runId: run.id, issueId, agentId, staleForMs },
+          "reconcileDetachedQueuedRuns: cancelled a detached queued run",
+        );
+      } catch (err) {
+        result.failed += 1;
+        logger.warn({ err, runId: run.id }, "reconcileDetachedQueuedRuns: failed to reconcile candidate");
+      }
+    }
+
+    return result;
+  }
+
   async function sweepStaleIssueLocks() {
     return recovery.sweepStaleIssueLocks();
   }
@@ -27289,6 +27457,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     reconcileStrandedAssignedIssues,
 
     sweepStaleIssueLocks,
+
+    reconcileDetachedQueuedRuns,
 
     buildIssueGraphLivenessAutoRecoveryPreview,
 
