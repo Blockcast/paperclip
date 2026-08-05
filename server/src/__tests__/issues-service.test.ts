@@ -3140,6 +3140,96 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     const after = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
     expect(after.title).toBe("Human changed ownership context");
   });
+
+  // BLO-18829 regression, positive direction.
+  //
+  // The rejection test above is not sufficient on its own, for two independent reasons:
+  // it seeds an explicitly millisecond-aligned `updatedAt` ("...T12:00:00.000Z"), so the
+  // round-trip through a JS `Date` is lossless and the microsecond truncation never
+  // shows up; and it asserts only that a *stale* write is refused. A compare-and-swap
+  // that refuses EVERY write satisfies that assertion exactly as well as a correct one.
+  // A CAS therefore needs a positive test: assert the guarded write LANDS when nothing
+  // intervened, on a row whose updated_at came from `defaultNow()` and so still carries
+  // sub-millisecond digits. Without this, a permanently-closed guard ships green — which
+  // is precisely what happened, silently disabling stranded escalation fleet-wide.
+  //
+  // Covers both accepted `expectedUpdatedAt` shapes:
+  //   - the raw `updated_at::text` token, which is exact and is what
+  //     `escalateStrandedAssignedIssue` actually passes;
+  //   - a JS `Date`, which is millisecond-granular and was the unsatisfiable branch.
+  it("update() with an expectedUpdatedAt ::text token applies when nothing intervened", async () => {
+    const companyId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    // No explicit updatedAt: let defaultNow() supply a microsecond-precision value.
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Fresh snapshot",
+      status: "in_progress",
+      priority: "medium",
+    });
+
+    const [observed] = await db
+      .select({ token: sql<string>`${issues.updatedAt}::text` })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    // Guard the guard: if the seeded value ever stops carrying sub-millisecond digits,
+    // this test has quietly stopped exercising the precision asymmetry it exists to pin.
+    expect(/\.\d{4,6}/.test(observed!.token)).toBe(true);
+
+    const result = await svc.update(
+      issueId,
+      { status: "blocked" },
+      db,
+      { expectedStatus: ["in_progress"], expectedUpdatedAt: observed!.token },
+    );
+
+    expect(result).not.toBeNull();
+    expect(result?.status).toBe("blocked");
+  });
+
+  it("update() with an expectedUpdatedAt Date applies when nothing intervened", async () => {
+    const companyId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Fresh snapshot via Date",
+      status: "in_progress",
+      priority: "medium",
+    });
+
+    const [raw] = await db
+      .select({ token: sql<string>`${issues.updatedAt}::text` })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    expect(/\.\d{4,6}/.test(raw!.token)).toBe(true);
+
+    // Read it back the way an ordinary drizzle caller would: as a truncated JS Date.
+    const observed = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+
+    const result = await svc.update(
+      issueId,
+      { status: "blocked" },
+      db,
+      { expectedStatus: ["in_progress"], expectedUpdatedAt: observed.updatedAt },
+    );
+
+    expect(result).not.toBeNull();
+    expect(result?.status).toBe("blocked");
+  });
 });
 
 describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
