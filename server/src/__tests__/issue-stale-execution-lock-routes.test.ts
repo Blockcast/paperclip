@@ -1831,4 +1831,96 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
       .then((rows) => rows[0]);
     expect(row).toEqual({ status: "in_review", executionPolicy: revisedPolicy });
   });
+
+  it.each(["review_request", "decision"] as const)(
+    "rejects the stale writer when %s commits first from a shared snapshot",
+    async (firstWriter) => {
+      const { companyId, agentId } = await seedCompanyAgentAndRuns();
+      const issueId = randomUUID();
+      const stageId = randomUUID();
+      const executionPolicy = {
+        mode: "normal",
+        commentRequired: true,
+        stages: [{
+          id: stageId,
+          type: "review",
+          approvalsNeeded: 1,
+          participants: [{ type: "agent", agentId }],
+        }],
+      };
+      const executionState = {
+        status: "pending",
+        currentStageId: stageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId },
+        returnAssignee: { type: "agent", agentId },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+        reviewRequest: null,
+      };
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: `Review request and decision race: ${firstWriter}`,
+        status: "in_review",
+        priority: "high",
+        assigneeAgentId: agentId,
+        executionPolicy,
+        executionState,
+      });
+
+      const persistedSnapshot = await db
+        .select({
+          executionState: issues.executionState,
+          executionPolicy: issues.executionPolicy,
+        })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0] as {
+          executionState: typeof executionState;
+          executionPolicy: typeof executionPolicy;
+        });
+      const reviewRequestState = {
+        ...persistedSnapshot.executionState,
+        reviewRequest: { instructions: "Review the concurrent update." },
+      };
+      const decisionState = {
+        ...persistedSnapshot.executionState,
+        status: "completed",
+        currentStageId: null,
+        currentStageIndex: null,
+        currentStageType: null,
+        currentParticipant: null,
+        returnAssignee: null,
+        completedStageIds: [stageId],
+        lastDecisionId: randomUUID(),
+        lastDecisionOutcome: "approved",
+        reviewRequest: null,
+      };
+
+      const svc = issueService(db);
+      const firstState = firstWriter === "review_request" ? reviewRequestState : decisionState;
+      const secondState = firstWriter === "review_request" ? decisionState : reviewRequestState;
+      await svc.update(issueId, {
+        executionState: firstState,
+        expectedCurrentExecutionState: persistedSnapshot.executionState,
+        expectedCurrentExecutionPolicy: persistedSnapshot.executionPolicy,
+      });
+      await expect(svc.update(issueId, {
+        executionState: secondState,
+        expectedCurrentExecutionState: persistedSnapshot.executionState,
+        expectedCurrentExecutionPolicy: persistedSnapshot.executionPolicy,
+      })).rejects.toMatchObject({ status: 409 });
+
+      const row = await db
+        .select({ executionState: issues.executionState })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]);
+      expect(row?.executionState).toEqual(firstState);
+    },
+  );
+
 });
