@@ -114,6 +114,14 @@ describeEmbeddedPostgres("productivity review service", () => {
     parentId?: string | null;
     originKind?: string;
     executionPolicy?: Record<string, unknown> | null;
+    // BLO-22016: active duration is now derived from a run's own `startedAt`,
+    // not from issue checkout time. By default, seeding an explicit
+    // `startedAt` also seeds a matching "running" heartbeat run that
+    // actually started then, so existing long-active/monitor/approval-gate
+    // fixtures keep representing a genuinely executing episode. Pass
+    // `activeRun: false` to opt out (e.g. to simulate a checked-out issue
+    // whose run never executed, or a 100%-routine-origin sampling window).
+    activeRun?: boolean;
   }) {
     const companyId = randomUUID();
     const ownerUserId = randomUUID();
@@ -122,6 +130,16 @@ describeEmbeddedPostgres("productivity review service", () => {
     const issueId = randomUUID();
     const issuePrefix = `PR${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
     const createdAt = new Date("2026-04-28T10:00:00.000Z");
+    const status = opts?.status ?? "in_progress";
+    const startedAt = opts?.startedAt ?? createdAt;
+    // BLO-22016: default to seeding a matching run whenever a fixture
+    // explicitly backdates `startedAt` to simulate an aged episode — that's
+    // what nearly every caller in this file wants (a genuinely executing
+    // episode for long-active/monitor/approval-gate suppression tests), not
+    // a checked-out issue whose run never ran. Pass `activeRun: false`
+    // explicitly to opt out (e.g. to simulate the queued-never-executed
+    // case this bug fix targets, or a 100%-routine-origin sampling window).
+    const shouldSeedActiveRun = opts?.activeRun ?? Boolean(opts?.startedAt);
 
     await db.insert(companies).values({
       id: companyId,
@@ -165,14 +183,14 @@ describeEmbeddedPostgres("productivity review service", () => {
       id: issueId,
       companyId,
       title: "Implement data import",
-      status: opts?.status ?? "in_progress",
+      status,
       priority: "medium",
       assigneeAgentId: coderId,
       parentId: opts?.parentId ?? null,
       originKind: opts?.originKind ?? "manual",
       issueNumber: 1,
       identifier: `${issuePrefix}-1`,
-      startedAt: opts?.startedAt ?? createdAt,
+      startedAt,
       monitorNextCheckAt: opts?.monitorNextCheckAt ?? null,
       monitorScheduledBy: opts?.monitorScheduledBy ?? null,
       monitorLastTriggeredAt: opts?.monitorLastTriggeredAt ?? null,
@@ -181,6 +199,21 @@ describeEmbeddedPostgres("productivity review service", () => {
       createdAt,
       updatedAt: createdAt,
     });
+
+    if (status === "in_progress" && shouldSeedActiveRun) {
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId,
+        agentId: coderId,
+        status: "running",
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        startedAt,
+        contextSnapshot: { issueId, taskId: issueId },
+        createdAt: startedAt,
+        updatedAt: startedAt,
+      });
+    }
 
     return { companyId, ownerUserId, managerId, coderId, issueId, issuePrefix, createdAt };
   }
@@ -936,6 +969,93 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(hold.held).toBe(false);
   });
 
+  // BLO-22016: `issue.startedAt` is stamped at checkout, before a run has
+  // necessarily been dispatched. An issue checked out long ago whose run is
+  // still queued (never executed) must not accrue active duration or trip
+  // `long_active_duration` -- the platform hasn't started the work yet, the
+  // assignee hasn't stalled on it.
+  it("does not create a long-active review when the checked-out issue's run has never executed (BLO-22016)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 17.75 * 60 * 60 * 1000),
+      activeRun: false,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      status: "queued",
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      startedAt: null,
+      contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+      createdAt: new Date(now.getTime() - 17.75 * 60 * 60 * 1000),
+      updatedAt: new Date(now.getTime() - 17.75 * 60 * 60 * 1000),
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  // Same shape, but no run row exists at all yet (nothing dispatched since checkout).
+  it("does not create a long-active review for a checked-out issue with zero runs (BLO-22016)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      activeRun: false,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  // A run that actually started (even if it later failed) still anchors the
+  // active episode to its own `startedAt`, so a genuinely long-running or
+  // long-stalled *executing* run still trips the threshold -- this guards
+  // against fixing BLO-22016 by simply desensitizing the detector.
+  it("still creates a long-active review once the queued run actually starts executing (BLO-22016 control)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 17.75 * 60 * 60 * 1000),
+      activeRun: false,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      status: "running",
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+      createdAt: new Date(now.getTime() - 17.75 * 60 * 60 * 1000),
+      updatedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+    expect(review?.description).toContain("current active episode has lasted 7h");
+  });
+
   // BLO-19848: `long_active_duration` measured raw wall-clock from
   // issues.started_at to now with no reference to whether anything was actually
   // executing, so an issue pinned by a non-live executionRunId kept accruing
@@ -1104,7 +1224,8 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(review?.description).toContain("Excluded as non-live execution hold");
   });
 
-  it("excludes only the silent tail when a running holder goes quiet mid-episode (BLO-19848)", async () => {    const now = new Date("2026-04-28T12:00:00.000Z");
+  it("excludes only the silent tail when a running holder goes quiet mid-episode (BLO-19848)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
     const episodeStart = new Date(now.getTime() - 7 * 60 * 60 * 1000);
     const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: episodeStart });
     await pinExecutionRun({
@@ -3851,6 +3972,9 @@ describeEmbeddedPostgres("productivity review service", () => {
     const seeded = await seedAssignedIssue({
       status: "in_progress",
       startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      // The default companion run (BLO-22016) is not routine-origin, which
+      // would break the "100% routine" premise this test depends on.
+      activeRun: false,
     });
     await insertRuns({
       companyId: seeded.companyId,

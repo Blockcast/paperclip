@@ -357,9 +357,8 @@ function latestDate(...values: Array<Date | string | null | undefined>) {
  *
  * Returns the clamp point — the last moment still attributable to the run — so
  * the episode is truncated when live work stopped rather than dropped to zero.
- * An issue with no execution holder at all returns null and keeps full
- * wall-clock accounting: that is an unowned `in_progress` issue, which is
- * genuine stalling and exactly what the trigger should still catch.
+ * An issue with no execution holder at all returns null; BLO-22016's
+ * activeExecutionEpisodeStart decides whether any run has actually started.
  */
 function nonLiveExecutionHoldSince(
   issue: IssueRow,
@@ -433,6 +432,35 @@ function liveSegmentStartedAt(executionRun: HeartbeatRunRow | null, now: Date): 
   // clamping the episode start into the future.
   if (parkEndedAt.getTime() > now.getTime()) return null;
   return parkEndedAt;
+}
+
+/**
+ * BLO-22016: `issue.startedAt` is stamped at checkout time (see
+ * `issueService.checkout`), not when a run actually begins executing. A
+ * checked-out issue can sit behind a scheduler backlog or provider capacity
+ * gate for hours before its first run dispatches, and that queueing was
+ * being counted as "active" work, manufacturing `long_active_duration`
+ * false positives (BLO-18846 / run `9e49405e`: ~17.75h queued, 0 tokens).
+ *
+ * Anchor the active episode to the earliest run that has actually started
+ * executing (`run.startedAt` populated) since the current checkout, instead
+ * of the checkout timestamp itself. `latestRuns` is not pre-scoped to the
+ * current episode (it is the issue's most recent runs overall), so runs
+ * that started before this checkout are excluded. An issue whose run(s)
+ * are still queued/scheduled and have never executed has no active episode
+ * yet, so this returns null and the caller treats elapsed duration as
+ * absent rather than zero-but-growing.
+ */
+function activeExecutionEpisodeStart(issue: IssueRow, latestRuns: HeartbeatRunRow[]): Date | null {
+  const checkoutAt = coerceDate(issue.startedAt) ?? coerceDate(issue.executionLockedAt);
+  if (!checkoutAt) return null;
+  let earliest: Date | null = null;
+  for (const run of latestRuns) {
+    const startedAt = coerceDate(run.startedAt);
+    if (!startedAt || startedAt.getTime() < checkoutAt.getTime()) continue;
+    if (!earliest || startedAt.getTime() < earliest.getTime()) earliest = startedAt;
+  }
+  return earliest;
 }
 
 function isTerminalIssueStatus(status: string | null | undefined) {
@@ -2073,7 +2101,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     const activeRunCount = latestRuns.filter((run) =>
       ACTIVE_RUN_STATUSES.includes(run.status as (typeof ACTIVE_RUN_STATUSES)[number]),
     ).length;
-    const activeStartedAt = sourceIssue.startedAt ?? sourceIssue.executionLockedAt ?? null;
+    const activeStartedAt = activeExecutionEpisodeStart(sourceIssue, latestRuns);
     // BLO-19848: clamp the episode end to the last moment execution was
     // attributable to a live run, so a wedged holder cannot accrue "active"
     // time on work that already finished. See nonLiveExecutionHoldSince.
