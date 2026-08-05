@@ -1764,7 +1764,13 @@ export function recoveryService(
       .then((rows) => Boolean(rows[0]));
   }
 
-  async function getLatestIssueRunSince(companyId: string, issueId: string, agentId: string, since: Date): Promise<LatestIssueRun> {
+  async function getLatestIssueRunSince(
+    companyId: string,
+    issueId: string,
+    agentId: string,
+    since: Date,
+    interactionId: string,
+  ): Promise<LatestIssueRun> {
     return db
       .select({
         id: heartbeatRuns.id,
@@ -1785,6 +1791,7 @@ export function recoveryService(
           eq(heartbeatRuns.companyId, companyId),
           eq(heartbeatRuns.agentId, agentId),
           sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+          sql`${heartbeatRuns.contextSnapshot} ->> 'interactionId' = ${interactionId}`,
           or(gte(heartbeatRuns.createdAt, since), gte(heartbeatRuns.finishedAt, since)),
         ),
       )
@@ -5939,6 +5946,41 @@ export function recoveryService(
         );
 
         if (!successfulRunSinceResolution) {
+          const latestPostResolutionRun = await getLatestIssueRunSince(
+            issue.companyId,
+            issue.id,
+            agentId,
+            acceptedInteractionResolvedAt,
+            acceptedContinuationInteraction.id,
+          );
+          const postResolutionClassification = latestPostResolutionRun &&
+              isUnsuccessfulTerminalIssueRun(latestPostResolutionRun)
+            ? classifyContinuationFailure(latestPostResolutionRun)
+            : null;
+          if (postResolutionClassification?.kind === "non_retryable") {
+            if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, latestPostResolutionRun)) {
+              result.skipped += 1;
+              continue;
+            }
+            const failureSummary = summarizeRunFailureForIssueComment(latestPostResolutionRun);
+            const updated = await escalateStrandedAssignedIssue({
+              issue,
+              previousStatus: issue.status as StrandedPreviousStatus,
+              latestRun: latestPostResolutionRun,
+              comment:
+                "Paperclip detected a non-retryable failure after an accepted interaction " +
+                `(\`${postResolutionClassification.errorCode}\`). Skipping continuation replay and moving it to ` +
+                `\`blocked\` so it is visible for intervention.${failureSummary ?? ""}`,
+            });
+            if (updated) {
+              result.escalated += 1;
+              result.issueIds.push(issue.id);
+            } else {
+              result.skipped += 1;
+            }
+            continue;
+          }
+
           if (!agentInvokable) {
             result.skipped += 1;
             continue;
@@ -5954,12 +5996,6 @@ export function recoveryService(
             continue;
           }
 
-          const latestPostResolutionRun = await getLatestIssueRunSince(
-            issue.companyId,
-            issue.id,
-            agentId,
-            acceptedInteractionResolvedAt,
-          );
           const { consecutive } = await summarizeRecentContinuationRetries(
             issue.companyId,
             issue.id,
@@ -6053,11 +6089,16 @@ export function recoveryService(
           isUnsuccessfulTerminalIssueRun(participantLatestRun) &&
           participantContinuationClassification.kind === "non_retryable"
         ) {
+          if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, participantLatestRun)) {
+            result.skipped += 1;
+            continue;
+          }
           const failureSummary = summarizeRunFailureForIssueComment(participantLatestRun);
           const updated = await escalateStrandedAssignedIssue({
             issue,
             previousStatus: "in_review",
             latestRun: participantLatestRun,
+            recoveryCause: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
             recoveryOwnerAgentId: participantAgentId,
             comment:
               "Paperclip detected a non-retryable failure on the active review participant's run " +
@@ -6219,6 +6260,10 @@ export function recoveryService(
 
         const assignmentContinuationClassification = classifyContinuationFailure(latestRun);
         if (assignmentContinuationClassification.kind === "non_retryable") {
+          if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, latestRun)) {
+            result.skipped += 1;
+            continue;
+          }
           const failureSummary = summarizeRunFailureForIssueComment(latestRun);
           const updated = await escalateStrandedAssignedIssue({
             issue,

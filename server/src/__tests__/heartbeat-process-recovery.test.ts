@@ -6504,6 +6504,67 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
+  it("records non-retryable review-participant recovery under the reviewer cause", async () => {
+    const { companyId, agentId, issueId, runId, wakeupRequestId, stageId } =
+      await seedInReviewParticipantRunFixture();
+    const sourceAssigneeAgentId = randomUUID();
+    const finishedAt = new Date("2026-03-19T00:05:00.000Z");
+
+    await db.insert(agents).values({
+      id: sourceAssigneeAgentId,
+      companyId,
+      name: "CodexImplementor",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.update(issues).set({
+      assigneeAgentId: sourceAssigneeAgentId,
+      executionRunId: null,
+      executionState: {
+        status: "pending",
+        currentStageId: stageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId, userId: null },
+        returnAssignee: { type: "agent", agentId: sourceAssigneeAgentId, userId: null },
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    }).where(eq(issues.id, issueId));
+    await db.update(heartbeatRuns).set({
+      status: "failed",
+      startedAt: new Date("2026-03-19T00:00:00.000Z"),
+      finishedAt,
+      updatedAt: finishedAt,
+      errorCode: "job_missing",
+      error: "External lifecycle Job disappeared after adapter invocation",
+    }).where(eq(heartbeatRuns.id, runId));
+    await db.update(agentWakeupRequests).set({
+      status: "failed",
+      claimedAt: new Date("2026-03-19T00:00:00.000Z"),
+      finishedAt,
+      updatedAt: finishedAt,
+      error: "External lifecycle Job disappeared after adapter invocation",
+    }).where(eq(agentWakeupRequests.id, wakeupRequestId));
+
+    const result = await createHeartbeat().reconcileStrandedAssignedIssues();
+
+    expect(result).toMatchObject({ reviewParticipantRequeued: 0, escalated: 1 });
+    const [action] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(action).toMatchObject({
+      cause: "execution_review_participant_recovery",
+      ownerAgentId: agentId,
+      previousOwnerAgentId: sourceAssigneeAgentId,
+      returnOwnerAgentId: sourceAssigneeAgentId,
+    });
+  });
+
   it.each([
     ["failed", "adapter_failed"],
     ["failed", "process_lost"],
@@ -6672,6 +6733,55 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       interactionContinuationPolicy: "wake_assignee_on_accept",
       interactionResolvedAt: resolvedAt.toISOString(),
     });
+  });
+
+  it("blocks accepted interaction continuation after job_missing without replaying it", async () => {
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      runErrorCode: "job_missing",
+      retryReason: "issue_continuation_needed",
+    });
+    const interactionId = randomUUID();
+    const resolvedAt = new Date("2026-03-18T23:59:00.000Z");
+    await db.insert(issueThreadInteractions).values({
+      id: interactionId,
+      companyId,
+      issueId,
+      kind: "request_confirmation",
+      status: "accepted",
+      continuationPolicy: "wake_assignee_on_accept",
+      createdByAgentId: agentId,
+      resolvedByUserId: "responsible-user",
+      resolvedAt,
+      updatedAt: resolvedAt,
+      payload: { version: 1, prompt: "Approve the plan?" },
+      result: { outcome: "accepted" },
+    });
+    await db.update(heartbeatRuns).set({
+      contextSnapshot: {
+        issueId,
+        taskId: issueId,
+        wakeReason: "issue_continuation_needed",
+        retryReason: "issue_continuation_needed",
+        mutation: "interaction",
+        interactionId,
+      },
+    }).where(eq(heartbeatRuns.id, runId));
+
+    const result = await createHeartbeat().reconcileStrandedAssignedIssues();
+
+    expect(result).toMatchObject({ continuationRequeued: 0, escalated: 1 });
+    const [issue, runs] = await Promise.all([
+      db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null),
+      db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId)),
+    ]);
+    expect(issue?.status).toBe("blocked");
+    expect(runs.some((run) => run.id === runId)).toBe(true);
+    expect(runs.filter((run) =>
+      (run.contextSnapshot as Record<string, unknown> | null)?.source ===
+        "issue.interaction_continuation_recovery"
+    )).toHaveLength(0);
   });
 
   it("escalates accepted interaction continuation recovery after three review-park cancellations", async () => {
@@ -8740,6 +8850,14 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       runUsageJson: null,
     },
     {
+      label: "todo + non-retryable continuation failure",
+      issueStatus: "todo" as const,
+      runStatus: "failed" as const,
+      runErrorCode: "job_missing",
+      retryReason: null,
+      runUsageJson: null,
+    },
+    {
       label: "todo + zero-token startup failure run",
       issueStatus: "todo" as const,
       runStatus: "failed" as const,
@@ -8826,6 +8944,47 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       expect(issue?.status).toBe(issueStatus);
     },
   );
+
+  it("skips non-retryable review-participant escalation when the failure predates an operator unblock", async () => {
+    const { companyId, agentId, issueId, runId, wakeupRequestId } =
+      await seedInReviewParticipantRunFixture();
+    const failedAt = new Date("2026-03-19T00:05:00.000Z");
+    await db.update(issues).set({ executionRunId: null }).where(eq(issues.id, issueId));
+    await db.update(heartbeatRuns).set({
+      status: "failed",
+      createdAt: failedAt,
+      startedAt: failedAt,
+      finishedAt: failedAt,
+      updatedAt: failedAt,
+      errorCode: "job_missing",
+      error: "External lifecycle Job disappeared after adapter invocation",
+    }).where(eq(heartbeatRuns.id, runId));
+    await db.update(agentWakeupRequests).set({
+      status: "failed",
+      claimedAt: failedAt,
+      finishedAt: failedAt,
+      updatedAt: failedAt,
+      error: "External lifecycle Job disappeared after adapter invocation",
+    }).where(eq(agentWakeupRequests.id, wakeupRequestId));
+    await db.insert(activityLog).values({
+      id: randomUUID(),
+      companyId,
+      actorType: "user",
+      actorId: "operator",
+      action: "issue.updated",
+      entityType: "issue",
+      entityId: issueId,
+      details: { previousStatus: "blocked", status: "in_review" },
+      createdAt: new Date("2026-03-19T01:00:00.000Z"),
+    });
+
+    const result = await createHeartbeat().reconcileStrandedAssignedIssues();
+
+    expect(result).toMatchObject({ reviewParticipantRequeued: 0, escalated: 0 });
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue).toMatchObject({ status: "in_review", assigneeAgentId: agentId });
+    expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
+  });
 
   it("does not treat a productive terminal run as healthy when in-progress work has no live path", async () => {
     const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
