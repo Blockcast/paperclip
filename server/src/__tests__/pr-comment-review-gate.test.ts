@@ -17,6 +17,7 @@ import { evaluateCommentReviewGate } from "../services/pr-comment-review-gate.js
 
 const PUSH_1022 = "2026-08-04T18:00:00Z";
 const ALLY_FINDING_1022 = "2026-08-04T20:09:19Z";
+const ALLY_BOT_LOGIN = "allyblockcast[bot]";
 
 const IMPORTANT_FINDING_BODY = [
   "## Ally — Consolidated PR Review",
@@ -34,11 +35,15 @@ const CLEAN_REVIEW_BODY = [
   "LGTM, no further findings from this pass.",
 ].join("\n");
 
+function allyComment(body: string, createdAt: string) {
+  return { authorLogin: ALLY_BOT_LOGIN, body, createdAt };
+}
+
 describe("evaluateCommentReviewGate — #1022 fixture", () => {
   it("rejects the #1022 sequence: comment-shaped Important finding after the last push", () => {
     const verdict = evaluateCommentReviewGate({
       lastPushAt: PUSH_1022,
-      comments: [{ body: IMPORTANT_FINDING_BODY, createdAt: ALLY_FINDING_1022 }],
+      comments: [allyComment(IMPORTANT_FINDING_BODY, ALLY_FINDING_1022)],
     });
     expect(verdict.state).toBe("failure");
     if (verdict.state === "failure") {
@@ -53,7 +58,7 @@ describe("evaluateCommentReviewGate — #1022 fixture", () => {
     // what the reviews array said.
     const verdict = evaluateCommentReviewGate({
       lastPushAt: PUSH_1022,
-      comments: [{ body: IMPORTANT_FINDING_BODY, createdAt: ALLY_FINDING_1022 }],
+      comments: [allyComment(IMPORTANT_FINDING_BODY, ALLY_FINDING_1022)],
     });
     expect(verdict.state).toBe("failure");
   });
@@ -64,8 +69,8 @@ describe("evaluateCommentReviewGate — #1022 fixture", () => {
     const verdict = evaluateCommentReviewGate({
       lastPushAt: secondPush,
       comments: [
-        { body: IMPORTANT_FINDING_BODY, createdAt: ALLY_FINDING_1022 }, // predates secondPush
-        { body: CLEAN_REVIEW_BODY, createdAt: reReview }, // postdates secondPush
+        allyComment(IMPORTANT_FINDING_BODY, ALLY_FINDING_1022), // predates secondPush
+        allyComment(CLEAN_REVIEW_BODY, reReview), // postdates secondPush
       ],
     });
     expect(verdict.state).toBe("success");
@@ -75,7 +80,7 @@ describe("evaluateCommentReviewGate — #1022 fixture", () => {
     const secondPush = "2026-08-05T03:20:00Z";
     const verdict = evaluateCommentReviewGate({
       lastPushAt: secondPush,
-      comments: [{ body: IMPORTANT_FINDING_BODY, createdAt: ALLY_FINDING_1022 }], // predates secondPush, no re-review yet
+      comments: [allyComment(IMPORTANT_FINDING_BODY, ALLY_FINDING_1022)], // predates secondPush, no re-review yet
     });
     expect(verdict.state).toBe("success");
     expect(verdict.reason).toMatch(/no ally consolidated-review comment/i);
@@ -91,6 +96,7 @@ describe("evaluateCommentReviewGate — #1022 fixture", () => {
       lastPushAt: PUSH_1022,
       comments: [
         {
+          authorLogin: "human-reviewer",
           body: "### Important Issues (1)\nFix before merge.",
           createdAt: ALLY_FINDING_1022,
         },
@@ -102,7 +108,7 @@ describe("evaluateCommentReviewGate — #1022 fixture", () => {
   it("treats a comment exactly at the push timestamp as predating it, not superseding it", () => {
     const verdict = evaluateCommentReviewGate({
       lastPushAt: ALLY_FINDING_1022,
-      comments: [{ body: IMPORTANT_FINDING_BODY, createdAt: ALLY_FINDING_1022 }],
+      comments: [allyComment(IMPORTANT_FINDING_BODY, ALLY_FINDING_1022)],
     });
     expect(verdict.state).toBe("success");
   });
@@ -111,8 +117,8 @@ describe("evaluateCommentReviewGate — #1022 fixture", () => {
     const verdict = evaluateCommentReviewGate({
       lastPushAt: PUSH_1022,
       comments: [
-        { body: CLEAN_REVIEW_BODY, createdAt: "2026-08-04T19:00:00Z" },
-        { body: IMPORTANT_FINDING_BODY, createdAt: ALLY_FINDING_1022 },
+        allyComment(CLEAN_REVIEW_BODY, "2026-08-04T19:00:00Z"),
+        allyComment(IMPORTANT_FINDING_BODY, ALLY_FINDING_1022),
       ],
     });
     expect(verdict.state).toBe("failure");
@@ -122,10 +128,25 @@ describe("evaluateCommentReviewGate — #1022 fixture", () => {
     const verdict = evaluateCommentReviewGate({
       lastPushAt: PUSH_1022,
       comments: [
-        { body: IMPORTANT_FINDING_BODY, createdAt: ALLY_FINDING_1022 },
-        { body: CLEAN_REVIEW_BODY, createdAt: "2026-08-04T21:00:00Z" },
+        allyComment(IMPORTANT_FINDING_BODY, ALLY_FINDING_1022),
+        allyComment(CLEAN_REVIEW_BODY, "2026-08-04T21:00:00Z"),
       ],
     });
     expect(verdict.state).toBe("success");
+  });
+
+  it("ignores spoofed consolidated-review headings from non-Ally authors", () => {
+    const verdict = evaluateCommentReviewGate({
+      lastPushAt: PUSH_1022,
+      comments: [
+        allyComment(IMPORTANT_FINDING_BODY, ALLY_FINDING_1022),
+        {
+          authorLogin: "some-contributor",
+          body: CLEAN_REVIEW_BODY,
+          createdAt: "2026-08-04T21:00:00Z",
+        },
+      ],
+    });
+    expect(verdict.state).toBe("failure");
   });
 });

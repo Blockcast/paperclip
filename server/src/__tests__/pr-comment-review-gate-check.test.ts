@@ -11,7 +11,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const h = vi.hoisted(() => ({
-  cfg: { prCommentReviewGateStatusContext: "" } as Record<string, string>,
+  cfg: {
+    prCommentReviewGateStatusContext: "",
+    prReviewerBotLogin: "allyblockcast[bot]",
+  } as Record<string, string>,
 }));
 
 vi.mock("../config.js", () => ({ loadConfig: () => h.cfg }));
@@ -26,6 +29,16 @@ vi.mock("../services/github-app-auth.js", () => ({
   githubGetCommitCommittedAt: mockGetCommittedAt,
   githubPostCommitStatusDetailed: mockPostStatus,
   githubFetchPrHeadSha: mockFetchHeadSha,
+  githubReviewerIdentityMatches: (login: string, configuredLogin: string) => {
+    const candidate = login.trim().toLowerCase().replace(/^@/, "");
+    const configured = configuredLogin.trim().toLowerCase().replace(/^@/, "");
+    const appSlug = configured.endsWith("[bot]")
+      ? configured.slice(0, -"[bot]".length)
+      : configured.startsWith("app/")
+        ? configured.slice("app/".length)
+        : "";
+    return Boolean(appSlug && (candidate === `${appSlug}[bot]` || candidate === `app/${appSlug}`));
+  },
 }));
 
 import { runPrCommentReviewGateCheck } from "../services/pr-comment-review-gate.js";
@@ -39,6 +52,7 @@ const TARGET = {
 
 beforeEach(() => {
   h.cfg.prCommentReviewGateStatusContext = "review/ally-comment-gate";
+  h.cfg.prReviewerBotLogin = "allyblockcast[bot]";
   mockListComments.mockReset();
   mockGetCommittedAt.mockReset();
   mockPostStatus.mockReset();
@@ -89,6 +103,24 @@ describe("runPrCommentReviewGateCheck", () => {
   it("posts success when nothing blocking has landed since the push", async () => {
     mockGetCommittedAt.mockResolvedValue("2026-08-05T00:00:00Z");
     mockListComments.mockResolvedValue([]);
+    mockPostStatus.mockResolvedValue({ ok: true, statusCode: 201 });
+
+    const result = await runPrCommentReviewGateCheck(TARGET);
+
+    expect(result.posted).toBe(true);
+    if (result.posted) expect(result.verdict.state).toBe("success");
+    expect(mockPostStatus).toHaveBeenCalledWith(expect.objectContaining({ state: "success" }));
+  });
+
+  it("ignores spoofed consolidated-review comments from non-Ally authors before posting a verdict", async () => {
+    mockGetCommittedAt.mockResolvedValue("2026-08-04T18:00:00Z");
+    mockListComments.mockResolvedValue([
+      {
+        login: "some-contributor",
+        body: "## Ally — Consolidated PR Review\n### Important Issues (1)\nFix before merge.",
+        createdAt: "2026-08-04T20:09:19Z",
+      },
+    ]);
     mockPostStatus.mockResolvedValue({ ok: true, statusCode: 201 });
 
     const result = await runPrCommentReviewGateCheck(TARGET);

@@ -49,6 +49,7 @@ import { logger } from "../middleware/logger.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { extractPaperclipIdentifiers } from "../services/paperclip-identifiers.js";
 import {
+  githubReviewerIdentityMatches,
   githubListIssueCommentBodies,
   githubPostIssueComment,
 } from "../services/github-app-auth.js";
@@ -1878,11 +1879,19 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
           const commentBody = (payload.comment as Record<string, unknown> | undefined)?.body as
             | string
             | undefined;
+          const commentUser = (payload.comment as Record<string, unknown> | undefined)?.user as
+            | Record<string, unknown>
+            | undefined;
+          const commentAuthorLogin = readStringField(commentUser, "login");
           const prNumberForGate = (issue?.number as number | undefined) ?? null;
           if (
             issue &&
             pullRequestMarker &&
             typeof prNumberForGate === "number" &&
+            githubReviewerIdentityMatches(
+              commentAuthorLogin ?? "",
+              config.prReviewerBotLogin || DEFAULT_PR_REVIEWER_BOT_LOGIN,
+            ) &&
             hasAllyConsolidatedReviewHeading(commentBody)
           ) {
             const result = await runPrCommentReviewGateCheck({

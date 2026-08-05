@@ -46,9 +46,14 @@ import {
   githubGetCommitCommittedAt,
   githubListIssueCommentsWithTimestamps,
   githubPostCommitStatusDetailed,
+  githubReviewerIdentityMatches,
 } from "./github-app-auth.js";
 
+const DEFAULT_PR_REVIEWER_BOT_LOGIN = "allyblockcast[bot]";
+
 export interface CommentReviewGateComment {
+  /** GitHub login for the comment author. Must match the configured Ally App identity. */
+  authorLogin: string | null | undefined;
   body: string | null | undefined;
   /** ISO 8601 string or Date; the comment's `created_at`. */
   createdAt: string | Date;
@@ -62,6 +67,18 @@ function toEpochMs(value: string | Date): number {
   return value instanceof Date ? value.getTime() : Date.parse(value);
 }
 
+function isAllyConsolidatedReviewComment(
+  comment: CommentReviewGateComment,
+  reviewerBotLogin: string,
+): boolean {
+  const authorLogin = comment.authorLogin?.trim();
+  return Boolean(
+    authorLogin &&
+    githubReviewerIdentityMatches(authorLogin, reviewerBotLogin) &&
+    hasAllyConsolidatedReviewHeading(comment.body),
+  );
+}
+
 /**
  * The most recent Ally-consolidated-review-shaped comment posted strictly
  * after `lastPushAt`, or null when none exists — either no Ally comment has
@@ -70,12 +87,13 @@ function toEpochMs(value: string | Date): number {
 function latestAllyCommentSincePush(
   comments: CommentReviewGateComment[],
   lastPushAt: string | Date,
+  reviewerBotLogin: string,
 ): CommentReviewGateComment | null {
   const pushTime = toEpochMs(lastPushAt);
   let latest: CommentReviewGateComment | null = null;
   let latestTime = -Infinity;
   for (const comment of comments) {
-    if (!hasAllyConsolidatedReviewHeading(comment.body)) continue;
+    if (!isAllyConsolidatedReviewComment(comment, reviewerBotLogin)) continue;
     const commentTime = toEpochMs(comment.createdAt);
     if (!Number.isFinite(commentTime) || !(commentTime > pushTime)) continue;
     if (commentTime > latestTime) {
@@ -98,8 +116,10 @@ function latestAllyCommentSincePush(
 export function evaluateCommentReviewGate(input: {
   comments: CommentReviewGateComment[];
   lastPushAt: string | Date;
+  reviewerBotLogin?: string | null;
 }): CommentReviewGateVerdict {
-  const latest = latestAllyCommentSincePush(input.comments ?? [], input.lastPushAt);
+  const reviewerBotLogin = input.reviewerBotLogin?.trim() || DEFAULT_PR_REVIEWER_BOT_LOGIN;
+  const latest = latestAllyCommentSincePush(input.comments ?? [], input.lastPushAt, reviewerBotLogin);
 
   if (!latest) {
     return {
@@ -148,7 +168,9 @@ export async function runPrCommentReviewGateCheck(input: {
   headSha?: string | null;
   prUrl?: string | null;
 }): Promise<PrCommentReviewGateCheckResult> {
-  const context = loadConfig().prCommentReviewGateStatusContext.trim();
+  const config = loadConfig();
+  const context = config.prCommentReviewGateStatusContext.trim();
+  const reviewerBotLogin = config.prReviewerBotLogin.trim() || DEFAULT_PR_REVIEWER_BOT_LOGIN;
   if (!context) return { posted: false, reason: "not_configured" };
 
   // issue_comment webhook contexts (the primary trigger — Ally's finding
@@ -166,8 +188,13 @@ export async function runPrCommentReviewGateCheck(input: {
   if (comments == null || lastPushAt == null) return { posted: false, reason: "fetch_failed" };
 
   const verdict = evaluateCommentReviewGate({
-    comments: comments.map((comment) => ({ body: comment.body, createdAt: comment.createdAt })),
+    comments: comments.map((comment) => ({
+      authorLogin: comment.login,
+      body: comment.body,
+      createdAt: comment.createdAt,
+    })),
     lastPushAt,
+    reviewerBotLogin,
   });
 
   const posted = await githubPostCommitStatusDetailed({
