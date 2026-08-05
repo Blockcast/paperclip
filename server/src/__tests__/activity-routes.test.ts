@@ -118,6 +118,14 @@ describe.sequential("activity routes", () => {
       agentId: undefined,
       entityType: undefined,
       entityId: undefined,
+      action: undefined,
+      limit: 100,
+    });
+    expect(JSON.parse(res.headers["x-applied-filters"])).toEqual({
+      agentId: null,
+      entityType: null,
+      entityId: null,
+      action: null,
       limit: 100,
     });
   });
@@ -136,8 +144,75 @@ describe.sequential("activity routes", () => {
       agentId: undefined,
       entityType: "issue",
       entityId: undefined,
+      action: undefined,
       limit: 500,
     });
+  });
+
+  it("filters company activity by action", async () => {
+    mockActivityService.list.mockResolvedValue([
+      { id: "evt-1", action: "issue_write_denied", entityType: "issue", entityId: "issue-1" },
+    ]);
+
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl).get("/api/companies/company-1/activity?limit=5&action=issue_write_denied"),
+    );
+
+    expect(res.status).toBe(200);
+    expect(mockActivityService.list).toHaveBeenCalledWith({
+      companyId: "company-1",
+      agentId: undefined,
+      entityType: undefined,
+      entityId: undefined,
+      action: "issue_write_denied",
+      limit: 5,
+    });
+    expect(res.body).toEqual([
+      { id: "evt-1", action: "issue_write_denied", entityType: "issue", entityId: "issue-1" },
+    ]);
+    expect(JSON.parse(res.headers["x-applied-filters"]).action).toBe("issue_write_denied");
+  });
+
+  it("does not silently return an unfiltered feed when the action filter yields zero matches", async () => {
+    mockActivityService.list.mockResolvedValue([]);
+
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl).get("/api/companies/company-1/activity?action=totally_bogus_action"),
+    );
+
+    expect(res.status).toBe(200);
+    expect(mockActivityService.list).toHaveBeenCalledWith(
+      expect.objectContaining({ action: "totally_bogus_action" }),
+    );
+    expect(res.body).toEqual([]);
+  });
+
+  it("rejects unknown query parameters on company activity with a 400 naming the key", async () => {
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl).get("/api/companies/company-1/activity?actionn=issue_write_denied"),
+    );
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain("actionn");
+    expect(res.body.unsupportedParams).toEqual(["actionn"]);
+    expect(mockActivityService.list).not.toHaveBeenCalled();
+  });
+
+  it("rejects unknown query parameters on issue activity with a 400 naming the key", async () => {
+    mockIssueService.getByIdentifier.mockResolvedValue({
+      id: "issue-uuid-1",
+      companyId: "company-1",
+    });
+
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) => request(baseUrl).get("/api/issues/pc1a2-475/activity?action=x"));
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain("action");
+    expect(mockActivityService.forIssue).not.toHaveBeenCalled();
   });
 
   it("resolves alphanumeric issue identifiers before loading runs", async () => {
@@ -207,6 +282,18 @@ describe.sequential("activity routes", () => {
     const res = await requestApp(app, (baseUrl) => request(baseUrl).get("/api/heartbeat-runs/missing-run/issues"));
 
     expect(res.status).toBe(401);
+    expect(mockHeartbeatService.getRun).not.toHaveBeenCalled();
+    expect(mockActivityService.issuesForRun).not.toHaveBeenCalled();
+  });
+
+  it("rejects unknown query parameters on heartbeat-run issue lookups with a 400 naming the key", async () => {
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl).get("/api/heartbeat-runs/run-2/issues?entityType=issue"),
+    );
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain("entityType");
     expect(mockHeartbeatService.getRun).not.toHaveBeenCalled();
     expect(mockActivityService.issuesForRun).not.toHaveBeenCalled();
   });
