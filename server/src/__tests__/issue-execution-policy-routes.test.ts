@@ -1722,6 +1722,67 @@ describe("issue execution policy routes", () => {
     });
   });
 
+  it("pins the execution snapshot when updating a pending stage review request", async () => {
+    const executionPolicy = normalizeIssueExecutionPolicy({
+      stages: [{
+        id: "11111111-1111-4111-8111-111111111111",
+        type: "review",
+        participants: [{ type: "agent", agentId: "33333333-3333-4333-8333-333333333333" }],
+      }],
+    })!;
+    const executionState = {
+      status: "pending",
+      currentStageId: "11111111-1111-4111-8111-111111111111",
+      currentStageIndex: 0,
+      currentStageType: "review",
+      currentParticipant: { type: "agent", agentId: "33333333-3333-4333-8333-333333333333" },
+      returnAssignee: { type: "agent", agentId: "33333333-3333-4333-8333-333333333333" },
+      completedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+      reviewRequest: null,
+    };
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "in_review",
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1054",
+      title: "Concurrent review request",
+      executionPolicy,
+      executionState,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+
+    const res = await request(await createApp({
+      type: "agent",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      companyId: "company-1",
+      runId: "run-1",
+    }))
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ reviewRequest: { instructions: "Check the concurrency behavior." } });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      issue.id,
+      expect.objectContaining({
+        executionState: expect.objectContaining({
+          reviewRequest: { instructions: "Check the concurrency behavior." },
+        }),
+        expectedCurrentExecutionState: executionState,
+        expectedCurrentExecutionPolicy: executionPolicy,
+      }),
+    );
+  });
+
   describe("monitor convergence guard (BLO-18294)", () => {
     const CONVERGED_ISSUE_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
     const BLOCKER_ISSUE_ID = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";

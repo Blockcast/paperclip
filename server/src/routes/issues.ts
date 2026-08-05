@@ -10191,6 +10191,19 @@ export function issueRoutes(
       }
     }
 
+    const executionSnapshotPreconditions = updateFields.executionState === undefined
+      ? {}
+      : {
+          expectedCurrentExecutionState:
+            existing.executionState && typeof existing.executionState === "object"
+              ? existing.executionState
+              : null,
+          expectedCurrentExecutionPolicy:
+            existing.executionPolicy && typeof existing.executionPolicy === "object"
+              ? existing.executionPolicy
+              : null,
+        };
+
     let issue;
     try {
       if (transition.decision && decisionId) {
@@ -10202,14 +10215,7 @@ export function issueRoutes(
               ...updateFields,
               actorAgentId: actor.agentId ?? null,
               actorUserId: actor.actorType === "user" ? actor.actorId : null,
-              expectedCurrentExecutionState:
-                existing.executionState && typeof existing.executionState === "object"
-                  ? existing.executionState
-                  : null,
-              expectedCurrentExecutionPolicy:
-                existing.executionPolicy && typeof existing.executionPolicy === "object"
-                  ? existing.executionPolicy
-                  : null,
+              ...executionSnapshotPreconditions,
               ...(delegateRecoveryPatchInFlight
                 ? {
                     expectedCurrentStatus: "blocked",
@@ -10245,6 +10251,7 @@ export function issueRoutes(
           ...updateFields,
           actorAgentId: actor.agentId ?? null,
           actorUserId: actor.actorType === "user" ? actor.actorId : null,
+          ...executionSnapshotPreconditions,
           ...(delegateRecoveryPatchInFlight
             ? {
                 expectedCurrentStatus: "blocked",
