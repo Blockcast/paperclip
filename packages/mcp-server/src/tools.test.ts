@@ -485,7 +485,7 @@ describe("paperclip MCP tools", () => {
     const tool = getTool("paperclipCreateApproval");
     await tool.execute({
       type: "hire_agent",
-      payload: { branch: "pap-1167" },
+      payload: { title: "Approve agent hire", branch: "pap-1167" },
       issueIds: ["44444444-4444-4444-4444-444444444444"],
     });
 
@@ -497,7 +497,7 @@ describe("paperclip MCP tools", () => {
     expect(init.method).toBe("POST");
     expect(JSON.parse(String(init.body))).toEqual({
       type: "hire_agent",
-      payload: { branch: "pap-1167" },
+      payload: { title: "Approve agent hire", branch: "pap-1167" },
       issueIds: ["44444444-4444-4444-4444-444444444444"],
     });
   });
