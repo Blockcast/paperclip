@@ -6586,6 +6586,26 @@ const GITHUB_PR_CONTEXT_KEYS = [
   "reviewKind",
 ] as const;
 
+// BLO-22229: wake reasons whose contextSnapshot describes one specific review
+// instance (a formal `pull_request_review` submission, or review feedback
+// delivered via an `issue_comment`). Each such wake is a self-contained
+// report of "what does the review say right now" — it must never be read
+// alongside a review-content field left over from an earlier instance.
+const GITHUB_PR_REVIEW_INSTANCE_WAKE_REASONS = new Set([
+  "github_pr_review_feedback",
+  "github_pr_review_submitted",
+]);
+
+// The subset of GITHUB_PR_CONTEXT_KEYS that describes review *content*
+// (state/body/author of one review instance), as opposed to PR identity.
+const GITHUB_PR_REVIEW_CONTENT_KEYS = [
+  "githubPrReviewBody",
+  "githubPrReviewState",
+  "githubPrReviewAuthorLogin",
+  "githubReviewFeedbackActionable",
+  "githubReviewFeedbackCommentId",
+] as const;
+
 function readGithubPrIdentity(contextSnapshot: Record<string, unknown>) {
   const raw = contextSnapshot.githubPrNumber;
   const prNumber =
@@ -6708,6 +6728,26 @@ export function mergeCoalescedContextSnapshot(
     incomingPrIdentity !== existingPrIdentity;
   if (isDifferentGithubPr) {
     for (const key of GITHUB_PR_CONTEXT_KEYS) {
+      if (!(key in incoming)) delete merged[key];
+    }
+  }
+  // BLO-22229: even on the SAME PR, a new review-instance wake (a fresh
+  // `pull_request_review` submission, or review feedback posted as an
+  // `issue_comment`) must not inherit review-content fields from whichever
+  // review instance happened to be active before it. Without this, a
+  // comment-shaped review (which carries a body/author but, per
+  // github-webhook.ts's issue_comment branch, never a formal `reviewState`)
+  // merges onto a still-active `github_pr_review_submitted` run and keeps
+  // that run's stale `githubPrReviewState`/body — composing a directive from
+  // two different GitHub events (e.g. this comment's author paired with an
+  // earlier reviewer's APPROVED state) that together describe an event that
+  // never happened. Each review-instance wake owns this key block outright:
+  // whatever it doesn't re-supply is cleared, not inherited.
+  const incomingWakeReason = readNonEmptyString(incoming.wakeReason);
+  const isNewReviewInstance =
+    incomingWakeReason !== null && GITHUB_PR_REVIEW_INSTANCE_WAKE_REASONS.has(incomingWakeReason);
+  if (isNewReviewInstance) {
+    for (const key of GITHUB_PR_REVIEW_CONTENT_KEYS) {
       if (!(key in incoming)) delete merged[key];
     }
   }
