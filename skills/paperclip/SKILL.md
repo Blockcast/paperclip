@@ -58,13 +58,17 @@ Follow these steps every time you wake up:
 
 **Step 4 — Pick work.** Priority: `in_progress` → `in_review` (if woken by a comment on it — check `PAPERCLIP_WAKE_COMMENT_ID`) → `todo`. Skip `blocked` unless you can unblock.
 
-**Before working an issue, confirm you are the run that holds it.** Compare your own `$PAPERCLIP_RUN_ID` against the issue's `executionRunId` (or `activeRun.id`) — `GET /api/issues/{issueId}` returns both, so this costs no extra call:
+**Before working an issue, confirm you are the run that holds it.** The issue is claimed if **either** lock column — `checkoutRunId` or `executionRunId` — names a run that has not terminalized. `GET /api/issues/{issueId}` returns both, so this costs no extra call:
 
-- They match → you hold it. Proceed.
-- They differ **and** `activeRun.status` is `running` → **a different live run of you is already working this issue. Cede.** Do not edit files, commit, push, or change status. Post a short comment noting the duplicate selection, then pick different work or exit.
-- `activeRun` is `null` → nobody is holding it. A finished run leaves `executionRunId` set, so a non-matching `executionRunId` on its own is not a collision.
+- Either column equals your `$PAPERCLIP_RUN_ID` → you hold it. Proceed.
+- A column names a **different** run and that run is live (status `running`, `queued`, or `scheduled_retry`) → **a different run is already working this issue. Cede.** Do not edit files, commit, push, or change status. Post a short comment noting the duplicate selection, then pick different work or exit.
+- Both columns are null, or every run they name has terminalized (`succeeded`/`failed`/`cancelled`/`timed_out`/`interrupted`) → nobody is holding it. A finished run leaves its lock behind, so a non-matching column on its own is not a collision; `checkout()` clears a terminal lock and hands you the issue.
 
-`inbox-lite` withholds these issues server-side, so in practice you should not see one. Keep the check anyway: it is one comparison, it covers the fallback issue-list path and any stale-lock takeover, and a duplicate run that starts working is destructive rather than merely wasteful — under a shared worktree both runs edit the same tree, and a routine `rm -rf node_modules` in one destroys the other's state mid-task. Note that "no comments yet" is **not** evidence an issue is unworked: the holding run may be minutes into its first pass and not have commented yet.
+**Do not use `activeRun` for this check (BLO-19749).** It is derived from `executionRunId` **only**, so an issue held solely via `checkoutRunId` reads `activeRun: null` while `POST /checkout` simultaneously returns `409 Issue checkout conflict` naming that run. `activeRun: null` is therefore *not* evidence that nobody holds the issue — read the two columns instead. (`activeRun` was additionally blind to `scheduled_retry` holders until BLO-19749; that half is fixed, but the single-column gap is intrinsic.)
+
+**The checkout result is the authoritative answer.** A `409 Issue checkout conflict` means another live run holds it — cede, and treat any pre-checkout read that disagreed as the stale one. Never treat a 409 as a transient error to retry.
+
+`inbox-lite` withholds these issues server-side, so in practice you should not see one. Keep the check anyway: it is two comparisons, it covers the fallback issue-list path and any stale-lock takeover, and a duplicate run that starts working is destructive rather than merely wasteful — under a shared worktree both runs edit the same tree, and a routine `rm -rf node_modules` in one destroys the other's state mid-task. Note that "no comments yet" is **not** evidence an issue is unworked: the holding run may be minutes into its first pass and not have commented yet.
 
 Overrides and special cases:
 
