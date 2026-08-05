@@ -7,7 +7,11 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { logActivity, setPluginEventOutboxDb } from "../services/activity-log.js";
+import {
+  logActivity,
+  resetPluginEventOutboxDbForTests,
+  setPluginEventOutboxDb,
+} from "../services/activity-log.js";
 import { subscribeCompanyLiveEvents } from "../services/live-events.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -53,6 +57,7 @@ describeEmbeddedPostgres("logActivity publication vs. an enclosing transaction",
   });
 
   afterAll(async () => {
+    resetPluginEventOutboxDbForTests();
     await tempDb?.cleanup();
   });
 
@@ -98,6 +103,17 @@ describeEmbeddedPostgres("logActivity publication vs. an enclosing transaction",
     // The activity row rolled back, so the event describing it must have too.
     expect(activityRows).toHaveLength(0);
     expect(outboxRows).toHaveLength(0);
+  });
+
+  it("does not enqueue on a caller db when the plugin outbox is not configured", async () => {
+    resetPluginEventOutboxDbForTests();
+    try {
+      await logActivity(db, activityInput(randomUUID()));
+      expect(await db.select().from(pluginEventOutbox)).toHaveLength(0);
+      expect(await db.select().from(activityLog)).toHaveLength(1);
+    } finally {
+      setPluginEventOutboxDb(db);
+    }
   });
 
   it("enqueues the plugin event when the enclosing transaction commits", async () => {

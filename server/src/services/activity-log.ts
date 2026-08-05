@@ -47,6 +47,10 @@ export function setPluginEventOutboxDb(db: Db): void {
   _outboxDb = db;
 }
 
+export function resetPluginEventOutboxDbForTests(): void {
+  _outboxDb = null;
+}
+
 /** Accessor for the worker-tier outbox poller (the sole emitter). */
 export function getPluginEventBus(): PluginEventBus | null {
   return _pluginEventBus;
@@ -64,8 +68,9 @@ function eventTypeForActivityAction(action: string): PluginEventType | null {
  * are not loaded) reliably reach subscribed plugins. One writer + one emitter
  * ⇒ no double-delivery.
  *
- * Pass `db` to write the outbox row on a specific handle. When that handle is a
- * transaction the enqueue becomes atomic with it, so a rollback takes the
+ * The outbox is enabled only after app boot wires the global handle. Pass `db`
+ * to write the outbox row on a specific handle once enabled. When that handle
+ * is a transaction the enqueue becomes atomic with it, so a rollback takes the
  * pending event with it instead of leaving the worker to emit an event for a
  * row that never committed. Omit it (or pass null) to use the boot-time global
  * handle — correct for callers outside a transaction, and required for callers
@@ -76,15 +81,15 @@ function eventTypeForActivityAction(action: string): PluginEventType | null {
  * publication remains best-effort and only logs failures.
  */
 export async function publishPluginDomainEvent(event: PluginEvent, db?: Db | null): Promise<void> {
-  const outboxDb = db ?? _outboxDb;
-  const enlisted = db != null;
-  if (!outboxDb) {
+  if (!_outboxDb) {
     logger.warn(
       { eventType: event.eventType, eventId: event.eventId },
       "plugin event outbox db not set; dropping event",
     );
     return;
   }
+  const outboxDb = db ?? _outboxDb;
+  const enlisted = db != null;
   const insert = outboxDb.insert(pluginEventOutbox).values({
     eventId: event.eventId,
     companyId: event.companyId,
