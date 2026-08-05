@@ -814,13 +814,20 @@ const TRANSIENT_INFRA_CONTINUATION_ERROR_CODES = new Set<string>([
   "process_lost",
 ]);
 
+// BLO-19124: emitted by the dispatcher's dependency gate (see heartbeat.ts
+// `cancelQueuedRunForBlockedDependencies`) when `listDependencyReadiness` reports
+// the issue is not dependency-ready. A member of NON_RETRYABLE_CONTINUATION_ERROR_CODES
+// so it does not burn retry attempts — but unlike the other members it is not an
+// error condition at all, so it must not escalate as a stranded issue.
+const DEPENDENCY_BLOCKED_ERROR_CODE = "issue_dependencies_blocked";
+
 const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
   "agent_not_invokable",
   "agent_not_found",
   "budget_blocked",
   "budget_exhausted",
   "issue_paused",
-  "issue_dependencies_blocked",
+  DEPENDENCY_BLOCKED_ERROR_CODE,
 ]);
 
 // A continuation cancelled with this code is a *deliberate wait* (the latest run
@@ -5739,6 +5746,7 @@ export function recoveryService(
       zeroTokenStartupFailureBlocked: 0,
       zeroTokenSessionResetRetried: 0,
       waitingOnReviewResolved: 0,
+      dependencyWaitSkipped: 0,
       providerQuotaMonitored: 0,
       recentProgressExempted: 0,
       skipped: 0,
@@ -6539,6 +6547,33 @@ export function recoveryService(
             // `failed` is a genuine park failure (evidence-gate rejection
             // because there's nothing reviewable yet, or a transient update
             // failure). Fall through to the normal blocked recovery path.
+          }
+        }
+
+        // BLO-19124: `issue_dependencies_blocked` is a *wait*, not a failure. The
+        // dispatcher emits it when `listDependencyReadiness` says the issue is not
+        // dependency-ready, and its own cancellation reason promises "Paperclip will
+        // wake the assignee when blockers resolve" — that wake comes from
+        // `listWakeableBlockedDependents` when the blocker closes. It shares the
+        // non-retryable Set with genuine failures (`agent_not_invokable`,
+        // `budget_exhausted`) only because neither should burn retry attempts, and
+        // that co-tenancy made every correctly-sequenced DAG node escalate as a
+        // strand: 158 of 161 active recovery actions on one inbox, all 158 with a
+        // genuinely unresolved blocker. Escalating them is worse than a no-op —
+        // `escalateStrandedAssignedIssue` reassigns the issue to a recovery owner, so
+        // the dependency wake then fires at an agent that is no longer the assignee.
+        // Re-evaluate readiness *now* (not from the run's stale evidence): if the
+        // dispatcher's own gate would still refuse, there is nothing an owner can do,
+        // so skip. Keep escalating when the issue is dependency-ready, because
+        // "dependency-blocked with nothing blocking it" is a real defect and is
+        // exactly the `blocked`-with-zero-blockers state this ticket forbids.
+        if (classification.errorCode === DEPENDENCY_BLOCKED_ERROR_CODE) {
+          const readinessMap = await issuesSvc.listDependencyReadiness(issue.companyId, [issue.id]);
+          const readiness = readinessMap.get(issue.id);
+          if (readiness && !readiness.isDependencyReady) {
+            result.dependencyWaitSkipped += 1;
+            result.skipped += 1;
+            continue;
           }
         }
 
