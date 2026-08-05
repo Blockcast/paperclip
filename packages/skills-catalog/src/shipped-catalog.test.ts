@@ -68,6 +68,8 @@ const AUTHORING_COMMAND_PATTERNS = [
  * token file is the only selector that works — but `GH_TOKEN`, `--with-token`
  * and `gh auth` recipes are rejected too: they silently do *nothing* in these
  * pods, so documenting one next to an authoring command is a bug either way.
+ * The cluster SSH key (BLO-21854) is a third swap path: it authenticates to
+ * GitHub as a human account outside the App installation entirely.
  */
 const CREDENTIAL_SELECTOR_PATTERNS = [
   { name: "token-file selection", pattern: /PAPERCLIP_GITHUB_TOKEN_FILE\s*=/ },
@@ -76,6 +78,7 @@ const CREDENTIAL_SELECTOR_PATTERNS = [
   { name: "GITHUB_TOKEN assignment", pattern: /\bGITHUB_TOKEN\s*=/ },
   { name: "gh auth --with-token", pattern: /--with-token\b/ },
   { name: "gh auth login/switch", pattern: /\bgh\s+auth\s+(?:login|switch)\b/ },
+  { name: "literal cluster SSH key path", pattern: /\/paperclip\/\.ssh\/id_ed25519/ },
 ];
 
 /**
@@ -429,14 +432,17 @@ describe("shipped skills catalog", () => {
   it("names the cluster SSH key in the credential model and forbids any GitHub use (BLO-21854)", async () => {
     const content = await readFile(GITHUB_PR_WORKFLOW_SKILL, "utf8");
 
-    // /paperclip/.ssh/id_ed25519 authenticates to GitHub as a human's personal
-    // account (kkroo) as an unintended side effect of its cluster provisioning —
-    // the credential section must name it, its cluster-only scope, and the
-    // prohibition, so agents don't rediscover it as a surprise third authoring path.
-    expect(content).toContain("/paperclip/.ssh/id_ed25519");
-    expect(content).toContain("sfo12-public");
-    expect(content).toContain("home-residential");
-    expect(content).toContain("Never use this key for any GitHub operation");
+    // Scope the core assertions to the Cluster SSH key bullet itself, not the whole
+    // file — a test that only checks substrings survive anywhere would stay green
+    // even if the entry were removed or weakened and the strings persisted elsewhere.
+    const sshKeyEntry = /- \*\*Cluster SSH key\*\*[\s\S]*?See BLO-21854\./.exec(content)?.[0];
+    expect(sshKeyEntry, "Cluster SSH key credential entry not found").toBeTruthy();
+    expect(sshKeyEntry).toContain("/paperclip/.ssh/id_ed25519");
+    expect(sshKeyEntry).toContain("sfo12-public");
+    expect(sshKeyEntry).toContain("home-residential");
+    expect(sshKeyEntry).toContain("Never use this key for any GitHub operation");
+
+    // The authoring rule must extend the prohibition explicitly, not just imply it.
     expect(content).toContain("never over the cluster SSH key either");
   });
 
@@ -469,6 +475,18 @@ describe("shipped skills catalog", () => {
     const gitPushResult = credentialViolations(seatGitPush);
     expect(gitPushResult.authoringBlocks, "git -c … push must register as an authoring command").toBe(1);
     expect(gitPushResult.violations).not.toEqual([]);
+  });
+
+  it("rejects an authoring recipe that points git at the cluster SSH key (BLO-21854)", () => {
+    // The scanner defended only against token-based selectors before this key was
+    // documented. A GIT_SSH_COMMAND aimed at the cluster key is the same class of
+    // bypass — it must also fail the scan, or a future edit could reintroduce
+    // exactly the credential swap BLO-21854 found as a recipe here.
+    const sshKeyPush = ["```sh", "GIT_SSH_COMMAND='ssh -i /paperclip/.ssh/id_ed25519' git push origin HEAD", "```"].join("\n");
+
+    const result = credentialViolations(sshKeyPush);
+    expect(result.authoringBlocks, "git push must register as an authoring command").toBe(1);
+    expect(result.violations).not.toEqual([]);
   });
 
   describe("seat-authored PR recovery", () => {
