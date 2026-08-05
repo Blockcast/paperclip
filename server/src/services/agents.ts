@@ -939,6 +939,38 @@ export function agentService(db: Db) {
         await tx.delete(issueComments).where(eq(issueComments.authorAgentId, id));
         await tx.delete(approvalComments).where(eq(approvalComments.authorAgentId, id));
         await tx.update(approvals).set({ requestedByAgentId: null }).where(eq(approvals.requestedByAgentId, id));
+        // A hire approval that is still open when its pending agent is deleted has
+        // to stay withdrawable. Nulling `linked_agent_id` alone (next statement,
+        // and via the FK's ON DELETE SET NULL) strands a caller-supplied
+        // `payload.agentId` pointing at an agent that no longer exists, and the
+        // strict binding check in the approvals service then refuses the
+        // withdrawal with a 409 no retry can ever satisfy. Drop the stale
+        // reference so withdrawal takes the clean no-cleanup path instead.
+        // Undecided rows only -- decided rows keep the reference as history.
+        //
+        // Scoped to the removed agent's own company. `payload.agentId` is
+        // caller-controlled free-form JSON, so without this predicate any
+        // company could plant another company's agent id in a payload and have
+        // its approval rewritten when that foreign agent is deleted -- both a
+        // tenant-isolation break and an existence oracle for agents the caller
+        // cannot otherwise observe. The `linked_agent_id` arm is a trusted FK
+        // and same-company at every write site, so the predicate is a no-op
+        // there; it is the untrusted arm it constrains.
+        await tx
+          .update(approvals)
+          .set({ payload: sql`${approvals.payload} - 'agentId'` })
+          .where(
+            and(
+              eq(approvals.companyId, existing.companyId),
+              eq(approvals.type, "hire_agent"),
+              inArray(approvals.status, ["pending", "revision_requested"]),
+              or(
+                eq(approvals.linkedAgentId, id),
+                sql`${approvals.payload} ->> 'agentId' = ${id}`,
+              ),
+            ),
+          );
+        await tx.update(approvals).set({ linkedAgentId: null }).where(eq(approvals.linkedAgentId, id));
         await tx.update(assets).set({ createdByAgentId: null }).where(eq(assets.createdByAgentId, id));
         await tx.update(financeEvents).set({ agentId: null }).where(eq(financeEvents.agentId, id));
         await tx.update(goals).set({ ownerAgentId: null }).where(eq(goals.ownerAgentId, id));

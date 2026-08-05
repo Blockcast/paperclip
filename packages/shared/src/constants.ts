@@ -637,6 +637,7 @@ export const APPROVAL_STATUSES = [
   "revision_requested",
   "approved",
   "rejected",
+  "withdrawn",
   "cancelled",
 ] as const;
 export type ApprovalStatus = (typeof APPROVAL_STATUSES)[number];

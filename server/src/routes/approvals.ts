@@ -7,6 +7,7 @@ import {
   requestApprovalRevisionSchema,
   resolveApprovalSchema,
   resubmitApprovalSchema,
+  withdrawApprovalSchema,
 } from "@paperclipai/shared";
 import { validate } from "../middleware/validate.js";
 import {
@@ -146,6 +147,15 @@ export function approvalRoutes(
             { strictMode: strictSecretsMode },
           )
         : approvalInput.payload;
+    if (
+      approvalInput.type === "hire_agent" &&
+      Object.prototype.hasOwnProperty.call(normalizedPayload, "agentId")
+    ) {
+      res.status(422).json({
+        error: "Generic hire approvals cannot bind an existing agent; use the agent hire endpoint",
+      });
+      return;
+    }
 
     const actor = getActorInfo(req);
     const approval = await svc.create(companyId, {
@@ -312,7 +322,7 @@ export function approvalRoutes(
       return;
     }
 
-    const normalizedPayload = req.body.payload
+    let normalizedPayload = req.body.payload
       ? existing.type === "hire_agent"
         ? await secretsSvc.normalizeHireApprovalPayloadForPersistence(
             existing.companyId,
@@ -321,6 +331,19 @@ export function approvalRoutes(
           )
         : req.body.payload
       : undefined;
+    if (existing.type === "hire_agent" && normalizedPayload) {
+      const submittedAgentId = normalizedPayload.agentId;
+      if (
+        (existing.linkedAgentId && submittedAgentId !== undefined && submittedAgentId !== existing.linkedAgentId) ||
+        (!existing.linkedAgentId && Object.prototype.hasOwnProperty.call(normalizedPayload, "agentId"))
+      ) {
+        res.status(422).json({ error: "Hire approval agent binding cannot be changed" });
+        return;
+      }
+      if (existing.linkedAgentId) {
+        normalizedPayload = { ...normalizedPayload, agentId: existing.linkedAgentId };
+      }
+    }
     const approval = await svc.resubmit(id, normalizedPayload);
     const actor = getActorInfo(req);
     await logActivity(db, {
@@ -333,6 +356,33 @@ export function approvalRoutes(
       entityId: approval.id,
       details: { type: approval.type },
     });
+    res.json(redactApprovalPayload(approval));
+  });
+
+  router.post("/approvals/:id/withdraw", validate(withdrawApprovalSchema), async (req, res) => {
+    const id = req.params.id as string;
+    const existing = await getAccessibleResource(req, res, svc.getById(id), "Approval not found");
+    if (!existing) return;
+    if (!(await assertApprovalMutationAllowedByRunContext(req, res, existing.companyId))) return;
+
+    // Scoped exactly like resubmit: a requester may rescind its own ask, but
+    // never another agent's. Board actors retain full reach.
+    if (req.actor.type === "agent" && req.actor.agentId !== existing.requestedByAgentId) {
+      res.status(403).json({ error: "Only requesting agent can withdraw this approval" });
+      return;
+    }
+
+    const actor = getActorInfo(req);
+    const reason = req.body.reason as string;
+    const approval = await svc.withdraw(id, reason, {
+      userId: actor.actorType === "user" ? actor.actorId : null,
+      activity: {
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+      },
+    });
+
     res.json(redactApprovalPayload(approval));
   });
 
