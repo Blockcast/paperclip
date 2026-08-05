@@ -259,6 +259,72 @@ describe("github-webhook pure helpers", () => {
     ).toEqual({ owning: [] });
   });
 
+  it("keeps owning-looking text unreachable inside list-nested fences and unclosed fences (BLO-20886)", () => {
+    // A fence nested in a list item is ordinary Markdown -- it is how a bullet
+    // quotes an example PR body -- but its opening line starts with the list
+    // marker. A root-level-only fence scanner never opened a fence here, so the
+    // indented `Refs:` line inside the example declared an owner and could
+    // capture an author-directed "push a follow-up commit" wake.
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: ["- ```md", "  Refs: BLO-999", "  ```"].join("\n") }),
+    ).toEqual({ owning: [] });
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: ["1. ~~~", "   Closes: BLO-998", "   ~~~"].join("\n") }),
+    ).toEqual({ owning: [] });
+
+    // CommonMark allows only whitespace after a CLOSING fence's marker run, so
+    // ``` js inside an open fence is content. Treating it as the close reopened
+    // the remainder of the block to the ownership scan.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: ["```", "example:", "``` js", "Refs: BLO-997", "```"].join("\n"),
+      }),
+    ).toEqual({ owning: [] });
+
+    // An unterminated fence swallows the rest of the body rather than falling
+    // back to matching -- ambiguity fails closed, never toward a guessed owner.
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: ["```", "Refs: BLO-996"].join("\n") }),
+    ).toEqual({ owning: [] });
+
+    // The fence rules must not swallow the real thing: a closed fence releases
+    // the lines after it, and the repo's bulleted house style still owns.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: ["- ```md", "  Refs: BLO-999", "  ```", "- Refs: BLO-19132"].join("\n"),
+      }),
+    ).toEqual({ owning: ["BLO-19132"] });
+  });
+
+  it("never lets an HTML comment declare an owner (BLO-20886)", () => {
+    // A comment renders as nothing, so an owner declared inside one is
+    // invisible to every human reading the PR -- an unexplainable misroute.
+    // The opener and its `-->` sit on different lines in the repo's own
+    // PULL_REQUEST_TEMPLATE.md, so the state has to cross the line loop.
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: ["<!--", "Refs: BLO-888", "-->"].join("\n") }),
+    ).toEqual({ owning: [] });
+    expect(resolveOwningPaperclipIdentifiers({ body: "<!-- Refs: BLO-887 -->" })).toEqual({
+      owning: [],
+    });
+    // A comment cannot hide the fence that would otherwise contain it, either.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: ["<!-- ```", "-->", "Refs: BLO-886"].join("\n"),
+      }),
+    ).toEqual({ owning: ["BLO-886"] });
+    // Unterminated: the rest of the body stays commented out, failing closed.
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: ["<!--", "Refs: BLO-885"].join("\n") }),
+    ).toEqual({ owning: [] });
+    // A visible owner beside a commented decoy resolves to the visible one only.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: ["<!-- Fixes: BLO-884 -->", "Refs: BLO-19132"].join("\n"),
+      }),
+    ).toEqual({ owning: ["BLO-19132"] });
+  });
+
   it("falls back to a non-closing house-reference body line when title/keyword/branch all resolve nothing (BLO-21312)", () => {
     // `github_pr_review_requested` arrives via `issue_comment`, whose payload
     // carries no `pull_request.head.ref` -- `branch` is never populated on
@@ -356,7 +422,6 @@ describe("github-webhook pure helpers", () => {
       }),
     ).toEqual({ owning: ["BLO-1"] });
   });
-
 
   it("rejects payloads with bad signatures and accepts ones with good signatures", () => {
     const secret = "test-webhook-secret-do-not-use-in-prod";

@@ -152,12 +152,13 @@ describe("ReviewQueueCard", () => {
 
   async function render(
     client = new QueryClient({ defaultOptions: { queries: { retry: false } } }),
+    emptyState: "hidden" | "reassure" = "reassure",
   ) {
     root = createRoot(container);
     await act(async () => {
       root.render(
         <QueryClientProvider client={client}>
-          <ReviewQueueCard emptyState="reassure" />
+          <ReviewQueueCard emptyState={emptyState} />
         </QueryClientProvider>,
       );
     });
@@ -263,11 +264,13 @@ describe("ReviewQueueCard", () => {
     });
   });
 
-  it("keeps refreshing an empty mounted queue so externally-created pending requests appear", async () => {
+  it("polls an empty mounted queue on ONE timer so externally-created pending requests appear", async () => {
     let pendingCreated = false;
-    listActionRequestsMock.mockImplementation(async () => ({
-      actionRequests: pendingCreated ? [pendingRequest()] : [],
-    }));
+    const callTimes: number[] = [];
+    listActionRequestsMock.mockImplementation(async () => {
+      callTimes.push(Date.now());
+      return { actionRequests: pendingCreated ? [pendingRequest()] : [] };
+    });
 
     await render();
 
@@ -276,22 +279,52 @@ describe("ReviewQueueCard", () => {
       expect(document.body.textContent).toContain("Nothing is waiting for your OK right now.");
     });
 
+    // Two polls past the mount burst, so there are real intervals to measure.
     await vi.waitFor(
       () => {
-        expect(listActionRequestsMock.mock.calls.length).toBeGreaterThanOrEqual(3);
+        expect(callTimes.length).toBeGreaterThanOrEqual(4);
         expect(document.body.textContent).toContain("Nothing is waiting for your OK right now.");
       },
-      { timeout: 3_500 },
+      { timeout: 8_000 },
     );
+
+    // The cadence itself is the assertion. A bare call count cannot distinguish
+    // one 2s timer from two, so measure the gaps: calls[0] and calls[1] are the
+    // deliberate back-to-back mount refetch, and everything after is polling.
+    // A second concurrent timer shows up as a pair of near-simultaneous calls,
+    // which no jitter on a single timer can produce.
+    const pollGaps = callTimes.slice(2).map((time, index) => time - callTimes[index + 1]);
+    expect(pollGaps.length).toBeGreaterThanOrEqual(2);
+    expect(Math.min(...pollGaps)).toBeGreaterThanOrEqual(1_000);
 
     pendingCreated = true;
 
     await vi.waitFor(
       () => {
-        expect(listActionRequestsMock.mock.calls.length).toBeGreaterThanOrEqual(4);
         expect(buttonContaining("Allow once")).toBeTruthy();
       },
       { timeout: 3_500 },
     );
+  });
+
+  it("leaves a hidden empty queue on the slow interval instead of fast-polling it", async () => {
+    // This is what pins the queue to ONE polling mechanism. The visible cadence
+    // cannot: a second timer re-armed off the same fetch completion converges
+    // with refetchInterval and react-query dedupes the pair, so both variants
+    // poll at an identical ~2s and no call-count or gap assertion can tell them
+    // apart. The hidden case can -- refetchInterval deliberately backs off to
+    // 20s when the card renders nothing, and a stray unconditional 2s timer
+    // silently overrides exactly that.
+    listActionRequestsMock.mockResolvedValue({ actionRequests: [] });
+
+    await render(undefined, "hidden");
+
+    await vi.waitFor(() => {
+      expect(listActionRequestsMock).toHaveBeenCalledTimes(2);
+    });
+
+    await new Promise((resolve) => window.setTimeout(resolve, 2_600));
+
+    expect(listActionRequestsMock).toHaveBeenCalledTimes(2);
   });
 });
