@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, gte, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
@@ -5001,12 +5001,18 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       // Re-read source issue under the lock so the recovery action records
       // the latest owner/status evidence and repeated sweeps reuse the same
       // source-scoped action instead of creating issue-backed fallbacks.
-      const [fresh] = await tx
-        .select()
+      const [freshRow] = await tx
+        .select({
+          ...getTableColumns(issues),
+          // Compare the same raw Postgres value later; Date would truncate
+          // microseconds from a default `now()` updated_at and self-miss the CAS.
+          updatedAtCasToken: sql<string>`${issues.updatedAt}::text`,
+        })
         .from(issues)
         .where(eq(issues.id, input.issue.id))
         .limit(1);
-      if (!fresh) return null;
+      if (!freshRow) return null;
+      const { updatedAtCasToken, ...fresh } = freshRow;
       // BLO-18643: mirror the park paths' own re-check (parkReviewWaitingContinuationIssue /
       // parkNoDependencyReviewWaitingIssue both bail if `fresh.status` has moved past the
       // status the candidate was read at). Without this, a park that committed first --
@@ -5105,7 +5111,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         // Ally follow-up: status alone is not enough. A concurrent writer can keep
         // the same status while changing blockers or ownership, so include the
         // observed freshness marker too.
-        { expectedStatus: [fresh.status], expectedUpdatedAt: fresh.updatedAt },
+        { expectedStatus: [fresh.status], expectedUpdatedAt: updatedAtCasToken },
       );
       // BLO-18829: throw rather than `return null`. Returning would COMMIT the
       // transaction, which is exactly the bug: the recovery action, monitor, and wake
