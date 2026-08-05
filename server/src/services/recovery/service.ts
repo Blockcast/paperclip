@@ -1538,10 +1538,11 @@ export function recoveryService(
     return count;
   }
 
-  async function getLatestIssueRunForAgent(
+  async function getLatestIssueRunForAgentStage(
     companyId: string,
     issueId: string,
     agentId: string,
+    stageId: string,
   ): Promise<LatestIssueRun> {
     return db
       .select({
@@ -1563,6 +1564,10 @@ export function recoveryService(
           eq(heartbeatRuns.companyId, companyId),
           eq(heartbeatRuns.agentId, agentId),
           sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+          sql`coalesce(
+            ${heartbeatRuns.contextSnapshot} -> 'executionStage' ->> 'stageId',
+            ${heartbeatRuns.contextSnapshot} ->> 'currentStageId'
+          ) = ${stageId}`,
         ),
       )
       .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
@@ -1741,7 +1746,6 @@ export function recoveryService(
   async function hasSuccessfulIssueRunSince(
     companyId: string,
     issueId: string,
-    agentId: string,
     since: Date,
     interactionId?: string | null,
   ) {
@@ -1751,7 +1755,6 @@ export function recoveryService(
       .where(
         and(
           eq(heartbeatRuns.companyId, companyId),
-          eq(heartbeatRuns.agentId, agentId),
           eq(heartbeatRuns.status, "succeeded"),
           sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
           interactionId
@@ -1767,7 +1770,6 @@ export function recoveryService(
   async function getLatestIssueRunSince(
     companyId: string,
     issueId: string,
-    agentId: string,
     since: Date,
     interactionId: string,
   ): Promise<LatestIssueRun> {
@@ -1789,7 +1791,6 @@ export function recoveryService(
       .where(
         and(
           eq(heartbeatRuns.companyId, companyId),
-          eq(heartbeatRuns.agentId, agentId),
           sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
           sql`${heartbeatRuns.contextSnapshot} ->> 'interactionId' = ${interactionId}`,
           or(gte(heartbeatRuns.createdAt, since), gte(heartbeatRuns.finishedAt, since)),
@@ -5854,8 +5855,14 @@ export function recoveryService(
         continue;
       }
       const recoveryNow = new Date();
-      const participantLatestRunForRecovery = issue.status === "in_review" && participantAgentId
-        ? await getLatestIssueRunForAgent(issue.companyId, issue.id, participantAgentId)
+      const participantLatestRunForRecovery = issue.status === "in_review" && participantAgentId &&
+          pendingExecutionState?.currentStageId
+        ? await getLatestIssueRunForAgentStage(
+            issue.companyId,
+            issue.id,
+            participantAgentId,
+            pendingExecutionState.currentStageId,
+          )
         : null;
       const providerQuotaMonitorRun = issue.status === "in_review"
         ? participantLatestRunForRecovery
@@ -5940,7 +5947,6 @@ export function recoveryService(
         const successfulRunSinceResolution = await hasSuccessfulIssueRunSince(
           issue.companyId,
           issue.id,
-          agentId,
           acceptedInteractionResolvedAt,
           acceptedContinuationInteraction.id,
         );
@@ -5949,7 +5955,6 @@ export function recoveryService(
           const latestPostResolutionRun = await getLatestIssueRunSince(
             issue.companyId,
             issue.id,
-            agentId,
             acceptedInteractionResolvedAt,
             acceptedContinuationInteraction.id,
           );

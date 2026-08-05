@@ -1008,6 +1008,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       reason: wakeReason,
       payload: {
         issueId,
+        executionStage: { stageId, stageType: "review" },
         ...(input?.retryReason ? { retryReason: input.retryReason } : {}),
       },
       status: "queued",
@@ -1028,6 +1029,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         issueId,
         taskId: issueId,
         wakeReason,
+        executionStage: { stageId, stageType: "review" },
         ...(input?.retryReason ? { retryReason: input.retryReason } : {}),
       },
       updatedAt: now,
@@ -1911,13 +1913,21 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
     expect(await heartbeat.getRun(runId)).toMatchObject({
       status: "failed",
-      errorCode: "pr_review_output_missing",
+      errorCode: "job_missing",
+      resultJson: {
+        externalLifecycleRecovery: expect.objectContaining({ adapterInvocationStarted: true }),
+      },
     });
     const retries = await db
       .select()
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.retryOfRunId, runId));
-    expect(retries).toHaveLength(1);
+    expect(retries.some((retry) =>
+      (retry.contextSnapshot as Record<string, unknown> | null)?.source === "issue.continuation_recovery"
+    )).toBe(false);
+    expect(retries.every((retry) =>
+      (retry.contextSnapshot as Record<string, unknown> | null)?.allowDeliverableWork === false
+    )).toBe(true);
   });
 
   async function recoverClaimedReviewWithUnavailableVerification(kind: "result" | "throw") {
@@ -1960,20 +1970,32 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   it("keeps a missing-Job review claim fail-closed when GitHub returns an error", async () => {
     await expect(recoverClaimedReviewWithUnavailableVerification("result")).resolves.toMatchObject({
       status: "failed",
-      errorCode: "pr_review_verification_unavailable",
-      error: expect.stringContaining("reviews_http_503"),
+      errorCode: "job_missing",
+      resultJson: {
+        externalLifecycleRecovery: expect.objectContaining({
+          adapterInvocationStarted: true,
+          prReviewErrorCode: "pr_review_verification_unavailable",
+          prReviewErrorMessage: expect.stringContaining("reviews_http_503"),
+        }),
+      },
     });
   });
 
   it("keeps a missing-Job review claim fail-closed when GitHub verification throws", async () => {
     await expect(recoverClaimedReviewWithUnavailableVerification("throw")).resolves.toMatchObject({
       status: "failed",
-      errorCode: "pr_review_verification_unavailable",
-      error: expect.stringContaining("verification_threw"),
+      errorCode: "job_missing",
+      resultJson: {
+        externalLifecycleRecovery: expect.objectContaining({
+          adapterInvocationStarted: true,
+          prReviewErrorCode: "pr_review_verification_unavailable",
+          prReviewErrorMessage: expect.stringContaining("verification_threw"),
+        }),
+      },
     });
   });
 
-  it("fails and retries once when a PR-review request comment is not outcome evidence", async () => {
+  it("does not replay a missing-Job PR review when a request comment is not outcome evidence", async () => {
     const jobName = "agent-opencode-review-lost";
     const headSha = "075a9aeff53a229199ab0583e916f33c22459983";
     const { companyId, agentId, runId } = await seedRunFixture({
@@ -2013,14 +2035,24 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(mockGithubHasReviewerEvidenceForPr).toHaveBeenCalledTimes(1);
     expect(await heartbeat.getRun(runId)).toMatchObject({
       status: "failed",
-      errorCode: "pr_review_output_missing",
+      errorCode: "job_missing",
+      resultJson: {
+        externalLifecycleRecovery: expect.objectContaining({
+          adapterInvocationStarted: true,
+          prReviewErrorCode: "pr_review_output_missing",
+        }),
+      },
     });
     const retries = await db
       .select()
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.retryOfRunId, runId));
-    expect(retries).toHaveLength(1);
-    expect(retries[0]).toMatchObject({ status: "scheduled_retry", scheduledRetryAttempt: 1 });
+    expect(retries.some((retry) =>
+      (retry.contextSnapshot as Record<string, unknown> | null)?.source === "issue.continuation_recovery"
+    )).toBe(false);
+    expect(retries.every((retry) =>
+      (retry.contextSnapshot as Record<string, unknown> | null)?.allowDeliverableWork === false
+    )).toBe(true);
   });
 
   it("does not treat generic run artifacts as a completed missing-Job outcome", async () => {
@@ -6102,6 +6134,55 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(retryRun?.contextSnapshot as Record<string, unknown>).not.toHaveProperty("modelProfile");
   });
 
+  it("does not apply a prior-stage job_missing failure to a later stage with the same reviewer", async () => {
+    const { agentId, issueId, runId, wakeupRequestId } = await seedInReviewParticipantRunFixture();
+    const nextStageId = randomUUID();
+    const finishedAt = new Date("2026-03-19T00:05:00.000Z");
+    await db.update(heartbeatRuns).set({
+      status: "failed",
+      error: "External lifecycle Job is missing while heartbeat run is still running",
+      errorCode: "job_missing",
+      startedAt: new Date("2026-03-19T00:00:00.000Z"),
+      finishedAt,
+      updatedAt: finishedAt,
+    }).where(eq(heartbeatRuns.id, runId));
+    await db.update(agentWakeupRequests).set({
+      status: "failed",
+      finishedAt,
+      updatedAt: finishedAt,
+    }).where(eq(agentWakeupRequests.id, wakeupRequestId));
+    await db.update(issues).set({
+      executionRunId: null,
+      executionAgentNameKey: null,
+      executionLockedAt: null,
+      executionState: {
+        status: "pending",
+        currentStageId: nextStageId,
+        currentStageIndex: 1,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId, userId: null },
+        returnAssignee: { type: "agent", agentId, userId: null },
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    }).where(eq(issues.id, issueId));
+
+    const result = await createHeartbeat().reconcileStrandedAssignedIssues();
+
+    expect(result).toMatchObject({ reviewParticipantRequeued: 0, escalated: 0, skipped: 1 });
+    const [issue, recoveryRuns] = await Promise.all([
+      db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null),
+      db.select().from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.agentId, agentId),
+        sql`${heartbeatRuns.contextSnapshot} ->> 'currentStageId' = ${nextStageId}`,
+      )),
+    ]);
+    expect(issue?.status).toBe("in_review");
+    expect(recoveryRuns).toHaveLength(0);
+  });
+
   it("re-enqueues a stranded execution-review participant when another agent has the latest issue run", async () => {
     const { companyId, agentId, issueId, runId, wakeupRequestId, stageId } =
       await seedInReviewParticipantRunFixture();
@@ -6782,6 +6863,65 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       (run.contextSnapshot as Record<string, unknown> | null)?.source ===
         "issue.interaction_continuation_recovery"
     )).toHaveLength(0);
+  });
+
+  it("blocks accepted interaction continuation after reassignment without replaying prior-owner work", async () => {
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      runErrorCode: "job_missing",
+      retryReason: "issue_continuation_needed",
+    });
+    const nextAgentId = randomUUID();
+    const interactionId = randomUUID();
+    const resolvedAt = new Date("2026-03-18T23:59:00.000Z");
+    await db.insert(agents).values({
+      id: nextAgentId,
+      companyId,
+      name: "NextOwner",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issueThreadInteractions).values({
+      id: interactionId,
+      companyId,
+      issueId,
+      kind: "request_confirmation",
+      status: "accepted",
+      continuationPolicy: "wake_assignee_on_accept",
+      createdByAgentId: agentId,
+      resolvedByUserId: "responsible-user",
+      resolvedAt,
+      updatedAt: resolvedAt,
+      payload: { version: 1, prompt: "Approve the plan?" },
+      result: { outcome: "accepted" },
+    });
+    await db.update(heartbeatRuns).set({
+      contextSnapshot: { issueId, interactionId },
+    }).where(eq(heartbeatRuns.id, runId));
+    await db.update(issues).set({ assigneeAgentId: nextAgentId }).where(eq(issues.id, issueId));
+
+    const result = await createHeartbeat().reconcileStrandedAssignedIssues();
+
+    expect(result).toMatchObject({ continuationRequeued: 0, escalated: 1 });
+    const [issue, nextOwnerRuns] = await Promise.all([
+      db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null),
+      db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, nextAgentId)),
+    ]);
+    expect(issue?.status).toBe("blocked");
+    expect(nextOwnerRuns.some((run) =>
+      (run.contextSnapshot as Record<string, unknown> | null)?.source ===
+        "issue.interaction_continuation_recovery"
+    )).toBe(false);
+    expect(nextOwnerRuns).toHaveLength(1);
+    expect(nextOwnerRuns[0]?.contextSnapshot).toMatchObject({
+      allowDeliverableWork: false,
+      recoveryIntent: "status_only",
+    });
   });
 
   it("escalates accepted interaction continuation recovery after three review-park cancellations", async () => {

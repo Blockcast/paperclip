@@ -1030,6 +1030,8 @@ export function shouldScheduleAutomaticRunRetry(
     run.errorCode === "pr_review_output_missing" ||
     run.errorCode === "pr_review_verification_unavailable"
   ) {
+    const recovery = parseObject(parseObject(run.resultJson).externalLifecycleRecovery);
+    if (recovery.adapterInvocationStarted === true) return false;
     return isPrReviewRetryContext(parseObject(run.contextSnapshot));
   }
 
@@ -16586,7 +16588,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
       : externalLifecycleTerminalOutcome(input.jobStatus, preserveRecordedOutcome);
     const terminalOutcome =
-      baseTerminalOutcome && prReviewIncompleteOverride && !input.staleKill
+      baseTerminalOutcome && prReviewIncompleteOverride && !input.staleKill &&
+        baseTerminalOutcome.errorCode !== "job_missing"
         ? {
             ...baseTerminalOutcome,
             errorCode: prReviewIncompleteOverride.errorCode,
@@ -16596,7 +16599,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (!terminalOutcome) return false;
 
     const adapterInvocationStarted =
-        terminalOutcome.errorCode === "job_failed" || terminalOutcome.errorCode === "job_missing"
+        baseTerminalOutcome?.errorCode === "job_failed" || baseTerminalOutcome?.errorCode === "job_missing"
       ? await hasAdapterInvocationEvent(input.run.id)
       : null;
 
@@ -16617,6 +16620,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             jobPhase: terminalOutcome.jobPhase,
             jobReason: terminalOutcome.jobReason,
             jobMessage: terminalOutcome.jobMessage,
+            ...(prReviewIncompleteOverride
+              ? {
+                  prReviewErrorCode: prReviewIncompleteOverride.errorCode,
+                  prReviewErrorMessage: prReviewIncompleteOverride.errorMessage,
+                }
+              : {}),
             ...(adapterInvocationStarted !== null ? { adapterInvocationStarted } : {}),
             ...(containerDiagnostics ? { containerDiagnostics } : {}),
           },
@@ -16731,6 +16740,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const finalizationAgent = await getAgent(finalizedRun.agentId);
     if (
       terminalOutcome.status === "failed" &&
+      adapterInvocationStarted !== true &&
       shouldScheduleAutomaticRunRetry(finalizedRun) &&
       finalizationAgent
     ) {
@@ -24537,6 +24547,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const shouldBlockImmediately =
         !recoveryAgentInvokable ||
         !recoveryAgent ||
+        run.errorCode === "job_missing" ||
+        run.errorCode === "k8s_pod_schedule_failed" ||
         isWorkspaceValidationFailedRun(run) ||
         isConfigurationIncompleteFailedRun(run) ||
         didAutomaticRecoveryFail(run, issue.status === "todo" ? "assignment_recovery" : "issue_continuation_needed");
