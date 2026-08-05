@@ -8779,10 +8779,33 @@ export function issueService(db: Db) {
           ? [inArray(issues.status, options.expectedStatus)]
           : [];
         if (options?.expectedUpdatedAt instanceof Date) {
-          casPreconditions.push(eq(issues.updatedAt, options.expectedUpdatedAt));
+          // BLO-18829: compare over a half-open millisecond window, NOT with a bare
+          // `eq`. `issues.updated_at` is `timestamp with time zone`, which Postgres
+          // stores at microsecond precision, but a JS `Date` holds only milliseconds --
+          // so a Date obtained by reading this column is a *truncation* of the value on
+          // disk, and `eq(updatedAt, thatDate)` is unsatisfiable for every row still
+          // holding a `defaultNow()`/`now()` value. Left as `eq`, this branch is a
+          // permanently-closed guard: in `escalateStrandedAssignedIssue` a CAS miss
+          // throws the rollback sentinel, so the whole escalation transaction reverts
+          // and stranded issues silently stop escalating (no recovery action, no
+          // monitor, no owner wake) -- the under-escalation outcome AC-3 forbids.
+          //
+          // Prefer the string-token form below, which is exact. This branch exists for
+          // callers that only hold a Date and accepts 1ms granularity as the cost.
+          //
+          // Expressed with drizzle's typed timestamp operators rather than
+          // `date_trunc('milliseconds', ...) = $1`, because a raw `sql` fragment loses
+          // the column type and postgres.js then refuses to bind a JS Date ("must be of
+          // type string or Buffer, received Date"). Also index-friendly.
+          casPreconditions.push(
+            gte(issues.updatedAt, options.expectedUpdatedAt),
+            lt(issues.updatedAt, new Date(options.expectedUpdatedAt.getTime() + 1)),
+          );
         } else if (typeof options?.expectedUpdatedAt === "string") {
           // Raw database token, used when the caller must preserve Postgres
-          // microseconds that a JavaScript Date would truncate.
+          // microseconds that a JavaScript Date would truncate. Exact -- this is the
+          // form `escalateStrandedAssignedIssue` uses, pairing with a
+          // `${issues.updatedAt}::text` projection on the read side.
           casPreconditions.push(sql`${issues.updatedAt}::text = ${options.expectedUpdatedAt}`);
         }
         const writePreconditions = [...conflictPreconditions, ...casPreconditions];
