@@ -417,8 +417,12 @@ describe("shipped skills catalog", () => {
     expect(content).toContain("Use stacked PRs only when a follow-up change truly depends");
     expect(content).toContain("reviewed as an incremental diff against that base branch");
     expect(content).toContain("Stack: parent #<number>");
-    expect(content).toMatch(/Retarget to <default-branch> after #<number>\s+merges/);
-    expect(content).toContain("only then put it in the merge queue");
+    expect(content).toMatch(/change base to\s+<default-branch>, reconcile child commits, verify final diff, request fresh\s+review/);
+    expect(content).toContain("change the child PR's configured base to");
+    expect(content).toContain("reconcile the child commits for the parent's");
+    expect(content).toContain("Verify the final base and diff before continuing");
+    expect(content).toContain("request a fresh exact-head review");
+    expect(content).toContain("after that fresh review/approval and the required checks are current");
     expect(content).toMatch(/Protected branch\s+rules not configured for this branch/);
   });
 

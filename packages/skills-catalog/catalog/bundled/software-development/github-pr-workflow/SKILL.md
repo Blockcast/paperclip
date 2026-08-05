@@ -47,11 +47,20 @@ Rules:
   reviewed as an incremental diff against that base branch.
 - The child PR body must name the stack relationship and the retargeting plan:
   `Stack: parent #<number>`, `Base branch: <parent-branch>`, the dependency the
-  child needs from the parent, and `Retarget to <default-branch> after #<number>
-  merges`.
-- After the parent merges, immediately retarget or rebase the child onto the
-  default branch, rerun required checks, refresh the PR body if the diff changed,
-  and only then put it in the merge queue.
+  child needs from the parent, and `After #<number> merges: change base to
+  <default-branch>, reconcile child commits, verify final diff, request fresh
+  review`.
+- After the parent merges, immediately change the child PR's configured base to
+  the protected/default branch. Then reconcile the child commits for the parent's
+  merge method: a squash, rebase, or conflict resolution can change which commits
+  are already present on the default branch, so rebase or cherry-pick only the
+  child changes as needed.
+- Verify the final base and diff before continuing. `gh pr view` must show the
+  protected/default branch as the child PR's base branch, and the final PR diff
+  must contain only the child change.
+- Rerun required checks and request a fresh exact-head review after the final
+  base, head, and diff are established. Put the child in the merge queue only
+  after that fresh review/approval and the required checks are current.
 - Do not approve or auto-merge a stacked child while its base branch is an
   unprotected feature branch. GitHub may reject auto-merge with "Protected branch
   rules not configured for this branch", and the approval can be wasted if the
