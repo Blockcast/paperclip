@@ -155,6 +155,9 @@ describeEmbeddedPostgres("activity service", () => {
 
     const bogusResult = await activityService(db).list({ companyId, action: "no_such_action" });
     expect(bogusResult).toEqual([]);
+
+    const emptyActionResult = await activityService(db).list({ companyId, action: "" });
+    expect(emptyActionResult).toEqual([]);
   });
 
   it("returns compact usage and result summaries for issue runs", async () => {
