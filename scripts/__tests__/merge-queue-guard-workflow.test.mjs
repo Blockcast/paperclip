@@ -142,6 +142,53 @@ test("every arc-light root job waits for the merge-queue guard before consuming 
   }
 });
 
+test("every job downstream of policy scopes its own success check instead of inheriting the default", () => {
+  // BLO-21953 follow-up #2: GitHub's default `if: success()` walks the whole
+  // transitive needs graph, not just a job's direct `needs:` edge. Once
+  // `policy` gained `merge_queue_guard` as an ancestor, every job with a bare
+  // `needs: [policy]` (relying on the implicit default condition) started
+  // silently skipping on pull_request events -- merge_queue_guard reports
+  // `skipped` there, and that skip cascades past policy's own explicit
+  // always()-tolerant override to every descendant that didn't repeat it.
+  // `verify` treats an upstream skip as a failure, so this broke the
+  // required check for every PR, not just ones touching this workflow. This
+  // was caught by `verify` itself failing on this PR's own pull_request
+  // check run, not by this test file -- codifying it here so it can't ship
+  // silently again.
+  const directPolicyJobs = [
+    "typecheck_release_registry",
+    "worktree_install",
+    "general_tests",
+    "build",
+    "canary_dry_run",
+    "e2e",
+  ];
+  const jobsSection = workflow.slice(workflow.indexOf("\njobs:\n"));
+  const jobNames = [...jobsSection.matchAll(/^  ([a-z0-9_]+):\n/gm)].map((match) => match[1]);
+
+  for (const job of directPolicyJobs) {
+    const nextJob = jobNames[jobNames.indexOf(job) + 1];
+    const startMarker = `\n  ${job}:\n`;
+    const block = nextJob
+      ? extractBlock(startMarker, `\n  ${nextJob}:\n`)
+      : workflow.slice(workflow.indexOf(startMarker));
+    assert.match(block, /\n    needs: \[policy\]\n/, `${job} must declare needs: [policy]`);
+    assert.match(
+      block,
+      /\n    if: needs\.policy\.result == 'success'\n/,
+      `${job} must scope its run condition to policy's own result, not the implicit transitive success()`,
+    );
+  }
+
+  const verifyServerBlock = extractBlock("\n  verify_serialized_server:\n", "\n  canary_dry_run:\n");
+  assert.match(verifyServerBlock, /\n    needs: \[policy, general_tests\]\n/);
+  assert.match(
+    verifyServerBlock,
+    /\n    if: needs\.policy\.result == 'success' && needs\.general_tests\.result == 'success'\n/,
+    "verify_serialized_server must scope its run condition to its own direct dependencies' results",
+  );
+});
+
 test("live membership on the first page continues without cancelling", async () => {
   const result = await runGuard({
     responses: [responseFor(["other", "head-sha"])],
