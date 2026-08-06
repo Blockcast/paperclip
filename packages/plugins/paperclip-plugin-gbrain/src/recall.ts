@@ -159,6 +159,8 @@ function fallbackCandidates(input: PrefetchInput): TraversalCandidate[] {
 // graph. This bounds payload size regardless of how big the server-side hub
 // neighborhood is.
 export const MAX_ENRICHMENT_NODES = 50;
+export const MAX_ENRICHMENT_EDGES = 100;
+export const MAX_ENRICHMENT_SERIALIZED_BYTES = 64 * 1024;
 
 function mergeGraphs(primary: unknown | null, fallback: unknown): unknown {
   const cappedFallback = capEnrichmentGraph(fallback);
@@ -193,16 +195,25 @@ function mergeGraphs(primary: unknown | null, fallback: unknown): unknown {
  *  when nodes don't carry a `depth` field. */
 function capEnrichmentGraph(graph: unknown): unknown {
   if (Array.isArray(graph)) {
-    return capNodesArray(graph, MAX_ENRICHMENT_NODES);
+    return capArrayBySerializedBytes(capNodesArray(graph, MAX_ENRICHMENT_NODES));
   }
   if (isRecord(graph) && Array.isArray(graph.nodes)) {
-    const kept = capNodesArray(graph.nodes, MAX_ENRICHMENT_NODES);
-    if (kept === graph.nodes) return graph;
+    const kept = capArrayBySerializedBytes(capNodesArray(graph.nodes, MAX_ENRICHMENT_NODES));
     const keptSlugs = new Set(kept.map(nodeSlug).filter((slug): slug is string => slug !== null));
     const edges = Array.isArray(graph.edges)
-      ? graph.edges.filter((edge) => edgeWithinSlugs(edge, keptSlugs))
-      : graph.edges;
-    return { ...graph, nodes: kept, edges };
+      ? capArrayBySerializedBytes(
+          graph.edges.filter((edge) => edgeWithinSlugs(edge, keptSlugs)).slice(0, MAX_ENRICHMENT_EDGES),
+        )
+      : undefined;
+    return capGraphRecord({
+      nodes: kept,
+      ...(edges ? { edges } : {}),
+    });
+  }
+  if (isRecord(graph) && Array.isArray(graph.edges)) {
+    return capGraphRecord({
+      edges: capArrayBySerializedBytes(graph.edges.slice(0, MAX_ENRICHMENT_EDGES)),
+    });
   }
   return graph;
 }
@@ -228,6 +239,40 @@ function edgeWithinSlugs(edge: unknown, slugs: Set<string>): boolean {
   if (from !== null && !slugs.has(from)) return false;
   if (to !== null && !slugs.has(to)) return false;
   return true;
+}
+
+function capArrayBySerializedBytes(values: unknown[]): unknown[] {
+  const capped: unknown[] = [];
+  for (const value of values) {
+    capped.push(value);
+    if (serializedBytes(capped) > MAX_ENRICHMENT_SERIALIZED_BYTES) {
+      capped.pop();
+      break;
+    }
+  }
+  return capped;
+}
+
+function capGraphRecord(graph: { nodes?: unknown[]; edges?: unknown[] }): { nodes?: unknown[]; edges?: unknown[] } {
+  const capped = {
+    ...(graph.nodes ? { nodes: [...graph.nodes] } : {}),
+    ...(graph.edges ? { edges: [...graph.edges] } : {}),
+  };
+  while (serializedBytes(capped) > MAX_ENRICHMENT_SERIALIZED_BYTES && capped.edges && capped.edges.length > 0) {
+    capped.edges.pop();
+  }
+  while (serializedBytes(capped) > MAX_ENRICHMENT_SERIALIZED_BYTES && capped.nodes && capped.nodes.length > 0) {
+    capped.nodes.pop();
+    if (capped.edges) {
+      const keptSlugs = new Set(capped.nodes.map(nodeSlug).filter((slug): slug is string => slug !== null));
+      capped.edges = capped.edges.filter((edge) => edgeWithinSlugs(edge, keptSlugs));
+    }
+  }
+  return capped;
+}
+
+function serializedBytes(value: unknown): number {
+  return Buffer.byteLength(JSON.stringify(value));
 }
 
 function dedupeByStableString(values: unknown[]): unknown[] {
