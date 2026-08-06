@@ -4101,11 +4101,15 @@ export function recoveryService(
    * is a row in that shape, written on the escalation's transaction.
    *
    * The row is inserted pessimistically (already `dispatch_failed`, i.e. "owed but not
-   * yet delivered") and flipped to `dispatch_recovered` once the post-commit dispatch
-   * succeeds. That ordering is what makes the wake durable: if the process dies between
-   * commit and dispatch, the row is already on disk and the reconciler delivers it. If
-   * the CAS loses instead, the row rolls back with the rest of the escalation and no
-   * wake is ever owed.
+   * yet delivered") and DELETED once the post-commit dispatch succeeds. That ordering is
+   * what makes the wake durable: if the process dies between commit and dispatch, the row
+   * is already on disk and the reconciler delivers it. If the CAS loses instead, the row
+   * rolls back with the rest of the escalation and no wake is ever owed.
+   *
+   * It is deleted rather than retained as `dispatch_recovered` because this row is an IOU,
+   * not a wake, yet it carries the real wake's `agentId`/`reason`/`payload` -- so any
+   * reader that does not filter on status counts it as a second delivered wake. Retaining
+   * it made every escalation show up twice (see `dispatchDurableRecoveryWakeOutboxRow`).
    */
   const RECOVERY_WAKE_OUTBOX_FIRST_RETRY_MS = 60_000;
 
@@ -4154,21 +4158,9 @@ export function recoveryService(
     agentId: string;
     opts: RecoveryWakeupOptions;
   }): Promise<DurableRecoveryWakeDispatchResult> {
+    let run: Awaited<ReturnType<typeof deps.enqueueWakeup>>;
     try {
-      const run = await deps.enqueueWakeup(input.agentId, input.opts);
-      if (!run) {
-        logger.warn(
-          { agentId: input.agentId, outboxRowId: input.outboxRowId },
-          "stranded recovery wake dispatch returned no run after commit; left durable for reconcileFailedWakeDispatches",
-        );
-        return { delivered: false, cause: "enqueue_not_delivered" };
-      }
-      const now = new Date();
-      await db
-        .update(agentWakeupRequests)
-        .set({ status: "dispatch_recovered", finishedAt: now, updatedAt: now })
-        .where(eq(agentWakeupRequests.id, input.outboxRowId));
-      return { delivered: true };
+      run = await deps.enqueueWakeup(input.agentId, input.opts);
     } catch (err) {
       // Leave the row `dispatch_failed` on purpose -- that is precisely the state
       // reconcileFailedWakeDispatches selects on, so the wake is retried with backoff
@@ -4179,6 +4171,40 @@ export function recoveryService(
       );
       return { delivered: false, cause: "enqueue_threw", error: err };
     }
+    if (!run) {
+      logger.warn(
+        { agentId: input.agentId, outboxRowId: input.outboxRowId },
+        "stranded recovery wake dispatch returned no run after commit; left durable for reconcileFailedWakeDispatches",
+      );
+      return { delivered: false, cause: "enqueue_not_delivered" };
+    }
+    // BLO-18829 follow-up: DELETE the marker rather than flipping it to
+    // `dispatch_recovered`. The marker is an IOU ("a wake is owed"), not a wake --
+    // but it lives in `agent_wakeup_requests` carrying the real wake's `agentId`,
+    // `reason` and `payload`, so while it exists it is indistinguishable from the
+    // delivered wake to every reader that does not filter on status. Left behind,
+    // each escalation permanently doubles: `getWakeDiagnostics` (issues.ts) shows a
+    // phantom wake with `runId: null` next to the real one, and any agentId+reason
+    // or agentId+payload count returns 2. Once the debt is paid the IOU has no
+    // reader, so the honest representation is its absence.
+    //
+    // Deliberately OUTSIDE the enqueue try: a cleanup failure must not be reported
+    // as `delivered: false`. The wake really was delivered, so refunding the attempt
+    // would be wrong; the row simply stays `dispatch_failed` and the reconciler may
+    // redeliver, which `opts.idempotencyKey` de-dupes on replay. That is the normal
+    // at-least-once outbox window, and it is strictly narrower than reporting a
+    // successful delivery as a failure.
+    try {
+      await db
+        .delete(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, input.outboxRowId));
+    } catch (err) {
+      logger.warn(
+        { err, agentId: input.agentId, outboxRowId: input.outboxRowId },
+        "stranded recovery wake delivered but outbox row cleanup failed; reconciler may redeliver (idempotency-key de-duped)",
+      );
+    }
+    return { delivered: true };
   }
 
   type SourceScopedStrandedRecoveryWakeInput = {

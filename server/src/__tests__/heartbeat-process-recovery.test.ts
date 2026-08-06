@@ -1317,7 +1317,14 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         .where(eq(agentWakeupRequests.agentId, input.agentId));
       return wakeups.find((wakeup) => {
         const payload = wakeup.payload as Record<string, unknown> | null;
-        return payload?.issueId === input.issueId &&
+        // BLO-18829: require `runId`. The escalation writes a durable wake-outbox
+        // marker inside its transaction and only dispatches the real wake AFTER
+        // commit, so between those two points a payload-identical row exists with
+        // no run attached. Without this guard the poll latches onto that marker the
+        // instant it appears and returns a wake that was merely *owed*, making the
+        // `contextSnapshot` assertion below dereference a run that does not exist.
+        return wakeup.runId !== null &&
+          payload?.issueId === input.issueId &&
           payload?.sourceIssueId === input.issueId &&
           payload?.strandedRunId === input.runId &&
           payload?.recoveryActionId === action.id;
