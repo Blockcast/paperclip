@@ -8667,6 +8667,14 @@ export function issueService(db: Db) {
          */
         expectedCurrentAssigneeAgentId?: string | null;
         /**
+         * Pins run ownership that authorized a current-run agent mutation. A force
+         * release and checkout transfer can leave status/execution JSON unchanged
+         * while replacing the owning run; stale output from the former owner must
+         * not patch the newly owned issue.
+         */
+        expectedCurrentCheckoutRunId?: string | null;
+        expectedCurrentExecutionRunId?: string | null;
+        /**
          * Pins the execution-stage snapshot that authorized a decision. A
          * concurrent decision or stage advance must not be overwritten by a
          * former participant acting on stale route state.
@@ -8691,6 +8699,8 @@ export function issueService(db: Db) {
         actorUserId,
         expectedCurrentStatus,
         expectedCurrentAssigneeAgentId,
+        expectedCurrentCheckoutRunId,
+        expectedCurrentExecutionRunId,
         expectedCurrentExecutionState,
         expectedCurrentExecutionPolicy,
         ...issueData
@@ -8711,6 +8721,26 @@ export function issueService(db: Db) {
           issueId: id,
           expectedAssigneeAgentId: expectedCurrentAssigneeAgentId,
           currentAssigneeAgentId: existing.assigneeAgentId,
+        });
+      }
+      if (
+        expectedCurrentCheckoutRunId !== undefined &&
+        existing.checkoutRunId !== expectedCurrentCheckoutRunId
+      ) {
+        throw conflict("Issue checkout owner changed before the update could be applied", {
+          issueId: id,
+          expectedCheckoutRunId: expectedCurrentCheckoutRunId,
+          currentCheckoutRunId: existing.checkoutRunId,
+        });
+      }
+      if (
+        expectedCurrentExecutionRunId !== undefined &&
+        existing.executionRunId !== expectedCurrentExecutionRunId
+      ) {
+        throw conflict("Issue execution owner changed before the update could be applied", {
+          issueId: id,
+          expectedExecutionRunId: expectedCurrentExecutionRunId,
+          currentExecutionRunId: existing.executionRunId,
         });
       }
       if (
@@ -9126,6 +9156,20 @@ export function issueService(db: Db) {
                   ? isNull(issues.assigneeAgentId)
                   : eq(issues.assigneeAgentId, expectedCurrentAssigneeAgentId),
               ]),
+          ...(expectedCurrentCheckoutRunId === undefined
+            ? []
+            : [
+                expectedCurrentCheckoutRunId === null
+                  ? isNull(issues.checkoutRunId)
+                  : eq(issues.checkoutRunId, expectedCurrentCheckoutRunId),
+              ]),
+          ...(expectedCurrentExecutionRunId === undefined
+            ? []
+            : [
+                expectedCurrentExecutionRunId === null
+                  ? isNull(issues.executionRunId)
+                  : eq(issues.executionRunId, expectedCurrentExecutionRunId),
+              ]),
           ...(expectedCurrentExecutionState === undefined
             ? []
             : [
@@ -9163,6 +9207,12 @@ export function issueService(db: Db) {
               ...(expectedCurrentAssigneeAgentId === undefined
                 ? {}
                 : { expectedAssigneeAgentId: expectedCurrentAssigneeAgentId }),
+              ...(expectedCurrentCheckoutRunId === undefined
+                ? {}
+                : { expectedCheckoutRunId: expectedCurrentCheckoutRunId }),
+              ...(expectedCurrentExecutionRunId === undefined
+                ? {}
+                : { expectedExecutionRunId: expectedCurrentExecutionRunId }),
               ...(expectedCurrentExecutionState === undefined
                 ? {}
                 : { expectedExecutionState: true }),
@@ -9634,6 +9684,9 @@ export function issueService(db: Db) {
                 current.checkoutRunId
                   ? eq(issues.checkoutRunId, current.checkoutRunId)
                   : isNull(issues.checkoutRunId),
+                current.assigneeAgentId
+                  ? eq(issues.assigneeAgentId, current.assigneeAgentId)
+                  : isNull(issues.assigneeAgentId),
               ),
             )
             .returning()

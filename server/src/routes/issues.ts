@@ -10185,6 +10185,13 @@ export function issueRoutes(
               ? existing.executionPolicy
               : null,
         };
+    const currentRunMutationPreconditions =
+      req.actor.type === "agent" && isCurrentIssueExecutionRun(req, existing)
+        ? {
+            expectedCurrentCheckoutRunId: existing.checkoutRunId ?? null,
+            expectedCurrentExecutionRunId: existing.executionRunId ?? null,
+          }
+        : {};
 
     let issue;
     try {
@@ -10198,6 +10205,7 @@ export function issueRoutes(
               actorAgentId: actor.agentId ?? null,
               actorUserId: actor.actorType === "user" ? actor.actorId : null,
               ...executionSnapshotPreconditions,
+              ...currentRunMutationPreconditions,
               ...(delegateRecoveryPatchInFlight
                 ? {
                     expectedCurrentStatus: "blocked",
@@ -10234,6 +10242,7 @@ export function issueRoutes(
           actorAgentId: actor.agentId ?? null,
           actorUserId: actor.actorType === "user" ? actor.actorId : null,
           ...executionSnapshotPreconditions,
+          ...currentRunMutationPreconditions,
           ...(delegateRecoveryPatchInFlight
             ? {
                 expectedCurrentStatus: "blocked",
