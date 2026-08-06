@@ -174,22 +174,22 @@ Skip the `Risk and rollback` section only for clearly trivial PRs (typos, docs).
 ## Which credential to use (authoring, reviewing, merging)
 
 Three GitHub-reachable credentials are mounted or reachable from an agent pod.
-Only the first is a sanctioned authoring credential; which one **authors** your
-PR decides whether the PR can receive a formal review at all:
+They have different jobs. None of them is a magic bypass around the reviewer
+identity rules, and which identity **authors** your PR decides whether the PR can
+receive the formal reviews branch protection needs:
 
 - **Default App-installation token** — identity `app/allyblockcast[bot]`. This is
-  the **authoring identity**: commits, branch push, `gh pr create`, comments,
-  replies, status, reads, and merges. The review bot posts its **comment-mode**
-  reviews under this identity. Paperclip trusts App-authored review output when
-  it carries the canonical consolidated review body with an exact-head
-  attestation.
+  the default automation identity for branch pushes, `gh` reads, comments,
+  replies, status writes, and merges. The review bot also uses this identity for
+  gate-authorizing Bot/App reviews. That means a PR authored by this App cannot
+  receive the App's own formal review; clean App comments on an App-authored PR
+  are useful triage, not merge-gate evidence.
 - **User-seat token** — mounted at `/paperclip/.secrets/github-merge-token/token`
   when provisioned. This is the **`allyblockcast` user** account, a *distinct*
-  GitHub identity from the `app/allyblockcast[bot]` App. The review bot posts its
-  **formal approvals** under this seat. Paperclip trusts that seat review only
-  when it is `APPROVED` and contains the canonical consolidated review body with
-  exactly one exact-head `Reviewed head: <sha>` attestation. It is *not* an
-  authoring credential.
+  GitHub identity from the `app/allyblockcast[bot]` App. A dedicated reviewer
+  service may use this identity for singleton Ally-team approval evidence on the
+  same exact head as the Bot/App review. It is *not* an authoring credential, not
+  the Bot/App reviewer, and not a substitute for the Bot/App approval.
 - **Cluster SSH key** — `/paperclip/.ssh/id_ed25519`, readable by any agent pod
   that mounts the shared `/paperclip` PVC. It exists to reach cluster hosts
   (`sfo12-public`, `home-residential`) per `/paperclip/.ssh/config` — that is its
@@ -211,43 +211,50 @@ GitHub forbids an identity from submitting a **formal review** (`APPROVE` /
 different identities.
 
 Holding the user-seat token does **not** make you a reviewer, and it is not your
-push/create credential either — the review bot's own approvals come from that very
-same login, which is both why authoring under it blocks review and why you must
-never submit a review under it outside the dedicated reviewer pipeline (see
+push/create credential either. A seat approval posted by an ordinary agent is
+forged team evidence; it still cannot replace the Bot/App approval that
+`review/ally-complete` requires. Never submit a review under it outside the
+dedicated reviewer pipeline (see
 [Why the user seat must never post a review](#why-the-user-seat-must-never-post-a-review)).
 
-The dedicated reviewer pipeline has two trusted clean-review evidence shapes:
+The dedicated reviewer pipeline has two required clean-review evidence shapes for
+protected PRs:
 
-1. Post the canonical `## Ally — Consolidated PR Review` body, with exactly one
-   full `Reviewed head: <sha>` attestation, as the App identity for comment-mode
-   reviews or App-authored review output.
-2. If the review is clean and the PR is App-authored, submit the formal approval
-   under the user-seat identity with that same canonical body and exact-head
-   attestation. The approval satisfies branch protection, and the attested body
-   is the durable evidence Paperclip requires before completing the reviewer run.
+1. A Bot/App formal `APPROVED` review from `app/allyblockcast[bot]`, carrying the
+   canonical `## Ally — Consolidated PR Review` body with exactly one full
+   `Reviewed head: <sha>` attestation.
+2. The singleton Ally-team user approval on that same exact head, when the repo's
+   rules require team evidence in addition to the Bot/App review.
 
-A seat approval without the canonical `APPROVED` exact-head attestation is
-untrusted, and an App comment cannot satisfy a repository rule that explicitly
-requires a formal approval.
+For a non-App-authored PR, both evidence shapes must be current on the same head.
+For an App-authored PR, there is no gate-authorizing App review path: GitHub will
+not let the App approve its own PR. Reopen the exact head under an independent
+author before requesting review. A user-seat approval is team evidence, not a
+substitute for the Bot/App review, and an App comment cannot satisfy a repository
+rule that explicitly requires a formal approval.
 
-**Author and push under the default App token. Never author or push a PR under
-the user-seat token, and never over the cluster SSH key either.** No token
-selection is needed — the default `gh` and `git` credentials already are the App
-token, and GitHub operations must never go over SSH in these pods.
+**A protected PR that requires `review/ally-complete` must be authored by an
+independent identity, not by `app/allyblockcast[bot]` and not by the
+`allyblockcast` user seat. Never author or push a PR under the user-seat token,
+and never over the cluster SSH key either.** Use the default App token for normal
+automation writes that are allowed under that repo's rules — comments, status,
+routine branch maintenance, and merges after the review gate is satisfied.
+GitHub operations must never go over SSH in these pods.
 
-### Why seat-authoring breaks review
+### Why shared-identity authoring breaks review
 
-A PR authored under the seat makes author == approver, so GitHub refuses the
-approval, the review bot silently degrades to a comment-mode review, and the
-`review/ally-complete` gate maps a clean comment-mode review to `pending`, never
-`success`. The PR cannot go green, and no amount of re-requesting review will
-change that.
+A PR authored under a reviewer identity makes author == reviewer. GitHub refuses
+that same identity's formal review, so the reviewer can only leave comment-mode
+evidence and the protected review gate cannot go green. That is true for the
+`allyblockcast` user seat and for `app/allyblockcast[bot]` on repos whose gate
+requires the App's Bot/App approval.
 
 A PR's author is **fixed at creation**, so there is no in-place fix. If you find
-yourself on a seat-authored PR, the sanctioned recovery is to re-open it under the
-App: close the PR, then re-create it from the *same branch and SHA* with the
-default credential (GitHub permits only one open PR per head/base, so the close
-must come first). No force-push and no CI re-plumbing is needed.
+yourself on a PR authored by either reviewer identity, the sanctioned recovery is
+to re-open the exact head under an independent author: close the PR, then
+re-create it from the *same branch and SHA* with an identity that is neither the
+App nor the `allyblockcast` user. GitHub permits only one open PR per head/base,
+so the close must come first. No force-push and no CI re-plumbing is needed.
 
 Closing is the destructive step, so everything the replacement needs must be
 captured and re-validated *before* it, and every unsuccessful exit after it must
@@ -257,7 +264,8 @@ an empty remote SHA and the check "passes" on two blanks; the branch moves
 between capture and re-create, so the "same SHA" promise silently breaks;
 `gh pr create` fails — or the script is interrupted — and the branch is left with
 its review artifact closed and no replacement open; or the replacement is created
-under the seat as well, reproducing the exact defect while reporting success.
+under a reviewer identity as well, reproducing the exact defect while reporting
+success.
 
 ```sh
 set -euo pipefail
@@ -265,14 +273,12 @@ set -euo pipefail
 REPO=<org>/<repo>
 NUM=<number>
 
-# Preflight: the point of this recovery is an App-authored replacement, so prove
-# the active identity IS the App before touching anything. Recreating under the
-# seat reproduces the defect being recovered from and reports success doing it.
-# Assert the App's signature rather than the seat's absence: any other outcome —
-# a seat login, a network failure, a broken `gh` — must abort, not proceed.
-case "$(gh api user 2>&1 || true)" in
-  *"Resource not accessible by integration"*) ;;  # 403 == App installation
-  *) echo "abort: not authenticated as the App installation" >&2; exit 1 ;;
+# Preflight: the point of this recovery is an independently authored replacement,
+# so prove the active identity is neither reviewer identity before touching
+# anything. Recreating under the App or the seat reproduces the defect.
+AUTHOR_LOGIN="$(gh api user 2>/dev/null | jq -r '.login // empty' || true)"
+case "$AUTHOR_LOGIN" in
+  ""|allyblockcast|app/*|*"[bot]") echo "abort: not authenticated as an independent author" >&2; exit 1 ;;
 esac
 
 # Capture head, base, title, body AND the exact head SHA BEFORE closing.
@@ -376,9 +382,10 @@ printf '%s' "$NEW_NUM" | grep -Eq '^[0-9]+$' ||
 
 # Verification is part of the recovery, not a follow-up step: a replacement on a
 # different head or base is not a recovery, and leaving it open while the
-# original stays closed is worse than not having tried. Verify the author too —
+# original stays closed is worse than not having tried. Verify the author too:
 # the preflight can pass and the create still land under another identity, and a
-# seat-authored replacement is exactly the defect being recovered from.
+# replacement authored by either reviewer identity is exactly the defect being
+# recovered from.
 NEW_JSON="$(gh pr view "$NEW_NUM" --repo "$REPO" --json headRefOid,baseRefName,author)"
 [ "$(printf '%s' "$NEW_JSON" | jq -r '.headRefOid  // empty')" = "$ORIG_SHA" ] ||
   { echo "abort: #$NEW_NUM is not at $ORIG_SHA" >&2; exit 1; }
@@ -386,8 +393,7 @@ NEW_JSON="$(gh pr view "$NEW_NUM" --repo "$REPO" --json headRefOid,baseRefName,a
   { echo "abort: #$NEW_NUM is not onto $BASE_REF" >&2; exit 1; }
 NEW_AUTHOR="$(printf '%s' "$NEW_JSON" | jq -r '.author.login // empty')"
 case "$NEW_AUTHOR" in
-  app/*) ;;
-  *) echo "abort: #$NEW_NUM is authored by '$NEW_AUTHOR', not the App" >&2; exit 1 ;;
+  ""|allyblockcast|app/*|*"[bot]") echo "abort: #$NEW_NUM is authored by reviewer identity '$NEW_AUTHOR'" >&2; exit 1 ;;
 esac
 
 trap - EXIT INT TERM
@@ -406,17 +412,18 @@ back ready-for-review, which is usually what you want (a draft PR gets no
 reviewer wake at all) but is a change you should expect rather than discover.
 Re-apply anything you need on the replacement.
 
-Pushing under the seat is also unsafe where branch protection sets
+Pushing under either reviewer identity is also unsafe where branch protection sets
 `require_last_push_approval` — the most recent pusher cannot approve, so a
-seat-push disqualifies the only identity that can approve and leaves the PR with
-no eligible approver at all. The seat PAT additionally lacks `workflow` scope and
-cannot push `.github/workflows/**`.
+reviewer-identity push can disqualify the identity the gate needs. The seat PAT
+additionally lacks `workflow` scope and cannot push `.github/workflows/**`.
 
 ### Confirming which identity you are on
 
 ```sh
-gh api user   # 403 "Resource not accessible by integration" == the App token (correct)
-              # 200 with a login == you are on the user seat (wrong for authoring)
+gh api user --jq '.login // empty'
+# 403 "Resource not accessible by integration" == the App installation
+# allyblockcast == the user seat
+# any other expected human/service login == independent authoring identity
 ```
 
 The agent image wraps `gh` and deliberately replaces `GH_TOKEN` with the token
@@ -426,22 +433,25 @@ the same override reaches the `gh` credential helper used by `git push`.
 
 ### Merging
 
-Merge under the **default App token** — it holds merge rights on this fleet's
-main repos, and no token selection is needed:
+Merge under the **default App token** after the review gate is already satisfied
+— it holds merge rights on this fleet's main repos, and no token selection is
+needed:
 
 ```sh
 gh pr merge <number> --repo <org>/<repo> --squash
 ```
 
 Rules:
-- Use the **default App token** for authoring, pushing, commenting, and merging.
+- Use the **default App token** for comments, status, routine branch maintenance,
+  and merging. Do not create a protected PR under the App when that repo requires
+  the Ally App's own formal review.
 - **Never submit a formal review under the user-seat token.** No `gh pr review`
   with it — not `--approve`, not `--request-changes`, not `--comment`. This rule
   governs agents consuming this workflow; only the dedicated reviewer service may
-  produce the canonical exact-head `APPROVED` review under that seat. Never post
-  an `ally-verdict:` marker or a `Reviewed head: <sha>` line under it, on a review
-  or in a comment. This holds even when the review is honest and even when the
-  change is yours: the prohibition is on the *credential*, not on your intent.
+  produce singleton Ally-team approval evidence under that seat. Never post an
+  `ally-verdict:` marker or a `Reviewed head: <sha>` line under it, on a review or
+  in a comment. This holds even when the review is honest and even when the change
+  is yours: the prohibition is on the *credential*, not on your intent.
 - If merge is refused because branch protection requires an identity the App
   lacks, that is a **permission gate, not a credential puzzle** — do not reach for
   the seat to work around it. Note the exact refusal on the issue and escalate;
@@ -453,26 +463,27 @@ Rules:
 ### Why the user seat must never post a review
 
 The user-seat token authenticates as the `allyblockcast` **user** — the same
-identity the review bot's own formal approvals come from. GitHub records only
-that shared identity, so a review you post under it is **indistinguishable from
-the reviewer's own**, to a human reader and to CI alike.
+identity the dedicated reviewer service may use for singleton team evidence.
+GitHub records only that shared identity, so a review you post under it is
+**indistinguishable from the reviewer's own user-seat evidence**, to a human
+reader and to CI alike.
 
-The `review/ally-complete` merge gate keys off exactly that: an `APPROVED` review
-from an `allyblockcast` login. An approval posted under the seat therefore clears
-the gate for a change no reviewer ever looked at, and a manually forged canonical
-body is indistinguishable from the reviewer's own evidence after the fact. Only
-the reviewer's own pipeline may produce a review that clears that gate, and
-Paperclip completes that pipeline only after GitHub confirms the exact-head
-trusted evidence described above.
+The `review/ally-complete` merge gate requires the Bot/App formal approval
+described above. A user-seat approval posted by an ordinary agent cannot
+substitute for that App approval, and a manually forged canonical body pollutes
+the exact-head evidence trail after the fact. Only the dedicated reviewer
+pipeline may produce either trusted review artifact, and Paperclip completes that
+pipeline only after GitHub confirms the exact-head evidence described above.
 
 So when you are looking at a red `review/ally-complete` on your own PR, the
 sanctioned move is to **get a review** — re-request one (see the repo's review
-handoff convention) and wait. If the PR turns out to be seat-authored, no review
-can clear it and re-requesting is futile; re-open it under the App first, per
-[Why seat-authoring breaks review](#why-seat-authoring-breaks-review). Posting the
-approval yourself is not a shortcut past a slow reviewer; it is a forged review,
-and it has already shipped a data-loss bug to master that the real review had
-caught.
+handoff convention) and wait. If the PR turns out to be authored by either
+reviewer identity, no review can clear it and re-requesting is futile; re-open the
+exact head under an independent author first, per
+[Why shared-identity authoring breaks review](#why-shared-identity-authoring-breaks-review).
+Posting the approval yourself is not a shortcut past a slow reviewer; it is a
+forged review, and it has already shipped a data-loss bug to master that the real
+review had caught.
 
 ## Anti-patterns
 
@@ -487,6 +498,9 @@ caught.
 - Approving your own PR under the user-seat merge token to turn the review gate
   green. That is a forged review, not a merge unblock — see the credential rules
   above.
+- Keeping a protected PR authored by `app/allyblockcast[bot]` and treating a
+  user-seat approval as the missing review. The App cannot approve its own PR, and
+  the seat is not a substitute for the Bot/App review.
 - Reaching for the cluster SSH key (`/paperclip/.ssh/id_ed25519`) because the App
   token lacks write access to some repo. A repo the App isn't installed on is a
   permission gate, not a credential puzzle — the SSH key's GitHub registration is
