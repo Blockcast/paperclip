@@ -7,9 +7,18 @@
 //
 // This guard is fail-closed and runs on every manifest we build, so a future
 // literal credential breaks the build and the test suite rather than silently
-// shipping. It mirrors the same protection in the external claude_k8s adapter
-// (paperclip-adapter-claude-k8s `job-manifest.ts`), which renders the
-// production agent-job pods.
+// shipping.
+//
+// It does NOT mirror any protection in the external claude_k8s adapter. As of
+// pinned SHA 3ad3370, `paperclip-adapter-claude-k8s`'s `job-manifest.ts` (the
+// code that actually renders production agent-job pods) has no allowlist,
+// denylist, or filter of any kind: `getSelfPodInfo()` copies the paperclip
+// server's own pod env wholesale — every literal `env[].value`, every
+// `valueFrom.secretKeyRef`, every `envFrom` source, and every mounted secret
+// volume — onto each agent pod. This guard only covers manifests built by
+// this repo's Kubernetes sandbox-provider path; it provides zero coverage for
+// that adapter. See BLO-22514 for the gap and BLO-22506 for the related
+// k8s-ro read exposure.
 //
 // POLICY: allowlist, not denylist.
 //
