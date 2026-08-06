@@ -12527,16 +12527,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // this is not `issueLockOwnedByRetry`: a `queued` retry owning no lock is
     // the normal shape under lazy locking (BLO-21621), and treating it as dead
     // promotes a second runnable path beside it (BLO-21623).
-    const continuesContextIssue = (retryStatus: string) =>
-      Boolean(issueIdForLock) && !HEARTBEAT_RUN_TERMINAL_STATUSES.some((status) => status === retryStatus);
+    const continuesContextIssue = (retry: typeof heartbeatRuns.$inferSelect) =>
+      Boolean(issueIdForLock) &&
+      readNonEmptyString(parseObject(retry.contextSnapshot).issueId) === issueIdForLock &&
+      !HEARTBEAT_RUN_TERMINAL_STATUSES.some((status) => status === retry.status);
+    const pickExistingRetry = (retries: Array<typeof heartbeatRuns.$inferSelect>) =>
+      retries.find(continuesContextIssue) ?? retries[0] ?? null;
 
-    const existingRetry = await db
+    const existingRetries = await db
       .select()
       .from(heartbeatRuns)
       .where(and(eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.retryOfRunId, run.id)))
-      .orderBy(asc(heartbeatRuns.createdAt))
-      .limit(1)
-      .then((rows) => rows[0] ?? null);
+      .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id));
+    const existingRetry = pickExistingRetry(existingRetries);
     if (existingRetry) {
       await appendRunEventAtomicSeq(run, {
         eventType: "lifecycle",
@@ -12552,7 +12555,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         kind: "adopted",
         run: existingRetry,
         issueLockOwnedByRetry: await issueLockOwnedBy(existingRetry.id),
-        retryContinuesContextIssue: continuesContextIssue(existingRetry.status),
+        retryContinuesContextIssue: continuesContextIssue(existingRetry),
       };
     }
 
@@ -12615,13 +12618,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       await tx.execute(
         sql`select pg_advisory_xact_lock(hashtextextended(${`heartbeat-process-loss-retry:${run.id}`}, 0))`,
       );
-      const racedRetry = await tx
+      const racedRetries = await tx
         .select()
         .from(heartbeatRuns)
         .where(and(eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.retryOfRunId, run.id)))
-        .orderBy(asc(heartbeatRuns.createdAt))
-        .limit(1)
-        .then((rows) => rows[0] ?? null);
+        .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id));
+      const racedRetry = pickExistingRetry(racedRetries);
       if (racedRetry) {
         return {
           retryRun: racedRetry,
@@ -12761,7 +12763,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         kind: "adopted",
         run: queued.retryRun,
         issueLockOwnedByRetry: await issueLockOwnedBy(queued.retryRun.id),
-        retryContinuesContextIssue: continuesContextIssue(queued.retryRun.status),
+        retryContinuesContextIssue: continuesContextIssue(queued.retryRun),
       };
     }
 
@@ -12791,7 +12793,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       kind: "created",
       run: queued.retryRun,
       issueLockOwnedByRetry: queued.issueLockTransferred,
-      retryContinuesContextIssue: continuesContextIssue(queued.retryRun.status),
+      retryContinuesContextIssue: continuesContextIssue(queued.retryRun),
     };
   }
 

@@ -1370,12 +1370,84 @@ describeEmbeddedPostgres("heartbeat worker-crash marking and recovery convergenc
   // so an adopted retry without the lock is still a runnable continuation and
   // must suppress deferred-wake promotion.
   it.each([
-    { retryStatus: "queued", expectedWakeStatus: "deferred_issue_execution" },
-    { retryStatus: "interrupted", expectedWakeStatus: "queued" },
-  ])("handles an existing $retryStatus retry without the issue lock", async ({ retryStatus, expectedWakeStatus }) => {
+    { retryStatus: "queued", retryIssueScope: "same", expectedWakeStatus: "deferred_issue_execution" },
+    { retryStatus: "interrupted", retryIssueScope: "same", expectedWakeStatus: "queued" },
+    { retryStatus: "queued", retryIssueScope: "none", expectedWakeStatus: "queued" },
+    { retryStatus: "queued", retryIssueScope: "different", expectedWakeStatus: "queued" },
+  ])(
+    "handles an existing $retryStatus retry with $retryIssueScope issue scope",
+    async ({ retryStatus, retryIssueScope, expectedWakeStatus }) => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const run = await seedCrashMarkedRun({ companyId, agentId, finishedAt: new Date(Date.now() - 60_000) });
+      const issueId = "88888888-8888-8888-8888-888888888888";
+      const retryIssueId =
+        retryIssueScope === "same"
+          ? issueId
+          : retryIssueScope === "different"
+            ? "99999999-9999-9999-9999-999999999999"
+            : null;
+      await db
+        .update(heartbeatRuns)
+        .set({ contextSnapshot: { issueId } })
+        .where(eq(heartbeatRuns.id, run.id));
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Issue awaiting adopted retry",
+        status: "in_progress",
+        checkoutRunId: run.id,
+        executionRunId: null,
+        executionLockedAt: null,
+      });
+      const [existingRetry] = await db
+        .insert(heartbeatRuns)
+        .values({
+          companyId,
+          agentId,
+          invocationSource: "automation",
+          triggerDetail: "system",
+          status: retryStatus,
+          responsibleUserId: "crash-test-user",
+          contextSnapshot: { ...(retryIssueId ? { issueId: retryIssueId } : {}), retryOfRunId: run.id },
+          retryOfRunId: run.id,
+        })
+        .returning();
+      await db.insert(agentWakeupRequests).values({
+        companyId,
+        agentId,
+        source: "assignment",
+        status: "deferred_issue_execution",
+        payload: { issueId },
+      });
+
+      const result = await service().reconcileWorkerCrashedRuns();
+
+      const allRuns = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
+      const runnable = allRuns.filter((candidate) => candidate.status === "queued" || candidate.status === "running");
+      const runnableForIssue = runnable.filter(
+        (candidate) => (candidate.contextSnapshot as { issueId?: string } | null)?.issueId === issueId,
+      );
+      expect(runnableForIssue).toHaveLength(1);
+      if (retryStatus === "queued" && retryIssueScope === "same") {
+        expect(runnableForIssue[0]!.id).toBe(existingRetry!.id);
+      } else {
+        expect(runnableForIssue[0]!.retryOfRunId).toBeNull();
+      }
+
+      const [wakeAfter] = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.companyId, companyId));
+      expect(wakeAfter!.status).toBe(expectedWakeStatus);
+      expect(result.reconciledRunIds).toEqual([run.id]);
+      expect((await readRun(run.id)).crashRecoveryCompletedAt).not.toBeNull();
+    },
+  );
+
+  it("prefers a newer queued retry over terminal retry history for the same issue", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const run = await seedCrashMarkedRun({ companyId, agentId, finishedAt: new Date(Date.now() - 60_000) });
-    const issueId = "88888888-8888-8888-8888-888888888888";
+    const issueId = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
     await db
       .update(heartbeatRuns)
       .set({ contextSnapshot: { issueId } })
@@ -1383,24 +1455,38 @@ describeEmbeddedPostgres("heartbeat worker-crash marking and recovery convergenc
     await db.insert(issues).values({
       id: issueId,
       companyId,
-      title: "Issue awaiting adopted retry",
+      title: "Issue with mixed retry history",
       status: "in_progress",
       checkoutRunId: run.id,
       executionRunId: null,
       executionLockedAt: null,
     });
-    const [existingRetry] = await db
+    const retries = await db
       .insert(heartbeatRuns)
-      .values({
-        companyId,
-        agentId,
-        invocationSource: "automation",
-        triggerDetail: "system",
-        status: retryStatus,
-        responsibleUserId: "crash-test-user",
-        contextSnapshot: { issueId, retryOfRunId: run.id },
-        retryOfRunId: run.id,
-      })
+      .values([
+        {
+          companyId,
+          agentId,
+          invocationSource: "automation",
+          triggerDetail: "system",
+          status: "interrupted",
+          responsibleUserId: "crash-test-user",
+          contextSnapshot: { issueId, retryOfRunId: run.id },
+          retryOfRunId: run.id,
+          createdAt: new Date(Date.now() - 30_000),
+        },
+        {
+          companyId,
+          agentId,
+          invocationSource: "automation",
+          triggerDetail: "system",
+          status: "queued",
+          responsibleUserId: "crash-test-user",
+          contextSnapshot: { issueId, retryOfRunId: run.id },
+          retryOfRunId: run.id,
+          createdAt: new Date(),
+        },
+      ])
       .returning();
     await db.insert(agentWakeupRequests).values({
       companyId,
@@ -1410,23 +1496,15 @@ describeEmbeddedPostgres("heartbeat worker-crash marking and recovery convergenc
       payload: { issueId },
     });
 
-    const result = await service().reconcileWorkerCrashedRuns();
+    await service().reconcileWorkerCrashedRuns();
 
     const allRuns = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
     const runnable = allRuns.filter((candidate) => candidate.status === "queued" || candidate.status === "running");
-    expect(runnable).toHaveLength(1);
-    if (retryStatus === "queued") {
-      expect(runnable[0]!.id).toBe(existingRetry!.id);
-    } else {
-      expect(runnable[0]!.retryOfRunId).toBeNull();
-    }
-
+    expect(runnable.map((candidate) => candidate.id)).toEqual([retries[1]!.id]);
     const [wakeAfter] = await db
       .select()
       .from(agentWakeupRequests)
       .where(eq(agentWakeupRequests.companyId, companyId));
-    expect(wakeAfter!.status).toBe(expectedWakeStatus);
-    expect(result.reconciledRunIds).toEqual([run.id]);
-    expect((await readRun(run.id)).crashRecoveryCompletedAt).not.toBeNull();
+    expect(wakeAfter!.status).toBe("deferred_issue_execution");
   });
 });
