@@ -28,6 +28,8 @@ import {
   isNonPrimaryWorkspaceTarget,
   isWorkspaceLessFallbackCwdForOtherIsolationMode,
   isK8sIsolationRetryDeferred,
+  isBranchClaimRetryDeferred,
+  isQueuedRunAdmissionDeferred,
   logK8sGuardDecision,
   resolveProjectPrimaryWorkspaceId,
   extractWakeCommentIds,
@@ -2864,6 +2866,45 @@ describe("K8s session isolation metadata", () => {
     }, now)).toBe(false);
     expect(isK8sIsolationRetryDeferred({
       paperclipK8sIsolationRetryAt: "invalid",
+    }, now)).toBe(false);
+  });
+
+  // BLO-21602: deferRunForBranchClaimConflict stamps paperclipBranchClaimRetryAt
+  // on the run's contextSnapshot, mirroring the K8s isolation backoff stamp
+  // above. Queued-run admission must honor it via isQueuedRunAdmissionDeferred
+  // everywhere it previously only checked isK8sIsolationRetryDeferred, or a
+  // branch-conflict-deferred run is immediately eligible again and repeatedly
+  // performs setup, conflict, and requeue instead of honoring the backoff.
+  it("backs off branch-claim contention without creating a terminal run", () => {
+    const now = new Date("2026-07-14T12:00:00.000Z");
+    expect(isBranchClaimRetryDeferred({
+      paperclipBranchClaimRetryAt: "2026-07-14T12:00:01.000Z",
+    }, now)).toBe(true);
+    expect(isBranchClaimRetryDeferred({
+      paperclipBranchClaimRetryAt: "2026-07-14T11:59:59.000Z",
+    }, now)).toBe(false);
+    expect(isBranchClaimRetryDeferred({
+      paperclipBranchClaimRetryAt: "invalid",
+    }, now)).toBe(false);
+  });
+
+  it("isQueuedRunAdmissionDeferred combines the K8s isolation and branch-claim backoff stamps", () => {
+    const now = new Date("2026-07-14T12:00:00.000Z");
+    // Neither stamp present.
+    expect(isQueuedRunAdmissionDeferred({}, now)).toBe(false);
+    // Only the K8s isolation stamp is still in the future.
+    expect(isQueuedRunAdmissionDeferred({
+      paperclipK8sIsolationRetryAt: "2026-07-14T12:00:01.000Z",
+    }, now)).toBe(true);
+    // Only the branch-claim stamp is still in the future -- this is the case
+    // the queued-run admission bug missed before this fix.
+    expect(isQueuedRunAdmissionDeferred({
+      paperclipBranchClaimRetryAt: "2026-07-14T12:00:01.000Z",
+    }, now)).toBe(true);
+    // Both stamps present but expired.
+    expect(isQueuedRunAdmissionDeferred({
+      paperclipK8sIsolationRetryAt: "2026-07-14T11:59:59.000Z",
+      paperclipBranchClaimRetryAt: "2026-07-14T11:59:59.000Z",
     }, now)).toBe(false);
   });
 

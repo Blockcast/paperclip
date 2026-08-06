@@ -33,6 +33,47 @@ if (!embeddedPostgresSupport.supported) {
   );
 }
 
+// BLO-21602 (Ally review, native-codex lens): computeBranchClaimKey's
+// documented contract is that two workspaces referring to the same remote
+// via different URL forms (SSH vs HTTPS, with/without .git) collide on the
+// same identity. Pure string normalization (lowercase/trim/.git-strip)
+// satisfies that for one form but not across forms -- these run without
+// embedded Postgres since the function is pure.
+describe("computeBranchClaimKey", () => {
+  const branchName = "cto/blo-21602-branch-scoped-run-lock";
+
+  it("collides SSH scp-like, ssh://, and https:// forms of the same repo", () => {
+    const scpLike = computeBranchClaimKey({ repoUrl: "git@github.com:Blockcast/paperclip.git", branchName });
+    const sshUrl = computeBranchClaimKey({ repoUrl: "ssh://git@github.com/Blockcast/paperclip.git", branchName });
+    const https = computeBranchClaimKey({ repoUrl: "https://github.com/Blockcast/paperclip", branchName });
+    const httpsTrailingGitSlash = computeBranchClaimKey({ repoUrl: "https://github.com/Blockcast/paperclip.git/", branchName });
+    const mixedCase = computeBranchClaimKey({ repoUrl: "https://GitHub.com/Blockcast/Paperclip.git", branchName });
+
+    expect(sshUrl).toBe(scpLike);
+    expect(https).toBe(scpLike);
+    expect(httpsTrailingGitSlash).toBe(scpLike);
+    expect(mixedCase).toBe(scpLike);
+  });
+
+  it("does not collide different repos or different hosts", () => {
+    const paperclip = computeBranchClaimKey({ repoUrl: "git@github.com:Blockcast/paperclip.git", branchName });
+    const otherRepo = computeBranchClaimKey({ repoUrl: "git@github.com:Blockcast/other-repo.git", branchName });
+    const otherHost = computeBranchClaimKey({ repoUrl: "git@gitlab.com:Blockcast/paperclip.git", branchName });
+    const otherBranch = computeBranchClaimKey({ repoUrl: "git@github.com:Blockcast/paperclip.git", branchName: "other-branch" });
+
+    expect(otherRepo).not.toBe(paperclip);
+    expect(otherHost).not.toBe(paperclip);
+    expect(otherBranch).not.toBe(paperclip);
+  });
+
+  it("falls back to a stable opaque key for a null or unrecognized repo url", () => {
+    expect(computeBranchClaimKey({ repoUrl: null, branchName })).toBe(`unknown#${branchName}`);
+    const localPathA = computeBranchClaimKey({ repoUrl: "/srv/repos/paperclip", branchName });
+    const localPathB = computeBranchClaimKey({ repoUrl: "/srv/repos/paperclip", branchName });
+    expect(localPathA).toBe(localPathB);
+  });
+});
+
 describeEmbeddedPostgres("branch run claims", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
@@ -152,6 +193,67 @@ describeEmbeddedPostgres("branch run claims", () => {
     expect(active).toHaveLength(1);
     expect(active[0]?.heartbeatRunId).toBe(parent.runId);
     expect(active[0]?.issueId).toBe(parent.issueId);
+  });
+
+  // BLO-21602 (Ally review, gstack/review lens): the fixed 30-minute lease
+  // used to be acquired exactly once at run start and never renewed, so a
+  // still-`running` holder past minute 30 lost the branch to a challenger --
+  // recreating the exact divergent-commit race this guard exists to prevent.
+  // The fix (heartbeat.ts's `branchClaimRenewalTimer`, started once the
+  // adapter invocation begins) periodically re-acquires the SAME run's claim,
+  // which extends `expiresAt` via the `existing.heartbeatRunId === input.runId`
+  // branch below. This test simulates that renewal tick directly against the
+  // claims layer, without needing to drive a full adapter invocation.
+  it("a renewed claim survives past its original lease and still blocks a same-branch challenger", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const holder = await seedIssueAndRunningRun({ companyId, agentId, title: "Long-running holder" });
+    const challenger = await seedIssueAndRunningRun({ companyId, agentId, title: "Challenger" });
+    const branchKey = computeBranchClaimKey({ repoUrl: "https://github.com/Blockcast/paperclip.git", branchName: "long-running-branch" });
+
+    const acquiredAt = new Date("2026-08-04T04:00:00.000Z");
+    const firstClaim = await acquireBranchRunClaim(db, {
+      companyId,
+      branchKey,
+      executionWorkspaceId: null,
+      issueId: holder.issueId,
+      runId: holder.runId,
+      agentId,
+      now: acquiredAt,
+    });
+    const originalExpiresAt = firstClaim.expiresAt.getTime();
+
+    // Renewal tick at +5m (BRANCH_CLAIM_RENEWAL_INTERVAL_MS), well inside the
+    // 30m default lease -- the holder is still `running` and re-acquires its
+    // own claim, which extends expiresAt instead of throwing a conflict.
+    const renewalTick = new Date(acquiredAt.getTime() + 5 * 60_000);
+    const renewedClaim = await acquireBranchRunClaim(db, {
+      companyId,
+      branchKey,
+      executionWorkspaceId: null,
+      issueId: holder.issueId,
+      runId: holder.runId,
+      agentId,
+      now: renewalTick,
+    });
+    expect(renewedClaim.heartbeatRunId).toBe(holder.runId);
+    expect(renewedClaim.expiresAt.getTime()).toBeGreaterThan(originalExpiresAt);
+
+    // At the moment the ORIGINAL (un-renewed) lease would have lapsed, the
+    // holder is still `running` in the DB and its renewed lease is still
+    // valid -- a challenger on a different issue sharing this branch must
+    // still be refused, not allowed to supersede.
+    const pastOriginalExpiry = new Date(originalExpiresAt + 60_000);
+    const conflict = await acquireBranchRunClaim(db, {
+      companyId,
+      branchKey,
+      executionWorkspaceId: null,
+      issueId: challenger.issueId,
+      runId: challenger.runId,
+      agentId,
+      now: pastOriginalExpiry,
+    }).catch((error) => error);
+    expect(conflict).toBeInstanceOf(BranchClaimConflictError);
+    expect(conflict).toMatchObject({ holderRunId: holder.runId, holderIssueId: holder.issueId });
   });
 
   it("allows two different issues' runs to proceed when they resolve to different branches", async () => {

@@ -580,6 +580,10 @@ const K8S_ISOLATION_RETRY_BASE_DELAY_MS = 15_000;
 const K8S_ISOLATION_RETRY_MAX_DELAY_MS = 5 * 60_000;
 const BRANCH_CLAIM_RETRY_ATTEMPT_CONTEXT_KEY = "paperclipBranchClaimRetryAttempt";
 const BRANCH_CLAIM_RETRY_AT_CONTEXT_KEY = "paperclipBranchClaimRetryAt";
+// BLO-21602: renewal cadence for an in-flight run's branch claim. Kept well
+// under DEFAULT_BRANCH_CLAIM_LEASE_MS (30m) so a couple of missed ticks (e.g.
+// a slow DB write) still can't let the lease lapse out from under a live run.
+const BRANCH_CLAIM_RENEWAL_INTERVAL_MS = 5 * 60_000;
 // Rate-limit retries (errorFamily = "rate_limit_exhausted") use a flat short
 // delay instead of stacking exponential backoff. Rationale: rate-limit isn't
 // a transient upstream fault — it means "this account's window is closed".
@@ -5371,6 +5375,32 @@ export function isK8sIsolationRetryDeferred(
   return !Number.isNaN(retryAt.getTime()) && retryAt.getTime() > now.getTime();
 }
 
+// BLO-21602: deferRunForBranchClaimConflict (like deferRunForK8sIsolationConflict)
+// sends a run back to `queued` with a computed backoff rather than failing it,
+// stamping paperclipBranchClaimRetryAt on the run's contextSnapshot. Queued-run
+// admission must honor that backoff the same way it already honors the K8s
+// isolation retry stamp -- otherwise the run is immediately eligible again and
+// repeatedly performs setup, conflict, and requeue instead of waiting.
+export function isBranchClaimRetryDeferred(
+  context: Record<string, unknown> | null | undefined,
+  now = new Date(),
+): boolean {
+  const retryAtValue = readNonEmptyString(context?.[BRANCH_CLAIM_RETRY_AT_CONTEXT_KEY]);
+  if (!retryAtValue) return false;
+  const retryAt = new Date(retryAtValue);
+  return !Number.isNaN(retryAt.getTime()) && retryAt.getTime() > now.getTime();
+}
+
+// Combines every "queued run is not actually admissible yet" backoff stamp a
+// run's contextSnapshot may carry. Use this everywhere queued runs are
+// scanned for admission instead of checking isK8sIsolationRetryDeferred alone.
+export function isQueuedRunAdmissionDeferred(
+  context: Record<string, unknown> | null | undefined,
+  now = new Date(),
+): boolean {
+  return isK8sIsolationRetryDeferred(context, now) || isBranchClaimRetryDeferred(context, now);
+}
+
 export function buildK8sRunIsolationDescriptor(input: {
   adapterType: string | null | undefined;
   runId: string;
@@ -5873,7 +5903,7 @@ function isRunClaimable(
   now: Date,
 ): boolean {
   if (!issue || TERMINAL_ISSUE_STATUSES.has(issue.status)) return false;
-  if (isK8sIsolationRetryDeferred(contextSnapshot, now)) return false;
+  if (isQueuedRunAdmissionDeferred(contextSnapshot, now)) return false;
   return isEffectivelyDependencyReadyForDispatch(contextSnapshot, readiness);
 }
 
@@ -5908,7 +5938,7 @@ function isDispatchRankReady(
   readiness: { isDependencyReady: boolean } | null | undefined,
   now: Date,
 ): boolean {
-  if (isK8sIsolationRetryDeferred(contextSnapshot, now)) return false;
+  if (isQueuedRunAdmissionDeferred(contextSnapshot, now)) return false;
   return isEffectivelyDependencyReadyForDispatch(contextSnapshot, readiness);
 }
 
@@ -16387,7 +16417,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const context = parseObject(run.contextSnapshot);
     let issueDependencyReadyForAutoCheckout = true;
-    if (isK8sIsolationRetryDeferred(context)) {
+    if (isQueuedRunAdmissionDeferred(context)) {
       return null;
     }
     const budgetBlock = await budgets.getInvocationBlock(run.companyId, run.agentId, {
@@ -23104,13 +23134,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // Throwing BranchClaimConflictError here is caught by the outer
     // `catch (outerErr)` below and deferred back to `queued`, mirroring
     // ExternalRuntimeIsolationConflictError / deferRunForK8sIsolationConflict.
+    // `activeBranchClaimKey`, once set, is renewed periodically for the
+    // lifetime of the adapter invocation below (see branchClaimRenewalTimer)
+    // so a run that legitimately runs past DEFAULT_BRANCH_CLAIM_LEASE_MS
+    // never has its lease lapse out from under it.
+    let activeBranchClaimKey: string | null = null;
     if (issueRef && branchNameForInitialPersistence) {
+      activeBranchClaimKey = computeBranchClaimKey({
+        repoUrl: persistedExecutionWorkspace?.repoUrl ?? executionWorkspace.repoUrl ?? null,
+        branchName: branchNameForInitialPersistence,
+      });
       await acquireBranchRunClaim(db, {
         companyId: agent.companyId,
-        branchKey: computeBranchClaimKey({
-          repoUrl: persistedExecutionWorkspace?.repoUrl ?? executionWorkspace.repoUrl ?? null,
-          branchName: branchNameForInitialPersistence,
-        }),
+        branchKey: activeBranchClaimKey,
         executionWorkspaceId: persistedExecutionWorkspace?.id ?? null,
         issueId: issueRef.id,
         runId: run.id,
@@ -24118,6 +24154,60 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         adapterFinalizeOutcome = status;
       };
 
+      // BLO-21602: renew the branch claim on a cadence well inside
+      // DEFAULT_BRANCH_CLAIM_LEASE_MS so a run that is genuinely still
+      // executing never has its lease expire and get superseded by a
+      // sibling run racing to claim the same branch. `acquireBranchRunClaim`
+      // is idempotent for the same runId -- it just extends `expiresAt`.
+      // If renewal ever reports a *different* holder, our lease already
+      // lapsed and another run has legitimately taken over the branch; we
+      // cannot safely abort the in-flight adapter process here, so this is
+      // surfaced as a run event / error log for operator follow-up rather
+      // than silently ignored.
+      let branchClaimRenewalTimer: ReturnType<typeof setInterval> | null = null;
+      if (activeBranchClaimKey && issueRef) {
+        const branchKeyForRenewal = activeBranchClaimKey;
+        const issueIdForRenewal = issueRef.id;
+        branchClaimRenewalTimer = setInterval(() => {
+          void acquireBranchRunClaim(db, {
+            companyId: agent.companyId,
+            branchKey: branchKeyForRenewal,
+            executionWorkspaceId: persistedExecutionWorkspace?.id ?? null,
+            issueId: issueIdForRenewal,
+            runId: run.id,
+            agentId: agent.id,
+          }).catch(async (renewErr) => {
+            if (renewErr instanceof BranchClaimConflictError) {
+              logger.error(
+                {
+                  runId: run.id,
+                  branchKey: branchKeyForRenewal,
+                  holderRunId: renewErr.holderRunId,
+                  holderIssueId: renewErr.holderIssueId,
+                },
+                "Lost branch run claim to a competing run mid-run; a divergent commit is possible",
+              );
+              await appendRunEvent(run, await nextRunEventSeq(run.id), {
+                eventType: "lifecycle",
+                stream: "system",
+                level: "error",
+                message: "Lost branch run claim mid-run to a competing run",
+                payload: {
+                  branchKey: branchKeyForRenewal,
+                  holderRunId: renewErr.holderRunId,
+                  holderIssueId: renewErr.holderIssueId,
+                },
+              }).catch(() => {});
+              return;
+            }
+            logger.warn(
+              { err: renewErr, runId: run.id, branchKey: branchKeyForRenewal },
+              "Failed to renew branch run claim",
+            );
+          });
+        }, BRANCH_CLAIM_RENEWAL_INTERVAL_MS);
+      }
+
       let adapterResult: Awaited<ReturnType<typeof adapter.execute>>;
       try {
         const adapterContext = { ...context };
@@ -24414,6 +24504,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
         throw adapterErr;
       } finally {
+        if (branchClaimRenewalTimer) {
+          clearInterval(branchClaimRenewalTimer);
+        }
         try {
           await revokeHeartbeatRunGatewayTokens({
             db,
