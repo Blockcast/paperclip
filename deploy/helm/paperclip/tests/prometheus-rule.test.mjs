@@ -306,3 +306,85 @@ test("PaperclipPrReviewWakeTerminalFailed is pr_review-scoped, gauge-keyed, and 
     "terminal-failed alert must link the runbook from its annotation",
   );
 });
+
+test("PaperclipPlugin{Critical,}Errored key on the boolean gauge, split severity by plugin_key, and preserve error!=disabled (BLO-21092)", () => {
+  const rendered = execFileSync(
+    "helm",
+    [
+      "template",
+      "paperclip",
+      "deploy/helm/paperclip",
+      "--namespace",
+      "paperclip",
+      "-f",
+      "deploy/helm/paperclip/values.blockcast.yaml",
+      "--show-only",
+      "templates/prometheusrule.yaml",
+      "--set",
+      "prometheusRule.enabled=true",
+    ],
+    { cwd: repoRoot, encoding: "utf8" },
+  );
+
+  assert.match(rendered, /alert: PaperclipPluginCriticalErrored/);
+  assert.match(rendered, /alert: PaperclipPluginErrored/);
+
+  // Both alerts key on the boolean gauge with a strict equality, not a
+  // summed/thresholded count -- paperclip_plugin_error is already 0/1 per
+  // plugin, so `== 1` is the whole condition.
+  const [, criticalExpr] = rendered.match(
+    /alert: PaperclipPluginCriticalErrored[\s\S]*?\n\s+expr: (.+)\n/,
+  ) ?? [];
+  const [, warningExpr] = rendered.match(
+    /alert: PaperclipPluginErrored[\s\S]*?\n\s+expr: (.+)\n/,
+  ) ?? [];
+  assert.match(criticalExpr, /^paperclip_plugin_error\{plugin_key=~"[^"]+"\} == 1$/);
+  assert.match(warningExpr, /^paperclip_plugin_error\{plugin_key!~"[^"]+"\} == 1$/);
+
+  // Default critical key regex must select lucitra.plugin-secrets -- the
+  // exact plugin BLO-20410 found dead for 9+ hours with nothing alerting --
+  // and the two alerts' selectors must be exact complements (same regex, one
+  // positive one negative) so a plugin can never dual-fire nor fall through
+  // both.
+  const [, criticalRegex] = criticalExpr.match(/plugin_key=~"([^"]+)"/) ?? [];
+  const [, warningRegex] = warningExpr.match(/plugin_key!~"([^"]+)"/) ?? [];
+  assert.ok(criticalRegex, "critical alert must render a plugin_key=~ selector");
+  assert.equal(criticalRegex, warningRegex, "critical and warning selectors must be exact complements");
+  // Compare against the raw rendered (PromQL-string-escaped) text rather than
+  // constructing a JS RegExp from it -- criticalRegex is still PromQL/Go
+  // string-literal-escaped (e.g. a literal dot renders as `\\.`), so
+  // re-parsing it as a JS regex source would double-decode the escaping.
+  assert.ok(
+    criticalRegex.includes("plugin-secrets"),
+    `default critical key regex ${criticalRegex} must select lucitra.plugin-secrets`,
+  );
+
+  const [, criticalSeverity] = rendered.match(
+    /alert: PaperclipPluginCriticalErrored[\s\S]*?severity: (\w+)/,
+  ) ?? [];
+  const [, warningSeverity] = rendered.match(
+    /alert: PaperclipPluginErrored[\s\S]*?severity: (\w+)/,
+  ) ?? [];
+  assert.equal(criticalSeverity, "critical");
+  assert.equal(warningSeverity, "warning");
+
+  // Both alerts must render a `for:` grace period so a deploy's brief
+  // activation retry (BLO-978) does not page.
+  for (const alertName of ["PaperclipPluginCriticalErrored", "PaperclipPluginErrored"]) {
+    const [, forWindow] = rendered.match(
+      new RegExp(`alert: ${alertName}[\\s\\S]*?\\n\\s+for: (.+)\\n`),
+    ) ?? [];
+    assert.ok(forWindow, `${alertName} must render a for window`);
+  }
+
+  assert.match(
+    rendered,
+    /alert: PaperclipPluginCriticalErrored[\s\S]*?runbook_url: "[^"]*runbooks\/plugin-error\.md"/,
+    "critical plugin-error alert must link the runbook",
+  );
+  assert.match(
+    rendered,
+    /alert: PaperclipPluginErrored[\s\S]*?runbook_url: "[^"]*runbooks\/plugin-error\.md"/,
+    "plugin-error alert must link the runbook",
+  );
+});

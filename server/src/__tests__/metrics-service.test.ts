@@ -40,6 +40,8 @@ import {
   recordProcessLost,
   recordProcessLostLivenessNull,
   setExternalLifecycleRunningRuns,
+  PLUGIN_ERROR_METRIC,
+  setPluginErrorStatus,
 } from "../services/metrics.js";
 import {
   getDepBlockedMetric,
@@ -605,6 +607,51 @@ describe("setExternalLifecycleRunningRuns (BLO-16184 denominator #1)", () => {
     setExternalLifecycleRunningRuns({ claude_k8s: 1, some_future_k8s: 3, another: 4 });
     const { body } = await renderMetrics();
     expect(body).toContain(`${EXTERNAL_LIFECYCLE_RUNNING_RUNS_METRIC}{adapter="other"} 7`);
+  });
+});
+
+describe("setPluginErrorStatus (BLO-21092)", () => {
+  it("registers the gauge and reports 1 for an errored plugin, 0 for a ready one", async () => {
+    setPluginErrorStatus([
+      { id: "11111111-1111-1111-1111-111111111111", pluginKey: "lucitra.plugin-secrets", isError: true },
+      { id: "22222222-2222-2222-2222-222222222222", pluginKey: "example.plugin", isError: false },
+    ]);
+    const { body } = await renderMetrics();
+    expect(body).toContain(`# TYPE ${PLUGIN_ERROR_METRIC} gauge`);
+    expect(body).toContain(
+      `${PLUGIN_ERROR_METRIC}{plugin_id="11111111-1111-1111-1111-111111111111",plugin_key="lucitra.plugin-secrets"} 1`,
+    );
+    expect(body).toContain(
+      `${PLUGIN_ERROR_METRIC}{plugin_id="22222222-2222-2222-2222-222222222222",plugin_key="example.plugin"} 0`,
+    );
+  });
+
+  it("drops a plugin's series once it is no longer in the installed roster (reset-then-set)", async () => {
+    setPluginErrorStatus([
+      { id: "11111111-1111-1111-1111-111111111111", pluginKey: "lucitra.plugin-secrets", isError: true },
+    ]);
+    let body = (await renderMetrics()).body;
+    expect(body).toContain(
+      `${PLUGIN_ERROR_METRIC}{plugin_id="11111111-1111-1111-1111-111111111111",plugin_key="lucitra.plugin-secrets"} 1`,
+    );
+
+    // Plugin uninstalled: next tick's roster no longer includes it.
+    setPluginErrorStatus([]);
+    body = (await renderMetrics()).body;
+    expect(body).not.toContain("plugin_id=\"11111111-1111-1111-1111-111111111111\"");
+  });
+
+  it("flips an existing plugin's series from error to ready without leaving a stale 1", async () => {
+    setPluginErrorStatus([
+      { id: "11111111-1111-1111-1111-111111111111", pluginKey: "lucitra.plugin-secrets", isError: true },
+    ]);
+    setPluginErrorStatus([
+      { id: "11111111-1111-1111-1111-111111111111", pluginKey: "lucitra.plugin-secrets", isError: false },
+    ]);
+    const { body } = await renderMetrics();
+    expect(body).toContain(
+      `${PLUGIN_ERROR_METRIC}{plugin_id="11111111-1111-1111-1111-111111111111",plugin_key="lucitra.plugin-secrets"} 0`,
+    );
   });
 });
 

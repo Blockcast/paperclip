@@ -59,6 +59,20 @@
     - NOT yet merged and NOT yet live as of 2026-08-02. It reads a metric this
       PR adds, so it is inert until both land. Same manual `monitoring-rules`
       Argo sync gate as above applies afterwards.
+
+  STATUS of the BLO-21092 plugin-error alert, same auditability rule:
+
+    - Not yet landed on the onprem-k8s authoritative files as of the PR that
+      introduces this comment. It reads paperclip_plugin_error, a new gauge
+      this same PR adds to server/src/services/metrics.ts -- both the metric
+      and the rule are inert until the server image ships AND the onprem-k8s
+      lockstep pair (monitoring/prometheus-configmap.yaml,
+      paperclip/paperclip-runtime-alerts-prometheusrule.yaml) is merged. Verify
+      before treating it as live:
+        gh api repos/Blockcast/onprem-k8s/contents/monitoring/prometheus-configmap.yaml \
+          --jq '.content' | base64 -d | grep PaperclipPluginErrored
+    - Same manual `monitoring-rules` Argo sync gate as above (BLO-19095)
+      applies after merge -- a merged rule is not a deployed one.
 */}}
 {{- if .Values.prometheusRule.enabled }}
 apiVersion: monitoring.coreos.com/v1
@@ -269,6 +283,42 @@ spec:
             summary: "Paperclip PR-review wake is terminally failed and will never be retried"
             description: "A pr_review-scoped agent_wakeup_requests row has been sitting at status='failed' for more than {{ .Values.prometheusRule.wakeTerminalFailedAgeSeconds }}s with no successor wake for the same taskKey (BLO-20255). The age is the server-computed age of the oldest such row, published as paperclip_agent_wakeup_terminal_failed_oldest_age_seconds; the companion count series paperclip_agent_wakeup_terminal_failed_unresolved{scope=\"pr_review\"} breaks the population down by error_code. This state is TERMINAL: reconcileFailedWakeDispatches only selects dispatch_failed, so nothing re-drives it, and the BLO-18030 bounded retry deliberately declines three cases so it can never double-post a review (the GitHub probe found an existing review, the probe threw or there was no PR context, or the run was not a pr_review context). The PR has a posted review trigger and no review. Break down by the `error_code` label on the count series to decide: it is joined from heartbeat_runs.error_code via agent_wakeup_requests.run_id, because the wake table has no error_code column of its own. `external_lifecycle_stale_killed` means the reviewer Job went silent past the 45m hard-stale window and was force-terminated. `job_failed` means the Job itself exited non-zero. `none` means there was no run row or no code recorded. `other` means a code missing from KNOWN_TERMINAL_FAILED_WAKE_ERROR_CODES in services/metrics.ts — triage it into that list. Query the rows with `select w.id, w.agent_id, w.reason, w.error, w.payload ->> 'taskKey' as task_key, r.error_code from agent_wakeup_requests w left join heartbeat_runs r on r.id = w.run_id where w.status = 'failed' and w.finished_at > now() - interval '24 hours' order by w.finished_at desc`. See the runbook for the re-review-vs-accept decision."
             runbook_url: {{ .Values.prometheusRule.wakeTerminalFailedRunbookUrl | quote }}
+    - name: paperclip-plugin-lifecycle
+      rules:
+        - alert: PaperclipPluginCriticalErrored
+          # BLO-21092/BLO-20410: paperclip_plugin_error is a boolean-valued
+          # gauge already labeled by plugin_id/plugin_key, re-derived from the
+          # plugins table on every worker-tier collector tick (~30s). Unlike
+          # the wake-terminal-failed alert above, `for:` is safe to use
+          # directly here -- Prometheus tracks alert continuity per resulting
+          # series, and this series is already keyed per plugin, so it cannot
+          # collapse two different plugins' downtime into one continuously-true
+          # expression the way summing an unlabeled count would.
+          #
+          # Split into two alerts on the SAME expr shape rather than one alert
+          # with a templated severity label, so severity is visible directly
+          # in the rule file rather than hidden behind Go-template
+          # conditionals evaluated per-series at fire time. Critical: plugins
+          # matching pluginErrorCriticalKeyRegex (default lucitra.plugin-secrets,
+          # the exact plugin BLO-20410 found dead for 9+ hours). Everything
+          # else pages warning below.
+          expr: paperclip_plugin_error{plugin_key=~{{ .Values.prometheusRule.pluginErrorCriticalKeyRegex | quote }}} == 1
+          for: {{ .Values.prometheusRule.pluginErrorFor }}
+          labels:
+            severity: critical
+          annotations:
+            summary: "Paperclip critical plugin {{`{{ $labels.plugin_key }}`}} has been in status='error' for {{ .Values.prometheusRule.pluginErrorFor }}+"
+            description: "Plugin {{`{{ $labels.plugin_key }}`}} (id {{`{{ $labels.plugin_id }}`}}) has sat at status='error' for at least {{ .Values.prometheusRule.pluginErrorFor }} (BLO-21092). This plugin key matches the critical plugin allow-list (pluginErrorCriticalKeyRegex) because losing it is not merely a missing feature -- BLO-20410 found lucitra.plugin-secrets dead in this exact state for 9+ hours with the pod 1/1 Running and nothing alerting. status='error' is distinct from status='disabled': an operator-disabled plugin never sets this gauge and never pages. Check `select id, plugin_key, status, last_error, updated_at from plugins where plugin_key = '{{`{{ $labels.plugin_key }}`}}'` for the failure reason, then see the runbook."
+            runbook_url: {{ .Values.prometheusRule.pluginErrorRunbookUrl | quote }}
+        - alert: PaperclipPluginErrored
+          expr: paperclip_plugin_error{plugin_key!~{{ .Values.prometheusRule.pluginErrorCriticalKeyRegex | quote }}} == 1
+          for: {{ .Values.prometheusRule.pluginErrorFor }}
+          labels:
+            severity: warning
+          annotations:
+            summary: "Paperclip plugin {{`{{ $labels.plugin_key }}`}} has been in status='error' for {{ .Values.prometheusRule.pluginErrorFor }}+"
+            description: "Plugin {{`{{ $labels.plugin_key }}`}} (id {{`{{ $labels.plugin_id }}`}}) has sat at status='error' for at least {{ .Values.prometheusRule.pluginErrorFor }} (BLO-21092/BLO-20410 -- the detection gap that let 4 of 11 plugins, including the secrets subsystem, sit dead for 9+ hours with nothing alerting). status='error' is distinct from status='disabled': an operator-disabled plugin never sets this gauge and never pages. Check `select id, plugin_key, status, last_error, updated_at from plugins where plugin_key = '{{`{{ $labels.plugin_key }}`}}'` for the failure reason, then see the runbook."
+            runbook_url: {{ .Values.prometheusRule.pluginErrorRunbookUrl | quote }}
     {{- with .Values.prometheusRule.additionalGroups }}
     {{- toYaml . | nindent 4 }}
     {{- end }}

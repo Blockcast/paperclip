@@ -86,6 +86,7 @@ import { buildHostServices, flushPluginLogBuffer } from "./services/plugin-host-
 import { createPluginEventBus } from "./services/plugin-event-bus.js";
 import { setPluginEventBus, setPluginEventOutboxDb } from "./services/activity-log.js";
 import { startPluginEventOutbox } from "./services/plugin-event-outbox.js";
+import { startPluginStatusCollector } from "./services/plugin-status-metrics.js";
 import { startGitHubCommitStatusDeliveryOutbox } from "./services/github-status-delivery-outbox.js";
 import { createPluginDevWatcher } from "./services/plugin-dev-watcher.js";
 import { createPluginHostServiceCleanup } from "./services/plugin-host-service-cleanup.js";
@@ -999,6 +1000,7 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
   // can host workers.
   let stopPluginEventOutbox: (() => void) | null = null;
   let stopGitHubStatusDeliveryOutbox: (() => void) | null = null;
+  let stopPluginStatusCollector: (() => void) | null = null;
   if (appConfig.paperclipNodeRole === "api") {
     logger.info(
       { role: appConfig.paperclipNodeRole },
@@ -1006,6 +1008,10 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
     );
   } else {
     stopGitHubStatusDeliveryOutbox = startGitHubCommitStatusDeliveryOutbox(db);
+    // Status collection doesn't depend on loadAll() completing -- an
+    // already-error'd plugin from a previous boot must be visible on /metrics
+    // immediately, not only after this boot's own load attempt resolves.
+    stopPluginStatusCollector = startPluginStatusCollector(db);
     void ensureBundledKubernetesPlugin()
       .then(() => retireLegacyCcrotatePlugin())
       .then(() => retireIncompatiblePluginUpdater())
@@ -1032,6 +1038,7 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
     appServicesShutdown = true;
     stopPluginEventOutbox?.();
     stopGitHubStatusDeliveryOutbox?.();
+    stopPluginStatusCollector?.();
     disableFeedbackExportFlushes();
     devWatcher?.close();
     viteHtmlRenderer?.dispose();

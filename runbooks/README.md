@@ -28,3 +28,7 @@ platform cannot resolve automatically. Each runbook should be:
   confirmed alive. Trigger: `k8s_guard_decision` log line with
   `reason: "live_job_for_active_run"`, or
   `claude_k8s_concurrent_run_blocked_total{reason="live_job_for_active_run"}`.
+- [`plugin-error.md`](plugin-error.md) — an installed plugin has sat at
+  `plugins.status='error'` past the grace period, distinct from an
+  operator-disabled plugin. Trigger: alert `PaperclipPluginCriticalErrored` or
+  `PaperclipPluginErrored`, or `paperclip_plugin_error == 1`.
