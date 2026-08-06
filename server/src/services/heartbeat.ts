@@ -12632,7 +12632,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       let interrupted = interruptedStatus.run;
       await setWakeupStatus(run.wakeupRequestId, "cancelled", {
         finishedAt: now,
-        error: null,
+        error: interrupted.status === "cancelled" ? interrupted.error : null,
       });
       interrupted = await classifyAndPersistRunLiveness(interrupted, parseObject(interrupted.resultJson)) ?? interrupted;
 
@@ -12644,9 +12644,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         failureReason: interrupted.error ?? undefined,
       });
 
-      const retry = await enqueueProcessLossRetry(interrupted, agent, now);
+      const retry = interrupted.errorCode === "pipeline_stage_exited"
+        ? null
+        : await enqueueProcessLossRetry(interrupted, agent, now);
       if (!retry) {
-        await releaseIssueExecutionAndPromote(interrupted);
+        await releaseIssueExecutionAndPromote(interrupted, {
+          suppressImmediateRecovery: interrupted.errorCode === "pipeline_stage_exited",
+        });
       } else {
         retryRunIds.push(retry.id);
       }
@@ -12655,7 +12659,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         eventType: "lifecycle",
         stream: "system",
         level: "warn",
-        message,
+        message: interrupted.error ?? message,
         payload: {
           signal,
           ...(run.processPid ? { processPid: run.processPid } : {}),
@@ -12664,7 +12668,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         },
       });
 
-      await finalizeAgentStatus(run.agentId, "interrupted", message);
+      await finalizeAgentStatus(
+        run.agentId,
+        interrupted.status === "cancelled" ? "cancelled" : "interrupted",
+        interrupted.error ?? message,
+        { errorCode: interrupted.errorCode, runId: interrupted.id },
+      );
       interruptedRunIds.push(interrupted.id);
     }
 
@@ -17428,17 +17437,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         continue;
       }
       let finalizedRun = finalizedRunWrite.run;
-      await setWakeupStatus(run.wakeupRequestId, "failed", {
+      const stageExitCancelled = finalizedRun.errorCode === "pipeline_stage_exited";
+      await setWakeupStatus(run.wakeupRequestId, stageExitCancelled ? "cancelled" : "failed", {
         finishedAt: now,
-        error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
+        error: finalizedRun.error ?? (shouldRetry ? `${baseMessage}; retrying once` : baseMessage),
       });
       // BLO-16184: the process_lost mint is now committed for this run -- count it
       // (bounded adapter + error-string bucket + durable classification).
-      recordProcessLost({
-        adapter: adapterType,
-        errorString: baseMessage,
-        classification: processLossCapture.classification,
-      });
+      if (!stageExitCancelled) {
+        recordProcessLost({
+          adapter: adapterType,
+          errorString: baseMessage,
+          classification: processLossCapture.classification,
+        });
+      }
       finalizedRun = await classifyAndPersistRunLiveness(finalizedRun, parseObject(finalizedRun.resultJson)) ?? finalizedRun;
       // PCL-2571: cancel any open stale_active_run_evaluation review for
       // this run now that the silence is explained by process_lost. The
@@ -17450,9 +17462,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           companyId: finalizedRun.companyId,
           runId: finalizedRun.id,
           agentId: finalizedRun.agentId,
-          terminalStatus: "failed",
-          errorCode: "process_lost",
-          errorMessage: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
+          terminalStatus: stageExitCancelled ? "cancelled" : "failed",
+          errorCode: finalizedRun.errorCode ?? "process_lost",
+          errorMessage: finalizedRun.error ?? (shouldRetry ? `${baseMessage}; retrying once` : baseMessage),
         });
       } catch (err) {
         logger.warn(
@@ -17470,25 +17482,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // BLO-19085: `baseMessage` is the process_lost diagnosis already written
       // to the run record; pass it through so the agent record carries it too
       // instead of latching into `error` with a null reason.
-      await finalizeAgentStatus(run.agentId, "failed", baseMessage, {
-        errorCode: "process_lost",
-        runId: run.id,
-      });
+      await finalizeAgentStatus(
+        run.agentId,
+        stageExitCancelled ? "cancelled" : "failed",
+        finalizedRun.error ?? baseMessage,
+        {
+          errorCode: finalizedRun.errorCode ?? "process_lost",
+          runId: run.id,
+        },
+      );
 
       let retriedRun: typeof heartbeatRuns.$inferSelect | null = null;
       let promotedRunDispatched = false;
       const retryAgent = await getAgent(run.agentId);
-      if (shouldRetry) {
+      if (shouldRetry && !stageExitCancelled) {
         if (retryAgent) {
           retriedRun = await enqueueProcessLossRetry(finalizedRun, retryAgent, now);
         }
-      } else if (retryAgent) {
+      } else if (retryAgent && !stageExitCancelled) {
         const scheduled = await scheduleInteractionContinuationInfrastructureRetryIfEligible(finalizedRun, retryAgent);
         retriedRun = scheduled?.outcome === "scheduled" ? scheduled.run : null;
       }
 
       if (!retriedRun) {
-        promotedRunDispatched = await releaseIssueExecutionAndPromote(finalizedRun);
+        promotedRunDispatched = await releaseIssueExecutionAndPromote(finalizedRun, {
+          suppressImmediateRecovery: stageExitCancelled,
+        });
       }
       if (!opts?.suppressDispatchAfterReap && !promotedRunDispatched) {
         await startNextQueuedRunForAgent(run.agentId);
@@ -17497,10 +17516,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       await appendRunEvent(finalizedRun, await nextRunEventSeq(finalizedRun.id), {
         eventType: "lifecycle",
         stream: "system",
-        level: "error",
-        message: shouldRetry
-          ? `${baseMessage}; queued retry ${retriedRun?.id ?? ""}`.trim()
-          : baseMessage,
+        level: stageExitCancelled ? "warn" : "error",
+        message: stageExitCancelled
+          ? finalizedRun.error ?? "Run cancelled after pipeline stage exit"
+          : shouldRetry
+            ? `${baseMessage}; queued retry ${retriedRun?.id ?? ""}`.trim()
+            : baseMessage,
         payload: {
           ...(run.processPid ? { processPid: run.processPid } : {}),
           ...(run.processGroupId ? { processGroupId: run.processGroupId } : {}),

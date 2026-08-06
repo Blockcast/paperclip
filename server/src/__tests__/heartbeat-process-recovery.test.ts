@@ -2275,6 +2275,40 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(issue?.checkoutRunId).toBeNull();
   });
 
+  it("does not retry an orphaned run when guarded finalization persists a stage-exit cancellation", async () => {
+    const { agentId, runId, wakeupRequestId } = await seedRunFixture({
+      agentStatus: "running",
+      processPid: 999_999_999,
+      contextSnapshot: {
+        reviewKind: "pr_review",
+        taskKey: "pr_review:paperclipai/paperclip:123",
+      },
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({ resultJson: { pipelineStageExitCancellationRequestedAt: "2026-03-19T00:05:30.000Z" } })
+      .where(eq(heartbeatRuns.id, runId));
+
+    const result = await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+
+    expect(result).toEqual({ reaped: 1, runIds: [runId] });
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs.filter((run) => run.retryOfRunId === runId)).toHaveLength(0);
+    expect(runs.find((run) => run.id === runId)).toMatchObject({
+      id: runId,
+      status: "cancelled",
+      errorCode: "pipeline_stage_exited",
+    });
+    const wakeup = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, wakeupRequestId))
+      .then((rows) => rows[0] ?? null);
+    expect(wakeup).toMatchObject({ status: "cancelled" });
+    const agent = await db.select().from(agents).where(eq(agents.id, agentId)).then((rows) => rows[0]);
+    expect(agent?.status).toBe("idle");
+  });
+
   it("restores one lost monitor dispatch before escalating a second process loss", async () => {
     const { companyId, agentId, runId, issueId } = await seedRunFixture({
       adapterType: "openclaw_gateway",
@@ -2633,6 +2667,43 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .then((rows) => rows[0] ?? null);
     expect(issue?.checkoutRunId).toBeNull();
     expect(issue?.executionRunId).toBe(retryRun?.id);
+  });
+
+  it("does not queue shutdown recovery when guarded finalization persists a stage-exit cancellation", async () => {
+    const { agentId, runId, wakeupRequestId } = await seedRunFixture({
+      agentStatus: "running",
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({ resultJson: { pipelineStageExitCancellationRequestedAt: "2026-03-19T00:05:30.000Z" } })
+      .where(eq(heartbeatRuns.id, runId));
+    const heartbeat = createHeartbeat();
+
+    const result = await heartbeat.drainRunningRunsForShutdown(
+      "SIGTERM",
+      new Date("2026-03-19T00:06:00.000Z"),
+    );
+
+    expect(result).toEqual({
+      interrupted: 1,
+      interruptedRunIds: [runId],
+      retryRunIds: [],
+    });
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs.filter((run) => run.retryOfRunId === runId)).toHaveLength(0);
+    expect(runs.find((run) => run.id === runId)).toMatchObject({
+      id: runId,
+      status: "cancelled",
+      errorCode: "pipeline_stage_exited",
+    });
+    const wakeup = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, wakeupRequestId))
+      .then((rows) => rows[0] ?? null);
+    expect(wakeup).toMatchObject({ status: "cancelled" });
+    const agent = await db.select().from(agents).where(eq(agents.id, agentId)).then((rows) => rows[0]);
+    expect(agent?.status).toBe("idle");
   });
 
   it("does not overwrite a run that is no longer running during graceful shutdown drain", async () => {
