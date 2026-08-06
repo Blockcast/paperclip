@@ -136,7 +136,7 @@ test("every arc-light root job waits for the merge-queue guard before consuming 
     );
     assert.match(
       block,
-      /\n    if: always\(\) && \(needs\.merge_queue_guard\.result == 'success' \|\| needs\.merge_queue_guard\.result == 'skipped'\)\n/,
+      /\n    if: "!cancelled\(\) && \(needs\.merge_queue_guard\.result == 'success' \|\| needs\.merge_queue_guard\.result == 'skipped'\)"\n/,
       `${job} must fail open when the guard is skipped (pull_request) or succeeded (merge_group, still live)`,
     );
   }
@@ -149,7 +149,7 @@ test("every job downstream of policy scopes its own success check instead of inh
   // `needs: [policy]` (relying on the implicit default condition) started
   // silently skipping on pull_request events -- merge_queue_guard reports
   // `skipped` there, and that skip cascades past policy's own explicit
-  // always()-tolerant override to every descendant that didn't repeat it.
+  // !cancelled()-tolerant override to every descendant that didn't repeat it.
   // `verify` treats an upstream skip as a failure, so this broke the
   // required check for every PR, not just ones touching this workflow. This
   // was caught by `verify` itself failing on this PR's own pull_request
@@ -157,12 +157,14 @@ test("every job downstream of policy scopes its own success check instead of inh
   // silently again.
   //
   // A first attempt at this fix used a bare `if: needs.policy.result ==
-  // 'success'` with no `always()`. That still failed live: GitHub applies
-  // its default "skip if anything upstream was skipped" gate underneath a
-  // custom `if:` unless `always()` is also present, so the custom condition
-  // never even got evaluated -- merge_queue_guard's pull_request skip kept
-  // cascading through it exactly as before. `always()` must prefix every
-  // condition below, matching the pattern policy/helm_chart already use.
+  // 'success'` with no status-check function. That still failed live:
+  // GitHub applies its default "skip if anything upstream was skipped" gate
+  // underneath a custom `if:` unless a status-check function is also
+  // present, so the custom condition never even got evaluated --
+  // merge_queue_guard's pull_request skip kept cascading through it exactly
+  // as before. `!cancelled()` must prefix every condition below, matching the
+  // pattern policy/helm_chart already use without making cancelled workflows
+  // keep scheduling runner-heavy jobs.
   const directPolicyJobs = [
     "typecheck_release_registry",
     "worktree_install",
@@ -183,8 +185,8 @@ test("every job downstream of policy scopes its own success check instead of inh
     assert.match(block, /\n    needs: \[policy\]\n/, `${job} must declare needs: [policy]`);
     assert.match(
       block,
-      /\n    if: always\(\) && needs\.policy\.result == 'success'\n/,
-      `${job} must gate on always() && needs.policy.result == 'success', not the implicit transitive success() and not a bare custom condition without always()`,
+      /\n    if: "!cancelled\(\) && needs\.policy\.result == 'success'"\n/,
+      `${job} must gate on !cancelled() && needs.policy.result == 'success', not the implicit transitive success() and not a bare custom condition without a status-check function`,
     );
   }
 
@@ -192,8 +194,8 @@ test("every job downstream of policy scopes its own success check instead of inh
   assert.match(verifyServerBlock, /\n    needs: \[policy, general_tests\]\n/);
   assert.match(
     verifyServerBlock,
-    /\n    if: always\(\) && needs\.policy\.result == 'success' && needs\.general_tests\.result == 'success'\n/,
-    "verify_serialized_server must gate on always() plus both its direct dependencies' results",
+    /\n    if: "!cancelled\(\) && needs\.policy\.result == 'success' && needs\.general_tests\.result == 'success'"\n/,
+    "verify_serialized_server must gate on !cancelled() plus both its direct dependencies' results",
   );
 });
 

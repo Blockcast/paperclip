@@ -131,7 +131,7 @@ jobs:
     # `if` keeps the pull_request path working, where `merge_queue_guard`
     # never runs and reports `skipped` rather than `success`.
     needs: [merge_queue_guard]
-    if: always() && (needs.merge_queue_guard.result == 'success' || needs.merge_queue_guard.result == 'skipped')
+    if: "!cancelled() && (needs.merge_queue_guard.result == 'success' || needs.merge_queue_guard.result == 'skipped')"
     runs-on: arc-light
     timeout-minutes: 5
     permissions:
@@ -295,7 +295,7 @@ jobs:
     # independent arc-light root that must wait behind the merge-queue guard
     # instead of racing it for a runner.
     needs: [merge_queue_guard]
-    if: always() && (needs.merge_queue_guard.result == 'success' || needs.merge_queue_guard.result == 'skipped')
+    if: "!cancelled() && (needs.merge_queue_guard.result == 'success' || needs.merge_queue_guard.result == 'skipped')"
     runs-on: arc-light
     timeout-minutes: 10
 
@@ -328,10 +328,11 @@ jobs:
     # reports `skipped`, which cascades here and skips this job even though
     # policy itself succeeded. A custom `if:` alone does not fix this: GitHub
     # still applies its default "skip if anything upstream was skipped"
-    # check underneath a custom condition unless `always()` is also present,
-    # so both parts are required together.
+    # check underneath a custom condition unless a status-check function is
+    # present. Use !cancelled() so cancelled workflows do not keep scheduling
+    # runner-heavy jobs.
     needs: [policy]
-    if: always() && needs.policy.result == 'success'
+    if: "!cancelled() && needs.policy.result == 'success'"
     runs-on: default
     # ARC setup plus the sequential build-gap typechecks exceeded the previous
     # 20-minute ceiling while the final UI typecheck was still making progress.
@@ -373,12 +374,13 @@ jobs:
 
   worktree_install:
     name: Worktree install (NODE_ENV=production)
-    # BLO-21953: see typecheck_release_registry above -- always() is required
-    # alongside the custom condition, or GitHub's default upstream-skip check
-    # still applies underneath it and merge_queue_guard's pull_request skip
-    # cascades past policy and skips this job too.
+    # BLO-21953: see typecheck_release_registry above -- !cancelled() is
+    # required alongside the custom condition, or GitHub's default
+    # upstream-skip check still applies underneath it and
+    # merge_queue_guard's pull_request skip cascades past policy and skips
+    # this job too.
     needs: [policy]
-    if: always() && needs.policy.result == 'success'
+    if: "!cancelled() && needs.policy.result == 'success'"
     runs-on: default
     timeout-minutes: 20
     # Regression guard for BLO-19064. pnpm treats NODE_ENV=production as an
@@ -464,12 +466,13 @@ jobs:
 
   general_tests:
     name: General tests (${{ matrix.group_label }})
-    # BLO-21953: see typecheck_release_registry above -- always() is required
-    # alongside the custom condition, or GitHub's default upstream-skip check
-    # still applies underneath it and merge_queue_guard's pull_request skip
-    # cascades past policy and skips this job too.
+    # BLO-21953: see typecheck_release_registry above -- !cancelled() is
+    # required alongside the custom condition, or GitHub's default
+    # upstream-skip check still applies underneath it and
+    # merge_queue_guard's pull_request skip cascades past policy and skips
+    # this job too.
     needs: [policy]
-    if: always() && needs.policy.result == 'success'
+    if: "!cancelled() && needs.policy.result == 'success'"
     runs-on: default
     # Embedded Postgres can spend tens of seconds per suite waiting on shared
     # ARC node storage. A server shard reached the previous 60-minute ceiling
@@ -640,12 +643,13 @@ jobs:
 
   build:
     name: Build
-    # BLO-21953: see typecheck_release_registry above -- always() is required
-    # alongside the custom condition, or GitHub's default upstream-skip check
-    # still applies underneath it and merge_queue_guard's pull_request skip
-    # cascades past policy and skips this job too.
+    # BLO-21953: see typecheck_release_registry above -- !cancelled() is
+    # required alongside the custom condition, or GitHub's default
+    # upstream-skip check still applies underneath it and
+    # merge_queue_guard's pull_request skip cascades past policy and skips
+    # this job too.
     needs: [policy]
-    if: always() && needs.policy.result == 'success'
+    if: "!cancelled() && needs.policy.result == 'success'"
     runs-on: default
     timeout-minutes: 20
 
@@ -682,12 +686,13 @@ jobs:
 
   verify_serialized_server:
     name: Verify serialized server suites (${{ matrix.shard_label }})
-    # BLO-21953: see typecheck_release_registry above -- always() is required
-    # alongside the custom condition, or GitHub's default upstream-skip check
-    # still applies underneath it and merge_queue_guard's pull_request skip
-    # cascades past policy/general_tests and skips this job too.
+    # BLO-21953: see typecheck_release_registry above -- !cancelled() is
+    # required alongside the custom condition, or GitHub's default
+    # upstream-skip check still applies underneath it and
+    # merge_queue_guard's pull_request skip cascades past policy/general_tests
+    # and skips this job too.
     needs: [policy, general_tests]
-    if: always() && needs.policy.result == 'success' && needs.general_tests.result == 'success'
+    if: "!cancelled() && needs.policy.result == 'success' && needs.general_tests.result == 'success'"
     runs-on: default
     timeout-minutes: 90
     strategy:
@@ -741,12 +746,13 @@ jobs:
 
   canary_dry_run:
     name: Canary Dry Run
-    # BLO-21953: see typecheck_release_registry above -- always() is required
-    # alongside the custom condition, or GitHub's default upstream-skip check
-    # still applies underneath it and merge_queue_guard's pull_request skip
-    # cascades past policy and skips this job too.
+    # BLO-21953: see typecheck_release_registry above -- !cancelled() is
+    # required alongside the custom condition, or GitHub's default
+    # upstream-skip check still applies underneath it and
+    # merge_queue_guard's pull_request skip cascades past policy and skips
+    # this job too.
     needs: [policy]
-    if: always() && needs.policy.result == 'success'
+    if: "!cancelled() && needs.policy.result == 'success'"
     runs-on: default
     # ARC setup/cache restore plus release.sh's mandatory workspace build hit
     # the previous 20-minute ceiling while the build was still progressing.
@@ -805,12 +811,13 @@ jobs:
           ./scripts/release.sh canary --skip-verify --dry-run
 
   e2e:
-    # BLO-21953: see typecheck_release_registry above -- always() is required
-    # alongside the custom condition, or GitHub's default upstream-skip check
-    # still applies underneath it and merge_queue_guard's pull_request skip
-    # cascades past policy and skips this job too.
+    # BLO-21953: see typecheck_release_registry above -- !cancelled() is
+    # required alongside the custom condition, or GitHub's default
+    # upstream-skip check still applies underneath it and
+    # merge_queue_guard's pull_request skip cascades past policy and skips
+    # this job too.
     needs: [policy]
-    if: always() && needs.policy.result == 'success'
+    if: "!cancelled() && needs.policy.result == 'success'"
     # Keep the long browser suite off the org-wide default pool so PR bursts
     # cannot hold shared capacity for the full e2e runtime.
     runs-on: arc-e2e
