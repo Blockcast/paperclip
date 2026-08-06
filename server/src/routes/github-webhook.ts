@@ -1604,6 +1604,14 @@ async function withPrReviewerTaskLock<T>(
         settleLockProbe({ error });
         throw error;
       }
+      if (acquired && Date.now() >= deadline) {
+        logger.warn(
+          { taskKey },
+          "github webhook reviewer wake lock was acquired after its retry deadline; skipping reviewer wake action",
+        );
+        settleLockProbe({ acquired: false });
+        return { acquired: false as const };
+      }
       settleLockProbe({ acquired });
       if (!acquired) {
         return { acquired: false as const };
@@ -3037,6 +3045,7 @@ export const __test_buildPrReviewerWakeIdempotencyKey = buildPrReviewerWakeIdemp
 export const __test_prReviewerWakeIdempotencyScope = prReviewerWakeIdempotencyScope;
 export const __test_idempotentWakeStatuses = idempotentWakeStatuses;
 export const __test_buildPrReviewerTaskKey = buildPrReviewerTaskKey;
+export const __test_withPrReviewerTaskLock = withPrReviewerTaskLock;
 export const __test_buildDependabotAlertIssueBody = buildDependabotAlertIssueBody;
 export const __test_resolveDependabotAlertContext = resolveDependabotAlertContext;
 export const __test_hasActionablePrReviewFeedback = hasActionablePrReviewFeedback;

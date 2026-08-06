@@ -42,6 +42,7 @@ import {
   __test_resolveEventContext,
   __test_shouldFirePrReviewerWake,
   __test_verifyGithubSignature,
+  __test_withPrReviewerTaskLock,
   githubWebhookRoutes,
   type GithubWebhookConfig,
 } from "../routes/github-webhook.js";
@@ -1156,6 +1157,39 @@ describe("github-webhook pure helpers", () => {
   it("returns null for dependabot payloads without a numeric alert number", () => {
     expect(__test_resolveDependabotAlertContext({ action: "created", alert: {} })).toBeNull();
     expect(__test_resolveDependabotAlertContext({ action: "created" })).toBeNull();
+  });
+
+  it("does not run reviewer wake action when lock acquisition settles after the deadline", async () => {
+    let actionCalled = false;
+    let probeStarted = false;
+    const fakeDb = {
+      transaction: async (
+        callback: (tx: { execute: () => Promise<Array<{ acquired: boolean }>> }) => Promise<unknown>,
+      ) =>
+        callback({
+          execute: async () => {
+            probeStarted = true;
+            await new Promise((resolve) => setTimeout(resolve, 30));
+            return [{ acquired: true }];
+          },
+        }),
+    };
+
+    await expect(
+      __test_withPrReviewerTaskLock(
+        fakeDb as never,
+        "pr_review:Blockcast/paperclip:21582006",
+        Date.now() + 5,
+        async () => {
+          actionCalled = true;
+          return "queued";
+        },
+      ),
+    ).rejects.toThrow("timed out acquiring PR reviewer task assignment lock");
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(probeStarted).toBe(true);
+    expect(actionCalled).toBe(false);
   });
 });
 
