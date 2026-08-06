@@ -15,12 +15,26 @@
 // allowlist, denylist, or filter of any kind on the pod-env path.
 // `getSelfPodInfo()` (`k8s-client.ts:111-197`) selects one container off the
 // server pod — the one named `paperclip`, else the first — and extracts that
-// container's credential-bearing channels unfiltered: literal `env[].value`s,
-// `valueFrom` entries (`secretKeyRef` included), `envFrom` sources, and the
-// secret volumes mounted on it. `job-manifest.ts` then replays all four onto
-// every agent pod (`:491`, `:562`, `:1144`, `:879`). Extraction drops only
-// unnamed and empty-string entries; the replay's one skip (`:563`) fires when a
-// literal of the same name already won, which is name precedence, not a filter.
+// container's credential-bearing channels: literal `env[].value`s, `valueFrom`
+// entries (`secretKeyRef` included), `envFrom` sources, and the secret volumes
+// mounted on it. `job-manifest.ts` forwards all four onto every agent pod
+// (`:491`, `:562`, `:1144`, `:879`), subject only to ordinary environment
+// precedence and never to a security decision.
+//
+// Entries are dropped or replaced at several points along that path, so do not
+// read any single one as the only such point: extraction skips unnamed and
+// empty-string values (`k8s-client.ts:167`, `:173`); the merge layers that run
+// after the inherited env overwrite or extend same-name inherited literals
+// (`job-manifest.ts:490-550` — generated Paperclip values, `adapterConfig.env`
+// overrides, generated `ANTHROPIC_CUSTOM_HEADERS`, `HOME`, and isolation and
+// cache paths); and the `valueFrom` replay skips names a literal already set
+// (`:563`). Every one of those is name precedence or an emptiness check, so
+// none of them withholds a credential on the grounds that it is sensitive.
+//
+// The adapter's only env-related guard, `env-guard.ts`, is a Claude Code
+// `PreToolUse` hook blocking shell environment dumps (`env`, `printenv`,
+// `/proc/*/environ`) at agent runtime. It never inspects a manifest, so it does
+// not constrain anything described above.
 //
 // So this guard covers only manifests built by this repo's Kubernetes
 // sandbox-provider path, and provides zero coverage for that adapter. See
