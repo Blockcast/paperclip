@@ -4664,11 +4664,22 @@ export function issueService(db: Db) {
   ) {
     return db.transaction(async (tx) => {
       await lockIssueBlockerRelations(tx, companyId, issueId);
+      const currentBlockerIssueIds = await tx
+        .select({ id: issueRelations.issueId })
+        .from(issueRelations)
+        .where(
+          and(
+            eq(issueRelations.companyId, companyId),
+            eq(issueRelations.relatedIssueId, issueId),
+            eq(issueRelations.type, "blocks"),
+          ),
+        )
+        .then((rows) => rows.map((row) => row.id));
+      await lockBlockedByIssueRowsForUpdate(issueId, companyId, currentBlockerIssueIds, tx);
       const lockedIssue = await tx
         .select({ id: issues.id })
         .from(issues)
-        .where(eq(issues.id, issueId))
-        .for("update")
+        .where(and(eq(issues.companyId, companyId), eq(issues.id, issueId)))
         .then((rows) => rows[0] ?? null);
       if (!lockedIssue) return null;
 

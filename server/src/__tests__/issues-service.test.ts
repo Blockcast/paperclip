@@ -6664,6 +6664,90 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     expect(row).toEqual({ status: "todo", checkoutRunId: null });
   });
 
+  it("waits for an existing blocker status transition before checkout", async () => {
+    const companyId = randomUUID();
+    const assigneeAgentId = randomUUID();
+    const blockerId = "00000000-0000-4000-8000-000000000001";
+    const blockedId = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Concurrent checkout blocker status",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: assigneeAgentId,
+      companyId,
+      name: "ConcurrentCheckoutStatusAgent",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values([
+      { id: blockerId, companyId, title: "Resolved checkout blocker", status: "done", priority: "medium" },
+      {
+        id: blockedId,
+        companyId,
+        title: "Checkout status race candidate",
+        status: "todo",
+        priority: "medium",
+        assigneeAgentId,
+      },
+    ]);
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerId,
+      relatedIssueId: blockedId,
+      type: "blocks",
+    });
+
+    const blockerUpdateReady = deferred<void>();
+    const releaseBlockerUpdate = deferred<void>();
+    const blockerUpdate = db.transaction(async (tx) => {
+      await tx.update(issues).set({ status: "todo" }).where(eq(issues.id, blockerId));
+      blockerUpdateReady.resolve();
+      await releaseBlockerUpdate.promise;
+    });
+    await blockerUpdateReady.promise;
+
+    const checkout = svc.checkout(blockedId, assigneeAgentId, ["todo"], null);
+    try {
+      const deadline = Date.now() + 10_000;
+      let checkoutWaitedForBlockerUpdate = false;
+      while (Date.now() < deadline) {
+        const waitingRows = await db.execute(sql<{ waiting: boolean }>`
+          select exists (
+            select 1
+            from pg_stat_activity
+            where datname = current_database()
+              and pid <> pg_backend_pid()
+              and wait_event_type = 'Lock'
+          ) as waiting
+        `);
+        if (Array.from(waitingRows)[0]?.waiting) {
+          checkoutWaitedForBlockerUpdate = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      expect(checkoutWaitedForBlockerUpdate).toBe(true);
+    } finally {
+      releaseBlockerUpdate.resolve();
+    }
+
+    await blockerUpdate;
+    await expect(checkout).rejects.toMatchObject({ status: 422 });
+    const row = await db
+      .select({ status: issues.status, checkoutRunId: issues.checkoutRunId })
+      .from(issues)
+      .where(eq(issues.id, blockedId))
+      .then((rows) => rows[0] ?? null);
+    expect(row).toEqual({ status: "todo", checkoutRunId: null });
+  });
+
   it("allows a deliberate blocked to todo promotion when the latest agent comment awaits user input", async () => {
     const companyId = randomUUID();
     const assigneeAgentId = randomUUID();
