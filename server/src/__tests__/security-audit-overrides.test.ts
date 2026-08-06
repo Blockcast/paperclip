@@ -15,7 +15,7 @@ describe("PEN-1198 audit dependency remediation", () => {
     expect(overrides["@connectrpc/connect-node>undici"]).toBe(
       ">=6.27.0 <7",
     );
-    expect(overrides["jsdom>undici"]).toBe(">=7.28.0 <8");
+    expect(overrides["jsdom>undici"]).toBe(">=7.29.0 <8");
     expect(overrides.multer).toBe(">=2.2.0 <3");
     expect(serverPackageJson.dependencies.multer).toBe("^2.2.0");
   });
@@ -31,8 +31,9 @@ describe("PEN-1198 audit dependency remediation", () => {
       ]),
     });
     expect(remediations["jsdom>undici"]).toMatchObject({
-      patchedRange: ">=7.28.0 <8",
+      patchedRange: ">=7.29.0 <8",
       advisories: expect.arrayContaining([
+        "GHSA-4cwx-7wf7-3272",
         "GHSA-vmh5-mc38-953g",
         "GHSA-hm92-r4w5-c3mj",
       ]),
