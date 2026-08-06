@@ -44,7 +44,7 @@ export function ReviewQueueCard({
     refetchOnMount: false,
     refetchInterval: (state) => {
       const visibleItems = filterActionRequests(state.state.data?.actionRequests, connectionId);
-      return emptyState !== "hidden" && visibleItems.length === 0
+      return emptyState !== "hidden" && state.state.status === "success" && visibleItems.length === 0
         ? VISIBLE_EMPTY_QUEUE_REFRESH_MS
         : 20_000;
     },
