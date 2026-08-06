@@ -20,13 +20,13 @@
 -- predicate references the very column the rollback had just removed. The
 -- hinted `CREATE INDEX CONCURRENTLY` then failed with "column does not exist",
 -- and migrations could never advance — an unbreakable loop on any populated
--- pre-0210 database.
+-- pre-0211 database.
 --
 -- Phase A therefore does the one thing that is unconditionally safe and can
 -- never fail: add nullable, defaultless columns. That is a catalog-only change
 -- with no table rewrite and no lock held for any meaningful time, on a table of
--- any size. Phase B (0211) adds the supporting index and is written so it can
--- never raise on a populated table. Phase C (0212) validates.
+-- any size. Phase B (0212) adds the supporting index and is written so it can
+-- never raise on a populated table. Phase C (0213) validates.
 --
 -- No backfill is needed: `error_code = 'worker_crashed'` is introduced by the
 -- same change that adds these columns, so there are no pre-existing rows to

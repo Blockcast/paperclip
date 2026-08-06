@@ -1137,6 +1137,7 @@ export async function startServer(): Promise<StartedServer> {
       pluginWorkerManager,
       paperclipNodeRole: config.paperclipNodeRole,
       coldBootReattachGraceMs: EXTERNAL_LIFECYCLE_COLD_BOOT_REATTACH_GRACE_MS,
+      productivityReviewMonitorSchedulerIntervalMs: config.heartbeatSchedulerIntervalMs,
     });
     workerHeartbeat = heartbeat;
     // BLO-19722 AC 2/3: hand the entrypoint crash guard a way to terminalize

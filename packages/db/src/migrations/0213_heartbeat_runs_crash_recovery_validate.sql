@@ -1,7 +1,7 @@
 -- BLO-19722 / BLO-20822 — Phase C of three: validate that crash-recovery state
 -- landed, and report (never require) the supporting index.
 --
--- Split rationale in the header of 0210. In short: drizzle runs every pending
+-- Split rationale in the header of 0211. In short: drizzle runs every pending
 -- migration file inside one transaction, so anything that raises here rolls
 -- back Phase A's columns too. This file therefore validates only what recovery
 -- is actually *correct* against — the columns — and treats the index as
@@ -11,7 +11,7 @@
 -- them is load-bearing: `crash_recovery_completed_at` is the durable completion
 -- marker the startup reconciler selects on, and the three backoff columns are
 -- what stop a permanently-failing row from starving the oldest-first batch. If
--- 0210 were ever edited into a form that silently no-ops (an `IF NOT EXISTS`
+-- 0211 were ever edited into a form that silently no-ops (an `IF NOT EXISTS`
 -- against a pre-existing column of the wrong type, say), recovery would compile
 -- and then misbehave at runtime. Failing the deploy is the right response, and
 -- unlike a missing index it is a real, operator-fixable defect rather than a
@@ -68,17 +68,17 @@ BEGIN
 
   IF invalid_columns IS NOT NULL THEN
     RAISE EXCEPTION USING
-      MESSAGE = 'migration 0212: heartbeat_runs crash-recovery columns are missing or do not match the required shape after 0210: ' || invalid_columns,
-      HINT = 'Phase A (0210) did not apply cleanly, or a pre-existing column survived its ADD COLUMN IF NOT EXISTS. Each column must have the stated type, be nullable, and carry no default; a default on crash_recovery_completed_at silently excludes every crash-marked run from recovery. Inspect heartbeat_runs, drop or ALTER the offending columns, then retry migrations.';
+      MESSAGE = 'migration 0213: heartbeat_runs crash-recovery columns are missing or do not match the required shape after 0211: ' || invalid_columns,
+      HINT = 'Phase A (0211) did not apply cleanly, or a pre-existing column survived its ADD COLUMN IF NOT EXISTS. Each column must have the stated type, be nullable, and carry no default; a default on crash_recovery_completed_at silently excludes every crash-marked run from recovery. Inspect heartbeat_runs, drop or ALTER the offending columns, then retry migrations.';
   END IF;
 
   -- Reported, never required. On a populated database the index is created by
   -- the documented online `CREATE INDEX CONCURRENTLY` predeploy step, which can
-  -- only run once 0210 has committed — i.e. potentially after this migration.
-  -- Raising here would roll 0210 back and make that step impossible.
+  -- only run once 0211 has committed — i.e. potentially after this migration.
+  -- Raising here would roll 0211 back and make that step impossible.
   index_present := to_regclass('public.heartbeat_runs_crash_recovery_pending_idx') IS NOT NULL;
   IF NOT index_present THEN
-    RAISE NOTICE 'migration 0212: heartbeat_runs_crash_recovery_pending_idx is absent. Crash recovery is correct without it (the candidate scan degrades to a sequential scan); create it online when convenient — see 0211.';
+    RAISE NOTICE 'migration 0213: heartbeat_runs_crash_recovery_pending_idx is absent. Crash recovery is correct without it (the candidate scan degrades to a sequential scan); create it online when convenient — see 0212.';
   END IF;
 END
 $$;

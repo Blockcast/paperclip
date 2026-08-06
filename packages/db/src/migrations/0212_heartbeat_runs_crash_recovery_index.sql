@@ -10,7 +10,7 @@
 -- THIS FILE MUST NEVER `RAISE` BECAUSE THE INDEX IS ABSENT.
 --
 -- drizzle wraps *all* pending migration files in a single transaction (see the
--- header of 0210). Raising here would roll back 0210's `ADD COLUMN`, so the
+-- header of 0211). Raising here would roll back 0211's `ADD COLUMN`, so the
 -- `CREATE INDEX CONCURRENTLY` this file would be asking the operator to run
 -- could never succeed — its predicate references a column the rollback just
 -- removed. That is precisely the unbreakable loop this three-way split exists
@@ -25,7 +25,7 @@
 -- failed deploy.
 --
 -- On a populated database the index is therefore left to the documented online
--- predeploy step, which is safe to run at any time after 0210 has committed:
+-- predeploy step, which is safe to run at any time after 0211 has committed:
 --
 --   CREATE INDEX CONCURRENTLY IF NOT EXISTS heartbeat_runs_crash_recovery_pending_idx
 --     ON heartbeat_runs USING btree (finished_at, id)
@@ -78,12 +78,12 @@ BEGIN
       -- transaction and commits its history row before starting the next, so
       -- phase A's columns are already durable by the time this raises. The
       -- `crash_recovery_completed_at` the recreate below references therefore
-      -- exists. Pinned by the "phase A survives a 0209 raise" migration test --
+      -- exists. Pinned by the "phase A survives a phase B raise" migration test --
       -- if the runner is ever switched to drizzle's batch migrator (which does
       -- wrap all pending files in ONE transaction), that test fails and this
       -- hint must be reordered to drop -> rerun migrations -> create index.
       RAISE EXCEPTION USING
-        MESSAGE = 'migration 0211 found an invalid or incorrectly defined heartbeat_runs_crash_recovery_pending_idx',
+        MESSAGE = 'migration 0212 found an invalid or incorrectly defined heartbeat_runs_crash_recovery_pending_idx',
         HINT = 'Run DROP INDEX CONCURRENTLY IF EXISTS heartbeat_runs_crash_recovery_pending_idx; then recreate it with CREATE INDEX CONCURRENTLY heartbeat_runs_crash_recovery_pending_idx ON heartbeat_runs USING btree (finished_at, id) WHERE error_code = ''worker_crashed'' AND crash_recovery_completed_at IS NULL; then retry migrations.';
     END IF;
 
@@ -95,13 +95,13 @@ BEGIN
   -- meaningful lock. `SHARE MODE` closes the gap between this check and the
   -- CREATE without ever being taken on a populated production table.
   IF EXISTS (SELECT 1 FROM "heartbeat_runs" LIMIT 1) THEN
-    RAISE NOTICE 'migration 0211: heartbeat_runs is populated; skipping inline index build. Create heartbeat_runs_crash_recovery_pending_idx online with CREATE INDEX CONCURRENTLY (see this migration''s header). Recovery is correct without it — the candidate scan degrades to a sequential scan.';
+    RAISE NOTICE 'migration 0212: heartbeat_runs is populated; skipping inline index build. Create heartbeat_runs_crash_recovery_pending_idx online with CREATE INDEX CONCURRENTLY (see this migration''s header). Recovery is correct without it — the candidate scan degrades to a sequential scan.';
     RETURN;
   END IF;
 
   LOCK TABLE "heartbeat_runs" IN SHARE MODE;
   IF EXISTS (SELECT 1 FROM "heartbeat_runs" LIMIT 1) THEN
-    RAISE NOTICE 'migration 0211: heartbeat_runs became non-empty while acquiring SHARE; skipping inline index build. Create heartbeat_runs_crash_recovery_pending_idx online with CREATE INDEX CONCURRENTLY (see this migration''s header).';
+    RAISE NOTICE 'migration 0212: heartbeat_runs became non-empty while acquiring SHARE; skipping inline index build. Create heartbeat_runs_crash_recovery_pending_idx online with CREATE INDEX CONCURRENTLY (see this migration''s header).';
     RETURN;
   END IF;
 

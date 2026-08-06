@@ -31,7 +31,7 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
   });
 
   it("vendors the claude_k8s adapter commit with runtime isolation, Penstock retry hints, Opus 5, and run-cwd diagnostics", () => {
-    expect(serverDockerfile).toContain("ARG CLAUDE_K8S_REF=c9b3b2c1c979d2db121f0c1129a06a38356678e7");
+    expect(serverDockerfile).toContain("ARG CLAUDE_K8S_REF=3ad33702052f357ec2b31b7d3051e89ed1ed4875");
     expect(serverDockerfile).toContain("model-only commit based on the previous");
     expect(serverDockerfile).toContain("without bundling later retry-semantics changes");
     expect(serverDockerfile).toContain("bound the pre-Job live-Job list to 15 seconds");
@@ -72,7 +72,7 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
   });
 
   it("vendors the opencode_k8s adapter commit with runtime isolation, the env-dump deny, and Opus 5", () => {
-    expect(serverDockerfile).toContain("ARG OPENCODE_K8S_REF=3ab75fb6893d3f2eed26b38a830f1a48bd1f35c0");
+    expect(serverDockerfile).toContain("ARG OPENCODE_K8S_REF=42384fdef5780ccdfbfba67c1a60feebd7ffb87c");
     expect(serverDockerfile).toContain("add anthropic/claude-opus-5 to the");
     expect(serverDockerfile).toContain("bound the pre-Job live-Job list to 15 seconds");
     expect(serverDockerfile).toContain("PEN-1305 permission.bash env-dump deny");
@@ -133,6 +133,33 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
 
   it("keeps the agent image build timeout above full toolchain rebuild duration", () => {
     expect(dockerAgentWorkflow).toContain("timeout-minutes: 90");
+  });
+
+  it("gates agent rollout on a restricted-container screenshot smoke test", () => {
+    const buildIndex = dockerAgentWorkflow.indexOf("name: Build and push");
+    const smokeIndex = dockerAgentWorkflow.indexOf("Smoke test restricted headless screenshot");
+    const promoteIndex = dockerAgentWorkflow.indexOf("Promote verified agent image");
+    const bumpIndex = dockerAgentWorkflow.indexOf("Bump agent image refs in cluster");
+
+    expect(buildIndex).toBeGreaterThan(-1);
+    expect(smokeIndex).toBeGreaterThan(-1);
+    expect(buildIndex).toBeLessThan(smokeIndex);
+    expect(promoteIndex).toBeGreaterThan(smokeIndex);
+    expect(promoteIndex).toBeLessThan(bumpIndex);
+    expect(smokeIndex).toBeLessThan(bumpIndex);
+    expect(dockerAgentWorkflow).toContain("--user 1000:1000");
+    expect(dockerAgentWorkflow).toContain("--security-opt no-new-privileges");
+    expect(dockerAgentWorkflow).toContain("--cap-drop ALL");
+    expect(dockerAgentWorkflow).toContain("--tmpfs /paperclip:rw,nosuid,size=16m");
+    expect(dockerAgentWorkflow).toContain("paperclip-browser-smoke");
+    expect(dockerAgentWorkflow).toContain("AGENT_IMAGE: harbor.blockcast.net/paperclip-agent/paperclip-agent@${{ steps.build.outputs.digest }}");
+    expect(dockerAgentWorkflow).toContain("docker buildx imagetools create --tag \"$FLOATING_IMAGE\" \"$CANDIDATE_IMAGE\"");
+
+    const metadataBlock = dockerAgentWorkflow.slice(
+      dockerAgentWorkflow.indexOf("name: Docker meta"),
+      buildIndex,
+    );
+    expect(metadataBlock).not.toContain("latest-k8s-vendored");
   });
 
   it("includes resolved upstream image digests in stable image identities", () => {

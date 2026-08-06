@@ -36,6 +36,7 @@ import {
   issues,
   labels,
   linearIssueLinks,
+  milestones,
   projectWorkspaces,
   projects,
   workspaceOperations,
@@ -123,6 +124,7 @@ import { finalizeSummarySlotsForTerminalIssue } from "./summary-slot-finalizatio
 
 const ALL_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked", "done", "cancelled"];
 const OPEN_ROUTINE_EXECUTION_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked"] as const;
+const ISSUE_PARENT_ANCESTRY_VALIDATION_MAX_DEPTH = 256;
 const MAX_ISSUE_COMMENT_PAGE_LIMIT = 500;
 export const ISSUE_LIST_DEFAULT_LIMIT = 500;
 export const ISSUE_LIST_MAX_LIMIT = 1000;
@@ -787,6 +789,7 @@ type IssueUserContextInput = {
 };
 type ProjectGoalReader = Pick<Db, "select">;
 type DbReader = Pick<Db, "select">;
+type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type IssueCreateInput = Omit<typeof issues.$inferInsert, "companyId"> & {
   labelIds?: string[];
   blockedByIssueIds?: string[];
@@ -809,6 +812,7 @@ type IssueCreateInput = Omit<typeof issues.$inferInsert, "companyId"> & {
   idempotencyKey?: string | null;
   allowDuplicate?: boolean;
   onDeduplicated?: (reason: "idempotency_key" | "recent_open_title") => void;
+  beforeSideEffects?: (tx: DbTransaction) => Promise<void> | void;
 };
 type IssueChildCreateInput = IssueCreateInput & {
   acceptanceCriteria?: string[];
@@ -5108,6 +5112,83 @@ export function issueService(db: Db) {
     return workspace;
   }
 
+  async function assertValidIssueProject(
+    companyId: string,
+    projectId: string | null | undefined,
+    dbOrTx: any = db,
+  ) {
+    if (!projectId) return;
+    const project = await dbOrTx
+      .select({ id: projects.id, companyId: projects.companyId })
+      .from(projects)
+      .where(eq(projects.id, projectId))
+      .then((rows: Array<{ id: string; companyId: string }>) => rows[0] ?? null);
+    if (!project) throw notFound("Project not found");
+    if (project.companyId !== companyId) throw unprocessable("Project must belong to the issue's company");
+  }
+
+  async function assertValidIssueMilestone(
+    companyId: string,
+    projectId: string | null | undefined,
+    milestoneId: string | null | undefined,
+    dbOrTx: any = db,
+  ) {
+    if (!milestoneId) return;
+    const milestone = await dbOrTx
+      .select({ id: milestones.id, companyId: milestones.companyId, projectId: milestones.projectId })
+      .from(milestones)
+      .where(eq(milestones.id, milestoneId))
+      .then((rows: Array<{ id: string; companyId: string; projectId: string | null }>) => rows[0] ?? null);
+    if (!milestone) throw notFound("Milestone not found");
+    if (milestone.companyId !== companyId) throw unprocessable("Milestone must belong to the issue's company");
+    if (milestone.projectId && milestone.projectId !== projectId) {
+      throw unprocessable("Milestone must belong to the selected project");
+    }
+  }
+
+  async function lockIssueParentMutationCompany(companyId: string, dbOrTx: any = db) {
+    await dbOrTx.execute(
+      sql`select pg_advisory_xact_lock(hashtextextended(${`paperclip:issue-parent:${companyId}`}, 0))`,
+    );
+  }
+
+  async function assertValidIssueParent(
+    companyId: string,
+    issueId: string,
+    parentId: string | null | undefined,
+    dbOrTx: any = db,
+  ) {
+    if (!parentId) return;
+    if (parentId === issueId) throw unprocessable("Parent issue would create a cycle");
+    await dbOrTx.execute(
+      sql`SELECT ${issues.id} FROM ${issues}
+          WHERE ${and(eq(issues.companyId, companyId), inArray(issues.id, [issueId, parentId]))}
+          ORDER BY ${issues.id}
+          FOR UPDATE`,
+    );
+
+    let cursorId: string | null = parentId;
+    for (let depth = 0; cursorId; depth += 1) {
+      if (depth >= ISSUE_PARENT_ANCESTRY_VALIDATION_MAX_DEPTH) {
+        throw unprocessable("Parent issue ancestry is too deep");
+      }
+      await dbOrTx.execute(
+        sql`SELECT ${issues.id} FROM ${issues}
+            WHERE ${and(eq(issues.companyId, companyId), eq(issues.id, cursorId))}
+            FOR UPDATE`,
+      );
+      const cursor: { id: string; companyId: string; parentId: string | null } | null = await dbOrTx
+        .select({ id: issues.id, companyId: issues.companyId, parentId: issues.parentId })
+        .from(issues)
+        .where(eq(issues.id, cursorId))
+        .then((rows: Array<{ id: string; companyId: string; parentId: string | null }>) => rows[0] ?? null);
+      if (!cursor) throw notFound("Parent issue not found");
+      if (cursor.companyId !== companyId) throw unprocessable("Parent issue must belong to the issue's company");
+      if (cursor.id === issueId) throw unprocessable("Parent issue would create a cycle");
+      cursorId = cursor.parentId;
+    }
+  }
+
   async function assertValidLabelIds(companyId: string, labelIds: string[], dbOrTx: any = db) {
     if (labelIds.length === 0) return;
     const existing = await dbOrTx
@@ -5302,6 +5383,21 @@ export function issueService(db: Db) {
     }
   }
 
+  async function lockBlockedByIssueRowsForUpdate(
+    issueId: string,
+    companyId: string,
+    blockedByIssueIds: string[],
+    dbOrTx: any = db,
+  ) {
+    const lockedIssueIds = [issueId, ...new Set(blockedByIssueIds)].sort();
+    await dbOrTx.execute(
+      sql`SELECT ${issues.id} FROM ${issues}
+          WHERE ${and(eq(issues.companyId, companyId), inArray(issues.id, lockedIssueIds))}
+          ORDER BY ${issues.id}
+          FOR UPDATE`,
+    );
+  }
+
   async function syncBlockedByIssueIds(
     issueId: string,
     companyId: string,
@@ -5315,13 +5411,7 @@ export function issueService(db: Db) {
     }
 
     if (deduped.length > 0) {
-      const lockedIssueIds = [issueId, ...deduped].sort();
-      await dbOrTx.execute(
-        sql`SELECT ${issues.id} FROM ${issues}
-            WHERE ${and(eq(issues.companyId, companyId), inArray(issues.id, lockedIssueIds))}
-            ORDER BY ${issues.id}
-            FOR UPDATE`,
-      );
+      await lockBlockedByIssueRowsForUpdate(issueId, companyId, deduped, dbOrTx);
       const relatedIssues = await dbOrTx
         .select({ id: issues.id })
         .from(issues)
@@ -7551,16 +7641,20 @@ export function issueService(db: Db) {
       });
 
       if (blockParentUntilDone) {
-        const existingBlockers = await db
-          .select({ blockerIssueId: issueRelations.issueId })
-          .from(issueRelations)
-          .where(and(eq(issueRelations.companyId, parent.companyId), eq(issueRelations.relatedIssueId, parent.id), eq(issueRelations.type, "blocks")));
-        await syncBlockedByIssueIds(
-          parent.id,
-          parent.companyId,
-          [...new Set([...existingBlockers.map((row) => row.blockerIssueId), child.id])],
-          { agentId: actorAgentId ?? null, userId: actorUserId ?? null },
-        );
+        await db.transaction(async (tx) => {
+          await lockIssueParentMutationCompany(parent.companyId, tx);
+          const existingBlockers = await tx
+            .select({ blockerIssueId: issueRelations.issueId })
+            .from(issueRelations)
+            .where(and(eq(issueRelations.companyId, parent.companyId), eq(issueRelations.relatedIssueId, parent.id), eq(issueRelations.type, "blocks")));
+          await syncBlockedByIssueIds(
+            parent.id,
+            parent.companyId,
+            [...new Set([...existingBlockers.map((row) => row.blockerIssueId), child.id])],
+            { agentId: actorAgentId ?? null, userId: actorUserId ?? null },
+            tx,
+          );
+        });
         [child] = await withIssueRelationSummaries(parent.companyId, [child], db);
       }
 
@@ -7860,6 +7954,7 @@ export function issueService(db: Db) {
         idempotencyKey: rawIdempotencyKey,
         allowDuplicate,
         onDeduplicated,
+        beforeSideEffects,
         ...issueData
       } = data;
       const isolatedWorkspacesEnabled = (await instanceSettings.getExperimental()).enableIsolatedWorkspaces;
@@ -7957,6 +8052,13 @@ export function issueService(db: Db) {
           const [enriched] = await withIssueLabels(tx, [existingIssue]);
           const [withRelations] = await withIssueRelationSummaries(companyId, [enriched], tx);
           return withRelations;
+        }
+
+        // Create can mutate the same issue graph as update via parentId and
+        // blockedByIssueIds. Keep the company-scoped graph lock outermost
+        // before create-time blocker sync starts taking row locks.
+        if (issueData.parentId !== undefined || blockedByIssueIds !== undefined) {
+          await lockIssueParentMutationCompany(companyId, tx);
         }
 
         const defaultCompanyGoal = await getDefaultCompanyGoal(tx, companyId);
@@ -8183,6 +8285,7 @@ export function issueService(db: Db) {
             executionWorkspaceSettings: issueData.executionWorkspaceSettings,
           });
         }
+        await beforeSideEffects?.(tx);
         // Identifier minting is delegated to allocateIdentifier(), which
         // dispatches on companies.identifier_provider. The paperclip-internal
         // path runs inside this same tx (atomic counter + insert); the
@@ -8466,7 +8569,7 @@ export function issueService(db: Db) {
       const doneGateInput = {
         fromStatus: existing.status,
         toStatus: issueData.status,
-        existingExecutionRunId: existing.executionRunId,
+        existingCheckoutRunId: existing.checkoutRunId,
         lastEvidenceVerdict: doneGateEvidenceVerdict,
         isAgentActor: actorAgentId != null,
         hasDurableArtifactEvidence: false,
@@ -8497,7 +8600,7 @@ export function issueService(db: Db) {
         doneGateNeedsDurableArtifactCheck = shouldBlockNarratedDone({
           fromStatus: existing.status,
           toStatus: issueData.status,
-          existingExecutionRunId: existing.executionRunId,
+          existingCheckoutRunId: existing.checkoutRunId,
           lastEvidenceVerdict: doneGateEvidenceVerdict,
           isAgentActor: actorAgentId != null,
           hasDurableArtifactEvidence: false,
@@ -8546,56 +8649,13 @@ export function issueService(db: Db) {
       if (issueData.assigneeUserId) {
         await assertAssignableUser(existing.companyId, issueData.assigneeUserId);
       }
-      let nextProjectId = issueData.projectId !== undefined ? issueData.projectId : existing.projectId;
-      const nextProjectWorkspaceId =
-        issueData.projectWorkspaceId !== undefined ? issueData.projectWorkspaceId : existing.projectWorkspaceId;
-      const nextExecutionWorkspaceId =
-        issueData.executionWorkspaceId !== undefined ? issueData.executionWorkspaceId : existing.executionWorkspaceId;
-      const nextExecutionWorkspacePreference =
-        issueData.executionWorkspacePreference !== undefined
-          ? issueData.executionWorkspacePreference
-          : existing.executionWorkspacePreference;
-      const nextExecutionWorkspaceSettings =
-        issueData.executionWorkspaceSettings !== undefined
-          ? parseIssueExecutionWorkspaceSettings(issueData.executionWorkspaceSettings)
-          : parseIssueExecutionWorkspaceSettings(existing.executionWorkspaceSettings);
       if (issueData.executionWorkspaceSettings !== undefined) {
+        const nextExecutionWorkspaceSettings = parseIssueExecutionWorkspaceSettings(
+          issueData.executionWorkspaceSettings,
+        );
         patch.executionWorkspaceSettings = nextExecutionWorkspaceSettings
           ? { ...nextExecutionWorkspaceSettings }
           : null;
-      }
-      let validatedProjectWorkspace: { projectId: string } | null = null;
-      let validatedExecutionWorkspace: { projectId: string } | null = null;
-      if (!nextProjectId && nextProjectWorkspaceId) {
-        const workspace = await assertValidProjectWorkspace(existing.companyId, null, nextProjectWorkspaceId);
-        validatedProjectWorkspace = workspace;
-        nextProjectId = workspace.projectId;
-        patch.projectId = workspace.projectId;
-      }
-      if (!nextProjectId && nextExecutionWorkspaceId) {
-        const workspace = await assertValidExecutionWorkspace(existing.companyId, null, nextExecutionWorkspaceId);
-        validatedExecutionWorkspace = workspace;
-        nextProjectId = workspace.projectId;
-        patch.projectId = workspace.projectId;
-      }
-      if (nextProjectWorkspaceId) {
-        if (!validatedProjectWorkspace) {
-          await assertValidProjectWorkspace(existing.companyId, nextProjectId, nextProjectWorkspaceId);
-        }
-      }
-      if (nextExecutionWorkspaceId) {
-        if (!validatedExecutionWorkspace) {
-          await assertValidExecutionWorkspace(existing.companyId, nextProjectId, nextExecutionWorkspaceId);
-        }
-      }
-      if (isolatedWorkspacesEnabled && issueData.executionWorkspaceSettings !== undefined) {
-        assertExplicitPinnedWorktreeIssueRunnable({
-          projectId: nextProjectId ?? null,
-          projectWorkspaceId: nextProjectWorkspaceId ?? null,
-          executionWorkspaceId: nextExecutionWorkspaceId ?? null,
-          executionWorkspacePreference: nextExecutionWorkspacePreference ?? null,
-          executionWorkspaceSettings: issueData.executionWorkspaceSettings,
-        });
       }
 
       applyStatusSideEffects(issueData.status, patch);
@@ -8697,21 +8757,125 @@ export function issueService(db: Db) {
       }
 
       const runUpdate = async (tx: any) => {
-        const defaultCompanyGoal = await getDefaultCompanyGoal(tx, existing.companyId);
+        // Parent and blocker edges share issue rows. Take one company-scoped graph
+        // lock before either path starts row-level locks, so combined parent/blocker
+        // patches cannot invert against blocker-only patches.
+        if (issueData.parentId !== undefined || blockedByIssueIds !== undefined) {
+          await lockIssueParentMutationCompany(existing.companyId, tx);
+        }
+        if (blockedByIssueIds !== undefined) {
+          await lockBlockedByIssueRowsForUpdate(id, existing.companyId, blockedByIssueIds, tx);
+        }
+        if (issueData.parentId !== undefined) {
+          await assertValidIssueParent(existing.companyId, id, issueData.parentId, tx);
+        }
+        await tx.execute(
+          sql`SELECT ${issues.id} FROM ${issues}
+              WHERE ${eq(issues.id, id)}
+              FOR UPDATE`,
+        );
+        const lockedExisting = await tx
+          .select()
+          .from(issues)
+          .where(eq(issues.id, id))
+          .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
+        if (!lockedExisting) return null;
+
+        let nextProjectId = issueData.projectId !== undefined
+          ? issueData.projectId
+          : lockedExisting.projectId;
+        const nextProjectWorkspaceId =
+          issueData.projectWorkspaceId !== undefined
+            ? issueData.projectWorkspaceId
+            : lockedExisting.projectWorkspaceId;
+        const nextExecutionWorkspaceId =
+          issueData.executionWorkspaceId !== undefined
+            ? issueData.executionWorkspaceId
+            : lockedExisting.executionWorkspaceId;
+        const nextExecutionWorkspacePreference =
+          issueData.executionWorkspacePreference !== undefined
+            ? issueData.executionWorkspacePreference
+            : lockedExisting.executionWorkspacePreference;
+        const nextExecutionWorkspaceSettings =
+          issueData.executionWorkspaceSettings !== undefined
+            ? parseIssueExecutionWorkspaceSettings(issueData.executionWorkspaceSettings)
+            : parseIssueExecutionWorkspaceSettings(lockedExisting.executionWorkspaceSettings);
+        let validatedProjectWorkspace: { projectId: string } | null = null;
+        let validatedExecutionWorkspace: { projectId: string } | null = null;
+        if (!nextProjectId && nextProjectWorkspaceId) {
+          const workspace = await assertValidProjectWorkspace(
+            lockedExisting.companyId,
+            null,
+            nextProjectWorkspaceId,
+            tx,
+          );
+          validatedProjectWorkspace = workspace;
+          nextProjectId = workspace.projectId;
+          patch.projectId = workspace.projectId;
+        }
+        if (!nextProjectId && nextExecutionWorkspaceId) {
+          const workspace = await assertValidExecutionWorkspace(
+            lockedExisting.companyId,
+            null,
+            nextExecutionWorkspaceId,
+            tx,
+          );
+          validatedExecutionWorkspace = workspace;
+          nextProjectId = workspace.projectId;
+          patch.projectId = workspace.projectId;
+        }
+        if (nextProjectWorkspaceId) {
+          if (!validatedProjectWorkspace) {
+            await assertValidProjectWorkspace(lockedExisting.companyId, nextProjectId, nextProjectWorkspaceId, tx);
+          }
+        }
+        if (nextExecutionWorkspaceId) {
+          if (!validatedExecutionWorkspace) {
+            await assertValidExecutionWorkspace(lockedExisting.companyId, nextProjectId, nextExecutionWorkspaceId, tx);
+          }
+        }
+        if (isolatedWorkspacesEnabled && issueData.executionWorkspaceSettings !== undefined) {
+          assertExplicitPinnedWorktreeIssueRunnable({
+            projectId: nextProjectId ?? null,
+            projectWorkspaceId: nextProjectWorkspaceId ?? null,
+            executionWorkspaceId: nextExecutionWorkspaceId ?? null,
+            executionWorkspacePreference: nextExecutionWorkspacePreference ?? null,
+            executionWorkspaceSettings: issueData.executionWorkspaceSettings,
+          });
+        }
+        if (issueData.projectId !== undefined || patch.projectId !== undefined) {
+          await assertValidIssueProject(lockedExisting.companyId, nextProjectId, tx);
+        }
+        if (
+          issueData.milestoneId !== undefined ||
+          issueData.projectId !== undefined ||
+          patch.projectId !== undefined
+        ) {
+          await assertValidIssueMilestone(
+            lockedExisting.companyId,
+            nextProjectId,
+            issueData.milestoneId !== undefined ? issueData.milestoneId : lockedExisting.milestoneId,
+            tx,
+          );
+        }
+
+        const defaultCompanyGoal = await getDefaultCompanyGoal(tx, lockedExisting.companyId);
+        const projectIdForGoalFallback =
+          issueData.projectId !== undefined || patch.projectId !== undefined ? nextProjectId : undefined;
         const [currentProjectGoalId, nextProjectGoalId] = await Promise.all([
-          getProjectDefaultGoalId(tx, existing.companyId, existing.projectId),
+          getProjectDefaultGoalId(tx, lockedExisting.companyId, lockedExisting.projectId),
           getProjectDefaultGoalId(
             tx,
-            existing.companyId,
-            issueData.projectId !== undefined ? issueData.projectId : existing.projectId,
+            lockedExisting.companyId,
+            projectIdForGoalFallback !== undefined ? projectIdForGoalFallback : lockedExisting.projectId,
           ),
         ]);
 
         patch.goalId = resolveNextIssueGoalId({
-          currentProjectId: existing.projectId,
-          currentGoalId: existing.goalId,
+          currentProjectId: lockedExisting.projectId,
+          currentGoalId: lockedExisting.goalId,
           currentProjectGoalId,
-          projectId: issueData.projectId,
+          projectId: projectIdForGoalFallback,
           goalId: issueData.goalId,
           projectGoalId: nextProjectGoalId,
           defaultGoalId: defaultCompanyGoal?.id ?? null,
@@ -8738,7 +8902,7 @@ export function issueService(db: Db) {
             shouldBlockNarratedDone({
               fromStatus: existing.status,
               toStatus: issueData.status,
-              existingExecutionRunId: existing.executionRunId,
+              existingCheckoutRunId: existing.checkoutRunId,
               lastEvidenceVerdict: doneGateEvidenceVerdict,
               isAgentActor: actorAgentId != null,
               hasDurableArtifactEvidence: doneGateHasDurableArtifact,
@@ -8788,17 +8952,17 @@ export function issueService(db: Db) {
         }
         if (
           (updated.status === "done" || updated.status === "cancelled") &&
-          existing.status !== updated.status
+          lockedExisting.status !== updated.status
         ) {
           await finalizeSummarySlotsForTerminalIssue(tx, updated);
         }
         if (nextLabelIds !== undefined) {
-          await syncIssueLabels(updated.id, existing.companyId, nextLabelIds, tx);
+          await syncIssueLabels(updated.id, lockedExisting.companyId, nextLabelIds, tx);
         }
         if (blockedByIssueIds !== undefined) {
           await syncBlockedByIssueIds(
             updated.id,
-            existing.companyId,
+            lockedExisting.companyId,
             blockedByIssueIds,
             {
               agentId: actorAgentId ?? null,
@@ -8821,7 +8985,7 @@ export function issueService(db: Db) {
             .where(
               and(
                 eq(executionWorkspaces.id, nextExecutionWorkspaceId),
-                eq(executionWorkspaces.companyId, existing.companyId),
+                eq(executionWorkspaces.companyId, lockedExisting.companyId),
               ),
             )
             .then((rows: Array<{ id: string; metadata: unknown }>) => rows[0] ?? null);
@@ -8841,17 +9005,17 @@ export function issueService(db: Db) {
         const [enriched] = await withIssueLabels(tx, [updated]);
         if (
           (issueData.status === "done" || issueData.status === "cancelled") &&
-          existing.status !== issueData.status &&
-          existing.originKind === RECOVERY_ORIGIN_KINDS.issueGraphLivenessEscalation
+          lockedExisting.status !== issueData.status &&
+          lockedExisting.originKind === RECOVERY_ORIGIN_KINDS.issueGraphLivenessEscalation
         ) {
-          const parsedIncident = parseIssueGraphLivenessIncidentKey(existing.originId);
-          if (parsedIncident?.issueId && parsedIncident.companyId === existing.companyId) {
+          const parsedIncident = parseIssueGraphLivenessIncidentKey(lockedExisting.originId);
+          if (parsedIncident?.issueId && parsedIncident.companyId === lockedExisting.companyId) {
             await tx
               .delete(issueRelations)
               .where(
                 and(
-                  eq(issueRelations.companyId, existing.companyId),
-                  eq(issueRelations.issueId, existing.id),
+                  eq(issueRelations.companyId, lockedExisting.companyId),
+                  eq(issueRelations.issueId, lockedExisting.id),
                   eq(issueRelations.relatedIssueId, parsedIncident.issueId),
                   eq(issueRelations.type, "blocks"),
                 ),
@@ -9025,6 +9189,11 @@ export function issueService(db: Db) {
           assigneeUserId: null,
           checkoutRunId,
           executionRunId: checkoutRunId,
+          // BLO-19848: stamp the lock timestamp alongside the pointer. Without
+          // it sweepStaleIssueLocks' isPreClaimLockExpired bails on
+          // `if (!runId || !lockedAt) return false`, so a checkout-acquired lock
+          // whose run later parks at queued/scheduled_retry is never reclaimable.
+          executionLockedAt: now,
           status: "in_progress",
           startedAt: now,
           updatedAt: now,
@@ -9091,12 +9260,16 @@ export function issueService(db: Db) {
         (current.executionRunId == null || current.executionRunId === checkoutRunId) &&
         checkoutRunId
       ) {
+        const adoptedAt = new Date();
         const adopted = await db
           .update(issues)
           .set({
             checkoutRunId,
             executionRunId: checkoutRunId,
-            updatedAt: new Date(),
+            // BLO-19848: see the checkout site above — a lock pointer without a
+            // lock timestamp is unreclaimable by the stale-lock sweeper.
+            executionLockedAt: adoptedAt,
+            updatedAt: adoptedAt,
           })
           .where(
             and(
@@ -9205,6 +9378,8 @@ export function issueService(db: Db) {
               assigneeUserId: null,
               checkoutRunId,
               executionRunId: checkoutRunId,
+              // BLO-19848: see the checkout site above.
+              executionLockedAt: now,
               status: "in_progress",
               startedAt: now,
               updatedAt: now,

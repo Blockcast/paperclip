@@ -19,14 +19,14 @@ import {
  * "column does not exist". Migrations could then never advance.
  *
  * The previous test could not see any of that: it started from a database that
- * was already post-0210 (the column present, only the index dropped), which is
+ * was already post-0211 (the column present, only the index dropped), which is
  * a state the loop never reaches. Every case here therefore DROPS
  * `crash_recovery_completed_at` first, so the migration is exercised from a
- * genuinely pre-0210 shape.
+ * genuinely pre-0211 shape.
  */
-const PHASE_A = "0210_heartbeat_runs_crash_recovery_columns.sql";
-const PHASE_B = "0211_heartbeat_runs_crash_recovery_index.sql";
-const PHASE_C = "0212_heartbeat_runs_crash_recovery_validate.sql";
+const PHASE_A = "0211_heartbeat_runs_crash_recovery_columns.sql";
+const PHASE_B = "0212_heartbeat_runs_crash_recovery_index.sql";
+const PHASE_C = "0213_heartbeat_runs_crash_recovery_validate.sql";
 const INDEX_NAME = "heartbeat_runs_crash_recovery_pending_idx";
 const CRASH_COLUMNS = [
   "crash_recovery_completed_at",
@@ -45,10 +45,10 @@ async function migrationHash(file: string) {
 }
 
 /**
- * Rewind the database to the pre-0210 shape: drop the columns and index the
+ * Rewind the database to the pre-0211 shape: drop the columns and index the
  * three phases install, and forget that they ever ran.
  */
-async function rewindToPre0210(sql: postgres.Sql) {
+async function rewindToPre0211(sql: postgres.Sql) {
   await sql.unsafe(`
     DROP INDEX IF EXISTS ${INDEX_NAME};
     ${CRASH_COLUMNS.map((column) => `ALTER TABLE heartbeat_runs DROP COLUMN IF EXISTS ${column};`).join("\n")}
@@ -98,13 +98,13 @@ describeEmbeddedPostgres("heartbeat-run crash-recovery migration phases", () => 
     return { database, sql };
   }
 
-  it("applies cleanly to a populated pre-0210 database without requiring the index first", async () => {
+  it("applies cleanly to a populated pre-0211 database without requiring the index first", async () => {
     // The regression test for the unbreakable loop. Populated table, no column,
     // no index — exactly the production shape the old single-file migration
     // could never get past.
     const { database, sql } = await freshDatabase("paperclip-crash-recovery-populated-");
     await seedOneRun(sql);
-    await rewindToPre0210(sql);
+    await rewindToPre0211(sql);
 
     expect(await presentColumns(sql)).toEqual([]);
 
@@ -125,7 +125,7 @@ describeEmbeddedPostgres("heartbeat-run crash-recovery migration phases", () => 
     // predicate's column exists, so CREATE INDEX CONCURRENTLY now succeeds.
     const { database, sql } = await freshDatabase("paperclip-crash-recovery-online-");
     await seedOneRun(sql);
-    await rewindToPre0210(sql);
+    await rewindToPre0211(sql);
     await applyPendingMigrations(database.connectionString);
 
     await sql.unsafe(`
@@ -148,7 +148,7 @@ describeEmbeddedPostgres("heartbeat-run crash-recovery migration phases", () => 
     // Bootstrap and test databases get it for free; the build is instantaneous
     // and takes no meaningful lock on an empty table.
     const { database, sql } = await freshDatabase("paperclip-crash-recovery-empty-");
-    await rewindToPre0210(sql);
+    await rewindToPre0211(sql);
 
     await applyPendingMigrations(database.connectionString);
 
@@ -161,7 +161,7 @@ describeEmbeddedPostgres("heartbeat-run crash-recovery migration phases", () => 
     // nothing from this migration batch, so the operator can always act on it.
     const { database, sql } = await freshDatabase("paperclip-crash-recovery-wrong-index-");
     await seedOneRun(sql);
-    await rewindToPre0210(sql);
+    await rewindToPre0211(sql);
     // The column has to exist for a wrong-but-parseable index to be built at
     // all, so add it the way Phase A would; the migration is still pending.
     await sql.unsafe(`
@@ -172,7 +172,7 @@ describeEmbeddedPostgres("heartbeat-run crash-recovery migration phases", () => 
     `);
 
     await expect(applyPendingMigrations(database.connectionString)).rejects.toMatchObject({
-      message: `migration 0211 found an invalid or incorrectly defined ${INDEX_NAME}`,
+      message: `migration 0212 found an invalid or incorrectly defined ${INDEX_NAME}`,
       hint: expect.stringContaining(`DROP INDEX CONCURRENTLY IF EXISTS ${INDEX_NAME}`),
     });
     expect(await inspectMigrations(database.connectionString)).toMatchObject({
@@ -183,7 +183,7 @@ describeEmbeddedPostgres("heartbeat-run crash-recovery migration phases", () => 
   it("rejects an index left invalid by a failed concurrent build", async () => {
     const { database, sql } = await freshDatabase("paperclip-crash-recovery-invalid-index-");
     await seedOneRun(sql);
-    await rewindToPre0210(sql);
+    await rewindToPre0211(sql);
     await sql.unsafe(`
       ALTER TABLE heartbeat_runs ADD COLUMN crash_recovery_completed_at timestamp with time zone;
       CREATE INDEX ${INDEX_NAME}
@@ -193,12 +193,12 @@ describeEmbeddedPostgres("heartbeat-run crash-recovery migration phases", () => 
     `);
 
     await expect(applyPendingMigrations(database.connectionString)).rejects.toMatchObject({
-      message: `migration 0211 found an invalid or incorrectly defined ${INDEX_NAME}`,
+      message: `migration 0212 found an invalid or incorrectly defined ${INDEX_NAME}`,
     });
   }, 120_000);
 
-  it("keeps phase A durable when 0211 raises on a genuinely pre-0210 database, so the repair hint is followable", async () => {
-    // Review round 3 argued that 0211's malformed-index RAISE rolls phase A
+  it("keeps phase A durable when 0212 raises on a genuinely pre-0211 database, so the repair hint is followable", async () => {
+    // Review round 3 argued that 0212's malformed-index RAISE rolls phase A
     // back, leaving the hinted `CREATE INDEX CONCURRENTLY` referencing a column
     // that no longer exists — an unfollowable instruction. That is true of
     // drizzle's own migrator, which wraps every pending file in ONE
@@ -213,12 +213,12 @@ describeEmbeddedPostgres("heartbeat-run crash-recovery migration phases", () => 
     // it: if the runner is ever switched to the batch migrator, phase A stops
     // surviving and this fails, which is the signal to reorder the hint.
     //
-    // Setup is genuinely pre-0210 — no crash_recovery_* columns at all. The
+    // Setup is genuinely pre-0211 — no crash_recovery_* columns at all. The
     // malformed index therefore cannot reference one, so it is a same-name
     // index over a predicate that is buildable without them.
-    const { database, sql } = await freshDatabase("paperclip-crash-recovery-pre0210-malformed-");
+    const { database, sql } = await freshDatabase("paperclip-crash-recovery-pre0211-malformed-");
     await seedOneRun(sql);
-    await rewindToPre0210(sql);
+    await rewindToPre0211(sql);
     expect(await presentColumns(sql)).toEqual([]);
     await sql.unsafe(`
       CREATE INDEX ${INDEX_NAME}
@@ -233,11 +233,11 @@ describeEmbeddedPostgres("heartbeat-run crash-recovery migration phases", () => 
       () => null,
       (error: unknown) => error as { message?: string; hint?: string },
     );
-    expect(failure, "expected 0211 to reject on the malformed index").not.toBeNull();
-    expect(failure?.message).toBe(`migration 0211 found an invalid or incorrectly defined ${INDEX_NAME}`);
+    expect(failure, "expected 0212 to reject on the malformed index").not.toBeNull();
+    expect(failure?.message).toBe(`migration 0212 found an invalid or incorrectly defined ${INDEX_NAME}`);
 
     // The load-bearing fact: phase A committed in its own transaction and the
-    // 0211 raise did not take it with it.
+    // 0212 raise did not take it with it.
     expect(await presentColumns(sql)).toEqual([...CRASH_COLUMNS].sort());
     expect(failure?.hint).toContain(`DROP INDEX CONCURRENTLY IF EXISTS ${INDEX_NAME}`);
 
@@ -264,14 +264,14 @@ describeEmbeddedPostgres("heartbeat-run crash-recovery migration phases", () => 
     // recovery silently never runs. Validating the type alone let this through.
     const { database, sql } = await freshDatabase("paperclip-crash-recovery-default-column-");
     await seedOneRun(sql);
-    await rewindToPre0210(sql);
+    await rewindToPre0211(sql);
     await sql.unsafe(`
       ALTER TABLE heartbeat_runs
       ADD COLUMN crash_recovery_completed_at timestamp with time zone DEFAULT now();
     `);
 
     await expect(applyPendingMigrations(database.connectionString)).rejects.toMatchObject({
-      message: expect.stringContaining("migration 0212"),
+      message: expect.stringContaining("migration 0213"),
       hint: expect.stringContaining("carry no default"),
     });
     expect(await inspectMigrations(database.connectionString)).toMatchObject({
@@ -287,7 +287,7 @@ describeEmbeddedPostgres("heartbeat-run crash-recovery migration phases", () => 
     // NOT NULL column rejects at runtime. Left empty here so the column is
     // addable without also needing a default, isolating nullability.
     const { database, sql } = await freshDatabase("paperclip-crash-recovery-notnull-column-");
-    await rewindToPre0210(sql);
+    await rewindToPre0211(sql);
     await sql.unsafe(`
       ALTER TABLE heartbeat_runs ADD COLUMN crash_recovery_attempts integer NOT NULL;
     `);
