@@ -12,7 +12,7 @@
 // a document containing its own value. The release job instead renders the
 // chart TWICE: once unstamped to obtain the hash, then again through a trusted
 // post-renderer that adds the marker. The post-renderer works for historical
-// target charts that predate api.approvalPlanSha256.
+// target charts that predate api.approvalPlanSha256 or api.deployedCommit.
 //
 // That scheme is sound if and only if stamping changes NOTHING ELSE in the
 // rendered output. If it did, the hash taken from render #1 would not match the
@@ -67,7 +67,7 @@ function renderApiDeployment(extraArgs = []) {
   );
 }
 
-function stampApiDeployment(deployment, marker = SAMPLE) {
+function stampApiDeployment(deployment, marker = SAMPLE, deployedCommit = "") {
   const yaml = execFileSync(
     "bash",
     ["scripts/stamp-paperclip-api-approval-plan.sh"],
@@ -75,7 +75,11 @@ function stampApiDeployment(deployment, marker = SAMPLE) {
       cwd: repoRoot,
       encoding: "utf8",
       input: JSON.stringify(deployment),
-      env: { ...process.env, PAPERCLIP_APPROVAL_PLAN_SHA256: marker },
+      env: {
+        ...process.env,
+        PAPERCLIP_APPROVAL_PLAN_SHA256: marker,
+        PAPERCLIP_DEPLOYED_COMMIT: deployedCommit,
+      },
     },
   );
   return JSON.parse(
@@ -120,6 +124,14 @@ function stripTemplateAnnotation(deployment, key) {
     delete stripped.spec.template.metadata;
   }
   return stripped;
+}
+
+function withTemplateAnnotation(deployment, key, value) {
+  const annotated = structuredClone(deployment);
+  annotated.spec.template.metadata ??= {};
+  annotated.spec.template.metadata.annotations ??= {};
+  annotated.spec.template.metadata.annotations[key] = value;
+  return annotated;
 }
 
 test("no marker is stamped by default (non-Blockcast deploys skip the approval channel)", () => {
@@ -217,6 +229,25 @@ test("trusted post-renderer stamps an unstamped legacy chart without other chang
   assert.deepEqual(stripMarker(stamped), unstamped);
 });
 
+test("trusted post-renderer stamps deployed commit for a legacy chart before marker verification", () => {
+  const legacyUnstamped = renderApiDeployment();
+  const approvedUnstamped = withTemplateAnnotation(
+    legacyUnstamped,
+    DEPLOYED_COMMIT,
+    SAMPLE_COMMIT,
+  );
+  const marker = markerFor(approvedUnstamped);
+  const stamped = stampApiDeployment(legacyUnstamped, marker, SAMPLE_COMMIT);
+
+  assert.equal(stamped.spec.template.metadata.annotations[MARKER], marker);
+  assert.equal(stamped.spec.template.metadata.annotations[DEPLOYED_COMMIT], SAMPLE_COMMIT);
+  assert.deepEqual(stripMarker(stamped), approvedUnstamped);
+  assert.deepEqual(
+    stripTemplateAnnotation(stripMarker(stamped), DEPLOYED_COMMIT),
+    legacyUnstamped,
+  );
+});
+
 test("trusted post-renderer rejects a Helm render that differs from the approved plan", () => {
   const approved = renderApiDeployment();
   const changed = structuredClone(approved);
@@ -233,6 +264,14 @@ test("trusted post-renderer rejects a conflicting marker", () => {
   assert.throws(
     () => stampApiDeployment(chartStamped, "b".repeat(64)),
     /already carries a different approval-plan marker/,
+  );
+});
+
+test("trusted post-renderer rejects a conflicting deployed commit", () => {
+  const chartStamped = renderApiDeployment([`--set-string`, `api.deployedCommit=${SAMPLE_COMMIT}`]);
+  assert.throws(
+    () => stampApiDeployment(chartStamped, markerFor(chartStamped), "f".repeat(40)),
+    /already carries a different deployed-commit annotation/,
   );
 });
 

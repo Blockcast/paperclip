@@ -138,8 +138,13 @@ test("Docker deploy approves the exact stamped plan before Helm mutates producti
   assert.ok(approve < upgrade, "admission approval must complete before Helm upgrade");
   assert.match(deployJob, /ref: \$\{\{ github\.workflow_sha \}\}/);
   assert.match(deployJob, /--show-only templates\/deployment-api\.yaml/);
+  assert.match(deployJob, /deployed_commit_key="paperclip\.blockcast\.net\/deployed-commit"/);
+  assert.match(deployJob, /\.spec\.template\.metadata\.annotations\[\$key\] as \$existing/);
+  assert.match(deployJob, /\.spec\.template\.metadata\.annotations =/);
+  assert.match(deployJob, /PAPERCLIP_DEPLOYED_COMMIT="\$\{COMMIT\}"/);
   assert.match(deployJob, /PAPERCLIP_APPROVAL_PLAN_SHA256="\$\{marker\}" "\$\{STAMP_SCRIPT\}"/);
   assert.match(deployJob, /DEPLOY_PLAN: \$\{\{ steps\.plan\.outputs\.path \}\}/);
+  assert.match(deployJob, /COMMIT: \$\{\{ steps\.target\.outputs\.full \}\}/);
   assert.match(
     deployJob,
     /"\$\{APPROVE_SCRIPT\}" "\$\{DIGEST\}" "\$\{DEPLOY_PLAN\}"/,
@@ -153,8 +158,12 @@ test("Docker deploy approves the exact stamped plan before Helm mutates producti
     /PAPERCLIP_DEPLOY_NAMESPACE="\$\{NS\}"/,
   );
   assert.match(deployJob, /PAPERCLIP_APPROVED_SERVER_PLAN_OUT="\$\{approved_server_plan\}"/);
-  assert.match(deployJob, /PAPERCLIP_DEPLOY_NAMESPACE="\$\{NS\}"[\s\\]+PAPERCLIP_APPROVAL_PLAN_SHA256/);
+  assert.match(
+    deployJob,
+    /PAPERCLIP_DEPLOY_NAMESPACE="\$\{NS\}"[\s\\]+PAPERCLIP_DEPLOYED_COMMIT="\$\{COMMIT\}"[\s\\]+PAPERCLIP_APPROVAL_PLAN_SHA256/,
+  );
   assert.match(deployJob, /PAPERCLIP_DEPLOY_NAMESPACE: \$\{\{ vars\.PAPERCLIP_NAMESPACE \|\| 'paperclip' \}\}/);
+  assert.match(deployJob, /PAPERCLIP_DEPLOYED_COMMIT: \$\{\{ steps\.target\.outputs\.full \}\}/);
   assert.match(deployJob, /--post-renderer "\$\{STAMP_SCRIPT\}"/);
   assert.equal(
     deployJob.match(/reconcile_approved_api_plan/g)?.length,
@@ -181,6 +190,7 @@ test("Docker deploy approves the exact stamped plan before Helm mutates producti
   assert.match(deployJob, /BEGIN CANONICAL_DEPLOYMENT_JQ/);
   assert.match(deployJob, /live_server_plan_sha256.*approved_server_plan_sha256/s);
   assert.match(deployJob, /\.spec\.template\.metadata\.annotations\["paperclip\.blockcast\.net\/approval-plan-sha256"\] == \$marker/);
+  assert.match(deployJob, /\.spec\.template\.metadata\.annotations\["paperclip\.blockcast\.net\/deployed-commit"\] == \$commit/);
 });
 
 test("Docker deploy accepts an approved create plan without resourceVersion", () => {
