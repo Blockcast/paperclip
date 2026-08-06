@@ -189,7 +189,7 @@ describe("paperclip MCP tools", () => {
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(JSON.parse(String(init.body))).toEqual({
       agentId: "22222222-2222-2222-2222-222222222222",
-      expectedStatuses: ["todo", "backlog", "blocked"],
+      expectedStatuses: ["todo", "backlog", "blocked", "in_review"],
     });
   });
 

@@ -726,6 +726,40 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     });
   });
 
+  it("checks out a todo issue and stamps startedAt through the checkout CASE expression", async () => {
+    const companyId = await seedAssignableAgentCompany();
+    const agentId = randomUUID();
+    const checkoutRunId = randomUUID();
+    await db.insert(agents).values(agentRow(companyId, {
+      id: agentId,
+      name: "CheckoutCaseCoder",
+    }));
+    await db.insert(heartbeatRuns).values({
+      id: checkoutRunId,
+      companyId,
+      agentId,
+      status: "running",
+      invocationSource: "manual",
+    });
+    const issue = await svc.create(companyId, {
+      title: "Checkout raw SQL startedAt regression",
+      description: null,
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId: null,
+    });
+
+    const checkedOut = await svc.checkout(issue.id, agentId, ["todo"], checkoutRunId);
+
+    expect(checkedOut).toMatchObject({
+      status: "in_progress",
+      assigneeAgentId: agentId,
+      checkoutRunId,
+      executionRunId: checkoutRunId,
+    });
+    expect(checkedOut.startedAt).toBeInstanceOf(Date);
+  });
+
   it("lets an active source-scoped recovery owner checkout the source issue", async () => {
     const companyId = await seedAssignableAgentCompany();
     const assigneeAgentId = randomUUID();
@@ -8177,7 +8211,7 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
     expect(duplicateIssue?.executionRunId).toBeNull();
   });
 
-  it("returns a typed 422 (not generic 409) for assignee-owned in_review checkout with no active owner", async () => {
+  it("preserves the expectedStatuses guard for assignee-owned in_review checkout", async () => {
     const companyId = randomUUID();
     const assigneeAgentId = randomUUID();
     await db.insert(companies).values({
@@ -8198,9 +8232,11 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
       permissions: {},
     });
 
-    // Reproduction matrix (BLO-8454): status=in_review, assignee matches caller,
-    // checkoutRunId=null, executionRunId=null.
+    // Callers that do not include in_review in expectedStatuses still do not
+    // claim review work accidentally. Agent-facing checkout includes in_review
+    // explicitly; the route test pins that positive path.
     const issueId = randomUUID();
+    const checkoutRunId = randomUUID();
     await db.insert(issues).values({
       id: issueId,
       companyId,
@@ -8213,13 +8249,14 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
     });
 
     await expect(
-      svc.checkout(issueId, assigneeAgentId, ["todo", "backlog", "blocked"], randomUUID()),
+      svc.checkout(issueId, assigneeAgentId, ["todo", "backlog", "blocked"], checkoutRunId),
     ).rejects.toMatchObject({
-      status: 422,
-      details: { code: "issue_in_review_not_checkoutable", issueId },
+      status: 409,
+      message: "Issue checkout conflict",
+      details: { issueId },
     });
 
-    // The rejected checkout must not mutate the issue out of review (no state-machine side effect).
+    // The rejected checkout must not mutate the issue out of review.
     const after = await db
       .select({
         status: issues.status,
@@ -8476,6 +8513,175 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
       assigneeAgentId: agentId,
       checkoutRunId: null,
     });
+  });
+
+  it("checkout adoption of a stale executionRunId preserves startedAt on in_progress issues", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const failedRunId = randomUUID();
+    const successorRunId = randomUUID();
+    const originalStartedAt = new Date("2026-06-10T09:30:00.000Z");
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values([
+      {
+        id: failedRunId,
+        companyId,
+        agentId,
+        status: "failed",
+        invocationSource: "manual",
+        finishedAt: new Date("2026-06-10T10:05:00.000Z"),
+      },
+      {
+        id: successorRunId,
+        companyId,
+        agentId,
+        status: "running",
+        invocationSource: "manual",
+        startedAt: new Date("2026-06-10T10:07:00.000Z"),
+      },
+    ]);
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Stale execution lock on in-progress issue",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      startedAt: originalStartedAt,
+      executionRunId: failedRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date("2026-06-10T10:00:00.000Z"),
+    });
+
+    await expect(svc.checkout(issueId, agentId, ["in_progress"], successorRunId))
+      .resolves.toMatchObject({
+        status: "in_progress",
+        checkoutRunId: successorRunId,
+        executionRunId: successorRunId,
+      });
+
+    const row = await db
+      .select({ startedAt: issues.startedAt })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(row?.startedAt?.toISOString()).toBe(originalStartedAt.toISOString());
+  });
+
+  it("does not let runless stale-lock retry steal a concurrent reassignment", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const reassignedAgentId = randomUUID();
+    const issueId = randomUUID();
+    const failedRunId = randomUUID();
+    const triggerName = `test_reassign_on_clear_${randomUUID().replace(/-/g, "_")}`;
+    const functionName = `${triggerName}_fn`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values([
+      {
+        id: agentId,
+        companyId,
+        name: "CodexCoder",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: reassignedAgentId,
+        companyId,
+        name: "Reviewer",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+    await db.insert(heartbeatRuns).values({
+      id: failedRunId,
+      companyId,
+      agentId,
+      status: "failed",
+      invocationSource: "manual",
+      finishedAt: new Date("2026-06-10T10:05:00.000Z"),
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Stale execution lock reassigned during clear",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      executionRunId: failedRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date("2026-06-10T10:00:00.000Z"),
+    });
+
+    await db.execute(sql.raw(`
+      CREATE FUNCTION ${functionName}() RETURNS trigger AS $$
+      BEGIN
+        IF OLD.id = '${issueId}'::uuid
+          AND OLD.execution_run_id = '${failedRunId}'::uuid
+          AND NEW.execution_run_id IS NULL
+        THEN
+          NEW.assignee_agent_id := '${reassignedAgentId}'::uuid;
+        END IF;
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql;
+      CREATE TRIGGER ${triggerName}
+      BEFORE UPDATE ON issues
+      FOR EACH ROW EXECUTE FUNCTION ${functionName}();
+    `));
+
+    try {
+      await expect(svc.checkout(issueId, agentId, ["in_progress"], null))
+        .rejects.toMatchObject({ status: 409 });
+
+      const row = await db
+        .select({
+          assigneeAgentId: issues.assigneeAgentId,
+          executionRunId: issues.executionRunId,
+        })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0] ?? null);
+      expect(row).toMatchObject({
+        assigneeAgentId: reassignedAgentId,
+        executionRunId: null,
+      });
+    } finally {
+      await db.execute(sql.raw(`DROP TRIGGER IF EXISTS ${triggerName} ON issues;`));
+      await db.execute(sql.raw(`DROP FUNCTION IF EXISTS ${functionName}();`));
+    }
   });
 
   it("checkout adoption of a stale checkoutRunId preserves the issue's assigneeUserId", async () => {

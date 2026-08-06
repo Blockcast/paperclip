@@ -4084,6 +4084,7 @@ export function issueRoutes(
     createdByAgentId?: string | null;
     checkoutRunId?: string | null;
     executionRunId?: string | null;
+    executionState?: unknown;
   };
 
   type IssueCommentAuthorizationResult =
@@ -4115,7 +4116,57 @@ export function issueRoutes(
         reason: "deny_missing_run_id";
         boundary: "run";
         remediation: string;
+      }
+    | {
+        allowed: false;
+        kind: "run_ownership_conflict";
+        status: 409;
+        error: "Issue run ownership conflict";
+        reason: "deny_active_checkout";
+        details: Record<string, unknown>;
       };
+
+  function isLockedPendingInReviewExecutionStage(issue: {
+    status: string;
+    checkoutRunId?: string | null;
+    executionRunId?: string | null;
+    executionState?: unknown;
+  }) {
+    if (issue.status !== "in_review") return false;
+    if (!issue.checkoutRunId && !issue.executionRunId) return false;
+    if (!issue.executionState || typeof issue.executionState !== "object") return false;
+    return (issue.executionState as { status?: unknown }).status === "pending";
+  }
+
+  function actorOwnsAllIssueRunLocks(
+    req: Request,
+    issue: { checkoutRunId?: string | null; executionRunId?: string | null },
+  ) {
+    const runId = readAgentRunId(req);
+    if (!runId) return false;
+    return (
+      (!issue.checkoutRunId || issue.checkoutRunId === runId) &&
+      (!issue.executionRunId || issue.executionRunId === runId)
+    );
+  }
+
+  function issueRunOwnershipWritePreconditions(
+    req: Request,
+    issue: {
+      status: string;
+      checkoutRunId?: string | null;
+      executionRunId?: string | null;
+      executionState?: unknown;
+    },
+  ) {
+    if (req.actor.type !== "agent" || !isLockedPendingInReviewExecutionStage(issue)) return {};
+    return {
+      expectedCurrentStatus: issue.status,
+      expectedCurrentCheckoutRunId: issue.checkoutRunId ?? null,
+      expectedCurrentExecutionRunId: issue.executionRunId ?? null,
+      expectedCurrentExecutionState: issue.executionState,
+    };
+  }
 
   async function evaluateFreshTaskWatchdogSourceMutation(
     scope: Awaited<ReturnType<typeof resolveTaskWatchdogMutationScope>>,
@@ -4196,6 +4247,24 @@ export function issueRoutes(
       };
     }
 
+    if (isLockedPendingInReviewExecutionStage(issue)) {
+      if (!readAgentRunId(req)) return missingAgentRunIdCommentAuthorization();
+      if (!actorOwnsAllIssueRunLocks(req, issue)) {
+        return {
+          allowed: false,
+          kind: "run_ownership_conflict",
+          status: 409,
+          error: "Issue run ownership conflict",
+          reason: "deny_active_checkout",
+          details: {
+            issueId: issue.id,
+            checkoutRunId: issue.checkoutRunId ?? null,
+            executionRunId: issue.executionRunId ?? null,
+          },
+        };
+      }
+    }
+
     const watchdogDecision = await evaluateTaskWatchdogScopedIssueCommentAuthorization(req, issue);
     if (watchdogDecision) return watchdogDecision;
 
@@ -4270,6 +4339,14 @@ export function issueRoutes(
       return { canComment: true as const, reason: authorization.reason, remediation: null };
     }
     if (authorization.kind === "agent_auth_required") return null;
+    if (authorization.kind === "run_ownership_conflict") {
+      return {
+        canComment: false as const,
+        reason: authorization.reason,
+        boundary: "run",
+        remediation: "Another run owns this pending review stage. Exit without mutating the issue.",
+      };
+    }
     return {
       canComment: false as const,
       reason: authorization.reason,
@@ -4727,6 +4804,14 @@ export function issueRoutes(
         responseStatus: authorization.status,
       });
       res.status(authorization.status).json({ error: authorization.error });
+      return false;
+    }
+    if (authorization.kind === "run_ownership_conflict") {
+      await recordDeniedIssueWrite(req, issue, "issue:comment", {
+        reason: authorization.reason,
+        responseStatus: authorization.status,
+      });
+      res.status(authorization.status).json({ error: authorization.error, details: authorization.details });
       return false;
     }
     if (authorization.kind === "watchdog_denied") {
@@ -5227,6 +5312,24 @@ export function issueRoutes(
     const actorAgentId = req.actor.agentId;
     if (!actorAgentId) {
       res.status(403).json({ error: "Agent authentication required" });
+      return false;
+    }
+    if (isLockedPendingInReviewExecutionStage(issue) && !actorOwnsAllIssueRunLocks(req, issue)) {
+      const runId = requireAgentRunId(req, res);
+      if (!runId) return false;
+      await recordDeniedIssueWrite(req, issue, "issue:mutate", {
+        reason: "deny_active_checkout",
+        responseStatus: 409,
+      });
+      res.status(409).json({
+        error: "Issue run ownership conflict",
+        details: {
+          issueId: issue.id,
+          checkoutRunId: issue.checkoutRunId ?? null,
+          executionRunId: issue.executionRunId ?? null,
+          actorRunId: runId,
+        },
+      });
       return false;
     }
     if (options.allowScopedRecoveryOwnerSourceMutation) {
@@ -10183,6 +10286,7 @@ export function issueRoutes(
               ...updateFields,
               actorAgentId: actor.agentId ?? null,
               actorUserId: actor.actorType === "user" ? actor.actorId : null,
+              ...issueRunOwnershipWritePreconditions(req, existing),
               ...(delegateRecoveryPatchInFlight
                 ? {
                     expectedCurrentStatus: "blocked",
@@ -10218,6 +10322,7 @@ export function issueRoutes(
           ...updateFields,
           actorAgentId: actor.agentId ?? null,
           actorUserId: actor.actorType === "user" ? actor.actorId : null,
+          ...issueRunOwnershipWritePreconditions(req, existing),
           ...(delegateRecoveryPatchInFlight
             ? {
                 expectedCurrentStatus: "blocked",
@@ -11185,8 +11290,23 @@ export function issueRoutes(
       activeRecoveryActionForCheckout.sourceIssueId === issue.id &&
       (activeRecoveryActionForCheckout.status === "active" || activeRecoveryActionForCheckout.status === "escalated") &&
       activeRecoveryActionForCheckout.ownerAgentId === req.body.agentId;
+    const checkoutActorIsPendingExecutionParticipant =
+      req.actor.type === "agent" &&
+      req.actor.agentId === req.body.agentId &&
+      issue.status === "in_review" &&
+      (() => {
+        const executionState = parseIssueExecutionState(issue.executionState);
+        return executionState?.status === "pending" && actorMatchesExecutionParticipant(
+          { actorType: "agent", actorId: req.body.agentId },
+          executionState.currentParticipant,
+        );
+      })();
 
-    if (issue.assigneeAgentId !== req.body.agentId && !allowSourceScopedRecoveryOwnerCheckout) {
+    if (
+      issue.assigneeAgentId !== req.body.agentId &&
+      !allowSourceScopedRecoveryOwnerCheckout &&
+      !checkoutActorIsPendingExecutionParticipant
+    ) {
       try {
         await assertCanAssignTasks(req, issue.companyId, {
           issueId: issue.id,
@@ -11232,6 +11352,7 @@ export function issueRoutes(
     if (req.actor.type === "agent" && !checkoutRunId) return;
     const updated = await svc.checkout(id, req.body.agentId, req.body.expectedStatuses, checkoutRunId, {
       allowSourceScopedRecoveryOwner: allowSourceScopedRecoveryOwnerCheckout,
+      allowPendingExecutionParticipant: checkoutActorIsPendingExecutionParticipant,
       recoveryActionId: activeRecoveryActionForCheckout?.id ?? null,
       recoveryActionStatus: activeRecoveryActionForCheckout?.status ?? null,
     });
@@ -12607,6 +12728,7 @@ export function issueRoutes(
           status: typeof transition.patch.status === "string" ? transition.patch.status : "done",
           actorAgentId: actor.agentId ?? null,
           actorUserId: actor.actorType === "user" ? actor.actorId : null,
+          ...issueRunOwnershipWritePreconditions(req, currentIssue),
         };
 
         const sourceTrust = await sourceTrustForActorWrite(currentIssue, actor);
@@ -12622,6 +12744,12 @@ export function issueRoutes(
         };
         try {
           txResult = await db.transaction(async (tx) => {
+            // Lock and transition the issue before inserting the FK-backed
+            // comment. Concurrent approval inserts otherwise each hold KEY
+            // SHARE on the issue row and can deadlock while upgrading to the
+            // FOR UPDATE lock taken by svc.update.
+            const updated = await svc.update(id, updatePatch, tx);
+            if (!updated) throw new AutoApprovalIssueMissingError();
             const insertedComment = await svc.addComment(
               id,
               req.body.body,
@@ -12633,8 +12761,6 @@ export function issueRoutes(
               commentOptions,
               tx,
             );
-            const updated = await svc.update(id, updatePatch, tx);
-            if (!updated) throw new AutoApprovalIssueMissingError();
 
             if (transition.decision && decisionId) {
               await tx.insert(issueExecutionDecisions).values({
@@ -12690,17 +12816,30 @@ export function issueRoutes(
           requestedByActorId: actor.actorId,
         });
       } else {
-        comment = await svc.addComment(id, req.body.body, {
+        const commentActor = {
           agentId: actor.agentId ?? undefined,
           userId: actor.actorType === "user" ? actor.actorId : undefined,
           runId: actor.runId,
-        }, {
+        };
+        const plainCommentOptions = {
           authorType: req.body.authorType ?? (actor.actorType === "agent" ? "agent" : "user"),
           presentation: req.body.presentation ?? null,
           metadata: req.body.metadata ?? null,
           idempotencyKey: req.body.idempotencyKey ?? null,
           sourceTrust: await sourceTrustForActorWrite(currentIssue, actor),
-        });
+        };
+        if (req.actor.type === "agent" && isLockedPendingInReviewExecutionStage(currentIssue)) {
+          comment = await db.transaction(async (tx) => {
+            const guardedIssue = await svc.update(id, {
+              actorAgentId: actor.agentId ?? null,
+              ...issueRunOwnershipWritePreconditions(req, currentIssue),
+            }, tx);
+            if (!guardedIssue) throw notFound("Issue not found");
+            return svc.addComment(id, req.body.body, commentActor, plainCommentOptions, tx);
+          });
+        } else {
+          comment = await svc.addComment(id, req.body.body, commentActor, plainCommentOptions);
+        }
       }
     }
 
