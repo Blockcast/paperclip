@@ -71,8 +71,12 @@ kubectl logs -n <namespace> -l app=paperclip,paperclip-node-role=worker --since=
 
 The fix depends entirely on `last_error`:
 
-- **Expired/invalid credential** — rotate it via the plugin's config UI or
-  `PATCH /api/plugins/<id>/config`, then re-enable.
+- **Expired/invalid credential** — rotate it via the plugin's config UI, or
+  `GET /api/plugins/<id>/config` to fetch the current `configJson`, edit the
+  field, and `POST` the **complete** object back to
+  `/api/plugins/<id>/config` (this endpoint replaces the stored config
+  wholesale — it is not a partial patch, so omitting existing keys deletes
+  them), then re-enable.
 - **Broken manifest / bad deploy** — roll back the plugin package, or fix and
   reinstall.
 - **Unknown / needs investigation** — pull the worker pod logs for the full

@@ -319,6 +319,25 @@ spec:
             summary: "Paperclip plugin {{`{{ $labels.plugin_key }}`}} has been in status='error' for {{ .Values.prometheusRule.pluginErrorFor }}+"
             description: "Plugin {{`{{ $labels.plugin_key }}`}} (id {{`{{ $labels.plugin_id }}`}}) has sat at status='error' for at least {{ .Values.prometheusRule.pluginErrorFor }} (BLO-21092/BLO-20410 -- the detection gap that let 4 of 11 plugins, including the secrets subsystem, sit dead for 9+ hours with nothing alerting). status='error' is distinct from status='disabled': an operator-disabled plugin never sets this gauge and never pages. Check `select id, plugin_key, status, last_error, updated_at from plugins where plugin_key = '{{`{{ $labels.plugin_key }}`}}'` for the failure reason, then see the runbook."
             runbook_url: {{ .Values.prometheusRule.pluginErrorRunbookUrl | quote }}
+        - alert: PaperclipPluginStatusCollectorStale
+          # Review follow-up on BLO-21092: the two alerts above are silent by
+          # construction if the collector itself is dead -- a listInstalled()
+          # rejection on the FIRST tick means paperclip_plugin_error never gets
+          # a single series, and a rejection on any LATER tick just keeps
+          # re-serving the last-known snapshot forever, hiding both a new
+          # error and a recovery. This alert watches the collector's own
+          # heartbeat instead of the plugin data it produces. The gauge is
+          # zero-initialized at process start, so a collector that never
+          # succeeds even once pages within pluginStatusCollectorStaleFor
+          # rather than staying silent forever.
+          expr: (time() - paperclip_plugin_status_collector_last_success_timestamp_seconds) > {{ .Values.prometheusRule.pluginStatusCollectorStaleSeconds }}
+          for: {{ .Values.prometheusRule.pluginStatusCollectorStaleFor }}
+          labels:
+            severity: warning
+          annotations:
+            summary: "Paperclip plugin-status collector has not ticked successfully in over {{ .Values.prometheusRule.pluginStatusCollectorStaleSeconds }}s"
+            description: "paperclip_plugin_status_collector_last_success_timestamp_seconds has not advanced in over {{ .Values.prometheusRule.pluginStatusCollectorStaleSeconds }}s (BLO-21092 review follow-up). While this collector is stuck, PaperclipPluginCriticalErrored/PaperclipPluginErrored are silently unreliable: a plugin that just crashed will not be reflected, and a plugin that just recovered will keep paging. Check worker-tier logs for 'plugin-status-metrics: collector tick failed' to find the listInstalled() failure (most likely a DB connectivity issue on the worker pod), then see the runbook."
+            runbook_url: {{ .Values.prometheusRule.pluginErrorRunbookUrl | quote }}
     {{- with .Values.prometheusRule.additionalGroups }}
     {{- toYaml . | nindent 4 }}
     {{- end }}

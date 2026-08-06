@@ -16,7 +16,11 @@
 import type { Db } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
 import { pluginRegistryService } from "./plugin-registry.js";
-import { setPluginErrorStatus, type PluginErrorStatusEntry } from "./metrics.js";
+import {
+  setPluginErrorStatus,
+  setPluginStatusCollectorLastSuccessSeconds,
+  type PluginErrorStatusEntry,
+} from "./metrics.js";
 
 // Alert grace period is 10m (paperclip-runtime-alerts group); polling well
 // under that gives several scrapes of margin before the `for:` window could
@@ -46,6 +50,8 @@ export interface PluginStatusCollectorOptions {
   setInterval?: typeof setInterval;
   clearInterval?: typeof clearInterval;
   listInstalled?: () => Promise<ReadonlyArray<PluginStatusRow>>;
+  /** Injectable clock (unix ms), matching this codebase's `now?: () => number` convention. Default: `Date.now`. */
+  now?: () => number;
 }
 
 /**
@@ -61,6 +67,7 @@ export function startPluginStatusCollector(
   const scheduleInterval = options.setInterval ?? setInterval;
   const clearIntervalFn = options.clearInterval ?? clearInterval;
   const listInstalled = options.listInstalled ?? (() => pluginRegistryService(db).listInstalled());
+  const now = options.now ?? Date.now;
 
   let ticking = false;
   let stopped = false;
@@ -71,12 +78,18 @@ export function startPluginStatusCollector(
     try {
       const rows = await listInstalled();
       setPluginErrorStatus(pluginErrorEntriesFromRows(rows));
+      // Success timestamp only advances here — a rejected listInstalled()
+      // (first tick or any later one) leaves it where it was, so a
+      // `time() - this` alert grows monotonically while the collector is
+      // stuck instead of silently reporting the same snapshot forever.
+      setPluginStatusCollectorLastSuccessSeconds(Math.floor(now() / 1000));
     } catch (err) {
       logger.warn({ err }, "plugin-status-metrics: collector tick failed");
     } finally {
       ticking = false;
     }
   }
+
 
   void tick();
   const timer = scheduleInterval(() => {

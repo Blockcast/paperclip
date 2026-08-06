@@ -468,6 +468,10 @@ prometheusRule:
   pluginErrorCriticalKeyRegex: "lucitra\\.plugin-secrets"
   # -- Runbook for the plugin-error alert, linked from its annotation.
   pluginErrorRunbookUrl: "https://github.com/Blockcast/paperclip/blob/master/runbooks/plugin-error.md"
+  # -- Seconds since the plugin-status collector's last successful tick before it counts as stale (BLO-21092 review follow-up). 300s = 10x the collector's ~30s poll interval, well past what a single transient DB hiccup should cost; below this the collector is just between scrapes, not broken.
+  pluginStatusCollectorStaleSeconds: 300
+  # -- How long the staleness condition above must hold before paging. Combined with pluginStatusCollectorStaleSeconds this pages at roughly the same ~10m scale as pluginErrorFor, so a dead collector is not treated as more urgent than the plugin outages it exists to detect.
+  pluginStatusCollectorStaleFor: 5m
   # -- Additional PrometheusRule groups appended verbatim.
   additionalGroups: []
 

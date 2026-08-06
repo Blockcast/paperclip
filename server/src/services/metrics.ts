@@ -345,6 +345,20 @@ export const AGENT_WAKEUP_TERMINAL_FAILED_OLDEST_AGE_METRIC =
 export const PLUGIN_ERROR_METRIC = "paperclip_plugin_error";
 
 /**
+ * Unix timestamp (seconds) of the plugin-status collector's last successful
+ * tick (BLO-21092 review follow-up). Set ONLY on success, never on failure —
+ * a `listInstalled()` rejection (first tick or any later one) leaves this
+ * value where it was, so `time() - this` grows monotonically while the
+ * collector is stuck and {@link PLUGIN_ERROR_METRIC} silently keeps serving
+ * a stale (or, on a first-tick failure, entirely absent) snapshot. Alerting
+ * on staleness here catches exactly the case a plain `paperclip_plugin_error
+ * == 1` rule cannot: the collector itself is dead, so no plugin is reporting
+ * anything, healthy or not.
+ */
+export const PLUGIN_STATUS_COLLECTOR_LAST_SUCCESS_METRIC =
+  "paperclip_plugin_status_collector_last_success_timestamp_seconds";
+
+/**
  * Bounded `error_code` allow-list for
  * {@link AGENT_WAKEUP_TERMINAL_FAILED_UNRESOLVED_METRIC}.
  *
@@ -779,6 +793,7 @@ let githubReviewRequestDeadLetterUnresolved: Gauge<"reason"> | null = null;
 let agentWakeupTerminalFailedUnresolved: Gauge<"error_code" | "scope"> | null = null;
 let agentWakeupTerminalFailedOldestAge: Gauge<"scope"> | null = null;
 let pluginError: Gauge<"plugin_id" | "plugin_key"> | null = null;
+let pluginStatusCollectorLastSuccess: Gauge | null = null;
 let authRequest: Counter<"operation" | "outcome"> | null = null;
 
 function ensureRegistry(): {
@@ -801,6 +816,7 @@ function ensureRegistry(): {
   agentWakeupTerminalFailedUnresolvedGauge: Gauge<"error_code" | "scope">;
   agentWakeupTerminalFailedOldestAgeGauge: Gauge<"scope">;
   pluginErrorGauge: Gauge<"plugin_id" | "plugin_key">;
+  pluginStatusCollectorLastSuccessGauge: Gauge;
   authRequestCounter: Counter<"operation" | "outcome">;
 } {
   if (
@@ -823,6 +839,7 @@ function ensureRegistry(): {
     || !agentWakeupTerminalFailedUnresolved
     || !agentWakeupTerminalFailedOldestAge
     || !pluginError
+    || !pluginStatusCollectorLastSuccess
     || !authRequest
   ) {
     registry = new Registry();
@@ -1086,6 +1103,20 @@ function ensureRegistry(): {
       labelNames: ["plugin_id", "plugin_key"],
       registers: [registry],
     });
+    pluginStatusCollectorLastSuccess = new Gauge({
+      name: PLUGIN_STATUS_COLLECTOR_LAST_SUCCESS_METRIC,
+      help:
+        "Unix timestamp (seconds) of the plugin-status collector's last "
+        + "successful tick (BLO-21092). Set ONLY on success; a listInstalled() "
+        + "rejection -- first tick or any later one -- leaves this unchanged, so "
+        + PLUGIN_ERROR_METRIC + " can keep serving a stale or (on a first-tick "
+        + "failure) entirely absent snapshot while looking otherwise healthy. "
+        + "Initialized to 0 at registration so 'never succeeded' reads as "
+        + "maximally stale rather than as a missing series. Alert via "
+        + "(time() - this) exceeding several collector intervals.",
+      registers: [registry],
+    });
+    pluginStatusCollectorLastSuccess.set(0);
     authRequest = new Counter({
       name: AUTH_REQUEST_METRIC,
       help:
@@ -1123,6 +1154,7 @@ function ensureRegistry(): {
     agentWakeupTerminalFailedUnresolvedGauge: agentWakeupTerminalFailedUnresolved,
     agentWakeupTerminalFailedOldestAgeGauge: agentWakeupTerminalFailedOldestAge,
     pluginErrorGauge: pluginError,
+    pluginStatusCollectorLastSuccessGauge: pluginStatusCollectorLastSuccess,
     authRequestCounter: authRequest,
   };
 }
@@ -1530,6 +1562,15 @@ export function setPluginErrorStatus(entries: ReadonlyArray<PluginErrorStatusEnt
   }
 }
 
+/**
+ * Record a successful plugin-status collector tick (BLO-21092 review
+ * follow-up). Callers pass unix seconds, not milliseconds -- the collector
+ * owns the clock so this stays a pure setter and unit-tests deterministically.
+ */
+export function setPluginStatusCollectorLastSuccessSeconds(unixSeconds: number): void {
+  ensureRegistry().pluginStatusCollectorLastSuccessGauge.set(unixSeconds);
+}
+
 export function recordAuthRequest(input: {
   operation: string | null | undefined;
   outcome: string | null | undefined;
@@ -1587,6 +1628,7 @@ export function __resetMetricsForTest(): void {
   agentWakeupTerminalFailedUnresolved = null;
   agentWakeupTerminalFailedOldestAge = null;
   pluginError = null;
+  pluginStatusCollectorLastSuccess = null;
   authRequest = null;
   resetDepBlockedMetrics();
   resetBlockerResolvedWakeMetrics();

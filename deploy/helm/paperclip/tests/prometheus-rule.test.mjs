@@ -388,3 +388,45 @@ test("PaperclipPlugin{Critical,}Errored key on the boolean gauge, split severity
     "plugin-error alert must link the runbook",
   );
 });
+
+test("PaperclipPluginStatusCollectorStale watches the collector's own heartbeat, not the plugin data it produces (BLO-21092 review follow-up)", () => {
+  const rendered = execFileSync(
+    "helm",
+    [
+      "template",
+      "paperclip",
+      "deploy/helm/paperclip",
+      "--namespace",
+      "paperclip",
+      "-f",
+      "deploy/helm/paperclip/values.blockcast.yaml",
+      "--show-only",
+      "templates/prometheusrule.yaml",
+      "--set",
+      "prometheusRule.enabled=true",
+    ],
+    { cwd: repoRoot, encoding: "utf8" },
+  );
+
+  assert.match(rendered, /alert: PaperclipPluginStatusCollectorStale/);
+
+  const [, expr] = rendered.match(
+    /alert: PaperclipPluginStatusCollectorStale[\s\S]*?\n\s+expr: (.+)\n/,
+  ) ?? [];
+  assert.match(
+    expr,
+    /^\(time\(\) - paperclip_plugin_status_collector_last_success_timestamp_seconds\) > \d+$/,
+    "collector-stale alert must key on time() minus the last-success gauge, not on paperclip_plugin_error itself",
+  );
+
+  const [, forWindow] = rendered.match(
+    /alert: PaperclipPluginStatusCollectorStale[\s\S]*?\n\s+for: (.+)\n/,
+  ) ?? [];
+  assert.ok(forWindow, "collector-stale alert must render a for window");
+
+  assert.match(
+    rendered,
+    /alert: PaperclipPluginStatusCollectorStale[\s\S]*?runbook_url: "[^"]*runbooks\/plugin-error\.md"/,
+    "collector-stale alert must link the runbook",
+  );
+});

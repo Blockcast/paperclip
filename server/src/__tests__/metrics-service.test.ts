@@ -41,7 +41,9 @@ import {
   recordProcessLostLivenessNull,
   setExternalLifecycleRunningRuns,
   PLUGIN_ERROR_METRIC,
+  PLUGIN_STATUS_COLLECTOR_LAST_SUCCESS_METRIC,
   setPluginErrorStatus,
+  setPluginStatusCollectorLastSuccessSeconds,
 } from "../services/metrics.js";
 import {
   getDepBlockedMetric,
@@ -652,6 +654,25 @@ describe("setPluginErrorStatus (BLO-21092)", () => {
     expect(body).toContain(
       `${PLUGIN_ERROR_METRIC}{plugin_id="11111111-1111-1111-1111-111111111111",plugin_key="lucitra.plugin-secrets"} 0`,
     );
+  });
+});
+
+describe("setPluginStatusCollectorLastSuccessSeconds (BLO-21092 review follow-up)", () => {
+  it("is zero-initialized at registration, so a collector that never succeeds reads as maximally stale rather than absent", async () => {
+    const { body } = await renderMetrics();
+    expect(body).toContain(`# TYPE ${PLUGIN_STATUS_COLLECTOR_LAST_SUCCESS_METRIC} gauge`);
+    expect(body).toContain(`${PLUGIN_STATUS_COLLECTOR_LAST_SUCCESS_METRIC} 0`);
+  });
+
+  it("reports the exact unix-seconds value passed in, and only advances on an explicit call", async () => {
+    setPluginStatusCollectorLastSuccessSeconds(1_700_000_000);
+    let body = (await renderMetrics()).body;
+    expect(body).toContain(`${PLUGIN_STATUS_COLLECTOR_LAST_SUCCESS_METRIC} 1700000000`);
+
+    // A second success tick advances it; nothing else can move it backward or forward.
+    setPluginStatusCollectorLastSuccessSeconds(1_700_000_030);
+    body = (await renderMetrics()).body;
+    expect(body).toContain(`${PLUGIN_STATUS_COLLECTOR_LAST_SUCCESS_METRIC} 1700000030`);
   });
 });
 
