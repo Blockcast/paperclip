@@ -1,7 +1,8 @@
 # onprem-k8s: agent-authored PR review routing (BLO-21564)
 
-Counterpart technical work lives in `Blockcast/onprem-k8s` PR #2011:
-<https://github.com/Blockcast/onprem-k8s/pull/2011/files>
+The deployed counterpart technical work lives in `Blockcast/onprem-k8s` PR
+#2023: <https://github.com/Blockcast/onprem-k8s/pull/2023/files>. It superseded
+the closed, unmerged App-authored source PR #2011.
 
 ## TL;DR for the next agent
 
@@ -48,11 +49,12 @@ required reviewer is GitHub team `18686279`
 (`Blockcast/onprem-k8s-ally-reviewer`) with one required approval across
 `*` and `**/*`.
 
-PR #2011 added `* @Blockcast/onprem-k8s-ally-reviewer` as the first CODEOWNERS
-entry in the target repo. The live GitHub API later showed #2011 requesting
-that team plus the named security-path owners (`kkroo`, `eyad-hussein`, and
-`MohamedElmdary`). Do not preserve the earlier stale diagnosis that the team
-request was missing; that evidence was superseded.
+Merged PR #2023 added `* @Blockcast/onprem-k8s-ally-reviewer` as the first
+CODEOWNERS entry in the target repo and retained that team on every later
+security-path rule alongside the named owners (`kkroo`, `eyad-hussein`, and
+`MohamedElmdary`). It independently re-authored and superseded closed,
+unmerged App-authored PR #2011. Do not use #2011 as evidence of the deployed
+routing state.
 
 The remaining routing requirement is to collect two independent review
 artifacts on one immutable head. The Paperclip agent normally authors PRs as
