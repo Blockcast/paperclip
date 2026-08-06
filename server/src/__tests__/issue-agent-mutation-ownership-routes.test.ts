@@ -3535,6 +3535,49 @@ describe("agent issue mutation checkout ownership", () => {
     );
   });
 
+  it("pins post-adoption run ownership on ordinary PATCH writes", async () => {
+    const staleRunId = "99999999-9999-4999-8999-999999999999";
+    const stored = makeIssue({
+      assigneeAgentId: ownerAgentId,
+      checkoutRunId: staleRunId,
+      executionRunId: staleRunId,
+    });
+    mockIssueService.getById.mockResolvedValue(stored);
+    mockIssueService.assertCheckoutOwner.mockResolvedValueOnce({
+      adoptedFromRunId: staleRunId,
+      checkoutRunId: ownerRunId,
+      executionRunId: ownerRunId,
+    });
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...stored,
+      checkoutRunId: ownerRunId,
+      executionRunId: ownerRunId,
+      ...patch,
+    }));
+
+    const res = await request(await createApp(ownerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ title: "Post-adoption write" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.assertCheckoutOwner).toHaveBeenCalledWith(issueId, ownerAgentId, ownerRunId);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      issueId,
+      expect.objectContaining({
+        title: "Post-adoption write",
+        expectedCurrentCheckoutRunId: ownerRunId,
+        expectedCurrentExecutionRunId: ownerRunId,
+      }),
+    );
+    expect(mockIssueService.update).not.toHaveBeenCalledWith(
+      issueId,
+      expect.objectContaining({
+        expectedCurrentCheckoutRunId: staleRunId,
+        expectedCurrentExecutionRunId: staleRunId,
+      }),
+    );
+  });
+
   it("pins current-run ownership on execution-state PATCH writes", async () => {
     const stored = await makePendingReviewIssueForAgent(ownerAgentId, {
       assigneeAgentId: peerAgentId,
