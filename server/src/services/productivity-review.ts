@@ -722,6 +722,23 @@ function formatTrigger(trigger: ProductivityReviewTrigger) {
   return "Long active duration";
 }
 
+// BLO-22097: `usageJson: null` means usage was never *recorded*, not that
+// zero tokens were consumed — a post-model failure whose result event never
+// arrives leaves usage null even though the model produced output. Treating
+// null the same as an explicit `{inputTokens: 0, outputTokens: 0}` (which
+// `runUsageTokenCounts` does, since it exists to parse the blob once it
+// exists) misclassifies that run as never-executed. `logBytes` corroborates
+// the unknown case: every run log opens with ~15-20KB of session boilerplate
+// before any model turn, and explicit-zero-usage runs sampled across
+// BLO-19924/BLO-21091/BLO-21025 topped out at 111,337 bytes (still no model
+// turn — likely a slow upstream timeout inflating the pre-failure log). A
+// run that genuinely executed but lost its usage accounting (BLO-19924's
+// `claude_truncated` case) logged 844,801 bytes, two orders of magnitude
+// above that ceiling. The floor below is set with wide margin above the
+// observed boilerplate ceiling and well below the observed executed-run
+// floor — see BLO-22097 for the full sample tables.
+const NEVER_EXECUTED_UNKNOWN_USAGE_LOG_BYTES_CEILING = 200_000;
+
 // True when a run's most recent classification is `failed` liveness AND it
 // burned zero input+output tokens. That combination means the agent never
 // got a model turn — the runtime crashed, the process was killed, or every
@@ -731,8 +748,20 @@ function formatTrigger(trigger: ProductivityReviewTrigger) {
 // at all (`error: "unknown"`, `error_status: null`). Keying on token usage
 // rather than error code/status/dispatch-state is deliberate: it is the one
 // signature all four causes share (BLO-21769).
-function isNeverExecutedRun(run: Pick<HeartbeatRunRow, "livenessState" | "usageJson">): boolean {
+//
+// `usageJson: null` is unknown, not a measured zero (BLO-22097): it is only
+// read as never-executed when `logBytes` also stays at or under the
+// boilerplate-only ceiling. An *explicit* zero-usage blob is never
+// second-guessed by `logBytes` — a large log with confirmed zero tokens
+// (observed up to 111,337 bytes) is still never-executed, since the
+// corroboration only fills in for missing telemetry, not disputed telemetry.
+function isNeverExecutedRun(
+  run: Pick<HeartbeatRunRow, "livenessState" | "usageJson" | "logBytes">,
+): boolean {
   if (run.livenessState !== "failed") return false;
+  if (run.usageJson == null) {
+    return (run.logBytes ?? 0) <= NEVER_EXECUTED_UNKNOWN_USAGE_LOG_BYTES_CEILING;
+  }
   const { inputTokens, outputTokens } = runUsageTokenCounts(run.usageJson);
   return inputTokens === 0 && outputTokens === 0;
 }
