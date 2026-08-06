@@ -27,23 +27,44 @@ const verifyAgentFfmpeg = path.join(repoRoot, "scripts/verify-agent-ffmpeg.sh");
 function runFfmpegProbe(mode: "success" | "missing" | "failed" | "timeout") {
   const stubDir = mkdtempSync(path.join(tmpdir(), "paperclip-ffmpeg-probe-"));
   const dockerStub = path.join(stubDir, "docker");
-  const argsFile = path.join(stubDir, "docker-args");
+  const runArgsFile = path.join(stubDir, "docker-run-args");
+  const cleanupArgsFile = path.join(stubDir, "docker-cleanup-args");
   writeFileSync(
     dockerStub,
     `#!/bin/sh
-printf '%s\\n' "$@" > "$DOCKER_ARGS_FILE"
-case "$DOCKER_STUB_MODE" in
-  success)
-    printf ' E moq_mmt MMTP muxer\\n'
-    i=0
-    while [ "$i" -lt 5000 ]; do
-      printf ' D unrelated_%s unrelated muxer\\n' "$i"
-      i=$((i + 1))
+cmd=$1
+case "$cmd" in
+  run)
+    printf '%s\\n' "$@" > "$DOCKER_RUN_ARGS_FILE"
+    cidfile=""
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = "--cidfile" ]; then
+        shift
+        cidfile=$1
+      fi
+      shift || break
     done
+    if [ -n "$cidfile" ]; then
+      printf 'paperclip-ffmpeg-probe-test\\n' > "$cidfile"
+    fi
+    case "$DOCKER_STUB_MODE" in
+      success)
+        printf ' E moq_mmt MMTP muxer\\n'
+        i=0
+        while [ "$i" -lt 5000 ]; do
+          printf ' D unrelated_%s unrelated muxer\\n' "$i"
+          i=$((i + 1))
+        done
+        ;;
+      missing) printf ' E matroska Matroska muxer\\n' ;;
+      failed) exit 42 ;;
+      timeout) sleep 1 ;;
+    esac
     ;;
-  missing) printf ' E matroska Matroska muxer\\n' ;;
-  failed) exit 42 ;;
-  timeout) sleep 1 ;;
+  rm)
+    printf '%s\\n' "$@" > "$DOCKER_CLEANUP_ARGS_FILE"
+    ;;
+  *) exit 127 ;;
 esac
 `,
     { mode: 0o755 },
@@ -54,14 +75,17 @@ esac
       env: {
         ...process.env,
         PATH: `${stubDir}:${process.env.PATH}`,
-        DOCKER_ARGS_FILE: argsFile,
+        DOCKER_RUN_ARGS_FILE: runArgsFile,
+        DOCKER_CLEANUP_ARGS_FILE: cleanupArgsFile,
         DOCKER_STUB_MODE: mode,
-        FFMPEG_PROBE_TIMEOUT_SECONDS: mode === "timeout" ? "0.1" : "15",
+        FFMPEG_PROBE_OUTPUT_BYTES: "256",
+        FFMPEG_PROBE_TIMEOUT_SECONDS: mode === "timeout" ? "0.5" : "15",
       },
       encoding: "utf8",
     });
-    const args = readFileSync(argsFile, "utf8").trim().split("\n");
-    return { result, args };
+    const args = readFileSync(runArgsFile, "utf8").trim().split("\n");
+    const cleanupArgs = readFileSync(cleanupArgsFile, "utf8").trim().split("\n");
+    return { result, args, cleanupArgs };
   } finally {
     rmSync(stubDir, { recursive: true, force: true });
   }
@@ -264,6 +288,8 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
     expect(args).toEqual([
       "run",
       "--rm",
+      "--cidfile",
+      expect.stringContaining("paperclip-ffmpeg-probe-cid."),
       "--network",
       "none",
       "--read-only",
@@ -273,6 +299,12 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
       "no-new-privileges",
       "--pids-limit",
       "64",
+      "--cpus",
+      "1",
+      "--memory",
+      "256m",
+      "--memory-swap",
+      "256m",
       "--user",
       "65534:65534",
       "--entrypoint",
@@ -281,6 +313,14 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
       "-hide_banner",
       "-muxers",
     ]);
+  });
+
+  it("force-removes the probe container after a timeout", () => {
+    const { result, cleanupArgs } = runFfmpegProbe("timeout");
+
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain("timed out");
+    expect(cleanupArgs).toEqual(["rm", "-f", "paperclip-ffmpeg-probe-test"]);
   });
 
   it("returns the capability-missing status only for a completed negative probe", () => {
@@ -292,7 +332,6 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
 
   it.each([
     ["failed", "failed"],
-    ["timeout", "timed out"],
   ] as const)("fails closed when the FFmpeg probe %s", (mode, message) => {
     const { result } = runFfmpegProbe(mode);
 
