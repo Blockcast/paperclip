@@ -1185,27 +1185,50 @@ async function recordDependabotTerminalReceipt(
   // scoped to system comments) so the insert is a single atomic upsert:
   // ON CONFLICT DO NOTHING makes the external key authoritative in the
   // database rather than in application logic, independent of replica count.
-  await db
-    .insert(issueComments)
-    .values({
-      companyId: input.companyId,
-      issueId: issue.id,
-      authorType: "system",
-      idempotencyKey: externalKey,
-      body: receiptBody,
-      metadata: {
-        kind: "github_dependabot_terminal_receipt",
-        source: "github",
-        externalKey,
-        repoFullName: input.repoFullName,
-        alertNumber: input.alert.alertNumber,
-        action: input.alert.action,
-        deliveryId: input.deliveryId,
-        dismissalReason: input.alert.dismissalReason,
-        dismissalComment: input.alert.dismissalComment,
-      } as never,
-    })
-    .onConflictDoNothing();
+  //
+  // BLO-19037 review follow-up: the migration that introduced
+  // idempotency_key left historical receipt comments nullable. Those rows
+  // still carry metadata.externalKey, so preserve one metadata-key lookup
+  // before the atomic insert or the first replay after deploy creates a
+  // duplicate that the partial unique index cannot see.
+  const legacyReceipt = await db
+    .select({ id: issueComments.id })
+    .from(issueComments)
+    .where(and(
+      eq(issueComments.companyId, input.companyId),
+      eq(issueComments.issueId, issue.id),
+      eq(issueComments.authorType, "system"),
+      isNull(issueComments.idempotencyKey),
+      isNull(issueComments.deletedAt),
+      sql`${issueComments.metadata}->>'kind' = 'github_dependabot_terminal_receipt'`,
+      sql`${issueComments.metadata}->>'externalKey' = ${externalKey}`,
+    ))
+    .limit(1)
+    .then((rows) => rows[0] ?? null);
+
+  if (!legacyReceipt) {
+    await db
+      .insert(issueComments)
+      .values({
+        companyId: input.companyId,
+        issueId: issue.id,
+        authorType: "system",
+        idempotencyKey: externalKey,
+        body: receiptBody,
+        metadata: {
+          kind: "github_dependabot_terminal_receipt",
+          source: "github",
+          externalKey,
+          repoFullName: input.repoFullName,
+          alertNumber: input.alert.alertNumber,
+          action: input.alert.action,
+          deliveryId: input.deliveryId,
+          dismissalReason: input.alert.dismissalReason,
+          dismissalComment: input.alert.dismissalComment,
+        } as never,
+      })
+      .onConflictDoNothing();
+  }
 
   if (hasCompleteTerminalEvidence && issue.status !== "done") {
     await issueService(db).update(issue.id, { status: "done" });

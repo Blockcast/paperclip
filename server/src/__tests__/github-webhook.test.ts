@@ -19,7 +19,7 @@ import {
   issueRecoveryActions,
   issues,
 } from "@paperclipai/db";
-import { and, eq, inArray, sql } from "drizzle-orm";
+import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 import {
   __test_backLinkAbsoluteUrl,
   __test_buildDependabotAlertIssueBody,
@@ -4007,6 +4007,66 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(receipts[0]!.body).toContain("Action: `fixed`");
     expect(receipts[0]!.body).toContain("GitHub delivery: `delivery-fixed`");
     expect(receipts[0]!.body).toContain("no Dependabot REST or GraphQL query was used");
+  });
+
+  it("dedupes terminal delivery replays against legacy metadata-key receipts", async () => {
+    const { agentId } = await seedCompanyAndAgent({ agentName: "Release Engineer" });
+    const app = buildApp({ dependabotAgentId: agentId });
+
+    await postDependabot(app, dependabotPayload("critical", "created"), "delivery-created");
+
+    const [issue] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.originId, "github-dependabot:Blockcast/paperclip#58"));
+    expect(issue?.status).toBe("todo");
+
+    const externalKey = "github-dependabot:Blockcast/paperclip#58:fixed:delivery-fixed";
+    await db.insert(issueComments).values({
+      companyId: issue!.companyId,
+      issueId: issue!.id,
+      authorType: "system",
+      idempotencyKey: null,
+      body: "legacy terminal receipt",
+      metadata: {
+        kind: "github_dependabot_terminal_receipt",
+        source: "github",
+        externalKey,
+        repoFullName: "Blockcast/paperclip",
+        alertNumber: 58,
+        action: "fixed",
+        deliveryId: "delivery-fixed",
+      } as never,
+    });
+
+    const terminal = await postDependabot(app, dependabotPayload("critical", "fixed"), "delivery-fixed");
+    expect(terminal.status).toBe(200);
+
+    const [closedIssue] = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, issue!.id));
+    expect(closedIssue?.status).toBe("done");
+
+    const receipts = await db
+      .select({
+        body: issueComments.body,
+        idempotencyKey: issueComments.idempotencyKey,
+      })
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.issueId, issue!.id),
+          isNull(issueComments.deletedAt),
+          sql`${issueComments.metadata}->>'kind' = 'github_dependabot_terminal_receipt'`,
+        ),
+      );
+    expect(receipts).toEqual([
+      {
+        body: "legacy terminal receipt",
+        idempotencyKey: null,
+      },
+    ]);
   });
 
   // BLO-19037: the receipt dedup guard was a read-then-insert -- two
