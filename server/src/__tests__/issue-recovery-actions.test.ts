@@ -570,6 +570,69 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(comments.some(({ body }) => body.includes("non-retryable failure"))).toBe(true);
   });
 
+  it("does not escalate a stale review failure after the active stage advances", async () => {
+    const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
+    const staleStageId = randomUUID();
+    const activeStageId = randomUUID();
+    const executionState = (stageId: string, participantAgentId: string) => ({
+      status: "pending" as const,
+      currentStageId: stageId,
+      currentStageIndex: 0,
+      currentStageType: "review" as const,
+      currentParticipant: { type: "agent" as const, agentId: participantAgentId, userId: null },
+      returnAssignee: { type: "agent" as const, agentId: coderId, userId: null },
+      reviewRequest: null,
+      completedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+    });
+    await db.update(issues).set({
+      status: "in_review",
+      executionState: executionState(staleStageId, managerId),
+    }).where(eq(issues.id, sourceIssueId));
+    const staleIssue = await db.select().from(issues).where(eq(issues.id, sourceIssueId)).then((rows) => rows[0]!);
+    const staleRun = {
+      id: randomUUID(),
+      companyId,
+      agentId: managerId,
+      status: "failed",
+      errorCode: "job_missing",
+      error: "External lifecycle Job disappeared after adapter invocation",
+      contextSnapshot: { issueId: sourceIssueId, executionStage: { stageId: staleStageId } },
+      resultJson: null,
+      usageJson: null,
+      livenessState: null,
+      createdAt: new Date(),
+    } as const;
+
+    await db.update(issues).set({
+      executionState: executionState(activeStageId, coderId),
+    }).where(eq(issues.id, sourceIssueId));
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const updated = await recovery.escalateStrandedAssignedIssue({
+      issue: staleIssue,
+      previousStatus: "in_review",
+      latestRun: staleRun,
+      recoveryCause: "execution_review_participant_recovery",
+      recoveryOwnerAgentId: managerId,
+      expectedReviewStage: { stageId: staleStageId, participantAgentId: managerId },
+    });
+
+    expect(updated).toBeNull();
+    expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+    const [freshIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(freshIssue).toMatchObject({
+      status: "in_review",
+      executionState: {
+        currentStageId: activeStageId,
+        currentParticipant: { type: "agent", agentId: coderId },
+      },
+    });
+  });
+
   it("escalates stranded assigned work into a source action instead of a recovery issue", async () => {
     const { companyId, managerId, coderId, sourceIssue } = await seedCompany();
     // A DELIVERED wake returns the queued run. Null models one of `enqueueWakeup`'s

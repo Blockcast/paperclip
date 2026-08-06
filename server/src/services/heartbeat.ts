@@ -23975,6 +23975,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     );
   }
 
+  function buildNonRetryableExecutionReviewParticipantComment(input: {
+    latestRun: Pick<typeof heartbeatRuns.$inferSelect, "error" | "errorCode"> | null | undefined;
+  }) {
+    const failureSummary = summarizeRunFailureForIssueComment(input.latestRun);
+    return (
+      "Paperclip skipped automatic recovery for the pending execution-review participant because the run may have " +
+      `performed non-idempotent work before its external lifecycle failed.${failureSummary ?? ""} ` +
+      "Moving it to `blocked` with a source-scoped recovery action instead of risking a duplicate review or artifact."
+    );
+  }
+
   async function releaseIssueExecutionAndPromote(
     run: typeof heartbeatRuns.$inferSelect,
     options: { suppressImmediateRecovery?: boolean } = {},
@@ -24100,7 +24111,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         (run.errorCode === "job_missing" || run.errorCode === "k8s_pod_schedule_failed") &&
         issue.status === "in_review" &&
         !issue.assigneeUserId &&
-        Boolean(activeExecutionState?.currentStageId) &&
+        finalizedRunStageId !== null &&
         finalizedRunStageId === activeExecutionState?.currentStageId &&
         activeParticipant?.type === "agent" &&
         activeParticipant.agentId === run.agentId &&
@@ -24110,9 +24121,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           kind: "blocked" as const,
           issue,
           previousStatus: issue.status,
-          comment: buildExecutionReviewParticipantRecoveryComment({ latestRun: run }),
+          comment: buildNonRetryableExecutionReviewParticipantComment({ latestRun: run }),
           recoveryCause: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_CAUSE,
           recoveryOwnerAgentId: activeParticipant.agentId,
+          expectedReviewStage: {
+            stageId: finalizedRunStageId,
+            participantAgentId: run.agentId,
+          },
         };
       }
       if (issue.executionRunId && issue.executionRunId !== run.id) return null;
@@ -24437,7 +24452,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const issueNeedsReviewParticipantRecovery =
         issue.status === "in_review" &&
         !issue.assigneeUserId &&
-        Boolean(executionState?.currentStageId) &&
+        runStageId !== null &&
         runStageId === executionState?.currentStageId &&
         currentParticipant?.type === "agent" &&
         currentParticipant.agentId === run.agentId &&
@@ -24477,6 +24492,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             comment: buildExecutionReviewParticipantRecoveryComment({ latestRun: run }),
             recoveryCause: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_CAUSE,
             recoveryOwnerAgentId: currentParticipant.agentId,
+            expectedReviewStage: {
+              stageId: runStageId,
+              participantAgentId: run.agentId,
+            },
           };
         }
 
@@ -24709,6 +24728,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 ? EXECUTION_REVIEW_PARTICIPANT_RECOVERY_CAUSE
               : undefined,
         recoveryOwnerAgentId: promotionResult.recoveryOwnerAgentId,
+        expectedReviewStage:
+          "expectedReviewStage" in promotionResult ? promotionResult.expectedReviewStage : undefined,
       });
       return false;
     }

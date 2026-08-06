@@ -5124,6 +5124,7 @@ export function recoveryService(
     comment?: string;
     recoveryCause?: StrandedRecoveryCause;
     recoveryOwnerAgentId?: string | null;
+    expectedReviewStage?: { stageId: string; participantAgentId: string };
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
   }) {
     if (isRoutineExecutionDuplicateSuppressedRun(input.latestRun)) {
@@ -5172,6 +5173,20 @@ export function recoveryService(
       // function did NOT produce -- e.g. `in_review` from a park that raced it -- is a signal
       // that some other terminal action already claimed this issue for this cause.
       if (fresh.status !== input.previousStatus && fresh.status !== "blocked") return null;
+      if (input.expectedReviewStage) {
+        const executionState = parseIssueExecutionState(fresh.executionState);
+        const participant = executionState?.status === "pending"
+          ? executionState.currentParticipant
+          : null;
+        if (
+          fresh.status !== "in_review" ||
+          executionState?.currentStageId !== input.expectedReviewStage.stageId ||
+          participant?.type !== "agent" ||
+          participant.agentId !== input.expectedReviewStage.participantAgentId
+        ) {
+          return null;
+        }
+      }
 
       const recoveryCause = resolveStrandedRecoveryCause(input.latestRun, input.recoveryCause);
       const { action, hasNewActivitySinceLastAttempt } = await ensureSourceScopedStrandedRecoveryAction({
@@ -6061,7 +6076,7 @@ export function recoveryService(
       }
 
       if (issue.status === "in_review") {
-        if (!participantAgentId || !pendingExecutionState) {
+        if (!participantAgentId || !pendingExecutionState?.currentStageId) {
           result.skipped += 1;
           continue;
         }
@@ -6105,6 +6120,10 @@ export function recoveryService(
             latestRun: participantLatestRun,
             recoveryCause: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
             recoveryOwnerAgentId: participantAgentId,
+            expectedReviewStage: {
+              stageId: pendingExecutionState.currentStageId,
+              participantAgentId,
+            },
             comment:
               "Paperclip detected a non-retryable failure on the active review participant's run " +
               `(\`${participantContinuationClassification.errorCode}\`). Skipping automatic retries and moving it to ` +
