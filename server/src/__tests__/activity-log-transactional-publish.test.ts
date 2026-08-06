@@ -105,6 +105,70 @@ describeEmbeddedPostgres("logActivity publication vs. an enclosing transaction",
     // The activity row rolled back, so the event describing it must have too.
     expect(activityRows).toHaveLength(0);
     expect(outboxRows).toHaveLength(0);
+
+    // Characterizing the residual gap deliberately rather than leaving it
+    // unasserted: enlisting WITHOUT deferring binds the outbox row to the
+    // transaction but cannot un-send the in-memory live event, so a phantom
+    // `activity.logged` refresh hint does escape this rollback. The next test
+    // is the composition that closes it.
+    expect(live.seen).toEqual(["activity.logged"]);
+  });
+
+  it("enlisted + deferred publishes nothing at all when the transaction rolls back", async () => {
+    const entityId = randomUUID();
+    const live = captureLiveEvents();
+
+    await expect(
+      db.transaction(async (tx) => {
+        const publish = await logActivity(tx as unknown as Db, activityInput(entityId), {
+          enlistPluginOutbox: true,
+          deferPublish: true,
+        });
+        // Proves the enqueue already happened on the transaction handle: the
+        // deferred callback is never reached, yet the row below is still absent
+        // because it rolled back with the transaction rather than never existing.
+        void publish;
+        throw new Error("caller rolled back after logging activity");
+      }),
+    ).rejects.toThrow("caller rolled back after logging activity");
+
+    live.unsubscribe();
+    await new Promise((resolve) => setTimeout(resolve, 250));
+
+    expect(await db.select().from(activityLog)).toHaveLength(0);
+    expect(await db.select().from(pluginEventOutbox)).toHaveLength(0);
+    // The point of the composition: no phantom live event either.
+    expect(live.seen).toEqual([]);
+  });
+
+  it("enlisted + deferred enqueues inside the transaction but publishes live after commit", async () => {
+    const entityId = randomUUID();
+    const live = captureLiveEvents();
+
+    const publish = await db.transaction(async (tx) => {
+      const deferred = await logActivity(tx as unknown as Db, activityInput(entityId), {
+        enlistPluginOutbox: true,
+        deferPublish: true,
+      });
+      // Enqueued on the transaction handle, so it is already visible to this
+      // transaction before commit -- that is what makes it atomic.
+      expect(await tx.select().from(pluginEventOutbox)).toHaveLength(1);
+      return deferred;
+    });
+
+    // Committed, but publication was withheld: no live event has escaped yet.
+    expect(live.seen).toEqual([]);
+
+    await publish();
+    live.unsubscribe();
+
+    expect(live.seen).toEqual(["activity.logged"]);
+    const outboxRows = await db.select().from(pluginEventOutbox);
+    // Still exactly one: the deferred callback must not re-enqueue on the global
+    // handle for an event the transaction already carried.
+    expect(outboxRows).toHaveLength(1);
+    expect(outboxRows[0]?.eventType).toBe(PLUGIN_MAPPED_ACTION);
+    expect(await db.select().from(activityLog)).toHaveLength(1);
   });
 
   it("does not enqueue on a caller db when the plugin outbox is not configured", async () => {

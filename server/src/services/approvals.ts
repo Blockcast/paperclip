@@ -3,6 +3,7 @@ import type { Db } from "@paperclipai/db";
 import { agents, approvalComments, approvals } from "@paperclipai/db";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import { redactCurrentUserText } from "../log-redaction.js";
+import { logger } from "../middleware/logger.js";
 import { logActivity, type LogActivityInput } from "./activity-log.js";
 import { agentService } from "./agents.js";
 import { budgetService } from "./budgets.js";
@@ -377,7 +378,7 @@ export function approvalService(db: Db) {
         activity: Pick<LogActivityInput, "actorType" | "actorId" | "agentId">;
       },
     ) => {
-      return db.transaction(async (tx) => {
+      const { updated, publishWithdrawn } = await db.transaction(async (tx) => {
         const txDb = tx as unknown as Db;
         const existing = await getExistingApproval(id, txDb);
         if (existing.status !== "pending") {
@@ -419,7 +420,7 @@ export function approvalService(db: Db) {
           if (boundPendingAgent) await agentService(txDb).terminate(boundPendingAgent.id);
         }
 
-        await logActivity(txDb, {
+        const publishWithdrawn = await logActivity(txDb, {
           companyId: updated.companyId,
           ...actor.activity,
           action: "approval.withdrawn",
@@ -432,10 +433,31 @@ export function approvalService(db: Db) {
           // decided -- a durable phantom for an approval that is in fact still
           // pending. Bind the event to this transaction so it retracts too.
           atomicPluginEvent: true,
+        }, {
+          // ...and defer the in-memory live event past commit, which
+          // `atomicPluginEvent` alone does not cover: it binds the outbox row,
+          // but `publishLiveEvent` is not transactional and would announce a
+          // withdrawal that a failed commit then un-did.
+          deferPublish: true,
         });
 
-        return updated;
+        return { updated, publishWithdrawn };
       });
+
+      // Reached only on commit; a rollback throws straight past this.
+      try {
+        await publishWithdrawn();
+      } catch (err) {
+        // The withdrawal itself is committed and durable -- only its live
+        // refresh hint failed. The outbox row committed with the transaction,
+        // so plugins are still told.
+        logger.warn(
+          { err, approvalId: updated.id },
+          "withdrew approval but failed to publish its live activity event",
+        );
+      }
+
+      return updated;
     },
 
     listComments: async (approvalId: string) => {

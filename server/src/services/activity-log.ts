@@ -232,10 +232,17 @@ const NOOP_ACTIVITY_PUBLISH: ActivityPublish = async () => {};
  * activity that never happened. The returned function is a no-op unless
  * `deferPublish` was set, so existing callers can keep ignoring the result.
  *
- * A caller that logs inside a transaction and does NOT defer can pass
- * `{ enlistPluginOutbox: true }` so the enqueue runs on `db`, committing and
- * rolling back with the activity row it describes. Only the in-memory live
- * event escapes in that case, which `deferPublish` exists to close.
+ * A caller that logs inside a transaction can pass `{ enlistPluginOutbox: true }`
+ * so the enqueue runs on `db`, committing and rolling back with the activity row
+ * it describes.
+ *
+ * The two options are orthogonal and compose. `{ enlistPluginOutbox: true }`
+ * alone still lets the in-memory live event escape a later rollback; combine it
+ * with `{ deferPublish: true }` to bind the outbox row to the transaction *and*
+ * withhold the live event until after commit, which is what a transactional
+ * caller of a plugin-mapped action wants. Enlisting without deferring is a
+ * deliberate choice to accept a phantom `activity.logged` refresh hint, not a
+ * silently degraded mode.
  */
 export async function logActivity(
   db: Db,
@@ -299,20 +306,7 @@ export async function logActivity(
     };
   }
 
-  const emit = async (outboxDb: Db | null, enlistPluginOutbox: boolean): Promise<void> => {
-    const shouldEnlistPluginOutbox = outboxDb !== null &&
-      (enlistPluginOutbox || input.atomicPluginEvent === true);
-
-    if (pluginEvent && shouldEnlistPluginOutbox) {
-      // A live event cannot be rolled back. In the strict enlisted path, make
-      // the transactional outbox write succeed first so a failed insert does
-      // not publish a phantom activity for rows the caller rolls back.
-      await publishPluginDomainEvent(pluginEvent, {
-        db: outboxDb,
-        enlisted: true,
-      });
-    }
-
+  const publishLive = (): void => {
     publishLiveEvent({
       companyId: input.companyId,
       type: "activity.logged",
@@ -328,19 +322,39 @@ export async function logActivity(
         details: redactedDetails,
       },
     });
-
-    if (pluginEvent && !shouldEnlistPluginOutbox) {
-      await publishPluginDomainEvent(pluginEvent, {
-        db: null,
-        enlisted: false,
-      });
-    }
   };
 
-  if (options?.deferPublish) {
-    // Runs after the caller commits, so `db` is spent: enqueue on the global.
-    return () => emit(null, false);
+  // Best-effort enqueue on the boot-time global handle. Never rejects, and is
+  // the only correct handle once the caller has committed: `db` is spent by then.
+  const enqueueOnGlobal = async (): Promise<void> => {
+    if (!pluginEvent) return;
+    await publishPluginDomainEvent(pluginEvent, { db: null, enlisted: false });
+  };
+
+  const enlistPluginOutbox = options?.enlistPluginOutbox === true ||
+    input.atomicPluginEvent === true;
+
+  // The enlisted write is deliberately hoisted above BOTH publication paths.
+  // It has to run while `db` is still live, and a live event cannot be rolled
+  // back — so a failed insert must abort before anything is published, whether
+  // publication is inline or deferred.
+  if (pluginEvent && enlistPluginOutbox) {
+    await publishPluginDomainEvent(pluginEvent, { db, enlisted: true });
   }
-  await emit(db, options?.enlistPluginOutbox === true);
+
+  if (options?.deferPublish) {
+    // Enlistment and deferral are orthogonal and compose: the outbox row is
+    // already bound to the caller's transaction above, so all that remains to
+    // withhold until after commit is the in-memory live event. A non-enlisted
+    // plugin event still has to wait, because the global write commits
+    // independently and would outlive a rollback.
+    return async () => {
+      publishLive();
+      if (!enlistPluginOutbox) await enqueueOnGlobal();
+    };
+  }
+
+  publishLive();
+  if (!enlistPluginOutbox) await enqueueOnGlobal();
   return NOOP_ACTIVITY_PUBLISH;
 }
