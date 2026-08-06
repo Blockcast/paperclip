@@ -18178,10 +18178,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * to avoid. Keeping the id list as the only SQL predicate pins the pkey plan;
    * the status filter costs nothing in JS.
    *
-   * Returns the probe's own length and last key rather than the fetched rows',
-   * so callers advance the cursor past everything SCANNED and decide exhaustion
-   * from the scan. Deriving either from `runs` would treat a page thinned by
-   * phase 2 as the end of the queue and strand the remaining backlog.
+   * Returns the raw probe's own length and last key rather than the fetched
+   * rows', so callers advance the cursor past everything SCANNED and decide
+   * exhaustion from the scan. Deriving either from `runs` would treat a page
+   * thinned by phase 2 — including rows filtered by `excludeRunIds` after the
+   * probe — as the end of the queue and strand the remaining backlog.
    */
   async function readQueuedDispatchPage(input: {
     agentId: string;
@@ -18209,9 +18210,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       input.cursor
         ? sql`(${heartbeatRuns.createdAt}, ${heartbeatRuns.id}) > (${input.cursor.createdAt}::timestamptz, ${input.cursor.id}::uuid)`
         : undefined,
-      input.excludeRunIds?.size
-        ? notInArray(heartbeatRuns.id, [...input.excludeRunIds])
-        : undefined,
     );
 
     // `created_at::text` rather than the Date column: a JS Date truncates
@@ -18233,10 +18231,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (page.length === 0) return { probed: 0, cursor: null, runs: [] };
 
     const lastProbed = page[page.length - 1]!;
+    // Do not push `excludeRunIds` into phase 1. Emergency-admission refusals can
+    // accumulate many deferred rows near the head; a SQL `NOT IN (...)` would
+    // make PostgreSQL keep walking the ordered index until it finds enough
+    // non-deferred rows (or proves none remain), moving the start-lock work back
+    // toward queue depth. The raw probe is the bound. Filter after capturing its
+    // cursor so a page made entirely of deferred rows still makes progress.
+    const pageToHydrate = input.excludeRunIds?.size
+      ? page.filter((entry) => !input.excludeRunIds!.has(entry.id))
+      : page;
+    if (pageToHydrate.length === 0) {
+      return {
+        probed: page.length,
+        cursor: { createdAt: lastProbed.createdAt, id: lastProbed.id },
+        runs: [],
+      };
+    }
     const rows = await db
       .select()
       .from(heartbeatRuns)
-      .where(inArray(heartbeatRuns.id, page.map((entry) => entry.id)));
+      .where(inArray(heartbeatRuns.id, pageToHydrate.map((entry) => entry.id)));
 
     // Reorder in JS from the probe's ordering rather than adding an ORDER BY to
     // phase 2: the keys are already sorted, and sorting there would put a Sort
@@ -18248,7 +18262,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return {
       probed: page.length,
       cursor: { createdAt: lastProbed.createdAt, id: lastProbed.id },
-      runs: page
+      runs: pageToHydrate
         .map((entry) => runById.get(entry.id))
         .filter((run): run is typeof heartbeatRuns.$inferSelect => run !== undefined),
     };

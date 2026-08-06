@@ -326,6 +326,17 @@ const DISPATCH_HEAD_PROBE_CURSOR = `
    LIMIT ${SCAN_LIMIT}
 `;
 
+function dispatchHeadProbeQuery(cursor: { createdAt: string; id: string } | null = null) {
+  return `
+    SELECT created_at::text AS dispatch_created_at_cursor, id FROM heartbeat_runs
+     WHERE agent_id = '${AGENT}'::uuid
+       AND status = 'queued'
+       ${cursor ? `AND (created_at, id) > ('${cursor.createdAt}'::timestamptz, '${cursor.id}'::uuid)` : ""}
+     ORDER BY created_at ASC, id ASC
+     LIMIT ${SCAN_LIMIT}
+  `;
+}
+
 /**
  * A deep queue whose rows are physically INTERLEAVED with everyone else's.
  *
@@ -655,6 +666,44 @@ describeEmbeddedPostgres("BLO-20396 dispatch query plans", () => {
       expect(planNodes(probeCursor.root).map((n) => n["Node Type"])).not.toContain("Sort");
       expect(rowsInspected(probeCursor.root)).toBeLessThanOrEqual(HEAD_ABSOLUTE_BOUND);
 
+      // Deferred emergency-admission refusals are filtered *after* the raw
+      // cursor-bearing probe in production. If they were pushed into SQL as
+      // `NOT IN (...)`, PostgreSQL would have to keep walking the ordered index
+      // until it found SCAN_LIMIT non-deferred rows or proved none remained.
+      // Simulate several pages of deferred ids: each raw probe remains bounded,
+      // advances from the unfiltered page, and liveness reaches the next
+      // non-deferred page.
+      const deferredRows = await sql.unsafe(
+        `SELECT created_at::text AS created_at_text, id::text AS id FROM heartbeat_runs
+          WHERE agent_id = '${AGENT}'::uuid AND status = 'queued'
+          ORDER BY created_at ASC, id ASC
+          LIMIT ${SCAN_LIMIT * 3}`,
+      ) as Array<{ created_at_text: string; id: string }>;
+      expect(deferredRows).toHaveLength(SCAN_LIMIT * 3);
+      const deferredIds = new Set(deferredRows.map((row) => row.id));
+      let deferredCursor: { createdAt: string; id: string } | null = null;
+      for (let pass = 0; pass < 3; pass += 1) {
+        const deferredProbeQuery = dispatchHeadProbeQuery(deferredCursor);
+        const deferredProbe = await explain(sql, deferredProbeQuery);
+        record(`depth ${depth}: deferred raw probe pass ${pass + 1}`, deferredProbe);
+        expect(rowsInspected(deferredProbe.root)).toBeLessThanOrEqual(HEAD_ABSOLUTE_BOUND);
+
+        const rawPage = await sql.unsafe(deferredProbeQuery) as Array<{
+          dispatch_created_at_cursor: string;
+          id: string;
+        }>;
+        expect(rawPage).toHaveLength(SCAN_LIMIT);
+        expect(rawPage.every((row) => deferredIds.has(row.id))).toBe(true);
+        const last = rawPage[rawPage.length - 1]!;
+        deferredCursor = { createdAt: last.dispatch_created_at_cursor, id: last.id };
+      }
+      const afterDeferredRows = await sql.unsafe(dispatchHeadProbeQuery(deferredCursor)) as Array<{
+        dispatch_created_at_cursor: string;
+        id: string;
+      }>;
+      expect(afterDeferredRows).toHaveLength(SCAN_LIMIT);
+      expect(afterDeferredRows.every((row) => !deferredIds.has(row.id))).toBe(true);
+
       // Phase 2 hydrates exactly the probed page by primary key, so it is bounded
       // by SCAN_LIMIT and not by the queue behind it.
       const pageIds = (await sql.unsafe(
@@ -687,4 +736,3 @@ describeEmbeddedPostgres("BLO-20396 dispatch query plans", () => {
     expect(HEAD_ABSOLUTE_BOUND).toBeLessThan(DISPATCH_HEAD_DEPTHS[0]! / 1.5);
   }, 900_000);
 });
-
