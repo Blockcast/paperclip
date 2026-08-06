@@ -224,6 +224,16 @@ githubApp:
   privateKeyKey: private_key.pem
   # -- GitHub App login used to filter reviews/comments. Must be `<slug>[bot]` or `app/<slug>`; bare user logins are rejected. Empty -> server default ("allyblockcast[bot]").
   reviewerBotLogin: ""
+  # -- Durably capture signed review-gate webhooks without processing them. Roll this out to every API replica before enabling authority.
+  reviewGateCaptureEnabled: false
+  # -- Process captured review-gate deliveries and dispatch reconciliation. Requires capture; the Blockcast release workflow also proves the live capture rollout completed before promotion.
+  reviewGateEnabled: false
+  # -- Repositories whose signed webhook deliveries drive review-gate revocation and reconciliation.
+  reviewGateRepositories: []
+  # -- GitHub App identity allowed to produce the protected review-gate status.
+  reviewGateExpectedAppId: ""
+  # -- Installation identity allowed to produce the protected review-gate status.
+  reviewGateExpectedInstallationId: ""
   # -- Commit-status context to FAIL when a PR-review run exhausts its automatic
   # retries (e.g. "review/ally-complete"). A required status that is never posted
   # reads as "Expected — waiting for status" forever, so an exhausted reviewer

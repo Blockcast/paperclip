@@ -91,6 +91,10 @@ import {
   pullRequestExternalId,
 } from "../services/pull-request-work-products.js";
 import { matchesTaskKey, normalizePrReviewRepoFullName } from "../services/pr-review-duplicate-issue-guard.js";
+import {
+  enqueueGithubReviewGateDelivery,
+  type GithubReviewGateAuthorityConfig,
+} from "../services/github-review-gate-authority.js";
 
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type PrReviewerSelectionDb = Pick<Db | DbTransaction, "select">;
@@ -195,6 +199,12 @@ export interface GithubWebhookConfig {
    * agent runs.
    */
   dependabotMinSeverity?: "low" | "medium" | "high" | "critical";
+  /**
+   * Optional signed-webhook authority for an App-owned required review status.
+   * The route durably records revocation intent before processing the existing
+   * webhook effects, so cancelling a workflow cannot preserve authorization.
+   */
+  reviewGateAuthority?: GithubReviewGateAuthorityConfig | null;
   /**
    * Dispatch ownership and test overrides for heartbeat wakes. Split-tier
    * production forwards its node role so API handlers enqueue for the worker.
@@ -3833,11 +3843,63 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
 
     const eventName = req.header("x-github-event") ?? "";
     const deliveryId = req.header("x-github-delivery") ?? null;
+    const payload = (req.body ?? {}) as Record<string, unknown>;
+    let reviewGateReceipt: Record<string, unknown> | null = null;
+    const respond = (status: number, body: Record<string, unknown>) => {
+      if (!res.headersSent) res.status(reviewGateReceipt ? 202 : status).json(reviewGateReceipt ?? body);
+    };
+
+    if (config.reviewGateAuthority?.repositories.length) {
+      const gateDelivery = await enqueueGithubReviewGateDelivery({
+        db,
+        eventName,
+        deliveryId,
+        rawBody,
+        payload,
+        config: config.reviewGateAuthority,
+      });
+      if (gateDelivery.matched && !gateDelivery.queued) {
+        logger.error(
+          {
+            event: eventName,
+            deliveryId,
+            repoFullName: gateDelivery.repoFullName,
+            prNumber: gateDelivery.prNumber,
+            reason: gateDelivery.reason,
+          },
+          "github review-gate delivery could not be persisted",
+        );
+        res.status(gateDelivery.reason === "delivery_id_payload_conflict" ? 409 : 503).json({
+          error: "github review-gate delivery was not queued",
+          reason: gateDelivery.reason,
+        });
+        return;
+      }
+      if (gateDelivery.matched) {
+        logger.info(
+          {
+            event: eventName,
+            deliveryId,
+            repoFullName: gateDelivery.repoFullName,
+            prNumber: gateDelivery.prNumber,
+            deliveryDbId: gateDelivery.deliveryDbId,
+            duplicate: gateDelivery.duplicate,
+          },
+          "github review-gate delivery queued durably",
+        );
+        reviewGateReceipt = {
+          ok: true,
+          reviewGateDeliveryQueued: true,
+          deliveryId,
+          duplicate: gateDelivery.duplicate,
+        };
+      }
+    }
 
     if (!WAKE_DRIVING_EVENTS.has(eventName)) {
       // Acked but ignored. GitHub retries on non-2xx, and it would
       // hammer us if we 4xx'd every event we don't handle.
-      res.status(200).json({ ok: true, ignored: eventName });
+      respond(200, { ok: true, ignored: eventName });
       return;
     }
 
@@ -4435,7 +4497,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
     })();
 
     if (!context) {
-      res.status(200).json({
+      respond(200, {
         ok: true,
         ignored: "no_paperclip_identifier",
         reviewerWakeFired,
@@ -4482,7 +4544,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       : [];
 
     if (context.identifiers.length === 0 && previouslyLinkedPullRequestIssues.length === 0) {
-      res.status(200).json({
+      respond(200, {
         ok: true,
         ignored: "no_paperclip_identifier",
         reviewerWakeFired,
@@ -4676,7 +4738,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
     }
 
     if (matched.length === 0) {
-      res.status(200).json({
+      respond(200, {
         ok: true,
         ignored: "no_matching_issue",
         identifiers: context.identifiers,
@@ -5068,7 +5130,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       "github webhook drove issue wakes",
     );
 
-    res.status(200).json({
+    respond(200, {
       ok: true,
       wakes,
       skipped,

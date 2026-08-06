@@ -560,6 +560,7 @@ jobs:
           sparse-checkout: |
             scripts/approve-paperclip-api-digest.sh
             scripts/stamp-paperclip-api-approval-plan.sh
+            scripts/verify-review-gate-capture-promotion.mjs
           sparse-checkout-cone-mode: false
 
       - name: Verify release tooling revision
@@ -584,12 +585,14 @@ jobs:
           fi
           script="$(pwd)/.release-tooling/scripts/approve-paperclip-api-digest.sh"
           stamper="$(pwd)/.release-tooling/scripts/stamp-paperclip-api-approval-plan.sh"
-          if [ ! -x "${script}" ] || [ ! -x "${stamper}" ]; then
+          promotion_verifier="$(pwd)/.release-tooling/scripts/verify-review-gate-capture-promotion.mjs"
+          if [ ! -x "${script}" ] || [ ! -x "${stamper}" ] || [ ! -r "${promotion_verifier}" ]; then
             echo "Approval release tooling missing or non-executable at trusted revision ${expected}" >&2
             exit 1
           fi
           echo "approve_script=${script}" >> "$GITHUB_OUTPUT"
           echo "stamp_script=${stamper}" >> "$GITHUB_OUTPUT"
+          echo "promotion_verify_script=${promotion_verifier}" >> "$GITHUB_OUTPUT"
 
       - name: Render, stamp, and validate deploy plan
         id: plan
@@ -600,6 +603,7 @@ jobs:
           TAG: ${{ needs.build-and-push.outputs.image_tag }}
           COMMIT: ${{ steps.target.outputs.full }}
           STAMP_SCRIPT: ${{ steps.tooling.outputs.stamp_script }}
+          PROMOTION_VERIFY_SCRIPT: ${{ steps.tooling.outputs.promotion_verify_script }}
         run: |
           set -euo pipefail
           [[ "${DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]
@@ -639,6 +643,25 @@ jobs:
                     ((.spec.template.metadata.annotations // {}) + {($key): $commit})
                 end
               ' > "${unstamped}"
+
+          # A single rolling update cannot safely introduce capture and authority:
+          # old API replicas would still acknowledge without persisting. Trusted
+          # release tooling compares the full capture contract and rollout state
+          # before promotion. GitHub does not auto-redeliver failed webhooks, so
+          # an outage-based Recreate fallback is also unsafe.
+          authority_enabled="$(node "${PROMOTION_VERIFY_SCRIPT}" \
+            --target "${unstamped}" --print-authority)"
+          if [ "${authority_enabled}" = "true" ]; then
+            live_capture="${RUNNER_TEMP}/paperclip-api-live-capture.json"
+            if ! kubectl -n "${NS}" get deployment paperclip-api -o json > "${live_capture}"; then
+              echo "Review-gate authority requires an earlier completed capture-only API rollout" >&2
+              exit 1
+            fi
+            node "${PROMOTION_VERIFY_SCRIPT}" --target "${unstamped}" --live "${live_capture}"
+          elif [ "${authority_enabled}" != "false" ]; then
+            echo "Promotion verifier returned invalid authority state: ${authority_enabled}" >&2
+            exit 1
+          fi
 
           canonical_unstamped=$(jq -cS --arg key "${marker_key}" '
             del(.spec.template.metadata.annotations[$key])
