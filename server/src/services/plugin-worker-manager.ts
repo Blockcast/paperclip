@@ -221,6 +221,24 @@ function startupFailureCode(err: unknown): number | null {
   return typeof code === "number" ? code : null;
 }
 
+const HOST_STARTUP_RPC_FAILURE = Symbol("paperclip.hostStartupRpcFailure");
+
+type HostStartupRpcFailure = JsonRpcCallError & {
+  readonly [HOST_STARTUP_RPC_FAILURE]?: true;
+};
+
+function markHostStartupRpcFailure(error: JsonRpcCallError): JsonRpcCallError {
+  Object.defineProperty(error, HOST_STARTUP_RPC_FAILURE, { value: true });
+  return error;
+}
+
+function isHostStartupRpcFailure(err: unknown): err is HostStartupRpcFailure {
+  return (
+    err instanceof JsonRpcCallError &&
+    (err as HostStartupRpcFailure)[HOST_STARTUP_RPC_FAILURE] === true
+  );
+}
+
 /**
  * Thrown by `startWorker()` when a worker cannot be brought up.
  *
@@ -233,7 +251,7 @@ function startupFailureCode(err: unknown): number | null {
  */
 export class WorkerStartupError extends Error {
   override readonly name = "WorkerStartupError";
-  /** True only for the contention-shaped causes in TRANSIENT_STARTUP_RPC_CODES. */
+  /** True only for host-owned contention-shaped startup failures. */
   readonly transient: boolean;
   /** The underlying JSON-RPC error code, when the cause carried one. */
   readonly causeCode: number | null;
@@ -333,6 +351,8 @@ interface PendingRequest {
   method: string;
   /** Resolve the promise with the response. */
   resolve: (response: JsonRpcResponse) => void;
+  /** Reject the promise with a host-owned failure. */
+  reject: (error: Error) => void;
   /** Timeout timer handle. */
   timer: ReturnType<typeof setTimeout>;
   /** Timestamp when the request was sent. */
@@ -988,17 +1008,18 @@ export function createPluginWorkerHandle(
     childProcess = null;
     startedAt = null;
 
-    // Reject all pending requests. Typed WORKER_UNAVAILABLE so an initialize
-    // that was still in flight is classifiable as a transient startup failure
-    // without matching on the message (BLO-22095).
+    // Reject all pending requests. Tag this host-owned process-exit failure so
+    // initialize can be retried without trusting worker-returned error codes.
     rejectAllPending(
-      new JsonRpcCallError({
-        code: PLUGIN_RPC_ERROR_CODES.WORKER_UNAVAILABLE,
-        message: formatWorkerFailureMessage(
-          `Worker process exited (code=${code}, signal=${signal})`,
-          stderrExcerpt,
-        ),
-      }),
+      markHostStartupRpcFailure(
+        new JsonRpcCallError({
+          code: PLUGIN_RPC_ERROR_CODES.WORKER_UNAVAILABLE,
+          message: formatWorkerFailureMessage(
+            `Worker process exited (code=${code}, signal=${signal})`,
+            stderrExcerpt,
+          ),
+        }),
+      ),
     );
 
     // Emit synthetic close for any orphaned stream channels so SSE clients
@@ -1056,15 +1077,8 @@ export function createPluginWorkerHandle(
   }
 
   function rejectAllPending(error: Error): void {
-    for (const [id, pending] of pendingRequests) {
-      clearTimeout(pending.timer);
-      pending.resolve(
-        createErrorResponse(
-          pending.id,
-          PLUGIN_RPC_ERROR_CODES.WORKER_UNAVAILABLE,
-          error.message,
-        ) as JsonRpcResponse,
-      );
+    for (const pending of Array.from(pendingRequests.values())) {
+      pending.reject(error);
     }
     pendingRequests.clear();
     for (const invocation of activeInvocations.values()) {
@@ -1163,14 +1177,16 @@ export function createPluginWorkerHandle(
       // prefix, so the retry loop cannot recover it from the string.
       const msg = err instanceof Error ? err.message : String(err);
       const causeCode = startupFailureCode(err);
+      const transient =
+        isHostStartupRpcFailure(err) &&
+        TRANSIENT_STARTUP_RPC_CODES.includes(err.code);
       log.error({ err: msg, causeCode }, "worker initialize failed");
       await killProcess();
       setStatus("crashed");
       throw new WorkerStartupError(
         `Worker initialize failed for "${pluginId}": ${msg}`,
         {
-          transient:
-            causeCode !== null && TRANSIENT_STARTUP_RPC_CODES.includes(causeCode),
+          transient,
           causeCode,
         },
       );
@@ -1369,12 +1385,15 @@ export function createPluginWorkerHandle(
       };
 
       const timer = setTimeout(() => {
+        const timeoutError = new JsonRpcCallError({
+          code: PLUGIN_RPC_ERROR_CODES.TIMEOUT,
+          message: `RPC call "${method}" timed out after ${timeout}ms`,
+        });
         settle(
           reject,
-          new JsonRpcCallError({
-            code: PLUGIN_RPC_ERROR_CODES.TIMEOUT,
-            message: `RPC call "${method}" timed out after ${timeout}ms`,
-          }),
+          method === "initialize"
+            ? markHostStartupRpcFailure(timeoutError)
+            : timeoutError,
         );
       }, timeout);
 
@@ -1390,6 +1409,7 @@ export function createPluginWorkerHandle(
             settle(reject, new Error(`Unexpected response format for "${method}"`));
           }
         },
+        reject: (error: Error) => settle(reject, error),
         timer,
         sentAt: Date.now(),
         invocationId: invocation?.id,

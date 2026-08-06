@@ -44,17 +44,76 @@ import {
 function wrappedInitializeFailure(
   pluginId: string,
   cause: Error,
+  options: { transient?: boolean } = {},
 ): WorkerStartupError {
   const causeCode = cause instanceof JsonRpcCallError ? cause.code : null;
   return new WorkerStartupError(
     `Worker initialize failed for "${pluginId}": ${cause.message}`,
     {
-      transient:
-        causeCode === PLUGIN_RPC_ERROR_CODES.TIMEOUT ||
-        causeCode === PLUGIN_RPC_ERROR_CODES.WORKER_UNAVAILABLE,
+      transient: options.transient ?? false,
       causeCode,
     },
   );
+}
+
+class FakeChild extends EventEmitter {
+  pid = 4242;
+  stdin = new PassThrough();
+  stdout = new PassThrough();
+  stderr = new PassThrough();
+  killed = false;
+  kill(signal?: NodeJS.Signals): boolean {
+    this.killed = true;
+    this.emit("exit", null, signal ?? null);
+    return true;
+  }
+}
+
+const spawned: FakeChild[] = [];
+
+function installForkMock(): void {
+  spawned.length = 0;
+  forkMock.mockReset();
+  forkMock.mockImplementation(() => {
+    const child = new FakeChild();
+    spawned.push(child);
+    return child;
+  });
+}
+
+function createTestWorkerHandle(autoRestart = false) {
+  return createPluginWorkerHandle("example.plugin", {
+    entrypointPath: "/tmp/example-plugin/worker.js",
+    manifest: { id: "example.plugin", capabilities: [] } as never,
+    config: {},
+    instanceInfo: { instanceId: "test", hostVersion: "0.0.0" },
+    apiVersion: 1,
+    hostHandlers: {} as never,
+    autoRestart,
+  });
+}
+
+function readNextWorkerRequest(
+  child: FakeChild,
+): Promise<{ id: string | number | null; method?: string }> {
+  return new Promise((resolve, reject) => {
+    let buffer = "";
+    const onData = (chunk: Buffer): void => {
+      buffer += chunk.toString();
+      const lineEnd = buffer.indexOf("\n");
+      if (lineEnd === -1) return;
+      child.stdin.off("data", onData);
+      try {
+        resolve(JSON.parse(buffer.slice(0, lineEnd)) as {
+          id: string | number | null;
+          method?: string;
+        });
+      } catch (err) {
+        reject(err);
+      }
+    };
+    child.stdin.on("data", onData);
+  });
 }
 
 describe("isTransientActivationError", () => {
@@ -67,6 +126,7 @@ describe("isTransientActivationError", () => {
         code: PLUGIN_RPC_ERROR_CODES.TIMEOUT,
         message: 'RPC call "initialize" timed out after 60000ms',
       }),
+      { transient: true },
     );
     expect(observed.message).toBe(
       'Worker initialize failed for "lucitra.plugin-secrets": ' +
@@ -85,6 +145,7 @@ describe("isTransientActivationError", () => {
         code: PLUGIN_RPC_ERROR_CODES.WORKER_UNAVAILABLE,
         message: "Worker process exited (code=1, signal=null)",
       }),
+      { transient: true },
     );
     expect(isTransientActivationError(died)).toBe(true);
   });
@@ -99,6 +160,14 @@ describe("isTransientActivationError", () => {
       new JsonRpcCallError({
         code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
         message: "Error: bad credentials",
+      }),
+      new JsonRpcCallError({
+        code: PLUGIN_RPC_ERROR_CODES.TIMEOUT,
+        message: "nested host RPC timed out during setup",
+      }),
+      new JsonRpcCallError({
+        code: PLUGIN_RPC_ERROR_CODES.WORKER_UNAVAILABLE,
+        message: "nested host RPC worker unavailable during setup",
       }),
     ]) {
       const wrapped = wrappedInitializeFailure("example.plugin", cause);
@@ -250,6 +319,73 @@ describe("mapWithConcurrency", () => {
   });
 });
 
+describe("worker startup error provenance", () => {
+  beforeEach(() => {
+    installForkMock();
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it.each([
+    PLUGIN_RPC_ERROR_CODES.TIMEOUT,
+    PLUGIN_RPC_ERROR_CODES.WORKER_UNAVAILABLE,
+  ])(
+    "does not mark worker-returned setup code %s as transient",
+    async (code) => {
+      const handle = createTestWorkerHandle(false);
+
+      const start = handle.start();
+      const failure = start.catch((err: unknown) => err);
+
+      expect(spawned).toHaveLength(1);
+      const request = await readNextWorkerRequest(spawned[0]!);
+      expect(request.method).toBe("initialize");
+
+      spawned[0]!.stdout.write(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: request.id,
+          error: {
+            code,
+            message: `setup nested host RPC failed with ${code}`,
+          },
+        }) + "\n",
+      );
+
+      const err = await failure;
+      expect(err).toBeInstanceOf(WorkerStartupError);
+      expect((err as WorkerStartupError).causeCode).toBe(code);
+      expect((err as WorkerStartupError).transient).toBe(false);
+      expect(isTransientActivationError(err)).toBe(false);
+      expect(spawned).toHaveLength(1);
+    },
+  );
+
+  it("marks a host-owned initialize timeout as transient", async () => {
+    const handle = createTestWorkerHandle(false);
+
+    const start = handle.start();
+    const failure = start.catch((err: unknown) => err);
+
+    expect(spawned).toHaveLength(1);
+    const request = await readNextWorkerRequest(spawned[0]!);
+    expect(request.method).toBe("initialize");
+
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    const err = await failure;
+    expect(err).toBeInstanceOf(WorkerStartupError);
+    expect((err as WorkerStartupError).causeCode).toBe(
+      PLUGIN_RPC_ERROR_CODES.TIMEOUT,
+    );
+    expect((err as WorkerStartupError).transient).toBe(true);
+    expect(isTransientActivationError(err)).toBe(true);
+  });
+});
+
 /**
  * BLO-22095 finding 2 — a worker that crashes before `initialize` resolves
  * schedules its own restart on a 750–1250ms backoff. The activation retry loop
@@ -259,28 +395,8 @@ describe("mapWithConcurrency", () => {
  * the retry the loop was about to make.
  */
 describe("worker startup crash does not self-restart during the activation retry delay", () => {
-  const spawned: FakeChild[] = [];
-
-  class FakeChild extends EventEmitter {
-    pid = 4242;
-    stdin = new PassThrough();
-    stdout = new PassThrough();
-    stderr = new PassThrough();
-    killed = false;
-    kill(_signal?: NodeJS.Signals): boolean {
-      this.killed = true;
-      return true;
-    }
-  }
-
   beforeEach(() => {
-    spawned.length = 0;
-    forkMock.mockReset();
-    forkMock.mockImplementation(() => {
-      const child = new FakeChild();
-      spawned.push(child);
-      return child;
-    });
+    installForkMock();
     vi.useFakeTimers();
   });
 
