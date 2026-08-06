@@ -4343,6 +4343,168 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     180_000,
   );
 
+  it("advances the recovery lane through fully deferred admission-refusal pages", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const staleSlotRunId = randomUUID();
+    const issuePrefix = `D${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const baseCreatedAt = new Date(Date.now() - 5 * 60 * 1000);
+    const recoveryRunIds = Array.from({ length: 5 }, () => randomUUID());
+    const recoveryIssueIds = Array.from({ length: recoveryRunIds.length }, () => randomUUID());
+    let recoveryContinuationSchedules = 0;
+    let refusalStatusReads = 0;
+    let releasedStaleSlot = false;
+    let sawFullyDeferredRecoveryPage = false;
+
+    const boundedHeartbeat = heartbeatService(db, {
+      penstockGate: allowPenstockGate,
+      queuedRunDispatchBounds: { scanLimit: 2, maxScanBatches: 1, maxResumePasses: 12 },
+      beforeQueuedDispatchRefusalStatusReadForTest: async () => {
+        refusalStatusReads += 1;
+      },
+      afterQueuedDispatchContinuationScheduledForTest: async (event) => {
+        if (event.reason !== "resume_recovery_lane" || releasedStaleSlot) return;
+        recoveryContinuationSchedules += 1;
+        if (recoveryContinuationSchedules <= refusalStatusReads) return;
+        sawFullyDeferredRecoveryPage = true;
+        releasedStaleSlot = true;
+        await db
+          .update(externalRuntimeReservations)
+          .set({
+            state: "released",
+            releasedAt: new Date(),
+            releaseReason: "test_slot_released_after_deferred_page",
+            updatedAt: new Date(),
+          })
+          .where(eq(externalRuntimeReservations.runId, staleSlotRunId));
+      },
+    });
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "RecoveryLaneDeferredPagesCo",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "RecoveryLaneDeferredPagesAgent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { enabled: true, wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    await db.insert(issues).values(
+      recoveryIssueIds.map((issueId, index) => ({
+        id: issueId,
+        companyId,
+        title: `Recovery lane candidate ${index + 1}`,
+        status: "todo" as const,
+        priority: "medium" as const,
+        assigneeAgentId: agentId,
+        issueNumber: index + 1,
+        identifier: `${issuePrefix}-${index + 1}`,
+      })),
+    );
+
+    await db.insert(heartbeatRuns).values({
+      id: staleSlotRunId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "succeeded",
+      contextSnapshot: {},
+      startedAt: new Date(baseCreatedAt.getTime() - 60_000),
+      finishedAt: new Date(baseCreatedAt.getTime() - 30_000),
+      createdAt: new Date(baseCreatedAt.getTime() - 60_000),
+      updatedAt: new Date(baseCreatedAt.getTime() - 30_000),
+    });
+    await db.insert(externalRuntimeReservations).values({
+      companyId,
+      agentId,
+      runId: staleSlotRunId,
+      slotId: 0,
+      state: "launched",
+      jobName: `paperclip-agent-${staleSlotRunId}`,
+      jobUid: randomUUID(),
+      isolationMode: "run",
+      isolationKey: `run:${staleSlotRunId}`,
+      isolationBoundAt: new Date(baseCreatedAt.getTime() - 60_000),
+      reservedAt: new Date(baseCreatedAt.getTime() - 60_000),
+      launchingAt: new Date(baseCreatedAt.getTime() - 60_000),
+      launchedAt: new Date(baseCreatedAt.getTime() - 30_000),
+      createdAt: new Date(baseCreatedAt.getTime() - 60_000),
+      updatedAt: new Date(baseCreatedAt.getTime() - 30_000),
+    });
+
+    for (const [index, runId] of recoveryRunIds.entries()) {
+      const wakeId = randomUUID();
+      const recoveryActionId = randomUUID();
+      const issueId = recoveryIssueIds[index]!;
+      const createdAt = new Date(baseCreatedAt.getTime() + index);
+      await db.insert(agentWakeupRequests).values({
+        id: wakeId,
+        companyId,
+        agentId,
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "source_scoped_recovery_action",
+        payload: { issueId, recoveryActionId },
+        status: "queued",
+        runId,
+        requestedAt: createdAt,
+        updatedAt: createdAt,
+      });
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "queued",
+        wakeupRequestId: wakeId,
+        contextSnapshot: {
+          issueId,
+          wakeReason: "source_scoped_recovery_action",
+          source: "issue_recovery_action",
+          recoveryActionId,
+        },
+        createdAt,
+        updatedAt: createdAt,
+      });
+    }
+
+    const dispatchedRunIds: string[] = [];
+    mockAdapterExecute.mockImplementation(async (args: { runId: string }) => {
+      dispatchedRunIds.push(args.runId);
+      return {
+        exitCode: 0,
+        signal: null as string | null,
+        timedOut: false,
+        errorMessage: null as string | null,
+        resultJson: { exitCode: 0 },
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    await boundedHeartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(boundedHeartbeat, recoveryRunIds[2]!, 60_000);
+
+    expect(sawFullyDeferredRecoveryPage).toBe(true);
+    expect(releasedStaleSlot).toBe(true);
+    expect(refusalStatusReads).toBe(2);
+    expect(dispatchedRunIds[0]).toBe(recoveryRunIds[2]);
+    expect((await boundedHeartbeat.getRun(recoveryRunIds[0]!))?.status).toBe("queued");
+    expect((await boundedHeartbeat.getRun(recoveryRunIds[1]!))?.status).toBe("queued");
+    await boundedHeartbeat.drainInFlightExecutions(60_000);
+  }, 180_000);
+
   it("retries a lone emergency run after atomic admission refusal", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
