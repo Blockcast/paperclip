@@ -217,7 +217,11 @@ jobs:
         with:
           version: 9.15.4
 
+      # BLO-22675: skip the download when policy didn't upload anything this
+      # run (the common case) instead of logging a harmless-but-misleading
+      # "Artifact not found" ##[error] on every such run.
       - name: Restore regenerated PR lockfile (if policy uploaded one)
+        if: needs.policy.outputs.lockfile_regenerated == '1'
         uses: actions/download-artifact@v4
         continue-on-error: true
         with:
@@ -266,7 +270,11 @@ jobs:
         with:
           version: 9.15.4
 
+      # BLO-22675: skip the download when policy didn't upload anything this
+      # run (the common case) instead of logging a harmless-but-misleading
+      # "Artifact not found" ##[error] on every such run.
       - name: Restore regenerated PR lockfile (if policy uploaded one)
+        if: needs.policy.outputs.lockfile_regenerated == '1'
         uses: actions/download-artifact@v4
         continue-on-error: true
         with:
@@ -379,7 +387,11 @@ jobs:
         with:
           version: 9.15.4
 
+      # BLO-22675: skip the download when policy didn't upload anything this
+      # run (the common case) instead of logging a harmless-but-misleading
+      # "Artifact not found" ##[error] on every such run.
       - name: Restore regenerated PR lockfile (if policy uploaded one)
+        if: needs.policy.outputs.lockfile_regenerated == '1'
         uses: actions/download-artifact@v4
         continue-on-error: true
         with:
@@ -514,7 +526,11 @@ jobs:
         with:
           version: 9.15.4
 
+      # BLO-22675: skip the download when policy didn't upload anything this
+      # run (the common case) instead of logging a harmless-but-misleading
+      # "Artifact not found" ##[error] on every such run.
       - name: Restore regenerated PR lockfile (if policy uploaded one)
+        if: needs.policy.outputs.lockfile_regenerated == '1'
         uses: actions/download-artifact@v4
         continue-on-error: true
         with:
@@ -568,7 +584,11 @@ jobs:
         with:
           version: 9.15.4
 
+      # BLO-22675: skip the download when policy didn't upload anything this
+      # run (the common case) instead of logging a harmless-but-misleading
+      # "Artifact not found" ##[error] on every such run.
       - name: Restore regenerated PR lockfile (if policy uploaded one)
+        if: needs.policy.outputs.lockfile_regenerated == '1'
         uses: actions/download-artifact@v4
         continue-on-error: true
         with:
@@ -607,7 +627,11 @@ jobs:
         with:
           version: 9.15.4
 
+      # BLO-22675: skip the download when policy didn't upload anything this
+      # run (the common case) instead of logging a harmless-but-misleading
+      # "Artifact not found" ##[error] on every such run.
       - name: Restore regenerated PR lockfile (if policy uploaded one)
+        if: needs.policy.outputs.lockfile_regenerated == '1'
         uses: actions/download-artifact@v4
         continue-on-error: true
         with:
@@ -668,7 +692,11 @@ jobs:
         with:
           version: 9.15.4
 
+      # BLO-22675: skip the download when policy didn't upload anything this
+      # run (the common case) instead of logging a harmless-but-misleading
+      # "Artifact not found" ##[error] on every such run.
       - name: Restore regenerated PR lockfile (if policy uploaded one)
+        if: needs.policy.outputs.lockfile_regenerated == '1'
         uses: actions/download-artifact@v4
         continue-on-error: true
         with:
@@ -700,8 +728,20 @@ jobs:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ steps.playwright_version.outputs.version }}
 
+      # BLO-22675: apt's upstream mirrors (e.g. security.ubuntu.com) fail with
+      # a transient "Mirror sync in progress?" size mismatch often enough to
+      # take out a merge_group run on their own; retry before failing the job.
       - name: Install Playwright system dependencies
-        run: pnpm exec playwright install-deps chromium
+        run: |
+          for attempt in 1 2 3; do
+            if pnpm exec playwright install-deps chromium; then
+              exit 0
+            fi
+            echo "Playwright system dependency install failed (attempt $attempt/3); retrying in 15s..." >&2
+            sleep 15
+          done
+          echo "Playwright system dependency install failed after 3 attempts" >&2
+          exit 1
 
       - name: Install Playwright browser
         if: steps.playwright_cache.outputs.cache-hit != 'true'
