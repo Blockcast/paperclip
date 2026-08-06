@@ -3485,6 +3485,122 @@ describeEmbeddedPostgres("tool access service", () => {
     expect(row.status).toBe("pending");
   });
 
+  it("cancels a freshly-created action request with an already-invalid signature immediately, without waiting out the grace period (BLO-21490)", async () => {
+    // The signing grace only exists to cover signedArguments===null (the
+    // row's uninitialized state before the async backfill lands). A row
+    // that already carries a signature — malformed, or signed with the
+    // wrong secret — is a real integrity failure and must not be exposed
+    // in the review queue just because it happens to be fresh.
+    vi.stubEnv("PAPERCLIP_TOOL_ACTION_SIGNING_SECRET", "current-secret");
+    const company = await createCompany(db);
+    const [application] = await db.insert(toolApplications).values({
+      companyId: company.id,
+      name: `Action review app ${randomUUID()}`,
+      type: "mcp_http",
+      status: "active",
+    }).returning();
+    const [connection] = await db.insert(toolConnections).values({
+      companyId: company.id,
+      applicationId: application.id,
+      name: `Action review connection ${randomUUID()}`,
+      transport: "remote_http",
+      status: "active",
+      enabled: true,
+      config: { url: "https://fixture.example/mcp" },
+    }).returning();
+    const [catalogEntry] = await db.insert(toolCatalogEntries).values({
+      companyId: company.id,
+      applicationId: application.id,
+      connectionId: connection.id,
+      name: "kv_set",
+      toolName: "kv_set",
+      title: "KV Set",
+      riskLevel: "write",
+      isWrite: true,
+      status: "active",
+      versionHash: "v1",
+      schemaHash: "s1",
+    }).returning();
+    const canonicalArguments = canonicalToolArguments({ key: "alpha", value: "one" });
+    const [malformedInvocation, wrongSecretInvocation] = await db.insert(toolInvocations).values([1, 2].map(() => ({
+      companyId: company.id,
+      applicationId: application.id,
+      connectionId: connection.id,
+      catalogEntryId: catalogEntry.id,
+      toolName: "kv_set",
+      argumentsHash: "args-hash",
+      argumentsSummary: { summary: canonicalArguments, sha256: "args-hash", sizeBytes: canonicalArguments.length },
+      policyDecision: "require_approval" as const,
+      approvalState: "pending" as const,
+      status: "awaiting_approval" as const,
+    }))).returning();
+    const wrongSecretSignedArguments = signToolArguments({
+      invocationId: wrongSecretInvocation.id,
+      toolName: wrongSecretInvocation.toolName,
+      canonicalArguments,
+      signingSecret: "not-the-current-secret",
+    });
+    const freshCreatedAt = new Date();
+    const [malformedRequest, wrongSecretRequest] = await db.insert(toolActionRequests).values([
+      {
+        companyId: company.id,
+        invocationId: malformedInvocation.id,
+        status: "pending",
+        canonicalArgumentsHash: "args-hash",
+        canonicalArgumentsSummary: { summary: canonicalArguments, sha256: "args-hash", sizeBytes: canonicalArguments.length },
+        signedArguments: "not-a-real-signature-payload",
+        createdAt: freshCreatedAt,
+      },
+      {
+        companyId: company.id,
+        invocationId: wrongSecretInvocation.id,
+        status: "pending",
+        canonicalArgumentsHash: "args-hash",
+        canonicalArgumentsSummary: { summary: canonicalArguments, sha256: "args-hash", sizeBytes: canonicalArguments.length },
+        signedArguments: wrongSecretSignedArguments,
+        createdAt: freshCreatedAt,
+      },
+    ]).returning();
+
+    const list = await toolAccessService(db).listActionRequests(company.id, "pending");
+    const rows = await db.select().from(toolActionRequests);
+    const statusById = new Map(rows.map((row) => [row.id, row.status]));
+
+    expect(list).toEqual([]);
+    expect(statusById.get(malformedRequest.id)).toBe("cancelled");
+    expect(statusById.get(wrongSecretRequest.id)).toBe("cancelled");
+  });
+
+  it("cancels a freshly-created action request whose invocation is missing immediately, without waiting out the grace period (BLO-21490)", async () => {
+    // The invocation lookup in listActionRequests is scoped to the
+    // requesting company. A request row that references an invocation
+    // belonging to a *different* company (a data-integrity mismatch — the
+    // FK itself doesn't enforce company scoping) is indistinguishable from
+    // "still signing" by createdAt alone, but it can never actually finish
+    // signing. The grace period must not exempt it just because it's fresh.
+    const company = await createCompany(db);
+    const otherCompany = await createCompany(db);
+    const [otherCompanyInvocation] = await db.insert(toolInvocations).values({
+      companyId: otherCompany.id,
+      toolName: "kv_set",
+    }).returning();
+    const [orphanedRequest] = await db.insert(toolActionRequests).values({
+      companyId: company.id,
+      invocationId: otherCompanyInvocation.id,
+      status: "pending",
+      canonicalArgumentsHash: "args-hash",
+      canonicalArgumentsSummary: { summary: "{}", sha256: "args-hash", sizeBytes: 2 },
+      signedArguments: null,
+      createdAt: new Date(),
+    }).returning();
+
+    const list = await toolAccessService(db).listActionRequests(company.id, "pending");
+    const [row] = await db.select().from(toolActionRequests).where(eq(toolActionRequests.id, orphanedRequest.id));
+
+    expect(list).toEqual([]);
+    expect(row.status).toBe("cancelled");
+  });
+
   it("tracks new profile tools, reviews mixed allow/block decisions, and clears pending counts", async () => {
     const company = await createCompany(db);
     const app = createRouteApp(db);
