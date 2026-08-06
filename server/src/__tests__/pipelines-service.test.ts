@@ -3078,4 +3078,138 @@ describeEmbeddedPostgres("pipelineService", () => {
     expect(freshGrandchild!.terminalKind).toBe("cancelled");
     expect(freshGrandchild!.retiredReason).toBe("automation_retry");
   });
+
+  it("keeps a current-stage rerun attachment active", async () => {
+    const company = await seedCompany();
+    const routine = await seedRoutine(company.id, "Rerun stage automation");
+    const pipeline = await svc.createPipeline({
+      companyId: company.id,
+      key: "rerun-stage-automation",
+      name: "Rerun stage automation",
+      actor: userActor,
+      stages: [
+        { key: "intake", name: "Intake", kind: "open" },
+        { key: "drafting", name: "Drafting", kind: "working", config: { onEnter: { type: "run_routine", routineId: routine.id } } },
+        { key: "done", name: "Done", kind: "done" },
+        { key: "cancelled", name: "Cancelled", kind: "cancelled" },
+      ],
+    });
+    const created = await svc.ingestCase({
+      companyId: company.id,
+      pipelineId: pipeline.id,
+      caseKey: "rerun-current",
+      title: "Rerun current stage",
+      actor: userActor,
+    });
+    await svc.transitionCase({
+      companyId: company.id,
+      caseId: created.case.id,
+      toStageKey: "drafting",
+      expectedVersion: created.case.version,
+      actor: userActor,
+    });
+
+    const rerun = await svc.rerunCurrentStageAutomation({
+      companyId: company.id,
+      caseId: created.case.id,
+      actor: userActor,
+    });
+    const [rerunLink] = await db
+      .select()
+      .from(pipelineCaseIssueLinks)
+      .where(eq(pipelineCaseIssueLinks.automationAttemptId, rerun.automationLedger.id));
+    const [rerunIssue] = await db.select().from(issues).where(eq(issues.id, rerunLink!.issueId));
+
+    expect(rerunLink).toMatchObject({ retiredAt: null, retiredReason: null });
+    expect(["done", "cancelled"]).not.toContain(rerunIssue!.status);
+  });
+
+  it("preserves another case's coalesced issue during a previous-stage retry", async () => {
+    const company = await seedCompany();
+    const routine = await seedRoutine(company.id, "Coalesced retry automation");
+    const pipeline = await svc.createPipeline({
+      companyId: company.id,
+      key: "coalesced-previous-stage-retry",
+      name: "Coalesced previous-stage retry",
+      actor: userActor,
+      stages: [
+        { key: "intake", name: "Intake", kind: "open" },
+        { key: "drafting", name: "Drafting", kind: "working", config: { onEnter: { type: "run_routine", routineId: routine.id } } },
+        { key: "review", name: "Review", kind: "working" },
+        { key: "done", name: "Done", kind: "done" },
+        { key: "cancelled", name: "Cancelled", kind: "cancelled" },
+      ],
+    });
+    const enteredCases = [];
+    for (const caseKey of ["retrying-owner", "remaining-owner"]) {
+      const created = await svc.ingestCase({
+        companyId: company.id,
+        pipelineId: pipeline.id,
+        caseKey,
+        title: caseKey,
+        actor: userActor,
+      });
+      enteredCases.push(await svc.transitionCase({
+        companyId: company.id,
+        caseId: created.case.id,
+        toStageKey: "drafting",
+        expectedVersion: created.case.version,
+        actor: userActor,
+      }));
+    }
+    const retryingAttemptId = enteredCases[0]!.automationLedger!.id;
+    const remainingAttemptId = enteredCases[1]!.automationLedger!.id;
+    const sharedIssueId = enteredCases[0]!.automationExecution.status === "succeeded"
+      ? enteredCases[0]!.automationExecution.execution.executionIssueId!
+      : "";
+    const supersededIssueId = enteredCases[1]!.automationExecution.status === "succeeded"
+      ? enteredCases[1]!.automationExecution.execution.executionIssueId!
+      : "";
+    await db.update(pipelineAutomationExecutions)
+      .set({ executionIssueId: sharedIssueId })
+      .where(eq(pipelineAutomationExecutions.id, remainingAttemptId));
+    await db.update(pipelineCaseIssueLinks)
+      .set({ issueId: sharedIssueId })
+      .where(eq(pipelineCaseIssueLinks.automationAttemptId, remainingAttemptId));
+    await db.delete(issues).where(eq(issues.id, supersededIssueId));
+
+    const reviewed = await svc.transitionCase({
+      companyId: company.id,
+      caseId: enteredCases[0]!.case.id,
+      toStageKey: "review",
+      expectedVersion: enteredCases[0]!.case.version,
+      actor: userActor,
+    });
+    await db.update(pipelineCaseIssueLinks)
+      .set({ retiredAt: null, retiredReason: null })
+      .where(eq(pipelineCaseIssueLinks.automationAttemptId, retryingAttemptId));
+
+    await svc.retryStageAutomation({
+      companyId: company.id,
+      caseId: enteredCases[0]!.case.id,
+      scope: "previous_stage",
+      targetStageId: enteredCases[0]!.case.stageId,
+      expectedVersion: reviewed.case.version,
+      cleanup: {
+        retireDirectChildren: true,
+        retireDescendants: true,
+        cancelLinkedAutomationIssues: true,
+      },
+      actor: userActor,
+    });
+
+    const [sharedIssue] = await db.select().from(issues).where(eq(issues.id, sharedIssueId));
+    const sharedLinks = await db
+      .select()
+      .from(pipelineCaseIssueLinks)
+      .where(eq(pipelineCaseIssueLinks.issueId, sharedIssueId));
+    expect(["done", "cancelled"]).not.toContain(sharedIssue!.status);
+    expect(sharedLinks.find((link) => link.automationAttemptId === retryingAttemptId)).toMatchObject({
+      retiredReason: "stage_exited",
+    });
+    expect(sharedLinks.find((link) => link.automationAttemptId === remainingAttemptId)).toMatchObject({
+      retiredAt: null,
+      retiredReason: null,
+    });
+  });
 });

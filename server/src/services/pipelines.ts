@@ -5034,7 +5034,8 @@ export function pipelineService(db: Db, deps: { heartbeat?: PipelineHeartbeatDep
         const issueIdsToCancel = input.cleanup.cancelLinkedAutomationIssues
           ? effects.linkedAutomationIssueIds
           : [];
-        if (input.scope === "previous_stage" && detail.case.stageId !== plan.targetStageRow.id) {
+        const exitsCurrentStage = input.scope === "previous_stage" && detail.case.stageId !== plan.targetStageRow.id;
+        if (exitsCurrentStage) {
           await retireStageAutomationForExitedStage(tx, {
             companyId: input.companyId,
             caseId: detail.case.id,
@@ -5045,7 +5046,29 @@ export function pipelineService(db: Db, deps: { heartbeat?: PipelineHeartbeatDep
             runningRunIdsToCancel,
           });
         }
-        if (issueIdsToCancel.length > 0) {
+        if (exitsCurrentStage && input.cleanup.cancelLinkedAutomationIssues && plan.previousAttemptId) {
+          const previousAttemptLinks = await tx
+            .select({ linkId: pipelineCaseIssueLinks.id })
+            .from(pipelineCaseIssueLinks)
+            .where(and(
+              eq(pipelineCaseIssueLinks.companyId, input.companyId),
+              eq(pipelineCaseIssueLinks.caseId, input.caseId),
+              eq(pipelineCaseIssueLinks.role, "automation"),
+              eq(pipelineCaseIssueLinks.automationAttemptId, plan.previousAttemptId),
+              isNull(pipelineCaseIssueLinks.retiredAt),
+            ));
+          for (const { linkId } of previousAttemptLinks) {
+            await retireStageAutomationLink(tx, {
+              companyId: input.companyId,
+              linkId,
+              caseTitle: detail.case.title,
+              caseKey: detail.case.caseKey,
+              stageName: plan.targetStageRow.name,
+              runningRunIdsToCancel,
+            });
+          }
+        }
+        if (!exitsCurrentStage && issueIdsToCancel.length > 0) {
           const cancelledIssues = await tx
             .update(issues)
             .set({ status: "cancelled", updatedAt: now })
@@ -5200,6 +5223,21 @@ export function pipelineService(db: Db, deps: { heartbeat?: PipelineHeartbeatDep
             code: "automation_not_configured",
           });
         }
+        await writeCaseEvent(tx, {
+          companyId: input.companyId,
+          caseId: input.caseId,
+          type: "automation_retry_dispatched",
+          actor: input.actor,
+          toStageId: detail.stage.id,
+          payload: {
+            action: "stage_automation_rerun_dispatched",
+            automationId: automation.id,
+            routineId: automation.routineId,
+            targetStageId: detail.stage.id,
+            targetStageKey: detail.stage.key,
+            retryAttemptId: nextLedger.id,
+          },
+        });
         return nextLedger;
       });
       const automationExecution = await executeAutomationLedger(ledger.id, input.actor);
