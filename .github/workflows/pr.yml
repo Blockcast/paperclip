@@ -86,6 +86,22 @@ jobs:
       - name: Test no-git-push check
         run: node --test ./scripts/check-no-git-push.test.mjs
 
+      - name: Reject App-attributed commits on the PR (BLO-21416)
+        # Non-merge commits stamped with the shared allyblockcast[bot] App
+        # identity mean the commit was created via the GitHub REST/MCP write
+        # path (contents API, merge API, `create_or_update_file`/
+        # `push_files`) instead of `git push` — see AGENTS.md §9. Uses the
+        # already-checked-out history (fetch-depth: 0 above), no new token.
+        # Exempts the graphify-reindex bot branch: that automation's PRs are
+        # legitimately App-authored end-to-end (see run-quality-gates.mjs
+        # GRAPHIFY_REINDEX_BRANCH), unlike an agent's branch merely opened
+        # via the API.
+        if: github.head_ref != 'bot/graphify-reindex'
+        run: node ./scripts/check-commit-author-attribution.mjs --base "$PR_BASE_SHA" --head "$PR_HEAD_SHA"
+
+      - name: Test commit-author-attribution check
+        run: node --test ./scripts/check-commit-author-attribution.test.mjs
+
       - name: Test gh token wrapper
         run: node --test ./scripts/gh-token-wrapper.test.mjs
 
