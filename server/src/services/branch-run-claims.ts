@@ -55,17 +55,58 @@ function isConstraintConflict(error: unknown, expectedConstraint: string): boole
 }
 
 /**
- * Normalizes a repo + branch pair into the key branch_run_claims enforces
- * uniqueness on. Case-insensitive and trims a trailing `.git`/slash so
- * `git@github.com:Org/repo.git` and `https://github.com/Org/repo/` collide
- * on the same branch as intended.
+ * Canonicalizes a git remote URL to a `host/path` identity so the SSH
+ * (`git@github.com:org/repo.git`), scp-like SSH with an explicit scheme
+ * (`ssh://git@github.com/org/repo.git`), and HTTPS (`https://github.com/org/repo`)
+ * forms of the *same* remote all collide on the same identity. Case-insensitive
+ * and trims a trailing `.git`/slash. Falls back to a lowercase/trimmed copy of
+ * the raw input for anything that doesn't match a recognized remote form,
+ * rather than throwing -- an unrecognized value still needs a stable, if
+ * narrower, identity.
  */
-export function computeBranchClaimKey(input: { repoUrl: string | null; branchName: string }): string {
-  const normalizedRepo = (input.repoUrl ?? "unknown")
-    .trim()
+function canonicalizeGitRemoteIdentity(repoUrl: string): string {
+  const trimmed = repoUrl.trim();
+  if (!trimmed) return "unknown";
+
+  const stripPath = (path: string) =>
+    path
+      .replace(/^\/+/, "")
+      .replace(/\.git\/?$/, "")
+      .replace(/\/+$/, "")
+      .toLowerCase();
+
+  // scp-like SSH syntax has no "://", e.g. `git@github.com:org/repo.git`.
+  if (!trimmed.includes("://")) {
+    const scpMatch = trimmed.match(/^(?:[^@/\s]+@)?([^:/\s]+):(.+)$/);
+    if (scpMatch) {
+      const [, host, path] = scpMatch;
+      return `${host.toLowerCase()}/${stripPath(path)}`;
+    }
+  } else {
+    // Schemed forms: https://, http://, ssh://, git://, git+ssh://, ...
+    try {
+      const parsed = new URL(trimmed);
+      if (parsed.hostname) {
+        return `${parsed.hostname.toLowerCase()}/${stripPath(parsed.pathname)}`;
+      }
+    } catch {
+      // fall through to the opaque fallback below
+    }
+  }
+
+  return trimmed
     .toLowerCase()
     .replace(/\.git\/?$/, "")
     .replace(/\/+$/, "");
+}
+
+/**
+ * Normalizes a repo + branch pair into the key branch_run_claims enforces
+ * uniqueness on, so `git@github.com:Org/repo.git`, `ssh://git@github.com/Org/repo`,
+ * and `https://github.com/Org/repo/` all collide on the same branch.
+ */
+export function computeBranchClaimKey(input: { repoUrl: string | null; branchName: string }): string {
+  const normalizedRepo = input.repoUrl ? canonicalizeGitRemoteIdentity(input.repoUrl) : "unknown";
   return `${normalizedRepo}#${input.branchName}`;
 }
 
