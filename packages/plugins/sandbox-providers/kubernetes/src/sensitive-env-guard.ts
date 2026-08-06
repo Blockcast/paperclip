@@ -12,7 +12,8 @@
 // It does NOT mirror any protection in the external claude_k8s adapter, which
 // is the code that actually renders production agent-job pods. As of the SHA
 // pinned by `Dockerfile` (`CLAUDE_K8S_REF=3ad3370`), that adapter applies no
-// allowlist, denylist, or filter of any kind on the pod-env path.
+// security allowlist, denylist, or sensitivity-based filter on the pod-env
+// path.
 // `getSelfPodInfo()` (`k8s-client.ts:111-197`) selects one container off the
 // server pod — the one named `paperclip`, else the first — and extracts that
 // container's credential-bearing channels: literal `env[].value`s, `valueFrom`
