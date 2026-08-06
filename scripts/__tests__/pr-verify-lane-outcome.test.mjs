@@ -53,6 +53,7 @@ function runVerifyStep(results) {
     TYPECHECK_RELEASE_REGISTRY_RESULT: results.typecheck_release_registry ?? "success",
     GENERAL_TESTS_RESULT: results.general_tests ?? "success",
     WORKTREE_INSTALL_RESULT: results.worktree_install ?? "success",
+    OPENCODE_RESPONSES_REPLAY_RESULT: results.opencode_responses_replay ?? "success",
     BUILD_RESULT: results.build ?? "success",
     VERIFY_SERIALIZED_SERVER_RESULT: results.verify_serialized_server ?? "success",
   };
