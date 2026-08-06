@@ -56,6 +56,7 @@ async function runGuard({
   const cancelCalls = [];
   const warnings = [];
   const infos = [];
+  const outputs = {};
   const queuedResponses = [...responses];
   const github = {
     graphql: async (_query, variables) => {
@@ -81,6 +82,9 @@ async function runGuard({
     warning(message) {
       warnings.push(message);
     },
+    setOutput(name, value) {
+      outputs[name] = String(value);
+    },
   };
   const context = {
     repo: { owner: "Blockcast", repo: "paperclip" },
@@ -88,13 +92,15 @@ async function runGuard({
   };
 
   await fn(github, core, context, { env: { HEAD_SHA: headSha, QUEUE_BRANCH: branch } });
-  return { graphqlCalls, cancelCalls, warnings, infos };
+  return { graphqlCalls, cancelCalls, warnings, infos, outputs };
 }
 
 test("merge-queue guard is isolated from the checkout policy job", () => {
   const guardBlock = extractBlock("\n  merge_queue_guard:\n", "\n  policy:\n");
   assert.match(guardBlock, /\n    if: github\.event_name == 'merge_group'\n/);
   assert.match(guardBlock, /\n      actions: write\n/);
+  assert.match(guardBlock, /\n    outputs:\n      live: \$\{\{ steps\.guard\.outputs\.live \}\}\n/);
+  assert.match(guardBlock, /\n        id: guard\n/);
   assert.doesNotMatch(guardBlock, /actions\/checkout/);
   assert.doesNotMatch(guardBlock, /pnpm|node --test|git diff/);
 
@@ -136,8 +142,8 @@ test("every arc-light root job waits for the merge-queue guard before consuming 
     );
     assert.match(
       block,
-      /\n    if: "!cancelled\(\) && \(needs\.merge_queue_guard\.result == 'success' \|\| needs\.merge_queue_guard\.result == 'skipped'\)"\n/,
-      `${job} must fail open when the guard is skipped (pull_request) or succeeded (merge_group, still live)`,
+      /\n    if: "!cancelled\(\) && \(needs\.merge_queue_guard\.result == 'skipped' \|\| \(needs\.merge_queue_guard\.result == 'success' && needs\.merge_queue_guard\.outputs\.live == 'true'\)\)"\n/,
+      `${job} must fail open when the guard is skipped (pull_request) or explicitly reports a live merge_group run`,
     );
   }
 });
@@ -199,10 +205,25 @@ test("every job downstream of policy scopes its own success check instead of inh
   );
 });
 
+test("verify does not consume a runner for stale merge-queue generations", () => {
+  const verifyBlock = extractBlock("\n  verify:\n", "\n  build:\n");
+  assert.match(
+    verifyBlock,
+    /\n    if: "!cancelled\(\) && \(needs\.merge_queue_guard\.result == 'skipped' \|\| \(needs\.merge_queue_guard\.result == 'success' && needs\.merge_queue_guard\.outputs\.live == 'true'\)\)"\n/,
+    "verify must remain cancellation-aware and skip when the guard conclusively reports a stale merge_group run",
+  );
+  assert.match(
+    verifyBlock,
+    /\n    needs:\n      \[\n        merge_queue_guard,\n/,
+    "verify must depend directly on merge_queue_guard so it can read the live output",
+  );
+});
+
 test("live membership on the first page continues without cancelling", async () => {
   const result = await runGuard({
     responses: [responseFor(["other", "head-sha"])],
   });
+  assert.equal(result.outputs.live, "true");
   assert.equal(result.cancelCalls.length, 0);
   assert.match(result.infos.join("\n"), /still a live merge-queue entry/);
 });
@@ -216,15 +237,36 @@ test("complete lookup that excludes the head sha cancels the workflow run", asyn
     repo: "paperclip",
     run_id: 123456789,
   }]);
+  assert.equal(result.outputs.live, "false");
   assert.match(result.infos.join("\n"), /not a live merge-queue entry/);
 });
 
-test("GraphQL errors are inconclusive and fail open", async () => {
+test("GraphQL transport errors are inconclusive and fail open", async () => {
   const result = await runGuard({
     responses: [new Error("GraphQL: permission denied")],
   });
+  assert.equal(result.outputs.live, "true");
   assert.equal(result.cancelCalls.length, 0);
   assert.match(result.warnings.join("\n"), /lookup failed/);
+});
+
+test("GraphQL error payloads are inconclusive and fail open", async () => {
+  const result = await runGuard({
+    responses: [{
+      errors: [{ message: "mergeQueue field unavailable" }],
+      repository: {
+        mergeQueue: {
+          entries: {
+            nodes: [],
+            pageInfo: { hasNextPage: false, endCursor: null },
+          },
+        },
+      },
+    }],
+  });
+  assert.equal(result.outputs.live, "true");
+  assert.equal(result.cancelCalls.length, 0);
+  assert.match(result.warnings.join("\n"), /GraphQL errors/);
 });
 
 test("malformed or partial GraphQL data is inconclusive and fails open", async () => {
@@ -237,6 +279,7 @@ test("malformed or partial GraphQL data is inconclusive and fails open", async (
     { repository: { mergeQueue: { entries: { nodes: [], pageInfo: { hasNextPage: "false" } } } } },
   ]) {
     const result = await runGuard({ responses: [response] });
+    assert.equal(result.outputs.live, "true", `must report live for ${JSON.stringify(response)}`);
     assert.equal(result.cancelCalls.length, 0, `must not cancel for ${JSON.stringify(response)}`);
     assert.match(result.warnings.join("\n"), /malformed data/);
   }
@@ -249,6 +292,7 @@ test("pagination continues until a live entry is found", async () => {
       responseFor(["head-sha"], { hasNextPage: false, endCursor: null }),
     ],
   });
+  assert.equal(result.outputs.live, "true");
   assert.equal(result.cancelCalls.length, 0);
   assert.equal(result.graphqlCalls.length, 2);
   assert.equal(result.graphqlCalls[0].cursor, null);
@@ -262,6 +306,7 @@ test("paginated complete lookup cancels only after all pages exclude the head sh
       responseFor(["other-b"], { hasNextPage: false, endCursor: null }),
     ],
   });
+  assert.equal(result.outputs.live, "false");
   assert.equal(result.cancelCalls.length, 1);
   assert.equal(result.graphqlCalls.length, 2);
 });
@@ -272,8 +317,21 @@ test("truncated page without an end cursor is inconclusive and fails open", asyn
       responseFor(["other-a"], { hasNextPage: true, endCursor: "" }),
     ],
   });
+  assert.equal(result.outputs.live, "true");
   assert.equal(result.cancelCalls.length, 0);
   assert.match(result.warnings.join("\n"), /without an endCursor/);
+});
+
+test("pagination safety cap is inconclusive and fails open", async () => {
+  const result = await runGuard({
+    responses: Array.from({ length: 100 }, (_, index) => (
+      responseFor([`other-${index}`], { hasNextPage: true, endCursor: `cursor-${index}` })
+    )),
+  });
+  assert.equal(result.outputs.live, "true");
+  assert.equal(result.cancelCalls.length, 0);
+  assert.equal(result.graphqlCalls.length, 100);
+  assert.match(result.warnings.join("\n"), /pagination safety cap/);
 });
 
 test("cancellation API failures do not fail the guard job", async () => {
@@ -281,6 +339,7 @@ test("cancellation API failures do not fail the guard job", async () => {
     responses: [responseFor(["other-a"])],
     cancelError: new Error("cancel endpoint unavailable"),
   });
+  assert.equal(result.outputs.live, "false");
   assert.equal(result.cancelCalls.length, 1);
   assert.match(result.warnings.join("\n"), /failed to cancel superseded run/);
 });

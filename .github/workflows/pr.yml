@@ -28,6 +28,8 @@ jobs:
     permissions:
       contents: read
       actions: write
+    outputs:
+      live: ${{ steps.guard.outputs.live }}
     steps:
       # BLO-21953: the workflow-level `concurrency.group` above is keyed on
       # `merge_group.head_sha` for merge_group events. That SHA is the composed
@@ -35,9 +37,11 @@ jobs:
       # never fires across a PR's successive merge-queue attempts -- superseded
       # generations pile up and starve the shared runner pool. This pre-policy
       # job performs no checkout; it only asks the merge queue whether the
-      # current composed SHA is still live and cancels this run on conclusive
-      # stale evidence. All lookup and cancellation errors fail open.
+      # current composed SHA is still live. Lookup errors fail open; conclusive
+      # stale evidence is exported as `live=false` before requesting
+      # cancellation so descendants do not rely on cancellation propagation.
       - name: Cancel if superseded by merge-queue re-stage
+        id: guard
         uses: actions/github-script@v8
         env:
           HEAD_SHA: ${{ github.event.merge_group.head_sha }}
@@ -47,6 +51,10 @@ jobs:
             const headSha = process.env.HEAD_SHA;
             const branch = process.env.QUEUE_BRANCH;
             const { owner, repo } = context.repo;
+            const continueAsLive = (message) => {
+              core.setOutput("live", "true");
+              core.warning(message);
+            };
             const query = `
               query($owner:String!, $repo:String!, $branch:String!, $cursor:String) {
                 repository(owner: $owner, name: $repo) {
@@ -74,7 +82,12 @@ jobs:
               try {
                 result = await github.graphql(query, { owner, repo, branch, cursor });
               } catch (error) {
-                core.warning(`merge-queue lookup failed: ${error.message}; not cancelling (fail open)`);
+                continueAsLive(`merge-queue lookup failed: ${error.message}; not cancelling (fail open)`);
+                return;
+              }
+
+              if (Array.isArray(result?.errors) && result.errors.length > 0) {
+                continueAsLive("merge-queue lookup returned GraphQL errors; not cancelling (fail open)");
                 return;
               }
 
@@ -85,11 +98,12 @@ jobs:
                 !entries.pageInfo ||
                 typeof entries.pageInfo.hasNextPage !== "boolean"
               ) {
-                core.warning("merge-queue lookup returned malformed data; not cancelling (fail open)");
+                continueAsLive("merge-queue lookup returned malformed data; not cancelling (fail open)");
                 return;
               }
 
               if (entries.nodes.some((node) => node?.headCommit?.oid === headSha)) {
+                core.setOutput("live", "true");
                 core.info(`${headSha} is still a live merge-queue entry; continuing`);
                 return;
               }
@@ -100,18 +114,19 @@ jobs:
               }
 
               if (typeof entries.pageInfo.endCursor !== "string" || entries.pageInfo.endCursor.length === 0) {
-                core.warning("merge-queue lookup was paginated without an endCursor; not cancelling (fail open)");
+                continueAsLive("merge-queue lookup was paginated without an endCursor; not cancelling (fail open)");
                 return;
               }
               cursor = entries.pageInfo.endCursor;
             }
 
             if (exceededPaginationCap) {
-              core.warning("merge-queue lookup exceeded the pagination safety cap; not cancelling (fail open)");
+              continueAsLive("merge-queue lookup exceeded the pagination safety cap; not cancelling (fail open)");
               return;
             }
 
             core.info(`${headSha} is not a live merge-queue entry after a complete lookup; cancelling this run`);
+            core.setOutput("live", "false");
             try {
               await github.rest.actions.cancelWorkflowRun({
                 owner,
@@ -131,7 +146,7 @@ jobs:
     # `if` keeps the pull_request path working, where `merge_queue_guard`
     # never runs and reports `skipped` rather than `success`.
     needs: [merge_queue_guard]
-    if: "!cancelled() && (needs.merge_queue_guard.result == 'success' || needs.merge_queue_guard.result == 'skipped')"
+    if: "!cancelled() && (needs.merge_queue_guard.result == 'skipped' || (needs.merge_queue_guard.result == 'success' && needs.merge_queue_guard.outputs.live == 'true'))"
     runs-on: arc-light
     timeout-minutes: 5
     permissions:
@@ -295,7 +310,7 @@ jobs:
     # independent arc-light root that must wait behind the merge-queue guard
     # instead of racing it for a runner.
     needs: [merge_queue_guard]
-    if: "!cancelled() && (needs.merge_queue_guard.result == 'success' || needs.merge_queue_guard.result == 'skipped')"
+    if: "!cancelled() && (needs.merge_queue_guard.result == 'skipped' || (needs.merge_queue_guard.result == 'success' && needs.merge_queue_guard.outputs.live == 'true'))"
     runs-on: arc-light
     timeout-minutes: 10
 
@@ -556,9 +571,10 @@ jobs:
     # gate. See the issue for the measured latency tradeoff of putting a
     # ~90-minute job on the required path this way.
     name: verify
-    if: ${{ always() }}
+    if: "!cancelled() && (needs.merge_queue_guard.result == 'skipped' || (needs.merge_queue_guard.result == 'success' && needs.merge_queue_guard.outputs.live == 'true'))"
     needs:
       [
+        merge_queue_guard,
         helm_chart,
         typecheck_release_registry,
         general_tests,
