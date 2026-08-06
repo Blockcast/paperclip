@@ -17,6 +17,8 @@ export type BranchRunClaim = typeof branchRunClaims.$inferSelect;
 
 const ACTIVE_BRANCH_CONSTRAINT = "branch_run_claims_active_branch_idx";
 const DEFAULT_BRANCH_CLAIM_LEASE_MS = 30 * 60 * 1000;
+type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
+type BranchClaimReadDb = Pick<Db | DbTransaction, "select">;
 
 export class BranchClaimConflictError extends Error {
   readonly code = "branch_claim_conflict";
@@ -110,14 +112,17 @@ export function computeBranchClaimKey(input: { repoUrl: string | null; branchNam
   return `${normalizedRepo}#${input.branchName}`;
 }
 
-async function isTerminalOrMissingHeartbeatRun(db: Db, runId: string): Promise<boolean> {
+async function getHeartbeatRunState(
+  db: BranchClaimReadDb,
+  runId: string,
+): Promise<"live" | "missing" | "terminal"> {
   const run = await db
     .select({ status: heartbeatRuns.status })
     .from(heartbeatRuns)
     .where(eq(heartbeatRuns.id, runId))
     .then((rows) => rows[0] ?? null);
-  if (!run) return true;
-  return TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status);
+  if (!run) return "missing";
+  return TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status) ? "terminal" : "live";
 }
 
 export async function acquireBranchRunClaim(
@@ -159,9 +164,8 @@ export async function acquireBranchRunClaim(
             .then((rows) => rows[0]!);
         }
 
-        const stale = existing.expiresAt.getTime() < now.getTime()
-          || (await isTerminalOrMissingHeartbeatRun(tx, existing.heartbeatRunId));
-        if (!stale) {
+        const holderState = await getHeartbeatRunState(tx, existing.heartbeatRunId);
+        if (holderState === "live") {
           throw new BranchClaimConflictError(input.runId, input.branchKey, existing.heartbeatRunId, existing.issueId);
         }
 
@@ -169,7 +173,7 @@ export async function acquireBranchRunClaim(
           .update(branchRunClaims)
           .set({
             releasedAt: now,
-            releaseReason: existing.expiresAt.getTime() < now.getTime() ? "lease_expired" : "holder_run_terminal",
+            releaseReason: holderState === "missing" ? "holder_run_missing" : "holder_run_terminal",
             updatedAt: now,
           })
           .where(and(eq(branchRunClaims.id, existing.id), isNull(branchRunClaims.releasedAt)));
@@ -181,6 +185,8 @@ export async function acquireBranchRunClaim(
             supersededIssueId: existing.issueId,
             claimingRunId: input.runId,
             claimingIssueId: input.issueId,
+            holderState,
+            previousExpiresAt: existing.expiresAt.toISOString(),
           },
           "Superseded a stale branch run claim",
         );

@@ -45,11 +45,13 @@ describe("computeBranchClaimKey", () => {
   it("collides SSH scp-like, ssh://, and https:// forms of the same repo", () => {
     const scpLike = computeBranchClaimKey({ repoUrl: "git@github.com:Blockcast/paperclip.git", branchName });
     const sshUrl = computeBranchClaimKey({ repoUrl: "ssh://git@github.com/Blockcast/paperclip.git", branchName });
+    const gitSshUrl = computeBranchClaimKey({ repoUrl: "git+ssh://git@github.com/Blockcast/paperclip.git/", branchName });
     const https = computeBranchClaimKey({ repoUrl: "https://github.com/Blockcast/paperclip", branchName });
     const httpsTrailingGitSlash = computeBranchClaimKey({ repoUrl: "https://github.com/Blockcast/paperclip.git/", branchName });
     const mixedCase = computeBranchClaimKey({ repoUrl: "https://GitHub.com/Blockcast/Paperclip.git", branchName });
 
     expect(sshUrl).toBe(scpLike);
+    expect(gitSshUrl).toBe(scpLike);
     expect(https).toBe(scpLike);
     expect(httpsTrailingGitSlash).toBe(scpLike);
     expect(mixedCase).toBe(scpLike);
@@ -68,6 +70,7 @@ describe("computeBranchClaimKey", () => {
 
   it("falls back to a stable opaque key for a null or unrecognized repo url", () => {
     expect(computeBranchClaimKey({ repoUrl: null, branchName })).toBe(`unknown#${branchName}`);
+    expect(computeBranchClaimKey({ repoUrl: "  ", branchName })).toBe(`unknown#${branchName}`);
     const localPathA = computeBranchClaimKey({ repoUrl: "/srv/repos/paperclip", branchName });
     const localPathB = computeBranchClaimKey({ repoUrl: "/srv/repos/paperclip", branchName });
     expect(localPathA).toBe(localPathB);
@@ -256,6 +259,59 @@ describeEmbeddedPostgres("branch run claims", () => {
     expect(conflict).toMatchObject({ holderRunId: holder.runId, holderIssueId: holder.issueId });
   });
 
+  it("keeps an expired claim owned by a still-running holder", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const holder = await seedIssueAndRunningRun({ companyId, agentId, title: "Live holder" });
+    const challenger = await seedIssueAndRunningRun({ companyId, agentId, title: "Challenger" });
+    const branchKey = computeBranchClaimKey({
+      repoUrl: "git@github.com:Blockcast/paperclip.git",
+      branchName: "cto/live-holder",
+    });
+    const acquiredAt = new Date("2026-08-06T00:00:00.000Z");
+
+    const firstClaim = await acquireBranchRunClaim(db, {
+      companyId,
+      branchKey,
+      executionWorkspaceId: null,
+      issueId: holder.issueId,
+      runId: holder.runId,
+      agentId,
+      now: acquiredAt,
+      leaseMs: 1_000,
+    });
+    expect(firstClaim.expiresAt.getTime()).toBeLessThan(new Date("2026-08-06T00:01:00.000Z").getTime());
+
+    const conflict = await acquireBranchRunClaim(db, {
+      companyId,
+      branchKey,
+      executionWorkspaceId: null,
+      issueId: challenger.issueId,
+      runId: challenger.runId,
+      agentId,
+      now: new Date("2026-08-06T00:01:00.000Z"),
+      leaseMs: 1_000,
+    }).catch((error) => error);
+
+    expect(conflict).toBeInstanceOf(BranchClaimConflictError);
+    expect(conflict).toMatchObject({
+      holderRunId: holder.runId,
+      holderIssueId: holder.issueId,
+      branchKey,
+    });
+
+    const claimRows = await db
+      .select()
+      .from(branchRunClaims)
+      .where(eq(branchRunClaims.branchKey, branchKey));
+    expect(claimRows).toHaveLength(1);
+    expect(claimRows[0]).toMatchObject({
+      heartbeatRunId: holder.runId,
+      issueId: holder.issueId,
+      releasedAt: null,
+      releaseReason: null,
+    });
+  });
+
   it("allows two different issues' runs to proceed when they resolve to different branches", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const issueA = await seedIssueAndRunningRun({ companyId, agentId, title: "Issue A" });
@@ -313,6 +369,57 @@ describeEmbeddedPostgres("branch run claims", () => {
       agentId,
     });
     expect(supersededClaim.heartbeatRunId).toBe(challenger.runId);
+  });
+
+  it("lets an unreleased claim from a terminal run be superseded", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const deadHolder = await seedIssueAndRunningRun({
+      companyId,
+      agentId,
+      title: "Already terminal holder",
+      status: "failed",
+    });
+    const challenger = await seedIssueAndRunningRun({ companyId, agentId, title: "Challenger" });
+    const branchKey = computeBranchClaimKey({
+      repoUrl: "https://github.com/Blockcast/paperclip.git",
+      branchName: "terminal-holder-branch",
+    });
+
+    await acquireBranchRunClaim(db, {
+      companyId,
+      branchKey,
+      executionWorkspaceId: null,
+      issueId: deadHolder.issueId,
+      runId: deadHolder.runId,
+      agentId,
+      now: new Date("2026-08-06T00:00:00.000Z"),
+      leaseMs: 1_000,
+    });
+
+    const supersededClaim = await acquireBranchRunClaim(db, {
+      companyId,
+      branchKey,
+      executionWorkspaceId: null,
+      issueId: challenger.issueId,
+      runId: challenger.runId,
+      agentId,
+      now: new Date("2026-08-06T00:01:00.000Z"),
+      leaseMs: 1_000,
+    });
+    expect(supersededClaim.heartbeatRunId).toBe(challenger.runId);
+
+    const claimRows = await db
+      .select()
+      .from(branchRunClaims)
+      .where(eq(branchRunClaims.branchKey, branchKey));
+    expect(claimRows.find((row) => row.heartbeatRunId === deadHolder.runId)).toMatchObject({
+      releasedAt: expect.any(Date),
+      releaseReason: "holder_run_terminal",
+    });
+    expect(claimRows.find((row) => row.heartbeatRunId === challenger.runId)).toMatchObject({
+      releasedAt: null,
+      releaseReason: null,
+    });
   });
 
   it("releases the claim automatically when the holding run's status trigger fires terminal", async () => {
