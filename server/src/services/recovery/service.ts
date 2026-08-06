@@ -4946,11 +4946,11 @@ export function recoveryService(
 
       const claimed = await issuesSvc.update(
         input.issue.id,
-        { status: "blocked" },
-        tx,
         {
-          expectedStatus: [input.previousStatus, "blocked"],
+          status: "blocked",
+          expectedCurrentStatus: fresh.status,
         },
+        tx,
       );
       if (!claimed) return null;
 
@@ -4971,9 +4971,9 @@ export function recoveryService(
         {
           blockedByIssueIds: blockerIds,
           assigneeAgentId: routing.ownerAgentId ?? fresh.assigneeAgentId,
+          expectedCurrentStatus: "blocked",
         },
         tx,
-        { expectedStatus: ["blocked"] },
       ) ?? claimed;
 
       const { action, hasNewActivitySinceLastAttempt } = await ensureSourceScopedStrandedRecoveryAction({
