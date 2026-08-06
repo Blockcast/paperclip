@@ -126,10 +126,14 @@ const ACTIVE_BROKER_RUN_STATUSES = new Set(["running"]);
 const REMOTE_HTTP_REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 const MAX_REMOTE_HTTP_REDIRECTS = 5;
 /**
- * recordInvocation() inserts a pending toolActionRequests row before the
- * async approval-snapshot + signing step that fills in signedArguments
- * (BLO-21490). A read that lands in that window must not treat the row as
- * corrupt — only auto-cancel once it's had time to finish signing.
+ * recordInvocation() inserts a pending toolActionRequests row with
+ * signedArguments=null before the async approval-snapshot + signing step
+ * backfills it (BLO-21490). A read that lands in that window must not treat
+ * the still-uninitialized row as corrupt — only auto-cancel it once it's had
+ * time to finish signing. The grace applies ONLY to that null-initialization
+ * state: a row whose invocation is missing, or whose signedArguments is
+ * already non-null but fails to verify, is a real integrity failure and gets
+ * cancelled immediately regardless of age.
  */
 const ACTION_REQUEST_SIGNING_GRACE_MS = 30_000;
 
@@ -5686,12 +5690,20 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         const signingGraceCutoff = Date.now() - ACTION_REQUEST_SIGNING_GRACE_MS;
         const invalidRequestIds = requests
           .filter((request) => {
-            // Still within the grace period: recordInvocation() may not have
-            // finished the async sign-and-backfill UPDATE yet. Don't treat
-            // an unsigned-so-far row as corrupt (BLO-21490).
-            if (request.createdAt.getTime() > signingGraceCutoff) return false;
+            // An orphaned row (no matching invocation) is never a
+            // signing-in-progress state — always invalid, grace or not.
             const invocation = invocationById.get(request.invocationId);
             if (!invocation) return true;
+            // Only the uninitialized signedArguments===null state gets the
+            // grace period: recordInvocation() may not have finished the
+            // async sign-and-backfill UPDATE yet, so don't treat a
+            // not-yet-signed row as corrupt (BLO-21490). A row that already
+            // carries a (malformed/stale-secret) signature is a real
+            // integrity failure and is validated immediately, regardless of
+            // age — the grace period must not mask that.
+            if (request.signedArguments === null) {
+              return request.createdAt.getTime() <= signingGraceCutoff;
+            }
             try {
               return !readSignedToolArgumentsPayload({
                 signedArguments: request.signedArguments,
