@@ -131,6 +131,11 @@ import {
   requireExternalRuntimeExecutionOwnership,
   refreshExternalRuntimeReservationMetrics,
 } from "./external-runtime-reservations.js";
+import {
+  acquireBranchRunClaim,
+  BranchClaimConflictError,
+  computeBranchClaimKey,
+} from "./branch-run-claims.js";
 import { getServerAdapter, listAdapterModelProfiles, runningProcesses } from "../adapters/index.js";
 import type {
   AdapterRunIsolationDescriptor,
@@ -573,6 +578,8 @@ const K8S_ISOLATION_RETRY_ATTEMPT_CONTEXT_KEY = "paperclipK8sIsolationRetryAttem
 const K8S_ISOLATION_RETRY_AT_CONTEXT_KEY = "paperclipK8sIsolationRetryAt";
 const K8S_ISOLATION_RETRY_BASE_DELAY_MS = 15_000;
 const K8S_ISOLATION_RETRY_MAX_DELAY_MS = 5 * 60_000;
+const BRANCH_CLAIM_RETRY_ATTEMPT_CONTEXT_KEY = "paperclipBranchClaimRetryAttempt";
+const BRANCH_CLAIM_RETRY_AT_CONTEXT_KEY = "paperclipBranchClaimRetryAt";
 // Rate-limit retries (errorFamily = "rate_limit_exhausted") use a flat short
 // delay instead of stacking exponential backoff. Rationale: rate-limit isn't
 // a transient upstream fault — it means "this account's window is closed".
@@ -21964,6 +21971,97 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return deferredRun;
   }
 
+  // BLO-21602: mirrors deferRunForK8sIsolationConflict -- a branch claim
+  // conflict is a normal, expected race (two runs starting close together on
+  // issues that share a branch), not a failure. Send this run back to
+  // `queued` with backoff rather than failing it, and name the holder
+  // (run + issue) on the run event so the loser has an actionable signal.
+  async function deferRunForBranchClaimConflict(
+    run: typeof heartbeatRuns.$inferSelect,
+    conflict: BranchClaimConflictError,
+  ) {
+    const latestRun = await getRun(run.id);
+    if (!latestRun || latestRun.status !== "running") return null;
+
+    const now = new Date();
+    const context = parseObject(latestRun.contextSnapshot);
+    const retryAttempt = Math.max(
+      1,
+      Math.floor(asNumber(context[BRANCH_CLAIM_RETRY_ATTEMPT_CONTEXT_KEY], 0)) + 1,
+    );
+    const retryAt = new Date(now.getTime() + computeK8sIsolationRetryDelayMs(retryAttempt));
+    context[BRANCH_CLAIM_RETRY_ATTEMPT_CONTEXT_KEY] = retryAttempt;
+    context[BRANCH_CLAIM_RETRY_AT_CONTEXT_KEY] = retryAt.toISOString();
+
+    const deferredRun = await db
+      .update(heartbeatRuns)
+      .set({
+        status: "queued",
+        startedAt: null,
+        finishedAt: null,
+        error: null,
+        errorCode: null,
+        externalRunId: null,
+        processPid: null,
+        processGroupId: null,
+        processStartedAt: null,
+        contextSnapshot: context,
+        updatedAt: now,
+      })
+      .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "running")))
+      .returning()
+      .then((rows) => rows[0] ?? null);
+    if (!deferredRun) return null;
+
+    await setWakeupStatus(deferredRun.wakeupRequestId, "queued", {
+      claimedAt: null,
+      finishedAt: null,
+      error: null,
+    });
+    await appendRunEvent(deferredRun, await nextRunEventSeq(deferredRun.id), {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "info",
+      message: "Deferred run because another active run already claims this branch",
+      payload: {
+        branchKey: conflict.branchKey,
+        holderRunId: conflict.holderRunId,
+        holderIssueId: conflict.holderIssueId,
+        retryAttempt,
+        retryAt: retryAt.toISOString(),
+      },
+    });
+    publishLiveEvent({
+      companyId: deferredRun.companyId,
+      type: "heartbeat.run.status",
+      payload: {
+        runId: deferredRun.id,
+        agentId: deferredRun.agentId,
+        status: deferredRun.status,
+        invocationSource: deferredRun.invocationSource,
+        triggerDetail: deferredRun.triggerDetail,
+        error: null,
+        errorCode: null,
+        startedAt: null,
+        finishedAt: null,
+      },
+    });
+    publishRunLifecyclePluginEvent(deferredRun);
+    logger.info(
+      {
+        runId: deferredRun.id,
+        agentId: deferredRun.agentId,
+        branchKey: conflict.branchKey,
+        holderRunId: conflict.holderRunId,
+        holderIssueId: conflict.holderIssueId,
+        retryAttempt,
+        retryAt: retryAt.toISOString(),
+      },
+      "deferred run behind active branch claim",
+    );
+    return deferredRun;
+  }
+
   async function executeRun(runId: string) {
     if ((await getSchedulingSuppression()).suppressed) return;
 
@@ -21987,6 +22085,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     activeRunExecutions.add(run.id);
     let deferredForK8sIsolationConflict = false;
+    let deferredForBranchClaimConflict = false;
     // BLO-16537: set when this invocation discovers its own run-scoped Job is
     // still alive after the adapter refused to (re)launch it (see the guard
     // below). The run/reservation/lease are intentionally left untouched, so
@@ -23053,6 +23152,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
       }
       throw error;
+    }
+    // BLO-21602: the issue-scoped checkoutRunId/executionRunId guard cannot
+    // see contention between two DIFFERENT issues that resolve to the same
+    // branch (parent + child sharing one execution workspace, or any
+    // operator_branch/reuse_existing pairing) -- each independently passes
+    // its own issue-scoped ownership check. Claim the branch itself here,
+    // right after it's resolved to a concrete name, so a sibling run already
+    // holding it is refused before this run can produce a divergent commit.
+    // Throwing BranchClaimConflictError here is caught by the outer
+    // `catch (outerErr)` below and deferred back to `queued`, mirroring
+    // ExternalRuntimeIsolationConflictError / deferRunForK8sIsolationConflict.
+    if (issueRef && branchNameForInitialPersistence) {
+      await acquireBranchRunClaim(db, {
+        companyId: agent.companyId,
+        branchKey: computeBranchClaimKey({
+          repoUrl: persistedExecutionWorkspace?.repoUrl ?? executionWorkspace.repoUrl ?? null,
+          branchName: branchNameForInitialPersistence,
+        }),
+        executionWorkspaceId: persistedExecutionWorkspace?.id ?? null,
+        issueId: issueRef.id,
+        runId: run.id,
+        agentId: agent.id,
+      });
     }
     await workspaceOperationRecorder.attachExecutionWorkspaceId(persistedExecutionWorkspace?.id ?? null);
     await recordWorkspaceConfigFreshnessOperation({
@@ -25270,6 +25392,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       await finalizeAgentStatus(agent.id, "failed", message);
     }
     } catch (outerErr) {
+          if (outerErr instanceof BranchClaimConflictError) {
+            try {
+              const deferredRun = await deferRunForBranchClaimConflict(run, outerErr);
+              if (deferredRun) {
+                deferredForBranchClaimConflict = true;
+                await finalizeAgentStatus(run.agentId, "cancelled").catch(() => undefined);
+              }
+              return;
+            } catch (deferError) {
+              logger.error(
+                { err: deferError, runId, branchKey: outerErr.branchKey },
+                "failed to defer run after branch-claim contention",
+              );
+            }
+          }
           if (outerErr instanceof ExternalRuntimeIsolationConflictError) {
             try {
               const deferredRun = await deferRunForK8sIsolationConflict(run, outerErr);
@@ -25487,7 +25624,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // pass the agent process exit code and adapter type to the hook
           // for branching (e.g. only refresh the cache on success, or only
           // for `_k8s` adapters).
-          if (!deferredForK8sIsolationConflict && !abandonedForLiveOwnJob) {
+          if (!deferredForK8sIsolationConflict && !deferredForBranchClaimConflict && !abandonedForLiveOwnJob) {
             const latestRunForHook = await getRun(run.id).catch(() => null);
             const agentForHook = await getAgent(run.agentId).catch(() => null);
             const exitCode = (() => {
