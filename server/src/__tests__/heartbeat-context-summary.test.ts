@@ -1193,6 +1193,60 @@ describe("mergeCoalescedContextSnapshot", () => {
     expect(merged.paperclipWake).toBeUndefined();
   });
 
+  it("clears stale review-feedback comment routing when none survives same-PR review replacement", () => {
+    const merged = mergeCoalescedContextSnapshot(
+      {
+        issueId: "issue-1053",
+        wakeReason: "github_pr_review_feedback",
+        githubRepoFullName: "Blockcast/paperclip",
+        githubPrNumber: 1053,
+        githubHeadSha: "82f168065",
+        githubPrReviewBody: "1 Critical + 2 Important findings.",
+        githubPrReviewAuthorLogin: "allyblockcast[bot]",
+        githubReviewFeedbackActionable: true,
+        githubReviewFeedbackCommentId: "pr-feedback-comment-1053",
+        commentId: "pr-feedback-comment-1053",
+        wakeCommentId: "pr-feedback-comment-1053",
+        wakeCommentIds: ["pr-feedback-comment-1053"],
+        paperclipWake: {
+          comments: [
+            {
+              id: "pr-feedback-comment-1053",
+              body: "1 Critical + 2 Important findings.",
+              metadata: {
+                kind: "github_pr_review_feedback",
+                repoFullName: "Blockcast/paperclip",
+                prNumber: 1053,
+              },
+            },
+          ],
+        },
+        prRole: "author",
+      },
+      {
+        issueId: "issue-1053",
+        wakeReason: "github_pr_review_submitted",
+        githubRepoFullName: "Blockcast/paperclip",
+        githubPrNumber: 1053,
+        githubHeadSha: "82f168065",
+        githubPrReviewBody: "LGTM.",
+        githubPrReviewState: "approved",
+        githubPrReviewAuthorLogin: "kkroo",
+        prRole: "author",
+      },
+    );
+
+    expect(merged.githubPrReviewBody).toBe("LGTM.");
+    expect(merged.githubPrReviewState).toBe("approved");
+    expect(merged.githubPrReviewAuthorLogin).toBe("kkroo");
+    expect(merged.githubReviewFeedbackActionable).toBeUndefined();
+    expect(merged.githubReviewFeedbackCommentId).toBeUndefined();
+    expect(merged.commentId).toBeUndefined();
+    expect(merged.wakeCommentId).toBeUndefined();
+    expect(merged.wakeCommentIds).toBeUndefined();
+    expect(merged.paperclipWake).toBeUndefined();
+  });
+
   // Companion: a genuine second formal review (APPROVED -> CHANGES_REQUESTED
   // on the same PR) must fully replace the prior review's state, not merge
   // fields across the two submissions either.

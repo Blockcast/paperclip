@@ -6758,7 +6758,7 @@ export function mergeCoalescedContextSnapshot(
     // The merged context should carry canonical comment ids; the next wake will
     // regenerate any structured payload from those ids.
     delete merged[PAPERCLIP_WAKE_PAYLOAD_KEY];
-  } else if (isDifferentGithubPr) {
+  } else if (isDifferentGithubPr || isNewReviewInstance) {
     delete merged[WAKE_COMMENT_IDS_KEY];
     delete merged.commentId;
     delete merged.wakeCommentId;
