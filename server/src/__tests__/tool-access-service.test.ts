@@ -3378,6 +3378,9 @@ describeEmbeddedPostgres("tool access service", () => {
       canonicalArguments,
       signingSecret: "old-secret",
     });
+    // Older than the signing grace period so the auto-cancel path treats
+    // them as stale rather than as still-in-flight (BLO-21490).
+    const staleCreatedAt = new Date(Date.now() - 60_000);
     const [validRequest, missingSignatureRequest, oldSecretRequest] = await db.insert(toolActionRequests).values([
       {
         companyId: company.id,
@@ -3386,6 +3389,7 @@ describeEmbeddedPostgres("tool access service", () => {
         canonicalArgumentsHash: "args-hash",
         canonicalArgumentsSummary: { summary: canonicalArguments, sha256: "args-hash", sizeBytes: canonicalArguments.length },
         signedArguments: validSignedArguments,
+        createdAt: staleCreatedAt,
       },
       {
         companyId: company.id,
@@ -3394,6 +3398,7 @@ describeEmbeddedPostgres("tool access service", () => {
         canonicalArgumentsHash: "args-hash",
         canonicalArgumentsSummary: { summary: canonicalArguments, sha256: "args-hash", sizeBytes: canonicalArguments.length },
         signedArguments: null,
+        createdAt: staleCreatedAt,
       },
       {
         companyId: company.id,
@@ -3402,6 +3407,7 @@ describeEmbeddedPostgres("tool access service", () => {
         canonicalArgumentsHash: "args-hash",
         canonicalArgumentsSummary: { summary: canonicalArguments, sha256: "args-hash", sizeBytes: canonicalArguments.length },
         signedArguments: oldSecretSignedArguments,
+        createdAt: staleCreatedAt,
       },
     ]).returning();
 
@@ -3413,6 +3419,70 @@ describeEmbeddedPostgres("tool access service", () => {
     expect(statusById.get(validRequest.id)).toBe("pending");
     expect(statusById.get(missingSignatureRequest.id)).toBe("cancelled");
     expect(statusById.get(oldSecretRequest.id)).toBe("cancelled");
+  });
+
+  it("does not cancel a freshly-created pending action request that hasn't finished signing yet (BLO-21490)", async () => {
+    // recordInvocation() inserts the pending row before the async
+    // approval-snapshot + signing step backfills signedArguments. A review
+    // queue read landing in that window must not permanently cancel the
+    // request just because it hasn't been signed yet.
+    const company = await createCompany(db);
+    const [application] = await db.insert(toolApplications).values({
+      companyId: company.id,
+      name: `Action review app ${randomUUID()}`,
+      type: "mcp_http",
+      status: "active",
+    }).returning();
+    const [connection] = await db.insert(toolConnections).values({
+      companyId: company.id,
+      applicationId: application.id,
+      name: `Action review connection ${randomUUID()}`,
+      transport: "remote_http",
+      status: "active",
+      enabled: true,
+      config: { url: "https://fixture.example/mcp" },
+    }).returning();
+    const [catalogEntry] = await db.insert(toolCatalogEntries).values({
+      companyId: company.id,
+      applicationId: application.id,
+      connectionId: connection.id,
+      name: "kv_set",
+      toolName: "kv_set",
+      title: "KV Set",
+      riskLevel: "write",
+      isWrite: true,
+      status: "active",
+      versionHash: "v1",
+      schemaHash: "s1",
+    }).returning();
+    const canonicalArguments = canonicalToolArguments({ key: "alpha", value: "one" });
+    const [inFlightInvocation] = await db.insert(toolInvocations).values({
+      companyId: company.id,
+      applicationId: application.id,
+      connectionId: connection.id,
+      catalogEntryId: catalogEntry.id,
+      toolName: "kv_set",
+      argumentsHash: "args-hash",
+      argumentsSummary: { summary: canonicalArguments, sha256: "args-hash", sizeBytes: canonicalArguments.length },
+      policyDecision: "require_approval" as const,
+      approvalState: "pending" as const,
+      status: "awaiting_approval" as const,
+    }).returning();
+    const [inFlightRequest] = await db.insert(toolActionRequests).values({
+      companyId: company.id,
+      invocationId: inFlightInvocation.id,
+      status: "pending",
+      canonicalArgumentsHash: "args-hash",
+      canonicalArgumentsSummary: { summary: canonicalArguments, sha256: "args-hash", sizeBytes: canonicalArguments.length },
+      signedArguments: null,
+      createdAt: new Date(),
+    }).returning();
+
+    const list = await toolAccessService(db).listActionRequests(company.id, "pending");
+    const [row] = await db.select().from(toolActionRequests).where(eq(toolActionRequests.id, inFlightRequest.id));
+
+    expect(list.map((item) => item.request.id)).toEqual([inFlightRequest.id]);
+    expect(row.status).toBe("pending");
   });
 
   it("tracks new profile tools, reviews mixed allow/block decisions, and clears pending counts", async () => {
