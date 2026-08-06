@@ -30,8 +30,18 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
     expect(runtimeDockerfile).not.toMatch(/npm install[^\n]*\sopencode-ai(?:\s|\\)/);
   });
 
-  it("vendors the claude_k8s adapter commit with runtime isolation, Penstock retry hints, Opus 5, and run-cwd diagnostics", () => {
-    expect(serverDockerfile).toContain("ARG CLAUDE_K8S_REF=3ad33702052f357ec2b31b7d3051e89ed1ed4875");
+  it("builds the claude_k8s adapter from in-tree vendored source, not a pinned fork clone", () => {
+    // BLO-17980: CLAUDE_K8S_REF is retired. The adapter source lives in this
+    // repo so the credential-injection fix is reviewable under our own CI.
+    expect(serverDockerfile).not.toMatch(/^ARG CLAUDE_K8S_REF=/m);
+    expect(serverDockerfile).not.toContain("clone https://github.com/kkroo/paperclip-adapter-claude-k8s.git");
+    expect(serverDockerfile).toContain("COPY vendor/paperclip-adapter-claude-k8s /vendor/claude-k8s-src");
+    expect(serverDockerfile).toContain("mv paperclip-adapter-claude-k8s-*.tgz /vendor/paperclip-adapter-claude-k8s.tgz");
+    // opencode_k8s still clones, so the gh_token secret must survive.
+    expect(serverDockerfile).toContain("clone https://github.com/kkroo/paperclip-adapter-opencode-k8s.git");
+  });
+
+  it("keeps the claude_k8s adapter changelog as the history of the vendored source", () => {
     expect(serverDockerfile).toContain("model-only commit based on the previous");
     expect(serverDockerfile).toContain("without bundling later retry-semantics changes");
     expect(serverDockerfile).toContain("bound the pre-Job live-Job list to 15 seconds");

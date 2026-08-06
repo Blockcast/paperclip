@@ -85,15 +85,26 @@ silently diverge.
 
 ## Where this repo is referenced
 
-Both must change under either path — the mirror makes it same-change, the
-transfer merely makes it non-urgent because GitHub redirects:
+**Resolved for claude_k8s as of 2026-08-06 (BLO-17980).** That adapter is no
+longer cloned from `kkroo/paperclip-adapter-claude-k8s` at all — its source is
+vendored in-tree at `vendor/paperclip-adapter-claude-k8s/` and
+`ARG CLAUDE_K8S_REF` is retired. The single-owner dependency this document was
+written to address is gone for claude_k8s; the ownership question below now
+applies only to `paperclip-adapter-opencode-k8s`. See
+`vendor/paperclip-adapter-claude-k8s/PROVENANCE.md`.
 
-- `Dockerfile:399` — the vendor-stage `git clone`, pinned by
-  `ARG CLAUDE_K8S_REF` (`Dockerfile:177`).
-- `vendor/README.md` — the "Fork:" URL. Note the `Upstream:` URL recorded there
-  does not currently resolve, and `kkroo/paperclip-adapter-claude-k8s` is not a
-  GitHub fork of anything; that line is stale and should be corrected whenever
-  this file is next touched.
+That vendoring also settled the stale-reference question flagged here: the
+`Upstream:` URLs were checked against the GitHub API and
+`farhoodlabs/paperclip-adapter-claude-k8s` (and its opencode sibling) return
+**404**, while `kkroo/paperclip-adapter-claude-k8s` reports `fork: false` /
+`parent: none` — it is not a GitHub fork of anything. `vendor/README.md` has
+been corrected accordingly.
+
+For opencode_k8s, both paths below must still change together:
+
+- `Dockerfile` — the vendor-stage `git clone` of
+  `kkroo/paperclip-adapter-opencode-k8s`, pinned by `ARG OPENCODE_K8S_REF`.
+- `vendor/README.md` — the repository URL under "Fork pins".
 
 `adapter-plugins.json` and `/opt/paperclip-bundled-adapters` are **not**
 affected: they are local-dev only. Production packaging clones, builds and packs

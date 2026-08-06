@@ -52,11 +52,16 @@ RUN --mount=type=cache,target=/root/.local/share/pnpm/store,sharing=locked \
 
 FROM base AS vendor
 WORKDIR /vendor
-# Pinned commit SHAs for the kkroo forks of the two k8s-Job adapters.
-# Bump these by pushing the fork branch and updating the ARG. Public repos,
-# so no auth required at clone time.
+# The two k8s-Job adapters are sourced differently as of 2026-08-06:
 #
-# Each repo's build → `pnpm pack` (or `npm pack`) produces the .tgz the
+#   claude_k8s   — VENDORED IN-TREE at vendor/paperclip-adapter-claude-k8s/.
+#                  No clone, no pin. Edit the source and open a PR.
+#   opencode_k8s — still cloned from the kkroo fork at the pinned
+#                  ARG OPENCODE_K8S_REF below. Bump it by pushing the fork
+#                  branch and updating the ARG. Public repo, so no auth is
+#                  required at clone time.
+#
+# Each adapter's build → `pnpm pack` (or `npm pack`) produces the .tgz the
 # production stage installs. We never commit the tgz; it's reproduced on
 # every image build.
 # Re-pinned 2026-06-03 (BLO-8909) to kkroo/paperclip-adapter-opencode-k8s
@@ -176,7 +181,23 @@ WORKDIR /vendor
 # execute/job-manifest suite 230/230 and typecheck pass.
 # Bumped 2026-08-04 to 3ad3370: exclude the exact current lifecycle Job from
 # live-Job concurrency conflicts while preserving distinct-Job exclusion.
-ARG CLAUDE_K8S_REF=3ad33702052f357ec2b31b7d3051e89ed1ed4875
+#
+# ---------------------------------------------------------------------------
+# 2026-08-06 — CLAUDE_K8S_REF is RETIRED. The adapter is no longer cloned from
+# an external fork at a pinned SHA; its source now lives in this repository at
+# vendor/paperclip-adapter-claude-k8s/ and is built from there (see the
+# `COPY vendor/paperclip-adapter-claude-k8s` below).
+#
+# The changelog above is kept as the history of how that vendored source got
+# to its current state — every entry describes a commit that is now in-tree.
+#
+# Vendored under board approval bf83f96d (BLO-17980 / BLO-22506 / BLO-22514):
+# the fix site for a critical credential-exposure finding sat in a repository
+# outside our GitHub App installation, so we could neither PR it nor run it
+# through our own CI. To change adapter behaviour now, edit the vendored source
+# and open an ordinary PR. Provenance, upstream SHAs, license and an integrity
+# manifest: vendor/paperclip-adapter-claude-k8s/PROVENANCE.md
+# ---------------------------------------------------------------------------
 # Re-pinned 2026-06-14 to kkroo/paperclip-adapter-opencode-k8s master a533d11
 # (was 168688e): BLO-10448 — a transient k8s status-read error during the
 # completion poll was mislabeled as a deadline, surfacing as the bogus
@@ -396,12 +417,12 @@ RUN cd /vendor/adapter-utils-src \
 # rebuild we still re-resolve every transitive dep. The pnpm and npm
 # caches let those resolutions reuse tarballs from prior builds.
 
+# The claude_k8s adapter is built from in-tree vendored source (no clone, and
+# therefore no gh_token needed for it — opencode_k8s below still clones).
+COPY vendor/paperclip-adapter-claude-k8s /vendor/claude-k8s-src
 RUN --mount=type=cache,target=/root/.npm,sharing=locked \
-    --mount=type=secret,id=gh_token \
-    GH="$(cat /run/secrets/gh_token)" \
- && git -c "url.https://x-access-token:${GH}@github.com/.insteadOf=https://github.com/" \
-      clone https://github.com/kkroo/paperclip-adapter-claude-k8s.git claude-k8s \
-  && cd claude-k8s && git checkout "${CLAUDE_K8S_REF}" && rm -rf .git \
+    cd /vendor/claude-k8s-src \
+  && rm -rf node_modules dist \
   && npm ci \
   && npm install --no-save /vendor/adapter-utils.tgz \
   && npm run build \
@@ -457,17 +478,18 @@ FROM ${RUNTIME_IMAGE} AS production
 ARG USER_UID=1000
 ARG USER_GID=1000
 WORKDIR /app
-# The kkroo forks of paperclip-adapter-claude-k8s /
-# paperclip-adapter-opencode-k8s are built from source in the `vendor` stage
-# above and installed here.
+# Both k8s-Job adapters are built from source in the `vendor` stage above and
+# installed here. claude_k8s builds from in-tree vendored source; opencode_k8s
+# builds from the pinned kkroo fork.
 #
 # Do not install a local ccrotate CLI in this image. Paperclip production uses
 # ccrotate-auth-bot / ccrotate-serve as the source of truth; a baked local
 # rotator can read stale PVC state and switch agents onto exhausted accounts.
 # Refresh procedure:
-#   1. push the relevant kkroo fork branch (kkroo/paperclip-adapter-claude-k8s#master,
-#      kkroo/paperclip-adapter-opencode-k8s#master)
-#   2. bump the *_REF ARG in the `vendor` stage
+#   claude_k8s   — edit vendor/paperclip-adapter-claude-k8s/ and open a PR.
+#                  Nothing to pin or bump.
+#   opencode_k8s — push kkroo/paperclip-adapter-opencode-k8s#master, then bump
+#                  OPENCODE_K8S_REF in the `vendor` stage.
 RUN mkdir -p /tmp/paperclip-bundled-adapters
 COPY --from=vendor /vendor/paperclip-adapter-claude-k8s.tgz /tmp/paperclip-bundled-adapters/
 COPY --from=vendor /vendor/paperclip-adapter-opencode-k8s.tgz /tmp/paperclip-bundled-adapters/
