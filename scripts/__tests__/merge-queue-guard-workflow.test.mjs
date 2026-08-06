@@ -155,6 +155,14 @@ test("every job downstream of policy scopes its own success check instead of inh
   // was caught by `verify` itself failing on this PR's own pull_request
   // check run, not by this test file -- codifying it here so it can't ship
   // silently again.
+  //
+  // A first attempt at this fix used a bare `if: needs.policy.result ==
+  // 'success'` with no `always()`. That still failed live: GitHub applies
+  // its default "skip if anything upstream was skipped" gate underneath a
+  // custom `if:` unless `always()` is also present, so the custom condition
+  // never even got evaluated -- merge_queue_guard's pull_request skip kept
+  // cascading through it exactly as before. `always()` must prefix every
+  // condition below, matching the pattern policy/helm_chart already use.
   const directPolicyJobs = [
     "typecheck_release_registry",
     "worktree_install",
@@ -175,8 +183,8 @@ test("every job downstream of policy scopes its own success check instead of inh
     assert.match(block, /\n    needs: \[policy\]\n/, `${job} must declare needs: [policy]`);
     assert.match(
       block,
-      /\n    if: needs\.policy\.result == 'success'\n/,
-      `${job} must scope its run condition to policy's own result, not the implicit transitive success()`,
+      /\n    if: always\(\) && needs\.policy\.result == 'success'\n/,
+      `${job} must gate on always() && needs.policy.result == 'success', not the implicit transitive success() and not a bare custom condition without always()`,
     );
   }
 
@@ -184,8 +192,8 @@ test("every job downstream of policy scopes its own success check instead of inh
   assert.match(verifyServerBlock, /\n    needs: \[policy, general_tests\]\n/);
   assert.match(
     verifyServerBlock,
-    /\n    if: needs\.policy\.result == 'success' && needs\.general_tests\.result == 'success'\n/,
-    "verify_serialized_server must scope its run condition to its own direct dependencies' results",
+    /\n    if: always\(\) && needs\.policy\.result == 'success' && needs\.general_tests\.result == 'success'\n/,
+    "verify_serialized_server must gate on always() plus both its direct dependencies' results",
   );
 });
 
