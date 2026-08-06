@@ -67,11 +67,11 @@
         {
           "path": "SKILL.md",
           "kind": "skill",
-          "sizeBytes": 4042,
-          "sha256": "df5bdc8bf5e017b7ba5f70a4b5323fad51d0c323278f386580f26cf43ad09160"
+          "sizeBytes": 5850,
+          "sha256": "b9854c296bd143e333506b16664fb5c3054d57f7c6a78b523914f96a68611607"
         }
       ],
-      "contentHash": "sha256:88dc13560371fb364963782cb4f6eeb4090fcde92ee3774479428ed6b90e11c1"
+      "contentHash": "sha256:6241543a5a3144e85673a2206c790ea016081b249008e694db4ae18ca8450d6c"
     },
     {
       "id": "paperclipai:bundled:paperclip-operations:reflection-coach",

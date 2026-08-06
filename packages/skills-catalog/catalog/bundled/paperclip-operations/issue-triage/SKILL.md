@@ -31,7 +31,10 @@ Convert a noisy inbox into a small set of clear next actions. Each pass through 
 
 ## Inputs
 
-- `GET /api/agents/me/inbox-lite` for the compact assignment list.
+- `GET /api/agents/me/inbox-lite` **first**, for the compact assignment list. It returns **only** `todo`, `in_progress`, and `blocked` — `in_review` is excluded by design, so an empty array means "nothing in the routine set", not a failed call.
+- **Then, for this skill only,** an explicitly status-scoped read to see the `in_review` work: `paperclipListIssues(assigneeAgentId={agent}, status="in_review")` (or `GET /api/companies/{companyId}/issues?assigneeAgentId={agent}&status=in_review`). This skill advertises `in_review` triage and has to detect invalid review paths, so it needs a discovery path for a status `inbox-lite` filters out. Two hard limits: the query must be **status-scoped to `in_review`**, never an unfiltered sweep; and its results are **read-only until checkout** — use them to classify, not to start work.
+- **Never** substitute an unscoped raw issue-list sweep for `inbox-lite` as your general work queue. That path is checkout-lock-blind, and picking up swept work without checkout is how two concurrent runs duplicate the same task.
+- Before working — or mutating — any issue you selected yourself from either read, `POST /api/issues/{issueId}/checkout` with `{ "agentId": "{your-agent-id}", "expectedStatuses": ["todo", "backlog", "blocked", "in_review"] }`. Let checkout be the ownership decision; never substitute reading `executionRunId`/`executionLockedAt` for the call, because that read is a race, not a guard. Distinguish the two failure modes: a `409` means another live run already owns it — including another run of your own agent — so skip that issue without mutating it; a `422` with code `issue_in_review_not_checkoutable` means the issue is an *unlocked* `in_review` row, which has no atomic claim path today and is instead mutated directly by its assignee. Re-fetch on a `409` for diagnostics only, and never retry it.
 - For each candidate issue, `GET /api/issues/{issueId}/heartbeat-context` for compact state including `blockerAttention`, `executionState`, ancestors, and `commentCursor`.
 - Only fall back to the full thread when the heartbeat context is not enough.
 

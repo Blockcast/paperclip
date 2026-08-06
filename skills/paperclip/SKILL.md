@@ -56,15 +56,22 @@ Follow these steps every time you wake up:
 
 **Step 3 — Get assignments.** Prefer `GET /api/agents/me/inbox-lite` for the normal heartbeat inbox. It returns the compact assignment list you need for prioritization. Fall back to `GET /api/companies/{companyId}/issues?assigneeAgentId={your-agent-id}&status=todo,in_progress,in_review,blocked` only when you need the full issue objects.
 
+`inbox-lite` returns **only** `todo`, `in_progress`, and `blocked`. `in_review` is deliberately excluded — review/approval waits resume through comment, interaction, and monitor wakes (Step 4), not by being re-picked every heartbeat. So an **empty array means "nothing to pick", not a failed call.** Never "recover" from an empty inbox with a raw issue-list sweep: a hand-rolled sweep has no checkout-lock awareness, and picking swept work without checkout is how two runs end up duplicating the same task.
+
+What an empty array means next depends on **why you were woken**:
+
+- **Unscoped heartbeat** (no issue named — `heartbeat_timer`, `interval_elapsed`) → there is genuinely nothing to pick. Exit the heartbeat.
+- **The wake names an issue** — `PAPERCLIP_TASK_ID` is set, or the wake reason is a comment, mention, interaction, approval, monitor, continuation, or recovery wake → **do not exit.** Go to Step 4 and work the named issue. An empty inbox is the *expected* response when that issue is `in_review`, because `in_review` is filtered out by design. Exiting here would drop exactly the wake this filter assumes will resume the issue.
+
+Read the named issue directly by id (`paperclipGetIssue` / `GET /api/issues/{issueId}`) — that is a scoped read of one known issue, not a discovery sweep, and it is still followed by checkout in Step 5.
+
 **Step 4 — Pick work.** Priority: `in_progress` → `in_review` (if woken by a comment on it — check `PAPERCLIP_WAKE_COMMENT_ID`) → `todo`. Skip `blocked` unless you can unblock.
 
-**Before working an issue, confirm you are the run that holds it.** Compare your own `$PAPERCLIP_RUN_ID` against the issue's `executionRunId` (or `activeRun.id`) — `GET /api/issues/{issueId}` returns both, so this costs no extra call:
+**Selecting an issue is not claiming it — checkout is (Step 5).** Do not decide ownership by comparing `$PAPERCLIP_RUN_ID` against the issue's `executionRunId` / `activeRun.id`. That read is a race: the lock can be taken between your read and your first write, so a "nobody holds it" answer can be stale by the time you act on it. Those fields are the lock's storage, not its API.
 
-- They match → you hold it. Proceed.
-- They differ **and** `activeRun.status` is `running` → **a different live run of you is already working this issue. Cede.** Do not edit files, commit, push, or change status. Post a short comment noting the duplicate selection, then pick different work or exit.
-- `activeRun` is `null` → nobody is holding it. A finished run leaves `executionRunId` set, so a non-matching `executionRunId` on its own is not a collision.
+So: pick a candidate, then **let checkout be the ownership decision**. On `409`, you lost — including to another live run of your own agent. Re-fetch the issue for diagnostics only and **exit without mutating it**; do not post a "duplicate selection" comment, because a comment bumps activity, can trigger another wake, and can enter the approval-comment state machine on an issue another run owns. Read those fields when you want to *explain* a 409 in your own logs — never to pre-authorize work.
 
-`inbox-lite` withholds these issues server-side, so in practice you should not see one. Keep the check anyway: it is one comparison, it covers the fallback issue-list path and any stale-lock takeover, and a duplicate run that starts working is destructive rather than merely wasteful — under a shared worktree both runs edit the same tree, and a routine `rm -rf node_modules` in one destroys the other's state mid-task. Note that "no comments yet" is **not** evidence an issue is unworked: the holding run may be minutes into its first pass and not have commented yet.
+Duplicate work is destructive rather than merely wasteful: under a shared worktree both runs edit the same tree, and a routine `rm -rf node_modules` in one destroys the other's state mid-task. Note that "no comments yet" is **not** evidence an issue is unworked — the holding run may be minutes into its first pass and not have commented yet.
 
 Overrides and special cases:
 
@@ -84,6 +91,12 @@ Headers: Authorization: Bearer $PAPERCLIP_API_KEY, X-Paperclip-Run-Id: $PAPERCLI
 ```
 
 If already checked out by you, returns normally. If owned by another agent: `409 Conflict` — stop, pick a different task. **Never retry a 409.**
+
+**Checkout _is_ the concurrency check — it is not optional bookkeeping.** The execution lock is enforced atomically inside the checkout `UPDATE`, and it is **run-scoped, not agent-scoped**: if another run already holds the lock you get a `409` even when that run belongs to *the same agent as you*. `maxConcurrentRuns > 1` does not exempt you from your own lock. This is the only guardrail against two concurrent runs doing the same work, which is why checkout is mandatory before work of any kind — including work you found yourself rather than being woken for.
+
+Do **not** substitute your own inspection of `executionRunId` / `executionAgentNameKey` / `executionLockedAt` for calling checkout (see Step 4). They are the lock's storage, not its API. Use them for diagnostics only; let the `409` be your answer.
+
+**One current gap, so you can recognize it rather than work around it:** an **unlocked** assigned `in_review` issue is *not* checkoutable today — checkout returns `422` with code `issue_in_review_not_checkoutable`, directing the assignee to mutate the issue directly. Passing `in_review` in `expectedStatuses` (above) still matters, because it is what makes a *locked* `in_review` issue return `409` to a second run instead of silently proceeding. Treat the `422` as "this specific path has no atomic claim yet" — not as licence to skip checkout generally, and not as something to retry.
 
 **Step 6 — Understand context.** Prefer `GET /api/issues/{issueId}/heartbeat-context` first. It gives you compact issue state, ancestor summaries, goal/project info, and comment cursor metadata without forcing a full thread replay.
 
@@ -385,7 +398,9 @@ For commands, response fields, and MCP tools, read:
 
 ## Critical Rules
 
-- **Never retry a 409.** The task belongs to someone else.
+- **Never retry a 409.** The task belongs to someone else — or to another run of you. The execution lock is run-scoped, so a concurrent run of your own agent conflicts exactly like a foreign agent does.
+- **Checkout before any work; never hand-roll the lock check.** Inspecting `executionRunId`/`executionLockedAt` instead of calling checkout is a race, not a guardrail. See Steps 4 and 5.
+- **An empty `inbox-lite` is an answer, not an error.** It excludes `in_review` by design. Never "recover" from it with a raw issue-list sweep — that path is checkout-lock-blind.
 - **Never look for unassigned work.** No assignments = exit.
 - **Self-assign only for explicit @-mention handoff.** Requires a mention-triggered wake with `PAPERCLIP_WAKE_COMMENT_ID` and a comment that clearly directs you to do the task. Use checkout (never direct assignee patch).
 - **Honor "send it back to me" requests from board users.** If a board/user asks for review handoff (e.g. "let me review it", "assign it back to me"), reassign to them with `assigneeAgentId: null` and `assigneeUserId: "<requesting-user-id>"`, typically setting status to `in_review` instead of `done`. Resolve the user id from the triggering comment's `authorUserId` when available, else the issue's `createdByUserId` if it matches the requester context.
