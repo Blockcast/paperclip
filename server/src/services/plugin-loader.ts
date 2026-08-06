@@ -122,7 +122,7 @@ function isSdkInstallRaceError(err: unknown): boolean {
 }
 
 /**
- * Transient worker-startup failures (BLO-20410).
+ * Transient worker-startup failures (BLO-20410, narrowed in BLO-22095).
  *
  * `startWorker()` runs the `initialize` RPC under INITIALIZE_TIMEOUT_MS (60s,
  * plugin-worker-manager.ts) and throws `Worker initialize failed for "<id>":
@@ -133,23 +133,47 @@ function isSdkInstallRaceError(err: unknown): boolean {
  * single manual `/enable` with no other change.
  *
  * The timeout is a symptom of boot contention, not of a broken plugin, so it is
- * retried rather than latched. Deliberately narrow: only the initialize budget
- * and a worker that died during startup qualify. A plugin that reports a real
- * fault (`initialize returned ok=false`, a manifest error, a missing
- * entrypoint) still fails closed on the first attempt.
+ * retried rather than latched. Exactly two causes qualify, and both are read
+ * from the typed `WorkerStartupError.transient` flag set at the throw site:
+ * the blown initialize budget (`TIMEOUT`) and a worker that died before
+ * initialize resolved (`WORKER_UNAVAILABLE`).
+ *
+ * This used to be a message-substring match, which was strictly broader than
+ * this comment claimed. `Worker initialize failed for "<id>"` is the wrapper
+ * applied to *every* initialize failure, so a plugin whose `initialize` handler
+ * threw — bad credentials, missing config, any explicit RPC rejection — matched
+ * the marker and was retried 3x before latching the same error. Only an
+ * `ok=false` reply was excluded. The classification is now decided at the throw
+ * site, where the underlying cause is still available.
  */
-const TRANSIENT_ACTIVATION_ERR_MARKERS = [
-  "timed out after",
-  "Worker initialize failed",
-  "Worker exited during startup",
-];
+const INITIALIZE_TIMEOUT_ERR_MARKER = 'RPC call "initialize" timed out after';
+
+/**
+ * Realm-safe tag check. `plugin-loader` imports only types from
+ * `plugin-worker-manager`, and `instanceof` is unreliable across test mocks and
+ * duplicated module instances, so match on the discriminator instead.
+ */
+function isWorkerStartupError(
+  err: unknown,
+): err is { name: string; transient: boolean } {
+  return (
+    typeof err === "object" &&
+    err !== null &&
+    (err as { name?: unknown }).name === "WorkerStartupError" &&
+    typeof (err as { transient?: unknown }).transient === "boolean"
+  );
+}
 
 export function isTransientActivationError(err: unknown): boolean {
+  // Authoritative: startWorker() classified this at the throw site, where the
+  // underlying RPC error code was still in hand.
+  if (isWorkerStartupError(err)) return err.transient;
+
+  // Fallback for untyped or stringified rejections reaching this path. Narrowed
+  // to the initialize timeout specifically: a bare "timed out after" matched
+  // any RPC timeout, and the generic wrapper prefix matched real plugin faults.
   const msg = err instanceof Error ? err.message : String(err);
-  // An explicit ok=false is the plugin answering "I am broken" inside the
-  // budget — a real fault, not contention. Never retry it.
-  if (msg.includes("initialize returned ok=false")) return false;
-  return TRANSIENT_ACTIVATION_ERR_MARKERS.some((marker) => msg.includes(marker));
+  return msg.includes(INITIALIZE_TIMEOUT_ERR_MARKER);
 }
 
 /**
@@ -2735,6 +2759,26 @@ export function pluginLoader(
           }
           break;
         } catch (err) {
+          // Drop the failed handle before sleeping, not at the top of the next
+          // iteration (BLO-22095). A worker that crashed during startup owns a
+          // restart timer of its own; leaving it registered across the retry
+          // delay lets it restart itself inside the window and race the retry.
+          const releaseFailedWorker = async (): Promise<void> => {
+            if (!workerManager.getWorker(pluginId)) return;
+            try {
+              await workerManager.stopWorker(pluginId);
+            } catch (stopErr) {
+              log.warn(
+                {
+                  pluginId,
+                  pluginKey,
+                  err: stopErr instanceof Error ? stopErr.message : String(stopErr),
+                },
+                "plugin-loader: failed to stop worker before activation retry",
+              );
+            }
+          };
+
           if (
             isSdkInstallRaceError(err) &&
             sdkRaceAttempt < SDK_INSTALL_RACE_RETRY_DELAYS_MS.length
@@ -2751,6 +2795,7 @@ export function pluginLoader(
               },
               "plugin-loader: SDK install race detected, retrying worker spawn",
             );
+            await releaseFailedWorker();
             await sleep(delay);
             continue;
           }
@@ -2777,6 +2822,7 @@ export function pluginLoader(
               },
               "plugin-loader: transient worker startup failure, retrying before marking plugin errored",
             );
+            await releaseFailedWorker();
             await sleep(delay);
             continue;
           }

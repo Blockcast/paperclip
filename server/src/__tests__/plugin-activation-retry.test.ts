@@ -10,35 +10,113 @@
  *   2. boot activation is bounded, so the plugin set no longer contends for one
  *      60s initialize window.
  */
-import { describe, expect, it } from "vitest";
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { PLUGIN_RPC_ERROR_CODES, JsonRpcCallError } from "@paperclipai/plugin-sdk";
+
+// ESM namespaces are not configurable, so `fork` has to be replaced at module
+// resolution time rather than with vi.spyOn.
+const { forkMock } = vi.hoisted(() => ({ forkMock: vi.fn() }));
+vi.mock("node:child_process", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  return { ...actual, fork: forkMock };
+});
+
 import {
   TRANSIENT_ACTIVATION_RETRY_DELAYS_MS,
   isTransientActivationError,
   mapWithConcurrency,
   resolveActivationConcurrency,
 } from "../services/plugin-loader.js";
+import {
+  WorkerStartupError,
+  createPluginWorkerHandle,
+} from "../services/plugin-worker-manager.js";
+
+/**
+ * Build the error `startWorker()` actually throws, rather than hand-writing the
+ * string. BLO-22095: the wrapper prefix `Worker initialize failed for "<id>"`
+ * is applied to *every* initialize failure, so a test that constructs the
+ * message by hand can assert a classification the production shape never
+ * produces.
+ */
+function wrappedInitializeFailure(
+  pluginId: string,
+  cause: Error,
+): WorkerStartupError {
+  const causeCode = cause instanceof JsonRpcCallError ? cause.code : null;
+  return new WorkerStartupError(
+    `Worker initialize failed for "${pluginId}": ${cause.message}`,
+    {
+      transient:
+        causeCode === PLUGIN_RPC_ERROR_CODES.TIMEOUT ||
+        causeCode === PLUGIN_RPC_ERROR_CODES.WORKER_UNAVAILABLE,
+      causeCode,
+    },
+  );
+}
 
 describe("isTransientActivationError", () => {
   it("classifies the observed production initialize timeout as transient", () => {
-    // Verbatim from the four errored plugins' lastError (BLO-20410).
-    const observed = new Error(
+    // Verbatim from the four errored plugins' lastError (BLO-20410), rebuilt
+    // through the production wrapper so the typed cause is present.
+    const observed = wrappedInitializeFailure(
+      "lucitra.plugin-secrets",
+      new JsonRpcCallError({
+        code: PLUGIN_RPC_ERROR_CODES.TIMEOUT,
+        message: 'RPC call "initialize" timed out after 60000ms',
+      }),
+    );
+    expect(observed.message).toBe(
       'Worker initialize failed for "lucitra.plugin-secrets": ' +
         'RPC call "initialize" timed out after 60000ms',
     );
     expect(isTransientActivationError(observed)).toBe(true);
   });
 
-  it("classifies a worker that dies during startup as transient", () => {
-    expect(
-      isTransientActivationError(new Error("Worker exited during startup (code 1)")),
-    ).toBe(true);
+  it("classifies a worker that dies before initialize resolves as transient", () => {
+    // The real message: handleProcessExit() rejects the in-flight initialize
+    // with this, tagged WORKER_UNAVAILABLE. The previous marker list carried
+    // "Worker exited during startup", which no production code ever throws.
+    const died = wrappedInitializeFailure(
+      "example.plugin",
+      new JsonRpcCallError({
+        code: PLUGIN_RPC_ERROR_CODES.WORKER_UNAVAILABLE,
+        message: "Worker process exited (code=1, signal=null)",
+      }),
+    );
+    expect(isTransientActivationError(died)).toBe(true);
+  });
+
+  it("does NOT retry a plugin whose initialize handler throws (BLO-22095)", () => {
+    // The regression: every initialize failure is wrapped in the same
+    // `Worker initialize failed` prefix, so a substring match on that prefix
+    // classified a genuine plugin fault as contention and retried it 3x.
+    for (const cause of [
+      new Error("invalid credentials"),
+      new Error("missing required config key 'apiToken'"),
+      new JsonRpcCallError({
+        code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+        message: "Error: bad credentials",
+      }),
+    ]) {
+      const wrapped = wrappedInitializeFailure("example.plugin", cause);
+      expect(wrapped.message).toContain("Worker initialize failed");
+      expect(isTransientActivationError(wrapped)).toBe(false);
+    }
   });
 
   it("does NOT retry a plugin that reports a real fault inside the budget", () => {
     // ok=false is the plugin answering "I am broken" — retrying just delays a
     // legitimate error latch.
     expect(
-      isTransientActivationError(new Error("Worker initialize returned ok=false")),
+      isTransientActivationError(
+        wrappedInitializeFailure(
+          "example.plugin",
+          new Error("Worker initialize returned ok=false"),
+        ),
+      ),
     ).toBe(false);
   });
 
@@ -57,6 +135,15 @@ describe("isTransientActivationError", () => {
       true,
     );
     expect(isTransientActivationError(undefined)).toBe(false);
+  });
+
+  it("does not classify an unrelated RPC timeout as an activation failure", () => {
+    // The old marker was a bare "timed out after", which matched any RPC.
+    expect(
+      isTransientActivationError(
+        new Error('RPC call "jobs.run" timed out after 30000ms'),
+      ),
+    ).toBe(false);
   });
 
   it("budgets more than one retry but keeps the added boot delay small", () => {
@@ -160,5 +247,78 @@ describe("mapWithConcurrency", () => {
 
   it("handles an empty list without hanging", async () => {
     await expect(mapWithConcurrency([], 4, async (x) => x)).resolves.toEqual([]);
+  });
+});
+
+/**
+ * BLO-22095 finding 2 — a worker that crashes before `initialize` resolves
+ * schedules its own restart on a 750–1250ms backoff. The activation retry loop
+ * then sleeps TRANSIENT_ACTIVATION_RETRY_DELAYS_MS[0] (2000ms) before its own
+ * next attempt, and `killProcess()` did not cancel the pending timer, so the
+ * worker resurrected itself inside that window — one unbudgeted start racing
+ * the retry the loop was about to make.
+ */
+describe("worker startup crash does not self-restart during the activation retry delay", () => {
+  const spawned: FakeChild[] = [];
+
+  class FakeChild extends EventEmitter {
+    pid = 4242;
+    stdin = new PassThrough();
+    stdout = new PassThrough();
+    stderr = new PassThrough();
+    killed = false;
+    kill(_signal?: NodeJS.Signals): boolean {
+      this.killed = true;
+      return true;
+    }
+  }
+
+  beforeEach(() => {
+    spawned.length = 0;
+    forkMock.mockReset();
+    forkMock.mockImplementation(() => {
+      const child = new FakeChild();
+      spawned.push(child);
+      return child;
+    });
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("spawns exactly once when the worker dies before initialize resolves", async () => {
+    const handle = createPluginWorkerHandle("example.plugin", {
+      entrypointPath: "/tmp/example-plugin/worker.js",
+      manifest: { id: "example.plugin", capabilities: [] } as never,
+      config: {},
+      instanceInfo: { instanceId: "test", hostVersion: "0.0.0" },
+      apiVersion: 1,
+      hostHandlers: {} as never,
+      // Default (true) — the restart machinery must be armed for this to be a
+      // real regression test; disabling it would trivially pass.
+      autoRestart: true,
+    });
+
+    const start = handle.start();
+    const failure = start.catch((err: unknown) => err);
+
+    // The worker dies before answering initialize. This is the production
+    // crash-before-initialize path, not the dead "Worker exited during
+    // startup" marker.
+    expect(spawned).toHaveLength(1);
+    spawned[0]!.emit("exit", 1, null);
+
+    const err = await failure;
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toContain("Worker initialize failed");
+
+    // Backoff is MIN_BACKOFF_MS (1000ms) ±25% jitter, so any pending restart
+    // fires strictly inside the 2000ms activation retry sleep.
+    await vi.advanceTimersByTimeAsync(TRANSIENT_ACTIVATION_RETRY_DELAYS_MS[0]!);
+
+    expect(spawned).toHaveLength(1);
+    expect(handle.status).not.toBe("running");
   });
 });
