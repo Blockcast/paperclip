@@ -55,6 +55,7 @@ import {
   GITHUB_REVIEW_REQUEST_SUPPRESSION_METRIC,
   __resetMetricsForTest,
   getMetricsRegistry,
+  refreshGithubWorkflowRunConclusionMetrics,
 } from "../services/metrics.js";
 
 /**
@@ -87,7 +88,11 @@ async function suppressionCount(cause?: string): Promise<number> {
     .reduce((sum, entry) => sum + entry.value, 0);
 }
 
-async function workflowConclusionCount(conclusion: string): Promise<number> {
+async function workflowConclusionCount(
+  db: Parameters<typeof refreshGithubWorkflowRunConclusionMetrics>[0],
+  conclusion: string,
+): Promise<number> {
+  await refreshGithubWorkflowRunConclusionMetrics(db);
   const metric = getMetricsRegistry().getSingleMetric(GITHUB_WORKFLOW_RUN_CONCLUSION_METRIC);
   if (!metric) throw new Error(`${GITHUB_WORKFLOW_RUN_CONCLUSION_METRIC} is not registered`);
   const data = (await metric.get()) as {
@@ -1431,7 +1436,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
       "workflow-requested",
     );
     expect(queued.status).toBe(200);
-    expect(await workflowConclusionCount("cancelled")).toBe(0);
+    expect(await workflowConclusionCount(db, "cancelled")).toBe(0);
 
     const completed = await postWorkflowRun(
       app,
@@ -1439,7 +1444,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
       "workflow-completed",
     );
     expect(completed.status).toBe(200);
-    expect(await workflowConclusionCount("cancelled")).toBe(1);
+    expect(await workflowConclusionCount(db, "cancelled")).toBe(1);
   });
 
   it("normalizes a completed workflow_run with no conclusion to other", async () => {
@@ -1452,7 +1457,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
     );
 
     expect(res.status).toBe(200);
-    expect(await workflowConclusionCount("other")).toBe(1);
+    expect(await workflowConclusionCount(db, "other")).toBe(1);
   });
 
   it("dedupes redelivered completed workflow_run events durably by run id and attempt", async () => {
@@ -1464,7 +1469,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
       expect(res.status).toBe(200);
     }
 
-    expect(await workflowConclusionCount("cancelled")).toBe(1);
+    expect(await workflowConclusionCount(db, "cancelled")).toBe(1);
 
     const rerun = await postWorkflowRun(
       app,
@@ -1472,23 +1477,23 @@ describeEmbeddedPostgres("github-webhook route", () => {
       "workflow-rerun",
     );
     expect(rerun.status).toBe(200);
-    expect(await workflowConclusionCount("success")).toBe(1);
+    expect(await workflowConclusionCount(db, "success")).toBe(1);
   });
 
-  it("dedupes a workflow_run redelivery that lands on an independent handler instance", async () => {
+  it("keeps workflow_run observations recoverable across a handler restart and redelivery", async () => {
     const firstApp = buildApp();
     const payload = workflowRunPayload({ conclusion: "cancelled", runId: 30817055156, runAttempt: 1 });
 
     const first = await postWorkflowRun(firstApp, payload, "workflow-first-process");
     expect(first.status).toBe(200);
-    expect(await workflowConclusionCount("cancelled")).toBe(1);
+    expect(await workflowConclusionCount(db, "cancelled")).toBe(1);
 
     __resetMetricsForTest();
     const secondApp = buildApp();
     const second = await postWorkflowRun(secondApp, payload, "workflow-second-process");
 
     expect(second.status).toBe(200);
-    expect(await workflowConclusionCount("cancelled")).toBe(0);
+    expect(await workflowConclusionCount(db, "cancelled")).toBe(1);
   });
 
   it("leaves reviewer wakes queued when the webhook runs on the API tier", async () => {

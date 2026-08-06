@@ -20,6 +20,8 @@
  * @module server/services/metrics
  */
 
+import { githubWorkflowRunCompletions, type Db } from "@paperclipai/db";
+import { gte, sql } from "drizzle-orm";
 import { Counter, Gauge, Registry, collectDefaultMetrics } from "prom-client";
 import { resetDepBlockedMetrics, snapshotDepBlockedMetrics } from "./dep-blocked-metrics.js";
 import {
@@ -493,17 +495,18 @@ export function normalizeGithubSuppressionCause(cause: string | null | undefined
  * no metric surface at all, so the only way to notice it was an author
  * manually reading job conclusions.
  *
- * One increment per completed `workflow_run` webhook delivery, labeled only
- * by the bounded `conclusion` (see {@link KNOWN_WORKFLOW_RUN_CONCLUSIONS}).
- * Deliberately excludes repo/workflow name to keep cardinality fixed at
- * `KNOWN_WORKFLOW_RUN_CONCLUSIONS.length + 1` regardless of fleet growth —
- * this counter's whole job is "how many terminal runs of each kind arrived
- * recently", which `increase(...{conclusion="cancelled"}[window])` answers
- * without either label. A sustained burst of `cancelled` (as opposed to the
- * `failure` rate, which is ordinary background noise) is the alerting
- * signal — see the `PaperclipGithubWorkflowRunMassCancellation` rule.
+ * Exposed as a DB-derived rolling-window gauge, labeled only by the bounded
+ * `conclusion` (see {@link KNOWN_WORKFLOW_RUN_CONCLUSIONS}). Deliberately
+ * excludes repo/workflow name to keep cardinality fixed at
+ * `KNOWN_WORKFLOW_RUN_CONCLUSIONS.length + 1` regardless of fleet growth.
+ * Because every API replica reads the same durable ledger, alerts must use
+ * `max(...)` across scrape targets rather than `sum(...)`. A sustained burst
+ * of `cancelled` (as opposed to the `failure` rate, which is ordinary
+ * background noise) is the alerting signal — see the
+ * `PaperclipGithubWorkflowRunMassCancellation` rule.
  */
-export const GITHUB_WORKFLOW_RUN_CONCLUSION_METRIC = "paperclip_github_workflow_run_conclusion_total";
+export const GITHUB_WORKFLOW_RUN_CONCLUSION_METRIC = "paperclip_github_workflow_run_conclusion_recent_count";
+export const GITHUB_WORKFLOW_RUN_CONCLUSION_WINDOW_MS = 15 * 60 * 1000;
 
 export const KNOWN_WORKFLOW_RUN_CONCLUSIONS = [
   "success",
@@ -800,7 +803,7 @@ let githubReviewRequestSuppression: Counter<"cause" | "reason"> | null = null;
 let githubReviewRequestDeadLetterUnresolved: Gauge<"reason"> | null = null;
 let agentWakeupTerminalFailedUnresolved: Gauge<"error_code" | "scope"> | null = null;
 let agentWakeupTerminalFailedOldestAge: Gauge<"scope"> | null = null;
-let githubWorkflowRunConclusion: Counter<"conclusion"> | null = null;
+let githubWorkflowRunConclusion: Gauge<"conclusion"> | null = null;
 let authRequest: Counter<"operation" | "outcome"> | null = null;
 
 function ensureRegistry(): {
@@ -822,7 +825,7 @@ function ensureRegistry(): {
   githubReviewRequestDeadLetterUnresolvedGauge: Gauge<"reason">;
   agentWakeupTerminalFailedUnresolvedGauge: Gauge<"error_code" | "scope">;
   agentWakeupTerminalFailedOldestAgeGauge: Gauge<"scope">;
-  githubWorkflowRunConclusionCounter: Counter<"conclusion">;
+  githubWorkflowRunConclusionGauge: Gauge<"conclusion">;
   authRequestCounter: Counter<"operation" | "outcome">;
 } {
   if (
@@ -1094,19 +1097,18 @@ function ensureRegistry(): {
     for (const scope of TERMINAL_FAILED_WAKE_SCOPES) {
       agentWakeupTerminalFailedOldestAge.set({ scope }, 0);
     }
-    githubWorkflowRunConclusion = new Counter({
+    githubWorkflowRunConclusion = new Gauge({
       name: GITHUB_WORKFLOW_RUN_CONCLUSION_METRIC,
       help:
-        "Count of completed GitHub Actions workflow_run webhook deliveries, labeled by "
-        + "bounded conclusion (BLO-21078). One increment per completed run regardless of "
-        + "whether it matched a paperclip identifier. `increase(...{conclusion=\"cancelled\"}"
-        + "[window])` catches a fleet-wide mass-cancellation wave; ordinary `failure` is "
-        + "background noise and must not trip that alert.",
+        "DB-derived count of completed GitHub Actions workflow_run webhooks seen in the "
+        + "last 15 minutes, labeled by bounded conclusion (BLO-21078). This is refreshed "
+        + "from the durable completion ledger before /metrics is rendered, so an API "
+        + "process crash after webhook commit cannot permanently lose the observation.",
       labelNames: ["conclusion"],
       registers: [registry],
     });
     for (const conclusion of [...KNOWN_WORKFLOW_RUN_CONCLUSIONS, UNKNOWN_WORKFLOW_RUN_CONCLUSION]) {
-      githubWorkflowRunConclusion.inc({ conclusion }, 0);
+      githubWorkflowRunConclusion.set({ conclusion }, 0);
     }
     authRequest = new Counter({
       name: AUTH_REQUEST_METRIC,
@@ -1144,7 +1146,7 @@ function ensureRegistry(): {
     githubReviewRequestDeadLetterUnresolvedGauge: githubReviewRequestDeadLetterUnresolved,
     agentWakeupTerminalFailedUnresolvedGauge: agentWakeupTerminalFailedUnresolved,
     agentWakeupTerminalFailedOldestAgeGauge: agentWakeupTerminalFailedOldestAge,
-    githubWorkflowRunConclusionCounter: githubWorkflowRunConclusion,
+    githubWorkflowRunConclusionGauge: githubWorkflowRunConclusion,
     authRequestCounter: authRequest,
   };
 }
@@ -1527,18 +1529,35 @@ export function setAgentWakeupTerminalFailedOldestAgeSeconds(
   }
 }
 
-/**
- * Record one completed GitHub Actions `workflow_run` webhook delivery
- * (BLO-21078). Callers must perform durable idempotency before this function:
- * the Prometheus counter is process-local, while GitHub webhook redeliveries
- * can land on any API replica.
- */
-export function recordGithubWorkflowRunConclusion(
-  conclusion: string | null | undefined,
-): string {
-  const label = normalizeWorkflowRunConclusion(conclusion);
-  ensureRegistry().githubWorkflowRunConclusionCounter.inc({ conclusion: label });
-  return label;
+export async function refreshGithubWorkflowRunConclusionMetrics(
+  db: Pick<Db, "select">,
+  opts: { now?: Date; windowMs?: number } = {},
+): Promise<Record<string, number>> {
+  const windowMs = opts.windowMs ?? GITHUB_WORKFLOW_RUN_CONCLUSION_WINDOW_MS;
+  const now = opts.now ?? new Date();
+  const since = new Date(now.getTime() - windowMs);
+  const counts: Record<string, number> = Object.fromEntries(
+    [...KNOWN_WORKFLOW_RUN_CONCLUSIONS, UNKNOWN_WORKFLOW_RUN_CONCLUSION].map((conclusion) => [conclusion, 0]),
+  );
+  const rows = await db
+    .select({
+      conclusion: githubWorkflowRunCompletions.conclusion,
+      count: sql<number>`count(*)::int`,
+    })
+    .from(githubWorkflowRunCompletions)
+    .where(gte(githubWorkflowRunCompletions.createdAt, since))
+    .groupBy(githubWorkflowRunCompletions.conclusion);
+
+  for (const row of rows) {
+    const conclusion = normalizeWorkflowRunConclusion(row.conclusion);
+    counts[conclusion] = (counts[conclusion] ?? 0) + Number(row.count ?? 0);
+  }
+
+  const gauge = ensureRegistry().githubWorkflowRunConclusionGauge;
+  for (const [conclusion, count] of Object.entries(counts)) {
+    gauge.set({ conclusion }, count);
+  }
+  return counts;
 }
 
 export function recordAuthRequest(input: {

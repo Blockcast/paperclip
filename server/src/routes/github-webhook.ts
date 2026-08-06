@@ -57,7 +57,6 @@ import { recoveryService } from "../services/recovery/service.js";
 import {
   normalizeWorkflowRunConclusion,
   recordGithubReviewRequestDelivery,
-  recordGithubWorkflowRunConclusion,
 } from "../services/metrics.js";
 import {
   recordMergedPullRequest,
@@ -432,20 +431,28 @@ async function recordGithubWorkflowRunConclusionOnce(
   const conclusion = normalizeWorkflowRunConclusion(readStringField(input.workflowRun, "conclusion"));
   const workflowRunId = readWorkflowRunId(input.workflowRun);
   const runAttempt = readWorkflowRunAttempt(input.workflowRun);
+  const durableWorkflowRunId = workflowRunId ?? (
+    input.deliveryId ? `missing-workflow-run-id:${input.deliveryId}` : null
+  );
 
+  if (!durableWorkflowRunId) {
+    logger.warn(
+      { deliveryId: input.deliveryId, repoFullName: input.repoFullName },
+      "github workflow_run.completed missing workflow_run.id and delivery id; skipping durable metric observation",
+    );
+    return { recorded: false, conclusion, workflowRunId, runAttempt };
+  }
   if (!workflowRunId) {
     logger.warn(
       { deliveryId: input.deliveryId, repoFullName: input.repoFullName },
-      "github workflow_run.completed missing workflow_run.id; counting without durable dedup",
+      "github workflow_run.completed missing workflow_run.id; deduping metric observation by delivery id",
     );
-    recordGithubWorkflowRunConclusion(conclusion);
-    return { recorded: true, conclusion, workflowRunId, runAttempt };
   }
 
   const inserted = await db
     .insert(githubWorkflowRunCompletions)
     .values({
-      workflowRunId,
+      workflowRunId: durableWorkflowRunId,
       runAttempt,
       repoFullName: input.repoFullName,
       conclusion,
@@ -463,7 +470,6 @@ async function recordGithubWorkflowRunConclusionOnce(
     return { recorded: false, conclusion, workflowRunId, runAttempt };
   }
 
-  recordGithubWorkflowRunConclusion(conclusion);
   try {
     await db
       .delete(githubWorkflowRunCompletions)

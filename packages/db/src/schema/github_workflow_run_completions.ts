@@ -3,10 +3,10 @@ import { index, integer, pgTable, text, timestamp, uniqueIndex, uuid } from "dri
 /**
  * Durable first-seen ledger for completed GitHub Actions workflow_run events.
  *
- * The corresponding Prometheus counter is process-local, but the decision to
- * count a completed run must be fleet-wide. GitHub webhook deliveries are
- * at-least-once and can land on different API replicas, so this table provides
- * the shared unique key before any replica increments its own counter.
+ * The corresponding Prometheus signal is derived from this table at scrape
+ * time. GitHub webhook deliveries are at-least-once and can land on different
+ * API replicas, so this table provides both the shared unique key and the
+ * restart-safe metric source.
  */
 export const githubWorkflowRunCompletions = pgTable(
   "github_workflow_run_completions",

@@ -63,6 +63,38 @@ test("prometheusRule.enabled=true still renders the PrometheusRule (flag remains
   assert.match(rendered, /name: paperclip-runtime-alerts/);
 });
 
+test("PaperclipGithubWorkflowRunMassCancellation uses max over the DB-derived global gauge (BLO-21078)", () => {
+  const rendered = execFileSync(
+    "helm",
+    [
+      "template",
+      "paperclip",
+      "deploy/helm/paperclip",
+      "--namespace",
+      "paperclip",
+      "-f",
+      "deploy/helm/paperclip/values.blockcast.yaml",
+      "--show-only",
+      "templates/prometheusrule.yaml",
+      "--set",
+      "prometheusRule.enabled=true",
+    ],
+    { cwd: repoRoot, encoding: "utf8" },
+  );
+
+  assert.match(rendered, /alert: PaperclipGithubWorkflowRunMassCancellation/);
+  assert.match(
+    rendered,
+    /max\(paperclip_github_workflow_run_conclusion_recent_count\{conclusion="cancelled"\}\) >= 3/,
+    "mass-cancellation alert must use max over the global DB-derived gauge, not sum across API replicas",
+  );
+  assert.doesNotMatch(
+    rendered,
+    /paperclip_github_workflow_run_conclusion_total|increase\(paperclip_github_workflow_run_conclusion/,
+    "mass-cancellation alert must not use the old process-local counter expression",
+  );
+});
+
 test("PaperclipAgentPodUnschedulable keys on kube_pod_status_scheduled, not the non-portable kube_pod_status_unschedulable (BLO-16224)", () => {
   // kube_pod_status_unschedulable is not exposed by many kube-state-metrics
   // builds/allowlists (confirmed absent on the Blockcast cluster's KSM), so the

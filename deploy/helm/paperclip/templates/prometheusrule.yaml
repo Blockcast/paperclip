@@ -205,7 +205,7 @@ spec:
         # false on Blockcast, see the file header); kept only for coherence.
         - alert: PaperclipGithubWorkflowRunMassCancellation
           expr: |
-            sum(increase(paperclip_github_workflow_run_conclusion_total{conclusion="cancelled"}[15m])) >= 3
+            max(paperclip_github_workflow_run_conclusion_recent_count{conclusion="cancelled"}) >= 3
           for: 2m
           labels:
             severity: warning
