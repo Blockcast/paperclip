@@ -18797,7 +18797,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       while (recoveryLaneBatches < queuedRunDispatchMaxScanBatches) {
         recoveryLaneBatches += 1;
         const batchStartCursor = recoveryLaneCursor;
-        const batch = await db
+        const rawBatch = await db
           .select(dispatchRunSelection)
           .from(heartbeatRuns)
           .where(and(
@@ -18809,22 +18809,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             recoveryLaneCursor
               ? sql`(${heartbeatRuns.createdAt}, ${heartbeatRuns.id}) > (${recoveryLaneCursor.createdAt}::timestamptz, ${recoveryLaneCursor.id}::uuid)`
               : undefined,
-            deferredRunIds?.size
-              ? notInArray(heartbeatRuns.id, [...deferredRunIds])
-              : undefined,
           ))
           .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
           .limit(queuedRunDispatchScanLimit);
-        if (batch.length === 0) {
+        if (rawBatch.length === 0) {
           recoveryLaneExhausted = true;
           break;
         }
-        const lastRun = batch[batch.length - 1]!;
+        const lastRun = rawBatch[rawBatch.length - 1]!;
         recoveryLaneCursor = {
           createdAt: lastRun.dispatchCreatedAtCursor,
           id: lastRun.id,
         };
-        if (batch.length < queuedRunDispatchScanLimit) recoveryLaneExhausted = true;
+        if (rawBatch.length < queuedRunDispatchScanLimit) recoveryLaneExhausted = true;
+
+        // Match the main/critical dispatch scans: admission-refused emergency
+        // rows are filtered after the raw cursor-bearing probe. Keeping them out
+        // of SQL with NOT IN makes PostgreSQL walk the deferred prefix under the
+        // per-agent start lock; capturing the raw cursor first lets even a fully
+        // deferred page advance in bounded work.
+        const batch = deferredRunIds?.size
+          ? rawBatch.filter((run) => !deferredRunIds.has(run.id))
+          : rawBatch;
 
         const issueIdsToLoad = new Set<string>();
         for (const run of batch) {
