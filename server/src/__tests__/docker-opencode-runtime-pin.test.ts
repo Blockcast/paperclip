@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -23,6 +23,49 @@ const agentRuntimeBake = readFileSync(
 const designerDockerfile = readFileSync(path.join(repoRoot, "packages/services/designer/Dockerfile"), "utf8");
 const designerPackageLock = readFileSync(path.join(repoRoot, "packages/services/designer/package-lock.json"), "utf8");
 const verifyAgentFfmpeg = path.join(repoRoot, "scripts/verify-agent-ffmpeg.sh");
+
+function runFfmpegProbe(mode: "success" | "missing" | "failed" | "timeout") {
+  const stubDir = mkdtempSync(path.join(tmpdir(), "paperclip-ffmpeg-probe-"));
+  const dockerStub = path.join(stubDir, "docker");
+  const argsFile = path.join(stubDir, "docker-args");
+  writeFileSync(
+    dockerStub,
+    `#!/bin/sh
+printf '%s\\n' "$@" > "$DOCKER_ARGS_FILE"
+case "$DOCKER_STUB_MODE" in
+  success)
+    printf ' E moq_mmt MMTP muxer\\n'
+    i=0
+    while [ "$i" -lt 5000 ]; do
+      printf ' D unrelated_%s unrelated muxer\\n' "$i"
+      i=$((i + 1))
+    done
+    ;;
+  missing) printf ' E matroska Matroska muxer\\n' ;;
+  failed) exit 42 ;;
+  timeout) sleep 1 ;;
+esac
+`,
+    { mode: 0o755 },
+  );
+
+  try {
+    const result = spawnSync(verifyAgentFfmpeg, ["registry.example/ffmpeg@sha256:test"], {
+      env: {
+        ...process.env,
+        PATH: `${stubDir}:${process.env.PATH}`,
+        DOCKER_ARGS_FILE: argsFile,
+        DOCKER_STUB_MODE: mode,
+        FFMPEG_PROBE_TIMEOUT_SECONDS: mode === "timeout" ? "0.1" : "15",
+      },
+      encoding: "utf8",
+    });
+    const args = readFileSync(argsFile, "utf8").trim().split("\n");
+    return { result, args };
+  } finally {
+    rmSync(stubDir, { recursive: true, force: true });
+  }
+}
 
 describe("production Dockerfile k8s adapter runtime pins", () => {
   it("pins opencode-ai and asserts the installed version", () => {
@@ -211,32 +254,50 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
     );
     expect(dockerAgentWorkflow).toContain('scripts/verify-agent-ffmpeg.sh "$ffmpeg_image"');
     expect(dockerAgentWorkflow).toContain("lacks moq_mmt; using last known-good publisher digest");
+    expect(dockerAgentWorkflow).toContain("refusing publisher fallback");
   });
 
-  it("drains FFmpeg capability output after finding the required muxer", () => {
-    const stubDir = mkdtempSync(path.join(tmpdir(), "paperclip-ffmpeg-probe-"));
-    const dockerStub = path.join(stubDir, "docker");
-    writeFileSync(
-      dockerStub,
-      `#!/bin/sh
-printf ' E moq_mmt MMTP muxer\\n'
-i=0
-while [ "$i" -lt 5000 ]; do
-  printf ' D unrelated_%s unrelated muxer\\n' "$i"
-  i=$((i + 1))
-done
-`,
-      { mode: 0o755 },
-    );
+  it("constrains the FFmpeg probe and drains output after finding the muxer", () => {
+    const { result, args } = runFfmpegProbe("success");
 
-    try {
-      execFileSync(verifyAgentFfmpeg, ["registry.example/ffmpeg@sha256:test"], {
-        env: { ...process.env, PATH: `${stubDir}:${process.env.PATH}` },
-        stdio: "pipe",
-      });
-    } finally {
-      rmSync(stubDir, { recursive: true, force: true });
-    }
+    expect(result.status).toBe(0);
+    expect(args).toEqual([
+      "run",
+      "--rm",
+      "--network",
+      "none",
+      "--read-only",
+      "--cap-drop",
+      "ALL",
+      "--security-opt",
+      "no-new-privileges",
+      "--pids-limit",
+      "64",
+      "--user",
+      "65534:65534",
+      "--entrypoint",
+      "ffmpeg",
+      "registry.example/ffmpeg@sha256:test",
+      "-hide_banner",
+      "-muxers",
+    ]);
+  });
+
+  it("returns the capability-missing status only for a completed negative probe", () => {
+    const { result } = runFfmpegProbe("missing");
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("lacks required moq_mmt muxer");
+  });
+
+  it.each([
+    ["failed", "failed"],
+    ["timeout", "timed out"],
+  ] as const)("fails closed when the FFmpeg probe %s", (mode, message) => {
+    const { result } = runFfmpegProbe(mode);
+
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain(message);
   });
 
   it("publishes agent runtime images to Harbor with a secondary GHA cache", () => {
