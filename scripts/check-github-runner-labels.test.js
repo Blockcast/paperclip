@@ -18,7 +18,7 @@ test("runner-label guard accepts only ARC workflows", async (t) => {
     await mkdir(path.join(root, ".github/workflows"), { recursive: true });
     await writeFile(
       path.join(root, ".github/workflows/arc.yml"),
-      "jobs:\n  check:\n    runs-on: default\n  quoted:\n    runs-on: \"default\"\n  aggregate:\n    runs-on: [arc-light, arc-dind]\n  release:\n    runs-on:\n      group: arc-deploy\n  browser:\n    runs-on:\n      - arc-e2e\n",
+      "jobs:\n  check:\n    runs-on: default\n  quoted:\n    runs-on: \"default\"\n  aggregate:\n    runs-on: [arc-light, arc-dind]\n  release:\n    runs-on:\n      group: arc-deploy\n  browser:\n    runs-on:\n      - arc-e2e\n  merge_group_style:\n    runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'default' }}\n",
     );
 
     const result = spawnSync(process.execPath, [script], { cwd: root, encoding: "utf8" });
@@ -59,6 +59,28 @@ test("runner-label guard accepts only ARC workflows", async (t) => {
     const result = spawnSync(process.execPath, [script], { cwd: root, encoding: "utf8" });
     assert.equal(result.status, 1);
     assert.match(result.stderr, /unknown\.yml:3: runs-on: arc-e2ee/);
+  });
+
+  await t.test("rejects a ternary whose branch is not an allowed runner", async () => {
+    await writeFile(
+      path.join(root, ".github/workflows/ternary-bad.yml"),
+      "jobs:\n  heavy:\n    runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'ubuntu-latest' }}\n",
+    );
+
+    const result = spawnSync(process.execPath, [script], { cwd: root, encoding: "utf8" });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /ternary-bad\.yml:3:/);
+  });
+
+  await t.test("rejects an opaque expression that isn't the recognized ternary shape", async () => {
+    await writeFile(
+      path.join(root, ".github/workflows/expr-opaque.yml"),
+      "jobs:\n  heavy:\n    runs-on: ${{ fromJSON(vars.RUNNER_LABEL) }}\n",
+    );
+
+    const result = spawnSync(process.execPath, [script], { cwd: root, encoding: "utf8" });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /expr-opaque\.yml:3:/);
   });
 });
 
