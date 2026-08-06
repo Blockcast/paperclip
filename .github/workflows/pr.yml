@@ -27,20 +27,18 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: read
-      actions: write
     outputs:
       live: ${{ steps.guard.outputs.live }}
     steps:
       # BLO-21953: the workflow-level `concurrency.group` above is keyed on
       # `merge_group.head_sha` for merge_group events. That SHA is the composed
       # batch commit and is different on every re-stage, so `cancel-in-progress`
-      # never fires across a PR's successive merge-queue attempts -- superseded
-      # generations pile up and starve the shared runner pool. This pre-policy
-      # job performs no checkout; it only asks the merge queue whether the
-      # current composed SHA is still live. Lookup errors fail open; conclusive
-      # stale evidence is exported as `live=false` before requesting
-      # cancellation so descendants do not rely on cancellation propagation.
-      - name: Cancel if superseded by merge-queue re-stage
+      # never fires across a PR's successive merge-queue attempts. This
+      # pre-policy job performs no checkout and has no write-capable token; it
+      # only asks the merge queue whether the current composed SHA is still
+      # live. Lookup errors fail open, while conclusive stale evidence is
+      # exported as `live=false` so runner-heavy descendants are not scheduled.
+      - name: Detect if superseded by merge-queue re-stage
         id: guard
         uses: actions/github-script@v8
         env:
@@ -82,12 +80,12 @@ jobs:
               try {
                 result = await github.graphql(query, { owner, repo, branch, cursor });
               } catch (error) {
-                continueAsLive(`merge-queue lookup failed: ${error.message}; not cancelling (fail open)`);
+                continueAsLive(`merge-queue lookup failed: ${error.message}; continuing (fail open)`);
                 return;
               }
 
               if (Array.isArray(result?.errors) && result.errors.length > 0) {
-                continueAsLive("merge-queue lookup returned GraphQL errors; not cancelling (fail open)");
+                continueAsLive("merge-queue lookup returned GraphQL errors; continuing (fail open)");
                 return;
               }
 
@@ -98,7 +96,7 @@ jobs:
                 !entries.pageInfo ||
                 typeof entries.pageInfo.hasNextPage !== "boolean"
               ) {
-                continueAsLive("merge-queue lookup returned malformed data; not cancelling (fail open)");
+                continueAsLive("merge-queue lookup returned malformed data; continuing (fail open)");
                 return;
               }
 
@@ -114,39 +112,30 @@ jobs:
               }
 
               if (typeof entries.pageInfo.endCursor !== "string" || entries.pageInfo.endCursor.length === 0) {
-                continueAsLive("merge-queue lookup was paginated without an endCursor; not cancelling (fail open)");
+                continueAsLive("merge-queue lookup was paginated without an endCursor; continuing (fail open)");
                 return;
               }
               cursor = entries.pageInfo.endCursor;
             }
 
             if (exceededPaginationCap) {
-              continueAsLive("merge-queue lookup exceeded the pagination safety cap; not cancelling (fail open)");
+              continueAsLive("merge-queue lookup exceeded the pagination safety cap; continuing (fail open)");
               return;
             }
 
-            core.info(`${headSha} is not a live merge-queue entry after a complete lookup; cancelling this run`);
+            core.info(`${headSha} is not a live merge-queue entry after a complete lookup; marking stale`);
             core.setOutput("live", "false");
-            try {
-              await github.rest.actions.cancelWorkflowRun({
-                owner,
-                repo,
-                run_id: context.runId,
-              });
-            } catch (error) {
-              core.warning(`failed to cancel superseded run: ${error.message}; continuing anyway`);
-            }
 
   policy:
     # BLO-21953: without this dependency, `policy` is an independent root job
     # competing with `merge_queue_guard` for the same arc-light pool. Under
     # the pool-starvation failure mode the guard exists to fix, GitHub can
     # schedule `policy` first (or concurrently), so a superseded generation
-    # would burn a runner here before the guard ever gets to cancel it. The
+    # would burn a runner here before the guard ever classifies it. The
     # `if` keeps the pull_request path working, where `merge_queue_guard`
     # never runs and reports `skipped` rather than `success`.
     needs: [merge_queue_guard]
-    if: "!cancelled() && (needs.merge_queue_guard.result == 'skipped' || (needs.merge_queue_guard.result == 'success' && needs.merge_queue_guard.outputs.live == 'true'))"
+    if: "!cancelled() && (needs.merge_queue_guard.result == 'skipped' || needs.merge_queue_guard.result != 'success' || needs.merge_queue_guard.outputs.live != 'false')"
     runs-on: arc-light
     timeout-minutes: 5
     permissions:
@@ -310,7 +299,7 @@ jobs:
     # independent arc-light root that must wait behind the merge-queue guard
     # instead of racing it for a runner.
     needs: [merge_queue_guard]
-    if: "!cancelled() && (needs.merge_queue_guard.result == 'skipped' || (needs.merge_queue_guard.result == 'success' && needs.merge_queue_guard.outputs.live == 'true'))"
+    if: "!cancelled() && (needs.merge_queue_guard.result == 'skipped' || needs.merge_queue_guard.result != 'success' || needs.merge_queue_guard.outputs.live != 'false')"
     runs-on: arc-light
     timeout-minutes: 10
 
@@ -571,7 +560,7 @@ jobs:
     # gate. See the issue for the measured latency tradeoff of putting a
     # ~90-minute job on the required path this way.
     name: verify
-    if: "!cancelled() && (needs.merge_queue_guard.result == 'skipped' || (needs.merge_queue_guard.result == 'success' && needs.merge_queue_guard.outputs.live == 'true'))"
+    if: "!cancelled() && (needs.merge_queue_guard.result == 'skipped' || needs.merge_queue_guard.result != 'success' || needs.merge_queue_guard.outputs.live != 'false')"
     needs:
       [
         merge_queue_guard,

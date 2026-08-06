@@ -4,6 +4,8 @@ import { test } from "node:test";
 
 const workflow = readFileSync(new URL("../../.github/workflows/pr.yml", import.meta.url), "utf8");
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+const runnerWorkGuardCondition =
+  /\n    if: "!cancelled\(\) && \(needs\.merge_queue_guard\.result == 'skipped' \|\| needs\.merge_queue_guard\.result != 'success' \|\| needs\.merge_queue_guard\.outputs\.live != 'false'\)"\n/;
 
 function extractBlock(startMarker, endMarker) {
   const start = workflow.indexOf(startMarker);
@@ -14,7 +16,7 @@ function extractBlock(startMarker, endMarker) {
 }
 
 function extractGuardScript() {
-  const stepMarker = "\n      - name: Cancel if superseded by merge-queue re-stage\n";
+  const stepMarker = "\n      - name: Detect if superseded by merge-queue re-stage\n";
   const stepStart = workflow.indexOf(stepMarker);
   assert.notEqual(stepStart, -1, "pr.yml must define the merge-queue guard step");
 
@@ -48,7 +50,6 @@ async function runGuard({
   headSha = "head-sha",
   branch = "master",
   responses = [],
-  cancelError = null,
 } = {}) {
   const script = extractGuardScript();
   const fn = new AsyncFunction("github", "core", "context", "process", script);
@@ -70,7 +71,7 @@ async function runGuard({
       actions: {
         cancelWorkflowRun: async (args) => {
           cancelCalls.push(args);
-          if (cancelError) throw cancelError;
+          throw new Error("candidate-controlled merge_queue_guard must not cancel workflow runs");
         },
       },
     },
@@ -98,11 +99,13 @@ async function runGuard({
 test("merge-queue guard is isolated from the checkout policy job", () => {
   const guardBlock = extractBlock("\n  merge_queue_guard:\n", "\n  policy:\n");
   assert.match(guardBlock, /\n    if: github\.event_name == 'merge_group'\n/);
-  assert.match(guardBlock, /\n      actions: write\n/);
+  assert.match(guardBlock, /\n      contents: read\n/);
+  assert.doesNotMatch(guardBlock, /\n      actions: write\n/);
   assert.match(guardBlock, /\n    outputs:\n      live: \$\{\{ steps\.guard\.outputs\.live \}\}\n/);
   assert.match(guardBlock, /\n        id: guard\n/);
   assert.doesNotMatch(guardBlock, /actions\/checkout/);
   assert.doesNotMatch(guardBlock, /pnpm|node --test|git diff/);
+  assert.doesNotMatch(guardBlock, /cancelWorkflowRun/);
 
   const policyBlock = extractBlock("\n  policy:\n", "\n  typecheck_release_registry:\n");
   assert.match(policyBlock, /\n    permissions:\n      contents: read\n/);
@@ -114,9 +117,9 @@ test("every arc-light root job waits for the merge-queue guard before consuming 
   // start with no `needs` of their own -- everything else in the workflow is
   // already gated behind `policy`. If either became an independent root
   // again, it would race `merge_queue_guard` for the same arc-light pool and
-  // could consume a runner before a superseded run gets cancelled, making
-  // the guard's fail-open cancellation nondeterministic under the exact
-  // pool-starvation load it exists to relieve.
+  // could consume a runner before a superseded run gets classified, making
+  // the guard's load-shedding nondeterministic under the exact pool-starvation
+  // load it exists to relieve.
   const jobsSection = workflow.slice(workflow.indexOf("\njobs:\n"));
   const jobNames = [...jobsSection.matchAll(/^  ([a-z0-9_]+):\n/gm)].map((match) => match[1]);
   assert.deepEqual(jobNames, [
@@ -142,8 +145,8 @@ test("every arc-light root job waits for the merge-queue guard before consuming 
     );
     assert.match(
       block,
-      /\n    if: "!cancelled\(\) && \(needs\.merge_queue_guard\.result == 'skipped' \|\| \(needs\.merge_queue_guard\.result == 'success' && needs\.merge_queue_guard\.outputs\.live == 'true'\)\)"\n/,
-      `${job} must fail open when the guard is skipped (pull_request) or explicitly reports a live merge_group run`,
+      runnerWorkGuardCondition,
+      `${job} must skip only an explicit stale guard result and fail open for pull_request or guard infrastructure failures`,
     );
   }
 });
@@ -209,14 +212,30 @@ test("verify does not consume a runner for stale merge-queue generations", () =>
   const verifyBlock = extractBlock("\n  verify:\n", "\n  build:\n");
   assert.match(
     verifyBlock,
-    /\n    if: "!cancelled\(\) && \(needs\.merge_queue_guard\.result == 'skipped' \|\| \(needs\.merge_queue_guard\.result == 'success' && needs\.merge_queue_guard\.outputs\.live == 'true'\)\)"\n/,
-    "verify must remain cancellation-aware and skip when the guard conclusively reports a stale merge_group run",
+    runnerWorkGuardCondition,
+    "verify must remain cancellation-aware, skip only explicit stale merge_group runs, and fail open on guard infrastructure failures",
   );
   assert.match(
     verifyBlock,
     /\n    needs:\n      \[\n        merge_queue_guard,\n/,
     "verify must depend directly on merge_queue_guard so it can read the live output",
   );
+});
+
+test("guard failure does not make required verification disappear as skipped", () => {
+  // The condition must allow every non-success guard result through to the
+  // real policy/Helm/verify path. A failed guard job cannot prove staleness,
+  // so skipping `verify` would make the required check look successful without
+  // running substantive CI.
+  for (const [job, end] of [
+    ["policy", "helm_chart"],
+    ["helm_chart", "typecheck_release_registry"],
+    ["verify", "build"],
+  ]) {
+    const block = extractBlock(`\n  ${job}:\n`, `\n  ${end}:\n`);
+    assert.match(block, /needs\.merge_queue_guard\.result != 'success'/);
+    assert.match(block, /needs\.merge_queue_guard\.outputs\.live != 'false'/);
+  }
 });
 
 test("live membership on the first page continues without cancelling", async () => {
@@ -228,15 +247,11 @@ test("live membership on the first page continues without cancelling", async () 
   assert.match(result.infos.join("\n"), /still a live merge-queue entry/);
 });
 
-test("complete lookup that excludes the head sha cancels the workflow run", async () => {
+test("complete lookup that excludes the head sha marks the run stale without cancellation", async () => {
   const result = await runGuard({
     responses: [responseFor(["other-a", "other-b"])],
   });
-  assert.deepEqual(result.cancelCalls, [{
-    owner: "Blockcast",
-    repo: "paperclip",
-    run_id: 123456789,
-  }]);
+  assert.equal(result.cancelCalls.length, 0);
   assert.equal(result.outputs.live, "false");
   assert.match(result.infos.join("\n"), /not a live merge-queue entry/);
 });
@@ -299,7 +314,7 @@ test("pagination continues until a live entry is found", async () => {
   assert.equal(result.graphqlCalls[1].cursor, "cursor-1");
 });
 
-test("paginated complete lookup cancels only after all pages exclude the head sha", async () => {
+test("paginated complete lookup marks stale only after all pages exclude the head sha", async () => {
   const result = await runGuard({
     responses: [
       responseFor(["other-a"], { hasNextPage: true, endCursor: "cursor-1" }),
@@ -307,7 +322,7 @@ test("paginated complete lookup cancels only after all pages exclude the head sh
     ],
   });
   assert.equal(result.outputs.live, "false");
-  assert.equal(result.cancelCalls.length, 1);
+  assert.equal(result.cancelCalls.length, 0);
   assert.equal(result.graphqlCalls.length, 2);
 });
 
@@ -332,14 +347,4 @@ test("pagination safety cap is inconclusive and fails open", async () => {
   assert.equal(result.cancelCalls.length, 0);
   assert.equal(result.graphqlCalls.length, 100);
   assert.match(result.warnings.join("\n"), /pagination safety cap/);
-});
-
-test("cancellation API failures do not fail the guard job", async () => {
-  const result = await runGuard({
-    responses: [responseFor(["other-a"])],
-    cancelError: new Error("cancel endpoint unavailable"),
-  });
-  assert.equal(result.outputs.live, "false");
-  assert.equal(result.cancelCalls.length, 1);
-  assert.match(result.warnings.join("\n"), /failed to cancel superseded run/);
 });
