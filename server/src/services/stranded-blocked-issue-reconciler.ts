@@ -8,27 +8,24 @@
  * drains the existing population and keeps it drained: `status = 'blocked'`
  * with no unresolved blocker.
  *
- * Two other mechanisms independently leave an issue `blocked` with zero
- * unresolved blockers, and must not be touched by this sweep or they lose
- * their own wake path:
- *   - the convergence-stall guard (`executionState.monitor.clearReason ===
- *     "convergence_stalled"`, or a non-zero `convergenceStallCount`) —
- *     deliberately blocks a monitor that kept re-checking the same gate.
- *   - an active stranded-run recovery action pointing at the issue itself
- *     (`issue_recovery_actions` row with `status in ('active','escalated')`
- *     and `source_issue_id = issue.id`) — deliberately blocks the issue
- *     while ownership transfers to a new owner after a failed run.
- * A third population — issues blocked directly on a monitor watching
- * external gate signals (`executionState.monitor.gateSignals`) that was
- * never re-armed — never had a `blockedBy` edge in the first place, so
- * there is nothing for this fix to act on; it is excluded too.
+ * Several other mechanisms independently leave an issue `blocked` with zero
+ * unresolved blockers. They must not be touched by this sweep or they lose
+ * their own wake/repair path: pending interactions or approvals, latest-agent
+ * comments that are waiting on the user, executive hold comments, workspace
+ * preflight failures, active source-scoped recovery actions, convergence-stall
+ * guards, and monitor gate waits.
  *
  * `blocked` -> `todo` is the target status, per BLO-21523's accepted safe
  * default (not the issue's pre-block status).
  */
-import { sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
+import { issueRelations, issues } from "@paperclipai/db";
 import { logger as defaultLogger } from "../middleware/logger.js";
+import {
+  listBlockedIssueAutoResumeSuppressions,
+  listIssueDependencyReadinessMap,
+} from "./issues.js";
 
 /** Rows flipped per batch — keeps each UPDATE's lock window bounded. */
 const RECONCILE_BATCH_SIZE = 500;
@@ -41,73 +38,187 @@ export interface StrandedBlockedIssueReconcileResult {
   iterations: number;
 }
 
+type CandidateCursor = {
+  updatedAt: Date | string;
+  id: string;
+};
+
+type CandidateRow = {
+  id: string;
+  companyId: string;
+  identifier: string | null;
+  updatedAt: Date | string;
+};
+
+type LockedCandidateRow = {
+  id: string;
+  companyId: string;
+  identifier: string | null;
+  status: string;
+};
+
+function toRows<T>(rows: unknown): T[] {
+  return Array.isArray(rows) ? rows as T[] : Array.from(rows as Iterable<T>);
+}
+
+async function listCandidateRows(
+  dbOrTx: Pick<Db, "execute">,
+  batchSize: number,
+  cursor: CandidateCursor | null,
+): Promise<CandidateRow[]> {
+  const cursorPredicate = cursor
+    ? sql<boolean>`(i.updated_at, i.id) > (${cursor.updatedAt}, ${cursor.id}::uuid)`
+    : sql<boolean>`true`;
+  const rows = await dbOrTx.execute(sql<CandidateRow>`
+    SELECT
+      i.id::text AS id,
+      i.company_id::text AS "companyId",
+      i.identifier AS identifier,
+      i.updated_at AS "updatedAt"
+    FROM issues i
+    WHERE i.status = 'blocked'
+      AND ${cursorPredicate}
+    ORDER BY i.updated_at ASC, i.id ASC
+    LIMIT ${batchSize}
+  `);
+  return toRows<CandidateRow>(rows);
+}
+
+async function lockIssueRows(dbOrTx: Pick<Db, "execute">, issueIds: string[]) {
+  const uniqueIssueIds = [...new Set(issueIds.filter(Boolean))].sort();
+  if (uniqueIssueIds.length === 0) return;
+  await dbOrTx.execute(sql`
+    SELECT ${issues.id}
+    FROM ${issues}
+    WHERE ${inArray(issues.id, uniqueIssueIds)}
+    ORDER BY ${issues.id}
+    FOR UPDATE
+  `);
+}
+
+async function listCurrentBlockerIssueIds(
+  dbOrTx: Pick<Db, "select">,
+  candidateIds: string[],
+): Promise<string[]> {
+  if (candidateIds.length === 0) return [];
+  const rows = await dbOrTx
+    .select({ blockerIssueId: issueRelations.issueId })
+    .from(issueRelations)
+    .where(and(eq(issueRelations.type, "blocks"), inArray(issueRelations.relatedIssueId, candidateIds)));
+  return [...new Set(rows.map((row) => row.blockerIssueId))];
+}
+
+async function lockCandidatesAndCurrentBlockers(
+  dbOrTx: Pick<Db, "execute" | "select">,
+  candidateIds: string[],
+) {
+  const initialBlockerIds = await listCurrentBlockerIssueIds(dbOrTx, candidateIds);
+  const lockedIssueIds = new Set([...candidateIds, ...initialBlockerIds]);
+  await lockIssueRows(dbOrTx, [...lockedIssueIds]);
+
+  // Relation writers lock the dependent issue before changing blockedBy edges.
+  // After candidate rows are locked, the blocker set cannot change under us; if
+  // a relation committed immediately before the lock, lock that newly visible
+  // blocker too before the final readiness check.
+  const currentBlockerIds = await listCurrentBlockerIssueIds(dbOrTx, candidateIds);
+  const missingBlockerIds = currentBlockerIds.filter((id) => !lockedIssueIds.has(id));
+  if (missingBlockerIds.length > 0) {
+    await lockIssueRows(dbOrTx, missingBlockerIds);
+  }
+}
+
+async function listLockedBlockedCandidates(
+  dbOrTx: Pick<Db, "select">,
+  candidateIds: string[],
+): Promise<LockedCandidateRow[]> {
+  if (candidateIds.length === 0) return [];
+  const rows = await dbOrTx
+    .select({
+      id: issues.id,
+      companyId: issues.companyId,
+      identifier: issues.identifier,
+      status: issues.status,
+    })
+    .from(issues)
+    .where(inArray(issues.id, candidateIds));
+  return rows.filter((row) => row.status === "blocked");
+}
+
+async function reconcileCandidateBatch(
+  tx: Pick<Db, "execute" | "select" | "update">,
+  candidates: CandidateRow[],
+) {
+  const candidateIds = candidates.map((candidate) => candidate.id);
+  await lockCandidatesAndCurrentBlockers(tx, candidateIds);
+
+  const lockedCandidates = await listLockedBlockedCandidates(tx, candidateIds);
+  if (lockedCandidates.length === 0) return [];
+
+  const candidatesByCompany = new Map<string, LockedCandidateRow[]>();
+  for (const candidate of lockedCandidates) {
+    const rows = candidatesByCompany.get(candidate.companyId) ?? [];
+    rows.push(candidate);
+    candidatesByCompany.set(candidate.companyId, rows);
+  }
+
+  const eligibleIds: string[] = [];
+  for (const [companyId, companyCandidates] of candidatesByCompany) {
+    const companyIssueIds = companyCandidates.map((candidate) => candidate.id);
+    const [readinessMap, suppressions] = await Promise.all([
+      listIssueDependencyReadinessMap(tx, companyId, companyIssueIds),
+      listBlockedIssueAutoResumeSuppressions(tx, companyId, companyIssueIds, {
+        triggerPath: "stranded_blocked_reconciler",
+      }),
+    ]);
+
+    for (const candidate of companyCandidates) {
+      const readiness = readinessMap.get(candidate.id);
+      if (!readiness?.isDependencyReady) continue;
+      if (suppressions.has(candidate.id)) continue;
+      eligibleIds.push(candidate.id);
+    }
+  }
+
+  if (eligibleIds.length === 0) return [];
+  return tx
+    .update(issues)
+    .set({ status: "todo", updatedAt: new Date() })
+    .where(and(inArray(issues.id, eligibleIds), eq(issues.status, "blocked")))
+    .returning({ id: issues.id, identifier: issues.identifier });
+}
+
 /**
  * Flip `status = 'blocked'` -> `'todo'` for issues with zero unresolved
- * blockers, excluding the guard/recovery/monitor-gated populations described
- * above. Idempotent and safe to call on any schedule from any number of
- * replicas: the predicate is re-evaluated inside the `UPDATE ... WHERE`
- * itself, so a row already flipped (or claimed by a concurrent run) simply
- * fails to match on the next pass.
+ * blockers, excluding the intentional blocked populations described above.
+ * Idempotent and safe to call on any schedule from any number of replicas:
+ * each scanned issue and its current blocker rows are locked, canonical
+ * dependency readiness and blocked-resume suppressions are re-evaluated under
+ * that lock, and the final write still requires `status = 'blocked'`.
  */
 export async function reconcileStrandedBlockedIssues(
   db: Db,
   options: { batchSize?: number; maxIterations?: number; logger?: typeof defaultLogger } = {},
 ): Promise<StrandedBlockedIssueReconcileResult> {
-  const batchSize = options.batchSize ?? RECONCILE_BATCH_SIZE;
-  const maxIterations = options.maxIterations ?? MAX_ITERATIONS;
+  const batchSize = Math.max(1, options.batchSize ?? RECONCILE_BATCH_SIZE);
+  const maxIterations = Math.max(1, options.maxIterations ?? MAX_ITERATIONS);
   const log = options.logger ?? defaultLogger;
 
   let reconciled = 0;
   let iterations = 0;
+  let cursor: CandidateCursor | null = null;
 
   while (iterations < maxIterations) {
-    const rows = await db.execute(sql<{ id: string; identifier: string | null }>`
-      WITH candidates AS (
-        SELECT i.id
-        FROM issues i
-        WHERE i.status = 'blocked'
-          AND NOT EXISTS (
-            SELECT 1
-            FROM issue_relations r
-            JOIN issues b ON b.id = r.issue_id
-            WHERE r.related_issue_id = i.id
-              AND r.type = 'blocks'
-              AND r.company_id = i.company_id
-              AND b.status <> 'done'
-          )
-          AND COALESCE(
-            CASE
-              WHEN jsonb_typeof(i.execution_state -> 'monitor' -> 'gateSignals') = 'array'
-                THEN jsonb_array_length(i.execution_state -> 'monitor' -> 'gateSignals')
-              ELSE 0
-            END,
-            0
-          ) = 0
-          AND COALESCE(i.execution_state -> 'monitor' ->> 'clearReason', '') <> 'convergence_stalled'
-          AND COALESCE(
-            CASE
-              WHEN (i.execution_state -> 'monitor' ->> 'convergenceStallCount') ~ '^-?[0-9]+$'
-                THEN (i.execution_state -> 'monitor' ->> 'convergenceStallCount')::int
-              ELSE 0
-            END,
-            0
-          ) = 0
-          AND (i.execution_state -> 'monitor' ->> 'convergenceStalledAssigneeAgentId') IS NULL
-          AND NOT EXISTS (
-            SELECT 1
-            FROM issue_recovery_actions ra
-            WHERE ra.source_issue_id = i.id
-              AND ra.status IN ('active', 'escalated')
-          )
-        LIMIT ${batchSize}
-      )
-      UPDATE issues
-      SET status = 'todo', updated_at = now()
-      WHERE id IN (SELECT id FROM candidates)
-      RETURNING id, identifier
-    `);
+    const { candidates, flipped } = await db.transaction(async (tx) => {
+      const candidates = await listCandidateRows(tx, batchSize, cursor);
+      if (candidates.length === 0) return { candidates, flipped: [] };
+      return { candidates, flipped: await reconcileCandidateBatch(tx, candidates) };
+    });
 
-    const flipped = Array.isArray(rows) ? rows : Array.from(rows as Iterable<{ id: string; identifier: string | null }>);
+    const lastCandidate = candidates[candidates.length - 1] ?? null;
+    if (lastCandidate) {
+      cursor = { updatedAt: lastCandidate.updatedAt, id: lastCandidate.id };
+    }
+
     reconciled += flipped.length;
     iterations += 1;
 
@@ -118,7 +229,7 @@ export async function reconcileStrandedBlockedIssues(
       );
     }
 
-    if (flipped.length < batchSize) break;
+    if (candidates.length < batchSize) break;
   }
 
   if (iterations >= maxIterations) {
