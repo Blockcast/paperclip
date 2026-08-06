@@ -175,6 +175,18 @@ export interface Config {
   // GitHub login of the PR-reviewer bot (the GitHub App's bot user, e.g.
   // "allyblockcast[bot]") used to filter reviews/comments during verification.
   prReviewerBotLogin: string;
+  // Capture is deployed one rollout before authority processing so every API
+  // replica durably records deliveries before any replica can activate the gate.
+  githubReviewGateCaptureEnabled: boolean;
+  // Repositories whose signed GitHub webhook deliveries drive review-gate
+  // revocation and reconciliation. Empty keeps capture disabled.
+  githubReviewGateEnabled: boolean;
+  githubReviewGateRepositories: string[];
+  // Deployment-pinned identity allowed to produce the protected status.
+  // These are deliberately separate from the mounted credential fields so a
+  // secret rotation cannot silently transfer review authority to another App.
+  githubReviewGateExpectedAppId: string;
+  githubReviewGateExpectedInstallationId: string;
   // Commit-status context to fail when a PR-review run exhausts its bounded
   // retry chain (e.g. "review/ally-complete"). A required status that is never
   // posted shows as "Expected — waiting for status" forever, so an exhausted
@@ -462,6 +474,60 @@ export function loadConfig(): Config {
     throw new Error(resolvedBind.errors[0]);
   }
 
+  const githubWebhookSecret = process.env.GITHUB_WEBHOOK_SECRET ?? "";
+  const githubAppId = process.env.GITHUB_APP_ID ?? "";
+  const githubAppInstallationId = process.env.GITHUB_APP_INSTALLATION_ID ?? "";
+  const githubAppPrivateKey = (process.env.GITHUB_APP_PRIVATE_KEY ?? "").replace(/\\n/g, "\n");
+  const githubReviewGateCaptureEnabled =
+    process.env.PAPERCLIP_GITHUB_REVIEW_GATE_CAPTURE_ENABLED === "true";
+  const githubReviewGateEnabled = process.env.PAPERCLIP_GITHUB_REVIEW_GATE_ENABLED === "true";
+  const githubReviewGateRepositories = [
+    ...new Set(
+      (process.env.PAPERCLIP_GITHUB_REVIEW_GATE_REPOSITORIES ?? "")
+        .split(",")
+        .map((value) => value.trim())
+        .filter(Boolean),
+    ),
+  ];
+  const githubReviewGateExpectedAppId = (
+    process.env.PAPERCLIP_GITHUB_REVIEW_GATE_EXPECTED_APP_ID ?? ""
+  ).trim();
+  const githubReviewGateExpectedInstallationId = (
+    process.env.PAPERCLIP_GITHUB_REVIEW_GATE_EXPECTED_INSTALLATION_ID ?? ""
+  ).trim();
+  const prReviewGateStatusContext = (process.env.PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT ?? "").trim();
+  if (githubReviewGateCaptureEnabled) {
+    const missing = [
+      ["GITHUB_WEBHOOK_SECRET", githubWebhookSecret.trim()],
+      ["PAPERCLIP_GITHUB_REVIEW_GATE_REPOSITORIES", githubReviewGateRepositories.join(",")],
+      ["PAPERCLIP_GITHUB_REVIEW_GATE_EXPECTED_APP_ID", githubReviewGateExpectedAppId],
+      ["PAPERCLIP_GITHUB_REVIEW_GATE_EXPECTED_INSTALLATION_ID", githubReviewGateExpectedInstallationId],
+      ["PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT", prReviewGateStatusContext],
+    ].filter(([, value]) => !value).map(([name]) => name);
+    if (missing.length > 0) {
+      throw new Error(`GitHub review-gate capture is enabled but missing: ${missing.join(", ")}`);
+    }
+  }
+  if (githubReviewGateEnabled) {
+    if (!githubReviewGateCaptureEnabled) {
+      throw new Error("GitHub review-gate authority requires durable capture to be enabled");
+    }
+    const missing = [
+      ["GITHUB_APP_ID", githubAppId.trim()],
+      ["GITHUB_APP_INSTALLATION_ID", githubAppInstallationId.trim()],
+      ["GITHUB_APP_PRIVATE_KEY", githubAppPrivateKey.trim()],
+    ].filter(([, value]) => !value).map(([name]) => name);
+    if (missing.length > 0) {
+      throw new Error(`GitHub review-gate authority is enabled but missing: ${missing.join(", ")}`);
+    }
+    if (
+      githubAppId.trim() !== githubReviewGateExpectedAppId ||
+      githubAppInstallationId.trim() !== githubReviewGateExpectedInstallationId
+    ) {
+      throw new Error("GitHub review-gate runtime credentials do not match the pinned App authority");
+    }
+  }
+
   return {
     deploymentMode,
     deploymentExposure,
@@ -542,7 +608,7 @@ export function loadConfig(): Config {
     linearOAuthRedirectUri:
       process.env.PAPERCLIP_LINEAR_REDIRECT_URI ??
       `http://localhost:${Number(process.env.PORT) || fileConfig?.server.port || 3100}/api/auth/linear/callback`,
-    githubWebhookSecret: process.env.GITHUB_WEBHOOK_SECRET ?? "",
+    githubWebhookSecret,
     // Agent IDs that receive additional wakes on `pull_request.opened`,
     // `pull_request.ready_for_review`, and `pull_request_review.submitted`
     // events to drive PR review automation. When unset, the github-webhook
@@ -557,12 +623,17 @@ export function loadConfig(): Config {
     // GitHub App creds for server-side installation-token minting (PR-review
     // evidence verification). `private_key.pem` may arrive with escaped "\n"
     // depending on how it is injected, so normalize them to real newlines.
-    githubAppId: process.env.GITHUB_APP_ID ?? "",
-    githubAppInstallationId: process.env.GITHUB_APP_INSTALLATION_ID ?? "",
-    githubAppPrivateKey: (process.env.GITHUB_APP_PRIVATE_KEY ?? "").replace(/\\n/g, "\n"),
+    githubAppId,
+    githubAppInstallationId,
+    githubAppPrivateKey,
     prReviewerBotLogin: process.env.PAPERCLIP_PR_REVIEWER_BOT_LOGIN ?? "allyblockcast[bot]",
-    prReviewGateStatusContext: (process.env.PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT ?? "").trim(),
     prCommentReviewGateStatusContext: (process.env.PAPERCLIP_PR_COMMENT_REVIEW_GATE_STATUS_CONTEXT ?? "").trim(),
+    githubReviewGateCaptureEnabled,
+    githubReviewGateEnabled,
+    githubReviewGateRepositories,
+    githubReviewGateExpectedAppId,
+    githubReviewGateExpectedInstallationId,
+    prReviewGateStatusContext,
     telemetryEnabled: fileConfig?.telemetry?.enabled ?? true,
   };
 }

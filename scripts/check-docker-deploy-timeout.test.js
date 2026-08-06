@@ -172,6 +172,25 @@ test("Docker deploy binds Helm to the digest built for the approved SHA", () => 
   assert.match(imageHelper, /printf "%s@%s" \.Values\.image\.repository \.Values\.image\.digest/);
 });
 
+test("Docker deploy proves live review-gate capture before authority promotion", () => {
+  const deployJob = getDeployJobBlock();
+  const renderedPlan = deployJob.indexOf('> "${unstamped}"');
+  const promotionCheck = deployJob.indexOf('authority_enabled="$(node "${PROMOTION_VERIFY_SCRIPT}"');
+  const approval = deployJob.indexOf("name: Approve exact deploy plan at admission time");
+
+  assert.ok(renderedPlan >= 0, "the target API plan must be rendered before promotion validation");
+  assert.ok(
+    renderedPlan < promotionCheck && promotionCheck < approval,
+    "capture promotion must be checked before approving or applying the target plan",
+  );
+  assert.match(deployJob, /scripts\/verify-review-gate-capture-promotion\.mjs/);
+  assert.match(deployJob, /promotion_verify_script=\$\{promotion_verifier\}/);
+  assert.match(deployJob, /PROMOTION_VERIFY_SCRIPT: \$\{\{ steps\.tooling\.outputs\.promotion_verify_script \}\}/);
+  assert.match(deployJob, /kubectl -n "\$\{NS\}" get deployment paperclip-api -o json/);
+  assert.match(deployJob, /--target "\$\{unstamped\}" --print-authority/);
+  assert.match(deployJob, /--target "\$\{unstamped\}" --live "\$\{live_capture\}"/);
+});
+
 test("Docker deploy approves the exact stamped plan before Helm mutates production", () => {
   const deployJob = getDeployJobBlock();
   const tooling = deployJob.indexOf("name: Checkout release tooling at trusted revision");
