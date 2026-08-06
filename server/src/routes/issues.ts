@@ -5199,6 +5199,10 @@ export function issueRoutes(
         previousAssigneeAgentId: string | null;
         issueStatus: string;
       }) => void;
+      onCheckoutOwnershipValidated?: (input: {
+        checkoutRunId: string | null;
+        executionRunId: string | null;
+      }) => void;
       allowCoordinationMetadata?: boolean;
       /**
        * PATCH /issues/:id only: when an execution-stage currentParticipant and
@@ -5416,6 +5420,12 @@ export function issueRoutes(
     const runId = requireAgentRunId(req, res);
     if (!runId) return false;
     const ownership = await svc.assertCheckoutOwner(issue.id, actorAgentId, runId);
+    if ("checkoutRunId" in ownership || "executionRunId" in ownership) {
+      options.onCheckoutOwnershipValidated?.({
+        checkoutRunId: ownership.checkoutRunId ?? null,
+        executionRunId: ownership.executionRunId ?? null,
+      });
+    }
     if (ownership.adoptedFromRunId) {
       const actor = getActorInfo(req);
       await logActivity(db, {
@@ -9735,6 +9745,15 @@ export function issueRoutes(
         issueStatus: string;
       } | null;
     } = { current: null };
+    let currentRunMutationOwnershipSnapshot: {
+      checkoutRunId: string | null;
+      executionRunId: string | null;
+    } | null = req.actor.type === "agent" && isCurrentIssueExecutionRun(req, existing)
+      ? {
+          checkoutRunId: existing.checkoutRunId ?? null,
+          executionRunId: existing.executionRunId ?? null,
+        }
+      : null;
     // BLO-18289: coordination-metadata allowlist. Evaluated before the boundary
     // check so a manager holding tasks:assign can curate the dependency graph
     // on a report's issue; null whenever the body is not exclusively
@@ -9764,6 +9783,9 @@ export function issueRoutes(
         allowProductivityReviewOwner: true,
         onProductivityReviewOwnerMutationAllowed: (audit) => {
           productivityReviewSourceMutationAudit.current = audit;
+        },
+        onCheckoutOwnershipValidated: (ownership) => {
+          currentRunMutationOwnershipSnapshot = ownership;
         },
         allowCoordinationMetadata: coordinationMetadataDecision !== null,
         allowExecutionStageParticipantDecision: true,
@@ -10186,10 +10208,10 @@ export function issueRoutes(
               : null,
         };
     const currentRunMutationPreconditions =
-      req.actor.type === "agent" && isCurrentIssueExecutionRun(req, existing)
+      req.actor.type === "agent" && currentRunMutationOwnershipSnapshot
         ? {
-            expectedCurrentCheckoutRunId: existing.checkoutRunId ?? null,
-            expectedCurrentExecutionRunId: existing.executionRunId ?? null,
+            expectedCurrentCheckoutRunId: currentRunMutationOwnershipSnapshot.checkoutRunId,
+            expectedCurrentExecutionRunId: currentRunMutationOwnershipSnapshot.executionRunId,
           }
         : {};
 

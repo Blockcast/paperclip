@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { and, eq, inArray, isNull } from "drizzle-orm";
+import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
@@ -271,6 +271,109 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
         errorCode: null,
       },
     });
+  });
+
+  it("rejects a post-adoption stale PATCH when ownership transfers before the final write", async () => {
+    const { companyId, agentId, failedRunId, currentRunId } = await seedCompanyAgentAndRuns();
+    const nextRunId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: nextRunId,
+      companyId,
+      agentId,
+      status: "running",
+      invocationSource: "manual",
+      startedAt: new Date(),
+      createdAt: new Date("2026-01-01T00:02:00.000Z"),
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Post-adoption transfer",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: failedRunId,
+      executionRunId: failedRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date(),
+    });
+
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS test_post_adoption_transfer_config (
+        issue_id uuid PRIMARY KEY,
+        next_run_id uuid NOT NULL
+      )
+    `);
+    await db.execute(sql`
+      INSERT INTO test_post_adoption_transfer_config (issue_id, next_run_id)
+      VALUES (${issueId}, ${nextRunId})
+      ON CONFLICT (issue_id) DO UPDATE SET next_run_id = EXCLUDED.next_run_id
+    `);
+    await db.execute(sql`
+      CREATE OR REPLACE FUNCTION test_transfer_issue_after_adoption()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      AS $$
+      DECLARE
+        configured_next_run_id uuid;
+      BEGIN
+        SELECT next_run_id
+        INTO configured_next_run_id
+        FROM test_post_adoption_transfer_config
+        WHERE issue_id = NEW.id;
+
+        IF configured_next_run_id IS NOT NULL
+           AND NEW.checkout_run_id IS DISTINCT FROM configured_next_run_id THEN
+          UPDATE issues
+          SET checkout_run_id = configured_next_run_id,
+              execution_run_id = configured_next_run_id,
+              execution_locked_at = now(),
+              updated_at = now()
+          WHERE id = NEW.id;
+        END IF;
+
+        RETURN NEW;
+      END;
+      $$;
+    `);
+    await db.execute(sql`
+      DROP TRIGGER IF EXISTS test_transfer_issue_after_adoption ON issues
+    `);
+    await db.execute(sql`
+      CREATE TRIGGER test_transfer_issue_after_adoption
+      AFTER UPDATE OF checkout_run_id ON issues
+      FOR EACH ROW
+      WHEN (OLD.checkout_run_id IS DISTINCT FROM NEW.checkout_run_id)
+      EXECUTE FUNCTION test_transfer_issue_after_adoption()
+    `);
+
+    try {
+      const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+        .patch(`/api/issues/${issueId}`)
+        .send({ title: "Stale post-adoption write" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+
+      const row = await db
+        .select({
+          title: issues.title,
+          checkoutRunId: issues.checkoutRunId,
+          executionRunId: issues.executionRunId,
+        })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]);
+      expect(row).toEqual({
+        title: "Post-adoption transfer",
+        checkoutRunId: nextRunId,
+        executionRunId: nextRunId,
+      });
+    } finally {
+      await db.execute(sql`DROP TRIGGER IF EXISTS test_transfer_issue_after_adoption ON issues`);
+      await db.execute(sql`DROP FUNCTION IF EXISTS test_transfer_issue_after_adoption()`);
+      await db.execute(sql`DROP TABLE IF EXISTS test_post_adoption_transfer_config`);
+    }
   });
 
   it("allows a same-agent current run to close an issue owned by a stale adapter_failed checkout run", async () => {

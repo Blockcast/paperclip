@@ -10005,6 +10005,7 @@ export function issueService(db: Db) {
               status: issues.status,
               assigneeAgentId: issues.assigneeAgentId,
               checkoutRunId: issues.checkoutRunId,
+              executionRunId: issues.executionRunId,
             })
             .then((rows) => rows[0] ?? null);
           if (refreshed) {
