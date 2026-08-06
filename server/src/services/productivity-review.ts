@@ -444,23 +444,30 @@ function liveSegmentStartedAt(executionRun: HeartbeatRunRow | null, now: Date): 
  *
  * Anchor the active episode to the earliest run that has actually started
  * executing (`run.startedAt` populated) since the current checkout, instead
- * of the checkout timestamp itself. `latestRuns` is not pre-scoped to the
- * current episode (it is the issue's most recent runs overall), so runs
- * that started before this checkout are excluded. An issue whose run(s)
+ * of the checkout timestamp itself. This deliberately queries outside the
+ * `latestRuns` streak sample: that sample is capped at MAX_RUNS_FOR_STREAK
+ * and ordered newest-first, so it cannot be authoritative for the first run
+ * once an issue has a long post-checkout run history. An issue whose run(s)
  * are still queued/scheduled and have never executed has no active episode
- * yet, so this returns null and the caller treats elapsed duration as
- * absent rather than zero-but-growing.
+ * yet, so this returns null and the caller treats elapsed duration as absent
+ * rather than zero-but-growing.
  */
-function activeExecutionEpisodeStart(issue: IssueRow, latestRuns: HeartbeatRunRow[]): Date | null {
+async function activeExecutionEpisodeStart(db: Db, issue: IssueRow, agent: AgentRow): Promise<Date | null> {
   const checkoutAt = coerceDate(issue.startedAt) ?? coerceDate(issue.executionLockedAt);
   if (!checkoutAt) return null;
-  let earliest: Date | null = null;
-  for (const run of latestRuns) {
-    const startedAt = coerceDate(run.startedAt);
-    if (!startedAt || startedAt.getTime() < checkoutAt.getTime()) continue;
-    if (!earliest || startedAt.getTime() < earliest.getTime()) earliest = startedAt;
-  }
-  return earliest;
+  const [row] = await db
+    .select({ startedAt: sql<Date | string | null>`min(${heartbeatRuns.startedAt})` })
+    .from(heartbeatRuns)
+    .where(
+      and(
+        eq(heartbeatRuns.companyId, issue.companyId),
+        eq(heartbeatRuns.agentId, agent.id),
+        issueRunScopeSql(issue.id),
+        sql`${heartbeatRuns.startedAt} is not null`,
+        sql`${heartbeatRuns.startedAt} >= ${checkoutAt.toISOString()}::timestamptz`,
+      ),
+    );
+  return coerceDate(row?.startedAt);
 }
 
 function isTerminalIssueStatus(status: string | null | undefined) {
@@ -2101,7 +2108,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     const activeRunCount = latestRuns.filter((run) =>
       ACTIVE_RUN_STATUSES.includes(run.status as (typeof ACTIVE_RUN_STATUSES)[number]),
     ).length;
-    const activeStartedAt = activeExecutionEpisodeStart(sourceIssue, latestRuns);
+    const activeStartedAt = await activeExecutionEpisodeStart(db, sourceIssue, sourceAgent);
     // BLO-19848: clamp the episode end to the last moment execution was
     // attributable to a live run, so a wedged holder cannot accrue "active"
     // time on work that already finished. See nonLiveExecutionHoldSince.

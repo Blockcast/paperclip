@@ -1056,6 +1056,67 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(review?.description).toContain("current active episode has lasted 7h");
   });
 
+  it("keeps long-active review timing independent of the bounded run-streak sample (BLO-22016)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 8 * 60 * 60 * 1000),
+      activeRun: false,
+    });
+    const earliestStartedAt = new Date(now.getTime() - 7 * 60 * 60 * 1000);
+    const recentRuns: Array<typeof heartbeatRuns.$inferInsert> = Array.from({ length: 100 }, (_, index) => {
+      const createdAt = new Date(now.getTime() - index * 60_000);
+      return {
+        id: randomUUID(),
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        status: "succeeded",
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        startedAt: createdAt,
+        finishedAt: new Date(createdAt.getTime() + 30_000),
+        contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+        livenessState: "advanced",
+        nextAction: "Continue processing the next batch.",
+        createdAt,
+        updatedAt: createdAt,
+      };
+    });
+    await db.insert(heartbeatRuns).values([
+      ...recentRuns,
+      {
+        id: randomUUID(),
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        status: "succeeded",
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        startedAt: earliestStartedAt,
+        finishedAt: new Date(earliestStartedAt.getTime() + 30_000),
+        contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+        livenessState: "advanced",
+        nextAction: "Started the active episode.",
+        createdAt: earliestStartedAt,
+        updatedAt: earliestStartedAt,
+      },
+    ]);
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: {
+        noCommentStreakRuns: 1_000,
+        highChurnHourly: 1_000,
+        highChurnSixHours: 1_000,
+      },
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+    expect(review?.description).toContain("current active episode has lasted 7h");
+  });
+
   // BLO-19848: `long_active_duration` measured raw wall-clock from
   // issues.started_at to now with no reference to whether anything was actually
   // executing, so an issue pinned by a non-live executionRunId kept accruing
