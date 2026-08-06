@@ -151,28 +151,83 @@ function fallbackCandidates(input: PrefetchInput): TraversalCandidate[] {
   return candidates;
 }
 
-function mergeGraphs(primary: unknown | null, fallback: unknown): unknown {
-  if (primary === null || primary === undefined) return fallback;
-  if (Array.isArray(primary) && primary.length === 0) return fallback;
+// BLO-21635: the fallback candidates are agent/project hub nodes, which can be
+// linked to thousands of unrelated fact-* nodes (observed up to ~23k, ~5.8MB
+// decoded JSON, on a single "ok" recall). The issue traversal is scoped and
+// safe to attach whole; the hub fallback is not, so cap only the fallback's
+// contribution before merging rather than letting it dominate the cached
+// graph. This bounds payload size regardless of how big the server-side hub
+// neighborhood is.
+export const MAX_ENRICHMENT_NODES = 50;
 
-  if (Array.isArray(primary) && Array.isArray(fallback)) {
-    return dedupeByStableString([...primary, ...fallback]);
+function mergeGraphs(primary: unknown | null, fallback: unknown): unknown {
+  const cappedFallback = capEnrichmentGraph(fallback);
+
+  if (primary === null || primary === undefined) return cappedFallback;
+  if (Array.isArray(primary) && primary.length === 0) return cappedFallback;
+
+  if (Array.isArray(primary) && Array.isArray(cappedFallback)) {
+    return dedupeByStableString([...primary, ...cappedFallback]);
   }
 
-  if (isRecord(primary) && isRecord(fallback)) {
+  if (isRecord(primary) && isRecord(cappedFallback)) {
     const primaryNodes = Array.isArray(primary.nodes) ? primary.nodes : [];
-    const fallbackNodes = Array.isArray(fallback.nodes) ? fallback.nodes : [];
+    const fallbackNodes = Array.isArray(cappedFallback.nodes) ? cappedFallback.nodes : [];
     const primaryEdges = Array.isArray(primary.edges) ? primary.edges : [];
-    const fallbackEdges = Array.isArray(fallback.edges) ? fallback.edges : [];
+    const fallbackEdges = Array.isArray(cappedFallback.edges) ? cappedFallback.edges : [];
     return {
-      ...fallback,
+      ...cappedFallback,
       ...primary,
       nodes: dedupeByStableString([...primaryNodes, ...fallbackNodes]),
       edges: dedupeByStableString([...primaryEdges, ...fallbackEdges]),
     };
   }
 
-  return { issueGraph: primary, enrichmentGraph: fallback };
+  return { issueGraph: primary, enrichmentGraph: cappedFallback };
+}
+
+/** Bound a hub-node fallback graph to at most {@link MAX_ENRICHMENT_NODES}
+ *  nodes before it is merged into the cached recall. Keeps the nodes closest
+ *  to the hub (lowest traversal `depth`) when present, since those are the
+ *  most likely to be structurally relevant; falls back to traversal order
+ *  when nodes don't carry a `depth` field. */
+function capEnrichmentGraph(graph: unknown): unknown {
+  if (Array.isArray(graph)) {
+    return capNodesArray(graph, MAX_ENRICHMENT_NODES);
+  }
+  if (isRecord(graph) && Array.isArray(graph.nodes)) {
+    const kept = capNodesArray(graph.nodes, MAX_ENRICHMENT_NODES);
+    if (kept === graph.nodes) return graph;
+    const keptSlugs = new Set(kept.map(nodeSlug).filter((slug): slug is string => slug !== null));
+    const edges = Array.isArray(graph.edges)
+      ? graph.edges.filter((edge) => edgeWithinSlugs(edge, keptSlugs))
+      : graph.edges;
+    return { ...graph, nodes: kept, edges };
+  }
+  return graph;
+}
+
+function capNodesArray(nodes: unknown[], limit: number): unknown[] {
+  if (nodes.length <= limit) return nodes;
+  return [...nodes].sort((a, b) => nodeRank(a) - nodeRank(b)).slice(0, limit);
+}
+
+function nodeRank(node: unknown): number {
+  if (isRecord(node) && typeof node.depth === "number") return node.depth;
+  return Number.POSITIVE_INFINITY;
+}
+
+function nodeSlug(node: unknown): string | null {
+  return isRecord(node) && typeof node.slug === "string" ? node.slug : null;
+}
+
+function edgeWithinSlugs(edge: unknown, slugs: Set<string>): boolean {
+  if (!isRecord(edge)) return true;
+  const from = typeof edge.from === "string" ? edge.from : null;
+  const to = typeof edge.to === "string" ? edge.to : null;
+  if (from !== null && !slugs.has(from)) return false;
+  if (to !== null && !slugs.has(to)) return false;
+  return true;
 }
 
 function dedupeByStableString(values: unknown[]): unknown[] {
