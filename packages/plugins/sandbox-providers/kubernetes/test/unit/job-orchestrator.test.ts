@@ -78,17 +78,24 @@ describe("createJob", () => {
     expect(create).not.toHaveBeenCalled();
   });
 
-  // BLO-22454: a retry of the same run reproduces the same deterministic Job
-  // name and 409s against its own in-flight Job. The 409 must not be an
-  // opaque throw — it should adopt the existing Job's uid.
+  const identityLabels = {
+    "paperclip.io/run-id": "run-abc",
+    "paperclip.io/company-id": "company-abc",
+    "paperclip.io/managed-by": "paperclip-k8s-plugin",
+    "paperclip.io/adapter": "codex_local",
+  };
+
+  // BLO-22454: a concurrent create of the same run can 409 against its
+  // in-flight Job. It is safe to adopt only the Job carrying that run's
+  // immutable Paperclip identity labels.
   it("adopts the existing Job's uid on a 409 AlreadyExists", async () => {
     const create = vi.fn().mockRejectedValue({ code: 409 });
-    const read = vi.fn().mockResolvedValue({ metadata: { uid: "existing-uid" } });
+    const read = vi.fn().mockResolvedValue({ metadata: { uid: "existing-uid", labels: identityLabels } });
     const clients = { batch: { createNamespacedJob: create, readNamespacedJob: read } };
     const jobManifest = {
       apiVersion: "batch/v1",
       kind: "Job",
-      metadata: { name: "r-1", namespace: "ns", labels: { "paperclip.io/run-id": "run-abc" } },
+      metadata: { name: "r-1", namespace: "ns", labels: identityLabels },
       spec: { template: {} },
     };
     const result = await createJob(clients as never, "ns", jobManifest);
@@ -96,23 +103,47 @@ describe("createJob", () => {
     expect(result.uid).toBe("existing-uid");
   });
 
-  // A Job under foreground deletion (deletionTimestamp set) is about to
-  // disappear. Adopting it would attach a run to a Job that never runs.
-  it("does not adopt a Job that is Terminating (deletionTimestamp set)", async () => {
+  it("rejects an existing Job whose identity labels do not match the manifest", async () => {
     const create = vi.fn().mockRejectedValue({ code: 409 });
     const read = vi.fn().mockResolvedValue({
-      metadata: { uid: "existing-uid", deletionTimestamp: "2026-08-06T12:00:00Z" },
+      metadata: { uid: "existing-uid", labels: { ...identityLabels, "paperclip.io/run-id": "other-run" } },
     });
     const clients = { batch: { createNamespacedJob: create, readNamespacedJob: read } };
     const jobManifest = {
       apiVersion: "batch/v1",
       kind: "Job",
-      metadata: { name: "r-1", namespace: "ns", labels: { "paperclip.io/run-id": "run-abc" } },
+      metadata: { name: "r-1", namespace: "ns", labels: identityLabels },
       spec: { template: {} },
     };
-    await expect(createJob(clients as never, "ns", jobManifest)).rejects.toBeInstanceOf(JobAlreadyExistsError);
-    await expect(createJob(clients as never, "ns", jobManifest)).rejects.toThrow(/run-abc/);
-    await expect(createJob(clients as never, "ns", jobManifest)).rejects.toThrow(/Terminating/);
+
+    await expect(createJob(clients as never, "ns", jobManifest)).rejects.toThrow(/expected Paperclip identity labels/);
+  });
+
+  // A Job under foreground deletion is unsafe to adopt, but it is transient:
+  // wait for the observed UID to disappear, then retry the same manifest.
+  it("retries creation after a conflicting terminating Job disappears", async () => {
+    const create = vi
+      .fn()
+      .mockRejectedValueOnce({ code: 409 })
+      .mockResolvedValueOnce({ metadata: { uid: "replacement-uid" } });
+    const read = vi
+      .fn()
+      .mockResolvedValueOnce({
+        metadata: { uid: "existing-uid", deletionTimestamp: "2026-08-06T12:00:00Z", labels: identityLabels },
+      })
+      .mockRejectedValueOnce({ code: 404 });
+    const clients = { batch: { createNamespacedJob: create, readNamespacedJob: read } };
+    const jobManifest = {
+      apiVersion: "batch/v1",
+      kind: "Job",
+      metadata: { name: "r-1", namespace: "ns", labels: identityLabels },
+      spec: { template: {} },
+    };
+    const result = await createJob(clients as never, "ns", jobManifest, { conflictRetryTimeoutMs: 0 });
+
+    expect(result.uid).toBe("replacement-uid");
+    expect(create).toHaveBeenCalledTimes(2);
+    expect(read).toHaveBeenCalledTimes(2);
   });
 
   it("throws a typed error naming the run id when the existing Job can't be read", async () => {
@@ -122,7 +153,7 @@ describe("createJob", () => {
     const jobManifest = {
       apiVersion: "batch/v1",
       kind: "Job",
-      metadata: { name: "r-2", namespace: "ns", labels: { "paperclip.io/run-id": "run-xyz" } },
+      metadata: { name: "r-2", namespace: "ns", labels: { ...identityLabels, "paperclip.io/run-id": "run-xyz" } },
       spec: { template: {} },
     };
     await expect(createJob(clients as never, "ns", jobManifest)).rejects.toThrow(JobAlreadyExistsError);

@@ -20,12 +20,14 @@ export class JobAlreadyExistsError extends Error {
     namespace: string,
     name: string,
     runId: string | undefined,
-    reason: "terminating" | "unreadable" | "no-uid",
+    reason: "ownership-mismatch" | "terminating-timeout" | "unreadable" | "no-uid",
   ) {
     const runIdPart = runId ? ` (run ${runId})` : "";
     const reasonText =
-      reason === "terminating"
-        ? "the existing Job is still Terminating under foreground deletion, so it is not safe to adopt"
+      reason === "ownership-mismatch"
+        ? "the existing Job does not have the expected Paperclip identity labels"
+        : reason === "terminating-timeout"
+          ? "the existing Job remained Terminating past the bounded retry window"
         : reason === "unreadable"
           ? "the existing Job could not be read to adopt its uid"
           : "the existing Job has no uid to adopt";
@@ -34,10 +36,25 @@ export class JobAlreadyExistsError extends Error {
   }
 }
 
+export interface CreateJobOptions {
+  conflictRetryTimeoutMs?: number;
+  conflictRetryPollMs?: number;
+}
+
+const CONFLICT_RETRY_TIMEOUT_MS = 10_000;
+const CONFLICT_RETRY_POLL_MS = 250;
+const IDENTITY_LABELS = [
+  "paperclip.io/run-id",
+  "paperclip.io/company-id",
+  "paperclip.io/managed-by",
+  "paperclip.io/adapter",
+] as const;
+
 export async function createJob(
   clients: KubeClients,
   namespace: string,
   manifest: Record<string, unknown>,
+  options: CreateJobOptions = {},
 ): Promise<{ uid: string }> {
   // Choke point: this accepts an arbitrary manifest, so re-check here rather
   // than trusting that it came from buildJobManifest.
@@ -45,45 +62,102 @@ export async function createJob(
   const meta = (manifest.metadata as { name?: string; labels?: Record<string, string> } | undefined) ?? {};
   const name = meta.name;
   const runId = meta.labels?.["paperclip.io/run-id"];
-  try {
-    const result = await clients.batch.createNamespacedJob({ namespace, body: manifest as never });
-    const uid = (result as { metadata?: { uid?: string } }).metadata?.uid;
-    if (!uid) throw new Error("Job created without a UID");
-    return { uid };
-  } catch (err) {
-    if (!isAlreadyExists(err) || !name) throw err;
-    return adoptExistingJob(clients, namespace, name, runId);
+  const retryTimeoutMs = options.conflictRetryTimeoutMs ?? CONFLICT_RETRY_TIMEOUT_MS;
+  const retryPollMs = options.conflictRetryPollMs ?? CONFLICT_RETRY_POLL_MS;
+
+  for (;;) {
+    try {
+      const result = await clients.batch.createNamespacedJob({ namespace, body: manifest as never });
+      const uid = (result as { metadata?: { uid?: string } }).metadata?.uid;
+      if (!uid) throw new Error("Job created without a UID");
+      return { uid };
+    } catch (err) {
+      if (!isAlreadyExists(err) || !name) throw err;
+      const existing = await readExistingJob(clients, namespace, name, runId);
+      if (!existing) continue;
+      assertExpectedIdentity(existing, meta.labels, namespace, name, runId);
+      const uid = existing.metadata?.uid;
+      if (!uid) throw new JobAlreadyExistsError(namespace, name, runId, "no-uid");
+      if (!existing.metadata?.deletionTimestamp) return { uid };
+
+      await waitForJobDeletion(
+        clients,
+        namespace,
+        name,
+        runId,
+        meta.labels,
+        uid,
+        retryTimeoutMs,
+        retryPollMs,
+      );
+    }
   }
 }
 
-// A retry of the same run reproduces the same deterministic Job name and
-// 409s against its own in-flight (or just-deleted) Job. Adopt the existing
-// Job's uid rather than failing the run outright — unless it is mid-deletion,
-// in which case it is about to disappear and must not be attached to.
-async function adoptExistingJob(
+type ExistingJob = {
+  metadata?: { uid?: string; deletionTimestamp?: string; labels?: Record<string, string> };
+};
+
+async function readExistingJob(
   clients: KubeClients,
   namespace: string,
   name: string,
   runId: string | undefined,
-): Promise<{ uid: string }> {
-  let existing: { metadata?: { uid?: string; deletionTimestamp?: string } };
+): Promise<ExistingJob | null> {
   try {
-    existing = (await clients.batch.readNamespacedJob({ namespace, name })) as never;
-  } catch {
+    return (await clients.batch.readNamespacedJob({ namespace, name })) as ExistingJob;
+  } catch (err) {
+    if (isNotFound(err)) return null;
     throw new JobAlreadyExistsError(namespace, name, runId, "unreadable");
   }
-  if (existing.metadata?.deletionTimestamp) {
-    throw new JobAlreadyExistsError(namespace, name, runId, "terminating");
+}
+
+function assertExpectedIdentity(
+  existing: ExistingJob,
+  expectedLabels: Record<string, string> | undefined,
+  namespace: string,
+  name: string,
+  runId: string | undefined,
+): void {
+  const labels = existing.metadata?.labels;
+  if (IDENTITY_LABELS.some((key) => !expectedLabels?.[key] || labels?.[key] !== expectedLabels[key])) {
+    throw new JobAlreadyExistsError(namespace, name, runId, "ownership-mismatch");
   }
-  const uid = existing.metadata?.uid;
-  if (!uid) throw new JobAlreadyExistsError(namespace, name, runId, "no-uid");
-  return { uid };
+}
+
+async function waitForJobDeletion(
+  clients: KubeClients,
+  namespace: string,
+  name: string,
+  runId: string | undefined,
+  expectedLabels: Record<string, string> | undefined,
+  deletingUid: string,
+  timeoutMs: number,
+  pollMs: number,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const current = await readExistingJob(clients, namespace, name, runId);
+    if (!current) return;
+    assertExpectedIdentity(current, expectedLabels, namespace, name, runId);
+    if (current.metadata?.uid !== deletingUid || !current.metadata?.deletionTimestamp) return;
+    if (Date.now() >= deadline) {
+      throw new JobAlreadyExistsError(namespace, name, runId, "terminating-timeout");
+    }
+    await sleep(pollMs);
+  }
 }
 
 function isAlreadyExists(err: unknown): boolean {
   if (typeof err !== "object" || err === null) return false;
   const e = err as { code?: number; statusCode?: number };
   return e.code === 409 || e.statusCode === 409;
+}
+
+function isNotFound(err: unknown): boolean {
+  if (typeof err !== "object" || err === null) return false;
+  const e = err as { code?: number; statusCode?: number };
+  return e.code === 404 || e.statusCode === 404;
 }
 
 export type JobStatus = SandboxStatus;
