@@ -123,6 +123,15 @@ jobs:
             }
 
   policy:
+    # BLO-21953: without this dependency, `policy` is an independent root job
+    # competing with `merge_queue_guard` for the same arc-light pool. Under
+    # the pool-starvation failure mode the guard exists to fix, GitHub can
+    # schedule `policy` first (or concurrently), so a superseded generation
+    # would burn a runner here before the guard ever gets to cancel it. The
+    # `if` keeps the pull_request path working, where `merge_queue_guard`
+    # never runs and reports `skipped` rather than `success`.
+    needs: [merge_queue_guard]
+    if: always() && (needs.merge_queue_guard.result == 'success' || needs.merge_queue_guard.result == 'skipped')
     runs-on: arc-light
     timeout-minutes: 5
     permissions:
@@ -282,6 +291,11 @@ jobs:
   # the gate that every unrelated PR depends on.
   helm_chart:
     name: Helm chart
+    # BLO-21953: same rationale as `policy` above -- this is the other
+    # independent arc-light root that must wait behind the merge-queue guard
+    # instead of racing it for a runner.
+    needs: [merge_queue_guard]
+    if: always() && (needs.merge_queue_guard.result == 'success' || needs.merge_queue_guard.result == 'skipped')
     runs-on: arc-light
     timeout-minutes: 10
 

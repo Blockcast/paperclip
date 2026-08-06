@@ -103,6 +103,45 @@ test("merge-queue guard is isolated from the checkout policy job", () => {
   assert.doesNotMatch(policyBlock, /\n      actions: write\n/);
 });
 
+test("every arc-light root job waits for the merge-queue guard before consuming a runner", () => {
+  // BLO-21953 follow-up: `policy` and `helm_chart` are the only two jobs that
+  // start with no `needs` of their own -- everything else in the workflow is
+  // already gated behind `policy`. If either became an independent root
+  // again, it would race `merge_queue_guard` for the same arc-light pool and
+  // could consume a runner before a superseded run gets cancelled, making
+  // the guard's fail-open cancellation nondeterministic under the exact
+  // pool-starvation load it exists to relieve.
+  const jobsSection = workflow.slice(workflow.indexOf("\njobs:\n"));
+  const jobNames = [...jobsSection.matchAll(/^  ([a-z0-9_]+):\n/gm)].map((match) => match[1]);
+  assert.deepEqual(jobNames, [
+    "merge_queue_guard",
+    "policy",
+    "helm_chart",
+    "typecheck_release_registry",
+    "worktree_install",
+    "general_tests",
+    "verify",
+    "build",
+    "verify_serialized_server",
+    "canary_dry_run",
+    "e2e",
+  ]);
+
+  for (const job of ["policy", "helm_chart"]) {
+    const block = extractBlock(`\n  ${job}:\n`, `\n  ${job === "policy" ? "helm_chart" : "typecheck_release_registry"}:\n`);
+    assert.match(
+      block,
+      /\n    needs: \[merge_queue_guard\]\n/,
+      `${job} must declare needs: [merge_queue_guard] so it cannot start before the guard resolves`,
+    );
+    assert.match(
+      block,
+      /\n    if: always\(\) && \(needs\.merge_queue_guard\.result == 'success' \|\| needs\.merge_queue_guard\.result == 'skipped'\)\n/,
+      `${job} must fail open when the guard is skipped (pull_request) or succeeded (merge_group, still live)`,
+    );
+  }
+});
+
 test("live membership on the first page continues without cancelling", async () => {
   const result = await runGuard({
     responses: [responseFor(["other", "head-sha"])],
