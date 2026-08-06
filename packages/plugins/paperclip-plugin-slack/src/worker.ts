@@ -97,13 +97,18 @@ import type {
 } from "./types.js";
 
 let pluginCtx: PluginContext;
-let pluginToken: string;
 let pluginConfig: SlackPluginConfig;
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 let slackAdapter: SlackAdapter;
 
 // --- Slack signature verification ---
-let slackSigningSecret: string | null = null;
+// No module-level secret: on a multi-company install the bootstrap config is
+// always `{}` (plugin-loader.ts), so a value resolved once at setup() time
+// could only ever be one company's secret — wrongly accepted for every other
+// company's requests, or (as it actually manifested) never resolved at all,
+// permanently disabling verification AND `canProcessMutatingApprovalWebhook`
+// for every company. Resolved fresh per delivery in `onWebhook` instead; see
+// `resolveCompanySigningSecret`.
 
 /** Why a webhook signature check failed (for diagnostic logging only). */
 type SigFailReason =
@@ -157,8 +162,9 @@ function takeSuppressedSigCount(): number {
 function verifySlackSignature(
   headers: Record<string, string | string[]>,
   rawBody: string,
+  signingSecret: string | null,
 ): SigCheckResult {
-  if (!slackSigningSecret) return { ok: true }; // skip if not configured
+  if (!signingSecret) return { ok: true }; // skip if not configured
   const timestamp = String(
     headers["x-slack-request-timestamp"] ??
       headers["X-Slack-Request-Timestamp"] ??
@@ -192,7 +198,7 @@ function verifySlackSignature(
     };
   }
   const baseString = `v0:${timestamp}:${rawBody}`;
-  const hmac = createHmac("sha256", slackSigningSecret)
+  const hmac = createHmac("sha256", signingSecret)
     .update(baseString)
     .digest("hex");
   const expected = `v0=${hmac}`;
@@ -228,13 +234,59 @@ function verifySlackSignature(
   };
 }
 
-function canProcessMutatingApprovalWebhook(source: string): boolean {
-  if (slackSigningSecret) return true;
+function canProcessMutatingApprovalWebhook(
+  source: string,
+  signingSecret: string | null,
+): boolean {
+  if (signingSecret) return true;
   pluginCtx.logger.warn(
     "Rejected mutating Slack approval webhook: missing Slack signing secret",
     { source },
   );
   return false;
+}
+
+/**
+ * Resolve the Slack signing secret this delivery's own company configured,
+ * for signature verification and the mutating-approval gate. Never the
+ * `setup()` bootstrap snapshot — same reasoning as `resolveInteractionScope`:
+ * the host always hands the worker `{}` on a multi-company install, so a
+ * secret resolved once at startup could only ever be one company's, and using
+ * it to verify a DIFFERENT company's request would accept a signature that
+ * was never actually produced with that company's secret.
+ *
+ * Returns `null` (never throws) for a missing companyId, a config/secret read
+ * failure, or a company that simply hasn't configured a signing secret — the
+ * last case intentionally matches the pre-existing "skip verification if not
+ * configured" behavior, now evaluated per company instead of once globally.
+ */
+async function resolveCompanySigningSecret(
+  ctx: PluginContext,
+  companyId: string,
+): Promise<string | null> {
+  if (!companyId) return null;
+  let raw: Record<string, unknown> | null | undefined;
+  try {
+    raw = await ctx.config.get(companyId);
+  } catch (err) {
+    ctx.logger.warn(
+      `Could not load config to resolve the Slack signing secret for company ${companyId}`,
+      { err },
+    );
+    return null;
+  }
+  const ref = (raw as unknown as SlackPluginConfig | undefined)
+    ?.slackSigningSecretRef;
+  if (!ref) return null;
+  try {
+    return await ctx.secrets.resolve(ref, { companyId });
+  } catch (err) {
+    ctx.logger.warn(
+      `Could not resolve slackSigningSecretRef for company ${companyId}`,
+      { err },
+    );
+    return null;
+  }
 }
 
 // --- Helpers ---
@@ -267,8 +319,11 @@ async function approvalIdForMessage(
   return typeof id === "string" ? id : null;
 }
 
-function isAuthorizedReactor(slackUserId: string): boolean {
-  const allow = pluginConfig.approvalReactorSlackIds ?? [];
+function isAuthorizedReactor(
+  slackUserId: string,
+  config: SlackPluginConfig,
+): boolean {
+  const allow = config.approvalReactorSlackIds ?? [];
   return allow.includes(slackUserId);
 }
 
@@ -285,13 +340,102 @@ async function listTargetCompanies(
   return ctx.companies.list({ limit: 100, offset: 0 });
 }
 
-async function resolveTargetCompanyId(
-  ctx: Pick<PluginContext, "companies">,
-): Promise<string> {
-  const companyId = configuredCompanyId();
-  if (companyId) return companyId;
-  const companies = await ctx.companies.list({ limit: 1, offset: 0 });
-  return companies[0]?.id ?? "";
+/**
+ * Load the company-scoped config row for one interactive delivery. Never
+ * falls back to the `setup()` snapshot — see `resolveInteractionScope` for why.
+ * Returns `null` (after logging one warn) for a missing companyId, a config
+ * read failure, or a company with no stored config at all.
+ */
+async function loadCompanyConfig(
+  ctx: PluginContext,
+  companyId: string,
+  label: string,
+): Promise<SlackPluginConfig | null> {
+  if (!companyId) {
+    ctx.logger.warn(
+      `Slack ${label} dropped — inbound delivery carried no companyId, cannot establish tenant`,
+    );
+    return null;
+  }
+  let raw: Record<string, unknown> | null | undefined;
+  try {
+    raw = await ctx.config.get(companyId);
+  } catch (err) {
+    ctx.logger.warn(
+      `Slack ${label} dropped for company ${companyId} — could not load config`,
+      { err },
+    );
+    return null;
+  }
+  if (!raw || Object.keys(raw).length === 0) {
+    ctx.logger.warn(
+      `Slack ${label} dropped for company ${companyId} — no stored config`,
+    );
+    return null;
+  }
+  return raw as unknown as SlackPluginConfig;
+}
+
+export interface CompanyInteractionScope {
+  config: SlackPluginConfig;
+  token: string;
+}
+
+/**
+ * Resolve the config + bot token this interactive delivery should use, scoped
+ * strictly to the company the HOST attached to the delivery (`companyId`
+ * below — always the webhook's own `input.companyId`, an inbound event's
+ * `event.companyId`, or a downstream value threaded from one of those; never
+ * a guess).
+ *
+ * Deliberately never falls back to the `setup()` snapshot or to any other
+ * company's token. The snapshot is worthless — `plugin-loader.ts` builds the
+ * bootstrap config as a literal `{}` on any install with more than one
+ * configured company, so `pluginToken`/`pluginConfig` never carry real
+ * per-tenant credentials — and it is dangerous, because the only thing that
+ * ever populated those globals was whichever company's config the operator
+ * saved most recently. Serving that value to a different company's
+ * interaction would authenticate it against the wrong tenant's Slack bot
+ * token. This mirrors `resolveCompanyScope` in
+ * `paperclip-plugin-alertmanager/src/config-scope.ts` (BLO-20467) and
+ * `resolveCompanyJobScope` above (BLO-20959): per-request resolution, fail
+ * closed, one explanatory warn.
+ *
+ * Returns `null` — never throws — so the caller can drop the interaction
+ * without risking a retry that replays the same ambiguous/unresolvable
+ * tenant. `label` is folded into the warn so a log reader can tell which
+ * interactive surface no-oped without needing a stack trace.
+ */
+async function resolveInteractionScope(
+  ctx: PluginContext,
+  companyId: string,
+  label: string,
+): Promise<CompanyInteractionScope | null> {
+  const config = await loadCompanyConfig(ctx, companyId, label);
+  if (!config) return null;
+  if (!config.slackTokenRef) {
+    ctx.logger.warn(
+      `Slack ${label} dropped for company ${companyId} — config has no slackTokenRef`,
+    );
+    return null;
+  }
+  let token: string;
+  try {
+    token = await ctx.secrets.resolve(config.slackTokenRef, { companyId });
+  } catch (err) {
+    ctx.logger.warn(
+      `Slack ${label} dropped for company ${companyId} — could not resolve slackTokenRef`,
+      { err },
+    );
+    return null;
+  }
+  if (!token) {
+    ctx.logger.warn(
+      `Slack ${label} dropped for company ${companyId} — slackTokenRef resolved to an empty value`,
+    );
+    return null;
+  }
+  return { config, token };
 }
 
 /**
@@ -300,6 +444,8 @@ async function resolveTargetCompanyId(
  */
 async function handleReactionEvent(
   event: Record<string, unknown>,
+  companyId: string,
+  signingSecret: string | null,
 ): Promise<void> {
   const reaction = String(event.reaction ?? "");
   const decision = emojiToDecision(reaction);
@@ -310,24 +456,32 @@ async function handleReactionEvent(
   const ts = String(item?.ts ?? "");
   const slackUserId = String(event.user ?? "");
   if (!channel || !ts || !slackUserId) return;
-
-  const companyId = await resolveTargetCompanyId(pluginCtx);
   if (!companyId) return;
 
   const approvalId = await approvalIdForMessage(companyId, channel, ts);
   if (!approvalId) return; // reaction on a non-approval message → ignore
 
-  if (!canProcessMutatingApprovalWebhook("reaction")) return;
+  if (!canProcessMutatingApprovalWebhook("reaction", signingSecret)) return;
+
+  // Resolved only once we know this is an approval-card reaction, so the
+  // common case (an emoji on an ordinary message, in a busy channel) never
+  // pays for a config read + secret resolution.
+  const scope = await resolveInteractionScope(
+    pluginCtx,
+    companyId,
+    "reaction interaction",
+  );
+  if (!scope) return;
 
   if (event.type === "reaction_removed") {
-    await handleReactionRemoved(pluginCtx, pluginToken, {
+    await handleReactionRemoved(pluginCtx, scope.token, {
       companyId,
       approvalId,
       decision,
       slackUserId,
       channel,
       ts,
-      paperclipBaseUrl: pluginConfig.paperclipBaseUrl,
+      paperclipBaseUrl: scope.config.paperclipBaseUrl,
     });
     return;
   }
@@ -335,15 +489,15 @@ async function handleReactionEvent(
   // reaction_added → stage a pending decision (committed after the undo grace
   // window). The allowlist check is enforced inside stagePendingReaction so the
   // unauthorized note + no-op behavior is covered by direct unit tests.
-  await stagePendingReaction(pluginCtx, pluginToken, {
+  await stagePendingReaction(pluginCtx, scope.token, {
     companyId,
     approvalId,
     decision,
     slackUserId,
     channel,
     ts,
-    authorized: isAuthorizedReactor(slackUserId),
-    paperclipBaseUrl: pluginConfig.paperclipBaseUrl,
+    authorized: isAuthorizedReactor(slackUserId, scope.config),
+    paperclipBaseUrl: scope.config.paperclipBaseUrl,
   });
 }
 
@@ -355,6 +509,7 @@ async function handleReactionEvent(
  */
 async function handleInboundMessageEvent(
   event: Record<string, unknown>,
+  companyId: string,
 ): Promise<void> {
   // Ignore bot messages and non-plain subtypes (edits, deletes, joins, …).
   if (event.bot_id || event.app_id) return;
@@ -366,8 +521,6 @@ async function handleInboundMessageEvent(
   const threadTs = String(event.thread_ts ?? event.ts ?? "");
   const text = String(event.text ?? "");
   if (!channel || !threadTs) return;
-
-  const companyId = await resolveTargetCompanyId(pluginCtx);
   if (!companyId) return;
 
   const files = Array.isArray(event.files)
@@ -426,12 +579,18 @@ function genId(prefix: string): string {
 async function handleSlashCommand(
   ctx: PluginContext,
   rawBody: string,
+  companyId: string,
 ): Promise<void> {
   const { text, responseUrl, userId, channelId, threadTs } = parseSlashCommand(rawBody);
   const parts = text.trim().split(/\s+/);
   const subcommand = parts[0]?.toLowerCase() ?? "";
   const arg = parts[1]?.toLowerCase() ?? "";
-  const companyId = await resolveTargetCompanyId(ctx);
+  if (!companyId) {
+    ctx.logger.warn(
+      `Slack slash command "${subcommand}" dropped — inbound delivery carried no companyId, cannot establish tenant`,
+    );
+    return;
+  }
   try {
     switch (subcommand) {
       case "status":
@@ -447,12 +606,32 @@ async function handleSlashCommand(
       case "issues":
         await handleIssuesCommand(ctx, companyId, responseUrl, arg);
         break;
-      case "approve":
-        await handleApproveCommand(ctx, companyId, responseUrl, arg, userId);
+      case "approve": {
+        // Needs this company's own config for the approval allowlist —
+        // `pluginConfig` is the setup()-time bootstrap snapshot, which the
+        // host always hands the worker as `{}` (see plugin-loader.ts), so it
+        // never carries a usable `approvalReactorSlackIds` on a multi-company
+        // install.
+        const config = await loadCompanyConfig(ctx, companyId, "approve slash command");
+        if (!config) {
+          await respondEphemeral(ctx, responseUrl, {
+            text: ":warning: Slack is not fully configured for this workspace — command ignored.",
+          });
+          break;
+        }
+        await handleApproveCommand(ctx, companyId, responseUrl, arg, userId, config);
         break;
+      }
       case "acp": {
         const acpText = parts.slice(1).join(" ");
-        await handleAcpSlashCommand(ctx, pluginToken, {
+        const scope = await resolveInteractionScope(ctx, companyId, "acp slash command");
+        if (!scope) {
+          await respondEphemeral(ctx, responseUrl, {
+            text: ":warning: Slack credentials are not available for this workspace — command ignored.",
+          });
+          break;
+        }
+        await handleAcpSlashCommand(ctx, scope.token, {
           channel: channelId,
           threadTs,
           text: acpText,
@@ -684,6 +863,7 @@ async function handleApproveCommand(
   responseUrl: string,
   approvalId: string,
   slackUserId: string,
+  config: SlackPluginConfig,
 ): Promise<void> {
   if (!approvalId) {
     await respondEphemeral(ctx, responseUrl, {
@@ -697,7 +877,7 @@ async function handleApproveCommand(
     });
     return;
   }
-  if (!slackUserId || !isAuthorizedReactor(slackUserId)) {
+  if (!slackUserId || !isAuthorizedReactor(slackUserId, config)) {
     await respondEphemeral(ctx, responseUrl, {
       text: slackUserId
         ? `:warning: <@${slackUserId}> is not on the approval allowlist - command ignored.`
@@ -1336,11 +1516,15 @@ const plugin = definePlugin({
       );
       return;
     }
-    pluginToken = token;
-    // Resolve Slack signing secret for webhook signature verification
+    // Signing secret for the in-process thread-message router below, which
+    // (like `token`/`config` in this closure) is still bootstrap-snapshot
+    // scoped — see the BLO-21083 follow-up note near `resolveInteractionScope`.
+    // The webhook entrypoint (`onWebhook`) resolves its own signing secret
+    // per delivery via `resolveCompanySigningSecret` and does not use this.
+    let routerSigningSecret: string | null = null;
     if (config.slackSigningSecretRef) {
       try {
-        slackSigningSecret = await ctx.secrets.resolve(
+        routerSigningSecret = await ctx.secrets.resolve(
           config.slackSigningSecretRef,
         );
       } catch {
@@ -1957,7 +2141,7 @@ const plugin = definePlugin({
           // still-unresolved approval; otherwise treat it as ordinary thread
           // chatter and stop (approval threads do not route to agents).
           const freeformUserId = p.slackUserId ? String(p.slackUserId) : "";
-          if (!freeformUserId || !isAuthorizedReactor(freeformUserId)) return;
+          if (!freeformUserId || !isAuthorizedReactor(freeformUserId, config)) return;
           const resolvedLock = await ctx.state.get({
             scopeKind: "company",
             scopeId: event.companyId,
@@ -1969,7 +2153,7 @@ const plugin = definePlugin({
             stateKey: STATE_KEYS.approvalPending(approvalId),
           });
           if (resolvedLock || pendingDecision) return;
-          if (!canProcessMutatingApprovalWebhook("freeform_revision")) return;
+          if (!canProcessMutatingApprovalWebhook("freeform_revision", routerSigningSecret)) return;
           await requestRevision(ctx, token, {
             companyId: event.companyId,
             approvalId,
@@ -2006,9 +2190,9 @@ const plugin = definePlugin({
           return;
         }
         // parsed.kind === "decision"
-        if (!canProcessMutatingApprovalWebhook("thread_command")) return;
+        if (!canProcessMutatingApprovalWebhook("thread_command", routerSigningSecret)) return;
         const slackUserId = p.slackUserId ? String(p.slackUserId) : "";
-        if (!slackUserId || !isAuthorizedReactor(slackUserId)) {
+        if (!slackUserId || !isAuthorizedReactor(slackUserId, config)) {
           const text = slackUserId
             ? `:warning: <@${slackUserId}> is not on the approval allowlist — command ignored.`
             : ":warning: Command ignored because Slack did not include a user id, so approval allowlist membership could not be verified.";
@@ -2170,11 +2354,16 @@ const plugin = definePlugin({
   // Webhook handler (Slack Events, Slash Commands, Interactivity)
   // =========================================================================
   async onWebhook(input: PluginWebhookInput) {
-    // Verify Slack request signature (skip for url_verification challenge)
+    // Verify Slack request signature (skip for url_verification challenge).
+    // Resolved from THIS delivery's own company, never the setup() bootstrap
+    // snapshot — see resolveCompanySigningSecret.
     const body = input.parsedBody as Record<string, unknown> | undefined;
     const isVerificationChallenge = body?.type === "url_verification";
+    const signingSecret = isVerificationChallenge
+      ? null
+      : await resolveCompanySigningSecret(pluginCtx, input.companyId);
     if (!isVerificationChallenge) {
-      const sig = verifySlackSignature(input.headers, input.rawBody);
+      const sig = verifySlackSignature(input.headers, input.rawBody, signingSecret);
       if (!sig.ok) {
         // Throttle: at most one rejection warn per 5s (public endpoint).
         if (shouldEmitSigWarn()) {
@@ -2198,18 +2387,24 @@ const plugin = definePlugin({
       if (body?.type === "event_callback") {
         const event = body.event as Record<string, unknown> | undefined;
         if (event?.type === "file_shared") {
-          const companyId = await resolveTargetCompanyId(pluginCtx);
           const fileId = String(event.file_id ?? "");
           const channelId = String(event.channel_id ?? "");
-          if (companyId && fileId && channelId) {
-            await processMediaFile(
+          if (fileId && channelId) {
+            const scope = await resolveInteractionScope(
               pluginCtx,
-              pluginToken,
-              companyId,
-              fileId,
-              channelId,
-              "",
+              input.companyId,
+              "file_shared event",
             );
+            if (scope) {
+              await processMediaFile(
+                pluginCtx,
+                scope.token,
+                input.companyId,
+                fileId,
+                channelId,
+                "",
+              );
+            }
           }
         }
         // Approval interactions via emoji reaction (Phase 1)
@@ -2217,12 +2412,12 @@ const plugin = definePlugin({
           event?.type === "reaction_added" ||
           event?.type === "reaction_removed"
         ) {
-          await handleReactionEvent(event);
+          await handleReactionEvent(event, input.companyId, signingSecret);
         }
         // Thread replies → emit the synthetic thread_message event so the
         // existing router (and approval thread-command parsing) activates.
         if (event?.type === "message") {
-          await handleInboundMessageEvent(event);
+          await handleInboundMessageEvent(event, input.companyId);
         }
       }
     }
@@ -2231,11 +2426,11 @@ const plugin = definePlugin({
       const slash = parseSlashCommand(input.rawBody);
       if (
         slash.text.trim().split(/\s+/)[0]?.toLowerCase() === "approve" &&
-        !canProcessMutatingApprovalWebhook("slash_command")
+        !canProcessMutatingApprovalWebhook("slash_command", signingSecret)
       ) {
         return;
       }
-      await handleSlashCommand(pluginCtx, input.rawBody);
+      await handleSlashCommand(pluginCtx, input.rawBody, input.companyId);
       return;
     }
     // Interactivity (button clicks)
@@ -2251,28 +2446,39 @@ const plugin = definePlugin({
         ? String(user.id ?? user.username ?? "unknown")
         : "unknown";
 
+      // Resolved once per delivery: every branch below either checks the
+      // approval allowlist against this company's config or calls a Slack API
+      // that needs this company's bot token, so there is no cheaper path that
+      // would justify deferring it per-branch (contrast handleReactionEvent,
+      // where most reactions never reach an approval card at all).
+      const companyId = input.companyId;
+      const scope = await resolveInteractionScope(
+        pluginCtx,
+        companyId,
+        "interactivity",
+      );
+      if (!scope) return;
+
       // --- Revision modal submit (view_submission) ---
       // The "Request changes" button opens a modal; submitting it lands here as
       // a view_submission (not a block_actions). Route it to the revision path.
       if (payload.type === "view_submission") {
-        if (!canProcessMutatingApprovalWebhook("interactivity")) return;
+        if (!canProcessMutatingApprovalWebhook("interactivity", signingSecret)) return;
         const submission = parseRevisionModalSubmission(payload);
         if (!submission) return;
         try {
-          if (!userId || !isAuthorizedReactor(userId)) {
+          if (!userId || !isAuthorizedReactor(userId, scope.config)) {
             // No response_url for a modal submit; the unauthorized case is
             // dropped silently (the allowlist is also enforced when the modal
             // is opened, so reaching here requires a mid-flight allowlist change).
             return;
           }
-          const companyId = await resolveTargetCompanyId(pluginCtx);
-          if (!companyId) return;
-          await submitRevisionModal(pluginCtx, pluginToken, {
+          await submitRevisionModal(pluginCtx, scope.token, {
             companyId,
             slackUserId: userId,
             metadata: submission.metadata,
             reason: submission.reason,
-            paperclipBaseUrl: pluginConfig.paperclipBaseUrl,
+            paperclipBaseUrl: scope.config.paperclipBaseUrl,
           });
         } catch (err) {
           pluginCtx.logger.warn("Failed to handle revision modal submit", {
@@ -2296,20 +2502,18 @@ const plugin = definePlugin({
       if (!actionValue) return;
       // --- Approval buttons ---
       if (actionId === "approval_approve" || actionId === "approval_reject") {
-        if (!canProcessMutatingApprovalWebhook("interactivity")) return;
+        if (!canProcessMutatingApprovalWebhook("interactivity", signingSecret)) return;
         const approved = actionId === "approval_approve";
         const decision = approved ? "approve" : "reject";
         try {
-          if (!userId || !isAuthorizedReactor(userId)) {
-            await respondToAction(pluginCtx, pluginToken, responseUrl, {
+          if (!userId || !isAuthorizedReactor(userId, scope.config)) {
+            await respondToAction(pluginCtx, scope.token, responseUrl, {
               text: userId
                 ? `:warning: <@${userId}> is not on the approval allowlist - action ignored.`
                 : ":warning: Action ignored because Slack did not include a user id.",
             });
             return;
           }
-          const companyId = await resolveTargetCompanyId(pluginCtx);
-          if (!companyId) return;
           const result = await resolvePaperclipApproval(pluginCtx, {
             companyId,
             approvalId: actionValue,
@@ -2317,14 +2521,14 @@ const plugin = definePlugin({
             slackUserId: userId,
           });
           if (result.applied === false) {
-            await respondToAction(pluginCtx, pluginToken, responseUrl, {
+            await respondToAction(pluginCtx, scope.token, responseUrl, {
               text: `:information_source: Approval \`${actionValue}\` was already resolved server-side.`,
             });
             return;
           }
           await respondToAction(
             pluginCtx,
-            pluginToken,
+            scope.token,
             responseUrl,
             formatApprovalResolved(actionValue, approved, userId),
           );
@@ -2345,10 +2549,10 @@ const plugin = definePlugin({
       // on view_submission (handled above). The card's channel/ts ride through
       // private_metadata so the revision comment lands on the right thread.
       if (actionId === "approval_request_changes") {
-        if (!canProcessMutatingApprovalWebhook("interactivity")) return;
+        if (!canProcessMutatingApprovalWebhook("interactivity", signingSecret)) return;
         try {
-          if (!userId || !isAuthorizedReactor(userId)) {
-            await respondToAction(pluginCtx, pluginToken, responseUrl, {
+          if (!userId || !isAuthorizedReactor(userId, scope.config)) {
+            await respondToAction(pluginCtx, scope.token, responseUrl, {
               text: userId
                 ? `:warning: <@${userId}> is not on the approval allowlist - action ignored.`
                 : ":warning: Action ignored because Slack did not include a user id.",
@@ -2377,7 +2581,7 @@ const plugin = definePlugin({
           }
           await openModal(
             pluginCtx,
-            pluginToken,
+            scope.token,
             triggerId,
             buildRevisionModalView({
               approvalId: actionValue,
@@ -2393,8 +2597,6 @@ const plugin = definePlugin({
         }
         return;
       }
-      const companyId = await resolveTargetCompanyId(pluginCtx);
-      if (!companyId) return;
       // --- Escalation buttons ---
       if (
         actionId === "escalation_use_suggested" ||
@@ -2425,7 +2627,7 @@ const plugin = definePlugin({
           }
           await respondToAction(
             pluginCtx,
-            pluginToken,
+            scope.token,
             responseUrl,
             formatEscalationResolved(actionValue, actionId, userId),
           );
@@ -2446,7 +2648,7 @@ const plugin = definePlugin({
           const approved = actionId === "handoff_approve";
           await handleHandoffAction(
             pluginCtx,
-            pluginToken,
+            scope.token,
             companyId,
             actionValue,
             approved,
@@ -2454,7 +2656,7 @@ const plugin = definePlugin({
           );
           const emoji = approved ? ":white_check_mark:" : ":x:";
           const label = approved ? "Approved" : "Rejected";
-          await respondToAction(pluginCtx, pluginToken, responseUrl, {
+          await respondToAction(pluginCtx, scope.token, responseUrl, {
             text: `Handoff ${label} by ${userId}`,
             blocks: [
               {
@@ -2484,7 +2686,7 @@ const plugin = definePlugin({
             actionId === "discussion_continue" ? "continue" : "stop";
           await handleDiscussionAction(
             pluginCtx,
-            pluginToken,
+            scope.token,
             companyId,
             actionValue,
             discAction,
@@ -2493,7 +2695,7 @@ const plugin = definePlugin({
           const emoji =
             discAction === "continue" ? ":arrow_forward:" : ":stop_button:";
           const label = discAction === "continue" ? "Resumed" : "Stopped";
-          await respondToAction(pluginCtx, pluginToken, responseUrl, {
+          await respondToAction(pluginCtx, scope.token, responseUrl, {
             text: `Discussion ${label} by ${userId}`,
             blocks: [
               {
@@ -2521,7 +2723,7 @@ const plugin = definePlugin({
         const approved = actionId === "command_step_approve";
         const emoji = approved ? ":white_check_mark:" : ":x:";
         const label = approved ? "Approved" : "Rejected";
-        await respondToAction(pluginCtx, pluginToken, responseUrl, {
+        await respondToAction(pluginCtx, scope.token, responseUrl, {
           text: `Step ${label} by ${userId}`,
           blocks: [
             {

@@ -34,6 +34,7 @@ function nextTick(): number {
 const SIGNING_SECRET = "8f742231b10e8888abcd99yyyzzz1234";
 const SIGNING_REF = "secret:slack-signing";
 const REJECT_MSG = "Rejected webhook: invalid Slack signature";
+const COMPANY = "company-1";
 
 function makeContext(configOverrides: Record<string, unknown> = {}) {
   const config = {
@@ -100,6 +101,7 @@ async function fireWebhook(
   rawBody: string,
 ) {
   await plugin.definition.onWebhook?.({
+    companyId: COMPANY,
     endpointKey: WEBHOOK_KEYS.slashCommand,
     headers,
     rawBody,
@@ -261,6 +263,7 @@ describe("Slack interactivity signature verification", () => {
     rawBody: string,
   ) {
     await plugin.definition.onWebhook?.({
+      companyId: COMPANY,
       endpointKey: WEBHOOK_KEYS.interactivity,
       headers,
       rawBody,
@@ -328,6 +331,7 @@ describe("Slack rich-JSON event signature over original bytes", () => {
     const ts = nowTs();
     const rawBody = '{"type":"event_callback","event":{"text":"caf\\u00e9"}}';
     await plugin.definition.onWebhook?.({
+      companyId: COMPANY,
       endpointKey: WEBHOOK_KEYS.slackEvents,
       headers: {
         "x-slack-request-timestamp": ts,
