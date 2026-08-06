@@ -2867,6 +2867,16 @@ describe("K8s session isolation metadata", () => {
     expect(isK8sIsolationRetryDeferred({
       paperclipK8sIsolationRetryAt: "invalid",
     }, now)).toBe(false);
+
+    expect(isBranchClaimRetryDeferred({
+      paperclipBranchClaimRetryAt: "2026-07-14T12:00:01.000Z",
+    }, now)).toBe(true);
+    expect(isBranchClaimRetryDeferred({
+      paperclipBranchClaimRetryAt: "2026-07-14T11:59:59.000Z",
+    }, now)).toBe(false);
+    expect(isBranchClaimRetryDeferred({
+      paperclipBranchClaimRetryAt: "invalid",
+    }, now)).toBe(false);
   });
 
   // BLO-21602: deferRunForBranchClaimConflict stamps paperclipBranchClaimRetryAt

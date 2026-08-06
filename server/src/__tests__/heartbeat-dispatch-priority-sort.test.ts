@@ -119,6 +119,13 @@ async function waitForRunToSettle(
   return heartbeat.getRun(runId);
 }
 
+function buildQueuedRetryContext(index: number) {
+  const retryAt = new Date(Date.now() + 60 * 60_000).toISOString();
+  return index % 2 === 0
+    ? { paperclipK8sIsolationRetryAt: retryAt }
+    : { paperclipBranchClaimRetryAt: retryAt };
+}
+
 describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
   let db!: ReturnType<typeof createDb>;
   let heartbeat!: ReturnType<typeof heartbeatService>;
@@ -4045,8 +4052,8 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
           issueId,
           taskId: issueId,
           wakeReason: "issue_assigned",
-          ...(deferredCriticalIssueIds.includes(issueId)
-            ? { paperclipK8sIsolationRetryAt: new Date(Date.now() + 60 * 60_000).toISOString() }
+          ...(deferredCriticalIssueIds.indexOf(issueId) >= 0
+            ? buildQueuedRetryContext(deferredCriticalIssueIds.indexOf(issueId))
             : {}),
         },
         createdAt,
@@ -4240,8 +4247,8 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
           wakeReason: "source_scoped_recovery_action",
           source: "issue_recovery_action",
           recoveryActionId,
-          ...(deferredIssueIds.includes(issueId)
-            ? { paperclipK8sIsolationRetryAt: new Date(Date.now() + 60 * 60_000).toISOString() }
+          ...(deferredIssueIds.indexOf(issueId) >= 0
+            ? buildQueuedRetryContext(deferredIssueIds.indexOf(issueId))
             : {}),
         },
         createdAt,
