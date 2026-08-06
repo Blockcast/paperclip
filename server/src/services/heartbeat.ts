@@ -105,6 +105,7 @@ import {
 } from "./k8s-job-liveness.js";
 import { getActiveAgentIds } from "./agent-roster.js";
 import { tryLockIssueMonitorQueue } from "./issue-monitor-queue-lock.js";
+import { ACTIVE_RECOVERY_ACTION_STATUSES } from "./issue-recovery-actions.js";
 import { processPendingImageBumpForAgent } from "./agent-image-bump.js";
 import {
   buildProcessLossCapture,
@@ -25531,6 +25532,31 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   const DISPATCH_RETRY_RECONCILE_BACKOFF_MS = [60_000, 120_000, 240_000, 480_000, 900_000];
   const DISPATCH_RETRY_MAX_ATTEMPTS = DISPATCH_RETRY_RECONCILE_BACKOFF_MS.length;
 
+  async function spendRecoveredSourceScopedRecoveryWakeAttempt(input: {
+    row: typeof agentWakeupRequests.$inferSelect;
+    originalOpts: WakeupOptions;
+    now: Date;
+  }) {
+    const payload = parseObject(input.originalOpts.payload);
+    const contextSnapshot = parseObject(input.originalOpts.contextSnapshot);
+    const recoveryActionId =
+      readNonEmptyString(payload.recoveryActionId) ??
+      readNonEmptyString(contextSnapshot.recoveryActionId);
+    if (!recoveryActionId) return;
+
+    await db
+      .update(issueRecoveryActions)
+      .set({
+        attemptCount: sql`${issueRecoveryActions.attemptCount} + 1`,
+        updatedAt: input.now,
+      })
+      .where(and(
+        eq(issueRecoveryActions.companyId, input.row.companyId),
+        eq(issueRecoveryActions.id, recoveryActionId),
+        inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
+      ));
+  }
+
   /**
    * Periodic reconciliation for `dispatch_failed` rows written by
    * wakeupWithDispatchRetry. Retries the original wakeup() call with
@@ -25651,6 +25677,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .update(agentWakeupRequests)
           .set({ status: "dispatch_recovered", finishedAt: now, updatedAt: now })
           .where(eq(agentWakeupRequests.id, row.id));
+        await spendRecoveredSourceScopedRecoveryWakeAttempt({ row, originalOpts, now });
         recovered += 1;
         // The delivery reached the queued state after all, just later than the
         // inline path. Counting it here keeps the funnel arithmetic closed

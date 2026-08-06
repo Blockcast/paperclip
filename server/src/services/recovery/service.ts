@@ -4145,11 +4145,15 @@ export function recoveryService(
       .then((rows: Array<typeof agentWakeupRequests.$inferSelect>) => rows[0]!);
   }
 
+  type DurableRecoveryWakeDispatchResult =
+    | { delivered: true }
+    | { delivered: false; cause: "enqueue_not_delivered" | "enqueue_threw"; error?: unknown };
+
   async function dispatchDurableRecoveryWakeOutboxRow(input: {
     outboxRowId: string;
     agentId: string;
     opts: RecoveryWakeupOptions;
-  }) {
+  }): Promise<DurableRecoveryWakeDispatchResult> {
     try {
       const run = await deps.enqueueWakeup(input.agentId, input.opts);
       if (!run) {
@@ -4157,14 +4161,14 @@ export function recoveryService(
           { agentId: input.agentId, outboxRowId: input.outboxRowId },
           "stranded recovery wake dispatch returned no run after commit; left durable for reconcileFailedWakeDispatches",
         );
-        return null;
+        return { delivered: false, cause: "enqueue_not_delivered" };
       }
       const now = new Date();
       await db
         .update(agentWakeupRequests)
         .set({ status: "dispatch_recovered", finishedAt: now, updatedAt: now })
         .where(eq(agentWakeupRequests.id, input.outboxRowId));
-      return run;
+      return { delivered: true };
     } catch (err) {
       // Leave the row `dispatch_failed` on purpose -- that is precisely the state
       // reconcileFailedWakeDispatches selects on, so the wake is retried with backoff
@@ -4173,7 +4177,7 @@ export function recoveryService(
         { err, agentId: input.agentId, outboxRowId: input.outboxRowId },
         "stranded recovery wake dispatch failed after commit; left durable for reconcileFailedWakeDispatches",
       );
-      return null;
+      return { delivered: false, cause: "enqueue_threw", error: err };
     }
   }
 
@@ -5030,6 +5034,7 @@ export function recoveryService(
       outboxRowId: string;
       agentId: string;
       opts: RecoveryWakeupOptions;
+      wakeInput: SourceScopedStrandedRecoveryWakeInput;
     };
     type PendingWakeAttemptRefund = SourceScopedStrandedRecoveryWakeInput;
 
@@ -5185,7 +5190,7 @@ export function recoveryService(
       // so the callee contract ("null means we did not escalate") is unchanged.
       if (!updated) throw new StrandedEscalationCasMissError();
       const pendingWakeDispatch = wakePlan && wakeOutboxRow
-        ? { outboxRowId: wakeOutboxRow.id, agentId: wakePlan.agentId, opts: wakePlan.opts }
+        ? { outboxRowId: wakeOutboxRow.id, agentId: wakePlan.agentId, opts: wakePlan.opts, wakeInput }
         : null;
       const pendingWakeAttemptRefund =
         !wakePlan && sourceScopedWakePlanMissNeedsRefund(wakeInput) ? wakeInput : null;
@@ -5465,7 +5470,14 @@ export function recoveryService(
     // synchronously claiming the issue and defeating the CAS. It runs last so the
     // escalation comment is already visible to whoever the wake starts.
     if (pendingWakeDispatch) {
-      await dispatchDurableRecoveryWakeOutboxRow(pendingWakeDispatch);
+      const dispatchResult = await dispatchDurableRecoveryWakeOutboxRow(pendingWakeDispatch);
+      if (!dispatchResult.delivered) {
+        await refundUnspentSourceScopedWakeAttempt({
+          ...pendingWakeDispatch.wakeInput,
+          cause: dispatchResult.cause,
+          error: dispatchResult.error,
+        });
+      }
     }
     if (pendingWakeAttemptRefund) {
       await refundUnspentSourceScopedWakeAttempt({
