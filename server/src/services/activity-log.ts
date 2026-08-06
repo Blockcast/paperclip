@@ -300,6 +300,19 @@ export async function logActivity(
   }
 
   const emit = async (outboxDb: Db | null, enlistPluginOutbox: boolean): Promise<void> => {
+    const shouldEnlistPluginOutbox = outboxDb !== null &&
+      (enlistPluginOutbox || input.atomicPluginEvent === true);
+
+    if (pluginEvent && shouldEnlistPluginOutbox) {
+      // A live event cannot be rolled back. In the strict enlisted path, make
+      // the transactional outbox write succeed first so a failed insert does
+      // not publish a phantom activity for rows the caller rolls back.
+      await publishPluginDomainEvent(pluginEvent, {
+        db: outboxDb,
+        enlisted: true,
+      });
+    }
+
     publishLiveEvent({
       companyId: input.companyId,
       type: "activity.logged",
@@ -316,10 +329,10 @@ export async function logActivity(
       },
     });
 
-    if (pluginEvent) {
+    if (pluginEvent && !shouldEnlistPluginOutbox) {
       await publishPluginDomainEvent(pluginEvent, {
-        db: outboxDb,
-        enlisted: outboxDb !== null && (enlistPluginOutbox || input.atomicPluginEvent === true),
+        db: null,
+        enlisted: false,
       });
     }
   };

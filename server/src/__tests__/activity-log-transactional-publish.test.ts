@@ -136,6 +136,7 @@ describeEmbeddedPostgres("logActivity publication vs. an enclosing transaction",
   it("rejects and rolls back the activity row when the enlisted outbox insert fails", async () => {
     const entityId = randomUUID();
     const constraintName = "plugin_event_outbox_reject_approval_created_test";
+    const live = captureLiveEvents();
 
     await db.execute(sql.raw(`
       ALTER TABLE "plugin_event_outbox"
@@ -158,6 +159,37 @@ describeEmbeddedPostgres("logActivity publication vs. an enclosing transaction",
       expect((rejection as Error).message).toContain("plugin_event_outbox");
 
       expect(await db.select().from(activityLog)).toHaveLength(0);
+      expect(await db.select().from(pluginEventOutbox)).toHaveLength(0);
+      expect(live.seen).not.toContain("activity.logged");
+    } finally {
+      live.unsubscribe();
+      await db.execute(sql.raw(`
+        ALTER TABLE "plugin_event_outbox"
+        DROP CONSTRAINT IF EXISTS "${constraintName}"
+      `));
+    }
+  });
+
+  it("keeps unannotated transaction outbox failures best-effort on the global handle", async () => {
+    const entityId = randomUUID();
+    const constraintName = "plugin_event_outbox_reject_unannotated_tx_test";
+
+    await db.execute(sql.raw(`
+      ALTER TABLE "plugin_event_outbox"
+      ADD CONSTRAINT "${constraintName}"
+      CHECK ("event_type" <> '${PLUGIN_MAPPED_ACTION}')
+    `));
+
+    try {
+      await db.transaction(async (tx) => {
+        await expect(logActivity(tx as unknown as Db, activityInput(entityId))).resolves.toEqual(
+          expect.any(Function),
+        );
+      });
+
+      const activityRows = await db.select().from(activityLog);
+      expect(activityRows).toHaveLength(1);
+      expect(activityRows[0]?.entityId).toBe(entityId);
       expect(await db.select().from(pluginEventOutbox)).toHaveLength(0);
     } finally {
       await db.execute(sql.raw(`
