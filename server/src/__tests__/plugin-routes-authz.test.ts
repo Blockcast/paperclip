@@ -54,6 +54,10 @@ async function createApp(
     jobDeps?: unknown;
     toolDeps?: unknown;
     bridgeDeps?: unknown;
+    workerProxy?: {
+      nodeRole: "api" | "worker" | "all";
+      workersInternalUrl: string | null;
+    };
     captureJsonContext?: (context: unknown, body: unknown) => void;
   } = {},
 ) {
@@ -90,6 +94,7 @@ async function createApp(
     undefined,
     routeOverrides.toolDeps as never,
     routeOverrides.bridgeDeps as never,
+    routeOverrides.workerProxy,
   ));
   app.use(errorHandler);
 
@@ -1495,6 +1500,45 @@ describe.sequential("plugin state routes stay board-only for agent actors (BLO-2
     expect(res.body.error).toBe("Board access required");
     expect(call).not.toHaveBeenCalled();
     expect(mockRegistry.getById).not.toHaveBeenCalled();
+  });
+
+  it("rejects an agent actor before API-tier bridge proxying can reach a worker", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ handledBy: "worker" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+
+    try {
+      const workerProxy = {
+        nodeRole: "api" as const,
+        workersInternalUrl: "http://paperclip-worker.internal",
+      };
+      const { app: agentApp } = await createApp(agentActor(), {}, { workerProxy });
+
+      const agentRes = await request(agentApp)
+        .post(`/api/plugins/${pluginId}/bridge/data`)
+        .send({ key: "connection-status" });
+
+      expect(agentRes.status).toBe(403);
+      expect(agentRes.body.error).toBe("Board access required");
+      expect(fetchSpy).not.toHaveBeenCalled();
+
+      const { app: boardApp } = await createApp(boardActor(), {}, { workerProxy });
+      const boardRes = await request(boardApp)
+        .post(`/api/plugins/${pluginId}/bridge/data`)
+        .send({ key: "connection-status" });
+
+      expect(boardRes.status).toBe(200);
+      expect(boardRes.body).toEqual({ handledBy: "worker" });
+      expect(fetchSpy).toHaveBeenCalledOnce();
+      expect(String(fetchSpy.mock.calls[0]?.[0])).toBe(
+        `http://paperclip-worker.internal/api/plugins/${pluginId}/bridge/data`,
+      );
+    } finally {
+      fetchSpy.mockRestore();
+    }
   });
 
   it("rejects an agent actor with 403 when it tries to list plugin sync jobs", async () => {
