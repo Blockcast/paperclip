@@ -392,6 +392,29 @@ export const AGENT_WAKEUP_TERMINAL_FAILED_OLDEST_AGE_METRIC =
   "paperclip_agent_wakeup_terminal_failed_oldest_age_seconds";
 
 /**
+ * Restart-safe gauge: 1 while an installed plugin sits in `status = 'error'`,
+ * 0 otherwise (BLO-21092/BLO-20410). One sample per installed plugin, not per
+ * status — the label set is only the plugin's stable identity (`plugin_id`,
+ * `plugin_key`); the error/not-error distinction lives in the gauge value.
+ * Using `status` itself as a label would leave a stale `status="ready"`
+ * series behind the instant a plugin flips to `error` (prom-client never
+ * retires an old label combination on its own), so a query like
+ * `count(paperclip_plugin_status)` would grow every time a plugin's status
+ * ever changed instead of staying pinned at the installed-plugin count.
+ *
+ * Deliberately narrower than the full `PLUGIN_STATUSES` enum: a plugin the
+ * operator disabled is a different signal from one that crashed, and
+ * collapsing them would page on `disabled` maintenance. Re-derived on every
+ * collector tick from the `plugins` table (the worker tier only —
+ * `app.ts` gates plugin lifecycle to `paperclipNodeRole !== "api"`), so a
+ * pod restart republishes the current state instead of starting from a
+ * stale 0. This is the exact gap BLO-20410 exposed: `lucitra.plugin-secrets`
+ * sat in `status='error'` for 9+ hours with the pod `1/1 Running` and
+ * nothing watching the DB row.
+ */
+export const PLUGIN_ERROR_METRIC = "paperclip_plugin_error";
+
+/**
  * Bounded `error_code` allow-list for
  * {@link AGENT_WAKEUP_TERMINAL_FAILED_UNRESOLVED_METRIC}.
  *
@@ -1030,6 +1053,7 @@ let githubWorkflowRunConclusion: Counter<"conclusion" | "supersession"> | null =
 let queuedRunOldestAge: Gauge<"agent_id"> | null = null;
 let overdueScheduledRetryOldestAge: Gauge<"agent_id"> | null = null;
 let overdueScheduledRetryAgeMetricsRefreshSuccess: Gauge | null = null;
+let pluginError: Gauge<"plugin_id" | "plugin_key"> | null = null;
 let authRequest: Counter<"operation" | "outcome"> | null = null;
 let agentHeartbeatAge: Gauge<"agent_id"> | null = null;
 let agentHeartbeatInterval: Gauge<"agent_id"> | null = null;
@@ -1062,6 +1086,7 @@ function ensureRegistry(): {
   queuedRunAgeMetricsRefreshSuccessGauge: Gauge;
   overdueScheduledRetryOldestAgeGauge: Gauge<"agent_id">;
   overdueScheduledRetryAgeMetricsRefreshSuccessGauge: Gauge;
+  pluginErrorGauge: Gauge<"plugin_id" | "plugin_key">;
   authRequestCounter: Counter<"operation" | "outcome">;
   agentHeartbeatAgeGauge: Gauge<"agent_id">;
   agentHeartbeatIntervalGauge: Gauge<"agent_id">;
@@ -1094,6 +1119,7 @@ function ensureRegistry(): {
     || !queuedRunOldestAge
     || !overdueScheduledRetryOldestAge
     || !overdueScheduledRetryAgeMetricsRefreshSuccess
+    || !pluginError
     || !authRequest
     || !agentHeartbeatAge
     || !agentHeartbeatInterval
@@ -1438,6 +1464,20 @@ function ensureRegistry(): {
       registers: [registry],
     });
     overdueScheduledRetryAgeMetricsRefreshSuccess.set(0);
+    pluginError = new Gauge({
+      name: PLUGIN_ERROR_METRIC,
+      help:
+        "1 while an installed plugin sits in status='error', 0 otherwise "
+        + "(BLO-21092). Labeled by plugin_id and plugin_key only -- status is "
+        + "deliberately NOT a label, so a plugin flipping status rewrites this "
+        + "series' value instead of orphaning an old status=X series that "
+        + "prom-client would never retire on its own. Re-derived from the "
+        + "plugins table on every worker-tier collector tick; 'disabled' is "
+        + "distinct from 'error' and never sets this to 1, so an operator-"
+        + "disabled plugin does not page.",
+      labelNames: ["plugin_id", "plugin_key"],
+      registers: [registry],
+    });
     authRequest = new Counter({
       name: AUTH_REQUEST_METRIC,
       help:
@@ -1527,6 +1567,7 @@ function ensureRegistry(): {
     queuedRunOldestAgeGauge: queuedRunOldestAge,
     overdueScheduledRetryOldestAgeGauge: overdueScheduledRetryOldestAge,
     overdueScheduledRetryAgeMetricsRefreshSuccessGauge: overdueScheduledRetryAgeMetricsRefreshSuccess,
+    pluginErrorGauge: pluginError,
     authRequestCounter: authRequest,
     agentHeartbeatAgeGauge: agentHeartbeatAge,
     agentHeartbeatIntervalGauge: agentHeartbeatInterval,
@@ -2036,6 +2077,31 @@ export function setOverdueScheduledRetryAgeMetricsRefreshSuccess(success: boolea
   ensureRegistry().overdueScheduledRetryAgeMetricsRefreshSuccessGauge.set(success ? 1 : 0);
 }
 
+export interface PluginErrorStatusEntry {
+  /** `plugins.id` (uuid) — the stable DB identity. */
+  id: string;
+  /** `plugins.plugin_key` (e.g. `lucitra.plugin-secrets`) — the alert-routing label. */
+  pluginKey: string;
+  /** True when this row's `status` is `error`. */
+  isError: boolean;
+}
+
+/**
+ * Publish the current plugin error/ready split (BLO-21092). Reset-then-set
+ * with the full currently-installed roster on every collector tick: a
+ * plugin that gets uninstalled drops out of the series entirely instead of
+ * alerting forever on a row that no longer exists, and a plugin that
+ * recovers from `error` writes an explicit 0 -- the value the alert rule
+ * needs to see in order to resolve.
+ */
+export function setPluginErrorStatus(entries: ReadonlyArray<PluginErrorStatusEntry>): void {
+  const gauge = ensureRegistry().pluginErrorGauge;
+  gauge.reset();
+  for (const entry of entries) {
+    gauge.set({ plugin_id: entry.id, plugin_key: entry.pluginKey }, entry.isError ? 1 : 0);
+  }
+}
+
 export function recordAuthRequest(input: {
   operation: string | null | undefined;
   outcome: string | null | undefined;
@@ -2169,6 +2235,7 @@ export function __resetMetricsForTest(): void {
   queuedRunOldestAge = null;
   overdueScheduledRetryOldestAge = null;
   overdueScheduledRetryAgeMetricsRefreshSuccess = null;
+  pluginError = null;
   authRequest = null;
   agentHeartbeatAge = null;
   agentHeartbeatInterval = null;
