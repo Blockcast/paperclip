@@ -259,6 +259,116 @@ describe("github-webhook pure helpers", () => {
     ).toEqual({ owning: [] });
   });
 
+  it("does not let a list-prefixed pseudo-closer reopen a fence (BLO-20886)", () => {
+    // A closing fence admits only the marker run and whitespace. The OPENING
+    // grammar tolerates a list marker (a fence nested in a list item is
+    // ordinary Markdown), and reusing it to detect the close meant a `- ``` `
+    // line -- which CommonMark renders as fenced CONTENT -- ended the block
+    // early and exposed the following example as an ownership claim.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: ["```", "- ```", "Refs: BLO-777", "```"].join("\n"),
+      }),
+    ).toEqual({ owning: [] });
+
+    // Same for a numbered-list prefix, and for a tilde fence.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: ["~~~", "1. ~~~", "Fixes: BLO-778", "~~~"].join("\n"),
+      }),
+    ).toEqual({ owning: [] });
+
+    // The genuine closer still closes: an owning line AFTER a real fence is
+    // owning, so this did not simply wedge every fence open.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: ["```", "Refs: BLO-2", "```", "Refs: BLO-1"].join("\n"),
+      }),
+    ).toEqual({ owning: ["BLO-1"] });
+  });
+
+  it("treats mixed space-tab indentation as code by expanded columns (BLO-20886)", () => {
+    // CommonMark expands tabs to 4-column stops, so ` \t`, `  \t` and `   \t`
+    // are all four columns of indent -- an indented code block, exactly like
+    // `    `. Matching only the two literal prefixes `\t` and `    ` left the
+    // mixed forms eligible to declare an owner from inside a code example.
+    for (const indent of [" \t", "  \t", "   \t", "\t", "    ", "     "]) {
+      expect(
+        resolveOwningPaperclipIdentifiers({ body: `${indent}Refs: BLO-888` }),
+      ).toEqual({ owning: [] });
+    }
+
+    // Up to three columns is still a normal line, not code.
+    for (const indent of ["", " ", "  ", "   "]) {
+      expect(
+        resolveOwningPaperclipIdentifiers({ body: `${indent}Refs: BLO-1` }),
+      ).toEqual({ owning: ["BLO-1"] });
+    }
+  });
+
+  it("hides house-reference labels inside code, comments and indents (BLO-21312/BLO-20886)", () => {
+    // The house tier was added last and scanned the RAW body, so it skipped
+    // the fence/comment/indent filtering the closing-keyword tier already had.
+    // An `Issue:` line that renders as nothing -- or as a quoted example --
+    // could therefore route an author-directed "push a follow-up commit" wake
+    // to an issue no reader of the PR would call its owner.
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: ["```", "Issue: BLO-111", "```"].join("\n") }),
+    ).toEqual({ owning: [] });
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: ["<!--", "Issue: BLO-222", "-->"].join("\n") }),
+    ).toEqual({ owning: [] });
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: "    Paperclip task: BLO-333" }),
+    ).toEqual({ owning: [] });
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: "  \tPaperclip issue: BLO-334" }),
+    ).toEqual({ owning: [] });
+
+    // A fenced example does not suppress a real house label elsewhere.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: ["```", "Issue: BLO-111", "```", "Issue: BLO-1"].join("\n"),
+      }),
+    ).toEqual({ owning: ["BLO-1"] });
+  });
+
+  it("does not manufacture a branch owner from a version number (BLO-20886)", () => {
+    // Uppercasing a whole branch to match the uppercase-only identifier
+    // pattern also turns ordinary words-followed-by-a-number into
+    // "identifiers". Measured over the 200 most recently-updated PRs in this
+    // repo, that invented UNDICI-7, URI-3, ADDRESS-10, PR-870, FOLD-977 and
+    // EXPANSION-5. A spurious owner is not harmless: it hands an
+    // author-directed "push a follow-up commit" wake to whoever is assigned
+    // the same-named issue, which is this ticket's own defect.
+    for (const branch of [
+      "blo-21612-undici-7.29.0",
+      "blo-21611-fast-uri-3.1.5",
+      "blo-21613-ip-address-10.3.1",
+      "blo-21610-brace-expansion-5.0.9",
+      "sre/blo-20867-fold-977-metrics",
+    ]) {
+      const { owning } = resolveOwningPaperclipIdentifiers({ branch });
+      expect(owning).toHaveLength(1);
+      expect(owning[0]).toMatch(/^BLO-\d+$/);
+    }
+
+    // A branch carrying no ref at all still resolves nothing, rather than
+    // coining one from a trailing digit.
+    expect(resolveOwningPaperclipIdentifiers({ branch: "relay-wave-0" })).toEqual({ owning: [] });
+    expect(
+      resolveOwningPaperclipIdentifiers({ branch: "migration-members-page" }),
+    ).toEqual({ owning: [] });
+
+    // The real ref still resolves, at the branch start or after any `/`.
+    expect(
+      resolveOwningPaperclipIdentifiers({ branch: "sre/blo-20886-pr-review-wake-routing" }),
+    ).toEqual({ owning: ["BLO-20886"] });
+    expect(resolveOwningPaperclipIdentifiers({ branch: "blo-21610-thing" })).toEqual({
+      owning: ["BLO-21610"],
+    });
+  });
+
   it("falls back to a non-closing house-reference body line when title/keyword/branch all resolve nothing (BLO-21312)", () => {
     // `github_pr_review_requested` arrives via `issue_comment`, whose payload
     // carries no `pull_request.head.ref` -- `branch` is never populated on
@@ -1231,6 +1341,33 @@ describe("github-webhook pure helpers", () => {
     expect(ctx ? __test_shouldFirePrReviewerWake(ctx) : true).toBe(false);
   });
 
+  it("keeps a lowercase branch-only owner in the candidate identifiers (BLO-20886)", () => {
+    // The owning tiers uppercase the branch (real branches are lowercase and
+    // PAPERCLIP_IDENTIFIER_PATTERN is uppercase-only); the broad `identifiers`
+    // extraction does not. A PR whose ONLY ref is a lowercase branch therefore
+    // resolved an owner while `identifiers` came back empty -- and the route
+    // drops such a delivery at the `no_paperclip_identifier` gate before the
+    // owner is ever consulted. Past that gate it is still unreachable, because
+    // author wakes are `matched.filter(m => owning.includes(m.identifier))`
+    // and `matched` derives from `identifiers`. Either way the wake this
+    // module exists to deliver is lost, so the owner must appear in both.
+    const ctx = __test_resolveEventContext("pull_request_review", {
+      action: "submitted",
+      pull_request: {
+        number: 962,
+        title: "tidy up the webhook",
+        body: "No issue reference in this body at all.",
+        head: { ref: "fix/blo-20886-only", sha: "deadbeef" },
+        user: { login: "kkroo" },
+      },
+      review: { state: "changes_requested", body: "please fix", user: { login: "ally" } },
+      repository: { full_name: "Blockcast/paperclip" },
+    });
+
+    expect(ctx?.owningIdentifiers).toEqual(["BLO-20886"]);
+    expect(ctx?.identifiers).toContain("BLO-20886");
+  });
+
   it("extracts review body / state / author from pull_request_review.submitted so the assignee wake can render it inline (BLO-6300)", () => {
     const ctx = __test_resolveEventContext("pull_request_review", {
       action: "submitted",
@@ -2051,7 +2188,14 @@ describeEmbeddedPostgres("github-webhook route", () => {
         number: 18859,
         title: "Delivery funnel counters",
         body: null,
-        head: { ref: "platform/blo-18859-github-delivery-metrics" },
+        // Deliberately carries no Paperclip ref in branch, title or body: this
+        // test is about the reviewer-wake delivery counters, and needs the
+        // route to stop at `no_paperclip_identifier` so nothing else runs. The
+        // branch used to read `platform/blo-18859-...`, which only stayed
+        // inert because a lowercase branch-only ref was silently dropped
+        // before routing (BLO-20886) -- scaffolding that stopped being inert
+        // once that was fixed.
+        head: { ref: "platform/github-delivery-metrics" },
       },
       repository: { full_name: "Blockcast/paperclip" },
     };
@@ -2107,7 +2251,8 @@ describeEmbeddedPostgres("github-webhook route", () => {
         number: 18860,
         title: "Suppressed delivery",
         body: null,
-        head: { ref: "platform/blo-18859-suppressed" },
+        // No Paperclip ref anywhere, for the same reason as above.
+        head: { ref: "platform/suppressed-delivery" },
       },
       repository: { full_name: "Blockcast/paperclip" },
     };
@@ -3557,6 +3702,52 @@ describeEmbeddedPostgres("github-webhook route", () => {
       .where(inArray(agentWakeupRequests.agentId, [owner.agentId, relatedOnly.agentId]));
     // Only the house-label owner was woken -- never the Related: mention.
     expect(allWakes.map((w) => w.agentId)).toEqual([owner.agentId]);
+  });
+
+  it("delivers a lowercase branch-only author wake end-to-end (BLO-20886)", async () => {
+    // Route-level companion to the pure-helper test above. The owning tiers
+    // match the branch case-insensitively but the broad `identifiers`
+    // extraction is uppercase-only, so a PR whose ONLY ref is a lowercase
+    // branch resolved an owner and then died at the `no_paperclip_identifier`
+    // gate before that owner was ever consulted -- a dropped author wake that
+    // no test covered, because every existing branch fixture also carries the
+    // ref in its title or body.
+    const owner = await seedIssueWithIdentifier("BLO-20886");
+    const app = buildApp();
+    const payload = {
+      action: "submitted",
+      pull_request: {
+        number: 962,
+        title: "fix(github-webhook): tidy the receiver",
+        body: "No issue reference anywhere in this body.",
+        html_url: "https://github.com/Blockcast/paperclip/pull/962",
+        head: { ref: "sre/blo-20886-pr-review-wake-routing", sha: "17532d7f" },
+        user: { login: "kkroo" },
+      },
+      review: {
+        state: "changes_requested",
+        body: "one nit",
+        html_url: "https://github.com/Blockcast/paperclip/pull/962#pullrequestreview-1",
+        user: { login: "someone-else" },
+      },
+      repository: { full_name: "Blockcast/paperclip" },
+    };
+    const { body, signature } = signedRequest(payload);
+
+    const res = await request(app)
+      .post("/api/webhooks/github")
+      .set("x-github-event", "pull_request_review")
+      .set("x-hub-signature-256", signature)
+      .set("x-github-delivery", "delivery-blo-20886-lowercase-branch")
+      .set("content-type", "application/json")
+      .send(body);
+
+    expect(res.status).toBe(200);
+    // Specifically NOT dropped as `no_paperclip_identifier`.
+    expect(res.body.ignored).toBeUndefined();
+    expect(res.body.wakes).toEqual([
+      { issueIdentifier: "BLO-20886", agentId: owner.agentId },
+    ]);
   });
 
   it("dedupes an @ally comment redelivery on the author wake after it completed or was cancelled (BLO-18953)", async () => {

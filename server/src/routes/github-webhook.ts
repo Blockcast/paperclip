@@ -535,7 +535,53 @@ function clampReviewBody(value: string | null | undefined): string | null {
   return `${cut}\n…(truncated)`;
 }
 
+/**
+ * Resolve a webhook payload into the routing context, guaranteeing the
+ * invariant that every resolved OWNER is also a wake candidate.
+ *
+ * `identifiers` (every ref the PR mentions anywhere) and `owningIdentifiers`
+ * (the ones that actually own it) are extracted by different rules, and the
+ * owning tiers are deliberately more permissive in one place: tier 3
+ * uppercases the branch, because real branches are lowercase
+ * (`sre/blo-20886-...`) and PAPERCLIP_IDENTIFIER_PATTERN is uppercase-only.
+ * The broad set does not. So a PR whose ONLY ref is a lowercase branch --
+ * `fix/blo-20886-only`, nothing in title or body -- resolved an owner while
+ * `identifiers` came back empty, and the route then dropped the delivery at
+ * the `no_paperclip_identifier` gate before the owner could be used. Even past
+ * that gate the owner was unreachable: author wakes are computed as
+ * `matched.filter(m => owning.includes(m.identifier))`, and `matched` derives
+ * from `identifiers`, so an owner missing from the broad set silently yields
+ * no candidates. Both failures land on the wake this module exists to deliver.
+ *
+ * The union is taken here, once, rather than in each event branch so the
+ * invariant cannot be missed by a case added later.
+ *
+ * Deliberately NOT fixed by uppercasing the branch inside the broad
+ * extraction: that would also fold stale branch refs into `identifiers` for
+ * PRs whose branch and title disagree (#909's branch says `blo-20049` while
+ * title and body both name BLO-20467, the issue it actually fixes -- 8 such
+ * disagreements across the 175 PRs measured for the tier ordering). Those refs
+ * are exactly what the tier ranking exists to keep OUT of ownership; widening
+ * the broad set with them would spread that noise to every other consumer to
+ * fix a gate problem. Unioning the resolved owners adds the one identifier the
+ * tiers already decided was authoritative, and nothing else.
+ */
 function resolveEventContext(
+  eventName: string,
+  payload: Record<string, unknown>,
+  options: Parameters<typeof resolveEventContextRaw>[2] = {},
+): ResolvedEventContext | null {
+  const context = resolveEventContextRaw(eventName, payload, options);
+  if (!context) return null;
+  const owning = context.owningIdentifiers ?? [];
+  if (owning.length === 0) return context;
+  const identifiers = new Set(context.identifiers);
+  for (const identifier of owning) identifiers.add(identifier);
+  if (identifiers.size === context.identifiers.length) return context;
+  return { ...context, identifiers: Array.from(identifiers) };
+}
+
+function resolveEventContextRaw(
   eventName: string,
   payload: Record<string, unknown>,
   options: {
