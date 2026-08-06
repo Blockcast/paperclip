@@ -125,6 +125,7 @@ type ActorInfo = {
 const ACTIVE_BROKER_RUN_STATUSES = new Set(["running"]);
 const REMOTE_HTTP_REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 const MAX_REMOTE_HTTP_REDIRECTS = 5;
+const PENDING_ACTION_REQUEST_SIGNATURE_GRACE_MS = 10_000;
 
 type OAuthProviderEndpoints = {
   provider: string;
@@ -5676,8 +5677,11 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       const invocationById = new Map(invocations.map((invocation) => [invocation.id, invocation]));
       let visibleRequests = requests;
       if (status === "pending") {
-        const invalidRequestIds = requests
-          .filter((request) => {
+        const now = Date.now();
+        const invalidRequestIds: string[] = [];
+        const hiddenRequestIds: string[] = [];
+        for (const request of requests) {
+          const invalid = (() => {
             const invocation = invocationById.get(request.invocationId);
             if (!invocation) return true;
             try {
@@ -5689,8 +5693,17 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
             } catch {
               return true;
             }
-          })
-          .map((request) => request.id);
+          })();
+          if (!invalid) continue;
+
+          // executeTestCall signs immediately after recordInvocation inserts the
+          // pending row; hide that short-lived unsigned row instead of cancelling it.
+          if (now - request.createdAt.getTime() < PENDING_ACTION_REQUEST_SIGNATURE_GRACE_MS) {
+            hiddenRequestIds.push(request.id);
+          } else {
+            invalidRequestIds.push(request.id);
+          }
+        }
         if (invalidRequestIds.length > 0) {
           await db
             .update(toolActionRequests)
@@ -5700,9 +5713,9 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
               eq(toolActionRequests.status, "pending"),
               inArray(toolActionRequests.id, invalidRequestIds),
             ));
-          const invalidIds = new Set(invalidRequestIds);
-          visibleRequests = requests.filter((request) => !invalidIds.has(request.id));
         }
+        const hiddenIds = new Set([...invalidRequestIds, ...hiddenRequestIds]);
+        visibleRequests = requests.filter((request) => !hiddenIds.has(request.id));
       }
       if (visibleRequests.length === 0) return [];
 

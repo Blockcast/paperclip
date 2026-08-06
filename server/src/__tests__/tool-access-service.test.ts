@@ -3352,7 +3352,7 @@ describeEmbeddedPostgres("tool access service", () => {
       schemaHash: "s1",
     }).returning();
     const canonicalArguments = canonicalToolArguments({ key: "alpha", value: "one" });
-    const invocationValues = [1, 2, 3].map(() => ({
+    const invocationValues = [1, 2, 3, 4].map(() => ({
       companyId: company.id,
       applicationId: application.id,
       connectionId: connection.id,
@@ -3364,7 +3364,7 @@ describeEmbeddedPostgres("tool access service", () => {
       approvalState: "pending" as const,
       status: "awaiting_approval" as const,
     }));
-    const [validInvocation, missingSignatureInvocation, oldSecretInvocation] =
+    const [validInvocation, freshMissingSignatureInvocation, staleMissingSignatureInvocation, oldSecretInvocation] =
       await db.insert(toolInvocations).values(invocationValues).returning();
     const validSignedArguments = signToolArguments({
       invocationId: validInvocation.id,
@@ -3378,7 +3378,8 @@ describeEmbeddedPostgres("tool access service", () => {
       canonicalArguments,
       signingSecret: "old-secret",
     });
-    const [validRequest, missingSignatureRequest, oldSecretRequest] = await db.insert(toolActionRequests).values([
+    const staleCreatedAt = new Date(Date.now() - 60_000);
+    const [validRequest, freshMissingSignatureRequest, staleMissingSignatureRequest, oldSecretRequest] = await db.insert(toolActionRequests).values([
       {
         companyId: company.id,
         invocationId: validInvocation.id,
@@ -3389,11 +3390,21 @@ describeEmbeddedPostgres("tool access service", () => {
       },
       {
         companyId: company.id,
-        invocationId: missingSignatureInvocation.id,
+        invocationId: freshMissingSignatureInvocation.id,
         status: "pending",
         canonicalArgumentsHash: "args-hash",
         canonicalArgumentsSummary: { summary: canonicalArguments, sha256: "args-hash", sizeBytes: canonicalArguments.length },
         signedArguments: null,
+      },
+      {
+        companyId: company.id,
+        invocationId: staleMissingSignatureInvocation.id,
+        status: "pending",
+        canonicalArgumentsHash: "args-hash",
+        canonicalArgumentsSummary: { summary: canonicalArguments, sha256: "args-hash", sizeBytes: canonicalArguments.length },
+        signedArguments: null,
+        createdAt: staleCreatedAt,
+        updatedAt: staleCreatedAt,
       },
       {
         companyId: company.id,
@@ -3402,6 +3413,8 @@ describeEmbeddedPostgres("tool access service", () => {
         canonicalArgumentsHash: "args-hash",
         canonicalArgumentsSummary: { summary: canonicalArguments, sha256: "args-hash", sizeBytes: canonicalArguments.length },
         signedArguments: oldSecretSignedArguments,
+        createdAt: staleCreatedAt,
+        updatedAt: staleCreatedAt,
       },
     ]).returning();
 
@@ -3411,7 +3424,8 @@ describeEmbeddedPostgres("tool access service", () => {
 
     expect(list.map((item) => item.request.id)).toEqual([validRequest.id]);
     expect(statusById.get(validRequest.id)).toBe("pending");
-    expect(statusById.get(missingSignatureRequest.id)).toBe("cancelled");
+    expect(statusById.get(freshMissingSignatureRequest.id)).toBe("pending");
+    expect(statusById.get(staleMissingSignatureRequest.id)).toBe("cancelled");
     expect(statusById.get(oldSecretRequest.id)).toBe("cancelled");
   });
 
