@@ -25597,7 +25597,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         attempts?: number;
         nextAttemptAt?: string;
         originalOpts?: WakeupOptions;
+        deleteOnRecover?: boolean;
       };
+      // BLO-18829: rows written by the recovery wake-outbox are IOUs ("a wake is
+      // owed"), not wake requests -- but they carry the real wake's agentId, reason
+      // and payload, so any reader that does not filter on status counts one as a
+      // second delivered wake. Once we have replayed it the debt is paid and the
+      // honest representation is the row's absence; stamping `dispatch_recovered`
+      // would leave a permanent phantom with `runId: null`.
+      const deleteOnRecover = retryState.deleteOnRecover === true;
 
       const attempts = (retryState.attempts ?? 0) + 1;
       const originalOpts = retryState.originalOpts ?? {};
@@ -25673,10 +25681,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           );
           continue;
         }
-        await db
-          .update(agentWakeupRequests)
-          .set({ status: "dispatch_recovered", finishedAt: now, updatedAt: now })
-          .where(eq(agentWakeupRequests.id, row.id));
+        if (deleteOnRecover) {
+          await db
+            .delete(agentWakeupRequests)
+            .where(eq(agentWakeupRequests.id, row.id));
+        } else {
+          await db
+            .update(agentWakeupRequests)
+            .set({ status: "dispatch_recovered", finishedAt: now, updatedAt: now })
+            .where(eq(agentWakeupRequests.id, row.id));
+        }
         await spendRecoveredSourceScopedRecoveryWakeAttempt({ row, originalOpts, now });
         recovered += 1;
         // The delivery reached the queued state after all, just later than the

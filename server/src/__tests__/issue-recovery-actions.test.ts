@@ -23,7 +23,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
-import { buildPaperclipWakePayload } from "../services/heartbeat.js";
+import { buildPaperclipWakePayload, heartbeatService } from "../services/heartbeat.js";
 import { computeIssueMonitorGateFingerprint } from "../services/issue-execution-policy.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
 import { issueService } from "../services/issues.js";
@@ -2430,6 +2430,140 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(wakeRows).toHaveLength(1);
     expect(wakeRows[0]?.status).toBe("dispatch_failed");
     expect(wakeRows[0]?.finishedAt).toBeNull();
+  });
+
+  // BLO-18829 review follow-up (Ally, PR #1101). Deleting the marker on the inline
+  // happy path only moved the phantom rather than removing it: when the inline
+  // dispatch fails -- the one path this outbox exists to support -- the row survives
+  // to the reconciler, which stamped it `dispatch_recovered` and kept it forever. The
+  // result was a permanent payload-identical row with `runId: null` sitting next to
+  // the real wake, on the durable-retry path specifically.
+  it("BLO-18829: a reconciler-delivered outbox marker is deleted, not retained as dispatch_recovered", async () => {
+    const { companyId, coderId, sourceIssue } = await seedCompany();
+    // The reconciler replays through the REAL enqueueWakeup, which refuses to dispatch
+    // a run it cannot attribute to a responsible user. Set locally rather than in the
+    // shared fixture so the other tests in this file keep their current wake gating.
+    await db
+      .update(companies)
+      .set({ defaultResponsibleUserId: "responsible-user" })
+      .where(eq(companies.id, companyId));
+    // Inline dispatch fails, so the wake stays owed and the marker survives commit.
+    const enqueueWakeup = vi.fn(async () => {
+      throw new Error("dispatch exploded");
+    });
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const escalation = await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun: {
+        id: randomUUID(),
+        agentId: coderId,
+        status: "failed",
+        error: "adapter failed",
+        errorCode: "adapter_failed",
+        contextSnapshot: { retryReason: "issue_continuation_needed" },
+        livenessState: "needs_followup",
+        resultJson: null,
+        usageJson: null,
+        createdAt: new Date(),
+      },
+      comment: "Automatic continuation recovery failed.",
+    });
+    expect(escalation?.status).toBe("blocked");
+
+    const owedRows = await db.select().from(agentWakeupRequests);
+    expect(owedRows).toHaveLength(1);
+    const marker = owedRows[0]!;
+    expect(marker.status).toBe("dispatch_failed");
+    expect(marker.runId).toBeNull();
+    // The flag is the contract the reconciler keys on; without it the row is
+    // indistinguishable from an ordinary retryable wake.
+    expect(
+      (marker.payload as { dispatchRetry?: { deleteOnRecover?: boolean } })?.dispatchRetry
+        ?.deleteOnRecover,
+    ).toBe(true);
+
+    // Hand the owed wake to the real reconciler, dated past the row's first backoff.
+    const heartbeat = heartbeatService(db, { skipQueuedRunDispatch: true });
+    const result = await heartbeat.reconcileFailedWakeDispatches(
+      new Date(Date.now() + 10 * 60_000),
+    );
+    expect(result.recovered).toBe(1);
+
+    // The debt is paid, so the IOU is gone. What remains is one real wake -- not the
+    // marker relabelled, and not the marker alongside it.
+    const remaining = await db.select().from(agentWakeupRequests);
+    expect(remaining).toHaveLength(1);
+    expect(remaining.map((row) => row.id)).not.toContain(marker.id);
+    expect(remaining[0]?.status).not.toBe("dispatch_recovered");
+    expect(remaining[0]?.runId).not.toBeNull();
+  });
+
+  // BLO-18829 review follow-up (Ally, PR #1101). The old cleanup-failure comment
+  // claimed a retained marker was harmless because replay is `idempotencyKey`
+  // de-duplicated. Nothing dedupes this path: `enqueueWakeup` only writes the key,
+  // and its sole reader is caller-side and scoped to run-liveness continuations. A
+  // marker left `dispatch_failed` after a delivered wake therefore enqueues a SECOND
+  // real run, so cleanup must retire the row terminally rather than trust dedup.
+  it("BLO-18829: an outbox marker whose delete fails is retired terminally, not left replayable", async () => {
+    const { coderId, sourceIssue } = await seedCompany();
+    // Inline dispatch SUCCEEDS -- the wake is delivered and must never be sent twice.
+    const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
+    // Fail only deletes against agent_wakeup_requests, so the rest of escalation is
+    // untouched and the fallback `update` still reaches the database.
+    const dbWithFailingWakeDeletes = new Proxy(db, {
+      get(target, prop, receiver) {
+        if (prop === "delete") {
+          return (...args: unknown[]) => {
+            if (args[0] === agentWakeupRequests) {
+              throw new Error("simulated outbox cleanup failure");
+            }
+            return (target as unknown as Record<string, (...a: unknown[]) => unknown>)
+              .delete(...args);
+          };
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+    }) as typeof db;
+    const recovery = recoveryService(dbWithFailingWakeDeletes, { enqueueWakeup });
+
+    const escalation = await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun: {
+        id: randomUUID(),
+        agentId: coderId,
+        status: "failed",
+        error: "adapter failed",
+        errorCode: "adapter_failed",
+        contextSnapshot: { retryReason: "issue_continuation_needed" },
+        livenessState: "needs_followup",
+        resultJson: null,
+        usageJson: null,
+        createdAt: new Date(),
+      },
+      comment: "Automatic continuation recovery failed.",
+    });
+
+    // A cleanup failure must not be reported as a failed delivery: the wake really
+    // went out, so the escalation stands and the attempt is not refunded.
+    expect(escalation?.status).toBe("blocked");
+    expect(enqueueWakeup).toHaveBeenCalledTimes(1);
+
+    const afterCleanup = await db.select().from(agentWakeupRequests);
+    expect(afterCleanup).toHaveLength(1);
+    expect(afterCleanup[0]?.status).toBe("dispatch_superseded");
+    expect(afterCleanup[0]?.finishedAt).not.toBeNull();
+
+    // The point of retiring it: the reconciler selects `dispatch_failed` only, so the
+    // already-delivered wake cannot be replayed into a duplicate run.
+    const heartbeat = heartbeatService(db, { skipQueuedRunDispatch: true });
+    const result = await heartbeat.reconcileFailedWakeDispatches(
+      new Date(Date.now() + 10 * 60_000),
+    );
+    expect(result.recovered).toBe(0);
+    expect(await db.select().from(agentWakeupRequests)).toHaveLength(1);
   });
 
   it("does not create nested recovery artifacts when issue-backed fallback work itself fails", async () => {
