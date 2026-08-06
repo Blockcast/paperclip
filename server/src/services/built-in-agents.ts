@@ -1710,6 +1710,7 @@ export function builtInAgentService(db: Db) {
 
     const approval = await approvalSvc.create(companyId, {
       type: "hire_agent",
+      linkedAgentId: pending.id,
       requestedByAgentId: actor.requestedByAgentId ?? null,
       requestedByUserId: actor.requestedByUserId ?? null,
       status: "pending",

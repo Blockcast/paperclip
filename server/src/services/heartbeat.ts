@@ -84,6 +84,7 @@ import { conflict, HttpError, notFound } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import { describeDbError, isDbError, runWithTransientDbRetry } from "../lib/db-retry.js";
 import { publishLiveEvent } from "./live-events.js";
+import { canClaimPrReviewTask } from "./pr-review-dispatch-lock.js";
 import { normalizeResponsibleUserDenialCode } from "./responsible-user-denial-run-outcomes.js";
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
 import {
@@ -8458,6 +8459,20 @@ export interface HeartbeatServiceOptions {
     now: Date,
   ) => Promise<void> | void;
   /**
+   * Test-only concurrency hook: fired after stale-lock sweep has selected a
+   * candidate and immediately before the sweep transaction re-validates the
+   * current issue/run rows. Lets tests mimic a concurrent scheduled_retry
+   * re-park without exposing recovery internals.
+   */
+  beforeStaleIssueLockSweepClearForTest?: (
+    issue: {
+      id: string;
+      checkoutRunId: string | null;
+      executionRunId: string | null;
+      executionLockedAt: Date | null;
+    },
+  ) => Promise<void> | void;
+  /**
    * Test-only concurrency hook: fired inside the capacity-defer transaction
    * after coalescePendingTaskScopeWake() has returned a still-deferred run and
    * immediately before the conditional GitHub delivery-tally UPDATE. Lets a
@@ -8644,7 +8659,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   };
   const budgets = budgetService(db, budgetHooks);
   const sweepWakePreflightGbrain = createServerGbrainClient();
-  const recovery = recoveryService(db, { enqueueWakeup });
+  const recovery = recoveryService(db, {
+    enqueueWakeup,
+    beforeStaleIssueLockSweepClearForTest: options.beforeStaleIssueLockSweepClearForTest,
+  });
 
   function isPlanApprovalConfirmationPayload(payload: unknown) {
     const target = parseObject(parseObject(payload).target);
@@ -14790,26 +14808,48 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       issueContext: issueId ? await getIssueExecutionContext(run.companyId, issueId) : null,
       routineEnvContext: { routineId: null, env: null, responsibleUserId: null },
     });
+    const prReviewTaskKey = readNonEmptyString(context.taskKey) ?? run.contextTaskKey;
+    const exclusivePrReviewTaskKey = prReviewTaskKey && isPrReviewRetryContext(context)
+      ? prReviewTaskKey
+      : null;
     const initiallyClaimed = hasExternalLifecycle(agent.adapterType)
       ? (await claimRunWithExternalRuntimeSlotPool(
           db,
           run.id,
           claimedAt,
           resolveExternalLifecycleConcurrency(parseHeartbeatPolicy(agent)).effectiveMaxConcurrentRuns,
+          exclusivePrReviewTaskKey ? { exclusivePrReviewTaskKey } : {},
         ))?.run ?? null
+      : exclusivePrReviewTaskKey
+      ? await db.transaction(async (tx) => {
+          if (!(await canClaimPrReviewTask(tx, exclusivePrReviewTaskKey))) return null;
+          return tx
+            .update(heartbeatRuns)
+            .set({
+              status: "running",
+              error: null,
+              errorCode: null,
+              responsibleUserId,
+              startedAt: run.startedAt ?? claimedAt,
+              updatedAt: claimedAt,
+            })
+            .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
+            .returning()
+            .then((rows) => rows[0] ?? null);
+        })
       : await db
-          .update(heartbeatRuns)
-          .set({
-            status: "running",
-            error: null,
-            errorCode: null,
-            responsibleUserId,
-            startedAt: run.startedAt ?? claimedAt,
-            updatedAt: claimedAt,
-          })
-          .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
-          .returning()
-          .then((rows) => rows[0] ?? null);
+        .update(heartbeatRuns)
+        .set({
+          status: "running",
+          error: null,
+          errorCode: null,
+          responsibleUserId,
+          startedAt: run.startedAt ?? claimedAt,
+          updatedAt: claimedAt,
+        })
+        .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
+        .returning()
+        .then((rows) => rows[0] ?? null);
     const claimed = initiallyClaimed && hasExternalLifecycle(agent.adapterType)
       ? await db
           .update(heartbeatRuns)
@@ -18872,9 +18912,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // its shared worktree. Reaper/lifecycle checks must move the old run out
       // of "running" before a queued same-issue retry can proceed.
       const inFlightIssueIds = new Set<string>();
+      const inFlightPrReviewTaskKeys = new Set<string>();
       for (const row of runningRunRows) {
-        const id = readNonEmptyString(parseObject(row.contextSnapshot).issueId);
+        const snapshot = parseObject(row.contextSnapshot);
+        const id = readNonEmptyString(snapshot.issueId);
         if (id) inFlightIssueIds.add(id);
+        const taskKey = readNonEmptyString(snapshot.taskKey);
+        if (taskKey && isPrReviewRetryContext(snapshot)) {
+          inFlightPrReviewTaskKeys.add(taskKey);
+        }
       }
 
       const claimedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
@@ -18958,7 +19004,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         for (const queuedRun of prioritizedRuns) {
           if (claimedRuns.length >= availableSlots) break;
           if (dispatchStopped) break;
-          const queuedIssueId = readNonEmptyString(parseObject(queuedRun.contextSnapshot).issueId);
+          const queuedSnapshot = parseObject(queuedRun.contextSnapshot);
+          const queuedIssueId = readNonEmptyString(queuedSnapshot.issueId);
           if (queuedIssueId && inFlightIssueIds.has(queuedIssueId)) {
             // BLO-20396: only report the cancellation when this pass is the one
             // that actually moved the row. Previously every overlapping pass
@@ -18973,6 +19020,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             }
             continue;
           }
+          const queuedTaskKey = readNonEmptyString(queuedSnapshot.taskKey);
+          if (
+            queuedTaskKey &&
+            isPrReviewRetryContext(queuedSnapshot) &&
+            inFlightPrReviewTaskKeys.has(queuedTaskKey)
+          ) {
+            // Explicit review requests intentionally queue a follow-up while a
+            // review is running. Keep that row queued, but do not let it run
+            // concurrently with the review that already owns this PR task.
+            continue;
+          }
           const claimed = await claimQueuedRun(queuedRun, companyAgents);
           if (!claimed) {
             if (await scheduleEmergencyContinuationForStillQueuedRun(queuedRun)) {
@@ -18983,6 +19041,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
           claimedRuns.push(claimed);
           if (queuedIssueId) inFlightIssueIds.add(queuedIssueId);
+          if (queuedTaskKey && isPrReviewRetryContext(queuedSnapshot)) {
+            inFlightPrReviewTaskKeys.add(queuedTaskKey);
+          }
         }
       } catch (err) {
         launchClaimedRuns();

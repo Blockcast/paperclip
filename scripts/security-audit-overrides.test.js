@@ -47,7 +47,7 @@ async function main() {
     const packageJson = JSON.parse(
       await readFile(join(fixtureRoot, "package.json"), "utf8"),
     );
-    assert.equal(packageJson.pnpm.overrides["fast-uri"], "^3.1.3");
+    assert.equal(packageJson.pnpm.overrides["fast-uri"], "^3.1.5");
     assert.equal(packageJson.pnpm.overrides["brace-expansion"], "5.0.9");
 
     const lockfile = await readFile(join(fixtureRoot, "pnpm-lock.yaml"), "utf8");
@@ -63,11 +63,28 @@ async function main() {
     assert.ok(fastUriResolution, "lockfile missing fast-uri resolution");
     const [, major, minor, patch] = fastUriResolution.map(Number);
     assert.ok(
-      major > 3 || (major === 3 && (minor > 1 || (minor === 1 && patch >= 3))),
+      major > 3 || (major === 3 && (minor > 1 || (minor === 1 && patch >= 5))),
       `lockfile resolved vulnerable fast-uri ${major}.${minor}.${patch}`,
     );
+    const designerLockfile = JSON.parse(
+      await readFile(
+        join(fixtureRoot, "packages/services/designer/package-lock.json"),
+        "utf8",
+      ),
+    );
+    const [designerMajor, designerMinor, designerPatch] = designerLockfile.packages[
+      "node_modules/fast-uri"
+    ].version
+      .split(".")
+      .map(Number);
+    assert.ok(
+      designerMajor > 3 ||
+        (designerMajor === 3 &&
+          (designerMinor > 1 || (designerMinor === 1 && designerPatch >= 5))),
+      "designer lockfile resolved vulnerable fast-uri",
+    );
     assertIncludes(lockfile, "undici@6.27.0:", "lockfile");
-    assertIncludes(lockfile, "undici@7.28.0:", "lockfile");
+    assertIncludes(lockfile, "undici@7.29.0:", "lockfile");
     assertIncludes(lockfile, "multer@2.2.0:", "lockfile");
     assertIncludes(lockfile, "'@babel/core@7.29.7':", "lockfile");
     assertIncludes(lockfile, "esbuild@0.28.1:", "lockfile");
@@ -82,8 +99,8 @@ async function main() {
     );
     assert.match(
       lockfile,
-      /jsdom@28\.1\.0[\s\S]*?undici: 7\.28\.0/,
-      "jsdom must resolve undici 7.28.0",
+      /^  jsdom@28\.1\.0(?:\([^\n]*\))?:\n(?: {4,}[^\n]*\n)*?      undici: 7\.29\.0$/m,
+      "jsdom must resolve undici 7.29.0",
     );
 
     const audit = await runPnpm(["audit", "--prod", "--json"], fixtureRoot, true);

@@ -7,6 +7,7 @@ import {
   setExternalRuntimeReservationMetrics,
 } from "./metrics.js";
 import { logger } from "../middleware/logger.js";
+import { canClaimPrReviewTask } from "./pr-review-dispatch-lock.js";
 
 const DEFAULT_EXTERNAL_RUNTIME_SLOT_ID = 0;
 
@@ -89,28 +90,34 @@ function refreshExternalRuntimeReservationMetricsBestEffort(
   });
 }
 
-export async function claimRunWithExternalRuntimeSlot(
+type ExternalRuntimeClaim = {
+  run: typeof heartbeatRuns.$inferSelect;
+  reservation: ExternalRuntimeReservation;
+};
+
+async function claimRunWithExternalRuntimeSlotOutcome(
   db: Db,
   runId: string,
   claimedAt: Date,
   slotId = DEFAULT_EXTERNAL_RUNTIME_SLOT_ID,
-): Promise<{
-  run: typeof heartbeatRuns.$inferSelect;
-  reservation: ExternalRuntimeReservation;
-} | null> {
-  let claimed: {
-    run: typeof heartbeatRuns.$inferSelect;
-    reservation: ExternalRuntimeReservation;
-  } | null;
+  options: { exclusivePrReviewTaskKey?: string } = {},
+): Promise<{ claimed: ExternalRuntimeClaim | null; taskBlocked: boolean }> {
+  let outcome: { claimed: ExternalRuntimeClaim | null; taskBlocked: boolean };
   try {
-    claimed = await db.transaction(async (tx) => {
+    outcome = await db.transaction(async (tx) => {
+      if (
+        options.exclusivePrReviewTaskKey &&
+        !(await canClaimPrReviewTask(tx, options.exclusivePrReviewTaskKey))
+      ) {
+        return { claimed: null, taskBlocked: true };
+      }
       const run = await tx
         .select()
         .from(heartbeatRuns)
         .where(eq(heartbeatRuns.id, runId))
         .for("update")
         .then((rows) => rows[0] ?? null);
-      if (!run || run.status !== "queued") return null;
+      if (!run || run.status !== "queued") return { claimed: null, taskBlocked: false };
 
       let reservation = await tx
         .select()
@@ -165,7 +172,7 @@ export async function claimRunWithExternalRuntimeSlot(
           .returning()
           .then((rows) => rows[0] ?? null);
       }
-      if (!reservation) return null;
+      if (!reservation) return { claimed: null, taskBlocked: false };
 
       const updatedRun = await tx
         .update(heartbeatRuns)
@@ -182,16 +189,33 @@ export async function claimRunWithExternalRuntimeSlot(
       if (!updatedRun) {
         throw new Error(`External runtime reservation ${reservation.id} could not claim queued run ${run.id}`);
       }
-      return { run: updatedRun, reservation };
+      return { claimed: { run: updatedRun, reservation }, taskBlocked: false };
     });
   } catch (error) {
     if (!isConstraintConflict(error, ACTIVE_RUNTIME_SLOT_CONSTRAINT)) throw error;
-    claimed = null;
+    outcome = { claimed: null, taskBlocked: false };
   }
 
-  recordExternalRuntimeReservationEvent(claimed ? "reserved" : "contended");
+  recordExternalRuntimeReservationEvent(outcome.claimed ? "reserved" : "contended");
   refreshExternalRuntimeReservationMetricsBestEffort(db, claimedAt, "claim");
-  return claimed;
+  return outcome;
+}
+
+export async function claimRunWithExternalRuntimeSlot(
+  db: Db,
+  runId: string,
+  claimedAt: Date,
+  slotId = DEFAULT_EXTERNAL_RUNTIME_SLOT_ID,
+  options: { exclusivePrReviewTaskKey?: string } = {},
+): Promise<ExternalRuntimeClaim | null> {
+  const outcome = await claimRunWithExternalRuntimeSlotOutcome(
+    db,
+    runId,
+    claimedAt,
+    slotId,
+    options,
+  );
+  return outcome.claimed;
 }
 
 export async function claimRunWithExternalRuntimeSlotPool(
@@ -199,11 +223,19 @@ export async function claimRunWithExternalRuntimeSlotPool(
   runId: string,
   claimedAt: Date,
   maxSlots: number,
+  options: { exclusivePrReviewTaskKey?: string } = {},
 ) {
   const slotCount = Math.max(1, Math.floor(maxSlots));
   for (let slotId = 0; slotId < slotCount; slotId += 1) {
-    const claimed = await claimRunWithExternalRuntimeSlot(db, runId, claimedAt, slotId);
-    if (claimed) return claimed;
+    const outcome = await claimRunWithExternalRuntimeSlotOutcome(
+      db,
+      runId,
+      claimedAt,
+      slotId,
+      options,
+    );
+    if (outcome.claimed) return outcome.claimed;
+    if (outcome.taskBlocked) return null;
   }
   return null;
 }

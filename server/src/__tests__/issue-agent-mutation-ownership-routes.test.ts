@@ -1363,6 +1363,68 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueService.remove).not.toHaveBeenCalled();
   });
 
+  // `assertCanManageIssueMonitor` is a *second*, independent gate below
+  // `assertAgentIssueMutationAllowed`: the boundary above allows the PATCH via
+  // `allow_productivity_review_grant`, but this guard tests the assignee
+  // relation directly and never consulted the grant, so a reviewer that
+  // cleared the boundary still bounced off it here. Re-arming a wedged
+  // monitor is the one rubric remedy this specifically blocked (BLO-20426).
+  const productivityReviewDecideWithRuntimeManage = async (input: { action: string }) =>
+    input.action === "runtime:manage"
+      // Independent of the review grant — a reviewer already holds this as an
+      // ordinary company permission, same as in production.
+      ? { allowed: true, action: input.action, reason: "allow_explicit_grant", explanation: "Allowed by test runtime grant." }
+      : productivityReviewDecide(input);
+
+  it("lets a productivity-review owner re-arm the source issue's monitor via PATCH", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({
+      status: "in_progress",
+      assigneeAgentId: peerAgentId,
+      executionPolicy: null,
+    }));
+    mockAccessService.decide.mockImplementation(productivityReviewDecideWithRuntimeManage);
+
+    const res = await request(await createApp(ownerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        executionPolicy: {
+          monitor: {
+            nextCheckAt: "2026-08-10T00:00:00.000Z",
+            notes: "re-armed by reviewer",
+            scheduledBy: "assignee",
+          },
+        },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      issueId,
+      expect.objectContaining({
+        executionPolicy: expect.objectContaining({
+          monitor: expect.objectContaining({ notes: "re-armed by reviewer" }),
+        }),
+      }),
+    );
+  });
+
+  it("keeps the monitor gate closed to a productivity-review owner outside PATCH /issues/:id", async () => {
+    // The forced-wake route shares the same helper but never passes the
+    // reviewer-authorized option, so it must stay closed even though PATCH
+    // now honours the grant.
+    mockIssueService.getById.mockResolvedValue(makeIssue({
+      status: "in_progress",
+      assigneeAgentId: peerAgentId,
+      executionPolicy: null,
+    }));
+    mockAccessService.decide.mockImplementation(productivityReviewDecideWithRuntimeManage);
+
+    const res = await request(await createApp(ownerActor()))
+      .post(`/api/issues/${issueId}/monitor/check-now`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toBe("Only the assignee agent or a board user can manage issue monitors");
+  });
+
   // The comment route's current-execution-run short-circuit returns a bare
   // `true`, discarding the decision reason. A previous owner whose stale
   // execution lock still matches therefore reaches the route WITHOUT an
