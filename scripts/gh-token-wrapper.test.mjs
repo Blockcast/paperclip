@@ -29,13 +29,13 @@ function withTempDir(fn) {
 // branch has to clear all of them, because the wrapper's whole job is to pick a
 // branch based on which are set — inheriting one from the ambient environment
 // silently re-points the test at a different branch than it names. This is not
-// hypothetical: these tests run inside agent pods, and PAPERCLIP_GITHUB_TOKEN_VALUE
+// hypothetical: these tests run inside agent pods, and GH_SEAT_TOKEN_VALUE
 // is exactly what the scoped secret-binding path (BLO-18927) exports there.
 const WRAPPER_CREDENTIAL_ENV_VARS = [
   "GH_TOKEN",
   "GITHUB_TOKEN",
   "PAPERCLIP_GITHUB_TOKEN_FILE",
-  "PAPERCLIP_GITHUB_TOKEN_VALUE",
+  "GH_SEAT_TOKEN_VALUE",
 ];
 
 // The single way any test in this file builds an environment. Starts from a
@@ -57,7 +57,7 @@ function runWrapper(dir, { tokenFileContent, tokenValue, args = ["api", "user"] 
   const env = sanitizedEnv({ GH_TOKEN_WRAPPER_REAL_GH: stubGhPath });
 
   if (tokenValue !== undefined) {
-    env.PAPERCLIP_GITHUB_TOKEN_VALUE = tokenValue;
+    env.GH_SEAT_TOKEN_VALUE = tokenValue;
   }
 
   if (tokenFileContent !== undefined) {
@@ -183,7 +183,7 @@ test("logs a diagnostic to stderr and falls back when the token file exists but 
   });
 });
 
-// PAPERCLIP_GITHUB_TOKEN_VALUE — credentials delivered by the scoped
+// GH_SEAT_TOKEN_VALUE — credentials delivered by the scoped
 // secret-binding path rather than a mounted secret volume (BLO-18927).
 
 test("exports a token supplied by value when no token file exists", () => {
@@ -232,7 +232,7 @@ function runMalformedValue(dir, tokenValue) {
     env: sanitizedEnv({
       GH_TOKEN_WRAPPER_REAL_GH: stubGhPath,
       PAPERCLIP_GITHUB_TOKEN_FILE: tokenFilePath,
-      PAPERCLIP_GITHUB_TOKEN_VALUE: tokenValue,
+      GH_SEAT_TOKEN_VALUE: tokenValue,
       GH_TOKEN: "user_supplied_override",
       GITHUB_TOKEN: "user_supplied_override",
     }),
@@ -252,7 +252,7 @@ for (const [label, tokenValue] of [
     withTempDir((dir) => {
       const proc = runMalformedValue(dir, tokenValue);
       assert.equal(proc.status, 64);
-      assert.match(proc.stderr, /PAPERCLIP_GITHUB_TOKEN_VALUE is set but holds only whitespace/);
+      assert.match(proc.stderr, /GH_SEAT_TOKEN_VALUE is set but holds only whitespace/);
       assert.equal(proc.stdout, "");
     });
   });
@@ -294,7 +294,7 @@ test("a token supplied by value overrides a pre-existing GH_TOKEN in the caller'
 
     const env = sanitizedEnv({
       GH_TOKEN_WRAPPER_REAL_GH: stubGhPath,
-      PAPERCLIP_GITHUB_TOKEN_VALUE: "ghu_userseat",
+      GH_SEAT_TOKEN_VALUE: "ghu_userseat",
       GH_TOKEN: "user_supplied_override",
       GITHUB_TOKEN: "user_supplied_override",
     });
@@ -353,7 +353,7 @@ test("Dockerfile.runtime points git's credential helper at the wrapper, not gh.r
 // environment. Before the sanitized-env helper, that run failed two tests: the
 // GH_TOKEN-override test authenticated as the inherited value instead of the
 // file's, and the unreadable-file test never emitted its diagnostic, because
-// the inherited PAPERCLIP_GITHUB_TOKEN_VALUE sent both down the value branch.
+// the inherited GH_SEAT_TOKEN_VALUE sent both down the value branch.
 // A plain assertion inside a single test cannot catch that class of bug — the
 // leak is in how each test builds its environment, so the check has to be a
 // second run of every test under a dirty one.
@@ -366,7 +366,7 @@ if (!process.env.GH_TOKEN_WRAPPER_TEST_NESTED) {
       GH_TOKEN: "ambient_caller_token",
       GITHUB_TOKEN: "ambient_caller_token",
       PAPERCLIP_GITHUB_TOKEN_FILE: path.join(os.tmpdir(), "ambient-token-does-not-exist"),
-      PAPERCLIP_GITHUB_TOKEN_VALUE: "ghu_ambient_scoped_binding",
+      GH_SEAT_TOKEN_VALUE: "ghu_ambient_scoped_binding",
     };
     // node:test sets NODE_TEST_CONTEXT=child-v8 in every test-file subprocess.
     // Inheriting it makes the nested run report through the v8 serializer to a

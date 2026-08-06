@@ -369,6 +369,79 @@ describe("NewIssueDialog", () => {
     document.body.innerHTML = "";
   });
 
+  it("pre-fills new task descriptions with acceptance and verification headings", async () => {
+    const { root } = renderDialog(container);
+    await flush();
+
+    const descriptionInput = container.querySelector(
+      'textarea[aria-label="Add description..."]',
+    ) as HTMLTextAreaElement | null;
+
+    await waitForAssertion(() => {
+      expect(descriptionInput?.value).toBe("## Acceptance criteria\n\n## Verifying signal\n");
+    });
+
+    act(() => root.unmount());
+  });
+
+  it("creates without a warning when both recommended headings are present", async () => {
+    const { root } = renderDialog(container);
+    await flush();
+
+    const titleInput = container.querySelector('textarea[placeholder="Task title"]') as HTMLTextAreaElement;
+    await typeTextareaValue(titleInput, "Well specified task");
+
+    const submitButton = Array.from(container.querySelectorAll("button"))
+      .find((button) => button.textContent?.includes("Create Task"));
+    await vi.waitFor(() => expect(submitButton?.hasAttribute("disabled")).toBe(false));
+    await act(async () => {
+      submitButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flush();
+
+    expect(mockIssuesApi.create).toHaveBeenCalledWith(
+      "company-1",
+      expect.objectContaining({
+        description: "## Acceptance criteria\n\n## Verifying signal",
+      }),
+    );
+    expect(toastState.pushToast).not.toHaveBeenCalled();
+
+    act(() => root.unmount());
+  });
+
+  it("warns but still creates when a recommended heading is missing", async () => {
+    dialogState.newIssueDefaults = {
+      title: "Incomplete task",
+      description: "## Acceptance criteria\n\n- Observable result",
+    };
+    const { root } = renderDialog(container);
+    await flush();
+
+    const submitButton = Array.from(container.querySelectorAll("button"))
+      .find((button) => button.textContent?.includes("Create Task"));
+    await vi.waitFor(() => expect(submitButton?.hasAttribute("disabled")).toBe(false));
+    await act(async () => {
+      submitButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flush();
+
+    expect(toastState.pushToast).toHaveBeenCalledWith({
+      title: "Task description is missing recommended headings",
+      body: "Add `## Verifying signal` so completion and verification are explicit.",
+      tone: "warn",
+    });
+    expect(mockIssuesApi.create).toHaveBeenCalledWith(
+      "company-1",
+      expect.objectContaining({
+        title: "Incomplete task",
+        description: "## Acceptance criteria\n\n- Observable result",
+      }),
+    );
+
+    act(() => root.unmount());
+  });
+
   it("shows sub-issue context only when opened from a sub-issue action", async () => {
     dialogState.newIssueDefaults = {
       parentId: "issue-1",

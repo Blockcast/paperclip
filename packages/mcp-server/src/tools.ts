@@ -551,7 +551,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     ),
     makeTool(
       "paperclipCreateIssue",
-      "Create a new issue. Pass blockedByIssueIds to set dependency blockers at creation (write-only — they read back under `blockedBy`, not `blockedByIssueIds`).",
+      "Create a new issue. The response includes advisory `duplicateCandidates`; matches never refuse the create and are independent of `allowDuplicate`. Pass blockedByIssueIds to set dependency blockers at creation (write-only — they read back under `blockedBy`, not `blockedByIssueIds`).",
       createIssueToolSchema,
       async ({ companyId, ...body }) => {
         const resolved = await client.resolveCompany({ override: companyId });
