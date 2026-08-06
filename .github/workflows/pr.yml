@@ -21,63 +21,116 @@ env:
   PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
 
 jobs:
-  policy:
+  merge_queue_guard:
+    if: github.event_name == 'merge_group'
     runs-on: arc-light
     timeout-minutes: 5
     permissions:
       contents: read
       actions: write
-    outputs:
-      lockfile_regenerated: ${{ steps.regen_lockfile.outputs.regenerated }}
-
     steps:
       # BLO-21953: the workflow-level `concurrency.group` above is keyed on
       # `merge_group.head_sha` for merge_group events. That SHA is the composed
       # batch commit and is different on every re-stage, so `cancel-in-progress`
       # never fires across a PR's successive merge-queue attempts -- superseded
-      # generations pile up and starve the shared runner pool (BLO-21953).
-      # There is no reliable way to derive a stable per-entry key from
-      # `merge_group.head_ref` using GitHub Actions expressions alone (no
-      # regex/split), so instead of fighting the concurrency key, ask the
-      # merge queue directly whether this run's head_sha is still a live
-      # entry, and self-cancel if it has already been superseded. Fails open
-      # (never blocks/fails the job) on any lookup or cancel error -- this is
-      # a load-shedding optimization, not a correctness gate.
+      # generations pile up and starve the shared runner pool. This pre-policy
+      # job performs no checkout; it only asks the merge queue whether the
+      # current composed SHA is still live and cancels this run on conclusive
+      # stale evidence. All lookup and cancellation errors fail open.
       - name: Cancel if superseded by merge-queue re-stage
-        if: github.event_name == 'merge_group'
+        uses: actions/github-script@v8
         env:
-          GH_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ github.event.merge_group.head_sha }}
-          REPO_OWNER: ${{ github.repository_owner }}
-          REPO_NAME: ${{ github.event.repository.name }}
-        run: |
-          set -uo pipefail
-          query='query($o:String!,$r:String!,$b:String!){ repository(owner:$o,name:$r){ mergeQueue(branch:$b){ entries(first:100){ nodes { headCommit { oid } } } } } }'
-          body="$(printf '{"query":%s,"variables":{"o":%s,"r":%s,"b":"master"}}' \
-            "$(jq -Rs . <<<"$query")" "$(jq -Rs . <<<"$REPO_OWNER")" "$(jq -Rs . <<<"$REPO_NAME")")"
-          resp="$(curl -sS -o /tmp/mq.json -w '%{http_code}' \
-            -H "Authorization: bearer $GH_TOKEN" \
-            -H "Content-Type: application/json" \
-            -X POST https://api.github.com/graphql \
-            -d "$body")"
-          if [ "$resp" != "200" ]; then
-            echo "::warning::merge-queue lookup failed (HTTP $resp) -- not cancelling (fail open)"
-            exit 0
-          fi
-          live="$(jq -r --arg sha "$HEAD_SHA" '(.data.repository.mergeQueue.entries.nodes // []) | map(.headCommit.oid) | index($sha) != null' /tmp/mq.json 2>/dev/null || echo true)"
-          if [ "$live" = "false" ]; then
-            echo "$HEAD_SHA is not a live merge-queue entry (superseded by a re-stage) -- cancelling this run"
-            cancel_resp="$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
-              -H "Authorization: bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/actions/runs/${{ github.run_id }}/cancel")"
-            if [ "$cancel_resp" != "202" ]; then
-              echo "::warning::failed to cancel superseded run (HTTP $cancel_resp) -- continuing anyway"
-            fi
-          else
-            echo "$HEAD_SHA is a live merge-queue entry (or lookup was inconclusive) -- continuing"
-          fi
+          QUEUE_BRANCH: master
+        with:
+          script: |
+            const headSha = process.env.HEAD_SHA;
+            const branch = process.env.QUEUE_BRANCH;
+            const { owner, repo } = context.repo;
+            const query = `
+              query($owner:String!, $repo:String!, $branch:String!, $cursor:String) {
+                repository(owner: $owner, name: $repo) {
+                  mergeQueue(branch: $branch) {
+                    entries(first: 100, after: $cursor) {
+                      nodes {
+                        headCommit {
+                          oid
+                        }
+                      }
+                      pageInfo {
+                        hasNextPage
+                        endCursor
+                      }
+                    }
+                  }
+                }
+              }
+            `;
 
+            let cursor = null;
+            let exceededPaginationCap = true;
+            for (let page = 0; page < 100; page += 1) {
+              let result;
+              try {
+                result = await github.graphql(query, { owner, repo, branch, cursor });
+              } catch (error) {
+                core.warning(`merge-queue lookup failed: ${error.message}; not cancelling (fail open)`);
+                return;
+              }
+
+              const entries = result?.repository?.mergeQueue?.entries;
+              if (
+                !entries ||
+                !Array.isArray(entries.nodes) ||
+                !entries.pageInfo ||
+                typeof entries.pageInfo.hasNextPage !== "boolean"
+              ) {
+                core.warning("merge-queue lookup returned malformed data; not cancelling (fail open)");
+                return;
+              }
+
+              if (entries.nodes.some((node) => node?.headCommit?.oid === headSha)) {
+                core.info(`${headSha} is still a live merge-queue entry; continuing`);
+                return;
+              }
+
+              if (!entries.pageInfo.hasNextPage) {
+                exceededPaginationCap = false;
+                break;
+              }
+
+              if (typeof entries.pageInfo.endCursor !== "string" || entries.pageInfo.endCursor.length === 0) {
+                core.warning("merge-queue lookup was paginated without an endCursor; not cancelling (fail open)");
+                return;
+              }
+              cursor = entries.pageInfo.endCursor;
+            }
+
+            if (exceededPaginationCap) {
+              core.warning("merge-queue lookup exceeded the pagination safety cap; not cancelling (fail open)");
+              return;
+            }
+
+            core.info(`${headSha} is not a live merge-queue entry after a complete lookup; cancelling this run`);
+            try {
+              await github.rest.actions.cancelWorkflowRun({
+                owner,
+                repo,
+                run_id: context.runId,
+              });
+            } catch (error) {
+              core.warning(`failed to cancel superseded run: ${error.message}; continuing anyway`);
+            }
+
+  policy:
+    runs-on: arc-light
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      lockfile_regenerated: ${{ steps.regen_lockfile.outputs.regenerated }}
+
+    steps:
       - name: Checkout repository
         uses: actions/checkout@v6
         with:
@@ -141,6 +194,9 @@ jobs:
 
       - name: Test PR test-coverage gate
         run: node --test ./.github/scripts/tests/check-pr-test-coverage.test.mjs
+
+      - name: Test merge-queue superseded-run guard
+        run: node --test ./scripts/__tests__/merge-queue-guard-workflow.test.mjs
 
       - name: Setup Helm
         uses: azure/setup-helm@v4
