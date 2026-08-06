@@ -405,6 +405,7 @@ describe("approval routes idempotent retries", () => {
       .send({
         type: "hire_agent",
         payload: {
+          title: "Approve agent hire",
           name: "Untrusted hire",
           agentId: "00000000-0000-0000-0000-000000000002",
         },
@@ -562,6 +563,20 @@ describe("approval routes idempotent retries", () => {
 
     expect([200, 201], JSON.stringify(res.body)).toContain(res.status);
     expect(mockApprovalService.create).toHaveBeenCalled();
+  });
+
+  it.each([
+    ["absent", {}],
+    ["empty string", { title: "" }],
+    ["whitespace-only", { title: "   " }],
+  ])("rejects a resubmit replacement payload with a %s payload.title", async (_case, payload) => {
+    const res = await request(await createAgentApp())
+      .post("/api/approvals/approval-title-resubmit/resubmit")
+      .send({ payload });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(400);
+    expect(JSON.stringify(res.body)).toContain("payload.title");
+    expect(mockApprovalService.resubmit).not.toHaveBeenCalled();
   });
 
   it("blocks status-only recovery runs from creating approvals", async () => {

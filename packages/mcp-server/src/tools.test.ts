@@ -510,6 +510,42 @@ describe("paperclip MCP tools", () => {
     });
   });
 
+  it("publishes payload.title as required for approval creation", () => {
+    const tool = getTool("paperclipCreateApproval");
+    const payloadSchema = tool.schema.shape.payload;
+
+    expect(Object.keys(payloadSchema.shape)).toContain("title");
+    expect(tool.schema.safeParse({
+      type: "hire_agent",
+      payload: { branch: "pap-1167" },
+    }).success).toBe(false);
+    expect(tool.schema.safeParse({
+      type: "hire_agent",
+      payload: { title: "Approve agent hire", branch: "pap-1167" },
+    }).success).toBe(true);
+  });
+
+  it("omits approval resubmit payload when no replacement payloadJson is supplied", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      mockJsonResponse({ id: "approval-1" }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclipApprovalDecision");
+    await tool.execute({
+      approvalId: "55555555-5555-5555-5555-555555555555",
+      action: "resubmit",
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(String(url)).toBe(
+      "http://localhost:3100/api/approvals/55555555-5555-5555-5555-555555555555/resubmit",
+    );
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(String(init.body))).toEqual({});
+  });
+
   it("rejects invalid generic request paths", async () => {
     vi.stubGlobal("fetch", vi.fn());
 
