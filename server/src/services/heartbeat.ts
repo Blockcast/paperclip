@@ -24089,6 +24089,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           : candidateIssues[0]) ?? null;
 
       if (!issue) return null;
+      const activeExecutionState = parseIssueExecutionState(issue.executionState);
+      const finalizedRunExecutionStage = parseObject(runContext.executionStage);
+      const finalizedRunStageId =
+        readNonEmptyString(finalizedRunExecutionStage.stageId) ?? readNonEmptyString(runContext.currentStageId);
+      const activeParticipant = activeExecutionState?.status === "pending"
+        ? activeExecutionState.currentParticipant
+        : null;
+      if (
+        (run.errorCode === "job_missing" || run.errorCode === "k8s_pod_schedule_failed") &&
+        issue.status === "in_review" &&
+        !issue.assigneeUserId &&
+        Boolean(activeExecutionState?.currentStageId) &&
+        finalizedRunStageId === activeExecutionState?.currentStageId &&
+        activeParticipant?.type === "agent" &&
+        activeParticipant.agentId === run.agentId &&
+        isExecutionReviewParticipantRecoveryEligibleRun(run)
+      ) {
+        return {
+          kind: "blocked" as const,
+          issue,
+          previousStatus: issue.status,
+          comment: buildExecutionReviewParticipantRecoveryComment({ latestRun: run }),
+          recoveryCause: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_CAUSE,
+          recoveryOwnerAgentId: activeParticipant.agentId,
+        };
+      }
       if (issue.executionRunId && issue.executionRunId !== run.id) return null;
 
       // Pre-dispatch validation recovery: if the finalizing run failed before
@@ -24404,9 +24430,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const currentParticipant = executionState?.status === "pending"
         ? executionState.currentParticipant
         : null;
+      const reviewRunContext = parseObject(run.contextSnapshot);
+      const runExecutionStage = parseObject(reviewRunContext.executionStage);
+      const runStageId =
+        readNonEmptyString(runExecutionStage.stageId) ?? readNonEmptyString(reviewRunContext.currentStageId);
       const issueNeedsReviewParticipantRecovery =
         issue.status === "in_review" &&
         !issue.assigneeUserId &&
+        Boolean(executionState?.currentStageId) &&
+        runStageId === executionState?.currentStageId &&
         currentParticipant?.type === "agent" &&
         currentParticipant.agentId === run.agentId &&
         isExecutionReviewParticipantRecoveryEligibleRun(run) &&

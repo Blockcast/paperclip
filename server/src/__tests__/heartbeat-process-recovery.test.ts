@@ -6406,6 +6406,78 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(issue?.assigneeAgentId).toBe(agentId);
   });
 
+  it.each(["job_missing", "k8s_pod_schedule_failed"])(
+    "blocks immediate review-participant recovery after %s without replaying deliverable work",
+    async (errorCode) => {
+      mockAdapterExecute.mockResolvedValueOnce({
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+        errorCode,
+        errorMessage: "External lifecycle execution ended ambiguously",
+        provider: "test",
+        model: "test-model",
+      });
+      const { agentId, issueId, runId, stageId } = await seedInReviewParticipantRunFixture();
+      const heartbeat = createHeartbeat();
+
+      await heartbeat.resumeQueuedRuns();
+      const settledRun = await waitForRunToSettle(heartbeat, runId, 8_000);
+      expect(settledRun).toMatchObject({ status: "failed", errorCode });
+      expect(settledRun?.contextSnapshot).toMatchObject({
+        executionStage: { stageId, stageType: "review" },
+      });
+
+      const [issue, runs] = await Promise.all([
+        db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null),
+        db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId)),
+      ]);
+      expect(runs.some((row) =>
+        (row.contextSnapshot as Record<string, unknown> | null)?.retryReason ===
+          "execution_review_participant_recovery" &&
+        (row.contextSnapshot as Record<string, unknown> | null)?.allowDeliverableWork !== false
+      )).toBe(false);
+      expect(issue?.status).toBe("blocked");
+    },
+  );
+
+  it("does not let a late prior-stage failure recover a later stage with the same reviewer", async () => {
+    const { agentId, issueId, runId } = await seedInReviewParticipantRunFixture();
+    const nextStageId = randomUUID();
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+      const executionState = issue?.executionState as Record<string, unknown>;
+      await db.update(issues).set({
+        executionState: { ...executionState, currentStageId: nextStageId, currentStageIndex: 1 },
+      }).where(eq(issues.id, issueId));
+      return {
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+        errorCode: "adapter_failed",
+        errorMessage: "The prior review stage failed after the next stage started",
+        provider: "test",
+        model: "test-model",
+      };
+    });
+    const heartbeat = createHeartbeat();
+
+    await heartbeat.resumeQueuedRuns();
+    const settledRun = await waitForRunToSettle(heartbeat, runId, 8_000);
+    expect(settledRun).toMatchObject({ status: "failed", errorCode: "adapter_failed" });
+
+    const [issue, runs] = await Promise.all([
+      db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null),
+      db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId)),
+    ]);
+    expect(issue).toMatchObject({ status: "in_review", executionRunId: null });
+    expect((issue?.executionState as Record<string, unknown>)?.currentStageId).toBe(nextStageId);
+    expect(runs.filter((row) =>
+      (row.contextSnapshot as Record<string, unknown> | null)?.retryReason ===
+        "execution_review_participant_recovery"
+    )).toHaveLength(0);
+  });
+
   it("retries a pending execution-review participant once before blocking with a recovery action", async () => {
     const { companyId, agentId, issueId, runId, stageId } = await seedInReviewParticipantRunFixture();
     const heartbeat = createHeartbeat();

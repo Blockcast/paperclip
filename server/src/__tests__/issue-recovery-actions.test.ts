@@ -492,8 +492,9 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     ["k8s_pod_schedule_failed", "in_review"],
   ] as const)("does not enqueue recovery work after %s leaves an issue %s", async (errorCode, status) => {
     const { companyId, coderId, sourceIssueId } = await seedCompany();
+    let stageId: string | null = null;
     if (status === "in_review") {
-      const stageId = randomUUID();
+      stageId = randomUUID();
       await db.update(issues).set({
         status,
         executionPolicy: {
@@ -534,7 +535,10 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       resultJson: {
         externalLifecycleRecovery: { adapterInvocationStarted: true },
       },
-      contextSnapshot: { issueId: sourceIssueId },
+      contextSnapshot: {
+        issueId: sourceIssueId,
+        ...(stageId ? { executionStage: { stageId, stageType: "review" } } : {}),
+      },
       startedAt: new Date("2026-07-26T13:45:00.000Z"),
       finishedAt: new Date("2026-07-26T13:52:00.000Z"),
     });
@@ -979,7 +983,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       errorCode: "adapter_failed",
       startedAt: new Date("2026-07-15T20:00:00.000Z"),
       finishedAt: new Date("2026-07-15T20:01:00.000Z"),
-      contextSnapshot: { issueId: sourceIssueId },
+      contextSnapshot: { issueId: sourceIssueId, executionStage: { stageId, stageType: "review" } },
     });
     const enqueueWakeup = vi.fn(async () => null);
     const recovery = recoveryService(db, { enqueueWakeup });
@@ -1040,7 +1044,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       errorCode: "adapter_failed",
       startedAt: new Date("2026-07-15T20:00:00.000Z"),
       finishedAt: new Date("2026-07-15T20:01:00.000Z"),
-      contextSnapshot: { issueId: sourceIssueId },
+      contextSnapshot: { issueId: sourceIssueId, executionStage: { stageId, stageType: "review" } },
     });
     const enqueueWakeup = vi.fn(async () => null);
     const recovery = recoveryService(db, { enqueueWakeup });
@@ -1127,7 +1131,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       errorCode: "adapter_failed",
       startedAt: new Date("2026-07-15T20:00:00.000Z"),
       finishedAt: new Date("2026-07-15T20:01:00.000Z"),
-      contextSnapshot: { issueId: sourceIssueId },
+      contextSnapshot: { issueId: sourceIssueId, executionStage: { stageId, stageType: "review" } },
     }, {
       id: assigneeRunId,
       companyId,
@@ -1199,7 +1203,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       errorCode: "adapter_failed",
       startedAt: new Date("2026-07-15T20:00:00.000Z"),
       finishedAt: new Date("2026-07-15T20:01:00.000Z"),
-      contextSnapshot: { issueId: sourceIssueId },
+      contextSnapshot: { issueId: sourceIssueId, executionStage: { stageId, stageType: "review" } },
     });
     const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() } as never));
     const recovery = recoveryService(db, { enqueueWakeup });
