@@ -303,6 +303,15 @@ function shouldSupersedeInteractionOnUserComment(interaction: UserCommentSuperse
   return interaction.payload.supersedeOnUserComment === true;
 }
 
+// BLO-22660: accept/reject/respond/verdicts/cancel are board-only routes — every
+// agent actor is 403'd before assertBoard even runs (rejectAgentIssueThreadInteractionResolution
+// in server/src/routes/issues.ts). An issue whose assignee is an agent (and not also a
+// human) has no board actor positioned to resolve a pending card: the row reads as
+// owned and progressing while actually being parked with nobody who can act on it.
+function issueHasNoBoardResolverPath(issue: { assigneeAgentId?: string | null; assigneeUserId?: string | null }) {
+  return Boolean(issue.assigneeAgentId) && !issue.assigneeUserId;
+}
+
 function normalizeCreateInteractionInput(input: CreateIssueThreadInteraction): CreateIssueThreadInteraction {
   switch (input.kind) {
     case "ask_user_questions":
@@ -1174,7 +1183,12 @@ export function issueThreadInteractionService(db: Db) {
     },
 
     create: async (
-      issue: { id: string; companyId: string },
+      issue: {
+        id: string;
+        companyId: string;
+        assigneeAgentId?: string | null;
+        assigneeUserId?: string | null;
+      },
       input: CreateIssueThreadInteraction,
       actor: InteractionActor,
     ) => {
@@ -1194,6 +1208,22 @@ export function issueThreadInteractionService(db: Db) {
           }
           return hydrateInteraction(existing);
         }
+      }
+
+      if (issueHasNoBoardResolverPath(issue)) {
+        throw unprocessable(
+          "Cannot create an issue-thread interaction on an issue assigned only to an agent: "
+            + "accept/reject/respond/verdicts/cancel are board-only routes that reject every agent "
+            + "actor, so no one could ever resolve this card and it would sit pending indefinitely. "
+            + "Reassign the issue to a human via assigneeUserId before creating this interaction, or "
+            + "resolve the decision through a comment instead.",
+          {
+            boundary: "board_only_interaction_resolution",
+            issueId: issue.id,
+            assigneeAgentId: issue.assigneeAgentId ?? null,
+            assigneeUserId: issue.assigneeUserId ?? null,
+          },
+        );
       }
 
       if (data.sourceCommentId) {

@@ -1674,6 +1674,11 @@ export function createToolGatewayService(
         .onConflictDoNothing();
     }
 
+    // BLO-22660: deliberately omit assigneeAgentId/assigneeUserId here. This card lives
+    // on the calling agent's own checked-out issue (which is normally agent-assigned) and
+    // is discovered by humans through the tool-approval queue, not through issue assignment
+    // — so it must not trip the board-resolver guard that a self-addressed
+    // paperclipRequestConfirmation would.
     const interaction = await interactions.create(
       { id: input.session.issueId, companyId: input.session.companyId },
       {
@@ -2936,6 +2941,8 @@ export function createToolGatewayService(
         { invocationId: input.invocationId, tool: input.tool.name },
       );
     }
+    // BLO-22660: deliberately omit assigneeAgentId/assigneeUserId — see the matching
+    // comment on the tool-action confirmation above; the same exemption applies here.
     const interaction = await interactions.create(
       { id: input.session.issueId, companyId: input.session.companyId },
       {

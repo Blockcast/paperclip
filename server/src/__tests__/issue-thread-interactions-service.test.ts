@@ -1708,6 +1708,88 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     });
   });
 
+  it("rejects creating an interaction on an issue assigned only to an agent (BLO-22660)", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Agent-addressed confirmation");
+    const agentId = randomUUID();
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CTO",
+      role: "manager",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.update(issues).set({ assigneeAgentId: agentId, assigneeUserId: null }).where(eq(issues.id, issueId));
+
+    await expect(interactionsSvc.create({
+      id: issueId,
+      companyId,
+      assigneeAgentId: agentId,
+      assigneeUserId: null,
+    }, {
+      kind: "request_confirmation",
+      payload: {
+        version: 1,
+        prompt: "Ratify this scope ruling?",
+      },
+    } as CreateIssueThreadInteraction, {
+      agentId,
+    })).rejects.toMatchObject({
+      status: 422,
+      details: {
+        boundary: "board_only_interaction_resolution",
+        issueId,
+        assigneeAgentId: agentId,
+        assigneeUserId: null,
+      },
+    });
+
+    const rows = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, issueId));
+    expect(rows).toHaveLength(0);
+  });
+
+  it("still allows creating an interaction when the issue is assigned to a human board user", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Human-addressed confirmation");
+    const agentId = randomUUID();
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CTO",
+      role: "manager",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.update(issues).set({ assigneeAgentId: null, assigneeUserId: "local-board" }).where(eq(issues.id, issueId));
+
+    const created = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+      assigneeAgentId: null,
+      assigneeUserId: "local-board",
+    }, {
+      kind: "request_confirmation",
+      payload: {
+        version: 1,
+        prompt: "Ratify this scope ruling?",
+      },
+    } as CreateIssueThreadInteraction, {
+      agentId,
+    });
+
+    expect(created).toMatchObject({
+      kind: "request_confirmation",
+      status: "pending",
+    });
+  });
+
   it("expires request confirmations by default when a user comments after creation", async () => {
     const { companyId, issueId } = await seedConfirmationIssue();
     const commentId = randomUUID();
