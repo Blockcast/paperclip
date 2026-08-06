@@ -4,6 +4,7 @@ import {
   buildCacheEntry,
   RECALL_STATE_KEY,
   DEFAULT_RECALL_DEPTH,
+  MAX_ENRICHMENT_NODES,
 } from "../recall.js";
 import type { GbrainCallable } from "../pages.js";
 
@@ -106,6 +107,76 @@ describe("prefetchRunContext", () => {
       nodes: [{ slug: "issue-blo-1" }, { slug: "agent-cto" }, { slug: "issue-blo-999" }],
       edges: [{ from: "agent-cto", to: "issue-blo-999" }],
     });
+  });
+
+  it("caps an oversized agent-hub fallback (array shape) instead of attaching it whole", async () => {
+    // BLO-21635: hub nodes like "agent-cto" can be linked to thousands of
+    // unrelated fact-* nodes. Simulate that with a fallback far larger than
+    // MAX_ENRICHMENT_NODES and assert the merged graph stays bounded.
+    const hubNodes = Array.from({ length: MAX_ENRICHMENT_NODES + 200 }, (_, i) => ({
+      slug: `fact-${i}`,
+      depth: i < 10 ? 1 : 2,
+    }));
+    const client = {
+      call: vi.fn(async (_tool: string, args: Record<string, unknown>) => {
+        if (args.slug === "issue-blo-1") return [];
+        if (args.slug === "agent-cto") return hubNodes;
+        return null;
+      }),
+    };
+
+    const out = await prefetchRunContext({
+      client: client as unknown as GbrainCallable,
+      issueIdentifier: "BLO-1",
+      agentName: "CTO",
+      depth: 2,
+    });
+
+    expect(out.ok).toBe(true);
+    const graph = out.graph as unknown[];
+    expect(graph.length).toBe(MAX_ENRICHMENT_NODES);
+    // The lower-depth (more hub-proximate) nodes are kept preferentially.
+    const slugs = graph.map((n) => (n as { slug: string }).slug);
+    for (let i = 0; i < 10; i++) expect(slugs).toContain(`fact-${i}`);
+  });
+
+  it("caps an oversized agent-hub fallback (nodes/edges shape) and drops edges to dropped nodes", async () => {
+    const hubNodes = Array.from({ length: MAX_ENRICHMENT_NODES + 50 }, (_, i) => ({
+      slug: `fact-${i}`,
+      depth: 2,
+    }));
+    const hubEdges = hubNodes.map((n) => ({ from: "agent-cto", to: n.slug }));
+    const client = {
+      call: vi.fn(async (_tool: string, args: Record<string, unknown>) => {
+        if (args.slug === "issue-blo-1") {
+          return { nodes: [{ slug: "issue-blo-1" }], edges: [] };
+        }
+        if (args.slug === "agent-cto") {
+          return {
+            nodes: [{ slug: "agent-cto", depth: 0 }, ...hubNodes],
+            edges: hubEdges,
+          };
+        }
+        return null;
+      }),
+    };
+
+    const out = await prefetchRunContext({
+      client: client as unknown as GbrainCallable,
+      issueIdentifier: "BLO-1",
+      agentName: "CTO",
+      depth: 2,
+    });
+
+    expect(out.ok).toBe(true);
+    const graph = out.graph as { nodes: unknown[]; edges: { from: string; to: string }[] };
+    // +1 for the always-included issue-page node from the primary (island) graph.
+    expect(graph.nodes.length).toBeLessThanOrEqual(MAX_ENRICHMENT_NODES + 1);
+    const keptSlugs = new Set(graph.nodes.map((n) => (n as { slug: string }).slug));
+    for (const edge of graph.edges) {
+      expect(keptSlugs.has(edge.from)).toBe(true);
+      expect(keptSlugs.has(edge.to)).toBe(true);
+    }
   });
 
   it("tries ID-based agent and project fallbacks after a missing named agent hub", async () => {
