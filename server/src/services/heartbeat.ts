@@ -2441,6 +2441,20 @@ async function hasGitPushRemote(cwd: string | null | undefined) {
   return false;
 }
 
+function isNonRetryablePrReviewTerminalOutcome(
+  run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson" | "contextSnapshot">,
+) {
+  if (run.errorCode === "job_missing" || run.errorCode === "k8s_pod_schedule_failed") return true;
+  if (
+    run.errorCode !== "pr_review_output_missing" &&
+    run.errorCode !== "pr_review_verification_unavailable"
+  ) {
+    return false;
+  }
+  const recovery = parseObject(parseObject(run.resultJson).externalLifecycleRecovery);
+  return recovery.adapterInvocationStarted === true;
+}
+
 export async function assertGitWorktreeBaseWorkspaceReady(input: {
   requestedExecutionWorkspaceMode: ReturnType<typeof resolveExecutionWorkspaceMode>;
   config: Record<string, unknown>;
@@ -23993,19 +24007,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     run: typeof heartbeatRuns.$inferSelect,
     options: { suppressImmediateRecovery?: boolean } = {},
   ): Promise<boolean> {
-    if (run.errorCode === "job_missing" || run.errorCode === "k8s_pod_schedule_failed") {
-      await queueFailedPrReviewGateStatus(
-        run,
-        parseObject(run.contextSnapshot),
-        "non_retryable_external_lifecycle",
-      ).catch((error) => {
-        logger.warn(
-          { err: error, runId: run.id },
-          "failed to queue non-retryable PR-review gate status",
-        );
-      });
-    }
-
     const runContext = parseObject(run.contextSnapshot);
     const contextIssueId = readNonEmptyString(runContext.issueId);
     const taskKey = deriveTaskKeyWithHeartbeatFallback(runContext, null);
@@ -24128,10 +24129,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           { issueId: issue.id, finalizingRunId: run.id, activeExecutionRunId: issue.executionRunId },
           "skipping terminal-run recovery because a newer issue execution is active",
         );
-        return null;
+        return { kind: "superseded" as const };
       }
       if (
-        (run.errorCode === "job_missing" || run.errorCode === "k8s_pod_schedule_failed") &&
+        isNonRetryablePrReviewTerminalOutcome(run) &&
         issue.status === "in_review" &&
         !issue.assigneeUserId &&
         finalizedRunStageId !== null &&
@@ -24622,8 +24623,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const shouldBlockImmediately =
         !recoveryAgentInvokable ||
         !recoveryAgent ||
-        run.errorCode === "job_missing" ||
-        run.errorCode === "k8s_pod_schedule_failed" ||
+        isNonRetryablePrReviewTerminalOutcome(run) ||
         isWorkspaceValidationFailedRun(run) ||
         isConfigurationIncompleteFailedRun(run) ||
         didAutomaticRecoveryFail(run, issue.status === "todo" ? "assignment_recovery" : "issue_continuation_needed");
@@ -24737,6 +24737,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
     });
 
+    if (
+      promotionResult?.kind !== "superseded" &&
+      isNonRetryablePrReviewTerminalOutcome(run)
+    ) {
+      await queueFailedPrReviewGateStatus(
+        run,
+        runContext,
+        "non_retryable_external_lifecycle",
+      ).catch((error) => {
+        logger.warn(
+          { err: error, runId: run.id },
+          "failed to queue non-retryable PR-review gate status",
+        );
+      });
+    }
+
     if (promotionResult?.kind === "blocked") {
       await recovery.escalateStrandedAssignedIssue({
         issue: promotionResult.issue,
@@ -24767,7 +24783,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       return false;
     }
 
-    const promotedRun = promotionResult?.run ?? null;
+    const promotedRun = promotionResult && "run" in promotionResult ? promotionResult.run : null;
     if (!promotedRun) return false;
 
     if (promotionResult?.kind === "promoted" && promotionResult.reopenedActivity) {

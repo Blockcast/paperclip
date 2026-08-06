@@ -1954,6 +1954,66 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
+  it.each(["pr_review_output_missing", "pr_review_verification_unavailable"])(
+    "terminalizes the PR gate for non-retryable %s after adapter invocation",
+    async (errorCode) => {
+      const headSha = "075a9aeff53a229199ab0583e916f33c22459983";
+      mockAdapterExecute.mockResolvedValueOnce({
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+        errorCode,
+        errorMessage: "Review evidence could not be confirmed",
+        resultJson: { externalLifecycleRecovery: { adapterInvocationStarted: true } },
+        provider: "test",
+        model: "test-model",
+      });
+      const { runId, issueId } = await seedQueuedIssueRunFixture();
+      await db.update(heartbeatRuns).set({
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "github_pr_review_requested",
+          reviewKind: "pr_review",
+          taskKey: `pr_review:Blockcast/paperclip:1048:${headSha}`,
+          githubRepoFullName: "Blockcast/paperclip",
+          githubPrNumber: 1048,
+          githubHeadSha: headSha,
+        },
+      }).where(eq(heartbeatRuns.id, runId));
+      const previousGateContext = process.env.PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT;
+      process.env.PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT = "review/ally-complete";
+
+      try {
+        await heartbeat.resumeQueuedRuns();
+        expect(await waitForRunToSettle(heartbeat, runId, 8_000)).toMatchObject({
+          status: "failed",
+          errorCode,
+        });
+      } finally {
+        if (previousGateContext === undefined) {
+          delete process.env.PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT;
+        } else {
+          process.env.PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT = previousGateContext;
+        }
+      }
+
+      const [gateDeliveries, issue] = await Promise.all([
+        db.select().from(githubCommitStatusDeliveries).where(
+          eq(githubCommitStatusDeliveries.sourceRunId, runId),
+        ),
+        db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null),
+      ]);
+      expect(gateDeliveries).toHaveLength(1);
+      expect(gateDeliveries[0]).toMatchObject({
+        context: "review/ally-complete",
+        sha: headSha,
+        state: "failure",
+      });
+      expect(issue?.status).toBe("blocked");
+    },
+  );
+
   async function recoverClaimedReviewWithUnavailableVerification(kind: "result" | "throw") {
     const jobName = `agent-opencode-review-verification-${kind}`;
     const headSha = "075a9aeff53a229199ab0583e916f33c22459983";
@@ -6477,6 +6537,20 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   it("does not let an older terminal review run block a newer run in the same stage", async () => {
     const { companyId, agentId, issueId, runId, stageId } = await seedInReviewParticipantRunFixture();
     const newerRunId = randomUUID();
+    const headSha = "075a9aeff53a229199ab0583e916f33c22459983";
+    await db.update(heartbeatRuns).set({
+      contextSnapshot: {
+        issueId,
+        taskId: issueId,
+        wakeReason: "execution_review_requested",
+        executionStage: { stageId, stageType: "review" },
+        reviewKind: "pr_review",
+        taskKey: `pr_review:Blockcast/paperclip:1048:${headSha}`,
+        githubRepoFullName: "Blockcast/paperclip",
+        githubPrNumber: 1048,
+        githubHeadSha: headSha,
+      },
+    }).where(eq(heartbeatRuns.id, runId));
     mockAdapterExecute.mockImplementationOnce(async () => {
       await db.insert(heartbeatRuns).values({
         id: newerRunId,
@@ -6504,17 +6578,32 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       };
     });
     const heartbeat = createHeartbeat();
+    const previousGateContext = process.env.PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT;
+    process.env.PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT = "review/ally-complete";
 
-    await heartbeat.resumeQueuedRuns();
-    const settledRun = await waitForRunToSettle(heartbeat, runId, 8_000);
+    let settledRun: Awaited<ReturnType<typeof heartbeat.getRun>>;
+    try {
+      await heartbeat.resumeQueuedRuns();
+      settledRun = await waitForRunToSettle(heartbeat, runId, 8_000);
+    } finally {
+      if (previousGateContext === undefined) {
+        delete process.env.PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT;
+      } else {
+        process.env.PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT = previousGateContext;
+      }
+    }
     expect(settledRun).toMatchObject({ status: "failed", errorCode: "job_missing" });
 
-    const [issue, actions] = await Promise.all([
+    const [issue, actions, gateDeliveries] = await Promise.all([
       db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null),
       db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId)),
+      db.select().from(githubCommitStatusDeliveries).where(
+        eq(githubCommitStatusDeliveries.sourceRunId, runId),
+      ),
     ]);
     expect(issue).toMatchObject({ status: "in_review", executionRunId: newerRunId });
     expect(actions).toHaveLength(0);
+    expect(gateDeliveries).toHaveLength(0);
   });
 
   it("does not let a late prior-stage failure recover a later stage with the same reviewer", async () => {
