@@ -5,7 +5,10 @@
  * Creates a draft security advisory in the repo if any check fires.
  *
  * Env: GH_TOKEN, GH_REPO, PR_NUMBER, PR_AUTHOR
- * Exit: always 0 — security flags are silent, never block the PR visibly.
+ * Token requirement: the GitHub App needs Repository security advisories:
+ * read and write. Workflow security-events permission does not grant this.
+ * Exit: always 0. Advisory delivery failures are reported by an
+ * action_required security-review check.
  */
 import { fileURLToPath } from 'node:url';
 import { ghFetch } from './get-bot-token.mjs';
@@ -273,35 +276,66 @@ export async function findExistingDraftAdvisory(fetchImpl, token, repo, prNumber
   return null;
 }
 
-export async function postSecurityCheckRun(fetchImpl, token, repo, headSha, hasFlags) {
+export async function postSecurityCheckRun(fetchImpl, token, repo, headSha, outcome) {
+  let result;
+  if (outcome === 'flagged_with_advisory') {
+    result = {
+      conclusion: 'neutral',
+      title: 'Security Review Recommended',
+      summary: 'Draft advisory filed for maintainer review. Not a merge block — review the advisory at your leisure.',
+    };
+  } else if (outcome === 'advisory_sync_failed') {
+    result = {
+      conclusion: 'action_required',
+      title: 'Security Review Delivery Failed',
+      summary: 'Security flags were detected, but the draft advisory could not be created or updated. Manual maintainer review is required; inspect the workflow logs.',
+    };
+  } else if (outcome === 'clear') {
+    result = {
+      conclusion: 'success',
+      title: 'Security Review Passed',
+      summary: 'No security concerns detected.',
+    };
+  } else {
+    throw new Error(`Unknown security check outcome: ${outcome}`);
+  }
+
   await fetchImpl(`/repos/${repo}/check-runs`, token, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(hasFlags ? {
-      name: 'security-review',
-      head_sha: headSha,
-      // `completed/neutral` instead of `in_progress` so the check doesn't put
-      // the PR in `mergeStateStatus: BLOCKED`. The draft advisory is the
-      // durable signal for maintainers; there is no completion path that
-      // could ever flip an `in_progress` check-run back to completed on the
-      // same head SHA, so it would hang forever.
-      status: 'completed',
-      conclusion: 'neutral',
-      output: {
-        title: 'Security Review Recommended',
-        summary: 'Draft advisory filed for maintainer review. Not a merge block — review the advisory at your leisure.',
-      },
-    } : {
+    body: JSON.stringify({
       name: 'security-review',
       head_sha: headSha,
       status: 'completed',
-      conclusion: 'success',
+      conclusion: result.conclusion,
       output: {
-        title: 'Security Review Passed',
-        summary: 'No security concerns detected.',
+        title: result.title,
+        summary: result.summary,
       },
     }),
   });
+}
+
+export async function reportSecurityFlags(
+  fetchImpl,
+  token,
+  repo,
+  prNumber,
+  prTitle,
+  headSha,
+  flags,
+) {
+  try {
+    await syncDraftAdvisory(fetchImpl, token, repo, prNumber, prTitle, flags);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.warn(`[security] draft advisory sync failed: ${message}`);
+    await postSecurityCheckRun(fetchImpl, token, repo, headSha, 'advisory_sync_failed');
+    return { advisorySynced: false };
+  }
+
+  await postSecurityCheckRun(fetchImpl, token, repo, headSha, 'flagged_with_advisory');
+  return { advisorySynced: true };
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -382,17 +416,20 @@ async function main() {
   ];
 
   if (allFlags.length > 0) {
-    console.error(`[security] ${allFlags.length} flag(s) detected — creating draft advisory and pending check run`);
-    await Promise.all([
-      warnOnFailure('draft advisory sync', syncDraftAdvisory(ghFetch, GH_TOKEN, GH_REPO, prNumber, pr.title, allFlags)),
-      warnOnFailure('security check-run update', postSecurityCheckRun(ghFetch, GH_TOKEN, GH_REPO, pr.head.sha, true)),
-    ]);
+    console.error(`[security] ${allFlags.length} flag(s) detected — syncing draft advisory before reporting the check result`);
+    await warnOnFailure(
+      'security flag reporting',
+      reportSecurityFlags(ghFetch, GH_TOKEN, GH_REPO, prNumber, pr.title, pr.head.sha, allFlags),
+    );
   } else {
     console.log('[security] all clear');
-    await warnOnFailure('security check-run update', postSecurityCheckRun(ghFetch, GH_TOKEN, GH_REPO, pr.head.sha, false));
+    await warnOnFailure(
+      'security check-run update',
+      postSecurityCheckRun(ghFetch, GH_TOKEN, GH_REPO, pr.head.sha, 'clear'),
+    );
   }
 
-  // Always exit 0 — security flags are silent, never block the PR publicly
+  // Always exit 0. The security-review check carries the durable outcome.
   clearTimeout(watchdog);
   process.exit(0);
 }

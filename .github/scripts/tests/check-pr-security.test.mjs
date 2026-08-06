@@ -4,6 +4,7 @@ import {
   buildAdvisoryPayload,
   findExistingDraftAdvisory,
   postSecurityCheckRun,
+  reportSecurityFlags,
   scanSecrets,
   scanCITampering,
   scanBuildScripts,
@@ -200,13 +201,13 @@ test('syncDraftAdvisory: creates a new advisory when none exists', async () => {
   assert.deepEqual(JSON.parse(calls[1].options.body), buildAdvisoryPayload(6469, 'My PR', flags));
 });
 
-test('postSecurityCheckRun: uses the injected fetch implementation', async () => {
+test('postSecurityCheckRun: reports a successfully filed advisory as neutral', async () => {
   const calls = [];
 
   await postSecurityCheckRun(async (path, token, options) => {
     calls.push({ path, token, options });
     return { ok: true };
-  }, 'token', 'paperclipai/paperclip', 'deadbeef', true);
+  }, 'token', 'paperclipai/paperclip', 'deadbeef', 'flagged_with_advisory');
 
   assert.equal(calls.length, 1);
   assert.equal(calls[0].path, '/repos/paperclipai/paperclip/check-runs');
@@ -221,6 +222,97 @@ test('postSecurityCheckRun: uses the injected fetch implementation', async () =>
       summary: 'Draft advisory filed for maintainer review. Not a merge block — review the advisory at your leisure.',
     },
   });
+});
+
+test('postSecurityCheckRun: requires action when advisory delivery failed', async () => {
+  const calls = [];
+
+  await postSecurityCheckRun(async (path, token, options) => {
+    calls.push({ path, token, options });
+    return { ok: true };
+  }, 'token', 'paperclipai/paperclip', 'deadbeef', 'advisory_sync_failed');
+
+  assert.equal(calls.length, 1);
+  assert.deepEqual(JSON.parse(calls[0].options.body), {
+    name: 'security-review',
+    head_sha: 'deadbeef',
+    status: 'completed',
+    conclusion: 'action_required',
+    output: {
+      title: 'Security Review Delivery Failed',
+      summary: 'Security flags were detected, but the draft advisory could not be created or updated. Manual maintainer review is required; inspect the workflow logs.',
+    },
+  });
+});
+
+test('postSecurityCheckRun: reports a clear scan as successful', async () => {
+  const calls = [];
+
+  await postSecurityCheckRun(async (path, token, options) => {
+    calls.push({ path, token, options });
+    return { ok: true };
+  }, 'token', 'paperclipai/paperclip', 'deadbeef', 'clear');
+
+  assert.equal(calls.length, 1);
+  assert.deepEqual(JSON.parse(calls[0].options.body), {
+    name: 'security-review',
+    head_sha: 'deadbeef',
+    status: 'completed',
+    conclusion: 'success',
+    output: {
+      title: 'Security Review Passed',
+      summary: 'No security concerns detected.',
+    },
+  });
+});
+
+test('postSecurityCheckRun: rejects an unknown outcome instead of reporting success', async () => {
+  await assert.rejects(
+    postSecurityCheckRun(
+      async () => {
+        throw new Error('fetch must not be called');
+      },
+      'token',
+      'paperclipai/paperclip',
+      'deadbeef',
+      'typo',
+    ),
+    /Unknown security check outcome: typo/,
+  );
+});
+
+test('reportSecurityFlags: files the advisory before posting a neutral check', async () => {
+  const calls = [];
+  const flags = [{ check: 'ci-tampering', file: '.github/workflows/pr.yml' }];
+
+  const result = await reportSecurityFlags(async (path, token, options) => {
+    calls.push({ path, token, options });
+    if (path.includes('/security-advisories?state=draft')) return [];
+    return { ok: true };
+  }, 'token', 'paperclipai/paperclip', 6469, 'My PR', 'deadbeef', flags);
+
+  assert.deepEqual(result, { advisorySynced: true });
+  assert.equal(calls[1].path, '/repos/paperclipai/paperclip/security-advisories');
+  assert.equal(calls[2].path, '/repos/paperclipai/paperclip/check-runs');
+  assert.equal(JSON.parse(calls[2].options.body).conclusion, 'neutral');
+});
+
+test('reportSecurityFlags: posts action_required when advisory sync fails', async () => {
+  const calls = [];
+  const flags = [{ check: 'ci-tampering', file: '.github/workflows/pr.yml' }];
+
+  const result = await reportSecurityFlags(async (path, token, options) => {
+    calls.push({ path, token, options });
+    if (path.includes('/security-advisories?state=draft')) {
+      throw new Error('GitHub API GET security-advisories → 403: Resource not accessible by integration');
+    }
+    return { ok: true };
+  }, 'token', 'paperclipai/paperclip', 6469, 'My PR', 'deadbeef', flags);
+
+  assert.deepEqual(result, { advisorySynced: false });
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].path, '/repos/paperclipai/paperclip/check-runs');
+  assert.equal(JSON.parse(calls[1].options.body).conclusion, 'action_required');
 });
 
 test('validateSensitivePaths: checks paths against the resolved base ref instead of master', async () => {
