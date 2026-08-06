@@ -4698,11 +4698,17 @@ describe("agent issue mutation checkout ownership", () => {
           .patch(`/api/issues/${issueId}`)
           .send({ blockedByIssueIds: [] });
 
+        // `boundaryReason`, not `authorizationReason`: this assertion sees the
+        // argument handed to a mocked `logActivity`, so it passed happily while
+        // the real sanitizer replaced the value with `***REDACTED***` on the way
+        // to the row. The persisted value is pinned in
+        // `issue-coordination-metadata-refusal-persistence.test.ts`, which is
+        // the only level at which that bug is visible.
         expect(refusalRecords()).toEqual([
           expect.objectContaining({
             details: expect.objectContaining({
               refusalReason: "authorization_denied",
-              authorizationReason: "deny_missing_grant",
+              boundaryReason: "deny_missing_grant",
               fields: ["blockedByIssueIds"],
             }),
           }),

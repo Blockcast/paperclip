@@ -308,4 +308,115 @@ describeEmbeddedPostgres("coordination-metadata refusal records (persistence pat
     ).toBe(2);
     expect(new Set(assignees).size).toBe(2);
   });
+
+  // Ally review of cd1ecd253 finding 1. The reassignment test above only proves
+  // a transition survives while the bucket has room. The cap is the harder
+  // case: five cheap authorization denials — which an unprivileged actor can
+  // drive on demand by churning run ids — must not be able to exhaust the
+  // budget and then swallow the execution-lock refusal, which is the
+  // highest-value record this whole gate exists to emit. Scoping the cap per
+  // (assignee, holding run) epoch is what keeps that transition observable.
+  it("records the execution-lock transition after denials saturate the bucket", async () => {
+    const { companyId, assigneeAgentId, coordinatorAgentId, coordinatorRunId, issueId } =
+      await seedCoordinatorRefusedOnForeignIssue();
+
+    // Saturate the lock-free epoch with distinct signatures, exactly as the
+    // churn test does, so the pre-fix single bucket is genuinely full.
+    const churnedRunIds = [coordinatorRunId];
+    for (let index = 0; index < 11; index += 1) {
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId,
+        agentId: coordinatorAgentId,
+        status: "completed",
+        invocationSource: "manual",
+        startedAt: new Date(),
+      });
+      churnedRunIds.push(runId);
+    }
+    for (const runId of churnedRunIds) {
+      const res = await request(createApp(agentActor(companyId, coordinatorAgentId, runId)))
+        .patch(`/api/issues/${issueId}`)
+        .send({ priority: "low" });
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+    }
+    const saturated = await refusalRows(companyId);
+    expect(
+      saturated.length,
+      "precondition: the lock-free epoch must be at the cap before the transition",
+    ).toBe(COORDINATION_REFUSAL_AGGREGATE_MAX_RECORDS);
+    expect(saturated.every((row) =>
+      (row.details as Record<string, unknown>).refusalReason === "authorization_denied"
+    )).toBe(true);
+
+    // The assignee's run takes the execution lock: a new epoch, and the point
+    // at which a coordination rebind starts being able to strand a live run.
+    const holdingRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: holdingRunId,
+      companyId,
+      agentId: assigneeAgentId,
+      status: "running",
+      invocationSource: "manual",
+      startedAt: new Date(),
+    });
+    await db.update(issues).set({ executionRunId: holdingRunId }).where(eq(issues.id, issueId));
+
+    // `parentId` is execution-sensitive, so this is the refusal kind that says
+    // someone tried to rebind execution context out from under a running agent.
+    const rebind = await request(createApp(agentActor(companyId, coordinatorAgentId, coordinatorRunId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ parentId: null });
+    expect(rebind.status, JSON.stringify(rebind.body)).toBe(403);
+
+    const lockRows = (await refusalRows(companyId)).filter((row) =>
+      (row.details as Record<string, unknown>).refusalReason === "execution_lock"
+    );
+    expect(
+      lockRows.length,
+      "a saturated denial bucket must not swallow the first execution-lock refusal",
+    ).toBe(1);
+    const details = lockRows[0]?.details as Record<string, unknown>;
+    expect(details.executionRunId).toBe(holdingRunId);
+    expect(details.blockedFields).toEqual(["parentId"]);
+    expect(
+      details.refusalEpoch,
+      "the transition is recorded because the holding run opens a fresh epoch",
+    ).toBe(`assignee=${assigneeAgentId}|lock=${holdingRunId}`);
+  });
+
+  // Ally review of cd1ecd253 finding 2. `logActivity` runs details through
+  // `sanitizeRecord`, whose secret-key matcher treats any key *containing*
+  // "authorization" as credential material, so the original
+  // `authorizationReason` key persisted as `***REDACTED***` — the row kept
+  // every field except the one saying why the refusal happened. Asserting the
+  // exact persisted value is the only thing that catches this: the write
+  // succeeds, the key is present, and only its value is destroyed.
+  it("persists the boundary denial reason rather than redacting it", async () => {
+    const { companyId, coordinatorAgentId, coordinatorRunId, issueId } =
+      await seedCoordinatorRefusedOnForeignIssue();
+
+    const res = await request(createApp(agentActor(companyId, coordinatorAgentId, coordinatorRunId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ priority: "low" });
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+
+    const rows = await refusalRows(companyId);
+    expect(rows).toHaveLength(1);
+    const details = rows[0]?.details as Record<string, unknown>;
+    expect(details.refusalReason).toBe("authorization_denied");
+    // `deny_scope`, not `deny_missing_grant`: this coordinator holds no
+    // `tasks:assign` grant at all, so the real service turns it away on the
+    // scope check before grant evaluation. The mocked unit test stubs the
+    // decision and so cannot observe which reason the route actually records —
+    // another thing only the real-Postgres path can pin.
+    expect(
+      details.boundaryReason,
+      "the denial enum is not a secret and must survive activity-log sanitization intact",
+    ).toBe("deny_scope");
+    expect(details.boundaryReason).not.toBe("***REDACTED***");
+    // The redacting key must be gone, not merely shadowed by the new one.
+    expect(details).not.toHaveProperty("authorizationReason");
+  });
 });
