@@ -33,10 +33,11 @@ import {
   agentWakeupRequests,
   companies,
   heartbeatRuns,
+  githubWorkflowRunCompletions,
   issueComments,
   issues,
 } from "@paperclipai/db";
-import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, lt, sql } from "drizzle-orm";
 import { heartbeatService, type HeartbeatServiceOptions } from "../services/heartbeat.js";
 import { issueService } from "../services/issues.js";
 import {
@@ -53,7 +54,11 @@ import {
   githubPostIssueComment,
 } from "../services/github-app-auth.js";
 import { recoveryService } from "../services/recovery/service.js";
-import { recordGithubReviewRequestDelivery, recordGithubWorkflowRunConclusion } from "../services/metrics.js";
+import {
+  normalizeWorkflowRunConclusion,
+  recordGithubReviewRequestDelivery,
+  recordGithubWorkflowRunConclusion,
+} from "../services/metrics.js";
 import {
   recordMergedPullRequest,
   enrichAuthoredLocForRow,
@@ -68,6 +73,7 @@ type PrReviewerSelectionDb = Pick<Db | DbTransaction, "select">;
 // default pool satisfies the required minimum of two connections.
 const PR_REVIEWER_TASK_LOCK_TIMEOUT_MS = 2_000;
 const PR_REVIEWER_TASK_LOCK_RETRY_MS = 25;
+const WORKFLOW_RUN_COMPLETION_DEDUP_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 
 export interface GithubWebhookConfig {
   /**
@@ -392,6 +398,83 @@ function verifyGithubSignature(
 function readStringField(record: Record<string, unknown> | undefined, key: string): string | null {
   const value = record?.[key];
   return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+function readWorkflowRunId(workflowRun: Record<string, unknown> | undefined): string | null {
+  const value = workflowRun?.id;
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : null;
+  }
+  if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+    return String(Math.trunc(value));
+  }
+  return null;
+}
+
+function readWorkflowRunAttempt(workflowRun: Record<string, unknown> | undefined): number {
+  const value = workflowRun?.run_attempt;
+  if (typeof value === "number" && Number.isInteger(value) && value > 0) return value;
+  if (typeof value === "string" && /^[1-9]\d*$/.test(value.trim())) {
+    return Number.parseInt(value, 10);
+  }
+  return 1;
+}
+
+async function recordGithubWorkflowRunConclusionOnce(
+  db: Db,
+  input: {
+    workflowRun: Record<string, unknown> | undefined;
+    repoFullName: string | null;
+    deliveryId: string | null;
+  },
+): Promise<{ recorded: boolean; conclusion: string; workflowRunId: string | null; runAttempt: number }> {
+  const conclusion = normalizeWorkflowRunConclusion(readStringField(input.workflowRun, "conclusion"));
+  const workflowRunId = readWorkflowRunId(input.workflowRun);
+  const runAttempt = readWorkflowRunAttempt(input.workflowRun);
+
+  if (!workflowRunId) {
+    logger.warn(
+      { deliveryId: input.deliveryId, repoFullName: input.repoFullName },
+      "github workflow_run.completed missing workflow_run.id; counting without durable dedup",
+    );
+    recordGithubWorkflowRunConclusion(conclusion);
+    return { recorded: true, conclusion, workflowRunId, runAttempt };
+  }
+
+  const inserted = await db
+    .insert(githubWorkflowRunCompletions)
+    .values({
+      workflowRunId,
+      runAttempt,
+      repoFullName: input.repoFullName,
+      conclusion,
+      firstDeliveryId: input.deliveryId,
+    })
+    .onConflictDoNothing({
+      target: [
+        githubWorkflowRunCompletions.workflowRunId,
+        githubWorkflowRunCompletions.runAttempt,
+      ],
+    })
+    .returning({ id: githubWorkflowRunCompletions.id });
+
+  if (inserted.length === 0) {
+    return { recorded: false, conclusion, workflowRunId, runAttempt };
+  }
+
+  recordGithubWorkflowRunConclusion(conclusion);
+  try {
+    await db
+      .delete(githubWorkflowRunCompletions)
+      .where(lt(
+        githubWorkflowRunCompletions.createdAt,
+        new Date(Date.now() - WORKFLOW_RUN_COMPLETION_DEDUP_RETENTION_MS),
+      ));
+  } catch (err) {
+    logger.warn({ err }, "github workflow_run completion dedup retention prune failed");
+  }
+  return { recorded: true, conclusion, workflowRunId, runAttempt };
 }
 
 function githubPrUrl(repoFullName: string | null, prNumber: number | null, explicitUrl?: string | null): string | null {
@@ -1930,17 +2013,17 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
     // `context` is only non-null here for a *completed* workflow_run (see the
     // `action !== "completed"` guard in resolveEventContext's workflow_run
     // case) — exactly the terminal event this counter wants once per run.
-    // Pass the run's id/attempt so a GitHub redelivery of this same
-    // completion (at-least-once delivery) doesn't double-count.
+    // The insert is the cross-replica gate: only the first API process to
+    // persist this (workflow_run.id, run_attempt) increments its local
+    // Prometheus counter. Redeliveries that land on another replica conflict
+    // in Postgres and skip the increment.
     if (eventName === "workflow_run" && context) {
       const workflowRun = payload.workflow_run as Record<string, unknown> | undefined;
-      const runId = workflowRun?.id as number | string | undefined;
-      recordGithubWorkflowRunConclusion(
-        readStringField(workflowRun, "conclusion"),
-        runId !== undefined
-          ? { runId, runAttempt: workflowRun?.run_attempt as number | string | undefined }
-          : undefined,
-      );
+      await recordGithubWorkflowRunConclusionOnce(db, {
+        workflowRun,
+        repoFullName: context.repoFullName,
+        deliveryId,
+      });
     }
 
     // A closed or newly-drafted PR cannot produce useful reviewer work. Retire

@@ -624,31 +624,6 @@ describe("recordGithubWorkflowRunConclusion (BLO-21078 mass-cancellation detecto
     const { body } = await renderMetrics();
     expect(body).toContain(`${GITHUB_WORKFLOW_RUN_CONCLUSION_METRIC}{conclusion="other"} 1`);
   });
-
-  it("does not double-count a redelivered completion for the same run id + attempt (Ally review, BLO-21078)", async () => {
-    for (let i = 0; i < 3; i++) {
-      recordGithubWorkflowRunConclusion("cancelled", { runId: 30817055153, runAttempt: 1 });
-    }
-    const { body } = await renderMetrics();
-    expect(body).toContain(`${GITHUB_WORKFLOW_RUN_CONCLUSION_METRIC}{conclusion="cancelled"} 1`);
-  });
-
-  it("still counts a genuine re-run (same run id, new run_attempt) as its own completion", async () => {
-    recordGithubWorkflowRunConclusion("cancelled", { runId: 42, runAttempt: 1 });
-    recordGithubWorkflowRunConclusion("cancelled", { runId: 42, runAttempt: 1 }); // redelivery, ignored
-    recordGithubWorkflowRunConclusion("success", { runId: 42, runAttempt: 2 }); // real re-run
-    const { body } = await renderMetrics();
-    expect(body).toContain(`${GITHUB_WORKFLOW_RUN_CONCLUSION_METRIC}{conclusion="cancelled"} 1`);
-    expect(body).toContain(`${GITHUB_WORKFLOW_RUN_CONCLUSION_METRIC}{conclusion="success"} 1`);
-  });
-
-  it("treats distinct run ids independently even with no run_attempt given", async () => {
-    recordGithubWorkflowRunConclusion("cancelled", { runId: 1 });
-    recordGithubWorkflowRunConclusion("cancelled", { runId: 2 });
-    recordGithubWorkflowRunConclusion("cancelled", { runId: 1 }); // redelivery of run 1
-    const { body } = await renderMetrics();
-    expect(body).toContain(`${GITHUB_WORKFLOW_RUN_CONCLUSION_METRIC}{conclusion="cancelled"} 2`);
-  });
 });
 
 

@@ -527,39 +527,6 @@ export function normalizeWorkflowRunConclusion(conclusion: string | null | undef
     : UNKNOWN_WORKFLOW_RUN_CONCLUSION;
 }
 
-/**
- * `workflow_run.completed` deliveries are at-least-once: GitHub redelivers on
- * a failed ack, and a delivery can be replayed manually from the app's
- * settings UI. Without dedup, one redelivered `cancelled` run inflates the
- * mass-cancellation counter and can trip the `>= 3` alert threshold off a
- * single real event (found in review of BLO-21078's #977/#989).
- *
- * Keyed by `${run.id}:${run.run_attempt}` — the pair that's stable across
- * redeliveries of the *same* completion but distinct for a genuine re-run
- * (same run id, incremented `run_attempt`), which must still count as its
- * own terminal conclusion. Bounded FIFO so a busy fleet can't grow this
- * unboundedly; eviction just re-opens a redelivery window for very old runs,
- * which is an acceptable false-negative (worst case: under-count, never
- * over-count) given the alert only needs recent-window accuracy. This is
- * process-local, same scope as the counter itself — it does not dedupe
- * across replicas.
- */
-const WORKFLOW_RUN_DEDUP_CAP = 2000;
-let seenWorkflowRunCompletions = new Map<string, true>();
-
-function isDuplicateWorkflowRunCompletion(identity: { runId: string | number; runAttempt?: string | number | null } | undefined): boolean {
-  if (!identity) return false;
-  const key = `${identity.runId}:${identity.runAttempt ?? 1}`;
-  if (seenWorkflowRunCompletions.has(key)) return true;
-  seenWorkflowRunCompletions.set(key, true);
-  while (seenWorkflowRunCompletions.size > WORKFLOW_RUN_DEDUP_CAP) {
-    const oldestKey = seenWorkflowRunCompletions.keys().next().value;
-    if (oldestKey === undefined) break;
-    seenWorkflowRunCompletions.delete(oldestKey);
-  }
-  return false;
-}
-
 export const KNOWN_AUTH_OPERATIONS = [
   "oidc_start",
   "oidc_callback",
@@ -1562,21 +1529,14 @@ export function setAgentWakeupTerminalFailedOldestAgeSeconds(
 
 /**
  * Record one completed GitHub Actions `workflow_run` webhook delivery
- * (BLO-21078). Safe to call on every `workflow_run.completed` delivery the
- * webhook receives, including GitHub's at-least-once redeliveries — pass
- * `runIdentity` (the run's `id` and `run_attempt`) so a redelivered or
- * replayed delivery for the same completion increments the counter only
- * once. Omitting `runIdentity` disables dedup (used by direct unit-test
- * calls that don't model delivery identity).
+ * (BLO-21078). Callers must perform durable idempotency before this function:
+ * the Prometheus counter is process-local, while GitHub webhook redeliveries
+ * can land on any API replica.
  */
 export function recordGithubWorkflowRunConclusion(
   conclusion: string | null | undefined,
-  runIdentity?: { runId: string | number; runAttempt?: string | number | null },
 ): string {
   const label = normalizeWorkflowRunConclusion(conclusion);
-  if (isDuplicateWorkflowRunCompletion(runIdentity)) {
-    return label;
-  }
   ensureRegistry().githubWorkflowRunConclusionCounter.inc({ conclusion: label });
   return label;
 }
@@ -1638,7 +1598,6 @@ export function __resetMetricsForTest(): void {
   agentWakeupTerminalFailedUnresolved = null;
   agentWakeupTerminalFailedOldestAge = null;
   githubWorkflowRunConclusion = null;
-  seenWorkflowRunCompletions = new Map();
   authRequest = null;
   resetDepBlockedMetrics();
   resetBlockerResolvedWakeMetrics();
