@@ -49,6 +49,22 @@ test("Docker deploy job timeout covers every sequential rollout wait", () => {
   );
 });
 
+test("production helm upgrade retains --atomic so a failed upgrade rolls back instead of half-applying", () => {
+  const deployJob = getDeployJobBlock();
+  const helmUpgrade = deployJob.indexOf('helm upgrade "${RELEASE}"');
+  const helmPid = deployJob.indexOf("helm_pid=$!");
+
+  assert.ok(helmUpgrade >= 0, "deploy job must run helm upgrade");
+  assert.ok(helmPid > helmUpgrade, "helm_pid must be captured after the helm upgrade invocation");
+  assert.match(
+    deployJob.slice(helmUpgrade, helmPid),
+    /--atomic\b/,
+    "helm upgrade must pass --atomic (BLO-21492): without it, a resource denied mid-upgrade " +
+      "(e.g. by an admission policy) leaves the release half-applied instead of rolling back, " +
+      "which is how the worker and API tiers previously ended up on different image digests",
+  );
+});
+
 test("manual Docker deploys carry one full immutable SHA between jobs", () => {
   const buildJob = getBuildJobBlock();
   const deployJob = getDeployJobBlock();
