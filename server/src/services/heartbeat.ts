@@ -3,7 +3,7 @@ import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
-import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNotNull, isNull, lt, lte, ne, not, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNotNull, isNull, lt, lte, ne, not, notInArray, or, sql, type SQL } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
@@ -17858,6 +17858,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   // still names it the whole time — untouched here. Only a row whose lock
   // pointer has moved on or gone empty is a candidate, so real backlog is
   // never discarded for being merely old.
+  //
+  // BLO-21621 Ally review (gstack/review): detachment is a JOIN condition,
+  // evaluated in SQL against `issues`, not an application-side skip after an
+  // age-only scan. The prior version selected the oldest `limit` stale
+  // queued rows unconditionally and skipped the ones that turned out
+  // attached/terminal/malformed *after* fetching them — so once `limit`
+  // such permanently-skipped rows existed, every pass re-scanned the same
+  // prefix and a genuinely repairable row behind them was never reached.
+  // Filtering detachment in SQL means only actually-repairable rows ever
+  // occupy the bounded result set.
+  function detachedQueuedRunConditions(staleCutoff: Date, extra?: SQL | undefined) {
+    return and(
+      eq(heartbeatRuns.status, "queued"),
+      lte(heartbeatRuns.createdAt, staleCutoff),
+      notInArray(issues.status, [...TERMINAL_ISSUE_STATUSES]),
+      // NULL-safe: a never-locked issue (both pointers NULL) is just as
+      // detached from `run.id` as one locked to a different run.
+      sql`${issues.executionRunId} IS DISTINCT FROM ${heartbeatRuns.id}`,
+      sql`${issues.checkoutRunId} IS DISTINCT FROM ${heartbeatRuns.id}`,
+      extra,
+    );
+  }
+
   async function reconcileDetachedQueuedRuns(opts?: {
     now?: Date;
     companyId?: string;
@@ -17875,131 +17898,152 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const result = { scanned: 0, terminalized: 0, recovered: 0, skipped: 0, failed: 0 };
 
+    // `issues.id::text = heartbeatRuns.contextIssueId` (rather than casting
+    // the free-text column to uuid) so a malformed/missing issueId simply
+    // fails to join instead of throwing an invalid-uuid-syntax error for the
+    // whole query.
     const candidates = await db
       .select({
         id: heartbeatRuns.id,
         companyId: heartbeatRuns.companyId,
         agentId: heartbeatRuns.agentId,
         createdAt: heartbeatRuns.createdAt,
-        contextSnapshot: heartbeatRuns.contextSnapshot,
         wakeupRequestId: heartbeatRuns.wakeupRequestId,
-        resultJson: heartbeatRuns.resultJson,
+        issueId: issues.id,
+        issueAssigneeAgentId: issues.assigneeAgentId,
       })
       .from(heartbeatRuns)
-      .where(and(
-        sql`${heartbeatRuns.status} = 'queued'`,
-        lte(heartbeatRuns.createdAt, staleCutoff),
+      .innerJoin(
+        issues,
+        and(
+          eq(issues.companyId, heartbeatRuns.companyId),
+          sql`${issues.id}::text = ${heartbeatRuns.contextIssueId}`,
+        ),
+      )
+      .where(detachedQueuedRunConditions(
+        staleCutoff,
         opts?.companyId ? eq(heartbeatRuns.companyId, opts.companyId) : undefined,
       ))
       .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
       .limit(limit);
     result.scanned = candidates.length;
 
-    for (const run of candidates) {
+    // BLO-21621 Ally review (native-codex): reconcile every stale detached
+    // row for an issue before enqueueing a recovery wake for it, not just
+    // the one row this bounded scan happened to select first. Otherwise,
+    // cancelling one orphan and then calling enqueueWakeup lets its
+    // legacy-run lookup immediately adopt a *sibling* orphan for the same
+    // issue (stamping `executionRunId` onto it) — which then reads as
+    // "attached" and is left queued-but-dead forever, indistinguishable
+    // from the very leak this sweep exists to repair.
+    const processedIssueIds = new Set<string>();
+
+    for (const candidate of candidates) {
+      const issueId = candidate.issueId;
+      if (processedIssueIds.has(issueId)) continue;
+      processedIssueIds.add(issueId);
+
       try {
-        const context = parseObject(run.contextSnapshot);
-        const issueId = readNonEmptyString(context.issueId);
-        if (!issueId || !UUID_PATTERN.test(issueId)) {
-          result.skipped += 1;
-          continue;
-        }
-
-        const issue = await db
+        const siblings = await db
           .select({
-            id: issues.id,
-            companyId: issues.companyId,
-            status: issues.status,
-            assigneeAgentId: issues.assigneeAgentId,
-            executionRunId: issues.executionRunId,
-            checkoutRunId: issues.checkoutRunId,
+            id: heartbeatRuns.id,
+            createdAt: heartbeatRuns.createdAt,
+            wakeupRequestId: heartbeatRuns.wakeupRequestId,
+            resultJson: heartbeatRuns.resultJson,
           })
-          .from(issues)
-          .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
-          .then((rows) => rows[0] ?? null);
+          .from(heartbeatRuns)
+          .innerJoin(
+            issues,
+            and(
+              eq(issues.companyId, heartbeatRuns.companyId),
+              sql`${issues.id}::text = ${heartbeatRuns.contextIssueId}`,
+            ),
+          )
+          .where(detachedQueuedRunConditions(staleCutoff, eq(issues.id, issueId)));
 
-        // A missing or terminal issue is already handled by the dispatch-time
-        // terminal-issue prune (pruneStaleQueuedMaintenanceRunsForAgent /
-        // evaluateQueuedRunStaleness); nothing new to do here.
-        if (!issue || TERMINAL_ISSUE_STATUSES.has(issue.status)) {
-          result.skipped += 1;
-          continue;
-        }
-
-        // Still the recognized lock holder: this run is legitimately queued,
-        // not detached. Leave it — it may simply be waiting behind a full
-        // slot pool, which is expected and must not be terminalized.
-        const isDetached = issue.executionRunId !== run.id && issue.checkoutRunId !== run.id;
-        if (!isDetached) {
-          result.skipped += 1;
-          continue;
-        }
-
-        const staleForMs = now.getTime() - run.createdAt.getTime();
         const cancelReason =
           "Cancelled because this queued run detached from its source issue's execution lock and was never claimed";
-        const outcome = await setRunStatusIfQueued(run.id, "cancelled", {
-          finishedAt: now,
-          error: cancelReason,
-          errorCode: "queued_run_detached_from_issue",
-          resultJson: {
-            ...parseObject(run.resultJson),
-            stopReason: "queued_run_detached_from_issue",
-          },
-        });
-        if (!outcome.updated) {
-          // Lost the race (claimed, or reconciled by a concurrent pass) — the
-          // row is no longer detached-and-queued either way.
-          result.skipped += 1;
-          continue;
+        let anyTerminalized = false;
+
+        for (const sibling of siblings) {
+          const staleForMs = now.getTime() - sibling.createdAt.getTime();
+          const outcome = await setRunStatusIfQueued(sibling.id, "cancelled", {
+            finishedAt: now,
+            error: cancelReason,
+            errorCode: "queued_run_detached_from_issue",
+            resultJson: {
+              ...parseObject(sibling.resultJson),
+              stopReason: "queued_run_detached_from_issue",
+            },
+          });
+          if (!outcome.updated) {
+            // Lost the race (claimed, or reconciled by a concurrent pass) —
+            // the row is no longer detached-and-queued either way.
+            result.skipped += 1;
+            continue;
+          }
+          anyTerminalized = true;
+          result.terminalized += 1;
+
+          await setWakeupStatus(sibling.wakeupRequestId, "skipped", {
+            finishedAt: now,
+            error: cancelReason,
+          });
+
+          await appendRunEvent(outcome.run, await nextRunEventSeq(outcome.run.id), {
+            eventType: "lifecycle",
+            stream: "system",
+            level: "warn",
+            message: "Cancelled a detached queued run found by the BLO-21621 reconciliation sweep",
+            payload: { issueId, staleForMs },
+          });
+
+          logger.warn(
+            { runId: sibling.id, issueId, staleForMs },
+            "reconcileDetachedQueuedRuns: cancelled a detached queued run",
+          );
         }
-        const cancelled = outcome.run;
-        result.terminalized += 1;
 
-        await setWakeupStatus(run.wakeupRequestId, "skipped", {
-          finishedAt: now,
-          error: cancelReason,
-        });
+        if (!anyTerminalized) continue;
 
-        await appendRunEvent(cancelled, await nextRunEventSeq(cancelled.id), {
-          eventType: "lifecycle",
-          stream: "system",
-          level: "warn",
-          message: "Cancelled a detached queued run found by the BLO-21621 reconciliation sweep",
-          payload: { issueId, staleForMs },
-        });
+        // Every stale detached row for this issue is now cancelled, so
+        // enqueueWakeup's legacy-run lookup has nothing left to wrongly
+        // adopt. Re-read the lock pointers fresh — cancellation above never
+        // touches `issues`, but a live run may have claimed the issue
+        // between our candidate scan and now — and only re-wake when
+        // nothing else currently owns it.
+        const freshIssue = await db
+          .select({
+            executionRunId: issues.executionRunId,
+            checkoutRunId: issues.checkoutRunId,
+            assigneeAgentId: issues.assigneeAgentId,
+          })
+          .from(issues)
+          .where(eq(issues.id, issueId))
+          .then((rows) => rows[0] ?? null);
 
-        // Only re-wake when nothing else currently claims the issue's lock.
-        // If some other run already owns it (live or itself stale), that
-        // pointer is this sweep's problem to leave alone — sweepStaleIssueLocks
-        // and reconcileStrandedAssignedIssues already own resolving it, and
-        // waking here on top would risk a second execution for one issue.
-        const agentId = issue.assigneeAgentId ?? run.agentId;
-        if (!issue.executionRunId && !issue.checkoutRunId && agentId) {
+        const agentId = freshIssue?.assigneeAgentId ?? candidate.issueAssigneeAgentId ?? candidate.agentId;
+        if (freshIssue && !freshIssue.executionRunId && !freshIssue.checkoutRunId && agentId) {
           const recoveryRun = await enqueueWakeup(agentId, {
             source: "automation",
             triggerDetail: "system",
             reason: "queued_run_detachment_recovery",
-            payload: { issueId, retryOfRunId: run.id },
+            payload: { issueId, retryOfRunId: candidate.id },
             contextSnapshot: {
               issueId,
               taskId: issueId,
               wakeReason: "queued_run_detachment_recovery",
               retryReason: "queued_run_detachment_recovery",
-              retryOfRunId: run.id,
+              retryOfRunId: candidate.id,
               source: "heartbeat.reconcile_detached_queued_runs",
             },
-            idempotencyKey: `detached_queued_run_recovery:${run.id}`,
+            idempotencyKey: `detached_queued_run_recovery:${issueId}`,
           });
           if (recoveryRun) result.recovered += 1;
         }
-
-        logger.warn(
-          { runId: run.id, issueId, agentId, staleForMs },
-          "reconcileDetachedQueuedRuns: cancelled a detached queued run",
-        );
       } catch (err) {
         result.failed += 1;
-        logger.warn({ err, runId: run.id }, "reconcileDetachedQueuedRuns: failed to reconcile candidate");
+        logger.warn({ err, issueId }, "reconcileDetachedQueuedRuns: failed to reconcile candidate");
       }
     }
 

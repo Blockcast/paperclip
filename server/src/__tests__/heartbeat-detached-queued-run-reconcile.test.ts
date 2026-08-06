@@ -175,7 +175,10 @@ describeEmbeddedPostgres("heartbeat reconcileDetachedQueuedRuns", () => {
 
     const result = await heartbeat.reconcileDetachedQueuedRuns();
 
-    expect(result).toMatchObject({ scanned: 1, terminalized: 0, recovered: 0, skipped: 1, failed: 0 });
+    // BLO-21621 Ally review (gstack/review): detachment is now a JOIN
+    // condition evaluated in SQL, so an attached row never enters the
+    // candidate set at all -- it is not fetched and then skipped.
+    expect(result).toMatchObject({ scanned: 0, terminalized: 0, recovered: 0, skipped: 0, failed: 0 });
 
     const attachedRun = await db
       .select({ status: heartbeatRuns.status })
@@ -248,5 +251,151 @@ describeEmbeddedPostgres("heartbeat reconcileDetachedQueuedRuns", () => {
       .where(eq(issues.id, issueId))
       .then((rows2) => rows2[0]);
     expect(issue?.executionRunId).toBe(liveOwnerRunId);
+  });
+
+  it("reaches a repairable detached row behind more than `limit` permanently-attached rows (BLO-21621 gstack/review)", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+
+    // Five older, legitimately-attached queued rows -- each is its own
+    // issue's recognized lock holder, so an age-only bounded scan would
+    // treat all five as permanent, unskippable occupants of any small
+    // `limit`. Under the prior implementation these were only excluded
+    // *after* being fetched, so a `limit` smaller than "attached backlog
+    // count" meant a genuinely repairable row behind them was never
+    // reached by any pass.
+    for (let i = 0; i < 5; i += 1) {
+      const attachedIssueId = randomUUID();
+      const attachedRunId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: attachedRunId,
+        companyId,
+        agentId,
+        status: "queued",
+        invocationSource: "on_demand",
+        contextSnapshot: { issueId: attachedIssueId },
+        createdAt: new Date(Date.now() - SEVEN_HOURS_MS - (5 - i) * 1000),
+      });
+      await db.insert(issues).values({
+        id: attachedIssueId,
+        companyId,
+        title: `Permanently-attached backlog holder ${i}`,
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+        checkoutRunId: null,
+        executionRunId: attachedRunId,
+        executionLockedAt: new Date(Date.now() - SEVEN_HOURS_MS),
+      });
+    }
+
+    // One repairable detached row, created *after* all five attached rows
+    // above (so an age-ordered scan ranks it last), stale enough to qualify.
+    const repairableIssueId = randomUUID();
+    const repairableRunId = randomUUID();
+    await db.insert(issues).values({
+      id: repairableIssueId,
+      companyId,
+      title: "Repairable detached row behind a wall of attached backlog",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: null,
+      executionRunId: null,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: repairableRunId,
+      companyId,
+      agentId,
+      status: "queued",
+      invocationSource: "on_demand",
+      contextSnapshot: { issueId: repairableIssueId, wakeReason: "issue_continuation_needed" },
+      createdAt: new Date(Date.now() - SEVEN_HOURS_MS),
+    });
+
+    // `limit: 3` is smaller than the five permanently-attached rows seeded
+    // above -- an age-only scan bounded to 3 would never see past them.
+    const result = await heartbeat.reconcileDetachedQueuedRuns({ limit: 3 });
+
+    expect(result).toMatchObject({ scanned: 1, terminalized: 1, recovered: 1, skipped: 0, failed: 0 });
+
+    const repairableRun = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, repairableRunId))
+      .then((rows) => rows[0]);
+    expect(repairableRun?.status).toBe("cancelled");
+
+    // The five attached rows were never candidates at all (filtered by the
+    // SQL join, not fetched-then-skipped) -- none of them were cancelled by
+    // this sweep, regardless of what normal dispatch does with them next.
+    const cancelledCount = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.status, "cancelled")));
+    expect(cancelledCount).toHaveLength(1);
+  });
+
+  it("terminalizes both rows of a two-orphan issue and creates exactly one fresh replacement, without re-adopting a sibling orphan (BLO-21621 native-codex review)", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = randomUUID();
+    const orphanOneId = randomUUID();
+    const orphanTwoId = randomUUID();
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Two stale detached orphans for one issue",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: null,
+      executionRunId: null,
+    });
+    await db.insert(heartbeatRuns).values([
+      {
+        id: orphanOneId,
+        companyId,
+        agentId,
+        status: "queued",
+        invocationSource: "on_demand",
+        contextSnapshot: { issueId, wakeReason: "issue_continuation_needed" },
+        createdAt: new Date(Date.now() - SEVEN_HOURS_MS - 2000),
+      },
+      {
+        id: orphanTwoId,
+        companyId,
+        agentId,
+        status: "queued",
+        invocationSource: "on_demand",
+        contextSnapshot: { issueId, wakeReason: "issue_continuation_needed" },
+        createdAt: new Date(Date.now() - SEVEN_HOURS_MS - 1000),
+      },
+    ]);
+
+    const result = await heartbeat.reconcileDetachedQueuedRuns();
+
+    expect(result).toMatchObject({ scanned: 2, terminalized: 2, recovered: 1, skipped: 0, failed: 0 });
+
+    const rows = await db
+      .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.companyId, companyId));
+    // Both orphans terminal, plus exactly one newly-created replacement run.
+    expect(rows).toHaveLength(3);
+    expect(rows.find((row) => row.id === orphanOneId)?.status).toBe("cancelled");
+    expect(rows.find((row) => row.id === orphanTwoId)?.status).toBe("cancelled");
+    const freshRun = rows.find((row) => row.id !== orphanOneId && row.id !== orphanTwoId);
+    expect(freshRun).toBeDefined();
+    expect(freshRun?.status).not.toBe("cancelled");
+
+    // The issue must be pointed at the fresh run, never re-adopted onto
+    // either terminal orphan.
+    const issue = await db
+      .select({ executionRunId: issues.executionRunId, checkoutRunId: issues.checkoutRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows2) => rows2[0]);
+    expect(issue?.executionRunId).toBe(freshRun?.id);
+    expect(issue?.checkoutRunId).toBeNull();
   });
 });
