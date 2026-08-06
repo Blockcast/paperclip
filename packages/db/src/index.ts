@@ -13,6 +13,14 @@ export {
   type Db,
 } from "./client.js";
 export {
+  ensurePendingConcurrentIndexes,
+  PENDING_CONCURRENT_INDEXES,
+  type ConcurrentIndexSpec,
+  type ConcurrentIndexEnsureAction,
+  type ConcurrentIndexEnsureResult,
+  type EnsurePendingConcurrentIndexesOptions,
+} from "./concurrent-index-guard.js";
+export {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
   type EmbeddedPostgresTestDatabase,

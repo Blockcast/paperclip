@@ -23,6 +23,7 @@ import {
   getPostgresDataDirectory,
   inspectMigrations,
   applyPendingMigrations,
+  ensurePendingConcurrentIndexes,
   createEmbeddedPostgresLogBuffer,
   prepareEmbeddedPostgresNativeRuntime,
   reconcilePendingMigrationHistory,
@@ -338,6 +339,28 @@ export async function startServer(): Promise<StartedServer> {
     label: string,
     opts?: EnsureMigrationsOptions,
   ): Promise<MigrationSummary> {
+    const summary = await applyMigrationsForLabel(connectionString, label, opts);
+
+    // Runs on every startup, including "already applied": a migration can
+    // record complete on a populated database without building its deferred
+    // index (BLO-21526 — migration 0212), so an unchanged migration state is
+    // not evidence the index exists. Failure here fails startup, so a deploy
+    // that skips the online build fails visibly instead of silently.
+    const indexResults = await ensurePendingConcurrentIndexes(connectionString);
+    for (const result of indexResults) {
+      if (result.action !== "already-valid") {
+        logger.info({ index: result.name, table: result.table, action: result.action }, `${label}: built deferred index`);
+      }
+    }
+
+    return summary;
+  }
+
+  async function applyMigrationsForLabel(
+    connectionString: string,
+    label: string,
+    opts?: EnsureMigrationsOptions,
+  ): Promise<MigrationSummary> {
     const autoApply = opts?.autoApply === true;
     let state = await inspectMigrations(connectionString);
     if (state.status === "needsMigrations" && state.reason === "pending-migrations") {
@@ -364,12 +387,12 @@ export async function startServer(): Promise<StartedServer> {
             "Refusing to start against a stale schema. Run pnpm db:migrate or set PAPERCLIP_MIGRATION_AUTO_APPLY=true.",
         );
       }
-  
+
       logger.info({ pendingMigrations: state.pendingMigrations }, `Applying ${state.pendingMigrations.length} pending migrations for ${label}`);
       await applyPendingMigrations(connectionString);
       return "applied (pending migrations)";
     }
-  
+
     const apply = autoApply ? true : await promptApplyMigrations(state.pendingMigrations);
     if (!apply) {
       throw new Error(
@@ -377,7 +400,7 @@ export async function startServer(): Promise<StartedServer> {
           "Refusing to start against a stale schema. Run pnpm db:migrate or set PAPERCLIP_MIGRATION_AUTO_APPLY=true.",
       );
     }
-  
+
     logger.info({ pendingMigrations: state.pendingMigrations }, `Applying ${state.pendingMigrations.length} pending migrations for ${label}`);
     await applyPendingMigrations(connectionString);
     return "applied (pending migrations)";
@@ -1463,7 +1486,7 @@ export async function startServer(): Promise<StartedServer> {
               try {
                 const result = await heartbeat.reconcileWorkerCrashedRuns({
                   // BLO-21526: skip this pass until the candidate index exists.
-                  // Migration 0211 leaves it unbuilt on a populated table (an
+                  // Migration 0212 leaves it unbuilt on a populated table (an
                   // inline build would hold ACCESS EXCLUSIVE for its duration),
                   // so until the online CREATE INDEX CONCURRENTLY step has run,
                   // this query is a sequential scan plus a sort — tolerable once
