@@ -125,6 +125,13 @@ type ActorInfo = {
 const ACTIVE_BROKER_RUN_STATUSES = new Set(["running"]);
 const REMOTE_HTTP_REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 const MAX_REMOTE_HTTP_REDIRECTS = 5;
+/**
+ * recordInvocation() inserts a pending toolActionRequests row before the
+ * async approval-snapshot + signing step that fills in signedArguments
+ * (BLO-21490). A read that lands in that window must not treat the row as
+ * corrupt — only auto-cancel once it's had time to finish signing.
+ */
+const ACTION_REQUEST_SIGNING_GRACE_MS = 30_000;
 
 type OAuthProviderEndpoints = {
   provider: string;
@@ -5676,8 +5683,13 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       const invocationById = new Map(invocations.map((invocation) => [invocation.id, invocation]));
       let visibleRequests = requests;
       if (status === "pending") {
+        const signingGraceCutoff = Date.now() - ACTION_REQUEST_SIGNING_GRACE_MS;
         const invalidRequestIds = requests
           .filter((request) => {
+            // Still within the grace period: recordInvocation() may not have
+            // finished the async sign-and-backfill UPDATE yet. Don't treat
+            // an unsigned-so-far row as corrupt (BLO-21490).
+            if (request.createdAt.getTime() > signingGraceCutoff) return false;
             const invocation = invocationById.get(request.invocationId);
             if (!invocation) return true;
             try {
