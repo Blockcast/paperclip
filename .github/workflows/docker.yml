@@ -471,6 +471,7 @@ jobs:
           fi
 
           marker_key="paperclip.blockcast.net/approval-plan-sha256"
+          deployed_commit_key="paperclip.blockcast.net/deployed-commit"
           unstamped="${RUNNER_TEMP}/paperclip-api-unstamped.json"
           plan="${RUNNER_TEMP}/paperclip-api-plan.json"
 
@@ -481,7 +482,16 @@ jobs:
             --set image.tag="${TAG}" \
             --set-string image.digest="${DIGEST}" \
             --set-string api.deployedCommit="${COMMIT}" \
-            | kubectl create --dry-run=client -n "${NS}" -o json -f - > "${unstamped}"
+            | kubectl create --dry-run=client -n "${NS}" -o json -f - \
+            | jq --arg key "${deployed_commit_key}" --arg commit "${COMMIT}" '
+                .spec.template.metadata.annotations[$key] as $existing |
+                if $existing != null and $existing != $commit then
+                  error("paperclip-api render already carries a different deployed-commit annotation")
+                else
+                  .spec.template.metadata.annotations =
+                    ((.spec.template.metadata.annotations // {}) + {($key): $commit})
+                end
+              ' > "${unstamped}"
 
           canonical_unstamped=$(jq -cS --arg key "${marker_key}" '
             del(.spec.template.metadata.annotations[$key])
@@ -505,15 +515,23 @@ jobs:
             --set-string image.digest="${DIGEST}" \
             --set-string api.deployedCommit="${COMMIT}" \
             | PAPERCLIP_DEPLOY_NAMESPACE="${NS}" \
+              PAPERCLIP_DEPLOYED_COMMIT="${COMMIT}" \
               PAPERCLIP_APPROVAL_PLAN_SHA256="${marker}" "${STAMP_SCRIPT}" \
             | kubectl create --dry-run=client -n "${NS}" -o json -f - > "${plan}"
 
-          jq -e --arg key "${marker_key}" --arg marker "${marker}" --arg image "${expected_image}" --arg namespace "${NS}" '
+          jq -e \
+            --arg key "${marker_key}" \
+            --arg deployedCommitKey "${deployed_commit_key}" \
+            --arg marker "${marker}" \
+            --arg commit "${COMMIT}" \
+            --arg image "${expected_image}" \
+            --arg namespace "${NS}" '
             .apiVersion == "apps/v1" and
             .kind == "Deployment" and
             .metadata.namespace == $namespace and
             .metadata.name == "paperclip-api" and
             .spec.template.metadata.annotations[$key] == $marker and
+            .spec.template.metadata.annotations[$deployedCommitKey] == $commit and
             (.spec.template.spec.containers | all(.image == $image))
           ' "${plan}" >/dev/null
 
@@ -542,6 +560,7 @@ jobs:
           APPROVER_KUBECONFIG: ${{ secrets.KUBECONFIG_PAPERCLIP_RELEASE_APPROVER }}
           DIGEST: ${{ steps.artifact.outputs.digest }}
           APPROVE_SCRIPT: ${{ steps.tooling.outputs.approve_script }}
+          COMMIT: ${{ steps.target.outputs.full }}
           DEPLOY_PLAN: ${{ steps.plan.outputs.path }}
           NS: ${{ vars.PAPERCLIP_NAMESPACE || 'paperclip' }}
           # The approval window size is deliberately NOT set here. It is a
@@ -583,13 +602,14 @@ jobs:
             PAPERCLIP_APPROVED_SERVER_PLAN_OUT="${approved_server_plan}" \
             "${APPROVE_SCRIPT}" "${DIGEST}" "${DEPLOY_PLAN}" | tee "${approval_log}"
 
-          jq -e --arg namespace "${NS}" --arg digest "${DIGEST}" '
+          jq -e --arg namespace "${NS}" --arg digest "${DIGEST}" --arg commit "${COMMIT}" '
             .apiVersion == "apps/v1" and
             .kind == "Deployment" and
             .metadata.namespace == $namespace and
             .metadata.name == "paperclip-api" and
             ((.metadata.resourceVersion == null) or
               (.metadata.resourceVersion | type == "string" and length > 0)) and
+            .spec.template.metadata.annotations["paperclip.blockcast.net/deployed-commit"] == $commit and
             (.spec.template.spec.containers | all(.image == ("harbor.blockcast.net/paperclip/paperclip@" + $digest)))
           ' "${approved_server_plan}" >/dev/null
           echo "server_plan_path=${approved_server_plan}" >> "$GITHUB_OUTPUT"
@@ -616,6 +636,7 @@ jobs:
           APPROVE_SCRIPT: ${{ steps.tooling.outputs.approve_script }}
           STAMP_SCRIPT: ${{ steps.tooling.outputs.stamp_script }}
           PAPERCLIP_APPROVAL_PLAN_SHA256: ${{ steps.plan.outputs.marker }}
+          PAPERCLIP_DEPLOYED_COMMIT: ${{ steps.target.outputs.full }}
           PAPERCLIP_DEPLOY_NAMESPACE: ${{ vars.PAPERCLIP_NAMESPACE || 'paperclip' }}
         run: |
           set -euo pipefail
@@ -791,8 +812,10 @@ jobs:
           fi
           jq -e \
             --arg marker "${PLAN_MARKER}" \
+            --arg commit "${COMMIT}" \
             --arg image "harbor.blockcast.net/paperclip/paperclip@${DIGEST}" '
               .spec.template.metadata.annotations["paperclip.blockcast.net/approval-plan-sha256"] == $marker and
+              .spec.template.metadata.annotations["paperclip.blockcast.net/deployed-commit"] == $commit and
               (.spec.template.spec.containers | all(.image == $image))
             ' <<<"${live_json}" >/dev/null
 
