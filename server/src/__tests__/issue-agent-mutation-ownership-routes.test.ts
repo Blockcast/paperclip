@@ -3507,6 +3507,68 @@ describe("agent issue mutation checkout ownership", () => {
     });
   });
 
+  it("pins current-run ownership on ordinary PATCH writes", async () => {
+    const stored = makeIssue({
+      assigneeAgentId: peerAgentId,
+      checkoutRunId: ownerRunId,
+      executionRunId: ownerRunId,
+    });
+    mockIssueService.getById.mockResolvedValue(stored);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...stored,
+      ...patch,
+    }));
+
+    const res = await request(await createApp(ownerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ title: "Current run write" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.assertCheckoutOwner).not.toHaveBeenCalled();
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      issueId,
+      expect.objectContaining({
+        title: "Current run write",
+        expectedCurrentCheckoutRunId: ownerRunId,
+        expectedCurrentExecutionRunId: ownerRunId,
+      }),
+    );
+  });
+
+  it("pins current-run ownership on execution-state PATCH writes", async () => {
+    const stored = await makePendingReviewIssueForAgent(ownerAgentId, {
+      assigneeAgentId: peerAgentId,
+      checkoutRunId: ownerRunId,
+      executionRunId: ownerRunId,
+    });
+    mockIssueService.getById.mockResolvedValue(stored);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...stored,
+      ...patch,
+    }));
+
+    const res = await request(await createApp(ownerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ reviewRequest: { instructions: "Review the ownership guard." } });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.assertCheckoutOwner).not.toHaveBeenCalled();
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      issueId,
+      expect.objectContaining({
+        expectedCurrentStatus: "in_review",
+        expectedCurrentExecutionState: stored.executionState,
+        expectedCurrentExecutionPolicy: stored.executionPolicy,
+        expectedCurrentCheckoutRunId: ownerRunId,
+        expectedCurrentExecutionRunId: ownerRunId,
+      }),
+    );
+    const [, patch] = mockIssueService.update.mock.calls.at(-1) as [string, Record<string, unknown>];
+    expect(patch.executionState).toMatchObject({
+      reviewRequest: { instructions: "Review the ownership guard." },
+    });
+  });
+
   it("rejects peer-agent status updates that would clear a recovery action they do not own", async () => {
     mockIssueService.getById.mockResolvedValue(
       makeIssue({ status: "blocked", assigneeAgentId: null, assigneeUserId: "board-user" }),

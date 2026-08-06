@@ -1832,6 +1832,159 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
     expect(row).toEqual({ status: "in_review", executionPolicy: revisedPolicy });
   });
 
+  it("rejects a stale current-run ordinary update after run ownership transfers", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const nextRunId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: nextRunId,
+      companyId,
+      agentId,
+      status: "running",
+      invocationSource: "manual",
+      startedAt: new Date(),
+      createdAt: new Date("2026-01-01T00:02:00.000Z"),
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Current-run ordinary snapshot",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: currentRunId,
+      executionRunId: currentRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date(),
+    });
+    await db
+      .update(issues)
+      .set({ checkoutRunId: nextRunId, executionRunId: nextRunId })
+      .where(eq(issues.id, issueId));
+
+    await expect(issueService(db).update(issueId, {
+      title: "Stale ordinary write",
+      expectedCurrentCheckoutRunId: currentRunId,
+      expectedCurrentExecutionRunId: currentRunId,
+    })).rejects.toMatchObject({ status: 409 });
+
+    const row = await db
+      .select({
+        title: issues.title,
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({
+      title: "Current-run ordinary snapshot",
+      checkoutRunId: nextRunId,
+      executionRunId: nextRunId,
+    });
+  });
+
+  it("rejects a stale current-run execution-state update after run ownership transfers", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const nextRunId = randomUUID();
+    const issueId = randomUUID();
+    const stageId = randomUUID();
+    const executionPolicy = {
+      mode: "normal",
+      commentRequired: true,
+      stages: [{
+        id: stageId,
+        type: "review",
+        approvalsNeeded: 1,
+        participants: [{ type: "agent", agentId }],
+      }],
+    };
+    const executionState = {
+      status: "pending",
+      currentStageId: stageId,
+      currentStageIndex: 0,
+      currentStageType: "review",
+      currentParticipant: { type: "agent", agentId },
+      returnAssignee: { type: "agent", agentId },
+      completedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+      reviewRequest: null,
+    };
+    await db.insert(heartbeatRuns).values({
+      id: nextRunId,
+      companyId,
+      agentId,
+      status: "running",
+      invocationSource: "manual",
+      startedAt: new Date(),
+      createdAt: new Date("2026-01-01T00:02:00.000Z"),
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Current-run execution-state snapshot",
+      status: "in_review",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: currentRunId,
+      executionRunId: currentRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date(),
+      executionPolicy,
+      executionState,
+    });
+    const snapshot = await db
+      .select({
+        status: issues.status,
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+        executionPolicy: issues.executionPolicy,
+        executionState: issues.executionState,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] as {
+        status: string;
+        checkoutRunId: string;
+        executionRunId: string;
+        executionPolicy: Record<string, unknown>;
+        executionState: Record<string, unknown>;
+      });
+    const nextState = {
+      ...snapshot.executionState,
+      reviewRequest: { instructions: "Review after ownership transfer." },
+    };
+    await db
+      .update(issues)
+      .set({ checkoutRunId: nextRunId, executionRunId: nextRunId })
+      .where(eq(issues.id, issueId));
+
+    await expect(issueService(db).update(issueId, {
+      executionState: nextState,
+      expectedCurrentStatus: snapshot.status,
+      expectedCurrentExecutionState: snapshot.executionState,
+      expectedCurrentExecutionPolicy: snapshot.executionPolicy,
+      expectedCurrentCheckoutRunId: snapshot.checkoutRunId,
+      expectedCurrentExecutionRunId: snapshot.executionRunId,
+    })).rejects.toMatchObject({ status: 409 });
+
+    const row = await db
+      .select({
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+        executionState: issues.executionState,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({
+      checkoutRunId: nextRunId,
+      executionRunId: nextRunId,
+      executionState: snapshot.executionState,
+    });
+  });
+
   it.each(["review_request", "decision"] as const)(
     "rejects the stale writer when %s commits first from a shared snapshot",
     async (firstWriter) => {
