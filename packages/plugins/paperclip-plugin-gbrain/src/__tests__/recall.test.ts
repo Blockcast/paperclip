@@ -5,6 +5,8 @@ import {
   RECALL_STATE_KEY,
   DEFAULT_RECALL_DEPTH,
   MAX_ENRICHMENT_NODES,
+  MAX_ENRICHMENT_EDGES,
+  MAX_ENRICHMENT_SERIALIZED_BYTES,
 } from "../recall.js";
 import type { GbrainCallable } from "../pages.js";
 
@@ -177,6 +179,78 @@ describe("prefetchRunContext", () => {
       expect(keptSlugs.has(edge.from)).toBe(true);
       expect(keptSlugs.has(edge.to)).toBe(true);
     }
+  });
+
+  it("normalizes and caps an oversized edges-only fallback graph", async () => {
+    const hubEdges = Array.from({ length: MAX_ENRICHMENT_EDGES + 500 }, (_, i) => ({
+      from: `fact-${i}`,
+      to: `fact-${i + 1}`,
+      label: "related",
+    }));
+    const client = {
+      call: vi.fn(async (_tool: string, args: Record<string, unknown>) => {
+        if (args.slug === "issue-blo-1") return [];
+        if (args.slug === "agent-cto") return { edges: hubEdges };
+        return null;
+      }),
+    };
+
+    const out = await prefetchRunContext({
+      client: client as unknown as GbrainCallable,
+      issueIdentifier: "BLO-1",
+      agentName: "CTO",
+      depth: 2,
+    });
+
+    expect(out.ok).toBe(true);
+    const graph = out.graph as { edges: unknown[] };
+    expect(graph).toEqual({ edges: expect.any(Array) });
+    expect(graph.edges.length).toBeLessThanOrEqual(MAX_ENRICHMENT_EDGES);
+    expect(Buffer.byteLength(JSON.stringify(graph))).toBeLessThanOrEqual(MAX_ENRICHMENT_SERIALIZED_BYTES);
+  });
+
+  it("drops auxiliary fallback collections and caps dense kept-node edges", async () => {
+    const hubNodes = Array.from({ length: 12 }, (_, i) => ({
+      slug: `fact-${i}`,
+      depth: 1,
+    }));
+    const hubEdges = hubNodes.flatMap((from) =>
+      hubNodes.map((to) => ({
+        from: from.slug,
+        to: to.slug,
+        label: "dense",
+      }))
+    );
+    const oversizedPaths = Array.from({ length: 500 }, (_, i) => ({
+      id: `path-${i}`,
+      body: "x".repeat(1000),
+    }));
+    const client = {
+      call: vi.fn(async (_tool: string, args: Record<string, unknown>) => {
+        if (args.slug === "issue-blo-1") return { nodes: [{ slug: "issue-blo-1" }], edges: [] };
+        if (args.slug === "agent-cto") {
+          return {
+            nodes: hubNodes,
+            edges: hubEdges,
+            paths: oversizedPaths,
+          };
+        }
+        return null;
+      }),
+    };
+
+    const out = await prefetchRunContext({
+      client: client as unknown as GbrainCallable,
+      issueIdentifier: "BLO-1",
+      agentName: "CTO",
+      depth: 2,
+    });
+
+    expect(out.ok).toBe(true);
+    const graph = out.graph as { nodes: unknown[]; edges: unknown[]; paths?: unknown[] };
+    expect(graph.paths).toBeUndefined();
+    expect(graph.edges.length).toBeLessThanOrEqual(MAX_ENRICHMENT_EDGES);
+    expect(Buffer.byteLength(JSON.stringify(graph))).toBeLessThanOrEqual(MAX_ENRICHMENT_SERIALIZED_BYTES);
   });
 
   it("tries ID-based agent and project fallbacks after a missing named agent hub", async () => {
