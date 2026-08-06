@@ -35,6 +35,7 @@ import {
   withRecoveryModelProfileHint,
 } from "./recovery/model-profile-hint.js";
 import { RECOVERY_ORIGIN_KINDS } from "./recovery/origins.js";
+import { computeNoCommentStreak } from "./recovery/zero-token-startup-failure.js";
 
 export const PRODUCTIVITY_REVIEW_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.issueProductivityReview;
 export const DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS = 10;
@@ -134,6 +135,11 @@ type ProductivityReviewEvidence = {
   sourceIssue: IssueRow;
   sourceAgent: AgentRow;
   noCommentStreak: number;
+  // BLO-22054: terminal runs excluded from noCommentStreak because they burned
+  // zero tokens — the harness aborted them before the agent could act. Kept
+  // separate rather than dropped: repeated aborts are a real signal, just not
+  // one attributable to the assignee.
+  zeroTokenAbortRuns: number;
   totalRunCount: number;
   terminalRunCount: number;
   activeRunCount: number;
@@ -2026,11 +2032,11 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     const terminalRuns = latestRuns.filter((run) =>
       TERMINAL_RUN_STATUSES.includes(run.status as (typeof TERMINAL_RUN_STATUSES)[number]),
     );
-    let noCommentStreak = 0;
-    for (const run of terminalRuns) {
-      if (commentRunIds.has(run.id)) break;
-      noCommentStreak += 1;
-    }
+    // BLO-22054: runs the harness aborted before the first model turn are
+    // skipped rather than charged to the assignee, and surfaced separately so
+    // a repeatedly-failing harness stays visible as its own signal.
+    const { streak: noCommentStreak, zeroTokenAborts: zeroTokenAbortRuns } =
+      computeNoCommentStreak(latestRuns, commentRunIds);
 
     const [
       runCountLastHour,
@@ -2131,7 +2137,14 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     if (!trigger) return null;
 
     const triggerReasons: string[] = [];
-    if (noComment) triggerReasons.push(`${noCommentStreak} consecutive completed issue-linked runs had no run-created issue comment`);
+    if (noComment) {
+      triggerReasons.push(
+        `${noCommentStreak} consecutive completed issue-linked runs had no run-created issue comment`
+        + (zeroTokenAbortRuns > 0
+          ? ` (${zeroTokenAbortRuns} zero-token harness abort${zeroTokenAbortRuns === 1 ? "" : "s"} excluded — not attributable to the assignee)`
+          : ""),
+      );
+    }
     if (longActive) triggerReasons.push(`current active episode has lasted ${msToHuman(elapsedMs)}`);
     if (highChurn) {
       triggerReasons.push(
@@ -2196,6 +2209,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       sourceIssue,
       sourceAgent,
       noCommentStreak,
+      zeroTokenAbortRuns,
       totalRunCount: latestRuns.length,
       terminalRunCount: terminalRuns.length,
       activeRunCount,
@@ -2314,6 +2328,11 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       `- Terminal sampled runs: ${evidence.terminalRunCount}`,
       `- Active queued/running/scheduled runs: ${evidence.activeRunCount}`,
       `- No-comment completed-run streak: ${evidence.noCommentStreak}`,
+      ...(evidence.zeroTokenAbortRuns > 0
+        ? [
+            `- Excluded zero-token harness aborts: ${evidence.zeroTokenAbortRuns} (terminal runs that burned 0 input and 0 output tokens, so they never reached a model turn and had no opportunity to comment; not charged to the assignee — BLO-22054). Repeated aborts are a run-harness defect worth its own investigation.`,
+          ]
+        : []),
       `- Current active elapsed time: ${msToHuman(evidence.elapsedMs)}`,
       ...(evidence.nonLiveHoldMs > 0
         ? [
@@ -2369,7 +2388,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       `- Source issue: ${issueUiLink(evidence.sourceIssue, prefix)}`,
       `- Trigger: \`${evidence.trigger}\` (${formatTrigger(evidence.trigger)})`,
       `- Reasons: ${evidence.triggerReasons.join("; ")}`,
-      `- No-comment streak: ${evidence.noCommentStreak}`,
+      `- No-comment streak: ${evidence.noCommentStreak}${evidence.zeroTokenAbortRuns > 0 ? ` (+${evidence.zeroTokenAbortRuns} zero-token harness aborts excluded)` : ""}`,
       `- Runs/assignee comments: ${evidence.runCountLastHour}/${evidence.commentCountLastHour} in 1h, ${evidence.runCountLastSixHours}/${evidence.commentCountLastSixHours} in 6h`,
       ...(evidence.monitorGating
         ? [`- Elapsed accounting: ${formatMonitorGating(evidence.monitorGating)}`]

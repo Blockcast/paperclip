@@ -65,6 +65,96 @@ export function runUsageTokenCounts(
   };
 }
 
+// Heartbeat-run terminal statuses, successful and unsuccessful. Mirrors
+// TERMINAL_RUN_STATUSES in productivity-review.ts; kept local for the same
+// reason as UNSUCCESSFUL_TERMINAL_STATUSES above.
+const TERMINAL_STATUSES = new Set<string>([
+  "succeeded",
+  "interrupted",
+  "failed",
+  "cancelled",
+  "timed_out",
+]);
+
+export type NoCommentStreakRunInput = {
+  id: string;
+  status?: string | null;
+  usageJson?: Record<string, unknown> | null;
+};
+
+export type NoCommentStreakResult = {
+  // Terminal runs that genuinely executed and still produced no comment.
+  streak: number;
+  // Terminal runs skipped because they never reached a model turn.
+  zeroTokenAborts: number;
+};
+
+// BLO-22054: true when a run failed terminally having burned no tokens at all
+// — it never reached a first assistant turn, so the harness aborted it before
+// the agent could act. Cached input counts as activity: a run that replayed a
+// primed session did reach the model, and treating it as an abort would
+// wrongly excuse a real silent run.
+//
+// Deliberately restricted to UNSUCCESSFUL terminal statuses. A `succeeded` run
+// that reports no usage is a usage-reporting gap, not an abort — it ran. Were
+// this widened to every terminal status, any adapter that does not persist
+// `usage_json` would have its entire no-comment history read as aborts and the
+// streak trigger would silently disarm itself.
+//
+// Note the residual asymmetry, accepted on purpose: a failed run that did work
+// but lost its `usage_json` reads as an abort and is excluded. That
+// under-counts the streak rather than over-counting it, which is the safe
+// direction — the counter feeds a verdict that can cancel healthy work, so a
+// missed accusation costs far less than a manufactured one.
+export function isZeroTokenAbortRun(run: NoCommentStreakRunInput): boolean {
+  if (!run.status || !UNSUCCESSFUL_TERMINAL_STATUSES.has(run.status)) return false;
+  const { inputTokens, outputTokens } = runUsageTokenCounts(run.usageJson);
+  const cachedInputTokens = readTokenCount(run.usageJson, [
+    "cachedInputTokens",
+    "cached_input_tokens",
+  ]);
+  return inputTokens === 0 && outputTokens === 0 && cachedInputTokens === 0;
+}
+
+// BLO-22054: count consecutive terminal runs (newest first) that produced no
+// run-authored issue comment, skipping runs that never executed a turn.
+//
+// Three classes of run are handled differently, and the distinction is the
+// whole point:
+//   - non-terminal (`queued`, `running`, `scheduled_retry`) — skipped. A run
+//     that has not finished cannot yet be said to have stayed silent. A run
+//     stuck in `queued` behind the executionRunId lock (BLO-20321) never even
+//     started.
+//   - terminal but a zero-token failure — skipped AND counted in
+//     `zeroTokenAborts`. The harness failed to start it, so the agent had no
+//     opportunity to comment. Charging these to the assignee converts
+//     infrastructure flakiness into an accusation, and it compounds: the agent
+//     that draws unlucky runs is the one that then looks unproductive.
+//   - any other terminal run — counted, or breaks the streak if it commented.
+//
+// Skipping is transparent rather than stream-breaking: aborts interleaved
+// between two genuinely silent runs must not reset the counter, or a flaky
+// harness would mask a real silence problem instead of just fabricating one.
+export function computeNoCommentStreak(
+  runsNewestFirst: readonly NoCommentStreakRunInput[],
+  runIdsWithComments: ReadonlySet<string>,
+): NoCommentStreakResult {
+  let streak = 0;
+  let zeroTokenAborts = 0;
+  for (const run of runsNewestFirst) {
+    if (!run.status || !TERMINAL_STATUSES.has(run.status)) continue;
+    // Checked before the abort test so a run that did comment always breaks
+    // the streak, whatever its recorded usage.
+    if (runIdsWithComments.has(run.id)) break;
+    if (isZeroTokenAbortRun(run)) {
+      zeroTokenAborts += 1;
+      continue;
+    }
+    streak += 1;
+  }
+  return { streak, zeroTokenAborts };
+}
+
 // True when a run's most recent terminal failure is a structural, pre-model
 // startup wedge that produced zero token usage. The recovery sweep uses this
 // to gate `stranded_issue_recovery` wrapper creation: for this family the

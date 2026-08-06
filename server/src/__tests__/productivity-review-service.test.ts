@@ -193,20 +193,27 @@ describeEmbeddedPostgres("productivity review service", () => {
     now: Date;
     withRunComments?: boolean;
     contextSource?: string;
+    // BLO-22054: let a caller seed harness aborts (terminal-failed, zero
+    // tokens) and never-started runs alongside genuine ones.
+    status?: string;
+    usageJson?: Record<string, unknown> | null;
+    startOffsetRuns?: number;
   }) {
     const runs: Array<typeof heartbeatRuns.$inferInsert> = [];
+    const startOffset = input.startOffsetRuns ?? 0;
     for (let index = 0; index < input.count; index += 1) {
       const runId = randomUUID();
-      const createdAt = new Date(input.now.getTime() - index * 60_000);
+      const createdAt = new Date(input.now.getTime() - (startOffset + index) * 60_000);
       runs.push({
         id: runId,
         companyId: input.companyId,
         agentId: input.agentId,
-        status: "succeeded",
+        status: input.status ?? "succeeded",
         invocationSource: "assignment",
         triggerDetail: "system",
         startedAt: createdAt,
         finishedAt: new Date(createdAt.getTime() + 30_000),
+        ...(input.usageJson === undefined ? {} : { usageJson: input.usageJson }),
         contextSnapshot: input.contextSource
           ? { issueId: input.issueId, taskId: input.issueId, source: input.contextSource }
           : { issueId: input.issueId, taskId: input.issueId },
@@ -370,6 +377,92 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(reviews[0]?.description).toContain("No-comment completed-run streak: 10");
 
     expect(await listRefreshComments(reviews[0]!.id)).toHaveLength(0);
+  });
+
+  // BLO-22054. Reproduces the BLO-20960 run set that produced a reported
+  // no-comment streak of 5 against PlatformSREEngineer: four terminal-failed
+  // runs that burned zero tokens (the harness never started them, so the agent
+  // had no opportunity to comment) and one that never left `queued` behind the
+  // executionRunId lock (BLO-20321). Only the genuine run beneath them is the
+  // assignee's silence.
+  async function seedBlo20960RunSet(seeded: Awaited<ReturnType<typeof seedAssignedIssue>>, now: Date) {
+    // Newest first: queued, then the four zero-token aborts, then one real run.
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 1,
+      now,
+      status: "queued",
+      usageJson: null,
+      startOffsetRuns: 0,
+    });
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 4,
+      now,
+      status: "failed",
+      usageJson: { inputTokens: 0, outputTokens: 0 },
+      startOffsetRuns: 1,
+    });
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 1,
+      now,
+      status: "succeeded",
+      usageJson: { inputTokens: 18_432, outputTokens: 1_204 },
+      startOffsetRuns: 5,
+    });
+  }
+
+  it("excludes zero-token harness aborts from the streak and reports them separately (BLO-22054)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await seedBlo20960RunSet(seeded, now);
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      // Threshold 1 so the review fires and the rendered evidence is readable;
+      // the assertion under test is the split, not the firing decision.
+      thresholds: { noCommentStreakRuns: 1 },
+    });
+
+    expect(result.created).toBe(1);
+    const reviews = await listProductivityReviews(seeded.companyId);
+    expect(reviews[0]?.description).toContain("Primary trigger: `no_comment_streak`");
+    // The streak the assignee is actually answerable for: 1, not 5.
+    expect(reviews[0]?.description).toContain("No-comment completed-run streak: 1");
+    // The aborts stay visible as their own signal rather than being dropped.
+    expect(reviews[0]?.description).toContain("Excluded zero-token harness aborts: 4");
+    expect(reviews[0]?.description).toContain(
+      "1 consecutive completed issue-linked runs had no run-created issue comment"
+      + " (4 zero-token harness aborts excluded — not attributable to the assignee)",
+    );
+  });
+
+  it("does not open a review when the streak is made up of zero-token aborts (BLO-22054)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await seedBlo20960RunSet(seeded, now);
+
+    const service = productivityReviewService(db);
+    // Before the fix this run set computed a streak of 5 and would have opened
+    // a review — a verdict framework offering "stop/cancel the work", pointed
+    // at an agent whose only failing was four infrastructure aborts.
+    const result = await service.reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: { noCommentStreakRuns: 5 },
+    });
+
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
   });
 
   // BLO-19094: an open review grants its assignee issue:comment/issue:mutate on
