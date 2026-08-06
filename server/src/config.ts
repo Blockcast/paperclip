@@ -97,6 +97,11 @@ export interface Config {
   prReconcilerIntervalMinutes: number;
   prReconcilerWindowDays: number;
   prReconcilerEnrichLoc: boolean;
+  // Stranded-blocked-issue reconciler (BLO-21523 phase 1): drains issues stuck
+  // `blocked` with zero unresolved blockers (last blocker cleared but `status`
+  // was never recomputed). Worker-tier only, same rationale as the PR reconciler.
+  strandedBlockedIssueReconcilerEnabled: boolean;
+  strandedBlockedIssueReconcilerIntervalMinutes: number;
   serveUi: boolean;
   uiDevMiddleware: boolean;
   secretsProvider: SecretProvider;
@@ -377,6 +382,19 @@ export function loadConfig(): Config {
     process.env.PAPERCLIP_PR_RECONCILER_ENRICH_LOC !== undefined
       ? process.env.PAPERCLIP_PR_RECONCILER_ENRICH_LOC === "true"
       : true;
+  // Stranded-blocked-issue reconciler (BLO-21523). Enabled by default: leaving
+  // an issue permanently `blocked` after its last blocker clears is a silent
+  // dispatch-reliability defect, not an opt-in feature. 15m default interval —
+  // the backlog is small and re-checking is cheap (a guarded UPDATE that only
+  // matches rows still `blocked` with zero unresolved blockers).
+  const strandedBlockedIssueReconcilerEnabled =
+    process.env.PAPERCLIP_STRANDED_BLOCKED_ISSUE_RECONCILER_ENABLED !== undefined
+      ? process.env.PAPERCLIP_STRANDED_BLOCKED_ISSUE_RECONCILER_ENABLED === "true"
+      : true;
+  const strandedBlockedIssueReconcilerIntervalMinutes = Math.max(
+    1,
+    Number(process.env.PAPERCLIP_STRANDED_BLOCKED_ISSUE_RECONCILER_INTERVAL_MINUTES) || 15,
+  );
   const bindValidationErrors = validateConfiguredBindMode({
     deploymentMode,
     deploymentExposure,
@@ -421,6 +439,8 @@ export function loadConfig(): Config {
     prReconcilerIntervalMinutes,
     prReconcilerWindowDays,
     prReconcilerEnrichLoc,
+    strandedBlockedIssueReconcilerEnabled,
+    strandedBlockedIssueReconcilerIntervalMinutes,
     databaseBackupRetentionDays,
     databaseBackupDir,
     serveUi:

@@ -1499,6 +1499,26 @@ export async function startServer(): Promise<StartedServer> {
     }
   }
 
+  // Stranded-blocked-issue reconciler (BLO-21523 phase 1). Worker-tier
+  // singleton, same rationale as the merged-PR reconciler above: drains
+  // issues left `status = 'blocked'` after their last blocker cleared, which
+  // are otherwise permanently unreachable (no dispatch, no wake path). Kicks
+  // off once on startup, then on interval; each pass re-checks its own
+  // predicate at UPDATE time, so it's safe to run from every worker replica.
+  if (config.strandedBlockedIssueReconcilerEnabled && config.paperclipNodeRole !== "api") {
+    const { startStrandedBlockedIssueReconciler } = await import(
+      "./services/stranded-blocked-issue-reconciler.js"
+    );
+    logger.info(
+      { intervalMinutes: config.strandedBlockedIssueReconcilerIntervalMinutes },
+      "Stranded-blocked-issue reconciler enabled (BLO-21523)",
+    );
+    startStrandedBlockedIssueReconciler(
+      db,
+      config.strandedBlockedIssueReconcilerIntervalMinutes * 60 * 1000,
+    );
+  }
+
   // Wait for external adapters to finish loading before accepting requests.
   // Without this, adapter type validation (assertKnownAdapterType) would
   // reject valid external adapter types during the startup loading window.
