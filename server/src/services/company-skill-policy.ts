@@ -266,7 +266,10 @@ export function companySkillPolicyService(db: Db) {
           defaultEffect: policy.defaultEffect,
           ruleCount: policy.rules.length,
         },
-      }, { deferPublish: true });
+      }, {
+        enlistPluginOutbox: true,
+        deferPublish: true,
+      });
       return {
         result: { ...policy, revision: nextRevision, materialized: true } satisfies EffectiveSkillPolicy,
         publish: activityPublish,
@@ -301,7 +304,10 @@ export function companySkillPolicyService(db: Db) {
           entityType: "company_skill_policy",
           entityId: input.companyId,
           details: { previousRevision: existing.revision, newRevision: 0 },
-        }, { deferPublish: true });
+        }, {
+          enlistPluginOutbox: true,
+          deferPublish: true,
+        });
       }
       return { result: { ...OPEN_DEFAULT_POLICY, rules: [] }, publish: activityPublish };
     });
