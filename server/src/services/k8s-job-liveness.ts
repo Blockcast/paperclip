@@ -19,15 +19,12 @@ const K8S_JOB_LIVENESS_TIMEOUT_SECONDS = Math.max(
   Math.ceil(K8S_JOB_LIVENESS_TIMEOUT_MS / 1000),
 );
 
-// BLO-20801 (Ally review round 3): an accepted DELETE response is not proof
-// the Job is gone -- with Background propagation the API server only
-// acknowledges the request, and the Job's own controller reconciliation can
-// still be in flight and create/retry a pod before the object actually
-// disappears. `deleteStaleTerminalJob` re-reads the exact Job by name after
-// issuing the delete and only trusts the waiver once that read confirms a
-// 404, bounded by this small retry budget so a still-terminating Job fails
-// closed (stays blocking) rather than being trusted on the DELETE response
-// alone.
+// BLO-20801 (Ally review round 3/4): an accepted DELETE response is not proof
+// the Job is gone, nor proof that its dependent Pods have released any PVCs.
+// `deleteStaleTerminalJob` requests foreground deletion, then re-reads the
+// exact Job by name and only trusts the waiver once that read confirms a 404,
+// bounded by this small retry budget so a still-terminating Job fails closed
+// (stays blocking) rather than being trusted on the DELETE response alone.
 const STALE_JOB_DELETE_CONFIRM_ATTEMPTS = Math.max(
   1,
   Number(process.env.PAPERCLIP_K8S_STALE_JOB_DELETE_CONFIRM_ATTEMPTS ?? "3"),
@@ -720,14 +717,12 @@ export async function deleteAgentJobExact(
  * sibling of `deleteAgentJobExact` and does not change that function's
  * existing reaper call sites.
  *
- * BLO-20801 (Ally review round 3): a DELETE response of 200/202 only means
- * the API server accepted the request -- with `propagationPolicy: Background`
- * the Job's own controller reconciliation can still be mid-flight and create
- * a pod before the object is actually removed. Treating the accepted DELETE
- * itself as proof of absence would reopen the exact double-execution race
- * this function exists to close. So after issuing the delete, this re-reads
- * the exact Job by name with a small bounded retry until that read confirms
- * a 404 (`"deleted"`), sees the Job gained an active pod in the meantime
+ * BLO-20801 (Ally review round 3/4): a DELETE response of 200/202 only means
+ * the API server accepted the request. Treating that response itself as proof
+ * of absence would reopen the exact double-execution race this function exists
+ * to close, so deletion uses foreground propagation and then re-reads the exact
+ * Job by name with a small bounded retry until that read confirms a 404
+ * (`"deleted"`), sees the Job gained an active pod in the meantime
  * (`"still-active"`), or exhausts the retry budget without either -- which
  * fails closed (`null`) exactly like any other unconfirmed outcome.
  */
@@ -767,7 +762,7 @@ export async function deleteStaleTerminalJob(
       {
         name: identity.name,
         namespace: PAPERCLIP_K8S_NAMESPACE,
-        propagationPolicy: "Background",
+        propagationPolicy: "Foreground",
         body: { preconditions: { uid: identity.uid } },
       },
       requestOptionsWithTimeout(),
@@ -1053,16 +1048,31 @@ export async function hasActiveJobForAgent(
     // probe is deliberately NOT filtered by terminalRunIds/run-id: a run
     // being terminal in the DB says nothing about whether its pod has
     // released the PVC yet, and folding the two gates together would let a
-    // new pod dispatch into a multi-attach wedge.
-    const podRes = await state.coreApi.listNamespacedPod(
-      {
-        namespace: PAPERCLIP_K8S_NAMESPACE,
-        labelSelector: `${AGENT_JOB_LABEL_SELECTOR},${AGENT_ID_LABEL}=${agentId}`,
-        timeoutSeconds: K8S_JOB_LIVENESS_TIMEOUT_SECONDS,
-      },
-      requestOptionsWithTimeout(),
-    );
-    return (podRes.items ?? []).some(isActiveOrTerminatingAgentPod);
+    // new pod dispatch into a multi-attach wedge. If this probe is unavailable
+    // after a terminal-run waiver/deletion path, fail closed; the old broad
+    // catch remains fail-open only for the pure kube-API-unavailable fallback
+    // path where no stale-terminal cleanup was trusted.
+    try {
+      const podRes = await state.coreApi.listNamespacedPod(
+        {
+          namespace: PAPERCLIP_K8S_NAMESPACE,
+          labelSelector: `${AGENT_JOB_LABEL_SELECTOR},${AGENT_ID_LABEL}=${agentId}`,
+          timeoutSeconds: K8S_JOB_LIVENESS_TIMEOUT_SECONDS,
+        },
+        requestOptionsWithTimeout(),
+      );
+      return (podRes.items ?? []).some(isActiveOrTerminatingAgentPod);
+    } catch (error) {
+      if (staleWaivedJobs.length > 0) {
+        const reason = error instanceof Error ? error.message : String(error);
+        logger.warn(
+          { agentId, error: reason },
+          "k8s pod quiescence probe failed after stale-terminal cleanup; failing closed",
+        );
+        return true;
+      }
+      throw error;
+    }
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     logger.warn({ agentId, error: reason }, "k8s in-flight check failed; falling back to DB-only");

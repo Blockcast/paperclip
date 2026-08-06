@@ -131,9 +131,55 @@ describe("hasActiveJobForAgent run-id awareness (BLO-20801)", () => {
 
     expect(result).toBe(false);
     expect(mockDeleteNamespacedJob).toHaveBeenCalledWith(
-      expect.objectContaining({ name: JOB_NAME, body: { preconditions: { uid: JOB_UID } } }),
+      expect.objectContaining({
+        name: JOB_NAME,
+        propagationPolicy: "Foreground",
+        body: { preconditions: { uid: JOB_UID } },
+      }),
       expect.anything(),
     );
+  });
+
+  it("fails closed when the post-cleanup pod quiescence probe errors", async () => {
+    // Ally review (PR #946, round 4): after trusting a terminal-run waiver
+    // enough to delete/confirm the stale Job, a pod-list failure is no longer
+    // the generic "kube unavailable" fail-open path. It means dispatch cannot
+    // prove the old Job's Pod released the RWO PVC, so it must stay blocked.
+    mockListNamespacedJob.mockResolvedValue({ items: [terminalJob("run-terminal", null)] });
+    mockRereadAs(null, "run-terminal");
+    mockDeleteNamespacedJob.mockResolvedValue({});
+    mockConfirmDeleted();
+    mockListNamespacedPod.mockRejectedValue(new Error("pod list unavailable"));
+
+    const result = await hasActiveJobForAgent(AGENT_ID, {
+      isRunTerminal: async () => new Set(["run-terminal"]),
+    });
+
+    expect(result).toBe(true);
+  });
+
+  it("fails closed when a pod appears after stale Job deletion is confirmed", async () => {
+    // Foreground deletion plus a confirmed Job 404 is still followed by the
+    // existing pod quiescence probe. If a controller race or stale dependent
+    // Pod is visible there, dispatch remains blocked.
+    mockListNamespacedJob.mockResolvedValue({ items: [terminalJob("run-terminal", null)] });
+    mockRereadAs(null, "run-terminal");
+    mockDeleteNamespacedJob.mockResolvedValue({});
+    mockConfirmDeleted();
+    mockListNamespacedPod.mockResolvedValue({
+      items: [
+        {
+          metadata: { name: "agent-pod-late", uid: "pod-uid-late" },
+          status: { phase: "Running" },
+        },
+      ],
+    });
+
+    const result = await hasActiveJobForAgent(AGENT_ID, {
+      isRunTerminal: async () => new Set(["run-terminal"]),
+    });
+
+    expect(result).toBe(true);
   });
 
   it("resolves the all-zero-counters false positive once the run is terminal in the DB and the Job is deleted", async () => {
@@ -282,10 +328,10 @@ describe("hasActiveJobForAgent run-id awareness (BLO-20801)", () => {
   });
 
   it("fails closed when an accepted DELETE has not actually removed the Job by the time the retry budget is exhausted", async () => {
-    // Ally review (PR #946, round 3): a successful DELETE response with
-    // Background propagation only means the request was accepted -- the Job
-    // can still be present (e.g. pending finalizers) when dispatch would
-    // otherwise trust the waiver. Every confirmation re-read here keeps
+    // Ally review (PR #946, round 3): a successful DELETE response only means
+    // the request was accepted -- the Job can still be present (e.g. pending
+    // finalizers) when dispatch would otherwise trust the waiver. Every
+    // confirmation re-read here keeps
     // returning the Job present and inactive, so the retry budget must
     // exhaust and fail closed rather than treating the accepted DELETE call
     // itself as proof of removal.
