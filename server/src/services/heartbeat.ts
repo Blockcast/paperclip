@@ -9311,6 +9311,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     run: typeof heartbeatRuns.$inferSelect,
     contextSnapshot: Record<string, unknown>,
     reason: "retry_exhausted" | "non_retryable_external_lifecycle",
+    dbOrTx: Db | DbTransaction = db,
+    appendEvent = true,
   ) {
     const target = resolvePrReviewGateStatusTarget(
       contextSnapshot,
@@ -9318,7 +9320,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     );
     if (!target) return;
 
-    const delivery = await enqueueGithubCommitStatusDelivery(db, {
+    const delivery = await enqueueGithubCommitStatusDelivery(dbOrTx, {
       companyId: run.companyId,
       sourceRunId: run.id,
       repoFullName: target.repoFullName,
@@ -9332,6 +9334,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       prNumber: target.prNumber,
       prUrl: target.prUrl,
     });
+    if (appendEvent) await appendFailedPrReviewGateStatusEvent(run, target, reason, delivery);
+    return delivery;
+  }
+
+  async function appendFailedPrReviewGateStatusEvent(
+    run: typeof heartbeatRuns.$inferSelect,
+    target: NonNullable<ReturnType<typeof resolvePrReviewGateStatusTarget>>,
+    reason: "retry_exhausted" | "non_retryable_external_lifecycle",
+    delivery: Awaited<ReturnType<typeof enqueueGithubCommitStatusDelivery>>,
+  ) {
     await appendRunEvent(run, await nextRunEventSeq(run.id), {
       eventType: "lifecycle",
       stream: "system",
@@ -24019,6 +24031,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const recoverySessionBefore = recoveryAgentInvokable
       ? await resolveSessionBeforeForWakeup(recoveryAgent, taskKey)
       : null;
+    let gateDelivery: Awaited<ReturnType<typeof enqueueGithubCommitStatusDelivery>> | null = null;
     const promotionResult = await db.transaction(async (tx) => {
       // Lock the context issue (if any) AND every issue that still references this run.
       //
@@ -24116,7 +24129,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ? candidateIssues.find((candidate) => candidate.id === contextIssueId)
           : candidateIssues[0]) ?? null;
 
-      if (!issue) return null;
+      if (!issue) {
+        if (isNonRetryablePrReviewTerminalOutcome(run)) {
+          gateDelivery = await queueFailedPrReviewGateStatus(
+            run,
+            runContext,
+            "non_retryable_external_lifecycle",
+            tx,
+            false,
+          ) ?? null;
+        }
+        return null;
+      }
       const activeExecutionState = parseIssueExecutionState(issue.executionState);
       const finalizedRunExecutionStage = parseObject(runContext.executionStage);
       const finalizedRunStageId =
@@ -24130,6 +24154,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           "skipping terminal-run recovery because a newer issue execution is active",
         );
         return { kind: "superseded" as const };
+      }
+      if (isNonRetryablePrReviewTerminalOutcome(run)) {
+        // The outbox row is part of the ownership decision: a replacement run
+        // cannot claim this issue until both the lock release and delivery
+        // intent commit. Publishing the informational event can remain best
+        // effort after commit because the outbox is the durable artifact.
+        gateDelivery = await queueFailedPrReviewGateStatus(
+          run,
+          runContext,
+          "non_retryable_external_lifecycle",
+          tx,
+          false,
+        ) ?? null;
       }
       if (
         isNonRetryablePrReviewTerminalOutcome(run) &&
@@ -24737,18 +24774,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
     });
 
-    if (
-      promotionResult?.kind !== "superseded" &&
-      isNonRetryablePrReviewTerminalOutcome(run)
-    ) {
-      await queueFailedPrReviewGateStatus(
-        run,
+    if (gateDelivery) {
+      const target = resolvePrReviewGateStatusTarget(
         runContext,
+        loadConfig().prReviewGateStatusContext,
+      );
+      if (target) await appendFailedPrReviewGateStatusEvent(
+        run,
+        target,
         "non_retryable_external_lifecycle",
+        gateDelivery,
       ).catch((error) => {
         logger.warn(
           { err: error, runId: run.id },
-          "failed to queue non-retryable PR-review gate status",
+          "failed to append non-retryable PR-review gate status event",
         );
       });
     }

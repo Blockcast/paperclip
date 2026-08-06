@@ -89,6 +89,8 @@ import {
 } from "./zero-token-startup-failure.js";
 import { clearAgentTaskSessions } from "./session-reset.js";
 
+type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
+
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["interrupted", "failed", "cancelled", "timed_out"] as const;
 export const ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS = 60 * 60 * 1000;
@@ -4193,7 +4195,8 @@ export function recoveryService(
     recoveryCause?: StrandedRecoveryCause;
     recoveryOwnerAgentId?: string | null;
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
-  }) {
+  }, dbOrTx: Db | DbTransaction = db) {
+    const actionSvc = dbOrTx === db ? recoveryActionsSvc : issueRecoveryActionService(dbOrTx);
     const recoveryCause = resolveStrandedRecoveryCause(input.latestRun, input.recoveryCause);
     const routing = await resolveStrandedRecoveryRouting({
       issue: input.issue,
@@ -4221,14 +4224,14 @@ export function recoveryService(
 
     // Read existing action before upsert so we can compare lastAttemptAt against
     // issue.lastActivityAt and suppress duplicate non-assignee wakes when nothing changed.
-    const existingAction = await recoveryActionsSvc.getActiveForIssue(input.issue.companyId, input.issue.id);
+    const existingAction = await actionSvc.getActiveForIssue(input.issue.companyId, input.issue.id);
     const previousAttemptAt = existingAction?.lastAttemptAt
       ? new Date(existingAction.lastAttemptAt as Date | string)
       : null;
     const hasNewActivitySinceLastAttempt = !previousAttemptAt
       || input.issue.lastActivityAt > previousAttemptAt;
 
-    const action = await recoveryActionsSvc.upsertSourceScoped({
+    const action = await actionSvc.upsertSourceScoped({
       companyId: input.issue.companyId,
       sourceIssueId: input.issue.id,
       kind: strandedRecoveryActionKind(recoveryCause),
@@ -4872,8 +4875,12 @@ export function recoveryService(
     return cycleForming;
   }
 
-  async function unresolvedBlockerHumanDecisionEscalationState(companyId: string, issueId: string) {
-    const blockerRows = await db
+  async function unresolvedBlockerHumanDecisionEscalationState(
+    companyId: string,
+    issueId: string,
+    dbOrTx: Db | DbTransaction = db,
+  ) {
+    const blockerRows = await dbOrTx
       .select({
         blockerIssueId: issueRelations.issueId,
         assigneeAgentId: issues.assigneeAgentId,
@@ -5149,7 +5156,7 @@ export function recoveryService(
     // The advisory lock is xact-scoped on this tx's connection; once we
     // commit/return, waiting peers wake up and record their next attempt
     // against the same active source-scoped action.
-    return await db.transaction(async (tx) => {
+    const escalation = await db.transaction(async (tx) => {
       await tx.execute(
         sql`select pg_advisory_xact_lock(hashtextextended(${input.issue.companyId} || ':' || ${input.issue.id}, 0))`,
       );
@@ -5157,11 +5164,14 @@ export function recoveryService(
       // Re-read source issue under the lock so the recovery action records
       // the latest owner/status evidence and repeated sweeps reuse the same
       // source-scoped action instead of creating issue-backed fallbacks.
-      const [fresh] = await tx
+      const freshQuery = tx
         .select()
         .from(issues)
         .where(eq(issues.id, input.issue.id))
         .limit(1);
+      const [fresh] = input.expectedReviewStage
+        ? await freshQuery.for("update")
+        : await freshQuery;
       if (!fresh) return null;
       // BLO-18643: mirror the park paths' own re-check (parkReviewWaitingContinuationIssue /
       // parkNoDependencyReviewWaitingIssue both bail if `fresh.status` has moved past the
@@ -5204,6 +5214,7 @@ export function recoveryService(
       } else if (fresh.status !== input.previousStatus && fresh.status !== "blocked") return null;
 
       const recoveryCause = resolveStrandedRecoveryCause(input.latestRun, input.recoveryCause);
+      const mutationDb = input.expectedReviewStage ? tx : db;
       const { action, hasNewActivitySinceLastAttempt } = await ensureSourceScopedStrandedRecoveryAction({
         issue: fresh,
         previousStatus: input.previousStatus,
@@ -5211,38 +5222,50 @@ export function recoveryService(
         recoveryCause,
         recoveryOwnerAgentId: input.recoveryOwnerAgentId,
         successfulRunHandoffEvidence: input.successfulRunHandoffEvidence,
-      });
+      }, mutationDb);
       const isProviderQuotaWait = recoveryCause === "provider_quota" &&
         !action.ownerAgentId && Boolean(action.returnOwnerAgentId);
-      if (isProviderQuotaWait && action.returnOwnerAgentId) {
-        await ensureProviderQuotaWaitRecoveryMonitor({
-          issue: fresh,
-          latestRun: input.latestRun,
-          actionId: action.id,
-          agentId: action.returnOwnerAgentId,
-        });
-      }
       const {
         blockerIssueIds: blockerIds,
         needsHumanDecision,
-      } = await unresolvedBlockerHumanDecisionEscalationState(fresh.companyId, fresh.id);
+      } = await unresolvedBlockerHumanDecisionEscalationState(fresh.companyId, fresh.id, mutationDb);
 
-      await enqueueSourceScopedStrandedRecoveryWake({
-        action,
-        issue: fresh,
-        latestRun: input.latestRun,
-        recoveryCause,
-        hasNewActivitySinceLastAttempt,
-      });
+      if (!input.expectedReviewStage) {
+        if (isProviderQuotaWait && action.returnOwnerAgentId) {
+          await ensureProviderQuotaWaitRecoveryMonitor({
+            issue: fresh,
+            latestRun: input.latestRun,
+            actionId: action.id,
+            agentId: action.returnOwnerAgentId,
+          });
+        }
+        await enqueueSourceScopedStrandedRecoveryWake({
+          action,
+          issue: fresh,
+          latestRun: input.latestRun,
+          recoveryCause,
+          hasNewActivitySinceLastAttempt,
+        });
+      }
 
       const issueUpdate = {
         status: "blocked" as const,
         blockedByIssueIds: blockerIds,
         assigneeAgentId: action.ownerAgentId ?? fresh.assigneeAgentId,
       };
-      const updated = await issuesSvc.update(input.issue.id, issueUpdate);
+      const updated = await issuesSvc.update(input.issue.id, issueUpdate, mutationDb);
       if (!updated) return null;
-      if (isProviderQuotaWait) return updated;
+      if (isProviderQuotaWait) {
+        return {
+          updated,
+          action,
+          fresh,
+          recoveryCause,
+          hasNewActivitySinceLastAttempt,
+          needsHumanDecision,
+          blockerIds,
+        };
+      }
 
       const prefix = await getCompanyIssuePrefix(fresh.companyId);
       const workspacePreflightHandoffCause = describeWorkspacePreflightRecoveryCause(input.latestRun);
@@ -5314,7 +5337,7 @@ export function recoveryService(
         const escalationCommentMarker = announcesReassignment
           ? reassignmentMarker
           : `Recovery action: \`${action.id}\``;
-        const hasEscalationComment = await db
+        const hasEscalationComment = await mutationDb
           .select({ id: issueComments.id, body: issueComments.body, metadata: issueComments.metadata })
           .from(issueComments)
           .where(and(eq(issueComments.issueId, fresh.id), eq(issueComments.authorType, "system")))
@@ -5333,13 +5356,14 @@ export function recoveryService(
               authorType: "system",
               presentation: notice.presentation,
               metadata: notice.metadata,
-            });
+            }, mutationDb);
           } else {
             await issuesSvc.addComment(
               fresh.id,
               `${input.comment ?? "Automatic stranded-work recovery needs manual attention."}${recoveryLine}`,
               {},
               { authorType: "system" },
+              mutationDb,
             );
           }
         }
@@ -5374,7 +5398,7 @@ export function recoveryService(
         // is guaranteed to age the marker out and let a later sweep re-announce the same
         // exhaustion. Filtered by issue + author in SQL and capped at one row, so it costs
         // an index seek rather than the 50-row fetch it replaces.
-        const alreadyAnnounced = await db
+        const alreadyAnnounced = await mutationDb
           .select({ id: issueComments.id })
           .from(issueComments)
           .where(and(
@@ -5415,6 +5439,7 @@ export function recoveryService(
             ].join("\n"),
             {},
             { authorType: "system" },
+            mutationDb,
           );
         }
       }
@@ -5465,24 +5490,56 @@ export function recoveryService(
         },
       });
 
-      if (needsHumanDecision) {
-        const assigneeAgent = fresh.assigneeAgentId
-          ? await db
-            .select({ name: agents.name })
-            .from(agents)
-            .where(and(eq(agents.companyId, fresh.companyId), eq(agents.id, fresh.assigneeAgentId)))
-            .limit(1)
-            .then((rows) => rows[0] ?? null)
-          : null;
-        await emitNeedsHumanDecisionEscalationEvent({
-          issue: fresh,
-          assigneeAgentName: assigneeAgent?.name ?? null,
-          blockedByIssueIds: blockerIds,
-        });
-      }
-
-      return updated;
+      return {
+        updated,
+        action,
+        fresh,
+        recoveryCause,
+        hasNewActivitySinceLastAttempt,
+        needsHumanDecision,
+        blockerIds,
+      };
     });
+    if (!escalation) return null;
+
+    // The active recovery action committed above is the durable wake intent.
+    // Dispatch after releasing the stage row lock: enqueueWakeup may claim the
+    // issue synchronously, and running it inside this transaction would either
+    // self-block or publish work that an eventual rollback made inapplicable.
+    // A failed dispatch leaves the action active for the next recovery sweep.
+    if (input.expectedReviewStage && escalation.recoveryCause === "provider_quota" && !escalation.action.ownerAgentId && escalation.action.returnOwnerAgentId) {
+      await ensureProviderQuotaWaitRecoveryMonitor({
+        issue: escalation.fresh,
+        latestRun: input.latestRun,
+        actionId: escalation.action.id,
+        agentId: escalation.action.returnOwnerAgentId,
+      });
+    }
+    if (input.expectedReviewStage) {
+      await enqueueSourceScopedStrandedRecoveryWake({
+        action: escalation.action,
+        issue: escalation.fresh,
+        latestRun: input.latestRun,
+        recoveryCause: escalation.recoveryCause,
+        hasNewActivitySinceLastAttempt: escalation.hasNewActivitySinceLastAttempt,
+      });
+    }
+    if (escalation.needsHumanDecision) {
+      const assigneeAgent = escalation.fresh.assigneeAgentId
+        ? await db
+          .select({ name: agents.name })
+          .from(agents)
+          .where(and(eq(agents.companyId, escalation.fresh.companyId), eq(agents.id, escalation.fresh.assigneeAgentId)))
+          .limit(1)
+          .then((rows) => rows[0] ?? null)
+        : null;
+      await emitNeedsHumanDecisionEscalationEvent({
+        issue: escalation.fresh,
+        assigneeAgentName: assigneeAgent?.name ?? null,
+        blockedByIssueIds: escalation.blockerIds,
+      });
+    }
+    return escalation.updated;
   }
 
   function buildZeroTokenStartupFailureComment(input: {
