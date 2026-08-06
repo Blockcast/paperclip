@@ -203,7 +203,13 @@ jobs:
   typecheck_release_registry:
     name: Typecheck + Release Registry
     needs: [policy]
-    runs-on: default
+    # BLO-22428: merge_group traffic on this heavy label starves behind a
+    # pull_request backlog on the shared `default` pool (merge-queue check
+    # concurrency is 1, so a deep PR queue blocks the one queue that lands
+    # code without itself needing proportional capacity). Route merge_group
+    # runs to the dedicated arc-merge-queue pool instead; pull_request keeps
+    # using the shared default label unchanged.
+    runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'default' }}
     # ARC setup plus the sequential build-gap typechecks exceeded the previous
     # 20-minute ceiling while the final UI typecheck was still making progress.
     timeout-minutes: 40
@@ -245,7 +251,10 @@ jobs:
   worktree_install:
     name: Worktree install (NODE_ENV=production)
     needs: [policy]
-    runs-on: default
+    # BLO-22428: route merge_group traffic to the dedicated arc-merge-queue
+    # pool so a pull_request backlog on the shared default label can never
+    # starve the merge queue again. See typecheck_release_registry above.
+    runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'default' }}
     timeout-minutes: 20
     # Regression guard for BLO-19064. pnpm treats NODE_ENV=production as an
     # implicit `--prod` and silently skips every devDependency while still
@@ -331,7 +340,10 @@ jobs:
   general_tests:
     name: General tests (${{ matrix.group_label }})
     needs: [policy]
-    runs-on: default
+    # BLO-22428: route merge_group traffic to the dedicated arc-merge-queue
+    # pool so a pull_request backlog on the shared default label can never
+    # starve the merge queue again. See typecheck_release_registry above.
+    runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'default' }}
     # Embedded Postgres can spend tens of seconds per suite waiting on shared
     # ARC node storage. A server shard reached the previous 60-minute ceiling
     # while still advancing through passing suites, so retain a bounded margin
@@ -502,7 +514,10 @@ jobs:
   build:
     name: Build
     needs: [policy]
-    runs-on: default
+    # BLO-22428: route merge_group traffic to the dedicated arc-merge-queue
+    # pool so a pull_request backlog on the shared default label can never
+    # starve the merge queue again. See typecheck_release_registry above.
+    runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'default' }}
     timeout-minutes: 20
 
     steps:
@@ -539,7 +554,10 @@ jobs:
   verify_serialized_server:
     name: Verify serialized server suites (${{ matrix.shard_label }})
     needs: [policy, general_tests]
-    runs-on: default
+    # BLO-22428: route merge_group traffic to the dedicated arc-merge-queue
+    # pool so a pull_request backlog on the shared default label can never
+    # starve the merge queue again. See typecheck_release_registry above.
+    runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'default' }}
     timeout-minutes: 90
     strategy:
       fail-fast: false
@@ -593,7 +611,10 @@ jobs:
   canary_dry_run:
     name: Canary Dry Run
     needs: [policy]
-    runs-on: default
+    # BLO-22428: route merge_group traffic to the dedicated arc-merge-queue
+    # pool so a pull_request backlog on the shared default label can never
+    # starve the merge queue again. See typecheck_release_registry above.
+    runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'default' }}
     # ARC setup/cache restore plus release.sh's mandatory workspace build hit
     # the previous 20-minute ceiling while the build was still progressing.
     timeout-minutes: 40
