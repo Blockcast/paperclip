@@ -12,12 +12,14 @@
 // It does NOT mirror any protection in the external claude_k8s adapter, which
 // is the code that actually renders production agent-job pods. As of the SHA
 // pinned by `Dockerfile` (`CLAUDE_K8S_REF=3ad3370`), that adapter applies no
-// allowlist, denylist, or filter of any kind on the pod-env path:
-// `getSelfPodInfo()` (`k8s-client.ts`) snapshots the paperclip server's own pod
-// wholesale, and `job-manifest.ts` replays every channel of it onto each agent
-// pod — literal `env[].value`s, `valueFrom.secretKeyRef`s, `envFrom` sources,
-// and mounted secret volumes alike. The only entries dropped are empty-string
-// values and unnamed ones.
+// allowlist, denylist, or filter of any kind on the pod-env path.
+// `getSelfPodInfo()` (`k8s-client.ts:111-197`) selects one container off the
+// server pod — the one named `paperclip`, else the first — and extracts that
+// container's credential-bearing channels unfiltered: literal `env[].value`s,
+// `valueFrom` entries (`secretKeyRef` included), `envFrom` sources, and the
+// secret volumes mounted on it. `job-manifest.ts` then replays all four onto
+// every agent pod (`:491`, `:562`, `:1144`, `:879`). The only entries dropped
+// are empty-string values and unnamed ones.
 //
 // So this guard covers only manifests built by this repo's Kubernetes
 // sandbox-provider path, and provides zero coverage for that adapter. See
