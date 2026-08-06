@@ -124,6 +124,7 @@ describe("blank payload.title fallback (BLO-21032)", () => {
       type: "request_board_approval",
       requestedByAgentId: null,
       requestedByUserId: null,
+      linkedAgentId: null,
       status: "pending",
       payload: untitledPayload,
       decisionNote: null,

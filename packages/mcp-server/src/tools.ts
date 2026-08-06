@@ -708,9 +708,12 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
                 ? `/approvals/${encodeURIComponent(approvalId)}/request-revision`
                 : `/approvals/${encodeURIComponent(approvalId)}/resubmit`;
 
+        const replacementPayload = action === "resubmit" ? parseOptionalJson(payloadJson) : undefined;
         const body =
           action === "resubmit"
-            ? { payload: parseOptionalJson(payloadJson) ?? {} }
+            ? replacementPayload === undefined
+              ? {}
+              : { payload: replacementPayload }
             : { decisionNote };
 
         return client.requestJson("POST", path, { body });

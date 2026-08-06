@@ -3,6 +3,7 @@ import {
   addApprovalCommentSchema,
   createApprovalSchema,
   requestApprovalRevisionSchema,
+  resubmitApprovalSchema,
   resolveApprovalSchema,
 } from "./approval.js";
 import { APPROVAL_TYPES } from "../constants.js";
@@ -73,5 +74,35 @@ describe("createApprovalSchema payload.title requirement", () => {
     expect(() =>
       createApprovalSchema.parse({ type, payload: { title: "Approve hosting spend" } }),
     ).not.toThrow();
+  });
+
+  it("exposes payload.title as a structural field for MCP/tool contracts", () => {
+    const payloadSchema = createApprovalSchema.shape.payload;
+    expect(Object.keys(payloadSchema.shape)).toContain("title");
+    expect(payloadSchema.safeParse({ branch: "pap-1167" }).success).toBe(false);
+    expect(payloadSchema.safeParse({ title: "Approve hosting spend", branch: "pap-1167" }).success)
+      .toBe(true);
+  });
+});
+
+describe("resubmitApprovalSchema payload.title requirement", () => {
+  it("allows resubmission without a replacement payload", () => {
+    expect(resubmitApprovalSchema.parse({})).toEqual({});
+  });
+
+  it.each([
+    ["absent", {}],
+    ["empty string", { title: "" }],
+    ["whitespace-only", { title: "   " }],
+  ])("rejects a replacement payload with a %s payload.title", (_case, payload) => {
+    expect(() => resubmitApprovalSchema.parse({ payload })).toThrowError(/payload\.title/);
+  });
+
+  it("accepts a replacement payload with a non-empty payload.title and extra fields", () => {
+    expect(resubmitApprovalSchema.parse({
+      payload: { title: "Revise agent hire", branch: "pap-1167" },
+    })).toEqual({
+      payload: { title: "Revise agent hire", branch: "pap-1167" },
+    });
   });
 });

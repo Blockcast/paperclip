@@ -2,18 +2,16 @@ import { z } from "zod";
 import { APPROVAL_TYPES } from "../constants.js";
 import { multilineTextSchema } from "./text.js";
 
-const approvalPayloadSchema = z.record(z.string(), z.unknown()).superRefine((payload, ctx) => {
-  const title = payload.title;
-  if (typeof title !== "string" || title.trim().length === 0) {
-    ctx.addIssue({
-      code: z.ZodIssueCode.custom,
-      path: ["title"],
-      message:
-        "payload.title is required and must be a non-empty, non-whitespace string. " +
-        "Include a short, human-readable payload.title so the card is decidable in the board queue.",
-    });
-  }
-});
+const approvalTitleMessage =
+  "payload.title is required and must be a non-empty, non-whitespace string. " +
+  "Include a short, human-readable payload.title so the card is decidable in the board queue.";
+
+const approvalPayloadSchema = z.object({
+  title: z.string({
+    required_error: approvalTitleMessage,
+    invalid_type_error: approvalTitleMessage,
+  }).refine((title) => title.trim().length > 0, approvalTitleMessage),
+}).catchall(z.unknown());
 
 export const createApprovalSchema = z.object({
   type: z.enum(APPROVAL_TYPES),
@@ -37,7 +35,7 @@ export const requestApprovalRevisionSchema = z.object({
 export type RequestApprovalRevision = z.infer<typeof requestApprovalRevisionSchema>;
 
 export const resubmitApprovalSchema = z.object({
-  payload: z.record(z.string(), z.unknown()).optional(),
+  payload: approvalPayloadSchema.optional(),
 });
 
 export type ResubmitApproval = z.infer<typeof resubmitApprovalSchema>;
