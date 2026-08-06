@@ -33,6 +33,7 @@ import {
   isGatewayAllocationFault,
   isHintlessTransientUpstreamFault,
   isRateLimitExhausted,
+  isRepeatedGatewayAllocationFault,
   isRetryableK8sCcrotateThrottleResult,
   shouldScheduleAutomaticRunRetry,
 } from "../services/heartbeat.js";
@@ -68,6 +69,15 @@ const BLO_18138_RESULT_JSON = {
 const BLO_18138_ERROR_MESSAGE =
   "API Error: 503 Service temporarily unavailable. This is a server-side issue, usually " +
   "temporary — try again in a moment. If it persists, check your inference gateway (api.penstock.run).";
+
+const BLO_21803_ALLOCATION_MISSING_RESULT_JSON = {
+  api_error_status: 400,
+  result:
+    'API Error: 400 {"error":"No allocation configured for org \'org_penstock\' provider ' +
+    '\'anthropic\' on BYOS node \'blockcast-omar\'","code":"allocation_missing",' +
+    '"correlation_id":"01642b14-f519-4ca3-b465-db0bd57a36b9"}',
+  is_error: true,
+} as const;
 
 describe("isHintlessTransientUpstreamFault", () => {
   it("matches the BLO-18138 gateway-503 payload on the error_status surface", () => {
@@ -348,23 +358,50 @@ describe("isHintlessTransientUpstreamFault for the BLO-19879 gateway allocation 
 // (5-6+ scheduledRetryAttempt observed), burning retry budget on a standing
 // provisioning gap while the issue looks alive.
 describe("isGatewayAllocationFault", () => {
-  const BLO_19879_RESULT_JSON = {
-    api_error_status: 400,
-    result:
-      'API Error: 400 {"error":"No allocation configured for org \'org_penstock\' provider ' +
-      '\'anthropic\' on BYOS node \'blockcast-omar\'","code":"allocation_missing",' +
-      '"correlation_id":"01642b14-f519-4ca3-b465-db0bd57a36b9"}',
-    is_error: true,
-  } as const;
-
   it("matches exactly the same shape isHintlessTransientUpstreamFault does", () => {
-    expect(isGatewayAllocationFault(BLO_19879_RESULT_JSON)).toBe(true);
-    expect(isHintlessTransientUpstreamFault(BLO_19879_RESULT_JSON)).toBe(true);
+    expect(isGatewayAllocationFault(BLO_21803_ALLOCATION_MISSING_RESULT_JSON)).toBe(true);
+    expect(isHintlessTransientUpstreamFault(BLO_21803_ALLOCATION_MISSING_RESULT_JSON)).toBe(true);
   });
 
   it("does not fire on an unrelated failure", () => {
     expect(isGatewayAllocationFault(null)).toBe(false);
     expect(isGatewayAllocationFault({ api_error_status: 500, error: "server_error" })).toBe(false);
+  });
+});
+
+describe("isRepeatedGatewayAllocationFault", () => {
+  it("requires both the current run and its immediate predecessor to be allocation faults", () => {
+    expect(
+      isRepeatedGatewayAllocationFault({
+        currentResultJson: BLO_21803_ALLOCATION_MISSING_RESULT_JSON,
+        predecessorResultJson: BLO_21803_ALLOCATION_MISSING_RESULT_JSON,
+      }),
+    ).toBe(true);
+
+    expect(
+      isRepeatedGatewayAllocationFault({
+        currentResultJson: BLO_21803_ALLOCATION_MISSING_RESULT_JSON,
+        predecessorResultJson: BLO_18138_RESULT_JSON,
+        predecessorErrorMessage: BLO_18138_ERROR_MESSAGE,
+      }),
+    ).toBe(false);
+
+    expect(
+      isRepeatedGatewayAllocationFault({
+        currentResultJson: BLO_18138_RESULT_JSON,
+        currentErrorMessage: BLO_18138_ERROR_MESSAGE,
+        predecessorResultJson: BLO_21803_ALLOCATION_MISSING_RESULT_JSON,
+      }),
+    ).toBe(false);
+  });
+
+  it("treats an already-standing predecessor as allocation fault evidence", () => {
+    expect(
+      isRepeatedGatewayAllocationFault({
+        currentResultJson: BLO_21803_ALLOCATION_MISSING_RESULT_JSON,
+        predecessorErrorCode: "allocation_missing_standing",
+      }),
+    ).toBe(true);
   });
 });
 
@@ -424,6 +461,8 @@ const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 const HINTLESS_503_TEST_ADAPTER = "hintless_transient_upstream_test";
 const PLAIN_FAILURE_TEST_ADAPTER = "hintless_transient_upstream_control_test";
+const ALLOCATION_MISSING_TEST_ADAPTER = "hintless_transient_allocation_missing_test";
+const MIXED_TRANSIENT_ALLOCATION_TEST_ADAPTER = "hintless_transient_then_allocation_missing_test";
 
 if (!embeddedPostgresSupport.supported) {
   console.warn(
@@ -449,6 +488,7 @@ describeEmbeddedPostgres("hint-less gateway 503 does not strand", () => {
   let db!: ReturnType<typeof createDb>;
   let heartbeat!: ReturnType<typeof heartbeatService>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  const mixedAdapterCallsByAgentId = new Map<string, number>();
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-hintless-transient-upstream-");
@@ -489,11 +529,51 @@ describeEmbeddedPostgres("hint-less gateway 503 does not strand", () => {
       }),
       testEnvironment: testEnvironment(PLAIN_FAILURE_TEST_ADAPTER),
     });
+
+    registerServerAdapter({
+      type: ALLOCATION_MISSING_TEST_ADAPTER,
+      execute: async () => ({
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+        errorMessage: BLO_21803_ALLOCATION_MISSING_RESULT_JSON.result,
+        resultJson: { ...BLO_21803_ALLOCATION_MISSING_RESULT_JSON } as Record<string, unknown>,
+      }),
+      testEnvironment: testEnvironment(ALLOCATION_MISSING_TEST_ADAPTER),
+    });
+
+    registerServerAdapter({
+      type: MIXED_TRANSIENT_ALLOCATION_TEST_ADAPTER,
+      execute: async (ctx) => {
+        const attempt = (mixedAdapterCallsByAgentId.get(ctx.agent.id) ?? 0) + 1;
+        mixedAdapterCallsByAgentId.set(ctx.agent.id, attempt);
+        if (attempt === 1) {
+          return {
+            exitCode: 1,
+            signal: null,
+            timedOut: false,
+            errorMessage: BLO_18138_ERROR_MESSAGE,
+            resultJson: { ...BLO_18138_RESULT_JSON } as Record<string, unknown>,
+          };
+        }
+        return {
+          exitCode: 1,
+          signal: null,
+          timedOut: false,
+          errorMessage: BLO_21803_ALLOCATION_MISSING_RESULT_JSON.result,
+          resultJson: { ...BLO_21803_ALLOCATION_MISSING_RESULT_JSON } as Record<string, unknown>,
+        };
+      },
+      testEnvironment: testEnvironment(MIXED_TRANSIENT_ALLOCATION_TEST_ADAPTER),
+    });
   }, 120_000);
 
   afterAll(async () => {
     unregisterServerAdapter(HINTLESS_503_TEST_ADAPTER);
     unregisterServerAdapter(PLAIN_FAILURE_TEST_ADAPTER);
+    unregisterServerAdapter(ALLOCATION_MISSING_TEST_ADAPTER);
+    unregisterServerAdapter(MIXED_TRANSIENT_ALLOCATION_TEST_ADAPTER);
+    mixedAdapterCallsByAgentId.clear();
     await cleanupHeartbeatTestState(db, heartbeat, {
       errorLabel: "hint-less transient upstream cleanup",
       drainTimeoutMs: 30_000,
@@ -531,6 +611,37 @@ describeEmbeddedPostgres("hint-less gateway 503 does not strand", () => {
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.retryOfRunId, runId))
       .then((rows) => rows.length);
+  }
+
+  async function getRetryOf(runId: string) {
+    return db
+      .select({
+        id: heartbeatRuns.id,
+        status: heartbeatRuns.status,
+        retryOfRunId: heartbeatRuns.retryOfRunId,
+        scheduledRetryAttempt: heartbeatRuns.scheduledRetryAttempt,
+        scheduledRetryReason: heartbeatRuns.scheduledRetryReason,
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.retryOfRunId, runId))
+      .then((rows) => rows[0] ?? null);
+  }
+
+  async function executeScheduledRetryOf(runId: string) {
+    const retryRun = await getRetryOf(runId);
+    expect(retryRun).toMatchObject({
+      status: "scheduled_retry",
+      retryOfRunId: runId,
+      scheduledRetryReason: "transient_failure",
+    });
+
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "queued", updatedAt: new Date() })
+      .where(eq(heartbeatRuns.id, retryRun!.id));
+
+    await heartbeat.__test_executeRunForTesting(retryRun!.id);
+    return await heartbeat.getRun(retryRun!.id);
   }
 
   it("classifies the fault and schedules a bounded retry instead of stranding", async () => {
@@ -613,5 +724,51 @@ describeEmbeddedPostgres("hint-less gateway 503 does not strand", () => {
     // nothing was scheduled.
     await new Promise((resolve) => setTimeout(resolve, 1_000));
     expect(await countRetriesOf(run!.id)).toBe(0);
+  }, 60_000);
+
+  it("escalates allocation_missing only when the immediate predecessor had the same fault", async () => {
+    const { agentId } = await seedAgent(ALLOCATION_MISSING_TEST_ADAPTER);
+
+    const run = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
+    expect(run).not.toBeNull();
+
+    const firstFailedRun = await waitForRunToFinish(heartbeat, run!.id);
+    expect(firstFailedRun?.status).toBe("failed");
+    expect(firstFailedRun?.errorCode).toBe("provider_transient_upstream");
+    expect(await countRetriesOf(run!.id)).toBe(1);
+
+    const retryFailedRun = await executeScheduledRetryOf(run!.id);
+    expect(retryFailedRun?.status).toBe("failed");
+    expect(retryFailedRun?.errorCode).toBe("allocation_missing_standing");
+    expect((retryFailedRun?.resultJson as Record<string, unknown> | null)?.errorFamily ?? null).toBeNull();
+    expect(await countRetriesOf(retryFailedRun!.id)).toBe(0);
+  }, 60_000);
+
+  it("still retries a first allocation_missing after another transient family", async () => {
+    const { agentId } = await seedAgent(MIXED_TRANSIENT_ALLOCATION_TEST_ADAPTER);
+
+    const run = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
+    expect(run).not.toBeNull();
+
+    const firstFailedRun = await waitForRunToFinish(heartbeat, run!.id);
+    expect(firstFailedRun?.status).toBe("failed");
+    expect(firstFailedRun?.errorCode).toBe("provider_transient_upstream");
+    expect(isGatewayAllocationFault(firstFailedRun?.resultJson)).toBe(false);
+    expect(await countRetriesOf(run!.id)).toBe(1);
+
+    const retryFailedRun = await executeScheduledRetryOf(run!.id);
+    expect(retryFailedRun?.status).toBe("failed");
+    expect(retryFailedRun?.errorCode).toBe("provider_transient_upstream");
+    expect((retryFailedRun?.resultJson as Record<string, unknown> | null)?.errorFamily).toBe(
+      "transient_upstream",
+    );
+    expect(await countRetriesOf(retryFailedRun!.id)).toBe(1);
+
+    const nextRetry = await getRetryOf(retryFailedRun!.id);
+    expect(nextRetry).toMatchObject({
+      status: "scheduled_retry",
+      scheduledRetryAttempt: 2,
+      scheduledRetryReason: "transient_failure",
+    });
   }, 60_000);
 });

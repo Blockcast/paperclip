@@ -3888,6 +3888,36 @@ export function isGatewayAllocationFault(
   return looksLikeGatewayAllocationFault(opts?.errorMessage);
 }
 
+export function didRunSnapshotHitGatewayAllocationFault(input: {
+  errorCode?: string | null;
+  errorMessage?: string | null;
+  resultJson?: Record<string, unknown> | null;
+}): boolean {
+  if (input.errorCode === "allocation_missing_standing") return true;
+  return isGatewayAllocationFault(input.resultJson, {
+    errorMessage: input.errorMessage,
+  });
+}
+
+export function isRepeatedGatewayAllocationFault(input: {
+  currentResultJson?: Record<string, unknown> | null;
+  currentErrorMessage?: string | null;
+  predecessorResultJson?: Record<string, unknown> | null;
+  predecessorErrorMessage?: string | null;
+  predecessorErrorCode?: string | null;
+}): boolean {
+  if (!isGatewayAllocationFault(input.currentResultJson, {
+    errorMessage: input.currentErrorMessage,
+  })) {
+    return false;
+  }
+  return didRunSnapshotHitGatewayAllocationFault({
+    errorCode: input.predecessorErrorCode,
+    errorMessage: input.predecessorErrorMessage,
+    resultJson: input.predecessorResultJson,
+  });
+}
+
 export function isHintlessTransientUpstreamFault(
   resultJson: Record<string, unknown> | null | undefined,
   opts?: { errorMessage?: string | null },
@@ -13054,6 +13084,37 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       message: "Detached child process reported activity; cleared detached warning",
     });
     return updated;
+  }
+
+  async function isImmediatePredecessorRepeatGatewayAllocationFault(
+    run: typeof heartbeatRuns.$inferSelect,
+    current: {
+      errorMessage?: string | null;
+      resultJson?: Record<string, unknown> | null;
+    },
+  ) {
+    if (!run.retryOfRunId) return false;
+    const predecessor = await db
+      .select({
+        error: heartbeatRuns.error,
+        errorCode: heartbeatRuns.errorCode,
+        resultJson: heartbeatRuns.resultJson,
+      })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.companyId, run.companyId),
+        eq(heartbeatRuns.id, run.retryOfRunId),
+      ))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (!predecessor) return false;
+    return isRepeatedGatewayAllocationFault({
+      currentErrorMessage: current.errorMessage,
+      currentResultJson: current.resultJson,
+      predecessorErrorCode: predecessor.errorCode,
+      predecessorErrorMessage: predecessor.error,
+      predecessorResultJson: predecessor.resultJson as Record<string, unknown> | null,
+    });
   }
 
   async function patchRunIssueCommentStatus(
@@ -24140,11 +24201,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // very next attempt of the same chain, days apart: that is not the
       // transient routing blip BLO-19879 documented, it is a standing
       // provisioning gap ("no allocation configured"), and no amount of
-      // further retrying makes one appear. `run.scheduledRetryAttempt` names
-      // which attempt of its chain the JUST-FINISHED run represents (0/null
-      // for a first attempt, 1+ once it is itself already a scheduled retry),
-      // so gating on `>= 1` preserves the single self-heal attempt BLO-19879
-      // needs and only escalates a repeat.
+      // further retrying makes one appear. This must compare against the
+      // immediate retry predecessor, not merely `scheduledRetryAttempt >= 1`:
+      // a chain can start with a different retryable family and hit its first
+      // allocation fault on attempt 1, which still deserves the BLO-19879
+      // self-heal retry.
       const gatewayAllocationFault =
         outcome === "failed" &&
         !rateLimitExhaustedOverride &&
@@ -24153,8 +24214,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         isGatewayAllocationFault(adapterResult.resultJson, {
           errorMessage: adapterResult.errorMessage,
         });
+      const immediatePredecessorRepeatsGatewayAllocationFault = gatewayAllocationFault
+        ? await isImmediatePredecessorRepeatGatewayAllocationFault(run, {
+            errorMessage: adapterResult.errorMessage,
+            resultJson: adapterResult.resultJson,
+          })
+        : false;
       const repeatingGatewayAllocationFault =
-        gatewayAllocationFault && (run.scheduledRetryAttempt ?? 0) >= 1;
+        gatewayAllocationFault && immediatePredecessorRepeatsGatewayAllocationFault;
       const transientUpstreamOverride =
         outcome === "failed" &&
         !rateLimitExhaustedOverride &&
