@@ -92,6 +92,7 @@ import { setPluginEventBus, setPluginEventOutboxDb } from "./services/activity-l
 import { startPluginEventOutbox } from "./services/plugin-event-outbox.js";
 import { startPluginStatusCollector } from "./services/plugin-status-metrics.js";
 import { startGitHubCommitStatusDeliveryOutbox } from "./services/github-status-delivery-outbox.js";
+import { startGithubReviewGateDeliveryWorker } from "./services/github-review-gate-authority.js";
 import { createPluginDevWatcher } from "./services/plugin-dev-watcher.js";
 import { createPluginHostServiceCleanup } from "./services/plugin-host-service-cleanup.js";
 import { pluginRegistryService } from "./services/plugin-registry.js";
@@ -647,6 +648,15 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
       heartbeatOptions: { paperclipNodeRole: appConfig.paperclipNodeRole },
       prReviewerAgentIds: appConfig.githubPrReviewerAgentIds,
       prReviewerBotLogin: appConfig.prReviewerBotLogin || null,
+      reviewGateAuthority: appConfig.githubReviewGateCaptureEnabled
+        ? {
+            repositories: appConfig.githubReviewGateRepositories,
+            statusContext: appConfig.prReviewGateStatusContext,
+            expectedAppId: appConfig.githubReviewGateExpectedAppId,
+            expectedInstallationId: appConfig.githubReviewGateExpectedInstallationId,
+            reviewerBotLogin: appConfig.prReviewerBotLogin || null,
+          }
+        : null,
       // PR→issue back-link (BLO-13353). Absolute public origin used to build the
       // issue URL posted onto PRs; null (unset PAPERCLIP_PUBLIC_URL) disables it.
       // Opt-out gate is env-driven and defaults on; the poster also self-gates
@@ -1012,6 +1022,7 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
   let stopPluginEventOutbox: (() => void) | null = null;
   let stopGitHubStatusDeliveryOutbox: (() => void) | null = null;
   let stopPluginStatusCollector: (() => void) | null = null;
+  let stopGithubReviewGateDeliveryWorker: (() => Promise<void>) | null = null;
   if (appConfig.paperclipNodeRole === "api") {
     logger.info(
       { role: appConfig.paperclipNodeRole },
@@ -1023,6 +1034,12 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
     // already-error'd plugin from a previous boot must be visible on /metrics
     // immediately, not only after this boot's own load attempt resolves.
     stopPluginStatusCollector = startPluginStatusCollector(db);
+    // Capture is staged across every API replica before processing is enabled.
+    // This prevents an old replica from acknowledging a delivery without
+    // persisting it during the authority activation rollout.
+    if (appConfig.githubReviewGateEnabled) {
+      stopGithubReviewGateDeliveryWorker = startGithubReviewGateDeliveryWorker(db);
+    }
     void ensureBundledKubernetesPlugin()
       .then(() => retireLegacyCcrotatePlugin())
       .then(() => retireIncompatiblePluginUpdater())
@@ -1044,7 +1061,7 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
       });
   }
   let appServicesShutdown = false;
-  const shutdownAppServices = () => {
+  const shutdownAppServices = async () => {
     if (appServicesShutdown) return;
     appServicesShutdown = true;
     stopPluginEventOutbox?.();
@@ -1055,10 +1072,13 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
     viteHtmlRenderer?.dispose();
     hostServiceCleanup?.disposeAll();
     hostServiceCleanup?.teardown();
+    await stopGithubReviewGateDeliveryWorker?.();
   };
   app.locals.paperclipShutdown = shutdownAppServices;
 
-  process.once("exit", shutdownAppServices);
+  process.once("exit", () => {
+    void shutdownAppServices();
+  });
   process.once("beforeExit", () => {
     void flushPluginLogBuffer();
   });

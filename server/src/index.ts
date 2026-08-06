@@ -1896,8 +1896,8 @@ export async function startServer(): Promise<StartedServer> {
         // Best-effort tunnel shutdown.
       }
 
-      const appShutdown = (app as { locals?: { paperclipShutdown?: () => void } }).locals?.paperclipShutdown;
-      appShutdown?.();
+      const appShutdown = (app as { locals?: { paperclipShutdown?: () => void | Promise<void> } }).locals?.paperclipShutdown;
+      await appShutdown?.();
 
       if (embeddedPostgres && embeddedPostgresStartedByThisProcess) {
         writeShutdownBreadcrumb(`stopping embedded PostgreSQL (signal=${signal})`);
