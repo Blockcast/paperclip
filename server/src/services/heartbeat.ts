@@ -6454,6 +6454,37 @@ function preserveNonGithubPrWakeCommentIds(contextSnapshot: Record<string, unkno
   return extractWakeCommentIds(contextSnapshot).filter((commentId) => !githubPrScopedCommentIds.has(commentId));
 }
 
+function readGithubPrReviewFeedbackWakeCommentIds(contextSnapshot: Record<string, unknown>) {
+  const ids = new Set<string>();
+  const reviewFeedbackCommentId = readNonEmptyString(contextSnapshot.githubReviewFeedbackCommentId);
+  if (reviewFeedbackCommentId) ids.add(reviewFeedbackCommentId);
+
+  const paperclipWake = parseObject(contextSnapshot[PAPERCLIP_WAKE_PAYLOAD_KEY]);
+  const comments = Array.isArray(paperclipWake.comments) ? paperclipWake.comments : [];
+  const identity = readGithubPrIdentity(contextSnapshot);
+  for (const rawComment of comments) {
+    const comment = parseObject(rawComment);
+    const metadata = parseObject(comment.metadata);
+    if (readNonEmptyString(metadata.kind) !== "github_pr_review_feedback") continue;
+    const metadataIdentity = readGithubPrIdentity({
+      githubRepoFullName: metadata.repoFullName,
+      githubPrNumber: metadata.prNumber,
+    });
+    if (identity !== null && metadataIdentity !== null && metadataIdentity !== identity) continue;
+    const commentId = readNonEmptyString(comment.id);
+    if (commentId) ids.add(commentId);
+  }
+
+  return ids;
+}
+
+function preserveNonGithubPrReviewFeedbackWakeCommentIds(contextSnapshot: Record<string, unknown>) {
+  const reviewFeedbackCommentIds = readGithubPrReviewFeedbackWakeCommentIds(contextSnapshot);
+  const commentIds = mergeWakeCommentIds(contextSnapshot);
+  if (reviewFeedbackCommentIds.size === 0) return commentIds;
+  return commentIds.filter((commentId) => !reviewFeedbackCommentIds.has(commentId));
+}
+
 type AcceptedPlanWakeRoutingDecision = {
   otherActiveClaimIssueId: string;
   otherActiveClaimIdentifier: string | null;
@@ -6562,9 +6593,12 @@ export function mergeCoalescedContextSnapshot(
   for (const key of ["issueId", "taskId", "taskKey"] as const) {
     merged[key] = readNonEmptyString(incoming[key]) ?? readNonEmptyString(existing[key]) ?? merged[key];
   }
-  const mergedCommentIds = isDifferentGithubPr
-    ? mergeWakeCommentIds(preserveNonGithubPrWakeCommentIds(existing), incoming)
-    : mergeWakeCommentIds(existing, incoming);
+  const existingCommentIdsForMerge = isDifferentGithubPr
+    ? preserveNonGithubPrWakeCommentIds(existing)
+    : isNewReviewInstance
+      ? preserveNonGithubPrReviewFeedbackWakeCommentIds(existing)
+      : existing;
+  const mergedCommentIds = mergeWakeCommentIds(existingCommentIdsForMerge, incoming);
   if (mergedCommentIds.length > 0) {
     const latestCommentId = mergedCommentIds[mergedCommentIds.length - 1];
     merged[WAKE_COMMENT_IDS_KEY] = mergedCommentIds;
