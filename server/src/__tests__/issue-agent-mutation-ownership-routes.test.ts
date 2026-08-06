@@ -2,6 +2,7 @@ import { Readable } from "node:stream";
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { REDACTED_EVENT_VALUE } from "../redaction.js";
 
 const issueId = "11111111-1111-4111-8111-111111111111";
 const companyId = "22222222-2222-4222-8222-222222222222";
@@ -300,10 +301,97 @@ function makeRecoveryAction(overrides: Record<string, unknown> = {}) {
   };
 }
 
+// Denied-write recovery issues two bounded activity-log lookups from the route:
+// an exact duplicate probe selecting `{ entityId }`, then an aggregate probe
+// selecting `{ deniedWriteId }` to cap varied payloads per actor/issue/window.
+//
+// The stub used to resolve `[]` unconditionally, which meant the dedupe
+// early-return never executed in CI at all. Because the lookup deliberately
+// fails open (a throw is caught and recording proceeds), a regression that broke
+// the exact or aggregate bounds — a renamed `details` key, a wrong column —
+// would have stayed green while silently recording without bound. `recentRows`
+// drives the exact duplicate branch; `aggregateRows` drives the varied-payload
+// cap branch; `onLookup` captures predicates so tests can assert the
+// discriminators they key on.
+type DeniedWriteLookupKind = "exact" | "aggregate";
+type DeniedWriteLookupStub = {
+  recentRows?: unknown[];
+  aggregateRows?: unknown[];
+  rowsFor?: (where: unknown, kind: DeniedWriteLookupKind) => unknown[];
+  onLookup?: (where: unknown, kind: DeniedWriteLookupKind) => void;
+};
+
+function deniedWriteLookupLimitStub(
+  selection: Record<string, unknown>,
+  where: unknown,
+  stub: DeniedWriteLookupStub,
+) {
+  const selectionKeys = Object.keys(selection);
+  const lookupKind: DeniedWriteLookupKind | null = selectionKeys.includes("entityId")
+    ? "exact"
+    : selectionKeys.includes("deniedWriteId")
+    ? "aggregate"
+    : null;
+  return vi.fn((count: number) => ({
+    // Must honour `reject`: a thenable that only ever calls `resolve` leaves an
+    // awaiting caller hung forever when the stub throws, so a failure test would
+    // "pass" on a dangling promise instead of on the abort it means to assert.
+    then: async (resolve: (rows: unknown[]) => unknown, reject?: (err: unknown) => unknown) => {
+      try {
+        if (!lookupKind) return resolve([]);
+        stub.onLookup?.(where, lookupKind);
+        const fallbackRows = lookupKind === "exact" ? stub.recentRows ?? [] : stub.aggregateRows ?? [];
+        const rows = stub.rowsFor ? stub.rowsFor(where, lookupKind) : fallbackRows;
+        return resolve(rows.slice(0, count));
+      } catch (err) {
+        if (reject) return reject(err);
+        throw err;
+      }
+    },
+  }));
+}
+
+// Drizzle keeps bound values as raw primitives inside `queryChunks` until the
+// dialect compiles the statement, so a predicate's parameters can be read back
+// without a database. Used to assert the dedupe key actually carries the fields
+// the recorded row exposes — if the two sides ever drift (one renamed, the other
+// not) dedupe silently stops matching, and only comparing them catches it.
+function collectSqlParams(node: unknown, out: unknown[] = []): unknown[] {
+  if (typeof node === "string") {
+    out.push(node);
+    for (const match of node.matchAll(/'([^']+)'/g)) out.push(match[1]);
+    return out;
+  }
+  if (typeof node === "number" || node instanceof Date) {
+    out.push(node);
+    return out;
+  }
+  if (!node || typeof node !== "object") return out;
+  if (Array.isArray(node)) {
+    for (const child of node) collectSqlParams(child, out);
+    return out;
+  }
+  const chunks = (node as { queryChunks?: unknown }).queryChunks;
+  if (Array.isArray(chunks)) {
+    for (const child of chunks) collectSqlParams(child, out);
+    return out;
+  }
+  const value = (node as { value?: unknown }).value;
+  if (Array.isArray(value)) {
+    for (const child of value) collectSqlParams(child, out);
+    return out;
+  }
+  if (typeof value === "string" || typeof value === "number" || value instanceof Date) {
+    collectSqlParams(value, out);
+  }
+  return out;
+}
+
 function createRunContextDb(
   contextSnapshot: Record<string, unknown> = {},
   runAgentOrRows: string | Record<string, unknown>[] = ownerAgentId,
   runId: string = ownerRunId,
+  deniedWriteLookup: DeniedWriteLookupStub = {},
 ) {
   const runRows = Array.isArray(runAgentOrRows)
     ? runAgentOrRows
@@ -325,21 +413,33 @@ function createRunContextDb(
     return [{ id: runAgentId, companyId: runAgentCompanyId, permissions: {}, role: "engineer", reportsTo: null }];
   };
   const buildQuery = (selection: Record<string, unknown>) => {
-    const whereResult = {
+    const makeWhereResult = (where: unknown) => ({
       orderBy: vi.fn(async () => []),
+      limit: deniedWriteLookupLimitStub(selection, where, deniedWriteLookup),
       then: async (resolve: (rows: unknown[]) => unknown) => resolve(rowsForSelection(selection)),
-    };
+    });
     const query = {
       innerJoin: vi.fn(() => query),
-      where: vi.fn(() => whereResult),
+      where: vi.fn((where: unknown) => makeWhereResult(where)),
     };
     return query;
   };
+  const select = vi.fn((selection: Record<string, unknown> = {}) => ({
+    from: vi.fn(() => buildQuery(selection)),
+  }));
+  // The aggregate bound is enforced inside `db.transaction` under an advisory
+  // lock, so the stub transaction has to be a usable executor — an empty object
+  // would make every recording path throw and silently record nothing, turning
+  // the cap tests green for the wrong reason.
+  const tx = {
+    execute: vi.fn(async () => undefined),
+    select,
+    insert: vi.fn(() => ({ values: vi.fn(async () => undefined) })),
+  };
   return {
-    transaction: async (callback: (tx: Record<string, never>) => Promise<unknown>) => callback({}),
-    select: vi.fn((selection: Record<string, unknown> = {}) => ({
-      from: vi.fn(() => buildQuery(selection)),
-    })),
+    transaction: async (callback: (tx: unknown) => Promise<unknown>) => callback(tx),
+    execute: tx.execute,
+    select,
   };
 }
 
@@ -505,6 +605,10 @@ describe("agent issue mutation checkout ownership", () => {
     vi.doUnmock("../middleware/index.js");
     registerRouteMocks();
     vi.clearAllMocks();
+    // `clearAllMocks` clears calls but keeps implementations, so a test that
+    // installs one on `logActivity` (see `cheapRecoveryDedupeHarness`) would
+    // otherwise leak it into every test that follows.
+    mockLogActivity.mockImplementation((async () => undefined) as never);
     mockAccessService.canUser.mockReset();
     mockAccessService.decide.mockReset();
     mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
@@ -888,6 +992,29 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockWorkProductService.update).not.toHaveBeenCalled();
     expect(mockStorageService.putFile).not.toHaveBeenCalled();
     expect(mockStorageService.deleteObject).not.toHaveBeenCalled();
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        companyId,
+        actorType: "agent",
+        actorId: peerAgentId,
+        action: "issue_write_denied",
+        entityType: "issue",
+        entityId: issueId,
+        issueId,
+        details: expect.objectContaining({
+          attemptedAction: "issue:mutate",
+          reason: "deny_active_checkout",
+          boundaryReason: "allow_company_agent",
+          responseStatus: 409,
+          quarantined: true,
+        }),
+      }),
+      // Publication must be deferred past commit: `activity.logged` escapes the
+      // transaction, so an inline emit would race row visibility and survive a
+      // rollback as a phantom event.
+      { deferPublish: true },
+    );
   });
 
   it("allows a source-scoped recovery owner to clear a stale blocked source issue", async () => {
@@ -1054,6 +1181,7 @@ describe("agent issue mutation checkout ownership", () => {
 
   it("refuses reopen/resume from a recovery handoff grant instead of transitioning a blocked issue", async () => {
     for (const transition of [{ reopen: true }, { resume: true }]) {
+      mockLogActivity.mockClear();
       mockIssueService.getById.mockResolvedValue(makeIssue({ status: "blocked", assigneeAgentId: peerAgentId }));
       mockAccessService.decide.mockImplementation(recoveryHandoffDecide);
 
@@ -1066,6 +1194,23 @@ describe("agent issue mutation checkout ownership", () => {
       expect(res.body.details).toMatchObject({ reason: "allow_recovery_handoff_grant" });
       expect(mockIssueService.addComment).not.toHaveBeenCalled();
       expect(mockIssueService.update).not.toHaveBeenCalled();
+      expect(mockLogActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue_write_denied",
+          entityType: "issue",
+          entityId: issueId,
+          details: expect.objectContaining({
+            attemptedAction: "issue:mutate",
+            reason: "deny_recovery_handoff_comment_only",
+            responseStatus: 403,
+          }),
+        }),
+        // Publication must be deferred past commit: `activity.logged` escapes the
+        // transaction, so an inline emit would race row visibility and survive a
+        // rollback as a phantom event.
+        { deferPublish: true },
+      );
     }
   });
 
@@ -1216,6 +1361,68 @@ describe("agent issue mutation checkout ownership", () => {
 
     expect(deleteRes.status, JSON.stringify(deleteRes.body)).toBe(409);
     expect(mockIssueService.remove).not.toHaveBeenCalled();
+  });
+
+  // `assertCanManageIssueMonitor` is a *second*, independent gate below
+  // `assertAgentIssueMutationAllowed`: the boundary above allows the PATCH via
+  // `allow_productivity_review_grant`, but this guard tests the assignee
+  // relation directly and never consulted the grant, so a reviewer that
+  // cleared the boundary still bounced off it here. Re-arming a wedged
+  // monitor is the one rubric remedy this specifically blocked (BLO-20426).
+  const productivityReviewDecideWithRuntimeManage = async (input: { action: string }) =>
+    input.action === "runtime:manage"
+      // Independent of the review grant — a reviewer already holds this as an
+      // ordinary company permission, same as in production.
+      ? { allowed: true, action: input.action, reason: "allow_explicit_grant", explanation: "Allowed by test runtime grant." }
+      : productivityReviewDecide(input);
+
+  it("lets a productivity-review owner re-arm the source issue's monitor via PATCH", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({
+      status: "in_progress",
+      assigneeAgentId: peerAgentId,
+      executionPolicy: null,
+    }));
+    mockAccessService.decide.mockImplementation(productivityReviewDecideWithRuntimeManage);
+
+    const res = await request(await createApp(ownerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        executionPolicy: {
+          monitor: {
+            nextCheckAt: "2026-08-10T00:00:00.000Z",
+            notes: "re-armed by reviewer",
+            scheduledBy: "assignee",
+          },
+        },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      issueId,
+      expect.objectContaining({
+        executionPolicy: expect.objectContaining({
+          monitor: expect.objectContaining({ notes: "re-armed by reviewer" }),
+        }),
+      }),
+    );
+  });
+
+  it("keeps the monitor gate closed to a productivity-review owner outside PATCH /issues/:id", async () => {
+    // The forced-wake route shares the same helper but never passes the
+    // reviewer-authorized option, so it must stay closed even though PATCH
+    // now honours the grant.
+    mockIssueService.getById.mockResolvedValue(makeIssue({
+      status: "in_progress",
+      assigneeAgentId: peerAgentId,
+      executionPolicy: null,
+    }));
+    mockAccessService.decide.mockImplementation(productivityReviewDecideWithRuntimeManage);
+
+    const res = await request(await createApp(ownerActor()))
+      .post(`/api/issues/${issueId}/monitor/check-now`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toBe("Only the assignee agent or a board user can manage issue monitors");
   });
 
   // The comment route's current-execution-run short-circuit returns a bare
@@ -1650,6 +1857,51 @@ describe("agent issue mutation checkout ownership", () => {
       expect(mockIssueService.update).not.toHaveBeenCalled();
     });
 
+    // Ally review: the sibling recovery-handoff refusal directly above records,
+    // this one did not — so a recovery owner sending `reopen`/`resume` lost its
+    // attempted comment entirely, which is the exact loss AC3 exists to stop.
+    // The body is the recoverable evidence here: the refusal is about the
+    // status intent, not about the prose the owner was trying to leave.
+    it("records the recovery-owner comment-only refusal so the attempted body survives", async () => {
+      denyCommentGrantEverywhere();
+      mockIssueService.getById.mockResolvedValue(makeIssue({
+        status: "blocked",
+        checkoutRunId: ownerRunId,
+        executionRunId: ownerRunId,
+      }) as never);
+      mockIssueService.getDependencyReadiness.mockResolvedValue({
+        unresolvedBlockerCount: 0,
+        unresolvedBlockerIssueIds: [],
+      } as never);
+      mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(
+        makeRecoveryAction({ ownerAgentId: peerAgentId }) as never,
+      );
+
+      const res = await request(await createApp(recoveryOwnerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "Discharge evidence that must not be lost.", resume: true, apiKey: "sk-should-be-redacted" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe("Recovery owner grant is comment-only");
+
+      const call = mockLogActivity.mock.calls.find(
+        ([, entry]) => (entry as { action?: string }).action === "issue_write_denied",
+      );
+      expect(call, "expected an issue_write_denied record for the recovery-owner refusal").toBeTruthy();
+      const details = (call![1] as { details: Record<string, unknown> }).details;
+      expect(details).toMatchObject({
+        attemptedAction: "issue:mutate",
+        reason: "deny_recovery_owner_comment_only",
+        responseStatus: 403,
+        quarantined: true,
+      });
+      // Bounded + redacted, same contract as every other recorded denial.
+      const serialized = JSON.stringify(details);
+      expect(serialized).toContain("Discharge evidence that must not be lost.");
+      expect(serialized).not.toContain("sk-should-be-redacted");
+      expect(Buffer.byteLength(serialized, "utf8")).toBeLessThanOrEqual(16000);
+    });
+
     // The refusal must not swallow the grant's actual purpose: a plain comment on a
     // `blocked` source issue — the exact discharge path BLO-18996 exists to restore —
     // still has to land.
@@ -2080,6 +2332,44 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueService.addComment).not.toHaveBeenCalled();
   });
 
+  it("records the missing-run-id comment denial so the assignee's own content stays recoverable", async () => {
+    // This denial fires only when the issue is in_progress AND assigned to the
+    // actor, so it is an authenticated agent commenting on its own active issue.
+    // It used to share a branch with `agent_auth_required` — which genuinely
+    // cannot be recorded, having no agentId to attribute — and so responded 401
+    // and dropped the body. A dropped 401 loses the comment exactly the way a
+    // dropped 403 does, and this is the payload most worth keeping.
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+      allowed: input.action === "issue:comment" || input.action === "issue:read",
+      action: input.action,
+      reason: "allow_test_default",
+      explanation: "Allowed by missing-run-id recording regression test.",
+    }));
+    const app = await createApp({ ...ownerActor(), runId: undefined });
+
+    const res = await request(app)
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ body: "diagnosis worth preserving" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(401);
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    const denied = mockLogActivity.mock.calls
+      .map(([, entry]) => entry as {
+        action?: string;
+        runId?: string | null;
+        details?: { attemptedAction?: string; reason?: string; responseStatus?: number; payload?: unknown };
+      })
+      .filter((entry) => entry.action === "issue_write_denied");
+    expect(denied, "the 401 comment denial must leave a recovery record").toHaveLength(1);
+    expect(denied[0].details).toMatchObject({
+      attemptedAction: "issue:comment",
+      reason: "deny_missing_run_id",
+      responseStatus: 401,
+    });
+    expect(denied[0].runId, "no run id is exactly why this denied").toBeNull();
+    expect(JSON.stringify(denied[0].details?.payload)).toContain("diagnosis worth preserving");
+  });
+
   it("still enforces checkout run ownership for same-assignee state mutations", async () => {
     const app = await createApp(ownerActorFromSweepRun());
     const { HttpError } = await vi.importActual<typeof import("../errors.js")>("../errors.js");
@@ -2299,6 +2589,233 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueService.create).not.toHaveBeenCalled();
     expect(mockIssueService.createChild).not.toHaveBeenCalled();
     expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("records cheap status-only recovery profile PATCH denials with redacted payload", async () => {
+    const app = await createApp(
+      ownerActor(),
+      createRunContextDb({
+        modelProfile: "cheap",
+        recoveryIntent: "status_only",
+        allowDeliverableWork: false,
+        allowDocumentUpdates: false,
+        resumeRequiresNormalModel: true,
+      }),
+    );
+
+    const res = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        assigneeAdapterOverrides: { modelProfile: "cheap" },
+        comment: "Authorization: Bearer sk-cheap-secret-value",
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        companyId,
+        actorType: "agent",
+        actorId: ownerAgentId,
+        action: "issue_write_denied",
+        entityType: "issue",
+        entityId: issueId,
+        issueId,
+        details: expect.objectContaining({
+          attemptedAction: "issue:mutate",
+          reason: "deny_cheap_recovery_profile",
+          responseStatus: 403,
+          quarantined: true,
+        }),
+      }),
+      // Publication must be deferred past commit: `activity.logged` escapes the
+      // transaction, so an inline emit would race row visibility and survive a
+      // rollback as a phantom event.
+      { deferPublish: true },
+    );
+    const call = mockLogActivity.mock.calls.find(
+      ([, entry]) => (entry as { action?: string }).action === "issue_write_denied"
+        && (entry as { details?: { reason?: string } }).details?.reason === "deny_cheap_recovery_profile",
+    );
+    expect(call, "expected an issue_write_denied log entry for cheap profile denial").toBeTruthy();
+    const payload = (call![1] as { details: { payload: unknown } }).details.payload;
+    const serializedPayload = JSON.stringify(payload);
+    expect(serializedPayload).not.toContain("sk-cheap-secret-value");
+    expect(serializedPayload).toContain(REDACTED_EVENT_VALUE);
+  });
+
+  // Emulates the activity_log rows `hasRecentDeniedIssueWriteLog` reads back,
+  // applying the same discriminators its SQL predicate does: a stored row counts
+  // as a duplicate only when every value the predicate binds is present. So if
+  // the route stops keying on one of them, it stops suppressing here too — which
+  // is what makes these regression tests for the dedupe *key* and aggregate
+  // bound, not merely for the early-return.
+  function cheapRecoveryDedupeHarness(seedRows: Partial<{
+    id: string;
+    attemptedAction: string;
+    reason: string;
+    responseStatus: number;
+    payloadFingerprint: string;
+    createdAt: Date;
+  }>[] = [], options: { failAggregateLookup?: boolean } = {}) {
+    const recorded: {
+      id: string;
+      attemptedAction: string;
+      reason: string;
+      responseStatus: number;
+      payloadFingerprint: string;
+      createdAt: Date;
+    }[] = seedRows.map((row, index) => ({
+      id: row.id ?? `seed-denied-write-${index}`,
+      attemptedAction: row.attemptedAction ?? "issue:mutate",
+      reason: row.reason ?? "deny_cheap_recovery_profile",
+      responseStatus: row.responseStatus ?? 403,
+      payloadFingerprint: row.payloadFingerprint ?? `seed-payload-fingerprint-${index}`,
+      createdAt: row.createdAt ?? new Date(),
+    }));
+    const lookups: { kind: DeniedWriteLookupKind; params: unknown[] }[] = [];
+    mockLogActivity.mockImplementation((async (_db: unknown, entry: unknown) => {
+      const typed = entry as { action?: string; details?: Record<string, unknown> };
+      if (typed.action === "issue_write_denied" && typed.details) {
+        recorded.push({
+          id: `recorded-denied-write-${recorded.length}`,
+          attemptedAction: String(typed.details.attemptedAction),
+          reason: String(typed.details.reason),
+          responseStatus: Number(typed.details.responseStatus),
+          payloadFingerprint: String(typed.details.payloadFingerprint),
+          createdAt: new Date(),
+        });
+      }
+      return undefined;
+    }) as never);
+    const recentRows = (where: unknown) => {
+      const params = collectSqlParams(where);
+      const windowStart = params.find((param): param is Date => param instanceof Date) ?? new Date(0);
+      return recorded.filter((row) => row.createdAt >= windowStart);
+    };
+    const deniedWriteLookup: DeniedWriteLookupStub = {
+      onLookup: (where, kind) => lookups.push({ kind, params: collectSqlParams(where) }),
+      rowsFor: (where, kind) => {
+        const params = collectSqlParams(where);
+        if (kind === "aggregate") {
+          // Models an unhealthy database on the one query that enforces the
+          // bound. Recording must drop rather than insert unbounded.
+          if (options.failAggregateLookup) throw new Error("simulated aggregate bound lookup failure");
+          return recentRows(where).map((row) => ({ deniedWriteId: row.id }));
+        }
+        const duplicate = recorded.some((row) => params.includes(row.attemptedAction)
+          && params.includes(row.reason)
+          && params.includes(String(row.responseStatus))
+          && params.includes(row.payloadFingerprint)
+          && recentRows(where).includes(row));
+        return duplicate ? [{ entityId: issueId }] : [];
+      },
+    };
+    const cheapProfile = {
+      modelProfile: "cheap",
+      recoveryIntent: "status_only",
+      allowDeliverableWork: false,
+      allowDocumentUpdates: false,
+      resumeRequiresNormalModel: true,
+    };
+    const denyPatch = async (comment: string) => {
+      const app = await createApp(
+        ownerActor(),
+        createRunContextDb(cheapProfile, ownerAgentId, ownerRunId, deniedWriteLookup),
+      );
+      const res = await request(app)
+        .patch(`/api/issues/${issueId}`)
+        .send({ assigneeAdapterOverrides: { modelProfile: "cheap" }, comment });
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      return res;
+    };
+    return { recorded, lookups, denyPatch };
+  }
+
+  it("suppresses an exact repeat denial inside the window but records one whose payload differs", async () => {
+    const { recorded, denyPatch } = cheapRecoveryDedupeHarness();
+
+    await denyPatch("first denied diagnosis");
+    expect(recorded).toHaveLength(1);
+
+    // Same actor, run, target, action, reason and status, same body: a true
+    // repeat, and the only case dedupe should collapse.
+    await denyPatch("first denied diagnosis");
+    expect(recorded, "an identical repeat must not add a second recovery row").toHaveLength(1);
+
+    // Differing content is different recoverable evidence. AC3 exists to keep
+    // the payload, so this must record even though every other key matches.
+    await denyPatch("second, materially different diagnosis");
+    expect(recorded, "a denial with a different payload must still be recorded").toHaveLength(2);
+    expect(recorded[0].payloadFingerprint).not.toBe(recorded[1].payloadFingerprint);
+  });
+
+  it("keys the dedupe lookup on every discriminator it records", async () => {
+    const { recorded, lookups, denyPatch } = cheapRecoveryDedupeHarness();
+
+    await denyPatch("denied diagnosis");
+
+    expect(recorded).toHaveLength(1);
+    const [row] = recorded;
+    expect(row.reason).toBe("deny_cheap_recovery_profile");
+    expect(row.responseStatus).toBe(403);
+    expect(row.payloadFingerprint).toMatch(/^[\w-]{24}$/);
+
+    // The recorded row and the predicate must agree on both key names and
+    // values. Comparing them is the only thing that catches a rename on one
+    // side: the lookup fails open, so a predicate that silently matches nothing
+    // records without bound instead of erroring.
+    const exactLookup = lookups.find((lookup) => lookup.kind === "exact");
+    expect(exactLookup).toBeTruthy();
+    const params = exactLookup!.params;
+    expect(params).toContain("attemptedAction");
+    expect(params).toContain("reason");
+    expect(params).toContain("responseStatus");
+    expect(params).toContain("payloadFingerprint");
+    expect(params).toContain(row.attemptedAction);
+    expect(params).toContain(row.reason);
+    expect(params).toContain(String(row.responseStatus));
+    expect(params).toContain(row.payloadFingerprint);
+    expect(params, "dedupe must be scoped to the acting run").toContain(ownerRunId);
+    expect(params).toContain(issueId);
+  });
+
+  it("caps varied denied-write recovery rows for the same actor and issue inside the window", async () => {
+    const { recorded, denyPatch } = cheapRecoveryDedupeHarness();
+
+    for (let index = 0; index < 7; index += 1) {
+      await denyPatch(`distinct denied diagnosis ${index}`);
+    }
+
+    expect(recorded).toHaveLength(5);
+    expect(new Set(recorded.map((row) => row.payloadFingerprint)).size).toBe(5);
+  });
+
+  // The aggregate bound is the only thing capping how much payload a denied
+  // actor can cause to be written, so when it cannot be evaluated the record
+  // has to drop. The previous shape caught the failure and inserted anyway,
+  // which disabled the bound exactly when the database was unhealthy.
+  it("records nothing when the aggregate bound lookup fails", async () => {
+    const { recorded, denyPatch } = cheapRecoveryDedupeHarness([], { failAggregateLookup: true });
+
+    await denyPatch("denied diagnosis while the bound is unavailable");
+
+    expect(recorded, "a denial must not be recorded when its bound cannot be enforced").toHaveLength(0);
+  });
+
+  it("does not let out-of-window denied-write rows trip the aggregate cap", async () => {
+    const staleCreatedAt = new Date(Date.now() - (5 * 60_000) - 1_000);
+    const seedRows = Array.from({ length: 5 }, (_, index) => ({
+      id: `stale-denied-write-${index}`,
+      createdAt: staleCreatedAt,
+    }));
+    const { recorded, denyPatch } = cheapRecoveryDedupeHarness(seedRows);
+
+    await denyPatch("fresh denied diagnosis after stale aggregate rows");
+
+    expect(recorded).toHaveLength(6);
+    expect(recorded.at(-1)?.createdAt.getTime()).toBeGreaterThan(staleCreatedAt.getTime());
   });
 
   it("defaults agent-created root follow-up issues to inherit the current run workspace", async () => {
@@ -2944,6 +3461,32 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueService.assertCheckoutOwner).not.toHaveBeenCalled();
     expect(mockIssueService.update).not.toHaveBeenCalled();
     expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        companyId,
+        actorType: "agent",
+        actorId: peerAgentId,
+        action: "issue_write_denied",
+        entityType: "issue",
+        entityId: issueId,
+        issueId,
+        details: expect.objectContaining({
+          attemptedAction: "issue:mutate",
+          reason: "deny_assignee_mismatch",
+          boundaryReason: "allow_company_agent",
+          responseStatus: 403,
+          quarantined: true,
+          payload: expect.objectContaining({
+            title: `${status[0]!.toUpperCase()}${status.slice(1)} update`,
+          }),
+        }),
+      }),
+      // Publication must be deferred past commit: `activity.logged` escapes the
+      // transaction, so an inline emit would race row visibility and survive a
+      // rollback as a phantom event.
+      { deferPublish: true },
+    );
   });
 
   it("allows same-company agent mutations on unassigned in-progress issues", async () => {
@@ -3386,6 +3929,7 @@ describe("agent issue mutation checkout ownership", () => {
       watchdogIssueId?: string | null;
       ancestryParentId?: string | null;
       watchdogRows?: Record<string, unknown>[];
+      deniedWriteLookup?: DeniedWriteLookupStub;
     } = {}) {
       const watchedIssueId = options.watchedIssueId ?? issueId;
       const runRows = [{
@@ -3418,21 +3962,35 @@ describe("agent issue mutation checkout ownership", () => {
         return [{ id: peerAgentId, companyId, permissions: {}, role: "engineer", reportsTo: null }];
       };
       const buildQuery = (selection: Record<string, unknown>) => {
-        const whereResult = {
+        const makeWhereResult = (where: unknown) => ({
           orderBy: vi.fn(async () => []),
+          // Same `hasRecentDeniedIssueWriteLog` lookup as the top-level factory.
+          // It must not fall through to `rowsForSelection`, which would collide
+          // with the ancestry-row branch above via the shared "parentId" key.
+          limit: deniedWriteLookupLimitStub(selection, where, options.deniedWriteLookup ?? {}),
           then: async (resolve: (rows: unknown[]) => unknown) => resolve(rowsForSelection(selection)),
-        };
+        });
         const query = {
           innerJoin: vi.fn(() => query),
-          where: vi.fn(() => whereResult),
+          where: vi.fn((where: unknown) => makeWhereResult(where)),
         };
         return query;
       };
+      const select = vi.fn((selection: Record<string, unknown> = {}) => ({
+        from: vi.fn(() => buildQuery(selection)),
+      }));
+      // Denial recording enforces its aggregate bound inside `db.transaction`
+      // and fails closed, so a stub transaction that hands back an unusable
+      // executor records nothing at all — see the top-level factory.
+      const tx = {
+        execute: vi.fn(async () => undefined),
+        select,
+        insert: vi.fn(() => ({ values: vi.fn(async () => undefined) })),
+      };
       return {
-        transaction: async (callback: (tx: Record<string, never>) => Promise<unknown>) => callback({}),
-        select: vi.fn((selection: Record<string, unknown> = {}) => ({
-          from: vi.fn(() => buildQuery(selection)),
-        })),
+        transaction: async (callback: (tx: unknown) => Promise<unknown>) => callback(tx),
+        execute: tx.execute,
+        select,
       };
     }
 
@@ -3736,6 +4294,23 @@ describe("agent issue mutation checkout ownership", () => {
       expect(patchRes.body.error).toBe("Task-watchdog run context is not backed by an active persisted watchdog.");
       expect(mockIssueService.addComment).not.toHaveBeenCalled();
       expect(mockIssueService.update).not.toHaveBeenCalled();
+      const deniedWriteLogs = mockLogActivity.mock.calls
+        .map(([, entry]) => entry as { action?: string; details?: { attemptedAction?: string; reason?: string } })
+        .filter((entry) => entry.action === "issue_write_denied");
+      expect(deniedWriteLogs).toEqual([
+        expect.objectContaining({
+          details: expect.objectContaining({
+            attemptedAction: "issue:comment",
+            reason: "deny_task_watchdog_scope",
+          }),
+        }),
+        expect.objectContaining({
+          details: expect.objectContaining({
+            attemptedAction: "issue:mutate",
+            reason: "deny_task_watchdog_scope",
+          }),
+        }),
+      ]);
     });
   });
 

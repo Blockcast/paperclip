@@ -105,21 +105,41 @@ export const DEFAULT_LIVENESS_REESCALATION_COOLDOWN_MS = 60 * 60 * 1000;
 // heavily backlogged agent. Clearing the lock does not cancel or deprioritize
 // the run — it only stops subsequent wakes for the issue from being parked
 // behind a holder that may never start.
+//
+// BLO-21309: this is a bound on how long the *lock* is held, deliberately
+// independent of how far out a `scheduled_retry` holder's `scheduledRetryAt` is.
+// A `ccrotate_capacity` park takes its horizon from the provider's capacity
+// reset and is routinely days away; letting that horizon set the lock lifetime
+// took the issue out of service for the whole park, for its own assignee.
 export const STALE_PRE_CLAIM_ISSUE_LOCK_MS = 6 * 60 * 60 * 1000;
 export const ISSUE_ASSIGNMENT_RECOVERY_PER_AGENT_SWEEP_LIMIT = 5;
 const ASSIGNMENT_RECOVERY_CAPACITY_RESERVATION_STATUS = "assignment_recovery_capacity_reserved";
 // Enqueue normally finishes in seconds; an hour-old reservation has lost its owning process.
 const ASSIGNMENT_RECOVERY_CAPACITY_RESERVATION_TTL_MS = 60 * 60 * 1000;
+// Keep in sync with heartbeat.ts requiresIssueExecutionRetryLock(). These
+// retry kinds must retain issue.executionRunId through promotion: the promotion
+// path gates on the lock under FOR UPDATE, and the pre-start staleness check
+// cancels the run outright (`issue_execution_lock_changed`) if it changed. For
+// these reasons alone, clearing the lock destroys the continuation instead of
+// merely delaying it, so the sweeper leaves them held.
+const SCHEDULED_RETRY_REASONS_REQUIRING_CONTINUOUS_ISSUE_LOCK = new Set([
+  "max_turns_continuation",
+  "capacity_blocked",
+  "job_failed",
+]);
 // BLO-19941: the same backstop, for a holder wedged at `running`.
 //
 // `running` is neither missing nor terminal, so isCleanable() is false forever
 // and — unlike the pre-claim case — executionLockedAt cannot be the basis: a
 // healthy 4h run legitimately holds a 4h-old lock. Age must therefore be
-// measured against the run's own most-recent *genuine* activity
-// (lastUsefulActionAt > lastOutputAt > startedAt), which is exactly the metric
-// the dispatcher's slot gate uses (`nonStaleRunningRuns`,
-// heartbeat.ts:17162-17171) and the reaper's own silence test
-// (`persistedSignalRef`, heartbeat.ts:16283-16289). Deliberately NOT updatedAt:
+// measured against the run's own most-recent *genuine* activity — the newest of
+// lastUsefulActionAt / lastOutputAt / startedAt, NOT the first non-null of them
+// (see latestRunActivityAt below). That is the same metric the dispatcher's slot
+// gate uses (`nonStaleRunningRuns`, heartbeat.ts:17560-17569) and the reaper's
+// own silence test (`persistedSignalRef`, heartbeat.ts:16672-16682), though both
+// of those still coalesce by priority rather than taking the max — BLO-20775,
+// kept out of this change because it alters reap/dispatch behaviour.
+// Deliberately NOT updatedAt:
 // review/recovery churn bumps it every ~minute and would shield a dead run
 // forever (BLO-8827, and the reaper's own note at heartbeat.ts:16444-16448).
 //
@@ -137,6 +157,22 @@ const ASSIGNMENT_RECOVERY_CAPACITY_RESERVATION_TTL_MS = 60 * 60 * 1000;
 // `queued` holder may legitimately be waiting on capacity, whereas a `running`
 // holder has already had its liveness independently evaluated every ~30s.
 export const STALE_RUNNING_ISSUE_LOCK_MS = 2 * 60 * 60 * 1000;
+// The activity columns are independent stamps, not a priority chain: a run can
+// emit output without recording a useful action, so lastUsefulActionAt may be
+// hours older than lastOutputAt on a perfectly live run. Selecting the *newest*
+// valid timestamp is therefore the only safe reading — a `??` chain returns the
+// first non-null, which lets a stale lastUsefulActionAt mask recent output and
+// classify a live run as silent. Mirrors silenceStartedAtForRun() below, and
+// matches nonLiveExecutionHoldSince()'s latestDate() in productivity-review.ts.
+// NaN dates are dropped rather than propagated, so one bad row cannot poison
+// the comparison into never tripping.
+function latestRunActivityAt(...values: Array<Date | string | null | undefined>) {
+  const times = values
+    .map((value) => (value == null ? null : value instanceof Date ? value : new Date(value)))
+    .filter((value): value is Date => value !== null && !Number.isNaN(value.getTime()))
+    .map((value) => value.getTime());
+  return times.length > 0 ? new Date(Math.max(...times)) : null;
+}
 const ACTIVE_RUN_OUTPUT_EVIDENCE_TAIL_BYTES = 8 * 1024;
 // BLO-7113: re-fire suppression for `stale_active_run_evaluation` wrappers.
 // When the underlying `runs.status='running'` row is the canonical
@@ -1154,7 +1190,20 @@ function buildLivenessOriginalIssueComment(finding: IssueLivenessFinding, escala
   ].join("\n");
 }
 
-export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup }) {
+export function recoveryService(
+  db: Db,
+  deps: {
+    enqueueWakeup: RecoveryWakeup;
+    beforeStaleIssueLockSweepClearForTest?: (
+      issue: {
+        id: string;
+        checkoutRunId: string | null;
+        executionRunId: string | null;
+        executionLockedAt: Date | null;
+      },
+    ) => Promise<void> | void;
+  },
+) {
   const issuesSvc = issueService(db);
   const recoveryActionsSvc = issueRecoveryActionService(db);
   const treeControlSvc = issueTreeControlService(db);
@@ -2473,6 +2522,22 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       },
     };
     const finalizedRun = await db.transaction(async (tx) => {
+      // Lock order: issues before heartbeat_runs.
+      //
+      // sweepStaleIssueLocks takes `issues` FOR UPDATE and then `heartbeat_runs`
+      // FOR UPDATE; releaseIssueExecutionAndPromote likewise locks issues first
+      // and documents the ordering explicitly. This transaction used to update
+      // the run row first and the issue row last, so the two paths acquired the
+      // same two rows in opposite orders — and they contend on precisely the
+      // pair the sweep exists to reconcile: an execution lock whose holder is
+      // finalizing. Under that race Postgres aborts one side with
+      // deadlock_detected (40P01) instead of either completing, which is the
+      // failure the sweep is supposed to prevent.
+      //
+      // Taking the issue row up front removes the inversion without changing
+      // semantics: the conditional UPDATE below still no-ops when the lock has
+      // already moved to another run, and a missing issue row simply locks
+      // nothing, exactly as before.
       await tx
         .select({ id: issues.id })
         .from(issues)
@@ -7820,6 +7885,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
               id: heartbeatRuns.id,
               status: heartbeatRuns.status,
               scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
+              scheduledRetryReason: heartbeatRuns.scheduledRetryReason,
               startedAt: heartbeatRuns.startedAt,
               lastOutputAt: heartbeatRuns.lastOutputAt,
               lastUsefulActionAt: heartbeatRuns.lastUsefulActionAt,
@@ -7830,6 +7896,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     const runById = new Map<string, {
       status: string;
       scheduledRetryAt: Date | null;
+      scheduledRetryReason: string | null;
       startedAt: Date | null;
       lastOutputAt: Date | null;
       lastUsefulActionAt: Date | null;
@@ -7862,11 +7929,52 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         return Date.now() - lockedAt.getTime() >= STALE_PRE_CLAIM_ISSUE_LOCK_MS;
       }
       if (run?.status === "scheduled_retry") {
-        // Scheduled retries are intentionally parked until their retry deadline.
-        // Only clear them once that deadline itself has gone stale; provider
-        // capacity retries may be scheduled far into the future.
-        const staleBasis = run.scheduledRetryAt ?? lockedAt;
-        return Date.now() - staleBasis.getTime() >= STALE_PRE_CLAIM_ISSUE_LOCK_MS;
+        // BLO-19848: these retry kinds must retain issue.executionRunId through
+        // promotion, so for them clearing is NOT a safe reacquire. heartbeat.ts
+        // gates them on the lock at promotion (requiresIssueExecutionRetryLock,
+        // ~13281) and again in the pre-start staleness check (~15124), where a
+        // changed executionRunId cancels the run outright with
+        // `issue_execution_lock_changed`. Clearing here would therefore destroy
+        // a max-turns continuation rather than delay it. Keep the lock and let
+        // the promotion path own the lifecycle.
+        //
+        // This guard is why the "clearing early is always safe" reasoning below
+        // is scoped to the reasons that survive losing the lock.
+        if (
+          SCHEDULED_RETRY_REASONS_REQUIRING_CONTINUOUS_ISSUE_LOCK.has(
+            run.scheduledRetryReason ?? "",
+          )
+        ) {
+          return false;
+        }
+        // BLO-21309: measured from `lockedAt`, exactly like the `queued` branch
+        // above — NOT from `scheduledRetryAt`.
+        //
+        // This used to key off `run.scheduledRetryAt ?? lockedAt`, on the theory
+        // that a parked retry holds a legitimate future claim and should keep its
+        // lock until that deadline goes stale. But `scheduledRetryAt` is set from
+        // the *provider's* capacity-reset horizon, so a `ccrotate_capacity` retry
+        // is routinely parked days out — and since the basis was in the future,
+        // `now - basis` was negative and this returned false for the entire park.
+        // Effective lock lifetime became `scheduledRetryAt + 6h` rather than 6h.
+        //
+        // Nothing else could release it either: `scheduled_retry` is not in
+        // TERMINAL_HEARTBEAT_RUN_STATUSES, so isCleanable(), clearStaleExecutionLock()
+        // and clearCheckoutRunIfTerminal() all decline, and every route that can
+        // force a release is board-only. Net effect on BLO-20983: the *assignee*
+        // could not set status or re-arm its own monitor for ~4 days, from a live
+        // run, while `executionState` reported `idle` and `activeRun` was null.
+        //
+        // Clearing early is safe for the remaining reasons, and for the same
+        // reason the `queued` case is: promoteDueScheduledRetry's UPDATE is
+        // conditioned only on the run row (`status='scheduled_retry' and
+        // scheduledRetryAt <= now`) and never reads the issue lock, and
+        // claimQueuedRun re-stamps under
+        // `or(isNull(executionRunId), eq(executionRunId, claimed.id))` — so the
+        // retry still fires and simply re-acquires. If a fresh run has taken the
+        // issue in the meantime, the retry declines to claim and is cancelled,
+        // which is the correct outcome: live work outranks a days-old continuation.
+        return Date.now() - lockedAt.getTime() >= STALE_PRE_CLAIM_ISSUE_LOCK_MS;
       }
       return false;
     };
@@ -7887,7 +7995,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       // A `running` row that has not stamped any signal yet is anomalous, but it
       // is also the shape of a run mid-claim, so fall back to the lock timestamp
       // rather than clearing a lock that was taken seconds ago.
-      return run.lastUsefulActionAt ?? run.lastOutputAt ?? run.startedAt ?? lockedAt;
+      return latestRunActivityAt(
+        run.lastUsefulActionAt,
+        run.lastOutputAt,
+        run.startedAt,
+      ) ?? lockedAt;
     };
     const isRunningLockSilent = (runId: string | null, lockedAt: Date | null) => {
       const basis = runningLockStaleBasis(runId, lockedAt);
@@ -7900,54 +8012,159 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         issue.executionRunId,
         issue.executionLockedAt,
       );
+      // BLO-21309: distinguishes a parked-retry release from an unclaimed-`queued`
+      // release in the audit trail below. Both go through the same 6h bound, but
+      // only this one implies a provider-capacity park whose `scheduledRetryAt`
+      // may still be days out, so an operator reading `issue.stale_lock_cleared`
+      // can tell that the retry is expected to re-acquire later.
+      const parkedRetryLockExpired = issue.executionRunId != null
+        && runById.get(issue.executionRunId)?.status === "scheduled_retry"
+        && isPreClaimLockExpired(issue.executionRunId, issue.executionLockedAt);
       const executionLockExpired = isPreClaimLockExpired(
         issue.executionRunId,
         issue.executionLockedAt,
       ) || runningLockSilent;
-      // BLO-19941: in the wedge shape both columns point at the SAME wedged run
-      // (checkout and execution are claimed together), so the checkout guard
-      // below would `continue` before the execution check ever ran, making this
       // sweep a no-op for exactly the case it needs to cover.
       //
       // BLO-19566 extends that allowance from `running`-silent to the pre-claim
       // (`queued`) case, which BLO-19941 deliberately left out. The exclusion
       // made the BLO-18995 pre-claim path dead code for every issue checked out
-      // the normal way, because checkout stamps both columns at once. Measured
-      // on the live fleet 2026-08-01T05:32Z (81 issues holding a `queued` pin):
-      // of the 55 with a null checkoutRunId — where the guard already passes —
-      // none had held a lock past the 6h bound, while both of the only two pins
-      // in the fleet that *had* (BLO-19999 at 8.6h, BLO-20042 at 6.8h) sat in
-      // the 25-issue same-run population the guard skips.
+      // the normal way, because checkout stamps both columns at once.
       //
-      // Safety is the same argument BLO-18995 made for the execution column,
-      // and it extends to the checkout column: claimQueuedRun stamps only
-      // executionRunId/executionAgentNameKey/executionLockedAt and neither reads
-      // nor requires checkoutRunId (heartbeat.ts), and its `or(isNull(
-      // executionRunId), eq(executionRunId, claimed.id))` guard is satisfied by
-      // the swept state, so a late claim still succeeds. Ownership checks that
-      // gate a run's work are disjunctions over both columns
-      // (isCurrentIssueExecutionRun, routes/issues.ts), so a null checkout does
-      // not 409 the run or block its comments, and canAdoptUnownedCheckout /
-      // adoptUnownedCheckoutRun re-stamp it on the next checkout. The resulting
-      // shape (null checkoutRunId + non-null executionRunId on a queued run) is
-      // already produced on purpose by enqueueProcessLossRetry and the orphan
-      // reaper's per-issue self-heal.
+      // BLO-19848 applies the same reasoning to `scheduled_retry`: a retry
+      // deadline can be parked far into the future, and if checkoutRunId and
+      // executionRunId both point at that same expired holder, the checkout guard
+      // would otherwise keep the issue wedged forever.
       //
-      // The same-run-id restriction is what keeps this narrow: a *different*
-      // live checkout holder still keeps its lock no matter how stale the
-      // execution lock is.
-      const checkoutHeldBySameWedgedRun = executionLockExpired
+      // The same-run-id restriction is what keeps this narrow. A different live
+      // checkout holder still keeps its lock no matter how stale the execution
+      // lock is, while a late claim by the expired run can re-acquire through the
+      // usual `or(isNull(executionRunId), eq(executionRunId, self))` guard.
+      const checkoutHeldBySameExpiredRun = executionLockExpired
         && issue.checkoutRunId != null
         && issue.checkoutRunId === issue.executionRunId;
       // Guards are kept separate on purpose. The update below nulls the
-      // checkout *and* execution columns together, so the new pre-claim-expiry
-      // allowance must not become a blanket bypass of the checkout check: an
-      // issue whose checkoutRunId points at a live (non-terminal) run keeps its
-      // checkout lock no matter how stale the execution lock is.
-      if (!isCleanable(issue.checkoutRunId) && !checkoutHeldBySameWedgedRun) continue;
+      // checkout *and* execution columns together, so the expiry allowance must
+      // not become a blanket bypass of the checkout check.
+      if (!isCleanable(issue.checkoutRunId) && !checkoutHeldBySameExpiredRun) continue;
       if (!isCleanable(issue.executionRunId) && !executionLockExpired) continue;
 
       const sweepOutcome = await db.transaction(async (tx) => {
+        await deps.beforeStaleIssueLockSweepClearForTest?.(issue);
+
+        const currentIssue = await tx
+          .select({
+            id: issues.id,
+            companyId: issues.companyId,
+            assigneeAgentId: issues.assigneeAgentId,
+            responsibleUserId: issues.responsibleUserId,
+            checkoutRunId: issues.checkoutRunId,
+            executionRunId: issues.executionRunId,
+            executionLockedAt: issues.executionLockedAt,
+          })
+          .from(issues)
+          .where(eq(issues.id, issue.id))
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+
+        if (!currentIssue) return null;
+        if (currentIssue.checkoutRunId !== issue.checkoutRunId) return null;
+        if (currentIssue.executionRunId !== issue.executionRunId) return null;
+        if ((currentIssue.executionLockedAt?.getTime() ?? null) !== (issue.executionLockedAt?.getTime() ?? null)) {
+          return null;
+        }
+
+        const currentReferencedRunIds = [
+          ...new Set(
+            [currentIssue.checkoutRunId, currentIssue.executionRunId]
+              .filter((id): id is string => !!id),
+          ),
+        ];
+        const currentRunRows =
+          currentReferencedRunIds.length > 0
+            ? await tx
+                .select({
+                  id: heartbeatRuns.id,
+                  status: heartbeatRuns.status,
+                  scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
+                  scheduledRetryReason: heartbeatRuns.scheduledRetryReason,
+                  startedAt: heartbeatRuns.startedAt,
+                  lastOutputAt: heartbeatRuns.lastOutputAt,
+                  lastUsefulActionAt: heartbeatRuns.lastUsefulActionAt,
+                })
+                .from(heartbeatRuns)
+                .where(inArray(heartbeatRuns.id, currentReferencedRunIds))
+                .for("update")
+            : [];
+        const currentRunById = new Map<string, {
+          status: string;
+          scheduledRetryAt: Date | null;
+          scheduledRetryReason: string | null;
+          startedAt: Date | null;
+          lastOutputAt: Date | null;
+          lastUsefulActionAt: Date | null;
+        }>();
+        for (const row of currentRunRows) currentRunById.set(row.id, row);
+
+        const currentIsCleanable = (runId: string | null) => {
+          if (!runId) return true;
+          const run = currentRunById.get(runId);
+          if (!run) return true;
+          return TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status);
+        };
+        const currentPreClaimLockExpired = (runId: string | null, lockedAt: Date | null) => {
+          if (!runId || !lockedAt) return false;
+          const run = currentRunById.get(runId);
+          if (run?.status === "queued") {
+            return Date.now() - lockedAt.getTime() >= STALE_PRE_CLAIM_ISSUE_LOCK_MS;
+          }
+          if (run?.status === "scheduled_retry") {
+            // Mirror of isPreClaimLockExpired — keep both in sync. See the full
+            // rationale there (BLO-19848 lock-required guard, BLO-21309 basis).
+            if (
+              SCHEDULED_RETRY_REASONS_REQUIRING_CONTINUOUS_ISSUE_LOCK.has(
+                run.scheduledRetryReason ?? "",
+              )
+            ) {
+              return false;
+            }
+            return Date.now() - lockedAt.getTime() >= STALE_PRE_CLAIM_ISSUE_LOCK_MS;
+          }
+          return false;
+        };
+        const currentRunningLockStaleBasis = (runId: string | null, lockedAt: Date | null) => {
+          if (!runId) return null;
+          const run = currentRunById.get(runId);
+          if (run?.status !== "running") return null;
+          // Newest signal, not first non-null — see latestRunActivityAt.
+          return latestRunActivityAt(
+            run.lastUsefulActionAt,
+            run.lastOutputAt,
+            run.startedAt,
+          ) ?? lockedAt;
+        };
+        const currentRunningLockSilent = (runId: string | null, lockedAt: Date | null) => {
+          const basis = currentRunningLockStaleBasis(runId, lockedAt);
+          if (!basis) return false;
+          return Date.now() - basis.getTime() >= STALE_RUNNING_ISSUE_LOCK_MS;
+        };
+        const currentExecutionLockExpired = currentPreClaimLockExpired(
+          currentIssue.executionRunId,
+          currentIssue.executionLockedAt,
+        ) || currentRunningLockSilent(
+          currentIssue.executionRunId,
+          currentIssue.executionLockedAt,
+        );
+        const currentCheckoutHeldBySameExpiredRun = currentExecutionLockExpired
+          && currentIssue.checkoutRunId != null
+          && currentIssue.checkoutRunId === currentIssue.executionRunId;
+        if (!currentIsCleanable(currentIssue.checkoutRunId) && !currentCheckoutHeldBySameExpiredRun) {
+          return null;
+        }
+        if (!currentIsCleanable(currentIssue.executionRunId) && !currentExecutionLockExpired) {
+          return null;
+        }
+
         const clearedAt = new Date();
         const updated = await tx
           .update(issues)
@@ -7960,15 +8177,15 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           })
           .where(
             and(
-              eq(issues.id, issue.id),
-              issue.checkoutRunId
-                ? eq(issues.checkoutRunId, issue.checkoutRunId)
+              eq(issues.id, currentIssue.id),
+              currentIssue.checkoutRunId
+                ? eq(issues.checkoutRunId, currentIssue.checkoutRunId)
                 : isNull(issues.checkoutRunId),
-              issue.executionRunId
-                ? eq(issues.executionRunId, issue.executionRunId)
+              currentIssue.executionRunId
+                ? eq(issues.executionRunId, currentIssue.executionRunId)
                 : isNull(issues.executionRunId),
-              issue.executionLockedAt
-                ? eq(issues.executionLockedAt, issue.executionLockedAt)
+              currentIssue.executionLockedAt
+                ? eq(issues.executionLockedAt, currentIssue.executionLockedAt)
                 : isNull(issues.executionLockedAt),
             ),
           )
@@ -8225,6 +8442,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           // BLO-19941 adds the third case: a holder wedged at `running`.
           reason: runningLockSilent
             ? "running_lock_silent"
+            : parkedRetryLockExpired
+            ? "parked_retry_lock_expired"
             : executionLockExpired
             ? "pre_claim_lock_expired"
             : "run_terminal_or_missing",
@@ -8238,6 +8457,18 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
                 return basis ? Date.now() - basis.getTime() : null;
               })(),
               runningLockTimeoutMs: STALE_RUNNING_ISSUE_LOCK_MS,
+            }
+            : parkedRetryLockExpired
+            ? {
+              // The park is not cancelled by this release — surfacing the
+              // horizon it will re-acquire at is the point (BLO-21309).
+              parkedRetryLockHeldMs: issue.executionLockedAt
+                ? Date.now() - issue.executionLockedAt.getTime()
+                : null,
+              parkedRetryLockTimeoutMs: STALE_PRE_CLAIM_ISSUE_LOCK_MS,
+              parkedRetryScheduledRetryAt: issue.executionRunId
+                ? runById.get(issue.executionRunId)?.scheduledRetryAt?.toISOString() ?? null
+                : null,
             }
             : executionLockExpired
             ? {

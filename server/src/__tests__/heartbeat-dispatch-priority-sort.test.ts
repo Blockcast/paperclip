@@ -23,7 +23,7 @@
  * because it was the only candidate in the queue.
  */
 import { randomUUID } from "node:crypto";
-import { eq, inArray, sql } from "drizzle-orm";
+import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
@@ -42,6 +42,7 @@ import {
 import { cleanupHeartbeatTestState } from "./helpers/cleanup-heartbeat-test-state.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { issueService } from "../services/issues.js";
+import { _settleDetachedAgentStartLockWorkForTesting } from "../services/agent-start-lock.js";
 import { runningProcesses } from "../adapters/index.js";
 
 const mockAdapterExecute = vi.hoisted(() =>
@@ -1052,6 +1053,135 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
       errorCode: "duplicate_dispatch_suppressed",
     });
     expect(mockAdapterExecute.mock.calls.some(([ctx]) => ctx.runId === queuedRunId)).toBe(false);
+  });
+
+  it("keeps a same-PR review follow-up queued while another review task is running", async () => {
+    const companyId = randomUUID();
+    const runningReviewerId = randomUUID();
+    const queuedReviewerId = randomUUID();
+    const blockedTaskKey = "pr_review:Blockcast/paperclip:123";
+    const otherTaskKey = "pr_review:Blockcast/paperclip:124";
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "ReviewDispatchCo",
+      issuePrefix: `R${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values([
+      {
+        id: runningReviewerId,
+        companyId,
+        name: "RunningReviewAgent",
+        role: "engineer",
+        status: "running",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 3 } },
+        permissions: {},
+      },
+      {
+        id: queuedReviewerId,
+        companyId,
+        name: "QueuedReviewAgent",
+        role: "engineer",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 3 } },
+        permissions: {},
+      },
+    ]);
+
+    const now = new Date();
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId: runningReviewerId,
+      invocationSource: "automation",
+      triggerDetail: "github_webhook",
+      status: "running",
+      contextSnapshot: {
+        taskKey: blockedTaskKey,
+        reviewKind: "pr_review",
+        wakeReason: "github_pr_review_requested",
+      },
+      startedAt: now,
+      lastOutputAt: now,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    const blockedWakeId = randomUUID();
+    const blockedRunId = randomUUID();
+    const otherWakeId = randomUUID();
+    const otherRunId = randomUUID();
+    await db.insert(agentWakeupRequests).values([
+      {
+        id: blockedWakeId,
+        companyId,
+        agentId: queuedReviewerId,
+        source: "automation",
+        triggerDetail: "github_webhook",
+        reason: "github_pr_review_requested",
+        status: "queued",
+        runId: blockedRunId,
+      },
+      {
+        id: otherWakeId,
+        companyId,
+        agentId: queuedReviewerId,
+        source: "automation",
+        triggerDetail: "github_webhook",
+        reason: "github_pr_review_requested",
+        status: "queued",
+        runId: otherRunId,
+      },
+    ]);
+    await db.insert(heartbeatRuns).values([
+      {
+        id: blockedRunId,
+        companyId,
+        agentId: queuedReviewerId,
+        invocationSource: "automation",
+        triggerDetail: "github_webhook",
+        status: "queued",
+        wakeupRequestId: blockedWakeId,
+        contextSnapshot: {
+          taskKey: blockedTaskKey,
+          reviewKind: "pr_review",
+          wakeReason: "github_pr_review_requested",
+        },
+      },
+      {
+        id: otherRunId,
+        companyId,
+        agentId: queuedReviewerId,
+        invocationSource: "automation",
+        triggerDetail: "github_webhook",
+        status: "queued",
+        wakeupRequestId: otherWakeId,
+        contextSnapshot: {
+          taskKey: otherTaskKey,
+          reviewKind: "pr_review",
+          wakeReason: "github_pr_review_requested",
+        },
+      },
+    ]);
+
+    mockAdapterExecute.mockClear();
+    await heartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(heartbeat, otherRunId);
+
+    const blockedRun = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, blockedRunId))
+      .then((rows) => rows[0] ?? null);
+    expect(blockedRun?.status).toBe("queued");
+    expect(mockAdapterExecute.mock.calls.some(([ctx]) => ctx.runId === blockedRunId)).toBe(false);
+    expect(mockAdapterExecute.mock.calls.some(([ctx]) => ctx.runId === otherRunId)).toBe(true);
   });
 
   it("dispatches a long-starved low-priority todo run ahead of a fresh in_progress run (BLO-16253)", async () => {
@@ -3389,4 +3519,89 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
       await heartbeat.drainInFlightExecutions(60_000);
     }
   }, 120_000);
+
+  it("claims at most 15 available slots across concurrent dispatch attempts", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issuePrefix = `C${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    let releaseExecutions!: () => void;
+    const executionGate = new Promise<void>((resolve) => {
+      releaseExecutions = resolve;
+    });
+    const runIds = Array.from({ length: 20 }, () => randomUUID());
+    const now = new Date();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "ConcurrentDispatchTestCo",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "ConcurrentDispatchTestAgent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "opencode_k8s",
+      adapterConfig: {},
+      runtimeConfig: {
+        heartbeat: {
+          wakeOnDemand: true,
+          maxConcurrentRuns: 15,
+          concurrencyEnabled: true,
+        },
+      },
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values(runIds.map((id, index) => ({
+      id,
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "queued" as const,
+      contextSnapshot: { wakeReason: "concurrency_regression" },
+      createdAt: new Date(now.getTime() + index),
+      updatedAt: now,
+    })));
+
+    mockAdapterExecute.mockImplementation(async () => {
+      await executionGate;
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        resultJson: { exitCode: 0 },
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    try {
+      await Promise.all(Array.from({ length: 20 }, () => heartbeat.resumeQueuedRuns()));
+
+      const activeRuns = await db
+        .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(inArray(heartbeatRuns.id, runIds));
+      const activeReservations = await db
+        .select({ runId: externalRuntimeReservations.runId })
+        .from(externalRuntimeReservations)
+        .where(and(
+          inArray(externalRuntimeReservations.runId, runIds),
+          isNull(externalRuntimeReservations.releasedAt),
+        ));
+      expect(activeRuns.filter((run) => run.status === "running")).toHaveLength(15);
+      expect(activeRuns.filter((run) => run.status === "queued")).toHaveLength(5);
+      expect(activeReservations).toHaveLength(15);
+    } finally {
+      releaseExecutions();
+      await heartbeat.drainInFlightExecutions(10_000);
+      await _settleDetachedAgentStartLockWorkForTesting();
+      await heartbeat.drainInFlightExecutions(10_000);
+    }
+  });
 });

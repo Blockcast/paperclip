@@ -3,7 +3,7 @@ import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
-import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNotNull, isNull, lt, lte, ne, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNotNull, isNull, lt, lte, ne, not, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
@@ -30,6 +30,8 @@ import {
 import {
   HEARTBEAT_POLICY_COOLDOWN_MAX_SEC,
   HEARTBEAT_POLICY_COOLDOWN_MIN_SEC,
+  EXTERNAL_LIFECYCLE_ADAPTER_TYPES,
+  EXTERNAL_LIFECYCLE_MAX_CONCURRENT_RUNS,
   HEARTBEAT_POLICY_INTERVAL_MAX_SEC,
   HEARTBEAT_POLICY_INTERVAL_MIN_SEC,
   HEARTBEAT_POLICY_MAX_CONCURRENT_MAX,
@@ -82,6 +84,7 @@ import { conflict, HttpError, notFound } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import { describeDbError, isDbError, runWithTransientDbRetry } from "../lib/db-retry.js";
 import { publishLiveEvent } from "./live-events.js";
+import { canClaimPrReviewTask } from "./pr-review-dispatch-lock.js";
 import { normalizeResponsibleUserDenialCode } from "./responsible-user-denial-run-outcomes.js";
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
 import {
@@ -101,6 +104,7 @@ import {
   type ManagedAgentPod,
 } from "./k8s-job-liveness.js";
 import { getActiveAgentIds } from "./agent-roster.js";
+import { tryLockIssueMonitorQueue } from "./issue-monitor-queue-lock.js";
 import { processPendingImageBumpForAgent } from "./agent-image-bump.js";
 import {
   buildProcessLossCapture,
@@ -262,6 +266,9 @@ import {
   GITHUB_SUPPRESSION_CAUSE_DISPATCH_REJECTED,
   GITHUB_SUPPRESSION_CAUSE_SCHEDULED_RETRY_GATE,
   setGithubReviewRequestDeadLetterUnresolved,
+  setAgentWakeupTerminalFailedUnresolved,
+  setAgentWakeupTerminalFailedOldestAgeSeconds,
+  terminalFailedWakeScopeForTaskKey,
   setExternalLifecycleRunningRuns,
 } from "./metrics.js";
 import { runQuotaExhaustedHook } from "./quota-exhausted-hook.js";
@@ -411,7 +418,7 @@ const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 50;
  * misconfigured `maxConcurrentRuns` cannot alone blow past what the cluster
  * is provisioned to run for one agent concurrently.
  */
-const EXTERNAL_LIFECYCLE_SLOT_CAPACITY = 8;
+const EXTERNAL_LIFECYCLE_SLOT_CAPACITY = EXTERNAL_LIFECYCLE_MAX_CONCURRENT_RUNS;
 const STALE_QUEUED_MAINTENANCE_WAKE_MAX_AGE_MS = 30 * 60 * 1000;
 const STALE_QUEUED_MAINTENANCE_WAKE_BATCH_SIZE = 250;
 const STALE_QUEUED_MAINTENANCE_WAKE_REASONS = [
@@ -1120,10 +1127,7 @@ const SESSIONED_LOCAL_ADAPTERS = new Set([
   "opencode_local",
   "pi_local",
 ]);
-const EXTERNAL_LIFECYCLE_ADAPTERS = new Set([
-  "claude_k8s",
-  "opencode_k8s",
-]);
+const EXTERNAL_LIFECYCLE_ADAPTERS = new Set<string>(EXTERNAL_LIFECYCLE_ADAPTER_TYPES);
 // Fallback staleness window for external-lifecycle (k8s Job) runs when the
 // kube API is unavailable (local dev, RBAC misconfig, transient failure).
 // In-cluster the reaper uses listLiveAgentJobRunIds() to identify dead
@@ -3297,15 +3301,37 @@ function looksLikeRetryableDeadlineExceeded(value: unknown): boolean {
 // flat 90s curve is the correct schedule there (the ccrotate gate, not backoff,
 // decides when a closed account window reopens). Only no-hint server-fault
 // shapes land here.
+//
+// BLO-19909: `server_error` is NOT among the text patterns below, even though
+// the BLO-18138 payload carried it. It is Anthropic's own type name for a 500 —
+// the status BLO-18285 deliberately kept terminal — so standing alone, with no
+// status field at all, it is not evidence of a brownout. Paired with a 503/529
+// it needs no pattern: the status branch returns true before any text is
+// scanned. That is the "require it to be paired with a status" rule, expressed
+// by omission rather than by a second condition.
 const TRANSIENT_UPSTREAM_STATUS_CODES = new Set(["503", "529"]);
-const TRANSIENT_UPSTREAM_TEXT_KEYS = ["result", "message", "error", "summary"] as const;
+
+// BLO-19909: machine-authored error fields ONLY. `result` and `summary` are
+// model-authored: claude-local's parse.ts sets `resultJson = finalResult`
+// verbatim, so `resultJson.result` is the SDK final-result event's text — the
+// agent's own prose — and `summary` is derived from it. A run that fails for an
+// unrelated reason after the agent wrote "the gateway returned a 503 earlier"
+// would otherwise inherit the ~2h42m retry curve and be skipped by the strand
+// sweep for that window. The genuine fault text still reaches this predicate
+// through `errorMessage` (scanned below) and through `error` / `message`, which
+// the SDK and the adapters populate, not the model.
+//
+// The BLO-19879 allocation-fault scan deliberately keeps `result` in its own key
+// set: its pattern is anchored at the start of the string and matches a
+// structured `{"code":"allocation_missing"}` payload, which prose quoting the
+// literal cannot satisfy.
+const TRANSIENT_UPSTREAM_TEXT_KEYS = ["message", "error"] as const;
 const TRANSIENT_UPSTREAM_TEXT_PATTERNS = [
   /API Error:\s*(?:503|529)\b/i,
   /service\s+(?:is\s+)?(?:temporarily\s+)?unavailable/i,
   /temporarily\s+unavailable/i,
   /server\s+overloaded/i,
   /overloaded_error/i,
-  /\bserver_error\b/i,
 ];
 
 // BLO-19879: the penstock gateway answers `400 {"code":"allocation_missing"}`
@@ -8431,6 +8457,13 @@ export interface HeartbeatServiceOptions {
     maxResumePasses?: number;
   };
   /**
+   * Overrides the new-review grace for monitor wakes whose `monitorNextCheckAt`
+   * is due but not yet cleared. The worker derives the effective grace from this
+   * scheduler cadence, due-monitor batch position, and monitor dispatch claim
+   * TTL; tests can set it directly.
+   */
+  productivityReviewMonitorSchedulerIntervalMs?: number;
+  /**
    * Test-only concurrency hook: fired after the scheduler has read a due
    * scheduled_retry row and immediately before the conditional UPDATE that
    * promotes or cancels it.
@@ -8438,6 +8471,20 @@ export interface HeartbeatServiceOptions {
   beforeScheduledRetryPromotionUpdateForTest?: (
     run: typeof heartbeatRuns.$inferSelect,
     now: Date,
+  ) => Promise<void> | void;
+  /**
+   * Test-only concurrency hook: fired after stale-lock sweep has selected a
+   * candidate and immediately before the sweep transaction re-validates the
+   * current issue/run rows. Lets tests mimic a concurrent scheduled_retry
+   * re-park without exposing recovery internals.
+   */
+  beforeStaleIssueLockSweepClearForTest?: (
+    issue: {
+      id: string;
+      checkoutRunId: string | null;
+      executionRunId: string | null;
+      executionLockedAt: Date | null;
+    },
   ) => Promise<void> | void;
   /**
    * Test-only concurrency hook: fired inside the capacity-defer transaction
@@ -8626,7 +8673,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   };
   const budgets = budgetService(db, budgetHooks);
   const sweepWakePreflightGbrain = createServerGbrainClient();
-  const recovery = recoveryService(db, { enqueueWakeup });
+  const recovery = recoveryService(db, {
+    enqueueWakeup,
+    beforeStaleIssueLockSweepClearForTest: options.beforeStaleIssueLockSweepClearForTest,
+  });
 
   function isPlanApprovalConfirmationPayload(payload: unknown) {
     const target = parseObject(parseObject(payload).target);
@@ -10103,6 +10153,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const staleClaimThreshold = new Date(now.getTime() - 5 * 60 * 1000);
     const claimed = await db.transaction(async (tx) => {
+      if (!await tryLockIssueMonitorQueue(tx)) return null;
       const [updated] = await tx
         .update(issues)
         .set({
@@ -10164,7 +10215,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ),
         ),
       )
-      .orderBy(asc(issues.monitorNextCheckAt), asc(issues.updatedAt))
+      .orderBy(asc(issues.monitorNextCheckAt), asc(issues.updatedAt), asc(issues.id))
       .limit(50);
 
     let triggered = 0;
@@ -10172,6 +10223,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     for (const due of dueMonitors) {
       const claimed = await db.transaction(async (tx) => {
+        if (!await tryLockIssueMonitorQueue(tx)) return null;
         const [updated] = await tx
           .update(issues)
           .set({
@@ -14776,26 +14828,48 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       issueContext: issueId ? await getIssueExecutionContext(run.companyId, issueId) : null,
       routineEnvContext: { routineId: null, env: null, responsibleUserId: null },
     });
+    const prReviewTaskKey = readNonEmptyString(context.taskKey) ?? run.contextTaskKey;
+    const exclusivePrReviewTaskKey = prReviewTaskKey && isPrReviewRetryContext(context)
+      ? prReviewTaskKey
+      : null;
     const initiallyClaimed = hasExternalLifecycle(agent.adapterType)
       ? (await claimRunWithExternalRuntimeSlotPool(
           db,
           run.id,
           claimedAt,
           resolveExternalLifecycleConcurrency(parseHeartbeatPolicy(agent)).effectiveMaxConcurrentRuns,
+          exclusivePrReviewTaskKey ? { exclusivePrReviewTaskKey } : {},
         ))?.run ?? null
+      : exclusivePrReviewTaskKey
+      ? await db.transaction(async (tx) => {
+          if (!(await canClaimPrReviewTask(tx, exclusivePrReviewTaskKey))) return null;
+          return tx
+            .update(heartbeatRuns)
+            .set({
+              status: "running",
+              error: null,
+              errorCode: null,
+              responsibleUserId,
+              startedAt: run.startedAt ?? claimedAt,
+              updatedAt: claimedAt,
+            })
+            .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
+            .returning()
+            .then((rows) => rows[0] ?? null);
+        })
       : await db
-          .update(heartbeatRuns)
-          .set({
-            status: "running",
-            error: null,
-            errorCode: null,
-            responsibleUserId,
-            startedAt: run.startedAt ?? claimedAt,
-            updatedAt: claimedAt,
-          })
-          .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
-          .returning()
-          .then((rows) => rows[0] ?? null);
+        .update(heartbeatRuns)
+        .set({
+          status: "running",
+          error: null,
+          errorCode: null,
+          responsibleUserId,
+          startedAt: run.startedAt ?? claimedAt,
+          updatedAt: claimedAt,
+        })
+        .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
+        .returning()
+        .then((rows) => rows[0] ?? null);
     const claimed = initiallyClaimed && hasExternalLifecycle(agent.adapterType)
       ? await db
           .update(heartbeatRuns)
@@ -17671,7 +17745,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   async function reconcileProductivityReviews(opts?: { now?: Date; companyId?: string }) {
-    return productivityReviews.reconcileProductivityReviews({ ...opts, issueCreatedAtGte: await getWorktreeExecutionCutoff() });
+    return productivityReviews.reconcileProductivityReviews({
+      ...opts,
+      thresholds: options.productivityReviewMonitorSchedulerIntervalMs
+        ? { monitorSchedulerIntervalMs: options.productivityReviewMonitorSchedulerIntervalMs }
+        : undefined,
+      issueCreatedAtGte: await getWorktreeExecutionCutoff(),
+    });
   }
 
   // Sweep companion to the becameDone edge in routes/issues.ts. The edge wakes
@@ -18935,9 +19015,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // its shared worktree. Reaper/lifecycle checks must move the old run out
       // of "running" before a queued same-issue retry can proceed.
       const inFlightIssueIds = new Set<string>();
+      const inFlightPrReviewTaskKeys = new Set<string>();
       for (const row of runningRunRows) {
-        const id = readNonEmptyString(parseObject(row.contextSnapshot).issueId);
+        const snapshot = parseObject(row.contextSnapshot);
+        const id = readNonEmptyString(snapshot.issueId);
         if (id) inFlightIssueIds.add(id);
+        const taskKey = readNonEmptyString(snapshot.taskKey);
+        if (taskKey && isPrReviewRetryContext(snapshot)) {
+          inFlightPrReviewTaskKeys.add(taskKey);
+        }
       }
 
       const claimedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
@@ -19021,7 +19107,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         for (const queuedRun of prioritizedRuns) {
           if (claimedRuns.length >= availableSlots) break;
           if (dispatchStopped) break;
-          const queuedIssueId = readNonEmptyString(parseObject(queuedRun.contextSnapshot).issueId);
+          const queuedSnapshot = parseObject(queuedRun.contextSnapshot);
+          const queuedIssueId = readNonEmptyString(queuedSnapshot.issueId);
           if (queuedIssueId && inFlightIssueIds.has(queuedIssueId)) {
             // BLO-20396: only report the cancellation when this pass is the one
             // that actually moved the row. Previously every overlapping pass
@@ -19036,6 +19123,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             }
             continue;
           }
+          const queuedTaskKey = readNonEmptyString(queuedSnapshot.taskKey);
+          if (
+            queuedTaskKey &&
+            isPrReviewRetryContext(queuedSnapshot) &&
+            inFlightPrReviewTaskKeys.has(queuedTaskKey)
+          ) {
+            // Explicit review requests intentionally queue a follow-up while a
+            // review is running. Keep that row queued, but do not let it run
+            // concurrently with the review that already owns this PR task.
+            continue;
+          }
           const claimed = await claimQueuedRun(queuedRun, companyAgents);
           if (!claimed) {
             if (await scheduleEmergencyContinuationForStillQueuedRun(queuedRun)) {
@@ -19046,6 +19144,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
           claimedRuns.push(claimed);
           if (queuedIssueId) inFlightIssueIds.add(queuedIssueId);
+          if (queuedTaskKey && isPrReviewRetryContext(queuedSnapshot)) {
+            inFlightPrReviewTaskKeys.add(queuedTaskKey);
+          }
         }
       } catch (err) {
         launchClaimedRuns();
@@ -19129,6 +19230,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
   }
 
+  // BLO-21256: this pushes an already-claimed run backwards to
+  // queued/startedAt:null and nulls externalRunId, so it is only safe as long
+  // as `conflict` can never be raised once this run's own k8s Job has been
+  // created. That invariant holds today: ExternalRuntimeIsolationConflictError
+  // is thrown solely inside bindExternalRuntimeReservationIsolation()
+  // (external-runtime-reservations.ts), and only while the run's reservation
+  // is still isolationMode "pending"/"legacy" (the `replaceableBinding` gate)
+  // -- i.e. strictly before markExternalRuntimeReservationLaunching() /
+  // recordExpectedExternalRuntimeJobName() / recordExternalRuntimeJobIdentity()
+  // can ever stamp a Job onto it. Once bound, a further bind attempt on the
+  // same reservation either no-ops or throws a plain drift Error, never this
+  // type. Pinned by heartbeat-external-runtime-retry.test.ts's
+  // "cannot raise ExternalRuntimeIsolationConflictError for a run whose Job
+  // has already been created" case -- if a refactor moves isolation binding
+  // to after Job creation, or lets a bound reservation re-enter the throw
+  // path, that test fails before this function can strand a live Job.
   async function deferRunForK8sIsolationConflict(
     run: typeof heartbeatRuns.$inferSelect,
     conflict: ExternalRuntimeIsolationConflictError,
@@ -25677,6 +25794,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     await publishGithubReviewDeadLetterGauge(now);
+    await publishAgentWakeupTerminalFailedGauge(now);
 
     return { recovered, superseded, exhausted, stillFailing };
   }
@@ -25781,6 +25899,371 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       setGithubReviewRequestDeadLetterUnresolved(byReason);
     } catch (err) {
       logger.warn({ err }, "failed to publish github review dead-letter gauge (BLO-18859)");
+    }
+  }
+
+  /**
+   * Recency window for {@link publishAgentWakeupTerminalFailedGauge}. Same
+   * reasoning as {@link GITHUB_DEAD_LETTER_GAUGE_WINDOW_MS}: a `failed` row is
+   * terminal and never cleared, so an all-time count would climb monotonically
+   * and pin the alert on forever after the first one. Bounding by `finishedAt`
+   * makes the gauge mean "terminal-failed wakes recent enough to still be worth
+   * acting on".
+   */
+  const TERMINAL_FAILED_WAKE_GAUGE_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+  /**
+   * Per-scope scan budget for {@link publishAgentWakeupTerminalFailedGauge}.
+   *
+   * This bounds the COUNT series only. The age series the alert actually
+   * thresholds is computed by an uncapped aggregate
+   * (`selectOldestUnresolvedFinishedAt`) precisely so that no scan budget can
+   * hide an old row from it.
+   *
+   * The cap is applied PER SCOPE, with a separate query each, and that split is
+   * load-bearing rather than cosmetic. A single global `limit` ordered by
+   * `finishedAt desc` is resolved by Postgres before anything in this function
+   * can look at `payload->>'taskKey'`, so the scope a row belongs to is not yet
+   * known when rows are discarded. One noisy hour of ordinary wake failures
+   * would then evict unresolved `pr_review` failures from the candidate set and
+   * drive the alertable count to zero. Giving `pr_review` its own budget means
+   * non-review volume, however large, cannot consume it.
+   *
+   * Within a scope the count remains a bounded sample: past the budget it
+   * saturates rather than climbing. That is acceptable where a truncated MIN
+   * was not — a saturated count is still non-zero and still pages, whereas a
+   * truncated oldest-age is simply the wrong number and reads as healthy.
+   *
+   * `other` is dashboard-only (nothing pages on it), so its budget exists to
+   * bound the query rather than to guarantee completeness.
+   */
+  const TERMINAL_FAILED_WAKE_GAUGE_SCAN_LIMIT_PR_REVIEW = 500;
+  const TERMINAL_FAILED_WAKE_GAUGE_SCAN_LIMIT_OTHER = 500;
+
+  /**
+   * Wake statuses that prove a taskKey was genuinely picked back up.
+   *
+   * This MUST stay a positive allowlist. The predicate started life as
+   * `ne(status, "failed")`, which silently treated every other terminal state
+   * as proof of a re-drive: a successor written `skipped` by scheduling
+   * suppression or a policy gate, or a queued retry that later became
+   * `cancelled` / `dispatch_failed_exhausted` / `dispatch_superseded`, would
+   * stamp a newer timestamp and suppress the original failure forever. None of
+   * those states means a review ran, and the requirement this gauge exists to
+   * serve is that a lost review stays alertable until an active or successful
+   * successor exists. A negative check can only ever be as correct as the
+   * status vocabulary was on the day it was written — a new terminal status
+   * added anywhere in the codebase would silently join the "counts as coverage"
+   * set. A positive list fails the safe way instead: an unknown status is not
+   * coverage, so the worst case is an alert that fires and gets triaged.
+   *
+   * Live values mirror IDEMPOTENT_REVIEWER_WAKE_STATUSES in
+   * `routes/github-webhook.ts`, plus `completed` as the successful terminal.
+   * `coalesced` is deliberately NOT here: it means this request was folded into
+   * another in-flight wake, and that other row is itself either live (so it
+   * matches this list on its own) or terminal-failed (so it is a candidate in
+   * its own right). Counting `coalesced` as coverage would let two rows vouch
+   * for each other while no review ever ran.
+   */
+  const TERMINAL_FAILED_WAKE_SUCCESSOR_WAKE_STATUSES = [
+    "queued",
+    "claimed",
+    "running",
+    "scheduled",
+    "deferred_issue_execution",
+    "completed",
+  ] as const;
+
+  /**
+   * Run statuses that prove a taskKey was picked back up. Same positive-list
+   * reasoning as {@link TERMINAL_FAILED_WAKE_SUCCESSOR_WAKE_STATUSES}: the
+   * live set is `SUCCESSFUL_RUN_HANDOFF_LIVE_RUN_STATUSES`
+   * (`services/successful-run-handoff-state.ts`) plus `succeeded`. Every member
+   * of HEARTBEAT_RUN_TERMINAL_STATUSES except `succeeded` — `failed`,
+   * `cancelled`, `timed_out`, `interrupted` — is excluded, because a run that
+   * ended in any of those did not post a review.
+   */
+  const TERMINAL_FAILED_WAKE_SUCCESSOR_RUN_STATUSES = [
+    "queued",
+    "running",
+    "scheduled_retry",
+    "succeeded",
+  ] as const;
+
+  /**
+   * Re-derive the unresolved terminal-`failed` wake gauge from committed
+   * `agent_wakeup_requests` rows (BLO-20255).
+   *
+   * `reconcileFailedWakeDispatches` only ever selects `dispatch_failed`, so a
+   * row that lands on `failed` is never re-driven by anything. BLO-18030 /
+   * PR #900 added a bounded retry for the one slice that is provably safe to
+   * re-run (a stale-killed `pr_review` whose GitHub probe found no review), and
+   * deliberately left the other three cases terminal so we never double-post a
+   * review. Those are correct to leave alone and wrong to leave unmonitored —
+   * this gauge is the monitoring half.
+   *
+   * Two joins that are easy to get wrong:
+   *
+   * 1. `error_code` comes from `heartbeat_runs`, not from the wake row. The
+   *    wake table has no such column; the terminal-outcome path writes the code
+   *    to the run and only prose to `agent_wakeup_requests.error`. The join is
+   *    a LEFT join because the "deferred wake could not be promoted" sites set
+   *    `status='failed'` with no run at all — those are real terminal rows and
+   *    must still be counted, under `error_code="none"`.
+   *
+   * 2. The successor-wake exclusion is what keeps a retried row from paging. A
+   *    bounded retry creates a new `heartbeat_runs` row carrying the same
+   *    `context_task_key`; a fresh webhook push creates a new
+   *    `agent_wakeup_requests` row carrying the same `payload->>'taskKey'`.
+   *    Either one means the work has been picked back up, so both are checked.
+   *    A row whose taskKey is null cannot be checked and is counted — it is
+   *    genuinely unmonitored, which is the thing this gauge exists to surface.
+   *
+   * Best-effort: a failure here must not break the reconcile pass, whose real
+   * job is re-driving dispatches.
+   */
+  async function publishAgentWakeupTerminalFailedGauge(now: Date) {
+    try {
+      const cutoff = new Date(now.getTime() - TERMINAL_FAILED_WAKE_GAUGE_WINDOW_MS);
+      const wakeTaskKey = sql<string | null>`${agentWakeupRequests.payload} ->> 'taskKey'`;
+      // Scope must be decided in SQL, not in JS, so that the per-scope `limit`
+      // discards rows from the scope it is budgeting rather than from whichever
+      // scope happened to be older. Kept byte-identical in meaning to
+      // terminalFailedWakeScopeForTaskKey(): a `pr_review:` prefix, and a null
+      // taskKey falling to `other`. `like` (not `ilike`) because the webhook
+      // writes the prefix literally.
+      const isPrReviewTaskKey = sql<boolean>`coalesce(${wakeTaskKey} like 'pr\\_review:%', false)`;
+
+      const selectCandidates = async (scope: "pr_review" | "other", limit: number) =>
+        db
+          .select({
+            id: agentWakeupRequests.id,
+            finishedAt: agentWakeupRequests.finishedAt,
+            taskKey: wakeTaskKey,
+            errorCode: heartbeatRuns.errorCode,
+          })
+          .from(agentWakeupRequests)
+          .leftJoin(heartbeatRuns, eq(heartbeatRuns.id, agentWakeupRequests.runId))
+          .where(
+            and(
+              eq(agentWakeupRequests.status, "failed"),
+              gte(agentWakeupRequests.finishedAt, cutoff),
+              scope === "pr_review" ? isPrReviewTaskKey : not(isPrReviewTaskKey),
+            ),
+          )
+          .orderBy(desc(agentWakeupRequests.finishedAt))
+          .limit(limit);
+
+      /**
+       * Oldest unresolved terminal-`failed` wake per scope, computed with NO
+       * row cap (BLO-20255, Ally round 3).
+       *
+       * This exists because the alert thresholds the OLDEST unresolved age
+       * while `selectCandidates` is ordered `finishedAt desc` and capped. Those
+       * two facts compose into a silent failure: during a sustained burst of
+       * `pr_review` failures — roughly 17/min is enough to refill a 500-row
+       * budget inside the 30m threshold — every row older than the threshold is
+       * discarded before this function sees it, so the published age is
+       * permanently young and the alert stays quiet during exactly the outage
+       * it was built to detect. Raising the cap only moves the burst rate that
+       * defeats it; the cap has to be off the age path entirely.
+       *
+       * It is an aggregate, so "uncapped" costs one row per scope, not a scan
+       * proportional to the failure count. The count series keeps its bounded
+       * scan: a count is a magnitude and a truncated magnitude still pages,
+       * whereas a truncated MIN is simply the wrong number.
+       *
+       * The successor predicates are built from the SAME
+       * TERMINAL_FAILED_WAKE_SUCCESSOR_* constants the JS path uses. That is
+       * deliberate — the round-2 critical on this file was a successor
+       * vocabulary that had drifted out of step, and hand-copying the statuses
+       * into SQL would have recreated exactly that bug with a second source of
+       * truth. A row with a null taskKey cannot be matched by either subquery,
+       * so `not exists` holds and it counts as unresolved, matching the JS path.
+       */
+      const successorStatusList = (statuses: readonly string[]) =>
+        sql.join(
+          statuses.map((status) => sql`${status}`),
+          sql`, `,
+        );
+      const selectOldestUnresolvedFinishedAt = async () => {
+        const scopeExpr = sql<boolean>`${isPrReviewTaskKey}`;
+        const aggregated = await db
+          .select({
+            isPrReview: scopeExpr,
+            oldest: sql<string | Date | null>`min(${agentWakeupRequests.finishedAt})`,
+          })
+          .from(agentWakeupRequests)
+          .where(
+            and(
+              eq(agentWakeupRequests.status, "failed"),
+              gte(agentWakeupRequests.finishedAt, cutoff),
+              sql`not exists (
+                select 1
+                from agent_wakeup_requests successor_wake
+                where successor_wake.payload ->> 'taskKey' = ${wakeTaskKey}
+                  and successor_wake.id <> ${agentWakeupRequests.id}
+                  and successor_wake.requested_at > ${agentWakeupRequests.finishedAt}
+                  and successor_wake.status in (${successorStatusList(
+                    TERMINAL_FAILED_WAKE_SUCCESSOR_WAKE_STATUSES,
+                  )})
+              )`,
+              sql`not exists (
+                select 1
+                from heartbeat_runs successor_run
+                where successor_run.context_task_key = ${wakeTaskKey}
+                  and successor_run.created_at > ${agentWakeupRequests.finishedAt}
+                  and successor_run.status in (${successorStatusList(
+                    TERMINAL_FAILED_WAKE_SUCCESSOR_RUN_STATUSES,
+                  )})
+              )`,
+            ),
+          )
+          .groupBy(scopeExpr);
+
+        const out: Array<{ scope: string; finishedAt: Date }> = [];
+        for (const row of aggregated) {
+          // Same parse-at-the-boundary rule as noteSuccessor(): the driver
+          // returns a `min(timestamptz)` aggregate as a STRING regardless of
+          // the TS annotation, and an unparsed string would silently produce a
+          // NaN age.
+          if (!row.oldest) continue;
+          const parsed = row.oldest instanceof Date ? row.oldest : new Date(row.oldest);
+          if (Number.isNaN(parsed.getTime())) continue;
+          out.push({ scope: row.isPrReview ? "pr_review" : "other", finishedAt: parsed });
+        }
+        return out;
+      };
+
+      const [prReviewRows, otherRows, oldestUnresolvedByScope] = await Promise.all([
+        selectCandidates("pr_review", TERMINAL_FAILED_WAKE_GAUGE_SCAN_LIMIT_PR_REVIEW),
+        selectCandidates("other", TERMINAL_FAILED_WAKE_GAUGE_SCAN_LIMIT_OTHER),
+        selectOldestUnresolvedFinishedAt(),
+      ]);
+      const rows = [...prReviewRows, ...otherRows];
+
+      // The age series is published from the UNBOUNDED aggregate, so it is
+      // correct even when the detail scan above is saturated. Publishing it
+      // before the early return also means "no candidates at all" and "no
+      // unresolved candidates" agree: both zero every scope.
+      const oldestAges = oldestUnresolvedByScope.map(({ scope, finishedAt }) => ({
+        scope,
+        // Clamped at 0 so a row finishing a scrape into the future (clock skew
+        // between the app and the DB) cannot publish a negative age that reads
+        // as "brand new" forever.
+        ageSeconds: Math.max(0, Math.floor((now.getTime() - finishedAt.getTime()) / 1000)),
+      }));
+      setAgentWakeupTerminalFailedOldestAgeSeconds(oldestAges);
+
+      if (rows.length === 0) {
+        setAgentWakeupTerminalFailedUnresolved([]);
+        return;
+      }
+
+      // Only rows with a taskKey can be covered by a successor, and the
+      // successor must postdate the failure. Bounding both follow-up queries by
+      // the oldest candidate's finishedAt keeps them off a full-table scan.
+      const taskKeys = [
+        ...new Set(rows.map((row) => row.taskKey).filter((key): key is string => !!key)),
+      ];
+      const oldestFinishedAt = rows.reduce<Date>(
+        (oldest, row) => (row.finishedAt && row.finishedAt < oldest ? row.finishedAt : oldest),
+        rows[0]?.finishedAt ?? cutoff,
+      );
+
+      const latestSuccessorByTaskKey = new Map<string, Date>();
+      // The driver hands back a `max(timestamptz)` aggregate as a STRING, not a
+      // Date, no matter what the `sql<Date | null>` annotation claims -- the
+      // same reason `refreshExternalRuntimeReservationMetrics` re-wraps its
+      // `min(reservedAt)` in `new Date(...)`. Comparing that string to a real
+      // Date with `>` coerces both to numbers, the string becomes NaN, and
+      // EVERY comparison silently answers false -- which would have quietly
+      // disabled the successor exclusion entirely and paged on exactly the
+      // retried rows this gauge promises never to page on. Parse at the
+      // boundary and keep the map strictly Date-typed.
+      const noteSuccessor = (taskKey: string | null, at: unknown) => {
+        if (!taskKey || !at) return;
+        const parsed = at instanceof Date ? at : new Date(at as string);
+        if (Number.isNaN(parsed.getTime())) return;
+        const current = latestSuccessorByTaskKey.get(taskKey);
+        if (!current || parsed > current) latestSuccessorByTaskKey.set(taskKey, parsed);
+      };
+
+      if (taskKeys.length > 0) {
+        // Two exclusions, both load-bearing:
+        //
+        // 1. `notInArray(id, candidateIds)` -- a candidate must never be its own
+        //    successor. `requestedAt` is when the wake was ASKED for and
+        //    `finishedAt` is when it died, so any row whose failure we are
+        //    scoring also satisfies "requested after some candidate's
+        //    finishedAt" as soon as two candidates share a taskKey (and, for a
+        //    row requested after an earlier sibling failed, itself). Without
+        //    this the gauge silently suppresses the very rows it exists to
+        //    surface.
+        //
+        // 2. A positive status allowlist -- NOT `ne(status, "failed")`. See
+        //    TERMINAL_FAILED_WAKE_SUCCESSOR_WAKE_STATUSES: a successor that
+        //    ended `skipped`, `cancelled`, `dispatch_failed_exhausted`,
+        //    `dispatch_superseded` or `failed` did not run a review, and
+        //    treating its timestamp as coverage would bury the original
+        //    failure permanently.
+        const candidateIds = rows.map((row) => row.id);
+        const successorWakes = await db
+          .select({
+            taskKey: wakeTaskKey,
+            latest: sql<string | null>`max(${agentWakeupRequests.requestedAt})`,
+          })
+          .from(agentWakeupRequests)
+          .where(
+            and(
+              inArray(wakeTaskKey, taskKeys),
+              gt(agentWakeupRequests.requestedAt, oldestFinishedAt),
+              notInArray(agentWakeupRequests.id, candidateIds),
+              inArray(agentWakeupRequests.status, [
+                ...TERMINAL_FAILED_WAKE_SUCCESSOR_WAKE_STATUSES,
+              ]),
+            ),
+          )
+          .groupBy(wakeTaskKey);
+        for (const row of successorWakes) noteSuccessor(row.taskKey, row.latest);
+
+        const successorRuns = await db
+          .select({
+            taskKey: heartbeatRuns.contextTaskKey,
+            latest: sql<string | null>`max(${heartbeatRuns.createdAt})`,
+          })
+          .from(heartbeatRuns)
+          .where(
+            and(
+              inArray(heartbeatRuns.contextTaskKey, taskKeys),
+              gt(heartbeatRuns.createdAt, oldestFinishedAt),
+              inArray(heartbeatRuns.status, [...TERMINAL_FAILED_WAKE_SUCCESSOR_RUN_STATUSES]),
+            ),
+          )
+          .groupBy(heartbeatRuns.contextTaskKey);
+        for (const row of successorRuns) noteSuccessor(row.taskKey, row.latest);
+      }
+
+      const counts = new Map<string, { errorCode: string | null; scope: string; count: number }>();
+      for (const row of rows) {
+        const finishedAt = row.finishedAt;
+        if (row.taskKey && finishedAt) {
+          const successorAt = latestSuccessorByTaskKey.get(row.taskKey);
+          // Strictly-after: a successor stamped at the same instant as the
+          // failure is the same event, not a re-drive.
+          if (successorAt && successorAt > finishedAt) continue;
+        }
+        const errorCode = row.errorCode ?? null;
+        const scope = terminalFailedWakeScopeForTaskKey(row.taskKey);
+        const key = `${errorCode ?? ""} ${scope}`;
+        const existing = counts.get(key);
+        if (existing) existing.count += 1;
+        else counts.set(key, { errorCode, scope, count: 1 });
+      }
+
+      setAgentWakeupTerminalFailedUnresolved([...counts.values()]);
+    } catch (err) {
+      logger.warn({ err }, "failed to publish terminal-failed wake gauge (BLO-20255)");
     }
   }
 
@@ -26490,6 +26973,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
      * semantics. Do not call from production code.
      */
     __test_executeRunForTesting: (runId: string) => executeRun(runId),
+    __test_tickDueIssueMonitors: (now?: Date) => tickDueIssueMonitors(now),
     // Override-aware scheduling-suppression check (honors the worktree
     // run-execution experimental setting). Callers outside the service that
     // gate on suppression should prefer this over the env-only resolver.
