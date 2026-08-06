@@ -9,6 +9,31 @@ export class JobTimeoutError extends Error {
   }
 }
 
+// BLO-22454: createJob is the sole agent-Job create site and had no 409
+// handling, so a retry landing inside the Foreground-deletion window of a
+// just-released Job (deleteJob below) collided with its own prior Job and
+// threw an opaque error the run never recovered from. This error names the
+// run id and the pre-existing Job so the failure is attributable without
+// hand-reading an agent's errorReason field.
+export class JobAlreadyExistsError extends Error {
+  constructor(
+    namespace: string,
+    name: string,
+    runId: string | undefined,
+    reason: "terminating" | "unreadable" | "no-uid",
+  ) {
+    const runIdPart = runId ? ` (run ${runId})` : "";
+    const reasonText =
+      reason === "terminating"
+        ? "the existing Job is still Terminating under foreground deletion, so it is not safe to adopt"
+        : reason === "unreadable"
+          ? "the existing Job could not be read to adopt its uid"
+          : "the existing Job has no uid to adopt";
+    super(`Job ${namespace}/${name}${runIdPart} already exists and cannot be adopted: ${reasonText}`);
+    this.name = "JobAlreadyExistsError";
+  }
+}
+
 export async function createJob(
   clients: KubeClients,
   namespace: string,
@@ -17,10 +42,48 @@ export async function createJob(
   // Choke point: this accepts an arbitrary manifest, so re-check here rather
   // than trusting that it came from buildJobManifest.
   assertManifestHasNoLiteralSensitiveEnv(manifest, `Job in ${namespace}`);
-  const result = await clients.batch.createNamespacedJob({ namespace, body: manifest as never });
-  const uid = (result as { metadata?: { uid?: string } }).metadata?.uid;
-  if (!uid) throw new Error("Job created without a UID");
+  const meta = (manifest.metadata as { name?: string; labels?: Record<string, string> } | undefined) ?? {};
+  const name = meta.name;
+  const runId = meta.labels?.["paperclip.io/run-id"];
+  try {
+    const result = await clients.batch.createNamespacedJob({ namespace, body: manifest as never });
+    const uid = (result as { metadata?: { uid?: string } }).metadata?.uid;
+    if (!uid) throw new Error("Job created without a UID");
+    return { uid };
+  } catch (err) {
+    if (!isAlreadyExists(err) || !name) throw err;
+    return adoptExistingJob(clients, namespace, name, runId);
+  }
+}
+
+// A retry of the same run reproduces the same deterministic Job name and
+// 409s against its own in-flight (or just-deleted) Job. Adopt the existing
+// Job's uid rather than failing the run outright — unless it is mid-deletion,
+// in which case it is about to disappear and must not be attached to.
+async function adoptExistingJob(
+  clients: KubeClients,
+  namespace: string,
+  name: string,
+  runId: string | undefined,
+): Promise<{ uid: string }> {
+  let existing: { metadata?: { uid?: string; deletionTimestamp?: string } };
+  try {
+    existing = (await clients.batch.readNamespacedJob({ namespace, name })) as never;
+  } catch {
+    throw new JobAlreadyExistsError(namespace, name, runId, "unreadable");
+  }
+  if (existing.metadata?.deletionTimestamp) {
+    throw new JobAlreadyExistsError(namespace, name, runId, "terminating");
+  }
+  const uid = existing.metadata?.uid;
+  if (!uid) throw new JobAlreadyExistsError(namespace, name, runId, "no-uid");
   return { uid };
+}
+
+function isAlreadyExists(err: unknown): boolean {
+  if (typeof err !== "object" || err === null) return false;
+  const e = err as { code?: number; statusCode?: number };
+  return e.code === 409 || e.statusCode === 409;
 }
 
 export type JobStatus = SandboxStatus;
