@@ -220,6 +220,14 @@ describe("paperclip MCP tools", () => {
     });
   });
 
+  it("documents duplicate candidates as advisory and independent of allowDuplicate", () => {
+    const tool = getTool("paperclipCreateIssue");
+
+    expect(tool.description).toContain("advisory `duplicateCandidates`");
+    expect(tool.description).toContain("never refuse the create");
+    expect(tool.description).toContain("independent of `allowDuplicate`");
+  });
+
   it("defaults issue document format to markdown", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       mockJsonResponse({ key: "plan", latestRevisionNumber: 2 }),
