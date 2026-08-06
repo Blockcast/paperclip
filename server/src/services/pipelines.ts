@@ -4502,7 +4502,10 @@ export function pipelineService(
             routineRevisionId: routineWithRevision.latestRevisionId,
             routineRevisionNumber: routineWithRevision.latestRevisionNumber,
           },
-        }, { deferPublish: true });
+        }, {
+          enlistPluginOutbox: true,
+          deferPublish: true,
+        });
         return { updatedRoutine: routineWithRevision, publish: activityPublish };
       });
       // Reached only on commit; a rollback throws straight past this.

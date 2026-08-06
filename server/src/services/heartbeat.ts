@@ -18116,7 +18116,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               entityType: "execution_workspace",
               entityId: failedWorkspace.id,
               details: quarantine,
-            }, { deferPublish: true });
+            }, {
+              enlistPluginOutbox: true,
+              deferPublish: true,
+            });
             detachWorkspaceFromIssue = issueWorkspace.executionWorkspaceId === failedExecutionWorkspaceId;
           }
         }
@@ -31405,7 +31408,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 resolvedStrategy,
                 hasResolvablePriorSessionWorkspace,
               },
-            }, { deferPublish: true });
+            }, {
+              enlistPluginOutbox: true,
+              deferPublish: true,
+            });
             // Deferred: this "skipped" outcome carries the publisher out of the
             // transaction rather than firing inline (see the `outcome.kind`
             // switch right after `db.transaction` below), so a rollback throws
