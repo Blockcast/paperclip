@@ -45,19 +45,50 @@ function getVerifyLaneScript() {
   return scriptLines.join("\n");
 }
 
-function runVerifyStep(results) {
-  const script = getVerifyLaneScript();
-  const env = {
-    ...process.env,
+function laneEnv(results) {
+  return {
     HELM_CHART_RESULT: results.helm_chart ?? "success",
     TYPECHECK_RELEASE_REGISTRY_RESULT: results.typecheck_release_registry ?? "success",
     GENERAL_TESTS_RESULT: results.general_tests ?? "success",
     WORKTREE_INSTALL_RESULT: results.worktree_install ?? "success",
     BUILD_RESULT: results.build ?? "success",
     VERIFY_SERIALIZED_SERVER_RESULT: results.verify_serialized_server ?? "success",
+    VENDOR_CLAUDE_K8S_RESULT: results.vendor_claude_k8s ?? "success",
   };
+}
+
+function runVerifyStep(results) {
+  const script = getVerifyLaneScript();
+  const env = { ...process.env, ...laneEnv(results) };
   return spawnSync("bash", ["-c", script], { env, encoding: "utf8" });
 }
+
+// BLO-17980: adding a lane to the `verify` job's `lane_results` map without
+// also giving it a default here leaves its env var unset. The script's
+// `case` treats an empty result as `*)` — a failure — so EVERY scenario in
+// this file, including "every lane succeeds", starts emitting a spurious
+// lane-failure annotation. That is exactly how the `vendor_claude_k8s` lane
+// broke this suite. Assert the two stay in step so the next lane addition
+// fails here with a clear reason instead of as three unrelated-looking
+// assertion errors.
+test("every lane in the workflow's lane_results map has a test default", () => {
+  const script = getVerifyLaneScript();
+  const mapBody = script.slice(
+    script.indexOf("declare -A lane_results=("),
+    script.indexOf(")", script.indexOf("declare -A lane_results=(")),
+  );
+  const referenced = [...mapBody.matchAll(/\[(\w+)\]="\$(\w+)"/g)];
+  assert.ok(referenced.length > 0, "could not parse the lane_results map out of pr.yml");
+
+  const defaults = laneEnv({});
+  for (const [, lane, envVar] of referenced) {
+    assert.ok(
+      envVar in defaults,
+      `lane '${lane}' reads $${envVar} in pr.yml but laneEnv() sets no default for it — ` +
+        `add '${lane}' to laneEnv() or these tests will report it as a failed lane`,
+    );
+  }
+});
 
 test("verify step passes when every lane succeeds", () => {
   const result = runVerifyStep({});
