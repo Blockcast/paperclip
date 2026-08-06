@@ -9884,4 +9884,217 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       expect(issue?.status).not.toBe("in_review");
     });
   });
+
+  // BLO-18106: `escalateStrandedAssignedIssue` commits `blocked` + the durable recovery
+  // action in one transaction, then enqueues the owner wake AFTER that commit. If the
+  // enqueue throws or the process exits in between, the issue is left `blocked` with an
+  // active action and nobody scheduled to look at it -- and
+  // `reconcileStrandedAssignedIssues` cannot repair it, because it scans only
+  // todo/in_progress/in_review. These cover the backstop that reads that repairable state.
+  describe("reconcileStrandedRecoveryWakeBackstop", () => {
+    // Reproduces the gap: escalate for real, then delete the wake the escalation
+    // enqueued. What remains is exactly the post-commit/pre-dispatch crash state.
+    async function seedUndeliveredRecoveryWake() {
+      const fixture = await seedStrandedIssueFixture({
+        status: "in_progress",
+        runStatus: "failed",
+        retryReason: "issue_continuation_needed",
+        runErrorCode: "process_lost",
+        runError: "Process lost before external adapter invocation -- server may have restarted",
+      });
+      // Two prior process-lost runs exhaust the continuation retry budget, so the sweep
+      // escalates instead of requeueing another continuation.
+      await seedPriorProcessLostRun({
+        companyId: fixture.companyId,
+        agentId: fixture.agentId,
+        issueId: fixture.issueId,
+        retryReason: "issue_continuation_needed",
+        createdAt: new Date("2026-03-18T00:02:00.000Z"),
+      });
+      await seedPriorProcessLostRun({
+        companyId: fixture.companyId,
+        agentId: fixture.agentId,
+        issueId: fixture.issueId,
+        retryReason: "process_lost",
+        processLossRetryCount: 1,
+        createdAt: new Date("2026-03-18T00:00:00.000Z"),
+      });
+      heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+      const escalation = await heartbeat.reconcileStrandedAssignedIssues();
+      expect(escalation.escalated).toBe(1);
+
+      const [issue] = await db.select().from(issues).where(eq(issues.id, fixture.issueId));
+      expect(issue?.status).toBe("blocked");
+      const [action] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, fixture.issueId));
+      expect(action).toBeTruthy();
+
+      return { ...fixture, action };
+    }
+
+    // Drives the escalation's own dispatch to a dead end without deleting anything:
+    // the wake leaves `queued` and the run it spawned leaves the active-execution set,
+    // so `hasQueuedIssueWake` / `hasActiveExecutionPath` both read false. That is the
+    // observable state BLO-18106 actually produced -- an owner who was never brought to
+    // the issue -- and it covers the crash-before-enqueue case identically, since the
+    // backstop's eligibility check cannot distinguish "never enqueued" from "enqueued
+    // and died".
+    async function neutralizeRecoveryWake(agentId: string) {
+      const wakes = await db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(
+          and(
+            eq(agentWakeupRequests.agentId, agentId),
+            eq(agentWakeupRequests.reason, "source_scoped_recovery_action"),
+          ),
+        );
+      if (wakes.length === 0) return;
+      const wakeIds = wakes.map((wake) => wake.id);
+      await db
+        .update(agentWakeupRequests)
+        .set({ status: "failed", finishedAt: new Date() })
+        .where(inArray(agentWakeupRequests.id, wakeIds));
+      await db
+        .update(heartbeatRuns)
+        .set({ status: "failed", finishedAt: new Date() })
+        .where(inArray(heartbeatRuns.wakeupRequestId, wakeIds));
+    }
+
+    async function backstopWakes(agentId: string) {
+      const wakes = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(
+          and(
+            eq(agentWakeupRequests.agentId, agentId),
+            eq(agentWakeupRequests.reason, "source_scoped_recovery_action"),
+          ),
+        );
+      return wakes.filter((wake) => {
+        const payload = wake.payload as Record<string, unknown> | null;
+        return payload?.backstop === "stranded_recovery_wake_backstop";
+      });
+    }
+
+    // Push lastAttemptAt outside the 30m cooldown so the backstop is eligible.
+    async function clearBackstopCooldown(actionId: string) {
+      await db
+        .update(issueRecoveryActions)
+        .set({ lastAttemptAt: new Date(Date.now() - 60 * 60 * 1000) })
+        .where(eq(issueRecoveryActions.id, actionId));
+    }
+
+    it("redelivers the owner wake for a blocked issue whose recovery action was never dispatched", async () => {
+      const { companyId, agentId, issueId, action } = await seedUndeliveredRecoveryWake();
+      await neutralizeRecoveryWake(agentId);
+      await clearBackstopCooldown(action.id);
+
+      const result = await heartbeat.reconcileStrandedRecoveryWakeBackstop({ companyId });
+
+      expect(result.healed).toBe(1);
+      expect(result.issueIds).toEqual([issueId]);
+
+      const healedWakes = await backstopWakes(action.ownerAgentId ?? agentId);
+      expect(healedWakes).toHaveLength(1);
+      // `queued` or already `claimed` -- the harness may dispatch it within the same
+      // tick. Either way the owner was actually brought to the issue, which is the
+      // property under test; the status it is caught at is timing, not behaviour.
+      expect(["queued", "claimed"]).toContain(healedWakes[0]?.status);
+      expect(healedWakes[0]).toMatchObject({
+        companyId,
+        reason: "source_scoped_recovery_action",
+        payload: expect.objectContaining({
+          issueId,
+          recoveryActionId: action.id,
+          backstop: "stranded_recovery_wake_backstop",
+        }),
+      });
+
+      // The repair must not re-escalate: status and the action identity are untouched.
+      const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(issue?.status).toBe("blocked");
+      const actionsAfter = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+      expect(actionsAfter).toHaveLength(1);
+      expect(actionsAfter[0]?.id).toBe(action.id);
+    });
+
+    // The suppression regression: BLO-5681 escalates zero-token startup wedges straight
+    // to `blocked` WITHOUT a recovery action, precisely so nothing re-sweeps them. A
+    // backstop that healed on status alone would resurrect the BLO-5378 -> BLO-5676 loop.
+    it("leaves a blocked issue with no active recovery action alone", async () => {
+      const { companyId, agentId, issueId, action } = await seedUndeliveredRecoveryWake();
+      await neutralizeRecoveryWake(agentId);
+      await db.delete(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+
+      const result = await heartbeat.reconcileStrandedRecoveryWakeBackstop({ companyId });
+
+      expect(result.healed).toBe(0);
+      expect(result.noActiveActionSkipped).toBe(1);
+      expect(await backstopWakes(action.ownerAgentId ?? agentId)).toHaveLength(0);
+      const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(issue?.status).toBe("blocked");
+    });
+
+    it("does not double-wake when the escalation's own dispatch already landed", async () => {
+      const { companyId, action } = await seedUndeliveredRecoveryWake();
+      // Deliberately do NOT delete the wake: this is the healthy path, where the
+      // escalation dispatched fine and the backstop must stay out of the way.
+      await clearBackstopCooldown(action.id);
+
+      const result = await heartbeat.reconcileStrandedRecoveryWakeBackstop({ companyId });
+
+      expect(result.healed).toBe(0);
+      expect(result.livePathSkipped).toBe(1);
+    });
+
+    it("does not redeliver once the action's wake budget is exhausted", async () => {
+      const { companyId, agentId, action } = await seedUndeliveredRecoveryWake();
+      await neutralizeRecoveryWake(agentId);
+      await db
+        .update(issueRecoveryActions)
+        .set({
+          lastAttemptAt: new Date(Date.now() - 60 * 60 * 1000),
+          attemptCount: 99,
+          maxAttempts: 5,
+        })
+        .where(eq(issueRecoveryActions.id, action.id));
+
+      const result = await heartbeat.reconcileStrandedRecoveryWakeBackstop({ companyId });
+
+      expect(result.healed).toBe(0);
+      expect(result.exhaustedSkipped).toBe(1);
+    });
+
+    it("rate-limits redelivery with a cooldown so a persistently undeliverable action cannot spin", async () => {
+      const { companyId, agentId, action } = await seedUndeliveredRecoveryWake();
+      await neutralizeRecoveryWake(agentId);
+      await db
+        .update(issueRecoveryActions)
+        .set({ lastAttemptAt: new Date() })
+        .where(eq(issueRecoveryActions.id, action.id));
+
+      const result = await heartbeat.reconcileStrandedRecoveryWakeBackstop({ companyId });
+
+      expect(result.healed).toBe(0);
+      expect(result.cooldownSkipped).toBe(1);
+    });
+
+    it("runs as part of the issue-graph liveness pass", async () => {
+      const { companyId, agentId, issueId, action } = await seedUndeliveredRecoveryWake();
+      await neutralizeRecoveryWake(agentId);
+      await clearBackstopCooldown(action.id);
+
+      const result = await heartbeat.reconcileIssueGraphLiveness({ force: true });
+
+      expect(result.strandedRecoveryWakesHealed).toBeGreaterThanOrEqual(1);
+      expect(result.strandedRecoveryWakeIssueIds).toContain(issueId);
+      expect(companyId).toBeTruthy();
+    });
+  });
 });

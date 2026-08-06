@@ -203,6 +203,16 @@ const STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.staleActiv
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
 const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON = "execution_review_participant_recovery";
 const RESOLVED_DEPENDENCY_WAKE_BACKSTOP_CANDIDATE_LIMIT = 500;
+const STRANDED_RECOVERY_WAKE_BACKSTOP_CANDIDATE_LIMIT = 500;
+// Minimum gap between two backstop heals of the same action. This is the bound that
+// replaces spending a wake attempt: the backstop delivers a wake it did not itself
+// account for (the attempt was spent, and possibly refunded, by the escalation that
+// created the action), so decrementing via `releaseWakeAttempt` on non-delivery would
+// refund an attempt nobody spent and weaken the budget. A cooldown plus the action's
+// creation-anchored `timeoutAt` horizon bounds the loop instead -- see the BLO-18996
+// note in `enqueueSourceScopedStrandedRecoveryWake` on why the horizon, not
+// `attemptCount`, is what actually retires a permanently-undeliverable action.
+const STRANDED_RECOVERY_WAKE_BACKSTOP_COOLDOWN_MS = 30 * 60 * 1000;
 const SESSIONED_LOCAL_ADAPTERS = new Set([
   "claude_local",
   "codex_local",
@@ -1374,6 +1384,7 @@ export function recoveryService(
   const instanceSettings = instanceSettingsService(db);
   const runLogStore = getRunLogStore();
   let resolvedDependencyWakeBackstopCandidateCursor: string | null = null;
+  let strandedRecoveryWakeBackstopCandidateCursor: string | null = null;
 
   const getCurrentUserRedactionOptions = async () => ({
     enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
@@ -5444,7 +5455,15 @@ export function recoveryService(
         }
       }
 
-      await logActivity(db, {
+      // Write through `mutationDb`, not the outer `db`. On the review-stage path
+      // `mutationDb` IS this transaction (see above), so logging on `db` escaped it:
+      // a rollback of the escalation left a phantom `issue.updated` activity row for
+      // a blocking claim that never committed. `deferPublish` then keeps the live/
+      // plugin event on the same footing -- publication is returned to the caller and
+      // fired only after commit, so consumers cannot race the row's visibility or
+      // observe an event for a rolled-back escalation. The non-review path still uses
+      // the outer connection (autocommit) and publishes inline, exactly as before.
+      const publishEscalationActivity = await logActivity(mutationDb as Db, {
         companyId: fresh.companyId,
         actorType: "system",
         actorId: "system",
@@ -5506,15 +5525,28 @@ export function recoveryService(
         hasNewActivitySinceLastAttempt,
         needsHumanDecision,
         blockerIds,
+        publishEscalationActivity,
       };
     });
     if (!escalation) return null;
+
+    // Deferred on the review-stage path only (no-op otherwise): the escalation row is
+    // committed now, so publishing here can no longer emit an event for work a rollback
+    // discarded. Optional because the `isProviderQuotaWait` branch returns before the
+    // activity is written -- that path logs nothing, so there is nothing to publish.
+    escalation.publishEscalationActivity?.();
 
     // The active recovery action committed above is the durable wake intent.
     // Dispatch after releasing the stage row lock: enqueueWakeup may claim the
     // issue synchronously, and running it inside this transaction would either
     // self-block or publish work that an eventual rollback made inapplicable.
-    // A failed dispatch leaves the action active for the next recovery sweep.
+    //
+    // A failed dispatch -- or a process exit between this commit and the enqueue --
+    // leaves the action active but the issue `blocked`, which
+    // `reconcileStrandedAssignedIssues` deliberately does not scan (see the BLO-5681
+    // note on its status filter). `reconcileStrandedRecoveryWakeBackstop`, run from
+    // the issue-graph liveness pass, is what makes that state repairable; without it
+    // this comment's promise of "the next recovery sweep" was false.
     if (input.expectedReviewStage && escalation.recoveryCause === "provider_quota" && !escalation.action.ownerAgentId && escalation.action.returnOwnerAgentId) {
       await ensureProviderQuotaWaitRecoveryMonitor({
         issue: escalation.fresh,
@@ -8003,6 +8035,229 @@ export function recoveryService(
     return result;
   }
 
+  /**
+   * Redelivers the wake for a `blocked` issue whose stranded recovery action is still
+   * active but whose owner was never woken.
+   *
+   * `escalateStrandedAssignedIssue` commits `status = blocked` plus the durable recovery
+   * action in one transaction, then enqueues the owner wake *after* that commit (it has
+   * to: `enqueueWakeup` may claim the issue synchronously and would self-block inside the
+   * stage row lock). If the enqueue throws, or the process exits between commit and
+   * enqueue, the issue is left `blocked` with an active action and nobody scheduled to
+   * look at it. `reconcileStrandedAssignedIssues` cannot repair that, because it scans
+   * only `todo`/`in_progress`/`in_review` -- an exclusion its own BLO-5681 comment relies
+   * on deliberately, so widening that filter is not an option. This backstop is the
+   * repairable-state reader instead, and it is what makes the "leaves the action active
+   * for the next recovery sweep" promise at the escalation dispatch site true.
+   *
+   * Deliberately NOT a re-escalation: it never re-runs routing, rewrites evidence, or
+   * touches issue status. The action already records the owner decision; the only thing
+   * missing is delivery. Issues whose owner already has a queued wake or a live execution
+   * path are skipped, so a merely-slow first dispatch is never doubled.
+   *
+   * BLO-5681 issues are excluded for free: that path escalates to `blocked` without
+   * creating a recovery action at all, so it produces no candidate here and keeps its
+   * intended fire-once behaviour.
+   */
+  async function reconcileStrandedRecoveryWakeBackstop(opts?: {
+    runId?: string | null;
+    companyId?: string | null;
+    now?: Date;
+    cooldownMs?: number;
+  }) {
+    const result = {
+      checked: 0,
+      healed: 0,
+      noActiveActionSkipped: 0,
+      noOwnerSkipped: 0,
+      causeSkipped: 0,
+      exhaustedSkipped: 0,
+      cooldownSkipped: 0,
+      livePathSkipped: 0,
+      interactionSkipped: 0,
+      pauseHoldSkipped: 0,
+      candidateLimitSkipped: 0,
+      deferredOrFailed: 0,
+      enqueueFailed: 0,
+      issueIds: [] as string[],
+    };
+
+    const now = opts?.now ?? new Date();
+    const cooldownMs = Math.max(0, Math.floor(asNumber(opts?.cooldownMs, STRANDED_RECOVERY_WAKE_BACKSTOP_COOLDOWN_MS)));
+
+    const queryCandidates = (afterIssueId: string | null) => {
+      const filters = [
+        eq(issues.status, "blocked"),
+        visibleIssueCondition(),
+        sql`${issues.assigneeAgentId} is not null`,
+      ];
+      if (opts?.companyId) filters.push(eq(issues.companyId, opts.companyId));
+      if (afterIssueId) filters.push(gt(issues.id, afterIssueId));
+      return db
+        .select({
+          id: issues.id,
+          companyId: issues.companyId,
+          identifier: issues.identifier,
+          assigneeAgentId: issues.assigneeAgentId,
+          totalCount: sql<number>`count(*) over()::int`,
+        })
+        .from(issues)
+        .where(and(...filters))
+        .orderBy(asc(issues.id))
+        .limit(STRANDED_RECOVERY_WAKE_BACKSTOP_CANDIDATE_LIMIT);
+    };
+
+    let candidateRows = await queryCandidates(strandedRecoveryWakeBackstopCandidateCursor);
+    if (candidateRows.length === 0 && strandedRecoveryWakeBackstopCandidateCursor) {
+      strandedRecoveryWakeBackstopCandidateCursor = null;
+      candidateRows = await queryCandidates(null);
+    }
+    const totalCandidateCount = candidateRows[0]?.totalCount ?? 0;
+    const candidates = candidateRows.map(({ totalCount: _totalCount, ...candidate }) => candidate);
+    result.checked = candidates.length;
+    result.candidateLimitSkipped = Math.max(0, totalCandidateCount - candidates.length);
+    const lastCandidate = candidates[candidates.length - 1] ?? null;
+    strandedRecoveryWakeBackstopCandidateCursor =
+      result.candidateLimitSkipped > 0 && lastCandidate ? lastCandidate.id : null;
+
+    const candidatesByCompany = new Map<string, typeof candidates>();
+    for (const candidate of candidates) {
+      const companyCandidates = candidatesByCompany.get(candidate.companyId) ?? [];
+      companyCandidates.push(candidate);
+      candidatesByCompany.set(candidate.companyId, companyCandidates);
+    }
+
+    for (const [companyId, companyCandidates] of candidatesByCompany.entries()) {
+      const actionsByIssueId = await recoveryActionsSvc.listActiveForIssues(
+        companyId,
+        companyCandidates.map((candidate) => candidate.id),
+      );
+
+      for (const candidate of companyCandidates) {
+        const action = actionsByIssueId.get(candidate.id) ?? null;
+        if (!action) {
+          result.noActiveActionSkipped += 1;
+          continue;
+        }
+        if (!action.ownerAgentId) {
+          result.noOwnerSkipped += 1;
+          continue;
+        }
+        // Mirror `ensureSourceScopedStrandedRecoveryAction`'s `wakesOwner`: these two
+        // causes are board/monitor-only and never wake an owner, so a missing wake is
+        // the intended state rather than a gap to heal.
+        if (action.cause === "workspace_validation_failed" || action.cause === "configuration_incomplete") {
+          result.causeSkipped += 1;
+          continue;
+        }
+        if (strandedRecoveryWakeAttemptsExhausted(action, now)) {
+          result.exhaustedSkipped += 1;
+          continue;
+        }
+        const lastAttemptAt = action.lastAttemptAt
+          ? new Date(action.lastAttemptAt as Date | string)
+          : null;
+        if (lastAttemptAt && now.getTime() - lastAttemptAt.getTime() < cooldownMs) {
+          result.cooldownSkipped += 1;
+          continue;
+        }
+
+        const ownerAgentId = action.ownerAgentId;
+        if (
+          await hasActiveExecutionPath(companyId, candidate.id, ownerAgentId) ||
+          await hasQueuedIssueWake(companyId, candidate.id, ownerAgentId)
+        ) {
+          result.livePathSkipped += 1;
+          continue;
+        }
+        if (await hasPendingWakeInteraction(companyId, candidate.id)) {
+          result.interactionSkipped += 1;
+          continue;
+        }
+        if (await isAutomaticRecoverySuppressedByPauseHold(db, companyId, candidate.id, treeControlSvc)) {
+          result.pauseHoldSkipped += 1;
+          continue;
+        }
+
+        try {
+          const wake = await deps.enqueueWakeup(ownerAgentId, {
+            source: "assignment",
+            triggerDetail: "system",
+            reason: "source_scoped_recovery_action",
+            idempotencyKey: `source_scoped_recovery_action:${action.id}:${action.attemptCount}:wake_backstop`,
+            payload: withRecoveryModelProfileHint({
+              issueId: candidate.id,
+              sourceIssueId: candidate.id,
+              recoveryActionId: action.id,
+              recoveryCause: action.cause,
+              backstop: "stranded_recovery_wake_backstop",
+            }, "status_only"),
+            requestedByActorType: "system",
+            requestedByActorId: null,
+            contextSnapshot: withRecoveryModelProfileHint({
+              issueId: candidate.id,
+              taskId: candidate.id,
+              wakeReason: "source_scoped_recovery_action",
+              skipIssueComment: true,
+              source: "issue_recovery_action",
+              recoveryActionId: action.id,
+              sourceIssueId: candidate.id,
+              recoveryCause: action.cause,
+              backstop: "stranded_recovery_wake_backstop",
+            }, "status_only"),
+          });
+          if (!wake) {
+            // `enqueueWakeup` returns null on the normal deferred/skipped paths
+            // (capacity deferral, pause hold, cooldown, wake-on-demand disabled).
+            // Not an error, but nothing was healed this pass.
+            result.deferredOrFailed += 1;
+            continue;
+          }
+
+          result.healed += 1;
+          result.issueIds.push(candidate.id);
+
+          await logActivity(db, {
+            companyId,
+            actorType: "system",
+            actorId: "stranded_recovery_wake_backstop",
+            agentId: ownerAgentId,
+            runId: opts?.runId ?? null,
+            action: "issue.updated",
+            entityType: "issue",
+            entityId: candidate.id,
+            details: {
+              source: "recovery.stranded_recovery_wake_backstop",
+              identifier: candidate.identifier,
+              status: "blocked",
+              wakeupRunId: wake.id,
+              recoveryActionId: action.id,
+              recoveryCause: action.cause,
+              recoveryOwnerAgentId: ownerAgentId,
+              recoveryActionAttemptCount: action.attemptCount,
+            },
+          });
+        } catch (err) {
+          result.deferredOrFailed += 1;
+          result.enqueueFailed += 1;
+          logger.warn(
+            { err, issueId: candidate.id, agentId: ownerAgentId, recoveryActionId: action.id },
+            "failed to redeliver stranded recovery wake from backstop",
+          );
+        }
+      }
+    }
+
+    if (result.healed > 0) {
+      logger.warn(
+        { healed: result.healed, issueIds: result.issueIds },
+        "stranded recovery wake backstop redelivered undelivered recovery-action wakes",
+      );
+    }
+
+    return result;
+  }
+
   async function reconcileIssueGraphLiveness(opts?: {
     runId?: string | null;
     force?: boolean;
@@ -8074,6 +8329,14 @@ export function recoveryService(
       dependencyWakeDeferredOrFailed: 0,
       dependencyWakeEnqueueFailed: 0,
       dependencyWakeIssueIds: [] as string[],
+      strandedRecoveryWakeChecked: 0,
+      strandedRecoveryWakesHealed: 0,
+      strandedRecoveryWakeExhaustedSkipped: 0,
+      strandedRecoveryWakeCooldownSkipped: 0,
+      strandedRecoveryWakeLivePathSkipped: 0,
+      strandedRecoveryWakeDeferredOrFailed: 0,
+      strandedRecoveryWakeEnqueueFailed: 0,
+      strandedRecoveryWakeIssueIds: [] as string[],
       issueIds: [] as string[],
       escalationIssueIds: [] as string[],
       retiredRecoveryIssueIds: obsoleteRecoveryCleanup.retiredIssueIds,
@@ -8093,6 +8356,22 @@ export function recoveryService(
     result.dependencyWakeDeferredOrFailed = dependencyWakeBackstop.deferredOrFailed;
     result.dependencyWakeEnqueueFailed = dependencyWakeBackstop.enqueueFailed;
     result.dependencyWakeIssueIds = dependencyWakeBackstop.issueIds;
+
+    // Sibling backstop: heals `blocked` issues whose stranded recovery action never got
+    // its owner wake delivered. Runs unconditionally alongside the dependency backstop --
+    // both repair undelivered wakes, and neither depends on the liveness findings below.
+    const strandedRecoveryWakeBackstop = await reconcileStrandedRecoveryWakeBackstop({
+      runId: opts?.runId ?? null,
+      now,
+    });
+    result.strandedRecoveryWakeChecked = strandedRecoveryWakeBackstop.checked;
+    result.strandedRecoveryWakesHealed = strandedRecoveryWakeBackstop.healed;
+    result.strandedRecoveryWakeExhaustedSkipped = strandedRecoveryWakeBackstop.exhaustedSkipped;
+    result.strandedRecoveryWakeCooldownSkipped = strandedRecoveryWakeBackstop.cooldownSkipped;
+    result.strandedRecoveryWakeLivePathSkipped = strandedRecoveryWakeBackstop.livePathSkipped;
+    result.strandedRecoveryWakeDeferredOrFailed = strandedRecoveryWakeBackstop.deferredOrFailed;
+    result.strandedRecoveryWakeEnqueueFailed = strandedRecoveryWakeBackstop.enqueueFailed;
+    result.strandedRecoveryWakeIssueIds = strandedRecoveryWakeBackstop.issueIds;
 
     if (!autoRecoveryEnabled) {
       result.skippedAutoRecoveryDisabled = findings.length;
@@ -9065,6 +9344,7 @@ export function recoveryService(
     sweepStaleIssueLocks,
     buildIssueGraphLivenessAutoRecoveryPreview,
     reconcileResolvedDependencyWakeBackstop,
+    reconcileStrandedRecoveryWakeBackstop,
     reconcileIssueGraphLiveness,
     readRecoveryTimerIntervalMs,
   };
