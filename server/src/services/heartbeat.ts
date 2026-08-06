@@ -9293,9 +9293,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * delivery logging; the heartbeat lifecycle only records that the work was
    * durably queued. (BLO-17456)
    */
-  async function queueExhaustedPrReviewGateStatus(
+  async function queueFailedPrReviewGateStatus(
     run: typeof heartbeatRuns.$inferSelect,
     contextSnapshot: Record<string, unknown>,
+    reason: "retry_exhausted" | "non_retryable_external_lifecycle",
   ) {
     const target = resolvePrReviewGateStatusTarget(
       contextSnapshot,
@@ -9310,7 +9311,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       sha: target.sha,
       context: target.context,
       state: "failure",
-      description: "Paperclip reviewer run exhausted its automatic retries; no review was posted.",
+      description: reason === "retry_exhausted"
+        ? "Paperclip reviewer run exhausted its automatic retries; no review was posted."
+        : "Paperclip reviewer run ended ambiguously and was not replayed; no review was confirmed.",
       targetUrl: target.prUrl,
       prNumber: target.prNumber,
       prUrl: target.prUrl,
@@ -9321,7 +9324,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       level: "info",
       message:
         delivery.status === "queued" || delivery.status === "processing"
-          ? `Queued PR-review gate status failure delivery for ${target.context} on ${target.repoFullName}@${target.sha.slice(0, 7)} after retry exhaustion`
+          ? `Queued PR-review gate status failure delivery for ${target.context} on ${target.repoFullName}@${target.sha.slice(0, 7)} after ${reason === "retry_exhausted" ? "retry exhaustion" : "a non-retryable external lifecycle failure"}`
           : `PR-review gate status failure delivery for ${target.context} on ${target.repoFullName}@${target.sha.slice(0, 7)} is already ${delivery.status}`,
       payload: {
         deliveryId: delivery.id,
@@ -14057,7 +14060,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // GitHub-evidence read and transient GitHub/token failures can retry.
       // Opt-in and swallowed so status delivery can never alter exhaustion
       // handling.
-      await queueExhaustedPrReviewGateStatus(run, contextSnapshot).catch((error) => {
+      await queueFailedPrReviewGateStatus(run, contextSnapshot, "retry_exhausted").catch((error) => {
         logger.warn(
           { err: error, runId: run.id },
           "failed to queue exhausted PR-review gate status",
@@ -23990,6 +23993,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     run: typeof heartbeatRuns.$inferSelect,
     options: { suppressImmediateRecovery?: boolean } = {},
   ): Promise<boolean> {
+    if (run.errorCode === "job_missing" || run.errorCode === "k8s_pod_schedule_failed") {
+      await queueFailedPrReviewGateStatus(
+        run,
+        parseObject(run.contextSnapshot),
+        "non_retryable_external_lifecycle",
+      ).catch((error) => {
+        logger.warn(
+          { err: error, runId: run.id },
+          "failed to queue non-retryable PR-review gate status",
+        );
+      });
+    }
+
     const runContext = parseObject(run.contextSnapshot);
     const contextIssueId = readNonEmptyString(runContext.issueId);
     const taskKey = deriveTaskKeyWithHeartbeatFallback(runContext, null);
@@ -24107,6 +24123,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const activeParticipant = activeExecutionState?.status === "pending"
         ? activeExecutionState.currentParticipant
         : null;
+      if (issue.executionRunId && issue.executionRunId !== run.id) {
+        logger.info(
+          { issueId: issue.id, finalizingRunId: run.id, activeExecutionRunId: issue.executionRunId },
+          "skipping terminal-run recovery because a newer issue execution is active",
+        );
+        return null;
+      }
       if (
         (run.errorCode === "job_missing" || run.errorCode === "k8s_pod_schedule_failed") &&
         issue.status === "in_review" &&
@@ -24127,10 +24150,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           expectedReviewStage: {
             stageId: finalizedRunStageId,
             participantAgentId: run.agentId,
+            executionRunId: null,
           },
         };
       }
-      if (issue.executionRunId && issue.executionRunId !== run.id) return null;
 
       // Pre-dispatch validation recovery: if the finalizing run failed before
       // adapter launch, surface the primary issue for the blocked-recovery comment path.
@@ -24495,6 +24518,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             expectedReviewStage: {
               stageId: runStageId,
               participantAgentId: run.agentId,
+              executionRunId: null,
             },
           };
         }

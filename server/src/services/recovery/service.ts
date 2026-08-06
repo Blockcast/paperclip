@@ -5124,7 +5124,12 @@ export function recoveryService(
     comment?: string;
     recoveryCause?: StrandedRecoveryCause;
     recoveryOwnerAgentId?: string | null;
-    expectedReviewStage?: { stageId: string; participantAgentId: string };
+    expectedReviewStage?: {
+      stageId: string;
+      participantAgentId: string;
+      executionRunId: string | null;
+    };
+    reviewStageClaimed?: boolean;
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
   }) {
     if (isRoutineExecutionDuplicateSuppressedRun(input.latestRun)) {
@@ -5136,6 +5141,57 @@ export function recoveryService(
         issue: input.issue,
         previousStatus: input.previousStatus,
         latestRun: input.latestRun,
+      });
+    }
+
+    if (input.expectedReviewStage) {
+      const expectedReviewStage = input.expectedReviewStage;
+      const claimed = await db.transaction(async (tx) => {
+        await tx.execute(
+          sql`select pg_advisory_xact_lock(hashtextextended(${input.issue.companyId} || ':' || ${input.issue.id}, 0))`,
+        );
+        const [fresh] = await tx
+          .select()
+          .from(issues)
+          .where(eq(issues.id, input.issue.id))
+          .limit(1)
+          .for("update");
+        if (!fresh || fresh.status !== "in_review") return null;
+        const executionState = parseIssueExecutionState(fresh.executionState);
+        const participant = executionState?.status === "pending"
+          ? executionState.currentParticipant
+          : null;
+        if (
+          executionState?.currentStageId !== expectedReviewStage.stageId ||
+          participant?.type !== "agent" ||
+          participant.agentId !== expectedReviewStage.participantAgentId ||
+          fresh.executionRunId !== expectedReviewStage.executionRunId
+        ) {
+          logger.info(
+            {
+              issueId: fresh.id,
+              expectedReviewStage,
+              actualStageId: executionState?.currentStageId ?? null,
+              actualParticipantAgentId: participant?.type === "agent" ? participant.agentId : null,
+              actualExecutionRunId: fresh.executionRunId,
+            },
+            "skipping stale review-stage recovery escalation",
+          );
+          return null;
+        }
+        return tx
+          .update(issues)
+          .set({ status: "blocked", updatedAt: new Date() })
+          .where(eq(issues.id, fresh.id))
+          .returning()
+          .then((rows) => rows[0] ?? null);
+      });
+      if (!claimed) return null;
+      return escalateStrandedAssignedIssue({
+        ...input,
+        issue: claimed,
+        expectedReviewStage: undefined,
+        reviewStageClaimed: true,
       });
     }
 
@@ -5172,21 +5228,9 @@ export function recoveryService(
       // (attempt-count bookkeeping, wake suppression) rather than no-op. Only a status this
       // function did NOT produce -- e.g. `in_review` from a park that raced it -- is a signal
       // that some other terminal action already claimed this issue for this cause.
-      if (fresh.status !== input.previousStatus && fresh.status !== "blocked") return null;
-      if (input.expectedReviewStage) {
-        const executionState = parseIssueExecutionState(fresh.executionState);
-        const participant = executionState?.status === "pending"
-          ? executionState.currentParticipant
-          : null;
-        if (
-          fresh.status !== "in_review" ||
-          executionState?.currentStageId !== input.expectedReviewStage.stageId ||
-          participant?.type !== "agent" ||
-          participant.agentId !== input.expectedReviewStage.participantAgentId
-        ) {
-          return null;
-        }
-      }
+      if (input.reviewStageClaimed) {
+        if (fresh.status !== "blocked") return null;
+      } else if (fresh.status !== input.previousStatus && fresh.status !== "blocked") return null;
 
       const recoveryCause = resolveStrandedRecoveryCause(input.latestRun, input.recoveryCause);
       const { action, hasNewActivitySinceLastAttempt } = await ensureSourceScopedStrandedRecoveryAction({
@@ -5220,11 +5264,12 @@ export function recoveryService(
         hasNewActivitySinceLastAttempt,
       });
 
-      const updated = await issuesSvc.update(input.issue.id, {
-        status: "blocked",
+      const issueUpdate = {
+        status: "blocked" as const,
         blockedByIssueIds: blockerIds,
         assigneeAgentId: action.ownerAgentId ?? fresh.assigneeAgentId,
-      });
+      };
+      const updated = await issuesSvc.update(input.issue.id, issueUpdate);
       if (!updated) return null;
       if (isProviderQuotaWait) return updated;
 
@@ -6123,6 +6168,7 @@ export function recoveryService(
             expectedReviewStage: {
               stageId: pendingExecutionState.currentStageId,
               participantAgentId,
+              executionRunId: issue.executionRunId,
             },
             comment:
               "Paperclip detected a non-retryable failure on the active review participant's run " +

@@ -32,6 +32,7 @@ import {
   environments,
   executionWorkspaces,
   externalRuntimeReservations,
+  githubCommitStatusDeliveries,
   heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
@@ -1902,8 +1903,19 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       reason: "NotFound",
       name: jobName,
     });
+    const previousGateContext = process.env.PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT;
+    process.env.PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT = "review/ally-complete";
 
-    const result = await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+    let result: Awaited<ReturnType<typeof heartbeat.reapOrphanedRuns>>;
+    try {
+      result = await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+    } finally {
+      if (previousGateContext === undefined) {
+        delete process.env.PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT;
+      } else {
+        process.env.PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT = previousGateContext;
+      }
+    }
 
     expect(result.runIds).toContain(runId);
     expect(mockGithubHasReviewerEvidenceForPr).toHaveBeenCalledWith({
@@ -1928,6 +1940,18 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(retries.every((retry) =>
       (retry.contextSnapshot as Record<string, unknown> | null)?.allowDeliverableWork === false
     )).toBe(true);
+    const gateDeliveries = await db
+      .select()
+      .from(githubCommitStatusDeliveries)
+      .where(eq(githubCommitStatusDeliveries.sourceRunId, runId));
+    expect(gateDeliveries).toHaveLength(1);
+    expect(gateDeliveries[0]).toMatchObject({
+      context: "review/ally-complete",
+      repoFullName: "Blockcast/onprem-k8s",
+      sha: headSha,
+      state: "failure",
+      status: "queued",
+    });
   });
 
   async function recoverClaimedReviewWithUnavailableVerification(kind: "result" | "throw") {
@@ -6407,7 +6431,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   });
 
   it.each(["job_missing", "k8s_pod_schedule_failed"])(
-    "blocks immediate review-participant recovery after %s without replaying deliverable work",
+    "preserves a newer review execution after %s without replaying deliverable work",
     async (errorCode) => {
       mockAdapterExecute.mockResolvedValueOnce({
         exitCode: 1,
@@ -6428,18 +6452,70 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         executionStage: { stageId, stageType: "review" },
       });
 
-      const [issue, runs] = await Promise.all([
+      const [issue, runs, recoveryActions] = await Promise.all([
         db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null),
         db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId)),
+        db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId)),
       ]);
       expect(runs.some((row) =>
         (row.contextSnapshot as Record<string, unknown> | null)?.retryReason ===
           "execution_review_participant_recovery" &&
         (row.contextSnapshot as Record<string, unknown> | null)?.allowDeliverableWork !== false
       )).toBe(false);
-      expect(issue?.status).toBe("blocked");
+      expect(issue).toMatchObject({
+        status: "in_review",
+        executionState: {
+          currentStageId: stageId,
+          currentParticipant: { type: "agent", agentId },
+        },
+      });
+      expect(runs.some((row) => row.id !== runId)).toBe(true);
+      expect(recoveryActions).toHaveLength(0);
     },
   );
+
+  it("does not let an older terminal review run block a newer run in the same stage", async () => {
+    const { companyId, agentId, issueId, runId, stageId } = await seedInReviewParticipantRunFixture();
+    const newerRunId = randomUUID();
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      await db.insert(heartbeatRuns).values({
+        id: newerRunId,
+        companyId,
+        agentId,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status: "running",
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "execution_review_requested",
+          executionStage: { stageId, stageType: "review" },
+        },
+      });
+      await db.update(issues).set({ executionRunId: newerRunId }).where(eq(issues.id, issueId));
+      return {
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+        errorCode: "job_missing",
+        errorMessage: "The older external lifecycle Job disappeared",
+        provider: "test",
+        model: "test-model",
+      };
+    });
+    const heartbeat = createHeartbeat();
+
+    await heartbeat.resumeQueuedRuns();
+    const settledRun = await waitForRunToSettle(heartbeat, runId, 8_000);
+    expect(settledRun).toMatchObject({ status: "failed", errorCode: "job_missing" });
+
+    const [issue, actions] = await Promise.all([
+      db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null),
+      db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId)),
+    ]);
+    expect(issue).toMatchObject({ status: "in_review", executionRunId: newerRunId });
+    expect(actions).toHaveLength(0);
+  });
 
   it("does not let a late prior-stage failure recover a later stage with the same reviewer", async () => {
     const { agentId, issueId, runId } = await seedInReviewParticipantRunFixture();

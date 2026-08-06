@@ -617,7 +617,11 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       latestRun: staleRun,
       recoveryCause: "execution_review_participant_recovery",
       recoveryOwnerAgentId: managerId,
-      expectedReviewStage: { stageId: staleStageId, participantAgentId: managerId },
+      expectedReviewStage: {
+        stageId: staleStageId,
+        participantAgentId: managerId,
+        executionRunId: null,
+      },
     });
 
     expect(updated).toBeNull();
