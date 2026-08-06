@@ -820,6 +820,10 @@ const TRANSIENT_INFRA_CONTINUATION_ERROR_CODES = new Set<string>([
 // so it does not burn retry attempts — but unlike the other members it is not an
 // error condition at all, so it must not escalate as a stranded issue.
 const DEPENDENCY_BLOCKED_ERROR_CODE = "issue_dependencies_blocked";
+// Keep this aligned with heartbeat.ts reconcileResolvedBlockerDependents()'s
+// default minBlockerResolvedAgeMs. A blocker that just completed may still be
+// waiting for the normal edge-triggered dependency-resolved wake to land.
+const DEPENDENCY_RESOLVED_WAKE_GRACE_MS = 5 * 60 * 1000;
 
 const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
   "agent_not_invokable",
@@ -1712,6 +1716,26 @@ export function recoveryService(
       )
       .limit(1)
       .then((rows) => Boolean(rows[0]));
+  }
+
+  async function latestCompletedBlockerAt(companyId: string, blockerIssueIds: string[]) {
+    const uniqueBlockerIssueIds = [...new Set(blockerIssueIds.filter(Boolean))];
+    if (uniqueBlockerIssueIds.length === 0) return null;
+    return db
+      .select({ completedAt: sql<Date | null>`max(${issues.completedAt})` })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          inArray(issues.id, uniqueBlockerIssueIds),
+          eq(issues.status, "done"),
+        ),
+      )
+      .then((rows) => rows[0]?.completedAt ?? null);
+  }
+
+  function isWithinDependencyResolvedWakeGrace(completedAt: Date | null, now = new Date()) {
+    return completedAt !== null && now.getTime() - completedAt.getTime() < DEPENDENCY_RESOLVED_WAKE_GRACE_MS;
   }
 
   async function getLatestAcceptedContinuationInteraction(companyId: string, issueId: string) {
@@ -6574,6 +6598,14 @@ export function recoveryService(
             result.dependencyWaitSkipped += 1;
             result.skipped += 1;
             continue;
+          }
+          if (readiness?.isDependencyReady && readiness.blockerIssueIds.length > 0) {
+            const latestBlockerCompletedAt = await latestCompletedBlockerAt(issue.companyId, readiness.blockerIssueIds);
+            if (isWithinDependencyResolvedWakeGrace(latestBlockerCompletedAt)) {
+              result.dependencyWaitSkipped += 1;
+              result.skipped += 1;
+              continue;
+            }
           }
         }
 
