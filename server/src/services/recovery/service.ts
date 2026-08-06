@@ -24,6 +24,7 @@ import {
   issueRelations,
   issueThreadInteractions,
   issues,
+  workspaceOperations,
 } from "@paperclipai/db";
 import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
 import { runningProcesses } from "../../adapters/index.js";
@@ -661,10 +662,11 @@ const TRANSIENT_INFRA_CONTINUATION_ERROR_CODES = new Set<string>([
 // so it does not burn retry attempts — but unlike the other members it is not an
 // error condition at all, so it must not escalate as a stranded issue.
 const DEPENDENCY_BLOCKED_ERROR_CODE = "issue_dependencies_blocked";
-// Keep this aligned with heartbeat.ts reconcileResolvedBlockerDependents()'s
-// default minBlockerResolvedAgeMs. A blocker that just completed may still be
-// waiting for the normal edge-triggered dependency-resolved wake to land.
-const DEPENDENCY_RESOLVED_WAKE_GRACE_MS = 5 * 60 * 1000;
+// Longer than heartbeat.ts reconcileResolvedBlockerDependents()'s default
+// minBlockerResolvedAgeMs. A blocker that just became dependency-ready may still
+// be waiting for the normal edge-triggered or first sweep dependency-resolved
+// wake to land.
+const DEPENDENCY_RESOLVED_WAKE_GRACE_MS = 6 * 60 * 1000;
 
 const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
   "agent_not_invokable",
@@ -1557,11 +1559,15 @@ export function recoveryService(
       .then((rows) => Boolean(rows[0]));
   }
 
-  async function latestCompletedBlockerAt(companyId: string, blockerIssueIds: string[]) {
+  async function latestDependencyReadinessTransitionAt(companyId: string, blockerIssueIds: string[]) {
     const uniqueBlockerIssueIds = [...new Set(blockerIssueIds.filter(Boolean))];
     if (uniqueBlockerIssueIds.length === 0) return null;
-    return db
-      .select({ completedAt: sql<Date | null>`max(${issues.completedAt})` })
+    const blockerRows = await db
+      .select({
+        id: issues.id,
+        completedAt: issues.completedAt,
+        executionWorkspaceId: issues.executionWorkspaceId,
+      })
       .from(issues)
       .where(
         and(
@@ -1570,11 +1576,102 @@ export function recoveryService(
           eq(issues.status, "done"),
         ),
       )
-      .then((rows) => rows[0]?.completedAt ?? null);
+      .then((rows) => rows);
+
+    const readyAtByBlocker = new Map<string, Date | null>(
+      blockerRows.map((row) => [row.id, row.completedAt ?? null]),
+    );
+    const blockerWorkspacePairs = blockerRows.flatMap((row) =>
+      row.executionWorkspaceId
+        ? [{ blockerIssueId: row.id, executionWorkspaceId: row.executionWorkspaceId }]
+        : []
+    );
+
+    if (blockerWorkspacePairs.length > 0) {
+      const blockerWorkspaceKeys = new Set(
+        blockerWorkspacePairs.map((pair) => `${pair.blockerIssueId}:${pair.executionWorkspaceId}`),
+      );
+      const executionWorkspaceIds = [
+        ...new Set(blockerWorkspacePairs.map((pair) => pair.executionWorkspaceId)),
+      ];
+      const finalizeRows = await db
+        .select({
+          issueId: workspaceOperations.issueId,
+          executionWorkspaceId: workspaceOperations.executionWorkspaceId,
+          startedAt: workspaceOperations.startedAt,
+        })
+        .from(workspaceOperations)
+        .where(
+          and(
+            eq(workspaceOperations.companyId, companyId),
+            inArray(workspaceOperations.executionWorkspaceId, executionWorkspaceIds),
+            eq(workspaceOperations.phase, "workspace_finalize"),
+            eq(workspaceOperations.status, "succeeded"),
+            or(inArray(workspaceOperations.issueId, uniqueBlockerIssueIds), isNull(workspaceOperations.issueId)),
+          ),
+        );
+
+      const latestAttributedByBlockerWorkspace = new Map<string, Date>();
+      const latestUnattributedByWorkspace = new Map<string, Date>();
+      for (const row of finalizeRows) {
+        if (!row.executionWorkspaceId) continue;
+        if (row.issueId) {
+          const key = `${row.issueId}:${row.executionWorkspaceId}`;
+          if (!blockerWorkspaceKeys.has(key)) continue;
+          const current = latestAttributedByBlockerWorkspace.get(key);
+          if (!current || row.startedAt > current) latestAttributedByBlockerWorkspace.set(key, row.startedAt);
+          continue;
+        }
+        const current = latestUnattributedByWorkspace.get(row.executionWorkspaceId);
+        if (!current || row.startedAt > current) latestUnattributedByWorkspace.set(row.executionWorkspaceId, row.startedAt);
+      }
+
+      for (const pair of blockerWorkspacePairs) {
+        const finalizedAt = latestAttributedByBlockerWorkspace.get(`${pair.blockerIssueId}:${pair.executionWorkspaceId}`)
+          ?? latestUnattributedByWorkspace.get(pair.executionWorkspaceId)
+          ?? null;
+        if (!finalizedAt) continue;
+        const current = readyAtByBlocker.get(pair.blockerIssueId) ?? null;
+        if (!current || finalizedAt > current) readyAtByBlocker.set(pair.blockerIssueId, finalizedAt);
+      }
+    }
+
+    let latestReadyAt: Date | null = null;
+    for (const readyAt of readyAtByBlocker.values()) {
+      if (readyAt && (!latestReadyAt || readyAt > latestReadyAt)) latestReadyAt = readyAt;
+    }
+    return latestReadyAt;
   }
 
   function isWithinDependencyResolvedWakeGrace(completedAt: Date | null, now = new Date()) {
     return completedAt !== null && now.getTime() - completedAt.getTime() < DEPENDENCY_RESOLVED_WAKE_GRACE_MS;
+  }
+
+  async function hasObservableDependencyResolvedWakePath(input: {
+    issue: typeof issues.$inferSelect;
+    blockerIssueIds: string[];
+  }) {
+    const blockerIssueIds = [...new Set(input.blockerIssueIds.filter(Boolean))];
+    const assigneeAgentId = input.issue.assigneeAgentId;
+    if (!assigneeAgentId || blockerIssueIds.length === 0) return false;
+    const idempotencyKeys = blockerIssueIds.map((blockerIssueId) =>
+      buildIssueBlockersResolvedWakeIdempotencyKey({
+        dependentIssueId: input.issue.id,
+        resolvedBlockerIssueId: blockerIssueId,
+      })
+    );
+    const existingWake = await findExistingIssueBlockersResolvedWakeForAnyKey(db, {
+      companyId: input.issue.companyId,
+      idempotencyKeys,
+    });
+    if (existingWake) return true;
+
+    const [activeExecutionPath, queuedIssueWake, pendingWakeInteraction] = await Promise.all([
+      hasActiveExecutionPath(input.issue.companyId, input.issue.id, assigneeAgentId),
+      hasQueuedIssueWake(input.issue.companyId, input.issue.id, assigneeAgentId),
+      hasPendingWakeInteraction(input.issue.companyId, input.issue.id),
+    ]);
+    return activeExecutionPath || queuedIssueWake || pendingWakeInteraction;
   }
 
   async function getLatestAcceptedContinuationInteraction(companyId: string, issueId: string) {
@@ -6287,8 +6384,11 @@ export function recoveryService(
             continue;
           }
           if (readiness?.isDependencyReady && readiness.blockerIssueIds.length > 0) {
-            const latestBlockerCompletedAt = await latestCompletedBlockerAt(issue.companyId, readiness.blockerIssueIds);
-            if (isWithinDependencyResolvedWakeGrace(latestBlockerCompletedAt)) {
+            const latestDependencyReadyAt = await latestDependencyReadinessTransitionAt(issue.companyId, readiness.blockerIssueIds);
+            if (
+              isWithinDependencyResolvedWakeGrace(latestDependencyReadyAt) ||
+              await hasObservableDependencyResolvedWakePath({ issue, blockerIssueIds: readiness.blockerIssueIds })
+            ) {
               result.dependencyWaitSkipped += 1;
               result.skipped += 1;
               continue;
