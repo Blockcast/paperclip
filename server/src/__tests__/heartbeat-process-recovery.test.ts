@@ -4697,6 +4697,62 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stranded_issue_recovery")));
     expect(recoveryIssues).toHaveLength(0);
 
+    const recoveryActions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)));
+    expect(recoveryActions).toHaveLength(0);
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(0);
+  });
+
+  it("does not escalate a dependency-blocked continuation while a fresh blockers-resolved wake can still land", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "cancelled",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "issue_dependencies_blocked",
+      runError:
+        "Cancelled because issue dependencies are still blocked; Paperclip will wake the assignee when blockers resolve",
+    });
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const freshDoneBlockerId = randomUUID();
+
+    await db.insert(issues).values({
+      id: freshDoneBlockerId,
+      companyId,
+      title: "Upstream work that just finished",
+      status: "done",
+      priority: "medium",
+      issueNumber: 21,
+      identifier: `${issuePrefix}-21`,
+      completedAt: new Date(),
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: freshDoneBlockerId,
+      relatedIssueId: issueId,
+      type: "blocks",
+    });
+
+    heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.dependencyWaitSkipped).toBe(1);
+    expect(result.escalated).toBe(0);
+    expect(result.issueIds).toEqual([]);
+
+    const source = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(source?.status).toBe("in_progress");
+    expect(source?.assigneeAgentId).toBe(agentId);
+
+    const recoveryActions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)));
+    expect(recoveryActions).toHaveLength(0);
+
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
     expect(comments).toHaveLength(0);
   });
@@ -4724,6 +4780,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       priority: "medium",
       issueNumber: 21,
       identifier: `${issuePrefix}-21`,
+      completedAt: new Date(Date.now() - 10 * 60 * 1000),
     });
     await db.insert(issueRelations).values({
       companyId,
