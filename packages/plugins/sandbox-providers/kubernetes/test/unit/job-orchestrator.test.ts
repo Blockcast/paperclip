@@ -1,5 +1,13 @@
 import { describe, it, expect, vi } from "vitest";
-import { createJob, deleteJob, getJobStatus, findPodForJob, JobTimeoutError, waitForJobCompletion } from "../../src/job-orchestrator.js";
+import {
+  createJob,
+  deleteJob,
+  getJobStatus,
+  findPodForJob,
+  JobAlreadyExistsError,
+  JobTimeoutError,
+  waitForJobCompletion,
+} from "../../src/job-orchestrator.js";
 
 describe("createJob", () => {
   it("calls batch.createNamespacedJob with the manifest", async () => {
@@ -68,6 +76,65 @@ describe("createJob", () => {
       /agent\.env\[HOME\] \(value-not-allowlisted\)/,
     );
     expect(create).not.toHaveBeenCalled();
+  });
+
+  // BLO-22454: a retry of the same run reproduces the same deterministic Job
+  // name and 409s against its own in-flight Job. The 409 must not be an
+  // opaque throw — it should adopt the existing Job's uid.
+  it("adopts the existing Job's uid on a 409 AlreadyExists", async () => {
+    const create = vi.fn().mockRejectedValue({ code: 409 });
+    const read = vi.fn().mockResolvedValue({ metadata: { uid: "existing-uid" } });
+    const clients = { batch: { createNamespacedJob: create, readNamespacedJob: read } };
+    const jobManifest = {
+      apiVersion: "batch/v1",
+      kind: "Job",
+      metadata: { name: "r-1", namespace: "ns", labels: { "paperclip.io/run-id": "run-abc" } },
+      spec: { template: {} },
+    };
+    const result = await createJob(clients as never, "ns", jobManifest);
+    expect(read).toHaveBeenCalledWith({ namespace: "ns", name: "r-1" });
+    expect(result.uid).toBe("existing-uid");
+  });
+
+  // A Job under foreground deletion (deletionTimestamp set) is about to
+  // disappear. Adopting it would attach a run to a Job that never runs.
+  it("does not adopt a Job that is Terminating (deletionTimestamp set)", async () => {
+    const create = vi.fn().mockRejectedValue({ code: 409 });
+    const read = vi.fn().mockResolvedValue({
+      metadata: { uid: "existing-uid", deletionTimestamp: "2026-08-06T12:00:00Z" },
+    });
+    const clients = { batch: { createNamespacedJob: create, readNamespacedJob: read } };
+    const jobManifest = {
+      apiVersion: "batch/v1",
+      kind: "Job",
+      metadata: { name: "r-1", namespace: "ns", labels: { "paperclip.io/run-id": "run-abc" } },
+      spec: { template: {} },
+    };
+    await expect(createJob(clients as never, "ns", jobManifest)).rejects.toBeInstanceOf(JobAlreadyExistsError);
+    await expect(createJob(clients as never, "ns", jobManifest)).rejects.toThrow(/run-abc/);
+    await expect(createJob(clients as never, "ns", jobManifest)).rejects.toThrow(/Terminating/);
+  });
+
+  it("throws a typed error naming the run id when the existing Job can't be read", async () => {
+    const create = vi.fn().mockRejectedValue({ statusCode: 409 });
+    const read = vi.fn().mockRejectedValue(new Error("boom"));
+    const clients = { batch: { createNamespacedJob: create, readNamespacedJob: read } };
+    const jobManifest = {
+      apiVersion: "batch/v1",
+      kind: "Job",
+      metadata: { name: "r-2", namespace: "ns", labels: { "paperclip.io/run-id": "run-xyz" } },
+      spec: { template: {} },
+    };
+    await expect(createJob(clients as never, "ns", jobManifest)).rejects.toThrow(JobAlreadyExistsError);
+    await expect(createJob(clients as never, "ns", jobManifest)).rejects.toThrow(/run-xyz/);
+  });
+
+  it("re-throws non-409 errors from createNamespacedJob unchanged", async () => {
+    const boom = new Error("server exploded");
+    const create = vi.fn().mockRejectedValue(boom);
+    const clients = { batch: { createNamespacedJob: create } };
+    const jobManifest = { apiVersion: "batch/v1", kind: "Job", metadata: { name: "r-3", namespace: "ns" }, spec: { template: {} } };
+    await expect(createJob(clients as never, "ns", jobManifest)).rejects.toBe(boom);
   });
 });
 
