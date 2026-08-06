@@ -2512,7 +2512,10 @@ export function recoveryService(
 
       // The run is finalized; if it never wrote a status of its own, undo the
       // `in_progress` its checkout wrote (BLO-20649).
-      await restoreCheckoutPromotedStatus(tx, input.sourceIssue.id);
+      await restoreCheckoutPromotedStatus(tx, {
+        issueId: input.sourceIssue.id,
+        companyId: input.run.companyId,
+      });
 
       return updatedRun;
     });

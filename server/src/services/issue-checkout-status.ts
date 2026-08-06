@@ -1,4 +1,4 @@
-import { and, eq, isNotNull, sql } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, sql } from "drizzle-orm";
 import { heartbeatRuns, issues } from "@paperclipai/db";
 
 /**
@@ -17,6 +17,34 @@ export const TERMINAL_HEARTBEAT_RUN_STATUS_VALUES = [
   "cancelled",
   "timed_out",
 ] as const;
+
+/**
+ * The guard shared by both restore entry points: a checkout promotion may only be
+ * undone while nothing else has a claim on the row.
+ *
+ * Kept as one expression so the single-issue and batch variants can never drift
+ * apart — a divergence here would show up as an issue demoted out from under a
+ * live run, which is the failure mode this whole guard exists to prevent.
+ */
+const restorableCheckoutPromotion = and(
+  eq(issues.status, "in_progress"),
+  isNotNull(issues.checkoutRestoreStatus),
+  // `x IN (NULL)` is NULL rather than true, so a row with both lock columns
+  // already cleared correctly matches NOT EXISTS and is restored.
+  sql`not exists (
+    select 1 from ${heartbeatRuns}
+    where ${heartbeatRuns.id} in (${issues.checkoutRunId}, ${issues.executionRunId})
+      and ${heartbeatRuns.status} not in ${sql.raw(
+        `(${TERMINAL_HEARTBEAT_RUN_STATUS_VALUES.map((s) => `'${s}'`).join(", ")})`,
+      )}
+  )`,
+);
+
+const restoreCheckoutPromotionSet = () => ({
+  status: sql`${issues.checkoutRestoreStatus}`,
+  checkoutRestoreStatus: null,
+  updatedAt: new Date(),
+});
 
 /**
  * Undo a checkout's `in_progress` promotion when the run released without
@@ -42,40 +70,67 @@ export const TERMINAL_HEARTBEAT_RUN_STATUS_VALUES = [
  * caller that releases only the execution lock must not reset the status while a
  * live checkout still owns the row.
  *
+ * `companyId` is required rather than inferred. Callers reach this from run
+ * context (`gate.issueId`, a run's context snapshot), and an issue id read back
+ * from persisted context is not guaranteed to belong to the company whose lock
+ * the caller just released. Scoping the predicate makes a cross-company reset
+ * structurally impossible instead of relying on every caller to pre-check.
+ *
  * @returns true when a status was actually restored.
  */
 export async function restoreCheckoutPromotedStatus(
   dbOrTx: {
     update: (table: typeof issues) => any;
   },
-  issueId: string,
+  target: { issueId: string; companyId: string },
 ): Promise<boolean> {
   const restored = await dbOrTx
     .update(issues)
-    .set({
-      status: sql`${issues.checkoutRestoreStatus}`,
-      checkoutRestoreStatus: null,
-      updatedAt: new Date(),
-    })
+    .set(restoreCheckoutPromotionSet())
     .where(
       and(
-        eq(issues.id, issueId),
-        eq(issues.status, "in_progress"),
-        isNotNull(issues.checkoutRestoreStatus),
-        // `x IN (NULL)` is NULL rather than true, so a row with both lock columns
-        // already cleared correctly matches NOT EXISTS and is restored.
-        sql`not exists (
-          select 1 from ${heartbeatRuns}
-          where ${heartbeatRuns.id} in (${issues.checkoutRunId}, ${issues.executionRunId})
-            and ${heartbeatRuns.status} not in ${sql.raw(
-              `(${TERMINAL_HEARTBEAT_RUN_STATUS_VALUES.map((s) => `'${s}'`).join(", ")})`,
-            )}
-        )`,
+        eq(issues.id, target.issueId),
+        eq(issues.companyId, target.companyId),
+        restorableCheckoutPromotion,
       ),
     )
     .returning({ id: issues.id });
 
   return restored.length > 0;
+}
+
+/**
+ * Batch form of {@link restoreCheckoutPromotedStatus}, for callers releasing a
+ * run's lock across every sibling issue at once.
+ *
+ * One statement rather than one per issue: the primary finalizer deliberately
+ * clears its lock columns set-based so cleanup scales with the orphan count
+ * without N round-trips, and restoration has to hold that same property or it
+ * silently becomes the slow half of the same transaction.
+ *
+ * @returns the ids actually restored.
+ */
+export async function restoreCheckoutPromotedStatuses(
+  dbOrTx: {
+    update: (table: typeof issues) => any;
+  },
+  target: { issueIds: readonly string[]; companyId: string },
+): Promise<string[]> {
+  if (target.issueIds.length === 0) return [];
+
+  const restored = await dbOrTx
+    .update(issues)
+    .set(restoreCheckoutPromotionSet())
+    .where(
+      and(
+        inArray(issues.id, [...target.issueIds]),
+        eq(issues.companyId, target.companyId),
+        restorableCheckoutPromotion,
+      ),
+    )
+    .returning({ id: issues.id });
+
+  return restored.map((row: { id: string }) => row.id);
 }
 
 /**

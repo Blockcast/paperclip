@@ -47,6 +47,7 @@ import {
   parseExecutiveHoldMarkerTimestamp,
 } from "../services/issues.ts";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
+import { restoreCheckoutPromotedStatus } from "../services/issue-checkout-status.ts";
 import {
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE,
@@ -760,6 +761,70 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
 
       expect(await readIssue(issue.id)).toMatchObject({ status: "todo", restore: null });
       expect(companyId).toBeTruthy();
+    });
+
+    // The fallback checkout paths (stale-execution-lock adoption, and the
+    // clear-then-retry below it) also promote to `in_progress`. A promotion that
+    // does not record what it displaced is unrestorable, so these paths used to
+    // strand a row permanently even with the release side wired up.
+    for (const startStatus of ["todo", "backlog"] as const) {
+      it(`records a restore marker when adopting a stale execution lock from ${startStatus}`, async () => {
+        const { companyId, agentId, issue, runId } = await seedCheckoutFixture(startStatus);
+
+        // A previous run holds the execution lock and is already terminal, so
+        // checkout adopts the row rather than taking the primary path.
+        const deadRunId = randomUUID();
+        await db.insert(heartbeatRuns).values({
+          id: deadRunId,
+          companyId,
+          agentId,
+          status: "failed",
+          invocationSource: "manual",
+        });
+        await db
+          .update(issues)
+          .set({ executionRunId: deadRunId, executionLockedAt: new Date() })
+          .where(eq(issues.id, issue.id));
+
+        await svc.checkout(issue.id, agentId, [startStatus], runId);
+        expect(await readIssue(issue.id)).toMatchObject({
+          status: "in_progress",
+          restore: startStatus,
+        });
+
+        await finishRun(runId);
+        await svc.clearCheckoutRunIfTerminal(issue.id);
+
+        expect(await readIssue(issue.id)).toMatchObject({ status: startStatus, restore: null });
+      });
+    }
+
+    it("does not restore an issue belonging to another company", async () => {
+      // `restoreCheckoutPromotedStatus` takes issue ids from run context, which
+      // is not guaranteed to name an issue in the caller's company. The company
+      // predicate makes a cross-company reset structurally impossible.
+      const { agentId, issue, runId } = await seedCheckoutFixture("todo");
+      await svc.checkout(issue.id, agentId, ["todo"], runId);
+      await finishRun(runId);
+
+      const foreignCompanyId = await seedAssignableAgentCompany();
+      expect(
+        await restoreCheckoutPromotedStatus(db, {
+          issueId: issue.id,
+          companyId: foreignCompanyId,
+        }),
+      ).toBe(false);
+      expect(await readIssue(issue.id)).toMatchObject({ status: "in_progress", restore: "todo" });
+
+      // Same call, correct company: the row is otherwise fully qualified, so
+      // this proves the company predicate is what declined above.
+      expect(
+        await restoreCheckoutPromotedStatus(db, {
+          issueId: issue.id,
+          companyId: issue.companyId,
+        }),
+      ).toBe(true);
+      expect(await readIssue(issue.id)).toMatchObject({ status: "todo", restore: null });
     });
   });
 

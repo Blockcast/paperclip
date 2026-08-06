@@ -5754,7 +5754,7 @@ export function issueService(db: Db) {
         sql`select ${issues.id} from ${issues} where ${issues.id} = ${issueId} for update`,
       );
       const issue = await tx
-        .select({ executionRunId: issues.executionRunId })
+        .select({ executionRunId: issues.executionRunId, companyId: issues.companyId })
         .from(issues)
         .where(eq(issues.id, issueId))
         .then((rows) => rows[0] ?? null);
@@ -5787,7 +5787,9 @@ export function issueService(db: Db) {
         .returning({ id: issues.id })
         .then((rows) => rows[0] ?? null);
 
-      if (updated) await restoreCheckoutPromotedStatus(tx, issueId);
+      if (updated) {
+        await restoreCheckoutPromotedStatus(tx, { issueId, companyId: issue.companyId });
+      }
 
       return Boolean(updated);
     });
@@ -5878,7 +5880,11 @@ export function issueService(db: Db) {
         sql`select ${issues.id} from ${issues} where ${issues.id} = ${issueId} for update`,
       );
       const issue = await tx
-        .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+        .select({
+          checkoutRunId: issues.checkoutRunId,
+          executionRunId: issues.executionRunId,
+          companyId: issues.companyId,
+        })
         .from(issues)
         .where(eq(issues.id, issueId))
         .then((rows) => rows[0] ?? null);
@@ -5927,7 +5933,9 @@ export function issueService(db: Db) {
         .returning({ id: issues.id })
         .then((rows) => rows[0] ?? null);
 
-      if (updated) await restoreCheckoutPromotedStatus(tx, issueId);
+      if (updated) {
+        await restoreCheckoutPromotedStatus(tx, { issueId, companyId: issue.companyId });
+      }
 
       return Boolean(updated);
     });
@@ -9339,6 +9347,11 @@ export function issueService(db: Db) {
             executionAgentNameKey: null,
             executionLockedAt: now,
             status: "in_progress",
+            // This promotion is a checkout like any other, so it must record the
+            // status it displaced. Without the marker `restoreCheckoutPromotedStatus`
+            // can never undo it and the row strands in `in_progress` forever —
+            // the exact BLO-20649 leak, reached through the adoption path.
+            checkoutRestoreStatus: checkoutRestoreStatusExpression,
             updatedAt: now,
           };
           if (current.status !== "in_progress") {
@@ -9395,6 +9408,9 @@ export function issueService(db: Db) {
               // BLO-19848: see the checkout site above.
               executionLockedAt: now,
               status: "in_progress",
+              // Same reasoning as the adoption path above: a checkout that does
+              // not record what it displaced is unrestorable (BLO-20649).
+              checkoutRestoreStatus: checkoutRestoreStatusExpression,
               startedAt: now,
               updatedAt: now,
             })

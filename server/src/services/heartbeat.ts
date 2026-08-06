@@ -201,7 +201,10 @@ import {
   WorkspaceRepoMismatchError,
 } from "./workspace-runtime.js";
 import { issueService } from "./issues.js";
-import { restoreCheckoutPromotedStatus } from "./issue-checkout-status.js";
+import {
+  restoreCheckoutPromotedStatus,
+  restoreCheckoutPromotedStatuses,
+} from "./issue-checkout-status.js";
 import { resolveStaleDependabotAlertWakeIssue } from "./dependabot-alert-issues.js";
 import { createToolGatewayService } from "./tool-gateway.js";
 import { toolAccessService } from "./tool-access.js";
@@ -12928,7 +12931,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         );
       // The gate cancelled this run before it could do anything, so undo the
       // `in_progress` its checkout wrote (BLO-20649).
-      await restoreCheckoutPromotedStatus(db, gate.issueId);
+      await restoreCheckoutPromotedStatus(db, {
+        issueId: gate.issueId,
+        companyId: cancelled.companyId,
+      });
     }
 
     await appendRunEvent(cancelled, await nextRunEventSeq(cancelled.id), {
@@ -13249,6 +13255,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                   updatedAt: now,
                 })
                 .where(and(eq(issues.id, depIssueId), eq(issues.executionRunId, exhausted.id)));
+              // Retry budget is spent and no run will resume this issue, so the
+              // checkout promotion has to come back off (BLO-20649).
+              await restoreCheckoutPromotedStatus(db, {
+                issueId: depIssueId,
+                companyId: exhausted.companyId,
+              });
             }
             return { outcome: "not_promoted", run: exhausted };
           }
@@ -15013,6 +15025,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           eq(issues.executionRunId, run.id),
         ),
       );
+    // The run was cancelled before it could advance anything, so undo the
+    // `in_progress` its checkout wrote (BLO-20649).
+    await restoreCheckoutPromotedStatus(db, { issueId, companyId: run.companyId });
 
     await appendRunEvent(cancelled, await nextRunEventSeq(cancelled.id), {
       eventType: "lifecycle",
@@ -15248,6 +15263,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           eq(issues.executionRunId, run.id),
         ),
       );
+    // The run was cancelled before it could advance anything, so undo the
+    // `in_progress` its checkout wrote (BLO-20649).
+    await restoreCheckoutPromotedStatus(db, { issueId, companyId: run.companyId });
 
     await appendRunEvent(cancelled, await nextRunEventSeq(cancelled.id), {
       eventType: "lifecycle",
@@ -22792,6 +22810,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .where(
           and(eq(issues.companyId, run.companyId), eq(issues.checkoutRunId, run.id)),
         );
+
+      // Ownership of these rows just ended. This is the primary terminal-run
+      // finalizer, so it is also the primary place the BLO-20649 leak was
+      // reachable: a run that checked an issue out and finalized without writing
+      // a status of its own left the checkout's `in_progress` promotion behind
+      // forever. Restoring here — inside the same transaction as the lock clear,
+      // over the same rows already held FOR UPDATE — is what bounds the
+      // `in_progress AND execution_run_id IS NULL` population.
+      //
+      // The helper no-ops on any row a live run still claims, which is what
+      // makes this safe for the retry case described above: when a retry has
+      // taken `executionRunId`, that pointer survives the clear and the retry's
+      // non-terminal status blocks restoration.
+      await restoreCheckoutPromotedStatuses(tx, {
+        issueIds: candidateIssues.map((candidate) => candidate.id),
+        companyId: run.companyId,
+      });
 
       // Deferred-wake promotion is bound to a single primary issue: the run's context
       // issue when present, otherwise the first candidate we found (preserves the
