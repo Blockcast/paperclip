@@ -8179,6 +8179,31 @@ export function recoveryService(
           continue;
         }
 
+        // Claim the redelivery slot before enqueueing. The read above is only a cheap
+        // pre-filter -- it cannot bound the repair rate on its own, because nothing on the
+        // success path advanced `lastAttemptAt`: once the original escalation timestamp
+        // aged past `cooldownMs`, an owner run that failed fast (so it holds neither a
+        // queued wake nor an active execution) made this candidate eligible again on every
+        // liveness pass until `timeoutAt`. Stamping here is what actually applies the
+        // documented cooldown between repairs, and doing it as a conditional UPDATE also
+        // settles the race between two concurrent passes.
+        //
+        // The stamp is deliberately not rolled back when the enqueue below defers or
+        // throws. A capacity deferral or a failing enqueue is exactly the case that would
+        // otherwise re-run every pass, so it wants the same bound as success; the attempt
+        // is still visible via `deferredOrFailed`/`enqueueFailed`, and `timeoutAt` remains
+        // the outer horizon.
+        const claimed = await recoveryActionsSvc.claimWakeAttempt({
+          companyId,
+          actionId: action.id,
+          cooldownMs,
+          now,
+        });
+        if (!claimed) {
+          result.cooldownSkipped += 1;
+          continue;
+        }
+
         try {
           const wake = await deps.enqueueWakeup(ownerAgentId, {
             source: "assignment",

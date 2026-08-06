@@ -10085,6 +10085,44 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       expect(result.cooldownSkipped).toBe(1);
     });
 
+    // The test above only proves the eligibility READ works when `lastAttemptAt` is
+    // already recent. It cannot catch the actual gap, which is on the WRITE side: the
+    // success path used to bump counters and log activity without ever advancing
+    // `lastAttemptAt`. So once the original escalation timestamp aged past 30m, an owner
+    // run that failed fast -- leaving neither a queued wake nor an active execution --
+    // made the candidate eligible again on the very next pass, and every pass after that
+    // until `timeoutAt`: a dense redelivery loop the cooldown was supposed to bound.
+    // Re-running immediately after a successful heal is what distinguishes the two.
+    it("advances the cooldown on a successful redelivery so the next pass cannot immediately re-heal", async () => {
+      const { companyId, agentId, action } = await seedUndeliveredRecoveryWake();
+      await neutralizeRecoveryWake(agentId);
+      await clearBackstopCooldown(action.id);
+
+      const healed = await heartbeat.reconcileStrandedRecoveryWakeBackstop({ companyId });
+      expect(healed.healed).toBe(1);
+
+      const [afterHeal] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.id, action.id));
+      const stampedAt = afterHeal?.lastAttemptAt
+        ? new Date(afterHeal.lastAttemptAt as Date | string).getTime()
+        : null;
+      expect(stampedAt).not.toBeNull();
+      // Inside the cooldown window, i.e. actually re-stamped rather than left at the
+      // hour-old value `clearBackstopCooldown` wrote.
+      expect(Date.now() - (stampedAt ?? 0)).toBeLessThan(30 * 60 * 1000);
+
+      // Put the candidate back into the exact eligible shape -- the healed wake is dead,
+      // so nothing but the cooldown stands between it and a second redelivery.
+      await neutralizeRecoveryWake(agentId);
+      const rerun = await heartbeat.reconcileStrandedRecoveryWakeBackstop({ companyId });
+
+      expect(rerun.healed).toBe(0);
+      expect(rerun.cooldownSkipped).toBe(1);
+      expect(await backstopWakes(action.ownerAgentId ?? agentId)).toHaveLength(1);
+    });
+
     it("runs as part of the issue-graph liveness pass", async () => {
       const { companyId, agentId, issueId, action } = await seedUndeliveredRecoveryWake();
       await neutralizeRecoveryWake(agentId);

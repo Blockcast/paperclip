@@ -1,4 +1,4 @@
-import { and, desc, eq, inArray, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, lte, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { issueRecoveryActions } from "@paperclipai/db";
 import type {
@@ -535,6 +535,47 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
       );
   }
 
+  /**
+   * Atomically claims a redelivery slot by advancing `lastAttemptAt`, but only when the
+   * action's current `lastAttemptAt` is already outside `cooldownMs`. Returns true only
+   * for the caller that won the claim.
+   *
+   * The conditional UPDATE is what makes this safe: a read-then-write would let two
+   * concurrent liveness passes both observe a cooled-down action and both redeliver.
+   * Pushing the cooldown predicate into the WHERE clause makes the database the
+   * arbiter, so exactly one pass can advance the timestamp per window.
+   */
+  async function claimWakeAttempt(input: {
+    companyId: string;
+    actionId: string;
+    cooldownMs: number;
+    now?: Date;
+  }): Promise<boolean> {
+    const now = input.now ?? new Date();
+    const cutoff = new Date(now.getTime() - Math.max(0, input.cooldownMs));
+    const [claimed] = await db
+      .update(issueRecoveryActions)
+      .set({
+        lastAttemptAt: now,
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(issueRecoveryActions.id, input.actionId),
+          eq(issueRecoveryActions.companyId, input.companyId),
+          inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
+          // A never-attempted action (NULL) is claimable; `lte` alone would drop it,
+          // because every SQL comparison against NULL is NULL rather than true.
+          or(
+            isNull(issueRecoveryActions.lastAttemptAt),
+            lte(issueRecoveryActions.lastAttemptAt, cutoff),
+          ),
+        ),
+      )
+      .returning({ id: issueRecoveryActions.id });
+    return Boolean(claimed);
+  }
+
   async function resolveActiveForIssue(
     input: ResolveIssueRecoveryActionInput,
     dbOrTx: DbOrTransaction = db,
@@ -579,5 +620,6 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
     resolveActiveForIssue,
     upsertSourceScoped,
     releaseWakeAttempt,
+    claimWakeAttempt,
   };
 }
