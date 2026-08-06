@@ -18,8 +18,9 @@
 // container's credential-bearing channels unfiltered: literal `env[].value`s,
 // `valueFrom` entries (`secretKeyRef` included), `envFrom` sources, and the
 // secret volumes mounted on it. `job-manifest.ts` then replays all four onto
-// every agent pod (`:491`, `:562`, `:1144`, `:879`). The only entries dropped
-// are empty-string values and unnamed ones.
+// every agent pod (`:491`, `:562`, `:1144`, `:879`). Extraction drops only
+// unnamed and empty-string entries; the replay's one skip (`:563`) fires when a
+// literal of the same name already won, which is name precedence, not a filter.
 //
 // So this guard covers only manifests built by this repo's Kubernetes
 // sandbox-provider path, and provides zero coverage for that adapter. See
