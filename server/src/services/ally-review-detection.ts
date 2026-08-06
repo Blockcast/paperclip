@@ -21,6 +21,26 @@ export function hasAllyConsolidatedReviewHeading(body: string | null | undefined
   return typeof body === "string" && ALLY_CONSOLIDATED_REVIEW_HEADING_PATTERN.test(body);
 }
 
+// Ally's consolidated-review body carries an immutable attestation of which
+// head commit it reviewed, e.g. "Reviewed head: 8f8dcda264aa...". Binding a
+// verdict to this (rather than approximating "posted after the last push"
+// from the head commit's contributor-controlled committer date — a value a
+// pushed `GIT_COMMITTER_DATE` can set to anything) is what lets a gate key on
+// an exact reviewed tree instead of a spoofable timestamp. Requires exactly
+// one full 40-hex-char match: zero means the comment predates this
+// attestation convention (or is malformed), and more than one is ambiguous —
+// both return null rather than guessing which one binds.
+const REVIEWED_HEAD_ATTESTATION_PATTERN = /(?:^|\n)\s*_?\s*reviewed head:\s*([0-9a-f]{40})\s*_?\s*(?=\n|$)/gi;
+
+export function extractAllyReviewedHeadSha(body: string | null | undefined): string | null {
+  if (typeof body !== "string") return null;
+  const attestations = Array.from(
+    body.matchAll(REVIEWED_HEAD_ATTESTATION_PATTERN),
+    (match) => match[1]!.toLowerCase(),
+  );
+  return attestations.length === 1 ? attestations[0]! : null;
+}
+
 // Negation cues that flip an otherwise-actionable bare phrase into a confirmation
 // that nothing is required — e.g. Ally's COMMENTED, zero-finding review 4682219268
 // on TC PR #1115 said "Clean. No changes requested from this lens", which the bare

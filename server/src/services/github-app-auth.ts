@@ -20,6 +20,7 @@
 import { createSign } from "node:crypto";
 
 import { loadConfig } from "../config.js";
+import { extractAllyReviewedHeadSha } from "./ally-review-detection.js";
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 
 const GITHUB_HOST = "github.com";
@@ -273,11 +274,7 @@ function consolidatedReviewHead(body: string): string | null {
   if (!/(?:^|\n)\s*## Ally — Consolidated PR Review\s*(?=\n|$)/.test(body)) {
     return null;
   }
-  const attestations = Array.from(
-    body.matchAll(/(?:^|\n)\s*_?\s*reviewed head:\s*([0-9a-f]{40})\s*_?\s*(?=\n|$)/gi),
-    (match) => match[1]!.toLowerCase(),
-  );
-  return attestations.length === 1 ? attestations[0]! : null;
+  return extractAllyReviewedHeadSha(body);
 }
 
 /**
@@ -480,9 +477,20 @@ export async function githubListIssueCommentBodies(input: {
  * Full issue-comment records (login/body/createdAt), paginated. Unlike
  * `githubListIssueCommentBodies` (page 1 only, bodies only — sufficient for a
  * back-link presence check) this feeds the comment-review gate (BLO-21907),
- * which must rank comments by time against the PR's last push and can't
- * assume the relevant one is on page 1 of a long-lived PR's thread.
+ * which must find the newest Ally consolidated-review comment attesting to
+ * the PR's current head and can't assume it is on page 1 of a long-lived
+ * PR's thread.
+ *
+ * Paginates to exhaustion rather than a fixed page cap: a truncated result
+ * silently authorizing a PR from partial history is worse than a slower
+ * fetch, so `GITHUB_COMMENT_PAGINATION_HARD_LIMIT_PAGES` exists only as a
+ * backstop against a runaway loop (a PR with tens of thousands of comments),
+ * and hitting it returns null (fetch-failed) rather than the partial page set
+ * — see the comment-review gate module docstring for why an incomplete
+ * result must never be evaluated as if it were complete.
  */
+export const GITHUB_COMMENT_PAGINATION_HARD_LIMIT_PAGES = 500;
+
 export async function githubListIssueCommentsWithTimestamps(input: {
   repoFullName: string;
   prNumber: number;
@@ -493,7 +501,7 @@ export async function githubListIssueCommentsWithTimestamps(input: {
   const apiBase = gitHubApiBase(GITHUB_HOST);
   const results: Array<{ login: string | null; body: string; createdAt: string }> = [];
   try {
-    for (let page = 1; page <= 10; page += 1) {
+    for (let page = 1; page <= GITHUB_COMMENT_PAGINATION_HARD_LIMIT_PAGES; page += 1) {
       const url = `${apiBase}/repos/${input.repoFullName}/issues/${input.prNumber}/comments?per_page=100&page=${page}`;
       const res = await ghFetch(url, { headers });
       if (!res.ok) return null;
@@ -510,36 +518,10 @@ export async function githubListIssueCommentsWithTimestamps(input: {
           createdAt: comment.created_at,
         });
       }
-      if (batch.length < 100) break;
+      if (batch.length < 100) return results;
+      if (page === GITHUB_COMMENT_PAGINATION_HARD_LIMIT_PAGES) return null;
     }
     return results;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * The head commit's committer timestamp, used as the PR's "last push" proxy
- * (GitHub exposes no direct "PR last synchronized at" field). Not exact under
- * a rebase/amend that preserves an old committer date, but the comment-review
- * gate only needs an ordering boundary against comment `created_at`, and a
- * push updates the head SHA whose own commit metadata this reads.
- */
-export async function githubGetCommitCommittedAt(input: {
-  repoFullName: string;
-  sha: string;
-}): Promise<string | null> {
-  const token = await getInstallationToken();
-  if (!token) return null;
-  const headers = { ...GITHUB_API_HEADERS, authorization: `Bearer ${token}` };
-  const apiBase = gitHubApiBase(GITHUB_HOST);
-  try {
-    const url = `${apiBase}/repos/${input.repoFullName}/commits/${input.sha}`;
-    const res = await ghFetch(url, { headers });
-    if (!res.ok) return null;
-    const body = (await res.json()) as { commit?: { committer?: { date?: string | null } | null } };
-    const date = body.commit?.committer?.date;
-    return typeof date === "string" ? date : null;
   } catch {
     return null;
   }

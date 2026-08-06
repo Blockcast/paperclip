@@ -1716,7 +1716,14 @@ export function createToolGatewayService(
       { agentId: input.session.agentId },
     );
 
-    await db
+    // Guarded on status="pending": `listActionRequests`' unsigned-request
+    // sweep cancels a pending row that still looks unsigned once it outlives
+    // a grace period. If the (usually credential-fetch-bound) work above —
+    // `connectedRemoteApprovalSnapshot` / `signToolArguments` — took long
+    // enough to race that sweep, this update must not silently resurrect a
+    // cancelled row by writing a valid signature into it and returning an
+    // actionRequestId the caller believes is still live.
+    const [signedActionRequest] = await db
       .update(toolActionRequests)
       .set({
         interactionId: interaction.id,
@@ -1728,7 +1735,16 @@ export function createToolGatewayService(
         expiresAt,
         updatedAt: new Date(),
       })
-      .where(eq(toolActionRequests.id, actionRequest.id));
+      .where(and(eq(toolActionRequests.id, actionRequest.id), eq(toolActionRequests.status, "pending")))
+      .returning();
+    if (!signedActionRequest) {
+      throw new ToolGatewayHttpError(
+        409,
+        "Tool action request was cancelled before it could be signed for approval",
+        "action_request_cancelled_before_signing",
+        { invocationId: input.invocation.id, actionRequestId: actionRequest.id, tool: input.tool.name },
+      );
+    }
 
     await writeToolCallEvent({
       invocationId: input.invocation.id,
@@ -5086,7 +5102,13 @@ export function createToolGatewayService(
           signingSecret: options.toolActionSigningSecret,
         });
         const previewMarkdown = buildHumanizedActionPreview({ tool, argumentsSummary: argumentValidation.summary });
-        await db
+        // Guarded on status="pending" for the same reason as the primary
+        // approval-request path in `requestApprovalForRecordedToolCall`: the
+        // unsigned-request sweep in `listActionRequests` can cancel this row
+        // while `connectedRemoteApprovalSnapshot` above is still in flight,
+        // and a bare update-by-id would silently sign an already-cancelled
+        // request and hand its ID back as if it were still live.
+        const [signedActionRequest] = await db
           .update(toolActionRequests)
           .set({
             canonicalArgumentsHash,
@@ -5096,7 +5118,16 @@ export function createToolGatewayService(
             expiresAt: new Date(Date.now() + 60 * 60 * 1000),
             updatedAt: new Date(),
           })
-          .where(eq(toolActionRequests.id, recorded.actionRequest.id));
+          .where(and(eq(toolActionRequests.id, recorded.actionRequest.id), eq(toolActionRequests.status, "pending")))
+          .returning();
+        if (!signedActionRequest) {
+          throw new ToolGatewayHttpError(
+            409,
+            "Tool action request was cancelled before it could be signed for approval",
+            "action_request_cancelled_before_signing",
+            { invocationId, actionRequestId: recorded.actionRequest.id, tool: tool.name },
+          );
+        }
         await writeToolCallEvent({
           invocationId,
           actionRequestId: recorded.actionRequest.id,

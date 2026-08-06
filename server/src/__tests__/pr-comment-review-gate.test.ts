@@ -10,40 +10,53 @@
  * the merge queue with the finding still outstanding. This predicate is blind
  * to the formal-review surface by design (see the module docstring), so these
  * fixtures only ever populate `comments`.
+ *
+ * Bound to the current head via each comment's own immutable `Reviewed head:
+ * <sha>` attestation rather than a "posted after the last push" timestamp
+ * heuristic — a contributor-controlled commit `committer.date` cannot be used
+ * to hide or backdate a finding relative to a real head.
  */
 import { describe, expect, it } from "vitest";
 
 import { evaluateCommentReviewGate } from "../services/pr-comment-review-gate.js";
 
-const PUSH_1022 = "2026-08-04T18:00:00Z";
+const OLD_HEAD = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const NEW_HEAD = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const ALLY_FINDING_1022 = "2026-08-04T20:09:19Z";
 const ALLY_BOT_LOGIN = "allyblockcast[bot]";
 
-const IMPORTANT_FINDING_BODY = [
-  "## Ally — Consolidated PR Review",
-  "### Important Issues (1)",
-  "- Lane C's oldest page is unclaimable under the current dispatch order.",
-  "### Recommended Action",
-  "Make Lane C progress past an unclaimable oldest page before merge.",
-].join("\n");
+function reviewBody(lines: string[], headSha: string): string {
+  return ["## Ally — Consolidated PR Review", `Reviewed head: ${headSha}`, ...lines].join("\n");
+}
 
-const CLEAN_REVIEW_BODY = [
-  "## Ally — Consolidated PR Review",
-  "### Critical Issues (0)",
-  "### Important Issues (0)",
-  "",
-  "LGTM, no further findings from this pass.",
-].join("\n");
+function importantFindingBody(headSha: string): string {
+  return reviewBody(
+    [
+      "### Important Issues (1)",
+      "- Lane C's oldest page is unclaimable under the current dispatch order.",
+      "### Recommended Action",
+      "Make Lane C progress past an unclaimable oldest page before merge.",
+    ],
+    headSha,
+  );
+}
+
+function cleanReviewBody(headSha: string): string {
+  return reviewBody(
+    ["### Critical Issues (0)", "### Important Issues (0)", "", "LGTM, no further findings from this pass."],
+    headSha,
+  );
+}
 
 function allyComment(body: string, createdAt: string) {
   return { authorLogin: ALLY_BOT_LOGIN, body, createdAt };
 }
 
 describe("evaluateCommentReviewGate — #1022 fixture", () => {
-  it("rejects the #1022 sequence: comment-shaped Important finding after the last push", () => {
+  it("rejects the #1022 sequence: a comment-shaped Important finding attesting to the current head", () => {
     const verdict = evaluateCommentReviewGate({
-      lastPushAt: PUSH_1022,
-      comments: [allyComment(IMPORTANT_FINDING_BODY, ALLY_FINDING_1022)],
+      headSha: NEW_HEAD,
+      comments: [allyComment(importantFindingBody(NEW_HEAD), ALLY_FINDING_1022)],
     });
     expect(verdict.state).toBe("failure");
     if (verdict.state === "failure") {
@@ -57,47 +70,45 @@ describe("evaluateCommentReviewGate — #1022 fixture", () => {
     // blocking comment reproduces #1022's actual gate input regardless of
     // what the reviews array said.
     const verdict = evaluateCommentReviewGate({
-      lastPushAt: PUSH_1022,
-      comments: [allyComment(IMPORTANT_FINDING_BODY, ALLY_FINDING_1022)],
+      headSha: NEW_HEAD,
+      comments: [allyComment(importantFindingBody(NEW_HEAD), ALLY_FINDING_1022)],
     });
     expect(verdict.state).toBe("failure");
   });
 
-  it("accepts an addressed-then-re-reviewed sequence: a push clears the old finding, a clean re-review after it passes", () => {
-    const secondPush = "2026-08-05T03:20:00Z";
+  it("accepts an addressed-then-re-reviewed sequence: a push clears the old finding, a clean re-review of the new head passes", () => {
     const reReview = "2026-08-05T10:00:00Z";
     const verdict = evaluateCommentReviewGate({
-      lastPushAt: secondPush,
+      headSha: NEW_HEAD,
       comments: [
-        allyComment(IMPORTANT_FINDING_BODY, ALLY_FINDING_1022), // predates secondPush
-        allyComment(CLEAN_REVIEW_BODY, reReview), // postdates secondPush
+        allyComment(importantFindingBody(OLD_HEAD), ALLY_FINDING_1022), // attests to the superseded head
+        allyComment(cleanReviewBody(NEW_HEAD), reReview), // attests to the current head
       ],
     });
     expect(verdict.state).toBe("success");
   });
 
-  it("does not block when the only unresolved finding predates the last push", () => {
-    const secondPush = "2026-08-05T03:20:00Z";
+  it("does not block when the only unresolved finding attests to a superseded head", () => {
     const verdict = evaluateCommentReviewGate({
-      lastPushAt: secondPush,
-      comments: [allyComment(IMPORTANT_FINDING_BODY, ALLY_FINDING_1022)], // predates secondPush, no re-review yet
+      headSha: NEW_HEAD,
+      comments: [allyComment(importantFindingBody(OLD_HEAD), ALLY_FINDING_1022)], // no comment yet for NEW_HEAD
     });
     expect(verdict.state).toBe("success");
     expect(verdict.reason).toMatch(/no ally consolidated-review comment/i);
   });
 
   it("does not block a PR with no Ally comment at all — formal-review-only PRs are unaffected", () => {
-    const verdict = evaluateCommentReviewGate({ lastPushAt: PUSH_1022, comments: [] });
+    const verdict = evaluateCommentReviewGate({ headSha: NEW_HEAD, comments: [] });
     expect(verdict.state).toBe("success");
   });
 
   it("ignores a non-Ally comment even if it uses similar blocking language", () => {
     const verdict = evaluateCommentReviewGate({
-      lastPushAt: PUSH_1022,
+      headSha: NEW_HEAD,
       comments: [
         {
           authorLogin: "human-reviewer",
-          body: "### Important Issues (1)\nFix before merge.",
+          body: `Reviewed head: ${NEW_HEAD}\n### Important Issues (1)\nFix before merge.`,
           createdAt: ALLY_FINDING_1022,
         },
       ],
@@ -105,20 +116,26 @@ describe("evaluateCommentReviewGate — #1022 fixture", () => {
     expect(verdict.state).toBe("success");
   });
 
-  it("treats a comment exactly at the push timestamp as predating it, not superseding it", () => {
+  it("does not block when the comment carries no parseable head attestation", () => {
     const verdict = evaluateCommentReviewGate({
-      lastPushAt: ALLY_FINDING_1022,
-      comments: [allyComment(IMPORTANT_FINDING_BODY, ALLY_FINDING_1022)],
+      headSha: NEW_HEAD,
+      comments: [
+        {
+          authorLogin: ALLY_BOT_LOGIN,
+          body: "## Ally — Consolidated PR Review\n### Important Issues (1)\nFix before merge.",
+          createdAt: ALLY_FINDING_1022,
+        },
+      ],
     });
     expect(verdict.state).toBe("success");
   });
 
-  it("resolves on the most recent Ally comment since the push, not the first one", () => {
+  it("resolves on the most recent Ally comment for the head, not the first one", () => {
     const verdict = evaluateCommentReviewGate({
-      lastPushAt: PUSH_1022,
+      headSha: NEW_HEAD,
       comments: [
-        allyComment(CLEAN_REVIEW_BODY, "2026-08-04T19:00:00Z"),
-        allyComment(IMPORTANT_FINDING_BODY, ALLY_FINDING_1022),
+        allyComment(cleanReviewBody(NEW_HEAD), "2026-08-04T19:00:00Z"),
+        allyComment(importantFindingBody(NEW_HEAD), ALLY_FINDING_1022),
       ],
     });
     expect(verdict.state).toBe("failure");
@@ -126,10 +143,10 @@ describe("evaluateCommentReviewGate — #1022 fixture", () => {
 
   it("clears a blocking finding when a later Ally pass over the same head reports it dispositioned", () => {
     const verdict = evaluateCommentReviewGate({
-      lastPushAt: PUSH_1022,
+      headSha: NEW_HEAD,
       comments: [
-        allyComment(IMPORTANT_FINDING_BODY, ALLY_FINDING_1022),
-        allyComment(CLEAN_REVIEW_BODY, "2026-08-04T21:00:00Z"),
+        allyComment(importantFindingBody(NEW_HEAD), ALLY_FINDING_1022),
+        allyComment(cleanReviewBody(NEW_HEAD), "2026-08-04T21:00:00Z"),
       ],
     });
     expect(verdict.state).toBe("success");
@@ -137,15 +154,27 @@ describe("evaluateCommentReviewGate — #1022 fixture", () => {
 
   it("ignores spoofed consolidated-review headings from non-Ally authors", () => {
     const verdict = evaluateCommentReviewGate({
-      lastPushAt: PUSH_1022,
+      headSha: NEW_HEAD,
       comments: [
-        allyComment(IMPORTANT_FINDING_BODY, ALLY_FINDING_1022),
+        allyComment(importantFindingBody(NEW_HEAD), ALLY_FINDING_1022),
         {
           authorLogin: "some-contributor",
-          body: CLEAN_REVIEW_BODY,
+          body: cleanReviewBody(NEW_HEAD),
           createdAt: "2026-08-04T21:00:00Z",
         },
       ],
+    });
+    expect(verdict.state).toBe("failure");
+  });
+
+  it("cannot be fooled by a future-dated commit: a comment attesting to the current head still blocks regardless of createdAt ordering against commit metadata", () => {
+    // Simulates the critical finding this replaces a "since last push" time
+    // boundary for: a contributor-controlled committer date could otherwise
+    // make this comment look like it predates the push. Head-attestation
+    // matching never looks at commit metadata at all.
+    const verdict = evaluateCommentReviewGate({
+      headSha: NEW_HEAD,
+      comments: [allyComment(importantFindingBody(NEW_HEAD), "2020-01-01T00:00:00Z")],
     });
     expect(verdict.state).toBe("failure");
   });

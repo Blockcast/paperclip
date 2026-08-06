@@ -20,6 +20,7 @@ import {
   getInstallationTokenResult,
   githubHasReviewerEvidenceForPr,
   githubGetLatestCommitStatusForContext,
+  githubListIssueCommentsWithTimestamps,
   githubPostCommitStatus,
   githubPostCommitStatusDetailed,
   githubReviewerAppSlug,
@@ -683,5 +684,63 @@ describe("githubPostCommitStatus (BLO-17456)", () => {
     await expect(
       githubPostCommitStatus({ repoFullName, sha, context, state: "failure" }),
     ).resolves.toBe(false);
+  });
+});
+
+describe("githubListIssueCommentsWithTimestamps (BLO-21907)", () => {
+  const repoFullName = "Blockcast/paperclip";
+  const prNumber = 1049;
+
+  function commentPage(count: number, pageLabel: string) {
+    return Array.from({ length: count }, (_, i) => ({
+      user: { login: "allyblockcast[bot]" },
+      body: `comment ${pageLabel}-${i}`,
+      created_at: "2026-08-04T20:09:19Z",
+    }));
+  }
+
+  function stubPagedComments(pages: Array<Array<Record<string, unknown>>>) {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string | URL) => {
+        const u = String(url);
+        if (u.includes("/access_tokens")) return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
+        const pageMatch = u.match(/[?&]page=(\d+)/);
+        const page = pageMatch ? Number(pageMatch[1]) : 1;
+        return jsonResponse(pages[page - 1] ?? []);
+      }),
+    );
+  }
+
+  it("paginates past the old 10-page cap and returns the full comment set", async () => {
+    setCreds();
+    // 12 full pages (1,200 comments) then a short 13th page — strictly more
+    // than the old fixed 10-page/1,000-comment cap this replaces.
+    const pages = [...Array.from({ length: 12 }, (_, i) => commentPage(100, `p${i + 1}`)), commentPage(37, "p13")];
+    stubPagedComments(pages);
+
+    const result = await githubListIssueCommentsWithTimestamps({ repoFullName, prNumber });
+
+    expect(result).not.toBeNull();
+    expect(result).toHaveLength(12 * 100 + 37);
+  });
+
+  it("returns null instead of a truncated result when the pagination safety backstop is hit on a full page", async () => {
+    setCreds();
+    // Every page up to and including the hard limit is full (100 items), so
+    // there could be more comments past it — reporting "fetch failed" is the
+    // correct signal, not silently authorizing from a partial history.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string | URL) => {
+        const u = String(url);
+        if (u.includes("/access_tokens")) return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
+        return jsonResponse(commentPage(100, "full"));
+      }),
+    );
+
+    const result = await githubListIssueCommentsWithTimestamps({ repoFullName, prNumber });
+
+    expect(result).toBeNull();
   });
 });
