@@ -83,6 +83,9 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
     expect(serverDockerfile).toContain("add anthropic/claude-opus-5 to the");
     expect(serverDockerfile).toContain("bound the pre-Job live-Job list to 15 seconds");
     expect(serverDockerfile).toContain("PEN-1305 permission.bash env-dump deny");
+    expect(serverDockerfile).toContain(
+      "start completion grace only after\n# the log stream exits and preserve successful finite-timeout runs",
+    );
     expect(serverDockerfile).toContain("disable opencode's turn-zero workspace");
     expect(serverDockerfile).toContain("snapshot: false");
     expect(serverDockerfile).toContain("opencode config/auth writers respect XDG_*");

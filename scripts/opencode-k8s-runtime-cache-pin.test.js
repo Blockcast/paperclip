@@ -19,4 +19,8 @@ test("Dockerfile pins opencode_k8s and runs its security and execution regressio
   assert.doesNotMatch(dockerfile, /OPENCODE_K8S_REF=861227d3d0726b43bf7e4a5421d076e3ab8de0af/);
   assert.doesNotMatch(dockerfile, /OPENCODE_K8S_REF=cac7d0b53fa420beb756919561004f1b5b709fa2/);
   assert.doesNotMatch(dockerfile, /OPENCODE_K8S_REF=42d2d995a2f966e134f1b62a637497f9fe98c101/);
+  // ed0331690432d3c37cd7ed190ca1066c840b30c3 is 4 commits ahead of the BLO-22922
+  // fix (8f4272675db81e95bf393679a912d9037df3d9ab); this pin must never regress
+  // to a pre-fix commit that reports exitCode:0 runs as timed_out.
+  assert.doesNotMatch(dockerfile, /OPENCODE_K8S_REF=83197d46b0784c941801165464d48aca1b979909/);
 });
