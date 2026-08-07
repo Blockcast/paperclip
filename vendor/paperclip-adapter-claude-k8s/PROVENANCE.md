@@ -95,7 +95,7 @@ A manifest of `sha256(path)` over all 37 in-tree files, sorted by path under
 `LC_ALL=C`, itself hashes to:
 
 ```
-57fa15ad58c5073bc47ffc93fa3a90dc339d9def09336325ce2891ad6e63f2ba
+0f099cc02bf141beb448d841b4fccc4b22e88aa3b9c4298c11152fa76a5854bb
 ```
 
 Regenerate with:
@@ -149,6 +149,7 @@ upstream**, so they are enumerated here rather than left implicit.
 |---|---|---|
 | `cd1630512` | `src/server/env-guard.ts`, `src/server/env-guard.test.ts` | Anchored the `SAFE_ENV_INSPECTION_RE` safe-helper exception to a whole-command invocation. It was evaluated before the full-dump detector and matched the helper anywhere in the command, so a `<safe-helper> && <dump>` compound returned `allow` and executed the dump. Addresses an Ally review finding on Blockcast/paperclip#1092. |
 | `cd1630512` | `src/server/k8s-client.ts`, `src/server/k8s-client.test.ts` (new) | Keyed the `getSelfPodInfo()` cache by (kubeconfig path, namespace, hostname). It memoized into one process-global slot while callers pass a per-request kubeconfig, leaking the first execution's image, scheduling, PVC, env and Secret references into later executions against a different cluster. Same review. |
+| `8f4f7262a` | `src/server/env-guard.ts`, `src/server/env-guard.test.ts` | Treated `\r`/`\n` as command separators in both classifier copies. Anchoring the helper exception (above) closed the `&&`/`;`/`\|` compounds but not a literal newline: JS `$` without `m` is end-of-input and the argument tail's `\s` spanned newlines, so `paperclip-safe-env\nenv` was a whole-command match, and the dump detector did not treat `\n` as a boundary either. Follow-up on the same Ally review of Blockcast/paperclip#1092. |
 
 The two cherry-picked commits in the composition above remain upstream commits
 authored against the fork, not Blockcast-local patches.
