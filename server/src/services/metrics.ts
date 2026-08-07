@@ -20,6 +20,8 @@
  * @module server/services/metrics
  */
 
+import { githubWorkflowRunCompletions, type Db } from "@paperclipai/db";
+import { gte, sql } from "drizzle-orm";
 import { Counter, Gauge, Registry, collectDefaultMetrics } from "prom-client";
 import { resetDepBlockedMetrics, snapshotDepBlockedMetrics } from "./dep-blocked-metrics.js";
 import {
@@ -482,6 +484,52 @@ export function normalizeGithubSuppressionCause(cause: string | null | undefined
     : UNKNOWN_GITHUB_SUPPRESSION_CAUSE;
 }
 
+/**
+ * Terminal-conclusion counter for GitHub Actions `workflow_run` completions
+ * received over the webhook (BLO-21078). Exists to make a fleet-wide mass
+ * runner-kill visible as a metric instead of only as a wave of misattributed
+ * red checks: on 2026-08-02 19:34–19:57Z, GitHub gracefully cancelled
+ * multiple in-flight `PR` workflow runs across unrelated PRs/branches (post
+ * steps still ran, ruling out an ARC/k8s runner death) with no ARC event
+ * spike and no repo-side cancel automation to explain it — the incident had
+ * no metric surface at all, so the only way to notice it was an author
+ * manually reading job conclusions.
+ *
+ * Exposed as a DB-derived rolling-window gauge, labeled only by the bounded
+ * `conclusion` (see {@link KNOWN_WORKFLOW_RUN_CONCLUSIONS}). Deliberately
+ * excludes repo/workflow name to keep cardinality fixed at
+ * `KNOWN_WORKFLOW_RUN_CONCLUSIONS.length + 1` regardless of fleet growth.
+ * Because every API replica reads the same durable ledger, alerts must use
+ * `max(...)` across scrape targets rather than `sum(...)`. A sustained burst
+ * of `cancelled` (as opposed to the `failure` rate, which is ordinary
+ * background noise) is the alerting signal — see the
+ * `PaperclipGithubWorkflowRunMassCancellation` rule.
+ */
+export const GITHUB_WORKFLOW_RUN_CONCLUSION_METRIC = "paperclip_github_workflow_run_conclusion_recent_count";
+export const GITHUB_WORKFLOW_RUN_CONCLUSION_WINDOW_MS = 15 * 60 * 1000;
+
+export const KNOWN_WORKFLOW_RUN_CONCLUSIONS = [
+  "success",
+  "failure",
+  "cancelled",
+  "skipped",
+  "timed_out",
+  "action_required",
+  "neutral",
+  "stale",
+  "startup_failure",
+] as const;
+
+export const UNKNOWN_WORKFLOW_RUN_CONCLUSION = "other";
+
+const knownWorkflowRunConclusionSet: ReadonlySet<string> = new Set(KNOWN_WORKFLOW_RUN_CONCLUSIONS);
+
+export function normalizeWorkflowRunConclusion(conclusion: string | null | undefined): string {
+  return typeof conclusion === "string" && knownWorkflowRunConclusionSet.has(conclusion)
+    ? conclusion
+    : UNKNOWN_WORKFLOW_RUN_CONCLUSION;
+}
+
 export const KNOWN_AUTH_OPERATIONS = [
   "oidc_start",
   "oidc_callback",
@@ -755,6 +803,7 @@ let githubReviewRequestSuppression: Counter<"cause" | "reason"> | null = null;
 let githubReviewRequestDeadLetterUnresolved: Gauge<"reason"> | null = null;
 let agentWakeupTerminalFailedUnresolved: Gauge<"error_code" | "scope"> | null = null;
 let agentWakeupTerminalFailedOldestAge: Gauge<"scope"> | null = null;
+let githubWorkflowRunConclusion: Gauge<"conclusion"> | null = null;
 let authRequest: Counter<"operation" | "outcome"> | null = null;
 
 function ensureRegistry(): {
@@ -776,6 +825,7 @@ function ensureRegistry(): {
   githubReviewRequestDeadLetterUnresolvedGauge: Gauge<"reason">;
   agentWakeupTerminalFailedUnresolvedGauge: Gauge<"error_code" | "scope">;
   agentWakeupTerminalFailedOldestAgeGauge: Gauge<"scope">;
+  githubWorkflowRunConclusionGauge: Gauge<"conclusion">;
   authRequestCounter: Counter<"operation" | "outcome">;
 } {
   if (
@@ -797,6 +847,7 @@ function ensureRegistry(): {
     || !githubReviewRequestDeadLetterUnresolved
     || !agentWakeupTerminalFailedUnresolved
     || !agentWakeupTerminalFailedOldestAge
+    || !githubWorkflowRunConclusion
     || !authRequest
   ) {
     registry = new Registry();
@@ -1046,6 +1097,19 @@ function ensureRegistry(): {
     for (const scope of TERMINAL_FAILED_WAKE_SCOPES) {
       agentWakeupTerminalFailedOldestAge.set({ scope }, 0);
     }
+    githubWorkflowRunConclusion = new Gauge({
+      name: GITHUB_WORKFLOW_RUN_CONCLUSION_METRIC,
+      help:
+        "DB-derived count of completed GitHub Actions workflow_run webhooks seen in the "
+        + "last 15 minutes, labeled by bounded conclusion (BLO-21078). This is refreshed "
+        + "from the durable completion ledger before /metrics is rendered, so an API "
+        + "process crash after webhook commit cannot permanently lose the observation.",
+      labelNames: ["conclusion"],
+      registers: [registry],
+    });
+    for (const conclusion of [...KNOWN_WORKFLOW_RUN_CONCLUSIONS, UNKNOWN_WORKFLOW_RUN_CONCLUSION]) {
+      githubWorkflowRunConclusion.set({ conclusion }, 0);
+    }
     authRequest = new Counter({
       name: AUTH_REQUEST_METRIC,
       help:
@@ -1082,6 +1146,7 @@ function ensureRegistry(): {
     githubReviewRequestDeadLetterUnresolvedGauge: githubReviewRequestDeadLetterUnresolved,
     agentWakeupTerminalFailedUnresolvedGauge: agentWakeupTerminalFailedUnresolved,
     agentWakeupTerminalFailedOldestAgeGauge: agentWakeupTerminalFailedOldestAge,
+    githubWorkflowRunConclusionGauge: githubWorkflowRunConclusion,
     authRequestCounter: authRequest,
   };
 }
@@ -1464,6 +1529,37 @@ export function setAgentWakeupTerminalFailedOldestAgeSeconds(
   }
 }
 
+export async function refreshGithubWorkflowRunConclusionMetrics(
+  db: Pick<Db, "select">,
+  opts: { now?: Date; windowMs?: number } = {},
+): Promise<Record<string, number>> {
+  const windowMs = opts.windowMs ?? GITHUB_WORKFLOW_RUN_CONCLUSION_WINDOW_MS;
+  const now = opts.now ?? new Date();
+  const since = new Date(now.getTime() - windowMs);
+  const counts: Record<string, number> = Object.fromEntries(
+    [...KNOWN_WORKFLOW_RUN_CONCLUSIONS, UNKNOWN_WORKFLOW_RUN_CONCLUSION].map((conclusion) => [conclusion, 0]),
+  );
+  const rows = await db
+    .select({
+      conclusion: githubWorkflowRunCompletions.conclusion,
+      count: sql<number>`count(*)::int`,
+    })
+    .from(githubWorkflowRunCompletions)
+    .where(gte(githubWorkflowRunCompletions.createdAt, since))
+    .groupBy(githubWorkflowRunCompletions.conclusion);
+
+  for (const row of rows) {
+    const conclusion = normalizeWorkflowRunConclusion(row.conclusion);
+    counts[conclusion] = (counts[conclusion] ?? 0) + Number(row.count ?? 0);
+  }
+
+  const gauge = ensureRegistry().githubWorkflowRunConclusionGauge;
+  for (const [conclusion, count] of Object.entries(counts)) {
+    gauge.set({ conclusion }, count);
+  }
+  return counts;
+}
+
 export function recordAuthRequest(input: {
   operation: string | null | undefined;
   outcome: string | null | undefined;
@@ -1520,6 +1616,7 @@ export function __resetMetricsForTest(): void {
   githubReviewRequestDeadLetterUnresolved = null;
   agentWakeupTerminalFailedUnresolved = null;
   agentWakeupTerminalFailedOldestAge = null;
+  githubWorkflowRunConclusion = null;
   authRequest = null;
   resetDepBlockedMetrics();
   resetBlockerResolvedWakeMetrics();

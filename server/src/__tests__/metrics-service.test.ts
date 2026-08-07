@@ -28,15 +28,19 @@ import {
   recordIsolatedRunStarted,
   renderMetrics,
   EXTERNAL_LIFECYCLE_RUNNING_RUNS_METRIC,
+  GITHUB_WORKFLOW_RUN_CONCLUSION_METRIC,
   KNOWN_PROCESS_LOSS_CLASSIFICATIONS,
+  KNOWN_WORKFLOW_RUN_CONCLUSIONS,
   PROCESS_LOST_LIVENESS_NULL_METRIC,
   PROCESS_LOST_TOTAL_METRIC,
   UNKNOWN_EXTERNAL_ADAPTER,
   UNKNOWN_PROCESS_LOSS_CLASSIFICATION,
   UNKNOWN_PROCESS_LOST_BUCKET,
+  UNKNOWN_WORKFLOW_RUN_CONCLUSION,
   normalizeExternalAdapter,
   normalizeProcessLossClassification,
   normalizeProcessLostBucket,
+  normalizeWorkflowRunConclusion,
   recordProcessLost,
   recordProcessLostLivenessNull,
   setExternalLifecycleRunningRuns,
@@ -585,6 +589,23 @@ describe("recordProcessLost + renderMetrics (BLO-16184 numerator)", () => {
     );
   });
 });
+
+describe("GitHub workflow_run conclusion metric (BLO-21078 mass-cancellation detector numerator)", () => {
+  it("registers the DB-backed gauge so /metrics carries its TYPE line before any refresh", async () => {
+    const { body } = await renderMetrics();
+    expect(body).toContain(`# TYPE ${GITHUB_WORKFLOW_RUN_CONCLUSION_METRIC} gauge`);
+  });
+
+  it("keeps every known conclusion and collapses the rest to other", () => {
+    for (const c of KNOWN_WORKFLOW_RUN_CONCLUSIONS) {
+      expect(normalizeWorkflowRunConclusion(c)).toBe(c);
+    }
+    for (const bad of ["queued", "in_progress", "", null, undefined]) {
+      expect(normalizeWorkflowRunConclusion(bad as string)).toBe(UNKNOWN_WORKFLOW_RUN_CONCLUSION);
+    }
+  });
+});
+
 
 describe("setExternalLifecycleRunningRuns (BLO-16184 denominator #1)", () => {
   it("writes an explicit 0 for a known adapter with no running runs (drop-to-0 observable)", async () => {

@@ -50,10 +50,12 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import {
+  GITHUB_WORKFLOW_RUN_CONCLUSION_METRIC,
   GITHUB_REVIEW_REQUEST_DELIVERY_METRIC,
   GITHUB_REVIEW_REQUEST_SUPPRESSION_METRIC,
   __resetMetricsForTest,
   getMetricsRegistry,
+  refreshGithubWorkflowRunConclusionMetrics,
 } from "../services/metrics.js";
 
 /**
@@ -83,6 +85,21 @@ async function suppressionCount(cause?: string): Promise<number> {
   };
   return data.values
     .filter((entry) => cause === undefined || entry.labels.cause === cause)
+    .reduce((sum, entry) => sum + entry.value, 0);
+}
+
+async function workflowConclusionCount(
+  db: Parameters<typeof refreshGithubWorkflowRunConclusionMetrics>[0],
+  conclusion: string,
+): Promise<number> {
+  await refreshGithubWorkflowRunConclusionMetrics(db);
+  const metric = getMetricsRegistry().getSingleMetric(GITHUB_WORKFLOW_RUN_CONCLUSION_METRIC);
+  if (!metric) throw new Error(`${GITHUB_WORKFLOW_RUN_CONCLUSION_METRIC} is not registered`);
+  const data = (await metric.get()) as {
+    values: Array<{ labels: Record<string, string>; value: number }>;
+  };
+  return data.values
+    .filter((entry) => entry.labels.conclusion === conclusion)
     .reduce((sum, entry) => sum + entry.value, 0);
 }
 
@@ -1175,6 +1192,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
 
   beforeEach(async () => {
     if (!db) return;
+    __resetMetricsForTest();
     // These route tests default to skipQueuedRunDispatch, and several cases
     // intentionally seed queued/running rows to exercise coalescing. Finalize
     // test-owned rows directly so cleanup does not spend 30s waiting on
@@ -1182,14 +1200,14 @@ describeEmbeddedPostgres("github-webhook route", () => {
     await db.execute(sql.raw(
       `UPDATE "heartbeat_runs" SET status='failed', finished_at=NOW() WHERE status IN ('queued','running')`,
     ));
-    await db.execute(sql.raw(`TRUNCATE TABLE "companies" CASCADE`));
+    await db.execute(sql.raw(`TRUNCATE TABLE "github_workflow_run_completions", "companies" CASCADE`));
   }, 60_000);
 
   afterAll(async () => {
     await db.execute(sql.raw(
       `UPDATE "heartbeat_runs" SET status='failed', finished_at=NOW() WHERE status IN ('queued','running')`,
     ));
-    await db.execute(sql.raw(`TRUNCATE TABLE "companies" CASCADE`));
+    await db.execute(sql.raw(`TRUNCATE TABLE "github_workflow_run_completions", "companies" CASCADE`));
     await tempDb?.cleanup();
   }, 60_000);
 
@@ -1217,6 +1235,45 @@ describeEmbeddedPostgres("github-webhook route", () => {
     const signature =
       "sha256=" + crypto.createHmac("sha256", webhookSecret).update(Buffer.from(body, "utf8")).digest("hex");
     return { body, signature };
+  }
+
+  function workflowRunPayload(input: {
+    action?: string;
+    runId?: number | string;
+    runAttempt?: number | string;
+    conclusion?: string | null;
+    branch?: string;
+  } = {}): Record<string, unknown> {
+    const workflowRun: Record<string, unknown> = {
+      id: input.runId ?? 30817055153,
+      run_attempt: input.runAttempt ?? 1,
+      head_branch: input.branch ?? "ci/no-paperclip-id",
+      head_sha: "sha-workflow-run",
+      html_url: "https://github.com/Blockcast/paperclip/actions/runs/30817055153",
+      display_title: "CI",
+      pull_requests: [],
+    };
+    if (input.conclusion !== undefined) workflowRun.conclusion = input.conclusion;
+    return {
+      action: input.action ?? "completed",
+      workflow_run: workflowRun,
+      repository: { full_name: "Blockcast/paperclip" },
+    };
+  }
+
+  async function postWorkflowRun(
+    app: express.Express,
+    payload: Record<string, unknown>,
+    deliveryId: string,
+  ) {
+    const { body, signature } = signedRequest(payload);
+    return request(app)
+      .post("/api/webhooks/github")
+      .set("x-github-event", "workflow_run")
+      .set("x-hub-signature-256", signature)
+      .set("x-github-delivery", deliveryId)
+      .set("content-type", "application/json")
+      .send(body);
   }
 
   async function seedIssueWithIdentifier(identifier: string, opts?: { status?: string; assignee?: boolean }) {
@@ -1368,6 +1425,75 @@ describeEmbeddedPostgres("github-webhook route", () => {
       .send(body);
     expect(res.status).toBe(200);
     expect(res.body).toMatchObject({ ignored: "no_matching_issue", identifiers: ["UNKNOWN-1234"] });
+  });
+
+  it("records completed workflow_run conclusions and ignores non-completed actions", async () => {
+    const app = buildApp();
+
+    const queued = await postWorkflowRun(
+      app,
+      workflowRunPayload({ action: "requested", conclusion: "cancelled" }),
+      "workflow-requested",
+    );
+    expect(queued.status).toBe(200);
+    expect(await workflowConclusionCount(db, "cancelled")).toBe(0);
+
+    const completed = await postWorkflowRun(
+      app,
+      workflowRunPayload({ action: "completed", conclusion: "cancelled" }),
+      "workflow-completed",
+    );
+    expect(completed.status).toBe(200);
+    expect(await workflowConclusionCount(db, "cancelled")).toBe(1);
+  });
+
+  it("normalizes a completed workflow_run with no conclusion to other", async () => {
+    const app = buildApp();
+
+    const res = await postWorkflowRun(
+      app,
+      workflowRunPayload({ runId: 30817055154 }),
+      "workflow-missing-conclusion",
+    );
+
+    expect(res.status).toBe(200);
+    expect(await workflowConclusionCount(db, "other")).toBe(1);
+  });
+
+  it("dedupes redelivered completed workflow_run events durably by run id and attempt", async () => {
+    const app = buildApp();
+    const payload = workflowRunPayload({ conclusion: "cancelled", runId: 30817055155, runAttempt: 1 });
+
+    for (let i = 0; i < 3; i++) {
+      const res = await postWorkflowRun(app, payload, `workflow-redelivery-${i}`);
+      expect(res.status).toBe(200);
+    }
+
+    expect(await workflowConclusionCount(db, "cancelled")).toBe(1);
+
+    const rerun = await postWorkflowRun(
+      app,
+      workflowRunPayload({ conclusion: "success", runId: 30817055155, runAttempt: 2 }),
+      "workflow-rerun",
+    );
+    expect(rerun.status).toBe(200);
+    expect(await workflowConclusionCount(db, "success")).toBe(1);
+  });
+
+  it("keeps workflow_run observations recoverable across a handler restart and redelivery", async () => {
+    const firstApp = buildApp();
+    const payload = workflowRunPayload({ conclusion: "cancelled", runId: 30817055156, runAttempt: 1 });
+
+    const first = await postWorkflowRun(firstApp, payload, "workflow-first-process");
+    expect(first.status).toBe(200);
+    expect(await workflowConclusionCount(db, "cancelled")).toBe(1);
+
+    __resetMetricsForTest();
+    const secondApp = buildApp();
+    const second = await postWorkflowRun(secondApp, payload, "workflow-second-process");
+
+    expect(second.status).toBe(200);
+    expect(await workflowConclusionCount(db, "cancelled")).toBe(1);
   });
 
   it("leaves reviewer wakes queued when the webhook runs on the API tier", async () => {
