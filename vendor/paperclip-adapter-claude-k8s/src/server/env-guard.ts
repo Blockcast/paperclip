@@ -14,9 +14,16 @@
  * (which Job pods use, since there is no human to answer permission prompts),
  * so this is the correct enforcement point for unattended runs.
  *
- * The classification logic mirrors the server's `server/src/agent-shell-guard.ts`;
- * `env-guard.test.ts` locks the two in behavioural parity. Keep them in
- * lockstep when either changes.
+ * This module is the ENFORCED copy — the one a Job pod actually runs. A second,
+ * older copy of the same classifier lives at `server/src/agent-shell-guard.ts`.
+ * An earlier version of this comment claimed the two were "locked in
+ * behavioural parity" by `env-guard.test.ts`; that was never true. Nothing
+ * imports the server copy except its own test, `env-guard.test.ts` does not
+ * reference it, and the two have since diverged by four fixed bypasses
+ * (compound-command helper match, CR/LF separators, flag-only dumps, command
+ * substitution) that the server copy still has. Do not treat that file as the
+ * reference implementation, and do not assume a fix here lands there. Tracked
+ * separately for removal-or-resync; see BLO-22840.
  */
 
 export type AgentShellCommandDecision =
