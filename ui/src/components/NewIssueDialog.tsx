@@ -82,7 +82,14 @@ import { ReusableExecutionWorkspaceSelect } from "./ReusableExecutionWorkspaceSe
 const DRAFT_KEY = "paperclip:issue-draft";
 const DEBOUNCE_MS = 800;
 const MOBILE_DIALOG_HEIGHT = "calc(100dvh - max(1rem, env(safe-area-inset-top)) - max(1rem, env(safe-area-inset-bottom)))";
+const DEFAULT_ISSUE_DESCRIPTION = "## Acceptance criteria\n\n## Verifying signal\n";
+const RECOMMENDED_DESCRIPTION_HEADINGS = ["Acceptance criteria", "Verifying signal"] as const;
 
+function hasDescriptionHeading(description: string, heading: string) {
+  return description
+    .split(/\r?\n/)
+    .some((line) => line.trim().toLowerCase() === `## ${heading.toLowerCase()}`);
+}
 
 interface IssueDraft {
   title: string;
@@ -764,7 +771,7 @@ export function NewIssueDialog() {
       const defaultProjectWorkspaceId = newIssueDefaults.projectWorkspaceId
         ?? defaultProjectWorkspaceIdForProject(defaultProject);
       const defaultExecutionWorkspaceMode = defaultExecutionWorkspaceModeForIssueDefaults(newIssueDefaults, defaultProject);
-      setIssueText(newIssueDefaults.title ?? "", newIssueDefaults.description ?? "");
+      setIssueText(newIssueDefaults.title ?? "", newIssueDefaults.description ?? DEFAULT_ISSUE_DESCRIPTION);
       setStatus(newIssueDefaults.status ?? "todo");
       setPriority(newIssueDefaults.priority ?? "");
       setProjectId(defaultProjectId);
@@ -782,7 +789,7 @@ export function NewIssueDialog() {
         : null;
     } else if (newIssueDefaults.title) {
       const nextWorkMode = isIssueWorkMode(newIssueDefaults.workMode) ? newIssueDefaults.workMode : "standard";
-      setIssueText(newIssueDefaults.title, newIssueDefaults.description ?? "");
+      setIssueText(newIssueDefaults.title, newIssueDefaults.description ?? DEFAULT_ISSUE_DESCRIPTION);
       setStatus(newIssueDefaults.status ?? "todo");
       setPriority(newIssueDefaults.priority ?? "");
       const defaultProjectId = newIssueDefaults.projectId ?? "";
@@ -861,7 +868,7 @@ export function NewIssueDialog() {
       const defaultProjectId = newIssueDefaults.projectId ?? "";
       const defaultProject = orderedProjects.find((project) => project.id === defaultProjectId);
       const hasExplicitProjectWorkspaceId = newIssueDefaults.projectWorkspaceId !== undefined;
-      setIssueText("", "");
+      setIssueText("", DEFAULT_ISSUE_DESCRIPTION);
       setStatus(newIssueDefaults.status ?? "todo");
       setPriority(newIssueDefaults.priority ?? "");
       setProjectId(defaultProjectId);
@@ -986,6 +993,16 @@ export function NewIssueDialog() {
     const currentTitle = titleRef.current.trim();
     const currentDescription = descriptionRef.current.trim();
     if (!effectiveCompanyId || !currentTitle || createIssue.isPending) return;
+    const missingHeadings = RECOMMENDED_DESCRIPTION_HEADINGS.filter(
+      (heading) => !hasDescriptionHeading(currentDescription, heading),
+    );
+    if (missingHeadings.length > 0) {
+      pushToast({
+        title: "Task description is missing recommended headings",
+        body: `Add ${missingHeadings.map((heading) => `\`## ${heading}\``).join(" and ")} so completion and verification are explicit.`,
+        tone: "warn",
+      });
+    }
     const effectiveLane = assigneeSupportsCheapLane
       ? assigneeModelLane
       : assigneeModelLane === "cheap"

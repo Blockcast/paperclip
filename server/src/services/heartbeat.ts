@@ -177,7 +177,7 @@ import {
   isThrottleCandidateIssueRewake,
 } from "./issue-rewake-throttle.js";
 import { logActivity, publishPluginDomainEvent, type LogActivityInput } from "./activity-log.js";
-import { githubHasReviewerEvidenceForPr } from "./github-app-auth.js";
+import { githubGetPullRequestGate, githubHasReviewerEvidenceForPr } from "./github-app-auth.js";
 import { loadConfig } from "../config.js";
 import { enqueueGithubCommitStatusDelivery } from "./github-status-delivery-outbox.js";
 import {
@@ -335,6 +335,7 @@ import {
   type RuntimeStatusUpdate,
   type SessionCompactionPolicy,
 } from "@paperclipai/adapter-utils";
+import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import {
   readPaperclipSkillSyncPreference,
   UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
@@ -652,7 +653,68 @@ const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_WAKE_REASON = "execution_review_part
 const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_CAUSE = "execution_review_participant_recovery";
 const GITHUB_PR_WORKFLOW_SKILL_KEY = "paperclipai/bundled/software-development/github-pr-workflow";
 const GITHUB_PR_WORKFLOW_SKILL_SLUG = "github-pr-workflow";
-const PUSH_CAPABILITY_ENV_KEYS = ["GH_TOKEN", "GITHUB_TOKEN"] as const;
+const GH_SEAT_TOKEN_ENV_KEY = "GH_SEAT_TOKEN_VALUE";
+const STANDARD_GITHUB_CREDENTIAL_ENV_KEYS = ["GH_TOKEN", "GITHUB_TOKEN"] as const;
+
+// GH_SEAT_TOKEN_VALUE is a first-class member of this contract, not an
+// afterthought: it is the *only* one of the three that can be delivered without
+// mounting a credential into every Job pod (BLO-18927). Omitting it meant an
+// agent bound correctly for the scoped path was still rejected as
+// `push_write_credential_missing` before scripts/gh-token-wrapper.sh ever ran,
+// which would have made the scoped binding unusable for exactly the git-
+// sensitive local adapters this preflight guards. Widening the accepted set is
+// safe: this gate asserts that *some* push credential is configured, it does
+// not authorize anything.
+export const PUSH_CAPABILITY_ENV_KEYS = [
+  ...STANDARD_GITHUB_CREDENTIAL_ENV_KEYS,
+  GH_SEAT_TOKEN_ENV_KEY,
+] as const;
+
+export function translateGithubSeatTokenForExecutionTarget(input: {
+  runtimeConfig: Record<string, unknown>;
+  executionTarget: AdapterExecutionTarget | null | undefined;
+}): Record<string, unknown> {
+  const env = parseObject(input.runtimeConfig.env);
+  const rawSeatToken = env[GH_SEAT_TOKEN_ENV_KEY];
+  if (typeof rawSeatToken !== "string") return input.runtimeConfig;
+
+  const seatToken = rawSeatToken.trim();
+  if (!seatToken) {
+    throw new ConfigurationIncompleteFailure(
+      "configuration incomplete: GH_SEAT_TOKEN_VALUE is set but resolves to an empty GitHub credential.",
+      {
+        configurationIncomplete: {
+          reason: "github_seat_token_empty",
+          requiredEnvKeys: [...PUSH_CAPABILITY_ENV_KEYS],
+          requiredScopes: ["agent"],
+          missingBindings: [],
+        },
+      },
+    );
+  }
+  if (/\s/.test(seatToken)) {
+    throw new ConfigurationIncompleteFailure(
+      "configuration incomplete: GH_SEAT_TOKEN_VALUE contains embedded whitespace and cannot be translated safely.",
+      {
+        configurationIncomplete: {
+          reason: "github_seat_token_malformed",
+          requiredEnvKeys: [...PUSH_CAPABILITY_ENV_KEYS],
+          requiredScopes: ["agent"],
+          missingBindings: [],
+        },
+      },
+    );
+  }
+
+  return {
+    ...input.runtimeConfig,
+    env: {
+      ...env,
+      GH_TOKEN: seatToken,
+      GITHUB_TOKEN: seatToken,
+    },
+  };
+}
 // Keep this in sync with local adapters that require a git workspace before launch.
 const GIT_SENSITIVE_LOCAL_ADAPTER_TYPES = new Set([
   "claude_local",
@@ -1278,6 +1340,84 @@ function stripPaperclipRuntimeEnvFromAdapterConfig(config: Record<string, unknow
   };
 }
 
+// Keys that select the *identity* a runtime tool authenticates as, and which
+// must therefore only ever be settable at agent scope.
+//
+// GH_SEAT_TOKEN_VALUE is read by scripts/gh-token-wrapper.sh in precedence
+// above the mounted App token, so any scope able to set it can swap the
+// identity every `gh` invocation runs as, or park whitespace there and fail
+// them all with exit 64. Environment, project and routine env are overlaid
+// *after* agent-scope resolution (see below), so without this filter the
+// lowest-trust writer would win, not the highest. The issue-level adapter
+// override reaches the same key by a second route, one overlay earlier — see
+// withAgentScopedEnvProvenance.
+//
+// Before BLO-18927 the `PAPERCLIP_` prefix gave this protection for free at
+// every scope. Renaming the key out of that namespace was necessary to reach
+// agent scope at all — isPaperclipRuntimeEnvKey strips the prefix *before*
+// agent resolution — and this restores the protection for the scopes that
+// never needed the exemption.
+//
+// Deliberately NOT folded into isPaperclipRuntimeEnvKey: that guard strips at
+// every scope including agent, which is precisely what this key must escape.
+const AGENT_SCOPE_ONLY_ENV_KEYS = new Set([GH_SEAT_TOKEN_ENV_KEY]);
+
+function isAgentScopeOnlyEnvKey(key: string) {
+  return AGENT_SCOPE_ONLY_ENV_KEYS.has(key);
+}
+
+// Applied to environment / project / routine env only. Agent-scope env goes
+// through stripPaperclipRuntimeEnvFromAdapterConfig instead, which does not
+// filter these keys.
+function stripLowerScopeEnvBindings(envValue: unknown): Record<string, unknown> | null {
+  const record = parseObject(envValue);
+  const filtered = Object.fromEntries(
+    Object.entries(record).filter(
+      ([key]) => !isPaperclipRuntimeEnvKey(key) && !isAgentScopeOnlyEnvKey(key),
+    ),
+  );
+  return Object.keys(filtered).length > 0 ? filtered : null;
+}
+
+// Restores agent provenance for AGENT_SCOPE_ONLY_ENV_KEYS after the overlay
+// spread in mergeModelProfileAdapterConfig, whose result is handed to
+// resolveExecutionRunAdapterConfig as `executionRunConfig` — i.e. treated
+// wholesale as agent scope, and filtered there only for `PAPERCLIP_*`.
+//
+// Two properties of that merge break the agent-only boundary without this:
+//
+//   - `issueAdapterConfig` is issue.assigneeAdapterOverrides.adapterConfig.
+//     parseIssueAssigneeAdapterOverrides accepts arbitrary keys, and any actor
+//     able to create or patch the issue can set them. It is overlaid last.
+//   - the overlays are a *shallow* spread, so an overlay carrying `env` at all
+//     replaces the agent's `env` wholesale instead of merging into it.
+//
+// So an issue override could both introduce a seat token the agent never had
+// (selecting the identity every `gh` invocation authenticates as) and drop one
+// the agent did have. Post-condition established here: every
+// AGENT_SCOPE_ONLY_ENV_KEY present in the merged env holds exactly the
+// baseConfig value, and any the baseConfig lacks is absent. That closes both
+// directions.
+//
+// Note this also ignores the key when it arrives via modelProfile.adapterConfig,
+// which can be agent-provenanced (configSource "agent_runtime"). Deliberate: the
+// key resolves from the agent's primary config and nowhere else, so there is one
+// place to audit rather than one per profile.
+function withAgentScopedEnvProvenance(
+  merged: Record<string, unknown>,
+  baseConfig: Record<string, unknown>,
+): Record<string, unknown> {
+  // Reference-equal means no overlay supplied `env`, so nothing was displaced.
+  if (merged.env === baseConfig.env) return merged;
+  const env = Object.fromEntries(
+    Object.entries(parseObject(merged.env)).filter(([key]) => !isAgentScopeOnlyEnvKey(key)),
+  );
+  for (const [key, value] of Object.entries(parseObject(baseConfig.env))) {
+    if (isAgentScopeOnlyEnvKey(key)) env[key] = value;
+  }
+  return { ...merged, env };
+}
+
 function assertLowTrustEnvConfigAllowed(envValue: unknown, source: string) {
   const record = stripPaperclipRuntimeEnvBindings(envValue);
   if (!record) return;
@@ -1288,7 +1428,13 @@ function assertLowTrustEnvConfigAllowed(envValue: unknown, source: string) {
     const isPlainBinding =
       typeof binding === "string" ||
       (typeof binding === "object" && binding !== null && binding.type === "plain");
-    if (isPlainBinding && LOW_TRUST_SENSITIVE_ENV_KEY_RE.test(key)) {
+    // Agent-scope-only keys hold a raw credential by construction, but do not
+    // match the name-shaped heuristic below (GH_SEAT_TOKEN_VALUE contains no
+    // "secret"/"auth"/"access_token" substring). Treat them as sensitive
+    // explicitly so a low-trust run cannot inline one; it must use a
+    // secret_ref. Safe to add with this PR because the key is new here — no
+    // existing config can be relying on the inline form.
+    if (isPlainBinding && (LOW_TRUST_SENSITIVE_ENV_KEY_RE.test(key) || isAgentScopeOnlyEnvKey(key))) {
       throw new HttpError(422, `Low-trust execution cannot use inline sensitive env value ${source}.${key}`, {
         code: "low_trust_inline_sensitive_env_denied",
       });
@@ -1320,9 +1466,9 @@ export async function resolveExecutionRunAdapterConfig(input: {
   };
 }) {
   const executionRunConfig = stripPaperclipRuntimeEnvFromAdapterConfig(input.executionRunConfig);
-  const environmentEnv = stripPaperclipRuntimeEnvBindings(input.environmentEnv);
-  const projectEnv = stripPaperclipRuntimeEnvBindings(input.projectEnv);
-  const routineEnv = stripPaperclipRuntimeEnvBindings(input.routineEnv);
+  const environmentEnv = stripLowerScopeEnvBindings(input.environmentEnv);
+  const projectEnv = stripLowerScopeEnvBindings(input.projectEnv);
+  const routineEnv = stripLowerScopeEnvBindings(input.routineEnv);
   const lowTrustAllowedBindingIds = input.trustPreset?.kind === "low_trust_review"
     ? input.trustPreset.boundary.allowedSecretBindingIds ?? []
     : undefined;
@@ -2815,13 +2961,17 @@ export function sanitizeRunLogChunkForStorage(
 
 const SYNTHETIC_KEEPALIVE_RUN_LOG_LINE_RE =
   /^\[paperclip\] keepalive\b.*\bjob\b.*\brunning \(\d+s since last output\)$/;
+const SYNTHETIC_REATTACH_RUN_LOG_LINE_RE =
+  /^\[paperclip\] (?:Reattaching to orphaned Job \S+|Reattached to existing run \S+\.)$/;
 
 export function isSyntheticNonProgressRunLogChunk(chunk: string) {
   const lines = chunk
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter(Boolean);
-  return lines.length > 0 && lines.every((line) => SYNTHETIC_KEEPALIVE_RUN_LOG_LINE_RE.test(line));
+  return lines.length > 0 && lines.every((line) =>
+    SYNTHETIC_KEEPALIVE_RUN_LOG_LINE_RE.test(line) || SYNTHETIC_REATTACH_RUN_LOG_LINE_RE.test(line)
+  );
 }
 
 function normalizeHeartbeatIntervalSec(value: unknown, fallback: number) {
@@ -4015,11 +4165,12 @@ export function mergeModelProfileAdapterConfig(input: {
   modelProfile: ModelProfileApplication;
   issueAdapterConfig: Record<string, unknown> | null | undefined;
 }): Record<string, unknown> {
-  return {
+  const merged = {
     ...input.baseConfig,
     ...(input.modelProfile.adapterConfig ?? {}),
     ...(input.issueAdapterConfig ?? {}),
   };
+  return withAgentScopedEnvProvenance(merged, input.baseConfig);
 }
 
 function modelProfileRunMetadata(
@@ -8646,7 +8797,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   });
   const workspaceOperationsSvc = workspaceOperationService(db);
   const reattachingExternalRuns = new Set<string>();
-  const externalRunReattachedAt = new Map<string, number>();
   // Tracks the promises spawned by `void executeRun(...)` calls in the
   // dispatcher (startNextQueuedRunForAgent) so tests can await
   // fire-and-forget chains before TRUNCATE-based cleanup. Without this
@@ -16186,7 +16336,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
     runningProcesses.delete(input.run.id);
     activeRunExecutions.delete(input.run.id);
-    externalRunReattachedAt.delete(input.run.id);
     await environmentsSvc.releaseLeasesForRun(
       input.run.id,
       terminalOutcome.status === "succeeded" ? "released" : "failed",
@@ -16211,22 +16360,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   function externalLifecycleRecentRefTime(
     run: Pick<
       typeof heartbeatRuns.$inferSelect,
-      "id" | "lastOutputAt" | "startedAt" | "createdAt" | "finishedAt"
+      "lastOutputAt" | "lastUsefulActionAt" | "startedAt" | "createdAt" | "finishedAt"
     >,
   ): number {
+    const liveProgressRef = runTimestampMs(run.lastUsefulActionAt) || runTimestampMs(run.lastOutputAt);
     return Math.max(
-      runTimestampMs(run.lastOutputAt),
+      liveProgressRef,
       runTimestampMs(run.finishedAt),
       runTimestampMs(run.startedAt),
       runTimestampMs(run.createdAt),
-      externalRunReattachedAt.get(run.id) ?? 0,
     );
   }
 
   function isExternalLifecycleRunInRecentGrace(
     run: Pick<
       typeof heartbeatRuns.$inferSelect,
-      "id" | "lastOutputAt" | "updatedAt" | "startedAt" | "createdAt" | "finishedAt"
+      "id" | "lastOutputAt" | "lastUsefulActionAt" | "updatedAt" | "startedAt" | "createdAt" | "finishedAt"
     >,
     now: Date,
     graceMs = EXTERNAL_LIFECYCLE_RECENT_RUN_GRACE_MS,
@@ -16686,9 +16835,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ? reconciled.job
         : await readAgentJobRunStatusByName(reservation.jobName);
       if (observed?.phase !== "active" || observed.uid !== reservation.jobUid) continue;
+      const prReview = derivePaperclipPrReview(parseObject(run.contextSnapshot));
+      if (prReview?.repoFullName) {
+        const gate = await githubGetPullRequestGate({
+          repoFullName: prReview.repoFullName,
+          prNumber: prReview.prNumber,
+        });
+        if (!("error" in gate) && gate.state === "closed") {
+          const reason = `External PR gate ${prReview.repoFullName}#${prReview.prNumber} is closed${gate.merged ? " and merged" : " without merge"}`;
+          await cancelRunInternal(run.id, reason, {
+            errorCode: "external_gate_terminal",
+            eventMessage: "external-lifecycle reattach skipped because external gate is terminal",
+            eventPayload: {
+              repoFullName: prReview.repoFullName,
+              prNumber: prReview.prNumber,
+              state: gate.state,
+              merged: gate.merged,
+            },
+          });
+          continue;
+        }
+      }
       resumed += 1;
       reattachingExternalRuns.add(run.id);
-      externalRunReattachedAt.set(run.id, Date.now());
       void executeRun(run.id)
         .catch((error) => {
           logger.error({ error, runId: run.id }, "failed to reattach external-runtime execution");
@@ -17080,17 +17249,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
       let confirmedMissingExternalJob = false;
       if (externalLifecycleRun && externalLifecycleStarted) {
-        const persistedSignalRef = run.lastUsefulActionAt
-          ? new Date(run.lastUsefulActionAt).getTime()
-          : run.lastOutputAt
-          ? new Date(run.lastOutputAt).getTime()
-          : run.startedAt
-          ? new Date(run.startedAt).getTime()
-          : 0;
-        const lastSignalRef = Math.max(
-          persistedSignalRef,
-          externalRunReattachedAt.get(run.id) ?? 0,
-        );
+        const lastSignalRef = externalLifecycleRecentRefTime(run);
         const isSilent = !lastSignalRef || now.getTime() - lastSignalRef >= EXTERNAL_LIFECYCLE_STALE_MS;
         // BLO-12996: a much longer floor that gates the *destructive* kill of a
         // still-active Job (vs. isSilent, which only gates non-destructive
@@ -20255,7 +20414,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             consumerScopes: ["agent", "project"],
             reason: "push_write_credential_missing",
             remediation:
-              "GitHub PR workflow requires GH_TOKEN or GITHUB_TOKEN bound at project or agent scope.",
+              "GitHub PR workflow requires GH_TOKEN or GITHUB_TOKEN bound at project or agent scope, or GH_SEAT_TOKEN_VALUE bound at agent scope.",
           }
         : undefined,
     });
@@ -20284,6 +20443,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       ...effectiveResolvedConfig,
       paperclipRuntimeSkills: runtimeSkillEntries,
     };
+    runtimeConfig = translateGithubSeatTokenForExecutionTarget({
+      runtimeConfig,
+      executionTarget: null,
+    });
     const latestAgentConfigRevision = await getLatestAgentConfigRevision(agent.companyId, agent.id);
     const sessionConfigMetadata = await buildEffectiveRunSessionConfigMetadata({
       adapterType: agent.adapterType,
@@ -21129,6 +21292,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .update(heartbeatRuns)
         .set({
           lastOutputAt: pendingOutputProgress.at,
+          lastUsefulActionAt: pendingOutputProgress.at,
           lastOutputSeq: pendingOutputProgress.seq,
           lastOutputStream: pendingOutputProgress.stream,
           lastOutputBytes: pendingOutputProgress.bytes,
@@ -22968,7 +23132,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             });
           }
           activeRunExecutions.delete(run.id);
-          externalRunReattachedAt.delete(run.id);
           // Skip dispatch when this run was cancelled. `cancelRunInternal`
           // already calls `startNextQueuedRunForAgent` when it cancels a run,
           // so the finally-block dispatch is a duplicate that races with the
