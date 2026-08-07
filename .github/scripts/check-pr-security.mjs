@@ -219,8 +219,8 @@ export function buildAdvisoryPayload(prNumber, prTitle, flags) {
   };
 }
 
-export async function syncDraftAdvisory(fetchImpl, token, repo, prNumber, prTitle, flags) {
-  const existing = await findExistingDraftAdvisory(fetchImpl, token, repo, prNumber);
+export async function syncDraftAdvisory(fetchImpl, token, repo, prNumber, prTitle, flags, { signal } = {}) {
+  const existing = await findExistingDraftAdvisory(fetchImpl, token, repo, prNumber, { signal });
   const payload = buildAdvisoryPayload(prNumber, prTitle, flags);
 
   if (existing) {
@@ -237,6 +237,7 @@ export async function syncDraftAdvisory(fetchImpl, token, repo, prNumber, prTitl
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(patchPayload),
+      signal,
     });
   }
 
@@ -244,6 +245,7 @@ export async function syncDraftAdvisory(fetchImpl, token, repo, prNumber, prTitl
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
+    signal,
   });
 }
 
@@ -251,13 +253,14 @@ export async function syncDraftAdvisory(fetchImpl, token, repo, prNumber, prTitl
 // the security gate (it runs inside a 5-minute workflow timeout).
 const MAX_DRAFT_ADVISORY_PAGES = 20;
 
-export async function findExistingDraftAdvisory(fetchImpl, token, repo, prNumber) {
+export async function findExistingDraftAdvisory(fetchImpl, token, repo, prNumber, { signal } = {}) {
   const prMarker = `PR #${prNumber}`;
 
   for (let page = 1; page <= MAX_DRAFT_ADVISORY_PAGES; page += 1) {
     const advisories = await fetchImpl(
       `/repos/${repo}/security-advisories?state=draft&per_page=100&page=${page}`,
       token,
+      { signal },
     );
 
     if (!Array.isArray(advisories) || advisories.length === 0) return null;
@@ -357,7 +360,46 @@ async function warnOnFailure(label, promise) {
   }
 }
 
+export async function postFlaggedSecurityResult(
+  fetchImpl,
+  token,
+  repo,
+  pr,
+  flags,
+  advisoryBudgetMs,
+) {
+  const controller = new AbortController();
+  const budgetError = new Error(`draft advisory sync exceeded ${advisoryBudgetMs}ms wall-clock budget`);
+  let rejectBudget;
+  const budgetExpired = new Promise((_, reject) => { rejectBudget = reject; });
+  const timer = setTimeout(() => {
+    controller.abort(budgetError);
+    rejectBudget(budgetError);
+  }, advisoryBudgetMs);
+
+  let advisoryResult;
+  try {
+    const advisory = await Promise.race([
+      syncDraftAdvisory(fetchImpl, token, repo, pr.number, pr.title, flags, { signal: controller.signal }),
+      budgetExpired,
+    ]);
+    advisoryResult = { ok: true, url: advisory?.html_url };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.warn(`[security] draft advisory sync failed; continuing per always-exit-0 contract: ${message}`);
+    advisoryResult = { ok: false, error: message };
+  } finally {
+    clearTimeout(timer);
+  }
+
+  await warnOnFailure(
+    'security check-run update',
+    postSecurityCheckRun(fetchImpl, token, repo, pr.head.sha, true, { flags, advisoryResult }),
+  );
+}
+
 async function main() {
+  const startedAt = Date.now();
   const watchdog = startScriptWatchdog();
 
   const { GH_TOKEN, GH_REPO, PR_NUMBER } = process.env;
@@ -406,22 +448,16 @@ async function main() {
   if (allFlags.length > 0) {
     console.error(`[security] ${allFlags.length} flag(s) detected — creating draft advisory and pending check run`);
 
-    // Sequenced (not Promise.all) so the check-run always knows whether the
-    // advisory actually landed — it must never assert an advisory exists
-    // when the sync failed.
-    let advisoryResult = null;
-    try {
-      const advisory = await syncDraftAdvisory(ghFetch, GH_TOKEN, GH_REPO, prNumber, pr.title, allFlags);
-      advisoryResult = { ok: true, url: advisory?.html_url };
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      console.warn(`[security] draft advisory sync failed; continuing per always-exit-0 contract: ${message}`);
-      advisoryResult = { ok: false, error: message };
-    }
-
-    await warnOnFailure(
-      'security check-run update',
-      postSecurityCheckRun(ghFetch, GH_TOKEN, GH_REPO, pr.head.sha, true, { flags: allFlags, advisoryResult }),
+    // Reserve enough of the global watchdog for ghFetch's 15-second check-run
+    // POST timeout plus cleanup, even if earlier GitHub reads were slow.
+    const advisoryBudgetMs = Math.max(0, SCRIPT_WATCHDOG_MS - (Date.now() - startedAt) - 20_000);
+    await postFlaggedSecurityResult(
+      ghFetch,
+      GH_TOKEN,
+      GH_REPO,
+      { ...pr, number: prNumber },
+      allFlags,
+      advisoryBudgetMs,
     );
   } else {
     console.log('[security] all clear');
