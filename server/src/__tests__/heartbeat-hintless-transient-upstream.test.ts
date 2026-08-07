@@ -735,7 +735,11 @@ describeEmbeddedPostgres("hint-less gateway 503 does not strand", () => {
     const firstFailedRun = await waitForRunToFinish(heartbeat, run!.id);
     expect(firstFailedRun?.status).toBe("failed");
     expect(firstFailedRun?.errorCode).toBe("provider_transient_upstream");
-    expect(await countRetriesOf(run!.id)).toBe(1);
+    // Retry-row creation is a separate write after the status flip to
+    // "failed" that waitForRunToFinish polls for, so assert with .poll()
+    // instead of a synchronous read (same race the sibling "classifies the
+    // fault..." test above already guards against at line 664).
+    await expect.poll(() => countRetriesOf(run!.id), { timeout: 5_000, interval: 50 }).toBe(1);
 
     const retryFailedRun = await executeScheduledRetryOf(run!.id);
     expect(retryFailedRun?.status).toBe("failed");
@@ -754,7 +758,9 @@ describeEmbeddedPostgres("hint-less gateway 503 does not strand", () => {
     expect(firstFailedRun?.status).toBe("failed");
     expect(firstFailedRun?.errorCode).toBe("provider_transient_upstream");
     expect(isGatewayAllocationFault(firstFailedRun?.resultJson)).toBe(false);
-    expect(await countRetriesOf(run!.id)).toBe(1);
+    // Same async retry-row race as the test above — poll instead of a
+    // synchronous read.
+    await expect.poll(() => countRetriesOf(run!.id), { timeout: 5_000, interval: 50 }).toBe(1);
 
     const retryFailedRun = await executeScheduledRetryOf(run!.id);
     expect(retryFailedRun?.status).toBe("failed");
