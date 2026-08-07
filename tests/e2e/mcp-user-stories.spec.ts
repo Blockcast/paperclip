@@ -438,6 +438,12 @@ test.describe.serial("MCP prod Phase 5a user-story harness", () => {
         await approveActionRequest(request, seed.companyId, pending.actionRequestId!);
         await pollTestCall(request, connectionId, pending.actionRequestId!, "done");
         await page.goto(`/${seed.prefix}/apps/${connectionId}/review`);
+        // Let this navigation settle before the next loop iteration fires another
+        // goto() at the identical URL (BLO-22511): back-to-back page.goto() calls to
+        // the same URL race a documented Playwright/Chromium hazard where the second
+        // navigation's commit/load lifecycle desyncs and the SPA never reboots, so the
+        // review page silently never issues its data fetch and "Allow once" times out.
+        await page.waitForLoadState("networkidle");
         await screenshot(page, "US-9", `review-${value}`);
       }
       expect(mock.captures.filter((capture) => capture.method === "tools/call" && capture.toolName === "sheets:update_cell")).toHaveLength(2);
