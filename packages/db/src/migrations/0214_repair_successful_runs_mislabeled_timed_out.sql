@@ -36,8 +36,7 @@ WITH "repaired_runs" AS (
 UPDATE "agent_wakeup_requests" AS "wake"
 SET
 	"status" = 'completed',
-	"error" = NULL,
-	"updated_at" = NOW()
+	"error" = NULL
 FROM "repaired_runs"
 WHERE "wake"."id" = "repaired_runs"."wakeup_request_id"
 	AND "wake"."status" = 'timed_out';
