@@ -8832,6 +8832,25 @@ export function normalizeSessionParams(params: Record<string, unknown> | null | 
 
 type RunSessionOutcome = "succeeded" | "interrupted" | "failed" | "cancelled" | "timed_out";
 
+export function isConfirmedAdapterTimeout(
+  result: Pick<AdapterExecutionResult, "timedOut" | "exitCode">,
+): boolean {
+  // A successful process exit is authoritative. This also keeps a malformed
+  // adapter result from persisting the contradictory status/exit-code pair
+  // that corrupted Ally's failure-rate accounting in BLO-22922.
+  return result.timedOut === true && result.exitCode !== 0;
+}
+
+export function isSuccessfulAdapterResult(
+  result: Pick<AdapterExecutionResult, "timedOut" | "exitCode" | "errorMessage" | "resultJson">,
+): boolean {
+  const processSucceeded =
+    (result.exitCode ?? 0) === 0 ||
+    (result.resultJson?.subtype === "success" && !result.resultJson?.is_error);
+  const falseTimeoutError = result.timedOut === true && result.exitCode === 0;
+  return processSucceeded && (!result.errorMessage || falseTimeoutError);
+}
+
 type SkillTestHeartbeatCompletion = {
   outcome: "failed" | "cancelled";
   error: string | null;
@@ -23466,14 +23485,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const latestRun = await getRun(run.id);
       if (isHeartbeatRunTerminalStatus(latestRun?.status)) {
         outcome = latestRun.status;
-      } else if (adapterResult.timedOut) {
+      } else if (isConfirmedAdapterTimeout(adapterResult)) {
         outcome = "timed_out";
-      } else if (
-        (((adapterResult.exitCode ?? 0) === 0) ||
-          (adapterResult.resultJson?.subtype === "success" &&
-            !adapterResult.resultJson?.is_error)) &&
-        !adapterResult.errorMessage
-      ) {
+      } else if (isSuccessfulAdapterResult(adapterResult)) {
         if (adapterResult.silentFailure) {
           outcome = "failed";
           silentFailureMessage = `Agent exited cleanly but performed no work: ${adapterResult.silentFailure.reason}`;
