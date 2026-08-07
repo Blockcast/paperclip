@@ -169,7 +169,12 @@ import {
   ISSUE_WAKE_DIAGNOSTICS_MAX_ACTIVITY_RECORDS,
   ISSUE_WAKE_DIAGNOSTICS_MAX_WAKE_REQUESTS,
 } from "../services/issues.js";
-import { authorizationBoundaryLabel, authorizationDeniedDetails } from "../services/authorization.js";
+import {
+  authorizationBoundaryLabel,
+  authorizationDeniedDetails,
+  commentAuthorCanGrantIssueMention,
+  getActiveCompanyMembership,
+} from "../services/authorization.js";
 import { environmentService } from "../services/environments.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
 import { redactEventPayload, redactSensitiveText } from "../redaction.js";
@@ -10998,8 +11003,24 @@ export function issueRoutes(
           logger.warn({ err, issueId: id }, "failed to resolve @-mentions");
         }
 
+        let authorUserIsActiveMember = false;
+        if (mentionedIds.length > 0 && actor.actorType === "user") {
+          try {
+            authorUserIsActiveMember = Boolean(
+              await getActiveCompanyMembership(db, issue.companyId, "user", actor.actorId),
+            );
+          } catch (err) {
+            logger.warn({ err, issueId: id }, "failed to resolve comment author membership for @-mentions");
+          }
+        }
+
         for (const mentionedId of mentionedIds) {
-          if (actor.actorType === "agent" && actor.actorId === mentionedId) continue;
+          if (!commentAuthorCanGrantIssueMention({
+            mentionedAgentId: mentionedId,
+            issueAssigneeAgentId: issue.assigneeAgentId,
+            authorAgentId: actor.actorType === "agent" ? actor.actorId : null,
+            authorUserIsActiveMember,
+          })) continue;
           addWakeup(mentionedId, {
             source: "automation",
             triggerDetail: "system",
@@ -12937,8 +12958,24 @@ export function issueRoutes(
         logger.warn({ err, issueId: id }, "failed to resolve @-mentions");
       }
 
+      let authorUserIsActiveMember = false;
+      if (mentionedIds.length > 0 && actor.actorType === "user") {
+        try {
+          authorUserIsActiveMember = Boolean(
+            await getActiveCompanyMembership(db, issue.companyId, "user", actor.actorId),
+          );
+        } catch (err) {
+          logger.warn({ err, issueId: id }, "failed to resolve comment author membership for @-mentions");
+        }
+      }
+
       for (const mentionedId of mentionedIds) {
-        if (actorIsAgent && actor.actorId === mentionedId) continue;
+        if (!commentAuthorCanGrantIssueMention({
+          mentionedAgentId: mentionedId,
+          issueAssigneeAgentId: currentIssue.assigneeAgentId,
+          authorAgentId: actorIsAgent ? actor.actorId : null,
+          authorUserIsActiveMember,
+        })) continue;
         addWakeup(mentionedId, {
           source: "automation",
           triggerDetail: "system",

@@ -49,6 +49,22 @@ test("Docker deploy job timeout covers every sequential rollout wait", () => {
   );
 });
 
+test("production helm upgrade retains --atomic so a failed upgrade rolls back instead of half-applying", () => {
+  const deployJob = getDeployJobBlock();
+  const helmUpgrade = deployJob.indexOf('helm upgrade "${RELEASE}"');
+  const helmPid = deployJob.indexOf("helm_pid=$!");
+
+  assert.ok(helmUpgrade >= 0, "deploy job must run helm upgrade");
+  assert.ok(helmPid > helmUpgrade, "helm_pid must be captured after the helm upgrade invocation");
+  assert.match(
+    deployJob.slice(helmUpgrade, helmPid),
+    /--atomic\b/,
+    "helm upgrade must pass --atomic (BLO-21492): without it, a resource denied mid-upgrade " +
+      "(e.g. by an admission policy) leaves the release half-applied instead of rolling back, " +
+      "which is how the worker and API tiers previously ended up on different image digests",
+  );
+});
+
 test("manual Docker deploys carry one full immutable SHA between jobs", () => {
   const buildJob = getBuildJobBlock();
   const deployJob = getDeployJobBlock();
@@ -138,8 +154,13 @@ test("Docker deploy approves the exact stamped plan before Helm mutates producti
   assert.ok(approve < upgrade, "admission approval must complete before Helm upgrade");
   assert.match(deployJob, /ref: \$\{\{ github\.workflow_sha \}\}/);
   assert.match(deployJob, /--show-only templates\/deployment-api\.yaml/);
+  assert.match(deployJob, /deployed_commit_key="paperclip\.blockcast\.net\/deployed-commit"/);
+  assert.match(deployJob, /\.spec\.template\.metadata\.annotations\[\$key\] as \$existing/);
+  assert.match(deployJob, /\.spec\.template\.metadata\.annotations =/);
+  assert.match(deployJob, /PAPERCLIP_DEPLOYED_COMMIT="\$\{COMMIT\}"/);
   assert.match(deployJob, /PAPERCLIP_APPROVAL_PLAN_SHA256="\$\{marker\}" "\$\{STAMP_SCRIPT\}"/);
   assert.match(deployJob, /DEPLOY_PLAN: \$\{\{ steps\.plan\.outputs\.path \}\}/);
+  assert.match(deployJob, /COMMIT: \$\{\{ steps\.target\.outputs\.full \}\}/);
   assert.match(
     deployJob,
     /"\$\{APPROVE_SCRIPT\}" "\$\{DIGEST\}" "\$\{DEPLOY_PLAN\}"/,
@@ -153,8 +174,12 @@ test("Docker deploy approves the exact stamped plan before Helm mutates producti
     /PAPERCLIP_DEPLOY_NAMESPACE="\$\{NS\}"/,
   );
   assert.match(deployJob, /PAPERCLIP_APPROVED_SERVER_PLAN_OUT="\$\{approved_server_plan\}"/);
-  assert.match(deployJob, /PAPERCLIP_DEPLOY_NAMESPACE="\$\{NS\}"[\s\\]+PAPERCLIP_APPROVAL_PLAN_SHA256/);
+  assert.match(
+    deployJob,
+    /PAPERCLIP_DEPLOY_NAMESPACE="\$\{NS\}"[\s\\]+PAPERCLIP_DEPLOYED_COMMIT="\$\{COMMIT\}"[\s\\]+PAPERCLIP_APPROVAL_PLAN_SHA256/,
+  );
   assert.match(deployJob, /PAPERCLIP_DEPLOY_NAMESPACE: \$\{\{ vars\.PAPERCLIP_NAMESPACE \|\| 'paperclip' \}\}/);
+  assert.match(deployJob, /PAPERCLIP_DEPLOYED_COMMIT: \$\{\{ steps\.target\.outputs\.full \}\}/);
   assert.match(deployJob, /--post-renderer "\$\{STAMP_SCRIPT\}"/);
   assert.equal(
     deployJob.match(/reconcile_approved_api_plan/g)?.length,
@@ -181,6 +206,7 @@ test("Docker deploy approves the exact stamped plan before Helm mutates producti
   assert.match(deployJob, /BEGIN CANONICAL_DEPLOYMENT_JQ/);
   assert.match(deployJob, /live_server_plan_sha256.*approved_server_plan_sha256/s);
   assert.match(deployJob, /\.spec\.template\.metadata\.annotations\["paperclip\.blockcast\.net\/approval-plan-sha256"\] == \$marker/);
+  assert.match(deployJob, /\.spec\.template\.metadata\.annotations\["paperclip\.blockcast\.net\/deployed-commit"\] == \$commit/);
 });
 
 test("Docker deploy accepts an approved create plan without resourceVersion", () => {

@@ -360,7 +360,19 @@ WORKDIR /vendor
 # adapter tests and typecheck pass.
 # Bumped 2026-08-04 to 42384fd: merge #50 onto the exact-current-Job fix, so
 # both lifecycle-Job exclusion and anthropic/claude-opus-5 support are present.
-ARG OPENCODE_K8S_REF=42384fdef5780ccdfbfba67c1a60feebd7ffb87c
+# Bumped 2026-08-04 to ff92362 (#52): PEN-1305 plugin arm — canary-gated
+# tool.execute.before env-guard plugin (adapter config envGuardPlugin,
+# default off; fleet behavior unchanged until the canary flips it on).
+# Adapter suite 592 green + typecheck clean; plugin API validated against
+# the live opencode 1.15.12 runtime.
+# Bumped 2026-08-04 to 9ff4c4c: address Ally review on #52 -- disabled
+# canaries clean stale persistent guard artifacts, safe-helper allowlist no
+# longer masks helper+dump command chains, and unquoted sh/bash -c dumps are
+# blocked. Adapter suite 603 green + typecheck clean.
+# Bumped 2026-08-05 to 83197d4: parse the shell -c command-string before
+# positional arguments, closing sh -c env ignored / bash -c "env" ignored
+# wrapper bypasses. Focused env-guard suite 90/90, typecheck, and build pass.
+ARG OPENCODE_K8S_REF=83197d46b0784c941801165464d48aca1b979909
 
 # Pack paperclip's in-tree adapter-utils so the bundled adapters consume
 # the workspace version (may include exports newer than the latest
