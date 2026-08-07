@@ -384,10 +384,29 @@ describe("buildJobManifest", () => {
       const { job } = buildJobManifest({ ctx, selfPod });
       const init = job.spec?.template?.spec?.initContainers?.[0];
       const cmd = init?.command?.[2] ?? "";
-      expect(cmd).toContain("[ -L /paperclip/.config/google-chrome/BrowserMetrics ]");
+      // Paths are shell-quoted because they are operator-configurable
+      // (`config.workspaceMountPath` / `config.homeRoot`) and land in the init
+      // container's `sh -c`, which runs before the PreToolUse guard exists.
+      expect(cmd).toContain("[ -L '/paperclip/.config/google-chrome/BrowserMetrics' ]");
       expect(cmd).toContain(
-        "ln -sfn /runtime-cache/chrome-browser-metrics /paperclip/.config/google-chrome/BrowserMetrics",
+        "ln -sfn '/runtime-cache/chrome-browser-metrics' '/paperclip/.config/google-chrome/BrowserMetrics'",
       );
+    });
+
+    it("shell-quotes configured mount paths in the init command, and rejects shell-active ones", () => {
+      // A mount path of `/tmp/x; env; #` would otherwise execute mid-`sh -c`
+      // with the prompt/MCP/PVC mounts already attached, ahead of the guard.
+      ctx.config.workspaceMountPath = "/srv/agent data";
+      expect(() => buildJobManifest({ ctx, selfPod })).toThrow(/unsafe in a shell command/);
+      ctx.config.workspaceMountPath = "/tmp/x; env; #";
+      expect(() => buildJobManifest({ ctx, selfPod })).toThrow(/unsafe in a shell command/);
+      ctx.config.workspaceMountPath = "relative/path";
+      expect(() => buildJobManifest({ ctx, selfPod })).toThrow(/must be an absolute path/);
+      // A legitimate custom absolute path still builds, and is quoted.
+      ctx.config.workspaceMountPath = "/srv/agent-data";
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const initCmd = job.spec?.template?.spec?.initContainers?.[0]?.command?.[2] ?? "";
+      expect(initCmd).toContain("'/srv/agent-data/.config/google-chrome'");
     });
 
     it("write-prompt mounts the runtime-cache emptyDir so the BrowserMetrics symlink target resolves", () => {
@@ -493,10 +512,43 @@ describe("buildJobManifest", () => {
       expect(securityContext?.fsGroupChangePolicy).toBeUndefined();
     });
 
-    it("omits data volume when no PVC", () => {
+    it("backs the data volume with an emptyDir when no PVC is configured, so the Pod can still start", () => {
+      // Previously this asserted the volume was OMITTED. That was the root of a
+      // two-stage bug: an unconditional mount then named an undeclared volume
+      // (admission rejects the whole Pod), and making the mount conditional
+      // merely moved the failure later — the init container still runs
+      // `mkdir -p /paperclip/...` as runAsUser:1000, which is EACCES on the
+      // image's root filesystem. Declaring the volume unconditionally removes
+      // the condition rather than duplicating it: always declared, always
+      // mounted, always writable; ephemeral when there is no claim.
       selfPod.pvcClaimName = null;
       const { job } = buildJobManifest({ ctx, selfPod });
-      expect(job.spec?.template?.spec?.volumes?.find((v) => v.name === "data")).toBeUndefined();
+      const dataVolume = job.spec?.template?.spec?.volumes?.find((v) => v.name === "data");
+      expect(dataVolume).toEqual({ name: "data", emptyDir: {} });
+      expect(dataVolume?.persistentVolumeClaim).toBeUndefined();
+      // Both containers still mount it, so the mkdir the init container performs
+      // unconditionally has a writable target.
+      expect(job.spec?.template?.spec?.containers[0]?.volumeMounts).toContainEqual({
+        name: "data",
+        mountPath: "/paperclip",
+      });
+      expect(job.spec?.template?.spec?.initContainers?.[0]?.volumeMounts).toContainEqual({
+        name: "data",
+        mountPath: "/paperclip",
+      });
+    });
+
+    it("backs the data volume with the PVC when a claim IS configured", () => {
+      // Guards the other direction: the emptyDir fallback must not shadow a real
+      // claim, or every run would silently lose its persistent state.
+      selfPod.pvcClaimName = "paperclip-data";
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const dataVolume = job.spec?.template?.spec?.volumes?.find((v) => v.name === "data");
+      expect(dataVolume).toEqual({
+        name: "data",
+        persistentVolumeClaim: { claimName: "paperclip-data" },
+      });
+      expect(dataVolume?.emptyDir).toBeUndefined();
     });
 
     // Kubernetes rejects the entire Pod when any volumeMount names a volume the
@@ -1358,15 +1410,26 @@ describe("buildJobManifest", () => {
       expect(cmd).toContain("--accounts 'ok@example.test'");
     });
 
-    it("falls back to global rotation when every configured account is invalid", () => {
+    it("skips rotation entirely when a configured account pool has no valid entry (fail closed)", () => {
+      // This test previously asserted the OPPOSITE — that we fall back to global
+      // rotation. That was fail-*open*: an operator who scoped this environment
+      // to a specific pool would silently get ccrotate's global rotation and
+      // consume credentials from outside the pool they asked for, on nothing
+      // worse than a config typo. Absent config and invalid config are different
+      // things; only the former means "global rotation is intended".
       ctx.config = {
         providers: { anthropic: { accounts: ["$(id)", "`id`", "a; rm -rf /"] } },
       };
       const { job } = buildJobManifest({ ctx, selfPod });
       const cmd = job.spec?.template?.spec?.containers[0]?.command?.[2] ?? "";
-      expect(cmd).toContain("ccrotate next --yes --target claude");
+      expect(cmd).not.toContain("ccrotate next");
       expect(cmd).not.toContain("--accounts");
+      // The injection payloads must not survive into the command in any form.
       expect(cmd).not.toContain("rm -rf /");
+      expect(cmd).not.toContain("$(id)");
+      expect(cmd).not.toContain("`id`");
+      // Operators need to know why rotation was skipped, or this is a silent no-op.
+      expect(cmd).toContain("no entry is a valid account identifier");
     });
 
     it("does not add --accounts when providers is undefined (global rotation path)", () => {

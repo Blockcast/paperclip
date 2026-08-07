@@ -71,6 +71,38 @@ const SHELL_WRAPPER_RE = /^(?:\/bin\/)?(?:ba|z|)?sh\s+-l?c\s+(["'])([\s\S]*)\1\s
 const CMD_BOUNDARY = String.raw`;&|()\x60\r\n`;
 
 /**
+ * Where a *new command word* may begin, for the leading side of the detector
+ * only.
+ *
+ * `CMD_BOUNDARY` covers shell punctuation, but a dump is equally reachable as a
+ * bare argument to a command-introducing wrapper, separated by nothing but a
+ * space: `sh -c env`, `bash -c printenv`, `eval env`, `xargs env`,
+ * `nohup env`, `timeout 5 env`, `su -c env`. `SHELL_WRAPPER_RE` only unwraps a
+ * *quoted* `-c` payload, so every unquoted form reached the detector with a
+ * space sitting where a boundary was required, matched nothing, and returned
+ * `allow` — a full dump, which is the exact leak this guard exists to stop.
+ * Measured before this change: 9 of 9 such payloads were allowed by the real
+ * spawned pod script.
+ *
+ * Rather than enumerate wrapper utilities (an open-ended list — `nice`,
+ * `stdbuf`, `setsid`, `flock`, `chroot`, `script -c`, … all qualify), treat
+ * whitespace itself as a possible command start. This closes the whole class in
+ * one rule instead of chasing each wrapper.
+ *
+ * Whitespace is deliberately NOT added to the *trailing* terminator, which stays
+ * `CMD_BOUNDARY`: the trailing side is what distinguishes a dump from a command
+ * that merely takes an operand, and `env NAME=value cmd` / `printenv HOME` /
+ * `env -- ls` must stay allowed. Keeping the two classes distinct is what lets
+ * `grep env file` through while blocking `sh -c env`.
+ *
+ * Residual over-block, accepted in the safe direction: operand-less mentions
+ * such as `echo env`, `grep env` (reading stdin) and `command -v env` now block.
+ * They are rare, harmless to block, and consistent with this file's existing
+ * stance that a bare `env` inside a quoted string or heredoc also matches.
+ */
+const CMD_START = String.raw`${CMD_BOUNDARY} \t`;
+
+/**
  * Option tokens that may follow `env` / `printenv` while the command is still a
  * full dump.
  *
@@ -90,11 +122,11 @@ const ENV_DUMP_OPTION_RUN = String.raw`(?:[ \t]+(?:(?:-u|--unset)[ \t]+[^\s;&|()
 
 const FULL_ENV_DUMP_RE = new RegExp(
   [
-    String.raw`(?:^|[${CMD_BOUNDARY}]\s*)(?:command\s+)?(?:\/usr\/bin\/)?(?:env|printenv)${ENV_DUMP_OPTION_RUN}(?:\s*(?:[${CMD_BOUNDARY}]|$))`,
-    String.raw`(?:^|[${CMD_BOUNDARY}]\s*)(?:set)(?:\s*(?:[${CMD_BOUNDARY}]|$))`,
-    String.raw`(?:^|[${CMD_BOUNDARY}]\s*)export\s+-p(?:\s*(?:[${CMD_BOUNDARY}]|$))`,
-    String.raw`(?:^|[${CMD_BOUNDARY}]\s*)declare\s+-x(?:\s*(?:[${CMD_BOUNDARY}]|$))`,
-    String.raw`(?:^|[${CMD_BOUNDARY}]\s*)cat\s+\/proc\/(?:self|\d+)\/environ(?:\s*(?:[${CMD_BOUNDARY}]|$))`,
+    String.raw`(?:^|[${CMD_START}]\s*)(?:command\s+)?(?:\/usr\/bin\/)?(?:env|printenv)${ENV_DUMP_OPTION_RUN}(?:\s*(?:[${CMD_BOUNDARY}]|$))`,
+    String.raw`(?:^|[${CMD_START}]\s*)(?:set)(?:\s*(?:[${CMD_BOUNDARY}]|$))`,
+    String.raw`(?:^|[${CMD_START}]\s*)export\s+-p(?:\s*(?:[${CMD_BOUNDARY}]|$))`,
+    String.raw`(?:^|[${CMD_START}]\s*)declare\s+-x(?:\s*(?:[${CMD_BOUNDARY}]|$))`,
+    String.raw`(?:^|[${CMD_START}]\s*)cat\s+\/proc\/(?:self|\d+)\/environ(?:\s*(?:[${CMD_BOUNDARY}]|$))`,
     String.raw`\/proc\/(?:self|\d+)\/environ`,
   ].join("|"),
   "i",
@@ -141,7 +173,7 @@ export const ENV_GUARD_SCRIPT = String.raw`#!/usr/bin/env node
 const SAFE_ENV_INSPECTION_RE =
   /^(?:node[ \t]+)?(?:[^\s;&|()<>]*\/)?(?:safe-env-inspect(?:\.mjs)?|paperclip-safe-env)(?:[ \t]+[^;&|()<>$\x60\r\n]*)?$/;
 const SHELL_WRAPPER_RE = /^(?:\/bin\/)?(?:ba|z|)?sh\s+-l?c\s+(["'])([\s\S]*)\1\s*$/;
-const FULL_ENV_DUMP_RE = /(?:^|[;&|()\x60\r\n]\s*)(?:command\s+)?(?:\/usr\/bin\/)?(?:env|printenv)(?:[ \t]+(?:(?:-u|--unset)[ \t]+[^\s;&|()<>]+|-[^\s;&|()<>]*))*(?:\s*(?:[;&|()\x60\r\n]|$))|(?:^|[;&|()\x60\r\n]\s*)(?:set)(?:\s*(?:[;&|()\x60\r\n]|$))|(?:^|[;&|()\x60\r\n]\s*)export\s+-p(?:\s*(?:[;&|()\x60\r\n]|$))|(?:^|[;&|()\x60\r\n]\s*)declare\s+-x(?:\s*(?:[;&|()\x60\r\n]|$))|(?:^|[;&|()\x60\r\n]\s*)cat\s+\/proc\/(?:self|\d+)\/environ(?:\s*(?:[;&|()\x60\r\n]|$))|\/proc\/(?:self|\d+)\/environ/i;
+const FULL_ENV_DUMP_RE = /(?:^|[;&|()\x60\r\n \t]\s*)(?:command\s+)?(?:\/usr\/bin\/)?(?:env|printenv)(?:[ \t]+(?:(?:-u|--unset)[ \t]+[^\s;&|()<>]+|-[^\s;&|()<>]*))*(?:\s*(?:[;&|()\x60\r\n]|$))|(?:^|[;&|()\x60\r\n \t]\s*)(?:set)(?:\s*(?:[;&|()\x60\r\n]|$))|(?:^|[;&|()\x60\r\n \t]\s*)export\s+-p(?:\s*(?:[;&|()\x60\r\n]|$))|(?:^|[;&|()\x60\r\n \t]\s*)declare\s+-x(?:\s*(?:[;&|()\x60\r\n]|$))|(?:^|[;&|()\x60\r\n \t]\s*)cat\s+\/proc\/(?:self|\d+)\/environ(?:\s*(?:[;&|()\x60\r\n]|$))|\/proc\/(?:self|\d+)\/environ/i;
 function unwrapShell(command) {
   let current = String(command || "").trim();
   for (let i = 0; i < 3; i += 1) {

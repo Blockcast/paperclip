@@ -77,8 +77,42 @@ describe("classifyAgentShellCommand", () => {
     "`printenv`",
     "echo $(cat /proc/self/environ)",
     'sh -lc "echo $(env)"',
+    // UNQUOTED command wrappers. `SHELL_WRAPPER_RE` only unwraps a *quoted* `-c`
+    // payload, and a space was not a command boundary — so every form below
+    // reached the detector with the dump sitting after a space, matched nothing,
+    // and was ALLOWED. Measured against the real spawned pod script before the
+    // fix: 9 of 9 allowed. Fixed by treating whitespace as a possible command
+    // *start* (leading side only), which closes the whole wrapper class at once
+    // rather than enumerating wrapper utilities.
+    "sh -c env",
+    "bash -c env",
+    "/bin/sh -c env",
+    "zsh -c env",
+    "sh -lc env",
+    "sh -c printenv",
+    "bash -c set",
+    "eval env",
+    "eval printenv",
+    // Wrappers that are not shells at all — the reason this is a character-class
+    // rule and not a list of shell binaries.
+    "xargs env",
+    "nohup env",
+    "timeout 5 env",
+    "nice env",
+    "setsid printenv",
+    "su -c env",
+    "watch env",
   ];
   const allowed = [
+    // The trailing terminator deliberately does NOT include whitespace, which is
+    // what keeps an operand-bearing invocation out of the dump class. These are
+    // the regression guard for the wrapper fix above: it must not start matching
+    // a dump utility that is followed by an operand.
+    "grep env file.txt",
+    "grep -r env src/",
+    "cat .env",
+    "kubectl set image deploy/x c=y",
+    "git commit -m 'add env parsing'",
     // Legitimate env USE (set-and-run) must not be blocked.
     "env FOO=bar node script.js",
     "printenv PATH",
@@ -198,6 +232,18 @@ describe("embedded guard script (real node process)", () => {
     "X=$(printenv)",
     "(env)",
     'sh -lc "echo $(env)"',
+    // Unquoted command wrappers, in the real spawned artifact. The embedded
+    // script carries its own regex literals, so the leading-boundary widening
+    // has to be pinned here too and not only on the TypeScript classifier.
+    "sh -c env",
+    "bash -c env",
+    "/bin/sh -c env",
+    "zsh -c env",
+    "sh -c printenv",
+    "eval env",
+    "xargs env",
+    "nohup env",
+    "timeout 5 env",
   ]) {
     it(`exits 2 on compound bypass: ${JSON.stringify(cmd)}`, () => {
       const { status, stderr } = runGuardScript({ tool_name: "Bash", tool_input: { command: cmd } });

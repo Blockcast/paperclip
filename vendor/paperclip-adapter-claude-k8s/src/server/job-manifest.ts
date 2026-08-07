@@ -56,6 +56,28 @@ function sanitizeForK8sPath(value: string): string {
   return value.replace(/[^a-zA-Z0-9-]/g, "");
 }
 
+/**
+ * Validates an operator-configured filesystem path that is both used as a
+ * Kubernetes `mountPath` and interpolated into a container's `sh -c` command.
+ *
+ * Quoting at each interpolation site is what *guarantees* the shell treats these
+ * as one word; this is the second, independent defence, and it fails the
+ * manifest build loudly instead of emitting a Pod whose init command contains
+ * operator-supplied shell syntax. Kubernetes independently requires an absolute
+ * mountPath, so rejecting a relative one here only moves that error earlier.
+ */
+function assertSafeAbsolutePath(field: string, value: string): void {
+  if (!path.posix.isAbsolute(value)) {
+    throw new Error(`${field} must be an absolute path: ${value}`);
+  }
+  // Anything that could terminate a word, chain a command, expand, redirect, or
+  // start a new line. Deliberately a denylist of shell-active characters rather
+  // than an allowlist, so ordinary path punctuation (`.`, `-`, `_`, `/`) works.
+  if (/[;&|()<>$`'"\\\r\n\t*?\[\]{}!#~ ]/.test(value)) {
+    throw new Error(`${field} contains characters that are unsafe in a shell command: ${value}`);
+  }
+}
+
 export function buildPodLogPath(companyId: string, agentId: string, runId: string, isolationKey?: string): string {
   const dir = isolationKey
     ? `/paperclip/instances/default/data/run-logs/${companyId}/${agentId}/isolated/${isolationKey}`
@@ -963,16 +985,36 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const envWorkspaceMountPath = asString(config.workspaceMountPath, "").trim();
   const dataClaimName = envWorkspaceClaim || selfPod.pvcClaimName || "";
   const dataMountPath = envWorkspaceMountPath || "/paperclip";
-  if (dataClaimName) {
-    volumes.push({
-      name: "data",
-      persistentVolumeClaim: { claimName: dataClaimName },
-    });
-    volumeMounts.push({
-      name: "data",
-      mountPath: dataMountPath,
-    });
-  }
+  if (envWorkspaceMountPath) assertSafeAbsolutePath("config.workspaceMountPath", envWorkspaceMountPath);
+  // The `data` volume is ALWAYS declared — PVC-backed when a claim is
+  // configured, `emptyDir` otherwise.
+  //
+  // It was previously declared only alongside a claim, which forced every
+  // consumer to mirror that condition on its mount. Two failure modes came out
+  // of that, at different stages: an unconditional mount emitted a Pod that
+  // Kubernetes rejects outright (a volumeMount naming an undeclared volume is
+  // an admission error for the *whole* Pod), and the conditional mount that
+  // replaced it merely moved the failure later — the init container still runs
+  // `mkdir -p ${dataMountPath}/instances/...` unconditionally as runAsUser:1000,
+  // which is EACCES on the image's read-only root when nothing is mounted there.
+  // So no-PVC could not start either way.
+  //
+  // Declaring the volume unconditionally removes the condition instead of
+  // duplicating it: mounts are unconditional again (so the two lists cannot
+  // drift), the Pod always passes admission, and the mount point is always
+  // writable. Without a claim the state is ephemeral and dies with the pod,
+  // which is the honest semantic for "no persistent claim configured" — and is
+  // strictly better than rejecting the configuration, since a run that keeps no
+  // persistent state still completes.
+  volumes.push(
+    dataClaimName
+      ? { name: "data", persistentVolumeClaim: { claimName: dataClaimName } }
+      : { name: "data", emptyDir: {} },
+  );
+  volumeMounts.push({
+    name: "data",
+    mountPath: dataMountPath,
+  });
 
   // Mount secret volumes inherited from the Deployment pod
   for (const sv of selfPod.secretVolumes) {
@@ -1054,20 +1096,34 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   //      rather than passed on;
   //   2. single-quote the whole `--accounts` value, which is what actually
   //      guarantees the shell treats it as one literal word.
-  // Dropping invalid entries is fail-safe: if every entry is rejected the
-  // segment is empty and we fall back to documented global rotation.
+  //
+  // Absent configuration and invalid configuration are deliberately NOT the same
+  // thing. Dropping invalid entries and emitting no `--accounts` segment looks
+  // fail-safe but is fail-*open*: an operator who scoped this environment to a
+  // specific pool would silently get ccrotate's documented *global* rotation
+  // instead, consuming credentials from outside the pool they asked for —
+  // widening credential scope on a config typo. So:
+  //   - no `accounts` key at all      → global rotation (the documented default)
+  //   - a configured pool, some valid → use the valid entries
+  //   - a configured pool, none valid → skip rotation entirely, and say so
   const quoteShellArg = (value: string) => `'${value.replace(/'/g, "'\\''")}'`;
   const ACCOUNT_ID_RE = /^[A-Za-z0-9._%+-]+(?:@[A-Za-z0-9.-]+)?$/;
   const providersConfig = parseObject(config.providers);
   const anthropicConfig = parseObject(providersConfig.anthropic);
-  const anthropicAccounts = Array.isArray(anthropicConfig.accounts)
-    ? (anthropicConfig.accounts as ReadonlyArray<unknown>).filter(
-        (s): s is string => typeof s === "string" && s.length > 0 && ACCOUNT_ID_RE.test(s),
-      )
-    : [];
+  const rawAnthropicAccounts = Array.isArray(anthropicConfig.accounts)
+    ? (anthropicConfig.accounts as ReadonlyArray<unknown>)
+    : null;
+  const anthropicAccounts = (rawAnthropicAccounts ?? []).filter(
+    (s): s is string => typeof s === "string" && s.length > 0 && ACCOUNT_ID_RE.test(s),
+  );
+  // A non-empty pool was configured but nothing in it survived validation.
+  const accountPoolConfiguredButUnusable =
+    rawAnthropicAccounts !== null && rawAnthropicAccounts.length > 0 && anthropicAccounts.length === 0;
   const accountsArg =
     anthropicAccounts.length > 0 ? ` --accounts ${quoteShellArg(anthropicAccounts.join(","))}` : "";
-  const ccrotateRefresh = `(command -v ccrotate >/dev/null 2>&1 && ccrotate next --yes --target claude${accountsArg} >/dev/null 2>&1) || true`;
+  const ccrotateRefresh = accountPoolConfiguredButUnusable
+    ? `echo "[paperclip] providers.anthropic.accounts was configured but no entry is a valid account identifier; skipping ccrotate rather than falling back to global rotation" >&2`
+    : `(command -v ccrotate >/dev/null 2>&1 && ccrotate next --yes --target claude${accountsArg} >/dev/null 2>&1) || true`;
   // RCA 2026-05-06: terminal rate-limit fail-fast. Before this, a
   // `rate_limit_event` with `overageStatus:"rejected"` +
   // `overageDisabledReason:"out_of_credits"` was not a terminal signal to
@@ -1191,6 +1247,16 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // that dies with the pod.
   const browserHome = isolation.enabled ? isolation.homeRoot : dataMountPath;
   const browserMetricsTarget = isolation.enabled ? `${isolation.cacheRoot}/chrome-browser-metrics` : `${RUNTIME_CACHE_MOUNT_PATH}/chrome-browser-metrics`;
+  // Every path below is operator-configurable (`config.workspaceMountPath` →
+  // `dataMountPath`, `config.homeRoot` → `isolation.homeRoot`) and is
+  // interpolated into the init container's `sh -c`, which runs *before* the
+  // Claude PreToolUse guard is installed — so an unquoted `/tmp/x; env; #` as a
+  // mount path would execute with the prompt/MCP/PVC mounts already attached.
+  // Quote at every interpolation site; `assertSafeAbsolutePath` (applied where
+  // these are derived) is the second, independent defence.
+  const browserChromeDir = quoteShellArg(`${browserHome}/.config/google-chrome`);
+  const browserMetricsLink = quoteShellArg(`${browserHome}/.config/google-chrome/BrowserMetrics`);
+  const browserMetricsTargetQ = quoteShellArg(browserMetricsTarget);
   initCommandParts.push(
     ...(isolation.enabled
       ? [`mkdir -p ${[isolation.homeRoot, isolation.sessionRoot, isolation.workspaceRoot, isolation.cacheRoot, isolation.tmpRoot, isolation.promptCacheRoot]
@@ -1198,19 +1264,16 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
           .map(quoteShellArg)
           .join(" ")}`]
       : []),
-    `mkdir -p ${browserHome}/.config/google-chrome ${browserMetricsTarget}`,
-    `[ -L ${browserHome}/.config/google-chrome/BrowserMetrics ] || { rm -rf ${browserHome}/.config/google-chrome/BrowserMetrics; ln -sfn ${browserMetricsTarget} ${browserHome}/.config/google-chrome/BrowserMetrics; }`,
+    `mkdir -p ${browserChromeDir} ${browserMetricsTargetQ}`,
+    `[ -L ${browserMetricsLink} ] || { rm -rf ${browserMetricsLink}; ln -sfn ${browserMetricsTargetQ} ${browserMetricsLink}; }`,
   );
-  // Mirror the main container's conditional `data` mount. The `data` volume is
-  // only declared when a claim is configured (see `dataClaimName` above), and
-  // the Kubernetes API rejects the whole Pod when a volumeMount names a volume
-  // that does not exist — so mounting it unconditionally here made every no-PVC
-  // configuration emit an invalid manifest, failing at admission rather than
-  // degrading. `job-manifest.test.ts` pins the invariant ("every volumeMount
-  // resolves to a declared volume", asserted across both containers and every
-  // PVC/secret combination) so the two lists cannot drift apart again.
+  // The `data` volume is declared unconditionally above (PVC-backed, or an
+  // `emptyDir` when no claim is configured), so this mount needs no condition
+  // and cannot drift from the main container's list. `job-manifest.test.ts` pins
+  // the invariant ("every volumeMount resolves to a declared volume", asserted
+  // across both containers and every PVC/secret combination).
   const initVolumeMounts: k8s.V1VolumeMount[] = [
-    ...(dataClaimName ? [{ name: "data", mountPath: dataMountPath }] : []),
+    { name: "data", mountPath: dataMountPath },
     { name: "prompt", mountPath: "/tmp/prompt" },
     // Needed so the BrowserMetrics symlink target above resolves in the init
     // container; same emptyDir instance the main container mounts.
