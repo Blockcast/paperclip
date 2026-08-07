@@ -115,6 +115,95 @@ describeEmbeddedPostgres("external runtime reservations", () => {
     expect(metrics.body).toContain(`${EXTERNAL_RUNTIME_RESERVATION_EVENTS_METRIC}{event="contended"} 1`);
   });
 
+  function eventCount(body: string, event: string): number {
+    const match = new RegExp(
+      `^${EXTERNAL_RUNTIME_RESERVATION_EVENTS_METRIC}\\{event="${event}"\\} (\\d+)`,
+      "m",
+    ).exec(body);
+    return match ? Number(match[1]) : 0;
+  }
+
+  // BLO-23009: the pool walks slots 0..maxSlots-1 to find a free one, so a probe
+  // losing to an occupied slot is an inner step of one dispatch attempt -- not an
+  // independent contention event. Booking it per probe made `contended` a
+  // scan-depth counter that over-reported by up to maxSlots x (observed
+  // contended:reserved ~ 1340:1 on a merely-saturated fleet) and fired one
+  // full-table metrics aggregate per probe under the agent start lock.
+  it("books exactly one claim event per dispatch attempt, not one per slot probe", async () => {
+    const runIds = await seedQueuedRuns(4);
+    const now = new Date("2026-08-07T21:00:00.000Z");
+
+    // Fill all three slots.
+    for (const runId of runIds.slice(0, 3)) {
+      expect(await claimRunWithExternalRuntimeSlotPool(db, runId, now, 3)).not.toBeNull();
+    }
+
+    __resetMetricsForTest();
+    // A fourth attempt probes all 3 occupied slots and loses.
+    expect(await claimRunWithExternalRuntimeSlotPool(db, runIds[3], now, 3)).toBeNull();
+
+    const exhausted = (await renderMetrics()).body;
+    expect(eventCount(exhausted, "contended")).toBe(1);
+    expect(eventCount(exhausted, "reserved")).toBe(0);
+  });
+
+  it("books a single reserved event when a claim wins a later slot in the pool", async () => {
+    const runIds = await seedQueuedRuns(3);
+    const now = new Date("2026-08-07T21:05:00.000Z");
+
+    // Occupy slots 0 and 1 so the third claim only wins after probing both.
+    for (const runId of runIds.slice(0, 2)) {
+      expect(await claimRunWithExternalRuntimeSlotPool(db, runId, now, 3)).not.toBeNull();
+    }
+
+    __resetMetricsForTest();
+    expect(await claimRunWithExternalRuntimeSlotPool(db, runIds[2], now, 3)).not.toBeNull();
+
+    const won = (await renderMetrics()).body;
+    expect(eventCount(won, "reserved")).toBe(1);
+    // The two losing probes are internal to a successful claim.
+    expect(eventCount(won, "contended")).toBe(0);
+  });
+
+  // BLO-23009: the reconcile loop re-observes every running Job every cycle. The
+  // steady-state no-op path returned the reservation unchanged but still booked a
+  // `launched` event plus a count(*) aggregate -- measured at 25.8/s on an
+  // otherwise idle fleet.
+  it("does not re-book a launched event when re-observing an unchanged running Job", async () => {
+    const [runId] = await seedQueuedRuns(1);
+    await claimRunWithExternalRuntimeSlot(db, runId, new Date());
+    await markExternalRuntimeReservationLaunching(db, runId);
+    await recordExpectedExternalRuntimeJobName(db, { runId, jobName: "agent-opencode-run-1" });
+
+    const first = await recordExternalRuntimeJobIdentity(db, {
+      runId,
+      jobName: "agent-opencode-run-1",
+      jobUid: "uid-1",
+    });
+    expect(first?.state).toBe("launched");
+    expect(eventCount((await renderMetrics()).body, "launched")).toBe(1);
+
+    __resetMetricsForTest();
+    const reobserved = await recordExternalRuntimeJobIdentity(db, {
+      runId,
+      jobName: "agent-opencode-run-1",
+      jobUid: "uid-1",
+    });
+
+    // Still resolves to the same reservation -- callers rely on non-null here.
+    expect(reobserved?.id).toBe(first?.id);
+    expect(reobserved?.state).toBe("launched");
+    expect(eventCount((await renderMetrics()).body, "launched")).toBe(0);
+
+    // The run row still carries the stamp; it just is not rewritten each cycle.
+    const run = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0]);
+    expect(run.externalRunId).toBe("agent-opencode-run-1");
+  });
+
   it("atomically fills a bounded slot pool without over-claiming", async () => {
     const runIds = await seedQueuedRuns(3);
     const now = new Date("2026-07-14T12:00:00.000Z");

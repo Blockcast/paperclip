@@ -196,9 +196,26 @@ async function claimRunWithExternalRuntimeSlotOutcome(
     outcome = { claimed: null, taskBlocked: false };
   }
 
-  recordExternalRuntimeReservationEvent(outcome.claimed ? "reserved" : "contended");
-  refreshExternalRuntimeReservationMetricsBestEffort(db, claimedAt, "claim");
   return outcome;
+}
+
+/**
+ * Emits exactly one claim event per *dispatch attempt*, not per slot probe.
+ *
+ * `claimRunWithExternalRuntimeSlotPool` walks slots 0..maxSlots-1 looking for a
+ * free one, so a probe losing to an already-occupied slot is the expected inner
+ * step of a successful claim -- not an independent contention event. Recording
+ * inside the probe made `contended` a scan-depth counter: one attempt against a
+ * full 15-slot agent booked 15 increments, so the metric over-reported real
+ * contention by up to maxSlots x and grew superlinearly with fleet concurrency
+ * (observed contended:reserved ~ 1340:1 while dispatch was merely saturated).
+ * It also fired the `count(*)+min()` metrics refresh once per probe, turning a
+ * single dispatch into maxSlots full-table aggregates under the agent start
+ * lock -- the actual source of "agent start lock held longer than expected".
+ */
+function recordExternalRuntimeClaimAttempt(db: Db, claimedAt: Date, claimed: boolean) {
+  recordExternalRuntimeReservationEvent(claimed ? "reserved" : "contended");
+  refreshExternalRuntimeReservationMetricsBestEffort(db, claimedAt, "claim");
 }
 
 export async function claimRunWithExternalRuntimeSlot(
@@ -215,6 +232,7 @@ export async function claimRunWithExternalRuntimeSlot(
     slotId,
     options,
   );
+  recordExternalRuntimeClaimAttempt(db, claimedAt, Boolean(outcome.claimed));
   return outcome.claimed;
 }
 
@@ -234,9 +252,17 @@ export async function claimRunWithExternalRuntimeSlotPool(
       slotId,
       options,
     );
-    if (outcome.claimed) return outcome.claimed;
-    if (outcome.taskBlocked) return null;
+    if (outcome.claimed) {
+      recordExternalRuntimeClaimAttempt(db, claimedAt, true);
+      return outcome.claimed;
+    }
+    if (outcome.taskBlocked) {
+      recordExternalRuntimeClaimAttempt(db, claimedAt, false);
+      return null;
+    }
   }
+  // Every slot was occupied: one genuine contention event for the whole attempt.
+  recordExternalRuntimeClaimAttempt(db, claimedAt, false);
   return null;
 }
 
@@ -588,7 +614,7 @@ export async function recordExternalRuntimeJobIdentity(
   },
 ): Promise<ExternalRuntimeReservation | null> {
   const now = input.now ?? new Date();
-  const reservation = await db.transaction(async (tx) => {
+  const outcome = await db.transaction(async (tx) => {
     const existing = await tx
       .select()
       .from(externalRuntimeReservations)
@@ -617,11 +643,20 @@ export async function recordExternalRuntimeJobIdentity(
       );
     }
     if (existing.state === "launched" && existing.jobName && (!input.jobUid || existing.jobUid === input.jobUid)) {
+      // Steady-state re-observation of an already-launched Job. Only touch the
+      // run row when externalRunId actually changes (IS DISTINCT FROM, so a
+      // NULL still gets stamped) -- an unconditional set wrote updatedAt on
+      // every running run every reconcile cycle. No state transition happened,
+      // so the caller must not book a `launched` event for it either.
       await tx
         .update(heartbeatRuns)
         .set({ externalRunId: input.jobName, updatedAt: now })
-        .where(and(eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.status, "running")));
-      return existing;
+        .where(and(
+          eq(heartbeatRuns.id, input.runId),
+          eq(heartbeatRuns.status, "running"),
+          sql`${heartbeatRuns.externalRunId} IS DISTINCT FROM ${input.jobName}`,
+        ));
+      return { reservation: existing, transitioned: false };
     }
     if (existing.state !== "launching" && existing.state !== "launched") {
       throw new Error(`External runtime reservation for run ${input.runId} is not launchable from ${existing.state}`);
@@ -644,12 +679,12 @@ export async function recordExternalRuntimeJobIdentity(
       .update(heartbeatRuns)
       .set({ externalRunId: input.jobName, updatedAt: now })
       .where(and(eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.status, "running")));
-    return updated;
+    return { reservation: updated, transitioned: true };
   });
 
-  if (reservation) {
+  if (outcome?.transitioned) {
     recordExternalRuntimeReservationEvent("launched");
     refreshExternalRuntimeReservationMetricsBestEffort(db, now, "launch");
   }
-  return reservation;
+  return outcome?.reservation ?? null;
 }
