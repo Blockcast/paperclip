@@ -8,7 +8,7 @@ import {
   applyRunScopeToBranchName,
   realizeExecutionWorkspace,
 } from "../services/workspace-runtime.ts";
-import { parseIssueExecutionWorkspaceSettings } from "../services/execution-workspace-policy.ts";
+import { parseIssueExecutionWorkspaceSettings, buildExecutionWorkspaceAdapterConfig } from "../services/execution-workspace-policy.ts";
 import { issueExecutionWorkspaceSettingsSchema } from "@paperclipai/shared";
 
 /**
@@ -270,5 +270,24 @@ describe("runScope is reachable by configuration (AC3)", () => {
       workspaceStrategy: { type: "git_worktree", runScope: "nonsense" },
     });
     expect(settings?.workspaceStrategy?.runScope).toBeUndefined();
+  });
+
+  it("survives issue settings -> adapter config, which is what realize actually reads", () => {
+    // Closes the gap between "the validator accepts it" and "the runtime sees
+    // it": realizeExecutionWorkspace reads config.workspaceStrategy, so a scope
+    // that parsed cleanly but was dropped on the way into the adapter config
+    // would be silently inert.
+    const issueSettings = parseIssueExecutionWorkspaceSettings({
+      mode: "isolated_workspace",
+      workspaceStrategy: { type: "git_worktree", runScope: "per_run" },
+    });
+    const config = buildExecutionWorkspaceAdapterConfig({
+      agentConfig: {},
+      projectPolicy: null,
+      issueSettings,
+      mode: "isolated_workspace",
+      legacyUseProjectWorkspace: null,
+    });
+    expect((config.workspaceStrategy as Record<string, unknown>).runScope).toBe("per_run");
   });
 });
