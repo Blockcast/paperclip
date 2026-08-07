@@ -123,18 +123,40 @@ const OWNING_REFERENCE_LABEL_PATTERN =
 // OPEN, which fails closed to "no owning reference" -- the safe direction,
 // since the caller then drops the wake or sends it to the reviewer rather than
 // guessing an owner.
-const MARKDOWN_FENCE_PATTERN = /^ {0,3}(?:[-*+]|\d{1,3}[.)])?[ \t]*(`{3,}|~{3,})(.*)$/;
+const MARKDOWN_FENCE_PATTERN = /^( {0,3}(?:[-*+]|\d{1,3}[.)])?[ \t]*)(`{3,}|~{3,})(.*)$/;
 // A CLOSING fence is a strictly narrower grammar than an opening one, and
 // reusing the opener here was a real leak: the opener tolerates a list marker
 // (`- ```) because a fence nested in a list item is ordinary Markdown, but
-// CommonMark gives a closing fence no such latitude -- it admits up to three
-// leading spaces, the marker run, then nothing but whitespace. A line like
-// `- ``` ` sitting inside an open fence is therefore CONTENT, and accepting it
-// as the close reopened the remainder of the block to ownership matching,
-// exposing a following `Refs:` example exactly the way an unfenced one would.
-const MARKDOWN_FENCE_CLOSE_PATTERN = /^ {0,3}(`{3,}|~{3,})[ \t]*$/;
+// CommonMark gives a closing fence no such latitude -- it admits the marker run
+// and then nothing but whitespace. A line like `- ``` ` sitting inside an open
+// fence is therefore CONTENT, and accepting it as the close reopened the
+// remainder of the block to ownership matching, exposing a following `Refs:`
+// example exactly the way an unfenced one would.
+//
+// Leading whitespace is CAPTURED rather than bounded at three spaces, because
+// the three-space allowance is relative to the fence's CONTAINER, not to column
+// zero. A fence opened inside a nested list item (`  - ```md`) has its content
+// and its closer indented to match that container, so the closer legitimately
+// carries four or more raw spaces. Bounding it at three meant such a fence never
+// closed: the scanner swallowed the rest of the body and suppressed every
+// genuinely visible `Refs:`/`Issue:` line after it, dropping an owning wake that
+// should have been delivered. The caller compares this indent against the
+// opener's own marker column -- see visibleMarkdownLines -- which keeps the
+// closer no more permissive than CommonMark allows for that container.
+const MARKDOWN_FENCE_CLOSE_PATTERN = /^([ \t]*)(`{3,}|~{3,})[ \t]*$/;
 const TRAILING_NON_OWNING_LABEL_PATTERN =
   /(?:[;,][ \t]*|[ \t]+)(?:related|supersedes?|see[ \t]+also)[ \t]*:/i;
+
+/**
+ * Expand `text` to CommonMark columns, where a tab advances to the next
+ * 4-column tab stop. Every non-tab character counts as one column, so this also
+ * measures a prefix that includes a list marker.
+ */
+function expandedColumns(text: string): number {
+  let columns = 0;
+  for (const char of text) columns += char === "\t" ? 4 - (columns % 4) : 1;
+  return columns;
+}
 
 /**
  * Leading indentation of `line` in CommonMark columns, where a tab advances to
@@ -159,6 +181,12 @@ function leadingIndentColumns(line: string): number {
   return columns;
 }
 
+// A list-item marker, used only to track how far the enclosing container
+// indents its content -- see the closing-fence allowance in
+// visibleMarkdownLines. Requires whitespace after the marker so that a setext
+// underline (`---`) or a `*emphasis*` line is not mistaken for a list.
+const MARKDOWN_LIST_ITEM_PATTERN = /^([ \t]*)([-*+]|\d{1,3}[.)])([ \t]+)/;
+
 /**
  * Yield the lines of `body` that a human actually SEES rendered: fenced code,
  * HTML comments, and indented code blocks are removed.
@@ -178,13 +206,25 @@ function leadingIndentColumns(line: string): number {
  * wake or sends it to the reviewer, which is the safe direction.
  */
 function* visibleMarkdownLines(body: string): Generator<string> {
-  let fence: { marker: "`" | "~"; length: number } | null = null;
+  let fence: { marker: "`" | "~"; length: number; containerColumn: number } | null = null;
   let htmlComment = false;
+  // Content columns of the currently-open list items, outermost first. Only
+  // purpose is to bound the closing fence: CommonMark measures a closing
+  // fence's three-space allowance from its CONTAINER, not from column zero.
+  const listContentColumns: number[] = [];
   for (const line of body.split(/\r?\n/)) {
     if (fence) {
       // Fenced content is literal: no comment stripping, no label matching.
-      const closer = line.match(MARKDOWN_FENCE_CLOSE_PATTERN)?.[1];
-      if (closer && closer[0] === fence.marker && closer.length >= fence.length) fence = null;
+      const closeMatch = line.match(MARKDOWN_FENCE_CLOSE_PATTERN);
+      const closer = closeMatch?.[2];
+      if (
+        closer &&
+        closer[0] === fence.marker &&
+        closer.length >= fence.length &&
+        expandedColumns(closeMatch?.[1] ?? "") <= fence.containerColumn + 3
+      ) {
+        fence = null;
+      }
       continue;
     }
 
@@ -196,11 +236,36 @@ function* visibleMarkdownLines(body: string): Generator<string> {
     // Indentation is read from the raw line because that is what determines
     // CommonMark block structure, and checked before the fence so an indented
     // ``` is code rather than a fence opener.
-    if (leadingIndentColumns(line) >= 4) continue;
+    const indent = leadingIndentColumns(line);
+    if (indent >= 4) continue;
+
+    // Track list containers before reading the fence, so a fence opened on the
+    // same line as its marker (`- ```md`) sees its own item.
+    const listMatch = line.match(MARKDOWN_LIST_ITEM_PATTERN);
+    if (listMatch) {
+      const markerColumn = expandedColumns(listMatch[1] ?? "");
+      while (listContentColumns.length && listContentColumns[listContentColumns.length - 1]! > markerColumn) {
+        listContentColumns.pop();
+      }
+      listContentColumns.push(expandedColumns(`${listMatch[1] ?? ""}${listMatch[2] ?? ""}${listMatch[3] ?? ""}`));
+    } else if (line.trim()) {
+      // A non-blank line dedented past a container ends it. Blank lines do not:
+      // a list item may contain several blocks.
+      while (listContentColumns.length && listContentColumns[listContentColumns.length - 1]! > indent) {
+        listContentColumns.pop();
+      }
+    }
 
     const fenceMatch = visible.match(MARKDOWN_FENCE_PATTERN);
-    if (fenceMatch?.[1]) {
-      fence = { marker: fenceMatch[1][0] as "`" | "~", length: fenceMatch[1].length };
+    if (fenceMatch?.[2]) {
+      const markerColumn = expandedColumns(fenceMatch[1] ?? "");
+      // The innermost container whose content this fence sits in.
+      const containerColumn = listContentColumns.filter((column) => column <= markerColumn).pop() ?? 0;
+      fence = {
+        marker: fenceMatch[2][0] as "`" | "~",
+        length: fenceMatch[2].length,
+        containerColumn,
+      };
       continue;
     }
 
@@ -348,6 +413,7 @@ export function extractHouseReferenceLabeledIdentifiers(body: string | null | un
  */
 export function extractBranchIdentifiers(branch: string | null | undefined): string[] {
   if (!branch) return [];
+  if (DEPENDENCY_BOT_BRANCH_PATTERN.test(branch)) return [];
   const found = new Set<string>();
   for (const match of branch.matchAll(BRANCH_IDENTIFIER_PATTERN)) {
     const token = match[1];
@@ -359,7 +425,22 @@ export function extractBranchIdentifiers(branch: string | null | undefined): str
   return Array.from(found);
 }
 
-// The trailing `(?!\.\d)` rejects a VERSION CONTINUATION, and it is what makes
+// A dependency bot names its branch after the PACKAGE it is bumping, never
+// after an issue, so nothing in one is an ownership claim. Skipping the two
+// reserved namespaces is exact rather than heuristic -- only the tools that own
+// these prefixes generate them.
+//
+// This is NOT redundant with the version guard below, and measurement is what
+// settles it: the guard can only reject a candidate whose digits continue into
+// a version, and the real branch shapes include plenty that carry no version
+// suffix at all. `renovate/node-20` yields `NODE-20` and
+// `dependabot/npm_and_yarn/undici-7` yields `UNDICI-7` with nothing for a
+// version guard to catch. Since ownership consults the branch when title and
+// labeled body are silent -- and a dependency-bump PR is silent in both -- that
+// manufactured token would be the SOLE owner of the PR.
+const DEPENDENCY_BOT_BRANCH_PATTERN = /^(?:dependabot|renovate)\//i;
+
+// The trailing `(?!\.\w)` rejects a VERSION CONTINUATION, and it is what makes
 // the segment anchor above actually hold. The anchor alone only helps when the
 // package name sits mid-segment (`blo-21612-undici-7.29.0`); it does nothing
 // when the package name STARTS a segment, which is exactly the shape Dependabot
@@ -369,10 +450,18 @@ export function extractBranchIdentifiers(branch: string | null | undefined): str
 // `NODE-20` (`dependabot/npm_and_yarn/types/node-20.11.5`) and `CHECKOUT-4`
 // (`dependabot/github_actions/actions/checkout-4.2.0`).
 //
-// A dot followed by a digit is unambiguously the rest of a semver, never part
-// of an issue ref -- conventional branches continue with `-` (`blo-20886-round5`)
-// or end (`sre/blo-20886`), so neither loses its ref here.
-const BRANCH_IDENTIFIER_PATTERN = /(?:^|\/)([A-Za-z][A-Za-z0-9]{1,9}-\d{1,6}(?:\/\d{1,6})*)\b(?!\.\d)/g;
+// The guard rejects a dot followed by any word character, not just a digit.
+// `\d` alone left WILDCARD versions live -- `renovate/node-20.x` resolved
+// `NODE-20`, and a dependency update is exactly the kind of PR whose title and
+// body name no issue, so it would have owned whatever issue shares that name.
+// A dot never appears inside a real ref: conventional branches continue with
+// `-` (`blo-20886-round5`), `/` (`blo-20886/2`) or end (`sre/blo-20886`), so
+// none of them loses its ref here.
+//
+// The guard still earns its place alongside the namespace skip above, because
+// the same package-version shape occurs OUTSIDE those namespaces -- a hand-cut
+// `bump-undici-7.29.0`, or a fork whose automation uses a different prefix.
+const BRANCH_IDENTIFIER_PATTERN = /(?:^|\/)([A-Za-z][A-Za-z0-9]{1,9}-\d{1,6}(?:\/\d{1,6})*)\b(?!\.\w)/g;
 
 export interface OwningIdentifierResolution {
   // The PR's authoritative issue identifier(s) -- empty when none was found.

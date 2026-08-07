@@ -290,6 +290,50 @@ describe("github-webhook pure helpers", () => {
     ).toEqual({ owning: ["BLO-1"] });
   });
 
+  it("closes a fence indented by its list container, without loosening a root fence (BLO-20886)", () => {
+    // CommonMark measures a closing fence's three-space allowance from the
+    // fence's CONTAINER, not from column zero. Bounding it at three raw spaces
+    // meant a fence opened inside a list item never closed: the scanner
+    // swallowed the rest of the body and suppressed every genuinely visible
+    // owning line after it, dropping a wake that should have been delivered.
+    //
+    // Every expectation here was checked against a real CommonMark
+    // implementation (marked 16.4.2) rather than read off the spec.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: ["- outer", "  - inner:", "", "  ```md", "  Refs: BLO-999", "    ```", "", "Refs: BLO-555"].join("\n"),
+      }),
+    ).toEqual({ owning: ["BLO-555"] });
+
+    // A fence opened on its own list-marker line closes at the item's content
+    // indent.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: ["- ```md", "  Refs: BLO-999", "  ```", "", "Refs: BLO-555"].join("\n"),
+      }),
+    ).toEqual({ owning: ["BLO-555"] });
+
+    // The counter-case that keeps this from becoming a leak: with NO list
+    // container, a four-space `` ``` `` is fenced content, not a closer, so the
+    // fence stays open and everything after it stays unowning. marked agrees --
+    // it renders BLO-555 inside the code block. This is the fail-closed
+    // direction and must not regress into an early close.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: ["```md", "Refs: BLO-999", "    ```", "", "Refs: BLO-555"].join("\n"),
+      }),
+    ).toEqual({ owning: [] });
+
+    // Same when the opener carries its own 1-3 spaces but no container: the
+    // allowance does not grow with the opener's own indent, only with the
+    // container's.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: ["   ```md", "   Refs: BLO-999", "    ```", "", "Refs: BLO-555"].join("\n"),
+      }),
+    ).toEqual({ owning: [] });
+  });
+
   it("treats mixed space-tab indentation as code by expanded columns (BLO-20886)", () => {
     // CommonMark expands tabs to 4-column stops, so ` \t`, `  \t` and `   \t`
     // are all four columns of indent -- an indented code block, exactly like
@@ -389,14 +433,44 @@ describe("github-webhook pure helpers", () => {
       expect(resolveOwningPaperclipIdentifiers({ branch })).toEqual({ owning: [] });
     }
 
-    // The guard keys on `.` + digit, which is only ever a semver tail. Real
-    // refs continue with `-` or end, so neither shape regresses.
+    // The guard keys on `.` + any word character, which never occurs inside a
+    // real ref. Real refs continue with `-`, `/` or end, so no shape regresses.
     expect(
       resolveOwningPaperclipIdentifiers({ branch: "cto/blo-20886-round5-ownership-leaks" }),
     ).toEqual({ owning: ["BLO-20886"] });
     expect(resolveOwningPaperclipIdentifiers({ branch: "sre/blo-20886" })).toEqual({
       owning: ["BLO-20886"],
     });
+  });
+
+  it("does not manufacture a branch owner from a wildcard version or a bot namespace (BLO-20886 round 7)", () => {
+    // A `.<digit>` guard left WILDCARD versions live. A dependency PR names no
+    // issue in its title or body, so the branch tier is the only one consulted
+    // and a manufactured token would be the PR's SOLE owner.
+    for (const branch of ["renovate/node-20.x", "renovate/undici-7.x", "bump-undici-7.29.0"]) {
+      expect(resolveOwningPaperclipIdentifiers({ branch })).toEqual({ owning: [] });
+    }
+
+    // A version guard cannot be the whole answer, and this is the measurement
+    // that shows it: these carry NO version suffix for the guard to key on, yet
+    // still manufactured `NODE-20` / `UNDICI-7`. Skipping the two reserved bot
+    // namespaces is what closes them -- a dependency bot names its branch after
+    // the package it bumps, so nothing in one is an ownership claim.
+    for (const branch of [
+      "renovate/node-20",
+      "dependabot/npm_and_yarn/undici-7",
+      "renovate/blo-1-not-an-owner",
+    ]) {
+      expect(resolveOwningPaperclipIdentifiers({ branch })).toEqual({ owning: [] });
+    }
+
+    // Ordinary branches keep their refs, including the sub-issue `/` form.
+    expect(resolveOwningPaperclipIdentifiers({ branch: "kkroo/blo-19132-approval-dedupe-v2" })).toEqual({
+      owning: ["BLO-19132"],
+    });
+    expect(
+      resolveOwningPaperclipIdentifiers({ branch: "blo-21610-brace-expansion-5.0.9" }),
+    ).toEqual({ owning: ["BLO-21610"] });
   });
 
   it("classifies a lowercase branch-only owner as branch_ref, not body_ref (BLO-20886 round 6)", () => {
