@@ -53,11 +53,44 @@ describe("classifyAgentShellCommand", () => {
     "env\nls -la",
     "echo ok\r\nenv",
     'sh -lc "echo ok\nenv"',
+    // Flag-only forms still dump the whole environment. Requiring a boundary
+    // immediately after the utility name let every one of these through:
+    // `-0`/`--null` dump NUL-separated, `-u NAME` dumps all but one variable.
+    "env -0",
+    "printenv -0",
+    "env --null",
+    "printenv --null",
+    "env -u PATH",
+    "env --unset PATH",
+    "command env -0",
+    "/usr/bin/env -0",
+    "ls && env -0",
+    "echo ok\nprintenv -0",
+    // Command substitution is a command boundary too — the dump runs and its
+    // output lands in the transcript just the same.
+    'echo "$(env)"',
+    "echo `env`",
+    "X=$(printenv)",
+    "(env)",
+    "$(set)",
+    "echo $(env -0 | head)",
+    "`printenv`",
+    "echo $(cat /proc/self/environ)",
+    'sh -lc "echo $(env)"',
   ];
   const allowed = [
     // Legitimate env USE (set-and-run) must not be blocked.
     "env FOO=bar node script.js",
     "printenv PATH",
+    // An operand — a command to run, or a single variable to print — is what
+    // makes these not-a-dump. Tightening the flag handling above must not
+    // swallow them, including through a substitution or after `--`.
+    "env NAME=value command",
+    "env FOO=1 BAR=2 ./run.sh",
+    "printenv HOME",
+    "PATH=$(printenv PATH)",
+    "env -- ls",
+    "docker run --env-file .env img",
     // set with flags is ubiquitous in agent shells.
     "set -euo pipefail",
     "set -e",
@@ -156,6 +189,15 @@ describe("embedded guard script (real node process)", () => {
     "echo ok\ndeclare -x",
     "echo ok\r\nenv",
     'sh -lc "echo ok\nenv"',
+    // Flag-only dumps and command substitution, in the real spawned artifact.
+    "env -0",
+    "printenv --null",
+    "env -u PATH",
+    'echo "$(env)"',
+    "echo `env`",
+    "X=$(printenv)",
+    "(env)",
+    'sh -lc "echo $(env)"',
   ]) {
     it(`exits 2 on compound bypass: ${JSON.stringify(cmd)}`, () => {
       const { status, stderr } = runGuardScript({ tool_name: "Bash", tool_input: { command: cmd } });
@@ -165,7 +207,14 @@ describe("embedded guard script (real node process)", () => {
   }
 
   // ...and the embedded copy must not over-block multi-line scripts either.
-  for (const cmd of ["cd /repo\nset -euo pipefail\nls -la", "cd /repo\npaperclip-safe-env"]) {
+  for (const cmd of [
+    "cd /repo\nset -euo pipefail\nls -la",
+    "cd /repo\npaperclip-safe-env",
+    "env FOO=bar node script.js",
+    "printenv HOME",
+    "PATH=$(printenv PATH)",
+    "env -- ls",
+  ]) {
     it(`exits 0 on benign multi-line: ${JSON.stringify(cmd)}`, () => {
       expect(runGuardScript({ tool_name: "Bash", tool_input: { command: cmd } }).status).toBe(0);
     });

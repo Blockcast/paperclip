@@ -43,19 +43,51 @@ const SAFE_ENV_INSPECTION_RE =
 const SHELL_WRAPPER_RE = /^(?:\/bin\/)?(?:ba|z|)?sh\s+-l?c\s+(["'])([\s\S]*)\1\s*$/;
 
 /**
- * `\r` and `\n` are command separators here for the same reason `;` is: in a
- * multi-line command string each line is its own command, so `echo ok\nenv` is
- * a dump. Like `;`, this is deliberately parser-free and errs toward blocking —
- * a bare `env` line inside a quoted string or heredoc also matches, exactly as
+ * Characters that end one command and begin another, for the purposes of the
+ * dump detector.
+ *
+ * `\r` / `\n` are separators for the same reason `;` is: in a multi-line command
+ * string each line is its own command, so `echo ok\nenv` is a dump.
+ *
+ * `(` / `)` / a backtick (`\x60`, spelled as an escape because this file embeds
+ * the same pattern inside a backtick-delimited `String.raw` template below) make
+ * command *substitution* a boundary as well. Without them `echo "$(env)"`,
+ * `X=$(printenv)` and `` `env` `` all reached the detector with `(` sitting
+ * where a boundary was required, matched nothing, and returned `allow` — a full
+ * dump straight into the transcript, which is the exact leak this guard exists
+ * to stop.
+ *
+ * Like `;`, this is deliberately parser-free and errs toward blocking — a bare
+ * `env` line inside a quoted string or heredoc also matches, exactly as
  * `echo "a; env"` already did. The safe helper remains the unblocked path.
  */
+const CMD_BOUNDARY = String.raw`;&|()\x60\r\n`;
+
+/**
+ * Option tokens that may follow `env` / `printenv` while the command is still a
+ * full dump.
+ *
+ * `env` and `printenv` only stop dumping once given an *operand* — a command to
+ * run (`env FOO=1 node x.js`) or a single variable to print (`printenv HOME`).
+ * Flags alone do not: `env -0` / `printenv --null` dump the whole environment
+ * NUL-separated, and `env -u PATH` dumps everything bar one variable. Requiring
+ * a boundary immediately after the utility name therefore let every flag form
+ * through. So: consume a run of option tokens, and treat the command as a dump
+ * only if nothing but options separates the utility from the next boundary.
+ *
+ * `-u` / `--unset` are matched with their argument so that the NAME they consume
+ * is not mistaken for an operand — otherwise `env -u PATH` would read as
+ * "runs the command PATH" and be allowed.
+ */
+const ENV_DUMP_OPTION_RUN = String.raw`(?:[ \t]+(?:(?:-u|--unset)[ \t]+[^\s;&|()<>]+|-[^\s;&|()<>]*))*`;
+
 const FULL_ENV_DUMP_RE = new RegExp(
   [
-    String.raw`(?:^|[;&|\r\n]\s*)(?:command\s+)?(?:\/usr\/bin\/)?(?:env|printenv)(?:\s*(?:[;&|\r\n]|$))`,
-    String.raw`(?:^|[;&|\r\n]\s*)(?:set)(?:\s*(?:[;&|\r\n]|$))`,
-    String.raw`(?:^|[;&|\r\n]\s*)export\s+-p(?:\s*(?:[;&|\r\n]|$))`,
-    String.raw`(?:^|[;&|\r\n]\s*)declare\s+-x(?:\s*(?:[;&|\r\n]|$))`,
-    String.raw`(?:^|[;&|\r\n]\s*)cat\s+\/proc\/(?:self|\d+)\/environ(?:\s*(?:[;&|\r\n]|$))`,
+    String.raw`(?:^|[${CMD_BOUNDARY}]\s*)(?:command\s+)?(?:\/usr\/bin\/)?(?:env|printenv)${ENV_DUMP_OPTION_RUN}(?:\s*(?:[${CMD_BOUNDARY}]|$))`,
+    String.raw`(?:^|[${CMD_BOUNDARY}]\s*)(?:set)(?:\s*(?:[${CMD_BOUNDARY}]|$))`,
+    String.raw`(?:^|[${CMD_BOUNDARY}]\s*)export\s+-p(?:\s*(?:[${CMD_BOUNDARY}]|$))`,
+    String.raw`(?:^|[${CMD_BOUNDARY}]\s*)declare\s+-x(?:\s*(?:[${CMD_BOUNDARY}]|$))`,
+    String.raw`(?:^|[${CMD_BOUNDARY}]\s*)cat\s+\/proc\/(?:self|\d+)\/environ(?:\s*(?:[${CMD_BOUNDARY}]|$))`,
     String.raw`\/proc\/(?:self|\d+)\/environ`,
   ].join("|"),
   "i",
@@ -102,7 +134,7 @@ export const ENV_GUARD_SCRIPT = String.raw`#!/usr/bin/env node
 const SAFE_ENV_INSPECTION_RE =
   /^(?:node[ \t]+)?(?:[^\s;&|()<>]*\/)?(?:safe-env-inspect(?:\.mjs)?|paperclip-safe-env)(?:[ \t]+[^;&|()<>$\x60\r\n]*)?$/;
 const SHELL_WRAPPER_RE = /^(?:\/bin\/)?(?:ba|z|)?sh\s+-l?c\s+(["'])([\s\S]*)\1\s*$/;
-const FULL_ENV_DUMP_RE = /(?:^|[;&|\r\n]\s*)(?:command\s+)?(?:\/usr\/bin\/)?(?:env|printenv)(?:\s*(?:[;&|\r\n]|$))|(?:^|[;&|\r\n]\s*)(?:set)(?:\s*(?:[;&|\r\n]|$))|(?:^|[;&|\r\n]\s*)export\s+-p(?:\s*(?:[;&|\r\n]|$))|(?:^|[;&|\r\n]\s*)declare\s+-x(?:\s*(?:[;&|\r\n]|$))|(?:^|[;&|\r\n]\s*)cat\s+\/proc\/(?:self|\d+)\/environ(?:\s*(?:[;&|\r\n]|$))|\/proc\/(?:self|\d+)\/environ/i;
+const FULL_ENV_DUMP_RE = /(?:^|[;&|()\x60\r\n]\s*)(?:command\s+)?(?:\/usr\/bin\/)?(?:env|printenv)(?:[ \t]+(?:(?:-u|--unset)[ \t]+[^\s;&|()<>]+|-[^\s;&|()<>]*))*(?:\s*(?:[;&|()\x60\r\n]|$))|(?:^|[;&|()\x60\r\n]\s*)(?:set)(?:\s*(?:[;&|()\x60\r\n]|$))|(?:^|[;&|()\x60\r\n]\s*)export\s+-p(?:\s*(?:[;&|()\x60\r\n]|$))|(?:^|[;&|()\x60\r\n]\s*)declare\s+-x(?:\s*(?:[;&|()\x60\r\n]|$))|(?:^|[;&|()\x60\r\n]\s*)cat\s+\/proc\/(?:self|\d+)\/environ(?:\s*(?:[;&|()\x60\r\n]|$))|\/proc\/(?:self|\d+)\/environ/i;
 function unwrapShell(command) {
   let current = String(command || "").trim();
   for (let i = 0; i < 3; i += 1) {

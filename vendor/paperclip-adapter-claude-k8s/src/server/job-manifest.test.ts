@@ -499,6 +499,59 @@ describe("buildJobManifest", () => {
       expect(job.spec?.template?.spec?.volumes?.find((v) => v.name === "data")).toBeUndefined();
     });
 
+    // Kubernetes rejects the entire Pod when any volumeMount names a volume the
+    // spec does not declare, so a mount/volume mismatch is not a degradation —
+    // it is an unschedulable Job. The init container used to mount `data`
+    // unconditionally while the volume itself was conditional on a claim, so
+    // every no-PVC configuration produced an invalid manifest. Assert the
+    // invariant over BOTH containers across the PVC/secret matrix rather than
+    // spot-checking one case, so the two lists cannot drift apart again.
+    describe("every volumeMount resolves to a declared volume", () => {
+      // Each row returns the name of the optional volume it is meant to bring
+      // into play (or null), so a row cannot silently stop exercising its case.
+      const matrix: Array<[string, () => string | null]> = [
+        ["with PVC", () => "data"],
+        ["no PVC", () => { selfPod.pvcClaimName = null; return null; }],
+        ["no PVC + secret volumes", () => {
+          selfPod.pvcClaimName = null;
+          selfPod.secretVolumes = [{
+            volumeName: "my-secret",
+            secretName: "app-secret",
+            mountPath: "/secrets/app",
+            defaultMode: 420,
+          }];
+          return "my-secret";
+        }],
+        ["no PVC + large prompt", () => {
+          selfPod.pvcClaimName = null;
+          // >256 KiB switches prompt delivery to the Secret-volume path, which
+          // adds its own init-container mount.
+          ctx.config = { promptTemplate: "x".repeat(300 * 1024) };
+          return "prompt-secret";
+        }],
+      ];
+
+      for (const [name, setup] of matrix) {
+        it(name, () => {
+          const expectVolume = setup();
+          const { job } = buildJobManifest({ ctx, selfPod });
+          const spec = job.spec?.template?.spec;
+          const declared = new Set((spec?.volumes ?? []).map((v) => v.name));
+          // Guard against a vacuous row: if a case is meant to exercise an
+          // optional volume, prove that volume is actually in play.
+          if (expectVolume) expect([...declared]).toContain(expectVolume);
+          const containers = [...(spec?.initContainers ?? []), ...(spec?.containers ?? [])];
+          expect(containers.length).toBeGreaterThan(0);
+          const dangling = containers.flatMap((c) =>
+            (c.volumeMounts ?? [])
+              .filter((vm) => !declared.has(vm.name))
+              .map((vm) => `${c.name}:${vm.name}`),
+          );
+          expect(dangling).toEqual([]);
+        });
+      }
+    });
+
     it("mounts secret volumes", () => {
       selfPod.secretVolumes = [{
         volumeName: "my-secret",
@@ -1270,7 +1323,50 @@ describe("buildJobManifest", () => {
       };
       const { job } = buildJobManifest({ ctx, selfPod });
       const cmd = job.spec?.template?.spec?.containers[0]?.command?.[2] ?? "";
-      expect(cmd).toContain("ccrotate next --yes --target claude --accounts a@b.net,c@d.net");
+      expect(cmd).toContain("ccrotate next --yes --target claude --accounts 'a@b.net,c@d.net'");
+    });
+
+    // The pool is operator config interpolated into the main container's
+    // `sh -c` string. Unquoted, an account carrying shell syntax runs as its
+    // own command *before* claude starts — i.e. ahead of the PreToolUse
+    // env-guard — so `env` there would dump the pod's inherited credentials to
+    // the log. Validation drops it; quoting is the backstop.
+    it("does not let shell metacharacters in an account become a command", () => {
+      ctx.config = {
+        providers: {
+          anthropic: {
+            accounts: ["a@example.test; env; #", "b@example.test"],
+          },
+        },
+      };
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const cmd = job.spec?.template?.spec?.containers[0]?.command?.[2] ?? "";
+      // The injected payload is gone entirely, and the surviving account is
+      // still passed through.
+      expect(cmd).not.toContain("; env; #");
+      expect(cmd).toContain("--accounts 'b@example.test'");
+      // ccrotate remains a single command: nothing escaped the segment.
+      expect(cmd).toMatch(/\(command -v ccrotate .*ccrotate next --yes --target claude --accounts '[^']*'.*\) \|\| true/);
+    });
+
+    it("shell-quotes the accounts value so a quote cannot break out", () => {
+      ctx.config = {
+        providers: { anthropic: { accounts: ["ok@example.test"] } },
+      };
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const cmd = job.spec?.template?.spec?.containers[0]?.command?.[2] ?? "";
+      expect(cmd).toContain("--accounts 'ok@example.test'");
+    });
+
+    it("falls back to global rotation when every configured account is invalid", () => {
+      ctx.config = {
+        providers: { anthropic: { accounts: ["$(id)", "`id`", "a; rm -rf /"] } },
+      };
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const cmd = job.spec?.template?.spec?.containers[0]?.command?.[2] ?? "";
+      expect(cmd).toContain("ccrotate next --yes --target claude");
+      expect(cmd).not.toContain("--accounts");
+      expect(cmd).not.toContain("rm -rf /");
     });
 
     it("does not add --accounts when providers is undefined (global rotation path)", () => {

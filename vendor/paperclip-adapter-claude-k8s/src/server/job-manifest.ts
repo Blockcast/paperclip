@@ -1042,14 +1042,31 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // rotation to just that pool via `--accounts a@b.net,c@d.net`. Absent or
   // empty pool → the appended segment is the empty string and the command
   // stays bit-for-bit identical to the global-rotation behavior.
+  //
+  // The pool is operator-supplied config, and it lands in a string that the main
+  // container runs through `sh -c`. Interpolating it raw made it a command
+  // injection point: an account of `a@example.test; env; #` executes `env`
+  // *before* Claude starts, so it runs ahead of the PreToolUse env-guard and
+  // dumps the pod's inherited credentials into the log. Two independent
+  // defences, since either alone is one typo from being bypassed:
+  //   1. validate — an account identifier is an email/handle, so anything
+  //      outside this conservative set cannot be a real account and is dropped
+  //      rather than passed on;
+  //   2. single-quote the whole `--accounts` value, which is what actually
+  //      guarantees the shell treats it as one literal word.
+  // Dropping invalid entries is fail-safe: if every entry is rejected the
+  // segment is empty and we fall back to documented global rotation.
+  const quoteShellArg = (value: string) => `'${value.replace(/'/g, "'\\''")}'`;
+  const ACCOUNT_ID_RE = /^[A-Za-z0-9._%+-]+(?:@[A-Za-z0-9.-]+)?$/;
   const providersConfig = parseObject(config.providers);
   const anthropicConfig = parseObject(providersConfig.anthropic);
   const anthropicAccounts = Array.isArray(anthropicConfig.accounts)
     ? (anthropicConfig.accounts as ReadonlyArray<unknown>).filter(
-        (s): s is string => typeof s === "string" && s.length > 0,
+        (s): s is string => typeof s === "string" && s.length > 0 && ACCOUNT_ID_RE.test(s),
       )
     : [];
-  const accountsArg = anthropicAccounts.length > 0 ? ` --accounts ${anthropicAccounts.join(",")}` : "";
+  const accountsArg =
+    anthropicAccounts.length > 0 ? ` --accounts ${quoteShellArg(anthropicAccounts.join(","))}` : "";
   const ccrotateRefresh = `(command -v ccrotate >/dev/null 2>&1 && ccrotate next --yes --target claude${accountsArg} >/dev/null 2>&1) || true`;
   // RCA 2026-05-06: terminal rate-limit fail-fast. Before this, a
   // `rate_limit_event` with `overageStatus:"rejected"` +
@@ -1073,7 +1090,6 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // the pod marks Succeeded even when claude never emits any stream-json
   // — paperclip-server's parser only catches type:error events from
   // inside the JSON stream, not pre-stream crashes.
-  const quoteShellArg = (value: string) => `'${value.replace(/'/g, "'\\''")}'`;
   const workspaceSetup = isolation.mode === "run" && workspaceCwd && workspaceCwd !== isolation.workspaceRoot
     ? [
         `if git -C ${quoteShellArg(workspaceCwd)} rev-parse --verify HEAD >/dev/null 2>&1; then`,
@@ -1185,8 +1201,16 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     `mkdir -p ${browserHome}/.config/google-chrome ${browserMetricsTarget}`,
     `[ -L ${browserHome}/.config/google-chrome/BrowserMetrics ] || { rm -rf ${browserHome}/.config/google-chrome/BrowserMetrics; ln -sfn ${browserMetricsTarget} ${browserHome}/.config/google-chrome/BrowserMetrics; }`,
   );
+  // Mirror the main container's conditional `data` mount. The `data` volume is
+  // only declared when a claim is configured (see `dataClaimName` above), and
+  // the Kubernetes API rejects the whole Pod when a volumeMount names a volume
+  // that does not exist — so mounting it unconditionally here made every no-PVC
+  // configuration emit an invalid manifest, failing at admission rather than
+  // degrading. `job-manifest.test.ts` pins the invariant ("every volumeMount
+  // resolves to a declared volume", asserted across both containers and every
+  // PVC/secret combination) so the two lists cannot drift apart again.
   const initVolumeMounts: k8s.V1VolumeMount[] = [
-    { name: "data", mountPath: dataMountPath },
+    ...(dataClaimName ? [{ name: "data", mountPath: dataMountPath }] : []),
     { name: "prompt", mountPath: "/tmp/prompt" },
     // Needed so the BrowserMetrics symlink target above resolves in the init
     // container; same emptyDir instance the main container mounts.
