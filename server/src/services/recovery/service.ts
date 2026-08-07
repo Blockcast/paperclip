@@ -8145,10 +8145,13 @@ export function recoveryService(
 
         // BLO-22060: the release must outlive the issue row we just nulled.
         // The run itself is deliberately left alive (a `scheduled_retry` park
-        // still has to fire at its deadline), and enqueueWakeup's legacy-run
-        // fallback would otherwise re-adopt that same parked run and re-stamp
-        // executionLockedAt, restarting the 6h clock on every wake. Recording
-        // the release on the run is what lets adoption decline.
+        // still has to fire at its deadline, and a `queued` run must stay
+        // claimable), and enqueueWakeup's legacy-run fallback would otherwise
+        // re-adopt that same run and re-stamp executionLockedAt, restarting the
+        // 6h clock on every wake. Recording the release on the run is what lets
+        // adoption decline. Counted for whatever status held the lock — the
+        // fallback can select `queued`, `running` and `scheduled_retry` alike,
+        // and a released park that is later promoted reaches it as `queued`.
         if (currentIssue.executionRunId) {
           await tx
             .update(heartbeatRuns)

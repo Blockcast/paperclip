@@ -18,9 +18,13 @@
 --
 -- The release therefore has to leave a mark on the run itself; the issue row is
 -- the wrong place because the sweep nulls it. This counter is that mark.
--- Adoption declines once it reaches MAX_SCHEDULED_RETRY_ISSUE_LOCK_RELEASES,
--- which bounds total lock time attributable to one parked run at a single
--- window regardless of wake volume.
+-- Adoption declines once it reaches MAX_SWEPT_ISSUE_LOCK_RELEASES, which bounds
+-- total lock time attributable to one run at a single window regardless of wake
+-- volume. It is incremented for every holder the sweep releases, not only
+-- parks: `queued` (BLO-18995) and silent-`running` (BLO-19941) locks are
+-- released by the same path and are selectable by the same fallback, and a
+-- released park that is later promoted arrives there as `queued` still carrying
+-- this count.
 --
 -- Backfilled to 0: pre-existing rows have no recorded release, so they keep
 -- exactly one more adoption. That is the conservative direction — it cannot
