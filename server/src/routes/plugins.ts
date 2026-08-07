@@ -81,6 +81,7 @@ import {
   collectPluginConfigSecretValues,
   maskPluginConfigJson,
   mergeMaskedPluginConfig,
+  redactSecretValuesDeep,
   redactSecretValuesFromText,
 } from "../services/plugin-config-masking.js";
 import {
@@ -2834,13 +2835,14 @@ export function pluginRoutes(
       }
 
       // Worker unavailable or other RPC errors. Both `message` and the
-      // free-form `details` come from the worker, so redact over the whole
-      // serialized payload rather than just the top-level message.
-      const bridgeError = mapRpcErrorToBridgeError(err);
-      const scrubbedBridgeError = JSON.parse(
-        redactSecretValuesFromText(JSON.stringify(bridgeError), testSecretValues),
-      ) as PluginBridgeErrorResponse;
-      res.status(502).json(scrubbedBridgeError);
+      // free-form `details` come from the worker, so redact across the whole
+      // payload — structurally, not by stringify/replace/parse, which would
+      // miss a credential containing a quote or backslash.
+      const bridgeError = redactSecretValuesDeep(
+        mapRpcErrorToBridgeError(err),
+        testSecretValues,
+      );
+      res.status(502).json(bridgeError);
     }
   });
 

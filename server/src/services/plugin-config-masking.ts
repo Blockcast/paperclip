@@ -433,11 +433,46 @@ export function redactSecretValuesFromText<T extends string | undefined>(
   if (typeof text !== "string" || text.length === 0) return text;
 
   let result: string = text;
-  for (const secret of [...secretValues].sort((a, b) => b.length - a.length)) {
-    if (!secret) continue;
+  for (const secret of orderedSecrets(secretValues)) {
     result = result.split(secret).join(PLUGIN_CONFIG_SECRET_MASK);
   }
   return result as T;
+}
+
+/** Non-empty secrets, longest first. See {@link redactSecretValuesFromText}. */
+function orderedSecrets(secretValues: readonly string[]): string[] {
+  return secretValues.filter(Boolean).sort((a, b) => b.length - a.length);
+}
+
+/**
+ * Deep-redact known secret values from an arbitrary JSON-ish payload, rewriting
+ * string leaves (and object keys, which a worker could equally interpolate a
+ * credential into).
+ *
+ * This must NOT be done by stringifying the payload, replacing, and re-parsing:
+ * `JSON.stringify` escapes quotes and backslashes, so a credential containing
+ * either appears in the serialized text in escaped form and a raw-string
+ * replacement silently misses it — leaking exactly the value it was meant to
+ * remove. Walking the structure compares against the real string values.
+ */
+export function redactSecretValuesDeep<T>(value: T, secretValues: readonly string[]): T {
+  const secrets = orderedSecrets(secretValues);
+  if (secrets.length === 0) return value;
+
+  function walk(node: unknown): unknown {
+    if (typeof node === "string") return redactSecretValuesFromText(node, secrets);
+    if (Array.isArray(node)) return node.map(walk);
+    if (isPlainRecord(node)) {
+      const result: Record<string, unknown> = {};
+      for (const [key, child] of Object.entries(node)) {
+        result[redactSecretValuesFromText(key, secrets)] = walk(child);
+      }
+      return result;
+    }
+    return node;
+  }
+
+  return walk(value) as T;
 }
 
 /** Marks a key whose posted sentinel resolved to nothing, so it is dropped. */

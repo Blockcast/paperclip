@@ -1819,4 +1819,26 @@ describe.sequential("plugin config secret masking (BLO-20794)", () => {
 
     expect(JSON.stringify(res.body)).not.toContain(CONFIG_SECRET);
   }, 20_000);
+
+  it("redacts a credential containing JSON metacharacters", async () => {
+    // Redacting the 502 payload by stringify -> replace -> parse would miss
+    // this: JSON.stringify escapes the quote and backslash, so the raw secret
+    // never appears in the serialized text and survives verbatim. The walk has
+    // to compare against real string values, not the serialized form.
+    const awkwardSecret = 'sk-live-a"b\\c-xyz';
+    maskingPlugin();
+    seedConfigStore({ webhookToken: awkwardSecret, endpoint: "https://alerts.example.com" });
+    const workerCall = vi.fn().mockRejectedValue(
+      new Error(`connect failed using ${awkwardSecret}`),
+    );
+    const { app } = await createApp(adminActor(), {}, {
+      bridgeDeps: { workerManager: { isRunning: () => true, call: workerCall } },
+    });
+
+    const res = await request(app)
+      .post(`/api/plugins/${pluginId}/config/test`)
+      .send({ companyId: companyA, configJson: { webhookToken: "__redacted__", endpoint: "https://alerts.example.com" } });
+
+    expect(JSON.stringify(res.body)).not.toContain("sk-live-a");
+  }, 20_000);
 });
