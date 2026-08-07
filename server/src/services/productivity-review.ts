@@ -820,6 +820,25 @@ function formatTrigger(trigger: ProductivityReviewTrigger) {
 // floor — see BLO-22097 for the full sample tables.
 const NEVER_EXECUTED_UNKNOWN_USAGE_LOG_BYTES_CEILING = 200_000;
 
+const PRODUCTIVITY_REVIEW_TRIGGERS: readonly ProductivityReviewTrigger[] = [
+  "no_comment_streak",
+  "long_active_duration",
+  "high_churn",
+  "runtime_failure_streak",
+];
+
+// BLO-22105: `buildReviewMarkdown` bakes the trigger that produced it into the
+// `- Primary trigger:` line. Reading it back out of the persisted description
+// (rather than, say, the last activity-log entry) means the comparison is
+// against exactly what a reader currently sees, so a refresh regenerates
+// precisely when the visible Manager Decision guidance is actually stale.
+function extractReviewTriggerFromDescription(description: string | null): ProductivityReviewTrigger | null {
+  if (!description) return null;
+  const match = description.match(/^- Primary trigger: `([a-z_]+)`/m);
+  const candidate = match?.[1];
+  return PRODUCTIVITY_REVIEW_TRIGGERS.find((trigger) => trigger === candidate) ?? null;
+}
+
 // True when a run's most recent classification is `failed` liveness AND it
 // burned zero input+output tokens. That combination means the agent never
 // got a model turn — the runtime crashed, the process was killed, or every
@@ -2812,13 +2831,29 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           return { throttled: true as const, lastRefreshAt };
         }
 
+        // BLO-22105: the Manager Decision block is trigger-conditional (see
+        // buildReviewMarkdown), so a review whose live trigger has flipped since
+        // it was created/last regenerated is showing stale — potentially
+        // under-enforcing — remedy guidance. Regenerate only on an actual flip
+        // (never on unparseable/legacy descriptions) and only inside this same
+        // throttle-gated branch, so a trigger flip cannot be used to force a
+        // description write more often than the hard-floor interval allows.
+        const previousTrigger = extractReviewTriggerFromDescription(existing.description);
+        const descriptionStale = previousTrigger !== null && previousTrigger !== evidence.trigger;
+        if (descriptionStale) {
+          await tx
+            .update(issues)
+            .set({ description: buildReviewMarkdown(evidence, opts.prefix), updatedAt: evidence.generatedAt })
+            .where(eq(issues.id, existing.id));
+        }
+
         await addRefreshComment(
           existing.id,
           buildRefreshComment(evidence, opts.prefix),
           evidence.generatedAt,
           tx,
         );
-        return { throttled: false as const, lastRefreshAt };
+        return { throttled: false as const, lastRefreshAt, descriptionRegenerated: descriptionStale };
       });
 
       if (refreshOutcome.throttled) {
@@ -2848,6 +2883,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           noCommentStreak: evidence.noCommentStreak,
           runCountLastHour: evidence.runCountLastHour,
           commentCountLastHour: evidence.commentCountLastHour,
+          descriptionRegenerated: refreshOutcome.descriptionRegenerated,
         },
       });
       return { kind: "updated" as const, reviewIssueId: existing.id };

@@ -765,6 +765,118 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(await listRefreshComments(review!.id)).toHaveLength(DEFAULT_PRODUCTIVITY_REVIEW_MAX_REFRESH_COMMENTS);
   });
 
+  describe("BLO-22105: refresh regenerates the description on a trigger flip", () => {
+    it("regenerates the Manager Decision block when a no_comment_streak review flips to runtime_failure_streak", async () => {
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const seeded = await seedAssignedIssue();
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+      });
+
+      const service = productivityReviewService(db);
+      await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+      const [review] = await listProductivityReviews(seeded.companyId);
+      expect(review?.description).toContain("Primary trigger: `no_comment_streak`");
+      expect(review?.description).toContain("Request decomposition");
+
+      const refreshAt = new Date(now.getTime() + DEFAULT_PRODUCTIVITY_REVIEW_REFRESH_INTERVAL_MS);
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now: refreshAt,
+        status: "failed",
+        livenessState: "failed",
+        usageJson: { inputTokens: 0, outputTokens: 0 },
+      });
+
+      const refresh = await service.reconcileProductivityReviews({ now: refreshAt, companyId: seeded.companyId });
+      expect(refresh.updated).toBe(1);
+
+      const [refreshedReview] = await listProductivityReviews(seeded.companyId);
+      expect(refreshedReview?.id).toBe(review!.id);
+      expect(refreshedReview?.description).toContain("Primary trigger: `runtime_failure_streak`");
+      expect(refreshedReview?.description).toContain("do not decompose, block, or cancel");
+      expect(refreshedReview?.description).not.toContain("Request decomposition");
+    });
+
+    it("regenerates the Manager Decision block when a runtime_failure_streak review flips to no_comment_streak", async () => {
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const seeded = await seedAssignedIssue();
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+        status: "failed",
+        livenessState: "failed",
+        usageJson: { inputTokens: 0, outputTokens: 0 },
+      });
+
+      const service = productivityReviewService(db);
+      await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+      const [review] = await listProductivityReviews(seeded.companyId);
+      expect(review?.description).toContain("Primary trigger: `runtime_failure_streak`");
+      expect(review?.description).toContain("do not decompose, block, or cancel");
+
+      const refreshAt = new Date(now.getTime() + DEFAULT_PRODUCTIVITY_REVIEW_REFRESH_INTERVAL_MS);
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now: refreshAt,
+      });
+
+      const refresh = await service.reconcileProductivityReviews({ now: refreshAt, companyId: seeded.companyId });
+      expect(refresh.updated).toBe(1);
+
+      const [refreshedReview] = await listProductivityReviews(seeded.companyId);
+      expect(refreshedReview?.id).toBe(review!.id);
+      expect(refreshedReview?.description).toContain("Primary trigger: `no_comment_streak`");
+      expect(refreshedReview?.description).toContain("Request decomposition");
+      expect(refreshedReview?.description).not.toContain("do not decompose, block, or cancel");
+    });
+
+    it("does not rewrite the description when the refresh observes the same trigger", async () => {
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const seeded = await seedAssignedIssue();
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+      });
+
+      const service = productivityReviewService(db);
+      await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+      const [review] = await listProductivityReviews(seeded.companyId);
+      const originalDescription = review!.description;
+
+      const refreshAt = new Date(now.getTime() + DEFAULT_PRODUCTIVITY_REVIEW_REFRESH_INTERVAL_MS);
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now: refreshAt,
+      });
+
+      const refresh = await service.reconcileProductivityReviews({ now: refreshAt, companyId: seeded.companyId });
+      expect(refresh.updated).toBe(1);
+
+      const [refreshedReview] = await listProductivityReviews(seeded.companyId);
+      expect(refreshedReview?.description).toBe(originalDescription);
+    });
+  });
+
   it("allows only one productivity review per source issue in 24 hours", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const seeded = await seedAssignedIssue();
