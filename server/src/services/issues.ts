@@ -703,8 +703,16 @@ export interface IssueFilters {
   q?: string;
   limit?: number;
   offset?: number;
-  sortField?: "updated";
+  /**
+   * "updated" sorts by canonical last activity, which mutates constantly. Paginating
+   * over it re-orders rows mid-sweep, so an exhaustive walk both duplicates and skips
+   * rows. "id" sorts by the immutable primary key instead: rows never move, so a walk
+   * is safe to paginate. Pair it with `afterId` for a keyset cursor.
+   */
+  sortField?: "updated" | "id";
   sortDir?: "asc" | "desc";
+  /** Keyset cursor: return only rows with `id > afterId`. Requires sortField "id". */
+  afterId?: string;
 }
 
 type IssueRow = typeof issues.$inferSelect;
@@ -1824,6 +1832,12 @@ function issueListOrderBy(
   },
 ) {
   const canonicalLastActivityAt = issueCanonicalLastActivityAtExpr(companyId);
+  if (sortField === "id") {
+    // Total order on an immutable unique column, so concurrent activity cannot move a
+    // row between pages. Relevance ranking is deliberately dropped: a stable walk that
+    // visits every row exactly once is the whole point of this mode.
+    return [sortDir === "desc" ? desc(issues.id) : asc(issues.id)];
+  }
   if (sortField === "updated") {
     const activityOrder = sortDir === "asc"
       ? asc(canonicalLastActivityAt)
@@ -6067,6 +6081,11 @@ export function issueService(db: Db) {
         shouldExcludeRoutineExecutionIssues(filters)
       ) {
         conditions.push(nonRoutineExecutionIssueCondition());
+      }
+      if (filters?.afterId) {
+        conditions.push(
+          filters.sortDir === "desc" ? lt(issues.id, filters.afterId) : gt(issues.id, filters.afterId),
+        );
       }
       const priorityOrder = sql`CASE ${issues.priority} WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END`;
       const searchOrder = sql<number>`
