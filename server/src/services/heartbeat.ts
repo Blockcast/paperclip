@@ -3,7 +3,7 @@ import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
-import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNotNull, isNull, lt, lte, ne, not, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNotNull, isNull, lt, lte, ne, not, notInArray, or, sql, type SQL } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
@@ -53,6 +53,7 @@ import {
   companySkills as companySkillsTable,
   companies,
   costEvents,
+  detachedQueuedRunRecoveries,
   documentAnnotationComments,
   documentAnnotationThreads,
   documentRevisions,
@@ -306,7 +307,7 @@ import {
   recoveryAssigneeAdapterOverrides,
   withRecoveryModelProfileHint,
 } from "./recovery/model-profile-hint.js";
-import { recoveryService } from "./recovery/service.js";
+import { recoveryService, STALE_PRE_CLAIM_ISSUE_LOCK_MS } from "./recovery/service.js";
 import { productivityReviewService } from "./productivity-review.js";
 import { resolveRequiredSuccessfulRunHandoffOnValidPath } from "./successful-run-handoff-state.js";
 import { taskWatchdogService } from "./task-watchdogs.js";
@@ -3660,6 +3661,7 @@ function retryAfterDelayMs(value: unknown): number | null {
 const PROVIDER_CAPACITY_RESET_AT_PATTERN =
   /(?:\b(?:resume_at|retry_not_before|retryNotBefore)\b[\\'"\s]*[:=][\\'"\s]*|\b(?:capacity\s+)?may\s+reset\s+at\s+)(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))/i;
 const PROVIDER_CAPACITY_RETRY_IN_PATTERN = /\bretry\s+in\s+(\d+(?:\.\d+)?)\s*(?:s\b|secs?\b|seconds?\b)/i;
+const PROVIDER_CAPACITY_RESET_PROVENANCE_SOURCE = "server_parse_provider_capacity_horizon";
 
 // An advertised horizon further out than this is treated as unusable rather
 // than parked on: a bad parse (or a provider bug) must not silently sideline an
@@ -3708,6 +3710,50 @@ export function parseProviderCapacityResetHorizon(
   }
 
   return null;
+}
+
+function readProviderCapacityResetStatusEvidence(
+  resultJson: Record<string, unknown> | null | undefined,
+): { field: "api_error_status" | "error_status"; statusCode: number } | null {
+  for (const field of ["api_error_status", "error_status"] as const) {
+    const status = normalizeHttpStatusCode(resultJson?.[field]);
+    if (status == null) continue;
+    return { field, statusCode: Number(status) };
+  }
+  return null;
+}
+
+// Mirror of the recovery reader's instant guard. Adapters that hand back a
+// structured `retryNotBefore` (claude-local/codex-local) skip the prose parser
+// above, so before this they reached recovery carrying no provenance at all and
+// were forced into the generic rate-limit/quota wording — throwing away a 429
+// diagnosis we can actually substantiate. Such a horizon may earn the server
+// provenance marker, but it is adapter-controlled text, so it is re-derived
+// here rather than trusted: only a bare full-string ISO instant inside the same
+// forward horizon parseProviderCapacityResetHorizon accepts survives, and it is
+// re-emitted canonically so no adapter formatting reaches an issue comment.
+const PROVIDER_CAPACITY_RESET_INSTANT_PATTERN =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
+
+export function canonicalizeAdapterCapacityResetInstant(
+  value: unknown,
+  now = Date.now(),
+): Date | null {
+  const raw = typeof value === "string" ? value.trim() : null;
+  if (!raw || !PROVIDER_CAPACITY_RESET_INSTANT_PATTERN.test(raw)) return null;
+  const parsed = Date.parse(raw);
+  if (!Number.isFinite(parsed)) return null;
+  if (parsed <= now || parsed - now > PROVIDER_CAPACITY_MAX_HORIZON_MS) return null;
+  return new Date(parsed);
+}
+
+function stripAdapterProviderCapacityResetMetadata(
+  resultJson: Record<string, unknown> | null | undefined,
+): Record<string, unknown> {
+  const sanitized = { ...parseObject(resultJson) };
+  delete sanitized.providerCapacityResetAt;
+  delete sanitized.providerCapacityResetProvenance;
+  return sanitized;
 }
 
 function zeroTokenUsage(usage: { inputTokens?: number; outputTokens?: number; cachedInputTokens?: number } | undefined) {
@@ -6582,6 +6628,26 @@ const GITHUB_PR_CONTEXT_KEYS = [
   "reviewKind",
 ] as const;
 
+// BLO-22229: wake reasons whose contextSnapshot describes one specific review
+// instance (a formal `pull_request_review` submission, or review feedback
+// delivered via an `issue_comment`). Each such wake is a self-contained
+// report of "what does the review say right now" — it must never be read
+// alongside a review-content field left over from an earlier instance.
+const GITHUB_PR_REVIEW_INSTANCE_WAKE_REASONS = new Set([
+  "github_pr_review_feedback",
+  "github_pr_review_submitted",
+]);
+
+// The subset of GITHUB_PR_CONTEXT_KEYS that describes review *content*
+// (state/body/author of one review instance), as opposed to PR identity.
+const GITHUB_PR_REVIEW_CONTENT_KEYS = [
+  "githubPrReviewBody",
+  "githubPrReviewState",
+  "githubPrReviewAuthorLogin",
+  "githubReviewFeedbackActionable",
+  "githubReviewFeedbackCommentId",
+] as const;
+
 function readGithubPrIdentity(contextSnapshot: Record<string, unknown>) {
   const raw = contextSnapshot.githubPrNumber;
   const prNumber =
@@ -6624,6 +6690,37 @@ function preserveNonGithubPrWakeCommentIds(contextSnapshot: Record<string, unkno
   const githubPrScopedCommentIds = readGithubPrScopedWakeCommentIds(contextSnapshot);
   if (githubPrScopedCommentIds.size === 0) return extractWakeCommentIds(contextSnapshot);
   return extractWakeCommentIds(contextSnapshot).filter((commentId) => !githubPrScopedCommentIds.has(commentId));
+}
+
+function readGithubPrReviewFeedbackWakeCommentIds(contextSnapshot: Record<string, unknown>) {
+  const ids = new Set<string>();
+  const reviewFeedbackCommentId = readNonEmptyString(contextSnapshot.githubReviewFeedbackCommentId);
+  if (reviewFeedbackCommentId) ids.add(reviewFeedbackCommentId);
+
+  const paperclipWake = parseObject(contextSnapshot[PAPERCLIP_WAKE_PAYLOAD_KEY]);
+  const comments = Array.isArray(paperclipWake.comments) ? paperclipWake.comments : [];
+  const identity = readGithubPrIdentity(contextSnapshot);
+  for (const rawComment of comments) {
+    const comment = parseObject(rawComment);
+    const metadata = parseObject(comment.metadata);
+    if (readNonEmptyString(metadata.kind) !== "github_pr_review_feedback") continue;
+    const metadataIdentity = readGithubPrIdentity({
+      githubRepoFullName: metadata.repoFullName,
+      githubPrNumber: metadata.prNumber,
+    });
+    if (identity !== null && metadataIdentity !== null && metadataIdentity !== identity) continue;
+    const commentId = readNonEmptyString(comment.id);
+    if (commentId) ids.add(commentId);
+  }
+
+  return ids;
+}
+
+function preserveNonGithubPrReviewFeedbackWakeCommentIds(contextSnapshot: Record<string, unknown>) {
+  const reviewFeedbackCommentIds = readGithubPrReviewFeedbackWakeCommentIds(contextSnapshot);
+  const commentIds = mergeWakeCommentIds(contextSnapshot);
+  if (reviewFeedbackCommentIds.size === 0) return commentIds;
+  return commentIds.filter((commentId) => !reviewFeedbackCommentIds.has(commentId));
 }
 
 type AcceptedPlanWakeRoutingDecision = {
@@ -6707,6 +6804,26 @@ export function mergeCoalescedContextSnapshot(
       if (!(key in incoming)) delete merged[key];
     }
   }
+  // BLO-22229: even on the SAME PR, a new review-instance wake (a fresh
+  // `pull_request_review` submission, or review feedback posted as an
+  // `issue_comment`) must not inherit review-content fields from whichever
+  // review instance happened to be active before it. Without this, a
+  // comment-shaped review (which carries a body/author but, per
+  // github-webhook.ts's issue_comment branch, never a formal `reviewState`)
+  // merges onto a still-active `github_pr_review_submitted` run and keeps
+  // that run's stale `githubPrReviewState`/body — composing a directive from
+  // two different GitHub events (e.g. this comment's author paired with an
+  // earlier reviewer's APPROVED state) that together describe an event that
+  // never happened. Each review-instance wake owns this key block outright:
+  // whatever it doesn't re-supply is cleared, not inherited.
+  const incomingWakeReason = readNonEmptyString(incoming.wakeReason);
+  const isNewReviewInstance =
+    incomingWakeReason !== null && GITHUB_PR_REVIEW_INSTANCE_WAKE_REASONS.has(incomingWakeReason);
+  if (isNewReviewInstance) {
+    for (const key of GITHUB_PR_REVIEW_CONTENT_KEYS) {
+      if (!(key in incoming)) delete merged[key];
+    }
+  }
   if (existing.forceFreshSession === true || incoming.forceFreshSession === true) {
     merged.forceFreshSession = true;
   }
@@ -6714,9 +6831,12 @@ export function mergeCoalescedContextSnapshot(
   for (const key of ["issueId", "taskId", "taskKey"] as const) {
     merged[key] = readNonEmptyString(incoming[key]) ?? readNonEmptyString(existing[key]) ?? merged[key];
   }
-  const mergedCommentIds = isDifferentGithubPr
-    ? mergeWakeCommentIds(preserveNonGithubPrWakeCommentIds(existing), incoming)
-    : mergeWakeCommentIds(existing, incoming);
+  const existingCommentIdsForMerge = isDifferentGithubPr
+    ? preserveNonGithubPrWakeCommentIds(existing)
+    : isNewReviewInstance
+      ? preserveNonGithubPrReviewFeedbackWakeCommentIds(existing)
+      : existing;
+  const mergedCommentIds = mergeWakeCommentIds(existingCommentIdsForMerge, incoming);
   if (mergedCommentIds.length > 0) {
     const latestCommentId = mergedCommentIds[mergedCommentIds.length - 1];
     merged[WAKE_COMMENT_IDS_KEY] = mergedCommentIds;
@@ -6725,7 +6845,7 @@ export function mergeCoalescedContextSnapshot(
     // The merged context should carry canonical comment ids; the next wake will
     // regenerate any structured payload from those ids.
     delete merged[PAPERCLIP_WAKE_PAYLOAD_KEY];
-  } else if (isDifferentGithubPr) {
+  } else if (isDifferentGithubPr || isNewReviewInstance) {
     delete merged[WAKE_COMMENT_IDS_KEY];
     delete merged.commentId;
     delete merged.wakeCommentId;
@@ -8133,7 +8253,35 @@ export function buildPaperclipTaskMarkdown(input: {
       lines.push(`- Head SHA at wake time: ${quoteTaskScalar(prReview.headSha)} (may be superseded — confirm the current head before diffing or checking out)`);
     }
     if (prReview.event) lines.push(`- GitHub event: ${quoteTaskScalar(prReview.event)}`);
-    if (prReview.prRole === "author") {
+    if (prReview.prRole === "author" && prReview.wakeReason === "github_pr_review_requested") {
+      // BLO-19522: a review REQUEST is not review feedback. The author wake
+      // still fires for it on purpose (a manager or peer may have requested
+      // review on someone else's PR — see the suppressAuthorWake comment in
+      // routes/github-webhook.ts for why suppressing it is the wrong trade),
+      // but it must not borrow the feedback directive below.
+      //
+      // It used to. `prRole: "author"` is set for every `github_pr_*` wake,
+      // and on this path reviewState/reviewBody/reviewAuthorLogin are all null
+      // (isActionableReviewFeedbackContext is false for review_requested), so
+      // the null-state branch asserted "A reviewer just posted findings on
+      // YOUR pull request" and told the author to push a follow-up commit —
+      // when no review existed at all. Observed three times across three repos
+      // (Network-Operator-Portal#604, paperclip#929, BLO-19722), each costing a
+      // full run, and the obvious action it steers toward is re-requesting the
+      // review, which re-posts the marker and spins the loop that the #583
+      // author-filter and PC#822's marker were both meant to keep closed.
+      const requesterLabel = prReview.requestCommentAuthorLogin ?? "Someone";
+      lines.push(
+        "",
+        "GitHub PR review request directive:",
+        `${requesterLabel} requested a review on YOUR pull request. This is a review REQUEST, not review feedback: no review has been submitted in response to it yet, and there are no findings to act on.`,
+        "The reviewer was woken separately by this same event — you do NOT need to request the review again. Re-posting a `<!-- paperclip:review-request -->` comment here would only re-trigger this wake.",
+        "If you were already waiting on this review, treat this run as a no-op: verify with `gh api repos/{owner}/{repo}/pulls/{n}/reviews` (and check for a comment-shaped `## Ally` review, which files no review object), then return to what you were doing. Act only on a review that actually exists.",
+      );
+      if (prReview.requestCommentBody) {
+        lines.push("", "The request comment:", fenceTaskText(prReview.requestCommentBody));
+      }
+    } else if (prReview.prRole === "author") {
       const reviewerLabel = prReview.reviewAuthorLogin ?? "A reviewer";
       const stateLabel = prReview.reviewState ? prReview.reviewState.toUpperCase() : null;
       lines.push(
@@ -8663,6 +8811,22 @@ export interface HeartbeatServiceOptions {
       executionRunId: string | null;
       executionLockedAt: Date | null;
     },
+  ) => Promise<void> | void;
+  /**
+   * Test-only barrier after detached-run reconciliation has locked the issue
+   * and selected the still-detached queued rows, immediately before cancelling
+   * them and creating the durable recovery intent.
+   */
+  beforeDetachedQueuedRunCancellationForTest?: (
+    input: { issueId: string; runIds: string[] },
+  ) => Promise<void> | void;
+  /** Test-only failure injection after cancellation commits but before intent dispatch. */
+  beforeDetachedQueuedRunRecoveryEnqueueForTest?: (
+    input: { intentId: string; issueId: string; sourceRunId: string },
+  ) => Promise<void> | void;
+  /** Test-only signal immediately before an issue wake attempts to lock its issue row. */
+  beforeIssueWakeLockForTest?: (
+    input: { issueId: string; agentId: string },
   ) => Promise<void> | void;
   /**
    * Test-only concurrency hook: fired inside the capacity-defer transaction
@@ -17732,6 +17896,369 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return recovery.reconcileStrandedAssignedIssues({ issueCreatedAtGte: await getWorktreeExecutionCutoff() });
   }
 
+  // BLO-21621: a queued run can outlive an issue lock that once named it. A
+  // NULL lock pointer is not evidence of that defect: normal lazy-lock queue
+  // rows leave executionRunId NULL until claim, and can legitimately wait for
+  // hours behind an agent's concurrency ceiling. sweepStaleIssueLocks writes a
+  // detachedQueuedRunRecoveries row in the same transaction that releases an
+  // expired pre-claim lock. That durable lineage is the positive evidence this
+  // sweep requires; age plus NULL pointers is never enough.
+  //
+  // Keep both the lineage and current-detachment predicates in SQL before the
+  // age ordering and LIMIT. Otherwise permanently attached rows can occupy the
+  // bounded prefix and starve a genuinely repairable row behind them.
+  function detachedQueuedRunConditions(staleCutoff: Date, extra?: SQL | undefined) {
+    return and(
+      eq(detachedQueuedRunRecoveries.status, "detached"),
+      eq(heartbeatRuns.status, "queued"),
+      lte(heartbeatRuns.createdAt, staleCutoff),
+      notInArray(issues.status, [...TERMINAL_ISSUE_STATUSES]),
+      sql`${issues.executionRunId} IS DISTINCT FROM ${heartbeatRuns.id}`,
+      sql`${issues.checkoutRunId} IS DISTINCT FROM ${heartbeatRuns.id}`,
+      extra,
+    );
+  }
+
+  async function reconcileDetachedQueuedRuns(opts?: {
+    now?: Date;
+    companyId?: string;
+    limit?: number;
+    staleAfterMs?: number;
+  }) {
+    const now = opts?.now ?? new Date();
+    const limit = opts?.limit ?? 100;
+    // Reuses sweepStaleIssueLocks' own bound for "how long can a queued run
+    // hold its pre-claim lock" so the two sweeps agree on when a queued run
+    // stops being trustworthy evidence of life: a run cannot be genuinely
+    // detached before that sweep would have had a chance to release it.
+    const staleAfterMs = opts?.staleAfterMs ?? STALE_PRE_CLAIM_ISSUE_LOCK_MS;
+    const staleCutoff = new Date(now.getTime() - staleAfterMs);
+
+    const result = { scanned: 0, terminalized: 0, recovered: 0, skipped: 0, failed: 0 };
+
+    const candidates = await db
+      .select({
+        id: heartbeatRuns.id,
+        companyId: heartbeatRuns.companyId,
+        createdAt: heartbeatRuns.createdAt,
+        issueId: issues.id,
+      })
+      .from(detachedQueuedRunRecoveries)
+      .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, detachedQueuedRunRecoveries.sourceRunId))
+      .innerJoin(
+        issues,
+        and(
+          eq(issues.id, detachedQueuedRunRecoveries.issueId),
+          eq(issues.companyId, detachedQueuedRunRecoveries.companyId),
+        ),
+      )
+      .where(detachedQueuedRunConditions(
+        staleCutoff,
+        opts?.companyId ? eq(heartbeatRuns.companyId, opts.companyId) : undefined,
+      ))
+      .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
+      .limit(limit);
+    result.scanned = candidates.length;
+
+    const processedIssueIds = new Set<string>();
+    const cancelReason =
+      "Cancelled because this queued run detached from its source issue's execution lock and was never claimed";
+
+    for (const candidate of candidates) {
+      const issueId = candidate.issueId;
+      if (processedIssueIds.has(issueId)) continue;
+      processedIssueIds.add(issueId);
+
+      try {
+        // Lock ordering matches enqueueWakeup and sweepStaleIssueLocks: issue
+        // first, then heartbeat/outbox rows. Legacy adoption therefore cannot
+        // attach a selected sibling between our detachment check and cancel.
+        const outcome = await db.transaction(async (tx) => {
+          const currentIssue = await tx
+            .select({
+              id: issues.id,
+              companyId: issues.companyId,
+              status: issues.status,
+              checkoutRunId: issues.checkoutRunId,
+              executionRunId: issues.executionRunId,
+            })
+            .from(issues)
+            .where(eq(issues.id, issueId))
+            .for("update")
+            .then((rows) => rows[0] ?? null);
+          if (!currentIssue || TERMINAL_ISSUE_STATUSES.has(currentIssue.status)) return null;
+
+          const siblings = await tx
+            .select({
+              recoveryId: detachedQueuedRunRecoveries.id,
+              run: heartbeatRuns,
+            })
+            .from(detachedQueuedRunRecoveries)
+            .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, detachedQueuedRunRecoveries.sourceRunId))
+            .where(and(
+              eq(detachedQueuedRunRecoveries.companyId, currentIssue.companyId),
+              eq(detachedQueuedRunRecoveries.issueId, currentIssue.id),
+              eq(detachedQueuedRunRecoveries.status, "detached"),
+              eq(heartbeatRuns.status, "queued"),
+            ))
+            .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
+            .for("update");
+
+          const detachedSiblings = siblings.filter(
+            ({ run }) => run.id !== currentIssue.executionRunId && run.id !== currentIssue.checkoutRunId,
+          );
+          if (detachedSiblings.length === 0) return null;
+
+          await options.beforeDetachedQueuedRunCancellationForTest?.({
+            issueId,
+            runIds: detachedSiblings.map(({ run }) => run.id),
+          });
+
+          const cancelled: Array<{ recoveryId: string; run: typeof heartbeatRuns.$inferSelect; staleForMs: number }> = [];
+          for (const sibling of detachedSiblings) {
+            const cancelledRun = await tx
+              .update(heartbeatRuns)
+              .set({
+                status: "cancelled",
+                finishedAt: now,
+                error: cancelReason,
+                errorCode: "queued_run_detached_from_issue",
+                resultJson: {
+                  ...parseObject(sibling.run.resultJson),
+                  stopReason: "queued_run_detached_from_issue",
+                },
+                updatedAt: now,
+              })
+              .where(and(eq(heartbeatRuns.id, sibling.run.id), eq(heartbeatRuns.status, "queued")))
+              .returning()
+              .then((rows) => rows[0] ?? null);
+            if (!cancelledRun) continue;
+
+            if (cancelledRun.wakeupRequestId) {
+              await tx
+                .update(agentWakeupRequests)
+                .set({ status: "skipped", finishedAt: now, error: cancelReason, updatedAt: now })
+                .where(eq(agentWakeupRequests.id, cancelledRun.wakeupRequestId));
+            }
+            cancelled.push({
+              recoveryId: sibling.recoveryId,
+              run: cancelledRun,
+              staleForMs: now.getTime() - sibling.run.createdAt.getTime(),
+            });
+          }
+          if (cancelled.length === 0) return null;
+
+          const existingPending = await tx
+            .select({ id: detachedQueuedRunRecoveries.id })
+            .from(detachedQueuedRunRecoveries)
+            .where(and(
+              eq(detachedQueuedRunRecoveries.companyId, currentIssue.companyId),
+              eq(detachedQueuedRunRecoveries.issueId, currentIssue.id),
+              eq(detachedQueuedRunRecoveries.status, "pending"),
+            ))
+            .limit(1)
+            .for("update")
+            .then((rows) => rows[0] ?? null);
+
+          const issueAlreadyOwned = Boolean(currentIssue.executionRunId || currentIssue.checkoutRunId);
+          const anchor = !issueAlreadyOwned && !existingPending ? cancelled[0] : null;
+          if (anchor) {
+            await tx
+              .update(detachedQueuedRunRecoveries)
+              .set({ status: "pending", pendingAt: now, lastError: null, updatedAt: now })
+              .where(and(
+                eq(detachedQueuedRunRecoveries.id, anchor.recoveryId),
+                eq(detachedQueuedRunRecoveries.status, "detached"),
+              ));
+          }
+
+          const coveredRecoveryIds = cancelled
+            .filter(({ recoveryId }) => recoveryId !== anchor?.recoveryId)
+            .map(({ recoveryId }) => recoveryId);
+          if (coveredRecoveryIds.length > 0) {
+            await tx
+              .update(detachedQueuedRunRecoveries)
+              .set({ status: "superseded", completedAt: now, updatedAt: now })
+              .where(inArray(detachedQueuedRunRecoveries.id, coveredRecoveryIds));
+          }
+
+          return { cancelled };
+        });
+
+        if (!outcome) {
+          result.skipped += 1;
+          continue;
+        }
+        result.terminalized += outcome.cancelled.length;
+
+        // Lifecycle events are intentionally outside the cancellation/outbox
+        // transaction. Losing optional observability must never roll back or
+        // strand the durable recovery intent.
+        for (const cancelled of outcome.cancelled) {
+          try {
+            await appendRunEvent(cancelled.run, await nextRunEventSeq(cancelled.run.id), {
+              eventType: "lifecycle",
+              stream: "system",
+              level: "warn",
+              message: "Cancelled a detached queued run found by the BLO-21621 reconciliation sweep",
+              payload: { issueId, staleForMs: cancelled.staleForMs },
+            });
+          } catch (err) {
+            logger.warn(
+              { err, runId: cancelled.run.id, issueId },
+              "reconcileDetachedQueuedRuns: failed to append cancellation event",
+            );
+          }
+          logger.warn(
+            { runId: cancelled.run.id, issueId, staleForMs: cancelled.staleForMs },
+            "reconcileDetachedQueuedRuns: cancelled a detached queued run",
+          );
+        }
+      } catch (err) {
+        result.failed += 1;
+        logger.warn({ err, issueId }, "reconcileDetachedQueuedRuns: failed to reconcile candidate");
+      }
+    }
+
+    // Dispatch both intents created above and intents left pending by an older
+    // pass that crashed or failed after cancellation. enqueueWakeup serializes
+    // on the same issue row and coalesces an already-created execution path, so
+    // repeating an attempt with this stable intent key is idempotent.
+    const pendingIntents = await db
+      .select()
+      .from(detachedQueuedRunRecoveries)
+      .where(and(
+        eq(detachedQueuedRunRecoveries.status, "pending"),
+        opts?.companyId ? eq(detachedQueuedRunRecoveries.companyId, opts.companyId) : undefined,
+      ))
+      // Failed attempts move behind never-attempted/older work so a persistent
+      // bad intent cannot monopolize the bounded batch forever.
+      .orderBy(
+        sql`${detachedQueuedRunRecoveries.lastAttemptAt} asc nulls first`,
+        asc(detachedQueuedRunRecoveries.pendingAt),
+        asc(detachedQueuedRunRecoveries.id),
+      )
+      .limit(limit);
+
+    for (const intent of pendingIntents) {
+      try {
+        const attemptAt = new Date();
+        const claimedIntent = await db
+          .update(detachedQueuedRunRecoveries)
+          .set({
+            attemptCount: sql`${detachedQueuedRunRecoveries.attemptCount} + 1`,
+            lastAttemptAt: attemptAt,
+            updatedAt: attemptAt,
+          })
+          .where(and(
+            eq(detachedQueuedRunRecoveries.id, intent.id),
+            eq(detachedQueuedRunRecoveries.status, "pending"),
+          ))
+          .returning()
+          .then((rows) => rows[0] ?? null);
+        if (!claimedIntent) continue;
+
+        const currentIssue = await db
+          .select({
+            companyId: issues.companyId,
+            status: issues.status,
+            assigneeAgentId: issues.assigneeAgentId,
+          })
+          .from(issues)
+          .where(eq(issues.id, claimedIntent.issueId))
+          .then((rows) => rows[0] ?? null);
+        if (!currentIssue || TERMINAL_ISSUE_STATUSES.has(currentIssue.status)) {
+          await db
+            .update(detachedQueuedRunRecoveries)
+            .set({ status: "cancelled", completedAt: attemptAt, lastError: null, updatedAt: attemptAt })
+            .where(and(
+              eq(detachedQueuedRunRecoveries.id, claimedIntent.id),
+              eq(detachedQueuedRunRecoveries.status, "pending"),
+            ));
+          continue;
+        }
+
+        const findActiveRun = () => db
+          .select({ id: heartbeatRuns.id })
+          .from(heartbeatRuns)
+          .where(and(
+            eq(heartbeatRuns.companyId, currentIssue.companyId),
+            eq(heartbeatRuns.contextIssueId, claimedIntent.issueId),
+            inArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES]),
+          ))
+          .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        let activeRun: { id: string } | null = await findActiveRun();
+        let recoveryRun: { id: string } | null = null;
+
+        if (!activeRun) {
+          if (!currentIssue.assigneeAgentId) {
+            throw new Error("Detached queued-run recovery issue has no assignee agent");
+          }
+          await options.beforeDetachedQueuedRunRecoveryEnqueueForTest?.({
+            intentId: claimedIntent.id,
+            issueId: claimedIntent.issueId,
+            sourceRunId: claimedIntent.sourceRunId,
+          });
+          const enqueuedRecoveryRun = await enqueueWakeup(currentIssue.assigneeAgentId, {
+            source: "automation",
+            triggerDetail: "system",
+            reason: "queued_run_detachment_recovery",
+            payload: { issueId: claimedIntent.issueId, retryOfRunId: claimedIntent.sourceRunId },
+            contextSnapshot: {
+              issueId: claimedIntent.issueId,
+              taskId: claimedIntent.issueId,
+              wakeReason: "queued_run_detachment_recovery",
+              retryReason: "queued_run_detachment_recovery",
+              retryOfRunId: claimedIntent.sourceRunId,
+              source: "heartbeat.reconcile_detached_queued_runs",
+            },
+            idempotencyKey: `detached_queued_run_recovery:${claimedIntent.id}`,
+          });
+          recoveryRun = enqueuedRecoveryRun ? { id: enqueuedRecoveryRun.id } : null;
+          activeRun = recoveryRun ?? await findActiveRun();
+        }
+
+        if (!activeRun) {
+          throw new Error("Detached queued-run recovery enqueue produced no durable execution path");
+        }
+
+        const completed = await db
+          .update(detachedQueuedRunRecoveries)
+          .set({
+            status: "completed",
+            recoveryRunId: activeRun.id,
+            completedAt: new Date(),
+            lastError: null,
+            updatedAt: new Date(),
+          })
+          .where(and(
+            eq(detachedQueuedRunRecoveries.id, claimedIntent.id),
+            eq(detachedQueuedRunRecoveries.status, "pending"),
+          ))
+          .returning({ id: detachedQueuedRunRecoveries.id })
+          .then((rows) => rows[0] ?? null);
+        if (completed && recoveryRun) result.recovered += 1;
+      } catch (err) {
+        result.failed += 1;
+        await db
+          .update(detachedQueuedRunRecoveries)
+          .set({ lastError: err instanceof Error ? err.message : String(err), updatedAt: new Date() })
+          .where(and(
+            eq(detachedQueuedRunRecoveries.id, intent.id),
+            eq(detachedQueuedRunRecoveries.status, "pending"),
+          ));
+        logger.warn(
+          { err, intentId: intent.id, issueId: intent.issueId },
+          "reconcileDetachedQueuedRuns: failed to dispatch durable recovery intent",
+        );
+      }
+    }
+
+    return result;
+  }
+
   async function sweepStaleIssueLocks() {
     return recovery.sweepStaleIssueLocks();
   }
@@ -21981,14 +22508,33 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // prose. Only consulted when the adapter did not already hand back a
       // structured `retryNotBefore` (claude-local/codex-local do), and only for
       // the throttle families — a horizon quoted inside some unrelated failure's
-      // tool output must not push that failure's retry into next week.
+      // tool output must not push that failure's retry into next week. The
+      // structured case is not unhandled: it is picked up a few lines down.
+      const providerCapacityThrottleOverride =
+        rateLimitExhaustedOverride || providerThrottledNoProgressOverride;
       const providerCapacityResetAt =
-        (rateLimitExhaustedOverride || providerThrottledNoProgressOverride) && !adapterResult.retryNotBefore
+        providerCapacityThrottleOverride && !adapterResult.retryNotBefore
           ? parseProviderCapacityResetHorizon({
               resultJson: adapterResult.resultJson,
               errorMessage: adapterResult.errorMessage,
             })
           : null;
+      const providerCapacityResetStatusEvidence = providerCapacityThrottleOverride
+        ? readProviderCapacityResetStatusEvidence(adapterResult.resultJson)
+        : null;
+      // The structured counterpart of the prose horizon above. Gated on the
+      // server having actually observed a 429 on this result: the throttle
+      // families also fire for 401 cap-windows and legacy quota signals, and a
+      // `retryNotBefore` alone never implies a capacity 429 — that asymmetry is
+      // the whole reason the read side distrusts a bare hint.
+      const structuredProviderCapacityResetAt =
+        providerCapacityThrottleOverride &&
+        !providerCapacityResetAt &&
+        providerCapacityResetStatusEvidence?.statusCode === 429
+          ? canonicalizeAdapterCapacityResetInstant(adapterResult.retryNotBefore)
+          : null;
+      const persistedProviderCapacityResetAt =
+        providerCapacityResetAt ?? structuredProviderCapacityResetAt;
       const effectiveRetryNotBefore =
         adapterResult.retryNotBefore ?? providerCapacityResetAt?.toISOString() ?? null;
       let prReviewCompletionEvidence = outcome === "succeeded"
@@ -22172,22 +22718,39 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             } as Record<string, unknown>)
           : null;
 
+      const adapterResultJsonForPersistence = stripAdapterProviderCapacityResetMetadata(
+        adapterResult.resultJson,
+      );
       const persistedResultJson = mergeHeartbeatRunResultJson(
         mergeRunStopMetadataForAgent(agent, outcome, {
           resultJson: mergeModelProfileRunMetadata(
             mergeAdapterRecoveryMetadata({
               resultJson: {
-                ...parseObject(adapterResult.resultJson),
+                ...adapterResultJsonForPersistence,
                 configFreshness: configFreshnessResultMetadata,
-                // BLO-18278: keep the provenance of a prose-recovered horizon so
+                // BLO-18278: keep the provenance of the recovered horizon so
                 // the strand comment can name the reset instant, and so a wrong
                 // parse is debuggable from the persisted run rather than only
-                // from the raw log. Set here, inside `resultJson`, because
-                // mergeAdapterRecoveryMetadata only forwards errorFamily and
-                // retryNotBefore — any other key passed alongside them is
-                // dropped.
-                ...(providerCapacityResetAt
-                  ? { providerCapacityResetAt: providerCapacityResetAt.toISOString() }
+                // from the raw log. Adapter-owned capacity-reset fields were
+                // stripped above; the paired provenance discriminator below is
+                // written only by this server path, from either the prose
+                // parser or a 429-substantiated structured hint.
+                ...(persistedProviderCapacityResetAt
+                  ? {
+                      providerCapacityResetAt: persistedProviderCapacityResetAt.toISOString(),
+                      providerCapacityResetProvenance: {
+                        source: PROVIDER_CAPACITY_RESET_PROVENANCE_SOURCE,
+                        errorFamily: "rate_limit_exhausted",
+                        observedStatusCode: providerCapacityResetStatusEvidence?.statusCode ?? null,
+                        observedStatusField: providerCapacityResetStatusEvidence?.field ?? null,
+                        observedCause: rateLimitExhaustedOverride
+                          ? "rate_limit_exhausted"
+                          : "provider_throttled_no_progress",
+                        horizonSource: providerCapacityResetAt
+                          ? "server_prose_parse"
+                          : "adapter_structured_retry_not_before",
+                      },
+                    }
                   : {}),
                 ...(prReviewIncompleteOverride
                   ? {
@@ -24211,6 +24774,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // same issue workspace while the assignee already has a live run.
       const agentNameKey = normalizeAgentNameKey(agent.name);
 
+      await options.beforeIssueWakeLockForTest?.({ issueId, agentId });
       const outcome = await db.transaction(async (tx) => {
         await tx.execute(
           sql`select id from issues where id = ${issueId} and company_id = ${agent.companyId} for update`,
@@ -27221,6 +27785,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // adoption path can be driven directly from a test rather than only through
     // a plugin-host or route wrapper.
     enqueueWakeup,
+    reconcileDetachedQueuedRuns,
 
     buildIssueGraphLivenessAutoRecoveryPreview,
 

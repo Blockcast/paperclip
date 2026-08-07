@@ -72,10 +72,13 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
   });
 
   it("vendors the opencode_k8s adapter commit with runtime isolation, the env-dump deny, and Opus 5", () => {
-    expect(serverDockerfile).toContain("ARG OPENCODE_K8S_REF=42384fdef5780ccdfbfba67c1a60feebd7ffb87c");
+    expect(serverDockerfile).toContain("ARG OPENCODE_K8S_REF=83197d46b0784c941801165464d48aca1b979909");
     expect(serverDockerfile).toContain("add anthropic/claude-opus-5 to the");
     expect(serverDockerfile).toContain("bound the pre-Job live-Job list to 15 seconds");
     expect(serverDockerfile).toContain("PEN-1305 permission.bash env-dump deny");
+    expect(serverDockerfile).toContain("canaries clean stale persistent guard artifacts");
+    expect(serverDockerfile).toContain("unquoted sh/bash -c dumps are");
+    expect(serverDockerfile).toContain("positional arguments, closing sh -c env ignored");
     expect(serverDockerfile).toContain("disable opencode's turn-zero workspace");
     expect(serverDockerfile).toContain("snapshot: false");
     expect(serverDockerfile).toContain("opencode config/auth writers respect XDG_*");
