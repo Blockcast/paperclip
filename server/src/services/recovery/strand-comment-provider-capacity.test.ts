@@ -66,6 +66,88 @@ function run(overrides: Record<string, unknown>) {
 }
 
 describe("summarizeRunFailureForIssueComment — provider capacity 429", () => {
+  // BLO-18285. When the advertised window exceeds the horizon cap the run parks
+  // at OUR checkpoint, so `providerCapacityResetAt` is no longer the provider's
+  // claim. Two ways the old wording would now lie about that, both pinned here:
+  // attributing the checkpoint to the provider, and — once the checkpoint
+  // passes — announcing that the advertised horizon "has since elapsed" when it
+  // is still hours away.
+  const OVER_CAP_ADVERTISED_ISO = "2026-07-30T13:56:36.000Z";
+  const OVER_CAP_PARKED_ISO = "2026-07-27T18:50:31.000Z";
+  const OVER_CAP_PROVENANCE = {
+    ...SERVER_429_PROVENANCE,
+    horizonSource: "server_prose_parse_over_horizon_park",
+    advertisedResetAt: OVER_CAP_ADVERTISED_ISO,
+    horizonCapMs: 24 * 60 * 60 * 1000,
+  } as const;
+
+  function overCapRun() {
+    return run({
+      errorCode: "job_failed",
+      error: "External lifecycle Job failed: BackoffLimitExceeded: Job has reached the specified backoff limit.",
+      resultJson: {
+        errorFamily: "rate_limit_exhausted",
+        providerCapacityResetAt: OVER_CAP_PARKED_ISO,
+        providerCapacityResetProvenance: OVER_CAP_PROVENANCE,
+      },
+    });
+  }
+
+  it("attributes the advertised instant to the provider and the park to us", () => {
+    const summary = summarizeRunFailureForIssueComment(overCapRun(), SWEEP_WHILE_OPEN);
+
+    // The provider's own claim is what gets attributed to the provider.
+    expect(summary).toContain(`advertised a capacity reset at ${OVER_CAP_ADVERTISED_ISO}`);
+    // Our checkpoint appears, but as a park we chose — never as something the
+    // provider said.
+    expect(summary).toContain(`parked until ${OVER_CAP_PARKED_ISO}`);
+    expect(summary).not.toContain(`advertised a capacity reset at ${OVER_CAP_PARKED_ISO}`);
+    expect(summary).toContain("transient");
+    expect(summary).not.toContain("BackoffLimitExceeded");
+  });
+
+  it("does not claim the advertised horizon elapsed once the park checkpoint passes", () => {
+    // Read AFTER the park instant but BEFORE the advertised one — the exact
+    // window in which the pre-existing elapsed-horizon wording would be false.
+    const afterPark = Date.parse("2026-07-28T00:00:00.000Z");
+    expect(afterPark).toBeGreaterThan(Date.parse(OVER_CAP_PARKED_ISO));
+    expect(afterPark).toBeLessThan(Date.parse(OVER_CAP_ADVERTISED_ISO));
+
+    const summary = summarizeRunFailureForIssueComment(overCapRun(), afterPark);
+    expect(summary).not.toContain("has since elapsed");
+    expect(summary).toContain(`advertised a capacity reset at ${OVER_CAP_ADVERTISED_ISO}`);
+  });
+
+  // BLO-18285 boundary coupling. An over-cap park is written at
+  // `finalizationNow + PROVIDER_CAPACITY_MAX_HORIZON_MS` (heartbeat.ts) and read
+  // back through this file's `finishedAt + PROVIDER_CAPACITY_RESET_MAX_SKEW_MS`
+  // upper bound. Both constants are 24h TODAY, which is the only reason the
+  // park survives the bounds check — it lands exactly on it. Raising the write
+  // -side cap without raising this read-side skew would not fail loudly: the
+  // instant would just be refused, and every over-cap strand comment would
+  // silently drop back to the generic BackoffLimitExceeded text this whole file
+  // exists to replace. This case is the tripwire for that.
+  it("accepts a park sitting exactly on the reader's upper bound", () => {
+    const finishedAt = new Date("2026-07-26T18:51:11.000Z");
+    const parkedAtBoundary = new Date(finishedAt.getTime() + 24 * 60 * 60 * 1000).toISOString();
+
+    const summary = summarizeRunFailureForIssueComment(
+      run({
+        errorCode: "job_failed",
+        finishedAt,
+        resultJson: {
+          errorFamily: "rate_limit_exhausted",
+          providerCapacityResetAt: parkedAtBoundary,
+          providerCapacityResetProvenance: OVER_CAP_PROVENANCE,
+        },
+      }),
+      finishedAt.getTime() + 60_000,
+    );
+
+    expect(summary).toContain(`parked until ${parkedAtBoundary}`);
+    expect(summary).not.toContain("BackoffLimitExceeded");
+  });
+
   it("names the 429 and the reset instant instead of the BackoffLimitExceeded symptom", () => {
     const summary = summarizeRunFailureForIssueComment(
       run({
