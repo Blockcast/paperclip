@@ -14,16 +14,22 @@
  * (which Job pods use, since there is no human to answer permission prompts),
  * so this is the correct enforcement point for unattended runs.
  *
- * This module is the ENFORCED copy — the one a Job pod actually runs. A second,
- * older copy of the same classifier lives at `server/src/agent-shell-guard.ts`.
+ * This module is the ENFORCED copy — the one a Job pod actually runs. A second
+ * copy of the same classifier lives at `server/src/agent-shell-guard.ts`.
  * An earlier version of this comment claimed the two were "locked in
- * behavioural parity" by `env-guard.test.ts`; that was never true. Nothing
- * imports the server copy except its own test, `env-guard.test.ts` does not
- * reference it, and the two have since diverged by four fixed bypasses
- * (compound-command helper match, CR/LF separators, flag-only dumps, command
- * substitution) that the server copy still has. Do not treat that file as the
- * reference implementation, and do not assume a fix here lands there. Tracked
- * separately for removal-or-resync; see BLO-22840.
+ * behavioural parity" by `env-guard.test.ts`; that was never true — the test
+ * does not reference that file, and nothing imports it in production either.
+ *
+ * A later version of this comment then over-corrected, calling that file simply
+ * "four bypasses behind". Also wrong: the divergence runs in BOTH directions.
+ * The server copy was *ahead* on the unquoted-shell-wrapper bypass, which a
+ * human closed there in `993bf304c` (2026-08-04) while this copy still had it —
+ * and this copy was ahead on CR/LF separators, flag-only dumps and command
+ * substitution, which that copy still lacks. Neither file is the reference
+ * implementation, and a fix in one does not land in the other.
+ *
+ * So: check the other copy before assuming a bypass is novel here, and do not
+ * describe either as authoritative. Tracked for removal-or-resync as BLO-22840.
  */
 
 export type AgentShellCommandDecision =
@@ -47,7 +53,47 @@ export type AgentShellCommandDecision =
 const SAFE_ENV_INSPECTION_RE =
   /^(?:node[ \t]+)?(?:[^\s;&|()<>]*\/)?(?:safe-env-inspect(?:\.mjs)?|paperclip-safe-env)(?:[ \t]+[^;&|()<>$\x60\r\n]*)?$/;
 
-const SHELL_WRAPPER_RE = /^(?:\/bin\/)?(?:ba|z|)?sh\s+-l?c\s+(["'])([\s\S]*)\1\s*$/;
+/**
+ * Matches the `sh -c` / `bash -lc` prefix, WITHOUT requiring the payload to be
+ * quoted.
+ *
+ * This deliberately mirrors `SHELL_COMMAND_PREFIX_RE` +
+ * `readShellCommandArgument` in `server/src/agent-shell-guard.ts`, where the
+ * same unquoted-wrapper bypass was closed in `993bf304c`. Converging on that
+ * shape rather than inventing a third one is a point of vendoring.
+ *
+ * The previous pattern required a quoted payload (`(["'])([\s\S]*)\1`), so
+ * `sh -c env` was never unwrapped at all and reached the detector intact.
+ */
+const SHELL_COMMAND_PREFIX_RE = /^(?:\/bin\/)?(?:ba|z|)?sh\s+-l?c(?:\s+|$)/;
+
+/**
+ * Reads the argument to `sh -c`, quoted or bare.
+ *
+ * A bare argument is the first whitespace-delimited token, which is what the
+ * shell itself does: in `sh -c env ls`, `env` is the command and `ls` becomes
+ * `$0`. Taking only the first token is accurate, not a shortcut.
+ */
+function readShellCommandArgument(input: string): string {
+  const rest = input.trimStart();
+  if (!rest) return "";
+  const quote = rest[0];
+  if (quote === "'" || quote === '"') {
+    let out = "";
+    for (let i = 1; i < rest.length; i += 1) {
+      const ch = rest[i];
+      if (ch === quote) return out;
+      if (quote === '"' && ch === "\\" && i + 1 < rest.length) {
+        i += 1;
+        out += rest[i] ?? "";
+      } else {
+        out += ch;
+      }
+    }
+    return out;
+  }
+  return /^[^\s]+/.exec(rest)?.[0] ?? "";
+}
 
 /**
  * Characters that end one command and begin another, for the purposes of the
@@ -77,8 +123,9 @@ const CMD_BOUNDARY = String.raw`;&|()\x60\r\n`;
  * `CMD_BOUNDARY` covers shell punctuation, but a dump is equally reachable as a
  * bare argument to a command-introducing wrapper, separated by nothing but a
  * space: `sh -c env`, `bash -c printenv`, `eval env`, `xargs env`,
- * `nohup env`, `timeout 5 env`, `su -c env`. `SHELL_WRAPPER_RE` only unwraps a
- * *quoted* `-c` payload, so every unquoted form reached the detector with a
+ * `nohup env`, `timeout 5 env`, `su -c env`. Shell unwrapping only ever handles
+ * a `sh -c` prefix (and, before `993bf304c`'s shape was adopted below, only a
+ * *quoted* payload), so these reached the detector with a
  * space sitting where a boundary was required, matched nothing, and returned
  * `allow` — a full dump, which is the exact leak this guard exists to stop.
  * Measured before this change: 9 of 9 such payloads were allowed by the real
@@ -135,9 +182,9 @@ const FULL_ENV_DUMP_RE = new RegExp(
 function unwrapShell(command: string): string {
   let current = command.trim();
   for (let i = 0; i < 3; i += 1) {
-    const match = SHELL_WRAPPER_RE.exec(current);
+    const match = SHELL_COMMAND_PREFIX_RE.exec(current);
     if (!match) return current;
-    current = match[2] ?? current;
+    current = readShellCommandArgument(current.slice(match[0].length));
   }
   return current;
 }
@@ -172,14 +219,35 @@ export const ENV_GUARD_SCRIPT = String.raw`#!/usr/bin/env node
 // paperclip-adapter-claude-k8s; do not edit in the pod.
 const SAFE_ENV_INSPECTION_RE =
   /^(?:node[ \t]+)?(?:[^\s;&|()<>]*\/)?(?:safe-env-inspect(?:\.mjs)?|paperclip-safe-env)(?:[ \t]+[^;&|()<>$\x60\r\n]*)?$/;
-const SHELL_WRAPPER_RE = /^(?:\/bin\/)?(?:ba|z|)?sh\s+-l?c\s+(["'])([\s\S]*)\1\s*$/;
+const SHELL_COMMAND_PREFIX_RE = /^(?:\/bin\/)?(?:ba|z|)?sh\s+-l?c(?:\s+|$)/;
+function readShellCommandArgument(input) {
+  const rest = String(input || "").replace(/^\s+/, "");
+  if (!rest) return "";
+  const quote = rest[0];
+  if (quote === "'" || quote === '"') {
+    let out = "";
+    for (let i = 1; i < rest.length; i += 1) {
+      const ch = rest[i];
+      if (ch === quote) return out;
+      if (quote === '"' && ch === "\\" && i + 1 < rest.length) {
+        i += 1;
+        out += rest[i] != null ? rest[i] : "";
+      } else {
+        out += ch;
+      }
+    }
+    return out;
+  }
+  const m = /^[^\s]+/.exec(rest);
+  return m ? m[0] : "";
+}
 const FULL_ENV_DUMP_RE = /(?:^|[;&|()\x60\r\n \t]\s*)(?:command\s+)?(?:\/usr\/bin\/)?(?:env|printenv)(?:[ \t]+(?:(?:-u|--unset)[ \t]+[^\s;&|()<>]+|-[^\s;&|()<>]*))*(?:\s*(?:[;&|()\x60\r\n]|$))|(?:^|[;&|()\x60\r\n \t]\s*)(?:set)(?:\s*(?:[;&|()\x60\r\n]|$))|(?:^|[;&|()\x60\r\n \t]\s*)export\s+-p(?:\s*(?:[;&|()\x60\r\n]|$))|(?:^|[;&|()\x60\r\n \t]\s*)declare\s+-x(?:\s*(?:[;&|()\x60\r\n]|$))|(?:^|[;&|()\x60\r\n \t]\s*)cat\s+\/proc\/(?:self|\d+)\/environ(?:\s*(?:[;&|()\x60\r\n]|$))|\/proc\/(?:self|\d+)\/environ/i;
 function unwrapShell(command) {
   let current = String(command || "").trim();
   for (let i = 0; i < 3; i += 1) {
-    const match = SHELL_WRAPPER_RE.exec(current);
+    const match = SHELL_COMMAND_PREFIX_RE.exec(current);
     if (!match) return current;
-    current = match[2] != null ? match[2] : current;
+    current = readShellCommandArgument(current.slice(match[0].length));
   }
   return current;
 }
