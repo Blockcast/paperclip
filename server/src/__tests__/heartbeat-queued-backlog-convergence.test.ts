@@ -587,7 +587,13 @@ describeEmbeddedPostgres("queued backlog convergence (BLO-20396)", () => {
     await insertChunked(runRows, (chunk) => db.insert(heartbeatRuns).values(chunk));
 
     await heartbeat.resumeQueuedRuns();
-    await heartbeat.drainInFlightExecutions(120_000);
+    // BLO-21953: this drains 2,010+ rows through a real, recursive
+    // executeRun -> finalize -> startNextQueuedRunForAgent chain against
+    // Postgres. 120s was tight enough to read as "queued" under merge-queue
+    // CI load even though the dispatcher had not stalled, just not yet
+    // caught up — widen to 300s (still well inside this test's 600s
+    // timeout) instead of loosening the assertion itself.
+    await heartbeat.drainInFlightExecutions(300_000);
 
     // Reached via the resumed continuation, not by one pass scanning forever.
     const [runnableAfter] = await db
