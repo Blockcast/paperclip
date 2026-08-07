@@ -127,6 +127,9 @@ jobs:
       - name: Test verify job cancelled/skipped-vs-failed lane outcome
         run: node --test ./scripts/__tests__/pr-verify-lane-outcome.test.mjs
 
+      - name: Test pr-lockfile artifact guard and Playwright deps retry
+        run: node --test ./scripts/__tests__/pr-lockfile-artifact-guard.test.mjs
+
       - name: Validate release package manifest
         run: node ./scripts/release-package-map.mjs check
 
@@ -737,8 +740,10 @@ jobs:
             if pnpm exec playwright install-deps chromium; then
               exit 0
             fi
-            echo "Playwright system dependency install failed (attempt $attempt/3); retrying in 15s..." >&2
-            sleep 15
+            if [ "$attempt" -lt 3 ]; then
+              echo "Playwright system dependency install failed (attempt $attempt/3); retrying in 15s..." >&2
+              sleep 15
+            fi
           done
           echo "Playwright system dependency install failed after 3 attempts" >&2
           exit 1
