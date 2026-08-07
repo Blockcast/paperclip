@@ -656,8 +656,14 @@ export function applyRunScopeToBranchName(
   heartbeatRunId: string | null | undefined,
 ): string {
   if (runScope !== "per_run") return branchName;
-  const token = sanitizeBranchName(heartbeatRunId ?? "")
-    .replace(/-/g, "")
+  // Derive the token from the raw run id rather than via sanitizeBranchName:
+  // that helper substitutes a literal "paperclip-work" for empty input, which
+  // would turn every run *without* a run id into the same token ("papercli")
+  // and silently collapse them back onto one shared tree while still looking
+  // per-run. A missing id must degrade to the issue-scoped name loudly, not to
+  // a colliding one quietly.
+  const token = (heartbeatRunId ?? "")
+    .replace(/[^A-Za-z0-9]+/g, "")
     .slice(0, RUN_SCOPE_TOKEN_LENGTH)
     .toLowerCase();
   // No usable run id (e.g. a non-heartbeat realize path): fall back to the
