@@ -30,7 +30,15 @@ export interface SelfPodInfo {
   inheritedEnvFrom: k8s.V1EnvFromSource[];
 }
 
-let cachedSelfPod: SelfPodInfo | null = null;
+/**
+ * Self-pod introspection cache, keyed by (kubeconfig path, namespace, hostname).
+ * A process-global single-entry cache would be wrong: API clients and
+ * `execute()` accept a different kubeconfig per request, so the first
+ * execution to populate the cache would hand its cluster's image, scheduling,
+ * PVC, env and Secret references to every later execution running against a
+ * *different* cluster.
+ */
+const selfPodCache = new Map<string, SelfPodInfo>();
 
 /**
  * Cache keyed by kubeconfig path (empty string = in-cluster).
@@ -109,14 +117,17 @@ function readInClusterNamespace(): string {
  * and environment variables to forward to Job pods.
  */
 export async function getSelfPodInfo(kubeconfigPath?: string): Promise<SelfPodInfo> {
-  if (cachedSelfPod) return cachedSelfPod;
-
   const hostname = process.env.HOSTNAME;
   if (!hostname) {
     throw new Error("claude_k8s: HOSTNAME env var not set — cannot introspect running pod");
   }
 
   const namespace = readInClusterNamespace();
+  // NUL-joined so no component can forge a key boundary via its own content.
+  const cacheKey = [kubeconfigPath ?? "", namespace, hostname].join("\u0000");
+  const cached = selfPodCache.get(cacheKey);
+  if (cached) return cached;
+
   const coreApi = getCoreApi(kubeconfigPath);
   const pod = await coreApi.readNamespacedPod({ name: hostname, namespace });
 
@@ -177,7 +188,7 @@ export async function getSelfPodInfo(kubeconfigPath?: string): Promise<SelfPodIn
   // Capture envFrom sources (secretRef, configMapRef) from the container spec
   const inheritedEnvFrom: k8s.V1EnvFromSource[] = mainContainer.envFrom ?? [];
 
-  cachedSelfPod = {
+  const info: SelfPodInfo = {
     namespace,
     image: mainContainer.image,
     imagePullSecrets: (spec.imagePullSecrets ?? []).map((s) => ({
@@ -193,11 +204,12 @@ export async function getSelfPodInfo(kubeconfigPath?: string): Promise<SelfPodIn
     inheritedEnvFrom,
   };
 
-  return cachedSelfPod;
+  selfPodCache.set(cacheKey, info);
+  return info;
 }
 
 /** Reset cached state — useful for tests. */
 export function resetCache(): void {
   kcCache.clear();
-  cachedSelfPod = null;
+  selfPodCache.clear();
 }

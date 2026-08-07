@@ -26,6 +26,15 @@ describe("classifyAgentShellCommand", () => {
     "ls && printenv",
     'sh -lc "env"',
     "bash -c 'printenv'",
+    // Compound-command bypass: the safe-helper exception is evaluated before
+    // the full-dump detector, so a helper appearing anywhere in the command
+    // used to return `allow` and let the trailing dump through.
+    "paperclip-safe-env && env",
+    "safe-env-inspect; printenv",
+    "./scripts/safe-env-inspect.mjs && cat /proc/self/environ",
+    "node ~/.claude/safe-env-inspect.mjs | env",
+    "env && paperclip-safe-env",
+    'sh -lc "paperclip-safe-env && env"',
   ];
   const allowed = [
     // Legitimate env USE (set-and-run) must not be blocked.
@@ -43,6 +52,12 @@ describe("classifyAgentShellCommand", () => {
     "node ~/.claude/safe-env-inspect.mjs",
     "./scripts/safe-env-inspect.mjs",
     "paperclip-safe-env",
+    // Anchoring the helper exception must not over-block: args are fine, and a
+    // compound command that merely *contains* the helper is still allowed when
+    // nothing in it is an environment dump.
+    "paperclip-safe-env --json",
+    "scripts/safe-env-inspect.mjs",
+    "cd /repo && paperclip-safe-env",
     "",
   ];
 
@@ -95,6 +110,28 @@ describe("embedded guard script (real node process)", () => {
 
   it("exits 0 for the allowlisted helper", () => {
     const evt = { tool_name: "Bash", tool_input: { command: "node ~/.claude/safe-env-inspect.mjs" } };
+    expect(runGuardScript(evt).status).toBe(0);
+  });
+
+  // The embedded script carries its own copy of the regexes, so the
+  // compound-command bypass must be pinned here too — not just on the
+  // TypeScript classifier. These are the exact commands that returned `allow`
+  // before the safe-helper exception was anchored to the whole command.
+  for (const cmd of [
+    "paperclip-safe-env && env",
+    "safe-env-inspect; printenv",
+    "./scripts/safe-env-inspect.mjs && cat /proc/self/environ",
+    'sh -lc "paperclip-safe-env && env"',
+  ]) {
+    it(`exits 2 on compound bypass: ${JSON.stringify(cmd)}`, () => {
+      const { status, stderr } = runGuardScript({ tool_name: "Bash", tool_input: { command: cmd } });
+      expect(status).toBe(2);
+      expect(stderr).toContain("PEN-1305");
+    });
+  }
+
+  it("still exits 0 when the helper is invoked with arguments", () => {
+    const evt = { tool_name: "Bash", tool_input: { command: "paperclip-safe-env --json" } };
     expect(runGuardScript(evt).status).toBe(0);
   });
 
