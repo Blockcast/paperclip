@@ -23,12 +23,14 @@ const agentRuntimeBake = readFileSync(
 const designerDockerfile = readFileSync(path.join(repoRoot, "packages/services/designer/Dockerfile"), "utf8");
 const designerPackageLock = readFileSync(path.join(repoRoot, "packages/services/designer/package-lock.json"), "utf8");
 const verifyAgentFfmpeg = path.join(repoRoot, "scripts/verify-agent-ffmpeg.sh");
+const verifyAgentFfmpegScript = readFileSync(verifyAgentFfmpeg, "utf8");
 
-function runFfmpegProbe(mode: "success" | "missing" | "failed" | "timeout") {
+function runFfmpegProbe(mode: "success" | "missing" | "failed" | "timeout" | "newline-free") {
   const stubDir = mkdtempSync(path.join(tmpdir(), "paperclip-ffmpeg-probe-"));
   const dockerStub = path.join(stubDir, "docker");
   const runArgsFile = path.join(stubDir, "docker-run-args");
   const cleanupArgsFile = path.join(stubDir, "docker-cleanup-args");
+  const cidfileStateFile = path.join(stubDir, "docker-cidfile-state");
   writeFileSync(
     dockerStub,
     `#!/bin/sh
@@ -44,9 +46,13 @@ case "$cmd" in
       fi
       shift || break
     done
-    if [ -n "$cidfile" ]; then
-      printf 'paperclip-ffmpeg-probe-test\\n' > "$cidfile"
+    if [ -e "$cidfile" ]; then
+      printf 'present\\n' > "$DOCKER_CIDFILE_STATE_FILE"
+      printf 'cidfile already exists\\n' >&2
+      exit 125
     fi
+    printf 'missing:%s\\n' "$(stat -c %a "$(dirname "$cidfile")")" > "$DOCKER_CIDFILE_STATE_FILE"
+    printf 'paperclip-ffmpeg-probe-test\\n' > "$cidfile"
     case "$DOCKER_STUB_MODE" in
       success)
         printf ' E moq_mmt MMTP muxer\\n'
@@ -59,6 +65,10 @@ case "$cmd" in
       missing) printf ' E matroska Matroska muxer\\n' ;;
       failed) exit 42 ;;
       timeout) sleep 1 ;;
+      newline-free)
+        printf ' E moq_mmt '
+        dd if=/dev/zero bs=1024 count=1024 2>/dev/null | tr '\\000' x
+        ;;
     esac
     ;;
   rm)
@@ -77,6 +87,7 @@ esac
         PATH: `${stubDir}:${process.env.PATH}`,
         DOCKER_RUN_ARGS_FILE: runArgsFile,
         DOCKER_CLEANUP_ARGS_FILE: cleanupArgsFile,
+        DOCKER_CIDFILE_STATE_FILE: cidfileStateFile,
         DOCKER_STUB_MODE: mode,
         FFMPEG_PROBE_OUTPUT_BYTES: "256",
         FFMPEG_PROBE_TIMEOUT_SECONDS: mode === "timeout" ? "0.5" : "15",
@@ -85,7 +96,8 @@ esac
     });
     const args = readFileSync(runArgsFile, "utf8").trim().split("\n");
     const cleanupArgs = readFileSync(cleanupArgsFile, "utf8").trim().split("\n");
-    return { result, args, cleanupArgs };
+    const cidfileState = readFileSync(cidfileStateFile, "utf8").trim();
+    return { result, args, cleanupArgs, cidfileState };
   } finally {
     rmSync(stubDir, { recursive: true, force: true });
   }
@@ -282,14 +294,15 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
   });
 
   it("constrains the FFmpeg probe and drains output after finding the muxer", () => {
-    const { result, args } = runFfmpegProbe("success");
+    const { result, args, cidfileState } = runFfmpegProbe("success");
 
     expect(result.status).toBe(0);
+    expect(cidfileState).toBe("missing:700");
     expect(args).toEqual([
       "run",
       "--rm",
       "--cidfile",
-      expect.stringContaining("paperclip-ffmpeg-probe-cid."),
+      expect.stringMatching(/paperclip-ffmpeg-probe\.[^/]+\/cid$/),
       "--network",
       "none",
       "--read-only",
@@ -313,6 +326,14 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
       "-hide_banner",
       "-muxers",
     ]);
+  });
+
+  it("byte-bounds and drains newline-free probe output", () => {
+    const { result } = runFfmpegProbe("newline-free");
+
+    expect(result.status).toBe(0);
+    expect(verifyAgentFfmpegScript).toContain('head -c "$probe_output_bytes"');
+    expect(verifyAgentFfmpegScript).not.toContain("| awk");
   });
 
   it("force-removes the probe container after a timeout", () => {
