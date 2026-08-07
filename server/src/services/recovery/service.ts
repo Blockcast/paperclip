@@ -14,6 +14,7 @@ import {
   approvals,
   activityLog,
   companies,
+  detachedQueuedRunRecoveries,
   heartbeatRunEvents,
   heartbeatRunWatchdogDecisions,
   heartbeatRuns,
@@ -8089,6 +8090,11 @@ export function recoveryService(
         }
 
         const clearedAt = new Date();
+        const detachedQueuedRunId = currentIssue.executionRunId
+          && currentRunById.get(currentIssue.executionRunId)?.status === "queued"
+          && currentPreClaimLockExpired(currentIssue.executionRunId, currentIssue.executionLockedAt)
+          ? currentIssue.executionRunId
+          : null;
         const updated = await tx
           .update(issues)
           .set({
@@ -8121,6 +8127,26 @@ export function recoveryService(
           .then((rows) => rows[0] ?? null);
 
         if (!updated) return null;
+
+        // BLO-21621: clearing a stale pre-claim lock is the only positive
+        // evidence that a queued row previously owned, and then lost, this
+        // issue lock. Persist that lineage in the same transaction as the
+        // release. The detached-run reconciler must never infer this state from
+        // old age plus NULL issue pointers because that is also the normal
+        // lazy-lock backlog shape.
+        if (detachedQueuedRunId) {
+          await tx
+            .insert(detachedQueuedRunRecoveries)
+            .values({
+              companyId: updated.companyId,
+              issueId: updated.id,
+              sourceRunId: detachedQueuedRunId,
+              status: "detached",
+              detachedAt: clearedAt,
+              updatedAt: clearedAt,
+            })
+            .onConflictDoNothing({ target: detachedQueuedRunRecoveries.sourceRunId });
+        }
 
         const skippedDeferredWakeIds: string[] = [];
 
