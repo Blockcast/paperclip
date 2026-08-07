@@ -13,6 +13,7 @@ import {
   issueComments,
   issueExecutionDecisions,
   issueRelations,
+  issueWorkProducts,
   issues,
 } from "@paperclipai/db";
 import {
@@ -43,6 +44,7 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
   });
 
   afterEach(async () => {
+    await db.delete(issueWorkProducts);
     await db.delete(issueComments);
     await db.delete(issueRelations);
     await db.delete(activityLog);
@@ -57,16 +59,78 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
     await tempDb?.cleanup();
   });
 
-  function createApp(actor: Express.Request["actor"]) {
+  function createApp(
+    actor: Express.Request["actor"],
+    opts: Parameters<typeof issueRoutes>[2] = {},
+  ) {
     const app = express();
     app.use(express.json());
     app.use((req, _res, next) => {
       req.actor = actor;
       next();
     });
-    app.use("/api", issueRoutes(db, {} as any));
+    app.use("/api", issueRoutes(db, {} as any, opts));
     app.use(errorHandler);
     return app;
+  }
+
+  function deferred() {
+    let resolve!: () => void;
+    const promise = new Promise<void>((resolvePromise) => {
+      resolve = resolvePromise;
+    });
+    return { promise, resolve };
+  }
+
+  async function seedUnlockedPendingReview() {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const competingRunId = randomUUID();
+    const issueId = randomUUID();
+    const stageId = randomUUID();
+    const participant = { type: "agent" as const, agentId, userId: null };
+    await db.insert(heartbeatRuns).values({
+      id: competingRunId,
+      companyId,
+      agentId,
+      status: "running",
+      invocationSource: "manual",
+      startedAt: new Date(),
+      createdAt: new Date("2026-01-01T00:02:00.000Z"),
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Unlocked pending review",
+      status: "in_review",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: null,
+      executionRunId: null,
+      executionState: {
+        status: "pending",
+        currentStageId: stageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: participant,
+        returnAssignee: participant,
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+        monitor: null,
+      },
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [{
+          id: stageId,
+          type: "review",
+          approvalsNeeded: 1,
+          participants: [{ id: randomUUID(), ...participant }],
+        }],
+      },
+    });
+    return { companyId, agentId, currentRunId, competingRunId, issueId };
   }
 
   async function seedCompanyAgentAndRuns(options: { staleRunStatus?: string } = {}) {
@@ -179,6 +243,124 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
 
     return { queuedWakeupId, scheduledWakeupId, queuedRunId, scheduledRunId, runningRunId };
   }
+
+  it("rejects an unlocked pending-review PATCH after another run checks out", async () => {
+    const seeded = await seedUnlockedPendingReview();
+    const authorized = deferred();
+    const continueWrite = deferred();
+    const stalePatch = request(createApp(
+      agentActor(seeded.companyId, seeded.agentId, seeded.currentRunId),
+      {
+        pendingInReviewMutationBeforeGuardHook: async () => {
+          authorized.resolve();
+          await continueWrite.promise;
+        },
+      },
+    ))
+      .patch(`/api/issues/${seeded.issueId}`)
+      .send({ title: "Stale run edit" })
+      .then((response) => response);
+
+    await authorized.promise;
+    const checkout = await request(createApp(
+      agentActor(seeded.companyId, seeded.agentId, seeded.competingRunId),
+    ))
+      .post(`/api/issues/${seeded.issueId}/checkout`)
+      .send({
+        agentId: seeded.agentId,
+        expectedStatuses: ["in_review"],
+      });
+    expect(checkout.status, JSON.stringify(checkout.body)).toBe(200);
+
+    continueWrite.resolve();
+    const patch = await stalePatch;
+    expect(patch.status, JSON.stringify(patch.body)).toBe(409);
+    expect(patch.body.error).toBe("Issue run ownership conflict");
+
+    const row = await db
+      .select({
+        title: issues.title,
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+      })
+      .from(issues)
+      .where(eq(issues.id, seeded.issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({
+      title: "Unlocked pending review",
+      checkoutRunId: seeded.competingRunId,
+      executionRunId: seeded.competingRunId,
+    });
+  });
+
+  it("rejects an unlocked pending-review comment after another run checks out", async () => {
+    const seeded = await seedUnlockedPendingReview();
+    const authorized = deferred();
+    const continueWrite = deferred();
+    const staleComment = request(createApp(
+      agentActor(seeded.companyId, seeded.agentId, seeded.currentRunId),
+      {
+        pendingInReviewMutationBeforeGuardHook: async () => {
+          authorized.resolve();
+          await continueWrite.promise;
+        },
+      },
+    ))
+      .post(`/api/issues/${seeded.issueId}/comments`)
+      .send({ body: "Plain evidence from the stale run" })
+      .then((response) => response);
+
+    await authorized.promise;
+    const checkout = await request(createApp(
+      agentActor(seeded.companyId, seeded.agentId, seeded.competingRunId),
+    ))
+      .post(`/api/issues/${seeded.issueId}/checkout`)
+      .send({ agentId: seeded.agentId, expectedStatuses: ["in_review"] });
+    expect(checkout.status, JSON.stringify(checkout.body)).toBe(200);
+
+    continueWrite.resolve();
+    const comment = await staleComment;
+    expect(comment.status, JSON.stringify(comment.body)).toBe(409);
+    expect(comment.body.error).toBe("Issue run ownership conflict");
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, seeded.issueId))).toEqual([]);
+  });
+
+  it("rejects a non-PATCH pending-review write after another run checks out", async () => {
+    const seeded = await seedUnlockedPendingReview();
+    const authorized = deferred();
+    const continueWrite = deferred();
+    const staleWorkProduct = request(createApp(
+      agentActor(seeded.companyId, seeded.agentId, seeded.currentRunId),
+      {
+        pendingInReviewMutationBeforeGuardHook: async () => {
+          authorized.resolve();
+          await continueWrite.promise;
+        },
+      },
+    ))
+      .post(`/api/issues/${seeded.issueId}/work-products`)
+      .send({
+        type: "artifact",
+        provider: "test",
+        title: "Stale artifact",
+        status: "active",
+      })
+      .then((response) => response);
+
+    await authorized.promise;
+    const checkout = await request(createApp(
+      agentActor(seeded.companyId, seeded.agentId, seeded.competingRunId),
+    ))
+      .post(`/api/issues/${seeded.issueId}/checkout`)
+      .send({ agentId: seeded.agentId, expectedStatuses: ["in_review"] });
+    expect(checkout.status, JSON.stringify(checkout.body)).toBe(200);
+
+    continueWrite.resolve();
+    const workProduct = await staleWorkProduct;
+    expect(workProduct.status, JSON.stringify(workProduct.body)).toBe(409);
+    expect(workProduct.body.error).toBe("Issue run ownership conflict");
+    expect(await db.select().from(issueWorkProducts).where(eq(issueWorkProducts.issueId, seeded.issueId))).toEqual([]);
+  });
 
   function agentActor(companyId: string, agentId: string, runId: string): Express.Request["actor"] {
     return {

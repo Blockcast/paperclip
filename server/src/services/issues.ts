@@ -851,6 +851,12 @@ type AcceptedPlanDecompositionInput = {
   actorAgentId?: string | null;
   actorUserId?: string | null;
   actorRunId?: string | null;
+  expectedSourceIssueRunOwnership?: {
+    status: string;
+    checkoutRunId: string | null;
+    executionRunId: string | null;
+    executionState: unknown;
+  } | null;
 };
 type AcceptedPlanDocumentInteraction = {
   id: string;
@@ -7705,12 +7711,42 @@ export function issueService(db: Db) {
         .then((rows) => rows[0] ?? null);
       if (!sourceIssue) throw notFound("Source issue not found");
 
+      const lockExpectedSourceIssueRunOwnership = async (tx: any) => {
+        const expected = data.expectedSourceIssueRunOwnership;
+        if (!expected) return;
+        const locked = await tx
+          .select({ id: issues.id })
+          .from(issues)
+          .where(and(
+            eq(issues.id, sourceIssue.id),
+            eq(issues.status, expected.status),
+            expected.checkoutRunId === null
+              ? isNull(issues.checkoutRunId)
+              : eq(issues.checkoutRunId, expected.checkoutRunId),
+            expected.executionRunId === null
+              ? isNull(issues.executionRunId)
+              : eq(issues.executionRunId, expected.executionRunId),
+            sql`${issues.executionState} = ${JSON.stringify(expected.executionState)}::jsonb`,
+          ))
+          .for("update")
+          .then((rows: Array<{ id: string }>) => rows[0] ?? null);
+        if (!locked) {
+          throw conflict("Issue run ownership conflict", {
+            issueId: sourceIssue.id,
+            expectedStatus: expected.status,
+            expectedCheckoutRunId: expected.checkoutRunId,
+            expectedExecutionRunId: expected.executionRunId,
+          });
+        }
+      };
+
       const requestFingerprint = createAcceptedPlanDecompositionRequestFingerprint({
         acceptedPlanRevisionId: data.acceptedPlanRevisionId,
         children: data.children,
       });
 
       const initialClaim = await db.transaction(async (tx) => {
+        await lockExpectedSourceIssueRunOwnership(tx);
         await tx.execute(sql`select ${issues.id} from ${issues} where ${issues.id} = ${sourceIssue.id} for update`);
 
         const belongsToPlanDocument = await tx
@@ -7783,6 +7819,7 @@ export function issueService(db: Db) {
 
       while (true) {
         const step = await db.transaction(async (tx) => {
+          await lockExpectedSourceIssueRunOwnership(tx);
           await tx.execute(
             sql`select ${issuePlanDecompositions.id}
                 from ${issuePlanDecompositions}
@@ -9114,6 +9151,32 @@ export function issueService(db: Db) {
 
       return cleared;
     },
+
+    lockPendingInReviewRunOwnership: async (
+      receipt: {
+        issueId: string;
+        status: string;
+        checkoutRunId: string | null;
+        executionRunId: string | null;
+        executionState: unknown;
+      },
+      dbOrTx: any = db,
+    ) => dbOrTx
+      .select({ id: issues.id })
+      .from(issues)
+      .where(and(
+        eq(issues.id, receipt.issueId),
+        eq(issues.status, receipt.status),
+        receipt.checkoutRunId === null
+          ? isNull(issues.checkoutRunId)
+          : eq(issues.checkoutRunId, receipt.checkoutRunId),
+        receipt.executionRunId === null
+          ? isNull(issues.executionRunId)
+          : eq(issues.executionRunId, receipt.executionRunId),
+        sql`${issues.executionState} = ${JSON.stringify(receipt.executionState)}::jsonb`,
+      ))
+      .for("update")
+      .then((rows: Array<{ id: string }>) => rows[0] ?? null),
 
     remove: (id: string) =>
       db.transaction(async (tx) => {
