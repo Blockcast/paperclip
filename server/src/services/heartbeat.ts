@@ -53,6 +53,7 @@ import {
   companySkills as companySkillsTable,
   companies,
   costEvents,
+  detachedQueuedRunRecoveries,
   documentAnnotationComments,
   documentAnnotationThreads,
   documentRevisions,
@@ -8769,6 +8770,22 @@ export interface HeartbeatServiceOptions {
       executionRunId: string | null;
       executionLockedAt: Date | null;
     },
+  ) => Promise<void> | void;
+  /**
+   * Test-only barrier after detached-run reconciliation has locked the issue
+   * and selected the still-detached queued rows, immediately before cancelling
+   * them and creating the durable recovery intent.
+   */
+  beforeDetachedQueuedRunCancellationForTest?: (
+    input: { issueId: string; runIds: string[] },
+  ) => Promise<void> | void;
+  /** Test-only failure injection after cancellation commits but before intent dispatch. */
+  beforeDetachedQueuedRunRecoveryEnqueueForTest?: (
+    input: { intentId: string; issueId: string; sourceRunId: string },
+  ) => Promise<void> | void;
+  /** Test-only signal immediately before an issue wake attempts to lock its issue row. */
+  beforeIssueWakeLockForTest?: (
+    input: { issueId: string; agentId: string },
   ) => Promise<void> | void;
   /**
    * Test-only concurrency hook: fired inside the capacity-defer transaction
@@ -17838,43 +17855,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return recovery.reconcileStrandedAssignedIssues({ issueCreatedAtGte: await getWorktreeExecutionCutoff() });
   }
 
-  // BLO-21621: a queued run can outlive the issue lock that named it. The
-  // lazy-locking model only stamps `issues.executionRunId` at CLAIM time
-  // (see claimQueuedRun's "Fix A" comment), so a still-`queued` run is
-  // normally unlocked — that alone is not a defect. The defect is a run that
-  // is *both* stale (queued well past any normal dispatch cadence) *and*
-  // detached (its own issue's checkout/execution lock no longer names it,
-  // whether because sweepStaleIssueLocks released a stale pre-claim lock or
-  // the pointer simply never got (re)stamped after the run's predecessor
-  // died). Once detached, nothing in the recovery apparatus ever looks at
-  // this specific row again: hasActiveExecutionPath and every sweep built on
-  // it treat *any* queued row referencing the issue as proof of life, with
-  // no staleness check, so the row is invisible to reconciliation while
-  // still occupying a live queue slot forever.
+  // BLO-21621: a queued run can outlive an issue lock that once named it. A
+  // NULL lock pointer is not evidence of that defect: normal lazy-lock queue
+  // rows leave executionRunId NULL until claim, and can legitimately wait for
+  // hours behind an agent's concurrency ceiling. sweepStaleIssueLocks writes a
+  // detachedQueuedRunRecoveries row in the same transaction that releases an
+  // expired pre-claim lock. That durable lineage is the positive evidence this
+  // sweep requires; age plus NULL pointers is never enough.
   //
-  // Deliberately keyed on detachment, not age alone (BLO-21621 CEO review):
-  // an agent legitimately saturated at its concurrency ceiling can hold
-  // real queued work for hours while cycling slots, and that run's lock
-  // still names it the whole time — untouched here. Only a row whose lock
-  // pointer has moved on or gone empty is a candidate, so real backlog is
-  // never discarded for being merely old.
-  //
-  // BLO-21621 Ally review (gstack/review): detachment is a JOIN condition,
-  // evaluated in SQL against `issues`, not an application-side skip after an
-  // age-only scan. The prior version selected the oldest `limit` stale
-  // queued rows unconditionally and skipped the ones that turned out
-  // attached/terminal/malformed *after* fetching them — so once `limit`
-  // such permanently-skipped rows existed, every pass re-scanned the same
-  // prefix and a genuinely repairable row behind them was never reached.
-  // Filtering detachment in SQL means only actually-repairable rows ever
-  // occupy the bounded result set.
+  // Keep both the lineage and current-detachment predicates in SQL before the
+  // age ordering and LIMIT. Otherwise permanently attached rows can occupy the
+  // bounded prefix and starve a genuinely repairable row behind them.
   function detachedQueuedRunConditions(staleCutoff: Date, extra?: SQL | undefined) {
     return and(
+      eq(detachedQueuedRunRecoveries.status, "detached"),
       eq(heartbeatRuns.status, "queued"),
       lte(heartbeatRuns.createdAt, staleCutoff),
       notInArray(issues.status, [...TERMINAL_ISSUE_STATUSES]),
-      // NULL-safe: a never-locked issue (both pointers NULL) is just as
-      // detached from `run.id` as one locked to a different run.
       sql`${issues.executionRunId} IS DISTINCT FROM ${heartbeatRuns.id}`,
       sql`${issues.checkoutRunId} IS DISTINCT FROM ${heartbeatRuns.id}`,
       extra,
@@ -17898,26 +17895,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const result = { scanned: 0, terminalized: 0, recovered: 0, skipped: 0, failed: 0 };
 
-    // `issues.id::text = heartbeatRuns.contextIssueId` (rather than casting
-    // the free-text column to uuid) so a malformed/missing issueId simply
-    // fails to join instead of throwing an invalid-uuid-syntax error for the
-    // whole query.
     const candidates = await db
       .select({
         id: heartbeatRuns.id,
         companyId: heartbeatRuns.companyId,
-        agentId: heartbeatRuns.agentId,
         createdAt: heartbeatRuns.createdAt,
-        wakeupRequestId: heartbeatRuns.wakeupRequestId,
         issueId: issues.id,
-        issueAssigneeAgentId: issues.assigneeAgentId,
       })
-      .from(heartbeatRuns)
+      .from(detachedQueuedRunRecoveries)
+      .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, detachedQueuedRunRecoveries.sourceRunId))
       .innerJoin(
         issues,
         and(
-          eq(issues.companyId, heartbeatRuns.companyId),
-          sql`${issues.id}::text = ${heartbeatRuns.contextIssueId}`,
+          eq(issues.id, detachedQueuedRunRecoveries.issueId),
+          eq(issues.companyId, detachedQueuedRunRecoveries.companyId),
         ),
       )
       .where(detachedQueuedRunConditions(
@@ -17928,15 +17919,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .limit(limit);
     result.scanned = candidates.length;
 
-    // BLO-21621 Ally review (native-codex): reconcile every stale detached
-    // row for an issue before enqueueing a recovery wake for it, not just
-    // the one row this bounded scan happened to select first. Otherwise,
-    // cancelling one orphan and then calling enqueueWakeup lets its
-    // legacy-run lookup immediately adopt a *sibling* orphan for the same
-    // issue (stamping `executionRunId` onto it) — which then reads as
-    // "attached" and is left queued-but-dead forever, indistinguishable
-    // from the very leak this sweep exists to repair.
     const processedIssueIds = new Set<string>();
+    const cancelReason =
+      "Cancelled because this queued run detached from its source issue's execution lock and was never claimed";
 
     for (const candidate of candidates) {
       const issueId = candidate.issueId;
@@ -17944,106 +17929,289 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       processedIssueIds.add(issueId);
 
       try {
-        const siblings = await db
-          .select({
-            id: heartbeatRuns.id,
-            createdAt: heartbeatRuns.createdAt,
-            wakeupRequestId: heartbeatRuns.wakeupRequestId,
-            resultJson: heartbeatRuns.resultJson,
-          })
-          .from(heartbeatRuns)
-          .innerJoin(
-            issues,
-            and(
-              eq(issues.companyId, heartbeatRuns.companyId),
-              sql`${issues.id}::text = ${heartbeatRuns.contextIssueId}`,
-            ),
-          )
-          .where(detachedQueuedRunConditions(staleCutoff, eq(issues.id, issueId)));
+        // Lock ordering matches enqueueWakeup and sweepStaleIssueLocks: issue
+        // first, then heartbeat/outbox rows. Legacy adoption therefore cannot
+        // attach a selected sibling between our detachment check and cancel.
+        const outcome = await db.transaction(async (tx) => {
+          const currentIssue = await tx
+            .select({
+              id: issues.id,
+              companyId: issues.companyId,
+              status: issues.status,
+              checkoutRunId: issues.checkoutRunId,
+              executionRunId: issues.executionRunId,
+            })
+            .from(issues)
+            .where(eq(issues.id, issueId))
+            .for("update")
+            .then((rows) => rows[0] ?? null);
+          if (!currentIssue || TERMINAL_ISSUE_STATUSES.has(currentIssue.status)) return null;
 
-        const cancelReason =
-          "Cancelled because this queued run detached from its source issue's execution lock and was never claimed";
-        let anyTerminalized = false;
+          const siblings = await tx
+            .select({
+              recoveryId: detachedQueuedRunRecoveries.id,
+              run: heartbeatRuns,
+            })
+            .from(detachedQueuedRunRecoveries)
+            .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, detachedQueuedRunRecoveries.sourceRunId))
+            .where(and(
+              eq(detachedQueuedRunRecoveries.companyId, currentIssue.companyId),
+              eq(detachedQueuedRunRecoveries.issueId, currentIssue.id),
+              eq(detachedQueuedRunRecoveries.status, "detached"),
+              eq(heartbeatRuns.status, "queued"),
+            ))
+            .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
+            .for("update");
 
-        for (const sibling of siblings) {
-          const staleForMs = now.getTime() - sibling.createdAt.getTime();
-          const outcome = await setRunStatusIfQueued(sibling.id, "cancelled", {
-            finishedAt: now,
-            error: cancelReason,
-            errorCode: "queued_run_detached_from_issue",
-            resultJson: {
-              ...parseObject(sibling.resultJson),
-              stopReason: "queued_run_detached_from_issue",
-            },
+          const detachedSiblings = siblings.filter(
+            ({ run }) => run.id !== currentIssue.executionRunId && run.id !== currentIssue.checkoutRunId,
+          );
+          if (detachedSiblings.length === 0) return null;
+
+          await options.beforeDetachedQueuedRunCancellationForTest?.({
+            issueId,
+            runIds: detachedSiblings.map(({ run }) => run.id),
           });
-          if (!outcome.updated) {
-            // Lost the race (claimed, or reconciled by a concurrent pass) —
-            // the row is no longer detached-and-queued either way.
-            result.skipped += 1;
-            continue;
+
+          const cancelled: Array<{ recoveryId: string; run: typeof heartbeatRuns.$inferSelect; staleForMs: number }> = [];
+          for (const sibling of detachedSiblings) {
+            const cancelledRun = await tx
+              .update(heartbeatRuns)
+              .set({
+                status: "cancelled",
+                finishedAt: now,
+                error: cancelReason,
+                errorCode: "queued_run_detached_from_issue",
+                resultJson: {
+                  ...parseObject(sibling.run.resultJson),
+                  stopReason: "queued_run_detached_from_issue",
+                },
+                updatedAt: now,
+              })
+              .where(and(eq(heartbeatRuns.id, sibling.run.id), eq(heartbeatRuns.status, "queued")))
+              .returning()
+              .then((rows) => rows[0] ?? null);
+            if (!cancelledRun) continue;
+
+            if (cancelledRun.wakeupRequestId) {
+              await tx
+                .update(agentWakeupRequests)
+                .set({ status: "skipped", finishedAt: now, error: cancelReason, updatedAt: now })
+                .where(eq(agentWakeupRequests.id, cancelledRun.wakeupRequestId));
+            }
+            cancelled.push({
+              recoveryId: sibling.recoveryId,
+              run: cancelledRun,
+              staleForMs: now.getTime() - sibling.run.createdAt.getTime(),
+            });
           }
-          anyTerminalized = true;
-          result.terminalized += 1;
+          if (cancelled.length === 0) return null;
 
-          await setWakeupStatus(sibling.wakeupRequestId, "skipped", {
-            finishedAt: now,
-            error: cancelReason,
-          });
+          const existingPending = await tx
+            .select({ id: detachedQueuedRunRecoveries.id })
+            .from(detachedQueuedRunRecoveries)
+            .where(and(
+              eq(detachedQueuedRunRecoveries.companyId, currentIssue.companyId),
+              eq(detachedQueuedRunRecoveries.issueId, currentIssue.id),
+              eq(detachedQueuedRunRecoveries.status, "pending"),
+            ))
+            .limit(1)
+            .for("update")
+            .then((rows) => rows[0] ?? null);
 
-          await appendRunEvent(outcome.run, await nextRunEventSeq(outcome.run.id), {
-            eventType: "lifecycle",
-            stream: "system",
-            level: "warn",
-            message: "Cancelled a detached queued run found by the BLO-21621 reconciliation sweep",
-            payload: { issueId, staleForMs },
-          });
+          const issueAlreadyOwned = Boolean(currentIssue.executionRunId || currentIssue.checkoutRunId);
+          const anchor = !issueAlreadyOwned && !existingPending ? cancelled[0] : null;
+          if (anchor) {
+            await tx
+              .update(detachedQueuedRunRecoveries)
+              .set({ status: "pending", pendingAt: now, lastError: null, updatedAt: now })
+              .where(and(
+                eq(detachedQueuedRunRecoveries.id, anchor.recoveryId),
+                eq(detachedQueuedRunRecoveries.status, "detached"),
+              ));
+          }
 
+          const coveredRecoveryIds = cancelled
+            .filter(({ recoveryId }) => recoveryId !== anchor?.recoveryId)
+            .map(({ recoveryId }) => recoveryId);
+          if (coveredRecoveryIds.length > 0) {
+            await tx
+              .update(detachedQueuedRunRecoveries)
+              .set({ status: "superseded", completedAt: now, updatedAt: now })
+              .where(inArray(detachedQueuedRunRecoveries.id, coveredRecoveryIds));
+          }
+
+          return { cancelled };
+        });
+
+        if (!outcome) {
+          result.skipped += 1;
+          continue;
+        }
+        result.terminalized += outcome.cancelled.length;
+
+        // Lifecycle events are intentionally outside the cancellation/outbox
+        // transaction. Losing optional observability must never roll back or
+        // strand the durable recovery intent.
+        for (const cancelled of outcome.cancelled) {
+          try {
+            await appendRunEvent(cancelled.run, await nextRunEventSeq(cancelled.run.id), {
+              eventType: "lifecycle",
+              stream: "system",
+              level: "warn",
+              message: "Cancelled a detached queued run found by the BLO-21621 reconciliation sweep",
+              payload: { issueId, staleForMs: cancelled.staleForMs },
+            });
+          } catch (err) {
+            logger.warn(
+              { err, runId: cancelled.run.id, issueId },
+              "reconcileDetachedQueuedRuns: failed to append cancellation event",
+            );
+          }
           logger.warn(
-            { runId: sibling.id, issueId, staleForMs },
+            { runId: cancelled.run.id, issueId, staleForMs: cancelled.staleForMs },
             "reconcileDetachedQueuedRuns: cancelled a detached queued run",
           );
-        }
-
-        if (!anyTerminalized) continue;
-
-        // Every stale detached row for this issue is now cancelled, so
-        // enqueueWakeup's legacy-run lookup has nothing left to wrongly
-        // adopt. Re-read the lock pointers fresh — cancellation above never
-        // touches `issues`, but a live run may have claimed the issue
-        // between our candidate scan and now — and only re-wake when
-        // nothing else currently owns it.
-        const freshIssue = await db
-          .select({
-            executionRunId: issues.executionRunId,
-            checkoutRunId: issues.checkoutRunId,
-            assigneeAgentId: issues.assigneeAgentId,
-          })
-          .from(issues)
-          .where(eq(issues.id, issueId))
-          .then((rows) => rows[0] ?? null);
-
-        const agentId = freshIssue?.assigneeAgentId ?? candidate.issueAssigneeAgentId ?? candidate.agentId;
-        if (freshIssue && !freshIssue.executionRunId && !freshIssue.checkoutRunId && agentId) {
-          const recoveryRun = await enqueueWakeup(agentId, {
-            source: "automation",
-            triggerDetail: "system",
-            reason: "queued_run_detachment_recovery",
-            payload: { issueId, retryOfRunId: candidate.id },
-            contextSnapshot: {
-              issueId,
-              taskId: issueId,
-              wakeReason: "queued_run_detachment_recovery",
-              retryReason: "queued_run_detachment_recovery",
-              retryOfRunId: candidate.id,
-              source: "heartbeat.reconcile_detached_queued_runs",
-            },
-            idempotencyKey: `detached_queued_run_recovery:${issueId}`,
-          });
-          if (recoveryRun) result.recovered += 1;
         }
       } catch (err) {
         result.failed += 1;
         logger.warn({ err, issueId }, "reconcileDetachedQueuedRuns: failed to reconcile candidate");
+      }
+    }
+
+    // Dispatch both intents created above and intents left pending by an older
+    // pass that crashed or failed after cancellation. enqueueWakeup serializes
+    // on the same issue row and coalesces an already-created execution path, so
+    // repeating an attempt with this stable intent key is idempotent.
+    const pendingIntents = await db
+      .select()
+      .from(detachedQueuedRunRecoveries)
+      .where(and(
+        eq(detachedQueuedRunRecoveries.status, "pending"),
+        opts?.companyId ? eq(detachedQueuedRunRecoveries.companyId, opts.companyId) : undefined,
+      ))
+      // Failed attempts move behind never-attempted/older work so a persistent
+      // bad intent cannot monopolize the bounded batch forever.
+      .orderBy(
+        asc(detachedQueuedRunRecoveries.lastAttemptAt),
+        asc(detachedQueuedRunRecoveries.pendingAt),
+        asc(detachedQueuedRunRecoveries.id),
+      )
+      .limit(limit);
+
+    for (const intent of pendingIntents) {
+      try {
+        const attemptAt = new Date();
+        const claimedIntent = await db
+          .update(detachedQueuedRunRecoveries)
+          .set({
+            attemptCount: sql`${detachedQueuedRunRecoveries.attemptCount} + 1`,
+            lastAttemptAt: attemptAt,
+            updatedAt: attemptAt,
+          })
+          .where(and(
+            eq(detachedQueuedRunRecoveries.id, intent.id),
+            eq(detachedQueuedRunRecoveries.status, "pending"),
+          ))
+          .returning()
+          .then((rows) => rows[0] ?? null);
+        if (!claimedIntent) continue;
+
+        const currentIssue = await db
+          .select({
+            companyId: issues.companyId,
+            status: issues.status,
+            assigneeAgentId: issues.assigneeAgentId,
+          })
+          .from(issues)
+          .where(eq(issues.id, claimedIntent.issueId))
+          .then((rows) => rows[0] ?? null);
+        if (!currentIssue || TERMINAL_ISSUE_STATUSES.has(currentIssue.status)) {
+          await db
+            .update(detachedQueuedRunRecoveries)
+            .set({ status: "cancelled", completedAt: attemptAt, lastError: null, updatedAt: attemptAt })
+            .where(and(
+              eq(detachedQueuedRunRecoveries.id, claimedIntent.id),
+              eq(detachedQueuedRunRecoveries.status, "pending"),
+            ));
+          continue;
+        }
+
+        const findActiveRun = () => db
+          .select({ id: heartbeatRuns.id })
+          .from(heartbeatRuns)
+          .where(and(
+            eq(heartbeatRuns.companyId, currentIssue.companyId),
+            eq(heartbeatRuns.contextIssueId, claimedIntent.issueId),
+            inArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES]),
+          ))
+          .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        let activeRun: { id: string } | null = await findActiveRun();
+        let recoveryRun: { id: string } | null = null;
+
+        if (!activeRun) {
+          if (!currentIssue.assigneeAgentId) {
+            throw new Error("Detached queued-run recovery issue has no assignee agent");
+          }
+          await options.beforeDetachedQueuedRunRecoveryEnqueueForTest?.({
+            intentId: claimedIntent.id,
+            issueId: claimedIntent.issueId,
+            sourceRunId: claimedIntent.sourceRunId,
+          });
+          const enqueuedRecoveryRun = await enqueueWakeup(currentIssue.assigneeAgentId, {
+            source: "automation",
+            triggerDetail: "system",
+            reason: "queued_run_detachment_recovery",
+            payload: { issueId: claimedIntent.issueId, retryOfRunId: claimedIntent.sourceRunId },
+            contextSnapshot: {
+              issueId: claimedIntent.issueId,
+              taskId: claimedIntent.issueId,
+              wakeReason: "queued_run_detachment_recovery",
+              retryReason: "queued_run_detachment_recovery",
+              retryOfRunId: claimedIntent.sourceRunId,
+              source: "heartbeat.reconcile_detached_queued_runs",
+            },
+            idempotencyKey: `detached_queued_run_recovery:${claimedIntent.id}`,
+          });
+          recoveryRun = enqueuedRecoveryRun ? { id: enqueuedRecoveryRun.id } : null;
+          activeRun = recoveryRun ?? await findActiveRun();
+        }
+
+        if (!activeRun) {
+          throw new Error("Detached queued-run recovery enqueue produced no durable execution path");
+        }
+
+        const completed = await db
+          .update(detachedQueuedRunRecoveries)
+          .set({
+            status: "completed",
+            recoveryRunId: activeRun.id,
+            completedAt: new Date(),
+            lastError: null,
+            updatedAt: new Date(),
+          })
+          .where(and(
+            eq(detachedQueuedRunRecoveries.id, claimedIntent.id),
+            eq(detachedQueuedRunRecoveries.status, "pending"),
+          ))
+          .returning({ id: detachedQueuedRunRecoveries.id })
+          .then((rows) => rows[0] ?? null);
+        if (completed && recoveryRun) result.recovered += 1;
+      } catch (err) {
+        result.failed += 1;
+        await db
+          .update(detachedQueuedRunRecoveries)
+          .set({ lastError: err instanceof Error ? err.message : String(err), updatedAt: new Date() })
+          .where(and(
+            eq(detachedQueuedRunRecoveries.id, intent.id),
+            eq(detachedQueuedRunRecoveries.status, "pending"),
+          ));
+        logger.warn(
+          { err, intentId: intent.id, issueId: intent.issueId },
+          "reconcileDetachedQueuedRuns: failed to dispatch durable recovery intent",
+        );
       }
     }
 
@@ -24539,6 +24707,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // same issue workspace while the assignee already has a live run.
       const agentNameKey = normalizeAgentNameKey(agent.name);
 
+      await options.beforeIssueWakeLockForTest?.({ issueId, agentId });
       const outcome = await db.transaction(async (tx) => {
         await tx.execute(
           sql`select id from issues where id = ${issueId} and company_id = ${agent.companyId} for update`,

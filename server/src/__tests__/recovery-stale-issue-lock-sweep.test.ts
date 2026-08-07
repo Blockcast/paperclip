@@ -7,6 +7,7 @@ import {
   agents,
   companies,
   createDb,
+  detachedQueuedRunRecoveries,
   heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
@@ -291,6 +292,13 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       .where(eq(heartbeatRuns.id, queuedRunId))
       .then((rows) => rows[0]);
     expect(run?.status).toBe("queued");
+
+    const detachment = await db
+      .select({ issueId: detachedQueuedRunRecoveries.issueId, status: detachedQueuedRunRecoveries.status })
+      .from(detachedQueuedRunRecoveries)
+      .where(eq(detachedQueuedRunRecoveries.sourceRunId, queuedRunId))
+      .then((rows) => rows[0]);
+    expect(detachment).toEqual({ issueId, status: "detached" });
 
     const audit = await db
       .select({ details: activityLog.details })

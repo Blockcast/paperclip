@@ -20,11 +20,12 @@
  */
 import { randomUUID } from "node:crypto";
 import { eq, and } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
   companies,
   createDb,
+  detachedQueuedRunRecoveries,
   heartbeatRuns,
   issues,
 } from "@paperclipai/db";
@@ -56,7 +57,7 @@ describeEmbeddedPostgres("heartbeat reconcileDetachedQueuedRuns", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-detached-queued-run-");
     db = createDb(tempDb.connectionString);
-    heartbeat = heartbeatService(db);
+    heartbeat = heartbeatService(db, { skipQueuedRunDispatch: true });
   }, 120_000);
 
   afterEach(async () => {
@@ -97,7 +98,13 @@ describeEmbeddedPostgres("heartbeat reconcileDetachedQueuedRuns", () => {
     return { companyId, agentId };
   }
 
-  it("terminalizes a stale queued run whose issue lock is empty, and fires exactly one recovery wake (BLO-21621)", async () => {
+  async function markRunsDetached(companyId: string, issueId: string, runIds: string[]) {
+    await db.insert(detachedQueuedRunRecoveries).values(
+      runIds.map((sourceRunId) => ({ companyId, issueId, sourceRunId, status: "detached" })),
+    );
+  }
+
+  it("terminalizes a stale queued run with durable released-lock lineage, and fires exactly one recovery wake (BLO-21621)", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const issueId = randomUUID();
     const staleRunId = randomUUID();
@@ -121,6 +128,7 @@ describeEmbeddedPostgres("heartbeat reconcileDetachedQueuedRuns", () => {
       contextSnapshot: { issueId, wakeReason: "issue_continuation_needed" },
       createdAt: new Date(Date.now() - SEVEN_HOURS_MS),
     });
+    await markRunsDetached(companyId, issueId, [staleRunId]);
 
     const result = await heartbeat.reconcileDetachedQueuedRuns();
 
@@ -145,6 +153,42 @@ describeEmbeddedPostgres("heartbeat reconcileDetachedQueuedRuns", () => {
     expect(runsForIssue).toHaveLength(2);
     const freshRun = runsForIssue.find((row) => row.id !== staleRunId);
     expect(freshRun?.status).not.toBe("cancelled");
+  });
+
+  it("preserves an old normal lazy-lock backlog row when both issue pointers are null (BLO-21621 review)", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = randomUUID();
+    const queuedRunId = randomUUID();
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Legitimate lazy-lock backlog",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: null,
+      executionRunId: null,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: queuedRunId,
+      companyId,
+      agentId,
+      status: "queued",
+      invocationSource: "on_demand",
+      contextSnapshot: { issueId, wakeReason: "issue_continuation_needed" },
+      createdAt: new Date(Date.now() - SEVEN_HOURS_MS),
+    });
+
+    const result = await heartbeat.reconcileDetachedQueuedRuns();
+
+    expect(result).toMatchObject({ scanned: 0, terminalized: 0, recovered: 0, skipped: 0, failed: 0 });
+    const run = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, queuedRunId))
+      .then((rows) => rows[0]);
+    expect(run?.status).toBe("queued");
   });
 
   it("leaves a queued run alone when it is still the issue's recognized lock holder, no matter how old (BLO-21621)", async () => {
@@ -172,6 +216,7 @@ describeEmbeddedPostgres("heartbeat reconcileDetachedQueuedRuns", () => {
       executionRunId: attachedRunId,
       executionLockedAt: new Date(Date.now() - SEVEN_HOURS_MS),
     });
+    await markRunsDetached(companyId, issueId, [attachedRunId]);
 
     const result = await heartbeat.reconcileDetachedQueuedRuns();
 
@@ -232,6 +277,7 @@ describeEmbeddedPostgres("heartbeat reconcileDetachedQueuedRuns", () => {
       executionRunId: liveOwnerRunId,
       executionLockedAt: new Date(),
     });
+    await markRunsDetached(companyId, issueId, [staleOrphanRunId]);
 
     const result = await heartbeat.reconcileDetachedQueuedRuns();
 
@@ -286,6 +332,7 @@ describeEmbeddedPostgres("heartbeat reconcileDetachedQueuedRuns", () => {
         executionRunId: attachedRunId,
         executionLockedAt: new Date(Date.now() - SEVEN_HOURS_MS),
       });
+      await markRunsDetached(companyId, attachedIssueId, [attachedRunId]);
     }
 
     // One repairable detached row, created *after* all five attached rows
@@ -311,6 +358,7 @@ describeEmbeddedPostgres("heartbeat reconcileDetachedQueuedRuns", () => {
       contextSnapshot: { issueId: repairableIssueId, wakeReason: "issue_continuation_needed" },
       createdAt: new Date(Date.now() - SEVEN_HOURS_MS),
     });
+    await markRunsDetached(companyId, repairableIssueId, [repairableRunId]);
 
     // `limit: 3` is smaller than the five permanently-attached rows seeded
     // above -- an age-only scan bounded to 3 would never see past them.
@@ -333,6 +381,147 @@ describeEmbeddedPostgres("heartbeat reconcileDetachedQueuedRuns", () => {
       .from(heartbeatRuns)
       .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.status, "cancelled")));
     expect(cancelledCount).toHaveLength(1);
+  });
+
+  it("serializes cancellation against a concurrent legacy adoption on the same issue (BLO-21621 review)", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = randomUUID();
+    const orphanRunId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Legacy adoption races detached cancellation",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: null,
+      executionRunId: null,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: orphanRunId,
+      companyId,
+      agentId,
+      status: "queued",
+      invocationSource: "on_demand",
+      contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_continuation_needed" },
+      createdAt: new Date(Date.now() - SEVEN_HOURS_MS),
+    });
+    await markRunsDetached(companyId, issueId, [orphanRunId]);
+
+    let signalAdoptionReachedIssueLock!: () => void;
+    const adoptionReachedIssueLock = new Promise<void>((resolve) => {
+      signalAdoptionReachedIssueLock = resolve;
+    });
+    const adoptingHeartbeat = heartbeatService(db, {
+      skipQueuedRunDispatch: true,
+      beforeIssueWakeLockForTest: ({ issueId: lockingIssueId }) => {
+        if (lockingIssueId === issueId) signalAdoptionReachedIssueLock();
+      },
+    });
+    let adoptionPromise: ReturnType<typeof adoptingHeartbeat.wakeup> | null = null;
+    const reconcilingHeartbeat = heartbeatService(db, {
+      skipQueuedRunDispatch: true,
+      beforeDetachedQueuedRunCancellationForTest: async ({ issueId: lockedIssueId }) => {
+        expect(lockedIssueId).toBe(issueId);
+        adoptionPromise = adoptingHeartbeat.wakeup(agentId, {
+          source: "manual",
+          triggerDetail: "user",
+          reason: "concurrent_followup",
+          contextSnapshot: { issueId, taskId: issueId, wakeReason: "concurrent_followup" },
+        });
+        await adoptionReachedIssueLock;
+      },
+    });
+
+    const result = await reconcilingHeartbeat.reconcileDetachedQueuedRuns();
+    await adoptionPromise;
+
+    expect(result.terminalized).toBe(1);
+    const orphan = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, orphanRunId))
+      .then((rows) => rows[0]);
+    expect(orphan?.status).toBe("cancelled");
+
+    const activeRuns = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.companyId, companyId),
+        eq(heartbeatRuns.contextIssueId, issueId),
+        eq(heartbeatRuns.status, "queued"),
+      ));
+    expect(activeRuns).toHaveLength(1);
+    expect(activeRuns[0]?.id).not.toBe(orphanRunId);
+
+    const issue = await db
+      .select({ executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(issue?.executionRunId).not.toBe(orphanRunId);
+    if (issue?.executionRunId) expect(issue.executionRunId).toBe(activeRuns[0]?.id);
+  });
+
+  it("retries a durable recovery intent after failure between cancellation and enqueue (BLO-21621 review)", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = randomUUID();
+    const orphanRunId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Recovery enqueue fails after cancellation",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: null,
+      executionRunId: null,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: orphanRunId,
+      companyId,
+      agentId,
+      status: "queued",
+      invocationSource: "on_demand",
+      contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_continuation_needed" },
+      createdAt: new Date(Date.now() - SEVEN_HOURS_MS),
+    });
+    await markRunsDetached(companyId, issueId, [orphanRunId]);
+
+    const failBeforeEnqueue = vi.fn(async () => {
+      throw new Error("injected post-cancellation enqueue failure");
+    });
+    const failingHeartbeat = heartbeatService(db, {
+      skipQueuedRunDispatch: true,
+      beforeDetachedQueuedRunRecoveryEnqueueForTest: failBeforeEnqueue,
+    });
+    const first = await failingHeartbeat.reconcileDetachedQueuedRuns();
+
+    expect(first).toMatchObject({ scanned: 1, terminalized: 1, recovered: 0, failed: 1 });
+    expect(failBeforeEnqueue).toHaveBeenCalledTimes(1);
+    const pending = await db
+      .select({ id: detachedQueuedRunRecoveries.id, status: detachedQueuedRunRecoveries.status })
+      .from(detachedQueuedRunRecoveries)
+      .where(eq(detachedQueuedRunRecoveries.sourceRunId, orphanRunId))
+      .then((rows) => rows[0]);
+    expect(pending?.status).toBe("pending");
+
+    const retryingHeartbeat = heartbeatService(db, { skipQueuedRunDispatch: true });
+    const second = await retryingHeartbeat.reconcileDetachedQueuedRuns();
+    expect(second).toMatchObject({ scanned: 0, terminalized: 0, recovered: 1, failed: 0 });
+
+    const completed = await db
+      .select({
+        status: detachedQueuedRunRecoveries.status,
+        recoveryRunId: detachedQueuedRunRecoveries.recoveryRunId,
+        attemptCount: detachedQueuedRunRecoveries.attemptCount,
+      })
+      .from(detachedQueuedRunRecoveries)
+      .where(eq(detachedQueuedRunRecoveries.id, pending!.id))
+      .then((rows) => rows[0]);
+    expect(completed).toMatchObject({ status: "completed", attemptCount: 2 });
+    expect(completed?.recoveryRunId).toBeTruthy();
   });
 
   it("terminalizes both rows of a two-orphan issue and creates exactly one fresh replacement, without re-adopting a sibling orphan (BLO-21621 native-codex review)", async () => {
@@ -371,6 +560,7 @@ describeEmbeddedPostgres("heartbeat reconcileDetachedQueuedRuns", () => {
         createdAt: new Date(Date.now() - SEVEN_HOURS_MS - 1000),
       },
     ]);
+    await markRunsDetached(companyId, issueId, [orphanOneId, orphanTwoId]);
 
     const result = await heartbeat.reconcileDetachedQueuedRuns();
 
@@ -395,7 +585,7 @@ describeEmbeddedPostgres("heartbeat reconcileDetachedQueuedRuns", () => {
       .from(issues)
       .where(eq(issues.id, issueId))
       .then((rows2) => rows2[0]);
-    expect(issue?.executionRunId).toBe(freshRun?.id);
+    expect(issue?.executionRunId === null || issue?.executionRunId === freshRun?.id).toBe(true);
     expect(issue?.checkoutRunId).toBeNull();
   });
 });
