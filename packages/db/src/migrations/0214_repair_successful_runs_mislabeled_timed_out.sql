@@ -10,12 +10,12 @@ SET
 	"status" = 'succeeded',
 	"error" = NULL,
 	"error_code" = NULL,
-	"result_error" = NULL,
-	"result_message" = NULL,
 	"liveness_state" = NULL,
 	"liveness_reason" = NULL,
 	"result_json" = (
 		COALESCE("result_json", '{}'::jsonb)
+		- 'error'
+		- 'message'
 		- 'stopReason'
 		- 'timeoutFired'
 		- 'timeoutSource'
