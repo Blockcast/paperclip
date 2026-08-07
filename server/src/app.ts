@@ -513,6 +513,7 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
     db,
     jobStore,
     workerManager,
+    listConfigCompanyIds: (pluginId) => pluginRegistry.listConfigCompanyIds(pluginId),
   });
   const toolDispatcher = createPluginToolDispatcher({
     workerManager,

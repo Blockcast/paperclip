@@ -62,6 +62,13 @@ export interface CreateJobRunInput {
   pluginId: string;
   /** What triggered this run. */
   trigger: PluginJobRunTrigger;
+  /**
+   * Company this run is scoped to. The scheduler dispatches a job once per
+   * company configured for the plugin (BLO-20957), so this is set per
+   * dispatch; `null`/omitted for instance-level jobs (zero configured
+   * companies).
+   */
+  companyId?: string | null;
 }
 
 /**
@@ -354,6 +361,7 @@ export function pluginJobStore(db: Db) {
         .values({
           jobId: input.jobId,
           pluginId: input.pluginId,
+          companyId: input.companyId ?? null,
           trigger: input.trigger,
           status: "queued",
         })
@@ -455,6 +463,61 @@ export function pluginJobStore(db: Db) {
         .where(and(...conditions))
         .orderBy(desc(pluginJobRuns.createdAt))
         .limit(limit);
+    },
+
+    /**
+     * Active jobs whose most recent `minConsecutiveFailures` runs are *all*
+     * `failed` — a sustained failure streak, not a single blip.
+     *
+     * Used to surface a scheduled job that keeps failing (e.g. a
+     * company-scope denial the scheduler cannot resolve — BLO-20957 AC #3)
+     * as an alertable health signal instead of only an ERROR log line. Loops
+     * per active job rather than a single windowed query: `plugin_jobs` rows
+     * are few (one per manifest-declared job per installed plugin), and this
+     * is a low-frequency polling path (`/plugins/alerts/plugin-health`), not
+     * a hot one.
+     *
+     * @param minConsecutiveFailures - Minimum streak length to report (e.g. 3)
+     */
+    async listJobsWithFailureStreak(
+      minConsecutiveFailures: number,
+    ): Promise<
+      Array<{
+        job: typeof pluginJobs.$inferSelect;
+        consecutiveFailures: number;
+        lastError: string | null;
+      }>
+    > {
+      const activeJobs = await db
+        .select()
+        .from(pluginJobs)
+        .where(eq(pluginJobs.status, "active"));
+
+      const streaks: Array<{
+        job: typeof pluginJobs.$inferSelect;
+        consecutiveFailures: number;
+        lastError: string | null;
+      }> = [];
+
+      for (const job of activeJobs) {
+        const recentRuns = await db
+          .select()
+          .from(pluginJobRuns)
+          .where(eq(pluginJobRuns.jobId, job.id))
+          .orderBy(desc(pluginJobRuns.createdAt))
+          .limit(minConsecutiveFailures);
+
+        if (recentRuns.length < minConsecutiveFailures) continue;
+        if (!recentRuns.every((run) => run.status === "failed")) continue;
+
+        streaks.push({
+          job,
+          consecutiveFailures: recentRuns.length,
+          lastError: recentRuns[0]?.error ?? null,
+        });
+      }
+
+      return streaks;
     },
   };
 }

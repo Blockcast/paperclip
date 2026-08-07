@@ -1459,4 +1459,50 @@ describe.sequential("GET /api/plugins/alerts/plugin-health", () => {
     expect(res.status).toBe(403);
     expect(mockRegistry.listByStatus).not.toHaveBeenCalled();
   });
+
+  it("BLO-20957: surfaces a scheduled job with a sustained failure streak, even when the plugin worker itself is healthy", async () => {
+    mockRegistry.listByStatus.mockResolvedValue([]);
+    mockRegistry.getById.mockResolvedValue({
+      id: pluginId,
+      pluginKey: "paperclip-plugin-alertmanager",
+    });
+    const jobStore = {
+      listJobsWithFailureStreak: vi.fn().mockResolvedValue([
+        {
+          job: { id: "job-1", pluginId, jobKey: "check-alert-escalations" },
+          consecutiveFailures: 3,
+          lastError: 'Plugin is not allowed to perform "issues.list": company context is required',
+        },
+      ]),
+    };
+    const { app } = await createApp(boardActor(), {}, {
+      jobDeps: { scheduler: {}, jobStore },
+    });
+
+    const res = await request(app).get("/api/plugins/alerts/plugin-health");
+
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe("firing");
+    expect(res.body.alerts).toHaveLength(1);
+    const alert = res.body.alerts[0];
+    expect(alert.alertname).toBe("PaperclipPluginScheduledJobFailing");
+    expect(alert.severity).toBe("page");
+    expect(alert.pluginId).toBe(pluginId);
+    expect(alert.pluginKey).toBe("paperclip-plugin-alertmanager");
+    expect(alert.jobKey).toBe("check-alert-escalations");
+    expect(alert.consecutiveFailures).toBe(3);
+    expect(alert.lastError).toContain("company context is required");
+    expect(jobStore.listJobsWithFailureStreak).toHaveBeenCalledWith(3);
+  });
+
+  it("does not query job failure streaks when no job scheduling dependencies are wired", async () => {
+    mockRegistry.listByStatus.mockResolvedValue([]);
+    const { app } = await createApp(boardActor());
+
+    const res = await request(app).get("/api/plugins/alerts/plugin-health");
+
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe("ok");
+    expect(res.body.alerts).toEqual([]);
+  });
 });

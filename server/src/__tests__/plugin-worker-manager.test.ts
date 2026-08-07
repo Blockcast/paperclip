@@ -399,6 +399,88 @@ describe("plugin-worker-manager stderr failure context", () => {
     }
   });
 
+  it("scopes runJob invocations per company stamped on job.companyId, for a plugin with more than one configured company (BLO-20957)", async () => {
+    const companiesGet = vi.fn(async (
+      params: { companyId: string },
+      context?: { invocationScope?: { companyId?: string | null } | null },
+    ) => ({
+      id: params.companyId,
+      scopedCompanyId: context?.invocationScope?.companyId ?? null,
+    }));
+    // No `bootstrapCompanyId` — this reproduces a plugin configured by more
+    // than one company, where `plugin-loader.ts` deliberately leaves the
+    // legacy bootstrap scope undefined (`listConfigCompanyIds().length > 1`).
+    // Before BLO-20957, every runJob dispatch on a worker started this way
+    // got an empty `{}` invocation scope no matter which company the
+    // scheduler meant to run the job for, so this nested `companies.get`
+    // call would be denied with "company context is required" for both
+    // dispatches below.
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: INVOCATION_SCOPE_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: {},
+      instanceInfo: {
+        instanceId: "instance-1",
+        hostVersion: "1.0.0",
+      },
+      apiVersion: 1,
+      hostHandlers: {
+        "companies.get": companiesGet as never,
+      },
+    });
+
+    try {
+      await handle.start();
+
+      // Company A's dispatch must resolve to company A's scope...
+      await expect(handle.call("runJob", {
+        job: {
+          jobKey: "check-alert-escalations",
+          runId: "run-a",
+          trigger: "schedule",
+          scheduledAt: "2026-08-07T00:00:00.000Z",
+          companyId: "company-a",
+          mode: "echo",
+          requestedCompanyId: "company-a",
+        },
+      } as HostToWorkerMethods["runJob"][0])).resolves.toEqual({
+        id: "company-a",
+        scopedCompanyId: "company-a",
+      });
+
+      // ...and company B's independent dispatch must resolve to company B's
+      // scope, never company A's — proving the fan-out is per-company, not a
+      // single process-wide scope shared across dispatches.
+      await expect(handle.call("runJob", {
+        job: {
+          jobKey: "check-alert-escalations",
+          runId: "run-b",
+          trigger: "schedule",
+          scheduledAt: "2026-08-07T00:00:00.000Z",
+          companyId: "company-b",
+          mode: "echo",
+          requestedCompanyId: "company-b",
+        },
+      } as HostToWorkerMethods["runJob"][0])).resolves.toEqual({
+        id: "company-b",
+        scopedCompanyId: "company-b",
+      });
+
+      expect(companiesGet).toHaveBeenNthCalledWith(
+        1,
+        { companyId: "company-a" },
+        { invocationScope: { companyId: "company-a" } },
+      );
+      expect(companiesGet).toHaveBeenNthCalledWith(
+        2,
+        { companyId: "company-b" },
+        { invocationScope: { companyId: "company-b" } },
+      );
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
   it("rejects performAction nested host calls that omit the invocation id", async () => {
     const handlers = createHostClientHandlers({
       pluginId: "test.plugin",

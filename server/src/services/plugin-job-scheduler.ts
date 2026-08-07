@@ -12,6 +12,15 @@
  * 1. **Tick loop** — A `setInterval`-based loop fires every `tickIntervalMs`
  *    (default 30s). Each tick scans for due jobs and dispatches them.
  *
+ * 1a. **Per-company fan-out** — A due job dispatches once per company
+ *    configured for the plugin (via `listConfigCompanyIds`), each call
+ *    carrying its own `{ companyId }` invocation scope, rather than one
+ *    process-wide call. A plugin configured by zero companies dispatches
+ *    once with no company scope (instance-level job). Before this
+ *    (BLO-20957) a plugin configured by more than one company got an
+ *    unscoped dispatch and every company-scoped host call the job made was
+ *    denied.
+ *
  * 2. **Cron parsing & next-run calculation** — Uses the lightweight built-in
  *    cron parser ({@link parseCron}, {@link nextCronTick}) to compute the
  *    `nextRunAt` timestamp after each run or when a new job is registered.
@@ -37,6 +46,7 @@
 import { and, eq, lte, or } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { pluginJobs, pluginJobRuns } from "@paperclipai/db";
+import type { PluginJobRunTrigger } from "@paperclipai/shared";
 import type { PluginJobStore } from "./plugin-job-store.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { parseCron, nextCronTick, validateCron } from "./cron.js";
@@ -69,6 +79,14 @@ export interface PluginJobSchedulerOptions {
   jobStore: PluginJobStore;
   /** Worker process manager for RPC calls. */
   workerManager: PluginWorkerManager;
+  /**
+   * Enumerate the companies with saved configuration for a plugin. Scheduled
+   * dispatch calls this once per due job and fans out to one `runJob` call
+   * per configured company, each with its own host-issued invocation scope,
+   * instead of a single process-wide dispatch that only ever worked for
+   * exactly one configured company (BLO-20957).
+   */
+  listConfigCompanyIds: (pluginId: string) => Promise<string[]>;
   /** Interval between scheduler ticks in ms (default: 30s). */
   tickIntervalMs?: number;
   /** Timeout for individual job RPC calls in ms (default: 5min). */
@@ -185,6 +203,7 @@ export interface PluginJobScheduler {
  *   db,
  *   jobStore,
  *   workerManager,
+ *   listConfigCompanyIds: (pluginId) => pluginRegistry.listConfigCompanyIds(pluginId),
  * });
  *
  * // Start the tick loop
@@ -207,6 +226,7 @@ export function createPluginJobScheduler(
     db,
     jobStore,
     workerManager,
+    listConfigCompanyIds,
     tickIntervalMs = DEFAULT_TICK_INTERVAL_MS,
     jobTimeoutMs = DEFAULT_JOB_TIMEOUT_MS,
     maxConcurrentJobs = DEFAULT_MAX_CONCURRENT_JOBS,
@@ -337,27 +357,90 @@ export function createPluginJobScheduler(
   // -----------------------------------------------------------------------
 
   /**
-   * Dispatch a single job run — create the run record, call the worker,
-   * record the result, and advance the schedule pointer.
+   * Dispatch a single due job — fan out to one company-scoped `runJob` call
+   * per company configured for the plugin, then advance the schedule
+   * pointer once the whole fan-out settles.
+   *
+   * Before BLO-20957 this made exactly one process-wide `runJob` call, which
+   * only ever carried a company invocation scope when the plugin happened to
+   * have exactly one configured company (`bootstrapCompanyId`). Any plugin
+   * configured by more than one company got an unscoped dispatch, and every
+   * company-scoped host call the job made (`ctx.issues.list`,
+   * `ctx.config.get(companyId)`, ...) was denied with "company context is
+   * required" — silently, because the RPC still "succeeded" up to that
+   * denial and the failure only showed up as an ERROR log line.
    */
   async function dispatchJob(
     job: typeof pluginJobs.$inferSelect,
   ): Promise<void> {
-    const { id: jobId, pluginId, jobKey, schedule } = job;
+    const { id: jobId, pluginId, jobKey } = job;
     const jobLog = log.child({ jobId, pluginId, jobKey });
 
-    // Mark as active (overlap prevention)
+    // Mark as active (overlap prevention) for the whole job across every
+    // company dispatch, so a slow fan-out can't let the next tick pile a
+    // second dispatch for the same job on top.
     activeJobs.add(jobId);
+
+    try {
+      let companyIds: string[];
+      try {
+        companyIds = await listConfigCompanyIds(pluginId);
+      } catch (err) {
+        jobLog.error(
+          { err: err instanceof Error ? err.message : String(err) },
+          "failed to enumerate configured companies for scheduled dispatch — falling back to a single instance-scoped dispatch",
+        );
+        companyIds = [];
+      }
+
+      const dispatches = companyIds.length > 0
+        ? companyIds.map((companyId) => dispatchJobRun(job, companyId, "schedule"))
+        : [dispatchJobRun(job, null, "schedule")];
+
+      await Promise.allSettled(dispatches);
+    } finally {
+      // Remove from active set
+      activeJobs.delete(jobId);
+
+      // Always advance the schedule pointer (even on failure)
+      try {
+        await advanceSchedulePointer(job);
+      } catch (err) {
+        jobLog.error(
+          { err: err instanceof Error ? err.message : String(err) },
+          "failed to advance schedule pointer",
+        );
+      }
+    }
+  }
+
+  /**
+   * Run one company-scoped (or instance-scoped, when `companyId` is `null`)
+   * dispatch of `job`: create its own run record, call the worker with that
+   * company stamped onto `job.companyId`, and record the result. Failures
+   * are caught and recorded here, never rethrown, so one company's failure
+   * in a fan-out cannot cancel the others (`Promise.allSettled` in
+   * {@link dispatchJob} would already isolate them, but recording must not
+   * depend on that).
+   */
+  async function dispatchJobRun(
+    job: typeof pluginJobs.$inferSelect,
+    companyId: string | null,
+    trigger: PluginJobRunTrigger,
+  ): Promise<void> {
+    const { id: jobId, pluginId, jobKey } = job;
+    const jobLog = log.child({ jobId, pluginId, jobKey, companyId });
 
     let runId: string | undefined;
     const startedAt = Date.now();
 
     try {
-      // 1. Create run record
+      // 1. Create run record, scoped to this company
       const run = await jobStore.createRun({
         jobId,
         pluginId,
-        trigger: "schedule",
+        trigger,
+        companyId,
       });
       runId = run.id;
 
@@ -366,7 +449,7 @@ export function createPluginJobScheduler(
       // 2. Mark run as running
       await jobStore.markRunning(runId);
 
-      // 3. Call worker via RPC
+      // 3. Call worker via RPC, with this company as the invocation scope
       await workerManager.call(
         pluginId,
         "runJob",
@@ -374,8 +457,9 @@ export function createPluginJobScheduler(
           job: {
             jobKey,
             runId,
-            trigger: "schedule" as const,
+            trigger,
             scheduledAt: (job.nextRunAt ?? new Date()).toISOString(),
+            companyId,
           },
         },
         jobTimeoutMs,
@@ -415,19 +499,6 @@ export function createPluginJobScheduler(
             "failed to record job failure",
           );
         }
-      }
-    } finally {
-      // Remove from active set
-      activeJobs.delete(jobId);
-
-      // 5. Always advance the schedule pointer (even on failure)
-      try {
-        await advanceSchedulePointer(job);
-      } catch (err) {
-        jobLog.error(
-          { err: err instanceof Error ? err.message : String(err) },
-          "failed to advance schedule pointer",
-        );
       }
     }
   }

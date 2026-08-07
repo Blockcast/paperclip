@@ -157,7 +157,7 @@ interface PluginHealthCheckResult {
   lastError?: string;
 }
 
-interface PluginHealthAlert {
+interface PluginErrorAlert {
   alertname: "PaperclipPluginError";
   severity: "page";
   pluginId: string;
@@ -168,6 +168,38 @@ interface PluginHealthAlert {
   description: string;
   updatedAt: string;
 }
+
+/**
+ * A scheduled plugin job whose most recent runs all failed (BLO-20957 AC #3).
+ * The plugin worker itself may be perfectly healthy — `status: "ready"` — so
+ * this is a distinct alert shape from {@link PluginErrorAlert} rather than a
+ * variant of it, and it is the surfaced signal for a job that structurally
+ * cannot obtain the company scope it needs (e.g. zero configured companies
+ * for a plugin whose job requires one) instead of only an ERROR log line.
+ */
+interface PluginScheduledJobFailingAlert {
+  alertname: "PaperclipPluginScheduledJobFailing";
+  severity: "page";
+  pluginId: string;
+  pluginKey: string;
+  jobId: string;
+  jobKey: string;
+  consecutiveFailures: number;
+  lastError: string | null;
+  summary: string;
+  description: string;
+}
+
+type PluginHealthAlert = PluginErrorAlert | PluginScheduledJobFailingAlert;
+
+/**
+ * Minimum number of consecutive `failed` runs a scheduled job needs before
+ * `/plugins/alerts/plugin-health` reports it as firing (BLO-20957 AC #3).
+ * 3 tolerates one transient blip (a timeout, a momentary DB hiccup) while
+ * still catching a structurally broken job — one denied every tick — well
+ * before an operator would notice it any other way.
+ */
+const SCHEDULED_JOB_FAILURE_STREAK_THRESHOLD = 3;
 
 type RagHealthPluginError = {
   id: string;
@@ -1028,9 +1060,17 @@ export function pluginRoutes(
    * GET /api/plugins/alerts/plugin-health
    *
    * Polling endpoint for paging integrations (Prometheus JSON exporter,
-   * Alertmanager webhook receiver, or direct on-call script). Returns only
-   * plugins in `error` state; ready, disabled, and paused plugins are
-   * suppressed by the `listByStatus("error")` filter.
+   * Alertmanager webhook receiver, or direct on-call script). Two alert
+   * shapes:
+   *
+   * - `PaperclipPluginError` — the plugin worker itself is in `error` state
+   *   (crashed, failed to initialize, ...); ready/disabled/paused plugins
+   *   are suppressed by the `listByStatus("error")` filter.
+   * - `PaperclipPluginScheduledJobFailing` — the worker is healthy but one
+   *   of its scheduled jobs has failed its last {@link SCHEDULED_JOB_FAILURE_STREAK_THRESHOLD}
+   *   consecutive runs (BLO-20957 AC #3: a job that cannot obtain the
+   *   company scope it needs must surface here, not only as an ERROR log
+   *   line nobody greps for).
    *
    * Paging integration path: configure a Prometheus JSON exporter or
    * Alertmanager receiver to poll this route with a board token on a
@@ -1044,7 +1084,7 @@ export function pluginRoutes(
   router.get("/plugins/alerts/plugin-health", async (req, res) => {
     assertBoardOrgAccess(req);
     const erroredPlugins = await registry.listByStatus("error");
-    const alerts: PluginHealthAlert[] = erroredPlugins.map((plugin) => {
+    const errorAlerts: PluginHealthAlert[] = erroredPlugins.map((plugin) => {
       const lastError = plugin.lastError ?? null;
       return {
         alertname: "PaperclipPluginError",
@@ -1061,6 +1101,32 @@ export function pluginRoutes(
       };
     });
 
+    const jobAlerts: PluginHealthAlert[] = [];
+    if (jobDeps) {
+      const streaks = await jobDeps.jobStore.listJobsWithFailureStreak(
+        SCHEDULED_JOB_FAILURE_STREAK_THRESHOLD,
+      );
+      for (const streak of streaks) {
+        const plugin = await resolvePlugin(registry, streak.job.pluginId);
+        if (!plugin) continue; // job's plugin was hard-deleted; nothing to page on
+        jobAlerts.push({
+          alertname: "PaperclipPluginScheduledJobFailing",
+          severity: "page",
+          pluginId: plugin.id,
+          pluginKey: plugin.pluginKey,
+          jobId: streak.job.id,
+          jobKey: streak.job.jobKey,
+          consecutiveFailures: streak.consecutiveFailures,
+          lastError: streak.lastError,
+          summary: `Scheduled job "${streak.job.jobKey}" on plugin ${plugin.pluginKey} has failed its last ${streak.consecutiveFailures} runs`,
+          description: streak.lastError
+            ? `Job "${streak.job.jobKey}" (plugin ${plugin.pluginKey}, ${plugin.id}) has failed ${streak.consecutiveFailures} consecutive runs. Last error: ${streak.lastError}`
+            : `Job "${streak.job.jobKey}" (plugin ${plugin.pluginKey}, ${plugin.id}) has failed ${streak.consecutiveFailures} consecutive runs.`,
+        });
+      }
+    }
+
+    const alerts = [...errorAlerts, ...jobAlerts];
     res.json({
       status: alerts.length > 0 ? "firing" : "ok",
       alerts,

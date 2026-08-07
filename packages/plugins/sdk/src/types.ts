@@ -270,6 +270,16 @@ export interface PluginJobContext {
   trigger: "schedule" | "manual" | "retry";
   /** ISO 8601 timestamp when the run was scheduled to start. */
   scheduledAt: string;
+  /**
+   * Company this dispatch is scoped to, when the plugin has company-scoped
+   * configuration. The host dispatches a scheduled job once per company that
+   * has configured the plugin (BLO-20957), so a handler whose company-scoped
+   * host calls (`ctx.issues.*`, `ctx.config.get(companyId)`, ...) pass this
+   * value is granted exactly that company's invocation scope. `null`/absent
+   * when the plugin has zero configured companies — such a dispatch has no
+   * company scope and company-scoped host calls will be denied.
+   */
+  companyId?: string | null;
 }
 
 // ---------------------------------------------------------------------------
