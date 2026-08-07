@@ -60,6 +60,7 @@ const mockTelemetryClient = vi.hoisted(() => ({ track: vi.fn() }));
 const mockTrackAgentFirstHeartbeat = vi.hoisted(() => vi.fn());
 const mockTerminateLocalService = vi.hoisted(() => vi.fn());
 const mockGithubHasReviewerEvidenceForPr = vi.hoisted(() => vi.fn());
+const mockGithubGetPullRequestGate = vi.hoisted(() => vi.fn());
 const mockAdapterExecute = vi.hoisted(() =>
   vi.fn<
     (ctx: {
@@ -105,6 +106,7 @@ vi.mock("../services/github-app-auth.ts", async () => {
   );
   return {
     ...actual,
+    githubGetPullRequestGate: mockGithubGetPullRequestGate,
     githubHasReviewerEvidenceForPr: mockGithubHasReviewerEvidenceForPr,
   };
 });
@@ -472,6 +474,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     mockTerminateLocalService.mockImplementation(localServiceSupervisor.terminateLocalService);
     mockHasActiveJobForAgent.mockImplementation(async () => false);
     mockGithubHasReviewerEvidenceForPr.mockResolvedValue({ found: false });
+    mockGithubGetPullRequestGate.mockResolvedValue({ state: "open", merged: false });
     mockAdapterExecute.mockImplementation(async () => ({
       exitCode: 0,
       signal: null,
@@ -1579,6 +1582,109 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.agentId, agentId));
     expect(runs).toHaveLength(0);
+  });
+
+  it("reaps a no-progress external run against its original deadline after a service restart", async () => {
+    const stale = new Date(Date.now() - 46 * 60 * 1000);
+    const jobName = "agent-opencode-original-deadline";
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      includeIssue: false,
+      externalRunId: jobName,
+      lastOutputAt: stale,
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({ startedAt: stale, lastUsefulActionAt: null })
+      .where(eq(heartbeatRuns.id, runId));
+    await seedAdapterInvokeEvent({ companyId, agentId, runId });
+    await seedLaunchedReservation({ companyId, agentId, runId, jobName, jobUid: "original-deadline-uid" });
+    mockListAgentJobRunStatuses.mockResolvedValueOnce(new Map([[runId, {
+      phase: "active",
+      name: jobName,
+      uid: "original-deadline-uid",
+    }]]));
+
+    const restartedHeartbeat = createHeartbeat();
+    const result = await restartedHeartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+
+    expect(result.runIds).toContain(runId);
+    expect(await restartedHeartbeat.getRun(runId)).toMatchObject({
+      status: "failed",
+      errorCode: "external_lifecycle_stale_killed",
+    });
+    expect(mockDeleteAgentJobsForRun).toHaveBeenCalledWith({
+      runId,
+      agentId,
+      name: jobName,
+      uid: "original-deadline-uid",
+    });
+  });
+
+  it("keeps a long-running external Job when durable useful progress is recent", async () => {
+    const stale = new Date(Date.now() - 46 * 60 * 1000);
+    const recentProgress = new Date(Date.now() - 60 * 1000);
+    const jobName = "agent-opencode-recent-progress";
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      includeIssue: false,
+      externalRunId: jobName,
+      lastOutputAt: stale,
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({ startedAt: stale, lastUsefulActionAt: recentProgress })
+      .where(eq(heartbeatRuns.id, runId));
+    await seedAdapterInvokeEvent({ companyId, agentId, runId });
+    await seedLaunchedReservation({ companyId, agentId, runId, jobName, jobUid: "recent-progress-uid" });
+    mockListAgentJobRunStatuses.mockResolvedValueOnce(new Map([[runId, {
+      phase: "active",
+      name: jobName,
+      uid: "recent-progress-uid",
+    }]]));
+
+    const result = await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+
+    expect(result.runIds).not.toContain(runId);
+    expect((await heartbeat.getRun(runId))?.status).toBe("running");
+    expect(mockDeleteAgentJobsForRun).not.toHaveBeenCalled();
+  });
+
+  it("does not re-adopt an external Job after its PR gate closes", async () => {
+    const jobName = "agent-opencode-closed-pr";
+    const jobUid = "closed-pr-uid";
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      externalRunId: jobName,
+      contextSnapshot: {
+        wakeReason: "github_pr_review_requested",
+        reviewKind: "pr_review",
+        githubRepoFullName: "Blockcast/paperclip",
+        githubPrNumber: 847,
+      },
+    });
+    await seedLaunchedReservation({ companyId, agentId, runId, jobName, jobUid });
+    mockListManagedAgentJobs.mockResolvedValueOnce([{
+      phase: "active",
+      reason: null,
+      message: null,
+      runId,
+      agentId,
+      name: jobName,
+      uid: jobUid,
+      createdAt: new Date(),
+    }]);
+    mockGithubGetPullRequestGate.mockResolvedValueOnce({ state: "closed", merged: false });
+
+    const resumed = await heartbeat.resumeRunningExternalRuntimeRuns();
+
+    expect(resumed).toBe(0);
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+    expect(await heartbeat.getRun(runId)).toMatchObject({
+      status: "cancelled",
+      errorCode: "external_gate_terminal",
+    });
+    expect(mockDeleteAgentJobsForRun).toHaveBeenCalledWith({ runId, agentId, name: jobName, uid: jobUid });
   });
 
   it.each(["reserved", "launching"] as const)(
@@ -3068,6 +3174,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       db
         .select({
           lastOutputAt: heartbeatRuns.lastOutputAt,
+          lastUsefulActionAt: heartbeatRuns.lastUsefulActionAt,
           lastOutputSeq: heartbeatRuns.lastOutputSeq,
           lastOutputStream: heartbeatRuns.lastOutputStream,
         })
@@ -3108,9 +3215,40 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(progressAfterKeepalive?.lastOutputAt?.toISOString() ?? null).toBe(
       progressBeforeKeepalive?.lastOutputAt?.toISOString() ?? null,
     );
+    expect(progressAfterKeepalive?.lastUsefulActionAt?.toISOString() ?? null).toBe(
+      progressBeforeKeepalive?.lastUsefulActionAt?.toISOString() ?? null,
+    );
     expect(progressAfterKeepalive?.lastOutputSeq).toBe(progressBeforeKeepalive?.lastOutputSeq);
     expect(progressAfterKeepalive?.lastOutputStream).toBe(progressBeforeKeepalive?.lastOutputStream);
     expect(settledRun?.stdoutExcerpt ?? "").not.toContain("[paperclip] keepalive");
+  });
+
+  it("persists useful progress while an external-lifecycle run is still active", async () => {
+    let liveProgress: Date | null = null;
+    mockAdapterExecute.mockImplementationOnce(async (ctx) => {
+      await ctx.onLog?.("stdout", "Agent completed a repository inspection.\n");
+      liveProgress = await db
+        .select({ lastUsefulActionAt: heartbeatRuns.lastUsefulActionAt })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, ctx.runId))
+        .then((rows) => rows[0]?.lastUsefulActionAt ?? null);
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: "Completed after reporting progress.",
+        provider: "test",
+        model: "test-model",
+        resultJson: { result: "done" },
+      };
+    });
+
+    const { runId } = await seedQueuedIssueRunFixture();
+    await heartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(heartbeat, runId);
+
+    expect(liveProgress).toBeInstanceOf(Date);
   });
 
   async function settleClaimedPrReview(

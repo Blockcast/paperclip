@@ -176,7 +176,7 @@ import {
   isThrottleCandidateIssueRewake,
 } from "./issue-rewake-throttle.js";
 import { logActivity, publishPluginDomainEvent, type LogActivityInput } from "./activity-log.js";
-import { githubHasReviewerEvidenceForPr } from "./github-app-auth.js";
+import { githubGetPullRequestGate, githubHasReviewerEvidenceForPr } from "./github-app-auth.js";
 import { loadConfig } from "../config.js";
 import { enqueueGithubCommitStatusDelivery } from "./github-status-delivery-outbox.js";
 import {
@@ -334,6 +334,7 @@ import {
   type RuntimeStatusUpdate,
   type SessionCompactionPolicy,
 } from "@paperclipai/adapter-utils";
+import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import {
   readPaperclipSkillSyncPreference,
   UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
@@ -651,7 +652,68 @@ const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_WAKE_REASON = "execution_review_part
 const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_CAUSE = "execution_review_participant_recovery";
 const GITHUB_PR_WORKFLOW_SKILL_KEY = "paperclipai/bundled/software-development/github-pr-workflow";
 const GITHUB_PR_WORKFLOW_SKILL_SLUG = "github-pr-workflow";
-const PUSH_CAPABILITY_ENV_KEYS = ["GH_TOKEN", "GITHUB_TOKEN"] as const;
+const GH_SEAT_TOKEN_ENV_KEY = "GH_SEAT_TOKEN_VALUE";
+const STANDARD_GITHUB_CREDENTIAL_ENV_KEYS = ["GH_TOKEN", "GITHUB_TOKEN"] as const;
+
+// GH_SEAT_TOKEN_VALUE is a first-class member of this contract, not an
+// afterthought: it is the *only* one of the three that can be delivered without
+// mounting a credential into every Job pod (BLO-18927). Omitting it meant an
+// agent bound correctly for the scoped path was still rejected as
+// `push_write_credential_missing` before scripts/gh-token-wrapper.sh ever ran,
+// which would have made the scoped binding unusable for exactly the git-
+// sensitive local adapters this preflight guards. Widening the accepted set is
+// safe: this gate asserts that *some* push credential is configured, it does
+// not authorize anything.
+export const PUSH_CAPABILITY_ENV_KEYS = [
+  ...STANDARD_GITHUB_CREDENTIAL_ENV_KEYS,
+  GH_SEAT_TOKEN_ENV_KEY,
+] as const;
+
+export function translateGithubSeatTokenForExecutionTarget(input: {
+  runtimeConfig: Record<string, unknown>;
+  executionTarget: AdapterExecutionTarget | null | undefined;
+}): Record<string, unknown> {
+  const env = parseObject(input.runtimeConfig.env);
+  const rawSeatToken = env[GH_SEAT_TOKEN_ENV_KEY];
+  if (typeof rawSeatToken !== "string") return input.runtimeConfig;
+
+  const seatToken = rawSeatToken.trim();
+  if (!seatToken) {
+    throw new ConfigurationIncompleteFailure(
+      "configuration incomplete: GH_SEAT_TOKEN_VALUE is set but resolves to an empty GitHub credential.",
+      {
+        configurationIncomplete: {
+          reason: "github_seat_token_empty",
+          requiredEnvKeys: [...PUSH_CAPABILITY_ENV_KEYS],
+          requiredScopes: ["agent"],
+          missingBindings: [],
+        },
+      },
+    );
+  }
+  if (/\s/.test(seatToken)) {
+    throw new ConfigurationIncompleteFailure(
+      "configuration incomplete: GH_SEAT_TOKEN_VALUE contains embedded whitespace and cannot be translated safely.",
+      {
+        configurationIncomplete: {
+          reason: "github_seat_token_malformed",
+          requiredEnvKeys: [...PUSH_CAPABILITY_ENV_KEYS],
+          requiredScopes: ["agent"],
+          missingBindings: [],
+        },
+      },
+    );
+  }
+
+  return {
+    ...input.runtimeConfig,
+    env: {
+      ...env,
+      GH_TOKEN: seatToken,
+      GITHUB_TOKEN: seatToken,
+    },
+  };
+}
 // Keep this in sync with local adapters that require a git workspace before launch.
 const GIT_SENSITIVE_LOCAL_ADAPTER_TYPES = new Set([
   "claude_local",
@@ -1277,6 +1339,84 @@ function stripPaperclipRuntimeEnvFromAdapterConfig(config: Record<string, unknow
   };
 }
 
+// Keys that select the *identity* a runtime tool authenticates as, and which
+// must therefore only ever be settable at agent scope.
+//
+// GH_SEAT_TOKEN_VALUE is read by scripts/gh-token-wrapper.sh in precedence
+// above the mounted App token, so any scope able to set it can swap the
+// identity every `gh` invocation runs as, or park whitespace there and fail
+// them all with exit 64. Environment, project and routine env are overlaid
+// *after* agent-scope resolution (see below), so without this filter the
+// lowest-trust writer would win, not the highest. The issue-level adapter
+// override reaches the same key by a second route, one overlay earlier — see
+// withAgentScopedEnvProvenance.
+//
+// Before BLO-18927 the `PAPERCLIP_` prefix gave this protection for free at
+// every scope. Renaming the key out of that namespace was necessary to reach
+// agent scope at all — isPaperclipRuntimeEnvKey strips the prefix *before*
+// agent resolution — and this restores the protection for the scopes that
+// never needed the exemption.
+//
+// Deliberately NOT folded into isPaperclipRuntimeEnvKey: that guard strips at
+// every scope including agent, which is precisely what this key must escape.
+const AGENT_SCOPE_ONLY_ENV_KEYS = new Set([GH_SEAT_TOKEN_ENV_KEY]);
+
+function isAgentScopeOnlyEnvKey(key: string) {
+  return AGENT_SCOPE_ONLY_ENV_KEYS.has(key);
+}
+
+// Applied to environment / project / routine env only. Agent-scope env goes
+// through stripPaperclipRuntimeEnvFromAdapterConfig instead, which does not
+// filter these keys.
+function stripLowerScopeEnvBindings(envValue: unknown): Record<string, unknown> | null {
+  const record = parseObject(envValue);
+  const filtered = Object.fromEntries(
+    Object.entries(record).filter(
+      ([key]) => !isPaperclipRuntimeEnvKey(key) && !isAgentScopeOnlyEnvKey(key),
+    ),
+  );
+  return Object.keys(filtered).length > 0 ? filtered : null;
+}
+
+// Restores agent provenance for AGENT_SCOPE_ONLY_ENV_KEYS after the overlay
+// spread in mergeModelProfileAdapterConfig, whose result is handed to
+// resolveExecutionRunAdapterConfig as `executionRunConfig` — i.e. treated
+// wholesale as agent scope, and filtered there only for `PAPERCLIP_*`.
+//
+// Two properties of that merge break the agent-only boundary without this:
+//
+//   - `issueAdapterConfig` is issue.assigneeAdapterOverrides.adapterConfig.
+//     parseIssueAssigneeAdapterOverrides accepts arbitrary keys, and any actor
+//     able to create or patch the issue can set them. It is overlaid last.
+//   - the overlays are a *shallow* spread, so an overlay carrying `env` at all
+//     replaces the agent's `env` wholesale instead of merging into it.
+//
+// So an issue override could both introduce a seat token the agent never had
+// (selecting the identity every `gh` invocation authenticates as) and drop one
+// the agent did have. Post-condition established here: every
+// AGENT_SCOPE_ONLY_ENV_KEY present in the merged env holds exactly the
+// baseConfig value, and any the baseConfig lacks is absent. That closes both
+// directions.
+//
+// Note this also ignores the key when it arrives via modelProfile.adapterConfig,
+// which can be agent-provenanced (configSource "agent_runtime"). Deliberate: the
+// key resolves from the agent's primary config and nowhere else, so there is one
+// place to audit rather than one per profile.
+function withAgentScopedEnvProvenance(
+  merged: Record<string, unknown>,
+  baseConfig: Record<string, unknown>,
+): Record<string, unknown> {
+  // Reference-equal means no overlay supplied `env`, so nothing was displaced.
+  if (merged.env === baseConfig.env) return merged;
+  const env = Object.fromEntries(
+    Object.entries(parseObject(merged.env)).filter(([key]) => !isAgentScopeOnlyEnvKey(key)),
+  );
+  for (const [key, value] of Object.entries(parseObject(baseConfig.env))) {
+    if (isAgentScopeOnlyEnvKey(key)) env[key] = value;
+  }
+  return { ...merged, env };
+}
+
 function assertLowTrustEnvConfigAllowed(envValue: unknown, source: string) {
   const record = stripPaperclipRuntimeEnvBindings(envValue);
   if (!record) return;
@@ -1287,7 +1427,13 @@ function assertLowTrustEnvConfigAllowed(envValue: unknown, source: string) {
     const isPlainBinding =
       typeof binding === "string" ||
       (typeof binding === "object" && binding !== null && binding.type === "plain");
-    if (isPlainBinding && LOW_TRUST_SENSITIVE_ENV_KEY_RE.test(key)) {
+    // Agent-scope-only keys hold a raw credential by construction, but do not
+    // match the name-shaped heuristic below (GH_SEAT_TOKEN_VALUE contains no
+    // "secret"/"auth"/"access_token" substring). Treat them as sensitive
+    // explicitly so a low-trust run cannot inline one; it must use a
+    // secret_ref. Safe to add with this PR because the key is new here — no
+    // existing config can be relying on the inline form.
+    if (isPlainBinding && (LOW_TRUST_SENSITIVE_ENV_KEY_RE.test(key) || isAgentScopeOnlyEnvKey(key))) {
       throw new HttpError(422, `Low-trust execution cannot use inline sensitive env value ${source}.${key}`, {
         code: "low_trust_inline_sensitive_env_denied",
       });
@@ -1319,9 +1465,9 @@ export async function resolveExecutionRunAdapterConfig(input: {
   };
 }) {
   const executionRunConfig = stripPaperclipRuntimeEnvFromAdapterConfig(input.executionRunConfig);
-  const environmentEnv = stripPaperclipRuntimeEnvBindings(input.environmentEnv);
-  const projectEnv = stripPaperclipRuntimeEnvBindings(input.projectEnv);
-  const routineEnv = stripPaperclipRuntimeEnvBindings(input.routineEnv);
+  const environmentEnv = stripLowerScopeEnvBindings(input.environmentEnv);
+  const projectEnv = stripLowerScopeEnvBindings(input.projectEnv);
+  const routineEnv = stripLowerScopeEnvBindings(input.routineEnv);
   const lowTrustAllowedBindingIds = input.trustPreset?.kind === "low_trust_review"
     ? input.trustPreset.boundary.allowedSecretBindingIds ?? []
     : undefined;
@@ -2814,13 +2960,17 @@ export function sanitizeRunLogChunkForStorage(
 
 const SYNTHETIC_KEEPALIVE_RUN_LOG_LINE_RE =
   /^\[paperclip\] keepalive\b.*\bjob\b.*\brunning \(\d+s since last output\)$/;
+const SYNTHETIC_REATTACH_RUN_LOG_LINE_RE =
+  /^\[paperclip\] (?:Reattaching to orphaned Job \S+|Reattached to existing run \S+\.)$/;
 
 export function isSyntheticNonProgressRunLogChunk(chunk: string) {
   const lines = chunk
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter(Boolean);
-  return lines.length > 0 && lines.every((line) => SYNTHETIC_KEEPALIVE_RUN_LOG_LINE_RE.test(line));
+  return lines.length > 0 && lines.every((line) =>
+    SYNTHETIC_KEEPALIVE_RUN_LOG_LINE_RE.test(line) || SYNTHETIC_REATTACH_RUN_LOG_LINE_RE.test(line)
+  );
 }
 
 function normalizeHeartbeatIntervalSec(value: unknown, fallback: number) {
@@ -3469,6 +3619,7 @@ function retryAfterDelayMs(value: unknown): number | null {
 const PROVIDER_CAPACITY_RESET_AT_PATTERN =
   /(?:\b(?:resume_at|retry_not_before|retryNotBefore)\b[\\'"\s]*[:=][\\'"\s]*|\b(?:capacity\s+)?may\s+reset\s+at\s+)(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))/i;
 const PROVIDER_CAPACITY_RETRY_IN_PATTERN = /\bretry\s+in\s+(\d+(?:\.\d+)?)\s*(?:s\b|secs?\b|seconds?\b)/i;
+const PROVIDER_CAPACITY_RESET_PROVENANCE_SOURCE = "server_parse_provider_capacity_horizon";
 
 // An advertised horizon further out than this is treated as unusable rather
 // than parked on: a bad parse (or a provider bug) must not silently sideline an
@@ -3517,6 +3668,50 @@ export function parseProviderCapacityResetHorizon(
   }
 
   return null;
+}
+
+function readProviderCapacityResetStatusEvidence(
+  resultJson: Record<string, unknown> | null | undefined,
+): { field: "api_error_status" | "error_status"; statusCode: number } | null {
+  for (const field of ["api_error_status", "error_status"] as const) {
+    const status = normalizeHttpStatusCode(resultJson?.[field]);
+    if (status == null) continue;
+    return { field, statusCode: Number(status) };
+  }
+  return null;
+}
+
+// Mirror of the recovery reader's instant guard. Adapters that hand back a
+// structured `retryNotBefore` (claude-local/codex-local) skip the prose parser
+// above, so before this they reached recovery carrying no provenance at all and
+// were forced into the generic rate-limit/quota wording — throwing away a 429
+// diagnosis we can actually substantiate. Such a horizon may earn the server
+// provenance marker, but it is adapter-controlled text, so it is re-derived
+// here rather than trusted: only a bare full-string ISO instant inside the same
+// forward horizon parseProviderCapacityResetHorizon accepts survives, and it is
+// re-emitted canonically so no adapter formatting reaches an issue comment.
+const PROVIDER_CAPACITY_RESET_INSTANT_PATTERN =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
+
+export function canonicalizeAdapterCapacityResetInstant(
+  value: unknown,
+  now = Date.now(),
+): Date | null {
+  const raw = typeof value === "string" ? value.trim() : null;
+  if (!raw || !PROVIDER_CAPACITY_RESET_INSTANT_PATTERN.test(raw)) return null;
+  const parsed = Date.parse(raw);
+  if (!Number.isFinite(parsed)) return null;
+  if (parsed <= now || parsed - now > PROVIDER_CAPACITY_MAX_HORIZON_MS) return null;
+  return new Date(parsed);
+}
+
+function stripAdapterProviderCapacityResetMetadata(
+  resultJson: Record<string, unknown> | null | undefined,
+): Record<string, unknown> {
+  const sanitized = { ...parseObject(resultJson) };
+  delete sanitized.providerCapacityResetAt;
+  delete sanitized.providerCapacityResetProvenance;
+  return sanitized;
 }
 
 function zeroTokenUsage(usage: { inputTokens?: number; outputTokens?: number; cachedInputTokens?: number } | undefined) {
@@ -4014,11 +4209,12 @@ export function mergeModelProfileAdapterConfig(input: {
   modelProfile: ModelProfileApplication;
   issueAdapterConfig: Record<string, unknown> | null | undefined;
 }): Record<string, unknown> {
-  return {
+  const merged = {
     ...input.baseConfig,
     ...(input.modelProfile.adapterConfig ?? {}),
     ...(input.issueAdapterConfig ?? {}),
   };
+  return withAgentScopedEnvProvenance(merged, input.baseConfig);
 }
 
 function modelProfileRunMetadata(
@@ -6390,6 +6586,26 @@ const GITHUB_PR_CONTEXT_KEYS = [
   "reviewKind",
 ] as const;
 
+// BLO-22229: wake reasons whose contextSnapshot describes one specific review
+// instance (a formal `pull_request_review` submission, or review feedback
+// delivered via an `issue_comment`). Each such wake is a self-contained
+// report of "what does the review say right now" — it must never be read
+// alongside a review-content field left over from an earlier instance.
+const GITHUB_PR_REVIEW_INSTANCE_WAKE_REASONS = new Set([
+  "github_pr_review_feedback",
+  "github_pr_review_submitted",
+]);
+
+// The subset of GITHUB_PR_CONTEXT_KEYS that describes review *content*
+// (state/body/author of one review instance), as opposed to PR identity.
+const GITHUB_PR_REVIEW_CONTENT_KEYS = [
+  "githubPrReviewBody",
+  "githubPrReviewState",
+  "githubPrReviewAuthorLogin",
+  "githubReviewFeedbackActionable",
+  "githubReviewFeedbackCommentId",
+] as const;
+
 function readGithubPrIdentity(contextSnapshot: Record<string, unknown>) {
   const raw = contextSnapshot.githubPrNumber;
   const prNumber =
@@ -6432,6 +6648,37 @@ function preserveNonGithubPrWakeCommentIds(contextSnapshot: Record<string, unkno
   const githubPrScopedCommentIds = readGithubPrScopedWakeCommentIds(contextSnapshot);
   if (githubPrScopedCommentIds.size === 0) return extractWakeCommentIds(contextSnapshot);
   return extractWakeCommentIds(contextSnapshot).filter((commentId) => !githubPrScopedCommentIds.has(commentId));
+}
+
+function readGithubPrReviewFeedbackWakeCommentIds(contextSnapshot: Record<string, unknown>) {
+  const ids = new Set<string>();
+  const reviewFeedbackCommentId = readNonEmptyString(contextSnapshot.githubReviewFeedbackCommentId);
+  if (reviewFeedbackCommentId) ids.add(reviewFeedbackCommentId);
+
+  const paperclipWake = parseObject(contextSnapshot[PAPERCLIP_WAKE_PAYLOAD_KEY]);
+  const comments = Array.isArray(paperclipWake.comments) ? paperclipWake.comments : [];
+  const identity = readGithubPrIdentity(contextSnapshot);
+  for (const rawComment of comments) {
+    const comment = parseObject(rawComment);
+    const metadata = parseObject(comment.metadata);
+    if (readNonEmptyString(metadata.kind) !== "github_pr_review_feedback") continue;
+    const metadataIdentity = readGithubPrIdentity({
+      githubRepoFullName: metadata.repoFullName,
+      githubPrNumber: metadata.prNumber,
+    });
+    if (identity !== null && metadataIdentity !== null && metadataIdentity !== identity) continue;
+    const commentId = readNonEmptyString(comment.id);
+    if (commentId) ids.add(commentId);
+  }
+
+  return ids;
+}
+
+function preserveNonGithubPrReviewFeedbackWakeCommentIds(contextSnapshot: Record<string, unknown>) {
+  const reviewFeedbackCommentIds = readGithubPrReviewFeedbackWakeCommentIds(contextSnapshot);
+  const commentIds = mergeWakeCommentIds(contextSnapshot);
+  if (reviewFeedbackCommentIds.size === 0) return commentIds;
+  return commentIds.filter((commentId) => !reviewFeedbackCommentIds.has(commentId));
 }
 
 type AcceptedPlanWakeRoutingDecision = {
@@ -6515,6 +6762,26 @@ export function mergeCoalescedContextSnapshot(
       if (!(key in incoming)) delete merged[key];
     }
   }
+  // BLO-22229: even on the SAME PR, a new review-instance wake (a fresh
+  // `pull_request_review` submission, or review feedback posted as an
+  // `issue_comment`) must not inherit review-content fields from whichever
+  // review instance happened to be active before it. Without this, a
+  // comment-shaped review (which carries a body/author but, per
+  // github-webhook.ts's issue_comment branch, never a formal `reviewState`)
+  // merges onto a still-active `github_pr_review_submitted` run and keeps
+  // that run's stale `githubPrReviewState`/body — composing a directive from
+  // two different GitHub events (e.g. this comment's author paired with an
+  // earlier reviewer's APPROVED state) that together describe an event that
+  // never happened. Each review-instance wake owns this key block outright:
+  // whatever it doesn't re-supply is cleared, not inherited.
+  const incomingWakeReason = readNonEmptyString(incoming.wakeReason);
+  const isNewReviewInstance =
+    incomingWakeReason !== null && GITHUB_PR_REVIEW_INSTANCE_WAKE_REASONS.has(incomingWakeReason);
+  if (isNewReviewInstance) {
+    for (const key of GITHUB_PR_REVIEW_CONTENT_KEYS) {
+      if (!(key in incoming)) delete merged[key];
+    }
+  }
   if (existing.forceFreshSession === true || incoming.forceFreshSession === true) {
     merged.forceFreshSession = true;
   }
@@ -6522,9 +6789,12 @@ export function mergeCoalescedContextSnapshot(
   for (const key of ["issueId", "taskId", "taskKey"] as const) {
     merged[key] = readNonEmptyString(incoming[key]) ?? readNonEmptyString(existing[key]) ?? merged[key];
   }
-  const mergedCommentIds = isDifferentGithubPr
-    ? mergeWakeCommentIds(preserveNonGithubPrWakeCommentIds(existing), incoming)
-    : mergeWakeCommentIds(existing, incoming);
+  const existingCommentIdsForMerge = isDifferentGithubPr
+    ? preserveNonGithubPrWakeCommentIds(existing)
+    : isNewReviewInstance
+      ? preserveNonGithubPrReviewFeedbackWakeCommentIds(existing)
+      : existing;
+  const mergedCommentIds = mergeWakeCommentIds(existingCommentIdsForMerge, incoming);
   if (mergedCommentIds.length > 0) {
     const latestCommentId = mergedCommentIds[mergedCommentIds.length - 1];
     merged[WAKE_COMMENT_IDS_KEY] = mergedCommentIds;
@@ -6533,7 +6803,7 @@ export function mergeCoalescedContextSnapshot(
     // The merged context should carry canonical comment ids; the next wake will
     // regenerate any structured payload from those ids.
     delete merged[PAPERCLIP_WAKE_PAYLOAD_KEY];
-  } else if (isDifferentGithubPr) {
+  } else if (isDifferentGithubPr || isNewReviewInstance) {
     delete merged[WAKE_COMMENT_IDS_KEY];
     delete merged.commentId;
     delete merged.wakeCommentId;
@@ -7941,7 +8211,35 @@ export function buildPaperclipTaskMarkdown(input: {
       lines.push(`- Head SHA at wake time: ${quoteTaskScalar(prReview.headSha)} (may be superseded — confirm the current head before diffing or checking out)`);
     }
     if (prReview.event) lines.push(`- GitHub event: ${quoteTaskScalar(prReview.event)}`);
-    if (prReview.prRole === "author") {
+    if (prReview.prRole === "author" && prReview.wakeReason === "github_pr_review_requested") {
+      // BLO-19522: a review REQUEST is not review feedback. The author wake
+      // still fires for it on purpose (a manager or peer may have requested
+      // review on someone else's PR — see the suppressAuthorWake comment in
+      // routes/github-webhook.ts for why suppressing it is the wrong trade),
+      // but it must not borrow the feedback directive below.
+      //
+      // It used to. `prRole: "author"` is set for every `github_pr_*` wake,
+      // and on this path reviewState/reviewBody/reviewAuthorLogin are all null
+      // (isActionableReviewFeedbackContext is false for review_requested), so
+      // the null-state branch asserted "A reviewer just posted findings on
+      // YOUR pull request" and told the author to push a follow-up commit —
+      // when no review existed at all. Observed three times across three repos
+      // (Network-Operator-Portal#604, paperclip#929, BLO-19722), each costing a
+      // full run, and the obvious action it steers toward is re-requesting the
+      // review, which re-posts the marker and spins the loop that the #583
+      // author-filter and PC#822's marker were both meant to keep closed.
+      const requesterLabel = prReview.requestCommentAuthorLogin ?? "Someone";
+      lines.push(
+        "",
+        "GitHub PR review request directive:",
+        `${requesterLabel} requested a review on YOUR pull request. This is a review REQUEST, not review feedback: no review has been submitted in response to it yet, and there are no findings to act on.`,
+        "The reviewer was woken separately by this same event — you do NOT need to request the review again. Re-posting a `<!-- paperclip:review-request -->` comment here would only re-trigger this wake.",
+        "If you were already waiting on this review, treat this run as a no-op: verify with `gh api repos/{owner}/{repo}/pulls/{n}/reviews` (and check for a comment-shaped `## Ally` review, which files no review object), then return to what you were doing. Act only on a review that actually exists.",
+      );
+      if (prReview.requestCommentBody) {
+        lines.push("", "The request comment:", fenceTaskText(prReview.requestCommentBody));
+      }
+    } else if (prReview.prRole === "author") {
       const reviewerLabel = prReview.reviewAuthorLogin ?? "A reviewer";
       const stateLabel = prReview.reviewState ? prReview.reviewState.toUpperCase() : null;
       lines.push(
@@ -8629,7 +8927,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   });
   const workspaceOperationsSvc = workspaceOperationService(db);
   const reattachingExternalRuns = new Set<string>();
-  const externalRunReattachedAt = new Map<string, number>();
   // Tracks the promises spawned by `void executeRun(...)` calls in the
   // dispatcher (startNextQueuedRunForAgent) so tests can await
   // fire-and-forget chains before TRUNCATE-based cleanup. Without this
@@ -16169,7 +16466,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
     runningProcesses.delete(input.run.id);
     activeRunExecutions.delete(input.run.id);
-    externalRunReattachedAt.delete(input.run.id);
     await environmentsSvc.releaseLeasesForRun(
       input.run.id,
       terminalOutcome.status === "succeeded" ? "released" : "failed",
@@ -16194,22 +16490,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   function externalLifecycleRecentRefTime(
     run: Pick<
       typeof heartbeatRuns.$inferSelect,
-      "id" | "lastOutputAt" | "startedAt" | "createdAt" | "finishedAt"
+      "lastOutputAt" | "lastUsefulActionAt" | "startedAt" | "createdAt" | "finishedAt"
     >,
   ): number {
+    const liveProgressRef = runTimestampMs(run.lastUsefulActionAt) || runTimestampMs(run.lastOutputAt);
     return Math.max(
-      runTimestampMs(run.lastOutputAt),
+      liveProgressRef,
       runTimestampMs(run.finishedAt),
       runTimestampMs(run.startedAt),
       runTimestampMs(run.createdAt),
-      externalRunReattachedAt.get(run.id) ?? 0,
     );
   }
 
   function isExternalLifecycleRunInRecentGrace(
     run: Pick<
       typeof heartbeatRuns.$inferSelect,
-      "id" | "lastOutputAt" | "updatedAt" | "startedAt" | "createdAt" | "finishedAt"
+      "id" | "lastOutputAt" | "lastUsefulActionAt" | "updatedAt" | "startedAt" | "createdAt" | "finishedAt"
     >,
     now: Date,
     graceMs = EXTERNAL_LIFECYCLE_RECENT_RUN_GRACE_MS,
@@ -16669,9 +16965,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ? reconciled.job
         : await readAgentJobRunStatusByName(reservation.jobName);
       if (observed?.phase !== "active" || observed.uid !== reservation.jobUid) continue;
+      const prReview = derivePaperclipPrReview(parseObject(run.contextSnapshot));
+      if (prReview?.repoFullName) {
+        const gate = await githubGetPullRequestGate({
+          repoFullName: prReview.repoFullName,
+          prNumber: prReview.prNumber,
+        });
+        if (!("error" in gate) && gate.state === "closed") {
+          const reason = `External PR gate ${prReview.repoFullName}#${prReview.prNumber} is closed${gate.merged ? " and merged" : " without merge"}`;
+          await cancelRunInternal(run.id, reason, {
+            errorCode: "external_gate_terminal",
+            eventMessage: "external-lifecycle reattach skipped because external gate is terminal",
+            eventPayload: {
+              repoFullName: prReview.repoFullName,
+              prNumber: prReview.prNumber,
+              state: gate.state,
+              merged: gate.merged,
+            },
+          });
+          continue;
+        }
+      }
       resumed += 1;
       reattachingExternalRuns.add(run.id);
-      externalRunReattachedAt.set(run.id, Date.now());
       void executeRun(run.id)
         .catch((error) => {
           logger.error({ error, runId: run.id }, "failed to reattach external-runtime execution");
@@ -17063,17 +17379,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
       let confirmedMissingExternalJob = false;
       if (externalLifecycleRun && externalLifecycleStarted) {
-        const persistedSignalRef = run.lastUsefulActionAt
-          ? new Date(run.lastUsefulActionAt).getTime()
-          : run.lastOutputAt
-          ? new Date(run.lastOutputAt).getTime()
-          : run.startedAt
-          ? new Date(run.startedAt).getTime()
-          : 0;
-        const lastSignalRef = Math.max(
-          persistedSignalRef,
-          externalRunReattachedAt.get(run.id) ?? 0,
-        );
+        const lastSignalRef = externalLifecycleRecentRefTime(run);
         const isSilent = !lastSignalRef || now.getTime() - lastSignalRef >= EXTERNAL_LIFECYCLE_STALE_MS;
         // BLO-12996: a much longer floor that gates the *destructive* kill of a
         // still-active Job (vs. isSilent, which only gates non-destructive
@@ -19875,7 +20181,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             consumerScopes: ["agent", "project"],
             reason: "push_write_credential_missing",
             remediation:
-              "GitHub PR workflow requires GH_TOKEN or GITHUB_TOKEN bound at project or agent scope.",
+              "GitHub PR workflow requires GH_TOKEN or GITHUB_TOKEN bound at project or agent scope, or GH_SEAT_TOKEN_VALUE bound at agent scope.",
           }
         : undefined,
     });
@@ -19904,6 +20210,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       ...effectiveResolvedConfig,
       paperclipRuntimeSkills: runtimeSkillEntries,
     };
+    runtimeConfig = translateGithubSeatTokenForExecutionTarget({
+      runtimeConfig,
+      executionTarget: null,
+    });
     const latestAgentConfigRevision = await getLatestAgentConfigRevision(agent.companyId, agent.id);
     const sessionConfigMetadata = await buildEffectiveRunSessionConfigMetadata({
       adapterType: agent.adapterType,
@@ -20749,6 +21059,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .update(heartbeatRuns)
         .set({
           lastOutputAt: pendingOutputProgress.at,
+          lastUsefulActionAt: pendingOutputProgress.at,
           lastOutputSeq: pendingOutputProgress.seq,
           lastOutputStream: pendingOutputProgress.stream,
           lastOutputBytes: pendingOutputProgress.bytes,
@@ -21750,14 +22061,33 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // prose. Only consulted when the adapter did not already hand back a
       // structured `retryNotBefore` (claude-local/codex-local do), and only for
       // the throttle families — a horizon quoted inside some unrelated failure's
-      // tool output must not push that failure's retry into next week.
+      // tool output must not push that failure's retry into next week. The
+      // structured case is not unhandled: it is picked up a few lines down.
+      const providerCapacityThrottleOverride =
+        rateLimitExhaustedOverride || providerThrottledNoProgressOverride;
       const providerCapacityResetAt =
-        (rateLimitExhaustedOverride || providerThrottledNoProgressOverride) && !adapterResult.retryNotBefore
+        providerCapacityThrottleOverride && !adapterResult.retryNotBefore
           ? parseProviderCapacityResetHorizon({
               resultJson: adapterResult.resultJson,
               errorMessage: adapterResult.errorMessage,
             })
           : null;
+      const providerCapacityResetStatusEvidence = providerCapacityThrottleOverride
+        ? readProviderCapacityResetStatusEvidence(adapterResult.resultJson)
+        : null;
+      // The structured counterpart of the prose horizon above. Gated on the
+      // server having actually observed a 429 on this result: the throttle
+      // families also fire for 401 cap-windows and legacy quota signals, and a
+      // `retryNotBefore` alone never implies a capacity 429 — that asymmetry is
+      // the whole reason the read side distrusts a bare hint.
+      const structuredProviderCapacityResetAt =
+        providerCapacityThrottleOverride &&
+        !providerCapacityResetAt &&
+        providerCapacityResetStatusEvidence?.statusCode === 429
+          ? canonicalizeAdapterCapacityResetInstant(adapterResult.retryNotBefore)
+          : null;
+      const persistedProviderCapacityResetAt =
+        providerCapacityResetAt ?? structuredProviderCapacityResetAt;
       const effectiveRetryNotBefore =
         adapterResult.retryNotBefore ?? providerCapacityResetAt?.toISOString() ?? null;
       let prReviewCompletionEvidence = outcome === "succeeded"
@@ -21941,22 +22271,39 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             } as Record<string, unknown>)
           : null;
 
+      const adapterResultJsonForPersistence = stripAdapterProviderCapacityResetMetadata(
+        adapterResult.resultJson,
+      );
       const persistedResultJson = mergeHeartbeatRunResultJson(
         mergeRunStopMetadataForAgent(agent, outcome, {
           resultJson: mergeModelProfileRunMetadata(
             mergeAdapterRecoveryMetadata({
               resultJson: {
-                ...parseObject(adapterResult.resultJson),
+                ...adapterResultJsonForPersistence,
                 configFreshness: configFreshnessResultMetadata,
-                // BLO-18278: keep the provenance of a prose-recovered horizon so
+                // BLO-18278: keep the provenance of the recovered horizon so
                 // the strand comment can name the reset instant, and so a wrong
                 // parse is debuggable from the persisted run rather than only
-                // from the raw log. Set here, inside `resultJson`, because
-                // mergeAdapterRecoveryMetadata only forwards errorFamily and
-                // retryNotBefore — any other key passed alongside them is
-                // dropped.
-                ...(providerCapacityResetAt
-                  ? { providerCapacityResetAt: providerCapacityResetAt.toISOString() }
+                // from the raw log. Adapter-owned capacity-reset fields were
+                // stripped above; the paired provenance discriminator below is
+                // written only by this server path, from either the prose
+                // parser or a 429-substantiated structured hint.
+                ...(persistedProviderCapacityResetAt
+                  ? {
+                      providerCapacityResetAt: persistedProviderCapacityResetAt.toISOString(),
+                      providerCapacityResetProvenance: {
+                        source: PROVIDER_CAPACITY_RESET_PROVENANCE_SOURCE,
+                        errorFamily: "rate_limit_exhausted",
+                        observedStatusCode: providerCapacityResetStatusEvidence?.statusCode ?? null,
+                        observedStatusField: providerCapacityResetStatusEvidence?.field ?? null,
+                        observedCause: rateLimitExhaustedOverride
+                          ? "rate_limit_exhausted"
+                          : "provider_throttled_no_progress",
+                        horizonSource: providerCapacityResetAt
+                          ? "server_prose_parse"
+                          : "adapter_structured_retry_not_before",
+                      },
+                    }
                   : {}),
                 ...(prReviewIncompleteOverride
                   ? {
@@ -22588,7 +22935,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             });
           }
           activeRunExecutions.delete(run.id);
-          externalRunReattachedAt.delete(run.id);
           // Skip dispatch when this run was cancelled. `cancelRunInternal`
           // already calls `startNextQueuedRunForAgent` when it cancels a run,
           // so the finally-block dispatch is a duplicate that races with the

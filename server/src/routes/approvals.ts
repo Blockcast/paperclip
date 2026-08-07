@@ -18,21 +18,25 @@ import {
   secretService,
 } from "../services/index.js";
 import { assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
-import { redactApprovalPayloadByType } from "../redaction.js";
+import { redactApprovalPayloadForDisplay } from "../redaction.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { resolveApprovalWithSideEffects } from "../services/approval-resolution.js";
 
-function redactApprovalPayload<T extends { type: string; payload: Record<string, unknown> }>(approval: T): T {
+function redactApprovalPayload<T extends { type: string; payload: Record<string, unknown> }>(
+  approval: T,
+): T & { redactedFields: string[] } {
+  const { payload, redactedFields } = redactApprovalPayloadForDisplay(approval.type, approval.payload);
   return {
     ...approval,
-    payload: redactApprovalPayloadByType(approval.type, approval.payload),
+    payload,
+    redactedFields,
   };
 }
 
 function approvalResolutionResponse<T extends { type: string; payload: Record<string, unknown> }>(
   approval: T,
   applied: boolean,
-): T & { applied: boolean } {
+): T & { redactedFields: string[]; applied: boolean } {
   return {
     ...redactApprovalPayload(approval),
     applied,

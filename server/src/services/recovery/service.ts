@@ -325,7 +325,17 @@ type ResolvedDependencyWakeBackstopOptions = {
 
 type LatestIssueRun = Pick<
   typeof heartbeatRuns.$inferSelect,
-  "id" | "agentId" | "status" | "error" | "errorCode" | "contextSnapshot" | "livenessState" | "resultJson" | "usageJson" | "createdAt"
+  | "id"
+  | "agentId"
+  | "status"
+  | "error"
+  | "errorCode"
+  | "contextSnapshot"
+  | "livenessState"
+  | "resultJson"
+  | "usageJson"
+  | "createdAt"
+  | "finishedAt"
 > | null;
 type SuccessfulLatestIssueRun = NonNullable<LatestIssueRun> & { status: "succeeded" };
 
@@ -460,23 +470,116 @@ function summarizeAgentCapabilities(agent: typeof agents.$inferSelect | null | u
 // the throttle fault (see parseProviderCapacityResetHorizon). Read from the
 // run's own resultJson so the strand comment can attribute the stall to the
 // provider window rather than to whatever terminal symptom got recorded last.
-// Returns the ISO string only when this really was a throttle family — a bare
-// `retryNotBefore` on some other family is not a capacity 429.
-function readProviderCapacityResetAt(run: NonNullable<LatestIssueRun>): string | null {
-  const resultJson = parseObject(run.resultJson);
-  const explicit = readNonEmptyString(resultJson.providerCapacityResetAt);
-  if (explicit) return explicit;
+//
+// `run.resultJson` starts as adapter-owned data, and summarizeRunFailureForIssueComment
+// interpolates selected fields into an issue comment other agents read. The
+// `providerCapacityResetAt` path is therefore trusted only when heartbeat
+// finalization also wrote the paired server provenance key after stripping any
+// adapter-supplied copy. Without that discriminator, a spoofed adapter result
+// could relabel an ordinary failure as a self-healing capacity window.
+const PROVIDER_CAPACITY_THROTTLE_FAMILIES = new Set(["rate_limit_exhausted", "provider_quota"]);
+const PROVIDER_CAPACITY_RESET_PROVENANCE_SOURCE = "server_parse_provider_capacity_horizon";
 
-  const family = readNonEmptyString(resultJson.errorFamily);
-  if (family !== "rate_limit_exhausted" && family !== "provider_quota") return null;
-  return (
-    readNonEmptyString(resultJson.retryNotBefore) ??
-    readNonEmptyString(resultJson.transientRetryNotBefore) ??
-    null
-  );
+// Full-string match — no surrounding prose, markdown, or newlines survive it.
+// Mirrors the shape parseProviderCapacityResetHorizon captures on the write side.
+const PROVIDER_CAPACITY_RESET_INSTANT_PATTERN =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
+
+// The horizon was advertised during the run that recorded it, and the write side
+// caps an accepted horizon at 24h past finalization. Bound the read lower side
+// by run creation and the upper side by run finish (falling back to creation)
+// so long-running jobs can still report a horizon parsed near the end.
+const PROVIDER_CAPACITY_RESET_MAX_SKEW_MS = 24 * 60 * 60 * 1000;
+
+type ProviderCapacityResetBounds = {
+  lowerBoundAt: Date | null;
+  upperBoundAt: Date | null;
+};
+
+function readCapacityResetBounds(run: NonNullable<LatestIssueRun>): ProviderCapacityResetBounds {
+  const createdAt = run.createdAt instanceof Date ? run.createdAt : null;
+  const finishedAt = run.finishedAt instanceof Date ? run.finishedAt : null;
+  return { lowerBoundAt: createdAt, upperBoundAt: finishedAt ?? createdAt };
 }
 
-export function summarizeRunFailureForIssueComment(run: LatestIssueRun) {
+function canonicalizeCapacityResetInstant(value: unknown, bounds: ProviderCapacityResetBounds): string | null {
+  const raw = readNonEmptyString(value)?.trim();
+  if (!raw) return null;
+  if (!PROVIDER_CAPACITY_RESET_INSTANT_PATTERN.test(raw)) return null;
+  const parsed = Date.parse(raw);
+  if (!Number.isFinite(parsed)) return null;
+
+  const lowerAnchor = bounds.lowerBoundAt?.getTime();
+  if (lowerAnchor !== undefined && Number.isFinite(lowerAnchor)) {
+    if (parsed < lowerAnchor - PROVIDER_CAPACITY_RESET_MAX_SKEW_MS) return null;
+  }
+  const upperAnchor = bounds.upperBoundAt?.getTime();
+  if (upperAnchor !== undefined && Number.isFinite(upperAnchor)) {
+    if (parsed > upperAnchor + PROVIDER_CAPACITY_RESET_MAX_SKEW_MS) return null;
+  }
+  return new Date(parsed).toISOString();
+}
+
+function normalizeHttpStatusCode(value: unknown): number | null {
+  const parsed =
+    typeof value === "number"
+      ? value
+      : typeof value === "string" && value.trim().length > 0
+        ? Number(value.trim())
+        : NaN;
+  if (!Number.isInteger(parsed) || parsed < 100 || parsed > 599) return null;
+  return parsed;
+}
+
+function readProviderCapacityResetProvenance(resultJson: Record<string, unknown>) {
+  const provenance = parseObject(resultJson.providerCapacityResetProvenance);
+  if (readNonEmptyString(provenance.source) !== PROVIDER_CAPACITY_RESET_PROVENANCE_SOURCE) {
+    return null;
+  }
+  const family = readNonEmptyString(provenance.errorFamily);
+  if (!family || !PROVIDER_CAPACITY_THROTTLE_FAMILIES.has(family)) return null;
+  return {
+    errorFamily: family,
+    observedStatusCode: normalizeHttpStatusCode(provenance.observedStatusCode),
+  };
+}
+
+type ProviderCapacityResetRead = {
+  resetAt: string;
+  // True only when the instant carries real 429-capacity provenance, i.e. the
+  // server's own `providerCapacityResetAt`, which finalization writes solely
+  // from parseProviderCapacityResetHorizon under a throttle override. A bare
+  // `retryNotBefore` does NOT qualify: `rate_limit_exhausted` is set by
+  // isRateLimitExhausted() for "429, 401-cap, or 'you've hit your limit' cap
+  // text" (heartbeat.ts), and `provider_quota` is a legacy adapter quota
+  // signal — neither implies a 429 capacity event, so neither may be reported
+  // as one.
+  is429Capacity: boolean;
+};
+
+function readProviderCapacityResetAt(
+  run: NonNullable<LatestIssueRun>,
+): ProviderCapacityResetRead | null {
+  const resultJson = parseObject(run.resultJson);
+
+  const family = readNonEmptyString(resultJson.errorFamily);
+  if (!family || !PROVIDER_CAPACITY_THROTTLE_FAMILIES.has(family)) return null;
+
+  const bounds = readCapacityResetBounds(run);
+
+  const provenance = readProviderCapacityResetProvenance(resultJson);
+  const explicit = provenance
+    ? canonicalizeCapacityResetInstant(resultJson.providerCapacityResetAt, bounds)
+    : null;
+  if (explicit) return { resetAt: explicit, is429Capacity: provenance?.observedStatusCode === 429 };
+
+  const advertised =
+    canonicalizeCapacityResetInstant(resultJson.retryNotBefore, bounds) ??
+    canonicalizeCapacityResetInstant(resultJson.transientRetryNotBefore, bounds);
+  return advertised ? { resetAt: advertised, is429Capacity: false } : null;
+}
+
+export function summarizeRunFailureForIssueComment(run: LatestIssueRun, now = Date.now()) {
   if (!run) return null;
 
   const errorCode = readNonEmptyString(run.errorCode)?.trim() ?? null;
@@ -488,15 +591,44 @@ export function summarizeRunFailureForIssueComment(run: LatestIssueRun) {
   // BackoffLimitExceeded — describes the symptom (the Job gave up) and reads
   // as an infrastructure fault, which repeatedly sent readers looking at the
   // cluster instead of at a provider window that had already reopened on its
-  // own. Naming the 429 and the instant is the difference between "our Job
+  // own. Naming the window and the instant is the difference between "our Job
   // broke" and "the provider was closed until 21:29:59Z".
-  const capacityResetAt = readProviderCapacityResetAt(run);
-  if (capacityResetAt) {
+  //
+  // Only the explicit server-parsed horizon may be called a 429: the throttle
+  // families also cover 401 cap-windows and legacy quota signals, so a bare
+  // advertised `retryNotBefore` gets the honest "rate-limit/quota window"
+  // phrasing instead of a status code we cannot substantiate.
+  //
+  // The horizon is also only load-bearing while it is still in the future.
+  // Recovery sweeps run on their own cadence and routinely read a run that
+  // failed hours earlier, so an unconditional present-tense "waiting on that
+  // reset … self-healing" tells agents to sit out a window that already
+  // reopened — the exact misdiagnosis this summary exists to prevent, pointed
+  // the other way.
+  //
+  // But an elapsed horizon is not proof the window reopened either. The instant
+  // is the provider's own estimate, and the write-side parser deliberately
+  // accepts tentative wording ("capacity may reset at …", "retry in …"); a
+  // throttle can be extended past the instant it advertised. So past the
+  // horizon we claim only that the horizon elapsed and that current capacity
+  // must be rechecked. Asserting "the cause is something after it" would trade
+  // one confident misdiagnosis for another — sending the reader hunting a new
+  // blocker while the original throttle is still the live one.
+  const capacityReset = readProviderCapacityResetAt(run);
+  if (capacityReset) {
     const suffix = errorCode ? ` (surfaced as \`${errorCode}\`)` : "";
-    return (
-      ` Latest retry failure: provider capacity throttle (429) — the provider advertised a capacity reset at ` +
-      `${capacityResetAt}${suffix}. This is transient and self-healing; the issue is waiting on that reset, not on a broken runtime.`
-    );
+    const cause = capacityReset.is429Capacity
+      ? `provider capacity throttle (429) — the provider advertised a capacity reset at ${capacityReset.resetAt}`
+      : `provider rate-limit/quota window — the provider advertised availability no earlier than ${capacityReset.resetAt}`;
+    const resetAtMs = Date.parse(capacityReset.resetAt);
+    const windowStillOpen = Number.isFinite(resetAtMs) && resetAtMs > now;
+    return windowStillOpen
+      ? ` Latest retry failure: ${cause}${suffix}. This is transient and self-healing; ` +
+          `the issue is waiting on that reset, not on a broken runtime.`
+      : ` Latest retry failure: ${cause}${suffix}. That advertised horizon has since elapsed, ` +
+          `but the provider only ever advertised it as an estimate and a throttle can be ` +
+          `extended past it — recheck current provider capacity before either waiting on this ` +
+          `window or diagnosing a different blocker.`;
   }
 
   // Prefer the JSON `"message": "..."` field if the error body is a JSON
@@ -1233,6 +1365,7 @@ export function recoveryService(
     resultJson: heartbeatRuns.resultJson,
     usageJson: heartbeatRuns.usageJson,
     createdAt: heartbeatRuns.createdAt,
+    finishedAt: heartbeatRuns.finishedAt,
   } as const;
 
   async function getLatestIssueRun(companyId: string, issueId: string): Promise<LatestIssueRun> {
@@ -1389,6 +1522,7 @@ export function recoveryService(
         resultJson: heartbeatRuns.resultJson,
         usageJson: heartbeatRuns.usageJson,
         createdAt: heartbeatRuns.createdAt,
+        finishedAt: heartbeatRuns.finishedAt,
       })
       .from(heartbeatRuns)
       .where(
@@ -1610,6 +1744,7 @@ export function recoveryService(
         resultJson: heartbeatRuns.resultJson,
         usageJson: heartbeatRuns.usageJson,
         createdAt: heartbeatRuns.createdAt,
+        finishedAt: heartbeatRuns.finishedAt,
       })
       .from(heartbeatRuns)
       .where(

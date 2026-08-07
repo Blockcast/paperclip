@@ -20,7 +20,10 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { authorizationService } from "../services/authorization.js";
+import {
+  authorizationService,
+  commentAuthorCanGrantIssueMention,
+} from "../services/authorization.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -165,6 +168,30 @@ async function grantUserPermission(
     grantedByUserId: "owner",
   });
 }
+
+describe("comment mention grant predicate", () => {
+  it("matches wake eligibility to the author identities that can grant issue access", () => {
+    const base = {
+      mentionedAgentId: "mentioned-agent",
+      issueAssigneeAgentId: "assignee-agent",
+      authorUserIsActiveMember: false,
+    };
+
+    expect(commentAuthorCanGrantIssueMention({
+      ...base,
+      authorAgentId: "unrelated-agent",
+    })).toBe(false);
+    expect(commentAuthorCanGrantIssueMention({
+      ...base,
+      authorAgentId: "assignee-agent",
+    })).toBe(true);
+    expect(commentAuthorCanGrantIssueMention({
+      ...base,
+      authorAgentId: null,
+      authorUserIsActiveMember: true,
+    })).toBe(true);
+  });
+});
 
 describeEmbeddedPostgres("authorization service", () => {
   let db!: ReturnType<typeof createDb>;
@@ -2009,7 +2036,7 @@ describeEmbeddedPostgres("authorization service", () => {
     })).resolves.toMatchObject({ allowed: false, reason: "deny_low_trust_boundary" });
   });
 
-  it("allows active board-user comments to create mention-scoped issue grants", async () => {
+  it("requires an active board-user membership for mention-scoped issue grants", async () => {
     const company = await createCompany(db, "MentionCommentBoardGrant");
     const allowedProject = await createProject(db, company.id, "MentionBoardAllowed");
     const targetProject = await createProject(db, company.id, "MentionBoardTarget");
@@ -2033,13 +2060,6 @@ describeEmbeddedPostgres("authorization service", () => {
       assigneeAgentId: ownerAgent.id,
     });
     const boardUserId = `user-${randomUUID()}`;
-    await db.insert(companyMemberships).values({
-      companyId: company.id,
-      principalType: "user",
-      principalId: boardUserId,
-      status: "active",
-      membershipRole: "member",
-    });
     await db.insert(issueComments).values({
       companyId: company.id,
       issueId: issue.id,
@@ -2057,7 +2077,22 @@ describeEmbeddedPostgres("authorization service", () => {
       status: issue.status,
     } as const;
 
-    await expect(authorizationService(db).decide({
+    const authorization = authorizationService(db);
+    await expect(authorization.decide({
+      actor,
+      action: "issue:comment",
+      resource,
+    })).resolves.toMatchObject({ allowed: false });
+
+    await db.insert(companyMemberships).values({
+      companyId: company.id,
+      principalType: "user",
+      principalId: boardUserId,
+      status: "active",
+      membershipRole: "member",
+    });
+
+    await expect(authorization.decide({
       actor,
       action: "issue:comment",
       resource,
@@ -2602,6 +2637,80 @@ describeEmbeddedPostgres("authorization service", () => {
     expect(decision).toMatchObject({
       allowed: false,
       reason: "deny_missing_grant",
+    });
+  });
+
+  it("does not grant a parent issue's assignee access to its descendant (BLO-19170)", async () => {
+    const company = await createCompany(db, "DescendantDoesNotInheritGrant");
+    const parentAssignee = await createAgent(db, company.id, { role: "engineer" });
+    const childAssignee = await createAgent(db, company.id, { role: "engineer" });
+    const parentIssue = await createIssue(db, company.id, {
+      title: "Parent assigned to the actor",
+      assigneeAgentId: parentAssignee.id,
+      createdByAgentId: parentAssignee.id,
+    });
+    const childIssue = await createIssue(db, company.id, {
+      title: "Child assigned to an unrelated agent",
+      parentId: parentIssue.id,
+      assigneeAgentId: childAssignee.id,
+      createdByAgentId: childAssignee.id,
+    });
+
+    const decision = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: parentAssignee.id, companyId: company.id, source: "agent_jwt" },
+      action: "issue:comment",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: childIssue.id,
+        parentIssueId: parentIssue.id,
+        assigneeAgentId: childAssignee.id,
+        createdByAgentId: childIssue.createdByAgentId,
+        status: childIssue.status,
+      },
+    });
+
+    expect(decision).toMatchObject({
+      allowed: false,
+      reason: "deny_missing_grant",
+    });
+  });
+
+  it("allows an actor to comment on its assigned sibling issue regardless of ancestry (BLO-19036)", async () => {
+    const company = await createCompany(db, "SiblingUsesTargetAssigneeGrant");
+    const actorAgent = await createAgent(db, company.id, { role: "engineer" });
+    const wakeTargetAssignee = await createAgent(db, company.id, { role: "engineer" });
+    const parentIssue = await createIssue(db, company.id, { title: "Shared parent" });
+    await createIssue(db, company.id, {
+      title: "Wake target sibling",
+      parentId: parentIssue.id,
+      assigneeAgentId: wakeTargetAssignee.id,
+      createdByAgentId: wakeTargetAssignee.id,
+    });
+    const assignedSibling = await createIssue(db, company.id, {
+      title: "Sibling assigned to the actor",
+      parentId: parentIssue.id,
+      assigneeAgentId: actorAgent.id,
+      createdByAgentId: wakeTargetAssignee.id,
+    });
+
+    const decision = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: actorAgent.id, companyId: company.id, source: "agent_jwt" },
+      action: "issue:comment",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: assignedSibling.id,
+        parentIssueId: parentIssue.id,
+        assigneeAgentId: actorAgent.id,
+        createdByAgentId: assignedSibling.createdByAgentId,
+        status: assignedSibling.status,
+      },
+    });
+
+    expect(decision).toMatchObject({
+      allowed: true,
+      reason: "allow_self",
     });
   });
 
