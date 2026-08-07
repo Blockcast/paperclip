@@ -60,6 +60,42 @@ describeEmbeddedPostgres("wake idempotency receipts", () => {
     });
   }
 
+  it.each([
+    "queued",
+    "deferred_issue_execution",
+    "claimed",
+    "coalesced",
+    "completed",
+    "dispatch_recovered",
+  ])(
+    "treats an accepted wake in state %s as a receipt",
+    async (status) => {
+      await seed();
+      // Membership is decided by "was this delivery accepted?", not "did it
+      // finish?". Every state here is reached only after the wake was honoured,
+      // so a reclaimed comment effect that re-checked the key must find a
+      // receipt and skip its non-idempotent wake sink.
+      //
+      // `claimed` (accepted, executing) and `coalesced` (accepted, merged into
+      // a live run) are the two that were missing. `coalesced` is written with
+      // this key AND the surviving runId, so the wake demonstrably happened —
+      // it is a receipt, not a failure, and an earlier revision of this suite
+      // wrongly asserted the opposite alongside `failed`.
+      //
+      // `dispatch_recovered` is the same class: the inline dispatch failed and
+      // reconciliation re-delivered it, so a run exists for this key.
+      await insertWake(status, `issue_comment:${status}:assignee:a1`);
+
+      const receipt = await findWakeIdempotencyReceipt(db as never, {
+        companyId,
+        idempotencyKey: `issue_comment:${status}:assignee:a1`,
+      });
+      expect(receipt).not.toBeNull();
+      expect(receipt!.status).toBe(status);
+    },
+    60_000,
+  );
+
   it("treats a COMPLETED wake as a receipt, not just a pending one", async () => {
     await seed();
     // This is the property the comment-effect wake sink depends on. Live
@@ -76,21 +112,26 @@ describeEmbeddedPostgres("wake idempotency receipts", () => {
     expect(receipt!.status).toBe("completed");
   }, 60_000);
 
-  it("does not treat a superseded or failed wake as a receipt", async () => {
+  it("does not treat an undelivered wake as a receipt", async () => {
     await seed();
     // A wake that never took effect must NOT suppress a retry, otherwise the
-    // guard would convert a lost wake into a permanently missing one.
+    // guard would convert a lost wake into a permanently missing one — a worse
+    // failure than a duplicate. This is the boundary that keeps the receipt list
+    // from being widened into a silent wake-suppressor.
     await insertWake("failed", "issue_comment:c2:assignee:a1");
-    await insertWake("coalesced", "issue_comment:c3:assignee:a1");
+    await insertWake("dispatch_failed", "issue_comment:c2b:assignee:a1");
+    await insertWake("dispatch_failed_exhausted", "issue_comment:c2c:assignee:a1");
 
-    expect(await findWakeIdempotencyReceipt(db as never, {
-      companyId,
-      idempotencyKey: "issue_comment:c2:assignee:a1",
-    })).toBeNull();
-    expect(await findWakeIdempotencyReceipt(db as never, {
-      companyId,
-      idempotencyKey: "issue_comment:c3:assignee:a1",
-    })).toBeNull();
+    for (const key of [
+      "issue_comment:c2:assignee:a1",
+      "issue_comment:c2b:assignee:a1",
+      "issue_comment:c2c:assignee:a1",
+    ]) {
+      expect(await findWakeIdempotencyReceipt(db as never, {
+        companyId,
+        idempotencyKey: key,
+      })).toBeNull();
+    }
   }, 60_000);
 
   it("scopes receipts to the company and the exact key", async () => {

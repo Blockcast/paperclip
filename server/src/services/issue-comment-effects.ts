@@ -110,23 +110,31 @@ export async function hasCommentEffects(db: Db, commentId: string): Promise<bool
  * expired lease (its previous owner died). Returns null when another live
  * claim holds the row — the caller must then skip it rather than run it, which
  * is what stops two concurrent same-key requests from double-executing.
+ *
+ * Both the stamped lease and the expiry predicate come from database `now()`,
+ * never from this process's clock. Mixing the two is not cosmetic: with the
+ * local clock running ahead, a replica evaluates `claimExpiresAt < now` against
+ * a *future* instant and reclaims a lease another replica is still holding,
+ * running the same non-idempotent sink concurrently; running behind, it defers
+ * recovery of a genuinely dead owner. Because every lease is written and read
+ * in database time, the comparison is skew-free no matter how many replicas
+ * race here.
  */
 export async function claimEffect(
   db: Db,
   effectId: string,
   leaseMs: number = DEFAULT_CLAIM_LEASE_MS,
 ): Promise<CommentEffectRow | null> {
-  const now = new Date();
   const claimToken = randomUUID();
   const rows = await db
     .update(issueCommentEffects)
     .set({
       status: "processing",
       claimToken,
-      claimedAt: now,
-      claimExpiresAt: new Date(now.getTime() + leaseMs),
+      claimedAt: sql`now()`,
+      claimExpiresAt: sql`now() + make_interval(secs => ${leaseMs / 1000})`,
       attempts: sql`${issueCommentEffects.attempts} + 1`,
-      updatedAt: now,
+      updatedAt: sql`now()`,
     })
     .where(
       and(
@@ -135,7 +143,7 @@ export async function claimEffect(
           eq(issueCommentEffects.status, "queued"),
           and(
             eq(issueCommentEffects.status, "processing"),
-            lt(issueCommentEffects.claimExpiresAt, now),
+            lt(issueCommentEffects.claimExpiresAt, sql`now()`),
           ),
         ),
       ),
@@ -312,12 +320,15 @@ export async function markCommentProcessedIfSettled(db: Db, commentId: string): 
  * Comments whose effects are still outstanding and are due for another attempt
  * — i.e. `queued`, or `processing` past its lease. This is the reconciler's
  * work list; it is what turns a crashed request into eventual completion.
+ *
+ * The lease predicate uses database `now()`, matching `claimEffect`: a
+ * reconciler on a fast-running clock would otherwise hand itself work whose
+ * lease is still live, then lose the claim CAS and burn the attempt.
  */
 export async function listCommentsWithResumableEffects(
   db: Db,
   limit: number,
 ): Promise<string[]> {
-  const now = new Date();
   const rows = await db
     .selectDistinct({ commentId: issueCommentEffects.commentId })
     .from(issueCommentEffects)
@@ -326,7 +337,7 @@ export async function listCommentsWithResumableEffects(
         eq(issueCommentEffects.status, "queued"),
         and(
           eq(issueCommentEffects.status, "processing"),
-          lt(issueCommentEffects.claimExpiresAt, now),
+          lt(issueCommentEffects.claimExpiresAt, sql`now()`),
         ),
       ),
     )
