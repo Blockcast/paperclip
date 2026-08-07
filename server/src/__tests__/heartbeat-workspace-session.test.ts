@@ -60,6 +60,7 @@ import {
   shouldResetTaskSessionForWake,
   type ResolvedWorkspaceForRunSuccess,
 } from "../services/heartbeat.js";
+import { applyRunScopeToBranchName } from "../services/workspace-runtime.js";
 import type { TrustPresetResolution } from "../services/trust-preset-resolver.js";
 
 const execFile = promisify(execFileCallback);
@@ -4075,5 +4076,66 @@ describe("parseSessionCompactionPolicy", () => {
       maxSessionAgeHours: 0,
       maxConsecutiveFailedResumes: 5,
     });
+  });
+});
+
+// BLO-19063: the reuse path is the half of per-run isolation that PR #1143 did
+// not close. #1143 derives a run-scoped branch inside realizeExecutionWorkspace;
+// heartbeat then pins the issue to `reuse_existing`, and the restore path never
+// calls realize again. So the run token got derived once and frozen, and every
+// later run of that issue silently landed back in the first run's tree while the
+// config still read as per-run isolation.
+describe("BLO-19063 per_run scope refuses workspace restore", () => {
+  const perRunSettings = { mode: "isolated_workspace", workspaceStrategy: { type: "git_worktree", runScope: "per_run" } };
+  const perIssueSettings = { mode: "isolated_workspace", workspaceStrategy: { type: "git_worktree", runScope: "per_issue" } };
+
+  it("refuses to restore a per_run workspace even when the issue is already pinned to reuse_existing", () => {
+    const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({
+      issueExecutionWorkspaceId: "workspace-run-1",
+      issueExecutionWorkspacePreference: "reuse_existing",
+      existingExecutionWorkspaceStatus: "active",
+      issueExecutionWorkspaceSettings: perRunSettings,
+    });
+
+    // The whole point: a live, healthy, pinned workspace is still refused, so
+    // provisioning falls through to realizeExecutionWorkspace and the next run
+    // derives its own branch. Rescuing already-pinned issues matters because the
+    // pin outlives the config change that introduced per_run.
+    expect(reuseRequest.requestedShouldReuseExisting).toBe(false);
+    expect(reuseRequest.existingExecutionWorkspaceAvailable).toBe(false);
+  });
+
+  it.each([
+    { name: "per_issue scope", settings: perIssueSettings },
+    { name: "no workspace settings", settings: null },
+    { name: "settings without a strategy", settings: { mode: "isolated_workspace" } },
+  ])("still restores under $name, so shared_workspace stays default-safe", ({ settings }) => {
+    // AC4: this must not become a forced fleet-wide migration. Anything that did
+    // not explicitly opt into per_run keeps the pre-existing restore behaviour.
+    const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({
+      issueExecutionWorkspaceId: "workspace-old",
+      issueExecutionWorkspacePreference: "reuse_existing",
+      existingExecutionWorkspaceStatus: "active",
+      issueExecutionWorkspaceSettings: settings,
+    });
+
+    expect(reuseRequest.requestedShouldReuseExisting).toBe(true);
+    expect(reuseRequest.existingExecutionWorkspaceAvailable).toBe(true);
+  });
+
+  it("gives two runs of the SAME issue distinct, non-nested branches once restore is refused", () => {
+    // AC2, the vector #1143 alone did not close: same issue, two live runs.
+    // Refusing restore is only useful if what follows actually differs, so
+    // assert the realized branch names rather than just the boolean.
+    const issueBranch = "blo-19063-per-run-execution-workspaces";
+    const runA = applyRunScopeToBranchName(issueBranch, "per_run", "e60e672e-d7c6-48a9-bace-4e556ad9f106");
+    const runB = applyRunScopeToBranchName(issueBranch, "per_run", "1b716005-cdb1-4b3a-9667-16c74ba8c1a5");
+
+    expect(runA).not.toEqual(runB);
+    // Neither is a prefix of the other: worktree paths are join(parent, branch),
+    // so a prefix relationship would still be a nesting hazard.
+    expect(runA.startsWith(runB)).toBe(false);
+    expect(runB.startsWith(runA)).toBe(false);
+    expect(runA.startsWith(issueBranch)).toBe(true);
   });
 });

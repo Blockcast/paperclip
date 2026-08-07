@@ -5670,14 +5670,43 @@ export type ExecutionWorkspaceReuseRequestForIssue = {
   existingExecutionWorkspaceAvailable: boolean;
 };
 
+/**
+ * BLO-19063: does the issue's persisted workspace settings ask for `per_run` scope?
+ *
+ * Read straight off the persisted settings rather than the parsed strategy so
+ * this stays usable from the reuse decision, which runs before any strategy is
+ * resolved.
+ */
+function issueWorkspaceSettingsRequestPerRunScope(settings: unknown): boolean {
+  if (!settings || typeof settings !== "object") return false;
+  const strategy = (settings as { workspaceStrategy?: unknown }).workspaceStrategy;
+  if (!strategy || typeof strategy !== "object") return false;
+  return (strategy as { runScope?: unknown }).runScope === "per_run";
+}
+
 export function resolveExecutionWorkspaceReuseRequestForIssue(input: {
   issueExecutionWorkspaceId?: string | null;
   issueExecutionWorkspacePreference?: string | null;
   existingExecutionWorkspaceStatus?: string | null;
+  issueExecutionWorkspaceSettings?: unknown;
 }): ExecutionWorkspaceReuseRequestForIssue {
   const requestedExecutionWorkspaceId = readNonEmptyString(input.issueExecutionWorkspaceId);
+  // BLO-19063: a `per_run` workspace must never be restored.
+  //
+  // Restoring is exactly what makes run 2+ skip realizeExecutionWorkspace, and
+  // realization is the only place applyRunScopeToBranchName runs. So a restored
+  // `per_run` workspace hands the second run the *first* run's tree while the
+  // config still reads as per-run isolation — isolation that looks configured
+  // and delivers none, which is worse than not offering the mode at all.
+  //
+  // Checked against the persisted settings rather than only where the
+  // preference is written, so issues already pinned to `reuse_existing` before
+  // per_run was configured are rescued too instead of staying shared forever.
+  const perRunScopeForbidsReuse = issueWorkspaceSettingsRequestPerRunScope(input.issueExecutionWorkspaceSettings);
   const requestedShouldReuseExisting =
-    input.issueExecutionWorkspacePreference === "reuse_existing" && requestedExecutionWorkspaceId !== null;
+    !perRunScopeForbidsReuse &&
+    input.issueExecutionWorkspacePreference === "reuse_existing" &&
+    requestedExecutionWorkspaceId !== null;
 
   return {
     requestedExecutionWorkspaceId,
@@ -21224,6 +21253,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       issueExecutionWorkspaceId: requestedExecutionWorkspaceId,
       issueExecutionWorkspacePreference: issueRef?.executionWorkspacePreference ?? null,
       existingExecutionWorkspaceStatus: existingExecutionWorkspace?.status ?? null,
+      issueExecutionWorkspaceSettings: issueExecutionWorkspaceSettings,
     });
     const requestedShouldReuseExisting = workspaceReuseRequest.requestedShouldReuseExisting;
     const reusableExistingExecutionWorkspace = workspaceReuseRequest.existingExecutionWorkspaceAvailable
@@ -21895,10 +21925,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
     if (issueId && persistedExecutionWorkspace) {
       const nextIssueWorkspaceMode = issueExecutionWorkspaceModeForPersistedWorkspace(persistedExecutionWorkspace.mode);
+      // BLO-19063: never pin a `per_run` issue to `reuse_existing`. The pin is
+      // what routes later runs down the restore path, and the restore path
+      // never re-realizes, so the run token would be derived once and then
+      // frozen. resolveExecutionWorkspaceReuseRequestForIssue already refuses
+      // to honour such a pin; not writing it keeps the persisted state honest
+      // rather than relying on that guard to paper over a contradiction.
       const shouldSwitchIssueToExistingWorkspace =
-        issueRef?.executionWorkspacePreference === "reuse_existing" ||
-        requestedExecutionWorkspaceMode === "isolated_workspace" ||
-        requestedExecutionWorkspaceMode === "operator_branch";
+        !issueWorkspaceSettingsRequestPerRunScope(issueExecutionWorkspaceSettings) &&
+        (issueRef?.executionWorkspacePreference === "reuse_existing" ||
+          requestedExecutionWorkspaceMode === "isolated_workspace" ||
+          requestedExecutionWorkspaceMode === "operator_branch");
       const nextIssuePatch: Record<string, unknown> = {};
       if (issueRef?.executionWorkspaceId !== persistedExecutionWorkspace.id) {
         nextIssuePatch.executionWorkspaceId = persistedExecutionWorkspace.id;
@@ -26383,6 +26420,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             issueExecutionWorkspaceId: issue.executionWorkspaceId,
             issueExecutionWorkspacePreference: issue.executionWorkspacePreference,
             existingExecutionWorkspaceStatus,
+            issueExecutionWorkspaceSettings: issue.executionWorkspaceSettings,
           });
           const hasResolvablePriorSessionWorkspace = await resolveHasResolvablePriorSessionWorkspace();
 
