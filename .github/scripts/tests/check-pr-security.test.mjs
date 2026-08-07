@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   buildAdvisoryPayload,
   buildSecurityCheckRunOutput,
+  formatCheckRunFlagList,
   findExistingDraftAdvisory,
   postFlaggedSecurityResult,
   postSecurityCheckRun,
@@ -229,11 +230,12 @@ test('postSecurityCheckRun: links the advisory when the sync succeeded', async (
   });
 });
 
-test('postSecurityCheckRun: never claims an advisory was filed when the sync failed, and inlines the flags', async () => {
+test('postSecurityCheckRun: reports unknown advisory state and inlines redacted flags when sync failed', async () => {
   const calls = [];
+  const detectedToken = 'sk-abcdefghijklmnopqrstuvwxyz123456';
   const flags = [
     { check: 'ci-tampering', file: '.github/workflows/pr.yml' },
-    { check: 'secret-scan', file: 'src/config.ts', pattern: 'OpenAI API key' },
+    { check: 'secret-scan', file: 'src/config.ts', pattern: 'OpenAI API key', line: `+const token = "${detectedToken}"` },
   ];
 
   await postSecurityCheckRun(async (path, token, options) => {
@@ -253,10 +255,12 @@ test('postSecurityCheckRun: never claims an advisory was filed when the sync fai
     `summary must not claim an advisory was filed: ${body.output.summary}`,
   );
   assert.ok(body.output.summary.includes('403'), 'summary should surface the failure reason');
+  assert.ok(body.output.summary.includes('advisory state is unknown'));
   assert.ok(body.output.text.includes('ci-tampering'), 'flags must be inlined in output.text');
   assert.ok(body.output.text.includes('.github/workflows/pr.yml'));
   assert.ok(body.output.text.includes('secret-scan'));
   assert.ok(body.output.text.includes('OpenAI API key'));
+  assert.ok(!body.output.text.includes(detectedToken), 'check-run output must not disclose captured secret values');
 });
 
 test('postSecurityCheckRun: still inlines flags and stays truthful when no advisory sync was attempted', async () => {
@@ -318,6 +322,38 @@ test('postFlaggedSecurityResult: advisory budget expiry still posts the check-ru
   assert.ok(calls.some(path => path.endsWith('/check-runs')), 'check-run must be attempted after advisory timeout');
 });
 
+test('postFlaggedSecurityResult: advisory POST that commits before abort reports unknown state', async () => {
+  let advisoryCommitted = false;
+  let checkRunBody;
+  const fakeFetch = async (path, _token, options = {}) => {
+    if (path.includes('/security-advisories?state=draft')) return [];
+    if (path.endsWith('/security-advisories')) {
+      advisoryCommitted = true;
+      const error = new Error('request aborted after server commit');
+      error.name = 'AbortError';
+      throw error;
+    }
+    if (path.endsWith('/check-runs')) {
+      checkRunBody = JSON.parse(options.body);
+      return { ok: true };
+    }
+    throw new Error(`unexpected path: ${path}`);
+  };
+
+  await postFlaggedSecurityResult(
+    fakeFetch,
+    'token',
+    'paperclipai/paperclip',
+    { number: 6469, title: 'My PR', head: { sha: 'deadbeef' } },
+    [{ check: 'ci-tampering', file: '.github/workflows/pr.yml' }],
+    1_000,
+  );
+
+  assert.equal(advisoryCommitted, true);
+  assert.ok(checkRunBody.output.summary.includes('advisory state is unknown'));
+  assert.ok(!checkRunBody.output.summary.includes('was **not** created'));
+});
+
 // ── buildSecurityCheckRunOutput ─────────────────────────────────────────────
 
 test('buildSecurityCheckRunOutput: 403 advisory failure never asserts an advisory exists', () => {
@@ -329,6 +365,18 @@ test('buildSecurityCheckRunOutput: 403 advisory failure never asserts an advisor
 
   assert.ok(!output.summary.includes('Draft advisory filed'));
   assert.ok(output.text.includes('ci-tampering'));
+});
+
+test('formatCheckRunFlagList: bounds oversized output and reports omitted findings', () => {
+  const flags = Array.from({ length: 1_000 }, (_, index) => ({
+    check: 'sensitive-path',
+    file: `server/src/routes/${index}-${'x'.repeat(900)}.ts`,
+  }));
+
+  const text = formatCheckRunFlagList(flags);
+
+  assert.ok(text.length <= 60_000, `check-run text is ${text.length} characters`);
+  assert.match(text, /\d+ finding\(s\) omitted due to check-run output limits/);
 });
 
 test('validateSensitivePaths: checks paths against the resolved base ref instead of master', async () => {

@@ -201,6 +201,40 @@ export function formatFlagList(flags) {
   ].join('')).join('\n');
 }
 
+const CHECK_RUN_TEXT_MAX_LENGTH = 60_000;
+const CHECK_RUN_FLAG_MAX_LENGTH = 1_000;
+
+function formatCheckRunFlag(flag) {
+  return [
+    `- \`${flag.check}\`: ${flag.file ?? ''}`,
+    flag.pattern ? ` (pattern: ${flag.pattern})` : '',
+    flag.packages ? ` (packages: ${flag.packages.join(', ')})` : '',
+  ].join('').slice(0, CHECK_RUN_FLAG_MAX_LENGTH);
+}
+
+export function formatCheckRunFlagList(flags) {
+  const header = '**Flags:**\n\n';
+  const lines = [];
+
+  for (const flag of flags) {
+    const line = formatCheckRunFlag(flag);
+    const omitted = flags.length - lines.length - 1;
+    const suffix = omitted > 0 ? `\n\n_${omitted} finding(s) omitted due to check-run output limits._` : '';
+    const candidate = `${header}${[...lines, line].join('\n')}${suffix}`;
+    if (candidate.length > CHECK_RUN_TEXT_MAX_LENGTH) break;
+    lines.push(line);
+  }
+
+  let text;
+  do {
+    const omitted = flags.length - lines.length;
+    const suffix = omitted > 0 ? `\n\n_${omitted} finding(s) omitted due to check-run output limits._` : '';
+    text = `${header}${lines.join('\n')}${suffix}`;
+    if (text.length > CHECK_RUN_TEXT_MAX_LENGTH) lines.pop();
+  } while (text.length > CHECK_RUN_TEXT_MAX_LENGTH);
+  return text;
+}
+
 export function buildAdvisoryPayload(prNumber, prTitle, flags) {
   const checkNames = [...new Set(flags.map(f => f.check))].join(', ');
   return {
@@ -283,7 +317,7 @@ export async function findExistingDraftAdvisory(fetchImpl, token, repo, prNumber
 // `advisoryResult` describes what actually happened to the draft-advisory sync
 // so the check-run never asserts an advisory exists when it doesn't:
 //   { ok: true, url }     — advisory created/updated; link it
-//   { ok: false, error }  — sync failed; the flags below are the only durable record
+//   { ok: false, error }  — sync failed; advisory state may be unknown
 //   null                  — no advisory was attempted at all
 export function buildSecurityCheckRunOutput(hasFlags, flags = [], advisoryResult = null) {
   if (!hasFlags) {
@@ -301,13 +335,13 @@ export function buildSecurityCheckRunOutput(hasFlags, flags = [], advisoryResult
   }
 
   const advisoryNote = advisoryResult
-    ? `Draft advisory sync failed (${advisoryResult.error}) — the advisory was **not** created.`
+    ? `Draft advisory sync failed (${advisoryResult.error}) — advisory state is unknown.`
     : 'No draft advisory was created.';
 
   return {
     title: 'Security Review Recommended',
     summary: `${flags.length} security flag(s) detected. ${advisoryNote} Findings are inlined below. Not a merge block.`,
-    text: `**Flags:**\n\n${formatFlagList(flags)}`,
+    text: formatCheckRunFlagList(flags),
   };
 }
 
