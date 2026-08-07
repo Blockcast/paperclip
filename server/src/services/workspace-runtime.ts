@@ -10,6 +10,7 @@ import type { Db } from "@paperclipai/db";
 import { executionWorkspaces, issueComments, issues, projectWorkspaces, workspaceRuntimeServices } from "@paperclipai/db";
 import {
   listWorkspaceServiceCommandDefinitions,
+  type ExecutionWorkspaceRunScope,
   type GitWorktreeBranchAncestryVerdict,
   type GitWorktreeBranchIncoherenceEvidence as SharedGitWorktreeBranchIncoherenceEvidence,
   type GitWorktreeInProgressOperation,
@@ -626,6 +627,50 @@ export function applyIssueIdentifierToBranchName(
 
 function isAbsolutePath(value: string) {
   return path.isAbsolute(value) || value.startsWith("~");
+}
+
+/** Width of the hex run token appended to per-run branch names. */
+const RUN_SCOPE_TOKEN_LENGTH = 8;
+/** Keep the composed name inside sanitizeBranchName's 120-char ceiling. */
+const BRANCH_NAME_MAX_LENGTH = 120;
+
+/**
+ * BLO-19063: derive a run-scoped branch name so that two concurrent runs never
+ * share a working tree.
+ *
+ * Worktrees are keyed by branch name (`worktreePath = join(parentDir, branch)`),
+ * so making the branch run-unique makes the *path* run-unique for free. It also
+ * keeps `git worktree add` legal: git refuses to check the same branch out
+ * twice, so a per-run tree genuinely requires a per-run branch, not just a
+ * per-run directory.
+ *
+ * The issue identifier is preserved verbatim in the result, so the BLO-9117
+ * ref-linking guarantee (see applyIssueIdentifierToBranchName) still holds — the
+ * token is appended, never substituted. Returns `branchName` unchanged for
+ * `per_issue` scope or when no run id is available, which is what keeps this
+ * opt-in rather than a fleet-wide migration.
+ */
+export function applyRunScopeToBranchName(
+  branchName: string,
+  runScope: ExecutionWorkspaceRunScope | null | undefined,
+  heartbeatRunId: string | null | undefined,
+): string {
+  if (runScope !== "per_run") return branchName;
+  const token = sanitizeBranchName(heartbeatRunId ?? "")
+    .replace(/-/g, "")
+    .slice(0, RUN_SCOPE_TOKEN_LENGTH)
+    .toLowerCase();
+  // No usable run id (e.g. a non-heartbeat realize path): fall back to the
+  // issue-scoped name rather than inventing a token, which would strand a tree
+  // nothing can find again.
+  if (!token) return branchName;
+  const suffix = `-r${token}`;
+  const base = branchName.slice(0, BRANCH_NAME_MAX_LENGTH - suffix.length);
+  return sanitizeBranchName(`${base}${suffix}`);
+}
+
+function resolveExecutionWorkspaceRunScope(raw: unknown): ExecutionWorkspaceRunScope {
+  return asString(raw, "") === "per_run" ? "per_run" : "per_issue";
 }
 
 function resolveConfiguredPath(value: string, baseDir: string): string {
@@ -3648,7 +3693,15 @@ export async function realizeExecutionWorkspace(input: {
   // Option (A) (BLO-9117): process-enforce the issue identifier into the branch
   // name so a merged PR reliably ref-links at merge time. See
   // applyIssueIdentifierToBranchName.
-  let branchName = applyIssueIdentifierToBranchName(renderedBranch, input.issue?.identifier ?? null);
+  //
+  // BLO-19063: then, under `runScope: "per_run"`, append a run token so two
+  // concurrent runs of this issue land in different trees instead of sharing
+  // one. Applied after the identifier step so the identifier survives.
+  let branchName = applyRunScopeToBranchName(
+    applyIssueIdentifierToBranchName(renderedBranch, input.issue?.identifier ?? null),
+    resolveExecutionWorkspaceRunScope(rawStrategy.runScope),
+    input.heartbeatRunId ?? null,
+  );
   const configuredParentDir = asString(rawStrategy.worktreeParentDir, "");
   const worktreeParentDir = configuredParentDir
     ? resolveConfiguredPath(configuredParentDir, repoRoot)
