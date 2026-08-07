@@ -457,6 +457,66 @@ describe("githubHasReviewerEvidenceForPr", () => {
     });
   });
 
+  it("BLO-22574: rejects a forged consolidated comment from a non-reviewer author at the exact head", async () => {
+    setCreds();
+    // The comment surface is matched on a prose heading, so identity is the
+    // only thing standing between it and a forgery. An arbitrary actor who can
+    // comment on the PR reproduces the canonical body and the exact-head
+    // attestation verbatim; it must still not count as review evidence.
+    stubGithub({
+      reviews: [],
+      comments: [
+        {
+          user: { login: "someone-else" },
+          body: `## Ally — Consolidated PR Review\n\nReviewed head: ${headSha}\n\nNo findings.`,
+        },
+      ],
+    });
+    await expect(githubHasReviewerEvidenceForPr({ repoFullName, prNumber, headSha })).resolves.toEqual({
+      found: false,
+    });
+  });
+
+  it("BLO-22574: rejects a forged consolidated comment from the same-slug user seat", async () => {
+    setCreds();
+    // The user-seat login `allyblockcast` is a DIFFERENT actor from the App
+    // `allyblockcast[bot]`, and `githubReviewerIdentityMatches` accepts only
+    // `<slug>[bot]` / `app/<slug>`. So the seat is credited on NEITHER surface,
+    // whatever the review state: see the sibling case above asserting that even
+    // an APPROVED seat review at the exact head does not satisfy this gate.
+    stubGithub({
+      reviews: [],
+      comments: [
+        {
+          user: { login: "allyblockcast" },
+          body: `## Ally — Consolidated PR Review\n\nReviewed head: ${headSha}\n\nNo findings.`,
+        },
+      ],
+    });
+    await expect(githubHasReviewerEvidenceForPr({ repoFullName, prNumber, headSha })).resolves.toEqual({
+      found: false,
+    });
+  });
+
+  it("BLO-22574: rejects a canonical bot comment whose attestation is a truncated SHA", async () => {
+    setCreds();
+    // A malformed attestation must be distinguishable from a valid one and fail
+    // closed: a short SHA does not prove which tree was reviewed, so crediting
+    // it would satisfy the gate on unproven evidence.
+    stubGithub({
+      reviews: [],
+      comments: [
+        {
+          user: { login: "allyblockcast[bot]" },
+          body: `## Ally — Consolidated PR Review\n\nReviewed head: ${headSha.slice(0, 8)}\n\nNo findings.`,
+        },
+      ],
+    });
+    await expect(githubHasReviewerEvidenceForPr({ repoFullName, prNumber, headSha })).resolves.toEqual({
+      found: false,
+    });
+  });
+
   it("accepts the App-prefixed reviewer identity variant", async () => {
     setCreds();
     stubGithub({
