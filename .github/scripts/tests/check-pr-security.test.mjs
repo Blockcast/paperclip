@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   buildAdvisoryPayload,
+  buildSecurityCheckRunOutput,
   findExistingDraftAdvisory,
   postSecurityCheckRun,
   scanSecrets,
@@ -200,27 +201,109 @@ test('syncDraftAdvisory: creates a new advisory when none exists', async () => {
   assert.deepEqual(JSON.parse(calls[1].options.body), buildAdvisoryPayload(6469, 'My PR', flags));
 });
 
-test('postSecurityCheckRun: uses the injected fetch implementation', async () => {
+test('postSecurityCheckRun: links the advisory when the sync succeeded', async () => {
   const calls = [];
 
   await postSecurityCheckRun(async (path, token, options) => {
     calls.push({ path, token, options });
     return { ok: true };
-  }, 'token', 'paperclipai/paperclip', 'deadbeef', true);
+  }, 'token', 'paperclipai/paperclip', 'deadbeef', true, {
+    flags: [{ check: 'ci-tampering', file: '.github/workflows/pr.yml' }],
+    advisoryResult: { ok: true, url: 'https://github.com/paperclipai/paperclip/security/advisories/GHSA-test-1234' },
+  });
 
   assert.equal(calls.length, 1);
   assert.equal(calls[0].path, '/repos/paperclipai/paperclip/check-runs');
   assert.equal(calls[0].options.method, 'POST');
-  assert.deepEqual(JSON.parse(calls[0].options.body), {
+  const body = JSON.parse(calls[0].options.body);
+  assert.deepEqual(body, {
     name: 'security-review',
     head_sha: 'deadbeef',
     status: 'completed',
     conclusion: 'neutral',
     output: {
       title: 'Security Review Recommended',
-      summary: 'Draft advisory filed for maintainer review. Not a merge block — review the advisory at your leisure.',
+      summary: 'Draft advisory filed for maintainer review: https://github.com/paperclipai/paperclip/security/advisories/GHSA-test-1234. Not a merge block — review the advisory at your leisure.',
     },
   });
+});
+
+test('postSecurityCheckRun: never claims an advisory was filed when the sync failed, and inlines the flags', async () => {
+  const calls = [];
+  const flags = [
+    { check: 'ci-tampering', file: '.github/workflows/pr.yml' },
+    { check: 'secret-scan', file: 'src/config.ts', pattern: 'OpenAI API key' },
+  ];
+
+  await postSecurityCheckRun(async (path, token, options) => {
+    calls.push({ path, token, options });
+    return { ok: true };
+  }, 'token', 'paperclipai/paperclip', 'deadbeef', true, {
+    flags,
+    advisoryResult: { ok: false, error: '403: Resource not accessible by integration' },
+  });
+
+  assert.equal(calls.length, 1);
+  const body = JSON.parse(calls[0].options.body);
+
+  assert.equal(body.conclusion, 'neutral', 'must still never block merge');
+  assert.ok(
+    !body.output.summary.includes('Draft advisory filed'),
+    `summary must not claim an advisory was filed: ${body.output.summary}`,
+  );
+  assert.ok(body.output.summary.includes('403'), 'summary should surface the failure reason');
+  assert.ok(body.output.text.includes('ci-tampering'), 'flags must be inlined in output.text');
+  assert.ok(body.output.text.includes('.github/workflows/pr.yml'));
+  assert.ok(body.output.text.includes('secret-scan'));
+  assert.ok(body.output.text.includes('OpenAI API key'));
+});
+
+test('postSecurityCheckRun: still inlines flags and stays truthful when no advisory sync was attempted', async () => {
+  const calls = [];
+  const flags = [{ check: 'supply-chain', packages: ['evil-package'] }];
+
+  await postSecurityCheckRun(async (path, token, options) => {
+    calls.push({ path, token, options });
+    return { ok: true };
+  }, 'token', 'paperclipai/paperclip', 'deadbeef', true, { flags });
+
+  const body = JSON.parse(calls[0].options.body);
+  assert.ok(!body.output.summary.includes('Draft advisory filed'));
+  assert.ok(body.output.text.includes('evil-package'));
+});
+
+test('postSecurityCheckRun: "all clear" path is unaffected by the advisory plumbing', async () => {
+  const calls = [];
+
+  await postSecurityCheckRun(async (path, token, options) => {
+    calls.push({ path, token, options });
+    return { ok: true };
+  }, 'token', 'paperclipai/paperclip', 'deadbeef', false);
+
+  const body = JSON.parse(calls[0].options.body);
+  assert.deepEqual(body, {
+    name: 'security-review',
+    head_sha: 'deadbeef',
+    status: 'completed',
+    conclusion: 'success',
+    output: {
+      title: 'Security Review Passed',
+      summary: 'No security concerns detected.',
+    },
+  });
+});
+
+// ── buildSecurityCheckRunOutput ─────────────────────────────────────────────
+
+test('buildSecurityCheckRunOutput: 403 advisory failure never asserts an advisory exists', () => {
+  const flags = [{ check: 'ci-tampering', file: '.github/workflows/pr.yml' }];
+  const output = buildSecurityCheckRunOutput(true, flags, {
+    ok: false,
+    error: '403: Resource not accessible by integration',
+  });
+
+  assert.ok(!output.summary.includes('Draft advisory filed'));
+  assert.ok(output.text.includes('ci-tampering'));
 });
 
 test('validateSensitivePaths: checks paths against the resolved base ref instead of master', async () => {
