@@ -359,6 +359,8 @@ async function createRepositoryDispatch(input: {
         body: JSON.stringify({
           event_type: input.row.dispatchEventType,
           client_payload: {
+            producer_app_id: input.row.expectedAppId,
+            producer_installation_id: input.row.expectedInstallationId,
             retry_count: "0",
             target_pull_number: String(input.candidate.prNumber),
             target_head_sha: input.liveHeadSha,
