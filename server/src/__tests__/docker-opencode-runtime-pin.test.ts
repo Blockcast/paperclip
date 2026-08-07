@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -25,7 +25,7 @@ const designerPackageLock = readFileSync(path.join(repoRoot, "packages/services/
 const verifyAgentFfmpeg = path.join(repoRoot, "scripts/verify-agent-ffmpeg.sh");
 const verifyAgentFfmpegScript = readFileSync(verifyAgentFfmpeg, "utf8");
 
-function runFfmpegProbe(mode: "success" | "missing" | "failed" | "timeout" | "newline-free") {
+function runFfmpegProbe(mode: "success" | "missing" | "failed" | "timeout" | "newline-free" | "volume") {
   const stubDir = mkdtempSync(path.join(tmpdir(), "paperclip-ffmpeg-probe-"));
   const dockerStub = path.join(stubDir, "docker");
   const runArgsFile = path.join(stubDir, "docker-run-args");
@@ -36,6 +36,13 @@ function runFfmpegProbe(mode: "success" | "missing" | "failed" | "timeout" | "ne
     `#!/bin/sh
 cmd=$1
 case "$cmd" in
+  buildx)
+    if [ "$DOCKER_STUB_MODE" = "volume" ]; then
+      printf '{"/untrusted":{}}\\n'
+    else
+      printf 'null\\n'
+    fi
+    ;;
   run)
     printf '%s\\n' "$@" > "$DOCKER_RUN_ARGS_FILE"
     cidfile=""
@@ -94,9 +101,11 @@ esac
       },
       encoding: "utf8",
     });
-    const args = readFileSync(runArgsFile, "utf8").trim().split("\n");
-    const cleanupArgs = readFileSync(cleanupArgsFile, "utf8").trim().split("\n");
-    const cidfileState = readFileSync(cidfileStateFile, "utf8").trim();
+    const args = existsSync(runArgsFile) ? readFileSync(runArgsFile, "utf8").trim().split("\n") : [];
+    const cleanupArgs = existsSync(cleanupArgsFile)
+      ? readFileSync(cleanupArgsFile, "utf8").trim().split("\n")
+      : [];
+    const cidfileState = existsSync(cidfileStateFile) ? readFileSync(cidfileStateFile, "utf8").trim() : "";
     return { result, args, cleanupArgs, cidfileState };
   } finally {
     rmSync(stubDir, { recursive: true, force: true });
@@ -334,6 +343,14 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
     expect(result.status).toBe(0);
     expect(verifyAgentFfmpegScript).toContain('head -c "$probe_output_bytes"');
     expect(verifyAgentFfmpegScript).not.toContain("| awk");
+  });
+
+  it("rejects image-declared writable volumes before starting a container", () => {
+    const { result, args } = runFfmpegProbe("volume");
+
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain("declares writable volumes");
+    expect(args).toEqual([]);
   });
 
   it("force-removes the probe container after a timeout", () => {
