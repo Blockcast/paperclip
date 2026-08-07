@@ -53,12 +53,23 @@ export type PullRequestLinkSource = "branch_ref" | "title_ref" | "body_ref" | "r
  * branch (option (A): the branchTemplate injects the issue ref into the branch
  * name, so a branch match is the strongest, process-enforced signal), then
  * title, then body. Returns null if none of the fields carry it.
+ *
+ * The branch tier MUST use the same case-insensitive, segment-anchored
+ * extractor that decides ownership (BLO-20886). Real branches are lowercase and
+ * PAPERCLIP_IDENTIFIER_PATTERN is uppercase-only, so classifying the branch with
+ * the broad extractor made a lowercase branch-only owner -- `cto/blo-20886-...`,
+ * the shape branchTemplate actually produces -- resolve to nothing here even
+ * though ownership had already accepted it. It then fell through to `body_ref`;
+ * if the body also mentioned a related issue in the same company, both
+ * candidates carried equal strength and insertion order decided which one a
+ * merged PR was persisted against, so the authoritative branch owner could lose
+ * to a bare `Related:` mention.
  */
 export function resolveLinkSourceForIdentifier(
   identifier: string,
   fields: { branch?: string | null; title?: string | null; body?: string | null },
 ): PullRequestLinkSource | null {
-  if (extractPaperclipIdentifiers(fields.branch).includes(identifier)) return "branch_ref";
+  if (extractBranchIdentifiers(fields.branch).includes(identifier)) return "branch_ref";
   if (extractPaperclipIdentifiers(fields.title).includes(identifier)) return "title_ref";
   if (extractPaperclipIdentifiers(fields.body).includes(identifier)) return "body_ref";
   return null;
@@ -348,7 +359,20 @@ export function extractBranchIdentifiers(branch: string | null | undefined): str
   return Array.from(found);
 }
 
-const BRANCH_IDENTIFIER_PATTERN = /(?:^|\/)([A-Za-z][A-Za-z0-9]{1,9}-\d{1,6}(?:\/\d{1,6})*)\b/g;
+// The trailing `(?!\.\d)` rejects a VERSION CONTINUATION, and it is what makes
+// the segment anchor above actually hold. The anchor alone only helps when the
+// package name sits mid-segment (`blo-21612-undici-7.29.0`); it does nothing
+// when the package name STARTS a segment, which is exactly the shape Dependabot
+// emits: `dependabot/npm_and_yarn/undici-7.29.0` puts `undici` right after a
+// `/`, so `undici-7` clears the anchor and `\b` is satisfied by the following
+// `.`. Measured on the real branch shapes, that manufactured `UNDICI-7`,
+// `NODE-20` (`dependabot/npm_and_yarn/types/node-20.11.5`) and `CHECKOUT-4`
+// (`dependabot/github_actions/actions/checkout-4.2.0`).
+//
+// A dot followed by a digit is unambiguously the rest of a semver, never part
+// of an issue ref -- conventional branches continue with `-` (`blo-20886-round5`)
+// or end (`sre/blo-20886`), so neither loses its ref here.
+const BRANCH_IDENTIFIER_PATTERN = /(?:^|\/)([A-Za-z][A-Za-z0-9]{1,9}-\d{1,6}(?:\/\d{1,6})*)\b(?!\.\d)/g;
 
 export interface OwningIdentifierResolution {
   // The PR's authoritative issue identifier(s) -- empty when none was found.

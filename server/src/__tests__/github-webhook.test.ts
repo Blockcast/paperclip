@@ -55,7 +55,10 @@ import {
   __resetMetricsForTest,
   getMetricsRegistry,
 } from "../services/metrics.js";
-import { resolveOwningPaperclipIdentifiers } from "../services/paperclip-identifiers.js";
+import {
+  resolveLinkSourceForIdentifier,
+  resolveOwningPaperclipIdentifiers,
+} from "../services/paperclip-identifiers.js";
 
 /**
  * Sum {@link GITHUB_REVIEW_REQUEST_DELIVERY_METRIC} across every `reason`
@@ -367,6 +370,61 @@ describe("github-webhook pure helpers", () => {
     expect(resolveOwningPaperclipIdentifiers({ branch: "blo-21610-thing" })).toEqual({
       owning: ["BLO-21610"],
     });
+  });
+
+  it("does not manufacture a branch owner from a Dependabot path (BLO-20886 round 6)", () => {
+    // The segment anchor alone only discriminates when the package name sits
+    // MID-segment (`blo-21612-undici-7.29.0`). Dependabot puts it at the START
+    // of a segment, so `undici-7` clears the anchor and the following `.`
+    // supplies the word boundary -- the leak the anchor was believed to close.
+    // Each of these manufactured an owner before the version-continuation
+    // guard, and each would route a dependency PR's author wake to whoever is
+    // assigned the same-named issue.
+    for (const branch of [
+      "dependabot/npm_and_yarn/undici-7.29.0",
+      "dependabot/npm_and_yarn/types/node-20.11.5",
+      "dependabot/github_actions/actions/checkout-4.2.0",
+      "dependabot/npm_and_yarn/fast-uri-3.1.5",
+    ]) {
+      expect(resolveOwningPaperclipIdentifiers({ branch })).toEqual({ owning: [] });
+    }
+
+    // The guard keys on `.` + digit, which is only ever a semver tail. Real
+    // refs continue with `-` or end, so neither shape regresses.
+    expect(
+      resolveOwningPaperclipIdentifiers({ branch: "cto/blo-20886-round5-ownership-leaks" }),
+    ).toEqual({ owning: ["BLO-20886"] });
+    expect(resolveOwningPaperclipIdentifiers({ branch: "sre/blo-20886" })).toEqual({
+      owning: ["BLO-20886"],
+    });
+  });
+
+  it("classifies a lowercase branch-only owner as branch_ref, not body_ref (BLO-20886 round 6)", () => {
+    // Ownership accepts a lowercase branch case-insensitively, but link-source
+    // classification used the uppercase-only broad extractor, so the very shape
+    // branchTemplate produces resolved to nothing here and fell through to
+    // `body_ref`. With a related issue also named in the body, both candidates
+    // then carried equal strength and insertion order decided which one a
+    // merged PR was persisted against -- losing the authoritative branch owner
+    // to a bare `Related:` mention.
+    const fields = {
+      branch: "cto/blo-20886-round5-ownership-leaks",
+      title: "fix(github-webhook): close ownership-parsing leaks",
+      body: "Refs: BLO-20886\nRelated: BLO-19132",
+    };
+    expect(resolveLinkSourceForIdentifier("BLO-20886", fields)).toBe("branch_ref");
+    // The related-only identifier is still body-sourced, and the branch tier
+    // does not start claiming identifiers it does not carry.
+    expect(resolveLinkSourceForIdentifier("BLO-19132", fields)).toBe("body_ref");
+    // An uppercase branch keeps working, and a Dependabot branch stays unowned.
+    expect(resolveLinkSourceForIdentifier("BLO-20886", { branch: "CTO/BLO-20886-x" })).toBe(
+      "branch_ref",
+    );
+    expect(
+      resolveLinkSourceForIdentifier("UNDICI-7", {
+        branch: "dependabot/npm_and_yarn/undici-7.29.0",
+      }),
+    ).toBeNull();
   });
 
   it("falls back to a non-closing house-reference body line when title/keyword/branch all resolve nothing (BLO-21312)", () => {
