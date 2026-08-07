@@ -2,11 +2,12 @@ import { createHash, randomUUID } from "node:crypto";
 import { Router, type Request, type Response } from "express";
 import multer from "multer";
 import { z } from "zod";
-import { and, asc, desc, eq, gte, inArray, isNull, notInArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, isNull, lt, notInArray, or, sql, type SQL } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   activityLog,
   agents,
+  createDbFromPostgresClient,
   documents,
   executionWorkspaces,
   heartbeatRuns,
@@ -90,6 +91,10 @@ import {
   type SuccessfulRunHandoffState,
   type WorkspaceRuntimeService,
 } from "@paperclipai/shared";
+import {
+  findIssueDuplicateCandidates,
+  type IssueDuplicateDocument,
+} from "@paperclipai/shared/issue-duplicate-matcher";
 import { trackAgentTaskCompleted } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
 import type { StorageService } from "../storage/types.js";
@@ -178,8 +183,8 @@ import {
   parseIssueExecutionState,
   redactIssueMonitorExternalRef,
   setIssueExecutionPolicyMonitorScheduledBy,
+  type IssueMonitorConvergence,
 } from "../services/issue-execution-policy.js";
-import type { IssueMonitorConvergence } from "../services/issue-execution-policy.js";
 import { monitorConvergenceComment } from "../services/issue-monitor-convergence-message.js";
 import type { IssueUnblockOwner } from "../services/issue-monitor-convergence-message.js";
 import { parseIssueExecutionWorkspaceSettings } from "../services/execution-workspace-policy.js";
@@ -197,6 +202,267 @@ import {
   type TrustPresetResolution,
 } from "../services/trust-preset-resolver.js";
 import { externalObjectService } from "../services/external-objects.js";
+
+export const ISSUE_CREATE_DUPLICATE_CANDIDATE_WINDOW_DAYS = 30;
+export const ISSUE_CREATE_DUPLICATE_CANDIDATE_ROW_CAP = 200;
+export const ISSUE_CREATE_DUPLICATE_CANDIDATE_SCAN_CAP = 1_000;
+export const ISSUE_CREATE_DUPLICATE_CANDIDATE_TIMEOUT_MS = 500;
+export const ISSUE_CREATE_DUPLICATE_CANDIDATE_ACTIVITY_TIMEOUT_MS = 1_000;
+export const ISSUE_CREATE_DUPLICATE_CANDIDATE_LATENCY_BUDGET_MS = 1_000;
+
+type CreateIssueDuplicateCandidate = {
+  identifier: string;
+  title: string;
+  score: number;
+};
+
+type CreateIssueDuplicateCandidateRow = IssueDuplicateDocument & {
+  companyId: string;
+  projectId: string | null;
+  parentId: string | null;
+  assigneeAgentId: string | null;
+  assigneeUserId: string | null;
+  createdByAgentId: string | null;
+  status: string;
+  originKind: string | null;
+  originId: string | null;
+  createdAt: Date;
+};
+
+type CreateIssueDuplicateCandidateCorpusFilter = (
+  rows: CreateIssueDuplicateCandidateRow[],
+  signal?: AbortSignal,
+  scopedDb?: Db,
+) => Promise<CreateIssueDuplicateCandidateRow[]>;
+
+type CreateIssueDuplicateCandidatePage = {
+  corpus: Array<CreateIssueDuplicateCandidateRow & { createdAtMicros: string }>;
+  readable: CreateIssueDuplicateCandidateRow[];
+};
+
+export function raceCreateIssueDuplicateCandidateLookup<T>(
+  promise: Promise<T>,
+  timeoutMs = ISSUE_CREATE_DUPLICATE_CANDIDATE_TIMEOUT_MS,
+  onTimeout?: () => void,
+  operation = "issue duplicate candidate lookup",
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<T>((_, reject) => {
+    timer = setTimeout(
+      () => {
+        onTimeout?.();
+        reject(new Error(`${operation} timed out after ${timeoutMs}ms`));
+      },
+      timeoutMs,
+    );
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer);
+  });
+}
+
+export async function findCreateIssueDuplicateCandidates(
+  db: Db,
+  companyId: string,
+  subject: IssueDuplicateDocument,
+  filterCorpus?: CreateIssueDuplicateCandidateCorpusFilter,
+  signal?: AbortSignal,
+  statementTimeoutMs = ISSUE_CREATE_DUPLICATE_CANDIDATE_TIMEOUT_MS,
+): Promise<CreateIssueDuplicateCandidate[]> {
+  const cutoff = new Date(
+    Date.now() - ISSUE_CREATE_DUPLICATE_CANDIDATE_WINDOW_DAYS * 24 * 60 * 60 * 1_000,
+  );
+  const visibleCorpus: CreateIssueDuplicateCandidateRow[] = [];
+  let scannedRows = 0;
+  let cursor: { createdAtMicros: string; id: string } | null = null;
+  const createdAtMicros = sql<string>`(
+    extract(epoch from ${issueRows.createdAt}) * 1000000
+  )::numeric(20, 0)`;
+  do {
+    signal?.throwIfAborted();
+    const cursorCondition: SQL | undefined = cursor
+      ? or(
+          lt(createdAtMicros, cursor.createdAtMicros),
+          and(eq(createdAtMicros, cursor.createdAtMicros), lt(issueRows.id, cursor.id)),
+        )
+      : undefined;
+    const page: CreateIssueDuplicateCandidatePage = await db.transaction(async (tx) => {
+      await tx.execute(sql`select set_config('statement_timeout', ${String(statementTimeoutMs)}, true)`);
+      const corpus: CreateIssueDuplicateCandidatePage["corpus"] = await tx
+        .select({
+          id: issueRows.id,
+          identifier: issueRows.identifier,
+          title: issueRows.title,
+          description: issueRows.description,
+          companyId: issueRows.companyId,
+          projectId: issueRows.projectId,
+          parentId: issueRows.parentId,
+          assigneeAgentId: issueRows.assigneeAgentId,
+          assigneeUserId: issueRows.assigneeUserId,
+          createdByAgentId: issueRows.createdByAgentId,
+          status: issueRows.status,
+          originKind: issueRows.originKind,
+          originId: issueRows.originId,
+          createdAt: issueRows.createdAt,
+          createdAtMicros,
+        })
+        .from(issueRows)
+        .where(and(
+          eq(issueRows.companyId, companyId),
+          isNull(issueRows.hiddenAt),
+          gte(issueRows.createdAt, cutoff),
+          notInArray(issueRows.id, [subject.id]),
+          cursorCondition,
+        ))
+        .orderBy(desc(issueRows.createdAt), desc(issueRows.id))
+        .limit(Math.min(
+          ISSUE_CREATE_DUPLICATE_CANDIDATE_ROW_CAP,
+          ISSUE_CREATE_DUPLICATE_CANDIDATE_SCAN_CAP - scannedRows,
+        ));
+      signal?.throwIfAborted();
+      const readable = filterCorpus
+        ? await filterCorpus(corpus, signal, tx as unknown as Db)
+        : corpus;
+      return { corpus, readable };
+    });
+    signal?.throwIfAborted();
+    visibleCorpus.push(...page.readable);
+    scannedRows += page.corpus.length;
+    const lastRow = page.corpus.at(-1);
+    cursor = lastRow ? { createdAtMicros: lastRow.createdAtMicros, id: lastRow.id } : null;
+    if (!filterCorpus || page.corpus.length < ISSUE_CREATE_DUPLICATE_CANDIDATE_ROW_CAP) break;
+  } while (
+    visibleCorpus.length < ISSUE_CREATE_DUPLICATE_CANDIDATE_ROW_CAP
+    && scannedRows < ISSUE_CREATE_DUPLICATE_CANDIDATE_SCAN_CAP
+  );
+
+  return findIssueDuplicateCandidates(
+    subject,
+    visibleCorpus.slice(0, ISSUE_CREATE_DUPLICATE_CANDIDATE_ROW_CAP),
+  ).candidates.map((candidate) => ({
+    identifier: candidate.identifier ?? candidate.id,
+    title: candidate.title,
+    score: candidate.score,
+  }));
+}
+
+type ReservedPostgresSql = {
+  begin?: (fn: (sql: ReservedPostgresSql) => unknown) => Promise<unknown>;
+  release: () => void;
+  options?: unknown;
+  unsafe: (query: string) => PromiseLike<unknown>;
+};
+
+type ReservablePostgresClient = {
+  options: unknown;
+  reserve: () => Promise<ReservedPostgresSql>;
+};
+
+function getReservablePostgresClient(db: Db): ReservablePostgresClient | null {
+  const client = (db as Db & { $client?: Partial<ReservablePostgresClient> }).$client;
+  return typeof client?.reserve === "function" ? client as ReservablePostgresClient : null;
+}
+
+async function withReservedCreateIssueAdvisoryDb<T>(
+  db: Db,
+  timeoutMs: number,
+  operation: string,
+  fn: (db: Db) => Promise<T>,
+): Promise<T> {
+  const client = getReservablePostgresClient(db);
+  if (!client) return db.transaction((tx) => fn(tx as unknown as Db));
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const reservePromise = client.reserve();
+  const timeout = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), timeoutMs);
+  });
+  const reserved = await Promise.race([reservePromise, timeout]);
+  if (timer !== undefined) clearTimeout(timer);
+
+  if (!reserved) {
+    void reservePromise
+      .then((lateReserved) => lateReserved.release())
+      .catch((err) => {
+        logger.warn({ err }, `${operation} database connection reservation failed after timeout`);
+      });
+    throw new Error(`${operation} skipped because no database connection was available within ${timeoutMs}ms`);
+  }
+
+  try {
+    // postgres.js reserve() omits runtime options and begin() despite ReservedSql extending Sql.
+    reserved.options = client.options;
+    reserved.begin = async (transaction) => transaction(reserved);
+    const reservedDb = createDbFromPostgresClient(
+      reserved as unknown as Parameters<typeof createDbFromPostgresClient>[0],
+    );
+    await reserved.unsafe("BEGIN");
+    try {
+      const result = await fn(reservedDb);
+      await reserved.unsafe("COMMIT");
+      return result;
+    } catch (err) {
+      await reserved.unsafe("ROLLBACK");
+      throw err;
+    }
+  } finally {
+    reserved.release();
+  }
+}
+
+function scheduleDuplicateCandidateShownActivity(input: {
+  db: Db;
+  res: Response;
+  opts: {
+    createIssueDuplicateCandidateActivityWriter?: typeof logActivity;
+    createIssueDuplicateCandidateActivityTimeoutMs?: number;
+  };
+  companyId: string;
+  issue: { id: string; identifier: string | null };
+  actor: ReturnType<typeof getActorInfo>;
+  duplicateCandidates: CreateIssueDuplicateCandidate[];
+}) {
+  if (input.duplicateCandidates.length === 0) return;
+
+  input.res.once("finish", () => {
+    if (input.res.statusCode < 200 || input.res.statusCode >= 300) return;
+    const timeoutMs = input.opts.createIssueDuplicateCandidateActivityTimeoutMs
+      ?? ISSUE_CREATE_DUPLICATE_CANDIDATE_ACTIVITY_TIMEOUT_MS;
+    void raceCreateIssueDuplicateCandidateLookup(
+      withReservedCreateIssueAdvisoryDb(
+        input.db,
+        timeoutMs,
+        "issue duplicate candidate consumption event",
+        async (advisoryDb) => {
+          await advisoryDb.execute(sql`select set_config('statement_timeout', ${String(timeoutMs)}, true)`);
+          await (input.opts.createIssueDuplicateCandidateActivityWriter ?? logActivity)(advisoryDb, {
+            companyId: input.companyId,
+            actorType: input.actor.actorType,
+            actorId: input.actor.actorId,
+            agentId: input.actor.agentId,
+            runId: input.actor.runId,
+            agentApiKeyId: input.actor.agentApiKeyId,
+            action: "issue.duplicate_candidates_shown",
+            entityType: "company",
+            entityId: input.companyId,
+            details: {
+              identifier: input.issue.identifier,
+              duplicateCandidates: input.duplicateCandidates.map(({ identifier, score }) => ({ identifier, score })),
+            },
+          });
+        },
+      ),
+      timeoutMs,
+      undefined,
+      "issue duplicate candidate consumption event",
+    ).catch((err) => {
+      logger.warn(
+        { err, companyId: input.companyId, issueId: input.issue.id, issueIdentifier: input.issue.identifier },
+        "issue duplicate candidate consumption event failed; continuing successful create",
+      );
+    });
+  });
+}
 
 const MAX_ISSUE_COMMENT_LIMIT = 500;
 const updateIssueRouteSchema = updateIssueSchema.extend({
@@ -2703,6 +2969,17 @@ export function issueRoutes(
       actionRequestId: string;
       actor: { agentId?: string | null; userId?: string | null };
     }) => Promise<unknown>;
+    createIssueDuplicateCandidateLookup?: typeof findCreateIssueDuplicateCandidates;
+    createIssueDuplicateCandidateTimeoutMs?: number;
+    createIssueDuplicateCandidateCompanyScopeReader?: (
+      scopedDb: Db,
+      req: Request,
+      companyId: string,
+    ) => Promise<boolean>;
+    createIssueDuplicateCandidateActivityWriter?: typeof logActivity;
+    createIssueDuplicateCandidateActivityTimeoutMs?: number;
+    createIssueDuplicateCandidateCorpusFilter?: CreateIssueDuplicateCandidateCorpusFilter;
+    createIssueBeforeResponseHook?: () => Promise<void>;
   } = {},
 ) {
   const router = Router();
@@ -4606,13 +4883,53 @@ export function issueRoutes(
     return action.ownerAgentId === issue.assigneeAgentId;
   }
 
-  async function filterIssuesForActor<T extends Parameters<typeof decideIssueAccess>[1]>(req: Request, rows: T[]) {
-    const decisions = await Promise.all(rows.map((issue) => decideIssueAccess(req, issue, "issue:read")));
-    return rows.filter((_, index) => decisions[index]?.allowed);
+  async function filterIssuesForActor<T extends Parameters<typeof decideIssueAccess>[1]>(
+    req: Request,
+    rows: T[],
+    signal?: AbortSignal,
+    scopedDb?: Db,
+  ) {
+    if (!signal && !scopedDb) {
+      const decisions = await Promise.all(rows.map((issue) => decideIssueAccess(req, issue, "issue:read")));
+      return rows.filter((_, index) => decisions[index]?.allowed);
+    }
+    const scopedAccess = scopedDb ? accessService(scopedDb) : access;
+    const readable: T[] = [];
+    for (const issue of rows) {
+      signal?.throwIfAborted();
+      const decision = await scopedAccess.decide({
+        actor: req.actor,
+        action: "issue:read",
+        resource: {
+          type: "issue",
+          companyId: issue.companyId,
+          issueId: issue.id,
+          projectId: issue.projectId,
+          parentIssueId: issue.parentId,
+          assigneeAgentId: issue.assigneeAgentId,
+          assigneeUserId: issue.assigneeUserId,
+          createdByAgentId: issue.createdByAgentId ?? null,
+          status: issue.status,
+          originKind: issue.originKind,
+          originId: issue.originId ?? null,
+        },
+        scope: {
+          issueId: issue.id,
+          projectId: issue.projectId,
+          parentIssueId: issue.parentId,
+          assigneeAgentId: issue.assigneeAgentId,
+          assigneeUserId: issue.assigneeUserId,
+          originKind: issue.originKind ?? null,
+          originId: issue.originId ?? null,
+        },
+      });
+      if (decision.allowed) readable.push(issue);
+    }
+    return readable;
   }
 
-  async function actorCanReadCompanyScope(req: Request, companyId: string) {
-    const decision = await access.decide({
+  async function actorCanReadCompanyScope(req: Request, companyId: string, scopedDb?: Db) {
+    const decision = await (scopedDb ? accessService(scopedDb) : access).decide({
       actor: req.actor,
       action: "company_scope:read",
       resource: { type: "company", companyId },
@@ -8793,6 +9110,7 @@ export function issueRoutes(
         ...issue,
         deduplicated: true,
         deduplicationReason,
+        duplicateCandidates: [],
         relatedWork: referenceSummary,
         referencedIssueIdentifiers: referenceSummary.outbound.map((item) => item.issue.identifier ?? item.issue.id),
       });
@@ -8895,9 +9213,55 @@ export function issueRoutes(
       requestedByActorId: actor.actorId,
     });
     await queueTaskWatchdogEvaluation(issue, actor.runId);
+    await opts.createIssueBeforeResponseHook?.();
+
+    let duplicateCandidates: CreateIssueDuplicateCandidate[] = [];
+    try {
+      const lookupAbortController = new AbortController();
+      const lookupTimeoutMs = opts.createIssueDuplicateCandidateTimeoutMs
+        ?? ISSUE_CREATE_DUPLICATE_CANDIDATE_TIMEOUT_MS;
+      duplicateCandidates = await raceCreateIssueDuplicateCandidateLookup(
+        withReservedCreateIssueAdvisoryDb(db, lookupTimeoutMs, "issue duplicate candidate lookup", async (advisoryDb) => {
+          await advisoryDb.execute(sql`select set_config('statement_timeout', ${String(lookupTimeoutMs)}, true)`);
+          const canReadCompanyScope = await (opts.createIssueDuplicateCandidateCompanyScopeReader
+            ?? ((scopedDb, scopedReq, scopedCompanyId) => (
+              actorCanReadCompanyScope(scopedReq, scopedCompanyId, scopedDb)
+            )))(advisoryDb, req, companyId);
+          return (opts.createIssueDuplicateCandidateLookup ?? findCreateIssueDuplicateCandidates)(advisoryDb, companyId, {
+            id: issue.id,
+            identifier: issue.identifier,
+            title: issue.title,
+            description: issue.description,
+          }, opts.createIssueDuplicateCandidateCorpusFilter
+            ?? (canReadCompanyScope
+              ? undefined
+              : (rows, signal, scopedDb) => filterIssuesForActor(req, rows, signal, scopedDb)),
+          lookupAbortController.signal,
+          lookupTimeoutMs);
+        }),
+        lookupTimeoutMs,
+        () => lookupAbortController.abort(),
+      );
+    } catch (err) {
+      logger.warn(
+        { err, companyId, issueId: issue.id, issueIdentifier: issue.identifier },
+        "issue duplicate candidate lookup failed; continuing create without advisories",
+      );
+    }
+
+    scheduleDuplicateCandidateShownActivity({
+      db,
+      res,
+      opts,
+      companyId,
+      issue,
+      actor,
+      duplicateCandidates,
+    });
 
     res.status(201).json({
       ...issue,
+      duplicateCandidates,
       relatedWork: referenceSummary,
       referencedIssueIdentifiers: referenceSummary.outbound.map((item) => item.issue.identifier ?? item.issue.id),
     });

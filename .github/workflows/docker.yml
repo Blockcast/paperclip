@@ -708,6 +708,25 @@ jobs:
           # gave up at 10m. 30m absorbs that window without changing CI's
           # report-success semantics for healthy rollouts (which still
           # finish in ~30-90s). Investigate further if 30m proves too short.
+          # --atomic added (BLO-21492): without it, a partial failure (e.g.
+          # the API Deployment patch denied by an admission policy) left the
+          # release "upgraded" for every resource that applied cleanly --
+          # observed as the worker StatefulSet advancing to a new image while
+          # the API Deployment stayed on the old one, with no rollback and a
+          # bare exit 1. --atomic makes Helm roll the whole release back to
+          # the last successful revision on any failure, so a denied or
+          # otherwise failed upgrade never leaves the two tiers split across
+          # builds; it only ever advances both or neither. Still runs
+          # backgrounded (helm_pid) exactly as before so the approval-plan
+          # reconciliation loop below can keep polling and patching the API
+          # Deployment while Helm's own --wait blocks inside the background
+          # process; if Helm ultimately fails, --atomic rolls the release
+          # back -- including any already-reconciled API Deployment state --
+          # which is why the post-wait marker check below can legitimately
+          # see a reverted (non-matching) marker on a failed run, not only on
+          # a script bug. --atomic placed ahead of --wait --timeout (rather
+          # than between them) so scripts/check-docker-deploy-timeout.test.js's
+          # `--wait --timeout` match still finds it.
           helm_pid=""
           stop_background_helm() {
             if [ -n "${helm_pid}" ] && kill -0 "${helm_pid}" 2>/dev/null; then
@@ -724,7 +743,7 @@ jobs:
             --set-string image.digest="${DIGEST}" \
             --set-string api.deployedCommit="${COMMIT}" \
             --post-renderer "${STAMP_SCRIPT}" \
-            --wait --timeout 30m &
+            --atomic --wait --timeout 30m &
           helm_pid=$!
 
           # Helm applies release resources before entering its wait loop. As
@@ -799,6 +818,7 @@ jobs:
               .spec.template.metadata.annotations["paperclip.blockcast.net/deployed-commit"] == $commit and
               (.spec.template.spec.containers | all(.image == $image))
             ' <<<"${live_json}" >/dev/null
+
           helm -n "${NS}" list | head -3
           kubectl -n "${NS}" get pod -l app.kubernetes.io/name=paperclip \
             -o custom-columns=NAME:.metadata.name,IMAGE:.spec.containers[0].image,READY:.status.containerStatuses[0].ready,RESTARTS:.status.containerStatuses[0].restartCount
