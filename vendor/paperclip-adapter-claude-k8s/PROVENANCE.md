@@ -85,15 +85,17 @@ Upstream commits two things this repository does not accept:
   committing build artifacts.
 - `.DS_Store` — macOS filesystem noise.
 
-Everything else is byte-for-byte upstream. 36 files vendored.
+Everything else was byte-for-byte upstream at vendor time. 36 files vendored;
+see [Local modifications](#local-modifications) for the Blockcast patches
+applied since.
 
 ### Integrity
 
-A manifest of `sha256(path)` over all 36 vendored files, sorted by path under
+A manifest of `sha256(path)` over all 37 in-tree files, sorted by path under
 `LC_ALL=C`, itself hashes to:
 
 ```
-19adc3251e7781f86a3d579872ca473fbaffef4dcf2931d070b256cbb3a318b9
+57fa15ad58c5073bc47ffc93fa3a90dc339d9def09336325ce2891ad6e63f2ba
 ```
 
 Regenerate with:
@@ -138,12 +140,24 @@ out; it is not a blocker for the security fix.
 
 ## Local modifications
 
-None beyond the composition described above. The two cherry-picked commits are
-upstream commits authored against the fork, not Blockcast-local patches.
+Beyond the composition described above, this directory now carries Blockcast
+patches. They are ordinary in-tree changes, reviewed under our own CI — which is
+the point of vendoring — but they mean the tree is **no longer byte-for-byte
+upstream**, so they are enumerated here rather than left implicit.
+
+| commit | files | what |
+|---|---|---|
+| `cd1630512` | `src/server/env-guard.ts`, `src/server/env-guard.test.ts` | Anchored the `SAFE_ENV_INSPECTION_RE` safe-helper exception to a whole-command invocation. It was evaluated before the full-dump detector and matched the helper anywhere in the command, so a `<safe-helper> && <dump>` compound returned `allow` and executed the dump. Addresses an Ally review finding on Blockcast/paperclip#1092. |
+| `cd1630512` | `src/server/k8s-client.ts`, `src/server/k8s-client.test.ts` (new) | Keyed the `getSelfPodInfo()` cache by (kubeconfig path, namespace, hostname). It memoized into one process-global slot while callers pass a per-request kubeconfig, leaking the first execution's image, scheduling, PVC, env and Secret references into later executions against a different cluster. Same review. |
+
+The two cherry-picked commits in the composition above remain upstream commits
+authored against the fork, not Blockcast-local patches.
 
 Future changes to this directory are ordinary in-tree changes to this
 repository: edit, open a PR, let CI run. There is no longer an external fork to
-push to first, and `CLAUDE_K8S_REF` no longer exists.
+push to first, and `CLAUDE_K8S_REF` no longer exists. **Any change here must
+update the integrity hash in the same PR** — CI fails the `vendor_claude_k8s`
+job otherwise, and prints the expected value.
 
 ### The inert upstream workflow
 
