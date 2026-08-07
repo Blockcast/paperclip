@@ -1575,8 +1575,13 @@ class PrReviewerTaskLockTimeoutError extends Error {
 // until code explicitly does so on the connection it returns. Racing the
 // *reservation* against the deadline means an abandoned one can be released
 // the instant it lands, before a single query runs on it, and one that lands
-// in time is exclusively ours from then on -- no further pool contention is
-// possible, so nothing after that point needs bounding either.
+// in time is exclusively ours from then on -- no further POOL CONTENTION is
+// possible. That is a different guarantee from a stalled BACKEND, though:
+// once the connection is ours, `begin` and the advisory-lock probe are still
+// real queries that postgres.js cannot cancel client-side, so they get their
+// own database-side bound below (mirroring `boundedFallbackRead`'s
+// `statement_timeout` further down this file) rather than relying on the
+// reservation race to cover them too.
 type PgClient = Db["$client"];
 type ReservedPgConnection = Awaited<ReturnType<PgClient["reserve"]>>;
 
@@ -1641,42 +1646,67 @@ async function withPrReviewerTaskLock<T>(
     }
     let acquired = false;
     try {
-      await reservation`begin`;
+      // BLO-21582 review follow-up: `begin` and the advisory-lock probe are
+      // real round trips to a real backend, and postgres.js gives no way to
+      // cancel one client-side once it's in flight -- racing a deadline (the
+      // way `reserveConnectionOrTimeout` above does for the reservation
+      // itself) only stops US from awaiting the result, it doesn't stop the
+      // backend from running it. Asking Postgres itself to cancel a stalled
+      // statement via `statement_timeout` is the only bound that actually
+      // works. It has to be a plain (session-scoped) `SET`, not `SET LOCAL`:
+      // `begin` runs before any transaction exists for `LOCAL` to attach to.
+      const probeBudgetMs = Math.max(1, Math.floor(deadline - Date.now()));
+      let probeError: unknown = null;
       try {
+        await reservation.unsafe(`set statement_timeout = ${probeBudgetMs}`);
+        await reservation`begin`;
         const rows = await reservation`select pg_try_advisory_xact_lock(hashtextextended(${taskKey}, 0)) as acquired`;
         acquired = !!rows[0] && (rows[0] as Record<string, unknown>).acquired === true;
       } catch (error) {
+        probeError = error;
+      }
+      if (probeError) {
         await reservation`rollback`.catch(() => {});
-        throw error;
+        if (findPgError(probeError)?.code !== "57014") throw probeError;
+        // The statement_timeout fired on `begin` or the probe itself --
+        // treat exactly like a probe that never got the chance to run: not
+        // acquired (still false from above), deadline re-checked below like
+        // every other timeout path in this function.
+      } else {
+        // BLO-21582 review follow-up (preserves Omar's 573c9ff8 guard under
+        // the new reservation-based mechanism): the probe can still settle
+        // after `deadline` even though nothing here is detached anymore --
+        // e.g. the reservation itself landed late within its own race, or
+        // the probe query was simply slow. Treat a late acquisition as
+        // not-acquired rather than running `action`: bounding overall
+        // response latency to the budget is a deliberate policy independent
+        // of the detached-execution bug this rewrite fixes, and
+        // readers/callers downstream (the 200 response, the funnel
+        // counters) are already sized around that budget.
+        if (acquired && Date.now() >= deadline) {
+          logger.warn(
+            { taskKey },
+            "github webhook reviewer wake lock was acquired after its retry deadline; skipping reviewer wake action",
+          );
+          acquired = false;
+        }
+        if (acquired) {
+          // The lock -- and this reserved connection -- are ours from here
+          // on: no pool contention can delay `action` regardless of how
+          // long it runs, the same guarantee the previous design gave only
+          // the already-acquired case. Abandoning here would still leave
+          // the transaction open on a connection nobody is accounting for.
+          // Reset the probe's `statement_timeout` first: it's a plain
+          // `SET`, so it survives the `commit` below (nothing leaks onto
+          // the next borrower of this connection), but `action` itself must
+          // not inherit a bound sized for a one-row probe.
+          await reservation.unsafe(`set statement_timeout = 0`);
+          const value = await action(drizzleOverReservedConnection(client, reservation));
+          await reservation`commit`;
+          return value;
+        }
+        await reservation`rollback`;
       }
-      // BLO-21582 review follow-up (preserves Omar's 573c9ff8 guard under the
-      // new reservation-based mechanism): the probe can still settle after
-      // `deadline` even though nothing here is detached anymore -- e.g. the
-      // reservation itself landed late within its own race, or the probe
-      // query was simply slow. Treat a late acquisition as not-acquired
-      // rather than running `action`: bounding overall response latency to
-      // the budget is a deliberate policy independent of the detached-
-      // execution bug this rewrite fixes, and readers/callers downstream
-      // (the 200 response, the funnel counters) are already sized around
-      // that budget.
-      if (acquired && Date.now() >= deadline) {
-        logger.warn(
-          { taskKey },
-          "github webhook reviewer wake lock was acquired after its retry deadline; skipping reviewer wake action",
-        );
-        acquired = false;
-      }
-      if (acquired) {
-        // The lock -- and this reserved connection -- are ours from here on:
-        // no pool contention can delay `action` regardless of how long it
-        // runs, the same guarantee the previous design gave only the
-        // already-acquired case. Abandoning here would still leave the
-        // transaction open on a connection nobody is accounting for.
-        const value = await action(drizzleOverReservedConnection(client, reservation));
-        await reservation`commit`;
-        return value;
-      }
-      await reservation`rollback`;
     } catch (error) {
       if (acquired) {
         // `action` or `commit` failed after the lock was acquired: roll back
@@ -1686,6 +1716,13 @@ async function withPrReviewerTaskLock<T>(
       }
       throw error;
     } finally {
+      // Unconditional and independent of the reset above: a plain `SET`'s
+      // effect is undone by `rollback` (Postgres treats it as transactional
+      // for abort purposes even though it survives commit), so any path that
+      // rolled back here -- not-acquired, or an error after acquiring --
+      // would otherwise hand the next borrower of this physical connection a
+      // leftover statement_timeout sized for a probe that already finished.
+      await reservation.unsafe(`set statement_timeout = 0`).catch(() => {});
       reservation.release();
     }
     if (Date.now() >= deadline) {

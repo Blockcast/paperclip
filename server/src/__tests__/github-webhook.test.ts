@@ -1182,7 +1182,7 @@ describe("github-webhook pure helpers", () => {
         }
         return []; // rollback
       },
-      { release: () => {} },
+      { release: () => {}, unsafe: async () => [] },
     );
     const fakeDb = { $client: { reserve: async () => fakeReservedConnection } };
 
@@ -1202,6 +1202,81 @@ describe("github-webhook pure helpers", () => {
     expect(probeStarted).toBe(true);
     expect(actionCalled).toBe(false);
   });
+
+  it(
+    "bounds response latency to the deadline instead of waiting out a stalled probe " +
+      "(BLO-21582 review follow-up: the delayed-probe test above proves the action is " +
+      "skipped, but it lets the request wait for the slow probe to settle and so does not " +
+      "prove bounded latency -- this one measures wall-clock time against the fake probe's " +
+      "own delay to prove the opposite)",
+    async () => {
+      // Real Postgres can't be made to stall `pg_try_advisory_xact_lock`
+      // itself (it touches no table, so `holdExclusiveTableLock`-style
+      // contention has nothing to block) -- so this models what
+      // `statement_timeout` actually does on a real backend: the probe
+      // query races its own artificial delay against the timeout the
+      // production code just told Postgres about via `set statement_timeout
+      // = <ms>`, and "wins" with a real SQLSTATE 57014 (query_canceled) the
+      // same way a real backend would cancel a stalled statement.
+      let actionCalled = false;
+      let probeStarted = false;
+      let sawTimeoutReset = false;
+      let statementTimeoutMs: number | null = null;
+      let callIndex = 0;
+      const PROBE_STALL_MS = 500;
+      const fakeReservedConnection = Object.assign(
+        async (_strings: TemplateStringsArray, ..._values: unknown[]) => {
+          callIndex += 1;
+          if (callIndex === 1) return []; // begin
+          if (callIndex === 2) {
+            probeStarted = true;
+            const timeoutMs = statementTimeoutMs ?? Number.POSITIVE_INFINITY;
+            return await new Promise((resolve, reject) => {
+              const stalled = setTimeout(() => resolve([{ acquired: true }]), PROBE_STALL_MS);
+              setTimeout(() => {
+                clearTimeout(stalled);
+                reject(Object.assign(new Error("canceling statement due to statement timeout"), { code: "57014" }));
+              }, timeoutMs);
+            });
+          }
+          return []; // rollback
+        },
+        {
+          release: () => {},
+          unsafe: async (sqlText: string) => {
+            const match = /^set statement_timeout = (\d+)$/.exec(sqlText);
+            if (match) {
+              statementTimeoutMs = Number(match[1]);
+              if (statementTimeoutMs === 0) sawTimeoutReset = true;
+            }
+            return [];
+          },
+        },
+      );
+      const fakeDb = { $client: { reserve: async () => fakeReservedConnection } };
+
+      const startedAt = Date.now();
+      await expect(
+        __test_withPrReviewerTaskLock(
+          fakeDb as never,
+          "pr_review:Blockcast/paperclip:21582007",
+          Date.now() + 20,
+          async () => {
+            actionCalled = true;
+            return "queued";
+          },
+        ),
+      ).rejects.toThrow("timed out acquiring PR reviewer task assignment lock");
+      const elapsedMs = Date.now() - startedAt;
+
+      expect(probeStarted).toBe(true);
+      expect(actionCalled).toBe(false);
+      // The database-side bound fired well before the fake's simulated
+      // stall -- without it, this would take at least PROBE_STALL_MS.
+      expect(elapsedMs).toBeLessThan(PROBE_STALL_MS / 2);
+      expect(sawTimeoutReset).toBe(true);
+    },
+  );
 });
 
 describeEmbeddedPostgres("github-webhook route", () => {

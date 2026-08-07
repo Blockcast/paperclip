@@ -278,7 +278,7 @@ describe("ReviewQueueCard", () => {
 
     await vi.waitFor(
       () => {
-        expect(listActionRequestsMock.mock.calls.length).toBeGreaterThanOrEqual(3);
+        expect(listActionRequestsMock).toHaveBeenCalledTimes(3);
         expect(document.body.textContent).toContain("Nothing is waiting for your OK right now.");
       },
       { timeout: 3_500 },
@@ -288,7 +288,7 @@ describe("ReviewQueueCard", () => {
 
     await vi.waitFor(
       () => {
-        expect(listActionRequestsMock.mock.calls.length).toBeGreaterThanOrEqual(4);
+        expect(listActionRequestsMock).toHaveBeenCalledTimes(4);
         expect(buttonContaining("Allow once")).toBeTruthy();
       },
       { timeout: 3_500 },
