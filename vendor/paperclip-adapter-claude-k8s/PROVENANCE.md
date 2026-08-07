@@ -95,7 +95,7 @@ A manifest of `sha256(path)` over all 37 in-tree files, sorted by path under
 `LC_ALL=C`, itself hashes to:
 
 ```
-b74335fd51ba3a9d3d677aa7f7b4b8f8d120fed305051b9b38456c6263697832
+659df72c2297f3519dbfe4f58d8cb99b95aa9db677ae627beeabbc97bc3ae576
 ```
 
 Regenerate with:
@@ -155,6 +155,7 @@ upstream**, so they are enumerated here rather than left implicit.
 | `435219ccf` | `src/server/env-guard.ts` | Comment-only correction. The header claimed behavioural parity with `server/src/agent-shell-guard.ts` "locked by `env-guard.test.ts`". Both halves were false — the test never imports that file and nothing imports it in production; it is dead code, then four fixed bypasses behind. Tracked for removal-or-resync as BLO-22840. |
 | `3e0244a78` | `src/server/env-guard.ts`, `src/server/env-guard.test.ts` | Closed the unquoted-command-wrapper bypass class. `SHELL_WRAPPER_RE` unwraps only a *quoted* `-c` payload and whitespace was not a command boundary, so a dump passed as a bare argument to any wrapper (`sh -c env`, `eval env`, `xargs env`, `nohup env`, `timeout 5 env`, `su -c env`, ...) was allowed — 9 of 9 measured payloads, in the real spawned pod script. Split the boundary class: whitespace joins the *leading* class only, while the trailing terminator stays punctuation-only so operand-bearing forms (`env NAME=value cmd`, `printenv HOME`, `grep env file`) stay allowed. Fourth Ally review pass. |
 | `3e0244a78` | `src/server/job-manifest.ts`, `src/server/job-manifest.test.ts` | Three manifest fixes from the same review. (a) Operator-configured mount paths (`workspaceMountPath`, `homeRoot`) reached the init container's `sh -c` unquoted via `browserHome`; now quoted at every site plus a new `assertSafeAbsolutePath` as an independent second defence. (b) A configured account pool with no valid entry fell back to ccrotate's *global* rotation — fail-open, widening credential scope on a config typo; absent and invalid configuration are now distinguished. (c) The `data` volume is now ALWAYS declared (PVC-backed, else `emptyDir`), because the conditional mount from `551c461ef` merely moved the no-PVC failure from admission to an EACCES `mkdir` as runAsUser:1000. |
+| `b80b69218` | `src/server/env-guard.ts` | Converged shell unwrapping with `server/src/agent-shell-guard.ts`, adopting its `SHELL_COMMAND_PREFIX_RE` + `readShellCommandArgument` (a human closed the same unquoted-wrapper bypass there in `993bf304c`). Belt-and-braces with the boundary widening in `3e0244a78`: unwrapping is more precise for `sh -c`, the boundary rule is the only thing that reaches non-shell wrappers. Also corrected this file's header claim that the sibling copy was merely "four bypasses behind" — the divergence runs both ways. |
 
 The two cherry-picked commits in the composition above remain upstream commits
 authored against the fork, not Blockcast-local patches.
