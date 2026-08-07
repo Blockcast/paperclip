@@ -11875,8 +11875,22 @@ export function issueRoutes(
         // after another agent has taken over the issue.
         const boundaryDecision = await decideIssueAccess(req, issue, "issue:mutate");
         if (!boundaryDecision.allowed) {
-          respondIssueBoundaryDenied(res, boundaryDecision);
-          return;
+          // BLO-22670: that boundary is keyed to the issue's *current* trust
+          // posture (assignee, grants) — which the interaction's creator can
+          // lose the moment the issue changes hands, defeating the stale-card
+          // cleanup the comment above promises: the card becomes unwithdrawable
+          // by anyone (creator fails this boundary, the new assignee fails
+          // createdByAgentId below). The service's own createdByAgentId check
+          // is race-safe (re-applied in its UPDATE ... WHERE) and sufficient on
+          // its own, so give a genuine creator one more path through it instead
+          // of leaving the card permanently stuck.
+          const createdInteraction = actor.agentId
+            ? await issueThreadInteractionService(db).getById(interactionId)
+            : null;
+          if (!createdInteraction || createdInteraction.createdByAgentId !== actor.agentId) {
+            respondIssueBoundaryDenied(res, boundaryDecision);
+            return;
+          }
         }
         // Without a run id the watchdog scope above resolves to "none" and
         // silently stops confining the caller, so require one exactly as the
