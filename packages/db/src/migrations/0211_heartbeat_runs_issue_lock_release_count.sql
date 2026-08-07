@@ -1,0 +1,33 @@
+-- BLO-22060: make a stale-lock release durable so the 6h cap cannot be renewed
+-- by the same dead holder.
+--
+-- sweepStaleIssueLocks (server/src/services/recovery/service.ts) bounds a
+-- pre-claim issue lock at STALE_PRE_CLAIM_ISSUE_LOCK_MS measured from
+-- issues.execution_locked_at, and on expiry clears execution_run_id /
+-- execution_locked_at *without* cancelling the run — a `scheduled_retry` park
+-- must survive the release so it can still fire when its deadline arrives.
+--
+-- That post-sweep state (execution_run_id null, run still parked) is exactly
+-- the precondition for re-adoption in enqueueWakeup's legacy-run fallback:
+-- the fallback selects any run for the issue whose status is queued/running/
+-- scheduled_retry, has no exclusion for the run that just lost the lock, and
+-- cancelStaleScheduledRetry declines to cancel a park belonging to the issue's
+-- own assignee. It then re-stamps execution_locked_at = now(). The clock
+-- restarts, so a capacity park deadlined days out could re-acquire a fresh 6h
+-- lock on every wake, indefinitely.
+--
+-- The release therefore has to leave a mark on the run itself; the issue row is
+-- the wrong place because the sweep nulls it. This counter is that mark.
+-- Adoption declines once it reaches MAX_SCHEDULED_RETRY_ISSUE_LOCK_RELEASES,
+-- which bounds total lock time attributable to one parked run at a single
+-- window regardless of wake volume.
+--
+-- Backfilled to 0: pre-existing rows have no recorded release, so they keep
+-- exactly one more adoption. That is the conservative direction — it cannot
+-- strand a run that is legitimately mid-flight at deploy time, and any run that
+-- is genuinely wedged gets bounded on its next sweep release.
+--
+-- ADD COLUMN with a non-volatile DEFAULT is a catalog-only rewrite on
+-- PostgreSQL 11+, so this does not scan heartbeat_runs (~1.8 GB) and holds
+-- ACCESS EXCLUSIVE only for the catalog update.
+ALTER TABLE "heartbeat_runs" ADD COLUMN "issue_lock_release_count" integer DEFAULT 0 NOT NULL;

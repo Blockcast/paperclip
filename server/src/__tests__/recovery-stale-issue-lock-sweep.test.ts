@@ -605,6 +605,11 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     const result = await sweepPromise!;
 
     expect(result.cleared).toBe(0);
+    // BLO-22060: a bump landing on the sweep's own 30s cadence can starve the
+    // clear indefinitely, and `cleared: 0` alone reads identically to a quiet
+    // pass. Count the bailout so the starvation is observable.
+    expect(result.skippedByConcurrentLockChange).toBe(1);
+    expect(result.skippedByConcurrentLockChangeIssueIds).toEqual([issueId]);
     const row = await db
       .select({
         executionRunId: issues.executionRunId,
@@ -1265,6 +1270,10 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     scheduledRetryAt: Date;
     scheduledRetryReason?: string | null;
     sameRunHoldsCheckout?: boolean;
+    // Only the wake-driven case needs this: enqueueWakeup resolves a
+    // responsible user before it can seed a run, and throws 422 without one.
+    // Left null by default so the sweep-only cases keep their existing shape.
+    responsibleUserId?: string | null;
   }) {
     const wedgedRunId = randomUUID();
     const issueId = randomUUID();
@@ -1288,6 +1297,7 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       status: "in_progress",
       priority: "critical",
       assigneeAgentId: input.agentId,
+      responsibleUserId: input.responsibleUserId ?? null,
       checkoutRunId: input.sameRunHoldsCheckout === false ? null : wedgedRunId,
       executionRunId: wedgedRunId,
       executionLockedAt: input.lockedAt,
@@ -1351,6 +1361,94 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0]);
     expect(row?.executionRunId).toBeNull();
+  });
+
+  // BLO-22060: the cap the test above proves is renewable unless the release is
+  // recorded on the run. The sweep deliberately leaves the parked run alive, and
+  // enqueueWakeup's legacy-run fallback re-selected exactly that run —
+  // cancelStaleScheduledRetry declines to cancel a park owned by the issue's own
+  // assignee — then re-stamped executionLockedAt = now(). One wake restored the
+  // full 6h window, so a capacity park deadlined days out kept the issue out of
+  // service for its assignee indefinitely, in 6h slices rather than one block.
+  it("does not let a wake re-adopt a parked retry whose lock the sweep already released (BLO-22060)", async () => {
+    const { companyId, agentId } = await seed();
+    const { issueId, wedgedRunId } = await seedWedgedScheduledRetryIssue({
+      companyId,
+      agentId,
+      lockedAt: new Date(Date.now() - 13 * 60 * 60 * 1000),
+      // Capacity parks take their horizon from the provider's reset, so the
+      // deadline is routinely days out — the whole window this bug covers.
+      scheduledRetryAt: new Date(Date.now() + 3 * 24 * 60 * 60 * 1000),
+      sameRunHoldsCheckout: false,
+      responsibleUserId: "responsible-user",
+    });
+
+    const heartbeat = heartbeatService(db, { skipQueuedRunDispatch: true });
+
+    const sweep = await heartbeat.sweepStaleIssueLocks();
+    expect(sweep.cleared).toBe(1);
+    expect(sweep.issueIds).toContain(issueId);
+
+    // The release is recorded on the run, because the issue columns it was
+    // recorded on are exactly what the sweep just nulled.
+    const releasedRun = await db
+      .select({
+        status: heartbeatRuns.status,
+        issueLockReleaseCount: heartbeatRuns.issueLockReleaseCount,
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, wedgedRunId))
+      .then((rows) => rows[0]);
+    expect(releasedRun?.issueLockReleaseCount).toBe(1);
+    // The park itself survives — the sweep releases the lock, it does not cancel
+    // the retry, so the run still fires when its deadline arrives.
+    expect(releasedRun?.status).toBe("scheduled_retry");
+
+    // `manual` is user-initiated and so bypasses the ccrotate availability gate,
+    // keeping this hermetic. The adoption path under test is shared by every
+    // wake source.
+    await heartbeat.enqueueWakeup(agentId, {
+      source: "manual",
+      reason: "issue_assigned",
+      contextSnapshot: { issueId },
+      payload: { issueId },
+    });
+
+    const afterWake = await db
+      .select({
+        executionRunId: issues.executionRunId,
+        executionLockedAt: issues.executionLockedAt,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+
+    // The core assertion: the burnt-out park is not the holder again. Before the
+    // fix this was `wedgedRunId` with a brand-new executionLockedAt.
+    expect(afterWake?.executionRunId).not.toBe(wedgedRunId);
+    // And the sweep's release stays effective: nothing re-armed a 6h window on
+    // behalf of the run that just lost one.
+    const reReleasedRun = await db
+      .select({ issueLockReleaseCount: heartbeatRuns.issueLockReleaseCount })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, wedgedRunId))
+      .then((rows) => rows[0]);
+    expect(reReleasedRun?.issueLockReleaseCount).toBe(1);
+
+    // Idempotent under wake volume: the bound is on the run, not on the wake, so
+    // repeat wakes cannot walk it back.
+    await heartbeat.enqueueWakeup(agentId, {
+      source: "manual",
+      reason: "issue_assigned",
+      contextSnapshot: { issueId },
+      payload: { issueId },
+    });
+    const afterSecondWake = await db
+      .select({ executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(afterSecondWake?.executionRunId).not.toBe(wedgedRunId);
   });
 
   it.each([

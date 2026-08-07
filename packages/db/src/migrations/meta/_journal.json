@@ -1422,6 +1422,13 @@
       "when": 1785514532668,
       "tag": "0210_approval_linked_agent",
       "breakpoints": true
+    },
+    {
+      "idx": 211,
+      "version": "7",
+      "when": 1785600000000,
+      "tag": "0211_heartbeat_runs_issue_lock_release_count",
+      "breakpoints": true
     }
   ]
 }

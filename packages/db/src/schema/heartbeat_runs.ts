@@ -44,6 +44,16 @@ export const heartbeatRuns = pgTable(
       onDelete: "set null",
     }),
     processLossRetryCount: integer("process_loss_retry_count").notNull().default(0),
+    // BLO-22060: how many times sweepStaleIssueLocks has released an issue
+    // execution lock held by this run. The sweep deliberately does not cancel
+    // the run, so a run parked at `scheduled_retry` survives the release and
+    // was previously free to be re-adopted as the issue's executionRunId by
+    // enqueueWakeup's legacy-run fallback — re-stamping executionLockedAt and
+    // resetting the 6h staleness clock on every wake. This counter is what
+    // makes that release durable: adoption declines once it reaches
+    // MAX_SCHEDULED_RETRY_ISSUE_LOCK_RELEASES, so total lock time attributable
+    // to one parked run is bounded no matter how many wakes arrive.
+    issueLockReleaseCount: integer("issue_lock_release_count").notNull().default(0),
     scheduledRetryAt: timestamp("scheduled_retry_at", { withTimezone: true }),
     scheduledRetryAttempt: integer("scheduled_retry_attempt").notNull().default(0),
     scheduledRetryReason: text("scheduled_retry_reason"),
