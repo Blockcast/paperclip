@@ -18,10 +18,15 @@ export function isSensitiveEnvKey(key: string): boolean {
 }
 
 export function isPlausiblySensitiveEnvValue(value: string): boolean {
-  if (CREDENTIAL_VALUE_RES.some((re) => re.test(value))) return true;
-  if (value.length < 24 || /\s/.test(value)) return false;
-  if (!/^[A-Za-z0-9+/=_\-.]+$/.test(value)) return false;
-  const classes = [/[a-z]/.test(value), /[A-Z]/.test(value), /[0-9]/.test(value)];
+  const normalizedValue = value.trim();
+  if (CREDENTIAL_VALUE_RES.some((re) => re.test(normalizedValue))) return true;
+  if (normalizedValue.length < 24 || /\s/.test(normalizedValue)) return false;
+  if (!/^[A-Za-z0-9+/=_\-.]+$/.test(normalizedValue)) return false;
+  const classes = [
+    /[a-z]/.test(normalizedValue),
+    /[A-Z]/.test(normalizedValue),
+    /[0-9]/.test(normalizedValue),
+  ];
   return classes.filter(Boolean).length >= 2;
 }
 

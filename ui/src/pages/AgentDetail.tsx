@@ -105,7 +105,7 @@ import {
   type LiveEvent,
   type WorkspaceOperation,
   isResponsibleUserDenialCode,
-  isSensitiveEnvKey,
+  isSensitiveEnv,
   responsibleUserLabel,
 } from "@paperclipai/shared";
 import { ResponsibleUserDenialNotice } from "../components/ResponsibleUserDenialNotice";
@@ -156,12 +156,11 @@ function redactCommandText(value: string, censorUsernameInLogs: boolean): string
 }
 
 function shouldRedactSecretValue(key: string, value: unknown): boolean {
-  if (isSensitiveEnvKey(key)) return true;
   if (typeof value !== "string") return false;
-  return JWT_VALUE_RE.test(value);
+  return isSensitiveEnv(key, value) || JWT_VALUE_RE.test(value);
 }
 
-function redactEnvValue(key: string, value: unknown, censorUsernameInLogs: boolean): string {
+export function redactEnvValue(key: string, value: unknown, censorUsernameInLogs: boolean): string {
   if (
     typeof value === "object" &&
     value !== null &&

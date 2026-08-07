@@ -11,7 +11,7 @@ import {
   MODEL_PROFILE_KEYS,
   PROVIDER_QUOTA_MONITOR_SERVICE_NAME,
   envBindingSchema,
-  isSensitiveEnvKey,
+  isSensitiveEnv,
   isEnvironmentDriverSupportedForAdapter,
   type BillingType,
   type CostStatus,
@@ -1423,16 +1423,18 @@ function assertLowTrustEnvConfigAllowed(envValue: unknown, source: string) {
     const parsed = envBindingSchema.safeParse(rawBinding);
     if (!parsed.success) continue;
     const binding = parsed.data;
-    const isPlainBinding =
-      typeof binding === "string" ||
-      (typeof binding === "object" && binding !== null && binding.type === "plain");
+    const plainValue = typeof binding === "string"
+      ? binding
+      : binding.type === "plain"
+        ? binding.value
+        : null;
     // Agent-scope-only keys hold a raw credential by construction, but do not
     // match the name-shaped heuristic below (GH_SEAT_TOKEN_VALUE contains no
     // "secret"/"auth"/"access_token" substring). Treat them as sensitive
     // explicitly so a low-trust run cannot inline one; it must use a
     // secret_ref. Safe to add with this PR because the key is new here — no
     // existing config can be relying on the inline form.
-    if (isPlainBinding && (isSensitiveEnvKey(key) || isAgentScopeOnlyEnvKey(key))) {
+    if (plainValue !== null && (isSensitiveEnv(key, plainValue) || isAgentScopeOnlyEnvKey(key))) {
       throw new HttpError(422, `Low-trust execution cannot use inline sensitive env value ${source}.${key}`, {
         code: "low_trust_inline_sensitive_env_denied",
       });

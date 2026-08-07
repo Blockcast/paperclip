@@ -24,6 +24,7 @@ describe("sensitive env detection", () => {
 
   it("recognizes credential-shaped values without exposing their contents", () => {
     expect(isPlausiblySensitiveEnvValue("ghp_0123456789abcdef0123456789abcdef")).toBe(true);
+    expect(isPlausiblySensitiveEnvValue("  ghp_0123456789abcdef0123456789abcdef\n")).toBe(true);
     expect(isPlausiblySensitiveEnvValue("production")).toBe(false);
   });
 });
