@@ -8693,12 +8693,17 @@ export function isConfirmedAdapterTimeout(
 }
 
 export function isSuccessfulAdapterResult(
-  result: Pick<AdapterExecutionResult, "timedOut" | "exitCode" | "errorMessage" | "resultJson">,
+  result: Pick<AdapterExecutionResult, "timedOut" | "exitCode" | "errorMessage" | "errorCode" | "resultJson">,
 ): boolean {
   const processSucceeded =
     (result.exitCode ?? 0) === 0 ||
     (result.resultJson?.subtype === "success" && !result.resultJson?.is_error);
-  const falseTimeoutError = result.timedOut === true && result.exitCode === 0;
+  const falseTimeoutError =
+    result.timedOut === true &&
+    result.exitCode === 0 &&
+    result.errorCode === "timeout" &&
+    typeof result.errorMessage === "string" &&
+    /^Timed out after [0-9]+s$/.test(result.errorMessage.trim());
   return processSucceeded && (!result.errorMessage || falseTimeoutError);
 }
 
