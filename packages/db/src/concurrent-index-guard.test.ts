@@ -13,7 +13,11 @@
 import { afterEach, describe, expect, it } from "vitest";
 import postgres from "postgres";
 import { applyPendingMigrations } from "./client.js";
-import { ensurePendingConcurrentIndexes, type ConcurrentIndexSpec } from "./concurrent-index-guard.js";
+import {
+  ensurePendingConcurrentIndexes,
+  SERIALIZING_LOCK_KEY,
+  type ConcurrentIndexSpec,
+} from "./concurrent-index-guard.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -106,6 +110,9 @@ describeEmbeddedPostgres("ensurePendingConcurrentIndexes", () => {
       migration: "0212_heartbeat_runs_crash_recovery_index.sql",
       name: INDEX_NAME,
       table: "heartbeat_runs",
+      accessMethod: "btree",
+      keyColumns: ["finished_at", "id"],
+      predicate: "error_code = 'worker_crashed'::text AND crash_recovery_completed_at IS NULL",
       // References a column that does not exist, so the build itself fails
       // and this must surface as a thrown error, not a silently-empty result.
       createStatement:
@@ -117,5 +124,63 @@ describeEmbeddedPostgres("ensurePendingConcurrentIndexes", () => {
     await expect(
       ensurePendingConcurrentIndexes(database.connectionString, { specs: [brokenSpec] }),
     ).rejects.toThrow();
+  }, 60_000);
+
+  it("throws instead of silently trusting a same-named index with a different definition (BLO-21526 review)", async () => {
+    const { database, sql } = await seedPopulatedDatabaseWithoutIndex();
+    // Same name, same predicate, but the key columns are reversed. Postgres
+    // has no notion that this doesn't match what the guard expects -- it is
+    // a perfectly valid, ready index -- so only the structural check catches
+    // it, and it must not be silently dropped and rebuilt (it could be a
+    // legitimate index this check simply doesn't recognize).
+    await sql.unsafe(
+      `CREATE INDEX CONCURRENTLY ${INDEX_NAME} ON heartbeat_runs USING btree (id, finished_at) ` +
+        "WHERE error_code = 'worker_crashed' AND crash_recovery_completed_at IS NULL",
+    );
+
+    await expect(ensurePendingConcurrentIndexes(database.connectionString)).rejects.toThrow(
+      /does not match migration 0212_heartbeat_runs_crash_recovery_index\.sql's definition/,
+    );
+
+    const [{ indisvalid }] = await sql<{ indisvalid: boolean }[]>`
+      select indisvalid from pg_index where indexrelid = to_regclass(${`public.${INDEX_NAME}`})
+    `;
+    expect(indisvalid).toBe(true);
+    const [{ indexdef }] = await sql<{ indexdef: string }[]>`
+      select indexdef from pg_indexes where indexname = ${INDEX_NAME}
+    `;
+    expect(indexdef).toContain("(id, finished_at)");
+  }, 60_000);
+
+  it("serializes concurrent callers with a session-scoped advisory lock (BLO-21526 review)", async () => {
+    const { database } = await seedPopulatedDatabaseWithoutIndex();
+
+    // Simulate a first caller already mid-build by holding the same
+    // session-scoped advisory lock ensurePendingConcurrentIndexes takes
+    // internally -- from a caller's point of view, a real first caller and
+    // this holder connection are indistinguishable, so this exercises the
+    // exact serialization the guard promises without depending on Postgres's
+    // own CREATE INDEX CONCURRENTLY internals to create a race window (they
+    // resolve too fast against this tiny test table to reliably straddle a
+    // held-open blocking transaction).
+    const holder = postgres(database.connectionString, { max: 1 });
+    cleanups.push(async () => holder.end());
+    await holder.unsafe(`select pg_advisory_lock(hashtextextended('${SERIALIZING_LOCK_KEY}', 0))`);
+
+    const second = ensurePendingConcurrentIndexes(database.connectionString);
+
+    // While the holder keeps the lock, the second caller must not resolve --
+    // race it against a short timer and confirm the timer wins.
+    const stillWaiting = Symbol("still-waiting");
+    const raceResult = await Promise.race([
+      second.then(() => "resolved" as const),
+      new Promise((resolve) => setTimeout(() => resolve(stillWaiting), 500)),
+    ]);
+    expect(raceResult).toBe(stillWaiting);
+
+    await holder.unsafe(`select pg_advisory_unlock(hashtextextended('${SERIALIZING_LOCK_KEY}', 0))`);
+
+    const results = await second;
+    expect(results).toEqual([{ name: INDEX_NAME, table: "heartbeat_runs", action: "created" }]);
   }, 60_000);
 });
