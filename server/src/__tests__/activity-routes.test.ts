@@ -215,6 +215,31 @@ describe.sequential("activity routes", () => {
     expect(res.body).toEqual([]);
   });
 
+  it("rejects a malformed ?agentId= instead of letting it reach the database as an invalid UUID", async () => {
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl).get("/api/companies/company-1/activity?agentId=not-a-uuid"),
+    );
+
+    expect(res.status).toBe(400);
+    expect(res.body.invalidParams).toEqual(["agentId"]);
+    expect(mockActivityService.list).not.toHaveBeenCalled();
+  });
+
+  it("accepts a well-formed ?agentId= UUID", async () => {
+    mockActivityService.list.mockResolvedValue([]);
+
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl).get("/api/companies/company-1/activity?agentId=11111111-1111-1111-1111-111111111111"),
+    );
+
+    expect(res.status).toBe(200);
+    expect(mockActivityService.list).toHaveBeenCalledWith(
+      expect.objectContaining({ agentId: "11111111-1111-1111-1111-111111111111" }),
+    );
+  });
+
   it("rejects unknown query parameters on company activity with a 400 naming the key", async () => {
     const app = await createApp();
     const res = await requestApp(app, (baseUrl) =>

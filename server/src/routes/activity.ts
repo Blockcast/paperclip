@@ -30,6 +30,8 @@ const companyActivityQuerySchema = z.object({
   limit: z.string().optional(),
 });
 
+const uuidQueryParamSchema = z.string().uuid();
+
 // A caller who mistypes or invents a filter key on an audit surface must not get a plausible-looking
 // unfiltered page back — that reads as "verified absent" instead of "filter never applied" (BLO-21979).
 function rejectUnsupportedQueryParams(req: { query: Record<string, unknown> }, res: any, allowed: Set<string>) {
@@ -108,6 +110,17 @@ export function activityRoutes(db: Db) {
       res.status(400).json({
         error: `Query parameter${emptyParams.length === 1 ? "" : "s"} must not be empty: ${emptyParams.join(", ")}`,
         emptyParams,
+      });
+      return;
+    }
+
+    // openapi.ts documents `agentId` as a UUID; enforce that at runtime too, otherwise a malformed
+    // value (e.g. `?agentId=not-a-uuid`) reaches the Drizzle `eq` against the UUID column and Postgres
+    // rejects it, turning a client input error into an unhandled 500 instead of the documented 400 (BLO-21979).
+    if (parsedQuery.data.agentId !== undefined && !uuidQueryParamSchema.safeParse(parsedQuery.data.agentId).success) {
+      res.status(400).json({
+        error: "Query parameter agentId must be a valid UUID",
+        invalidParams: ["agentId"],
       });
       return;
     }
