@@ -140,6 +140,12 @@ type ProductivityReviewEvidence = {
   sourceAgent: AgentRow;
   noCommentStreak: number;
   runtimeFailureStreak: number;
+  // BLO-22097: whether the runtime-failure streak's "no model turn" evidence
+  // is a *measured* zero-token usage blob, an *inferred* call (null usage,
+  // corroborated only by low/missing log volume), or a mix — see
+  // `isNeverExecutedRun`. Evidence text must not claim "0 input/output
+  // tokens" for a run where usage was never recorded at all.
+  runtimeFailureUsageBasis: "measured" | "inferred" | "mixed" | null;
   totalRunCount: number;
   terminalRunCount: number;
   activeRunCount: number;
@@ -764,6 +770,24 @@ function isNeverExecutedRun(
   }
   const { inputTokens, outputTokens } = runUsageTokenCounts(run.usageJson);
   return inputTokens === 0 && outputTokens === 0;
+}
+
+// BLO-22097: manager-facing evidence text must not claim a measured "0
+// input/output tokens" for a run whose usage was never recorded — that
+// overstates an inferred infrastructure classification as a fact. Only
+// runs with a present zero-token usage blob get the explicit-zero wording;
+// null-usage runs get "unavailable" wording naming the corroborator instead.
+function formatRuntimeFailureUsageEvidence(
+  basis: "measured" | "inferred" | "mixed" | null,
+): string {
+  if (basis === "measured") return "0 input/output tokens";
+  if (basis === "inferred") {
+    return "usage telemetry unavailable — low/missing log volume consistent with no model turn";
+  }
+  if (basis === "mixed") {
+    return "usage telemetry unavailable for some runs (low/missing log volume consistent with no model turn), explicit 0 input/output tokens for the rest";
+  }
+  return "usage telemetry unavailable";
 }
 
 /**
@@ -2093,10 +2117,25 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     // chance to comment — so it is filtered out of the walk entirely rather
     // than counted as silence or treated as a streak-breaker.
     let runtimeFailureStreak = 0;
+    let runtimeFailureSawMeasuredZero = false;
+    let runtimeFailureSawInferred = false;
     for (const run of terminalRuns) {
       if (!isNeverExecutedRun(run)) break;
       runtimeFailureStreak += 1;
+      if (run.usageJson == null) {
+        runtimeFailureSawInferred = true;
+      } else {
+        runtimeFailureSawMeasuredZero = true;
+      }
     }
+    const runtimeFailureUsageBasis: ProductivityReviewEvidence["runtimeFailureUsageBasis"] =
+      runtimeFailureStreak === 0
+        ? null
+        : runtimeFailureSawMeasuredZero && runtimeFailureSawInferred
+          ? "mixed"
+          : runtimeFailureSawInferred
+            ? "inferred"
+            : "measured";
     const executedTerminalRuns = terminalRuns.filter((run) => !isNeverExecutedRun(run));
     let noCommentStreak = 0;
     for (const run of executedTerminalRuns) {
@@ -2210,7 +2249,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     const triggerReasons: string[] = [];
     if (runtimeFailure) {
       triggerReasons.push(
-        `${runtimeFailureStreak} consecutive terminal runs produced zero model turns (failed liveness, 0 input/output tokens) — infrastructure failure, not agent silence`,
+        `${runtimeFailureStreak} consecutive terminal runs produced zero model turns (failed liveness, ${formatRuntimeFailureUsageEvidence(runtimeFailureUsageBasis)}) — infrastructure failure, not agent silence`,
       );
     }
     if (noComment) triggerReasons.push(`${noCommentStreak} consecutive terminal, turn-executing issue-linked runs had no run-created issue comment`);
@@ -2279,6 +2318,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       sourceAgent,
       noCommentStreak,
       runtimeFailureStreak,
+      runtimeFailureUsageBasis,
       totalRunCount: latestRuns.length,
       terminalRunCount: terminalRuns.length,
       activeRunCount,
@@ -2435,7 +2475,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       "",
       ...(evidence.trigger === "runtime_failure_streak"
         ? [
-          "This trigger fired because the sampled runs never executed a model turn (failed liveness, zero input/output tokens) — the assignee was never given a chance to act. This is an infrastructure signal, not an agent-performance verdict; do not decompose, block, or cancel the underlying work on the strength of this alone.",
+          `This trigger fired because the sampled runs never executed a model turn (failed liveness, ${formatRuntimeFailureUsageEvidence(evidence.runtimeFailureUsageBasis)}) — the assignee was never given a chance to act. This is an infrastructure signal, not an agent-performance verdict; do not decompose, block, or cancel the underlying work on the strength of this alone.`,
           "",
           "Route to platform/SRE for one of:",
           "- Diagnose and fix the underlying dispatch/runtime fault (crashloop, provider outage, retry exhaustion)",

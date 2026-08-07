@@ -562,6 +562,68 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(reviews[0]?.description).toContain("Primary trigger: `runtime_failure_streak`");
     expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 0");
     expect(reviews[0]?.description).toContain("Runtime-failure streak (terminal, never-executed runs): 10");
+    // BLO-22097 Ally follow-up: usage was never recorded for this run — the
+    // evidence must not claim a measured "0 input/output tokens".
+    expect(reviews[0]?.description).toContain(
+      "usage telemetry unavailable — low/missing log volume consistent with no model turn",
+    );
+    expect(reviews[0]?.description).not.toContain("0 input/output tokens");
+  });
+
+  // BLO-22097 Ally follow-up: pin the inclusive boundary of
+  // `NEVER_EXECUTED_UNKNOWN_USAGE_LOG_BYTES_CEILING` (200,000 bytes) itself,
+  // through a null-usage run rather than the explicit-zero-usage boundary
+  // control above (which bypasses this comparison entirely).
+  it("still excludes a null-usage run from the no-comment streak at the 200,000-byte logBytes ceiling, inclusive (BLO-22097)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+      status: "failed",
+      livenessState: "failed",
+      usageJson: null,
+      logBytes: 200_000,
+    });
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const reviews = await listProductivityReviews(seeded.companyId);
+    expect(reviews).toHaveLength(1);
+    expect(reviews[0]?.description).toContain("Primary trigger: `runtime_failure_streak`");
+    expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 0");
+    expect(reviews[0]?.description).toContain("Runtime-failure streak (terminal, never-executed runs): 10");
+  });
+
+  it("counts a null-usage run toward the no-comment streak one byte past the 200,000-byte logBytes ceiling (BLO-22097)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+      status: "failed",
+      livenessState: "failed",
+      usageJson: null,
+      logBytes: 200_001,
+    });
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const reviews = await listProductivityReviews(seeded.companyId);
+    expect(reviews).toHaveLength(1);
+    expect(reviews[0]?.description).toContain("Primary trigger: `no_comment_streak`");
+    expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 10");
+    expect(reviews[0]?.description).toContain("Runtime-failure streak (terminal, never-executed runs): 0");
   });
 
   // BLO-19094: an open review grants its assignee issue:comment/issue:mutate on
