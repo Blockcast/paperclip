@@ -1616,6 +1616,7 @@ export function createToolGatewayService(
     const actionRequest = input.actionRequest;
     const expiresAt = new Date(Date.now() + 60 * 60 * 1000);
 
+    const requiresFormalApproval = toolRequiresFormalApproval(input.tool);
     let signedArguments: ReturnType<typeof signToolArguments>;
     try {
       signedArguments = signToolArguments({
@@ -1624,6 +1625,7 @@ export function createToolGatewayService(
         canonicalArguments,
         approvalSnapshot: approvalSnapshot ?? undefined,
         executionOnApprove: true,
+        requiresFormalApproval,
         signingSecret: options.toolActionSigningSecret,
       });
     } catch (error) {
@@ -1699,7 +1701,7 @@ export function createToolGatewayService(
     }
 
     let formalApprovalId: string | null = null;
-    if (toolRequiresFormalApproval(input.tool)) {
+    if (requiresFormalApproval) {
       const [approval] = await db
         .insert(approvals)
         .values({
@@ -4371,6 +4373,7 @@ export function createToolGatewayService(
         canonicalArguments,
         approvalSnapshot: signedPayload.approvalSnapshot,
         executionOnApprove: true,
+        requiresFormalApproval: signedPayload.requiresFormalApproval,
         signingSecret: options.toolActionSigningSecret,
       })
     ) {
@@ -5375,6 +5378,23 @@ export function createToolGatewayService(
           "action_request_invalidated",
         );
       }
+      // The signed payload carries requiresFormalApproval from sign time,
+      // tamper-evident and independent of whether the approvalId column has
+      // been linked yet. Backfill lands the signature before the (slower)
+      // approvals-insert + interactionId/approvalId link (BLO-21490), so a
+      // concurrent approve landing in that gap must not read a still-null
+      // approvalId as "no formal approval required" — that would let a
+      // destructive-tool request execute without ever passing through the
+      // board approval gate. Treat the row as not-yet-approvable (retryable,
+      // not cancelled — it is still a live, correctly-signed request).
+      if (signedPayload.requiresFormalApproval === true && !actionRequest.approvalId) {
+        throw new ToolGatewayHttpError(
+          409,
+          "Tool action request is still being prepared for formal board approval; retry shortly",
+          "approval_link_pending",
+          { actionRequestId: actionRequest.id },
+        );
+      }
       if (actionRequest.approvalId) {
         const [formalApproval] = await db
           .select({ status: approvals.status })
@@ -5806,6 +5826,7 @@ export function createToolGatewayService(
             canonicalArguments: storedCanonical,
             approvalSnapshot: signedPayload.approvalSnapshot,
             executionOnApprove: signedPayload.executionOnApprove,
+            requiresFormalApproval: signedPayload.requiresFormalApproval,
             signingSecret: options.toolActionSigningSecret,
           })
         ) {

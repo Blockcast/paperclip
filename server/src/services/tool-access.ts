@@ -1,6 +1,6 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { and, asc, desc, eq, gte, inArray, lt, max, ne, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, isNull, lt, max, ne, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   activityLog,
@@ -5688,44 +5688,76 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       let visibleRequests = requests;
       if (status === "pending") {
         const signingGraceCutoff = Date.now() - ACTION_REQUEST_SIGNING_GRACE_MS;
-        const invalidRequestIds = requests
-          .filter((request) => {
-            // An orphaned row (no matching invocation) is never a
-            // signing-in-progress state — always invalid, grace or not.
-            const invocation = invocationById.get(request.invocationId);
-            if (!invocation) return true;
-            // Only the uninitialized signedArguments===null state gets the
-            // grace period: recordInvocation() may not have finished the
-            // async sign-and-backfill UPDATE yet, so don't treat a
-            // not-yet-signed row as corrupt (BLO-21490). A row that already
-            // carries a (malformed/stale-secret) signature is a real
-            // integrity failure and is validated immediately, regardless of
-            // age — the grace period must not mask that.
-            if (request.signedArguments === null) {
-              return request.createdAt.getTime() <= signingGraceCutoff;
+        // Rows the sweep should cancel outright: orphaned (no matching
+        // invocation) or carrying a signature that's already non-null but
+        // fails verification (malformed / stale signing secret). Neither of
+        // these self-heals, so a plain by-id cancel is safe.
+        const cancelNowIds: string[] = [];
+        // Rows whose signedArguments is still null and have aged past the
+        // grace window. These MIGHT self-heal: the async signer could win
+        // the backfill race between this read and the cancel write below, so
+        // the write is additionally guarded on signedArguments still being
+        // null (BLO-21490) — otherwise the sweep can cancel a row the signer
+        // just validated, orphaning a request the caller already believes
+        // succeeded.
+        const cancelIfStillUnsignedIds: string[] = [];
+        // Rows still inside the grace window with signedArguments===null.
+        // Not cancel-worthy, but also not safe to display: a reviewer
+        // approving one before the backfill lands would fail signature
+        // verification and get treated as invalid, denying what may be a
+        // perfectly valid in-flight request. Exclude from this read without
+        // touching status; the next poll picks it up once it's signed.
+        const pendingInitializationIds: string[] = [];
+        for (const request of requests) {
+          const invocation = invocationById.get(request.invocationId);
+          if (!invocation) {
+            cancelNowIds.push(request.id);
+            continue;
+          }
+          if (request.signedArguments === null) {
+            if (request.createdAt.getTime() <= signingGraceCutoff) {
+              cancelIfStillUnsignedIds.push(request.id);
+            } else {
+              pendingInitializationIds.push(request.id);
             }
-            try {
-              return !readSignedToolArgumentsPayload({
-                signedArguments: request.signedArguments,
-                invocationId: invocation.id,
-                toolName: invocation.toolName,
-              });
-            } catch {
-              return true;
-            }
-          })
-          .map((request) => request.id);
-        if (invalidRequestIds.length > 0) {
+            continue;
+          }
+          let valid: boolean;
+          try {
+            valid = Boolean(readSignedToolArgumentsPayload({
+              signedArguments: request.signedArguments,
+              invocationId: invocation.id,
+              toolName: invocation.toolName,
+            }));
+          } catch {
+            valid = false;
+          }
+          if (!valid) cancelNowIds.push(request.id);
+        }
+        if (cancelNowIds.length > 0) {
           await db
             .update(toolActionRequests)
             .set({ status: "cancelled", resolvedAt: new Date(), updatedAt: new Date() })
             .where(and(
               eq(toolActionRequests.companyId, companyId),
               eq(toolActionRequests.status, "pending"),
-              inArray(toolActionRequests.id, invalidRequestIds),
+              inArray(toolActionRequests.id, cancelNowIds),
             ));
-          const invalidIds = new Set(invalidRequestIds);
-          visibleRequests = requests.filter((request) => !invalidIds.has(request.id));
+        }
+        if (cancelIfStillUnsignedIds.length > 0) {
+          await db
+            .update(toolActionRequests)
+            .set({ status: "cancelled", resolvedAt: new Date(), updatedAt: new Date() })
+            .where(and(
+              eq(toolActionRequests.companyId, companyId),
+              eq(toolActionRequests.status, "pending"),
+              isNull(toolActionRequests.signedArguments),
+              inArray(toolActionRequests.id, cancelIfStillUnsignedIds),
+            ));
+        }
+        const excludedIds = new Set([...cancelNowIds, ...cancelIfStillUnsignedIds, ...pendingInitializationIds]);
+        if (excludedIds.size > 0) {
+          visibleRequests = requests.filter((request) => !excludedIds.has(request.id));
         }
       }
       if (visibleRequests.length === 0) return [];
