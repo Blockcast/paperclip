@@ -10,6 +10,7 @@ describe("heartbeat timeout outcome", () => {
       timedOut: true,
       exitCode: 0,
       errorMessage: "Timed out after 3600s",
+      errorCode: "timeout",
       resultJson: null,
     };
     expect(isConfirmedAdapterTimeout(malformedResult)).toBe(false);
@@ -27,7 +28,18 @@ describe("heartbeat timeout outcome", () => {
       timedOut: false,
       exitCode: 1,
       errorMessage: "adapter failed",
+      errorCode: "adapter_failed",
       resultJson: null,
+    })).toBe(false);
+  });
+
+  it("does not suppress a non-timeout error that accompanies exit zero", () => {
+    expect(isSuccessfulAdapterResult({
+      timedOut: true,
+      exitCode: 0,
+      errorMessage: "Result publication failed",
+      errorCode: "timeout",
+      resultJson: { summary: "work completed" },
     })).toBe(false);
   });
 });

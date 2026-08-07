@@ -26,7 +26,7 @@ afterEach(async () => {
 }, 60_000);
 
 describeEmbeddedPostgres("heartbeat timeout outcome repair migration", () => {
-  it("repairs only exit-zero timeouts without writing generated result columns", async () => {
+  it("repairs only confirmed exit-zero timeouts and their linked wake requests", async () => {
     const database = await startEmbeddedPostgresTestDatabase("paperclip-timeout-repair-");
     cleanups.push(database.cleanup);
     const sql = postgres(database.connectionString, { max: 1, onnotice: () => {} });
@@ -36,7 +36,11 @@ describeEmbeddedPostgres("heartbeat timeout outcome repair migration", () => {
     const agentId = randomUUID();
     const correctedRunId = randomUUID();
     const genuineTimeoutRunId = randomUUID();
+    const ambiguousRunId = randomUUID();
     const existingSuccessRunId = randomUUID();
+    const correctedWakeupId = randomUUID();
+    const genuineTimeoutWakeupId = randomUUID();
+    const ambiguousWakeupId = randomUUID();
 
     await sql`
       DELETE FROM "drizzle"."__drizzle_migrations"
@@ -51,10 +55,25 @@ describeEmbeddedPostgres("heartbeat timeout outcome repair migration", () => {
       VALUES (${agentId}, ${companyId}, 'Timeout migration agent', 'engineer', 'process', '{}'::jsonb)
     `;
     await sql`
+      INSERT INTO "agent_wakeup_requests" (
+        "id",
+        "company_id",
+        "agent_id",
+        "source",
+        "status",
+        "error"
+      )
+      VALUES
+        (${correctedWakeupId}, ${companyId}, ${agentId}, 'test', 'timed_out', 'Timed out after 300s'),
+        (${genuineTimeoutWakeupId}, ${companyId}, ${agentId}, 'test', 'timed_out', 'Timed out after 300s'),
+        (${ambiguousWakeupId}, ${companyId}, ${agentId}, 'test', 'timed_out', 'Result publication failed')
+    `;
+    await sql`
       INSERT INTO "heartbeat_runs" (
         "id",
         "company_id",
         "agent_id",
+        "wakeup_request_id",
         "status",
         "error",
         "error_code",
@@ -68,12 +87,11 @@ describeEmbeddedPostgres("heartbeat timeout outcome repair migration", () => {
           ${correctedRunId},
           ${companyId},
           ${agentId},
+          ${correctedWakeupId},
           'timed_out',
-          'Timed out',
+          'Timed out after 300s',
           'timeout',
           ${sql.json({
-            error: "old error",
-            message: "old message",
             stopReason: "timeout",
             timeoutFired: true,
             timeoutSource: "adapter",
@@ -87,6 +105,7 @@ describeEmbeddedPostgres("heartbeat timeout outcome repair migration", () => {
           ${genuineTimeoutRunId},
           ${companyId},
           ${agentId},
+          ${genuineTimeoutWakeupId},
           'timed_out',
           'Timed out',
           'timeout',
@@ -96,9 +115,23 @@ describeEmbeddedPostgres("heartbeat timeout outcome repair migration", () => {
           137
         ),
         (
+          ${ambiguousRunId},
+          ${companyId},
+          ${agentId},
+          ${ambiguousWakeupId},
+          'timed_out',
+          'Result publication failed',
+          'timeout',
+          ${sql.json({ error: "publish failed", message: "real result", kept: "yes" })},
+          'stalled',
+          'timeout',
+          0
+        ),
+        (
           ${existingSuccessRunId},
           ${companyId},
           ${agentId},
+          NULL,
           'succeeded',
           NULL,
           NULL,
@@ -139,7 +172,7 @@ describeEmbeddedPostgres("heartbeat timeout outcome repair migration", () => {
         "liveness_reason",
         "exit_code"
       FROM "heartbeat_runs"
-      WHERE "id" IN (${correctedRunId}, ${genuineTimeoutRunId}, ${existingSuccessRunId})
+      WHERE "id" IN (${correctedRunId}, ${genuineTimeoutRunId}, ${ambiguousRunId}, ${existingSuccessRunId})
     `;
     const rowsById = new Map(rows.map((row) => [row.id, row]));
 
@@ -172,11 +205,46 @@ describeEmbeddedPostgres("heartbeat timeout outcome repair migration", () => {
       liveness_reason: "timeout",
       exit_code: 137,
     });
+    expect(rowsById.get(ambiguousRunId)).toMatchObject({
+      status: "timed_out",
+      error: "Result publication failed",
+      error_code: "timeout",
+      result_json: { error: "publish failed", message: "real result", kept: "yes" },
+      result_error: "publish failed",
+      result_message: "real result",
+      liveness_state: "stalled",
+      liveness_reason: "timeout",
+      exit_code: 0,
+    });
     expect(rowsById.get(existingSuccessRunId)).toMatchObject({
       status: "succeeded",
       result_json: { message: "already good" },
       result_message: "already good",
       exit_code: 0,
+    });
+
+    const wakeups = await sql<{
+      id: string;
+      status: string;
+      error: string | null;
+    }[]>`
+      SELECT "id", "status", "error"
+      FROM "agent_wakeup_requests"
+      WHERE "id" IN (${correctedWakeupId}, ${genuineTimeoutWakeupId}, ${ambiguousWakeupId})
+    `;
+    const wakeupsById = new Map(wakeups.map((wakeup) => [wakeup.id, wakeup]));
+    expect(wakeupsById.get(correctedWakeupId)).toEqual({
+      id: correctedWakeupId,
+      status: "completed",
+      error: null,
+    });
+    expect(wakeupsById.get(genuineTimeoutWakeupId)).toMatchObject({
+      status: "timed_out",
+      error: "Timed out after 300s",
+    });
+    expect(wakeupsById.get(ambiguousWakeupId)).toMatchObject({
+      status: "timed_out",
+      error: "Result publication failed",
     });
     expect((await inspectMigrations(database.connectionString)).status).toBe("upToDate");
   }, 60_000);
