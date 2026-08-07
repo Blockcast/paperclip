@@ -353,6 +353,25 @@ describe("sanitizeRecord value-shape gate (BLO-20810)", () => {
     expect(result?.userAuthContext).toBe(REDACTED_EVENT_VALUE);
   });
 
+  // Confirmed live on a currently-pending approval card during BLO-20810
+  // verification (post-#943-merge census), not hypothetical: an
+  // `authoritative_state` field — Tier 2, since "auth" is a substring of
+  // "authoritative", the same collision class as "author" — carried a long
+  // whitespace-free status-slug value and was blanked by the generic
+  // opaque-token length backstop. The backstop must still catch a real
+  // unbroken opaque token of the same length.
+  it("does not redact a long whitespace-free status-slug value under an ambiguous key, but still redacts an equally long opaque token", () => {
+    const result = redactEventPayload({
+      authoritative_state: "pending_human_merge_review_required_for_pr_2132",
+      userAuthContext: "a1B2c3D4e5F6g7H8i9J0k1L2m3N4",
+    });
+
+    expect(result?.authoritative_state).toBe(
+      "pending_human_merge_review_required_for_pr_2132",
+    );
+    expect(result?.userAuthContext).toBe(REDACTED_EVENT_VALUE);
+  });
+
   // Residual finding (#943 review, post-tiering): `auth`/`secret` as a whole
   // token in a short key (<=2 tokens) is an ordinary credential field name,
   // not the "author"/"no_secrets_in_payload" collision Tier 2 exists for —
