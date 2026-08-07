@@ -23,108 +23,72 @@ import {
 import { handleWebhook } from "./webhook-handler.js";
 import { runAlertEscalationSweep } from "./escalation.js";
 import {
-  buildConfig,
-  isEmptyConfig,
+  configChangedRequiresRestart,
   resolveCompanyScope,
+  resolveSweepScope,
 } from "./config-scope.js";
-import type { AlertmanagerPluginConfig } from "./types.js";
 
 // ---------------------------------------------------------------------------
 // Module-level worker state
 //
-// Read ONLY by the escalation job. The webhook path must never consult these.
+// Deliberately just the context. There is NO cached config and NO cached
+// bearer token, and both omissions are load-bearing:
 //
-// `setup()` cannot populate them: plugin-loader.ts builds the bootstrap config
-// as a literal `{}` for every install, so the snapshot is always empty. The
-// only thing that ever sets them is `onConfigChanged`, which the host fires
-// per company without saying which one — so they hold "whichever company saved
-// config last". That is fine for a single-company install's escalation sweep
-// and actively wrong for authenticating a webhook, which is why deliveries
-// re-resolve from their own `companyId` instead.
-//
-// Deliberately no cached bearer token here: the SDK contract for
-// `ctx.secrets.resolve` is that secret values must never be cached, and a
-// cached token is exactly what let a worker restart silently disable auth.
+//  - A config snapshot here could only ever come from `onConfigChanged`, which
+//    the host fires per company without saying which one — so it would hold
+//    "whichever company saved config last" and be empty until the first save
+//    after every restart. Both readers now derive their own scope instead: a
+//    webhook from its delivery's `companyId`, the escalation sweep from the
+//    host's invocation scope. Keeping no global is what makes that structural
+//    rather than a convention someone can quietly read around.
+//  - The SDK contract for `ctx.secrets.resolve` is that secret values must
+//    never be cached, and a cached token is exactly what let a worker restart
+//    silently disable auth for every company (BLO-20467).
 // ---------------------------------------------------------------------------
 
 let pluginCtx: PluginContext | null = null;
-let pluginConfig: AlertmanagerPluginConfig | null = null;
-
-// ---------------------------------------------------------------------------
-// Internal: apply a freshly-resolved config snapshot to the worker's in-memory
-// state for the escalation job. Used by onConfigChanged() (operator edits the
-// instance config at runtime, no restart required).
-// ---------------------------------------------------------------------------
-
-async function applyConfig(
-  ctx: PluginContext,
-  config: AlertmanagerPluginConfig,
-): Promise<void> {
-  const previousScope = pluginConfig?.defaultCompanyId ?? null;
-  pluginConfig = buildConfig(config);
-
-  if (!pluginConfig.defaultCompanyId) {
-    ctx.logger.warn(
-      "paperclip-plugin-alertmanager: defaultCompanyId is not configured — the escalation sweep has no company scope and alert ladders will not advance; incoming webhook deliveries are unaffected (they resolve the delivering company per request)",
-    );
-    return;
-  }
-  // The escalation sweep runs for exactly one company: whichever one this
-  // config names. `onConfigChanged` does not say which company saved, so on a
-  // multi-company install a save by tenant B silently moves the sweep off
-  // tenant A. Log the transition so that reassignment is observable rather than
-  // invisible; the sweep itself stays self-consistent either way, because it
-  // reads `defaultCompanyId` out of the very config row it is holding.
-  if (previousScope && previousScope !== pluginConfig.defaultCompanyId) {
-    ctx.logger.warn(
-      `paperclip-plugin-alertmanager: escalation sweep scope moved from company ${previousScope} to ${pluginConfig.defaultCompanyId} — only one company is swept at a time (BLO-20595)`,
-    );
-  }
-}
 
 export const plugin = definePlugin({
   async setup(ctx) {
     pluginCtx = ctx;
-    const rawConfig = (await ctx.config.get()) as
-      | Record<string, unknown>
-      | null
-      | undefined;
-    if (isEmptyConfig(rawConfig)) {
-      // The normal path, on every install: plugin-loader.ts hands the worker a
-      // literal `{}`, because plugin config is company-scoped and setup() has
-      // no company context. Not a misconfiguration — webhook deliveries resolve
-      // their own company's config per request. Only the escalation sweep is
-      // affected, and it stays idle until an onConfigChanged supplies a scope.
-      ctx.logger.info(
-        "paperclip-plugin-alertmanager: bootstrap config is empty (expected — config is company-scoped); webhooks resolve config per delivery",
-      );
-    } else {
-      await applyConfig(ctx, rawConfig as unknown as AlertmanagerPluginConfig);
-    }
+    // Deliberately no config read here. Before `initialize` completes, an
+    // unscoped `ctx.config.get()` returns the bootstrap snapshot, which
+    // `plugin-loader.ts` builds as a literal `{}` on every install because
+    // plugin config is company-scoped and `setup()` has no company context.
+    // Reading it produced only misleading "not configured" warnings while the
+    // stored config was perfectly fine (BLO-20467). Both real readers resolve
+    // their own scope at call time instead.
     ctx.jobs.register("check-alert-escalations", async () => {
-      if (!pluginConfig) {
-        // Idle until the first onConfigChanged. Deliveries are unaffected —
-        // they resolve per request — but escalation ladders do not advance, so
-        // say so on every tick instead of no-op'ing silently. Fixing this needs
-        // a host API to enumerate a plugin's configured companies, which
-        // PluginConfigClient does not expose today (BLO-20595).
-        ctx.logger.warn(
-          "paperclip-plugin-alertmanager: escalation sweep skipped — no company scope yet (config is company-scoped and setup() receives none); alert escalation ladders are not advancing until an operator saves config (BLO-20595)",
-        );
-        return;
-      }
-      await runAlertEscalationSweep(ctx, pluginConfig);
+      // Scope comes from the host's invocation scope, resolved per tick — not
+      // from a config snapshot captured at setup or at the last save. See
+      // `resolveSweepScope` for why that is the only correct source, and for
+      // the multi-company limitation it surfaces (BLO-20595).
+      const config = await resolveSweepScope(ctx);
+      if (!config) return; // resolveSweepScope logged the reason
+      await runAlertEscalationSweep(ctx, config);
     });
     ctx.logger.info("paperclip-plugin-alertmanager started");
   },
 
-  async onConfigChanged(newConfig) {
-    const ctx = pluginCtx;
-    if (!ctx) return;
-    await applyConfig(ctx, newConfig as unknown as AlertmanagerPluginConfig);
-    ctx.logger.info(
-      "paperclip-plugin-alertmanager: config reloaded without restart",
+  async onConfigChanged() {
+    // Deliberately fails with METHOD_NOT_IMPLEMENTED so the host restarts this
+    // worker (`server/src/routes/plugins.ts` → `lifecycle.restartWorker`).
+    //
+    // Nothing here needs a live update — no config is cached in this worker, so
+    // the delivery path already sees this edit. The restart is for the one
+    // thing this worker CANNOT refresh in place: the escalation sweep's company
+    // scope, frozen into `bootstrapCompanyId` when the worker spawned. Only a
+    // restart recomputes it, so a `0 -> 1`, `1 -> 2`, or `2 -> 1` change in
+    // configured companies would otherwise leave the sweep running against a
+    // scope that no longer matches the config.
+    //
+    // Returning normally — as this hook used to — is what suppresses that
+    // restart, and so is not the harmless no-op it reads as. See
+    // `configChangedRequiresRestart` for the full mechanism.
+    pluginCtx?.logger.info(
+      "paperclip-plugin-alertmanager: config changed; requesting a worker restart so the escalation sweep's company scope is recomputed",
     );
+    throw configChangedRequiresRestart();
   },
 
   async onWebhook(input: PluginWebhookInput) {

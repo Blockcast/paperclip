@@ -13,8 +13,8 @@ import {
   ACCEPTED_SCHEMA_VERSIONS,
   WEBHOOK_KEYS,
   alertStateRef,
-  legacyInstanceAlertStateRef,
 } from "./constants.js";
+import { readAlertState, writeAlertState } from "./alert-state.js";
 import {
   alertMatchesLabelFilter,
   buildIssueDescription,
@@ -124,45 +124,6 @@ export function isAlertmanagerPayload(
 }
 
 /**
- * Read a fingerprint's dedup row from its owning company's scope, migrating a
- * pre-BLO-20467 instance-scoped row on first sight.
- *
- * The migration is gated on `paperclipCompanyId`: a legacy row is adopted only
- * by the company whose issue it actually tracks. A row belonging to another
- * tenant is ignored (and left in place), which is precisely the cross-tenant
- * reuse this change exists to stop. Without the read-through, every alert
- * firing at upgrade time would look new — duplicating live issues and orphaning
- * the originals so their resolution could never close them.
- */
-async function readAlertState(
-  ctx: PluginContext,
-  companyId: string,
-  fingerprint: string,
-): Promise<{ ref: ReturnType<typeof alertStateRef>; record: AlertStateRecord | null }> {
-  const ref = alertStateRef(companyId, fingerprint);
-  const scoped = (await ctx.state.get(ref)) as AlertStateRecord | null;
-  if (scoped) return { ref, record: scoped };
-
-  const legacyRef = legacyInstanceAlertStateRef(fingerprint);
-  const legacy = (await ctx.state.get(legacyRef)) as AlertStateRecord | null;
-  if (legacy && legacy.paperclipCompanyId === companyId) {
-    await ctx.state.set(ref, legacy);
-    try {
-      await ctx.state.delete(legacyRef);
-    } catch (err) {
-      // The scoped copy is already durable, so the migration has taken effect;
-      // a stale legacy row is inert (only this company could ever adopt it, and
-      // it will never be read again now that the scoped row exists).
-      ctx.logger.warn(
-        `paperclip-plugin-alertmanager: migrated alert ${fingerprint} to company scope but could not remove the legacy row: ${String(err)}`,
-      );
-    }
-    return { ref, record: legacy };
-  }
-  return { ref, record: null };
-}
-
-/**
  * §8.1 — first time we see a fingerprint, create an issue. On re-fire, just
  * bump `lastFiredAt` and re-emit the firing event. On re-fire after a manual
  * close, re-open the existing issue (§8.3 option A).
@@ -183,7 +144,7 @@ export async function handleFiring(
     );
     return;
   }
-  const { ref: stateRef, record: stateRecord } = await readAlertState(
+  const stateHandle = await readAlertState(
     ctx,
     companyId,
     alert.fingerprint,
@@ -198,7 +159,8 @@ export async function handleFiring(
   //
   // This is the same `state ?? recover-from-issue` fallback the resolved path
   // has always used; only the firing path was missing it.
-  const existing = stateRecord ?? (await recoverStateFromIssue(ctx, config, alert));
+  const existing =
+    stateHandle.record ?? (await recoverStateFromIssue(ctx, config, alert));
   const nowIso = new Date().toISOString();
   const alertname = alert.labels.alertname ?? "UnnamedAlert";
   const severity = alert.labels.severity ?? "unknown";
@@ -257,7 +219,7 @@ export async function handleFiring(
         ? escalationDeadlineMs(alert, config)
         : (existing.escalationIntervalMs ?? escalationDeadlineMs(alert, config)),
     };
-    await ctx.state.set(stateRef, updated);
+    await writeAlertState(ctx, stateHandle, updated);
 
     await ctx.events.emit(
       "alertmanager.alert.firing",
@@ -365,7 +327,7 @@ export async function handleFiring(
     escalationComplete: false,
     escalationIntervalMs: escalationDeadlineMs(alert, config),
   };
-  await ctx.state.set(stateRef, record);
+  await writeAlertState(ctx, stateHandle, record);
 
   await ctx.events.emit("alertmanager.alert.firing", companyId, {
     fingerprint: alert.fingerprint,
@@ -429,12 +391,12 @@ export async function handleResolved(
     );
     return;
   }
-  const { ref: stateRef, record: stateRecord } = await readAlertState(
+  const resolveHandle = await readAlertState(
     ctx,
     companyId,
     alert.fingerprint,
   );
-  const existing = stateRecord ?? (await recoverStateFromIssue(ctx, config, alert));
+  const existing = resolveHandle.record ?? (await recoverStateFromIssue(ctx, config, alert));
   if (!existing) {
     ctx.logger.info(
       `Alertmanager: resolved for unknown fingerprint ${alert.fingerprint}, dropping`,
@@ -480,7 +442,7 @@ export async function handleResolved(
     nextEscalationAt: null,
     escalationComplete: true,
   };
-  await ctx.state.set(stateRef, updated);
+  await writeAlertState(ctx, resolveHandle, updated);
 
   await ctx.events.emit(
     "alertmanager.alert.resolved",
