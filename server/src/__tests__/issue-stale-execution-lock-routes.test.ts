@@ -133,6 +133,32 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
     return { companyId, agentId, currentRunId, competingRunId, issueId };
   }
 
+  async function seedUnlockedAssignedReview() {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const competingRunId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: competingRunId,
+      companyId,
+      agentId,
+      status: "running",
+      invocationSource: "manual",
+      startedAt: new Date(),
+      createdAt: new Date("2026-01-01T00:02:00.000Z"),
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Unlocked assigned review",
+      status: "in_review",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: null,
+      executionRunId: null,
+    });
+    return { companyId, agentId, currentRunId, competingRunId, issueId };
+  }
+
   async function seedCompanyAgentAndRuns(options: { staleRunStatus?: string } = {}) {
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -360,6 +386,101 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
     expect(workProduct.status, JSON.stringify(workProduct.body)).toBe(409);
     expect(workProduct.body.error).toBe("Issue run ownership conflict");
     expect(await db.select().from(issueWorkProducts).where(eq(issueWorkProducts.issueId, seeded.issueId))).toEqual([]);
+  });
+
+  it("rejects an ordinary unlocked in_review delete after another run checks out", async () => {
+    const seeded = await seedUnlockedAssignedReview();
+    const authorized = deferred();
+    const continueWrite = deferred();
+    const staleDelete = request(createApp(
+      agentActor(seeded.companyId, seeded.agentId, seeded.currentRunId),
+      {
+        pendingInReviewMutationBeforeGuardHook: async () => {
+          authorized.resolve();
+          await continueWrite.promise;
+        },
+      },
+    ))
+      .delete(`/api/issues/${seeded.issueId}`)
+      .then((response) => response);
+
+    await authorized.promise;
+    const checkout = await request(createApp(
+      agentActor(seeded.companyId, seeded.agentId, seeded.competingRunId),
+    ))
+      .post(`/api/issues/${seeded.issueId}/checkout`)
+      .send({ agentId: seeded.agentId, expectedStatuses: ["in_review"] });
+    expect(checkout.status, JSON.stringify(checkout.body)).toBe(200);
+
+    continueWrite.resolve();
+    const deleted = await staleDelete;
+    expect(deleted.status, JSON.stringify(deleted.body)).toBe(409);
+    expect(deleted.body.error).toBe("Issue run ownership conflict");
+
+    const row = await db
+      .select({
+        status: issues.status,
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+      })
+      .from(issues)
+      .where(eq(issues.id, seeded.issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({
+      status: "in_progress",
+      checkoutRunId: seeded.competingRunId,
+      executionRunId: seeded.competingRunId,
+    });
+  });
+
+  it("rejects a bundled PATCH comment when checkout wins after the issue update", async () => {
+    const seeded = await seedUnlockedPendingReview();
+    const updateCommitted = deferred();
+    const continueComment = deferred();
+    let guardCalls = 0;
+    const stalePatch = request(createApp(
+      agentActor(seeded.companyId, seeded.agentId, seeded.currentRunId),
+      {
+        pendingInReviewMutationBeforeGuardHook: async () => {
+          guardCalls += 1;
+          if (guardCalls !== 2) return;
+          updateCommitted.resolve();
+          await continueComment.promise;
+        },
+      },
+    ))
+      .patch(`/api/issues/${seeded.issueId}`)
+      .send({ title: "Updated before checkout", comment: "Bundled stale comment" })
+      .then((response) => response);
+
+    await updateCommitted.promise;
+    const checkout = await request(createApp(
+      agentActor(seeded.companyId, seeded.agentId, seeded.competingRunId),
+    ))
+      .post(`/api/issues/${seeded.issueId}/checkout`)
+      .send({ agentId: seeded.agentId, expectedStatuses: ["in_review"] });
+    expect(checkout.status, JSON.stringify(checkout.body)).toBe(200);
+
+    continueComment.resolve();
+    const patch = await stalePatch;
+    expect(patch.status, JSON.stringify(patch.body)).toBe(409);
+    expect(patch.body.error).toBe("Issue run ownership conflict");
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, seeded.issueId))).toEqual([]);
+
+    const row = await db
+      .select({
+        title: issues.title,
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+      })
+      .from(issues)
+      .where(eq(issues.id, seeded.issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({
+      title: "Updated before checkout",
+      checkoutRunId: seeded.competingRunId,
+      executionRunId: seeded.competingRunId,
+    });
   });
 
   function agentActor(companyId: string, agentId: string, runId: string): Express.Request["actor"] {

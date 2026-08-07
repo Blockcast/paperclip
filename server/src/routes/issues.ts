@@ -4174,7 +4174,7 @@ export function issueRoutes(
       executionState?: unknown;
     },
   ): PendingInReviewRunOwnershipReceipt | null {
-    if (req.actor.type !== "agent" || !isPendingInReviewExecutionStage(issue)) return null;
+    if (req.actor.type !== "agent" || issue.status !== "in_review") return null;
     return {
       issueId: issue.id,
       status: issue.status,
@@ -4236,7 +4236,7 @@ export function issueRoutes(
       executionState?: unknown;
     },
   ) {
-    if (req.actor.type !== "agent" || !isPendingInReviewExecutionStage(issue)) return {};
+    if (req.actor.type !== "agent" || issue.status !== "in_review") return {};
     return {
       expectedCurrentStatus: issue.status,
       expectedCurrentCheckoutRunId: issue.checkoutRunId ?? null,
@@ -10947,13 +10947,16 @@ export function issueRoutes(
     if (commentBody) {
       const commentReferenceSummaryBefore = updateReferenceSummaryAfter
         ?? await issueReferencesSvc.listIssueReferenceSummary(issue.id);
-      comment = await svc.addComment(id, commentBody, {
-        agentId: actor.agentId ?? undefined,
-        userId: actor.actorType === "user" ? actor.actorId : undefined,
-        runId: actor.runId,
-      }, {
-        sourceTrust: await sourceTrustForActorWrite(issue, actor),
-      });
+      const commentSourceTrust = await sourceTrustForActorWrite(issue, actor);
+      comment = await withPendingInReviewRunOwnershipGuard(req, issue, (dbOrTx) =>
+        issueSvcFor(dbOrTx).addComment(id, commentBody, {
+          agentId: actor.agentId ?? undefined,
+          userId: actor.actorType === "user" ? actor.actorId : undefined,
+          runId: actor.runId,
+        }, {
+          sourceTrust: commentSourceTrust,
+        }, dbOrTx),
+      );
       await issueReferencesSvc.syncComment(comment.id);
       await externalObjectsSvc.syncCommentSafely(comment.id);
       const commentReferenceSummaryAfter = await issueReferencesSvc.listIssueReferenceSummary(issue.id);
