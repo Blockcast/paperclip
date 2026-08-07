@@ -4,6 +4,7 @@ import {
   buildAdvisoryPayload,
   buildSecurityCheckRunOutput,
   findExistingDraftAdvisory,
+  postFlaggedSecurityResult,
   postSecurityCheckRun,
   scanSecrets,
   scanCITampering,
@@ -291,6 +292,30 @@ test('postSecurityCheckRun: "all clear" path is unaffected by the advisory plumb
       summary: 'No security concerns detected.',
     },
   });
+});
+
+test('postFlaggedSecurityResult: advisory budget expiry still posts the check-run', async () => {
+  const calls = [];
+  const fakeFetch = (path, _token, options = {}) => {
+    calls.push(path);
+    if (path.endsWith('/check-runs')) return Promise.resolve({ ok: true });
+
+    return new Promise((_resolve, reject) => {
+      options.signal?.addEventListener('abort', () => reject(options.signal.reason), { once: true });
+    });
+  };
+
+  await postFlaggedSecurityResult(
+    fakeFetch,
+    'token',
+    'paperclipai/paperclip',
+    { number: 6469, title: 'My PR', head: { sha: 'deadbeef' } },
+    [{ check: 'ci-tampering', file: '.github/workflows/pr.yml' }],
+    20,
+  );
+
+  assert.ok(calls.some(path => path.includes('/security-advisories?state=draft')));
+  assert.ok(calls.some(path => path.endsWith('/check-runs')), 'check-run must be attempted after advisory timeout');
 });
 
 // ── buildSecurityCheckRunOutput ─────────────────────────────────────────────
