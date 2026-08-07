@@ -37,6 +37,8 @@ import {
   issues,
 } from "@paperclipai/db";
 import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
+import { drizzle as drizzlePgFromClient } from "drizzle-orm/postgres-js";
+import { findPgError } from "../lib/db-retry.js";
 import { heartbeatService, type HeartbeatServiceOptions } from "../services/heartbeat.js";
 import { issueService } from "../services/issues.js";
 import {
@@ -1561,12 +1563,67 @@ class PrReviewerTaskLockTimeoutError extends Error {
   }
 }
 
+// BLO-21582 review follow-up: racing `db.transaction()` (or a bare read
+// promise) against a deadline can only stop US from awaiting it -- postgres.js
+// never exposes the internal query it uses to acquire a pooled connection, so
+// an abandoned one still lands on a freed connection later and runs its
+// BEGIN/probe/rollback (or SELECT) regardless of whether anyone is still
+// listening, adding detached work behind the exact pool contention this code
+// exists to survive (the prior version of this fix only logged that case).
+//
+// `sql.reserve()` is genuinely boundable: it never issues a query at all
+// until code explicitly does so on the connection it returns. Racing the
+// *reservation* against the deadline means an abandoned one can be released
+// the instant it lands, before a single query runs on it, and one that lands
+// in time is exclusively ours from then on -- no further pool contention is
+// possible, so nothing after that point needs bounding either.
+type PgClient = Db["$client"];
+type ReservedPgConnection = Awaited<ReturnType<PgClient["reserve"]>>;
+
+const RESERVATION_TIMED_OUT = Symbol("pr-reviewer-task-lock-reservation-timed-out");
+
+async function reserveConnectionOrTimeout(
+  client: PgClient,
+  remainingMs: number,
+): Promise<ReservedPgConnection | typeof RESERVATION_TIMED_OUT> {
+  if (remainingMs <= 0) return RESERVATION_TIMED_OUT;
+  const reservation = client.reserve();
+  const outcome = await Promise.race([
+    reservation.then((conn) => ({ conn })),
+    new Promise<typeof RESERVATION_TIMED_OUT>((resolve) => {
+      setTimeout(() => resolve(RESERVATION_TIMED_OUT), remainingMs);
+    }),
+  ]);
+  if (outcome !== RESERVATION_TIMED_OUT) return outcome.conn;
+  // postgres.js does not expose withdrawing a still-queued reserve() request
+  // -- but nothing has run on it, so hand it straight back the moment it
+  // lands instead of ever using it, which is the only part of the old
+  // behavior actually worth avoiding.
+  reservation.then((conn) => conn.release()).catch(() => {});
+  return RESERVATION_TIMED_OUT;
+}
+
+// A connection returned by `reserve()` does not carry the `.options` postgres.js
+// attaches to the top-level client (only the client `postgres(...)` itself
+// gets `begin`/`reserve`/`options`; see postgres.js's `Sql()` factory). The
+// postgres-js drizzle driver reads `client.options.parsers` while
+// constructing, so without this it throws immediately on a reserved
+// connection. Sharing the pool's own `options` object here is safe: the
+// mutation the driver performs on it (registering type-transparency parsers)
+// already ran once when `createDb()` built `client` itself, so re-running it
+// is idempotent (verified against the embedded-postgres test harness).
+function drizzleOverReservedConnection(client: PgClient, reserved: ReservedPgConnection): PrReviewerSelectionDb {
+  Object.assign(reserved, { options: (client as unknown as { options: unknown }).options });
+  return drizzlePgFromClient(reserved as unknown as PgClient);
+}
+
 async function withPrReviewerTaskLock<T>(
   db: Db,
   taskKey: string,
   deadline: number,
-  action: (tx: DbTransaction) => Promise<T>,
+  action: (tx: PrReviewerSelectionDb) => Promise<T>,
 ): Promise<T> {
+  const client = db.$client;
   while (true) {
     const remainingMs = deadline - Date.now();
     if (remainingMs <= 0) {
@@ -1574,85 +1631,63 @@ async function withPrReviewerTaskLock<T>(
     }
     // Do not block a pooled connection while another request owns the lock:
     // the winner needs a second connection for heartbeat's enqueue transaction.
-    //
-    // Race pool checkout + the lock probe -- and ONLY that -- against the
-    // remaining budget: `db.transaction()` alone does not respect `deadline`
-    // (a stalled pool checkout under contention could block well past it),
-    // so bound it explicitly here rather than only checking elapsed time
-    // after it resolves. `settleLockProbe` below fires the instant the probe
-    // query itself settles, before `action(tx)` ever runs, so the race can
-    // never observe a still-running `action` as "not acquired" (BLO-21582
-    // review follow-up: racing the whole transaction -- including
-    // `action(tx)` -- let the handler abandon a live transaction that could
-    // still commit a wake after the deadline had already been reported as a
-    // lock-acquisition failure, producing a false dead-letter AND a second,
-    // uncounted wake).
-    let settleLockProbe: (outcome: { acquired: boolean } | { error: unknown }) => void;
-    const lockProbeSettled = new Promise<{ acquired: boolean } | { error: unknown }>((resolve) => {
-      settleLockProbe = resolve;
-    });
-    const transactionPromise = db.transaction(async (tx) => {
-      let acquired: boolean;
+    const reservation = await reserveConnectionOrTimeout(client, remainingMs);
+    if (reservation === RESERVATION_TIMED_OUT) {
+      if (Date.now() >= deadline) {
+        throw new PrReviewerTaskLockTimeoutError(taskKey);
+      }
+      await new Promise((resolve) => setTimeout(resolve, PR_REVIEWER_TASK_LOCK_RETRY_MS));
+      continue;
+    }
+    let acquired = false;
+    try {
+      await reservation`begin`;
       try {
-        const rows = await tx.execute(
-          sql`select pg_try_advisory_xact_lock(hashtextextended(${taskKey}, 0)) as acquired`,
-        );
-        const row = Array.isArray(rows) ? rows[0] : null;
-        acquired =
-          !!row && typeof row === "object" && (row as Record<string, unknown>).acquired === true;
+        const rows = await reservation`select pg_try_advisory_xact_lock(hashtextextended(${taskKey}, 0)) as acquired`;
+        acquired = !!rows[0] && (rows[0] as Record<string, unknown>).acquired === true;
       } catch (error) {
-        settleLockProbe({ error });
+        await reservation`rollback`.catch(() => {});
         throw error;
       }
+      // BLO-21582 review follow-up (preserves Omar's 573c9ff8 guard under the
+      // new reservation-based mechanism): the probe can still settle after
+      // `deadline` even though nothing here is detached anymore -- e.g. the
+      // reservation itself landed late within its own race, or the probe
+      // query was simply slow. Treat a late acquisition as not-acquired
+      // rather than running `action`: bounding overall response latency to
+      // the budget is a deliberate policy independent of the detached-
+      // execution bug this rewrite fixes, and readers/callers downstream
+      // (the 200 response, the funnel counters) are already sized around
+      // that budget.
       if (acquired && Date.now() >= deadline) {
         logger.warn(
           { taskKey },
           "github webhook reviewer wake lock was acquired after its retry deadline; skipping reviewer wake action",
         );
-        settleLockProbe({ acquired: false });
-        return { acquired: false as const };
+        acquired = false;
       }
-      settleLockProbe({ acquired });
-      if (!acquired) {
-        return { acquired: false as const };
+      if (acquired) {
+        // The lock -- and this reserved connection -- are ours from here on:
+        // no pool contention can delay `action` regardless of how long it
+        // runs, the same guarantee the previous design gave only the
+        // already-acquired case. Abandoning here would still leave the
+        // transaction open on a connection nobody is accounting for.
+        const value = await action(drizzleOverReservedConnection(client, reservation));
+        await reservation`commit`;
+        return value;
       }
-      // The lock is ours from here on: no further racing against the
-      // deadline, even if `action` runs long. Abandoning this branch after
-      // this point would still let the transaction commit on its own
-      // connection with nobody accounting for the outcome.
-      return { acquired: true as const, value: await action(tx) };
-    });
-    const probeOutcome = await Promise.race([
-      lockProbeSettled,
-      new Promise<{ acquired: false }>((resolve) => {
-        setTimeout(() => resolve({ acquired: false }), remainingMs);
-      }),
-    ]);
-    if ("error" in probeOutcome) {
-      // The probe query itself failed (not a lock-acquisition timeout) --
-      // this is a genuine DB error, not ours to retry. Swallow the
-      // transaction's own rejection (same error, already surfaced here) so
-      // it doesn't also report as an unhandled rejection.
-      transactionPromise.catch(() => {});
-      throw probeOutcome.error;
+      await reservation`rollback`;
+    } catch (error) {
+      if (acquired) {
+        // `action` or `commit` failed after the lock was acquired: roll back
+        // so this connection doesn't return to the pool mid-transaction,
+        // then surface the real error instead of a lock timeout.
+        await reservation`rollback`.catch(() => {});
+      }
+      throw error;
+    } finally {
+      reservation.release();
     }
-    if (probeOutcome.acquired) {
-      // Lock acquisition already resolved inside the transaction; await the
-      // in-flight `action(tx)` to completion instead of racing it further.
-      const outcome = (await transactionPromise) as { acquired: true; value: T };
-      return outcome.value;
-    }
-    // The probe did not settle within budget (most likely a stalled pool
-    // checkout): move on without waiting further, but log if the abandoned
-    // transaction eventually does settle so that's still observable. It
-    // still commits or rolls back on its own connection regardless of
-    // whether we're still waiting on it.
-    transactionPromise.catch((err) => {
-      logger.warn(
-        { err, taskKey },
-        "github webhook reviewer wake lock transaction settled after its retry budget was abandoned",
-      );
-    });
     if (Date.now() >= deadline) {
       throw new PrReviewerTaskLockTimeoutError(taskKey);
     }
@@ -1667,22 +1702,53 @@ async function withPrReviewerTaskLock<T>(
 const FALLBACK_RECHECK_TIMED_OUT = Symbol("pr-reviewer-wake-fallback-recheck-timed-out");
 
 // Bounds one lock-exhaustion fallback read against `deadlineMs` (BLO-21582
-// review follow-up). A timeout here must propagate as "unknown", not as a
-// false "confirmed no active reviewer" -- the caller has to keep that
-// distinction to avoid silently swallowing a real loss just because the
-// recheck itself couldn't get a connection in time.
+// review follow-up). Reserving the connection first (same mechanism as
+// `withPrReviewerTaskLock`) means a reservation that times out is released
+// before it ever runs `read`. Unlike the lock probe's `action`, a fallback
+// read has no self-healing value in letting a stall keep running -- it is a
+// best-effort advisory check, so once the connection is ours the actual
+// query still needs bounding regardless of why it might be slow (a table
+// lock, a slow plan -- not just pool contention). `SET LOCAL
+// statement_timeout` does that at the database itself instead of merely
+// abandoning the JS promise, so nothing is left running once this connection
+// is released. `read` may issue more than one statement (see
+// `selectPrReviewerAgentId`'s two-query fallback); each gets its own fresh
+// per-statement timer, so a multi-statement read can in the worst case take
+// a small multiple of the budget rather than exactly bounding the total --
+// acceptable here because the result stays bounded and finite, not the
+// unbounded hang this replaces. A timeout here must propagate as "unknown",
+// not as a false "confirmed no active reviewer" -- the caller has to keep
+// that distinction to avoid silently swallowing a real loss just because the
+// recheck itself couldn't finish in time.
 async function boundedFallbackRead<T>(
-  promise: Promise<T>,
+  client: PgClient,
   deadlineMs: number,
+  read: (reservedDb: PrReviewerSelectionDb) => Promise<T>,
 ): Promise<T | typeof FALLBACK_RECHECK_TIMED_OUT> {
   const remainingMs = deadlineMs - Date.now();
-  if (remainingMs <= 0) return FALLBACK_RECHECK_TIMED_OUT;
-  return Promise.race([
-    promise,
-    new Promise<typeof FALLBACK_RECHECK_TIMED_OUT>((resolve) => {
-      setTimeout(() => resolve(FALLBACK_RECHECK_TIMED_OUT), remainingMs);
-    }),
-  ]);
+  const reservation = await reserveConnectionOrTimeout(client, remainingMs);
+  if (reservation === RESERVATION_TIMED_OUT) return FALLBACK_RECHECK_TIMED_OUT;
+  try {
+    const statementTimeoutMs = Math.max(1, Math.floor(deadlineMs - Date.now()));
+    await reservation`begin`;
+    try {
+      // Not parameterized: `SET` does not accept a bind parameter for its
+      // value in all PostgreSQL versions/drivers (the existing `SET LOCAL
+      // statement_timeout` usage in routes/plugins.ts inlines a literal for
+      // the same reason). Safe here because the value is our own computed
+      // integer, never external input.
+      await reservation.unsafe(`set local statement_timeout = ${statementTimeoutMs}`);
+      const result = await read(drizzleOverReservedConnection(client, reservation));
+      await reservation`commit`;
+      return result;
+    } catch (error) {
+      await reservation`rollback`.catch(() => {});
+      if (findPgError(error)?.code === "57014") return FALLBACK_RECHECK_TIMED_OUT;
+      throw error;
+    }
+  } finally {
+    reservation.release();
+  }
 }
 
 // Shared between the lock-guarded idempotency check inside
@@ -2340,8 +2406,9 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
           // or an unbounded wait on the other.
           const fallbackDeadline = lockDeadline + PR_REVIEWER_TASK_LOCK_FALLBACK_BUDGET_MS;
           const equivalentWake = await boundedFallbackRead(
-            findExistingPrReviewerWake(db, reviewerAgentIds, idempotencyKey, idempotentStatuses),
+            db.$client,
             fallbackDeadline,
+            (reservedDb) => findExistingPrReviewerWake(reservedDb, reviewerAgentIds, idempotencyKey, idempotentStatuses),
           );
           if (equivalentWake === FALLBACK_RECHECK_TIMED_OUT) {
             logger.warn(
@@ -2373,10 +2440,11 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
             return false;
           } else {
             const equivalentReviewerAgentId = await boundedFallbackRead(
-              (async () =>
-                (await findActivePrReviewerForTask(db, reviewerAgentIds, reviewerTaskKey)) ??
-                (await selectPrReviewerAgentId(db, reviewerAgentIds, reviewerTaskKey)))(),
+              db.$client,
               fallbackDeadline,
+              async (reservedDb) =>
+                (await findActivePrReviewerForTask(reservedDb, reviewerAgentIds, reviewerTaskKey)) ??
+                (await selectPrReviewerAgentId(reservedDb, reviewerAgentIds, reviewerTaskKey)),
             );
             if (equivalentReviewerAgentId === FALLBACK_RECHECK_TIMED_OUT) {
               logger.warn(

@@ -1160,20 +1160,31 @@ describe("github-webhook pure helpers", () => {
   });
 
   it("does not run reviewer wake action when lock acquisition settles after the deadline", async () => {
+    // Faked at the `$client.reserve()` boundary (BLO-21582 review
+    // follow-up), not `db.transaction()` -- withPrReviewerTaskLock no longer
+    // goes through drizzle's transaction wrapper at all; it reserves a raw
+    // connection and drives BEGIN/probe/COMMIT/ROLLBACK itself so an
+    // abandoned reservation can be released before ever issuing a query.
+    // This fake reproduces the same "probe settles after the deadline"
+    // scenario one level lower: reservation resolves immediately (nothing
+    // ours to bound there), the probe query itself is what's slow.
     let actionCalled = false;
     let probeStarted = false;
-    const fakeDb = {
-      transaction: async (
-        callback: (tx: { execute: () => Promise<Array<{ acquired: boolean }>> }) => Promise<unknown>,
-      ) =>
-        callback({
-          execute: async () => {
-            probeStarted = true;
-            await new Promise((resolve) => setTimeout(resolve, 30));
-            return [{ acquired: true }];
-          },
-        }),
-    };
+    let callIndex = 0;
+    const fakeReservedConnection = Object.assign(
+      async (_strings: TemplateStringsArray, ..._values: unknown[]) => {
+        callIndex += 1;
+        if (callIndex === 1) return []; // begin
+        if (callIndex === 2) {
+          probeStarted = true;
+          await new Promise((resolve) => setTimeout(resolve, 30));
+          return [{ acquired: true }];
+        }
+        return []; // rollback
+      },
+      { release: () => {} },
+    );
+    const fakeDb = { $client: { reserve: async () => fakeReservedConnection } };
 
     await expect(
       __test_withPrReviewerTaskLock(
@@ -3044,6 +3055,130 @@ describeEmbeddedPostgres("github-webhook route", () => {
         expect(await deliveryCount("queued")).toBe(beforeQueued);
       },
       15_000,
+    );
+
+    it(
+      "leaves no detached lock-probe running once genuine pool-checkout contention outlasts the deadline, proven while " +
+        "contention is still held rather than after releasing it (BLO-21582 review follow-up: 'the current regression " +
+        "test releases its blocking locks immediately after the response and therefore does not prove cleanup while " +
+        "contention remains')",
+      async () => {
+        const reviewerAgentId = randomUUID();
+        const { companyId } = await seedCompanyAndAgent();
+        await db.insert(agents).values({
+          id: reviewerAgentId,
+          companyId,
+          name: "Ally",
+          role: "engineer",
+          status: "idle",
+          adapterType: "claude_k8s",
+          adapterConfig: {},
+          runtimeConfig: {},
+          permissions: {},
+        });
+
+        const prNumber = 21582006;
+
+        // Saturate every connection in the app's own `db` pool with held
+        // transactions -- unlike holdAdvisoryLock/holdExclusiveTableLock
+        // above (which block a query running on an available connection),
+        // this blocks the pool CHECKOUT itself, reproducing the "stalled
+        // pool checkout" scenario withPrReviewerTaskLock's reservation
+        // bound targets, not merely lock contention.
+        const poolSize = Number(db.$client.options.max ?? 10);
+        const releasers: Array<() => void> = [];
+        const held: Array<Promise<unknown>> = [];
+        for (let i = 0; i < poolSize; i++) {
+          let release: () => void = () => {};
+          const gate = new Promise<void>((resolve) => {
+            release = resolve;
+          });
+          releasers.push(release);
+          held.push(
+            db.transaction(async (tx) => {
+              await tx.execute(sql`select 1`);
+              await gate;
+            }),
+          );
+        }
+        // Let every held transaction actually claim a connection before
+        // firing the webhook, so the pool is genuinely saturated when it
+        // tries to reserve one.
+        await new Promise((resolve) => setTimeout(resolve, 200));
+
+        const app = buildApp({ prReviewerAgentId: reviewerAgentId });
+        const payload = {
+          action: "opened",
+          pull_request: {
+            number: prNumber,
+            title: "Reviewer wake pool-checkout-stall regression",
+            body: null,
+            head: { ref: "fix/blo-21582-pool-checkout-stall", sha: "poolstallsha" },
+          },
+          repository: { full_name: "Blockcast/paperclip" },
+        };
+        const { body, signature } = signedRequest(payload);
+        const beforeDeadLettered = await deliveryCount("dead_lettered");
+        const beforeReceived = await deliveryCount("received");
+        const beforeQueued = await deliveryCount("queued");
+
+        try {
+          const startedAt = Date.now();
+          const res = await request(app)
+            .post("/api/webhooks/github")
+            .set("x-github-event", "pull_request")
+            .set("x-hub-signature-256", signature)
+            .set("x-github-delivery", "delivery-blo-21582-pool-checkout-stall")
+            .set("content-type", "application/json")
+            .send(body);
+          const elapsedMs = Date.now() - startedAt;
+
+          expect(res.status).toBe(200);
+          expect(res.body).toMatchObject({ reviewerWakeFired: false });
+          // Bounded by PR_REVIEWER_TASK_LOCK_BUDGET_MS (4s) +
+          // PR_REVIEWER_TASK_LOCK_FALLBACK_BUDGET_MS (1s); the pool stays
+          // saturated the whole time, so the fallback recheck's own
+          // reservation attempt times out too.
+          expect(elapsedMs).toBeGreaterThanOrEqual(3_900);
+          expect(elapsedMs).toBeLessThan(7_000);
+
+          expect(await deliveryCount("received")).toBe(beforeReceived + 1);
+          expect(await deliveryCount("dead_lettered")).toBe(beforeDeadLettered + 1);
+          expect(await deliveryCount("queued")).toBe(beforeQueued);
+
+          // The pool is STILL saturated here -- this is the assertion the
+          // review flagged as missing. If the abandoned reservation were
+          // still queued and later ran its BEGIN/probe/action on a freed
+          // connection (the pre-fix behavior), releasing exactly one
+          // connection below would let it complete and move these counters
+          // again, after the response already reported dead_lettered.
+          await new Promise((resolve) => setTimeout(resolve, 500));
+          expect(await deliveryCount("received")).toBe(beforeReceived + 1);
+          expect(await deliveryCount("dead_lettered")).toBe(beforeDeadLettered + 1);
+          expect(await deliveryCount("queued")).toBe(beforeQueued);
+
+          releasers[0]();
+          releasers[0] = () => {};
+          await new Promise((resolve) => setTimeout(resolve, 500));
+          expect(await deliveryCount("received")).toBe(beforeReceived + 1);
+          expect(await deliveryCount("dead_lettered")).toBe(beforeDeadLettered + 1);
+          expect(await deliveryCount("queued")).toBe(beforeQueued);
+
+          // A fresh reservation must be servable promptly off the one
+          // connection just freed -- if the abandoned reservation were
+          // still ahead of it in the pool's queue doing real work, this
+          // would stall behind it instead of resolving immediately.
+          const probeStartedAt = Date.now();
+          const probe = await db.$client.reserve();
+          const probeElapsedMs = Date.now() - probeStartedAt;
+          probe.release();
+          expect(probeElapsedMs).toBeLessThan(1_000);
+        } finally {
+          for (const release of releasers) release();
+          await Promise.allSettled(held);
+        }
+      },
+      20_000,
     );
   });
 
