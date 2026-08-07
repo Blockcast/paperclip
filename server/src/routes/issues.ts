@@ -11884,9 +11884,21 @@ export function issueRoutes(
           // is race-safe (re-applied in its UPDATE ... WHERE) and sufficient on
           // its own, so give a genuine creator one more path through it instead
           // of leaving the card permanently stuck.
-          const createdInteraction = actor.agentId
-            ? await issueThreadInteractionService(db).getById(interactionId)
-            : null;
+          //
+          // Scoped to deny_missing_grant deliberately. Only that reason means
+          // "this agent lost the issue-level grant", which is the reassignment
+          // case above. Other denials are narrower than the agent and creator
+          // identity cannot stand in for them: a skill_test or task_bridge key
+          // gets deny_scope from decideSkillTestAccess/decideTaskBridgeAccess
+          // for an issue outside the key's boundary, and createdByAgentId is
+          // agent-wide, not key- or run-scoped, so a match there says nothing
+          // about whether *this credential* may touch *this* issue. Treating
+          // every !allowed alike would let a narrowly scoped key withdraw on
+          // an out-of-scope issue purely because its agent authored the card.
+          const createdInteraction =
+            actor.agentId && boundaryDecision.reason === "deny_missing_grant"
+              ? await issueThreadInteractionService(db).getById(interactionId)
+              : null;
           if (!createdInteraction || createdInteraction.createdByAgentId !== actor.agentId) {
             respondIssueBoundaryDenied(res, boundaryDecision);
             return;

@@ -786,6 +786,35 @@ describe.sequential("issue thread interaction routes", () => {
     expect(mockInteractionService.withdrawInteraction).not.toHaveBeenCalled();
   });
 
+  // BLO-22670 review follow-up: the fallback above must not swallow denials
+  // that are narrower than the agent. A skill_test / task_bridge key gets
+  // deny_scope for an issue outside its boundary, and createdByAgentId is
+  // agent-wide — so a creator match cannot restore a per-credential scope.
+  // This caller IS the creator and must still be refused.
+  it("keeps a scoped-credential denial terminal even for the interaction's creator", async () => {
+    mockAccessDecide.mockResolvedValueOnce({
+      allowed: false,
+      action: "issue:mutate",
+      reason: "deny_scope",
+      explanation: "Task bridge key can only access assigned or bridge-created issues.",
+    });
+    mockInteractionService.getById.mockResolvedValueOnce({
+      id: "interaction-2",
+      createdByAgentId: CREATED_AGENT_ID,
+    });
+    const app = await createApp(AGENT_ACTOR);
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-2/withdraw")
+      .send({ reason: "Out-of-scope key must not get through" });
+
+    expect(res.status).toBe(403);
+    // Short-circuited before the creator lookup: the scope denial is terminal,
+    // so ownership is never consulted in the first place.
+    expect(mockInteractionService.getById).not.toHaveBeenCalled();
+    expect(mockInteractionService.withdrawInteraction).not.toHaveBeenCalled();
+  });
+
   it("surfaces the service's 403 when an agent withdraws a card it did not create", async () => {
     const { HttpError } = await import("../errors.js");
     mockInteractionService.withdrawInteraction.mockRejectedValueOnce(
