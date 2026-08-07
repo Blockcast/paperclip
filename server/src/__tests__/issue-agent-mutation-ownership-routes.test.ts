@@ -2913,14 +2913,26 @@ describe("agent issue mutation checkout ownership", () => {
       expect(remediation).toMatch(/does not grant you comment access/i);
       // Names somewhere to respond instead, so the wake is not a dead end.
       expect(remediation).toMatch(/respond on an issue you are assigned to/i);
+      // BLO-22742: and names the one route that survives fan-out. Both remedies
+      // above are per-issue, so a sweep blocked on 216 issues was told only to
+      // do 216 things it could not do. The reportsTo escalation is standing
+      // authorization (`allow_manager_chain`), not a grant to be collected.
+      expect(remediation).toMatch(/reportsTo chain/i);
       expect(mockIssueService.addComment).not.toHaveBeenCalled();
     });
 
-    // The manager-chain case. `allow_manager_chain` is gated to
-    // `tasks:manage_active_checkouts`/`tasks:override_execution_stage`, so
-    // managing the assignee confers no `issue:comment` right. That is the
-    // intended least-privilege posture — assert the deny, and assert it still
-    // arrives with guidance rather than silently.
+    // The manager-chain case, from the route's side. `decide` is stubbed to deny
+    // here, so this pins the *route* contract — a denial still arrives with
+    // guidance rather than silently — and deliberately says nothing about how
+    // the real ladder rules on a manager.
+    //
+    // BLO-22742: it used to claim `allow_manager_chain` was gated to
+    // `tasks:manage_active_checkouts`/`tasks:override_execution_stage` and so
+    // conferred no `issue:comment`. That is not what the service does:
+    // services/authorization.ts allows `issue:comment` outright for an actor
+    // that manages the assignee in the `reportsTo` chain. The stale note is
+    // worth calling out because believing it is exactly what makes an agent
+    // conclude there is no route to a peer's issue when there is one.
     it("denies a managing agent the same way, but with actionable guidance", async () => {
       mockAccessService.decide.mockImplementation(denyCommentGrant);
       mockIssueService.getById.mockResolvedValue(makeIssue({ assigneeAgentId: ownerAgentId }));
