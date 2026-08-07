@@ -92,6 +92,16 @@ spec:
       priorityClassName: {{ . }}
       {{- end }}
       {{- if .Values.api.spreadAcrossNodes }}
+      {{- /*
+      BLO-20901 follow-up: minDomains (GA 1.30) and matchLabelKeys (beta 1.27)
+      below need 1.30. This used to be a chart-wide `kubeVersion` floor in
+      Chart.yaml, which rejected installs on older clusters even with
+      api.enabled=false, where none of this renders. Scope the check to the
+      path that actually needs it instead.
+      */}}
+      {{- if not (semverCompare ">=1.30.0-0" .Capabilities.KubeVersion.Version) }}
+      {{- fail (printf "paperclip-api: api.spreadAcrossNodes requires Kubernetes >=1.30.0-0 (cluster is %s) for topologySpreadConstraints minDomains/matchLabelKeys support. Set api.spreadAcrossNodes=false to install on this cluster." .Capabilities.KubeVersion.Version) }}
+      {{- end }}
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
