@@ -12,6 +12,20 @@ case "$probe_output_bytes" in
     ;;
 esac
 
+if ! declared_volumes=$(
+  docker buildx imagetools inspect "$image" --format '{{json .Image.Config.Volumes}}' 2>/dev/null
+); then
+  echo "Unable to inspect FFmpeg image volume declarations for ${image}" >&2
+  exit 2
+fi
+case "$declared_volumes" in
+  null|"{}") ;;
+  *)
+    echo "FFmpeg image ${image} declares writable volumes; refusing capability probe" >&2
+    exit 2
+    ;;
+esac
+
 probe_dir=$(mktemp -d "${TMPDIR:-/tmp}/paperclip-ffmpeg-probe.XXXXXX")
 cidfile="$probe_dir/cid"
 probe_output_file="$probe_dir/output"
