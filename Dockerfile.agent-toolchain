@@ -314,23 +314,39 @@ COPY --from=ffmpeg-publisher \
      /usr/local/bin/ffmpeg  /usr/local/bin/ffmpeg
 COPY --from=ffmpeg-publisher \
      /usr/local/bin/ffprobe /usr/local/bin/ffprobe
-# Check that BOTH binaries can actually load before asserting on muxer output.
+# Prove every copied binary actually EXECUTES before asserting on muxer output.
 # The muxer grep alone cannot tell "ffmpeg ran and lacks moq_mmt" apart from
 # "ffmpeg never started", because a dynamic-linker error also produces output
 # with no moq_mmt in it. That ambiguity cost five days: the missing
 # libsrt.so.1.5 above surfaced as 'moq_mmt muxer missing from copied ffmpeg'
 # on every build from 2026-08-04 onward, while the publisher image had the
 # muxer the whole time. Print what actually happened instead of swallowing it.
-RUN for bin in ffmpeg ffprobe; do \
-      if ! missing="$(ldd "/usr/local/bin/$bin" | grep 'not found')"; then :; fi; \
-      if [ -n "$missing" ]; then \
-        echo "ERROR: /usr/local/bin/$bin has unresolved shared libraries:"; \
-        echo "$missing"; \
-        echo "HINT: the publisher is bookworm-based; copy the drifted .so from"; \
+#
+# Running `-version` rather than grepping `ldd` output is deliberate: it fails
+# closed on ANY startup failure, not just the ones that print "not found"
+# (`ldd` can exit nonzero for other reasons, and a grep-based check silently
+# passes those). `ldd` is still printed, but only as a diagnostic hint after a
+# failure. The glob covers every ff* binary the COPY steps land, so adding
+# ffplay later cannot slip past the check; a zero count is itself a failure.
+RUN set -eu; \
+    checked=0; \
+    for bin in /usr/local/bin/ff*; do \
+      [ -x "$bin" ] || continue; \
+      checked=$((checked + 1)); \
+      if ! out="$("$bin" -version 2>&1)"; then \
+        echo "ERROR: $bin failed to execute:"; \
+        echo "$out"; \
+        echo "--- ldd $bin ---"; \
+        ldd "$bin" 2>&1 || true; \
+        echo "HINT: the publisher is bookworm-based; copy any 'not found' .so from"; \
         echo "      ffmpeg-publisher above, as done for libx265/libvpx/libsrt."; \
         exit 1; \
       fi; \
-    done
+    done; \
+    [ "$checked" -gt 0 ] || { \
+      echo 'ERROR: no executable /usr/local/bin/ff* found — the COPY steps above did not land.'; \
+      exit 1; }; \
+    echo "verified $checked ffmpeg binaries execute"
 RUN muxers="$(ffmpeg -hide_banner -muxers 2>&1)" || { \
       echo 'ERROR: ffmpeg failed to run; output was:'; echo "$muxers"; exit 1; }; \
     printf '%s\n' "$muxers" | grep -qE '(^|[[:space:]])moq_mmt([[:space:]]|$)' \
