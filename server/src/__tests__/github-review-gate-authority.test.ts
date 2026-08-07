@@ -405,6 +405,8 @@ describeEmbeddedPostgres("GitHub review-gate durable authority", () => {
     expect(JSON.parse(String(dispatchCall?.[1]?.body))).toMatchObject({
       event_type: "review_gate_reconcile",
       client_payload: {
+        producer_app_id: "3966421",
+        producer_installation_id: "138085375",
         retry_count: "0",
         target_pull_number: String(PR_NUMBER),
         target_head_sha: LIVE_HEAD,
