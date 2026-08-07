@@ -18093,7 +18093,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // Failed attempts move behind never-attempted/older work so a persistent
       // bad intent cannot monopolize the bounded batch forever.
       .orderBy(
-        asc(detachedQueuedRunRecoveries.lastAttemptAt),
+        sql`${detachedQueuedRunRecoveries.lastAttemptAt} asc nulls first`,
         asc(detachedQueuedRunRecoveries.pendingAt),
         asc(detachedQueuedRunRecoveries.id),
       )

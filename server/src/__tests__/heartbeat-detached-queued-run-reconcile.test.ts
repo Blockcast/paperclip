@@ -524,6 +524,185 @@ describeEmbeddedPostgres("heartbeat reconcileDetachedQueuedRuns", () => {
     expect(completed?.recoveryRunId).toBeTruthy();
   });
 
+  it("prioritizes never-attempted recovery intents in a bounded retry batch (BLO-21621 Ally review)", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const failedIssueId = randomUUID();
+    const freshIssueId = randomUUID();
+    const failedSourceRunId = randomUUID();
+    const freshSourceRunId = randomUUID();
+    const failedIntentId = randomUUID();
+    const freshIntentId = randomUUID();
+
+    await db.insert(issues).values([
+      {
+        id: failedIssueId,
+        companyId,
+        title: "Previously failed detached-run recovery",
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+        checkoutRunId: null,
+        executionRunId: null,
+      },
+      {
+        id: freshIssueId,
+        companyId,
+        title: "Never-attempted detached-run recovery",
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+        checkoutRunId: null,
+        executionRunId: null,
+      },
+    ]);
+    await db.insert(heartbeatRuns).values([
+      {
+        id: failedSourceRunId,
+        companyId,
+        agentId,
+        status: "cancelled",
+        invocationSource: "on_demand",
+        contextSnapshot: { issueId: failedIssueId },
+        createdAt: new Date(Date.now() - SEVEN_HOURS_MS),
+      },
+      {
+        id: freshSourceRunId,
+        companyId,
+        agentId,
+        status: "cancelled",
+        invocationSource: "on_demand",
+        contextSnapshot: { issueId: freshIssueId },
+        createdAt: new Date(Date.now() - SEVEN_HOURS_MS),
+      },
+    ]);
+    await db.insert(detachedQueuedRunRecoveries).values([
+      {
+        id: failedIntentId,
+        companyId,
+        issueId: failedIssueId,
+        sourceRunId: failedSourceRunId,
+        status: "pending",
+        pendingAt: new Date(Date.now() - 60_000),
+        lastAttemptAt: new Date(Date.now() - 30_000),
+        attemptCount: 7,
+        lastError: "persistent injected failure",
+      },
+      {
+        id: freshIntentId,
+        companyId,
+        issueId: freshIssueId,
+        sourceRunId: freshSourceRunId,
+        status: "pending",
+        pendingAt: new Date(),
+        lastAttemptAt: null,
+        attemptCount: 0,
+      },
+    ]);
+
+    const result = await heartbeat.reconcileDetachedQueuedRuns({ companyId, limit: 1 });
+
+    expect(result).toMatchObject({ scanned: 0, terminalized: 0, recovered: 1, failed: 0 });
+    const intents = await db
+      .select({
+        id: detachedQueuedRunRecoveries.id,
+        status: detachedQueuedRunRecoveries.status,
+        attemptCount: detachedQueuedRunRecoveries.attemptCount,
+      })
+      .from(detachedQueuedRunRecoveries)
+      .where(eq(detachedQueuedRunRecoveries.companyId, companyId));
+    expect(intents.find((intent) => intent.id === freshIntentId)).toMatchObject({
+      status: "completed",
+      attemptCount: 1,
+    });
+    expect(intents.find((intent) => intent.id === failedIntentId)).toMatchObject({
+      status: "pending",
+      attemptCount: 7,
+    });
+  });
+
+  it("coalesces concurrent dispatches of the same pending recovery intent (BLO-21621 Ally suggestion)", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = randomUUID();
+    const sourceRunId = randomUUID();
+    const intentId = randomUUID();
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Concurrent durable recovery dispatch",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: null,
+      executionRunId: null,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: sourceRunId,
+      companyId,
+      agentId,
+      status: "cancelled",
+      invocationSource: "on_demand",
+      contextSnapshot: { issueId },
+      createdAt: new Date(Date.now() - SEVEN_HOURS_MS),
+    });
+    await db.insert(detachedQueuedRunRecoveries).values({
+      id: intentId,
+      companyId,
+      issueId,
+      sourceRunId,
+      status: "pending",
+      pendingAt: new Date(),
+    });
+
+    let arrivals = 0;
+    let releaseBoth!: () => void;
+    const bothDispatchesReady = new Promise<void>((resolve) => {
+      releaseBoth = resolve;
+    });
+    const pauseBeforeEnqueue = vi.fn(async () => {
+      arrivals += 1;
+      if (arrivals === 2) releaseBoth();
+      await bothDispatchesReady;
+    });
+    const firstHeartbeat = heartbeatService(db, {
+      skipQueuedRunDispatch: true,
+      beforeDetachedQueuedRunRecoveryEnqueueForTest: pauseBeforeEnqueue,
+    });
+    const secondHeartbeat = heartbeatService(db, {
+      skipQueuedRunDispatch: true,
+      beforeDetachedQueuedRunRecoveryEnqueueForTest: pauseBeforeEnqueue,
+    });
+
+    const [first, second] = await Promise.all([
+      firstHeartbeat.reconcileDetachedQueuedRuns({ companyId, limit: 1 }),
+      secondHeartbeat.reconcileDetachedQueuedRuns({ companyId, limit: 1 }),
+    ]);
+
+    expect(pauseBeforeEnqueue).toHaveBeenCalledTimes(2);
+    expect(first.failed + second.failed).toBe(0);
+    const liveRuns = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.companyId, companyId),
+        eq(heartbeatRuns.contextIssueId, issueId),
+        eq(heartbeatRuns.status, "queued"),
+      ));
+    expect(liveRuns).toHaveLength(1);
+
+    const completed = await db
+      .select({
+        status: detachedQueuedRunRecoveries.status,
+        recoveryRunId: detachedQueuedRunRecoveries.recoveryRunId,
+        attemptCount: detachedQueuedRunRecoveries.attemptCount,
+      })
+      .from(detachedQueuedRunRecoveries)
+      .where(eq(detachedQueuedRunRecoveries.id, intentId))
+      .then((rows) => rows[0]);
+    expect(completed).toMatchObject({ status: "completed", recoveryRunId: liveRuns[0]?.id });
+    expect(completed?.attemptCount).toBe(2);
+  });
+
   it("terminalizes both rows of a two-orphan issue and creates exactly one fresh replacement, without re-adopting a sibling orphan (BLO-21621 native-codex review)", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const issueId = randomUUID();
