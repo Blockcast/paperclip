@@ -133,6 +133,9 @@ jobs:
       - name: Test verify job cancelled/skipped-vs-failed lane outcome
         run: node --test ./scripts/__tests__/pr-verify-lane-outcome.test.mjs
 
+      - name: Test PR server-shard folding
+        run: node --test ./scripts/__tests__/pr-ci-shard-folding.test.mjs
+
       - name: Validate release package manifest
         run: node ./scripts/release-package-map.mjs check
 
@@ -459,13 +462,17 @@ jobs:
           fi
           pnpm test:run:general -- "${args[@]}"
 
+      # Reuse the checkout, dependency install, cache restore, and embedded
+      # Postgres setup already paid for by each server shard. This removes four
+      # ARC pod cold starts without reducing serialized-suite coverage.
+      - name: Run serialized server test shard
+        if: matrix.group == 'general-server'
+        run: pnpm test:run:serialized -- --shard-index ${{ matrix.shard_index }} --shard-count ${{ matrix.shard_count }}
+
   verify:
     # Preserve the legacy required-check name while the underlying work runs in parallel.
-    # BLO-20869: verify_serialized_server is folded in here (rather than made
-    # required on its own) so a cancelled/skipped/never-scheduled serialized
-    # shard fails this required check instead of being invisible to the merge
-    # gate. See the issue for the measured latency tradeoff of putting a
-    # ~90-minute job on the required path this way.
+    # Serialized server suites run inside the four general-server matrix jobs,
+    # so general_tests remains the required aggregate for both test families.
     name: verify
     if: ${{ always() }}
     needs:
@@ -476,7 +483,6 @@ jobs:
         worktree_install,
         opencode_responses_replay,
         build,
-        verify_serialized_server,
       ]
     runs-on: arc-light
     timeout-minutes: 5
@@ -510,7 +516,6 @@ jobs:
           WORKTREE_INSTALL_RESULT: ${{ needs.worktree_install.result }}
           OPENCODE_RESPONSES_REPLAY_RESULT: ${{ needs.opencode_responses_replay.result }}
           BUILD_RESULT: ${{ needs.build.result }}
-          VERIFY_SERIALIZED_SERVER_RESULT: ${{ needs.verify_serialized_server.result }}
         run: |
           lane_names=(
             helm_chart
@@ -519,7 +524,6 @@ jobs:
             worktree_install
             opencode_responses_replay
             build
-            verify_serialized_server
           )
           lane_results=(
             "$HELM_CHART_RESULT"
@@ -528,7 +532,6 @@ jobs:
             "$WORKTREE_INSTALL_RESULT"
             "$OPENCODE_RESPONSES_REPLAY_RESULT"
             "$BUILD_RESULT"
-            "$VERIFY_SERIALIZED_SERVER_RESULT"
           )
 
           cancelled_lanes=()
@@ -604,63 +607,6 @@ jobs:
 
       - name: Build
         run: pnpm build
-
-  verify_serialized_server:
-    name: Verify serialized server suites (${{ matrix.shard_label }})
-    needs: [policy, general_tests]
-    # BLO-22428: route merge_group traffic to the dedicated arc-merge-queue
-    # pool so pull_request and merge_group traffic cannot starve each other.
-    # See typecheck_release_registry above.
-    runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-paperclip-general' }}
-    timeout-minutes: 90
-    strategy:
-      fail-fast: false
-      max-parallel: 4
-      matrix:
-        include:
-          - shard_index: 0
-            shard_count: 4
-            shard_label: 1/4
-          - shard_index: 1
-            shard_count: 4
-            shard_label: 2/4
-          - shard_index: 2
-            shard_count: 4
-            shard_label: 3/4
-          - shard_index: 3
-            shard_count: 4
-            shard_label: 4/4
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v6
-        with:
-          version: 9.15.4
-
-      - name: Restore regenerated PR lockfile (if policy uploaded one)
-        uses: actions/download-artifact@v4
-        continue-on-error: true
-        with:
-          name: pr-lockfile
-          path: .
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v6
-        with:
-          node-version: 24
-          cache: pnpm
-
-      - name: Set up GHA-backed sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
-
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: Run serialized server test shard
-        run: pnpm test:run:serialized -- --shard-index ${{ matrix.shard_index }} --shard-count ${{ matrix.shard_count }}
 
   canary_dry_run:
     name: Canary Dry Run
