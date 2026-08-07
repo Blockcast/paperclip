@@ -406,6 +406,22 @@ describe("mergeMaskedPluginConfig", () => {
     expect(merged).toEqual({ webhookToken: "rotated" });
   });
 
+  it("round-trips a UUID-shaped credential in a `writeOnly` field losslessly", () => {
+    // Now that a UUID at a non-`secret-ref` path is masked rather than passed
+    // through, the lossless round-trip has to hold for it too: the operator
+    // reads `__redacted__` and posts it back unchanged, and the original UUID
+    // must survive rather than being clobbered by the sentinel.
+    const schema = {
+      type: "object",
+      properties: { apiKey: { type: "string", writeOnly: true } },
+    };
+    const masked = maskPluginConfigJson({ apiKey: SECRET_ID }, schema) as Record<string, unknown>;
+    expect(masked.apiKey).toBe(PLUGIN_CONFIG_SECRET_MASK);
+
+    const merged = mergeConfig(masked, { apiKey: SECRET_ID });
+    expect(merged).toEqual({ apiKey: SECRET_ID });
+  });
+
   it("drops the sentinel rather than persisting it when nothing is stored", () => {
     const merged = mergeConfig({ webhookToken: PLUGIN_CONFIG_SECRET_MASK }, {});
 
