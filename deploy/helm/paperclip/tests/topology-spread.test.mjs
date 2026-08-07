@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import path from "node:path";
@@ -28,6 +29,32 @@ function renderTemplate(extraArgs = []) {
     ],
     { cwd: repoRoot, encoding: "utf8" },
   );
+}
+
+function renderTemplateExpectingFailure(extraArgs = []) {
+  try {
+    execFileSync(
+      "helm",
+      [
+        "template",
+        "paperclip",
+        "deploy/helm/paperclip",
+        "--namespace",
+        "paperclip",
+        "-f",
+        "deploy/helm/paperclip/values.blockcast.yaml",
+        "--show-only",
+        "templates/deployment-api.yaml",
+        "--set",
+        "api.enabled=true",
+        ...extraArgs,
+      ],
+      { cwd: repoRoot, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+    );
+    assert.fail("expected helm template to fail");
+  } catch (err) {
+    return err.stderr?.toString() ?? "";
+  }
 }
 
 test("API deployment hard-enforces node spread by default (BLO-20901)", () => {
@@ -77,4 +104,63 @@ test("API deployment topologySpreadConstraints merges with custom .Values.affini
   assert.match(rendered, /topologySpreadConstraints:/);
   assert.match(rendered, /nodeAffinity:/);
   assert.match(rendered, /requiredDuringSchedulingIgnoredDuringExecution:/);
+});
+
+// BLO-20901 follow-up (Ally review on #965): a chart-wide `kubeVersion` floor
+// in Chart.yaml rejected every install on an older cluster, even with
+// api.enabled=false where none of this ever renders. The version check moved
+// into the template, gated by the same condition that renders the
+// minDomains/matchLabelKeys constraint.
+
+test("chart has no chart-wide kubeVersion floor", () => {
+  const chartYaml = readFileSync(
+    path.join(repoRoot, "deploy/helm/paperclip/Chart.yaml"),
+    "utf8",
+  );
+  assert.doesNotMatch(chartYaml, /^kubeVersion:/m);
+});
+
+test("installs on an older cluster when api.enabled=false", () => {
+  const rendered = execFileSync(
+    "helm",
+    [
+      "template",
+      "paperclip",
+      "deploy/helm/paperclip",
+      "--namespace",
+      "paperclip",
+      "-f",
+      "deploy/helm/paperclip/values.blockcast.yaml",
+      "--set",
+      "api.enabled=false",
+      "--kube-version",
+      "1.28.0",
+    ],
+    { cwd: repoRoot, encoding: "utf8" },
+  );
+
+  assert.doesNotMatch(rendered, /deployment-api/);
+});
+
+test("installs on an older cluster when api.enabled=true and spreadAcrossNodes=false", () => {
+  const rendered = renderTemplate([
+    "--set",
+    "api.spreadAcrossNodes=false",
+    "--kube-version",
+    "1.28.0",
+  ]);
+
+  assert.doesNotMatch(rendered, /topologySpreadConstraints:/);
+});
+
+test("fails clearly on an older cluster when api.enabled=true and spreadAcrossNodes=true", () => {
+  const stderr = renderTemplateExpectingFailure([
+    "--set",
+    "api.spreadAcrossNodes=true",
+    "--kube-version",
+    "1.28.0",
+  ]);
+
+  assert.match(stderr, /spreadAcrossNodes requires Kubernetes >=1\.30\.0-0/);
+  assert.match(stderr, /cluster is v1\.28\.0/);
 });
