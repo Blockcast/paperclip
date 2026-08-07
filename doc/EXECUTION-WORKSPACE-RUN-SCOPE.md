@@ -92,11 +92,35 @@ workspace pays the cold-store number. Trees under one execution workspace share 
 store and pay the warm number.
 
 At 2.8 GB per run this is not free, which is why it is opt-in rather than the
-default. Note however that the fleet is *already* paying this cost via the 93
-hand-rolled worktrees — just without lifecycle management, ownership stamping, or
-cleanup. `per_run` moves that spend under the managed path
-(`stampGitWorktreeOwnership` / `pruneOwnStaleGitWorktree`), where it can be
-collected.
+default. `per_run` brings ownership stamping to that spend, so a tree can be
+attributed to the run that made it — but **ownership is not collection, and there
+is currently no automatic collector.** Enabling `per_run` therefore converts a
+per-*issue* leak into a per-*run* leak. Do not enable it on a busy agent until a
+collector exists.
+
+The distinction, because it is easy to get wrong:
+
+- `pruneOwnStaleGitWorktree` (`git-worktree-ownership.ts:384`) reclaims **git
+  registry entries, not disk**. It returns `removed: false` whenever the
+  directory still exists, by design — removing a materialized tree could discard
+  uncommitted work. Its only call site is the workspace *restore* path
+  (`workspace-runtime.ts:4149`), which runs when a tree has gone missing. It is
+  not a GC and never frees a byte.
+- The only code that actually removes a worktree from disk is
+  `cleanupExecutionWorkspaceArtifacts` (`workspace-runtime.ts:4261`, removal at
+  `:4339`). It has two callers: a `catch` rollback in `heartbeat.ts:20960` that
+  fires only when *persisting* the workspace row throws, and the manual
+  `PATCH /execution-workspaces/:id` route. **Neither runs at end of a normal
+  run.**
+- `cleanupEligibleAt` is written and read as a field but is not a query predicate
+  anywhere in `server/src`; no sweep consumes it.
+
+Measured on the live host 2026-08-07, which is what this claim rests on rather
+than code reading alone: five runtime-managed worktrees under
+`.paperclip/worktrees/` created between 2026-07-30 and 2026-08-05, none
+collected; 38 hand-rolled `blo-*-wt` directories created 2026-08-01 → 2026-08-07,
+monotonically increasing, none collected; 95 registered worktrees in total; 2.0 GB
+apparent size for a single runtime-managed tree.
 
 ## What this does not do
 
@@ -105,6 +129,5 @@ collected.
   `maxConcurrentRuns: 1`. This is not a forced fleet-wide migration.
 - It does not retire the 93 pre-existing hand-rolled worktrees. That cleanup is
   separate operational work.
-- It does not by itself decide *which* agents should run `per_run`. The intended
-  next step is to enable it for agents that are both workspace-mutating and running
-  `maxConcurrentRuns > 1` — which today is the CTO agent at 5.
+- It does not by itself decide *which* agents should run `per_run`. Enabling it is
+  gated on a collector existing, per the cost section above.
