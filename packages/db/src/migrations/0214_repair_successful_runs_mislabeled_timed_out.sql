@@ -20,7 +20,10 @@ WITH "repaired_runs" AS (
 			- 'timeoutFired'
 			- 'timeoutSource'
 		) || '{"outcomeCorrection":{"issue":"BLO-22922","from":"timed_out","reason":"exit_code_0"}}'::jsonb
-	WHERE "run"."status" = 'timed_out'
+	FROM "agents" AS "agent"
+	WHERE "agent"."id" = "run"."agent_id"
+		AND "agent"."adapter_type" = 'opencode_k8s'
+		AND "run"."status" = 'timed_out'
 		AND "run"."exit_code" = 0
 		AND "run"."error_code" = 'timeout'
 		AND ("run"."error" IS NULL OR "run"."error" ~ '^Timed out after [0-9]+s$')

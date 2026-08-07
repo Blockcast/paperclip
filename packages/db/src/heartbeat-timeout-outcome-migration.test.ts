@@ -33,10 +33,12 @@ describeEmbeddedPostgres("heartbeat timeout outcome repair migration", () => {
     cleanups.push(async () => sql.end());
 
     const companyId = randomUUID();
-    const agentId = randomUUID();
+    const affectedAgentId = randomUUID();
+    const unrelatedAgentId = randomUUID();
     const correctedRunId = randomUUID();
     const genuineTimeoutRunId = randomUUID();
     const ambiguousRunId = randomUUID();
+    const unrelatedRunId = randomUUID();
     const existingSuccessRunId = randomUUID();
     const correctedWakeupId = randomUUID();
     const genuineTimeoutWakeupId = randomUUID();
@@ -52,7 +54,9 @@ describeEmbeddedPostgres("heartbeat timeout outcome repair migration", () => {
     `;
     await sql`
       INSERT INTO "agents" ("id", "company_id", "name", "role", "adapter_type", "adapter_config")
-      VALUES (${agentId}, ${companyId}, 'Timeout migration agent', 'engineer', 'process', '{}'::jsonb)
+      VALUES
+        (${affectedAgentId}, ${companyId}, 'Affected timeout agent', 'engineer', 'opencode_k8s', '{}'::jsonb),
+        (${unrelatedAgentId}, ${companyId}, 'Unrelated timeout agent', 'engineer', 'claude_k8s', '{}'::jsonb)
     `;
     await sql`
       INSERT INTO "agent_wakeup_requests" (
@@ -64,9 +68,9 @@ describeEmbeddedPostgres("heartbeat timeout outcome repair migration", () => {
         "error"
       )
       VALUES
-        (${correctedWakeupId}, ${companyId}, ${agentId}, 'test', 'timed_out', 'Timed out after 300s'),
-        (${genuineTimeoutWakeupId}, ${companyId}, ${agentId}, 'test', 'timed_out', 'Timed out after 300s'),
-        (${ambiguousWakeupId}, ${companyId}, ${agentId}, 'test', 'timed_out', 'Result publication failed')
+        (${correctedWakeupId}, ${companyId}, ${affectedAgentId}, 'test', 'timed_out', 'Timed out after 300s'),
+        (${genuineTimeoutWakeupId}, ${companyId}, ${affectedAgentId}, 'test', 'timed_out', 'Timed out after 300s'),
+        (${ambiguousWakeupId}, ${companyId}, ${affectedAgentId}, 'test', 'timed_out', 'Result publication failed')
     `;
     await sql`
       INSERT INTO "heartbeat_runs" (
@@ -86,7 +90,7 @@ describeEmbeddedPostgres("heartbeat timeout outcome repair migration", () => {
         (
           ${correctedRunId},
           ${companyId},
-          ${agentId},
+          ${affectedAgentId},
           ${correctedWakeupId},
           'timed_out',
           'Timed out after 300s',
@@ -104,7 +108,7 @@ describeEmbeddedPostgres("heartbeat timeout outcome repair migration", () => {
         (
           ${genuineTimeoutRunId},
           ${companyId},
-          ${agentId},
+          ${affectedAgentId},
           ${genuineTimeoutWakeupId},
           'timed_out',
           'Timed out',
@@ -117,7 +121,7 @@ describeEmbeddedPostgres("heartbeat timeout outcome repair migration", () => {
         (
           ${ambiguousRunId},
           ${companyId},
-          ${agentId},
+          ${affectedAgentId},
           ${ambiguousWakeupId},
           'timed_out',
           'Result publication failed',
@@ -128,9 +132,22 @@ describeEmbeddedPostgres("heartbeat timeout outcome repair migration", () => {
           0
         ),
         (
+          ${unrelatedRunId},
+          ${companyId},
+          ${unrelatedAgentId},
+          NULL,
+          'timed_out',
+          NULL,
+          'timeout',
+          NULL,
+          'stalled',
+          'timeout',
+          0
+        ),
+        (
           ${existingSuccessRunId},
           ${companyId},
-          ${agentId},
+          ${affectedAgentId},
           NULL,
           'succeeded',
           NULL,
@@ -153,7 +170,7 @@ describeEmbeddedPostgres("heartbeat timeout outcome repair migration", () => {
       status: string;
       error: string | null;
       error_code: string | null;
-      result_json: Record<string, unknown>;
+      result_json: Record<string, unknown> | null;
       result_error: string | null;
       result_message: string | null;
       liveness_state: string | null;
@@ -172,7 +189,13 @@ describeEmbeddedPostgres("heartbeat timeout outcome repair migration", () => {
         "liveness_reason",
         "exit_code"
       FROM "heartbeat_runs"
-      WHERE "id" IN (${correctedRunId}, ${genuineTimeoutRunId}, ${ambiguousRunId}, ${existingSuccessRunId})
+      WHERE "id" IN (
+        ${correctedRunId},
+        ${genuineTimeoutRunId},
+        ${ambiguousRunId},
+        ${unrelatedRunId},
+        ${existingSuccessRunId}
+      )
     `;
     const rowsById = new Map(rows.map((row) => [row.id, row]));
 
@@ -212,6 +235,15 @@ describeEmbeddedPostgres("heartbeat timeout outcome repair migration", () => {
       result_json: { error: "publish failed", message: "real result", kept: "yes" },
       result_error: "publish failed",
       result_message: "real result",
+      liveness_state: "stalled",
+      liveness_reason: "timeout",
+      exit_code: 0,
+    });
+    expect(rowsById.get(unrelatedRunId)).toMatchObject({
+      status: "timed_out",
+      error: null,
+      error_code: "timeout",
+      result_json: null,
       liveness_state: "stalled",
       liveness_reason: "timeout",
       exit_code: 0,
