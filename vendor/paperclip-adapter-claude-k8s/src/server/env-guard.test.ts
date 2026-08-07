@@ -35,6 +35,24 @@ describe("classifyAgentShellCommand", () => {
     "node ~/.claude/safe-env-inspect.mjs | env",
     "env && paperclip-safe-env",
     'sh -lc "paperclip-safe-env && env"',
+    // Newline is a command separator too. Anchoring the helper exception to the
+    // whole command is not enough on its own: JS `$` without `m` is
+    // end-of-input, so a `\s`-permissive argument tail made
+    // `paperclip-safe-env\nenv` a whole-command match, and the dump detector
+    // did not treat `\n` as a boundary either — so even `echo ok\nenv` fell
+    // through as `not_environment_dump`.
+    "paperclip-safe-env\nenv",
+    "paperclip-safe-env\nprintenv",
+    "safe-env-inspect.mjs\nenv",
+    "node ~/.claude/safe-env-inspect.mjs\ncat /proc/self/environ",
+    "echo ok\nenv",
+    "echo ok\nprintenv",
+    "echo ok\nset",
+    "echo ok\nexport -p",
+    "echo ok\ndeclare -x",
+    "env\nls -la",
+    "echo ok\r\nenv",
+    'sh -lc "echo ok\nenv"',
   ];
   const allowed = [
     // Legitimate env USE (set-and-run) must not be blocked.
@@ -58,6 +76,13 @@ describe("classifyAgentShellCommand", () => {
     "paperclip-safe-env --json",
     "scripts/safe-env-inspect.mjs",
     "cd /repo && paperclip-safe-env",
+    // Newline-as-separator must not over-block ordinary multi-line scripts:
+    // each line is classified as its own command, and none of these is a dump.
+    "cd /repo\nset -euo pipefail\nls -la",
+    "echo one\necho two",
+    "cd /repo\npaperclip-safe-env",
+    "export FOO=bar\nnode script.js",
+    "printenv PATH\nprintenv HOME",
     "",
   ];
 
@@ -116,17 +141,33 @@ describe("embedded guard script (real node process)", () => {
   // The embedded script carries its own copy of the regexes, so the
   // compound-command bypass must be pinned here too — not just on the
   // TypeScript classifier. These are the exact commands that returned `allow`
-  // before the safe-helper exception was anchored to the whole command.
+  // before the safe-helper exception was anchored to the whole command, plus
+  // the newline-separated forms that survived that anchoring.
   for (const cmd of [
     "paperclip-safe-env && env",
     "safe-env-inspect; printenv",
     "./scripts/safe-env-inspect.mjs && cat /proc/self/environ",
     'sh -lc "paperclip-safe-env && env"',
+    "paperclip-safe-env\nenv",
+    "safe-env-inspect.mjs\nprintenv",
+    "echo ok\nenv",
+    "echo ok\nset",
+    "echo ok\nexport -p",
+    "echo ok\ndeclare -x",
+    "echo ok\r\nenv",
+    'sh -lc "echo ok\nenv"',
   ]) {
     it(`exits 2 on compound bypass: ${JSON.stringify(cmd)}`, () => {
       const { status, stderr } = runGuardScript({ tool_name: "Bash", tool_input: { command: cmd } });
       expect(status).toBe(2);
       expect(stderr).toContain("PEN-1305");
+    });
+  }
+
+  // ...and the embedded copy must not over-block multi-line scripts either.
+  for (const cmd of ["cd /repo\nset -euo pipefail\nls -la", "cd /repo\npaperclip-safe-env"]) {
+    it(`exits 0 on benign multi-line: ${JSON.stringify(cmd)}`, () => {
+      expect(runGuardScript({ tool_name: "Bash", tool_input: { command: cmd } }).status).toBe(0);
     });
   }
 
