@@ -10159,7 +10159,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
       const healedPerPass: number[] = [];
       let exhaustedPasses = 0;
-      // One more pass than the budget allows, so the stop is observed rather than assumed.
+      // Two more passes than the budget allows, so the stop is observed rather than assumed.
       for (let pass = 0; pass < maxAttempts + 2; pass += 1) {
         await neutralizeRecoveryWake(agentId);
         await clearBackstopCooldown(action.id);
@@ -10168,18 +10168,31 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         exhaustedPasses += result.exhaustedSkipped;
       }
 
-      // `attemptCount` starts at 1 (spent by the escalation) and the exhaustion helper
-      // trips on `attemptCount > maxAttempts`, so exactly `maxAttempts` further wakes fit.
-      expect(healedPerPass.filter((healed) => healed === 1)).toHaveLength(maxAttempts);
-      expect(healedPerPass.slice(maxAttempts)).toEqual([0, 0]);
-      expect(exhaustedPasses).toBe(2);
+      // BLO-18106 review follow-up (Ally @ 048350286, finding 1). An earlier revision of
+      // this test asserted `maxAttempts` FURTHER wakes on top of the one the escalation
+      // already spent, ending at `attemptCount === maxAttempts + 1` -- i.e. it codified a
+      // budget overrun as the expected behaviour, which is how the off-by-one survived a
+      // review round.
+      //
+      // `attemptCount` counts attempts ALREADY SPENT and starts at 1 (spent by the
+      // escalation that created the action). The claim spends one more, so it may only
+      // proceed while `attemptCount < maxAttempts`. With a budget of 3 that leaves room
+      // for 2 backstop redeliveries, and the total spend lands exactly ON the ceiling --
+      // the same number the ordinary enqueue path spends against the same column.
+      expect(healedPerPass).toEqual([1, 1, 0, 0, 0]);
+      // The three refused passes must be reported as BUDGET rejections, not cooldown ones.
+      // The first of them is the boundary case (`attemptCount === maxAttempts`), which the
+      // exhaustion helper's `>` test alone would misclassify -- the caller asks the
+      // post-increment question so the counter that is this path's post-deploy signal
+      // stays truthful.
+      expect(exhaustedPasses).toBe(3);
 
       const [after] = await db
         .select()
         .from(issueRecoveryActions)
         .where(eq(issueRecoveryActions.id, action.id));
-      expect(after?.attemptCount).toBe(maxAttempts + 1);
-      expect(await backstopWakes(action.ownerAgentId ?? agentId)).toHaveLength(maxAttempts);
+      expect(after?.attemptCount).toBe(maxAttempts);
+      expect(await backstopWakes(action.ownerAgentId ?? agentId)).toHaveLength(maxAttempts - 1);
     });
 
     // The negative half of the same finding: a wake that reached nobody must NOT spend

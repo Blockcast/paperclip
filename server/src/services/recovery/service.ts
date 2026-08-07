@@ -4364,6 +4364,14 @@ export function recoveryService(
         recoveryActionsSvc.releaseWakeAttempt({
           companyId: input.issue.companyId,
           actionId: input.action.id,
+          // BLO-18106 (review follow-up): fence the refund to the reservation this sweep
+          // spent. `upsertSourceScoped` resets `attemptCount` to 1 on a change of owner, so
+          // an unscoped refund racing a reassignment would decrement the NEW owner's fresh
+          // budget. Matching the post-increment count also makes the retry below idempotent
+          // — including the nastiest case, where the first refund committed but the client
+          // saw a connection error, which previously double-refunded.
+          expectedOwnerAgentId: input.action.ownerAgentId,
+          expectedAttemptCount: input.action.attemptCount,
         });
       try {
         await release();
@@ -8233,7 +8241,17 @@ export function recoveryService(
             currentIssue.assigneeAgentId !== candidate.assigneeAgentId
           ) {
             result.staleSnapshotSkipped += 1;
-          } else if (strandedRecoveryWakeAttemptsExhausted(current, now)) {
+          } else if (
+            // Ask the same POST-increment question the claim's SQL asks, so the boundary
+            // row (`attemptCount === maxAttempts`) — claimable under the old `<=`, rejected
+            // under `lt` — is reported as the budget rejection it is rather than charged to
+            // the cooldown counter. These counters are this path's post-deploy signal, so a
+            // classifier that drifts from the predicate makes the signal lie.
+            strandedRecoveryWakeAttemptsExhausted(
+              { ...current, attemptCount: current.attemptCount + 1 },
+              now,
+            )
+          ) {
             result.exhaustedSkipped += 1;
           } else {
             result.cooldownSkipped += 1;
@@ -8248,9 +8266,18 @@ export function recoveryService(
         // stands because a deferral is precisely the case that would otherwise re-run on
         // every pass. A failing refund must not mask the delivery outcome, so it is logged
         // rather than thrown; the cooldown and `timeoutAt` still bound the action.
+        //
+        // Scoped to the reservation this claim created (owner + post-claim count), so an
+        // owner change racing the enqueue cannot refund against the replacement owner's
+        // reset counter and hand them an uncounted wake.
         const refundClaimedAttempt = async (reason: string) => {
           try {
-            await recoveryActionsSvc.releaseWakeAttempt({ companyId, actionId: action.id });
+            await recoveryActionsSvc.releaseWakeAttempt({
+              companyId,
+              actionId: action.id,
+              expectedOwnerAgentId: ownerAgentId,
+              expectedAttemptCount: claimedAttemptCount,
+            });
           } catch (refundErr) {
             logger.warn(
               { err: refundErr, issueId: candidate.id, recoveryActionId: action.id, reason },

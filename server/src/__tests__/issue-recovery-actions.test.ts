@@ -4186,13 +4186,29 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       expect(claim.claimed).toBe(false);
     });
 
-    // The ceiling mirrors `strandedRecoveryWakeAttemptsExhausted`, which trips on
-    // `attemptCount > maxAttempts` -- so sitting *at* the ceiling is still claimable and
-    // one past it is not. Pinning both sides keeps the predicate and that helper from
-    // drifting apart, which would misreport a budget rejection as a cooldown one.
-    it("claims at the ceiling but not past it", async () => {
+    // The claim SPENDS an attempt, so the bound is the post-increment one: a claim is
+    // allowed only while `attemptCount + 1 <= maxAttempts`.
+    //
+    // An earlier revision of this test asserted that a row sitting *at* the ceiling was
+    // still claimable, on the theory that the predicate should mirror
+    // `strandedRecoveryWakeAttemptsExhausted`'s `>` test. That mirrored the helper across
+    // the increment and so codified one extra delivered wake: with `maxAttempts: 5` the
+    // backstop could take the row to `attemptCount: 6`, while the ordinary path (which
+    // increments first and tests the post-increment row) stops at 5. Both paths spend the
+    // same column against the same ceiling, so both must stop at the same number.
+    it("stops claiming once the budget has no room for the increment", async () => {
+      // 4 -> 5 is the last claim the ceiling has room for.
+      const belowCeiling = await seedClaimable({ attemptCount: 4, maxAttempts: 5 });
+      const lastClaim = await belowCeiling.svc.claimWakeAttempt(currentSnapshot(belowCeiling));
+      expect(lastClaim.claimed).toBe(true);
+      expect(lastClaim.attemptCount).toBe(5);
+
+      // At the ceiling there is no room to increment: claiming would spend a 6th attempt
+      // against a budget of 5. This is the case that regressed.
       const atCeiling = await seedClaimable({ attemptCount: 5, maxAttempts: 5 });
-      expect((await atCeiling.svc.claimWakeAttempt(currentSnapshot(atCeiling))).claimed).toBe(true);
+      expect((await atCeiling.svc.claimWakeAttempt(currentSnapshot(atCeiling))).claimed).toBe(
+        false,
+      );
 
       const pastCeiling = await seedClaimable({ attemptCount: 6, maxAttempts: 5 });
       expect((await pastCeiling.svc.claimWakeAttempt(currentSnapshot(pastCeiling))).claimed).toBe(
@@ -4210,6 +4226,82 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       const claim = await seeded.svc.claimWakeAttempt(currentSnapshot(seeded));
 
       expect(claim.claimed).toBe(false);
+    });
+
+    // BLO-18106 review follow-up (Ally @ 048350286, finding 3). The refund is a
+    // compensating write for a specific reservation, so it has to be fenced to that
+    // reservation and not merely to the action id.
+    //
+    // The row is reused in place across reassignments and `upsertSourceScoped` RESETS
+    // `attemptCount` to 1 on a change of owner. So an owner change racing a non-delivered
+    // enqueue used to decrement the REPLACEMENT owner's fresh budget -- handing that owner
+    // a wake nobody counted, which is the exact opposite of a refund's purpose.
+    it("does not refund against a replacement owner's reset budget", async () => {
+      const seeded = await seedClaimable({ attemptCount: 3, maxAttempts: 5 });
+      const claim = await seeded.svc.claimWakeAttempt(currentSnapshot(seeded));
+      expect(claim.claimed).toBe(true);
+      expect(claim.attemptCount).toBe(4);
+
+      // The enqueue is in flight when an operator hands the action to a different owner.
+      // That resets the sequence to attemptCount 1 for the new owner.
+      const reowned = await seeded.svc.upsertSourceScoped({
+        companyId: seeded.companyId,
+        sourceIssueId: seeded.sourceIssueId,
+        kind: "issue_recovery",
+        ownerAgentId: seeded.coderId,
+        cause: "stranded_assigned_issue",
+        fingerprint: `stranded:${seeded.sourceIssueId}`,
+        nextAction: "wake_owner",
+        maxAttempts: 5,
+      });
+      expect(reowned).toMatchObject({ ownerAgentId: seeded.coderId, attemptCount: 1 });
+
+      // The enqueue then reports non-delivery and the original claimer refunds.
+      const refunded = await seeded.svc.releaseWakeAttempt({
+        companyId: seeded.companyId,
+        actionId: seeded.action.id,
+        expectedOwnerAgentId: seeded.managerId,
+        expectedAttemptCount: 4,
+      });
+
+      // Assert the persisted budget FIRST, so this fails on the defect itself rather than
+      // on the newer return type: pre-fix the unscoped refund decremented the new owner's
+      // 1 down to 0, gifting them an uncounted wake.
+      const [row] = await db
+        .select({ attemptCount: issueRecoveryActions.attemptCount })
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.id, seeded.action.id));
+      expect(row?.attemptCount).toBe(1);
+      expect(refunded).toBe(false);
+    });
+
+    // Matching the post-claim count makes the refund idempotent for free, which the
+    // ordinary path relies on -- it retries a failed refund once, and the nastiest case is
+    // a first call that committed but whose client saw a connection error.
+    it("refunds a reservation exactly once", async () => {
+      const seeded = await seedClaimable({ attemptCount: 3, maxAttempts: 5 });
+      const claim = await seeded.svc.claimWakeAttempt(currentSnapshot(seeded));
+      expect(claim.attemptCount).toBe(4);
+
+      const reservation = {
+        companyId: seeded.companyId,
+        actionId: seeded.action.id,
+        expectedOwnerAgentId: seeded.managerId,
+        expectedAttemptCount: 4,
+      };
+
+      const first = await seeded.svc.releaseWakeAttempt(reservation);
+      const second = await seeded.svc.releaseWakeAttempt(reservation);
+
+      // Persisted budget first, so the pre-fix failure is the double-decrement (to 2)
+      // rather than the newer return type.
+      const [row] = await db
+        .select({ attemptCount: issueRecoveryActions.attemptCount })
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.id, seeded.action.id));
+      expect(row?.attemptCount).toBe(3);
+      expect(first).toBe(true);
+      expect(second).toBe(false);
     });
 
     it("leaves an unbudgeted action bounded only by its cooldown", async () => {

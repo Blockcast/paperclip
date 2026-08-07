@@ -1,4 +1,4 @@
-import { and, desc, eq, gt, inArray, isNull, lte, or, sql } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, isNull, lt, lte, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { issueRecoveryActions, issues } from "@paperclipai/db";
 import type {
@@ -519,20 +519,51 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
   // So only wakes that actually reached the queue count against the budget. Floors at 0 so a
   // refunded first attempt makes the next sweep's `existing.attemptCount + 1` land back on 1.
   // Scoped to active statuses and matched on company so it cannot touch a resolved row.
-  async function releaseWakeAttempt(input: { companyId: string; actionId: string }): Promise<void> {
-    await db
+  //
+  // BLO-18106 (review follow-up): the refund must also be scoped to the RESERVATION that
+  // created it, not just to the action id. The row is long-lived and reused in place across
+  // reassignments, and `upsertSourceScoped` RESETS `attemptCount` to 1 on a change of owner.
+  // So an owner change between claim and refund would decrement the replacement owner's
+  // freshly-reset counter — silently granting that owner an extra uncounted wake, which is
+  // the opposite of what a refund is for.
+  //
+  // `expectedAttemptCount` is the post-claim count returned by `claimWakeAttempt`. Matching
+  // on it makes the refund idempotent for free: the successful refund moves the column off
+  // the expected value, so a duplicate or retried call simply matches no row. That matters
+  // because the ordinary path deliberately retries a failed refund once.
+  //
+  // Returns whether a row was actually refunded, so a caller that cares (the retrying one)
+  // can tell "no matching reservation" apart from "database refused".
+  async function releaseWakeAttempt(input: {
+    companyId: string;
+    actionId: string;
+    expectedOwnerAgentId?: string | null;
+    expectedAttemptCount?: number;
+  }): Promise<boolean> {
+    const predicates = [
+      eq(issueRecoveryActions.id, input.actionId),
+      eq(issueRecoveryActions.companyId, input.companyId),
+      inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
+    ];
+    if (input.expectedOwnerAgentId !== undefined) {
+      predicates.push(
+        input.expectedOwnerAgentId === null
+          ? isNull(issueRecoveryActions.ownerAgentId)
+          : eq(issueRecoveryActions.ownerAgentId, input.expectedOwnerAgentId),
+      );
+    }
+    if (input.expectedAttemptCount !== undefined) {
+      predicates.push(eq(issueRecoveryActions.attemptCount, input.expectedAttemptCount));
+    }
+    const refunded = await db
       .update(issueRecoveryActions)
       .set({
         attemptCount: sql`greatest(${issueRecoveryActions.attemptCount} - 1, 0)`,
         updatedAt: new Date(),
       })
-      .where(
-        and(
-          eq(issueRecoveryActions.id, input.actionId),
-          eq(issueRecoveryActions.companyId, input.companyId),
-          inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
-        ),
-      );
+      .where(and(...predicates))
+      .returning({ id: issueRecoveryActions.id });
+    return refunded.length > 0;
   }
 
   /**
@@ -554,10 +585,10 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
    *    the same per-owner budget the ordinary enqueue path spends, or the action's
    *    `maxAttempts` ceiling is bypassed entirely: with only a cooldown bound, a 30m
    *    cooldown against a 6h `timeoutAt` horizon permits ~12 wakes on a budget of 5,
-   *    while `attemptCount` stays put and the exhaustion notice under-reports. The
-   *    predicate mirrors `strandedRecoveryWakeAttemptsExhausted` exactly -- that helper
-   *    trips on `attemptCount > maxAttempts`, so `attemptCount` may *equal* the ceiling;
-   *    claiming increments, hence `attemptCount < maxAttempts` is the claimable bound.
+   *    while `attemptCount` stays put and the exhaustion notice under-reports. The claim
+   *    spends an attempt, so the bound is the POST-increment one: `attemptCount <
+   *    maxAttempts`. (`strandedRecoveryWakeAttemptsExhausted` tests `>` on already-spent
+   *    counts; matching it literally here would permit one extra wake -- see the predicate.)
    * 3. **Snapshot** -- the action's observed owner and the issue's observed
    *    status/assignee. Without this, an operator who unblocks or reassigns the issue
    *    between candidate selection and this claim still gets a wake sent to the owner
@@ -588,17 +619,37 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
         lte(issueRecoveryActions.lastAttemptAt, cutoff),
       ),
       // Unbudgeted actions (`maxAttempts` NULL) are bounded only by their caller; a
-      // budgeted one must still be inside both its ceiling and its horizon. This is the
-      // exact negation of `strandedRecoveryWakeAttemptsExhausted`, deliberately including
-      // its `>` (not `>=`) ceiling test -- `attemptCount` counts attempts already spent
-      // and starts at 1 on creation, so an action sitting *at* `maxAttempts` is not yet
-      // exhausted. Matching the helper rather than tightening it keeps this predicate and
-      // the caller's pre-filter from disagreeing, which would misreport a budget rejection
-      // as a cooldown one.
+      // budgeted one must still be inside both its ceiling and its horizon.
+      //
+      // The invariant is POST-increment: this claim spends an attempt, so it may only
+      // proceed when the resulting count still satisfies the ceiling --
+      // `attemptCount + 1 <= maxAttempts`, i.e. `attemptCount < maxAttempts`.
+      //
+      // An earlier revision used `<=` here, reasoning that it "mirrors
+      // `strandedRecoveryWakeAttemptsExhausted` exactly" because that helper trips on `>`
+      // rather than `>=`. That conflated two counts taken on opposite sides of the
+      // increment, and cost one extra delivered wake per action:
+      //
+      //   ordinary path  -- `upsertSourceScoped` increments FIRST, then the caller tests
+      //                     the POST-increment row (service.ts, `...Exhausted(input.action)`),
+      //                     so it delivers for attemptCount 1..maxAttempts -> maxAttempts wakes.
+      //   backstop (old) -- tested the PRE-increment row with `<=`, so it delivered while
+      //                     the pre-count was <= maxAttempts, leaving a post-count of
+      //                     maxAttempts + 1 -> maxAttempts + 1 wakes.
+      //
+      // With `lt` both paths spend exactly `maxAttempts` attempts against the same column.
+      // The helper itself is deliberately NOT retightened to `>=`: it is applied to
+      // post-increment counts everywhere else, and `>=` there would silently cut the
+      // ordinary path to `maxAttempts - 1` wakes.
+      //
+      // The caller's miss classifier stays in step by asking the same post-increment
+      // question (`...Exhausted({ ...current, attemptCount: current.attemptCount + 1 })`),
+      // so a rejection at the boundary is reported as a budget rejection rather than a
+      // cooldown one.
       or(
         isNull(issueRecoveryActions.maxAttempts),
         and(
-          lte(issueRecoveryActions.attemptCount, issueRecoveryActions.maxAttempts),
+          lt(issueRecoveryActions.attemptCount, issueRecoveryActions.maxAttempts),
           or(
             isNull(issueRecoveryActions.timeoutAt),
             gt(issueRecoveryActions.timeoutAt, now),
