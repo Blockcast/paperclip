@@ -367,7 +367,18 @@ function looksLikeCredentialValue(value: string): boolean {
   if (KNOWN_SECRET_PREFIX_RE.test(withoutScheme)) return true;
   if (JWT_LIKE_VALUE_RE.test(withoutScheme)) return true;
   if (/\s/.test(withoutScheme)) return false;
-  return withoutScheme.length >= MIN_OPAQUE_TOKEN_LENGTH;
+  if (withoutScheme.length < MIN_OPAQUE_TOKEN_LENGTH) return false;
+  // Same over-redaction as the URL path-segment case, one level up: a
+  // whitespace-free length-20+ *status slug* (`pending_human_merge_review`)
+  // is exactly as common under a Tier-2 collision key as a real opaque
+  // token, and the length backstop alone can't tell them apart. Confirmed
+  // live on a currently-pending card, not hypothetical: an
+  // `authoritative_state` field (Tier 2 — "auth" is a substring of
+  // "authoritative", the same collision class as "author") got blanked by
+  // this exact branch post-#943-merge. Reuse the same
+  // dictionary-word-shaped-parts exemption already applied to URL path
+  // segments.
+  return !looksLikeReadableSlug(withoutScheme);
 }
 
 /**
