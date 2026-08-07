@@ -45,5 +45,9 @@ describe("PEN-1198 audit dependency remediation", () => {
         "GHSA-3p4h-7m6x-2hcm",
       ]),
     });
+    expect(remediations["js-yaml"]).toMatchObject({
+      patchedRange: ">=4.3.1 <5",
+      advisories: expect.arrayContaining(["GHSA-5p4m-2wfm-xmqj"]),
+    });
   });
 });
