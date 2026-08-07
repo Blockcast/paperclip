@@ -1653,6 +1653,52 @@ describe.sequential("plugin config secret masking (BLO-20794)", () => {
     expect(store.configJson).toEqual({ endpoint: "https://x.example.com" });
   }, 20_000);
 
+  it("re-homes nothing when an array entry is deleted, matching entries by identity", async () => {
+    // BLO-20871 review finding: positional restore would hand `token-alpha` to
+    // beta's endpoint. Identity matching keeps each secret with its own entry.
+    maskingPlugin({ type: "object", properties: { endpoint: { type: "string" } } });
+    const store = seedConfigStore({
+      targets: [
+        { name: "alpha", token: "token-alpha-live" },
+        { name: "beta", token: "token-beta-live" },
+      ],
+    });
+    const { app } = await createApp(adminActor());
+
+    const res = await request(app)
+      .post(`/api/plugins/${pluginId}/config`)
+      .send({
+        companyId: companyA,
+        configJson: { targets: [{ name: "beta", token: "__redacted__" }] },
+      });
+
+    expect(res.status).toBe(200);
+    expect(store.configJson).toEqual({ targets: [{ name: "beta", token: "token-beta-live" }] });
+    expect(JSON.stringify(store.configJson)).not.toContain("token-alpha-live");
+  }, 20_000);
+
+  it("rejects the save when a masked array entry cannot be matched to storage", async () => {
+    // No stable identity on the entries, and the array shrank — restoring by
+    // position could only guess, so the write is refused outright.
+    maskingPlugin({ type: "object", properties: { endpoint: { type: "string" } } });
+    const store = seedConfigStore({
+      targets: [{ token: "token-alpha-live" }, { token: "token-beta-live" }],
+    });
+    const { app } = await createApp(adminActor());
+
+    const res = await request(app)
+      .post(`/api/plugins/${pluginId}/config`)
+      .send({ companyId: companyA, configJson: { targets: [{ token: "__redacted__" }] } });
+
+    expect(res.status).toBe(400);
+    expect(res.body.unresolvedMaskPaths).toEqual(["targets.0"]);
+    // Storage is untouched, and no sentinel was written.
+    expect(store.configJson).toEqual({
+      targets: [{ token: "token-alpha-live" }, { token: "token-beta-live" }],
+    });
+    expect(mockRegistry.upsertConfig).not.toHaveBeenCalled();
+  }, 20_000);
+
   it("restores the stored secret before validating against a constrained schema", async () => {
     // `__redacted__` is 12 chars; a minLength of 20 proves the merge runs first.
     maskingPlugin({
@@ -1709,5 +1755,68 @@ describe.sequential("plugin config secret masking (BLO-20794)", () => {
       "validateConfig",
       { config: expect.objectContaining({ webhookToken: CONFIG_SECRET }) },
     );
+  }, 20_000);
+
+  it("redacts the restored secret from worker warnings", async () => {
+    // BLO-20871 review finding: the worker legitimately receives plaintext, and
+    // its diagnostics are author-controlled strings returned verbatim, so a
+    // worker could echo the credential straight back out of /config/test.
+    maskingPlugin();
+    seedConfigStore({ webhookToken: CONFIG_SECRET, endpoint: "https://alerts.example.com" });
+    const workerCall = vi.fn().mockResolvedValue({
+      ok: true,
+      warnings: [`token ${CONFIG_SECRET} is close to expiry`],
+    });
+    const { app } = await createApp(adminActor(), {}, {
+      bridgeDeps: { workerManager: { isRunning: () => true, call: workerCall } },
+    });
+
+    const res = await request(app)
+      .post(`/api/plugins/${pluginId}/config/test`)
+      .send({ companyId: companyA, configJson: { webhookToken: "__redacted__", endpoint: "https://alerts.example.com" } });
+
+    expect(res.status).toBe(200);
+    expect(JSON.stringify(res.body)).not.toContain(CONFIG_SECRET);
+    expect(res.body.message).toContain("__redacted__");
+    expect(res.body.message).toContain("close to expiry");
+  }, 20_000);
+
+  it("redacts the restored secret from worker errors", async () => {
+    maskingPlugin();
+    seedConfigStore({ webhookToken: CONFIG_SECRET, endpoint: "https://alerts.example.com" });
+    const workerCall = vi.fn().mockResolvedValue({
+      ok: false,
+      errors: [`upstream rejected bearer ${CONFIG_SECRET}`],
+    });
+    const { app } = await createApp(adminActor(), {}, {
+      bridgeDeps: { workerManager: { isRunning: () => true, call: workerCall } },
+    });
+
+    const res = await request(app)
+      .post(`/api/plugins/${pluginId}/config/test`)
+      .send({ companyId: companyA, configJson: { webhookToken: "__redacted__", endpoint: "https://alerts.example.com" } });
+
+    expect(res.status).toBe(200);
+    expect(res.body.valid).toBe(false);
+    expect(JSON.stringify(res.body)).not.toContain(CONFIG_SECRET);
+    expect(res.body.message).toContain("upstream rejected bearer");
+  }, 20_000);
+
+  it("redacts the restored secret from a thrown worker RPC error", async () => {
+    // The 502 path carries worker-controlled `message` and free-form `details`.
+    maskingPlugin();
+    seedConfigStore({ webhookToken: CONFIG_SECRET, endpoint: "https://alerts.example.com" });
+    const workerCall = vi.fn().mockRejectedValue(
+      new Error(`connect failed using ${CONFIG_SECRET}`),
+    );
+    const { app } = await createApp(adminActor(), {}, {
+      bridgeDeps: { workerManager: { isRunning: () => true, call: workerCall } },
+    });
+
+    const res = await request(app)
+      .post(`/api/plugins/${pluginId}/config/test`)
+      .send({ companyId: companyA, configJson: { webhookToken: "__redacted__", endpoint: "https://alerts.example.com" } });
+
+    expect(JSON.stringify(res.body)).not.toContain(CONFIG_SECRET);
   }, 20_000);
 });

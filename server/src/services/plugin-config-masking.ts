@@ -80,6 +80,8 @@ const SECRET_WORD_PAIRS = new Set([
   "consumer key",
 ]);
 
+type SchemaNode = Record<string, unknown>;
+
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const proto = Object.getPrototypeOf(value);
@@ -157,60 +159,139 @@ function isSecretPointerCandidate(value: unknown): value is Record<string, unkno
  * - `x-paperclip-secret: true` — explicit Paperclip marker for authors who do
  *   not want `writeOnly`'s other UI implications.
  */
-function declaresSecret(node: Record<string, unknown>): boolean {
+function declaresSecret(node: SchemaNode): boolean {
   return (
-    node.format === "secret-ref" ||
-    node.writeOnly === true ||
-    node["x-paperclip-secret"] === true
+    node.format === "secret-ref" || node.writeOnly === true || node["x-paperclip-secret"] === true
   );
 }
 
-export interface PluginConfigSecretPaths {
-  /** Dot-paths the manifest declares secret-bearing. */
-  secret: Set<string>;
-  /** Dot-paths the manifest explicitly declares NOT secret (`x-paperclip-secret: false`). */
-  exempt: Set<string>;
-}
-
 /**
- * Collect the dot-paths a manifest marks secret-bearing (and those it
- * explicitly exempts), following `properties` plus the `allOf` / `anyOf` /
- * `oneOf` composition keywords — same traversal shape as
- * `collectSecretRefPaths`, widened to the markers in {@link declaresSecret}.
+ * Flatten a set of schema nodes through the composition keywords, so a marker
+ * sitting on an `allOf` / `anyOf` / `oneOf` *branch node itself* is seen rather
+ * than only markers on that branch's `properties`.
+ *
+ * Applicability is deliberately not evaluated: a value covered by any branch of
+ * a composition is treated as covered by all of them. Masking is fail-closed —
+ * a field that is secret in only one `oneOf` branch must not be emitted in the
+ * clear just because another branch would have permitted it.
  */
-export function collectSecretBearingPaths(
-  schema: Record<string, unknown> | null | undefined,
-): PluginConfigSecretPaths {
-  const secret = new Set<string>();
-  const exempt = new Set<string>();
-  if (!schema || typeof schema !== "object") return { secret, exempt };
+function expandSchemaNodes(nodes: SchemaNode[]): SchemaNode[] {
+  const expanded: SchemaNode[] = [];
+  const seen = new Set<SchemaNode>();
+  const stack = [...nodes];
 
-  function walk(node: Record<string, unknown>, prefix: string): void {
+  while (stack.length > 0) {
+    const node = stack.pop();
+    if (!isPlainRecord(node) || seen.has(node)) continue;
+    seen.add(node);
+    expanded.push(node);
     for (const keyword of ["allOf", "anyOf", "oneOf"] as const) {
       const branches = node[keyword];
       if (!Array.isArray(branches)) continue;
       for (const branch of branches) {
-        if (!isPlainRecord(branch)) continue;
-        walk(branch, prefix);
+        if (isPlainRecord(branch)) stack.push(branch);
       }
-    }
-
-    const properties = node.properties;
-    if (!isPlainRecord(properties)) return;
-    for (const [key, propertySchema] of Object.entries(properties)) {
-      if (!isPlainRecord(propertySchema)) continue;
-      const path = prefix ? `${prefix}.${key}` : key;
-      if (declaresSecret(propertySchema)) {
-        secret.add(path);
-      } else if (propertySchema["x-paperclip-secret"] === false) {
-        exempt.add(path);
-      }
-      walk(propertySchema, path);
     }
   }
 
-  walk(schema, "");
-  return { secret, exempt };
+  return expanded;
+}
+
+/**
+ * Schema nodes that govern `record[key]`, honouring `properties`,
+ * `patternProperties` and `additionalProperties` (the last only when neither of
+ * the former claims the key, matching JSON Schema evaluation order).
+ */
+function childNodesForKey(nodes: SchemaNode[], key: string): SchemaNode[] {
+  const children: SchemaNode[] = [];
+
+  for (const node of nodes) {
+    let claimed = false;
+
+    const properties = node.properties;
+    if (isPlainRecord(properties) && key in properties) {
+      claimed = true;
+      const declared = properties[key];
+      if (isPlainRecord(declared)) children.push(declared);
+    }
+
+    const patternProperties = node.patternProperties;
+    if (isPlainRecord(patternProperties)) {
+      for (const [pattern, subSchema] of Object.entries(patternProperties)) {
+        let matcher: RegExp;
+        try {
+          matcher = new RegExp(pattern);
+        } catch {
+          continue; // A manifest with an invalid pattern must not break masking.
+        }
+        if (!matcher.test(key)) continue;
+        claimed = true;
+        if (isPlainRecord(subSchema)) children.push(subSchema);
+      }
+    }
+
+    const additionalProperties = node.additionalProperties;
+    if (!claimed && isPlainRecord(additionalProperties)) children.push(additionalProperties);
+  }
+
+  return children;
+}
+
+/**
+ * Schema nodes that govern `array[index]`, honouring the 2020-12 `prefixItems`
+ * + `items` pair as well as the draft-07 tuple form (`items` as an array with
+ * `additionalItems` for the tail).
+ */
+function childNodesForIndex(nodes: SchemaNode[], index: number): SchemaNode[] {
+  const children: SchemaNode[] = [];
+
+  for (const node of nodes) {
+    let claimedByTuple = false;
+
+    const prefixItems = node.prefixItems;
+    if (Array.isArray(prefixItems) && index < prefixItems.length) {
+      claimedByTuple = true;
+      if (isPlainRecord(prefixItems[index])) children.push(prefixItems[index]);
+    }
+
+    const items = node.items;
+    if (Array.isArray(items)) {
+      if (index < items.length) {
+        claimedByTuple = true;
+        if (isPlainRecord(items[index])) children.push(items[index]);
+      } else if (isPlainRecord(node.additionalItems)) {
+        children.push(node.additionalItems);
+      }
+    } else if (isPlainRecord(items) && !claimedByTuple) {
+      children.push(items);
+    }
+  }
+
+  return children;
+}
+
+function nodesDeclareSecret(nodes: SchemaNode[]): boolean {
+  return nodes.some(declaresSecret);
+}
+
+/**
+ * Whether the value at this path is declared *specifically* as a secret-ref
+ * pointer, rather than merely secret-bearing.
+ *
+ * Only `format: "secret-ref"` gets the bare-UUID passthrough in
+ * {@link maskPluginConfigJson}. A UUID sitting in a `writeOnly` /
+ * `x-paperclip-secret` field is an ordinary credential that happens to be
+ * UUID-shaped — plenty of providers issue UUID API keys — and returning it in
+ * the clear would defeat the masking entirely. The legacy-binding coercion that
+ * passthrough exists to serve is itself gated on `format === "secret-ref"`
+ * (`json-schema-secret-refs.ts`), so widening it here buys nothing.
+ */
+function nodesDeclareSecretRef(nodes: SchemaNode[]): boolean {
+  return nodes.some((node) => node.format === "secret-ref");
+}
+
+function nodesDeclareNotSecret(nodes: SchemaNode[]): boolean {
+  return nodes.some((node) => node["x-paperclip-secret"] === false);
 }
 
 /**
@@ -220,6 +301,11 @@ export function collectSecretBearingPaths(
  * A value is secret-bearing when the manifest declares it (see
  * {@link declaresSecret}) or when its key name matches {@link SECRET_WORDS} /
  * {@link SECRET_WORD_PAIRS} and the manifest has not exempted it.
+ *
+ * The schema is walked in lockstep with the value rather than pre-flattened into
+ * dot-paths, so declarations reachable only through `items`, `prefixItems`,
+ * `patternProperties`, `additionalProperties` or a composition branch are
+ * honoured at every depth.
  *
  * Secret pointers are preserved rather than masked — they name a secret without
  * disclosing it, and dropping them would break the config form's binding
@@ -233,69 +319,214 @@ export function collectSecretBearingPaths(
  */
 export function maskPluginConfigJson(
   configJson: unknown,
-  schema?: Record<string, unknown> | null,
+  schema?: SchemaNode | null,
+  collector?: Set<string>,
 ): unknown {
   if (!isPlainRecord(configJson)) return configJson;
-  const { secret, exempt } = collectSecretBearingPaths(schema);
 
-  function maskRecord(
-    record: Record<string, unknown>,
-    prefix: string,
-    inSecretContainer: boolean,
-  ): Record<string, unknown> {
-    const result: Record<string, unknown> = {};
-    for (const [key, value] of Object.entries(record)) {
-      const path = prefix ? `${prefix}.${key}` : key;
-      result[key] = maskValue(key, value, path, inSecretContainer);
-    }
-    return result;
+  /** Record the plaintext being masked, for {@link collectPluginConfigSecretValues}. */
+  function mask(value: unknown): string {
+    if (collector && typeof value === "string" && value.length > 0) collector.add(value);
+    return PLUGIN_CONFIG_SECRET_MASK;
   }
 
-  function maskValue(
-    key: string,
+  function maskNode(
     value: unknown,
-    path: string,
-    inSecretContainer: boolean,
+    key: string | null,
+    nodes: SchemaNode[],
+    inheritedSuspect: boolean,
   ): unknown {
     // A pointer names a secret without disclosing it — keep it, minus baggage.
     if (isSecretPointerCandidate(value)) {
-      return sanitizeSecretPointer(value) ?? PLUGIN_CONFIG_SECRET_MASK;
+      return sanitizeSecretPointer(value) ?? mask(value);
     }
 
-    if (secret.has(path)) {
-      // A bare UUID at a declared-secret path is a legacy binding (see
-      // `coerceLegacySecretRef`), i.e. a pointer, not a credential.
-      if (typeof value === "string" && isUuidSecretRef(value)) return value;
+    if (nodesDeclareSecret(nodes)) {
+      // A bare UUID under `format: "secret-ref"` is a legacy binding (see
+      // `coerceLegacySecretRef`), i.e. a pointer, not a credential. That
+      // passthrough is deliberately NOT extended to `writeOnly` /
+      // `x-paperclip-secret`, where a UUID is just a UUID-shaped credential.
+      if (
+        typeof value === "string" &&
+        isUuidSecretRef(value) &&
+        nodesDeclareSecretRef(nodes)
+      ) {
+        return value;
+      }
       if (value === null || value === undefined) return value;
-      return PLUGIN_CONFIG_SECRET_MASK;
+      return mask(value);
     }
 
     // An explicit `x-paperclip-secret: false` wins over the heuristic, and over
     // a suspicious ancestor.
-    const suspect = exempt.has(path)
+    const suspect = nodesDeclareNotSecret(nodes)
       ? false
-      : inSecretContainer || matchesSecretFieldName(key);
+      : inheritedSuspect || (key !== null && matchesSecretFieldName(key));
 
-    if (isPlainRecord(value)) return maskRecord(value, path, suspect);
+    if (isPlainRecord(value)) {
+      const result: Record<string, unknown> = {};
+      for (const [childKey, childValue] of Object.entries(value)) {
+        result[childKey] = maskNode(
+          childValue,
+          childKey,
+          expandSchemaNodes(childNodesForKey(nodes, childKey)),
+          suspect,
+        );
+      }
+      return result;
+    }
 
+    // Arrays recurse through the same entry point, so a nested array under a
+    // credential-shaped key (`tokens: [["live"]]`) is covered at any depth.
     if (Array.isArray(value)) {
-      return value.map((entry, index) => {
-        if (isPlainRecord(entry)) return maskRecord(entry, `${path}.${index}`, suspect);
-        if (suspect && typeof entry === "string" && entry.length > 0) {
-          return PLUGIN_CONFIG_SECRET_MASK;
-        }
-        return entry;
-      });
+      return value.map((entry, index) =>
+        maskNode(entry, null, expandSchemaNodes(childNodesForIndex(nodes, index)), suspect),
+      );
     }
 
     if (suspect && typeof value === "string" && value.length > 0) {
-      return PLUGIN_CONFIG_SECRET_MASK;
+      return mask(value);
     }
 
     return value;
   }
 
-  return maskRecord(configJson, "", false);
+  return maskNode(configJson, null, expandSchemaNodes(isPlainRecord(schema) ? [schema] : []), false);
+}
+
+/**
+ * Every plaintext string {@link maskPluginConfigJson} would replace in this
+ * config.
+ *
+ * Deliberately implemented by running the real masking walk and recording what
+ * it covers, rather than by a parallel reimplementation: any future change to
+ * what counts as secret is picked up here for free, and the two can never drift
+ * into disagreeing about a given field.
+ */
+export function collectPluginConfigSecretValues(
+  configJson: unknown,
+  schema?: SchemaNode | null,
+): string[] {
+  const collected = new Set<string>();
+  maskPluginConfigJson(configJson, schema, collected);
+  return [...collected];
+}
+
+/**
+ * Replace every occurrence of a known secret value in free-form text with
+ * {@link PLUGIN_CONFIG_SECRET_MASK}.
+ *
+ * Plugin workers receive restored plaintext (that is what makes `validateConfig`
+ * useful), and their warnings/errors are author-controlled strings that flow
+ * straight back to the client. A worker that interpolates the credential into
+ * its own diagnostic — `"401 rejected for token sk-live-…"` — would otherwise
+ * hand the plaintext back through the very endpoint that masks it (BLO-20871).
+ *
+ * Longest-first so that a secret which is a substring of another is not left
+ * partially exposed by an earlier replacement. No minimum length: over-redacting
+ * a diagnostic is harmless, under-redacting one is the bug.
+ */
+export function redactSecretValuesFromText<T extends string | undefined>(
+  text: T,
+  secretValues: readonly string[],
+): T {
+  if (typeof text !== "string" || text.length === 0) return text;
+
+  let result: string = text;
+  for (const secret of [...secretValues].sort((a, b) => b.length - a.length)) {
+    if (!secret) continue;
+    result = result.split(secret).join(PLUGIN_CONFIG_SECRET_MASK);
+  }
+  return result as T;
+}
+
+/** Marks a key whose posted sentinel resolved to nothing, so it is dropped. */
+const DROP_KEY = Symbol("plugin-config-mask-drop");
+
+/**
+ * Keys tried first when identifying array entries across a masked round-trip.
+ * Anything else present on every entry is still usable as a fallback identity.
+ */
+const IDENTITY_KEY_PREFERENCE = ["id", "uuid", "name", "slug", "key"];
+
+export interface MergeMaskedPluginConfigResult {
+  /** The posted config with sentinels resolved against storage. */
+  configJson: Record<string, unknown>;
+  /**
+   * Dot-paths where a posted sentinel could not be matched to a stored value
+   * with confidence. Callers MUST reject the write when this is non-empty —
+   * see {@link mergeMaskedPluginConfig}.
+   */
+  unresolvedMaskPaths: string[];
+}
+
+function containsMask(value: unknown): boolean {
+  if (value === PLUGIN_CONFIG_SECRET_MASK) return true;
+  if (Array.isArray(value)) return value.some(containsMask);
+  if (isPlainRecord(value)) return Object.values(value).some(containsMask);
+  return false;
+}
+
+/**
+ * A value usable as an array entry's identity: a non-empty scalar that is not
+ * itself masked (a masked identity would match everything).
+ */
+function identityValue(entry: Record<string, unknown>, key: string): string | number | undefined {
+  const value = entry[key];
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.length > 0 && value !== PLUGIN_CONFIG_SECRET_MASK) {
+    return value;
+  }
+  return undefined;
+}
+
+/**
+ * Find a key that identifies entries stably across both arrays: present with a
+ * usable scalar value on every entry, and unique within each array.
+ */
+function findIdentityKey(
+  incoming: Record<string, unknown>[],
+  stored: Record<string, unknown>[],
+): string | null {
+  const candidates = Object.keys(incoming[0] ?? {});
+  const ordered = [
+    ...IDENTITY_KEY_PREFERENCE.filter((key) => candidates.includes(key)),
+    ...candidates.filter((key) => !IDENTITY_KEY_PREFERENCE.includes(key)).sort(),
+  ];
+
+  for (const key of ordered) {
+    const incomingValues = incoming.map((entry) => identityValue(entry, key));
+    const storedValues = stored.map((entry) => identityValue(entry, key));
+    if (incomingValues.some((value) => value === undefined)) continue;
+    if (storedValues.some((value) => value === undefined)) continue;
+    if (new Set(incomingValues).size !== incomingValues.length) continue;
+    if (new Set(storedValues).size !== storedValues.length) continue;
+    return key;
+  }
+
+  return null;
+}
+
+/**
+ * Whether every non-masked scalar the caller sent still matches storage. Used
+ * only as the last-resort positional check, to detect that an array entry was
+ * reordered or replaced rather than merely re-posted with its secret masked.
+ */
+function scalarFieldsMatch(
+  incoming: Record<string, unknown>,
+  stored: Record<string, unknown>,
+): boolean {
+  for (const [key, value] of Object.entries(incoming)) {
+    if (value === PLUGIN_CONFIG_SECRET_MASK) continue;
+    const isScalar =
+      value === null ||
+      typeof value === "string" ||
+      typeof value === "number" ||
+      typeof value === "boolean";
+    if (!isScalar) continue;
+    if (stored[key] !== value) return false;
+  }
+  return true;
 }
 
 /**
@@ -310,52 +541,103 @@ export function maskPluginConfigJson(
  *
  * Callers that supply a genuinely new value overwrite the stored secret as
  * before — only the exact sentinel is treated as "unchanged".
+ *
+ * **Array entries are never restored by bare position.** Restoring
+ * `[A(mask), B(mask)]` positionally means that deleting `A` silently re-homes
+ * `A`'s credential onto `B`, handing a live secret to a different endpoint. An
+ * entry is matched by a stable identity key when one exists; failing that,
+ * position is accepted only when the array is otherwise unchanged. Anything
+ * else is reported in {@link MergeMaskedPluginConfigResult.unresolvedMaskPaths}
+ * and the operator must re-enter the secret. Callers MUST reject a write whose
+ * result carries unresolved paths; the sentinel is dropped from the returned
+ * config as well, so an unchecked caller still cannot persist it.
  */
 export function mergeMaskedPluginConfig(
   incomingConfig: Record<string, unknown>,
   storedConfig: unknown,
-): Record<string, unknown> {
+): MergeMaskedPluginConfigResult {
   const stored = isPlainRecord(storedConfig) ? storedConfig : {};
+  const unresolvedMaskPaths: string[] = [];
+
+  function mergeValue(incoming: unknown, storedValue: unknown, path: string): unknown {
+    if (incoming === PLUGIN_CONFIG_SECRET_MASK) {
+      // Nothing stored to restore — drop the key rather than persist the mask.
+      if (storedValue === undefined) return DROP_KEY;
+      return storedValue;
+    }
+
+    if (isPlainRecord(incoming)) {
+      return mergeRecord(incoming, isPlainRecord(storedValue) ? storedValue : {}, path);
+    }
+
+    if (Array.isArray(incoming)) {
+      return mergeArray(incoming, Array.isArray(storedValue) ? storedValue : [], path);
+    }
+
+    return incoming;
+  }
 
   function mergeRecord(
     incoming: Record<string, unknown>,
     storedNode: Record<string, unknown>,
+    path: string,
   ): Record<string, unknown> {
     const result: Record<string, unknown> = {};
     for (const [key, value] of Object.entries(incoming)) {
-      const storedValue = storedNode[key];
-
-      if (value === PLUGIN_CONFIG_SECRET_MASK) {
-        // Nothing stored to restore — drop the key rather than persist the mask.
-        if (storedValue === undefined) continue;
-        result[key] = storedValue;
-        continue;
-      }
-
-      if (isPlainRecord(value)) {
-        result[key] = mergeRecord(value, isPlainRecord(storedValue) ? storedValue : {});
-        continue;
-      }
-
-      if (Array.isArray(value)) {
-        const storedArray = Array.isArray(storedValue) ? storedValue : [];
-        result[key] = value
-          .map((entry, index) => {
-            const storedEntry = storedArray[index];
-            if (entry === PLUGIN_CONFIG_SECRET_MASK) return storedEntry;
-            if (isPlainRecord(entry)) {
-              return mergeRecord(entry, isPlainRecord(storedEntry) ? storedEntry : {});
-            }
-            return entry;
-          })
-          .filter((entry) => entry !== undefined);
-        continue;
-      }
-
-      result[key] = value;
+      const childPath = path ? `${path}.${key}` : key;
+      const merged = mergeValue(value, storedNode[key], childPath);
+      if (merged === DROP_KEY) continue;
+      result[key] = merged;
     }
     return result;
   }
 
-  return mergeRecord(incomingConfig, stored);
+  function mergeArray(incoming: unknown[], storedArray: unknown[], path: string): unknown[] {
+    const bothAllRecords =
+      incoming.length > 0 &&
+      storedArray.length > 0 &&
+      incoming.every(isPlainRecord) &&
+      storedArray.every(isPlainRecord);
+    const identityKey = bothAllRecords
+      ? findIdentityKey(incoming as Record<string, unknown>[], storedArray as Record<string, unknown>[])
+      : null;
+
+    return incoming
+      .map((entry, index) => {
+        const entryPath = `${path}.${index}`;
+
+        // Entries carrying no sentinel need no stored counterpart at all, so a
+        // structural change elsewhere in the array cannot invalidate them.
+        if (!containsMask(entry)) return entry;
+
+        let storedEntry: unknown;
+
+        if (identityKey) {
+          const wanted = identityValue(entry as Record<string, unknown>, identityKey);
+          storedEntry = (storedArray as Record<string, unknown>[]).find(
+            (candidate) => identityValue(candidate, identityKey) === wanted,
+          );
+        } else if (incoming.length === storedArray.length) {
+          const positional = storedArray[index];
+          const stable =
+            !isPlainRecord(entry) ||
+            (isPlainRecord(positional) && scalarFieldsMatch(entry, positional));
+          storedEntry = stable ? positional : undefined;
+        } else {
+          storedEntry = undefined;
+        }
+
+        if (storedEntry === undefined) {
+          unresolvedMaskPaths.push(entryPath);
+          // Resolve against nothing: the sentinel is dropped, never persisted.
+          return mergeValue(entry, undefined, entryPath);
+        }
+
+        return mergeValue(entry, storedEntry, entryPath);
+      })
+      .filter((entry) => entry !== DROP_KEY);
+  }
+
+  const configJson = mergeRecord(incomingConfig, stored, "");
+  return { configJson, unresolvedMaskPaths: [...new Set(unresolvedMaskPaths)] };
 }

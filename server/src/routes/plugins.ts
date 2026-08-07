@@ -78,8 +78,10 @@ import {
 } from "./authz.js";
 import { validateInstanceConfig } from "../services/plugin-config-validator.js";
 import {
+  collectPluginConfigSecretValues,
   maskPluginConfigJson,
   mergeMaskedPluginConfig,
+  redactSecretValuesFromText,
 } from "../services/plugin-config-masking.js";
 import {
   findLocalFolderDeclaration,
@@ -2608,10 +2610,22 @@ export function pluginRoutes(
     // must run before the secret-ref extraction so bindings are read from the
     // real stored pointers.
     const storedConfig = await registry.getConfig(plugin.id, companyId);
-    const configJson = mergeMaskedPluginConfig(
+    const merged = mergeMaskedPluginConfig(
       body.configJson,
       storedConfig && typeof storedConfig === "object" ? storedConfig.configJson : null,
     );
+    // A sentinel inside an array that was reordered or had entries removed
+    // cannot be resolved without risking re-homing the credential onto a
+    // different entry. Refuse the write and make the operator re-enter it.
+    if (merged.unresolvedMaskPaths.length > 0) {
+      res.status(400).json({
+        error:
+          "Masked secret values could not be matched to stored configuration because the surrounding array changed. Re-enter the affected secrets explicitly.",
+        unresolvedMaskPaths: merged.unresolvedMaskPaths,
+      });
+      return;
+    }
+    const configJson = merged.configJson;
 
     // Validate configJson against the plugin's instanceConfigSchema (if declared).
     // This ensures CLI/API callers get the same validation the UI performs client-side.
@@ -2748,10 +2762,19 @@ export function pluginRoutes(
     // read back from the masked GET must exercise the stored secret, not the
     // sentinel.
     const storedTestConfig = await registry.getConfig(plugin.id, companyId);
-    const testConfigJson = mergeMaskedPluginConfig(
+    const mergedTest = mergeMaskedPluginConfig(
       body.configJson,
       storedTestConfig && typeof storedTestConfig === "object" ? storedTestConfig.configJson : null,
     );
+    if (mergedTest.unresolvedMaskPaths.length > 0) {
+      res.status(400).json({
+        error:
+          "Masked secret values could not be matched to stored configuration because the surrounding array changed. Re-enter the affected secrets explicitly.",
+        unresolvedMaskPaths: mergedTest.unresolvedMaskPaths,
+      });
+      return;
+    }
+    const testConfigJson = mergedTest.configJson;
 
     // Fast schema-level rejection before hitting the worker RPC.
     const schema = plugin.manifestJson?.instanceConfigSchema;
@@ -2765,6 +2788,13 @@ export function pluginRoutes(
         return;
       }
     }
+
+    // The worker is handed restored plaintext, and both its diagnostics and any
+    // error it throws are author-controlled strings that flow back to the
+    // client. Scrub the secrets out of everything this handler emits, so a
+    // worker cannot echo a credential through the endpoint whose whole job is
+    // to mask it (BLO-20871).
+    const testSecretValues = collectPluginConfigSecretValues(testConfigJson, schema);
 
     try {
       const secretRefs = extractSecretRefBindingsFromConfig(testConfigJson, schema);
@@ -2782,12 +2812,12 @@ export function pluginRoutes(
         const warningText = result.warnings?.length
           ? `Warnings: ${result.warnings.join("; ")}`
           : undefined;
-        res.json({ valid: true, message: warningText });
+        res.json({ valid: true, message: redactSecretValuesFromText(warningText, testSecretValues) });
       } else {
         const errorText = result.errors?.length
           ? result.errors.join("; ")
           : "Configuration validation failed.";
-        res.json({ valid: false, message: errorText });
+        res.json({ valid: false, message: redactSecretValuesFromText(errorText, testSecretValues) });
       }
     } catch (err) {
       // If the worker does not implement validateConfig, return a structured response
@@ -2803,9 +2833,14 @@ export function pluginRoutes(
         return;
       }
 
-      // Worker unavailable or other RPC errors
+      // Worker unavailable or other RPC errors. Both `message` and the
+      // free-form `details` come from the worker, so redact over the whole
+      // serialized payload rather than just the top-level message.
       const bridgeError = mapRpcErrorToBridgeError(err);
-      res.status(502).json(bridgeError);
+      const scrubbedBridgeError = JSON.parse(
+        redactSecretValuesFromText(JSON.stringify(bridgeError), testSecretValues),
+      ) as PluginBridgeErrorResponse;
+      res.status(502).json(scrubbedBridgeError);
     }
   });
 
