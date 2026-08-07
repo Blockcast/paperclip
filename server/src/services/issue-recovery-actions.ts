@@ -1,6 +1,6 @@
-import { and, desc, eq, inArray, isNull, lte, or, sql } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, isNull, lte, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { issueRecoveryActions } from "@paperclipai/db";
+import { issueRecoveryActions, issues } from "@paperclipai/db";
 import type {
   IssueRecoveryAction,
   IssueRecoveryActionKind,
@@ -536,44 +536,106 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
   }
 
   /**
-   * Atomically claims a redelivery slot by advancing `lastAttemptAt`, but only when the
-   * action's current `lastAttemptAt` is already outside `cooldownMs`. Returns true only
-   * for the caller that won the claim.
+   * Atomically claims a redelivery slot: advances `lastAttemptAt` *and* spends one
+   * attempt, but only when the action is cooled down, still inside its budget, and
+   * still matches the snapshot the caller made its decision on. Returns the claimed
+   * attempt number only for the caller that won.
    *
    * The conditional UPDATE is what makes this safe: a read-then-write would let two
    * concurrent liveness passes both observe a cooled-down action and both redeliver.
-   * Pushing the cooldown predicate into the WHERE clause makes the database the
-   * arbiter, so exactly one pass can advance the timestamp per window.
+   * Pushing every predicate into the WHERE clause makes the database the arbiter,
+   * so exactly one pass can claim per window.
+   *
+   * Three things are fenced here, all for the same reason -- the caller's reads happen
+   * several `await`s before this call, so anything read earlier may already be stale:
+   *
+   * 1. **Cooldown** -- `lastAttemptAt` outside `cooldownMs`.
+   * 2. **Budget** (BLO-18106 review follow-up) -- a delivered backstop wake must consume
+   *    the same per-owner budget the ordinary enqueue path spends, or the action's
+   *    `maxAttempts` ceiling is bypassed entirely: with only a cooldown bound, a 30m
+   *    cooldown against a 6h `timeoutAt` horizon permits ~12 wakes on a budget of 5,
+   *    while `attemptCount` stays put and the exhaustion notice under-reports. The
+   *    predicate mirrors `strandedRecoveryWakeAttemptsExhausted` exactly -- that helper
+   *    trips on `attemptCount > maxAttempts`, so `attemptCount` may *equal* the ceiling;
+   *    claiming increments, hence `attemptCount < maxAttempts` is the claimable bound.
+   * 3. **Snapshot** -- the action's observed owner and the issue's observed
+   *    status/assignee. Without this, an operator who unblocks or reassigns the issue
+   *    between candidate selection and this claim still gets a wake sent to the owner
+   *    their newer disposition removed.
+   *
+   * Only the attempt is refundable (via `releaseWakeAttempt`) when the enqueue reaches
+   * nobody; the cooldown stamp deliberately stands, because a deferral is exactly the
+   * case that would otherwise re-run on every pass.
    */
   async function claimWakeAttempt(input: {
     companyId: string;
     actionId: string;
     cooldownMs: number;
     now?: Date;
-  }): Promise<boolean> {
+    expectedOwnerAgentId?: string | null;
+    expectedIssue?: { id: string; status: string; assigneeAgentId: string | null } | null;
+  }): Promise<{ claimed: boolean; attemptCount: number | null }> {
     const now = input.now ?? new Date();
     const cutoff = new Date(now.getTime() - Math.max(0, input.cooldownMs));
+    const predicates = [
+      eq(issueRecoveryActions.id, input.actionId),
+      eq(issueRecoveryActions.companyId, input.companyId),
+      inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
+      // A never-attempted action (NULL) is claimable; `lte` alone would drop it,
+      // because every SQL comparison against NULL is NULL rather than true.
+      or(
+        isNull(issueRecoveryActions.lastAttemptAt),
+        lte(issueRecoveryActions.lastAttemptAt, cutoff),
+      ),
+      // Unbudgeted actions (`maxAttempts` NULL) are bounded only by their caller; a
+      // budgeted one must still be inside both its ceiling and its horizon. This is the
+      // exact negation of `strandedRecoveryWakeAttemptsExhausted`, deliberately including
+      // its `>` (not `>=`) ceiling test -- `attemptCount` counts attempts already spent
+      // and starts at 1 on creation, so an action sitting *at* `maxAttempts` is not yet
+      // exhausted. Matching the helper rather than tightening it keeps this predicate and
+      // the caller's pre-filter from disagreeing, which would misreport a budget rejection
+      // as a cooldown one.
+      or(
+        isNull(issueRecoveryActions.maxAttempts),
+        and(
+          lte(issueRecoveryActions.attemptCount, issueRecoveryActions.maxAttempts),
+          or(
+            isNull(issueRecoveryActions.timeoutAt),
+            gt(issueRecoveryActions.timeoutAt, now),
+          ),
+        ),
+      ),
+    ];
+    if (input.expectedOwnerAgentId !== undefined) {
+      predicates.push(
+        input.expectedOwnerAgentId === null
+          ? isNull(issueRecoveryActions.ownerAgentId)
+          : eq(issueRecoveryActions.ownerAgentId, input.expectedOwnerAgentId),
+      );
+    }
+    if (input.expectedIssue) {
+      const expected = input.expectedIssue;
+      predicates.push(
+        sql`exists (select 1 from ${issues} where ${issues.id} = ${expected.id} and ${issues.status} = ${expected.status} and ${
+          expected.assigneeAgentId === null
+            ? sql`${issues.assigneeAgentId} is null`
+            : sql`${issues.assigneeAgentId} = ${expected.assigneeAgentId}`
+        })`,
+      );
+    }
     const [claimed] = await db
       .update(issueRecoveryActions)
       .set({
         lastAttemptAt: now,
         updatedAt: now,
+        attemptCount: sql`${issueRecoveryActions.attemptCount} + 1`,
       })
-      .where(
-        and(
-          eq(issueRecoveryActions.id, input.actionId),
-          eq(issueRecoveryActions.companyId, input.companyId),
-          inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
-          // A never-attempted action (NULL) is claimable; `lte` alone would drop it,
-          // because every SQL comparison against NULL is NULL rather than true.
-          or(
-            isNull(issueRecoveryActions.lastAttemptAt),
-            lte(issueRecoveryActions.lastAttemptAt, cutoff),
-          ),
-        ),
-      )
-      .returning({ id: issueRecoveryActions.id });
-    return Boolean(claimed);
+      .where(and(...predicates))
+      .returning({
+        id: issueRecoveryActions.id,
+        attemptCount: issueRecoveryActions.attemptCount,
+      });
+    return { claimed: Boolean(claimed), attemptCount: claimed?.attemptCount ?? null };
   }
 
   async function resolveActiveForIssue(

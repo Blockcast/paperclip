@@ -4083,4 +4083,144 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       expect(escalationComment?.body).toContain(`to owner \`${managerId}\``);
     });
   });
+
+  // BLO-18106 review follow-up (Ally @ a2a5fcc38). `claimWakeAttempt` is the atomic
+  // delivery-intent predicate: everything a redelivery caller decided on is re-asserted
+  // in the WHERE clause, because the caller's reads happen several awaits earlier and
+  // may already be stale by the time it claims.
+  describe("claimWakeAttempt", () => {
+    async function seedClaimable(overrides?: {
+      attemptCount?: number;
+      maxAttempts?: number | null;
+      timeoutAt?: Date | null;
+    }) {
+      const seeded = await seedCompany();
+      await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, seeded.sourceIssueId));
+      const svc = issueRecoveryActionService(db);
+      const action = await svc.upsertSourceScoped({
+        companyId: seeded.companyId,
+        sourceIssueId: seeded.sourceIssueId,
+        kind: "issue_recovery",
+        ownerAgentId: seeded.managerId,
+        cause: "stranded_assigned_issue",
+        fingerprint: `stranded:${seeded.sourceIssueId}`,
+        nextAction: "wake_owner",
+        maxAttempts: overrides?.maxAttempts === undefined ? 5 : overrides.maxAttempts,
+        timeoutAt: overrides?.timeoutAt ?? null,
+        // Well outside any cooldown the tests use.
+        lastAttemptAt: new Date(Date.now() - 60 * 60 * 1000),
+      });
+      if (overrides?.attemptCount !== undefined) {
+        await db
+          .update(issueRecoveryActions)
+          .set({ attemptCount: overrides.attemptCount })
+          .where(eq(issueRecoveryActions.id, action.id));
+      }
+      return { ...seeded, svc, action };
+    }
+
+    const currentSnapshot = (seeded: Awaited<ReturnType<typeof seedClaimable>>) => ({
+      companyId: seeded.companyId,
+      actionId: seeded.action.id,
+      cooldownMs: 30 * 60 * 1000,
+      expectedOwnerAgentId: seeded.managerId,
+      expectedIssue: {
+        id: seeded.sourceIssueId,
+        status: "blocked",
+        assigneeAgentId: seeded.coderId,
+      },
+    });
+
+    it("claims and spends one attempt when the snapshot still holds", async () => {
+      const seeded = await seedClaimable({ attemptCount: 1 });
+
+      const claim = await seeded.svc.claimWakeAttempt(currentSnapshot(seeded));
+
+      expect(claim.claimed).toBe(true);
+      expect(claim.attemptCount).toBe(2);
+      const [row] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.id, seeded.action.id));
+      expect(row?.attemptCount).toBe(2);
+    });
+
+    it("refuses the claim when the issue is no longer blocked", async () => {
+      const seeded = await seedClaimable({ attemptCount: 1 });
+      await db
+        .update(issues)
+        .set({ status: "in_progress" })
+        .where(eq(issues.id, seeded.sourceIssueId));
+
+      const claim = await seeded.svc.claimWakeAttempt(currentSnapshot(seeded));
+
+      expect(claim.claimed).toBe(false);
+      const [row] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.id, seeded.action.id));
+      expect(row?.attemptCount).toBe(1);
+    });
+
+    it("refuses the claim when the issue was reassigned", async () => {
+      const seeded = await seedClaimable({ attemptCount: 1 });
+      await db
+        .update(issues)
+        .set({ assigneeAgentId: seeded.managerId })
+        .where(eq(issues.id, seeded.sourceIssueId));
+
+      const claim = await seeded.svc.claimWakeAttempt(currentSnapshot(seeded));
+
+      expect(claim.claimed).toBe(false);
+    });
+
+    it("refuses the claim when the action's owner changed", async () => {
+      const seeded = await seedClaimable({ attemptCount: 1 });
+      await db
+        .update(issueRecoveryActions)
+        .set({ ownerAgentId: seeded.coderId })
+        .where(eq(issueRecoveryActions.id, seeded.action.id));
+
+      const claim = await seeded.svc.claimWakeAttempt(currentSnapshot(seeded));
+
+      expect(claim.claimed).toBe(false);
+    });
+
+    // The ceiling mirrors `strandedRecoveryWakeAttemptsExhausted`, which trips on
+    // `attemptCount > maxAttempts` -- so sitting *at* the ceiling is still claimable and
+    // one past it is not. Pinning both sides keeps the predicate and that helper from
+    // drifting apart, which would misreport a budget rejection as a cooldown one.
+    it("claims at the ceiling but not past it", async () => {
+      const atCeiling = await seedClaimable({ attemptCount: 5, maxAttempts: 5 });
+      expect((await atCeiling.svc.claimWakeAttempt(currentSnapshot(atCeiling))).claimed).toBe(true);
+
+      const pastCeiling = await seedClaimable({ attemptCount: 6, maxAttempts: 5 });
+      expect((await pastCeiling.svc.claimWakeAttempt(currentSnapshot(pastCeiling))).claimed).toBe(
+        false,
+      );
+    });
+
+    it("refuses the claim past the action's timeout horizon", async () => {
+      const seeded = await seedClaimable({
+        attemptCount: 1,
+        maxAttempts: 5,
+        timeoutAt: new Date(Date.now() - 60_000),
+      });
+
+      const claim = await seeded.svc.claimWakeAttempt(currentSnapshot(seeded));
+
+      expect(claim.claimed).toBe(false);
+    });
+
+    it("leaves an unbudgeted action bounded only by its cooldown", async () => {
+      const seeded = await seedClaimable({ attemptCount: 99, maxAttempts: null });
+
+      const first = await seeded.svc.claimWakeAttempt(currentSnapshot(seeded));
+      expect(first.claimed).toBe(true);
+
+      // Immediately re-claiming is inside the cooldown the first claim just stamped.
+      const second = await seeded.svc.claimWakeAttempt(currentSnapshot(seeded));
+      expect(second.claimed).toBe(false);
+    });
+  });
 });

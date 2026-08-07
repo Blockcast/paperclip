@@ -8073,6 +8073,9 @@ export function recoveryService(
       causeSkipped: 0,
       exhaustedSkipped: 0,
       cooldownSkipped: 0,
+      // Claim lost to a concurrent disposition: the issue was unblocked/reassigned, or
+      // the action's owner changed, between candidate selection and the claim.
+      staleSnapshotSkipped: 0,
       livePathSkipped: 0,
       interactionSkipped: 0,
       pauseHoldSkipped: 0,
@@ -8179,37 +8182,90 @@ export function recoveryService(
           continue;
         }
 
-        // Claim the redelivery slot before enqueueing. The read above is only a cheap
-        // pre-filter -- it cannot bound the repair rate on its own, because nothing on the
-        // success path advanced `lastAttemptAt`: once the original escalation timestamp
-        // aged past `cooldownMs`, an owner run that failed fast (so it holds neither a
-        // queued wake nor an active execution) made this candidate eligible again on every
-        // liveness pass until `timeoutAt`. Stamping here is what actually applies the
-        // documented cooldown between repairs, and doing it as a conditional UPDATE also
-        // settles the race between two concurrent passes.
+        // Claim the redelivery slot before enqueueing. The reads above are only a cheap
+        // pre-filter -- they cannot bound the repair rate on their own, because nothing on
+        // the success path advanced `lastAttemptAt` or spent an attempt: once the original
+        // escalation timestamp aged past `cooldownMs`, an owner run that failed fast (so it
+        // holds neither a queued wake nor an active execution) made this candidate eligible
+        // again on every liveness pass until `timeoutAt`. Claiming here is what actually
+        // applies the documented cooldown between repairs, and doing it as a conditional
+        // UPDATE also settles the race between two concurrent passes.
         //
-        // The stamp is deliberately not rolled back when the enqueue below defers or
-        // throws. A capacity deferral or a failing enqueue is exactly the case that would
-        // otherwise re-run every pass, so it wants the same bound as success; the attempt
-        // is still visible via `deferredOrFailed`/`enqueueFailed`, and `timeoutAt` remains
-        // the outer horizon.
-        const claimed = await recoveryActionsSvc.claimWakeAttempt({
+        // The claim spends an attempt as well as stamping the cooldown, so a delivered
+        // backstop wake consumes the same per-owner budget the ordinary enqueue path
+        // spends. Without that, `maxAttempts` bounded nothing here and the exhaustion
+        // notice under-reported how often the owner had actually been woken.
+        //
+        // It also re-asserts the snapshot these reads were made against -- the action's
+        // owner and the issue's status/assignee -- because an operator can unblock or
+        // reassign the issue during the awaits above, and a wake sent afterwards would
+        // contradict their newer disposition.
+        const claim = await recoveryActionsSvc.claimWakeAttempt({
           companyId,
           actionId: action.id,
           cooldownMs,
           now,
+          expectedOwnerAgentId: ownerAgentId,
+          expectedIssue: {
+            id: candidate.id,
+            status: "blocked",
+            assigneeAgentId: candidate.assigneeAgentId,
+          },
         });
-        if (!claimed) {
-          result.cooldownSkipped += 1;
+        if (!claim.claimed) {
+          // A single conditional UPDATE cannot report *which* predicate rejected it, so
+          // classify from a re-read rather than charging every miss to the cooldown
+          // counter -- these counters are the post-deploy signal for this path.
+          const [current, [currentIssue]] = await Promise.all([
+            recoveryActionsSvc.getActiveForIssue(companyId, candidate.id),
+            db
+              .select({ status: issues.status, assigneeAgentId: issues.assigneeAgentId })
+              .from(issues)
+              .where(eq(issues.id, candidate.id))
+              .limit(1),
+          ]);
+          if (
+            !current ||
+            current.id !== action.id ||
+            current.ownerAgentId !== ownerAgentId ||
+            !currentIssue ||
+            currentIssue.status !== "blocked" ||
+            currentIssue.assigneeAgentId !== candidate.assigneeAgentId
+          ) {
+            result.staleSnapshotSkipped += 1;
+          } else if (strandedRecoveryWakeAttemptsExhausted(current, now)) {
+            result.exhaustedSkipped += 1;
+          } else {
+            result.cooldownSkipped += 1;
+          }
           continue;
         }
+        const claimedAttemptCount = claim.attemptCount ?? action.attemptCount;
 
+        // Refund the attempt -- but not the cooldown stamp -- whenever the enqueue reached
+        // nobody, matching `releaseWakeAttempt`'s BLO-18996 contract: only wakes that
+        // actually made it onto the queue should count against the budget. The stamp
+        // stands because a deferral is precisely the case that would otherwise re-run on
+        // every pass. A failing refund must not mask the delivery outcome, so it is logged
+        // rather than thrown; the cooldown and `timeoutAt` still bound the action.
+        const refundClaimedAttempt = async (reason: string) => {
+          try {
+            await recoveryActionsSvc.releaseWakeAttempt({ companyId, actionId: action.id });
+          } catch (refundErr) {
+            logger.warn(
+              { err: refundErr, issueId: candidate.id, recoveryActionId: action.id, reason },
+              "failed to refund stranded recovery wake backstop attempt",
+            );
+          }
+        };
+
+        let wakeDelivered = false;
         try {
           const wake = await deps.enqueueWakeup(ownerAgentId, {
             source: "assignment",
             triggerDetail: "system",
             reason: "source_scoped_recovery_action",
-            idempotencyKey: `source_scoped_recovery_action:${action.id}:${action.attemptCount}:wake_backstop`,
+            idempotencyKey: `source_scoped_recovery_action:${action.id}:${claimedAttemptCount}:wake_backstop`,
             payload: withRecoveryModelProfileHint({
               issueId: candidate.id,
               sourceIssueId: candidate.id,
@@ -8236,9 +8292,11 @@ export function recoveryService(
             // (capacity deferral, pause hold, cooldown, wake-on-demand disabled).
             // Not an error, but nothing was healed this pass.
             result.deferredOrFailed += 1;
+            await refundClaimedAttempt("deferred");
             continue;
           }
 
+          wakeDelivered = true;
           result.healed += 1;
           result.issueIds.push(candidate.id);
 
@@ -8259,14 +8317,20 @@ export function recoveryService(
               recoveryActionId: action.id,
               recoveryCause: action.cause,
               recoveryOwnerAgentId: ownerAgentId,
-              recoveryActionAttemptCount: action.attemptCount,
+              recoveryActionAttemptCount: claimedAttemptCount,
             },
           });
         } catch (err) {
-          result.deferredOrFailed += 1;
-          result.enqueueFailed += 1;
+          // Only refund when the wake itself never landed. A throw from the activity
+          // write *after* a delivered wake must not give the attempt back -- the owner
+          // was genuinely woken, so the budget was genuinely spent.
+          if (!wakeDelivered) {
+            result.deferredOrFailed += 1;
+            result.enqueueFailed += 1;
+            await refundClaimedAttempt("enqueue_failed");
+          }
           logger.warn(
-            { err, issueId: candidate.id, agentId: ownerAgentId, recoveryActionId: action.id },
+            { err, issueId: candidate.id, agentId: ownerAgentId, recoveryActionId: action.id, wakeDelivered },
             "failed to redeliver stranded recovery wake from backstop",
           );
         }
@@ -8358,6 +8422,7 @@ export function recoveryService(
       strandedRecoveryWakesHealed: 0,
       strandedRecoveryWakeExhaustedSkipped: 0,
       strandedRecoveryWakeCooldownSkipped: 0,
+      strandedRecoveryWakeStaleSnapshotSkipped: 0,
       strandedRecoveryWakeLivePathSkipped: 0,
       strandedRecoveryWakeDeferredOrFailed: 0,
       strandedRecoveryWakeEnqueueFailed: 0,
@@ -8393,6 +8458,8 @@ export function recoveryService(
     result.strandedRecoveryWakesHealed = strandedRecoveryWakeBackstop.healed;
     result.strandedRecoveryWakeExhaustedSkipped = strandedRecoveryWakeBackstop.exhaustedSkipped;
     result.strandedRecoveryWakeCooldownSkipped = strandedRecoveryWakeBackstop.cooldownSkipped;
+    result.strandedRecoveryWakeStaleSnapshotSkipped =
+      strandedRecoveryWakeBackstop.staleSnapshotSkipped;
     result.strandedRecoveryWakeLivePathSkipped = strandedRecoveryWakeBackstop.livePathSkipped;
     result.strandedRecoveryWakeDeferredOrFailed = strandedRecoveryWakeBackstop.deferredOrFailed;
     result.strandedRecoveryWakeEnqueueFailed = strandedRecoveryWakeBackstop.enqueueFailed;
