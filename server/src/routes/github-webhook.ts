@@ -2772,6 +2772,17 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
               ? { githubPrReviewAuthorLogin: reviewAuthorLogin }
               : {}),
             ...(actionableReviewFeedback ? { githubReviewFeedbackActionable: true } : {}),
+            // BLO-19522: carry the request comment onto the AUTHOR wake too,
+            // not just the reviewer wake. The review-request directive says
+            // who asked and shows the ask, which is the difference between
+            // "a review was requested" (true, actionable by nobody) and the
+            // feedback directive this path used to borrow.
+            ...(context.wakeReason === "github_pr_review_requested" && context.commentBody
+              ? { githubPrReviewRequestBody: context.commentBody }
+              : {}),
+            ...(context.wakeReason === "github_pr_review_requested" && context.commentAuthorLogin
+              ? { githubPrReviewRequestAuthorLogin: context.commentAuthorLogin }
+              : {}),
           },
           // Coalesce rapid bursts on the same PR/event so a single review
           // submission can't fan into N author runs. Parallel to the
