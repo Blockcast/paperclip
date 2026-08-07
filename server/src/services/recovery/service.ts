@@ -541,6 +541,12 @@ function readProviderCapacityResetProvenance(resultJson: Record<string, unknown>
   return {
     errorFamily: family,
     observedStatusCode: normalizeHttpStatusCode(provenance.observedStatusCode),
+    // BLO-18285: present only when the run parked at the horizon cap rather
+    // than on the instant the provider named. `providerCapacityResetAt` is then
+    // OUR checkpoint, not the provider's claim — so any sentence attributing it
+    // to the provider has to use this field instead, or it states something the
+    // provider never said.
+    advertisedResetAt: readNonEmptyString(provenance.advertisedResetAt) ?? null,
   };
 }
 
@@ -555,6 +561,11 @@ type ProviderCapacityResetRead = {
   // signal — neither implies a 429 capacity event, so neither may be reported
   // as one.
   is429Capacity: boolean;
+  // BLO-18285: set when `resetAt` is our capped checkpoint rather than the
+  // provider's own instant. Distinguishing them keeps the strand comment
+  // honest: at the checkpoint the ADVERTISED window has not elapsed, so the
+  // "that horizon has since elapsed" wording below would be simply untrue.
+  advertisedResetAt: string | null;
 };
 
 function readProviderCapacityResetAt(
@@ -571,12 +582,18 @@ function readProviderCapacityResetAt(
   const explicit = provenance
     ? canonicalizeCapacityResetInstant(resultJson.providerCapacityResetAt, bounds)
     : null;
-  if (explicit) return { resetAt: explicit, is429Capacity: provenance?.observedStatusCode === 429 };
+  if (explicit) {
+    return {
+      resetAt: explicit,
+      is429Capacity: provenance?.observedStatusCode === 429,
+      advertisedResetAt: provenance?.advertisedResetAt ?? null,
+    };
+  }
 
   const advertised =
     canonicalizeCapacityResetInstant(resultJson.retryNotBefore, bounds) ??
     canonicalizeCapacityResetInstant(resultJson.transientRetryNotBefore, bounds);
-  return advertised ? { resetAt: advertised, is429Capacity: false } : null;
+  return advertised ? { resetAt: advertised, is429Capacity: false, advertisedResetAt: null } : null;
 }
 
 export function summarizeRunFailureForIssueComment(run: LatestIssueRun, now = Date.now()) {
@@ -617,6 +634,25 @@ export function summarizeRunFailureForIssueComment(run: LatestIssueRun, now = Da
   const capacityReset = readProviderCapacityResetAt(run);
   if (capacityReset) {
     const suffix = errorCode ? ` (surfaced as \`${errorCode}\`)` : "";
+
+    // BLO-18285: an over-cap park. `resetAt` here is OUR checkpoint, not the
+    // provider's instant, so it must not be attributed to the provider — and
+    // the elapsed-horizon branch below must not fire on it, because reaching
+    // the checkpoint says nothing about the advertised window, which is still
+    // open by construction. Report both numbers and what each one means.
+    if (capacityReset.advertisedResetAt) {
+      const cause =
+        `provider capacity throttle (429) — the provider advertised a capacity reset at ` +
+        `${capacityReset.advertisedResetAt}, further out than we are willing to park on a single ` +
+        `unverified estimate`;
+      return (
+        ` Latest retry failure: ${cause}${suffix}. The run is parked until ${capacityReset.resetAt} ` +
+        `to recheck capacity rather than waiting out the full advertised window; if the throttle is ` +
+        `still in force then, it parks again. This is transient and self-healing — the issue is ` +
+        `waiting on provider capacity, not on a broken runtime.`
+      );
+    }
+
     const cause = capacityReset.is429Capacity
       ? `provider capacity throttle (429) — the provider advertised a capacity reset at ${capacityReset.resetAt}`
       : `provider rate-limit/quota window — the provider advertised availability no earlier than ${capacityReset.resetAt}`;
