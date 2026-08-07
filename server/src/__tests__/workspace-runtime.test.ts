@@ -1,4 +1,4 @@
-import { execFile, spawn } from "node:child_process";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import fs from "node:fs/promises";
@@ -8,7 +8,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { parse as parseEnvContents } from "dotenv";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
   agents,
@@ -30,6 +30,7 @@ import {
   ensureServerWorkspaceLinksCurrent,
   ensureRuntimeServicesForRun,
   executeProcessForTests,
+  isProcessGroupAliveForTests,
   listConfiguredRuntimeServiceEntries,
   normalizeAdapterManagedRuntimeServices,
   reconcilePersistedRuntimeServicesOnStartup,
@@ -61,6 +62,15 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+
+// Real `spawn` by default -- every existing test in this file (and
+// `executeProcess` itself, imported from the same module graph) drives a real
+// subprocess and must keep doing so. Only the BLO-20047 timeout-settle test
+// below substitutes a fake, non-emitting child via `mockImplementationOnce`.
+vi.mock("node:child_process", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  return { ...actual, spawn: vi.fn(actual.spawn) };
+});
 
 const execFileAsync = promisify(execFile);
 
@@ -3211,6 +3221,9 @@ describe("realizeExecutionWorkspace", () => {
       expect(degradedOp?.result.status).toBe("skipped");
       expect(degradedOp?.metadata).toMatchObject({
         stage: "initial",
+        // BLO-20047: distinguishes this from the withheld-repair degrade by a
+        // stable field rather than by matching `reason` prose.
+        cause: "inconclusive_probe",
         attempts: 2,
         timeoutMs: 1,
       });
@@ -3580,6 +3593,9 @@ describe("realizeExecutionWorkspace", () => {
         (operation) => operation.metadata?.action === "submodule_inspection_degraded",
       );
       expect(degraded?.metadata).toMatchObject({
+        // BLO-20047: the probe reached no conclusion (retry skipped, not "found
+        // a fault") -- inconclusive_probe, not repair_withheld.
+        cause: "inconclusive_probe",
         attempts: 1,
         reason: expect.stringContaining("retry was skipped"),
       });
@@ -3670,6 +3686,9 @@ describe("realizeExecutionWorkspace", () => {
         (operation) => operation.metadata?.action === "submodule_inspection_degraded",
       );
       expect(degraded?.metadata).toMatchObject({
+        // BLO-20047: the probe found a real fault (salvaged partial output)
+        // but repair was withheld -- repair_withheld, not inconclusive_probe.
+        cause: "repair_withheld",
         attempts: 1,
         reason: expect.stringContaining("automatic submodule repair was skipped"),
       });
@@ -3767,6 +3786,10 @@ describe("realizeExecutionWorkspace", () => {
       );
       expect(degraded).toHaveLength(1);
       expect(degraded[0]?.metadata?.stage).toBe("post_repair");
+      // BLO-20047: post-repair verification stalling is inconclusive, not a
+      // withheld repair (the repair already ran and is reported separately
+      // above) -- pin the stable field, not the shared `stage`.
+      expect(degraded[0]?.metadata?.cause).toBe("inconclusive_probe");
       expect(degraded[0]?.metadata?.attempts).toBe(2);
     } finally {
       setSubmoduleInspectSettingsForTests(null);
@@ -5260,6 +5283,102 @@ describe("executeProcess (timeout classification)", () => {
     expect(result.timedOut).toBe(false);
     expect(result.stdout).toBe("ok\n");
   }, 15_000);
+
+  it("settles within budget when a wedged direct child emits neither exit nor close (BLO-20047)", async () => {
+    // The tests above all rely on `exit`/`close` eventually firing. A direct
+    // child wedged in uninterruptible I/O (D state) on a stalled mount fires
+    // neither: SIGKILL stays pending-but-undelivered until the syscall
+    // returns. No real subprocess can be made to do that on demand, so this
+    // drives a stub `child_process.spawn` return value that never emits
+    // either event, and asserts the call still settles from the timeout
+    // path alone.
+    //
+    // Revert check: with the settle call removed from the kill timer (or
+    // `killTimer.unref()` restored so the timer cannot fire on its own),
+    // this hangs until the surrounding test timeout kills the run.
+    const listeners = new Map<string, (...args: unknown[]) => void>();
+    const fakeStdout = { on: vi.fn(), off: vi.fn(), destroy: vi.fn() };
+    const fakeStderr = { on: vi.fn(), off: vi.fn(), destroy: vi.fn() };
+    const fakeChild: Record<string, unknown> = {
+      pid: 999_999_999,
+      stdout: fakeStdout,
+      stderr: fakeStderr,
+      kill: vi.fn(),
+    };
+    fakeChild.on = vi.fn((event: string, handler: (...args: unknown[]) => void) => {
+      listeners.set(event, handler);
+      return fakeChild;
+    });
+    vi.mocked(spawn).mockImplementationOnce(() => fakeChild as unknown as ChildProcess);
+    // `terminateChildProcess` signals the fabricated pid directly -- stub
+    // `process.kill` so the test never sends a real signal to an
+    // arbitrary/unrelated process on the host.
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+    setProcessGroupLivenessProbeForTests(() => true);
+    const started = Date.now();
+
+    try {
+      const result = await executeProcessForTests({
+        command: "unused-because-spawn-is-stubbed",
+        args: [],
+        cwd: os.tmpdir(),
+        timeoutMs: 50,
+      });
+      const elapsed = Date.now() - started;
+
+      expect(result.timedOut).toBe(true);
+      // Never `0`: callers that branch on `code === 0` without checking
+      // `timedOut` (BLO-20047 AC bullet 3 -- `runWorkspaceCommand`,
+      // `recordWorkspaceCommandOperation`) must not read a wedged-and-killed
+      // child as a clean success once they gain a timeout budget.
+      expect(result.code).toBeNull();
+      expect(result.processGroupAliveAfterTimeout).toBe(true);
+      // Budget: timeoutMs (50) + SIGTERM->SIGKILL grace (5_000) + the bounded
+      // post-kill liveness wait (750, PROCESS_TIMEOUT_GROUP_LIVENESS_GRACE_MS).
+      expect(elapsed).toBeLessThan(6_500);
+      // Confirms the promise settled purely off the timeout timers: `exit`
+      // and `close` handlers were armed but this stub never invoked them.
+      expect(listeners.has("exit")).toBe(true);
+      expect(listeners.has("close")).toBe(true);
+    } finally {
+      killSpy.mockRestore();
+      setProcessGroupLivenessProbeForTests(null);
+    }
+  }, 15_000);
+});
+
+describe("isProcessGroupAlive", () => {
+  // Every other test in this file drives `setProcessGroupLivenessProbeForTests`,
+  // which proves the *policy* built on top of `isProcessGroupAlive` but never
+  // calls the real `process.kill(-pgid, 0)` primitive. These stub
+  // `process.kill` itself instead, to exercise that primitive directly.
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("reports alive when process.kill(-pgid, 0) does not throw", () => {
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+    expect(isProcessGroupAliveForTests(4242)).toBe(true);
+    expect(killSpy).toHaveBeenCalledWith(-4242, 0);
+  });
+
+  it("reports not-alive when process.kill(-pgid, 0) throws ESRCH", () => {
+    vi.spyOn(process, "kill").mockImplementation(() => {
+      throw Object.assign(new Error("kill ESRCH"), { code: "ESRCH" });
+    });
+    expect(isProcessGroupAliveForTests(4242)).toBe(false);
+  });
+
+  it("documented false-degrade: an unreaped zombie group leader still answers signal 0, reading as alive", () => {
+    // A group leader that has exited but not yet been reaped keeps its PID
+    // reserved by the kernel, so `kill(pid, 0)` still succeeds -- identical to
+    // the genuinely-alive case above. `isProcessGroupAlive` cannot tell the
+    // two apart without parsing `/proc/<pid>/stat` for state `Z` (Linux-only).
+    // BLO-20047 accepts this as a false *degrade*, never a false proceed --
+    // see the function's doc comment in workspace-runtime.ts.
+    vi.spyOn(process, "kill").mockImplementation(() => true);
+    expect(isProcessGroupAliveForTests(4242)).toBe(true);
+  });
 });
 
 describe("resolveShell (shell fallback)", () => {
