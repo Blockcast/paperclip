@@ -14395,6 +14395,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 eq(executionWorkspaces.companyId, run.companyId),
               ));
 
+            // This action has no plugin-event mapping, so no outbox write can
+            // escape the transaction; keep the default publication semantics.
             await logActivity(tx as unknown as Db, {
               companyId: run.companyId,
               actorType: "system",
@@ -25340,6 +25342,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               idempotencyKey: opts.idempotencyKey ?? null,
               finishedAt: now,
             });
+            // This action has no plugin-event mapping, so no outbox write can
+            // escape the transaction; keep the default publication semantics.
             await logActivity(tx as unknown as Db, {
               companyId: issue.companyId,
               actorType: "system",
