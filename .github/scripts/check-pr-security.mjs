@@ -192,6 +192,15 @@ function worstSeverity(flags) {
   }, 'low');
 }
 
+export function formatFlagList(flags) {
+  return flags.map(f => [
+    `- \`${f.check}\`: ${f.file ?? ''}`,
+    f.pattern ? ` (pattern: ${f.pattern})` : '',
+    f.packages ? ` (packages: ${f.packages.join(', ')})` : '',
+    f.line ? `\n  \`${f.line}\`` : '',
+  ].join('')).join('\n');
+}
+
 export function buildAdvisoryPayload(prNumber, prTitle, flags) {
   const checkNames = [...new Set(flags.map(f => f.check))].join(', ');
   return {
@@ -201,12 +210,7 @@ export function buildAdvisoryPayload(prNumber, prTitle, flags) {
     `**Checks triggered:** ${checkNames}`,
     '',
     '**Details:**',
-    ...flags.map(f => [
-      `- \`${f.check}\`: ${f.file ?? ''}`,
-      f.pattern ? ` (pattern: ${f.pattern})` : '',
-      f.packages ? ` (packages: ${f.packages.join(', ')})` : '',
-      f.line ? `\n  \`${f.line}\`` : '',
-    ].join('')),
+    formatFlagList(flags),
     '',
     '> This advisory was created automatically by commitperclip. Review and dismiss if not a real concern.',
     ].join('\n'),
@@ -273,33 +277,51 @@ export async function findExistingDraftAdvisory(fetchImpl, token, repo, prNumber
   return null;
 }
 
-export async function postSecurityCheckRun(fetchImpl, token, repo, headSha, hasFlags) {
+// `advisoryResult` describes what actually happened to the draft-advisory sync
+// so the check-run never asserts an advisory exists when it doesn't:
+//   { ok: true, url }     — advisory created/updated; link it
+//   { ok: false, error }  — sync failed; the flags below are the only durable record
+//   null                  — no advisory was attempted at all
+export function buildSecurityCheckRunOutput(hasFlags, flags = [], advisoryResult = null) {
+  if (!hasFlags) {
+    return {
+      title: 'Security Review Passed',
+      summary: 'No security concerns detected.',
+    };
+  }
+
+  if (advisoryResult?.ok) {
+    return {
+      title: 'Security Review Recommended',
+      summary: `Draft advisory filed for maintainer review: ${advisoryResult.url}. Not a merge block — review the advisory at your leisure.`,
+    };
+  }
+
+  const advisoryNote = advisoryResult
+    ? `Draft advisory sync failed (${advisoryResult.error}) — the advisory was **not** created.`
+    : 'No draft advisory was created.';
+
+  return {
+    title: 'Security Review Recommended',
+    summary: `${flags.length} security flag(s) detected. ${advisoryNote} Findings are inlined below. Not a merge block.`,
+    text: `**Flags:**\n\n${formatFlagList(flags)}`,
+  };
+}
+
+export async function postSecurityCheckRun(fetchImpl, token, repo, headSha, hasFlags, { flags = [], advisoryResult = null } = {}) {
   await fetchImpl(`/repos/${repo}/check-runs`, token, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(hasFlags ? {
+    body: JSON.stringify({
       name: 'security-review',
       head_sha: headSha,
       // `completed/neutral` instead of `in_progress` so the check doesn't put
-      // the PR in `mergeStateStatus: BLOCKED`. The draft advisory is the
-      // durable signal for maintainers; there is no completion path that
-      // could ever flip an `in_progress` check-run back to completed on the
-      // same head SHA, so it would hang forever.
+      // the PR in `mergeStateStatus: BLOCKED`. There is no completion path
+      // that could ever flip an `in_progress` check-run back to completed on
+      // the same head SHA, so it would hang forever.
       status: 'completed',
-      conclusion: 'neutral',
-      output: {
-        title: 'Security Review Recommended',
-        summary: 'Draft advisory filed for maintainer review. Not a merge block — review the advisory at your leisure.',
-      },
-    } : {
-      name: 'security-review',
-      head_sha: headSha,
-      status: 'completed',
-      conclusion: 'success',
-      output: {
-        title: 'Security Review Passed',
-        summary: 'No security concerns detected.',
-      },
+      conclusion: hasFlags ? 'neutral' : 'success',
+      output: buildSecurityCheckRunOutput(hasFlags, flags, advisoryResult),
     }),
   });
 }
@@ -383,10 +405,24 @@ async function main() {
 
   if (allFlags.length > 0) {
     console.error(`[security] ${allFlags.length} flag(s) detected — creating draft advisory and pending check run`);
-    await Promise.all([
-      warnOnFailure('draft advisory sync', syncDraftAdvisory(ghFetch, GH_TOKEN, GH_REPO, prNumber, pr.title, allFlags)),
-      warnOnFailure('security check-run update', postSecurityCheckRun(ghFetch, GH_TOKEN, GH_REPO, pr.head.sha, true)),
-    ]);
+
+    // Sequenced (not Promise.all) so the check-run always knows whether the
+    // advisory actually landed — it must never assert an advisory exists
+    // when the sync failed.
+    let advisoryResult = null;
+    try {
+      const advisory = await syncDraftAdvisory(ghFetch, GH_TOKEN, GH_REPO, prNumber, pr.title, allFlags);
+      advisoryResult = { ok: true, url: advisory?.html_url };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.warn(`[security] draft advisory sync failed; continuing per always-exit-0 contract: ${message}`);
+      advisoryResult = { ok: false, error: message };
+    }
+
+    await warnOnFailure(
+      'security check-run update',
+      postSecurityCheckRun(ghFetch, GH_TOKEN, GH_REPO, pr.head.sha, true, { flags: allFlags, advisoryResult }),
+    );
   } else {
     console.log('[security] all clear');
     await warnOnFailure('security check-run update', postSecurityCheckRun(ghFetch, GH_TOKEN, GH_REPO, pr.head.sha, false));
