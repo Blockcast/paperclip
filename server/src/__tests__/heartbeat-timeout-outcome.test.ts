@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   isConfirmedAdapterTimeout,
+  isFalseAdapterTimeoutResult,
   isSuccessfulAdapterResult,
 } from "../services/heartbeat.js";
 
@@ -14,6 +15,7 @@ describe("heartbeat timeout outcome", () => {
       resultJson: null,
     };
     expect(isConfirmedAdapterTimeout(malformedResult)).toBe(false);
+    expect(isFalseAdapterTimeoutResult(malformedResult)).toBe(true);
     expect(isSuccessfulAdapterResult(malformedResult)).toBe(true);
   });
 
@@ -34,12 +36,14 @@ describe("heartbeat timeout outcome", () => {
   });
 
   it("does not suppress a non-timeout error that accompanies exit zero", () => {
-    expect(isSuccessfulAdapterResult({
+    const result = {
       timedOut: true,
       exitCode: 0,
       errorMessage: "Result publication failed",
       errorCode: "timeout",
       resultJson: { summary: "work completed" },
-    })).toBe(false);
+    };
+    expect(isFalseAdapterTimeoutResult(result)).toBe(false);
+    expect(isSuccessfulAdapterResult(result)).toBe(false);
   });
 });
