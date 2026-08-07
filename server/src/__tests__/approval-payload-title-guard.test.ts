@@ -18,27 +18,30 @@ import ts from "typescript";
  * fails when it finds a `db.insert(approvals).values(...)` call whose
  * payload object literal has no `title` key. Sites where the payload cannot
  * be checked syntactically (e.g. it is a caller-supplied variable) must be
- * either routed through `insertApproval()` in services/approval-insert.ts —
- * which requires `payload.title` in its own parameter type, so a missing
- * title fails to compile — or added to STATICALLY_UNVERIFIABLE_ALLOWLIST
- * below with a comment explaining where the title guarantee actually lives.
+ * routed through one of the two helpers in services/approval-insert.ts —
+ * `insertApproval()` (requires `payload.title` in its own parameter type) or
+ * `insertApprovalRecord()` (runtime-checks that the payload has SOME subject
+ * field: title/name/summary/recommendedAction) — so a missing subject fails
+ * loudly instead of being silently allowlisted below. Only that one file is
+ * allowlisted, deliberately: it is the sole non-HTTP choke point for every
+ * approval producer in server/src, so adding a *new* direct
+ * `db.insert(approvals)` call anywhere else — including inside a file that
+ * used to be exempt, e.g. services/approvals.ts before this guard narrowed
+ * to just the helper file — is caught by this test, not silently skipped.
  */
 
 const SRC_DIR = join(dirname(fileURLToPath(import.meta.url)), "..");
 
 const STATICALLY_UNVERIFIABLE_ALLOWLIST = new Set([
-  // insertApproval()'s own definition: `values` is a parameter, not an
-  // inline object literal, so this scan can't see a `title:` key in the
-  // text. The guarantee lives in insertApproval's parameter type instead
-  // (`payload: ... & { title: string }`), which is exercised directly by
-  // approval-insert.test.ts.
+  // approval-insert.ts's two helpers: `values` is a parameter, not an
+  // inline object literal, so this scan can't see a `title:`/subject key in
+  // the text. The guarantee lives in their signatures/runtime checks
+  // instead (see the file's own doc comments), exercised directly by
+  // approval-insert.test.ts. Every other server-internal producer
+  // (budgets.ts, oidc-rbac.ts, approvals.ts's generic create()) routes
+  // through one of these two functions rather than calling
+  // db.insert(approvals) itself, so this is the only allowlisted file.
   "services/approval-insert.ts",
-  // Generic approval-creation entrypoint (`approvalService(db).create`).
-  // `data.payload` is caller-supplied: the HTTP route validates it with
-  // createApprovalSchema (payload.title, BLO-21032/#975), and every other
-  // caller (built-in-agents.ts, plugin-managed-agents.ts, routes/agents.ts)
-  // sets payload.title itself when building the hire-agent payload.
-  "services/approvals.ts",
 ]);
 
 function listSourceFiles(dir: string): string[] {
@@ -143,10 +146,11 @@ describe("approval payload title guard", () => {
       offenses,
       "db.insert(approvals) call sites must construct payload with a `title` key so board cards "
         + "render a subject instead of a blank row (BLO-21032 / BLO-22705). Route the insert through "
-        + "insertApproval() in services/approval-insert.ts (requires payload.title at the type level), "
-        + "add an inline `title` key to the payload object literal, or — only if the title guarantee "
-        + "genuinely lives elsewhere — add the file to STATICALLY_UNVERIFIABLE_ALLOWLIST with a comment "
-        + `explaining where. Offending sites:\n${offenses.join("\n")}`,
+        + "insertApproval() or insertApprovalRecord() in services/approval-insert.ts (both require a "
+        + "subject at the type/runtime level), add an inline `title` key to the payload object literal, "
+        + "or — only if the title guarantee genuinely lives elsewhere — add the file to "
+        + "STATICALLY_UNVERIFIABLE_ALLOWLIST with a comment explaining where. "
+        + `Offending sites:\n${offenses.join("\n")}`,
     ).toEqual([]);
   });
 
