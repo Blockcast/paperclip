@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { companies, createDb, issueComments, issueCommentEffects, issues } from "@paperclipai/db";
 import { eq } from "drizzle-orm";
 import {
@@ -290,6 +290,45 @@ describeEmbeddedPostgres("issue comment effect ledger", () => {
     expect(await renewEffectLease(db as never, effect.id, claimed!.claimToken!, 60_000)).toBe(true);
     expect(await claimEffect(db as never, effect.id, 40)).toBeNull();
     expect(await completeEffect(db as never, claimed!)).toBe(true);
+  }, 60_000);
+
+  it("does not let a replica with a fast clock reclaim a live lease", async () => {
+    await seed();
+    await enqueueCommentEffects(db as never, { companyId, issueId, commentId, effects: intents });
+    // Claim *every* effect, so an expired lease is the only thing that could
+    // make this comment look resumable. Leaving siblings `queued` would make the
+    // reconciler assertion below pass for the wrong reason.
+    const outstanding = await listUnfinishedEffects(db as never, commentId);
+    const owners = [];
+    for (const row of outstanding) {
+      const owner = await claimEffect(db as never, row.id, 60_000);
+      expect(owner).not.toBeNull();
+      owners.push(owner!);
+    }
+
+    // Simulate a replica whose *application* clock runs 10 minutes fast while
+    // the database clock is unchanged. When claim expiry was evaluated against
+    // `new Date()`, this replica compared live 60s leases against a future
+    // instant, reclaimed rows another worker still owned, and ran the same
+    // non-idempotent sinks concurrently. Only `Date` is faked — the pg driver's
+    // own timers must keep working.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(new Date(Date.now() + 10 * 60_000));
+
+      for (const owner of owners) {
+        expect(await claimEffect(db as never, owner.id, 60_000)).toBeNull();
+      }
+      // The reconciler must not hand itself work it would then fail to claim.
+      expect(await listCommentsWithResumableEffects(db as never, 10)).not.toContain(commentId);
+    } finally {
+      vi.useRealTimers();
+    }
+
+    // The genuine owners still hold their rows and can finish them.
+    for (const owner of owners) {
+      expect(await completeEffect(db as never, owner)).toBe(true);
+    }
   }, 60_000);
 
   it("tells a worker that lost its lease that completion did not land", async () => {
