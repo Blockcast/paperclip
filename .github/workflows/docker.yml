@@ -41,6 +41,7 @@ jobs:
     outputs:
       target_sha: ${{ steps.target.outputs.full }}
       image_digest: ${{ steps.build.outputs.digest }}
+      image_tag: ${{ steps.image_tag.outputs.value }}
     steps:
       - name: Validate target commit
         id: target
@@ -80,6 +81,29 @@ jobs:
             echo "Target ${full} is not reachable from master" >&2
             exit 1
           fi
+
+      # Manual and push builds for the same commit can overlap. A shared
+      # per-commit tag lets the later build overwrite the earlier build's tag,
+      # which makes the protected deploy reject its own recorded digest. Give
+      # each manual run attempt a private candidate tag; Helm still deploys by
+      # immutable digest, and push builds retain the readable commit tag.
+      - name: Resolve image tag
+        id: image_tag
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          TARGET_SHORT: ${{ steps.target.outputs.short }}
+        run: |
+          set -euo pipefail
+          if [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
+            value="sha-${TARGET_SHORT}-run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-k8s-vendored"
+          else
+            value="sha-${TARGET_SHORT}-k8s-vendored"
+          fi
+          if [[ ! "${value}" =~ ^sha-[0-9a-f]{7}(-run-[0-9]+-[0-9]+)?-k8s-vendored$ ]]; then
+            echo "Resolved image tag is invalid: ${value}" >&2
+            exit 1
+          fi
+          echo "value=${value}" >> "$GITHUB_OUTPUT"
 
       # Self-hosted runner reuses its workspace across builds. A previous
       # build (or a developer session sharing the same checkout dir) may
@@ -192,7 +216,8 @@ jobs:
             harbor.blockcast.net/paperclip/paperclip-runtime:latest
 
       # Tag scheme matches values.blockcast.yaml's expectation:
-      #   - `sha-<7>-k8s-vendored` per-commit tag the deploy step pins to
+      #   - `sha-<7>-k8s-vendored` per-commit tag for push builds
+      #   - `sha-<7>-run-<run>-<attempt>-k8s-vendored` private manual candidate
       #   - `latest-k8s-vendored` floating tag for ad-hoc pulls
       # The `-k8s-vendored` suffix marks a kkroo-fork build (vendored
       # adapter tarballs + ccrotate kkroo patch baked in via the
@@ -204,8 +229,7 @@ jobs:
           images: |
             harbor.blockcast.net/paperclip/paperclip
           tags: |
-            type=sha,prefix=sha-,suffix=-k8s-vendored,format=short,enable=${{ github.event_name != 'workflow_dispatch' }}
-            type=raw,value=sha-${{ steps.target.outputs.short }}-k8s-vendored,enable=${{ github.event_name == 'workflow_dispatch' }}
+            type=raw,value=${{ steps.image_tag.outputs.value }}
             type=raw,value=latest-k8s-vendored,enable=${{ github.ref == 'refs/heads/master' && github.event_name != 'workflow_dispatch' }}
 
       - name: Build and push
@@ -248,7 +272,7 @@ jobs:
           {
             echo "### Paperclip image"
             echo "- Commit: \`${{ steps.target.outputs.full }}\`"
-            echo "- Image: \`harbor.blockcast.net/paperclip/paperclip:sha-${{ steps.target.outputs.short }}-k8s-vendored@${{ steps.build.outputs.digest }}\`"
+            echo "- Image: \`harbor.blockcast.net/paperclip/paperclip:${{ steps.image_tag.outputs.value }}@${{ steps.build.outputs.digest }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
   deploy:
@@ -330,7 +354,7 @@ jobs:
 
       - name: Verify image tag exists
         env:
-          TAG: sha-${{ steps.target.outputs.short }}-k8s-vendored
+          TAG: ${{ needs.build-and-push.outputs.image_tag }}
         run: |
           set -e
           for i in 1 2 3; do
@@ -338,7 +362,7 @@ jobs:
               echo "tag ${TAG} present"
               exit 0
             fi
-            echo "tag ${TAG} not found (attempt $i) — retrying in 60s (a push build may still be running)"
+            echo "tag ${TAG} not found (attempt $i) — retrying in 60s for registry consistency"
             sleep 60
           done
           echo "tag ${TAG} missing after retries; failing this window — the next one retries" >&2
@@ -349,7 +373,7 @@ jobs:
         env:
           BUILD_RESULT: ${{ needs.build-and-push.result }}
           EXPECTED_DIGEST: ${{ needs.build-and-push.outputs.image_digest }}
-          TAG: sha-${{ steps.target.outputs.short }}-k8s-vendored
+          TAG: ${{ needs.build-and-push.outputs.image_tag }}
         run: |
           set -euo pipefail
           image="harbor.blockcast.net/paperclip/paperclip:${TAG}"
@@ -450,7 +474,7 @@ jobs:
           DIGEST: ${{ steps.artifact.outputs.digest }}
           NS: ${{ vars.PAPERCLIP_NAMESPACE || 'paperclip' }}
           RELEASE: ${{ vars.PAPERCLIP_HELM_RELEASE || 'paperclip' }}
-          TAG: sha-${{ steps.target.outputs.short }}-k8s-vendored
+          TAG: ${{ needs.build-and-push.outputs.image_tag }}
           COMMIT: ${{ steps.target.outputs.full }}
           STAMP_SCRIPT: ${{ steps.tooling.outputs.stamp_script }}
         run: |
@@ -629,7 +653,7 @@ jobs:
           DIGEST: ${{ steps.artifact.outputs.digest }}
           NS: ${{ vars.PAPERCLIP_NAMESPACE || 'paperclip' }}
           RELEASE: ${{ vars.PAPERCLIP_HELM_RELEASE || 'paperclip' }}
-          TAG: sha-${{ steps.target.outputs.short }}-k8s-vendored
+          TAG: ${{ needs.build-and-push.outputs.image_tag }}
           COMMIT: ${{ steps.target.outputs.full }}
           PLAN_MARKER: ${{ steps.plan.outputs.marker }}
           APPROVED_SERVER_PLAN: ${{ steps.approval.outputs.server_plan_path }}

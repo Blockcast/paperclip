@@ -32,6 +32,7 @@ import {
   MAX_TURN_CONTINUATION_WAKE_REASON,
   heartbeatService,
   isRetryableInteractionContinuationInfrastructureFailure,
+  probeStaleKillReviewEvidence,
   shouldScheduleAutomaticRunRetry,
 } from "../services/heartbeat.js";
 
@@ -1543,6 +1544,214 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
       }),
     ).toBe(false);
+  });
+
+  // BLO-18030 — external_lifecycle_stale_killed retry gate.
+  //
+  // The 2026-07-25 PR #1758 incident: a pr_review wake was claimed, went silent,
+  // and was force-killed at EXTERNAL_LIFECYCLE_HARD_STALE_MS. The run was left
+  // terminal with NO bounded retry (this predicate returned false), and its
+  // agent_wakeup_requests row was set to `failed`, which
+  // reconcileFailedWakeDispatches never selects. The review simply never
+  // happened. These tests pin the retry on, and pin the double-review guard that
+  // makes it safe.
+  it("BLO-18030: retries a stale-killed pr_review run once the probe proved no review landed", () => {
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "external_lifecycle_stale_killed",
+        resultJson: { externalLifecycleRecovery: { reviewEvidenceFound: false } },
+        contextSnapshot: { taskKey: "pr_review:Blockcast/pim-multicast-gateway:1758" },
+      }),
+    ).toBe(true);
+
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "external_lifecycle_stale_killed",
+        resultJson: { externalLifecycleRecovery: { reviewEvidenceFound: false } },
+        contextSnapshot: {
+          wakeReason: "github_pr_synchronized",
+          reviewKind: "pr_review",
+          githubPrNumber: 1758,
+        },
+      }),
+    ).toBe(true);
+  });
+
+  it("BLO-18030: never retries a stale-killed run that may already have posted a review", () => {
+    // A review WAS found at this head -- retrying would double-review.
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "external_lifecycle_stale_killed",
+        resultJson: { externalLifecycleRecovery: { reviewEvidenceFound: true } },
+        contextSnapshot: { taskKey: "pr_review:Blockcast/pim-multicast-gateway:1758" },
+      }),
+    ).toBe(false);
+
+    // Probe errored or no PR context => no flag recorded at all. Absence must be
+    // read as "unproven", NOT as "safe to retry": a stale-killed run really was
+    // running and may have posted. This is the case that distinguishes this gate
+    // from job_missing/k8s_pod_schedule_failed, where the pod provably never ran.
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "external_lifecycle_stale_killed",
+        resultJson: { externalLifecycleRecovery: { reason: "external_lifecycle_stale_killed" } },
+        contextSnapshot: { taskKey: "pr_review:Blockcast/pim-multicast-gateway:1758" },
+      }),
+    ).toBe(false);
+
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "external_lifecycle_stale_killed",
+        resultJson: {},
+        contextSnapshot: { taskKey: "pr_review:Blockcast/pim-multicast-gateway:1758" },
+      }),
+    ).toBe(false);
+  });
+
+  it("BLO-18030: does not retry a stale-killed run outside a PR-review context", () => {
+    // Leak guard, matching k8s_concurrent_run_blocked / job_missing: a proven-no-
+    // review issue run must stay terminal rather than re-queueing arbitrary work.
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "external_lifecycle_stale_killed",
+        resultJson: { externalLifecycleRecovery: { reviewEvidenceFound: false } },
+        contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
+      }),
+    ).toBe(false);
+
+    // A present-but-not-pr_review taskKey must also be rejected, so a future
+    // weakening of isPrReviewRetryContext is caught here too.
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "external_lifecycle_stale_killed",
+        resultJson: { externalLifecycleRecovery: { reviewEvidenceFound: false } },
+        contextSnapshot: { taskKey: `issue:${randomUUID()}:42`, wakeReason: "issue_assigned" },
+      }),
+    ).toBe(false);
+
+    // Malformed snapshot must not throw and must stay terminal.
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "external_lifecycle_stale_killed",
+        resultJson: { externalLifecycleRecovery: { reviewEvidenceFound: false } },
+        contextSnapshot: null,
+      }),
+    ).toBe(false);
+  });
+
+  // BLO-18030 review (Important): the stale-kill gate must be evaluated BEFORE
+  // readTransientRecoveryContractFromRun's unconditional `return true`.
+  // Stale-kill finalization merges into the run's PRIOR resultJson, so a run
+  // that hit a transient upstream error earlier in its life keeps that
+  // errorFamily on the record. With the gate ordered after the transient check,
+  // that retained family authorized the retry before the review-evidence gate
+  // ran at all — reintroducing exactly the double-review the gate exists to
+  // prevent, and only for runs carrying stale transient metadata (which is why
+  // the original ordering looked correct in every other test above).
+  it("BLO-18030: a retained transient errorFamily cannot bypass the stale-kill evidence gate", () => {
+    for (const errorFamily of ["transient_upstream", "rate_limit_exhausted", "provider_quota"]) {
+      // Unproven evidence + retained transient family => still terminal.
+      expect(
+        shouldScheduleAutomaticRunRetry({
+          errorCode: "external_lifecycle_stale_killed",
+          resultJson: {
+            errorFamily,
+            externalLifecycleRecovery: { reason: "external_lifecycle_stale_killed" },
+          },
+          contextSnapshot: { taskKey: "pr_review:Blockcast/pim-multicast-gateway:1758" },
+        }),
+      ).toBe(false);
+
+      // A review WAS found + retained transient family => still terminal.
+      expect(
+        shouldScheduleAutomaticRunRetry({
+          errorCode: "external_lifecycle_stale_killed",
+          resultJson: {
+            errorFamily,
+            externalLifecycleRecovery: { reviewEvidenceFound: true },
+          },
+          contextSnapshot: { taskKey: "pr_review:Blockcast/pim-multicast-gateway:1758" },
+        }),
+      ).toBe(false);
+
+      // Proven-no-review still retries: hoisting the gate must not disable it.
+      expect(
+        shouldScheduleAutomaticRunRetry({
+          errorCode: "external_lifecycle_stale_killed",
+          resultJson: {
+            errorFamily,
+            externalLifecycleRecovery: { reviewEvidenceFound: false },
+          },
+          contextSnapshot: { taskKey: "pr_review:Blockcast/pim-multicast-gateway:1758" },
+        }),
+      ).toBe(true);
+    }
+
+    // Non-stale-kill runs must keep the transient fast-path untouched.
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "adapter_failed",
+        resultJson: { errorFamily: "transient_upstream" },
+        contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
+      }),
+    ).toBe(true);
+  });
+
+  // BLO-18030 review (Important): the stale-kill probe must require the wake's
+  // EXACT head. githubHasReviewerEvidenceForPr keys its comment-mode pass on a
+  // head prefix and falls back to fetching the PR's current head when the wake
+  // carried none; if that fetch fails there is no prefix, the comment-mode pass
+  // is skipped, and the probe can answer `{found: false}` while a comment-mode
+  // review exists. Everywhere else that false negative is merely additive —
+  // here it authorizes a retry, i.e. a double review. An unresolved head must
+  // therefore read as unproven (null), never false.
+  //
+  // Each case below returns before any network call, so this pins the guard
+  // itself rather than GitHub behaviour.
+  it("BLO-18030: the stale-kill probe reports an unresolved head as unproven, never as no-review", async () => {
+    // pr_review context, resolvable repo + PR, but the wake carried no head SHA.
+    await expect(
+      probeStaleKillReviewEvidence({
+        contextSnapshot: {
+          reviewKind: "pr_review",
+          githubRepoFullName: "Blockcast/pim-multicast-gateway",
+          githubPrNumber: 1758,
+        },
+      }),
+    ).resolves.toBeNull();
+
+    // Present-but-blank head SHA must not be treated as resolved.
+    await expect(
+      probeStaleKillReviewEvidence({
+        contextSnapshot: {
+          reviewKind: "pr_review",
+          githubRepoFullName: "Blockcast/pim-multicast-gateway",
+          githubPrNumber: 1758,
+          githubHeadSha: "   ",
+        },
+      }),
+    ).resolves.toBeNull();
+
+    // No repo => nothing to probe against.
+    await expect(
+      probeStaleKillReviewEvidence({
+        contextSnapshot: {
+          reviewKind: "pr_review",
+          githubPrNumber: 1758,
+          githubHeadSha: "448bff43a1b2c3d4e5f60718293a4b5c6d7e8f90",
+        },
+      }),
+    ).resolves.toBeNull();
+
+    // Not a PR-review wake at all.
+    await expect(
+      probeStaleKillReviewEvidence({
+        contextSnapshot: { wakeReason: "issue_assigned", issueId: randomUUID() },
+      }),
+    ).resolves.toBeNull();
+
+    // Malformed snapshot must not throw.
+    await expect(probeStaleKillReviewEvidence({ contextSnapshot: null })).resolves.toBeNull();
   });
 
   it("does not retry plain adapter failures when the wake is not an idempotent PR review", () => {

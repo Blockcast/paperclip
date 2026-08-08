@@ -929,6 +929,33 @@ export const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set([
   "timed_out",
 ]);
 const STALE_ISSUE_CONTEXT_RUN_STATUSES = ["queued", "scheduled_retry"] as const;
+// Same statuses, as a lookup set: these are the non-terminal statuses a run can
+// hold before it has ever executed.
+const NEVER_STARTED_HEARTBEAT_RUN_STATUSES = new Set<string>(STALE_ISSUE_CONTEXT_RUN_STATUSES);
+
+// BLO-20321: a run that exists but has never executed holds no real claim on an
+// issue. `queued` and `scheduled_retry` are non-terminal, so a terminal-only
+// staleness test read them as a live owner and answered the assignee's own write
+// with 409 "Issue run ownership conflict". That made WIP monotonic: checkout adds
+// WIP without a lock, while parking or closing needs the lock — and the lock was
+// held by the very queue backlog being drained.
+//
+// Reaping is gated on `startedAt == null` as well as status, so a run that has
+// actually begun is never reaped here even if its status column is momentarily
+// out of step. The race protection the guard exists for is preserved: a genuinely
+// `running` owner still conflicts.
+//
+// This is the single source of truth for "is this lock owner reapable". There are
+// Transactional ownership paths read the run rows themselves and defer to this
+// predicate; they must not drift, because adoptStaleCheckoutRun runs FIRST and a
+// non-stale verdict there throws the 409 before another recovery path is reached.
+function isReapableHeartbeatRunRow(
+  run: { status: string; startedAt: Date | null } | null | undefined,
+): boolean {
+  if (!run) return true;
+  if (TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) return true;
+  return NEVER_STARTED_HEARTBEAT_RUN_STATUSES.has(run.status) && run.startedAt == null;
+}
 const ISSUE_LIST_DESCRIPTION_MAX_CHARS = 1200;
 
 function escapeLikePattern(value: string): string {
@@ -5457,6 +5484,55 @@ export function issueService(db: Db) {
     return TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status);
   }
 
+  async function cancelNeverStartedOwnerRun(
+    dbOrTx: any,
+    run: {
+      id: string;
+      status: string;
+      startedAt: Date | null;
+      wakeupRequestId: string | null;
+    } | null | undefined,
+    input: { reason: string; errorCode: string },
+  ) {
+    if (!run || TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) return true;
+    if (!isReapableHeartbeatRunRow(run)) return false;
+
+    const now = new Date();
+    const cancelled: { wakeupRequestId: string | null } | null = await dbOrTx
+      .update(heartbeatRuns)
+      .set({
+        status: "cancelled",
+        finishedAt: now,
+        error: input.reason,
+        errorCode: input.errorCode,
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(heartbeatRuns.id, run.id),
+          inArray(heartbeatRuns.status, STALE_ISSUE_CONTEXT_RUN_STATUSES),
+          isNull(heartbeatRuns.startedAt),
+        ),
+      )
+      .returning({ wakeupRequestId: heartbeatRuns.wakeupRequestId })
+      .then((rows: Array<{ wakeupRequestId: string | null }>) => rows[0] ?? null);
+    if (!cancelled) return false;
+
+    const wakeupRequestId = cancelled.wakeupRequestId ?? run.wakeupRequestId;
+    if (wakeupRequestId) {
+      await dbOrTx
+        .update(agentWakeupRequests)
+        .set({
+          status: "skipped",
+          finishedAt: now,
+          error: input.reason,
+          updatedAt: now,
+        })
+        .where(eq(agentWakeupRequests.id, wakeupRequestId));
+    }
+    return true;
+  }
+
   async function isSameAgentRetryOfRun(input: {
     actorRunId: string;
     expectedCheckoutRunId: string;
@@ -5605,36 +5681,69 @@ export function issueService(db: Db) {
         return { adopted: null, latest: lockedIssue };
       }
 
-      await Promise.all([
-        tx.execute(
-          sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${input.expectedCheckoutRunId} for update`,
-        ),
-        tx.execute(
-          sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${input.actorRunId} for update`,
-        ),
-      ]);
-      const [existingRun, actorRun] = await Promise.all([
-        tx
-          .select({ status: heartbeatRuns.status })
-          .from(heartbeatRuns)
-          .where(eq(heartbeatRuns.id, input.expectedCheckoutRunId))
-          .then((rows) => rows[0] ?? null),
-        tx
-          .select({
-            status: heartbeatRuns.status,
-            agentId: heartbeatRuns.agentId,
-            retryOfRunId: heartbeatRuns.retryOfRunId,
-          })
-          .from(heartbeatRuns)
-          .where(eq(heartbeatRuns.id, input.actorRunId))
-          .then((rows) => rows[0] ?? null),
-      ]);
-      const stale = !existingRun || TERMINAL_HEARTBEAT_RUN_STATUSES.has(existingRun.status);
+      const ownerRunIds = [...new Set([
+        input.expectedCheckoutRunId,
+        lockedIssue.executionRunId,
+        input.actorRunId,
+      ].filter((runId): runId is string => Boolean(runId)))].sort();
+      const lockedRuns = await tx
+        .select({
+          id: heartbeatRuns.id,
+          status: heartbeatRuns.status,
+          startedAt: heartbeatRuns.startedAt,
+          agentId: heartbeatRuns.agentId,
+          retryOfRunId: heartbeatRuns.retryOfRunId,
+          wakeupRequestId: heartbeatRuns.wakeupRequestId,
+        })
+        .from(heartbeatRuns)
+        .where(inArray(heartbeatRuns.id, ownerRunIds))
+        .orderBy(asc(heartbeatRuns.id))
+        .for("update");
+      const runById = new Map(lockedRuns.map((run) => [run.id, run]));
+      const existingRun = runById.get(input.expectedCheckoutRunId) ?? null;
+      const actorRun = runById.get(input.actorRunId) ?? null;
+      const executionOwnerRun = lockedIssue.executionRunId
+        ? runById.get(lockedIssue.executionRunId) ?? null
+        : null;
+      // BLO-20321: same reapability rule as clearStaleExecutionLock. This test
+      // runs FIRST when checkoutRunId is set, so a divergence here would make the
+      // fix unreachable for the common shape (checkout and execution locks both
+      // pointing at one never-started run).
+      const stale = isReapableHeartbeatRunRow(existingRun);
       const actorLive = actorRun && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(actorRun.status);
       const sameAgentRetry =
         actorRun?.agentId === input.actorAgentId &&
         actorRun.retryOfRunId === input.expectedCheckoutRunId;
       if ((!stale && !sameAgentRetry) || !actorLive) {
+        return { adopted: null, latest: lockedIssue };
+      }
+
+      const executionOwnerIsAllowed =
+        !lockedIssue.executionRunId ||
+        lockedIssue.executionRunId === input.actorRunId ||
+        lockedIssue.executionRunId === input.expectedCheckoutRunId ||
+        isReapableHeartbeatRunRow(executionOwnerRun);
+      if (!executionOwnerIsAllowed) {
+        return { adopted: null, latest: lockedIssue };
+      }
+
+      const cancellation = {
+        reason: "Cancelled because the issue checkout was adopted by the current execution run",
+        errorCode: "issue_checkout_adopted",
+      };
+      // BLO-6869: adoption is authorised by EITHER limb of the gate above, so the
+      // reap must only be demanded of the limb that needs it. A same-agent retry
+      // inherits the lock from its own parent run, which is still `running` and
+      // therefore never reapable — requiring it to be cancellable-as-never-started
+      // made that limb dead code and answered the retry with 409. When staleness
+      // is what authorises adoption the reap is still mandatory, so a never-started
+      // owner cannot start later against a state the adopter has since changed.
+      if (
+        (stale && !(await cancelNeverStartedOwnerRun(tx, existingRun, cancellation))) ||
+        (lockedIssue.executionRunId !== input.expectedCheckoutRunId &&
+          lockedIssue.executionRunId !== input.actorRunId &&
+          !(await cancelNeverStartedOwnerRun(tx, executionOwnerRun, cancellation)))
+      ) {
         return { adopted: null, latest: lockedIssue };
       }
 
@@ -5653,6 +5762,9 @@ export function issueService(db: Db) {
             eq(issues.status, "in_progress"),
             eq(issues.assigneeAgentId, input.actorAgentId),
             eq(issues.checkoutRunId, input.expectedCheckoutRunId),
+            lockedIssue.executionRunId
+              ? eq(issues.executionRunId, lockedIssue.executionRunId)
+              : isNull(issues.executionRunId),
           ),
         )
         .returning({
@@ -5792,28 +5904,93 @@ export function issueService(db: Db) {
     });
   }
 
-  async function clearStaleExecutionLock(issueId: string, expectedExecutionRunId: string) {
-    const stale = await isTerminalOrMissingHeartbeatRun(expectedExecutionRunId);
-    if (!stale) return false;
+  async function clearStaleExecutionLock(input: {
+    issueId: string;
+    expectedCheckoutRunId: string | null;
+    expectedExecutionRunId: string;
+    actorRunId: string | null;
+  }) {
+    // BLO-20321: reap never-started (`queued` / `scheduled_retry`) owners as well
+    // as terminal ones. Callers re-acquire the lock and then run
+    // cancelStaleIssueContextRuns(keepRunId: <actor run>), which cancels the
+    // superseded run — so it cannot start later against a status the assignee has
+    // since changed.
+    return db.transaction(async (tx) => {
+      const issue = await tx
+        .select({
+          checkoutRunId: issues.checkoutRunId,
+          executionRunId: issues.executionRunId,
+        })
+        .from(issues)
+        .where(eq(issues.id, input.issueId))
+        .for("update")
+        .then((rows) => rows[0] ?? null);
+      if (
+        issue?.executionRunId !== input.expectedExecutionRunId ||
+        issue.checkoutRunId !== input.expectedCheckoutRunId
+      ) return false;
 
-    const cleared = await db
-      .update(issues)
-      .set({
-        executionRunId: null,
-        executionAgentNameKey: null,
-        executionLockedAt: null,
-        updatedAt: new Date(),
-      })
-      .where(
-        and(
-          eq(issues.id, issueId),
-          eq(issues.executionRunId, expectedExecutionRunId),
-        ),
-      )
-      .returning({ id: issues.id })
-      .then((rows) => rows[0] ?? null);
+      const ownerRunIds = [...new Set([
+        input.expectedExecutionRunId,
+        input.expectedCheckoutRunId,
+      ].filter((runId): runId is string => Boolean(runId)))].sort();
+      const ownerRuns = await tx
+        .select({
+          id: heartbeatRuns.id,
+          status: heartbeatRuns.status,
+          startedAt: heartbeatRuns.startedAt,
+          wakeupRequestId: heartbeatRuns.wakeupRequestId,
+        })
+        .from(heartbeatRuns)
+        .where(inArray(heartbeatRuns.id, ownerRunIds))
+        .orderBy(asc(heartbeatRuns.id))
+        .for("update")
+      const ownerRunById = new Map(ownerRuns.map((run) => [run.id, run]));
+      const executionOwnerRun = ownerRunById.get(input.expectedExecutionRunId) ?? null;
+      const distinctCheckoutOwnerId = input.expectedCheckoutRunId !== null &&
+        input.expectedCheckoutRunId !== input.actorRunId &&
+        input.expectedCheckoutRunId !== input.expectedExecutionRunId
+          ? input.expectedCheckoutRunId
+          : null;
+      const distinctCheckoutOwnerRun = distinctCheckoutOwnerId
+        ? ownerRunById.get(distinctCheckoutOwnerId) ?? null
+        : null;
+      if (distinctCheckoutOwnerId && !isReapableHeartbeatRunRow(distinctCheckoutOwnerRun)) {
+        return false;
+      }
 
-    return cleared != null;
+      const cancellation = {
+        reason: "Cancelled because the stale issue execution lock was released",
+        errorCode: "issue_execution_lock_reaped",
+      };
+      if (
+        !(await cancelNeverStartedOwnerRun(tx, executionOwnerRun, cancellation)) ||
+        (distinctCheckoutOwnerId &&
+          !(await cancelNeverStartedOwnerRun(tx, distinctCheckoutOwnerRun, cancellation)))
+      ) return false;
+
+      const cleared = await tx
+        .update(issues)
+        .set({
+          executionRunId: null,
+          executionAgentNameKey: null,
+          executionLockedAt: null,
+          updatedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(issues.id, input.issueId),
+            eq(issues.executionRunId, input.expectedExecutionRunId),
+            input.expectedCheckoutRunId
+              ? eq(issues.checkoutRunId, input.expectedCheckoutRunId)
+              : isNull(issues.checkoutRunId),
+          ),
+        )
+        .returning({ id: issues.id })
+        .then((rows) => rows[0] ?? null);
+
+      return cleared != null;
+    });
   }
 
   async function cancelStaleIssueContextRuns(input: {
@@ -5822,7 +5999,7 @@ export function issueService(db: Db) {
     keepRunId?: string | null;
     reason: string;
     errorCode: string;
-  }) {
+  }, dbOrTx: any = db) {
     const now = new Date();
     const conditions: SQL[] = [
       eq(heartbeatRuns.companyId, input.companyId),
@@ -5833,7 +6010,7 @@ export function issueService(db: Db) {
       conditions.push(ne(heartbeatRuns.id, input.keepRunId));
     }
 
-    const cancelled = await db
+    const cancelled: Array<{ id: string; wakeupRequestId: string | null }> = await dbOrTx
       .update(heartbeatRuns)
       .set({
         status: "cancelled",
@@ -5849,10 +6026,10 @@ export function issueService(db: Db) {
       });
 
     const wakeupRequestIds = cancelled
-      .map((run) => run.wakeupRequestId)
-      .filter((id): id is string => Boolean(id));
+      .map((run: { wakeupRequestId: string | null }) => run.wakeupRequestId)
+      .filter((id: string | null): id is string => Boolean(id));
     if (wakeupRequestIds.length > 0) {
-      await db
+      await dbOrTx
         .update(agentWakeupRequests)
         .set({
           status: "skipped",
@@ -8490,6 +8667,22 @@ export function issueService(db: Db) {
          * version when the statement blocks on a concurrent transaction.
          */
         expectedCurrentAssigneeAgentId?: string | null;
+        /**
+         * Pins run ownership that authorized a current-run agent mutation. A force
+         * release and checkout transfer can leave status/execution JSON unchanged
+         * while replacing the owning run; stale output from the former owner must
+         * not patch the newly owned issue.
+         */
+        expectedCurrentCheckoutRunId?: string | null;
+        expectedCurrentExecutionRunId?: string | null;
+        /**
+         * Pins the execution-stage snapshot that authorized a decision. A
+         * concurrent decision or stage advance must not be overwritten by a
+         * former participant acting on stale route state.
+         */
+        expectedCurrentExecutionState?: Record<string, unknown> | null;
+        /** Pins the policy from which an execution-stage transition was derived. */
+        expectedCurrentExecutionPolicy?: Record<string, unknown> | null;
       },
       dbOrTx: any = db,
     ) => {
@@ -8507,6 +8700,10 @@ export function issueService(db: Db) {
         actorUserId,
         expectedCurrentStatus,
         expectedCurrentAssigneeAgentId,
+        expectedCurrentCheckoutRunId,
+        expectedCurrentExecutionRunId,
+        expectedCurrentExecutionState,
+        expectedCurrentExecutionPolicy,
         ...issueData
       } = data;
 
@@ -8525,6 +8722,42 @@ export function issueService(db: Db) {
           issueId: id,
           expectedAssigneeAgentId: expectedCurrentAssigneeAgentId,
           currentAssigneeAgentId: existing.assigneeAgentId,
+        });
+      }
+      if (
+        expectedCurrentCheckoutRunId !== undefined &&
+        existing.checkoutRunId !== expectedCurrentCheckoutRunId
+      ) {
+        throw conflict("Issue checkout owner changed before the update could be applied", {
+          issueId: id,
+          expectedCheckoutRunId: expectedCurrentCheckoutRunId,
+          currentCheckoutRunId: existing.checkoutRunId,
+        });
+      }
+      if (
+        expectedCurrentExecutionRunId !== undefined &&
+        existing.executionRunId !== expectedCurrentExecutionRunId
+      ) {
+        throw conflict("Issue execution owner changed before the update could be applied", {
+          issueId: id,
+          expectedExecutionRunId: expectedCurrentExecutionRunId,
+          currentExecutionRunId: existing.executionRunId,
+        });
+      }
+      if (
+        expectedCurrentExecutionState !== undefined &&
+        JSON.stringify(existing.executionState ?? null) !== JSON.stringify(expectedCurrentExecutionState)
+      ) {
+        throw conflict("Issue execution stage changed before the decision could be applied", {
+          issueId: id,
+        });
+      }
+      if (
+        expectedCurrentExecutionPolicy !== undefined &&
+        JSON.stringify(existing.executionPolicy ?? null) !== JSON.stringify(expectedCurrentExecutionPolicy)
+      ) {
+        throw conflict("Issue execution policy changed before the decision could be applied", {
+          issueId: id,
         });
       }
       const experimental = await instanceSettings.getExperimental();
@@ -8924,6 +9157,34 @@ export function issueService(db: Db) {
                   ? isNull(issues.assigneeAgentId)
                   : eq(issues.assigneeAgentId, expectedCurrentAssigneeAgentId),
               ]),
+          ...(expectedCurrentCheckoutRunId === undefined
+            ? []
+            : [
+                expectedCurrentCheckoutRunId === null
+                  ? isNull(issues.checkoutRunId)
+                  : eq(issues.checkoutRunId, expectedCurrentCheckoutRunId),
+              ]),
+          ...(expectedCurrentExecutionRunId === undefined
+            ? []
+            : [
+                expectedCurrentExecutionRunId === null
+                  ? isNull(issues.executionRunId)
+                  : eq(issues.executionRunId, expectedCurrentExecutionRunId),
+              ]),
+          ...(expectedCurrentExecutionState === undefined
+            ? []
+            : [
+                expectedCurrentExecutionState === null
+                  ? isNull(issues.executionState)
+                  : sql`${issues.executionState} = ${JSON.stringify(expectedCurrentExecutionState)}::jsonb`,
+              ]),
+          ...(expectedCurrentExecutionPolicy === undefined
+            ? []
+            : [
+                expectedCurrentExecutionPolicy === null
+                  ? isNull(issues.executionPolicy)
+                  : sql`${issues.executionPolicy} = ${JSON.stringify(expectedCurrentExecutionPolicy)}::jsonb`,
+              ]),
         ];
         const updated = await tx
           .update(issues)
@@ -8947,6 +9208,18 @@ export function issueService(db: Db) {
               ...(expectedCurrentAssigneeAgentId === undefined
                 ? {}
                 : { expectedAssigneeAgentId: expectedCurrentAssigneeAgentId }),
+              ...(expectedCurrentCheckoutRunId === undefined
+                ? {}
+                : { expectedCheckoutRunId: expectedCurrentCheckoutRunId }),
+              ...(expectedCurrentExecutionRunId === undefined
+                ? {}
+                : { expectedExecutionRunId: expectedCurrentExecutionRunId }),
+              ...(expectedCurrentExecutionState === undefined
+                ? {}
+                : { expectedExecutionState: true }),
+              ...(expectedCurrentExecutionPolicy === undefined
+                ? {}
+                : { expectedExecutionPolicy: true }),
             });
           }
           return null;
@@ -9310,10 +9583,20 @@ export function issueService(db: Db) {
       // Adopt stale executionRunId — if the execution lock points to a terminal/missing run, clear it and proceed.
       // Only adopts when the caller's expectedStatuses guard still holds; preserves any existing assigneeUserId
       // and preserves the original startedAt when the issue is already in_progress.
+      //
+      // BLO-20321 deliberately left this branch terminal-only. Checkout is not
+      // where the WIP defect bites (checkout adds WIP; it is parking/closing that
+      // was blocked), and widening here would change which branch handles a
+      // never-started owner — this one preserves startedAt, the
+      // clearStaleExecutionLock fallback below resets it. A never-started owner
+      // now falls through to that fallback and is adopted there.
       if (
         checkoutRunId &&
         current.executionRunId &&
         current.executionRunId !== checkoutRunId &&
+        (current.checkoutRunId == null ||
+          current.checkoutRunId === checkoutRunId ||
+          current.checkoutRunId === current.executionRunId) &&
         (current.assigneeAgentId === agentId || current.assigneeAgentId == null)
       ) {
         const stale = await isTerminalOrMissingHeartbeatRun(current.executionRunId);
@@ -9339,6 +9622,9 @@ export function issueService(db: Db) {
                 eq(issues.id, id),
                 inArray(issues.status, expectedStatuses),
                 eq(issues.executionRunId, current.executionRunId),
+                current.checkoutRunId
+                  ? eq(issues.checkoutRunId, current.checkoutRunId)
+                  : isNull(issues.checkoutRunId),
                 or(isNull(issues.assigneeAgentId), eq(issues.assigneeAgentId, agentId)),
               ),
             )
@@ -9355,7 +9641,8 @@ export function issueService(db: Db) {
       if (
         current.assigneeAgentId === agentId &&
         current.status === "in_progress" &&
-        sameRunLock(current.checkoutRunId, checkoutRunId)
+        sameRunLock(current.checkoutRunId, checkoutRunId) &&
+        (current.executionRunId == null || current.executionRunId === checkoutRunId)
       ) {
         const row = await db.select().from(issues).where(eq(issues.id, id)).then((rows) => rows[0] ?? null);
         if (!row) throw notFound("Issue not found");
@@ -9369,7 +9656,12 @@ export function issueService(db: Db) {
         current.executionRunId !== checkoutRunId &&
         (current.assigneeAgentId === agentId || current.assigneeAgentId == null)
       ) {
-        const cleared = await clearStaleExecutionLock(id, current.executionRunId);
+        const cleared = await clearStaleExecutionLock({
+          issueId: id,
+          expectedCheckoutRunId: current.checkoutRunId,
+          expectedExecutionRunId: current.executionRunId,
+          actorRunId: checkoutRunId,
+        });
         if (cleared) {
           const now = new Date();
           const retried = await db
@@ -9390,6 +9682,12 @@ export function issueService(db: Db) {
                 eq(issues.id, id),
                 inArray(issues.status, expectedStatuses),
                 isNull(issues.executionRunId),
+                current.checkoutRunId
+                  ? eq(issues.checkoutRunId, current.checkoutRunId)
+                  : isNull(issues.checkoutRunId),
+                current.assigneeAgentId
+                  ? eq(issues.assigneeAgentId, current.assigneeAgentId)
+                  : isNull(issues.assigneeAgentId),
               ),
             )
             .returning()
@@ -9473,7 +9771,8 @@ export function issueService(db: Db) {
         if (
           candidate.status === "in_progress" &&
           candidate.assigneeAgentId === actorAgentId &&
-          sameRunLock(candidate.checkoutRunId, actorRunId)
+          sameRunLock(candidate.checkoutRunId, actorRunId) &&
+          (candidate.executionRunId == null || candidate.executionRunId === actorRunId)
         ) {
           return { ...candidate, adoptedFromRunId: null as string | null };
         }
@@ -9550,23 +9849,29 @@ export function issueService(db: Db) {
           }
 
           const latestCandidate = staleAdoption.latest ?? candidate;
-          const activeActorRun = await adoptActiveActorIssueRun({
-            issueId: id,
-            companyId: latestCandidate.companyId,
-            actorAgentId,
-            actorRunId,
-            expectedCheckoutRunId: latestCandidate.checkoutRunId,
-            expectedExecutionRunId: latestCandidate.executionRunId,
-          });
+          // Active issue-scoped runs may supersede one older owner, but must not
+          // collapse divergent ownership after stale adoption rejected either
+          // side. In particular, a reapable execution owner cannot make a
+          // distinct live checkout owner replaceable.
+          if (latestCandidate.checkoutRunId === latestCandidate.executionRunId) {
+            const activeActorRun = await adoptActiveActorIssueRun({
+              issueId: id,
+              companyId: latestCandidate.companyId,
+              actorAgentId,
+              actorRunId,
+              expectedCheckoutRunId: latestCandidate.checkoutRunId,
+              expectedExecutionRunId: latestCandidate.executionRunId,
+            });
 
-          if (activeActorRun) {
-            return {
-              ownership: {
-                ...activeActorRun,
-                adoptedFromRunId: latestCandidate.checkoutRunId,
-              },
-              latest: null,
-            };
+            if (activeActorRun) {
+              return {
+                ownership: {
+                  ...activeActorRun,
+                  adoptedFromRunId: latestCandidate.checkoutRunId,
+                },
+                latest: null,
+              };
+            }
           }
 
           if (staleAdoption.latest) {
@@ -9669,7 +9974,12 @@ export function issueService(db: Db) {
         current.executionRunId &&
         current.executionRunId !== actorRunId
       ) {
-        const cleared = await clearStaleExecutionLock(id, current.executionRunId);
+        const cleared = await clearStaleExecutionLock({
+          issueId: id,
+          expectedCheckoutRunId: current.checkoutRunId,
+          expectedExecutionRunId: current.executionRunId,
+          actorRunId,
+        });
         if (cleared) {
           const refreshed = await db
             .update(issues)
@@ -9685,6 +9995,9 @@ export function issueService(db: Db) {
                 eq(issues.status, "in_progress"),
                 eq(issues.assigneeAgentId, actorAgentId),
                 isNull(issues.executionRunId),
+                current.checkoutRunId
+                  ? eq(issues.checkoutRunId, current.checkoutRunId)
+                  : isNull(issues.checkoutRunId),
               ),
             )
             .returning({
@@ -9693,6 +10006,7 @@ export function issueService(db: Db) {
               status: issues.status,
               assigneeAgentId: issues.assigneeAgentId,
               checkoutRunId: issues.checkoutRunId,
+              executionRunId: issues.executionRunId,
             })
             .then((rows) => rows[0] ?? null);
           if (refreshed) {
@@ -9734,21 +10048,50 @@ export function issueService(db: Db) {
         if (actorAgentId && existing.assigneeAgentId && existing.assigneeAgentId !== actorAgentId) {
           throw conflict("Only assignee can release issue");
         }
-        if (
-          actorAgentId &&
-          existing.status === "in_progress" &&
-          existing.assigneeAgentId === actorAgentId &&
-          existing.checkoutRunId &&
-          !sameRunLock(existing.checkoutRunId, actorRunId ?? null)
-        ) {
-          const stale = await isTerminalOrMissingHeartbeatRun(existing.checkoutRunId, tx);
-          if (!stale) {
+        if (existing.checkoutRunId || existing.executionRunId) {
+          const ownerRunIds = [...new Set([
+            existing.checkoutRunId,
+            existing.executionRunId,
+          ].filter((runId): runId is string => Boolean(runId)))].sort();
+          const ownerRuns = ownerRunIds.length > 0
+            ? await tx
+                .select({
+                  id: heartbeatRuns.id,
+                  status: heartbeatRuns.status,
+                  startedAt: heartbeatRuns.startedAt,
+                  wakeupRequestId: heartbeatRuns.wakeupRequestId,
+                })
+                .from(heartbeatRuns)
+                .where(inArray(heartbeatRuns.id, ownerRunIds))
+                .orderBy(asc(heartbeatRuns.id))
+                .for("update")
+            : [];
+          const ownerRunById = new Map(ownerRuns.map((run) => [run.id, run]));
+          const actorOwnsRun = (runId: string | null) => Boolean(runId && actorRunId && runId === actorRunId);
+          const ownerIsReleasable = (runId: string | null) =>
+            !runId || actorOwnsRun(runId) || isReapableHeartbeatRunRow(ownerRunById.get(runId));
+
+          if (!ownerIsReleasable(existing.checkoutRunId) || !ownerIsReleasable(existing.executionRunId)) {
             throw conflict("Only checkout run can release issue", {
               issueId: existing.id,
               assigneeAgentId: existing.assigneeAgentId,
               checkoutRunId: existing.checkoutRunId,
+              executionRunId: existing.executionRunId,
               actorRunId: actorRunId ?? null,
             });
+          }
+
+          const cancellation = {
+            reason: "Cancelled because the issue was released",
+            errorCode: "issue_released",
+          };
+          for (const runId of ownerRunIds) {
+            if (!actorOwnsRun(runId) && !(await cancelNeverStartedOwnerRun(tx, ownerRunById.get(runId), cancellation))) {
+              throw conflict("Issue run ownership changed before release", {
+                issueId: existing.id,
+                ownerRunId: runId,
+              });
+            }
           }
         }
 
@@ -9772,7 +10115,7 @@ export function issueService(db: Db) {
           issueId: updated.id,
           reason: "Cancelled because the issue was released",
           errorCode: "issue_released",
-        });
+        }, tx);
         const [enriched] = await withIssueLabels(tx, [updated]);
         return enriched;
       }),

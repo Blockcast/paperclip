@@ -3194,7 +3194,11 @@ describe.sequential("issue comment reopen routes", () => {
       expect(mockDb.transaction).toHaveBeenCalledTimes(1);
       expect(mockIssueService.update).toHaveBeenCalledWith(
         "11111111-1111-4111-8111-111111111111",
-        expect.objectContaining({ status: "done" }),
+        expect.objectContaining({
+          status: "done",
+          expectedCurrentStatus: "in_review",
+          expectedCurrentExecutionPolicy: policy,
+        }),
         mockTx,
       );
       expect(mockLogActivity).toHaveBeenCalledWith(
@@ -4125,7 +4129,11 @@ describe.sequential("issue comment reopen routes", () => {
       expect(mockDb.transaction).toHaveBeenCalledTimes(1);
       expect(mockIssueService.update).toHaveBeenCalledWith(
         "11111111-1111-4111-8111-111111111111",
-        expect.objectContaining({ status: "done" }),
+        expect.objectContaining({
+          status: "done",
+          expectedCurrentStatus: "in_review",
+          expectedCurrentExecutionPolicy: policy,
+        }),
         mockTx,
       );
       expect(mockLogActivity).toHaveBeenCalledWith(
