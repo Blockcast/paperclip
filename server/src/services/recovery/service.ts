@@ -8353,6 +8353,19 @@ export function recoveryService(
 
         if (!updated) return null;
 
+        // The issue columns are cleared by the sweep, so record the release on
+        // its former holder in the same transaction. Legacy wake adoption uses
+        // this durable marker to avoid renewing a stale holder indefinitely.
+        if (currentIssue.executionRunId) {
+          await tx
+            .update(heartbeatRuns)
+            .set({
+              issueLockReleaseCount: sql`${heartbeatRuns.issueLockReleaseCount} + 1`,
+              updatedAt: clearedAt,
+            })
+            .where(eq(heartbeatRuns.id, currentIssue.executionRunId));
+        }
+
         // BLO-21621: clearing a stale pre-claim lock is the only positive
         // evidence that a queued row previously owned, and then lost, this
         // issue lock. Persist that lineage in the same transaction as the

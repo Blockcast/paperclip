@@ -44,6 +44,10 @@ export const heartbeatRuns = pgTable(
       onDelete: "set null",
     }),
     processLossRetryCount: integer("process_loss_retry_count").notNull().default(0),
+    // A stale-lock sweep releases the issue row but deliberately leaves the
+    // run alive. Keep that release on the run so legacy wake adoption cannot
+    // repeatedly grant the same stale holder a fresh lock window.
+    issueLockReleaseCount: integer("issue_lock_release_count").notNull().default(0),
     scheduledRetryAt: timestamp("scheduled_retry_at", { withTimezone: true }),
     scheduledRetryAttempt: integer("scheduled_retry_attempt").notNull().default(0),
     scheduledRetryReason: text("scheduled_retry_reason"),

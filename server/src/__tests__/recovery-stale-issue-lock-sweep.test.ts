@@ -1296,11 +1296,28 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       status: "in_progress",
       priority: "critical",
       assigneeAgentId: input.agentId,
+      responsibleUserId: "responsible-user",
       checkoutRunId: input.sameRunHoldsCheckout === false ? null : wedgedRunId,
       executionRunId: wedgedRunId,
       executionLockedAt: input.lockedAt,
     });
     return { wedgedRunId, issueId };
+  }
+
+  async function wakeIssue(
+    heartbeat: ReturnType<typeof heartbeatService>,
+    agentId: string,
+    issueId: string,
+  ) {
+    return heartbeat.wakeup(agentId, {
+      source: "manual",
+      triggerDetail: "manual",
+      reason: "issue_assigned",
+      contextSnapshot: { issueId, taskId: issueId },
+      payload: { issueId },
+      requestedByActorType: "user",
+      requestedByActorId: "test-user",
+    });
   }
 
   it("clears a lock whose scheduled_retry holder also holds the checkout column (BLO-19848)", async () => {
@@ -1359,6 +1376,159 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0]);
     expect(row?.executionRunId).toBeNull();
+  });
+
+  it("does not re-adopt a swept parked retry across repeated wakes (BLO-22060)", async () => {
+    const { companyId, agentId } = await seed();
+    const { issueId, wedgedRunId } = await seedWedgedScheduledRetryIssue({
+      companyId,
+      agentId,
+      lockedAt: new Date(Date.now() - 13 * 60 * 60 * 1000),
+      scheduledRetryAt: new Date(Date.now() + 3 * 24 * 60 * 60 * 1000),
+      sameRunHoldsCheckout: false,
+    });
+    const heartbeat = heartbeatService(db, { skipQueuedRunDispatch: true });
+
+    expect((await heartbeat.sweepStaleIssueLocks()).issueIds).toContain(issueId);
+
+    const released = await db
+      .select({
+        status: heartbeatRuns.status,
+        issueLockReleaseCount: heartbeatRuns.issueLockReleaseCount,
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, wedgedRunId))
+      .then((rows) => rows[0]);
+    expect(released).toMatchObject({ status: "scheduled_retry", issueLockReleaseCount: 1 });
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      await wakeIssue(heartbeat, agentId, issueId);
+      const lock = await db
+        .select({ executionRunId: issues.executionRunId })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]);
+      expect(lock?.executionRunId).not.toBe(wedgedRunId);
+    }
+
+    const afterWakes = await db
+      .select({ issueLockReleaseCount: heartbeatRuns.issueLockReleaseCount })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, wedgedRunId))
+      .then((rows) => rows[0]);
+    expect(afterWakes?.issueLockReleaseCount).toBe(1);
+  });
+
+  it("keeps a live parked retry as the issue lock owner (BLO-22060)", async () => {
+    const { companyId, agentId } = await seed();
+    const lockedAt = new Date(Date.now() - 60 * 60 * 1000);
+    const { issueId, wedgedRunId } = await seedWedgedScheduledRetryIssue({
+      companyId,
+      agentId,
+      lockedAt,
+      scheduledRetryAt: new Date(Date.now() + 60 * 60 * 1000),
+      sameRunHoldsCheckout: false,
+    });
+    const heartbeat = heartbeatService(db, { skipQueuedRunDispatch: true });
+
+    expect((await heartbeat.sweepStaleIssueLocks()).cleared).toBe(0);
+    await wakeIssue(heartbeat, agentId, issueId);
+
+    const [lock, run] = await Promise.all([
+      db
+        .select({ executionRunId: issues.executionRunId, executionLockedAt: issues.executionLockedAt })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]),
+      db
+        .select({ status: heartbeatRuns.status, issueLockReleaseCount: heartbeatRuns.issueLockReleaseCount })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, wedgedRunId))
+        .then((rows) => rows[0]),
+    ]);
+    expect(lock?.executionRunId).toBe(wedgedRunId);
+    expect(lock?.executionLockedAt?.getTime()).toBe(lockedAt.getTime());
+    expect(run).toMatchObject({ status: "scheduled_retry", issueLockReleaseCount: 0 });
+  });
+
+  it.each([
+    { label: "queued", status: "queued" as const, lastSignalAt: null },
+    { label: "silent running", status: "running" as const, lastSignalAt: new Date(Date.now() - 5 * 60 * 60 * 1000) },
+  ])("does not re-adopt a swept $label holder through legacy wake adoption (BLO-22060)", async ({ status, lastSignalAt }) => {
+    const { companyId, agentId, queuedRunId, runningRunId } = await seed();
+    const issueId = randomUUID();
+    const runId = status === "queued" ? queuedRunId : runningRunId;
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: { issueId, taskId: issueId },
+        ...(status === "running"
+          ? {
+              startedAt: lastSignalAt,
+              lastOutputAt: lastSignalAt,
+              lastUsefulActionAt: lastSignalAt,
+            }
+          : {}),
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: `Stale ${status} lock owner`,
+      status: "in_progress",
+      priority: "critical",
+      assigneeAgentId: agentId,
+      responsibleUserId: "responsible-user",
+      executionRunId: runId,
+      executionLockedAt: new Date(Date.now() - 13 * 60 * 60 * 1000),
+    });
+    const heartbeat = heartbeatService(db, { skipQueuedRunDispatch: true });
+
+    expect((await heartbeat.sweepStaleIssueLocks()).issueIds).toContain(issueId);
+    const released = await db
+      .select({ issueLockReleaseCount: heartbeatRuns.issueLockReleaseCount })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0]);
+    expect(released?.issueLockReleaseCount).toBe(1);
+
+    await wakeIssue(heartbeat, agentId, issueId);
+    const lock = await db
+      .select({ executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(lock?.executionRunId).not.toBe(runId);
+  });
+
+  it("keeps a swept retry release marker through promotion to queued (BLO-22060)", async () => {
+    const { companyId, agentId } = await seed();
+    const { issueId, wedgedRunId } = await seedWedgedScheduledRetryIssue({
+      companyId,
+      agentId,
+      lockedAt: new Date(Date.now() - 13 * 60 * 60 * 1000),
+      scheduledRetryAt: new Date(Date.now() - 60_000),
+      sameRunHoldsCheckout: false,
+    });
+    const heartbeat = heartbeatService(db, { skipQueuedRunDispatch: true });
+
+    expect((await heartbeat.sweepStaleIssueLocks()).issueIds).toContain(issueId);
+    expect((await heartbeat.promoteDueScheduledRetries(new Date())).runIds).toContain(wedgedRunId);
+
+    const promoted = await db
+      .select({ status: heartbeatRuns.status, issueLockReleaseCount: heartbeatRuns.issueLockReleaseCount })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, wedgedRunId))
+      .then((rows) => rows[0]);
+    expect(promoted).toMatchObject({ status: "queued", issueLockReleaseCount: 1 });
+
+    await wakeIssue(heartbeat, agentId, issueId);
+    const lock = await db
+      .select({ executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(lock?.executionRunId).not.toBe(wedgedRunId);
   });
 
   it.each([

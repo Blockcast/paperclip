@@ -494,6 +494,12 @@ const MAX_INLINE_WAKE_COMMENT_BODY_CHARS = 4_000;
 const MAX_INLINE_WAKE_COMMENT_BODY_TOTAL_CHARS = 12_000;
 const execFile = promisify(execFileCallback);
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
+// A run whose issue lock was released by the stale-lock sweep may continue
+// through its normal claim/promotion path, but must not be selected again by
+// legacy wake adoption. The count is run history, not a status property:
+// scheduled retries can be promoted to queued and stale queued/running holders
+// are selectable by the same fallback.
+const MAX_SWEPT_ISSUE_LOCK_RELEASES = 1;
 const TASK_SCOPE_COALESCIBLE_RUN_STATUSES = ["queued", "scheduled_retry"] as const;
 const CANCELLABLE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const HEARTBEAT_RUN_TERMINAL_STATUSES = ["succeeded", "interrupted", "failed", "cancelled", "timed_out"] as const;
@@ -25000,6 +25006,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 eq(heartbeatRuns.companyId, issue.companyId),
                 inArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES]),
                 sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
+                // A stale-lock sweep made this run ineligible for legacy
+                // ownership renewal. Filter in SQL so another eligible run for
+                // the issue can still be adopted normally.
+                lt(heartbeatRuns.issueLockReleaseCount, MAX_SWEPT_ISSUE_LOCK_RELEASES),
               ),
             )
             .orderBy(
