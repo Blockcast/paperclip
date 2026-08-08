@@ -266,7 +266,7 @@ describe("githubHasReviewerEvidenceForPr", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("finds a bot review at the exact head commit", async () => {
+  it("BLO-22574: formal surface accepts reviewer-App evidence at the exact head", async () => {
     setCreds();
     stubGithub({ reviews: [{ user: { login: "allyblockcast[bot]" }, commit_id: headSha }] });
     await expect(githubHasReviewerEvidenceForPr({ repoFullName, prNumber, headSha })).resolves.toEqual({
@@ -341,6 +341,56 @@ describe("githubHasReviewerEvidenceForPr", () => {
     await expect(githubHasReviewerEvidenceForPr({ repoFullName, prNumber, headSha })).resolves.toEqual({
       found: true,
       via: "comment",
+    });
+  });
+
+  it("BLO-22574: comment evidence rejects a forged canonical body from a different actor", async () => {
+    setCreds();
+    stubGithub({
+      reviews: [],
+      comments: [
+        {
+          user: { login: "someone-else" },
+          body: `## Ally — Consolidated PR Review\n\nReviewed head: ${headSha}\n\nNo findings.`,
+        },
+      ],
+    });
+    await expect(githubHasReviewerEvidenceForPr({ repoFullName, prNumber, headSha })).resolves.toEqual({
+      found: false,
+    });
+  });
+
+  it("BLO-22574: comment evidence rejects a canonical body from the same-slug user seat", async () => {
+    setCreds();
+    // The bare user seat is a distinct principal. It cannot turn a copied
+    // comment-shaped review into App evidence for the monitor surface.
+    stubGithub({
+      reviews: [],
+      comments: [
+        {
+          user: { login: "allyblockcast" },
+          body: `## Ally — Consolidated PR Review\n\nReviewed head: ${headSha}\n\nNo findings.`,
+        },
+      ],
+    });
+    await expect(githubHasReviewerEvidenceForPr({ repoFullName, prNumber, headSha })).resolves.toEqual({
+      found: false,
+    });
+  });
+
+  it("BLO-22574: comment evidence rejects a truncated head attestation", async () => {
+    setCreds();
+    stubGithub({
+      reviews: [],
+      comments: [
+        {
+          user: { login: "allyblockcast[bot]" },
+          body: `## Ally — Consolidated PR Review\n\nReviewed head: ${headSha.slice(0, 8)}\n\nNo findings.`,
+        },
+      ],
+    });
+    await expect(githubHasReviewerEvidenceForPr({ repoFullName, prNumber, headSha })).resolves.toEqual({
+      found: false,
     });
   });
 
@@ -430,7 +480,7 @@ describe("githubHasReviewerEvidenceForPr", () => {
     });
   });
 
-  it("does not match a review by a different author or at a different head", async () => {
+  it("BLO-22574: exact-head formal pass rejects an unrelated reviewer", async () => {
     setCreds();
     stubGithub({
       reviews: [
