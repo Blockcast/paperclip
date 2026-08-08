@@ -45,7 +45,7 @@ replacement for it:
    node ID and head commit:
    ```
    gh api graphql -f query='{ repository(owner:"Blockcast", name:"paperclip") {
-     mergeQueue(branch: {qualifiedName: "refs/heads/master"}) {
+     mergeQueue(branch: "master") {
        entries(first: 1) { nodes { pullRequest { id number } headCommit { oid } } }
      } } }'
    ```
