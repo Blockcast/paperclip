@@ -128,6 +128,10 @@ export function verifyCapturePromotion(targetDeployment, liveDeployment) {
   const target = record(targetDeployment, "target API Deployment");
   if (!authorityEnabled(target)) return { required: false };
   const live = record(liveDeployment, "live API Deployment");
+  const liveEnvironment = paperclipEnvironment(live, "live API Deployment");
+  if (booleanFlag(liveEnvironment, ENV.authorityEnabled, "live API Deployment")) {
+    throw new Error("live API Deployment already has review-gate authority enabled");
+  }
   const targetContract = captureContract(target, "target API Deployment");
   const liveContract = captureContract(live, "live API Deployment");
   if (JSON.stringify(liveContract) !== JSON.stringify(targetContract)) {

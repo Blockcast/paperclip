@@ -643,6 +643,7 @@ jobs:
                     ((.spec.template.metadata.annotations // {}) + {($key): $commit})
                 end
               ' > "${unstamped}"
+          api_deployment="$(jq -er '.metadata.name | select(type == "string" and length > 0)' "${unstamped}")"
 
           # A single rolling update cannot safely introduce capture and authority:
           # old API replicas would still acknowledge without persisting. Trusted
@@ -653,7 +654,7 @@ jobs:
             --target "${unstamped}" --print-authority)"
           if [ "${authority_enabled}" = "true" ]; then
             live_capture="${RUNNER_TEMP}/paperclip-api-live-capture.json"
-            if ! kubectl -n "${NS}" get deployment paperclip-api -o json > "${live_capture}"; then
+            if ! kubectl -n "${NS}" get deployment "${api_deployment}" -o json > "${live_capture}"; then
               echo "Review-gate authority requires an earlier completed capture-only API rollout" >&2
               exit 1
             fi
@@ -684,7 +685,8 @@ jobs:
             --set image.tag="${TAG}" \
             --set-string image.digest="${DIGEST}" \
             --set-string api.deployedCommit="${COMMIT}" \
-            | PAPERCLIP_DEPLOY_NAMESPACE="${NS}" \
+            | PAPERCLIP_API_DEPLOYMENT="${api_deployment}" \
+              PAPERCLIP_DEPLOY_NAMESPACE="${NS}" \
               PAPERCLIP_DEPLOYED_COMMIT="${COMMIT}" \
               PAPERCLIP_APPROVAL_PLAN_SHA256="${marker}" "${STAMP_SCRIPT}" \
             | kubectl create --dry-run=client -n "${NS}" -o json -f - > "${plan}"
@@ -695,11 +697,12 @@ jobs:
             --arg marker "${marker}" \
             --arg commit "${COMMIT}" \
             --arg image "${expected_image}" \
-            --arg namespace "${NS}" '
+            --arg namespace "${NS}" \
+            --arg name "${api_deployment}" '
             .apiVersion == "apps/v1" and
             .kind == "Deployment" and
             .metadata.namespace == $namespace and
-            .metadata.name == "paperclip-api" and
+            .metadata.name == $name and
             .spec.template.metadata.annotations[$key] == $marker and
             .spec.template.metadata.annotations[$deployedCommitKey] == $commit and
             (.spec.template.spec.containers | all(.image == $image))
@@ -758,6 +761,7 @@ jobs:
           approval_log="${approver_dir}/approval.log"
           deploy_kubeconfig="${KUBECONFIG}"
           approved_server_plan="$(mktemp "${RUNNER_TEMP}/paperclip-api-approved.XXXXXXXX.json")"
+          api_deployment="$(jq -er '.metadata.name | select(type == "string" and length > 0)' "${DEPLOY_PLAN}")"
 
           # Arm the cleanup BEFORE the credential reaches disk, so a kubectl/jq
           # failure exiting under `set -e` cannot leave it behind. umask instead
@@ -767,16 +771,17 @@ jobs:
           unset APPROVER_KUBECONFIG
 
           KUBECONFIG="${approver_kubeconfig}" \
+            PAPERCLIP_API_DEPLOYMENT="${api_deployment}" \
             PAPERCLIP_DEPLOY_KUBECONFIG="${deploy_kubeconfig}" \
             PAPERCLIP_DEPLOY_NAMESPACE="${NS}" \
             PAPERCLIP_APPROVED_SERVER_PLAN_OUT="${approved_server_plan}" \
             "${APPROVE_SCRIPT}" "${DIGEST}" "${DEPLOY_PLAN}" | tee "${approval_log}"
 
-          jq -e --arg namespace "${NS}" --arg digest "${DIGEST}" --arg commit "${COMMIT}" '
+          jq -e --arg namespace "${NS}" --arg digest "${DIGEST}" --arg commit "${COMMIT}" --arg name "${api_deployment}" '
             .apiVersion == "apps/v1" and
             .kind == "Deployment" and
             .metadata.namespace == $namespace and
-            .metadata.name == "paperclip-api" and
+            .metadata.name == $name and
             ((.metadata.resourceVersion == null) or
               (.metadata.resourceVersion | type == "string" and length > 0)) and
             .spec.template.metadata.annotations["paperclip.blockcast.net/deployed-commit"] == $commit and
@@ -812,12 +817,13 @@ jobs:
           set -euo pipefail
           [[ "${DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]
           echo "rolling out ${TAG}@${DIGEST} to ${NS}/${RELEASE}"
+          api_deployment="$(jq -er '.metadata.name | select(type == "string" and length > 0)' "${APPROVED_SERVER_PLAN}")"
           reconcile_approved_api_plan() {
             local attempt live_json reconciled replace_err
             reconciled="$(mktemp "${RUNNER_TEMP}/paperclip-api-reconciled.XXXXXXXX.json")"
             replace_err="$(mktemp "${RUNNER_TEMP}/paperclip-api-replace.XXXXXXXX.err")"
             for attempt in $(seq 1 5); do
-              live_json="$(kubectl -n "${NS}" get deployment paperclip-api -o json)"
+              live_json="$(kubectl -n "${NS}" get deployment "${api_deployment}" -o json)"
               jq --slurpfile approved "${APPROVED_SERVER_PLAN}" '
                 def release_controlled_metadata_key:
                   startswith("app.kubernetes.io/") or
@@ -906,7 +912,8 @@ jobs:
           }
           trap stop_background_helm EXIT
 
-          helm upgrade "${RELEASE}" ./deploy/helm/paperclip \
+          PAPERCLIP_API_DEPLOYMENT="${api_deployment}" \
+            helm upgrade "${RELEASE}" ./deploy/helm/paperclip \
             -n "${NS}" \
             -f deploy/helm/paperclip/values.blockcast.yaml \
             --set image.tag="${TAG}" \
@@ -924,7 +931,7 @@ jobs:
           # marker-bearing intermediate Deployment is left live.
           api_plan_reconciled=""
           while kill -0 "${helm_pid}" 2>/dev/null; do
-            live_marker="$(kubectl -n "${NS}" get deployment paperclip-api \
+            live_marker="$(kubectl -n "${NS}" get deployment "${api_deployment}" \
               -o jsonpath='{.spec.template.metadata.annotations.paperclip\.blockcast\.net/approval-plan-sha256}' \
               2>/dev/null || true)"
             if [ "${live_marker}" = "${PLAN_MARKER}" ]; then
@@ -944,7 +951,7 @@ jobs:
           # invocation; only this unconditional post-wait pass guarantees a later
           # three-way merge or failure cannot strand live-only template drift.
           api_plan_reconciled=""
-          live_marker="$(kubectl -n "${NS}" get deployment paperclip-api \
+          live_marker="$(kubectl -n "${NS}" get deployment "${api_deployment}" \
             -o jsonpath='{.spec.template.metadata.annotations.paperclip\.blockcast\.net/approval-plan-sha256}' \
             2>/dev/null || true)"
           if [ "${live_marker}" = "${PLAN_MARKER}" ]; then
@@ -960,7 +967,7 @@ jobs:
             exit "${helm_status}"
           fi
 
-          kubectl -n "${NS}" rollout status deployment/paperclip-api --timeout=30m
+          kubectl -n "${NS}" rollout status "deployment/${api_deployment}" --timeout=30m
 
           # BLO-29008: the api Deployment is only ONE of the two tiers this
           # release rolls. statefulset/paperclip runs PAPERCLIP_NODE_ROLE=worker
@@ -995,7 +1002,7 @@ jobs:
           fi
           approved_server_plan_sha256="$(jq -cS "${canonical_jq}" "${APPROVED_SERVER_PLAN}" \
             | sha256sum | awk '{print $1}')"
-          live_json="$(kubectl -n "${NS}" get deployment paperclip-api -o json)"
+          live_json="$(kubectl -n "${NS}" get deployment "${api_deployment}" -o json)"
           live_server_plan_sha256="$(jq -cS "${canonical_jq}" <<<"${live_json}" \
             | sha256sum | awk '{print $1}')"
           if [ "${live_server_plan_sha256}" != "${approved_server_plan_sha256}" ]; then
