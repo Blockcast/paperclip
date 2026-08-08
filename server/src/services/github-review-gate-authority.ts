@@ -444,6 +444,17 @@ async function processDelivery(db: Db, row: DeliveryRow): Promise<void> {
   const refreshed = await refreshDeliveryClaim(db, fencedRow);
   if (!refreshed) return;
   fencedRow = refreshed;
+
+  if (statusFailures.length > 0) {
+    const failure = statusFailures[0]!;
+    const reason = failure.result.ok ? "review_gate_status_incomplete" : failure.result.reason;
+    await retryDelivery(db, fencedRow, reason, {
+      headShas,
+      statusFailures,
+    });
+    return;
+  }
+
   const dispatch = await createRepositoryDispatch({
     token: token.token,
     row: fencedRow,
@@ -452,15 +463,9 @@ async function processDelivery(db: Db, row: DeliveryRow): Promise<void> {
     origin,
   });
 
-  if (statusFailures.length > 0 || !dispatch.ok) {
-    const reason = statusFailures[0]?.result.ok === false
-      ? statusFailures[0].result.reason
-      : dispatch.ok
-        ? "review_gate_delivery_incomplete"
-        : dispatch.reason;
-    await retryDelivery(db, fencedRow, reason, {
+  if (!dispatch.ok) {
+    await retryDelivery(db, fencedRow, dispatch.reason, {
       headShas,
-      statusFailures,
       dispatch,
     });
     return;
