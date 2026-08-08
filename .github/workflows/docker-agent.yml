@@ -134,7 +134,7 @@ jobs:
               return 1
             fi
             docker run --rm --entrypoint ffmpeg "$image" -hide_banner -muxers 2>&1 \
-              | grep -qE '(^|[[:space:]])moq_mmt([[:space:]]|$)'
+              | node .github/scripts/check-ffmpeg-muxer.mjs moq_mmt
           }
 
           # Last digest independently confirmed (via a genuinely fresh,
@@ -391,7 +391,7 @@ jobs:
   alert-on-failure:
     needs: build-and-push
     if: always() && needs.build-and-push.result == 'failure' && github.event_name != 'workflow_dispatch'
-    runs-on: ubuntu-latest
+    runs-on: arc-light
     permissions:
       issues: write
     steps:
