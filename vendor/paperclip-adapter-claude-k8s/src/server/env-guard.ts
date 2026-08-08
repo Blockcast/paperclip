@@ -54,139 +54,389 @@ const SAFE_ENV_INSPECTION_RE =
   /^(?:node[ \t]+)?(?:[^\s;&|()<>]*\/)?(?:safe-env-inspect(?:\.mjs)?|paperclip-safe-env)(?:[ \t]+[^;&|()<>$\x60\r\n]*)?$/;
 
 /**
- * Matches the `sh -c` / `bash -lc` prefix, WITHOUT requiring the payload to be
- * quoted.
+ * ---------------------------------------------------------------------------
+ * Shell-aware normalizer.
  *
- * This deliberately mirrors `SHELL_COMMAND_PREFIX_RE` +
- * `readShellCommandArgument` in `server/src/agent-shell-guard.ts`, where the
- * same unquoted-wrapper bypass was closed in `993bf304c`. Converging on that
- * shape rather than inventing a third one is a point of vendoring.
+ * WHY THIS IS NOT A REGEX ANY MORE. Five successive rounds of review closed a
+ * boundary-regex bypass (`&&`, CR/LF, flag-only dumps, command substitution,
+ * unquoted wrappers) and a sixth round found three more: `env >&2`, `e''nv`
+ * and `env -S '-u PATH'`. Re-measured against the real spawned pod script,
+ * that round's class was wider than reported — 10 of 12 probe payloads were
+ * ALLOWED while `/bin/sh` demonstrably dumped a marker variable, including
+ * `e"n"v`, `\env`, `'env'`, `env>&2`, `env 2>&1` and `env -S '-0'`.
  *
- * The previous pattern required a quoted payload (`(["'])([\s\S]*)\1`), so
- * `sh -c env` was never unwrapped at all and reached the detector intact.
+ * The reason is structural, not a missing character class. A regex matches the
+ * command *text*, but the shell executes the command *after* quote removal,
+ * escape processing, redirection stripping and (for GNU `env -S`) argument
+ * re-splitting. Any classifier that inspects the text before those
+ * transformations is matching a different string than the one that runs, so
+ * each new boundary character only closes the instance that was reported.
+ *
+ * So: lex the command the way a shell does — quote removal, escape handling,
+ * operator splitting, redirection stripping — and classify the resulting
+ * words. Bypasses that depend on spelling the same token differently
+ * (`e''nv`, `'env'`, `\env`) collapse to the same word and are caught by
+ * construction rather than by enumeration.
+ *
+ * The lexer is deliberately partial: it recognises the constructs that change
+ * which token executes, not the whole POSIX grammar. Anything it cannot
+ * resolve (a substitution body, a quoted multi-word payload) is re-analysed as
+ * a nested command, which errs toward blocking — consistent with this file's
+ * long-standing stance that a bare `env` inside a quoted string also matches.
+ * The safe helper remains the unblocked path.
+ * ---------------------------------------------------------------------------
  */
-const SHELL_COMMAND_PREFIX_RE = /^(?:\/bin\/)?(?:ba|z|)?sh\s+-l?c(?:\s+|$)/;
+
+/** Backtick, written as an escape because the pod script below is a `String.raw` template. */
+const BACKTICK = "\x60";
+
+/** Utilities that dump the whole environment when given no operand. */
+const ENV_DUMP_UTILS = ["env", "printenv"];
+
+/** Reading a process's environ file is a dump regardless of the reader. */
+const PROC_ENVIRON_RE = /\/proc\/(?:self|\d+)\/environ/;
 
 /**
- * Reads the argument to `sh -c`, quoted or bare.
+ * Shells whose `-c` argument is a *command string* rather than an operand.
  *
- * A bare argument is the first whitespace-delimited token, which is what the
- * shell itself does: in `sh -c env ls`, `env` is the command and `ls` becomes
- * `$0`. Taking only the first token is accurate, not a shortcut.
+ * This is the one wrapper class that must be recursed rather than scanned:
+ * in `sh -c env ls`, `env` is the command and `ls` is merely `$0`, so a flat
+ * scan would read `ls` as `env`'s operand and allow a full dump. Non-shell
+ * wrappers (`eval`, `xargs`, `nohup`, `timeout`, `su -c`, `watch`, …) need no
+ * enumeration: their payload stays a normal word and the flat scan below
+ * already catches it.
  */
-function readShellCommandArgument(input: string): string {
-  const rest = input.trimStart();
-  if (!rest) return "";
-  const quote = rest[0];
-  if (quote === "'" || quote === '"') {
-    let out = "";
-    for (let i = 1; i < rest.length; i += 1) {
-      const ch = rest[i];
-      if (ch === quote) return out;
-      if (quote === '"' && ch === "\\" && i + 1 < rest.length) {
-        i += 1;
-        out += rest[i] ?? "";
-      } else {
-        out += ch;
-      }
-    }
-    return out;
-  }
-  return /^[^\s]+/.exec(rest)?.[0] ?? "";
+const SHELL_BASENAMES = ["sh", "bash", "zsh", "ksh", "dash", "ash", "busybox"];
+
+type LexedCommand = string[];
+
+interface LexResult {
+  /** Simple commands, as quote-removed word lists, split on shell operators. */
+  commands: LexedCommand[];
+  /** Command strings needing their own pass: substitution bodies and quoted payloads. */
+  nested: string[];
+}
+
+function basename(word: string): string {
+  const cut = word.lastIndexOf("/");
+  return cut === -1 ? word : word.slice(cut + 1);
 }
 
 /**
- * Characters that end one command and begin another, for the purposes of the
- * dump detector.
- *
- * `\r` / `\n` are separators for the same reason `;` is: in a multi-line command
- * string each line is its own command, so `echo ok\nenv` is a dump.
- *
- * `(` / `)` / a backtick (`\x60`, spelled as an escape because this file embeds
- * the same pattern inside a backtick-delimited `String.raw` template below) make
- * command *substitution* a boundary as well. Without them `echo "$(env)"`,
- * `X=$(printenv)` and `` `env` `` all reached the detector with `(` sitting
- * where a boundary was required, matched nothing, and returned `allow` — a full
- * dump straight into the transcript, which is the exact leak this guard exists
- * to stop.
- *
- * Like `;`, this is deliberately parser-free and errs toward blocking — a bare
- * `env` line inside a quoted string or heredoc also matches, exactly as
- * `echo "a; env"` already did. The safe helper remains the unblocked path.
+ * Lex a command string the way a shell does, to the depth that affects which
+ * token is executed. Performs quote removal and escape processing, splits on
+ * command operators, and discards redirections together with their targets.
  */
-const CMD_BOUNDARY = String.raw`;&|()\x60\r\n`;
+function lexShell(input: string): LexResult {
+  const commands: LexedCommand[] = [];
+  const nested: string[] = [];
+  let words: string[] = [];
+  let cur: string | null = null;
+  let curQuoted = false;
+  let i = 0;
+  const n = input.length;
 
-/**
- * Where a *new command word* may begin, for the leading side of the detector
- * only.
- *
- * `CMD_BOUNDARY` covers shell punctuation, but a dump is equally reachable as a
- * bare argument to a command-introducing wrapper, separated by nothing but a
- * space: `sh -c env`, `bash -c printenv`, `eval env`, `xargs env`,
- * `nohup env`, `timeout 5 env`, `su -c env`. Shell unwrapping only ever handles
- * a `sh -c` prefix (and, before `993bf304c`'s shape was adopted below, only a
- * *quoted* payload), so these reached the detector with a
- * space sitting where a boundary was required, matched nothing, and returned
- * `allow` — a full dump, which is the exact leak this guard exists to stop.
- * Measured before this change: 9 of 9 such payloads were allowed by the real
- * spawned pod script.
- *
- * Rather than enumerate wrapper utilities (an open-ended list — `nice`,
- * `stdbuf`, `setsid`, `flock`, `chroot`, `script -c`, … all qualify), treat
- * whitespace itself as a possible command start. This closes the whole class in
- * one rule instead of chasing each wrapper.
- *
- * Whitespace is deliberately NOT added to the *trailing* terminator, which stays
- * `CMD_BOUNDARY`: the trailing side is what distinguishes a dump from a command
- * that merely takes an operand, and `env NAME=value cmd` / `printenv HOME` /
- * `env -- ls` must stay allowed. Keeping the two classes distinct is what lets
- * `grep env file` through while blocking `sh -c env`.
- *
- * Residual over-block, accepted in the safe direction: operand-less mentions
- * such as `echo env`, `grep env` (reading stdin) and `command -v env` now block.
- * They are rare, harmless to block, and consistent with this file's existing
- * stance that a bare `env` inside a quoted string or heredoc also matches.
- */
-const CMD_START = String.raw`${CMD_BOUNDARY} \t`;
+  const add = (s: string): void => {
+    cur = (cur === null ? "" : cur) + s;
+  };
+  const endWord = (): void => {
+    if (cur === null) return;
+    // A quoted payload containing a command SEPARATOR may itself be a command
+    // string (`eval "echo ok; env"`); re-analyse it rather than treating it as
+    // one opaque word. Deliberately keyed on separators and not on whitespace:
+    // recursing on whitespace alone would block ordinary prose arguments such
+    // as `git commit -m 'fix env'`, and a shell wrapper's `-c` payload is
+    // already recursed explicitly by `shellPayloadIndex` below.
+    if (curQuoted && /[;&|()\r\n]/.test(cur)) nested.push(cur);
+    words.push(cur);
+    cur = null;
+    curQuoted = false;
+  };
+  const endCommand = (): void => {
+    endWord();
+    if (words.length) commands.push(words);
+    words = [];
+  };
 
-/**
- * Option tokens that may follow `env` / `printenv` while the command is still a
- * full dump.
- *
- * `env` and `printenv` only stop dumping once given an *operand* — a command to
- * run (`env FOO=1 node x.js`) or a single variable to print (`printenv HOME`).
- * Flags alone do not: `env -0` / `printenv --null` dump the whole environment
- * NUL-separated, and `env -u PATH` dumps everything bar one variable. Requiring
- * a boundary immediately after the utility name therefore let every flag form
- * through. So: consume a run of option tokens, and treat the command as a dump
- * only if nothing but options separates the utility from the next boundary.
- *
- * `-u` / `--unset` are matched with their argument so that the NAME they consume
- * is not mistaken for an operand — otherwise `env -u PATH` would read as
- * "runs the command PATH" and be allowed.
- */
-const ENV_DUMP_OPTION_RUN = String.raw`(?:[ \t]+(?:(?:-u|--unset)[ \t]+[^\s;&|()<>]+|-[^\s;&|()<>]*))*`;
+  /** Reads `$(...)`, a backtick pair, `${...}` or `$NAME`, recording bodies to re-analyse. */
+  const readExpansion = (start: number): number => {
+    if (input[start] === BACKTICK) {
+      let j = start + 1;
+      let body = "";
+      while (j < n && input[j] !== BACKTICK) {
+        if (input[j] === "\\" && j + 1 < n) {
+          body += input[j + 1];
+          j += 2;
+          continue;
+        }
+        body += input[j];
+        j += 1;
+      }
+      nested.push(body);
+      if (cur === null) cur = "";
+      return j + 1;
+    }
+    if (input[start + 1] === "(") {
+      let depth = 0;
+      let j = start + 1;
+      let body = "";
+      for (; j < n; j += 1) {
+        const c = input[j];
+        if (c === "(") {
+          depth += 1;
+          if (depth === 1) continue;
+        } else if (c === ")") {
+          depth -= 1;
+          if (depth === 0) {
+            j += 1;
+            break;
+          }
+        }
+        if (depth >= 1) body += c;
+      }
+      nested.push(body);
+      if (cur === null) cur = "";
+      return j;
+    }
+    if (input[start + 1] === "{") {
+      let j = start + 2;
+      while (j < n && input[j] !== "}") j += 1;
+      if (cur === null) cur = "";
+      return j + 1;
+    }
+    let j = start + 1;
+    while (j < n && /[A-Za-z0-9_]/.test(input[j] as string)) j += 1;
+    if (cur === null) cur = "";
+    return j === start + 1 ? start + 1 : j;
+  };
 
-const FULL_ENV_DUMP_RE = new RegExp(
-  [
-    String.raw`(?:^|[${CMD_START}]\s*)(?:command\s+)?(?:\/usr\/bin\/)?(?:env|printenv)${ENV_DUMP_OPTION_RUN}(?:\s*(?:[${CMD_BOUNDARY}]|$))`,
-    String.raw`(?:^|[${CMD_START}]\s*)(?:set)(?:\s*(?:[${CMD_BOUNDARY}]|$))`,
-    String.raw`(?:^|[${CMD_START}]\s*)export\s+-p(?:\s*(?:[${CMD_BOUNDARY}]|$))`,
-    String.raw`(?:^|[${CMD_START}]\s*)declare\s+-x(?:\s*(?:[${CMD_BOUNDARY}]|$))`,
-    String.raw`(?:^|[${CMD_START}]\s*)cat\s+\/proc\/(?:self|\d+)\/environ(?:\s*(?:[${CMD_BOUNDARY}]|$))`,
-    String.raw`\/proc\/(?:self|\d+)\/environ`,
-  ].join("|"),
-  "i",
-);
+  /** Discards a redirection operator and its target, as the shell does before exec. */
+  const readRedirection = (start: number): number => {
+    let j = start;
+    while (j < n && (input[j] === "<" || input[j] === ">" || input[j] === "&")) j += 1;
+    while (j < n && (input[j] === " " || input[j] === "\t")) j += 1;
+    // Discard the target word (quoted or bare).
+    if (j < n && (input[j] === "'" || input[j] === '"')) {
+      const q = input[j];
+      j += 1;
+      while (j < n && input[j] !== q) j += 1;
+      return j + 1;
+    }
+    while (j < n && !/[\s;&|()<>]/.test(input[j] as string)) j += 1;
+    return j;
+  };
 
-function unwrapShell(command: string): string {
-  let current = command.trim();
-  for (let i = 0; i < 3; i += 1) {
-    const match = SHELL_COMMAND_PREFIX_RE.exec(current);
-    if (!match) return current;
-    current = readShellCommandArgument(current.slice(match[0].length));
+  while (i < n) {
+    const ch = input[i] as string;
+
+    if (ch === " " || ch === "\t") {
+      endWord();
+      i += 1;
+      continue;
+    }
+    if (ch === "\n" || ch === "\r") {
+      endCommand();
+      i += 1;
+      continue;
+    }
+    if (ch === "\\") {
+      if (i + 1 < n) {
+        if (input[i + 1] === "\n") {
+          i += 2;
+          continue;
+        }
+        // Escape removal: `\env` is the word `env`.
+        add(input[i + 1] as string);
+        i += 2;
+        continue;
+      }
+      i += 1;
+      continue;
+    }
+    if (ch === "'") {
+      if (cur === null) cur = "";
+      curQuoted = true;
+      i += 1;
+      while (i < n && input[i] !== "'") {
+        add(input[i] as string);
+        i += 1;
+      }
+      i += 1;
+      continue;
+    }
+    if (ch === '"') {
+      if (cur === null) cur = "";
+      curQuoted = true;
+      i += 1;
+      while (i < n && input[i] !== '"') {
+        const c = input[i] as string;
+        if (c === "\\" && i + 1 < n) {
+          const nx = input[i + 1] as string;
+          if (nx === '"' || nx === "\\" || nx === "$" || nx === BACKTICK) {
+            add(nx);
+            i += 2;
+            continue;
+          }
+          add(c);
+          i += 1;
+          continue;
+        }
+        if (c === "$" || c === BACKTICK) {
+          i = readExpansion(i);
+          continue;
+        }
+        add(c);
+        i += 1;
+      }
+      i += 1;
+      continue;
+    }
+    if (ch === "$" || ch === BACKTICK) {
+      i = readExpansion(i);
+      continue;
+    }
+    if (ch === "<" || ch === ">") {
+      // A bare leading file-descriptor number belongs to the redirection.
+      if (cur !== null && /^\d+$/.test(cur)) {
+        cur = null;
+        curQuoted = false;
+      } else {
+        endWord();
+      }
+      i = readRedirection(i);
+      continue;
+    }
+    if (ch === "&") {
+      if (input[i + 1] === ">") {
+        endWord();
+        i = readRedirection(i);
+        continue;
+      }
+      endCommand();
+      i += input[i + 1] === "&" ? 2 : 1;
+      continue;
+    }
+    if (ch === "|") {
+      endCommand();
+      i += input[i + 1] === "|" ? 2 : 1;
+      continue;
+    }
+    if (ch === ";" || ch === "(" || ch === ")") {
+      endCommand();
+      i += 1;
+      continue;
+    }
+    add(ch);
+    i += 1;
   }
-  return current;
+  endCommand();
+  return { commands, nested };
+}
+
+/**
+ * True when the argument list contains a real *operand* — a command to run or
+ * a variable name to print — which is what stops `env`/`printenv` dumping.
+ *
+ * Flags alone never stop the dump: `-0`/`--null` dump NUL-separated and
+ * `-u NAME` dumps everything but one variable. GNU `env -S STRING` re-splits
+ * STRING into further arguments, so its payload is expanded here rather than
+ * counted as an operand — that is what makes `env -S '-u PATH'` a dump.
+ */
+function hasOperand(args: string[]): boolean {
+  const queue = args.slice();
+  let guard = 0;
+  while (queue.length > 0 && guard < 256) {
+    guard += 1;
+    const a = queue.shift() as string;
+    if (a === "--") return queue.length > 0;
+    if (a === "-u" || a === "--unset") {
+      queue.shift();
+      continue;
+    }
+    if (a.indexOf("--unset=") === 0) continue;
+    if (a === "-S" || a === "--split-string") {
+      const payload = queue.shift();
+      if (payload != null) queue.unshift(...payload.split(/[ \t]+/).filter(Boolean));
+      continue;
+    }
+    if (a.indexOf("--split-string=") === 0) {
+      queue.unshift(...a.slice("--split-string=".length).split(/[ \t]+/).filter(Boolean));
+      continue;
+    }
+    if (a.length > 1 && a[0] === "-" && a[1] !== "-") {
+      // Bundled short flags; GNU env allows `S` inside the bundle (`-vS '…'`).
+      const sAt = a.indexOf("S");
+      if (sAt !== -1) {
+        const inline = a.slice(sAt + 1);
+        if (inline) {
+          queue.unshift(...inline.split(/[ \t]+/).filter(Boolean));
+        } else {
+          const payload = queue.shift();
+          if (payload != null) queue.unshift(...payload.split(/[ \t]+/).filter(Boolean));
+        }
+      }
+      continue;
+    }
+    if (a.indexOf("--") === 0) continue;
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(a)) continue;
+    return true;
+  }
+  return false;
+}
+
+/** Classifies one simple command (already quote-removed and redirection-stripped). */
+function simpleCommandDumps(words: string[]): boolean {
+  if (words.length === 0) return false;
+  for (const w of words) if (PROC_ENVIRON_RE.test(w)) return true;
+
+  for (let i = 0; i < words.length; i += 1) {
+    const base = basename(words[i] as string);
+    const rest = words.slice(i + 1);
+    if (ENV_DUMP_UTILS.indexOf(base) !== -1) {
+      if (!hasOperand(rest)) return true;
+      continue;
+    }
+    if (base === "set") {
+      // Bare `set` prints every shell variable, exported secrets included.
+      if (rest.length === 0) return true;
+      continue;
+    }
+    if (base === "export" && rest.indexOf("-p") !== -1) return true;
+    if (base === "declare" && rest.indexOf("-x") !== -1) return true;
+  }
+  return false;
+}
+
+/** Index of a shell wrapper's `-c` payload word, or -1. */
+function shellPayloadIndex(words: string[]): number {
+  for (let i = 0; i < words.length; i += 1) {
+    if (SHELL_BASENAMES.indexOf(basename(words[i] as string)) === -1) continue;
+    for (let j = i + 1; j < words.length; j += 1) {
+      const w = words[j] as string;
+      if (/^-[a-z]*c$/.test(w)) return j + 1 < words.length ? j + 1 : -1;
+      if (w[0] !== "-") break;
+    }
+  }
+  return -1;
+}
+
+function containsDump(command: string, depth: number): boolean {
+  if (depth > 4) return false;
+  const { commands, nested } = lexShell(command);
+  for (const words of commands) {
+    const payload = shellPayloadIndex(words);
+    if (payload !== -1) {
+      // Everything after a shell's `-c` payload is `$0`/`$1`, not an operand.
+      if (containsDump(words[payload] as string, depth + 1)) return true;
+      if (simpleCommandDumps(words.slice(0, payload))) return true;
+      continue;
+    }
+    if (simpleCommandDumps(words)) return true;
+  }
+  for (const body of nested) {
+    if (body.trim() && containsDump(body, depth + 1)) return true;
+  }
+  return false;
 }
 
 /**
@@ -194,10 +444,10 @@ function unwrapShell(command: string): string {
  * for the allowlisted names-only helper or any non-dump command.
  */
 export function classifyAgentShellCommand(command: string): AgentShellCommandDecision {
-  const normalized = unwrapShell(command).trim();
+  const normalized = command.trim();
   if (!normalized) return { action: "allow", reason: "not_environment_dump" };
   if (SAFE_ENV_INSPECTION_RE.test(normalized)) return { action: "allow", reason: "safe_env_inspection" };
-  if (FULL_ENV_DUMP_RE.test(normalized)) return { action: "block", reason: "full_environment_dump" };
+  if (containsDump(normalized, 0)) return { action: "block", reason: "full_environment_dump" };
   return { action: "allow", reason: "not_environment_dump" };
 }
 
@@ -219,43 +469,243 @@ export const ENV_GUARD_SCRIPT = String.raw`#!/usr/bin/env node
 // paperclip-adapter-claude-k8s; do not edit in the pod.
 const SAFE_ENV_INSPECTION_RE =
   /^(?:node[ \t]+)?(?:[^\s;&|()<>]*\/)?(?:safe-env-inspect(?:\.mjs)?|paperclip-safe-env)(?:[ \t]+[^;&|()<>$\x60\r\n]*)?$/;
-const SHELL_COMMAND_PREFIX_RE = /^(?:\/bin\/)?(?:ba|z|)?sh\s+-l?c(?:\s+|$)/;
-function readShellCommandArgument(input) {
-  const rest = String(input || "").replace(/^\s+/, "");
-  if (!rest) return "";
-  const quote = rest[0];
-  if (quote === "'" || quote === '"') {
-    let out = "";
-    for (let i = 1; i < rest.length; i += 1) {
-      const ch = rest[i];
-      if (ch === quote) return out;
-      if (quote === '"' && ch === "\\" && i + 1 < rest.length) {
-        i += 1;
-        out += rest[i] != null ? rest[i] : "";
-      } else {
-        out += ch;
-      }
-    }
-    return out;
-  }
-  const m = /^[^\s]+/.exec(rest);
-  return m ? m[0] : "";
+// Shell-aware normalizer. Behaviourally identical to classifyAgentShellCommand
+// in env-guard.ts; env-guard.test.ts runs the SAME corpus through both, so any
+// drift between the two copies fails the suite. A regex over command TEXT
+// cannot be correct here: the shell executes the command after quote removal,
+// escape processing, redirection stripping and GNU "env -S" re-splitting, so
+// the text matched is not the token that runs. Lex first, then classify.
+const BACKTICK = "\x60";
+const ENV_DUMP_UTILS = ["env", "printenv"];
+const PROC_ENVIRON_RE = /\/proc\/(?:self|\d+)\/environ/;
+const SHELL_BASENAMES = ["sh", "bash", "zsh", "ksh", "dash", "ash", "busybox"];
+function basename(word) {
+  const cut = word.lastIndexOf("/");
+  return cut === -1 ? word : word.slice(cut + 1);
 }
-const FULL_ENV_DUMP_RE = /(?:^|[;&|()\x60\r\n \t]\s*)(?:command\s+)?(?:\/usr\/bin\/)?(?:env|printenv)(?:[ \t]+(?:(?:-u|--unset)[ \t]+[^\s;&|()<>]+|-[^\s;&|()<>]*))*(?:\s*(?:[;&|()\x60\r\n]|$))|(?:^|[;&|()\x60\r\n \t]\s*)(?:set)(?:\s*(?:[;&|()\x60\r\n]|$))|(?:^|[;&|()\x60\r\n \t]\s*)export\s+-p(?:\s*(?:[;&|()\x60\r\n]|$))|(?:^|[;&|()\x60\r\n \t]\s*)declare\s+-x(?:\s*(?:[;&|()\x60\r\n]|$))|(?:^|[;&|()\x60\r\n \t]\s*)cat\s+\/proc\/(?:self|\d+)\/environ(?:\s*(?:[;&|()\x60\r\n]|$))|\/proc\/(?:self|\d+)\/environ/i;
-function unwrapShell(command) {
-  let current = String(command || "").trim();
-  for (let i = 0; i < 3; i += 1) {
-    const match = SHELL_COMMAND_PREFIX_RE.exec(current);
-    if (!match) return current;
-    current = readShellCommandArgument(current.slice(match[0].length));
+function lexShell(input) {
+  const commands = [];
+  const nested = [];
+  let words = [];
+  let cur = null;
+  let curQuoted = false;
+  let i = 0;
+  const n = input.length;
+  const add = (s) => { cur = (cur === null ? "" : cur) + s; };
+  const endWord = () => {
+    if (cur === null) return;
+    if (curQuoted && /[;&|()\r\n]/.test(cur)) nested.push(cur);
+    words.push(cur);
+    cur = null;
+    curQuoted = false;
+  };
+  const endCommand = () => {
+    endWord();
+    if (words.length) commands.push(words);
+    words = [];
+  };
+  const readExpansion = (start) => {
+    if (input[start] === BACKTICK) {
+      let j = start + 1;
+      let body = "";
+      while (j < n && input[j] !== BACKTICK) {
+        if (input[j] === "\\" && j + 1 < n) { body += input[j + 1]; j += 2; continue; }
+        body += input[j];
+        j += 1;
+      }
+      nested.push(body);
+      if (cur === null) cur = "";
+      return j + 1;
+    }
+    if (input[start + 1] === "(") {
+      let depth = 0;
+      let j = start + 1;
+      let body = "";
+      for (; j < n; j += 1) {
+        const c = input[j];
+        if (c === "(") { depth += 1; if (depth === 1) continue; }
+        else if (c === ")") { depth -= 1; if (depth === 0) { j += 1; break; } }
+        if (depth >= 1) body += c;
+      }
+      nested.push(body);
+      if (cur === null) cur = "";
+      return j;
+    }
+    if (input[start + 1] === "{") {
+      let j = start + 2;
+      while (j < n && input[j] !== "}") j += 1;
+      if (cur === null) cur = "";
+      return j + 1;
+    }
+    let j = start + 1;
+    while (j < n && /[A-Za-z0-9_]/.test(input[j])) j += 1;
+    if (cur === null) cur = "";
+    return j === start + 1 ? start + 1 : j;
+  };
+  const readRedirection = (start) => {
+    let j = start;
+    while (j < n && (input[j] === "<" || input[j] === ">" || input[j] === "&")) j += 1;
+    while (j < n && (input[j] === " " || input[j] === "\t")) j += 1;
+    if (j < n && (input[j] === "'" || input[j] === '"')) {
+      const q = input[j];
+      j += 1;
+      while (j < n && input[j] !== q) j += 1;
+      return j + 1;
+    }
+    while (j < n && !/[\s;&|()<>]/.test(input[j])) j += 1;
+    return j;
+  };
+  while (i < n) {
+    const ch = input[i];
+    if (ch === " " || ch === "\t") { endWord(); i += 1; continue; }
+    if (ch === "\n" || ch === "\r") { endCommand(); i += 1; continue; }
+    if (ch === "\\") {
+      if (i + 1 < n) {
+        if (input[i + 1] === "\n") { i += 2; continue; }
+        add(input[i + 1]);
+        i += 2;
+        continue;
+      }
+      i += 1;
+      continue;
+    }
+    if (ch === "'") {
+      if (cur === null) cur = "";
+      curQuoted = true;
+      i += 1;
+      while (i < n && input[i] !== "'") { add(input[i]); i += 1; }
+      i += 1;
+      continue;
+    }
+    if (ch === '"') {
+      if (cur === null) cur = "";
+      curQuoted = true;
+      i += 1;
+      while (i < n && input[i] !== '"') {
+        const c = input[i];
+        if (c === "\\" && i + 1 < n) {
+          const nx = input[i + 1];
+          if (nx === '"' || nx === "\\" || nx === "$" || nx === BACKTICK) { add(nx); i += 2; continue; }
+          add(c);
+          i += 1;
+          continue;
+        }
+        if (c === "$" || c === BACKTICK) { i = readExpansion(i); continue; }
+        add(c);
+        i += 1;
+      }
+      i += 1;
+      continue;
+    }
+    if (ch === "$" || ch === BACKTICK) { i = readExpansion(i); continue; }
+    if (ch === "<" || ch === ">") {
+      if (cur !== null && /^\d+$/.test(cur)) { cur = null; curQuoted = false; }
+      else endWord();
+      i = readRedirection(i);
+      continue;
+    }
+    if (ch === "&") {
+      if (input[i + 1] === ">") { endWord(); i = readRedirection(i); continue; }
+      endCommand();
+      i += input[i + 1] === "&" ? 2 : 1;
+      continue;
+    }
+    if (ch === "|") { endCommand(); i += input[i + 1] === "|" ? 2 : 1; continue; }
+    if (ch === ";" || ch === "(" || ch === ")") { endCommand(); i += 1; continue; }
+    add(ch);
+    i += 1;
   }
-  return current;
+  endCommand();
+  return { commands: commands, nested: nested };
+}
+function hasOperand(args) {
+  const queue = args.slice();
+  let guard = 0;
+  while (queue.length > 0 && guard < 256) {
+    guard += 1;
+    const a = queue.shift();
+    if (a === "--") return queue.length > 0;
+    if (a === "-u" || a === "--unset") { queue.shift(); continue; }
+    if (a.indexOf("--unset=") === 0) continue;
+    if (a === "-S" || a === "--split-string") {
+      const payload = queue.shift();
+      if (payload != null) queue.unshift(...payload.split(/[ \t]+/).filter(Boolean));
+      continue;
+    }
+    if (a.indexOf("--split-string=") === 0) {
+      queue.unshift(...a.slice("--split-string=".length).split(/[ \t]+/).filter(Boolean));
+      continue;
+    }
+    if (a.length > 1 && a[0] === "-" && a[1] !== "-") {
+      const sAt = a.indexOf("S");
+      if (sAt !== -1) {
+        const inline = a.slice(sAt + 1);
+        if (inline) queue.unshift(...inline.split(/[ \t]+/).filter(Boolean));
+        else {
+          const payload = queue.shift();
+          if (payload != null) queue.unshift(...payload.split(/[ \t]+/).filter(Boolean));
+        }
+      }
+      continue;
+    }
+    if (a.indexOf("--") === 0) continue;
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(a)) continue;
+    return true;
+  }
+  return false;
+}
+function simpleCommandDumps(words) {
+  if (words.length === 0) return false;
+  for (const w of words) if (PROC_ENVIRON_RE.test(w)) return true;
+  for (let i = 0; i < words.length; i += 1) {
+    const base = basename(words[i]);
+    const rest = words.slice(i + 1);
+    if (ENV_DUMP_UTILS.indexOf(base) !== -1) {
+      if (!hasOperand(rest)) return true;
+      continue;
+    }
+    if (base === "set") {
+      if (rest.length === 0) return true;
+      continue;
+    }
+    if (base === "export" && rest.indexOf("-p") !== -1) return true;
+    if (base === "declare" && rest.indexOf("-x") !== -1) return true;
+  }
+  return false;
+}
+function shellPayloadIndex(words) {
+  for (let i = 0; i < words.length; i += 1) {
+    if (SHELL_BASENAMES.indexOf(basename(words[i])) === -1) continue;
+    for (let j = i + 1; j < words.length; j += 1) {
+      const w = words[j];
+      if (/^-[a-z]*c$/.test(w)) return j + 1 < words.length ? j + 1 : -1;
+      if (w[0] !== "-") break;
+    }
+  }
+  return -1;
+}
+function containsDump(command, depth) {
+  if (depth > 4) return false;
+  const lexed = lexShell(command);
+  for (const words of lexed.commands) {
+    const payload = shellPayloadIndex(words);
+    if (payload !== -1) {
+      if (containsDump(words[payload], depth + 1)) return true;
+      if (simpleCommandDumps(words.slice(0, payload))) return true;
+      continue;
+    }
+    if (simpleCommandDumps(words)) return true;
+  }
+  for (const body of lexed.nested) {
+    if (body.trim() && containsDump(body, depth + 1)) return true;
+  }
+  return false;
 }
 function isFullEnvDump(command) {
-  const normalized = unwrapShell(command).trim();
+  const normalized = String(command || "").trim();
   if (!normalized) return false;
   if (SAFE_ENV_INSPECTION_RE.test(normalized)) return false;
-  return FULL_ENV_DUMP_RE.test(normalized);
+  return containsDump(normalized, 0);
 }
 let raw = "";
 process.stdin.on("data", (d) => { raw += d; });

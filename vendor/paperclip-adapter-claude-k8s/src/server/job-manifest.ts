@@ -986,6 +986,32 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const dataClaimName = envWorkspaceClaim || selfPod.pvcClaimName || "";
   const dataMountPath = envWorkspaceMountPath || "/paperclip";
   if (envWorkspaceMountPath) assertSafeAbsolutePath("config.workspaceMountPath", envWorkspaceMountPath);
+  // Kubernetes rejects a Pod outright when one container declares two
+  // volumeMounts at the same `mountPath`, so an operator-supplied
+  // `workspaceMountPath` that happens to equal a path this builder already
+  // emits (`/tmp/prompt`, `/runtime-cache`, or an inherited secret mount) does
+  // not "win" — it produces a manifest that never admits, and the operator sees
+  // an opaque API rejection rather than the config mistake that caused it.
+  // `assertSafeAbsolutePath` above does not catch this: it validates the shape
+  // of the path, not whether the path is already taken.
+  //
+  // Fail closed at construction with a message that names the conflict. Only
+  // EXACT duplicates are a conflict — nesting (`/paperclip` alongside
+  // `/paperclip/cache`) is legal and stays allowed.
+  const normalizeMountPath = (value: string): string =>
+    value.length > 1 ? value.replace(/\/+$/, "") : value;
+  const claimedMountPaths = new Map<string, string>();
+  for (const mount of volumeMounts) {
+    claimedMountPaths.set(normalizeMountPath(mount.mountPath), mount.name);
+  }
+  const normalizedDataMountPath = normalizeMountPath(dataMountPath);
+  const reservedCollision = claimedMountPaths.get(normalizedDataMountPath);
+  if (reservedCollision) {
+    throw new Error(
+      `config.workspaceMountPath must not collide with the reserved "${reservedCollision}" mount at ${normalizedDataMountPath}`,
+    );
+  }
+  claimedMountPaths.set(normalizedDataMountPath, "data");
   // The `data` volume is ALWAYS declared — PVC-backed when a claim is
   // configured, `emptyDir` otherwise.
   //
@@ -1017,7 +1043,22 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   });
 
   // Mount secret volumes inherited from the Deployment pod
+  //
+  // These are platform state, not operator config: the running Deployment is
+  // already using them, so a collision here must not wedge every run. An
+  // inherited mount that duplicates a path already claimed above is therefore
+  // SKIPPED rather than thrown on — except when it collides with the
+  // operator-chosen workspace mount, which is a config mistake the operator can
+  // actually fix and so is surfaced instead of silently dropping a secret.
   for (const sv of selfPod.secretVolumes) {
+    const normalized = normalizeMountPath(sv.mountPath);
+    if (normalized === normalizedDataMountPath) {
+      throw new Error(
+        `config.workspaceMountPath must not collide with inherited secret mount "${sv.volumeName}" at ${normalized}`,
+      );
+    }
+    if (claimedMountPaths.has(normalized)) continue;
+    claimedMountPaths.set(normalized, sv.volumeName);
     volumes.push({
       name: sv.volumeName,
       secret: { secretName: sv.secretName, defaultMode: sv.defaultMode, optional: true },
@@ -1081,9 +1122,9 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // When the environment driver supplies a per-env Anthropic account pool
   // (effectiveConfig.providers.anthropic.accounts, plumbed through
   // mergeEnvironmentConfig from executionTarget.config), constrain ccrotate's
-  // rotation to just that pool via `--accounts a@b.net,c@d.net`. Absent or
-  // empty pool → the appended segment is the empty string and the command
-  // stays bit-for-bit identical to the global-rotation behavior.
+  // rotation to just that pool via `--accounts a@b.net,c@d.net`. An absent pool
+  // → the appended segment is the empty string and the command stays
+  // bit-for-bit identical to the global-rotation behavior.
   //
   // The pool is operator-supplied config, and it lands in a string that the main
   // container runs through `sh -c`. Interpolating it raw made it a command
@@ -1106,23 +1147,65 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   //   - no `accounts` key at all      → global rotation (the documented default)
   //   - a configured pool, some valid → use the valid entries
   //   - a configured pool, none valid → skip rotation entirely, and say so
+  //
+  // PRESENCE IS TESTED SEPARATELY FROM VALIDITY, and that distinction is the
+  // whole fix. Collapsing "malformed" into "absent" with a single
+  // `Array.isArray(...) ? ... : null` reintroduced exactly the fail-open this
+  // block exists to prevent: `accounts: "a@example.test"` (a bare string rather
+  // than a list — the likeliest possible typo) is not an array, became `null`,
+  // read as "no pool configured", and selected unrestricted global rotation.
+  // `parseObject` returns `{}` for any non-object, so `providers.anthropic`
+  // itself has the same failure mode one level up and is checked the same way.
+  //
+  // An explicitly empty pool (`accounts: []`) is also treated as configured but
+  // unusable. It is a deliberate statement that no account is eligible, so
+  // widening it to every account on the box is the same fail-open in miniature.
+  //
+  // Diagnostics report the offending TYPE only, never the value: this config is
+  // adjacent to credential material and the message lands in the pod log.
   const quoteShellArg = (value: string) => `'${value.replace(/'/g, "'\\''")}'`;
   const ACCOUNT_ID_RE = /^[A-Za-z0-9._%+-]+(?:@[A-Za-z0-9.-]+)?$/;
+  const isConfigured = (value: unknown): boolean => value !== undefined && value !== null;
+  const isPlainObject = (value: unknown): boolean =>
+    typeof value === "object" && value !== null && !Array.isArray(value);
+  const describeType = (value: unknown): string => (Array.isArray(value) ? "array" : typeof value);
+
   const providersConfig = parseObject(config.providers);
-  const anthropicConfig = parseObject(providersConfig.anthropic);
-  const rawAnthropicAccounts = Array.isArray(anthropicConfig.accounts)
-    ? (anthropicConfig.accounts as ReadonlyArray<unknown>)
-    : null;
-  const anthropicAccounts = (rawAnthropicAccounts ?? []).filter(
+  const rawAnthropic = providersConfig.anthropic;
+  const anthropicConfig = parseObject(rawAnthropic);
+  const rawAnthropicAccounts = anthropicConfig.accounts;
+
+  // A configured value that this builder cannot interpret. Fail closed.
+  const malformedPoolReason = !isConfigured(rawAnthropic)
+    ? null
+    : !isPlainObject(rawAnthropic)
+      ? `providers.anthropic must be an object, got ${describeType(rawAnthropic)}`
+      : !isConfigured(rawAnthropicAccounts)
+        ? null
+        : !Array.isArray(rawAnthropicAccounts)
+          ? `providers.anthropic.accounts must be an array, got ${describeType(rawAnthropicAccounts)}`
+          : null;
+
+  const configuredAccounts: ReadonlyArray<unknown> = Array.isArray(rawAnthropicAccounts)
+    ? rawAnthropicAccounts
+    : [];
+  const anthropicAccounts = configuredAccounts.filter(
     (s): s is string => typeof s === "string" && s.length > 0 && ACCOUNT_ID_RE.test(s),
   );
-  // A non-empty pool was configured but nothing in it survived validation.
+  // A pool was configured but nothing in it is usable — malformed shape, an
+  // explicitly empty list, or entries that all failed validation.
   const accountPoolConfiguredButUnusable =
-    rawAnthropicAccounts !== null && rawAnthropicAccounts.length > 0 && anthropicAccounts.length === 0;
+    malformedPoolReason !== null ||
+    (Array.isArray(rawAnthropicAccounts) && anthropicAccounts.length === 0);
+  const unusablePoolReason =
+    malformedPoolReason ??
+    (configuredAccounts.length === 0
+      ? "providers.anthropic.accounts is an empty list, so no account is eligible"
+      : "no entry in providers.anthropic.accounts is a valid account identifier");
   const accountsArg =
     anthropicAccounts.length > 0 ? ` --accounts ${quoteShellArg(anthropicAccounts.join(","))}` : "";
   const ccrotateRefresh = accountPoolConfiguredButUnusable
-    ? `echo "[paperclip] providers.anthropic.accounts was configured but no entry is a valid account identifier; skipping ccrotate rather than falling back to global rotation" >&2`
+    ? `echo "[paperclip] ${unusablePoolReason}; skipping ccrotate rather than falling back to global rotation" >&2`
     : `(command -v ccrotate >/dev/null 2>&1 && ccrotate next --yes --target claude${accountsArg} >/dev/null 2>&1) || true`;
   // RCA 2026-05-06: terminal rate-limit fail-fast. Before this, a
   // `rate_limit_event` with `overageStatus:"rejected"` +
@@ -1306,6 +1389,32 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
       limits: { cpu: "100m", memory: "64Mi" },
     },
   };
+
+  // Backstop for the duplicate-mountPath rule, asserted once both lists are
+  // final. The targeted check on `config.workspaceMountPath` above gives the
+  // better error message and catches the operator-reachable case, but it runs
+  // before `docker-sock` (/var/run), `prompt-secret` and `mcp-config-secret` are
+  // appended — and the init container keeps a SECOND, independently-built list.
+  // Kubernetes rejects the whole Pod for a duplicate path in *any* container, so
+  // assert the invariant per container rather than trusting each append site to
+  // remember it. This is the same "assert the invariant, don't duplicate the
+  // condition" shape already used for volume/mount correspondence.
+  for (const [containerName, mounts] of [
+    ["write-prompt (init)", initVolumeMounts],
+    ["claude (main)", volumeMounts],
+  ] as ReadonlyArray<readonly [string, ReadonlyArray<k8s.V1VolumeMount>]>) {
+    const seen = new Map<string, string>();
+    for (const mount of mounts) {
+      const normalized = normalizeMountPath(mount.mountPath);
+      const previous = seen.get(normalized);
+      if (previous !== undefined) {
+        throw new Error(
+          `container ${containerName} would declare duplicate volumeMounts at ${normalized} (volumes "${previous}" and "${mount.name}"); Kubernetes rejects such a Pod`,
+        );
+      }
+      seen.set(normalized, mount.name);
+    }
+  }
 
   const job: k8s.V1Job = {
     apiVersion: "batch/v1",

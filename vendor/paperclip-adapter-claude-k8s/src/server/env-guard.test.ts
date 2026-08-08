@@ -11,147 +11,181 @@ import {
   classifyAgentShellCommand,
 } from "./env-guard.js";
 
+const blocked = [
+  "env",
+  "printenv",
+  "set",
+  "export -p",
+  "declare -x",
+  "cat /proc/self/environ",
+  "cat /proc/1/environ",
+  "/usr/bin/env",
+  "command env",
+  "env; ls -la",
+  "ls && printenv",
+  'sh -lc "env"',
+  "bash -c 'printenv'",
+  // Compound-command bypass: the safe-helper exception is evaluated before
+  // the full-dump detector, so a helper appearing anywhere in the command
+  // used to return `allow` and let the trailing dump through.
+  "paperclip-safe-env && env",
+  "safe-env-inspect; printenv",
+  "./scripts/safe-env-inspect.mjs && cat /proc/self/environ",
+  "node ~/.claude/safe-env-inspect.mjs | env",
+  "env && paperclip-safe-env",
+  'sh -lc "paperclip-safe-env && env"',
+  // Newline is a command separator too. Anchoring the helper exception to the
+  // whole command is not enough on its own: JS `$` without `m` is
+  // end-of-input, so a `\s`-permissive argument tail made
+  // `paperclip-safe-env\nenv` a whole-command match, and the dump detector
+  // did not treat `\n` as a boundary either — so even `echo ok\nenv` fell
+  // through as `not_environment_dump`.
+  "paperclip-safe-env\nenv",
+  "paperclip-safe-env\nprintenv",
+  "safe-env-inspect.mjs\nenv",
+  "node ~/.claude/safe-env-inspect.mjs\ncat /proc/self/environ",
+  "echo ok\nenv",
+  "echo ok\nprintenv",
+  "echo ok\nset",
+  "echo ok\nexport -p",
+  "echo ok\ndeclare -x",
+  "env\nls -la",
+  "echo ok\r\nenv",
+  'sh -lc "echo ok\nenv"',
+  // Flag-only forms still dump the whole environment. Requiring a boundary
+  // immediately after the utility name let every one of these through:
+  // `-0`/`--null` dump NUL-separated, `-u NAME` dumps all but one variable.
+  "env -0",
+  "printenv -0",
+  "env --null",
+  "printenv --null",
+  "env -u PATH",
+  "env --unset PATH",
+  "command env -0",
+  "/usr/bin/env -0",
+  "ls && env -0",
+  "echo ok\nprintenv -0",
+  // Command substitution is a command boundary too — the dump runs and its
+  // output lands in the transcript just the same.
+  'echo "$(env)"',
+  "echo `env`",
+  "X=$(printenv)",
+  "(env)",
+  "$(set)",
+  "echo $(env -0 | head)",
+  "`printenv`",
+  "echo $(cat /proc/self/environ)",
+  'sh -lc "echo $(env)"',
+  // UNQUOTED command wrappers. `SHELL_WRAPPER_RE` only unwraps a *quoted* `-c`
+  // payload, and a space was not a command boundary — so every form below
+  // reached the detector with the dump sitting after a space, matched nothing,
+  // and was ALLOWED. Measured against the real spawned pod script before the
+  // fix: 9 of 9 allowed. Fixed by treating whitespace as a possible command
+  // *start* (leading side only), which closes the whole wrapper class at once
+  // rather than enumerating wrapper utilities.
+  "sh -c env",
+  "bash -c env",
+  "/bin/sh -c env",
+  "zsh -c env",
+  "sh -lc env",
+  "sh -c printenv",
+  "bash -c set",
+  "eval env",
+  "eval printenv",
+  // Wrappers that are not shells at all — the reason this is a character-class
+  // rule and not a list of shell binaries.
+  "xargs env",
+  "nohup env",
+  "timeout 5 env",
+  "nice env",
+  "setsid printenv",
+  "su -c env",
+  "watch env",
+  // Round 6 — LEXICAL transformations. A regex matches the command text, but the
+  // shell executes it after quote removal, escape processing, redirection
+  // stripping and GNU `env -S` re-splitting, so the matched string is not the
+  // token that runs. Every entry below was measured ALLOWED by the real spawned
+  // pod script while `/bin/sh` emitted a marker variable from the environment.
+  // Three were reported; the rest were found by probing the same class.
+  "env >&2", // redirection is stripped before exec, leaving a bare `env`
+  "env>&2", // ...with no space, so `env` never even ends at whitespace
+  "env 2>&1", // fd-prefixed form: `2` belongs to the redirection, not to argv
+  "printenv >/tmp/captured", // a file the agent can read back is still a leak
+  "e''nv", // quote removal rejoins the word
+  'e"n"v',
+  "'env'",
+  "\\env", // escape removal
+  "env -S '-u PATH'", // GNU -S re-splits its payload into further flags
+  "env -S '-0'",
+  "env --split-string='-u PATH'",
+  // Wrapper + lexical transformation combined.
+  "sh -c 'e''nv'",
+  "eval env >&2",
+];
+const allowed = [
+  // The trailing terminator deliberately does NOT include whitespace, which is
+  // what keeps an operand-bearing invocation out of the dump class. These are
+  // the regression guard for the wrapper fix above: it must not start matching
+  // a dump utility that is followed by an operand.
+  "grep env file.txt",
+  "grep -r env src/",
+  "cat .env",
+  "kubectl set image deploy/x c=y",
+  "git commit -m 'add env parsing'",
+  // Legitimate env USE (set-and-run) must not be blocked.
+  "env FOO=bar node script.js",
+  "printenv PATH",
+  // An operand — a command to run, or a single variable to print — is what
+  // makes these not-a-dump. Tightening the flag handling above must not
+  // swallow them, including through a substitution or after `--`.
+  "env NAME=value command",
+  "env FOO=1 BAR=2 ./run.sh",
+  "printenv HOME",
+  "PATH=$(printenv PATH)",
+  "env -- ls",
+  "docker run --env-file .env img",
+  // set with flags is ubiquitous in agent shells.
+  "set -euo pipefail",
+  "set -e",
+  // Ordinary commands.
+  "ls -la",
+  "git status",
+  'echo "hello"',
+  "grep -r env .",
+  // The allowlisted names-only helper.
+  "node ~/.claude/safe-env-inspect.mjs",
+  "./scripts/safe-env-inspect.mjs",
+  "paperclip-safe-env",
+  // Anchoring the helper exception must not over-block: args are fine, and a
+  // compound command that merely *contains* the helper is still allowed when
+  // nothing in it is an environment dump.
+  "paperclip-safe-env --json",
+  "scripts/safe-env-inspect.mjs",
+  "cd /repo && paperclip-safe-env",
+  // Newline-as-separator must not over-block ordinary multi-line scripts:
+  // each line is classified as its own command, and none of these is a dump.
+  "cd /repo\nset -euo pipefail\nls -la",
+  "echo one\necho two",
+  "cd /repo\npaperclip-safe-env",
+  "export FOO=bar\nnode script.js",
+  "printenv PATH\nprintenv HOME",
+  // Round 6 — the normalizer must not over-block. Quote removal makes the
+  // classifier see real words, so a dump utility NAME appearing as ordinary
+  // prose or as an operand-bearing argument stays allowed. Nested re-analysis
+  // is keyed on command SEPARATORS, not whitespace, precisely so these pass.
+  'echo "hello env"',
+  "git commit -m 'fix env'",
+  'git commit -m "update env parsing docs"',
+  "env -S 'node script.js'", // -S payload IS an operand here: it runs a command
+  "env --split-string='node script.js'",
+  "printenv PATH >/tmp/path.txt", // an operand, so not a dump; redirection is irrelevant
+  'sh -c "ls -la"', // shell payload recursed, and it is not a dump
+  "sh -c 'cd /repo && npm test'",
+  "echo 'a > b'",
+  "",
+];
+
 describe("classifyAgentShellCommand", () => {
-  const blocked = [
-    "env",
-    "printenv",
-    "set",
-    "export -p",
-    "declare -x",
-    "cat /proc/self/environ",
-    "cat /proc/1/environ",
-    "/usr/bin/env",
-    "command env",
-    "env; ls -la",
-    "ls && printenv",
-    'sh -lc "env"',
-    "bash -c 'printenv'",
-    // Compound-command bypass: the safe-helper exception is evaluated before
-    // the full-dump detector, so a helper appearing anywhere in the command
-    // used to return `allow` and let the trailing dump through.
-    "paperclip-safe-env && env",
-    "safe-env-inspect; printenv",
-    "./scripts/safe-env-inspect.mjs && cat /proc/self/environ",
-    "node ~/.claude/safe-env-inspect.mjs | env",
-    "env && paperclip-safe-env",
-    'sh -lc "paperclip-safe-env && env"',
-    // Newline is a command separator too. Anchoring the helper exception to the
-    // whole command is not enough on its own: JS `$` without `m` is
-    // end-of-input, so a `\s`-permissive argument tail made
-    // `paperclip-safe-env\nenv` a whole-command match, and the dump detector
-    // did not treat `\n` as a boundary either — so even `echo ok\nenv` fell
-    // through as `not_environment_dump`.
-    "paperclip-safe-env\nenv",
-    "paperclip-safe-env\nprintenv",
-    "safe-env-inspect.mjs\nenv",
-    "node ~/.claude/safe-env-inspect.mjs\ncat /proc/self/environ",
-    "echo ok\nenv",
-    "echo ok\nprintenv",
-    "echo ok\nset",
-    "echo ok\nexport -p",
-    "echo ok\ndeclare -x",
-    "env\nls -la",
-    "echo ok\r\nenv",
-    'sh -lc "echo ok\nenv"',
-    // Flag-only forms still dump the whole environment. Requiring a boundary
-    // immediately after the utility name let every one of these through:
-    // `-0`/`--null` dump NUL-separated, `-u NAME` dumps all but one variable.
-    "env -0",
-    "printenv -0",
-    "env --null",
-    "printenv --null",
-    "env -u PATH",
-    "env --unset PATH",
-    "command env -0",
-    "/usr/bin/env -0",
-    "ls && env -0",
-    "echo ok\nprintenv -0",
-    // Command substitution is a command boundary too — the dump runs and its
-    // output lands in the transcript just the same.
-    'echo "$(env)"',
-    "echo `env`",
-    "X=$(printenv)",
-    "(env)",
-    "$(set)",
-    "echo $(env -0 | head)",
-    "`printenv`",
-    "echo $(cat /proc/self/environ)",
-    'sh -lc "echo $(env)"',
-    // UNQUOTED command wrappers. `SHELL_WRAPPER_RE` only unwraps a *quoted* `-c`
-    // payload, and a space was not a command boundary — so every form below
-    // reached the detector with the dump sitting after a space, matched nothing,
-    // and was ALLOWED. Measured against the real spawned pod script before the
-    // fix: 9 of 9 allowed. Fixed by treating whitespace as a possible command
-    // *start* (leading side only), which closes the whole wrapper class at once
-    // rather than enumerating wrapper utilities.
-    "sh -c env",
-    "bash -c env",
-    "/bin/sh -c env",
-    "zsh -c env",
-    "sh -lc env",
-    "sh -c printenv",
-    "bash -c set",
-    "eval env",
-    "eval printenv",
-    // Wrappers that are not shells at all — the reason this is a character-class
-    // rule and not a list of shell binaries.
-    "xargs env",
-    "nohup env",
-    "timeout 5 env",
-    "nice env",
-    "setsid printenv",
-    "su -c env",
-    "watch env",
-  ];
-  const allowed = [
-    // The trailing terminator deliberately does NOT include whitespace, which is
-    // what keeps an operand-bearing invocation out of the dump class. These are
-    // the regression guard for the wrapper fix above: it must not start matching
-    // a dump utility that is followed by an operand.
-    "grep env file.txt",
-    "grep -r env src/",
-    "cat .env",
-    "kubectl set image deploy/x c=y",
-    "git commit -m 'add env parsing'",
-    // Legitimate env USE (set-and-run) must not be blocked.
-    "env FOO=bar node script.js",
-    "printenv PATH",
-    // An operand — a command to run, or a single variable to print — is what
-    // makes these not-a-dump. Tightening the flag handling above must not
-    // swallow them, including through a substitution or after `--`.
-    "env NAME=value command",
-    "env FOO=1 BAR=2 ./run.sh",
-    "printenv HOME",
-    "PATH=$(printenv PATH)",
-    "env -- ls",
-    "docker run --env-file .env img",
-    // set with flags is ubiquitous in agent shells.
-    "set -euo pipefail",
-    "set -e",
-    // Ordinary commands.
-    "ls -la",
-    "git status",
-    'echo "hello"',
-    "grep -r env .",
-    // The allowlisted names-only helper.
-    "node ~/.claude/safe-env-inspect.mjs",
-    "./scripts/safe-env-inspect.mjs",
-    "paperclip-safe-env",
-    // Anchoring the helper exception must not over-block: args are fine, and a
-    // compound command that merely *contains* the helper is still allowed when
-    // nothing in it is an environment dump.
-    "paperclip-safe-env --json",
-    "scripts/safe-env-inspect.mjs",
-    "cd /repo && paperclip-safe-env",
-    // Newline-as-separator must not over-block ordinary multi-line scripts:
-    // each line is classified as its own command, and none of these is a dump.
-    "cd /repo\nset -euo pipefail\nls -la",
-    "echo one\necho two",
-    "cd /repo\npaperclip-safe-env",
-    "export FOO=bar\nnode script.js",
-    "printenv PATH\nprintenv HOME",
-    "",
-  ];
 
   for (const cmd of blocked) {
     it(`blocks: ${JSON.stringify(cmd)}`, () => {
@@ -205,64 +239,26 @@ describe("embedded guard script (real node process)", () => {
     expect(runGuardScript(evt).status).toBe(0);
   });
 
-  // The embedded script carries its own copy of the regexes, so the
-  // compound-command bypass must be pinned here too — not just on the
-  // TypeScript classifier. These are the exact commands that returned `allow`
-  // before the safe-helper exception was anchored to the whole command, plus
-  // the newline-separated forms that survived that anchoring.
-  for (const cmd of [
-    "paperclip-safe-env && env",
-    "safe-env-inspect; printenv",
-    "./scripts/safe-env-inspect.mjs && cat /proc/self/environ",
-    'sh -lc "paperclip-safe-env && env"',
-    "paperclip-safe-env\nenv",
-    "safe-env-inspect.mjs\nprintenv",
-    "echo ok\nenv",
-    "echo ok\nset",
-    "echo ok\nexport -p",
-    "echo ok\ndeclare -x",
-    "echo ok\r\nenv",
-    'sh -lc "echo ok\nenv"',
-    // Flag-only dumps and command substitution, in the real spawned artifact.
-    "env -0",
-    "printenv --null",
-    "env -u PATH",
-    'echo "$(env)"',
-    "echo `env`",
-    "X=$(printenv)",
-    "(env)",
-    'sh -lc "echo $(env)"',
-    // Unquoted command wrappers, in the real spawned artifact. The embedded
-    // script carries its own regex literals, so the leading-boundary widening
-    // has to be pinned here too and not only on the TypeScript classifier.
-    "sh -c env",
-    "bash -c env",
-    "/bin/sh -c env",
-    "zsh -c env",
-    "sh -c printenv",
-    "eval env",
-    "xargs env",
-    "nohup env",
-    "timeout 5 env",
-  ]) {
-    it(`exits 2 on compound bypass: ${JSON.stringify(cmd)}`, () => {
+  // DRIFT CONTROL. The embedded pod script carries its own copy of the
+  // classifier, and hand-maintaining a second, shorter list of cases here is
+  // exactly how the two copies diverged before: a fix landed in one, the
+  // curated list did not grow, and the bypass survived in the artifact a pod
+  // actually runs. So drive the WHOLE corpus through the real spawned process
+  // and require it to agree with the TypeScript classifier on every case.
+  // Adding a case to `blocked`/`allowed` above now covers both copies at once.
+  for (const cmd of blocked) {
+    it(`embedded copy blocks: ${JSON.stringify(cmd)}`, () => {
       const { status, stderr } = runGuardScript({ tool_name: "Bash", tool_input: { command: cmd } });
       expect(status).toBe(2);
       expect(stderr).toContain("PEN-1305");
+      expect(classifyAgentShellCommand(cmd).action).toBe("block");
     });
   }
 
-  // ...and the embedded copy must not over-block multi-line scripts either.
-  for (const cmd of [
-    "cd /repo\nset -euo pipefail\nls -la",
-    "cd /repo\npaperclip-safe-env",
-    "env FOO=bar node script.js",
-    "printenv HOME",
-    "PATH=$(printenv PATH)",
-    "env -- ls",
-  ]) {
-    it(`exits 0 on benign multi-line: ${JSON.stringify(cmd)}`, () => {
+  for (const cmd of allowed) {
+    it(`embedded copy allows: ${JSON.stringify(cmd)}`, () => {
       expect(runGuardScript({ tool_name: "Bash", tool_input: { command: cmd } }).status).toBe(0);
+      expect(classifyAgentShellCommand(cmd).action).toBe("allow");
     });
   }
 

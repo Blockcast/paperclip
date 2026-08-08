@@ -409,6 +409,86 @@ describe("buildJobManifest", () => {
       expect(initCmd).toContain("'/srv/agent-data/.config/google-chrome'");
     });
 
+    // Round 6: `assertSafeAbsolutePath` validates the SHAPE of the configured
+    // path but not whether that path is already taken. A `workspaceMountPath`
+    // equal to a mount this builder already emits produced a Pod with two
+    // volumeMounts at one mountPath, which Kubernetes rejects outright — so the
+    // operator saw an opaque admission error instead of the config mistake.
+    // These paths are all shape-valid, so they get past the checks above.
+    for (const reserved of ["/tmp/prompt", "/runtime-cache"]) {
+      it(`rejects workspaceMountPath colliding with the reserved ${reserved} mount`, () => {
+        ctx.config.workspaceMountPath = reserved;
+        expect(() => buildJobManifest({ ctx, selfPod })).toThrow(
+          /must not collide with the reserved/,
+        );
+      });
+
+      it(`rejects ${reserved} even with a trailing slash (same mount path to Kubernetes)`, () => {
+        ctx.config.workspaceMountPath = `${reserved}/`;
+        expect(() => buildJobManifest({ ctx, selfPod })).toThrow(
+          /must not collide with the reserved/,
+        );
+      });
+    }
+
+    it("rejects workspaceMountPath colliding with an inherited secret mount", () => {
+      // Inherited secret mounts come from the running Deployment, so this is
+      // reachable without touching adapter config at all.
+      selfPod.secretVolumes = [
+        { volumeName: "gh-token", secretName: "gh", mountPath: "/paperclip/.secrets/gh", defaultMode: 0o400 },
+      ];
+      ctx.config.workspaceMountPath = "/paperclip/.secrets/gh";
+      expect(() => buildJobManifest({ ctx, selfPod })).toThrow(
+        /must not collide with inherited secret mount/,
+      );
+    });
+
+    it("rejects workspaceMountPath colliding with the DinD socket mount", () => {
+      // /var/run is appended AFTER the targeted workspace check, so only the
+      // per-container backstop catches this one.
+      ctx.config.enableDocker = true;
+      ctx.config.workspaceMountPath = "/var/run";
+      expect(() => buildJobManifest({ ctx, selfPod })).toThrow(/duplicate volumeMounts at \/var\/run/);
+    });
+
+    it("still allows a NESTED workspace mount path — only exact duplicates are illegal", () => {
+      // Kubernetes permits /runtime-cache alongside /runtime-cache/workspace;
+      // the collision check must not over-reject and break valid layouts.
+      ctx.config.workspaceMountPath = "/runtime-cache/workspace";
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const mounts = job.spec?.template?.spec?.containers[0]?.volumeMounts ?? [];
+      expect(mounts).toContainEqual({ name: "data", mountPath: "/runtime-cache/workspace" });
+    });
+
+    it("emits no duplicate mountPath in either container across the manifest matrix", () => {
+      // The invariant itself, asserted over the combinations that vary the
+      // mount set, rather than one case per bug.
+      for (const enableDocker of [false, true]) {
+        for (const pvcClaimName of ["", "paperclip-data"]) {
+          for (const secretVolumes of [
+            [],
+            [{ volumeName: "gh", secretName: "gh", mountPath: "/paperclip/.secrets/gh", defaultMode: 0o400 }],
+          ]) {
+            selfPod.pvcClaimName = pvcClaimName;
+            selfPod.secretVolumes = secretVolumes;
+            ctx.config = { enableDocker };
+            const { job } = buildJobManifest({ ctx, selfPod });
+            const spec = job.spec?.template?.spec;
+            const containers = [
+              ...(spec?.initContainers ?? []),
+              ...(spec?.containers ?? []),
+            ];
+            for (const container of containers) {
+              const paths = (container.volumeMounts ?? []).map((m) => m.mountPath);
+              expect(new Set(paths).size, `${container.name} has duplicate mountPaths: ${paths.join(", ")}`).toBe(
+                paths.length,
+              );
+            }
+          }
+        }
+      }
+    });
+
     it("write-prompt mounts the runtime-cache emptyDir so the BrowserMetrics symlink target resolves", () => {
       const { job } = buildJobManifest({ ctx, selfPod });
       const init = job.spec?.template?.spec?.initContainers?.[0];
@@ -1429,7 +1509,68 @@ describe("buildJobManifest", () => {
       expect(cmd).not.toContain("$(id)");
       expect(cmd).not.toContain("`id`");
       // Operators need to know why rotation was skipped, or this is a silent no-op.
-      expect(cmd).toContain("no entry is a valid account identifier");
+      // The message names the config key, so the reason is actionable without
+      // reading this source.
+      expect(cmd).toContain("no entry in providers.anthropic.accounts is a valid account identifier");
+      expect(cmd).toContain("skipping ccrotate rather than falling back to global rotation");
+    });
+
+    // Round 6: the fail-closed branch above only fired for a well-formed ARRAY
+    // whose entries all failed validation. A configured pool of the wrong SHAPE
+    // took a different path: `Array.isArray(...) ? ... : null` collapsed it to
+    // the same `null` used for "absent", so it read as "no pool configured" and
+    // selected unrestricted GLOBAL rotation — the exact widening this block
+    // exists to prevent, reachable by the single likeliest typo (`accounts:
+    // "a@b.test"` as a bare string instead of a list).
+    //
+    // `parseObject` returns `{}` for any non-object, so `providers.anthropic`
+    // has the identical failure mode one level up; both levels are covered here.
+    for (const [label, providers] of [
+      ["accounts is a bare string", { anthropic: { accounts: "a@example.test" } }],
+      ["accounts is a comma string", { anthropic: { accounts: "a@example.test,b@example.test" } }],
+      ["accounts is an object", { anthropic: { accounts: { primary: "a@example.test" } } }],
+      ["accounts is a number", { anthropic: { accounts: 42 } }],
+      ["accounts is a boolean", { anthropic: { accounts: true } }],
+      ["anthropic is a string", { anthropic: "a@example.test" }],
+      ["anthropic is an array", { anthropic: ["a@example.test"] }],
+    ] as ReadonlyArray<readonly [string, Record<string, unknown>]>) {
+      it(`skips rotation instead of widening to global when ${label} (fail closed)`, () => {
+        ctx.config = { providers };
+        const { job } = buildJobManifest({ ctx, selfPod });
+        const cmd = job.spec?.template?.spec?.containers[0]?.command?.[2] ?? "";
+        // The load-bearing assertion: a malformed pool must NOT reach the
+        // unrestricted global-rotation command.
+        expect(cmd).not.toContain("ccrotate next");
+        expect(cmd).not.toContain("--accounts");
+        expect(cmd).toContain("skipping ccrotate rather than falling back to global rotation");
+        expect(cmd).toContain("must be an");
+        // The offending value is never echoed: this config sits next to
+        // credential material and the message lands in the pod log.
+        expect(cmd).not.toContain("a@example.test");
+      });
+    }
+
+    it("treats an explicitly empty pool as configured-but-unusable, not as absent", () => {
+      // `accounts: []` is a deliberate statement that no account is eligible.
+      // Widening that to every account on the box is the same fail-open in
+      // miniature, so it skips rotation rather than falling back to global.
+      ctx.config = { providers: { anthropic: { accounts: [] } } };
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const cmd = job.spec?.template?.spec?.containers[0]?.command?.[2] ?? "";
+      expect(cmd).not.toContain("ccrotate next");
+      expect(cmd).toContain("empty list");
+    });
+
+    it("still takes the global-rotation path when accounts is explicitly null/undefined", () => {
+      // Absent really does mean absent — an operator writing `null` is saying
+      // "no pool", which is the documented default, not a malformed value.
+      for (const accounts of [null, undefined]) {
+        ctx.config = { providers: { anthropic: { accounts } } };
+        const { job } = buildJobManifest({ ctx, selfPod });
+        const cmd = job.spec?.template?.spec?.containers[0]?.command?.[2] ?? "";
+        expect(cmd).toContain("ccrotate next --yes --target claude");
+        expect(cmd).not.toContain("--accounts");
+      }
     });
 
     it("does not add --accounts when providers is undefined (global rotation path)", () => {
