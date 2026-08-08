@@ -28,6 +28,20 @@ import { issueRoutes } from "../routes/issues.js";
 import { ensureHumanRoleDefaultGrants } from "../services/principal-access-compatibility.js";
 import { taskWatchdogService } from "../services/task-watchdogs.js";
 
+/** True when `error` is the `activity_log_run_id_heartbeat_runs_id_fk` violation (BLO-22231). */
+function isActivityLogHeartbeatRunsFkViolation(error: unknown): boolean {
+  let current: unknown = error;
+  for (let depth = 0; depth < 6; depth += 1) {
+    if (!current || typeof current !== "object") return false;
+    const record = current as { code?: unknown; constraint_name?: unknown; cause?: unknown };
+    if (record.code === "23503" && record.constraint_name === "activity_log_run_id_heartbeat_runs_id_fk") {
+      return true;
+    }
+    current = record.cause;
+  }
+  return false;
+}
+
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
@@ -47,10 +61,7 @@ describeEmbeddedPostgres("issue watchdog routes", () => {
   }, 120_000);
 
   afterEach(async () => {
-    await db.delete(activityLog);
-    await db.delete(issueComments);
-    await db.delete(heartbeatRunEvents);
-    await db.delete(heartbeatRuns);
+    await deleteActivityLogThenHeartbeatRunsWithStragglerRetry();
     await db.delete(agentWakeupRequests);
     await db.delete(agentRuntimeState);
     await db.delete(issueRelations);
@@ -61,6 +72,51 @@ describeEmbeddedPostgres("issue watchdog routes", () => {
     await db.delete(companyMemberships);
     await db.delete(companies);
   });
+
+  /**
+   * BLO-22231: `recordDeniedIssueWrite` (routes/issues.ts) always sends the
+   * denial response (`res.status(...).json(...)`) before it awaits its own
+   * `logActivity` write -- deliberately, so the client-facing 403/409 for a
+   * denied write is never held up by best-effort recovery-audit logging (see
+   * the "Fail closed ... optional recovery telemetry" comment at
+   * routes/issues.ts:4352). Supertest's `request(app)` resolves as soon as
+   * the HTTP response is flushed, not when the Express handler's promise
+   * settles, so that trailing write can land in `activity_log` *after* this
+   * `afterEach` has already started and *before* it reaches `heartbeatRuns`,
+   * referencing a run this test is about to delete.
+   *
+   * Confirmed by a stack-traced repro (2026-08-07): the straggler write came
+   * from `recordDeniedIssueWrite` <- `assertTaskWatchdogScopedIssueMutationAllowed`
+   * <- `assertTaskWatchdogIssueMutationAllowed` <-
+   * `rejectAgentIssueThreadInteractionResolution`, ~15ms into this exact
+   * `afterEach`, on the very test this file's flake was reported against
+   * ("rejects watchdog interaction-resolution attempts outside the persisted
+   * watched subtree"). The same respond-then-log ordering is used by every
+   * `recordDeniedIssueWrite` call site (~30 of them) across routes/issues.ts,
+   * so awaiting "harder" at the source isn't available without adding DB
+   * latency to every denied-write response -- not worth it for a test-only
+   * race. Any suite that supertest-drives a denying route and truncates
+   * `heartbeat_runs` in its `afterEach` has the same exposure (e.g.
+   * low-trust-red-team-routes.test.ts, issue-denied-write-recovery-persistence.test.ts,
+   * issue-coordination-metadata-refusal-persistence.test.ts).
+   *
+   * Retrying the pair is safe: these are the same idempotent truncate-style
+   * deletes already run in this `afterEach`, and 5 attempts is far more than
+   * enough headroom for a write that lands within tens of milliseconds.
+   */
+  async function deleteActivityLogThenHeartbeatRunsWithStragglerRetry(maxAttempts = 5): Promise<void> {
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      await db.delete(activityLog);
+      await db.delete(issueComments);
+      await db.delete(heartbeatRunEvents);
+      try {
+        await db.delete(heartbeatRuns);
+        return;
+      } catch (err) {
+        if (attempt === maxAttempts || !isActivityLogHeartbeatRunsFkViolation(err)) throw err;
+      }
+    }
+  }
 
   afterAll(async () => {
     await tempDb?.cleanup();
