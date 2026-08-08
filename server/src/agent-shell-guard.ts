@@ -53,63 +53,157 @@ const INLINE_INTERPRETER_RE = new RegExp(
   "i",
 );
 
-const JS_ENV_REFERENCE_RE = /\bprocess\s*\.\s*env\b/gi;
-const JS_ENV_ALIAS_DECLARATION_RE = /\{[^{}]*?\benv\s*(?::\s*([$A-Z_a-z][$\w]*))?[^{}]*?\}\s*=\s*(?:globalThis\s*\.\s*)?process\b/gi;
-const PYTHON_ENV_REFERENCE_RE = /\bos\s*\.\s*environ\b/gi;
-const PYTHON_ENV_IMPORT_RE = /\bfrom\s+os\s+import\s+environ(?:\s+as\s+([A-Za-z_][\w]*))?/gi;
-const PYTHON_OS_ALIAS_IMPORT_RE = /\bimport\s+os\s+as\s+([A-Za-z_][\w]*)/gi;
-
-// Explicit bulk forms which do not use a normal `process.env`/`os.environ`
-// member reference, plus the dynamic-index variants.
-const ENV_BULK_ACCESS_RE = new RegExp(
+const INLINE_EVAL_SOURCE_RE = new RegExp(
   [
-    String.raw`process\.env\s*(?:[,)\]};'"]|$)`,
-    String.raw`process\s*\[\s*["']env["']\s*\]`,
-    String.raw`process\.env\s*\[\s*[^"'\]\s]`,
-    String.raw`Object\.(?:keys|values|entries|assign)\s*\(\s*process\.env\s*\)`,
-    String.raw`JSON\.stringify\s*\(\s*process\.env\b`,
-    String.raw`\.\.\.\s*process\.env\b`,
-    String.raw`\bin\s+process\.env\b`,
-    String.raw`\{\s*env\s*\}\s*=\s*process\b[\s\S]*?\benv\s*(?:[,)\]};'"]|$)`,
-    String.raw`require\s*\(\s*["'](?:node:)?process["']\s*\)\s*\.env\s*(?:[,)\]};'"]|$)`,
-    String.raw`os\.environ\s*(?:[,)\]};'"]|$)`,
-    String.raw`os\.environ\s*\[\s*[^"'\]\s]`,
-    String.raw`os\.environ\s*\.\s*get\s*\(\s*[^"'\)\s]`,
-    String.raw`os\.environ\s*\.\s*(?:items|keys|values|copy)\s*\(\s*\)`,
-    String.raw`dict\s*\(\s*os\.environ\s*\)`,
-    String.raw`list\s*\(\s*os\.environ\s*\)`,
-    String.raw`\*\*\s*os\.environ\b`,
-    String.raw`from\s+os\s+import\s+environ\b[\s\S]*?\benviron\s*(?:[,)\]};'"]|$)`,
-    String.raw`from\s+os\s+import\s+environ\b[\s\S]*?\benviron\s*\[\s*[^"'\]\s]`,
-    String.raw`from\s+os\s+import\s+environ\b[\s\S]*?\benviron\s*\.\s*get\s*\(\s*[^"'\)\s]`,
-    String.raw`from\s+os\s+import\s+environ\b[\s\S]*?\benviron\s*\.\s*(?:items|keys|values|copy)\s*\(\s*\)`,
-    String.raw`from\s+os\s+import\s+environ\b[\s\S]*?\b(?:dict|list)\s*\(\s*environ\s*\)`,
-    String.raw`from\s+os\s+import\s+environ\b[\s\S]*?\*\*\s*environ\b`,
+    `(?:^|[\\s;&|()\\x60])${INTERPRETER_PATH_PREFIX_RE}${NODE_LIKE_RE}\\b(?:\\s+${FLAG_WITH_OPTIONAL_VALUE_RE})*\\s+-{1,2}(?:e|eval|p|print|pe|ep)\\b(?:=|\\s+)`,
+    `(?:^|[\\s;&|()\\x60])${INTERPRETER_PATH_PREFIX_RE}${PYTHON_RE}\\b(?:\\s+${FLAG_WITH_OPTIONAL_VALUE_RE})*\\s+-{1,2}(?:c|command)\\b(?:=|\\s+)`,
   ].join("|"),
   "i",
 );
+const PIPE_SOURCE_RE = /(?:^|[;&|]\s*)(?:printf|echo)\s+/i;
+const PIPE_TO_INTERPRETER_RE = new RegExp(
+  String.raw`\|\s*${INTERPRETER_PATH_PREFIX_RE}(?:${NODE_LIKE_BARE_RE}|${PYTHON_RE})\b`,
+  "i",
+);
 
-function isQuotedLiteralIndex(input: string): boolean {
-  return /^\s*\[\s*(["'])(?:\\.|(?!\1)[\s\S])*\1\s*\]/.test(input);
+const JS_ENV_REFERENCE_RE = /\bprocess\s*(?:\.\s*|\?\.\s*)env\b/gi;
+const JS_ENV_ALIAS_DECLARATION_RE = /\{[^{}]*?\benv\s*(?::\s*([$A-Z_a-z][$\w]*))?[^{}]*?\}\s*=\s*(?:globalThis\s*\.\s*)?process\b/gi;
+const JS_PROCESS_ALIAS_DECLARATION_RE = /(?:\b(?:const|let|var)\s+)?([$A-Z_a-z][$\w]*)\s*=\s*(?:globalThis\s*\.\s*)?process\b/gi;
+const PYTHON_ENV_REFERENCE_RE = /\bos\s*\.\s*environ\b/gi;
+const PYTHON_ENV_IMPORT_RE = /\bfrom\s+os\s+import\s+(?:environ(?:\s+as\s+([A-Za-z_][\w]*))?|\*)/gi;
+const PYTHON_OS_ALIAS_IMPORT_RE = /\bimport\s+os\s+as\s+([A-Za-z_][\w]*)/gi;
+
+// Full-environment access forms whose source is not a normal `.env` member
+// reference. These are only applied at non-literal source positions below.
+const JS_PROCESS_ENV_BRACKET_RE = /\bprocess\s*\[\s*(["'`])env\1\s*\]/gi;
+const JS_REFLECT_PROCESS_ENV_RE = /\bReflect\s*\.\s*get\s*\(\s*(?:globalThis\s*\.\s*)?process\s*,\s*(["'`])env\1(?=\s*(?:,|\)))/gi;
+const JS_REQUIRE_PROCESS_ENV_RE = /\brequire\s*\(\s*(["'])(?:node:)?process\1\s*\)\s*(?:\.\s*env\b|\[\s*(["'`])env\2\s*\])/gi;
+const PYTHON_GETATTR_ENV_RE = /\bgetattr\s*\(\s*os\s*,\s*(["'])environ\1(?=\s*(?:,|\)))/gi;
+const PYTHON_IMPORT_ENV_RE = /\b__import__\s*\(\s*(["'])os\1\s*\)\s*\.\s*environ\b/gi;
+
+function maskInlineLanguageLiterals(source: string): string {
+  const masked = source.split("");
+  let quote: "'" | '"' | "`" | undefined;
+  let lineComment = false;
+  let blockComment = false;
+  let templateExpressionDepth = 0;
+
+  for (let i = 0; i < source.length; i += 1) {
+    const ch = source[i] ?? "";
+    const next = source[i + 1] ?? "";
+
+    if (lineComment) {
+      masked[i] = " ";
+      if (ch === "\n") lineComment = false;
+      continue;
+    }
+    if (blockComment) {
+      masked[i] = " ";
+      if (ch === "*" && next === "/") {
+        masked[i + 1] = " ";
+        i += 1;
+        blockComment = false;
+      }
+      continue;
+    }
+    if (quote) {
+      masked[i] = " ";
+      if (ch === "\\" && i + 1 < source.length) {
+        i += 1;
+        masked[i] = " ";
+        continue;
+      }
+      if (quote === "`" && ch === "$" && next === "{") {
+        masked[i + 1] = " ";
+        i += 1;
+        quote = undefined;
+        templateExpressionDepth = 1;
+        continue;
+      }
+      if (ch === quote) quote = undefined;
+      continue;
+    }
+    if (templateExpressionDepth > 0) {
+      if (ch === "{") {
+        templateExpressionDepth += 1;
+        continue;
+      }
+      if (ch === "}") {
+        templateExpressionDepth -= 1;
+        if (templateExpressionDepth === 0) {
+          masked[i] = " ";
+          quote = "`";
+        }
+        continue;
+      }
+    }
+    if (ch === "/" && next === "/") {
+      masked[i] = " ";
+      masked[i + 1] = " ";
+      i += 1;
+      lineComment = true;
+      continue;
+    }
+    if (ch === "/" && next === "*") {
+      masked[i] = " ";
+      masked[i + 1] = " ";
+      i += 1;
+      blockComment = true;
+      continue;
+    }
+    if (ch === "'" || ch === '"' || ch === "`") {
+      masked[i] = " ";
+      quote = ch;
+    }
+  }
+
+  return masked.join("");
+}
+
+function hasStaticLiteralIndex(input: string): boolean {
+  let index = 0;
+  while (/\s/.test(input[index] ?? "")) index += 1;
+  if (input[index] !== "[") return false;
+  index += 1;
+  while (/\s/.test(input[index] ?? "")) index += 1;
+  const quote = input[index];
+  if (quote !== "'" && quote !== '"' && quote !== "`") return false;
+  index += 1;
+
+  for (; index < input.length; index += 1) {
+    const ch = input[index] ?? "";
+    if (ch === "\\") {
+      index += 1;
+      continue;
+    }
+    if (quote === "`" && ch === "$" && input[index + 1] === "{") return false;
+    if (ch !== quote) continue;
+    index += 1;
+    while (/\s/.test(input[index] ?? "")) index += 1;
+    return input[index] === "]";
+  }
+
+  return false;
 }
 
 function hasScopedJavaScriptEnvironmentRead(input: string): boolean {
-  return /^\s*\.\s*[$A-Z_a-z][$\w]*/.test(input) || isQuotedLiteralIndex(input);
+  return /^\s*(?:\.|\?\.)\s*[$A-Z_a-z][$\w]*/.test(input) || hasStaticLiteralIndex(input);
 }
 
 function hasScopedPythonEnvironmentRead(input: string): boolean {
-  return isQuotedLiteralIndex(input) || /^\s*\.\s*get\s*\(\s*(["'])(?:\\.|(?!\1)[\s\S])*\1/.test(input);
+  return hasStaticLiteralIndex(input) || /^\s*\.\s*get\s*\(\s*(?:key\s*=\s*)?(["'])(?:\\.|(?!\1)[\s\S])*\1/.test(input);
 }
 
 function hasUnsafeEnvironmentReference(
-  command: string,
+  source: string,
+  maskedSource: string,
   reference: RegExp,
   isScopedRead: (input: string) => boolean,
 ): boolean {
   reference.lastIndex = 0;
   let match: RegExpExecArray | null;
-  while ((match = reference.exec(command))) {
-    if (!isScopedRead(command.slice(reference.lastIndex))) return true;
+  while ((match = reference.exec(maskedSource))) {
+    if (!isScopedRead(source.slice(reference.lastIndex))) return true;
   }
   return false;
 }
@@ -119,57 +213,93 @@ function escapeRegExp(input: string): string {
 }
 
 function hasUnsafeEnvironmentAliasReference(
-  command: string,
+  source: string,
+  maskedSource: string,
   declaration: RegExp,
   defaultAlias: string,
   isScopedRead: (input: string) => boolean,
 ): boolean {
   declaration.lastIndex = 0;
   let declarationMatch: RegExpExecArray | null;
-  while ((declarationMatch = declaration.exec(command))) {
+  while ((declarationMatch = declaration.exec(maskedSource))) {
     const alias = declarationMatch[1] ?? defaultAlias;
-    const remainder = command.slice(declaration.lastIndex);
+    const sourceRemainder = source.slice(declaration.lastIndex);
+    const maskedRemainder = maskedSource.slice(declaration.lastIndex);
     const reference = new RegExp(`\\b${escapeRegExp(alias)}\\b`, "g");
     let referenceMatch: RegExpExecArray | null;
-    while ((referenceMatch = reference.exec(remainder))) {
-      if (!isScopedRead(remainder.slice(reference.lastIndex))) return true;
+    while ((referenceMatch = reference.exec(maskedRemainder))) {
+      if (!isScopedRead(sourceRemainder.slice(reference.lastIndex))) return true;
     }
   }
   return false;
 }
 
-function hasUnsafePythonOsAliasReference(command: string): boolean {
+function hasUnsafeJavaScriptProcessAliasReference(source: string, maskedSource: string): boolean {
+  JS_PROCESS_ALIAS_DECLARATION_RE.lastIndex = 0;
+  let declarationMatch: RegExpExecArray | null;
+  while ((declarationMatch = JS_PROCESS_ALIAS_DECLARATION_RE.exec(maskedSource))) {
+    const alias = declarationMatch[1] ?? "process";
+    const sourceRemainder = source.slice(JS_PROCESS_ALIAS_DECLARATION_RE.lastIndex);
+    const maskedRemainder = maskedSource.slice(JS_PROCESS_ALIAS_DECLARATION_RE.lastIndex);
+    const reference = new RegExp(`\\b${escapeRegExp(alias)}\\s*(?:\\.\\s*|\\?\\.\\s*)env\\b`, "g");
+    let referenceMatch: RegExpExecArray | null;
+    while ((referenceMatch = reference.exec(maskedRemainder))) {
+      if (!hasScopedJavaScriptEnvironmentRead(sourceRemainder.slice(reference.lastIndex))) return true;
+    }
+  }
+  return false;
+}
+
+function hasUnsafePythonOsAliasReference(source: string, maskedSource: string): boolean {
   PYTHON_OS_ALIAS_IMPORT_RE.lastIndex = 0;
   let importMatch: RegExpExecArray | null;
-  while ((importMatch = PYTHON_OS_ALIAS_IMPORT_RE.exec(command))) {
-    const remainder = command.slice(PYTHON_OS_ALIAS_IMPORT_RE.lastIndex);
+  while ((importMatch = PYTHON_OS_ALIAS_IMPORT_RE.exec(maskedSource))) {
+    const sourceRemainder = source.slice(PYTHON_OS_ALIAS_IMPORT_RE.lastIndex);
+    const maskedRemainder = maskedSource.slice(PYTHON_OS_ALIAS_IMPORT_RE.lastIndex);
     const reference = new RegExp(`\\b${escapeRegExp(importMatch[1] ?? "os")}\\s*\\.\\s*environ\\b`, "g");
     let referenceMatch: RegExpExecArray | null;
-    while ((referenceMatch = reference.exec(remainder))) {
-      if (!hasScopedPythonEnvironmentRead(remainder.slice(reference.lastIndex))) return true;
+    while ((referenceMatch = reference.exec(maskedRemainder))) {
+      if (!hasScopedPythonEnvironmentRead(sourceRemainder.slice(reference.lastIndex))) return true;
     }
   }
   return false;
 }
 
-function hasUnsafeInlineEnvironmentAccess(command: string): boolean {
+function hasCodePattern(source: string, maskedSource: string, pattern: RegExp): boolean {
+  pattern.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(source))) {
+    if (maskedSource[match.index] !== " ") return true;
+  }
+  return false;
+}
+
+function hasUnsafeInlineEnvironmentAccess(source: string): boolean {
+  const maskedSource = maskInlineLanguageLiterals(source);
   return (
-    ENV_BULK_ACCESS_RE.test(command)
-    || hasUnsafeEnvironmentReference(command, JS_ENV_REFERENCE_RE, hasScopedJavaScriptEnvironmentRead)
-    || hasUnsafeEnvironmentReference(command, PYTHON_ENV_REFERENCE_RE, hasScopedPythonEnvironmentRead)
+    hasCodePattern(source, maskedSource, JS_PROCESS_ENV_BRACKET_RE)
+    || hasCodePattern(source, maskedSource, JS_REFLECT_PROCESS_ENV_RE)
+    || hasCodePattern(source, maskedSource, JS_REQUIRE_PROCESS_ENV_RE)
+    || hasCodePattern(source, maskedSource, PYTHON_GETATTR_ENV_RE)
+    || hasCodePattern(source, maskedSource, PYTHON_IMPORT_ENV_RE)
+    || hasUnsafeEnvironmentReference(source, maskedSource, JS_ENV_REFERENCE_RE, hasScopedJavaScriptEnvironmentRead)
+    || hasUnsafeEnvironmentReference(source, maskedSource, PYTHON_ENV_REFERENCE_RE, hasScopedPythonEnvironmentRead)
     || hasUnsafeEnvironmentAliasReference(
-      command,
+      source,
+      maskedSource,
       JS_ENV_ALIAS_DECLARATION_RE,
       "env",
       hasScopedJavaScriptEnvironmentRead,
     )
     || hasUnsafeEnvironmentAliasReference(
-      command,
+      source,
+      maskedSource,
       PYTHON_ENV_IMPORT_RE,
       "environ",
       hasScopedPythonEnvironmentRead,
     )
-    || hasUnsafePythonOsAliasReference(command)
+    || hasUnsafeJavaScriptProcessAliasReference(source, maskedSource)
+    || hasUnsafePythonOsAliasReference(source, maskedSource)
   );
 }
 
@@ -204,13 +334,23 @@ function unwrapShell(command: string): string {
   return current;
 }
 
+function extractInlineInterpreterSource(command: string): string {
+  const evalMatch = INLINE_EVAL_SOURCE_RE.exec(command);
+  if (evalMatch) return readShellCommandArgument(command.slice(evalMatch.index + evalMatch[0].length));
+  if (PIPE_TO_INTERPRETER_RE.test(command)) {
+    const sourceMatch = PIPE_SOURCE_RE.exec(command);
+    if (sourceMatch) return readShellCommandArgument(command.slice(sourceMatch.index + sourceMatch[0].length));
+  }
+  return command;
+}
+
 export function classifyAgentShellCommand(command: string): AgentShellCommandDecision {
   const normalized = unwrapShell(command).trim();
   if (!normalized) return { action: "allow", reason: "not_environment_dump" };
   if (FULL_ENV_DUMP_RE.test(normalized)) return { action: "block", reason: "full_environment_dump" };
   if (ENV_READ_BY_VARIABLE_RE.test(normalized)) return { action: "block", reason: "full_environment_dump" };
   if (XARGS_ENV_RE.test(normalized)) return { action: "block", reason: "full_environment_dump" };
-  if (INLINE_INTERPRETER_RE.test(normalized) && hasUnsafeInlineEnvironmentAccess(normalized)) {
+  if (INLINE_INTERPRETER_RE.test(normalized) && hasUnsafeInlineEnvironmentAccess(extractInlineInterpreterSource(normalized))) {
     return { action: "block", reason: "full_environment_dump" };
   }
   if (SAFE_ENV_INSPECTION_ONLY_RE.test(normalized)) return { action: "allow", reason: "safe_env_inspection" };

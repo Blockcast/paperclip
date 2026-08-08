@@ -60,6 +60,7 @@ describe("classifyAgentShellCommand", () => {
     `node -e 'console.log(JSON.stringify(process.env))'`,
     `node -e 'console.log({...process.env})'`,
     `node -e 'for (const k in process.env) console.log(k)'`,
+    `echo -e harmless; node -e 'console.log(process.env)'`,
     `python3 -c 'import os; print(os.environ)'`,
     `python3 -c 'import os; print(dict(os.environ))'`,
     `python3 -c 'import os; print(os.environ.items())'`,
@@ -159,6 +160,21 @@ describe("classifyAgentShellCommand", () => {
   });
 
   it.each([
+    `node -e 'const p = process; console.log(p.env)'`,
+    `node -e 'console.log(process?.env)'`,
+    `node -e 'console.log(Reflect.get(process, "env"))'`,
+    `node -e 'console.log(require("node:process")["env"])'`,
+    `python3 -c 'from os import *; print(environ)'`,
+    `python3 -c 'import os; print(getattr(os, "environ"))'`,
+    `python3 -c 'print(__import__("os").environ)'`,
+  ])("blocks alias, optional-chain, and reflective full-environment forms: %s", (command) => {
+    expect(classifyAgentShellCommand(command)).toEqual({
+      action: "block",
+      reason: "full_environment_dump",
+    });
+  });
+
+  it.each([
     `python3 -c 'from os import environ; print(environ.get("DATABASE_URL"))'`,
     `python3 -c 'from os import environ; print(environ["DATABASE_URL"])'`,
     `node -e 'const {env: runtimeEnv}=process; console.log(runtimeEnv.DATABASE_URL)'`,
@@ -166,5 +182,19 @@ describe("classifyAgentShellCommand", () => {
     `python3 -c 'import os as runtime_os; print(runtime_os.environ.get("DATABASE_URL"))'`,
   ])("still allows scoped reads through the os-import alias: %s", (command) => {
     expect(classifyAgentShellCommand(command).action).toBe("allow");
+  });
+
+  it.each([
+    `node -e 'console.log(process.env?.DATABASE_URL)'`,
+    "node -e 'console.log(process.env[`DATABASE_URL`])'",
+    `node -e 'console.log(process.env["DATABASE_URL"])'`,
+    `python3 -c 'import os; print(os.environ.get(key="DATABASE_URL"))'`,
+    `node -e 'console.log("process.env")'`,
+    `python3 -c 'print("os.environ")'`,
+  ])("allows scoped reads and harmless environment-reference strings: %s", (command) => {
+    expect(classifyAgentShellCommand(command)).toEqual({
+      action: "allow",
+      reason: "not_environment_dump",
+    });
   });
 });
