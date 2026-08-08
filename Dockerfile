@@ -357,7 +357,10 @@ ARG CLAUDE_K8S_REF=3ad33702052f357ec2b31b7d3051e89ed1ed4875
 # Bumped 2026-08-08 to 6dca020 (#56/#58): retain those fixes and restore the
 # PEN-1305 shell-command parser on the current adapter line. The vendor build
 # runs the upstream env-guard and execute suites against this exact tree.
-ARG OPENCODE_K8S_REF=6dca0201547f962dc9ae45576c81c12808b73bb3
+# Bumped 2026-08-08 to ed03316 (#60): reattach to an exact persisted lifecycle
+# Job after worker recovery instead of recreating its prompt Secret and Job.
+# Running and terminal Jobs are both recovered by name, UID, and run label.
+ARG OPENCODE_K8S_REF=ed0331690432d3c37cd7ed190ca1066c840b30c3
 
 # Pack paperclip's in-tree adapter-utils so the bundled adapters consume
 # the workspace version (may include exports newer than the latest
