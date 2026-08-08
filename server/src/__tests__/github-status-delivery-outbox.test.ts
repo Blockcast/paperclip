@@ -269,8 +269,7 @@ describeEmbeddedPostgres("GitHub commit-status delivery outbox", () => {
       const u = String(url);
       if (u.includes("/access_tokens")) return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
       if (/\/commits\/[^/]+\/statuses(?:\?|$)/.test(u)) return jsonResponse([]);
-      if (u.includes("/pulls/") && u.includes("/reviews")) return jsonResponse([]);
-      if (u.includes("/issues/") && u.includes("/comments")) {
+      if (u.includes("/pulls/") && u.includes("/reviews")) {
         const staleProcessingAt = new Date(Date.now() - 11 * 60 * 1_000);
         await db
           .update(githubCommitStatusDeliveries)
@@ -463,18 +462,33 @@ describeEmbeddedPostgres("GitHub commit-status delivery outbox", () => {
     expect(events.at(-1)?.message).toContain("Set PR-review gate status review/ally-complete to failure");
   });
 
-  it("skips the failure write when reviewer evidence now exists on GitHub", async () => {
+  it("skips the failure write when an approved App review exists on GitHub", async () => {
     setCreds();
     const { delivery } = await seedRun();
     const fetchMock = stubGithub({
       latestStatuses: [],
-      reviews: [{ user: { login: "allyblockcast[bot]" }, commit_id: HEAD_SHA }],
+      reviews: [{ user: { login: "allyblockcast[bot]" }, commit_id: HEAD_SHA, state: "APPROVED" }],
     });
 
     await pollGitHubCommitStatusDeliveriesOnce(db);
 
     expect(await readDelivery(delivery.id)).toMatchObject({ status: "skipped" });
     expect(fetchMock.mock.calls.some(([url]) => String(url).includes(`/statuses/${HEAD_SHA}`))).toBe(false);
+  });
+
+  it("does not let an exact-head COMMENTED App review suppress the gate failure", async () => {
+    setCreds();
+    const { delivery } = await seedRun();
+    const fetchMock = stubGithub({
+      latestStatuses: [],
+      reviews: [{ user: { login: "allyblockcast[bot]" }, commit_id: HEAD_SHA, state: "COMMENTED" }],
+      comments: [],
+    });
+
+    await pollGitHubCommitStatusDeliveriesOnce(db);
+
+    expect(await readDelivery(delivery.id)).toMatchObject({ status: "delivered" });
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes(`/statuses/${HEAD_SHA}`))).toBe(true);
   });
 
   it("re-checks commit status after reviewer evidence before posting failure", async () => {
