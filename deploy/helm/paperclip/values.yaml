@@ -408,6 +408,26 @@ serviceMonitor:
   interval: 30s
   # -- Per-scrape timeout. Must be `<=` `interval`.
   scrapeTimeout: 10s
+
+# Grafana dashboards shipped as sidecar-adopted ConfigMaps (BLO-20171).
+#
+# Unlike `prometheusRule` above, this is safe to enable on Blockcast: the
+# paperclip-ci-deploy ServiceAccount holds ClusterRole/admin in the release
+# namespace, which covers core `configmaps` but not the monitoring.coreos.com
+# CRDs. See templates/grafana-dashboard.yaml for the full reasoning.
+grafanaDashboard:
+  # -- Render Grafana dashboard ConfigMaps for a `grafana_dashboard`-watching sidecar.
+  enabled: false
+  # -- Label the Grafana dashboard sidecar watches for.
+  sidecarLabel: grafana_dashboard
+  # -- Value that label must carry. Quoted on render because sidecars compare strings.
+  sidecarLabelValue: "1"
+  # -- Grafana datasource **uid** the dashboard panels query. Must be a Prometheus that scrapes the paperclip control plane; `thanos` and `prometheus-monitoring` do not.
+  datasourceUid: cluster
+  # -- Grafana folder to file the dashboard under, via the `grafana_folder` annotation. Empty leaves it in the sidecar's default folder.
+  folder: ""
+  # -- Extra labels to merge onto the dashboard ConfigMaps.
+  extraLabels: {}
   # -- Namespaces of the Prometheus pods that scrape this Service. Appended to
   # the NetworkPolicy ingress `from` (when `networkPolicy.enabled`) so scrapes
   # are not blocked. Same shape as `networkPolicy.allowFromNamespaces`.
@@ -454,6 +474,8 @@ prometheusRule:
   githubDeliveryDeadLetterWindow: 30m
   # -- How long a non-zero dead-letter rate must persist before firing. Kept short: a dead-lettered delivery is already terminal, so there is nothing to self-resolve.
   githubDeliveryDeadLetterFor: 5m
+  # -- Grafana URL for the review-request delivery funnel dashboard, surfaced on the dead-letter alert so the page carries its own panel link (BLO-20171). Must match the `uid` in dashboards/github-review-request-funnel.json.
+  githubDeliveryDashboardUrl: "https://stats.orc8r.blockcast.net/d/paperclip-review-request-funnel"
   # -- Rolling window for outage-like terminal suppression of GitHub review-request wakes (BLO-18859).
   githubDeliverySuppressionWindow: 30m
   # -- How long outage-like suppression must persist before firing. Same reasoning as the dead-letter alert: suppression is terminal, nothing self-resolves.
