@@ -53,6 +53,7 @@ function runVerifyStep(results) {
     TYPECHECK_RELEASE_REGISTRY_RESULT: results.typecheck_release_registry ?? "success",
     GENERAL_TESTS_RESULT: results.general_tests ?? "success",
     WORKTREE_INSTALL_RESULT: results.worktree_install ?? "success",
+    OPENCODE_RESPONSES_REPLAY_RESULT: results.opencode_responses_replay ?? "success",
     BUILD_RESULT: results.build ?? "success",
     VERIFY_SERIALIZED_SERVER_RESULT: results.verify_serialized_server ?? "success",
   };
@@ -63,6 +64,22 @@ test("verify step passes when every lane succeeds", () => {
   const result = runVerifyStep({});
   assert.equal(result.status, 0);
 });
+
+for (const [laneResult, annotation] of [
+  ["failure", "failure"],
+  ["skipped", "skipped"],
+  ["cancelled", "cancelled"],
+]) {
+  test(`verify step rejects an OpenCode Responses replay ${laneResult}`, () => {
+    const result = runVerifyStep({ opencode_responses_replay: laneResult });
+    assert.notEqual(result.status, 0);
+    assert.match(
+      result.stdout,
+      new RegExp(`::error title=verify: lane ${annotation}::`),
+    );
+    assert.match(result.stdout, /opencode_responses_replay/);
+  });
+}
 
 test("verify step exits non-zero and annotates a cancelled lane without asserting a specific cause", () => {
   const result = runVerifyStep({ general_tests: "cancelled" });

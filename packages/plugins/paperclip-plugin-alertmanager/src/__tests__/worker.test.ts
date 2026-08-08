@@ -14,6 +14,7 @@ import {
   handleWebhook,
   verifyBearerToken,
 } from "../webhook-handler.js";
+import { getCredentialHealth, resetCredentialHealth } from "../credential-health.js";
 import {
   BLOCKCAST_PHYSICAL_INFRA_AGENT_ID,
   BLOCKCAST_PHYSICAL_INFRA_GOAL_ID,
@@ -167,6 +168,7 @@ const mkCtx = (): { ctx: PluginContext; mocks: MockClients } => {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  resetCredentialHealth();
 });
 
 // ---------------------------------------------------------------------------
@@ -229,6 +231,86 @@ describe("handleWebhook — auth", () => {
     const config = baseConfig();
     await handleWebhook(ctx, config, TOKEN, baseInput());
     expect(mocks.issues.create).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BLO-20572 — credential-resolution health, derived from delivery outcomes
+// ---------------------------------------------------------------------------
+
+describe("handleWebhook — credential health (BLO-20572)", () => {
+  it("reports ok when no delivery has happened yet", () => {
+    expect(getCredentialHealth()).toEqual({ status: "ok" });
+  });
+
+  it("reports degraded, naming the company, after a delivery resolves no token", async () => {
+    const { ctx } = mkCtx();
+    const config = baseConfig();
+    const input = baseInput({ companyId: "company-no-token", headers: {} });
+
+    // resolvedToken is null: this company's config has no credential at all,
+    // same as what config-scope.ts's resolveWebhookToken() returns.
+    await expect(handleWebhook(ctx, config, null, input)).rejects.toBeInstanceOf(
+      WebhookUnauthorizedError,
+    );
+
+    const health = getCredentialHealth();
+    expect(health.status).toBe("degraded");
+    expect(health.message).toContain("company-no-token");
+    expect(health.details).toEqual({ companyIds: ["company-no-token"] });
+  });
+
+  it("does not flag a company whose token is configured but was presented wrong", async () => {
+    const { ctx } = mkCtx();
+    const config = baseConfig();
+    const input = baseInput({
+      companyId: "company-real-token",
+      headers: { authorization: "Bearer wrong-value" },
+    });
+
+    // resolvedToken is non-null: the company DOES have a credential
+    // configured. This request just presented the wrong one — an auth
+    // failure, not a misconfiguration, and must not report unhealthy.
+    await expect(handleWebhook(ctx, config, TOKEN, input)).rejects.toBeInstanceOf(
+      WebhookUnauthorizedError,
+    );
+
+    expect(getCredentialHealth()).toEqual({ status: "ok" });
+  });
+
+  it("clears once a later delivery for the same company resolves a credential — no restart needed", async () => {
+    const { ctx } = mkCtx();
+    const config = baseConfig();
+
+    await expect(
+      handleWebhook(ctx, config, null, baseInput({ companyId: "company-1", headers: {} })),
+    ).rejects.toBeInstanceOf(WebhookUnauthorizedError);
+    expect(getCredentialHealth().status).toBe("degraded");
+
+    await handleWebhook(ctx, config, TOKEN, baseInput({ companyId: "company-1" }));
+
+    expect(getCredentialHealth()).toEqual({ status: "ok" });
+  });
+
+  it("tracks multiple companies independently and never leaks a token value", async () => {
+    const { ctx } = mkCtx();
+    const config = baseConfig();
+
+    await expect(
+      handleWebhook(ctx, config, null, baseInput({ companyId: "company-a", headers: {} })),
+    ).rejects.toBeInstanceOf(WebhookUnauthorizedError);
+    await expect(
+      handleWebhook(ctx, config, null, baseInput({ companyId: "company-b", headers: {} })),
+    ).rejects.toBeInstanceOf(WebhookUnauthorizedError);
+    await handleWebhook(ctx, config, TOKEN, baseInput({ companyId: "company-c" }));
+
+    const health = getCredentialHealth();
+    expect(health.details).toEqual({ companyIds: ["company-a", "company-b"] });
+    expect(JSON.stringify(health)).not.toContain(TOKEN);
+
+    // company-a recovers; company-b remains flagged.
+    await handleWebhook(ctx, config, TOKEN, baseInput({ companyId: "company-a" }));
+    expect(getCredentialHealth().details).toEqual({ companyIds: ["company-b"] });
   });
 });
 

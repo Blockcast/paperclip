@@ -14,6 +14,7 @@ import {
   approvals,
   activityLog,
   companies,
+  detachedQueuedRunRecoveries,
   heartbeatRunEvents,
   heartbeatRunWatchdogDecisions,
   heartbeatRuns,
@@ -326,7 +327,17 @@ type ResolvedDependencyWakeBackstopOptions = {
 
 type LatestIssueRun = Pick<
   typeof heartbeatRuns.$inferSelect,
-  "id" | "agentId" | "status" | "error" | "errorCode" | "contextSnapshot" | "livenessState" | "resultJson" | "usageJson" | "createdAt"
+  | "id"
+  | "agentId"
+  | "status"
+  | "error"
+  | "errorCode"
+  | "contextSnapshot"
+  | "livenessState"
+  | "resultJson"
+  | "usageJson"
+  | "createdAt"
+  | "finishedAt"
 > | null;
 type SuccessfulLatestIssueRun = NonNullable<LatestIssueRun> & { status: "succeeded" };
 
@@ -461,23 +472,116 @@ function summarizeAgentCapabilities(agent: typeof agents.$inferSelect | null | u
 // the throttle fault (see parseProviderCapacityResetHorizon). Read from the
 // run's own resultJson so the strand comment can attribute the stall to the
 // provider window rather than to whatever terminal symptom got recorded last.
-// Returns the ISO string only when this really was a throttle family — a bare
-// `retryNotBefore` on some other family is not a capacity 429.
-function readProviderCapacityResetAt(run: NonNullable<LatestIssueRun>): string | null {
-  const resultJson = parseObject(run.resultJson);
-  const explicit = readNonEmptyString(resultJson.providerCapacityResetAt);
-  if (explicit) return explicit;
+//
+// `run.resultJson` starts as adapter-owned data, and summarizeRunFailureForIssueComment
+// interpolates selected fields into an issue comment other agents read. The
+// `providerCapacityResetAt` path is therefore trusted only when heartbeat
+// finalization also wrote the paired server provenance key after stripping any
+// adapter-supplied copy. Without that discriminator, a spoofed adapter result
+// could relabel an ordinary failure as a self-healing capacity window.
+const PROVIDER_CAPACITY_THROTTLE_FAMILIES = new Set(["rate_limit_exhausted", "provider_quota"]);
+const PROVIDER_CAPACITY_RESET_PROVENANCE_SOURCE = "server_parse_provider_capacity_horizon";
 
-  const family = readNonEmptyString(resultJson.errorFamily);
-  if (family !== "rate_limit_exhausted" && family !== "provider_quota") return null;
-  return (
-    readNonEmptyString(resultJson.retryNotBefore) ??
-    readNonEmptyString(resultJson.transientRetryNotBefore) ??
-    null
-  );
+// Full-string match — no surrounding prose, markdown, or newlines survive it.
+// Mirrors the shape parseProviderCapacityResetHorizon captures on the write side.
+const PROVIDER_CAPACITY_RESET_INSTANT_PATTERN =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
+
+// The horizon was advertised during the run that recorded it, and the write side
+// caps an accepted horizon at 24h past finalization. Bound the read lower side
+// by run creation and the upper side by run finish (falling back to creation)
+// so long-running jobs can still report a horizon parsed near the end.
+const PROVIDER_CAPACITY_RESET_MAX_SKEW_MS = 24 * 60 * 60 * 1000;
+
+type ProviderCapacityResetBounds = {
+  lowerBoundAt: Date | null;
+  upperBoundAt: Date | null;
+};
+
+function readCapacityResetBounds(run: NonNullable<LatestIssueRun>): ProviderCapacityResetBounds {
+  const createdAt = run.createdAt instanceof Date ? run.createdAt : null;
+  const finishedAt = run.finishedAt instanceof Date ? run.finishedAt : null;
+  return { lowerBoundAt: createdAt, upperBoundAt: finishedAt ?? createdAt };
 }
 
-export function summarizeRunFailureForIssueComment(run: LatestIssueRun) {
+function canonicalizeCapacityResetInstant(value: unknown, bounds: ProviderCapacityResetBounds): string | null {
+  const raw = readNonEmptyString(value)?.trim();
+  if (!raw) return null;
+  if (!PROVIDER_CAPACITY_RESET_INSTANT_PATTERN.test(raw)) return null;
+  const parsed = Date.parse(raw);
+  if (!Number.isFinite(parsed)) return null;
+
+  const lowerAnchor = bounds.lowerBoundAt?.getTime();
+  if (lowerAnchor !== undefined && Number.isFinite(lowerAnchor)) {
+    if (parsed < lowerAnchor - PROVIDER_CAPACITY_RESET_MAX_SKEW_MS) return null;
+  }
+  const upperAnchor = bounds.upperBoundAt?.getTime();
+  if (upperAnchor !== undefined && Number.isFinite(upperAnchor)) {
+    if (parsed > upperAnchor + PROVIDER_CAPACITY_RESET_MAX_SKEW_MS) return null;
+  }
+  return new Date(parsed).toISOString();
+}
+
+function normalizeHttpStatusCode(value: unknown): number | null {
+  const parsed =
+    typeof value === "number"
+      ? value
+      : typeof value === "string" && value.trim().length > 0
+        ? Number(value.trim())
+        : NaN;
+  if (!Number.isInteger(parsed) || parsed < 100 || parsed > 599) return null;
+  return parsed;
+}
+
+function readProviderCapacityResetProvenance(resultJson: Record<string, unknown>) {
+  const provenance = parseObject(resultJson.providerCapacityResetProvenance);
+  if (readNonEmptyString(provenance.source) !== PROVIDER_CAPACITY_RESET_PROVENANCE_SOURCE) {
+    return null;
+  }
+  const family = readNonEmptyString(provenance.errorFamily);
+  if (!family || !PROVIDER_CAPACITY_THROTTLE_FAMILIES.has(family)) return null;
+  return {
+    errorFamily: family,
+    observedStatusCode: normalizeHttpStatusCode(provenance.observedStatusCode),
+  };
+}
+
+type ProviderCapacityResetRead = {
+  resetAt: string;
+  // True only when the instant carries real 429-capacity provenance, i.e. the
+  // server's own `providerCapacityResetAt`, which finalization writes solely
+  // from parseProviderCapacityResetHorizon under a throttle override. A bare
+  // `retryNotBefore` does NOT qualify: `rate_limit_exhausted` is set by
+  // isRateLimitExhausted() for "429, 401-cap, or 'you've hit your limit' cap
+  // text" (heartbeat.ts), and `provider_quota` is a legacy adapter quota
+  // signal — neither implies a 429 capacity event, so neither may be reported
+  // as one.
+  is429Capacity: boolean;
+};
+
+function readProviderCapacityResetAt(
+  run: NonNullable<LatestIssueRun>,
+): ProviderCapacityResetRead | null {
+  const resultJson = parseObject(run.resultJson);
+
+  const family = readNonEmptyString(resultJson.errorFamily);
+  if (!family || !PROVIDER_CAPACITY_THROTTLE_FAMILIES.has(family)) return null;
+
+  const bounds = readCapacityResetBounds(run);
+
+  const provenance = readProviderCapacityResetProvenance(resultJson);
+  const explicit = provenance
+    ? canonicalizeCapacityResetInstant(resultJson.providerCapacityResetAt, bounds)
+    : null;
+  if (explicit) return { resetAt: explicit, is429Capacity: provenance?.observedStatusCode === 429 };
+
+  const advertised =
+    canonicalizeCapacityResetInstant(resultJson.retryNotBefore, bounds) ??
+    canonicalizeCapacityResetInstant(resultJson.transientRetryNotBefore, bounds);
+  return advertised ? { resetAt: advertised, is429Capacity: false } : null;
+}
+
+export function summarizeRunFailureForIssueComment(run: LatestIssueRun, now = Date.now()) {
   if (!run) return null;
 
   const errorCode = readNonEmptyString(run.errorCode)?.trim() ?? null;
@@ -489,15 +593,44 @@ export function summarizeRunFailureForIssueComment(run: LatestIssueRun) {
   // BackoffLimitExceeded — describes the symptom (the Job gave up) and reads
   // as an infrastructure fault, which repeatedly sent readers looking at the
   // cluster instead of at a provider window that had already reopened on its
-  // own. Naming the 429 and the instant is the difference between "our Job
+  // own. Naming the window and the instant is the difference between "our Job
   // broke" and "the provider was closed until 21:29:59Z".
-  const capacityResetAt = readProviderCapacityResetAt(run);
-  if (capacityResetAt) {
+  //
+  // Only the explicit server-parsed horizon may be called a 429: the throttle
+  // families also cover 401 cap-windows and legacy quota signals, so a bare
+  // advertised `retryNotBefore` gets the honest "rate-limit/quota window"
+  // phrasing instead of a status code we cannot substantiate.
+  //
+  // The horizon is also only load-bearing while it is still in the future.
+  // Recovery sweeps run on their own cadence and routinely read a run that
+  // failed hours earlier, so an unconditional present-tense "waiting on that
+  // reset … self-healing" tells agents to sit out a window that already
+  // reopened — the exact misdiagnosis this summary exists to prevent, pointed
+  // the other way.
+  //
+  // But an elapsed horizon is not proof the window reopened either. The instant
+  // is the provider's own estimate, and the write-side parser deliberately
+  // accepts tentative wording ("capacity may reset at …", "retry in …"); a
+  // throttle can be extended past the instant it advertised. So past the
+  // horizon we claim only that the horizon elapsed and that current capacity
+  // must be rechecked. Asserting "the cause is something after it" would trade
+  // one confident misdiagnosis for another — sending the reader hunting a new
+  // blocker while the original throttle is still the live one.
+  const capacityReset = readProviderCapacityResetAt(run);
+  if (capacityReset) {
     const suffix = errorCode ? ` (surfaced as \`${errorCode}\`)` : "";
-    return (
-      ` Latest retry failure: provider capacity throttle (429) — the provider advertised a capacity reset at ` +
-      `${capacityResetAt}${suffix}. This is transient and self-healing; the issue is waiting on that reset, not on a broken runtime.`
-    );
+    const cause = capacityReset.is429Capacity
+      ? `provider capacity throttle (429) — the provider advertised a capacity reset at ${capacityReset.resetAt}`
+      : `provider rate-limit/quota window — the provider advertised availability no earlier than ${capacityReset.resetAt}`;
+    const resetAtMs = Date.parse(capacityReset.resetAt);
+    const windowStillOpen = Number.isFinite(resetAtMs) && resetAtMs > now;
+    return windowStillOpen
+      ? ` Latest retry failure: ${cause}${suffix}. This is transient and self-healing; ` +
+          `the issue is waiting on that reset, not on a broken runtime.`
+      : ` Latest retry failure: ${cause}${suffix}. That advertised horizon has since elapsed, ` +
+          `but the provider only ever advertised it as an estimate and a throttle can be ` +
+          `extended past it — recheck current provider capacity before either waiting on this ` +
+          `window or diagnosing a different blocker.`;
   }
 
   // Prefer the JSON `"message": "..."` field if the error body is a JSON
@@ -564,6 +697,28 @@ function isCheckoutAdoptionCancelledRun(
   return (
     latestRun?.status === "cancelled" &&
     readNonEmptyString(latestRun.errorCode) === CHECKOUT_ADOPTED_RUN_ERROR_CODE
+  );
+}
+
+// BLO-19954: `routine_execution_duplicate_suppressed` is the dispatch layer's
+// own single-owner lock refusing a non-owner run of a routine configured
+// `concurrencyPolicy=always_enqueue` — the run's cancellation message says so
+// verbatim ("the owner run will continue the work"). It is benign, intentional
+// control flow, not a stranded assignment: nothing failed, there is no
+// runtime/adapter defect to repair, and no owner action can make this run
+// succeed (the lock is held by another issue's run by design). Escalating it
+// created a wake amplifier — one recovery action and one `wake_owner` per
+// routine fire, forever, on a routine that was never broken. See
+// `cancelClaimedRunForRoutineExecutionDuplicate` (heartbeat.ts) for where the
+// run itself is cancelled with this code.
+const ROUTINE_EXECUTION_DUPLICATE_SUPPRESSED_ERROR_CODE = "routine_execution_duplicate_suppressed";
+
+function isRoutineExecutionDuplicateSuppressedRun(
+  latestRun: LatestIssueRun,
+): latestRun is NonNullable<LatestIssueRun> {
+  return (
+    latestRun?.status === "cancelled" &&
+    readNonEmptyString(latestRun.errorCode) === ROUTINE_EXECUTION_DUPLICATE_SUPPRESSED_ERROR_CODE
   );
 }
 
@@ -1246,6 +1401,7 @@ export function recoveryService(
     resultJson: heartbeatRuns.resultJson,
     usageJson: heartbeatRuns.usageJson,
     createdAt: heartbeatRuns.createdAt,
+    finishedAt: heartbeatRuns.finishedAt,
   } as const;
 
   async function getLatestIssueRun(companyId: string, issueId: string): Promise<LatestIssueRun> {
@@ -1402,6 +1558,7 @@ export function recoveryService(
         resultJson: heartbeatRuns.resultJson,
         usageJson: heartbeatRuns.usageJson,
         createdAt: heartbeatRuns.createdAt,
+        finishedAt: heartbeatRuns.finishedAt,
       })
       .from(heartbeatRuns)
       .where(
@@ -1738,6 +1895,7 @@ export function recoveryService(
         resultJson: heartbeatRuns.resultJson,
         usageJson: heartbeatRuns.usageJson,
         createdAt: heartbeatRuns.createdAt,
+        finishedAt: heartbeatRuns.finishedAt,
       })
       .from(heartbeatRuns)
       .where(
@@ -4044,6 +4202,11 @@ export function recoveryService(
       previousStatus: input.previousStatus,
       latestIssueStatus: input.issue.status,
       latestRunId: input.latestRun?.id ?? null,
+      // BLO-20263: whose run failed. `upsertSourceScoped` needs this to tell replay of an
+      // earlier agent's failure apart from a recovery owner that has since failed on its
+      // own run — owner identity alone reads identically in both, and the handoff grant
+      // must refresh for the second and not the first.
+      latestRunAgentId: input.latestRun?.agentId ?? null,
       latestRunStatus: input.latestRun?.status ?? null,
       latestRunErrorCode: input.latestRun?.errorCode ?? null,
       latestRunFailureSummary: summarizeRunFailureForIssueComment(input.latestRun),
@@ -4932,6 +5095,65 @@ export function recoveryService(
     return updated;
   }
 
+  // BLO-19954: cancel a routine-execution issue whose only run was suppressed
+  // as a dispatch-lock duplicate, instead of escalating it. `cancelled` is the
+  // correct terminal status — the issue performed no scan and never will, the
+  // lock owner is already continuing the work — so there is nothing for a
+  // recovery owner to repair and no wake to raise.
+  async function cancelDuplicateSuppressedRoutineExecutionIssue(
+    issue: typeof issues.$inferSelect,
+    latestRun: LatestIssueRun,
+  ) {
+    return await db.transaction(async (tx) => {
+      await tx.execute(
+        sql`select pg_advisory_xact_lock(hashtextextended(${issue.companyId} || ':' || ${issue.id}, 0))`,
+      );
+
+      const [fresh] = await tx
+        .select()
+        .from(issues)
+        .where(eq(issues.id, issue.id))
+        .limit(1);
+      if (!fresh || isTerminalIssueStatus(fresh.status)) return null;
+
+      const updated = await issuesSvc.update(fresh.id, { status: "cancelled" }, tx);
+      if (!updated) return null;
+
+      await logActivity(db, {
+        companyId: fresh.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: null,
+        runId: null,
+        action: "issue.updated",
+        entityType: "issue",
+        entityId: fresh.id,
+        details: {
+          identifier: fresh.identifier,
+          status: "cancelled",
+          previousStatus: fresh.status,
+          source: "recovery.routine_execution_duplicate_suppressed",
+          latestRunId: latestRun?.id ?? null,
+          latestRunErrorCode: latestRun?.errorCode ?? null,
+        },
+      });
+
+      await issuesSvc.addComment(
+        fresh.id,
+        "Paperclip cancelled this routine-execution issue instead of escalating it to `blocked`. Its run was " +
+          `cancelled with \`${ROUTINE_EXECUTION_DUPLICATE_SUPPRESSED_ERROR_CODE}\` because another open ` +
+          "routine-execution issue already owns this dispatch lock. Under `always_enqueue` with a single-owner " +
+          "dispatcher, that is expected, intentional control flow — the lock owner continues the work. This issue " +
+          "performed no scan and never will, so no recovery action or owner wake was raised.",
+        {},
+        { authorType: "system" },
+        tx,
+      );
+
+      return updated;
+    });
+  }
+
   async function escalateStrandedAssignedIssue(input: {
     issue: typeof issues.$inferSelect;
     previousStatus: StrandedPreviousStatus;
@@ -4941,6 +5163,10 @@ export function recoveryService(
     recoveryOwnerAgentId?: string | null;
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
   }) {
+    if (isRoutineExecutionDuplicateSuppressedRun(input.latestRun)) {
+      return cancelDuplicateSuppressedRoutineExecutionIssue(input.issue, input.latestRun);
+    }
+
     if (isStrandedIssueRecoveryIssue(input.issue)) {
       return escalateStrandedRecoveryIssueInPlace({
         issue: input.issue,
@@ -8256,6 +8482,11 @@ export function recoveryService(
         }
 
         const clearedAt = new Date();
+        const detachedQueuedRunId = currentIssue.executionRunId
+          && currentRunById.get(currentIssue.executionRunId)?.status === "queued"
+          && currentPreClaimLockExpired(currentIssue.executionRunId, currentIssue.executionLockedAt)
+          ? currentIssue.executionRunId
+          : null;
         const updated = await tx
           .update(issues)
           .set({
@@ -8288,6 +8519,26 @@ export function recoveryService(
           .then((rows) => rows[0] ?? null);
 
         if (!updated) return null;
+
+        // BLO-21621: clearing a stale pre-claim lock is the only positive
+        // evidence that a queued row previously owned, and then lost, this
+        // issue lock. Persist that lineage in the same transaction as the
+        // release. The detached-run reconciler must never infer this state from
+        // old age plus NULL issue pointers because that is also the normal
+        // lazy-lock backlog shape.
+        if (detachedQueuedRunId) {
+          await tx
+            .insert(detachedQueuedRunRecoveries)
+            .values({
+              companyId: updated.companyId,
+              issueId: updated.id,
+              sourceRunId: detachedQueuedRunId,
+              status: "detached",
+              detachedAt: clearedAt,
+              updatedAt: clearedAt,
+            })
+            .onConflictDoNothing({ target: detachedQueuedRunRecoveries.sourceRunId });
+        }
 
         const skippedDeferredWakeIds: string[] = [];
 
