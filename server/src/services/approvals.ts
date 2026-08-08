@@ -5,6 +5,7 @@ import { conflict, notFound, unprocessable } from "../errors.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { logActivity, type LogActivityInput } from "./activity-log.js";
 import { agentService } from "./agents.js";
+import { insertApprovalRecord } from "./approval-insert.js";
 import { budgetService } from "./budgets.js";
 import { notifyHireApproved } from "./hire-hook.js";
 import { instanceSettingsService } from "./instance-settings.js";
@@ -167,11 +168,7 @@ export function approvalService(db: Db) {
     },
 
     create: (companyId: string, data: Omit<typeof approvals.$inferInsert, "companyId">) =>
-      db
-        .insert(approvals)
-        .values({ ...data, companyId })
-        .returning()
-        .then((rows) => rows[0]),
+      insertApprovalRecord(db, { ...data, companyId }).then((rows) => rows[0]),
 
     approve: async (id: string, decidedByUserId: string, decisionNote?: string | null) => {
       const now = new Date();

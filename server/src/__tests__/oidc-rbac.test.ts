@@ -1,5 +1,9 @@
 import { describe, it, expect, vi } from "vitest";
 import {
+  approvals as approvalsTable,
+  companyMemberships as companyMembershipsTable,
+} from "@paperclipai/db";
+import {
   loadDexRbacConfig,
   parseIdTokenGroups,
   reconcileDexUser,
@@ -98,11 +102,11 @@ describe("reconcileDexUser (mocked db)", () => {
         from: (table: any) => ({
           where: (_clause: any) => ({
             limit: (_n: number) => {
-              if (table?._?.name === "company_memberships" || table === "company_memberships") {
+              if (table === companyMembershipsTable) {
                 const m = store.memberships[0];
                 return m ? [{ id: m.id, status: m.status }] : [];
               }
-              if (table?._?.name === "approvals" || table === "approvals") {
+              if (table === approvalsTable) {
                 const a = store.approvals[0];
                 return a ? [{ id: a.id }] : [];
               }
@@ -114,9 +118,9 @@ describe("reconcileDexUser (mocked db)", () => {
       insert: vi.fn().mockImplementation((table: any) => ({
         values: vi.fn().mockImplementation(async (row: any) => {
           const id = `id-${(store.memberships.length + store.approvals.length + 1)}`;
-          if (table?._?.name === "company_memberships" || table === "company_memberships") {
+          if (table === companyMembershipsTable) {
             store.memberships.push({ id, ...row });
-          } else if (table?._?.name === "approvals" || table === "approvals") {
+          } else if (table === approvalsTable) {
             store.approvals.push({ id, ...row });
           }
         }),
@@ -126,10 +130,6 @@ describe("reconcileDexUser (mocked db)", () => {
       })),
       _store: store,
     } as any;
-    // Wire table names. The real drizzle objects expose their pg table name
-    // via Symbol/`._`. We approximate by attaching a `.tableName` for the
-    // imported tokens so the mock's `from` recognition works without a
-    // schema graph.
     return db;
   }
 
@@ -192,6 +192,18 @@ describe("reconcileDexUser (mocked db)", () => {
     const result = await reconcileDexUser(db, "user-1", ["g-admin"], cfg);
     expect(result.pendingAdminElevation).toBe(true);
     expect(result.addedMembership).toBe(false);
+  });
+
+  it("adds a non-empty title to a pending admin-elevation approval", async () => {
+    const db = makeDb();
+    db.select = vi.fn(() => ({
+      from: () => ({ where: () => ({ limit: () => [] }) }),
+    }));
+
+    await reconcileDexUser(db, "user-1", ["g-admin"], cfg);
+
+    expect(db._store.approvals).toHaveLength(1);
+    expect(db._store.approvals[0]?.payload.title).toBe("Admin elevation requested for user-1");
   });
 
   it("does not create a duplicate approval when one is already pending", async () => {

@@ -24,6 +24,7 @@ import type {
 } from "@paperclipai/shared";
 import { notFound, unprocessable } from "../errors.js";
 import { logActivity } from "./activity-log.js";
+import { insertApproval } from "./approval-insert.js";
 
 type ScopeRecord = {
   companyId: string;
@@ -165,6 +166,11 @@ async function computeObservedAmount(
   return Number(row?.total ?? 0);
 }
 
+function formatBudgetAmount(metric: BudgetMetric, amount: number): string {
+  if (metric === "billed_cents") return `$${(amount / 100).toFixed(2)}`;
+  return String(amount);
+}
+
 function buildApprovalPayload(input: {
   policy: PolicyRow;
   scopeName: string;
@@ -173,7 +179,13 @@ function buildApprovalPayload(input: {
   windowStart: Date;
   windowEnd: Date;
 }) {
+  const metric = input.policy.metric as BudgetMetric;
+  const verb = input.thresholdType === "hard" ? "exceeded" : "crossed";
+  const capLabel = input.thresholdType === "hard" ? "hard cap" : "warn threshold";
   return {
+    title:
+      `Budget override: ${input.scopeName} ${verb} ${metric} ${capLabel} `
+      + `(${formatBudgetAmount(metric, input.amountObserved)} of ${formatBudgetAmount(metric, input.policy.amount)})`,
     scopeType: input.policy.scopeType,
     scopeId: input.policy.scopeId,
     scopeName: input.scopeName,
@@ -378,16 +390,14 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
     });
 
     const approval = thresholdType === "hard"
-      ? await db
-        .insert(approvals)
-        .values({
-          companyId: policy.companyId,
-          type: "budget_override_required",
-          requestedByUserId: null,
-          requestedByAgentId: null,
-          status: "pending",
-          payload,
-        })
+      ? await insertApproval(db, {
+        companyId: policy.companyId,
+        type: "budget_override_required",
+        requestedByUserId: null,
+        requestedByAgentId: null,
+        status: "pending",
+        payload,
+      })
         .returning()
         .then((rows) => rows[0] ?? null)
       : null;

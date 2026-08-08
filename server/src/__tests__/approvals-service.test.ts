@@ -74,6 +74,13 @@ function createDbStub(selectResults: Array<Array<Record<string, unknown>>>, upda
   };
 }
 
+function createInsertDbStub() {
+  const returning = vi.fn(async () => [{ id: "approval-1" }]);
+  const values = vi.fn(() => ({ returning }));
+  const insert = vi.fn(() => ({ values }));
+  return { db: { insert } as any, insert, values };
+}
+
 const withdrawalActor = {
   userId: null,
   activity: {
@@ -82,6 +89,36 @@ const withdrawalActor = {
     agentId: "requester-1",
   },
 };
+
+describe("approvalService creation payload validation", () => {
+  it("accepts a hire payload whose card subject is name", async () => {
+    const { db, values } = createInsertDbStub();
+
+    const approval = await approvalService(db).create("company-1", {
+      type: "hire_agent",
+      status: "pending",
+      payload: { name: "Pending Coder", title: null },
+    } as any);
+
+    expect(approval).toEqual({ id: "approval-1" });
+    expect(values).toHaveBeenCalledWith(expect.objectContaining({
+      companyId: "company-1",
+      payload: { name: "Pending Coder", title: null },
+    }));
+  });
+
+  it("rejects an internal create with no usable approval-card subject", () => {
+    const { db, insert } = createInsertDbStub();
+
+    expect(() => approvalService(db).create("company-1", {
+      type: "request_board_approval",
+      status: "pending",
+      payload: { title: " ", scopeId: "scope-1" },
+    } as any)).toThrow(/title, name, summary, or recommendedAction/);
+
+    expect(insert).not.toHaveBeenCalled();
+  });
+});
 
 describe("approvalService resolution idempotency", () => {
   beforeEach(() => {

@@ -133,6 +133,9 @@ describe("budgetService", () => {
         companyId: "company-1",
         type: "budget_override_required",
         status: "pending",
+        payload: expect.objectContaining({
+          title: "Budget override: Budget Agent exceeded billed_cents hard cap ($1.50 of $1.00)",
+        }),
       }),
     );
     expect(dbStub.insertValues).toHaveBeenCalledWith(
