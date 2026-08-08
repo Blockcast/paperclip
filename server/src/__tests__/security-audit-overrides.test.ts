@@ -16,6 +16,7 @@ describe("PEN-1198 audit dependency remediation", () => {
       ">=6.27.0 <7",
     );
     expect(overrides["jsdom>undici"]).toBe(">=7.29.0 <8");
+    expect(overrides["js-yaml"]).toBe(">=4.3.1 <5");
     expect(overrides.multer).toBe(">=2.2.0 <3");
     expect(serverPackageJson.dependencies.multer).toBe("^2.2.0");
   });
