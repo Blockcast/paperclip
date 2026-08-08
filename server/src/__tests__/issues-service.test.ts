@@ -9694,3 +9694,184 @@ describeEmbeddedPostgres("issueService.update expectedCurrentStatus (BLO-18797)"
     expect(updated?.status).toBe("in_progress");
   });
 });
+
+describeEmbeddedPostgres("issueService.update delegate recovery blocker guard (BLO-20385)", () => {
+  let db!: ReturnType<typeof createDb>;
+  let svc!: ReturnType<typeof issueService>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-delegate-recovery-blockers-");
+    db = createDb(tempDb.connectionString);
+    svc = issueService(db);
+  });
+
+  afterEach(async () => {
+    await db.delete(issueComments);
+    await db.delete(issueRelations);
+    await db.delete(issueInboxArchives);
+    await db.delete(activityLog);
+    await db.delete(issues);
+    await db.delete(heartbeatRuns);
+    await db.delete(executionWorkspaces);
+    await db.delete(projectWorkspaces);
+    await db.delete(projects);
+    await db.delete(goals);
+    await db.delete(agents);
+    await db.delete(instanceSettings);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  async function seedBlockedIssue() {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "DelegateRecoveryAgent",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Delegate recovery target",
+      status: "blocked",
+      priority: "critical",
+      assigneeAgentId: agentId,
+    });
+    return { companyId, agentId, issueId };
+  }
+
+  async function addBlocker(companyId: string, blockedIssueId: string, status: "todo" | "done") {
+    const blockerId = randomUUID();
+    await db.insert(issues).values({
+      id: blockerId,
+      companyId,
+      title: `Blocker (${status})`,
+      status,
+      priority: "high",
+    });
+    await db.insert(issueRelations).values({
+      id: randomUUID(),
+      companyId,
+      issueId: blockerId,
+      relatedIssueId: blockedIssueId,
+      type: "blocks",
+    });
+    return blockerId;
+  }
+
+  async function readBlockerIds(issueId: string) {
+    const rows = await db
+      .select({ blockerIssueId: issueRelations.issueId })
+      .from(issueRelations)
+      .where(eq(issueRelations.relatedIssueId, issueId));
+    return rows.map((row) => row.blockerIssueId).sort();
+  }
+
+  function delegateRecoveryUnpark(issueId: string, assigneeAgentId: string) {
+    return svc.update(issueId, {
+      status: "todo",
+      blockedByIssueIds: [],
+      expectedCurrentStatus: "blocked",
+      expectedCurrentAssigneeAgentId: assigneeAgentId,
+      requireDependencyReadyBeforeClearingBlockers: true,
+    });
+  }
+
+  it("refuses a live blocker and leaves both the issue and edge unchanged", async () => {
+    const { companyId, agentId, issueId } = await seedBlockedIssue();
+    const blockerId = await addBlocker(companyId, issueId, "todo");
+
+    await expect(delegateRecoveryUnpark(issueId, agentId)).rejects.toMatchObject({
+      status: 409,
+      details: {
+        reason: "delegate_recovery_unresolved_blockers",
+        unresolvedBlockerIssueIds: [blockerId],
+      },
+    });
+
+    expect(await readBlockerIds(issueId)).toEqual([blockerId]);
+    const row = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row?.status).toBe("blocked");
+  });
+
+  it("allows recovery past a terminal blocker edge and clears that stale edge", async () => {
+    const { companyId, agentId, issueId } = await seedBlockedIssue();
+    await addBlocker(companyId, issueId, "done");
+
+    const updated = await delegateRecoveryUnpark(issueId, agentId);
+
+    expect(updated?.status).toBe("todo");
+    expect(await readBlockerIds(issueId)).toEqual([]);
+  });
+
+  it("does not constrain ordinary blocker edits when the delegate guard is absent", async () => {
+    const { companyId, issueId } = await seedBlockedIssue();
+    await addBlocker(companyId, issueId, "todo");
+
+    const updated = await svc.update(issueId, { blockedByIssueIds: [] });
+
+    expect(updated).not.toBeNull();
+    expect(await readBlockerIds(issueId)).toEqual([]);
+  });
+
+  it("rechecks readiness after waiting on a concurrent blocker write", async () => {
+    const { companyId, agentId, issueId } = await seedBlockedIssue();
+    const blockerId = randomUUID();
+    await db.insert(issues).values({
+      id: blockerId,
+      companyId,
+      title: "Concurrent live blocker",
+      status: "todo",
+      priority: "high",
+    });
+
+    const targetLocked = deferred<void>();
+    const allowBlockerCommit = deferred<void>();
+    const concurrentBlockerWrite = db.transaction(async (tx) => {
+      await tx.execute(sql`select ${issues.id} from ${issues} where ${issues.id} = ${issueId} for update`);
+      targetLocked.resolve();
+      await allowBlockerCommit.promise;
+      await tx.insert(issueRelations).values({
+        id: randomUUID(),
+        companyId,
+        issueId: blockerId,
+        relatedIssueId: issueId,
+        type: "blocks",
+      });
+    });
+
+    await targetLocked.promise;
+    const unpark = delegateRecoveryUnpark(issueId, agentId);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    allowBlockerCommit.resolve();
+    await concurrentBlockerWrite;
+
+    await expect(unpark).rejects.toMatchObject({
+      status: 409,
+      details: { reason: "delegate_recovery_unresolved_blockers" },
+    });
+    expect(await readBlockerIds(issueId)).toEqual([blockerId]);
+  });
+});

@@ -8490,6 +8490,14 @@ export function issueService(db: Db) {
          * version when the statement blocks on a concurrent transaction.
          */
         expectedCurrentAssigneeAgentId?: string | null;
+        /**
+         * Used only by the exact delegate-recovery unpark route. That route
+         * clears `blockedByIssueIds`, so it authorizes the write only after it
+         * has established that every explicit blocker is terminal. Recheck
+         * after taking the issue-row lock to make that authorization fact hold
+         * at the point where edges would otherwise be removed.
+         */
+        requireDependencyReadyBeforeClearingBlockers?: boolean;
       },
       dbOrTx: any = db,
     ) => {
@@ -8507,6 +8515,7 @@ export function issueService(db: Db) {
         actorUserId,
         expectedCurrentStatus,
         expectedCurrentAssigneeAgentId,
+        requireDependencyReadyBeforeClearingBlockers,
         ...issueData
       } = data;
 
@@ -8781,6 +8790,33 @@ export function issueService(db: Db) {
           .where(eq(issues.id, id))
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!lockedExisting) return null;
+
+        // The route's readiness lookup gives a useful pre-write 409, but it is
+        // only a snapshot. `syncBlockedByIssueIds` takes this same row lock for
+        // blocker additions, so rechecking after the lock means a concurrent
+        // addition either committed and is visible here or waits until after
+        // this recovery has completed. Keep the option narrow: ordinary
+        // coordination edits must retain their existing blocker-write behavior.
+        if (
+          requireDependencyReadyBeforeClearingBlockers &&
+          blockedByIssueIds !== undefined &&
+          blockedByIssueIds.length === 0
+        ) {
+          const readiness = (
+            await listIssueDependencyReadinessMap(tx, lockedExisting.companyId, [lockedExisting.id])
+          ).get(lockedExisting.id) ?? createIssueDependencyReadiness(lockedExisting.id);
+          if (readiness.unresolvedBlockerCount > 0) {
+            throw conflict(
+              "Cannot unpark an issue that still has unresolved blockers: this patch shape clears blockedByIssueIds and would delete live dependency edges",
+              {
+                issueId: lockedExisting.id,
+                reason: "delegate_recovery_unresolved_blockers",
+                unresolvedBlockerCount: readiness.unresolvedBlockerCount,
+                unresolvedBlockerIssueIds: readiness.unresolvedBlockerIssueIds,
+              },
+            );
+          }
+        }
 
         let nextProjectId = issueData.projectId !== undefined
           ? issueData.projectId

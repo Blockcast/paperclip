@@ -5308,6 +5308,24 @@ export function issueRoutes(
       creatorOrManagerChainDecision &&
       isCreatorOrManagerChainRecoveryPatch(issue, req.body as Record<string, unknown>)
     ) {
+      // This narrow recovery shape always clears `blockedByIssueIds`. Do not
+      // admit it while an explicit dependency is still live, or the otherwise
+      // limited creator/manager-chain grant would silently remove an edge the
+      // caller is not allowed to edit. Terminal edges remain recoverable.
+      const readiness = await svc.getDependencyReadiness(issue.id);
+      if (readiness.unresolvedBlockerCount > 0) {
+        res.status(409).json({
+          error:
+            "Cannot unpark an issue that still has unresolved blockers: this patch shape clears blockedByIssueIds and would delete live dependency edges",
+          details: {
+            issueId: issue.id,
+            reason: "delegate_recovery_unresolved_blockers",
+            unresolvedBlockerCount: readiness.unresolvedBlockerCount,
+            unresolvedBlockerIssueIds: readiness.unresolvedBlockerIssueIds,
+          },
+        });
+        return false;
+      }
       return true;
     }
     if (creatorOrManagerChainDecision && !options.allowCreatorOrManagerChainOwnership) {
@@ -10210,6 +10228,10 @@ export function issueRoutes(
                     // reassignment to an unrelated agent that keeps the row
                     // blocked would still satisfy an id+status predicate.
                     expectedCurrentAssigneeAgentId: existing.assigneeAgentId,
+                    // Repeat dependency readiness inside the service
+                    // transaction before clearing edges so a concurrent
+                    // blocker add cannot be lost.
+                    requireDependencyReadyBeforeClearingBlockers: true,
                   }
                 : {}),
             },
@@ -10243,6 +10265,7 @@ export function issueRoutes(
                 // See the transactional branch above: the assignee is an
                 // authorization-relevant snapshot field for allow_manager_chain.
                 expectedCurrentAssigneeAgentId: existing.assigneeAgentId,
+                requireDependencyReadyBeforeClearingBlockers: true,
               }
             : {}),
         });

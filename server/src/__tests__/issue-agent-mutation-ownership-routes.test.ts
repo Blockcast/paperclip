@@ -3367,8 +3367,76 @@ describe("agent issue mutation checkout ownership", () => {
         status: "todo",
         expectedCurrentStatus: "blocked",
         expectedCurrentAssigneeAgentId: ownerAgentId,
+        requireDependencyReadyBeforeClearingBlockers: true,
       });
       expect(patch.blockedByIssueIds).toEqual([]);
+    },
+  );
+
+  it.each(commentGrantMutationDenialCases)(
+    "refuses delegate recovery with live explicit blockers for a %s comment grant holder",
+    async (_kind, agentRows, issueOverrides) => {
+      useProductionIssueAuthorization(agentRows);
+      mockIssueService.getById.mockResolvedValue(
+        makeIssue({ status: "blocked", assigneeAgentId: ownerAgentId, ...issueOverrides }),
+      );
+      const liveBlockerId = "99999999-9999-4999-8999-999999999999";
+      mockIssueService.getDependencyReadiness.mockResolvedValue({
+        issueId,
+        blockerIssueIds: [liveBlockerId],
+        unresolvedBlockerCount: 1,
+        unresolvedBlockerIssueIds: [liveBlockerId],
+        pendingFinalizeBlockerIssueIds: [],
+        allBlockersDone: false,
+        isDependencyReady: false,
+      });
+
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "todo", blockedByIssueIds: [] });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body.details).toMatchObject({
+        reason: "delegate_recovery_unresolved_blockers",
+        unresolvedBlockerCount: 1,
+        unresolvedBlockerIssueIds: [liveBlockerId],
+      });
+      expect(mockIssueService.getDependencyReadiness).toHaveBeenCalledWith(issueId);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(commentGrantMutationDenialCases)(
+    "keeps terminal-edge delegate recovery available for a %s comment grant holder",
+    async (_kind, agentRows, issueOverrides) => {
+      useProductionIssueAuthorization(agentRows);
+      const stored = makeIssue({ status: "blocked", assigneeAgentId: ownerAgentId, ...issueOverrides });
+      mockIssueService.getById.mockResolvedValue(stored);
+      mockIssueService.getDependencyReadiness.mockResolvedValue({
+        issueId,
+        blockerIssueIds: ["88888888-8888-4888-8888-888888888888"],
+        unresolvedBlockerCount: 0,
+        unresolvedBlockerIssueIds: [],
+        pendingFinalizeBlockerIssueIds: [],
+        allBlockersDone: true,
+        isDependencyReady: true,
+      });
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...stored,
+        ...patch,
+      }));
+
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "todo", blockedByIssueIds: [] });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      const [, patch] = mockIssueService.update.mock.calls.at(-1) as [string, Record<string, unknown>];
+      expect(patch).toMatchObject({
+        status: "todo",
+        blockedByIssueIds: [],
+        requireDependencyReadyBeforeClearingBlockers: true,
+      });
     },
   );
 
@@ -3446,6 +3514,7 @@ describe("agent issue mutation checkout ownership", () => {
     const [, patch] = mockIssueService.update.mock.calls.at(-1) as [string, Record<string, unknown>];
     expect(patch.expectedCurrentStatus).toBeUndefined();
     expect(patch.expectedCurrentAssigneeAgentId).toBeUndefined();
+    expect(patch.requireDependencyReadyBeforeClearingBlockers).toBeUndefined();
   });
 
   it.each([
