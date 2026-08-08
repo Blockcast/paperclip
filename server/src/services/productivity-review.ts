@@ -722,6 +722,67 @@ function formatTrigger(trigger: ProductivityReviewTrigger) {
   return "Long active duration";
 }
 
+const PRODUCTIVITY_REVIEW_TRIGGERS: readonly ProductivityReviewTrigger[] = [
+  "no_comment_streak",
+  "long_active_duration",
+  "high_churn",
+  "runtime_failure_streak",
+];
+
+// `buildReviewMarkdown` bakes the trigger that produced it into the
+// `- Primary trigger:` line. Reading it back out of the persisted description
+// means this comparison matches the Manager Decision guidance a reader sees,
+// rather than a separate record that could have drifted.
+function extractReviewTriggerFromDescription(description: string | null): ProductivityReviewTrigger | null {
+  if (!description) return null;
+  const match = description.match(/^- Primary trigger: `([a-z_]+)`/m);
+  const candidate = match?.[1];
+  return PRODUCTIVITY_REVIEW_TRIGGERS.find((trigger) => trigger === candidate) ?? null;
+}
+
+function buildManagerDecisionMarkdown(trigger: ProductivityReviewTrigger) {
+  return (trigger === "runtime_failure_streak"
+    ? [
+        "This trigger fired because the sampled runs never executed a model turn (failed liveness, zero input/output tokens) — the assignee was never given a chance to act. This is an infrastructure signal, not an agent-performance verdict; do not decompose, block, or cancel the underlying work on the strength of this alone.",
+        "",
+        "Route to platform/SRE for one of:",
+        "- Diagnose and fix the underlying dispatch/runtime fault (crashloop, provider outage, retry exhaustion)",
+        "- Confirm the fault has cleared and let the issue continue unattended (no assignee action needed)",
+        "- If the fault persists, escalate for infrastructure remediation instead of reassigning or cancelling the source work",
+      ]
+    : [
+        "A \"Close as productive\" verdict requires at least ONE of the following concrete progress signals:",
+        "- An assignee run-linked comment in the last 6h that contains a `Next action:` line",
+        "- A non-stale PR/MR link in the source issue's evidence (created or updated in the last 24h)",
+        "- A recent test result, artifact commit, or workspace deliverable in the last 6h",
+        "",
+        "If none of these signals is present, the correct verdict is one of:",
+        "- Request decomposition (the work is too large for a single heartbeat issue and needs to be split)",
+        "- Block with an unblock owner (the work needs human direction; name the gate)",
+        "- Stop/cancel (the work is not delivering value and should be wound down)",
+        "- Continue with a snooze window (only if the assignee has a clear next step but no surface evidence yet)",
+      ]).join("\n");
+}
+
+function replaceGeneratedReviewTriggerGuidance(
+  description: string,
+  previousTrigger: ProductivityReviewTrigger,
+  nextTrigger: ProductivityReviewTrigger,
+): string | null {
+  const previousTriggerLine = `- Primary trigger: \`${previousTrigger}\` (${formatTrigger(previousTrigger)})`;
+  const nextTriggerLine = `- Primary trigger: \`${nextTrigger}\` (${formatTrigger(nextTrigger)})`;
+  const previousManagerDecision = `## Manager Decision\n\n${buildManagerDecisionMarkdown(previousTrigger)}`;
+  const nextManagerDecision = `## Manager Decision\n\n${buildManagerDecisionMarkdown(nextTrigger)}`;
+
+  // Only replace exact generated text. A manager's edit to the decision block
+  // is authoritative, so an unexpected shape is intentionally left untouched.
+  if (!description.includes(previousTriggerLine) || !description.includes(previousManagerDecision)) return null;
+  const replacement = description
+    .replace(previousTriggerLine, nextTriggerLine)
+    .replace(previousManagerDecision, nextManagerDecision);
+  return replacement === description ? null : replacement;
+}
+
 // True when a run's most recent classification is `failed` liveness AND it
 // burned zero input+output tokens. That combination means the agent never
 // got a model turn — the runtime crashed, the process was killed, or every
@@ -2404,27 +2465,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       "",
       "## Manager Decision",
       "",
-      ...(evidence.trigger === "runtime_failure_streak"
-        ? [
-          "This trigger fired because the sampled runs never executed a model turn (failed liveness, zero input/output tokens) — the assignee was never given a chance to act. This is an infrastructure signal, not an agent-performance verdict; do not decompose, block, or cancel the underlying work on the strength of this alone.",
-          "",
-          "Route to platform/SRE for one of:",
-          "- Diagnose and fix the underlying dispatch/runtime fault (crashloop, provider outage, retry exhaustion)",
-          "- Confirm the fault has cleared and let the issue continue unattended (no assignee action needed)",
-          "- If the fault persists, escalate for infrastructure remediation instead of reassigning or cancelling the source work",
-        ]
-        : [
-          "A \"Close as productive\" verdict requires at least ONE of the following concrete progress signals:",
-          "- An assignee run-linked comment in the last 6h that contains a `Next action:` line",
-          "- A non-stale PR/MR link in the source issue's evidence (created or updated in the last 24h)",
-          "- A recent test result, artifact commit, or workspace deliverable in the last 6h",
-          "",
-          "If none of these signals is present, the correct verdict is one of:",
-          "- Request decomposition (the work is too large for a single heartbeat issue and needs to be split)",
-          "- Block with an unblock owner (the work needs human direction; name the gate)",
-          "- Stop/cancel (the work is not delivering value and should be wound down)",
-          "- Continue with a snooze window (only if the assignee has a clear next step but no surface evidence yet)",
-        ]),
+      buildManagerDecisionMarkdown(evidence.trigger),
     ].join("\n");
   }
 
@@ -2565,22 +2606,54 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           sql`select pg_advisory_xact_lock(hashtextextended(${evidence.sourceIssue.companyId} || ':' || ${existing.id}, 0))`,
         );
 
+        // The advisory lock serializes reconcilers, not normal issue edits.
+        // Lock and re-read the review row before changing its generated text so
+        // a manager edit cannot be overwritten between the outer lookup and
+        // this refresh transaction.
+        const lockedReview = await tx
+          .select({ description: issues.description })
+          .from(issues)
+          .where(eq(issues.id, existing.id))
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+        if (!lockedReview) {
+          return { throttled: true as const, lastRefreshAt: existing.updatedAt };
+        }
+
         const refreshState = await getRefreshCommentState(evidence.sourceIssue.companyId, existing.id, tx);
         const lastRefreshAt = refreshState.latestCreatedAt ?? existing.createdAt;
-        if (
-          refreshState.count >= opts.thresholds.maxRefreshComments ||
-          evidence.generatedAt.getTime() - lastRefreshAt.getTime() < effectiveRefreshIntervalMs
-        ) {
+        if (evidence.generatedAt.getTime() - lastRefreshAt.getTime() < effectiveRefreshIntervalMs) {
           return { throttled: true as const, lastRefreshAt };
         }
 
-        await addRefreshComment(
-          existing.id,
-          buildRefreshComment(evidence, opts.prefix),
-          evidence.generatedAt,
-          tx,
-        );
-        return { throttled: false as const, lastRefreshAt };
+        const previousTrigger = extractReviewTriggerFromDescription(lockedReview.description);
+        const replacement = previousTrigger !== null && previousTrigger !== evidence.trigger && lockedReview.description
+          ? replaceGeneratedReviewTriggerGuidance(lockedReview.description, previousTrigger, evidence.trigger)
+          : null;
+        if (replacement !== null) {
+          await tx
+            .update(issues)
+            .set({ description: replacement, updatedAt: evidence.generatedAt })
+            .where(eq(issues.id, existing.id));
+        }
+
+        // The cap applies only to repeated comments. A genuine trigger flip
+        // must still be able to repair the generated decision guidance.
+        const refreshCommentAdded = refreshState.count < opts.thresholds.maxRefreshComments;
+        if (refreshCommentAdded) {
+          await addRefreshComment(
+            existing.id,
+            buildRefreshComment(evidence, opts.prefix),
+            evidence.generatedAt,
+            tx,
+          );
+        }
+        return {
+          throttled: false as const,
+          lastRefreshAt,
+          descriptionRegenerated: replacement !== null,
+          refreshCommentAdded,
+        };
       });
 
       if (refreshOutcome.throttled) {
@@ -2593,6 +2666,9 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           },
           "productivity review refresh throttled: previous refresh within hard-floor window",
         );
+        return { kind: "existing" as const, reviewIssueId: existing.id };
+      }
+      if (!refreshOutcome.descriptionRegenerated && !refreshOutcome.refreshCommentAdded) {
         return { kind: "existing" as const, reviewIssueId: existing.id };
       }
       await logActivity(db, {
@@ -2610,6 +2686,8 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           noCommentStreak: evidence.noCommentStreak,
           runCountLastHour: evidence.runCountLastHour,
           commentCountLastHour: evidence.commentCountLastHour,
+          descriptionRegenerated: refreshOutcome.descriptionRegenerated,
+          refreshCommentAdded: refreshOutcome.refreshCommentAdded,
         },
       });
       return { kind: "updated" as const, reviewIssueId: existing.id };
