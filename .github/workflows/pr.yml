@@ -344,7 +344,9 @@ jobs:
   opencode_responses_replay:
     name: OpenCode Responses replay
     needs: [policy]
-    runs-on: default
+    # Keep this merge_group dependency off the shared default pool too; leaving
+    # even one required lane there would preserve the starvation path.
+    runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-paperclip-general' }}
     timeout-minutes: 15
 
     steps:
