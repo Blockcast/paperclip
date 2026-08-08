@@ -18856,11 +18856,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           isRunTerminal: (runIds) => findTerminalHeartbeatRunIds(agentId, runIds, agent.companyId),
         })
         : false;
-      // A live Job with no corresponding non-stale running row is an orphan or
+      // A live Job with no corresponding running row at all is an orphan or
       // terminating pod. Do not allocate a new slot until the reaper/kubelet
       // clears it. When running rows do exist, their atomic reservations define
       // capacity and distinct isolation keys may run concurrently.
-      if (externalLifecycle && runningCount === 0 && hasActiveExternalJob) {
+      //
+      // Gate on runningRunRows (every tracked row), NOT runningCount (only the
+      // non-stale ones). Those differ precisely when tracked runs are alive but
+      // quiet, and conflating them deadlocks dispatch: BLO-12990 excludes a
+      // >15min-silent run from the slot gate so it cannot starve new work, but
+      // if EVERY running row is silent then runningCount collapses to 0 while
+      // the Jobs are still `phase: active`, and this guard then blocks ALL
+      // dispatch — the exact starvation BLO-12990 set out to prevent, made
+      // total. It persists until every Job exits, because nothing here kills
+      // them: the destructive force-kill is keyed to EXTERNAL_LIFECYCLE_HARD_
+      // STALE_MS (45 min), deliberately far above the 15 min soft floor. That
+      // leaves a 30-minute window in which a run is uncounted, unkillable and
+      // Job-alive, and an agent whose runs all land in it stops dispatching
+      // entirely. Observed 2026-08-08: Ally held 9 running rows, all exactly
+      // 20 min silent (opencode_k8s never writes lastUsefulActionAt, so
+      // silence is measured from lastOutputAt and accrues fast), 12 live pods,
+      // ~80 queued runs, and zero dispatches for over an hour.
+      if (externalLifecycle && runningRunRows.length === 0 && hasActiveExternalJob) {
         await pruneStaleQueuedMaintenanceRunsForAgent(agentId);
         logger.debug(
           { agentId, adapterType: agent.adapterType },
