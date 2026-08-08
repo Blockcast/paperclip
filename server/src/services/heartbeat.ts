@@ -5293,6 +5293,36 @@ function allowsIssueInteractionWake(
   return Boolean(deriveCommentId(contextSnapshot, null));
 }
 
+/**
+ * The single definition of "can dispatch actually claim this row", as far as
+ * dependency blockers are concerned.
+ *
+ * `claimQueuedRun` cancels a queued run whose issue has unresolved blockers
+ * *unless* the run is an issue-interaction wake carrying a comment id — those
+ * are deliberately allowed to run on a blocked issue so a human can still talk
+ * to the assignee while it waits. Every dispatch-side readiness screen has to
+ * agree with that, or the two disagree in a way that is invisible and
+ * unbounded (BLO-21792 third review follow-up):
+ *
+ *   - the emergency/starvation lanes treat the row as unclaimable, so they
+ *     page PAST it looking for "real" work and it is never offered; and
+ *   - `dispatchRank` files it under the dependency-blocked rank (12+), below
+ *     every routine row, so on the pass that does collect it, it loses to
+ *     anything else in the window.
+ *
+ * Under sustained critical arrivals that combination has no upper bound — the
+ * exact starvation shape this issue exists to cap — while the claim path would
+ * have run the row immediately. Both sides now read this predicate, so a future
+ * change to the claim-time exemption cannot silently desynchronize them.
+ */
+function isEffectivelyDependencyReadyForDispatch(
+  contextSnapshot: Record<string, unknown> | null | undefined,
+  readiness: { isDependencyReady: boolean } | null | undefined,
+) {
+  if (readiness?.isDependencyReady ?? true) return true;
+  return allowsIssueInteractionWake(contextSnapshot);
+}
+
 async function listUnresolvedBlockerSummaries(
   dbOrTx: Pick<Db, "select">,
   companyId: string,
@@ -19255,7 +19285,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           const issueId = readNonEmptyString(snapshot.issueId);
           return Boolean(
             issueId
-            && (batchReadiness.get(issueId)?.isDependencyReady ?? true)
+            && isEffectivelyDependencyReadyForDispatch(snapshot, batchReadiness.get(issueId))
             && !isK8sIsolationRetryDeferred(snapshot, dispatchNow)
           );
         });
@@ -19364,7 +19394,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           const issueId = readNonEmptyString(snapshot.issueId);
           return Boolean(
             issueId
-            && (batchReadiness.get(issueId)?.isDependencyReady ?? true)
+            && isEffectivelyDependencyReadyForDispatch(snapshot, batchReadiness.get(issueId))
             && !isK8sIsolationRetryDeferred(snapshot, dispatchNow)
           );
         });
@@ -19525,9 +19555,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // "Eligible" must mean the same thing the claim loop means, or the
           // lane stops paging on a row that will not in fact be claimed and the
           // masking survives in a narrower form. A row counts only if it has a
-          // live issue, is dependency-ready, and is not an isolation retry still
-          // waiting on its timestamp — the same three screens the claim path
-          // applies, matching how lane A defines `foundReadyCritical`.
+          // live issue, is *effectively* dependency-ready (see
+          // `isEffectivelyDependencyReadyForDispatch` — a blocked issue whose
+          // wake is an interaction wake IS claimable), and is not an isolation
+          // retry still waiting on its timestamp — the same screens the claim
+          // path applies, matching how lane A defines `foundReadyCritical`.
           foundReadyAbsolute = batch.some((run) => {
             const snapshot = parseObject(run.contextSnapshot);
             const issueId = readNonEmptyString(snapshot.issueId);
@@ -19535,7 +19567,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             const issue = issueById.get(issueId);
             if (!issue || TERMINAL_ISSUE_STATUSES.has(issue.status)) return false;
             return Boolean(
-              (batchReadiness.get(issueId)?.isDependencyReady ?? true)
+              isEffectivelyDependencyReadyForDispatch(snapshot, batchReadiness.get(issueId))
               && !isK8sIsolationRetryDeferred(snapshot, dispatchNow)
             );
           });
@@ -19776,16 +19808,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           return waitedMs >= STARVATION_FULL_ESCALATION_MS ? 2 : 10;
         }
         // NB: the aging escalation below stays *underneath* this `!ready`
-        // check on purpose. A dependency-blocked run must never escalate to
-        // the front of the queue no matter how long it has waited, because it
-        // cannot run yet.
+        // check on purpose. A run that genuinely cannot be claimed must never
+        // escalate to the front of the queue no matter how long it has waited.
+        // `ready` here is *effective* claimability, not the raw blocker count:
+        // an interaction wake on a blocked issue is claimable (the claim path
+        // exempts it), so it is ranked as the runnable row it is rather than
+        // being buried at 12+ where sustained critical arrivals would starve it
+        // without bound — BLO-21792 third review follow-up.
         if (!ready) return 12 + issueRunPriorityRank(issue?.priority);
         // BLO-21792: absolute anti-starvation ceiling. Checked BEFORE the
         // priority-tiered floor below because it deliberately outranks it —
         // this is the one case where non-critical work may pass fresh critical
         // work, and only after a wait long enough that the alternative is an
-        // unbounded one. Kept under the `!ready` guard above: a
-        // dependency-blocked run must never jump the queue however long it has
+        // unbounded one. Kept under the `!ready` guard above: a run that cannot
+        // actually be claimed must not jump the queue however long it has
         // waited, since it still cannot run.
         if (waitedMs >= STARVATION_ABSOLUTE_ESCALATION_MS) {
           return ABSOLUTE_STARVATION_DISPATCH_RANK;
@@ -19822,7 +19858,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const snapshot = parseObject(queuedRun.contextSnapshot);
         const issueId = readNonEmptyString(snapshot.issueId);
         const ready = issueId
-          ? (dependencyReadiness.get(issueId)?.isDependencyReady ?? true)
+          ? isEffectivelyDependencyReadyForDispatch(snapshot, dependencyReadiness.get(issueId))
           : true;
         const issue = issueId ? issueById.get(issueId) : null;
         // Require both recoveryActionId AND source:"issue_recovery_action" (every
@@ -27912,6 +27948,30 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
      * semantics. Do not call from production code.
      */
     __test_executeRunForTesting: (runId: string) => executeRun(runId),
+
+    /**
+     * Test-only read of the bounded forward scan's resume cursor for an agent.
+     *
+     * The starvation-lane regressions turn on *cursor geometry*: the case is
+     * only asking its question while the aged target sits behind a resume
+     * cursor that has not been cleared. A cleared cursor means the forward scan
+     * exhausted and the next pass rescans from the head, which rediscovers the
+     * target through the MAIN scan — so the case would then pass against
+     * pre-fix source and prove nothing about the lane (BLO-21792, Ally review
+     * of PR #1022 at f7aa2df7, Important finding 2).
+     *
+     * That precondition was previously only *argued* from queue depth, which
+     * cannot distinguish "deep queue" from "cursor still advanced". Exposing
+     * the cursor lets the test assert it directly. Read-only; returns null when
+     * no cursor is set (i.e. the scan exhausted or never ran). Do not call from
+     * production code.
+     */
+    __test_getDispatchResumeCursor: (agentId: string) => {
+      const cursor = dispatchResumeCursorByAgent.get(agentId);
+      return cursor
+        ? { createdAt: cursor.createdAt, id: cursor.id, passes: cursor.passes }
+        : null;
+    },
     __test_tickDueIssueMonitors: (now?: Date) => tickDueIssueMonitors(now),
     // Override-aware scheduling-suppression check (honors the worktree
     // run-execution experimental setting). Callers outside the service that
