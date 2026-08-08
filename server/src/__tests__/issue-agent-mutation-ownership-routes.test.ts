@@ -3340,6 +3340,66 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueService.remove).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ["reassign", { assigneeAgentId: peerAgentId }],
+    ["cancel", { status: "cancelled" }],
+  ])("allows a manager-chain agent to %s an issue held by a non-invokable assignee", async (_kind, body) => {
+    useProductionIssueAuthorization([
+      makeAgent(peerAgentId),
+      makeAgent(ownerAgentId, { reportsTo: peerAgentId, status: "paused" }),
+    ]);
+    mockAgentService.getById.mockResolvedValue(makeAgent(ownerAgentId, { reportsTo: peerAgentId, status: "paused" }));
+    mockAgentService.resolveByReference.mockResolvedValue({ ambiguous: false, agent: makeAgent(peerAgentId) });
+    mockIssueService.getById.mockResolvedValue(makeIssue({ assigneeAgentId: ownerAgentId }));
+
+    const res = await request(await createApp(peerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send(body);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalled();
+    const [, patch] = mockIssueService.update.mock.calls.at(-1) as [string, Record<string, unknown>];
+    expect(patch).toMatchObject({
+      ...body,
+      expectedCurrentAssigneeAgentId: ownerAgentId,
+    });
+  });
+
+  it.each([
+    ["reassign", { assigneeAgentId: peerAgentId }],
+    ["cancel", { status: "cancelled" }],
+  ])("denies a manager-chain %s when the current assignee is invokable", async (_kind, body) => {
+    useProductionIssueAuthorization([
+      makeAgent(peerAgentId),
+      makeAgent(ownerAgentId, { reportsTo: peerAgentId, status: "active" }),
+    ]);
+    mockAgentService.getById.mockResolvedValue(makeAgent(ownerAgentId, { reportsTo: peerAgentId, status: "active" }));
+    mockIssueService.getById.mockResolvedValue(makeIssue({ assigneeAgentId: ownerAgentId }));
+
+    const res = await request(await createApp(peerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send(body);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.details).toMatchObject({ reason: "deny_missing_grant", boundary: "grant" });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("keeps DELETE denied to a manager-chain agent when the assignee is non-invokable", async () => {
+    useProductionIssueAuthorization([
+      makeAgent(peerAgentId),
+      makeAgent(ownerAgentId, { reportsTo: peerAgentId, status: "paused" }),
+    ]);
+    mockAgentService.getById.mockResolvedValue(makeAgent(ownerAgentId, { reportsTo: peerAgentId, status: "paused" }));
+    mockIssueService.getById.mockResolvedValue(makeIssue({ assigneeAgentId: ownerAgentId }));
+
+    const res = await request(await createApp(peerActor())).delete(`/api/issues/${issueId}`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.details).toMatchObject({ reason: "deny_missing_grant", boundary: "grant" });
+    expect(mockIssueService.remove).not.toHaveBeenCalled();
+  });
+
   it.each(commentGrantMutationDenialCases)(
     "lets an exact blocked-to-todo delegate recovery patch proceed for a %s comment grant holder",
     async (_kind, agentRows, issueOverrides) => {
