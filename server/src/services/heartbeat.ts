@@ -1137,6 +1137,17 @@ function requiresIssueExecutionRetryLock(retryReason: string | null | undefined)
   );
 }
 
+function issueExecutionRetryLockAvailable(
+  currentExecutionRunId: string | null | undefined,
+  run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "retryOfRunId">,
+) {
+  return (
+    currentExecutionRunId == null ||
+    currentExecutionRunId === run.id ||
+    (run.retryOfRunId != null && currentExecutionRunId === run.retryOfRunId)
+  );
+}
+
 function requiresInProgressIssueRetry(retryReason: string | null | undefined) {
   return requiresIssueExecutionRetryLock(retryReason);
 }
@@ -6485,11 +6496,14 @@ export function shouldAutoCheckoutIssueForWake(input: {
   }
 
   const wakeReason = readNonEmptyString(input.contextSnapshot?.wakeReason);
+  return isAutoCheckoutWakeReason(wakeReason);
+}
+
+function isAutoCheckoutWakeReason(wakeReason: string | null | undefined) {
   if (!wakeReason) return false;
   if (wakeReason === "issue_comment_mentioned") return false;
   if (wakeReason === "source_scoped_recovery_action") return false;
   if (wakeReason.startsWith("execution_")) return false;
-
   return true;
 }
 
@@ -12421,16 +12435,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .where(eq(agentWakeupRequests.id, wakeupRequest.id));
 
       await tx
-        .update(issues)
-        .set({
-          executionRunId: queuedRun.id,
-          executionAgentNameKey: normalizeAgentNameKey(agent.name),
-          executionLockedAt: now,
-          updatedAt: now,
-        })
-        .where(eq(issues.id, issue.id));
-
-      await tx
         .update(heartbeatRuns)
         .set({
           issueCommentStatus: "retry_queued",
@@ -12623,6 +12627,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const responsibleUserId = await resolveResponsibleUserIdForRunContext(run, retryContextSnapshot);
 
     const queued = await db.transaction(async (tx) => {
+      // Transactions touching both ownership rows always lock issue before run.
+      if (issueId) {
+        await tx
+          .select({ id: issues.id })
+          .from(issues)
+          .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
+          .for("update");
+      }
+      await tx
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId)))
+        .for("update");
+
       const wakeupRequest = await tx
         .insert(agentWakeupRequests)
         .values({
@@ -12683,9 +12701,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .update(issues)
           .set({
             checkoutRunId: null,
-            executionRunId: retryRun.id,
-            executionAgentNameKey: normalizeAgentNameKey(agent.name),
-            executionLockedAt: now,
+            executionRunId: null,
+            executionAgentNameKey: null,
+            executionLockedAt: null,
             updatedAt: now,
           })
           .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId), eq(issues.executionRunId, run.id)));
@@ -13222,7 +13240,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
     }
 
-    if (input.enforceIssueExecutionLock && issue.executionRunId !== run.id) {
+    if (input.enforceIssueExecutionLock && !issueExecutionRetryLockAvailable(issue.executionRunId, run)) {
       return {
         allowed: false,
         reason: "Scheduled retry suppressed because the issue execution lock belongs to a different run",
@@ -13783,7 +13801,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             issueId: promotionIssueId,
             details: { issueId: promotionIssueId, currentStatus: lockedIssue.status, requiredStatus: "in_progress" },
           };
-        } else if (lockedIssue.executionRunId !== dueRun.id) {
+        } else if (!issueExecutionRetryLockAvailable(lockedIssue.executionRunId, dueRun)) {
           promotionGate = {
             allowed: false,
             reason: "Scheduled retry suppressed because the issue execution lock belongs to a different run",
@@ -14371,7 +14389,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             };
           }
 
-          if (lockedIssue.executionRunId !== run.id) {
+          if (!issueExecutionRetryLockAvailable(lockedIssue.executionRunId, run)) {
             return {
               outcome: "not_scheduled",
               reason: "Scheduled retry suppressed because the issue execution lock belongs to a different run",
@@ -14540,9 +14558,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         await tx
           .update(issues)
           .set({
-            executionRunId: scheduledRun.id,
-            executionAgentNameKey: normalizeAgentNameKey(agent.name),
-            executionLockedAt: now,
+            executionRunId: null,
+            executionAgentNameKey: null,
+            executionLockedAt: null,
             ...(detachWorkspaceFromIssue
               ? {
                   executionWorkspaceId: null,
@@ -15136,6 +15154,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     const context = parseObject(run.contextSnapshot);
+    let issueDependencyReadyForAutoCheckout = true;
     if (isK8sIsolationRetryDeferred(context)) {
       return null;
     }
@@ -15223,6 +15242,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const dependencyReadiness = await issuesSvc.listDependencyReadiness(run.companyId, [issueId]);
       const readiness = dependencyReadiness.get(issueId);
       const unresolvedBlockerCount = readiness?.unresolvedBlockerCount ?? 0;
+      issueDependencyReadyForAutoCheckout = unresolvedBlockerCount === 0;
       if (unresolvedBlockerCount > 0 && !allowsIssueInteractionWake(context)) {
         await cancelQueuedRunForBlockedDependencies(run, issueId, readiness?.unresolvedBlockerIssueIds ?? []);
         logger.info({ runId: run.id, issueId, unresolvedBlockerCount }, "claimQueuedRun: cancelled blocked queued run");
@@ -15345,28 +15365,111 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       const claimedAgent = await getAgent(claimed.agentId);
       const issueLockRequired = !allowsIssueInteractionWake(claimedContext);
+      const claimedRetryReason = readNonEmptyString(claimedContext.retryReason) ?? claimed.scheduledRetryReason;
+      const executionRunClaimCondition =
+        requiresIssueExecutionRetryLock(claimedRetryReason) && claimed.retryOfRunId
+          ? or(
+              isNull(issues.executionRunId),
+              eq(issues.executionRunId, claimed.id),
+              eq(issues.executionRunId, claimed.retryOfRunId),
+            )
+          : or(isNull(issues.executionRunId), eq(issues.executionRunId, claimed.id));
+      const autoCheckoutWake = isAutoCheckoutWakeReason(claimedWakeReason);
+      const autoCheckoutIssueStatusCondition = (
+        autoCheckoutWake && issueDependencyReadyForAutoCheckout
+      )
+        ? and(
+            eq(issues.assigneeAgentId, claimed.agentId),
+            inArray(issues.status, ["todo", "backlog", "blocked"]),
+            sql`coalesce(${issues.executionState} ->> 'status', '') <> 'pending'`,
+          )
+        : undefined;
+      const issueStatusCondition = requiresInProgressIssueRetry(claimedRetryReason)
+        ? eq(issues.status, "in_progress")
+        : autoCheckoutIssueStatusCondition
+          ? or(inArray(issues.status, ["in_progress", "in_review"]), autoCheckoutIssueStatusCondition)
+          : inArray(issues.status, ["in_progress", "in_review"]);
+      const issueActorCondition = or(
+        eq(issues.assigneeAgentId, claimed.agentId),
+        and(
+          eq(issues.status, "in_review"),
+          sql`${issues.executionState} -> 'currentParticipant' ->> 'type' = 'agent'`,
+          sql`${issues.executionState} -> 'currentParticipant' ->> 'agentId' = ${claimed.agentId}`,
+        ),
+      );
       let claimedIssueLock: Pick<typeof issues.$inferSelect, "id" | "executionRunId"> | null = null;
       try {
-        claimedIssueLock = await db
-          .update(issues)
-          .set({
-            executionRunId: claimed.id,
-            executionAgentNameKey: normalizeAgentNameKey(claimedAgent?.name),
-            executionLockedAt: claimedAt,
-            updatedAt: claimedAt,
-          })
-          .where(
-            and(
-              eq(issues.id, claimedIssueId),
-              eq(issues.companyId, claimed.companyId),
-              // Mention/context runs can touch an issue, but only the current assignee
-              // owns the issue execution lock shown as the active run.
-              eq(issues.assigneeAgentId, claimed.agentId),
-              or(isNull(issues.executionRunId), eq(issues.executionRunId, claimed.id)),
-            ),
-          )
-          .returning({ id: issues.id, executionRunId: issues.executionRunId })
-          .then((rows) => rows[0] ?? null);
+        claimedIssueLock = await db.transaction(async (tx) => {
+          let blockerIssueIds: string[] = [];
+          if (autoCheckoutWake) {
+            await tx.execute(
+              sql`select pg_advisory_xact_lock(hashtextextended(${`paperclip:issue-blockers:${claimed.companyId}:${claimedIssueId}`}, 0))`,
+            );
+            const blockerRows = await tx
+              .select({ id: issueRelations.issueId })
+              .from(issueRelations)
+              .where(
+                and(
+                  eq(issueRelations.companyId, claimed.companyId),
+                  eq(issueRelations.relatedIssueId, claimedIssueId),
+                  eq(issueRelations.type, "blocks"),
+                ),
+              )
+              .orderBy(asc(issueRelations.issueId));
+            blockerIssueIds = blockerRows.map((row) => row.id);
+          }
+          // Relation writers lock this same complete set in UUID order.
+          const issueIdsToLock = [...new Set([claimedIssueId, ...blockerIssueIds])].sort();
+          const lockedIssues = await tx.execute(
+            sql`SELECT ${issues.id} FROM ${issues}
+                WHERE ${and(
+                  eq(issues.companyId, claimed.companyId),
+                  inArray(issues.id, issueIdsToLock),
+                )}
+                ORDER BY ${issues.id}
+                FOR UPDATE`,
+          );
+          if (lockedIssues.length !== issueIdsToLock.length) return null;
+
+          if (autoCheckoutWake) {
+            const lockedReadiness = await issuesSvc.listDependencyReadiness(
+              claimed.companyId,
+              [claimedIssueId],
+              tx,
+            );
+            if ((lockedReadiness.get(claimedIssueId)?.unresolvedBlockerCount ?? 0) > 0) return null;
+          }
+
+          const lockedRun = await tx
+            .select({ status: heartbeatRuns.status })
+            .from(heartbeatRuns)
+            .where(eq(heartbeatRuns.id, claimed.id))
+            .for("update")
+            .then((rows) => rows[0] ?? null);
+          if (lockedRun?.status !== "running") return null;
+
+          return tx
+            .update(issues)
+            .set({
+              executionRunId: claimed.id,
+              executionAgentNameKey: normalizeAgentNameKey(claimedAgent?.name),
+              executionLockedAt: claimedAt,
+              updatedAt: claimedAt,
+            })
+            .where(
+              and(
+                eq(issues.id, claimedIssueId),
+                eq(issues.companyId, claimed.companyId),
+                // Mention/context runs can touch an issue, but only the current assignee
+                // or execution-review participant owns the issue execution lock shown as the active run.
+                issueStatusCondition,
+                issueActorCondition,
+                executionRunClaimCondition,
+              ),
+            )
+            .returning({ id: issues.id, executionRunId: issues.executionRunId })
+            .then((rows) => rows[0] ?? null);
+        });
       } catch (error) {
         if (!isOpenRoutineExecutionUniqueViolation(error)) throw error;
         const racedLockOwner = await findOpenRoutineExecutionLockOwnerForIssue(claimed.companyId, claimedIssueId);
@@ -15600,7 +15703,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
     }
 
-    if (requiresIssueExecutionRetryLock(retryReason) && issue.executionRunId !== run.id) {
+    if (requiresIssueExecutionRetryLock(retryReason) && !issueExecutionRetryLockAvailable(issue.executionRunId, run)) {
       return {
         stale: true,
         errorCode: "issue_execution_lock_changed",
@@ -23895,8 +23998,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const recoverySessionBefore = recoveryAgentInvokable
       ? await resolveSessionBeforeForWakeup(recoveryAgent, taskKey)
       : null;
-    const recoveryAgentNameKey = normalizeAgentNameKey(recoveryAgent?.name);
-
     const promotionResult = await db.transaction(async (tx) => {
       // Lock the context issue (if any) AND every issue that still references this run.
       //
@@ -24265,17 +24366,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           })
           .where(eq(agentWakeupRequests.id, deferred.id));
 
-        await tx
-          .update(issues)
-          .set({
-            executionRunId: newRun.id,
-            executionAgentNameKey: normalizeAgentNameKey(deferredAgent.name),
-            executionLockedAt: now,
-            updatedAt: now,
-          })
-          // Promoted mention wakes are issue-scoped, not issue ownership transfers.
-          .where(and(eq(issues.id, issue.id), eq(issues.assigneeAgentId, deferredAgent.id)));
-
         return {
           kind: "promoted" as const,
           run: newRun,
@@ -24425,16 +24515,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           })
           .where(eq(agentWakeupRequests.id, wakeupRequest.id));
 
-        await tx
-          .update(issues)
-          .set({
-            executionRunId: queuedRun.id,
-            executionAgentNameKey: recoveryAgentNameKey,
-            executionLockedAt: now,
-            updatedAt: now,
-          })
-          .where(eq(issues.id, issue.id));
-
         return {
           kind: "queued_recovery" as const,
           run: queuedRun,
@@ -24580,16 +24660,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           updatedAt: now,
         })
         .where(eq(agentWakeupRequests.id, wakeupRequest.id));
-
-      await tx
-        .update(issues)
-        .set({
-          executionRunId: queuedRun.id,
-          executionAgentNameKey: recoveryAgentNameKey,
-          executionLockedAt: now,
-          updatedAt: now,
-        })
-        .where(eq(issues.id, issue.id));
 
       return {
         kind: "queued_recovery" as const,
@@ -25436,20 +25506,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               activeExecutionRun = null;
             } else {
               activeExecutionRun = legacyRun;
-              const legacyAgent = await tx
-                .select({ name: agents.name })
-                .from(agents)
-                .where(eq(agents.id, legacyRun.agentId))
-                .then((rows) => rows[0] ?? null);
-              await tx
-                .update(issues)
-                .set({
-                  executionRunId: legacyRun.id,
-                  executionAgentNameKey: normalizeAgentNameKey(legacyAgent?.name),
-                  executionLockedAt: new Date(),
-                  updatedAt: new Date(),
-                })
-                .where(eq(issues.id, issue.id));
+              if (legacyRun.status === "running") {
+                const legacyAgent = await tx
+                  .select({ name: agents.name })
+                  .from(agents)
+                  .where(eq(agents.id, legacyRun.agentId))
+                  .then((rows) => rows[0] ?? null);
+                await tx
+                  .update(issues)
+                  .set({
+                    executionRunId: legacyRun.id,
+                    executionAgentNameKey: normalizeAgentNameKey(legacyAgent?.name),
+                    executionLockedAt: new Date(),
+                    updatedAt: new Date(),
+                  })
+                  .where(eq(issues.id, issue.id));
+              }
             }
           }
         }
@@ -25704,15 +25776,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             .update(agentWakeupRequests)
             .set({ runId: scheduledRun.id, updatedAt: now })
             .where(eq(agentWakeupRequests.id, wakeupRequest.id));
-          await tx
-            .update(issues)
-            .set({
-              executionRunId: scheduledRun.id,
-              executionAgentNameKey: agentNameKey,
-              executionLockedAt: now,
-              updatedAt: now,
-            })
-            .where(eq(issues.id, issue.id));
           incrementDepBlockedMetric("dep_blocked_scheduled");
           return { kind: "dep_blocked_scheduled" as const, run: scheduledRun };
         }
