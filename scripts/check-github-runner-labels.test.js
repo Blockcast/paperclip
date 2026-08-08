@@ -113,3 +113,12 @@ test("PR e2e workflow uses the dedicated ARC e2e runner", async () => {
     "a later job must not satisfy the PR e2e runner assertion",
   );
 });
+
+test("PR workflow does not route jobs to the shared default pool", async () => {
+  const workflow = await readFile(path.join(repoRoot, ".github/workflows/pr.yml"), "utf8");
+  assert.doesNotMatch(
+    workflow,
+    /^\s*runs-on:\s*default\s*$/m,
+    "PR and merge-group jobs must use repository-scoped ARC pools",
+  );
+});
