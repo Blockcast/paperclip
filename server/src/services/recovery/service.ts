@@ -372,6 +372,19 @@ function isProviderQuotaRecovery(latestRun: LatestIssueRun) {
   return /(?:usage|rate|quota) limit|quota (?:exceeded|reset)|try again after/i.test(latestRun.error ?? "");
 }
 
+const K8S_POD_REMOVAL_TRUNCATION_MARKER =
+  "pod is gone — Job pod was removed (eviction, preemption, or external delete) before exit could be read";
+
+// A missing Kubernetes Job is an infrastructure interruption, not evidence that the
+// assignee failed the work. Ordinary claude_truncated failures must still use the
+// escalation path, so only the adapter's complete stable marker is accepted here.
+export function isInfraClassStrandedFailure(latestRun: LatestIssueRun): boolean {
+  if (!latestRun) return false;
+  if (latestRun.errorCode === "k8s_job_deleted_externally") return true;
+  if (latestRun.errorCode !== "claude_truncated") return false;
+  return (latestRun.error ?? "").includes(K8S_POD_REMOVAL_TRUNCATION_MARKER);
+}
+
 function resolveStrandedRecoveryCause(
   latestRun: LatestIssueRun,
   explicitCause?: StrandedRecoveryCause,
@@ -3731,11 +3744,15 @@ export function recoveryService(
     recoveryCause: StrandedRecoveryCause;
     preferredOwnerAgentId?: string | null;
   }) {
+    // Quota recovery deliberately follows the agent that actually hit the quota. The
+    // re-dispatch causes below instead follow the lock-fresh issue assignee so recovery
+    // never overwrites an assignment made after the failed run started.
     const originalAgentId = input.latestRun?.agentId ?? input.issue.assigneeAgentId;
     const returnOwnerAgentId = input.issue.assigneeAgentId ?? originalAgentId;
     const routeToOriginal = input.recoveryCause === "process_lost" ||
       input.recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON ||
-      input.recoveryCause === "codex_output_inactivity_monitor";
+      input.recoveryCause === "codex_output_inactivity_monitor" ||
+      (input.recoveryCause === "stranded_assigned_issue" && isInfraClassStrandedFailure(input.latestRun));
     if (input.recoveryCause === "provider_quota") {
       const retryAgentId = await resolveInvokableRecoveryAgentId(input.issue, originalAgentId);
       if (!retryAgentId) {
@@ -3752,13 +3769,13 @@ export function recoveryService(
       };
     }
     if (routeToOriginal) {
-      const ownerAgentId = await resolveInvokableRecoveryAgentId(input.issue, originalAgentId);
+      const ownerAgentId = await resolveInvokableRecoveryAgentId(input.issue, returnOwnerAgentId);
       if (ownerAgentId) {
-        return { ownerAgentId, returnOwnerAgentId: originalAgentId, routingFallbackReason: null };
+        return { ownerAgentId, returnOwnerAgentId, routingFallbackReason: null };
       }
       return {
         ownerAgentId: await resolveStrandedIssueRecoveryOwnerAgentId(input.issue),
-        returnOwnerAgentId: originalAgentId,
+        returnOwnerAgentId,
         routingFallbackReason: "The original assignee is not invokable; recovery fell through to the manager ladder.",
       };
     }
@@ -4084,6 +4101,7 @@ export function recoveryService(
       latestRunFailureSummary: summarizeRunFailureForIssueComment(input.latestRun),
       retryReason: readNonEmptyString(context.retryReason) ?? null,
       recoveryCause: input.recoveryCause,
+      infraClassCause: isInfraClassStrandedFailure(input.latestRun),
       originalAssigneeMcpKeys: extractAgentMcpKeys(input.sourceAssignee),
       originalAssigneeCapabilities: summarizeAgentCapabilities(input.sourceAssignee),
       sourceRunId: input.successfulRunHandoffEvidence?.sourceRunId ?? null,

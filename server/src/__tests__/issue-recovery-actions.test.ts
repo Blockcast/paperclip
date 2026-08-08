@@ -30,6 +30,7 @@ import { issueService } from "../services/issues.js";
 import {
   STRANDED_RECOVERY_MAX_OWNER_WAKE_ATTEMPTS,
   STRANDED_RECOVERY_OWNER_WAKE_HORIZON_MS,
+  isInfraClassStrandedFailure,
   recoveryService,
   strandedRecoveryWakeAttemptsExhausted,
 } from "../services/recovery/service.js";
@@ -552,6 +553,234 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       recoveryCause: "stranded_assigned_issue",
     });
   });
+
+  it("re-dispatches a pod-removal claude_truncated failure to the current assignee", async () => {
+    const { managerId, coderId, sourceIssue } = await seedCompany();
+    const enqueueWakeup = vi.fn<
+      (agentId: string, opts?: { payload?: unknown }) => Promise<{ id: string }>
+    >(async () => ({ id: randomUUID() }));
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const latestRun = {
+      id: randomUUID(),
+      agentId: coderId,
+      status: "failed",
+      error: "Claude run was truncated mid-stream; pod is gone — Job pod was removed " +
+        "(eviction, preemption, or external delete) before exit could be read",
+      errorCode: "claude_truncated",
+      contextSnapshot: { retryReason: "issue_continuation_needed" },
+      livenessState: "needs_followup",
+      resultJson: null,
+      usageJson: null,
+      createdAt: new Date(),
+    } as const;
+
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun,
+      comment: "Automatic continuation recovery failed.",
+    });
+
+    const [action] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+    expect(action).toMatchObject({
+      kind: "stranded_assigned_issue",
+      cause: "stranded_assigned_issue",
+      ownerAgentId: coderId,
+      returnOwnerAgentId: coderId,
+      evidence: { infraClassCause: true },
+    });
+    expect(action?.ownerAgentId).not.toBe(managerId);
+
+    const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
+    expect(updatedIssue).toMatchObject({
+      status: "blocked",
+      assigneeAgentId: coderId,
+    });
+    expect(enqueueWakeup).toHaveBeenCalledWith(coderId, expect.anything());
+  });
+
+  it("still escalates an ordinary claude_truncated failure to the manager", async () => {
+    const { managerId, coderId, sourceIssue } = await seedCompany();
+    const enqueueWakeup = vi.fn<
+      (agentId: string, opts?: { payload?: unknown }) => Promise<{ id: string }>
+    >(async () => ({ id: randomUUID() }));
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const latestRun = {
+      id: randomUUID(),
+      agentId: coderId,
+      status: "failed",
+      error: "Claude run was truncated mid-stream; exit code 1, reason=Error, message=panic",
+      errorCode: "claude_truncated",
+      contextSnapshot: { retryReason: "issue_continuation_needed" },
+      livenessState: "needs_followup",
+      resultJson: null,
+      usageJson: null,
+      createdAt: new Date(),
+    } as const;
+
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun,
+      comment: "Automatic continuation recovery failed.",
+    });
+
+    const [action] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+    expect(action).toMatchObject({
+      kind: "stranded_assigned_issue",
+      cause: "stranded_assigned_issue",
+      ownerAgentId: managerId,
+      returnOwnerAgentId: coderId,
+      evidence: { infraClassCause: false },
+    });
+
+    const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
+    expect(updatedIssue).toMatchObject({
+      status: "blocked",
+      assigneeAgentId: managerId,
+    });
+    expect(enqueueWakeup).toHaveBeenCalledWith(managerId, expect.anything());
+  });
+
+  describe("isInfraClassStrandedFailure", () => {
+    const baseRun = {
+      id: "run-1",
+      agentId: "agent-1",
+      status: "failed",
+      contextSnapshot: {},
+      livenessState: "needs_followup",
+      resultJson: null,
+      usageJson: null,
+      createdAt: new Date(),
+      finishedAt: null,
+    } as const;
+
+    it("accepts the explicit external-deletion error code regardless of error text", () => {
+      expect(
+        isInfraClassStrandedFailure({
+          ...baseRun,
+          errorCode: "k8s_job_deleted_externally",
+          error: "unrelated wording",
+        }),
+      ).toBe(true);
+    });
+
+    it("accepts the complete stable pod-removal marker", () => {
+      expect(
+        isInfraClassStrandedFailure({
+          ...baseRun,
+          errorCode: "claude_truncated",
+          error: "prefix: pod is gone — Job pod was removed (eviction, preemption, or external delete) before exit could be read",
+        }),
+      ).toBe(true);
+    });
+
+    it("rejects incidental or incomplete pod-removal wording", () => {
+      expect(
+        isInfraClassStrandedFailure({
+          ...baseRun,
+          errorCode: "claude_truncated",
+          error: "node preempted the eviction handler during shutdown and panicked",
+        }),
+      ).toBe(false);
+      expect(
+        isInfraClassStrandedFailure({
+          ...baseRun,
+          errorCode: "claude_truncated",
+          error: "pod is gone after the process panicked",
+        }),
+      ).toBe(false);
+    });
+
+    it("requires a truncated or explicit-deletion error code", () => {
+      expect(
+        isInfraClassStrandedFailure({
+          ...baseRun,
+          errorCode: "adapter_failed",
+          error: "pod is gone — Job pod was removed (eviction, preemption, or external delete) before exit could be read",
+        }),
+      ).toBe(false);
+    });
+  });
+
+  it.each([
+    [
+      "infra-class pod-removal failure",
+      "claude_truncated",
+      "pod is gone — Job pod was removed (eviction, preemption, or external delete) before exit could be read",
+      undefined,
+    ],
+    ["infra-class external Job deletion", "k8s_job_deleted_externally", "Job was deleted", undefined],
+    ["process loss", "process_lost", "process lost", undefined],
+    ["output inactivity", "codex_output_inactivity_monitor", "no output", undefined],
+    ["successful run missing state", "adapter_failed", "adapter failed", "successful_run_missing_state"],
+  ] as const)(
+    "re-dispatches %s to the lock-fresh assignee instead of the stale run agent",
+    async (_label, errorCode, error, explicitCause) => {
+      const { companyId, managerId, coderId, sourceIssue } = await seedCompany();
+      const reassignedAgentId = randomUUID();
+      await db.insert(agents).values({
+        id: reassignedAgentId,
+        companyId,
+        name: "Reassigned Engineer",
+        role: "engineer",
+        status: "idle",
+        reportsTo: managerId,
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      await db.update(issues).set({ assigneeAgentId: reassignedAgentId }).where(eq(issues.id, sourceIssue.id));
+
+      const enqueueWakeup = vi.fn(async () => null);
+      const recovery = recoveryService(db, { enqueueWakeup });
+      const latestRun = {
+        id: randomUUID(),
+        agentId: coderId,
+        status: errorCode === "adapter_failed" && explicitCause === "successful_run_missing_state"
+          ? "succeeded"
+          : "failed",
+        error,
+        errorCode,
+        contextSnapshot: { retryReason: "issue_continuation_needed" },
+        livenessState: "needs_followup",
+        resultJson: null,
+        usageJson: null,
+        createdAt: new Date(),
+      } as const;
+
+      // Supply the pre-reassignment snapshot to exercise the transaction's lock-fresh
+      // issue read; the latest assignment must win over latestRun.agentId.
+      await recovery.escalateStrandedAssignedIssue({
+        issue: sourceIssue,
+        previousStatus: "in_progress",
+        latestRun,
+        ...(explicitCause ? { recoveryCause: explicitCause } : {}),
+      });
+
+      const [action] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+      expect(action).toMatchObject({
+        ownerAgentId: reassignedAgentId,
+        returnOwnerAgentId: reassignedAgentId,
+      });
+      expect(action?.ownerAgentId).not.toBe(coderId);
+      expect(action?.ownerAgentId).not.toBe(managerId);
+
+      const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
+      expect(updatedIssue).toMatchObject({ assigneeAgentId: reassignedAgentId });
+      expect(enqueueWakeup).toHaveBeenCalledWith(reassignedAgentId, expect.anything());
+    },
+  );
 
   // BLO-19954: paired with the test above. A routine-execution issue whose
   // only run was cancelled because another open routine-execution issue
