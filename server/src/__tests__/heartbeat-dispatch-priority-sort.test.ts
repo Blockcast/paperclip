@@ -10,8 +10,8 @@
  * priority can cross the status boundary.
  *
  * Fix #1 (stale-run exclusion): verifies that a stale/silent running run does
- * not hold a dispatch slot hostage. A run is stale when its most-recent signal
- * (lastUsefulActionAt > lastOutputAt > startedAt) is older than
+ * not hold a dispatch slot hostage. A run is stale when its newest valid activity
+ * stamp is older than
  * EXTERNAL_LIFECYCLE_STALE_MS (15 min). Before the fix, stale runs counted as
  * "running" and blocked all dispatch for external-lifecycle agents via the hard
  * early-return gate — even when the k8s Job was already gone.
@@ -472,6 +472,110 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
       .where(eq(heartbeatRuns.id, todoRunId))
       .then((rows) => rows[0] ?? null);
     expect(todoRun?.status).not.toBe("queued");
+  });
+
+  it("keeps a slot occupied when output is newer than stale useful activity (BLO-20775)", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runningIssueId = randomUUID();
+    const queuedIssueId = randomUUID();
+    const issuePrefix = `N${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const stale = new Date(Date.now() - 20 * 60 * 1000);
+    const recentOutput = new Date(Date.now() - 60 * 1000);
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "NewestActivityCo",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "NewestActivityAgent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    await db.insert(issues).values([
+      {
+        id: runningIssueId,
+        companyId,
+        title: "In-flight work with recent output",
+        status: "in_progress",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        issueNumber: 1,
+        identifier: `${issuePrefix}-1`,
+        startedAt: stale,
+      },
+      {
+        id: queuedIssueId,
+        companyId,
+        title: "Queued work",
+        status: "todo",
+        priority: "high",
+        assigneeAgentId: agentId,
+        issueNumber: 2,
+        identifier: `${issuePrefix}-2`,
+      },
+    ]);
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId,
+      invocationSource: "heartbeat",
+      triggerDetail: "timer",
+      status: "running",
+      contextSnapshot: { issueId: runningIssueId, wakeReason: "heartbeat_timer" },
+      startedAt: stale,
+      lastUsefulActionAt: stale,
+      lastOutputAt: recentOutput,
+      createdAt: stale,
+      updatedAt: recentOutput,
+    });
+
+    const queuedWakeupId = randomUUID();
+    const queuedRunId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: queuedWakeupId,
+      companyId,
+      agentId,
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId: queuedIssueId },
+      status: "queued",
+      runId: queuedRunId,
+      requestedAt: recentOutput,
+      updatedAt: recentOutput,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: queuedRunId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "queued",
+      wakeupRequestId: queuedWakeupId,
+      contextSnapshot: { issueId: queuedIssueId, wakeReason: "issue_assigned" },
+      createdAt: recentOutput,
+      updatedAt: recentOutput,
+    });
+
+    await heartbeat.resumeQueuedRuns();
+
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+    const queuedRun = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, queuedRunId))
+      .then((rows) => rows[0] ?? null);
+    expect(queuedRun?.status).toBe("queued");
   });
 
   it("suppresses a queued same-issue retry even when the running row is stale", async () => {

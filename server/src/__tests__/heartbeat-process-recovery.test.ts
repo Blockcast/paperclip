@@ -1620,32 +1620,78 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
-  it("keeps a long-running external Job when durable useful progress is recent", async () => {
+  it("uses the newest valid activity stamp before reaping external Jobs (BLO-20775)", async () => {
     const stale = new Date(Date.now() - 46 * 60 * 1000);
-    const recentProgress = new Date(Date.now() - 60 * 1000);
-    const jobName = "agent-opencode-recent-progress";
-    const { companyId, agentId, runId } = await seedRunFixture({
-      adapterType: "opencode_k8s",
-      includeIssue: false,
-      externalRunId: jobName,
-      lastOutputAt: stale,
-    });
-    await db
-      .update(heartbeatRuns)
-      .set({ startedAt: stale, lastUsefulActionAt: recentProgress })
-      .where(eq(heartbeatRuns.id, runId));
-    await seedAdapterInvokeEvent({ companyId, agentId, runId });
-    await seedLaunchedReservation({ companyId, agentId, runId, jobName, jobUid: "recent-progress-uid" });
-    mockListAgentJobRunStatuses.mockResolvedValueOnce(new Map([[runId, {
-      phase: "active",
-      name: jobName,
-      uid: "recent-progress-uid",
-    }]]));
+    const older = new Date(Date.now() - 47 * 60 * 1000);
+    const recent = new Date(Date.now() - 60 * 1000);
+    const activityCases = [
+      {
+        label: "recent useful action after stale output",
+        lastUsefulActionAt: recent,
+        lastOutputAt: stale,
+        startedAt: older,
+      },
+      {
+        label: "recent output after stale useful action",
+        lastUsefulActionAt: stale,
+        lastOutputAt: recent,
+        startedAt: older,
+      },
+      {
+        label: "recent output with a null useful-action stamp",
+        lastUsefulActionAt: null,
+        lastOutputAt: recent,
+        startedAt: older,
+      },
+      {
+        label: "tied recent useful-action and output stamps",
+        lastUsefulActionAt: recent,
+        lastOutputAt: recent,
+        startedAt: older,
+      },
+      {
+        label: "recent start with both progress stamps null",
+        lastUsefulActionAt: null,
+        lastOutputAt: null,
+        startedAt: recent,
+      },
+    ];
+    const fixtures: Array<{ runId: string; jobName: string; jobUid: string }> = [];
+
+    for (const [index, activity] of activityCases.entries()) {
+      const jobName = `agent-opencode-newest-activity-${index}`;
+      const jobUid = `newest-activity-${index}`;
+      const { companyId, agentId, runId } = await seedRunFixture({
+        adapterType: "opencode_k8s",
+        includeIssue: false,
+        externalRunId: jobName,
+        lastOutputAt: activity.lastOutputAt,
+      });
+      await db
+        .update(heartbeatRuns)
+        .set({
+          createdAt: older,
+          startedAt: activity.startedAt,
+          lastOutputAt: activity.lastOutputAt,
+          lastUsefulActionAt: activity.lastUsefulActionAt,
+        })
+        .where(eq(heartbeatRuns.id, runId));
+      await seedAdapterInvokeEvent({ companyId, agentId, runId });
+      await seedLaunchedReservation({ companyId, agentId, runId, jobName, jobUid });
+      fixtures.push({ runId, jobName, jobUid });
+    }
+
+    mockListAgentJobRunStatuses.mockResolvedValueOnce(new Map(fixtures.map(({ runId, jobName, jobUid }) => [
+      runId,
+      { phase: "active" as const, name: jobName, uid: jobUid },
+    ])));
 
     const result = await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
 
-    expect(result.runIds).not.toContain(runId);
-    expect((await heartbeat.getRun(runId))?.status).toBe("running");
+    for (const { runId } of fixtures) {
+      expect(result.runIds).not.toContain(runId);
+      expect((await heartbeat.getRun(runId))?.status).toBe("running");
+    }
     expect(mockDeleteAgentJobsForRun).not.toHaveBeenCalled();
   });
 

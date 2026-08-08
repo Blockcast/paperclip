@@ -16510,9 +16510,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       "lastOutputAt" | "lastUsefulActionAt" | "startedAt" | "createdAt" | "finishedAt"
     >,
   ): number {
-    const liveProgressRef = runTimestampMs(run.lastUsefulActionAt) || runTimestampMs(run.lastOutputAt);
+    // These are independent timestamps. A priority fallback lets an old but
+    // non-null useful-action stamp hide newer streamed output, making active
+    // work look silent. Compare every valid source so recency is monotonic.
     return Math.max(
-      liveProgressRef,
+      runTimestampMs(run.lastUsefulActionAt),
+      runTimestampMs(run.lastOutputAt),
       runTimestampMs(run.finishedAt),
       runTimestampMs(run.startedAt),
       runTimestampMs(run.createdAt),
@@ -18827,21 +18830,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // BLO-12990 Fix #1: stale/silent running runs must not block new high-priority
       // work. Fetch full run rows so we can partition into active vs. stale using
       // the same silence metric the reaper uses (EXTERNAL_LIFECYCLE_STALE_MS). A run
-      // is stale when its most-recent signal (lastUsefulActionAt > lastOutputAt >
-      // startedAt) is older than the threshold. Only non-stale runs count toward the
-      // slot gate — a k8s Job that has been silent for >15 min should not starve
-      // newly-queued high-priority work indefinitely.
+      // is stale when the newest valid activity stamp is older than the threshold.
+      // Only non-stale runs count toward the slot gate — a k8s Job that has been
+      // silent for >15 min should not starve newly-queued high-priority work
+      // indefinitely.
       const dispatchNow = new Date();
       const staleFloorMs = dispatchNow.getTime() - EXTERNAL_LIFECYCLE_STALE_MS;
       const runningRunRows = await listRunningRunsForAgent(agentId);
       const nonStaleRunningRuns = runningRunRows.filter((r) => {
-        const signalMs = r.lastUsefulActionAt
-          ? new Date(r.lastUsefulActionAt).getTime()
-          : r.lastOutputAt
-          ? new Date(r.lastOutputAt).getTime()
-          : r.startedAt
-          ? new Date(r.startedAt).getTime()
-          : 0;
+        const signalMs = Math.max(
+          runTimestampMs(r.lastUsefulActionAt),
+          runTimestampMs(r.lastOutputAt),
+          runTimestampMs(r.startedAt),
+        );
         return signalMs >= staleFloorMs;
       });
       const runningCount = nonStaleRunningRuns.length;
