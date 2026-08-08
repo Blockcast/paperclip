@@ -1000,6 +1000,32 @@ function isTerminalDispatchRaceRun(
   );
 }
 
+// BLO-19160: the three issue columns adoption rewrites — the execution lock pair
+// plus the owner. Captured fresh when a handover marker is observed and used as
+// a compare-and-set precondition on every recovery mutation that observation
+// leads to.
+type IssueLockOwnerState = {
+  executionRunId: string | null;
+  checkoutRunId: string | null;
+  assigneeAgentId: string | null;
+};
+
+function issueLockOwnerStateMatches(a: IssueLockOwnerState, b: IssueLockOwnerState) {
+  return a.executionRunId === b.executionRunId &&
+    a.checkoutRunId === b.checkoutRunId &&
+    a.assigneeAgentId === b.assigneeAgentId;
+}
+
+// BLO-19160: the outcome of observing a checkout-handover marker when the
+// adopter can no longer prove continuity. `markerRunId` is the handover run —
+// the newest run genuinely scoped to this issue, so the honest retry parent.
+// `lockOwnerState` is the CAS precondition for every mutation the observation
+// leads to.
+type AdoptionHandoverNeutralRecovery = {
+  markerRunId: string;
+  lockOwnerState: IssueLockOwnerState;
+};
+
 function buildNonRetryableEscalationComment(input: {
   status: "todo" | "in_progress";
   latestRun: LatestIssueRun;
@@ -1765,6 +1791,94 @@ export function recoveryService(
       .then((rows) => rows[0] ?? null);
   }
 
+  // BLO-19160: the execution lock + owner as of a specific instant. The
+  // stranded-assigned sweep reads its candidates as one bulk snapshot and then
+  // performs many awaits per candidate, so by the time a per-candidate branch
+  // runs the snapshot's lock columns may be several seconds stale. Adoption
+  // rewrites exactly these three fields, so a handover observed against a stale
+  // snapshot resolves the *previous* terminal owner while a live adopter holds
+  // the current lock — and recovery then escalates or reassigns the issue out
+  // from under that live run. Re-read them at observation time, and CAS on them
+  // before any mutation the observation led to.
+  async function readIssueLockOwnerState(
+    companyId: string,
+    issueId: string,
+  ): Promise<IssueLockOwnerState | null> {
+    const [row] = await db
+      .select({
+        executionRunId: issues.executionRunId,
+        checkoutRunId: issues.checkoutRunId,
+        assigneeAgentId: issues.assigneeAgentId,
+      })
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.id, issueId)))
+      .limit(1);
+    return row ?? null;
+  }
+
+  // True when `expected` no longer describes the issue's committed lock/owner —
+  // i.e. this sweep lost the race and must take no side effect. A vanished issue
+  // counts as changed. `null`/`undefined` expectation means "no handover was
+  // observed on this candidate", so nothing extra is enforced.
+  async function issueLockOwnerStateChanged(
+    issueId: string,
+    expected: IssueLockOwnerState | null | undefined,
+  ): Promise<boolean> {
+    if (!expected) return false;
+    const [fresh] = await db
+      .select({
+        executionRunId: issues.executionRunId,
+        checkoutRunId: issues.checkoutRunId,
+        assigneeAgentId: issues.assigneeAgentId,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .limit(1);
+    if (!fresh) return true;
+    return !issueLockOwnerStateMatches(expected, fresh);
+  }
+
+  // Decide what a checkout-handover marker means for the issue it is scoped to.
+  // Returns null when there is nothing to recover — either a live same-assignee
+  // adopter holds the lock (continuity) or the issue vanished mid-sweep.
+  // Otherwise returns the neutral-recovery descriptor: the marker run for
+  // provenance, plus the lock/owner values to CAS every later mutation against.
+  async function resolveCheckoutAdoptionHandover(
+    issue: Pick<typeof issues.$inferSelect, "companyId" | "id">,
+    handoverMarkerRun: NonNullable<LatestIssueRun>,
+  ): Promise<AdoptionHandoverNeutralRecovery | null> {
+    // BLO-19160 finding 2: resolve the adopter from the lock as it is NOW, not
+    // as the candidate snapshot saw it before this loop began. Following stale
+    // lock ids resolves the *previous* terminal owner while a live adopter holds
+    // the current lock — a narrow-window re-entry into the exact BLO-18860
+    // failure mode this whole path exists to prevent.
+    const lockOwnerState = await readIssueLockOwnerState(issue.companyId, issue.id);
+    if (!lockOwnerState) return null;
+
+    const adoptingRun = await getCheckoutAdoptingRun(
+      { companyId: issue.companyId, ...lockOwnerState },
+      handoverMarkerRun,
+    );
+    // Compare against the assignee, not the sweep's `agentId`: adoption is only
+    // ever performed by the assignee's own run (`adoptStaleCheckoutRun` requires
+    // `assigneeAgentId = actor`), and on an `in_review` issue `agentId` is the
+    // review participant instead.
+    //
+    // The adopter proves continuity only while it is LIVE. A terminal adopter
+    // tells us nothing about this issue (see the caller), and so does the
+    // successor-less case: `clearCheckoutRunIfTerminal` (services/issues.ts)
+    // nulls BOTH lock columns once the adopter goes terminal, leaving no id to
+    // resolve here — the ordinary cleanup sequence, not an anomaly.
+    if (
+      adoptingRun &&
+      adoptingRun.agentId === lockOwnerState.assigneeAgentId &&
+      !isTerminalIssueRun(adoptingRun)
+    ) {
+      return null;
+    }
+    return { markerRunId: handoverMarkerRun.id, lockOwnerState };
+  }
+
   // Count the number of consecutive (most-recent-first) succeeded runs for
   // this issue whose livenessState is non-productive (plan_only,
   // empty_response, failed, or null). Stops counting at the first
@@ -2326,7 +2440,14 @@ export function recoveryService(
     source: string;
     retryOfRunId?: string | null;
     extraContext?: Record<string, unknown>;
+    // BLO-19160: when this recovery follows a checkout-handover observation,
+    // the lock/owner values it was decided on. If an adoption committed in the
+    // meantime a live run owns this issue now, and queuing a wake would put
+    // competing work against it.
+    expectedLockOwnerState?: IssueLockOwnerState | null;
   }) {
+    if (await issueLockOwnerStateChanged(input.issueId, input.expectedLockOwnerState)) return null;
+
     const queued = await deps.enqueueWakeup(input.agentId, {
       source: "automation",
       triggerDetail: "system",
@@ -2356,7 +2477,14 @@ export function recoveryService(
     return queued;
   }
 
-  async function enqueueInitialAssignedTodoDispatch(issue: typeof issues.$inferSelect, agentId: string) {
+  async function enqueueInitialAssignedTodoDispatch(
+    issue: typeof issues.$inferSelect,
+    agentId: string,
+    expectedLockOwnerState?: IssueLockOwnerState | null,
+  ) {
+    // BLO-19160: see `enqueueStrandedIssueRecovery` — on the handover path this
+    // dispatch must not race a freshly committed adoption.
+    if (await issueLockOwnerStateChanged(issue.id, expectedLockOwnerState)) return null;
     return deps.enqueueWakeup(agentId, {
       source: "assignment",
       triggerDetail: "system",
@@ -5185,7 +5313,11 @@ export function recoveryService(
     issue: typeof issues.$inferSelect;
     previousStatus: StrandedPreviousStatus;
     latestRun: LatestIssueRun;
+    expectedLockOwnerState?: IssueLockOwnerState | null;
   }) {
+    // BLO-19160: see `escalateStrandedAssignedIssue` — a handover-derived
+    // escalation must not commit if the lock/owner moved under it.
+    if (await issueLockOwnerStateChanged(input.issue.id, input.expectedLockOwnerState)) return null;
     const updated = await issuesSvc.update(input.issue.id, { status: "blocked" });
     if (!updated) return null;
 
@@ -5254,6 +5386,7 @@ export function recoveryService(
     issue: typeof issues.$inferSelect;
     previousStatus: "in_progress";
     latestRun: LatestIssueRun;
+    expectedLockOwnerState?: IssueLockOwnerState | null;
   }) {
     return await db.transaction(async (tx) => {
       await tx.execute(
@@ -5266,6 +5399,19 @@ export function recoveryService(
         .where(eq(issues.id, input.issue.id))
         .limit(1);
       if (!fresh || fresh.status !== "in_progress" || !hasActiveMonitorPath(fresh)) return null;
+
+      // BLO-19160: parking to `in_review` is a status mutation on the handover
+      // path just as much as an escalation is, so it takes the same CAS.
+      if (
+        input.expectedLockOwnerState &&
+        !issueLockOwnerStateMatches(input.expectedLockOwnerState, {
+          executionRunId: fresh.executionRunId,
+          checkoutRunId: fresh.checkoutRunId,
+          assigneeAgentId: fresh.assigneeAgentId,
+        })
+      ) {
+        return null;
+      }
 
       const updated = await issuesSvc.update(fresh.id, { status: "in_review" }, tx);
       if (!updated) return null;
@@ -5334,6 +5480,18 @@ export function recoveryService(
       if (!fresh) return "failed";
       if (fresh.status === "in_review") return "already_parked";
       if (fresh.status !== "in_progress") return "failed";
+
+      // BLO-19160: deliberately NO lock-owner CAS here, unlike the sibling
+      // parks/escalations. Two reasons, in order:
+      //   1. `ReviewWaitingParkOutcome` has no "took no action" variant, and a
+      //      lost race must not map to "failed" — the caller treats "failed" as
+      //      a genuine park failure and falls through to `blocked` escalation,
+      //      i.e. exactly the clobber a CAS is supposed to prevent. Guarding
+      //      here without a new outcome variant is worse than not guarding.
+      //   2. It is unreachable on the handover path anyway: the only call site
+      //      is gated on `isWaitingOnReviewContinuationRun(latestRun)`, which
+      //      requires `latestRun?.status === "cancelled"`, and the handover
+      //      path sets `latestRun` to null.
 
       // The in_review transition runs an evidence gate (issues.ts) that throws
       // `unprocessable` when the issue has no reviewable evidence yet (analysis-only
@@ -5536,7 +5694,16 @@ export function recoveryService(
       );
   }
 
-  async function resolveContinuationWaitingOnReview(issue: typeof issues.$inferSelect) {
+  // BLO-19160: `expectedLockOwnerState` is the handover-observation CAS. This
+  // helper mutates the issue to `blocked` and writes blocker relations, so it
+  // is an escalation side effect exactly like `escalateStrandedAssignedIssue`
+  // even though it is not one of the four enqueue/escalate helpers — which is
+  // precisely how the original "all N call sites guarded" audit missed it. Any
+  // audit of this path has to enumerate *mutations*, not helper names.
+  async function resolveContinuationWaitingOnReview(
+    issue: typeof issues.$inferSelect,
+    expectedLockOwnerState?: IssueLockOwnerState | null,
+  ) {
     const existingBlockers = await existingUnresolvedBlockerIssues(issue.companyId, issue.id);
     const openChildren = await db
       .select({ id: issues.id, identifier: issues.identifier })
@@ -5592,6 +5759,10 @@ export function recoveryService(
     // `in_review` park instead of aborting the whole periodic recovery sweep.
     let updated: Awaited<ReturnType<typeof issuesSvc.update>>;
     try {
+      // BLO-19160: re-check the handover lock/owner state immediately before
+      // the mutation. A live adopter committing after the handover observation
+      // must not be blocked out by this path.
+      if (await issueLockOwnerStateChanged(issue.id, expectedLockOwnerState)) return null;
       updated = await issuesSvc.update(issue.id, { status: "blocked", blockedByIssueIds });
     } catch (error) {
       if (!isBlockingRelationCycleError(error)) throw error;
@@ -5736,6 +5907,12 @@ export function recoveryService(
       executionRunId: string | null;
     };
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
+    // BLO-19160: when this escalation follows a checkout-handover observation,
+    // the lock/owner values it was decided on. Re-checked below against the
+    // in-transaction re-read, before any side effect — so a *detected* race
+    // takes no escalation or reassignment side effect. It is NOT a
+    // mutation-time CAS; see the limitation note at that check.
+    expectedLockOwnerState?: IssueLockOwnerState | null;
   }) {
     // `isRoutineExecutionDuplicateSuppressedRun` is a type predicate, so the
     // negative branch below narrows `input.latestRun` all the way to `null`.
@@ -5752,6 +5929,7 @@ export function recoveryService(
         issue: input.issue,
         previousStatus: input.previousStatus,
         latestRun: input.latestRun,
+        expectedLockOwnerState: input.expectedLockOwnerState,
       });
     }
 
@@ -5896,6 +6074,41 @@ export function recoveryService(
           },
           "skipping stranded escalation for dependency-wait terminal run",
         );
+        return null;
+      }
+
+      // BLO-19160: same shape as the status CAS above, for the lock/owner
+      // columns. An adoption that commits between the handover observation and
+      // this transaction means a live run holds this issue's execution lock;
+      // escalating on the evidence read before it would reassign the issue away
+      // from that run and revoke the assignee's write access — the BLO-18860
+      // failure mode through a narrower window. Bail rather than clobber.
+      //
+      // LIMITATION, measured — this NARROWS the window, it does not close it.
+      // `adoptStaleCheckoutRun` (services/issues.ts) takes no advisory lock; it
+      // serializes on a `select … for update` ROW lock of this row, so the two
+      // paths share no mutual-exclusion primitive and an adoption committing
+      // after this comparison is not excluded. The two obvious fixes both
+      // DEADLOCK here and were reverted after being measured:
+      //   * `fresh` → `.for("update")`, and/or
+      //   * routing the mutation below through `tx`
+      // Either one hangs `issue-recovery-actions.test.ts` at the 60s test
+      // timeout, because helpers between the read and the write touch this same
+      // issue row on the pooled `db` connection and block on the tx's lock.
+      // Closing it properly means threading `tx` through those helpers, which is
+      // BLO-18829's scope (`Stranded-escalation side effects escape when the
+      // expectedStatus CAS loses the race` — the identical defect class for the
+      // status CAS directly above). Until then: a *detected* race is side-effect
+      // free, because this check precedes the action upsert, quota monitor and
+      // wake enqueue.
+      if (
+        input.expectedLockOwnerState &&
+        !issueLockOwnerStateMatches(input.expectedLockOwnerState, {
+          executionRunId: fresh.executionRunId,
+          checkoutRunId: fresh.checkoutRunId,
+          assigneeAgentId: fresh.assigneeAgentId,
+        })
+      ) {
         return null;
       }
 
@@ -6725,7 +6938,7 @@ export function recoveryService(
         continue;
       }
 
-      let latestRun = await getLatestIssueRun(issue.companyId, issue.id);
+      const newestIssueRun = await getLatestIssueRun(issue.companyId, issue.id);
       // `issue_terminal_status` means this queued dispatch was correctly
       // cancelled while the issue was terminal. The candidate query above has
       // already established that the issue is non-terminal now, so this is
@@ -6733,50 +6946,58 @@ export function recoveryService(
       // to keep skipping the issue forever. Clear it before classification,
       // but retain the flag so an `in_progress` issue reaches the normal
       // continuation re-dispatch below instead of the generic no-run skip.
+      let latestRun: LatestIssueRun = newestIssueRun;
       const reopenedAfterTerminalDispatchRace = isTerminalDispatchRaceRun(latestRun);
       if (reopenedAfterTerminalDispatchRace) latestRun = null;
-      // Set when this issue's newest run is a handover marker whose successor
-      // can no longer be identified. Distinguishes "adopted, then the lock was
-      // cleaned up" from "this issue genuinely has no run history at all" —
-      // the no-run/no-lock guard below must skip only the latter.
-      let adoptionHandoverLostSuccessor = false;
       // BLO-18860: never judge an issue on a checkout-adoption cancellation.
-      // The adopting run is by construction the assignee's own *live* run, so
-      // this issue has continuity, not a lost execution path — but the
+      // The adopting run is by construction the assignee's own run, so this
+      // issue has continuity, not a lost execution path — but the
       // `hasActiveExecutionPath` check above cannot see that run (it matches on
       // `contextSnapshot ->> 'issueId'`, and the adopting run is scoped to
       // whichever issue its own dispatch was for). Left unhandled, the handover
       // marker is the newest run row for this issue, reads as
       // terminal-unsuccessful, and escalates the issue away from the agent that
-      // had just written to it. Resolve the evidence to the adopting run
-      // instead: live same-assignee run → continuity, otherwise judge the issue
-      // on that run's real outcome so no escalation ever cites
-      // `issue_checkout_adopted` as its cause.
-      if (isCheckoutAdoptionCancelledRun(latestRun)) {
-        const adoptingRun = await getCheckoutAdoptingRun(issue, latestRun);
-        // Compare against the assignee, not `agentId`: adoption is only ever
-        // performed by the assignee's own run (`adoptStaleCheckoutRun` requires
-        // `assigneeAgentId = actor`), and on an `in_review` issue `agentId` is
-        // the review participant instead.
-        if (
-          adoptingRun &&
-          adoptingRun.agentId === issue.assigneeAgentId &&
-          !isTerminalIssueRun(adoptingRun)
-        ) {
+      // had just written to it.
+      let adoptionHandover: AdoptionHandoverNeutralRecovery | null = null;
+      if (isCheckoutAdoptionCancelledRun(newestIssueRun)) {
+        adoptionHandover = await resolveCheckoutAdoptionHandover(issue, newestIssueRun);
+        // Continuity (a live same-assignee adopter holds the lock) or the issue
+        // vanished mid-sweep. Either way there is nothing to recover.
+        if (!adoptionHandover) {
           result.skipped += 1;
           continue;
         }
-        // No successor run resolvable: the adopter went terminal and
-        // `clearCheckoutRunIfTerminal` (services/issues.ts) nulled BOTH lock
-        // columns, so `getCheckoutAdoptingRun` has no id left to look up. That
-        // is the ordinary cleanup sequence, not an anomaly. Record it — the
-        // handover marker stays the newest run scoped to this issue forever, so
-        // without this flag the no-run/no-lock guard below would skip the issue
-        // on this sweep and on every sweep after it, stranding for good an
-        // issue whose only crime was being adopted once.
-        adoptionHandoverLostSuccessor = !adoptingRun;
-        latestRun = adoptingRun;
       }
+      // BLO-19160 finding 1: on the handover path this issue is judged with NO
+      // run evidence. The handover marker itself is bookkeeping about the run
+      // that lost the checkout, and the adopter — once terminal — is by
+      // construction scoped to a *different* issue, so its error code,
+      // workspace result, quota state, liveness and retry budget all describe
+      // that other issue's work. Substituting the adopter as `latestRun` (as
+      // this branch used to) let a foreign nonretryable outcome block,
+      // reassign, or suppress recovery on an issue for which the condition was
+      // never true. Carrying no evidence instead lands the issue on the neutral
+      // continuation recovery at the end of the loop: it is known to need a
+      // live execution path, and nothing more than that is known.
+      //
+      // Annotated (rather than inferred) because `isCheckoutAdoptionCancelledRun`
+      // is a type predicate: without the annotation TS narrows its *negative*
+      // branch to `null` too, and reads every run check below as unreachable.
+      if (adoptionHandover) latestRun = null;
+      // The marker stays the newest run scoped to this issue forever, so the
+      // no-run/no-lock guard below must not read the resulting absence of
+      // evidence as "nothing to recover from" and skip the issue on this sweep
+      // and every sweep after it.
+      const adoptionHandoverNeedsNeutralRecovery = Boolean(adoptionHandover);
+      // Provenance for that neutral recovery. The handover marker is the newest
+      // run genuinely scoped to THIS issue, which makes it the honest retry
+      // parent — unlike the lock columns, which on this path may name a run
+      // dispatched for someone else's issue.
+      const adoptionHandoverMarkerRunId = adoptionHandover?.markerRunId ?? null;
+      // Lock/owner values re-read at the instant the handover was observed.
+      // Non-null only on the handover path; every recovery mutation below CASes
+      // against it so a lost race takes no side effect.
+      const adoptionHandoverLockGuard = adoptionHandover?.lockOwnerState ?? null;
       const agent = await getAgent(agentId);
       const agentInvokable = agent && agent.companyId === issue.companyId
         ? await isAgentInvokable(agent)
@@ -6887,6 +7108,7 @@ export function recoveryService(
           continue;
         }
         const updated = await escalateStrandedRecoveryIssueInPlace({
+          expectedLockOwnerState: adoptionHandoverLockGuard,
           issue,
           previousStatus: issue.status as StrandedPreviousStatus,
           latestRun,
@@ -6926,6 +7148,7 @@ export function recoveryService(
           continue;
         } else {
           const updated = await escalateStrandedAssignedIssue({
+            expectedLockOwnerState: adoptionHandoverLockGuard,
             issue,
             previousStatus: issue.status as StrandedPreviousStatus,
             latestRun,
@@ -7015,7 +7238,7 @@ export function recoveryService(
             acceptedInteractionResolvedAt,
           );
           if (consecutive >= INTERACTION_CONTINUATION_REQUEUE_MAX_ATTEMPTS && latestPostResolutionRun) {
-            const resolved = await resolveContinuationWaitingOnReview(issue);
+            const resolved = await resolveContinuationWaitingOnReview(issue, adoptionHandoverLockGuard);
             if (resolved) {
               result.waitingOnReviewResolved += 1;
               result.issueIds.push(issue.id);
@@ -7023,6 +7246,7 @@ export function recoveryService(
             }
 
             const updated = await escalateStrandedAssignedIssue({
+              expectedLockOwnerState: adoptionHandoverLockGuard,
               issue,
               previousStatus: issue.status as StrandedPreviousStatus,
               latestRun: latestPostResolutionRun,
@@ -7041,6 +7265,7 @@ export function recoveryService(
           }
 
           const queued = await enqueueStrandedIssueRecovery({
+            expectedLockOwnerState: adoptionHandoverLockGuard,
             issueId: issue.id,
             agentId,
             reason: "issue_continuation_needed",
@@ -7076,6 +7301,7 @@ export function recoveryService(
         if (!participantLatestRun || !isTerminalIssueRun(participantLatestRun)) {
           if (!agentInvokable) {
             const updated = await escalateStrandedAssignedIssue({
+              expectedLockOwnerState: adoptionHandoverLockGuard,
               issue,
               previousStatus: "in_review",
               latestRun: participantLatestRun,
@@ -7170,6 +7396,7 @@ export function recoveryService(
         }
         if (participantAdapterFailureClassification?.kind === "configuration_incomplete") {
           const updated = await escalateStrandedAssignedIssue({
+            expectedLockOwnerState: adoptionHandoverLockGuard,
             issue,
             previousStatus: "in_review",
             latestRun: participantLatestRun,
@@ -7195,6 +7422,7 @@ export function recoveryService(
 
         if (!agentInvokable) {
           const updated = await escalateStrandedAssignedIssue({
+            expectedLockOwnerState: adoptionHandoverLockGuard,
             issue,
             previousStatus: "in_review",
             latestRun: participantLatestRun,
@@ -7223,6 +7451,7 @@ export function recoveryService(
 
         if (didAutomaticRecoveryFail(participantLatestRun, EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON)) {
           const updated = await escalateStrandedAssignedIssue({
+            expectedLockOwnerState: adoptionHandoverLockGuard,
             issue,
             previousStatus: "in_review",
             latestRun: participantLatestRun,
@@ -7255,6 +7484,7 @@ export function recoveryService(
         }
 
         const queued = await enqueueStrandedIssueRecovery({
+          expectedLockOwnerState: adoptionHandoverLockGuard,
           issueId: issue.id,
           agentId: participantAgentId,
           reason: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
@@ -7290,7 +7520,7 @@ export function recoveryService(
           }
 
           const queued = await enqueueWithAssignmentRecoveryCapacity(issue, agentId, () =>
-            enqueueInitialAssignedTodoDispatch(issue, agentId)
+            enqueueInitialAssignedTodoDispatch(issue, agentId, adoptionHandoverLockGuard)
           );
           if (queued) {
             result.assignmentDispatched += 1;
@@ -7338,6 +7568,7 @@ export function recoveryService(
             continue;
           }
           const updated = await escalateStrandedAssignedIssue({
+            expectedLockOwnerState: adoptionHandoverLockGuard,
             issue,
             previousStatus: "todo",
             latestRun,
@@ -7432,6 +7663,7 @@ export function recoveryService(
           }
           const failureSummary = summarizeRunFailureForIssueComment(latestRun);
           const updated = await escalateStrandedAssignedIssue({
+            expectedLockOwnerState: adoptionHandoverLockGuard,
             issue,
             previousStatus: "todo",
             latestRun,
@@ -7456,6 +7688,7 @@ export function recoveryService(
 
         const queued = await enqueueWithAssignmentRecoveryCapacity(issue, agentId, () =>
           enqueueStrandedIssueRecovery({
+            expectedLockOwnerState: adoptionHandoverLockGuard,
             issueId: issue.id,
             agentId,
             reason: "issue_assignment_recovery",
@@ -7473,15 +7706,16 @@ export function recoveryService(
         continue;
       }
 
-      // No run evidence and no lock: nothing to recover from. A lost-successor
-      // handover is the exception — there the absence of both is the *result*
-      // of normal adoption cleanup, and the issue still needs a live path, so
-      // let it fall through to the continuation re-dispatch at the end.
+      // No run evidence and no lock: nothing to recover from. A handover marker
+      // is the exception — there the absence of usable evidence is deliberate
+      // (BLO-19160) or the result of normal adoption cleanup, and the issue
+      // still needs a live path, so let it fall through to the continuation
+      // re-dispatch at the end.
       if (
         !latestRun &&
         !issue.checkoutRunId &&
         !issue.executionRunId &&
-        !adoptionHandoverLostSuccessor &&
+        !adoptionHandoverNeedsNeutralRecovery &&
         !reopenedAfterTerminalDispatchRace
       ) {
         result.skipped += 1;
@@ -7495,6 +7729,7 @@ export function recoveryService(
         }
 
         const updated = await escalateStrandedAssignedIssue({
+          expectedLockOwnerState: adoptionHandoverLockGuard,
           issue,
           previousStatus: "in_progress",
           latestRun,
@@ -7539,6 +7774,7 @@ export function recoveryService(
             );
             if (!exempted) {
               const updated = await escalateStrandedAssignedIssue({
+                expectedLockOwnerState: adoptionHandoverLockGuard,
                 issue,
                 previousStatus: "in_progress",
                 latestRun: successfulRun,
@@ -7561,6 +7797,7 @@ export function recoveryService(
             continue;
           }
           const queued = await enqueueStrandedIssueRecovery({
+            expectedLockOwnerState: adoptionHandoverLockGuard,
             issueId: issue.id,
             agentId,
             reason: "issue_continuation_needed",
@@ -7596,6 +7833,7 @@ export function recoveryService(
         );
         if (nonProductiveStreak >= NON_PRODUCTIVE_RUN_NOOP_THRESHOLD) {
           const updated = await escalateStrandedAssignedIssue({
+            expectedLockOwnerState: adoptionHandoverLockGuard,
             issue,
             previousStatus: "in_progress",
             latestRun,
@@ -7631,6 +7869,7 @@ export function recoveryService(
           continue;
         }
         const updated = await escalateStrandedAssignedIssue({
+          expectedLockOwnerState: adoptionHandoverLockGuard,
           issue,
           previousStatus: "in_progress",
           latestRun,
@@ -7725,7 +7964,7 @@ export function recoveryService(
         const classification = classifyContinuationFailure(latestRun);
 
         if (classification.errorCode === CONTINUATION_WAITING_ON_REVIEW_ERROR_CODE) {
-          const resolved = await resolveContinuationWaitingOnReview(issue);
+          const resolved = await resolveContinuationWaitingOnReview(issue, adoptionHandoverLockGuard);
           if (resolved) {
             result.waitingOnReviewResolved += 1;
             result.issueIds.push(issue.id);
@@ -7816,6 +8055,7 @@ export function recoveryService(
         if (classification.kind === "non_retryable") {
           const failureSummary = summarizeRunFailureForIssueComment(latestRun);
           const updated = await escalateStrandedAssignedIssue({
+            expectedLockOwnerState: adoptionHandoverLockGuard,
             issue,
             previousStatus: "in_progress",
             latestRun,
@@ -7851,6 +8091,7 @@ export function recoveryService(
               ? ` Latest cause: \`${classification.errorCode}\`.`
               : "";
             const updated = await escalateStrandedAssignedIssue({
+              expectedLockOwnerState: adoptionHandoverLockGuard,
               issue,
               previousStatus: "in_progress",
               latestRun,
@@ -7891,7 +8132,11 @@ export function recoveryService(
         reason: "issue_continuation_needed",
         retryReason: "issue_continuation_needed",
         source: "issue.continuation_recovery",
-        retryOfRunId: latestRun?.id ?? issue.checkoutRunId ?? null,
+        // BLO-19160: prefer the handover marker over the lock columns for
+        // provenance — on the handover path the lock may name a run dispatched
+        // for a different issue, while the marker is scoped to this one.
+        retryOfRunId: latestRun?.id ?? adoptionHandoverMarkerRunId ?? issue.checkoutRunId ?? null,
+        expectedLockOwnerState: adoptionHandoverLockGuard,
       });
       if (queued) {
         result.continuationRequeued += 1;

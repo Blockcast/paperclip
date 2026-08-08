@@ -43,6 +43,33 @@ import {
   strandedRecoveryWakeAttemptsExhausted,
 } from "../services/recovery/service.js";
 
+// BLO-19160: seam for the adoption-interleaving regression test. The stranded
+// sweep reads its candidates as one bulk snapshot and only reaches the
+// checkout-handover branch several awaits later, so an adoption committing in
+// that window used to be followed with the snapshot's stale lock ids.
+// `isAutomaticRecoverySuppressedByPauseHold` is the last await before
+// `getLatestIssueRun`, which makes it the precise seam for "commit an adoption
+// between the snapshot load and the handover branch". The mock delegates to the
+// real implementation and the hook is null unless a test arms it, so every other
+// test in this file is unaffected.
+const pauseHoldSeam = vi.hoisted(() => ({
+  onNextCheck: null as null | (() => Promise<void>),
+}));
+vi.mock("../services/recovery/pause-hold-guard.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../services/recovery/pause-hold-guard.js")>();
+  return {
+    ...actual,
+    isAutomaticRecoverySuppressedByPauseHold: async (
+      ...args: Parameters<typeof actual.isAutomaticRecoverySuppressedByPauseHold>
+    ) => {
+      const hook = pauseHoldSeam.onNextCheck;
+      pauseHoldSeam.onNextCheck = null;
+      if (hook) await hook();
+      return actual.isAutomaticRecoverySuppressedByPauseHold(...args);
+    },
+  };
+});
+
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 const defaultRecoveryActionMaxAttempts = loadConfig().recoveryActionMaxAttempts;
@@ -358,6 +385,9 @@ describeEmbeddedPostgres("issue recovery actions", () => {
   }, 120_000);
 
   afterEach(async () => {
+    // Defensive: a test that arms the seam but never reaches it must not leak
+    // the hook into the next test.
+    pauseHoldSeam.onNextCheck = null;
     await db.delete(issueRecoveryActions);
     await db.delete(issueComments);
     await db.delete(environmentLeases);
@@ -5100,7 +5130,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         })
         .where(eq(issues.id, seeded.sourceIssueId));
 
-      return { ...seeded, deadCheckoutRunId, queuedContextRunId, adoptingRunId };
+      return { ...seeded, deadCheckoutRunId, queuedContextRunId, adoptingRunId, otherIssueId };
     }
 
     function agentActor(companyId: string, agentId: string, runId: string) {
@@ -5260,6 +5290,207 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       expect(afterSweep).toMatchObject({
         status: "todo",
         assigneeAgentId: coderId,
+      });
+    });
+
+    // BLO-19160 finding 1: once the adopter is terminal it is, by construction,
+    // scoped to a DIFFERENT issue — `getLatestIssueRun` could not see it
+    // otherwise. Substituting it as this issue's `latestRun` handed every
+    // downstream classifier (error code, workspace result, quota state,
+    // liveness, retry budget) evidence describing someone else's work. The
+    // sibling test above only covers a plain failure, which classifies as
+    // retryable and happens to land on the same re-dispatch either way; these
+    // two cover the outcomes where the foreign verdict actually changes what
+    // happens to the adopted issue.
+    it("does not block the adopted issue on a foreign adopter's non-retryable failure", async () => {
+      const { companyId, coderId, sourceIssueId, adoptingRunId, otherIssueId, queuedContextRunId } =
+        await seedAdoptedCheckout({ adoptingRunStatus: "running" });
+
+      const res = await request(createApp(agentActor(companyId, coderId, adoptingRunId)))
+        .patch(`/api/issues/${sourceIssueId}`)
+        .send({ title: "Annotated while stalled" });
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+      // The adopter dies on a workspace defect belonging to the OTHER issue it
+      // was dispatched for — `workspace_repo_mismatch` is non-retryable, so
+      // reading it as this issue's evidence blocks and reassigns this issue for
+      // a condition that was never true of it.
+      await db
+        .update(heartbeatRuns)
+        .set({
+          status: "failed",
+          error: "workspace repo does not match the issue's project",
+          errorCode: "workspace_repo_mismatch",
+          contextSnapshot: { issueId: otherIssueId },
+          finishedAt: new Date("2026-07-29T12:30:00.000Z"),
+        })
+        .where(eq(heartbeatRuns.id, adoptingRunId));
+
+      const enqueueWakeup = vi.fn(async () => null);
+      const recovery = recoveryService(db, { enqueueWakeup });
+      const result = await recovery.reconcileStrandedAssignedIssues();
+
+      // Neither blocked nor reassigned, and no recovery action citing a foreign
+      // run as this issue's evidence.
+      expect(result.escalated).toBe(0);
+      expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
+      const [reconciled] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(reconciled).toMatchObject({ status: "in_progress", assigneeAgentId: coderId });
+      // Instead: neutral continuation recovery. The retry parent is the handover
+      // marker (scoped to THIS issue), never the foreign adopter.
+      expect(enqueueWakeup).toHaveBeenCalledWith(
+        coderId,
+        expect.objectContaining({
+          reason: "issue_continuation_needed",
+          payload: expect.objectContaining({ issueId: sourceIssueId }),
+        }),
+      );
+      const [wakeCall] = enqueueWakeup.mock.calls as unknown as [
+        [string, { payload: Record<string, unknown> }],
+      ];
+      // Assert the marker run positively, not just "not the foreign adopter":
+      // `!== adoptingRunId` also passes when provenance is dropped entirely, so
+      // it does not actually prove the promised marker provenance.
+      expect(wakeCall[1].payload.retryOfRunId).toBe(queuedContextRunId);
+    });
+
+    it("does not suppress recovery on a foreign adopter's quota exhaustion", async () => {
+      const { companyId, coderId, sourceIssueId, adoptingRunId, otherIssueId } =
+        await seedAdoptedCheckout({ adoptingRunStatus: "running" });
+
+      const res = await request(createApp(agentActor(companyId, coderId, adoptingRunId)))
+        .patch(`/api/issues/${sourceIssueId}`)
+        .send({ title: "Annotated while stalled" });
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+      await db
+        .update(heartbeatRuns)
+        .set({
+          status: "failed",
+          error: "provider usage limit reached",
+          errorCode: "provider_quota_exhausted",
+          contextSnapshot: { issueId: otherIssueId },
+          finishedAt: new Date("2026-07-29T12:30:00.000Z"),
+        })
+        .where(eq(heartbeatRuns.id, adoptingRunId));
+      // A provider-quota monitor armed against that same foreign run — the
+      // downstream consequence of the same substitution, and the second way the
+      // adopted issue's recovery got suppressed on another issue's quota state.
+      await db
+        .update(issues)
+        .set({
+          monitorNextCheckAt: new Date(Date.now() + 60 * 60 * 1000),
+          executionPolicy: {
+            mode: "normal",
+            commentRequired: true,
+            stages: [],
+            monitor: {
+              nextCheckAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+              scheduledBy: "assignee",
+              kind: "external_service",
+              serviceName: "provider_quota_recovery",
+              externalRef: adoptingRunId,
+            },
+          },
+        })
+        .where(eq(issues.id, sourceIssueId));
+
+      const enqueueWakeup = vi.fn(async () => null);
+      const recovery = recoveryService(db, { enqueueWakeup });
+      const result = await recovery.reconcileStrandedAssignedIssues();
+
+      // Recovery runs rather than being suppressed by a quota condition that
+      // belongs to another issue's run, and still does not escalate.
+      expect(result.escalated).toBe(0);
+      expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
+      expect(enqueueWakeup).toHaveBeenCalledWith(
+        coderId,
+        expect.objectContaining({
+          reason: "issue_continuation_needed",
+          payload: expect.objectContaining({ issueId: sourceIssueId }),
+        }),
+      );
+      const [reconciled] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(reconciled).toMatchObject({ status: "in_progress", assigneeAgentId: coderId });
+    });
+
+    // BLO-19160 finding 2: the handover branch used to read `executionRunId` /
+    // `checkoutRunId` off the pre-loop candidate snapshot. An adoption that
+    // commits inside that window leaves the sweep observing the new handover
+    // marker while following the OLD lock ids — resolving the previous terminal
+    // owner instead of the live adopter, and escalating the issue out from under
+    // a run that holds both current locks. That is a narrow-window re-entry into
+    // the exact BLO-18860 failure mode.
+    it("resolves the live adopter when an adoption commits after the candidate snapshot", async () => {
+      const { companyId, coderId, sourceIssueId, adoptingRunId } = await seedAdoptedCheckout({
+        adoptingRunStatus: "running",
+      });
+
+      // First adoption: run A takes the checkout and produces the handover
+      // marker, then goes terminal. Preserve the in-progress status marker so
+      // current master can clean up A's stale ownership without restoring the
+      // issue to `todo`; B can then adopt the unowned in-progress checkout in
+      // the seam below.
+      const first = await request(createApp(agentActor(companyId, coderId, adoptingRunId)))
+        .patch(`/api/issues/${sourceIssueId}`)
+        .send({ title: "Annotated while stalled" });
+      expect(first.status, JSON.stringify(first.body)).toBe(200);
+      await db
+        .update(heartbeatRuns)
+        .set({
+          status: "failed",
+          error: "adopter A died",
+          finishedAt: new Date("2026-07-29T12:30:00.000Z"),
+        })
+        .where(eq(heartbeatRuns.id, adoptingRunId));
+      await db
+        .update(issues)
+        .set({ checkoutRestoreStatus: "in_progress" })
+        .where(eq(issues.id, sourceIssueId));
+
+      // Run B: the assignee's next live run, scoped to yet another issue.
+      const liveAdopterRunId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: liveAdopterRunId,
+        companyId,
+        agentId: coderId,
+        invocationSource: "timer",
+        status: "running",
+        contextSnapshot: { issueId: randomUUID() },
+        createdAt: new Date("2026-07-29T13:00:00.000Z"),
+        startedAt: new Date("2026-07-29T13:00:00.000Z"),
+      });
+
+      // B adopts *during* the sweep — after the candidate snapshot is taken,
+      // before the handover branch runs (see `pauseHoldSeam`).
+      pauseHoldSeam.onNextCheck = async () => {
+        const second = await request(createApp(agentActor(companyId, coderId, liveAdopterRunId)))
+          .patch(`/api/issues/${sourceIssueId}`)
+          .send({ title: "Annotated again by the live run" });
+        expect(second.status, JSON.stringify(second.body)).toBe(200);
+        const [afterSecond] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+        expect(afterSecond).toMatchObject({
+          executionRunId: liveAdopterRunId,
+          checkoutRunId: liveAdopterRunId,
+        });
+      };
+
+      const enqueueWakeup = vi.fn(async () => null);
+      const recovery = recoveryService(db, { enqueueWakeup });
+      const result = await recovery.reconcileStrandedAssignedIssues();
+
+      expect(pauseHoldSeam.onNextCheck).toBeNull();
+      // The sweep followed the CURRENT lock to the live adopter B and read
+      // continuity — no escalation, no reassignment, no competing wake.
+      expect(result.escalated).toBe(0);
+      expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
+      expect(enqueueWakeup).not.toHaveBeenCalled();
+      const [reconciled] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(reconciled).toMatchObject({
+        status: "in_progress",
+        assigneeAgentId: coderId,
+        executionRunId: liveAdopterRunId,
+        checkoutRunId: liveAdopterRunId,
       });
     });
 
