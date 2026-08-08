@@ -16,7 +16,8 @@
  * apart both submitted at head ff1c72db, 34 s apart, with opposite verdicts.
  *
  * Invariants asserted here:
- *   I1  At most one operative Ally verdict per (PR, head SHA).
+ *   I1  At most one operative Ally verdict per (PR, head SHA), after collapsing
+ *       only the verified App/User-seat double-submit described below.
  *   I2  No operative Ally APPROVED whose own body reports a Critical or
  *       Important finding, and no operative APPROVED coexisting at a SHA with
  *       an operative Ally review that does.
@@ -28,6 +29,12 @@
  *
  * "Operative" excludes DISMISSED and PENDING: a dismissed review is disposed,
  * not a standing attestation.
+ *
+ * A1 reports (but does not fail on) exactly one byte-identical, current-head
+ * verdict submitted through Ally's known App and approval-seat credentials.
+ * It is delivery duplication, not two independent attestations. The exception
+ * is deliberately narrow; every unknown identity, extra submission, state
+ * difference, or stale/ambiguous attestation remains fatal under I1/I3.
  *
  * Do not replace this with the obvious shell one-liner that groups reviews by
  * commit_id and flags a group when its states differ. That formulation misses
@@ -44,6 +51,21 @@ import { fileURLToPath } from "node:url";
 
 const ALLY_LOGIN_RE =
   /^(allyblockcast|blockcast-ally|ally-bot|blockcast-ci-packages)(\[bot\])?$/;
+
+// These GitHub numeric user IDs identify the two distinct credentials used by
+// Ally. A login alone is not sufficient: the App and the merge-approval user
+// share the same slug but are different GitHub principals.
+const ALLY_APP_USER_ID = 290875700;
+const ALLY_APPROVAL_SEAT_USER_ID = 296676656;
+const ALLY_DUAL_CREDENTIAL_USER_IDS = new Set([
+  ALLY_APP_USER_ID,
+  ALLY_APPROVAL_SEAT_USER_ID,
+]);
+const TERMINAL_REVIEW_STATES = new Set([
+  "APPROVED",
+  "COMMENTED",
+  "CHANGES_REQUESTED",
+]);
 
 /** A heading like `### Important Issues (2)` — but not `(0)`. */
 const BLOCKING_SECTION_RE =
@@ -73,6 +95,21 @@ export function attestedHead(body) {
   return match ? match[1].toLowerCase() : null;
 }
 
+function attestedHeads(body) {
+  return Array.from(
+    String(body ?? "").matchAll(new RegExp(ATTESTED_HEAD_RE.source, "gim")),
+    (match) => match[1].toLowerCase(),
+  );
+}
+
+function hasOneCurrentHeadAttestation(body, headSha) {
+  const head = String(headSha ?? "").toLowerCase();
+  if (!/^[0-9a-f]{40}$/.test(head)) return false;
+
+  const attestations = attestedHeads(body);
+  return attestations.length === 1 && attestations[0] === head;
+}
+
 export function operativeAllyReviews(reviews, headSha) {
   return (reviews ?? []).filter(
     (review) =>
@@ -84,6 +121,78 @@ export function operativeAllyReviews(reviews, headSha) {
 }
 
 /**
+ * Whether one body group is the narrowly defined benign double-submit that
+ * occurs when Ally emits the same verdict through both of its credentials.
+ *
+ * This is intentionally stricter than "two different accounts wrote the same
+ * body": it requires exactly the known App/User-seat pair, the same terminal
+ * review state, and one identical attestation for the current head. Anything
+ * else remains a separate verdict and is subject to I1. In particular, this
+ * never hides an extra same-account retry, an unknown identity, a changed
+ * review state, or a stale/ambiguous attestation.
+ */
+function isBenignDualCredentialDoubleSubmit(group, headSha) {
+  if (group.length !== 2) return false;
+
+  const userIds = new Set(group.map((review) => review?.user?.id));
+  if (
+    userIds.size !== ALLY_DUAL_CREDENTIAL_USER_IDS.size ||
+    [...userIds].some((userId) => !ALLY_DUAL_CREDENTIAL_USER_IDS.has(userId))
+  ) {
+    return false;
+  }
+
+  const state = group[0]?.state;
+  if (
+    !TERMINAL_REVIEW_STATES.has(state) ||
+    group.some((review) => review?.state !== state)
+  ) {
+    return false;
+  }
+
+  const body = String(group[0]?.body ?? "");
+  return group.every(
+    (review) =>
+      String(review?.body ?? "") === body &&
+      hasOneCurrentHeadAttestation(review?.body, headSha),
+  );
+}
+
+/**
+ * The exact known App/User-seat double-submission shape, reported separately
+ * from I1 because it is one attested verdict posted twice. The proof is narrow
+ * enough that a genuine credential, head, state, or attestation conflict stays
+ * fatal rather than being downgraded to an advisory.
+ */
+export function duplicateCredentialSubmissions(reviews, headSha) {
+  const operative = operativeAllyReviews(reviews, headSha);
+  const byBody = new Map();
+  for (const review of operative) {
+    const body = String(review?.body ?? "");
+    byBody.set(body, [...(byBody.get(body) ?? []), review]);
+  }
+
+  return [...byBody.values()].filter((group) =>
+    isBenignDualCredentialDoubleSubmit(group, headSha),
+  );
+}
+
+/**
+ * Operative reviews after removing only the redundant half of a verified
+ * App/User-seat double-submit. I1 therefore counts independent verdicts, not
+ * delivery attempts.
+ */
+export function distinctVerdicts(reviews, headSha) {
+  const redundantReviews = new Set(
+    duplicateCredentialSubmissions(reviews, headSha).flatMap((group) => group.slice(1)),
+  );
+
+  return operativeAllyReviews(reviews, headSha).filter(
+    (review) => !redundantReviews.has(review),
+  );
+}
+
+/**
  * @param {{number: number, headSha: string, reviews: object[]}} pr
  * @returns {string[]} human-readable violations; empty when the PR is sound
  */
@@ -91,12 +200,13 @@ export function findPrViolations(pr) {
   const head = pr.headSha;
   const short = String(head ?? "").slice(0, 8);
   const operative = operativeAllyReviews(pr.reviews, head);
+  const verdicts = distinctVerdicts(pr.reviews, head);
   const violations = [];
 
-  if (operative.length > 1) {
-    const detail = operative.map((r) => `${r.state}/${r.id}`).join(", ");
+  if (verdicts.length > 1) {
+    const detail = verdicts.map((r) => `${r.state}/${r.id}`).join(", ");
     violations.push(
-      `I1 PR #${pr.number} @${short}: ${operative.length} operative Ally verdicts (${detail}) — expected at most 1`,
+      `I1 PR #${pr.number} @${short}: ${verdicts.length} operative Ally verdicts (${detail}) — expected at most 1`,
     );
   }
 
@@ -145,6 +255,21 @@ export function findPrViolations(pr) {
 
 export function findViolations(prs) {
   return (prs ?? []).flatMap((pr) => findPrViolations(pr));
+}
+
+/** Report benign App/User-seat double-submissions without masking I1 conflicts. */
+export function findPrAdvisories(pr) {
+  const short = String(pr.headSha ?? "").slice(0, 8);
+  return duplicateCredentialSubmissions(pr.reviews, pr.headSha).map((group) => {
+    const detail = group
+      .map((review) => `${review.state}/${review.id} by uid ${review.user.id}`)
+      .join(", ");
+    return `A1 PR #${pr.number} @${short}: one attested verdict submitted twice through Ally's App/User-seat credentials (${detail}) — see BLO-22916`;
+  });
+}
+
+export function findAdvisories(prs) {
+  return (prs ?? []).flatMap((pr) => findPrAdvisories(pr));
 }
 
 function gh(args) {
@@ -207,6 +332,15 @@ function main() {
   const repo = process.env.ALLY_REVIEW_REPO || "Blockcast/paperclip";
   const prs = fetchOpenPrs(repo);
   const violations = findViolations(prs);
+  const advisories = findAdvisories(prs);
+
+  if (advisories.length > 0) {
+    console.error(
+      `Ally review-consistency guard: ${advisories.length} benign dual-credential double-submit(s), reported but not fatal:\n`,
+    );
+    for (const advisory of advisories) console.error(`  ${advisory}`);
+    console.error("");
+  }
 
   if (violations.length > 0) {
     console.error(
@@ -220,8 +354,12 @@ function main() {
     process.exit(1);
   }
 
+  const advisoryNote =
+    advisories.length > 0
+      ? `; ${advisories.length} benign dual-credential double-submit(s) reported above (BLO-22916)`
+      : "";
   console.log(
-    `Ally review-consistency guard passed: no attestation conflicts found across ${prs.length} open PR(s) in ${repo}.`,
+    `Ally review-consistency guard passed: no attestation conflicts found across ${prs.length} open PR(s) in ${repo}${advisoryNote}.`,
   );
 }
 

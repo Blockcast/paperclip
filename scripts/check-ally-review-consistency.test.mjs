@@ -6,6 +6,10 @@ import { pathToFileURL } from "node:url";
 import {
   assertPrListComplete,
   attestedHead,
+  distinctVerdicts,
+  duplicateCredentialSubmissions,
+  findAdvisories,
+  findPrAdvisories,
   findPrViolations,
   findViolations,
   hasBlockingFindings,
@@ -27,6 +31,26 @@ function review(overrides = {}) {
     body: `## Ally — Consolidated PR Review\nReviewed head: ${HEAD}\n`,
     ...overrides,
   };
+}
+
+const ALLY_APP_USER_ID = 290875700;
+const ALLY_APPROVAL_SEAT_USER_ID = 296676656;
+
+function dualCredentialPair(body) {
+  return [
+    review({
+      id: 11,
+      state: "APPROVED",
+      body,
+      user: { login: "allyblockcast[bot]", id: ALLY_APP_USER_ID },
+    }),
+    review({
+      id: 12,
+      state: "APPROVED",
+      body,
+      user: { login: "allyblockcast", id: ALLY_APPROVAL_SEAT_USER_ID },
+    }),
+  ];
 }
 
 describe("isAllyLogin", () => {
@@ -271,6 +295,127 @@ describe("findPrViolations", () => {
       ],
     };
     assert.deepEqual(findPrViolations(pr), []);
+  });
+});
+
+describe("dual-credential double-submit reconciliation", () => {
+  const body = `## Ally — Consolidated PR Review\nReviewed head: ${HEAD}\n\nNo blockers.`;
+
+  it("reports exactly the known same-attestation App/User-seat pair as an advisory", () => {
+    const reviews = dualCredentialPair(body);
+    const pr = { number: 1141, headSha: HEAD, reviews };
+
+    assert.deepEqual(
+      duplicateCredentialSubmissions(reviews, HEAD).map((group) =>
+        group.map((review) => review.id),
+      ),
+      [[11, 12]],
+    );
+    assert.deepEqual(distinctVerdicts(reviews, HEAD).map((review) => review.id), [11]);
+    assert.deepEqual(findPrViolations(pr), []);
+
+    const advisories = findPrAdvisories(pr);
+    assert.equal(advisories.length, 1);
+    assert.match(advisories[0], /^A1 PR #1141 @ff1c72db: one attested verdict submitted twice/);
+  });
+
+  it("keeps an otherwise identical third submission visible to I1", () => {
+    const reviews = [
+      ...dualCredentialPair(body),
+      review({
+        id: 13,
+        state: "APPROVED",
+        body,
+        user: { login: "allyblockcast", id: 999999999 },
+      }),
+    ];
+    const violations = findPrViolations({ number: 1142, headSha: HEAD, reviews });
+
+    assert.deepEqual(duplicateCredentialSubmissions(reviews, HEAD), []);
+    assert.deepEqual(distinctVerdicts(reviews, HEAD).map((review) => review.id), [11, 12, 13]);
+    assert.match(violations.find((violation) => violation.startsWith("I1")) ?? "", /3 operative Ally verdicts/);
+  });
+
+  it("keeps a missing credential identity visible to I1", () => {
+    const [app, seat] = dualCredentialPair(body);
+    const reviews = [app, { ...seat, user: { login: "allyblockcast" } }];
+    const violations = findPrViolations({ number: 1143, headSha: HEAD, reviews });
+
+    assert.deepEqual(duplicateCredentialSubmissions(reviews, HEAD), []);
+    assert.match(violations.find((violation) => violation.startsWith("I1")) ?? "", /2 operative Ally verdicts/);
+  });
+
+  it("keeps an unexpected credential identity paired with the App visible to I1", () => {
+    const [app, seat] = dualCredentialPair(body);
+    const reviews = [
+      app,
+      { ...seat, user: { login: "allyblockcast", id: 999999999 } },
+    ];
+    const violations = findPrViolations({ number: 11435, headSha: HEAD, reviews });
+
+    assert.deepEqual(duplicateCredentialSubmissions(reviews, HEAD), []);
+    assert.match(violations.find((violation) => violation.startsWith("I1")) ?? "", /2 operative Ally verdicts/);
+  });
+
+  it("keeps a same-account retry visible to I1", () => {
+    const [app, seat] = dualCredentialPair(body);
+    const reviews = [app, { ...seat, user: app.user }];
+    const violations = findPrViolations({ number: 11436, headSha: HEAD, reviews });
+
+    assert.deepEqual(duplicateCredentialSubmissions(reviews, HEAD), []);
+    assert.match(violations.find((violation) => violation.startsWith("I1")) ?? "", /2 operative Ally verdicts/);
+  });
+
+  it("keeps a cross-credential state conflict visible to I1", () => {
+    const [app, seat] = dualCredentialPair(body);
+    const reviews = [app, { ...seat, state: "COMMENTED" }];
+    const violations = findPrViolations({ number: 1144, headSha: HEAD, reviews });
+
+    assert.deepEqual(duplicateCredentialSubmissions(reviews, HEAD), []);
+    assert.match(violations.find((violation) => violation.startsWith("I1")) ?? "", /2 operative Ally verdicts/);
+  });
+
+  it("keeps a same-body stale-attestation conflict fatal", () => {
+    const staleBody = `## Ally — Consolidated PR Review\nReviewed head: ${OTHER}\n\nNo blockers.`;
+    const reviews = dualCredentialPair(staleBody);
+    const violations = findPrViolations({ number: 1145, headSha: HEAD, reviews });
+
+    assert.deepEqual(duplicateCredentialSubmissions(reviews, HEAD), []);
+    assert.match(violations.find((violation) => violation.startsWith("I1")) ?? "", /2 operative Ally verdicts/);
+    assert.equal(violations.filter((violation) => violation.startsWith("I3")).length, 2);
+  });
+
+  it("keeps an ambiguous multi-attestation body visible to I1", () => {
+    const ambiguousBody = `Reviewed head: ${HEAD}\nReviewed head: ${HEAD}`;
+    const reviews = dualCredentialPair(ambiguousBody);
+    const violations = findPrViolations({ number: 1146, headSha: HEAD, reviews });
+
+    assert.deepEqual(duplicateCredentialSubmissions(reviews, HEAD), []);
+    assert.match(violations.find((violation) => violation.startsWith("I1")) ?? "", /2 operative Ally verdicts/);
+  });
+
+  it("keeps distinct current-head attestation bodies visible to I1", () => {
+    const [app, seat] = dualCredentialPair(body);
+    const reviews = [app, { ...seat, body: `${body}\n### Suggestions (1)\n- another pass` }];
+    const violations = findPrViolations({ number: 1147, headSha: HEAD, reviews });
+
+    assert.deepEqual(duplicateCredentialSubmissions(reviews, HEAD), []);
+    assert.match(violations.find((violation) => violation.startsWith("I1")) ?? "", /2 operative Ally verdicts/);
+  });
+});
+
+describe("findAdvisories", () => {
+  const body = `Reviewed head: ${HEAD}`;
+
+  it("aggregates only verified dual-credential submissions across PRs", () => {
+    const advisories = findAdvisories([
+      { number: 1148, headSha: HEAD, reviews: dualCredentialPair(body) },
+      { number: 1149, headSha: HEAD, reviews: dualCredentialPair(body) },
+    ]);
+
+    assert.equal(advisories.length, 2);
+    assert.match(advisories[0], /PR #1148/);
+    assert.match(advisories[1], /PR #1149/);
   });
 });
 
