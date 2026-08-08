@@ -6,7 +6,7 @@ const dockerfile = readFileSync(new URL("../Dockerfile", import.meta.url), "utf8
 const opencodeRefMatch = dockerfile.match(/^ARG OPENCODE_K8S_REF=([0-9a-f]{40})$/m);
 
 test("Dockerfile pins opencode_k8s and runs its security and execution regressions", () => {
-  assert.equal(opencodeRefMatch?.[1], "6dca0201547f962dc9ae45576c81c12808b73bb3");
+  assert.equal(opencodeRefMatch?.[1], "ed0331690432d3c37cd7ed190ca1066c840b30c3");
   assert.match(dockerfile, /add anthropic\/claude-opus-5/);
   assert.match(
     dockerfile,
