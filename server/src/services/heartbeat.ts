@@ -3,7 +3,7 @@ import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
-import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNotNull, isNull, lt, lte, ne, not, notInArray, or, sql, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, exists, getTableColumns, gt, gte, inArray, isNotNull, isNull, lt, lte, ne, not, notInArray, or, sql, type SQL } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
@@ -202,6 +202,7 @@ import {
   WorkspaceRepoMismatchError,
 } from "./workspace-runtime.js";
 import { issueService } from "./issues.js";
+import { ISSUE_EXECUTION_LOCK_HOLDING_RUN_STATUSES } from "./issue-execution-lock.js";
 import { resolveStaleDependabotAlertWakeIssue } from "./dependabot-alert-issues.js";
 import { createToolGatewayService } from "./tool-gateway.js";
 import { toolAccessService } from "./tool-access.js";
@@ -495,7 +496,10 @@ const MAX_INLINE_WAKE_COMMENTS = 8;
 const MAX_INLINE_WAKE_COMMENT_BODY_CHARS = 4_000;
 const MAX_INLINE_WAKE_COMMENT_BODY_TOTAL_CHARS = 12_000;
 const execFile = promisify(execFileCallback);
-const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
+// Same notion as ISSUE_EXECUTION_LOCK_HOLDING_RUN_STATUSES (a run that has not
+// terminalized still owns its issue lock); sourced from there so the two cannot
+// drift apart again. See issue-execution-lock.ts for the drift this closed.
+const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ISSUE_EXECUTION_LOCK_HOLDING_RUN_STATUSES;
 const TASK_SCOPE_COALESCIBLE_RUN_STATUSES = ["queued", "scheduled_retry"] as const;
 const CANCELLABLE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const HEARTBEAT_RUN_TERMINAL_STATUSES = ["succeeded", "interrupted", "failed", "cancelled", "timed_out"] as const;
@@ -15020,7 +15024,41 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return cancelled;
   }
 
+  /**
+   * Whether a generic timer wake has any work this run could actually pick up.
+   *
+   * BLO-19749: this used to count assigned issues by STATUS alone, which made
+   * `skipTimerWhenNoActionableWork` unable to suppress the wakes that actually
+   * waste runs. An issue in `todo`/`in_progress` whose execution lock is already
+   * held by a live run is *not* available to a fresh timer wake — `checkout()`
+   * 409s on it — so a wake that finds only such issues burns a full run and
+   * exits having done nothing. Observed on a UXDesigner timer wake where both
+   * candidate issues 409'd and available work was genuinely zero.
+   *
+   * Availability is therefore checked against the same lock columns `checkout()`
+   * blocks on. Note there is no self-exclusion to make here: the predicate runs
+   * before this wake's run row exists, so *any* non-terminal holder — including
+   * another run of this same agent — is a run this wake would lose to.
+   *
+   * Deliberately still counted as actionable: an issue whose blockers are
+   * unresolved. `checkout()` 422s on those, so they are not workable either, but
+   * suppressing their wakes would remove the only path by which an agent notices
+   * and escalates an ageing blocker. Unavailable-because-busy is transient;
+   * unavailable-because-blocked needs someone to look.
+   */
   async function hasActionableTimerWork(agent: typeof agents.$inferSelect) {
+    const heldByLiveRun = exists(
+      db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, issues.companyId),
+            or(eq(heartbeatRuns.id, issues.checkoutRunId), eq(heartbeatRuns.id, issues.executionRunId)),
+            inArray(heartbeatRuns.status, [...ISSUE_EXECUTION_LOCK_HOLDING_RUN_STATUSES]),
+          ),
+        ),
+    );
     const row = await db
       .select({ id: issues.id })
       .from(issues)
@@ -15031,6 +15069,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           isNull(issues.assigneeUserId),
           isNull(issues.hiddenAt),
           inArray(issues.status, [...TIMER_ACTIONABLE_ISSUE_STATUSES]),
+          not(heldByLiveRun),
         ),
       )
       .limit(1)

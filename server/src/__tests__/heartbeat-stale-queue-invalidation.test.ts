@@ -350,6 +350,187 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     expect(countExecuteCallsForRun(run!.id)).toBe(1);
   });
 
+  /**
+   * BLO-19749. `skipTimerWhenNoActionableWork` counted assigned issues by STATUS
+   * alone, so it could not suppress the wakes that actually waste runs: an issue
+   * sitting in `todo`/`in_progress` whose execution lock is already held by a
+   * live run is not available to a fresh timer wake — `checkout()` 409s on it —
+   * and the wake burns a full run to discover that.
+   *
+   * Reported from a UXDesigner timer wake where both candidate issues 409'd
+   * (`todo` held by one run, `in_progress` held by another) and available work
+   * was genuinely zero, yet the predicate reported work and the wake ran.
+   */
+  async function seedLockHolderRun(input: {
+    companyId: string;
+    agentId: string;
+    status: string;
+  }) {
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId: input.companyId,
+      agentId: input.agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: input.status,
+    });
+    return runId;
+  }
+
+  it("skips generic timer wakes when every actionable assigned issue is held by a live run", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent({
+      heartbeatConfig: {
+        enabled: true,
+        skipTimerWhenNoActionableWork: true,
+      },
+    });
+    const runningHolder = await seedLockHolderRun({ companyId, agentId, status: "running" });
+    const queuedHolder = await seedLockHolderRun({ companyId, agentId, status: "queued" });
+    await db.insert(issues).values([
+      {
+        id: randomUUID(),
+        companyId,
+        title: "todo but already checked out by another run",
+        status: "todo",
+        priority: "high",
+        assigneeAgentId: agentId,
+        checkoutRunId: runningHolder,
+        executionRunId: runningHolder,
+      },
+      {
+        id: randomUUID(),
+        companyId,
+        title: "in_progress but locked by a queued dispatch",
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+        executionRunId: queuedHolder,
+      },
+    ]);
+
+    const run = await heartbeat.wakeup(agentId, {
+      source: "timer",
+      triggerDetail: "schedule",
+    });
+
+    expect(run).toBeNull();
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+
+    const [wakeup] = await db
+      .select({ status: agentWakeupRequests.status, reason: agentWakeupRequests.reason })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakeup).toMatchObject({
+      status: "skipped",
+      reason: "heartbeat.timer.no_actionable_work",
+    });
+  });
+
+  it("skips generic timer wakes when the only actionable issue is held by a scheduled_retry run", async () => {
+    // The status the retry ladder parks runs in. It is non-terminal, so it holds
+    // the lock and `checkout()` 409s on it — but it was absent from every
+    // open-coded ["queued","running"] availability literal.
+    const { companyId, agentId } = await seedCompanyAndAgent({
+      heartbeatConfig: {
+        enabled: true,
+        skipTimerWhenNoActionableWork: true,
+      },
+    });
+    const retryHolder = await seedLockHolderRun({ companyId, agentId, status: "scheduled_retry" });
+    await db.insert(issues).values({
+      id: randomUUID(),
+      companyId,
+      title: "awaiting a scheduled retry",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: retryHolder,
+      executionRunId: retryHolder,
+    });
+
+    const run = await heartbeat.wakeup(agentId, {
+      source: "timer",
+      triggerDetail: "schedule",
+    });
+
+    expect(run).toBeNull();
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+  });
+
+  it("allows generic timer wakes when a stale lock names a run that already terminalized", async () => {
+    // A terminal holder releases the lock: `checkout()` clears it and succeeds,
+    // so this issue IS available and the wake is not waste. Suppressing here
+    // would strand the issue with no wake path.
+    const { companyId, agentId } = await seedCompanyAndAgent({
+      heartbeatConfig: {
+        enabled: true,
+        skipTimerWhenNoActionableWork: true,
+      },
+    });
+    const deadHolder = await seedLockHolderRun({ companyId, agentId, status: "failed" });
+    await db.insert(issues).values({
+      id: randomUUID(),
+      companyId,
+      title: "stale lock from a dead run",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: deadHolder,
+      executionRunId: deadHolder,
+    });
+
+    const run = await heartbeat.wakeup(agentId, {
+      source: "timer",
+      triggerDetail: "schedule",
+    });
+
+    expect(run).not.toBeNull();
+    await waitForCondition(async () => countExecuteCallsForRun(run!.id) > 0);
+    expect(countExecuteCallsForRun(run!.id)).toBe(1);
+  });
+
+  it("allows generic timer wakes when a held issue coexists with an available one", async () => {
+    // The predicate is availability-any, not all-or-nothing: one busy issue must
+    // not suppress a wake that has other work to do.
+    const { companyId, agentId } = await seedCompanyAndAgent({
+      heartbeatConfig: {
+        enabled: true,
+        skipTimerWhenNoActionableWork: true,
+      },
+    });
+    const holder = await seedLockHolderRun({ companyId, agentId, status: "running" });
+    await db.insert(issues).values([
+      {
+        id: randomUUID(),
+        companyId,
+        title: "held",
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+        checkoutRunId: holder,
+        executionRunId: holder,
+      },
+      {
+        id: randomUUID(),
+        companyId,
+        title: "free",
+        status: "todo",
+        priority: "high",
+        assigneeAgentId: agentId,
+      },
+    ]);
+
+    const run = await heartbeat.wakeup(agentId, {
+      source: "timer",
+      triggerDetail: "schedule",
+    });
+
+    expect(run).not.toBeNull();
+    await waitForCondition(async () => countExecuteCallsForRun(run!.id) > 0);
+    expect(countExecuteCallsForRun(run!.id)).toBe(1);
+  });
+
   it("allows legacy generic timer wakes by default when no skip policy is set", async () => {
     const { agentId } = await seedCompanyAndAgent({
       heartbeatConfig: {

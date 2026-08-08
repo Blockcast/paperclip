@@ -92,6 +92,10 @@ import {
 } from "./execution-workspace-policy.js";
 import { mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
 import { buildInitialIssueMonitorFields, normalizeIssueExecutionPolicy } from "./issue-execution-policy.js";
+import {
+  ISSUE_EXECUTION_LOCK_HOLDING_RUN_STATUSES,
+  TERMINAL_HEARTBEAT_RUN_STATUSES,
+} from "./issue-execution-lock.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { redactSensitiveText } from "../redaction.js";
@@ -924,16 +928,7 @@ function normalizeAgentNameKey(value: string | null | undefined) {
   const normalized = value.trim().toLowerCase();
   return normalized.length > 0 ? normalized : null;
 }
-
-export const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set([
-  "succeeded",
-  "interrupted",
-  "failed",
-  "error",
-  "adapter_failed",
-  "cancelled",
-  "timed_out",
-]);
+export { TERMINAL_HEARTBEAT_RUN_STATUSES } from "./issue-execution-lock.js";
 const STALE_ISSUE_CONTEXT_RUN_STATUSES = ["queued", "scheduled_retry"] as const;
 // Same statuses, as a lookup set: these are the non-terminal statuses a run can
 // hold before it has ever executed.
@@ -2288,7 +2283,13 @@ async function watchdogMapForIssues(dbOrTx: any, rows: IssueRow[]): Promise<Map<
   return map;
 }
 
-const ACTIVE_RUN_STATUSES = ["queued", "running"];
+// BLO-19749: the set of statuses whose runs hold an issue's execution lock, so
+// `activeRun` reports exactly what `checkout()` would 409 on. This used to be a
+// local ["queued", "running"] literal, which silently omitted `scheduled_retry`
+// and made `GET /issues/{id}` return `activeRun: null` for an issue whose
+// checkout simultaneously 409'd naming the parked retry run. See
+// `issue-execution-lock.ts` for the full drift table.
+const ACTIVE_RUN_STATUSES = [...ISSUE_EXECUTION_LOCK_HOLDING_RUN_STATUSES];
 const BLOCKER_ATTENTION_ACTIVE_RUN_STATUSES = ["queued", "running"];
 const BLOCKER_ATTENTION_ACTIVE_WAKE_STATUSES = ["queued", "deferred_issue_execution"];
 const BLOCKER_ATTENTION_PENDING_INTERACTION_STATUSES = ["pending"];
@@ -6729,7 +6730,7 @@ export function issueService(db: Db) {
     },
 
     /**
-     * The queued-or-running run recorded for this issue, or null.
+     * The non-terminal run named by this issue's `executionRunId`, or null.
      *
      * BLO-19001: single-issue counterpart to the `activeRun` the list paths
      * attach via `withActiveRuns`. `getById` deliberately stays lean, so the
@@ -6740,9 +6741,26 @@ export function issueService(db: Db) {
      * terminalized" — `activeRunMapForIssues` only returns rows whose status is
      * in ACTIVE_RUN_STATUSES. That is the distinction a caller needs: a stale
      * `executionRunId` left behind by a finished run reads as not-held, while a
-     * live sibling run reads as present. A queued run is present but does not
-     * yet hold a worktree; callers should use `isRunHoldingIssue` for that
-     * stricter cede decision.
+     * live sibling run reads as present. A queued or `scheduled_retry` run is
+     * present but does not yet hold a worktree; callers should use
+     * `isRunHoldingIssue` for that stricter cede decision.
+     *
+     * ## Do NOT use this to decide "has another run claimed this issue?"
+     *
+     * BLO-19749. This reads ONE of the two lock columns. `checkout()` blocks on
+     * `checkoutRunId` OR `executionRunId`, so an issue whose `executionRunId` is
+     * null while a live run still holds `checkoutRunId` reads `activeRun: null`
+     * here and 409s `Issue checkout conflict` there. Both columns are already on
+     * the issue payload; the authoritative "is it claimed" test is whether
+     * EITHER names a run whose status is non-terminal
+     * (`runStatusHoldsIssueExecutionLock` in `issue-execution-lock.ts`).
+     *
+     * A `scheduled_retry` holder used to fall through this same hole for the
+     * *other* reason — it is non-terminal, so it holds the lock and 409s, but the
+     * old `["queued","running"]` filter dropped it, making `activeRun` blind to
+     * the entire retry ladder. That half is fixed; the two-column gap above is
+     * intrinsic to reading a single column and is why the cede-check must not be
+     * written against this field.
      */
     getActiveRun: async (
       issue: Pick<IssueRow, "companyId" | "executionRunId">,
