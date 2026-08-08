@@ -40,6 +40,7 @@ import {
   __test_idempotentWakeStatuses,
   __test_prReviewerWakeIdempotencyScope,
   __test_recordWorkflowRunSighting,
+  __test_resolvePrCommentReviewGateWebhookTrigger,
   __test_resolveDependabotAlertContext,
   __test_resolveEventContext,
   __test_shouldFirePrReviewerWake,
@@ -1332,6 +1333,89 @@ describe("workflow_run supersession classification (BLO-21078 AC3)", () => {
   });
 });
 
+describe("comment-review gate webhook trigger", () => {
+  const repo = "Blockcast/paperclip";
+  const head = "1234567890abcdef1234567890abcdef12345678";
+  const reviewer = "allyblockcast[bot]";
+
+  function issueCommentPayload(author = reviewer, body = "## Ally — Consolidated PR Review\n### Important Issues (0)") {
+    return {
+      action: "created",
+      repository: { full_name: repo },
+      issue: {
+        number: 1049,
+        html_url: `https://github.com/${repo}/pull/1049`,
+        pull_request: { url: `https://api.github.com/repos/${repo}/pulls/1049` },
+      },
+      comment: { user: { login: author }, body },
+    };
+  }
+
+  it("triggers for a trusted Ally PR comment even with no Paperclip identifier", () => {
+    expect(
+      __test_resolvePrCommentReviewGateWebhookTrigger(
+        "issue_comment",
+        issueCommentPayload(),
+        reviewer,
+      ),
+    ).toEqual({
+      repoFullName: repo,
+      prNumber: 1049,
+      prUrl: `https://github.com/${repo}/pull/1049`,
+    });
+  });
+
+  it("rejects a same-shaped human comment and a prose mention of the heading", () => {
+    expect(
+      __test_resolvePrCommentReviewGateWebhookTrigger(
+        "issue_comment",
+        issueCommentPayload("allyblockcast"),
+        reviewer,
+      ),
+    ).toBeNull();
+    expect(
+      __test_resolvePrCommentReviewGateWebhookTrigger(
+        "issue_comment",
+        issueCommentPayload(reviewer, "Please revisit your Ally — Consolidated PR Review."),
+        reviewer,
+      ),
+    ).toBeNull();
+  });
+
+  it.each(["opened", "reopened", "synchronize"])("starts a fresh status check on pull_request.%s", (action) => {
+    expect(
+      __test_resolvePrCommentReviewGateWebhookTrigger(
+        "pull_request",
+        {
+          action,
+          repository: { full_name: repo },
+          pull_request: { number: 1049, html_url: `https://github.com/${repo}/pull/1049`, head: { sha: head } },
+        },
+        reviewer,
+      ),
+    ).toEqual({
+      repoFullName: repo,
+      prNumber: 1049,
+      headSha: head,
+      prUrl: `https://github.com/${repo}/pull/1049`,
+    });
+  });
+
+  it("does not run on unrelated PR lifecycle actions", () => {
+    expect(
+      __test_resolvePrCommentReviewGateWebhookTrigger(
+        "pull_request",
+        {
+          action: "closed",
+          repository: { full_name: repo },
+          pull_request: { number: 1049, head: { sha: head } },
+        },
+        reviewer,
+      ),
+    ).toBeNull();
+  });
+});
+
 describeEmbeddedPostgres("github-webhook route", () => {
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   let db: ReturnType<typeof createDb>;
@@ -1366,7 +1450,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
     await tempDb?.cleanup();
   }, 60_000);
 
-  function buildApp(config: Pick<GithubWebhookConfig, "prReviewerAgentIds" | "prReviewerAgentId" | "prReviewerBotLogin" | "selfReviewEscalationThreshold" | "dependabotAgentId" | "dependabotMinSeverity" | "heartbeatOptions"> = {}) {
+  function buildApp(config: Pick<GithubWebhookConfig, "prReviewerAgentIds" | "prReviewerAgentId" | "prReviewerBotLogin" | "runPrCommentReviewGateCheck" | "selfReviewEscalationThreshold" | "dependabotAgentId" | "dependabotMinSeverity" | "heartbeatOptions"> = {}) {
     const app = express();
     app.use(express.json({
       verify: (req, _res, buf) => {
@@ -1376,6 +1460,10 @@ describeEmbeddedPostgres("github-webhook route", () => {
     app.use("/api/webhooks/github", githubWebhookRoutes(db, {
       webhookSecret,
       ...config,
+      runPrCommentReviewGateCheck: config.runPrCommentReviewGateCheck ?? (async () => ({
+        posted: false as const,
+        reason: "not_configured" as const,
+      })),
       heartbeatOptions: {
         penstockAvailabilityGate: allowPenstockGate,
         skipQueuedRunDispatch: true,
@@ -1542,6 +1630,57 @@ describeEmbeddedPostgres("github-webhook route", () => {
       .send(body);
     expect(res.status).toBe(200);
     expect(res.body).toMatchObject({ ignored: "no_matching_issue", identifiers: ["UNKNOWN-1234"] });
+  });
+
+  it("runs the comment-review gate for a trusted Ally comment without a Paperclip identifier", async () => {
+    const calls: Array<{
+      repoFullName: string;
+      prNumber: number;
+      headSha?: string | null;
+      prUrl?: string | null;
+    }> = [];
+    let markCalled!: () => void;
+    const called = new Promise<void>((resolve) => {
+      markCalled = resolve;
+    });
+    const app = buildApp({
+      prReviewerBotLogin: "allyblockcast[bot]",
+      runPrCommentReviewGateCheck: async (input) => {
+        calls.push(input);
+        markCalled();
+        return { posted: true, verdict: { state: "success", reason: "test" } };
+      },
+    });
+    const payload = {
+      action: "created",
+      repository: { full_name: "Blockcast/paperclip" },
+      issue: {
+        number: 1049,
+        title: "No tracker reference here",
+        pull_request: { url: "https://api.github.com/repos/Blockcast/paperclip/pulls/1049" },
+      },
+      comment: {
+        user: { login: "allyblockcast[bot]" },
+        body: "## Ally — Consolidated PR Review\n### Important Issues (0)",
+      },
+    };
+    const { body, signature } = signedRequest(payload);
+
+    const response = await request(app)
+      .post("/api/webhooks/github")
+      .set("x-github-event", "issue_comment")
+      .set("x-hub-signature-256", signature)
+      .set("content-type", "application/json")
+      .send(body);
+    await called;
+
+    expect(response.status).toBe(200);
+    expect(response.body).toMatchObject({ ignored: "no_paperclip_identifier" });
+    expect(calls).toEqual([{
+      repoFullName: "Blockcast/paperclip",
+      prNumber: 1049,
+      prUrl: "https://github.com/Blockcast/paperclip/pull/1049",
+    }]);
   });
 
   it("leaves reviewer wakes queued when the webhook runs on the API tier", async () => {
