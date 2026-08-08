@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { agentWakeupRequests, agents, companies, createDb } from "@paperclipai/db";
+import { eq } from "drizzle-orm";
 import { findWakeIdempotencyReceipt } from "./wake-idempotency.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -59,6 +60,58 @@ describeEmbeddedPostgres("wake idempotency receipts", () => {
       idempotencyKey,
     });
   }
+
+  /**
+   * The guard contract the comment-effect wake sink consumes: look the key up,
+   * skip if a receipt exists, dispatch otherwise. `routes/issues.ts` is one line
+   * over this (`if (receipt) return { wakeSkipped: "already_accepted" }`), so
+   * driving it here exercises the reclaim decision without standing up the
+   * route harness. `dispatches` counts real wake creations, which is the thing
+   * that must stay at one.
+   */
+  async function attemptWakeEffect(
+    idempotencyKey: string,
+    dispatches: { count: number },
+    landsInStatus: string,
+  ): Promise<"dispatched" | "skipped"> {
+    const receipt = await findWakeIdempotencyReceipt(db as never, { companyId, idempotencyKey });
+    if (receipt) return "skipped";
+    dispatches.count += 1;
+    await insertWake(landsInStatus, idempotencyKey);
+    return "dispatched";
+  }
+
+  it.each(["claimed", "coalesced"])(
+    "does not dispatch a second wake when the effect is reclaimed while the first is %s",
+    async (landsInStatus) => {
+      await seed();
+      const idempotencyKey = `issue_comment:${randomUUID()}:assignee:a1`;
+      const dispatches = { count: 0 };
+
+      // Attempt 1: the effect claims, dispatches the wake, and the process dies
+      // before `completeEffect` — so the ledger row goes back to `queued` and
+      // the effect will be handed out again. The wake, meanwhile, is already
+      // accepted and has moved on to `claimed`/`coalesced`.
+      expect(await attemptWakeEffect(idempotencyKey, dispatches, landsInStatus)).toBe("dispatched");
+      expect(dispatches.count).toBe(1);
+
+      // Attempt 2 is the reclaim. This is the exact case the receipt list was
+      // widened for: before the fix neither `claimed` nor `coalesced` counted,
+      // so this attempt found nothing and woke the agent a second time for one
+      // comment — the duplicate-emit defect this whole chain exists to kill.
+      expect(await attemptWakeEffect(idempotencyKey, dispatches, landsInStatus)).toBe("skipped");
+      expect(dispatches.count).toBe(1);
+
+      // And the durable evidence is still a single wake, not two.
+      const rows = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.idempotencyKey, idempotencyKey));
+      expect(rows).toHaveLength(1);
+      expect(rows[0].status).toBe(landsInStatus);
+    },
+    60_000,
+  );
 
   it.each([
     "queued",
