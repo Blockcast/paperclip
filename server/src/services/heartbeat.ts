@@ -170,7 +170,6 @@ import {
 } from "./run-liveness.js";
 import {
   ISSUE_NEW_INPUT_ACTIVITY_ACTIONS,
-  ISSUE_PROGRESS_ACTIVITY_ACTIONS,
   ISSUE_REWAKE_LOOKBACK_MS,
   ISSUE_REWAKE_RUN_SAMPLE_LIMIT,
   evaluateIssueRewakeThrottle,
@@ -25596,44 +25595,38 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
           if (recentTerminalRuns.length > 0) {
             const sampleRunIds = recentTerminalRuns.map((sampleRun) => sampleRun.id);
-            const progressRows = await tx
-              .select({ runId: activityLog.runId })
+            const lastRunFinishedAt = recentTerminalRuns[0]?.finishedAt ?? null;
+            // Single pass over the actions the throttle can ever need: rows
+            // attributed to a sampled run (progress) plus rows created after
+            // the newest run finished (new input). evaluateIssueRewakeThrottle
+            // decides, per row, which of those two questions it answers —
+            // including the actor check that keeps a self-authored status
+            // comment from counting as either (BLO-23081).
+            const activityRows = await tx
+              .select({
+                runId: activityLog.runId,
+                action: activityLog.action,
+                agentId: activityLog.agentId,
+                createdAt: activityLog.createdAt,
+              })
               .from(activityLog)
               .where(
                 and(
                   eq(activityLog.companyId, agent.companyId),
                   eq(activityLog.entityType, "issue"),
                   eq(activityLog.entityId, issue.id),
-                  inArray(activityLog.runId, sampleRunIds),
-                  inArray(activityLog.action, ISSUE_PROGRESS_ACTIVITY_ACTIONS),
+                  inArray(activityLog.action, ISSUE_NEW_INPUT_ACTIVITY_ACTIONS),
+                  lastRunFinishedAt
+                    ? or(inArray(activityLog.runId, sampleRunIds), gt(activityLog.createdAt, lastRunFinishedAt))
+                    : inArray(activityLog.runId, sampleRunIds),
                 ),
               );
-            const lastRunFinishedAt = recentTerminalRuns[0]?.finishedAt ?? null;
-            const newInputRows = lastRunFinishedAt
-              ? await tx
-                .select({ id: activityLog.id })
-                .from(activityLog)
-                .where(
-                  and(
-                    eq(activityLog.companyId, agent.companyId),
-                    eq(activityLog.entityType, "issue"),
-                    eq(activityLog.entityId, issue.id),
-                    gt(activityLog.createdAt, lastRunFinishedAt),
-                    inArray(activityLog.action, ISSUE_NEW_INPUT_ACTIVITY_ACTIONS),
-                  ),
-                )
-                .limit(1)
-              : [];
 
             const throttleDecision = evaluateIssueRewakeThrottle({
               now: throttleNow,
+              agentId,
               recentTerminalRuns,
-              runIdsWithIssueProgress: new Set(
-                progressRows
-                  .map((row) => row.runId)
-                  .filter((runId): runId is string => Boolean(runId)),
-              ),
-              hasNewIssueInputSinceLastRun: newInputRows.length > 0,
+              activityRows,
             });
 
             if (throttleDecision.blocked) {
