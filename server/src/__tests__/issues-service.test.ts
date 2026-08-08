@@ -602,6 +602,38 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     });
   });
 
+  it("rejects foreign project ids on create and update", async () => {
+    const companyId = await seedAssignableAgentCompany();
+    const foreignCompanyId = await seedAssignableAgentCompany();
+    const foreignProjectId = randomUUID();
+    await db.insert(projects).values({
+      id: foreignProjectId,
+      companyId: foreignCompanyId,
+      name: "Foreign project",
+    });
+
+    await expect(svc.create(companyId, {
+      title: "Foreign project create",
+      status: "todo",
+      priority: "medium",
+      projectId: foreignProjectId,
+    })).rejects.toMatchObject({
+      status: 422,
+      message: "Project must belong to the issue's company",
+    });
+
+    const issue = await svc.create(companyId, {
+      title: "Foreign project update",
+      status: "todo",
+      priority: "medium",
+    });
+    await expect(svc.update(issue.id, { projectId: foreignProjectId })).rejects.toMatchObject({
+      status: 422,
+      message: "Project must belong to the issue's company",
+    });
+    await expect(svc.getById(issue.id)).resolves.toMatchObject({ projectId: null });
+  });
+
   function agentRow(companyId: string, input: {
     id: string;
     name: string;

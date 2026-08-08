@@ -9153,6 +9153,7 @@ export function issueService(db: Db) {
             issueData.projectId = ledProjects[0].id;
           }
         }
+        await assertValidIssueProject(companyId, issueData.projectId, tx);
         const projectGoalId = await getProjectDefaultGoalId(tx, companyId, issueData.projectId);
         // Cache the project policy lookup for this insert. Both the
         // default-settings block and the assignee-environment-promotion block
