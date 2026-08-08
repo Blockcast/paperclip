@@ -140,6 +140,12 @@ type ProductivityReviewEvidence = {
   sourceAgent: AgentRow;
   noCommentStreak: number;
   runtimeFailureStreak: number;
+  // BLO-22436: runs in the sample window that could not possibly have
+  // produced a comment (infra failure or dependency-gate cancellation),
+  // reported separately from the streaks so a review body never has to be
+  // re-derived from raw run telemetry.
+  nonExecutingRunCount: number;
+  nonExecutingDominantErrorCode: string | null;
   totalRunCount: number;
   terminalRunCount: number;
   activeRunCount: number;
@@ -722,6 +728,16 @@ function formatTrigger(trigger: ProductivityReviewTrigger) {
   return "Long active duration";
 }
 
+// True when the dependency gate cancelled a queued run before dispatch (see
+// `cancelQueuedRunForBlockedDependencies` in heartbeat.ts). The run never
+// reached the adapter, so it is disjoint from `isInfraFailureRun` below even
+// though both are zero-token: this one is a graph-state fact about the issue
+// (an unresolved `blockedBy` edge), not an infrastructure fault, and it must
+// not be reported as one (BLO-22436).
+function isDependencyBlockedRun(run: Pick<HeartbeatRunRow, "errorCode">): boolean {
+  return run.errorCode === "issue_dependencies_blocked";
+}
+
 // True when a run's most recent classification is `failed` liveness AND it
 // burned zero input+output tokens. That combination means the agent never
 // got a model turn — the runtime crashed, the process was killed, or every
@@ -730,11 +746,40 @@ function formatTrigger(trigger: ProductivityReviewTrigger) {
 // provider capacity 429 kill, and retry-budget exhaustion with no error code
 // at all (`error: "unknown"`, `error_status: null`). Keying on token usage
 // rather than error code/status/dispatch-state is deliberate: it is the one
-// signature all four causes share (BLO-21769).
-function isNeverExecutedRun(run: Pick<HeartbeatRunRow, "livenessState" | "usageJson">): boolean {
+// signature all four causes share (BLO-21769). Excludes dependency-gate
+// cancellations (BLO-22436) — those are counted separately.
+function isInfraFailureRun(run: Pick<HeartbeatRunRow, "livenessState" | "usageJson" | "errorCode">): boolean {
+  if (isDependencyBlockedRun(run)) return false;
   if (run.livenessState !== "failed") return false;
   const { inputTokens, outputTokens } = runUsageTokenCounts(run.usageJson);
   return inputTokens === 0 && outputTokens === 0;
+}
+
+// Union of every population that could not possibly have produced a run
+// comment: the agent was never given a model turn to comment with, whether
+// because the runtime failed (`isInfraFailureRun`) or because the dependency
+// gate cancelled the run before dispatch (`isDependencyBlockedRun`,
+// BLO-22436). Both populations are excluded from the no-comment-streak walk
+// on the same basis — neither is evidence of assignee silence.
+function isNeverExecutedRun(run: Pick<HeartbeatRunRow, "livenessState" | "usageJson" | "errorCode">): boolean {
+  return isInfraFailureRun(run) || isDependencyBlockedRun(run);
+}
+
+function dominantErrorCode(runs: Array<Pick<HeartbeatRunRow, "errorCode">>): string | null {
+  const counts = new Map<string, number>();
+  for (const run of runs) {
+    const code = run.errorCode ?? "unknown";
+    counts.set(code, (counts.get(code) ?? 0) + 1);
+  }
+  let winner: string | null = null;
+  let winnerCount = -1;
+  for (const [code, count] of counts) {
+    if (count > winnerCount) {
+      winner = code;
+      winnerCount = count;
+    }
+  }
+  return winner;
 }
 
 /**
@@ -2020,6 +2065,25 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     thresholds: ProductivityReviewThresholds,
     now: Date,
   ): Promise<ProductivityReviewEvidence | MonitorScheduledSuppression | ApprovalGatedSuppression | null> {
+    // BLO-22436: an issue with an unresolved blocker has its queued runs
+    // cancelled by the dependency gate before dispatch (see
+    // `cancelQueuedRunForBlockedDependencies` in heartbeat.ts) and therefore
+    // cannot produce a run comment no matter how long it waits. The standard
+    // remediation for a flagged productivity review is to model the platform
+    // fault as a `blockedBy` edge, which makes this a self-reinforcing loop
+    // unless blocked issues are exempt: fixing the previous review's cause
+    // becomes the cause of the next one. Skip entirely while blocked,
+    // regardless of trigger — the assignee cannot act on a gate it doesn't
+    // control.
+    const dependencyReadiness = await issuesSvc.listDependencyReadiness(
+      sourceIssue.companyId,
+      [sourceIssue.id],
+      db,
+    );
+    if ((dependencyReadiness.get(sourceIssue.id)?.unresolvedBlockerCount ?? 0) > 0) {
+      return null;
+    }
+
     const oneHourAgo = new Date(now.getTime() - 60 * 60 * 1000);
     const sixHoursAgo = new Date(now.getTime() - 6 * 60 * 60 * 1000);
 
@@ -2059,13 +2123,17 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     );
 
     // BLO-21769: a run that never executed a model turn (see
-    // `isNeverExecutedRun`) is infrastructure telemetry, not agent behaviour.
+    // `isInfraFailureRun`) is infrastructure telemetry, not agent behaviour.
     // It must not extend `noCommentStreak` — the agent was never given a
     // chance to comment — so it is filtered out of the walk entirely rather
-    // than counted as silence or treated as a streak-breaker.
+    // than counted as silence or treated as a streak-breaker. This streak is
+    // deliberately scoped to `isInfraFailureRun` and excludes dependency-gate
+    // cancellations (BLO-22436): those are a graph-state fact, not an
+    // infrastructure fault, and must not surface as one via
+    // `runtime_failure_streak`.
     let runtimeFailureStreak = 0;
     for (const run of terminalRuns) {
-      if (!isNeverExecutedRun(run)) break;
+      if (!isInfraFailureRun(run)) break;
       runtimeFailureStreak += 1;
     }
     const executedTerminalRuns = terminalRuns.filter((run) => !isNeverExecutedRun(run));
@@ -2074,6 +2142,13 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       if (commentRunIds.has(run.id)) break;
       noCommentStreak += 1;
     }
+    // BLO-22436: every run in the sample window that could not possibly have
+    // produced a comment (infra failure OR dependency-gate cancellation),
+    // reported as a count + dominant errorCode so a reviewing manager doesn't
+    // have to re-derive dispatch health from raw run telemetry.
+    const nonExecutingRuns = terminalRuns.filter((run) => isNeverExecutedRun(run));
+    const nonExecutingRunCount = nonExecutingRuns.length;
+    const nonExecutingDominantErrorCode = dominantErrorCode(nonExecutingRuns);
 
     const [
       runCountLastHour,
@@ -2250,6 +2325,8 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       sourceAgent,
       noCommentStreak,
       runtimeFailureStreak,
+      nonExecutingRunCount,
+      nonExecutingDominantErrorCode,
       totalRunCount: latestRuns.length,
       terminalRunCount: terminalRuns.length,
       activeRunCount,
@@ -2369,6 +2446,11 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       `- Active queued/running/scheduled runs: ${evidence.activeRunCount}`,
       `- No-comment streak (terminal, turn-executing runs): ${evidence.noCommentStreak}`,
       `- Runtime-failure streak (terminal, never-executed runs): ${evidence.runtimeFailureStreak}`,
+      ...(evidence.nonExecutingRunCount > 0
+        ? [
+            `- Non-executing runs in sample window (excluded from streaks above): ${evidence.nonExecutingRunCount} (dominant errorCode: \`${evidence.nonExecutingDominantErrorCode}\`)`,
+          ]
+        : []),
       `- Current active elapsed time: ${msToHuman(evidence.elapsedMs)}`,
       ...(evidence.nonLiveHoldMs > 0
         ? [
