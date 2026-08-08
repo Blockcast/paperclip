@@ -493,16 +493,51 @@ function parseMonitorDate(value: string | null | undefined) {
   return Number.isNaN(date.getTime()) ? null : date;
 }
 
-function exhaustedMonitorClearReason(input: {
-  monitor: IssueExecutionMonitorPolicy;
+/**
+ * Ceiling used by scheduler dispatch for a monitor armed without an explicit
+ * `maxAttempts` (BLO-23061).
+ *
+ * `recoveryPolicy` and the whole `max_attempts_exhausted` → owner-recovery path
+ * are already implemented and tested, but they hang off `exhaustedMonitorClearReason`,
+ * which only fires when `maxAttempts` is non-null. Agents routinely arm monitors
+ * with a `recoveryPolicy` and no `maxAttempts`, which made that escalation
+ * unreachable: the monitor re-armed forever and no human was ever notified.
+ * Observed on BLO-22305 — 19 agent runs across 31 hours, every one reporting an
+ * unchanged signature and re-arming.
+ *
+ * 24 is deliberately generous: at the ~hourly cadence those live monitors used,
+ * it is roughly a day of self-service polling before a human is pulled in. An
+ * explicit `maxAttempts` on the policy still wins, so callers that genuinely
+ * need a longer leash can set one. This is intentionally a scheduler default,
+ * not an API re-arm default: an explicit re-arm without `maxAttempts` remains
+ * unbounded as it was before this ceiling existed.
+ */
+export const DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS = 24;
+
+/**
+ * Single source of truth for "has this monitor run out of road?" — shared by the
+ * policy transition path and the heartbeat scheduler (BLO-23061).
+ *
+ * `attemptCount` is the number of attempts ALREADY made, not the one about to be
+ * consumed. The scheduler previously kept a private copy of this rule phrased as
+ * `nextAttemptCount > maxAttempts`, where `nextAttemptCount = attemptCount + 1`;
+ * that is algebraically identical to `attemptCount >= maxAttempts`, so collapsing
+ * the two is behaviour-preserving. Keep this parameterization — passing the
+ * post-increment count here would move the ceiling by one. Only the scheduler
+ * supplies `defaultMaxAttempts`; explicit policy transitions omit it so a
+ * monitor with no configured limit remains unbounded.
+ */
+export function exhaustedMonitorClearReason(input: {
+  monitor: IssueExecutionMonitorPolicy | null;
   attemptCount: number;
   now: Date;
+  defaultMaxAttempts?: number | null;
 }): IssueExecutionMonitorClearReason | null {
-  const timeoutAt = parseMonitorDate(input.monitor.timeoutAt ?? null);
+  const timeoutAt = parseMonitorDate(input.monitor?.timeoutAt ?? null);
   if (timeoutAt && input.now.getTime() >= timeoutAt.getTime()) {
     return "timeout_exceeded";
   }
-  const maxAttempts = input.monitor.maxAttempts ?? null;
+  const maxAttempts = input.monitor?.maxAttempts ?? input.defaultMaxAttempts ?? null;
   if (maxAttempts !== null && input.attemptCount >= maxAttempts) {
     return "max_attempts_exhausted";
   }
