@@ -11,6 +11,7 @@ import {
   createDb,
   heartbeatRuns,
   issueComments,
+  issueExecutionDecisions,
   issueRelations,
   issues,
 } from "@paperclipai/db";
@@ -43,6 +44,7 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
 
   afterEach(async () => {
     await db.delete(issueComments);
+    await db.delete(issueExecutionDecisions);
     await db.delete(issueRelations);
     await db.delete(activityLog);
     await db.delete(issues);
@@ -56,14 +58,17 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
     await tempDb?.cleanup();
   });
 
-  function createApp(actor: Express.Request["actor"]) {
+  function createApp(
+    actor: Express.Request["actor"],
+    opts: Parameters<typeof issueRoutes>[2] = {},
+  ) {
     const app = express();
     app.use(express.json());
     app.use((req, _res, next) => {
       req.actor = actor;
       next();
     });
-    app.use("/api", issueRoutes(db, {} as any));
+    app.use("/api", issueRoutes(db, {} as any, opts));
     app.use(errorHandler);
     return app;
   }
@@ -179,6 +184,80 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
     return { queuedWakeupId, scheduledWakeupId, queuedRunId, scheduledRunId, runningRunId };
   }
 
+  function deferred() {
+    let resolve!: () => void;
+    const promise = new Promise<void>((resolvePromise) => {
+      resolve = resolvePromise;
+    });
+    return { promise, resolve };
+  }
+
+  async function seedPendingReviewStage(options: { driftedAssignee?: boolean } = {}) {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const competingRunId = randomUUID();
+    const stageId = randomUUID();
+    const issueId = randomUUID();
+    const participant = { type: "agent" as const, agentId, userId: null };
+    let assigneeAgentId = agentId;
+
+    if (options.driftedAssignee) {
+      assigneeAgentId = randomUUID();
+      await db.insert(agents).values({
+        id: assigneeAgentId,
+        companyId,
+        name: "DriftedAssignee",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+    }
+
+    await db.insert(heartbeatRuns).values({
+      id: competingRunId,
+      companyId,
+      agentId,
+      status: "running",
+      invocationSource: "manual",
+      startedAt: new Date(),
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Pending review stage",
+      status: "in_review",
+      priority: "high",
+      assigneeAgentId,
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [{
+          id: stageId,
+          type: "review",
+          approvalsNeeded: 1,
+          participants: [{ id: randomUUID(), ...participant }],
+        }],
+      },
+      executionState: {
+        status: "pending",
+        currentStageId: stageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: participant,
+        returnAssignee: participant,
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+        monitor: null,
+      },
+    });
+
+    return { companyId, agentId, currentRunId, competingRunId, issueId, stageId, assigneeAgentId };
+  }
+
   function agentActor(companyId: string, agentId: string, runId: string): Express.Request["actor"] {
     return {
       type: "agent",
@@ -199,6 +278,124 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
       source: "session",
     };
   }
+
+  it("atomically lets only one participant run claim a pending review stage", async () => {
+    const seeded = await seedPendingReviewStage({ driftedAssignee: true });
+    const claim = (runId: string) => request(createApp(agentActor(seeded.companyId, seeded.agentId, runId)))
+      .post(`/api/issues/${seeded.issueId}/checkout`)
+      .send({ agentId: seeded.agentId, expectedStatuses: ["in_review"] });
+
+    const results = await Promise.all([claim(seeded.currentRunId), claim(seeded.competingRunId)]);
+    const winners = results.filter((result) => result.status === 200);
+    const losers = results.filter((result) => result.status === 409);
+
+    expect(winners).toHaveLength(1);
+    expect(losers).toHaveLength(1);
+    expect(winners[0].body).toMatchObject({
+      status: "in_review",
+      assigneeAgentId: seeded.assigneeAgentId,
+    });
+
+    const winnerRunId = winners[0].body.checkoutRunId;
+    expect([seeded.currentRunId, seeded.competingRunId]).toContain(winnerRunId);
+    const row = await db
+      .select({
+        status: issues.status,
+        assigneeAgentId: issues.assigneeAgentId,
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+        executionState: issues.executionState,
+      })
+      .from(issues)
+      .where(eq(issues.id, seeded.issueId))
+      .then((rows) => rows[0]);
+
+    expect(row).toMatchObject({
+      status: "in_review",
+      assigneeAgentId: seeded.assigneeAgentId,
+      checkoutRunId: winnerRunId,
+      executionRunId: winnerRunId,
+      executionState: {
+        status: "pending",
+        currentStageId: seeded.stageId,
+        currentParticipant: { type: "agent", agentId: seeded.agentId },
+      },
+    });
+  });
+
+  it("rejects a stale participant that races a claim or tries to reopen the claimed stage", async () => {
+    const seeded = await seedPendingReviewStage();
+    const reachedWrite = deferred();
+    const releaseWrite = deferred();
+    const staleAdvance = request(createApp(
+      agentActor(seeded.companyId, seeded.agentId, seeded.currentRunId),
+      {
+        pendingReviewStageBeforeWriteHook: async () => {
+          reachedWrite.resolve();
+          await releaseWrite.promise;
+        },
+      },
+    ))
+      .patch(`/api/issues/${seeded.issueId}`)
+      .send({ status: "done", comment: "Approve from the stale run" })
+      // Supertest does not dispatch until the thenable is consumed. Start the
+      // paused request now so the competing claim actually lands between its
+      // authorization snapshot and its guarded write.
+      .then((response) => response);
+
+    await reachedWrite.promise;
+    const claim = await request(createApp(agentActor(seeded.companyId, seeded.agentId, seeded.competingRunId)))
+      .post(`/api/issues/${seeded.issueId}/checkout`)
+      .send({ agentId: seeded.agentId, expectedStatuses: ["in_review"] });
+    expect(claim.status, JSON.stringify(claim.body)).toBe(200);
+
+    releaseWrite.resolve();
+    const advance = await staleAdvance;
+    expect(advance.status, JSON.stringify(advance.body)).toBe(409);
+    expect(advance.body.error).toBe("Issue checkout run changed before the update could be applied");
+
+    const staleReopen = await request(createApp(agentActor(seeded.companyId, seeded.agentId, seeded.currentRunId)))
+      .patch(`/api/issues/${seeded.issueId}`)
+      .send({ status: "in_progress", comment: "Request changes from the stale run" });
+    expect(staleReopen.status, JSON.stringify(staleReopen.body)).toBe(409);
+    expect(staleReopen.body.error).toBe("Issue run ownership conflict");
+
+    const staleApprovalComment = await request(createApp(agentActor(
+      seeded.companyId,
+      seeded.agentId,
+      seeded.currentRunId,
+    )))
+      .post(`/api/issues/${seeded.issueId}/comments`)
+      .send({ body: "kind: review\ndecision: approved" });
+    expect(staleApprovalComment.status, JSON.stringify(staleApprovalComment.body)).toBe(409);
+    expect(staleApprovalComment.body.error).toBe("Issue run ownership conflict");
+
+    const decisions = await db
+      .select({ id: issueExecutionDecisions.id })
+      .from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.issueId, seeded.issueId));
+    expect(decisions).toEqual([]);
+
+    const row = await db
+      .select({
+        status: issues.status,
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+        executionState: issues.executionState,
+      })
+      .from(issues)
+      .where(eq(issues.id, seeded.issueId))
+      .then((rows) => rows[0]);
+    expect(row).toMatchObject({
+      status: "in_review",
+      checkoutRunId: seeded.competingRunId,
+      executionRunId: seeded.competingRunId,
+      executionState: {
+        status: "pending",
+        currentStageId: seeded.stageId,
+      },
+    });
+  });
 
   it("allows an assigned agent PATCH to recover a terminal stale executionRunId", async () => {
     const { companyId, agentId, failedRunId, currentRunId } = await seedCompanyAgentAndRuns();

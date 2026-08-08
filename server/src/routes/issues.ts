@@ -2066,6 +2066,26 @@ function isCurrentIssueExecutionRun(
   return issue.checkoutRunId === runId || issue.executionRunId === runId;
 }
 
+function pendingReviewStageWritePreconditions(
+  req: Request,
+  issue: {
+    status: string;
+    checkoutRunId?: string | null;
+    executionRunId?: string | null;
+    executionState?: unknown;
+  },
+) {
+  if (req.actor.type !== "agent" || issue.status !== "in_review") return {};
+  const executionState = parseIssueExecutionState(issue.executionState);
+  if (executionState?.status !== "pending") return {};
+  return {
+    expectedCurrentStatus: "in_review",
+    expectedCurrentCheckoutRunId: issue.checkoutRunId ?? null,
+    expectedCurrentExecutionRunId: issue.executionRunId ?? null,
+    expectedCurrentExecutionState: issue.executionState ?? null,
+  };
+}
+
 function summarizeIssueMonitor(
   issue: {
     monitorNextCheckAt?: Date | null;
@@ -2985,6 +3005,8 @@ export function issueRoutes(
     createIssueDuplicateCandidateActivityTimeoutMs?: number;
     createIssueDuplicateCandidateCorpusFilter?: CreateIssueDuplicateCandidateCorpusFilter;
     createIssueBeforeResponseHook?: () => Promise<void>;
+    /** Test seam for deterministic claim-vs-decision interleavings. */
+    pendingReviewStageBeforeWriteHook?: () => Promise<void>;
   } = {},
 ) {
   const router = Router();
@@ -4332,6 +4354,7 @@ export function issueRoutes(
     | "deny_patch_policy"
     | "deny_recovery_handoff_comment_only"
     | "deny_recovery_owner_comment_only"
+    | "deny_stale_execution_stage_claim"
     | "deny_resume_policy"
     | "deny_structured_comment_fields"
     | "deny_task_watchdog_scope";
@@ -5067,12 +5090,16 @@ export function issueRoutes(
   // routes — including DELETE /issues/:id and the document/work-product writes
   // that back the done-gate evidence, letting one actor author closure evidence
   // and then approve the close.
-  function isAgentCurrentExecutionStageParticipant(
+  function isAgentPendingReviewStageParticipant(
     req: Request,
-    issue: { status: string; executionState?: unknown },
+    issue: {
+      status: string;
+      executionState?: unknown;
+      checkoutRunId?: string | null;
+      executionRunId?: string | null;
+    },
   ) {
     if (req.actor.type !== "agent" || !req.actor.agentId) return false;
-    if (!isExecutionStageDecisionPatchBody(req.body)) return false;
     if (issue.status !== "in_review") return false;
     const executionState = parseIssueExecutionState(issue.executionState);
     if (executionState?.status !== "pending") return false;
@@ -5080,6 +5107,55 @@ export function issueRoutes(
       { actorType: "agent", actorId: req.actor.agentId },
       executionState.currentParticipant,
     );
+  }
+
+  function isAgentCurrentExecutionStageParticipant(
+    req: Request,
+    issue: {
+      status: string;
+      executionState?: unknown;
+      checkoutRunId?: string | null;
+      executionRunId?: string | null;
+    },
+  ) {
+    if (!isExecutionStageDecisionPatchBody(req.body)) return false;
+    if (!isAgentPendingReviewStageParticipant(req, issue)) return false;
+    // An unclaimed stage can still receive its participant's decision. Once a
+    // run has claimed it, however, the participant identity alone is not enough:
+    // a previous heartbeat of that same participant must not complete or reopen
+    // the stage owned by the newer run.
+    return (
+      (issue.checkoutRunId == null && issue.executionRunId == null) ||
+      isCurrentIssueExecutionRun(req, issue)
+    );
+  }
+
+  function isAgentStalePendingReviewStageParticipant(
+    req: Request,
+    issue: {
+      status: string;
+      executionState?: unknown;
+      checkoutRunId?: string | null;
+      executionRunId?: string | null;
+    },
+  ) {
+    return (
+      isAgentPendingReviewStageParticipant(req, issue) &&
+      (issue.checkoutRunId != null || issue.executionRunId != null) &&
+      !isCurrentIssueExecutionRun(req, issue)
+    );
+  }
+
+  function isAgentStaleExecutionStageParticipant(
+    req: Request,
+    issue: {
+      status: string;
+      executionState?: unknown;
+      checkoutRunId?: string | null;
+      executionRunId?: string | null;
+    },
+  ) {
+    return isExecutionStageDecisionPatchBody(req.body) && isAgentStalePendingReviewStageParticipant(req, issue);
   }
 
   // BLO-18289: returns the coordination-metadata field names in this PATCH
@@ -5319,6 +5395,22 @@ export function issueRoutes(
           actorAgentId,
           status: issue.status,
           securityPrinciples: ["Least Privilege", "Complete Mediation", "Fail Securely"],
+        },
+      });
+      return false;
+    }
+    if (options.allowExecutionStageDecision && isAgentStaleExecutionStageParticipant(req, issue)) {
+      await recordDeniedIssueWrite(req, issue, "issue:mutate", {
+        reason: "deny_stale_execution_stage_claim",
+        responseStatus: 409,
+      });
+      res.status(409).json({
+        error: "Issue run ownership conflict",
+        details: {
+          issueId: issue.id,
+          checkoutRunId: issue.checkoutRunId ?? null,
+          executionRunId: issue.executionRunId ?? null,
+          actorRunId: req.actor.runId ?? null,
         },
       });
       return false;
@@ -9793,6 +9885,7 @@ export function issueRoutes(
       !!existing.assigneeAgentId &&
       existing.assigneeAgentId !== req.actor.agentId &&
       isCreatorOrManagerChainRecoveryPatch(existing, req.body as Record<string, unknown>);
+    const pendingReviewStagePreconditions = pendingReviewStageWritePreconditions(req, existing);
     if (!(await assertCheapRecoveryIssueAssigneeProfileAllowed(req, res, existing, req.body))) return;
 
     const actor = getActorInfo(req);
@@ -10193,6 +10286,9 @@ export function issueRoutes(
 
     let issue;
     try {
+      if (pendingReviewStagePreconditions.expectedCurrentStatus !== undefined) {
+        await opts.pendingReviewStageBeforeWriteHook?.();
+      }
       if (transition.decision && decisionId) {
         const decision = transition.decision;
         issue = await db.transaction(async (tx) => {
@@ -10202,6 +10298,7 @@ export function issueRoutes(
               ...updateFields,
               actorAgentId: actor.agentId ?? null,
               actorUserId: actor.actorType === "user" ? actor.actorId : null,
+              ...pendingReviewStagePreconditions,
               ...(delegateRecoveryPatchInFlight
                 ? {
                     expectedCurrentStatus: "blocked",
@@ -10237,6 +10334,7 @@ export function issueRoutes(
           ...updateFields,
           actorAgentId: actor.agentId ?? null,
           actorUserId: actor.actorType === "user" ? actor.actorId : null,
+          ...pendingReviewStagePreconditions,
           ...(delegateRecoveryPatchInFlight
             ? {
                 expectedCurrentStatus: "blocked",
@@ -11221,7 +11319,23 @@ export function issueRoutes(
       (activeRecoveryActionForCheckout.status === "active" || activeRecoveryActionForCheckout.status === "escalated") &&
       activeRecoveryActionForCheckout.ownerAgentId === req.body.agentId;
 
-    if (issue.assigneeAgentId !== req.body.agentId && !allowSourceScopedRecoveryOwnerCheckout) {
+    const checkoutActorIsPendingReviewStageParticipant =
+      req.actor.type === "agent" &&
+      req.actor.agentId === req.body.agentId &&
+      issue.status === "in_review" &&
+      (() => {
+        const executionState = parseIssueExecutionState(issue.executionState);
+        return executionState?.status === "pending" && actorMatchesExecutionParticipant(
+          { actorType: "agent", actorId: req.body.agentId },
+          executionState.currentParticipant,
+        );
+      })();
+
+    if (
+      issue.assigneeAgentId !== req.body.agentId &&
+      !allowSourceScopedRecoveryOwnerCheckout &&
+      !checkoutActorIsPendingReviewStageParticipant
+    ) {
       try {
         await assertCanAssignTasks(req, issue.companyId, {
           issueId: issue.id,
@@ -11267,6 +11381,7 @@ export function issueRoutes(
     if (req.actor.type === "agent" && !checkoutRunId) return;
     const updated = await svc.checkout(id, req.body.agentId, req.body.expectedStatuses, checkoutRunId, {
       allowSourceScopedRecoveryOwner: allowSourceScopedRecoveryOwnerCheckout,
+      allowPendingReviewStageClaim: checkoutActorIsPendingReviewStageParticipant,
       recoveryActionId: activeRecoveryActionForCheckout?.id ?? null,
       recoveryActionStatus: activeRecoveryActionForCheckout?.status ?? null,
     });
@@ -12605,6 +12720,23 @@ export function issueRoutes(
         actorMatchesExecutionParticipant(actor, currentExecutionState.currentParticipant ?? null) &&
         isApprovalReviewComment(req.body.body);
 
+      if (shouldAutoApproveReviewComment && isAgentStalePendingReviewStageParticipant(req, currentIssue)) {
+        await recordDeniedIssueWrite(req, currentIssue, "issue:mutate", {
+          reason: "deny_stale_execution_stage_claim",
+          responseStatus: 409,
+        });
+        res.status(409).json({
+          error: "Issue run ownership conflict",
+          details: {
+            issueId: currentIssue.id,
+            checkoutRunId: currentIssue.checkoutRunId ?? null,
+            executionRunId: currentIssue.executionRunId ?? null,
+            actorRunId: req.actor.runId ?? null,
+          },
+        });
+        return;
+      }
+
       if (req.body.idempotencyKey && shouldAutoApproveReviewComment) {
         res.status(400).json({ error: "Idempotent comments cannot approve review stages" });
         return;
@@ -12642,6 +12774,7 @@ export function issueRoutes(
           status: typeof transition.patch.status === "string" ? transition.patch.status : "done",
           actorAgentId: actor.agentId ?? null,
           actorUserId: actor.actorType === "user" ? actor.actorId : null,
+          ...pendingReviewStageWritePreconditions(req, currentIssue),
         };
 
         const sourceTrust = await sourceTrustForActorWrite(currentIssue, actor);
@@ -12656,7 +12789,17 @@ export function issueRoutes(
           issue: NonNullable<Awaited<ReturnType<typeof svc.update>>>;
         };
         try {
+          if (updatePatch.expectedCurrentStatus !== undefined) {
+            await opts.pendingReviewStageBeforeWriteHook?.();
+          }
           txResult = await db.transaction(async (tx) => {
+            const updated = await svc.update(id, updatePatch, tx);
+            if (!updated) throw new AutoApprovalIssueMissingError();
+
+            // Update first: concurrent approval comments otherwise each hold
+            // a foreign-key key-share lock before trying to upgrade the issue
+            // row. Keeping both writes in this transaction preserves atomic
+            // comment/decision behavior without that lock-upgrade deadlock.
             const insertedComment = await svc.addComment(
               id,
               req.body.body,
@@ -12668,8 +12811,6 @@ export function issueRoutes(
               commentOptions,
               tx,
             );
-            const updated = await svc.update(id, updatePatch, tx);
-            if (!updated) throw new AutoApprovalIssueMissingError();
 
             if (transition.decision && decisionId) {
               await tx.insert(issueExecutionDecisions).values({

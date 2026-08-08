@@ -143,6 +143,19 @@ const ISSUE_LIST_RELATED_QUERY_CHUNK_SIZE = 500;
 export const MAX_CHILD_ISSUES_CREATED_BY_HELPER = 25;
 const MAX_CHILD_COMPLETION_SUMMARIES = 20;
 const CHILD_COMPLETION_SUMMARY_BODY_MAX_CHARS = 500;
+
+/**
+ * A pending execution stage deliberately remains `in_review`. It is not an
+ * ordinary assignee-owned review shell: only its typed current participant may
+ * claim the run locks, and a claim must not move the issue back to active work.
+ */
+function pendingInReviewExecutionStageCondition() {
+  return sql<boolean>`(
+    ${issues.status} = 'in_review'
+    AND ${issues.executionState} ->> 'status' = 'pending'
+    AND jsonb_typeof(${issues.executionState} -> 'currentParticipant') = 'object'
+  )`;
+}
 // Non-human author sentinels that agents post under. These ARE eligible for
 // agent-attribution derivation even though `local-board` is also materialized
 // as a row in the `user` table (it is the implicit board admin). Genuine human
@@ -8490,6 +8503,15 @@ export function issueService(db: Db) {
          * version when the statement blocks on a concurrent transaction.
          */
         expectedCurrentAssigneeAgentId?: string | null;
+        /**
+         * Pending review-stage decisions are authorized from a route snapshot,
+         * then persisted later. Keep the run-lock and stage-state receipt in
+         * the UPDATE predicate so a competing claim cannot be overwritten by a
+         * stale participant.
+         */
+        expectedCurrentCheckoutRunId?: string | null;
+        expectedCurrentExecutionRunId?: string | null;
+        expectedCurrentExecutionState?: unknown;
       },
       dbOrTx: any = db,
     ) => {
@@ -8507,6 +8529,9 @@ export function issueService(db: Db) {
         actorUserId,
         expectedCurrentStatus,
         expectedCurrentAssigneeAgentId,
+        expectedCurrentCheckoutRunId,
+        expectedCurrentExecutionRunId,
+        expectedCurrentExecutionState,
         ...issueData
       } = data;
 
@@ -8525,6 +8550,26 @@ export function issueService(db: Db) {
           issueId: id,
           expectedAssigneeAgentId: expectedCurrentAssigneeAgentId,
           currentAssigneeAgentId: existing.assigneeAgentId,
+        });
+      }
+      if (
+        expectedCurrentCheckoutRunId !== undefined &&
+        existing.checkoutRunId !== expectedCurrentCheckoutRunId
+      ) {
+        throw conflict("Issue checkout run changed before the update could be applied", {
+          issueId: id,
+          expectedCheckoutRunId: expectedCurrentCheckoutRunId,
+          currentCheckoutRunId: existing.checkoutRunId,
+        });
+      }
+      if (
+        expectedCurrentExecutionRunId !== undefined &&
+        existing.executionRunId !== expectedCurrentExecutionRunId
+      ) {
+        throw conflict("Issue execution run changed before the update could be applied", {
+          issueId: id,
+          expectedExecutionRunId: expectedCurrentExecutionRunId,
+          currentExecutionRunId: existing.executionRunId,
         });
       }
       const experimental = await instanceSettings.getExperimental();
@@ -8924,6 +8969,31 @@ export function issueService(db: Db) {
                   ? isNull(issues.assigneeAgentId)
                   : eq(issues.assigneeAgentId, expectedCurrentAssigneeAgentId),
               ]),
+          ...(expectedCurrentCheckoutRunId === undefined
+            ? []
+            : [
+                expectedCurrentCheckoutRunId === null
+                  ? isNull(issues.checkoutRunId)
+                  : eq(issues.checkoutRunId, expectedCurrentCheckoutRunId),
+              ]),
+          ...(expectedCurrentExecutionRunId === undefined
+            ? []
+            : [
+                expectedCurrentExecutionRunId === null
+                  ? isNull(issues.executionRunId)
+                  : eq(issues.executionRunId, expectedCurrentExecutionRunId),
+              ]),
+          // `execution_state` is nullable in SQL. JSONB `null` is not SQL
+          // NULL, so use IS NULL for the latter rather than comparing it to a
+          // JSON literal (the regression that broke ordinary in_review edits
+          // in the original app-authored PR).
+          ...(expectedCurrentExecutionState === undefined
+            ? []
+            : [
+                expectedCurrentExecutionState === null
+                  ? isNull(issues.executionState)
+                  : sql`${issues.executionState} = ${JSON.stringify(expectedCurrentExecutionState)}::jsonb`,
+              ]),
         ];
         const updated = await tx
           .update(issues)
@@ -8947,6 +9017,12 @@ export function issueService(db: Db) {
               ...(expectedCurrentAssigneeAgentId === undefined
                 ? {}
                 : { expectedAssigneeAgentId: expectedCurrentAssigneeAgentId }),
+              ...(expectedCurrentCheckoutRunId === undefined
+                ? {}
+                : { expectedCheckoutRunId: expectedCurrentCheckoutRunId }),
+              ...(expectedCurrentExecutionRunId === undefined
+                ? {}
+                : { expectedExecutionRunId: expectedCurrentExecutionRunId }),
             });
           }
           return null;
@@ -9111,6 +9187,7 @@ export function issueService(db: Db) {
       checkoutRunId: string | null,
       options: {
         allowSourceScopedRecoveryOwner?: boolean;
+        allowPendingReviewStageClaim?: boolean;
         recoveryActionId?: string | null;
         recoveryActionStatus?: string | null;
       } = {},
@@ -9165,9 +9242,49 @@ export function issueService(db: Db) {
           or(isNull(issues.checkoutRunId), eq(issues.checkoutRunId, checkoutRunId)),
         )
         : and(eq(issues.assigneeAgentId, agentId), isNull(issues.checkoutRunId));
+      const checkoutLockCondition = checkoutRunId
+        ? or(isNull(issues.checkoutRunId), eq(issues.checkoutRunId, checkoutRunId))
+        : isNull(issues.checkoutRunId);
       const executionLockCondition = checkoutRunId
         ? or(isNull(issues.executionRunId), eq(issues.executionRunId, checkoutRunId))
         : isNull(issues.executionRunId);
+      const pendingReviewStageCondition = pendingInReviewExecutionStageCondition();
+      const currentParticipantClaimCondition = sql<boolean>`(
+        ${pendingReviewStageCondition}
+        AND ${issues.executionState} -> 'currentParticipant' ->> 'type' = 'agent'
+        AND ${issues.executionState} -> 'currentParticipant' ->> 'agentId' = ${agentId}
+      )`;
+
+      // A pending execution stage is its own ownership domain. Claiming it only
+      // writes the run locks: status, assignee and startedAt intentionally stay
+      // unchanged so the stage remains visible as in_review and a drifted
+      // assignee cannot be silently overwritten.
+      if (options.allowPendingReviewStageClaim) {
+        const claimedStage = await db
+          .update(issues)
+          .set({
+            checkoutRunId,
+            executionRunId: checkoutRunId,
+            executionLockedAt: now,
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(issues.id, id),
+              inArray(issues.status, expectedStatuses),
+              currentParticipantClaimCondition,
+              checkoutLockCondition,
+              executionLockCondition,
+            ),
+          )
+          .returning()
+          .then((rows) => rows[0] ?? null);
+
+        if (claimedStage) {
+          const [enriched] = await withIssueLabels(db, [claimedStage]);
+          return enriched;
+        }
+      }
       const activeRecoveryOwnerCondition = options.allowSourceScopedRecoveryOwner
         ? exists(
           db
@@ -9203,6 +9320,7 @@ export function issueService(db: Db) {
           and(
             eq(issues.id, id),
             inArray(issues.status, expectedStatuses),
+            sql<boolean>`NOT (${pendingReviewStageCondition})`,
             activeRecoveryOwnerCondition
               ? or(isNull(issues.assigneeAgentId), sameRunAssigneeCondition, activeRecoveryOwnerCondition)
               : or(isNull(issues.assigneeAgentId), sameRunAssigneeCondition),
@@ -9237,12 +9355,29 @@ export function issueService(db: Db) {
           assigneeAgentId: issues.assigneeAgentId,
           checkoutRunId: issues.checkoutRunId,
           executionRunId: issues.executionRunId,
+          executionState: issues.executionState,
         })
         .from(issues)
         .where(eq(issues.id, id))
         .then((rows) => rows[0] ?? null);
 
       if (!current) throw notFound("Issue not found");
+
+      const currentHasPendingReviewStage =
+        current.status === "in_review" &&
+        current.executionState !== null &&
+        typeof current.executionState === "object" &&
+        (current.executionState as { status?: unknown }).status === "pending" &&
+        typeof (current.executionState as { currentParticipant?: unknown }).currentParticipant === "object" &&
+        (current.executionState as { currentParticipant?: unknown }).currentParticipant !== null;
+      if (currentHasPendingReviewStage) {
+        throw conflict("Pending review stage is already claimed or assigned to another participant", {
+          issueId: current.id,
+          status: current.status,
+          checkoutRunId: current.checkoutRunId,
+          executionRunId: current.executionRunId,
+        });
+      }
 
       if (options.allowSourceScopedRecoveryOwner && current.assigneeAgentId !== agentId) {
         throw conflict("Issue checkout failed — authorization or status mismatch", {
