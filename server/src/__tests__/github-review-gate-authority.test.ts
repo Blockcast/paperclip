@@ -302,7 +302,7 @@ describeEmbeddedPostgres("GitHub review-gate durable authority", () => {
     });
     expect(firstFetch.mock.calls.some(([url]) => String(url).endsWith(`/statuses/${LIVE_HEAD}`))).toBe(true);
     expect(firstFetch.mock.calls.some(([url]) => String(url).endsWith(`/statuses/${EVENT_HEAD}`))).toBe(true);
-    expect(firstFetch.mock.calls.some(([url]) => String(url).endsWith("/dispatches"))).toBe(true);
+    expect(firstFetch.mock.calls.some(([url]) => String(url).endsWith("/dispatches"))).toBe(false);
 
     await makeDue();
     const secondFetch = installGithubStub();
@@ -310,6 +310,7 @@ describeEmbeddedPostgres("GitHub review-gate durable authority", () => {
     expect(await readDelivery()).toMatchObject({ status: "delivered" });
     expect(secondFetch.mock.calls.some(([url]) => String(url).endsWith(`/statuses/${LIVE_HEAD}`))).toBe(true);
     expect(secondFetch.mock.calls.some(([url]) => String(url).endsWith(`/statuses/${EVENT_HEAD}`))).toBe(true);
+    expect(secondFetch.mock.calls.filter(([url]) => String(url).endsWith("/dispatches"))).toHaveLength(1);
   });
 
   it("retries a failed repository dispatch after all pending writes succeeded", async () => {

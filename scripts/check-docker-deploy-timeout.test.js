@@ -186,7 +186,10 @@ test("Docker deploy proves live review-gate capture before authority promotion",
   assert.match(deployJob, /scripts\/verify-review-gate-capture-promotion\.mjs/);
   assert.match(deployJob, /promotion_verify_script=\$\{promotion_verifier\}/);
   assert.match(deployJob, /PROMOTION_VERIFY_SCRIPT: \$\{\{ steps\.tooling\.outputs\.promotion_verify_script \}\}/);
-  assert.match(deployJob, /kubectl -n "\$\{NS\}" get deployment paperclip-api -o json/);
+  assert.match(deployJob, /api_deployment="\$\(jq -er '\.metadata\.name/);
+  assert.match(deployJob, /kubectl -n "\$\{NS\}" get deployment "\$\{api_deployment\}" -o json/);
+  assert.match(deployJob, /PAPERCLIP_API_DEPLOYMENT="\$\{api_deployment\}"/);
+  assert.doesNotMatch(deployJob, /get deployment paperclip-api/);
   assert.match(deployJob, /--target "\$\{unstamped\}" --print-authority/);
   assert.match(deployJob, /--target "\$\{unstamped\}" --live "\$\{live_capture\}"/);
 });

@@ -46,6 +46,13 @@ test("accepts an exact completed live capture contract", () => {
   assert.deepEqual(result.contract.repositories, ["blockcast/penstock-llm-proxy-core"]);
 });
 
+test("rejects an authoritative live rollout as capture-only proof", () => {
+  assert.throws(
+    () => verifyCapturePromotion(deployment(), deployment()),
+    /already has review-gate authority enabled/,
+  );
+});
+
 test("rejects a completed rollout for a different repository", () => {
   const live = deployment({
     authority: false,
