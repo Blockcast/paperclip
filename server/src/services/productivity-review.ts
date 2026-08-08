@@ -35,6 +35,7 @@ import {
   withRecoveryModelProfileHint,
 } from "./recovery/model-profile-hint.js";
 import { RECOVERY_ORIGIN_KINDS } from "./recovery/origins.js";
+import { runUsageTokenCounts } from "./recovery/zero-token-startup-failure.js";
 
 export const PRODUCTIVITY_REVIEW_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.issueProductivityReview;
 export const DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS = 10;
@@ -107,7 +108,11 @@ export const MONITOR_LAPSE_SERVICE_GRACE_MS = DEFAULT_PRODUCTIVITY_REVIEW_MONITO
 type IssueRow = typeof issues.$inferSelect;
 type AgentRow = typeof agents.$inferSelect;
 type HeartbeatRunRow = typeof heartbeatRuns.$inferSelect;
-type ProductivityReviewTrigger = "no_comment_streak" | "long_active_duration" | "high_churn";
+type ProductivityReviewTrigger =
+  | "no_comment_streak"
+  | "long_active_duration"
+  | "high_churn"
+  | "runtime_failure_streak";
 
 type ProductivityReviewThresholds = {
   noCommentStreakRuns: number;
@@ -134,6 +139,7 @@ type ProductivityReviewEvidence = {
   sourceIssue: IssueRow;
   sourceAgent: AgentRow;
   noCommentStreak: number;
+  runtimeFailureStreak: number;
   totalRunCount: number;
   terminalRunCount: number;
   activeRunCount: number;
@@ -686,10 +692,19 @@ function buildThresholds(overrides?: Partial<ProductivityReviewThresholds>): Pro
 }
 
 function choosePrimaryTrigger(input: {
+  runtimeFailure: boolean;
   noComment: boolean;
   longActive: boolean;
   highChurn: boolean;
 }): ProductivityReviewTrigger | null {
+  // Runtime failure takes priority: if the sampled window is dominated by
+  // runs that never got a model turn, that is the root cause worth surfacing
+  // first — an agent that never executed cannot also be judged unproductive
+  // (BLO-21769). `no_comment_streak` only ever counts turn-executing runs
+  // (see `isNeverExecutedRun` filtering in `collectEvidence`), so the two
+  // streaks are drawn from disjoint run sets and can coexist without this
+  // ordering being arbitrary.
+  if (input.runtimeFailure) return "runtime_failure_streak";
   if (input.noComment) return "no_comment_streak";
   if (input.highChurn) return "high_churn";
   if (input.longActive) return "long_active_duration";
@@ -703,7 +718,23 @@ function isSoftStopTrigger(trigger: ProductivityReviewTrigger) {
 function formatTrigger(trigger: ProductivityReviewTrigger) {
   if (trigger === "no_comment_streak") return "No-comment streak";
   if (trigger === "high_churn") return "High churn";
+  if (trigger === "runtime_failure_streak") return "Runtime failure streak";
   return "Long active duration";
+}
+
+// True when a run's most recent classification is `failed` liveness AND it
+// burned zero input+output tokens. That combination means the agent never
+// got a model turn — the runtime crashed, the process was killed, or every
+// model call errored before producing output. Observed causes include a K8s
+// crashloop (`BackoffLimitExceeded`), an inference-gateway 503 storm, a
+// provider capacity 429 kill, and retry-budget exhaustion with no error code
+// at all (`error: "unknown"`, `error_status: null`). Keying on token usage
+// rather than error code/status/dispatch-state is deliberate: it is the one
+// signature all four causes share (BLO-21769).
+function isNeverExecutedRun(run: Pick<HeartbeatRunRow, "livenessState" | "usageJson">): boolean {
+  if (run.livenessState !== "failed") return false;
+  const { inputTokens, outputTokens } = runUsageTokenCounts(run.usageJson);
+  return inputTokens === 0 && outputTokens === 0;
 }
 
 /**
@@ -2026,8 +2057,20 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     const terminalRuns = latestRuns.filter((run) =>
       TERMINAL_RUN_STATUSES.includes(run.status as (typeof TERMINAL_RUN_STATUSES)[number]),
     );
-    let noCommentStreak = 0;
+
+    // BLO-21769: a run that never executed a model turn (see
+    // `isNeverExecutedRun`) is infrastructure telemetry, not agent behaviour.
+    // It must not extend `noCommentStreak` — the agent was never given a
+    // chance to comment — so it is filtered out of the walk entirely rather
+    // than counted as silence or treated as a streak-breaker.
+    let runtimeFailureStreak = 0;
     for (const run of terminalRuns) {
+      if (!isNeverExecutedRun(run)) break;
+      runtimeFailureStreak += 1;
+    }
+    const executedTerminalRuns = terminalRuns.filter((run) => !isNeverExecutedRun(run));
+    let noCommentStreak = 0;
+    for (const run of executedTerminalRuns) {
       if (commentRunIds.has(run.id)) break;
       noCommentStreak += 1;
     }
@@ -2121,17 +2164,27 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       : Math.min(episodeMs, leadingParkMs + trailingHoldMs);
 
     const noComment = noCommentStreak >= thresholds.noCommentStreakRuns;
+    // Reuses `noCommentStreakRuns` as the sample-size threshold: both streaks
+    // ask "how many consecutive terminal runs is suspicious", just over
+    // disjoint filters (turn-executing vs never-executed). A separate config
+    // knob would be redundant surface for the same question.
+    const runtimeFailure = runtimeFailureStreak >= thresholds.noCommentStreakRuns;
     const longActive = elapsedMs !== null && elapsedMs >= thresholds.longActiveMs;
     const highChurn =
       runCountLastHour >= thresholds.highChurnHourly ||
       assigneeRunCommentCountLastHour >= thresholds.highChurnHourly ||
       runCountLastSixHours >= thresholds.highChurnSixHours ||
       assigneeRunCommentCountLastSixHours >= thresholds.highChurnSixHours;
-    const trigger = choosePrimaryTrigger({ noComment, longActive, highChurn });
+    const trigger = choosePrimaryTrigger({ runtimeFailure, noComment, longActive, highChurn });
     if (!trigger) return null;
 
     const triggerReasons: string[] = [];
-    if (noComment) triggerReasons.push(`${noCommentStreak} consecutive completed issue-linked runs had no run-created issue comment`);
+    if (runtimeFailure) {
+      triggerReasons.push(
+        `${runtimeFailureStreak} consecutive terminal runs produced zero model turns (failed liveness, 0 input/output tokens) — infrastructure failure, not agent silence`,
+      );
+    }
+    if (noComment) triggerReasons.push(`${noCommentStreak} consecutive terminal, turn-executing issue-linked runs had no run-created issue comment`);
     if (longActive) triggerReasons.push(`current active episode has lasted ${msToHuman(elapsedMs)}`);
     if (highChurn) {
       triggerReasons.push(
@@ -2196,6 +2249,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       sourceIssue,
       sourceAgent,
       noCommentStreak,
+      runtimeFailureStreak,
       totalRunCount: latestRuns.length,
       terminalRunCount: terminalRuns.length,
       activeRunCount,
@@ -2313,7 +2367,8 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       `- Total sampled issue-linked runs: ${evidence.totalRunCount}`,
       `- Terminal sampled runs: ${evidence.terminalRunCount}`,
       `- Active queued/running/scheduled runs: ${evidence.activeRunCount}`,
-      `- No-comment completed-run streak: ${evidence.noCommentStreak}`,
+      `- No-comment streak (terminal, turn-executing runs): ${evidence.noCommentStreak}`,
+      `- Runtime-failure streak (terminal, never-executed runs): ${evidence.runtimeFailureStreak}`,
       `- Current active elapsed time: ${msToHuman(evidence.elapsedMs)}`,
       ...(evidence.nonLiveHoldMs > 0
         ? [
@@ -2330,7 +2385,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       "",
       "## Thresholds",
       "",
-      `- No-comment streak: ${evidence.thresholds.noCommentStreakRuns} completed runs`,
+      `- No-comment / runtime-failure streak: ${evidence.thresholds.noCommentStreakRuns} consecutive terminal runs`,
       `- Long active duration: ${msToHuman(evidence.thresholds.longActiveMs)}`,
       `- High churn: ${evidence.thresholds.highChurnHourly}/1h or ${evidence.thresholds.highChurnSixHours}/6h runs/assignee-run comments`,
       `- Resolved-review snooze: ${msToHuman(evidence.thresholds.resolvedSnoozeMs)}`,
@@ -2349,16 +2404,27 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       "",
       "## Manager Decision",
       "",
-      "A \"Close as productive\" verdict requires at least ONE of the following concrete progress signals:",
-      "- An assignee run-linked comment in the last 6h that contains a `Next action:` line",
-      "- A non-stale PR/MR link in the source issue's evidence (created or updated in the last 24h)",
-      "- A recent test result, artifact commit, or workspace deliverable in the last 6h",
-      "",
-      "If none of these signals is present, the correct verdict is one of:",
-      "- Request decomposition (the work is too large for a single heartbeat issue and needs to be split)",
-      "- Block with an unblock owner (the work needs human direction; name the gate)",
-      "- Stop/cancel (the work is not delivering value and should be wound down)",
-      "- Continue with a snooze window (only if the assignee has a clear next step but no surface evidence yet)",
+      ...(evidence.trigger === "runtime_failure_streak"
+        ? [
+          "This trigger fired because the sampled runs never executed a model turn (failed liveness, zero input/output tokens) — the assignee was never given a chance to act. This is an infrastructure signal, not an agent-performance verdict; do not decompose, block, or cancel the underlying work on the strength of this alone.",
+          "",
+          "Route to platform/SRE for one of:",
+          "- Diagnose and fix the underlying dispatch/runtime fault (crashloop, provider outage, retry exhaustion)",
+          "- Confirm the fault has cleared and let the issue continue unattended (no assignee action needed)",
+          "- If the fault persists, escalate for infrastructure remediation instead of reassigning or cancelling the source work",
+        ]
+        : [
+          "A \"Close as productive\" verdict requires at least ONE of the following concrete progress signals:",
+          "- An assignee run-linked comment in the last 6h that contains a `Next action:` line",
+          "- A non-stale PR/MR link in the source issue's evidence (created or updated in the last 24h)",
+          "- A recent test result, artifact commit, or workspace deliverable in the last 6h",
+          "",
+          "If none of these signals is present, the correct verdict is one of:",
+          "- Request decomposition (the work is too large for a single heartbeat issue and needs to be split)",
+          "- Block with an unblock owner (the work needs human direction; name the gate)",
+          "- Stop/cancel (the work is not delivering value and should be wound down)",
+          "- Continue with a snooze window (only if the assignee has a clear next step but no surface evidence yet)",
+        ]),
     ].join("\n");
   }
 
@@ -2370,6 +2436,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       `- Trigger: \`${evidence.trigger}\` (${formatTrigger(evidence.trigger)})`,
       `- Reasons: ${evidence.triggerReasons.join("; ")}`,
       `- No-comment streak: ${evidence.noCommentStreak}`,
+      `- Runtime-failure streak: ${evidence.runtimeFailureStreak}`,
       `- Runs/assignee comments: ${evidence.runCountLastHour}/${evidence.commentCountLastHour} in 1h, ${evidence.runCountLastSixHours}/${evidence.commentCountLastSixHours} in 6h`,
       ...(evidence.monitorGating
         ? [`- Elapsed accounting: ${formatMonitorGating(evidence.monitorGating)}`]

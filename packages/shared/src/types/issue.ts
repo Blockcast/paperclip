@@ -476,7 +476,8 @@ export interface IssueBlockedInboxAttention {
 export type IssueProductivityReviewTrigger =
   | "no_comment_streak"
   | "long_active_duration"
-  | "high_churn";
+  | "high_churn"
+  | "runtime_failure_streak";
 
 export interface IssueProductivityReview {
   reviewIssueId: string;

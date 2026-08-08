@@ -331,6 +331,38 @@ jobs:
         if: always()
         run: git worktree remove --force "$RUNNER_TEMP/worktree-install-check" || true
 
+  opencode_responses_replay:
+    name: OpenCode Responses replay
+    needs: [policy]
+    runs-on: default
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Install the pinned OpenCode release
+        run: |
+          set -euo pipefail
+          version="$(node -e '
+            const source = require("node:fs").readFileSync("Dockerfile.runtime", "utf8");
+            const match = source.match(/^ARG OPENCODE_AI_VERSION=(\S+)$/m);
+            if (!match) process.exit(1);
+            process.stdout.write(match[1]);
+          ')"
+          npm install --prefix "$RUNNER_TEMP/opencode-replay" --omit=dev "opencode-ai@$version"
+          binary="$RUNNER_TEMP/opencode-replay/node_modules/.bin/opencode"
+          test "$("$binary" --version)" = "$version"
+          echo "OPENCODE_REPLAY_BINARY=$binary" >> "$GITHUB_ENV"
+
+      - name: Replay framed and malformed Responses streams
+        run: node scripts/smoke/opencode-responses-replay.mjs
+
   general_tests:
     name: General tests (${{ matrix.group_label }})
     needs: [policy]
@@ -424,6 +456,7 @@ jobs:
         typecheck_release_registry,
         general_tests,
         worktree_install,
+        opencode_responses_replay,
         build,
         verify_serialized_server,
       ]
@@ -457,23 +490,35 @@ jobs:
           TYPECHECK_RELEASE_REGISTRY_RESULT: ${{ needs.typecheck_release_registry.result }}
           GENERAL_TESTS_RESULT: ${{ needs.general_tests.result }}
           WORKTREE_INSTALL_RESULT: ${{ needs.worktree_install.result }}
+          OPENCODE_RESPONSES_REPLAY_RESULT: ${{ needs.opencode_responses_replay.result }}
           BUILD_RESULT: ${{ needs.build.result }}
           VERIFY_SERIALIZED_SERVER_RESULT: ${{ needs.verify_serialized_server.result }}
         run: |
-          declare -A lane_results=(
-            [helm_chart]="$HELM_CHART_RESULT"
-            [typecheck_release_registry]="$TYPECHECK_RELEASE_REGISTRY_RESULT"
-            [general_tests]="$GENERAL_TESTS_RESULT"
-            [worktree_install]="$WORKTREE_INSTALL_RESULT"
-            [build]="$BUILD_RESULT"
-            [verify_serialized_server]="$VERIFY_SERIALIZED_SERVER_RESULT"
+          lane_names=(
+            helm_chart
+            typecheck_release_registry
+            general_tests
+            worktree_install
+            opencode_responses_replay
+            build
+            verify_serialized_server
+          )
+          lane_results=(
+            "$HELM_CHART_RESULT"
+            "$TYPECHECK_RELEASE_REGISTRY_RESULT"
+            "$GENERAL_TESTS_RESULT"
+            "$WORKTREE_INSTALL_RESULT"
+            "$OPENCODE_RESPONSES_REPLAY_RESULT"
+            "$BUILD_RESULT"
+            "$VERIFY_SERIALIZED_SERVER_RESULT"
           )
 
           cancelled_lanes=()
           skipped_lanes=()
           failed_lanes=()
-          for lane in "${!lane_results[@]}"; do
-            case "${lane_results[$lane]}" in
+          for i in "${!lane_names[@]}"; do
+            lane="${lane_names[$i]}"
+            case "${lane_results[$i]}" in
               success) ;;
               cancelled) cancelled_lanes+=("$lane") ;;
               skipped) skipped_lanes+=("$lane") ;;
