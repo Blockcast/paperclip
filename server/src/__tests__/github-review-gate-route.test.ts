@@ -5,11 +5,13 @@ import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const { enqueueGithubReviewGateDelivery } = vi.hoisted(() => ({
+const { activateGithubReviewGateDelivery, enqueueGithubReviewGateDelivery } = vi.hoisted(() => ({
+  activateGithubReviewGateDelivery: vi.fn(),
   enqueueGithubReviewGateDelivery: vi.fn(),
 }));
 
 vi.mock("../services/github-review-gate-authority.js", () => ({
+  activateGithubReviewGateDelivery,
   enqueueGithubReviewGateDelivery,
 }));
 
@@ -71,6 +73,8 @@ async function postWebhook(input: {
 
 describe("github review-gate authority route", () => {
   beforeEach(() => {
+    activateGithubReviewGateDelivery.mockReset();
+    activateGithubReviewGateDelivery.mockResolvedValue({ ok: true });
     enqueueGithubReviewGateDelivery.mockReset();
   });
 
@@ -79,6 +83,7 @@ describe("github review-gate authority route", () => {
       matched: true,
       queued: true,
       duplicate: false,
+      requiresRevocation: true,
       deliveryDbId: "durable-row",
       repoFullName: "Blockcast/penstock-llm-proxy-core",
       prNumber: 1085,
@@ -109,6 +114,38 @@ describe("github review-gate authority route", () => {
       rawBody: Buffer.from(JSON.stringify(payload), "utf8"),
       payload,
       config: reviewGateAuthority,
+    });
+    expect(activateGithubReviewGateDelivery).toHaveBeenCalledWith(db, "durable-row");
+  });
+
+  it("returns a retryable failure when the synchronous pending revocation fails", async () => {
+    enqueueGithubReviewGateDelivery.mockResolvedValue({
+      matched: true,
+      queued: true,
+      duplicate: false,
+      requiresRevocation: true,
+      deliveryDbId: "durable-row",
+      repoFullName: "Blockcast/penstock-llm-proxy-core",
+      prNumber: 1085,
+    });
+    activateGithubReviewGateDelivery.mockResolvedValue({
+      ok: false,
+      reason: "review_gate_status_http_503",
+    });
+
+    const response = await postWebhook({
+      eventName: "pull_request",
+      deliveryId: "delivery-revocation-failed",
+      payload: {
+        action: "edited",
+        repository: { full_name: "Blockcast/penstock-llm-proxy-core" },
+      },
+    });
+
+    expect(response.status).toBe(503);
+    expect(response.body).toEqual({
+      error: "github review-gate pending revocation failed",
+      reason: "review_gate_status_http_503",
     });
   });
 
