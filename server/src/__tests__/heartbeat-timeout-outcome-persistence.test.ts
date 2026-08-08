@@ -27,6 +27,7 @@ vi.mock("@paperclipai/shared/telemetry", async () => {
 });
 
 const FALSE_TIMEOUT_ADAPTER = "false_timeout_persistence_test";
+const FALSE_TIMEOUT_WITH_FAILURE_ADAPTER = "false_timeout_with_failure_persistence_test";
 const EMPTY_RESULT_ADAPTER = "empty_result_persistence_test";
 const EMPTY_RESULT_MESSAGE = "Agent exited successfully but produced no result";
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -86,10 +87,23 @@ describeEmbeddedPostgres("heartbeat timeout outcome persistence", () => {
       }),
       testEnvironment: testEnvironment(EMPTY_RESULT_ADAPTER),
     });
+    registerServerAdapter({
+      type: FALSE_TIMEOUT_WITH_FAILURE_ADAPTER,
+      execute: async () => ({
+        exitCode: 0,
+        signal: null,
+        timedOut: true,
+        errorMessage: "Timed out after 300s",
+        errorCode: "timeout",
+        resultJson: { error: "Result publication failed" },
+      }),
+      testEnvironment: testEnvironment(FALSE_TIMEOUT_WITH_FAILURE_ADAPTER),
+    });
   }, 120_000);
 
   afterAll(async () => {
     unregisterServerAdapter(FALSE_TIMEOUT_ADAPTER);
+    unregisterServerAdapter(FALSE_TIMEOUT_WITH_FAILURE_ADAPTER);
     unregisterServerAdapter(EMPTY_RESULT_ADAPTER);
     await cleanupHeartbeatTestState(db, heartbeat, {
       errorLabel: "timeout outcome persistence cleanup",
@@ -122,16 +136,25 @@ describeEmbeddedPostgres("heartbeat timeout outcome persistence", () => {
     return agentId;
   }
 
-  async function getWake(wakeupRequestId: string | null) {
+  async function waitForWakeToFinish(wakeupRequestId: string | null, timeoutMs = 5_000) {
     expect(wakeupRequestId).not.toBeNull();
-    return await db
-      .select({
-        status: agentWakeupRequests.status,
-        error: agentWakeupRequests.error,
-      })
-      .from(agentWakeupRequests)
-      .where(eq(agentWakeupRequests.id, wakeupRequestId!))
-      .then((rows) => rows[0] ?? null);
+    const deadline = Date.now() + timeoutMs;
+    let wake: { status: string; error: string | null } | null = null;
+    while (Date.now() < deadline) {
+      wake = await db
+        .select({
+          status: agentWakeupRequests.status,
+          error: agentWakeupRequests.error,
+        })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, wakeupRequestId!))
+        .then((rows) => rows[0] ?? null);
+      if (wake && !["queued", "claimed", "running", "scheduled"].includes(wake.status)) {
+        return wake;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    return wake;
   }
 
   it("persists the exact exit-zero timeout contradiction as success", async () => {
@@ -152,9 +175,34 @@ describeEmbeddedPostgres("heartbeat timeout outcome persistence", () => {
       timeoutConfigured: true,
       effectiveTimeoutSec: 300,
     });
-    await expect(getWake(persistedRun?.wakeupRequestId ?? null)).resolves.toEqual({
+    await expect(waitForWakeToFinish(persistedRun?.wakeupRequestId ?? null)).resolves.toEqual({
       status: "completed",
       error: null,
+    });
+  });
+
+  it("persists structured failure evidence instead of normalizing it to success", async () => {
+    const agentId = await seedAgent(FALSE_TIMEOUT_WITH_FAILURE_ADAPTER);
+    const run = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
+    expect(run).not.toBeNull();
+
+    const persistedRun = await waitForRunToFinish(heartbeat, run!.id);
+    expect(persistedRun).toMatchObject({
+      status: "failed",
+      exitCode: 0,
+      error: "Timed out after 300s",
+      errorCode: "timeout",
+    });
+    expect(persistedRun?.resultJson).toMatchObject({
+      error: "Result publication failed",
+      stopReason: "adapter_failed",
+      timeoutFired: false,
+      timeoutConfigured: true,
+      effectiveTimeoutSec: 300,
+    });
+    await expect(waitForWakeToFinish(persistedRun?.wakeupRequestId ?? null)).resolves.toEqual({
+      status: "failed",
+      error: "Timed out after 300s",
     });
   });
 
@@ -174,7 +222,7 @@ describeEmbeddedPostgres("heartbeat timeout outcome persistence", () => {
       stopReason: "adapter_failed",
       timeoutFired: false,
     });
-    await expect(getWake(persistedRun?.wakeupRequestId ?? null)).resolves.toEqual({
+    await expect(waitForWakeToFinish(persistedRun?.wakeupRequestId ?? null)).resolves.toEqual({
       status: "failed",
       error: EMPTY_RESULT_MESSAGE,
     });

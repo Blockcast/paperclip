@@ -29,7 +29,12 @@ WITH "repaired_runs" AS (
 		AND ("run"."error" IS NULL OR "run"."error" ~ '^Timed out after [0-9]+s$')
 		AND NOT (
 			COALESCE("run"."result_json", '{}'::jsonb)
-			?| ARRAY['error', 'message', 'result', 'summary']
+			?| ARRAY[
+				'error', 'errors', 'errorMessage', 'errorCode',
+				'message', 'result', 'summary',
+				'is_error', 'isError', 'success', 'ok',
+				'type', 'subtype', 'status', 'outcome', 'stop_reason'
+			]
 		)
 	RETURNING "run"."wakeup_request_id"
 )
