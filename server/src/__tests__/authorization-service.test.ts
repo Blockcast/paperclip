@@ -2706,6 +2706,127 @@ describeEmbeddedPostgres("authorization service", () => {
     expect(decision.allowed, decision.explanation).toBe(true);
   });
 
+  // BLO-21947: stranded-execution recovery authority. Both actions exist to
+  // give a *non-assignee* manager a repair lever, because this failure class
+  // breaks the assignee's own wake path — and because
+  // `issue-execution-policy.ts` refuses a convergence-stalled re-arm by the
+  // assignee outright, mandating a non-assignee actor the permission layer
+  // never provisioned below board. Same manager-chain + `tasks:assign` shape as
+  // coordination-metadata above, for the same stated reason: the grant is held
+  // unscoped by nearly every agent, so the manager-chain is the real gate.
+  it("allows a managing tasks:assign holder to recover a report's stranded run", async () => {
+    const company = await createCompany(db, "StrandedManager");
+    const managerAgent = await createAgent(db, company.id, { role: "engineer" });
+    const reportAgent = await createAgent(db, company.id, { role: "engineer", reportsTo: managerAgent.id });
+    await grantAgentPermission(db, company.id, managerAgent.id, "tasks:assign");
+
+    const decision = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: managerAgent.id, companyId: company.id, source: "agent_jwt" },
+      action: "run:recover_stranded",
+      resource: { type: "agent", companyId: company.id, agentId: reportAgent.id },
+    });
+
+    expect(decision.allowed, decision.explanation).toBe(true);
+  });
+
+  it("denies stranded-run recovery to a tasks:assign holder who does not manage the run's agent", async () => {
+    const company = await createCompany(db, "StrandedPeer");
+    const actorAgent = await createAgent(db, company.id, { role: "engineer" });
+    const peerAgent = await createAgent(db, company.id, { role: "engineer" });
+    await grantAgentPermission(db, company.id, actorAgent.id, "tasks:assign");
+
+    const decision = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: actorAgent.id, companyId: company.id, source: "agent_jwt" },
+      action: "run:recover_stranded",
+      resource: { type: "agent", companyId: company.id, agentId: peerAgent.id },
+    });
+
+    expect(decision).toMatchObject({ allowed: false, reason: "deny_scope" });
+  });
+
+  it("denies stranded-run recovery to a manager without a tasks:assign grant", async () => {
+    const company = await createCompany(db, "StrandedNoGrant");
+    const managerAgent = await createAgent(db, company.id, { role: "engineer" });
+    const reportAgent = await createAgent(db, company.id, { role: "engineer", reportsTo: managerAgent.id });
+
+    const decision = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: managerAgent.id, companyId: company.id, source: "agent_jwt" },
+      action: "run:recover_stranded",
+      resource: { type: "agent", companyId: company.id, agentId: reportAgent.id },
+    });
+
+    expect(decision.allowed).toBe(false);
+  });
+
+  it("denies stranded-run recovery targeting the actor's own run", async () => {
+    // Self-recovery needs no widening; this action exists only for the
+    // cross-agent case the broken wake path cannot serve.
+    const company = await createCompany(db, "StrandedSelf");
+    const actorAgent = await createAgent(db, company.id, { role: "engineer" });
+    await grantAgentPermission(db, company.id, actorAgent.id, "tasks:assign");
+
+    const decision = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: actorAgent.id, companyId: company.id, source: "agent_jwt" },
+      action: "run:recover_stranded",
+      resource: { type: "agent", companyId: company.id, agentId: actorAgent.id },
+    });
+
+    expect(decision).toMatchObject({ allowed: false, reason: "deny_scope" });
+  });
+
+  it("allows a company-root actor to recover an indirect report's stranded run", async () => {
+    const company = await createCompany(db, "StrandedIndirect");
+    const ceoAgent = await createAgent(db, company.id, { role: "ceo" });
+    const ctoAgent = await createAgent(db, company.id, { role: "cto", reportsTo: ceoAgent.id });
+    const engineerAgent = await createAgent(db, company.id, { role: "engineer", reportsTo: ctoAgent.id });
+    await grantAgentPermission(db, company.id, ceoAgent.id, "tasks:assign");
+
+    const decision = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: ceoAgent.id, companyId: company.id, source: "agent_jwt" },
+      action: "run:recover_stranded",
+      resource: { type: "agent", companyId: company.id, agentId: engineerAgent.id },
+    });
+
+    expect(decision.allowed, decision.explanation).toBe(true);
+  });
+
+  // Same trap as the coordination-metadata case above: a heartbeat run carries
+  // onBehalfOfUserId, so every real recovery call goes through the
+  // responsible-user intersection. `run:recover_stranded` has no board
+  // permission mapping, so without an entry in
+  // activeResponsibleUserCanAuthorizeIssueAction the intersection denies it as
+  // unsupported and the agent-side allow is never reached — the feature would
+  // pass its unit tests and fail in production.
+  it("does not let the responsible-user intersection deny recovery actions as unsupported", async () => {
+    const company = await createCompany(db, "RecoveryResponsibleUser");
+    const managerAgent = await createAgent(db, company.id, { role: "ceo" });
+    const reportAgent = await createAgent(db, company.id, { role: "engineer", reportsTo: managerAgent.id });
+    const responsibleUserId = await createUser(db);
+    await grantAgentPermission(db, company.id, managerAgent.id, "tasks:assign");
+    await db.insert(companyMemberships).values({
+      companyId: company.id,
+      principalType: "user",
+      principalId: responsibleUserId,
+      status: "active",
+      membershipRole: "operator",
+    });
+    const actor = {
+      type: "agent" as const,
+      agentId: managerAgent.id,
+      companyId: company.id,
+      onBehalfOfUserId: responsibleUserId,
+      source: "agent_jwt" as const,
+    };
+    const svc = authorizationService(db);
+
+    const runDecision = await svc.decide({
+      actor,
+      action: "run:recover_stranded",
+      resource: { type: "agent", companyId: company.id, agentId: reportAgent.id },
+    });
+    expect(runDecision.allowed, runDecision.explanation).toBe(true);
+  });
+
   it("denies execution-stage override for an unrelated peer agent", async () => {
     const company = await createCompany(db, "UnrelatedOverride");
     const actorAgent = await createAgent(db, company.id, { role: "engineer" });
