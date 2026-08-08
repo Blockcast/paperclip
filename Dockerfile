@@ -351,7 +351,22 @@ ARG CLAUDE_K8S_REF=3ad33702052f357ec2b31b7d3051e89ed1ed4875
 # Bumped 2026-08-05 to 83197d4: parse the shell -c command-string before
 # positional arguments, closing sh -c env ignored / bash -c "env" ignored
 # wrapper bypasses. Focused env-guard suite 90/90, typecheck, and build pass.
-ARG OPENCODE_K8S_REF=83197d46b0784c941801165464d48aca1b979909
+# Bumped 2026-08-08 to 8f42726 (#55): BLO-22922 -- preserve successful
+# finite-timeout runs. completionWithGrace armed its grace timer at
+# construction and raced it against real job completion, so every run longer
+# than LOG_EXIT_COMPLETION_GRACE_MS (30s) was finalized timedOut:true
+# regardless of the configured timeoutSec. 689 successful runs were
+# mislabelled, poisoning every failure-rate metric and discarding work that
+# had exited 0.
+#
+# NOTE: this pin moves back ONTO adapter master. The previous pin 83197d4 was
+# never merged -- it is a dangling commit on codex/pen1305-env-guard-review-fix
+# pushed after PR #53 merged, so 83197d4 and master are diverged, not
+# fast-forward. Repinning therefore drops 83197d4's env-guard fix for parsing
+# the shell -c command string. That is inert today: the env-guard plugin is
+# canary-gated (adapterConfig.envGuardPlugin) and 0 of 46 production agents
+# enable it. Re-land 83197d4 on adapter master and repin to restore it.
+ARG OPENCODE_K8S_REF=8f4272675db81e95bf393679a912d9037df3d9ab
 
 # Pack paperclip's in-tree adapter-utils so the bundled adapters consume
 # the workspace version (may include exports newer than the latest
