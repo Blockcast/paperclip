@@ -92,11 +92,21 @@ jobs:
         # path (contents API, merge API, `create_or_update_file`/
         # `push_files`) instead of `git push` — see AGENTS.md §9. Uses the
         # already-checked-out history (fetch-depth: 0 above), no new token.
-        # Exempts the graphify-reindex bot branch: that automation's PRs are
-        # legitimately App-authored end-to-end (see run-quality-gates.mjs
-        # GRAPHIFY_REINDEX_BRANCH), unlike an agent's branch merely opened
-        # via the API.
-        if: github.head_ref != 'bot/graphify-reindex'
+        #
+        # There is deliberately NO branch exemption. The graphify-reindex bot
+        # commits via `git push` under its own git identity
+        # (`allyblockcast[bot]@users.noreply.github.com`), which is not the
+        # REST-path stamp this gate matches
+        # (`290875700+allyblockcast[bot]@users.noreply.github.com`) — measured
+        # by running this script over the real graphify PRs #789 and #944:
+        # both pass. A `github.head_ref`-keyed exemption was therefore
+        # protecting against a rejection that never happens, while being both
+        # a fork bypass (any fork can name its branch `bot/graphify-reindex`,
+        # and `head_ref` carries no repository identity) and a merge-queue
+        # false-reject (`head_ref` is empty in `merge_group`). Pinned by the
+        # graphify-identity case in check-commit-author-attribution.test.mjs —
+        # if that test starts failing, the bot moved onto the REST write path
+        # and the right fix is to move it back, not to re-add an exemption.
         run: node ./scripts/check-commit-author-attribution.mjs --base "$PR_BASE_SHA" --head "$PR_HEAD_SHA"
 
       - name: Test commit-author-attribution check

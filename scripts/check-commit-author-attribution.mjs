@@ -36,6 +36,26 @@ export const APP_NOREPLY_EMAIL = "290875700+allyblockcast[bot]@users.noreply.git
 export const DEFAULT_AUDIT_REPOS = ["Blockcast/trafficcontrol", "Blockcast/paperclip"];
 export const DEFAULT_PER_REPO_LIMIT = 20;
 
+/**
+ * `gh pr list --state merged --limit N` returns the N most recently *created*
+ * merged PRs, not the N most recently *merged* ones — a long-running PR merged
+ * yesterday can sort behind a short one merged last week. Over-fetch this
+ * multiple of the window and order by `mergedAt` locally.
+ *
+ * Residual limit: a PR created further back than `factor * perRepoLimit` PRs
+ * but merged inside the window is still missed. No GitHub list/search ordering
+ * exposes merge time, so widening the window is the only lever — raise
+ * `--per-repo-limit` to cover a longer tail.
+ */
+export const AUDIT_OVERFETCH_FACTOR = 5;
+
+/**
+ * `GET /pulls/{number}/commits` is hard-capped at 250 entries; `--paginate`
+ * cannot reach past it. Beyond the cap the list is silently short, so an
+ * offense at commit 251+ would read as a pass. Detect and fail closed instead.
+ */
+export const COMMITS_API_MAX = 250;
+
 const UNIT_SEPARATOR = "\u001f";
 const RECORD_SEPARATOR = "\u001e";
 
@@ -81,8 +101,27 @@ export function findLocalRangeOffenses({ repoRoot, base, head, execFile = execFi
 }
 
 /**
- * Remote audit mode: last `perRepoLimit` merged PRs in `repo`, each PR's own
- * (pre-squash) commit list. `ghApi` is injected so tests never shell out.
+ * Order merged PRs by merge time and take the newest `perRepoLimit`.
+ * Entries without a parseable `mergedAt` are dropped rather than sorted to an
+ * arbitrary position — `gh` only omits it for PRs that are not actually merged.
+ */
+export function selectRecentlyMergedPrs(prs, perRepoLimit) {
+  return prs
+    .map((pr) => ({ pr, mergedMs: Date.parse(pr.mergedAt ?? "") }))
+    .filter((entry) => Number.isFinite(entry.mergedMs))
+    .sort((a, b) => b.mergedMs - a.mergedMs)
+    .slice(0, perRepoLimit)
+    .map((entry) => entry.pr);
+}
+
+/**
+ * Remote audit mode: the `perRepoLimit` most recently merged PRs in `repo`,
+ * each PR's own (pre-squash) commit list. `ghApi` is injected so tests never
+ * shell out.
+ *
+ * Returns `truncated` alongside `offenses`: a PR whose commit list hits
+ * `COMMITS_API_MAX` was only partially audited, which is a distinct outcome
+ * from "audited and clean" and must not be reported as a pass.
  */
 export async function auditRepoCommitAttribution({ repo, perRepoLimit, ghApi }) {
   const prsJson = await ghApi([
@@ -93,13 +132,14 @@ export async function auditRepoCommitAttribution({ repo, perRepoLimit, ghApi }) 
     "--state",
     "merged",
     "--limit",
-    String(perRepoLimit),
+    String(perRepoLimit * AUDIT_OVERFETCH_FACTOR),
     "--json",
     "number,title,mergedAt",
   ]);
-  const prs = JSON.parse(prsJson);
+  const prs = selectRecentlyMergedPrs(JSON.parse(prsJson), perRepoLimit);
 
   const offenses = [];
+  const truncated = [];
   let totalCommits = 0;
   for (const pr of prs) {
     const commitsJson = await ghApi([
@@ -114,6 +154,9 @@ export async function auditRepoCommitAttribution({ repo, perRepoLimit, ghApi }) 
       .split(/(?<=])\s*(?=\[)/)
       .flatMap((page) => (page ? JSON.parse(page) : []));
     totalCommits += commits.length;
+    if (commits.length >= COMMITS_API_MAX) {
+      truncated.push({ repo, prNumber: pr.number, prTitle: pr.title, commitsSeen: commits.length });
+    }
     const normalized = commits.map((commit) => ({
       sha: commit.sha,
       authorEmail: commit.commit?.author?.email ?? null,
@@ -125,7 +168,7 @@ export async function auditRepoCommitAttribution({ repo, perRepoLimit, ghApi }) 
     }
   }
 
-  return { repo, prsChecked: prs.length, commitsChecked: totalCommits, offenses };
+  return { repo, prsChecked: prs.length, commitsChecked: totalCommits, offenses, truncated };
 }
 
 async function defaultGhApi(args) {
@@ -150,9 +193,20 @@ export async function runAudit({
         `  VIOLATION ${repo}#${offense.prNumber} ${offense.sha.slice(0, 7)} "${offense.message}" — ${offense.authorEmail}`,
       );
     }
+    for (const partial of result.truncated) {
+      log(
+        `  INCOMPLETE ${repo}#${partial.prNumber} "${partial.prTitle}" — commit list hit the ${COMMITS_API_MAX}-entry API cap; commits past it were NOT audited`,
+      );
+    }
   }
   const allOffenses = results.flatMap((r) => r.offenses);
-  return { passed: allOffenses.length === 0, results, offenses: allOffenses };
+  const allTruncated = results.flatMap((r) => r.truncated);
+  return {
+    passed: allOffenses.length === 0 && allTruncated.length === 0,
+    results,
+    offenses: allOffenses,
+    truncated: allTruncated,
+  };
 }
 
 function parseArgs(argv) {
@@ -176,13 +230,22 @@ async function main() {
   const args = parseArgs(process.argv.slice(2));
 
   if (args.mode === "audit") {
-    const { passed, offenses } = await runAudit({
+    const { passed, offenses, truncated } = await runAudit({
       repos: args.repos,
       perRepoLimit: args.perRepoLimit,
     });
-    if (!passed) {
+    // Name which of the two failure modes fired: an offense is a real
+    // violation, a truncated PR is an audit that could not complete. Reporting
+    // the latter as the former would send someone hunting a commit that the
+    // audit never actually saw.
+    if (offenses.length > 0) {
       console.error(
         `\n${offenses.length} non-merge commit(s) carry the shared App identity (${APP_NOREPLY_EMAIL}) instead of a per-agent author. See BLO-21416 / AGENTS.md §9.`,
+      );
+    }
+    if (truncated.length > 0) {
+      console.error(
+        `\n${truncated.length} PR(s) could not be fully audited: their commit list hit the ${COMMITS_API_MAX}-entry cap on GET /pulls/{number}/commits, so a violation past that point would be invisible. This is an incomplete audit, not a clean one.`,
       );
     }
     process.exit(passed ? 0 : 1);
