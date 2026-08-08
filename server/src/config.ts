@@ -173,6 +173,9 @@ export interface Config {
   // the feature is opt-in per deployment because the context name belongs to
   // whoever owns the branch-protection rule, not to this server.
   prReviewGateStatusContext: string;
+  // Commit-status context for comment-shaped Ally findings. Empty by default:
+  // operators must opt in and make the context required in branch protection.
+  prCommentReviewGateStatusContext: string;
   telemetryEnabled: boolean;
 }
 
@@ -512,6 +515,7 @@ export function loadConfig(): Config {
     githubAppPrivateKey: (process.env.GITHUB_APP_PRIVATE_KEY ?? "").replace(/\\n/g, "\n"),
     prReviewerBotLogin: process.env.PAPERCLIP_PR_REVIEWER_BOT_LOGIN ?? "allyblockcast[bot]",
     prReviewGateStatusContext: (process.env.PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT ?? "").trim(),
+    prCommentReviewGateStatusContext: (process.env.PAPERCLIP_PR_COMMENT_REVIEW_GATE_STATUS_CONTEXT ?? "").trim(),
     telemetryEnabled: fileConfig?.telemetry?.enabled ?? true,
   };
 }

@@ -49,9 +49,15 @@ import { logger } from "../middleware/logger.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { extractPaperclipIdentifiers } from "../services/paperclip-identifiers.js";
 import {
+  githubReviewerIdentityMatches,
   githubListIssueCommentBodies,
   githubPostIssueComment,
 } from "../services/github-app-auth.js";
+import {
+  hasActionablePrReviewFeedback,
+  hasAllyConsolidatedReviewHeading,
+} from "../services/ally-review-detection.js";
+import { runPrCommentReviewGateCheck } from "../services/pr-comment-review-gate.js";
 import { recoveryService } from "../services/recovery/service.js";
 import {
   recordGithubReviewRequestDelivery,
@@ -101,6 +107,12 @@ export interface GithubWebhookConfig {
    * than pull_request_review.submitted.
    */
   prReviewerBotLogin?: string | null;
+  /**
+   * Optional seam for the comment-review status gate. Production uses the
+   * service implementation; route tests supply a local recorder so webhook
+   * behavior is verified without contacting GitHub.
+   */
+  runPrCommentReviewGateCheck?: typeof runPrCommentReviewGateCheck;
   /**
    * Absolute public origin of this Paperclip deployment (PAPERCLIP_PUBLIC_URL),
    * used to build the absolute issue URL posted back onto PRs (BLO-13353). When
@@ -217,31 +229,6 @@ function hasAllyConsolidatedReviewHeader(body: string | null | undefined): boole
   return typeof body === "string" && /\bAlly\s*(?:—|-|:)\s*Consolidated\s+PR\s+Review\b/i.test(body);
 }
 
-// Narrow variant, used ONLY to disqualify an agent review request (BLO-18865).
-//
-// `hasAllyConsolidatedReviewHeader` scans the whole body, which is right at its
-// other call site (isActionablePrReviewComment, where a body carrying the header
-// counts as review feedback no matter who relayed it — a WIDENING use). Reusing
-// it here was too broad in the opposite direction: a legitimate marked request
-// that merely MENTIONS the review in prose ("your Ally — Consolidated PR Review
-// flagged X") was silently dropped. A silently dropped review request is the
-// exact failure this marker exists to fix, so the exclusion is scoped to the
-// shape Ally's own output actually has: the header on its own line, as a
-// Markdown heading or bold run.
-//
-// This keeps the #583 layer intact — Ally echoing the marker at byte 0 still
-// carries its `## Ally — Consolidated PR Review` line and is still rejected —
-// while a quoted (`> ## Ally — ...`) or indented copy reads as a quote, not as
-// Ally's output, and no longer suppresses a real request. The heading/bold
-// prefix is optional so a format change on Ally's side does not silently lapse
-// the guard; only a mid-line prose reference is let through.
-const ALLY_CONSOLIDATED_REVIEW_HEADING_PATTERN =
-  /^[ \t]{0,3}(?:#{1,6}[ \t]+|\*\*[ \t]*)?Ally[ \t]*(?:—|–|-|:)[ \t]*Consolidated[ \t]+PR[ \t]+Review\b/im;
-
-function hasAllyConsolidatedReviewHeading(body: string | null | undefined): boolean {
-  return typeof body === "string" && ALLY_CONSOLIDATED_REVIEW_HEADING_PATTERN.test(body);
-}
-
 // Explicit "a Paperclip agent is asking for review" marker (BLO-18865).
 //
 // Agents post PR comments through the Paperclip GitHub App, so their comment
@@ -275,8 +262,8 @@ function hasAllyConsolidatedReviewHeading(body: string | null | undefined): bool
 //   2. NEVER on Ally's own review output. A body whose consolidated-review
 //      header stands on its own line is not a request regardless of any marker,
 //      so Ally echoing the marker into its own review verdict still enqueues
-//      nothing. See ALLY_CONSOLIDATED_REVIEW_HEADING_PATTERN for why this is
-//      matched on the heading shape rather than anywhere in the body.
+//      nothing. See hasAllyConsolidatedReviewHeading for why this is matched
+//      on the heading shape rather than anywhere in the body.
 //
 // Trailing attributes are allowed (e.g. `<!-- paperclip:review-request
 // agent=cto -->`) so the marker can carry provenance without a parser change.
@@ -287,84 +274,6 @@ const PR_REVIEWER_AGENT_REQUEST_MARKER_PATTERN =
 
 function hasPrReviewerAgentRequestMarker(body: string | null | undefined): boolean {
   return typeof body === "string" && PR_REVIEWER_AGENT_REQUEST_MARKER_PATTERN.test(body);
-}
-
-// Negation cues that flip an otherwise-actionable bare phrase into a confirmation
-// that nothing is required — e.g. Ally's COMMENTED, zero-finding review 4682219268
-// on TC PR #1115 said "Clean. No changes requested from this lens", which the bare
-// `changes\s+requested` phrase match flagged as actionable and bounced a fully
-// approved PR back to the implementer (BLO-15942). Scanned in the text immediately
-// preceding a match, bounded to NEGATION_LOOKBACK_WORDS words and stopping at
-// sentence punctuation, so a genuine, later occurrence of the phrase elsewhere in
-// the body still counts, and an unrelated earlier negation in the same long
-// sentence (e.g. "The docs aren't complete, changes requested for section 3.")
-// doesn't suppress it.
-const NEGATION_CUE_REGEX =
-  /\b(?:no|not|zero|none|never|without|isn't|aren't|doesn't|didn't|won't|cannot)\b/i;
-const NEGATION_LOOKBACK_WORDS = 8;
-
-// An uncounted "Critical Issues" / "Important Issues" findings section, matched
-// only where it starts a line — optionally behind markdown heading (`###`),
-// blockquote, bullet/ordered-list, or emphasis (`**`) decoration. See the call
-// site in hasActionablePrReviewFeedback for why the anchor is load-bearing.
-const UNCOUNTED_FINDINGS_HEADING_REGEX =
-  /^[ \t]*(?:[#>]+[ \t]*)?(?:(?:[-*+]|\d+[.)])[ \t]+)?[*_]*(?:Critical|Important)[ \t]+Issues\b(?![*_]*[ \t]*\()/im;
-
-// Returns true if `pattern` matches `text` at least once outside a negated context
-// (see NEGATION_CUE_REGEX). Used for bare-phrase heuristics ("changes requested")
-// that read very differently as "no changes requested" vs "please make the changes
-// requested".
-function hasNonNegatedMatch(text: string, pattern: RegExp): boolean {
-  const flags = pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`;
-  const regex = new RegExp(pattern.source, flags);
-  let match: RegExpExecArray | null;
-  while ((match = regex.exec(text)) !== null) {
-    const preceding = text.slice(0, match.index);
-    const sentenceStart = Math.max(preceding.lastIndexOf("."), preceding.lastIndexOf("\n")) + 1;
-    const sentenceLocal = preceding.slice(sentenceStart);
-    const lookback = sentenceLocal.trim().split(/\s+/).slice(-NEGATION_LOOKBACK_WORDS).join(" ");
-    if (!NEGATION_CUE_REGEX.test(lookback)) return true;
-    if (regex.lastIndex === match.index) regex.lastIndex += 1;
-  }
-  return false;
-}
-
-function hasActionablePrReviewFeedback(body: string | null | undefined, state?: string | null): boolean {
-  const normalizedState = state?.trim().toLowerCase();
-  if (normalizedState === "changes_requested" || normalizedState === "changes-requested") return true;
-  if (typeof body !== "string") return false;
-  const text = body.trim();
-  if (!text) return false;
-
-  // Ally's consolidated review buckets blocking findings under a severity
-  // heading with a count, e.g. "### Critical Issues (1)" or "### Important
-  // Issues (2)". Any bucket with a non-zero count is actionable. `matchAll`
-  // (not `match`) so a zero-count bucket ("Critical Issues (0)") appearing
-  // before a non-zero one doesn't mask it. NOTE: keep this list in sync with
-  // the reviewer's severity taxonomy — a review that flags "Critical Issues"
-  // must not slip through as non-actionable (the BLO-12541/#973 stall).
-  for (const bucket of text.matchAll(/\b(?:Critical|Important)\s+Issues\b[*_]*\s*\((\d+)\)/gi)) {
-    if (Number(bucket[1]) > 0) return true;
-  }
-  // Same headings without an explicit count still signal findings. Match the
-  // uncounted heading itself so any zero-count bucket, even for the same label,
-  // cannot mask a later uncounted findings section.
-  //
-  // Anchored to the start of a line (allowing markdown heading/list/emphasis
-  // decoration) because an unanchored match also fires on ordinary prose that
-  // says the opposite: Ally's APPROVED review on Network-Operator-Portal#591
-  // read "Looks good. No Critical or Important issues found.", whose trailing
-  // "Important issues" matched here and bounced a clean, approved PR back to
-  // its author (BLO-19067). A real findings section is always its own heading
-  // or list item, never mid-sentence.
-  if (UNCOUNTED_FINDINGS_HEADING_REGEX.test(text)) return true;
-  if (/^[ \t]*decision[ \t]*:[ \t]*changes_requested[ \t]*$/im.test(text)) return true;
-  if (hasNonNegatedMatch(text, /\bchanges\s+requested\b/i)) return true;
-  if (hasNonNegatedMatch(text, /\brequest(?:ed|s)?\s+changes\b/i)) return true;
-  // Match "before merge" and its inflections ("before merging/merged/merges").
-  // The bare `\bmerge\b` form silently missed "before merging" (#973).
-  if (/\bRecommended\s+Action\b[\s\S]{0,400}\bfix\b[\s\S]{0,400}\bbefore\s+merg(?:e|es|ed|ing)\b/i.test(text)) return true;
-  return false;
 }
 
 function isActionablePrReviewComment(
@@ -472,6 +381,70 @@ export function __resetWorkflowRunSupersessionTrackingForTest(): void {
 
 export const __test_recordWorkflowRunSighting = recordWorkflowRunSighting;
 export const __test_classifyWorkflowRunSupersession = classifyWorkflowRunSupersession;
+
+type PrCommentReviewGateWebhookTrigger = {
+  repoFullName: string;
+  prNumber: number;
+  headSha?: string;
+  prUrl: string | null;
+};
+
+/**
+ * Select webhook deliveries that can change the comment-shaped Ally gate.
+ * This deliberately reads the signed raw payload rather than the wake context:
+ * it must work for PRs without Paperclip identifiers and for a clean review
+ * that clears a prior failure.
+ */
+function resolvePrCommentReviewGateWebhookTrigger(
+  eventName: string,
+  payload: Record<string, unknown>,
+  configuredReviewerLogin: string | null | undefined,
+): PrCommentReviewGateWebhookTrigger | null {
+  const repository = payload.repository as Record<string, unknown> | undefined;
+  const repoFullName = readStringField(repository, "full_name");
+  if (!repoFullName) return null;
+
+  if (eventName === "issue_comment") {
+    if (payload.action !== "created") return null;
+    const issue = payload.issue as Record<string, unknown> | undefined;
+    const pullRequestMarker = issue?.pull_request as Record<string, unknown> | undefined;
+    const comment = payload.comment as Record<string, unknown> | undefined;
+    const commentUser = comment?.user as Record<string, unknown> | undefined;
+    const prNumber = typeof issue?.number === "number" ? issue.number : null;
+    if (
+      !issue ||
+      !pullRequestMarker ||
+      prNumber === null ||
+      !githubReviewerIdentityMatches(
+        readStringField(commentUser, "login") ?? "",
+        configuredReviewerLogin || DEFAULT_PR_REVIEWER_BOT_LOGIN,
+      ) ||
+      !hasAllyConsolidatedReviewHeading(readStringField(comment, "body"))
+    ) {
+      return null;
+    }
+    return {
+      repoFullName,
+      prNumber,
+      prUrl: githubPrUrl(repoFullName, prNumber, readStringField(issue, "html_url")),
+    };
+  }
+
+  if (eventName !== "pull_request") return null;
+  const action = payload.action;
+  if (action !== "opened" && action !== "reopened" && action !== "synchronize") return null;
+  const pr = payload.pull_request as Record<string, unknown> | undefined;
+  const head = pr?.head as Record<string, unknown> | undefined;
+  const prNumber = typeof pr?.number === "number" ? pr.number : null;
+  const headSha = readStringField(head, "sha");
+  if (prNumber === null || !headSha) return null;
+  return {
+    repoFullName,
+    prNumber,
+    headSha,
+    prUrl: githubPrUrl(repoFullName, prNumber, readStringField(pr, "html_url")),
+  };
+}
 
 // PR→issue back-link (BLO-13353, #973 symptom-1). A hidden marker makes the
 // one-time post idempotent across redeliveries/reopens: if any existing PR
@@ -2102,6 +2075,35 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       }
     }
 
+    // A consolidated review can arrive as a plain issue comment, which GitHub
+    // does not reflect in reviewDecision. Run the opt-in status gate directly
+    // from the signed payload, independent of Paperclip issue matching and the
+    // author-wake decision. It remains detached so GitHub webhook acknowledgement
+    // is never delayed by a GitHub API read/write.
+    const commentReviewGateTrigger = resolvePrCommentReviewGateWebhookTrigger(
+      eventName,
+      payload,
+      config.prReviewerBotLogin,
+    );
+    if (commentReviewGateTrigger) {
+      void (config.runPrCommentReviewGateCheck ?? runPrCommentReviewGateCheck)(commentReviewGateTrigger)
+        .then((result) => {
+          // The disabled default must be silent; otherwise every PR webhook in
+          // a deployment that has not opted in would emit a warning.
+          if (!result.posted && result.reason === "not_configured") return;
+          logger[result.posted ? "info" : "warn"](
+            { deliveryId, event: eventName, ...commentReviewGateTrigger, result },
+            "github webhook comment-review gate check completed",
+          );
+        })
+        .catch((err) => {
+          logger.warn(
+            { err, deliveryId, event: eventName, ...commentReviewGateTrigger },
+            "github webhook comment-review gate check failed (non-fatal)",
+          );
+        });
+    }
+
     // A closed or newly-drafted PR cannot produce useful reviewer work. Retire
     // every queued or scheduled-retry run for its stable task scope so it does
     // not consume the reviewer's single external-lifecycle slot hours later.
@@ -2977,3 +2979,4 @@ export const __test_buildIssueBackLinkBody = buildIssueBackLinkBody;
 export const __test_commentsContainBackLinkMarker = commentsContainBackLinkMarker;
 export const __test_backLinkAbsoluteUrl = backLinkAbsoluteUrl;
 export const __test_isSelfReviewedPr = isSelfReviewedPr;
+export const __test_resolvePrCommentReviewGateWebhookTrigger = resolvePrCommentReviewGateWebhookTrigger;

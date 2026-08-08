@@ -268,6 +268,21 @@ async function fetchPrHeadSha(
   }
 }
 
+/** Fetch the current SHA for a pull request when a webhook payload lacks it. */
+export async function githubFetchPrHeadSha(input: {
+  repoFullName: string;
+  prNumber: number;
+}): Promise<string | null> {
+  const token = await getInstallationToken();
+  if (!token) return null;
+  return fetchPrHeadSha(
+    gitHubApiBase(GITHUB_HOST),
+    input.repoFullName,
+    input.prNumber,
+    { ...GITHUB_API_HEADERS, authorization: `Bearer ${token}` },
+  );
+}
+
 /**
  * Authoritatively check whether the reviewer GitHub App approved THIS PR's
  * required head before a claimed PR-review run can complete.
@@ -355,6 +370,57 @@ export async function githubListIssueCommentBodies(input: {
     if (!res.ok) return null;
     const batch = (await res.json()) as Array<{ body?: string | null }>;
     return batch.map((c) => c.body ?? "");
+  } catch {
+    return null;
+  }
+}
+
+// A comment-review gate cannot safely authorize from a prefix of a long-lived
+// PR discussion: a later consolidated review may block or clear the head.
+// This is only a runaway-loop backstop; reaching it returns null rather than a
+// silently truncated result.
+export const GITHUB_COMMENT_PAGINATION_HARD_LIMIT_PAGES = 500;
+
+/**
+ * Fetch the complete issue-comment history needed by the comment-review gate.
+ * Returns null when credentials or any page cannot be read, including the
+ * safety backstop, so callers can leave the prior status untouched instead of
+ * publishing a verdict from partial history.
+ */
+export async function githubListIssueCommentsWithTimestamps(input: {
+  repoFullName: string;
+  prNumber: number;
+}): Promise<Array<{ login: string | null; body: string; createdAt: string }> | null> {
+  const token = await getInstallationToken();
+  if (!token) return null;
+  const headers = { ...GITHUB_API_HEADERS, authorization: `Bearer ${token}` };
+  const apiBase = gitHubApiBase(GITHUB_HOST);
+  const comments: Array<{ login: string | null; body: string; createdAt: string }> = [];
+
+  try {
+    for (let page = 1; page <= GITHUB_COMMENT_PAGINATION_HARD_LIMIT_PAGES; page += 1) {
+      const url = `${apiBase}/repos/${input.repoFullName}/issues/${input.prNumber}/comments?per_page=100&page=${page}`;
+      const response = await ghFetch(url, { headers });
+      if (!response.ok) return null;
+      const batch = (await response.json()) as Array<{
+        user?: { login?: string | null } | null;
+        body?: string | null;
+        created_at?: string | null;
+      }>;
+
+      for (const comment of batch) {
+        if (typeof comment.created_at !== "string") continue;
+        comments.push({
+          login: comment.user?.login ?? null,
+          body: comment.body ?? "",
+          createdAt: comment.created_at,
+        });
+      }
+
+      if (batch.length < 100) return comments;
+      if (page === GITHUB_COMMENT_PAGINATION_HARD_LIMIT_PAGES) return null;
+    }
+    return comments;
   } catch {
     return null;
   }
