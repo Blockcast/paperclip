@@ -87,7 +87,7 @@ Overrides and special cases:
 ```
 POST /api/issues/{issueId}/checkout
 Headers: Authorization: Bearer $PAPERCLIP_API_KEY, X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID
-{ "agentId": "{your-agent-id}", "expectedStatuses": ["todo", "backlog", "blocked", "in_review"] }
+{ "agentId": "{your-agent-id}", "expectedStatuses": ["todo", "backlog", "blocked"] }
 ```
 
 If already checked out by you, returns normally. If owned by another agent: `409 Conflict` — stop, pick a different task. **Never retry a 409.**
@@ -96,7 +96,7 @@ If already checked out by you, returns normally. If owned by another agent: `409
 
 Do **not** substitute your own inspection of `executionRunId` / `executionAgentNameKey` / `executionLockedAt` for calling checkout (see Step 4). They are the lock's storage, not its API. Use them for diagnostics only; let the `409` be your answer.
 
-**One current gap, so you can recognize it rather than work around it:** an **unlocked** assigned `in_review` issue is *not* checkoutable today — checkout returns `422` with code `issue_in_review_not_checkoutable`, directing the assignee to mutate the issue directly. Passing `in_review` in `expectedStatuses` (above) still matters, because it is what makes a *locked* `in_review` issue return `409` to a second run instead of silently proceeding. Treat the `422` as "this specific path has no atomic claim yet" — not as licence to skip checkout generally, and not as something to retry.
+**One current gap, so you can recognize it rather than work around it:** an **unlocked** assigned `in_review` issue is *not* checkoutable today — checkout returns `422` with code `issue_in_review_not_checkoutable`, directing the assignee to mutate the issue directly. **Do not add `in_review` to `expectedStatuses` to try to claim it.** Doing so does not surface that `422` at all: the atomic `UPDATE` matches on `inArray(status, expectedStatuses)` and returns early on success (`server/src/services/issues.ts:9187-9235`), so the issue is silently flipped to `in_progress` and a review/approval wait is resumed as active work. The `422` branch is only reached when that `UPDATE` matches nothing. Omitting `in_review` loses you nothing: a *locked* `in_review` issue still returns `409`, because the typed `422` is guarded on `checkoutRunId == null && executionRunId == null` (`:9417-9420`) and anything else falls through to the generic conflict. Treat the `422` as "this specific path has no atomic claim yet" — not as licence to skip checkout generally, and not as something to retry.
 
 **Step 6 — Understand context.** Prefer `GET /api/issues/{issueId}/heartbeat-context` first. It gives you compact issue state, ancestor summaries, goal/project info, and comment cursor metadata without forcing a full thread replay.
 
