@@ -9266,6 +9266,10 @@ export function issueRoutes(
                     // reassignment to an unrelated agent that keeps the row
                     // blocked would still satisfy an id+status predicate.
                     expectedCurrentAssigneeAgentId: existing.assigneeAgentId,
+                    // BLO-20385: neither pin catches a concurrent blocker add,
+                    // which changes no field either one covers. Re-assert
+                    // readiness under the row lock before the edges are cleared.
+                    requireDependencyReadyBeforeClearingBlockers: true,
                   }
                 : {}),
             },
@@ -9299,6 +9303,8 @@ export function issueRoutes(
                 // See the transactional branch above: the assignee is an
                 // authorization-relevant snapshot field for allow_manager_chain.
                 expectedCurrentAssigneeAgentId: existing.assigneeAgentId,
+                // BLO-20385: and neither pin covers a concurrent blocker add.
+                requireDependencyReadyBeforeClearingBlockers: true,
               }
             : {}),
         });

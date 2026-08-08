@@ -9236,3 +9236,226 @@ describeEmbeddedPostgres("issueService.update expectedCurrentStatus (BLO-18797)"
     expect(updated?.status).toBe("in_progress");
   });
 });
+
+describeEmbeddedPostgres(
+  "issueService.update requireDependencyReadyBeforeClearingBlockers (BLO-20385)",
+  () => {
+    let db!: ReturnType<typeof createDb>;
+    let svc!: ReturnType<typeof issueService>;
+    let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+    beforeAll(async () => {
+      tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issues-unpark-readiness-");
+      db = createDb(tempDb.connectionString);
+      svc = issueService(db);
+    });
+
+    afterEach(async () => {
+      await db.delete(issueComments);
+      await db.delete(issueRelations);
+      await db.delete(issueInboxArchives);
+      await db.delete(activityLog);
+      await db.delete(issues);
+      await db.delete(heartbeatRuns);
+      await db.delete(executionWorkspaces);
+      await db.delete(projectWorkspaces);
+      await db.delete(projects);
+      await db.delete(goals);
+      await db.delete(agents);
+      await db.delete(instanceSettings);
+      await db.delete(companies);
+    });
+
+    afterAll(async () => {
+      await tempDb?.cleanup();
+    });
+
+    async function seedBlockedIssue() {
+      const companyId = randomUUID();
+      const agentId = randomUUID();
+      const issueId = randomUUID();
+
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+      });
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: "MulticastEngineer",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Delegate recovery target",
+        status: "blocked",
+        priority: "critical",
+        assigneeAgentId: agentId,
+      });
+
+      return { companyId, agentId, issueId };
+    }
+
+    async function seedBlocker(companyId: string, blockedIssueId: string, status: string) {
+      const blockerId = randomUUID();
+      await db.insert(issues).values({
+        id: blockerId,
+        companyId,
+        title: `Upstream blocker (${status})`,
+        status,
+        priority: "high",
+      });
+      await db.insert(issueRelations).values({
+        id: randomUUID(),
+        companyId,
+        issueId: blockerId,
+        relatedIssueId: blockedIssueId,
+        type: "blocks",
+      });
+      return blockerId;
+    }
+
+    async function readBlockerIds(issueId: string) {
+      const rows = await db
+        .select({ blockerIssueId: issueRelations.issueId })
+        .from(issueRelations)
+        .where(eq(issueRelations.relatedIssueId, issueId));
+      return rows.map((row) => row.blockerIssueId).sort();
+    }
+
+    function unpark(issueId: string, assigneeAgentId: string) {
+      return svc.update(issueId, {
+        status: "todo",
+        blockedByIssueIds: [],
+        expectedCurrentStatus: "blocked",
+        expectedCurrentAssigneeAgentId: assigneeAgentId,
+        requireDependencyReadyBeforeClearingBlockers: true,
+      });
+    }
+
+    it("refuses and preserves the edge when a live blocker lands after the route's snapshot", async () => {
+      const { companyId, issueId, agentId } = await seedBlockedIssue();
+
+      // The route authorized this patch against a readiness snapshot taken when
+      // the row had no blockers. This edge is what commits in between.
+      const blockerId = await seedBlocker(companyId, issueId, "todo");
+
+      await expect(unpark(issueId, agentId)).rejects.toMatchObject({
+        status: 409,
+        details: { reason: "delegate_recovery_unresolved_blockers" },
+      });
+
+      expect(await readBlockerIds(issueId)).toEqual([blockerId]);
+      const row = await db
+        .select({ status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]);
+      expect(row?.status).toBe("blocked");
+    });
+
+    it("refuses and preserves the edge when the blocker commits while the write is in flight", async () => {
+      const { companyId, issueId, agentId } = await seedBlockedIssue();
+
+      const blockerId = randomUUID();
+      await db.insert(issues).values({
+        id: blockerId,
+        companyId,
+        title: "Upstream blocker racing the unpark",
+        status: "todo",
+        priority: "high",
+      });
+
+      const rowLocked = deferred<void>();
+      const addCanCommit = deferred<void>();
+
+      // `syncBlockedByIssueIds` takes `FOR UPDATE` on the blocked row before it
+      // inserts, so this transaction holds exactly the lock the unpark's own
+      // UPDATE has to wait behind. Nothing is visible to the unpark until it
+      // commits — which is the interleaving that used to lose the edge.
+      const concurrentAdd = db.transaction(async (tx) => {
+        await tx.execute(
+          sql`select ${issues.id} from ${issues} where ${issues.id} = ${issueId} for update`,
+        );
+        rowLocked.resolve();
+        await addCanCommit.promise;
+        await tx.insert(issueRelations).values({
+          id: randomUUID(),
+          companyId,
+          issueId: blockerId,
+          relatedIssueId: issueId,
+          type: "blocks",
+        });
+      });
+
+      await rowLocked.promise;
+
+      const unparkPromise = unpark(issueId, agentId);
+      // Let the unpark reach its UPDATE and block on the held row lock.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      addCanCommit.resolve();
+      await concurrentAdd;
+
+      await expect(unparkPromise).rejects.toMatchObject({
+        status: 409,
+        details: { reason: "delegate_recovery_unresolved_blockers" },
+      });
+
+      expect(await readBlockerIds(issueId)).toEqual([blockerId]);
+      const row = await db
+        .select({ status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]);
+      expect(row?.status).toBe("blocked");
+    });
+
+    it("still unparks a row with no blockers at all", async () => {
+      const { issueId, agentId } = await seedBlockedIssue();
+
+      const updated = await unpark(issueId, agentId);
+
+      expect(updated?.status).toBe("todo");
+      expect(await readBlockerIds(issueId)).toEqual([]);
+    });
+
+    it("still unparks and clears stale edges when every blocker is done", async () => {
+      const { companyId, issueId, agentId } = await seedBlockedIssue();
+      await seedBlocker(companyId, issueId, "done");
+
+      const updated = await unpark(issueId, agentId);
+
+      expect(updated?.status).toBe("todo");
+      expect(await readBlockerIds(issueId)).toEqual([]);
+    });
+
+    it("treats a cancelled blocker as unresolved and leaves the edge in place", async () => {
+      const { companyId, issueId, agentId } = await seedBlockedIssue();
+      const blockerId = await seedBlocker(companyId, issueId, "cancelled");
+
+      await expect(unpark(issueId, agentId)).rejects.toMatchObject({ status: 409 });
+
+      expect(await readBlockerIds(issueId)).toEqual([blockerId]);
+    });
+
+    it("leaves ordinary blocker writes unguarded when the flag is not set", async () => {
+      const { companyId, issueId } = await seedBlockedIssue();
+      await seedBlocker(companyId, issueId, "todo");
+
+      // The #870 coordination path legitimately rewrites edges on a row with
+      // live blockers; the new guard must not reach it.
+      const updated = await svc.update(issueId, { blockedByIssueIds: [] });
+
+      expect(updated).not.toBeNull();
+      expect(await readBlockerIds(issueId)).toEqual([]);
+    });
+  },
+);

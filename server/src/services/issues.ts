@@ -8386,6 +8386,27 @@ export function issueService(db: Db) {
          * version when the statement blocks on a concurrent transaction.
          */
         expectedCurrentAssigneeAgentId?: string | null;
+        /**
+         * BLO-20385: the delegate-recovery unpark is authorized *because* the
+         * issue's blockers are all terminal, and the patch it carries clears
+         * `blockedByIssueIds`. The route checks readiness before this call, but
+         * that read is a snapshot: a concurrent writer can add a live blocker
+         * without touching the status or the assignee, so both preconditions
+         * above still hold and `syncBlockedByIssueIds(..., [])` then deletes the
+         * newly-live edge — reinstating the exact data loss this path was
+         * changed to prevent.
+         *
+         * When set, dependency readiness is re-asserted inside the transaction,
+         * after the UPDATE below has taken the issue row's exclusive lock and
+         * before any relation is cleared. That ordering is what makes it sound:
+         * every path that adds a blocker goes through `syncBlockedByIssueIds`,
+         * which takes `FOR UPDATE` on the blocked issue's row. So a concurrent
+         * adder either commits before our UPDATE — and the re-read below, under
+         * READ COMMITTED, sees its edge and we 409 — or it blocks on our lock
+         * until we commit and re-adds its edge afterwards. Neither interleaving
+         * loses the edge.
+         */
+        requireDependencyReadyBeforeClearingBlockers?: boolean;
       },
       dbOrTx: any = db,
     ) => {
@@ -8403,6 +8424,7 @@ export function issueService(db: Db) {
         actorUserId,
         expectedCurrentStatus,
         expectedCurrentAssigneeAgentId,
+        requireDependencyReadyBeforeClearingBlockers,
         ...issueData
       } = data;
 
@@ -8796,6 +8818,33 @@ export function issueService(db: Db) {
           await syncIssueLabels(updated.id, existing.companyId, nextLabelIds, tx);
         }
         if (blockedByIssueIds !== undefined) {
+          // BLO-20385 (Ally review on #970): re-assert dependency readiness here
+          // rather than trusting the route's pre-write snapshot. The UPDATE above
+          // has already taken this row's exclusive lock, and every blocker-add
+          // path takes `FOR UPDATE` on the blocked row inside
+          // `syncBlockedByIssueIds`, so by this point a concurrent adder has
+          // either committed — and this re-read, under READ COMMITTED, sees its
+          // edge — or is parked behind us and re-adds after we commit. Without
+          // this, the clear below silently deletes an edge that went live after
+          // the authorization check.
+          if (requireDependencyReadyBeforeClearingBlockers) {
+            const readinessNow = await listIssueDependencyReadinessMap(tx, existing.companyId, [
+              updated.id,
+            ]);
+            const readiness =
+              readinessNow.get(updated.id) ?? createIssueDependencyReadiness(updated.id);
+            if (readiness.unresolvedBlockerCount > 0) {
+              throw conflict(
+                "Cannot unpark an issue that still has unresolved blockers: this patch shape clears blockedByIssueIds and would delete live dependency edges",
+                {
+                  issueId: updated.id,
+                  reason: "delegate_recovery_unresolved_blockers",
+                  unresolvedBlockerCount: readiness.unresolvedBlockerCount,
+                  unresolvedBlockerIssueIds: readiness.unresolvedBlockerIssueIds,
+                },
+              );
+            }
+          }
           await syncBlockedByIssueIds(
             updated.id,
             existing.companyId,
