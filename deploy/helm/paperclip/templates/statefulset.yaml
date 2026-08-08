@@ -320,6 +320,33 @@ spec:
               cat > "${LOCAL_BIN}/paperclip-github-token-env" <<'EOF'
               #!/bin/sh
               set -eu
+              # Match the image wrapper's explicit, agent-scoped credential
+              # override. A malformed selection must fail closed rather than
+              # silently running with the shared App-installation token.
+              if [ "${GH_SEAT_TOKEN_VALUE+x}" = x ]; then
+                TOKEN="${GH_SEAT_TOKEN_VALUE}"
+                while :; do
+                  case "${TOKEN}" in
+                    [[:space:]]*) TOKEN="${TOKEN#?}" ;;
+                    *[[:space:]]) TOKEN="${TOKEN%?}" ;;
+                    *) break ;;
+                  esac
+                done
+                if [ -z "${TOKEN}" ]; then
+                  echo "paperclip-github-token-env: GH_SEAT_TOKEN_VALUE is set but holds only whitespace; refusing to run with ambient auth" >&2
+                  exit 64
+                fi
+                case "${TOKEN}" in
+                  *[[:space:]]*)
+                    echo "paperclip-github-token-env: GH_SEAT_TOKEN_VALUE contains embedded whitespace; refusing to guess at the intended token" >&2
+                    exit 64
+                    ;;
+                esac
+                export GH_TOKEN="${TOKEN}"
+                export GITHUB_TOKEN="${TOKEN}"
+                export GITHUB_PERSONAL_ACCESS_TOKEN="${TOKEN}"
+                exec "$@"
+              fi
               TOKEN_FILE="${PAPERCLIP_GITHUB_TOKEN_FILE:-/paperclip/.secrets/github-token/token}"
               if [ ! -r "${TOKEN_FILE}" ]; then
                 echo "paperclip github token file not readable: ${TOKEN_FILE}" >&2
@@ -343,6 +370,28 @@ spec:
                 *"host=github.com"*) ;;
                 *) exit 0 ;;
               esac
+              if [ "${GH_SEAT_TOKEN_VALUE+x}" = x ]; then
+                TOKEN="${GH_SEAT_TOKEN_VALUE}"
+                while :; do
+                  case "${TOKEN}" in
+                    [[:space:]]*) TOKEN="${TOKEN#?}" ;;
+                    *[[:space:]]) TOKEN="${TOKEN%?}" ;;
+                    *) break ;;
+                  esac
+                done
+                case "${TOKEN}" in
+                  "")
+                    echo "github-token-credential-helper: GH_SEAT_TOKEN_VALUE is set but holds only whitespace; refusing to run with ambient auth" >&2
+                    exit 1
+                    ;;
+                  *[[:space:]]*)
+                    echo "github-token-credential-helper: GH_SEAT_TOKEN_VALUE contains embedded whitespace; refusing to guess at the intended token" >&2
+                    exit 1
+                    ;;
+                esac
+                printf 'username=x-access-token\npassword=%s\n\n' "${TOKEN}"
+                exit 0
+              fi
               TOKEN_FILE="${PAPERCLIP_GITHUB_TOKEN_FILE:-/paperclip/.secrets/github-token/token}"
               [ -r "${TOKEN_FILE}" ] || exit 0
               TOKEN="$(tr -d '\r\n' < "${TOKEN_FILE}")"
