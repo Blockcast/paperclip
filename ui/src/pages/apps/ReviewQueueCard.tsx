@@ -11,7 +11,7 @@ import { toolsApi } from "@/api/tools";
 import { Button } from "@/components/ui/button";
 import { MarkdownBody } from "@/components/MarkdownBody";
 
-const VISIBLE_EMPTY_QUEUE_REFRESH_MS = 2_000;
+const VISIBLE_REVIEW_QUEUE_REFRESH_MS = 2_000;
 
 /**
  * "Ask first" review queue (M1b float / M9 card, PAP-10859).
@@ -42,7 +42,9 @@ export function ReviewQueueCard({
     enabled: !!selectedCompanyId,
     staleTime: 0,
     refetchOnMount: false,
-    refetchInterval: 20_000,
+    // An ask-first request can be persisted just after a review fetch.
+    // Keep the approval page responsive instead of waiting for the usual 20-second refresh.
+    refetchInterval: VISIBLE_REVIEW_QUEUE_REFRESH_MS,
   });
 
   const items = useMemo(() => {
@@ -62,7 +64,7 @@ export function ReviewQueueCard({
     if (query.dataUpdatedAt === 0 || query.fetchStatus === "fetching") return;
     const timeout = window.setTimeout(() => {
       void query.refetch();
-    }, VISIBLE_EMPTY_QUEUE_REFRESH_MS);
+    }, VISIBLE_REVIEW_QUEUE_REFRESH_MS);
     return () => window.clearTimeout(timeout);
   }, [items.length, query.dataUpdatedAt, query.fetchStatus, query.refetch, selectedCompanyId]);
 
