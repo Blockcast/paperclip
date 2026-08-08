@@ -198,6 +198,17 @@ async function screenshot(page: Page, storyId: string, step: string) {
   await page.screenshot({ path: `${SCREENSHOT_DIR}/${storyId.toLowerCase()}-${step}.png`, fullPage: true });
 }
 
+async function openReviewPage(page: Page, reviewPath: string) {
+  // Chromium does not reliably create a fresh document navigation for a
+  // page.goto() to the URL already loaded. Reloading in that case guarantees
+  // the next US-9 iteration observes a newly bootstrapped review queue.
+  if (new URL(page.url()).pathname === reviewPath) {
+    await page.reload({ waitUntil: "domcontentloaded" });
+    return;
+  }
+  await page.goto(reviewPath, { waitUntil: "domcontentloaded" });
+}
+
 async function seedConnectedFixture(request: APIRequestContext, label: string) {
   const seed = await newCompany(request, label);
   const scout = await createScout(request, seed.companyId);
@@ -426,18 +437,22 @@ test.describe.serial("MCP prod Phase 5a user-story harness", () => {
 
   test(`${storyById("US-9").id} ${storyById("US-9").title} @mcp-runnable @mcp-us9`, async ({ page, request }) => {
     const { seed, scout, mock, connectionId } = await seedConnectedFixture(request, "us9");
+    const reviewPath = `/${seed.prefix}/apps/${connectionId}/review`;
     try {
       for (const value of ["first", "second"]) {
         const pending = await testCall(request, connectionId, scout, "sheets:update_cell", { cell: "B1", value });
         expect(pending.decision).toBe("ask_first");
-        await page.goto(`/${seed.prefix}/apps/${connectionId}/review`);
+        await openReviewPage(page, reviewPath);
         await expect(page.getByRole("button", { name: "Allow once" })).toBeVisible({
           timeout: 30_000,
         });
         await screenshot(page, "US-9", `review-pending-${value}`);
         await approveActionRequest(request, seed.companyId, pending.actionRequestId!);
         await pollTestCall(request, connectionId, pending.actionRequestId!, "done");
-        await page.goto(`/${seed.prefix}/apps/${connectionId}/review`);
+        await openReviewPage(page, reviewPath);
+        await expect(page.getByText("Nothing is waiting for your OK right now.")).toBeVisible({
+          timeout: 30_000,
+        });
         await screenshot(page, "US-9", `review-${value}`);
       }
       expect(mock.captures.filter((capture) => capture.method === "tools/call" && capture.toolName === "sheets:update_cell")).toHaveLength(2);
