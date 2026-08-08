@@ -44,6 +44,15 @@ export const DEFAULT_CLAIM_LEASE_MS = 60_000;
 export const MAX_EFFECT_ATTEMPTS = 10;
 
 /**
+ * Structured `event` field emitted when a comment settles with at least one
+ * permanently failed effect. Stable by contract: it is an alerting selector
+ * (`event = "comment_effect_permanently_failed"`), so renaming it silently
+ * disarms whatever monitor is keyed on it. Exported so tests and dashboards
+ * reference the same literal rather than each copying the string.
+ */
+export const COMMENT_EFFECT_LOSS_EVENT = "comment_effect_permanently_failed";
+
+/**
  * Persist the deterministic effect intents for a comment.
  *
  * MUST be called inside the same transaction that inserts the comment: that
@@ -288,6 +297,13 @@ export async function getEffectResult(
  * effect is visible via its `failed` status and `last_error`; settlement is about
  * "is any work still owed", and the answer for a parked effect is no.
  *
+ * Settling on a parked effect is nonetheless real downstream loss, so it must
+ * never be *silent*: the transition below emits `COMMENT_EFFECT_LOSS_EVENT` at
+ * error level, naming the comment and every parked effect. That log line is the
+ * operator's alert hook and the entry point for the repair path tracked
+ * separately — settlement no longer being blocked is not the same as the work
+ * having happened, and only the emission keeps that distinction visible.
+ *
  * Returns true when the comment is (now or already) processed.
  */
 export async function markCommentProcessedIfSettled(db: Db, commentId: string): Promise<boolean> {
@@ -303,7 +319,23 @@ export async function markCommentProcessedIfSettled(db: Db, commentId: string): 
     .limit(1);
   if (outstanding.length > 0) return false;
 
-  await db
+  const failed = await db
+    .select({
+      id: issueCommentEffects.id,
+      effectKind: issueCommentEffects.effectKind,
+      effectKey: issueCommentEffects.effectKey,
+      attempts: issueCommentEffects.attempts,
+      lastError: issueCommentEffects.lastError,
+    })
+    .from(issueCommentEffects)
+    .where(
+      and(
+        eq(issueCommentEffects.commentId, commentId),
+        eq(issueCommentEffects.status, "failed"),
+      ),
+    );
+
+  const stamped = await db
     .update(issueComments)
     .set({ idempotencyProcessedAt: new Date() })
     .where(
@@ -312,7 +344,31 @@ export async function markCommentProcessedIfSettled(db: Db, commentId: string): 
         isNull(issueComments.idempotencyProcessedAt),
         isNull(issueComments.deletedAt),
       ),
+    )
+    .returning({ id: issueComments.id });
+
+  // Emit only on the actual transition. The `isNull(idempotencyProcessedAt)`
+  // predicate makes this update a one-shot, so gating on its result keeps the
+  // alert at exactly one line per lost comment however often the settlement
+  // sweep re-runs — an alert that repeats on every pass gets muted, and a muted
+  // alert is indistinguishable from the silence this exists to prevent.
+  if (stamped.length > 0 && failed.length > 0) {
+    logger.error(
+      {
+        event: COMMENT_EFFECT_LOSS_EVENT,
+        commentId,
+        failedEffectCount: failed.length,
+        failedEffects: failed.map((effect) => ({
+          id: effect.id,
+          effectKind: effect.effectKind,
+          effectKey: effect.effectKey,
+          attempts: effect.attempts,
+          lastError: effect.lastError,
+        })),
+      },
+      "issue-comment-effects: comment stamped processed with permanently failed effects",
     );
+  }
   return true;
 }
 
