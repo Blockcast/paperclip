@@ -19,7 +19,7 @@ export const githubReviewGateDeliveries = pgTable(
     dispatchEventType: text("dispatch_event_type").notNull(),
     expectedAppId: text("expected_app_id").notNull(),
     expectedInstallationId: text("expected_installation_id").notNull(),
-    /** queued -> processing -> delivered; governance failures retry indefinitely. */
+    /** capturing -> queued -> processing -> delivered; governance failures retry indefinitely. */
     status: text("status").notNull().default("queued"),
     attempts: integer("attempts").notNull().default(0),
     nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true }).notNull().defaultNow(),

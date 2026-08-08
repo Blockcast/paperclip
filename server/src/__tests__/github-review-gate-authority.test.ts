@@ -24,6 +24,7 @@ vi.mock("../config.js", () => ({ loadConfig: () => h.cfg }));
 
 import { _resetInstallationTokenCache } from "../services/github-app-auth.js";
 import {
+  activateGithubReviewGateDelivery,
   enqueueGithubReviewGateDelivery,
   pollGithubReviewGateDeliveriesOnce,
   resetStaleGithubReviewGateDeliveries,
@@ -193,13 +194,14 @@ describeEmbeddedPostgres("GitHub review-gate durable authority", () => {
   });
 
   async function enqueue(options: {
+    captureOnly?: boolean;
     deliveryId?: string;
     eventName?: string;
     payload?: Record<string, unknown>;
     rawBody?: Buffer;
   } = {}) {
     const payload = options.payload ?? pullRequestPayload({ before: EVENT_HEAD });
-    return enqueueGithubReviewGateDelivery({
+    const result = await enqueueGithubReviewGateDelivery({
       db,
       eventName: options.eventName ?? "pull_request",
       deliveryId: options.deliveryId ?? "delivery-1",
@@ -207,6 +209,13 @@ describeEmbeddedPostgres("GitHub review-gate durable authority", () => {
       payload,
       config: authorityConfig,
     });
+    if (result.matched && result.queued && !options.captureOnly) {
+      await db
+        .update(githubReviewGateDeliveries)
+        .set({ status: "queued" })
+        .where(eq(githubReviewGateDeliveries.id, result.deliveryDbId));
+    }
+    return result;
   }
 
   async function readDelivery(deliveryId = "delivery-1") {
@@ -228,15 +237,45 @@ describeEmbeddedPostgres("GitHub review-gate durable authority", () => {
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
 
-    await expect(enqueue()).resolves.toMatchObject({ matched: true, queued: true, duplicate: false });
+    await expect(enqueue({ captureOnly: true })).resolves.toMatchObject({
+      matched: true,
+      queued: true,
+      duplicate: false,
+      requiresRevocation: true,
+    });
 
     expect(fetchMock).not.toHaveBeenCalled();
     expect(await readDelivery()).toMatchObject({
-      status: "queued",
+      status: "capturing",
       expectedAppId: "3966421",
       expectedInstallationId: "138085375",
       payloadDigest: expect.stringMatching(/^[0-9a-f]{64}$/),
     });
+  });
+
+  it("posts every pending revocation before activating a delivery for the worker", async () => {
+    const queued = await enqueue({ captureOnly: true });
+    const fetchMock = installGithubStub();
+
+    await expect(
+      activateGithubReviewGateDelivery(db, queued.matched && queued.queued ? queued.deliveryDbId : ""),
+    ).resolves.toEqual({ ok: true });
+
+    expect(await readDelivery()).toMatchObject({ status: "queued" });
+    expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith(`/statuses/${LIVE_HEAD}`))).toBe(true);
+    expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith(`/statuses/${EVENT_HEAD}`))).toBe(true);
+    expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith("/dispatches"))).toBe(false);
+  });
+
+  it("keeps a delivery in capture when synchronous revocation fails", async () => {
+    const queued = await enqueue({ captureOnly: true });
+    installGithubStub({ failStatusSha: EVENT_HEAD });
+
+    await expect(
+      activateGithubReviewGateDelivery(db, queued.matched && queued.queued ? queued.deliveryDbId : ""),
+    ).resolves.toEqual({ ok: false, reason: "review_gate_status_http_503" });
+
+    expect(await readDelivery()).toMatchObject({ status: "capturing" });
   });
 
   it("deduplicates an identical delivery and rejects a conflicting duplicate", async () => {
@@ -408,6 +447,7 @@ describeEmbeddedPostgres("GitHub review-gate durable authority", () => {
       client_payload: {
         producer_app_id: "3966421",
         producer_installation_id: "138085375",
+        producer_delivery_id: "delivery-1",
         retry_count: "0",
         target_pull_number: String(PR_NUMBER),
         target_head_sha: LIVE_HEAD,
