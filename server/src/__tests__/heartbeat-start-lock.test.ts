@@ -294,6 +294,70 @@ describe("heartbeat agent start lock (BLO-20396)", () => {
     expect(calls).toEqual(ids);
   });
 
+  it("force-releases a section that never settles so the agent's later demand still dispatches, without affecting other agents (BLO-23094)", async () => {
+    // BLO-23094: Ally's dispatch produced zero starts for ~49 minutes with
+    // free slots and demand, while the fleet dispatched normally for every
+    // other agent. The suspected mechanism was a critical section whose `fn`
+    // never settles — before this test, `runningByAgent` had no liveness
+    // backstop for that case at all: the coalesced follow-up chains on the
+    // stuck section's marker via `running.then(...)`, so if that marker
+    // never resolves, NOTHING queued behind it ever runs again, forever,
+    // regardless of how much capacity frees up. Warn logging alone (30s)
+    // does not fix this — it only proves the section is slow, not that it
+    // will ever finish.
+    vi.useFakeTimers();
+
+    const agentId = randomUUID();
+    const otherAgentId = randomUUID();
+
+    // Stands in for an unbounded await deep inside `fn` (e.g. a future
+    // k8s/DB call with no timeout): deliberately never resolved or rejected.
+    const stuck = deferred<string>();
+    const stuckFn = vi.fn(async () => stuck.promise);
+    const later = vi.fn(async () => "later");
+
+    const held = withAgentStartLock(agentId, stuckFn, coalesced);
+    // This mirrors `execution` inside runExclusively, which really does stay
+    // pending forever — force-release only unblocks NEW demand, not the
+    // original abandoned call. Attach a no-op handler so the never-settling
+    // promise cannot surface as an unhandled rejection later in the test run.
+    held.catch(() => {});
+    await Promise.resolve();
+    expect(stuckFn).toHaveBeenCalledTimes(1);
+
+    // Demand arriving while the section is (as far as anyone can tell) still
+    // running joins the single coalesced follow-up, same as any busy-lock case.
+    const laterResult = withAgentStartLock(agentId, later, coalesced);
+    await Promise.resolve();
+    expect(later).not.toHaveBeenCalled();
+
+    // An unrelated agent must be completely unaffected, both while the other
+    // agent is wedged and once it recovers — per-agent keying must not leak.
+    const otherFn = vi.fn(async () => "other");
+    await expect(withAgentStartLock(otherAgentId, otherFn, coalesced)).resolves.toBe("other");
+    expect(otherFn).toHaveBeenCalledTimes(1);
+
+    // Blow past the warn threshold: nothing recovers on its own yet, matching
+    // the live incident's "112 warns logged, 0 runs started" — a warning is
+    // not a liveness mechanism.
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(later).not.toHaveBeenCalled();
+
+    // Cross the hard liveness ceiling. The never-settling section is
+    // force-released: the coalesced follow-up unblocks and runs fresh.
+    await vi.advanceTimersByTimeAsync(300_000);
+    await expect(laterResult).resolves.toBe("later");
+    expect(later).toHaveBeenCalledTimes(1);
+
+    // The agent is not permanently wedged: a brand new call after the
+    // force-release goes through normally too.
+    const afterRecovery = vi.fn(async () => "after-recovery");
+    await expect(withAgentStartLock(agentId, afterRecovery, coalesced)).resolves.toBe("after-recovery");
+
+    // Let the zombie settle so it does not linger past the test.
+    stuck.resolve("stuck");
+  });
+
   it("serializes a burst so each queued item is handed out at most once", async () => {
     const agentId = randomUUID();
     const queue = Array.from({ length: 20 }, (_, i) => i);

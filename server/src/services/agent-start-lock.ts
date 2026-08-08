@@ -23,11 +23,22 @@ import { logger } from "../middleware/logger.js";
  *                             one extra pass instead of N queued passes.
  *   - Re-entrant / too deep → do not run; return `onCoalesced()`.
  *
- * There is no timeout bypass. A timeout must never downgrade mutual exclusion —
- * that was the defect. Liveness comes instead from (a) removing the re-entrancy
- * that used to self-deadlock and (b) bounding the critical section's work. A
- * section that overruns `LOCK_HELD_WARN_MS` is logged loudly rather than
- * silently overtaken.
+ * There is no timeout bypass *on ordinary contention*. A 30s-scale timeout
+ * must never downgrade mutual exclusion — that was the defect. Liveness comes
+ * instead from (a) removing the re-entrancy that used to self-deadlock and
+ * (b) bounding the critical section's work. A section that overruns
+ * `LOCK_HELD_WARN_MS` is logged loudly rather than silently overtaken.
+ *
+ * BLO-23094: that guarantee assumed `fn` always eventually settles. It does
+ * not hold if a future bug puts a genuinely never-resolving await inside
+ * `fn` — no amount of re-entrancy guarding or depth capping helps, because
+ * the section is not looping or nesting, it is simply stuck. That failure
+ * mode wedges the affected agent's dispatch until the process restarts, with
+ * no other recovery path, since the lock state is purely in-memory. The
+ * module now backstops that one failure mode — and only that one — with
+ * `LOCK_FORCE_RELEASE_MS`, an order of magnitude above any duration ordinary
+ * contention could plausibly produce. See its comment for why that bound is
+ * safe to add without reintroducing the original defect.
  *
  * Re-entrancy matters here and is not hypothetical. `startNextQueuedRunForAgent`
  * calls `reapOrphanedRuns`, which is not agent-scoped and can reach
@@ -60,6 +71,38 @@ import { logger } from "../middleware/logger.js";
 
 /** Warn (do not bypass) when one critical section runs longer than this. */
 const LOCK_HELD_WARN_MS = 30_000;
+
+/**
+ * Hard liveness ceiling (BLO-23094). If a critical section has not settled
+ * after this long, the module concludes it is not "slow" but genuinely
+ * *hung* — an await inside `fn` that will never resolve or reject — and
+ * force-releases this agent's bookkeeping so new demand is not held hostage
+ * forever. Before this, `runningByAgent`/`followUpByAgent` had no liveness
+ * backstop at all: a single never-settling `fn()` call wedged that agent's
+ * dispatch until the process restarted, no matter how long the incident ran.
+ *
+ * This is deliberately NOT the BLO-20396 defect reintroduced. That bypass
+ * fired at LOCK_HELD_WARN_MS (30s) — well inside the duration of ordinary,
+ * even heavily re-entrant/cascaded work (every k8s call in this dispatch
+ * path is itself AbortSignal-bounded to a couple of seconds; see
+ * k8s-job-liveness.ts) — and let a second section run CONCURRENTLY with the
+ * first, which is what produced duplicate scans and repeated cancellations.
+ * This ceiling is an order of magnitude higher specifically so that no
+ * plausible legitimate section — including one nested MAX_NESTED_DISPATCH_DEPTH
+ * deep — can ever reach it; only a genuinely stuck await can.
+ *
+ * Force-releasing does not cancel the abandoned `fn()` — there is no way to
+ * cancel an arbitrary in-flight await from here. It keeps running
+ * unobserved, and its eventual settlement is a no-op against the module's
+ * bookkeeping (guarded by marker identity, both here and in `runExclusively`'s
+ * `finally`), because by then a fresh section may already be running in its
+ * place. That sacrifices strict mutual exclusion only in this
+ * already-abnormal case — a zombie execution could in principle still be
+ * mutating state when a fresh one starts — but the alternative is an agent
+ * whose dispatch never recovers without a pod restart, which is strictly
+ * worse and is exactly the incident this constant exists to bound.
+ */
+const LOCK_FORCE_RELEASE_MS = 300_000;
 
 /**
  * Maximum number of distinct agents whose locks may be held on a single async
@@ -135,10 +178,28 @@ async function runExclusively<T>(agentId: string, fn: () => Promise<T>): Promise
   }, LOCK_HELD_WARN_MS);
   warnTimer.unref?.();
 
+  // Liveness backstop (BLO-23094): see LOCK_FORCE_RELEASE_MS for why this
+  // ceiling cannot fire on ordinary contention. Guarded by marker identity so
+  // it never clobbers a section that already finished and was replaced.
+  const forceReleaseTimer = setTimeout(() => {
+    if (runningByAgent.get(agentId) !== marker) return;
+    logger.error(
+      { agentId, heldMs: Date.now() - startedAtMs, forceReleaseAfterMs: LOCK_FORCE_RELEASE_MS },
+      "agent start lock force-released after exceeding the hard liveness ceiling; this section is not settling — treat as a bug (unbounded await), not normal contention",
+    );
+    runningByAgent.delete(agentId);
+    // Unblocks any coalesced follow-up chained on `marker` (ensureCoalescedFollowUp
+    // awaits it via `running.then(...)`) so queued demand for this agent proceeds
+    // on a fresh section instead of waiting on one that may never return.
+    settleMarker();
+  }, LOCK_FORCE_RELEASE_MS);
+  forceReleaseTimer.unref?.();
+
   try {
     return await execution;
   } finally {
     clearTimeout(warnTimer);
+    clearTimeout(forceReleaseTimer);
     if (runningByAgent.get(agentId) === marker) runningByAgent.delete(agentId);
   }
 }
