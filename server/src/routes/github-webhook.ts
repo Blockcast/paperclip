@@ -478,6 +478,9 @@ interface ResolvedEventContext {
   // needing a separate `gh pr view` shellout.
   reviewBody?: string | null;
   reviewState?: string | null;
+  // pull_request_review.submitted only. This is the durable identity of one
+  // submitted review, used to distinguish new feedback from a redelivery.
+  reviewId?: number | null;
   reviewAuthorLogin?: string | null;
   reviewUrl?: string | null;
   // BLO-9293: PR author login (pull_request.user.login / issue.user.login on a
@@ -776,6 +779,8 @@ function resolveEventContext(
       const reviewUser = review?.user as Record<string, unknown> | undefined;
       const reviewAuthorLogin = (reviewUser?.login as string | undefined) ?? null;
       const reviewUrl = readStringField(review, "html_url");
+      const reviewIdRaw = review?.id;
+      const reviewId = typeof reviewIdRaw === "number" ? reviewIdRaw : null;
       return {
         identifiers: collected.ids,
         wakeReason: "github_pr_review_submitted",
@@ -788,6 +793,7 @@ function resolveEventContext(
         prAuthorLogin: collected.authorLogin,
         reviewBody,
         reviewState,
+        reviewId,
         reviewAuthorLogin,
         reviewUrl,
       };
@@ -1580,6 +1586,11 @@ function isActionableReviewFeedbackContext(context: ResolvedEventContext): boole
 
 function buildPrFeedbackExternalKey(context: ResolvedEventContext, deliveryId: string | null): string | null {
   if (context.commentId) return `github_issue_comment:${context.commentId}`;
+  if (context.reviewId !== null && context.reviewId !== undefined) {
+    const repo = context.repoFullName ?? "unknown";
+    const pr = context.prNumber ?? "unknown";
+    return `github_pr_review_id:${repo}:${pr}:${context.reviewId}`;
+  }
   if (context.reviewUrl) return `github_pr_review:${context.reviewUrl}`;
   if (context.eventUrl) return `github_event:${context.eventUrl}`;
   if (deliveryId) return `github_delivery:${deliveryId}`;
@@ -1721,9 +1732,6 @@ async function reopenInReviewIssueForActionablePrFeedback(
 ): Promise<{ reopened: boolean; commentId: string | null; assigneeAgentId: string | null }> {
   const returnAssigneeAgentId = readReturnAssigneeAgentId(issue.executionState);
   const effectiveAssigneeAgentId = returnAssigneeAgentId ?? issue.assigneeAgentId;
-  if (issue.status !== "in_review" || !effectiveAssigneeAgentId) {
-    return { reopened: false, commentId: null, assigneeAgentId: effectiveAssigneeAgentId };
-  }
 
   const externalKey = buildPrFeedbackExternalKey(context, deliveryId);
   const now = new Date();
@@ -1761,6 +1769,14 @@ async function reopenInReviewIssueForActionablePrFeedback(
         })
         .returning({ id: issueComments.id })
         .then((rows): string | null => rows[0]?.id ?? null);
+
+    // Every distinct actionable review is feedback the assignee must be able
+    // to see. The first review changes an in-review issue to in-progress, so
+    // keeping the comment behind that transition silently discarded every
+    // later review on the same PR.
+    if (issue.status !== "in_review" || !effectiveAssigneeAgentId) {
+      return { reopened: false, commentId, assigneeAgentId: effectiveAssigneeAgentId };
+    }
 
     const executionState = markExecutionStateChangesRequested(issue.executionState);
     const patch: Partial<typeof issues.$inferInsert> = {

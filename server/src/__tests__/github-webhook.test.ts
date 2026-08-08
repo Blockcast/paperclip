@@ -3563,6 +3563,108 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(wakesAfterDuplicate).toHaveLength(1);
   });
 
+  function reviewSubmittedFeedbackPayload(input: {
+    prNumber: number;
+    reviewId: number;
+    identifier: string;
+    headSha: string;
+  }) {
+    return {
+      action: "submitted",
+      pull_request: {
+        number: input.prNumber,
+        title: `Fix hosted vault onboarding (${input.identifier})`,
+        body: null,
+        html_url: `https://github.com/Blockcast/paperclip/pull/${input.prNumber}`,
+        head: { ref: "codex/fix-vault", sha: input.headSha },
+        user: { login: "codex-bot" },
+      },
+      review: {
+        id: input.reviewId,
+        body: "Please fix before merge.",
+        state: "changes_requested",
+        html_url: `https://github.com/Blockcast/paperclip/pull/${input.prNumber}#pullrequestreview-${input.reviewId}`,
+        user: { login: "allyblockcast[bot]" },
+      },
+      repository: { full_name: "Blockcast/paperclip" },
+    };
+  }
+
+  async function sendReviewSubmitted(
+    app: ReturnType<typeof buildApp>,
+    payload: Record<string, unknown>,
+    deliveryId: string,
+  ) {
+    const { body, signature } = signedRequest(payload);
+    return request(app)
+      .post("/api/webhooks/github")
+      .set("x-github-event", "pull_request_review")
+      .set("x-hub-signature-256", signature)
+      .set("x-github-delivery", deliveryId)
+      .set("content-type", "application/json")
+      .send(body);
+  }
+
+  it("records every distinct Ally review after the first and dedupes a redelivery", async () => {
+    const { agentId, issueId } = await seedIssueWithIdentifier("PEN-1126", { status: "in_review" });
+    const app = buildApp({ prReviewerBotLogin: "allyblockcast[bot]" });
+    const review1 = reviewSubmittedFeedbackPayload({
+      prNumber: 850,
+      reviewId: 111,
+      identifier: "PEN-1126",
+      headSha: "sha-one",
+    });
+    const review2 = reviewSubmittedFeedbackPayload({
+      prNumber: 850,
+      reviewId: 222,
+      identifier: "PEN-1126",
+      headSha: "sha-two",
+    });
+
+    const first = await sendReviewSubmitted(app, review1, "delivery-review-1");
+    expect(first.status).toBe(200);
+    expect(first.body.reopened).toEqual([{ issueIdentifier: "PEN-1126", commentId: expect.any(String) }]);
+
+    const [afterFirst] = await db.select({ status: issues.status }).from(issues).where(eq(issues.id, issueId));
+    expect(afterFirst?.status).toBe("in_progress");
+
+    const second = await sendReviewSubmitted(app, review2, "delivery-review-2");
+    expect(second.status).toBe(200);
+    expect(second.body.reopened).toEqual([]);
+    expect(second.body.wakes).toEqual([{ issueIdentifier: "PEN-1126", agentId }]);
+
+    const feedbackComments = (await db
+      .select({ metadata: issueComments.metadata })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId)))
+      .filter((comment) => (comment.metadata as Record<string, unknown> | null)?.kind === "github_pr_review_feedback");
+    expect(feedbackComments).toHaveLength(2);
+    expect(feedbackComments.map((comment) => (comment.metadata as Record<string, unknown>).externalKey)).toEqual(
+      expect.arrayContaining([
+        "github_pr_review_id:Blockcast/paperclip:850:111",
+        "github_pr_review_id:Blockcast/paperclip:850:222",
+      ]),
+    );
+
+    const replay = await sendReviewSubmitted(app, review1, "delivery-review-1-replay");
+    expect(replay.status).toBe(200);
+    expect(replay.body.skipped).toContainEqual({
+      issueIdentifier: "PEN-1126",
+      reason: "duplicate_review_feedback",
+    });
+
+    const commentsAfterReplay = await db
+      .select({ id: issueComments.id })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    expect(commentsAfterReplay).toHaveLength(2);
+    const wakesAfterReplay = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakesAfterReplay).toHaveLength(2);
+  });
+
   it("does not count same-number PR feedback cycles from other repos", async () => {
     const { companyId, agentId, issueId } = await seedIssueWithIdentifier("PEN-1126", { status: "in_review" });
     await db.insert(issueComments).values({
