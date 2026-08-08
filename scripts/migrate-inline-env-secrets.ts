@@ -1,9 +1,7 @@
 import { eq } from "drizzle-orm";
 import { agents, createDb } from "@paperclipai/db";
+import { isPlausiblySensitiveEnvValue, isSensitiveEnvKey } from "@paperclipai/shared";
 import { secretService } from "../server/src/services/secrets.js";
-
-const SENSITIVE_ENV_KEY_RE =
-  /(api[-_]?key|access[-_]?token|auth(?:_?token)?|authorization|bearer|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring)/i;
 
 type EnvBinding =
   | string
@@ -42,6 +40,8 @@ async function main() {
   let changedAgents = 0;
   let createdSecrets = 0;
   let rotatedSecrets = 0;
+  const wouldConvertKeys: Array<{ agentId: string; key: string }> = [];
+  const skippedPlausiblySensitiveKeys: Array<{ agentId: string; key: string }> = [];
 
   for (const agent of allAgents) {
     const adapterConfig = asRecord(agent.adapterConfig);
@@ -53,11 +53,17 @@ async function main() {
     const nextEnv: Record<string, EnvBinding> = { ...(env as Record<string, EnvBinding>) };
 
     for (const [key, rawBinding] of Object.entries(env)) {
-      if (!SENSITIVE_ENV_KEY_RE.test(key)) continue;
       const plain = toPlainValue(rawBinding);
       if (plain === null) continue;
       if (plain.trim().length === 0) continue;
+      if (!isSensitiveEnvKey(key)) {
+        if (isPlausiblySensitiveEnvValue(plain)) {
+          skippedPlausiblySensitiveKeys.push({ agentId: agent.id, key });
+        }
+        continue;
+      }
 
+      wouldConvertKeys.push({ agentId: agent.id, key });
       const name = secretName(agent.id, key);
       if (apply) {
         const existing = await secrets.getByName(agent.companyId, name);
@@ -112,6 +118,15 @@ async function main() {
 
   if (!apply) {
     console.log(`Dry run: ${changedAgents} agents would be updated`);
+    for (const candidate of wouldConvertKeys) {
+      console.log(`Would convert: agent=${candidate.agentId} key=${candidate.key}`);
+    }
+    if (skippedPlausiblySensitiveKeys.length > 0) {
+      console.log("Skipped plausibly sensitive keys (values redacted):");
+      for (const skipped of skippedPlausiblySensitiveKeys) {
+        console.log(`- agent=${skipped.agentId} key=${skipped.key}`);
+      }
+    }
     console.log("Re-run with --apply to persist changes");
     process.exit(0);
   }

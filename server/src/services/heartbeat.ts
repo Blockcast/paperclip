@@ -11,6 +11,7 @@ import {
   MODEL_PROFILE_KEYS,
   PROVIDER_QUOTA_MONITOR_SERVICE_NAME,
   envBindingSchema,
+  isSensitiveEnv,
   isEnvironmentDriverSupportedForAdapter,
   type BillingType,
   type CostStatus,
@@ -1317,9 +1318,6 @@ export function requiresPushCapabilityPreflight(input: {
     && hasGithubPrWorkflowSkill(input.explicitRunScopedSkillKeys);
 }
 
-const LOW_TRUST_SENSITIVE_ENV_KEY_RE =
-  /(api[-_]?key|access[-_]?token|auth(?:_?token)?|authorization|bearer|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring)/i;
-
 function isPaperclipRuntimeEnvKey(key: string) {
   return key.startsWith("PAPERCLIP_");
 }
@@ -1425,16 +1423,18 @@ function assertLowTrustEnvConfigAllowed(envValue: unknown, source: string) {
     const parsed = envBindingSchema.safeParse(rawBinding);
     if (!parsed.success) continue;
     const binding = parsed.data;
-    const isPlainBinding =
-      typeof binding === "string" ||
-      (typeof binding === "object" && binding !== null && binding.type === "plain");
+    const plainValue = typeof binding === "string"
+      ? binding
+      : binding.type === "plain"
+        ? binding.value
+        : null;
     // Agent-scope-only keys hold a raw credential by construction, but do not
     // match the name-shaped heuristic below (GH_SEAT_TOKEN_VALUE contains no
     // "secret"/"auth"/"access_token" substring). Treat them as sensitive
     // explicitly so a low-trust run cannot inline one; it must use a
     // secret_ref. Safe to add with this PR because the key is new here — no
     // existing config can be relying on the inline form.
-    if (isPlainBinding && (LOW_TRUST_SENSITIVE_ENV_KEY_RE.test(key) || isAgentScopeOnlyEnvKey(key))) {
+    if (plainValue !== null && (isSensitiveEnv(key, plainValue) || isAgentScopeOnlyEnvKey(key))) {
       throw new HttpError(422, `Low-trust execution cannot use inline sensitive env value ${source}.${key}`, {
         code: "low_trust_inline_sensitive_env_denied",
       });

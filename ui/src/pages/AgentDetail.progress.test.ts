@@ -5,8 +5,20 @@ import { queryKeys } from "../lib/queryKeys";
 import {
   buildHeartbeatProgressLogLine,
   heartbeatProgressLogLineKey,
+  redactEnvValue,
   syncAgentRouteAfterRename,
 } from "./AgentDetail";
+
+describe("redactEnvValue", () => {
+  it("redacts credential-shaped values under benign keys", () => {
+    expect(redactEnvValue("CONFIG", "ghp_0123456789abcdef0123456789abcdef", false)).toBe(
+      "***REDACTED***",
+    );
+    expect(redactEnvValue("CONFIG", "-----BEGIN RSA PRIVATE KEY-----", false)).toBe(
+      "***REDACTED***",
+    );
+  });
+});
 
 describe("buildHeartbeatProgressLogLine", () => {
   it("renders progress messages with phase prefixes as system log lines", () => {

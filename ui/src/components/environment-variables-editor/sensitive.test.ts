@@ -17,9 +17,7 @@ describe("isSensitiveEnv", () => {
   it("does not flag benign names with short values", () => {
     expect(isSensitiveEnv("NODE_ENV", "production")).toBe(false);
     expect(isSensitiveEnv("PORT", "3000")).toBe(false);
-    // A bare `TOKEN` in the name is intentionally NOT matched by name alone
-    // (the server regex only matches access_token / auth_token).
-    expect(isSensitiveEnv("GH_TOKEN", "short")).toBe(false);
+    expect(isSensitiveEnv("GH_TOKEN", "short")).toBe(true);
   });
 
   it("flags known credential value shapes even with benign names", () => {
