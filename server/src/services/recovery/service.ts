@@ -5488,6 +5488,14 @@ export function recoveryService(
           returnOwnerAgentId: action.returnOwnerAgentId,
           blockerIssueIds: blockerIds,
         },
+      }, {
+        // Only the review-stage path passes a transaction as `mutationDb` (see the
+        // `input.expectedReviewStage ? tx : db` binding above). Deferring there hands the
+        // live/plugin publish back to the caller, which fires it after commit; on the
+        // non-review path `mutationDb` is the autocommit connection, so publishing inline
+        // is already correct and deferring would strand the event behind a caller that has
+        // nothing left to commit.
+        deferPublish: Boolean(input.expectedReviewStage),
       });
 
       return {

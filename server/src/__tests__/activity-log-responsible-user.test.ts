@@ -20,6 +20,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { subscribeCompanyLiveEvents } from "../services/live-events.js";
 
 type TableRows = Map<unknown, Array<Record<string, unknown>>>;
 
@@ -230,5 +231,122 @@ describeEmbeddedPostgres("logActivity responsible-user stamping", () => {
       .then((rows) => rows[0]);
 
     expect(row?.responsibleUserId).toBe("key-user");
+  });
+
+  // The contract `deferPublish` exists to enforce: the live event must not escape a
+  // transaction that later rolls back. `publishLiveEvent` is in-memory and the plugin
+  // outbox writes on its own handle, so both bypass the enclosing transaction entirely --
+  // publishing inline turns a rollback into a phantom event for an activity row that
+  // never existed. Callers logging inside a transaction (the review-stage recovery
+  // escalation is one) therefore have to pass the option and fire the returned publisher
+  // after commit.
+  it("does not publish a live event when a deferred activity's transaction rolls back", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      defaultResponsibleUserId: "default-user",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "running",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const seen: unknown[] = [];
+    const unsubscribe = subscribeCompanyLiveEvents(companyId, (event) => {
+      seen.push(event);
+    });
+
+    try {
+      await expect(db.transaction(async (tx) => {
+        await logActivity(tx as unknown as Db, activityInput({
+          companyId,
+          actorId: agentId,
+          agentId,
+          entityType: "agent",
+          entityId: agentId,
+        }), { deferPublish: true });
+        // Stand-in for any post-log failure inside the same transaction. Because the
+        // publisher was deferred, nothing has been emitted yet at this point.
+        throw new Error("rollback");
+      })).rejects.toThrow("rollback");
+    } finally {
+      unsubscribe();
+    }
+
+    expect(seen).toHaveLength(0);
+    const rows = await db
+      .select({ id: activityLog.id })
+      .from(activityLog)
+      .where(eq(activityLog.companyId, companyId));
+    expect(rows).toHaveLength(0);
+  });
+
+  // Positive control for the test above. Asserting "no event was emitted" proves nothing
+  // on its own -- a subscription wired to the wrong channel would satisfy it vacuously.
+  // This pins the other half of the contract: the deferred publisher is the real one, and
+  // invoking it after commit does emit on the same channel the rollback test watches.
+  it("publishes the deferred live event when the transaction commits", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      defaultResponsibleUserId: "default-user",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "running",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const seen: unknown[] = [];
+    const unsubscribe = subscribeCompanyLiveEvents(companyId, (event) => {
+      seen.push(event);
+    });
+
+    try {
+      const publish = await db.transaction(async (tx) => {
+        return await logActivity(tx as unknown as Db, activityInput({
+          companyId,
+          actorId: agentId,
+          agentId,
+          entityType: "agent",
+          entityId: agentId,
+        }), { deferPublish: true });
+      });
+      // Still nothing: publication was handed back rather than fired inside the tx.
+      expect(seen).toHaveLength(0);
+      publish();
+      expect(seen).toHaveLength(1);
+    } finally {
+      unsubscribe();
+    }
+
+    const rows = await db
+      .select({ id: activityLog.id })
+      .from(activityLog)
+      .where(eq(activityLog.companyId, companyId));
+    expect(rows).toHaveLength(1);
   });
 });
