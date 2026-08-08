@@ -9857,8 +9857,22 @@ export function issueRoutes(
         ? activeRecoveryActionForPatch
         : await recoveryActionsSvc.getActiveForIssue(existing.companyId, existing.id)
       : null;
+    // BLO-19951: the coordination-metadata allowlist (BLO-18289) is decided
+    // above but was never consulted here, so an allowlist-confined patch still
+    // 403'd whenever the issue carried a recovery action owned outside the
+    // actor's chain. Stranded-recovery issues are exactly the population the
+    // gate exists to curate (BLO-19119), so that subset was unreachable.
+    //
+    // Reusing the already-computed decision rather than recomputing keeps the
+    // two paths from drifting. The carve-out is narrow by construction: a
+    // non-null decision means the body contained *only* allowlisted fields, and
+    // `status` / `assigneeAgentId` / `executionPolicy` / `reopen` / `resume` are
+    // all outside the allowlist, so the only trigger that can reach this line
+    // with a decision in hand is `blockedByIssueIds` — the BLO-18163 use case.
+    // Any non-allowlisted field nulls the decision and restores the guard.
     if (
       recoveryRelevantSourceMutationRequested &&
+      !coordinationMetadataDecision &&
       !(await assertRecoveryActionAuthority(
         req,
         res,

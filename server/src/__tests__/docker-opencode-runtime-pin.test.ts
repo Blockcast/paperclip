@@ -9,6 +9,7 @@ const runtimeDockerfile = readFileSync(path.join(repoRoot, "Dockerfile.runtime")
 const dockerWorkflow = readFileSync(path.join(repoRoot, ".github/workflows/docker.yml"), "utf8");
 const dockerAgentWorkflow = readFileSync(path.join(repoRoot, ".github/workflows/docker-agent.yml"), "utf8");
 const dockerDesignerWorkflow = readFileSync(path.join(repoRoot, ".github/workflows/docker-designer.yml"), "utf8");
+const prWorkflow = readFileSync(path.join(repoRoot, ".github/workflows/pr.yml"), "utf8");
 const agentRuntimeImagesWorkflow = readFileSync(
   path.join(repoRoot, ".github/workflows/agent-runtime-images.yml"),
   "utf8",
@@ -22,12 +23,15 @@ const designerPackageLock = readFileSync(path.join(repoRoot, "packages/services/
 
 describe("production Dockerfile k8s adapter runtime pins", () => {
   it("pins opencode-ai and asserts the installed version", () => {
-    expect(runtimeDockerfile).toContain("ARG OPENCODE_AI_VERSION=1.15.12");
-    expect(runtimeDockerfile).toContain("reasoning output items");
-    expect(runtimeDockerfile).toContain("UnknownError/exit 1");
+    expect(runtimeDockerfile).toContain("ARG OPENCODE_AI_VERSION=1.18.11");
+    expect(runtimeDockerfile).toContain("response.in_progress");
+    expect(runtimeDockerfile).toContain("opencode-responses-replay.mjs");
     expect(runtimeDockerfile).toContain('"opencode-ai@${OPENCODE_AI_VERSION}"');
     expect(runtimeDockerfile).toContain('test "$(opencode --version)" = "${OPENCODE_AI_VERSION}"');
     expect(runtimeDockerfile).not.toMatch(/npm install[^\n]*\sopencode-ai(?:\s|\\)/);
+    expect(prWorkflow).toContain("opencode_responses_replay:");
+    expect(prWorkflow).toContain("OPENCODE_REPLAY_BINARY=");
+    expect(prWorkflow).toContain("node scripts/smoke/opencode-responses-replay.mjs");
   });
 
   it("builds the claude_k8s adapter from in-tree vendored source, not a pinned fork clone", () => {

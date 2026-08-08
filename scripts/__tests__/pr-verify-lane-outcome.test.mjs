@@ -51,6 +51,7 @@ function laneEnv(results) {
     TYPECHECK_RELEASE_REGISTRY_RESULT: results.typecheck_release_registry ?? "success",
     GENERAL_TESTS_RESULT: results.general_tests ?? "success",
     WORKTREE_INSTALL_RESULT: results.worktree_install ?? "success",
+    OPENCODE_RESPONSES_REPLAY_RESULT: results.opencode_responses_replay ?? "success",
     BUILD_RESULT: results.build ?? "success",
     VERIFY_SERIALIZED_SERVER_RESULT: results.verify_serialized_server ?? "success",
     VENDOR_CLAUDE_K8S_RESULT: results.vendor_claude_k8s ?? "success",
@@ -63,25 +64,50 @@ function runVerifyStep(results) {
   return spawnSync("bash", ["-c", script], { env, encoding: "utf8" });
 }
 
-// BLO-17980: adding a lane to the `verify` job's `lane_results` map without
-// also giving it a default here leaves its env var unset. The script's
-// `case` treats an empty result as `*)` — a failure — so EVERY scenario in
-// this file, including "every lane succeeds", starts emitting a spurious
-// lane-failure annotation. That is exactly how the `vendor_claude_k8s` lane
-// broke this suite. Assert the two stay in step so the next lane addition
-// fails here with a clear reason instead of as three unrelated-looking
-// assertion errors.
-test("every lane in the workflow's lane_results map has a test default", () => {
+// BLO-17980: adding a lane to the `verify` job's lane list without also giving
+// it a default here leaves its env var unset. The script's `case` treats an
+// empty result as `*)` — a failure — so EVERY scenario in this file, including
+// "every lane succeeds", starts emitting a spurious lane-failure annotation.
+// That is exactly how the `vendor_claude_k8s` lane broke this suite.
+//
+// The workflow moved from an associative `declare -A lane_results` to two
+// PARALLEL indexed arrays (`lane_names` + `lane_results`) for portability, so
+// this now also asserts the two stay the same length and in the same order.
+// That pairing is load-bearing and silent when wrong: the script indexes
+// `lane_results[$i]` by `lane_names` position, so a single insertion into one
+// array shifts every later lane onto the wrong result and misreports which lane
+// failed — with no syntax error to catch it.
+test("every lane in the workflow's lane list is paired and has a test default", () => {
   const script = getVerifyLaneScript();
-  const mapBody = script.slice(
-    script.indexOf("declare -A lane_results=("),
-    script.indexOf(")", script.indexOf("declare -A lane_results=(")),
+  const readArray = (name) => {
+    const start = script.indexOf(`${name}=(`);
+    assert.notEqual(start, -1, `could not find ${name} in pr.yml`);
+    return script
+      .slice(start + `${name}=(`.length, script.indexOf(")", start))
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+  };
+
+  const laneNames = readArray("lane_names");
+  const laneResults = readArray("lane_results");
+  assert.ok(laneNames.length > 0, "could not parse lane_names out of pr.yml");
+  assert.equal(
+    laneNames.length,
+    laneResults.length,
+    `lane_names (${laneNames.length}) and lane_results (${laneResults.length}) must stay the ` +
+      `same length — the script pairs them by index, so a mismatch silently reports the wrong lane`,
   );
-  const referenced = [...mapBody.matchAll(/\[(\w+)\]="\$(\w+)"/g)];
-  assert.ok(referenced.length > 0, "could not parse the lane_results map out of pr.yml");
 
   const defaults = laneEnv({});
-  for (const [, lane, envVar] of referenced) {
+  for (const [i, lane] of laneNames.entries()) {
+    const envVar = laneResults[i].replace(/^"\$/, "").replace(/"$/, "");
+    assert.equal(
+      envVar,
+      `${lane.toUpperCase()}_RESULT`,
+      `lane_names[${i}] is '${lane}' but lane_results[${i}] reads $${envVar} — the arrays are ` +
+        `out of order, so this lane's outcome would be read from a different lane's result`,
+    );
     assert.ok(
       envVar in defaults,
       `lane '${lane}' reads $${envVar} in pr.yml but laneEnv() sets no default for it — ` +
@@ -94,6 +120,22 @@ test("verify step passes when every lane succeeds", () => {
   const result = runVerifyStep({});
   assert.equal(result.status, 0);
 });
+
+for (const [laneResult, annotation] of [
+  ["failure", "failure"],
+  ["skipped", "skipped"],
+  ["cancelled", "cancelled"],
+]) {
+  test(`verify step rejects an OpenCode Responses replay ${laneResult}`, () => {
+    const result = runVerifyStep({ opencode_responses_replay: laneResult });
+    assert.notEqual(result.status, 0);
+    assert.match(
+      result.stdout,
+      new RegExp(`::error title=verify: lane ${annotation}::`),
+    );
+    assert.match(result.stdout, /opencode_responses_replay/);
+  });
+}
 
 test("verify step exits non-zero and annotates a cancelled lane without asserting a specific cause", () => {
   const result = runVerifyStep({ general_tests: "cancelled" });
