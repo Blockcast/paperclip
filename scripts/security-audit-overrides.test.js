@@ -12,6 +12,31 @@ function assertIncludes(haystack, needle, label) {
   assert.ok(haystack.includes(needle), `${label} missing ${needle}`);
 }
 
+function compareVersions(left, right) {
+  for (let index = 0; index < 3; index += 1) {
+    const difference = left[index] - right[index];
+    if (difference !== 0) {
+      return difference;
+    }
+  }
+  return 0;
+}
+
+function isBetweenInclusive(version, minimum, maximum) {
+  return compareVersions(version, minimum) >= 0 && compareVersions(version, maximum) <= 0;
+}
+
+function isVulnerableBraceExpansionVersion(version) {
+  const [major, minor, patch] = version;
+  return (
+    compareVersions(version, [1, 1, 18]) < 0 ||
+    isBetweenInclusive(version, [2, 0, 0], [2, 1, 3]) ||
+    isBetweenInclusive(version, [3, 0, 0], [3, 0, 5]) ||
+    major === 4 ||
+    (major === 5 && minor === 0 && patch <= 8)
+  );
+}
+
 async function runPnpm(args, cwd, allowFailure = false) {
   try {
     return await execFileAsync("pnpm", args, {
@@ -48,8 +73,21 @@ async function main() {
       await readFile(join(fixtureRoot, "package.json"), "utf8"),
     );
     assert.equal(packageJson.pnpm.overrides["fast-uri"], "^3.1.5");
+    assert.equal(packageJson.pnpm.overrides["brace-expansion"], "5.0.9");
 
     const lockfile = await readFile(join(fixtureRoot, "pnpm-lock.yaml"), "utf8");
+    assertIncludes(lockfile, "brace-expansion@5.0.9:", "lockfile");
+    const vulnerableBraceExpansionVersions = Array.from(
+      lockfile.matchAll(/^  brace-expansion@(\d+)\.(\d+)\.(\d+)(?=[:(])/gm),
+      ([, major, minor, patch]) => [Number(major), Number(minor), Number(patch)],
+    )
+      .filter(isVulnerableBraceExpansionVersion)
+      .map((version) => version.join("."));
+    assert.deepEqual(
+      vulnerableBraceExpansionVersions,
+      [],
+      "lockfile must not resolve any vulnerable brace-expansion version",
+    );
     const fastUriResolution = lockfile.match(
       /^  fast-uri@(\d+)\.(\d+)\.(\d+):$/m,
     );
