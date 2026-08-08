@@ -160,7 +160,12 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
     expect(dockerAgentWorkflow).toContain("--tmpfs /paperclip:rw,nosuid,size=16m");
     expect(dockerAgentWorkflow).toContain("paperclip-browser-smoke");
     expect(dockerAgentWorkflow).toContain("AGENT_IMAGE: harbor.blockcast.net/paperclip-agent/paperclip-agent@${{ steps.build.outputs.digest }}");
-    expect(dockerAgentWorkflow).toContain("docker buildx imagetools create --tag \"$FLOATING_IMAGE\" \"$CANDIDATE_IMAGE\"");
+    expect(dockerAgentWorkflow).toContain(
+      'docker buildx imagetools create --tag "$FLOATING_IMAGE" "$CANDIDATE_IMAGE"',
+    );
+    expect(dockerAgentWorkflow).not.toContain("--prefer-index=false");
+    expect(dockerAgentWorkflow).toContain('grep -qF "$EXPECTED_DIGEST"');
+    expect(dockerAgentWorkflow).toContain("does not reference the verified image $EXPECTED_DIGEST");
 
     const metadataBlock = dockerAgentWorkflow.slice(
       dockerAgentWorkflow.indexOf("name: Docker meta"),
