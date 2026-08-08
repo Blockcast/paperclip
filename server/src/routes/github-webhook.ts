@@ -1176,12 +1176,21 @@ async function recordDependabotTerminalReceipt(
   }
 
   const externalKey = `${input.originId}:${input.alert.action}:${input.deliveryId ?? "no-delivery"}`;
-  const existingReceipt = await db
+  // BLO-19037: new receipts use the already-deployed partial unique index on
+  // system-comment issueId + idempotencyKey, making same-delivery inserts
+  // atomic across API replicas. Historical receipts predate that key and keep
+  // it null, so retain a narrowly-scoped legacy lookup before the keyed insert
+  // to avoid duplicating the first replay after deployment.
+  const legacyReceipt = await db
     .select({ id: issueComments.id })
     .from(issueComments)
     .where(
       and(
+        eq(issueComments.companyId, input.companyId),
         eq(issueComments.issueId, issue.id),
+        eq(issueComments.authorType, "system"),
+        isNull(issueComments.idempotencyKey),
+        isNull(issueComments.deletedAt),
         sql`${issueComments.metadata}->>'kind' = 'github_dependabot_terminal_receipt'`,
         sql`${issueComments.metadata}->>'externalKey' = ${externalKey}`,
       ),
@@ -1189,24 +1198,28 @@ async function recordDependabotTerminalReceipt(
     .limit(1)
     .then((rows) => rows[0] ?? null);
 
-  if (!existingReceipt) {
-    await db.insert(issueComments).values({
-      companyId: input.companyId,
-      issueId: issue.id,
-      authorType: "system",
-      body: receiptBody,
-      metadata: {
-        kind: "github_dependabot_terminal_receipt",
-        source: "github",
-        externalKey,
-        repoFullName: input.repoFullName,
-        alertNumber: input.alert.alertNumber,
-        action: input.alert.action,
-        deliveryId: input.deliveryId,
-        dismissalReason: input.alert.dismissalReason,
-        dismissalComment: input.alert.dismissalComment,
-      } as never,
-    });
+  if (!legacyReceipt) {
+    await db
+      .insert(issueComments)
+      .values({
+        companyId: input.companyId,
+        issueId: issue.id,
+        authorType: "system",
+        idempotencyKey: externalKey,
+        body: receiptBody,
+        metadata: {
+          kind: "github_dependabot_terminal_receipt",
+          source: "github",
+          externalKey,
+          repoFullName: input.repoFullName,
+          alertNumber: input.alert.alertNumber,
+          action: input.alert.action,
+          deliveryId: input.deliveryId,
+          dismissalReason: input.alert.dismissalReason,
+          dismissalComment: input.alert.dismissalComment,
+        } as never,
+      })
+      .onConflictDoNothing();
   }
 
   if (hasCompleteTerminalEvidence && issue.status !== "done") {
