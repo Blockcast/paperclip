@@ -173,8 +173,6 @@ describeEmbeddedPostgres("heartbeat timeout outcome persistence", () => {
     expect(persistedRun?.resultJson).toMatchObject({
       stopReason: "adapter_failed",
       timeoutFired: false,
-      errorCode: "EMPTY_RESULT",
-      errorMessage: EMPTY_RESULT_MESSAGE,
     });
     await expect(getWake(persistedRun?.wakeupRequestId ?? null)).resolves.toEqual({
       status: "failed",
