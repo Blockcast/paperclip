@@ -889,7 +889,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       .from(issues)
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
-    expect(issue?.executionRunId).toBe(scheduled.run.id);
+    expect(issue?.executionRunId).toBeNull();
   });
 
   it("does not retry the permanent claude_k8s agent-home workspace failure", () => {
@@ -1077,7 +1077,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
     expect(issue).toMatchObject({
-      executionRunId: scheduled.run.id,
+      executionRunId: null,
       executionWorkspaceId: null,
       executionWorkspacePreference: null,
       executionWorkspaceSettings: { mode: "isolated_workspace" },
@@ -1269,7 +1269,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
     expect(issue).toMatchObject({
-      executionRunId: scheduled.run.id,
+      executionRunId: null,
       executionWorkspaceId: foreignWorkspaceId,
       executionWorkspacePreference: "reuse_existing",
     });
@@ -1397,7 +1397,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
     expect(issue).toMatchObject({
-      executionRunId: scheduled.run.id,
+      executionRunId: null,
       executionWorkspaceId: currentWorkspaceId,
       executionWorkspacePreference: "reuse_existing",
     });
@@ -2212,10 +2212,15 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         delayMs: 1_000,
       });
       expect(staleLock).toMatchObject({
-        outcome: "not_scheduled",
-        errorCode: "issue_execution_lock_changed",
-        issueId: staleLockFixture.issueId,
+        outcome: "scheduled",
       });
+      if (staleLock.outcome !== "scheduled") return;
+      const staleLockIssue = await db
+        .select({ executionRunId: issues.executionRunId })
+        .from(issues)
+        .where(eq(issues.id, staleLockFixture.issueId))
+        .then((rows) => rows[0] ?? null);
+      expect(staleLockIssue?.executionRunId).toBeNull();
     },
   );
 

@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, gte, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, inArray, isNull, lt, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
@@ -113,6 +113,10 @@ export const DEFAULT_LIVENESS_REESCALATION_COOLDOWN_MS = 60 * 60 * 1000;
 // reset and is routinely days away; letting that horizon set the lock lifetime
 // took the issue out of service for the whole park, for its own assignee.
 export const STALE_PRE_CLAIM_ISSUE_LOCK_MS = 6 * 60 * 60 * 1000;
+export const ISSUE_ASSIGNMENT_RECOVERY_PER_AGENT_SWEEP_LIMIT = 5;
+const ASSIGNMENT_RECOVERY_CAPACITY_RESERVATION_STATUS = "assignment_recovery_capacity_reserved";
+// Enqueue normally finishes in seconds; an hour-old reservation has lost its owning process.
+const ASSIGNMENT_RECOVERY_CAPACITY_RESERVATION_TTL_MS = 60 * 60 * 1000;
 // Keep in sync with heartbeat.ts requiresIssueExecutionRetryLock(). These
 // retry kinds must retain issue.executionRunId through promotion: the promotion
 // path gates on the lock under FOR UPDATE, and the pre-start staleness check
@@ -1888,6 +1892,79 @@ export function recoveryService(
         source: "issue.assigned_todo_liveness_dispatch",
       }, "normal_model"),
     });
+  }
+
+  async function enqueueWithAssignmentRecoveryCapacity<T>(
+    issue: Pick<typeof issues.$inferSelect, "companyId">,
+    agentId: string,
+    enqueue: () => Promise<T | null | undefined>,
+  ): Promise<T | null> {
+    // Reserve under the cross-replica lock, then release the transaction's
+    // connection before enqueueWakeup acquires its own connection.
+    const reservationId = await db.transaction(async (tx) => {
+      await tx.execute(
+        sql`select pg_advisory_xact_lock(hashtextextended(${issue.companyId} || ':assignment_recovery:' || ${agentId}, 0))`,
+      );
+
+      await tx.delete(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, issue.companyId),
+        eq(agentWakeupRequests.agentId, agentId),
+        eq(agentWakeupRequests.status, ASSIGNMENT_RECOVERY_CAPACITY_RESERVATION_STATUS),
+        lt(agentWakeupRequests.updatedAt, new Date(Date.now() - ASSIGNMENT_RECOVERY_CAPACITY_RESERVATION_TTL_MS)),
+      ));
+
+      const liveAssignmentRecoveryRuns = await tx
+        .select({ count: sql<number>`count(*)::int` })
+        .from(heartbeatRuns)
+        .where(and(
+          eq(heartbeatRuns.companyId, issue.companyId),
+          eq(heartbeatRuns.agentId, agentId),
+          inArray(heartbeatRuns.status, ["queued", "scheduled_retry", "running"]),
+          or(
+            sql`${heartbeatRuns.contextSnapshot} ->> 'retryReason' = 'assignment_recovery'`,
+            sql`${heartbeatRuns.contextSnapshot} ->> 'source' = 'issue.assigned_todo_liveness_dispatch'`,
+          ),
+        ))
+        .then((rows) => Number(rows[0]?.count ?? 0));
+
+      const activeReservations = await tx
+        .select({ count: sql<number>`count(*)::int` })
+        .from(agentWakeupRequests)
+        .where(and(
+          eq(agentWakeupRequests.companyId, issue.companyId),
+          eq(agentWakeupRequests.agentId, agentId),
+          eq(agentWakeupRequests.status, ASSIGNMENT_RECOVERY_CAPACITY_RESERVATION_STATUS),
+        ))
+        .then((rows) => Number(rows[0]?.count ?? 0));
+
+      if (
+        liveAssignmentRecoveryRuns + activeReservations >=
+        ISSUE_ASSIGNMENT_RECOVERY_PER_AGENT_SWEEP_LIMIT
+      ) {
+        return null;
+      }
+
+      return tx
+        .insert(agentWakeupRequests)
+        .values({
+          companyId: issue.companyId,
+          agentId,
+          source: "automation",
+          triggerDetail: "system",
+          reason: "issue_assignment_recovery_capacity_reservation",
+          status: ASSIGNMENT_RECOVERY_CAPACITY_RESERVATION_STATUS,
+        })
+        .returning({ id: agentWakeupRequests.id })
+        .then((rows) => rows[0]?.id ?? null);
+    });
+
+    if (!reservationId) return null;
+
+    try {
+      return await enqueue() ?? null;
+    } finally {
+      await db.delete(agentWakeupRequests).where(eq(agentWakeupRequests.id, reservationId));
+    }
   }
 
   async function isInvocationBudgetBlocked(issue: typeof issues.$inferSelect, agentId: string) {
@@ -5637,9 +5714,16 @@ export function recoveryService(
             sql`${issues.assigneeAgentId} is not null`,
             eq(issues.status, "in_review"),
           ),
+          sql`not exists (
+            select 1
+            from ${heartbeatRuns} live_execution_run
+            where live_execution_run.id = ${issues.executionRunId}
+              and live_execution_run.status in ('queued', 'running', 'scheduled_retry')
+          )`,
           opts?.issueCreatedAtGte ? gte(issues.createdAt, opts.issueCreatedAtGte) : undefined,
         ),
-      );
+      )
+      .orderBy(asc(issues.companyId), asc(issues.assigneeAgentId), asc(issues.createdAt), asc(issues.id));
 
     const result = {
       assignmentDispatched: 0,
@@ -5660,7 +5744,6 @@ export function recoveryService(
       skipped: 0,
       issueIds: [] as string[],
     };
-
     for (const issue of candidates) {
       const executionState = issue.status === "in_review"
         ? parseIssueExecutionState(issue.executionState)
@@ -6086,7 +6169,9 @@ export function recoveryService(
             continue;
           }
 
-          const queued = await enqueueInitialAssignedTodoDispatch(issue, agentId);
+          const queued = await enqueueWithAssignmentRecoveryCapacity(issue, agentId, () =>
+            enqueueInitialAssignedTodoDispatch(issue, agentId)
+          );
           if (queued) {
             result.assignmentDispatched += 1;
             result.issueIds.push(issue.id);
@@ -6187,14 +6272,16 @@ export function recoveryService(
           continue;
         }
 
-        const queued = await enqueueStrandedIssueRecovery({
-          issueId: issue.id,
-          agentId,
-          reason: "issue_assignment_recovery",
-          retryReason: "assignment_recovery",
-          source: "issue.assignment_recovery",
-          retryOfRunId: latestRun.id,
-        });
+        const queued = await enqueueWithAssignmentRecoveryCapacity(issue, agentId, () =>
+          enqueueStrandedIssueRecovery({
+            issueId: issue.id,
+            agentId,
+            reason: "issue_assignment_recovery",
+            retryReason: "assignment_recovery",
+            source: "issue.assignment_recovery",
+            retryOfRunId: latestRun.id,
+          })
+        );
         if (queued) {
           result.dispatchRequeued += 1;
           result.issueIds.push(issue.id);
@@ -8049,20 +8136,10 @@ export function recoveryService(
       return TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status);
     };
 
-    // BLO-18995: a lock can also be held by a run that never started. Four
-    // enqueue paths stamp executionRunId/executionLockedAt at *enqueue* time
-    // alongside a freshly-inserted `queued` run (enqueueMissingIssueCommentRetry,
-    // enqueueProcessLossRetry, and the two recovery-wake inserts), rather than
-    // lazily at claim time the way claimQueuedRun does. `queued` is neither
-    // missing nor terminal, so isCleanable() above returns false forever and
-    // this sweeper — the designated backstop — never clears it. Meanwhile
-    // enqueueWakeup parks every subsequent wake for that issue as
-    // `deferred_issue_execution` behind the apparent live holder, and those
-    // deferred wakes are only promoted by releaseIssueExecutionAndPromote when
-    // the holding run finishes. A run that is never claimed therefore strands
-    // them indefinitely, with no timeout anywhere in the path. Observed in
-    // production: BLO-18939 held executionLockedAt for a run still `queued`
-    // with startedAt null.
+    // BLO-18995: older deployments stamped executionRunId/executionLockedAt at
+    // enqueue time. Keep cleaning those persisted pre-claim locks after the
+    // writer paths move to claim-time locking; otherwise an upgraded instance
+    // can retain a queued lock indefinitely.
     //
     // Bound it: once a pre-claim lock has been held longer than
     // STALE_PRE_CLAIM_ISSUE_LOCK_MS, treat it as cleanable. Clearing is safe
@@ -8572,16 +8649,6 @@ export function recoveryService(
             skippedDeferredWakeIds.push(deferred.id);
             continue;
           }
-
-          await tx
-            .update(issues)
-            .set({
-              executionRunId: newRun.id,
-              executionAgentNameKey: normalizeAgentNameKey(deferredAgent.name),
-              executionLockedAt: now,
-              updatedAt: now,
-            })
-            .where(and(eq(issues.id, updated.id), eq(issues.assigneeAgentId, deferredAgent.id)));
 
           return {
             updated,
