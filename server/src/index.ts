@@ -84,6 +84,7 @@ import { BUNDLED_PLUGIN_PACKAGES } from "./bootstrap/bundled-plugin-packages.js"
 import { initTelemetry, getTelemetryClient } from "./telemetry.js";
 import { conflict } from "./errors.js";
 import { githubReviewerAppSlug } from "./services/github-app-auth.js";
+import { reconcileContendedPrReviewerWakes } from "./routes/github-webhook.js";
 import { coordinateHeartbeatSchedulerShutdown } from "./shutdown.js";
 import type {
   InstanceDatabaseBackupRunResult,
@@ -1458,6 +1459,28 @@ export async function startServer(): Promise<StartedServer> {
                 logger.warn(
                   { ...failedWakeDispatches },
                   "periodic failed-wake-dispatch reconciliation retried durable wake failures (BLO-14395)",
+                );
+              }
+            })
+            .then(async () => {
+              // BLO-21995: replay PR-reviewer wakes that lost their PR-scope
+              // advisory lock at webhook time. GitHub never redelivers a 200,
+              // so this pass is the only path back for a sanctioned review
+              // request that lost that race.
+              const contendedReviewerWakes = await reconcileContendedPrReviewerWakes(db as any, {
+                webhookSecret: config.githubWebhookSecret || null,
+                pluginWorkerManager,
+                heartbeatOptions: { paperclipNodeRole: config.paperclipNodeRole },
+                prReviewerAgentIds: config.githubPrReviewerAgentIds,
+                prReviewerBotLogin: config.prReviewerBotLogin || null,
+              });
+              if (
+                contendedReviewerWakes.recovered > 0 ||
+                contendedReviewerWakes.exhausted > 0
+              ) {
+                logger.warn(
+                  { ...contendedReviewerWakes },
+                  "periodic contended PR-reviewer wake reconciliation replayed lock-contended review requests (BLO-21995)",
                 );
               }
             })
