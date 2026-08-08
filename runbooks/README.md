@@ -28,6 +28,10 @@ platform cannot resolve automatically. Each runbook should be:
   confirmed alive. Trigger: `k8s_guard_decision` log line with
   `reason: "live_job_for_active_run"`, or
   `claude_k8s_concurrent_run_blocked_total{reason="live_job_for_active_run"}`.
+- [`queued-run-stranded.md`](queued-run-stranded.md) — a heartbeat run accepted
+  for dispatch is still `queued` after 24 minutes. Trigger: alert
+  `PaperclipQueuedRunStranded` —
+  `max(paperclip_queued_run_oldest_age_seconds) by (agent_id) > 1440` for 5m.
 - [`merge-queue-stalled-head.md`](merge-queue-stalled-head.md) — when to
   manually dequeue a head-of-queue PR whose `merge_group` check is stuck
   (not failing) and is silently freezing the `master` merge queue. Trigger:

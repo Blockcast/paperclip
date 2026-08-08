@@ -31,6 +31,7 @@ import {
   KNOWN_PROCESS_LOSS_CLASSIFICATIONS,
   PROCESS_LOST_LIVENESS_NULL_METRIC,
   PROCESS_LOST_TOTAL_METRIC,
+  QUEUED_RUN_OLDEST_AGE_METRIC,
   UNKNOWN_EXTERNAL_ADAPTER,
   UNKNOWN_PROCESS_LOSS_CLASSIFICATION,
   UNKNOWN_PROCESS_LOST_BUCKET,
@@ -40,6 +41,7 @@ import {
   recordProcessLost,
   recordProcessLostLivenessNull,
   setExternalLifecycleRunningRuns,
+  setQueuedRunOldestAgeMetrics,
 } from "../services/metrics.js";
 import {
   getDepBlockedMetric,
@@ -605,6 +607,40 @@ describe("setExternalLifecycleRunningRuns (BLO-16184 denominator #1)", () => {
     setExternalLifecycleRunningRuns({ claude_k8s: 1, some_future_k8s: 3, another: 4 });
     const { body } = await renderMetrics();
     expect(body).toContain(`${EXTERNAL_LIFECYCLE_RUNNING_RUNS_METRIC}{adapter="other"} 7`);
+  });
+});
+
+describe("setQueuedRunOldestAgeMetrics (BLO-21116)", () => {
+  it("writes an explicit zero after a known agent's queue drains", async () => {
+    const agentA = "11111111-1111-1111-1111-111111111111";
+    const agentB = "22222222-2222-2222-2222-222222222222";
+    const knownAgentIds = new Set([agentA, agentB]);
+
+    setQueuedRunOldestAgeMetrics([{ agentId: agentA, ageSeconds: 54_000 }], knownAgentIds);
+    let body = (await renderMetrics()).body;
+    expect(body).toContain(`${QUEUED_RUN_OLDEST_AGE_METRIC}{agent_id="${agentA}"} 54000`);
+    expect(body).toContain(`${QUEUED_RUN_OLDEST_AGE_METRIC}{agent_id="${agentB}"} 0`);
+
+    setQueuedRunOldestAgeMetrics([], knownAgentIds);
+    body = (await renderMetrics()).body;
+    expect(body).toContain(`${QUEUED_RUN_OLDEST_AGE_METRIC}{agent_id="${agentA}"} 0`);
+    expect(body).not.toContain(`${QUEUED_RUN_OLDEST_AGE_METRIC}{agent_id="${agentA}"} 54000`);
+  });
+
+  it("uses the oldest value per agent and bounds unknown labels", async () => {
+    const agentA = "33333333-3333-3333-3333-333333333333";
+    setQueuedRunOldestAgeMetrics(
+      [
+        { agentId: agentA, ageSeconds: 120 },
+        { agentId: agentA, ageSeconds: 9_000 },
+        { agentId: "not-a-known-agent", ageSeconds: 4_500 },
+      ],
+      new Set([agentA]),
+    );
+
+    const { body } = await renderMetrics();
+    expect(body).toContain(`${QUEUED_RUN_OLDEST_AGE_METRIC}{agent_id="${agentA}"} 9000`);
+    expect(body).toContain(`${QUEUED_RUN_OLDEST_AGE_METRIC}{agent_id="${UNKNOWN_AGENT_ID}"} 4500`);
   });
 });
 

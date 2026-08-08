@@ -762,11 +762,12 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect(duePromotion).toEqual({ promoted: 1, runIds: [scheduled.run.id] });
 
     const promotedRun = await db
-      .select({ status: heartbeatRuns.status })
+      .select({ status: heartbeatRuns.status, queuedAt: heartbeatRuns.queuedAt })
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, scheduled.run.id))
       .then((rows) => rows[0] ?? null);
     expect(promotedRun?.status).toBe("queued");
+    expect(promotedRun?.queuedAt?.toISOString()).toBe(expectedDueAt.toISOString());
   });
 
   it("treats idempotent GitHub PR-review adapter failures as retry-eligible", () => {

@@ -13729,6 +13729,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           status: "queued",
           error: null,
           errorCode: null,
+          queuedAt: now,
           updatedAt: now,
         })
         .where(
@@ -19919,6 +19920,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         processGroupId: null,
         processStartedAt: null,
         contextSnapshot: context,
+        queuedAt: now,
         updatedAt: now,
       })
       .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "running")))

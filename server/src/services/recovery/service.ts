@@ -909,6 +909,10 @@ const PROVIDER_QUOTA_ERROR_RE =
   /(?:you(?:'|’)ve hit your usage limit|usage limit(?: reached| exceeded)?|provider quota|quota (?:limit )?exceeded|model (?:is )?at capacity)/i;
 const CONFIGURATION_INCOMPLETE_ERROR_RE =
   /(?:model_not_found|model [^\n]{0,120} not found|missing (?:api )?(?:key|credentials?)|credentials? (?:are |is )?missing|no (?:api )?(?:key|credentials?) (?:was |were )?(?:found|configured|provided)|api key (?:is )?(?:not set|unavailable))/i;
+// A malformed adapter response is transport data, not configuration or quota
+// evidence. Its raw text can contain arbitrary provider-shaped phrases.
+const ADAPTER_RESPONSE_PARSE_FAILURE_RE =
+  /(?:json\s+(?:parsing|parse)\s+failed|failed\s+to\s+parse\s+json)/i;
 
 export type AdapterFailureRecoveryClassification =
   | { kind: "provider_quota"; retryAt: Date; parsedResetTime: boolean }
@@ -995,7 +999,14 @@ export function classifyAdapterFailureForRecovery(
     return null;
   }
   const resultJson = parseObject(latestRun.resultJson);
-  const error = [latestRun.errorCode ?? "", latestRun.error ?? "", JSON.stringify(resultJson)].join("\n");
+  const rawError = latestRun.error ?? "";
+  if (
+    latestRun.errorCode === "adapter_failed"
+    && ADAPTER_RESPONSE_PARSE_FAILURE_RE.test(rawError)
+  ) {
+    return null;
+  }
+  const error = [latestRun.errorCode ?? "", rawError, JSON.stringify(resultJson)].join("\n");
   if (latestRun.errorCode === "configuration_incomplete" || CONFIGURATION_INCOMPLETE_ERROR_RE.test(error)) {
     return { kind: "configuration_incomplete" };
   }

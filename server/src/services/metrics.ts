@@ -70,6 +70,7 @@ export const AGENT_NO_USAGE_STREAK_METRIC = "paperclip_agent_zero_token_complete
 export const EXTERNAL_RUNTIME_RESERVATION_EVENTS_METRIC = "paperclip_external_runtime_reservation_events_total";
 export const EXTERNAL_RUNTIME_RESERVATIONS_ACTIVE_METRIC = "paperclip_external_runtime_reservations_active";
 export const EXTERNAL_RUNTIME_RESERVATION_OLDEST_AGE_METRIC = "paperclip_external_runtime_reservation_oldest_age_seconds";
+export const QUEUED_RUN_OLDEST_AGE_METRIC = "paperclip_queued_run_oldest_age_seconds";
 /**
  * process_lost reap counter (BLO-16184, parent BLO-12292). Incremented once at
  * the reaper's `process_lost` mint, labeled by bounded `adapter`
@@ -755,6 +756,7 @@ let githubReviewRequestSuppression: Counter<"cause" | "reason"> | null = null;
 let githubReviewRequestDeadLetterUnresolved: Gauge<"reason"> | null = null;
 let agentWakeupTerminalFailedUnresolved: Gauge<"error_code" | "scope"> | null = null;
 let agentWakeupTerminalFailedOldestAge: Gauge<"scope"> | null = null;
+let queuedRunOldestAge: Gauge<"agent_id"> | null = null;
 let authRequest: Counter<"operation" | "outcome"> | null = null;
 
 function ensureRegistry(): {
@@ -776,6 +778,7 @@ function ensureRegistry(): {
   githubReviewRequestDeadLetterUnresolvedGauge: Gauge<"reason">;
   agentWakeupTerminalFailedUnresolvedGauge: Gauge<"error_code" | "scope">;
   agentWakeupTerminalFailedOldestAgeGauge: Gauge<"scope">;
+  queuedRunOldestAgeGauge: Gauge<"agent_id">;
   authRequestCounter: Counter<"operation" | "outcome">;
 } {
   if (
@@ -797,6 +800,7 @@ function ensureRegistry(): {
     || !githubReviewRequestDeadLetterUnresolved
     || !agentWakeupTerminalFailedUnresolved
     || !agentWakeupTerminalFailedOldestAge
+    || !queuedRunOldestAge
     || !authRequest
   ) {
     registry = new Registry();
@@ -1046,6 +1050,15 @@ function ensureRegistry(): {
     for (const scope of TERMINAL_FAILED_WAKE_SCOPES) {
       agentWakeupTerminalFailedOldestAge.set({ scope }, 0);
     }
+    queuedRunOldestAge = new Gauge({
+      name: QUEUED_RUN_OLDEST_AGE_METRIC,
+      help:
+        "Age in seconds of the oldest queued heartbeat run for each agent. "
+        + "Refreshed from durable queue-entry timestamps on every metrics scrape; "
+        + "a failed refresh clears samples rather than exporting stale values.",
+      labelNames: ["agent_id"],
+      registers: [registry],
+    });
     authRequest = new Counter({
       name: AUTH_REQUEST_METRIC,
       help:
@@ -1082,6 +1095,7 @@ function ensureRegistry(): {
     githubReviewRequestDeadLetterUnresolvedGauge: githubReviewRequestDeadLetterUnresolved,
     agentWakeupTerminalFailedUnresolvedGauge: agentWakeupTerminalFailedUnresolved,
     agentWakeupTerminalFailedOldestAgeGauge: agentWakeupTerminalFailedOldestAge,
+    queuedRunOldestAgeGauge: queuedRunOldestAge,
     authRequestCounter: authRequest,
   };
 }
@@ -1464,6 +1478,36 @@ export function setAgentWakeupTerminalFailedOldestAgeSeconds(
   }
 }
 
+/**
+ * Publish the oldest queued-run age per agent from a complete database
+ * snapshot. Known agents without queued work explicitly receive zero so a
+ * successful refresh resolves a previous alert instead of leaving it stale.
+ */
+export function setQueuedRunOldestAgeMetrics(
+  entries: ReadonlyArray<{ agentId: string | null | undefined; ageSeconds: number }>,
+  knownAgentIds: ReadonlySet<string>,
+): void {
+  const gauge = ensureRegistry().queuedRunOldestAgeGauge;
+  gauge.reset();
+  const oldestByAgentId = new Map<string, number>();
+  for (const entry of entries) {
+    const agentId = normalizeAgentId(entry.agentId, knownAgentIds);
+    const ageSeconds = Number.isFinite(entry.ageSeconds) ? Math.max(0, entry.ageSeconds) : 0;
+    const previous = oldestByAgentId.get(agentId);
+    if (previous === undefined || ageSeconds > previous) oldestByAgentId.set(agentId, ageSeconds);
+  }
+  for (const agentId of knownAgentIds) {
+    gauge.set({ agent_id: agentId }, oldestByAgentId.get(agentId) ?? 0);
+  }
+  const unknownAge = oldestByAgentId.get(UNKNOWN_AGENT_ID);
+  if (unknownAge !== undefined) gauge.set({ agent_id: UNKNOWN_AGENT_ID }, unknownAge);
+}
+
+/** Remove queued-run samples after a failed refresh so Prometheus never sees stale state as live data. */
+export function invalidateQueuedRunOldestAgeMetrics(): void {
+  ensureRegistry().queuedRunOldestAgeGauge.reset();
+}
+
 export function recordAuthRequest(input: {
   operation: string | null | undefined;
   outcome: string | null | undefined;
@@ -1520,6 +1564,7 @@ export function __resetMetricsForTest(): void {
   githubReviewRequestDeadLetterUnresolved = null;
   agentWakeupTerminalFailedUnresolved = null;
   agentWakeupTerminalFailedOldestAge = null;
+  queuedRunOldestAge = null;
   authRequest = null;
   resetDepBlockedMetrics();
   resetBlockerResolvedWakeMetrics();

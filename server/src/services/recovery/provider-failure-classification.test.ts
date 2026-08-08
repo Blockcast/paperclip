@@ -92,4 +92,28 @@ describe("classifyAdapterFailureForRecovery", () => {
       resultJson: null,
     })).toBeNull();
   });
+
+  it("does not classify a JSON response-parse failure from config-like payload text", () => {
+    expect(classifyAdapterFailureForRecovery({
+      errorCode: "adapter_failed",
+      error: 'JSON parsing failed: Text: {"response":{"missing api key" ...',
+      resultJson: { raw: "truncated response that mentions model xyz not found" },
+    })).toBeNull();
+  });
+
+  it("does not classify a JSON response-parse failure from quota-like payload text", () => {
+    expect(classifyAdapterFailureForRecovery({
+      errorCode: "adapter_failed",
+      error: 'failed to parse JSON: {"response":{"error":"quota exceeded" ...',
+      resultJson: null,
+    })).toBeNull();
+  });
+
+  it("still classifies a genuine configuration failure alongside unrelated result data", () => {
+    expect(classifyAdapterFailureForRecovery({
+      errorCode: "adapter_failed",
+      error: "No API credentials were found for this provider",
+      resultJson: { detail: "unrelated diagnostic payload" },
+    })).toEqual({ kind: "configuration_incomplete" });
+  });
 });

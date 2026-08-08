@@ -306,3 +306,43 @@ test("PaperclipPrReviewWakeTerminalFailed is pr_review-scoped, gauge-keyed, and 
     "terminal-failed alert must link the runbook from its annotation",
   );
 });
+
+test("PaperclipQueuedRunStranded uses per-agent queue-entry age and fires before 30 minutes (BLO-21116)", () => {
+  const rendered = renderChart([
+    "--show-only",
+    "templates/prometheusrule.yaml",
+    "--set",
+    "prometheusRule.enabled=true",
+  ]);
+
+  assert.match(rendered, /alert: PaperclipQueuedRunStranded/);
+  const [, expression] = rendered.match(
+    /alert: PaperclipQueuedRunStranded[\s\S]*?\n\s+expr: (.+)\n/,
+  ) ?? [];
+  assert.ok(expression, "queued-run stranded alert must render an expression");
+  assert.match(
+    expression,
+    /^max\(paperclip_queued_run_oldest_age_seconds\) by \(agent_id\) > \d+$/,
+    "the alert must threshold the per-agent queue-age gauge, not a count",
+  );
+
+  const [, threshold] = expression.match(/> (\d+)$/) ?? [];
+  const [, hold] = rendered.match(
+    /alert: PaperclipQueuedRunStranded[\s\S]*?\n\s+for: (\d+)m\n/,
+  ) ?? [];
+  assert.ok(threshold && hold, "queued-run stranded alert must have numeric age and hold values");
+  assert.ok(
+    Number(threshold) + Number(hold) * 60 <= 1_800,
+    "age threshold plus alert hold must fire before 30 minutes of real queue wait",
+  );
+  assert.match(
+    rendered,
+    /coalesce\(queued_at, created_at\).*order by coalesce\(queued_at, created_at\) asc/,
+    "the responder query must use the same queue-entry timestamp as the gauge",
+  );
+  assert.match(
+    rendered,
+    /alert: PaperclipQueuedRunStranded[\s\S]*?runbook_url: "[^"]*runbooks\/queued-run-stranded\.md"/,
+    "queued-run stranded alert must link the operational runbook",
+  );
+});

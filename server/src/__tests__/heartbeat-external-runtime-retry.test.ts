@@ -456,6 +456,8 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
     expect(contender.status).toBe("queued");
     expect(contender.error).toBeNull();
     expect(contender.errorCode).toBeNull();
+    expect(contender.queuedAt).not.toBeNull();
+    expect(contender.queuedAt!.getTime()).toBeGreaterThanOrEqual(contender.createdAt.getTime());
     expect(contender.contextSnapshot).toMatchObject({
       paperclipK8sIsolationRetryAttempt: 1,
     });

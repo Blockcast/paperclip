@@ -55,6 +55,9 @@ export const heartbeatRuns = pgTable(
     continuationAttempt: integer("continuation_attempt").notNull().default(0),
     lastUsefulActionAt: timestamp("last_useful_action_at", { withTimezone: true }),
     nextAction: text("next_action"),
+    // Fresh queued rows age from createdAt. Re-queued rows stamp this field so
+    // queue-wait observability does not include their earlier lifecycle time.
+    queuedAt: timestamp("queued_at", { withTimezone: true }),
     contextSnapshot: jsonb("context_snapshot").$type<Record<string, unknown>>(),
     // Generated stored columns mirroring the hot context_snapshot keys.
     // See migration 0079. Populated automatically by Postgres on insert /

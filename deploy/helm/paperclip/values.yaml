@@ -464,6 +464,12 @@ prometheusRule:
   wakeTerminalFailedFor: 5m
   # -- Runbook for the terminal-failed wake alert, linked from its annotation.
   wakeTerminalFailedRunbookUrl: "https://github.com/Blockcast/paperclip/blob/master/runbooks/agent-wakeup-terminal-failed.md"
+  # -- Queue-entry age at which an undispatched heartbeat run becomes actionable (BLO-21116). 24m plus the 5m hold below fires before 30m of actual queue wait.
+  queuedRunStrandedAgeSeconds: 1440
+  # -- Scrape-flap tolerance only; queue age is measured by the server-side gauge above.
+  queuedRunStrandedFor: 5m
+  # -- Runbook for the queued-run stranded alert, linked from its annotation.
+  queuedRunStrandedRunbookUrl: "https://github.com/Blockcast/paperclip/blob/master/runbooks/queued-run-stranded.md"
   # -- Prometheus regex of suppression causes that mean an outage rather than a deliberate decline (BLO-18859). Expected policy declines (company.inactive, heartbeat.cooldown.active, heartbeat.disabled, heartbeat.wakeOnDemand.disabled, budget.blocked, agent.not_invokable, heartbeat.worktree_execution_cutoff, issue_tree_hold_active) are excluded so they never page. `other` is included: it is the bucket for a skip reason missing from KNOWN_GITHUB_SUPPRESSION_CAUSES, and an untriaged cause is not a known-good decline.
   githubDeliverySuppressionOutageCauses: "heartbeat.scheduling_suppressed|dispatch_rejected|other"
   # -- Additional PrometheusRule groups appended verbatim.
