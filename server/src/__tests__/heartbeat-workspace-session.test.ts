@@ -61,6 +61,7 @@ import {
   type ResolvedWorkspaceForRunSuccess,
 } from "../services/heartbeat.js";
 import { applyRunScopeToBranchName } from "../services/workspace-runtime.js";
+import { executionWorkspaceUsesPerRunScope } from "../services/execution-workspace-policy.js";
 import type { TrustPresetResolution } from "../services/trust-preset-resolver.js";
 
 const execFile = promisify(execFileCallback);
@@ -4086,15 +4087,34 @@ describe("parseSessionCompactionPolicy", () => {
 // later run of that issue silently landed back in the first run's tree while the
 // config still read as per-run isolation.
 describe("BLO-19063 per_run scope refuses workspace restore", () => {
-  const perRunSettings = { mode: "isolated_workspace", workspaceStrategy: { type: "git_worktree", runScope: "per_run" } };
-  const perIssueSettings = { mode: "isolated_workspace", workspaceStrategy: { type: "git_worktree", runScope: "per_issue" } };
+  const perRunStrategy = { type: "git_worktree" as const, runScope: "per_run" as const };
+  const perIssueStrategy = { type: "git_worktree" as const, runScope: "per_issue" as const };
+  const perRunSettings = { mode: "isolated_workspace" as const, workspaceStrategy: perRunStrategy };
+  const perIssueSettings = { mode: "isolated_workspace" as const, workspaceStrategy: perIssueStrategy };
+
+  // `runScope` can be set on any of three layers, so the guard is driven by the
+  // resolved answer rather than by the issue row. This helper resolves it the
+  // same way heartbeat does.
+  const usesPerRunScope = (input: {
+    issueSettings?: Parameters<typeof executionWorkspaceUsesPerRunScope>[0]["issueSettings"];
+    projectPolicy?: Parameters<typeof executionWorkspaceUsesPerRunScope>[0]["projectPolicy"];
+    agentConfig?: Record<string, unknown>;
+    mode?: Parameters<typeof executionWorkspaceUsesPerRunScope>[0]["mode"];
+  }) =>
+    executionWorkspaceUsesPerRunScope({
+      agentConfig: input.agentConfig ?? {},
+      projectPolicy: input.projectPolicy ?? null,
+      issueSettings: input.issueSettings ?? null,
+      mode: input.mode ?? "isolated_workspace",
+      legacyUseProjectWorkspace: null,
+    });
 
   it("refuses to restore a per_run workspace even when the issue is already pinned to reuse_existing", () => {
     const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({
       issueExecutionWorkspaceId: "workspace-run-1",
       issueExecutionWorkspacePreference: "reuse_existing",
       existingExecutionWorkspaceStatus: "active",
-      issueExecutionWorkspaceSettings: perRunSettings,
+      usesPerRunScope: usesPerRunScope({ issueSettings: perRunSettings }),
     });
 
     // The whole point: a live, healthy, pinned workspace is still refused, so
@@ -4105,10 +4125,51 @@ describe("BLO-19063 per_run scope refuses workspace restore", () => {
     expect(reuseRequest.existingExecutionWorkspaceAvailable).toBe(false);
   });
 
+  // The guard originally read the issue row only. Project policy and the agent's
+  // adapterConfig are the two most natural ways to turn per-run isolation on for
+  // more than one issue, and nothing copies a strategy from either onto the issue
+  // row — `defaultIssueExecutionWorkspaceSettingsForProject` emits `mode` alone.
+  // So an issue-only guard would have restored in exactly the fleet-wide cases
+  // per_run exists for.
+  it.each([
+    {
+      name: "project policy",
+      input: { projectPolicy: { enabled: true, defaultMode: "isolated_workspace", workspaceStrategy: perRunStrategy } },
+    },
+    {
+      name: "agent adapterConfig",
+      input: { agentConfig: { workspaceStrategy: perRunStrategy }, issueSettings: { mode: "isolated_workspace" } },
+    },
+  ] as const)("refuses to restore when per_run comes from $name rather than the issue row", ({ input }) => {
+    expect(usesPerRunScope(input)).toBe(true);
+
+    const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({
+      issueExecutionWorkspaceId: "workspace-old",
+      issueExecutionWorkspacePreference: "reuse_existing",
+      existingExecutionWorkspaceStatus: "active",
+      usesPerRunScope: usesPerRunScope(input),
+    });
+
+    expect(reuseRequest.requestedShouldReuseExisting).toBe(false);
+    expect(reuseRequest.existingExecutionWorkspaceAvailable).toBe(false);
+  });
+
+  it("lets issue settings override an agent-level per_run default, matching realization's precedence", () => {
+    // Precedence is issue -> project -> agent, whole-object, so an issue strategy
+    // without runScope shadows an agent one that has it. The guard must agree
+    // with what realizeExecutionWorkspace will actually do, not be more eager.
+    expect(
+      usesPerRunScope({
+        agentConfig: { workspaceStrategy: perRunStrategy },
+        issueSettings: perIssueSettings,
+      }),
+    ).toBe(false);
+  });
+
   it.each([
     { name: "per_issue scope", settings: perIssueSettings },
     { name: "no workspace settings", settings: null },
-    { name: "settings without a strategy", settings: { mode: "isolated_workspace" } },
+    { name: "settings without a strategy", settings: { mode: "isolated_workspace" as const } },
   ])("still restores under $name, so shared_workspace stays default-safe", ({ settings }) => {
     // AC4: this must not become a forced fleet-wide migration. Anything that did
     // not explicitly opt into per_run keeps the pre-existing restore behaviour.
@@ -4116,11 +4177,33 @@ describe("BLO-19063 per_run scope refuses workspace restore", () => {
       issueExecutionWorkspaceId: "workspace-old",
       issueExecutionWorkspacePreference: "reuse_existing",
       existingExecutionWorkspaceStatus: "active",
-      issueExecutionWorkspaceSettings: settings,
+      usesPerRunScope: usesPerRunScope({ issueSettings: settings }),
     });
 
     expect(reuseRequest.requestedShouldReuseExisting).toBe(true);
     expect(reuseRequest.existingExecutionWorkspaceAvailable).toBe(true);
+  });
+
+  it("still restores a shared_workspace issue whose agent happens to carry a per_run strategy", () => {
+    // AC4 again, and the regression the mode gate exists to prevent: per_run is
+    // meaningless outside isolated_workspace, and buildExecutionWorkspaceAdapterConfig
+    // drops workspaceStrategy there. A guard that ignored mode would strand every
+    // shared_workspace issue under such an agent on a fresh workspace per run.
+    const input = {
+      agentConfig: { workspaceStrategy: perRunStrategy },
+      issueSettings: { mode: "shared_workspace" as const },
+      mode: "shared_workspace" as const,
+    };
+    expect(usesPerRunScope(input)).toBe(false);
+
+    const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({
+      issueExecutionWorkspaceId: "workspace-old",
+      issueExecutionWorkspacePreference: "reuse_existing",
+      existingExecutionWorkspaceStatus: "active",
+      usesPerRunScope: usesPerRunScope(input),
+    });
+
+    expect(reuseRequest.requestedShouldReuseExisting).toBe(true);
   });
 
   it("gives two runs of the SAME issue distinct, non-nested branches once restore is refused", () => {
