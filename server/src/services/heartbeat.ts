@@ -208,8 +208,10 @@ import { toolAccessService } from "./tool-access.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { ISSUE_BLOCKERS_RESOLVED_WAKE_REASON } from "./issue-dependency-wakeups.js";
 import {
+  DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS,
   buildIssueMonitorClearedPatch,
   buildIssueMonitorTriggeredPatch,
+  exhaustedMonitorClearReason,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
 } from "./issue-execution-policy.js";
@@ -10041,28 +10043,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     monitorScheduledBy: string | null;
   }
 
-  function parseMonitorDate(value: string | null | undefined) {
-    if (!value) return null;
-    const date = new Date(value);
-    return Number.isNaN(date.getTime()) ? null : date;
-  }
-
-  function issueMonitorLimitClearReason(input: {
-    monitor: IssueExecutionMonitorPolicy | null;
-    nextAttemptCount: number;
-    now: Date;
-  }): IssueExecutionMonitorClearReason | null {
-    const timeoutAt = parseMonitorDate(input.monitor?.timeoutAt ?? null);
-    if (timeoutAt && input.now.getTime() >= timeoutAt.getTime()) {
-      return "timeout_exceeded";
-    }
-    const maxAttempts = input.monitor?.maxAttempts ?? null;
-    if (maxAttempts !== null && input.nextAttemptCount > maxAttempts) {
-      return "max_attempts_exhausted";
-    }
-    return null;
-  }
-
   function monitorRecoveryPolicy(
     monitor: IssueExecutionMonitorPolicy | null,
   ): IssueExecutionMonitorRecoveryPolicy {
@@ -10375,10 +10355,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     const scheduledAtIso = claimed.monitorNextCheckAt.toISOString();
-    const nextAttemptCount = (claimed.monitorAttemptCount ?? 0) + 1;
+    const priorAttemptCount = claimed.monitorAttemptCount ?? 0;
+    const nextAttemptCount = priorAttemptCount + 1;
     const policy = normalizeIssueExecutionPolicy(claimed.executionPolicy ?? null);
     const monitor = policy?.monitor ?? null;
-    const clearReason = issueMonitorLimitClearReason({ monitor, nextAttemptCount, now: input.now });
+    const clearReason = exhaustedMonitorClearReason({
+      monitor,
+      attemptCount: priorAttemptCount,
+      now: input.now,
+      defaultMaxAttempts: DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS,
+    });
     const recoveryPolicy = monitorRecoveryPolicy(monitor);
     const monitorMetadata = {
       serviceName: monitor?.serviceName ?? null,
