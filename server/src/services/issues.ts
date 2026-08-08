@@ -65,6 +65,7 @@ import {
   issueCommentAuthorTypeSchema,
   issueCommentMetadataSchema,
   issueCommentPresentationSchema,
+  isAgentStatusInvokable,
   isUuidLike,
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
   SYSTEM_ISSUE_DOCUMENT_KEYS,
@@ -9048,6 +9049,21 @@ export function issueService(db: Db) {
          */
         expectedCurrentAssigneeAgentId?: string | null;
         /**
+         * BLO-22876 review: the manager-chain reroute grant is conditioned on the
+         * current assignee being *non-invokable*. Unlike the guard above, that
+         * fact lives in `agents`, not `issues`, so no WHERE clause on the target
+         * row can pin it — the route's `agentsSvc.getById()` read and this write
+         * would otherwise straddle a `paused -> running` resume and let a manager
+         * reassign or cancel an issue held by a live report.
+         *
+         * Set to re-read the assignee's row inside this transaction under
+         * `FOR SHARE` and 409 if it has become invokable. The lock is what makes
+         * this a write-time snapshot: a concurrent resume either commits first
+         * (we read the new status and reject) or blocks until we commit (the row
+         * was still non-invokable for the whole write).
+         */
+        expectedCurrentAssigneeAgentNonInvokable?: boolean;
+        /**
          * Pins run ownership that authorized a current-run agent mutation. A force
          * release and checkout transfer can leave status/execution JSON unchanged
          * while replacing the owning run; stale output from the former owner must
@@ -9080,6 +9096,7 @@ export function issueService(db: Db) {
         actorUserId,
         expectedCurrentStatus,
         expectedCurrentAssigneeAgentId,
+        expectedCurrentAssigneeAgentNonInvokable,
         expectedCurrentCheckoutRunId,
         expectedCurrentExecutionRunId,
         expectedCurrentExecutionState,
@@ -9408,6 +9425,46 @@ export function issueService(db: Db) {
           .where(eq(issues.id, id))
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!lockedExisting) return null;
+
+        // BLO-22876 review: close the invokability time-of-check/time-of-use gap.
+        // The caller's authorization rested on the assignee being non-invokable,
+        // read outside this transaction. Re-read it here under `FOR SHARE`, which
+        // both serializes against a concurrent `paused -> running` resume and
+        // holds that row until we commit, so the status we authorize on is the
+        // status in force for the whole write.
+        if (expectedCurrentAssigneeAgentNonInvokable) {
+          const assigneeAgentId = lockedExisting.assigneeAgentId;
+          if (!assigneeAgentId) {
+            throw conflict("Issue assignee changed before the update could be applied", {
+              issueId: id,
+              currentAssigneeAgentId: null,
+            });
+          }
+          await tx.execute(
+            sql`SELECT ${agents.id} FROM ${agents}
+                WHERE ${eq(agents.id, assigneeAgentId)}
+                FOR SHARE`,
+          );
+          const lockedAssignee = await tx
+            .select({ id: agents.id, companyId: agents.companyId, status: agents.status })
+            .from(agents)
+            .where(eq(agents.id, assigneeAgentId))
+            .then((rows: Array<{ id: string; companyId: string; status: string }>) => rows[0] ?? null);
+          if (
+            !lockedAssignee ||
+            lockedAssignee.companyId !== lockedExisting.companyId ||
+            isAgentStatusInvokable(lockedAssignee.status)
+          ) {
+            throw conflict(
+              "Issue assignee became execution-eligible before the update could be applied",
+              {
+                issueId: id,
+                assigneeAgentId,
+                currentAssigneeAgentStatus: lockedAssignee?.status ?? null,
+              },
+            );
+          }
+        }
 
         let nextProjectId = issueData.projectId !== undefined
           ? issueData.projectId
