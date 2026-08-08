@@ -169,7 +169,12 @@ import {
   ISSUE_WAKE_DIAGNOSTICS_MAX_ACTIVITY_RECORDS,
   ISSUE_WAKE_DIAGNOSTICS_MAX_WAKE_REQUESTS,
 } from "../services/issues.js";
-import { authorizationBoundaryLabel, authorizationDeniedDetails } from "../services/authorization.js";
+import {
+  authorizationBoundaryLabel,
+  authorizationDeniedDetails,
+  commentAuthorCanGrantIssueMention,
+  getActiveCompanyMembership,
+} from "../services/authorization.js";
 import { environmentService } from "../services/environments.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
 import { redactEventPayload, redactSensitiveText } from "../redaction.js";
@@ -9852,8 +9857,22 @@ export function issueRoutes(
         ? activeRecoveryActionForPatch
         : await recoveryActionsSvc.getActiveForIssue(existing.companyId, existing.id)
       : null;
+    // BLO-19951: the coordination-metadata allowlist (BLO-18289) is decided
+    // above but was never consulted here, so an allowlist-confined patch still
+    // 403'd whenever the issue carried a recovery action owned outside the
+    // actor's chain. Stranded-recovery issues are exactly the population the
+    // gate exists to curate (BLO-19119), so that subset was unreachable.
+    //
+    // Reusing the already-computed decision rather than recomputing keeps the
+    // two paths from drifting. The carve-out is narrow by construction: a
+    // non-null decision means the body contained *only* allowlisted fields, and
+    // `status` / `assigneeAgentId` / `executionPolicy` / `reopen` / `resume` are
+    // all outside the allowlist, so the only trigger that can reach this line
+    // with a decision in hand is `blockedByIssueIds` — the BLO-18163 use case.
+    // Any non-allowlisted field nulls the decision and restores the guard.
     if (
       recoveryRelevantSourceMutationRequested &&
+      !coordinationMetadataDecision &&
       !(await assertRecoveryActionAuthority(
         req,
         res,
@@ -10998,8 +11017,24 @@ export function issueRoutes(
           logger.warn({ err, issueId: id }, "failed to resolve @-mentions");
         }
 
+        let authorUserIsActiveMember = false;
+        if (mentionedIds.length > 0 && actor.actorType === "user") {
+          try {
+            authorUserIsActiveMember = Boolean(
+              await getActiveCompanyMembership(db, issue.companyId, "user", actor.actorId),
+            );
+          } catch (err) {
+            logger.warn({ err, issueId: id }, "failed to resolve comment author membership for @-mentions");
+          }
+        }
+
         for (const mentionedId of mentionedIds) {
-          if (actor.actorType === "agent" && actor.actorId === mentionedId) continue;
+          if (!commentAuthorCanGrantIssueMention({
+            mentionedAgentId: mentionedId,
+            issueAssigneeAgentId: issue.assigneeAgentId,
+            authorAgentId: actor.actorType === "agent" ? actor.actorId : null,
+            authorUserIsActiveMember,
+          })) continue;
           addWakeup(mentionedId, {
             source: "automation",
             triggerDetail: "system",
@@ -11875,8 +11910,34 @@ export function issueRoutes(
         // after another agent has taken over the issue.
         const boundaryDecision = await decideIssueAccess(req, issue, "issue:mutate");
         if (!boundaryDecision.allowed) {
-          respondIssueBoundaryDenied(res, boundaryDecision);
-          return;
+          // BLO-22670: that boundary is keyed to the issue's *current* trust
+          // posture (assignee, grants) — which the interaction's creator can
+          // lose the moment the issue changes hands, defeating the stale-card
+          // cleanup the comment above promises: the card becomes unwithdrawable
+          // by anyone (creator fails this boundary, the new assignee fails
+          // createdByAgentId below). The service's own createdByAgentId check
+          // is race-safe (re-applied in its UPDATE ... WHERE) and sufficient on
+          // its own, so give a genuine creator one more path through it instead
+          // of leaving the card permanently stuck.
+          //
+          // Scoped to deny_missing_grant deliberately. Only that reason means
+          // "this agent lost the issue-level grant", which is the reassignment
+          // case above. Other denials are narrower than the agent and creator
+          // identity cannot stand in for them: a skill_test or task_bridge key
+          // gets deny_scope from decideSkillTestAccess/decideTaskBridgeAccess
+          // for an issue outside the key's boundary, and createdByAgentId is
+          // agent-wide, not key- or run-scoped, so a match there says nothing
+          // about whether *this credential* may touch *this* issue. Treating
+          // every !allowed alike would let a narrowly scoped key withdraw on
+          // an out-of-scope issue purely because its agent authored the card.
+          const createdInteraction =
+            actor.agentId && boundaryDecision.reason === "deny_missing_grant"
+              ? await issueThreadInteractionService(db).getById(interactionId)
+              : null;
+          if (!createdInteraction || createdInteraction.createdByAgentId !== actor.agentId) {
+            respondIssueBoundaryDenied(res, boundaryDecision);
+            return;
+          }
         }
         // Without a run id the watchdog scope above resolves to "none" and
         // silently stops confining the caller, so require one exactly as the
@@ -12937,8 +12998,24 @@ export function issueRoutes(
         logger.warn({ err, issueId: id }, "failed to resolve @-mentions");
       }
 
+      let authorUserIsActiveMember = false;
+      if (mentionedIds.length > 0 && actor.actorType === "user") {
+        try {
+          authorUserIsActiveMember = Boolean(
+            await getActiveCompanyMembership(db, issue.companyId, "user", actor.actorId),
+          );
+        } catch (err) {
+          logger.warn({ err, issueId: id }, "failed to resolve comment author membership for @-mentions");
+        }
+      }
+
       for (const mentionedId of mentionedIds) {
-        if (actorIsAgent && actor.actorId === mentionedId) continue;
+        if (!commentAuthorCanGrantIssueMention({
+          mentionedAgentId: mentionedId,
+          issueAssigneeAgentId: currentIssue.assigneeAgentId,
+          authorAgentId: actorIsAgent ? actor.actorId : null,
+          authorUserIsActiveMember,
+        })) continue;
         addWakeup(mentionedId, {
           source: "automation",
           triggerDetail: "system",

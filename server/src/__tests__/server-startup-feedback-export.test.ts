@@ -64,6 +64,13 @@ const {
     reconcileTaskWatchdogs: vi.fn(async () => ({ triggered: 0 })),
     scanSilentActiveRuns: vi.fn(async () => ({ created: 0, escalated: 0 })),
     sweepStaleIssueLocks: vi.fn(async () => ({ cleared: 0 })),
+    reconcileDetachedQueuedRuns: vi.fn(async () => ({
+      scanned: 0,
+      terminalized: 0,
+      recovered: 0,
+      skipped: 0,
+      failed: 0,
+    })),
     reconcileProductivityReviews: vi.fn(async () => ({ created: 0, updated: 0, failed: 0 })),
     reconcileResolvedBlockerDependents: vi.fn(async () => ({ woken: 0, failed: 0 })),
     reconcileFailedWakeDispatches: vi.fn(async () => ({ recovered: 0, exhausted: 0 })),
@@ -461,6 +468,21 @@ describe("startServer feedback export wiring", () => {
     expect(heartbeatServiceMock.resumeQueuedRuns).toHaveBeenCalledTimes(1);
   });
 
+  it("continues startup recovery when the detached-queued-run sweep fails", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+    heartbeatServiceMock.reconcileDetachedQueuedRuns.mockRejectedValueOnce(
+      new Error("detached-queued-run sweep failure"),
+    );
+
+    await startServer();
+
+    expect(heartbeatServiceMock.promoteDueScheduledRetries).toHaveBeenCalledTimes(1);
+    expect(heartbeatServiceMock.resumeQueuedRuns).toHaveBeenCalledTimes(1);
+  });
+
   it("starts listening while queued-run recovery continues in the background", async () => {
     loadConfigMock.mockReturnValue(buildTestConfig({
       heartbeatSchedulerEnabled: true,
@@ -501,6 +523,7 @@ describe("startServer feedback export wiring", () => {
     try {
       await startServer();
       heartbeatServiceMock.sweepStaleIssueLocks.mockClear();
+      heartbeatServiceMock.reconcileDetachedQueuedRuns.mockClear();
       heartbeatServiceMock.reconcileStrandedAssignedIssues.mockRejectedValueOnce(
         new Error("unrelated recovery failure"),
       );
@@ -510,6 +533,7 @@ describe("startServer feedback export wiring", () => {
       await Promise.resolve();
 
       expect(heartbeatServiceMock.sweepStaleIssueLocks).toHaveBeenCalledTimes(1);
+      expect(heartbeatServiceMock.reconcileDetachedQueuedRuns).toHaveBeenCalledTimes(1);
     } finally {
       setIntervalSpy.mockRestore();
     }

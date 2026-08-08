@@ -1,5 +1,13 @@
 import { describe, it, expect, vi } from "vitest";
-import { createJob, deleteJob, getJobStatus, findPodForJob, JobTimeoutError, waitForJobCompletion } from "../../src/job-orchestrator.js";
+import {
+  createJob,
+  deleteJob,
+  getJobStatus,
+  findPodForJob,
+  JobAlreadyExistsError,
+  JobTimeoutError,
+  waitForJobCompletion,
+} from "../../src/job-orchestrator.js";
 
 describe("createJob", () => {
   it("calls batch.createNamespacedJob with the manifest", async () => {
@@ -68,6 +76,96 @@ describe("createJob", () => {
       /agent\.env\[HOME\] \(value-not-allowlisted\)/,
     );
     expect(create).not.toHaveBeenCalled();
+  });
+
+  const identityLabels = {
+    "paperclip.io/run-id": "run-abc",
+    "paperclip.io/company-id": "company-abc",
+    "paperclip.io/managed-by": "paperclip-k8s-plugin",
+    "paperclip.io/adapter": "codex_local",
+  };
+
+  // BLO-22454: a concurrent create of the same run can 409 against its
+  // in-flight Job. It is safe to adopt only the Job carrying that run's
+  // immutable Paperclip identity labels.
+  it("adopts the existing Job's uid on a 409 AlreadyExists", async () => {
+    const create = vi.fn().mockRejectedValue({ code: 409 });
+    const read = vi.fn().mockResolvedValue({ metadata: { uid: "existing-uid", labels: identityLabels } });
+    const clients = { batch: { createNamespacedJob: create, readNamespacedJob: read } };
+    const jobManifest = {
+      apiVersion: "batch/v1",
+      kind: "Job",
+      metadata: { name: "r-1", namespace: "ns", labels: identityLabels },
+      spec: { template: {} },
+    };
+    const result = await createJob(clients as never, "ns", jobManifest);
+    expect(read).toHaveBeenCalledWith({ namespace: "ns", name: "r-1" });
+    expect(result.uid).toBe("existing-uid");
+  });
+
+  it("rejects an existing Job whose identity labels do not match the manifest", async () => {
+    const create = vi.fn().mockRejectedValue({ code: 409 });
+    const read = vi.fn().mockResolvedValue({
+      metadata: { uid: "existing-uid", labels: { ...identityLabels, "paperclip.io/run-id": "other-run" } },
+    });
+    const clients = { batch: { createNamespacedJob: create, readNamespacedJob: read } };
+    const jobManifest = {
+      apiVersion: "batch/v1",
+      kind: "Job",
+      metadata: { name: "r-1", namespace: "ns", labels: identityLabels },
+      spec: { template: {} },
+    };
+
+    await expect(createJob(clients as never, "ns", jobManifest)).rejects.toThrow(/expected Paperclip identity labels/);
+  });
+
+  // A Job under foreground deletion is unsafe to adopt, but it is transient:
+  // wait for the observed UID to disappear, then retry the same manifest.
+  it("retries creation after a conflicting terminating Job disappears", async () => {
+    const create = vi
+      .fn()
+      .mockRejectedValueOnce({ code: 409 })
+      .mockResolvedValueOnce({ metadata: { uid: "replacement-uid" } });
+    const read = vi
+      .fn()
+      .mockResolvedValueOnce({
+        metadata: { uid: "existing-uid", deletionTimestamp: "2026-08-06T12:00:00Z", labels: identityLabels },
+      })
+      .mockRejectedValueOnce({ code: 404 });
+    const clients = { batch: { createNamespacedJob: create, readNamespacedJob: read } };
+    const jobManifest = {
+      apiVersion: "batch/v1",
+      kind: "Job",
+      metadata: { name: "r-1", namespace: "ns", labels: identityLabels },
+      spec: { template: {} },
+    };
+    const result = await createJob(clients as never, "ns", jobManifest, { conflictRetryTimeoutMs: 0 });
+
+    expect(result.uid).toBe("replacement-uid");
+    expect(create).toHaveBeenCalledTimes(2);
+    expect(read).toHaveBeenCalledTimes(2);
+  });
+
+  it("throws a typed error naming the run id when the existing Job can't be read", async () => {
+    const create = vi.fn().mockRejectedValue({ statusCode: 409 });
+    const read = vi.fn().mockRejectedValue(new Error("boom"));
+    const clients = { batch: { createNamespacedJob: create, readNamespacedJob: read } };
+    const jobManifest = {
+      apiVersion: "batch/v1",
+      kind: "Job",
+      metadata: { name: "r-2", namespace: "ns", labels: { ...identityLabels, "paperclip.io/run-id": "run-xyz" } },
+      spec: { template: {} },
+    };
+    await expect(createJob(clients as never, "ns", jobManifest)).rejects.toThrow(JobAlreadyExistsError);
+    await expect(createJob(clients as never, "ns", jobManifest)).rejects.toThrow(/run-xyz/);
+  });
+
+  it("re-throws non-409 errors from createNamespacedJob unchanged", async () => {
+    const boom = new Error("server exploded");
+    const create = vi.fn().mockRejectedValue(boom);
+    const clients = { batch: { createNamespacedJob: create } };
+    const jobManifest = { apiVersion: "batch/v1", kind: "Job", metadata: { name: "r-3", namespace: "ns" }, spec: { template: {} } };
+    await expect(createJob(clients as never, "ns", jobManifest)).rejects.toBe(boom);
   });
 });
 
