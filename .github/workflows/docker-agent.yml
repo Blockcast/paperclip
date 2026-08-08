@@ -115,6 +115,15 @@ jobs:
             exit 1
           fi
           ffmpeg_image="${ffmpeg_ref%:*}@${ffmpeg_digest}"
+          # The publisher's moving stable tag can regress independently of
+          # Paperclip. Validate it before deriving the toolchain identity and
+          # fall back to the latest digest proven by a green agent-image build.
+          ffmpeg_known_good_digest="sha256:be20fcc53b6ca777de62c004ea926bcbb044f766f942e0bbe0eac6ee419a06d1"
+          if ! scripts/verify-agent-ffmpeg.sh "$ffmpeg_image"; then
+            echo "::warning::${ffmpeg_image} lacks moq_mmt; using last known-good publisher digest"
+            ffmpeg_image="${ffmpeg_ref%:*}@${ffmpeg_known_good_digest}"
+            scripts/verify-agent-ffmpeg.sh "$ffmpeg_image"
+          fi
           toolchain_tag="$(scripts/container-base-tag.sh agent-toolchain "$runtime_image" "$ffmpeg_image")"
           toolchain_image="harbor.blockcast.net/paperclip-agent/paperclip-agent-toolchain:${toolchain_tag}"
           if docker buildx imagetools inspect "$runtime_image" >/dev/null 2>&1; then
@@ -251,7 +260,7 @@ jobs:
           EXPECTED_DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           set -euo pipefail
-          docker buildx imagetools create --tag "$FLOATING_IMAGE" "$CANDIDATE_IMAGE"
+          docker buildx imagetools create --prefer-index=false --tag "$FLOATING_IMAGE" "$CANDIDATE_IMAGE"
           promoted_digest=$(docker buildx imagetools inspect "$FLOATING_IMAGE" --format '{{json .Manifest.Digest}}' | tr -d '"')
           test "$promoted_digest" = "$EXPECTED_DIGEST"
 

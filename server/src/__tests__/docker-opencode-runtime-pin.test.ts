@@ -1,4 +1,6 @@
-import { readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
@@ -20,6 +22,7 @@ const agentRuntimeBake = readFileSync(
 );
 const designerDockerfile = readFileSync(path.join(repoRoot, "packages/services/designer/Dockerfile"), "utf8");
 const designerPackageLock = readFileSync(path.join(repoRoot, "packages/services/designer/package-lock.json"), "utf8");
+const verifyAgentFfmpeg = path.join(repoRoot, "scripts/verify-agent-ffmpeg.sh");
 
 describe("production Dockerfile k8s adapter runtime pins", () => {
   it("pins opencode-ai and asserts the installed version", () => {
@@ -160,7 +163,9 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
     expect(dockerAgentWorkflow).toContain("--tmpfs /paperclip:rw,nosuid,size=16m");
     expect(dockerAgentWorkflow).toContain("paperclip-browser-smoke");
     expect(dockerAgentWorkflow).toContain("AGENT_IMAGE: harbor.blockcast.net/paperclip-agent/paperclip-agent@${{ steps.build.outputs.digest }}");
-    expect(dockerAgentWorkflow).toContain("docker buildx imagetools create --tag \"$FLOATING_IMAGE\" \"$CANDIDATE_IMAGE\"");
+    expect(dockerAgentWorkflow).toContain(
+      "docker buildx imagetools create --prefer-index=false --tag \"$FLOATING_IMAGE\" \"$CANDIDATE_IMAGE\"",
+    );
 
     const metadataBlock = dockerAgentWorkflow.slice(
       dockerAgentWorkflow.indexOf("name: Docker meta"),
@@ -175,6 +180,37 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
       'RUNTIME_BASE_IMAGE=${{ steps.bases.outputs.runtime_base_image }}',
     );
     expect(dockerAgentWorkflow).toContain('FFMPEG_IMAGE=${{ steps.bases.outputs.ffmpeg_image }}');
+    expect(dockerAgentWorkflow).toContain(
+      'ffmpeg_known_good_digest="sha256:be20fcc53b6ca777de62c004ea926bcbb044f766f942e0bbe0eac6ee419a06d1"',
+    );
+    expect(dockerAgentWorkflow).toContain('scripts/verify-agent-ffmpeg.sh "$ffmpeg_image"');
+    expect(dockerAgentWorkflow).toContain("lacks moq_mmt; using last known-good publisher digest");
+  });
+
+  it("drains FFmpeg capability output after finding the required muxer", () => {
+    const stubDir = mkdtempSync(path.join(tmpdir(), "paperclip-ffmpeg-probe-"));
+    const dockerStub = path.join(stubDir, "docker");
+    writeFileSync(
+      dockerStub,
+      `#!/bin/sh
+printf ' E moq_mmt MMTP muxer\\n'
+i=0
+while [ "$i" -lt 5000 ]; do
+  printf ' D unrelated_%s unrelated muxer\\n' "$i"
+  i=$((i + 1))
+done
+`,
+      { mode: 0o755 },
+    );
+
+    try {
+      execFileSync(verifyAgentFfmpeg, ["registry.example/ffmpeg@sha256:test"], {
+        env: { ...process.env, PATH: `${stubDir}:${process.env.PATH}` },
+        stdio: "pipe",
+      });
+    } finally {
+      rmSync(stubDir, { recursive: true, force: true });
+    }
   });
 
   it("publishes agent runtime images to Harbor with a secondary GHA cache", () => {

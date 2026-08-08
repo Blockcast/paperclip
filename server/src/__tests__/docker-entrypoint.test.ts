@@ -104,7 +104,7 @@ describe("docker-entrypoint.sh", () => {
     expect(stdout).toContain("ENTRYPOINT-CMD-RAN");
     expect(stderr).toBe("");
     expect(calls).toContain("mkdir -p /paperclip/bin");
-    expect(calls).toContain(`ln -sf ${join(stubDir, "google-chrome")} /paperclip/bin/google-chrome`);
+    expect(calls).toContain(`ln -sfn ${join(stubDir, "google-chrome")} /paperclip/bin/google-chrome`);
   });
 
   it("execs directly with a warning for an arbitrary non-root UID (OpenShift-style)", async () => {
@@ -136,6 +136,16 @@ describe("docker-entrypoint.sh", () => {
     expect(stdout).toContain("ENTRYPOINT-CMD-RAN");
     expect(stderr).toContain("/paperclip/bin is not writable; browser link not installed");
     expect(calls).toContain("mkdir -p /paperclip/bin");
-    expect(calls).not.toContain("ln -sf");
+    expect(calls).not.toContain("ln -sfn");
+  });
+
+  it("replaces a hostile browser leaf symlink without following it", async () => {
+    installStubs({ uid: 1000, gid: 1000 });
+
+    const { stdout, calls } = await runEntrypoint();
+
+    expect(stdout).toContain("ENTRYPOINT-CMD-RAN");
+    expect(calls).toContain(`ln -sfn ${join(stubDir, "google-chrome")} /paperclip/bin/google-chrome`);
+    expect(calls).not.toContain("ln -sf ");
   });
 });
