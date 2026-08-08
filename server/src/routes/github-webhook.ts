@@ -92,6 +92,7 @@ import {
 } from "../services/pull-request-work-products.js";
 import { matchesTaskKey, normalizePrReviewRepoFullName } from "../services/pr-review-duplicate-issue-guard.js";
 import {
+  activateGithubReviewGateDelivery,
   enqueueGithubReviewGateDelivery,
   type GithubReviewGateAuthorityConfig,
 } from "../services/github-review-gate-authority.js";
@@ -3876,6 +3877,25 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
         return;
       }
       if (gateDelivery.matched) {
+        if (gateDelivery.requiresRevocation) {
+          const revocation = await activateGithubReviewGateDelivery(db, gateDelivery.deliveryDbId);
+          if (!revocation.ok) {
+            logger.error(
+              {
+                event: eventName,
+                deliveryId,
+                deliveryDbId: gateDelivery.deliveryDbId,
+                reason: revocation.reason,
+              },
+              "github review-gate delivery persisted but pending revocation failed",
+            );
+            res.status(503).json({
+              error: "github review-gate pending revocation failed",
+              reason: revocation.reason,
+            });
+            return;
+          }
+        }
         logger.info(
           {
             event: eventName,

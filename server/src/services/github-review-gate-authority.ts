@@ -51,6 +51,7 @@ export type GithubReviewGateEnqueueResult =
       matched: true;
       queued: true;
       duplicate: boolean;
+      requiresRevocation: boolean;
       deliveryDbId: string;
       repoFullName: string;
       prNumber: number;
@@ -361,6 +362,7 @@ async function createRepositoryDispatch(input: {
           client_payload: {
             producer_app_id: input.row.expectedAppId,
             producer_installation_id: input.row.expectedInstallationId,
+            producer_delivery_id: input.row.deliveryId,
             retry_count: "0",
             target_pull_number: String(input.candidate.prNumber),
             target_head_sha: input.liveHeadSha,
@@ -383,44 +385,56 @@ function affectsProtectedBase(candidate: Candidate, liveBaseRef: string, protect
     || candidate.previousBaseRef === protectedBaseRef;
 }
 
-async function processDelivery(db: Db, row: DeliveryRow): Promise<void> {
+type PendingRevocationResult =
+  | { ok: false; reason: string; result: Record<string, unknown> }
+  | { ok: true; affectsProtectedBase: false; result: Record<string, unknown> }
+  | {
+      ok: true;
+      affectsProtectedBase: true;
+      token: string;
+      candidate: Candidate;
+      liveHeadSha: string;
+      headShas: string[];
+      origin: string;
+      result: Record<string, unknown>;
+    };
+
+async function postPendingStatusesForDelivery(row: DeliveryRow): Promise<PendingRevocationResult> {
   const runtime = loadConfig();
   const actualAppId = runtime.githubAppId.trim();
   const actualInstallationId = runtime.githubAppInstallationId.trim();
   if (actualAppId !== row.expectedAppId || actualInstallationId !== row.expectedInstallationId) {
-    await retryDelivery(db, row, "review_gate_identity_mismatch", {
-      expectedAppId: row.expectedAppId,
-      expectedInstallationId: row.expectedInstallationId,
-      actualAppId,
-      actualInstallationId,
-    });
-    return;
+    return {
+      ok: false,
+      reason: "review_gate_identity_mismatch",
+      result: {
+        expectedAppId: row.expectedAppId,
+        expectedInstallationId: row.expectedInstallationId,
+        actualAppId,
+        actualInstallationId,
+      },
+    };
   }
 
   const candidate = resolveCandidate(row.eventName, row.payload, row.reviewerBotLogin);
   if (!candidate || candidate.repoFullName.toLowerCase() !== row.repoFullName.toLowerCase()) {
-    await retryDelivery(db, row, "review_gate_persisted_payload_invalid", {});
-    return;
+    return { ok: false, reason: "review_gate_persisted_payload_invalid", result: {} };
   }
 
   const token = await getInstallationTokenResult(Date.now(), { signal: requestSignal() });
-  if (!token.ok) {
-    await retryDelivery(db, row, token.reason, token);
-    return;
-  }
+  if (!token.ok) return { ok: false, reason: token.reason, result: token };
 
   const pullRequest = await fetchPullRequest(token.token, row, candidate);
   if (!pullRequest.ok) {
-    await retryDelivery(db, row, pullRequest.reason, pullRequest);
-    return;
+    return { ok: false, reason: pullRequest.reason, result: pullRequest };
   }
 
   if (!affectsProtectedBase(candidate, pullRequest.baseRef, row.baseRef)) {
-    await markDelivered(db, row, {
-      reason: "pull_request_base_not_protected",
-      liveBaseRef: pullRequest.baseRef,
-    });
-    return;
+    return {
+      ok: true,
+      affectsProtectedBase: false,
+      result: { reason: "pull_request_base_not_protected", liveBaseRef: pullRequest.baseRef },
+    };
   }
 
   const headShas = [...new Set([
@@ -430,48 +444,69 @@ async function processDelivery(db: Db, row: DeliveryRow): Promise<void> {
   ].filter((sha): sha is string => Boolean(sha)))];
   const origin = originRequestId(row.deliveryId);
   const targetUrl = candidate.targetUrl ?? pullRequest.targetUrl;
-  let fencedRow = await refreshDeliveryClaim(db, row);
-  if (!fencedRow) return;
-
   const statusResults = await Promise.all(
     headShas.map(async (sha) => ({
       sha,
-      result: await postPendingStatus({ token: token.token, row: fencedRow!, sha, targetUrl, origin }),
+      result: await postPendingStatus({ token: token.token, row, sha, targetUrl, origin }),
     })),
   );
   const statusFailures = statusResults.filter((entry) => !entry.result.ok);
+  if (statusFailures.length > 0) {
+    const failure = statusFailures[0]!;
+    return {
+      ok: false,
+      reason: failure.result.ok ? "review_gate_status_incomplete" : failure.result.reason,
+      result: { headShas, statusFailures },
+    };
+  }
+
+  return {
+    ok: true,
+    affectsProtectedBase: true,
+    token: token.token,
+    candidate,
+    liveHeadSha: pullRequest.headSha,
+    headShas,
+    origin,
+    result: { headShas, originRequestId: origin },
+  };
+}
+
+async function processDelivery(db: Db, row: DeliveryRow): Promise<void> {
+  let fencedRow = await refreshDeliveryClaim(db, row);
+  if (!fencedRow) return;
+  const pending = await postPendingStatusesForDelivery(fencedRow);
 
   const refreshed = await refreshDeliveryClaim(db, fencedRow);
   if (!refreshed) return;
   fencedRow = refreshed;
 
-  if (statusFailures.length > 0) {
-    const failure = statusFailures[0]!;
-    const reason = failure.result.ok ? "review_gate_status_incomplete" : failure.result.reason;
-    await retryDelivery(db, fencedRow, reason, {
-      headShas,
-      statusFailures,
-    });
+  if (!pending.ok) {
+    await retryDelivery(db, fencedRow, pending.reason, pending.result);
+    return;
+  }
+  if (!pending.affectsProtectedBase) {
+    await markDelivered(db, fencedRow, pending.result);
     return;
   }
 
   const dispatch = await createRepositoryDispatch({
-    token: token.token,
+    token: pending.token,
     row: fencedRow,
-    candidate,
-    liveHeadSha: pullRequest.headSha,
-    origin,
+    candidate: pending.candidate,
+    liveHeadSha: pending.liveHeadSha,
+    origin: pending.origin,
   });
 
   if (!dispatch.ok) {
     await retryDelivery(db, fencedRow, dispatch.reason, {
-      headShas,
+      headShas: pending.headShas,
       dispatch,
     });
     return;
   }
 
-  await markDelivered(db, fencedRow, { headShas, originRequestId: origin, dispatch });
+  await markDelivered(db, fencedRow, { ...pending.result, dispatch });
 }
 
 export async function enqueueGithubReviewGateDelivery(input: {
@@ -530,7 +565,7 @@ export async function enqueueGithubReviewGateDelivery(input: {
         dispatchEventType: input.config.dispatchEventType?.trim() || "review_gate_reconcile",
         expectedAppId,
         expectedInstallationId,
-        status: "queued",
+        status: "capturing",
         attempts: 0,
         nextAttemptAt: now,
         createdAt: now,
@@ -566,10 +601,45 @@ export async function enqueueGithubReviewGateDelivery(input: {
     matched: true,
     queued: true,
     duplicate: enqueueResult.duplicate,
+    requiresRevocation: enqueueResult.row.status === "capturing",
     deliveryDbId: enqueueResult.row.id,
     repoFullName: candidate.repoFullName,
     prNumber: candidate.prNumber,
   };
+}
+
+export async function activateGithubReviewGateDelivery(
+  db: Db,
+  deliveryDbId: string,
+): Promise<{ ok: true } | { ok: false; reason: string }> {
+  const row = await db
+    .select()
+    .from(githubReviewGateDeliveries)
+    .where(eq(githubReviewGateDeliveries.id, deliveryDbId))
+    .then((rows) => rows[0] ?? null);
+  if (!row) return { ok: false, reason: "review_gate_delivery_not_found" };
+  if (row.status !== "capturing") return { ok: true };
+
+  const pending = await postPendingStatusesForDelivery(row);
+  if (!pending.ok) return { ok: false, reason: pending.reason };
+
+  const now = new Date();
+  await db
+    .update(githubReviewGateDeliveries)
+    .set({
+      status: "queued",
+      nextAttemptAt: now,
+      lastError: null,
+      lastResult: { synchronousRevocation: pending.result },
+      updatedAt: now,
+    })
+    .where(
+      and(
+        eq(githubReviewGateDeliveries.id, row.id),
+        eq(githubReviewGateDeliveries.status, "capturing"),
+      ),
+    );
+  return { ok: true };
 }
 
 export async function resetStaleGithubReviewGateDeliveries(db: Db, now = new Date()): Promise<number> {
@@ -579,7 +649,7 @@ export async function resetStaleGithubReviewGateDeliveries(db: Db, now = new Dat
     .set({ status: "queued", nextAttemptAt: now, updatedAt: now })
     .where(
       and(
-        eq(githubReviewGateDeliveries.status, "processing"),
+        inArray(githubReviewGateDeliveries.status, ["capturing", "processing"]),
         lt(githubReviewGateDeliveries.updatedAt, staleBefore),
       ),
     )
