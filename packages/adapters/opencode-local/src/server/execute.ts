@@ -826,6 +826,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         stderrLine ||
         `OpenCode exited with code ${synthesizedExitCode ?? -1}`;
       const modelId = model || null;
+      const sessionUnavailable =
+        (synthesizedExitCode ?? 0) !== 0 &&
+        isOpenCodeUnknownSessionError(attempt.proc.stdout, attempt.rawStderr) &&
+        attempt.parsed.usage.inputTokens === 0 &&
+        attempt.parsed.usage.outputTokens === 0 &&
+        attempt.parsed.toolCallCount === 0;
 
       // BLO-7436: opencode does not populate part.cost for openai-compatible
       // routes via LiteLLM/openai-direct, so attempt.parsed.costUsd lands as 0
@@ -843,6 +849,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         exitCode: synthesizedExitCode,
         signal: attempt.proc.signal,
         timedOut: false,
+        errorCode: sessionUnavailable ? "session_unavailable" : undefined,
         errorMessage: (synthesizedExitCode ?? 0) === 0 ? null : fallbackErrorMessage,
         usage: {
           inputTokens: attempt.parsed.usage.inputTokens,
@@ -874,7 +881,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       if (
         sessionId &&
         initialFailed &&
-        isOpenCodeUnknownSessionError(initial.proc.stdout, initial.rawStderr)
+        isOpenCodeUnknownSessionError(initial.proc.stdout, initial.rawStderr) &&
+        initial.parsed.usage.inputTokens === 0 &&
+        initial.parsed.usage.outputTokens === 0 &&
+        initial.parsed.toolCallCount === 0
       ) {
         await onLog(
           "stdout",

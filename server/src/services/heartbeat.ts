@@ -301,7 +301,12 @@ import {
   readContinuationAttempt,
 } from "./recovery/index.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./recovery/pause-hold-guard.js";
-import { runUsageTokenCounts } from "./recovery/zero-token-startup-failure.js";
+import {
+  runUsageTokenCounts,
+  SESSION_UNAVAILABLE_RECOVERY_MAX_ATTEMPTS,
+  SESSION_UNAVAILABLE_RECOVERY_RETRY_REASON,
+  ZERO_TOKEN_SESSION_RESET_RETRY_REASON,
+} from "./recovery/zero-token-startup-failure.js";
 import { clearAgentTaskSessions } from "./recovery/session-reset.js";
 import {
   recoveryAssigneeAdapterOverrides,
@@ -632,6 +637,13 @@ export const CAPACITY_BLOCKED_HEARTBEAT_RETRY_MAX_ATTEMPTS = 20;
 export const JOB_FAILED_HEARTBEAT_RETRY_REASON = "job_failed";
 export const JOB_FAILED_HEARTBEAT_RETRY_WAKE_REASON = "job_failed_retry";
 export const JOB_FAILED_HEARTBEAT_RETRY_MAX_ATTEMPTS = 4;
+// The adapter already makes one fresh-session attempt in-process. These are a
+// bounded backstop for control-plane/process loss around that transition.
+const SESSION_UNAVAILABLE_HEARTBEAT_RETRY_REASON = SESSION_UNAVAILABLE_RECOVERY_RETRY_REASON;
+const SESSION_UNAVAILABLE_HEARTBEAT_RETRY_WAKE_REASON = "session_unavailable_retry";
+export const SESSION_UNAVAILABLE_HEARTBEAT_RETRY_DELAY_MS = 30 * 1000;
+export const SESSION_UNAVAILABLE_HEARTBEAT_RETRY_MAX_ATTEMPTS =
+  SESSION_UNAVAILABLE_RECOVERY_MAX_ATTEMPTS;
 export const DEP_BLOCKED_RETRY_REASON = "dependency_blocked";
 export const DEP_BLOCKED_BASE_DELAY_MS = 5 * 60 * 1000;
 export const DEP_BLOCKED_MAX_DELAY_MS = 60 * 60 * 1000;
@@ -936,7 +948,9 @@ function readTransientRecoveryContractFromRun(
 }
 
 export function shouldScheduleAutomaticRunRetry(
-  run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson" | "contextSnapshot">,
+  run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson" | "contextSnapshot"> & {
+    usageJson?: Record<string, unknown> | null;
+  },
 ) {
   if (readTransientRecoveryContractFromRun(run)) return true;
 
@@ -991,6 +1005,11 @@ export function shouldScheduleAutomaticRunRetry(
   // stay terminal, matching the k8s_concurrent_run_blocked leak guard above.
   if (run.errorCode === "k8s_pod_schedule_failed" || run.errorCode === "job_missing") {
     return isPrReviewRetryContext(parseObject(run.contextSnapshot));
+  }
+
+  if (run.errorCode === "session_unavailable") {
+    const { inputTokens, outputTokens } = runUsageTokenCounts(run.usageJson ?? null);
+    return inputTokens === 0 && outputTokens === 0;
   }
 
   if (run.errorCode !== "adapter_failed" && run.errorCode !== "process_lost") return false;
@@ -1048,7 +1067,7 @@ export function selectAgedPrReviewRunForFairDispatch(
  * when `shouldScheduleAutomaticRunRetry` already returned true.
  */
 function resolveAutomaticRunRetryOpts(
-  run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode">,
+  run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "contextSnapshot">,
 ) {
   if (run.errorCode === "k8s_concurrent_run_blocked") {
     return {
@@ -1065,6 +1084,19 @@ function resolveAutomaticRunRetryOpts(
       maxAttempts: JOB_FAILED_HEARTBEAT_RETRY_MAX_ATTEMPTS,
     };
   }
+  if (run.errorCode === "session_unavailable") {
+    const retryReason =
+      readNonEmptyString(parseObject(run.contextSnapshot).retryReason) ===
+      ZERO_TOKEN_SESSION_RESET_RETRY_REASON
+        ? ZERO_TOKEN_SESSION_RESET_RETRY_REASON
+        : SESSION_UNAVAILABLE_HEARTBEAT_RETRY_REASON;
+    return {
+      retryReason,
+      wakeReason: SESSION_UNAVAILABLE_HEARTBEAT_RETRY_WAKE_REASON,
+      maxAttempts: SESSION_UNAVAILABLE_HEARTBEAT_RETRY_MAX_ATTEMPTS,
+      delayMs: SESSION_UNAVAILABLE_HEARTBEAT_RETRY_DELAY_MS,
+    };
+  }
   return undefined;
 }
 
@@ -1072,12 +1104,18 @@ function requiresIssueExecutionRetryLock(retryReason: string | null | undefined)
   return (
     retryReason === MAX_TURN_CONTINUATION_RETRY_REASON ||
     retryReason === CAPACITY_BLOCKED_HEARTBEAT_RETRY_REASON ||
+    retryReason === SESSION_UNAVAILABLE_HEARTBEAT_RETRY_REASON ||
+    retryReason === ZERO_TOKEN_SESSION_RESET_RETRY_REASON ||
     retryReason === JOB_FAILED_HEARTBEAT_RETRY_REASON
   );
 }
 
 function requiresInProgressIssueRetry(retryReason: string | null | undefined) {
-  return requiresIssueExecutionRetryLock(retryReason);
+  return (
+    requiresIssueExecutionRetryLock(retryReason) &&
+    retryReason !== SESSION_UNAVAILABLE_HEARTBEAT_RETRY_REASON &&
+    retryReason !== ZERO_TOKEN_SESSION_RESET_RETRY_REASON
+  );
 }
 
 function isResolvedInteractionContinuationWakeContext(contextSnapshot: unknown) {
@@ -3142,6 +3180,8 @@ interface WakeupOptions {
   requestedByActorType?: "user" | "agent" | "system";
   requestedByActorId?: string | null;
   contextSnapshot?: Record<string, unknown>;
+  retryOfRunId?: string | null;
+  scheduledRetryAttempt?: number;
 }
 
 type UsageTotals = {
@@ -22768,6 +22808,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       const persistedRunWrite = await setRunStatusIfRunning(run.id, status, {
         finishedAt: new Date(),
+        contextSnapshot: {
+          ...parseObject(run.contextSnapshot),
+          // Preserve the immutable producer identity for session recovery.
+          // The assigned agent can be reconfigured before a recovery sweep;
+          // that sweep must never clear the new adapter's healthy session.
+          adapterType: agent.adapterType,
+        },
         error: runErrorMessage,
         errorCode: runErrorCode,
         exitCode: adapterResult.exitCode,
@@ -22861,6 +22908,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }));
         }
         await recordZeroTokenCompletedRunStreak(agent);
+        let suppressImmediateRecovery = false;
         if (outcome === "failed" && isMaxTurnExhaustionRun(livenessRun)) {
           const policy = parseMaxTurnContinuationPolicy(agent);
           if (policy.enabled && policy.maxAttempts > 0) {
@@ -22883,10 +22931,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             });
           }
         } else if (outcome === "failed" && shouldScheduleAutomaticRunRetry(livenessRun)) {
-          await scheduleBoundedRetryForRun(livenessRun, agent, resolveAutomaticRunRetryOpts(livenessRun));
+          const automaticRetryResult = await scheduleBoundedRetryForRun(
+            livenessRun,
+            agent,
+            resolveAutomaticRunRetryOpts(livenessRun),
+          );
+          if (
+            livenessRun.errorCode === "session_unavailable" &&
+            automaticRetryResult.outcome === "retry_exhausted"
+          ) {
+            suppressImmediateRecovery = true;
+          }
         }
         const issueCommentPolicyResult = await finalizeIssueCommentPolicy(livenessRun, agent);
-        await releaseIssueExecutionAndPromote(livenessRun);
+        await releaseIssueExecutionAndPromote(
+          livenessRun,
+          suppressImmediateRecovery ? { suppressImmediateRecovery: true } : undefined,
+        );
         await handleRunLivenessContinuation(livenessRun);
         await handleSuccessfulRunHandoff(
           issueCommentPolicyResult.outcome === "retry_queued" || issueCommentPolicyResult.outcome === "retry_exhausted"
@@ -23813,6 +23874,60 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           });
         }
         const now = new Date();
+        const promotedRetryOfRunId = readNonEmptyString(promotedContextSnapshot.retryOfRunId);
+        const promotedScheduledRetryAttempt = promotedContextSnapshot.scheduledRetryAttempt;
+        if (
+          readNonEmptyString(promotedContextSnapshot.retryReason) ===
+          ZERO_TOKEN_SESSION_RESET_RETRY_REASON
+        ) {
+          const expectedAdapterType = readNonEmptyString(promotedContextSnapshot.adapterType);
+          if (expectedAdapterType && expectedAdapterType !== deferredAgent.adapterType) {
+            await tx
+              .update(agentWakeupRequests)
+              .set({
+                status: "cancelled",
+                finishedAt: now,
+                error: "Deferred session reset was cancelled because adapter configuration changed",
+                updatedAt: now,
+              })
+              .where(eq(agentWakeupRequests.id, deferred.id));
+            continue;
+          }
+          const latestIssueRunId = await tx
+            .select({ id: heartbeatRuns.id })
+            .from(heartbeatRuns)
+            .where(
+              and(
+                eq(heartbeatRuns.companyId, issue.companyId),
+                sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
+              ),
+            )
+            .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
+            .limit(1)
+            .then((rows) => rows[0]?.id ?? null);
+          if (!promotedRetryOfRunId || latestIssueRunId !== promotedRetryOfRunId) {
+            await tx
+              .update(agentWakeupRequests)
+              .set({
+                status: "cancelled",
+                finishedAt: now,
+                error: "Deferred session reset was superseded by newer issue execution",
+                updatedAt: now,
+              })
+              .where(eq(agentWakeupRequests.id, deferred.id));
+            continue;
+          }
+          await tx
+            .delete(agentTaskSessions)
+            .where(
+              and(
+                eq(agentTaskSessions.companyId, issue.companyId),
+                eq(agentTaskSessions.agentId, deferredAgent.id),
+                eq(agentTaskSessions.taskKey, promotedTaskKey ?? issue.id),
+                eq(agentTaskSessions.adapterType, expectedAdapterType ?? deferredAgent.adapterType),
+              ),
+            );
+        }
         const newRun = await tx
           .insert(heartbeatRuns)
           .values({
@@ -23826,6 +23941,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             responsibleUserId: promotedResponsibleUserId,
             sessionIdBefore: sessionBefore,
             continuationAttempt: promotedContinuationAttempt,
+            retryOfRunId: promotedRetryOfRunId,
+            scheduledRetryAttempt:
+              typeof promotedScheduledRetryAttempt === "number" &&
+              Number.isInteger(promotedScheduledRetryAttempt) &&
+              promotedScheduledRetryAttempt >= 0
+                ? promotedScheduledRetryAttempt
+                : undefined,
           })
           .returning()
           .then((rows) => rows[0]);
@@ -24236,6 +24358,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const contextSnapshot: Record<string, unknown> = { ...(opts.contextSnapshot ?? {}) };
     const reason = opts.reason ?? null;
     const payload = opts.payload ?? null;
+    const hasInitialRetryMetadata =
+      opts.retryOfRunId !== undefined || opts.scheduledRetryAttempt !== undefined;
     const {
       contextSnapshot: enrichedContextSnapshot,
       issueIdFromPayload,
@@ -24248,6 +24372,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       triggerDetail,
       payload,
     });
+    const initialRetryReason = readNonEmptyString(enrichedContextSnapshot.retryReason);
     let issueId = readNonEmptyString(enrichedContextSnapshot.issueId) ?? issueIdFromPayload;
 
     const agent = await getAgent(agentId);
@@ -24288,6 +24413,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         },
       });
     };
+
+    if (readNonEmptyString(enrichedContextSnapshot.retryReason) === ZERO_TOKEN_SESSION_RESET_RETRY_REASON) {
+      const expectedAdapterType = readNonEmptyString(enrichedContextSnapshot.adapterType);
+      if (expectedAdapterType && expectedAdapterType !== agent.adapterType) {
+        await writeSkippedRequest("zero_token_session_reset_adapter_changed", {
+          error: "Session reset skipped because the agent adapter changed before recovery could be queued",
+        });
+        return null;
+      }
+    }
 
     const schedulingSuppression = await getSchedulingSuppression();
     if (schedulingSuppression.suppressed) {
@@ -25446,6 +25581,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
           if (
             isSameExecutionAgent &&
+            !hasInitialRetryMetadata &&
             !shouldDeferFollowupWake &&
             !shouldQueueFollowupForRunningWake &&
             !shouldDeferCrossPrReviewWake &&
@@ -25507,6 +25643,33 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             return { kind: "coalesced" as const, run: mergedRun };
           }
 
+          if (
+            hasInitialRetryMetadata &&
+            activeExecutionRun.retryOfRunId === opts.retryOfRunId &&
+            activeExecutionRun.scheduledRetryAttempt === opts.scheduledRetryAttempt &&
+            (
+              activeExecutionRun.scheduledRetryReason ??
+              readNonEmptyString(parseObject(activeExecutionRun.contextSnapshot).retryReason)
+            ) === initialRetryReason
+          ) {
+            await tx.insert(agentWakeupRequests).values({
+              companyId: agent.companyId,
+              agentId,
+              source,
+              triggerDetail,
+              reason: "retry_execution_duplicate",
+              payload,
+              status: "coalesced",
+              coalescedCount: 1,
+              requestedByActorType: opts.requestedByActorType ?? null,
+              requestedByActorId: opts.requestedByActorId ?? null,
+              idempotencyKey: opts.idempotencyKey ?? null,
+              runId: activeExecutionRun.id,
+              finishedAt: new Date(),
+            });
+            return { kind: "coalesced" as const, run: activeExecutionRun };
+          }
+
           const shouldDeferAgainstActiveRun =
             Boolean(availableActiveExecutionRun) ||
             (isSameExecutionAgent && shouldDeferCrossPrReviewWake && activeExecutionRun.status === "running");
@@ -25527,6 +25690,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                   eq(agentWakeupRequests.agentId, agentId),
                   eq(agentWakeupRequests.status, "deferred_issue_execution"),
                   sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issue.id}`,
+                  hasInitialRetryMetadata
+                    ? and(
+                        sql`(${agentWakeupRequests.payload} -> ${DEFERRED_WAKE_CONTEXT_KEY} ->> 'retryOfRunId') is not distinct from ${opts.retryOfRunId ?? null}`,
+                        sql`(${agentWakeupRequests.payload} -> ${DEFERRED_WAKE_CONTEXT_KEY} ->> 'scheduledRetryAttempt') is not distinct from ${opts.scheduledRetryAttempt?.toString() ?? null}`,
+                        sql`(${agentWakeupRequests.payload} -> ${DEFERRED_WAKE_CONTEXT_KEY} ->> 'retryReason') is not distinct from ${initialRetryReason}`,
+                      )
+                    : and(
+                        sql`${agentWakeupRequests.payload} -> ${DEFERRED_WAKE_CONTEXT_KEY} ->> 'retryOfRunId' is null`,
+                        sql`${agentWakeupRequests.payload} -> ${DEFERRED_WAKE_CONTEXT_KEY} ->> 'scheduledRetryAttempt' is null`,
+                      ),
                 ),
               )
               .orderBy(asc(agentWakeupRequests.requestedAt))
@@ -25723,7 +25896,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // wake may already have queued the single follow-up while this
         // transaction waited on the issue lock; absorb into that pending task
         // scope before inserting another follow-up.
-        const coalescedTaskScopeRun = await coalescePendingTaskScopeWake({
+        const coalescedTaskScopeRun = hasInitialRetryMetadata ? null : await coalescePendingTaskScopeWake({
           tx,
           companyId: agent.companyId,
           agentId,
@@ -25741,7 +25914,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           return { kind: "coalesced" as const, run: coalescedTaskScopeRun };
         }
 
-        const coalescedGithubStateRun = await coalesceQueuedGithubStateWake({
+        const coalescedGithubStateRun = hasInitialRetryMetadata ? null : await coalesceQueuedGithubStateWake({
           tx,
           companyId: agent.companyId,
           agentId,
@@ -25757,6 +25930,62 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         });
         if (coalescedGithubStateRun) {
           return { kind: "coalesced" as const, run: coalescedGithubStateRun };
+        }
+
+        let sessionResetAdapterType: string | null = null;
+        if (readNonEmptyString(enrichedContextSnapshot.retryReason) === ZERO_TOKEN_SESSION_RESET_RETRY_REASON) {
+          const expectedAdapterType = readNonEmptyString(enrichedContextSnapshot.adapterType);
+          const resetAgent = await tx
+            .select({ adapterType: agents.adapterType })
+            .from(agents)
+            .where(and(eq(agents.id, agent.id), eq(agents.companyId, agent.companyId)))
+            .for("update")
+            .then((rows) => rows[0] ?? null);
+          if (!resetAgent || (expectedAdapterType && resetAgent.adapterType !== expectedAdapterType)) {
+            await tx.insert(agentWakeupRequests).values({
+              companyId: agent.companyId,
+              agentId,
+              source,
+              triggerDetail,
+              reason: "zero_token_session_reset_adapter_changed",
+              payload,
+              status: "skipped",
+              requestedByActorType: opts.requestedByActorType ?? null,
+              requestedByActorId: opts.requestedByActorId ?? null,
+              idempotencyKey: opts.idempotencyKey ?? null,
+              finishedAt: new Date(),
+            });
+            return { kind: "skipped" as const };
+          }
+          const latestIssueRunId = await tx
+            .select({ id: heartbeatRuns.id })
+            .from(heartbeatRuns)
+            .where(
+              and(
+                eq(heartbeatRuns.companyId, issue.companyId),
+                sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
+              ),
+            )
+            .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
+            .limit(1)
+            .then((rows) => rows[0]?.id ?? null);
+          if (!opts.retryOfRunId || latestIssueRunId !== opts.retryOfRunId) {
+            await tx.insert(agentWakeupRequests).values({
+              companyId: agent.companyId,
+              agentId,
+              source,
+              triggerDetail,
+              reason: "zero_token_session_reset_superseded",
+              payload,
+              status: "skipped",
+              requestedByActorType: opts.requestedByActorType ?? null,
+              requestedByActorId: opts.requestedByActorId ?? null,
+              idempotencyKey: opts.idempotencyKey ?? null,
+              finishedAt: new Date(),
+            });
+            return { kind: "skipped" as const };
+          }
+          sessionResetAdapterType = resetAgent.adapterType;
         }
 
         const wakeupRequest = await tx
@@ -25776,6 +26005,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .returning()
           .then((rows) => rows[0]);
 
+        if (sessionResetAdapterType) {
+          await tx
+            .delete(agentTaskSessions)
+            .where(
+              and(
+                eq(agentTaskSessions.companyId, issue.companyId),
+                eq(agentTaskSessions.agentId, agent.id),
+                eq(agentTaskSessions.taskKey, effectiveTaskKey ?? issue.id),
+                eq(agentTaskSessions.adapterType, sessionResetAdapterType),
+              ),
+            );
+        }
+
         const newRun = await tx
           .insert(heartbeatRuns)
           .values({
@@ -25793,6 +26035,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             contextSnapshot: enrichedContextSnapshot,
             sessionIdBefore: sessionBefore,
             continuationAttempt,
+            retryOfRunId: opts.retryOfRunId,
+            scheduledRetryAttempt: opts.scheduledRetryAttempt,
           })
           .returning()
           .then((rows) => rows[0]);
@@ -25871,7 +26115,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       liveRunExecutions,
     );
 
-    if (coalescedTargetRun) {
+    if (coalescedTargetRun && !hasInitialRetryMetadata) {
       const mergedContextSnapshot = mergeCoalescedContextSnapshot(
         coalescedTargetRun.contextSnapshot,
         enrichedContextSnapshot,
@@ -25916,7 +26160,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // common case. Re-check after acquiring it so a queued run or a
       // capacity-deferred scheduled retry that appeared meanwhile absorbs the
       // new wake. Keep a coalesced wake row for audit, but only one run.
-      const coalescedTaskScopeRun = await coalescePendingTaskScopeWake({
+      const coalescedTaskScopeRun = hasInitialRetryMetadata ? null : await coalescePendingTaskScopeWake({
         tx,
         companyId: agent.companyId,
         agentId,
@@ -25980,7 +26224,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         return { kind: "skipped" as const };
       }
 
-      const coalescedGithubStateRun = await coalesceQueuedGithubStateWake({
+      const coalescedGithubStateRun = hasInitialRetryMetadata ? null : await coalesceQueuedGithubStateWake({
         tx,
         companyId: agent.companyId,
         agentId,
@@ -26030,6 +26274,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           contextSnapshot: enrichedContextSnapshot,
           sessionIdBefore: sessionBefore,
           continuationAttempt,
+          retryOfRunId: opts.retryOfRunId,
+          scheduledRetryAttempt: opts.scheduledRetryAttempt,
         })
         .returning()
         .then((rows) => rows[0]);

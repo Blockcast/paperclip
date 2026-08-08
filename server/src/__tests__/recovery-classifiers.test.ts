@@ -10,6 +10,7 @@ import {
   buildRunLivenessContinuationIdempotencyKey,
   classifyIssueGraphLiveness,
   decideRunLivenessContinuation,
+  isLegacySessionUnavailableAdapterMismatch,
   isStrandedIssueRecoveryOriginKind,
   isZeroTokenStartupFailureRun,
   isZeroTokenSessionResetRetryRun,
@@ -283,8 +284,61 @@ describe("zero-token startup-failure classifier (BLO-5681)", () => {
 
   it("flags every member of the pre-model startup-failure family across terminal statuses", () => {
     expect(isZeroTokenStartupFailureRun({ status: "failed", errorCode: "context_length_exceeded" })).toBe(true);
+    expect(isZeroTokenStartupFailureRun({ status: "failed", errorCode: "session_unavailable" })).toBe(true);
     expect(isZeroTokenStartupFailureRun({ status: "timed_out", errorCode: "startup_error_pre_model" })).toBe(true);
     expect(isZeroTokenStartupFailureRun({ status: "cancelled", errorCode: "context_overflow" })).toBe(true);
+  });
+
+  it("recognizes legacy OpenCode session-unavailable failures only for OpenCode adapters", () => {
+    expect(
+      isZeroTokenStartupFailureRun({
+        adapterType: "opencode_k8s",
+        status: "failed",
+        errorCode: "adapter_failed",
+        error: "Session unavailable",
+      }),
+    ).toBe(true);
+    expect(
+      isZeroTokenStartupFailureRun({
+        adapterType: "opencode_k8s",
+        status: "failed",
+        errorCode: "adapter_failed",
+        error: "Provider unavailable",
+      }),
+    ).toBe(false);
+    expect(
+      isZeroTokenStartupFailureRun({
+        adapterType: "claude_k8s",
+        status: "failed",
+        errorCode: "adapter_failed",
+        error: "Session unavailable",
+      }),
+    ).toBe(false);
+  });
+
+  it("detects a legacy session failure whose historical adapter no longer matches", () => {
+    expect(
+      isLegacySessionUnavailableAdapterMismatch({
+        run: {
+          adapterType: "claude_k8s",
+          status: "failed",
+          errorCode: "adapter_failed",
+          error: "Session unavailable",
+        },
+        currentAdapterType: "opencode_k8s",
+      }),
+    ).toBe(true);
+    expect(
+      isLegacySessionUnavailableAdapterMismatch({
+        run: {
+          adapterType: "opencode_k8s",
+          status: "failed",
+          errorCode: "adapter_failed",
+          error: "Session unavailable",
+        },
+        currentAdapterType: "opencode_k8s",
+      }),
+    ).toBe(false);
   });
 
   it("trims surrounding whitespace on the error code", () => {
@@ -297,6 +351,13 @@ describe("zero-token startup-failure classifier (BLO-5681)", () => {
         status: "failed",
         errorCode: "context_overflow",
         usageJson: { inputTokens: 5000, outputTokens: 0 },
+      }),
+    ).toBe(false);
+    expect(
+      isZeroTokenStartupFailureRun({
+        status: "failed",
+        errorCode: "session_unavailable",
+        usageJson: { inputTokens: 1, outputTokens: 0 },
       }),
     ).toBe(false);
     expect(
@@ -340,6 +401,21 @@ describe("zero-token session-reset retry marker (BLO-10889 / BLO-10866 WS2)", ()
     expect(isZeroTokenSessionResetRetryRun({ contextSnapshot: null })).toBe(false);
     expect(isZeroTokenSessionResetRetryRun(null)).toBe(false);
     expect(isZeroTokenSessionResetRetryRun(undefined)).toBe(false);
+  });
+
+  it("treats only the exhausted ordinary session-unavailable chain as reset-exhausted", () => {
+    expect(
+      isZeroTokenSessionResetRetryRun({
+        contextSnapshot: { retryReason: "session_unavailable" },
+        scheduledRetryAttempt: 1,
+      }),
+    ).toBe(false);
+    expect(
+      isZeroTokenSessionResetRetryRun({
+        contextSnapshot: { retryReason: "session_unavailable" },
+        scheduledRetryAttempt: 2,
+      }),
+    ).toBe(true);
   });
 });
 
@@ -398,4 +474,3 @@ describe("isContinuationAttemptRetryReason — combined process_lost attempt cap
     expect(isContinuationAttemptRetryReason("zero_token_session_reset", "process_lost")).toBe(false);
   });
 });
-

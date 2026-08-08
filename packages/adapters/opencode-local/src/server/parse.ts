@@ -24,6 +24,7 @@ export function parseOpenCodeJsonl(stdout: string) {
   const messages: string[] = [];
   const errors: string[] = [];
   const toolErrors: string[] = [];
+  let toolCallCount = 0;
   const usage = {
     inputTokens: 0,
     cachedInputTokens: 0,
@@ -62,6 +63,7 @@ export function parseOpenCodeJsonl(stdout: string) {
     }
 
     if (type === "tool_use") {
+      toolCallCount += 1;
       const part = parseObject(event.part);
       const state = parseObject(part.state);
       if (asString(state.status, "") === "error") {
@@ -85,17 +87,28 @@ export function parseOpenCodeJsonl(stdout: string) {
     costUsd,
     errorMessage: errors.length > 0 ? errors.join("\n") : null,
     toolErrors,
+    toolCallCount,
   };
 }
 
 export function isOpenCodeUnknownSessionError(stdout: string, stderr: string): boolean {
-  const haystack = `${stdout}\n${stderr}`
+  const rawHaystack = `${stdout}\n${stderr}`
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter(Boolean)
     .join("\n");
 
-  return /unknown\s+session|session\b.*\bnot\s+found|resource\s+not\s+found:.*[\\/]session[\\/].*\.json|notfounderror|no session/i.test(
-    haystack,
-  );
+  if (
+    /unknown\s+session|session\b.*\bnot\s+found|resource\s+not\s+found:.*[\\/]session[\\/].*\.json|notfounderror|no session/i.test(
+      rawHaystack,
+    )
+  ) {
+    return true;
+  }
+
+  // Only structured OpenCode errors may opt into the Session unavailable
+  // recovery path. Assistant text is untrusted task output and must not be
+  // able to schedule a fresh-session retry.
+  const structuredError = parseOpenCodeJsonl(stdout).errorMessage ?? "";
+  return /session\s+unavailable/i.test(`${structuredError}\n${stderr}`);
 }

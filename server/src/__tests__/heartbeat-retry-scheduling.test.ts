@@ -32,6 +32,8 @@ import {
   MAX_TURN_CONTINUATION_WAKE_REASON,
   heartbeatService,
   isRetryableInteractionContinuationInfrastructureFailure,
+  SESSION_UNAVAILABLE_HEARTBEAT_RETRY_DELAY_MS,
+  SESSION_UNAVAILABLE_HEARTBEAT_RETRY_MAX_ATTEMPTS,
   shouldScheduleAutomaticRunRetry,
 } from "../services/heartbeat.js";
 
@@ -1567,6 +1569,86 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         },
       }),
     ).toBe(false);
+  });
+
+  it("retries only zero-token session-unavailable failures on the short bounded policy", () => {
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "session_unavailable",
+        resultJson: {},
+        contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
+        usageJson: { inputTokens: 0, outputTokens: 0 },
+      }),
+    ).toBe(true);
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "session_unavailable",
+        resultJson: {},
+        contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
+        usageJson: { inputTokens: 1, outputTokens: 0 },
+      }),
+    ).toBe(false);
+    expect(SESSION_UNAVAILABLE_HEARTBEAT_RETRY_DELAY_MS).toBe(30_000);
+    expect(SESSION_UNAVAILABLE_HEARTBEAT_RETRY_MAX_ATTEMPTS).toBe(2);
+  });
+
+  it("preserves the reset lineage when a zero-token session-unavailable run is retried", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const issueId = randomUUID();
+    const now = new Date();
+    await seedQueuedRunFixture({
+      companyId,
+      agentId,
+      runId,
+      now,
+      contextSnapshot: {
+        issueId,
+        wakeReason: "issue_zero_token_session_reset",
+        retryReason: "zero_token_session_reset",
+      },
+    });
+    mockAdapterExecute.mockResolvedValueOnce({
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      errorMessage: "Session unavailable",
+      errorCode: "session_unavailable",
+      usage: { inputTokens: 0, outputTokens: 0 },
+      summary: "failed",
+      resultJson: {},
+      provider: "test",
+      model: "test-model",
+    });
+
+    await heartbeat.__test_executeRunForTesting(runId);
+
+    const [failedRun, retryRun] = await Promise.all([
+      db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null),
+      db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.retryOfRunId, runId))
+        .then((rows) => rows[0] ?? null),
+    ]);
+    expect(retryRun).toMatchObject({
+      scheduledRetryReason: "zero_token_session_reset",
+      scheduledRetryAttempt: 1,
+      contextSnapshot: {
+        retryReason: "zero_token_session_reset",
+        wakeReason: "session_unavailable_retry",
+        scheduledRetryAttempt: 1,
+      },
+    });
+    expect(retryRun?.scheduledRetryAt?.getTime()).toBeGreaterThanOrEqual(
+      (failedRun?.finishedAt?.getTime() ?? 0) + SESSION_UNAVAILABLE_HEARTBEAT_RETRY_DELAY_MS - 1_000,
+    );
+    expect(failedRun?.contextSnapshot).toMatchObject({ adapterType: "codex_local" });
   });
 
   // BLO-9147 AC1 — thin-snapshot adapter_failed retry gate

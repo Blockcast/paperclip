@@ -141,6 +141,42 @@ describe("opencode local execution — session-unavailable recovery prompt (BLO-
     return workspaceDir;
   }
 
+  async function executeResumedSession(workspaceDir: string) {
+    return execute({
+      runId: "run-session-unavailable",
+      agent: {
+        id: "agent-1",
+        companyId: "company-1",
+        name: "OpenCode Builder",
+        adapterType: "opencode_local",
+        adapterConfig: {},
+      },
+      runtime: {
+        sessionId: "session-abc",
+        sessionParams: { sessionId: "session-abc", cwd: workspaceDir },
+        sessionDisplayId: "session-abc",
+        taskKey: null,
+      },
+      config: {
+        command: "opencode",
+        model: "test-provider/test-model",
+        promptTemplate: `${TASK_CONTEXT_MARKER} {{agentId}}`,
+        bootstrapPromptTemplate: `${BOOTSTRAP_MARKER} {{agentId}}`,
+        paperclipSkillSync: { desiredSkills: [] },
+      },
+      context: {
+        paperclipWorkspace: {
+          cwd: workspaceDir,
+          source: "project_primary",
+        },
+        paperclipWake: {
+          issue: { id: "issue-1", title: "Fix the thing" },
+        },
+      },
+      onLog: async () => {},
+    });
+  }
+
   it(
     "renders a fresh-session prompt (bootstrap + full task context, no resume-delta phrasing) on the recovered attempt, while leaving the original resume attempt's prompt unchanged",
     async () => {
@@ -269,4 +305,79 @@ describe("opencode local execution — session-unavailable recovery prompt (BLO-
     },
     RUN_CHILD_PROCESS_TEST_TIMEOUT_MS,
   );
+
+  it("classifies a terminal, zero-work Session unavailable retry so the control plane can bound it", async () => {
+    const workspaceDir = await makeWorkspaceDir("paperclip-opencode-session-unavailable-");
+    runChildProcess.mockImplementation(async (_runId, _command, args) => {
+      if (args.includes("models")) {
+        return {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          stdout: "test-provider/test-model\n",
+          stderr: "",
+          pid: 100,
+          startedAt: new Date().toISOString(),
+        };
+      }
+      return {
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+        stdout: JSON.stringify({ type: "error", error: { message: "Session unavailable" } }),
+        stderr: "",
+        pid: 101,
+        startedAt: new Date().toISOString(),
+      };
+    });
+
+    const result = await executeResumedSession(workspaceDir);
+
+    expect(result.errorCode).toBe("session_unavailable");
+    expect(result.clearSession).toBe(true);
+    const runCalls = runChildProcess.mock.calls.filter(
+      (entry) => Array.isArray(entry[2]) && entry[2].includes("run"),
+    );
+    expect(runCalls).toHaveLength(2);
+    expect(runCalls[0]?.[2]).toEqual(expect.arrayContaining(["--session", "session-abc"]));
+    expect(runCalls[1]?.[2]).not.toContain("--session");
+  });
+
+  it("does not retry or label a Session unavailable failure after a tool call", async () => {
+    const workspaceDir = await makeWorkspaceDir("paperclip-opencode-session-unavailable-tool-");
+    runChildProcess.mockImplementation(async (_runId, _command, args) => {
+      if (args.includes("models")) {
+        return {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          stdout: "test-provider/test-model\n",
+          stderr: "",
+          pid: 100,
+          startedAt: new Date().toISOString(),
+        };
+      }
+      return {
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+        stdout: [
+          JSON.stringify({ type: "tool_use", part: { state: { status: "completed" } } }),
+          JSON.stringify({ type: "error", error: { message: "Session unavailable" } }),
+        ].join("\n"),
+        stderr: "",
+        pid: 101,
+        startedAt: new Date().toISOString(),
+      };
+    });
+
+    const result = await executeResumedSession(workspaceDir);
+
+    expect(result.errorCode).toBeUndefined();
+    expect(result.clearSession).toBe(false);
+    const runCalls = runChildProcess.mock.calls.filter(
+      (entry) => Array.isArray(entry[2]) && entry[2].includes("run"),
+    );
+    expect(runCalls).toHaveLength(1);
+  });
 });
