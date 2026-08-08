@@ -1892,6 +1892,10 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
       const runIdByKey = new Map(rows.map((row) => [row.key, row.runId]));
       const targetRunId = runIdByKey.get("target")!;
       const targetIssueId = rows.find((row) => row.key === "target")!.issueId;
+      // The aged prefix is ordered blockedA < blockedB < blockedC < target, so
+      // a resume cursor strictly past this timestamp is proof the forward scan
+      // walked beyond `target` rather than stalling on the prefix.
+      const targetCreatedAt = rows.find((row) => row.key === "target")!.createdAt;
       let nextIssueNumber = rows.length + 2;
 
       await db.insert(issues).values([
@@ -2027,20 +2031,56 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
         });
       };
 
-      // Phase 1 — let the main scan walk the aged prefix while every aged row is
-      // still blocked, so `target` ends up behind the resume cursor. A couple of
-      // fresh criticals dispatching is ample evidence the cursor has moved on.
+      // Phase 1 — walk the main forward scan past the aged blocked prefix so
+      // `target` ends up BEHIND the resume cursor, and keep it there.
+      //
+      // This phase used to run ungated, waiting only for three dispatches. That
+      // was the same unsound shape Ally found in phase 2 (PR #1022 review at
+      // f7aa2df7, Important finding 2): with the mock resolving immediately,
+      // completion-triggered passes could keep dispatching through the finite
+      // backlog between iterations. If the queued set drained to within the
+      // forward scan's reach, `scanExhausted` latched, the resume cursor
+      // cleared, and phase 2 then found `target` from a head rescan on the MAIN
+      // scan -- with Lane C never paging. The case would pass against pre-fix
+      // source, which makes it worthless as this issue's verifying signal.
+      //
+      // So phase 1 now uses the SAME gated 2-in/<=1-out protocol as phase 2:
+      // two fresh criticals are inserted while the single slot is occupied and
+      // held, then exactly one execution is released, so at most one row can be
+      // consumed per iteration. Arrivals are stamped `now`, i.e. strictly after
+      // the cursor, so the rows ahead of the cursor grow monotonically and the
+      // bounded scan cannot reach its end. The geometry is established by
+      // construction rather than by racing a completion.
+      gateExecutions = true;
       await boundedHeartbeat.resumeQueuedRuns();
+      expect(await waitForHeldExecution()).toBe(true);
       const phaseOneDeadline = Date.now() + 60_000;
       while (Date.now() < phaseOneDeadline && dispatchedRunIds.length < 3) {
-        await new Promise((resolve) => setTimeout(resolve, 50));
+        // (a) replacements land while the slot is still occupied
+        await arriveFreshCritical();
+        await arriveFreshCritical();
+        // (b) free exactly one slot
+        releaseOneExecution();
+        // (c) let the freed slot be refilled, by our pass or a completion's
         await boundedHeartbeat.resumeQueuedRuns();
+        await waitForHeldExecution(2_000);
       }
       // Precondition, not the assertion under test: the blocked rows must NOT
       // have dispatched. If one did, the fixture failed to block them and the
       // masking geometry never formed.
       expect(dispatchedRunIds).not.toContain(targetRunId);
-      expect(dispatchedRunIds.length).toBeGreaterThanOrEqual(2);
+      expect(dispatchedRunIds.length).toBeGreaterThanOrEqual(3);
+
+      // The geometry itself, asserted rather than argued. Queue depth alone
+      // cannot distinguish "deep queue" from "cursor still advanced past the
+      // target", and only the latter is the condition under which this case's
+      // question is well-posed. A null cursor means the forward scan exhausted
+      // and the next pass rescans from the head -- which would rescue `target`
+      // through the main scan and prove nothing about Lane C.
+      const phaseOneCursor = boundedHeartbeat.__test_getDispatchResumeCursor(agentId);
+      expect(phaseOneCursor).not.toBeNull();
+      expect(new Date(phaseOneCursor!.createdAt).getTime())
+        .toBeGreaterThan(targetCreatedAt.getTime());
 
       // Phase 2 — `target` becomes dependency-ready while sitting behind the
       // main cursor and behind the lane's first page. Only a lane that pages
@@ -2058,12 +2098,13 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
       // and the head rescan rediscovers `target` through the MAIN scan -- which
       // makes the case pass against the unfixed source and proves nothing.
       //
-      // The previous version of this loop tried to arrange that by inserting
-      // two rows per iteration and sleeping. That was not sound: with the mock
+      // An earlier version of this loop tried to arrange that by inserting two
+      // rows per iteration and sleeping. That was not sound: with the mock
       // resolving immediately, completion-triggered passes could consume rows
       // between iterations, so the arrival rate was never actually guaranteed
       // to outrun the drain rate. Ally caught it; the fix is to stop relying on
-      // rates at all.
+      // rates at all, and phase 1 above now runs under the same protocol for
+      // the same reason.
       //
       // Gated protocol -- one slot, one held execution, so the accounting is
       // exact rather than statistical:
@@ -2079,13 +2120,26 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
       // therefore monotonically non-decreasing by construction, independent of
       // any timing, so the bounded forward scan cannot reach its end. That is
       // the precondition the assertion below records.
-      gateExecutions = true;
-      await boundedHeartbeat.resumeQueuedRuns();
-      expect(await waitForHeldExecution()).toBe(true);
+      //
+      // The gate is already on and a slot already held, carried over from phase
+      // one -- deliberately, so there is no ungated window between the two
+      // phases in which the queue could drain and clear the cursor this case
+      // just asserted.
+      expect(gateExecutions).toBe(true);
+      expect(heldExecutions.size).toBeGreaterThan(0);
 
       let minQueuedDuringPhaseTwo = await countQueuedRuns();
+      // The direct form of the same precondition: did the main forward scan
+      // ever exhaust and clear its resume cursor while phase 2 was running? If
+      // it did, a head rescan could have rediscovered `target` on the main scan
+      // and the dispatch below would not implicate Lane C at all. Queue depth
+      // is a proxy for this; the cursor is the thing itself.
+      let mainCursorClearedDuringPhaseTwo = false;
       const sampleQueuedDepth = async () => {
         minQueuedDuringPhaseTwo = Math.min(minQueuedDuringPhaseTwo, await countQueuedRuns());
+        if (!boundedHeartbeat.__test_getDispatchResumeCursor(agentId)) {
+          mainCursorClearedDuringPhaseTwo = true;
+        }
       };
       // 90s, not 120s. Phase 1 (60s) + phase 2 + the finally drain (60s) must
       // fit inside the `it` timeout with room to spare, or a REGRESSION fails
@@ -2129,6 +2183,9 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
       // been rescued by a head rescan after exhaustion. Without this the
       // assertion below does not distinguish the lane from the main scan.
       expect(minQueuedDuringPhaseTwo).toBeGreaterThan(2);
+      // ...and the direct form of it. Depth is circumstantial; a resume cursor
+      // that survived every sample is the geometry itself.
+      expect(mainCursorClearedDuringPhaseTwo).toBe(false);
 
       // The regression: masked behind a dependency-blocked page AND behind the
       // main resume cursor, the aged row must still be dispatched -- while the
@@ -2152,6 +2209,303 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     // still leaves headroom for the assertions to run and REPORT. At the old
     // 240s this case failed as "Test timed out" against pre-fix source, which
     // discriminates but says nothing about what broke.
+  }, 300_000);
+
+  it("dispatches an aged interaction wake whose issue is dependency-blocked, since the claim path accepts it, while a non-interaction blocked row still waits (BLO-21792 fourth review follow-up)", async () => {
+    // Ally's review of PR #1022 at f7aa2df7 (Important finding 1): dispatch and
+    // the claim path disagreed about what "dependency-blocked" disqualifies.
+    //
+    //   claimQueuedRun    : cancels a queued run whose issue has unresolved
+    //                       blockers *unless* it is an issue-interaction wake
+    //                       carrying a comment id — those are allowed to run,
+    //                       so a human can talk to the assignee mid-block.
+    //   dispatch (before) : ranked ANY blocked row at 12+, below every routine
+    //                       row, and the starvation lanes paged past it as
+    //                       "not ready".
+    //
+    // So an interaction wake the claim path would have run immediately was
+    // ranked last and skipped by the lane. Under sustained critical arrivals
+    // that is unbounded — the exact starvation shape the absolute floor exists
+    // to cap, reappearing through a readiness definition rather than through
+    // the aging formula. Both sides now read
+    // `isEffectivelyDependencyReadyForDispatch`.
+    //
+    // The `blockedControl` row is what keeps this honest: it is aged and
+    // blocked identically but its wake is a plain `issue_assigned`, which the
+    // claim path WOULD cancel. It must still not dispatch. Without it, this
+    // case would also pass if the fix had simply stopped honouring blockers.
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issuePrefix = `Z${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const SEVEN_HOURS_MS = 7 * 60 * 60 * 1000;
+    const baseNow = Date.now();
+
+    const boundedHeartbeat = heartbeatService(db, {
+      penstockGate: allowPenstockGate,
+      queuedRunDispatchBounds: { scanLimit: 2, maxScanBatches: 1, maxResumePasses: 64 },
+    });
+
+    // Same gated protocol as the case above: two arrivals in, at most one row
+    // out per iteration, so the queued set cannot drain and the pressure the
+    // question depends on is maintained by construction rather than by timing.
+    const heldExecutions = new Map<string, () => void>();
+    let gateExecutions = false;
+    const releaseOneExecution = () => {
+      for (const [runId, release] of heldExecutions) {
+        heldExecutions.delete(runId);
+        release();
+        return true;
+      }
+      return false;
+    };
+    const releaseAllExecutions = () => {
+      let released = releaseOneExecution();
+      while (released) {
+        released = releaseOneExecution();
+      }
+    };
+    const waitForHeldExecution = async (timeoutMs = 10_000) => {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline && heldExecutions.size === 0) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      return heldExecutions.size > 0;
+    };
+
+    try {
+      await db.insert(companies).values({
+        id: companyId,
+        name: "BlockedInteractionWakeCo",
+        issuePrefix,
+        requireBoardApprovalForNewAgents: false,
+        defaultResponsibleUserId: "responsible-user",
+      });
+
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: "BlockedInteractionWakeAgent",
+        role: "engineer",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+        permissions: {},
+      });
+
+      const blockerIssueId = randomUUID();
+      const aged = (offsetMs: number) => new Date(baseNow - SEVEN_HOURS_MS + offsetMs);
+      const rows = [
+        // Aged, blocked, and an interaction wake: claimable, so dispatch must
+        // treat it as runnable.
+        {
+          key: "interactionWake",
+          priority: "medium" as const,
+          createdAt: aged(0),
+          blocked: true,
+          wakeReason: "issue_commented",
+          wakeCommentId: randomUUID(),
+        },
+        // Aged, blocked, NOT an interaction wake: the claim path would cancel
+        // it, so dispatch must keep ranking it last.
+        {
+          key: "blockedControl",
+          priority: "medium" as const,
+          createdAt: aged(1),
+          blocked: true,
+          wakeReason: "issue_assigned",
+          wakeCommentId: null as string | null,
+        },
+        ...Array.from({ length: 12 }, (_, index) => ({
+          key: `freshCritical${index}`,
+          priority: "critical" as const,
+          createdAt: new Date(baseNow + index),
+          blocked: false,
+          wakeReason: "issue_assigned",
+          wakeCommentId: null as string | null,
+        })),
+      ].map((row, index) => ({
+        ...row,
+        issueId: randomUUID(),
+        runId: randomUUID(),
+        issueNumber: index + 2,
+      }));
+      const runIdByKey = new Map(rows.map((row) => [row.key, row.runId]));
+      const interactionRunId = runIdByKey.get("interactionWake")!;
+      const controlRunId = runIdByKey.get("blockedControl")!;
+      let nextIssueNumber = rows.length + 2;
+
+      await db.insert(issues).values([
+        {
+          id: blockerIssueId,
+          companyId,
+          title: "Blocker",
+          status: "in_progress" as const,
+          priority: "medium" as const,
+          issueNumber: 1,
+          identifier: `${issuePrefix}-1`,
+          responsibleUserId: "responsible-user",
+        },
+        ...rows.map((row) => ({
+          id: row.issueId,
+          companyId,
+          title: `Queued ${row.key}`,
+          status: "in_progress" as const,
+          priority: row.priority,
+          assigneeAgentId: agentId,
+          issueNumber: row.issueNumber,
+          identifier: `${issuePrefix}-${row.issueNumber}`,
+          startedAt: row.createdAt,
+          responsibleUserId: "responsible-user",
+        })),
+      ]);
+
+      // The blocker stays OPEN for the whole case. Nothing here ever becomes
+      // dependency-ready in the raw sense; the interaction wake dispatches
+      // because it is *effectively* claimable, which is the whole point.
+      await db.insert(issueRelations).values(
+        rows.filter((row) => row.blocked).map((row) => ({
+          companyId,
+          issueId: blockerIssueId,
+          relatedIssueId: row.issueId,
+          type: "blocks" as const,
+        })),
+      );
+
+      for (const row of rows) {
+        const wakeId = randomUUID();
+        await db.insert(agentWakeupRequests).values({
+          id: wakeId,
+          companyId,
+          agentId,
+          source: "assignment",
+          triggerDetail: "system",
+          reason: row.wakeReason,
+          payload: { issueId: row.issueId },
+          status: "queued",
+          runId: row.runId,
+          requestedAt: row.createdAt,
+          updatedAt: row.createdAt,
+        });
+        await db.insert(heartbeatRuns).values({
+          id: row.runId,
+          companyId,
+          agentId,
+          invocationSource: "assignment",
+          triggerDetail: "system",
+          status: "queued",
+          wakeupRequestId: wakeId,
+          contextSnapshot: {
+            issueId: row.issueId,
+            taskId: row.issueId,
+            wakeReason: row.wakeReason,
+            ...(row.wakeCommentId ? { wakeCommentId: row.wakeCommentId } : {}),
+          },
+          createdAt: row.createdAt,
+          updatedAt: row.createdAt,
+        });
+      }
+
+      const dispatchedRunIds: string[] = [];
+      mockAdapterExecute.mockImplementation(async (args: { runId: string }) => {
+        dispatchedRunIds.push(args.runId);
+        if (gateExecutions) {
+          await new Promise<void>((resolve) => {
+            heldExecutions.set(args.runId, resolve);
+          });
+        }
+        return {
+          exitCode: 0,
+          signal: null as string | null,
+          timedOut: false,
+          errorMessage: null as string | null,
+          resultJson: { exitCode: 0 },
+          provider: "test",
+          model: "test-model",
+        };
+      });
+
+      const arriveFreshCritical = async () => {
+        const issueId = randomUUID();
+        const runId = randomUUID();
+        const wakeId = randomUUID();
+        const issueNumber = nextIssueNumber++;
+        const createdAt = new Date(Date.now());
+        await db.insert(issues).values({
+          id: issueId,
+          companyId,
+          title: `Arrival ${issueNumber}`,
+          status: "in_progress" as const,
+          priority: "critical" as const,
+          assigneeAgentId: agentId,
+          issueNumber,
+          identifier: `${issuePrefix}-${issueNumber}`,
+          startedAt: createdAt,
+          responsibleUserId: "responsible-user",
+        });
+        await db.insert(agentWakeupRequests).values({
+          id: wakeId,
+          companyId,
+          agentId,
+          source: "assignment",
+          triggerDetail: "system",
+          reason: "issue_assigned",
+          payload: { issueId },
+          status: "queued",
+          runId,
+          requestedAt: createdAt,
+          updatedAt: createdAt,
+        });
+        await db.insert(heartbeatRuns).values({
+          id: runId,
+          companyId,
+          agentId,
+          invocationSource: "assignment",
+          triggerDetail: "system",
+          status: "queued",
+          wakeupRequestId: wakeId,
+          contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_assigned" },
+          createdAt,
+          updatedAt: createdAt,
+        });
+      };
+
+      gateExecutions = true;
+      await boundedHeartbeat.resumeQueuedRuns();
+      expect(await waitForHeldExecution()).toBe(true);
+
+      const deadline = Date.now() + 90_000;
+      while (Date.now() < deadline && !dispatchedRunIds.includes(interactionRunId)) {
+        await arriveFreshCritical();
+        await arriveFreshCritical();
+        releaseOneExecution();
+        await boundedHeartbeat.resumeQueuedRuns();
+        await waitForHeldExecution(2_000);
+      }
+      // Read both verdicts BEFORE teardown, for the same reason the case above
+      // does: releasing the gates drains the queue, and a drained queue is
+      // exactly the condition under which pre-fix source also gets around to
+      // the aged rows. The sustained-pressure window is the only interval in
+      // which this question is well-posed.
+      const interactionDispatchedUnderPressure = dispatchedRunIds.includes(interactionRunId);
+      const controlDispatchedUnderPressure = dispatchedRunIds.includes(controlRunId);
+
+      releaseAllExecutions();
+      gateExecutions = false;
+      await boundedHeartbeat.drainInFlightExecutions(60_000);
+
+      // The regression. Pre-fix this row ranks 12+ behind an endless supply of
+      // fresh critical arrivals and never dispatches.
+      expect(interactionDispatchedUnderPressure).toBe(true);
+      // The guard against over-correcting: a genuinely unclaimable blocked row
+      // must still lose. If this ever flips, the exemption has widened from
+      // "interaction wakes" to "blocked rows", and the claim path would cancel
+      // whatever dispatch just started.
+      expect(controlDispatchedUnderPressure).toBe(false);
+    } finally {
+      releaseAllExecutions();
+      await boundedHeartbeat.drainInFlightExecutions(60_000);
+    }
   }, 300_000);
 
   it("dispatches critical issue work before an aged issue-less run without starving routine issue work (BLO-19337)", async () => {
