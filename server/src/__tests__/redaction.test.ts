@@ -306,6 +306,14 @@ describe("sanitizeRecord value-shape gate (BLO-20810)", () => {
     expect(result?.base_url).toBe(REDACTED_EVENT_VALUE);
   });
 
+  it("still redacts a Tier-2 URL with credential parameters in its fragment", () => {
+    const result = redactEventPayload({
+      base_url: "https://client.example/callback#access_token=abc123def456&token_type=bearer",
+    });
+
+    expect(result?.base_url).toBe(REDACTED_EVENT_VALUE);
+  });
+
   // CTO finding (#943 review, post-tiering): the URL branch returned "safe"
   // for any URL without `user:pass@` userinfo or a `?token=`-style query, so
   // a capability URL that embeds its credential directly in the path (a
@@ -332,6 +340,18 @@ describe("sanitizeRecord value-shape gate (BLO-20810)", () => {
     expect(result?.base_url).toBe("https://github.com/Blockcast/paperclip/pull/1898");
   });
 
+  it("does not redact full Git object IDs or canonical UUIDs in Tier-2 URL paths", () => {
+    const result = redactEventPayload({
+      base_url: "https://github.com/Blockcast/paperclip/commit/76c13c6e9a883091335220be89cdcf12b2823ad9",
+      author_link: "https://example.test/evidence/550e8400-e29b-41d4-a716-446655440000",
+    });
+
+    expect(result?.base_url).toBe(
+      "https://github.com/Blockcast/paperclip/commit/76c13c6e9a883091335220be89cdcf12b2823ad9",
+    );
+    expect(result?.author_link).toBe("https://example.test/evidence/550e8400-e29b-41d4-a716-446655440000");
+  });
+
   // Ally review (#943): a spaced passphrase or cookie value was exempted by
   // the old whitespace check. Both key stems are Tier-1 now, so the value
   // shape never matters.
@@ -351,6 +371,14 @@ describe("sanitizeRecord value-shape gate (BLO-20810)", () => {
     });
 
     expect(result?.userAuthContext).toBe(REDACTED_EVENT_VALUE);
+  });
+
+  it("keeps unknown delimiter-separated opaque values redacted under a Tier-2 key", () => {
+    const result = redactEventPayload({
+      authoritative_state: "a1b2c3d4-e5f6g7h8-i9j0k1l2",
+    });
+
+    expect(result?.authoritative_state).toBe(REDACTED_EVENT_VALUE);
   });
 
   // Residual finding (#943 review, post-tiering): `auth`/`secret` as a whole
@@ -374,13 +402,27 @@ describe("sanitizeRecord value-shape gate (BLO-20810)", () => {
     expect(result?.clientSecret).toBe(REDACTED_EVENT_VALUE);
   });
 
-  it("does not promote base_url, or sentence-shaped/multi-token keys, to tier 1", () => {
+  it("redacts a short value under a multi-token field ending in auth or secret", () => {
+    const result = redactEventPayload({
+      stripe_webhook_secret: "whsec123",
+      database_client_secret: "s3cr3t99",
+      thirdPartyAuth: "pw12345",
+    });
+
+    expect(result?.stripe_webhook_secret).toBe(REDACTED_EVENT_VALUE);
+    expect(result?.database_client_secret).toBe(REDACTED_EVENT_VALUE);
+    expect(result?.thirdPartyAuth).toBe(REDACTED_EVENT_VALUE);
+  });
+
+  it("does not promote base_url or sentence-shaped Tier-2 keys to tier 1", () => {
     const input = {
       base_url: "short",
       author: "octocat",
       authors: ["alice", "bob"],
       ask_2_author_identity: "PR #1898 was authored by the app account, not a human.",
       no_secrets_in_payload: "No secret values are present in this payload.",
+      secret_fields_must_stay_redacted: "This field intentionally left blank.",
+      no_secret_values_in_this_report: "No secret values are present in this report.",
     };
 
     expect(redactEventPayload(structuredClone(input))).toEqual(input);

@@ -34,14 +34,11 @@ const SECRET_TIER2_KEY_RE = new RegExp(String.raw`[A-Za-z0-9_-]*(?:${SECRET_TIER
 
 /**
  * `auth`/`secret` are Tier 2 because they collide with ordinary words
- * (`author`, `no_secrets_in_payload`), but as a *whole token* in a short key
- * they're never that collision — `secret`, `client_secret`, `webhook_secret`,
- * `auth` are ordinary credential field names, not prose. Promote those to
- * Tier 1 so a short value under them (`{ secret: "hunter2" }`) doesn't fall
- * through `looksLikeCredentialValue`'s length/shape gate (BLO-20810 residual
- * finding, #943 review). `author`/`authors` keep Tier 2 because "auth" isn't
- * a whole token in them; `base_url` is excluded on purpose — it is two
- * tokens but never itself a credential value.
+ * (`author`, `no_secrets_in_payload`), but as a whole token in a field name
+ * they are usually credential names. Promote short keys as before, and longer
+ * keys only when the ambiguous token is trailing: `stripe_webhook_secret` and
+ * `thirdPartyAuth` are Tier 1, while sentence-shaped keys such as
+ * `secret_fields_must_stay_redacted` remain Tier 2.
  */
 const AMBIGUOUS_PROMOTABLE_TOKENS = new Set(["auth", "secret"]);
 
@@ -55,7 +52,9 @@ function keyTokens(key: string): string[] {
 
 function promotesTier2ToTier1(key: string): boolean {
   const tokens = keyTokens(key);
-  return tokens.length > 0 && tokens.length <= 2 && tokens.some((token) => AMBIGUOUS_PROMOTABLE_TOKENS.has(token));
+  if (tokens.length === 0) return false;
+  if (tokens.length <= 2) return tokens.some((token) => AMBIGUOUS_PROMOTABLE_TOKENS.has(token));
+  return AMBIGUOUS_PROMOTABLE_TOKENS.has(tokens[tokens.length - 1]);
 }
 
 /**
@@ -258,6 +257,8 @@ const URL_CREDENTIAL_QUERY_RE = /[?&](?:token|sig|signature|api[-_]?key|access[-
 const KNOWN_SECRET_PREFIX_RE = /^(?:sk-|sk_live_|pk_live_|ghp_|gho_|ghu_|ghs_|ghr_|xox[baprs]-|AKIA|glpat-|gsk_)/i;
 const JWT_LIKE_VALUE_RE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
 const MIN_OPAQUE_TOKEN_LENGTH = 20;
+const FULL_GIT_OBJECT_ID_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
+const CANONICAL_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
  * A URL's total length trivially exceeds any opaque-token threshold, so a
@@ -267,6 +268,10 @@ const MIN_OPAQUE_TOKEN_LENGTH = 20;
  * capability/webhook URL that embeds its credential directly in the path
  * (no `user:pass@`, no `?token=`) puts the whole secret in a single segment,
  * e.g. `https://hooks.slack.test/services/T000/B000/<opaque-secret>`.
+ *
+ * Full Git object IDs and canonical UUIDs are recognizable identifiers, so
+ * they remain readable. Other long path segments stay fail-closed: arbitrary
+ * delimiter-separated chunks can still be credentials.
  */
 function hasOpaqueUrlPathSegment(pathname: string): boolean {
   return pathname.split("/").some((rawSegment) => {
@@ -277,7 +282,8 @@ function hasOpaqueUrlPathSegment(pathname: string): boolean {
     } catch {
       // Malformed percent-encoding: judge the raw segment as-is.
     }
-    return !/\s/.test(segment) && segment.length >= MIN_OPAQUE_TOKEN_LENGTH;
+    if (/\s/.test(segment) || segment.length < MIN_OPAQUE_TOKEN_LENGTH) return false;
+    return !FULL_GIT_OBJECT_ID_RE.test(segment) && !CANONICAL_UUID_RE.test(segment);
   });
 }
 
@@ -307,7 +313,9 @@ function looksLikeCredentialValue(value: string): boolean {
   if (URL_LIKE_VALUE_RE.test(trimmed)) {
     if (URL_USERINFO_RE.test(trimmed) || URL_CREDENTIAL_QUERY_RE.test(trimmed)) return true;
     try {
-      return hasOpaqueUrlPathSegment(new URL(trimmed).pathname);
+      const url = new URL(trimmed);
+      if (url.hash.length > 1 && URL_CREDENTIAL_QUERY_RE.test(`?${url.hash.slice(1)}`)) return true;
+      return hasOpaqueUrlPathSegment(url.pathname);
     } catch {
       return false;
     }
