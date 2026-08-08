@@ -12,6 +12,7 @@ const mockIssueService = vi.hoisted(() => ({
 const mockInteractionService = vi.hoisted(() => ({
   listForIssue: vi.fn(),
   create: vi.fn(),
+  getById: vi.fn(),
   acceptInteraction: vi.fn(),
   acceptSuggestedTasks: vi.fn(),
   rejectInteraction: vi.fn(),
@@ -727,6 +728,77 @@ describe.sequential("issue thread interaction routes", () => {
 
     expect(res.status).toBe(403);
     expect(mockAccessDecide).toHaveBeenCalledWith(expect.objectContaining({ action: "issue:mutate" }));
+    expect(mockInteractionService.withdrawInteraction).not.toHaveBeenCalled();
+  });
+
+  it("lets the interaction creator withdraw after reassignment removes its issue grant", async () => {
+    mockAccessDecide.mockResolvedValueOnce({
+      allowed: false,
+      action: "issue:mutate",
+      reason: "deny_missing_grant",
+      explanation: "Issue mutation is outside the active trust boundary.",
+    });
+    mockInteractionService.getById.mockResolvedValueOnce({
+      id: "interaction-2",
+      createdByAgentId: CREATED_AGENT_ID,
+    });
+    const app = await createApp(AGENT_ACTOR);
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-2/withdraw")
+      .send({ reason: "Issue moved on without me" });
+
+    expect(res.status).toBe(200);
+    expect(mockInteractionService.getById).toHaveBeenCalledWith("interaction-2");
+    expect(mockInteractionService.withdrawInteraction).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" }),
+      "interaction-2",
+      { reason: "Issue moved on without me" },
+      expect.objectContaining({ agentId: CREATED_AGENT_ID, userId: null }),
+      { requireCreatedByAgentId: CREATED_AGENT_ID },
+    );
+  });
+
+  it("keeps a missing-grant denial when a different agent created the interaction", async () => {
+    mockAccessDecide.mockResolvedValueOnce({
+      allowed: false,
+      action: "issue:mutate",
+      reason: "deny_missing_grant",
+      explanation: "Issue mutation is outside the active trust boundary.",
+    });
+    mockInteractionService.getById.mockResolvedValueOnce({
+      id: "interaction-2",
+      createdByAgentId: "33333333-3333-4333-8333-333333333333",
+    });
+    const app = await createApp(AGENT_ACTOR);
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-2/withdraw")
+      .send({});
+
+    expect(res.status).toBe(403);
+    expect(mockInteractionService.withdrawInteraction).not.toHaveBeenCalled();
+  });
+
+  it("keeps scoped-credential denials terminal even for the interaction creator", async () => {
+    mockAccessDecide.mockResolvedValueOnce({
+      allowed: false,
+      action: "issue:mutate",
+      reason: "deny_scope",
+      explanation: "Task bridge key can only access assigned or bridge-created issues.",
+    });
+    mockInteractionService.getById.mockResolvedValueOnce({
+      id: "interaction-2",
+      createdByAgentId: CREATED_AGENT_ID,
+    });
+    const app = await createApp(AGENT_ACTOR);
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-2/withdraw")
+      .send({ reason: "Out-of-scope key must not get through" });
+
+    expect(res.status).toBe(403);
+    expect(mockInteractionService.getById).not.toHaveBeenCalled();
     expect(mockInteractionService.withdrawInteraction).not.toHaveBeenCalled();
   });
 

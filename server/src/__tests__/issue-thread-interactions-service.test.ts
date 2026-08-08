@@ -1708,6 +1708,55 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     });
   });
 
+  it("allows an agent-owned issue to create an interaction a board user can resolve", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Agent-owned confirmation");
+    const agentId = randomUUID();
+    const agentOwnedIssue = {
+      id: issueId,
+      companyId,
+      assigneeAgentId: agentId,
+      assigneeUserId: null,
+    };
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Assigned engineer",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.update(issues).set({
+      assigneeAgentId: agentId,
+      assigneeUserId: null,
+    }).where(eq(issues.id, issueId));
+
+    const created = await interactionsSvc.create(agentOwnedIssue, {
+      kind: "request_confirmation",
+      payload: {
+        version: 1,
+        prompt: "Proceed with the implementation?",
+      },
+    } as CreateIssueThreadInteraction, { agentId });
+
+    const rejected = await interactionsSvc.rejectInteraction(
+      { id: issueId, companyId },
+      created.id,
+      { reason: "Please revise the scope first." },
+      { userId: "local-board" },
+    );
+
+    expect(created).toMatchObject({ kind: "request_confirmation", status: "pending" });
+    expect(rejected).toMatchObject({
+      id: created.id,
+      status: "rejected",
+      resolvedByUserId: "local-board",
+    });
+  });
+
   it("expires request confirmations by default when a user comments after creation", async () => {
     const { companyId, issueId } = await seedConfirmationIssue();
     const commentId = randomUUID();

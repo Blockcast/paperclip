@@ -11910,8 +11910,17 @@ export function issueRoutes(
         // after another agent has taken over the issue.
         const boundaryDecision = await decideIssueAccess(req, issue, "issue:mutate");
         if (!boundaryDecision.allowed) {
-          respondIssueBoundaryDenied(res, boundaryDecision);
-          return;
+          // A missing issue grant can result from reassignment, while a scoped
+          // credential denial is still a hard boundary. The service rechecks
+          // creator ownership in its UPDATE predicate before changing the row.
+          const createdInteraction =
+            actor.agentId && boundaryDecision.reason === "deny_missing_grant"
+              ? await issueThreadInteractionService(db).getById(interactionId)
+              : null;
+          if (!createdInteraction || createdInteraction.createdByAgentId !== actor.agentId) {
+            respondIssueBoundaryDenied(res, boundaryDecision);
+            return;
+          }
         }
         // Without a run id the watchdog scope above resolves to "none" and
         // silently stops confining the caller, so require one exactly as the
