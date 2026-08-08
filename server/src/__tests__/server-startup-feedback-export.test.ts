@@ -45,6 +45,12 @@ const {
     resumeRunningExternalRuntimeRuns: vi.fn(async () => 0),
     stopDispatch: vi.fn(),
     reconcileHotRestartAdoption: vi.fn(async () => ({ mode: "none" })),
+    reconcileWorkerCrashedRuns: vi.fn(async () => ({
+      reconciledRunIds: [],
+      retryRunIds: [],
+      unresolvedRunIds: [],
+      budgetExhausted: false,
+    })),
     reapOrphanedRuns: vi.fn(async () => ({ reaped: 0, runIds: [] })),
     promoteDueScheduledRetries: vi.fn(async () => ({ promoted: 0, runIds: [] })),
     resumeQueuedRuns: vi.fn(async () => undefined),
@@ -529,12 +535,153 @@ describe("startServer feedback export wiring", () => {
       );
 
       intervalCallback?.();
-      await Promise.resolve();
-      await Promise.resolve();
-
-      expect(heartbeatServiceMock.sweepStaleIssueLocks).toHaveBeenCalledTimes(1);
+      await vi.waitFor(() => expect(heartbeatServiceMock.sweepStaleIssueLocks).toHaveBeenCalledTimes(1));
       expect(heartbeatServiceMock.reconcileDetachedQueuedRuns).toHaveBeenCalledTimes(1);
     } finally {
+      setIntervalSpy.mockRestore();
+    }
+  });
+
+  it("runs worker-crash reconciliation on the periodic scheduler tick", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+    let intervalCallback: (() => void) | null = null;
+    const setIntervalSpy = vi
+      .spyOn(globalThis, "setInterval")
+      .mockImplementation(((callback: () => void) => {
+        intervalCallback = callback;
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      }) as typeof setInterval);
+
+    try {
+      await startServer();
+      await vi.waitFor(() =>
+        expect(heartbeatServiceMock.reconcileWorkerCrashedRuns).toHaveBeenCalledTimes(1),
+      );
+      heartbeatServiceMock.reconcileWorkerCrashedRuns.mockClear();
+
+      intervalCallback?.();
+      await vi.waitFor(() =>
+        expect(heartbeatServiceMock.reconcileWorkerCrashedRuns).toHaveBeenCalledTimes(1),
+      );
+    } finally {
+      setIntervalSpy.mockRestore();
+    }
+  });
+
+  it("does not start crash reconciliation after shutdown starts during suppression resolution", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+    let intervalCallback: (() => void) | null = null;
+    const setIntervalSpy = vi
+      .spyOn(globalThis, "setInterval")
+      .mockImplementation(((callback: () => void) => {
+        intervalCallback = callback;
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      }) as typeof setInterval);
+    const priorSigterm = process.listeners("SIGTERM");
+    process.removeAllListeners("SIGTERM");
+
+    try {
+      await startServer();
+      await vi.waitFor(() =>
+        expect(heartbeatServiceMock.reconcileWorkerCrashedRuns).toHaveBeenCalledTimes(1),
+      );
+      heartbeatServiceMock.reconcileWorkerCrashedRuns.mockClear();
+      heartbeatServiceMock.sweepStaleIssueLocks.mockClear();
+
+      let releaseSuppression: (() => void) | null = null;
+      resolveHeartbeatSchedulingSuppressionMock
+        .mockImplementationOnce(() => ({ suppressed: false, reason: null }))
+        .mockImplementationOnce(
+          () => new Promise<{ suppressed: boolean; reason: string | null }>((resolve) => {
+            releaseSuppression = () => resolve({ suppressed: false, reason: null });
+          }),
+        );
+
+      intervalCallback?.();
+      await vi.waitFor(() => expect(releaseSuppression).not.toBeNull());
+
+      process.emit("SIGTERM" as NodeJS.Signals);
+      await vi.waitFor(() => expect(fakeServer.close).toHaveBeenCalled());
+
+      releaseSuppression?.();
+      for (let index = 0; index < 25; index += 1) await Promise.resolve();
+
+      expect(heartbeatServiceMock.reconcileWorkerCrashedRuns).not.toHaveBeenCalled();
+      expect(heartbeatServiceMock.sweepStaleIssueLocks).not.toHaveBeenCalled();
+    } finally {
+      setIntervalSpy.mockRestore();
+      process.removeAllListeners("SIGTERM");
+      for (const listener of priorSigterm) {
+        process.on("SIGTERM", listener as (...args: unknown[]) => void);
+      }
+    }
+  });
+
+  it("serializes crash reconciliation and stale-lock sweeping across interval ticks", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+    let intervalCallback: (() => void) | null = null;
+    const setIntervalSpy = vi
+      .spyOn(globalThis, "setInterval")
+      .mockImplementation(((callback: () => void) => {
+        intervalCallback = callback;
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      }) as typeof setInterval);
+    let releaseReconciliation: (() => void) | null = null;
+
+    try {
+      await startServer();
+      await vi.waitFor(() =>
+        expect(heartbeatServiceMock.reconcileWorkerCrashedRuns).toHaveBeenCalledTimes(1),
+      );
+      heartbeatServiceMock.reconcileWorkerCrashedRuns.mockClear();
+      heartbeatServiceMock.sweepStaleIssueLocks.mockClear();
+
+      heartbeatServiceMock.reconcileWorkerCrashedRuns.mockImplementationOnce(
+        () => new Promise<{
+          reconciledRunIds: string[];
+          retryRunIds: string[];
+          unresolvedRunIds: string[];
+          budgetExhausted: boolean;
+        }>((resolve) => {
+          releaseReconciliation = () => resolve({
+            reconciledRunIds: [],
+            retryRunIds: [],
+            unresolvedRunIds: [],
+            budgetExhausted: false,
+          });
+        }),
+      );
+
+      intervalCallback?.();
+      await vi.waitFor(() =>
+        expect(heartbeatServiceMock.reconcileWorkerCrashedRuns).toHaveBeenCalledTimes(1),
+      );
+
+      intervalCallback?.();
+      await vi.waitFor(() =>
+        expect(heartbeatServiceMock.reconcileDetachedQueuedRuns).toHaveBeenCalled(),
+      );
+      expect(heartbeatServiceMock.reconcileWorkerCrashedRuns).toHaveBeenCalledTimes(1);
+      expect(heartbeatServiceMock.sweepStaleIssueLocks).not.toHaveBeenCalled();
+
+      releaseReconciliation?.();
+      await vi.waitFor(() => expect(heartbeatServiceMock.sweepStaleIssueLocks).toHaveBeenCalledTimes(1));
+
+      intervalCallback?.();
+      await vi.waitFor(() =>
+        expect(heartbeatServiceMock.reconcileWorkerCrashedRuns).toHaveBeenCalledTimes(2),
+      );
+    } finally {
+      releaseReconciliation?.();
       setIntervalSpy.mockRestore();
     }
   });

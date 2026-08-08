@@ -5,6 +5,29 @@ import { promisify } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
 import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNotNull, isNull, lt, lte, ne, not, notInArray, or, sql, type SQL } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
+
+type HeartbeatTx = Parameters<Parameters<Db["transaction"]>[0]>[0];
+type HeartbeatDbExecutor = Db | HeartbeatTx;
+
+/** The process-loss retry result must distinguish deliberate suppression from a failed enqueue. */
+type ProcessLossRetryResult =
+  | {
+      kind: "created" | "adopted";
+      run: typeof heartbeatRuns.$inferSelect;
+      issueLockOwnedByRetry: boolean;
+      retryContinuesContextIssue: boolean;
+    }
+  | { kind: "suppressed"; reason: string };
+
+type CrashRecoveryStepOutcome =
+  | { kind: "done" }
+  | { kind: "skipped"; detail: string }
+  | { kind: "incomplete"; detail: string };
+
+type AgentFinalizationResult =
+  | { kind: "applied" }
+  | { kind: "superseded"; reason: string }
+  | { kind: "failed"; reason: string };
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
   ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
@@ -1190,6 +1213,59 @@ const EXTERNAL_LIFECYCLE_ADAPTERS = new Set<string>(EXTERNAL_LIFECYCLE_ADAPTER_T
 // threshold. Issue/worktree ownership stays more conservative: a running row
 // holds its issue until it reaches a terminal/missing lifecycle state.
 const EXTERNAL_LIFECYCLE_STALE_MS = RUN_STALE_SILENCE_MS;
+const WORKER_CRASH_RECONCILE_MAX_RUNS = 200;
+const WORKER_CRASH_RECONCILE_BUDGET_MS = 2 * 60 * 1000;
+const WORKER_CRASH_RECOVERY_BACKOFF_BASE_MS = 5 * 60 * 1000;
+const WORKER_CRASH_RECOVERY_BACKOFF_MAX_MS = 6 * 60 * 60 * 1000;
+const WORKER_CRASH_RECOVERY_CLAIM_TTL_MS = 10 * 60 * 1000;
+const WORKER_CRASH_RECOVERY_PROVIDER_RELEASE_TIMEOUT_MS = WORKER_CRASH_RECOVERY_CLAIM_TTL_MS / 2;
+const WORKER_CRASH_RECOVERY_ERROR_MAX_CHARS = 500;
+
+async function withRecoveryProviderTimeout<T>(
+  label: string,
+  work: Promise<T>,
+  onTimeout: (detail: string) => T,
+  timeoutMs: number = WORKER_CRASH_RECOVERY_PROVIDER_RELEASE_TIMEOUT_MS,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<T>((resolve) => {
+    timer = setTimeout(() => resolve(onTimeout(`${label} exceeded ${timeoutMs}ms`)), timeoutMs);
+    timer.unref?.();
+  });
+  try {
+    return await Promise.race([work, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function workerCrashRecoveryBackoffMs(attempts: number): number {
+  const exponent = Math.min(Math.max(0, attempts - 1), 31);
+  return Math.min(WORKER_CRASH_RECOVERY_BACKOFF_BASE_MS * 2 ** exponent, WORKER_CRASH_RECOVERY_BACKOFF_MAX_MS);
+}
+
+function resolveCrashRecoveryClock(now: Date | (() => Date) | undefined): () => Date {
+  if (typeof now === "function") return now;
+  if (now) return () => now;
+  return () => new Date();
+}
+
+function describeRecoveryError(error: unknown): string {
+  const text = error instanceof Error
+    ? `${error.name}: ${error.message}`
+    : typeof error === "string"
+      ? error
+      : (() => {
+        try {
+          return JSON.stringify(error) ?? String(error);
+        } catch {
+          return String(error);
+        }
+      })();
+  return text.length > WORKER_CRASH_RECOVERY_ERROR_MAX_CHARS
+    ? `${text.slice(0, WORKER_CRASH_RECOVERY_ERROR_MAX_CHARS - 1)}…`
+    : text;
+}
 // External-lifecycle adapters create a DB run before the adapter.invoke event
 // is appended. Startup and periodic reapers can overlap that setup window;
 // give slow pre-run hooks and kube Job creation time to reach adapter.invoke.
@@ -8841,6 +8917,24 @@ export interface HeartbeatServiceOptions {
   beforeQueuedDispatchRefusalStatusReadForTest?: (
     run: typeof heartbeatRuns.$inferSelect,
   ) => Promise<void> | void;
+  /** Test seam for a retry-enqueue failure during crash recovery. */
+  beforeProcessLossRetryEnqueueForTest?: (
+    run: typeof heartbeatRuns.$inferSelect,
+  ) => Promise<void> | void;
+  /** Shortens the otherwise five-minute provider-release timeout in tests. */
+  workerCrashRecoveryProviderTimeoutMsForTest?: number;
+  /** Fires after an atomic event insert but before its transaction commits. */
+  afterRunEventAppendedInTransactionForTest?: (
+    run: typeof heartbeatRuns.$inferSelect,
+  ) => Promise<void> | void;
+  /** Distinguishes a missing crash-recovery agent from a failed agent lookup. */
+  beforeCrashRecoveryAgentLoadForTest?: (
+    run: typeof heartbeatRuns.$inferSelect,
+  ) => Promise<void> | void;
+  /** Simulates a failure persisting crash-recovery completion/backoff state. */
+  beforeCrashRecoveryTerminalWriteForTest?: (
+    run: typeof heartbeatRuns.$inferSelect,
+  ) => Promise<void> | void;
 }
 
 function isTruthyRuntimeEnvValue(value: string | undefined) {
@@ -9367,7 +9461,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     agentId: string;
     status: string | null | undefined;
     failureReason?: string | null;
-  }) {
+  }): Promise<{ fullyReleased: boolean; failureReason: string | null }> {
+    let thrown: unknown = null;
     const releaseResult = await envOrchestrator.releaseForRun({
       heartbeatRunId: input.runId,
       companyId: input.companyId,
@@ -9376,6 +9471,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       failureReason: input.failureReason ?? undefined,
     }).catch((err) => {
       logger.warn({ err, runId: input.runId }, "failed to release environment leases for heartbeat run");
+      thrown = err;
       return null;
     });
     for (const releaseError of releaseResult?.errors ?? []) {
@@ -9384,6 +9480,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         "failed to release environment lease for heartbeat run",
       );
     }
+    if (thrown) {
+      return {
+        fullyReleased: false,
+        failureReason: `environment lease release threw: ${describeRecoveryError(thrown)}`,
+      };
+    }
+    if ((releaseResult?.errors.length ?? 0) > 0) {
+      return {
+        fullyReleased: false,
+        failureReason: `${releaseResult?.errors.length ?? 0} environment lease(s) left unreleased`,
+      };
+    }
+    return { fullyReleased: true, failureReason: null };
   }
 
   async function hasUnsafeTextProjectionDatabase() {
@@ -12012,7 +12121,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       message?: string;
       payload?: Record<string, unknown>;
     },
-  ) {
+    executor: HeartbeatDbExecutor = db,
+  ): Promise<{ publish: () => void }> {
     const eventAt = new Date();
     const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
     const sanitizedMessage = event.message
@@ -12033,7 +12143,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       at: eventAt,
     });
 
-    await db.insert(heartbeatRunEvents).values({
+    await executor.insert(heartbeatRunEvents).values({
       companyId: run.companyId,
       runId: run.id,
       agentId: run.agentId,
@@ -12046,40 +12156,49 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       payload: sanitizedPayload,
     });
 
-    publishLiveEvent({
-      companyId: run.companyId,
-      type: "heartbeat.run.event",
-      payload: {
-        runId: run.id,
-        agentId: run.agentId,
-        issueId,
-        seq,
-        eventType: event.eventType,
-        stream: event.stream ?? null,
-        level: event.level ?? null,
-        color: event.color ?? null,
-        message: sanitizedMessage ?? null,
-        currentToolName: progress?.currentToolName ?? null,
-        lastAssistantSnippet: progress?.lastAssistantSnippet ?? null,
-        lastEventAt: (progress?.lastEventAt ?? eventAt).toISOString(),
-        payload: sanitizedPayload ?? null,
-      },
-    });
-    if (progress && isHeartbeatRunRuntimeStatusActive(run.status)) {
-      const status = setHeartbeatRunRuntimeStatus({
+    const publish = () => {
+      publishLiveEvent({
         companyId: run.companyId,
-        issueId,
-        agentId: run.agentId,
-        runId: run.id,
-        phase: progress.phase,
-        message: progress.message,
-        updatedAt: eventAt,
-        currentToolName: progress.currentToolName,
-        lastAssistantSnippet: progress.lastAssistantSnippet,
-        lastEventAt: progress.lastEventAt,
+        type: "heartbeat.run.event",
+        payload: {
+          runId: run.id,
+          agentId: run.agentId,
+          issueId,
+          seq,
+          eventType: event.eventType,
+          stream: event.stream ?? null,
+          level: event.level ?? null,
+          color: event.color ?? null,
+          message: sanitizedMessage ?? null,
+          currentToolName: progress?.currentToolName ?? null,
+          lastAssistantSnippet: progress?.lastAssistantSnippet ?? null,
+          lastEventAt: (progress?.lastEventAt ?? eventAt).toISOString(),
+          payload: sanitizedPayload ?? null,
+        },
       });
-      if (status) publishHeartbeatRunRuntimeProgress(status);
+      if (progress && isHeartbeatRunRuntimeStatusActive(run.status)) {
+        const status = setHeartbeatRunRuntimeStatus({
+          companyId: run.companyId,
+          issueId,
+          agentId: run.agentId,
+          runId: run.id,
+          phase: progress.phase,
+          message: progress.message,
+          updatedAt: eventAt,
+          currentToolName: progress.currentToolName,
+          lastAssistantSnippet: progress.lastAssistantSnippet,
+          lastEventAt: progress.lastEventAt,
+        });
+        if (status) publishHeartbeatRunRuntimeProgress(status);
+      }
+    };
+
+    // Pooled writes autocommit. A transaction caller must publish after the
+    // transaction succeeds so subscribers never see a rolled-back event.
+    if (executor === db) {
+      publish();
     }
+    return { publish };
   }
 
   async function nextRunEventSeq(runId: string) {
@@ -12088,6 +12207,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .from(heartbeatRunEvents)
       .where(eq(heartbeatRunEvents.runId, runId));
     return Number(row?.maxSeq ?? 0) + 1;
+  }
+
+  async function appendRunEventAtomicSeq(
+    run: typeof heartbeatRuns.$inferSelect,
+    event: {
+      eventType: string;
+      stream?: "system" | "stdout" | "stderr";
+      level?: "info" | "warn" | "error";
+      color?: string;
+      message?: string;
+      payload?: Record<string, unknown>;
+    },
+  ) {
+    const { publish } = await db.transaction(async (tx) => {
+      await tx.execute(
+        sql`select pg_advisory_xact_lock(hashtextextended(${`heartbeat-run-event-seq:${run.id}`}, 0))`,
+      );
+      const [row] = await tx
+        .select({ maxSeq: sql<number | null>`max(${heartbeatRunEvents.seq})` })
+        .from(heartbeatRunEvents)
+        .where(eq(heartbeatRunEvents.runId, run.id));
+      const appended = await appendRunEvent(run, Number(row?.maxSeq ?? 0) + 1, event, tx);
+      await options.afterRunEventAppendedInTransactionForTest?.(run);
+      return appended;
+    });
+    publish();
   }
 
   async function persistRunProcessMetadata(
@@ -12443,16 +12588,37 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     run: typeof heartbeatRuns.$inferSelect,
     agent: typeof agents.$inferSelect,
     now: Date,
-  ) {
-    const existingRetry = await db
+  ): Promise<ProcessLossRetryResult> {
+    await options.beforeProcessLossRetryEnqueueForTest?.(run);
+
+    const issueIdForLock = readNonEmptyString(parseObject(run.contextSnapshot).issueId);
+    const issueLockOwnedBy = async (retryRunId: string) => {
+      if (!issueIdForLock) return false;
+      const rows = await db
+        .select({ id: issues.id })
+        .from(issues)
+        .where(and(
+          eq(issues.id, issueIdForLock),
+          eq(issues.companyId, run.companyId),
+          eq(issues.executionRunId, retryRunId),
+        ));
+      return rows.length > 0;
+    };
+    const continuesContextIssue = (retry: typeof heartbeatRuns.$inferSelect) =>
+      Boolean(issueIdForLock) &&
+      readNonEmptyString(parseObject(retry.contextSnapshot).issueId) === issueIdForLock &&
+      !HEARTBEAT_RUN_TERMINAL_STATUSES.includes(retry.status as typeof HEARTBEAT_RUN_TERMINAL_STATUSES[number]);
+    const pickExistingRetry = (retries: Array<typeof heartbeatRuns.$inferSelect>) =>
+      retries.find(continuesContextIssue) ?? retries[0] ?? null;
+
+    const existingRetries = await db
       .select()
       .from(heartbeatRuns)
       .where(and(eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.retryOfRunId, run.id)))
-      .orderBy(asc(heartbeatRuns.createdAt))
-      .limit(1)
-      .then((rows) => rows[0] ?? null);
+      .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id));
+    const existingRetry = pickExistingRetry(existingRetries);
     if (existingRetry) {
-      await appendRunEvent(run, await nextRunEventSeq(run.id), {
+      await appendRunEventAtomicSeq(run, {
         eventType: "lifecycle",
         stream: "system",
         level: "warn",
@@ -12462,12 +12628,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           retryRunStatus: existingRetry.status,
         },
       });
-      return existingRetry;
+      return {
+        kind: "adopted",
+        run: existingRetry,
+        issueLockOwnedByRetry: await issueLockOwnedBy(existingRetry.id),
+        retryContinuesContextIssue: continuesContextIssue(existingRetry),
+      };
     }
 
     const invokability = await getAgentInvokability(agent);
     if (!invokability.invokable) {
-      await appendRunEvent(run, await nextRunEventSeq(run.id), {
+      await appendRunEventAtomicSeq(run, {
         eventType: "lifecycle",
         stream: "system",
         level: "warn",
@@ -12478,8 +12649,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ...invokability.details,
         },
       });
-      await releaseIssueExecutionAndPromote(run);
-      return null;
+      return { kind: "suppressed", reason: invokability.reason ?? "agent_not_invokable" };
     }
 
     const contextSnapshot = parseObject(run.contextSnapshot);
@@ -12498,6 +12668,45 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const responsibleUserId = await resolveResponsibleUserIdForRunContext(run, retryContextSnapshot);
 
     const queued = await db.transaction(async (tx) => {
+      await tx.execute(
+        sql`select pg_advisory_xact_lock(hashtextextended(${`heartbeat-process-loss-retry:${run.id}`}, 0))`,
+      );
+      const racedRetries = await tx
+        .select()
+        .from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.retryOfRunId, run.id)))
+        .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id));
+      const racedRetry = pickExistingRetry(racedRetries);
+      if (racedRetry) {
+        return {
+          retryRun: racedRetry,
+          created: false as const,
+          issueLockTransferred: false,
+          issueLockUnavailable: false as const,
+        };
+      }
+
+      if (issueId) {
+        await tx.execute(sql`
+          select id from issues
+          where id = ${issueId} and company_id = ${run.companyId}
+          for update
+        `);
+        const issueLock = await tx
+          .select({ executionRunId: issues.executionRunId })
+          .from(issues)
+          .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
+          .then((rows) => rows[0] ?? null);
+        if (issueLock?.executionRunId !== run.id) {
+          return {
+            retryRun: null,
+            created: false as const,
+            issueLockTransferred: false,
+            issueLockUnavailable: true as const,
+          };
+        }
+      }
+
       const wakeupRequest = await tx
         .insert(agentWakeupRequests)
         .values({
@@ -12553,8 +12762,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         })
         .where(eq(heartbeatRuns.id, run.id));
 
+      let issueLockTransferred = false;
       if (issueId) {
-        await tx
+        const transferred = await tx
           .update(issues)
           .set({
             checkoutRunId: null,
@@ -12563,25 +12773,55 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             executionLockedAt: now,
             updatedAt: now,
           })
-          .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId), eq(issues.executionRunId, run.id)));
+          .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId), eq(issues.executionRunId, run.id)))
+          .returning({ id: issues.id });
+        issueLockTransferred = transferred.length > 0;
       }
 
-      return retryRun;
+      return {
+        retryRun,
+        created: true as const,
+        issueLockTransferred,
+        issueLockUnavailable: false as const,
+      };
     });
 
+    if (queued.issueLockUnavailable) {
+      return { kind: "suppressed", reason: "issue_lock_not_owned" };
+    }
+
+    if (!queued.created) {
+      await appendRunEventAtomicSeq(run, {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: "Process-loss retry was queued concurrently by another worker; adopting it",
+        payload: {
+          retryRunId: queued.retryRun.id,
+          retryRunStatus: queued.retryRun.status,
+        },
+      });
+      return {
+        kind: "adopted",
+        run: queued.retryRun,
+        issueLockOwnedByRetry: await issueLockOwnedBy(queued.retryRun.id),
+        retryContinuesContextIssue: continuesContextIssue(queued.retryRun),
+      };
+    }
+
     publishLiveEvent({
-      companyId: queued.companyId,
+      companyId: queued.retryRun.companyId,
       type: "heartbeat.run.queued",
       payload: {
-        runId: queued.id,
-        agentId: queued.agentId,
-        invocationSource: queued.invocationSource,
-        triggerDetail: queued.triggerDetail,
-        wakeupRequestId: queued.wakeupRequestId,
+        runId: queued.retryRun.id,
+        agentId: queued.retryRun.agentId,
+        invocationSource: queued.retryRun.invocationSource,
+        triggerDetail: queued.retryRun.triggerDetail,
+        wakeupRequestId: queued.retryRun.wakeupRequestId,
       },
     });
 
-    await appendRunEvent(queued, 1, {
+    await appendRunEvent(queued.retryRun, 1, {
       eventType: "lifecycle",
       stream: "system",
       level: "warn",
@@ -12591,7 +12831,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       },
     });
 
-    return queued;
+    return {
+      kind: "created",
+      run: queued.retryRun,
+      issueLockOwnedByRetry: queued.issueLockTransferred,
+      retryContinuesContextIssue: continuesContextIssue(queued.retryRun),
+    };
   }
 
   function toHotRestartIntentRun(input: {
@@ -12875,6 +13120,378 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     };
   }
 
+  async function markRunsInterruptedByWorkerCrash(input: {
+    reason: string;
+    now?: Date;
+  }): Promise<{ markedRunIds: string[] }> {
+    const clock = resolveCrashRecoveryClock(input.now);
+    const now = input.now ?? new Date();
+    const runIds = Array.from(new Set([...runningProcesses.keys(), ...activeRunExecutions]));
+    if (runIds.length === 0) return { markedRunIds: [] };
+
+    // An external lifecycle is not ours to terminate: its Job can remain live
+    // after this process exits. Prove local ownership both from adapter type and
+    // the immutable run-scoped reservation before changing a row.
+    const ownedRuns = await db
+      .select({ runId: heartbeatRuns.id, adapterType: agents.adapterType })
+      .from(heartbeatRuns)
+      .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
+      .where(inArray(heartbeatRuns.id, runIds));
+    const localByAdapter = ownedRuns
+      .filter((row) => !hasExternalLifecycle(row.adapterType))
+      .map((row) => row.runId);
+    if (localByAdapter.length === 0) return { markedRunIds: [] };
+
+    let reservedRunIds: Set<string>;
+    try {
+      const reserved = await db
+        .select({ runId: externalRuntimeReservations.runId })
+        .from(externalRuntimeReservations)
+        .where(and(
+          inArray(externalRuntimeReservations.runId, localByAdapter),
+          isNull(externalRuntimeReservations.releasedAt),
+        ));
+      reservedRunIds = new Set(reserved.map((row) => row.runId));
+    } catch (error) {
+      logger.warn({ err: error }, "failed to read external runtime reservations during crash marking");
+      return { markedRunIds: [] };
+    }
+
+    const localRunIds = localByAdapter.filter((runId) => !reservedRunIds.has(runId));
+    if (localRunIds.length === 0) return { markedRunIds: [] };
+
+    const message = `Interrupted by worker process crash (${input.reason})`;
+    // Mark every positively-local run before any expensive cleanup. The crash
+    // guard has a short deadline; attribution must not wait behind provider IO.
+    const claimedRuns = await db
+      .update(heartbeatRuns)
+      .set({
+        status: "interrupted",
+        finishedAt: now,
+        error: message,
+        errorCode: "worker_crashed",
+        updatedAt: now,
+      })
+      .where(and(
+        inArray(heartbeatRuns.id, localRunIds),
+        eq(heartbeatRuns.status, "running"),
+        isNull(heartbeatRuns.externalRunId),
+      ))
+      .returning();
+
+    const markedRunIds = claimedRuns.map((run) => run.id);
+    for (const run of claimedRuns) {
+      try {
+        await recoverCrashInterruptedRun(run, {
+          reason: input.reason,
+          message,
+          clock,
+        });
+      } catch (error) {
+        logger.warn({ err: error, runId: run.id }, "crash-time recovery failed; leaving run for reconciliation");
+      }
+    }
+    if (markedRunIds.length > 0) {
+      logger.warn({ markedRunIds, reason: input.reason }, "marked local heartbeat runs interrupted by worker crash");
+    }
+    return { markedRunIds };
+  }
+
+  async function recoverCrashInterruptedRun(
+    run: typeof heartbeatRuns.$inferSelect,
+    context: { reason: string; message: string; clock: () => Date },
+  ): Promise<{ retryRunId: string | null; claimed: boolean; completed: boolean; incompleteSteps: string[] }> {
+    const now = context.clock();
+    const claimLeaseUntil = new Date(now.getTime() + WORKER_CRASH_RECOVERY_CLAIM_TTL_MS);
+    const claimed = await db
+      .update(heartbeatRuns)
+      .set({
+        crashRecoveryAttempts: sql`coalesce(${heartbeatRuns.crashRecoveryAttempts}, 0) + 1`,
+        crashRecoveryNextAttemptAt: claimLeaseUntil,
+        updatedAt: now,
+      })
+      .where(and(
+        eq(heartbeatRuns.id, run.id),
+        isNull(heartbeatRuns.crashRecoveryCompletedAt),
+        or(
+          isNull(heartbeatRuns.crashRecoveryNextAttemptAt),
+          lte(heartbeatRuns.crashRecoveryNextAttemptAt, now),
+        ),
+      ))
+      .returning()
+      .then((rows) => rows[0] ?? null);
+    if (!claimed) {
+      return { retryRunId: null, claimed: false, completed: false, incompleteSteps: [] };
+    }
+
+    const attempts = claimed.crashRecoveryAttempts ?? 1;
+    const steps: Array<{ name: string; outcome: CrashRecoveryStepOutcome }> = [];
+    const record = (name: string, outcome: CrashRecoveryStepOutcome) => {
+      steps.push({ name, outcome });
+      return outcome;
+    };
+    let preRetryCleanupIncomplete = false;
+
+    try {
+      await setWakeupStatus(run.wakeupRequestId, "cancelled", { finishedAt: now, error: null });
+      record("wakeup_cancel", { kind: "done" });
+    } catch (error) {
+      preRetryCleanupIncomplete = true;
+      record("wakeup_cancel", { kind: "incomplete", detail: describeRecoveryError(error) });
+    }
+
+    const leaseRelease = await withRecoveryProviderTimeout(
+      "environment lease release",
+      releaseEnvironmentLeasesForRun({
+        runId: run.id,
+        companyId: run.companyId,
+        agentId: run.agentId,
+        status: run.status,
+        failureReason: run.error ?? undefined,
+      }),
+      (detail) => ({ fullyReleased: false as const, failureReason: detail }),
+      options.workerCrashRecoveryProviderTimeoutMsForTest,
+    );
+    if (leaseRelease.fullyReleased) {
+      record("environment_leases", { kind: "done" });
+    } else {
+      preRetryCleanupIncomplete = true;
+      record("environment_leases", {
+        kind: "incomplete",
+        detail: leaseRelease.failureReason ?? "environment lease left active",
+      });
+    }
+
+    let agent: typeof agents.$inferSelect | null = null;
+    let agentLoadFailed = false;
+    try {
+      await options.beforeCrashRecoveryAgentLoadForTest?.(run);
+      agent = await getAgent(run.agentId);
+      record(
+        "agent_load",
+        agent
+          ? { kind: "done" }
+          : { kind: "skipped", detail: "agent row missing; no retry can be created" },
+      );
+    } catch (error) {
+      agentLoadFailed = true;
+      record("agent_load", { kind: "incomplete", detail: describeRecoveryError(error) });
+    }
+
+    let retry: typeof heartbeatRuns.$inferSelect | null = null;
+    let retryOwnsIssueLock = false;
+    let retryContinuesContextIssue = false;
+    let retryEnqueueIncomplete = false;
+    if (preRetryCleanupIncomplete) {
+      record("retry_enqueue", { kind: "skipped", detail: "required pre-retry cleanup incomplete" });
+    } else if (agent && !agentLoadFailed) {
+      try {
+        const result = await enqueueProcessLossRetry(run, agent, now);
+        if (result.kind === "suppressed") {
+          record("retry_enqueue", { kind: "skipped", detail: `suppressed: ${result.reason}` });
+        } else {
+          retry = result.run;
+          retryOwnsIssueLock = result.issueLockOwnedByRetry;
+          retryContinuesContextIssue = result.retryContinuesContextIssue;
+          record("retry_enqueue", { kind: "done" });
+        }
+      } catch (error) {
+        retryEnqueueIncomplete = true;
+        record("retry_enqueue", { kind: "incomplete", detail: describeRecoveryError(error) });
+      }
+    }
+
+    if (preRetryCleanupIncomplete || agentLoadFailed || retryEnqueueIncomplete) {
+      record("issue_release", {
+        kind: "skipped",
+        detail: "a retry is still owed; issue lock remains until replay",
+      });
+    } else {
+      try {
+        await releaseIssueExecutionAndPromote(run, { suppressPromotion: retryContinuesContextIssue });
+        record("issue_release", { kind: "done" });
+      } catch (error) {
+        record("issue_release", { kind: "incomplete", detail: describeRecoveryError(error) });
+      }
+    }
+
+    try {
+      await appendRunEventAtomicSeq(run, {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: context.message,
+        payload: {
+          reason: context.reason,
+          ...(retry ? {
+            retryRunId: retry.id,
+            issueLockOwnedByRetry: retryOwnsIssueLock,
+            retryContinuesContextIssue,
+          } : {}),
+        },
+      });
+      record("lifecycle_event", { kind: "done" });
+    } catch (error) {
+      logger.warn({ err: error, runId: run.id }, "failed to append crash recovery lifecycle event");
+      record("lifecycle_event", { kind: "skipped", detail: describeRecoveryError(error) });
+    }
+
+    try {
+      const finalization = await finalizeAgentStatus(run.agentId, "interrupted", context.message, {
+        errorCode: "worker_crashed",
+        runId: run.id,
+        requireOwnership: run,
+      });
+      record(
+        "agent_finalize",
+        finalization.kind === "failed"
+          ? { kind: "incomplete", detail: finalization.reason }
+          : finalization.kind === "superseded"
+            ? { kind: "skipped", detail: finalization.reason }
+            : { kind: "done" },
+      );
+    } catch (error) {
+      record("agent_finalize", { kind: "incomplete", detail: describeRecoveryError(error) });
+    }
+
+    const incompleteSteps = steps
+      .filter((step) => step.outcome.kind === "incomplete")
+      .map((step) => `${step.name}: ${step.outcome.kind === "incomplete" ? step.outcome.detail : ""}`);
+    let superseded = false;
+    let terminalWriteFailed = false;
+    try {
+      await options.beforeCrashRecoveryTerminalWriteForTest?.(run);
+      const terminalNow = context.clock();
+      const write = incompleteSteps.length === 0
+        ? db
+          .update(heartbeatRuns)
+          .set({
+            crashRecoveryCompletedAt: terminalNow,
+            crashRecoveryNextAttemptAt: null,
+            crashRecoveryLastError: null,
+            updatedAt: terminalNow,
+          })
+        : db
+          .update(heartbeatRuns)
+          .set({
+            crashRecoveryNextAttemptAt: new Date(terminalNow.getTime() + workerCrashRecoveryBackoffMs(attempts)),
+            crashRecoveryLastError: describeRecoveryError(incompleteSteps.join("; ")),
+            updatedAt: terminalNow,
+          });
+      const persisted = await write
+        .where(and(
+          eq(heartbeatRuns.id, run.id),
+          eq(heartbeatRuns.crashRecoveryNextAttemptAt, claimLeaseUntil),
+        ))
+        .returning({ id: heartbeatRuns.id });
+      superseded = persisted.length === 0;
+    } catch (error) {
+      terminalWriteFailed = true;
+      logger.warn({ err: error, runId: run.id }, "failed to persist worker-crash recovery progress");
+    }
+
+    return {
+      retryRunId: retry?.id ?? null,
+      claimed: true,
+      completed: incompleteSteps.length === 0 && !superseded && !terminalWriteFailed,
+      incompleteSteps,
+    };
+  }
+
+  let crashRecoveryCandidateIndexWarned = false;
+
+  async function crashRecoveryCandidateIndexPresent(): Promise<boolean> {
+    try {
+      const rows = await db.execute(sql`
+        select 1
+        from pg_class c
+        join pg_index i on i.indexrelid = c.oid
+        join pg_namespace n on n.oid = c.relnamespace
+        where c.relname = 'heartbeat_runs_crash_recovery_pending_idx'
+          and n.nspname = current_schema()
+          and c.relkind = 'i'
+          and i.indisvalid
+          and i.indisready
+        limit 1
+      `);
+      const present = Array.from(rows as unknown as Iterable<unknown>).length > 0;
+      if (present) {
+        crashRecoveryCandidateIndexWarned = false;
+      } else if (!crashRecoveryCandidateIndexWarned) {
+        crashRecoveryCandidateIndexWarned = true;
+        logger.warn(
+          { index: "heartbeat_runs_crash_recovery_pending_idx" },
+          "worker-crash candidate index missing or invalid; periodic crash reconciliation is disabled until it is built online",
+        );
+      }
+      return present;
+    } catch (error) {
+      logger.warn({ err: error }, "failed to probe worker-crash candidate index");
+      return false;
+    }
+  }
+
+  async function reconcileWorkerCrashedRuns(options: {
+    maxRuns?: number;
+    now?: Date | (() => Date);
+    budgetMs?: number;
+    requireCandidateIndex?: boolean;
+  } = {}): Promise<{
+    reconciledRunIds: string[];
+    retryRunIds: string[];
+    unresolvedRunIds: string[];
+    budgetExhausted: boolean;
+    skippedReason?: "candidate_index_missing";
+  }> {
+    if (options.requireCandidateIndex && !(await crashRecoveryCandidateIndexPresent())) {
+      return {
+        reconciledRunIds: [],
+        retryRunIds: [],
+        unresolvedRunIds: [],
+        budgetExhausted: false,
+        skippedReason: "candidate_index_missing",
+      };
+    }
+    const clock = resolveCrashRecoveryClock(options.now);
+    const start = clock();
+    const deadline = start.getTime() + (options.budgetMs ?? WORKER_CRASH_RECONCILE_BUDGET_MS);
+    const candidates = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.status, "interrupted"),
+        eq(heartbeatRuns.errorCode, "worker_crashed"),
+        isNull(heartbeatRuns.crashRecoveryCompletedAt),
+        or(
+          isNull(heartbeatRuns.crashRecoveryNextAttemptAt),
+          lte(heartbeatRuns.crashRecoveryNextAttemptAt, start),
+        ),
+      ))
+      .orderBy(asc(heartbeatRuns.finishedAt), asc(heartbeatRuns.id))
+      .limit(options.maxRuns ?? WORKER_CRASH_RECONCILE_MAX_RUNS);
+
+    const reconciledRunIds: string[] = [];
+    const retryRunIds: string[] = [];
+    const unresolvedRunIds: string[] = [];
+    let budgetExhausted = false;
+    for (const run of candidates) {
+      if (clock().getTime() >= deadline) {
+        budgetExhausted = true;
+        break;
+      }
+      const recovered = await recoverCrashInterruptedRun(run, {
+        reason: "worker crash recovery incomplete at previous exit",
+        message: run.error ?? "Interrupted by worker process crash",
+        clock,
+      });
+      if (!recovered.claimed) continue;
+      if (recovered.completed) reconciledRunIds.push(run.id);
+      else unresolvedRunIds.push(run.id);
+      if (recovered.retryRunId) retryRunIds.push(recovered.retryRunId);
+    }
+    return { reconciledRunIds, retryRunIds, unresolvedRunIds, budgetExhausted };
+  }
+
   async function drainRunningRunsForShutdown(signal: "SIGINT" | "SIGTERM", now = new Date()) {
     const activeRuns = await db
       .select({
@@ -12935,10 +13552,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         failureReason: interrupted.error ?? undefined,
       });
 
-      const retry = await enqueueProcessLossRetry(interrupted, agent, now);
-      if (!retry) {
-        await releaseIssueExecutionAndPromote(interrupted);
-      } else {
+      const retryResult = await enqueueProcessLossRetry(interrupted, agent, now);
+      const retry = retryResult.kind === "suppressed" ? null : retryResult.run;
+      const retryContinuesContextIssue =
+        retryResult.kind === "suppressed" ? false : retryResult.retryContinuesContextIssue;
+      await releaseIssueExecutionAndPromote(interrupted, { suppressPromotion: retryContinuesContextIssue });
+      if (retry) {
         retryRunIds.push(retry.id);
       }
 
@@ -15794,13 +16413,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       retryNotBefore?: Date | null;
       /** Run that drove this transition, so a fallback reason can point at it. */
       runId?: string | null;
+      /** Refuse a stale recovery write when another run owns agent state. */
+      requireOwnership?: typeof heartbeatRuns.$inferSelect;
     },
-  ) {
+  ): Promise<AgentFinalizationResult> {
     const existing = await getAgent(agentId);
-    if (!existing) return;
+    if (!existing) return { kind: "superseded", reason: "agent_missing" };
 
     if (existing.status === "paused" || existing.status === "terminated") {
-      return;
+      return { kind: "superseded", reason: `agent_${existing.status}` };
     }
 
     const isFirstHeartbeat = !existing.lastHeartbeatAt;
@@ -15833,6 +16454,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ? "idle"
           : "error";
 
+    const ownerRun = options?.requireOwnership;
+    const ownerFinishedAt = ownerRun
+      ? new Date(ownerRun.finishedAt ?? ownerRun.createdAt).toISOString()
+      : null;
+    const ownershipGuard = ownerRun
+      ? sql`not exists (
+          select 1 from ${heartbeatRuns}
+          where ${heartbeatRuns.agentId} = ${agentId}
+            and ${heartbeatRuns.id} <> ${ownerRun.id}
+            and (
+              ${heartbeatRuns.status} = 'running'
+              or ${heartbeatRuns.finishedAt} > ${ownerFinishedAt}::timestamptz
+            )
+        )`
+      : undefined;
+
     const updated = await db
       .update(agents)
       .set({
@@ -15857,9 +16494,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         lastHeartbeatAt: new Date(),
         updatedAt: new Date(),
       })
-      .where(eq(agents.id, agentId))
+      .where(ownershipGuard ? and(eq(agents.id, agentId), ownershipGuard) : eq(agents.id, agentId))
       .returning()
       .then((rows) => rows[0] ?? null);
+
+    if (!updated && ownershipGuard) {
+      logger.info(
+        { agentId, outcome, runId: options?.runId ?? null },
+        "finalizeAgentStatus: declined stale agent status write; a newer run owns the derived state",
+      );
+      return { kind: "superseded", reason: "newer_run_owns_agent_state" };
+    }
 
     if (isFirstHeartbeat && updated) {
       const tc = getTelemetryClient();
@@ -15913,6 +16558,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         );
       });
     }
+
+    return { kind: "applied" };
   }
 
   function mergeRunStopMetadataForAgent(
@@ -17776,20 +18423,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
 
       let retriedRun: typeof heartbeatRuns.$inferSelect | null = null;
+      let retryContinuesContextIssue = false;
       let promotedRunDispatched = false;
       const retryAgent = await getAgent(run.agentId);
       if (shouldRetry) {
         if (retryAgent) {
-          retriedRun = await enqueueProcessLossRetry(finalizedRun, retryAgent, now);
+          const retryResult = await enqueueProcessLossRetry(finalizedRun, retryAgent, now);
+          retriedRun = retryResult.kind === "suppressed" ? null : retryResult.run;
+          retryContinuesContextIssue =
+            retryResult.kind === "suppressed" ? false : retryResult.retryContinuesContextIssue;
         }
       } else if (retryAgent) {
         const scheduled = await scheduleInteractionContinuationInfrastructureRetryIfEligible(finalizedRun, retryAgent);
         retriedRun = scheduled?.outcome === "scheduled" ? scheduled.run : null;
+        retryContinuesContextIssue = Boolean(
+          retriedRun && readNonEmptyString(parseObject(finalizedRun.contextSnapshot).issueId),
+        );
       }
 
-      if (!retriedRun) {
-        promotedRunDispatched = await releaseIssueExecutionAndPromote(finalizedRun);
-      }
+      promotedRunDispatched = await releaseIssueExecutionAndPromote(finalizedRun, {
+        suppressPromotion: retryContinuesContextIssue,
+      });
       if (!opts?.suppressDispatchAfterReap && !promotedRunDispatched) {
         await startNextQueuedRunForAgent(run.agentId);
       }
@@ -23459,7 +24113,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   async function releaseIssueExecutionAndPromote(
     run: typeof heartbeatRuns.$inferSelect,
-    options: { suppressImmediateRecovery?: boolean } = {},
+    options: { suppressImmediateRecovery?: boolean; suppressPromotion?: boolean } = {},
   ): Promise<boolean> {
     const runContext = parseObject(run.contextSnapshot);
     const contextIssueId = readNonEmptyString(runContext.issueId);
@@ -23563,6 +24217,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .where(
           and(eq(issues.companyId, run.companyId), eq(issues.checkoutRunId, run.id)),
         );
+
+      // A live retry for the same context issue is already the only intended
+      // continuation. Clearing stale sibling locks is still required, but
+      // promoting a deferred wake here would create a second runnable path.
+      if (options.suppressPromotion) return null;
 
       // Deferred-wake promotion is bound to a single primary issue: the run's context
       // issue when present, otherwise the first candidate we found (preserves the
@@ -27692,6 +28351,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // gate on suppression should prefer this over the env-only resolver.
     resolveSchedulingSuppression: getSchedulingSuppression,
     drainRunningRunsForShutdown,
+    markRunsInterruptedByWorkerCrash,
+    reconcileWorkerCrashedRuns,
 
     promoteDueScheduledRetries,
     retryScheduledRetryNow,

@@ -44,6 +44,13 @@ export const heartbeatRuns = pgTable(
       onDelete: "set null",
     }),
     processLossRetryCount: integer("process_loss_retry_count").notNull().default(0),
+    // Durable worker-crash recovery state. A completed marker is intentionally
+    // separate from the existence of a retry: recovery can correctly finish
+    // without a retry, while a retry may be committed before later cleanup.
+    crashRecoveryCompletedAt: timestamp("crash_recovery_completed_at", { withTimezone: true }),
+    crashRecoveryAttempts: integer("crash_recovery_attempts"),
+    crashRecoveryNextAttemptAt: timestamp("crash_recovery_next_attempt_at", { withTimezone: true }),
+    crashRecoveryLastError: text("crash_recovery_last_error"),
     scheduledRetryAt: timestamp("scheduled_retry_at", { withTimezone: true }),
     scheduledRetryAttempt: integer("scheduled_retry_attempt").notNull().default(0),
     scheduledRetryReason: text("scheduled_retry_reason"),
@@ -114,5 +121,10 @@ export const heartbeatRuns = pgTable(
       table.companyId,
       table.createdAt.desc(),
     ),
+    // Kept near-empty in steady state: only crash-marked runs whose recovery
+    // has not completed participate in the oldest-first reconciliation scan.
+    crashRecoveryPendingIdx: index("heartbeat_runs_crash_recovery_pending_idx")
+      .on(table.finishedAt, table.id)
+      .where(sql`${table.errorCode} = 'worker_crashed' and ${table.crashRecoveryCompletedAt} is null`),
   }),
 );
