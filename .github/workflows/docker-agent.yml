@@ -420,16 +420,16 @@ jobs:
           title="Docker (agent base) is failing on master"
           existing="$(gh issue list --repo "$REPO" --state open --search "in:title \"$title\"" --json number --jq '.[0].number // empty')"
           body="$(cat <<EOF
-\`Docker (agent base)\` failed on master at commit ${HEAD_SHA}.
+          \`Docker (agent base)\` failed on master at commit ${HEAD_SHA}.
 
-Run: ${RUN_URL}
+          Run: ${RUN_URL}
 
-While this workflow is red, steps \`Promote verified agent image\` and
-\`Bump agent image refs in cluster\` never execute — no agent image change
-reaches the cluster until it's fixed. See BLO-23128 for the incident where
-this went unnoticed for ~6 days; check that issue and its comments for the
-last confirmed root cause before starting a fresh investigation.
-EOF
+          While this workflow is red, steps \`Promote verified agent image\` and
+          \`Bump agent image refs in cluster\` never execute — no agent image change
+          reaches the cluster until it's fixed. See BLO-23128 for the incident where
+          this went unnoticed for ~6 days; check that issue and its comments for the
+          last confirmed root cause before starting a fresh investigation.
+          EOF
           )"
           if [ -n "$existing" ]; then
             gh issue comment "$existing" --repo "$REPO" --body "$body"
