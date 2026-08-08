@@ -354,8 +354,10 @@ ARG CLAUDE_K8S_REF=3ad33702052f357ec2b31b7d3051e89ed1ed4875
 # Bumped 2026-08-08 to 8f42726 (#54/#55): treat deleting nonterminal Jobs as
 # live concurrency blockers; for BLO-22922, start completion grace only after
 # the log stream exits and preserve successful finite-timeout runs.
-# Focused regressions, typecheck, build, and the full adapter suite pass.
-ARG OPENCODE_K8S_REF=8f4272675db81e95bf393679a912d9037df3d9ab
+# Bumped 2026-08-08 to 6dca020 (#56/#58): retain those fixes and restore the
+# PEN-1305 shell-command parser on the current adapter line. The vendor build
+# runs the upstream env-guard and execute suites against this exact tree.
+ARG OPENCODE_K8S_REF=6dca0201547f962dc9ae45576c81c12808b73bb3
 
 # Pack paperclip's in-tree adapter-utils so the bundled adapters consume
 # the workspace version (may include exports newer than the latest
@@ -433,6 +435,7 @@ RUN --mount=type=cache,target=/root/.npm,sharing=locked \
   && rm -rf .git \
   && npm ci \
   && npm install --no-save /vendor/adapter-utils.tgz \
+  && npm test -- src/server/env-guard-plugin.test.ts src/server/execute.test.ts \
   && npm run build \
   && npm pack \
   && mv paperclip-adapter-opencode-k8s-*.tgz /vendor/paperclip-adapter-opencode-k8s.tgz

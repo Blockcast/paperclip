@@ -5,11 +5,13 @@ import { test } from "node:test";
 const dockerfile = readFileSync(new URL("../Dockerfile", import.meta.url), "utf8");
 const opencodeRefMatch = dockerfile.match(/^ARG OPENCODE_K8S_REF=([0-9a-f]{40})$/m);
 
-test("Dockerfile pins opencode_k8s to the Opus 5-capable adapter", () => {
-  assert.equal(opencodeRefMatch?.[1], "8f4272675db81e95bf393679a912d9037df3d9ab");
+test("Dockerfile pins opencode_k8s and runs its security and execution regressions", () => {
+  assert.equal(opencodeRefMatch?.[1], "6dca0201547f962dc9ae45576c81c12808b73bb3");
   assert.match(dockerfile, /add anthropic\/claude-opus-5/);
-  assert.match(dockerfile, /treat deleting nonterminal Jobs as/);
-  assert.match(dockerfile, /preserve successful finite-timeout runs/);
+  assert.match(
+    dockerfile,
+    /npm test -- src\/server\/env-guard-plugin\.test\.ts src\/server\/execute\.test\.ts/,
+  );
   assert.match(dockerfile, /mount a per-agent\s*\n# \/runtime-cache emptyDir/);
   assert.match(dockerfile, /kkroo\/paperclip-adapter-opencode-k8s#29/);
   assert.match(dockerfile, /reserve the runtime-cache env keys/);
