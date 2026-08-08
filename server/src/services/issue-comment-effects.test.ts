@@ -16,8 +16,10 @@ import {
   releaseEffect,
   renewEffectLease,
   resetLeaselessProcessing,
+  COMMENT_EFFECT_LOSS_EVENT,
   MAX_EFFECT_ATTEMPTS,
 } from "./issue-comment-effects.js";
+import { logger } from "../middleware/logger.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -431,5 +433,80 @@ describeEmbeddedPostgres("issue comment effect ledger", () => {
     expect(await markCommentProcessedIfSettled(db as never, commentId)).toBe(true);
     const [comment] = await db.select().from(issueComments).where(eq(issueComments.id, commentId));
     expect(comment.idempotencyProcessedAt).not.toBeNull();
+  }, 60_000);
+
+  it("emits an alertable loss event, exactly once, when settling over a failed effect", async () => {
+    await seed();
+    await enqueueCommentEffects(db as never, { companyId, issueId, commentId, effects: intents });
+    const ordered = await listUnfinishedEffects(db as never, commentId);
+
+    for (let attempt = 0; attempt <= MAX_EFFECT_ATTEMPTS; attempt += 1) {
+      const claimed = await claimEffect(db as never, ordered[0].id);
+      if (!claimed) break;
+      await releaseEffect(db as never, claimed, new Error("poison"));
+    }
+    for (const effect of ordered.slice(1)) {
+      const claimed = await claimEffect(db as never, effect.id);
+      await completeEffect(db as never, claimed!);
+    }
+
+    const errorSpy = vi.spyOn(logger, "error").mockImplementation(() => {});
+    try {
+      expect(await markCommentProcessedIfSettled(db as never, commentId)).toBe(true);
+
+      // The side effect never happened, so settling is real downstream loss.
+      // It has to reach an operator: assert on the structured selector a monitor
+      // would key on, not on the human-readable message.
+      const emitted = errorSpy.mock.calls.filter(
+        ([fields]) =>
+          (fields as { event?: string } | undefined)?.event === COMMENT_EFFECT_LOSS_EVENT,
+      );
+      expect(emitted).toHaveLength(1);
+      const [fields] = emitted[0] as [
+        {
+          commentId: string;
+          failedEffectCount: number;
+          failedEffects: { effectKind: string; lastError: string | null }[];
+        },
+      ];
+      expect(fields.commentId).toBe(commentId);
+      expect(fields.failedEffectCount).toBe(1);
+      expect(fields.failedEffects[0].effectKind).toBe(ordered[0].effectKind);
+      // The parked error is the operator's first diagnostic; losing it would
+      // make the alert unactionable.
+      expect(fields.failedEffects[0].lastError).toContain("poison");
+
+      // The settlement sweep re-runs; an alert that repeats every pass gets
+      // muted, and a muted alert is the silence this exists to prevent.
+      expect(await markCommentProcessedIfSettled(db as never, commentId)).toBe(true);
+      expect(
+        errorSpy.mock.calls.filter(
+          ([f]) => (f as { event?: string } | undefined)?.event === COMMENT_EFFECT_LOSS_EVENT,
+        ),
+      ).toHaveLength(1);
+    } finally {
+      errorSpy.mockRestore();
+    }
+  }, 60_000);
+
+  it("does not emit the loss event when every effect completed", async () => {
+    await seed();
+    await enqueueCommentEffects(db as never, { companyId, issueId, commentId, effects: intents });
+    for (const effect of await listUnfinishedEffects(db as never, commentId)) {
+      const claimed = await claimEffect(db as never, effect.id);
+      await completeEffect(db as never, claimed!);
+    }
+
+    const errorSpy = vi.spyOn(logger, "error").mockImplementation(() => {});
+    try {
+      expect(await markCommentProcessedIfSettled(db as never, commentId)).toBe(true);
+      expect(
+        errorSpy.mock.calls.filter(
+          ([f]) => (f as { event?: string } | undefined)?.event === COMMENT_EFFECT_LOSS_EVENT,
+        ),
+      ).toHaveLength(0);
+    } finally {
+      errorSpy.mockRestore();
+    }
   }, 60_000);
 });
