@@ -2802,6 +2802,10 @@ function setIssueListResponseCacheEntry(key: string, entry: IssueListCacheEntry)
   trimIssueListResponseCache();
 }
 
+export function __setIssueListResponseCacheEntryForTests(key: string, entry: IssueListCacheEntry) {
+  setIssueListResponseCacheEntry(key, entry);
+}
+
 function decrementIssueListActorClientInflight(actorClientKey: string) {
   const next = (issueListActorClientInflight.get(actorClientKey) ?? 1) - 1;
   if (next <= 0) issueListActorClientInflight.delete(actorClientKey);
