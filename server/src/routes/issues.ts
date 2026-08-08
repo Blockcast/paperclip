@@ -5193,10 +5193,7 @@ export function issueRoutes(
 
   async function decideManagerChainNonInvokableAssigneeReroute(
     req: Request,
-    issue: {
-      companyId: string;
-      assigneeAgentId: string | null;
-    },
+    issue: Parameters<typeof decideIssueAccess>[1],
   ) {
     if (req.actor.type !== "agent" || !req.actor.agentId) return null;
     if (req.actor.companyId !== issue.companyId || !issue.assigneeAgentId) return null;
