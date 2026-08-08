@@ -58,10 +58,14 @@ import {
   stripPaperclipSessionMetadataFromSessionParams,
   normalizeSessionParams,
   shouldResetTaskSessionForWake,
+  mergeModelProfileAdapterConfig,
   type ResolvedWorkspaceForRunSuccess,
 } from "../services/heartbeat.js";
 import { applyRunScopeToBranchName } from "../services/workspace-runtime.js";
-import { executionWorkspaceUsesPerRunScope } from "../services/execution-workspace-policy.js";
+import {
+  buildExecutionWorkspaceAdapterConfig,
+  executionWorkspaceUsesPerRunScope,
+} from "../services/execution-workspace-policy.js";
 import type { TrustPresetResolution } from "../services/trust-preset-resolver.js";
 
 const execFile = promisify(execFileCallback);
@@ -4100,6 +4104,7 @@ describe("BLO-19063 per_run scope refuses workspace restore", () => {
     projectPolicy?: Parameters<typeof executionWorkspaceUsesPerRunScope>[0]["projectPolicy"];
     agentConfig?: Record<string, unknown>;
     mode?: Parameters<typeof executionWorkspaceUsesPerRunScope>[0]["mode"];
+    issueAdapterConfig?: Record<string, unknown> | null;
   }) =>
     executionWorkspaceUsesPerRunScope({
       agentConfig: input.agentConfig ?? {},
@@ -4107,6 +4112,7 @@ describe("BLO-19063 per_run scope refuses workspace restore", () => {
       issueSettings: input.issueSettings ?? null,
       mode: input.mode ?? "isolated_workspace",
       legacyUseProjectWorkspace: null,
+      issueAdapterConfig: input.issueAdapterConfig ?? null,
     });
 
   it("refuses to restore a per_run workspace even when the issue is already pinned to reuse_existing", () => {
@@ -4220,5 +4226,164 @@ describe("BLO-19063 per_run scope refuses workspace restore", () => {
     expect(runA.startsWith(runB)).toBe(false);
     expect(runB.startsWith(runA)).toBe(false);
     expect(runA.startsWith(issueBranch)).toBe(true);
+  });
+});
+
+// BLO-19063 follow-up (PR #1154 review): the guard above is computed before
+// workspace realization, from the three *policy* layers. But those are not the
+// last word on `workspaceStrategy`: mergeModelProfileAdapterConfig shallow-spreads
+// the model profile and then issue.assigneeAdapterOverrides.adapterConfig over
+// the policy-resolved config, and the result — hostExecutionWorkspaceConfig — is
+// what realizeExecutionWorkspace actually reads `runScope` from.
+//
+// So the predicate and realization could disagree. Both directions are bugs: a
+// false negative restores a per_run workspace (the exact isolation failure this
+// whole issue exists to fix), and a false positive provisions a fresh workspace
+// for a run that did not need one. These assert they agree instead.
+describe("BLO-19063 per_run predicate agrees with the config realization consumes", () => {
+  const perRunStrategy = { type: "git_worktree" as const, runScope: "per_run" as const };
+  const perIssueStrategy = { type: "git_worktree" as const, runScope: "per_issue" as const };
+  const noProfile = {
+    requested: null,
+    requestedBy: null,
+    applied: null,
+    configSource: null,
+    fallbackReason: null,
+    adapterConfig: null,
+  } as const;
+
+  // The end-to-end shape the reviewer asked for: resolve the predicate from the
+  // policy layers exactly as heartbeat does, build the merged config exactly as
+  // heartbeat does, and assert the two see the same runScope. Returns both so a
+  // failure names which side drifted.
+  const resolveBothSides = (input: {
+    agentConfig?: Record<string, unknown>;
+    issueSettings?: Parameters<typeof executionWorkspaceUsesPerRunScope>[0]["issueSettings"];
+    mode?: Parameters<typeof executionWorkspaceUsesPerRunScope>[0]["mode"];
+    issueAdapterConfig?: Record<string, unknown> | null;
+    modelProfileAdapterConfig?: Record<string, unknown> | null;
+  }) => {
+    const policyInput = {
+      agentConfig: input.agentConfig ?? {},
+      projectPolicy: null,
+      issueSettings: input.issueSettings ?? null,
+      mode: input.mode ?? ("isolated_workspace" as const),
+      legacyUseProjectWorkspace: null,
+    };
+    const predicted = executionWorkspaceUsesPerRunScope({
+      ...policyInput,
+      issueAdapterConfig: input.issueAdapterConfig ?? null,
+    });
+    // This mirrors heartbeat.ts: buildExecutionWorkspaceAdapterConfig ->
+    // mergeModelProfileAdapterConfig -> (host config) -> realizeExecutionWorkspace.
+    const realizedConfig = mergeModelProfileAdapterConfig({
+      baseConfig: buildExecutionWorkspaceAdapterConfig(policyInput),
+      modelProfile: { ...noProfile, adapterConfig: input.modelProfileAdapterConfig ?? null },
+      issueAdapterConfig: input.issueAdapterConfig ?? null,
+    });
+    // Read it the way workspace-runtime.ts resolveExecutionWorkspaceRunScope does.
+    const realizedRunScope =
+      (realizedConfig.workspaceStrategy as { runScope?: unknown } | undefined)?.runScope === "per_run";
+    return { predicted, realizedRunScope };
+  };
+
+  it("sees per_run when an issue adapterConfig override introduces it", () => {
+    // The reachable vector: assigneeAdapterOverrides.adapterConfig is free-form
+    // (z.record(z.string(), z.unknown())) and overlaid last, so any actor able to
+    // patch the issue can set workspaceStrategy there. Before this fix the
+    // predicate read only the policy layers, stayed false, and the pinned
+    // workspace was restored — per-run isolation that reads as configured and
+    // delivers none.
+    const { predicted, realizedRunScope } = resolveBothSides({
+      issueSettings: { mode: "isolated_workspace", workspaceStrategy: perIssueStrategy },
+      issueAdapterConfig: { workspaceStrategy: perRunStrategy },
+    });
+
+    expect(realizedRunScope).toBe(true);
+    expect(predicted).toBe(realizedRunScope);
+  });
+
+  it("refuses to restore, and refuses to pin reuse_existing, on that override path", () => {
+    const { predicted } = resolveBothSides({
+      issueSettings: { mode: "isolated_workspace", workspaceStrategy: perIssueStrategy },
+      issueAdapterConfig: { workspaceStrategy: perRunStrategy },
+    });
+    const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({
+      issueExecutionWorkspaceId: "workspace-run-1",
+      issueExecutionWorkspacePreference: "reuse_existing",
+      existingExecutionWorkspaceStatus: "active",
+      usesPerRunScope: predicted,
+    });
+
+    expect(reuseRequest.requestedShouldReuseExisting).toBe(false);
+    expect(reuseRequest.existingExecutionWorkspaceAvailable).toBe(false);
+  });
+
+  it("sees per_issue when an issue adapterConfig override downgrades a per_run policy", () => {
+    // The reverse direction the reviewer flagged: predicting per_run here would
+    // refuse a restore that realization is perfectly happy to reuse, costing a
+    // fresh provision (and a dependency install) every run for no isolation gain.
+    const { predicted, realizedRunScope } = resolveBothSides({
+      issueSettings: { mode: "isolated_workspace", workspaceStrategy: perRunStrategy },
+      issueAdapterConfig: { workspaceStrategy: perIssueStrategy },
+    });
+
+    expect(realizedRunScope).toBe(false);
+    expect(predicted).toBe(realizedRunScope);
+  });
+
+  it("keeps the override's re-introduction of a strategy visible outside isolated_workspace", () => {
+    // buildExecutionWorkspaceAdapterConfig deletes workspaceStrategy when the mode
+    // is not isolated_workspace, but the overlay is applied *after* that delete and
+    // realization reads the strategy type off the config rather than off the mode
+    // (resolveEffectiveWorkspaceStrategyType). So the key really can come back —
+    // and the predicate has to agree with that rather than assume the mode gate held.
+    const { predicted, realizedRunScope } = resolveBothSides({
+      issueSettings: { mode: "shared_workspace" },
+      mode: "shared_workspace",
+      issueAdapterConfig: { workspaceStrategy: perRunStrategy },
+    });
+
+    expect(predicted).toBe(realizedRunScope);
+  });
+
+  it("ignores a workspaceStrategy arriving via a model profile, on both sides", () => {
+    // A model profile selects a model and an effort; it has no business moving the
+    // run's tree. Excluding it is also what lets the predicate run before the
+    // profile is resolved (that needs an async listAdapterModelProfiles) without
+    // being able to drift from the merge.
+    const { predicted, realizedRunScope } = resolveBothSides({
+      issueSettings: { mode: "isolated_workspace", workspaceStrategy: perIssueStrategy },
+      modelProfileAdapterConfig: { workspaceStrategy: perRunStrategy },
+    });
+
+    expect(realizedRunScope).toBe(false);
+    expect(predicted).toBe(realizedRunScope);
+  });
+
+  it("drops a model-profile-only strategy rather than leaving the key set to undefined", () => {
+    // No policy layer and no override supply one, so the merged config must not
+    // carry the profile's. Presence is observable (Object.hasOwn), so the key is
+    // deleted rather than assigned undefined.
+    const merged = mergeModelProfileAdapterConfig({
+      baseConfig: {},
+      modelProfile: { ...noProfile, adapterConfig: { workspaceStrategy: perRunStrategy } },
+      issueAdapterConfig: null,
+    });
+
+    expect(Object.hasOwn(merged, "workspaceStrategy")).toBe(false);
+  });
+
+  it("still lets an issue override set non-scope strategy fields", () => {
+    // assigneeAdapterOverrides.adapterConfig.workspaceStrategy is a supported shape
+    // — workspace-command-authz.ts guards provisionCommand/teardownCommand on
+    // exactly that path. Pinning the strategy must not quietly disable it.
+    const merged = mergeModelProfileAdapterConfig({
+      baseConfig: { workspaceStrategy: { type: "git_worktree", baseRef: "main" } },
+      modelProfile: { ...noProfile },
+      issueAdapterConfig: { workspaceStrategy: { type: "git_worktree", baseRef: "release" } },
+    });
+
+    expect(merged.workspaceStrategy).toMatchObject({ baseRef: "release" });
   });
 });

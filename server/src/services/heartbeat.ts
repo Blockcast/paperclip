@@ -254,6 +254,7 @@ import {
   resolveEffectiveWorkspaceStrategyType,
   resolveExecutionWorkspaceEnvironmentId,
   resolveExecutionWorkspaceMode,
+  resolveOverlaidWorkspaceStrategy,
   WORKSPACE_PREFLIGHT_BLOCKED_ACTIVITY_ACTION,
   WORKSPACE_PREFLIGHT_CLEARED_ACTIVITY_ACTION,
   WORKSPACE_PREFLIGHT_STATE_ACTIVITY_ACTIONS,
@@ -4371,6 +4372,38 @@ export function resolveModelProfileApplication(input: {
   };
 }
 
+// BLO-19063: keeps the merged `workspaceStrategy` equal to what
+// executionWorkspaceUsesPerRunScope predicts, by restricting which slots may
+// supply it. The policy layers and the issue override both may; the *model
+// profile* may not.
+//
+// The model profile slot is excluded rather than accounted for because it is the
+// one slot the reuse guard cannot see: the guard runs before workspace
+// resolution, while the profile is only resolved later (it needs an async
+// listAdapterModelProfiles). Predicting it would mean hoisting that resolution
+// purely to satisfy a prediction. Ignoring it is instead the correct semantics —
+// a model profile selects a model and effort, and has no business redefining
+// where the run's tree lives. Same shape of argument, and same reason, as
+// withAgentScopedEnvProvenance above.
+function withPolicyResolvedWorkspaceStrategy(
+  merged: Record<string, unknown>,
+  baseConfig: Record<string, unknown>,
+  issueAdapterConfig: Record<string, unknown> | null | undefined,
+): Record<string, unknown> {
+  const strategy = resolveOverlaidWorkspaceStrategy({ baseConfig, issueAdapterConfig });
+  // Absent from both authoritative slots means a model profile is the only thing
+  // that supplied one. Delete rather than assign `undefined`: the key's presence
+  // is itself observable via Object.hasOwn in resolveOverlaidWorkspaceStrategy.
+  if (!strategy.present) {
+    if (!Object.hasOwn(merged, "workspaceStrategy")) return merged;
+    const next = { ...merged };
+    delete next.workspaceStrategy;
+    return next;
+  }
+  if (merged.workspaceStrategy === strategy.value) return merged;
+  return { ...merged, workspaceStrategy: strategy.value };
+}
+
 export function mergeModelProfileAdapterConfig(input: {
   baseConfig: Record<string, unknown>;
   modelProfile: ModelProfileApplication;
@@ -4381,7 +4414,11 @@ export function mergeModelProfileAdapterConfig(input: {
     ...(input.modelProfile.adapterConfig ?? {}),
     ...(input.issueAdapterConfig ?? {}),
   };
-  return withAgentScopedEnvProvenance(merged, input.baseConfig);
+  return withPolicyResolvedWorkspaceStrategy(
+    withAgentScopedEnvProvenance(merged, input.baseConfig),
+    input.baseConfig,
+    input.issueAdapterConfig,
+  );
 }
 
 function modelProfileRunMetadata(
@@ -21243,13 +21280,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const requestedExecutionWorkspaceId = readNonEmptyString(issueRef?.executionWorkspaceId);
     const existingExecutionWorkspace =
       requestedExecutionWorkspaceId ? await executionWorkspacesSvc.getById(requestedExecutionWorkspaceId) : null;
-    // BLO-19063: resolved across all three config layers, not just the issue row.
+    // BLO-19063: resolved across all three policy layers *and* the issue-level
+    // adapterConfig overlay, so this agrees with the post-merge
+    // hostExecutionWorkspaceConfig that realizeExecutionWorkspace reads
+    // `runScope` from. The overlay is the reachable divergence: it is free-form
+    // and applied last, so reading the policy layers alone would restore a
+    // per_run workspace whenever the scope arrived that way.
     const executionWorkspaceUsesPerRunScopeForIssue = executionWorkspaceUsesPerRunScope({
       agentConfig: config,
       projectPolicy: projectExecutionWorkspacePolicy,
       issueSettings: issueExecutionWorkspaceSettings,
       mode: requestedExecutionWorkspaceMode,
       legacyUseProjectWorkspace: issueAssigneeOverrides?.useProjectWorkspace ?? null,
+      issueAdapterConfig: issueAssigneeOverrides?.adapterConfig ?? null,
     });
     const workspaceReuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({
       issueExecutionWorkspaceId: requestedExecutionWorkspaceId,
@@ -25879,6 +25922,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             executionWorkspacePreference: issues.executionWorkspacePreference,
             executionWorkspaceSettings: issues.executionWorkspaceSettings,
             assigneeAgentId: issues.assigneeAgentId,
+            // BLO-19063: needed to resolve the same workspaceStrategy overlay the
+            // scheduling path applies, so both agree on `per_run`.
+            assigneeAdapterOverrides: issues.assigneeAdapterOverrides,
             executionRunId: issues.executionRunId,
             executionAgentNameKey: issues.executionAgentNameKey,
             createdAt: issues.createdAt,
@@ -26407,6 +26453,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             mode: resolvedMode,
             legacyUseProjectWorkspace: null,
           });
+          // BLO-19063: same overlay gating as the scheduling path — the issue's
+          // adapterConfig only applies when the issue is assigned to this agent.
+          const issueAdapterConfigForScope =
+            issue.assigneeAgentId === agent.id
+              ? parseIssueAssigneeAdapterOverrides(issue.assigneeAdapterOverrides)?.adapterConfig ?? null
+              : null;
           const resolvedStrategy = resolveEffectiveWorkspaceStrategyType(resolvedMode, workspaceManagedConfig);
           const existingExecutionWorkspaceStatus = issue.executionWorkspaceId
             ? await tx
@@ -26422,9 +26474,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             issueExecutionWorkspaceId: issue.executionWorkspaceId,
             issueExecutionWorkspacePreference: issue.executionWorkspacePreference,
             existingExecutionWorkspaceStatus,
-            // BLO-19063: read off the already-merged config so this site agrees
-            // with the scheduling path about what "per_run" means.
-            usesPerRunScope: asString(parseObject(workspaceManagedConfig.workspaceStrategy).runScope, "") === "per_run",
+            // BLO-19063: resolve through the same overlay helper the merge uses,
+            // so this site agrees with the scheduling path — and with
+            // realization — about what "per_run" means.
+            usesPerRunScope: asString(
+              parseObject(
+                resolveOverlaidWorkspaceStrategy({
+                  baseConfig: workspaceManagedConfig,
+                  issueAdapterConfig: issueAdapterConfigForScope,
+                }).value,
+              ).runScope,
+              "",
+            ) === "per_run",
           });
           const hasResolvablePriorSessionWorkspace = await resolveHasResolvablePriorSessionWorkspace();
 
