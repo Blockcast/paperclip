@@ -8692,15 +8692,53 @@ export function isConfirmedAdapterTimeout(
   return result.timedOut === true && result.exitCode !== 0;
 }
 
+function hasStructuredAdapterFailureEvidence(
+  resultJson: Record<string, unknown> | null | undefined,
+): boolean {
+  if (!resultJson) return false;
+
+  if (resultJson.is_error === true || resultJson.isError === true) return true;
+  if (resultJson.success === false || resultJson.ok === false) return true;
+
+  const failureState = [
+    resultJson.type,
+    resultJson.subtype,
+    resultJson.status,
+    resultJson.outcome,
+    resultJson.stopReason,
+    resultJson.stop_reason,
+  ].some(
+    (value) =>
+      typeof value === "string" &&
+      /^(?:error(?:[_-].*)?|failed|failure|cancelled|canceled|timed[_-]?out)$/i.test(
+        value.trim(),
+      ),
+  );
+  if (failureState) return true;
+
+  return ["error", "errors", "errorMessage", "errorCode"].some((key) => {
+    const value = resultJson[key];
+    if (typeof value === "string") return value.trim().length > 0;
+    if (typeof value === "number") return value !== 0;
+    if (typeof value === "boolean") return value;
+    if (Array.isArray(value)) return value.length > 0;
+    return value !== null && typeof value === "object" && Object.keys(value).length > 0;
+  });
+}
+
 export function isFalseAdapterTimeoutResult(
-  result: Pick<AdapterExecutionResult, "timedOut" | "exitCode" | "errorMessage" | "errorCode">,
+  result: Pick<
+    AdapterExecutionResult,
+    "timedOut" | "exitCode" | "errorMessage" | "errorCode" | "resultJson"
+  >,
 ): boolean {
   return (
     result.timedOut === true &&
     result.exitCode === 0 &&
     result.errorCode === "timeout" &&
     typeof result.errorMessage === "string" &&
-    /^Timed out after [0-9]+s$/.test(result.errorMessage.trim())
+    /^Timed out after [0-9]+s$/.test(result.errorMessage.trim()) &&
+    !hasStructuredAdapterFailureEvidence(result.resultJson)
   );
 }
 
