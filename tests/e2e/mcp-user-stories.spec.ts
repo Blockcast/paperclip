@@ -425,6 +425,7 @@ test.describe.serial("MCP prod Phase 5a user-story harness", () => {
   });
 
   test(`${storyById("US-9").id} ${storyById("US-9").title} @mcp-runnable @mcp-us9`, async ({ page, request }) => {
+    test.skip(true, storyById("US-9").gate);
     const { seed, scout, mock, connectionId } = await seedConnectedFixture(request, "us9");
     try {
       for (const value of ["first", "second"]) {

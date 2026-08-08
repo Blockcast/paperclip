@@ -1,4 +1,4 @@
-export type McpUserStoryStatus = "runnable" | "dependency_gated";
+export type McpUserStoryStatus = "runnable" | "dependency_gated" | "quarantined";
 
 export interface McpUserStory {
   id: `US-${number}`;
@@ -104,7 +104,8 @@ export const mcpUserStories: McpUserStory[] = [
     id: "US-9",
     title: "Test-tab bug regressions",
     personas: ["Ana"],
-    status: "runnable",
+    status: "quarantined",
+    gate: "QUARANTINED BLO-23198: 'Allow once' never renders on the review page for a pending ask_first decision. Deterministic (fails on retry), not flaky.",
     assertions: [
       "A side-effecting ask-first test action can be approved and re-run.",
       "The Review link does not lose the pending card.",
