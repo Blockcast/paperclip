@@ -43,6 +43,7 @@ import {
   issueTreeControlService,
 } from "../issue-tree-control.js";
 import { TERMINAL_HEARTBEAT_RUN_STATUSES, issueService } from "../issues.js";
+import { restoreCheckoutPromotedStatus } from "../issue-checkout-status.js";
 import {
   applyIssueMonitorPolicyTransition,
   derivePersistedMonitorState,
@@ -2651,7 +2652,7 @@ export function recoveryService(
           .where(and(eq(agentWakeupRequests.id, input.run.wakeupRequestId), eq(agentWakeupRequests.companyId, input.run.companyId)));
       }
 
-      await tx
+      const releasedIssue = await tx
         .update(issues)
         .set({
           executionRunId: null,
@@ -2665,7 +2666,19 @@ export function recoveryService(
             eq(issues.companyId, input.run.companyId),
             eq(issues.executionRunId, input.run.id),
           ),
-        );
+        )
+        .returning({ id: issues.id })
+        .then((rows) => rows[0] ?? null);
+
+      // The run is finalized; if it never wrote a status of its own, undo the
+      // `in_progress` its checkout wrote (BLO-20649), but only if the scoped
+      // execution release above actually won its compare-and-set.
+      if (releasedIssue) {
+        await restoreCheckoutPromotedStatus(tx, {
+          issueId: input.sourceIssue.id,
+          companyId: input.run.companyId,
+        });
+      }
 
       return updatedRun;
     });

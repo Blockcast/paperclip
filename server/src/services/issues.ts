@@ -71,6 +71,11 @@ import {
 } from "@paperclipai/shared";
 import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
 import { incrementBlockerResolvedWakeMetric } from "./blocker-resolved-wake-metrics.js";
+import {
+  checkoutRestoreStatusExpression,
+  restoreCheckoutPromotedStatus,
+  TERMINAL_HEARTBEAT_RUN_STATUS_VALUES,
+} from "./issue-checkout-status.js";
 import { logger } from "../middleware/logger.js";
 import { parseObject } from "../adapters/utils.js";
 import {
@@ -919,15 +924,9 @@ function sameRunLock(checkoutRunId: string | null, actorRunId: string | null) {
   return checkoutRunId == null;
 }
 
-export const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set([
-  "succeeded",
-  "interrupted",
-  "failed",
-  "error",
-  "adapter_failed",
-  "cancelled",
-  "timed_out",
-]);
+export const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set<string>(
+  TERMINAL_HEARTBEAT_RUN_STATUS_VALUES,
+);
 const STALE_ISSUE_CONTEXT_RUN_STATUSES = ["queued", "scheduled_retry"] as const;
 const ISSUE_LIST_DESCRIPTION_MAX_CHARS = 1200;
 
@@ -3250,6 +3249,7 @@ const issueListSelect = {
   // ~14% of pg CPU under list load with 66% of issues > 2KB description).
   description: sql<string | null>`substring(${issues.description}, 1, ${ISSUE_LIST_DESCRIPTION_MAX_CHARS})`,
   status: issues.status,
+  checkoutRestoreStatus: issues.checkoutRestoreStatus,
   workMode: issues.workMode,
   harnessKind: issues.harnessKind,
   priority: issues.priority,
@@ -5755,7 +5755,7 @@ export function issueService(db: Db) {
         sql`select ${issues.id} from ${issues} where ${issues.id} = ${issueId} for update`,
       );
       const issue = await tx
-        .select({ executionRunId: issues.executionRunId })
+        .select({ executionRunId: issues.executionRunId, companyId: issues.companyId })
         .from(issues)
         .where(eq(issues.id, issueId))
         .then((rows) => rows[0] ?? null);
@@ -5788,6 +5788,10 @@ export function issueService(db: Db) {
         .returning({ id: issues.id })
         .then((rows) => rows[0] ?? null);
 
+      if (updated) {
+        await restoreCheckoutPromotedStatus(tx, { issueId, companyId: issue.companyId });
+      }
+
       return Boolean(updated);
     });
   }
@@ -5810,8 +5814,12 @@ export function issueService(db: Db) {
           eq(issues.executionRunId, expectedExecutionRunId),
         ),
       )
-      .returning({ id: issues.id })
+      .returning({ id: issues.id, companyId: issues.companyId })
       .then((rows) => rows[0] ?? null);
+
+    if (cleared) {
+      await restoreCheckoutPromotedStatus(db, { issueId, companyId: cleared.companyId });
+    }
 
     return cleared != null;
   }
@@ -5877,7 +5885,11 @@ export function issueService(db: Db) {
         sql`select ${issues.id} from ${issues} where ${issues.id} = ${issueId} for update`,
       );
       const issue = await tx
-        .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+        .select({
+          checkoutRunId: issues.checkoutRunId,
+          executionRunId: issues.executionRunId,
+          companyId: issues.companyId,
+        })
         .from(issues)
         .where(eq(issues.id, issueId))
         .then((rows) => rows[0] ?? null);
@@ -5925,6 +5937,10 @@ export function issueService(db: Db) {
         )
         .returning({ id: issues.id })
         .then((rows) => rows[0] ?? null);
+
+      if (updated) {
+        await restoreCheckoutPromotedStatus(tx, { issueId, companyId: issue.companyId });
+      }
 
       return Boolean(updated);
     });
@@ -8612,6 +8628,15 @@ export function issueService(db: Db) {
         ...issueData,
         updatedAt: new Date(),
       };
+      // An explicit status write means a run (or a human) decided where this
+      // issue belongs, so there is no longer a checkout promotion to undo. Drop
+      // the restore marker and the automatic reset in
+      // `restoreCheckoutPromotedStatus` becomes a no-op — including for a
+      // deliberate write of `in_progress`, which must survive the run that set
+      // it. See BLO-20649.
+      if (issueData.status && issueData.checkoutRestoreStatus === undefined) {
+        patch.checkoutRestoreStatus = null;
+      }
       if (doneTransitionEvidenceVerdict) {
         patch.lastEvidenceVerdict = doneTransitionEvidenceVerdict;
         patch.lastEvidenceVerdictEvaluatedAt = new Date(doneTransitionEvidenceVerdict.evaluatedAt);
@@ -9196,6 +9221,7 @@ export function issueService(db: Db) {
           // whose run later parks at queued/scheduled_retry is never reclaimable.
           executionLockedAt: now,
           status: "in_progress",
+          checkoutRestoreStatus: checkoutRestoreStatusExpression,
           startedAt: now,
           updatedAt: now,
         })
@@ -9270,6 +9296,11 @@ export function issueService(db: Db) {
             // BLO-19848: see the checkout site above — a lock pointer without a
             // lock timestamp is unreclaimable by the stale-lock sweeper.
             executionLockedAt: adoptedAt,
+            // The regular dispatcher reaches this fallback for an old
+            // markerless `in_progress` strand because its expected-status list
+            // intentionally excludes `in_progress`. Adopt the old status as
+            // `todo` so this newly acquired checkout can release it again.
+            checkoutRestoreStatus: checkoutRestoreStatusExpression,
             updatedAt: adoptedAt,
           })
           .where(
@@ -9326,6 +9357,11 @@ export function issueService(db: Db) {
             executionAgentNameKey: null,
             executionLockedAt: now,
             status: "in_progress",
+            // This promotion is a checkout like any other, so it must record the
+            // status it displaced. Without the marker `restoreCheckoutPromotedStatus`
+            // can never undo it and the row strands in `in_progress` forever —
+            // the exact BLO-20649 leak, reached through the adoption path.
+            checkoutRestoreStatus: checkoutRestoreStatusExpression,
             updatedAt: now,
           };
           if (current.status !== "in_progress") {
@@ -9382,6 +9418,9 @@ export function issueService(db: Db) {
               // BLO-19848: see the checkout site above.
               executionLockedAt: now,
               status: "in_progress",
+              // Same reasoning as the adoption path above: a checkout that does
+              // not record what it displaced is unrestorable (BLO-20649).
+              checkoutRestoreStatus: checkoutRestoreStatusExpression,
               startedAt: now,
               updatedAt: now,
             })

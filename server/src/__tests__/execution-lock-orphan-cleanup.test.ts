@@ -36,11 +36,11 @@ describeEmbeddedPostgres("execution lock orphan cleanup", () => {
   }, 120_000);
 
   afterEach(async () => {
-    await db.delete(agentWakeupRequests);
     await db.delete(activityLog);
     await db.delete(heartbeatRunEvents);
     await db.delete(issues);
     await db.delete(heartbeatRuns);
+    await db.delete(agentWakeupRequests);
     await db.delete(agents);
     await db.delete(companies);
   });
@@ -456,6 +456,163 @@ describeEmbeddedPostgres("execution lock orphan cleanup", () => {
       expect(contextAfter?.executionRunId).toBeNull();
       expect(unrelatedAfter?.executionRunId).toBe(unrelatedRunId);
       expect(unrelatedAfter?.executionAgentNameKey).toBe("se1");
+    });
+  });
+
+  // BLO-20649: `checkout` promotes an issue to `in_progress` and records what it
+  // displaced in `checkout_restore_status`. `releaseIssueExecutionAndPromote` is
+  // the primary terminal-run finalizer, so it is the path that actually decides
+  // whether `in_progress` is a statement about live work or a high-water mark of
+  // every issue any wake ever touched. These drive the real finalizer via
+  // `cancelRun` rather than calling the restore helper directly.
+  describe("checkout status restore through run finalization", () => {
+    // `issues.checkout_run_id` / `execution_run_id` are FKs, so the run row has
+    // to exist before any issue can point at it.
+    async function seedRun(
+      companyId: string,
+      agentId: string,
+      runId: string,
+      overrides: { status?: string; contextSnapshot?: Record<string, unknown> } = {},
+    ) {
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        status: overrides.status ?? "queued",
+        ...(overrides.contextSnapshot ? { contextSnapshot: overrides.contextSnapshot } : {}),
+      } as typeof heartbeatRuns.$inferInsert);
+    }
+
+    async function seedPromotedIssue(
+      companyId: string,
+      runId: string,
+      restoreStatus: "todo" | "backlog" | null,
+    ) {
+      return seedIssue(companyId, {
+        status: "in_progress",
+        checkoutRestoreStatus: restoreStatus,
+        checkoutRunId: runId,
+        executionRunId: runId,
+        executionAgentNameKey: "ceo",
+        executionLockedAt: new Date(),
+      });
+    }
+
+    it("returns a checkout-promoted issue to its pre-checkout status when the run finalizes", async () => {
+      const companyId = await seedCompany();
+      const agentId = await seedAgent(companyId, "CEO");
+
+      const runId = randomUUID();
+      await seedRun(companyId, agentId, runId);
+      const todoIssueId = await seedPromotedIssue(companyId, runId, "todo");
+      const backlogIssueId = await seedPromotedIssue(companyId, runId, "backlog");
+      await db
+        .update(heartbeatRuns)
+        .set({ contextSnapshot: { issueId: todoIssueId } })
+        .where(eq(heartbeatRuns.id, runId));
+
+      await heartbeatService(db).cancelRun(runId);
+
+      const [todoAfter] = await db.select().from(issues).where(eq(issues.id, todoIssueId));
+      const [backlogAfter] = await db.select().from(issues).where(eq(issues.id, backlogIssueId));
+
+      // Restored to the exact tier each issue held, not a blanket `todo`, and
+      // across every sibling the run touched — not only its context issue.
+      expect(todoAfter?.status).toBe("todo");
+      expect(todoAfter?.checkoutRestoreStatus).toBeNull();
+      expect(backlogAfter?.status).toBe("backlog");
+      expect(backlogAfter?.checkoutRestoreStatus).toBeNull();
+    });
+
+    it("leaves a run-written status alone when the run finalizes", async () => {
+      const companyId = await seedCompany();
+      const agentId = await seedAgent(companyId, "CEO");
+
+      const runId = randomUUID();
+      await seedRun(companyId, agentId, runId);
+      // No marker: an explicit status write clears it, which is how a run that
+      // genuinely advanced the issue — or deliberately re-asserted
+      // `in_progress` — is protected from the reset.
+      const advancedIssueId = await seedPromotedIssue(companyId, runId, null);
+      await db
+        .update(heartbeatRuns)
+        .set({ contextSnapshot: { issueId: advancedIssueId } })
+        .where(eq(heartbeatRuns.id, runId));
+
+      await heartbeatService(db).cancelRun(runId);
+
+      const [after] = await db.select().from(issues).where(eq(issues.id, advancedIssueId));
+      expect(after?.status).toBe("in_progress");
+      expect(after?.executionRunId).toBeNull();
+    });
+
+    it("does not reset while a live retry run still claims the issue", async () => {
+      const companyId = await seedCompany();
+      const agentId = await seedAgent(companyId, "CEO");
+
+      const finalizingRunId = randomUUID();
+      const retryRunId = randomUUID();
+      await seedRun(companyId, agentId, finalizingRunId);
+      await seedRun(companyId, agentId, retryRunId, { status: "running" });
+      const issueId = await seedPromotedIssue(companyId, finalizingRunId, "todo");
+      // Retry hand-off: `executionRunId` has moved to a still-running retry while
+      // `checkoutRunId` stays pinned at the finalizing run. The lock clear
+      // releases only the checkout column, and the live retry must keep the
+      // issue in `in_progress` so its work is not demoted underneath it.
+      await db
+        .update(issues)
+        .set({ executionRunId: retryRunId })
+        .where(eq(issues.id, issueId));
+      await db
+        .update(heartbeatRuns)
+        .set({ contextSnapshot: { issueId } })
+        .where(eq(heartbeatRuns.id, finalizingRunId));
+
+      await heartbeatService(db).cancelRun(finalizingRunId);
+
+      const [after] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(after?.status).toBe("in_progress");
+      expect(after?.checkoutRestoreStatus).toBe("todo");
+      expect(after?.executionRunId).toBe(retryRunId);
+    });
+
+    it("keeps a checkout promotion while finalization hands ownership to a continuation retry", async () => {
+      const companyId = await seedCompany();
+      const agentId = await seedAgent(companyId, "CEO");
+      const runId = randomUUID();
+      await seedRun(companyId, agentId, runId);
+      const issueId = await seedPromotedIssue(companyId, runId, "todo");
+      await db
+        .update(issues)
+        .set({ assigneeAgentId: agentId, responsibleUserId: "responsible-user" })
+        .where(eq(issues.id, issueId));
+      await db
+        .update(heartbeatRuns)
+        .set({ contextSnapshot: { issueId }, responsibleUserId: "responsible-user" })
+        .where(eq(heartbeatRuns.id, runId));
+
+      // Keep the retry queued so this asserts the exact durable handoff rather
+      // than an adapter's later execution outcome.
+      await heartbeatService(db, { skipQueuedRunDispatch: true }).cancelRun(runId);
+
+      const [after] = await db.select().from(issues).where(eq(issues.id, issueId));
+      const recoveryRun = after?.executionRunId
+        ? await db
+          .select()
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, after.executionRunId))
+          .then((rows) => rows[0] ?? null)
+        : null;
+
+      expect(after?.status).toBe("in_progress");
+      expect(after?.checkoutRestoreStatus).toBe("todo");
+      expect(recoveryRun?.status).toBe("queued");
+      expect(recoveryRun?.contextSnapshot).toMatchObject({
+        issueId,
+        retryReason: "issue_continuation_needed",
+        retryOfRunId: runId,
+      });
     });
   });
 });
