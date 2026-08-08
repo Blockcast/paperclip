@@ -332,3 +332,25 @@ export function buildExecutionWorkspaceAdapterConfig(input: {
 
   return nextConfig;
 }
+
+/**
+ * BLO-19063: will this issue's workspace be realized with a per-run scope?
+ *
+ * `runScope` can be set on any of three layers — issue settings, project policy,
+ * or the agent's `adapterConfig` — and the precedence between them (plus the
+ * mode gating that drops `workspaceStrategy` entirely outside
+ * `isolated_workspace`) lives in `buildExecutionWorkspaceAdapterConfig`. So this
+ * asks that function rather than re-deriving the chain: the reuse guard must see
+ * exactly the strategy realization will see, and a second copy of the precedence
+ * would be free to drift away from it.
+ */
+export function executionWorkspaceUsesPerRunScope(input: {
+  agentConfig: Record<string, unknown>;
+  projectPolicy: ProjectExecutionWorkspacePolicy | null;
+  issueSettings: IssueExecutionWorkspaceSettings | null;
+  mode: ParsedExecutionWorkspaceMode;
+  legacyUseProjectWorkspace: boolean | null;
+}): boolean {
+  const resolvedConfig = buildExecutionWorkspaceAdapterConfig(input);
+  return asString(parseObject(resolvedConfig.workspaceStrategy).runScope, "") === "per_run";
+}
