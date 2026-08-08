@@ -7833,6 +7833,7 @@ const EXPLICIT_PR_REVIEW_REQUEST_WAKE_REASONS = new Set([
   "github_pr_review_requested",
   "github_pr_ready_for_review",
   "github_pr_synchronized",
+  "issue_pr_review_requested",
 ]);
 
 // BLO-18953: an explicit review request must never be absorbed into a review

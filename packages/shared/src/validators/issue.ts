@@ -488,6 +488,10 @@ const createIssueBaseSchema = z.object({
     agentId: z.string().uuid(),
     instructions: multilineTextSchema.optional().nullable(),
   }).strict().optional().nullable(),
+  prReviewTarget: z.object({
+    repoFullName: z.string().regex(/^[\w.-]+\/[\w.-]+$/),
+    prNumber: z.number().int().positive(),
+  }).strict().optional().nullable(),
 });
 
 const createIssueDuplicateGuardSchema = {
@@ -545,6 +549,7 @@ export const updateIssueSchema = createIssueBaseSchema.omit({
   createdByUserId: true,
   responsibleUserId: true,
   watchdog: true,
+  prReviewTarget: true,
 }).partial().extend({
   requestDepth: issueRequestDepthInputSchema.optional(),
   assigneeAgentId: z.string().trim().min(1).optional().nullable(),

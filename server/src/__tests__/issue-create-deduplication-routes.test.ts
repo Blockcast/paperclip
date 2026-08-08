@@ -238,6 +238,43 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
     });
   });
 
+  it("reuses one unresolved PR review issue across four advancing heads", async () => {
+    const companyId = await seedCompany();
+    const app = createApp();
+    const prReviewTarget = { repoFullName: "Blockcast/paperclip", prNumber: 876 };
+    const titles = [
+      "Review Blockcast/paperclip PR #876 at 15a949a4",
+      "Review Blockcast/paperclip PR #876 at ad0da2bc",
+      "Review paperclip PR #876 exact head ad0da2bc55",
+      "Review Blockcast/paperclip PR #876 at ff1c72db",
+    ];
+
+    const responses = await Promise.all(titles.map((title) => request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ title, prReviewTarget })));
+
+    expect(responses.map((response) => response.status).sort()).toEqual([200, 200, 200, 201]);
+    expect(new Set(responses.map((response) => response.body.id)).size).toBe(1);
+    expect(responses.filter((response) => response.status === 200)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          body: expect.objectContaining({
+            deduplicated: true,
+            deduplicationReason: "pr_review_target",
+          }),
+        }),
+      ]),
+    );
+
+    const rows = await db.select().from(issues).where(eq(issues.companyId, companyId));
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      originKind: "pr_review",
+      originFingerprint: "pr_review:Blockcast/paperclip:876",
+    });
+    expect(titles).toContain(rows[0]!.title);
+  });
+
   it("serializes keyed and title-only creates for the same issue", async () => {
     const companyId = await seedCompany();
     const parent = await seedParent(companyId);

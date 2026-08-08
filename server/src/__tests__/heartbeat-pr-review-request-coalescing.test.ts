@@ -8,11 +8,13 @@ import {
   createDb,
   heartbeatRunEvents,
   heartbeatRuns,
+  issues,
 } from "@paperclipai/db";
 import {
   heartbeatService,
   shouldQueueFollowupInsteadOfAbsorbingIntoRunningRun,
 } from "../services/heartbeat.js";
+import { queueIssueAssignmentWakeup } from "../services/issue-assignment-wakeup.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -101,6 +103,17 @@ describe("explicit PR review requests are not absorbed by an in-flight review (B
     ).toBe(true);
   });
 
+  it("queues an issue-derived new-head request behind a running same-PR review run", () => {
+    expect(
+      shouldQueueFollowupInsteadOfAbsorbingIntoRunningRun({
+        hasRunningSameScopeRun: true,
+        hasQueuedSameScopeRun: false,
+        contextSnapshot: reviewerSnapshot({ wakeReason: "issue_pr_review_requested" }),
+        wakeCommentId: null,
+      }),
+    ).toBe(true);
+  });
+
   it("does not apply to the PR author's wake, only the reviewer's", () => {
     // The author wake carries the same wakeReason but prRole: "author"; it is
     // issue-scoped and must keep its existing coalescing behavior.
@@ -128,6 +141,7 @@ describeEmbeddedPostgres("PR review request coalescing into a queued run", () =>
     await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
+    await db.delete(issues);
     await db.delete(agents);
     await db.delete(companies);
   });
@@ -141,6 +155,7 @@ describeEmbeddedPostgres("PR review request coalescing into a queued run", () =>
     const agentId = randomUUID();
     const existingRunId = randomUUID();
     const existingWakeupId = randomUUID();
+    const issueId = randomUUID();
 
     await db.insert(companies).values({
       id: companyId,
@@ -148,6 +163,7 @@ describeEmbeddedPostgres("PR review request coalescing into a queued run", () =>
       status: "active",
       issuePrefix: "REV",
       requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
     });
 
     await db.insert(agents).values({
@@ -162,6 +178,16 @@ describeEmbeddedPostgres("PR review request coalescing into a queued run", () =>
         heartbeat: { enabled: true, intervalSec: 60, wakeOnDemand: true },
       },
       permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Review Blockcast/pim-multicast-gateway PR #1888",
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      originKind: "pr_review",
+      originFingerprint: TASK_KEY,
     });
 
     await db.insert(agentWakeupRequests).values({
@@ -192,20 +218,26 @@ describeEmbeddedPostgres("PR review request coalescing into a queued run", () =>
       skipQueuedRunDispatch: true,
     });
 
-    const run = await heartbeat.wakeup(agentId, {
-      source: "automation",
-      triggerDetail: "system",
-      reason: "github_pr_review_requested",
+    await queueIssueAssignmentWakeup({
+      heartbeat,
+      issue: {
+        id: issueId,
+        assigneeAgentId: agentId,
+        status: "todo",
+        originKind: "pr_review",
+        originFingerprint: TASK_KEY,
+      },
+      reason: "issue_assigned",
+      mutation: "create",
+      contextSource: "issue.create",
       requestedByActorType: "system",
       requestedByActorId: "github_webhook",
-      payload: { taskKey: TASK_KEY, reviewKind: "pr_review" },
-      contextSnapshot: reviewerSnapshot({ githubHeadSha: "newerheadB" }),
     });
 
     // No run fan-out: the queued run absorbs the request.
-    expect(run?.id).toBe(existingRunId);
     const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
     expect(runs).toHaveLength(1);
+    expect(runs[0]?.id).toBe(existingRunId);
 
     // The audit row survives, so BLO-18859's counters can report `coalesced`
     // as its own delivery state rather than as a delivered wake.
@@ -215,5 +247,92 @@ describeEmbeddedPostgres("PR review request coalescing into a queued run", () =>
       .where(eq(agentWakeupRequests.agentId, agentId));
     expect(wakeups.map((wakeup) => wakeup.status).sort()).toEqual(["coalesced", "queued"]);
     expect(wakeups.find((wakeup) => wakeup.status === "coalesced")?.runId).toBe(existingRunId);
+  });
+
+  it("queues an issue-derived request after a running reviewer has snapshotted an older head", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runningRunId = randomUUID();
+    const issueId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Running Reviewer Co",
+      status: "active",
+      issuePrefix: "RUN",
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Ally",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {
+        heartbeat: { enabled: true, intervalSec: 60, wakeOnDemand: true },
+      },
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Review Blockcast/pim-multicast-gateway PR #1888 at newerheadB",
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      originKind: "pr_review",
+      originFingerprint: TASK_KEY,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runningRunId,
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "running",
+      startedAt: new Date(),
+      contextTaskKey: TASK_KEY,
+      contextSnapshot: reviewerSnapshot({ githubHeadSha: "olderheadA" }),
+    });
+
+    const heartbeat = heartbeatService(db, {
+      penstockAvailabilityGate: allowPenstockGate,
+      skipQueuedRunDispatch: true,
+    });
+    await queueIssueAssignmentWakeup({
+      heartbeat,
+      issue: {
+        id: issueId,
+        assigneeAgentId: agentId,
+        status: "todo",
+        originKind: "pr_review",
+        originFingerprint: TASK_KEY,
+      },
+      reason: "issue_assigned",
+      mutation: "create_deduplicated",
+      contextSource: "issue.create",
+    });
+
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(2);
+    expect(runs.find((run) => run.id === runningRunId)?.status).toBe("running");
+    const followup = runs.find((run) => run.id !== runningRunId);
+    expect(followup).toMatchObject({
+      status: "queued",
+      contextTaskKey: TASK_KEY,
+      contextSnapshot: expect.objectContaining({
+        wakeReason: "issue_pr_review_requested",
+        reviewKind: "pr_review",
+        prRole: "reviewer",
+        githubPrNumber: 1888,
+        githubRepoFullName: "Blockcast/pim-multicast-gateway",
+      }),
+    });
   });
 });

@@ -18,9 +18,25 @@ export interface IssueAssignmentWakeupDeps {
   ) => Promise<unknown>;
 }
 
+function prReviewTargetFromIssue(issue: {
+  originKind?: string | null;
+  originFingerprint?: string | null;
+}) {
+  if (issue.originKind !== "pr_review") return null;
+  const match = /^pr_review:(.+\/.+):(\d+)$/.exec(issue.originFingerprint ?? "");
+  if (!match) return null;
+  return { repoFullName: match[1]!, prNumber: Number(match[2]) };
+}
+
 export function queueIssueAssignmentWakeup(input: {
   heartbeat: IssueAssignmentWakeupDeps;
-  issue: { id: string; assigneeAgentId: string | null; status: string };
+  issue: {
+    id: string;
+    assigneeAgentId: string | null;
+    status: string;
+    originKind?: string | null;
+    originFingerprint?: string | null;
+  };
   reason: string;
   mutation: string;
   contextSource: string;
@@ -30,23 +46,39 @@ export function queueIssueAssignmentWakeup(input: {
   rethrowOnError?: boolean;
 }) {
   if (!input.issue.assigneeAgentId || input.issue.status === "backlog") return;
+  const prReviewTarget = prReviewTargetFromIssue(input.issue);
+  const taskKey = input.taskKey ?? (prReviewTarget
+    ? `pr_review:${prReviewTarget.repoFullName}:${prReviewTarget.prNumber}`
+    : null);
+  const reason = prReviewTarget ? "issue_pr_review_requested" : input.reason;
+  const reviewContext = prReviewTarget
+    ? {
+        reviewKind: "pr_review",
+        prRole: "reviewer",
+        githubPrNumber: prReviewTarget.prNumber,
+        githubRepoFullName: prReviewTarget.repoFullName,
+      }
+    : {};
 
   return input.heartbeat
     .wakeup(input.issue.assigneeAgentId, {
       source: "assignment",
       triggerDetail: "system",
-      reason: input.reason,
+      reason,
       payload: {
         issueId: input.issue.id,
         mutation: input.mutation,
-        ...(input.taskKey ? { taskKey: input.taskKey } : {}),
+        ...(taskKey ? { taskKey } : {}),
+        ...reviewContext,
       },
       requestedByActorType: input.requestedByActorType,
       requestedByActorId: input.requestedByActorId ?? null,
       contextSnapshot: {
         issueId: input.issue.id,
         source: input.contextSource,
-        ...(input.taskKey ? { taskKey: input.taskKey } : {}),
+        wakeReason: reason,
+        ...(taskKey ? { taskKey } : {}),
+        ...reviewContext,
       },
     })
     .catch((err) => {

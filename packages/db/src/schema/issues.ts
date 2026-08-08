@@ -234,6 +234,14 @@ export const issues = pgTable(
           and ${table.hiddenAt} is null
           and ${table.status} not in ('done', 'cancelled')`,
       ),
+    activePrReviewIdx: uniqueIndex("issues_active_pr_review_uq")
+      .on(table.companyId, table.originKind, table.originFingerprint)
+      .where(
+        sql`${table.originKind} = 'pr_review'
+          and ${table.originFingerprint} <> 'default'
+          and ${table.hiddenAt} is null
+          and ${table.status} not in ('done', 'cancelled')`,
+      ),
     // BLO-16319: one open issue per Dependabot alert. originId is the stable
     // `github-dependabot:<repoFullName>#<alertNumber>` key (the same key the
     // webhook route already uses for the wake idempotency key), so a
