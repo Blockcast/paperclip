@@ -18,7 +18,7 @@ test("runner-label guard accepts only ARC workflows", async (t) => {
     await mkdir(path.join(root, ".github/workflows"), { recursive: true });
     await writeFile(
       path.join(root, ".github/workflows/arc.yml"),
-      "jobs:\n  check:\n    runs-on: default\n  quoted:\n    runs-on: \"default\"\n  aggregate:\n    runs-on: [arc-light, arc-dind]\n  release:\n    runs-on:\n      group: arc-deploy\n  browser:\n    runs-on:\n      - arc-e2e\n",
+      "jobs:\n  check:\n    runs-on: default\n  quoted:\n    runs-on: \"default\"\n  aggregate:\n    runs-on: [arc-light, arc-dind]\n  release:\n    runs-on:\n      group: arc-deploy\n  browser:\n    runs-on:\n      - arc-e2e\n  merge_group_style:\n    runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-paperclip-general' }}\n",
     );
 
     const result = spawnSync(process.execPath, [script], { cwd: root, encoding: "utf8" });
@@ -60,6 +60,39 @@ test("runner-label guard accepts only ARC workflows", async (t) => {
     assert.equal(result.status, 1);
     assert.match(result.stderr, /unknown\.yml:3: runs-on: arc-e2ee/);
   });
+
+  await t.test("rejects a ternary whose branch is not an allowed runner", async () => {
+    await writeFile(
+      path.join(root, ".github/workflows/ternary-bad.yml"),
+      "jobs:\n  heavy:\n    runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'ubuntu-latest' }}\n",
+    );
+
+    const result = spawnSync(process.execPath, [script], { cwd: root, encoding: "utf8" });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /ternary-bad\.yml:3:/);
+  });
+
+  await t.test("rejects a chained expression with an earlier forbidden runner", async () => {
+    await writeFile(
+      path.join(root, ".github/workflows/ternary-chained.yml"),
+      "jobs:\n  heavy:\n    runs-on: ${{ cond && 'ubuntu-latest' || github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-paperclip-general' }}\n",
+    );
+
+    const result = spawnSync(process.execPath, [script], { cwd: root, encoding: "utf8" });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /ternary-chained\.yml:3:/);
+  });
+
+  await t.test("rejects an opaque expression that isn't the recognized ternary shape", async () => {
+    await writeFile(
+      path.join(root, ".github/workflows/expr-opaque.yml"),
+      "jobs:\n  heavy:\n    runs-on: ${{ fromJSON(vars.RUNNER_LABEL) }}\n",
+    );
+
+    const result = spawnSync(process.execPath, [script], { cwd: root, encoding: "utf8" });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /expr-opaque\.yml:3:/);
+  });
 });
 
 test("PR e2e workflow uses the dedicated ARC e2e runner", async () => {
@@ -78,5 +111,14 @@ test("PR e2e workflow uses the dedicated ARC e2e runner", async () => {
     driftedWorkflow,
     prE2eRunnerPattern,
     "a later job must not satisfy the PR e2e runner assertion",
+  );
+});
+
+test("PR workflow does not route jobs to the shared default pool", async () => {
+  const workflow = await readFile(path.join(repoRoot, ".github/workflows/pr.yml"), "utf8");
+  assert.doesNotMatch(
+    workflow,
+    /^\s*runs-on:\s*default\s*$/m,
+    "PR and merge-group jobs must use repository-scoped ARC pools",
   );
 });

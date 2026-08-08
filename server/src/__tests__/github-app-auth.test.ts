@@ -18,6 +18,7 @@ import {
   mintAppJwt,
   getInstallationToken,
   getInstallationTokenResult,
+  githubGetPullRequestGate,
   githubHasReviewerEvidenceForPr,
   githubGetLatestCommitStatusForContext,
   githubPostCommitStatus,
@@ -159,6 +160,44 @@ describe("getInstallationToken", () => {
       reason: "github_app_token_rate_limited",
       statusCode: 403,
     });
+  });
+});
+
+describe("githubGetPullRequestGate", () => {
+  it.each([
+    { state: "open", merged: false },
+    { state: "closed", merged: false },
+    { state: "closed", merged: true },
+  ] as const)("returns the authoritative PR gate state: $state merged=$merged", async (gate) => {
+    setCreds();
+    const fetchMock = vi.fn(async (url: string | URL) => {
+      if (String(url).includes("/access_tokens")) {
+        return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
+      }
+      expect(String(url)).toContain("/repos/Blockcast/paperclip/pulls/847");
+      return jsonResponse(gate);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(githubGetPullRequestGate({
+      repoFullName: "Blockcast/paperclip",
+      prNumber: 847,
+    })).resolves.toEqual(gate);
+  });
+
+  it("fails open to an explicit error when GitHub is unavailable", async () => {
+    setCreds();
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL) => {
+      if (String(url).includes("/access_tokens")) {
+        return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
+      }
+      return jsonResponse({ message: "unavailable" }, false, 503);
+    }));
+
+    await expect(githubGetPullRequestGate({
+      repoFullName: "Blockcast/paperclip",
+      prNumber: 847,
+    })).resolves.toEqual({ error: "pull_request_http_503" });
   });
 });
 

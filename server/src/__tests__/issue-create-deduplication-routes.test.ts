@@ -1,7 +1,9 @@
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { performance } from "node:perf_hooks";
 import express from "express";
 import request from "supertest";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
@@ -11,6 +13,7 @@ import {
   heartbeatRuns,
   issueCreateIdempotencyKeys,
   issues,
+  projects,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -18,7 +21,14 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { actorMiddleware } from "../middleware/auth.js";
 import { errorHandler } from "../middleware/index.js";
-import { issueRoutes } from "../routes/issues.js";
+import {
+  ISSUE_CREATE_DUPLICATE_CANDIDATE_LATENCY_BUDGET_MS,
+  ISSUE_CREATE_DUPLICATE_CANDIDATE_ROW_CAP,
+  ISSUE_CREATE_DUPLICATE_CANDIDATE_SCAN_CAP,
+  findCreateIssueDuplicateCandidates,
+  issueRoutes,
+  raceCreateIssueDuplicateCandidateLookup,
+} from "../routes/issues.js";
 import {
   ISSUE_CREATE_IDEMPOTENCY_KEY_RETENTION_DAYS,
   issueService,
@@ -26,6 +36,27 @@ import {
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+
+type FilingFixture = {
+  identifier: string;
+  title: string;
+  description: string;
+};
+
+const monitorFilings = JSON.parse(
+  readFileSync(
+    new URL("../../../packages/shared/src/__fixtures__/issue-duplicate-monitor-filings.json", import.meta.url),
+    "utf8",
+  ),
+) as FilingFixture[];
+
+it("bounds a stalled duplicate candidate lookup so create can fail open", async () => {
+  const startedAt = performance.now();
+
+  await expect(raceCreateIssueDuplicateCandidateLookup(new Promise<never>(() => {}), 10))
+    .rejects.toThrow("issue duplicate candidate lookup timed out after 10ms");
+  expect(performance.now() - startedAt).toBeLessThan(ISSUE_CREATE_DUPLICATE_CANDIDATE_LATENCY_BUDGET_MS);
+});
 
 if (!embeddedPostgresSupport.supported) {
   console.warn(
@@ -50,6 +81,7 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
     await db.delete(issues);
     await db.delete(heartbeatRuns);
     await db.delete(agents);
+    await db.delete(projects);
     await db.delete(companies);
   });
 
@@ -57,11 +89,11 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
     await tempDb?.cleanup();
   });
 
-  function createApp() {
+  function createApp(opts: Parameters<typeof issueRoutes>[2] = {}) {
     const app = express();
     app.use(express.json());
     app.use(actorMiddleware(db, { deploymentMode: "local_trusted" }));
-    app.use("/api", issueRoutes(db, {} as any));
+    app.use("/api", issueRoutes(db, {} as any, opts));
     app.use(errorHandler);
     return app;
   }
@@ -85,6 +117,37 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
       priority: "medium",
     }).returning();
     return parent;
+  }
+
+  async function seedProject(companyId: string, name: string) {
+    const [project] = await db.insert(projects).values({ companyId, name }).returning();
+    return project;
+  }
+
+  async function waitUntil(assertion: () => void | Promise<void>, timeoutMs = 1_000) {
+    const deadline = Date.now() + timeoutMs;
+    let lastError: unknown;
+    while (Date.now() < deadline) {
+      try {
+        await assertion();
+        return;
+      } catch (error) {
+        lastError = error;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+    }
+    if (lastError) throw lastError;
+    await assertion();
+  }
+
+  async function waitForActivityEvents(companyId: string, action: string, expectedCount: number) {
+    let rows: Array<typeof activityLog.$inferSelect> = [];
+    await waitUntil(async () => {
+      rows = (await db.select().from(activityLog).where(eq(activityLog.companyId, companyId)))
+        .filter((event) => event.action === action);
+      expect(rows).toHaveLength(expectedCount);
+    });
+    return rows;
   }
 
   it("replays the existing issue for the same company idempotency key", async () => {
@@ -226,6 +289,619 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
       .expect(201);
 
     expect(duplicate.body.id).not.toBe(first.body.id);
+  });
+
+  it("returns company-scoped advisory candidates and records one queryable consumption event", async () => {
+    const companyId = await seedCompany();
+    const candidateProject = await seedProject(companyId, "Candidate project");
+    const createdProject = await seedProject(companyId, "Created project");
+    const app = createApp();
+    const seededFilings = [monitorFilings[0]!, monitorFilings[2]!, monitorFilings[3]!];
+
+    await db.insert(issues).values(seededFilings.map((filing) => ({
+      companyId,
+      projectId: candidateProject.id,
+      identifier: filing.identifier,
+      title: filing.title,
+      description: filing.description,
+      status: "todo",
+      priority: "medium",
+    })));
+
+    const subject = monitorFilings[1]!;
+    const response = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({
+        projectId: createdProject.id,
+        title: subject.title,
+        description: subject.description,
+        allowDuplicate: false,
+      })
+      .expect(201);
+
+    expect(response.body.duplicateCandidates.map((candidate: { identifier: string }) => candidate.identifier).sort())
+      .toEqual(seededFilings.map((filing) => filing.identifier).sort());
+    expect(response.body.duplicateCandidates[0]).toEqual(expect.objectContaining({
+      identifier: expect.any(String),
+      title: expect.any(String),
+      score: expect.any(Number),
+    }));
+
+    const explicitlyAllowed = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({
+        projectId: createdProject.id,
+        title: `Retry: ${subject.title}`,
+        description: subject.description,
+        allowDuplicate: true,
+      })
+      .expect(201);
+    expect(explicitlyAllowed.body.duplicateCandidates).not.toEqual([]);
+
+    const shownEvents = await waitForActivityEvents(companyId, "issue.duplicate_candidates_shown", 2);
+    const activityEvents = await db.select().from(activityLog).where(eq(activityLog.companyId, companyId));
+    const consumptionEvents = shownEvents.filter(
+      (event) => event.details?.identifier === response.body.identifier,
+    );
+    expect(consumptionEvents).toHaveLength(1);
+    expect(consumptionEvents[0]).toMatchObject({
+      entityType: "company",
+      entityId: companyId,
+    });
+    expect(consumptionEvents[0]?.details).toMatchObject({
+      identifier: response.body.identifier,
+      duplicateCandidates: response.body.duplicateCandidates.map(
+        (candidate: { identifier: string; score: number }) => ({
+          identifier: candidate.identifier,
+          score: candidate.score,
+        }),
+      ),
+    });
+    expect(activityEvents.find((event) => event.action === "issue.created")?.details)
+      .not.toHaveProperty("duplicateCandidates");
+  });
+
+  it("keeps the create successful when advisory consumption telemetry fails", async () => {
+    const companyId = await seedCompany();
+    const candidate = monitorFilings[0]!;
+    await db.insert(issues).values({
+      companyId,
+      identifier: candidate.identifier,
+      title: candidate.title,
+      description: candidate.description,
+      status: "todo",
+      priority: "medium",
+    });
+    const app = createApp({
+      createIssueDuplicateCandidateActivityWriter: async () => {
+        throw new Error("telemetry unavailable");
+      },
+    });
+
+    const subject = monitorFilings[1]!;
+    const response = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ title: subject.title, description: subject.description })
+      .expect(201);
+
+    expect(response.body.duplicateCandidates).not.toEqual([]);
+    expect(await db.select().from(issues).where(eq(issues.id, response.body.id))).toHaveLength(1);
+  });
+
+  it("keeps the create successful when advisory consumption telemetry stalls", async () => {
+    const companyId = await seedCompany();
+    const candidate = monitorFilings[0]!;
+    await db.insert(issues).values({
+      companyId,
+      identifier: candidate.identifier,
+      title: candidate.title,
+      description: candidate.description,
+      status: "todo",
+      priority: "medium",
+    });
+    let writerStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      writerStarted = resolve;
+    });
+    let releaseWriter!: () => void;
+    const release = new Promise<void>((resolve) => {
+      releaseWriter = resolve;
+    });
+    const app = createApp({
+      createIssueDuplicateCandidateActivityWriter: async () => {
+        writerStarted();
+        await release;
+      },
+    });
+
+    const subject = monitorFilings[1]!;
+    const response = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ title: subject.title, description: subject.description })
+      .expect(201);
+
+    expect(response.body.duplicateCandidates).not.toEqual([]);
+    expect(await db.select().from(issues).where(eq(issues.id, response.body.id))).toHaveLength(1);
+    await started;
+    releaseWriter();
+  });
+
+  it("cancels a blocked advisory consumption telemetry write", async () => {
+    const companyId = await seedCompany();
+    const candidate = monitorFilings[0]!;
+    await db.insert(issues).values({
+      companyId,
+      identifier: candidate.identifier,
+      title: candidate.title,
+      description: candidate.description,
+      status: "todo",
+      priority: "medium",
+    });
+    const blockingDb = createDb(tempDb!.connectionString);
+    let writerErrorCode: string | undefined;
+    let writerFinished!: () => void;
+    const writerCompletion = new Promise<void>((resolve) => {
+      writerFinished = resolve;
+    });
+    const app = createApp({
+      createIssueDuplicateCandidateActivityTimeoutMs: 25,
+      createIssueDuplicateCandidateActivityWriter: async (scopedDb) => {
+        let releaseLock!: () => void;
+        const release = new Promise<void>((resolve) => {
+          releaseLock = resolve;
+        });
+        let lockAcquired!: () => void;
+        const acquired = new Promise<void>((resolve) => {
+          lockAcquired = resolve;
+        });
+        const lock = blockingDb.transaction(async (tx) => {
+          await tx.execute(sql`lock table activity_log in access exclusive mode`);
+          lockAcquired();
+          await release;
+        });
+        await acquired;
+        try {
+          await scopedDb.select().from(activityLog);
+        } catch (error) {
+          writerErrorCode = (error as { code?: string; cause?: { code?: string } }).cause?.code
+            ?? (error as { code?: string }).code;
+        } finally {
+          releaseLock();
+          await lock;
+          writerFinished();
+        }
+      },
+    });
+
+    const subject = monitorFilings[1]!;
+    const response = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ title: subject.title, description: subject.description })
+      .expect(201);
+
+    expect(response.body.duplicateCandidates).not.toEqual([]);
+    await writerCompletion;
+    expect(writerErrorCode).toBe("57014");
+  });
+
+  it("returns 201 without advisories when the route lookup stalls", async () => {
+    const companyId = await seedCompany();
+    let lookupAborted = false;
+    const app = createApp({
+      createIssueDuplicateCandidateLookup: (_db, _companyId, _subject, _filterCorpus, signal) => (
+        new Promise<never>((_resolve, reject) => {
+          signal?.addEventListener("abort", () => {
+            lookupAborted = true;
+            reject(signal.reason);
+          }, { once: true });
+        })
+      ),
+    });
+    const response = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ title: "Create remains available while advisory lookup stalls" })
+      .expect(201);
+
+    expect(response.body.duplicateCandidates).toEqual([]);
+    expect(lookupAborted).toBe(true);
+    const activityEvents = await db.select().from(activityLog).where(eq(activityLog.companyId, companyId));
+    expect(activityEvents.filter((event) => event.action === "issue.duplicate_candidates_shown")).toHaveLength(0);
+  });
+
+  it("skips advisory lookup when connection reservation exceeds the deadline", async () => {
+    const companyId = await seedCompany();
+    const client = (db as typeof db & {
+      $client: { reserve: () => Promise<{ release: () => void }> };
+    }).$client;
+    const originalReserve = client.reserve.bind(client);
+    let lookupStarted = false;
+    let releaseLateReservation!: () => void;
+    let lateReservationReleased = false;
+    client.reserve = () => new Promise((resolve) => {
+      releaseLateReservation = () => resolve({
+        release: () => {
+          lateReservationReleased = true;
+        },
+      });
+    });
+    const app = createApp({
+      createIssueDuplicateCandidateTimeoutMs: 10,
+      createIssueDuplicateCandidateLookup: async () => {
+        lookupStarted = true;
+        return [{ identifier: "DUP-1", title: "Duplicate", score: 0.99 }];
+      },
+    });
+
+    try {
+      const response = await request(app)
+        .post(`/api/companies/${companyId}/issues`)
+        .send({ title: "Create without queued advisory lookup" })
+        .expect(201);
+
+      expect(response.body.duplicateCandidates).toEqual([]);
+      expect(lookupStarted).toBe(false);
+      releaseLateReservation();
+      await waitUntil(() => expect(lateReservationReleased).toBe(true));
+    } finally {
+      client.reserve = originalReserve;
+    }
+  });
+
+  it("skips advisory telemetry when connection reservation exceeds the deadline", async () => {
+    const companyId = await seedCompany();
+    const candidate = monitorFilings[0]!;
+    await db.insert(issues).values({
+      companyId,
+      identifier: candidate.identifier,
+      title: candidate.title,
+      description: candidate.description,
+      status: "todo",
+      priority: "medium",
+    });
+    const client = (db as typeof db & {
+      $client: { reserve: () => Promise<{ release: () => void }> };
+    }).$client;
+    const originalReserve = client.reserve.bind(client);
+    let reserveCalls = 0;
+    let telemetryWriterCalled = false;
+    let releaseLateReservation!: () => void;
+    let lateReservationReleased = false;
+    client.reserve = () => {
+      reserveCalls += 1;
+      if (reserveCalls === 1) return originalReserve();
+      return new Promise((resolve) => {
+        releaseLateReservation = () => resolve({
+          release: () => {
+            lateReservationReleased = true;
+          },
+        });
+      });
+    };
+    const app = createApp({
+      createIssueDuplicateCandidateActivityTimeoutMs: 10,
+      createIssueDuplicateCandidateActivityWriter: async () => {
+        telemetryWriterCalled = true;
+      },
+    });
+    const subject = monitorFilings[1]!;
+
+    try {
+      const response = await request(app)
+        .post(`/api/companies/${companyId}/issues`)
+        .send({ title: subject.title, description: subject.description })
+        .expect(201);
+
+      expect(response.body.duplicateCandidates).not.toEqual([]);
+      await waitUntil(() => expect(reserveCalls).toBeGreaterThanOrEqual(2));
+      expect(telemetryWriterCalled).toBe(false);
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      releaseLateReservation();
+      await waitUntil(() => expect(lateReservationReleased).toBe(true));
+      expect(await db.select().from(activityLog).where(eq(activityLog.companyId, companyId)))
+        .not.toEqual(expect.arrayContaining([
+          expect.objectContaining({ action: "issue.duplicate_candidates_shown" }),
+        ]));
+    } finally {
+      client.reserve = originalReserve;
+    }
+  });
+
+  it("does not start advisory lookup when a required create side effect fails", async () => {
+    const companyId = await seedCompany();
+    const candidate = monitorFilings[0]!;
+    await db.insert(issues).values({
+      companyId,
+      identifier: candidate.identifier,
+      title: candidate.title,
+      description: candidate.description,
+      status: "todo",
+      priority: "medium",
+    });
+    let lookupStarted = false;
+    const app = createApp({
+      createIssueDuplicateCandidateLookup: async () => {
+        lookupStarted = true;
+        return [{ identifier: candidate.identifier, title: candidate.title, score: 0.99 }];
+      },
+      createIssueBeforeResponseHook: async () => {
+        throw new Error("late create side effect failed");
+      },
+    });
+    const subject = monitorFilings[1]!;
+
+    await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ title: subject.title, description: subject.description })
+      .expect(500);
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(lookupStarted).toBe(false);
+    const activityEvents = await db.select().from(activityLog).where(eq(activityLog.companyId, companyId));
+    expect(activityEvents.filter((event) => event.action === "issue.duplicate_candidates_shown")).toHaveLength(0);
+  });
+
+  it("continues past 200 newer unreadable rows to collect readable candidates", async () => {
+    const companyId = await seedCompany();
+    const allowedProject = await seedProject(companyId, "Allowed project");
+    const deniedProject = await seedProject(companyId, "Denied project");
+    const candidate = monitorFilings[0]!;
+    await db.insert(issues).values({
+      companyId,
+      projectId: allowedProject.id,
+      identifier: candidate.identifier,
+      title: candidate.title,
+      description: candidate.description,
+      status: "todo",
+      priority: "medium",
+      createdAt: new Date(Date.now() - 60_000),
+    });
+    await db.insert(issues).values(Array.from(
+      { length: ISSUE_CREATE_DUPLICATE_CANDIDATE_ROW_CAP },
+      (_, index) => ({
+        companyId,
+        projectId: deniedProject.id,
+        title: `Newer inaccessible issue ${index}`,
+        status: "todo" as const,
+        priority: "medium" as const,
+      }),
+    ));
+    const app = createApp({
+      createIssueDuplicateCandidateActivityWriter: async () => {},
+      createIssueDuplicateCandidateCorpusFilter: async (rows) => (
+        rows.filter((row) => row.projectId === allowedProject.id)
+      ),
+    });
+    const subject = monitorFilings[1]!;
+
+    const response = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ projectId: allowedProject.id, title: subject.title, description: subject.description })
+      .expect(201);
+
+    expect(response.body.duplicateCandidates).toEqual(expect.arrayContaining([
+      expect.objectContaining({ identifier: candidate.identifier }),
+    ]));
+  });
+
+  it("does not skip rows with distinct microseconds inside the cursor millisecond", async () => {
+    const companyId = await seedCompany();
+    const allowedProject = await seedProject(companyId, "Allowed project");
+    const deniedProject = await seedProject(companyId, "Denied project");
+    const candidate = monitorFilings[0]!;
+    const candidateId = randomUUID();
+    await db.insert(issues).values({
+      id: candidateId,
+      companyId,
+      projectId: allowedProject.id,
+      identifier: candidate.identifier,
+      title: candidate.title,
+      description: candidate.description,
+      status: "todo",
+      priority: "medium",
+    });
+    await db.insert(issues).values(Array.from(
+      { length: ISSUE_CREATE_DUPLICATE_CANDIDATE_ROW_CAP },
+      (_, index) => ({
+        companyId,
+        projectId: deniedProject.id,
+        title: `Microsecond boundary issue ${index}`,
+        status: "todo" as const,
+        priority: "medium" as const,
+      }),
+    ));
+    await db.execute(sql`
+      update issues
+      set created_at = date_trunc('milliseconds', now() - interval '1 minute')
+        + case
+          when id = ${candidateId} then interval '100 microseconds'
+          else (200 + substring(title from '[0-9]+$')::integer) * interval '1 microsecond'
+        end
+      where company_id = ${companyId}
+    `);
+    const app = createApp({
+      createIssueDuplicateCandidateActivityWriter: async () => {},
+      createIssueDuplicateCandidateCorpusFilter: async (rows) => (
+        rows.filter((row) => row.projectId === allowedProject.id)
+      ),
+    });
+    const subject = monitorFilings[1]!;
+
+    const response = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ projectId: allowedProject.id, title: subject.title, description: subject.description })
+      .expect(201);
+
+    expect(response.body.duplicateCandidates).toEqual(expect.arrayContaining([
+      expect.objectContaining({ identifier: candidate.identifier }),
+    ]));
+  });
+
+  it("cancels an in-flight corpus query at the database statement deadline", async () => {
+    const companyId = await seedCompany();
+    const blockingDb = createDb(tempDb!.connectionString);
+    let releaseLock!: () => void;
+    const release = new Promise<void>((resolve) => {
+      releaseLock = resolve;
+    });
+    let lockAcquired!: () => void;
+    const acquired = new Promise<void>((resolve) => {
+      lockAcquired = resolve;
+    });
+    const lock = blockingDb.transaction(async (tx) => {
+      await tx.execute(sql`lock table issues in access exclusive mode`);
+      lockAcquired();
+      await release;
+    });
+    await acquired;
+    const startedAt = performance.now();
+
+    try {
+      await expect(findCreateIssueDuplicateCandidates(
+        db,
+        companyId,
+        { id: randomUUID(), identifier: null, title: "Blocked query", description: null },
+        undefined,
+        undefined,
+        25,
+      )).rejects.toMatchObject({ cause: { code: "57014" } });
+      expect(performance.now() - startedAt).toBeLessThan(ISSUE_CREATE_DUPLICATE_CANDIDATE_LATENCY_BUDGET_MS);
+    } finally {
+      releaseLock();
+      await lock;
+    }
+  });
+
+  it("cancels a blocked company-scope authorization decision", async () => {
+    const companyId = await seedCompany();
+    const blockingDb = createDb(tempDb!.connectionString);
+    let authorizationErrorCode: string | undefined;
+    let authorizationFinished!: () => void;
+    const authorizationCompletion = new Promise<void>((resolve) => {
+      authorizationFinished = resolve;
+    });
+    const app = createApp({
+      createIssueDuplicateCandidateTimeoutMs: 25,
+      createIssueDuplicateCandidateCompanyScopeReader: async (scopedDb) => {
+        let releaseLock!: () => void;
+        const release = new Promise<void>((resolve) => {
+          releaseLock = resolve;
+        });
+        let lockAcquired!: () => void;
+        const acquired = new Promise<void>((resolve) => {
+          lockAcquired = resolve;
+        });
+        const lock = blockingDb.transaction(async (tx) => {
+          await tx.execute(sql`lock table activity_log in access exclusive mode`);
+          lockAcquired();
+          await release;
+        });
+        await acquired;
+        try {
+          await scopedDb.select().from(activityLog);
+        } catch (error) {
+          authorizationErrorCode = (error as { code?: string; cause?: { code?: string } }).cause?.code
+            ?? (error as { code?: string }).code;
+        } finally {
+          releaseLock();
+          await lock;
+          authorizationFinished();
+        }
+        return false;
+      },
+    });
+
+    const response = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ title: "Company authorization remains bounded" })
+      .expect(201);
+
+    expect(response.body.duplicateCandidates).toEqual([]);
+    await authorizationCompletion;
+    expect(authorizationErrorCode).toBe("57014");
+  });
+
+  it("stops scanning after the explicit company corpus cap", async () => {
+    const companyId = await seedCompany();
+    const corpusCreatedAt = new Date(Date.now() - 60_000);
+    await db.insert(issues).values(Array.from(
+      { length: ISSUE_CREATE_DUPLICATE_CANDIDATE_SCAN_CAP + ISSUE_CREATE_DUPLICATE_CANDIDATE_ROW_CAP },
+      (_, index) => ({
+        companyId,
+        title: `Unreadable corpus issue ${index}`,
+        status: "todo" as const,
+        priority: "medium" as const,
+        createdAt: corpusCreatedAt,
+      }),
+    ));
+    let scannedRows = 0;
+    const app = createApp({
+      createIssueDuplicateCandidateTimeoutMs: 10_000,
+      createIssueDuplicateCandidateCorpusFilter: async (rows) => {
+        scannedRows += rows.length;
+        return [];
+      },
+    });
+
+    const response = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ title: "Bound the inaccessible duplicate corpus scan" })
+      .expect(201);
+
+    expect(response.body.duplicateCandidates).toEqual([]);
+    expect(scannedRows).toBe(ISSUE_CREATE_DUPLICATE_CANDIDATE_SCAN_CAP);
+  });
+
+  it("returns no advisory and records no consumption payload for a distinct issue", async () => {
+    const companyId = await seedCompany();
+    const app = createApp();
+    await db.insert(issues).values({
+      companyId,
+      identifier: "BLO-17001",
+      title: "Issue list rows wrap at tablet width",
+      description: "The `IssueRow` layout hides the assignee avatar at 1024px.",
+      status: "todo",
+      priority: "medium",
+    });
+
+    const response = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({
+        title: "Worker retry backoff resets after restart",
+        description: "Persist `nextAttemptAt` so adapter retries survive a worker crashloop.",
+      })
+      .expect(201);
+
+    expect(response.body.duplicateCandidates).toEqual([]);
+    const createdEvents = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.companyId, companyId));
+    expect(createdEvents.filter((event) => event.action === "issue.duplicate_candidates_shown")).toHaveLength(0);
+  });
+
+  it("keeps candidate lookup bounded with the row cap saturated", async () => {
+    const companyId = await seedCompany();
+    const app = createApp();
+    await db.insert(issues).values(Array.from(
+      { length: ISSUE_CREATE_DUPLICATE_CANDIDATE_ROW_CAP },
+      (_, index) => ({
+        companyId,
+        title: `Bounded candidate ${index}`,
+        description: `Investigate uniqueSymbol${index} in server/src/bounded/candidate-${index}.ts`,
+        status: "todo",
+        priority: "medium",
+      }),
+    ));
+
+    const response = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({
+        title: "Completely separate release documentation task",
+        description: "Update the operator handbook release checklist and screenshots.",
+        allowDuplicate: true,
+      })
+      .expect(201);
+    expect(response.body.duplicateCandidates).toEqual([]);
   });
 
   it("does not apply the route soft guard to internal service creates", async () => {
