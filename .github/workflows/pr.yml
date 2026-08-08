@@ -133,6 +133,9 @@ jobs:
       - name: Test verify job cancelled/skipped-vs-failed lane outcome
         run: node --test ./scripts/__tests__/pr-verify-lane-outcome.test.mjs
 
+      - name: Test pr-lockfile artifact guard and Playwright deps retry
+        run: node --test ./scripts/__tests__/pr-lockfile-artifact-guard.test.mjs
+
       - name: Validate release package manifest
         run: node ./scripts/release-package-map.mjs check
 
@@ -230,9 +233,11 @@ jobs:
         with:
           version: 9.15.4
 
+      # Skip only the normal no-artifact case. If policy generated a lockfile,
+      # a missing download must fail loudly rather than hide an invalid CI state.
       - name: Restore regenerated PR lockfile (if policy uploaded one)
+        if: needs.policy.outputs.lockfile_regenerated == '1'
         uses: actions/download-artifact@v4
-        continue-on-error: true
         with:
           name: pr-lockfile
           path: .
@@ -282,9 +287,11 @@ jobs:
         with:
           version: 9.15.4
 
+      # Skip only the normal no-artifact case. If policy generated a lockfile,
+      # a missing download must fail loudly rather than hide an invalid CI state.
       - name: Restore regenerated PR lockfile (if policy uploaded one)
+        if: needs.policy.outputs.lockfile_regenerated == '1'
         uses: actions/download-artifact@v4
-        continue-on-error: true
         with:
           name: pr-lockfile
           path: .
@@ -432,9 +439,11 @@ jobs:
         with:
           version: 9.15.4
 
+      # Skip only the normal no-artifact case. If policy generated a lockfile,
+      # a missing download must fail loudly rather than hide an invalid CI state.
       - name: Restore regenerated PR lockfile (if policy uploaded one)
+        if: needs.policy.outputs.lockfile_regenerated == '1'
         uses: actions/download-artifact@v4
-        continue-on-error: true
         with:
           name: pr-lockfile
           path: .
@@ -583,9 +592,11 @@ jobs:
         with:
           version: 9.15.4
 
+      # Skip only the normal no-artifact case. If policy generated a lockfile,
+      # a missing download must fail loudly rather than hide an invalid CI state.
       - name: Restore regenerated PR lockfile (if policy uploaded one)
+        if: needs.policy.outputs.lockfile_regenerated == '1'
         uses: actions/download-artifact@v4
-        continue-on-error: true
         with:
           name: pr-lockfile
           path: .
@@ -640,9 +651,11 @@ jobs:
         with:
           version: 9.15.4
 
+      # Skip only the normal no-artifact case. If policy generated a lockfile,
+      # a missing download must fail loudly rather than hide an invalid CI state.
       - name: Restore regenerated PR lockfile (if policy uploaded one)
+        if: needs.policy.outputs.lockfile_regenerated == '1'
         uses: actions/download-artifact@v4
-        continue-on-error: true
         with:
           name: pr-lockfile
           path: .
@@ -682,9 +695,11 @@ jobs:
         with:
           version: 9.15.4
 
+      # Skip only the normal no-artifact case. If policy generated a lockfile,
+      # a missing download must fail loudly rather than hide an invalid CI state.
       - name: Restore regenerated PR lockfile (if policy uploaded one)
+        if: needs.policy.outputs.lockfile_regenerated == '1'
         uses: actions/download-artifact@v4
-        continue-on-error: true
         with:
           name: pr-lockfile
           path: .
@@ -743,9 +758,11 @@ jobs:
         with:
           version: 9.15.4
 
+      # Skip only the normal no-artifact case. If policy generated a lockfile,
+      # a missing download must fail loudly rather than hide an invalid CI state.
       - name: Restore regenerated PR lockfile (if policy uploaded one)
+        if: needs.policy.outputs.lockfile_regenerated == '1'
         uses: actions/download-artifact@v4
-        continue-on-error: true
         with:
           name: pr-lockfile
           path: .
@@ -776,7 +793,18 @@ jobs:
           key: playwright-${{ runner.os }}-${{ steps.playwright_version.outputs.version }}
 
       - name: Install Playwright system dependencies
-        run: pnpm exec playwright install-deps chromium
+        run: |
+          for attempt in 1 2 3; do
+            if pnpm exec playwright install-deps chromium; then
+              exit 0
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              echo "Playwright system dependency install failed (attempt $attempt/3); retrying in 15s..." >&2
+              sleep 15
+            fi
+          done
+          echo "Playwright system dependency install failed after 3 attempts" >&2
+          exit 1
 
       - name: Install Playwright browser
         if: steps.playwright_cache.outputs.cache-hit != 'true'
