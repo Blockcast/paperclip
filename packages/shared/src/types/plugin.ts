@@ -664,6 +664,13 @@ export interface PluginRecord {
   installOrder: number | null;
   /** Resolved package path for local-path installs; used to find worker entrypoint. */
   packagePath: string | null;
+  /**
+   * npm install prefix this plugin was installed into, when it differs from
+   * the shared plugins directory. Null means the shared store. See
+   * BLO-20961 — set for plugins isolated from the shared store's
+   * workspace-SDK-fork vendoring.
+   */
+  installDir: string | null;
   /** Most recent error message, or operator-provided disable reason. */
   lastError: string | null;
   /** Timestamp when the plugin was first installed. */

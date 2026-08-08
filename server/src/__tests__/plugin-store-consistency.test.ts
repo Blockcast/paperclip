@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -12,6 +13,10 @@ import {
   pluginLoader,
   type PluginRuntimeServices,
 } from "../services/plugin-loader.js";
+import {
+  ISOLATED_SDK_PLUGIN_PACKAGES,
+  resolveDefaultInstallDir,
+} from "../bootstrap/isolated-sdk-plugins.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -233,6 +238,77 @@ describe("checkSharedDependencyConsistency", () => {
   });
 });
 
+describe("BLO-20961: installDir isolation survives a re-torn shared store across boots", () => {
+  const cleanupPaths = new Set<string>();
+
+  afterEach(async () => {
+    for (const cleanupPath of cleanupPaths) {
+      await rm(cleanupPath, { recursive: true, force: true });
+    }
+    cleanupPaths.clear();
+  });
+
+  async function tempDir(prefix: string): Promise<string> {
+    const dir = await mkdtemp(path.join(os.tmpdir(), prefix));
+    cleanupPaths.add(dir);
+    return dir;
+  }
+
+  it("resolves every ISOLATED_SDK_PLUGIN_PACKAGES entry outside the shared store, and leaves everything else in it", async () => {
+    const pluginsHome = await tempDir("paperclip-plugin-home-");
+    const sharedDir = path.join(pluginsHome, "plugins");
+    await mkdir(sharedDir, { recursive: true });
+
+    for (const pkg of ISOLATED_SDK_PLUGIN_PACKAGES) {
+      const resolved = resolveDefaultInstallDir(pkg, sharedDir);
+      expect(resolved).not.toBe(sharedDir);
+      expect(path.relative(sharedDir, resolved).startsWith("..")).toBe(true);
+    }
+
+    expect(resolveDefaultInstallDir("@paperclipai/some-other-plugin", sharedDir)).toBe(sharedDir);
+    expect(resolveDefaultInstallDir(undefined, sharedDir)).toBe(sharedDir);
+  });
+
+  it("an isolated plugin's SDK install stays congruent when boot 2 re-tears only the shared store — the exact BLO-18384/BLO-20961 recurrence", async () => {
+    // Boot 1: both the shared store and an isolated plugin's own install
+    // start out correctly reconciled (mirrors the "reconciled after the
+    // first boot" precondition from the BLO-20961 acceptance criteria).
+    const pluginsHome = await tempDir("paperclip-plugin-home-");
+    const sharedDir = path.join(pluginsHome, "plugins");
+    await mkdir(sharedDir, { recursive: true });
+    const isolatedDir = resolveDefaultInstallDir(ISOLATED_SDK_PLUGIN_PACKAGES[0], sharedDir);
+    await mkdir(isolatedDir, { recursive: true });
+
+    await writeLockfileVersion(sharedDir, SDK_PACKAGE, "2026.513.0");
+    await writeInstalledPackageVersion(sharedDir, SDK_PACKAGE, "2026.513.0");
+    await writeLockfileVersion(isolatedDir, SDK_PACKAGE, "2026.513.0");
+    await writeInstalledPackageVersion(isolatedDir, SDK_PACKAGE, "2026.513.0");
+
+    const bootOneShared = await checkSharedDependencyConsistency(sharedDir, SDK_PACKAGE);
+    const bootOneIsolated = await checkSharedDependencyConsistency(isolatedDir, SDK_PACKAGE);
+    expect(bootOneShared.consistent).toBe(true);
+    expect(bootOneIsolated.consistent).toBe(true);
+
+    // Boot 2: `copyWorkspaceSdkFiles()` / the workspace-fork copy in
+    // index.ts unconditionally re-vendors the fork (1.0.0) into the SHARED
+    // store's node_modules on every restart, without touching its
+    // package-lock.json — tearing it again exactly as it did live on
+    // 2026-08-01/02/04. It never touches the isolated dir; that's the fix.
+    await writeInstalledPackageVersion(sharedDir, SDK_PACKAGE, "1.0.0");
+
+    const bootTwoShared = await checkSharedDependencyConsistency(sharedDir, SDK_PACKAGE);
+    const bootTwoIsolated = await checkSharedDependencyConsistency(isolatedDir, SDK_PACKAGE);
+
+    // The shared store re-tears just like before this fix — expected, and
+    // orthogonal: nothing still sharing that store is exempted by this fix.
+    expect(bootTwoShared.consistent).toBe(false);
+    // What must hold: the isolated plugin's own install is untouched by the
+    // second boot's fork-copy and remains exactly as it was after boot 1.
+    expect(bootTwoIsolated).toEqual(bootOneIsolated);
+    expect(bootTwoIsolated.consistent).toBe(true);
+  });
+});
+
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe.sequential : describe.skip;
 
@@ -264,7 +340,7 @@ describeEmbeddedPostgres("torn plugin store — activation fails closed", () => 
     await tempDb?.cleanup();
   });
 
-  async function createFixturePluginPackage(): Promise<{
+  async function createFixturePluginPackage(packageNameOverride?: string): Promise<{
     packageRoot: string;
     packageName: string;
     manifest: {
@@ -281,7 +357,7 @@ describeEmbeddedPostgres("torn plugin store — activation fails closed", () => 
   }> {
     const slug = `plugin-store-consistency-${randomUUID().slice(0, 8)}`;
     const pluginKey = `paperclip.${slug.replace(/-/g, "_")}`;
-    const packageName = `@paperclipai/${slug}`;
+    const packageName = packageNameOverride ?? `@paperclipai/${slug}`;
     const packageRoot = await mkdtemp(path.join(os.tmpdir(), "paperclip-plugin-fixture-"));
     cleanupPaths.add(packageRoot);
     const distDir = path.join(packageRoot, "dist");
@@ -359,6 +435,14 @@ describeEmbeddedPostgres("torn plugin store — activation fails closed", () => 
       instanceInfo: { instanceId: "test-instance", hostVersion: "1.0.0" },
     };
     return { runtimeServices, startWorker, markError };
+  }
+
+  async function tempPluginStore(): Promise<string> {
+    const pluginsHome = await mkdtemp(path.join(os.tmpdir(), "paperclip-plugin-home-"));
+    cleanupPaths.add(pluginsHome);
+    const installDir = path.join(pluginsHome, "plugins");
+    await mkdir(installDir, { recursive: true });
+    return installDir;
   }
 
   async function insertReadyFixturePlugin(input: Awaited<ReturnType<typeof createFixturePluginPackage>>) {
@@ -509,4 +593,86 @@ describeEmbeddedPostgres("torn plugin store — activation fails closed", () => 
     expect(markError).toHaveBeenCalledTimes(1);
     expect(markError).toHaveBeenCalledWith(installedRow.id, expect.stringContaining("Torn plugin store detected"));
   }, 35_000);
+
+  it("BLO-20961: activates an isolated third-party plugin across a second boot that re-tears only the shared store", async () => {
+    const fixture = await createFixturePluginPackage();
+    const sharedDir = await tempPluginStore();
+    const isolatedDir = resolveDefaultInstallDir(ISOLATED_SDK_PLUGIN_PACKAGES[0], sharedDir);
+    await mkdir(isolatedDir, { recursive: true });
+
+    // Boot 1: both the shared store and this plugin's own (isolated) install
+    // start out correctly reconciled.
+    await writeLockfileVersion(sharedDir, SDK_PACKAGE, "2026.513.0");
+    await writeInstalledPackageVersion(sharedDir, SDK_PACKAGE, "2026.513.0");
+    await writeLockfileVersion(isolatedDir, SDK_PACKAGE, "2026.513.0");
+    await writeInstalledPackageVersion(isolatedDir, SDK_PACKAGE, "2026.513.0");
+
+    const [plugin] = await db
+      .insert(plugins)
+      .values({
+        pluginKey: fixture.manifest.id,
+        packageName: ISOLATED_SDK_PLUGIN_PACKAGES[0],
+        version: fixture.manifest.version,
+        apiVersion: fixture.manifest.apiVersion,
+        categories: fixture.manifest.categories as never,
+        manifestJson: fixture.manifest as never,
+        status: "ready",
+        packagePath: fixture.packageRoot,
+        installDir: isolatedDir,
+      })
+      .returning();
+    if (!plugin) throw new Error("fixture plugin row not inserted");
+
+    // Boot 2: `copyWorkspaceSdkFiles()` / the workspace-fork copy in
+    // index.ts unconditionally re-vendors the fork into the SHARED store on
+    // every restart — the exact recurrence from BLO-18384/BLO-18405. It
+    // never touches this plugin's isolated install dir.
+    await writeInstalledPackageVersion(sharedDir, SDK_PACKAGE, "1.0.0");
+
+    const { runtimeServices, startWorker, markError } = createRuntimeServices();
+    const loader = pluginLoader(db, { localPluginDir: sharedDir }, runtimeServices);
+    const result = await loader.loadSingle(plugin.id);
+
+    expect(result.success).toBe(true);
+    expect(startWorker).toHaveBeenCalledTimes(1);
+    expect(markError).not.toHaveBeenCalled();
+  }, 20_000);
+
+  it("BLO-20961: migrates an existing torn-store row before reactivating it", async () => {
+    const packageName = ISOLATED_SDK_PLUGIN_PACKAGES[0]!;
+    const fixture = await createFixturePluginPackage(packageName);
+    const sharedDir = await tempPluginStore();
+    await writeLockfileVersion(sharedDir, SDK_PACKAGE, "2026.513.0");
+    await writeInstalledPackageVersion(sharedDir, SDK_PACKAGE, "1.0.0");
+
+    const [legacyPlugin] = await db
+      .insert(plugins)
+      .values({
+        pluginKey: fixture.manifest.id,
+        packageName,
+        // npm accepts an exact local file specifier, so this test exercises
+        // the same isolated reinstall path without touching the registry.
+        version: `file:${fixture.packageRoot}`,
+        apiVersion: fixture.manifest.apiVersion,
+        categories: fixture.manifest.categories as never,
+        manifestJson: fixture.manifest as never,
+        status: "error",
+        lastError: "Torn plugin store detected for @paperclipai/plugin-sdk",
+      })
+      .returning();
+    if (!legacyPlugin) throw new Error("legacy fixture plugin row not inserted");
+
+    const { runtimeServices, startWorker, markError } = createRuntimeServices();
+    const loader = pluginLoader(db, { localPluginDir: sharedDir }, runtimeServices);
+    const result = await loader.loadAll();
+
+    const [persisted] = await db.select().from(plugins).where(eq(plugins.id, legacyPlugin.id));
+    const isolatedDir = resolveDefaultInstallDir(packageName, sharedDir);
+    expect(persisted?.installDir).toBe(isolatedDir);
+    expect(persisted?.status).toBe("ready");
+    expect(existsSync(path.join(isolatedDir, "node_modules", ...packageName.split("/"), "package.json"))).toBe(true);
+    expect(result).toMatchObject({ total: 1, succeeded: 1, failed: 0 });
+    expect(startWorker).toHaveBeenCalledTimes(1);
+    expect(markError).not.toHaveBeenCalled();
+  }, 60_000);
 });

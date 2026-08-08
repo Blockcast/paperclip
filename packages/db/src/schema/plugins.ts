@@ -34,6 +34,17 @@ export const plugins = pgTable(
     installOrder: integer("install_order"),
     /** Resolved package path for local-path installs; used to find worker entrypoint. */
     packagePath: text("package_path"),
+    /**
+     * npm install prefix this plugin was installed into, when it differs from
+     * the shared plugins directory (`installDir` on PluginInstallOptions).
+     * Null means the shared store. Set for plugins that declare their own
+     * `@paperclipai/plugin-sdk` dependency and are isolated so the shared
+     * store's workspace-fork vendoring can never overwrite their install
+     * (see BLO-20961). Read back by upgradePlugin/cleanupInstallArtifacts so
+     * upgrades and uninstalls target the same directory the plugin actually
+     * lives in instead of defaulting back to the shared store.
+     */
+    installDir: text("install_dir"),
     lastError: text("last_error"),
     installedAt: timestamp("installed_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
