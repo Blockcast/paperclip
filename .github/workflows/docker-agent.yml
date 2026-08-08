@@ -252,8 +252,22 @@ jobs:
         run: |
           set -euo pipefail
           docker buildx imagetools create --tag "$FLOATING_IMAGE" "$CANDIDATE_IMAGE"
-          promoted_digest=$(docker buildx imagetools inspect "$FLOATING_IMAGE" --format '{{json .Manifest.Digest}}' | tr -d '"')
-          test "$promoted_digest" = "$EXPECTED_DIGEST"
+          # `imagetools create` re-assembles the manifest index around the
+          # source image (buildx attaches provenance/SBOM attestations), so the
+          # floating tag's INDEX digest is legitimately different from the
+          # candidate IMAGE digest. Asserting equality therefore failed on
+          # every promotion — verified 2026-08-08 on run 31250770598, where the
+          # push itself reported DONE and `latest-k8s-vendored` correctly
+          # resolved to an index referencing the expected digest, yet the step
+          # still exited 1. Assert what actually matters: the tag we publish
+          # must CONTAIN the image we just built and smoke-tested.
+          if ! docker buildx imagetools inspect "$FLOATING_IMAGE" --raw \
+               | grep -qF "$EXPECTED_DIGEST"; then
+            echo "ERROR: $FLOATING_IMAGE does not reference the verified image $EXPECTED_DIGEST"
+            echo "--- floating tag manifest ---"
+            docker buildx imagetools inspect "$FLOATING_IMAGE" --raw || true
+            exit 1
+          fi
 
       # BLO-4141: Auto-bump per-agent adapter_config.image so the freshly
       # built tag actually lands on running agents. Without this, the new
