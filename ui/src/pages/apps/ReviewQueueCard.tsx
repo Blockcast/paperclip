@@ -42,12 +42,22 @@ export function ReviewQueueCard({
     enabled: !!selectedCompanyId,
     staleTime: 0,
     refetchOnMount: false,
-    refetchInterval: 20_000,
+    // The single polling mechanism for "keep an empty queue fresh": poll
+    // fast whenever the (filtered) queue is empty -- regardless of
+    // `emptyState`, since a `hidden` card still needs to notice a new
+    // pending item promptly so it can start rendering -- and fall back to
+    // the slow interval once there's something to show. A second,
+    // independent `setTimeout`-based effect used to duplicate this exact
+    // polling for the visible (`reassure`) empty state; consolidated here so
+    // there is only ever one in-flight timer for it (review follow-up).
+    refetchInterval: (state) => {
+      const visibleItems = filterActionRequests(state.state.data?.actionRequests, connectionId);
+      return visibleItems.length === 0 ? VISIBLE_EMPTY_QUEUE_REFRESH_MS : 20_000;
+    },
   });
 
   const items = useMemo(() => {
-    const all = query.data?.actionRequests ?? [];
-    return connectionId ? all.filter((item) => item.connectionId === connectionId) : all;
+    return filterActionRequests(query.data?.actionRequests, connectionId);
   }, [query.data, connectionId]);
 
   useEffect(() => {
@@ -56,15 +66,6 @@ export function ReviewQueueCard({
     didRefetchOnMountForCompany.current = selectedCompanyId;
     void query.refetch();
   }, [query.dataUpdatedAt, query.fetchStatus, query.refetch, selectedCompanyId]);
-
-  useEffect(() => {
-    if (!selectedCompanyId || items.length > 0) return;
-    if (query.dataUpdatedAt === 0 || query.fetchStatus === "fetching") return;
-    const timeout = window.setTimeout(() => {
-      void query.refetch();
-    }, VISIBLE_EMPTY_QUEUE_REFRESH_MS);
-    return () => window.clearTimeout(timeout);
-  }, [items.length, query.dataUpdatedAt, query.fetchStatus, query.refetch, selectedCompanyId]);
 
   if (!selectedCompanyId) return null;
   if (query.isLoading) return null;
@@ -94,6 +95,14 @@ export function ReviewQueueCard({
       </div>
     </section>
   );
+}
+
+function filterActionRequests(
+  actionRequests: ToolActionRequestListItem[] | undefined,
+  connectionId?: string,
+) {
+  const all = actionRequests ?? [];
+  return connectionId ? all.filter((item) => item.connectionId === connectionId) : all;
 }
 
 function ReviewRow({ companyId, item }: { companyId: string; item: ToolActionRequestListItem }) {

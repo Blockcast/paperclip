@@ -3320,7 +3320,7 @@ describeEmbeddedPostgres("tool access service", () => {
     ]);
   });
 
-  it("cancels stale pending action requests with invalid signatures before listing the review queue", async () => {
+  it("waits for a fresh action request to be signed while cancelling stale or invalid approvals", async () => {
     vi.stubEnv("PAPERCLIP_TOOL_ACTION_SIGNING_SECRET", "current-secret");
     const company = await createCompany(db);
     const [application] = await db.insert(toolApplications).values({
@@ -3352,7 +3352,7 @@ describeEmbeddedPostgres("tool access service", () => {
       schemaHash: "s1",
     }).returning();
     const canonicalArguments = canonicalToolArguments({ key: "alpha", value: "one" });
-    const invocationValues = [1, 2, 3].map(() => ({
+    const invocationValues = [1, 2, 3, 4].map(() => ({
       companyId: company.id,
       applicationId: application.id,
       connectionId: connection.id,
@@ -3364,7 +3364,7 @@ describeEmbeddedPostgres("tool access service", () => {
       approvalState: "pending" as const,
       status: "awaiting_approval" as const,
     }));
-    const [validInvocation, missingSignatureInvocation, oldSecretInvocation] =
+    const [validInvocation, freshUnsignedInvocation, staleUnsignedInvocation, oldSecretInvocation] =
       await db.insert(toolInvocations).values(invocationValues).returning();
     const validSignedArguments = signToolArguments({
       invocationId: validInvocation.id,
@@ -3378,7 +3378,8 @@ describeEmbeddedPostgres("tool access service", () => {
       canonicalArguments,
       signingSecret: "old-secret",
     });
-    const [validRequest, missingSignatureRequest, oldSecretRequest] = await db.insert(toolActionRequests).values([
+    const staleUnsignedCreatedAt = new Date(Date.now() - 60_000);
+    const [validRequest, freshUnsignedRequest, staleUnsignedRequest, oldSecretRequest] = await db.insert(toolActionRequests).values([
       {
         companyId: company.id,
         invocationId: validInvocation.id,
@@ -3389,11 +3390,21 @@ describeEmbeddedPostgres("tool access service", () => {
       },
       {
         companyId: company.id,
-        invocationId: missingSignatureInvocation.id,
+        invocationId: freshUnsignedInvocation.id,
         status: "pending",
         canonicalArgumentsHash: "args-hash",
         canonicalArgumentsSummary: { summary: canonicalArguments, sha256: "args-hash", sizeBytes: canonicalArguments.length },
         signedArguments: null,
+      },
+      {
+        companyId: company.id,
+        invocationId: staleUnsignedInvocation.id,
+        status: "pending",
+        canonicalArgumentsHash: "args-hash",
+        canonicalArgumentsSummary: { summary: canonicalArguments, sha256: "args-hash", sizeBytes: canonicalArguments.length },
+        signedArguments: null,
+        createdAt: staleUnsignedCreatedAt,
+        updatedAt: staleUnsignedCreatedAt,
       },
       {
         companyId: company.id,
@@ -3405,14 +3416,34 @@ describeEmbeddedPostgres("tool access service", () => {
       },
     ]).returning();
 
-    const list = await toolAccessService(db).listActionRequests(company.id, "pending");
+    const service = toolAccessService(db);
+    const list = await service.listActionRequests(company.id, "pending");
     const rows = await db.select().from(toolActionRequests);
     const statusById = new Map(rows.map((row) => [row.id, row.status]));
 
     expect(list.map((item) => item.request.id)).toEqual([validRequest.id]);
     expect(statusById.get(validRequest.id)).toBe("pending");
-    expect(statusById.get(missingSignatureRequest.id)).toBe("cancelled");
+    expect(statusById.get(freshUnsignedRequest.id)).toBe("pending");
+    expect(statusById.get(staleUnsignedRequest.id)).toBe("cancelled");
     expect(statusById.get(oldSecretRequest.id)).toBe("cancelled");
+
+    await db
+      .update(toolActionRequests)
+      .set({
+        signedArguments: signToolArguments({
+          invocationId: freshUnsignedInvocation.id,
+          toolName: freshUnsignedInvocation.toolName,
+          canonicalArguments,
+          signingSecret: "current-secret",
+        }),
+        updatedAt: new Date(),
+      })
+      .where(eq(toolActionRequests.id, freshUnsignedRequest.id));
+
+    const signedList = await service.listActionRequests(company.id, "pending");
+    expect(signedList.map((item) => item.request.id).sort()).toEqual(
+      [freshUnsignedRequest.id, validRequest.id].sort(),
+    );
   });
 
   it("tracks new profile tools, reviews mixed allow/block decisions, and clears pending counts", async () => {

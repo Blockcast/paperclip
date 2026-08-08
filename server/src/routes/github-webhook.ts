@@ -37,6 +37,8 @@ import {
   issues,
 } from "@paperclipai/db";
 import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
+import { drizzle as drizzlePgFromClient } from "drizzle-orm/postgres-js";
+import { findPgError } from "../lib/db-retry.js";
 import { heartbeatService, type HeartbeatServiceOptions } from "../services/heartbeat.js";
 import { issueService } from "../services/issues.js";
 import {
@@ -66,8 +68,26 @@ type PrReviewerSelectionDb = Pick<Db | DbTransaction, "select">;
 // Keep lock contention well below GitHub's webhook timeout. The winner holds
 // one pooled connection while heartbeat commits through another; createDb's
 // default pool satisfies the required minimum of two connections.
-const PR_REVIEWER_TASK_LOCK_TIMEOUT_MS = 2_000;
+//
+// BLO-21582 review follow-up: this is now a single request-wide budget
+// (passed to withPrReviewerTaskLock as one deadline, not re-armed per
+// attempt) so the whole lock-acquisition sequence -- including pool
+// checkout/query time, which a bare `await db.transaction()` does not
+// otherwise bound -- cannot itself approach GitHub's response window and
+// trigger the redelivery-under-contention loop this path exists to absorb.
+const PR_REVIEWER_TASK_LOCK_BUDGET_MS = 4_000;
 const PR_REVIEWER_TASK_LOCK_RETRY_MS = 25;
+// Bounds the lock-exhaustion fallback recheck (findExistingPrReviewerWake /
+// findActivePrReviewerForTask / selectPrReviewerAgentId) that runs after
+// PR_REVIEWER_TASK_LOCK_BUDGET_MS is already spent. Those reads use the same
+// pool that just failed to check out a connection in time, so a saturated
+// pool can stall them exactly as it stalled the lock probe -- without a
+// bound of their own they would defeat the whole point of the budget above
+// (BLO-21582 review follow-up: "the fallback queries are outside the
+// deadline"). Small on purpose: these are single indexed-row reads, and a
+// timeout here just falls back to the pre-existing conservative default
+// (record the delivery as lost) rather than confirming a no-op.
+const PR_REVIEWER_TASK_LOCK_FALLBACK_BUDGET_MS = 1_000;
 
 export interface GithubWebhookConfig {
   /**
@@ -1532,36 +1552,264 @@ async function findActivePrReviewerForTask(
     .then((rows) => rows[0]?.agentId ?? null);
 }
 
+// BLO-21582: a distinct class (not a bare Error) so the reviewer-wake call
+// site can retry ONLY a lock-acquisition timeout -- never a business-rule
+// refusal (HttpError) or a genuine DB error surfacing through the same catch,
+// which retrying would just delay for no benefit.
+class PrReviewerTaskLockTimeoutError extends Error {
+  constructor(taskKey: string) {
+    super(`timed out acquiring PR reviewer task assignment lock for ${taskKey}`);
+    this.name = "PrReviewerTaskLockTimeoutError";
+  }
+}
+
+// BLO-21582 review follow-up: racing `db.transaction()` (or a bare read
+// promise) against a deadline can only stop US from awaiting it -- postgres.js
+// never exposes the internal query it uses to acquire a pooled connection, so
+// an abandoned one still lands on a freed connection later and runs its
+// BEGIN/probe/rollback (or SELECT) regardless of whether anyone is still
+// listening, adding detached work behind the exact pool contention this code
+// exists to survive (the prior version of this fix only logged that case).
+//
+// `sql.reserve()` is genuinely boundable: it never issues a query at all
+// until code explicitly does so on the connection it returns. Racing the
+// *reservation* against the deadline means an abandoned one can be released
+// the instant it lands, before a single query runs on it, and one that lands
+// in time is exclusively ours from then on -- no further POOL CONTENTION is
+// possible. That is a different guarantee from a stalled BACKEND, though:
+// once the connection is ours, `begin` and the advisory-lock probe are still
+// real queries that postgres.js cannot cancel client-side, so they get their
+// own database-side bound below (mirroring `boundedFallbackRead`'s
+// `statement_timeout` further down this file) rather than relying on the
+// reservation race to cover them too.
+type PgClient = Db["$client"];
+type ReservedPgConnection = Awaited<ReturnType<PgClient["reserve"]>>;
+
+const RESERVATION_TIMED_OUT = Symbol("pr-reviewer-task-lock-reservation-timed-out");
+
+async function reserveConnectionOrTimeout(
+  client: PgClient,
+  remainingMs: number,
+): Promise<ReservedPgConnection | typeof RESERVATION_TIMED_OUT> {
+  if (remainingMs <= 0) return RESERVATION_TIMED_OUT;
+  const reservation = client.reserve();
+  const outcome = await Promise.race([
+    reservation.then((conn) => ({ conn })),
+    new Promise<typeof RESERVATION_TIMED_OUT>((resolve) => {
+      setTimeout(() => resolve(RESERVATION_TIMED_OUT), remainingMs);
+    }),
+  ]);
+  if (outcome !== RESERVATION_TIMED_OUT) return outcome.conn;
+  // postgres.js does not expose withdrawing a still-queued reserve() request
+  // -- but nothing has run on it, so hand it straight back the moment it
+  // lands instead of ever using it, which is the only part of the old
+  // behavior actually worth avoiding.
+  reservation.then((conn) => conn.release()).catch(() => {});
+  return RESERVATION_TIMED_OUT;
+}
+
+// A connection returned by `reserve()` does not carry the `.options` postgres.js
+// attaches to the top-level client (only the client `postgres(...)` itself
+// gets `begin`/`reserve`/`options`; see postgres.js's `Sql()` factory). The
+// postgres-js drizzle driver reads `client.options.parsers` while
+// constructing, so without this it throws immediately on a reserved
+// connection. Sharing the pool's own `options` object here is safe: the
+// mutation the driver performs on it (registering type-transparency parsers)
+// already ran once when `createDb()` built `client` itself, so re-running it
+// is idempotent (verified against the embedded-postgres test harness).
+function drizzleOverReservedConnection(client: PgClient, reserved: ReservedPgConnection): PrReviewerSelectionDb {
+  Object.assign(reserved, { options: (client as unknown as { options: unknown }).options });
+  return drizzlePgFromClient(reserved as unknown as PgClient);
+}
+
 async function withPrReviewerTaskLock<T>(
   db: Db,
   taskKey: string,
-  action: (tx: DbTransaction) => Promise<T>,
+  deadline: number,
+  action: (tx: PrReviewerSelectionDb) => Promise<T>,
 ): Promise<T> {
-  const deadline = Date.now() + PR_REVIEWER_TASK_LOCK_TIMEOUT_MS;
-
+  const client = db.$client;
   while (true) {
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) {
+      throw new PrReviewerTaskLockTimeoutError(taskKey);
+    }
     // Do not block a pooled connection while another request owns the lock:
     // the winner needs a second connection for heartbeat's enqueue transaction.
-    const outcome = await db.transaction(async (tx) => {
-      const rows = await tx.execute(
-        sql`select pg_try_advisory_xact_lock(hashtextextended(${taskKey}, 0)) as acquired`,
-      );
-      const row = Array.isArray(rows) ? rows[0] : null;
-      if (
-        !row ||
-        typeof row !== "object" ||
-        (row as Record<string, unknown>).acquired !== true
-      ) {
-        return { acquired: false as const };
+    const reservation = await reserveConnectionOrTimeout(client, remainingMs);
+    if (reservation === RESERVATION_TIMED_OUT) {
+      if (Date.now() >= deadline) {
+        throw new PrReviewerTaskLockTimeoutError(taskKey);
       }
-      return { acquired: true as const, value: await action(tx) };
-    });
-    if (outcome.acquired) return outcome.value;
+      await new Promise((resolve) => setTimeout(resolve, PR_REVIEWER_TASK_LOCK_RETRY_MS));
+      continue;
+    }
+    let acquired = false;
+    try {
+      // BLO-21582 review follow-up: `begin` and the advisory-lock probe are
+      // real round trips to a real backend, and postgres.js gives no way to
+      // cancel one client-side once it's in flight -- racing a deadline (the
+      // way `reserveConnectionOrTimeout` above does for the reservation
+      // itself) only stops US from awaiting the result, it doesn't stop the
+      // backend from running it. Asking Postgres itself to cancel a stalled
+      // statement via `statement_timeout` is the only bound that actually
+      // works. It has to be a plain (session-scoped) `SET`, not `SET LOCAL`:
+      // `begin` runs before any transaction exists for `LOCAL` to attach to.
+      const probeBudgetMs = Math.max(1, Math.floor(deadline - Date.now()));
+      let probeError: unknown = null;
+      try {
+        await reservation.unsafe(`set statement_timeout = ${probeBudgetMs}`);
+        await reservation`begin`;
+        const rows = await reservation`select pg_try_advisory_xact_lock(hashtextextended(${taskKey}, 0)) as acquired`;
+        acquired = !!rows[0] && (rows[0] as Record<string, unknown>).acquired === true;
+      } catch (error) {
+        probeError = error;
+      }
+      if (probeError) {
+        await reservation`rollback`.catch(() => {});
+        if (findPgError(probeError)?.code !== "57014") throw probeError;
+        // The statement_timeout fired on `begin` or the probe itself --
+        // treat exactly like a probe that never got the chance to run: not
+        // acquired (still false from above), deadline re-checked below like
+        // every other timeout path in this function.
+      } else {
+        // BLO-21582 review follow-up (preserves Omar's 573c9ff8 guard under
+        // the new reservation-based mechanism): the probe can still settle
+        // after `deadline` even though nothing here is detached anymore --
+        // e.g. the reservation itself landed late within its own race, or
+        // the probe query was simply slow. Treat a late acquisition as
+        // not-acquired rather than running `action`: bounding overall
+        // response latency to the budget is a deliberate policy independent
+        // of the detached-execution bug this rewrite fixes, and
+        // readers/callers downstream (the 200 response, the funnel
+        // counters) are already sized around that budget.
+        if (acquired && Date.now() >= deadline) {
+          logger.warn(
+            { taskKey },
+            "github webhook reviewer wake lock was acquired after its retry deadline; skipping reviewer wake action",
+          );
+          acquired = false;
+        }
+        if (acquired) {
+          // The lock -- and this reserved connection -- are ours from here
+          // on: no pool contention can delay `action` regardless of how
+          // long it runs, the same guarantee the previous design gave only
+          // the already-acquired case. Abandoning here would still leave
+          // the transaction open on a connection nobody is accounting for.
+          // Reset the probe's `statement_timeout` first: it's a plain
+          // `SET`, so it survives the `commit` below (nothing leaks onto
+          // the next borrower of this connection), but `action` itself must
+          // not inherit a bound sized for a one-row probe.
+          await reservation.unsafe(`set statement_timeout = 0`);
+          const value = await action(drizzleOverReservedConnection(client, reservation));
+          await reservation`commit`;
+          return value;
+        }
+        await reservation`rollback`;
+      }
+    } catch (error) {
+      if (acquired) {
+        // `action` or `commit` failed after the lock was acquired: roll back
+        // so this connection doesn't return to the pool mid-transaction,
+        // then surface the real error instead of a lock timeout.
+        await reservation`rollback`.catch(() => {});
+      }
+      throw error;
+    } finally {
+      // Unconditional and independent of the reset above: a plain `SET`'s
+      // effect is undone by `rollback` (Postgres treats it as transactional
+      // for abort purposes even though it survives commit), so any path that
+      // rolled back here -- not-acquired, or an error after acquiring --
+      // would otherwise hand the next borrower of this physical connection a
+      // leftover statement_timeout sized for a probe that already finished.
+      await reservation.unsafe(`set statement_timeout = 0`).catch(() => {});
+      reservation.release();
+    }
     if (Date.now() >= deadline) {
-      throw new Error("timed out acquiring PR reviewer task assignment lock");
+      throw new PrReviewerTaskLockTimeoutError(taskKey);
     }
     await new Promise((resolve) => setTimeout(resolve, PR_REVIEWER_TASK_LOCK_RETRY_MS));
   }
+}
+
+// Sentinel distinct from any real query result (including `null`, which
+// `findExistingPrReviewerWake`/`findActivePrReviewerForTask` return to mean
+// "no row" -- a legitimate, confident answer that must NOT be confused with
+// "we don't know because the read didn't finish in time").
+const FALLBACK_RECHECK_TIMED_OUT = Symbol("pr-reviewer-wake-fallback-recheck-timed-out");
+
+// Bounds one lock-exhaustion fallback read against `deadlineMs` (BLO-21582
+// review follow-up). Reserving the connection first (same mechanism as
+// `withPrReviewerTaskLock`) means a reservation that times out is released
+// before it ever runs `read`. Unlike the lock probe's `action`, a fallback
+// read has no self-healing value in letting a stall keep running -- it is a
+// best-effort advisory check, so once the connection is ours the actual
+// query still needs bounding regardless of why it might be slow (a table
+// lock, a slow plan -- not just pool contention). `SET LOCAL
+// statement_timeout` does that at the database itself instead of merely
+// abandoning the JS promise, so nothing is left running once this connection
+// is released. `read` may issue more than one statement (see
+// `selectPrReviewerAgentId`'s two-query fallback); each gets its own fresh
+// per-statement timer, so a multi-statement read can in the worst case take
+// a small multiple of the budget rather than exactly bounding the total --
+// acceptable here because the result stays bounded and finite, not the
+// unbounded hang this replaces. A timeout here must propagate as "unknown",
+// not as a false "confirmed no active reviewer" -- the caller has to keep
+// that distinction to avoid silently swallowing a real loss just because the
+// recheck itself couldn't finish in time.
+async function boundedFallbackRead<T>(
+  client: PgClient,
+  deadlineMs: number,
+  read: (reservedDb: PrReviewerSelectionDb) => Promise<T>,
+): Promise<T | typeof FALLBACK_RECHECK_TIMED_OUT> {
+  const remainingMs = deadlineMs - Date.now();
+  const reservation = await reserveConnectionOrTimeout(client, remainingMs);
+  if (reservation === RESERVATION_TIMED_OUT) return FALLBACK_RECHECK_TIMED_OUT;
+  try {
+    const statementTimeoutMs = Math.max(1, Math.floor(deadlineMs - Date.now()));
+    await reservation`begin`;
+    try {
+      // Not parameterized: `SET` does not accept a bind parameter for its
+      // value in all PostgreSQL versions/drivers (the existing `SET LOCAL
+      // statement_timeout` usage in routes/plugins.ts inlines a literal for
+      // the same reason). Safe here because the value is our own computed
+      // integer, never external input.
+      await reservation.unsafe(`set local statement_timeout = ${statementTimeoutMs}`);
+      const result = await read(drizzleOverReservedConnection(client, reservation));
+      await reservation`commit`;
+      return result;
+    } catch (error) {
+      await reservation`rollback`.catch(() => {});
+      if (findPgError(error)?.code === "57014") return FALLBACK_RECHECK_TIMED_OUT;
+      throw error;
+    }
+  } finally {
+    reservation.release();
+  }
+}
+
+// Shared between the lock-guarded idempotency check inside
+// withPrReviewerTaskLock's closure and the unlocked recheck on lock
+// exhaustion below (BLO-21582 review follow-up) -- same query, same meaning,
+// just without the per-task serialization the locked read gets.
+async function findExistingPrReviewerWake(
+  db: PrReviewerSelectionDb,
+  reviewerAgentIds: string[],
+  idempotencyKey: string,
+  idempotentStatuses: string[],
+) {
+  return db
+    .select({ id: agentWakeupRequests.id, status: agentWakeupRequests.status })
+    .from(agentWakeupRequests)
+    .where(
+      and(
+        inArray(agentWakeupRequests.agentId, reviewerAgentIds),
+        eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
+        inArray(agentWakeupRequests.status, idempotentStatuses),
+      ),
+    )
+    .limit(1)
+    .then((rows) => rows[0] ?? null);
 }
 
 function prFeedbackBody(context: ResolvedEventContext): string | null {
@@ -2034,39 +2282,56 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
         );
         return false;
       }
+      const heartbeat = heartbeatService(db, {
+        pluginWorkerManager: config.pluginWorkerManager,
+        ...config.heartbeatOptions,
+      });
+      const reviewerWakeupOptions = buildPrReviewerWakeupOptions(context, eventName, deliveryId);
+      const reviewerTaskKey = reviewerWakeupOptions.payload.taskKey;
+      const idempotencyKey = reviewerWakeupOptions.idempotencyKey;
+      // taskKey scopes active-run coalescing; idempotencyKey scopes duplicate
+      // request rows for the same PR+reason before enqueueing.
+      // Request-scoped keys also dedup terminal completed/cancelled rows, so a
+      // GitHub redelivery of one event cannot re-run work that already ran or
+      // was retired by converted_to_draft (BLO-18953).
+      const idempotentStatuses = idempotentWakeStatuses(
+        prReviewerWakeIdempotencyScope(context, deliveryId),
+      );
+
+      // BLO-21582: withPrReviewerTaskLock can time out acquiring the per-PR
+      // advisory lock -- observed live in production during bursts of
+      // concurrent webhook deliveries, most plausibly because the lock
+      // holder is itself blocked acquiring the SECOND pooled connection
+      // `heartbeat.wakeup()` needs (see the comment on withPrReviewerTaskLock)
+      // and so never releases the lock within the budget. That throw used to
+      // land straight in the catch below and return false -- BEFORE the
+      // `received` counter a few lines down ever increments, so the loss was
+      // invisible to the entire BLO-18859 delivery funnel (not `received`,
+      // not `queued`, not `dead_lettered`): a review request that "routed
+      // correctly" per every webhook-side log vanished with zero record
+      // anywhere, while this handler still answered GitHub 200 (so GitHub's
+      // own redelivery-on-failure never fired either).
+      //
+      // A single request-wide budget (PR_REVIEWER_TASK_LOCK_BUDGET_MS) absorbs
+      // a transient contention window instead of stranding the PR on one
+      // unlucky timing, while staying well under GitHub's webhook response
+      // window -- see the comment on withPrReviewerTaskLock for how the
+      // budget is enforced end-to-end (review follow-up on an earlier
+      // 3-attempt x fresh-2s-each design that could reach ~7.2s and only
+      // bounded time *after* each pool checkout, not during it).
+      const lockDeadline = Date.now() + PR_REVIEWER_TASK_LOCK_BUDGET_MS;
       try {
-        const heartbeat = heartbeatService(db, {
-          pluginWorkerManager: config.pluginWorkerManager,
-          ...config.heartbeatOptions,
-        });
-        const reviewerWakeupOptions = buildPrReviewerWakeupOptions(context, eventName, deliveryId);
-        const reviewerTaskKey = reviewerWakeupOptions.payload.taskKey;
-        const idempotencyKey = reviewerWakeupOptions.idempotencyKey;
-        // taskKey scopes active-run coalescing; idempotencyKey scopes duplicate
-        // request rows for the same PR+reason before enqueueing.
-        // Request-scoped keys also dedup terminal completed/cancelled rows, so a
-        // GitHub redelivery of one event cannot re-run work that already ran or
-        // was retired by converted_to_draft (BLO-18953).
-        const idempotentStatuses = idempotentWakeStatuses(
-          prReviewerWakeIdempotencyScope(context, deliveryId),
-        );
-        return await withPrReviewerTaskLock(db, reviewerTaskKey, async (tx) => {
+        return await withPrReviewerTaskLock(db, reviewerTaskKey, lockDeadline, async (tx) => {
           // The wake insert commits through heartbeat's own transaction. Keep
           // this transaction-scoped lock held until that commit is visible so
           // concurrent first events for one PR re-check affinity instead of
           // assigning the same task to different reviewers.
-          const existingWake = await tx
-            .select({ id: agentWakeupRequests.id, status: agentWakeupRequests.status })
-            .from(agentWakeupRequests)
-            .where(
-              and(
-                inArray(agentWakeupRequests.agentId, reviewerAgentIds),
-                eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
-                inArray(agentWakeupRequests.status, idempotentStatuses),
-              ),
-            )
-            .limit(1)
-            .then((rows) => rows[0] ?? null);
+          const existingWake = await findExistingPrReviewerWake(
+            tx,
+            reviewerAgentIds,
+            idempotencyKey,
+            idempotentStatuses,
+          );
           if (existingWake) {
             logger.info(
               {
@@ -2151,6 +2416,112 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
           return false;
         });
       } catch (err) {
+        if (err instanceof PrReviewerTaskLockTimeoutError) {
+          // BLO-21582 review follow-up: lock exhaustion means this delivery
+          // never reached the lock-guarded idempotency/active-reviewer gates
+          // above, so we cannot assume the equivalent wake was actually
+          // lost -- a concurrent duplicate delivery for the same PR may have
+          // held the lock for the full budget and completed the exact wake
+          // this one would have produced, or no reviewer may have been
+          // active the whole time either way. An unlocked recheck can't
+          // fully replace the lock-guarded read (a wake committed a moment
+          // later still slips through), but it turns the common
+          // already-handled case into the same silent no-op the idempotency
+          // and no-active-reviewer gates use above instead of a false
+          // dead-letter alert, while contention with no such evidence still
+          // counts as loss below.
+          //
+          // Both reads below are bounded by PR_REVIEWER_TASK_LOCK_FALLBACK_BUDGET_MS
+          // (BLO-21582 review follow-up): they share the same pool that just
+          // failed to check out a connection in time for the lock probe, so
+          // an unbounded synchronous read here could stall this response
+          // exactly as the lock probe did, defeating the deadline's whole
+          // purpose. A timeout is treated as "unknown" -- NOT as "confirmed
+          // no equivalent wake" / "confirmed no active reviewer" -- and falls
+          // straight through to the pre-existing conservative default below
+          // (record it as lost) rather than risking a false no-op on one side
+          // or an unbounded wait on the other.
+          const fallbackDeadline = lockDeadline + PR_REVIEWER_TASK_LOCK_FALLBACK_BUDGET_MS;
+          const equivalentWake = await boundedFallbackRead(
+            db.$client,
+            fallbackDeadline,
+            (reservedDb) => findExistingPrReviewerWake(reservedDb, reviewerAgentIds, idempotencyKey, idempotentStatuses),
+          );
+          if (equivalentWake === FALLBACK_RECHECK_TIMED_OUT) {
+            logger.warn(
+              {
+                taskKey: reviewerTaskKey,
+                event: eventName,
+                deliveryId,
+                wakeReason: context.wakeReason,
+                prNumber: context.prNumber,
+                repoFullName: context.repoFullName,
+              },
+              "github webhook reviewer wake lock-exhaustion recheck (existing wake) timed out waiting for a "
+                + "database read; recording the delivery as lost rather than risking an unbounded synchronous read",
+            );
+          } else if (equivalentWake) {
+            logger.info(
+              {
+                equivalentWakeId: equivalentWake.id,
+                equivalentWakeStatus: equivalentWake.status,
+                idempotencyKey,
+                event: eventName,
+                deliveryId,
+                wakeReason: context.wakeReason,
+                prNumber: context.prNumber,
+                repoFullName: context.repoFullName,
+              },
+              "github webhook reviewer wake lock exhausted, but an equivalent wake is already durable: not counting as a lost wake",
+            );
+            return false;
+          } else {
+            const equivalentReviewerAgentId = await boundedFallbackRead(
+              db.$client,
+              fallbackDeadline,
+              async (reservedDb) =>
+                (await findActivePrReviewerForTask(reservedDb, reviewerAgentIds, reviewerTaskKey)) ??
+                (await selectPrReviewerAgentId(reservedDb, reviewerAgentIds, reviewerTaskKey)),
+            );
+            if (equivalentReviewerAgentId === FALLBACK_RECHECK_TIMED_OUT) {
+              logger.warn(
+                {
+                  taskKey: reviewerTaskKey,
+                  event: eventName,
+                  deliveryId,
+                  wakeReason: context.wakeReason,
+                  prNumber: context.prNumber,
+                  repoFullName: context.repoFullName,
+                },
+                "github webhook reviewer wake lock-exhaustion recheck (active reviewer) timed out waiting for a "
+                  + "database read; recording the delivery as lost rather than risking an unbounded synchronous read",
+              );
+            } else if (!equivalentReviewerAgentId) {
+              logger.warn(
+                {
+                  configuredReviewerCount: reviewerAgentIds.length,
+                  event: eventName,
+                  prNumber: context.prNumber,
+                  repoFullName: context.repoFullName,
+                },
+                "github webhook reviewer wake lock exhausted, but no configured reviewer is active: not counting as a lost wake",
+              );
+              return false;
+            }
+          }
+          // BLO-21582: an exhausted lock-acquisition timeout happens before
+          // the lock-guarded closure can record `received`, and neither
+          // recheck above found an equivalent completed/no-op outcome.
+          // Preserve the BLO-18859 funnel
+          // (`received == queued + suppressed + dead_lettered`) by recording
+          // the delivery's entry into the durable wake path before its
+          // terminal dead-letter.
+          recordGithubReviewRequestDelivery({ state: "received", reason: context.wakeReason });
+        }
+        // Do not double-count `received` for an arbitrary (non-timeout)
+        // error: those are thrown from inside the closure, after its normal
+        // `received` increment already ran.
+        recordGithubReviewRequestDelivery({ state: "dead_lettered", reason: context.wakeReason });
         logger.error(
           {
             err,
@@ -2790,6 +3161,7 @@ export const __test_buildPrReviewerWakeIdempotencyKey = buildPrReviewerWakeIdemp
 export const __test_prReviewerWakeIdempotencyScope = prReviewerWakeIdempotencyScope;
 export const __test_idempotentWakeStatuses = idempotentWakeStatuses;
 export const __test_buildPrReviewerTaskKey = buildPrReviewerTaskKey;
+export const __test_withPrReviewerTaskLock = withPrReviewerTaskLock;
 export const __test_buildDependabotAlertIssueBody = buildDependabotAlertIssueBody;
 export const __test_resolveDependabotAlertContext = resolveDependabotAlertContext;
 export const __test_hasActionablePrReviewFeedback = hasActionablePrReviewFeedback;

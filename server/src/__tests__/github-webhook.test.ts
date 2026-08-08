@@ -42,6 +42,7 @@ import {
   __test_resolveEventContext,
   __test_shouldFirePrReviewerWake,
   __test_verifyGithubSignature,
+  __test_withPrReviewerTaskLock,
   githubWebhookRoutes,
   type GithubWebhookConfig,
 } from "../routes/github-webhook.js";
@@ -1157,6 +1158,125 @@ describe("github-webhook pure helpers", () => {
     expect(__test_resolveDependabotAlertContext({ action: "created", alert: {} })).toBeNull();
     expect(__test_resolveDependabotAlertContext({ action: "created" })).toBeNull();
   });
+
+  it("does not run reviewer wake action when lock acquisition settles after the deadline", async () => {
+    // Faked at the `$client.reserve()` boundary (BLO-21582 review
+    // follow-up), not `db.transaction()` -- withPrReviewerTaskLock no longer
+    // goes through drizzle's transaction wrapper at all; it reserves a raw
+    // connection and drives BEGIN/probe/COMMIT/ROLLBACK itself so an
+    // abandoned reservation can be released before ever issuing a query.
+    // This fake reproduces the same "probe settles after the deadline"
+    // scenario one level lower: reservation resolves immediately (nothing
+    // ours to bound there), the probe query itself is what's slow.
+    let actionCalled = false;
+    let probeStarted = false;
+    let callIndex = 0;
+    const fakeReservedConnection = Object.assign(
+      async (_strings: TemplateStringsArray, ..._values: unknown[]) => {
+        callIndex += 1;
+        if (callIndex === 1) return []; // begin
+        if (callIndex === 2) {
+          probeStarted = true;
+          await new Promise((resolve) => setTimeout(resolve, 30));
+          return [{ acquired: true }];
+        }
+        return []; // rollback
+      },
+      { release: () => {}, unsafe: async () => [] },
+    );
+    const fakeDb = { $client: { reserve: async () => fakeReservedConnection } };
+
+    await expect(
+      __test_withPrReviewerTaskLock(
+        fakeDb as never,
+        "pr_review:Blockcast/paperclip:21582006",
+        Date.now() + 5,
+        async () => {
+          actionCalled = true;
+          return "queued";
+        },
+      ),
+    ).rejects.toThrow("timed out acquiring PR reviewer task assignment lock");
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(probeStarted).toBe(true);
+    expect(actionCalled).toBe(false);
+  });
+
+  it(
+    "bounds response latency to the deadline instead of waiting out a stalled probe " +
+      "(BLO-21582 review follow-up: the delayed-probe test above proves the action is " +
+      "skipped, but it lets the request wait for the slow probe to settle and so does not " +
+      "prove bounded latency -- this one measures wall-clock time against the fake probe's " +
+      "own delay to prove the opposite)",
+    async () => {
+      // Real Postgres can't be made to stall `pg_try_advisory_xact_lock`
+      // itself (it touches no table, so `holdExclusiveTableLock`-style
+      // contention has nothing to block) -- so this models what
+      // `statement_timeout` actually does on a real backend: the probe
+      // query races its own artificial delay against the timeout the
+      // production code just told Postgres about via `set statement_timeout
+      // = <ms>`, and "wins" with a real SQLSTATE 57014 (query_canceled) the
+      // same way a real backend would cancel a stalled statement.
+      let actionCalled = false;
+      let probeStarted = false;
+      let sawTimeoutReset = false;
+      let statementTimeoutMs: number | null = null;
+      let callIndex = 0;
+      const PROBE_STALL_MS = 500;
+      const fakeReservedConnection = Object.assign(
+        async (_strings: TemplateStringsArray, ..._values: unknown[]) => {
+          callIndex += 1;
+          if (callIndex === 1) return []; // begin
+          if (callIndex === 2) {
+            probeStarted = true;
+            const timeoutMs = statementTimeoutMs ?? Number.POSITIVE_INFINITY;
+            return await new Promise((resolve, reject) => {
+              const stalled = setTimeout(() => resolve([{ acquired: true }]), PROBE_STALL_MS);
+              setTimeout(() => {
+                clearTimeout(stalled);
+                reject(Object.assign(new Error("canceling statement due to statement timeout"), { code: "57014" }));
+              }, timeoutMs);
+            });
+          }
+          return []; // rollback
+        },
+        {
+          release: () => {},
+          unsafe: async (sqlText: string) => {
+            const match = /^set statement_timeout = (\d+)$/.exec(sqlText);
+            if (match) {
+              statementTimeoutMs = Number(match[1]);
+              if (statementTimeoutMs === 0) sawTimeoutReset = true;
+            }
+            return [];
+          },
+        },
+      );
+      const fakeDb = { $client: { reserve: async () => fakeReservedConnection } };
+
+      const startedAt = Date.now();
+      await expect(
+        __test_withPrReviewerTaskLock(
+          fakeDb as never,
+          "pr_review:Blockcast/paperclip:21582007",
+          Date.now() + 20,
+          async () => {
+            actionCalled = true;
+            return "queued";
+          },
+        ),
+      ).rejects.toThrow("timed out acquiring PR reviewer task assignment lock");
+      const elapsedMs = Date.now() - startedAt;
+
+      expect(probeStarted).toBe(true);
+      expect(actionCalled).toBe(false);
+      // The database-side bound fired well before the fake's simulated
+      // stall -- without it, this would take at least PROBE_STALL_MS.
+      expect(elapsedMs).toBeLessThan(PROBE_STALL_MS / 2);
+      expect(sawTimeoutReset).toBe(true);
+    },
+  );
 });
 
 describeEmbeddedPostgres("github-webhook route", () => {
@@ -2503,7 +2623,643 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(queuedWakes[0]?.payload).toMatchObject({ headSha: "freshsha" });
   });
 
+  // BLO-21582: production evidence showed `withPrReviewerTaskLock` timing out
+  // (2s budget) under contention, and the failure landing in the outer catch
+  // BEFORE the `received` counter a few lines further in ever incremented --
+  // so the loss was invisible to the whole delivery funnel, not just
+  // `dead_lettered`. These two tests reproduce genuine advisory-lock
+  // contention across a second, independent DB connection (a fresh
+  // `createDb(...)` pool -- `pg_advisory_xact_lock` only contends across
+  // sessions) and assert the two outcomes the fix is meant to produce: a
+  // contention window shorter than the request-wide lock budget self-heals,
+  // and one that outlasts it is at least COUNTED as `dead_lettered` instead
+  // of vanishing with zero record anywhere.
+  describe("reviewer wake lock contention (BLO-21582)", () => {
+    let lockDb: ReturnType<typeof createDb>;
+
+    beforeAll(() => {
+      lockDb = createDb(tempDb!.connectionString);
+    });
+
+    afterAll(async () => {
+      await lockDb.$client.end();
+    });
+
+    async function holdAdvisoryLock(taskKey: string, holdMs: number) {
+      let releaseHeld: () => void = () => {};
+      const held = new Promise<void>((resolve) => {
+        releaseHeld = resolve;
+      });
+      const acquired = new Promise<void>((resolveAcquired, rejectAcquired) => {
+        void lockDb
+          .transaction(async (tx) => {
+            await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${taskKey}, 0))`);
+            resolveAcquired();
+            await held;
+          })
+          .catch(rejectAcquired);
+      });
+      await acquired;
+      const timer = setTimeout(releaseHeld, holdMs);
+      return () => {
+        clearTimeout(timer);
+        releaseHeld();
+      };
+    }
+
+    // Blocks any plain SELECT against `tableName` on the app's own `db` pool
+    // for up to `holdMs` -- unlike the advisory lock above (which only
+    // contends with itself), this simulates a genuinely stalled read on the
+    // exact query the lock-exhaustion fallback recheck issues, regardless of
+    // whether the real-world cause is pool-checkout starvation or something
+    // else blocking the connection (BLO-21582 review follow-up: "cover
+    // actual pool-checkout starvation, not only advisory-lock contention").
+    async function holdExclusiveTableLock(tableName: string, holdMs: number) {
+      let releaseHeld: () => void = () => {};
+      const held = new Promise<void>((resolve) => {
+        releaseHeld = resolve;
+      });
+      const acquired = new Promise<void>((resolveAcquired, rejectAcquired) => {
+        void lockDb
+          .transaction(async (tx) => {
+            await tx.execute(sql.raw(`LOCK TABLE "${tableName}" IN ACCESS EXCLUSIVE MODE`));
+            resolveAcquired();
+            await held;
+          })
+          .catch(rejectAcquired);
+      });
+      await acquired;
+      const timer = setTimeout(releaseHeld, holdMs);
+      return () => {
+        clearTimeout(timer);
+        releaseHeld();
+      };
+    }
+
+    it(
+      "recovers a reviewer wake once a transient lock-holder releases within the retry budget",
+      async () => {
+        const reviewerAgentId = randomUUID();
+        const { companyId } = await seedCompanyAndAgent();
+        await db.insert(agents).values({
+          id: reviewerAgentId,
+          companyId,
+          name: "Ally",
+          role: "engineer",
+          status: "idle",
+          adapterType: "claude_k8s",
+          adapterConfig: {},
+          runtimeConfig: {},
+          permissions: {},
+        });
+
+        const prNumber = 21582001;
+        const taskKey = `pr_review:Blockcast/paperclip:${prNumber}`;
+        // Well inside the 4s request-wide lock budget (PR_REVIEWER_TASK_LOCK_BUDGET_MS
+        // in github-webhook.ts), with a wide margin either side so this is not
+        // coupled to the exact retry-poll cadence: the fix retries continuously
+        // against one deadline rather than in discrete backed-off attempts, so
+        // any release before the deadline self-heals.
+        const release = await holdAdvisoryLock(taskKey, 2_300);
+
+        const app = buildApp({ prReviewerAgentId: reviewerAgentId });
+        const payload = {
+          action: "opened",
+          pull_request: {
+            number: prNumber,
+            title: "Reviewer wake lock contention regression",
+            body: null,
+            head: { ref: "fix/blo-21582-lock-contention", sha: "lockcontendsha" },
+          },
+          repository: { full_name: "Blockcast/paperclip" },
+        };
+        const { body, signature } = signedRequest(payload);
+        const before = await deliveryCount("dead_lettered");
+
+        const res = await request(app)
+          .post("/api/webhooks/github")
+          .set("x-github-event", "pull_request")
+          .set("x-hub-signature-256", signature)
+          .set("x-github-delivery", "delivery-blo-21582-lock-recovery")
+          .set("content-type", "application/json")
+          .send(body);
+
+        release();
+
+        expect(res.status).toBe(200);
+        expect(res.body).toMatchObject({ reviewerWakeFired: true });
+        expect(await deliveryCount("dead_lettered")).toBe(before);
+
+        const queuedWakes = await db
+          .select({ status: agentWakeupRequests.status })
+          .from(agentWakeupRequests)
+          .where(
+            and(
+              eq(agentWakeupRequests.agentId, reviewerAgentId),
+              eq(agentWakeupRequests.idempotencyKey, `pr_review:Blockcast/paperclip:${prNumber}:github_pr_opened`),
+              eq(agentWakeupRequests.status, "queued"),
+            ),
+          );
+        expect(queuedWakes).toHaveLength(1);
+      },
+      15_000,
+    );
+
+    it(
+      "records received and dead_lettered once every lock-acquisition retry is exhausted, without lying in the 200 response",
+      async () => {
+        const reviewerAgentId = randomUUID();
+        const { companyId } = await seedCompanyAndAgent();
+        await db.insert(agents).values({
+          id: reviewerAgentId,
+          companyId,
+          name: "Ally",
+          role: "engineer",
+          status: "idle",
+          adapterType: "claude_k8s",
+          adapterConfig: {},
+          runtimeConfig: {},
+          permissions: {},
+        });
+
+        const prNumber = 21582002;
+        const taskKey = `pr_review:Blockcast/paperclip:${prNumber}`;
+        // Outlasts the 4s request-wide lock budget (PR_REVIEWER_TASK_LOCK_BUDGET_MS
+        // in github-webhook.ts) with a clear margin, so this delivery must
+        // exhaust the retry budget outright.
+        const release = await holdAdvisoryLock(taskKey, 4_600);
+
+        const app = buildApp({ prReviewerAgentId: reviewerAgentId });
+        const payload = {
+          action: "opened",
+          pull_request: {
+            number: prNumber,
+            title: "Reviewer wake lock exhaustion regression",
+            body: null,
+            head: { ref: "fix/blo-21582-lock-exhaustion", sha: "lockexhaustsha" },
+          },
+          repository: { full_name: "Blockcast/paperclip" },
+        };
+        const { body, signature } = signedRequest(payload);
+        const beforeDeadLettered = await deliveryCount("dead_lettered");
+        const beforeQueued = await deliveryCount("queued");
+        const beforeReceived = await deliveryCount("received");
+        const beforeSuppressed = await deliveryCount("suppressed");
+
+        const res = await request(app)
+          .post("/api/webhooks/github")
+          .set("x-github-event", "pull_request")
+          .set("x-hub-signature-256", signature)
+          .set("x-github-delivery", "delivery-blo-21582-lock-exhaustion")
+          .set("content-type", "application/json")
+          .send(body);
+
+        release();
+
+        // The handler still answers GitHub 200 (matching every other
+        // suppression path in this route -- GitHub redelivery is not the
+        // backstop here), but MUST NOT claim reviewerWakeFired for a wake
+        // that never queued a run.
+        expect(res.status).toBe(200);
+        expect(res.body).toMatchObject({ reviewerWakeFired: false });
+
+        // The regression: this delivery never reached the normal `received`
+        // increment inside the lock-guarded closure. The exhausted lock path
+        // must still record both the funnel entry and the terminal state, so
+        // the delivery does not disappear and the BLO-18859 equation keeps
+        // holding for this path's delta.
+        const afterDeadLettered = await deliveryCount("dead_lettered");
+        const afterQueued = await deliveryCount("queued");
+        const afterReceived = await deliveryCount("received");
+        const afterSuppressed = await deliveryCount("suppressed");
+
+        expect(afterReceived).toBe(beforeReceived + 1);
+        expect(afterDeadLettered).toBe(beforeDeadLettered + 1);
+        expect(afterQueued).toBe(beforeQueued);
+        expect(afterSuppressed).toBe(beforeSuppressed);
+        expect(afterReceived - beforeReceived).toBe(
+          afterQueued - beforeQueued
+            + (afterSuppressed - beforeSuppressed)
+            + (afterDeadLettered - beforeDeadLettered),
+        );
+
+        const wakes = await db
+          .select({ status: agentWakeupRequests.status })
+          .from(agentWakeupRequests)
+          .where(eq(agentWakeupRequests.agentId, reviewerAgentId));
+        expect(wakes).toHaveLength(0);
+      },
+      10_000,
+    );
+
+    it(
+      "treats lock exhaustion as a no-op, not a false dead-letter, when a concurrent duplicate delivery already produced the equivalent durable wake",
+      async () => {
+        const reviewerAgentId = randomUUID();
+        const { companyId } = await seedCompanyAndAgent();
+        await db.insert(agents).values({
+          id: reviewerAgentId,
+          companyId,
+          name: "Ally",
+          role: "engineer",
+          status: "idle",
+          adapterType: "claude_k8s",
+          adapterConfig: {},
+          runtimeConfig: {},
+          permissions: {},
+        });
+
+        const prNumber = 21582003;
+        const taskKey = `pr_review:Blockcast/paperclip:${prNumber}`;
+        const idempotencyKey = `pr_review:Blockcast/paperclip:${prNumber}:github_pr_opened`;
+
+        // Stands in for a concurrent duplicate delivery that won the lock and
+        // already committed the exact durable wake this delivery would have
+        // produced -- the scenario the unlocked recheck in the
+        // PrReviewerTaskLockTimeoutError branch exists to detect (BLO-21582
+        // review follow-up: "Add a concurrent same-idempotency-key test where
+        // one request succeeds while the other exhausts").
+        await db.insert(agentWakeupRequests).values({
+          companyId,
+          agentId: reviewerAgentId,
+          source: "github",
+          reason: "github_pr_opened",
+          idempotencyKey,
+          status: "queued",
+          payload: { taskKey },
+        });
+
+        // Outlasts the request-wide lock budget with a clear margin: this
+        // delivery must exhaust every lock-acquisition retry and hit the
+        // PrReviewerTaskLockTimeoutError catch, not the normal lock-guarded
+        // idempotency check (which the pre-existing row above would also
+        // satisfy, but that path isn't what this test exercises).
+        const release = await holdAdvisoryLock(taskKey, 4_600);
+
+        const app = buildApp({ prReviewerAgentId: reviewerAgentId });
+        const payload = {
+          action: "opened",
+          pull_request: {
+            number: prNumber,
+            title: "Reviewer wake lock exhaustion with an equivalent durable wake",
+            body: null,
+            head: { ref: "fix/blo-21582-equivalent-wake", sha: "lockequivsha" },
+          },
+          repository: { full_name: "Blockcast/paperclip" },
+        };
+        const { body, signature } = signedRequest(payload);
+        const beforeDeadLettered = await deliveryCount("dead_lettered");
+        const beforeQueued = await deliveryCount("queued");
+        const beforeReceived = await deliveryCount("received");
+        const beforeSuppressed = await deliveryCount("suppressed");
+
+        const res = await request(app)
+          .post("/api/webhooks/github")
+          .set("x-github-event", "pull_request")
+          .set("x-hub-signature-256", signature)
+          .set("x-github-delivery", "delivery-blo-21582-lock-equivalent-wake")
+          .set("content-type", "application/json")
+          .send(body);
+
+        release();
+
+        expect(res.status).toBe(200);
+        expect(res.body).toMatchObject({ reviewerWakeFired: false });
+
+        // The false-loss the review flagged: without the recheck, this would
+        // have recorded received+dead_lettered even though the equivalent
+        // wake is already durable. It must instead be the same silent no-op
+        // the lock-guarded duplicate-idempotency-key check produces -- no
+        // delivery-funnel metric moves at all.
+        expect(await deliveryCount("dead_lettered")).toBe(beforeDeadLettered);
+        expect(await deliveryCount("queued")).toBe(beforeQueued);
+        expect(await deliveryCount("received")).toBe(beforeReceived);
+        expect(await deliveryCount("suppressed")).toBe(beforeSuppressed);
+      },
+      10_000,
+    );
+
+    it(
+      "awaits an in-flight wake to completion once the lock is already acquired, instead of abandoning " +
+        "it at the deadline (BLO-21582 review follow-up: racing action(tx) itself, not just the lock probe, " +
+        "could abandon a live transaction that later commits a wake the response already claimed was lost)",
+      async () => {
+        const reviewerAgentId = randomUUID();
+        const { companyId } = await seedCompanyAndAgent();
+        await db.insert(agents).values({
+          id: reviewerAgentId,
+          companyId,
+          name: "Ally",
+          role: "engineer",
+          status: "idle",
+          adapterType: "claude_k8s",
+          adapterConfig: {},
+          runtimeConfig: {},
+          permissions: {},
+        });
+
+        const prNumber = 21582004;
+
+        // No advisory-lock contention here at all: the lock probe resolves
+        // near-instantly. Instead, `heartbeat.wakeup()` -- which runs INSIDE
+        // the lock-guarded action, after the lock is already acquired -- is
+        // held open past PR_REVIEWER_TASK_LOCK_BUDGET_MS (4s in
+        // github-webhook.ts) by a penstock-availability gate that only
+        // resolves once the test releases it. The buggy version of
+        // withPrReviewerTaskLock raced the WHOLE transaction (lock probe +
+        // action) against the deadline, so it would abandon this still-live
+        // transaction at 4s and answer `reviewerWakeFired: false` --
+        // even though the action goes on to actually commit the wake a
+        // moment later, producing a false dead-letter and an uncounted
+        // extra `received`/`queued` pair after the response was already
+        // sent. The fix must instead await the action to completion once
+        // the lock is acquired, however long past the deadline it runs.
+        let releaseGate: () => void = () => {};
+        const gateBlocked = new Promise<void>((resolve) => {
+          releaseGate = resolve;
+        });
+        const delayedPenstockGate: NonNullable<GithubWebhookConfig["heartbeatOptions"]>["penstockAvailabilityGate"] = {
+          checkAdapter: async () => {
+            await gateBlocked;
+            return { allow: true };
+          },
+          _resetForTesting: () => {},
+        };
+
+        const app = buildApp({
+          prReviewerAgentId: reviewerAgentId,
+          heartbeatOptions: { penstockAvailabilityGate: delayedPenstockGate },
+        });
+        const payload = {
+          action: "opened",
+          pull_request: {
+            number: prNumber,
+            title: "Reviewer wake action-delayed-past-deadline regression",
+            body: null,
+            head: { ref: "fix/blo-21582-action-delay", sha: "actiondelaysha" },
+          },
+          repository: { full_name: "Blockcast/paperclip" },
+        };
+        const { body, signature } = signedRequest(payload);
+        const beforeDeadLettered = await deliveryCount("dead_lettered");
+        const beforeQueued = await deliveryCount("queued");
+        const beforeReceived = await deliveryCount("received");
+
+        const responsePromise = request(app)
+          .post("/api/webhooks/github")
+          .set("x-github-event", "pull_request")
+          .set("x-hub-signature-256", signature)
+          .set("x-github-delivery", "delivery-blo-21582-action-delay")
+          .set("content-type", "application/json")
+          .send(body);
+
+        // Release the gate well after PR_REVIEWER_TASK_LOCK_BUDGET_MS (4s)
+        // has elapsed. Only the fix under test -- not racing an
+        // already-acquired lock's action against the deadline -- lets this
+        // request wait that long and still resolve with the real outcome.
+        await new Promise((resolve) => setTimeout(resolve, 4_300));
+        releaseGate();
+
+        const res = await responsePromise;
+
+        expect(res.status).toBe(200);
+        expect(res.body).toMatchObject({ reviewerWakeFired: true });
+
+        // Exactly one terminal outcome: received -> queued, no dead-letter.
+        expect(await deliveryCount("received")).toBe(beforeReceived + 1);
+        expect(await deliveryCount("queued")).toBe(beforeQueued + 1);
+        expect(await deliveryCount("dead_lettered")).toBe(beforeDeadLettered);
+
+        const queuedWakes = await db
+          .select({ status: agentWakeupRequests.status })
+          .from(agentWakeupRequests)
+          .where(
+            and(
+              eq(agentWakeupRequests.agentId, reviewerAgentId),
+              eq(agentWakeupRequests.idempotencyKey, `pr_review:Blockcast/paperclip:${prNumber}:github_pr_opened`),
+              eq(agentWakeupRequests.status, "queued"),
+            ),
+          );
+        expect(queuedWakes).toHaveLength(1);
+
+        // No post-response mutation: the counters and the wake row are
+        // already final by the time the response was sent, so waiting
+        // longer must not move them again.
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        expect(await deliveryCount("received")).toBe(beforeReceived + 1);
+        expect(await deliveryCount("queued")).toBe(beforeQueued + 1);
+        expect(await deliveryCount("dead_lettered")).toBe(beforeDeadLettered);
+      },
+      15_000,
+    );
+
+    it(
+      "bounds the lock-exhaustion fallback recheck instead of stalling behind the same blocked connection, " +
+        "and still records the loss (BLO-21582 review follow-up: 'the fallback queries are outside the " +
+        "deadline... defeating the end-to-end bound')",
+      async () => {
+        const reviewerAgentId = randomUUID();
+        const { companyId } = await seedCompanyAndAgent();
+        await db.insert(agents).values({
+          id: reviewerAgentId,
+          companyId,
+          name: "Ally",
+          role: "engineer",
+          status: "idle",
+          adapterType: "claude_k8s",
+          adapterConfig: {},
+          runtimeConfig: {},
+          permissions: {},
+        });
+
+        const prNumber = 21582005;
+        const taskKey = `pr_review:Blockcast/paperclip:${prNumber}`;
+
+        // Force the lock-acquisition attempt to exhaust its own budget...
+        const releaseLock = await holdAdvisoryLock(taskKey, 8_000);
+        // ...and separately block the unlocked fallback recheck's own read
+        // (findExistingPrReviewerWake, which selects from
+        // agent_wakeup_requests) well past
+        // PR_REVIEWER_TASK_LOCK_FALLBACK_BUDGET_MS (1s) -- a stalled
+        // connection on that query, not more advisory-lock contention, is
+        // exactly the gap the review flagged.
+        const releaseTableLock = await holdExclusiveTableLock("agent_wakeup_requests", 8_000);
+
+        const app = buildApp({ prReviewerAgentId: reviewerAgentId });
+        const payload = {
+          action: "opened",
+          pull_request: {
+            number: prNumber,
+            title: "Reviewer wake fallback-recheck-timeout regression",
+            body: null,
+            head: { ref: "fix/blo-21582-fallback-timeout", sha: "fallbacktimeoutsha" },
+          },
+          repository: { full_name: "Blockcast/paperclip" },
+        };
+        const { body, signature } = signedRequest(payload);
+        const beforeDeadLettered = await deliveryCount("dead_lettered");
+        const beforeQueued = await deliveryCount("queued");
+        const beforeReceived = await deliveryCount("received");
+
+        const startedAt = Date.now();
+        let res;
+        try {
+          res = await request(app)
+            .post("/api/webhooks/github")
+            .set("x-github-event", "pull_request")
+            .set("x-hub-signature-256", signature)
+            .set("x-github-delivery", "delivery-blo-21582-fallback-timeout")
+            .set("content-type", "application/json")
+            .send(body);
+        } finally {
+          releaseLock();
+          releaseTableLock();
+        }
+        const elapsedMs = Date.now() - startedAt;
+
+        // Lock budget (4s) + fallback budget (1s) must bound the response
+        // well under the 8s the table lock and advisory lock are held for.
+        // Without the fallback bound, this would not resolve until ~8s.
+        expect(elapsedMs).toBeLessThan(7_000);
+
+        expect(res.status).toBe(200);
+        expect(res.body).toMatchObject({ reviewerWakeFired: false });
+
+        expect(await deliveryCount("received")).toBe(beforeReceived + 1);
+        expect(await deliveryCount("dead_lettered")).toBe(beforeDeadLettered + 1);
+        expect(await deliveryCount("queued")).toBe(beforeQueued);
+      },
+      15_000,
+    );
+
+    it(
+      "leaves no detached lock-probe running once genuine pool-checkout contention outlasts the deadline, proven while " +
+        "contention is still held rather than after releasing it (BLO-21582 review follow-up: 'the current regression " +
+        "test releases its blocking locks immediately after the response and therefore does not prove cleanup while " +
+        "contention remains')",
+      async () => {
+        const reviewerAgentId = randomUUID();
+        const { companyId } = await seedCompanyAndAgent();
+        await db.insert(agents).values({
+          id: reviewerAgentId,
+          companyId,
+          name: "Ally",
+          role: "engineer",
+          status: "idle",
+          adapterType: "claude_k8s",
+          adapterConfig: {},
+          runtimeConfig: {},
+          permissions: {},
+        });
+
+        const prNumber = 21582006;
+
+        // Saturate every connection in the app's own `db` pool with held
+        // transactions -- unlike holdAdvisoryLock/holdExclusiveTableLock
+        // above (which block a query running on an available connection),
+        // this blocks the pool CHECKOUT itself, reproducing the "stalled
+        // pool checkout" scenario withPrReviewerTaskLock's reservation
+        // bound targets, not merely lock contention.
+        const poolSize = Number(db.$client.options.max ?? 10);
+        const releasers: Array<() => void> = [];
+        const held: Array<Promise<unknown>> = [];
+        for (let i = 0; i < poolSize; i++) {
+          let release: () => void = () => {};
+          const gate = new Promise<void>((resolve) => {
+            release = resolve;
+          });
+          releasers.push(release);
+          held.push(
+            db.transaction(async (tx) => {
+              await tx.execute(sql`select 1`);
+              await gate;
+            }),
+          );
+        }
+        // Let every held transaction actually claim a connection before
+        // firing the webhook, so the pool is genuinely saturated when it
+        // tries to reserve one.
+        await new Promise((resolve) => setTimeout(resolve, 200));
+
+        const app = buildApp({ prReviewerAgentId: reviewerAgentId });
+        const payload = {
+          action: "opened",
+          pull_request: {
+            number: prNumber,
+            title: "Reviewer wake pool-checkout-stall regression",
+            body: null,
+            head: { ref: "fix/blo-21582-pool-checkout-stall", sha: "poolstallsha" },
+          },
+          repository: { full_name: "Blockcast/paperclip" },
+        };
+        const { body, signature } = signedRequest(payload);
+        const beforeDeadLettered = await deliveryCount("dead_lettered");
+        const beforeReceived = await deliveryCount("received");
+        const beforeQueued = await deliveryCount("queued");
+
+        try {
+          const startedAt = Date.now();
+          const res = await request(app)
+            .post("/api/webhooks/github")
+            .set("x-github-event", "pull_request")
+            .set("x-hub-signature-256", signature)
+            .set("x-github-delivery", "delivery-blo-21582-pool-checkout-stall")
+            .set("content-type", "application/json")
+            .send(body);
+          const elapsedMs = Date.now() - startedAt;
+
+          expect(res.status).toBe(200);
+          expect(res.body).toMatchObject({ reviewerWakeFired: false });
+          // Bounded by PR_REVIEWER_TASK_LOCK_BUDGET_MS (4s) +
+          // PR_REVIEWER_TASK_LOCK_FALLBACK_BUDGET_MS (1s); the pool stays
+          // saturated the whole time, so the fallback recheck's own
+          // reservation attempt times out too.
+          expect(elapsedMs).toBeGreaterThanOrEqual(3_900);
+          expect(elapsedMs).toBeLessThan(7_000);
+
+          expect(await deliveryCount("received")).toBe(beforeReceived + 1);
+          expect(await deliveryCount("dead_lettered")).toBe(beforeDeadLettered + 1);
+          expect(await deliveryCount("queued")).toBe(beforeQueued);
+
+          // The pool is STILL saturated here -- this is the assertion the
+          // review flagged as missing. If the abandoned reservation were
+          // still queued and later ran its BEGIN/probe/action on a freed
+          // connection (the pre-fix behavior), releasing exactly one
+          // connection below would let it complete and move these counters
+          // again, after the response already reported dead_lettered.
+          await new Promise((resolve) => setTimeout(resolve, 500));
+          expect(await deliveryCount("received")).toBe(beforeReceived + 1);
+          expect(await deliveryCount("dead_lettered")).toBe(beforeDeadLettered + 1);
+          expect(await deliveryCount("queued")).toBe(beforeQueued);
+
+          releasers[0]();
+          releasers[0] = () => {};
+          await new Promise((resolve) => setTimeout(resolve, 500));
+          expect(await deliveryCount("received")).toBe(beforeReceived + 1);
+          expect(await deliveryCount("dead_lettered")).toBe(beforeDeadLettered + 1);
+          expect(await deliveryCount("queued")).toBe(beforeQueued);
+
+          // A fresh reservation must be servable promptly off the one
+          // connection just freed -- if the abandoned reservation were
+          // still ahead of it in the pool's queue doing real work, this
+          // would stall behind it instead of resolving immediately.
+          const probeStartedAt = Date.now();
+          const probe = await db.$client.reserve();
+          const probeElapsedMs = Date.now() - probeStartedAt;
+          probe.release();
+          expect(probeElapsedMs).toBeLessThan(1_000);
+        } finally {
+          for (const release of releasers) release();
+          await Promise.allSettled(held);
+        }
+      },
+      20_000,
+    );
+  });
+
+
   it("re-reviews a PR after a fixup push even though the prior review completed (stale-head regression)", async () => {
+
     const reviewerAgentId = randomUUID();
     const { companyId } = await seedCompanyAndAgent();
     await db.insert(agents).values({

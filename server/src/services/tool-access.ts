@@ -125,6 +125,11 @@ type ActorInfo = {
 const ACTIVE_BROKER_RUN_STATUSES = new Set(["running"]);
 const REMOTE_HTTP_REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 const MAX_REMOTE_HTTP_REDIRECTS = 5;
+// `recordInvocation` creates an approval request before the gateway can attach
+// its invocation-bound signature. A queue poll may observe that short-lived
+// row, so do not expose or cancel it until signing has had a chance to finish.
+// Unsigned rows older than this are still treated as invalid and cancelled.
+const PENDING_ACTION_REQUEST_SIGNING_GRACE_MS = 30_000;
 
 type OAuthProviderEndpoints = {
   provider: string;
@@ -5676,8 +5681,18 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       const invocationById = new Map(invocations.map((invocation) => [invocation.id, invocation]));
       let visibleRequests = requests;
       if (status === "pending") {
+        const signingGraceCutoff = now().getTime() - PENDING_ACTION_REQUEST_SIGNING_GRACE_MS;
+        const signingRequestIds = new Set(
+          requests
+            .filter((request) => !request.signedArguments && request.createdAt.getTime() > signingGraceCutoff)
+            .map((request) => request.id),
+        );
         const invalidRequestIds = requests
           .filter((request) => {
+            // The signer writes after `recordInvocation` has inserted the
+            // request. Keep that short-lived, unsigned row out of the queue
+            // rather than cancelling it as if it had been tampered with.
+            if (signingRequestIds.has(request.id)) return false;
             const invocation = invocationById.get(request.invocationId);
             if (!invocation) return true;
             try {
@@ -5701,7 +5716,11 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
               inArray(toolActionRequests.id, invalidRequestIds),
             ));
           const invalidIds = new Set(invalidRequestIds);
-          visibleRequests = requests.filter((request) => !invalidIds.has(request.id));
+          visibleRequests = requests.filter(
+            (request) => !invalidIds.has(request.id) && !signingRequestIds.has(request.id),
+          );
+        } else if (signingRequestIds.size > 0) {
+          visibleRequests = requests.filter((request) => !signingRequestIds.has(request.id));
         }
       }
       if (visibleRequests.length === 0) return [];
