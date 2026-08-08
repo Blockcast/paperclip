@@ -1429,6 +1429,27 @@
       "when": 1786060800000,
       "tag": "0211_detached_queued_run_recovery_outbox",
       "breakpoints": true
+    },
+    {
+      "idx": 212,
+      "version": "7",
+      "when": 1786189534326,
+      "tag": "0212_heartbeat_runs_crash_recovery_columns",
+      "breakpoints": true
+    },
+    {
+      "idx": 213,
+      "version": "7",
+      "when": 1786189534327,
+      "tag": "0213_heartbeat_runs_crash_recovery_index",
+      "breakpoints": true
+    },
+    {
+      "idx": 214,
+      "version": "7",
+      "when": 1786189534328,
+      "tag": "0214_heartbeat_runs_crash_recovery_validate",
+      "breakpoints": true
     }
   ]
 }

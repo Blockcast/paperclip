@@ -1106,6 +1106,9 @@ export async function startServer(): Promise<StartedServer> {
   let heartbeatSchedulerStopped = false;
   let heartbeatStartupRecoveryPending = false;
   let heartbeatSchedulerInterval: ReturnType<typeof setInterval> | null = null;
+  // The crash reconciler terminalizes a run and then hands off its issue lock;
+  // keep the stale-lock sweep out of that short handoff window across ticks.
+  let crashReconcileSweepInFlight = false;
   const heartbeatSchedulerInFlight = new Set<Promise<void>>();
   const trackHeartbeatSchedulerWork = (work: Promise<unknown>) => {
     let tracked: Promise<void>;
@@ -1130,7 +1133,7 @@ export async function startServer(): Promise<StartedServer> {
       productivityReviewMonitorSchedulerIntervalMs: config.heartbeatSchedulerIntervalMs,
     });
     workerHeartbeat = heartbeat;
-    // BLO-19722 AC 2/3: hand the entrypoint crash guard a way to terminalize
+  // BLO-19722 AC 2/3: hand the entrypoint crash guard a way to terminalize
     // this worker's in-flight runs before the process dies. Registered here
     // rather than passed at install time because the guard is installed before
     // this service exists (see `markInFlightRunsForWorkerCrash`).
@@ -1168,6 +1171,18 @@ export async function startServer(): Promise<StartedServer> {
     } else {
       heartbeatStartupRecoveryPending = true;
       const startupHeartbeatRecovery = (async () => {
+        try {
+          const crashRecovery = await heartbeat.reconcileWorkerCrashedRuns();
+          if (crashRecovery.reconciledRunIds.length > 0 || crashRecovery.unresolvedRunIds.length > 0) {
+            logger.warn(crashRecovery, "startup worker-crash recovery reconciliation complete");
+          }
+        } catch (err) {
+          logger.error(
+            { err },
+            "startup worker-crash recovery reconciliation failed - terminal rows remain for the next reconciliation pass",
+          );
+        }
+
         try {
           const reattachedExternalRuns = await heartbeat.resumeRunningExternalRuntimeRuns();
           if (reattachedExternalRuns > 0) {
@@ -1327,7 +1342,12 @@ export async function startServer(): Promise<StartedServer> {
           );
         }
 
-        if (!(await heartbeat.resolveSchedulingSuppression()).suppressed) {
+        const timerSuppression = await heartbeat.resolveSchedulingSuppression();
+        // This callback is not tracked while it awaits suppression. Shutdown
+        // can clear the interval and drain tracked work during that window, so
+        // fence new work after the await as well as before it.
+        if (heartbeatSchedulerStopped) return;
+        if (!timerSuppression.suppressed) {
           trackHeartbeatSchedulerWork(heartbeat
             .tickTimers(new Date())
             .then((result) => {
@@ -1377,17 +1397,42 @@ export async function startServer(): Promise<StartedServer> {
           }));
 
         if (heartbeatSchedulerStopped) return;
-        if (!(await heartbeat.resolveSchedulingSuppression()).suppressed) {
-          trackHeartbeatSchedulerWork(heartbeat
-            .sweepStaleIssueLocks()
-            .then((swept) => {
-              if (swept.cleared > 0) {
-                logger.warn({ ...swept }, "periodic stale-lock sweeper cleared issue locks");
+        const periodicSuppression = await heartbeat.resolveSchedulingSuppression();
+        if (heartbeatSchedulerStopped || periodicSuppression.suppressed) return;
+        {
+          // setInterval can overlap an unresolved prior tick. Reconciliation
+          // and stale-lock cleanup must be a single cross-tick flight: the
+          // latter otherwise can clear a terminalized crash row's lock between
+          // recovery and retry handoff.
+          if (!crashReconcileSweepInFlight) {
+            crashReconcileSweepInFlight = true;
+            trackHeartbeatSchedulerWork((async () => {
+              try {
+                const recovery = await heartbeat.reconcileWorkerCrashedRuns({
+                  requireCandidateIndex: true,
+                });
+                if (recovery.reconciledRunIds.length > 0 || recovery.unresolvedRunIds.length > 0) {
+                  logger.warn(recovery, "periodic worker-crash recovery reconciliation complete");
+                }
+              } catch (err) {
+                logger.error({ err }, "periodic worker-crash recovery reconciliation failed");
               }
-            })
-            .catch((err) => {
-              logger.error({ err }, "periodic stale-lock sweeper failed");
+
+              if (heartbeatSchedulerStopped) return;
+              try {
+                const swept = await heartbeat.sweepStaleIssueLocks();
+                if (swept.cleared > 0) {
+                  logger.warn({ ...swept }, "periodic stale-lock sweeper cleared issue locks");
+                }
+              } catch (err) {
+                logger.error({ err }, "periodic stale-lock sweeper failed");
+              }
+            })().finally(() => {
+              crashReconcileSweepInFlight = false;
             }));
+          }
+
+          if (heartbeatSchedulerStopped) return;
 
           // BLO-21621: same cadence as the stale-lock sweeper above — a
           // detached queued run is only reachable once its lock has already
