@@ -24015,6 +24015,37 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     );
   }
 
+  /**
+   * BLO-18106: master's `8446c1011` ("bind issue locks only for running runs")
+   * moved the `issues.executionRunId` write from *enqueue* time to *claim*
+   * time. The supersession guard above (`issue.executionRunId !== run.id`) was
+   * written against the enqueue-time binding, so a replacement review run that
+   * is queued but not yet claimed is invisible to it -- and the review-participant
+   * escalation then moves the issue to `blocked` while its replacement is
+   * already pending, which is exactly the strand this path exists to prevent.
+   *
+   * Mirrors `hasQueuedIssueWake` in recovery/service.ts. Callers MUST evaluate
+   * this last in their condition chain so the query stays off the hot path.
+   */
+  async function hasQueuedReplacementIssueWake(
+    dbOrTx: typeof db | Parameters<Parameters<typeof db.transaction>[0]>[0],
+    companyId: string,
+    issueId: string,
+  ) {
+    return dbOrTx
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.companyId, companyId),
+          eq(agentWakeupRequests.status, "queued"),
+          sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
+        ),
+      )
+      .limit(1)
+      .then((rows) => Boolean(rows[0]));
+  }
+
   async function releaseIssueExecutionAndPromote(
     run: typeof heartbeatRuns.$inferSelect,
     options: { suppressImmediateRecovery?: boolean } = {},
@@ -24148,6 +24179,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const activeParticipant = activeExecutionState?.status === "pending"
         ? activeExecutionState.currentParticipant
         : null;
+      // BLO-18106: the failed-PR-review gate is a durable, PR-visible artifact.
+      // Writing it once the review stage has already advanced marks the PR
+      // failed for a stage this run no longer owns -- e.g. a replacement run
+      // has since taken the stage and may have completed the review. Only
+      // suppress when the move is *provable* (both stage ids known and
+      // different); an unknown stage stays fail-open so genuine failures still
+      // surface on the PR.
+      const finalizedRunStageSuperseded =
+        finalizedRunStageId !== null &&
+        activeExecutionState?.currentStageId != null &&
+        activeExecutionState.currentStageId !== finalizedRunStageId;
       if (issue.executionRunId && issue.executionRunId !== run.id) {
         logger.info(
           { issueId: issue.id, finalizingRunId: run.id, activeExecutionRunId: issue.executionRunId },
@@ -24155,7 +24197,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         );
         return { kind: "superseded" as const };
       }
-      if (isNonRetryablePrReviewTerminalOutcome(run)) {
+      if (isNonRetryablePrReviewTerminalOutcome(run) && !finalizedRunStageSuperseded) {
         // The outbox row is part of the ownership decision: a replacement run
         // cannot claim this issue until both the lock release and delivery
         // intent commit. Publishing the informational event can remain best
@@ -24176,7 +24218,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         finalizedRunStageId === activeExecutionState?.currentStageId &&
         activeParticipant?.type === "agent" &&
         activeParticipant.agentId === run.agentId &&
-        isExecutionReviewParticipantRecoveryEligibleRun(run)
+        isExecutionReviewParticipantRecoveryEligibleRun(run) &&
+        // Evaluated last on purpose: keeps the extra query off the hot path.
+        !(await hasQueuedReplacementIssueWake(tx, issue.companyId, issue.id))
       ) {
         return {
           kind: "blocked" as const,
