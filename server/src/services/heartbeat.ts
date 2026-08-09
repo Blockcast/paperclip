@@ -297,6 +297,7 @@ import {
   normalizeIsolationMode,
   recordAgentZeroTokenCompletedRunStreak,
   recordCcrotateCapacityDeferred,
+  recordHeartbeatTimerSchedulerExclusion,
   recordConcurrentRunBlocked,
   recordHeartbeatRunFailed,
   recordOrphanedManagedPodReaped,
@@ -24829,7 +24830,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // Atomic conditional UPDATE is the sole gate (no read-then-write); 0 rows => abort.
       const runningAgent = await db
         .update(agents)
-        .set({ status: "running", updatedAt: new Date() })
+        .set({ status: "running", errorReason: null, updatedAt: new Date() })
         .where(and(eq(agents.id, agent.id), notInArray(agents.status, [...DIRECT_NON_INVOKABLE_STATUSES])))
         .returning()
         .then((rows) => rows[0] ?? null);
@@ -32324,6 +32325,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .where(eq(agents.id, agent.id));
       };
 
+      const writeTimerCircuitBreakerSkip = async (
+        agent: typeof agents.$inferSelect,
+        reason: "idle_circuit_breaker" | "adapter_failed_circuit_breaker",
+        evidence: Record<string, number>,
+      ) => {
+        await db.insert(agentWakeupRequests).values({
+          companyId: agent.companyId,
+          agentId: agent.id,
+          source: "timer",
+          triggerDetail: "system",
+          reason,
+          payload: { heartbeatSkip: { reason, ...evidence } },
+          status: "skipped",
+          requestedByActorType: "system",
+          requestedByActorId: "heartbeat_scheduler",
+          finishedAt: now,
+        });
+      };
+
       const opencodeK8sAgentIds = allAgents
         .filter((agent) => agent.adapterType === "opencode_k8s")
         .map((agent) => agent.id);
@@ -32377,6 +32397,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           const stateJson = parseObject(runtimeState?.stateJson);
           const consecutiveIdle = asNumber(stateJson.consecutiveTimerIdleRuns, 0);
           if (consecutiveIdle >= policy.idleAutoPauseAfter) {
+            await writeTimerCircuitBreakerSkip(agent, "idle_circuit_breaker", {
+              consecutiveIdle,
+              threshold: policy.idleAutoPauseAfter,
+            });
+            recordHeartbeatTimerSchedulerExclusion("idle_circuit_breaker");
             logger.debug(
               { agentId: agent.id, agentName: agent.name, consecutiveIdle, threshold: policy.idleAutoPauseAfter },
               "idle circuit breaker: skipping timer wakeup",
@@ -32395,6 +32420,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           const stateJson = parseObject(runtimeState?.stateJson);
           const consecutiveFailed = asNumber(stateJson.consecutiveAdapterFailedRuns, 0);
           if (consecutiveFailed >= policy.adapterFailedAutoPauseAfter) {
+            await writeTimerCircuitBreakerSkip(agent, "adapter_failed_circuit_breaker", {
+              consecutiveFailed,
+              threshold: policy.adapterFailedAutoPauseAfter,
+            });
+            recordHeartbeatTimerSchedulerExclusion("adapter_failed_circuit_breaker");
             logger.warn(
               { agentId: agent.id, agentName: agent.name, consecutiveFailed, threshold: policy.adapterFailedAutoPauseAfter },
               "crashloop circuit breaker: skipping timer wakeup due to consecutive adapter_failed runs",
@@ -32406,6 +32436,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
         if (agent.adapterType === "opencode_k8s" && !assignedLiveWorkAgentIds.has(agent.id)) {
           await writeNoInFlightWorkSkip(agent);
+          recordHeartbeatTimerSchedulerExclusion("no_in_flight_work");
           logger.info(
             { agentId: agent.id, agentName: agent.name, adapterType: agent.adapterType, skipped: "no_in_flight_work" },
             "opencode_k8s timer wakeup skipped because agent has no assigned live work",
@@ -32414,6 +32445,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           continue;
         }
 
+        const suppression: WakeSuppressionOutcome = {
+          durableSkipReason: null,
+          providerCapacityDeferred: false,
+        };
         const run = await enqueueWakeup(agent.id, {
           source: "timer",
           triggerDetail: "system",
@@ -32425,9 +32460,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             reason: "interval_elapsed",
             now: now.toISOString(),
           },
-        });
+        }, suppression);
         if (run) enqueued += 1;
-        else skipped += 1;
+        else {
+          recordHeartbeatTimerSchedulerExclusion(
+            suppression.providerCapacityDeferred
+              ? "provider_capacity_deferred"
+              : suppression.durableSkipReason,
+          );
+          skipped += 1;
+        }
       }
 
       const issueMonitors = await tickDueIssueMonitors(now);

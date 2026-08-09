@@ -160,6 +160,44 @@ describe("createPenstockAvailabilityGate", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
+  it("refreshes a cached denial as soon as its provider reset expires", async () => {
+    let now = new Date("2026-06-30T08:00:00.000Z");
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            state: "rate_limited",
+            reason: "penstock.capacity_rate_limited",
+            resume_at: "2026-06-30T08:00:05.000Z",
+          }),
+          { status: 200 },
+        ),
+      )
+      .mockResolvedValueOnce(new Response(JSON.stringify({ state: "available" }), { status: 200 }));
+    const gate = createPenstockAvailabilityGate({
+      fetchImpl: fetchMock as unknown as typeof fetch,
+      log,
+      cacheTtlMs: 30_000,
+      now: () => now,
+    });
+    const input = {
+      adapterType: "claude_k8s",
+      agentId: "agent-1",
+      adapterConfig: {
+        model: "claude-opus-4-8[1m]",
+        env: { ANTHROPIC_BASE_URL: { value: "https://api.penstock.run/anthropic" } },
+      },
+      now,
+      env: { ANTHROPIC_API_KEY: "psk_test" },
+    };
+
+    expect(await gate.checkAdapter(input)).toMatchObject({ allow: false });
+    now = new Date("2026-06-30T08:00:05.000Z");
+    expect(await gate.checkAdapter({ ...input, now })).toEqual({ allow: true });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   it("falls back to the legacy message probe when capacity readback is unavailable", async () => {
     const fetchMock = vi
       .fn()

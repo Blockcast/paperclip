@@ -88,6 +88,34 @@ export const ISOLATED_RUN_STARTED_METRIC = "paperclip_k8s_isolated_run_started_t
  * Unknown/empty values collapse to "unknown" to guard against future changes.
  */
 export const CCROTATE_CAPACITY_DEFERRED_METRIC = "paperclip_ccrotate_capacity_deferred_total";
+export const HEARTBEAT_TIMER_SCHEDULER_EXCLUSION_METRIC =
+  "paperclip_heartbeat_timer_scheduler_exclusion_total";
+
+export const KNOWN_HEARTBEAT_TIMER_SCHEDULER_EXCLUSIONS = [
+  "idle_circuit_breaker",
+  "adapter_failed_circuit_breaker",
+  "no_in_flight_work",
+  "provider_capacity_deferred",
+  "heartbeat.scheduling_suppressed",
+  "company.inactive",
+  "heartbeat.worktree_execution_cutoff",
+  "budget.blocked",
+  "agent.not_invokable",
+  "heartbeat.disabled",
+  "heartbeat.cooldown.active",
+  "heartbeat.timer.no_actionable_work",
+  "issue_tree_hold_active",
+] as const;
+export const UNKNOWN_HEARTBEAT_TIMER_SCHEDULER_EXCLUSION = "other";
+const knownHeartbeatTimerSchedulerExclusionSet: ReadonlySet<string> = new Set(
+  KNOWN_HEARTBEAT_TIMER_SCHEDULER_EXCLUSIONS,
+);
+
+export function normalizeHeartbeatTimerSchedulerExclusion(reason: string | null | undefined): string {
+  return typeof reason === "string" && knownHeartbeatTimerSchedulerExclusionSet.has(reason)
+    ? reason
+    : UNKNOWN_HEARTBEAT_TIMER_SCHEDULER_EXCLUSION;
+}
 export const AGENT_NO_USAGE_STREAK_METRIC = "paperclip_agent_zero_token_completed_run_streak";
 export const EXTERNAL_RUNTIME_RESERVATION_EVENTS_METRIC = "paperclip_external_runtime_reservation_events_total";
 export const EXTERNAL_RUNTIME_RESERVATIONS_ACTIVE_METRIC = "paperclip_external_runtime_reservations_active";
@@ -1063,6 +1091,7 @@ type HeartbeatRunFailedLabel =
 
 let heartbeatRunFailed: Counter<HeartbeatRunFailedLabel> | null = null;
 let ccrotateCapacityDeferred: Counter<"adapter" | "provider"> | null = null;
+let heartbeatTimerSchedulerExclusion: Counter<"reason"> | null = null;
 let agentZeroTokenCompletedRunStreak: Gauge<"agent_id" | "adapter"> | null = null;
 let externalRuntimeReservationEvents: Counter<"event"> | null = null;
 let externalRuntimeReservationsActive: Gauge | null = null;
@@ -1097,6 +1126,7 @@ function ensureRegistry(): {
   isolatedStartedCounter: Counter<"agent_id" | "isolation_mode">;
   failedCounter: Counter<HeartbeatRunFailedLabel>;
   capacityDeferredCounter: Counter<"adapter" | "provider">;
+  heartbeatTimerSchedulerExclusionCounter: Counter<"reason">;
   zeroTokenCompletedRunStreakGauge: Gauge<"agent_id" | "adapter">;
   externalRuntimeReservationEventsCounter: Counter<"event">;
   externalRuntimeReservationsActiveGauge: Gauge;
@@ -1131,6 +1161,7 @@ function ensureRegistry(): {
     || !isolatedRunStarted
     || !heartbeatRunFailed
     || !ccrotateCapacityDeferred
+    || !heartbeatTimerSchedulerExclusion
     || !agentZeroTokenCompletedRunStreak
     || !externalRuntimeReservationEvents
     || !externalRuntimeReservationsActive
@@ -1200,6 +1231,15 @@ function ensureRegistry(): {
         + "that returned scheduled_retry with scheduledRetryReason='ccrotate_capacity'. "
         + "A sustained non-zero rate means the fleet is quota-stalled.",
       labelNames: ["adapter", "provider"],
+      registers: [registry],
+    });
+    heartbeatTimerSchedulerExclusion = new Counter({
+      name: HEARTBEAT_TIMER_SCHEDULER_EXCLUSION_METRIC,
+      help:
+        "Count of due heartbeat timer ticks excluded before dispatch, labeled by a bounded "
+        + "operational reason. Each increment has durable evidence in agent_wakeup_requests "
+        + "or a scheduled_retry heartbeat run.",
+      labelNames: ["reason"],
       registers: [registry],
     });
     agentZeroTokenCompletedRunStreak = new Gauge({
@@ -1600,6 +1640,7 @@ function ensureRegistry(): {
     isolatedStartedCounter: isolatedRunStarted,
     failedCounter: heartbeatRunFailed,
     capacityDeferredCounter: ccrotateCapacityDeferred,
+    heartbeatTimerSchedulerExclusionCounter: heartbeatTimerSchedulerExclusion,
     zeroTokenCompletedRunStreakGauge: agentZeroTokenCompletedRunStreak,
     externalRuntimeReservationEventsCounter: externalRuntimeReservationEvents,
     externalRuntimeReservationsActiveGauge: externalRuntimeReservationsActive,
@@ -1757,6 +1798,12 @@ export function recordCcrotateCapacityDeferred(
   };
   ensureRegistry().capacityDeferredCounter.inc(labels);
   return labels;
+}
+
+export function recordHeartbeatTimerSchedulerExclusion(reason: string | null | undefined): string {
+  const normalized = normalizeHeartbeatTimerSchedulerExclusion(reason);
+  ensureRegistry().heartbeatTimerSchedulerExclusionCounter.inc({ reason: normalized });
+  return normalized;
 }
 
 export interface RecordAgentZeroTokenCompletedRunStreakInput {
@@ -2309,6 +2356,7 @@ export function __resetMetricsForTest(): void {
   isolatedRunStarted = null;
   heartbeatRunFailed = null;
   ccrotateCapacityDeferred = null;
+  heartbeatTimerSchedulerExclusion = null;
   agentZeroTokenCompletedRunStreak = null;
   zeroTokenStreakAdapterByAgentId.clear();
   externalRuntimeReservationEvents = null;

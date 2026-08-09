@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, lte, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import * as metricsModule from "../services/metrics.js";
 import {
@@ -989,7 +989,58 @@ describeEmbeddedPostgres("heartbeat ccrotate capacity-defer → scheduled retry"
     );
   });
 
-  it("stops re-deferring and terminates once the pool has been down past the escalation horizon", async () => {
+  it("moves expired capacity re-deferrals beyond now so they cannot starve the bounded due scan", async () => {
+    const { companyId, agentId } = await seedAgent();
+    const due = new Date("2026-04-20T03:02:00.000Z");
+    const expiredReset = new Date("2026-04-20T03:01:59.000Z");
+    const capacityRows = Array.from({ length: 50 }, (_, index) => ({
+      id: randomUUID(),
+      companyId,
+      agentId,
+      invocationSource: "assignment" as const,
+      status: "scheduled_retry" as const,
+      scheduledRetryReason: "ccrotate_capacity",
+      scheduledRetryAt: new Date(expiredReset.getTime() - (50 - index)),
+      scheduledRetryAttempt: 0,
+      errorCode: "rate_limit_exhausted",
+      resultJson: { errorFamily: "rate_limit_exhausted" },
+      contextSnapshot: { wakeSource: "assignment" },
+    }));
+    const targetRunId = randomUUID();
+    await db.insert(heartbeatRuns).values([
+      ...capacityRows,
+      {
+        id: targetRunId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        status: "scheduled_retry",
+        scheduledRetryReason: "transient_failure",
+        scheduledRetryAt: due,
+        scheduledRetryAttempt: 1,
+        contextSnapshot: { wakeReason: "transient_failure_retry" },
+      },
+    ]);
+    const heartbeat = heartbeatService(db, {
+      penstockAvailabilityGate: denyingGate(expiredReset),
+      skipQueuedRunDispatch: true,
+    });
+
+    expect(await heartbeat.promoteDueScheduledRetries(due)).toMatchObject({ promoted: 0 });
+    expect(await heartbeat.promoteDueScheduledRetries(due)).toMatchObject({
+      promoted: 1,
+      runIds: [targetRunId],
+    });
+
+    const stillImmediatelyDue = await db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.status, "scheduled_retry"), lte(heartbeatRuns.scheduledRetryAt, due)))
+      .then((rows) => rows[0]?.count ?? 0);
+    expect(stillImmediatelyDue).toBe(0);
+  });
+
+  it("stops re-deferring and terminates once the retry cap is reached", async () => {
     const { companyId, agentId } = await seedAgent();
     const runId = randomUUID();
     const due = new Date("2026-04-20T03:02:00.000Z");
