@@ -154,7 +154,11 @@ export function createPenstockAvailabilityGate(
         token: resolved.token,
       });
       const cached = cache.get(key);
-      if (cached && nowMs - cached.fetchedAt < cacheTtlMs) {
+      const cachedResetStillFuture =
+        cached?.result.allow !== false ||
+        cached.result.resumeAt === null ||
+        cached.result.resumeAt.getTime() > nowMs;
+      if (cached && nowMs - cached.fetchedAt < cacheTtlMs && cachedResetStillFuture) {
         return cached.result;
       }
 

@@ -454,6 +454,10 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         scheduledRetryReason: "ccrotate_capacity",
       })
       .where(eq(heartbeatRuns.id, runId));
+    await db
+      .update(agents)
+      .set({ status: "error", errorReason: "stale failure from the previous run" })
+      .where(eq(agents.id, agentId));
 
     let observedClaim = false;
     mockAdapterExecute.mockImplementationOnce(async () => {
@@ -477,6 +481,11 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         scheduledRetryAttempt: 2,
         scheduledRetryReason: "ccrotate_capacity",
       });
+      const [runningAgent] = await db
+        .select({ status: agents.status, errorReason: agents.errorReason })
+        .from(agents)
+        .where(eq(agents.id, agentId));
+      expect(runningAgent).toEqual({ status: "running", errorReason: null });
       observedClaim = true;
 
       return {
