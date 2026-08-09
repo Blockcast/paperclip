@@ -1220,6 +1220,18 @@ export async function startServer(): Promise<StartedServer> {
           logger.error({ err }, "startup stale-lock sweeper failed");
         }
 
+        // BLO-21621: terminalize queued runs whose issue lock has already
+        // moved on or gone empty, so a detached run cannot sit invisible to
+        // every other recovery sweep indefinitely.
+        try {
+          const detached = await heartbeat.reconcileDetachedQueuedRuns();
+          if (detached.terminalized > 0) {
+            logger.warn({ ...detached }, "startup detached-queued-run sweeper terminalized stale runs");
+          }
+        } catch (err) {
+          logger.error({ err }, "startup detached-queued-run sweeper failed");
+        }
+
         const promotion = await heartbeat.promoteDueScheduledRetries();
         await heartbeat.resumeQueuedRuns();
         const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
@@ -1369,6 +1381,20 @@ export async function startServer(): Promise<StartedServer> {
             })
             .catch((err) => {
               logger.error({ err }, "periodic stale-lock sweeper failed");
+            }));
+
+          // BLO-21621: same cadence as the stale-lock sweeper above — a
+          // detached queued run is only reachable once its lock has already
+          // gone stale, so the two run back to back.
+          trackHeartbeatSchedulerWork(heartbeat
+            .reconcileDetachedQueuedRuns()
+            .then((detached) => {
+              if (detached.terminalized > 0) {
+                logger.warn({ ...detached }, "periodic detached-queued-run sweeper terminalized stale runs");
+              }
+            })
+            .catch((err) => {
+              logger.error({ err }, "periodic detached-queued-run sweeper failed");
             }));
 
           // Periodically reap orphaned runs (5-min staleness threshold) and make sure
