@@ -2424,6 +2424,8 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           "- Block with an unblock owner (the work needs human direction; name the gate)",
           "- Stop/cancel (the work is not delivering value and should be wound down)",
           "- Continue with a snooze window (only if the assignee has a clear next step but no surface evidence yet)",
+          "",
+          "If you choose \"Block with an unblock owner\", file the escalation in this same run: create a `request_board_approval` approval with this review's source issue in `issueIds`, naming the gate and the exact human action needed. The source link is required and the source must be authorized before the approval is created — an unlinked card reaches a human with no context, and a review run may not attach arbitrary same-company issues. A stated gate with no approval card reaches nobody, and polling a human-only gate is not a substitute. This review runs on the cheap status-only profile, which is permitted to create that one approval type and no other.",
         ]),
     ].join("\n");
   }
