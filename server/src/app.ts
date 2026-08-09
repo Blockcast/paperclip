@@ -70,6 +70,7 @@ import { adapterRoutes } from "./routes/adapters.js";
 import { metricsIngestRoutes } from "./routes/metrics-ingest.js";
 import { renderMetrics } from "./services/metrics.js";
 import { refreshExternalRuntimeReservationMetrics } from "./services/external-runtime-reservations.js";
+import { refreshOverdueScheduledRetryAgeMetrics } from "./services/overdue-scheduled-retry-metrics.js";
 import { pluginUiStaticRoutes } from "./routes/plugin-ui-static.js";
 import { readBrandedStaticIndexHtml } from "./static-index-html.js";
 import { applyUiBranding } from "./ui-branding.js";
@@ -308,6 +309,9 @@ export async function createApp(
     try {
       await refreshExternalRuntimeReservationMetrics(db).catch((err) => {
         logger.warn({ err }, "failed to refresh external-runtime reservation metrics before scrape");
+      });
+      await refreshOverdueScheduledRetryAgeMetrics(db).catch((err) => {
+        logger.warn({ err }, "failed to refresh overdue scheduled-retry age metrics before scrape");
       });
       const { contentType, body } = await renderMetrics();
       res.status(200).set("Content-Type", contentType).send(body);

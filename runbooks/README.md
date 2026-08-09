@@ -33,3 +33,7 @@ platform cannot resolve automatically. Each runbook should be:
   (not failing) and is silently freezing the `master` merge queue. Trigger:
   `master` hasn't advanced in >90 min with the queue non-empty, or the
   position-1 entry's `merge_group` run shows no state change for that long.
+- [`overdue-scheduled-retry.md`](overdue-scheduled-retry.md) — a heartbeat
+  retry remains parked past `scheduled_retry_at` instead of being promoted or
+  deliberately re-deferred. Trigger: `PaperclipOverdueScheduledRetry`, or
+  `max(paperclip_overdue_scheduled_retry_oldest_age_seconds) by (agent_id) > 5400`.

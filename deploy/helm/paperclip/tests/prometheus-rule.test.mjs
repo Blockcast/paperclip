@@ -306,3 +306,53 @@ test("PaperclipPrReviewWakeTerminalFailed is pr_review-scoped, gauge-keyed, and 
     "terminal-failed alert must link the runbook from its annotation",
   );
 });
+
+test("PaperclipOverdueScheduledRetry is agent-keyed, age-thresholded, and links its runbook (BLO-22094)", () => {
+  const rendered = execFileSync(
+    "helm",
+    [
+      "template",
+      "paperclip",
+      "deploy/helm/paperclip",
+      "--namespace",
+      "paperclip",
+      "-f",
+      "deploy/helm/paperclip/values.blockcast.yaml",
+      "--show-only",
+      "templates/prometheusrule.yaml",
+      "--set",
+      "prometheusRule.enabled=true",
+    ],
+    { cwd: repoRoot, encoding: "utf8" },
+  );
+
+  assert.match(rendered, /alert: PaperclipOverdueScheduledRetry/);
+  const [, expr] = rendered.match(
+    /alert: PaperclipOverdueScheduledRetry[\s\S]*?\n\s+expr: (.+)\n/,
+  ) ?? [];
+  assert.ok(expr, "overdue scheduled-retry alert must render an expr");
+  assert.match(
+    expr,
+    /^max\(paperclip_overdue_scheduled_retry_oldest_age_seconds\) by \(agent_id\) > (\d+)$/,
+    "overdue scheduled-retry alert must threshold the per-agent age gauge",
+  );
+
+  const [, ageThreshold] = expr.match(/> (\d+)$/) ?? [];
+  assert.ok(Number(ageThreshold) > 0, "overdue scheduled-retry threshold must be strictly positive");
+
+  const [, forWindow] = rendered.match(
+    /alert: PaperclipOverdueScheduledRetry[\s\S]*?\n\s+for: (.+)\n/,
+  ) ?? [];
+  const forMinutes = /^\d+m$/.test(forWindow?.trim() ?? "")
+    ? Number(forWindow.trim().slice(0, -1))
+    : null;
+  assert.ok(
+    forMinutes !== null && forMinutes > 0 && forMinutes <= 10,
+    `for window ${forWindow} must be short scrape-flap tolerance`,
+  );
+  assert.match(
+    rendered,
+    /alert: PaperclipOverdueScheduledRetry[\s\S]*?runbook_url: "[^"]*runbooks\/overdue-scheduled-retry\.md"/,
+    "overdue scheduled-retry alert must link its runbook",
+  );
+});

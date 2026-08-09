@@ -71,6 +71,11 @@ export const EXTERNAL_RUNTIME_RESERVATION_EVENTS_METRIC = "paperclip_external_ru
 export const EXTERNAL_RUNTIME_RESERVATIONS_ACTIVE_METRIC = "paperclip_external_runtime_reservations_active";
 export const EXTERNAL_RUNTIME_RESERVATION_OLDEST_AGE_METRIC = "paperclip_external_runtime_reservation_oldest_age_seconds";
 /**
+ * Age, past its scheduled due time, of the oldest parked retry per agent.
+ * A retry still waiting for a future due time is intentionally excluded.
+ */
+export const OVERDUE_SCHEDULED_RETRY_OLDEST_AGE_METRIC = "paperclip_overdue_scheduled_retry_oldest_age_seconds";
+/**
  * process_lost reap counter (BLO-16184, parent BLO-12292). Incremented once at
  * the reaper's `process_lost` mint, labeled by bounded `adapter`
  * (claude_k8s/opencode_k8s/other), `error_bucket` (the fixed reaper failure
@@ -814,6 +819,7 @@ let agentZeroTokenCompletedRunStreak: Gauge<"agent_id" | "adapter"> | null = nul
 let externalRuntimeReservationEvents: Counter<"event"> | null = null;
 let externalRuntimeReservationsActive: Gauge | null = null;
 let externalRuntimeReservationOldestAge: Gauge | null = null;
+let overdueScheduledRetryOldestAge: Gauge<"agent_id"> | null = null;
 let processLostTotal: Counter<"adapter" | "error_bucket" | "classification"> | null = null;
 let externalLifecycleRunningRuns: Gauge<"adapter"> | null = null;
 let processLostLivenessNull: Counter | null = null;
@@ -836,6 +842,7 @@ function ensureRegistry(): {
   externalRuntimeReservationEventsCounter: Counter<"event">;
   externalRuntimeReservationsActiveGauge: Gauge;
   externalRuntimeReservationOldestAgeGauge: Gauge;
+  overdueScheduledRetryOldestAgeGauge: Gauge<"agent_id">;
   processLostTotalCounter: Counter<"adapter" | "error_bucket" | "classification">;
   externalLifecycleRunningRunsGauge: Gauge<"adapter">;
   processLostLivenessNullCounter: Counter;
@@ -858,6 +865,7 @@ function ensureRegistry(): {
     || !externalRuntimeReservationEvents
     || !externalRuntimeReservationsActive
     || !externalRuntimeReservationOldestAge
+    || !overdueScheduledRetryOldestAge
     || !processLostTotal
     || !externalLifecycleRunningRuns
     || !processLostLivenessNull
@@ -935,6 +943,14 @@ function ensureRegistry(): {
     externalRuntimeReservationOldestAge = new Gauge({
       name: EXTERNAL_RUNTIME_RESERVATION_OLDEST_AGE_METRIC,
       help: "Age in seconds of the oldest unreleased external-runtime slot reservation.",
+      registers: [registry],
+    });
+    overdueScheduledRetryOldestAge = new Gauge({
+      name: OVERDUE_SCHEDULED_RETRY_OLDEST_AGE_METRIC,
+      help:
+        "Age in seconds past due time of the oldest `scheduled_retry` heartbeat run for an agent. "
+        + "Refreshed from overdue parked rows on every /metrics scrape; an agent without one reads 0.",
+      labelNames: ["agent_id"],
       registers: [registry],
     });
     processLostTotal = new Counter({
@@ -1162,6 +1178,7 @@ function ensureRegistry(): {
     externalRuntimeReservationEventsCounter: externalRuntimeReservationEvents,
     externalRuntimeReservationsActiveGauge: externalRuntimeReservationsActive,
     externalRuntimeReservationOldestAgeGauge: externalRuntimeReservationOldestAge,
+    overdueScheduledRetryOldestAgeGauge: overdueScheduledRetryOldestAge,
     processLostTotalCounter: processLostTotal,
     externalLifecycleRunningRunsGauge: externalLifecycleRunningRuns,
     processLostLivenessNullCounter: processLostLivenessNull,
@@ -1555,6 +1572,31 @@ export function setAgentWakeupTerminalFailedOldestAgeSeconds(
 }
 
 /**
+ * Rewrite the overdue scheduled-retry age gauge from durable state. Every
+ * known agent receives an explicit 0 when it has no overdue parked retry, so
+ * an alert resolves instead of retaining a stale value.
+ */
+export function setOverdueScheduledRetryAgeMetrics(
+  entries: ReadonlyArray<{ agentId: string | null | undefined; ageSeconds: number }>,
+  knownAgentIds: ReadonlySet<string>,
+): void {
+  const gauge = ensureRegistry().overdueScheduledRetryOldestAgeGauge;
+  gauge.reset();
+  const oldestByAgentId = new Map<string, number>();
+  for (const entry of entries) {
+    const agentId = normalizeAgentId(entry.agentId, knownAgentIds);
+    const ageSeconds = Number.isFinite(entry.ageSeconds) ? Math.max(0, entry.ageSeconds) : 0;
+    const current = oldestByAgentId.get(agentId);
+    if (current === undefined || ageSeconds > current) oldestByAgentId.set(agentId, ageSeconds);
+  }
+  for (const agentId of knownAgentIds) {
+    gauge.set({ agent_id: agentId }, oldestByAgentId.get(agentId) ?? 0);
+  }
+  const unknownAge = oldestByAgentId.get(UNKNOWN_AGENT_ID);
+  if (unknownAge !== undefined) gauge.set({ agent_id: UNKNOWN_AGENT_ID }, unknownAge);
+}
+
+/**
  * Record one completed GitHub Actions `workflow_run` webhook delivery
  * (BLO-21078). Call exactly once per completed run, regardless of whether it
  * matched a paperclip identifier — the counter's job is fleet-wide visibility
@@ -1622,6 +1664,7 @@ export function __resetMetricsForTest(): void {
   externalRuntimeReservationEvents = null;
   externalRuntimeReservationsActive = null;
   externalRuntimeReservationOldestAge = null;
+  overdueScheduledRetryOldestAge = null;
   processLostTotal = null;
   externalLifecycleRunningRuns = null;
   processLostLivenessNull = null;

@@ -295,6 +295,20 @@ spec:
             summary: "Paperclip PR-review wake is terminally failed and will never be retried"
             description: "A pr_review-scoped agent_wakeup_requests row has been sitting at status='failed' for more than {{ .Values.prometheusRule.wakeTerminalFailedAgeSeconds }}s with no successor wake for the same taskKey (BLO-20255). The age is the server-computed age of the oldest such row, published as paperclip_agent_wakeup_terminal_failed_oldest_age_seconds; the companion count series paperclip_agent_wakeup_terminal_failed_unresolved{scope=\"pr_review\"} breaks the population down by error_code. This state is TERMINAL: reconcileFailedWakeDispatches only selects dispatch_failed, so nothing re-drives it, and the BLO-18030 bounded retry deliberately declines three cases so it can never double-post a review (the GitHub probe found an existing review, the probe threw or there was no PR context, or the run was not a pr_review context). The PR has a posted review trigger and no review. Break down by the `error_code` label on the count series to decide: it is joined from heartbeat_runs.error_code via agent_wakeup_requests.run_id, because the wake table has no error_code column of its own. `external_lifecycle_stale_killed` means the reviewer Job went silent past the 45m hard-stale window and was force-terminated. `job_failed` means the Job itself exited non-zero. `none` means there was no run row or no code recorded. `other` means a code missing from KNOWN_TERMINAL_FAILED_WAKE_ERROR_CODES in services/metrics.ts — triage it into that list. Query the rows with `select w.id, w.agent_id, w.reason, w.error, w.payload ->> 'taskKey' as task_key, r.error_code from agent_wakeup_requests w left join heartbeat_runs r on r.id = w.run_id where w.status = 'failed' and w.finished_at > now() - interval '24 hours' order by w.finished_at desc`. See the runbook for the re-review-vs-accept decision."
             runbook_url: {{ .Values.prometheusRule.wakeTerminalFailedRunbookUrl | quote }}
+    - name: paperclip-overdue-scheduled-retry
+      rules:
+        - alert: PaperclipOverdueScheduledRetry
+          # A due scheduled retry should be promoted promptly by the heartbeat
+          # scheduler. This gauges time past due, not time spent backing off,
+          # so ordinary future retries remain silent.
+          expr: max(paperclip_overdue_scheduled_retry_oldest_age_seconds) by (agent_id) > {{ .Values.prometheusRule.overdueScheduledRetryAgeSeconds }}
+          for: {{ .Values.prometheusRule.overdueScheduledRetryFor }}
+          labels:
+            severity: warning
+          annotations:
+            summary: "Paperclip agent {{`{{ $labels.agent_id }}`}} has a scheduled retry overdue past its due time for longer than {{ .Values.prometheusRule.overdueScheduledRetryAgeSeconds }}s"
+            description: "Agent {{`{{ $labels.agent_id }}`}} has a heartbeat run still parked at status='scheduled_retry' for {{`{{ $value }}`}}s past scheduled_retry_at (BLO-22094). A healthy scheduler promotes a due retry or deliberately re-defers it with a later due time. Query `select id, agent_id, scheduled_retry_reason, scheduled_retry_attempt, scheduled_retry_at, now() - scheduled_retry_at as overdue_by, updated_at, context_snapshot ->> 'issueId' as issue_id from heartbeat_runs where status = 'scheduled_retry' and scheduled_retry_at < now() and agent_id = '{{`{{ $labels.agent_id }}`}}' order by scheduled_retry_at asc limit 10` and use the runbook to distinguish deliberate re-deferral from a wedged promotion sweep."
+            runbook_url: {{ .Values.prometheusRule.overdueScheduledRetryRunbookUrl | quote }}
     {{- with .Values.prometheusRule.additionalGroups }}
     {{- toYaml . | nindent 4 }}
     {{- end }}

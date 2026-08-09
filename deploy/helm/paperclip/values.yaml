@@ -464,6 +464,12 @@ prometheusRule:
   wakeTerminalFailedFor: 5m
   # -- Runbook for the terminal-failed wake alert, linked from its annotation.
   wakeTerminalFailedRunbookUrl: "https://github.com/Blockcast/paperclip/blob/master/runbooks/agent-wakeup-terminal-failed.md"
+  # -- How long an agent's oldest due-but-unpromoted scheduled_retry heartbeat run may sit before firing (BLO-22094). The threshold is based on a 7-day observed due-to-promotion population: p99 1594.8s, max 3567.5s; 5400s leaves a 50% margin over the maximum while excluding ordinary future backoff.
+  overdueScheduledRetryAgeSeconds: 5400
+  # -- Scrape-flap tolerance only; the age lives in overdueScheduledRetryAgeSeconds above.
+  overdueScheduledRetryFor: 5m
+  # -- Runbook for the overdue scheduled-retry alert, linked from its annotation.
+  overdueScheduledRetryRunbookUrl: "https://github.com/Blockcast/paperclip/blob/master/runbooks/overdue-scheduled-retry.md"
   # -- Prometheus regex of suppression causes that mean an outage rather than a deliberate decline (BLO-18859). Expected policy declines (company.inactive, heartbeat.cooldown.active, heartbeat.disabled, heartbeat.wakeOnDemand.disabled, budget.blocked, agent.not_invokable, heartbeat.worktree_execution_cutoff, issue_tree_hold_active) are excluded so they never page. `other` is included: it is the bucket for a skip reason missing from KNOWN_GITHUB_SUPPRESSION_CAUSES, and an untriaged cause is not a known-good decline.
   githubDeliverySuppressionOutageCauses: "heartbeat.scheduling_suppressed|dispatch_rejected|other"
   # -- Additional PrometheusRule groups appended verbatim.
