@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import path from "node:path";
@@ -265,6 +266,62 @@ test("the dead-letter alert annotation links to this dashboard (BLO-20171 accept
     alertBlock,
     /\/d\/paperclip-review-request-funnel/,
     "the dead-letter alert must carry a link to the review-request funnel dashboard",
+  );
+});
+
+test("adding grafanaDashboard did not orphan serviceMonitor.scrapeAllowFromNamespaces (BLO-20171 review catch)", () => {
+  // The `grafanaDashboard` block was originally inserted into the MIDDLE of the
+  // `serviceMonitor` mapping in values.yaml, between `scrapeTimeout` and
+  // `scrapeAllowFromNamespaces`. YAML reparented the trailing key, so the
+  // documented `serviceMonitor.scrapeAllowFromNamespaces` silently became
+  // `grafanaDashboard.scrapeAllowFromNamespaces` while templates/networkpolicy.yaml
+  // still read the serviceMonitor path.
+  //
+  // This has to be a STRUCTURAL assertion on values.yaml, not a render assertion.
+  // A render test that passes the value with `--set serviceMonitor....` supplies the
+  // correct path itself and therefore passes whether or not the default is
+  // misplaced -- verified: re-introducing the bug left such a test green. And the
+  // shipped default is `[]`, which renders identically to a missing key. The
+  // failure mode is real but only bites someone who copies values.yaml and edits
+  // it in place, so values.yaml's own shape is the thing worth pinning.
+  const valuesPath = path.join(repoRoot, "deploy/helm/paperclip/values.yaml");
+  const values = readFileSync(valuesPath, "utf8");
+
+  const blockOf = (topLevelKey) => {
+    const start = values.indexOf(`\n${topLevelKey}:\n`);
+    assert.notEqual(start, -1, `values.yaml has no top-level ${topLevelKey}`);
+    const rest = values.slice(start + 1);
+    // Next top-level key = a line starting with a non-space, non-comment char.
+    const nextKey = rest.slice(1).search(/\n[A-Za-z]/);
+    return nextKey === -1 ? rest : rest.slice(0, nextKey + 1);
+  };
+
+  assert.match(
+    blockOf("serviceMonitor"),
+    /^\s{2}scrapeAllowFromNamespaces:/m,
+    "scrapeAllowFromNamespaces must sit inside the serviceMonitor mapping; templates/networkpolicy.yaml reads .Values.serviceMonitor.scrapeAllowFromNamespaces",
+  );
+  assert.doesNotMatch(
+    blockOf("grafanaDashboard"),
+    /scrapeAllowFromNamespaces/,
+    "scrapeAllowFromNamespaces has been reparented under grafanaDashboard by an insertion in the middle of the serviceMonitor mapping",
+  );
+
+  // ...and the wiring it protects still works end to end.
+  const rendered = renderChart([
+    "--set",
+    "serviceMonitor.enabled=true",
+    "--set",
+    "networkPolicy.enabled=true",
+    "--set",
+    "serviceMonitor.scrapeAllowFromNamespaces[0].namespaceSelector.matchLabels.kubernetes\\.io/metadata\\.name=monitoring",
+    "--show-only",
+    "templates/networkpolicy.yaml",
+  ]);
+  assert.match(
+    rendered,
+    /kubernetes\.io\/metadata\.name: monitoring/,
+    "serviceMonitor.scrapeAllowFromNamespaces must reach the NetworkPolicy ingress rules",
   );
 });
 

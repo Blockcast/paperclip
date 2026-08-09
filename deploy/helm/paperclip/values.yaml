@@ -408,10 +408,15 @@ serviceMonitor:
   interval: 30s
   # -- Per-scrape timeout. Must be `<=` `interval`.
   scrapeTimeout: 10s
+  # -- Namespaces of the Prometheus pods that scrape this Service. Appended to
+  # the NetworkPolicy ingress `from` (when `networkPolicy.enabled`) so scrapes
+  # are not blocked. Same shape as `networkPolicy.allowFromNamespaces`.
+  # Example: `[{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: monitoring}}}]`.
+  scrapeAllowFromNamespaces: []
 
 # Grafana dashboards shipped as sidecar-adopted ConfigMaps (BLO-20171).
 #
-# Unlike `prometheusRule` above, this is safe to enable on Blockcast: the
+# Unlike `prometheusRule` below, this is safe to enable on Blockcast: the
 # paperclip-ci-deploy ServiceAccount holds ClusterRole/admin in the release
 # namespace, which covers core `configmaps` but not the monitoring.coreos.com
 # CRDs. See templates/grafana-dashboard.yaml for the full reasoning.
@@ -428,11 +433,6 @@ grafanaDashboard:
   folder: ""
   # -- Extra labels to merge onto the dashboard ConfigMaps.
   extraLabels: {}
-  # -- Namespaces of the Prometheus pods that scrape this Service. Appended to
-  # the NetworkPolicy ingress `from` (when `networkPolicy.enabled`) so scrapes
-  # are not blocked. Same shape as `networkPolicy.allowFromNamespaces`.
-  # Example: `[{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: monitoring}}}]`.
-  scrapeAllowFromNamespaces: []
 
 # -- Prometheus Operator rules for Paperclip runtime health. Requires the
 # `monitoring.coreos.com/v1` CRDs and the ServiceMonitor scrape above. Disabled
