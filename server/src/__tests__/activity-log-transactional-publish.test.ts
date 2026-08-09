@@ -81,6 +81,18 @@ describeEmbeddedPostgres("logActivity publication vs. an enclosing transaction",
     return { seen, unsubscribe };
   }
 
+  function withTimeout<T>(promise: Promise<T>, ms: number, label: string) {
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    return Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+      }),
+    ]).finally(() => {
+      if (timeout) clearTimeout(timeout);
+    });
+  }
+
   it("enqueues no plugin event when the enclosing transaction rolls back", async () => {
     const entityId = randomUUID();
     const live = captureLiveEvents();
@@ -236,30 +248,34 @@ describeEmbeddedPostgres("logActivity publication vs. an enclosing transaction",
 
   it("keeps unannotated transaction outbox failures best-effort on the global handle", async () => {
     const entityId = randomUUID();
-    const constraintName = "plugin_event_outbox_reject_unannotated_tx_test";
+    let markEnqueueStarted!: () => void;
+    const enqueueStarted = new Promise<void>((resolve) => {
+      markEnqueueStarted = resolve;
+    });
+    const rejectingOutboxDb = {
+      insert: () => ({
+        values: () => {
+          markEnqueueStarted();
+          return Promise.reject(new Error("global outbox rejected the test event"));
+        },
+      }),
+    } as unknown as Db;
 
-    await db.execute(sql.raw(`
-      ALTER TABLE "plugin_event_outbox"
-      ADD CONSTRAINT "${constraintName}"
-      CHECK ("event_type" <> '${PLUGIN_MAPPED_ACTION}')
-    `));
-
+    setPluginEventOutboxDb(rejectingOutboxDb);
     try {
       await db.transaction(async (tx) => {
         await expect(logActivity(tx as unknown as Db, activityInput(entityId))).resolves.toEqual(
           expect.any(Function),
         );
       });
+      await withTimeout(enqueueStarted, 1_000, "unannotated transaction global outbox enqueue");
 
       const activityRows = await db.select().from(activityLog);
       expect(activityRows).toHaveLength(1);
       expect(activityRows[0]?.entityId).toBe(entityId);
       expect(await db.select().from(pluginEventOutbox)).toHaveLength(0);
     } finally {
-      await db.execute(sql.raw(`
-        ALTER TABLE "plugin_event_outbox"
-        DROP CONSTRAINT IF EXISTS "${constraintName}"
-      `));
+      setPluginEventOutboxDb(db);
     }
   });
 
@@ -270,7 +286,10 @@ describeEmbeddedPostgres("logActivity publication vs. an enclosing transaction",
     await db.execute(sql.raw(`
       ALTER TABLE "plugin_event_outbox"
       ADD CONSTRAINT "${constraintName}"
-      CHECK ("event_type" <> '${PLUGIN_MAPPED_ACTION}')
+      CHECK (
+        "event_type" <> '${PLUGIN_MAPPED_ACTION}'
+        OR "payload"->>'entityId' <> '${entityId}'
+      )
     `));
 
     try {
@@ -279,7 +298,10 @@ describeEmbeddedPostgres("logActivity publication vs. an enclosing transaction",
       const activityRows = await db.select().from(activityLog);
       expect(activityRows).toHaveLength(1);
       expect(activityRows[0]?.entityId).toBe(entityId);
-      expect(await db.select().from(pluginEventOutbox)).toHaveLength(0);
+      const matchingOutboxRows = (await db.select().from(pluginEventOutbox)).filter(
+        (row) => row.eventType === PLUGIN_MAPPED_ACTION && row.payload.entityId === entityId,
+      );
+      expect(matchingOutboxRows).toHaveLength(0);
     } finally {
       await db.execute(sql.raw(`
         ALTER TABLE "plugin_event_outbox"
@@ -332,6 +354,47 @@ describeEmbeddedPostgres("logActivity publication vs. an enclosing transaction",
       await expect(publish()).rejects.toThrow("live listener exploded");
     } finally {
       unsubscribe();
+    }
+  });
+
+  it("waits for a plain Db global outbox enqueue before resolving", async () => {
+    const entityId = randomUUID();
+    let markEnqueueStarted!: () => void;
+    let releaseEnqueue: (() => void) | null = null;
+    let pending: ReturnType<typeof logActivity> | null = null;
+    const enqueueStarted = new Promise<void>((resolve) => {
+      markEnqueueStarted = resolve;
+    });
+    const blockedEnqueue = new Promise<void>((resolve) => {
+      releaseEnqueue = resolve;
+    });
+    const blockedOutboxDb = {
+      insert: () => ({
+        values: () => {
+          markEnqueueStarted();
+          return blockedEnqueue;
+        },
+      }),
+    } as unknown as Db;
+
+    setPluginEventOutboxDb(blockedOutboxDb);
+    try {
+      pending = logActivity(db, activityInput(entityId));
+      await withTimeout(enqueueStarted, 1_000, "plain Db global outbox enqueue");
+
+      let settled = false;
+      void pending.then(() => {
+        settled = true;
+      });
+      await Promise.resolve();
+      expect(settled).toBe(false);
+
+      releaseEnqueue?.();
+      await expect(pending).resolves.toEqual(expect.any(Function));
+    } finally {
+      releaseEnqueue?.();
+      await pending?.catch(() => undefined);
+      setPluginEventOutboxDb(db);
     }
   });
 

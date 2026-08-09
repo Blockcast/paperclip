@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
+import { PostgresJsTransaction } from "drizzle-orm/postgres-js";
 import type { Db } from "@paperclipai/db";
 import { activityLog, agentApiKeys, companies, heartbeatRuns, issues, pluginEventOutbox } from "@paperclipai/db";
 import { isUuidLike, PLUGIN_EVENT_TYPES, type PluginEventType } from "@paperclipai/shared";
@@ -372,6 +373,23 @@ export async function logActivity(
   }
 
   publishLive();
-  if (!enlistPluginOutbox) await enqueueOnGlobal();
+  if (!enlistPluginOutbox) {
+    if (db instanceof PostgresJsTransaction) {
+      // Do not hold a caller's transaction connection while the global outbox
+      // pool acquires its own connection. With a saturated shared pool, awaiting
+      // that insert here deadlocks every transaction before any can commit and
+      // release a slot. This path is explicitly best-effort; enlisted writes
+      // above remain awaited and atomic with the caller's transaction.
+      void enqueueOnGlobal().catch((err) =>
+        logger.warn(
+          { err, eventType: pluginEvent?.eventType ?? null },
+          "failed to enqueue non-enlisted plugin event to outbox",
+        ),
+      );
+    } else {
+      // Preserve the synchronous completion contract for ordinary callers.
+      await enqueueOnGlobal();
+    }
+  }
   return NOOP_ACTIVITY_PUBLISH;
 }
