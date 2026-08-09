@@ -27,6 +27,7 @@ import {
   isEmptyConfig,
   resolveCompanyScope,
 } from "./config-scope.js";
+import { getCredentialHealth } from "./credential-health.js";
 import type { AlertmanagerPluginConfig } from "./types.js";
 
 // ---------------------------------------------------------------------------
@@ -153,7 +154,10 @@ export const plugin = definePlugin({
   },
 
   async onHealth() {
-    return { status: "ok" };
+    // Derived from observed delivery outcomes, not a config probe: this
+    // method has no company scope (BLO-20572), so it cannot enumerate
+    // configured companies and pre-check their tokens.
+    return getCredentialHealth();
   },
 });
 

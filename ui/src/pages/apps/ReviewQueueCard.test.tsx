@@ -83,7 +83,11 @@ function pendingRequest() {
 async function flushReact() {
   await act(async () => {
     await Promise.resolve();
-    await new Promise((resolve) => window.setTimeout(resolve, 0));
+    if (vi.isFakeTimers()) {
+      await vi.advanceTimersByTimeAsync(0);
+    } else {
+      await new Promise((resolve) => window.setTimeout(resolve, 0));
+    }
   });
 }
 
@@ -145,6 +149,7 @@ describe("ReviewQueueCard", () => {
 
   afterEach(() => {
     act(() => root?.unmount());
+    vi.useRealTimers();
     container.remove();
     document.body.innerHTML = "";
     vi.clearAllMocks();
@@ -152,13 +157,14 @@ describe("ReviewQueueCard", () => {
 
   async function render(
     client = new QueryClient({ defaultOptions: { queries: { retry: false } } }),
+    connectionId?: string,
     emptyState: "hidden" | "reassure" = "reassure",
   ) {
     root = createRoot(container);
     await act(async () => {
       root.render(
         <QueryClientProvider client={client}>
-          <ReviewQueueCard emptyState={emptyState} />
+          <ReviewQueueCard emptyState={emptyState} connectionId={connectionId} />
         </QueryClientProvider>,
       );
     });
@@ -264,67 +270,130 @@ describe("ReviewQueueCard", () => {
     });
   });
 
-  it("polls an empty mounted queue on ONE timer so externally-created pending requests appear", async () => {
+  it("keeps refreshing an empty mounted queue so externally-created pending requests appear", async () => {
+    vi.useFakeTimers();
     let pendingCreated = false;
-    const callTimes: number[] = [];
-    listActionRequestsMock.mockImplementation(async () => {
-      callTimes.push(Date.now());
-      return { actionRequests: pendingCreated ? [pendingRequest()] : [] };
-    });
+    listActionRequestsMock.mockImplementation(async () => ({
+      actionRequests: pendingCreated ? [pendingRequest()] : [],
+    }));
 
     await render();
 
-    await vi.waitFor(() => {
-      expect(listActionRequestsMock).toHaveBeenCalledTimes(2);
-      expect(document.body.textContent).toContain("Nothing is waiting for your OK right now.");
+    expect(listActionRequestsMock).toHaveBeenCalledTimes(2);
+    expect(document.body.textContent).toContain("Nothing is waiting for your OK right now.");
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
     });
+    await flushReact();
+    expect(listActionRequestsMock).toHaveBeenCalledTimes(3);
+    expect(document.body.textContent).toContain("Nothing is waiting for your OK right now.");
 
-    // Two polls past the mount burst, so there are real intervals to measure.
-    await vi.waitFor(
-      () => {
-        expect(callTimes.length).toBeGreaterThanOrEqual(4);
-        expect(document.body.textContent).toContain("Nothing is waiting for your OK right now.");
-      },
-      { timeout: 8_000 },
-    );
-
-    // The cadence itself is the assertion. A bare call count cannot distinguish
-    // one 2s timer from two, so measure the gaps: calls[0] and calls[1] are the
-    // deliberate back-to-back mount refetch, and everything after is polling.
-    // A second concurrent timer shows up as a pair of near-simultaneous calls,
-    // which no jitter on a single timer can produce.
-    const pollGaps = callTimes.slice(2).map((time, index) => time - callTimes[index + 1]);
-    expect(pollGaps.length).toBeGreaterThanOrEqual(2);
-    expect(Math.min(...pollGaps)).toBeGreaterThanOrEqual(1_000);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    await flushReact();
+    expect(listActionRequestsMock).toHaveBeenCalledTimes(4);
+    expect(document.body.textContent).toContain("Nothing is waiting for your OK right now.");
 
     pendingCreated = true;
 
-    await vi.waitFor(
-      () => {
-        expect(buttonContaining("Allow once")).toBeTruthy();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    await flushReact();
+    expect(listActionRequestsMock).toHaveBeenCalledTimes(5);
+    await vi.waitFor(() => expect(buttonContaining("Allow once")).toBeTruthy(), {
+      timeout: 500,
+      interval: 10,
+    });
+    expect(listActionRequestsMock).toHaveBeenCalledTimes(5);
+  });
+
+  it("does not enter the fast empty-queue polling loop after request failures", async () => {
+    vi.useFakeTimers();
+    listActionRequestsMock.mockRejectedValue(new Error("action request API down"));
+
+    await render();
+
+    expect(listActionRequestsMock).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    await flushReact();
+    expect(listActionRequestsMock).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(18_000);
+    });
+    await flushReact();
+    expect(listActionRequestsMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps refreshing an empty connection-scoped queue when other connections have requests", async () => {
+    vi.useFakeTimers();
+    let scopedPendingCreated = false;
+    const unrelatedRequest = {
+      ...pendingRequest(),
+      request: {
+        ...pendingRequest().request,
+        id: "request-other",
       },
-      { timeout: 3_500 },
-    );
+      connectionId: "connection-other",
+    };
+    listActionRequestsMock.mockImplementation(async () => ({
+      actionRequests: scopedPendingCreated ? [unrelatedRequest, pendingRequest()] : [unrelatedRequest],
+    }));
+
+    await render(undefined, "connection-1");
+
+    expect(listActionRequestsMock).toHaveBeenCalledTimes(2);
+    expect(document.body.textContent).toContain("Nothing is waiting for your OK right now.");
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    await flushReact();
+    expect(listActionRequestsMock).toHaveBeenCalledTimes(3);
+
+    scopedPendingCreated = true;
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    await flushReact();
+    expect(listActionRequestsMock).toHaveBeenCalledTimes(4);
+    await vi.waitFor(() => expect(buttonContaining("Allow once")).toBeTruthy(), {
+      timeout: 500,
+      interval: 10,
+    });
   });
 
   it("leaves a hidden empty queue on the slow interval instead of fast-polling it", async () => {
-    // This is what pins the queue to ONE polling mechanism. The visible cadence
-    // cannot: a second timer re-armed off the same fetch completion converges
-    // with refetchInterval and react-query dedupes the pair, so both variants
-    // poll at an identical ~2s and no call-count or gap assertion can tell them
-    // apart. The hidden case can -- refetchInterval deliberately backs off to
-    // 20s when the card renders nothing, and a stray unconditional 2s timer
-    // silently overrides exactly that.
+    // The `emptyState === "hidden"` backoff is what pins the card to ONE polling
+    // mechanism. The visible cadence cannot: a stray second timer re-armed off
+    // the same fetch completion converges with refetchInterval at an identical
+    // ~2s and react-query dedupes the pair. The hidden case can -- refetchInterval
+    // deliberately drops to 20s when the card renders nothing, and an
+    // unconditional 2s timer silently overrides exactly that.
+    vi.useFakeTimers();
     listActionRequestsMock.mockResolvedValue({ actionRequests: [] });
 
-    await render(undefined, "hidden");
-
-    await vi.waitFor(() => {
-      expect(listActionRequestsMock).toHaveBeenCalledTimes(2);
-    });
-
-    await new Promise((resolve) => window.setTimeout(resolve, 2_600));
+    await render(undefined, undefined, "hidden");
 
     expect(listActionRequestsMock).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    await flushReact();
+    expect(listActionRequestsMock).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(18_000);
+    });
+    await flushReact();
+    expect(listActionRequestsMock).toHaveBeenCalledTimes(3);
   });
 });

@@ -24,6 +24,7 @@ case "${1:-}" in
       printf 'runtime-base-image=%s\n' "$runtime_base_image"
       for file in \
         Dockerfile.runtime \
+        scripts/smoke/opencode-responses-replay.mjs \
         scripts/gh-token-wrapper.sh \
         scripts/docker-entrypoint.sh \
         scripts/paperclip-consult-codex.sh; do

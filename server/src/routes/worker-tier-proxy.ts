@@ -22,6 +22,7 @@ import { Readable } from "node:stream";
 import type { IncomingHttpHeaders } from "node:http";
 import type { Request, RequestHandler, Router } from "express";
 import { logger } from "../middleware/logger.js";
+import { assertBoardOrgAccess } from "./authz.js";
 
 /**
  * Plugin routes whose handlers reach pluginWorkerManager.{startWorker,
@@ -31,6 +32,7 @@ import { logger } from "../middleware/logger.js";
 export const WORKER_DEPENDENT_PLUGIN_ROUTES: ReadonlyArray<{
   method: "get" | "post" | "put" | "delete";
   path: string;
+  preProxyAuth?: "board-org";
   /** Long-lived response (SSE) — skip the request timeout, stream the body. */
   streaming?: boolean;
   /**
@@ -56,7 +58,7 @@ export const WORKER_DEPENDENT_PLUGIN_ROUTES: ReadonlyArray<{
   // Webhook deliveries dispatch into the plugin worker via handleWebhook.
   { method: "post", path: "/plugins/:pluginId/webhooks/:endpointKey" },
   // UI bridge — getData/performAction RPCs and the SSE push channel.
-  { method: "post", path: "/plugins/:pluginId/bridge/data" },
+  { method: "post", path: "/plugins/:pluginId/bridge/data", preProxyAuth: "board-org" },
   { method: "post", path: "/plugins/:pluginId/bridge/action" },
   { method: "post", path: "/plugins/:pluginId/data/:key" },
   { method: "post", path: "/plugins/:pluginId/actions/:key" },
@@ -86,6 +88,15 @@ const PROXY_PLUGIN_API_REQUEST_TIMEOUT_MS = 150_000;
 const PROXY_STREAM_STARTUP_RETRY_BUDGET_MS = 30_000;
 const PROXY_GET_RETRY_INITIAL_MS = 250;
 const PROXY_GET_RETRY_MAX_MS = 2_000;
+
+const boardOrgAccessProxyGuard: RequestHandler = (req, _res, next) => {
+  try {
+    assertBoardOrgAccess(req);
+    next();
+  } catch (err) {
+    next(err);
+  }
+};
 
 export interface WorkerTierProxyOptions {
   requestTimeoutMs?: number;
@@ -344,9 +355,14 @@ export function registerWorkerTierProxyRoutes(
   for (const route of WORKER_DEPENDENT_PLUGIN_ROUTES) {
     const timeoutMs =
       route.timeoutProfile === "plugin-api" ? pluginApiTimeoutMs : defaultTimeoutMs;
+    const handlers: RequestHandler[] = [];
+    if (route.preProxyAuth === "board-org") {
+      handlers.push(boardOrgAccessProxyGuard);
+    }
+    handlers.push(createWorkerProxyHandler(workersInternalUrl, route.streaming ?? false, timeoutMs));
     router[route.method](
       route.path,
-      createWorkerProxyHandler(workersInternalUrl, route.streaming ?? false, timeoutMs),
+      ...handlers,
     );
   }
   logger.info(

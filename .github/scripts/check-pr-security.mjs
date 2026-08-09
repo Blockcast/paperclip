@@ -192,6 +192,49 @@ function worstSeverity(flags) {
   }, 'low');
 }
 
+export function formatFlagList(flags) {
+  return flags.map(f => [
+    `- \`${f.check}\`: ${f.file ?? ''}`,
+    f.pattern ? ` (pattern: ${f.pattern})` : '',
+    f.packages ? ` (packages: ${f.packages.join(', ')})` : '',
+    f.line ? `\n  \`${f.line}\`` : '',
+  ].join('')).join('\n');
+}
+
+const CHECK_RUN_TEXT_MAX_LENGTH = 60_000;
+const CHECK_RUN_FLAG_MAX_LENGTH = 1_000;
+
+function formatCheckRunFlag(flag) {
+  return [
+    `- \`${flag.check}\`: ${flag.file ?? ''}`,
+    flag.pattern ? ` (pattern: ${flag.pattern})` : '',
+    flag.packages ? ` (packages: ${flag.packages.join(', ')})` : '',
+  ].join('').slice(0, CHECK_RUN_FLAG_MAX_LENGTH);
+}
+
+export function formatCheckRunFlagList(flags) {
+  const header = '**Flags:**\n\n';
+  const lines = [];
+
+  for (const flag of flags) {
+    const line = formatCheckRunFlag(flag);
+    const omitted = flags.length - lines.length - 1;
+    const suffix = omitted > 0 ? `\n\n_${omitted} finding(s) omitted due to check-run output limits._` : '';
+    const candidate = `${header}${[...lines, line].join('\n')}${suffix}`;
+    if (candidate.length > CHECK_RUN_TEXT_MAX_LENGTH) break;
+    lines.push(line);
+  }
+
+  let text;
+  do {
+    const omitted = flags.length - lines.length;
+    const suffix = omitted > 0 ? `\n\n_${omitted} finding(s) omitted due to check-run output limits._` : '';
+    text = `${header}${lines.join('\n')}${suffix}`;
+    if (text.length > CHECK_RUN_TEXT_MAX_LENGTH) lines.pop();
+  } while (text.length > CHECK_RUN_TEXT_MAX_LENGTH);
+  return text;
+}
+
 export function buildAdvisoryPayload(prNumber, prTitle, flags) {
   const checkNames = [...new Set(flags.map(f => f.check))].join(', ');
   return {
@@ -201,12 +244,7 @@ export function buildAdvisoryPayload(prNumber, prTitle, flags) {
     `**Checks triggered:** ${checkNames}`,
     '',
     '**Details:**',
-    ...flags.map(f => [
-      `- \`${f.check}\`: ${f.file ?? ''}`,
-      f.pattern ? ` (pattern: ${f.pattern})` : '',
-      f.packages ? ` (packages: ${f.packages.join(', ')})` : '',
-      f.line ? `\n  \`${f.line}\`` : '',
-    ].join('')),
+    formatFlagList(flags),
     '',
     '> This advisory was created automatically by commitperclip. Review and dismiss if not a real concern.',
     ].join('\n'),
@@ -215,8 +253,8 @@ export function buildAdvisoryPayload(prNumber, prTitle, flags) {
   };
 }
 
-export async function syncDraftAdvisory(fetchImpl, token, repo, prNumber, prTitle, flags) {
-  const existing = await findExistingDraftAdvisory(fetchImpl, token, repo, prNumber);
+export async function syncDraftAdvisory(fetchImpl, token, repo, prNumber, prTitle, flags, { signal } = {}) {
+  const existing = await findExistingDraftAdvisory(fetchImpl, token, repo, prNumber, { signal });
   const payload = buildAdvisoryPayload(prNumber, prTitle, flags);
 
   if (existing) {
@@ -233,6 +271,7 @@ export async function syncDraftAdvisory(fetchImpl, token, repo, prNumber, prTitl
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(patchPayload),
+      signal,
     });
   }
 
@@ -240,6 +279,7 @@ export async function syncDraftAdvisory(fetchImpl, token, repo, prNumber, prTitl
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
+    signal,
   });
 }
 
@@ -247,13 +287,14 @@ export async function syncDraftAdvisory(fetchImpl, token, repo, prNumber, prTitl
 // the security gate (it runs inside a 5-minute workflow timeout).
 const MAX_DRAFT_ADVISORY_PAGES = 20;
 
-export async function findExistingDraftAdvisory(fetchImpl, token, repo, prNumber) {
+export async function findExistingDraftAdvisory(fetchImpl, token, repo, prNumber, { signal } = {}) {
   const prMarker = `PR #${prNumber}`;
 
   for (let page = 1; page <= MAX_DRAFT_ADVISORY_PAGES; page += 1) {
     const advisories = await fetchImpl(
       `/repos/${repo}/security-advisories?state=draft&per_page=100&page=${page}`,
       token,
+      { signal },
     );
 
     if (!Array.isArray(advisories) || advisories.length === 0) return null;
@@ -273,33 +314,51 @@ export async function findExistingDraftAdvisory(fetchImpl, token, repo, prNumber
   return null;
 }
 
-export async function postSecurityCheckRun(fetchImpl, token, repo, headSha, hasFlags) {
+// `advisoryResult` describes what actually happened to the draft-advisory sync
+// so the check-run never asserts an advisory exists when it doesn't:
+//   { ok: true, url }     — advisory created/updated; link it
+//   { ok: false, error }  — sync failed; advisory state may be unknown
+//   null                  — no advisory was attempted at all
+export function buildSecurityCheckRunOutput(hasFlags, flags = [], advisoryResult = null) {
+  if (!hasFlags) {
+    return {
+      title: 'Security Review Passed',
+      summary: 'No security concerns detected.',
+    };
+  }
+
+  if (advisoryResult?.ok) {
+    return {
+      title: 'Security Review Recommended',
+      summary: `Draft advisory filed for maintainer review: ${advisoryResult.url}. Not a merge block — review the advisory at your leisure.`,
+    };
+  }
+
+  const advisoryNote = advisoryResult
+    ? `Draft advisory sync failed (${advisoryResult.error}) — advisory state is unknown.`
+    : 'No draft advisory was created.';
+
+  return {
+    title: 'Security Review Recommended',
+    summary: `${flags.length} security flag(s) detected. ${advisoryNote} Findings are inlined below. Not a merge block.`,
+    text: formatCheckRunFlagList(flags),
+  };
+}
+
+export async function postSecurityCheckRun(fetchImpl, token, repo, headSha, hasFlags, { flags = [], advisoryResult = null } = {}) {
   await fetchImpl(`/repos/${repo}/check-runs`, token, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(hasFlags ? {
+    body: JSON.stringify({
       name: 'security-review',
       head_sha: headSha,
       // `completed/neutral` instead of `in_progress` so the check doesn't put
-      // the PR in `mergeStateStatus: BLOCKED`. The draft advisory is the
-      // durable signal for maintainers; there is no completion path that
-      // could ever flip an `in_progress` check-run back to completed on the
-      // same head SHA, so it would hang forever.
+      // the PR in `mergeStateStatus: BLOCKED`. There is no completion path
+      // that could ever flip an `in_progress` check-run back to completed on
+      // the same head SHA, so it would hang forever.
       status: 'completed',
-      conclusion: 'neutral',
-      output: {
-        title: 'Security Review Recommended',
-        summary: 'Draft advisory filed for maintainer review. Not a merge block — review the advisory at your leisure.',
-      },
-    } : {
-      name: 'security-review',
-      head_sha: headSha,
-      status: 'completed',
-      conclusion: 'success',
-      output: {
-        title: 'Security Review Passed',
-        summary: 'No security concerns detected.',
-      },
+      conclusion: hasFlags ? 'neutral' : 'success',
+      output: buildSecurityCheckRunOutput(hasFlags, flags, advisoryResult),
     }),
   });
 }
@@ -335,7 +394,46 @@ async function warnOnFailure(label, promise) {
   }
 }
 
+export async function postFlaggedSecurityResult(
+  fetchImpl,
+  token,
+  repo,
+  pr,
+  flags,
+  advisoryBudgetMs,
+) {
+  const controller = new AbortController();
+  const budgetError = new Error(`draft advisory sync exceeded ${advisoryBudgetMs}ms wall-clock budget`);
+  let rejectBudget;
+  const budgetExpired = new Promise((_, reject) => { rejectBudget = reject; });
+  const timer = setTimeout(() => {
+    controller.abort(budgetError);
+    rejectBudget(budgetError);
+  }, advisoryBudgetMs);
+
+  let advisoryResult;
+  try {
+    const advisory = await Promise.race([
+      syncDraftAdvisory(fetchImpl, token, repo, pr.number, pr.title, flags, { signal: controller.signal }),
+      budgetExpired,
+    ]);
+    advisoryResult = { ok: true, url: advisory?.html_url };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.warn(`[security] draft advisory sync failed; continuing per always-exit-0 contract: ${message}`);
+    advisoryResult = { ok: false, error: message };
+  } finally {
+    clearTimeout(timer);
+  }
+
+  await warnOnFailure(
+    'security check-run update',
+    postSecurityCheckRun(fetchImpl, token, repo, pr.head.sha, true, { flags, advisoryResult }),
+  );
+}
+
 async function main() {
+  const startedAt = Date.now();
   const watchdog = startScriptWatchdog();
 
   const { GH_TOKEN, GH_REPO, PR_NUMBER } = process.env;
@@ -383,10 +481,18 @@ async function main() {
 
   if (allFlags.length > 0) {
     console.error(`[security] ${allFlags.length} flag(s) detected — creating draft advisory and pending check run`);
-    await Promise.all([
-      warnOnFailure('draft advisory sync', syncDraftAdvisory(ghFetch, GH_TOKEN, GH_REPO, prNumber, pr.title, allFlags)),
-      warnOnFailure('security check-run update', postSecurityCheckRun(ghFetch, GH_TOKEN, GH_REPO, pr.head.sha, true)),
-    ]);
+
+    // Reserve enough of the global watchdog for ghFetch's 15-second check-run
+    // POST timeout plus cleanup, even if earlier GitHub reads were slow.
+    const advisoryBudgetMs = Math.max(0, SCRIPT_WATCHDOG_MS - (Date.now() - startedAt) - 20_000);
+    await postFlaggedSecurityResult(
+      ghFetch,
+      GH_TOKEN,
+      GH_REPO,
+      { ...pr, number: prNumber },
+      allFlags,
+      advisoryBudgetMs,
+    );
   } else {
     console.log('[security] all clear');
     await warnOnFailure('security check-run update', postSecurityCheckRun(ghFetch, GH_TOKEN, GH_REPO, pr.head.sha, false));

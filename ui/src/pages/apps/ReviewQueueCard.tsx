@@ -44,7 +44,7 @@ export function ReviewQueueCard({
     refetchOnMount: false,
     refetchInterval: (state) => {
       const visibleItems = filterActionRequests(state.state.data?.actionRequests, connectionId);
-      return emptyState !== "hidden" && visibleItems.length === 0
+      return emptyState !== "hidden" && state.state.status === "success" && visibleItems.length === 0
         ? VISIBLE_EMPTY_QUEUE_REFRESH_MS
         : 20_000;
     },
@@ -60,16 +60,6 @@ export function ReviewQueueCard({
     didRefetchOnMountForCompany.current = selectedCompanyId;
     void query.refetch();
   }, [query.dataUpdatedAt, query.fetchStatus, query.refetch, selectedCompanyId]);
-
-  // Keeping an empty queue fresh is `refetchInterval`'s job alone. A second
-  // setTimeout loop used to do the same thing here: because its deps include
-  // `query.dataUpdatedAt`, each refetch re-ran the effect and re-armed the
-  // timer, so it was a full VISIBLE_EMPTY_QUEUE_REFRESH_MS poll rather than the
-  // one-shot it read as -- two independent timers at the same cadence, double
-  // the requests, and a test that could only assert `>=` call counts and so
-  // could not tell the difference. The interval above subsumes it, including
-  // the deliberate 20s backoff when `emptyState === "hidden"`, where the card
-  // renders nothing and does not warrant a 2s poll.
 
   if (!selectedCompanyId) return null;
   if (query.isLoading) return null;
