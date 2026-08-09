@@ -40,7 +40,12 @@ import { HEARTBEAT_RUN_STATUSES, type HeartbeatRunStatus } from "@paperclipai/sh
  * column, and treating an unknown-but-clearly-dead status as holding a lock
  * would strand the issue forever. Fail toward releasing.
  */
-export const TERMINAL_HEARTBEAT_RUN_STATUSES: ReadonlySet<string> = new Set([
+// Keep the terminal statuses as a non-empty tuple as well as a lookup set.
+// Drizzle's `notInArray()` intentionally returns `undefined` for an arbitrary
+// possibly-empty array, whereas the timer availability query needs a required
+// SQL predicate. This tuple proves that the SQL list is non-empty and the Set
+// remains the single membership source for in-memory lock decisions.
+export const TERMINAL_HEARTBEAT_RUN_STATUS_VALUES: [
   "succeeded",
   "interrupted",
   "failed",
@@ -48,7 +53,19 @@ export const TERMINAL_HEARTBEAT_RUN_STATUSES: ReadonlySet<string> = new Set([
   "adapter_failed",
   "cancelled",
   "timed_out",
-]);
+] = [
+  "succeeded",
+  "interrupted",
+  "failed",
+  "error",
+  "adapter_failed",
+  "cancelled",
+  "timed_out",
+];
+
+export const TERMINAL_HEARTBEAT_RUN_STATUSES: ReadonlySet<string> = new Set<string>(
+  TERMINAL_HEARTBEAT_RUN_STATUS_VALUES,
+);
 
 /**
  * Non-terminal statuses whose lock is reclaimable only when the run never

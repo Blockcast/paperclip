@@ -205,6 +205,7 @@ import { issueService } from "./issues.js";
 import {
   ISSUE_EXECUTION_LOCK_HOLDING_RUN_STATUSES,
   ISSUE_EXECUTION_LOCK_REAPABLE_NEVER_STARTED_RUN_STATUSES,
+  TERMINAL_HEARTBEAT_RUN_STATUS_VALUES,
   TERMINAL_HEARTBEAT_RUN_STATUSES,
 } from "./issue-execution-lock.js";
 import { resolveStaleDependabotAlertWakeIssue } from "./dependabot-alert-issues.js";
@@ -15066,7 +15067,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             // including a status introduced by a newer deployment. Its only
             // additional availability path is a queued/retry row that never
             // started, which checkout can cancel and adopt once this run starts.
-            notInArray(heartbeatRuns.status, [...TERMINAL_HEARTBEAT_RUN_STATUSES]),
+            notInArray(heartbeatRuns.status, TERMINAL_HEARTBEAT_RUN_STATUS_VALUES),
             not(
               and(
                 inArray(

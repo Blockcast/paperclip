@@ -3,6 +3,7 @@ import { HEARTBEAT_RUN_STATUSES } from "@paperclipai/shared";
 import {
   ISSUE_EXECUTION_LOCK_HOLDING_RUN_STATUSES,
   ISSUE_EXECUTION_LOCK_REAPABLE_NEVER_STARTED_RUN_STATUSES,
+  TERMINAL_HEARTBEAT_RUN_STATUS_VALUES,
   TERMINAL_HEARTBEAT_RUN_STATUSES,
   runStatusHoldsIssueExecutionLock,
 } from "../services/issue-execution-lock.js";
@@ -28,6 +29,10 @@ describe("issue execution-lock run statuses", () => {
         `"${status}" must be exactly one of holding/terminal, got holds=${holds} terminal=${terminal}`,
       ).toBe(true);
     }
+  });
+
+  it("keeps the SQL-safe terminal tuple and lock lookup set in sync", () => {
+    expect([...TERMINAL_HEARTBEAT_RUN_STATUSES]).toEqual(TERMINAL_HEARTBEAT_RUN_STATUS_VALUES);
   });
 
   it("treats scheduled_retry as holding the lock", () => {
