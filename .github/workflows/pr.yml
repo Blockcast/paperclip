@@ -415,6 +415,12 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      # Match the sibling test lanes, which reach vitest through `pnpm test:run:*`
+      # and so always relink stale workspace packages first. This lane invokes
+      # vitest directly, so it has to run the preflight itself.
+      - name: Ensure workspace package links
+        run: pnpm run preflight:workspace-links
+
       - name: Run the focused regression three times from a clean OpenCode home
         run: |
           set -euo pipefail
