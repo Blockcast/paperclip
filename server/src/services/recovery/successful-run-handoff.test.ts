@@ -110,10 +110,14 @@ describe("successful run handoff decision", () => {
     if (decision.kind !== "enqueue") return;
     expect(decision.payload).not.toHaveProperty("modelProfile");
     expect(decision.payload).not.toHaveProperty("recoveryIntent");
+    expect(decision.payload).not.toHaveProperty("allowDeliverableWork");
     expect(decision.payload).not.toHaveProperty("allowDocumentUpdates");
     expect(decision.payload).not.toHaveProperty("resumeRequiresNormalModel");
     expect(decision.contextSnapshot).not.toHaveProperty("modelProfile");
     expect(decision.contextSnapshot).not.toHaveProperty("recoveryIntent");
+    expect(decision.contextSnapshot).not.toHaveProperty("allowDeliverableWork");
+    expect(decision.contextSnapshot).not.toHaveProperty("allowDocumentUpdates");
+    expect(decision.contextSnapshot).not.toHaveProperty("resumeRequiresNormalModel");
     expect(decision.instruction).toContain("normal-model planning continuation");
     expect(decision.instruction).toContain("Complete the required plan or issue-document update");
     expect(decision.instruction).not.toContain("document or plan updates are not allowed");
