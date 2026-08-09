@@ -7,6 +7,7 @@ import {
   agents,
   companies,
   createDb,
+  detachedQueuedRunRecoveries,
   externalRuntimeReservations,
   heartbeatRunEvents,
   heartbeatRuns,
@@ -401,13 +402,8 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     expect(second.cleared).toBe(0);
   });
 
-  // BLO-18995: four enqueue paths stamp executionRunId/executionLockedAt at
-  // *enqueue* time next to a freshly-inserted `queued` run instead of lazily at
-  // claim time. `queued` is neither missing nor terminal, so isCleanable()
-  // returned false forever and this sweeper — the designated backstop — never
-  // cleared the lock, while enqueueWakeup parked every later wake for the issue
-  // as `deferred_issue_execution` behind a holder that may never start. There
-  // was no timeout anywhere in the path. Observed live on BLO-18939.
+  // BLO-18995: preserve upgrade cleanup for pre-claim locks written by older
+  // deployments, even though current enqueue paths no longer create them.
   it("clears an execution lock held past the timeout by a run that never started (BLO-18995)", async () => {
     const { companyId, agentId, queuedRunId } = await seed();
     const issueId = randomUUID();
@@ -448,6 +444,13 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       .where(eq(heartbeatRuns.id, queuedRunId))
       .then((rows) => rows[0]);
     expect(run?.status).toBe("queued");
+
+    const detachment = await db
+      .select({ issueId: detachedQueuedRunRecoveries.issueId, status: detachedQueuedRunRecoveries.status })
+      .from(detachedQueuedRunRecoveries)
+      .where(eq(detachedQueuedRunRecoveries.sourceRunId, queuedRunId))
+      .then((rows) => rows[0]);
+    expect(detachment).toEqual({ issueId, status: "detached" });
 
     const audit = await db
       .select({ details: activityLog.details })
@@ -774,7 +777,7 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     expect(row?.executionLockedAt?.getTime()).toBe(refreshedLockedAt.getTime());
   });
 
-  it("promotes the oldest eligible deferred issue wake after clearing an expired pre-claim lock", async () => {
+  it("promotes the oldest eligible deferred issue wake without binding its queued run", async () => {
     const { companyId, agentId, queuedRunId } = await seed();
     const issueId = randomUUID();
     const deferredWakeId = randomUUID();
@@ -871,9 +874,11 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       .from(issues)
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0]);
-    expect(issue?.executionRunId).toBe(wake?.runId);
-    expect(issue?.executionAgentNameKey).toBe("coder");
-    expect(issue?.executionLockedAt).not.toBeNull();
+    expect(issue).toEqual({
+      executionRunId: null,
+      executionAgentNameKey: null,
+      executionLockedAt: null,
+    });
 
     const originalRun = await db
       .select({ status: heartbeatRuns.status })

@@ -117,6 +117,49 @@ describeEmbeddedPostgres("activity service", () => {
     expect(result.map((event) => event.action)).toEqual(["test.newest", "test.middle"]);
   });
 
+  it("filters company activity lists by action", async () => {
+    const companyId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(activityLog).values([
+      {
+        companyId,
+        actorType: "system",
+        actorId: "system",
+        action: "issue_write_denied",
+        entityType: "issue",
+        entityId: randomUUID(),
+        createdAt: new Date("2026-04-21T10:00:00.000Z"),
+      },
+      {
+        companyId,
+        actorType: "system",
+        actorId: "system",
+        action: "issue.updated",
+        entityType: "issue",
+        entityId: randomUUID(),
+        createdAt: new Date("2026-04-21T11:00:00.000Z"),
+      },
+    ]);
+
+    const result = await activityService(db).list({ companyId, action: "issue_write_denied" });
+
+    expect(result).toHaveLength(1);
+    expect(result[0]?.action).toBe("issue_write_denied");
+
+    const bogusResult = await activityService(db).list({ companyId, action: "no_such_action" });
+    expect(bogusResult).toEqual([]);
+
+    const emptyActionResult = await activityService(db).list({ companyId, action: "" });
+    expect(emptyActionResult).toEqual([]);
+  });
+
   it("returns compact usage and result summaries for issue runs", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
