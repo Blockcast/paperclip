@@ -74,13 +74,10 @@ export const ISSUE_EXECUTION_LOCK_HOLDING_RUN_STATUSES: readonly HeartbeatRunSta
  * costs a deferral, whereas being wrong the other way lets two runs edit one
  * worktree.
  *
- * SQL call sites deliberately invert that bias. They filter with
- * `inArray(status, ISSUE_EXECUTION_LOCK_HOLDING_RUN_STATUSES)` — an enumeration,
- * so an unrecognised status reads as NOT holding and the issue reads as
- * available. There the failure mode is reversed: a wake that runs unnecessarily
- * wastes one run, but an issue wrongly judged "held" by a status nothing will
- * ever clear is stranded with no wake path at all. Both directions fail toward
- * the recoverable error; they differ because the recoverable error differs.
+ * SQL call sites that decide whether work is checkoutable must use the same
+ * terminal-status predicate. An enumeration of the known holding statuses would
+ * make a newly persisted non-terminal status look available, dispatch a wake,
+ * and then immediately receive the checkout conflict this predicate prevents.
  */
 export function runStatusHoldsIssueExecutionLock(status: string | null | undefined): boolean {
   if (!status) return false;

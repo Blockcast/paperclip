@@ -54,8 +54,8 @@ describe("issue execution-lock run statuses", () => {
   });
 
   it("holds the lock for any non-terminal status, so a new status cannot silently free a live issue", () => {
-    // Strict-complement bias, and the opposite of what the SQL enumeration does
-    // with the same input — see the note on runStatusHoldsIssueExecutionLock.
+    // SQL availability checks must use this same terminal complement rather
+    // than treating the known holding-status array as a closed enum.
     expect(runStatusHoldsIssueExecutionLock("some_future_live_status")).toBe(true);
     expect(ISSUE_EXECUTION_LOCK_HOLDING_RUN_STATUSES as readonly string[]).not.toContain(
       "some_future_live_status",

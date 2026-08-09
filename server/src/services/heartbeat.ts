@@ -202,7 +202,10 @@ import {
   WorkspaceRepoMismatchError,
 } from "./workspace-runtime.js";
 import { issueService } from "./issues.js";
-import { ISSUE_EXECUTION_LOCK_HOLDING_RUN_STATUSES } from "./issue-execution-lock.js";
+import {
+  ISSUE_EXECUTION_LOCK_HOLDING_RUN_STATUSES,
+  TERMINAL_HEARTBEAT_RUN_STATUSES,
+} from "./issue-execution-lock.js";
 import { resolveStaleDependabotAlertWakeIssue } from "./dependabot-alert-issues.js";
 import { createToolGatewayService } from "./tool-gateway.js";
 import { toolAccessService } from "./tool-access.js";
@@ -15037,8 +15040,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    *
    * Availability is therefore checked against the same lock columns `checkout()`
    * blocks on. Note there is no self-exclusion to make here: the predicate runs
-   * before this wake's run row exists, so *any* non-terminal holder — including
-   * another run of this same agent — is a run this wake would lose to.
+   * before this wake's run row exists, so *any* holder whose status is not
+   * terminal — including another run of this same agent or a future persisted
+   * status — is a run this wake would lose to.
    *
    * Deliberately still counted as actionable: an issue whose blockers are
    * unresolved. `checkout()` 422s on those, so they are not workable either, but
@@ -15055,7 +15059,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           and(
             eq(heartbeatRuns.companyId, issues.companyId),
             or(eq(heartbeatRuns.id, issues.checkoutRunId), eq(heartbeatRuns.id, issues.executionRunId)),
-            inArray(heartbeatRuns.status, [...ISSUE_EXECUTION_LOCK_HOLDING_RUN_STATUSES]),
+            // Keep this as the terminal complement rather than enumerating known
+            // holding statuses. `checkout()` retains every non-terminal status,
+            // including a status introduced by a newer deployment, so the timer
+            // must not dispatch a wake that checkout will immediately reject.
+            notInArray(heartbeatRuns.status, [...TERMINAL_HEARTBEAT_RUN_STATUSES]),
           ),
         ),
     );
