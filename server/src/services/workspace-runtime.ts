@@ -735,6 +735,18 @@ function createProcessOutputCapture(maxBytes: number): ProcessOutputAccumulator 
   };
 }
 
+/**
+ * `process.kill(-pgid, 0)` cannot distinguish a running process group from a
+ * group leader that has exited but not yet been reaped by its parent: the
+ * kernel keeps a zombie's PID reserved until `wait()` is called, so signal 0
+ * still succeeds against it. That makes an unreaped-zombie leader read as
+ * "alive". Accepted as a documented false *degrade* (a live tree misreported
+ * as gone would be the dangerous direction; this is the safe one) rather than
+ * corrected -- the alternative is parsing `/proc/<pid>/stat` for state `Z`,
+ * which is Linux-only and buys a nuisance fix on the safe side of the
+ * failure. See the `isProcessGroupAlive` test coverage for the documented
+ * behaviour.
+ */
 function isProcessGroupAlive(processGroupId: number): boolean {
   if (process.platform === "win32") return false;
   if (processGroupLivenessProbeForTests) return processGroupLivenessProbeForTests(processGroupId);
@@ -874,11 +886,22 @@ async function executeProcess(input: {
       timeoutTimer = globalThis.setTimeout(() => {
         timedOut = true;
         terminateChildProcess(child, "SIGTERM");
+        // Settle from *this* timer, not from the SIGTERM callback above: a
+        // child wedged in uninterruptible I/O (D state) never delivers
+        // SIGKILL, so it emits neither `exit` nor `close`, and without this
+        // the wall-clock budget stops being enforced the moment SIGKILL is
+        // merely scheduled -- the exact stranding BLO-18784 removed, reached
+        // by a different route (BLO-20047). Settling here instead of inline
+        // on SIGTERM preserves the 5s grace for a child that honours it.
+        // `settle` already escalates to SIGKILL + a bounded liveness wait
+        // when `timedOut`, so the redundant kill below is harmless.
+        // Must hold the event loop open to fire even with nothing else
+        // pending -- do not `.unref()` it.
         killTimer = globalThis.setTimeout(() => {
           killTimer = null;
           terminateChildProcess(child, "SIGKILL");
+          settle(null, { destroyStreams: true });
         }, 5_000);
-        killTimer.unref?.();
       }, timeoutMs);
     }
     child.stdout?.on("data", onStdoutData);
@@ -947,6 +970,15 @@ async function executeProcess(input: {
  * `setSubmoduleInspectSettingsForTests`.
  */
 export const executeProcessForTests = executeProcess;
+
+/**
+ * Test seam for `isProcessGroupAlive`. Every other test drives the
+ * `setProcessGroupLivenessProbeForTests` override, which proves the policy
+ * built on top of this function but never exercises the primitive itself --
+ * see its doc comment for the accepted zombie-leader false positive this is
+ * meant to cover.
+ */
+export const isProcessGroupAliveForTests = isProcessGroupAlive;
 
 /**
  * Raised when a git subprocess exceeded its wall-clock budget. Distinguished from
@@ -2873,10 +2905,25 @@ function describeSubmoduleInspectionDegradation(cwd: string, inspection: { reaso
  * Best-effort: bookkeeping must not defeat the point of degrading. If the
  * recorder itself fails we swallow it and still let the run proceed -- the
  * human-readable warning is returned to the caller either way.
+ *
+ * `cause` separates two operationally distinct degrades that used to share
+ * this one action name with no other structured distinction: `inconclusive_
+ * probe` means the probe itself never reached a conclusion (retries
+ * exhausted with no evidence either way); `repair_withheld` means the probe
+ * *did* find a real fault (missing submodules, from salvaged partial output)
+ * but automatic repair was skipped because the previous timed-out process
+ * group was still alive. Evidence queries need this to be a stable field, not
+ * a prose match on `reason`.
  */
 async function recordSubmoduleInspectionDegradation(
   recorder: WorkspaceOperationRecorder | null | undefined,
-  input: { cwd: string; reason: string; attempts: number; stage: "initial" | "post_repair" },
+  input: {
+    cwd: string;
+    reason: string;
+    attempts: number;
+    stage: "initial" | "post_repair";
+    cause: "inconclusive_probe" | "repair_withheld";
+  },
 ): Promise<void> {
   if (!recorder) return;
   const settings = readSubmoduleInspectSettings();
@@ -2889,6 +2936,7 @@ async function recordSubmoduleInspectionDegradation(
         cwd: input.cwd,
         action: "submodule_inspection_degraded",
         stage: input.stage,
+        cause: input.cause,
         attempts: input.attempts,
         timeoutMs: settings.timeoutMs,
         reason: input.reason,
@@ -2926,6 +2974,7 @@ async function ensureGitSubmodulesReady(input: {
       reason: inspection.reason,
       attempts: inspection.attempts,
       stage: "initial",
+      cause: "inconclusive_probe",
     });
     return [warning];
   }
@@ -2960,6 +3009,7 @@ async function ensureGitSubmodulesReady(input: {
       reason,
       attempts: inspection.attempts ?? 1,
       stage: "initial",
+      cause: "repair_withheld",
     });
     return [
       `Could not safely initialize git submodules for execution workspace "${input.cwd}" (${missingPaths.join(", ")}): ` +
@@ -3034,6 +3084,7 @@ async function ensureGitSubmodulesReady(input: {
       reason: verification.reason,
       attempts: verification.attempts,
       stage: "post_repair",
+      cause: "inconclusive_probe",
     });
     return [
       `Initialized git submodules before starting: ${missingPaths.join(", ")}`,
