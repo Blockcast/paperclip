@@ -1,15 +1,25 @@
 import { spawn } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
 const statefulSetPath = path.join(repoRoot, "deploy/helm/paperclip/templates/statefulset.yaml");
 const opencodeBin = path.join(repoRoot, "server/node_modules/.bin/opencode");
+// Steady-state bound for a regression run: once the state home is migrated, a healthy run finishes
+// in well under this, so it still fails fast on a genuinely hung subprocess while leaving room for
+// slower CI hosts. Most of a healthy run is the deliberate CALLER_TIMEOUT_MS hung-call assertion.
+const RUN_WATCHDOG_MS = 60_000;
+// OpenCode migrates its SQLite store once per state home and warns the migration "may take a few
+// minutes". That is startup cost, not regression work, so it gets a budget of its own.
+const MIGRATION_TIMEOUT_MS = 240_000;
+// Keep the vitest budget above both spawns' watchdogs so a hang is reported by the watchdog, with
+// its stdout/stderr diagnostics, rather than as an opaque vitest timeout.
+const TEST_TIMEOUT_MS = RUN_WATCHDOG_MS * 2 + 30_000;
 const IDLE_WINDOW_MS = 610_000;
 const OPENCODE_FALLBACK_TIMEOUT_MS = 1_000;
 const CALLER_TIMEOUT_MS = 10_000;
@@ -33,6 +43,10 @@ type CapturedCall = PlannedCall & {
 
 const servers: Server[] = [];
 const tempDirs: string[] = [];
+const suiteDirs: string[] = [];
+// One migrated OpenCode state home is shared by every spawn in this suite; each spawn still gets
+// its own project directory, so runs stay isolated without re-paying the migration.
+let opencodeStateHome = "";
 
 function readK8sRoSeed(): SeedEntry {
   const source = readFileSync(statefulSetPath, "utf8");
@@ -309,9 +323,65 @@ async function startModelFixture(
   return { baseUrl: await listen(server) };
 }
 
+function opencodeEnv(home: string, extra: Record<string, string> = {}) {
+  return {
+    ...process.env,
+    HOME: home,
+    XDG_CONFIG_HOME: path.join(home, ".config"),
+    XDG_DATA_HOME: path.join(home, ".local/share"),
+    XDG_STATE_HOME: path.join(home, ".local/state"),
+    XDG_CACHE_HOME: path.join(home, ".cache"),
+    OPENCODE_DISABLE_PROJECT_CONFIG: "1",
+    OPENCODE_DISABLE_AUTOUPDATE: "1",
+    OPENCODE_DISABLE_AUTOCOMPACT: "1",
+    OPENCODE_DISABLE_MODELS_FETCH: "1",
+    ...extra,
+  };
+}
+
+function spawnOpenCode(
+  args: string[],
+  options: { cwd: string; env: NodeJS.ProcessEnv; timeoutMs: number; label: string },
+) {
+  return new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+    const child = spawn(opencodeBin, args, {
+      cwd: options.cwd,
+      stdio: ["ignore", "pipe", "pipe"],
+      env: options.env,
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
+    child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+    let watchdogExpired = false;
+    const watchdog = setTimeout(() => {
+      watchdogExpired = true;
+      child.kill("SIGKILL");
+    }, options.timeoutMs);
+    let settled = false;
+    const settle = (action: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(watchdog);
+      action();
+    };
+    child.once("error", (error) => settle(() => reject(error)));
+    child.once("close", (code) => {
+      settle(() => {
+        if (watchdogExpired) {
+          reject(new Error(
+            `${options.label} timed out after ${options.timeoutMs}ms\nstdout:\n${stdout}\nstderr:\n${stderr}`,
+          ));
+        } else if (code === 0) resolve({ stdout, stderr });
+        else reject(new Error(`${options.label} exited ${code}\nstdout:\n${stdout}\nstderr:\n${stderr}`));
+      });
+    });
+  });
+}
+
 async function runOpenCode(mcpUrl: string, modelUrl: string) {
-  const home = mkdtempSync(path.join(tmpdir(), "paperclip-opencode-k8s-"));
-  tempDirs.push(home);
+  const project = mkdtempSync(path.join(tmpdir(), "paperclip-opencode-k8s-"));
+  tempDirs.push(project);
   const config = {
     share: "disabled",
     autoupdate: false,
@@ -348,56 +418,40 @@ async function runOpenCode(mcpUrl: string, modelUrl: string) {
     permission: { "*": "allow" },
   };
 
-  return new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
-    const child = spawn(
-      opencodeBin,
-      ["run", "--model", "fake/fake-model", "--format", "json", "--title", "k8s-ro-regression", "Run the deterministic Kubernetes reads."],
-      {
-        cwd: home,
-        stdio: ["ignore", "pipe", "pipe"],
-        env: {
-          ...process.env,
-          HOME: home,
-          XDG_CONFIG_HOME: path.join(home, ".config"),
-          XDG_DATA_HOME: path.join(home, ".local/share"),
-          XDG_STATE_HOME: path.join(home, ".local/state"),
-          XDG_CACHE_HOME: path.join(home, ".cache"),
-          OPENCODE_CONFIG_CONTENT: JSON.stringify(config),
-          OPENCODE_AUTH_CONTENT: "{}",
-          OPENCODE_DISABLE_PROJECT_CONFIG: "1",
-          OPENCODE_DISABLE_AUTOUPDATE: "1",
-          OPENCODE_DISABLE_AUTOCOMPACT: "1",
-          OPENCODE_DISABLE_MODELS_FETCH: "1",
-        },
-      },
-    );
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
-    child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
-    let watchdogExpired = false;
-    const watchdog = setTimeout(() => {
-      watchdogExpired = true;
-      child.kill("SIGKILL");
-    }, 30_000);
-    let settled = false;
-    const settle = (action: () => void) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(watchdog);
-      action();
-    };
-    child.once("error", (error) => settle(() => reject(error)));
-    child.once("close", (code) => {
-      settle(() => {
-        if (watchdogExpired) {
-          reject(new Error(`OpenCode regression timed out\nstdout:\n${stdout}\nstderr:\n${stderr}`));
-        } else if (code === 0) resolve({ stdout, stderr });
-        else reject(new Error(`OpenCode exited ${code}\nstdout:\n${stdout}\nstderr:\n${stderr}`));
-      });
-    });
-  });
+  return spawnOpenCode(
+    ["run", "--model", "fake/fake-model", "--format", "json", "--title", "k8s-ro-regression", "Run the deterministic Kubernetes reads."],
+    {
+      cwd: project,
+      env: opencodeEnv(opencodeStateHome, {
+        OPENCODE_CONFIG_CONTENT: JSON.stringify(config),
+        OPENCODE_AUTH_CONTENT: "{}",
+      }),
+      timeoutMs: RUN_WATCHDOG_MS,
+      label: "OpenCode regression",
+    },
+  );
 }
+
+beforeAll(async () => {
+  opencodeStateHome = mkdtempSync(path.join(tmpdir(), "paperclip-opencode-home-"));
+  suiteDirs.push(opencodeStateHome);
+  // Pay OpenCode's one-time SQLite migration here rather than inside a regression run's watchdog:
+  // `db path` initializes the store and prints its location, and every later spawn reuses it.
+  const { stdout } = await spawnOpenCode(["db", "path"], {
+    cwd: opencodeStateHome,
+    env: opencodeEnv(opencodeStateHome),
+    timeoutMs: MIGRATION_TIMEOUT_MS,
+    label: "OpenCode state migration",
+  });
+  const dbPath = stdout.trim().split("\n").pop()?.trim() ?? "";
+  // If a future OpenCode release stops migrating here, the migration would silently move back
+  // inside a run's watchdog and the cold-start flake would return; fail loudly instead.
+  expect(existsSync(dbPath)).toBe(true);
+}, MIGRATION_TIMEOUT_MS + 30_000);
+
+afterAll(() => {
+  while (suiteDirs.length) rmSync(suiteDirs.pop()!, { recursive: true, force: true });
+});
 
 afterEach(async () => {
   while (servers.length) {
@@ -473,6 +527,11 @@ describe("opencode_k8s production k8s-ro connector after idle", () => {
     expect(timeoutObservedMs).toBeLessThanOrEqual(
       CALLER_TIMEOUT_MS + FIXTURE_CLOSE_OBSERVATION_TOLERANCE_MS,
     );
+    // A healthy run spends most of its time deliberately waiting out the hung call above, so the
+    // watchdog has to outlast that by a wide margin or it would kill passing runs on slow hosts.
+    expect(RUN_WATCHDOG_MS).toBeGreaterThan(
+      (CALLER_TIMEOUT_MS + FIXTURE_CLOSE_OBSERVATION_TOLERANCE_MS) * 3,
+    );
     console.info("[k8s-ro regression] post-idle Pod/PVC/Event/Node passed in one OpenCode session; timeout bounded");
-  }, 75_000);
+  }, TEST_TIMEOUT_MS);
 });
