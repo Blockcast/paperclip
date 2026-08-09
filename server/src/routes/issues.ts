@@ -2002,6 +2002,7 @@ async function assertCanManageIssueMonitor(
     // `assertAgentIssueMutationAllowed` has already allowed this mutation via
     // `allow_productivity_review_grant` (BLO-19723). See the call site.
     productivityReviewOwnerAuthorized?: boolean;
+    managerMonitorRearmAuthorized?: boolean;
   } = {},
 ) {
   if (!monitorChanged) return;
@@ -2039,6 +2040,7 @@ async function assertCanManageIssueMonitor(
   //   * still behind `runtime:manage` above — the review grant substitutes for
   //     the assignee *relation*, not for the runtime capability.
   if (options.productivityReviewOwnerAuthorized) return;
+  if (options.managerMonitorRearmAuthorized) return;
   throw forbidden(
     "Only the assignee agent or a board user can manage issue monitors",
     {
@@ -2052,6 +2054,7 @@ async function assertCanManageIssueMonitor(
         "the issue's assignee agent",
         "the agent holding the issue's current execution run",
         "the owner of an open productivity review of this issue (PATCH /issues/:id only)",
+        "a manager in the assignee's reporting chain re-arming a triggered monitor (PATCH /issues/:id only)",
       ],
     },
   );
@@ -5207,6 +5210,21 @@ export function issueRoutes(
     return commentDecision;
   }
 
+  function isLapsedMonitorRearmPatch(
+    issue: {
+      status: string;
+      executionState?: unknown;
+      monitorNextCheckAt?: Date | null;
+    },
+    body: Record<string, unknown>,
+  ) {
+    if (!["in_progress", "in_review"].includes(issue.status) || issue.monitorNextCheckAt) return false;
+    if (Object.keys(body).length !== 1 || body.executionPolicy == null) return false;
+    const currentMonitor = parseIssueExecutionState(issue.executionState)?.monitor ?? null;
+    if (currentMonitor?.status !== "triggered") return false;
+    return Boolean(normalizeIssueExecutionPolicy(body.executionPolicy)?.monitor);
+  }
+
   async function assertAgentIssueMutationAllowed(
     req: Request,
     res: Response,
@@ -5240,6 +5258,7 @@ export function issueRoutes(
       allowCoordinationMetadata?: boolean;
       allowManagerChainNonInvokableReroute?: boolean;
       onManagerChainNonInvokableRerouteAllowed?: () => void;
+      allowManagerMonitorRearm?: boolean;
       /**
        * PATCH /issues/:id only: when an execution-stage currentParticipant and
        * issue assignee diverge, the participant must still be able to submit a
@@ -5282,6 +5301,9 @@ export function issueRoutes(
     // inside this shared helper reaches ~two dozen mutation routes, so the
     // gate has to live at the caller that knows what is being written.
     if (options.allowCoordinationMetadata) {
+      return true;
+    }
+    if (options.allowManagerMonitorRearm) {
       return true;
     }
     if (isCurrentIssueExecutionRun(req, issue)) {
@@ -9884,6 +9906,15 @@ export function issueRoutes(
         coordinationMetadataFields,
       )
       : null;
+    const managerMonitorRearmDecision =
+      req.actor.type === "agent" &&
+      isLapsedMonitorRearmPatch(existing, req.body as Record<string, unknown>)
+        ? await decideIssueAccess(req, existing, "issue:comment")
+        : null;
+    const managerMonitorRearmAuthorized = Boolean(
+      managerMonitorRearmDecision &&
+      managerMonitorRearmDecision.reason === "allow_manager_chain",
+    );
     if (!(await assertAgentIssueMutationAllowed(
       req,
       res,
@@ -9904,6 +9935,7 @@ export function issueRoutes(
         onManagerChainNonInvokableRerouteAllowed: () => {
           managerChainNonInvokableRerouteAllowed = true;
         },
+        allowManagerMonitorRearm: managerMonitorRearmAuthorized,
         // BLO-18797: the delegate-recovery path. The helper additionally
         // requires a blocked -> todo patch containing only status and
         // blockedByIssueIds.
@@ -10200,6 +10232,7 @@ export function issueRoutes(
         // the reason differs, the audit stays null, and this guard keeps its
         // pre-existing behaviour — fail-closed.
         productivityReviewOwnerAuthorized: productivityReviewSourceMutationAudit.current !== null,
+        managerMonitorRearmAuthorized,
       },
     );
 

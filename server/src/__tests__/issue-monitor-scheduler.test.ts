@@ -26,7 +26,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { heartbeatService } from "../services/heartbeat.js";
+import { heartbeatService, ISSUE_MONITOR_DISPATCH_LAPSE_MS } from "../services/heartbeat.js";
 import {
   DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS,
   normalizeIssueExecutionPolicy,
@@ -289,6 +289,51 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       .where(eq(activityLog.entityId, issueId))
       .then((rows) => rows.map((row) => row.action));
     expect(activity).toContain("issue.monitor_triggered");
+  });
+
+  it("re-arms a triggered monitor when its wake-carrying run does not dispatch", async () => {
+    const { issueId } = await seedFixture();
+    const heartbeat = heartbeatService(db, { skipQueuedRunDispatch: true });
+    heartbeatServices.add(heartbeat);
+    const triggeredAt = new Date("2026-04-11T12:31:00.000Z");
+
+    await heartbeat.tickTimers(triggeredAt);
+    const queuedRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.status, "queued"))
+      .then((rows) => rows[0]!);
+    await db
+      .update(heartbeatRuns)
+      .set({ createdAt: new Date(triggeredAt.getTime() - ISSUE_MONITOR_DISPATCH_LAPSE_MS) })
+      .where(eq(heartbeatRuns.id, queuedRun.id));
+    await db
+      .update(issues)
+      .set({ executionRunId: queuedRun.id })
+      .where(eq(issues.id, issueId));
+
+    const lapseDetectedAt = new Date(triggeredAt.getTime() + ISSUE_MONITOR_DISPATCH_LAPSE_MS);
+    await heartbeat.tickTimers(lapseDetectedAt);
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "cancelled", finishedAt: lapseDetectedAt })
+      .where(eq(heartbeatRuns.id, queuedRun.id));
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(issue.monitorNextCheckAt?.getTime()).toBeGreaterThan(lapseDetectedAt.getTime());
+    expect(normalizeIssueExecutionPolicy(issue.executionPolicy)?.monitor).toMatchObject({
+      serviceName: "paperclip_monitor_dispatch",
+      gateSignals: [`heartbeat_run:${queuedRun.id}`],
+    });
+    expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({ status: "scheduled" });
+    expect(issue.monitorAttemptCount, "a wake that never dispatched does not consume an attempt").toBe(0);
+
+    const activity = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, issueId));
+    expect(activity.map((row) => row.action)).toContain("issue.monitor_rearmed_after_dispatch_lapse");
+
   });
 
   it("wakes a cross-agent review participant for provider quota monitors", async () => {

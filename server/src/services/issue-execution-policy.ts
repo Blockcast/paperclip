@@ -1367,6 +1367,33 @@ export function buildIssueMonitorTriggeredPatch(input: {
   };
 }
 
+export function buildIssueMonitorDispatchRearmPatch(input: {
+  issue: IssueLike;
+  policy: IssueExecutionPolicy;
+}) {
+  const existingState = parseIssueExecutionState(input.issue.executionState);
+  const currentMonitorState = derivePersistedMonitorState({
+    issue: input.issue,
+    state: existingState,
+    policy: input.policy,
+  });
+  const restoredAttemptCount = Math.max(0, (currentMonitorState?.attemptCount ?? 1) - 1);
+  const previousMonitorState = currentMonitorState
+    ? { ...currentMonitorState, attemptCount: restoredAttemptCount }
+    : null;
+  const nextMonitorState = buildScheduledMonitorState(previousMonitorState, input.policy.monitor!);
+
+  return {
+    executionPolicy: input.policy as unknown as Record<string, unknown>,
+    executionState: executionStateWithMonitor(existingState, nextMonitorState) as Record<string, unknown> | null,
+    monitorNextCheckAt: new Date(input.policy.monitor!.nextCheckAt),
+    monitorWakeRequestedAt: null,
+    monitorAttemptCount: restoredAttemptCount,
+    monitorNotes: nextMonitorState.notes,
+    monitorScheduledBy: nextMonitorState.scheduledBy,
+  };
+}
+
 export function buildIssueMonitorClearedPatch(input: {
   issue: IssueLike;
   policy: IssueExecutionPolicy | null;
