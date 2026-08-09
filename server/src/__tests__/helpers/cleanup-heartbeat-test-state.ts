@@ -1,15 +1,14 @@
-import { eq, inArray, or, sql } from "drizzle-orm";
+import { eq, inArray, or } from "drizzle-orm";
 import {
   agentWakeupRequests,
   type createDb,
   heartbeatRuns,
 } from "@paperclipai/db";
-import { runWithTransientDbRetry } from "../../lib/db-retry.js";
 import type { heartbeatService } from "../../services/heartbeat.ts";
+import { truncateCompanyScopedTestState } from "./truncate-company-scoped-test-state.js";
 
 type Db = ReturnType<typeof createDb>;
 type Heartbeat = ReturnType<typeof heartbeatService>;
-const TEST_DATABASE_CLEANUP_LOCK_KEY = "paperclip:test-database-cleanup";
 
 export type CleanupHeartbeatTestStateOptions = {
   /**
@@ -54,13 +53,15 @@ export type CleanupHeartbeatTestStateOptions = {
  *      dispatches) so postRun lifecycle hooks finish their writes
  *      BEFORE the TRUNCATE.
  *
- *   3. Take a transaction-scoped advisory lock, then `TRUNCATE TABLE
- *      "companies", <extras> CASCADE`. The lock serializes destructive cleanup
- *      across Vitest processes sharing a database, preventing concurrent
- *      CASCADE lock walks from deadlocking. The single TRUNCATE still avoids
- *      the per-table ordering races that surfaced as "delete from companies
- *      violates ... FK on document_revisions" in dep-sched (master
- *      verify_canary run 26136174642).
+ *   3. Delegate to `truncateCompanyScopedTestState`, which takes a
+ *      transaction-scoped advisory lock and then `TRUNCATE TABLE "companies",
+ *      <extras> CASCADE`. The lock serializes destructive cleanup across Vitest
+ *      processes sharing a database, preventing concurrent CASCADE lock walks
+ *      from deadlocking. The single TRUNCATE still avoids the per-table
+ *      ordering races that surfaced as "delete from companies violates ... FK
+ *      on document_revisions" in dep-sched (master verify_canary run
+ *      26136174642). Suites with no heartbeat service to drain can call that
+ *      helper directly.
  *
  * Tests that previously had a bespoke `cancelActiveRunsForCleanup`
  * helper, a pg_terminate_backend statement, a 3-retry on 40P01, or a
@@ -96,20 +97,7 @@ export async function cleanupHeartbeatTestState(
 
   await cancelActiveRunsForCleanup(db, errorLabel, cancelTimeoutMs);
   await heartbeat.drainInFlightExecutions(drainTimeoutMs);
-
-  const truncateList = ['"companies"', ...extraTruncateTables.map((t) => `"${t}"`)].join(", ");
-  await runWithTransientDbRetry(async () => {
-    await db.transaction(async (tx) => {
-      await tx.execute(
-        sql`select pg_advisory_xact_lock(hashtextextended(${TEST_DATABASE_CLEANUP_LOCK_KEY}, 0))`,
-      );
-      await tx.execute(sql.raw(`TRUNCATE TABLE ${truncateList} CASCADE`));
-    });
-  }, {
-    maxAttempts: 5,
-    baseDelayMs: 50,
-    jitterMs: 100,
-  });
+  await truncateCompanyScopedTestState(db, { extraTruncateTables });
 }
 
 async function cancelActiveRunsForCleanup(
