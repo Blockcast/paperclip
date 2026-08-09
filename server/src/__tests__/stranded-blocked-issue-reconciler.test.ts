@@ -23,6 +23,11 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { reconcileStrandedBlockedIssues } from "../services/stranded-blocked-issue-reconciler.js";
+import { listBlockedIssueAutoResumeSuppressions } from "../services/issues.js";
+import {
+  WORKSPACE_PREFLIGHT_BLOCKED_ACTIVITY_ACTION,
+  WORKSPACE_PREFLIGHT_CLEARED_ACTIVITY_ACTION,
+} from "../services/execution-workspace-policy.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -407,20 +412,27 @@ describeEmbeddedPostgres("reconcileStrandedBlockedIssues", () => {
     expect(await statusOf(executiveHold)).toBe("blocked");
   });
 
-  it("does not sweep workspace-preflight-blocked issues, and continues scanning past suppressed rows", async () => {
+  it("clears a repaired workspace-preflight hold before promoting after the final blocker resolves", async () => {
     const { companyId, agentId } = await createCompany("SBP");
-    const preflightBlocked = await insertIssue({
+    const finalBlocker = await insertIssue({
       companyId,
       identifier: "SBP-1",
-      status: "blocked",
+      status: "in_progress",
       assigneeAgentId: agentId,
     });
-    const stranded = await insertIssue({
+    const preflightBlocked = await insertIssue({
       companyId,
       identifier: "SBP-2",
       status: "blocked",
       assigneeAgentId: agentId,
     });
+    const stranded = await insertIssue({
+      companyId,
+      identifier: "SBP-3",
+      status: "blocked",
+      assigneeAgentId: agentId,
+    });
+    await block({ companyId, blockerIssueId: finalBlocker, blockedIssueId: preflightBlocked });
     await db
       .update(issues)
       .set({ updatedAt: new Date("2026-08-06T10:00:00.000Z") })
@@ -433,18 +445,40 @@ describeEmbeddedPostgres("reconcileStrandedBlockedIssues", () => {
       companyId,
       actorType: "system",
       actorId: "system",
-      action: "issue.workspace_preflight_blocked",
+      action: WORKSPACE_PREFLIGHT_BLOCKED_ACTIVITY_ACTION,
       entityType: "issue",
       entityId: preflightBlocked,
       details: { code: "workspace_worktree_requires_project" },
       createdAt: new Date("2026-08-06T10:00:00.000Z"),
     });
 
+    const suppressed = await listBlockedIssueAutoResumeSuppressions(db, companyId, [preflightBlocked]);
+    expect(suppressed.get(preflightBlocked)).toMatchObject({ reason: "workspace_preflight_blocked" });
+
+    const beforeRepair = await reconcileStrandedBlockedIssues(db, { batchSize: 1, maxIterations: 4 });
+    expect(beforeRepair.reconciled).toBe(1);
+    expect(await statusOf(preflightBlocked)).toBe("blocked");
+    expect(await statusOf(stranded)).toBe("todo");
+
+    // A successful retry after the operator repairs the workspace appends the
+    // clear transition; the failed event remains available as audit history.
+    await db.insert(activityLog).values({
+      companyId,
+      actorType: "system",
+      actorId: "system",
+      action: WORKSPACE_PREFLIGHT_CLEARED_ACTIVITY_ACTION,
+      entityType: "issue",
+      entityId: preflightBlocked,
+      details: { code: "workspace_worktree_requires_project", result: "passed" },
+      createdAt: new Date("2026-08-06T10:01:00.000Z"),
+    });
+    expect((await listBlockedIssueAutoResumeSuppressions(db, companyId, [preflightBlocked])).has(preflightBlocked)).toBe(false);
+
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, finalBlocker));
     const result = await reconcileStrandedBlockedIssues(db, { batchSize: 1, maxIterations: 3 });
 
     expect(result.reconciled).toBe(1);
-    expect(await statusOf(preflightBlocked)).toBe("blocked");
-    expect(await statusOf(stranded)).toBe("todo");
+    expect(await statusOf(preflightBlocked)).toBe("todo");
   });
 
   it("sweeps a workspace-preflight-blocked issue once a project is attached (repaired, not permanent)", async () => {
