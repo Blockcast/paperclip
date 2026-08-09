@@ -570,7 +570,9 @@ spec:
                 ; do
                   run_claude_plugin_seed "plugin install ${plugin}" "${CLAUDE_BIN}" plugin install "${plugin}" | tail -2 || true
                 done
-                chown -R 1000:1000 "${BASE}/.claude" 2>/dev/null || true
+                # The init container already runs as UID/GID 1000. Never walk
+                # the shared .claude tree here: it can contain millions of
+                # CephFS-backed files and prevent the worker pod from starting.
               else
                 echo "seed: skipping plugin install — claude not at ${CLAUDE_BIN}"
               fi
