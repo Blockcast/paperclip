@@ -739,6 +739,40 @@ const VIRTUAL_RUN_TOOL: ToolGatewayDescriptor = {
 
 const VIRTUAL_TOOLS = [VIRTUAL_SEARCH_TOOLS, VIRTUAL_RUN_TOOL];
 
+/**
+ * Atomically backfills the async-computed signature/hash/preview onto a
+ * still-pending tool action request. Guarded on status="pending" so a
+ * request the review-queue integrity sweep already cancelled as stale
+ * (BLO-21490) can never be silently resurrected with a signature landing
+ * after the fact — the update becomes a no-op (returns null) and callers
+ * must treat that as "this request is dead," not retry the write.
+ */
+export async function backfillPendingActionRequestSignature(
+  db: Db,
+  actionRequestId: string,
+  fields: {
+    canonicalArgumentsHash: string;
+    canonicalArgumentsSummary: ReturnType<typeof summarizeToolValue>;
+    signedArguments: string;
+    previewMarkdown: string;
+    expiresAt: Date;
+  },
+) {
+  const [row] = await db
+    .update(toolActionRequests)
+    .set({
+      canonicalArgumentsHash: fields.canonicalArgumentsHash,
+      canonicalArgumentsSummary: fields.canonicalArgumentsSummary,
+      signedArguments: fields.signedArguments,
+      previewMarkdown: fields.previewMarkdown,
+      expiresAt: fields.expiresAt,
+      updatedAt: new Date(),
+    })
+    .where(and(eq(toolActionRequests.id, actionRequestId), eq(toolActionRequests.status, "pending")))
+    .returning();
+  return row ?? null;
+}
+
 export function createToolGatewayService(
   db: Db,
   options: {
@@ -1582,6 +1616,7 @@ export function createToolGatewayService(
     const actionRequest = input.actionRequest;
     const expiresAt = new Date(Date.now() + 60 * 60 * 1000);
 
+    const requiresFormalApproval = toolRequiresFormalApproval(input.tool);
     let signedArguments: ReturnType<typeof signToolArguments>;
     try {
       signedArguments = signToolArguments({
@@ -1590,6 +1625,7 @@ export function createToolGatewayService(
         canonicalArguments,
         approvalSnapshot: approvalSnapshot ?? undefined,
         executionOnApprove: true,
+        requiresFormalApproval,
         signingSecret: options.toolActionSigningSecret,
       });
     } catch (error) {
@@ -1619,17 +1655,6 @@ export function createToolGatewayService(
       }
       throw error;
     }
-    // Board-only technical detail for the formal-approval interaction (target=custom).
-    const detailsMarkdown = [
-      `Tool: \`${input.tool.name}\``,
-      `Risk: \`${input.tool.risk}\``,
-      "",
-      "Arguments reviewed for execution:",
-      "",
-      "```json",
-      input.argumentsSummary.summary,
-      "```",
-    ].join("\n");
 
     // Prosumer-facing card preview (M5/M7/M9). Respect an already-set custom preview
     // (e.g. OpenClaw-supplied), otherwise emit plain language with no technical vocab.
@@ -1637,8 +1662,46 @@ export function createToolGatewayService(
       actionRequest.previewMarkdown?.trim() ||
       buildHumanizedActionPreview({ tool: input.tool, argumentsSummary: input.argumentsSummary });
 
+    // Backfill the async-computed signature now — before the slower formal
+    // approval / interaction creation below — guarded on the row still
+    // being "pending". This closes the review-queue cancellation race
+    // (BLO-21490): once this lands, the row already carries a valid
+    // signature and is visible in the queue well before any interaction
+    // exists for it. If it returns nothing, the review-queue integrity
+    // sweep already cancelled this row as stale while we were computing
+    // the approval snapshot/signature above — there's no live request left
+    // to attach an interaction to, so bail out rather than silently
+    // writing a signature onto a dead row (which would leave it
+    // permanently cancelled-yet-signed, invisible to both the queue and
+    // any future backfill).
+    const signedActionRequest = await backfillPendingActionRequestSignature(db, actionRequest.id, {
+      canonicalArgumentsHash,
+      canonicalArgumentsSummary: input.argumentsSummary,
+      signedArguments,
+      previewMarkdown,
+      expiresAt,
+    });
+    if (!signedActionRequest) {
+      await db
+        .update(toolInvocations)
+        .set({
+          status: "denied",
+          errorCode: "action_request_invalidated",
+          errorMessage: "Tool action request was cancelled before it could be signed",
+          completedAt: new Date(),
+          updatedAt: new Date(),
+        })
+        .where(eq(toolInvocations.id, input.invocation.id));
+      throw new ToolGatewayHttpError(
+        409,
+        "Tool action request was cancelled before it could be signed; retry the call",
+        "action_request_invalidated",
+        { invocationId: input.invocation.id, actionRequestId: actionRequest.id, tool: input.tool.name },
+      );
+    }
+
     let formalApprovalId: string | null = null;
-    if (toolRequiresFormalApproval(input.tool)) {
+    if (requiresFormalApproval) {
       const [approval] = await db
         .insert(approvals)
         .values({
@@ -1673,6 +1736,18 @@ export function createToolGatewayService(
         })
         .onConflictDoNothing();
     }
+
+    // Board-only technical detail for the formal-approval interaction (target=custom).
+    const detailsMarkdown = [
+      `Tool: \`${input.tool.name}\``,
+      `Risk: \`${input.tool.risk}\``,
+      "",
+      "Arguments reviewed for execution:",
+      "",
+      "```json",
+      input.argumentsSummary.summary,
+      "```",
+    ].join("\n");
 
     const interaction = await interactions.create(
       { id: input.session.issueId, companyId: input.session.companyId },
@@ -1716,16 +1791,14 @@ export function createToolGatewayService(
       { agentId: input.session.agentId },
     );
 
+    // Signature/hash/preview/expiry were already backfilled above before
+    // the interaction existed; this just attaches the now-created
+    // interaction (and any formal approval) to the same row.
     await db
       .update(toolActionRequests)
       .set({
         interactionId: interaction.id,
-        canonicalArgumentsHash,
-        canonicalArgumentsSummary: input.argumentsSummary,
-        signedArguments,
-        previewMarkdown,
         approvalId: formalApprovalId,
-        expiresAt,
         updatedAt: new Date(),
       })
       .where(eq(toolActionRequests.id, actionRequest.id));
@@ -4300,6 +4373,7 @@ export function createToolGatewayService(
         canonicalArguments,
         approvalSnapshot: signedPayload.approvalSnapshot,
         executionOnApprove: true,
+        requiresFormalApproval: signedPayload.requiresFormalApproval,
         signingSecret: options.toolActionSigningSecret,
       })
     ) {
@@ -5086,17 +5160,23 @@ export function createToolGatewayService(
           signingSecret: options.toolActionSigningSecret,
         });
         const previewMarkdown = buildHumanizedActionPreview({ tool, argumentsSummary: argumentValidation.summary });
-        await db
-          .update(toolActionRequests)
-          .set({
-            canonicalArgumentsHash,
-            canonicalArgumentsSummary: argumentValidation.summary,
-            signedArguments,
-            previewMarkdown,
-            expiresAt: new Date(Date.now() + 60 * 60 * 1000),
-            updatedAt: new Date(),
-          })
-          .where(eq(toolActionRequests.id, recorded.actionRequest.id));
+        // Guarded like the production backfill above (BLO-21490): don't
+        // resurrect a row the review-queue integrity sweep already
+        // cancelled while connectedRemoteApprovalSnapshot() was in flight.
+        const signedTestActionRequest = await backfillPendingActionRequestSignature(db, recorded.actionRequest.id, {
+          canonicalArgumentsHash,
+          canonicalArgumentsSummary: argumentValidation.summary,
+          signedArguments,
+          previewMarkdown,
+          expiresAt: new Date(Date.now() + 60 * 60 * 1000),
+        });
+        if (!signedTestActionRequest) {
+          throw new ToolGatewayHttpError(409, "Tool action request was cancelled before it could be signed; retry the call", "action_request_invalidated", {
+            invocationId,
+            actionRequestId: recorded.actionRequest.id,
+            tool: tool.name,
+          });
+        }
         await writeToolCallEvent({
           invocationId,
           actionRequestId: recorded.actionRequest.id,
@@ -5296,6 +5376,23 @@ export function createToolGatewayService(
           409,
           "Tool action request is no longer approvable; refresh the review queue",
           "action_request_invalidated",
+        );
+      }
+      // The signed payload carries requiresFormalApproval from sign time,
+      // tamper-evident and independent of whether the approvalId column has
+      // been linked yet. Backfill lands the signature before the (slower)
+      // approvals-insert + interactionId/approvalId link (BLO-21490), so a
+      // concurrent approve landing in that gap must not read a still-null
+      // approvalId as "no formal approval required" — that would let a
+      // destructive-tool request execute without ever passing through the
+      // board approval gate. Treat the row as not-yet-approvable (retryable,
+      // not cancelled — it is still a live, correctly-signed request).
+      if (signedPayload.requiresFormalApproval === true && !actionRequest.approvalId) {
+        throw new ToolGatewayHttpError(
+          409,
+          "Tool action request is still being prepared for formal board approval; retry shortly",
+          "approval_link_pending",
+          { actionRequestId: actionRequest.id },
         );
       }
       if (actionRequest.approvalId) {
@@ -5729,6 +5826,7 @@ export function createToolGatewayService(
             canonicalArguments: storedCanonical,
             approvalSnapshot: signedPayload.approvalSnapshot,
             executionOnApprove: signedPayload.executionOnApprove,
+            requiresFormalApproval: signedPayload.requiresFormalApproval,
             signingSecret: options.toolActionSigningSecret,
           })
         ) {
