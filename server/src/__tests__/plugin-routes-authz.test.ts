@@ -1470,6 +1470,7 @@ describe.sequential("GET /api/plugins/alerts/plugin-health", () => {
       listJobsWithFailureStreak: vi.fn().mockResolvedValue([
         {
           job: { id: "job-1", pluginId, jobKey: "check-alert-escalations" },
+          companyId: "company-a",
           consecutiveFailures: 3,
           lastError: 'Plugin is not allowed to perform "issues.list": company context is required',
         },
@@ -1493,6 +1494,75 @@ describe.sequential("GET /api/plugins/alerts/plugin-health", () => {
     expect(alert.consecutiveFailures).toBe(3);
     expect(alert.lastError).toContain("company context is required");
     expect(jobStore.listJobsWithFailureStreak).toHaveBeenCalledWith(3);
+  });
+
+  it("BLO-20957 review: names the failing tenant, so a responder knows which of N companies is broken", async () => {
+    mockRegistry.listByStatus.mockResolvedValue([]);
+    mockRegistry.getById.mockResolvedValue({
+      id: pluginId,
+      pluginKey: "paperclip-plugin-slack",
+    });
+    // Two tenants of the same job failing independently must produce two
+    // distinct, individually-actionable alerts — not one smeared alert.
+    const jobStore = {
+      listJobsWithFailureStreak: vi.fn().mockResolvedValue([
+        {
+          job: { id: "job-1", pluginId, jobKey: "commit-pending-approvals" },
+          companyId: "company-a",
+          consecutiveFailures: 3,
+          lastError: "company context is required",
+        },
+        {
+          job: { id: "job-1", pluginId, jobKey: "commit-pending-approvals" },
+          companyId: "company-b",
+          consecutiveFailures: 4,
+          lastError: "company context is required",
+        },
+      ]),
+    };
+    const { app } = await createApp(boardActor(), {}, {
+      jobDeps: { scheduler: {}, jobStore },
+    });
+
+    const res = await request(app).get("/api/plugins/alerts/plugin-health");
+
+    expect(res.status).toBe(200);
+    expect(res.body.alerts).toHaveLength(2);
+    expect(res.body.alerts.map((a: { companyId: string }) => a.companyId).sort()).toEqual([
+      "company-a",
+      "company-b",
+    ]);
+    // The tenant must be legible from the human-facing text too, not only
+    // from a machine field.
+    expect(res.body.alerts[0].description).toContain("company-a");
+  });
+
+  it("BLO-20957 review: labels an instance-scoped streak instead of emitting a bare null company", async () => {
+    mockRegistry.listByStatus.mockResolvedValue([]);
+    mockRegistry.getById.mockResolvedValue({
+      id: pluginId,
+      pluginKey: "paperclip-plugin-alertmanager",
+    });
+    const jobStore = {
+      listJobsWithFailureStreak: vi.fn().mockResolvedValue([
+        {
+          job: { id: "job-1", pluginId, jobKey: "check-alert-escalations" },
+          companyId: null,
+          consecutiveFailures: 3,
+          lastError: "Failed to enumerate configured companies: registry unavailable",
+        },
+      ]),
+    };
+    const { app } = await createApp(boardActor(), {}, {
+      jobDeps: { scheduler: {}, jobStore },
+    });
+
+    const res = await request(app).get("/api/plugins/alerts/plugin-health");
+
+    expect(res.status).toBe(200);
+    const alert = res.body.alerts[0];
+    expect(alert.companyId).toBeNull();
+    expect(alert.description).toContain("instance-scoped");
   });
 
   it("does not query job failure streaks when no job scheduling dependencies are wired", async () => {

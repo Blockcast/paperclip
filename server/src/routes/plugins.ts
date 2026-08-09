@@ -184,6 +184,13 @@ interface PluginScheduledJobFailingAlert {
   pluginKey: string;
   jobId: string;
   jobKey: string;
+  /**
+   * The tenant whose runs are failing, or `null` for an instance-scoped run.
+   * Streaks are computed per `(jobId, companyId)` since the BLO-20957
+   * per-company fan-out, so an alert without this is not actionable: the
+   * responder cannot tell which of six tenants is broken.
+   */
+  companyId: string | null;
   consecutiveFailures: number;
   lastError: string | null;
   summary: string;
@@ -1109,6 +1116,10 @@ export function pluginRoutes(
       for (const streak of streaks) {
         const plugin = await resolvePlugin(registry, streak.job.pluginId);
         if (!plugin) continue; // job's plugin was hard-deleted; nothing to page on
+        const scopeLabel =
+          streak.companyId === null
+            ? "instance-scoped (no company)"
+            : `company ${streak.companyId}`;
         jobAlerts.push({
           alertname: "PaperclipPluginScheduledJobFailing",
           severity: "page",
@@ -1116,12 +1127,13 @@ export function pluginRoutes(
           pluginKey: plugin.pluginKey,
           jobId: streak.job.id,
           jobKey: streak.job.jobKey,
+          companyId: streak.companyId,
           consecutiveFailures: streak.consecutiveFailures,
           lastError: streak.lastError,
-          summary: `Scheduled job "${streak.job.jobKey}" on plugin ${plugin.pluginKey} has failed its last ${streak.consecutiveFailures} runs`,
+          summary: `Scheduled job "${streak.job.jobKey}" on plugin ${plugin.pluginKey} has failed its last ${streak.consecutiveFailures} runs for ${scopeLabel}`,
           description: streak.lastError
-            ? `Job "${streak.job.jobKey}" (plugin ${plugin.pluginKey}, ${plugin.id}) has failed ${streak.consecutiveFailures} consecutive runs. Last error: ${streak.lastError}`
-            : `Job "${streak.job.jobKey}" (plugin ${plugin.pluginKey}, ${plugin.id}) has failed ${streak.consecutiveFailures} consecutive runs.`,
+            ? `Job "${streak.job.jobKey}" (plugin ${plugin.pluginKey}, ${plugin.id}) has failed ${streak.consecutiveFailures} consecutive runs for ${scopeLabel}. Last error: ${streak.lastError}`
+            : `Job "${streak.job.jobKey}" (plugin ${plugin.pluginKey}, ${plugin.id}) has failed ${streak.consecutiveFailures} consecutive runs for ${scopeLabel}.`,
         });
       }
     }

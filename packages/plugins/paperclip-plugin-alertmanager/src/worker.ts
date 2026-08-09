@@ -38,13 +38,15 @@ export const plugin = definePlugin({
       const companyId = job.companyId;
       if (!companyId) {
         // The host dispatches once per company configured for this plugin
-        // (BLO-20957); zero configured companies means zero escalation
-        // dispatches reach here on a normal tick. This branch only fires for
-        // a dispatch path that doesn't stamp a company (e.g. a manual "run
-        // now" trigger, which still falls back to the legacy single-tenant
-        // scope) — say so instead of silently no-op'ing.
+        // (BLO-20957) — on the scheduled path *and* on manual/retry "run
+        // now" triggers, both of which fan out per company and stamp
+        // `job.companyId`. So this branch no longer fires for a normal
+        // trigger; it means the plugin has zero configured companies (a
+        // successful empty enumeration), which for an escalation sweep is
+        // genuinely nothing to do. Warn rather than no-op silently so the
+        // "configured nowhere" case is still visible.
         ctx.logger.warn(
-          "paperclip-plugin-alertmanager: escalation sweep skipped — dispatch carried no company scope",
+          "paperclip-plugin-alertmanager: escalation sweep skipped — dispatch carried no company scope (plugin has no configured companies)",
         );
         return;
       }
