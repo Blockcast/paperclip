@@ -1,6 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { execFile } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readlinkSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -141,11 +150,21 @@ describe("docker-entrypoint.sh", () => {
 
   it("replaces a browser leaf symlink without following it", async () => {
     installStubs({ uid: 1000, gid: 1000 });
+    const paperclipHome = join(stubDir, "paperclip-home");
+    const browserBin = join(paperclipHome, "bin");
+    const browserLink = join(browserBin, "google-chrome");
+    const staleBrowserDirectory = join(stubDir, "stale-browser");
+    mkdirSync(browserBin, { recursive: true });
+    mkdirSync(staleBrowserDirectory);
+    symlinkSync(staleBrowserDirectory, browserLink);
+    writeStub("mkdir", `echo "mkdir $*" >> "${logFile}"\nexec /bin/mkdir "$@"`);
+    writeStub("ln", `echo "ln $*" >> "${logFile}"\nexec /bin/ln "$@"`);
 
-    const { stdout, calls } = await runEntrypoint();
+    const { stdout, calls } = await runEntrypoint({ PAPERCLIP_HOME: paperclipHome });
 
     expect(stdout).toContain("ENTRYPOINT-CMD-RAN");
-    expect(calls).toContain(`ln -sfn ${join(stubDir, "google-chrome")} /paperclip/bin/google-chrome`);
+    expect(calls).toContain(`ln -sfn ${join(stubDir, "google-chrome")} ${browserLink}`);
     expect(calls).not.toContain("ln -sf ");
+    expect(readlinkSync(browserLink)).toBe(join(stubDir, "google-chrome"));
   });
 });
