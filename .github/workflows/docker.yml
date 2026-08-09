@@ -144,11 +144,43 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # BuildKit cache is local to each StatefulSet ordinal. Ephemeral ARC
+      # client IPs make Service session affinity ineffective between runs, so
+      # route each build class to a stable cache owner. The ClusterIP remains a
+      # bounded availability fallback when the preferred ordinal is unhealthy.
+      - name: Select BuildKit endpoint
+        id: buildkit-endpoint
+        env:
+          PREFERRED_ORDINAL: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${PREFERRED_ORDINAL}" =~ ^[01]$ ]]; then
+            echo "Invalid BuildKit ordinal: ${PREFERRED_ORDINAL}" >&2
+            exit 1
+          fi
+
+          probe_buildkit() {
+            local host="$1"
+            local timeout_seconds="$2"
+            timeout "${timeout_seconds}" nc -z -w "${timeout_seconds}" "${host}" 1234
+          }
+
+          preferred="buildkit-amd64-${PREFERRED_ORDINAL}.buildkit-amd64-headless.ci.svc.cluster.local"
+          fallback="buildkit-amd64.ci.svc.cluster.local"
+          host="${preferred}"
+          if ! probe_buildkit "${preferred}" 5; then
+            echo "::warning::Preferred BuildKit ${preferred} is unavailable; using the healthy service endpoint"
+            host="${fallback}"
+            probe_buildkit "${fallback}" 10
+          fi
+          echo "endpoint=tcp://${host}:1234" >> "$GITHUB_OUTPUT"
+          echo "Using BuildKit endpoint tcp://${host}:1234"
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
         with:
           driver: remote
-          endpoint: tcp://buildkit-amd64.ci.svc.cluster.local:1234
+          endpoint: ${{ steps.buildkit-endpoint.outputs.endpoint }}
 
       # Runtime packages and global CLIs change far less often than /app.
       # Address the base by its inputs and only build it when that exact image
