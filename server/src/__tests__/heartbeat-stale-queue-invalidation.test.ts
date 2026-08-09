@@ -458,6 +458,40 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     expect(mockAdapterExecute).not.toHaveBeenCalled();
   });
 
+  it("skips generic timer wakes when a checkout-only holder has an unknown non-terminal status", async () => {
+    // The checkout path retains every status outside the terminal set. Keep the
+    // availability query identical: treating a future persisted status as free
+    // would start a wake which can only 409 at checkout.
+    const { companyId, agentId } = await seedCompanyAndAgent({
+      heartbeatConfig: {
+        enabled: true,
+        skipTimerWhenNoActionableWork: true,
+      },
+    });
+    const futureHolder = await seedLockHolderRun({
+      companyId,
+      agentId,
+      status: "some_future_live_status",
+    });
+    await db.insert(issues).values({
+      id: randomUUID(),
+      companyId,
+      title: "checkout lock held by a newer run status",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: futureHolder,
+    });
+
+    const run = await heartbeat.wakeup(agentId, {
+      source: "timer",
+      triggerDetail: "schedule",
+    });
+
+    expect(run).toBeNull();
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+  });
+
   it("allows generic timer wakes when a stale lock names a run that already terminalized", async () => {
     // A terminal holder releases the lock: `checkout()` clears it and succeeds,
     // so this issue IS available and the wake is not waste. Suppressing here
