@@ -592,7 +592,19 @@ describe("approval routes idempotent retries", () => {
     resumeRequiresNormalModel: true,
   } as const;
 
-  it("lets a status-only recovery run file a board escalation linked to the source issue", async () => {
+  // A productivity-review run carries both: `issueId` is the review issue, `sourceIssueId` is the
+  // stalled issue actually under review — the one a "block with an unblock owner" gate is about.
+  const REVIEW_ISSUE_ID = "22222222-2222-4222-8222-222222222222";
+  const SOURCE_ISSUE_ID = "11111111-1111-4111-8111-111111111111";
+  const UNRELATED_ISSUE_ID = "33333333-3333-4333-8333-333333333333";
+  const PRODUCTIVITY_REVIEW_CONTEXT = {
+    ...STATUS_ONLY_CONTEXT,
+    issueId: REVIEW_ISSUE_ID,
+    taskId: REVIEW_ISSUE_ID,
+    sourceIssueId: SOURCE_ISSUE_ID,
+  } as const;
+
+  function mockEscalationCreate() {
     mockApprovalService.create.mockResolvedValue({
       id: "approval-escalation",
       companyId: "company-1",
@@ -608,22 +620,86 @@ describe("approval routes idempotent retries", () => {
       updatedAt: new Date("2026-08-07T00:00:00.000Z"),
     });
     mockIssueApprovalService.linkManyForApproval.mockResolvedValue(undefined);
+  }
 
-    const res = await request(await createAgentApp({ contextSnapshot: { ...STATUS_ONLY_CONTEXT } }))
+  it("lets a status-only recovery run file a board escalation linked to the source issue", async () => {
+    mockEscalationCreate();
+
+    const res = await request(await createAgentApp({ contextSnapshot: { ...PRODUCTIVITY_REVIEW_CONTEXT } }))
       .post("/api/companies/company-1/approvals")
       .send({
         type: "request_board_approval",
         payload: { title: "Unblock owner needed for BLO-22206" },
-        issueIds: ["11111111-1111-4111-8111-111111111111"],
+        issueIds: [SOURCE_ISSUE_ID],
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(201);
     expect(mockApprovalService.create).toHaveBeenCalled();
     expect(mockIssueApprovalService.linkManyForApproval).toHaveBeenCalledWith(
       "approval-escalation",
-      ["11111111-1111-4111-8111-111111111111"],
+      [SOURCE_ISSUE_ID],
       expect.anything(),
     );
+  });
+
+  it("lets a status-only recovery run link the escalation to its own review issue", async () => {
+    mockEscalationCreate();
+
+    const res = await request(await createAgentApp({ contextSnapshot: { ...PRODUCTIVITY_REVIEW_CONTEXT } }))
+      .post("/api/companies/company-1/approvals")
+      .send({
+        type: "request_board_approval",
+        payload: { title: "Unblock owner needed" },
+        issueIds: [REVIEW_ISSUE_ID, SOURCE_ISSUE_ID],
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+  });
+
+  it("refuses a status-only board escalation that links an issue outside the run context", async () => {
+    const res = await request(await createAgentApp({ contextSnapshot: { ...PRODUCTIVITY_REVIEW_CONTEXT } }))
+      .post("/api/companies/company-1/approvals")
+      .send({
+        type: "request_board_approval",
+        payload: { title: "Unblock owner needed" },
+        issueIds: [SOURCE_ISSUE_ID, UNRELATED_ISSUE_ID],
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toContain("issues named in its run context");
+    expect(res.body.details.unrelatedIssueIds).toEqual([UNRELATED_ISSUE_ID]);
+    expect(mockApprovalService.create).not.toHaveBeenCalled();
+    expect(mockIssueApprovalService.linkManyForApproval).not.toHaveBeenCalled();
+  });
+
+  it("refuses an unlinked status-only board escalation, which would reach a human with no context", async () => {
+    const res = await request(await createAgentApp({ contextSnapshot: { ...PRODUCTIVITY_REVIEW_CONTEXT } }))
+      .post("/api/companies/company-1/approvals")
+      .send({
+        type: "request_board_approval",
+        payload: { title: "Unblock owner needed" },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toContain("must link its board escalation");
+    expect(res.body.details.linkableIssueIds).toEqual(
+      expect.arrayContaining([REVIEW_ISSUE_ID, SOURCE_ISSUE_ID]),
+    );
+    expect(mockApprovalService.create).not.toHaveBeenCalled();
+  });
+
+  it("refuses a status-only board escalation when the run context names no issue at all", async () => {
+    const res = await request(await createAgentApp({ contextSnapshot: { ...STATUS_ONLY_CONTEXT } }))
+      .post("/api/companies/company-1/approvals")
+      .send({
+        type: "request_board_approval",
+        payload: { title: "Unblock owner needed" },
+        issueIds: [SOURCE_ISSUE_ID],
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toContain("names no issue to link it to");
+    expect(mockApprovalService.create).not.toHaveBeenCalled();
   });
 
   it("still blocks a status-only recovery run from creating non-escalation approvals", async () => {
@@ -631,7 +707,7 @@ describe("approval routes idempotent retries", () => {
       title: "Hire an SRE",
     });
 
-    const res = await request(await createAgentApp({ contextSnapshot: { ...STATUS_ONLY_CONTEXT } }))
+    const res = await request(await createAgentApp({ contextSnapshot: { ...PRODUCTIVITY_REVIEW_CONTEXT } }))
       .post("/api/companies/company-1/approvals")
       .send({
         type: "hire_agent",

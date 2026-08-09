@@ -54,7 +54,30 @@ function approvalResolutionResponse<T extends { type: string; payload: Record<st
 //
 // Deliberately create-only: resubmit/withdraw/comment never pass a requested type, so they stay
 // barred regardless of the target approval's type.
+//
+// The escape is additionally bound to the run's own issues (see
+// `statusOnlyEscalationLinkableIssueIds`). `linkManyForApproval` already rejects cross-company and
+// unknown issues, so tenant isolation was never at stake — but status-only is the most restricted
+// work class, and an escalation it files should be about the work it was woken for, not an
+// arbitrary issue elsewhere in the company. Requiring the link is also what makes the card useful:
+// an unlinked escalation reaches a human with no context, which is the same "reaches nobody
+// actionable" failure this issue exists to close.
 const BOARD_ESCALATION_APPROVAL_TYPE = "request_board_approval";
+
+// Issues a status-only run may attach its escalation to: the issue it is executing on, and — for a
+// productivity review — the source issue under review, which is the one the gate is actually about.
+const STATUS_ONLY_ESCALATION_CONTEXT_ISSUE_KEYS = ["issueId", "taskId", "sourceIssueId"] as const;
+
+function statusOnlyEscalationLinkableIssueIds(contextSnapshot: unknown): Set<string> {
+  const ids = new Set<string>();
+  if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return ids;
+  const context = contextSnapshot as Record<string, unknown>;
+  for (const key of STATUS_ONLY_ESCALATION_CONTEXT_ISSUE_KEYS) {
+    const value = context[key];
+    if (typeof value === "string" && value.trim()) ids.add(value.trim());
+  }
+  return ids;
+}
 
 function isStatusOnlyCheapRecoveryContext(contextSnapshot: unknown) {
   if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return false;
@@ -101,7 +124,7 @@ export function approvalRoutes(
     req: Request,
     res: any,
     companyId: string,
-    options: { requestedType?: unknown } = {},
+    options: { requestedType?: unknown; requestedIssueIds?: unknown } = {},
   ) {
     if (req.actor.type !== "agent") return true;
     const runId = req.actor.runId?.trim();
@@ -119,22 +142,56 @@ export function approvalRoutes(
       .then((rows) => rows[0] ?? null);
     if (!run || run.companyId !== companyId || run.agentId !== req.actor.agentId) return true;
     if (!isStatusOnlyCheapRecoveryContext(run.contextSnapshot)) return true;
-    if (options.requestedType === BOARD_ESCALATION_APPROVAL_TYPE) return true;
 
-    res.status(403).json({
-      error:
-        "Cheap status-only recovery runs can only create `request_board_approval` approvals; " +
-        "every other approval create/modify action requires a normal-model run",
-      details: {
-        companyId,
-        runId: run.id,
-        modelProfile: "cheap",
-        recoveryIntent: "status_only",
-        resumeRequiresNormalModel: true,
-        allowedApprovalType: BOARD_ESCALATION_APPROVAL_TYPE,
-      },
-    });
-    return false;
+    const refuse = (error: string, extra: Record<string, unknown> = {}) => {
+      res.status(403).json({
+        error,
+        details: {
+          companyId,
+          runId: run.id,
+          modelProfile: "cheap",
+          recoveryIntent: "status_only",
+          resumeRequiresNormalModel: true,
+          allowedApprovalType: BOARD_ESCALATION_APPROVAL_TYPE,
+          ...extra,
+        },
+      });
+      return false;
+    };
+
+    if (options.requestedType === BOARD_ESCALATION_APPROVAL_TYPE) {
+      const linkable = statusOnlyEscalationLinkableIssueIds(run.contextSnapshot);
+      const requested = Array.isArray(options.requestedIssueIds)
+        ? options.requestedIssueIds.filter((value): value is string => typeof value === "string" && !!value.trim())
+          .map((value) => value.trim())
+        : [];
+
+      if (linkable.size === 0) {
+        return refuse(
+          "This status-only run cannot file a board escalation: its run context names no issue to link it to",
+          { linkableIssueIds: [] },
+        );
+      }
+      if (requested.length === 0) {
+        return refuse(
+          "A status-only run must link its board escalation to its own issue; pass it in `issueIds`",
+          { linkableIssueIds: [...linkable] },
+        );
+      }
+      const unrelated = requested.filter((id) => !linkable.has(id));
+      if (unrelated.length > 0) {
+        return refuse(
+          "A status-only run may only link a board escalation to the issues named in its run context",
+          { linkableIssueIds: [...linkable], unrelatedIssueIds: unrelated },
+        );
+      }
+      return true;
+    }
+
+    return refuse(
+      "Cheap status-only recovery runs can only create `request_board_approval` approvals; " +
+      "every other approval create/modify action requires a normal-model run",
+    );
   }
 
   router.get("/companies/:companyId/approvals", async (req, res) => {
@@ -160,6 +217,7 @@ export function approvalRoutes(
     if (!(await assertApprovalAccessAllowed(req, res, companyId))) return;
     if (!(await assertApprovalMutationAllowedByRunContext(req, res, companyId, {
       requestedType: req.body?.type,
+      requestedIssueIds: req.body?.issueIds,
     }))) return;
     const rawIssueIds = req.body.issueIds;
     const issueIds = Array.isArray(rawIssueIds)
