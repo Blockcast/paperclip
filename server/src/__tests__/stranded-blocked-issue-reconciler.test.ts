@@ -447,6 +447,37 @@ describeEmbeddedPostgres("reconcileStrandedBlockedIssues", () => {
     expect(await statusOf(stranded)).toBe("todo");
   });
 
+  it("sweeps a workspace-preflight-blocked issue once a project is attached (repaired, not permanent)", async () => {
+    const { companyId, agentId } = await createCompany("SBW");
+    const { projectId } = await createExecutionWorkspace(companyId);
+    const preflightBlocked = await insertIssue({
+      companyId,
+      identifier: "SBW-1",
+      status: "blocked",
+      assigneeAgentId: agentId,
+    });
+    await db.insert(activityLog).values({
+      companyId,
+      actorType: "system",
+      actorId: "system",
+      action: "issue.workspace_preflight_blocked",
+      entityType: "issue",
+      entityId: preflightBlocked,
+      details: { code: "workspace_worktree_requires_project" },
+      createdAt: new Date("2026-08-06T10:00:00.000Z"),
+    });
+
+    const beforeRepair = await reconcileStrandedBlockedIssues(db);
+    expect(beforeRepair.reconciled).toBe(0);
+    expect(await statusOf(preflightBlocked)).toBe("blocked");
+
+    await db.update(issues).set({ projectId }).where(eq(issues.id, preflightBlocked));
+
+    const afterRepair = await reconcileStrandedBlockedIssues(db);
+    expect(afterRepair.reconciled).toBe(1);
+    expect(await statusOf(preflightBlocked)).toBe("todo");
+  });
+
   it("is idempotent: a second sweep reconciles nothing further", async () => {
     const { companyId } = await createCompany("SB8");
     await insertIssue({ companyId, identifier: "SB8-1", status: "blocked" });

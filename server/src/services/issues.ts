@@ -80,6 +80,7 @@ import {
 import {
   defaultIssueExecutionWorkspaceSettingsForProject,
   gateProjectExecutionWorkspacePolicy,
+  hasReusableExecutionWorkspaceBinding,
   issueExecutionWorkspaceModeForPersistedWorkspace,
   isUnrunnableWorktreeCombo,
   parseIssueExecutionWorkspaceSettings,
@@ -3693,7 +3694,34 @@ export async function listBlockedIssueAutoResumeSuppressions(
         inArray(activityLog.entityId, uniqueIssueIds),
       ),
     );
-  for (const row of workspacePreflightRows) addSuppression(row.issueId, "workspace_preflight_blocked");
+  const workspacePreflightIssueIds = [...new Set(workspacePreflightRows.map((row) => row.issueId))];
+  if (workspacePreflightIssueIds.length > 0) {
+    // The activity-log row only records that the combo was unrunnable at write time; it is
+    // never retracted, so it must not be treated as a permanent hold. Re-check the same
+    // project/reusable-workspace condition live — once an operator attaches a project or binds a
+    // reusable workspace (the two remediations named in the original block comment), this issue
+    // is runnable again and must stop being suppressed.
+    const workspaceStateRows = await dbOrTx
+      .select({
+        id: issues.id,
+        projectId: issues.projectId,
+        projectWorkspaceId: issues.projectWorkspaceId,
+        executionWorkspaceId: issues.executionWorkspaceId,
+        executionWorkspacePreference: issues.executionWorkspacePreference,
+      })
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), inArray(issues.id, workspacePreflightIssueIds)));
+    for (const row of workspaceStateRows) {
+      const stillUnresolved =
+        !row.projectId &&
+        !row.projectWorkspaceId &&
+        !hasReusableExecutionWorkspaceBinding({
+          executionWorkspaceId: row.executionWorkspaceId,
+          executionWorkspacePreference: row.executionWorkspacePreference,
+        });
+      if (stillUnresolved) addSuppression(row.id, "workspace_preflight_blocked");
+    }
+  }
 
   const recoveryRows = await dbOrTx
     .select({ issueId: issueRecoveryActions.sourceIssueId })
