@@ -301,11 +301,13 @@ describe("sanitizeRecord value-shape gate (BLO-20810)", () => {
       apiKey: "https://hooks.slack.test/services/T000/B000/signed-webhook-value",
       base_url: "https://example.test/callback?token=abc123def456",
       backup_base_url: "https://example.test/callback?password=hunter2",
+      auth_base_url: "https://example.test/callback?authentication=hunter2",
     });
 
     expect(result?.apiKey).toBe(REDACTED_EVENT_VALUE);
     expect(result?.base_url).toBe(REDACTED_EVENT_VALUE);
     expect(result?.backup_base_url).toBe(REDACTED_EVENT_VALUE);
+    expect(result?.auth_base_url).toBe(REDACTED_EVENT_VALUE);
   });
 
   // CTO finding (#943 review, post-tiering): the URL branch returned "safe"
