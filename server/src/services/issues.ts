@@ -3722,14 +3722,42 @@ export async function listBlockedIssueAutoResumeSuppressions(
       })
       .from(issues)
       .where(and(eq(issues.companyId, companyId), inArray(issues.id, workspacePreflightIssueIds)));
+    const reusableExecutionWorkspaceIds = [...new Set(
+      workspaceStateRows.flatMap((row) =>
+        hasReusableExecutionWorkspaceBinding({
+          executionWorkspaceId: row.executionWorkspaceId,
+          executionWorkspacePreference: row.executionWorkspacePreference,
+        }) && row.executionWorkspaceId
+          ? [row.executionWorkspaceId]
+          : []),
+    )];
+    const liveReusableExecutionWorkspaceIds = new Set<string>();
+    if (reusableExecutionWorkspaceIds.length > 0) {
+      const workspaceRows = await dbOrTx
+        .select({ id: executionWorkspaces.id, status: executionWorkspaces.status })
+        .from(executionWorkspaces)
+        .where(and(
+          eq(executionWorkspaces.companyId, companyId),
+          inArray(executionWorkspaces.id, reusableExecutionWorkspaceIds),
+        ));
+      for (const workspace of workspaceRows) {
+        if (workspace.status !== "archived") {
+          liveReusableExecutionWorkspaceIds.add(workspace.id);
+        }
+      }
+    }
     for (const row of workspaceStateRows) {
+      const hasLiveReusableExecutionWorkspace =
+        row.executionWorkspaceId !== null &&
+        hasReusableExecutionWorkspaceBinding({
+          executionWorkspaceId: row.executionWorkspaceId,
+          executionWorkspacePreference: row.executionWorkspacePreference,
+        }) &&
+        liveReusableExecutionWorkspaceIds.has(row.executionWorkspaceId);
       const stillUnresolved =
         !row.projectId &&
         !row.projectWorkspaceId &&
-        !hasReusableExecutionWorkspaceBinding({
-          executionWorkspaceId: row.executionWorkspaceId,
-          executionWorkspacePreference: row.executionWorkspacePreference,
-        });
+        !hasLiveReusableExecutionWorkspace;
       if (stillUnresolved) addSuppression(row.id, "workspace_preflight_blocked");
     }
   }

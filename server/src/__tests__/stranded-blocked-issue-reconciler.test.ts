@@ -22,7 +22,11 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { reconcileStrandedBlockedIssues } from "../services/stranded-blocked-issue-reconciler.js";
+import {
+  reconcileStrandedBlockedIssues,
+  startStrandedBlockedIssueReconciler,
+  type StrandedBlockedIssueReconcilerScheduler,
+} from "../services/stranded-blocked-issue-reconciler.js";
 import { listBlockedIssueAutoResumeSuppressions } from "../services/issues.js";
 import {
   WORKSPACE_PREFLIGHT_BLOCKED_ACTIVITY_ACTION,
@@ -512,6 +516,55 @@ describeEmbeddedPostgres("reconcileStrandedBlockedIssues", () => {
     expect(await statusOf(preflightBlocked)).toBe("todo");
   });
 
+  it("keeps workspace-preflight holds for archived and missing-for-company reuse targets", async () => {
+    const { companyId, agentId } = await createCompany("SBRW");
+    const { executionWorkspaceId } = await createExecutionWorkspace(companyId);
+    // The foreign key prevents an orphaned ID; another company's workspace is
+    // the database-valid missing target for this company-scoped lookup.
+    const { companyId: otherCompanyId } = await createCompany("SBRW2");
+    const { executionWorkspaceId: foreignExecutionWorkspaceId } = await createExecutionWorkspace(otherCompanyId);
+    const archivedReuse = await insertIssue({
+      companyId,
+      identifier: "SBRW-1",
+      status: "blocked",
+      assigneeAgentId: agentId,
+    });
+    const nonCompanyReuse = await insertIssue({
+      companyId,
+      identifier: "SBRW-2",
+      status: "blocked",
+      assigneeAgentId: agentId,
+    });
+    await db.update(executionWorkspaces)
+      .set({ status: "archived" })
+      .where(eq(executionWorkspaces.id, executionWorkspaceId));
+    await db.update(issues)
+      .set({ executionWorkspaceId, executionWorkspacePreference: "reuse_existing" })
+      .where(eq(issues.id, archivedReuse));
+    await db.update(issues)
+      .set({ executionWorkspaceId: foreignExecutionWorkspaceId, executionWorkspacePreference: "reuse_existing" })
+      .where(eq(issues.id, nonCompanyReuse));
+    await db.insert(activityLog).values([archivedReuse, nonCompanyReuse].map((issueId) => ({
+      companyId,
+      actorType: "system",
+      actorId: "system",
+      action: WORKSPACE_PREFLIGHT_BLOCKED_ACTIVITY_ACTION,
+      entityType: "issue",
+      entityId: issueId,
+      details: { code: "workspace_worktree_requires_project" },
+    })));
+
+    const suppressed = await listBlockedIssueAutoResumeSuppressions(db, companyId, [archivedReuse, nonCompanyReuse]);
+    expect(suppressed.get(archivedReuse)).toMatchObject({ reason: "workspace_preflight_blocked" });
+    expect(suppressed.get(nonCompanyReuse)).toMatchObject({ reason: "workspace_preflight_blocked" });
+
+    const result = await reconcileStrandedBlockedIssues(db);
+
+    expect(result.reconciled).toBe(0);
+    expect(await statusOf(archivedReuse)).toBe("blocked");
+    expect(await statusOf(nonCompanyReuse)).toBe("blocked");
+  });
+
   it("is idempotent: a second sweep reconciles nothing further", async () => {
     const { companyId } = await createCompany("SB8");
     await insertIssue({ companyId, identifier: "SB8-1", status: "blocked" });
@@ -557,5 +610,51 @@ describeEmbeddedPostgres("reconcileStrandedBlockedIssues", () => {
 
     expect(result.reconciled).toBe(0);
     expect(await statusOf(issueId)).toBe("in_progress");
+  });
+});
+
+describe("startStrandedBlockedIssueReconciler", () => {
+  it("does not start an overlapping scheduled sweep", async () => {
+    let transactionCount = 0;
+    let scheduledTick: (() => void) | null = null;
+    let firstTransactionStartedResolve!: () => void;
+    const firstTransactionStarted = new Promise<void>((resolve) => {
+      firstTransactionStartedResolve = resolve;
+    });
+    let releaseFirstTransactionResolve!: () => void;
+    const releaseFirstTransaction = new Promise<void>((resolve) => {
+      releaseFirstTransactionResolve = resolve;
+    });
+    const fakeDb = {
+      transaction: async () => {
+        transactionCount += 1;
+        if (transactionCount === 1) {
+          firstTransactionStartedResolve();
+          await releaseFirstTransaction;
+        }
+        return { candidates: [], flipped: [] };
+      },
+    } as unknown as ReturnType<typeof createDb>;
+    const scheduler: StrandedBlockedIssueReconcilerScheduler = {
+      setInterval: (callback) => {
+        scheduledTick = callback;
+        return 0 as unknown as ReturnType<typeof setInterval>;
+      },
+      clearInterval: () => {},
+    };
+
+    const stop = startStrandedBlockedIssueReconciler(fakeDb, 1, {}, scheduler);
+    await firstTransactionStarted;
+    expect(scheduledTick).not.toBeNull();
+
+    scheduledTick?.();
+    scheduledTick?.();
+    expect(transactionCount).toBe(1);
+
+    releaseFirstTransactionResolve();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    scheduledTick?.();
+    expect(transactionCount).toBe(2);
+    stop();
   });
 });
