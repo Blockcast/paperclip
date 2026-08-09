@@ -69,6 +69,19 @@ export type JsonSchema = {
    * `secret`, …) but whose value is not sensitive.
    */
   "x-paperclip-secret"?: boolean;
+  /**
+   * Names the property that immutably identifies an entry of this array, e.g.
+   * `items: { "x-paperclip-identity": "id" }`.
+   *
+   * Declaring it is a promise that the named property never changes for a given
+   * entry. That promise is what lets the host restore a masked secret onto an
+   * entry that moved or was edited (BLO-20871). Without it, a masked array entry
+   * is restored only when the array is otherwise byte-identical, and any
+   * reorder, insertion, deletion or edit forces the operator to re-enter the
+   * secret — deliberately, because an inferred identity can re-home a live
+   * credential onto the wrong entry.
+   */
+  "x-paperclip-identity"?: string;
   [key: string]: unknown;
 };
 

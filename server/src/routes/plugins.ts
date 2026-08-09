@@ -2614,6 +2614,7 @@ export function pluginRoutes(
     const merged = mergeMaskedPluginConfig(
       body.configJson,
       storedConfig && typeof storedConfig === "object" ? storedConfig.configJson : null,
+      plugin.manifestJson?.instanceConfigSchema,
     );
     // A sentinel inside an array that was reordered or had entries removed
     // cannot be resolved without risking re-homing the credential onto a
@@ -2766,6 +2767,7 @@ export function pluginRoutes(
     const mergedTest = mergeMaskedPluginConfig(
       body.configJson,
       storedTestConfig && typeof storedTestConfig === "object" ? storedTestConfig.configJson : null,
+      plugin.manifestJson?.instanceConfigSchema,
     );
     if (mergedTest.unresolvedMaskPaths.length > 0) {
       res.status(400).json({

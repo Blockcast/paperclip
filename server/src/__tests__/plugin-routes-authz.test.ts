@@ -1668,8 +1668,19 @@ describe.sequential("plugin config secret masking (BLO-20794)", () => {
 
   it("re-homes nothing when an array entry is deleted, matching entries by identity", async () => {
     // BLO-20871 review finding: positional restore would hand `token-alpha` to
-    // beta's endpoint. Identity matching keeps each secret with its own entry.
-    maskingPlugin({ type: "object", properties: { endpoint: { type: "string" } } });
+    // beta's endpoint. A manifest-designated immutable identity keeps each
+    // secret with its own entry; without one this save is refused outright (see
+    // the reorder test below).
+    maskingPlugin({
+      type: "object",
+      properties: {
+        endpoint: { type: "string" },
+        targets: {
+          type: "array",
+          items: { type: "object", "x-paperclip-identity": "name" },
+        },
+      },
+    });
     const store = seedConfigStore({
       targets: [
         { name: "alpha", token: "token-alpha-live" },
@@ -1853,6 +1864,183 @@ describe.sequential("plugin config secret masking (BLO-20794)", () => {
       .send({ companyId: companyA, configJson: { webhookToken: "__redacted__", endpoint: "https://alerts.example.com" } });
 
     expect(JSON.stringify(res.body)).not.toContain("sk-live-a");
+  }, 20_000);
+
+  // ---------------------------------------------------------------------------
+  // Round-6 review findings (BLO-20871)
+  // ---------------------------------------------------------------------------
+
+  /** A declared secret that is an object, not a string. */
+  const structuredSchema = {
+    type: "object",
+    properties: {
+      auth: {
+        type: "object",
+        "x-paperclip-secret": true,
+        properties: { user: { type: "string" }, password: { type: "string" } },
+      },
+      endpoint: { type: "string" },
+    },
+  };
+
+  it("never emits a structured declared secret's leaves to an authorized reader", async () => {
+    maskingPlugin(structuredSchema);
+    seedConfigStore({
+      auth: { user: "svc", password: CONFIG_SECRET },
+      endpoint: "https://alerts.example.com",
+    });
+    const { app } = await createApp(adminActor());
+
+    const res = await request(app)
+      .get(`/api/plugins/${pluginId}/config`)
+      .query({ companyId: companyA });
+
+    expect(res.status).toBe(200);
+    expect(JSON.stringify(res.body)).not.toContain(CONFIG_SECRET);
+    expect(res.body.configJson.endpoint).toBe("https://alerts.example.com");
+  }, 20_000);
+
+  it("redacts an object-shaped secret's leaves from worker warnings", async () => {
+    // The masked container recorded no nested strings, so `password` was unknown
+    // to the diagnostic scrubber and a worker echoing it leaked the credential
+    // straight back through the endpoint that masks it.
+    maskingPlugin(structuredSchema);
+    seedConfigStore({
+      auth: { user: "svc", password: CONFIG_SECRET },
+      endpoint: "https://alerts.example.com",
+    });
+    const workerCall = vi.fn().mockResolvedValue({
+      ok: true,
+      warnings: [`401 rejected for ${CONFIG_SECRET}`],
+    });
+    const { app } = await createApp(adminActor(), {}, {
+      bridgeDeps: { workerManager: { isRunning: () => true, call: workerCall } },
+    });
+
+    const res = await request(app)
+      .post(`/api/plugins/${pluginId}/config/test`)
+      .send({
+        companyId: companyA,
+        configJson: { auth: "__redacted__", endpoint: "https://alerts.example.com" },
+      });
+
+    // The worker must still receive the real credential, or the test is useless.
+    expect(workerCall.mock.calls[0]?.[2]?.config).toEqual({
+      auth: { user: "svc", password: CONFIG_SECRET },
+      endpoint: "https://alerts.example.com",
+    });
+    expect(JSON.stringify(res.body)).not.toContain(CONFIG_SECRET);
+  }, 20_000);
+
+  it("redacts an object-shaped secret's leaves from a thrown worker error", async () => {
+    maskingPlugin(structuredSchema);
+    seedConfigStore({
+      auth: { user: "svc", password: CONFIG_SECRET },
+      endpoint: "https://alerts.example.com",
+    });
+    const workerCall = vi.fn().mockRejectedValue(
+      new Error(`connect failed using ${CONFIG_SECRET}`),
+    );
+    const { app } = await createApp(adminActor(), {}, {
+      bridgeDeps: { workerManager: { isRunning: () => true, call: workerCall } },
+    });
+
+    const res = await request(app)
+      .post(`/api/plugins/${pluginId}/config/test`)
+      .send({
+        companyId: companyA,
+        configJson: { auth: "__redacted__", endpoint: "https://alerts.example.com" },
+      });
+
+    expect(JSON.stringify(res.body)).not.toContain(CONFIG_SECRET);
+  }, 20_000);
+
+  it("redacts an array-shaped secret's leaves from worker warnings", async () => {
+    const arraySchema = {
+      type: "object",
+      properties: { keys: { type: "array", "x-paperclip-secret": true } },
+    };
+    maskingPlugin(arraySchema);
+    seedConfigStore({ keys: [CONFIG_SECRET, "second-live-key"] });
+    const workerCall = vi.fn().mockResolvedValue({
+      ok: true,
+      warnings: [`rotated ${CONFIG_SECRET} and second-live-key`],
+    });
+    const { app } = await createApp(adminActor(), {}, {
+      bridgeDeps: { workerManager: { isRunning: () => true, call: workerCall } },
+    });
+
+    const res = await request(app)
+      .post(`/api/plugins/${pluginId}/config/test`)
+      .send({ companyId: companyA, configJson: { keys: "__redacted__" } });
+
+    expect(JSON.stringify(res.body)).not.toContain(CONFIG_SECRET);
+    expect(JSON.stringify(res.body)).not.toContain("second-live-key");
+  }, 20_000);
+
+  it("never emits a secret declared behind a local $ref", async () => {
+    maskingPlugin({
+      type: "object",
+      $defs: { credential: { type: "string", writeOnly: true } },
+      properties: {
+        auth: { $ref: "#/$defs/credential" },
+        endpoint: { type: "string" },
+      },
+    });
+    seedConfigStore({ auth: CONFIG_SECRET, endpoint: "https://alerts.example.com" });
+    const { app } = await createApp(adminActor());
+
+    const res = await request(app)
+      .get(`/api/plugins/${pluginId}/config`)
+      .query({ companyId: companyA });
+
+    expect(res.status).toBe(200);
+    expect(JSON.stringify(res.body)).not.toContain(CONFIG_SECRET);
+    expect(res.body.configJson.endpoint).toBe("https://alerts.example.com");
+  }, 20_000);
+
+  it("rejects a save whose masked array entry was reordered without a designated identity", async () => {
+    const store = seedConfigStore({
+      targets: [
+        { name: "alpha", token: "token-alpha" },
+        { name: "beta", token: "token-beta" },
+      ],
+    });
+    maskingPlugin({
+      type: "object",
+      properties: {
+        targets: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: { name: { type: "string" }, token: { type: "string", writeOnly: true } },
+          },
+        },
+      },
+    });
+    const { app } = await createApp(adminActor());
+
+    const res = await request(app)
+      .post(`/api/plugins/${pluginId}/config`)
+      .send({
+        companyId: companyA,
+        configJson: {
+          targets: [
+            { name: "beta", token: "__redacted__" },
+            { name: "alpha", token: "__redacted__" },
+          ],
+        },
+      });
+
+    expect(res.status).toBe(400);
+    expect(res.body.unresolvedMaskPaths).toEqual(["targets.0", "targets.1"]);
+    // Storage untouched: no credential moved to the other endpoint.
+    expect(store.configJson).toEqual({
+      targets: [
+        { name: "alpha", token: "token-alpha" },
+        { name: "beta", token: "token-beta" },
+      ],
+    });
   }, 20_000);
 });
 

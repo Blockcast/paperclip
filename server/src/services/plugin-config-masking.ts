@@ -166,25 +166,80 @@ function declaresSecret(node: SchemaNode): boolean {
 }
 
 /**
- * Flatten a set of schema nodes through the composition keywords, so a marker
- * sitting on an `allOf` / `anyOf` / `oneOf` *branch node itself* is seen rather
+ * A node injected in place of a `$ref` that could not be resolved.
+ *
+ * Masking is fail-closed: an unresolvable reference means we cannot prove the
+ * target is *not* secret, so we treat it as secret rather than emit plaintext.
+ * This covers external refs (`https://…`, `other.json#/…`), refs into a missing
+ * `$defs` entry, and reference cycles.
+ */
+const UNRESOLVED_REF_NODE: SchemaNode = Object.freeze({ "x-paperclip-secret": true });
+
+/**
+ * Resolve a local JSON-Pointer `$ref` (`#/$defs/credential`) against the root
+ * schema. Returns `null` for anything non-local or unresolvable, which the
+ * caller turns into {@link UNRESOLVED_REF_NODE}.
+ */
+function resolveLocalRef(ref: string, root: SchemaNode | null): SchemaNode | null {
+  if (!root || ref === "#") return ref === "#" ? root : null;
+  if (!ref.startsWith("#/")) return null; // external / non-pointer — fail closed
+
+  let current: unknown = root;
+  for (const rawToken of ref.slice(2).split("/")) {
+    // RFC 6901 escaping: ~1 is "/", ~0 is "~" (in that order).
+    const token = rawToken.replace(/~1/g, "/").replace(/~0/g, "~");
+    if (Array.isArray(current)) {
+      const index = Number(token);
+      if (!Number.isInteger(index) || index < 0 || index >= current.length) return null;
+      current = current[index];
+      continue;
+    }
+    if (!isPlainRecord(current) || !(token in current)) return null;
+    current = current[token];
+  }
+
+  return isPlainRecord(current) ? current : null;
+}
+
+/**
+ * Flatten a set of schema nodes through the composition keywords and local
+ * `$ref` indirection, so a marker sitting on an `allOf` / `anyOf` / `oneOf`
+ * *branch node itself*, or on a `$defs` entry a field points at, is seen rather
  * than only markers on that branch's `properties`.
  *
  * Applicability is deliberately not evaluated: a value covered by any branch of
  * a composition is treated as covered by all of them. Masking is fail-closed —
  * a field that is secret in only one `oneOf` branch must not be emitted in the
  * clear just because another branch would have permitted it.
+ *
+ * `$ref` targets are resolved against `root`. A ref that is external, dangling,
+ * or cyclic contributes {@link UNRESOLVED_REF_NODE} instead, so an unreadable
+ * declaration masks rather than leaks.
  */
-function expandSchemaNodes(nodes: SchemaNode[]): SchemaNode[] {
+function expandSchemaNodes(nodes: SchemaNode[], root: SchemaNode | null = null): SchemaNode[] {
   const expanded: SchemaNode[] = [];
   const seen = new Set<SchemaNode>();
   const stack = [...nodes];
 
   while (stack.length > 0) {
     const node = stack.pop();
-    if (!isPlainRecord(node) || seen.has(node)) continue;
+    if (!isPlainRecord(node)) continue;
+    if (seen.has(node)) continue; // cycle or diamond — already accounted for
     seen.add(node);
     expanded.push(node);
+
+    const ref = node.$ref;
+    if (typeof ref === "string") {
+      const target = resolveLocalRef(ref, root);
+      if (target === null) {
+        expanded.push(UNRESOLVED_REF_NODE);
+      } else if (seen.has(target)) {
+        // A cycle reached this target already; its markers are in `expanded`.
+      } else {
+        stack.push(target);
+      }
+    }
+
     for (const keyword of ["allOf", "anyOf", "oneOf"] as const) {
       const branches = node[keyword];
       if (!Array.isArray(branches)) continue;
@@ -295,6 +350,35 @@ function nodesDeclareNotSecret(nodes: SchemaNode[]): boolean {
 }
 
 /**
+ * Add every string *leaf* reachable beneath `value` to `collector`.
+ *
+ * Used when a declared secret is masked wholesale: the container is replaced by
+ * a single sentinel, but each plaintext string it held must still be known to
+ * {@link redactSecretValuesDeep} so worker diagnostics cannot reflect it back.
+ *
+ * Object *keys* are deliberately not collected. Collected values feed an
+ * unbounded substring replacement (see {@link redactSecretValuesFromText}), and
+ * keys are schema-authored field names: collecting `host` from
+ * `{ host, password }` would rewrite "localhost" to "__redactedname" in every
+ * subsequent diagnostic. A credential used as a map key is still masked in the
+ * GET response — only the narrower diagnostic-reflection path is uncovered, and
+ * that is the better trade against corrupting operator-facing error text.
+ */
+function collectStringLeaves(value: unknown, collector: Set<string>): void {
+  if (typeof value === "string") {
+    if (value.length > 0) collector.add(value);
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const entry of value) collectStringLeaves(entry, collector);
+    return;
+  }
+  if (isPlainRecord(value)) {
+    for (const child of Object.values(value)) collectStringLeaves(child, collector);
+  }
+}
+
+/**
  * Return a copy of `configJson` with every secret-bearing value replaced by
  * {@link PLUGIN_CONFIG_SECRET_MASK}.
  *
@@ -324,9 +408,20 @@ export function maskPluginConfigJson(
 ): unknown {
   if (!isPlainRecord(configJson)) return configJson;
 
-  /** Record the plaintext being masked, for {@link collectPluginConfigSecretValues}. */
+  const root = isPlainRecord(schema) ? schema : null;
+
+  /**
+   * Record the plaintext being masked, for
+   * {@link collectPluginConfigSecretValues}.
+   *
+   * A *declared* secret is masked wholesale, so when the value is an object or
+   * array we must still record every string leaf beneath it. Recording only
+   * direct string inputs would leave `{ password: "live" }` uncollected, and
+   * "live" would then pass unredacted through the worker-diagnostic scrubbing in
+   * `POST /config/test`. Keys are left alone — see {@link collectStringLeaves}.
+   */
   function mask(value: unknown): string {
-    if (collector && typeof value === "string" && value.length > 0) collector.add(value);
+    if (collector) collectStringLeaves(value, collector);
     return PLUGIN_CONFIG_SECRET_MASK;
   }
 
@@ -369,7 +464,7 @@ export function maskPluginConfigJson(
         result[childKey] = maskNode(
           childValue,
           childKey,
-          expandSchemaNodes(childNodesForKey(nodes, childKey)),
+          expandSchemaNodes(childNodesForKey(nodes, childKey), root),
           suspect,
         );
       }
@@ -380,7 +475,7 @@ export function maskPluginConfigJson(
     // credential-shaped key (`tokens: [["live"]]`) is covered at any depth.
     if (Array.isArray(value)) {
       return value.map((entry, index) =>
-        maskNode(entry, null, expandSchemaNodes(childNodesForIndex(nodes, index)), suspect),
+        maskNode(entry, null, expandSchemaNodes(childNodesForIndex(nodes, index), root), suspect),
       );
     }
 
@@ -391,7 +486,7 @@ export function maskPluginConfigJson(
     return value;
   }
 
-  return maskNode(configJson, null, expandSchemaNodes(isPlainRecord(schema) ? [schema] : []), false);
+  return maskNode(configJson, null, expandSchemaNodes(root ? [root] : [], root), false);
 }
 
 /**
@@ -479,10 +574,15 @@ export function redactSecretValuesDeep<T>(value: T, secretValues: readonly strin
 const DROP_KEY = Symbol("plugin-config-mask-drop");
 
 /**
- * Keys tried first when identifying array entries across a masked round-trip.
- * Anything else present on every entry is still usable as a fallback identity.
+ * Manifest keyword designating the property that immutably identifies an array
+ * entry, e.g. `items: { "x-paperclip-identity": "id", … }`.
+ *
+ * Declaring it is a promise that the named property is stable for the lifetime
+ * of the entry. That promise is what makes it safe to re-home a stored
+ * credential onto a re-ordered or edited entry; see
+ * {@link mergeMaskedPluginConfig} for why nothing weaker will do.
  */
-const IDENTITY_KEY_PREFERENCE = ["id", "uuid", "name", "slug", "key"];
+const IDENTITY_KEYWORD = "x-paperclip-identity";
 
 export interface MergeMaskedPluginConfigResult {
   /** The posted config with sentinels resolved against storage. */
@@ -516,52 +616,55 @@ function identityValue(entry: Record<string, unknown>, key: string): string | nu
 }
 
 /**
- * Find a key that identifies entries stably across both arrays: present with a
- * usable scalar value on every entry, and unique within each array.
+ * The immutable identity property the manifest designates for entries of this
+ * array, from `x-paperclip-identity` on the array node or on its `items` node.
+ *
+ * Nothing is inferred. An inferred identity was the original bug: any unique
+ * scalar was accepted, including a mutable `name`, so renaming one entry to a
+ * deleted entry's name re-homed that entry's credential.
  */
-function findIdentityKey(
-  incoming: Record<string, unknown>[],
-  stored: Record<string, unknown>[],
-): string | null {
-  const candidates = Object.keys(incoming[0] ?? {});
-  const ordered = [
-    ...IDENTITY_KEY_PREFERENCE.filter((key) => candidates.includes(key)),
-    ...candidates.filter((key) => !IDENTITY_KEY_PREFERENCE.includes(key)).sort(),
-  ];
-
-  for (const key of ordered) {
-    const incomingValues = incoming.map((entry) => identityValue(entry, key));
-    const storedValues = stored.map((entry) => identityValue(entry, key));
-    if (incomingValues.some((value) => value === undefined)) continue;
-    if (storedValues.some((value) => value === undefined)) continue;
-    if (new Set(incomingValues).size !== incomingValues.length) continue;
-    if (new Set(storedValues).size !== storedValues.length) continue;
-    return key;
+function designatedIdentityKey(nodes: SchemaNode[], root: SchemaNode | null): string | null {
+  const candidates: SchemaNode[] = [...nodes];
+  for (const node of nodes) {
+    // `items` describes the entries, so authors naturally put it there.
+    if (isPlainRecord(node.items)) candidates.push(...expandSchemaNodes([node.items], root));
   }
-
+  for (const node of candidates) {
+    const declared = node[IDENTITY_KEYWORD];
+    if (typeof declared === "string" && declared.length > 0) return declared;
+  }
   return null;
 }
 
 /**
- * Whether every non-masked scalar the caller sent still matches storage. Used
- * only as the last-resort positional check, to detect that an array entry was
- * reordered or replaced rather than merely re-posted with its secret masked.
+ * Whether `incoming` is `stored` with secrets blanked out — every non-masked
+ * position deep-equals storage, and every masked position has something stored
+ * to restore.
+ *
+ * This is the evidence that a masked entry really is the stored entry re-posted
+ * rather than a different entry that happens to sit at the same index. It is
+ * deliberately exact, including key sets: an entry the operator edited no longer
+ * proves correspondence, and must be treated as unresolved rather than guessed
+ * at.
  */
-function scalarFieldsMatch(
-  incoming: Record<string, unknown>,
-  stored: Record<string, unknown>,
-): boolean {
-  for (const [key, value] of Object.entries(incoming)) {
-    if (value === PLUGIN_CONFIG_SECRET_MASK) continue;
-    const isScalar =
-      value === null ||
-      typeof value === "string" ||
-      typeof value === "number" ||
-      typeof value === "boolean";
-    if (!isScalar) continue;
-    if (stored[key] !== value) return false;
+function matchesIgnoringMask(incoming: unknown, stored: unknown): boolean {
+  if (incoming === PLUGIN_CONFIG_SECRET_MASK) return stored !== undefined;
+
+  if (Array.isArray(incoming)) {
+    if (!Array.isArray(stored) || stored.length !== incoming.length) return false;
+    return incoming.every((entry, index) => matchesIgnoringMask(entry, stored[index]));
   }
-  return true;
+
+  if (isPlainRecord(incoming)) {
+    if (!isPlainRecord(stored)) return false;
+    const incomingKeys = Object.keys(incoming);
+    if (incomingKeys.length !== Object.keys(stored).length) return false;
+    return incomingKeys.every(
+      (key) => key in stored && matchesIgnoringMask(incoming[key], stored[key]),
+    );
+  }
+
+  return incoming === stored;
 }
 
 /**
@@ -577,24 +680,68 @@ function scalarFieldsMatch(
  * Callers that supply a genuinely new value overwrite the stored secret as
  * before — only the exact sentinel is treated as "unchanged".
  *
- * **Array entries are never restored by bare position.** Restoring
- * `[A(mask), B(mask)]` positionally means that deleting `A` silently re-homes
- * `A`'s credential onto `B`, handing a live secret to a different endpoint. An
- * entry is matched by a stable identity key when one exists; failing that,
- * position is accepted only when the array is otherwise unchanged. Anything
- * else is reported in {@link MergeMaskedPluginConfigResult.unresolvedMaskPaths}
- * and the operator must re-enter the secret. Callers MUST reject a write whose
- * result carries unresolved paths; the sentinel is dropped from the returned
- * config as well, so an unchecked caller still cannot persist it.
+ * **Array entries are never restored by inferred identity or by bare
+ * position.** Both re-home live credentials:
+ *
+ * - *Inferred identity.* Accepting any unique scalar as an entry's identity
+ *   includes mutable fields. With `[{name:"a",token:X},{name:"b",token:Y}]`
+ *   stored, deleting `a` and renaming `b` to `a` posts one entry named `a` with
+ *   a masked token — and `X`, the deleted entry's credential, is restored onto
+ *   it.
+ * - *Position.* Reordering `[["x",mask],["y",mask]]` swaps which endpoint each
+ *   credential belongs to.
+ *
+ * So a masked entry is restored only on one of two proofs:
+ *
+ * 1. The manifest designates an immutable identity property via
+ *    `x-paperclip-identity`, and exactly one stored entry carries that identity.
+ *    Declaring it asserts the property never changes for a given entry, which is
+ *    what makes reorder and edit safe.
+ * 2. Failing that, the arrays are the same length and the entry at the same
+ *    index is exactly this entry with its secrets blanked
+ *    ({@link matchesIgnoringMask}). Anything else — a reorder, an insertion, a
+ *    deletion, or an edit to a non-secret field — is not proof and is refused.
+ *
+ * Rule 2 means an operator editing a sibling field of a masked secret must
+ * re-enter that secret. That is the deliberate cost of not guessing; a manifest
+ * that declares `x-paperclip-identity` gets the ergonomic path back.
+ *
+ * Unproven entries are reported in
+ * {@link MergeMaskedPluginConfigResult.unresolvedMaskPaths} and the operator
+ * must re-enter the secret. Callers MUST reject a write whose result carries
+ * unresolved paths; the sentinel is dropped from the returned config as well, so
+ * an unchecked caller still cannot persist it.
+ *
+ * @param schema - The plugin's `instanceConfigSchema`, walked in lockstep so
+ *   `x-paperclip-identity` is found at any depth. Omitting it costs only the
+ *   designated-identity path; rule 2 still applies.
  */
 export function mergeMaskedPluginConfig(
   incomingConfig: Record<string, unknown>,
   storedConfig: unknown,
+  schema?: SchemaNode | null,
 ): MergeMaskedPluginConfigResult {
   const stored = isPlainRecord(storedConfig) ? storedConfig : {};
+  const root = isPlainRecord(schema) ? schema : null;
   const unresolvedMaskPaths: string[] = [];
+  /**
+   * Set while draining an entry already reported unresolved. Its descendants
+   * resolve against nothing (so the sentinel is still dropped) but must not be
+   * reported again — one path per unresolvable entry, matching how record-shaped
+   * entries already behave.
+   */
+  let suppressUnresolvedReporting = false;
 
-  function mergeValue(incoming: unknown, storedValue: unknown, path: string): unknown {
+  function reportUnresolved(path: string): void {
+    if (!suppressUnresolvedReporting) unresolvedMaskPaths.push(path);
+  }
+
+  function mergeValue(
+    incoming: unknown,
+    storedValue: unknown,
+    path: string,
+    nodes: SchemaNode[],
+  ): unknown {
     if (incoming === PLUGIN_CONFIG_SECRET_MASK) {
       // Nothing stored to restore — drop the key rather than persist the mask.
       if (storedValue === undefined) return DROP_KEY;
@@ -602,11 +749,11 @@ export function mergeMaskedPluginConfig(
     }
 
     if (isPlainRecord(incoming)) {
-      return mergeRecord(incoming, isPlainRecord(storedValue) ? storedValue : {}, path);
+      return mergeRecord(incoming, isPlainRecord(storedValue) ? storedValue : {}, path, nodes);
     }
 
     if (Array.isArray(incoming)) {
-      return mergeArray(incoming, Array.isArray(storedValue) ? storedValue : [], path);
+      return mergeArray(incoming, Array.isArray(storedValue) ? storedValue : [], path, nodes);
     }
 
     return incoming;
@@ -616,30 +763,35 @@ export function mergeMaskedPluginConfig(
     incoming: Record<string, unknown>,
     storedNode: Record<string, unknown>,
     path: string,
+    nodes: SchemaNode[],
   ): Record<string, unknown> {
     const result: Record<string, unknown> = {};
     for (const [key, value] of Object.entries(incoming)) {
       const childPath = path ? `${path}.${key}` : key;
-      const merged = mergeValue(value, storedNode[key], childPath);
+      const merged = mergeValue(
+        value,
+        storedNode[key],
+        childPath,
+        expandSchemaNodes(childNodesForKey(nodes, key), root),
+      );
       if (merged === DROP_KEY) continue;
       result[key] = merged;
     }
     return result;
   }
 
-  function mergeArray(incoming: unknown[], storedArray: unknown[], path: string): unknown[] {
-    const bothAllRecords =
-      incoming.length > 0 &&
-      storedArray.length > 0 &&
-      incoming.every(isPlainRecord) &&
-      storedArray.every(isPlainRecord);
-    const identityKey = bothAllRecords
-      ? findIdentityKey(incoming as Record<string, unknown>[], storedArray as Record<string, unknown>[])
-      : null;
+  function mergeArray(
+    incoming: unknown[],
+    storedArray: unknown[],
+    path: string,
+    nodes: SchemaNode[],
+  ): unknown[] {
+    const identityKey = designatedIdentityKey(nodes, root);
 
     return incoming
       .map((entry, index) => {
         const entryPath = `${path}.${index}`;
+        const entryNodes = expandSchemaNodes(childNodesForIndex(nodes, index), root);
 
         // Entries carrying no sentinel need no stored counterpart at all, so a
         // structural change elsewhere in the array cannot invalidate them.
@@ -647,32 +799,47 @@ export function mergeMaskedPluginConfig(
 
         let storedEntry: unknown;
 
-        if (identityKey) {
-          const wanted = identityValue(entry as Record<string, unknown>, identityKey);
-          storedEntry = (storedArray as Record<string, unknown>[]).find(
-            (candidate) => identityValue(candidate, identityKey) === wanted,
-          );
+        if (identityKey && isPlainRecord(entry)) {
+          // Proof 1: a manifest-designated immutable identity, matched uniquely.
+          const wanted = identityValue(entry, identityKey);
+          const matches =
+            wanted === undefined
+              ? []
+              : storedArray.filter(
+                  (candidate) =>
+                    isPlainRecord(candidate) && identityValue(candidate, identityKey) === wanted,
+                );
+          storedEntry = matches.length === 1 ? matches[0] : undefined;
         } else if (incoming.length === storedArray.length) {
+          // Proof 2: same shape, same place, identical but for the secrets.
           const positional = storedArray[index];
-          const stable =
-            !isPlainRecord(entry) ||
-            (isPlainRecord(positional) && scalarFieldsMatch(entry, positional));
-          storedEntry = stable ? positional : undefined;
+          storedEntry = matchesIgnoringMask(entry, positional) ? positional : undefined;
         } else {
           storedEntry = undefined;
         }
 
         if (storedEntry === undefined) {
-          unresolvedMaskPaths.push(entryPath);
+          reportUnresolved(entryPath);
           // Resolve against nothing: the sentinel is dropped, never persisted.
-          return mergeValue(entry, undefined, entryPath);
+          const wasSuppressed = suppressUnresolvedReporting;
+          suppressUnresolvedReporting = true;
+          try {
+            return mergeValue(entry, undefined, entryPath, entryNodes);
+          } finally {
+            suppressUnresolvedReporting = wasSuppressed;
+          }
         }
 
-        return mergeValue(entry, storedEntry, entryPath);
+        return mergeValue(entry, storedEntry, entryPath, entryNodes);
       })
       .filter((entry) => entry !== DROP_KEY);
   }
 
-  const configJson = mergeRecord(incomingConfig, stored, "");
+  const configJson = mergeRecord(
+    incomingConfig,
+    stored,
+    "",
+    expandSchemaNodes(root ? [root] : [], root),
+  );
   return { configJson, unresolvedMaskPaths: [...new Set(unresolvedMaskPaths)] };
 }

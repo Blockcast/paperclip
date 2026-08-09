@@ -1,16 +1,22 @@
 import { describe, expect, it } from "vitest";
 import {
   PLUGIN_CONFIG_SECRET_MASK,
+  collectPluginConfigSecretValues,
   maskPluginConfigJson,
   mergeMaskedPluginConfig,
+  redactSecretValuesDeep,
 } from "../services/plugin-config-masking.js";
 
 const SECRET = "super-secret-bearer-value";
 const SECRET_ID = "77777777-7777-4777-8777-777777777777";
 
 /** The merge contract is "resolved config + paths that could not be resolved". */
-function merge(incoming: Record<string, unknown>, stored: unknown) {
-  return mergeMaskedPluginConfig(incoming, stored);
+function merge(
+  incoming: Record<string, unknown>,
+  stored: unknown,
+  schema?: Record<string, unknown> | null,
+) {
+  return mergeMaskedPluginConfig(incoming, stored, schema);
 }
 
 /** Most assertions only care about the resolved config. */
@@ -89,6 +95,144 @@ describe("maskPluginConfigJson — declaration markers", () => {
   it("ignores a missing or non-object schema", () => {
     expect(maskPluginConfigJson({ plain: "value" }, undefined)).toEqual({ plain: "value" });
     expect(maskPluginConfigJson({ plain: "value" }, null)).toEqual({ plain: "value" });
+  });
+});
+
+describe("maskPluginConfigJson — local `$ref` declarations", () => {
+  // Round-6 finding: `expandSchemaNodes` followed only allOf/anyOf/oneOf, so a
+  // marker sitting on a `$defs` entry was never seen and the field came back in
+  // plaintext whenever its key did not trip the name heuristic.
+  it("masks a scalar secret declared behind a local $ref", () => {
+    const masked = maskPluginConfigJson(
+      { auth: SECRET, endpoint: "https://a.example.com" },
+      {
+        type: "object",
+        $defs: { credential: { type: "string", writeOnly: true } },
+        properties: {
+          auth: { $ref: "#/$defs/credential" },
+          endpoint: { type: "string" },
+        },
+      },
+    );
+
+    expect(masked).toEqual({
+      auth: PLUGIN_CONFIG_SECRET_MASK,
+      endpoint: "https://a.example.com",
+    });
+    expect(JSON.stringify(masked)).not.toContain(SECRET);
+  });
+
+  it("masks an object secret declared behind a local $ref", () => {
+    const masked = maskPluginConfigJson(
+      { auth: { user: "svc", pass: SECRET }, endpoint: "https://a.example.com" },
+      {
+        type: "object",
+        $defs: {
+          credential: {
+            type: "object",
+            "x-paperclip-secret": true,
+            properties: { user: { type: "string" }, pass: { type: "string" } },
+          },
+        },
+        properties: {
+          auth: { $ref: "#/$defs/credential" },
+          endpoint: { type: "string" },
+        },
+      },
+    );
+
+    expect(masked).toEqual({
+      auth: PLUGIN_CONFIG_SECRET_MASK,
+      endpoint: "https://a.example.com",
+    });
+    expect(JSON.stringify(masked)).not.toContain(SECRET);
+  });
+
+  it("resolves a $ref nested inside array items", () => {
+    const masked = maskPluginConfigJson(
+      { targets: [{ url: "https://a.example.com", auth: SECRET }] },
+      {
+        type: "object",
+        $defs: { credential: { type: "string", writeOnly: true } },
+        properties: {
+          targets: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: { url: { type: "string" }, auth: { $ref: "#/$defs/credential" } },
+            },
+          },
+        },
+      },
+    );
+
+    expect(masked).toEqual({
+      targets: [{ url: "https://a.example.com", auth: PLUGIN_CONFIG_SECRET_MASK }],
+    });
+    expect(JSON.stringify(masked)).not.toContain(SECRET);
+  });
+
+  it("fails closed on a dangling $ref rather than emitting plaintext", () => {
+    const masked = maskPluginConfigJson(
+      { auth: SECRET },
+      { type: "object", properties: { auth: { $ref: "#/$defs/missing" } } },
+    );
+
+    expect(masked).toEqual({ auth: PLUGIN_CONFIG_SECRET_MASK });
+    expect(JSON.stringify(masked)).not.toContain(SECRET);
+  });
+
+  it("fails closed on an external $ref", () => {
+    const masked = maskPluginConfigJson(
+      { auth: SECRET },
+      { type: "object", properties: { auth: { $ref: "https://example.com/schema.json#/x" } } },
+    );
+
+    expect(masked).toEqual({ auth: PLUGIN_CONFIG_SECRET_MASK });
+    expect(JSON.stringify(masked)).not.toContain(SECRET);
+  });
+
+  it("terminates on a cyclic $ref", () => {
+    const masked = maskPluginConfigJson(
+      { node: { child: { leaf: "plain" } } },
+      {
+        type: "object",
+        $defs: {
+          loop: { type: "object", properties: { child: { $ref: "#/$defs/loop" } } },
+        },
+        properties: { node: { $ref: "#/$defs/loop" } },
+      },
+    );
+
+    // The point is that it returns at all; a cycle must not hang the request.
+    expect(masked).toBeDefined();
+  });
+
+  it("honours RFC 6901 escaping in a $ref pointer", () => {
+    const masked = maskPluginConfigJson(
+      { auth: SECRET },
+      {
+        type: "object",
+        $defs: { "a/b": { type: "string", writeOnly: true } },
+        properties: { auth: { $ref: "#/$defs/a~1b" } },
+      },
+    );
+
+    expect(masked).toEqual({ auth: PLUGIN_CONFIG_SECRET_MASK });
+  });
+
+  it("leaves a non-secret $ref target in the clear", () => {
+    // Guards the fail-closed behaviour from becoming blanket masking.
+    const masked = maskPluginConfigJson(
+      { endpoint: "https://a.example.com" },
+      {
+        type: "object",
+        $defs: { url: { type: "string" } },
+        properties: { endpoint: { $ref: "#/$defs/url" } },
+      },
+    );
+
+    expect(masked).toEqual({ endpoint: "https://a.example.com" });
   });
 });
 
@@ -485,6 +629,22 @@ describe("mergeMaskedPluginConfig — array entry identity", () => {
     ],
   };
 
+  // A manifest that promises `name` never changes for a given entry. Only this
+  // declaration buys reorder/edit tolerance; see mergeMaskedPluginConfig.
+  const IDENTITY_SCHEMA = {
+    type: "object",
+    properties: {
+      targets: {
+        type: "array",
+        items: {
+          type: "object",
+          "x-paperclip-identity": "name",
+          properties: { name: { type: "string" }, url: { type: "string" } },
+        },
+      },
+    },
+  };
+
   it("restores each entry's own secret on an unmodified round-trip", () => {
     const masked = maskPluginConfigJson(STORED_TARGETS) as Record<string, unknown>;
     const result = merge(JSON.parse(JSON.stringify(masked)), STORED_TARGETS);
@@ -493,7 +653,7 @@ describe("mergeMaskedPluginConfig — array entry identity", () => {
     expect(result.configJson).toEqual(STORED_TARGETS);
   });
 
-  it("follows the entry, not the index, when entries are reordered", () => {
+  it("follows the entry, not the index, when the manifest designates an identity", () => {
     const result = merge(
       {
         targets: [
@@ -502,6 +662,7 @@ describe("mergeMaskedPluginConfig — array entry identity", () => {
         ],
       },
       STORED_TARGETS,
+      IDENTITY_SCHEMA,
     );
 
     expect(result.unresolvedMaskPaths).toEqual([]);
@@ -513,18 +674,109 @@ describe("mergeMaskedPluginConfig — array entry identity", () => {
     });
   });
 
+  it("refuses a reorder when no identity is designated, rather than guessing", () => {
+    // Without `x-paperclip-identity` nothing proves that the entry now at index
+    // 0 is the entry that was stored at index 0, so both are refused.
+    const result = merge(
+      {
+        targets: [
+          { name: "beta", url: "https://b.example.com", token: PLUGIN_CONFIG_SECRET_MASK },
+          { name: "alpha", url: "https://a.example.com", token: PLUGIN_CONFIG_SECRET_MASK },
+        ],
+      },
+      STORED_TARGETS,
+    );
+
+    expect(result.unresolvedMaskPaths).toEqual(["targets.0", "targets.1"]);
+    expect(JSON.stringify(result.configJson)).not.toContain("token-");
+    expect(JSON.stringify(result.configJson)).not.toContain(PLUGIN_CONFIG_SECRET_MASK);
+  });
+
   it("does not re-home a credential when an earlier entry is deleted", () => {
     // The BLO-20871 review finding: positional restore would hand `token-alpha`
-    // to beta's endpoint.
+    // to beta's endpoint. With a designated identity, beta keeps its own.
     const result = merge(
       { targets: [{ name: "beta", url: "https://b.example.com", token: PLUGIN_CONFIG_SECRET_MASK }] },
       STORED_TARGETS,
+      IDENTITY_SCHEMA,
     );
 
     expect(result.unresolvedMaskPaths).toEqual([]);
     expect(result.configJson).toEqual({
       targets: [{ name: "beta", url: "https://b.example.com", token: "token-beta" }],
     });
+    expect(JSON.stringify(result.configJson)).not.toContain("token-alpha");
+  });
+
+  it("does not re-home a credential when an entry is deleted and another renamed into its place", () => {
+    // Round-6 finding: an *inferred* identity accepted any unique scalar, so
+    // `name` served as identity even though it is mutable. Deleting alpha and
+    // renaming beta to "alpha" then restored alpha's credential onto beta's
+    // endpoint. With no designated identity this must be refused outright.
+    const result = merge(
+      { targets: [{ name: "alpha", url: "https://b.example.com", token: PLUGIN_CONFIG_SECRET_MASK }] },
+      STORED_TARGETS,
+    );
+
+    expect(result.unresolvedMaskPaths).toEqual(["targets.0"]);
+    expect(JSON.stringify(result.configJson)).not.toContain("token-alpha");
+    expect(JSON.stringify(result.configJson)).not.toContain("token-beta");
+  });
+
+  it("does not swap secrets when nested tuple entries are reordered", () => {
+    // Round-6 finding: equal-length non-record entries fell through to a bare
+    // positional restore, so reordering swapped which credential belonged to
+    // which endpoint without ever reporting an unresolved path.
+    const stored = { pairs: [["alpha", "token-alpha"], ["beta", "token-beta"]] };
+    const result = merge(
+      {
+        pairs: [
+          ["beta", PLUGIN_CONFIG_SECRET_MASK],
+          ["alpha", PLUGIN_CONFIG_SECRET_MASK],
+        ],
+      },
+      stored,
+    );
+
+    expect(result.unresolvedMaskPaths).toEqual(["pairs.0", "pairs.1"]);
+    expect(JSON.stringify(result.configJson)).not.toContain("token-");
+    expect(JSON.stringify(result.configJson)).not.toContain(PLUGIN_CONFIG_SECRET_MASK);
+  });
+
+  it("still restores nested tuple entries that were left in place", () => {
+    const stored = { pairs: [["alpha", "token-alpha"], ["beta", "token-beta"]] };
+    const result = merge(
+      {
+        pairs: [
+          ["alpha", PLUGIN_CONFIG_SECRET_MASK],
+          ["beta", PLUGIN_CONFIG_SECRET_MASK],
+        ],
+      },
+      stored,
+    );
+
+    expect(result.unresolvedMaskPaths).toEqual([]);
+    expect(result.configJson).toEqual(stored);
+  });
+
+  it("refuses a designated identity that matches more than one stored entry", () => {
+    const result = merge(
+      { targets: [{ name: "dup", token: PLUGIN_CONFIG_SECRET_MASK }] },
+      { targets: [{ name: "dup", token: "token-one" }, { name: "dup", token: "token-two" }] },
+      IDENTITY_SCHEMA,
+    );
+
+    expect(result.unresolvedMaskPaths).toEqual(["targets.0"]);
+    expect(JSON.stringify(result.configJson)).not.toContain("token-");
+  });
+
+  it("refuses an edit to a non-secret sibling when no identity is designated", () => {
+    const result = merge(
+      { targets: [{ name: "alpha", url: "https://moved.example.com", token: PLUGIN_CONFIG_SECRET_MASK }, STORED_TARGETS.targets[1]] },
+      STORED_TARGETS,
+    );
+
+    expect(result.unresolvedMaskPaths).toEqual(["targets.0"]);
     expect(JSON.stringify(result.configJson)).not.toContain("token-alpha");
   });
 
@@ -651,5 +903,85 @@ describe("maskPluginConfigJson — credential-shaped containers", () => {
 
     expect(JSON.stringify(masked)).not.toContain(SECRET);
     expect(mergeConfig(JSON.parse(JSON.stringify(masked)), stored)).toEqual(stored);
+  });
+});
+
+describe("collectPluginConfigSecretValues — structured declared secrets", () => {
+  // Round-6 finding: a declared secret that is an object or array is masked
+  // wholesale, and the collector recorded only *direct string* inputs. The
+  // nested leaves were therefore unknown to the diagnostic scrubber, so a worker
+  // that echoed one back leaked it through POST /config/test.
+  const OBJECT_SCHEMA = {
+    type: "object",
+    properties: {
+      auth: {
+        type: "object",
+        "x-paperclip-secret": true,
+        properties: { user: { type: "string" }, password: { type: "string" } },
+      },
+      endpoint: { type: "string" },
+    },
+  };
+
+  it("collects every string leaf of an object-shaped declared secret", () => {
+    const values = collectPluginConfigSecretValues(
+      { auth: { user: "svc", password: "live-password" }, endpoint: "https://a.example.com" },
+      OBJECT_SCHEMA,
+    );
+
+    expect(values).toContain("live-password");
+    expect(values).toContain("svc");
+    expect(values).not.toContain("https://a.example.com");
+  });
+
+  it("collects every string leaf of an array-shaped declared secret", () => {
+    const values = collectPluginConfigSecretValues(
+      { keys: ["live-one", "live-two"] },
+      {
+        type: "object",
+        properties: { keys: { type: "array", "x-paperclip-secret": true } },
+      },
+    );
+
+    expect(values).toEqual(expect.arrayContaining(["live-one", "live-two"]));
+  });
+
+  it("collects leaves nested at arbitrary depth under a declared secret", () => {
+    const values = collectPluginConfigSecretValues(
+      { auth: { nested: [{ deep: "live-deep" }] } },
+      {
+        type: "object",
+        properties: { auth: { type: "object", writeOnly: true } },
+      },
+    );
+
+    expect(values).toContain("live-deep");
+  });
+
+  it("does not collect schema-authored keys, which would corrupt diagnostics", () => {
+    // Collected values feed an unbounded substring replacement, so collecting
+    // the key "user" would rewrite every later mention of it — including inside
+    // words like "username" — in operator-facing error text.
+    const values = collectPluginConfigSecretValues(
+      { auth: { user: "svc", password: "live-password" } },
+      OBJECT_SCHEMA,
+    );
+
+    expect(values).not.toContain("user");
+    expect(values).not.toContain("password");
+  });
+
+  it("redacts a structured secret's leaves out of a worker diagnostic", () => {
+    const values = collectPluginConfigSecretValues(
+      { auth: { user: "svc", password: "live-password" } },
+      OBJECT_SCHEMA,
+    );
+
+    const diagnostic = redactSecretValuesDeep(
+      { warnings: ["401 rejected for live-password"], detail: { echoed: "live-password" } },
+      values,
+    );
+
+    expect(JSON.stringify(diagnostic)).not.toContain("live-password");
   });
 });
