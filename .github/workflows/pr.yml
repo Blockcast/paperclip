@@ -13,10 +13,6 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  SCCACHE_GHA_ENABLED: "true"
-  RUSTC_WRAPPER: sccache
-  CC: "sccache gcc"
-  CXX: "sccache g++"
   PR_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
   PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
 
@@ -80,17 +76,49 @@ jobs:
       - name: Validate Docker deploy timeout margin
         run: node --test ./scripts/check-docker-deploy-timeout.test.js
 
+      - name: Test CI cache and Docker runner routing
+        run: node --test ./scripts/__tests__/ci-cache-routing.test.mjs
+
       - name: Reject git push in adapter/runtime code
         run: node ./scripts/check-no-git-push.mjs
 
       - name: Test no-git-push check
         run: node --test ./scripts/check-no-git-push.test.mjs
 
+      - name: Reject App-attributed commits on the PR (BLO-21416)
+        # Non-merge commits stamped with the shared allyblockcast[bot] App
+        # identity mean the commit was created via the GitHub REST/MCP write
+        # path (contents API, merge API, `create_or_update_file`/
+        # `push_files`) instead of `git push` — see AGENTS.md §9. Uses the
+        # already-checked-out history (fetch-depth: 0 above), no new token.
+        #
+        # There is deliberately NO branch exemption. The graphify-reindex bot
+        # commits via `git push` under its own git identity
+        # (`allyblockcast[bot]@users.noreply.github.com`), which is not the
+        # REST-path stamp this gate matches
+        # (`290875700+allyblockcast[bot]@users.noreply.github.com`) — measured
+        # by running this script over the real graphify PRs #789 and #944:
+        # both pass. A `github.head_ref`-keyed exemption was therefore
+        # protecting against a rejection that never happens, while being both
+        # a fork bypass (any fork can name its branch `bot/graphify-reindex`,
+        # and `head_ref` carries no repository identity) and a merge-queue
+        # false-reject (`head_ref` is empty in `merge_group`). Pinned by the
+        # graphify-identity case in check-commit-author-attribution.test.mjs —
+        # if that test starts failing, the bot moved onto the REST write path
+        # and the right fix is to move it back, not to re-add an exemption.
+        run: node ./scripts/check-commit-author-attribution.mjs --base "$PR_BASE_SHA" --head "$PR_HEAD_SHA"
+
+      - name: Test commit-author-attribution check
+        run: node --test ./scripts/check-commit-author-attribution.test.mjs
+
       - name: Test gh token wrapper
         run: node --test ./scripts/gh-token-wrapper.test.mjs
 
       - name: Test PR test-coverage gate
         run: node --test ./.github/scripts/tests/check-pr-test-coverage.test.mjs
+
+      - name: Test ffmpeg muxer detection (BLO-23128)
+        run: node --test ./.github/scripts/tests/check-ffmpeg-muxer.test.mjs
 
       - name: Validate Designer fast-uri security floor
         run: node ./scripts/designer-fast-uri-security.test.js
@@ -129,6 +157,9 @@ jobs:
 
       - name: Test verify job cancelled/skipped-vs-failed lane outcome
         run: node --test ./scripts/__tests__/pr-verify-lane-outcome.test.mjs
+
+      - name: Test PR server-shard folding
+        run: node --test ./scripts/__tests__/pr-ci-shard-folding.test.mjs
 
       - name: Validate release package manifest
         run: node ./scripts/release-package-map.mjs check
@@ -228,6 +259,7 @@ jobs:
           version: 9.15.4
 
       - name: Restore regenerated PR lockfile (if policy uploaded one)
+        if: needs.policy.outputs.lockfile_regenerated == '1'
         uses: actions/download-artifact@v4
         continue-on-error: true
         with:
@@ -239,9 +271,6 @@ jobs:
         with:
           node-version: 24
           cache: pnpm
-
-      - name: Set up GHA-backed sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -280,6 +309,7 @@ jobs:
           version: 9.15.4
 
       - name: Restore regenerated PR lockfile (if policy uploaded one)
+        if: needs.policy.outputs.lockfile_regenerated == '1'
         uses: actions/download-artifact@v4
         continue-on-error: true
         with:
@@ -430,6 +460,7 @@ jobs:
           version: 9.15.4
 
       - name: Restore regenerated PR lockfile (if policy uploaded one)
+        if: needs.policy.outputs.lockfile_regenerated == '1'
         uses: actions/download-artifact@v4
         continue-on-error: true
         with:
@@ -442,9 +473,6 @@ jobs:
           node-version: 24
           cache: pnpm
 
-      - name: Set up GHA-backed sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
-
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
@@ -456,13 +484,17 @@ jobs:
           fi
           pnpm test:run:general -- "${args[@]}"
 
+      # Reuse the checkout, dependency install, cache restore, and embedded
+      # Postgres setup already paid for by each server shard. This removes four
+      # ARC pod cold starts without reducing serialized-suite coverage.
+      - name: Run serialized server test shard
+        if: matrix.group == 'general-server'
+        run: pnpm test:run:serialized -- --shard-index ${{ matrix.shard_index }} --shard-count ${{ matrix.shard_count }}
+
   verify:
     # Preserve the legacy required-check name while the underlying work runs in parallel.
-    # BLO-20869: verify_serialized_server is folded in here (rather than made
-    # required on its own) so a cancelled/skipped/never-scheduled serialized
-    # shard fails this required check instead of being invisible to the merge
-    # gate. See the issue for the measured latency tradeoff of putting a
-    # ~90-minute job on the required path this way.
+    # Serialized server suites run inside the four general-server matrix jobs,
+    # so general_tests remains the required aggregate for both test families.
     name: verify
     if: ${{ always() }}
     needs:
@@ -473,7 +505,6 @@ jobs:
         worktree_install,
         opencode_responses_replay,
         build,
-        verify_serialized_server,
       ]
     runs-on: arc-light
     timeout-minutes: 5
@@ -507,7 +538,6 @@ jobs:
           WORKTREE_INSTALL_RESULT: ${{ needs.worktree_install.result }}
           OPENCODE_RESPONSES_REPLAY_RESULT: ${{ needs.opencode_responses_replay.result }}
           BUILD_RESULT: ${{ needs.build.result }}
-          VERIFY_SERIALIZED_SERVER_RESULT: ${{ needs.verify_serialized_server.result }}
         run: |
           lane_names=(
             helm_chart
@@ -516,7 +546,6 @@ jobs:
             worktree_install
             opencode_responses_replay
             build
-            verify_serialized_server
           )
           lane_results=(
             "$HELM_CHART_RESULT"
@@ -525,7 +554,6 @@ jobs:
             "$WORKTREE_INSTALL_RESULT"
             "$OPENCODE_RESPONSES_REPLAY_RESULT"
             "$BUILD_RESULT"
-            "$VERIFY_SERIALIZED_SERVER_RESULT"
           )
 
           cancelled_lanes=()
@@ -581,6 +609,7 @@ jobs:
           version: 9.15.4
 
       - name: Restore regenerated PR lockfile (if policy uploaded one)
+        if: needs.policy.outputs.lockfile_regenerated == '1'
         uses: actions/download-artifact@v4
         continue-on-error: true
         with:
@@ -592,72 +621,12 @@ jobs:
         with:
           node-version: 24
           cache: pnpm
-
-      - name: Set up GHA-backed sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
       - name: Build
         run: pnpm build
-
-  verify_serialized_server:
-    name: Verify serialized server suites (${{ matrix.shard_label }})
-    needs: [policy, general_tests]
-    # BLO-22428: route merge_group traffic to the dedicated arc-merge-queue
-    # pool so pull_request and merge_group traffic cannot starve each other.
-    # See typecheck_release_registry above.
-    runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-paperclip-general' }}
-    timeout-minutes: 90
-    strategy:
-      fail-fast: false
-      max-parallel: 4
-      matrix:
-        include:
-          - shard_index: 0
-            shard_count: 4
-            shard_label: 1/4
-          - shard_index: 1
-            shard_count: 4
-            shard_label: 2/4
-          - shard_index: 2
-            shard_count: 4
-            shard_label: 3/4
-          - shard_index: 3
-            shard_count: 4
-            shard_label: 4/4
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v6
-        with:
-          version: 9.15.4
-
-      - name: Restore regenerated PR lockfile (if policy uploaded one)
-        uses: actions/download-artifact@v4
-        continue-on-error: true
-        with:
-          name: pr-lockfile
-          path: .
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v6
-        with:
-          node-version: 24
-          cache: pnpm
-
-      - name: Set up GHA-backed sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
-
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: Run serialized server test shard
-        run: pnpm test:run:serialized -- --shard-index ${{ matrix.shard_index }} --shard-count ${{ matrix.shard_count }}
 
   canary_dry_run:
     name: Canary Dry Run
@@ -680,6 +649,7 @@ jobs:
           version: 9.15.4
 
       - name: Restore regenerated PR lockfile (if policy uploaded one)
+        if: needs.policy.outputs.lockfile_regenerated == '1'
         uses: actions/download-artifact@v4
         continue-on-error: true
         with:
@@ -691,9 +661,6 @@ jobs:
         with:
           node-version: 24
           cache: pnpm
-
-      - name: Set up GHA-backed sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -741,6 +708,7 @@ jobs:
           version: 9.15.4
 
       - name: Restore regenerated PR lockfile (if policy uploaded one)
+        if: needs.policy.outputs.lockfile_regenerated == '1'
         uses: actions/download-artifact@v4
         continue-on-error: true
         with:
@@ -752,9 +720,6 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
-
-      - name: Set up GHA-backed sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile

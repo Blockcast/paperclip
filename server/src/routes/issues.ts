@@ -2063,7 +2063,13 @@ function isCurrentIssueExecutionRun(
   if (req.actor.type !== "agent") return false;
   const runId = req.actor.runId;
   if (!runId) return false;
-  return issue.checkoutRunId === runId || issue.executionRunId === runId;
+  const ownsCheckout = issue.checkoutRunId === runId;
+  const ownsExecution = issue.executionRunId === runId;
+  return (
+    (ownsCheckout || ownsExecution) &&
+    (issue.checkoutRunId == null || ownsCheckout) &&
+    (issue.executionRunId == null || ownsExecution)
+  );
 }
 
 function summarizeIssueMonitor(
@@ -5042,32 +5048,19 @@ export function issueRoutes(
     );
   }
 
-  // A stage decision is a status advance, optionally carrying the reviewer's
-  // rationale. Deliberately mirrors isBlockedCorrectionPatchBody: anything else
-  // in the body (assignee moves, executionPolicy edits, title/description,
-  // relations) is not a stage decision and must stay on the ownership path.
-  // `in_review` is excluded because it does not advance a pending stage —
-  // hasExecutionStageOverrideAuthorization rejects it for the same reason.
   function isExecutionStageDecisionPatchBody(body: unknown) {
     if (!body || typeof body !== "object" || Array.isArray(body)) return false;
     const patch = body as Record<string, unknown>;
-    const allowedKeys = new Set(["status", "comment"]);
-    if (!Object.keys(patch).every((key) => allowedKeys.has(key))) return false;
-    return typeof patch.status === "string" && patch.status !== "in_review";
+    const presentKeys = Object.entries(patch)
+      .filter(([, value]) => value !== undefined)
+      .map(([key]) => key);
+    if (presentKeys.length === 0) return false;
+    const allowedKeys = new Set(["status", "comment", "reviewRequest"]);
+    if (!presentKeys.every((key) => allowedKeys.has(key))) return false;
+    return patch.status === "done" || patch.status === "in_progress";
   }
 
-  // BLO-19081: the stage's currentParticipant and the issue's assigneeAgentId
-  // can diverge (a reassignment while a review stage is pending), which left the
-  // pinned reviewer unable to decide their own stage — a hard 403 with no actor
-  // able to clear it. This grants the participant exactly that decision and
-  // nothing else. Double-narrowed like isAgentBlockedCorrectionForActiveExecutionStage:
-  // callers must opt in via options.allowExecutionStageDecision (only the
-  // PATCH /issues/:id route does), *and* the body must be a stage decision.
-  // Without both, this grant would reach all 25 assertAgentIssueMutationAllowed
-  // routes — including DELETE /issues/:id and the document/work-product writes
-  // that back the done-gate evidence, letting one actor author closure evidence
-  // and then approve the close.
-  function isAgentCurrentExecutionStageParticipant(
+  function isAgentExecutionStageParticipantDecision(
     req: Request,
     issue: { status: string; executionState?: unknown },
   ) {
@@ -5076,10 +5069,8 @@ export function issueRoutes(
     if (issue.status !== "in_review") return false;
     const executionState = parseIssueExecutionState(issue.executionState);
     if (executionState?.status !== "pending") return false;
-    return actorMatchesExecutionParticipant(
-      { actorType: "agent", actorId: req.actor.agentId },
-      executionState.currentParticipant,
-    );
+    const actor = { type: "agent" as const, agentId: req.actor.agentId, userId: null };
+    return executionPrincipalsEqual(executionState.currentParticipant, actor);
   }
 
   // BLO-18289: returns the coordination-metadata field names in this PATCH
@@ -5205,7 +5196,6 @@ export function issueRoutes(
     },
     options: {
       allowBlockedCorrection?: boolean;
-      allowExecutionStageDecision?: boolean;
       allowScopedRecoveryOwnerSourceMutation?: boolean;
       allowRecoveryActionOwner?: boolean;
       allowProductivityReviewOwner?: boolean;
@@ -5214,7 +5204,18 @@ export function issueRoutes(
         previousAssigneeAgentId: string | null;
         issueStatus: string;
       }) => void;
+      onCheckoutOwnershipValidated?: (input: {
+        checkoutRunId: string | null;
+        executionRunId: string | null;
+      }) => void;
       allowCoordinationMetadata?: boolean;
+      /**
+       * PATCH /issues/:id only: when an execution-stage currentParticipant and
+       * issue assignee diverge, the participant must still be able to submit a
+       * decision-shaped stage patch. Keep this opt-in and shape-gated because
+       * this helper also protects delete/document/work-product routes.
+       */
+      allowExecutionStageParticipantDecision?: boolean;
       /**
        * BLO-18797: opt in to the allow_issue_creator / allow_manager_chain
        * ownership bypass below. Off by default and deliberately so — this
@@ -5329,7 +5330,10 @@ export function issueRoutes(
     if (options.allowBlockedCorrection && isAgentBlockedCorrectionForActiveExecutionStage(req, issue)) {
       return true;
     }
-    if (options.allowExecutionStageDecision && isAgentCurrentExecutionStageParticipant(req, issue)) {
+    if (
+      options.allowExecutionStageParticipantDecision &&
+      isAgentExecutionStageParticipantDecision(req, issue)
+    ) {
       return true;
     }
     if (issue.assigneeAgentId !== actorAgentId) {
@@ -5421,6 +5425,12 @@ export function issueRoutes(
     const runId = requireAgentRunId(req, res);
     if (!runId) return false;
     const ownership = await svc.assertCheckoutOwner(issue.id, actorAgentId, runId);
+    if ("checkoutRunId" in ownership || "executionRunId" in ownership) {
+      options.onCheckoutOwnershipValidated?.({
+        checkoutRunId: ownership.checkoutRunId ?? null,
+        executionRunId: ownership.executionRunId ?? null,
+      });
+    }
     if (ownership.adoptedFromRunId) {
       const actor = getActorInfo(req);
       await logActivity(db, {
@@ -9740,6 +9750,15 @@ export function issueRoutes(
         issueStatus: string;
       } | null;
     } = { current: null };
+    let currentRunMutationOwnershipSnapshot: {
+      checkoutRunId: string | null;
+      executionRunId: string | null;
+    } | null = req.actor.type === "agent" && isCurrentIssueExecutionRun(req, existing)
+      ? {
+          checkoutRunId: existing.checkoutRunId ?? null,
+          executionRunId: existing.executionRunId ?? null,
+        }
+      : null;
     // BLO-18289: coordination-metadata allowlist. Evaluated before the boundary
     // check so a manager holding tasks:assign can curate the dependency graph
     // on a report's issue; null whenever the body is not exclusively
@@ -9765,13 +9784,16 @@ export function issueRoutes(
       existing,
       {
         allowBlockedCorrection: true,
-        allowExecutionStageDecision: true,
         allowScopedRecoveryOwnerSourceMutation,
         allowProductivityReviewOwner: true,
         onProductivityReviewOwnerMutationAllowed: (audit) => {
           productivityReviewSourceMutationAudit.current = audit;
         },
+        onCheckoutOwnershipValidated: (ownership) => {
+          currentRunMutationOwnershipSnapshot = ownership;
+        },
         allowCoordinationMetadata: coordinationMetadataDecision !== null,
+        allowExecutionStageParticipantDecision: true,
         // BLO-18797: the delegate-recovery path. The helper additionally
         // requires a blocked -> todo patch containing only status and
         // blockedByIssueIds.
@@ -10191,6 +10213,27 @@ export function issueRoutes(
       }
     }
 
+    const executionSnapshotPreconditions = updateFields.executionState === undefined
+      ? {}
+      : {
+          expectedCurrentStatus: existing.status,
+          expectedCurrentExecutionState:
+            existing.executionState && typeof existing.executionState === "object"
+              ? existing.executionState
+              : null,
+          expectedCurrentExecutionPolicy:
+            existing.executionPolicy && typeof existing.executionPolicy === "object"
+              ? existing.executionPolicy
+              : null,
+        };
+    const currentRunMutationPreconditions =
+      req.actor.type === "agent" && currentRunMutationOwnershipSnapshot
+        ? {
+            expectedCurrentCheckoutRunId: currentRunMutationOwnershipSnapshot.checkoutRunId,
+            expectedCurrentExecutionRunId: currentRunMutationOwnershipSnapshot.executionRunId,
+          }
+        : {};
+
     let issue;
     try {
       if (transition.decision && decisionId) {
@@ -10202,6 +10245,8 @@ export function issueRoutes(
               ...updateFields,
               actorAgentId: actor.agentId ?? null,
               actorUserId: actor.actorType === "user" ? actor.actorId : null,
+              ...executionSnapshotPreconditions,
+              ...currentRunMutationPreconditions,
               ...(delegateRecoveryPatchInFlight
                 ? {
                     expectedCurrentStatus: "blocked",
@@ -10237,6 +10282,8 @@ export function issueRoutes(
           ...updateFields,
           actorAgentId: actor.agentId ?? null,
           actorUserId: actor.actorType === "user" ? actor.actorId : null,
+          ...executionSnapshotPreconditions,
+          ...currentRunMutationPreconditions,
           ...(delegateRecoveryPatchInFlight
             ? {
                 expectedCurrentStatus: "blocked",
@@ -11910,8 +11957,34 @@ export function issueRoutes(
         // after another agent has taken over the issue.
         const boundaryDecision = await decideIssueAccess(req, issue, "issue:mutate");
         if (!boundaryDecision.allowed) {
-          respondIssueBoundaryDenied(res, boundaryDecision);
-          return;
+          // BLO-22670: that boundary is keyed to the issue's *current* trust
+          // posture (assignee, grants) — which the interaction's creator can
+          // lose the moment the issue changes hands, defeating the stale-card
+          // cleanup the comment above promises: the card becomes unwithdrawable
+          // by anyone (creator fails this boundary, the new assignee fails
+          // createdByAgentId below). The service's own createdByAgentId check
+          // is race-safe (re-applied in its UPDATE ... WHERE) and sufficient on
+          // its own, so give a genuine creator one more path through it instead
+          // of leaving the card permanently stuck.
+          //
+          // Scoped to deny_missing_grant deliberately. Only that reason means
+          // "this agent lost the issue-level grant", which is the reassignment
+          // case above. Other denials are narrower than the agent and creator
+          // identity cannot stand in for them: a skill_test or task_bridge key
+          // gets deny_scope from decideSkillTestAccess/decideTaskBridgeAccess
+          // for an issue outside the key's boundary, and createdByAgentId is
+          // agent-wide, not key- or run-scoped, so a match there says nothing
+          // about whether *this credential* may touch *this* issue. Treating
+          // every !allowed alike would let a narrowly scoped key withdraw on
+          // an out-of-scope issue purely because its agent authored the card.
+          const createdInteraction =
+            actor.agentId && boundaryDecision.reason === "deny_missing_grant"
+              ? await issueThreadInteractionService(db).getById(interactionId)
+              : null;
+          if (!createdInteraction || createdInteraction.createdByAgentId !== actor.agentId) {
+            respondIssueBoundaryDenied(res, boundaryDecision);
+            return;
+          }
         }
         // Without a run id the watchdog scope above resolves to "none" and
         // silently stops confining the caller, so require one exactly as the
@@ -12668,7 +12741,18 @@ export function issueRoutes(
               commentOptions,
               tx,
             );
-            const updated = await svc.update(id, updatePatch, tx);
+            const updated = await svc.update(id, {
+              ...updatePatch,
+              expectedCurrentStatus: currentIssue.status,
+              expectedCurrentExecutionState:
+                currentIssue.executionState && typeof currentIssue.executionState === "object"
+                  ? currentIssue.executionState
+                  : null,
+              expectedCurrentExecutionPolicy:
+                currentIssue.executionPolicy && typeof currentIssue.executionPolicy === "object"
+                  ? currentIssue.executionPolicy
+                  : null,
+            }, tx);
             if (!updated) throw new AutoApprovalIssueMissingError();
 
             if (transition.decision && decisionId) {

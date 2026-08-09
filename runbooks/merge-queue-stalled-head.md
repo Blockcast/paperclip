@@ -39,30 +39,64 @@ replacement for it:
    non-empty, that alone is not actionable — queues drain in bursts and a
    healthy run can legitimately take up to ~40 minutes.
 2. **90 minutes since the last merge, queue non-empty, position-1 unchanged**:
-   read the position-1 entry's backing `merge_group` run
-   (`gh run list --repo Blockcast/paperclip --event merge_group --limit 1`).
-   If it is `in_progress` and its per-job timestamps are still advancing,
-   keep monitoring — this is a slow but live run, not a stall.
-3. **150 minutes (2.5x the healthy run duration) with the position-1 run
-   still `queued` (never started) or `in_progress` with no job having
-   progressed since the last check**: this is a stall. Post the evidence
-   (run ID, `createdAt`, per-job state) to the incident/alert issue and
-   escalate for a **manual dequeue** of that one entry
-   (`gh api graphql -f query='mutation { dequeuePullRequest(input: {...}) }'`
-   or the "Remove from queue" action in the GitHub UI) — this requires a
-   named approver per this agent's standing permissions, since it mutates
-   shared queue state. Do not cancel the underlying Actions run first; GitHub
+   resolve the position-1 entry's exact identity first — do not trust the
+   newest repo-wide `merge_group` run, since concurrent re-staging can make
+   that a different PR's run entirely. Query the queue for the entry's PR
+   node ID and head commit:
+   ```
+   gh api graphql -f query='{ repository(owner:"Blockcast", name:"paperclip") {
+     mergeQueue(branch: "master") {
+       entries(first: 1) { nodes { pullRequest { id number } headCommit { oid } } }
+     } } }'
+   ```
+   then filter Actions runs by that exact commit, not by recency:
+   `gh run list --repo Blockcast/paperclip --event merge_group --commit <headCommit.oid> --json databaseId,status,createdAt,headSha`,
+   and confirm the returned `headSha` matches `headCommit.oid` before acting
+   on it. Record the PR node ID and the run's `databaseId`. If the run is
+   `in_progress` and its per-job timestamps are still advancing, keep
+   monitoring — this is a slow but live run, not a stall.
+3. **150 minutes since the run identified in step 2 was created** (the run's
+   own `createdAt`, never wall-clock time since the last merge — a freshly
+   promoted position-1 entry has not been stalled just because its
+   predecessor was) **with that same run still `queued` (never started) or
+   `in_progress` with no job having progressed since the step-2 check**:
+   this is a stall. Re-run the step-2 resolution and require the PR node ID
+   and run `databaseId` to be identical to what you recorded — if either has
+   changed, a different entry was promoted to position 1 and the elapsed-time
+   clock resets; do not carry over the previous head's stall time. Once
+   identity and elapsed time are both confirmed, post the evidence (PR node
+   ID, run `databaseId`, `createdAt`, per-job state) to the incident/alert
+   issue and escalate for a **manual dequeue** of that one entry. Immediately
+   before mutating, re-fetch and re-confirm the same PR node ID and run
+   `databaseId` one more time — this check must be the last thing done
+   before the write, not something verified minutes earlier, to close the
+   race between evidence-gathering and the mutation:
+   ```
+   gh api graphql -f query='mutation { dequeuePullRequest(input: { id: "<PR node ID, re-confirmed>" }) { clientMutationId } }'
+   ```
+   (`input.id` is the pull request's node ID, not the merge-queue entry's) or
+   the "Remove from queue" action in the GitHub UI — this requires a named
+   approver per this agent's standing permissions, since it mutates shared
+   queue state. Do not cancel the underlying Actions run first; GitHub
    requires the dequeue as the primary action and will handle the run.
+   Postcondition: re-query `mergeQueue.entries` and confirm the dequeued PR
+   node ID is gone and the next entry has been promoted to position 1.
 4. **If the very next head also stalls with the same signature** (not a
    different PR's own failure): stop dequeuing one-by-one. That pattern means
    the constraint is systemic (runner capacity, an Actions-side outage — see
    [BLO-22428](/BLO/issues/BLO-22428)), not one bad PR, and continuing to
    evict entries only burns queue slots without addressing the cause. File or
-   update the capacity/infra incident instead, and consider pausing new
-   merge-queue entries (`gh api` PATCH to disable
-   `auto_merge`/branch-protection merge-queue requirement temporarily is a
-   repo-admin action — hand off rather than attempting it solo) until the
-   underlying constraint clears.
+   update the capacity/infra incident instead, and freeze the queue
+   operationally: announce the freeze and hold off enqueueing new PRs by
+   convention, leaving branch protections untouched. Do **not** disable
+   `auto_merge` or the branch-protection/ruleset merge-queue requirement as a
+   pause mechanism — repository `auto_merge` configuration does not gate
+   queue admission, and removing the merge-queue requirement can let merges
+   bypass the only enforced path to production; ruleset edits can also drop
+   unrelated protections. No tested snapshot/restore procedure for that
+   exists today, so it is out of scope for this runbook — if an
+   admission-level pause is ever genuinely required, that is a repo-admin
+   decision to hand off, not a step to take solo.
 
 ## Why 150 minutes and not GitHub's 6h
 
