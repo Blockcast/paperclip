@@ -29,6 +29,7 @@ const issue = {
   identifier: "PAP-1",
   title: "Finish backend handoff",
   status: "in_progress",
+  workMode: "standard",
   assigneeAgentId: "agent-1",
   assigneeUserId: null,
   executionState: null,
@@ -100,6 +101,22 @@ describe("successful run handoff decision", () => {
     expect(decision.instruction).toContain("Resolve the missing disposition before creating or revising any new artifacts");
     expect(decision.instruction).toContain("Choose **exactly one** outcome");
     expect(decision.instruction).toContain("record an explicit continuation path");
+  });
+
+  it("uses the normal model lane when a planning handoff must revise an issue document", () => {
+    const decision = decide({ issue: { ...issue, workMode: "planning" } as any });
+
+    expect(decision.kind).toBe("enqueue");
+    if (decision.kind !== "enqueue") return;
+    expect(decision.payload).not.toHaveProperty("modelProfile");
+    expect(decision.payload).not.toHaveProperty("recoveryIntent");
+    expect(decision.payload).not.toHaveProperty("allowDocumentUpdates");
+    expect(decision.payload).not.toHaveProperty("resumeRequiresNormalModel");
+    expect(decision.contextSnapshot).not.toHaveProperty("modelProfile");
+    expect(decision.contextSnapshot).not.toHaveProperty("recoveryIntent");
+    expect(decision.instruction).toContain("normal-model planning continuation");
+    expect(decision.instruction).toContain("Complete the required plan or issue-document update");
+    expect(decision.instruction).not.toContain("document or plan updates are not allowed");
   });
 
   it("does not queue when the issue already has a valid disposition", () => {

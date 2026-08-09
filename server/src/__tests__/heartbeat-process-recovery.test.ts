@@ -4245,6 +4245,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
   it("queues one missing-disposition handoff for artifact-producing successful runs left in progress", async () => {
     const { companyId, agentId, runId, issueId } = await seedQueuedIssueRunFixture();
+    await db.update(issues).set({ workMode: "planning" }).where(eq(issues.id, issueId));
     mockAdapterExecute.mockImplementationOnce(async (ctx: { runId: string }) => {
       const documentId = randomUUID();
       const revisionId = randomUUID();
@@ -4331,6 +4332,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(classifiedRun?.livenessState).toBe("advanced");
     expect(handoffWakeups).toHaveLength(1);
     expect(handoffWakeups[0]?.idempotencyKey).toBe(`finish_successful_run_handoff:${issueId}:${runId}:1`);
+    expect(handoffWakeups[0]?.payload).not.toHaveProperty("modelProfile");
+    expect(handoffWakeups[0]?.payload).not.toHaveProperty("recoveryIntent");
+    expect(handoffWakeups[0]?.payload).not.toHaveProperty("allowDocumentUpdates");
+    expect(handoffWakeups[0]?.payload).not.toHaveProperty("resumeRequiresNormalModel");
 
     const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
     expect(issue?.status).toBe("in_progress");
