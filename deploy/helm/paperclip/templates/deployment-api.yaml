@@ -71,6 +71,27 @@ spec:
       {{- end }}
       {{- $_ := set $podAnnotations "paperclip.blockcast.net/approval-plan-sha256" . }}
       {{- end }}
+      {{- /*
+      BLO-22032: stamp the exact commit this release job deployed onto the pod
+      template, alongside the approval marker above. The live Deployment
+      previously carried no build stamp at all (no BUILD_INFO, no /version
+      endpoint, no commit SHA in server/dist/index.js), so the only way to learn
+      what commit was running was `docker buildx imagetools inspect` mapping the
+      pinned image digest back to its Harbor `sha-<short>-k8s-vendored` tag by
+      hand. This annotation makes it a single `kubectl get` instead. Opt-in
+      (unset by default) so it composes with the marker invariant above exactly
+      like api.approvalPlanSha256 does: neither is set for non-Blockcast/local
+      renders, and setting this one changes nothing else in the render.
+      */}}
+      {{- if hasKey $podAnnotations "paperclip.blockcast.net/deployed-commit" }}
+      {{- fail "pod.annotations must not set reserved key paperclip.blockcast.net/deployed-commit; use api.deployedCommit through the release workflow" }}
+      {{- end }}
+      {{- with .Values.api.deployedCommit }}
+      {{- if not (regexMatch "^[0-9a-f]{40}$" .) }}
+      {{- fail (printf "api.deployedCommit must be 40 lowercase hex characters, got %q" .) }}
+      {{- end }}
+      {{- $_ := set $podAnnotations "paperclip.blockcast.net/deployed-commit" . }}
+      {{- end }}
       {{- with $podAnnotations }}
       annotations:
         {{- toYaml . | nindent 8 }}
