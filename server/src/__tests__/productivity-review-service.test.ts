@@ -185,6 +185,37 @@ describeEmbeddedPostgres("productivity review service", () => {
     return { companyId, ownerUserId, managerId, coderId, issueId, issuePrefix, createdAt };
   }
 
+  // BLO-22436: creates an explicit `blocks` edge so the source issue has an
+  // unresolved blocker unless the blocker is already done.
+  async function addBlocker(input: {
+    companyId: string;
+    issuePrefix: string;
+    blockedIssueId: string;
+    blockerStatus?: "todo" | "done";
+  }) {
+    const blockerId = randomUUID();
+    const createdAt = new Date("2026-04-28T09:00:00.000Z");
+    await db.insert(issues).values({
+      id: blockerId,
+      companyId: input.companyId,
+      title: "Blocking issue",
+      status: input.blockerStatus ?? "todo",
+      priority: "medium",
+      originKind: "manual",
+      issueNumber: 900,
+      identifier: `${input.issuePrefix}-900`,
+      createdAt,
+      updatedAt: createdAt,
+    });
+    await db.insert(issueRelations).values({
+      companyId: input.companyId,
+      issueId: blockerId,
+      relatedIssueId: input.blockedIssueId,
+      type: "blocks",
+    });
+    return blockerId;
+  }
+
   async function insertRuns(input: {
     companyId: string;
     agentId: string;
@@ -196,11 +227,13 @@ describeEmbeddedPostgres("productivity review service", () => {
     status?: string;
     livenessState?: string | null;
     usageJson?: Record<string, unknown> | null;
+    errorCode?: string | null;
+    spacingMs?: number;
   }) {
     const runs: Array<typeof heartbeatRuns.$inferInsert> = [];
     for (let index = 0; index < input.count; index += 1) {
       const runId = randomUUID();
-      const createdAt = new Date(input.now.getTime() - index * 60_000);
+      const createdAt = new Date(input.now.getTime() - index * (input.spacingMs ?? 60_000));
       runs.push({
         id: runId,
         companyId: input.companyId,
@@ -215,6 +248,7 @@ describeEmbeddedPostgres("productivity review service", () => {
           : { issueId: input.issueId, taskId: input.issueId },
         livenessState: input.livenessState !== undefined ? input.livenessState : "advanced",
         usageJson: input.usageJson !== undefined ? input.usageJson : undefined,
+        errorCode: input.errorCode !== undefined ? input.errorCode : undefined,
         nextAction: "Continue processing the next batch.",
         createdAt,
         updatedAt: createdAt,
@@ -468,6 +502,292 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(reviews[0]?.description).toContain("Primary trigger: `no_comment_streak`");
     expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 10");
     expect(reviews[0]?.description).toContain("Runtime-failure streak (terminal, never-executed runs): 0");
+  });
+
+  // BLO-22436: runs cancelled by the dependency gate never reach the adapter,
+  // and so cannot be evidence that the assignee ran silently. There is no
+  // current blocker in this fixture: it proves historical cancellations do not
+  // manufacture a trigger after the dependency has resolved.
+  it("excludes dependency-gate cancellations from both streaks without creating a review (BLO-22436)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+      spacingMs: 10 * 60_000,
+      status: "cancelled",
+      livenessState: null,
+      usageJson: null,
+      errorCode: "issue_dependencies_blocked",
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(result.dependencyBlockedSkipped).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  it("counts current dependency-blocked candidates separately from generic skips (BLO-22436)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+    });
+    await addBlocker({
+      companyId: seeded.companyId,
+      issuePrefix: seeded.issuePrefix,
+      blockedIssueId: seeded.issueId,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(result.dependencyBlockedSkipped).toBe(1);
+    expect(result.skipped).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  it("keeps dependency-gate cancellations transparent to a subsequent infra-failure streak (BLO-22436)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 3,
+      now,
+      status: "cancelled",
+      livenessState: null,
+      usageJson: null,
+      errorCode: "issue_dependencies_blocked",
+    });
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now: new Date(now.getTime() - 4 * 60_000),
+      status: "failed",
+      livenessState: "failed",
+      usageJson: null,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `runtime_failure_streak`");
+    expect(review?.description).toContain("No-comment streak (terminal, turn-executing runs): 0");
+    expect(review?.description).toContain("Runtime-failure streak (terminal, never-executed runs): 10");
+  });
+
+  it("reports dependency-gate cancellations separately when another trigger fires (BLO-22436)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 3,
+      now,
+      status: "cancelled",
+      livenessState: null,
+      usageJson: null,
+      errorCode: "issue_dependencies_blocked",
+    });
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now: new Date(now.getTime() - 4 * 60_000),
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `no_comment_streak`");
+    expect(review?.description).toContain("No-comment streak (terminal, turn-executing runs): 10");
+    expect(review?.description).toContain("Runtime-failure streak (terminal, never-executed runs): 0");
+    expect(review?.description).toContain(
+      "Non-executing runs in sample window (excluded from streaks above): 3 (dominant errorCode: `issue_dependencies_blocked`, 3/3)",
+    );
+  });
+
+  it("distinguishes a missing error code from literal `unknown` in non-executing telemetry", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 3,
+      now,
+      status: "failed",
+      livenessState: "failed",
+      usageJson: null,
+      errorCode: null,
+    });
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 1,
+      now: new Date(now.getTime() - 4 * 60_000),
+      status: "failed",
+      livenessState: "failed",
+      usageJson: null,
+      errorCode: "unknown",
+    });
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now: new Date(now.getTime() - 6 * 60_000),
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain(
+      "Non-executing runs in sample window (excluded from streaks above): 4 (dominant errorCode: `(none)`, 3/4)",
+    );
+  });
+
+  it("omits a non-executing error-code diagnosis when no code has a strict majority", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 2,
+      now,
+      status: "failed",
+      livenessState: "failed",
+      usageJson: null,
+      errorCode: null,
+    });
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 2,
+      now: new Date(now.getTime() - 3 * 60_000),
+      status: "failed",
+      livenessState: "failed",
+      usageJson: null,
+      errorCode: "unknown",
+    });
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now: new Date(now.getTime() - 6 * 60_000),
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain(
+      "Non-executing runs in sample window (excluded from streaks above): 4",
+    );
+    expect(review?.description).not.toContain("dominant errorCode:");
+  });
+
+  it("retires every open productivity review whose source becomes dependency-blocked (BLO-22436)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    const reviewId = await insertProductivityReview({ seeded, createdAt: now });
+    const blockerId = await addBlocker({
+      companyId: seeded.companyId,
+      issuePrefix: seeded.issuePrefix,
+      blockedIssueId: seeded.issueId,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.closedDependencyBlockedReviews).toBe(1);
+    expect(result.dependencyBlockedSkipped).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.id).toBe(reviewId);
+    expect(review?.status).toBe("done");
+    const [closure] = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.action, "issue.productivity_review_suppressed_open_review_closed"));
+    expect(closure?.details).toMatchObject({
+      sourceIssueId: seeded.issueId,
+      suppressedBy: "dependency_blocked",
+      unresolvedBlockerCount: 1,
+      unresolvedBlockerIssueIds: [blockerId],
+    });
+  });
+
+  it("keeps an existing continuation hold active until reconciliation retires a blocked review (BLO-22436)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+    });
+    const service = productivityReviewService(db);
+    expect((await service.reconcileProductivityReviews({ now, companyId: seeded.companyId })).created).toBe(1);
+    await addBlocker({
+      companyId: seeded.companyId,
+      issuePrefix: seeded.issuePrefix,
+      blockedIssueId: seeded.issueId,
+    });
+
+    const hold = await service.isProductivityReviewContinuationHoldActive({
+      companyId: seeded.companyId,
+      issueId: seeded.issueId,
+      agentId: seeded.coderId,
+      now,
+    });
+    expect(hold.held).toBe(true);
+
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+    expect(result.closedDependencyBlockedReviews).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.status).toBe("done");
   });
 
   // BLO-19094: an open review grants its assignee issue:comment/issue:mutate on

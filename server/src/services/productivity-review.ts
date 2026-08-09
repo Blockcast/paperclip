@@ -133,6 +133,11 @@ type ProductivityReviewThresholds = {
   monitorDispatchBatchSize: number;
 };
 
+type DominantErrorCode = {
+  errorCode: string | null;
+  count: number;
+};
+
 type ProductivityReviewEvidence = {
   trigger: ProductivityReviewTrigger;
   triggerReasons: string[];
@@ -140,6 +145,12 @@ type ProductivityReviewEvidence = {
   sourceAgent: AgentRow;
   noCommentStreak: number;
   runtimeFailureStreak: number;
+  // Runs in the sample window that could not possibly have produced a comment
+  // (an infrastructure failure or dependency-gate cancellation). They are
+  // reported separately from the two streaks so the review body does not make
+  // operators reconstruct dispatch health from raw run telemetry (BLO-22436).
+  nonExecutingRunCount: number;
+  nonExecutingDominantErrorCode: DominantErrorCode | null;
   totalRunCount: number;
   terminalRunCount: number;
   activeRunCount: number;
@@ -722,6 +733,14 @@ function formatTrigger(trigger: ProductivityReviewTrigger) {
   return "Long active duration";
 }
 
+// True when the dependency gate cancelled a queued run before dispatch (see
+// `cancelQueuedRunForBlockedDependencies` in heartbeat.ts). This is a
+// graph-state fact about the source issue, not an infrastructure fault
+// (BLO-22436).
+function isDependencyBlockedRun(run: Pick<HeartbeatRunRow, "errorCode">): boolean {
+  return run.errorCode === "issue_dependencies_blocked";
+}
+
 // True when a run's most recent classification is `failed` liveness AND it
 // burned zero input+output tokens. That combination means the agent never
 // got a model turn — the runtime crashed, the process was killed, or every
@@ -730,11 +749,57 @@ function formatTrigger(trigger: ProductivityReviewTrigger) {
 // provider capacity 429 kill, and retry-budget exhaustion with no error code
 // at all (`error: "unknown"`, `error_status: null`). Keying on token usage
 // rather than error code/status/dispatch-state is deliberate: it is the one
-// signature all four causes share (BLO-21769).
-function isNeverExecutedRun(run: Pick<HeartbeatRunRow, "livenessState" | "usageJson">): boolean {
+// signature all four causes share (BLO-21769). Dependency-gate cancellations
+// are deliberately excluded so they cannot be reported as infrastructure.
+function isInfraFailureRun(
+  run: Pick<HeartbeatRunRow, "livenessState" | "usageJson" | "errorCode">,
+): boolean {
+  if (isDependencyBlockedRun(run)) return false;
   if (run.livenessState !== "failed") return false;
   const { inputTokens, outputTokens } = runUsageTokenCounts(run.usageJson);
   return inputTokens === 0 && outputTokens === 0;
+}
+
+// Every run that could not have emitted a progress comment is transparent to
+// the no-comment streak. The same dependency-gate population is transparent
+// to the infra-failure streak below: a cancelled queue entry neither proves
+// nor breaks a sequence of actual runtime failures.
+function isNeverExecutedRun(
+  run: Pick<HeartbeatRunRow, "livenessState" | "usageJson" | "errorCode">,
+): boolean {
+  return isInfraFailureRun(run) || isDependencyBlockedRun(run);
+}
+
+function dominantErrorCode(
+  runs: Array<Pick<HeartbeatRunRow, "errorCode">>,
+): DominantErrorCode | null {
+  const counts = new Map<string | null, number>();
+  for (const run of runs) {
+    counts.set(run.errorCode, (counts.get(run.errorCode) ?? 0) + 1);
+  }
+
+  let winner: string | null | undefined;
+  let winnerCount = 0;
+  for (const [errorCode, count] of counts) {
+    if (count > winnerCount) {
+      winner = errorCode;
+      winnerCount = count;
+    }
+  }
+  // A tied error-code mix is telemetry, not a diagnosis. Omit it rather than
+  // letting map insertion order turn it into a misleading definite cause.
+  if (winner === undefined || winnerCount * 2 <= runs.length) return null;
+  return { errorCode: winner, count: winnerCount };
+}
+
+function formatNonExecutingRunEvidence(
+  runCount: number,
+  dominant: DominantErrorCode | null,
+): string {
+  const prefix = `- Non-executing runs in sample window (excluded from streaks above): ${runCount}`;
+  if (!dominant) return prefix;
+  const errorCode = dominant.errorCode === null ? "`(none)`" : `\`${dominant.errorCode}\``;
+  return `${prefix} (dominant errorCode: ${errorCode}, ${dominant.count}/${runCount})`;
 }
 
 /**
@@ -1764,6 +1829,26 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       for (const source of sourceRows) sourceIssueById.set(source.id, source);
     }
 
+    // The open-review sweep can span companies, while readiness is company
+    // scoped. Read each company's sources in one batch so retiring a blocked
+    // review uses exactly the dependency policy that cancels its queued runs.
+    const sourceIssueIdsByCompany = new Map<string, string[]>();
+    for (const sourceIssue of sourceIssueById.values()) {
+      const ids = sourceIssueIdsByCompany.get(sourceIssue.companyId) ?? [];
+      ids.push(sourceIssue.id);
+      sourceIssueIdsByCompany.set(sourceIssue.companyId, ids);
+    }
+    const dependencyReadinessByCompany = new Map<
+      string,
+      Awaited<ReturnType<typeof issuesSvc.listDependencyReadiness>>
+    >();
+    for (const [sourceCompanyId, sourceIds] of sourceIssueIdsByCompany) {
+      dependencyReadinessByCompany.set(
+        sourceCompanyId,
+        await issuesSvc.listDependencyReadiness(sourceCompanyId, sourceIds, db),
+      );
+    }
+
     const reviewTriggerById = new Map<string, unknown>();
     const reviewIds = reviewRows.map((review) => review.id);
     for (const chunk of reviewIds.length > 0 ? [reviewIds] : []) {
@@ -1786,25 +1871,40 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
 
     let closedMonitorScheduled = 0;
     let closedTerminalSource = 0;
+    let closedDependencyBlocked = 0;
     for (const review of reviewRows) {
       if (!review.originId) continue;
       const sourceIssue = sourceIssueById.get(review.originId) ?? null;
       if (!sourceIssue) continue;
       if (sourceIssue.companyId !== review.companyId) continue;
       const trigger = reviewTriggerById.get(review.id);
+      const dependencyReadiness = dependencyReadinessByCompany
+        .get(sourceIssue.companyId)
+        ?.get(sourceIssue.id);
 
-      let suppressedBy: "terminal_source" | "monitor_scheduled" | null = null;
+      let suppressedBy: "terminal_source" | "monitor_scheduled" | "dependency_blocked" | null = null;
       let suppressionDetails: Record<string, unknown> = {};
-      // A `done` source can retire an already-open long-active review: the work
-      // episode finished under the terminal-status evidence gate, so the
-      // elapsed-time alarm no longer needs manager adjudication. This does not
-      // extend to `cancelled`; an assignee can abandon and later restore their
-      // own source issue, so cancellation must not retire its oversight
-      // artifact. It also does not extend to historical/accountability triggers
-      // (`no_comment_streak`, `high_churn`) or missing provenance: completion
-      // does not invalidate those signals, and unknown trigger semantics fail
-      // closed.
-      if (trigger === "long_active_duration" && sourceIssue.status === "done") {
+      // A dependency-blocked source cannot make progress until the relation is
+      // resolved, so an already-open review is no longer actionable by its
+      // assignee. Unlike terminal/monitor suppression, this applies to every
+      // productivity trigger: the candidate path below also exempts every
+      // trigger while the same gate is active (BLO-22436).
+      if ((dependencyReadiness?.unresolvedBlockerCount ?? 0) > 0) {
+        suppressedBy = "dependency_blocked";
+        suppressionDetails = {
+          unresolvedBlockerCount: dependencyReadiness?.unresolvedBlockerCount ?? 0,
+          unresolvedBlockerIssueIds: dependencyReadiness?.unresolvedBlockerIssueIds ?? [],
+        };
+      } else if (trigger === "long_active_duration" && sourceIssue.status === "done") {
+        // A `done` source can retire an already-open long-active review: the work
+        // episode finished under the terminal-status evidence gate, so the
+        // elapsed-time alarm no longer needs manager adjudication. This does not
+        // extend to `cancelled`; an assignee can abandon and later restore their
+        // own source issue, so cancellation must not retire its oversight
+        // artifact. It also does not extend to historical/accountability triggers
+        // (`no_comment_streak`, `high_churn`) or missing provenance: completion
+        // does not invalidate those signals, and unknown trigger semantics fail
+        // closed.
         suppressedBy = "terminal_source";
         suppressionDetails = { sourceStatus: sourceIssue.status };
       } else if (trigger === "long_active_duration" && !isTerminalIssueStatus(sourceIssue.status)) {
@@ -1838,11 +1938,45 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
             and source_issue.status = 'done'
         )`);
       }
-      const closed = await db
-        .update(issues)
-        .set({ status: "done", completedAt: now, updatedAt: now })
-        .where(and(...closePredicates))
-        .returning({ id: issues.id });
+      let closed: Array<{ id: string }>;
+      if (suppressedBy === "dependency_blocked") {
+        // Relation writers acquire this same per-source lock before changing a
+        // `blocks` edge or its readiness. Re-read while holding it so a blocker
+        // that just resolved cannot turn into a stale review closure and a
+        // six-hour resolved-review snooze.
+        const lockedClose = await db.transaction(async (tx) => {
+          await tx.execute(sql`
+            select pg_advisory_xact_lock(
+              hashtextextended(${`paperclip:issue-blockers:${review.companyId}:${sourceIssue.id}`}, 0)
+            )
+          `);
+          const lockedReadiness = await issuesSvc.listDependencyReadiness(
+            review.companyId,
+            [sourceIssue.id],
+            tx,
+          );
+          const lockedDependencyReadiness = lockedReadiness.get(sourceIssue.id);
+          if ((lockedDependencyReadiness?.unresolvedBlockerCount ?? 0) === 0) return null;
+          const lockedClosed = await tx
+            .update(issues)
+            .set({ status: "done", completedAt: now, updatedAt: now })
+            .where(and(...closePredicates))
+            .returning({ id: issues.id });
+          return { closed: lockedClosed, dependencyReadiness: lockedDependencyReadiness };
+        });
+        if (!lockedClose) continue;
+        closed = lockedClose.closed;
+        suppressionDetails = {
+          unresolvedBlockerCount: lockedClose.dependencyReadiness?.unresolvedBlockerCount ?? 0,
+          unresolvedBlockerIssueIds: lockedClose.dependencyReadiness?.unresolvedBlockerIssueIds ?? [],
+        };
+      } else {
+        closed = await db
+          .update(issues)
+          .set({ status: "done", completedAt: now, updatedAt: now })
+          .where(and(...closePredicates))
+          .returning({ id: issues.id });
+      }
       if (closed.length === 0) continue;
 
       await logActivity(db, {
@@ -1862,9 +1996,14 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         },
       });
       if (suppressedBy === "terminal_source") closedTerminalSource += 1;
+      else if (suppressedBy === "dependency_blocked") closedDependencyBlocked += 1;
       else closedMonitorScheduled += 1;
     }
-    return { monitorScheduled: closedMonitorScheduled, terminalSource: closedTerminalSource };
+    return {
+      monitorScheduled: closedMonitorScheduled,
+      terminalSource: closedTerminalSource,
+      dependencyBlocked: closedDependencyBlocked,
+    };
   }
 
   async function monitorBacklogGraceMs(
@@ -2058,14 +2197,17 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       TERMINAL_RUN_STATUSES.includes(run.status as (typeof TERMINAL_RUN_STATUSES)[number]),
     );
 
-    // BLO-21769: a run that never executed a model turn (see
-    // `isNeverExecutedRun`) is infrastructure telemetry, not agent behaviour.
-    // It must not extend `noCommentStreak` — the agent was never given a
-    // chance to comment — so it is filtered out of the walk entirely rather
-    // than counted as silence or treated as a streak-breaker.
+    // BLO-21769: an infrastructure failure never executed a model turn, so it
+    // is not agent behaviour and must not extend `noCommentStreak`. Dependency
+    // gate cancellations are similarly transparent to both walks: they did not
+    // execute, but they also must not break a preceding infrastructure-failure
+    // streak once the source becomes runnable again (BLO-22436).
+    const terminalRunsWithoutDependencyGateCancellation = terminalRuns.filter(
+      (run) => !isDependencyBlockedRun(run),
+    );
     let runtimeFailureStreak = 0;
-    for (const run of terminalRuns) {
-      if (!isNeverExecutedRun(run)) break;
+    for (const run of terminalRunsWithoutDependencyGateCancellation) {
+      if (!isInfraFailureRun(run)) break;
       runtimeFailureStreak += 1;
     }
     const executedTerminalRuns = terminalRuns.filter((run) => !isNeverExecutedRun(run));
@@ -2074,6 +2216,9 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       if (commentRunIds.has(run.id)) break;
       noCommentStreak += 1;
     }
+    const nonExecutingRuns = terminalRuns.filter((run) => isNeverExecutedRun(run));
+    const nonExecutingRunCount = nonExecutingRuns.length;
+    const nonExecutingDominantErrorCode = dominantErrorCode(nonExecutingRuns);
 
     const [
       runCountLastHour,
@@ -2250,6 +2395,8 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       sourceAgent,
       noCommentStreak,
       runtimeFailureStreak,
+      nonExecutingRunCount,
+      nonExecutingDominantErrorCode,
       totalRunCount: latestRuns.length,
       terminalRunCount: terminalRuns.length,
       activeRunCount,
@@ -2369,6 +2516,14 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       `- Active queued/running/scheduled runs: ${evidence.activeRunCount}`,
       `- No-comment streak (terminal, turn-executing runs): ${evidence.noCommentStreak}`,
       `- Runtime-failure streak (terminal, never-executed runs): ${evidence.runtimeFailureStreak}`,
+      ...(evidence.nonExecutingRunCount > 0
+        ? [
+            formatNonExecutingRunEvidence(
+              evidence.nonExecutingRunCount,
+              evidence.nonExecutingDominantErrorCode,
+            ),
+          ]
+        : []),
       `- Current active elapsed time: ${msToHuman(evidence.elapsedMs)}`,
       ...(evidence.nonLiveHoldMs > 0
         ? [
@@ -3109,9 +3264,11 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       approvalGatedSuppressed: 0,
       closedSuppressedMonitorReviews: 0,
       closedTerminalSourceReviews: 0,
+      closedDependencyBlockedReviews: 0,
       creationCapped: 0,
       noActionSuppressed: 0,
       skipped: 0,
+      dependencyBlockedSkipped: 0,
       suppressedTerminalSource: 0,
       failed: 0,
       reviewIssueIds: [] as string[],
@@ -3121,6 +3278,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     const closedSuppressed = await closeOpenSuppressedReviews(now, opts?.companyId);
     result.closedSuppressedMonitorReviews = closedSuppressed.monitorScheduled;
     result.closedTerminalSourceReviews = closedSuppressed.terminalSource;
+    result.closedDependencyBlockedReviews = closedSuppressed.dependencyBlocked;
 
     const recoveredReservations = await recoverStaleReservedProductivityReviews({
       now,
@@ -3151,6 +3309,26 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       .limit(MAX_CANDIDATE_ISSUES);
     result.scanned = candidates.length;
 
+    // Read readiness in company batches once per reconciliation. The
+    // continuation-hold path intentionally calls `collectEvidence` directly,
+    // so keeping this gate here preserves its existing enforcement semantics.
+    const candidateIssueIdsByCompany = new Map<string, string[]>();
+    for (const candidate of candidates) {
+      const ids = candidateIssueIdsByCompany.get(candidate.companyId) ?? [];
+      ids.push(candidate.id);
+      candidateIssueIdsByCompany.set(candidate.companyId, ids);
+    }
+    const candidateDependencyReadinessByCompany = new Map<
+      string,
+      Awaited<ReturnType<typeof issuesSvc.listDependencyReadiness>>
+    >();
+    for (const [candidateCompanyId, candidateIds] of candidateIssueIdsByCompany) {
+      candidateDependencyReadinessByCompany.set(
+        candidateCompanyId,
+        await issuesSvc.listDependencyReadiness(candidateCompanyId, candidateIds, db),
+      );
+    }
+
     const prefixCache = new Map<string, string>();
     for (const candidate of candidates) {
       if (recoveredReservations.recoveredSourceIssueIds.has(candidate.id)) {
@@ -3166,6 +3344,15 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       }
       if (isProductivityReviewOptedOut(candidate)) {
         result.optedOut += 1;
+        continue;
+      }
+      if (
+        (candidateDependencyReadinessByCompany
+          .get(candidate.companyId)
+          ?.get(candidate.id)
+          ?.unresolvedBlockerCount ?? 0) > 0
+      ) {
+        result.dependencyBlockedSkipped += 1;
         continue;
       }
       const sourceAgent = await getAgent(candidate.assigneeAgentId);
