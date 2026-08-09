@@ -19,11 +19,17 @@
  *      boundary: merge/squash-merge commits are legitimately App-attributed).
  *
  *   2. `--audit-merged` mode (network via `gh`; the AC's "automated
- *      verifying signal"). For the last N merged PRs across one or more
- *      repos, fetches each PR's own commit list and applies the same
- *      assertion. A PR's `/commits` entries are pre-squash source commits,
- *      each with exactly one parent unless the branch merged another ref in
- *      (multi-parent → excluded, same merge-commit exception as mode 1).
+ *      verifying signal"). Selects PRs by MERGE TIME — every PR merged on or
+ *      after `--since` (default 7d) across one or more repos — fetches each
+ *      PR's own commit list and applies the same assertion. A PR's `/commits`
+ *      entries are pre-squash source commits, each with exactly one parent
+ *      unless the branch merged another ref in (multi-parent → excluded, same
+ *      merge-commit exception as mode 1).
+ *
+ *      The window is a claim the tool can prove: it either audits every PR
+ *      merged since that date, or reports INCOMPLETE. It deliberately does not
+ *      offer a "last N merged PRs" mode — `gh pr list` orders by creation, so
+ *      no count-based window can establish which PRs merged most recently.
  *
  * Both modes are read-only: this script never posts, comments, or writes.
  */
@@ -34,20 +40,25 @@ import { fileURLToPath } from "node:url";
 
 export const APP_NOREPLY_EMAIL = "290875700+allyblockcast[bot]@users.noreply.github.com";
 export const DEFAULT_AUDIT_REPOS = ["Blockcast/trafficcontrol", "Blockcast/paperclip"];
-export const DEFAULT_PER_REPO_LIMIT = 20;
+
+/** Default lookback for `--audit-merged`, in days. */
+export const DEFAULT_AUDIT_SINCE_DAYS = 7;
 
 /**
- * `gh pr list --state merged --limit N` returns the N most recently *created*
- * merged PRs, not the N most recently *merged* ones — a long-running PR merged
- * yesterday can sort behind a short one merged last week. Over-fetch this
- * multiple of the window and order by `mergedAt` locally.
+ * The audit selects PRs by MERGE TIME, not by a count.
  *
- * Residual limit: a PR created further back than `factor * perRepoLimit` PRs
- * but merged inside the window is still missed. No GitHub list/search ordering
- * exposes merge time, so widening the window is the only lever — raise
- * `--per-repo-limit` to cover a longer tail.
+ * A count-based window cannot be honest here: `gh pr list --state merged`
+ * orders by creation, so "the last N merged PRs" is unknowable from the first
+ * N (or 5N) rows — a long-running PR created outside the bound can merge most
+ * recently and be silently skipped. Filtering on `merged:>=<date>` asks the
+ * search API the question we actually mean, and the answer is complete for
+ * that window as long as it fits under this cap.
+ *
+ * If a repo returns exactly this many PRs, the window did not fit and the
+ * audit reports INCOMPLETE rather than claiming coverage it cannot prove.
+ * Narrow `--since` in that case.
  */
-export const AUDIT_OVERFETCH_FACTOR = 5;
+export const AUDIT_PR_LIST_MAX = 300;
 
 /**
  * `GET /pulls/{number}/commits` is hard-capped at 250 entries; `--paginate`
@@ -101,29 +112,46 @@ export function findLocalRangeOffenses({ repoRoot, base, head, execFile = execFi
 }
 
 /**
- * Order merged PRs by merge time and take the newest `perRepoLimit`.
- * Entries without a parseable `mergedAt` are dropped rather than sorted to an
- * arbitrary position — `gh` only omits it for PRs that are not actually merged.
+ * Normalize `--since` to the `YYYY-MM-DD` form the search qualifier takes.
+ * Accepts `<N>d` (relative) or an explicit `YYYY-MM-DD`.
  */
-export function selectRecentlyMergedPrs(prs, perRepoLimit) {
+export function resolveSince(value, nowMs = Date.now()) {
+  const raw = String(value ?? `${DEFAULT_AUDIT_SINCE_DAYS}d`).trim();
+  const relative = /^(\d+)d$/.exec(raw);
+  if (relative) {
+    return new Date(nowMs - Number(relative[1]) * 86_400_000).toISOString().slice(0, 10);
+  }
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+    throw new Error(`--since expects YYYY-MM-DD or <N>d, got ${JSON.stringify(raw)}`);
+  }
+  return raw;
+}
+
+/**
+ * Newest merge first. Entries without a parseable `mergedAt` are dropped
+ * rather than sorted to an arbitrary position — `gh` only omits it for PRs
+ * that are not actually merged.
+ */
+export function sortByMergedAtDesc(prs) {
   return prs
     .map((pr) => ({ pr, mergedMs: Date.parse(pr.mergedAt ?? "") }))
     .filter((entry) => Number.isFinite(entry.mergedMs))
     .sort((a, b) => b.mergedMs - a.mergedMs)
-    .slice(0, perRepoLimit)
     .map((entry) => entry.pr);
 }
 
 /**
- * Remote audit mode: the `perRepoLimit` most recently merged PRs in `repo`,
- * each PR's own (pre-squash) commit list. `ghApi` is injected so tests never
- * shell out.
+ * Remote audit mode: every PR in `repo` merged on or after `since`, each PR's
+ * own (pre-squash) commit list. `ghApi` is injected so tests never shell out.
  *
- * Returns `truncated` alongside `offenses`: a PR whose commit list hits
- * `COMMITS_API_MAX` was only partially audited, which is a distinct outcome
- * from "audited and clean" and must not be reported as a pass.
+ * Two incompleteness signals travel with the result, both distinct from
+ * "audited and clean":
+ *   - `windowTruncated` — the merge-time window exceeded AUDIT_PR_LIST_MAX, so
+ *     some merged PRs in it were never examined.
+ *   - `truncated` — a PR's commit list hit COMMITS_API_MAX, so that PR was
+ *     only partially examined.
  */
-export async function auditRepoCommitAttribution({ repo, perRepoLimit, ghApi }) {
+export async function auditRepoCommitAttribution({ repo, since, ghApi }) {
   const prsJson = await ghApi([
     "pr",
     "list",
@@ -131,12 +159,16 @@ export async function auditRepoCommitAttribution({ repo, perRepoLimit, ghApi }) 
     repo,
     "--state",
     "merged",
+    "--search",
+    `merged:>=${since}`,
     "--limit",
-    String(perRepoLimit * AUDIT_OVERFETCH_FACTOR),
+    String(AUDIT_PR_LIST_MAX),
     "--json",
     "number,title,mergedAt",
   ]);
-  const prs = selectRecentlyMergedPrs(JSON.parse(prsJson), perRepoLimit);
+  const rawPrs = JSON.parse(prsJson);
+  const windowTruncated = rawPrs.length >= AUDIT_PR_LIST_MAX;
+  const prs = sortByMergedAtDesc(rawPrs);
 
   const offenses = [];
   const truncated = [];
@@ -168,7 +200,17 @@ export async function auditRepoCommitAttribution({ repo, perRepoLimit, ghApi }) 
     }
   }
 
-  return { repo, prsChecked: prs.length, commitsChecked: totalCommits, offenses, truncated };
+  return {
+    repo,
+    since,
+    prsChecked: prs.length,
+    commitsChecked: totalCommits,
+    offenses,
+    truncated,
+    windowTruncated,
+    oldestMergedAt: prs.at(-1)?.mergedAt ?? null,
+    newestMergedAt: prs[0]?.mergedAt ?? null,
+  };
 }
 
 async function defaultGhApi(args) {
@@ -177,20 +219,29 @@ async function defaultGhApi(args) {
 
 export async function runAudit({
   repos = DEFAULT_AUDIT_REPOS,
-  perRepoLimit = DEFAULT_PER_REPO_LIMIT,
+  since,
   ghApi = defaultGhApi,
   log = console.log,
 } = {}) {
+  const window = resolveSince(since);
   const results = [];
   for (const repo of repos) {
-    const result = await auditRepoCommitAttribution({ repo, perRepoLimit, ghApi });
+    const result = await auditRepoCommitAttribution({ repo, since: window, ghApi });
     results.push(result);
+    const covered = result.oldestMergedAt
+      ? `${result.oldestMergedAt} .. ${result.newestMergedAt}`
+      : "no merged PRs in window";
     log(
-      `${repo}: checked ${result.commitsChecked} non-merge commits across ${result.prsChecked} merged PRs — ${result.offenses.length} App-attributed`,
+      `${repo}: checked ${result.commitsChecked} non-merge commits across ${result.prsChecked} PRs merged since ${window} (${covered}) — ${result.offenses.length} App-attributed`,
     );
     for (const offense of result.offenses) {
       log(
         `  VIOLATION ${repo}#${offense.prNumber} ${offense.sha.slice(0, 7)} "${offense.message}" — ${offense.authorEmail}`,
+      );
+    }
+    if (result.windowTruncated) {
+      log(
+        `  INCOMPLETE ${repo} — the window since ${window} contains at least ${AUDIT_PR_LIST_MAX} merged PRs, which is the fetch cap; merged PRs beyond it were NOT audited. Narrow --since.`,
       );
     }
     for (const partial of result.truncated) {
@@ -201,11 +252,14 @@ export async function runAudit({
   }
   const allOffenses = results.flatMap((r) => r.offenses);
   const allTruncated = results.flatMap((r) => r.truncated);
+  const windowTruncated = results.filter((r) => r.windowTruncated);
   return {
-    passed: allOffenses.length === 0 && allTruncated.length === 0,
+    passed: allOffenses.length === 0 && allTruncated.length === 0 && windowTruncated.length === 0,
+    since: window,
     results,
     offenses: allOffenses,
     truncated: allTruncated,
+    windowTruncated,
   };
 }
 
@@ -215,7 +269,7 @@ function parseArgs(argv) {
     const arg = argv[i];
     if (arg === "--audit-merged") args.mode = "audit";
     else if (arg === "--repos") args.repos = argv[++i]?.split(",").map((r) => r.trim()).filter(Boolean);
-    else if (arg === "--per-repo-limit") args.perRepoLimit = Number.parseInt(argv[++i], 10);
+    else if (arg === "--since") args.since = argv[++i];
     else if (arg === "--base") args.base = argv[++i];
     else if (arg === "--head") args.head = argv[++i];
   }
@@ -230,17 +284,22 @@ async function main() {
   const args = parseArgs(process.argv.slice(2));
 
   if (args.mode === "audit") {
-    const { passed, offenses, truncated } = await runAudit({
+    const { passed, offenses, truncated, windowTruncated, since } = await runAudit({
       repos: args.repos,
-      perRepoLimit: args.perRepoLimit,
+      since: args.since,
     });
-    // Name which of the two failure modes fired: an offense is a real
-    // violation, a truncated PR is an audit that could not complete. Reporting
-    // the latter as the former would send someone hunting a commit that the
-    // audit never actually saw.
+    // Name which failure mode fired: an offense is a real violation, a
+    // truncated result is an audit that could not complete. Reporting the
+    // latter as the former would send someone hunting a commit the audit
+    // never actually saw.
     if (offenses.length > 0) {
       console.error(
         `\n${offenses.length} non-merge commit(s) carry the shared App identity (${APP_NOREPLY_EMAIL}) instead of a per-agent author. See BLO-21416 / AGENTS.md §9.`,
+      );
+    }
+    if (windowTruncated.length > 0) {
+      console.error(
+        `\n${windowTruncated.length} repo(s) had more than ${AUDIT_PR_LIST_MAX} PRs merged since ${since}, so the window could not be audited in full. Re-run with a narrower --since. This is an incomplete audit, not a clean one.`,
       );
     }
     if (truncated.length > 0) {

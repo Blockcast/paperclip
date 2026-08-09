@@ -8,12 +8,13 @@ import test from "node:test";
 import {
   APP_NOREPLY_EMAIL,
   auditRepoCommitAttribution,
-  AUDIT_OVERFETCH_FACTOR,
+  AUDIT_PR_LIST_MAX,
   COMMITS_API_MAX,
   findAttributionOffenses,
   findLocalRangeOffenses,
+  resolveSince,
   runAudit,
-  selectRecentlyMergedPrs,
+  sortByMergedAtDesc,
 } from "./check-commit-author-attribution.mjs";
 
 test("findAttributionOffenses flags a non-merge commit stamped with the shared App identity", () => {
@@ -148,7 +149,7 @@ test("auditRepoCommitAttribution flags App-attributed commits across the injecte
 
   const result = await auditRepoCommitAttribution({
     repo: "Blockcast/example",
-    perRepoLimit: 5,
+    since: "2026-08-01",
     ghApi: fakeGhApi,
   });
 
@@ -174,68 +175,9 @@ test("auditRepoCommitAttribution joins multiple --paginate pages", async () => {
     return page1 + page2;
   };
 
-  const result = await auditRepoCommitAttribution({ repo: "Blockcast/example", perRepoLimit: 1, ghApi: fakeGhApi });
+  const result = await auditRepoCommitAttribution({ repo: "Blockcast/example", since: "2026-08-01", ghApi: fakeGhApi });
   assert.equal(result.commitsChecked, 2);
   assert.equal(result.offenses.length, 1);
-});
-
-test("selectRecentlyMergedPrs orders by merge time, not by gh's creation-time order", () => {
-  // `gh pr list --state merged` sorts by creation, so a long-running PR merged
-  // later can appear behind a short one merged earlier. Mirrors the real case
-  // Ally found: #1034 (merged Aug 6) sitting behind #1051 (merged Aug 5).
-  const selected = selectRecentlyMergedPrs(
-    [
-      { number: 1051, mergedAt: "2026-08-05T10:00:00Z" },
-      { number: 1034, mergedAt: "2026-08-06T10:00:00Z" },
-      { number: 900, mergedAt: "2026-07-01T10:00:00Z" },
-    ],
-    2,
-  );
-  assert.deepEqual(
-    selected.map((pr) => pr.number),
-    [1034, 1051],
-  );
-});
-
-test("selectRecentlyMergedPrs drops entries with a missing or unparseable mergedAt", () => {
-  const selected = selectRecentlyMergedPrs(
-    [
-      { number: 1, mergedAt: null },
-      { number: 2, mergedAt: "not-a-date" },
-      { number: 3, mergedAt: "2026-08-06T10:00:00Z" },
-    ],
-    5,
-  );
-  assert.deepEqual(
-    selected.map((pr) => pr.number),
-    [3],
-  );
-});
-
-test("auditRepoCommitAttribution over-fetches the PR list, then audits only the newest-merged window", async () => {
-  let requestedLimit = null;
-  const auditedPrNumbers = [];
-  const fakeGhApi = async (args) => {
-    if (args[0] === "pr" && args[1] === "list") {
-      requestedLimit = Number(args[args.indexOf("--limit") + 1]);
-      return JSON.stringify([
-        { number: 1051, title: "merged earlier", mergedAt: "2026-08-05T10:00:00Z" },
-        { number: 1034, title: "merged latest", mergedAt: "2026-08-06T10:00:00Z" },
-      ]);
-    }
-    auditedPrNumbers.push(Number(args[1].match(/pulls\/(\d+)\/commits/)[1]));
-    return JSON.stringify([]);
-  };
-
-  const result = await auditRepoCommitAttribution({
-    repo: "Blockcast/example",
-    perRepoLimit: 1,
-    ghApi: fakeGhApi,
-  });
-
-  assert.equal(requestedLimit, AUDIT_OVERFETCH_FACTOR);
-  assert.equal(result.prsChecked, 1);
-  assert.deepEqual(auditedPrNumbers, [1034]);
 });
 
 test("auditRepoCommitAttribution reports a commit list that hit the 250-entry API cap", async () => {
@@ -256,7 +198,7 @@ test("auditRepoCommitAttribution reports a commit list that hit the 250-entry AP
 
   const result = await auditRepoCommitAttribution({
     repo: "Blockcast/example",
-    perRepoLimit: 1,
+    since: "2026-08-01",
     ghApi: fakeGhApi,
   });
 
@@ -278,7 +220,7 @@ test("runAudit fails closed on a truncated commit list even with zero offenses",
 
   const outcome = await runAudit({
     repos: ["Blockcast/example"],
-    perRepoLimit: 1,
+    since: "2026-08-01",
     log: (line) => logged.push(line),
     ghApi: async (args) => {
       if (args[0] === "pr" && args[1] === "list") {
@@ -296,10 +238,108 @@ test("runAudit fails closed on a truncated commit list even with zero offenses",
   assert.ok(!logged.some((line) => line.includes("VIOLATION")));
 });
 
+test("resolveSince converts a relative <N>d window to a YYYY-MM-DD date", () => {
+  const nowMs = Date.parse("2026-08-09T00:00:00Z");
+  assert.equal(resolveSince("7d", nowMs), "2026-08-02");
+  assert.equal(resolveSince(undefined, nowMs), "2026-08-02"); // default 7d
+  assert.equal(resolveSince("2026-07-01", nowMs), "2026-07-01");
+});
+
+test("resolveSince rejects a window it cannot turn into a search qualifier", () => {
+  assert.throws(() => resolveSince("last week"), /--since expects/);
+  assert.throws(() => resolveSince("2026-8-1"), /--since expects/);
+});
+
+test("sortByMergedAtDesc orders newest-merged first and drops unparseable entries", () => {
+  const sorted = sortByMergedAtDesc([
+    { number: 1051, mergedAt: "2026-08-05T10:00:00Z" },
+    { number: 2, mergedAt: "not-a-date" },
+    { number: 1034, mergedAt: "2026-08-06T10:00:00Z" },
+    { number: 1, mergedAt: null },
+  ]);
+  assert.deepEqual(
+    sorted.map((pr) => pr.number),
+    [1034, 1051],
+  );
+});
+
+test("auditRepoCommitAttribution selects PRs by merge time, not by a creation-ordered count", async () => {
+  // The bug this replaces: `gh pr list --state merged --limit N` orders by
+  // creation, so "the last N merged PRs" is unknowable from the first N rows.
+  // Asking `merged:>=<date>` is a question the API can answer completely.
+  let listArgs = null;
+  const fakeGhApi = async (args) => {
+    if (args[0] === "pr" && args[1] === "list") {
+      listArgs = args;
+      return JSON.stringify([{ number: 1034, title: "merged latest", mergedAt: "2026-08-06T10:00:00Z" }]);
+    }
+    return JSON.stringify([]);
+  };
+
+  const result = await auditRepoCommitAttribution({
+    repo: "Blockcast/example",
+    since: "2026-08-01",
+    ghApi: fakeGhApi,
+  });
+
+  assert.ok(listArgs.includes("--search"), "must filter by merge time");
+  assert.equal(listArgs[listArgs.indexOf("--search") + 1], "merged:>=2026-08-01");
+  assert.equal(listArgs[listArgs.indexOf("--limit") + 1], String(AUDIT_PR_LIST_MAX));
+  assert.equal(result.windowTruncated, false);
+  assert.equal(result.newestMergedAt, "2026-08-06T10:00:00Z");
+});
+
+test("runAudit fails closed when the merge-time window exceeds the fetch cap", async () => {
+  // Coverage it cannot prove must not be reported as coverage. A full page
+  // means there may be merged PRs in the window we never looked at.
+  const cappedList = JSON.stringify(
+    Array.from({ length: AUDIT_PR_LIST_MAX }, (_, index) => ({
+      number: index + 1,
+      title: `pr ${index + 1}`,
+      mergedAt: "2026-08-06T10:00:00Z",
+    })),
+  );
+  const logged = [];
+
+  const outcome = await runAudit({
+    repos: ["Blockcast/example"],
+    since: "2026-01-01",
+    log: (line) => logged.push(line),
+    ghApi: async (args) =>
+      args[0] === "pr" && args[1] === "list" ? cappedList : JSON.stringify([]),
+  });
+
+  assert.equal(outcome.passed, false);
+  assert.deepEqual(outcome.offenses, []);
+  assert.equal(outcome.windowTruncated.length, 1);
+  assert.ok(logged.some((line) => line.includes("INCOMPLETE") && line.includes("Narrow --since")));
+  assert.ok(!logged.some((line) => line.includes("VIOLATION")));
+});
+
+test("runAudit reports the merge window it actually covered", async () => {
+  const logged = [];
+  await runAudit({
+    repos: ["Blockcast/example"],
+    since: "2026-08-01",
+    log: (line) => logged.push(line),
+    ghApi: async (args) =>
+      args[0] === "pr" && args[1] === "list"
+        ? JSON.stringify([
+            { number: 9, title: "older", mergedAt: "2026-08-02T00:00:00Z" },
+            { number: 10, title: "newer", mergedAt: "2026-08-06T00:00:00Z" },
+          ])
+        : JSON.stringify([]),
+  });
+
+  const summary = logged[0];
+  assert.ok(summary.includes("merged since 2026-08-01"));
+  assert.ok(summary.includes("2026-08-02T00:00:00Z .. 2026-08-06T00:00:00Z"));
+});
+
 test("runAudit passes when every PR is fully audited and clean", async () => {
   const outcome = await runAudit({
     repos: ["Blockcast/example"],
-    perRepoLimit: 1,
+    since: "2026-08-01",
     log: () => {},
     ghApi: async (args) => {
       if (args[0] === "pr" && args[1] === "list") {
