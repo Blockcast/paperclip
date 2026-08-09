@@ -194,7 +194,7 @@ function registerModuleMocks() {
   }));
 }
 
-async function createApp(actor: Record<string, unknown>) {
+async function createApp(actor: Record<string, unknown>, db: Record<string, unknown> = {}) {
   const [{ companySkillRoutes }, { errorHandler }] = await Promise.all([
     vi.importActual<typeof import("../routes/company-skills.js")>("../routes/company-skills.js"),
     vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
@@ -205,7 +205,7 @@ async function createApp(actor: Record<string, unknown>) {
     (req as any).actor = actor;
     next();
   });
-  app.use("/api", companySkillRoutes({} as any));
+  app.use("/api", companySkillRoutes(db as any));
   app.use(errorHandler);
   return app;
 }
@@ -1899,6 +1899,25 @@ describe("company skill mutation permissions", () => {
   });
 
   it("creates and cancels skill test runs through hidden issue orchestration", async () => {
+    const cancellationOrder: string[] = [];
+    const routeDb = {
+      select: vi.fn(() => {
+        cancellationOrder.push("snapshot-live-runs");
+        return {
+          from: vi.fn(() => ({
+            where: vi.fn(async () => [{ id: "run-1" }]),
+          })),
+        };
+      }),
+    };
+    mockIssueService.update.mockImplementationOnce(async () => {
+      cancellationOrder.push("cancel-issue");
+      return {};
+    });
+    mockHeartbeatService.cancelRun.mockImplementationOnce(async () => {
+      cancellationOrder.push("cancel-run");
+      return {};
+    });
     mockCompanySkillService.createTestRun.mockImplementationOnce(async (
       _companyId: string,
       _skillId: string,
@@ -1994,7 +2013,7 @@ describe("company skill mutation permissions", () => {
       companyIds: ["company-1"],
       source: "local_implicit",
       isInstanceAdmin: false,
-    });
+    }, routeDb);
 
     const created = await request(app)
       .post("/api/companies/company-1/skills/skill-1/test-runs")
@@ -2020,6 +2039,7 @@ describe("company skill mutation permissions", () => {
       status: "cancelled",
       actorUserId: "local-board",
     }));
+    expect(cancellationOrder).toEqual(["cancel-issue", "snapshot-live-runs", "cancel-run"]);
   });
 
   it.each([

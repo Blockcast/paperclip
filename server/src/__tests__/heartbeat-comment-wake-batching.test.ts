@@ -1929,7 +1929,17 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
           .from(heartbeatRuns)
           .where(eq(heartbeatRuns.agentId, mentionedAgentId))
           .orderBy(asc(heartbeatRuns.createdAt));
-        return runs.length === 1 && runs[0]?.status === "succeeded";
+        const primaryRuns = await db
+          .select()
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.agentId, primaryAgentId))
+          .orderBy(asc(heartbeatRuns.createdAt));
+        return (
+          runs.length === 1 &&
+          runs[0]?.status === "succeeded" &&
+          primaryRuns.length === 2 &&
+          primaryRuns[1]?.issueCommentStatus === "retry_exhausted"
+        );
       }, 90_000);
       expect(gateway.getAgentPayloads().length).toBeGreaterThanOrEqual(2);
 

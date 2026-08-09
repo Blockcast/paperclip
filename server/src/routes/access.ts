@@ -2677,6 +2677,26 @@ async function probeInviteResolutionTarget(
   }
 }
 
+// Agent actor sources `/cli-auth/me` will introspect, as an explicit allowlist.
+//
+// `actorMiddleware` mints agent actors from more than one credential. Only these
+// two are real bearer credentials the caller proved; `run_id` (auth.ts, the
+// local_trusted `X-Paperclip-Run-Id` branch) is an unauthenticated convenience
+// actor, and its source satisfies neither the proxy's `/^agent(_|$)/` tier nor
+// the `canBoardManageRuntime` guard that mirrors it — so it would return an
+// agent identity that every consumer's discriminator then misreads as a board
+// one. An allowlist rather than a `run_id` denylist so that any actor source
+// added later fails closed here until it is deliberately admitted.
+const INTROSPECTABLE_AGENT_SOURCES = ["agent_jwt", "agent_key"] as const;
+
+type IntrospectableAgentSource = (typeof INTROSPECTABLE_AGENT_SOURCES)[number];
+
+function isIntrospectableAgentSource(
+  source: string | undefined,
+): source is IntrospectableAgentSource {
+  return (INTROSPECTABLE_AGENT_SOURCES as readonly (string | undefined)[]).includes(source);
+}
+
 export function accessRoutes(
   db: Db,
   opts: {
@@ -2922,7 +2942,36 @@ export function accessRoutes(
     },
   );
 
+  // Token introspection. Historically board-only, but the onprem-k8s MCP auth
+  // proxy (`paperclip-public-k8s-platform-sre`) does not verify signatures — it
+  // introspects here and then gates on an `agent:<uuid>` tier that compares the
+  // returned `userId` against an agent id. So agents must be able to resolve
+  // their *own* identity through this endpoint; what they learn is strictly less
+  // than `GET /api/agents/me` already returns them.
+  //
+  // CONSUMER CONTRACT: `userId` is a board user id only when `source` is a board
+  // source. When `source` matches /^agent(_|$)/ it is an AGENT id and `user` is
+  // null — discriminate on `source` before treating `userId` as a person. Only
+  // the INTROSPECTABLE_AGENT_SOURCES allowlist reaches the agent branch, so that
+  // discriminator stays exhaustive over everything this endpoint can emit; any
+  // other agent actor falls through to the board check and gets a 401.
+  //
+  // `/cli-auth/refresh` below stays board-only on purpose: it mutates board API
+  // key TTLs, which is not a thing an agent actor has any business doing.
   router.get("/cli-auth/me", async (req, res) => {
+    if (req.actor.type === "agent" && req.actor.agentId && isIntrospectableAgentSource(req.actor.source)) {
+      res.json({
+        user: null,
+        userId: req.actor.agentId,
+        isInstanceAdmin: false,
+        companyIds: req.actor.companyId ? [req.actor.companyId] : [],
+        memberships: [],
+        source: req.actor.source,
+        keyId: null,
+        expiresAt: null,
+      });
+      return;
+    }
     if (req.actor.type !== "board" || !req.actor.userId) {
       throw unauthorized("Board authentication required");
     }
