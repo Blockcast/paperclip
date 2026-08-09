@@ -152,6 +152,9 @@ jobs:
       - name: Test Ally review-consistency guard
         run: node --test ./scripts/check-ally-review-consistency.test.mjs
 
+      - name: Test CODEOWNERS guard
+        run: node --test ./scripts/check-codeowners.test.mjs
+
       - name: Test general-server shard partition
         run: node --test ./scripts/__tests__/run-vitest-stable-shard.test.mjs
 
