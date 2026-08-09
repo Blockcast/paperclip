@@ -32330,17 +32330,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         reason: "idle_circuit_breaker" | "adapter_failed_circuit_breaker",
         evidence: Record<string, number>,
       ) => {
-        await db.insert(agentWakeupRequests).values({
-          companyId: agent.companyId,
-          agentId: agent.id,
-          source: "timer",
-          triggerDetail: "system",
-          reason,
-          payload: { heartbeatSkip: { reason, ...evidence } },
-          status: "skipped",
-          requestedByActorType: "system",
-          requestedByActorId: "heartbeat_scheduler",
-          finishedAt: now,
+        await db.transaction(async (tx) => {
+          await tx.insert(agentWakeupRequests).values({
+            companyId: agent.companyId,
+            agentId: agent.id,
+            source: "timer",
+            triggerDetail: "system",
+            reason,
+            payload: { heartbeatSkip: { reason, ...evidence } },
+            status: "skipped",
+            requestedByActorType: "system",
+            requestedByActorId: "heartbeat_scheduler",
+            finishedAt: now,
+          });
+          await tx
+            .update(agents)
+            .set({ lastHeartbeatAt: now, updatedAt: now })
+            .where(eq(agents.id, agent.id));
         });
       };
 

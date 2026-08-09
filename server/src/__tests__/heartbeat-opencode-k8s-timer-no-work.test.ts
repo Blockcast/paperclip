@@ -217,6 +217,17 @@ describeEmbeddedPostgres("opencode_k8s timer no-work suppression", () => {
     expect((await renderMetrics()).body).toContain(
       `${HEARTBEAT_TIMER_SCHEDULER_EXCLUSION_METRIC}{reason="${reason}"}`,
     );
+
+    expect(await heartbeat.tickTimers(new Date("2026-05-25T20:30:10.000Z"))).toMatchObject({
+      checked: 1,
+      enqueued: 0,
+      skipped: 0,
+    });
+    const skipsAfterImmediateRetry = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(skipsAfterImmediateRetry).toHaveLength(1);
   });
 
   it("queues opencode_k8s timer ticks when the agent has assigned live work", async () => {
