@@ -16,10 +16,11 @@
  * apart both submitted at head ff1c72db, 34 s apart, with opposite verdicts.
  *
  * Invariants asserted here:
- *   I1  At most one operative Ally review submission per (PR, head SHA).
- *       Each live GitHub review is an attestation with its own credential; do
- *       not normalize a duplicate after it has been created. The publisher
- *       must choose one credential for each verdict instead.
+ *   I1  At most one operative Ally review submission per (PR, head SHA), or
+ *       exactly the current-head APPROVED App/User pair mandated by protected
+ *       merge. Every other multi-review shape is fatal. The pair is checked as
+ *       two independent, exact identities—not by removing or normalizing a
+ *       review—so retries and lookalike credentials remain visible.
  *   I2  No operative Ally APPROVED whose own body reports a Critical or
  *       Important finding, no operative APPROVED coexisting at a SHA with an
  *       operative Ally review that does, and no operative APPROVED that makes
@@ -75,6 +76,14 @@ const STILL_PRESENT_DISPOSITION_RE =
 /** The single standalone attestation line Ally is required to emit. */
 const ATTESTED_HEAD_RE = /^[ \t]*(?:[_*]+)?[ \t]*reviewed head:[ \t]*`?([0-9a-f]{40})`?[ \t]*(?:[_*]+)?[ \t]*$/im;
 
+// The two distinct GitHub principals required by the protected-merge policy.
+// Pin both the immutable REST ID and the canonical login: either mismatch is
+// not an eligible substitute for the required artifact.
+export const ALLY_APP_REVIEWER_ID = 290875700;
+export const ALLY_APP_REVIEWER_LOGIN = "allyblockcast[bot]";
+export const ALLY_USER_REVIEWER_ID = 296676656;
+export const ALLY_USER_REVIEWER_LOGIN = "allyblockcast";
+
 export function isAllyLogin(login) {
   return ALLY_LOGIN_RE.test(String(login ?? ""));
 }
@@ -102,6 +111,43 @@ export function operativeAllyReviews(reviews, headSha) {
   );
 }
 
+function isExpectedApproval(review, { id, login }, headSha) {
+  return (
+    review?.state === "APPROVED" &&
+    review?.user?.id === id &&
+    review?.user?.login === login &&
+    attestedHead(review?.body) === String(headSha ?? "").toLowerCase()
+  );
+}
+
+/**
+ * The only permitted two-review shape: one current-head approval from the
+ * required App identity and one from the required User seat. This deliberately
+ * inspects the full operative set instead of deduplicating it; a retry, an
+ * unexpected identity, or a missing/stale attestation makes the shape fail.
+ */
+export function isRequiredApprovalPair(reviews, headSha) {
+  const operative = operativeAllyReviews(reviews, headSha);
+  if (operative.length !== 2) return false;
+
+  return (
+    operative.some((review) =>
+      isExpectedApproval(
+        review,
+        { id: ALLY_APP_REVIEWER_ID, login: ALLY_APP_REVIEWER_LOGIN },
+        headSha,
+      ),
+    ) &&
+    operative.some((review) =>
+      isExpectedApproval(
+        review,
+        { id: ALLY_USER_REVIEWER_ID, login: ALLY_USER_REVIEWER_LOGIN },
+        headSha,
+      ),
+    )
+  );
+}
+
 /**
  * @param {{number: number, headSha: string, reviews: object[]}} pr
  * @returns {string[]} human-readable violations; empty when the PR is sound
@@ -112,10 +158,10 @@ export function findPrViolations(pr) {
   const operative = operativeAllyReviews(pr.reviews, head);
   const violations = [];
 
-  if (operative.length > 1) {
+  if (operative.length > 1 && !isRequiredApprovalPair(pr.reviews, head)) {
     const detail = operative.map((r) => `${r.state}/${r.id}`).join(", ");
     violations.push(
-      `I1 PR #${pr.number} @${short}: ${operative.length} operative Ally reviews (${detail}) — expected at most 1`,
+      `I1 PR #${pr.number} @${short}: ${operative.length} operative Ally reviews (${detail}) — expected at most 1 or the exact App/User APPROVED pair`,
     );
   }
 
