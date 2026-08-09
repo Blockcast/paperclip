@@ -568,6 +568,73 @@ describeEmbeddedPostgres("productivity review service", () => {
       "usage telemetry unavailable — low/missing log volume consistent with no model turn",
     );
     expect(reviews[0]?.description).not.toContain("0 input/output tokens");
+    // BLO-22097 Ally follow-up: an inferred basis must not assert the
+    // definitive "produced zero model turns" / "never given a chance to act"
+    // claims — those are only true for a measured basis. The trigger reason
+    // and Manager Decision text must both use hedged wording instead.
+    expect(reviews[0]?.description).toContain(
+      "consecutive terminal runs show no evidence of a model turn",
+    );
+    expect(reviews[0]?.description).not.toContain("produced zero model turns");
+    expect(reviews[0]?.description).toContain(
+      "consistent with the assignee never being given a chance to act, though missing usage telemetry means this cannot be confirmed",
+    );
+    expect(reviews[0]?.description).not.toContain("the assignee was never given a chance to act.");
+  });
+
+  // BLO-22097 Ally follow-up: a streak that mixes an explicit measured zero
+  // with missing-usage runs must report the "mixed" basis, and the
+  // trigger/manager-facing claims must stay hedged (not the definitive
+  // "measured" wording) since not every run in the streak is actually
+  // measured.
+  it("reports a mixed usage basis with hedged wording for a streak mixing measured-zero and inferred runs (BLO-22097)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    const streak = DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS;
+    const runs: Array<typeof heartbeatRuns.$inferInsert> = [];
+    for (let index = 0; index < streak; index += 1) {
+      const createdAt = new Date(now.getTime() - index * 60_000);
+      runs.push({
+        id: randomUUID(),
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        status: "failed",
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        startedAt: createdAt,
+        finishedAt: new Date(createdAt.getTime() + 30_000),
+        contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+        livenessState: "failed",
+        // Alternate between an explicit measured zero and missing usage so
+        // the streak walk sees both bases.
+        usageJson: index % 2 === 0 ? { inputTokens: 0, outputTokens: 0 } : null,
+        logBytes: index % 2 === 0 ? 500 : null,
+        nextAction: "Continue processing the next batch.",
+        createdAt,
+        updatedAt: createdAt,
+      });
+    }
+    await db.insert(heartbeatRuns).values(runs);
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const reviews = await listProductivityReviews(seeded.companyId);
+    expect(reviews).toHaveLength(1);
+    expect(reviews[0]?.description).toContain("Primary trigger: `runtime_failure_streak`");
+    expect(reviews[0]?.description).toContain(`Runtime-failure streak (terminal, never-executed runs): ${streak}`);
+    expect(reviews[0]?.description).toContain(
+      "usage telemetry unavailable for some runs (low/missing log volume consistent with no model turn), explicit 0 input/output tokens for the rest",
+    );
+    expect(reviews[0]?.description).toContain(
+      "consecutive terminal runs show no evidence of a model turn",
+    );
+    expect(reviews[0]?.description).not.toContain("produced zero model turns");
+    expect(reviews[0]?.description).toContain(
+      "consistent with the assignee never being given a chance to act, though missing usage telemetry means this cannot be confirmed",
+    );
+    expect(reviews[0]?.description).not.toContain("the assignee was never given a chance to act.");
   });
 
   // BLO-22097 Ally follow-up: pin the inclusive boundary of
