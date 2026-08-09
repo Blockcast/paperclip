@@ -1,6 +1,6 @@
 /** Env-var names that conventionally hold credentials. */
 export const SENSITIVE_ENV_KEY_RE =
-  /token$|api[-_]?key|access[-_]?token|auth(?:_?token)?|authorization|bearer|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring/i;
+  /token(?:$|[-_])|api[-_]?key|access[-_]?token|auth(?:_?token)?|authorization|bearer|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring/i;
 
 const CREDENTIAL_VALUE_RES: RegExp[] = [
   /^sk-[A-Za-z0-9-_]{16,}$/,
