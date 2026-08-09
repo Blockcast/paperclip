@@ -27,6 +27,7 @@ import {
   __test_buildPrReviewerTaskKey,
   __test_buildPrReviewerWakeIdempotencyKey,
   __test_buildPrReviewFeedbackComment,
+  __test_classifyWorkflowRunSupersession,
   __test_commentsContainBackLinkMarker,
   __test_extractPaperclipIdentifiers,
   __test_hasActionablePrReviewFeedback,
@@ -38,10 +39,12 @@ import {
   __test_hasAllyConsolidatedReviewHeader,
   __test_idempotentWakeStatuses,
   __test_prReviewerWakeIdempotencyScope,
+  __test_recordWorkflowRunSighting,
   __test_resolveDependabotAlertContext,
   __test_resolveEventContext,
   __test_shouldFirePrReviewerWake,
   __test_verifyGithubSignature,
+  __resetWorkflowRunSupersessionTrackingForTest,
   githubWebhookRoutes,
   type GithubWebhookConfig,
 } from "../routes/github-webhook.js";
@@ -1156,6 +1159,99 @@ describe("github-webhook pure helpers", () => {
   it("returns null for dependabot payloads without a numeric alert number", () => {
     expect(__test_resolveDependabotAlertContext({ action: "created", alert: {} })).toBeNull();
     expect(__test_resolveDependabotAlertContext({ action: "created" })).toBeNull();
+  });
+});
+
+describe("workflow_run supersession classification (BLO-21078 AC3)", () => {
+  beforeEach(() => {
+    __resetWorkflowRunSupersessionTrackingForTest();
+  });
+
+  it("classifies none when no other run has been sighted on the branch", () => {
+    expect(
+      __test_classifyWorkflowRunSupersession("Blockcast/paperclip", "blo-1-x", 100, Date.parse("2026-08-02T19:34:01Z")),
+    ).toBe("none");
+  });
+
+  it("classifies none for the run's own sighting (same runId is not a supersession)", () => {
+    const createdAt = Date.parse("2026-08-02T19:31:32Z");
+    __test_recordWorkflowRunSighting("Blockcast/paperclip", "cto/blo-18278-capacity-reset", 930, createdAt);
+    expect(
+      __test_classifyWorkflowRunSupersession(
+        "Blockcast/paperclip",
+        "cto/blo-18278-capacity-reset",
+        930,
+        Date.parse("2026-08-02T19:34:01Z"),
+      ),
+    ).toBe("none");
+  });
+
+  it("classifies superseded when a newer run on the same branch already existed by the time this one ended", () => {
+    // Mirrors the benign shape from BLO-21078's own investigation: run
+    // 30796167940 on staff/blo-20742-ally-concurrency-v2, created 08:07:35Z,
+    // cancelled 08:22:15Z after a newer push created a run at 08:21:26Z.
+    __test_recordWorkflowRunSighting(
+      "Blockcast/paperclip",
+      "staff/blo-20742-ally-concurrency-v2",
+      30796167940,
+      Date.parse("2026-08-03T08:07:35Z"),
+    );
+    __test_recordWorkflowRunSighting(
+      "Blockcast/paperclip",
+      "staff/blo-20742-ally-concurrency-v2",
+      30796200001,
+      Date.parse("2026-08-03T08:21:26Z"),
+    );
+    expect(
+      __test_classifyWorkflowRunSupersession(
+        "Blockcast/paperclip",
+        "staff/blo-20742-ally-concurrency-v2",
+        30796167940,
+        Date.parse("2026-08-03T08:22:15Z"),
+      ),
+    ).toBe("superseded");
+  });
+
+  it("classifies none when the only newer sighting arrived after this run already ended", () => {
+    // The genuine-kill shape: nothing newer existed yet when this run died.
+    __test_recordWorkflowRunSighting("Blockcast/paperclip", "blo-20613-claude-oom-signal", 1, Date.parse("2026-08-02T19:13:27Z"));
+    expect(
+      __test_classifyWorkflowRunSupersession(
+        "Blockcast/paperclip",
+        "blo-20613-claude-oom-signal",
+        1,
+        Date.parse("2026-08-02T19:34:01Z"),
+      ),
+    ).toBe("none");
+    // A later push on the same branch, sighted only after the cancellation
+    // instant, must not retroactively mark the earlier kill as superseded.
+    __test_recordWorkflowRunSighting("Blockcast/paperclip", "blo-20613-claude-oom-signal", 2, Date.parse("2026-08-02T20:00:00Z"));
+    expect(
+      __test_classifyWorkflowRunSupersession(
+        "Blockcast/paperclip",
+        "blo-20613-claude-oom-signal",
+        1,
+        Date.parse("2026-08-02T19:34:01Z"),
+      ),
+    ).toBe("none");
+  });
+
+  it("keeps branches independent -- a supersession on one branch never leaks onto another", () => {
+    __test_recordWorkflowRunSighting("Blockcast/paperclip", "branch-a", 1, Date.parse("2026-08-02T19:00:00Z"));
+    __test_recordWorkflowRunSighting("Blockcast/paperclip", "branch-a", 2, Date.parse("2026-08-02T19:05:00Z"));
+    __test_recordWorkflowRunSighting("Blockcast/paperclip", "branch-b", 3, Date.parse("2026-08-02T19:00:00Z"));
+    expect(
+      __test_classifyWorkflowRunSupersession("Blockcast/paperclip", "branch-b", 3, Date.parse("2026-08-02T19:10:00Z")),
+    ).toBe("none");
+  });
+
+  it("ignores an out-of-order (older) sighting so it cannot regress an already-newer record", () => {
+    __test_recordWorkflowRunSighting("Blockcast/paperclip", "branch-c", 2, Date.parse("2026-08-02T19:10:00Z"));
+    // A late/duplicate delivery for an older run must not evict the newer one.
+    __test_recordWorkflowRunSighting("Blockcast/paperclip", "branch-c", 1, Date.parse("2026-08-02T19:05:00Z"));
+    expect(
+      __test_classifyWorkflowRunSupersession("Blockcast/paperclip", "branch-c", 1, Date.parse("2026-08-02T19:11:00Z")),
+    ).toBe("superseded");
   });
 });
 

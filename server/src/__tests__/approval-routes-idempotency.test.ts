@@ -394,6 +394,28 @@ describe("approval routes idempotent retries", () => {
     );
   });
 
+  it("rejects an agent id on the generic hire approval route", async () => {
+    mockSecretService.normalizeHireApprovalPayloadForPersistence.mockResolvedValue({
+      name: "Untrusted hire",
+      agentId: "00000000-0000-0000-0000-000000000002",
+    });
+
+    const res = await request(await createAgentApp())
+      .post("/api/companies/company-1/approvals")
+      .send({
+        type: "hire_agent",
+        payload: {
+          title: "Approve agent hire",
+          name: "Untrusted hire",
+          agentId: "00000000-0000-0000-0000-000000000002",
+        },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error).toContain("cannot bind an existing agent");
+    expect(mockApprovalService.create).not.toHaveBeenCalled();
+  });
+
   it("carries the payload `note` into details as description (note alias)", async () => {
     mockApprovalService.create.mockResolvedValue({
       id: "approval-note",
@@ -497,6 +519,64 @@ describe("approval routes idempotent retries", () => {
         requestedByUserId: "user-1",
       }),
     );
+  });
+
+  it.each([
+    ["absent", {}],
+    ["empty string", { title: "" }],
+    ["whitespace-only", { title: "   " }],
+  ])("rejects a create request with a %s payload.title with a 4xx naming the field", async (_case, payload) => {
+    const res = await request(await createAgentApp())
+      .post("/api/companies/company-1/approvals")
+      .send({
+        type: "request_board_approval",
+        payload,
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(400);
+    expect(JSON.stringify(res.body)).toContain("payload.title");
+    expect(mockApprovalService.create).not.toHaveBeenCalled();
+  });
+
+  it("accepts a create request with a non-empty payload.title", async () => {
+    mockApprovalService.create.mockResolvedValue({
+      id: "approval-title-ok",
+      companyId: "company-1",
+      type: "request_board_approval",
+      requestedByAgentId: "agent-1",
+      requestedByUserId: null,
+      status: "pending",
+      payload: { title: "Approve hosting spend" },
+      decisionNote: null,
+      decidedByUserId: null,
+      decidedAt: null,
+      createdAt: new Date("2026-04-06T00:00:00.000Z"),
+      updatedAt: new Date("2026-04-06T00:00:00.000Z"),
+    });
+
+    const res = await request(await createAgentApp())
+      .post("/api/companies/company-1/approvals")
+      .send({
+        type: "request_board_approval",
+        payload: { title: "Approve hosting spend" },
+      });
+
+    expect([200, 201], JSON.stringify(res.body)).toContain(res.status);
+    expect(mockApprovalService.create).toHaveBeenCalled();
+  });
+
+  it.each([
+    ["absent", {}],
+    ["empty string", { title: "" }],
+    ["whitespace-only", { title: "   " }],
+  ])("rejects a resubmit replacement payload with a %s payload.title", async (_case, payload) => {
+    const res = await request(await createAgentApp())
+      .post("/api/approvals/approval-title-resubmit/resubmit")
+      .send({ payload });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(400);
+    expect(JSON.stringify(res.body)).toContain("payload.title");
+    expect(mockApprovalService.resubmit).not.toHaveBeenCalled();
   });
 
   it("blocks status-only recovery runs from creating approvals", async () => {

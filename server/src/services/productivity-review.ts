@@ -35,6 +35,7 @@ import {
   withRecoveryModelProfileHint,
 } from "./recovery/model-profile-hint.js";
 import { RECOVERY_ORIGIN_KINDS } from "./recovery/origins.js";
+import { runUsageTokenCounts } from "./recovery/zero-token-startup-failure.js";
 
 export const PRODUCTIVITY_REVIEW_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.issueProductivityReview;
 export const DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS = 10;
@@ -69,6 +70,13 @@ const ACTIVE_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const MAX_CANDIDATE_ISSUES = 250;
 const MAX_RUNS_FOR_STREAK = 100;
 const MAX_PARENT_WALK_DEPTH = 25;
+// BLO-19848: how long a `running` execution holder may go without a genuine
+// activity signal before its elapsed time stops being attributed to live work.
+// Matches STALE_RUNNING_ISSUE_LOCK_MS in recovery/service.ts, which is the point
+// the stale-lock sweeper itself stops believing the holder — kept as a local
+// constant rather than an import to avoid coupling the detector to the recovery
+// service's module graph.
+const NON_LIVE_EXECUTION_SILENCE_MS = 2 * 60 * 60 * 1000;
 export const PRODUCTIVITY_REVIEW_REFRESH_COMMENT_PREFIX = "Productivity review evidence refreshed.";
 const PRODUCTIVITY_REVIEW_CREATED_ACTION = "issue.productivity_review_created";
 const PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_STARTED_ACTION =
@@ -100,7 +108,11 @@ export const MONITOR_LAPSE_SERVICE_GRACE_MS = DEFAULT_PRODUCTIVITY_REVIEW_MONITO
 type IssueRow = typeof issues.$inferSelect;
 type AgentRow = typeof agents.$inferSelect;
 type HeartbeatRunRow = typeof heartbeatRuns.$inferSelect;
-type ProductivityReviewTrigger = "no_comment_streak" | "long_active_duration" | "high_churn";
+type ProductivityReviewTrigger =
+  | "no_comment_streak"
+  | "long_active_duration"
+  | "high_churn"
+  | "runtime_failure_streak";
 
 type ProductivityReviewThresholds = {
   noCommentStreakRuns: number;
@@ -127,6 +139,7 @@ type ProductivityReviewEvidence = {
   sourceIssue: IssueRow;
   sourceAgent: AgentRow;
   noCommentStreak: number;
+  runtimeFailureStreak: number;
   totalRunCount: number;
   terminalRunCount: number;
   activeRunCount: number;
@@ -136,6 +149,10 @@ type ProductivityReviewEvidence = {
   commentCountLastHour: number;
   commentCountLastSixHours: number;
   elapsedMs: number | null;
+  // BLO-19848: wall-clock excluded from elapsedMs because the issue's
+  // executionRunId was pinned by a run that was not live. 0 when the holder is
+  // live or absent.
+  nonLiveHoldMs: number;
   monitorGating: {
     gatedMs: number;
     unattendedMs: number;
@@ -312,6 +329,116 @@ function isActiveProductivityReviewUniqueConflict(error: unknown) {
 function coerceDate(value: Date | string | null | undefined) {
   if (!value) return null;
   return value instanceof Date ? value : new Date(value);
+}
+
+function latestDate(...values: Array<Date | string | null | undefined>) {
+  const dates = values
+    .map(coerceDate)
+    .filter((value): value is Date => !!value && !Number.isNaN(value.getTime()));
+  if (dates.length === 0) return null;
+  return new Date(Math.max(...dates.map((date) => date.getTime())));
+}
+
+/**
+ * BLO-19848: the moment an issue's execution stopped being attributable to a
+ * live run, or null while the current holder is genuinely live.
+ *
+ * `long_active_duration` measures wall-clock from `issues.started_at` to `now`
+ * with no reference to whether anything is actually executing. That is correct
+ * while a run is working and wrong the instant the holding run stops: an issue
+ * whose `executionRunId` is pinned by a non-live run keeps accruing "active"
+ * time indefinitely, so the detector reports an episode that ended days ago and
+ * files a review against an assignee who cannot even transition the issue (the
+ * same wedge produces `409 Issue run ownership conflict`). BLO-18307 accrued a
+ * reported "1d 7h active episode" behind a `scheduled_retry` holder whose fix
+ * had already merged; BLO-12565 and BLO-12696 are the same shape.
+ *
+ * Liveness here is deliberately stricter than `ACTIVE_RUN_STATUSES`. `queued`
+ * and `scheduled_retry` are non-terminal but are, by definition, not executing —
+ * counting their elapsed time is exactly the bug. A `running` holder counts as
+ * live until it goes silent past NON_LIVE_EXECUTION_SILENCE_MS, measured on the
+ * run's own activity columns (the same basis the stale-lock sweeper and the
+ * dispatcher's slot gate use) rather than on `updatedAt`, which review and
+ * recovery churn would otherwise keep fresh forever (BLO-8827).
+ *
+ * Returns the clamp point — the last moment still attributable to the run — so
+ * the episode is truncated when live work stopped rather than dropped to zero.
+ * An issue with no execution holder at all returns null and keeps full
+ * wall-clock accounting: that is an unowned `in_progress` issue, which is
+ * genuine stalling and exactly what the trigger should still catch.
+ */
+function nonLiveExecutionHoldSince(
+  issue: IssueRow,
+  executionRun: HeartbeatRunRow | null,
+  now: Date,
+): Date | null {
+  if (!issue.executionRunId) return null;
+  // Pointer to a run row we cannot see: treat the lock timestamp as the last
+  // attributable moment rather than trusting an unverifiable holder.
+  if (!executionRun) return coerceDate(issue.executionLockedAt);
+
+  const lastSignal = latestDate(
+    executionRun.lastUsefulActionAt,
+    executionRun.lastOutputAt,
+    executionRun.startedAt,
+    issue.executionLockedAt,
+  );
+
+  if (executionRun.status === "running") {
+    if (!lastSignal) return null; // mid-claim; do not truncate on a bare row
+    return now.getTime() - lastSignal.getTime() >= NON_LIVE_EXECUTION_SILENCE_MS
+      ? new Date(lastSignal.getTime() + NON_LIVE_EXECUTION_SILENCE_MS)
+      : null;
+  }
+
+  if (TERMINAL_RUN_STATUSES.includes(executionRun.status as (typeof TERMINAL_RUN_STATUSES)[number])) {
+    return coerceDate(executionRun.finishedAt) ?? lastSignal;
+  }
+
+  // queued / scheduled_retry: parked, not executing.
+  return lastSignal;
+}
+
+/**
+ * BLO-19848 (review follow-up): the moment the current live execution segment
+ * began, when the holding run reached `running` by way of a park — or null when
+ * there is no park to exclude.
+ *
+ * `nonLiveExecutionHoldSince` only truncates the *tail* of an episode, so it
+ * stops helping the instant a parked holder resumes: the run is genuinely live
+ * again, the clamp goes away, and the entire parked interval is re-attributed to
+ * active work because elapsed is still measured from `issues.started_at`. That
+ * is the reported failure — a 6h50m park plus a 10m run still totals 7h and
+ * still trips `long_active_duration`, which is the same false positive this
+ * issue exists to remove, just reached by a different path.
+ *
+ * A promoted retry keeps its park on the row: promoteDueScheduledRetry flips
+ * `scheduled_retry` to `queued` writing only status/error/updatedAt
+ * (heartbeat.ts), and the subsequent claim preserves `startedAt`
+ * (`run.startedAt ?? claimedAt`). So `scheduledRetryAt` survives promotion as a
+ * durable record of when the park ended, and `startedAt` still points at the
+ * original, pre-park start. A `running` row carrying a past `scheduledRetryAt`
+ * therefore could not have been executing before that timestamp.
+ *
+ * Only consulted for `running` holders. While a run is still parked its
+ * `scheduledRetryAt` is the *future* due time, which says nothing about a live
+ * segment — that case is already handled by the tail clamp.
+ *
+ * This deliberately measures the current segment rather than summing every live
+ * segment across a multi-park episode: the row keeps only the most recent park
+ * boundary, so earlier live attempts are dropped. That under-counts, which is
+ * the safe direction for a trigger whose failure mode is firing on work that is
+ * not actually running; a genuinely long-running segment still fires, and the
+ * evidence block reports the excluded total alongside it.
+ */
+function liveSegmentStartedAt(executionRun: HeartbeatRunRow | null, now: Date): Date | null {
+  if (!executionRun || executionRun.status !== "running") return null;
+  const parkEndedAt = coerceDate(executionRun.scheduledRetryAt);
+  if (!parkEndedAt || Number.isNaN(parkEndedAt.getTime())) return null;
+  // A future deadline on a `running` row is contradictory; ignore rather than
+  // clamping the episode start into the future.
+  if (parkEndedAt.getTime() > now.getTime()) return null;
+  return parkEndedAt;
 }
 
 function isTerminalIssueStatus(status: string | null | undefined) {
@@ -565,10 +692,19 @@ function buildThresholds(overrides?: Partial<ProductivityReviewThresholds>): Pro
 }
 
 function choosePrimaryTrigger(input: {
+  runtimeFailure: boolean;
   noComment: boolean;
   longActive: boolean;
   highChurn: boolean;
 }): ProductivityReviewTrigger | null {
+  // Runtime failure takes priority: if the sampled window is dominated by
+  // runs that never got a model turn, that is the root cause worth surfacing
+  // first — an agent that never executed cannot also be judged unproductive
+  // (BLO-21769). `no_comment_streak` only ever counts turn-executing runs
+  // (see `isNeverExecutedRun` filtering in `collectEvidence`), so the two
+  // streaks are drawn from disjoint run sets and can coexist without this
+  // ordering being arbitrary.
+  if (input.runtimeFailure) return "runtime_failure_streak";
   if (input.noComment) return "no_comment_streak";
   if (input.highChurn) return "high_churn";
   if (input.longActive) return "long_active_duration";
@@ -582,7 +718,23 @@ function isSoftStopTrigger(trigger: ProductivityReviewTrigger) {
 function formatTrigger(trigger: ProductivityReviewTrigger) {
   if (trigger === "no_comment_streak") return "No-comment streak";
   if (trigger === "high_churn") return "High churn";
+  if (trigger === "runtime_failure_streak") return "Runtime failure streak";
   return "Long active duration";
+}
+
+// True when a run's most recent classification is `failed` liveness AND it
+// burned zero input+output tokens. That combination means the agent never
+// got a model turn — the runtime crashed, the process was killed, or every
+// model call errored before producing output. Observed causes include a K8s
+// crashloop (`BackoffLimitExceeded`), an inference-gateway 503 storm, a
+// provider capacity 429 kill, and retry-budget exhaustion with no error code
+// at all (`error: "unknown"`, `error_status: null`). Keying on token usage
+// rather than error code/status/dispatch-state is deliberate: it is the one
+// signature all four causes share (BLO-21769).
+function isNeverExecutedRun(run: Pick<HeartbeatRunRow, "livenessState" | "usageJson">): boolean {
+  if (run.livenessState !== "failed") return false;
+  const { inputTokens, outputTokens } = runUsageTokenCounts(run.usageJson);
+  return inputTokens === 0 && outputTokens === 0;
 }
 
 /**
@@ -1905,8 +2057,20 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     const terminalRuns = latestRuns.filter((run) =>
       TERMINAL_RUN_STATUSES.includes(run.status as (typeof TERMINAL_RUN_STATUSES)[number]),
     );
-    let noCommentStreak = 0;
+
+    // BLO-21769: a run that never executed a model turn (see
+    // `isNeverExecutedRun`) is infrastructure telemetry, not agent behaviour.
+    // It must not extend `noCommentStreak` — the agent was never given a
+    // chance to comment — so it is filtered out of the walk entirely rather
+    // than counted as silence or treated as a streak-breaker.
+    let runtimeFailureStreak = 0;
     for (const run of terminalRuns) {
+      if (!isNeverExecutedRun(run)) break;
+      runtimeFailureStreak += 1;
+    }
+    const executedTerminalRuns = terminalRuns.filter((run) => !isNeverExecutedRun(run));
+    let noCommentStreak = 0;
+    for (const run of executedTerminalRuns) {
       if (commentRunIds.has(run.id)) break;
       noCommentStreak += 1;
     }
@@ -1953,22 +2117,74 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       ACTIVE_RUN_STATUSES.includes(run.status as (typeof ACTIVE_RUN_STATUSES)[number]),
     ).length;
     const activeStartedAt = sourceIssue.startedAt ?? sourceIssue.executionLockedAt ?? null;
-    const elapsedMs = sourceIssue.status === "in_progress" && activeStartedAt
+    // BLO-19848: clamp the episode end to the last moment execution was
+    // attributable to a live run, so a wedged holder cannot accrue "active"
+    // time on work that already finished. See nonLiveExecutionHoldSince.
+    const executionRun = sourceIssue.executionRunId
+      ? await db
+          .select()
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, sourceIssue.executionRunId))
+          .limit(1)
+          .then((rows) => rows[0] ?? null)
+      : null;
+    const nonLiveHoldSince = nonLiveExecutionHoldSince(sourceIssue, executionRun, now);
+    // Clamping below activeStartedAt collapses to 0 via Math.max — i.e. a holder
+    // that went non-live before the episode began contributes no active time.
+    const attributableEndAt = nonLiveHoldSince ?? now;
+    // BLO-19848 (review follow-up): the tail clamp above is not enough on its
+    // own, because it only truncates a hold that is *still* open. A holder that
+    // parked and then resumed is live again, so nonLiveExecutionHoldSince
+    // correctly returns null — and the whole parked interval silently reverts to
+    // being counted, since elapsed is measured from activeStartedAt. A 6h50m
+    // park followed by a 10m run still reported 7h and still fired the trigger.
+    // Exclude the park from the front of the episode too. See
+    // liveSegmentStartedAt.
+    const liveSegmentStart = liveSegmentStartedAt(executionRun, now);
+    const attributableStartAt = activeStartedAt
+      && liveSegmentStart
+      && liveSegmentStart.getTime() > activeStartedAt.getTime()
+      ? liveSegmentStart
+      : activeStartedAt;
+    const elapsedMs = sourceIssue.status === "in_progress" && attributableStartAt
+      ? Math.max(0, attributableEndAt.getTime() - attributableStartAt.getTime())
+      : null;
+    // Total wall-clock withheld from the trigger: the leading park plus the
+    // trailing non-live hold. Bounded by the episode so the two exclusions
+    // cannot report more than the episode actually spans.
+    const leadingParkMs = activeStartedAt && attributableStartAt
+      ? Math.max(0, attributableStartAt.getTime() - activeStartedAt.getTime())
+      : 0;
+    const trailingHoldMs = Math.max(0, now.getTime() - attributableEndAt.getTime());
+    const episodeMs = activeStartedAt
       ? Math.max(0, now.getTime() - activeStartedAt.getTime())
       : null;
+    const nonLiveHoldMs = episodeMs === null
+      ? trailingHoldMs
+      : Math.min(episodeMs, leadingParkMs + trailingHoldMs);
 
     const noComment = noCommentStreak >= thresholds.noCommentStreakRuns;
+    // Reuses `noCommentStreakRuns` as the sample-size threshold: both streaks
+    // ask "how many consecutive terminal runs is suspicious", just over
+    // disjoint filters (turn-executing vs never-executed). A separate config
+    // knob would be redundant surface for the same question.
+    const runtimeFailure = runtimeFailureStreak >= thresholds.noCommentStreakRuns;
     const longActive = elapsedMs !== null && elapsedMs >= thresholds.longActiveMs;
     const highChurn =
       runCountLastHour >= thresholds.highChurnHourly ||
       assigneeRunCommentCountLastHour >= thresholds.highChurnHourly ||
       runCountLastSixHours >= thresholds.highChurnSixHours ||
       assigneeRunCommentCountLastSixHours >= thresholds.highChurnSixHours;
-    const trigger = choosePrimaryTrigger({ noComment, longActive, highChurn });
+    const trigger = choosePrimaryTrigger({ runtimeFailure, noComment, longActive, highChurn });
     if (!trigger) return null;
 
     const triggerReasons: string[] = [];
-    if (noComment) triggerReasons.push(`${noCommentStreak} consecutive completed issue-linked runs had no run-created issue comment`);
+    if (runtimeFailure) {
+      triggerReasons.push(
+        `${runtimeFailureStreak} consecutive terminal runs produced zero model turns (failed liveness, 0 input/output tokens) — infrastructure failure, not agent silence`,
+      );
+    }
+    if (noComment) triggerReasons.push(`${noCommentStreak} consecutive terminal, turn-executing issue-linked runs had no run-created issue comment`);
     if (longActive) triggerReasons.push(`current active episode has lasted ${msToHuman(elapsedMs)}`);
     if (highChurn) {
       triggerReasons.push(
@@ -2033,6 +2249,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       sourceIssue,
       sourceAgent,
       noCommentStreak,
+      runtimeFailureStreak,
       totalRunCount: latestRuns.length,
       terminalRunCount: terminalRuns.length,
       activeRunCount,
@@ -2042,7 +2259,8 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       commentCountLastHour: assigneeRunCommentCountLastHour,
       commentCountLastSixHours: assigneeRunCommentCountLastSixHours,
       elapsedMs,
-      monitorGating: monitorGatingBreakdown(sourceIssue, activeStartedAt, elapsedMs, now),
+      nonLiveHoldMs,
+      monitorGating: monitorGatingBreakdown(sourceIssue, attributableStartAt, elapsedMs, now),
       latestRuns: latestRuns.slice(0, 5),
       latestComments,
       costCents: costRow.costCents,
@@ -2149,8 +2367,14 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       `- Total sampled issue-linked runs: ${evidence.totalRunCount}`,
       `- Terminal sampled runs: ${evidence.terminalRunCount}`,
       `- Active queued/running/scheduled runs: ${evidence.activeRunCount}`,
-      `- No-comment completed-run streak: ${evidence.noCommentStreak}`,
+      `- No-comment streak (terminal, turn-executing runs): ${evidence.noCommentStreak}`,
+      `- Runtime-failure streak (terminal, never-executed runs): ${evidence.runtimeFailureStreak}`,
       `- Current active elapsed time: ${msToHuman(evidence.elapsedMs)}`,
+      ...(evidence.nonLiveHoldMs > 0
+        ? [
+            `- Excluded as non-live execution hold: ${msToHuman(evidence.nonLiveHoldMs)} (issue's executionRunId parked or pinned by a run that was not live; not counted toward the trigger — BLO-19848)`,
+          ]
+        : []),
       ...(evidence.monitorGating
         ? [`- Elapsed accounting: ${formatMonitorGating(evidence.monitorGating)}`]
         : []),
@@ -2161,7 +2385,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       "",
       "## Thresholds",
       "",
-      `- No-comment streak: ${evidence.thresholds.noCommentStreakRuns} completed runs`,
+      `- No-comment / runtime-failure streak: ${evidence.thresholds.noCommentStreakRuns} consecutive terminal runs`,
       `- Long active duration: ${msToHuman(evidence.thresholds.longActiveMs)}`,
       `- High churn: ${evidence.thresholds.highChurnHourly}/1h or ${evidence.thresholds.highChurnSixHours}/6h runs/assignee-run comments`,
       `- Resolved-review snooze: ${msToHuman(evidence.thresholds.resolvedSnoozeMs)}`,
@@ -2180,16 +2404,27 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       "",
       "## Manager Decision",
       "",
-      "A \"Close as productive\" verdict requires at least ONE of the following concrete progress signals:",
-      "- An assignee run-linked comment in the last 6h that contains a `Next action:` line",
-      "- A non-stale PR/MR link in the source issue's evidence (created or updated in the last 24h)",
-      "- A recent test result, artifact commit, or workspace deliverable in the last 6h",
-      "",
-      "If none of these signals is present, the correct verdict is one of:",
-      "- Request decomposition (the work is too large for a single heartbeat issue and needs to be split)",
-      "- Block with an unblock owner (the work needs human direction; name the gate)",
-      "- Stop/cancel (the work is not delivering value and should be wound down)",
-      "- Continue with a snooze window (only if the assignee has a clear next step but no surface evidence yet)",
+      ...(evidence.trigger === "runtime_failure_streak"
+        ? [
+          "This trigger fired because the sampled runs never executed a model turn (failed liveness, zero input/output tokens) — the assignee was never given a chance to act. This is an infrastructure signal, not an agent-performance verdict; do not decompose, block, or cancel the underlying work on the strength of this alone.",
+          "",
+          "Route to platform/SRE for one of:",
+          "- Diagnose and fix the underlying dispatch/runtime fault (crashloop, provider outage, retry exhaustion)",
+          "- Confirm the fault has cleared and let the issue continue unattended (no assignee action needed)",
+          "- If the fault persists, escalate for infrastructure remediation instead of reassigning or cancelling the source work",
+        ]
+        : [
+          "A \"Close as productive\" verdict requires at least ONE of the following concrete progress signals:",
+          "- An assignee run-linked comment in the last 6h that contains a `Next action:` line",
+          "- A non-stale PR/MR link in the source issue's evidence (created or updated in the last 24h)",
+          "- A recent test result, artifact commit, or workspace deliverable in the last 6h",
+          "",
+          "If none of these signals is present, the correct verdict is one of:",
+          "- Request decomposition (the work is too large for a single heartbeat issue and needs to be split)",
+          "- Block with an unblock owner (the work needs human direction; name the gate)",
+          "- Stop/cancel (the work is not delivering value and should be wound down)",
+          "- Continue with a snooze window (only if the assignee has a clear next step but no surface evidence yet)",
+        ]),
     ].join("\n");
   }
 
@@ -2201,6 +2436,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       `- Trigger: \`${evidence.trigger}\` (${formatTrigger(evidence.trigger)})`,
       `- Reasons: ${evidence.triggerReasons.join("; ")}`,
       `- No-comment streak: ${evidence.noCommentStreak}`,
+      `- Runtime-failure streak: ${evidence.runtimeFailureStreak}`,
       `- Runs/assignee comments: ${evidence.runCountLastHour}/${evidence.commentCountLastHour} in 1h, ${evidence.runCountLastSixHours}/${evidence.commentCountLastSixHours} in 6h`,
       ...(evidence.monitorGating
         ? [`- Elapsed accounting: ${formatMonitorGating(evidence.monitorGating)}`]

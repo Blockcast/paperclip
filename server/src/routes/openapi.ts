@@ -76,6 +76,7 @@ import {
   resolveApprovalSchema,
   requestApprovalRevisionSchema,
   resubmitApprovalSchema,
+  withdrawApprovalSchema,
   addApprovalCommentSchema,
   // Cost / budget
   createCostEventSchema,
@@ -2923,6 +2924,25 @@ registry.registerPath({
 });
 
 registry.registerPath({
+  method: "post",
+  path: "/api/approvals/{id}/withdraw",
+  tags: ["approvals"],
+  summary: "Withdraw an approval request (requesting agent or board)",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(withdrawApprovalSchema),
+  },
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+  },
+});
+
+registry.registerPath({
   method: "get",
   path: "/api/approvals/{id}/comments",
   tags: ["approvals"],
@@ -3050,8 +3070,17 @@ registry.registerPath({
   path: "/api/companies/{companyId}/activity",
   tags: ["activity"],
   summary: "List company activity",
-  request: { params: z.object({ companyId: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  request: {
+    params: z.object({ companyId: z.string() }),
+    query: z.object({
+      agentId: z.string().uuid().optional(),
+      entityType: z.string().optional(),
+      entityId: z.string().optional(),
+      action: z.string().optional(),
+      limit: z.string().optional(),
+    }),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
 });
 
 registry.registerPath({
@@ -3080,7 +3109,7 @@ registry.registerPath({
   tags: ["activity"],
   summary: "List activity for an issue",
   request: { params: z.object({ id: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
 });
 
 registry.registerPath({
@@ -3089,7 +3118,7 @@ registry.registerPath({
   tags: ["activity"],
   summary: "List runs for an issue",
   request: { params: z.object({ id: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
 });
 
 registry.registerPath({
@@ -3098,7 +3127,7 @@ registry.registerPath({
   tags: ["activity"],
   summary: "List issues for a heartbeat run",
   request: { params: z.object({ runId: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
 });
 
 // ─── Dashboard ───────────────────────────────────────────────────────────────

@@ -24,6 +24,9 @@ export interface ToolDefinition {
   schema: z.AnyZodObject;
   execute: (input: Record<string, unknown>) => Promise<{
     content: Array<{ type: "text"; text: string }>;
+    // Set by formatErrorResponse. Keeping it in the declared return type makes
+    // MCP error propagation visible to implementers and tests (BLO-18466).
+    isError?: boolean;
   }>;
 }
 
@@ -548,7 +551,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     ),
     makeTool(
       "paperclipCreateIssue",
-      "Create a new issue. Pass blockedByIssueIds to set dependency blockers at creation (write-only — they read back under `blockedBy`, not `blockedByIssueIds`).",
+      "Create a new issue. The response includes advisory `duplicateCandidates`; matches never refuse the create and are independent of `allowDuplicate`. Pass blockedByIssueIds to set dependency blockers at creation (write-only — they read back under `blockedBy`, not `blockedByIssueIds`).",
       createIssueToolSchema,
       async ({ companyId, ...body }) => {
         const resolved = await client.resolveCompany({ override: companyId });
@@ -705,9 +708,12 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
                 ? `/approvals/${encodeURIComponent(approvalId)}/request-revision`
                 : `/approvals/${encodeURIComponent(approvalId)}/resubmit`;
 
+        const replacementPayload = action === "resubmit" ? parseOptionalJson(payloadJson) : undefined;
         const body =
           action === "resubmit"
-            ? { payload: parseOptionalJson(payloadJson) ?? {} }
+            ? replacementPayload === undefined
+              ? {}
+              : { payload: replacementPayload }
             : { decisionNote };
 
         return client.requestJson("POST", path, { body });

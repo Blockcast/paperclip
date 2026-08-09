@@ -339,7 +339,28 @@ ARG CLAUDE_K8S_REF=3ad33702052f357ec2b31b7d3051e89ed1ed4875
 # adapter tests and typecheck pass.
 # Bumped 2026-08-04 to 42384fd: merge #50 onto the exact-current-Job fix, so
 # both lifecycle-Job exclusion and anthropic/claude-opus-5 support are present.
-ARG OPENCODE_K8S_REF=42384fdef5780ccdfbfba67c1a60feebd7ffb87c
+# Bumped 2026-08-04 to ff92362 (#52): PEN-1305 plugin arm — canary-gated
+# tool.execute.before env-guard plugin (adapter config envGuardPlugin,
+# default off; fleet behavior unchanged until the canary flips it on).
+# Adapter suite 592 green + typecheck clean; plugin API validated against
+# the live opencode 1.15.12 runtime.
+# Bumped 2026-08-04 to 9ff4c4c: address Ally review on #52 -- disabled
+# canaries clean stale persistent guard artifacts, safe-helper allowlist no
+# longer masks helper+dump command chains, and unquoted sh/bash -c dumps are
+# blocked. Adapter suite 603 green + typecheck clean.
+# Bumped 2026-08-05 to 83197d4: parse the shell -c command-string before
+# positional arguments, closing sh -c env ignored / bash -c "env" ignored
+# wrapper bypasses. Focused env-guard suite 90/90, typecheck, and build pass.
+# Bumped 2026-08-08 to 8f42726 (#54/#55): treat deleting nonterminal Jobs as
+# live concurrency blockers; for BLO-22922, start completion grace only after
+# the log stream exits and preserve successful finite-timeout runs.
+# Bumped 2026-08-08 to 6dca020 (#56/#58): retain those fixes and restore the
+# PEN-1305 shell-command parser on the current adapter line. The vendor build
+# runs the upstream env-guard and execute suites against this exact tree.
+# Bumped 2026-08-08 to ed03316 (#60): reattach to an exact persisted lifecycle
+# Job after worker recovery instead of recreating its prompt Secret and Job.
+# Running and terminal Jobs are both recovered by name, UID, and run label.
+ARG OPENCODE_K8S_REF=ed0331690432d3c37cd7ed190ca1066c840b30c3
 
 # Pack paperclip's in-tree adapter-utils so the bundled adapters consume
 # the workspace version (may include exports newer than the latest
@@ -417,6 +438,7 @@ RUN --mount=type=cache,target=/root/.npm,sharing=locked \
   && rm -rf .git \
   && npm ci \
   && npm install --no-save /vendor/adapter-utils.tgz \
+  && npm test -- src/server/env-guard-plugin.test.ts src/server/execute.test.ts \
   && npm run build \
   && npm pack \
   && mv paperclip-adapter-opencode-k8s-*.tgz /vendor/paperclip-adapter-opencode-k8s.tgz
