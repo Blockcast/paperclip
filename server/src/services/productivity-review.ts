@@ -2824,10 +2824,10 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
 
         const refreshState = await getRefreshCommentState(evidence.sourceIssue.companyId, existing.id, tx);
         const lastRefreshAt = refreshState.latestCreatedAt ?? existing.createdAt;
-        if (
-          refreshState.count >= opts.thresholds.maxRefreshComments ||
-          evidence.generatedAt.getTime() - lastRefreshAt.getTime() < effectiveRefreshIntervalMs
-        ) {
+        // The hard-floor interval gates everything below, including the
+        // description rewrite — a trigger flip must not be usable to force
+        // more writes than a normal refresh already allows.
+        if (evidence.generatedAt.getTime() - lastRefreshAt.getTime() < effectiveRefreshIntervalMs) {
           return { throttled: true as const, lastRefreshAt };
         }
 
@@ -2840,20 +2840,43 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         // description write more often than the hard-floor interval allows.
         const previousTrigger = extractReviewTriggerFromDescription(existing.description);
         const descriptionStale = previousTrigger !== null && previousTrigger !== evidence.trigger;
+        let descriptionRegenerated = false;
         if (descriptionStale) {
-          await tx
+          // `existing.description` was read outside this transaction. The
+          // advisory lock only serializes this refresh path against itself —
+          // it says nothing about a human editing the review issue's
+          // description directly in between. Guard the overwrite with the
+          // description we actually read so a concurrent edit loses the race
+          // cleanly (0 rows matched, nothing clobbered) instead of being
+          // silently discarded.
+          const [updatedRow] = await tx
             .update(issues)
             .set({ description: buildReviewMarkdown(evidence, opts.prefix), updatedAt: evidence.generatedAt })
-            .where(eq(issues.id, existing.id));
+            .where(and(eq(issues.id, existing.id), eq(issues.description, existing.description as string)))
+            .returning({ id: issues.id });
+          descriptionRegenerated = updatedRow !== undefined;
         }
 
-        await addRefreshComment(
-          existing.id,
-          buildRefreshComment(evidence, opts.prefix),
-          evidence.generatedAt,
-          tx,
-        );
-        return { throttled: false as const, lastRefreshAt, descriptionRegenerated: descriptionStale };
+        // `maxRefreshComments` bounds refresh-comment churn, not the
+        // correctness of the durable Manager Decision guidance. Gating the
+        // description rewrite on it too would mean a review that outlives the
+        // cap could never self-correct after a trigger flip — exactly the
+        // staleness this fix exists to close. Only the comment emission is
+        // capped; the interval check above still applies to both.
+        const commentCapped = refreshState.count >= opts.thresholds.maxRefreshComments;
+        if (!commentCapped) {
+          await addRefreshComment(
+            existing.id,
+            buildRefreshComment(evidence, opts.prefix),
+            evidence.generatedAt,
+            tx,
+          );
+        }
+
+        if (commentCapped && !descriptionRegenerated) {
+          return { throttled: true as const, lastRefreshAt };
+        }
+        return { throttled: false as const, lastRefreshAt, descriptionRegenerated };
       });
 
       if (refreshOutcome.throttled) {
@@ -2864,7 +2887,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
             lastRefreshAt: refreshOutcome.lastRefreshAt.toISOString(),
             minIntervalMs: effectiveRefreshIntervalMs,
           },
-          "productivity review refresh throttled: previous refresh within hard-floor window",
+          "productivity review refresh throttled: within hard-floor window or comment cap reached with no stale description to fix",
         );
         return { kind: "existing" as const, reviewIssueId: existing.id };
       }
