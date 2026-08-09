@@ -7,7 +7,6 @@ import {
   assertHeadSha,
   assertPrListComplete,
   attestedHead,
-  distinctVerdicts,
   findPrViolations,
   findViolations,
   hasBlockingFindings,
@@ -15,7 +14,6 @@ import {
   isAllyLogin,
   isMainModule,
   operativeAllyReviews,
-  requiredIdentityAttestationPairs,
 } from "./check-ally-review-consistency.mjs";
 
 const HEAD = "ff1c72dbfd18014c838cf1373b1640dd17378f3e";
@@ -178,7 +176,7 @@ describe("findPrViolations", () => {
     };
     const violations = findPrViolations(pr);
     assert.equal(violations.length, 2);
-    assert.match(violations[0], /^I1 PR #876 @ff1c72db: 2 logical Ally verdicts/);
+    assert.match(violations[0], /^I1 PR #876 @ff1c72db: 2 operative Ally reviews/);
     assert.match(violations[1], /^I2b PR #876 @ff1c72db: standing APPROVED \(4829069732\)/);
   });
 
@@ -328,118 +326,43 @@ describe("assertPrListComplete", () => {
 const APP_UID = 290875700;
 const USER_UID = 296676656;
 
-/** The required App/User exact-head evidence pair: one body, two identities. */
-function credentialPair(body) {
+/** The duplicate-credential shape from BLO-22916: one body, two identities. */
+function duplicateCredentialPair(body) {
   return [
     { ...review({ id: 11, state: "APPROVED", body }), user: { login: "allyblockcast[bot]", id: APP_UID } },
     { ...review({ id: 12, state: "APPROVED", body }), user: { login: "allyblockcast", id: USER_UID } },
   ];
 }
 
-describe("requiredIdentityAttestationPairs", () => {
+describe("I1 counts actual operative review submissions", () => {
   const body = `## Ally — Consolidated PR Review\nReviewed head: ${HEAD}\n`;
 
-  it("groups an identical body posted under the required App and User identities", () => {
-    const groups = requiredIdentityAttestationPairs(credentialPair(body), HEAD);
-    assert.equal(groups.length, 1);
-    assert.deepEqual(groups[0].map((r) => r.id), [11, 12]);
-  });
+  it("flags a byte-identical App/User pair rather than collapsing it", () => {
+    const violations = findPrViolations({
+      number: 1129,
+      headSha: HEAD,
+      reviews: duplicateCredentialPair(body),
+    });
 
-  it("does not group two identical bodies from the same identity — that is a retry", () => {
-    const reviews = credentialPair(body).map((r) => ({ ...r, user: { login: "allyblockcast", id: USER_UID } }));
-    assert.deepEqual(requiredIdentityAttestationPairs(reviews, HEAD), []);
-  });
-
-  it("does not group different bodies across the two identities — those are two real verdicts", () => {
-    const [app, user] = credentialPair(body);
-    assert.deepEqual(
-      requiredIdentityAttestationPairs([app, { ...user, body: `${body}\n### Important Issues (1)\n- something` }], HEAD),
-      [],
-    );
-  });
-
-  it("ignores a review recorded against a different head", () => {
-    const [app, user] = credentialPair(body);
-    assert.deepEqual(requiredIdentityAttestationPairs([app, { ...user, commit_id: OTHER }], HEAD), []);
-  });
-
-  it("does not group a triple with a same-identity retry", () => {
-    const [app, user] = credentialPair(body);
-    const retry = { ...user, id: 13 };
-    assert.deepEqual(requiredIdentityAttestationPairs([app, user, retry], HEAD), []);
-  });
-
-  it("does not group an unexpected or missing credential ID", () => {
-    const [app, user] = credentialPair(body);
-    assert.deepEqual(
-      requiredIdentityAttestationPairs(
-        [app, user, { ...user, id: 13, user: { login: "allyblockcast", id: 42 } }],
-        HEAD,
-      ),
-      [],
-    );
-    assert.deepEqual(
-      requiredIdentityAttestationPairs(
-        [app, user, { ...user, id: 13, user: { login: "allyblockcast" } }],
-        HEAD,
-      ),
-      [],
-    );
-  });
-});
-
-describe("distinctVerdicts", () => {
-  const body = `## Ally — Consolidated PR Review\nReviewed head: ${HEAD}\n`;
-
-  it("collapses the required identity pair to its single logical verdict", () => {
-    assert.deepEqual(distinctVerdicts(credentialPair(body), HEAD).map((r) => r.id), [11]);
-  });
-
-  it("keeps a same-account duplicate, so a retry still trips I1", () => {
-    const reviews = credentialPair(body).map((r) => ({ ...r, user: { login: "allyblockcast", id: USER_UID } }));
-    assert.equal(distinctVerdicts(reviews, HEAD).length, 2);
-  });
-});
-
-describe("I1 after required-identity pair collapse", () => {
-  const body = `## Ally — Consolidated PR Review\nReviewed head: ${HEAD}\n`;
-
-  it("does not fire on a required App/User pair", () => {
-    const violations = findPrViolations({ number: 1129, headSha: HEAD, reviews: credentialPair(body) });
-    assert.deepEqual(violations.filter((v) => v.startsWith("I1")), []);
-  });
-
-  it("still fires when the two accounts submit genuinely different verdicts", () => {
-    const [app, user] = credentialPair(body);
-    const blocker = { ...app, body: `${body}\n### Important Issues (1)\n- real finding` };
-    const violations = findPrViolations({ number: 876, headSha: HEAD, reviews: [blocker, user] });
     assert.equal(violations.filter((v) => v.startsWith("I1")).length, 1);
+    assert.match(
+      violations.find((v) => v.startsWith("I1")) ?? "",
+      /^I1 PR #1129 @ff1c72db: 2 operative Ally reviews \(APPROVED\/11, APPROVED\/12\)/,
+    );
   });
 
-  it("keeps an extra same-identity retry visible to I1", () => {
-    const [app, user] = credentialPair(body);
+  it("counts every live duplicate, including a third retry", () => {
+    const [app, user] = duplicateCredentialPair(body);
     const violations = findPrViolations({
       number: 1193,
       headSha: HEAD,
       reviews: [app, user, { ...user, id: 13 }],
     });
-    assert.equal(violations.filter((v) => v.startsWith("I1")).length, 1);
-  });
 
-  it("keeps an unexpected or missing credential ID visible to I1", () => {
-    const [app, user] = credentialPair(body);
-    const unexpected = findPrViolations({
-      number: 1194,
-      headSha: HEAD,
-      reviews: [app, user, { ...user, id: 13, user: { login: "allyblockcast", id: 42 } }],
-    });
-    const missing = findPrViolations({
-      number: 1195,
-      headSha: HEAD,
-      reviews: [app, user, { ...user, id: 13, user: { login: "allyblockcast" } }],
-    });
-    assert.equal(unexpected.filter((v) => v.startsWith("I1")).length, 1);
-    assert.equal(missing.filter((v) => v.startsWith("I1")).length, 1);
+    assert.match(
+      violations.find((v) => v.startsWith("I1")) ?? "",
+      /^I1 PR #1193 @ff1c72db: 3 operative Ally reviews/,
+    );
   });
 });
 

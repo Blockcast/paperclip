@@ -1,7 +1,7 @@
 name: Ally Review Consistency Guard
 
-# Asserts that every open PR carries at most one logical Ally verdict at its
-# current head (the required App/User exact-head pair is one logical verdict),
+# Asserts that every open PR carries at most one operative Ally review at its
+# current head,
 # that no standing APPROVED masks a Critical/Important finding, and that a
 # review's body-attested head matches the commit GitHub recorded it against.
 # See scripts/check-ally-review-consistency.mjs and BLO-19778 for the incident
