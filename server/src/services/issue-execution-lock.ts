@@ -51,6 +51,16 @@ export const TERMINAL_HEARTBEAT_RUN_STATUSES: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * Non-terminal statuses whose lock is reclaimable only when the run never
+ * started. `issues.checkout()` cancels and adopts these rows when `startedAt`
+ * is null, so availability queries must not call such an issue busy.
+ */
+export const ISSUE_EXECUTION_LOCK_REAPABLE_NEVER_STARTED_RUN_STATUSES = [
+  "queued",
+  "scheduled_retry",
+] as const satisfies readonly HeartbeatRunStatus[];
+
+/**
  * Run statuses that HOLD an issue execution lock — the complement of
  * {@link TERMINAL_HEARTBEAT_RUN_STATUSES} over {@link HEARTBEAT_RUN_STATUSES}.
  *
@@ -75,9 +85,10 @@ export const ISSUE_EXECUTION_LOCK_HOLDING_RUN_STATUSES: readonly HeartbeatRunSta
  * worktree.
  *
  * SQL call sites that decide whether work is checkoutable must use the same
- * terminal-status predicate. An enumeration of the known holding statuses would
- * make a newly persisted non-terminal status look available, dispatch a wake,
- * and then immediately receive the checkout conflict this predicate prevents.
+ * terminal-status predicate, excluding the two statuses above only when their
+ * row has never started. An enumeration of the known holding statuses would make
+ * a newly persisted non-terminal status look available, dispatch a wake, and
+ * then immediately receive the checkout conflict this predicate prevents.
  */
 export function runStatusHoldsIssueExecutionLock(status: string | null | undefined): boolean {
   if (!status) return false;

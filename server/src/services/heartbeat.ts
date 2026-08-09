@@ -204,6 +204,7 @@ import {
 import { issueService } from "./issues.js";
 import {
   ISSUE_EXECUTION_LOCK_HOLDING_RUN_STATUSES,
+  ISSUE_EXECUTION_LOCK_REAPABLE_NEVER_STARTED_RUN_STATUSES,
   TERMINAL_HEARTBEAT_RUN_STATUSES,
 } from "./issue-execution-lock.js";
 import { resolveStaleDependabotAlertWakeIssue } from "./dependabot-alert-issues.js";
@@ -15039,10 +15040,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * candidate issues 409'd and available work was genuinely zero.
    *
    * Availability is therefore checked against the same lock columns `checkout()`
-   * blocks on. Note there is no self-exclusion to make here: the predicate runs
-   * before this wake's run row exists, so *any* holder whose status is not
-   * terminal — including another run of this same agent or a future persisted
-   * status — is a run this wake would lose to.
+   * blocks on, including its never-started-lock adoption path. A `queued` or
+   * `scheduled_retry` holder with `startedAt: null` is reclaimable by the timer
+   * run after it starts, so it is actionable; every other non-terminal holder —
+   * including another run of this same agent or a future persisted status — is a
+   * run this wake would lose to.
    *
    * Deliberately still counted as actionable: an issue whose blockers are
    * unresolved. `checkout()` 422s on those, so they are not workable either, but
@@ -15051,7 +15053,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * unavailable-because-blocked needs someone to look.
    */
   async function hasActionableTimerWork(agent: typeof agents.$inferSelect) {
-    const heldByLiveRun = exists(
+    const heldByNonReapableRun = exists(
       db
         .select({ id: heartbeatRuns.id })
         .from(heartbeatRuns)
@@ -15061,9 +15063,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             or(eq(heartbeatRuns.id, issues.checkoutRunId), eq(heartbeatRuns.id, issues.executionRunId)),
             // Keep this as the terminal complement rather than enumerating known
             // holding statuses. `checkout()` retains every non-terminal status,
-            // including a status introduced by a newer deployment, so the timer
-            // must not dispatch a wake that checkout will immediately reject.
+            // including a status introduced by a newer deployment. Its only
+            // additional availability path is a queued/retry row that never
+            // started, which checkout can cancel and adopt once this run starts.
             notInArray(heartbeatRuns.status, [...TERMINAL_HEARTBEAT_RUN_STATUSES]),
+            not(
+              and(
+                inArray(
+                  heartbeatRuns.status,
+                  [...ISSUE_EXECUTION_LOCK_REAPABLE_NEVER_STARTED_RUN_STATUSES],
+                ),
+                isNull(heartbeatRuns.startedAt),
+              ),
+            ),
           ),
         ),
     );
@@ -15077,7 +15089,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           isNull(issues.assigneeUserId),
           isNull(issues.hiddenAt),
           inArray(issues.status, [...TIMER_ACTIONABLE_ISSUE_STATUSES]),
-          not(heldByLiveRun),
+          not(heldByNonReapableRun),
         ),
       )
       .limit(1)

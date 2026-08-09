@@ -94,6 +94,7 @@ import { mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
 import { buildInitialIssueMonitorFields, normalizeIssueExecutionPolicy } from "./issue-execution-policy.js";
 import {
   ISSUE_EXECUTION_LOCK_HOLDING_RUN_STATUSES,
+  ISSUE_EXECUTION_LOCK_REAPABLE_NEVER_STARTED_RUN_STATUSES,
   TERMINAL_HEARTBEAT_RUN_STATUSES,
 } from "./issue-execution-lock.js";
 import { instanceSettingsService } from "./instance-settings.js";
@@ -929,7 +930,7 @@ function normalizeAgentNameKey(value: string | null | undefined) {
   return normalized.length > 0 ? normalized : null;
 }
 export { TERMINAL_HEARTBEAT_RUN_STATUSES } from "./issue-execution-lock.js";
-const STALE_ISSUE_CONTEXT_RUN_STATUSES = ["queued", "scheduled_retry"] as const;
+const STALE_ISSUE_CONTEXT_RUN_STATUSES = ISSUE_EXECUTION_LOCK_REAPABLE_NEVER_STARTED_RUN_STATUSES;
 // Same statuses, as a lookup set: these are the non-terminal statuses a run can
 // hold before it has ever executed.
 const NEVER_STARTED_HEARTBEAT_RUN_STATUSES = new Set<string>(STALE_ISSUE_CONTEXT_RUN_STATUSES);
