@@ -122,7 +122,7 @@ function isSdkInstallRaceError(err: unknown): boolean {
 }
 
 /**
- * Transient worker-startup failures (BLO-20410, narrowed in BLO-22095).
+ * Transient worker-startup failures (BLO-20410).
  *
  * `startWorker()` runs the `initialize` RPC under INITIALIZE_TIMEOUT_MS (60s,
  * plugin-worker-manager.ts) and throws `Worker initialize failed for "<id>":
@@ -133,26 +133,33 @@ function isSdkInstallRaceError(err: unknown): boolean {
  * single manual `/enable` with no other change.
  *
  * The timeout is a symptom of boot contention, not of a broken plugin, so it is
- * retried rather than latched. Exactly two causes qualify, and both are read
- * from the typed `WorkerStartupError.transient` flag set at the throw site:
- * the blown initialize budget (`TIMEOUT`) and a worker that died before
- * initialize resolved (`WORKER_UNAVAILABLE`).
- *
- * This used to be a message-substring match, which was strictly broader than
- * this comment claimed. `Worker initialize failed for "<id>"` is the wrapper
- * applied to *every* initialize failure, so a plugin whose `initialize` handler
- * threw — bad credentials, missing config, any explicit RPC rejection — matched
- * the marker and was retried 3x before latching the same error. Only an
- * `ok=false` reply was excluded. The classification is now decided at the throw
- * site, where the underlying cause is still available.
+ * retried rather than latched. Deliberately narrow: only the initialize budget
+ * and a worker that died during startup qualify. A plugin that reports a real
+ * fault (`initialize returned ok=false`, a manifest error, a missing
+ * entrypoint) still fails closed on the first attempt.
+ */
+const TRANSIENT_ACTIVATION_ERR_MARKERS = [
+  "timed out after",
+  "Worker initialize failed",
+  "Worker exited during startup",
+];
+
+export function isTransientActivationError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  // An explicit ok=false is the plugin answering "I am broken" inside the
+  // budget — a real fault, not contention. Never retry it.
+  if (msg.includes("initialize returned ok=false")) return false;
+  return TRANSIENT_ACTIVATION_ERR_MARKERS.some((marker) => msg.includes(marker));
+}
+
+/**
+ * Retry policy for activation failures. This intentionally remains separate
+ * from the compatibility classifier above: the latter preserves the behavior
+ * that current master exposes, while activation retries require provenance from
+ * `startWorker()` so a plugin-reported failure cannot borrow the retry budget.
  */
 const INITIALIZE_TIMEOUT_ERR_MARKER = 'RPC call "initialize" timed out after';
 
-/**
- * Realm-safe tag check. `plugin-loader` imports only types from
- * `plugin-worker-manager`, and `instanceof` is unreliable across test mocks and
- * duplicated module instances, so match on the discriminator instead.
- */
 function isWorkerStartupError(
   err: unknown,
 ): err is { name: string; transient: boolean } {
@@ -164,14 +171,13 @@ function isWorkerStartupError(
   );
 }
 
-export function isTransientActivationError(err: unknown): boolean {
-  // Authoritative: startWorker() classified this at the throw site, where the
-  // underlying RPC error code was still in hand.
+/**
+ * Classify only failures that should consume the expensive activation retry
+ * budget. Typed `WorkerStartupError` provenance is authoritative; the narrow
+ * string fallback is solely for an untyped initialize-timeout rejection.
+ */
+export function isTransientActivationRetryError(err: unknown): boolean {
   if (isWorkerStartupError(err)) return err.transient;
-
-  // Fallback for untyped or stringified rejections reaching this path. Narrowed
-  // to the initialize timeout specifically: a bare "timed out after" matched
-  // any RPC timeout, and the generic wrapper prefix matched real plugin faults.
   const msg = err instanceof Error ? err.message : String(err);
   return msg.includes(INITIALIZE_TIMEOUT_ERR_MARKER);
 }
@@ -2759,10 +2765,9 @@ export function pluginLoader(
           }
           break;
         } catch (err) {
-          // Drop the failed handle before sleeping, not at the top of the next
-          // iteration (BLO-22095). A worker that crashed during startup owns a
-          // restart timer of its own; leaving it registered across the retry
-          // delay lets it restart itself inside the window and race the retry.
+          // Drop the failed handle before sleeping. A worker that crashed during
+          // startup can own a restart timer; leaving it registered across the
+          // retry delay lets it start itself inside the next retry window.
           const releaseFailedWorker = async (): Promise<void> => {
             if (!workerManager.getWorker(pluginId)) return;
             try {
@@ -2806,7 +2811,7 @@ export function pluginLoader(
           // give the SDK race 7 attempts instead of 5.
           if (
             !isSdkInstallRaceError(err) &&
-            isTransientActivationError(err) &&
+            isTransientActivationRetryError(err) &&
             transientAttempt < TRANSIENT_ACTIVATION_RETRY_DELAYS_MS.length
           ) {
             const delay = TRANSIENT_ACTIVATION_RETRY_DELAYS_MS[transientAttempt]!;
