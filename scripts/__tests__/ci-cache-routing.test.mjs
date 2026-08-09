@@ -11,7 +11,7 @@ test("PR jobs do not install an ineffective compiler cache", async () => {
   assert.doesNotMatch(workflow, /sccache|SCCACHE|RUSTC_WRAPPER/);
 });
 
-test("Docker builds use persistent remote BuildKit and exact-SHA cache lineage", async () => {
+test("Docker builds use persistent remote BuildKit, exact-SHA cache, and bounded compression", async () => {
   const workflow = await readFile(dockerWorkflowPath, "utf8");
   const buildJob = workflow.match(/\n  build-and-push:\n([\s\S]*?)\n  deploy:\n/)?.[1];
 
@@ -30,4 +30,9 @@ test("Docker builds use persistent remote BuildKit and exact-SHA cache lineage",
     /cache-from: \|\n            type=registry,ref=harbor\.blockcast\.net\/paperclip\/paperclip:buildcache-\$\{\{ steps\.target\.outputs\.full \}\}-k8s-vendored\n            type=registry,ref=harbor\.blockcast\.net\/paperclip\/paperclip:latest-k8s-vendored\n            type=registry,ref=harbor\.blockcast\.net\/paperclip\/paperclip:buildcache-v6\n/,
   );
   assert.match(buildJob, /cache-to: type=inline/);
+  assert.match(
+    buildJob,
+    /outputs: type=image,push=true,compression=gzip,compression-level=1/,
+  );
+  assert.doesNotMatch(buildJob, /outputs: [^\n]*force-compression/);
 });
