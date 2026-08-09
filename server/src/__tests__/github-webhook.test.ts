@@ -3940,6 +3940,125 @@ describeEmbeddedPostgres("github-webhook route", () => {
     ).toHaveLength(2);
   });
 
+  // BLO-23267: real-world reproduction of the same defect via the
+  // COMMENT-shaped path (issue_comment, not pull_request_review.submitted) --
+  // the shape Ally's consolidated review actually takes. Payload bodies and
+  // comment ids are taken verbatim from Blockcast/paperclip#1123: round 1
+  // (5211484248) posted "## Changes Requested" 2s later; round 2 (5221029179,
+  // ~16.5h later) re-reported the same unresolved finding as still-present
+  // under a "### Prior Findings Dispositioned" heading, alongside its own
+  // non-zero "### Important Issues (1)" bucket, and produced nothing before
+  // this fix -- BLO-20775 sat unattended for 13h46m as a result.
+  it("wakes the author again on a second comment-shaped Ally review that re-reports an unresolved finding as still-present (BLO-23267 / #1123)", async () => {
+    const { agentId, issueId } = await seedIssueWithIdentifier("PEN-1126", { status: "in_review" });
+    const app = buildApp({ prReviewerBotLogin: "allyblockcast[bot]" });
+    const issuePayload = {
+      number: 269,
+      title: "Fix hosted vault onboarding",
+      body: "Closes PEN-1126",
+      html_url: "https://github.com/Blockcast/penstock-llm-proxy-core/pull/269",
+      pull_request: { url: "https://api.github.com/repos/Blockcast/penstock-llm-proxy-core/pulls/269" },
+      user: { login: "codex-bot" },
+    };
+
+    const round1Payload = {
+      action: "created",
+      issue: issuePayload,
+      comment: {
+        id: 5211484248,
+        body: [
+          "## Ally — Consolidated PR Review",
+          "",
+          "Reviewed head: eb12af73f34d0d9735148505d2f338dfe5de42a2",
+          "",
+          "### Critical Issues (0)",
+          "",
+          "### Important Issues (1)",
+          "- **[tests/code]** The asserted stale-useful/fresh-output state is not produced by the current running-output path.",
+          "",
+          "### Recommended Action",
+          "1. Address the Important issue this cycle before merge.",
+        ].join("\n"),
+        html_url: "https://github.com/Blockcast/penstock-llm-proxy-core/pull/269#issuecomment-5211484248",
+        user: { login: "allyblockcast[bot]" },
+      },
+      repository: { full_name: "Blockcast/penstock-llm-proxy-core" },
+    };
+    const round1 = signedRequest(round1Payload);
+    const round1Res = await request(app)
+      .post("/api/webhooks/github")
+      .set("x-github-event", "issue_comment")
+      .set("x-hub-signature-256", round1.signature)
+      .set("x-github-delivery", "delivery-blo23267-round1")
+      .set("content-type", "application/json")
+      .send(round1.body);
+    expect(round1Res.status).toBe(200);
+    expect(round1Res.body.reopened).toEqual([{ issueIdentifier: "PEN-1126", commentId: expect.any(String) }]);
+    expect(round1Res.body.wakes).toEqual([{ issueIdentifier: "PEN-1126", agentId }]);
+
+    const [afterRound1] = await db.select({ status: issues.status }).from(issues).where(eq(issues.id, issueId));
+    expect(afterRound1?.status).toBe("in_progress");
+
+    const round2Payload = {
+      action: "created",
+      issue: issuePayload,
+      comment: {
+        id: 5221029179,
+        body: [
+          "## Ally — Consolidated PR Review",
+          "",
+          "Reviewed head: ed97d2530c67a12a3c2e8bd9c33cb73eb2b8acbc",
+          "",
+          "### Prior Findings Dispositioned (1)",
+          "- **prior:eb12af7 important 1** — still-present — the replacement reachability rationale is still not valid.",
+          "",
+          "### Critical Issues (0)",
+          "",
+          "### Important Issues (1)",
+          "- **[prior:eb12af7 important 1]** The source comment and external-Job test still imply an unreachable claim.",
+          "",
+          "### Recommended Action",
+          "1. Correct the remaining cross-adapter reachability claim before merge.",
+        ].join("\n"),
+        html_url: "https://github.com/Blockcast/penstock-llm-proxy-core/pull/269#issuecomment-5221029179",
+        user: { login: "allyblockcast[bot]" },
+      },
+      repository: { full_name: "Blockcast/penstock-llm-proxy-core" },
+    };
+    const round2 = signedRequest(round2Payload);
+    const round2Res = await request(app)
+      .post("/api/webhooks/github")
+      .set("x-github-event", "issue_comment")
+      .set("x-hub-signature-256", round2.signature)
+      .set("x-github-delivery", "delivery-blo23267-round2")
+      .set("content-type", "application/json")
+      .send(round2.body);
+
+    expect(round2Res.status).toBe(200);
+    expect(round2Res.body.skipped ?? []).not.toContainEqual(
+      expect.objectContaining({ issueIdentifier: "PEN-1126" }),
+    );
+    expect(round2Res.body.wakes).toEqual([{ issueIdentifier: "PEN-1126", agentId }]);
+
+    const commentsAfterRound2 = await db
+      .select({ body: issueComments.body, metadata: issueComments.metadata })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    const feedbackCommentsAfterRound2 = commentsAfterRound2.filter(
+      (c) => (c.metadata as Record<string, unknown> | null)?.kind === "github_pr_review_feedback",
+    );
+    expect(feedbackCommentsAfterRound2).toHaveLength(2);
+    expect(feedbackCommentsAfterRound2.some((c) => c.body.includes("issuecomment-5211484248"))).toBe(true);
+    expect(feedbackCommentsAfterRound2.some((c) => c.body.includes("issuecomment-5221029179"))).toBe(true);
+
+    const wakesAfterRound2 = await db
+      .select({ id: agentWakeupRequests.id, reason: agentWakeupRequests.reason })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakesAfterRound2).toHaveLength(2);
+    expect(wakesAfterRound2.some((w) => w.reason === "github_pr_review_feedback")).toBe(true);
+  });
+
   it("still emits the review-feedback comment and escalates to the manager when the assignee's monitor is triggered with no scheduled re-check (BLO-19497 AC #5)", async () => {
     const companyId = randomUUID();
     const managerId = randomUUID();
