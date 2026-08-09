@@ -722,6 +722,25 @@ function formatTrigger(trigger: ProductivityReviewTrigger) {
   return "Long active duration";
 }
 
+const PRODUCTIVITY_REVIEW_TRIGGERS: readonly ProductivityReviewTrigger[] = [
+  "no_comment_streak",
+  "long_active_duration",
+  "high_churn",
+  "runtime_failure_streak",
+];
+
+// BLO-22105: `buildReviewMarkdown` bakes the trigger that produced it into the
+// `- Primary trigger:` line. Reading it back out of the persisted description
+// (rather than, say, the last activity-log entry) means the comparison is
+// against exactly what a reader currently sees, so a refresh regenerates
+// precisely when the visible Manager Decision guidance is actually stale.
+function extractReviewTriggerFromDescription(description: string | null): ProductivityReviewTrigger | null {
+  if (!description) return null;
+  const match = description.match(/^- Primary trigger: `([a-z_]+)`/m);
+  const candidate = match?.[1];
+  return PRODUCTIVITY_REVIEW_TRIGGERS.find((trigger) => trigger === candidate) ?? null;
+}
+
 // True when a run's most recent classification is `failed` liveness AND it
 // burned zero input+output tokens. That combination means the agent never
 // got a model turn — the runtime crashed, the process was killed, or every
@@ -2567,20 +2586,59 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
 
         const refreshState = await getRefreshCommentState(evidence.sourceIssue.companyId, existing.id, tx);
         const lastRefreshAt = refreshState.latestCreatedAt ?? existing.createdAt;
-        if (
-          refreshState.count >= opts.thresholds.maxRefreshComments ||
-          evidence.generatedAt.getTime() - lastRefreshAt.getTime() < effectiveRefreshIntervalMs
-        ) {
+        // The hard-floor interval gates everything below, including the
+        // description rewrite — a trigger flip must not be usable to force
+        // more writes than a normal refresh already allows.
+        if (evidence.generatedAt.getTime() - lastRefreshAt.getTime() < effectiveRefreshIntervalMs) {
           return { throttled: true as const, lastRefreshAt };
         }
 
-        await addRefreshComment(
-          existing.id,
-          buildRefreshComment(evidence, opts.prefix),
-          evidence.generatedAt,
-          tx,
-        );
-        return { throttled: false as const, lastRefreshAt };
+        // BLO-22105: the Manager Decision block is trigger-conditional (see
+        // buildReviewMarkdown), so a review whose live trigger has flipped since
+        // it was created/last regenerated is showing stale — potentially
+        // under-enforcing — remedy guidance. Regenerate only on an actual flip
+        // (never on unparseable/legacy descriptions) and only inside this same
+        // throttle-gated branch, so a trigger flip cannot be used to force a
+        // description write more often than the hard-floor interval allows.
+        const previousTrigger = extractReviewTriggerFromDescription(existing.description);
+        const descriptionStale = previousTrigger !== null && previousTrigger !== evidence.trigger;
+        let descriptionRegenerated = false;
+        if (descriptionStale) {
+          // `existing.description` was read outside this transaction. The
+          // advisory lock only serializes this refresh path against itself —
+          // it says nothing about a human editing the review issue's
+          // description directly in between. Guard the overwrite with the
+          // description we actually read so a concurrent edit loses the race
+          // cleanly (0 rows matched, nothing clobbered) instead of being
+          // silently discarded.
+          const [updatedRow] = await tx
+            .update(issues)
+            .set({ description: buildReviewMarkdown(evidence, opts.prefix), updatedAt: evidence.generatedAt })
+            .where(and(eq(issues.id, existing.id), eq(issues.description, existing.description as string)))
+            .returning({ id: issues.id });
+          descriptionRegenerated = updatedRow !== undefined;
+        }
+
+        // `maxRefreshComments` bounds refresh-comment churn, not the
+        // correctness of the durable Manager Decision guidance. Gating the
+        // description rewrite on it too would mean a review that outlives the
+        // cap could never self-correct after a trigger flip — exactly the
+        // staleness this fix exists to close. Only the comment emission is
+        // capped; the interval check above still applies to both.
+        const commentCapped = refreshState.count >= opts.thresholds.maxRefreshComments;
+        if (!commentCapped) {
+          await addRefreshComment(
+            existing.id,
+            buildRefreshComment(evidence, opts.prefix),
+            evidence.generatedAt,
+            tx,
+          );
+        }
+
+        if (commentCapped && !descriptionRegenerated) {
+          return { throttled: true as const, lastRefreshAt };
+        }
+        return { throttled: false as const, lastRefreshAt, descriptionRegenerated };
       });
 
       if (refreshOutcome.throttled) {
@@ -2591,7 +2649,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
             lastRefreshAt: refreshOutcome.lastRefreshAt.toISOString(),
             minIntervalMs: effectiveRefreshIntervalMs,
           },
-          "productivity review refresh throttled: previous refresh within hard-floor window",
+          "productivity review refresh throttled: within hard-floor window or comment cap reached with no stale description to fix",
         );
         return { kind: "existing" as const, reviewIssueId: existing.id };
       }
@@ -2610,6 +2668,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           noCommentStreak: evidence.noCommentStreak,
           runCountLastHour: evidence.runCountLastHour,
           commentCountLastHour: evidence.commentCountLastHour,
+          descriptionRegenerated: refreshOutcome.descriptionRegenerated,
         },
       });
       return { kind: "updated" as const, reviewIssueId: existing.id };
