@@ -4,6 +4,7 @@ import test from "node:test";
 
 const prWorkflowPath = ".github/workflows/pr.yml";
 const dockerWorkflowPath = ".github/workflows/docker.yml";
+const dockerAgentWorkflowPath = ".github/workflows/docker-agent.yml";
 const refreshLockfileWorkflowPath = ".github/workflows/refresh-lockfile.yml";
 
 test("PR jobs do not install an ineffective compiler cache", async () => {
@@ -14,13 +15,41 @@ test("PR jobs do not install an ineffective compiler cache", async () => {
 
 test("Docker builds use persistent remote BuildKit, exact-SHA cache, and bounded compression", async () => {
   const workflow = await readFile(dockerWorkflowPath, "utf8");
+  const agentWorkflow = await readFile(dockerAgentWorkflowPath, "utf8");
   const buildJob = workflow.match(/\n  build-and-push:\n([\s\S]*?)\n  deploy:\n/)?.[1];
 
   assert.ok(buildJob, "build-and-push job is missing");
   assert.match(buildJob, /\n    runs-on: arc-paperclip-buildkit\n/);
   assert.match(
     buildJob,
-    /uses: docker\/setup-buildx-action@v4\n        with:\n          driver: remote\n          endpoint: tcp:\/\/buildkit-amd64\.ci\.svc\.cluster\.local:1234\n/,
+    /PREFERRED_ORDINAL: \$\{\{ github\.event_name == 'workflow_dispatch' && '1' \|\| '0' \}\}/,
+  );
+  assert.match(
+    buildJob,
+    /preferred="buildkit-amd64-\$\{PREFERRED_ORDINAL\}\.buildkit-amd64-headless\.ci\.svc\.cluster\.local"/,
+  );
+  assert.match(buildJob, /fallback="buildkit-amd64\.ci\.svc\.cluster\.local"/);
+  assert.match(
+    buildJob,
+    /timeout "\$\{timeout_seconds\}" nc -z -w "\$\{timeout_seconds\}" "\$\{host\}" 1234/,
+  );
+  assert.match(
+    buildJob,
+    /uses: docker\/setup-buildx-action@v4\n        with:\n          driver: remote\n          endpoint: \$\{\{ steps\.buildkit-endpoint\.outputs\.endpoint \}\}\n/,
+  );
+  assert.match(agentWorkflow, /PREFERRED_ORDINAL: "1"/);
+  assert.match(
+    agentWorkflow,
+    /preferred="buildkit-amd64-\$\{PREFERRED_ORDINAL\}\.buildkit-amd64-headless\.ci\.svc\.cluster\.local"/,
+  );
+  assert.match(agentWorkflow, /fallback="buildkit-amd64\.ci\.svc\.cluster\.local"/);
+  assert.match(
+    agentWorkflow,
+    /timeout "\$\{timeout_seconds\}" nc -z -w "\$\{timeout_seconds\}" "\$\{host\}" 1234/,
+  );
+  assert.match(
+    agentWorkflow,
+    /uses: docker\/setup-buildx-action@v4\n        with:\n          driver: remote\n          endpoint: \$\{\{ steps\.buildkit-endpoint\.outputs\.endpoint \}\}\n/,
   );
   assert.match(
     buildJob,
