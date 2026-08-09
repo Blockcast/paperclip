@@ -75,13 +75,15 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
     expect(serverDockerfile).toContain("execute/job-manifest suite 230/230");
   });
 
-  it("vendors the opencode_k8s adapter commit and executes its env-guard and runtime regressions", () => {
+  it("vendors the latest opencode_k8s adapter with finite-timeout, env-guard, and runtime regressions", () => {
     expect(serverDockerfile).toContain("ARG OPENCODE_K8S_REF=ed0331690432d3c37cd7ed190ca1066c840b30c3");
     expect(serverDockerfile).toContain(
       "npm test -- src/server/env-guard-plugin.test.ts src/server/execute.test.ts",
     );
     expect(serverDockerfile).toContain("add anthropic/claude-opus-5 to the");
     expect(serverDockerfile).toContain("bound the pre-Job live-Job list to 15 seconds");
+    expect(serverDockerfile).toContain("BLO-22922, start completion grace only after");
+    expect(serverDockerfile).toContain("preserve successful finite-timeout runs");
     expect(serverDockerfile).toContain("PEN-1305 permission.bash env-dump deny");
     expect(serverDockerfile).toContain("disable opencode's turn-zero workspace");
     expect(serverDockerfile).toContain("snapshot: false");

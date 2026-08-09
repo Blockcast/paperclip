@@ -8621,6 +8621,74 @@ export function normalizeSessionParams(params: Record<string, unknown> | null | 
 
 type RunSessionOutcome = "succeeded" | "interrupted" | "failed" | "cancelled" | "timed_out";
 
+export function isConfirmedAdapterTimeout(
+  result: Pick<AdapterExecutionResult, "timedOut" | "exitCode">,
+): boolean {
+  // A successful process exit is authoritative. This also keeps a malformed
+  // adapter result from persisting the contradictory status/exit-code pair
+  // that corrupted Ally's failure-rate accounting in BLO-22922.
+  return result.timedOut === true && result.exitCode !== 0;
+}
+
+function hasStructuredAdapterFailureEvidence(
+  resultJson: Record<string, unknown> | null | undefined,
+): boolean {
+  if (!resultJson) return false;
+
+  if (resultJson.is_error === true || resultJson.isError === true) return true;
+  if (resultJson.success === false || resultJson.ok === false) return true;
+
+  const failureState = [
+    resultJson.type,
+    resultJson.subtype,
+    resultJson.status,
+    resultJson.outcome,
+    resultJson.stopReason,
+    resultJson.stop_reason,
+  ].some(
+    (value) =>
+      typeof value === "string" &&
+      /^(?:error(?:[_-].*)?|failed|failure|cancelled|canceled|timed[_-]?out)$/i.test(
+        value.trim(),
+      ),
+  );
+  if (failureState) return true;
+
+  return ["error", "errors", "errorMessage", "errorCode"].some((key) => {
+    const value = resultJson[key];
+    if (typeof value === "string") return value.trim().length > 0;
+    if (typeof value === "number") return value !== 0;
+    if (typeof value === "boolean") return value;
+    if (Array.isArray(value)) return value.length > 0;
+    return value !== null && typeof value === "object" && Object.keys(value).length > 0;
+  });
+}
+
+export function isFalseAdapterTimeoutResult(
+  result: Pick<
+    AdapterExecutionResult,
+    "timedOut" | "exitCode" | "errorMessage" | "errorCode" | "resultJson"
+  >,
+): boolean {
+  return (
+    result.timedOut === true &&
+    result.exitCode === 0 &&
+    result.errorCode === "timeout" &&
+    typeof result.errorMessage === "string" &&
+    /^Timed out after [0-9]+s$/.test(result.errorMessage.trim()) &&
+    !hasStructuredAdapterFailureEvidence(result.resultJson)
+  );
+}
+
+export function isSuccessfulAdapterResult(
+  result: Pick<AdapterExecutionResult, "timedOut" | "exitCode" | "errorMessage" | "errorCode" | "resultJson">,
+): boolean {
+  const processSucceeded =
+    (result.exitCode ?? 0) === 0 ||
+    (result.resultJson?.subtype === "success" && !result.resultJson?.is_error);
+  return processSucceeded && (!result.errorMessage || isFalseAdapterTimeoutResult(result));
+}
+
 type SkillTestHeartbeatCompletion = {
   outcome: "failed" | "cancelled";
   error: string | null;
@@ -22945,14 +23013,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const latestRun = await getRun(run.id);
       if (isHeartbeatRunTerminalStatus(latestRun?.status)) {
         outcome = latestRun.status;
-      } else if (adapterResult.timedOut) {
+      } else if (isConfirmedAdapterTimeout(adapterResult)) {
         outcome = "timed_out";
-      } else if (
-        (((adapterResult.exitCode ?? 0) === 0) ||
-          (adapterResult.resultJson?.subtype === "success" &&
-            !adapterResult.resultJson?.is_error)) &&
-        !adapterResult.errorMessage
-      ) {
+      } else if (isSuccessfulAdapterResult(adapterResult)) {
         if (adapterResult.silentFailure) {
           outcome = "failed";
           silentFailureMessage = `Agent exited cleanly but performed no work: ${adapterResult.silentFailure.reason}`;
@@ -23083,6 +23146,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         outcome = "failed";
       }
 
+      // An affected opencode_k8s adapter returned before parsing its output, so
+      // an empty result is part of the false-timeout contradiction rather than
+      // evidence that the successful process performed no work (BLO-22922).
+      const falseAdapterTimeout = isFalseAdapterTimeoutResult(adapterResult);
+      let emptyResultOverride = false;
+      if (
+        outcome === "succeeded" &&
+        !falseAdapterTimeout &&
+        isEmptyResult(adapterResult.resultJson)
+      ) {
+        outcome = "failed";
+        emptyResultOverride = true;
+      }
+
       const nextSessionState = resolveNextSessionState({
         adapterType: agent.adapterType,
         codec: sessionCodec,
@@ -23105,16 +23182,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ? "Run hit Anthropic rate limit (out of extra usage); scheduled for transient retry"
         : providerThrottledNoProgressOverride
           ? "Run hit provider throttle/deadline before any token usage; scheduled for transient retry"
-        : prReviewIncompleteOverride
-          ? prReviewIncompleteOverride.errorMessage
-        : outcome === "cancelled"
-          ? (latestRun?.error ?? adapterResult.errorMessage ?? "Cancelled")
-          : outcome === "succeeded"
-            ? null
-            : redactCurrentUserText(
-                silentFailureMessage ?? adapterResult.errorMessage ?? (outcome === "timed_out" ? "Timed out" : "Adapter failed"),
-                currentUserRedactionOptions,
-              );
+          : prReviewIncompleteOverride
+            ? prReviewIncompleteOverride.errorMessage
+            : emptyResultOverride
+              ? "Agent exited successfully but produced no result"
+              : outcome === "cancelled"
+                ? (latestRun?.error ?? adapterResult.errorMessage ?? "Cancelled")
+                : outcome === "succeeded"
+                  ? null
+                  : redactCurrentUserText(
+                      silentFailureMessage ?? adapterResult.errorMessage ?? (outcome === "timed_out" ? "Timed out" : "Adapter failed"),
+                      currentUserRedactionOptions,
+                    );
       const recordedResponsibleUserDenialCode =
         normalizeResponsibleUserDenialCode(latestRun?.errorCode);
       const runErrorCode = rateLimitExhaustedOverride
@@ -23123,33 +23202,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ? "provider_throttled_no_progress"
           : prReviewIncompleteOverride
             ? prReviewIncompleteOverride.errorCode
-            // BLO-18285: name the fault only where the code would otherwise be
-            // the anonymous "adapter_failed" fallback. A specific adapter code
-            // (or a silent-failure verdict) is the more precise diagnosis and
-            // is left intact — the errorFamily tag below is what actually
-            // drives the retry, so the schedule is unaffected either way.
-            : transientUpstreamOverride && !adapterResult.errorCode && !silentFailureMessage
-              ? "provider_transient_upstream"
-            : outcome === "timed_out"
-          ? "timeout"
-          : outcome === "cancelled"
-            ? (latestRun?.errorCode ?? "cancelled")
-            : outcome === "failed"
-              ? (silentFailureMessage
-                  ? "silent_failure"
-                  : adapterResult.errorCode ?? recordedResponsibleUserDenialCode ?? "adapter_failed")
-              : null;
-
-      // [PRACTICO-PATCH] Override succeeded → failed when result is empty (#1117)
-      let emptyResultOverride = false;
-      if (outcome === "succeeded" && isEmptyResult(adapterResult.resultJson)) {
-        outcome = "failed";
-        emptyResultOverride = true;
-      }
-      // [PRACTICO-PATCH] Effective error message for empty-result override (#1117)
-      const effectiveErrorMessage = emptyResultOverride
-        ? "Agent exited successfully but produced no result"
-        : (adapterResult.errorMessage ?? null);
+            : emptyResultOverride
+              ? "EMPTY_RESULT"
+              // BLO-18285: name the fault only where the code would otherwise be
+              // the anonymous "adapter_failed" fallback. A specific adapter code
+              // (or a silent-failure verdict) is the more precise diagnosis and
+              // is left intact — the errorFamily tag below is what actually
+              // drives the retry, so the schedule is unaffected either way.
+              : transientUpstreamOverride && !adapterResult.errorCode && !silentFailureMessage
+                ? "provider_transient_upstream"
+                : outcome === "timed_out"
+                  ? "timeout"
+                  : outcome === "cancelled"
+                    ? (latestRun?.errorCode ?? "cancelled")
+                    : outcome === "failed"
+                      ? (silentFailureMessage
+                          ? "silent_failure"
+                          : adapterResult.errorCode ?? recordedResponsibleUserDenialCode ?? "adapter_failed")
+                      : null;
 
       let logSummary: { bytes: number; sha256?: string; compressed: boolean } | null = null;
       if (handle) {
