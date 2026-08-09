@@ -11575,6 +11575,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         void refreshExternalRuntimeReservationMetrics(db).catch((err) => {
           logger.warn({ err, runId: updated.id }, "failed to refresh external-runtime reservation metrics");
         });
+        void processPendingImageBumpForAgent(db, updated.agentId).catch((err) => {
+          logger.warn(
+            {
+              agentId: updated.agentId,
+              runId: updated.id,
+              error: err instanceof Error ? err.message : String(err),
+            },
+            "processPendingImageBumpForAgent failed; will retry on next run completion",
+          );
+        });
       }
       return { run: updated, updated: true as const };
     }
