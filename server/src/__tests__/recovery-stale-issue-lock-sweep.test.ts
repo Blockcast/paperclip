@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq, sql } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -7,6 +7,7 @@ import {
   agents,
   companies,
   createDb,
+  externalRuntimeReservations,
   heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
@@ -50,6 +51,7 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     await db.delete(activityLog);
     await db.delete(issueTreeHolds);
     await db.delete(issues);
+    await db.delete(externalRuntimeReservations);
     // Must precede heartbeatRuns: the promotion tests drive
     // promoteDueScheduledRetries, which writes heartbeat_run_events, and the FK
     // heartbeat_run_events_run_id_heartbeat_runs_id_fk otherwise blocks the
@@ -191,6 +193,161 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0]);
     expect(row).toEqual({ checkoutRunId: runningRunId, executionRunId: runningRunId });
+  });
+
+  it("does not clear a terminal run lock while its external runtime reservation is active", async () => {
+    const { companyId, agentId, failedRunId } = await seed();
+    const issueId = randomUUID();
+    const now = new Date();
+    await db.insert(externalRuntimeReservations).values({
+      companyId,
+      agentId,
+      runId: failedRunId,
+      slotId: 0,
+      state: "release_pending",
+      expectedJobName: `agent-job-${failedRunId.slice(0, 8)}`,
+      jobName: `agent-job-${failedRunId.slice(0, 8)}`,
+      jobUid: `uid-${failedRunId}`,
+      isolationMode: "shared",
+      isolationKey: `agent-shared:${agentId}`,
+      isolationBoundAt: now,
+      reservedAt: now,
+      launchingAt: now,
+      launchedAt: now,
+      releaseRequestedAt: now,
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Terminal run with external cleanup pending",
+      status: "in_review",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: failedRunId,
+      executionRunId: failedRunId,
+      executionLockedAt: now,
+    });
+
+    const result = await heartbeatService(db).sweepStaleIssueLocks();
+
+    expect(result.cleared).toBe(0);
+    const row = await db
+      .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({ checkoutRunId: failedRunId, executionRunId: failedRunId });
+  });
+
+  it("rechecks external runtime reservations inside the stale-lock transaction", async () => {
+    const { companyId, agentId, failedRunId } = await seed();
+    const issueId = randomUUID();
+    const now = new Date();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Terminal run whose cleanup starts during the sweep",
+      status: "in_review",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: failedRunId,
+      executionRunId: failedRunId,
+      executionLockedAt: now,
+    });
+
+    const heartbeat = heartbeatService(db, {
+      beforeStaleIssueLockSweepClearForTest: async (issue) => {
+        if (issue.id !== issueId) return;
+        await db.insert(externalRuntimeReservations).values({
+          companyId,
+          agentId,
+          runId: failedRunId,
+          slotId: 0,
+          state: "release_pending",
+          expectedJobName: `agent-job-${failedRunId.slice(0, 8)}`,
+          jobName: `agent-job-${failedRunId.slice(0, 8)}`,
+          jobUid: `uid-${failedRunId}`,
+          isolationMode: "shared",
+          isolationKey: `agent-shared:${agentId}`,
+          isolationBoundAt: now,
+          reservedAt: now,
+          launchingAt: now,
+          launchedAt: now,
+          releaseRequestedAt: now,
+        });
+      },
+    });
+
+    const result = await heartbeat.sweepStaleIssueLocks();
+
+    expect(result.cleared).toBe(0);
+    const row = await db
+      .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({ checkoutRunId: failedRunId, executionRunId: failedRunId });
+  });
+
+  it("does not promote an ordinary deferred wake while an external monitor owns resumption", async () => {
+    const { companyId, agentId, failedRunId } = await seed();
+    const issueId = randomUUID();
+    const monitorNextCheckAt = new Date("2099-12-01T12:00:00.000Z");
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "External wait with a deferred comment",
+      status: "in_review",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: failedRunId,
+      executionRunId: failedRunId,
+      executionLockedAt: new Date(),
+      executionPolicy: {
+        monitor: {
+          nextCheckAt: monitorNextCheckAt.toISOString(),
+          scheduledBy: "assignee",
+          kind: "external_service",
+          serviceName: "github-actions",
+        },
+      },
+      monitorNextCheckAt,
+      monitorScheduledBy: "assignee",
+    });
+    const deferredWakeId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: deferredWakeId,
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_execution_deferred",
+      payload: {
+        issueId,
+        _paperclipWakeContext: { issueId, wakeReason: "issue_comment_added" },
+      },
+      status: "deferred_issue_execution",
+    });
+
+    const result = await heartbeatService(db).sweepStaleIssueLocks();
+
+    expect(result.cleared).toBe(1);
+    const [wake, promotedRuns] = await Promise.all([
+      db
+        .select({ status: agentWakeupRequests.status })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, deferredWakeId))
+        .then((rows) => rows[0] ?? null),
+      db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(and(
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+          sql`${heartbeatRuns.id} <> ${failedRunId}`,
+        )),
+    ]);
+    expect(wake?.status).toBe("cancelled");
+    expect(promotedRuns).toHaveLength(0);
   });
 
   it("does not clear when checkoutRunId is terminal but executionRunId is still running", async () => {

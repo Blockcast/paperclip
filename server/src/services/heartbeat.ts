@@ -504,6 +504,13 @@ const GITHUB_STATE_CHANGE_WAKE_REASONS = new Set([
   "github_check_suite_completed",
   "github_workflow_completed",
 ]);
+const EXTERNAL_WAIT_RESUME_WAKE_REASONS = new Set([
+  ...GITHUB_STATE_CHANGE_WAKE_REASONS,
+  "github_pr_closed",
+  "github_pr_converted_to_draft",
+  "github_pr_review_submitted",
+  "issue_monitor_due",
+]);
 export {
   ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS,
   ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS,
@@ -6668,6 +6675,14 @@ export function mergeCoalescedContextSnapshot(
   }
   if (existing.forceFreshSession === true || incoming.forceFreshSession === true) {
     merged.forceFreshSession = true;
+  }
+  if (
+    existing.externalWaitResumeRequested === true ||
+    incoming.externalWaitResumeRequested === true ||
+    EXTERNAL_WAIT_RESUME_WAKE_REASONS.has(readNonEmptyString(existing.wakeReason) ?? "") ||
+    EXTERNAL_WAIT_RESUME_WAKE_REASONS.has(readNonEmptyString(incoming.wakeReason) ?? "")
+  ) {
+    merged.externalWaitResumeRequested = true;
   }
   // Preserve task identity after overlaying newer GitHub metadata.
   for (const key of ["issueId", "taskId", "taskKey"] as const) {
@@ -16534,11 +16549,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   async function reconcileReleasePendingExternalRuntimeReservations(
     jobRunStatuses: Map<string, AgentJobRunStatus> | null,
     ambiguousRunIds: ReadonlySet<string> = new Set(),
+    options: { suppressDispatch?: boolean } = {},
   ) {
     const pending = await db
       .select({
         reservation: externalRuntimeReservations,
-        runStatus: heartbeatRuns.status,
+        run: heartbeatRuns,
       })
       .from(externalRuntimeReservations)
       .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, externalRuntimeReservations.runId))
@@ -16587,7 +16603,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ),
         ),
       );
-    for (const { reservation, runStatus } of pending) {
+    for (const { reservation, run } of pending) {
       if (activeRunExecutions.has(reservation.runId)) continue;
       if (ambiguousRunIds.has(reservation.runId)) continue;
       const observed = jobRunStatuses?.get(reservation.runId) ?? null;
@@ -16641,12 +16657,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           reservation.releaseReason ??
           (terminalPrelaunchOrphan ? "terminal_prelaunch_orphan" : "job_terminal_or_missing"),
       });
+      if (released && isHeartbeatRunTerminalStatus(run.status)) {
+        await releaseIssueExecutionAndPromote(run, {
+          externalWaitYield: run.errorCode === "external_wait_yield",
+        }).catch((error) => {
+          logger.warn(
+            { error, runId: run.id },
+            "reservation reconciler released runtime slot but issue-lock cleanup remains pending",
+          );
+        });
+        await finalizeAgentStatus(run.agentId, run.status).catch((error) => {
+          logger.warn(
+            { error, runId: run.id, agentId: run.agentId },
+            "reservation reconciler released runtime slot but agent finalization failed",
+          );
+        });
+        if (!options.suppressDispatch) await startNextQueuedRunForAgent(run.agentId);
+      }
       if (released && terminalPrelaunchOrphan) {
         logger.warn(
           {
             reservationId: reservation.id,
             runId: reservation.runId,
-            runStatus,
+            runStatus: run.status,
             reservationState: reservation.state,
           },
           "released prelaunch external-runtime reservation left behind by terminal run",
@@ -16772,12 +16805,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return reaped;
   }
 
-  async function releaseExternalRuntimeReservationIfQuiesced(runId: string, reason: string) {
+  async function releaseExternalRuntimeReservationIfQuiesced(
+    runId: string,
+    reason: string,
+    options: { requireJobMissing?: boolean } = {},
+  ) {
     const reservation = await getActiveExternalRuntimeReservation(db, runId);
     if (!reservation) return null;
 
     const jobName = reservation.jobName ?? reservation.expectedJobName;
     const status = jobName ? await readAgentJobRunStatusByName(jobName) : null;
+    if (options.requireJobMissing && status?.phase !== "missing") return null;
     if (
       reservation.jobUid
       && status
@@ -17086,7 +17124,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const cleanedTerminalJobRunIds = await cleanupTerminalExternalLifecycleJobs(jobRunStatuses, now);
     reaped.push(...cleanedTerminalJobRunIds);
-    await reconcileReleasePendingExternalRuntimeReservations(jobRunStatuses, ambiguousExternalRunIds);
+    await reconcileReleasePendingExternalRuntimeReservations(jobRunStatuses, ambiguousExternalRunIds, {
+      suppressDispatch: opts?.suppressDispatchAfterReap,
+    });
     const liveJobRunIds =
       jobRunStatuses !== null
         ? new Set(
@@ -22847,7 +22887,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   async function releaseIssueExecutionAndPromote(
     run: typeof heartbeatRuns.$inferSelect,
-    options: { suppressImmediateRecovery?: boolean } = {},
+    options: { suppressImmediateRecovery?: boolean; externalWaitYield?: boolean } = {},
   ): Promise<boolean> {
     const runContext = parseObject(run.contextSnapshot);
     const contextIssueId = readNonEmptyString(runContext.issueId);
@@ -23005,6 +23045,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
         if (!deferred) break;
 
+        const deferredPayload = parseObject(deferred.payload);
+        const deferredContextSeed = parseObject(deferredPayload[DEFERRED_WAKE_CONTEXT_KEY]);
+        const deferredWakeReason =
+          readNonEmptyString(deferredContextSeed.wakeReason) ?? readNonEmptyString(deferred.reason);
+        const resumesExternalWait =
+          deferredContextSeed.externalWaitResumeRequested === true ||
+          EXTERNAL_WAIT_RESUME_WAKE_REASONS.has(deferredWakeReason ?? "");
+        if (options.externalWaitYield && !resumesExternalWait) {
+          await tx
+            .update(agentWakeupRequests)
+            .set({
+              status: "cancelled",
+              finishedAt: new Date(),
+              error: "Deferred wake superseded by persisted external-service wait",
+              updatedAt: new Date(),
+            })
+            .where(eq(agentWakeupRequests.id, deferred.id));
+          continue;
+        }
+
         const deferredAgent = await tx
           .select()
           .from(agents)
@@ -23041,8 +23101,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           continue;
         }
 
-        const deferredPayload = parseObject(deferred.payload);
-        const deferredContextSeed = parseObject(deferredPayload[DEFERRED_WAKE_CONTEXT_KEY]);
         // Pass tx so the gate lookup reuses the txn's connection instead of taking another from the pool while holding FOR UPDATE locks (BLO-3855).
         const activePauseHold = await treeControlSvc.getActivePauseHoldGate(issue.companyId, issue.id, tx);
         const treeHoldInteractionWake = activePauseHold && await isVerifiedIssueTreeControlInteractionWake(tx, {
@@ -23079,7 +23137,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           };
         }
         const deferredCommentIds = extractWakeCommentIds(deferredContextSeed);
-        const deferredWakeReason = readNonEmptyString(deferredContextSeed.wakeReason);
         // Local-CLI agents post comments under user auth, so a self-comment from
         // the run that is now ending would otherwise look like a real human
         // comment and trigger a reopen on the very issue this run just closed.
@@ -24163,6 +24220,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             assigneeAgentId: issues.assigneeAgentId,
             executionRunId: issues.executionRunId,
             executionAgentNameKey: issues.executionAgentNameKey,
+            executionPolicy: issues.executionPolicy,
+            monitorNextCheckAt: issues.monitorNextCheckAt,
             createdAt: issues.createdAt,
           })
           .from(issues)
@@ -24201,6 +24260,31 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 issueId: issue.id,
               },
             },
+            status: "skipped",
+            requestedByActorType: opts.requestedByActorType ?? null,
+            requestedByActorId: opts.requestedByActorId ?? null,
+            idempotencyKey: opts.idempotencyKey ?? null,
+            finishedAt: new Date(),
+          });
+          return { kind: "skipped" as const };
+        }
+
+        const persistedMonitor = normalizeIssueExecutionPolicy(issue.executionPolicy ?? null)?.monitor;
+        const resumesExternalWait =
+          enrichedContextSnapshot.externalWaitResumeRequested === true ||
+          EXTERNAL_WAIT_RESUME_WAKE_REASONS.has(readNonEmptyString(enrichedContextSnapshot.wakeReason) ?? "");
+        if (
+          issue.monitorNextCheckAt &&
+          persistedMonitor?.kind === "external_service" &&
+          !resumesExternalWait
+        ) {
+          await tx.insert(agentWakeupRequests).values({
+            companyId: agent.companyId,
+            agentId,
+            source,
+            triggerDetail,
+            reason: "issue_external_wait_wake_suppressed",
+            payload,
             status: "skipped",
             requestedByActorType: opts.requestedByActorType ?? null,
             requestedByActorId: opts.requestedByActorId ?? null,
@@ -24299,9 +24383,30 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             .where(eq(heartbeatRuns.id, issue.executionRunId))
             .then((rows) => rows[0] ?? null)
           : null;
+        const activeExecutionReservation = activeExecutionRun
+          ? await tx
+              .select({ id: externalRuntimeReservations.id })
+              .from(externalRuntimeReservations)
+              .where(
+                and(
+                  eq(externalRuntimeReservations.runId, activeExecutionRun.id),
+                  isNull(externalRuntimeReservations.releasedAt),
+                ),
+              )
+              .limit(1)
+              .then((rows) => rows[0] ?? null)
+          : null;
+        const terminalRunCleanupPending = Boolean(
+          activeExecutionRun &&
+          activeExecutionReservation &&
+          HEARTBEAT_RUN_TERMINAL_STATUSES.includes(
+            activeExecutionRun.status as (typeof HEARTBEAT_RUN_TERMINAL_STATUSES)[number],
+          ),
+        );
 
         if (
           activeExecutionRun &&
+          !terminalRunCleanupPending &&
           !EXECUTION_PATH_HEARTBEAT_RUN_STATUSES.includes(
             activeExecutionRun.status as (typeof EXECUTION_PATH_HEARTBEAT_RUN_STATUSES)[number],
           )
@@ -24833,6 +24938,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
           if (
             isSameExecutionAgent &&
+            !terminalRunCleanupPending &&
             !shouldDeferFollowupWake &&
             !shouldQueueFollowupForRunningWake &&
             !shouldDeferCrossPrReviewWake &&
@@ -24895,6 +25001,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
 
           const shouldDeferAgainstActiveRun =
+            terminalRunCleanupPending ||
             Boolean(availableActiveExecutionRun) ||
             (isSameExecutionAgent && shouldDeferCrossPrReviewWake && activeExecutionRun.status === "running");
 
@@ -26471,6 +26578,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     resultJson?: Record<string, unknown>;
     eventMessage?: string;
     eventPayload?: Record<string, unknown>;
+    persistBeforeTerminate?: boolean;
+    repairTerminalRelease?: boolean;
   };
 
   async function cancelPendingRunsForTaskInternal(
@@ -26560,9 +26669,112 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   async function cancelRunInternal(runId: string, reason = "Cancelled by control plane", options: CancelRunOptions = {}) {
     const run = await getRun(runId);
     if (!run) throw notFound("Heartbeat run not found");
-    if (!CANCELLABLE_HEARTBEAT_RUN_STATUSES.includes(run.status as (typeof CANCELLABLE_HEARTBEAT_RUN_STATUSES)[number])) return run;
     const agent = await getAgent(run.agentId);
     const errorCode = options.errorCode ?? "cancelled";
+
+    const persistCancellationArtifacts = async (
+      cancelledRun: typeof heartbeatRuns.$inferSelect,
+      finishedAt: Date,
+    ) => {
+      await setWakeupStatus(cancelledRun.wakeupRequestId, "cancelled", {
+        finishedAt,
+        error: reason,
+      });
+      const eventMessage = options.eventMessage ?? "run cancelled";
+      const existingEvent = await db
+        .select({ id: heartbeatRunEvents.id })
+        .from(heartbeatRunEvents)
+        .where(
+          and(
+            eq(heartbeatRunEvents.runId, cancelledRun.id),
+            eq(heartbeatRunEvents.eventType, "lifecycle"),
+            eq(heartbeatRunEvents.message, eventMessage),
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (!existingEvent) {
+        await appendRunEvent(cancelledRun, await nextRunEventSeq(cancelledRun.id), {
+          eventType: "lifecycle",
+          stream: "system",
+          level: "warn",
+          message: eventMessage,
+          ...(options.eventPayload ? { payload: options.eventPayload } : {}),
+        });
+      }
+    };
+
+    const cleanupExternalRuntime = async (cancelledRun: typeof heartbeatRuns.$inferSelect, strict: boolean) => {
+      if (!agent || !hasExternalLifecycle(agent.adapterType)) return true;
+      const activeReservation = await getActiveExternalRuntimeReservation(db, cancelledRun.id);
+      if (!activeReservation) return true;
+      const deleted = await deleteExactExternalRuntimeJob(cancelledRun);
+      let releasedReservation = null;
+      if (deleted === "deleted" || deleted === "missing") {
+        if (strict) {
+          const jobName = activeReservation.jobName ?? activeReservation.expectedJobName;
+          const status = jobName ? await readAgentJobRunStatusByName(jobName) : null;
+          if (status?.phase === "missing") {
+            releasedReservation = await releaseExternalRuntimeReservation(db, {
+              runId: cancelledRun.id,
+              reason: `run_cancelled:${errorCode}`,
+            });
+          }
+        } else {
+          releasedReservation = await releaseExternalRuntimeReservationIfQuiesced(
+            cancelledRun.id,
+            `run_cancelled:${errorCode}`,
+          );
+        }
+      }
+      logger.info(
+        { runId: cancelledRun.id, deletionResult: deleted, reservationReleased: Boolean(releasedReservation) },
+        "cancelRun: cascaded Job deletion for external-lifecycle adapter",
+      );
+      return !strict || Boolean(releasedReservation);
+    };
+
+    const releaseIssueExecutionWithRetry = async (
+      cancelledRun: typeof heartbeatRuns.$inferSelect,
+      bestEffort = false,
+    ) => {
+      try {
+        await releaseIssueExecutionAndPromote(cancelledRun, {
+          externalWaitYield: cancelledRun.errorCode === "external_wait_yield",
+        });
+        return true;
+      } catch (error) {
+        logger.warn({ error, runId: cancelledRun.id }, "cancelRun: issue-lock release failed; retrying once");
+        try {
+          await releaseIssueExecutionAndPromote(cancelledRun, {
+            externalWaitYield: cancelledRun.errorCode === "external_wait_yield",
+          });
+          return true;
+        } catch (retryError) {
+          if (!bestEffort) throw retryError;
+          logger.warn(
+            { error: retryError, runId: cancelledRun.id },
+            "cancelRun: runtime slot released but issue-lock cleanup remains pending",
+          );
+          return false;
+        }
+      }
+    };
+
+    if (!CANCELLABLE_HEARTBEAT_RUN_STATUSES.includes(run.status as (typeof CANCELLABLE_HEARTBEAT_RUN_STATUSES)[number])) {
+      if (options.repairTerminalRelease && run.status === "cancelled" && run.errorCode === errorCode) {
+        await persistCancellationArtifacts(run, run.finishedAt ?? new Date());
+        const quiesced = await cleanupExternalRuntime(run, true).catch((error) => {
+          logger.warn({ error, runId: run.id }, "cancelRun: external runtime cleanup is still pending");
+          return false;
+        });
+        if (!quiesced) return run;
+        await releaseIssueExecutionWithRetry(run, true);
+        await finalizeAgentStatus(run.agentId, "cancelled");
+        await startNextQueuedRunForAgent(run.agentId);
+      }
+      return run;
+    }
     const resultJson = agent
       ? {
           ...mergeRunStopMetadataForAgent(agent, "cancelled", {
@@ -26574,8 +26786,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
       : options.resultJson;
 
-    const running = runningProcesses.get(run.id);
-    try {
+    const terminateRunProcess = async () => {
+      const running = runningProcesses.get(run.id);
       if (running) {
         await terminateHeartbeatRunProcess({
           pid: running.child.pid ?? run.processPid,
@@ -26588,33 +26800,68 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           processGroupId: run.processGroupId,
         });
       }
-    } finally {
+    };
+
+    const persistBeforeTerminate = Boolean(
+      options.persistBeforeTerminate && agent && hasExternalLifecycle(agent.adapterType),
+    );
+    if (!persistBeforeTerminate) {
+      await terminateRunProcess();
       runningProcesses.delete(run.id);
     }
 
     const finishedAt = new Date();
-    const cancelled = await setRunStatus(run.id, "cancelled", {
+    const cancellationPatch = {
       finishedAt,
       error: reason,
       errorCode,
       ...(resultJson ? { resultJson } : {}),
-    });
-
-    await setWakeupStatus(run.wakeupRequestId, "cancelled", {
-      finishedAt,
-      error: reason,
-    });
-
-    if (cancelled) {
-      await appendRunEvent(cancelled, 1, {
-        eventType: "lifecycle",
-        stream: "system",
-        level: "warn",
-        message: options.eventMessage ?? "run cancelled",
-        ...(options.eventPayload ? { payload: options.eventPayload } : {}),
-      });
-      await releaseIssueExecutionAndPromote(cancelled);
+    };
+    const cancelledWrite = await setRunStatusIfCurrentStatus(
+      run.id,
+      run.status,
+      "cancelled",
+      cancellationPatch,
+      "cancelRunInternal",
+    );
+    if (!cancelledWrite.updated || !cancelledWrite.run) {
+      const current = await getRun(run.id);
+      if (
+        current &&
+        current.status !== run.status &&
+        CANCELLABLE_HEARTBEAT_RUN_STATUSES.includes(
+          current.status as (typeof CANCELLABLE_HEARTBEAT_RUN_STATUSES)[number],
+        )
+      ) {
+        return cancelRunInternal(run.id, reason, options);
+      }
+      return current ?? run;
     }
+    const cancelled = cancelledWrite.run;
+
+    let terminationError: unknown = null;
+    if (persistBeforeTerminate) {
+      try {
+        await terminateRunProcess();
+      } catch (error) {
+        terminationError = error;
+        logger.error({ error, runId: run.id }, "cancelRun: process termination failed after durable cancellation");
+      } finally {
+        if (!terminationError) runningProcesses.delete(run.id);
+      }
+    }
+
+    await persistCancellationArtifacts(cancelled, finishedAt);
+    if (terminationError) throw terminationError;
+
+    if (options.repairTerminalRelease) {
+      const quiesced = await cleanupExternalRuntime(cancelled, true).catch((error) => {
+        logger.warn({ error, runId: cancelled.id }, "cancelRun: external runtime cleanup is still pending");
+        return false;
+      });
+      if (!quiesced) return cancelled;
+    }
+    await releaseIssueExecutionWithRetry(cancelled, options.repairTerminalRelease);
 
     // RCA 2026-05-06: external-lifecycle adapters (claude_k8s, opencode_k8s)
     // create a k8s Job that doesn't observe local SIGTERM. Without this,
@@ -26624,13 +26871,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // before dispatching another run: the dispatcher may release the terminal
     // run's reservation, which is the durable name/UID identity required for
     // safe deletion. Best-effort.
-    if (agent && hasExternalLifecycle(agent.adapterType)) {
+    if (!options.repairTerminalRelease && agent && hasExternalLifecycle(agent.adapterType)) {
       try {
-        const deleted = await deleteExactExternalRuntimeJob(run);
-        logger.info(
-          { runId: run.id, deletionResult: deleted },
-          "cancelRun: cascaded Job deletion for external-lifecycle adapter",
-        );
+        await cleanupExternalRuntime(cancelled, false);
       } catch (error) {
         logger.warn(
           { runId: run.id, error: error instanceof Error ? error.message : String(error) },

@@ -14,6 +14,7 @@ import {
   approvals,
   activityLog,
   companies,
+  externalRuntimeReservations,
   heartbeatRunEvents,
   heartbeatRunWatchdogDecisions,
   heartbeatRuns,
@@ -194,6 +195,15 @@ export const STALE_ACTIVE_RUN_EVALUATION_REFIRE_COMMENT_MARKER = "[detector] +1 
 const STRANDED_ISSUE_RECOVERY_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.strandedIssueRecovery;
 const STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.staleActiveRunEvaluation;
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
+const EXTERNAL_WAIT_RESUME_WAKE_REASONS = new Set([
+  "github_check_completed",
+  "github_check_suite_completed",
+  "github_workflow_completed",
+  "github_pr_closed",
+  "github_pr_converted_to_draft",
+  "github_pr_review_submitted",
+  "issue_monitor_due",
+]);
 const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON = "execution_review_participant_recovery";
 const RESOLVED_DEPENDENCY_WAKE_BACKSTOP_CANDIDATE_LIMIT = 500;
 const SESSIONED_LOCAL_ADAPTERS = new Set([
@@ -7815,12 +7825,26 @@ export function recoveryService(
       lastUsefulActionAt: Date | null;
     }>();
     for (const row of runRows) runById.set(row.id, row);
+    const activeReservationRunIds = new Set(
+      referencedRunIds.length > 0
+        ? await db
+            .select({ runId: externalRuntimeReservations.runId })
+            .from(externalRuntimeReservations)
+            .where(
+              and(
+                inArray(externalRuntimeReservations.runId, referencedRunIds),
+                isNull(externalRuntimeReservations.releasedAt),
+              ),
+            )
+            .then((rows) => rows.map((row) => row.runId))
+        : [],
+    );
 
     const isCleanable = (runId: string | null) => {
       if (!runId) return true;
       const run = runById.get(runId);
       if (!run) return true; // missing run row → no real claim
-      return TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status);
+      return TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status) && !activeReservationRunIds.has(runId);
     };
 
     // BLO-18995: a lock can also be held by a run that never started. Four
@@ -7984,6 +8008,8 @@ export function recoveryService(
             checkoutRunId: issues.checkoutRunId,
             executionRunId: issues.executionRunId,
             executionLockedAt: issues.executionLockedAt,
+            executionPolicy: issues.executionPolicy,
+            monitorNextCheckAt: issues.monitorNextCheckAt,
           })
           .from(issues)
           .where(eq(issues.id, issue.id))
@@ -8028,12 +8054,26 @@ export function recoveryService(
           lastUsefulActionAt: Date | null;
         }>();
         for (const row of currentRunRows) currentRunById.set(row.id, row);
+        const currentActiveReservationRunIds = new Set(
+          currentReferencedRunIds.length > 0
+            ? await tx
+                .select({ runId: externalRuntimeReservations.runId })
+                .from(externalRuntimeReservations)
+                .where(
+                  and(
+                    inArray(externalRuntimeReservations.runId, currentReferencedRunIds),
+                    isNull(externalRuntimeReservations.releasedAt),
+                  ),
+                )
+                .then((rows) => rows.map((row) => row.runId))
+            : [],
+        );
 
         const currentIsCleanable = (runId: string | null) => {
           if (!runId) return true;
           const run = currentRunById.get(runId);
           if (!run) return true;
-          return TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status);
+          return TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status) && !currentActiveReservationRunIds.has(runId);
         };
         const currentPreClaimLockExpired = (runId: string | null, lockedAt: Date | null) => {
           if (!runId || !lockedAt) return false;
@@ -8153,6 +8193,30 @@ export function recoveryService(
               promotedAgentId: null,
               skippedDeferredWakeIds,
             };
+          }
+
+          const externalWaitDeferredPayload = parseObject(deferred.payload);
+          const deferredContext = parseObject(externalWaitDeferredPayload[DEFERRED_WAKE_CONTEXT_KEY]);
+          const deferredWakeReason =
+            readNonEmptyString(deferredContext.wakeReason) ?? readNonEmptyString(deferred.reason);
+          const hasExternalWait =
+            currentIssue.monitorNextCheckAt !== null &&
+            normalizeIssueExecutionPolicy(currentIssue.executionPolicy ?? null)?.monitor?.kind === "external_service";
+          const resumesExternalWait =
+            deferredContext.externalWaitResumeRequested === true ||
+            EXTERNAL_WAIT_RESUME_WAKE_REASONS.has(deferredWakeReason ?? "");
+          if (hasExternalWait && !resumesExternalWait) {
+            await tx
+              .update(agentWakeupRequests)
+              .set({
+                status: "cancelled",
+                finishedAt: new Date(),
+                error: "Deferred wake superseded by persisted external-service wait",
+                updatedAt: new Date(),
+              })
+              .where(eq(agentWakeupRequests.id, deferred.id));
+            skippedDeferredWakeIds.push(deferred.id);
+            continue;
           }
 
           const deferredAgent = await tx

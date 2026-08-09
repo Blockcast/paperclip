@@ -5258,6 +5258,87 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
+  it("cancels a scheduled retry without losing its terminal status", async () => {
+    const { runId } = await seedRunFixture({
+      runStatus: "scheduled_retry",
+      agentStatus: "running",
+      includeIssue: false,
+    });
+
+    const cancelled = await heartbeat.cancelRun(runId);
+
+    expect(cancelled).toMatchObject({
+      status: "cancelled",
+      errorCode: "cancelled",
+    });
+  });
+
+  it("does not overwrite a run that completes while cancellation is terminating its process", async () => {
+    const { runId } = await seedRunFixture({
+      agentStatus: "running",
+      includeIssue: false,
+    });
+    runningProcesses.set(runId, {
+      child: { pid: 12345 } as ChildProcess,
+      graceSec: 1,
+      processGroupId: null,
+    });
+    let finishTermination: (() => void) | null = null;
+    const terminationStarted = new Promise<void>((resolve) => {
+      mockTerminateLocalService.mockImplementationOnce(async () => {
+        resolve();
+        await new Promise<void>((finish) => {
+          finishTermination = finish;
+        });
+      });
+    });
+
+    const cancelling = heartbeat.cancelRun(runId);
+    await terminationStarted;
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "succeeded", finishedAt: new Date(), updatedAt: new Date() })
+      .where(eq(heartbeatRuns.id, runId));
+    finishTermination?.();
+
+    const result = await cancelling;
+    expect(result?.status).toBe("succeeded");
+    expect(result?.errorCode).toBeNull();
+  });
+
+  it("does not release the issue slot when durable cancellation cannot terminate the process", async () => {
+    const { runId, issueId } = await seedRunFixture({
+      adapterType: "process",
+      agentStatus: "running",
+      includeIssue: true,
+    });
+    runningProcesses.set(runId, {
+      child: { pid: 12345 } as ChildProcess,
+      graceSec: 1,
+      processGroupId: null,
+    });
+    mockTerminateLocalService.mockRejectedValueOnce(new Error("termination failed"));
+
+    await expect(heartbeat.cancelRun(runId, "Yielded after persisting an external-service wait", {
+      errorCode: "external_wait_yield",
+      persistBeforeTerminate: true,
+      repairTerminalRelease: true,
+    })).rejects.toThrow("termination failed");
+
+    const [cancelledRun, lockedIssue] = await Promise.all([
+      heartbeat.getRun(runId),
+      db
+        .select({ executionRunId: issues.executionRunId, checkoutRunId: issues.checkoutRunId })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0] ?? null),
+    ]);
+    expect(cancelledRun).toMatchObject({ status: "running", errorCode: null });
+    expect(lockedIssue).toEqual({ executionRunId: runId, checkoutRunId: runId });
+    expect(runningProcesses.has(runId)).toBe(true);
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+  });
+
   it("cancelRun cascades Job deletion for claude_k8s (RCA 2026-05-06)", async () => {
     // The reaper-driven path got cascade-delete in PR #108; this is the
     // sibling path for explicit operator/board cancel. Without this,
@@ -5370,6 +5451,300 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         source: "issue_comment_interrupt",
       }),
     });
+  });
+
+  it("releases the current slot and dispatches the next issue after an external-wait yield", async () => {
+    const { companyId, agentId, runId, issueId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      agentStatus: "running",
+      includeIssue: true,
+    });
+    await seedLaunchedReservation({ companyId, agentId, runId });
+    const monitorNextCheckAt = new Date("2099-12-01T12:00:00.000Z");
+    await db
+      .update(issues)
+      .set({
+        status: "in_review",
+        executionPolicy: {
+          mode: "normal",
+          commentRequired: true,
+          stages: [],
+          monitor: {
+            nextCheckAt: monitorNextCheckAt.toISOString(),
+            scheduledBy: "assignee",
+            kind: "external_service",
+            serviceName: "github-actions",
+            externalRef: "https://github.com/Blockcast/paperclip/pull/1234",
+            gateSignals: ["pr:Blockcast/paperclip#1234:checks"],
+          },
+        },
+        monitorNextCheckAt,
+        monitorScheduledBy: "assignee",
+        updatedAt: new Date(),
+      })
+      .where(eq(issues.id, issueId));
+
+    const nextIssueId = randomUUID();
+    const nextWakeupId = randomUUID();
+    const nextRunId = randomUUID();
+    await db.insert(issues).values({
+      id: nextIssueId,
+      companyId,
+      title: "Next queued assignment",
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      responsibleUserId: "responsible-user",
+      issueNumber: 2,
+      identifier: `NEXT-${nextIssueId.slice(0, 6)}`,
+    });
+    await db.insert(agentWakeupRequests).values({
+      id: nextWakeupId,
+      companyId,
+      agentId,
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId: nextIssueId },
+      status: "queued",
+    });
+    await db.insert(heartbeatRuns).values({
+      id: nextRunId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "queued",
+      wakeupRequestId: nextWakeupId,
+      contextSnapshot: { issueId: nextIssueId },
+      createdAt: new Date("2026-03-19T00:01:00.000Z"),
+      updatedAt: new Date("2026-03-19T00:01:00.000Z"),
+    });
+    const deferredWakeId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: deferredWakeId,
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_comment_added",
+      payload: {
+        issueId,
+        _paperclipWakeContext: {
+          issueId,
+          wakeReason: "issue_comment_added",
+        },
+      },
+      status: "deferred_issue_execution",
+    });
+    mockReadAgentJobRunStatusByName.mockResolvedValueOnce({
+      phase: "missing",
+      reason: "NotFound",
+      name: `agent-job-${runId.slice(0, 8)}`,
+    });
+
+    const yielded = await heartbeat.cancelRun(runId, "Yielded after persisting an external-service wait", {
+      errorCode: "external_wait_yield",
+      resultJson: {
+        yieldedExternalWait: true,
+        issueId,
+        serviceName: "github-actions",
+      },
+      persistBeforeTerminate: true,
+      repairTerminalRelease: true,
+    });
+    await waitForRunToSettle(heartbeat, nextRunId);
+
+    expect(yielded).toMatchObject({
+      status: "cancelled",
+      errorCode: "external_wait_yield",
+      resultJson: expect.objectContaining({
+        yieldedExternalWait: true,
+        issueId,
+      }),
+    });
+    const waitingIssue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(waitingIssue).toMatchObject({
+      status: "in_review",
+      executionRunId: null,
+      checkoutRunId: null,
+      monitorNextCheckAt,
+    });
+    expect(waitingIssue?.executionPolicy).toMatchObject({
+      monitor: {
+        kind: "external_service",
+        serviceName: "github-actions",
+      },
+    });
+
+    const [nextRun, retiredDeferredWake, prematureFirstIssueRuns] = await Promise.all([
+      heartbeat.getRun(nextRunId),
+      db
+        .select({ status: agentWakeupRequests.status })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, deferredWakeId))
+        .then((rows) => rows[0] ?? null),
+      db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(and(
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+          sql`${heartbeatRuns.id} <> ${runId}`,
+        )),
+    ]);
+    expect(nextRun?.status).not.toBe("queued");
+    expect(retiredDeferredWake?.status).toBe("cancelled");
+    expect(prematureFirstIssueRuns).toHaveLength(0);
+    expect(mockDeleteAgentJobsForRun).toHaveBeenCalledWith(expect.objectContaining({ runId }));
+    expect(mockAdapterExecute).toHaveBeenCalledWith(expect.objectContaining({ runId: nextRunId }));
+
+    const suppressedWake = await heartbeat.wakeup(agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_comment_added",
+      payload: { issueId },
+      contextSnapshot: { issueId, wakeReason: "issue_comment_added" },
+    });
+    expect(suppressedWake).toBeNull();
+    const postReleaseFirstIssueRuns = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(and(
+        sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+        sql`${heartbeatRuns.id} <> ${runId}`,
+      ));
+    expect(postReleaseFirstIssueRuns).toHaveLength(0);
+
+    await heartbeat.triggerIssueMonitor(issueId, {
+      now: new Date("2099-12-01T12:00:01.000Z"),
+      actorType: "system",
+      actorId: "test-monitor",
+    });
+    const resumedFirstIssueRuns = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(and(
+        sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+        sql`${heartbeatRuns.id} <> ${runId}`,
+      ));
+    expect(resumedFirstIssueRuns).toHaveLength(1);
+    await waitForRunToSettle(heartbeat, resumedFirstIssueRuns[0]!.id);
+  });
+
+  it("reaps and repairs the issue slot when exact external-wait Job deletion is delayed", async () => {
+    const { companyId, agentId, runId, issueId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      agentStatus: "running",
+      includeIssue: true,
+    });
+    const reservation = await seedLaunchedReservation({ companyId, agentId, runId });
+    const monitorNextCheckAt = new Date("2099-12-01T12:00:00.000Z");
+    await db
+      .update(issues)
+      .set({
+        status: "in_review",
+        executionPolicy: {
+          mode: "normal",
+          commentRequired: true,
+          stages: [],
+          monitor: {
+            nextCheckAt: monitorNextCheckAt.toISOString(),
+            scheduledBy: "assignee",
+            kind: "external_service",
+            serviceName: "github-actions",
+          },
+        },
+        monitorNextCheckAt,
+        monitorScheduledBy: "assignee",
+        updatedAt: new Date(),
+      })
+      .where(eq(issues.id, issueId));
+    mockDeleteAgentJobsForRun.mockResolvedValueOnce("mismatch");
+
+    const yielded = await heartbeat.cancelRun(runId, "Yielded after persisting an external-service wait", {
+      errorCode: "external_wait_yield",
+      persistBeforeTerminate: true,
+      repairTerminalRelease: true,
+    });
+
+    const [waitingIssue, activeReservation, cancelledRun] = await Promise.all([
+      db
+        .select({ executionRunId: issues.executionRunId, checkoutRunId: issues.checkoutRunId })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0] ?? null),
+      db
+        .select({ state: externalRuntimeReservations.state })
+        .from(externalRuntimeReservations)
+        .where(eq(externalRuntimeReservations.id, reservation.id))
+        .then((rows) => rows[0] ?? null),
+      heartbeat.getRun(runId),
+    ]);
+    expect(waitingIssue).toEqual({ executionRunId: runId, checkoutRunId: runId });
+    expect(activeReservation?.state).toBe("release_pending");
+    expect(cancelledRun).toMatchObject({ status: "cancelled", errorCode: "external_wait_yield" });
+    expect(yielded).toMatchObject({ status: "cancelled", errorCode: "external_wait_yield" });
+
+    const terminalWake = await heartbeat.wakeup(agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "github_check_suite_completed",
+      payload: { issueId },
+      contextSnapshot: { issueId, wakeReason: "github_check_suite_completed" },
+    });
+    expect(terminalWake).toBeNull();
+    const deferredTerminalWake = await db
+      .select({ status: agentWakeupRequests.status })
+      .from(agentWakeupRequests)
+      .where(and(
+        eq(agentWakeupRequests.agentId, agentId),
+        eq(agentWakeupRequests.status, "deferred_issue_execution"),
+      ));
+    expect(deferredTerminalWake).toHaveLength(1);
+
+    mockReadAgentJobRunStatusByName.mockResolvedValueOnce({
+      phase: "missing",
+      reason: "NotFound",
+      name: reservation.jobName,
+    });
+    await heartbeat.reapOrphanedRuns();
+    const resumedRuns = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(and(
+        sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+        sql`${heartbeatRuns.id} <> ${runId}`,
+      ));
+    expect(resumedRuns).toHaveLength(1);
+    await waitForRunToSettle(heartbeat, resumedRuns[0]!.id);
+
+    const [repairedIssue, repairedReservation, lifecycleEvents] = await Promise.all([
+      db
+        .select({ executionRunId: issues.executionRunId, checkoutRunId: issues.checkoutRunId })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0] ?? null),
+      db
+        .select({ state: externalRuntimeReservations.state })
+        .from(externalRuntimeReservations)
+        .where(eq(externalRuntimeReservations.id, reservation.id))
+        .then((rows) => rows[0] ?? null),
+      db
+        .select({ id: heartbeatRunEvents.id })
+        .from(heartbeatRunEvents)
+        .where(and(
+          eq(heartbeatRunEvents.runId, runId),
+          eq(heartbeatRunEvents.message, "run cancelled"),
+        )),
+    ]);
+    expect(repairedIssue).toEqual({ executionRunId: null, checkoutRunId: null });
+    expect(repairedReservation?.state).toBe("released");
+    expect(lifecycleEvents).toHaveLength(1);
+    expect(mockDeleteAgentJobsForRun).toHaveBeenCalledTimes(1);
   });
 
   it("dispatches assigned todo work with no prior run as a normal assignment wake", async () => {

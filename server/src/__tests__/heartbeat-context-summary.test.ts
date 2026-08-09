@@ -1133,6 +1133,22 @@ describe("mergeCoalescedContextSnapshot", () => {
     expect(merged.githubPrReviewBody).toBe("Findings on #824.");
   });
 
+  it("preserves a terminal external resume signal when a later wake is coalesced", () => {
+    const merged = mergeCoalescedContextSnapshot(
+      {
+        issueId: "issue-1",
+        wakeReason: "github_check_suite_completed",
+      },
+      {
+        issueId: "issue-1",
+        wakeReason: "issue_commented",
+      },
+    );
+
+    expect(merged.wakeReason).toBe("issue_commented");
+    expect(merged.externalWaitResumeRequested).toBe(true);
+  });
+
   // parseObject returns its argument by reference when that argument is already
   // an object, so a clear implemented against `existing` would corrupt the
   // caller's persisted snapshot.

@@ -10390,6 +10390,58 @@ export function issueRoutes(
     }
     await routinesSvc.syncRunStatusForIssue(issue.id);
 
+    const externalWaitMonitor = nextExecutionPolicy?.monitor;
+    const externalWaitNextCheckAt = issue.monitorNextCheckAt;
+    const shouldYieldCurrentRunForExternalWait =
+      req.actor.type === "agent" &&
+      actor.runId !== null &&
+      isCurrentIssueExecutionRun(req, existing) &&
+      externalWaitMonitor?.kind === "external_service" &&
+      externalWaitNextCheckAt !== null &&
+      (issue.status === "in_progress" || issue.status === "in_review") &&
+      (req.body.executionPolicy !== undefined || (existing.status !== "in_review" && issue.status === "in_review"));
+
+    if (shouldYieldCurrentRunForExternalWait) {
+      const yielded = await heartbeat.cancelRun(
+        actor.runId as string,
+        "Yielded after persisting an external-service wait",
+        {
+          errorCode: "external_wait_yield",
+          resultJson: {
+            yieldedExternalWait: true,
+            issueId: issue.id,
+            serviceName: externalWaitMonitor.serviceName ?? null,
+          },
+          eventMessage: "run yielded after persisting an external-service wait",
+          eventPayload: {
+            issueId: issue.id,
+            serviceName: externalWaitMonitor.serviceName ?? null,
+          },
+          persistBeforeTerminate: true,
+          repairTerminalRelease: true,
+        },
+      );
+      if (yielded?.status === "cancelled" && yielded.errorCode === "external_wait_yield") {
+        await logActivity(db, {
+          companyId: issue.companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          agentApiKeyId: actor.agentApiKeyId,
+          action: "heartbeat.external_wait_yielded",
+          entityType: "heartbeat_run",
+          entityId: yielded.id,
+          issueId: issue.id,
+          details: {
+            issueId: issue.id,
+            serviceName: externalWaitMonitor.serviceName ?? null,
+            monitorNextCheckAt: externalWaitNextCheckAt.toISOString(),
+          },
+        });
+      }
+    }
+
     if (actor.runId) {
       await heartbeat.reportRunActivity(actor.runId).catch((err) =>
         logger.warn({ err, runId: actor.runId }, "failed to clear detached run warning after issue activity"));
