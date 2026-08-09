@@ -38,6 +38,16 @@ export interface StrandedBlockedIssueReconcileResult {
   iterations: number;
 }
 
+export type StrandedBlockedIssueReconcilerScheduler = {
+  setInterval: (callback: () => void, intervalMs: number) => ReturnType<typeof setInterval>;
+  clearInterval: (timer: ReturnType<typeof setInterval>) => void;
+};
+
+const defaultScheduler: StrandedBlockedIssueReconcilerScheduler = {
+  setInterval,
+  clearInterval,
+};
+
 type CandidateCursor = {
   updatedAt: Date | string;
   id: string;
@@ -252,13 +262,22 @@ export function startStrandedBlockedIssueReconciler(
   db: Db,
   intervalMs: number,
   options: { batchSize?: number; maxIterations?: number } = {},
+  scheduler: StrandedBlockedIssueReconcilerScheduler = defaultScheduler,
 ): () => void {
-  const runTick = () =>
-    void reconcileStrandedBlockedIssues(db, options).catch((err) => {
-      defaultLogger.error({ err }, "stranded-blocked-issue reconciler sweep failed");
-    });
+  let inFlight: Promise<void> | null = null;
+  const runTick = () => {
+    if (inFlight) return;
+    inFlight = reconcileStrandedBlockedIssues(db, options)
+      .catch((err) => {
+        defaultLogger.error({ err }, "stranded-blocked-issue reconciler sweep failed");
+      })
+      .then(() => undefined)
+      .finally(() => {
+        inFlight = null;
+      });
+  };
 
   runTick();
-  const timer = setInterval(runTick, intervalMs);
-  return () => clearInterval(timer);
+  const timer = scheduler.setInterval(runTick, intervalMs);
+  return () => scheduler.clearInterval(timer);
 }
