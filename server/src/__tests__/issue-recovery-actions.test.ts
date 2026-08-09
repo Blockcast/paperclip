@@ -16,6 +16,8 @@ import {
   issueRecoveryActions,
   issueRelations,
   issues,
+  routines,
+  routineRuns,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -355,6 +357,8 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(environments);
+    await db.delete(routineRuns);
+    await db.delete(routines);
     await db.delete(issues);
     await db.delete(agents);
     await db.delete(companies);
@@ -4227,6 +4231,242 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       );
       expect(escalationComment?.body).toContain("cause `stranded_assigned_issue`");
       expect(escalationComment?.body).toContain(`to owner \`${managerId}\``);
+    });
+  });
+
+  // BLO-21395: the scheduler-side failure heartbeat. A routine execution issue
+  // that strands before user code ever ran gets a deduplicated cross-post to
+  // the routine's alert surface (`routines.parentIssueId`), because the
+  // runbook's own pre-flight heartbeat never had a chance to run.
+  describe("scheduler-side failure heartbeat for routine executions", () => {
+    async function seedRoutineWithAlertSurface(input: {
+      companyId: string;
+      prefix: string;
+      assigneeAgentId: string;
+    }) {
+      const alertIssueId = randomUUID();
+      await db.insert(issues).values({
+        id: alertIssueId,
+        companyId: input.companyId,
+        title: "[Sweep] Agent health & stalled-issue alerts",
+        status: "in_progress",
+        priority: "medium",
+        issueNumber: 500,
+        identifier: `${input.prefix}-500`,
+      });
+      const routineId = randomUUID();
+      await db.insert(routines).values({
+        id: routineId,
+        companyId: input.companyId,
+        parentIssueId: alertIssueId,
+        title: "Agent health & stalled-issue check",
+        assigneeAgentId: input.assigneeAgentId,
+      });
+      return { alertIssueId, routineId };
+    }
+
+    async function seedRoutineExecutionIssue(input: {
+      companyId: string;
+      prefix: string;
+      assigneeAgentId: string;
+      routineId: string;
+      triggeredAt: Date;
+      issueNumber: number;
+    }) {
+      const routineRunId = randomUUID();
+      await db.insert(routineRuns).values({
+        id: routineRunId,
+        companyId: input.companyId,
+        routineId: input.routineId,
+        source: "schedule",
+        status: "received",
+        triggeredAt: input.triggeredAt,
+      });
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId: input.companyId,
+        title: "Agent health & stalled-issue check",
+        status: "in_progress",
+        priority: "medium",
+        assigneeAgentId: input.assigneeAgentId,
+        issueNumber: input.issueNumber,
+        identifier: `${input.prefix}-${input.issueNumber}`,
+        originKind: "routine_execution",
+        originId: input.routineId,
+        originRunId: routineRunId,
+      });
+      const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+      return { issue: issue!, routineRunId };
+    }
+
+    it("survives a capacity-park then stale-kill sequence and posts exactly one heartbeat (BLO-21235)", async () => {
+      const { companyId, managerId, coderId, prefix } = await seedCompany();
+      const { alertIssueId, routineId } = await seedRoutineWithAlertSurface({
+        companyId,
+        prefix,
+        assigneeAgentId: managerId,
+      });
+      const triggeredAt = new Date("2026-08-03T00:00:00.000Z");
+      const { issue } = await seedRoutineExecutionIssue({
+        companyId,
+        prefix,
+        assigneeAgentId: coderId,
+        routineId,
+        triggeredAt,
+        issueNumber: 501,
+      });
+      const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
+      const recovery = recoveryService(db, { enqueueWakeup });
+
+      // Phase 1: transient provider-capacity park (`ccrotate_capacity`). The
+      // window may still recover once capacity reopens, so this must not post
+      // a scheduler heartbeat.
+      const capacityRunId = randomUUID();
+      // The ownerless provider-quota path schedules a retry run whose
+      // `retryOfRunId` FK points at the stranded run, so it has to actually
+      // exist as a row (mirrors the precedent in "gives a newly bounded owner
+      // a fresh horizon..." above).
+      await seedHeartbeatRun({
+        companyId,
+        agentId: coderId,
+        runId: capacityRunId,
+        issueId: issue.id,
+        status: "failed",
+      });
+      const capacityRun = {
+        id: capacityRunId,
+        agentId: coderId,
+        status: "failed",
+        error: "quota exceeded, try again after reset",
+        errorCode: "provider_quota",
+        contextSnapshot: { retryReason: "issue_continuation_needed" },
+        livenessState: null,
+        resultJson: null,
+        usageJson: null,
+        createdAt: new Date(),
+      } as const;
+      await recovery.escalateStrandedAssignedIssue({
+        issue,
+        previousStatus: "in_progress",
+        latestRun: capacityRun,
+      });
+
+      const afterCapacityPark = await db
+        .select({ id: issueComments.id })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, alertIssueId));
+      expect(afterCapacityPark).toHaveLength(0);
+
+      // Phase 2: the job is force-terminated as stale
+      // (`external_lifecycle_stale_killed`) -- the window is now confirmed
+      // stranded before user code ever ran.
+      const staleKillRun = {
+        id: randomUUID(),
+        agentId: coderId,
+        status: "failed",
+        error: "External lifecycle Job stale-killed",
+        errorCode: "external_lifecycle_stale_killed",
+        contextSnapshot: { retryReason: "issue_continuation_needed" },
+        livenessState: null,
+        resultJson: null,
+        usageJson: null,
+        createdAt: new Date(),
+      } as const;
+      await recovery.escalateStrandedAssignedIssue({
+        issue,
+        previousStatus: "in_progress",
+        latestRun: staleKillRun,
+      });
+      // A later sweep re-observing the same stranded window must not duplicate
+      // the receipt.
+      await recovery.escalateStrandedAssignedIssue({
+        issue,
+        previousStatus: "in_progress",
+        latestRun: staleKillRun,
+      });
+
+      const heartbeatComments = await db
+        .select({ body: issueComments.body, idempotencyKey: issueComments.idempotencyKey })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, alertIssueId));
+      expect(heartbeatComments).toHaveLength(1);
+      const windowKey = triggeredAt.toISOString();
+      expect(heartbeatComments[0]!.idempotencyKey).toBe(
+        `scheduler-heartbeat:${routineId}:${windowKey}`,
+      );
+      expect(heartbeatComments[0]!.body).toContain("Scheduler-side failure heartbeat");
+      expect(heartbeatComments[0]!.body).toContain(windowKey);
+      expect(heartbeatComments[0]!.body).toContain(issue.identifier!);
+      expect(heartbeatComments[0]!.body).toContain("external_lifecycle_stale_killed");
+    });
+
+    it("does not post a second heartbeat when user code already ran before stranding", async () => {
+      const { companyId, managerId, coderId, prefix } = await seedCompany();
+      const { alertIssueId, routineId } = await seedRoutineWithAlertSurface({
+        companyId,
+        prefix,
+        assigneeAgentId: managerId,
+      });
+      const triggeredAt = new Date("2026-08-05T06:00:00.000Z");
+      const { issue } = await seedRoutineExecutionIssue({
+        companyId,
+        prefix,
+        assigneeAgentId: coderId,
+        routineId,
+        triggeredAt,
+        issueNumber: 502,
+      });
+
+      // Evidence the agent actually ran and did work -- this is what a normal
+      // completion, or a run that reached the runbook's own in-run failure
+      // heartbeat, both leave behind.
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId,
+        agentId: coderId,
+        invocationSource: "automation",
+        status: "failed",
+        errorCode: "run_crashed",
+        contextSnapshot: { issueId: issue.id },
+        lastUsefulActionAt: new Date("2026-08-05T06:03:00.000Z"),
+        createdAt: new Date("2026-08-05T06:01:00.000Z"),
+      });
+
+      const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
+      const recovery = recoveryService(db, { enqueueWakeup });
+      const crashRun = {
+        id: randomUUID(),
+        agentId: coderId,
+        status: "failed",
+        error: "worker crashed mid-run",
+        errorCode: "run_crashed",
+        contextSnapshot: { issueId: issue.id, retryReason: "issue_continuation_needed" },
+        livenessState: null,
+        resultJson: null,
+        usageJson: null,
+        createdAt: new Date(),
+      } as const;
+      await recovery.escalateStrandedAssignedIssue({
+        issue,
+        previousStatus: "in_progress",
+        latestRun: crashRun,
+      });
+
+      // The source issue still gets the ordinary recovery-owner escalation
+      // comment -- only the cross-post to the routine's alert surface is
+      // suppressed.
+      const sourceComments = await db
+        .select({ id: issueComments.id })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, issue.id));
+      expect(sourceComments.length).toBeGreaterThan(0);
+
+      const alertSurfaceComments = await db
+        .select({ id: issueComments.id })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, alertIssueId));
+      expect(alertSurfaceComments).toHaveLength(0);
     });
   });
 });
