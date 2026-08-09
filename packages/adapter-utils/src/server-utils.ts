@@ -1419,6 +1419,10 @@ export function renderPaperclipWakePrompt(
         ]
       : []),
   ];
+  const credentialDiagnosticSafetyLines = [
+    "Credential diagnostic safety: never run `gh auth status` or another diagnostic that renders token fields. Validate GitHub identity with field-filtered output such as `gh api user --jq .login`; never emit credential values, token fields, authorization headers, or secret-bearing environment variables.",
+    "",
+  ];
   const lines = resumedSession
       ? [
         "## Paperclip Resume Delta",
@@ -1428,6 +1432,7 @@ export function renderPaperclipWakePrompt(
         "Focus on the new wake delta below and continue the current task without restating the full heartbeat boilerplate.",
         "Fetch the API thread only when `fallbackFetchNeeded` is true or you need broader history than this batch.",
         "",
+        ...credentialDiagnosticSafetyLines,
         ...executionContractLines,
         ...wakeSummaryLines,
       ]
@@ -1444,6 +1449,7 @@ export function renderPaperclipWakePrompt(
           ? ["Only fetch the API thread when `fallbackFetchNeeded` is true or you need broader history than this batch."]
           : []),
         "",
+        ...credentialDiagnosticSafetyLines,
         ...executionContractLines,
         ...wakeSummaryLines,
       ];
