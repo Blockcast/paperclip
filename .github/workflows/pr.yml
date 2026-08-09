@@ -13,10 +13,6 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  SCCACHE_GHA_ENABLED: "true"
-  RUSTC_WRAPPER: sccache
-  CC: "sccache gcc"
-  CXX: "sccache g++"
   PR_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
   PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
 
@@ -79,6 +75,9 @@ jobs:
 
       - name: Validate Docker deploy timeout margin
         run: node --test ./scripts/check-docker-deploy-timeout.test.js
+
+      - name: Test CI cache and Docker runner routing
+        run: node --test ./scripts/__tests__/ci-cache-routing.test.mjs
 
       - name: Reject git push in adapter/runtime code
         run: node ./scripts/check-no-git-push.mjs
@@ -246,9 +245,6 @@ jobs:
         with:
           node-version: 24
           cache: pnpm
-
-      - name: Set up GHA-backed sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -451,9 +447,6 @@ jobs:
           node-version: 24
           cache: pnpm
 
-      - name: Set up GHA-backed sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
-
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
@@ -603,9 +596,6 @@ jobs:
           node-version: 24
           cache: pnpm
 
-      - name: Set up GHA-backed sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
-
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
@@ -645,9 +635,6 @@ jobs:
         with:
           node-version: 24
           cache: pnpm
-
-      - name: Set up GHA-backed sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -707,9 +694,6 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
-
-      - name: Set up GHA-backed sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
