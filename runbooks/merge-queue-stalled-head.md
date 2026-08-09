@@ -9,7 +9,7 @@ the merge queue is non-empty, or
 `completed`. Owner: Platform/SRE (staffed by CTO timebox — see
 [BLO-518](/BLO/issues/BLO-518#document-plan)).
 
-## The two failure shapes, and why only one is automatic
+## The three failure shapes, and why only two are automatic
 
 GitHub's merge queue removes a queue entry automatically **once a required
 check concludes as failing** — that path needs no runbook, it already works
@@ -28,6 +28,84 @@ runs ~30-36 min). A 6h passive timeout is a >10x margin over that baseline —
 long enough for one stuck head, repeated across each new head as the batch
 re-stages behind it, to freeze the only path to production for the better
 part of a day, exactly as this incident did.
+
+A third shape emits **no signal at all**, automatic or otherwise: see
+"Silent eviction: un-stageable rebase" below.
+
+## Silent eviction: un-stageable rebase (BLO-23395)
+
+Source: [BLO-23395](/BLO/issues/BLO-23395)
+([Blockcast/paperclip#1092](https://github.com/Blockcast/paperclip/pull/1092)
+sat evicted from the merge queue for 9h13m unnoticed — added
+`2026-08-08T09:24:35Z`, removed `13:55:45Z`, six issues blocked behind it).
+
+If `master` advances far enough past a queued entry's merge base while it
+waits, the entry goes `CONFLICTING`/`DIRTY` and the queue **cannot stage it
+at all**. This is neither of the two shapes above:
+
+- It is not a failing required check — no check ever ran, so there is
+  nothing to fail. **Zero `merge_group` runs are created for that PR.**
+- It does not stall the queue — the queue keeps draining every other entry
+  perfectly well, so `master`'s tip keeps advancing and step 2's "position-1
+  unchanged" trigger never fires.
+
+The only trace is a `removed_from_merge_queue` timeline event, with no PR
+comment, no check-run, and no reviewer wake. This is a foreseeable
+recurrence, not a one-off: any PR that sits in a queue behind a busy `master`
+long enough will eventually go `CONFLICTING` — the longer the queue, the more
+likely it is.
+
+**Detection is automated** (`.github/workflows/merge-queue-eviction-detector.yml`,
+`scripts/merge-queue-eviction-detector.mjs`): GitHub fires
+`pull_request` `action=dequeued` for every queue removal, including a
+successful merge. The workflow waits out a short race window, then confirms
+the PR is genuinely unmerged, enumerates `merge_group` runs for that PR's
+queue head, and classifies the eviction:
+
+- **zero `merge_group` runs at that head → `conflict_unstageable`** (this
+  shape),
+- **a run exists and concluded `failure` → `check_failure`** (the automatic
+  shape above — should already have produced its own signal; a detector hit
+  here means something upstream is missing evidence),
+- **a run exists, did not fail, PR still unmerged → `manual`** (the stalled-head
+  procedure's manual dequeue, or a GitHub-side timeout).
+
+It posts the classification as a PR comment carrying a
+`<!-- paperclip:merge-queue-eviction -->` marker; `github-webhook.ts`
+recognizes that marker (from the `github-actions[bot]` login only — see
+`MERGE_QUEUE_EVICTION_BOT_LOGIN`) and wakes the PR's assignee the same way an
+`@ally` review comment does, so the PR author's Paperclip agent is notified
+directly rather than needing a human to notice a GitHub-side artifact. This
+closes the gap for an agent-authored PR, which has no human watching it.
+
+**Manual diagnosis**, if you need to confirm or replay a specific eviction by
+hand — this is exactly what the detector automates:
+
+```
+# 1. Confirm the eviction and its timing from the PR's own timeline.
+gh api repos/Blockcast/paperclip/issues/<PR_NUMBER>/timeline --paginate \
+  | jq '.[] | select(.event | test("_merge_queue$")) | {event, created_at}'
+```
+
+```
+# 2. Enumerate every merge_group run in the relevant window and confirm
+#    none of them belongs to this PR (head branch
+#    gh-readonly-queue/<base>/pr-<PR_NUMBER>-<sha>).
+gh run list --repo Blockcast/paperclip --event merge_group \
+  --json databaseId,headBranch,status,conclusion,createdAt --limit 500 \
+  | jq --arg pr "pr-<PR_NUMBER>-" '[.[] | select(.headBranch | startswith("gh-readonly-queue/") and contains($pr))]'
+```
+
+An empty array from step 2, alongside a `removed_from_merge_queue` event and
+no matching `merged` event from step 1, is the conflict/un-stageable
+signature. Fix is routine: rebase the PR onto the current base and re-add it
+to the queue — this runbook exists for the missing *signal*, not for a
+special repair procedure.
+
+A PR whose queue entry is evicted must not be left reporting a stale
+"enqueued" state anywhere an agent might read it as progress: the detector's
+wake/comment is the correction, and it fires whether or not anyone is
+watching.
 
 ## The policy
 
