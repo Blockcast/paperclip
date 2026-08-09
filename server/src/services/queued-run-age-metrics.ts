@@ -1,7 +1,8 @@
-import { eq, sql } from "drizzle-orm";
+import { and, eq, lt, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents, heartbeatRuns } from "@paperclipai/db";
 import {
+  setOverdueScheduledRetryAgeMetrics,
   setQueuedRunAgeMetricsRefreshSuccess,
   setQueuedRunOldestAgeMetrics,
 } from "./metrics.js";
@@ -65,4 +66,50 @@ export async function refreshQueuedRunAgeMetrics(db: Db, now = new Date()): Prom
     setQueuedRunAgeMetricsRefreshSuccess(false);
     throw error;
   }
+}
+
+/**
+ * Refresh the per-agent oldest-overdue-`scheduled_retry`-row-age gauge
+ * (BLO-22094). {@link refreshQueuedRunAgeMetrics} above only ever sees
+ * `status='queued'` rows -- a parked retry is `status: "scheduled_retry"`, a
+ * distinct value, so it never enters that aggregate at any age. That
+ * exclusion is intentional (it is what stops a promoted retry from replaying
+ * its whole backoff as queued-dispatch wait, onprem-k8s#2013), but it leaves
+ * a retry that is parked and never promoted invisible to any gauge, forever
+ * -- the exact gap this metric closes.
+ *
+ * Ages off `scheduled_retry_at`, not `created_at`: a parked row's `due` time
+ * is what a wedged promotion path fails to act on, and that is what an
+ * on-call reader needs to see overrun. Only rows already past due
+ * (`scheduled_retry_at < now`) count -- a run still backing off toward a
+ * future due time is working as designed and must contribute nothing, or
+ * this gauge would page on ordinary retry backoff instead of a stuck
+ * promotion sweep.
+ *
+ * Same "query every agent id, reset-then-set" shape as
+ * {@link refreshQueuedRunAgeMetrics} so an agent with no overdue parked row
+ * reads back an explicit 0 rather than an absent series.
+ */
+export async function refreshOverdueScheduledRetryAgeMetrics(db: Db, now = new Date()): Promise<void> {
+  const [agentRows, oldestByAgent] = await Promise.all([
+    db.select({ id: agents.id }).from(agents),
+    db
+      .select({
+        agentId: heartbeatRuns.agentId,
+        oldestDueAt: sql<Date | string | null>`min(${heartbeatRuns.scheduledRetryAt})`,
+      })
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.status, "scheduled_retry"), lt(heartbeatRuns.scheduledRetryAt, now)))
+      .groupBy(heartbeatRuns.agentId),
+  ]);
+
+  const knownAgentIds = new Set(agentRows.map((row) => row.id));
+  const entries = oldestByAgent
+    .filter((row) => row.agentId !== null && row.oldestDueAt)
+    .map((row) => ({
+      agentId: row.agentId,
+      ageSeconds: Math.max(0, (now.getTime() - new Date(row.oldestDueAt as Date | string).getTime()) / 1000),
+    }));
+
+  setOverdueScheduledRetryAgeMetrics(entries, knownAgentIds);
 }

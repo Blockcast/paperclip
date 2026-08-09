@@ -552,3 +552,79 @@ test("agent_id-joined alerts pre-aggregate both sides (multi-replica safe, BLO-2
       `'max by (agent_id) (...)':\n  ${unaggregated.join("\n  ")}`,
   );
 });
+
+test("PaperclipOverdueScheduledRetry is agent-keyed, gauge-thresholded, and links its runbook (BLO-22094)", () => {
+  const rendered = execFileSync(
+    "helm",
+    [
+      "template",
+      "paperclip",
+      "deploy/helm/paperclip",
+      "--namespace",
+      "paperclip",
+      "-f",
+      "deploy/helm/paperclip/values.blockcast.yaml",
+      "--show-only",
+      "templates/prometheusrule.yaml",
+      "--set",
+      "prometheusRule.enabled=true",
+    ],
+    { cwd: repoRoot, encoding: "utf8" },
+  );
+
+  assert.match(rendered, /alert: PaperclipOverdueScheduledRetry/);
+  const [, expr] = rendered.match(
+    /alert: PaperclipOverdueScheduledRetry[\s\S]*?\n\s+expr: (.+)\n/,
+  ) ?? [];
+  assert.ok(expr, "overdue-scheduled-retry alert must render an expr");
+
+  // Must threshold the per-agent overdue-parked-age gauge, not a summed
+  // scheduled_retry row count under a long `for:` -- same reasoning as
+  // PaperclipQueuedRunStranded above.
+  assert.match(
+    expr,
+    /^max\(paperclip_overdue_scheduled_retry_oldest_age_seconds\) by \(agent_id\) > (\d+)$/,
+    "overdue-scheduled-retry alert must threshold the per-agent age gauge, "
+      + "not a summed count under a long `for:`",
+  );
+
+  const [, ageThreshold] = expr.match(/> (\d+)$/) ?? [];
+  // The gauge is reset-then-set to 0 for every known agent on each refresh
+  // (see setOverdueScheduledRetryAgeMetrics), so a strictly positive
+  // threshold is the silent-in-steady-state guarantee.
+  assert.ok(
+    Number(ageThreshold) > 0,
+    "age threshold must be strictly positive so a zero-valued gauge is silent",
+  );
+
+  const [, forWindow] = rendered.match(
+    /alert: PaperclipOverdueScheduledRetry[\s\S]*?\n\s+for: (.+)\n/,
+  ) ?? [];
+  // `for:` is scrape-flap tolerance only -- the ageing lives in the
+  // threshold above, derived from a 7-day population (see values.yaml
+  // comment), not from `for:` duration.
+  assert.ok(forWindow, "overdue-scheduled-retry alert must render a for window");
+  const forMinutes = /^(\d+)m$/.test(forWindow.trim())
+    ? Number(forWindow.trim().slice(0, -1))
+    : /^(\d+)h$/.test(forWindow.trim())
+      ? Number(forWindow.trim().slice(0, -1)) * 60
+      : null;
+  assert.ok(
+    forMinutes !== null && forMinutes > 0 && forMinutes <= 10,
+    `for window ${forWindow} must be a short scrape-flap tolerance (<= 10m); `
+      + "the ageing belongs in the age-gauge threshold, not here",
+  );
+
+  assert.match(
+    rendered,
+    /alert: PaperclipOverdueScheduledRetry[\s\S]*?runbook_url: "[^"]*runbooks\/queued-run-stranded\.md#overdue-scheduled-retry-blo-22094"/,
+    "overdue-scheduled-retry alert must link the runbook from its annotation",
+  );
+
+  // A run merely backing off (scheduled_retry_at in the future) must never
+  // read as overdue -- the gauge only ages off rows already past due, so a
+  // strictly-greater-than comparison against a positive threshold is the
+  // only way this alert can stay silent for designed backoff.
+  assert.match(expr, />/, "overdue-scheduled-retry alert must use a strict greater-than comparison");
+});
+

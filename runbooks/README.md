@@ -46,6 +46,12 @@ platform cannot resolve automatically. Each runbook should be:
   snapshot cannot be refreshed safely. Trigger: alert
   `PaperclipQueuedRunStranded`, `PaperclipQueuedRunAgeMetricsRefreshFailed`,
   or `max(paperclip_queued_run_oldest_age_seconds) by (agent_id) > 1800`.
+- [`queued-run-stranded.md#overdue-scheduled-retry-blo-22094`](queued-run-stranded.md#overdue-scheduled-retry-blo-22094) —
+  a `heartbeat_runs` row parked at `status='scheduled_retry'` past its own due
+  time, never promoted: the retry-promotion sweep either wedged or is
+  systematically failing this row, and (unlike the alert above) the row never
+  even reached `queued`. Trigger: alert `PaperclipOverdueScheduledRetry`, or
+  `max(paperclip_overdue_scheduled_retry_oldest_age_seconds) by (agent_id) > 5400`.
 - [`productivity-review-monitor-rearm.md`](productivity-review-monitor-rearm.md)
   — you are adjudicating an open productivity review and the reviewed issue's
   monitor has lapsed (`status: "triggered"`, `nextCheckAt: null`, no active
