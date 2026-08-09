@@ -21,6 +21,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { cleanupHeartbeatTestState } from "./helpers/cleanup-heartbeat-test-state.js";
 import { heartbeatService } from "../services/heartbeat.js";
+import { issueService } from "../services/issues.js";
 import { runningProcesses } from "../adapters/index.js";
 
 const mockAdapterExecute = vi.hoisted(() =>
@@ -365,6 +366,9 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     companyId: string;
     agentId: string;
     status: string;
+    startedAt?: Date | null;
+    contextSnapshot?: Record<string, unknown>;
+    createdAt?: Date;
   }) {
     const runId = randomUUID();
     await db.insert(heartbeatRuns).values({
@@ -374,6 +378,9 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       invocationSource: "automation",
       triggerDetail: "system",
       status: input.status,
+      startedAt: input.startedAt ?? null,
+      contextSnapshot: input.contextSnapshot ?? {},
+      createdAt: input.createdAt ?? new Date(),
     });
     return runId;
   }
@@ -386,7 +393,12 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       },
     });
     const runningHolder = await seedLockHolderRun({ companyId, agentId, status: "running" });
-    const queuedHolder = await seedLockHolderRun({ companyId, agentId, status: "queued" });
+    const retryHolder = await seedLockHolderRun({
+      companyId,
+      agentId,
+      status: "scheduled_retry",
+      startedAt: new Date(),
+    });
     await db.insert(issues).values([
       {
         id: randomUUID(),
@@ -401,11 +413,11 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       {
         id: randomUUID(),
         companyId,
-        title: "in_progress but locked by a queued dispatch",
+        title: "in_progress but locked by an executing scheduled retry",
         status: "in_progress",
         priority: "high",
         assigneeAgentId: agentId,
-        executionRunId: queuedHolder,
+        executionRunId: retryHolder,
       },
     ]);
 
@@ -437,7 +449,12 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
         skipTimerWhenNoActionableWork: true,
       },
     });
-    const retryHolder = await seedLockHolderRun({ companyId, agentId, status: "scheduled_retry" });
+    const retryHolder = await seedLockHolderRun({
+      companyId,
+      agentId,
+      status: "scheduled_retry",
+      startedAt: new Date(),
+    });
     await db.insert(issues).values({
       id: randomUUID(),
       companyId,
@@ -491,6 +508,77 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     expect(run).toBeNull();
     expect(mockAdapterExecute).not.toHaveBeenCalled();
   });
+
+  it.each(["queued", "scheduled_retry"] as const)(
+    "allows a timer wake to adopt a never-started %s lock",
+    async (status) => {
+      const { companyId, agentId } = await seedCompanyAndAgent({
+        heartbeatConfig: {
+          enabled: true,
+          skipTimerWhenNoActionableWork: true,
+        },
+      });
+      const issueId = randomUUID();
+      const staleHolder = await seedLockHolderRun({
+        companyId,
+        agentId,
+        status,
+        // Give the stale holder its actual issue scope. That prevents the
+        // generic timer wake from coalescing into it and matches the lock shape
+        // checkout is expected to reclaim.
+        contextSnapshot: { issueId },
+        // The actor must be newer than the owner for adoption; avoid a
+        // millisecond-resolution tie between the two inserts.
+        createdAt: new Date(Date.now() - 1_000),
+      });
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: `never-started ${status} lock is reclaimable`,
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+        checkoutRunId: staleHolder,
+        executionRunId: staleHolder,
+      });
+
+      // A queued holder is itself eligible for dispatch and otherwise wins the
+      // agent queue before the new generic timer run. Fence dispatch, then
+      // advance the newly-enqueued timer run to its real checkout state. This
+      // keeps the gate/adoption regression deterministic while still exercising
+      // checkout's atomic owner cancellation and transfer.
+      const timerOnlyHeartbeat = heartbeatService(db, { skipQueuedRunDispatch: true });
+      const run = await timerOnlyHeartbeat.wakeup(agentId, {
+        source: "timer",
+        triggerDetail: "schedule",
+      });
+
+      expect(run).not.toBeNull();
+      if (!run) throw new Error("timer wake was unexpectedly skipped");
+      expect(run.id).not.toBe(staleHolder);
+      expect(mockAdapterExecute).not.toHaveBeenCalled();
+
+      await db
+        .update(heartbeatRuns)
+        .set({ status: "running", startedAt: new Date(), updatedAt: new Date() })
+        .where(eq(heartbeatRuns.id, run.id));
+
+      const adopted = await issueService(db).checkout(issueId, agentId, ["in_progress"], run.id);
+      expect(adopted).toMatchObject({
+        checkoutRunId: run.id,
+        executionRunId: run.id,
+      });
+      const previousOwner = await db
+        .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, staleHolder))
+        .then((rows) => rows[0]);
+      expect(previousOwner).toEqual({
+        status: "cancelled",
+        errorCode: "issue_checkout_adopted",
+      });
+    },
+  );
 
   it("allows generic timer wakes when a stale lock names a run that already terminalized", async () => {
     // A terminal holder releases the lock: `checkout()` clears it and succeeds,

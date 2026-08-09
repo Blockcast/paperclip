@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { HEARTBEAT_RUN_STATUSES } from "@paperclipai/shared";
 import {
   ISSUE_EXECUTION_LOCK_HOLDING_RUN_STATUSES,
+  ISSUE_EXECUTION_LOCK_REAPABLE_NEVER_STARTED_RUN_STATUSES,
   TERMINAL_HEARTBEAT_RUN_STATUSES,
   runStatusHoldsIssueExecutionLock,
 } from "../services/issue-execution-lock.js";
@@ -34,6 +35,10 @@ describe("issue execution-lock run statuses", () => {
     // ["queued","running"] activeRun filter dropped.
     expect(runStatusHoldsIssueExecutionLock("scheduled_retry")).toBe(true);
     expect(ISSUE_EXECUTION_LOCK_HOLDING_RUN_STATUSES).toContain("scheduled_retry");
+  });
+
+  it("allows only queued and scheduled_retry locks to be reaped before they start", () => {
+    expect(ISSUE_EXECUTION_LOCK_REAPABLE_NEVER_STARTED_RUN_STATUSES).toEqual(["queued", "scheduled_retry"]);
   });
 
   it("holds for queued and running, releases for every terminal status", () => {
