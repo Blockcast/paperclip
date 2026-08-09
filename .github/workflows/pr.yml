@@ -387,7 +387,14 @@ jobs:
     # SQLite store once per state home, and the suite creates a fresh one per run,
     # so each iteration below is a genuine cold start rather than a warmed repeat.
     runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-paperclip-general' }}
-    timeout-minutes: 20
+    # Must cover the suite's own worst case, not the observed ~25s: each iteration
+    # allows 270s for the beforeAll migration (MIGRATION_TIMEOUT_MS + 30s) plus 150s
+    # for the test (TEST_TIMEOUT_MS), so three iterations can reach 21 minutes before
+    # checkout, setup, and install. A 20-minute cap would have GitHub kill the job in
+    # precisely the slow-cold-migration case this lane exists to catch, discarding the
+    # diagnostics the watchdog is meant to preserve. Keep this above 3 * (270s + 150s)
+    # plus setup margin if either budget in the suite changes.
+    timeout-minutes: 30
 
     steps:
       - name: Checkout repository
