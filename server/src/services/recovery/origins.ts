@@ -14,6 +14,7 @@ export const RECOVERY_REASON_KINDS = {
 export const RECOVERY_KEY_PREFIXES = {
   issueGraphLivenessIncident: "harness_liveness",
   issueGraphLivenessLeaf: "harness_liveness_leaf",
+  schedulerFailureHeartbeat: "scheduler-heartbeat",
 } as const;
 
 export type RecoveryOriginKind = typeof RECOVERY_ORIGIN_KINDS[keyof typeof RECOVERY_ORIGIN_KINDS];
@@ -59,5 +60,22 @@ export function buildIssueGraphLivenessLeafKey(input: {
     input.companyId,
     input.state,
     input.leafIssueId,
+  ].join(":");
+}
+
+// BLO-21395: dedup key for the scheduler-side failure heartbeat, kept in its
+// own namespace rather than a suffix inside a routine's own free-text
+// `agent-health:<window>`-style convention (which is per-runbook, not a
+// platform contract this service owns). One key per (routine, window) --
+// stable across repeated escalation sweeps for the same stranded window, and
+// distinct across windows because each routine run gets its own `windowKey`.
+export function buildSchedulerFailureHeartbeatKey(input: {
+  routineId: string;
+  windowKey: string;
+}) {
+  return [
+    RECOVERY_KEY_PREFIXES.schedulerFailureHeartbeat,
+    input.routineId,
+    input.windowKey,
   ].join(":");
 }
