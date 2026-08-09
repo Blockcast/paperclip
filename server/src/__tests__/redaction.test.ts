@@ -300,10 +300,12 @@ describe("sanitizeRecord value-shape gate (BLO-20810)", () => {
     const result = redactEventPayload({
       apiKey: "https://hooks.slack.test/services/T000/B000/signed-webhook-value",
       base_url: "https://example.test/callback?token=abc123def456",
+      backup_base_url: "https://example.test/callback?password=hunter2",
     });
 
     expect(result?.apiKey).toBe(REDACTED_EVENT_VALUE);
     expect(result?.base_url).toBe(REDACTED_EVENT_VALUE);
+    expect(result?.backup_base_url).toBe(REDACTED_EVENT_VALUE);
   });
 
   // CTO finding (#943 review, post-tiering): the URL branch returned "safe"
@@ -364,6 +366,8 @@ describe("sanitizeRecord value-shape gate (BLO-20810)", () => {
       client_secret: "s3cr3t99",
       webhook_secret: "abc123XY",
       auth: "pw12345",
+      authentication: "hunter2",
+      clientAuthentication: "short-password",
       clientSecret: "another-short-one",
     });
 
@@ -371,6 +375,8 @@ describe("sanitizeRecord value-shape gate (BLO-20810)", () => {
     expect(result?.client_secret).toBe(REDACTED_EVENT_VALUE);
     expect(result?.webhook_secret).toBe(REDACTED_EVENT_VALUE);
     expect(result?.auth).toBe(REDACTED_EVENT_VALUE);
+    expect(result?.authentication).toBe(REDACTED_EVENT_VALUE);
+    expect(result?.clientAuthentication).toBe(REDACTED_EVENT_VALUE);
     expect(result?.clientSecret).toBe(REDACTED_EVENT_VALUE);
   });
 

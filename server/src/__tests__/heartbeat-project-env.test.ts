@@ -696,7 +696,7 @@ describe("resolveExecutionRunAdapterConfig", () => {
       issueId: "issue-1",
       executionRunConfig: {
         env: {
-          OPENAI_API_KEY: "inline-secret",
+          FOO_TOKEN: "inline-secret",
         },
       },
       projectEnv: null,
@@ -724,14 +724,21 @@ describe("resolveExecutionRunAdapterConfig", () => {
   // substrings the sensitive-key heuristic looks for, so without an explicit
   // rule a low-trust run could inline the seat credential. Introduced with the
   // key itself (BLO-18927) rather than left for later.
-  it("rejects an inline agent-scope-only seat token for low-trust runs", async () => {
+  it.each([
+    ["an inline agent-scope-only seat token", "GH_SEAT_TOKEN_VALUE", "inline-seat-token"],
+    [
+      "a credential-shaped value under a benign key",
+      "CONFIG",
+      { type: "plain", value: "ghp_0123456789abcdef0123456789abcdef" },
+    ],
+  ])("rejects %s for low-trust runs", async (_description, key, value) => {
     await expect(resolveExecutionRunAdapterConfig({
       companyId: "company-1",
       agentId: "agent-1",
       issueId: "issue-1",
       executionRunConfig: {
         env: {
-          GH_SEAT_TOKEN_VALUE: "inline-seat-token",
+          [key]: value,
         },
       },
       projectEnv: null,
