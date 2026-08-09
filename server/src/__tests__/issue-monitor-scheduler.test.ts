@@ -27,7 +27,11 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.js";
-import { normalizeIssueExecutionPolicy, parseIssueExecutionState } from "../services/issue-execution-policy.js";
+import {
+  DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS,
+  normalizeIssueExecutionPolicy,
+  parseIssueExecutionState,
+} from "../services/issue-execution-policy.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -422,6 +426,70 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       .where(eq(activityLog.entityId, issueId))
       .then((rows) => rows.map((row) => row.action));
     expect(activity).toContain("issue.monitor_skipped");
+  });
+
+  // BLO-23061: a monitor armed WITHOUT an explicit maxAttempts is unbounded, so
+  // `exhaustedMonitorClearReason` never returns "max_attempts_exhausted" and the
+  // configured `recoveryPolicy: "wake_owner"` can never fire. Observed live on
+  // BLO-22305: 19 agent runs in 31 hours, each re-arming with an unchanged
+  // signature, no escalation, no human ever notified. The escalation machinery
+  // is complete and tested (see the test below) — it is simply unreachable
+  // without a default ceiling.
+  it("bounds a monitor armed without an explicit maxAttempts so owner recovery can still fire", async () => {
+    const { issueId, agentId } = await seedFixture({
+      monitorAttemptCount: DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS,
+      monitor: {
+        // Deliberately NO maxAttempts — this is the live shape on BLO-22305 and
+        // BLO-22361, both of which carry recoveryPolicy but maxAttempts: null.
+        recoveryPolicy: "wake_owner",
+      },
+    });
+    const heartbeat = createHeartbeat();
+    const tickAt = new Date("2026-04-11T12:31:00.000Z");
+
+    const result = await heartbeat.tickTimers(tickAt);
+
+    expect(result.enqueued).toBe(0);
+    expect(result.skipped).toBe(1);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(issue.monitorNextCheckAt).toBeNull();
+    expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({
+      status: "cleared",
+      clearReason: "max_attempts_exhausted",
+    });
+
+    const wakeup = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .then((rows) => rows[0] ?? null);
+    expect(wakeup?.reason).toBe("issue_monitor_recovery");
+  });
+
+  // Characterization test pinning the exact exhaustion boundary, so the shared
+  // limit helper cannot silently shift it by one. The scheduler compares
+  // `nextAttemptCount > maxAttempts` where `nextAttemptCount = prior + 1`, which
+  // is equivalent to `prior >= maxAttempts`. One attempt below the ceiling must
+  // still dispatch normally.
+  it("still dispatches one attempt below the default monitor ceiling", async () => {
+    const { issueId } = await seedFixture({
+      monitorAttemptCount: DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS - 1,
+      monitor: {
+        recoveryPolicy: "wake_owner",
+      },
+    });
+    const heartbeat = createHeartbeat();
+
+    const result = await heartbeat.tickTimers(new Date("2026-04-11T12:31:00.000Z"));
+
+    expect(result.enqueued).toBe(1);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({
+      status: "triggered",
+      attemptCount: DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS,
+    });
   });
 
   it("clears exhausted monitors and queues bounded owner recovery instead of another due check", async () => {

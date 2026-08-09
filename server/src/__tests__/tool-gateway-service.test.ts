@@ -732,6 +732,64 @@ describeEmbeddedPostgres("tool gateway service", () => {
     expect((result.result as { result?: { data?: { target?: string } } }).result?.data?.target).toBe("repo");
   });
 
+  it("refuses to approve a destructive-tool action request whose formal-approval link hasn't landed yet, instead of treating a null approvalId as no approval required (BLO-21490)", async () => {
+    // requestApprovalForRecordedToolCall() backfills the signature (making
+    // the row pass signature verification) before the slower interaction +
+    // approvalId link lands. A concurrent call to the generic
+    // approveActionRequest() endpoint landing in that gap must not read the
+    // still-null approvalId as "this tool never required formal approval" —
+    // that would let a destructive action execute without ever passing the
+    // board approval gate. Simulate the gap directly by clearing approvalId
+    // back to null after the row has otherwise fully settled.
+    const { company, agent, run } = await createRunFixture(db);
+    await db.insert(toolPolicies).values({
+      companyId: company.id,
+      name: "Review destructive tools",
+      policyType: "require_approval",
+      selectors: { toolName: "fixture:delete_everything" },
+    });
+    const gateway = createTestToolGatewayService(db, { pluginToolDispatcher: fakePluginDispatcher() });
+    const session = await gateway.createSession({
+      companyId: company.id,
+      agentId: agent.id,
+      runId: run.id,
+    });
+
+    await expect(gateway.executeTool({
+      sessionToken: session.token,
+      tool: "fixture:delete_everything",
+      parameters: { target: "repo" },
+    })).rejects.toMatchObject({ reasonCode: "approval_required" });
+
+    const [actionRequest] = await db.select().from(toolActionRequests);
+    expect(actionRequest.approvalId).toEqual(expect.any(String));
+    const realApprovalId = actionRequest.approvalId!;
+
+    await db.update(toolActionRequests)
+      .set({ approvalId: null, updatedAt: new Date() })
+      .where(eq(toolActionRequests.id, actionRequest.id));
+
+    await expect(gateway.approveActionRequest({
+      companyId: company.id,
+      actionRequestId: actionRequest.id,
+      actor: { userId: "board-user" },
+    })).rejects.toMatchObject({ reasonCode: "approval_link_pending" });
+
+    const [afterAttempt] = await db.select().from(toolActionRequests).where(eq(toolActionRequests.id, actionRequest.id));
+    expect(afterAttempt.status).toBe("pending");
+
+    // Once the link lands (the real-world outcome once the slower interaction
+    // creation finishes), the normal formal-approval gate applies again.
+    await db.update(toolActionRequests)
+      .set({ approvalId: realApprovalId, updatedAt: new Date() })
+      .where(eq(toolActionRequests.id, actionRequest.id));
+    await expect(gateway.approveActionRequest({
+      companyId: company.id,
+      actionRequestId: actionRequest.id,
+      actor: { userId: "board-user" },
+    })).rejects.toMatchObject({ reasonCode: "formal_approval_required" });
+  });
+
   it("maps remote MCP elicitation to a durable issue interaction", async () => {
     const { company, agent, run } = await createRunFixture(db);
     await createRemoteMcpToolFixture(db, company.id);

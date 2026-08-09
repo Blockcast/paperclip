@@ -1431,12 +1431,15 @@ describe("issue execution policy routes", () => {
             lastDecisionOutcome: "approved",
             lastDecisionId: expect.any(String),
           }),
+          expectedCurrentStatus: "in_review",
+          expectedCurrentExecutionState: issue.executionState,
+          expectedCurrentExecutionPolicy: issue.executionPolicy,
         }),
         expect.anything(),
       );
     });
 
-    it("lets the current stage participant decide when recovery or reassignment drifted the issue assignee", async () => {
+    it("lets the active stage participant decide even when the assignee field diverged", async () => {
       const divergedAssigneeAgentId = "44444444-4444-4444-8444-444444444444";
       const issue = {
         ...makeStuckReviewIssue(),
@@ -1453,7 +1456,7 @@ describe("issue execution policy routes", () => {
         type: "agent",
         agentId: mandateBoundParticipantAgentId,
         companyId: "company-1",
-        runId: "run-blo-18614-participant",
+        runId: "run-blo-20321-participant-drift",
       }))
         .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
         .send({
@@ -1477,11 +1480,10 @@ describe("issue execution policy routes", () => {
       );
     });
 
-    it("does not let the current stage participant carry the stage-decision exception into DELETE", async () => {
-      const divergedAssigneeAgentId = "44444444-4444-4444-8444-444444444444";
+    it("does not let a diverged stage participant smuggle unrelated edits through the decision path", async () => {
       const issue = {
         ...makeStuckReviewIssue(),
-        assigneeAgentId: divergedAssigneeAgentId,
+        assigneeAgentId: "44444444-4444-4444-8444-444444444444",
       };
       mockIssueService.getById.mockResolvedValue(issue);
 
@@ -1489,17 +1491,18 @@ describe("issue execution policy routes", () => {
         type: "agent",
         agentId: mandateBoundParticipantAgentId,
         companyId: "company-1",
-        runId: "run-blo-18614-participant-delete",
+        runId: "run-blo-20321-participant-drift-smuggle",
       }))
-        .delete("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
         .send({
           status: "done",
-          comment: "Trying to approve through the wrong route.",
+          title: "Unauthorized rewrite",
+          comment: "Trying to approve and rewrite task content.",
         });
 
       expect(res.status, JSON.stringify(res.body)).toBe(403);
       expect(res.body.error).toBe("Agent cannot mutate another agent's issue");
-      expect(mockIssueService.remove).not.toHaveBeenCalled();
+      expect(mockIssueService.update).not.toHaveBeenCalled();
     });
 
     it("still rejects an unrelated, unauthorized agent (regression: override does not open the stage to anyone)", async () => {
@@ -1720,6 +1723,68 @@ describe("issue execution policy routes", () => {
       expect(overrideCall?.resource?.assigneeAgentId).toBe(mandateBoundParticipantAgentId);
       expect(overrideCall?.resource?.assigneeAgentId).not.toBe(divergedAssigneeAgentId);
     });
+  });
+
+  it("pins the execution snapshot when updating a pending stage review request", async () => {
+    const executionPolicy = normalizeIssueExecutionPolicy({
+      stages: [{
+        id: "11111111-1111-4111-8111-111111111111",
+        type: "review",
+        participants: [{ type: "agent", agentId: "33333333-3333-4333-8333-333333333333" }],
+      }],
+    })!;
+    const executionState = {
+      status: "pending",
+      currentStageId: "11111111-1111-4111-8111-111111111111",
+      currentStageIndex: 0,
+      currentStageType: "review",
+      currentParticipant: { type: "agent", agentId: "33333333-3333-4333-8333-333333333333" },
+      returnAssignee: { type: "agent", agentId: "33333333-3333-4333-8333-333333333333" },
+      completedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+      reviewRequest: null,
+    };
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "in_review",
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1054",
+      title: "Concurrent review request",
+      executionPolicy,
+      executionState,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+
+    const res = await request(await createApp({
+      type: "agent",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      companyId: "company-1",
+      runId: "run-1",
+    }))
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ reviewRequest: { instructions: "Check the concurrency behavior." } });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      issue.id,
+      expect.objectContaining({
+        executionState: expect.objectContaining({
+          reviewRequest: { instructions: "Check the concurrency behavior." },
+        }),
+        expectedCurrentStatus: "in_review",
+        expectedCurrentExecutionState: executionState,
+        expectedCurrentExecutionPolicy: executionPolicy,
+      }),
+    );
   });
 
   describe("monitor convergence guard (BLO-18294)", () => {

@@ -22,6 +22,12 @@ export function canBoardManageRuntime(
   boardAccess: CurrentBoardAccess | undefined,
 ) {
   if (!companyId || !boardAccess) return false;
+  // `/cli-auth/me` also answers for agent actors, where `userId` is an agent id
+  // and `user` is null. An agent identity is not a board membership, and its
+  // empty `memberships` would otherwise fall through to the companyIds check
+  // below and read as "manage". No agent token drives this client today; this
+  // keeps the predicate honest if one ever does.
+  if (/^agent(_|$)/.test(boardAccess.source)) return false;
   if (boardAccess.source === "local_implicit" || boardAccess.isInstanceAdmin) return true;
   if (!boardAccess.memberships || boardAccess.memberships.length === 0) {
     return boardAccess.companyIds.includes(companyId);

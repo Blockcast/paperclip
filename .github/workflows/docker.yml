@@ -31,7 +31,9 @@ jobs:
     # Pushes publish immutable images; manual releases rebuild the approved SHA
     # so the deploy job can bind Helm to this run's recorded digest.
     if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
-    runs-on: arc-dind
+    # This job only needs a BuildKit client. Keep it off the warm-seeded DinD
+    # pool and execute the build on the persistent, Ceph-backed amd64 builders.
+    runs-on: arc-paperclip-buildkit
     timeout-minutes: 90
     concurrency:
       # A master push may supersede another publish build, but it must never
@@ -41,6 +43,7 @@ jobs:
     outputs:
       target_sha: ${{ steps.target.outputs.full }}
       image_digest: ${{ steps.build.outputs.digest }}
+      image_tag: ${{ steps.image_tag.outputs.value }}
     steps:
       - name: Validate target commit
         id: target
@@ -80,6 +83,29 @@ jobs:
             echo "Target ${full} is not reachable from master" >&2
             exit 1
           fi
+
+      # Manual and push builds for the same commit can overlap. A shared
+      # per-commit tag lets the later build overwrite the earlier build's tag,
+      # which makes the protected deploy reject its own recorded digest. Give
+      # each manual run attempt a private candidate tag; Helm still deploys by
+      # immutable digest, and push builds retain the readable commit tag.
+      - name: Resolve image tag
+        id: image_tag
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          TARGET_SHORT: ${{ steps.target.outputs.short }}
+        run: |
+          set -euo pipefail
+          if [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
+            value="sha-${TARGET_SHORT}-run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-k8s-vendored"
+          else
+            value="sha-${TARGET_SHORT}-k8s-vendored"
+          fi
+          if [[ ! "${value}" =~ ^sha-[0-9a-f]{7}(-run-[0-9]+-[0-9]+)?-k8s-vendored$ ]]; then
+            echo "Resolved image tag is invalid: ${value}" >&2
+            exit 1
+          fi
+          echo "value=${value}" >> "$GITHUB_OUTPUT"
 
       # Self-hosted runner reuses its workspace across builds. A previous
       # build (or a developer session sharing the same checkout dir) may
@@ -121,16 +147,8 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
         with:
-          # Tear the builder down at end-of-job so a corrupt content-store
-          # blob can't survive into the next run. Commit 822ebd0 bumped
-          # buildcache v2->v3 after the same `short read: expected
-          # 29780174 bytes but got 0: unexpected EOF` symptom — that fix
-          # held until v3 itself accumulated the same bad blob and master
-          # builds started failing again with the identical byte count.
-          # The persistent docker-container builder + registry cache
-          # combination is what carries the corruption forward; an
-          # ephemeral builder per run breaks the loop.
-          cleanup: true
+          driver: remote
+          endpoint: tcp://buildkit-amd64.ci.svc.cluster.local:1234
 
       # Runtime packages and global CLIs change far less often than /app.
       # Address the base by its inputs and only build it when that exact image
@@ -192,7 +210,9 @@ jobs:
             harbor.blockcast.net/paperclip/paperclip-runtime:latest
 
       # Tag scheme matches values.blockcast.yaml's expectation:
-      #   - `sha-<7>-k8s-vendored` per-commit tag the deploy step pins to
+      #   - `sha-<7>-k8s-vendored` per-commit tag for push builds
+      #   - `sha-<7>-run-<run>-<attempt>-k8s-vendored` private manual candidate
+      #   - `buildcache-<full-sha>-k8s-vendored` exact cache shared by retries
       #   - `latest-k8s-vendored` floating tag for ad-hoc pulls
       # The `-k8s-vendored` suffix marks a kkroo-fork build (vendored
       # adapter tarballs + ccrotate kkroo patch baked in via the
@@ -204,8 +224,8 @@ jobs:
           images: |
             harbor.blockcast.net/paperclip/paperclip
           tags: |
-            type=sha,prefix=sha-,suffix=-k8s-vendored,format=short,enable=${{ github.event_name != 'workflow_dispatch' }}
-            type=raw,value=sha-${{ steps.target.outputs.short }}-k8s-vendored,enable=${{ github.event_name == 'workflow_dispatch' }}
+            type=raw,value=${{ steps.image_tag.outputs.value }}
+            type=raw,value=buildcache-${{ steps.target.outputs.full }}-k8s-vendored
             type=raw,value=latest-k8s-vendored,enable=${{ github.ref == 'refs/heads/master' && github.event_name != 'workflow_dispatch' }}
 
       - name: Build and push
@@ -214,7 +234,10 @@ jobs:
         with:
           context: .
           platforms: linux/amd64
-          push: true
+          # Gzip level 1 cuts CPU spent materializing newly changed application
+          # layers. Keep force-compression disabled so imported cache layers
+          # retain their existing blobs instead of being recompressed.
+          outputs: type=image,push=true,compression=gzip,compression-level=1
           # Skip SBOM + provenance attestations. v6 adds them by default,
           # which makes the registry serve an OCI image index with
           # attestation-manifest entries containing very small blobs (550–750
@@ -227,14 +250,13 @@ jobs:
           sbom: false
           build-args: |
             RUNTIME_IMAGE=${{ steps.runtime.outputs.image }}
-          # Keep cache reads on Harbor, but publish current cache metadata
-          # inline with the image that this step already pushes. A separate
-          # mode=max registry exporter made deploy-critical builds wait after
-          # the image was available (run 29811211280 spent 164 s preparing the
-          # cache graph and only 16 s sending it). The frozen v6 cache remains
-          # a read-only migration fallback; latest-k8s-vendored becomes the
-          # continuously refreshed inline cache without a second exporter.
+          # Read the exact commit graph first. Manual release candidates use a
+          # run-scoped deployment tag, so without this stable cache tag a retry
+          # cannot address its earlier graph. The floating and frozen caches
+          # remain fallbacks for the first build of a commit. Cache metadata is
+          # published inline with all image tags to avoid a second exporter.
           cache-from: |
+            type=registry,ref=harbor.blockcast.net/paperclip/paperclip:buildcache-${{ steps.target.outputs.full }}-k8s-vendored
             type=registry,ref=harbor.blockcast.net/paperclip/paperclip:latest-k8s-vendored
             type=registry,ref=harbor.blockcast.net/paperclip/paperclip:buildcache-v6
           cache-to: type=inline
@@ -248,7 +270,7 @@ jobs:
           {
             echo "### Paperclip image"
             echo "- Commit: \`${{ steps.target.outputs.full }}\`"
-            echo "- Image: \`harbor.blockcast.net/paperclip/paperclip:sha-${{ steps.target.outputs.short }}-k8s-vendored@${{ steps.build.outputs.digest }}\`"
+            echo "- Image: \`harbor.blockcast.net/paperclip/paperclip:${{ steps.image_tag.outputs.value }}@${{ steps.build.outputs.digest }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
   deploy:
@@ -330,7 +352,7 @@ jobs:
 
       - name: Verify image tag exists
         env:
-          TAG: sha-${{ steps.target.outputs.short }}-k8s-vendored
+          TAG: ${{ needs.build-and-push.outputs.image_tag }}
         run: |
           set -e
           for i in 1 2 3; do
@@ -338,7 +360,7 @@ jobs:
               echo "tag ${TAG} present"
               exit 0
             fi
-            echo "tag ${TAG} not found (attempt $i) — retrying in 60s (a push build may still be running)"
+            echo "tag ${TAG} not found (attempt $i) — retrying in 60s for registry consistency"
             sleep 60
           done
           echo "tag ${TAG} missing after retries; failing this window — the next one retries" >&2
@@ -349,7 +371,7 @@ jobs:
         env:
           BUILD_RESULT: ${{ needs.build-and-push.result }}
           EXPECTED_DIGEST: ${{ needs.build-and-push.outputs.image_digest }}
-          TAG: sha-${{ steps.target.outputs.short }}-k8s-vendored
+          TAG: ${{ needs.build-and-push.outputs.image_tag }}
         run: |
           set -euo pipefail
           image="harbor.blockcast.net/paperclip/paperclip:${TAG}"
@@ -450,7 +472,8 @@ jobs:
           DIGEST: ${{ steps.artifact.outputs.digest }}
           NS: ${{ vars.PAPERCLIP_NAMESPACE || 'paperclip' }}
           RELEASE: ${{ vars.PAPERCLIP_HELM_RELEASE || 'paperclip' }}
-          TAG: sha-${{ steps.target.outputs.short }}-k8s-vendored
+          TAG: ${{ needs.build-and-push.outputs.image_tag }}
+          COMMIT: ${{ steps.target.outputs.full }}
           STAMP_SCRIPT: ${{ steps.tooling.outputs.stamp_script }}
         run: |
           set -euo pipefail
@@ -470,6 +493,7 @@ jobs:
           fi
 
           marker_key="paperclip.blockcast.net/approval-plan-sha256"
+          deployed_commit_key="paperclip.blockcast.net/deployed-commit"
           unstamped="${RUNNER_TEMP}/paperclip-api-unstamped.json"
           plan="${RUNNER_TEMP}/paperclip-api-plan.json"
 
@@ -479,7 +503,17 @@ jobs:
             --show-only templates/deployment-api.yaml \
             --set image.tag="${TAG}" \
             --set-string image.digest="${DIGEST}" \
-            | kubectl create --dry-run=client -n "${NS}" -o json -f - > "${unstamped}"
+            --set-string api.deployedCommit="${COMMIT}" \
+            | kubectl create --dry-run=client -n "${NS}" -o json -f - \
+            | jq --arg key "${deployed_commit_key}" --arg commit "${COMMIT}" '
+                .spec.template.metadata.annotations[$key] as $existing |
+                if $existing != null and $existing != $commit then
+                  error("paperclip-api render already carries a different deployed-commit annotation")
+                else
+                  .spec.template.metadata.annotations =
+                    ((.spec.template.metadata.annotations // {}) + {($key): $commit})
+                end
+              ' > "${unstamped}"
 
           canonical_unstamped=$(jq -cS --arg key "${marker_key}" '
             del(.spec.template.metadata.annotations[$key])
@@ -501,16 +535,25 @@ jobs:
             --show-only templates/deployment-api.yaml \
             --set image.tag="${TAG}" \
             --set-string image.digest="${DIGEST}" \
+            --set-string api.deployedCommit="${COMMIT}" \
             | PAPERCLIP_DEPLOY_NAMESPACE="${NS}" \
+              PAPERCLIP_DEPLOYED_COMMIT="${COMMIT}" \
               PAPERCLIP_APPROVAL_PLAN_SHA256="${marker}" "${STAMP_SCRIPT}" \
             | kubectl create --dry-run=client -n "${NS}" -o json -f - > "${plan}"
 
-          jq -e --arg key "${marker_key}" --arg marker "${marker}" --arg image "${expected_image}" --arg namespace "${NS}" '
+          jq -e \
+            --arg key "${marker_key}" \
+            --arg deployedCommitKey "${deployed_commit_key}" \
+            --arg marker "${marker}" \
+            --arg commit "${COMMIT}" \
+            --arg image "${expected_image}" \
+            --arg namespace "${NS}" '
             .apiVersion == "apps/v1" and
             .kind == "Deployment" and
             .metadata.namespace == $namespace and
             .metadata.name == "paperclip-api" and
             .spec.template.metadata.annotations[$key] == $marker and
+            .spec.template.metadata.annotations[$deployedCommitKey] == $commit and
             (.spec.template.spec.containers | all(.image == $image))
           ' "${plan}" >/dev/null
 
@@ -539,6 +582,7 @@ jobs:
           APPROVER_KUBECONFIG: ${{ secrets.KUBECONFIG_PAPERCLIP_RELEASE_APPROVER }}
           DIGEST: ${{ steps.artifact.outputs.digest }}
           APPROVE_SCRIPT: ${{ steps.tooling.outputs.approve_script }}
+          COMMIT: ${{ steps.target.outputs.full }}
           DEPLOY_PLAN: ${{ steps.plan.outputs.path }}
           NS: ${{ vars.PAPERCLIP_NAMESPACE || 'paperclip' }}
           # The approval window size is deliberately NOT set here. It is a
@@ -580,13 +624,14 @@ jobs:
             PAPERCLIP_APPROVED_SERVER_PLAN_OUT="${approved_server_plan}" \
             "${APPROVE_SCRIPT}" "${DIGEST}" "${DEPLOY_PLAN}" | tee "${approval_log}"
 
-          jq -e --arg namespace "${NS}" --arg digest "${DIGEST}" '
+          jq -e --arg namespace "${NS}" --arg digest "${DIGEST}" --arg commit "${COMMIT}" '
             .apiVersion == "apps/v1" and
             .kind == "Deployment" and
             .metadata.namespace == $namespace and
             .metadata.name == "paperclip-api" and
             ((.metadata.resourceVersion == null) or
               (.metadata.resourceVersion | type == "string" and length > 0)) and
+            .spec.template.metadata.annotations["paperclip.blockcast.net/deployed-commit"] == $commit and
             (.spec.template.spec.containers | all(.image == ("harbor.blockcast.net/paperclip/paperclip@" + $digest)))
           ' "${approved_server_plan}" >/dev/null
           echo "server_plan_path=${approved_server_plan}" >> "$GITHUB_OUTPUT"
@@ -606,12 +651,14 @@ jobs:
           DIGEST: ${{ steps.artifact.outputs.digest }}
           NS: ${{ vars.PAPERCLIP_NAMESPACE || 'paperclip' }}
           RELEASE: ${{ vars.PAPERCLIP_HELM_RELEASE || 'paperclip' }}
-          TAG: sha-${{ steps.target.outputs.short }}-k8s-vendored
+          TAG: ${{ needs.build-and-push.outputs.image_tag }}
+          COMMIT: ${{ steps.target.outputs.full }}
           PLAN_MARKER: ${{ steps.plan.outputs.marker }}
           APPROVED_SERVER_PLAN: ${{ steps.approval.outputs.server_plan_path }}
           APPROVE_SCRIPT: ${{ steps.tooling.outputs.approve_script }}
           STAMP_SCRIPT: ${{ steps.tooling.outputs.stamp_script }}
           PAPERCLIP_APPROVAL_PLAN_SHA256: ${{ steps.plan.outputs.marker }}
+          PAPERCLIP_DEPLOYED_COMMIT: ${{ steps.target.outputs.full }}
           PAPERCLIP_DEPLOY_NAMESPACE: ${{ vars.PAPERCLIP_NAMESPACE || 'paperclip' }}
         run: |
           set -euo pipefail
@@ -716,6 +763,7 @@ jobs:
             -f deploy/helm/paperclip/values.blockcast.yaml \
             --set image.tag="${TAG}" \
             --set-string image.digest="${DIGEST}" \
+            --set-string api.deployedCommit="${COMMIT}" \
             --post-renderer "${STAMP_SCRIPT}" \
             --atomic --wait --timeout 30m &
           helm_pid=$!
@@ -786,8 +834,10 @@ jobs:
           fi
           jq -e \
             --arg marker "${PLAN_MARKER}" \
+            --arg commit "${COMMIT}" \
             --arg image "harbor.blockcast.net/paperclip/paperclip@${DIGEST}" '
               .spec.template.metadata.annotations["paperclip.blockcast.net/approval-plan-sha256"] == $marker and
+              .spec.template.metadata.annotations["paperclip.blockcast.net/deployed-commit"] == $commit and
               (.spec.template.spec.containers | all(.image == $image))
             ' <<<"${live_json}" >/dev/null
 
