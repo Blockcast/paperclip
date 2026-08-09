@@ -280,6 +280,7 @@ import {
   type PenstockAvailabilityGate,
   type PenstockAvailabilityGateDenyResult,
 } from "./penstock-availability-gate.js";
+import { resolveCcrotateCapacityRetry, clampTransientRetryHorizon } from "./ccrotate-capacity-retry.js";
 import {
   evaluateExecutionAllowlist,
   isExecutionForcedToKubernetes,
@@ -13583,8 +13584,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
           return { outcome: "not_promoted", run: exhausted };
         }
-        const nextDueAt =
-          capacity.resumeAt ?? new Date(now.getTime() + CCROTATE_CAPACITY_DEFAULT_RETRY_DELAY_MS);
+        // BLO-23438: clamp + jitter rather than honouring the advertised reset
+        // verbatim. This is the only path that can shorten a park, and it runs
+        // solely when the run is already due, so an unbounded horizon here
+        // freezes the task until that horizon even after capacity returns.
+        const capacityRetryPlan = resolveCcrotateCapacityRetry({
+          resumeAt: capacity.resumeAt,
+          now,
+          defaultRetryDelayMs: CCROTATE_CAPACITY_DEFAULT_RETRY_DELAY_MS,
+        });
+        const nextDueAt = capacityRetryPlan.retryAt;
         const rescheduled = await db
           .update(heartbeatRuns)
           .set({ scheduledRetryAttempt: nextAttempt, scheduledRetryAt: nextDueAt, updatedAt: now })
@@ -13608,6 +13617,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               scheduledRetryAt: nextDueAt.toISOString(),
               ccrotateTarget: capacity.target,
               providerCapacityReason: capacity.reason,
+              ...(capacityRetryPlan.clampedFromIso
+                ? { capacityParkClampedFrom: capacityRetryPlan.clampedFromIso }
+                : {}),
               ...(capacity.penstockProvider ? { penstockProvider: capacity.penstockProvider } : {}),
               ...(capacity.penstockModel ? { penstockModel: capacity.penstockModel } : {}),
               ...(capacity.penstockRetryAfterSeconds !== undefined
@@ -14112,12 +14124,30 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
     }
 
+    // BLO-23438: the advertised floor is honoured, but not unboundedly. Without
+    // a ceiling any run finalized with a far-future `retryNotBefore` parks until
+    // that instant — the in-run k8s ccrotate path breaks out precisely to hand
+    // this scheduler a multi-day reset, so clamping the capacity gate alone
+    // leaves this route to the same freeze wide open.
+    //
+    // `provider_quota` is deliberately exempt. That family carries a contractual
+    // window boundary (a session/billing reset), not a capacity estimate:
+    // retrying before it fails deterministically, so clamping would just burn
+    // attempts against a wall. The horizons this ticket is about are capacity
+    // guesses, which are the ones that go stale or arrive fabricated.
+    const clampTransientHorizon =
+      transientRetryNotBefore !== null && transientRecovery?.errorFamily !== "provider_quota";
+    const clampedTransientRetry =
+      clampTransientHorizon && transientRetryNotBefore
+        ? clampTransientRetryHorizon({ retryNotBefore: transientRetryNotBefore, now })
+        : null;
+    const effectiveRetryNotBefore = clampedTransientRetry?.dueAt ?? transientRetryNotBefore;
     const schedule =
-      transientRetryNotBefore && transientRetryNotBefore.getTime() > baseSchedule.dueAt.getTime()
+      effectiveRetryNotBefore && effectiveRetryNotBefore.getTime() > baseSchedule.dueAt.getTime()
         ? {
             ...baseSchedule,
-            dueAt: transientRetryNotBefore,
-            delayMs: Math.max(0, transientRetryNotBefore.getTime() - now.getTime()),
+            dueAt: effectiveRetryNotBefore,
+            delayMs: Math.max(0, effectiveRetryNotBefore.getTime() - now.getTime()),
           }
         : baseSchedule;
 
@@ -14191,6 +14221,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       scheduledRetryAttempt: schedule.attempt,
       scheduledRetryAt: schedule.dueAt.toISOString(),
       ...(transientRetryNotBefore ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
+      ...(clampedTransientRetry?.clampedFromIso
+        ? { transientRetryHorizonClampedFrom: clampedTransientRetry.clampedFromIso }
+        : {}),
       ...(transientRecovery?.errorFamily === "provider_quota" && transientRetryNotBefore
         ? { providerQuotaRetryNotBefore: transientRetryNotBefore.toISOString() }
         : {}),
@@ -24980,9 +25013,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     async function persistProviderCapacityRetry(gateResult: PenstockAvailabilityGateDenyResult) {
-      const resumeAtIso = gateResult.resumeAt ? gateResult.resumeAt.toISOString() : null;
-      const scheduledRetryAt =
-        gateResult.resumeAt ?? new Date(Date.now() + CCROTATE_CAPACITY_DEFAULT_RETRY_DELAY_MS);
+      // BLO-23438: the provider's advertised reset is a hint, not a commitment.
+      // Honouring it verbatim parked ~76 runs five days out off one denial, and
+      // because `scheduled_retry` coalesces without resetting `scheduledRetryAt`
+      // every later wake on the task inherited that horizon. Clamp to a ceiling
+      // so we re-probe, and jitter so a cohort denied against one reset does not
+      // release in lockstep.
+      //
+      // `retryNotBefore` carries the CLAMPED instant, not the advertised one.
+      // Several paths treat it as a retry floor rather than as documentation --
+      // scheduleBoundedRetryForRun pushes a bounded retry out to it whenever it
+      // is later than the computed due time -- so leaving a five-day advertised
+      // value there would reintroduce the very park this clamp removes, on the
+      // next failure of the same run. The provider's claim is preserved
+      // verbatim under its own key instead.
+      const capacityRetryPlan = resolveCcrotateCapacityRetry({
+        resumeAt: gateResult.resumeAt,
+        now: new Date(),
+        defaultRetryDelayMs: CCROTATE_CAPACITY_DEFAULT_RETRY_DELAY_MS,
+      });
+      const advertisedResumeAtIso = gateResult.resumeAt ? gateResult.resumeAt.toISOString() : null;
+      const scheduledRetryAt = capacityRetryPlan.retryAt;
+      const resumeAtIso = scheduledRetryAt.toISOString();
       // BLO-18859 review follow-up: a capacity deferral is late, not lost — but
       // only if whoever promotes this run can still tell which delivery it
       // settles. Derive the label here, where `opts` is in hand and the exact
@@ -24999,6 +25051,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         penstockModel: gateResult.model,
         ...(githubReviewWakeReason !== null ? { githubReviewWakeReason } : {}),
         ...(resumeAtIso ? { penstockResumeAt: resumeAtIso } : {}),
+        ...(advertisedResumeAtIso ? { penstockAdvertisedResumeAt: advertisedResumeAtIso } : {}),
+        ...(capacityRetryPlan.clampedFromIso
+          ? { penstockCapacityParkClampedFrom: capacityRetryPlan.clampedFromIso }
+          : {}),
       };
       const retryContextSnapshot = githubReviewWakeReason !== null
         ? { ...retryContextSnapshotBase, [GITHUB_REVIEW_DELIVERY_COUNT_KEY]: 1 }
@@ -25106,6 +25162,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             resultJson: {
               errorFamily: "rate_limit_exhausted",
               ...(resumeAtIso ? { retryNotBefore: resumeAtIso, transientRetryNotBefore: resumeAtIso } : {}),
+              ...(advertisedResumeAtIso
+                ? { penstockAdvertisedResumeAt: advertisedResumeAtIso }
+                : {}),
+              ...(capacityRetryPlan.clampedFromIso
+                ? { penstockCapacityParkClampedFrom: capacityRetryPlan.clampedFromIso }
+                : {}),
               penstockProvider: gateResult.provider,
               penstockModel: gateResult.model,
               penstockReason: gateResult.reason,
