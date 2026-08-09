@@ -45,7 +45,7 @@ export function isIdempotentFinishSuccessfulRunHandoffWakeStatus(status: string)
 type HeartbeatRunRow = typeof heartbeatRuns.$inferSelect;
 type IssueRow = Pick<
   typeof issues.$inferSelect,
-  "id" | "companyId" | "identifier" | "title" | "status" | "assigneeAgentId" | "assigneeUserId" | "executionState"
+  "id" | "companyId" | "identifier" | "title" | "status" | "workMode" | "assigneeAgentId" | "assigneeUserId" | "executionState"
 >;
 type AgentRow = Pick<typeof agents.$inferSelect, "id" | "companyId" | "status">;
 type NoticeIssue = Pick<typeof issues.$inferSelect, "id" | "identifier" | "title" | "status">;
@@ -351,14 +351,20 @@ function isProductiveSuccessfulRun(input: {
 export function buildSuccessfulRunHandoffInstruction(input: {
   issueIdentifier: string | null;
   sourceRunId: string;
+  workMode: IssueRow["workMode"];
 }) {
   const issueLabel = input.issueIdentifier ?? "this issue";
+  const isPlanningContinuation = input.workMode === "planning";
   return [
     `Your previous run on ${issueLabel} succeeded, but the issue is still in \`in_progress\` and Paperclip cannot identify a valid issue disposition.`,
     "",
-    "This is a status-only retry to the original agent. Record a disposition; do not start new work.",
+    isPlanningContinuation
+      ? "This is a normal-model planning continuation. Complete the required plan or issue-document update, then record a disposition. Do not begin implementation."
+      : "This is a status-only retry to the original agent. Record a disposition; do not start new work.",
     "",
-    "Resolve the missing disposition before creating or revising any new artifacts. Choose **exactly one** outcome and perform the matching Paperclip action:",
+    isPlanningContinuation
+      ? "Finish the planning deliverable, then choose **exactly one** outcome and perform the matching Paperclip action:"
+      : "Resolve the missing disposition before creating or revising any new artifacts. Choose **exactly one** outcome and perform the matching Paperclip action:",
     "",
     "**Is the issue finished?**",
     "1. Mark it `done` (scope complete) or `cancelled` (intentionally stopped).",
@@ -372,7 +378,9 @@ export function buildSuccessfulRunHandoffInstruction(input: {
     "**Is there more work to do?**",
     `4. Either delegate follow-up work (create/link a follow-up issue and block this one on it, or close this issue if its scope is independently complete) or record an explicit continuation path with \`resumeIntent: true\`, \`resumeFromRunId: ${input.sourceRunId}\`, and a concrete next action. Do not perform the remaining source work in this recovery run; the follow-up/resume wake must use the normal model lane.`,
     "",
-    "Comments, document revisions, work-product writes, and continuation summaries are supporting evidence only — they do not satisfy this handoff unless the issue state/path also records one valid disposition. If this wake is status-only recovery, document or plan updates are not allowed.",
+    isPlanningContinuation
+      ? "The plan or issue-document revision is the required deliverable, but it does not satisfy this handoff unless the issue state/path also records one valid disposition."
+      : "Comments, document revisions, work-product writes, and continuation summaries are supporting evidence only — they do not satisfy this handoff unless the issue state/path also records one valid disposition. If this wake is status-only recovery, document or plan updates are not allowed.",
   ].join("\n");
 }
 
@@ -445,8 +453,10 @@ export function decideSuccessfulRunHandoff(input: {
   const instruction = buildSuccessfulRunHandoffInstruction({
     issueIdentifier: issue.identifier,
     sourceRunId: run.id,
+    workMode: issue.workMode,
   });
-  const payload = withRecoveryModelProfileHint({
+  const workClass = issue.workMode === "planning" ? "normal_model" : "status_only";
+  const payloadInput = {
     issueId: issue.id,
     taskId: issue.id,
     sourceIssueId: issue.id,
@@ -463,7 +473,10 @@ export function decideSuccessfulRunHandoff(input: {
     resumeFromRunId: run.id,
     ...(input.taskKey ? { taskKey: input.taskKey } : {}),
     instruction,
-  }, "status_only");
+  };
+  const payload = workClass === "normal_model"
+    ? withRecoveryModelProfileHint(payloadInput, "normal_model")
+    : withRecoveryModelProfileHint(payloadInput, "status_only");
 
   return {
     kind: "enqueue",
@@ -474,10 +487,16 @@ export function decideSuccessfulRunHandoff(input: {
     }),
     payload,
     instruction,
-    contextSnapshot: withRecoveryModelProfileHint({
-      ...payload,
-      wakeReason: FINISH_SUCCESSFUL_RUN_HANDOFF_REASON,
-      livenessState: input.livenessState,
-    }, "status_only"),
+    contextSnapshot: workClass === "normal_model"
+      ? withRecoveryModelProfileHint({
+        ...payload,
+        wakeReason: FINISH_SUCCESSFUL_RUN_HANDOFF_REASON,
+        livenessState: input.livenessState,
+      }, "normal_model")
+      : withRecoveryModelProfileHint({
+        ...payload,
+        wakeReason: FINISH_SUCCESSFUL_RUN_HANDOFF_REASON,
+        livenessState: input.livenessState,
+      }, "status_only"),
   };
 }
