@@ -932,6 +932,22 @@ describe("renderPaperclipWakePrompt", () => {
     expect(fallbackPrompt).toContain("- fallback fetch needed: yes");
   });
 
+  it("prohibits credential-bearing GitHub diagnostics on fresh and resumed wakes", () => {
+    const payload = {
+      reason: "issue_assigned",
+      issue: { id: "issue-1", identifier: "PAP-1581", title: "Check GitHub auth" },
+    };
+
+    for (const prompt of [
+      renderPaperclipWakePrompt(payload),
+      renderPaperclipWakePrompt(payload, { resumedSession: true }),
+    ]) {
+      expect(prompt).toContain("never run `gh auth status`");
+      expect(prompt).toContain("`gh api user --jq .login`");
+      expect(prompt).toContain("never emit credential values");
+    }
+  });
+
   it("renders the execution workspace branch guard only on non-resumed sessions", () => {
     const payload = {
       reason: "issue_assigned",
