@@ -247,6 +247,9 @@ import {
   resolveEffectiveWorkspaceStrategyType,
   resolveExecutionWorkspaceEnvironmentId,
   resolveExecutionWorkspaceMode,
+  WORKSPACE_PREFLIGHT_BLOCKED_ACTIVITY_ACTION,
+  WORKSPACE_PREFLIGHT_CLEARED_ACTIVITY_ACTION,
+  WORKSPACE_PREFLIGHT_STATE_ACTIVITY_ACTIONS,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION,
@@ -25976,7 +25979,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               actorId: "system",
               agentId,
               runId: null,
-              action: "issue.workspace_preflight_blocked",
+              action: WORKSPACE_PREFLIGHT_BLOCKED_ACTIVITY_ACTION,
               entityType: "issue",
               entityId: issue.id,
               details: {
@@ -25992,6 +25995,45 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               },
             });
             return { kind: "skipped" as const };
+          }
+        }
+
+        // Workspace-preflight activity represents the current unresolved
+        // hold, not a permanent historical fact. Only append a resolved event
+        // when this retry has passed the preflight path, so an operator repair
+        // unblocks later dependency promotion without producing an event for
+        // every ordinary wake.
+        if (!activeExecutionRun && issue.status !== "done" && issue.status !== "cancelled") {
+          const latestWorkspacePreflightState = await tx
+            .select({ action: activityLog.action })
+            .from(activityLog)
+            .where(and(
+              eq(activityLog.companyId, issue.companyId),
+              eq(activityLog.entityType, "issue"),
+              eq(activityLog.entityId, issue.id),
+              inArray(activityLog.action, WORKSPACE_PREFLIGHT_STATE_ACTIVITY_ACTIONS),
+            ))
+            .orderBy(desc(activityLog.createdAt), desc(activityLog.id))
+            .limit(1)
+            .then((rows) => rows[0] ?? null);
+          if (latestWorkspacePreflightState?.action === WORKSPACE_PREFLIGHT_BLOCKED_ACTIVITY_ACTION) {
+            await logActivity(tx as unknown as Db, {
+              companyId: issue.companyId,
+              actorType: "system",
+              actorId: "system",
+              agentId,
+              runId: null,
+              action: WORKSPACE_PREFLIGHT_CLEARED_ACTIVITY_ACTION,
+              entityType: "issue",
+              entityId: issue.id,
+              details: {
+                code: WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE,
+                reason: "A retry passed workspace preflight after the workspace configuration was repaired.",
+                requestedReason: reason,
+                source,
+                triggerDetail,
+              },
+            });
           }
         }
 

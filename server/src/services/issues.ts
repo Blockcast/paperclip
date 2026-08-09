@@ -86,6 +86,8 @@ import {
   parseIssueExecutionWorkspaceSettings,
   parseProjectExecutionWorkspacePolicy,
   resolvePinnedIssueWorkspaceStrategyType,
+  WORKSPACE_PREFLIGHT_BLOCKED_ACTIVITY_ACTION,
+  WORKSPACE_PREFLIGHT_STATE_ACTIVITY_ACTIONS,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION,
@@ -3683,24 +3685,33 @@ export async function listBlockedIssueAutoResumeSuppressions(
     }
   }
 
+  // The latest blocked/cleared activity is the durable preflight state, like
+  // successful-run handoff activity. Older failures remain audit history. A
+  // still-blocked state is also rechecked against the two documented operator
+  // remediations, so a direct project/workspace repair cannot be held hostage
+  // by an earlier event while the retry is being scheduled.
   const workspacePreflightRows = await dbOrTx
-    .select({ issueId: activityLog.entityId })
+    .select({ issueId: activityLog.entityId, action: activityLog.action })
     .from(activityLog)
     .where(
       and(
         eq(activityLog.companyId, companyId),
         eq(activityLog.entityType, "issue"),
-        eq(activityLog.action, "issue.workspace_preflight_blocked"),
+        inArray(activityLog.action, WORKSPACE_PREFLIGHT_STATE_ACTIVITY_ACTIONS),
         inArray(activityLog.entityId, uniqueIssueIds),
       ),
-    );
-  const workspacePreflightIssueIds = [...new Set(workspacePreflightRows.map((row) => row.issueId))];
+    )
+    .orderBy(desc(activityLog.createdAt), desc(activityLog.id));
+  const latestWorkspacePreflightStateByIssueId = new Map<string, string>();
+  for (const row of workspacePreflightRows) {
+    if (!latestWorkspacePreflightStateByIssueId.has(row.issueId)) {
+      latestWorkspacePreflightStateByIssueId.set(row.issueId, row.action);
+    }
+  }
+  const workspacePreflightIssueIds = [...latestWorkspacePreflightStateByIssueId]
+    .filter(([, action]) => action === WORKSPACE_PREFLIGHT_BLOCKED_ACTIVITY_ACTION)
+    .map(([issueId]) => issueId);
   if (workspacePreflightIssueIds.length > 0) {
-    // The activity-log row only records that the combo was unrunnable at write time; it is
-    // never retracted, so it must not be treated as a permanent hold. Re-check the same
-    // project/reusable-workspace condition live — once an operator attaches a project or binds a
-    // reusable workspace (the two remediations named in the original block comment), this issue
-    // is runnable again and must stop being suppressed.
     const workspaceStateRows = await dbOrTx
       .select({
         id: issues.id,

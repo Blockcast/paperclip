@@ -14,6 +14,12 @@ export const WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION =
   "Attach a project to the task, or bind a reusable execution workspace, then retry.";
 export const WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE =
   `This task is set to run in an isolated git worktree, but it has no project and no reusable execution workspace to create the worktree from. ${WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION}`;
+export const WORKSPACE_PREFLIGHT_BLOCKED_ACTIVITY_ACTION = "issue.workspace_preflight_blocked";
+export const WORKSPACE_PREFLIGHT_CLEARED_ACTIVITY_ACTION = "issue.workspace_preflight_cleared";
+export const WORKSPACE_PREFLIGHT_STATE_ACTIVITY_ACTIONS = [
+  WORKSPACE_PREFLIGHT_BLOCKED_ACTIVITY_ACTION,
+  WORKSPACE_PREFLIGHT_CLEARED_ACTIVITY_ACTION,
+] as const;
 
 type WorkspaceStrategyType = ExecutionWorkspaceStrategy["type"];
 
