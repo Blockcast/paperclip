@@ -143,6 +143,41 @@ const ISSUE_LIST_RELATED_QUERY_CHUNK_SIZE = 500;
 export const MAX_CHILD_ISSUES_CREATED_BY_HELPER = 25;
 const MAX_CHILD_COMPLETION_SUMMARIES = 20;
 const CHILD_COMPLETION_SUMMARY_BODY_MAX_CHARS = 500;
+
+function preserveInReviewExecutionStageCheckoutCondition() {
+  return sql`(
+    ${issues.status} = 'in_review'
+    AND ${issues.executionState} ->> 'status' = 'pending'
+    AND coalesce(${issues.executionState} -> 'currentParticipant', 'null'::jsonb) <> 'null'::jsonb
+  )`;
+}
+
+function checkoutStatusForCurrentRow() {
+  return sql<string>`CASE
+    WHEN ${preserveInReviewExecutionStageCheckoutCondition()} THEN 'in_review'
+    ELSE 'in_progress'
+  END`;
+}
+
+function checkoutStartedAtForCurrentRow(now: Date) {
+  const nowIso = now.toISOString();
+  return sql<Date | null>`CASE
+    WHEN ${preserveInReviewExecutionStageCheckoutCondition()} THEN ${issues.startedAt}
+    WHEN ${issues.status} = 'in_progress' THEN ${issues.startedAt}
+    ELSE ${nowIso}::timestamptz
+  END`;
+}
+
+export type PendingInReviewRunOwnershipReceipt = {
+  issueId: string;
+  status: string;
+  assigneeAgentId: string | null;
+  assigneeUserId: string | null;
+  checkoutRunId: string | null;
+  executionRunId: string | null;
+  executionState: Record<string, unknown> | null;
+  executionPolicy: Record<string, unknown> | null;
+};
 // Non-human author sentinels that agents post under. These ARE eligible for
 // agent-attribution derivation even though `local-board` is also materialized
 // as a row in the `user` table (it is the implicit board admin). Genuine human
@@ -827,6 +862,7 @@ type AcceptedPlanDecompositionInput = {
   actorAgentId?: string | null;
   actorUserId?: string | null;
   actorRunId?: string | null;
+  expectedSourceIssueRunOwnership?: Omit<PendingInReviewRunOwnershipReceipt, "issueId"> | null;
 };
 type AcceptedPlanDocumentInteraction = {
   id: string;
@@ -4723,6 +4759,41 @@ export function issueService(db: Db) {
     });
   }
 
+  async function lockPendingInReviewRunOwnership(
+    receipt: PendingInReviewRunOwnershipReceipt,
+    dbOrTx: any = db,
+  ) {
+    const conditions = [
+      eq(issues.id, receipt.issueId),
+      eq(issues.status, receipt.status),
+      receipt.assigneeAgentId === null
+        ? isNull(issues.assigneeAgentId)
+        : eq(issues.assigneeAgentId, receipt.assigneeAgentId),
+      receipt.assigneeUserId === null
+        ? isNull(issues.assigneeUserId)
+        : eq(issues.assigneeUserId, receipt.assigneeUserId),
+      receipt.checkoutRunId === null
+        ? isNull(issues.checkoutRunId)
+        : eq(issues.checkoutRunId, receipt.checkoutRunId),
+      receipt.executionRunId === null
+        ? isNull(issues.executionRunId)
+        : eq(issues.executionRunId, receipt.executionRunId),
+      receipt.executionState === null
+        ? isNull(issues.executionState)
+        : sql`${issues.executionState} = ${JSON.stringify(receipt.executionState)}::jsonb`,
+      receipt.executionPolicy === null
+        ? isNull(issues.executionPolicy)
+        : sql`${issues.executionPolicy} = ${JSON.stringify(receipt.executionPolicy)}::jsonb`,
+    ];
+
+    return dbOrTx
+      .select({ id: issues.id })
+      .from(issues)
+      .where(and(...conditions))
+      .for("update")
+      .then((rows: Array<{ id: string }>) => rows[0] ?? null);
+  }
+
   function normalizeCreateIssueTitle(title: string) {
     return title.trim().replace(/\s+/g, " ").toLowerCase();
   }
@@ -8031,12 +8102,33 @@ export function issueService(db: Db) {
         .then((rows) => rows[0] ?? null);
       if (!sourceIssue) throw notFound("Source issue not found");
 
+      const lockExpectedSourceIssueRunOwnership = async (tx: any) => {
+        const expected = data.expectedSourceIssueRunOwnership;
+        if (!expected) return;
+        const locked = await lockPendingInReviewRunOwnership({
+          issueId: sourceIssue.id,
+          ...expected,
+        }, tx);
+        if (!locked) {
+          throw conflict("Issue run ownership conflict", {
+            issueId: sourceIssue.id,
+            expectedStatus: expected.status,
+            expectedAssigneeAgentId: expected.assigneeAgentId,
+            expectedAssigneeUserId: expected.assigneeUserId,
+            expectedCheckoutRunId: expected.checkoutRunId,
+            expectedExecutionRunId: expected.executionRunId,
+            expectedExecutionPolicy: true,
+          });
+        }
+      };
+
       const requestFingerprint = createAcceptedPlanDecompositionRequestFingerprint({
         acceptedPlanRevisionId: data.acceptedPlanRevisionId,
         children: data.children,
       });
 
       const initialClaim = await db.transaction(async (tx) => {
+        await lockExpectedSourceIssueRunOwnership(tx);
         await tx.execute(sql`select ${issues.id} from ${issues} where ${issues.id} = ${sourceIssue.id} for update`);
 
         const belongsToPlanDocument = await tx
@@ -8109,6 +8201,7 @@ export function issueService(db: Db) {
 
       while (true) {
         const step = await db.transaction(async (tx) => {
+          await lockExpectedSourceIssueRunOwnership(tx);
           await tx.execute(
             sql`select ${issuePlanDecompositions.id}
                 from ${issuePlanDecompositions}
@@ -8840,6 +8933,8 @@ export function issueService(db: Db) {
          * version when the statement blocks on a concurrent transaction.
          */
         expectedCurrentAssigneeAgentId?: string | null;
+        /** Pins the human assignee when ownership is authorization-relevant. */
+        expectedCurrentAssigneeUserId?: string | null;
         /**
          * Pins run ownership that authorized a current-run agent mutation. A force
          * release and checkout transfer can leave status/execution JSON unchanged
@@ -8873,6 +8968,7 @@ export function issueService(db: Db) {
         actorUserId,
         expectedCurrentStatus,
         expectedCurrentAssigneeAgentId,
+        expectedCurrentAssigneeUserId,
         expectedCurrentCheckoutRunId,
         expectedCurrentExecutionRunId,
         expectedCurrentExecutionState,
@@ -8895,6 +8991,16 @@ export function issueService(db: Db) {
           issueId: id,
           expectedAssigneeAgentId: expectedCurrentAssigneeAgentId,
           currentAssigneeAgentId: existing.assigneeAgentId,
+        });
+      }
+      if (
+        expectedCurrentAssigneeUserId !== undefined &&
+        existing.assigneeUserId !== expectedCurrentAssigneeUserId
+      ) {
+        throw conflict("Issue user assignee changed before the update could be applied", {
+          issueId: id,
+          expectedAssigneeUserId: expectedCurrentAssigneeUserId,
+          currentAssigneeUserId: existing.assigneeUserId,
         });
       }
       if (
@@ -9335,6 +9441,13 @@ export function issueService(db: Db) {
                   ? isNull(issues.assigneeAgentId)
                   : eq(issues.assigneeAgentId, expectedCurrentAssigneeAgentId),
               ]),
+          ...(expectedCurrentAssigneeUserId === undefined
+            ? []
+            : [
+                expectedCurrentAssigneeUserId === null
+                  ? isNull(issues.assigneeUserId)
+                  : eq(issues.assigneeUserId, expectedCurrentAssigneeUserId),
+              ]),
           ...(expectedCurrentCheckoutRunId === undefined
             ? []
             : [
@@ -9396,6 +9509,9 @@ export function issueService(db: Db) {
               ...(expectedCurrentAssigneeAgentId === undefined
                 ? {}
                 : { expectedAssigneeAgentId: expectedCurrentAssigneeAgentId }),
+              ...(expectedCurrentAssigneeUserId === undefined
+                ? {}
+                : { expectedAssigneeUserId: expectedCurrentAssigneeUserId }),
               ...(expectedCurrentCheckoutRunId === undefined
                 ? {}
                 : { expectedCheckoutRunId: expectedCurrentCheckoutRunId }),
@@ -9523,6 +9639,11 @@ export function issueService(db: Db) {
       return cleared;
     },
 
+    lockPendingInReviewRunOwnership: (
+      receipt: PendingInReviewRunOwnershipReceipt,
+      dbOrTx: any = db,
+    ) => lockPendingInReviewRunOwnership(receipt, dbOrTx),
+
     remove: (id: string) =>
       db.transaction(async (tx) => {
         const attachmentAssetIds = await tx
@@ -9572,6 +9693,7 @@ export function issueService(db: Db) {
       checkoutRunId: string | null,
       options: {
         allowSourceScopedRecoveryOwner?: boolean;
+        allowPendingExecutionParticipant?: boolean;
         recoveryActionId?: string | null;
         recoveryActionStatus?: string | null;
       } = {},
@@ -9623,6 +9745,22 @@ export function issueService(db: Db) {
       const executionLockCondition = checkoutRunId
         ? or(isNull(issues.executionRunId), eq(issues.executionRunId, checkoutRunId))
         : isNull(issues.executionRunId);
+      const unassignedIssueCondition = and(isNull(issues.assigneeAgentId), isNull(issues.assigneeUserId));
+      const pendingExecutionStageCondition = preserveInReviewExecutionStageCheckoutCondition();
+      const nonPendingExecutionStageCondition = sql`NOT (${pendingExecutionStageCondition})`;
+      const unassignedCheckoutCondition = and(unassignedIssueCondition, nonPendingExecutionStageCondition);
+      const sameRunAssigneeCheckoutCondition = and(
+        sameRunAssigneeCondition,
+        nonPendingExecutionStageCondition,
+      );
+      const pendingExecutionParticipantCondition = options.allowPendingExecutionParticipant
+        ? sql`(
+          ${issues.status} = 'in_review'
+          AND ${issues.executionState} ->> 'status' = 'pending'
+          AND ${issues.executionState} -> 'currentParticipant' ->> 'type' = 'agent'
+          AND ${issues.executionState} -> 'currentParticipant' ->> 'agentId' = ${agentId}
+        )`
+        : undefined;
       const activeRecoveryOwnerCondition = options.allowSourceScopedRecoveryOwner
         ? exists(
           db
@@ -9645,12 +9783,16 @@ export function issueService(db: Db) {
         tx
           .update(issues)
           .set({
-            assigneeAgentId: agentId,
-            assigneeUserId: null,
+            assigneeAgentId: pendingExecutionParticipantCondition
+              ? sql`CASE WHEN ${pendingExecutionParticipantCondition} THEN ${issues.assigneeAgentId} ELSE ${agentId} END`
+              : agentId,
+            assigneeUserId: pendingExecutionParticipantCondition
+              ? sql`CASE WHEN ${pendingExecutionParticipantCondition} THEN ${issues.assigneeUserId} ELSE NULL END`
+              : null,
             checkoutRunId,
             ...checkoutExecutionPatch,
-            status: "in_progress",
-            startedAt: now,
+            status: checkoutStatusForCurrentRow(),
+            startedAt: checkoutStartedAtForCurrentRow(now),
             updatedAt: now,
           })
           .where(
@@ -9658,8 +9800,13 @@ export function issueService(db: Db) {
               eq(issues.id, id),
               inArray(issues.status, expectedStatuses),
               activeRecoveryOwnerCondition
-                ? or(isNull(issues.assigneeAgentId), sameRunAssigneeCondition, activeRecoveryOwnerCondition)
-                : or(isNull(issues.assigneeAgentId), sameRunAssigneeCondition),
+                ? or(
+                  unassignedCheckoutCondition,
+                  sameRunAssigneeCheckoutCondition,
+                  and(activeRecoveryOwnerCondition, nonPendingExecutionStageCondition),
+                  pendingExecutionParticipantCondition,
+                )
+                : or(unassignedCheckoutCondition, sameRunAssigneeCheckoutCondition, pendingExecutionParticipantCondition),
               executionLockCondition,
             ),
           )
@@ -9690,14 +9837,27 @@ export function issueService(db: Db) {
           id: issues.id,
           status: issues.status,
           assigneeAgentId: issues.assigneeAgentId,
+          assigneeUserId: issues.assigneeUserId,
           checkoutRunId: issues.checkoutRunId,
           executionRunId: issues.executionRunId,
+          executionState: issues.executionState,
         })
         .from(issues)
         .where(eq(issues.id, id))
         .then((rows) => rows[0] ?? null);
 
       if (!current) throw notFound("Issue not found");
+      const currentHasPendingExecutionStage =
+        current.status === "in_review" &&
+        !!current.executionState &&
+        typeof current.executionState === "object" &&
+        (current.executionState as { status?: unknown }).status === "pending";
+      const currentCheckoutActorIsEligible =
+        (currentHasPendingExecutionStage && options.allowPendingExecutionParticipant === true) ||
+        (!currentHasPendingExecutionStage && (
+          current.assigneeAgentId === agentId ||
+          (current.assigneeAgentId == null && current.assigneeUserId == null)
+        ));
 
       if (options.allowSourceScopedRecoveryOwner && current.assigneeAgentId !== agentId) {
         throw conflict("Issue checkout failed — authorization or status mismatch", {
@@ -9766,7 +9926,7 @@ export function issueService(db: Db) {
 
       // Adopt stale executionRunId — if the execution lock points to a terminal/missing run, clear it and proceed.
       // Only adopts when the caller's expectedStatuses guard still holds; preserves any existing assigneeUserId
-      // and preserves the original startedAt when the issue is already in_progress.
+      // and preserves startedAt for rows that were already in progress or in a pending review stage.
       //
       // BLO-20321 deliberately left this branch terminal-only. Checkout is not
       // where the WIP defect bites (checkout adds WIP; it is parking/closing that
@@ -9781,7 +9941,7 @@ export function issueService(db: Db) {
         (current.checkoutRunId == null ||
           current.checkoutRunId === checkoutRunId ||
           current.checkoutRunId === current.executionRunId) &&
-        (current.assigneeAgentId === agentId || current.assigneeAgentId == null)
+        currentCheckoutActorIsEligible
       ) {
         const expectedExecutionRunId = current.executionRunId;
         const stale = await isTerminalOrMissingHeartbeatRun(expectedExecutionRunId);
@@ -9795,15 +9955,15 @@ export function issueService(db: Db) {
             now,
             async (tx, checkoutExecutionPatch) => {
               const adoptionSet: Record<string, unknown> = {
-                assigneeAgentId: agentId,
+                assigneeAgentId: pendingExecutionParticipantCondition
+                  ? sql`CASE WHEN ${pendingExecutionParticipantCondition} THEN ${issues.assigneeAgentId} ELSE ${agentId} END`
+                  : agentId,
                 checkoutRunId,
                 ...checkoutExecutionPatch,
-                status: "in_progress",
+                status: checkoutStatusForCurrentRow(),
                 updatedAt: now,
               };
-              if (current.status !== "in_progress") {
-                adoptionSet.startedAt = now;
-              }
+              adoptionSet.startedAt = checkoutStartedAtForCurrentRow(now);
               return tx
                 .update(issues)
                 .set(adoptionSet)
@@ -9815,7 +9975,18 @@ export function issueService(db: Db) {
                     current.checkoutRunId
                       ? eq(issues.checkoutRunId, current.checkoutRunId)
                       : isNull(issues.checkoutRunId),
-                    or(isNull(issues.assigneeAgentId), eq(issues.assigneeAgentId, agentId)),
+                    or(
+                      and(
+                        nonPendingExecutionStageCondition,
+                        current.assigneeAgentId
+                          ? eq(issues.assigneeAgentId, current.assigneeAgentId)
+                          : isNull(issues.assigneeAgentId),
+                        current.assigneeUserId
+                          ? eq(issues.assigneeUserId, current.assigneeUserId)
+                          : isNull(issues.assigneeUserId),
+                      ),
+                      pendingExecutionParticipantCondition,
+                    ),
                   ),
                 )
                 .returning()
@@ -9862,7 +10033,7 @@ export function issueService(db: Db) {
       if (
         current.executionRunId &&
         current.executionRunId !== checkoutRunId &&
-        (current.assigneeAgentId === agentId || current.assigneeAgentId == null)
+        currentCheckoutActorIsEligible
       ) {
         const cleared = await clearStaleExecutionLock({
           issueId: id,
@@ -9882,12 +10053,16 @@ export function issueService(db: Db) {
               tx
                 .update(issues)
                 .set({
-                  assigneeAgentId: agentId,
-                  assigneeUserId: null,
+                  assigneeAgentId: pendingExecutionParticipantCondition
+                    ? sql`CASE WHEN ${pendingExecutionParticipantCondition} THEN ${issues.assigneeAgentId} ELSE ${agentId} END`
+                    : agentId,
+                  assigneeUserId: pendingExecutionParticipantCondition
+                    ? sql`CASE WHEN ${pendingExecutionParticipantCondition} THEN ${issues.assigneeUserId} ELSE NULL END`
+                    : null,
                   checkoutRunId,
                   ...checkoutExecutionPatch,
-                  status: "in_progress",
-                  startedAt: now,
+                  status: checkoutStatusForCurrentRow(),
+                  startedAt: checkoutStartedAtForCurrentRow(now),
                   updatedAt: now,
                 })
                 .where(
@@ -9898,9 +10073,18 @@ export function issueService(db: Db) {
                     current.checkoutRunId
                       ? eq(issues.checkoutRunId, current.checkoutRunId)
                       : isNull(issues.checkoutRunId),
-                    current.assigneeAgentId
-                      ? eq(issues.assigneeAgentId, current.assigneeAgentId)
-                      : isNull(issues.assigneeAgentId),
+                    or(
+                      and(
+                        nonPendingExecutionStageCondition,
+                        current.assigneeAgentId
+                          ? eq(issues.assigneeAgentId, current.assigneeAgentId)
+                          : isNull(issues.assigneeAgentId),
+                        current.assigneeUserId
+                          ? eq(issues.assigneeUserId, current.assigneeUserId)
+                          : isNull(issues.assigneeUserId),
+                      ),
+                      pendingExecutionParticipantCondition,
+                    ),
                   ),
                 )
                 .returning()
@@ -9920,14 +10104,15 @@ export function issueService(db: Db) {
         }
       }
 
-      // in_review is intentionally not claimable via checkout (it is excluded from every
-      // caller's expectedStatuses, matching shouldAutoCheckoutIssueForWake). When the caller
-      // already owns the issue and there is no active checkout/execution owner, the generic
-      // "Issue checkout conflict" 409 is misleading: there is no owner to conflict with. Surface
-      // a typed 422 pointing at the review-mutation path instead — the assignee can already
-      // PATCH/comment/close their own in_review issue without checkout (BLO-8454).
+      // Ordinary in_review is intentionally not claimable via checkout (it is
+      // excluded from every caller's expectedStatuses, matching
+      // shouldAutoCheckoutIssueForWake). Pending execution stages are handled
+      // above; a CAS miss for one must remain a 409 rather than being rewritten
+      // as the ordinary-review 422.
       if (
         current.status === "in_review" &&
+        !currentHasPendingExecutionStage &&
+        expectedStatuses.includes("in_review") &&
         current.assigneeAgentId === agentId &&
         current.checkoutRunId == null &&
         current.executionRunId == null

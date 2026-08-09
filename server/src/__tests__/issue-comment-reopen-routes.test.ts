@@ -13,6 +13,7 @@ const mockIssueService = vi.hoisted(() => ({
   getCurrentScheduledRetry: vi.fn(),
   findMentionedAgents: vi.fn(),
   listWakeableBlockedDependents: vi.fn(),
+  lockPendingInReviewRunOwnership: vi.fn(async () => ({ id: "11111111-1111-4111-8111-111111111111" })),
   getWakeableParentAfterChildCompletion: vi.fn(),
 }));
 
@@ -268,6 +269,10 @@ describe.sequential("issue comment reopen routes", () => {
     mockIssueService.getCurrentScheduledRetry.mockReset();
     mockIssueService.findMentionedAgents.mockReset();
     mockIssueService.listWakeableBlockedDependents.mockReset();
+    mockIssueService.lockPendingInReviewRunOwnership.mockReset();
+    mockIssueService.lockPendingInReviewRunOwnership.mockResolvedValue({
+      id: "11111111-1111-4111-8111-111111111111",
+    });
     mockIssueService.getWakeableParentAfterChildCompletion.mockReset();
     mockAccessService.canUser.mockReset();
     mockAccessService.decide.mockReset();
@@ -461,6 +466,7 @@ describe.sequential("issue comment reopen routes", () => {
         actorAgentId: null,
         actorUserId: "local-board",
       }),
+      expect.anything(),
     );
     expect(mockLogActivity).toHaveBeenCalledWith(
       expect.anything(),
@@ -493,6 +499,7 @@ describe.sequential("issue comment reopen routes", () => {
       expect.objectContaining({
         assigneeAgentId: "33333333-3333-4333-8333-333333333333",
       }),
+      expect.anything(),
     );
   });
 
@@ -539,6 +546,7 @@ describe.sequential("issue comment reopen routes", () => {
         actorAgentId: null,
         actorUserId: "local-board",
       }),
+      expect.anything(),
     );
     expect(mockLogActivity).toHaveBeenCalledWith(
       expect.anything(),
@@ -1237,6 +1245,7 @@ describe.sequential("issue comment reopen routes", () => {
         assigneeAgentId: otherAgentId,
         status: "todo",
       }),
+      expect.anything(),
     );
     expect(mockLogActivity).toHaveBeenCalledWith(
       expect.anything(),
@@ -1814,6 +1823,7 @@ describe.sequential("issue comment reopen routes", () => {
         actorAgentId: null,
         actorUserId: "local-board",
       }),
+      expect.anything(),
     );
     await waitForWakeup(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
       "22222222-2222-4222-8222-222222222222",
@@ -1870,6 +1880,7 @@ describe.sequential("issue comment reopen routes", () => {
         actorAgentId: null,
         actorUserId: "local-board",
       }),
+      expect.anything(),
     );
     expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith("retry-run-1");
     await waitForWakeup(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
@@ -1978,10 +1989,12 @@ describe.sequential("issue comment reopen routes", () => {
         actorAgentId: null,
         actorUserId: "local-board",
       }),
+      expect.anything(),
     );
     expect(mockIssueService.update).not.toHaveBeenCalledWith(
       "11111111-1111-4111-8111-111111111111",
       expect.objectContaining({ status: "todo" }),
+      expect.anything(),
     );
     await waitForWakeup(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
       "22222222-2222-4222-8222-222222222222",
@@ -2074,6 +2087,7 @@ describe.sequential("issue comment reopen routes", () => {
         actorAgentId: "22222222-2222-4222-8222-222222222222",
         actorUserId: null,
       }),
+      expect.anything(),
     );
     expect(mockLogActivity).toHaveBeenCalledWith(
       expect.anything(),
@@ -2864,7 +2878,8 @@ describe.sequential("issue comment reopen routes", () => {
       .send({ body: reviewBody });
 
     expect(res.status).toBe(201);
-    expect(mockDb.transaction).not.toHaveBeenCalled();
+    expect(mockDb.transaction).toHaveBeenCalledTimes(1);
+    expect(mockIssueService.lockPendingInReviewRunOwnership).toHaveBeenCalled();
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
@@ -2924,7 +2939,8 @@ describe.sequential("issue comment reopen routes", () => {
       .send({ body: reviewBody });
 
     expect(res.status).toBe(201);
-    expect(mockDb.transaction).not.toHaveBeenCalled();
+    expect(mockDb.transaction).toHaveBeenCalledTimes(1);
+    expect(mockIssueService.lockPendingInReviewRunOwnership).toHaveBeenCalled();
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
@@ -2982,7 +2998,8 @@ describe.sequential("issue comment reopen routes", () => {
       .send({ body: reviewBody });
 
     expect(res.status).toBe(201);
-    expect(mockDb.transaction).not.toHaveBeenCalled();
+    expect(mockDb.transaction).toHaveBeenCalledTimes(1);
+    expect(mockIssueService.lockPendingInReviewRunOwnership).toHaveBeenCalled();
     expect(mockIssueService.update).not.toHaveBeenCalled();
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
@@ -3116,7 +3133,8 @@ describe.sequential("issue comment reopen routes", () => {
         .send({ body });
 
       expect(res.status).toBe(201);
-      expect(mockDb.transaction).not.toHaveBeenCalled();
+      expect(mockDb.transaction).toHaveBeenCalledTimes(1);
+      expect(mockIssueService.lockPendingInReviewRunOwnership).toHaveBeenCalled();
       expect(mockIssueService.update).not.toHaveBeenCalled();
       expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
     });
@@ -3270,18 +3288,11 @@ describe.sequential("issue comment reopen routes", () => {
       .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
       .send({ body: reviewBody });
 
-    // The route must propagate the 422 (no successful 201) and must insert the
-    // comment inside the same transaction as the status update so the comment
-    // rolls back when the status update fails.
+    // The route must propagate the 422 (no successful 201) and avoid inserting
+    // the comment when the status update fails inside the transaction.
     expect(res.status).toBe(422);
     expect(mockDb.transaction).toHaveBeenCalledTimes(1);
-    expect(mockIssueService.addComment).toHaveBeenCalledWith(
-      "11111111-1111-4111-8111-111111111111",
-      reviewBody,
-      expect.objectContaining({ agentId: reviewerAgentId }),
-      expect.any(Object),
-      mockTx,
-    );
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 
@@ -3340,18 +3351,11 @@ describe.sequential("issue comment reopen routes", () => {
       .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
       .send({ body: reviewBody });
 
-    // The route must surface a 404 AND keep the transaction rollback path intact:
-    // the addComment INSERT must run inside the same transaction that the throw aborts,
-    // so the comment cannot survive when the status update finds no issue.
+    // The route must surface a 404 and avoid inserting a comment after the
+    // status update discovers that the issue was concurrently deleted.
     expect(res.status).toBe(404);
     expect(mockDb.transaction).toHaveBeenCalledTimes(1);
-    expect(mockIssueService.addComment).toHaveBeenCalledWith(
-      "11111111-1111-4111-8111-111111111111",
-      reviewBody,
-      expect.objectContaining({ agentId: reviewerAgentId }),
-      expect.any(Object),
-      mockTx,
-    );
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 
@@ -3799,7 +3803,8 @@ describe.sequential("issue comment reopen routes", () => {
       .send({ body: reviewBody });
 
     expect(res.status).toBe(201);
-    expect(mockDb.transaction).not.toHaveBeenCalled();
+    expect(mockDb.transaction).toHaveBeenCalledTimes(1);
+    expect(mockIssueService.lockPendingInReviewRunOwnership).toHaveBeenCalled();
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
@@ -3859,7 +3864,8 @@ describe.sequential("issue comment reopen routes", () => {
       .send({ body: reviewBody });
 
     expect(res.status).toBe(201);
-    expect(mockDb.transaction).not.toHaveBeenCalled();
+    expect(mockDb.transaction).toHaveBeenCalledTimes(1);
+    expect(mockIssueService.lockPendingInReviewRunOwnership).toHaveBeenCalled();
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
@@ -3917,7 +3923,8 @@ describe.sequential("issue comment reopen routes", () => {
       .send({ body: reviewBody });
 
     expect(res.status).toBe(201);
-    expect(mockDb.transaction).not.toHaveBeenCalled();
+    expect(mockDb.transaction).toHaveBeenCalledTimes(1);
+    expect(mockIssueService.lockPendingInReviewRunOwnership).toHaveBeenCalled();
     expect(mockIssueService.update).not.toHaveBeenCalled();
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
@@ -4051,7 +4058,8 @@ describe.sequential("issue comment reopen routes", () => {
         .send({ body });
 
       expect(res.status).toBe(201);
-      expect(mockDb.transaction).not.toHaveBeenCalled();
+      expect(mockDb.transaction).toHaveBeenCalledTimes(1);
+      expect(mockIssueService.lockPendingInReviewRunOwnership).toHaveBeenCalled();
       expect(mockIssueService.update).not.toHaveBeenCalled();
       expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
     });
@@ -4205,18 +4213,11 @@ describe.sequential("issue comment reopen routes", () => {
       .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
       .send({ body: reviewBody });
 
-    // The route must propagate the 422 (no successful 201) and must insert the
-    // comment inside the same transaction as the status update so the comment
-    // rolls back when the status update fails.
+    // The route must propagate the 422 (no successful 201) and avoid inserting
+    // the comment when the status update fails inside the transaction.
     expect(res.status).toBe(422);
     expect(mockDb.transaction).toHaveBeenCalledTimes(1);
-    expect(mockIssueService.addComment).toHaveBeenCalledWith(
-      "11111111-1111-4111-8111-111111111111",
-      reviewBody,
-      expect.objectContaining({ agentId: reviewerAgentId }),
-      expect.any(Object),
-      mockTx,
-    );
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 
@@ -4275,18 +4276,11 @@ describe.sequential("issue comment reopen routes", () => {
       .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
       .send({ body: reviewBody });
 
-    // The route must surface a 404 AND keep the transaction rollback path intact:
-    // the addComment INSERT must run inside the same transaction that the throw aborts,
-    // so the comment cannot survive when the status update finds no issue.
+    // The route must surface a 404 and avoid inserting a comment after the
+    // status update discovers that the issue was concurrently deleted.
     expect(res.status).toBe(404);
     expect(mockDb.transaction).toHaveBeenCalledTimes(1);
-    expect(mockIssueService.addComment).toHaveBeenCalledWith(
-      "11111111-1111-4111-8111-111111111111",
-      reviewBody,
-      expect.objectContaining({ agentId: reviewerAgentId }),
-      expect.any(Object),
-      mockTx,
-    );
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 

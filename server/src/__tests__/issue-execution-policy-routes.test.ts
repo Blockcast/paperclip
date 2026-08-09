@@ -17,6 +17,7 @@ const mockIssueService = vi.hoisted(() => ({
   findMentionedAgents: vi.fn(),
   getRelationSummaries: vi.fn(),
   listWakeableBlockedDependents: vi.fn(),
+  lockPendingInReviewRunOwnership: vi.fn(async () => ({ id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" })),
   // BLO-18294: the monitor convergence guard reads live blocker edges on every arm.
   listDependencyReadiness: vi.fn(async () => new Map()),
   getWakeableParentAfterChildCompletion: vi.fn(),
@@ -644,6 +645,7 @@ describe("issue execution policy routes", () => {
         monitorNextCheckAt: new Date("2099-12-01T13:00:00.000Z"),
         monitorScheduledBy: "assignee",
       }),
+      expect.anything(),
     );
   });
 
@@ -1784,6 +1786,7 @@ describe("issue execution policy routes", () => {
         expectedCurrentExecutionState: executionState,
         expectedCurrentExecutionPolicy: executionPolicy,
       }),
+      expect.anything(),
     );
   });
 

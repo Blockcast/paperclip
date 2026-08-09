@@ -567,13 +567,13 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     ),
     makeTool(
       "paperclipCheckoutIssue",
-      "Check out an issue: assigns it (if unassigned) and moves it to in_progress. You MUST do this before doing any work on an issue. Returns 409 on a checkout conflict — commonly another agent already owns it, but can also fire on a status mismatch (e.g. the issue is blocked/in_review) even when you already own it. Re-fetch the issue to see the actual status/assignee before deciding whether to wait, retry, or pick different work.",
+      "Check out an issue: assigns it (if unassigned) and acquires the run-scoped execution lock. Ordinary work moves to in_progress; pending execution-policy review/approval stages stay in_review so the reviewer can approve or request changes. You MUST do this before doing any work on an issue. Returns 409 on a checkout conflict — commonly another live run already owns it, but can also fire on a status mismatch. Re-fetch the issue to see the actual status, checkoutRunId, and executionRunId before deciding whether to wait, skip, or pick different work.",
       checkoutIssueToolSchema,
       async ({ issueId, agentId, expectedStatuses }) =>
         client.requestJson("POST", `/issues/${encodeURIComponent(issueId)}/checkout`, {
           body: {
             agentId: client.resolveAgentId(agentId),
-            expectedStatuses: expectedStatuses ?? ["todo", "backlog", "blocked"],
+            expectedStatuses: expectedStatuses ?? ["todo", "backlog", "blocked", "in_review"],
           },
         }),
     ),
