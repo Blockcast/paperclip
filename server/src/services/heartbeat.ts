@@ -19860,7 +19860,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         let absoluteLaneBatches = 0;
         while (absoluteLaneBatches < queuedRunDispatchMaxScanBatches) {
           absoluteLaneBatches += 1;
-          const batch: DispatchRun[] = await db
+          const batch = await db
             .select(dispatchRunSelection)
             .from(heartbeatRuns)
             .where(and(
