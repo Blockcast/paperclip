@@ -16,10 +16,10 @@
  * apart both submitted at head ff1c72db, 34 s apart, with opposite verdicts.
  *
  * Invariants asserted here:
- *   I1  At most one logical Ally verdict per (PR, head SHA). The exact-head
- *       gate deliberately requires the App and User-seat review artifacts on
- *       independently authored PRs; one byte-identical pair from exactly those
- *       two identities is one logical verdict, not a duplicate verdict.
+ *   I1  At most one operative Ally review submission per (PR, head SHA).
+ *       Each live GitHub review is an attestation with its own credential; do
+ *       not normalize a duplicate after it has been created. The publisher
+ *       must choose one credential for each verdict instead.
  *   I2  No operative Ally APPROVED whose own body reports a Critical or
  *       Important finding, no operative APPROVED coexisting at a SHA with an
  *       operative Ally review that does, and no operative APPROVED that makes
@@ -75,12 +75,6 @@ const STILL_PRESENT_DISPOSITION_RE =
 /** The single standalone attestation line Ally is required to emit. */
 const ATTESTED_HEAD_RE = /^[ \t]*(?:[_*]+)?[ \t]*reviewed head:[ \t]*`?([0-9a-f]{40})`?[ \t]*(?:[_*]+)?[ \t]*$/im;
 
-// The two identities required by the exact-head gate. Treating a pair as one
-// logical verdict is deliberately fail-closed: any extra, unknown, missing, or
-// same-identity submission remains visible to I1.
-export const ALLY_APP_REVIEWER_ID = 290875700;
-export const ALLY_USER_REVIEWER_ID = 296676656;
-
 export function isAllyLogin(login) {
   return ALLY_LOGIN_RE.test(String(login ?? ""));
 }
@@ -109,47 +103,6 @@ export function operativeAllyReviews(reviews, headSha) {
 }
 
 /**
- * Exact App/User review pairs that attest the same body at one head. The
- * protected-review contract requires both artifacts, so this pair is a single
- * logical verdict. The exception is deliberately narrow: it accepts only two
- * submissions whose user IDs are exactly the known App and User-seat IDs.
- *
- * A third submission, a retry under one identity, an unknown credential, or a
- * missing ID must remain fatal under I1. Broadly grouping by "different IDs"
- * would erase exactly the malformed multi-review state this guard exists to
- * detect.
- */
-export function requiredIdentityAttestationPairs(reviews, headSha) {
-  const operative = operativeAllyReviews(reviews, headSha);
-  const byBody = new Map();
-  for (const review of operative) {
-    const key = String(review?.body ?? "");
-    byBody.set(key, [...(byBody.get(key) ?? []), review]);
-  }
-  return [...byBody.values()].filter(
-    (group) =>
-      group.length === 2 &&
-      group.some((review) => review?.user?.id === ALLY_APP_REVIEWER_ID) &&
-      group.some((review) => review?.user?.id === ALLY_USER_REVIEWER_ID),
-  );
-}
-
-/**
- * Operative reviews with one member of each valid required-identity pair
- * removed, so I1 counts logical verdicts rather than required evidence copies.
- */
-export function distinctVerdicts(reviews, headSha) {
-  const redundant = new Set(
-    requiredIdentityAttestationPairs(reviews, headSha)
-      .flatMap((group) => group.slice(1))
-      .map((review) => review?.id),
-  );
-  return operativeAllyReviews(reviews, headSha).filter(
-    (review) => !redundant.has(review?.id),
-  );
-}
-
-/**
  * @param {{number: number, headSha: string, reviews: object[]}} pr
  * @returns {string[]} human-readable violations; empty when the PR is sound
  */
@@ -157,13 +110,12 @@ export function findPrViolations(pr) {
   const head = pr.headSha;
   const short = String(head ?? "").slice(0, 8);
   const operative = operativeAllyReviews(pr.reviews, head);
-  const verdicts = distinctVerdicts(pr.reviews, head);
   const violations = [];
 
-  if (verdicts.length > 1) {
-    const detail = verdicts.map((r) => `${r.state}/${r.id}`).join(", ");
+  if (operative.length > 1) {
+    const detail = operative.map((r) => `${r.state}/${r.id}`).join(", ");
     violations.push(
-      `I1 PR #${pr.number} @${short}: ${verdicts.length} logical Ally verdicts (${detail}) — expected at most 1`,
+      `I1 PR #${pr.number} @${short}: ${operative.length} operative Ally reviews (${detail}) — expected at most 1`,
     );
   }
 
