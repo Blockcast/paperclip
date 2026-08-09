@@ -120,9 +120,10 @@
         ]
       },
       "js-yaml": {
-        "patchedRange": ">=4.3.0 <5",
+        "patchedRange": ">=4.3.1 <5",
         "advisories": [
-          "GHSA-h67p-54hq-rp68"
+          "GHSA-h67p-54hq-rp68",
+          "GHSA-5p4m-2wfm-xmqj"
         ]
       },
       "esbuild": {
@@ -162,7 +163,7 @@
       "@tootallnate/once": "^2.0.1",
       "form-data": ">=4.0.6",
       "@babel/core": ">=7.29.7 <8",
-      "js-yaml": ">=4.3.0 <5",
+      "js-yaml": ">=4.3.1 <5",
       "esbuild": ">=0.28.1 <0.29",
       "@connectrpc/connect-node>undici": ">=6.27.0 <7",
       "jsdom>undici": ">=7.29.0 <8",

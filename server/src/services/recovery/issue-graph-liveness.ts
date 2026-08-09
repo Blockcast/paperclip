@@ -181,6 +181,35 @@ function monitorFromIssue(issue: IssueLivenessIssueInput) {
   return { policyMonitor, stateMonitor };
 }
 
+const REVIEW_STAGE_TYPES = new Set(["review", "approval"]);
+
+/**
+ * Evidence that a review workflow was actually configured on the issue.
+ *
+ * `executionState` is a shared envelope, not a review-only structure: arming a
+ * monitor populates it on issues that never had a review stage. So a non-null
+ * `executionState` is not proof of a review workflow (BLO-20725). Without this
+ * gate, every `in_review` issue whose monitor fired and was never re-armed fell
+ * into the unresolvable-participant branch and produced a recovery issue telling
+ * its owner to repair a review participant that was never configured — while an
+ * otherwise identical issue that had never armed a monitor was left alone.
+ */
+function hasConfiguredReviewWorkflow(issue: IssueLivenessIssueInput) {
+  const state = readRecord(issue.executionState);
+  if (state) {
+    if (typeof state.currentStageId === "string" && state.currentStageId.length > 0) return true;
+    if (typeof state.currentStageType === "string" && REVIEW_STAGE_TYPES.has(state.currentStageType)) return true;
+    if (readRecord(state.reviewRequest)) return true;
+  }
+
+  const stages = readRecord(issue.executionPolicy)?.stages;
+  if (!Array.isArray(stages)) return false;
+  return stages.some((stage) => {
+    const type = readRecord(stage)?.type;
+    return typeof type === "string" && REVIEW_STAGE_TYPES.has(type);
+  });
+}
+
 function hasScheduledMonitor(issue: IssueLivenessIssueInput, nowMs: number) {
   const nextCheckAtMs = readDateMs(issue.monitorNextCheckAt);
   if (nextCheckAtMs === null || nextCheckAtMs <= nowMs) return false;
@@ -456,7 +485,7 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
 
     if (principalIsResolvableUser(participant)) return null;
 
-    if (reviewIssue.executionState) {
+    if (hasConfiguredReviewWorkflow(reviewIssue)) {
       return finding({
         issue: source,
         state: "invalid_review_participant",
@@ -470,7 +499,10 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
       });
     }
 
-    // User-assigned reviews are operator territory -- escalation belongs
+    // Reached when no review workflow was ever configured -- "in review" here
+    // means "awaiting review", not "review workflow corrupt", so the honest
+    // finding is in_review_without_action_path below rather than a participant
+    // repair. User-assigned reviews are operator territory -- escalation belongs
     // upstream of paperclip's automation. Agent-assigned and unassigned
     // both surface findings; routing fans out to the chain of command via
     // ownerCandidates so unassigned issues don't sit silently forever.
