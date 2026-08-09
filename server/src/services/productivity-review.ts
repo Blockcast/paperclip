@@ -795,6 +795,37 @@ function formatRuntimeFailureUsageEvidence(
   return "usage telemetry unavailable";
 }
 
+// BLO-22097 (Ally follow-up): "produced zero model turns" is a fact only when
+// `basis === "measured"`. For `inferred`/`mixed` the underlying signal is
+// missing usage telemetry corroborated by low/absent log volume — consistent
+// with no model turn, not proof of it. Asserting the unqualified claim for
+// those bases overstates a heuristic as a measured outcome, so they get
+// hedged wording instead.
+function formatRuntimeFailureTriggerClaim(
+  streak: number,
+  basis: "measured" | "inferred" | "mixed" | null,
+): string {
+  const evidence = formatRuntimeFailureUsageEvidence(basis);
+  if (basis === "measured") {
+    return `${streak} consecutive terminal runs produced zero model turns (failed liveness, ${evidence}) — infrastructure failure, not agent silence`;
+  }
+  return `${streak} consecutive terminal runs show no evidence of a model turn (failed liveness, ${evidence}) — consistent with an infrastructure failure, not confirmed agent silence`;
+}
+
+// Same qualification as `formatRuntimeFailureTriggerClaim`, applied to the
+// manager-facing decision text: "the assignee was never given a chance to
+// act" is only provable when usage is measured. Missing telemetry cannot
+// confirm that claim, only be consistent with it.
+function formatRuntimeFailureManagerClaim(
+  basis: "measured" | "inferred" | "mixed" | null,
+): string {
+  const evidence = formatRuntimeFailureUsageEvidence(basis);
+  if (basis === "measured") {
+    return `This trigger fired because the sampled runs never executed a model turn (failed liveness, ${evidence}) — the assignee was never given a chance to act. This is an infrastructure signal, not an agent-performance verdict; do not decompose, block, or cancel the underlying work on the strength of this alone.`;
+  }
+  return `This trigger fired because the sampled runs show no evidence of executing a model turn (failed liveness, ${evidence}) — consistent with the assignee never being given a chance to act, though missing usage telemetry means this cannot be confirmed. This is an infrastructure signal, not an agent-performance verdict; do not decompose, block, or cancel the underlying work on the strength of this alone.`;
+}
+
 /**
  * Either the pooled handle or an open transaction. Helpers that participate in
  * the BLO-3737 refresh-throttle critical section accept this so the read and the
@@ -2253,9 +2284,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
 
     const triggerReasons: string[] = [];
     if (runtimeFailure) {
-      triggerReasons.push(
-        `${runtimeFailureStreak} consecutive terminal runs produced zero model turns (failed liveness, ${formatRuntimeFailureUsageEvidence(runtimeFailureUsageBasis)}) — infrastructure failure, not agent silence`,
-      );
+      triggerReasons.push(formatRuntimeFailureTriggerClaim(runtimeFailureStreak, runtimeFailureUsageBasis));
     }
     if (noComment) triggerReasons.push(`${noCommentStreak} consecutive terminal, turn-executing issue-linked runs had no run-created issue comment`);
     if (longActive) triggerReasons.push(`current active episode has lasted ${msToHuman(elapsedMs)}`);
@@ -2480,7 +2509,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       "",
       ...(evidence.trigger === "runtime_failure_streak"
         ? [
-          `This trigger fired because the sampled runs never executed a model turn (failed liveness, ${formatRuntimeFailureUsageEvidence(evidence.runtimeFailureUsageBasis)}) — the assignee was never given a chance to act. This is an infrastructure signal, not an agent-performance verdict; do not decompose, block, or cancel the underlying work on the strength of this alone.`,
+          formatRuntimeFailureManagerClaim(evidence.runtimeFailureUsageBasis),
           "",
           "Route to platform/SRE for one of:",
           "- Diagnose and fix the underlying dispatch/runtime fault (crashloop, provider outage, retry exhaustion)",
