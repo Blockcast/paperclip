@@ -579,24 +579,69 @@ describe("approval routes idempotent retries", () => {
     expect(mockApprovalService.resubmit).not.toHaveBeenCalled();
   });
 
-  it("blocks status-only recovery runs from creating approvals", async () => {
-    const res = await request(await createAgentApp({
-      contextSnapshot: {
-        modelProfile: "cheap",
-        recoveryIntent: "status_only",
-        allowDeliverableWork: false,
-        allowDocumentUpdates: false,
-        resumeRequiresNormalModel: true,
-      },
-    }))
+  // BLO-23036: a productivity-review run is a cheap status-only run, and one of the four verdicts
+  // Paperclip itself offers is "block with an unblock owner". A board escalation is the only channel
+  // that reaches a human, so the reviewing manager has to be able to file one in the run that
+  // reaches the verdict — otherwise it states a gate it cannot escalate and the stall the review
+  // exists to catch is silently reproduced.
+  const STATUS_ONLY_CONTEXT = {
+    modelProfile: "cheap",
+    recoveryIntent: "status_only",
+    allowDeliverableWork: false,
+    allowDocumentUpdates: false,
+    resumeRequiresNormalModel: true,
+  } as const;
+
+  it("lets a status-only recovery run file a board escalation linked to the source issue", async () => {
+    mockApprovalService.create.mockResolvedValue({
+      id: "approval-escalation",
+      companyId: "company-1",
+      type: "request_board_approval",
+      requestedByAgentId: "agent-1",
+      requestedByUserId: null,
+      status: "pending",
+      payload: { title: "Unblock owner needed for BLO-22206" },
+      decisionNote: null,
+      decidedByUserId: null,
+      decidedAt: null,
+      createdAt: new Date("2026-08-07T00:00:00.000Z"),
+      updatedAt: new Date("2026-08-07T00:00:00.000Z"),
+    });
+    mockIssueApprovalService.linkManyForApproval.mockResolvedValue(undefined);
+
+    const res = await request(await createAgentApp({ contextSnapshot: { ...STATUS_ONLY_CONTEXT } }))
       .post("/api/companies/company-1/approvals")
       .send({
         type: "request_board_approval",
-        payload: { title: "Approve hosting spend" },
+        payload: { title: "Unblock owner needed for BLO-22206" },
+        issueIds: ["11111111-1111-4111-8111-111111111111"],
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockApprovalService.create).toHaveBeenCalled();
+    expect(mockIssueApprovalService.linkManyForApproval).toHaveBeenCalledWith(
+      "approval-escalation",
+      ["11111111-1111-4111-8111-111111111111"],
+      expect.anything(),
+    );
+  });
+
+  it("still blocks a status-only recovery run from creating non-escalation approvals", async () => {
+    mockSecretService.normalizeHireApprovalPayloadForPersistence.mockResolvedValue({
+      title: "Hire an SRE",
+    });
+
+    const res = await request(await createAgentApp({ contextSnapshot: { ...STATUS_ONLY_CONTEXT } }))
+      .post("/api/companies/company-1/approvals")
+      .send({
+        type: "hire_agent",
+        payload: { title: "Hire an SRE" },
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(403);
-    expect(res.body.error).toContain("Cheap status-only recovery runs cannot create or modify approvals");
+    // The refusal has to name the one reachable path, or the agent learns only that it is barred.
+    expect(res.body.error).toContain("request_board_approval");
+    expect(res.body.details.allowedApprovalType).toBe("request_board_approval");
     expect(mockApprovalService.create).not.toHaveBeenCalled();
     expect(mockIssueApprovalService.linkManyForApproval).not.toHaveBeenCalled();
   });
@@ -624,7 +669,7 @@ describe("approval routes idempotent retries", () => {
       .send({ payload: { title: "Retry" } });
 
     expect(res.status, JSON.stringify(res.body)).toBe(403);
-    expect(res.body.error).toContain("Cheap status-only recovery runs cannot create or modify approvals");
+    expect(res.body.error).toContain("can only create `request_board_approval` approvals");
     expect(mockApprovalService.resubmit).not.toHaveBeenCalled();
   });
 
@@ -651,7 +696,7 @@ describe("approval routes idempotent retries", () => {
       .send({ body: "please approve" });
 
     expect(res.status, JSON.stringify(res.body)).toBe(403);
-    expect(res.body.error).toContain("Cheap status-only recovery runs cannot create or modify approvals");
+    expect(res.body.error).toContain("can only create `request_board_approval` approvals");
     expect(mockApprovalService.addComment).not.toHaveBeenCalled();
   });
 });

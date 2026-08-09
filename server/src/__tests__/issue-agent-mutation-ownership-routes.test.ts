@@ -2508,13 +2508,13 @@ describe("agent issue mutation checkout ownership", () => {
         request(app).post(`/api/issues/${issueId}/approvals`).send({
           approvalId: "88888888-8888-4888-8888-888888888888",
         }),
-      "Cheap status-only recovery runs cannot create or modify approvals",
+      "Cheap status-only recovery runs cannot link or unlink approvals",
     ],
     [
       "issue approval unlink",
       (app: express.Express) =>
         request(app).delete(`/api/issues/${issueId}/approvals/88888888-8888-4888-8888-888888888888`),
-      "Cheap status-only recovery runs cannot create or modify approvals",
+      "Cheap status-only recovery runs cannot link or unlink approvals",
     ],
   ])("blocks cheap status-only recovery runs from %s", async (_name, sendRequest, expectedError) => {
     const app = await createApp(

@@ -43,6 +43,19 @@ function approvalResolutionResponse<T extends { type: string; payload: Record<st
   };
 }
 
+// A status-only recovery run is barred from approval work because approvals carry expensive or
+// destructive side effects once resolved. Filing a board escalation is the one exception: the card
+// is inert until a human resolves it, and it is the only channel that reaches a human at all.
+//
+// A manager delivering the productivity-review verdict "block with an unblock owner" has to be able
+// to execute that verdict in the same run that reaches it. Without this escape the review can state
+// a gate it cannot escalate, and the natural failure mode — believing the escalation implied by the
+// verdict exists — silently reproduces the stall the review was created to catch. See BLO-23036.
+//
+// Deliberately create-only: resubmit/withdraw/comment never pass a requested type, so they stay
+// barred regardless of the target approval's type.
+const BOARD_ESCALATION_APPROVAL_TYPE = "request_board_approval";
+
 function isStatusOnlyCheapRecoveryContext(contextSnapshot: unknown) {
   if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return false;
   const context = contextSnapshot as Record<string, unknown>;
@@ -84,7 +97,12 @@ export function approvalRoutes(
     return false;
   }
 
-  async function assertApprovalMutationAllowedByRunContext(req: Request, res: any, companyId: string) {
+  async function assertApprovalMutationAllowedByRunContext(
+    req: Request,
+    res: any,
+    companyId: string,
+    options: { requestedType?: unknown } = {},
+  ) {
     if (req.actor.type !== "agent") return true;
     const runId = req.actor.runId?.trim();
     if (!runId || !req.actor.agentId) return true;
@@ -101,15 +119,19 @@ export function approvalRoutes(
       .then((rows) => rows[0] ?? null);
     if (!run || run.companyId !== companyId || run.agentId !== req.actor.agentId) return true;
     if (!isStatusOnlyCheapRecoveryContext(run.contextSnapshot)) return true;
+    if (options.requestedType === BOARD_ESCALATION_APPROVAL_TYPE) return true;
 
     res.status(403).json({
-      error: "Cheap status-only recovery runs cannot create or modify approvals",
+      error:
+        "Cheap status-only recovery runs can only create `request_board_approval` approvals; " +
+        "every other approval create/modify action requires a normal-model run",
       details: {
         companyId,
         runId: run.id,
         modelProfile: "cheap",
         recoveryIntent: "status_only",
         resumeRequiresNormalModel: true,
+        allowedApprovalType: BOARD_ESCALATION_APPROVAL_TYPE,
       },
     });
     return false;
@@ -136,7 +158,9 @@ export function approvalRoutes(
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     if (!(await assertApprovalAccessAllowed(req, res, companyId))) return;
-    if (!(await assertApprovalMutationAllowedByRunContext(req, res, companyId))) return;
+    if (!(await assertApprovalMutationAllowedByRunContext(req, res, companyId, {
+      requestedType: req.body?.type,
+    }))) return;
     const rawIssueIds = req.body.issueIds;
     const issueIds = Array.isArray(rawIssueIds)
       ? rawIssueIds.filter((value: unknown): value is string => typeof value === "string")

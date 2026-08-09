@@ -5955,13 +5955,16 @@ export function issueRoutes(
     if (!isStatusOnlyCheapRecoveryContext(run.contextSnapshot)) return true;
 
     res.status(403).json({
-      error: "Cheap status-only recovery runs cannot create or modify approvals",
+      error:
+        "Cheap status-only recovery runs cannot link or unlink approvals; to escalate from this run, " +
+        "create a `request_board_approval` with this issue in `issueIds` instead",
       details: {
         issueId: issue.id,
         runId: run.id,
         modelProfile: "cheap",
         recoveryIntent: "status_only",
         resumeRequiresNormalModel: true,
+        allowedApprovalType: "request_board_approval",
       },
     });
     return false;
