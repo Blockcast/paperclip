@@ -4,6 +4,7 @@ import test from "node:test";
 
 const prWorkflowPath = ".github/workflows/pr.yml";
 const dockerWorkflowPath = ".github/workflows/docker.yml";
+const refreshLockfileWorkflowPath = ".github/workflows/refresh-lockfile.yml";
 
 test("PR jobs do not install an ineffective compiler cache", async () => {
   const workflow = await readFile(prWorkflowPath, "utf8");
@@ -35,4 +36,50 @@ test("Docker builds use persistent remote BuildKit, exact-SHA cache, and bounded
     /outputs: type=image,push=true,compression=gzip,compression-level=1/,
   );
   assert.doesNotMatch(buildJob, /outputs: [^\n]*force-compression/);
+});
+
+test("Refresh Lockfile populates the setup-node-compatible pnpm cache before saving", async () => {
+  const workflow = await readFile(refreshLockfileWorkflowPath, "utf8");
+  const setupNode = workflow.match(
+    /\n      - name: Setup Node\.js\n([\s\S]*?)(?=\n      - name:)/,
+  )?.[1];
+
+  assert.ok(setupNode, "Refresh Lockfile Setup Node.js step is missing");
+  assert.doesNotMatch(setupNode, /\n\s+cache: pnpm\n/);
+
+  const cacheKey =
+    /key: node-cache-\$\{\{ runner\.os \}\}-\$\{\{ steps\.pnpm-cache\.outputs\.arch \}\}-pnpm-\$\{\{ hashFiles\('pnpm-lock\.yaml'\) \}\}/g;
+  assert.equal(
+    [...workflow.matchAll(cacheKey)].length,
+    2,
+    "restore and save must use setup-node's exact PNPM cache key shape",
+  );
+  assert.match(
+    workflow,
+    /- name: Resolve pnpm store cache\n        id: pnpm-cache[\s\S]*echo "path=\$\(pnpm store path --silent\)"[\s\S]*echo "arch=\$\(node -p 'process\.arch'\)"/,
+  );
+  assert.match(
+    workflow,
+    /- name: Restore pnpm store\n        id: pnpm-cache-restore\n        uses: actions\/cache\/restore@v4\n        with:\n          path: \$\{\{ steps\.pnpm-cache\.outputs\.path \}\}/,
+  );
+  assert.match(workflow, /- name: Populate pnpm store\n        run: pnpm fetch --frozen-lockfile/);
+  assert.match(
+    workflow,
+    /- name: Save populated pnpm store\n        if: success\(\) && steps\.pnpm-cache-restore\.outputs\.cache-hit != 'true'\n        uses: actions\/cache\/save@v4\n        with:\n          path: \$\{\{ steps\.pnpm-cache\.outputs\.path \}\}/,
+  );
+
+  const orderedSteps = [
+    "- name: Refresh pnpm lockfile",
+    "- name: Resolve pnpm store cache",
+    "- name: Restore pnpm store",
+    "- name: Populate pnpm store",
+    "- name: Save populated pnpm store",
+    "- name: Fail on unexpected file changes",
+  ].map((step) => workflow.indexOf(step));
+  assert.ok(orderedSteps.every((index) => index >= 0), "cache seeding steps are incomplete");
+  assert.deepEqual(
+    [...orderedSteps].sort((left, right) => left - right),
+    orderedSteps,
+    "the refreshed lockfile must be restored, fetched, and saved in order",
+  );
 });
