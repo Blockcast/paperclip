@@ -5283,12 +5283,31 @@ export function issueRoutes(
   // caps at five, and a genuinely new epoch opens a fresh budget so its
   // transition is always recorded.
   //
-  // This stays bounded because the refused actor cannot manufacture epochs.
-  // Neither `assigneeAgentId` nor `status` is in COORDINATION_METADATA_FIELDS,
-  // so nothing reachable through this path lets a coordinator reassign the
-  // issue or take/release its execution lock; epoch changes are driven by other
-  // actors doing real work. Contrast `runId`, which the actor *can* churn — see
-  // the note on the aggregate cap in the recorder below.
+  // The bound this buys is path-scoped, and only that. Neither
+  // `assigneeAgentId` nor `status` is in COORDINATION_METADATA_FIELDS, so no
+  // patch reaching *this* function can reassign the issue or take/release its
+  // execution lock: within one epoch the cap genuinely holds at five.
+  //
+  // It does NOT hold as a blanket property, because other routes move the
+  // epoch. `POST /issues/:id/checkout` reassigns `assigneeAgentId` behind
+  // `assertCanAssignTasks` alone, and `tasks:assign` resolves in simple mode
+  // via `allow_simple_company_member` with no manager-chain check — whereas
+  // `issue:coordination_metadata` additionally requires
+  // `isManagerOf(companyId, actor, assignee)`. So an actor `deny_scope`'d here
+  // for not managing the assignee can still self-checkout the same issue and
+  // mint a fresh `(assignee, lock)` epoch, and by churning checkout/handoff
+  // cycles can open new five-record budgets over time.
+  //
+  // That is accepted rather than fixed here, on two grounds: each reset is
+  // itself an audited `issue.checked_out` event, so the churn is visible in
+  // the same log a reader of these records is already in; and once the actor
+  // holds the issue this path returns `null` for it outright (see the
+  // self-assignee guard in `decideCoordinationMetadataPatch`), so it cannot
+  // farm refusals against its own assignment. Closing it properly would need a
+  // per-issue ceiling independent of epoch — which would reintroduce the exact
+  // swallowing of transitions that the epoch scoping above exists to fix, so it
+  // is not a drop-in tightening. Contrast `runId`, which the actor *can* churn
+  // directly — see the note on the aggregate cap in the recorder below.
   async function countRecentCoordinationMetadataRefusals(input: {
     executor: Pick<typeof db, "select">;
     companyId: string;
