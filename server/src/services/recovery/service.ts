@@ -826,6 +826,14 @@ const DEPENDENCY_BLOCKED_ERROR_CODE = "issue_dependencies_blocked";
 // be waiting for the normal edge-triggered or first sweep dependency-resolved
 // wake to land.
 const DEPENDENCY_RESOLVED_WAKE_GRACE_MS = 6 * 60 * 1000;
+// A dependency-resolved wake only proves an observable execution path while it
+// is still being delivered. A completed row is historical idempotency evidence,
+// not evidence that its dependent made progress.
+const LIVE_ISSUE_BLOCKERS_RESOLVED_WAKE_STATUSES = new Set([
+  "queued",
+  "deferred_issue_execution",
+  "claimed",
+]);
 
 const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
   "agent_not_invokable",
@@ -1759,6 +1767,7 @@ export function recoveryService(
         .select({
           issueId: workspaceOperations.issueId,
           executionWorkspaceId: workspaceOperations.executionWorkspaceId,
+          finishedAt: workspaceOperations.finishedAt,
           startedAt: workspaceOperations.startedAt,
         })
         .from(workspaceOperations)
@@ -1776,15 +1785,19 @@ export function recoveryService(
       const latestUnattributedByWorkspace = new Map<string, Date>();
       for (const row of finalizeRows) {
         if (!row.executionWorkspaceId) continue;
+        // A successful finalization restores readiness when it completes, not
+        // when it begins. Keep `startedAt` only as a compatibility fallback for
+        // legacy succeeded rows that predate (or failed to persist) `finishedAt`.
+        const finalizedAt = row.finishedAt ?? row.startedAt;
         if (row.issueId) {
           const key = `${row.issueId}:${row.executionWorkspaceId}`;
           if (!blockerWorkspaceKeys.has(key)) continue;
           const current = latestAttributedByBlockerWorkspace.get(key);
-          if (!current || row.startedAt > current) latestAttributedByBlockerWorkspace.set(key, row.startedAt);
+          if (!current || finalizedAt > current) latestAttributedByBlockerWorkspace.set(key, finalizedAt);
           continue;
         }
         const current = latestUnattributedByWorkspace.get(row.executionWorkspaceId);
-        if (!current || row.startedAt > current) latestUnattributedByWorkspace.set(row.executionWorkspaceId, row.startedAt);
+        if (!current || finalizedAt > current) latestUnattributedByWorkspace.set(row.executionWorkspaceId, finalizedAt);
       }
 
       for (const pair of blockerWorkspacePairs) {
@@ -1825,7 +1838,7 @@ export function recoveryService(
       companyId: input.issue.companyId,
       idempotencyKeys,
     });
-    if (existingWake) return true;
+    if (existingWake && LIVE_ISSUE_BLOCKERS_RESOLVED_WAKE_STATUSES.has(existingWake.status)) return true;
 
     const [activeExecutionPath, queuedIssueWake, pendingWakeInteraction] = await Promise.all([
       hasActiveExecutionPath(input.issue.companyId, input.issue.id, assigneeAgentId),
@@ -5288,6 +5301,17 @@ export function recoveryService(
       if (fresh.status !== input.previousStatus && fresh.status !== "blocked") return null;
 
       const recoveryCause = resolveStrandedRecoveryCause(input.latestRun, input.recoveryCause);
+      // The sweep's preflight readiness check can be invalidated by a blocker
+      // that is added or reopened while this escalation waits for its per-issue
+      // advisory lock. Re-read through this transaction immediately before the
+      // first recovery side effect so a now-blocked dependent stays with its
+      // assignee for the normal dependency wake path.
+      if (input.latestRun?.errorCode === DEPENDENCY_BLOCKED_ERROR_CODE) {
+        const readiness = await issuesSvc
+          .listDependencyReadiness(fresh.companyId, [fresh.id], tx)
+          .then((rows) => rows.get(fresh.id));
+        if (readiness && !readiness.isDependencyReady) return null;
+      }
       const { action, hasNewActivitySinceLastAttempt } = await ensureSourceScopedStrandedRecoveryAction({
         issue: fresh,
         previousStatus: input.previousStatus,
