@@ -12,6 +12,7 @@ const ALLOWED_RUNNERS = new Set([
   "arc-deploy",
   "arc-e2e",
   "arc-merge-queue",
+  "arc-paperclip-buildkit",
   "arc-paperclip-general",
 ]);
 
