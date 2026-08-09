@@ -1268,6 +1268,137 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(review?.description).toContain("Primary trigger: `long_active_duration`");
   });
 
+  // BLO-23248/BLO-22331: a capacity-class `scheduled_retry` (fleet
+  // ccrotate/penstock model-provider exhaustion) clears `issue.executionRunId`
+  // to null the moment it is scheduled (`scheduleBoundedRetryForRun` in
+  // heartbeat.ts), so the BLO-19848 `nonLiveExecutionHoldSince` clamp above
+  // — which only sees a hold via `issue.executionRunId` — never engages for
+  // this state and the whole park counts as unattended. These fixtures
+  // reproduce that exact state (heartbeat run present and issue-scoped via
+  // `contextSnapshot`, but `issue.executionRunId` left null) rather than
+  // using `pinExecutionRun`, which sets the pointer this bug is about the
+  // absence of.
+  async function insertCapacityScheduledRetryRun(input: {
+    companyId: string;
+    agentId: string;
+    issueId: string;
+    createdAt: Date;
+    scheduledRetryAt: Date;
+    scheduledRetryReason?: string | null;
+    errorCode?: string | null;
+  }) {
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId: input.companyId,
+      agentId: input.agentId,
+      status: "scheduled_retry",
+      invocationSource: "automation",
+      triggerDetail: "system",
+      errorCode: input.errorCode ?? "rate_limit_exhausted",
+      scheduledRetryAt: input.scheduledRetryAt,
+      scheduledRetryAttempt: 0,
+      scheduledRetryReason: input.scheduledRetryReason ?? "ccrotate_capacity",
+      contextSnapshot: { issueId: input.issueId, taskId: input.issueId },
+      createdAt: input.createdAt,
+      updatedAt: input.createdAt,
+    });
+    return { runId };
+  }
+
+  it("does not fire long_active_duration while a capacity-class scheduled_retry is still due in the future, even though issue.executionRunId is null (BLO-23248/BLO-22331)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const episodeStart = new Date(now.getTime() - 7 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: episodeStart });
+    await insertCapacityScheduledRetryRun({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      createdAt: episodeStart,
+      scheduledRetryAt: new Date(now.getTime() + 5 * 24 * 60 * 60 * 1000),
+    });
+    // Sanity: reproduce the reported bug state directly — the issue's
+    // execution pointer is null while a live scheduled_retry row exists for it.
+    const [issueRow] = await db.select().from(issues).where(eq(issues.id, seeded.issueId));
+    expect(issueRow?.executionRunId).toBeNull();
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  it("still fires long_active_duration once an overdue capacity retry sits unpromoted, naming the capacity stall rather than the assignee (BLO-22331 no-indefinite-suppression guard)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const episodeStart = new Date(now.getTime() - 7 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: episodeStart });
+    const { runId } = await insertCapacityScheduledRetryRun({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      createdAt: episodeStart,
+      // Due an hour ago and never promoted/dispatched: a genuinely wedged
+      // retry chain, which BLO-22331's AC requires to remain reviewable
+      // rather than suppressed forever.
+      scheduledRetryAt: new Date(now.getTime() - 60 * 60 * 1000),
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+    expect(review?.description).toContain("capacity-stalled behind an overdue");
+    expect(review?.description).toContain("fleet-capacity signal, not assignee inactivity");
+    expect(review?.description).toContain(`run \`${runId}\``);
+    expect(review?.description).toContain(`Capacity-stall accounting:`);
+  });
+
+  it("surfaces the capacity-stalled bucket in evidence and does not let long_active_duration ride along when a different trigger fires (BLO-23248 AC)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const episodeStart = new Date(now.getTime() - 7 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: episodeStart });
+    // 10 terminal, turn-executing runs with no comments — trips
+    // no_comment_streak on its own, independent of the capacity retry.
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now: episodeStart,
+    });
+    // The most recent run for the issue is the still-future capacity retry —
+    // `latestRuns[0]`, so it (not the older terminal runs) drives
+    // `capacityGating`.
+    await insertCapacityScheduledRetryRun({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      createdAt: episodeStart,
+      scheduledRetryAt: new Date(now.getTime() + 5 * 24 * 60 * 60 * 1000),
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    // no_comment_streak fired on its own merits; long_active_duration was
+    // eligible on elapsed time (7h > default 6h threshold) but suppressed.
+    expect(review?.description).toContain("Primary trigger: `no_comment_streak`");
+    expect(review?.description).not.toContain("Primary trigger: `long_active_duration`");
+    expect(review?.description).toContain("Capacity-stall accounting:");
+    expect(review?.description).toContain("capacity-stalled");
+  });
+
   it("suppresses long-active productivity reviews for deliberate future monitor waits", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const monitorNextCheckAt = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);

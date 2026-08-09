@@ -77,6 +77,23 @@ const MAX_PARENT_WALK_DEPTH = 25;
 // constant rather than an import to avoid coupling the detector to the recovery
 // service's module graph.
 const NON_LIVE_EXECUTION_SILENCE_MS = 2 * 60 * 60 * 1000;
+// BLO-23248/BLO-22331: a capacity-class `scheduled_retry` — the fleet's
+// ccrotate/penstock model-provider pool is exhausted, not a per-run hiccup —
+// parks the assignee's issue for hours to days with nothing the assignee can
+// do about it. Mirrors CCROTATE_CAPACITY_RETRY_REASON in heartbeat.ts,
+// duplicated locally (not imported) because heartbeat.ts imports
+// productivityReviewService from this module; importing back would be
+// circular. scheduledRetryReason is the primary signal; errorCode is a
+// fallback for rows written before the reason was recorded on this path.
+const CAPACITY_RETRY_REASON = "ccrotate_capacity";
+const CAPACITY_RETRY_ERROR_CODE = "rate_limit_exhausted";
+// Share of the active episode that must be capacity-stalled before
+// `long_active_duration` treats the episode as a fleet-capacity artifact
+// rather than assignee inactivity (BLO-23248 AC2). Chosen so a brand-new
+// capacity park (which is nearly all of a fresh episode) always suppresses,
+// while an episode that was already long *before* the retry started still
+// fires on its own unattended time.
+const CAPACITY_STALL_DOMINANT_SHARE = 0.5;
 export const PRODUCTIVITY_REVIEW_REFRESH_COMMENT_PREFIX = "Productivity review evidence refreshed.";
 const PRODUCTIVITY_REVIEW_CREATED_ACTION = "issue.productivity_review_created";
 const PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_STARTED_ACTION =
@@ -160,6 +177,18 @@ type ProductivityReviewEvidence = {
     priorLapseAt: Date | null;
     armedUntil: Date | null;
     gatedIsUpperBound: boolean;
+  } | null;
+  // BLO-23248: elapsed time attributable to the issue's current run sitting
+  // in a capacity-class `scheduled_retry` (fleet model-provider exhaustion) —
+  // a third bucket distinct from monitor-gated and unattended time. null when
+  // the current run (latestRuns[0]) is not such a retry.
+  capacityGating: {
+    stalledMs: number;
+    runId: string;
+    scheduledRetryAt: Date;
+    retryReason: string | null;
+    errorCode: string | null;
+    overdue: boolean;
   } | null;
   latestRuns: HeartbeatRunRow[];
   latestComments: Array<typeof issueComments.$inferSelect>;
@@ -441,6 +470,40 @@ function liveSegmentStartedAt(executionRun: HeartbeatRunRow | null, now: Date): 
   return parkEndedAt;
 }
 
+/**
+ * BLO-23248/BLO-22331: the fleet-capacity-retry state of the run currently
+ * heading this issue's execution history (`latestRuns[0]`), independent of
+ * `issue.executionRunId`. That pointer reads null for the entire time a run
+ * sits parked in `scheduled_retry`: `scheduleBoundedRetryForRun` clears the
+ * issue's execution lock the moment it inserts the retry row (heartbeat.ts),
+ * so `nonLiveExecutionHoldSince` — which only clamps a hold it can see via
+ * `issue.executionRunId` — never engages for this state, and the full
+ * wall-clock park gets counted as unattended (root cause: BLO-22331).
+ * `latestRuns` is scoped to this issue and ordered by `createdAt` desc (see
+ * `issueRunScopeSql`), so its head is this episode's current attempt
+ * regardless of which pointer the issue row carries.
+ *
+ * Returns null unless the current run is a capacity-class `scheduled_retry`.
+ * A transient-failure or dependency-blocked retry is a different, per-run
+ * condition the assignee can legitimately be asked about, so it is
+ * deliberately excluded — this only covers the fleet-wide model-provider
+ * exhaustion shape.
+ */
+function currentCapacityScheduledRetry(
+  latestRuns: HeartbeatRunRow[],
+  now: Date,
+): { run: HeartbeatRunRow; scheduledRetryAt: Date; overdue: boolean } | null {
+  const currentRun = latestRuns[0];
+  if (!currentRun || currentRun.status !== "scheduled_retry") return null;
+  const isCapacityClass =
+    currentRun.scheduledRetryReason === CAPACITY_RETRY_REASON
+    || currentRun.errorCode === CAPACITY_RETRY_ERROR_CODE;
+  if (!isCapacityClass) return null;
+  const scheduledRetryAt = coerceDate(currentRun.scheduledRetryAt);
+  if (!scheduledRetryAt) return null;
+  return { run: currentRun, scheduledRetryAt, overdue: scheduledRetryAt.getTime() <= now.getTime() };
+}
+
 function isTerminalIssueStatus(status: string | null | undefined) {
   return status === "done" || status === "cancelled";
 }
@@ -587,6 +650,13 @@ function formatMonitorGating(gating: NonNullable<ProductivityReviewEvidence["mon
     return `${split} (no monitor armed during this episode; previous monitor lapsed at ${gating.priorLapseAt.toISOString()}, before it began)`;
   }
   return `${split} (no monitor armed during this episode)`;
+}
+
+function formatCapacityGating(gating: NonNullable<ProductivityReviewEvidence["capacityGating"]>) {
+  const dueClause = gating.overdue
+    ? `due ${gating.scheduledRetryAt.toISOString()}, overdue and not yet promoted`
+    : `due ${gating.scheduledRetryAt.toISOString()}`;
+  return `${msToHumanFine(gating.stalledMs)} capacity-stalled (run \`${gating.runId}\` parked \`scheduled_retry\` on \`${gating.retryReason ?? gating.errorCode ?? "unknown"}\`, ${dueClause})`;
 }
 
 function isMonitorScheduledSuppression(
@@ -2163,13 +2233,58 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       ? trailingHoldMs
       : Math.min(episodeMs, leadingParkMs + trailingHoldMs);
 
+    // BLO-23248: the portion of elapsedMs attributable to the current run
+    // sitting in a capacity-class scheduled_retry, reported as its own
+    // evidence bucket distinct from monitor-gated/unattended (BLO-22331).
+    // stalledSince clamps to the episode start so a retry chain that outlives
+    // this episode (rare, but possible across a park→dispatch→re-park cycle)
+    // cannot report more capacity-stall time than the episode actually spans.
+    const capacityRetry = currentCapacityScheduledRetry(latestRuns, now);
+    const capacityGating = capacityRetry && attributableStartAt && elapsedMs !== null
+      ? (() => {
+          const stalledSince = latestDate(capacityRetry.run.createdAt, attributableStartAt) ?? attributableStartAt;
+          const stalledMs = Math.max(0, Math.min(elapsedMs, now.getTime() - stalledSince.getTime()));
+          return {
+            stalledMs,
+            runId: capacityRetry.run.id,
+            scheduledRetryAt: capacityRetry.scheduledRetryAt,
+            retryReason: capacityRetry.run.scheduledRetryReason,
+            errorCode: capacityRetry.run.errorCode,
+            overdue: capacityRetry.overdue,
+          };
+        })()
+      : null;
+    const capacityDominant = Boolean(
+      capacityGating
+        && elapsedMs !== null
+        && elapsedMs > 0
+        && capacityGating.stalledMs / elapsedMs > CAPACITY_STALL_DOMINANT_SHARE,
+    );
+    // Only suppress while the retry is genuinely still backing off
+    // (`scheduledRetryAt` in the future). Per BLO-22331 AC, this must not
+    // become indefinite: once due passes and the run sits unpromoted, that is
+    // itself the wedged-retry-chain signal the detector should surface (see
+    // BLO-22094's overdue-scheduled-retry gauge for the fleet-level view) —
+    // so `longActive` is allowed to fire again, with the evidence block and
+    // trigger-reason qualifier below naming the capacity stall explicitly
+    // rather than leaving the primary-trigger line reading as pure assignee
+    // inactivity.
+    const capacityDominantAndDue = capacityDominant && capacityGating !== null && !capacityGating.overdue;
+
     const noComment = noCommentStreak >= thresholds.noCommentStreakRuns;
     // Reuses `noCommentStreakRuns` as the sample-size threshold: both streaks
     // ask "how many consecutive terminal runs is suspicious", just over
     // disjoint filters (turn-executing vs never-executed). A separate config
     // knob would be redundant surface for the same question.
     const runtimeFailure = runtimeFailureStreak >= thresholds.noCommentStreakRuns;
-    const longActive = elapsedMs !== null && elapsedMs >= thresholds.longActiveMs;
+    // BLO-23248: while the dominant share of the episode is capacity-stalled
+    // AND that retry is still due in the future (fleet model-provider
+    // exhaustion the assignee cannot act on), long_active_duration does not
+    // fire — mirrors how a pending monitor/approval gate suppresses this same
+    // trigger below, just folded into the boolean rather than a parallel gate
+    // object, since (like those gates) this only ever affects
+    // `long_active_duration` specifically and never the other triggers.
+    const longActive = elapsedMs !== null && elapsedMs >= thresholds.longActiveMs && !capacityDominantAndDue;
     const highChurn =
       runCountLastHour >= thresholds.highChurnHourly ||
       assigneeRunCommentCountLastHour >= thresholds.highChurnHourly ||
@@ -2185,7 +2300,16 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       );
     }
     if (noComment) triggerReasons.push(`${noCommentStreak} consecutive terminal, turn-executing issue-linked runs had no run-created issue comment`);
-    if (longActive) triggerReasons.push(`current active episode has lasted ${msToHuman(elapsedMs)}`);
+    if (longActive) {
+      // BLO-23248: this only fires while capacity-dominant when the retry is
+      // *overdue* (capacityDominantAndDue already excluded the still-backing-off
+      // case above) — a stuck retry chain the assignee still cannot act on, so
+      // name the cause explicitly rather than reading as assignee inactivity.
+      const capacityNote = capacityDominant && capacityGating
+        ? ` — ${msToHuman(capacityGating.stalledMs)} of that is capacity-stalled behind an overdue \`scheduled_retry\` (run \`${capacityGating.runId}\`, due ${capacityGating.scheduledRetryAt.toISOString()}, not yet promoted); this is a fleet-capacity signal, not assignee inactivity`
+        : "";
+      triggerReasons.push(`current active episode has lasted ${msToHuman(elapsedMs)}${capacityNote}`);
+    }
     if (highChurn) {
       triggerReasons.push(
         `${runCountLastHour} runs/${assigneeRunCommentCountLastHour} assignee-run comments in 1h; ${runCountLastSixHours} runs/${assigneeRunCommentCountLastSixHours} assignee-run comments in 6h`,
@@ -2261,6 +2385,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       elapsedMs,
       nonLiveHoldMs,
       monitorGating: monitorGatingBreakdown(sourceIssue, attributableStartAt, elapsedMs, now),
+      capacityGating,
       latestRuns: latestRuns.slice(0, 5),
       latestComments,
       costCents: costRow.costCents,
@@ -2378,6 +2503,9 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       ...(evidence.monitorGating
         ? [`- Elapsed accounting: ${formatMonitorGating(evidence.monitorGating)}`]
         : []),
+      ...(evidence.capacityGating
+        ? [`- Capacity-stall accounting: ${formatCapacityGating(evidence.capacityGating)}`]
+        : []),
       `- Runs in rolling windows: ${evidence.runCountLastHour}/1h, ${evidence.runCountLastSixHours}/6h`,
       `- Assignee run-linked comments total/window: ${evidence.commentCount} total, ${evidence.commentCountLastHour}/1h, ${evidence.commentCountLastSixHours}/6h`,
       `- Cost events total: ${evidence.costCents} cents`,
@@ -2440,6 +2568,9 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       `- Runs/assignee comments: ${evidence.runCountLastHour}/${evidence.commentCountLastHour} in 1h, ${evidence.runCountLastSixHours}/${evidence.commentCountLastSixHours} in 6h`,
       ...(evidence.monitorGating
         ? [`- Elapsed accounting: ${formatMonitorGating(evidence.monitorGating)}`]
+        : []),
+      ...(evidence.capacityGating
+        ? [`- Capacity-stall accounting: ${formatCapacityGating(evidence.capacityGating)}`]
         : []),
       `- Next action: ${evidence.nextAction ? truncateInline(evidence.nextAction, 300) : "none recorded"}`,
     ].join("\n");
