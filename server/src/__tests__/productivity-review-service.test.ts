@@ -1375,12 +1375,18 @@ describeEmbeddedPostgres("productivity review service", () => {
     });
     // The most recent run for the issue is the still-future capacity retry —
     // `latestRuns[0]`, so it (not the older terminal runs) drives
-    // `capacityGating`.
+    // `capacityGating`. It must be STRICTLY newer than every streak run:
+    // `insertRuns` stamps its newest row at exactly `now`, so seeding this at
+    // `episodeStart` too tied the head of the `desc(createdAt), desc(id)`
+    // ordering, leaving the winner to be decided by which `randomUUID()` sorted
+    // higher — a ~50/50 flake that passed locally and failed in CI.
+    // `scheduled_retry` is in ACTIVE_RUN_STATUSES, not TERMINAL_RUN_STATUSES, so
+    // moving it later keeps it out of the `no_comment_streak` walk unchanged.
     await insertCapacityScheduledRetryRun({
       companyId: seeded.companyId,
       agentId: seeded.coderId,
       issueId: seeded.issueId,
-      createdAt: episodeStart,
+      createdAt: new Date(episodeStart.getTime() + 60_000),
       scheduledRetryAt: new Date(now.getTime() + 5 * 24 * 60 * 60 * 1000),
     });
 
