@@ -159,9 +159,126 @@ signal as production observability, verify the rendered rule in Prometheus
 at `/api/v1/rules` after deployment; the onprem-k8s change and Argo sync must
 be confirmed separately.
 
+## Overdue scheduled-retry (BLO-22094)
+
+Source: `server/src/services/queued-run-age-metrics.ts`
+(`refreshOverdueScheduledRetryAgeMetrics`), `server/src/services/metrics.ts`
+(`OVERDUE_SCHEDULED_RETRY_OLDEST_AGE_METRIC`,
+`setOverdueScheduledRetryAgeMetrics`)
+Trigger: alert `PaperclipOverdueScheduledRetry` —
+`max(paperclip_overdue_scheduled_retry_oldest_age_seconds) by (agent_id) > 5400`
+for 5m
+Owner: Platform / SRE (BLO-22094)
+
+### The invariant, and why it needed a second alert rather than reusing the one above
+
+A `heartbeat_runs` row at `status='scheduled_retry'` is **parked**, not
+dispatched — it has not yet reached the `queued` state `PaperclipQueuedRunStranded`
+covers. `promoteDueScheduledRetries` (`server/src/services/heartbeat.ts`) sweeps
+these on the same periodic tick as dispatch and should flip a row to `queued`
+(`promoteScheduledRetryRun`) within one tick of its `scheduled_retry_at` due
+time passing.
+
+`PaperclipQueuedRunStranded`'s gauge deliberately excludes `scheduled_retry`
+rows at any age — `refreshQueuedRunAgeMetrics` filters
+`status = 'queued'` only, and `promoteScheduledRetryRun` resets `queuedAt` on
+promotion, so a retry's backoff time never counts as queued-dispatch wait
+(Ally review, onprem-k8s#2013 — without that exclusion a retry promoted after
+hours of backoff would instantly report that whole backoff as a stranded
+queue). That exclusion is correct and stays. Its side effect is that a retry
+which parks and is **never promoted** was invisible to any gauge, forever —
+the promotion sweep could wedge and nothing would page. This alert is that
+missing detector: it ages `scheduled_retry` rows off their own `scheduled_retry_at`
+due time, counting only rows already overdue (`scheduled_retry_at < now()`).
+A row still backing off toward a future due time contributes exactly 0.
+
+### What to do when paged
+
+#### Step 1 — find the overdue rows for the paged agent
+
+```sql
+select id, agent_id, scheduled_retry_reason, scheduled_retry_attempt,
+       scheduled_retry_at, now() - scheduled_retry_at as overdue_by,
+       updated_at, now() - updated_at as since_last_touch,
+       context_snapshot ->> 'issueId' as issue_id
+from heartbeat_runs
+where status = 'scheduled_retry'
+  and scheduled_retry_at < now()
+  and agent_id = '<agent_id from the alert>'
+order by scheduled_retry_at asc
+limit 10;
+```
+
+#### Step 2 — tell a wedged promotion sweep apart from a gate legitimately re-deferring
+
+These look identical in the gauge (both are "a `scheduled_retry` row past its
+due time"), but need different responses. Do not assume every page here is a
+dead scheduler.
+
+- **A gate legitimately re-deferring.** `issue_dependencies_blocked` is the
+  concrete case (`heartbeat.ts`, the `DEP_BLOCKED_RETRY_REASON` branch of
+  `promoteScheduledRetryRun`): at promotion time it re-checks dependency
+  readiness, and if the blockers are still unresolved it rearms
+  `scheduled_retry_at` further out with exponential backoff and stays at
+  `status='scheduled_retry'` — logging `"dependencies still blocked at
+  promotion; re-deferred with backoff"` as a run event and incrementing the
+  `dep_blocked_redeferred` counter. This is designed backoff, not a strand.
+  **Diagnostic:** re-run the query from Step 1 a few seconds apart. A row
+  that is alive and re-deferring shows `updated_at`/`scheduled_retry_at`
+  moving forward each pass (the sweep is touching it, just re-arming it
+  faster than you're reading), and `scheduled_retry_attempt` climbing. Check
+  `GET /api/issues/{issueId}` (from `context_snapshot ->> 'issueId'`) for the
+  actual `blockedBy` set — if it is genuinely unresolved, this is the
+  dependency graph's problem to fix (chase the named blocker), not the
+  scheduler's.
+- **The promotion sweep is wedged.** `updated_at` on the row is stale —
+  unchanged since long before `scheduled_retry_at` passed, well past one
+  scheduler tick (default 30s). Confirm fleet-wide, not just this row: check
+  `heartbeat_run_events` for *any* recent `"Scheduled retry became due and was
+  promoted to the queued run pool"` or `"re-deferred with backoff"` message
+  across other agents/rows. If nothing has promoted or re-deferred fleet-wide
+  in the alerting window, `promoteDueScheduledRetries` itself has stopped
+  running — this shares its root cause with the "dropped dispatch" case in
+  the section above (`heartbeatSchedulerStopped` / `heartbeatStartupRecoveryPending`
+  stuck `true` silently no-ops the *entire* periodic chain, dispatch AND
+  retry promotion together, on that pod), or `getSchedulingSuppression()`
+  unexpectedly returning `suppressed: true`. If only this one agent's rows are
+  affected while other agents keep promoting normally, look for a lock or
+  exception specific to this row (e.g. a promotion attempt repeatedly
+  throwing before it can `UPDATE`) rather than a fleet-wide scheduler fault.
+
+### Silencing
+
+`severity: warning`. As with `PaperclipQueuedRunStranded`, silence on the
+alert name plus `agent_id` for a bounded window if you are deliberately
+holding an agent's retries back; do not raise
+`prometheusRule.overdueScheduledRetryAgeSeconds` to make a real strand quiet —
+that threshold was derived from a 7-day park→promotion population (p50=21.5s,
+p90=83.7s, p95=131.9s, p99=1594.8s, max=3567.5s over the 2026-07-31..2026-08-07
+window; see the `values.yaml` comment for the full derivation and the reason
+it margins off the worst single day's max rather than the aggregate p99).
+
+### Verifying the signal is live
+
+```
+paperclip_overdue_scheduled_retry_oldest_age_seconds
+```
+
+Zero-initialized per known agent on every `/metrics` scrape (reset-then-set,
+see `setOverdueScheduledRetryAgeMetrics`), same contract as
+`paperclip_queued_run_oldest_age_seconds` above — a healthy fleet renders **0**
+per agent, not "No data".
+
+Same onprem-k8s lockstep caveat as the section above applies here too: the
+chart copy at `deploy/helm/paperclip/templates/prometheusrule.yaml` does not
+deploy on Blockcast (`prometheusRule.enabled: false`) — verify this rule
+against `/api/v1/rules` in the environment that actually pages before relying
+on it, and confirm the `Blockcast/onprem-k8s` copy is in place if it isn't.
+
 ## References
 
 - `runbooks/README.md` — index
 - BLO-21116 — JSON-parse recovery classification and queued-run observability
+- BLO-22094 — the `PaperclipOverdueScheduledRetry` alert above
 - `runbooks/agent-wakeup-terminal-failed.md` — the sibling alert
 - BLO-19095 — the manual Argo sync gate between merge and deployment
