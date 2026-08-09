@@ -185,6 +185,7 @@ import {
 } from "../services/company-search-rate-limit.js";
 import {
   applyIssueExecutionPolicyTransition,
+  mergeIssueExecutionPolicyMonitor,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
   redactIssueMonitorExternalRef,
@@ -5222,7 +5223,26 @@ export function issueRoutes(
     if (Object.keys(body).length !== 1 || body.executionPolicy == null) return false;
     const currentMonitor = parseIssueExecutionState(issue.executionState)?.monitor ?? null;
     if (currentMonitor?.status !== "triggered") return false;
-    return Boolean(normalizeIssueExecutionPolicy(body.executionPolicy)?.monitor);
+    // The capability this unlocks is a monitor re-arm and nothing else. A body
+    // carrying only `executionPolicy` is NOT sufficient to establish that:
+    // `executionPolicy` is a whole-policy replace, so a policy that merely
+    // *contains* a monitor alongside `stages` or `authorizationPolicy` would let
+    // a manager rewrite a report's workflow and authorization configuration
+    // through a path that deliberately skips the ordinary mutation boundary.
+    //
+    // Checked on the *normalized* policy rather than the request's key set:
+    // `validate(updateIssueRouteSchema)` has already replaced req.body with the
+    // parsed result, and unlike the top-level `.partial()` object the nested
+    // policy schema does fire its defaults — a monitor-only policy arrives here
+    // as `{mode, commentRequired, stages, monitor}`. So key presence proves
+    // nothing and only the values do. `mode`/`commentRequired` are not checked
+    // because the merge at the write site keeps the report's own values and
+    // discards everything the request carried except the monitor.
+    const requestedPolicy = normalizeIssueExecutionPolicy(body.executionPolicy);
+    if (!requestedPolicy?.monitor) return false;
+    if (requestedPolicy.stages.length > 0) return false;
+    if (requestedPolicy.reviewPreset || requestedPolicy.authorizationPolicy) return false;
+    return true;
   }
 
   async function assertAgentIssueMutationAllowed(
@@ -10203,10 +10223,21 @@ export function issueRoutes(
       });
     }
     if (req.body.executionPolicy !== undefined) {
-      updateFields.executionPolicy = applyActorMonitorScheduledBy(
+      const requestedExecutionPolicy = applyActorMonitorScheduledBy(
         normalizeIssueExecutionPolicy(req.body.executionPolicy),
         actor.actorType,
       );
+      // A manager-chain re-arm is authorized to restore a *timer*, not to
+      // rewrite the policy. `isLapsedMonitorRearmPatch` already rejects a
+      // request carrying anything but a monitor; merging rather than replacing
+      // closes the other half — the write itself must not silently drop stages,
+      // reviewPreset, authorizationPolicy or mode that the assignee set.
+      updateFields.executionPolicy = managerMonitorRearmAuthorized
+        ? mergeIssueExecutionPolicyMonitor(
+          normalizeIssueExecutionPolicy(existing.executionPolicy ?? null),
+          requestedExecutionPolicy?.monitor ?? null,
+        )
+        : requestedExecutionPolicy;
     }
     const previousExecutionPolicy = normalizeIssueExecutionPolicy(existing.executionPolicy ?? null);
     const nextExecutionPolicy =

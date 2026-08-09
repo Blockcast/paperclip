@@ -589,6 +589,28 @@ export function setIssueExecutionPolicyMonitorScheduledBy(
   };
 }
 
+/**
+ * Merge a requested monitor into an existing policy rather than replacing the
+ * policy outright.
+ *
+ * `PATCH /issues/:id` writes `executionPolicy` wholesale, which is correct for
+ * an actor who already holds general mutation authority over the issue. It is
+ * wrong for the narrow manager-chain monitor re-arm (BLO-22860): that actor is
+ * *not* the assignee and holds no general mutation grant, so restoring a lapsed
+ * timer must not also drop the report's `stages`, `reviewPreset`,
+ * `authorizationPolicy` or `mode` as a side effect.
+ */
+export function mergeIssueExecutionPolicyMonitor(
+  previous: IssueExecutionPolicy | null,
+  monitor: IssueExecutionMonitorPolicy | null,
+): IssueExecutionPolicy | null {
+  if (!monitor) return previous;
+  if (!previous) {
+    return { mode: "normal", commentRequired: true, stages: [], monitor };
+  }
+  return { ...previous, monitor };
+}
+
 export function normalizeIssueExecutionPolicy(input: unknown): IssueExecutionPolicy | null {
   if (input == null) return null;
   const parsed = issueExecutionPolicySchema.safeParse(input);
