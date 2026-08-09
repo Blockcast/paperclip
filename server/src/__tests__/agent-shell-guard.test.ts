@@ -40,6 +40,16 @@ describe("classifyAgentShellCommand", () => {
     });
   });
 
+  it.each([
+    'for key in $(node scripts/safe-env-inspect.mjs); do printf "%s=%s\\n" "$key" "${!key}"; done',
+    'bash -lc \'for key in $(scripts/safe-env-inspect.mjs); do printf "%s=%s\\n" "$key" "${!key}"; done\'',
+  ])("blocks Bash indirect expansion composed with safe env inspection: %s", (command) => {
+    expect(classifyAgentShellCommand(command)).toEqual({
+      action: "block",
+      reason: "full_environment_dump",
+    });
+  });
+
   it("does not block scoped env reads", () => {
     expect(classifyAgentShellCommand("printenv PATH")).toEqual({
       action: "allow",
