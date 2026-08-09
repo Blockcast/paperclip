@@ -6172,6 +6172,11 @@ export function recoveryService(
               comment: buildExecutionReviewParticipantUnavailableComment(participantLatestRun),
               recoveryCause: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
               recoveryOwnerAgentId: participantAgentId,
+              expectedReviewStage: {
+                stageId: pendingExecutionState.currentStageId,
+                participantAgentId,
+                executionRunId: issue.executionRunId,
+              },
             });
             if (updated) {
               result.escalated += 1;
@@ -6274,6 +6279,11 @@ export function recoveryService(
             comment: buildExecutionReviewParticipantUnavailableComment(participantLatestRun),
             recoveryCause: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
             recoveryOwnerAgentId: participantAgentId,
+            expectedReviewStage: {
+              stageId: pendingExecutionState.currentStageId,
+              participantAgentId,
+              executionRunId: issue.executionRunId,
+            },
           });
           if (updated) {
             result.escalated += 1;
@@ -6292,6 +6302,11 @@ export function recoveryService(
             comment: buildExecutionReviewParticipantRecoveryComment(participantLatestRun),
             recoveryCause: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
             recoveryOwnerAgentId: participantAgentId,
+            expectedReviewStage: {
+              stageId: pendingExecutionState.currentStageId,
+              participantAgentId,
+              executionRunId: issue.executionRunId,
+            },
           });
           if (updated) {
             result.escalated += 1;
