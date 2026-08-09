@@ -10,6 +10,7 @@ import type { Db } from "@paperclipai/db";
 import { executionWorkspaces, issueComments, issues, projectWorkspaces, workspaceRuntimeServices } from "@paperclipai/db";
 import {
   listWorkspaceServiceCommandDefinitions,
+  type ExecutionWorkspaceRunScope,
   type GitWorktreeBranchAncestryVerdict,
   type GitWorktreeBranchIncoherenceEvidence as SharedGitWorktreeBranchIncoherenceEvidence,
   type GitWorktreeInProgressOperation,
@@ -628,6 +629,56 @@ function isAbsolutePath(value: string) {
   return path.isAbsolute(value) || value.startsWith("~");
 }
 
+/** Width of the hex run token appended to per-run branch names. */
+const RUN_SCOPE_TOKEN_LENGTH = 8;
+/** Keep the composed name inside sanitizeBranchName's 120-char ceiling. */
+const BRANCH_NAME_MAX_LENGTH = 120;
+
+/**
+ * BLO-19063: derive a run-scoped branch name so that two concurrent runs never
+ * share a working tree.
+ *
+ * Worktrees are keyed by branch name (`worktreePath = join(parentDir, branch)`),
+ * so making the branch run-unique makes the *path* run-unique for free. It also
+ * keeps `git worktree add` legal: git refuses to check the same branch out
+ * twice, so a per-run tree genuinely requires a per-run branch, not just a
+ * per-run directory.
+ *
+ * The issue identifier is preserved verbatim in the result, so the BLO-9117
+ * ref-linking guarantee (see applyIssueIdentifierToBranchName) still holds — the
+ * token is appended, never substituted. Returns `branchName` unchanged for
+ * `per_issue` scope or when no run id is available, which is what keeps this
+ * opt-in rather than a fleet-wide migration.
+ */
+export function applyRunScopeToBranchName(
+  branchName: string,
+  runScope: ExecutionWorkspaceRunScope | null | undefined,
+  heartbeatRunId: string | null | undefined,
+): string {
+  if (runScope !== "per_run") return branchName;
+  // Derive the token from the raw run id rather than via sanitizeBranchName:
+  // that helper substitutes a literal "paperclip-work" for empty input, which
+  // would turn every run *without* a run id into the same token ("papercli")
+  // and silently collapse them back onto one shared tree while still looking
+  // per-run. A missing id must degrade to the issue-scoped name loudly, not to
+  // a colliding one quietly.
+  const token = (heartbeatRunId ?? "")
+    .replace(/[^A-Za-z0-9]+/g, "")
+    .slice(0, RUN_SCOPE_TOKEN_LENGTH)
+    .toLowerCase();
+  // No usable run id (e.g. a non-heartbeat realize path): fall back to the
+  // issue-scoped name rather than inventing a token, which would strand a tree
+  // nothing can find again.
+  if (!token) return branchName;
+  const suffix = `-r${token}`;
+  const base = branchName.slice(0, BRANCH_NAME_MAX_LENGTH - suffix.length);
+  return sanitizeBranchName(`${base}${suffix}`);
+}
+
+function resolveExecutionWorkspaceRunScope(raw: unknown): ExecutionWorkspaceRunScope {
+  return asString(raw, "") === "per_run" ? "per_run" : "per_issue";
+}
+
 function resolveConfiguredPath(value: string, baseDir: string): string {
   if (isAbsolutePath(value)) {
     return resolveHomeAwarePath(value);
@@ -684,6 +735,18 @@ function createProcessOutputCapture(maxBytes: number): ProcessOutputAccumulator 
   };
 }
 
+/**
+ * `process.kill(-pgid, 0)` cannot distinguish a running process group from a
+ * group leader that has exited but not yet been reaped by its parent: the
+ * kernel keeps a zombie's PID reserved until `wait()` is called, so signal 0
+ * still succeeds against it. That makes an unreaped-zombie leader read as
+ * "alive". Accepted as a documented false *degrade* (a live tree misreported
+ * as gone would be the dangerous direction; this is the safe one) rather than
+ * corrected -- the alternative is parsing `/proc/<pid>/stat` for state `Z`,
+ * which is Linux-only and buys a nuisance fix on the safe side of the
+ * failure. See the `isProcessGroupAlive` test coverage for the documented
+ * behaviour.
+ */
 function isProcessGroupAlive(processGroupId: number): boolean {
   if (process.platform === "win32") return false;
   if (processGroupLivenessProbeForTests) return processGroupLivenessProbeForTests(processGroupId);
@@ -823,11 +886,22 @@ async function executeProcess(input: {
       timeoutTimer = globalThis.setTimeout(() => {
         timedOut = true;
         terminateChildProcess(child, "SIGTERM");
+        // Settle from *this* timer, not from the SIGTERM callback above: a
+        // child wedged in uninterruptible I/O (D state) never delivers
+        // SIGKILL, so it emits neither `exit` nor `close`, and without this
+        // the wall-clock budget stops being enforced the moment SIGKILL is
+        // merely scheduled -- the exact stranding BLO-18784 removed, reached
+        // by a different route (BLO-20047). Settling here instead of inline
+        // on SIGTERM preserves the 5s grace for a child that honours it.
+        // `settle` already escalates to SIGKILL + a bounded liveness wait
+        // when `timedOut`, so the redundant kill below is harmless.
+        // Must hold the event loop open to fire even with nothing else
+        // pending -- do not `.unref()` it.
         killTimer = globalThis.setTimeout(() => {
           killTimer = null;
           terminateChildProcess(child, "SIGKILL");
+          settle(null, { destroyStreams: true });
         }, 5_000);
-        killTimer.unref?.();
       }, timeoutMs);
     }
     child.stdout?.on("data", onStdoutData);
@@ -896,6 +970,15 @@ async function executeProcess(input: {
  * `setSubmoduleInspectSettingsForTests`.
  */
 export const executeProcessForTests = executeProcess;
+
+/**
+ * Test seam for `isProcessGroupAlive`. Every other test drives the
+ * `setProcessGroupLivenessProbeForTests` override, which proves the policy
+ * built on top of this function but never exercises the primitive itself --
+ * see its doc comment for the accepted zombie-leader false positive this is
+ * meant to cover.
+ */
+export const isProcessGroupAliveForTests = isProcessGroupAlive;
 
 /**
  * Raised when a git subprocess exceeded its wall-clock budget. Distinguished from
@@ -2822,10 +2905,25 @@ function describeSubmoduleInspectionDegradation(cwd: string, inspection: { reaso
  * Best-effort: bookkeeping must not defeat the point of degrading. If the
  * recorder itself fails we swallow it and still let the run proceed -- the
  * human-readable warning is returned to the caller either way.
+ *
+ * `cause` separates two operationally distinct degrades that used to share
+ * this one action name with no other structured distinction: `inconclusive_
+ * probe` means the probe itself never reached a conclusion (retries
+ * exhausted with no evidence either way); `repair_withheld` means the probe
+ * *did* find a real fault (missing submodules, from salvaged partial output)
+ * but automatic repair was skipped because the previous timed-out process
+ * group was still alive. Evidence queries need this to be a stable field, not
+ * a prose match on `reason`.
  */
 async function recordSubmoduleInspectionDegradation(
   recorder: WorkspaceOperationRecorder | null | undefined,
-  input: { cwd: string; reason: string; attempts: number; stage: "initial" | "post_repair" },
+  input: {
+    cwd: string;
+    reason: string;
+    attempts: number;
+    stage: "initial" | "post_repair";
+    cause: "inconclusive_probe" | "repair_withheld";
+  },
 ): Promise<void> {
   if (!recorder) return;
   const settings = readSubmoduleInspectSettings();
@@ -2838,6 +2936,7 @@ async function recordSubmoduleInspectionDegradation(
         cwd: input.cwd,
         action: "submodule_inspection_degraded",
         stage: input.stage,
+        cause: input.cause,
         attempts: input.attempts,
         timeoutMs: settings.timeoutMs,
         reason: input.reason,
@@ -2875,6 +2974,7 @@ async function ensureGitSubmodulesReady(input: {
       reason: inspection.reason,
       attempts: inspection.attempts,
       stage: "initial",
+      cause: "inconclusive_probe",
     });
     return [warning];
   }
@@ -2909,6 +3009,7 @@ async function ensureGitSubmodulesReady(input: {
       reason,
       attempts: inspection.attempts ?? 1,
       stage: "initial",
+      cause: "repair_withheld",
     });
     return [
       `Could not safely initialize git submodules for execution workspace "${input.cwd}" (${missingPaths.join(", ")}): ` +
@@ -2983,6 +3084,7 @@ async function ensureGitSubmodulesReady(input: {
       reason: verification.reason,
       attempts: verification.attempts,
       stage: "post_repair",
+      cause: "inconclusive_probe",
     });
     return [
       `Initialized git submodules before starting: ${missingPaths.join(", ")}`,
@@ -3648,7 +3750,15 @@ export async function realizeExecutionWorkspace(input: {
   // Option (A) (BLO-9117): process-enforce the issue identifier into the branch
   // name so a merged PR reliably ref-links at merge time. See
   // applyIssueIdentifierToBranchName.
-  let branchName = applyIssueIdentifierToBranchName(renderedBranch, input.issue?.identifier ?? null);
+  //
+  // BLO-19063: then, under `runScope: "per_run"`, append a run token so two
+  // concurrent runs of this issue land in different trees instead of sharing
+  // one. Applied after the identifier step so the identifier survives.
+  let branchName = applyRunScopeToBranchName(
+    applyIssueIdentifierToBranchName(renderedBranch, input.issue?.identifier ?? null),
+    resolveExecutionWorkspaceRunScope(rawStrategy.runScope),
+    input.heartbeatRunId ?? null,
+  );
   const configuredParentDir = asString(rawStrategy.worktreeParentDir, "");
   const worktreeParentDir = configuredParentDir
     ? resolveConfiguredPath(configuredParentDir, repoRoot)

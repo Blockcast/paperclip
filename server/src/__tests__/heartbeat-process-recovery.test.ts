@@ -60,6 +60,7 @@ const mockTelemetryClient = vi.hoisted(() => ({ track: vi.fn() }));
 const mockTrackAgentFirstHeartbeat = vi.hoisted(() => vi.fn());
 const mockTerminateLocalService = vi.hoisted(() => vi.fn());
 const mockGithubHasReviewerEvidenceForPr = vi.hoisted(() => vi.fn());
+const mockGithubGetPullRequestGate = vi.hoisted(() => vi.fn());
 const mockAdapterExecute = vi.hoisted(() =>
   vi.fn<
     (ctx: {
@@ -105,6 +106,7 @@ vi.mock("../services/github-app-auth.ts", async () => {
   );
   return {
     ...actual,
+    githubGetPullRequestGate: mockGithubGetPullRequestGate,
     githubHasReviewerEvidenceForPr: mockGithubHasReviewerEvidenceForPr,
   };
 });
@@ -271,6 +273,7 @@ import {
   SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY,
   SUCCESSFUL_RUN_MISSING_STATE_REASON,
 } from "../services/recovery/index.ts";
+import { ISSUE_ASSIGNMENT_RECOVERY_PER_AGENT_SWEEP_LIMIT } from "../services/recovery/service.ts";
 import type { PluginEventBus, ScopedPluginEventBus } from "../services/plugin-event-bus.js";
 import type { PluginEvent } from "@paperclipai/plugin-sdk";
 import {
@@ -471,6 +474,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     mockTerminateLocalService.mockImplementation(localServiceSupervisor.terminateLocalService);
     mockHasActiveJobForAgent.mockImplementation(async () => false);
     mockGithubHasReviewerEvidenceForPr.mockResolvedValue({ found: false });
+    mockGithubGetPullRequestGate.mockResolvedValue({ state: "open", merged: false });
     mockAdapterExecute.mockImplementation(async () => ({
       exitCode: 0,
       signal: null,
@@ -1580,6 +1584,109 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(runs).toHaveLength(0);
   });
 
+  it("reaps a no-progress external run against its original deadline after a service restart", async () => {
+    const stale = new Date(Date.now() - 46 * 60 * 1000);
+    const jobName = "agent-opencode-original-deadline";
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      includeIssue: false,
+      externalRunId: jobName,
+      lastOutputAt: stale,
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({ startedAt: stale, lastUsefulActionAt: null })
+      .where(eq(heartbeatRuns.id, runId));
+    await seedAdapterInvokeEvent({ companyId, agentId, runId });
+    await seedLaunchedReservation({ companyId, agentId, runId, jobName, jobUid: "original-deadline-uid" });
+    mockListAgentJobRunStatuses.mockResolvedValueOnce(new Map([[runId, {
+      phase: "active",
+      name: jobName,
+      uid: "original-deadline-uid",
+    }]]));
+
+    const restartedHeartbeat = createHeartbeat();
+    const result = await restartedHeartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+
+    expect(result.runIds).toContain(runId);
+    expect(await restartedHeartbeat.getRun(runId)).toMatchObject({
+      status: "failed",
+      errorCode: "external_lifecycle_stale_killed",
+    });
+    expect(mockDeleteAgentJobsForRun).toHaveBeenCalledWith({
+      runId,
+      agentId,
+      name: jobName,
+      uid: "original-deadline-uid",
+    });
+  });
+
+  it("keeps a long-running external Job when durable useful progress is recent", async () => {
+    const stale = new Date(Date.now() - 46 * 60 * 1000);
+    const recentProgress = new Date(Date.now() - 60 * 1000);
+    const jobName = "agent-opencode-recent-progress";
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      includeIssue: false,
+      externalRunId: jobName,
+      lastOutputAt: stale,
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({ startedAt: stale, lastUsefulActionAt: recentProgress })
+      .where(eq(heartbeatRuns.id, runId));
+    await seedAdapterInvokeEvent({ companyId, agentId, runId });
+    await seedLaunchedReservation({ companyId, agentId, runId, jobName, jobUid: "recent-progress-uid" });
+    mockListAgentJobRunStatuses.mockResolvedValueOnce(new Map([[runId, {
+      phase: "active",
+      name: jobName,
+      uid: "recent-progress-uid",
+    }]]));
+
+    const result = await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+
+    expect(result.runIds).not.toContain(runId);
+    expect((await heartbeat.getRun(runId))?.status).toBe("running");
+    expect(mockDeleteAgentJobsForRun).not.toHaveBeenCalled();
+  });
+
+  it("does not re-adopt an external Job after its PR gate closes", async () => {
+    const jobName = "agent-opencode-closed-pr";
+    const jobUid = "closed-pr-uid";
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      externalRunId: jobName,
+      contextSnapshot: {
+        wakeReason: "github_pr_review_requested",
+        reviewKind: "pr_review",
+        githubRepoFullName: "Blockcast/paperclip",
+        githubPrNumber: 847,
+      },
+    });
+    await seedLaunchedReservation({ companyId, agentId, runId, jobName, jobUid });
+    mockListManagedAgentJobs.mockResolvedValueOnce([{
+      phase: "active",
+      reason: null,
+      message: null,
+      runId,
+      agentId,
+      name: jobName,
+      uid: jobUid,
+      createdAt: new Date(),
+    }]);
+    mockGithubGetPullRequestGate.mockResolvedValueOnce({ state: "closed", merged: false });
+
+    const resumed = await heartbeat.resumeRunningExternalRuntimeRuns();
+
+    expect(resumed).toBe(0);
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+    expect(await heartbeat.getRun(runId)).toMatchObject({
+      status: "cancelled",
+      errorCode: "external_gate_terminal",
+    });
+    expect(mockDeleteAgentJobsForRun).toHaveBeenCalledWith({ runId, agentId, name: jobName, uid: jobUid });
+  });
+
   it.each(["reserved", "launching"] as const)(
     "keeps a six-minute-old pre-adapter run while its %s reservation still owns launch",
     async (state) => {
@@ -2271,7 +2378,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .from(issues)
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
-    expect(issue?.executionRunId).toBe(retryRun?.id ?? null);
+    expect(issue?.executionRunId).toBeNull();
     expect(issue?.checkoutRunId).toBeNull();
   });
 
@@ -2632,7 +2739,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
     expect(issue?.checkoutRunId).toBeNull();
-    expect(issue?.executionRunId).toBe(retryRun?.id);
+    expect(issue?.executionRunId).toBeNull();
   });
 
   it("does not overwrite a run that is no longer running during graceful shutdown drain", async () => {
@@ -2774,7 +2881,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
     expect(issue?.checkoutRunId).toBeNull();
-    expect(issue?.executionRunId).toBe(secondRetry?.id);
+    expect(issue?.executionRunId).toBeNull();
   });
 
   it("releases active environment leases when an orphaned run is reaped", async () => {
@@ -2852,7 +2959,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .from(issues)
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
-    expect(issue?.executionRunId).toBe(retryRun?.id ?? null);
+    expect(issue?.executionRunId).toBeNull();
   });
 
   it("blocks the issue when process-loss retry is exhausted and the immediate continuation recovery also fails", async () => {
@@ -3067,6 +3174,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       db
         .select({
           lastOutputAt: heartbeatRuns.lastOutputAt,
+          lastUsefulActionAt: heartbeatRuns.lastUsefulActionAt,
           lastOutputSeq: heartbeatRuns.lastOutputSeq,
           lastOutputStream: heartbeatRuns.lastOutputStream,
         })
@@ -3107,9 +3215,40 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(progressAfterKeepalive?.lastOutputAt?.toISOString() ?? null).toBe(
       progressBeforeKeepalive?.lastOutputAt?.toISOString() ?? null,
     );
+    expect(progressAfterKeepalive?.lastUsefulActionAt?.toISOString() ?? null).toBe(
+      progressBeforeKeepalive?.lastUsefulActionAt?.toISOString() ?? null,
+    );
     expect(progressAfterKeepalive?.lastOutputSeq).toBe(progressBeforeKeepalive?.lastOutputSeq);
     expect(progressAfterKeepalive?.lastOutputStream).toBe(progressBeforeKeepalive?.lastOutputStream);
     expect(settledRun?.stdoutExcerpt ?? "").not.toContain("[paperclip] keepalive");
+  });
+
+  it("persists useful progress while an external-lifecycle run is still active", async () => {
+    let liveProgress: Date | null = null;
+    mockAdapterExecute.mockImplementationOnce(async (ctx) => {
+      await ctx.onLog?.("stdout", "Agent completed a repository inspection.\n");
+      liveProgress = await db
+        .select({ lastUsefulActionAt: heartbeatRuns.lastUsefulActionAt })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, ctx.runId))
+        .then((rows) => rows[0]?.lastUsefulActionAt ?? null);
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: "Completed after reporting progress.",
+        provider: "test",
+        model: "test-model",
+        resultJson: { result: "done" },
+      };
+    });
+
+    const { runId } = await seedQueuedIssueRunFixture();
+    await heartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(heartbeat, runId);
+
+    expect(liveProgress).toBeInstanceOf(Date);
   });
 
   async function settleClaimedPrReview(
@@ -3365,7 +3504,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
     expect(issue?.status).toBe("in_progress");
-    expect(issue?.executionRunId).toBe(retryRun?.id ?? null);
+    expect(issue?.executionRunId).toBeNull();
 
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
     expect(comments).toHaveLength(0);
@@ -3503,7 +3642,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .then((rows) => rows[0] ?? null);
     expect(issue).toEqual({
       status: "in_review",
-      executionRunId: retryRun?.id ?? null,
+      executionRunId: null,
     });
 
     const comments = await waitForValue(async () => {
@@ -5289,6 +5428,166 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     }
   });
 
+  it("caps assignment recovery per agent and skips issues with live execution locks", async () => {
+    const { companyId, agentId, issueId } = await seedAssignedTodoNoRunFixture({
+      agentStatus: "running",
+    });
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const activeRunId = randomUUID();
+    const secondAgentId = randomUUID();
+    const secondActiveRunId = randomUUID();
+    const lockedIssueId = randomUUID();
+    const additionalIssueIds = Array.from(
+      { length: ISSUE_ASSIGNMENT_RECOVERY_PER_AGENT_SWEEP_LIMIT + 1 },
+      () => randomUUID(),
+    );
+    const secondAgentIssueIds = Array.from(
+      { length: ISSUE_ASSIGNMENT_RECOVERY_PER_AGENT_SWEEP_LIMIT + 1 },
+      () => randomUUID(),
+    );
+
+    await db
+      .update(agents)
+      .set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } })
+      .where(eq(agents.id, agentId));
+
+    await db.insert(agents).values({
+      id: secondAgentId,
+      companyId,
+      name: "SecondCoder",
+      role: "engineer",
+      status: "running",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+
+    await db.insert(heartbeatRuns).values([
+      {
+        id: activeRunId,
+        companyId,
+        agentId,
+        invocationSource: "automation",
+        status: "running",
+        startedAt: new Date(),
+        contextSnapshot: {},
+      },
+      {
+        id: secondActiveRunId,
+        companyId,
+        agentId: secondAgentId,
+        invocationSource: "automation",
+        status: "running",
+        startedAt: new Date(),
+        contextSnapshot: {},
+      },
+    ]);
+    await db.insert(issues).values([
+      ...additionalIssueIds.map((id, index) => ({
+        id,
+        companyId,
+        title: `Recovery candidate ${index + 2}`,
+        status: "todo" as const,
+        priority: "medium" as const,
+        assigneeAgentId: agentId,
+        responsibleUserId: "responsible-user",
+        issueNumber: index + 2,
+        identifier: `${issuePrefix}-${index + 2}`,
+      })),
+      {
+        id: lockedIssueId,
+        companyId,
+        title: "Already running recovery candidate",
+        status: "todo",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        responsibleUserId: "responsible-user",
+        executionRunId: activeRunId,
+        executionAgentNameKey: "codexcoder",
+        executionLockedAt: new Date(),
+        issueNumber: additionalIssueIds.length + 2,
+        identifier: `${issuePrefix}-${additionalIssueIds.length + 2}`,
+      },
+      ...secondAgentIssueIds.map((id, index) => ({
+        id,
+        companyId,
+        title: `Second-agent recovery candidate ${index + 1}`,
+        status: "todo" as const,
+        priority: "medium" as const,
+        assigneeAgentId: secondAgentId,
+        responsibleUserId: "responsible-user",
+        issueNumber: additionalIssueIds.length + index + 3,
+        identifier: `${issuePrefix}-${additionalIssueIds.length + index + 3}`,
+      })),
+    ]);
+
+    await Promise.all([
+      heartbeat.reconcileStrandedAssignedIssues(),
+      heartbeat.reconcileStrandedAssignedIssues(),
+    ]);
+
+    const firstAgentQueuedRuns = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "queued")));
+    expect(firstAgentQueuedRuns).toHaveLength(ISSUE_ASSIGNMENT_RECOVERY_PER_AGENT_SWEEP_LIMIT);
+    expect(firstAgentQueuedRuns.every((run) => run.contextSnapshot &&
+      (run.contextSnapshot as Record<string, unknown>).issueId !== lockedIssueId)).toBe(true);
+    const secondAgentQueuedRuns = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.agentId, secondAgentId), eq(heartbeatRuns.status, "queued")));
+    expect(secondAgentQueuedRuns).toHaveLength(ISSUE_ASSIGNMENT_RECOVERY_PER_AGENT_SWEEP_LIMIT);
+
+    const candidateRows = await db
+      .select({ id: issues.id, executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(inArray(issues.id, [issueId, ...additionalIssueIds, ...secondAgentIssueIds]));
+    expect(candidateRows).toHaveLength(additionalIssueIds.length + secondAgentIssueIds.length + 1);
+    expect(candidateRows.every((issue) => issue.executionRunId === null)).toBe(true);
+
+    const lockedIssue = await db
+      .select({ executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, lockedIssueId))
+      .then((rows) => rows[0] ?? null);
+    expect(lockedIssue?.executionRunId).toBe(activeRunId);
+  });
+
+  it("expires abandoned assignment recovery reservations before applying the per-agent cap", async () => {
+    const { companyId, agentId } = await seedAssignedTodoNoRunFixture({
+      agentStatus: "running",
+    });
+    const oldReservationTime = new Date(Date.now() - 2 * 60 * 60_000);
+    await db.insert(agentWakeupRequests).values(
+      Array.from({ length: ISSUE_ASSIGNMENT_RECOVERY_PER_AGENT_SWEEP_LIMIT }, () => ({
+        companyId,
+        agentId,
+        source: "automation" as const,
+        triggerDetail: "system",
+        reason: "issue_assignment_recovery_capacity_reservation",
+        status: "assignment_recovery_capacity_reserved",
+        createdAt: oldReservationTime,
+        updatedAt: oldReservationTime,
+      })),
+    );
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.assignmentDispatched).toBe(1);
+    const recoveryRuns = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(recoveryRuns).toHaveLength(1);
+    const staleReservations = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.status, "assignment_recovery_capacity_reserved"));
+    expect(staleReservations).toHaveLength(0);
+  });
+
   it("does not duplicate initial assigned todo dispatch when a queued wake already exists", async () => {
     const { companyId, agentId, issueId } = await seedAssignedTodoNoRunFixture();
     await db.insert(agentWakeupRequests).values({
@@ -5361,7 +5660,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         triggerDetail: "first",
         status: "queued",
         wakeupRequestId: olderWakeupId,
-        contextSnapshot: { issueId },
+        contextSnapshot: { issueId, wakeReason: "issue_assigned" },
         createdAt: olderTime,
         updatedAt: olderTime,
       },
@@ -5373,7 +5672,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         triggerDetail: "second",
         status: "queued",
         wakeupRequestId: newerWakeupId,
-        contextSnapshot: { issueId },
+        contextSnapshot: { issueId, wakeReason: "issue_assigned" },
         createdAt: newerTime,
         updatedAt: newerTime,
       },
@@ -5460,7 +5759,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     await heartbeat.resumeQueuedRuns();
 
     const run = await heartbeat.getRun(queuedRunId);
-    expect(mockHasActiveJobForAgent).toHaveBeenCalledWith(agentId);
+    expect(mockHasActiveJobForAgent).toHaveBeenCalledWith(
+      agentId,
+      expect.objectContaining({ isRunTerminal: expect.any(Function) }),
+    );
     expect(run?.status).toBe("queued");
     expect(mockAdapterExecute.mock.calls.some(([ctx]) => ctx.runId === queuedRunId)).toBe(false);
   });

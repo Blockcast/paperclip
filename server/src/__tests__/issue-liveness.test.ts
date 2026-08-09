@@ -693,4 +693,179 @@ describe("issue graph liveness classifier", () => {
     expect(findings.filter((f) => f.state === "invalid_review_participant")).toEqual([]);
     expect(findings).toEqual([]);
   });
+
+  describe("monitor-only executionState is not a review workflow (BLO-20725)", () => {
+    const now = new Date("2026-08-02T00:00:00.000Z");
+    const reviewIssueId = "review-monitor-only-1";
+
+    // The exact BLO-19001 shape that produced the false BLO-20627 escalation: no
+    // execution policy, no stages, no participant -- the monitor is the only
+    // populated substructure, and it has already fired without being re-armed.
+    function monitorOnlyIssue(overrides: Record<string, unknown> = {}) {
+      return issue({
+        id: reviewIssueId,
+        identifier: "BLO-19001",
+        title: "Parked in review behind a monitor",
+        status: "in_review",
+        assigneeAgentId: coderId,
+        executionPolicy: null,
+        executionState: {
+          status: "idle",
+          currentStageId: null,
+          currentStageIndex: null,
+          currentStageType: null,
+          currentParticipant: null,
+          returnAssignee: null,
+          reviewRequest: null,
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+          monitor: {
+            status: "triggered",
+            nextCheckAt: null,
+            lastTriggeredAt: "2026-08-01T22:00:00.000Z",
+            attemptCount: 4,
+          },
+        },
+        monitorNextCheckAt: null,
+        monitorAttemptCount: 4,
+        ...overrides,
+      });
+    }
+
+    it("does not report invalid_review_participant when an expired monitor is the only executionState content", () => {
+      const findings = classifyIssueGraphLiveness({
+        issues: [monitorOnlyIssue()],
+        relations: [],
+        agents: [agent(), manager],
+        now,
+      });
+
+      expect(findings.filter((f) => f.state === "invalid_review_participant")).toEqual([]);
+    });
+
+    it("classifies the monitor-only issue exactly like an executionState: null issue", () => {
+      const monitorFindings = classifyIssueGraphLiveness({
+        issues: [monitorOnlyIssue()],
+        relations: [],
+        agents: [agent(), manager],
+        now,
+      });
+      const bareFindings = classifyIssueGraphLiveness({
+        issues: [monitorOnlyIssue({ executionState: null, monitorAttemptCount: null })],
+        relations: [],
+        agents: [agent(), manager],
+        now,
+      });
+
+      // The inconsistency this fixes: arming a monitor was the only difference
+      // between these two issues, and it flipped the finding to a participant
+      // repair for a review workflow that never existed.
+      expect(monitorFindings).toEqual(bareFindings);
+      expect(monitorFindings).toHaveLength(1);
+      expect(monitorFindings[0]).toMatchObject({
+        state: "in_review_without_action_path",
+        recoveryIssueId: reviewIssueId,
+      });
+    });
+
+    it("still reports invalid_review_participant when a participant names an unresolvable agent", () => {
+      const findings = classifyIssueGraphLiveness({
+        issues: [
+          monitorOnlyIssue({
+            executionState: {
+              status: "pending",
+              currentStageId: "stage-1",
+              currentStageIndex: 0,
+              currentStageType: "review",
+              currentParticipant: { type: "agent", agentId: "missing-agent" },
+              returnAssignee: { type: "agent", agentId: coderId },
+              reviewRequest: null,
+              completedStageIds: [],
+              lastDecisionId: null,
+              lastDecisionOutcome: null,
+              monitor: { status: "triggered", nextCheckAt: null, attemptCount: 4 },
+            },
+          }),
+        ],
+        relations: [],
+        agents: [agent(), manager],
+        now,
+      });
+
+      expect(findings).toHaveLength(1);
+      expect(findings[0]).toMatchObject({
+        state: "invalid_review_participant",
+        incidentKey: `harness_liveness:${companyId}:${reviewIssueId}:invalid_review_participant:missing-agent`,
+      });
+    });
+
+    it("still reports invalid_review_participant when a configured review stage has an unresolvable participant", () => {
+      // No participant agent id and no resolvable participant user, but the
+      // policy carries a real review stage -- the genuine "review workflow is
+      // corrupt" case that must keep firing.
+      const findings = classifyIssueGraphLiveness({
+        issues: [
+          monitorOnlyIssue({
+            executionPolicy: {
+              mode: "normal",
+              commentRequired: true,
+              stages: [{ id: "stage-1", type: "review", approvalsNeeded: 1, participants: [] }],
+            },
+            executionState: {
+              status: "pending",
+              currentStageId: null,
+              currentStageIndex: null,
+              currentStageType: null,
+              currentParticipant: { type: "agent" },
+              returnAssignee: null,
+              reviewRequest: null,
+              completedStageIds: [],
+              lastDecisionId: null,
+              lastDecisionOutcome: null,
+              monitor: { status: "triggered", nextCheckAt: null, attemptCount: 4 },
+            },
+          }),
+        ],
+        relations: [],
+        agents: [agent(), manager],
+        now,
+      });
+
+      expect(findings).toHaveLength(1);
+      expect(findings[0]).toMatchObject({
+        state: "invalid_review_participant",
+        recoveryIssueId: reviewIssueId,
+      });
+    });
+
+    it("keeps suppressing every finding while the monitor is still scheduled", () => {
+      const findings = classifyIssueGraphLiveness({
+        issues: [
+          monitorOnlyIssue({
+            executionState: {
+              status: "idle",
+              currentStageId: null,
+              currentStageIndex: null,
+              currentStageType: null,
+              currentParticipant: null,
+              returnAssignee: null,
+              reviewRequest: null,
+              completedStageIds: [],
+              lastDecisionId: null,
+              lastDecisionOutcome: null,
+              monitor: { status: "scheduled", nextCheckAt: "2026-08-02T01:00:00.000Z", attemptCount: 1 },
+            },
+            monitorNextCheckAt: new Date("2026-08-02T01:00:00.000Z"),
+            monitorAttemptCount: 1,
+          }),
+        ],
+        relations: [],
+        agents: [agent(), manager],
+        now,
+      });
+
+      expect(findings).toEqual([]);
+    });
+  });
 });

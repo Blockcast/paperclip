@@ -5,7 +5,28 @@ const workflowsDir = path.resolve(".github/workflows");
 const workflowFiles = (await readdir(workflowsDir))
   .filter((file) => file.endsWith(".yml") || file.endsWith(".yaml"))
   .sort();
-const ALLOWED_RUNNERS = new Set(["default", "arc-light", "arc-dind", "arc-deploy", "arc-e2e"]);
+const ALLOWED_RUNNERS = new Set([
+  "default",
+  "arc-light",
+  "arc-dind",
+  "arc-deploy",
+  "arc-e2e",
+  "arc-merge-queue",
+  "arc-paperclip-buildkit",
+  "arc-paperclip-general",
+]);
+
+// BLO-22428: a handful of heavy jobs route merge_group traffic to the
+// dedicated arc-merge-queue pool while pull_request traffic uses the
+// repository-scoped arc-paperclip-general pool, via
+// `runs-on: ${{ <cond> && 'X' || 'Y' }}`. This checker
+// otherwise treats the whole `${{ ... }}` value as one opaque runner name,
+// which would flag that expression as an unknown label. Recognize exactly
+// this one ternary shape and validate both literal branches individually;
+// any other expression shape still falls through to the opaque-string path
+// below and fails closed as an unrecognized runner label.
+const TERNARY_RUNNER_EXPRESSION =
+  /^\$\{\{\s*github\.event_name\s*==\s*'merge_group'\s*&&\s*'([^']*)'\s*\|\|\s*'([^']*)'\s*\}\}$/;
 const violations = [];
 
 function stripInlineComment(value) {
@@ -62,7 +83,10 @@ function valuesFromScalar(value) {
   const inlineList = splitInlineList(value);
   if (inlineList) return inlineList;
   const scalar = unquote(value);
-  return scalar ? [scalar] : [];
+  if (!scalar) return [];
+  const ternaryMatch = scalar.match(TERNARY_RUNNER_EXPRESSION);
+  if (ternaryMatch) return [ternaryMatch[1], ternaryMatch[2]];
+  return [scalar];
 }
 
 function leadingSpaces(line) {
