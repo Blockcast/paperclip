@@ -4,8 +4,10 @@ import { describe, it } from "node:test";
 import { pathToFileURL } from "node:url";
 
 import {
+  assertHeadSha,
   assertPrListComplete,
   attestedHead,
+  distinctVerdicts,
   findPrViolations,
   findViolations,
   hasBlockingFindings,
@@ -13,6 +15,7 @@ import {
   isAllyLogin,
   isMainModule,
   operativeAllyReviews,
+  requiredIdentityAttestationPairs,
 } from "./check-ally-review-consistency.mjs";
 
 const HEAD = "ff1c72dbfd18014c838cf1373b1640dd17378f3e";
@@ -175,7 +178,7 @@ describe("findPrViolations", () => {
     };
     const violations = findPrViolations(pr);
     assert.equal(violations.length, 2);
-    assert.match(violations[0], /^I1 PR #876 @ff1c72db: 2 operative Ally verdicts/);
+    assert.match(violations[0], /^I1 PR #876 @ff1c72db: 2 logical Ally verdicts/);
     assert.match(violations[1], /^I2b PR #876 @ff1c72db: standing APPROVED \(4829069732\)/);
   });
 
@@ -319,5 +322,190 @@ describe("assertPrListComplete", () => {
 
   it("tolerates a nullish list", () => {
     assert.doesNotThrow(() => assertPrListComplete(undefined, "o/r", 10));
+  });
+});
+
+const APP_UID = 290875700;
+const USER_UID = 296676656;
+
+/** The required App/User exact-head evidence pair: one body, two identities. */
+function credentialPair(body) {
+  return [
+    { ...review({ id: 11, state: "APPROVED", body }), user: { login: "allyblockcast[bot]", id: APP_UID } },
+    { ...review({ id: 12, state: "APPROVED", body }), user: { login: "allyblockcast", id: USER_UID } },
+  ];
+}
+
+describe("requiredIdentityAttestationPairs", () => {
+  const body = `## Ally — Consolidated PR Review\nReviewed head: ${HEAD}\n`;
+
+  it("groups an identical body posted under the required App and User identities", () => {
+    const groups = requiredIdentityAttestationPairs(credentialPair(body), HEAD);
+    assert.equal(groups.length, 1);
+    assert.deepEqual(groups[0].map((r) => r.id), [11, 12]);
+  });
+
+  it("does not group two identical bodies from the same identity — that is a retry", () => {
+    const reviews = credentialPair(body).map((r) => ({ ...r, user: { login: "allyblockcast", id: USER_UID } }));
+    assert.deepEqual(requiredIdentityAttestationPairs(reviews, HEAD), []);
+  });
+
+  it("does not group different bodies across the two identities — those are two real verdicts", () => {
+    const [app, user] = credentialPair(body);
+    assert.deepEqual(
+      requiredIdentityAttestationPairs([app, { ...user, body: `${body}\n### Important Issues (1)\n- something` }], HEAD),
+      [],
+    );
+  });
+
+  it("ignores a review recorded against a different head", () => {
+    const [app, user] = credentialPair(body);
+    assert.deepEqual(requiredIdentityAttestationPairs([app, { ...user, commit_id: OTHER }], HEAD), []);
+  });
+
+  it("does not group a triple with a same-identity retry", () => {
+    const [app, user] = credentialPair(body);
+    const retry = { ...user, id: 13 };
+    assert.deepEqual(requiredIdentityAttestationPairs([app, user, retry], HEAD), []);
+  });
+
+  it("does not group an unexpected or missing credential ID", () => {
+    const [app, user] = credentialPair(body);
+    assert.deepEqual(
+      requiredIdentityAttestationPairs(
+        [app, user, { ...user, id: 13, user: { login: "allyblockcast", id: 42 } }],
+        HEAD,
+      ),
+      [],
+    );
+    assert.deepEqual(
+      requiredIdentityAttestationPairs(
+        [app, user, { ...user, id: 13, user: { login: "allyblockcast" } }],
+        HEAD,
+      ),
+      [],
+    );
+  });
+});
+
+describe("distinctVerdicts", () => {
+  const body = `## Ally — Consolidated PR Review\nReviewed head: ${HEAD}\n`;
+
+  it("collapses the required identity pair to its single logical verdict", () => {
+    assert.deepEqual(distinctVerdicts(credentialPair(body), HEAD).map((r) => r.id), [11]);
+  });
+
+  it("keeps a same-account duplicate, so a retry still trips I1", () => {
+    const reviews = credentialPair(body).map((r) => ({ ...r, user: { login: "allyblockcast", id: USER_UID } }));
+    assert.equal(distinctVerdicts(reviews, HEAD).length, 2);
+  });
+});
+
+describe("I1 after required-identity pair collapse", () => {
+  const body = `## Ally — Consolidated PR Review\nReviewed head: ${HEAD}\n`;
+
+  it("does not fire on a required App/User pair", () => {
+    const violations = findPrViolations({ number: 1129, headSha: HEAD, reviews: credentialPair(body) });
+    assert.deepEqual(violations.filter((v) => v.startsWith("I1")), []);
+  });
+
+  it("still fires when the two accounts submit genuinely different verdicts", () => {
+    const [app, user] = credentialPair(body);
+    const blocker = { ...app, body: `${body}\n### Important Issues (1)\n- real finding` };
+    const violations = findPrViolations({ number: 876, headSha: HEAD, reviews: [blocker, user] });
+    assert.equal(violations.filter((v) => v.startsWith("I1")).length, 1);
+  });
+
+  it("keeps an extra same-identity retry visible to I1", () => {
+    const [app, user] = credentialPair(body);
+    const violations = findPrViolations({
+      number: 1193,
+      headSha: HEAD,
+      reviews: [app, user, { ...user, id: 13 }],
+    });
+    assert.equal(violations.filter((v) => v.startsWith("I1")).length, 1);
+  });
+
+  it("keeps an unexpected or missing credential ID visible to I1", () => {
+    const [app, user] = credentialPair(body);
+    const unexpected = findPrViolations({
+      number: 1194,
+      headSha: HEAD,
+      reviews: [app, user, { ...user, id: 13, user: { login: "allyblockcast", id: 42 } }],
+    });
+    const missing = findPrViolations({
+      number: 1195,
+      headSha: HEAD,
+      reviews: [app, user, { ...user, id: 13, user: { login: "allyblockcast" } }],
+    });
+    assert.equal(unexpected.filter((v) => v.startsWith("I1")).length, 1);
+    assert.equal(missing.filter((v) => v.startsWith("I1")).length, 1);
+  });
+});
+
+describe("I2d — APPROVED with no attestation line", () => {
+  it("fires on the #1114 shape: a short APPROVED that attests nothing", () => {
+    const reviews = [
+      review({
+        id: 4879433972,
+        state: "APPROVED",
+        body: "Approved the current CI head. The implementation is unchanged; this head only retriggers checks.",
+      }),
+    ];
+    const violations = findPrViolations({ number: 1114, headSha: HEAD, reviews });
+    assert.equal(violations.filter((v) => v.startsWith("I2d")).length, 1);
+  });
+
+  it("does not fire on an APPROVED that does attest the head", () => {
+    const reviews = [review({ id: 1, state: "APPROVED" })];
+    assert.deepEqual(
+      findPrViolations({ number: 1, headSha: HEAD, reviews }).filter((v) => v.startsWith("I2d")),
+      [],
+    );
+  });
+
+  it("does not fire on a COMMENTED review with no attestation — only an approval claims soundness", () => {
+    const reviews = [review({ id: 1, state: "COMMENTED", body: "no attestation here" })];
+    assert.deepEqual(
+      findPrViolations({ number: 1, headSha: HEAD, reviews }).filter((v) => v.startsWith("I2d")),
+      [],
+    );
+  });
+});
+
+describe("assertHeadSha", () => {
+  it("passes a well-formed 40-hex head", () => {
+    const row = { number: 1, headRefOid: HEAD };
+    assert.equal(assertHeadSha(row, "o/r"), row);
+  });
+
+  for (const bad of [undefined, null, "", "not-a-sha", HEAD.slice(0, 39), HEAD.toUpperCase()]) {
+    it(`throws on ${JSON.stringify(bad)} rather than asserting nothing`, () => {
+      assert.throws(() => assertHeadSha({ number: 7, headRefOid: bad }, "o/r"), /no usable headRefOid/);
+    });
+  }
+
+  it("names the PR so the failure is actionable", () => {
+    assert.throws(() => assertHeadSha({ number: 42, headRefOid: null }, "o/r"), /o\/r#42/);
+  });
+});
+
+describe("a falsy head would otherwise silently pass a maximal violation", () => {
+  it("finds every invariant broken at the real head", () => {
+    const reviews = [
+      review({ id: 1, state: "APPROVED", body: `Reviewed head: ${OTHER}\n### Critical Issues (3)\n- boom` }),
+      review({ id: 2, state: "COMMENTED", body: `Reviewed head: ${HEAD}\n### Important Issues (1)\n- boom` }),
+    ];
+    assert.ok(findPrViolations({ number: 9, headSha: HEAD, reviews }).length >= 4);
+  });
+
+  it("finds nothing at all when the head is falsy — which is why assertHeadSha exists", () => {
+    const reviews = [
+      review({ id: 1, state: "APPROVED", body: `Reviewed head: ${OTHER}\n### Critical Issues (3)\n- boom` }),
+      review({ id: 2, state: "COMMENTED", body: `Reviewed head: ${HEAD}\n### Important Issues (1)\n- boom` }),
+    ];
+    for (const head of [undefined, null, ""]) {
+      assert.deepEqual(findPrViolations({ number: 9, headSha: head, reviews }), []);
+    }
   });
 });
