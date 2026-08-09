@@ -13,10 +13,6 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  SCCACHE_GHA_ENABLED: "true"
-  RUSTC_WRAPPER: sccache
-  CC: "sccache gcc"
-  CXX: "sccache g++"
   PR_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
   PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
 
@@ -80,11 +76,40 @@ jobs:
       - name: Validate Docker deploy timeout margin
         run: node --test ./scripts/check-docker-deploy-timeout.test.js
 
+      - name: Test CI cache and Docker runner routing
+        run: node --test ./scripts/__tests__/ci-cache-routing.test.mjs
+
       - name: Reject git push in adapter/runtime code
         run: node ./scripts/check-no-git-push.mjs
 
       - name: Test no-git-push check
         run: node --test ./scripts/check-no-git-push.test.mjs
+
+      - name: Reject App-attributed commits on the PR (BLO-21416)
+        # Non-merge commits stamped with the shared allyblockcast[bot] App
+        # identity mean the commit was created via the GitHub REST/MCP write
+        # path (contents API, merge API, `create_or_update_file`/
+        # `push_files`) instead of `git push` — see AGENTS.md §9. Uses the
+        # already-checked-out history (fetch-depth: 0 above), no new token.
+        #
+        # There is deliberately NO branch exemption. The graphify-reindex bot
+        # commits via `git push` under its own git identity
+        # (`allyblockcast[bot]@users.noreply.github.com`), which is not the
+        # REST-path stamp this gate matches
+        # (`290875700+allyblockcast[bot]@users.noreply.github.com`) — measured
+        # by running this script over the real graphify PRs #789 and #944:
+        # both pass. A `github.head_ref`-keyed exemption was therefore
+        # protecting against a rejection that never happens, while being both
+        # a fork bypass (any fork can name its branch `bot/graphify-reindex`,
+        # and `head_ref` carries no repository identity) and a merge-queue
+        # false-reject (`head_ref` is empty in `merge_group`). Pinned by the
+        # graphify-identity case in check-commit-author-attribution.test.mjs —
+        # if that test starts failing, the bot moved onto the REST write path
+        # and the right fix is to move it back, not to re-add an exemption.
+        run: node ./scripts/check-commit-author-attribution.mjs --base "$PR_BASE_SHA" --head "$PR_HEAD_SHA"
+
+      - name: Test commit-author-attribution check
+        run: node --test ./scripts/check-commit-author-attribution.test.mjs
 
       - name: Test gh token wrapper
         run: node --test ./scripts/gh-token-wrapper.test.mjs
@@ -246,9 +271,6 @@ jobs:
         with:
           node-version: 24
           cache: pnpm
-
-      - name: Set up GHA-backed sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -451,9 +473,6 @@ jobs:
           node-version: 24
           cache: pnpm
 
-      - name: Set up GHA-backed sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
-
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
@@ -603,9 +622,6 @@ jobs:
           node-version: 24
           cache: pnpm
 
-      - name: Set up GHA-backed sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
-
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
@@ -645,9 +661,6 @@ jobs:
         with:
           node-version: 24
           cache: pnpm
-
-      - name: Set up GHA-backed sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -707,9 +720,6 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
-
-      - name: Set up GHA-backed sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile

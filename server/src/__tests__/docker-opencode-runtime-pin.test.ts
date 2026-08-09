@@ -126,8 +126,11 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
     expect(serverDockerfile).not.toContain("git apply /vendor/opencode-k8s-run-isolation-working-dir.patch");
   });
 
-  it("routes Paperclip Docker image builds through the DIND runner pool", () => {
-    expect(dockerWorkflow.match(/runs-on: arc-dind/g)).toHaveLength(1);
+  it("routes server image builds through the dedicated remote BuildKit pool", () => {
+    expect(dockerWorkflow.match(/runs-on: arc-paperclip-buildkit/g)).toHaveLength(1);
+    expect(dockerWorkflow).not.toContain("runs-on: arc-dind");
+    expect(dockerWorkflow).toContain("driver: remote");
+    expect(dockerWorkflow).toContain("endpoint: tcp://buildkit-amd64.ci.svc.cluster.local:1234");
     expect(dockerWorkflow.match(/runs-on: arc-deploy/g)).toHaveLength(1);
     expect(dockerWorkflow).toContain(
       "if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}",
