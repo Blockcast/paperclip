@@ -877,6 +877,131 @@ describeEmbeddedPostgres("productivity review service", () => {
       const [refreshedReview] = await listProductivityReviews(seeded.companyId);
       expect(refreshedReview?.description).toBe(originalDescription);
     });
+
+    it("still regenerates a stale description after the refresh-comment cap is reached, without posting another comment", async () => {
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const seeded = await seedAssignedIssue();
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+      });
+
+      const service = productivityReviewService(db);
+      await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+      const [review] = await listProductivityReviews(seeded.companyId);
+
+      // Exhaust the DEFAULT_PRODUCTIVITY_REVIEW_MAX_REFRESH_COMMENTS cap (3)
+      // with unchanged-trigger refreshes, exactly like the existing
+      // "caps refresh comments" coverage above.
+      let cursor = now;
+      for (let i = 0; i < DEFAULT_PRODUCTIVITY_REVIEW_MAX_REFRESH_COMMENTS; i += 1) {
+        cursor = new Date(cursor.getTime() + DEFAULT_PRODUCTIVITY_REVIEW_REFRESH_INTERVAL_MS);
+        await insertRuns({
+          companyId: seeded.companyId,
+          agentId: seeded.coderId,
+          issueId: seeded.issueId,
+          count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+          now: cursor,
+        });
+        await service.reconcileProductivityReviews({ now: cursor, companyId: seeded.companyId });
+      }
+      expect(await listRefreshComments(review!.id)).toHaveLength(DEFAULT_PRODUCTIVITY_REVIEW_MAX_REFRESH_COMMENTS);
+
+      // The cap is now hit. A further refresh that only repeats the same
+      // trigger should stay throttled...
+      const stillNoOpAt = new Date(cursor.getTime() + DEFAULT_PRODUCTIVITY_REVIEW_REFRESH_INTERVAL_MS);
+      const noOpRefresh = await service.reconcileProductivityReviews({
+        now: stillNoOpAt,
+        companyId: seeded.companyId,
+      });
+      expect(noOpRefresh.updated).toBe(0);
+      expect(noOpRefresh.existing).toBe(1);
+
+      // ...but a trigger flip must still correct the Manager Decision block —
+      // the comment cap bounds comment churn, not correctness of the guidance.
+      const flipAt = new Date(stillNoOpAt.getTime() + DEFAULT_PRODUCTIVITY_REVIEW_REFRESH_INTERVAL_MS);
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now: flipAt,
+        status: "failed",
+        livenessState: "failed",
+        usageJson: { inputTokens: 0, outputTokens: 0 },
+      });
+      const flipRefresh = await service.reconcileProductivityReviews({ now: flipAt, companyId: seeded.companyId });
+      expect(flipRefresh.updated).toBe(1);
+
+      const [afterFlip] = await listProductivityReviews(seeded.companyId);
+      expect(afterFlip?.description).toContain("Primary trigger: `runtime_failure_streak`");
+      expect(afterFlip?.description).toContain("do not decompose, block, or cancel");
+      // No new comment: the cap still bounds comment churn.
+      expect(await listRefreshComments(review!.id)).toHaveLength(DEFAULT_PRODUCTIVITY_REVIEW_MAX_REFRESH_COMMENTS);
+    });
+
+    it("preserves a description edited concurrently with a trigger-flip refresh instead of clobbering it", async () => {
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const seeded = await seedAssignedIssue();
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+      });
+
+      const service = productivityReviewService(db);
+      await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+      const [review] = await listProductivityReviews(seeded.companyId);
+      expect(review?.description).toContain("Primary trigger: `no_comment_streak`");
+
+      const refreshAt = new Date(now.getTime() + DEFAULT_PRODUCTIVITY_REVIEW_REFRESH_INTERVAL_MS);
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now: refreshAt,
+        status: "failed",
+        livenessState: "failed",
+        usageJson: { inputTokens: 0, outputTokens: 0 },
+      });
+
+      const concurrentlyEditedDescription = `${review!.description}\n\nManager note: escalating directly, do not overwrite.`;
+
+      // Simulate a human editing the review issue's description directly
+      // (e.g. via the issues API) in the window between this refresh's outer
+      // read of `existing` and the transaction's guarded UPDATE. The
+      // advisory lock only serializes this refresh path against itself; it
+      // says nothing about a plain issue edit landing concurrently.
+      const originalTransaction = db.transaction.bind(db);
+      const transactionSpy = vi.spyOn(db, "transaction").mockImplementation(
+        (async (...args: Parameters<typeof db.transaction>) => {
+          await db
+            .update(issues)
+            .set({ description: concurrentlyEditedDescription })
+            .where(eq(issues.id, review!.id));
+          return originalTransaction(...args);
+        }) as typeof db.transaction,
+      );
+
+      try {
+        const refresh = await service.reconcileProductivityReviews({ now: refreshAt, companyId: seeded.companyId });
+        // The refresh comment still gets appended — only the description
+        // overwrite lost the race.
+        expect(refresh.updated).toBe(1);
+      } finally {
+        transactionSpy.mockRestore();
+      }
+
+      const [afterRefresh] = await listProductivityReviews(seeded.companyId);
+      expect(afterRefresh?.description).toBe(concurrentlyEditedDescription);
+      expect(afterRefresh?.description).not.toContain("Primary trigger: `runtime_failure_streak`");
+    });
   });
 
   it("allows only one productivity review per source issue in 24 hours", async () => {
