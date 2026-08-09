@@ -59,6 +59,8 @@ describe("PEN-1198 audit dependency remediation", () => {
   it("keeps nanoid outside the GHSA-28wg-ghj8-5hjv vulnerable range", () => {
     expect(rootPackageJson.pnpm.overrides.nanoid).toBe(">=5.1.16 <6");
     expect(rootLockfile).toContain("nanoid@5.1.16:");
-    expect(rootLockfile).not.toMatch(/^  nanoid@5\.1\.(?:[0-9]|1[0-5]):$/m);
+    expect(rootLockfile).not.toMatch(
+      /^  nanoid@(?:4\.\d+\.\d+|5\.0\.\d+|5\.1\.(?:[0-9]|1[0-5])):$/m,
+    );
   });
 });
