@@ -1,5 +1,14 @@
-import { readFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { cp, mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
+
+const execFileAsync = promisify(execFile);
+const repoRoot = new URL("../../../", import.meta.url);
+const repoRootPath = fileURLToPath(repoRoot);
 
 const rootPackageJson = JSON.parse(
   await readFile(new URL("../../../package.json", import.meta.url), "utf8"),
@@ -7,6 +16,40 @@ const rootPackageJson = JSON.parse(
 const serverPackageJson = JSON.parse(
   await readFile(new URL("../../package.json", import.meta.url), "utf8"),
 );
+
+function isVulnerableNanoidVersion([major, minor, patch]: number[]) {
+  return (
+    major === 4 ||
+    (major === 5 && (minor === 0 || (minor === 1 && patch <= 15)))
+  );
+}
+
+async function copyLockfileFixture(fixtureRoot: string) {
+  const { stdout } = await execFileAsync(
+    "git",
+    [
+      "ls-files",
+      "--",
+      "package.json",
+      "**/package.json",
+      "pnpm-workspace.yaml",
+      ".npmrc",
+      "pnpmfile.cjs",
+      "pnpmfile.js",
+      "pnpmfile.mjs",
+      "patches",
+    ],
+    { cwd: repoRootPath },
+  );
+
+  for (const sourceRelativePath of stdout.split("\n").filter(Boolean)) {
+    const source = join(repoRootPath, sourceRelativePath);
+    const destination = join(fixtureRoot, sourceRelativePath);
+
+    await mkdir(dirname(destination), { recursive: true });
+    await cp(source, destination, { recursive: true });
+  }
+}
 
 describe("PEN-1198 audit dependency remediation", () => {
   it("keeps high-risk production dependency paths on patched ranges", () => {
@@ -51,4 +94,61 @@ describe("PEN-1198 audit dependency remediation", () => {
       advisories: expect.arrayContaining(["GHSA-5p4m-2wfm-xmqj"]),
     });
   });
+
+  it(
+    "keeps nanoid outside the GHSA-28wg-ghj8-5hjv vulnerable range",
+    async () => {
+      const tmpRoot = await mkdtemp(join(tmpdir(), "paperclip-nanoid-"));
+      const fixtureRoot = join(tmpRoot, "repo");
+
+      try {
+        await copyLockfileFixture(fixtureRoot);
+
+        // Human and agent PRs do not commit pnpm-lock.yaml. Recreate the
+        // policy-job artifact from workspace manifests in a disposable fixture
+        // before asserting the resolved dependency graph.
+        await execFileAsync(
+          "pnpm",
+          [
+            "install",
+            "--lockfile-only",
+            "--ignore-scripts",
+            "--no-frozen-lockfile",
+          ],
+          { cwd: fixtureRoot, maxBuffer: 1024 * 1024 * 20 },
+        );
+
+        const fixturePackageJson = JSON.parse(
+          await readFile(join(fixtureRoot, "package.json"), "utf8"),
+        );
+        const lockfile = await readFile(
+          join(fixtureRoot, "pnpm-lock.yaml"),
+          "utf8",
+        );
+
+        expect(fixturePackageJson.pnpm.overrides.nanoid).toBe(">=5.1.16 <6");
+        expect(lockfile).toMatch(
+          /^  nanoid@5\.1\.16:\n    resolution: \{integrity: .+\}$/m,
+        );
+
+        const vulnerableVersions = Array.from(
+          lockfile.matchAll(
+            /^  nanoid@(\d+)\.(\d+)\.(\d+)(?=[:(])/gm,
+          ),
+          ([, major, minor, patch]) => [
+            Number(major),
+            Number(minor),
+            Number(patch),
+          ],
+        )
+          .filter(isVulnerableNanoidVersion)
+          .map((version) => version.join("."));
+
+        expect(vulnerableVersions).toEqual([]);
+      } finally {
+        await rm(tmpRoot, { recursive: true, force: true });
+      }
+    },
+    120_000,
+  );
 });

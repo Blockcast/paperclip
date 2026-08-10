@@ -234,7 +234,10 @@ jobs:
         with:
           context: .
           platforms: linux/amd64
-          push: true
+          # Gzip level 1 cuts CPU spent materializing newly changed application
+          # layers. Keep force-compression disabled so imported cache layers
+          # retain their existing blobs instead of being recompressed.
+          outputs: type=image,push=true,compression=gzip,compression-level=1
           # Skip SBOM + provenance attestations. v6 adds them by default,
           # which makes the registry serve an OCI image index with
           # attestation-manifest entries containing very small blobs (550–750

@@ -73,6 +73,7 @@ import {
   updateUserSecretValueSchema,
   // Approval
   createApprovalSchema,
+  listApprovalsQuerySchema,
   resolveApprovalSchema,
   requestApprovalRevisionSchema,
   resubmitApprovalSchema,
@@ -2841,8 +2842,14 @@ registry.registerPath({
   path: "/api/companies/{companyId}/approvals",
   tags: ["approvals"],
   summary: "List approvals in a company",
-  request: { params: z.object({ companyId: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  description:
+    "view=full (default) returns whole payload bodies. Use view=count or view=summary for a cheap " +
+    "existence check before filing a new approval — summary omits payload and adds a derived label.",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    query: listApprovalsQuerySchema,
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
 });
 
 registry.registerPath({

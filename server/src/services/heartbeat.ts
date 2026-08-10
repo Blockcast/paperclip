@@ -170,7 +170,6 @@ import {
 } from "./run-liveness.js";
 import {
   ISSUE_NEW_INPUT_ACTIVITY_ACTIONS,
-  ISSUE_PROGRESS_ACTIVITY_ACTIONS,
   ISSUE_REWAKE_LOOKBACK_MS,
   ISSUE_REWAKE_RUN_SAMPLE_LIMIT,
   evaluateIssueRewakeThrottle,
@@ -282,6 +281,7 @@ import {
   type PenstockAvailabilityGate,
   type PenstockAvailabilityGateDenyResult,
 } from "./penstock-availability-gate.js";
+import { resolveCcrotateCapacityRetry, clampTransientRetryHorizon } from "./ccrotate-capacity-retry.js";
 import {
   evaluateExecutionAllowlist,
   isExecutionForcedToKubernetes,
@@ -13569,8 +13569,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
           return { outcome: "not_promoted", run: exhausted };
         }
-        const nextDueAt =
-          capacity.resumeAt ?? new Date(now.getTime() + CCROTATE_CAPACITY_DEFAULT_RETRY_DELAY_MS);
+        // BLO-23438: clamp + jitter rather than honouring the advertised reset
+        // verbatim. This is the only path that can shorten a park, and it runs
+        // solely when the run is already due, so an unbounded horizon here
+        // freezes the task until that horizon even after capacity returns.
+        const capacityRetryPlan = resolveCcrotateCapacityRetry({
+          resumeAt: capacity.resumeAt,
+          now,
+          defaultRetryDelayMs: CCROTATE_CAPACITY_DEFAULT_RETRY_DELAY_MS,
+        });
+        const nextDueAt = capacityRetryPlan.retryAt;
         const rescheduled = await db
           .update(heartbeatRuns)
           .set({ scheduledRetryAttempt: nextAttempt, scheduledRetryAt: nextDueAt, updatedAt: now })
@@ -13594,6 +13602,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               scheduledRetryAt: nextDueAt.toISOString(),
               ccrotateTarget: capacity.target,
               providerCapacityReason: capacity.reason,
+              ...(capacityRetryPlan.clampedFromIso
+                ? { capacityParkClampedFrom: capacityRetryPlan.clampedFromIso }
+                : {}),
               ...(capacity.penstockProvider ? { penstockProvider: capacity.penstockProvider } : {}),
               ...(capacity.penstockModel ? { penstockModel: capacity.penstockModel } : {}),
               ...(capacity.penstockRetryAfterSeconds !== undefined
@@ -14098,12 +14109,30 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
     }
 
+    // BLO-23438: the advertised floor is honoured, but not unboundedly. Without
+    // a ceiling any run finalized with a far-future `retryNotBefore` parks until
+    // that instant — the in-run k8s ccrotate path breaks out precisely to hand
+    // this scheduler a multi-day reset, so clamping the capacity gate alone
+    // leaves this route to the same freeze wide open.
+    //
+    // `provider_quota` is deliberately exempt. That family carries a contractual
+    // window boundary (a session/billing reset), not a capacity estimate:
+    // retrying before it fails deterministically, so clamping would just burn
+    // attempts against a wall. The horizons this ticket is about are capacity
+    // guesses, which are the ones that go stale or arrive fabricated.
+    const clampTransientHorizon =
+      transientRetryNotBefore !== null && transientRecovery?.errorFamily !== "provider_quota";
+    const clampedTransientRetry =
+      clampTransientHorizon && transientRetryNotBefore
+        ? clampTransientRetryHorizon({ retryNotBefore: transientRetryNotBefore, now })
+        : null;
+    const effectiveRetryNotBefore = clampedTransientRetry?.dueAt ?? transientRetryNotBefore;
     const schedule =
-      transientRetryNotBefore && transientRetryNotBefore.getTime() > baseSchedule.dueAt.getTime()
+      effectiveRetryNotBefore && effectiveRetryNotBefore.getTime() > baseSchedule.dueAt.getTime()
         ? {
             ...baseSchedule,
-            dueAt: transientRetryNotBefore,
-            delayMs: Math.max(0, transientRetryNotBefore.getTime() - now.getTime()),
+            dueAt: effectiveRetryNotBefore,
+            delayMs: Math.max(0, effectiveRetryNotBefore.getTime() - now.getTime()),
           }
         : baseSchedule;
 
@@ -14177,6 +14206,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       scheduledRetryAttempt: schedule.attempt,
       scheduledRetryAt: schedule.dueAt.toISOString(),
       ...(transientRetryNotBefore ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
+      ...(clampedTransientRetry?.clampedFromIso
+        ? { transientRetryHorizonClampedFrom: clampedTransientRetry.clampedFromIso }
+        : {}),
       ...(transientRecovery?.errorFamily === "provider_quota" && transientRetryNotBefore
         ? { providerQuotaRetryNotBefore: transientRetryNotBefore.toISOString() }
         : {}),
@@ -14524,6 +14556,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 eq(executionWorkspaces.companyId, run.companyId),
               ));
 
+            // This action has no plugin-event mapping, so no outbox write can
+            // escape the transaction; keep the default publication semantics.
             await logActivity(tx as unknown as Db, {
               companyId: run.companyId,
               actorType: "system",
@@ -18968,9 +19002,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * survive across passes.
    */
   type DispatchCursor = { createdAt: string; id: string };
-  type DispatchRun = typeof heartbeatRuns.$inferSelect & {
-    dispatchCreatedAtCursor: string;
-  };
   const dispatchRunSelection = {
     ...getTableColumns(heartbeatRuns),
     dispatchCreatedAtCursor: sql<string>`${heartbeatRuns.createdAt}::text`.as(
@@ -18996,6 +19027,149 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   const dispatchDeferredRunIdsByAgent = new Map<string, Set<string>>();
   const dispatchResumeCapRetryTimersByAgent = new Map<string, ReturnType<typeof setTimeout>>();
   const dispatchAdmissionRetryTimersByAgent = new Map<string, ReturnType<typeof setTimeout>>();
+
+  /**
+   * BLO-20736: read one keyset page of an agent's queued runs in two phases.
+   *
+   * Phase 1 projects ONLY (created_at, id). Both live in
+   * heartbeat_runs_agent_dispatch_idx alongside the (agent_id, status) prefix,
+   * so the whole page comes from the index with no heap access at all — an
+   * `Index Only Scan`, ordered, that stops after `limit` entries.
+   *
+   * That projection is the entire point, and it is a cost-model fix rather than
+   * a cosmetic one. PostgreSQL estimates `agent_id = $1` and `status = 'queued'`
+   * independently and multiplies their selectivities, but the two are almost
+   * perfectly correlated here: a backlogged agent's rows are overwhelmingly
+   * queued and an idle agent has none. Measured on a 200k-row interleaved
+   * fixture the estimate came out 200x low at depth 1000 (rows=5 vs 1000) and
+   * 42x low at depth 5000 (rows=120 vs 5000). On an estimate that small the
+   * planner stops treating LIMIT as a reason to preserve index order and picks
+   * `Bitmap Heap Scan` + top-N `Sort` instead. A sort cannot emit its first row
+   * until it has consumed its whole input, so the dispatcher read and sorted the
+   * agent's ENTIRE queue to return 200 rows — 10,400 rows inspected at depth
+   * 5000, growing with the backlog, all while the strict per-agent start lock is
+   * held.
+   *
+   * Fetching only index columns removes the planner's incentive: with zero heap
+   * fetches the ordered path's LIMIT-scaled cost is ~10 whether the planner
+   * believes 126 rows or 5167, while the bitmap alternative still has to
+   * materialize the entire match set before its sort can emit. So the plan is
+   * correct *despite* the bad estimate rather than needing the estimate fixed.
+   * Verified stable at a still-40x-wrong estimate.
+   *
+   * Deliberately NOT fixed with extended statistics: `CREATE STATISTICS ON
+   * (agent_id, status)` does correct the estimate (rows=1107 vs 1000 actual) and
+   * then makes the plan WORSE — the planner switches to a `BitmapAnd` of
+   * heartbeat_runs_company_status_process_started_idx and
+   * heartbeat_runs_company_agent_started_idx and still sorts. Measured, twice.
+   *
+   * Caveat worth knowing before trusting this: an index-only scan is only
+   * costed cheaply when the visibility map says most pages are all-visible. On a
+   * table that has NEVER been vacuumed (relallvisible = 0) the planner falls
+   * back to bitmap+sort even for this projection. That is a fixture artifact —
+   * heartbeat_runs is continuously autovacuumed, and the cost model reads the
+   * table-wide relallvisible/relpages fraction, not a per-range one. Churn alone
+   * does not break it: updating every queued row and re-ANALYZEing (no VACUUM)
+   * still plans index-only and still inspects a bounded page.
+   *
+   * Phase 2 then fetches exactly that page by primary key, and re-checks
+   * `status` in JS rather than in SQL. A row can leave the queue between the two
+   * statements, and such a row must drop out — but adding
+   * `AND status = 'queued'` to the fetch makes the dispatch index look
+   * attractive again and PostgreSQL drives phase 2 from it instead of the
+   * primary key (measured), which is exactly the unbounded shape phase 1 exists
+   * to avoid. Keeping the id list as the only SQL predicate pins the pkey plan;
+   * the status filter costs nothing in JS.
+   *
+   * Returns the raw probe's own length and last key rather than the fetched
+   * rows', so callers advance the cursor past everything SCANNED and decide
+   * exhaustion from the scan. Deriving either from `runs` would treat a page
+   * thinned by phase 2 — including rows filtered by `excludeRunIds` after the
+   * probe — as the end of the queue and strand the remaining backlog.
+   */
+  async function readQueuedDispatchPage(input: {
+    agentId: string;
+    cutoff: Date | null;
+    cursor: DispatchCursor | null;
+    limit: number;
+    excludeRunIds?: Set<string> | null;
+  }): Promise<{
+    probed: number;
+    cursor: DispatchCursor | null;
+    runs: Array<typeof heartbeatRuns.$inferSelect>;
+  }> {
+    const queuedPagePredicate = and(
+      eq(heartbeatRuns.agentId, input.agentId),
+      // Keep the partial-index predicate a SQL literal. postgres.js uses
+      // prepared statements by default; a bound status parameter can receive a
+      // generic plan that cannot imply `status = 'queued'`.
+      sql`${heartbeatRuns.status} = 'queued'`,
+      input.cutoff ? gte(heartbeatRuns.createdAt, input.cutoff) : undefined,
+      // Keyset cursor. created_at alone is not unique (bulk wake fan-out stamps
+      // identical timestamps), so the id tiebreak is what keeps paging from
+      // skipping or repeating rows at a batch boundary. The bounds are bound as
+      // text with explicit casts: inside a raw `sql` template there is no column
+      // mapper, and postgres-js rejects a bare Date at bind time.
+      input.cursor
+        ? sql`(${heartbeatRuns.createdAt}, ${heartbeatRuns.id}) > (${input.cursor.createdAt}::timestamptz, ${input.cursor.id}::uuid)`
+        : undefined,
+    );
+
+    // `created_at::text` rather than the Date column: a JS Date truncates
+    // postgres' microsecond timestamps to milliseconds, and a cursor that
+    // rounds down re-reads the rows it already returned while one that rounds
+    // up skips them. The cast is over an indexed column, so the page still
+    // comes entirely from the index.
+    const page = await db
+      .select({
+        createdAt: sql<string>`${heartbeatRuns.createdAt}::text`.as(
+          "dispatch_created_at_cursor",
+        ),
+        id: heartbeatRuns.id,
+      })
+      .from(heartbeatRuns)
+      .where(queuedPagePredicate)
+      .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
+      .limit(input.limit);
+    if (page.length === 0) return { probed: 0, cursor: null, runs: [] };
+
+    const lastProbed = page[page.length - 1]!;
+    // Do not push `excludeRunIds` into phase 1. Emergency-admission refusals can
+    // accumulate many deferred rows near the head; a SQL `NOT IN (...)` would
+    // make PostgreSQL keep walking the ordered index until it finds enough
+    // non-deferred rows (or proves none remain), moving the start-lock work back
+    // toward queue depth. The raw probe is the bound. Filter after capturing its
+    // cursor so a page made entirely of deferred rows still makes progress.
+    const pageToHydrate = input.excludeRunIds?.size
+      ? page.filter((entry) => !input.excludeRunIds!.has(entry.id))
+      : page;
+    if (pageToHydrate.length === 0) {
+      return {
+        probed: page.length,
+        cursor: { createdAt: lastProbed.createdAt, id: lastProbed.id },
+        runs: [],
+      };
+    }
+    const rows = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(inArray(heartbeatRuns.id, pageToHydrate.map((entry) => entry.id)));
+
+    // Reorder in JS from the probe's ordering rather than adding an ORDER BY to
+    // phase 2: the keys are already sorted, and sorting there would put a Sort
+    // node back over ~2.8 kB-wide rows for no reason. Rows that left the queue
+    // between the two statements are dropped here.
+    const runById = new Map(
+      rows.filter((run) => run.status === "queued").map((run) => [run.id, run]),
+    );
+    return {
+      probed: page.length,
+      cursor: { createdAt: lastProbed.createdAt, id: lastProbed.id },
+      runs: pageToHydrate
+        .map((entry) => runById.get(entry.id))
+        .filter((run): run is typeof heartbeatRuns.$inferSelect => run !== undefined),
+    };
+  }
 
   /** Run one more dispatch pass for `agentId`, detached from this critical section. */
   function scheduleDetachedDispatchPass(agentId: string, reason: string) {
@@ -19278,44 +19452,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       while (scannedBatches < queuedRunDispatchMaxScanBatches) {
         scannedBatches += 1;
-        // Annotated rather than inferred: `scanCursor` is assigned from this
-        // batch's last row, so control-flow analysis would otherwise chase
-        // `batch` -> `scanCursor` -> `batch` and give up with an implicit any.
-        const batch: DispatchRun[] = await db
-          .select(dispatchRunSelection)
-          .from(heartbeatRuns)
-          .where(and(
-            eq(heartbeatRuns.agentId, agentId),
-            // Keep the partial-index predicate a SQL literal. postgres.js uses
-            // prepared statements by default; a bound status parameter can
-            // receive a generic plan that cannot imply `status = 'queued'`.
-            sql`${heartbeatRuns.status} = 'queued'`,
-            cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined,
-            // Keyset cursor. created_at alone is not unique (bulk wake fan-out
-            // stamps identical timestamps), so the id tiebreak is what keeps
-            // paging from skipping or repeating rows at a batch boundary.
-            // The bounds are bound as text with explicit casts: inside a raw
-            // `sql` template there is no column mapper, and postgres-js rejects
-            // a bare Date at bind time.
-            scanCursor
-              ? sql`(${heartbeatRuns.createdAt}, ${heartbeatRuns.id}) > (${scanCursor.createdAt}::timestamptz, ${scanCursor.id}::uuid)`
-              : undefined,
-            deferredRunIds?.size
-              ? notInArray(heartbeatRuns.id, [...deferredRunIds])
-              : undefined,
-          ))
-          .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
-          .limit(queuedRunDispatchScanLimit);
-        if (batch.length === 0) {
+        const page = await readQueuedDispatchPage({
+          agentId,
+          cutoff: cutoff ?? null,
+          cursor: scanCursor,
+          limit: queuedRunDispatchScanLimit,
+          excludeRunIds: deferredRunIds,
+        });
+        const batch = page.runs;
+        if (page.probed === 0) {
           scanExhausted = true;
           break;
         }
-        const lastScannedRun = batch[batch.length - 1]!;
-        scanCursor = {
-          createdAt: lastScannedRun.dispatchCreatedAtCursor,
-          id: lastScannedRun.id,
-        };
-        if (batch.length < queuedRunDispatchScanLimit) scanExhausted = true;
+        scanCursor = page.cursor;
+        if (page.probed < queuedRunDispatchScanLimit) scanExhausted = true;
 
         const batchIssueIds = [...new Set(
           batch
@@ -19463,33 +19613,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       while (criticalLaneBatches < queuedRunDispatchMaxScanBatches) {
         criticalLaneBatches += 1;
         const batchStartCursor = criticalLaneCursor;
-        const batch = await db
-          .select(dispatchRunSelection)
-          .from(heartbeatRuns)
-          .where(and(
-            eq(heartbeatRuns.agentId, agentId),
-            sql`${heartbeatRuns.status} = 'queued'`,
-            cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined,
-            criticalLaneCursor
-              ? sql`(${heartbeatRuns.createdAt}, ${heartbeatRuns.id}) > (${criticalLaneCursor.createdAt}::timestamptz, ${criticalLaneCursor.id}::uuid)`
-              : undefined,
-            deferredRunIds?.size
-              ? notInArray(heartbeatRuns.id, [...deferredRunIds])
-              : undefined,
-          ))
-          .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
-          .limit(queuedRunDispatchScanLimit);
-        if (batch.length === 0) {
+        const criticalPage = await readQueuedDispatchPage({
+          agentId,
+          cutoff: cutoff ?? null,
+          cursor: criticalLaneCursor,
+          limit: queuedRunDispatchScanLimit,
+          excludeRunIds: deferredRunIds,
+        });
+        const batch = criticalPage.runs;
+        if (criticalPage.probed === 0) {
           criticalLaneExhausted = true;
           break;
         }
 
-        const lastCritical = batch[batch.length - 1]!;
-        criticalLaneCursor = {
-          createdAt: lastCritical.dispatchCreatedAtCursor,
-          id: lastCritical.id,
-        };
-        if (batch.length < queuedRunDispatchScanLimit) criticalLaneExhausted = true;
+        criticalLaneCursor = criticalPage.cursor;
+        if (criticalPage.probed < queuedRunDispatchScanLimit) criticalLaneExhausted = true;
 
         const batchIssueIds = [...new Set(
           batch
@@ -19581,7 +19719,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       while (recoveryLaneBatches < queuedRunDispatchMaxScanBatches) {
         recoveryLaneBatches += 1;
         const batchStartCursor = recoveryLaneCursor;
-        const batch = await db
+        const rawBatch = await db
           .select(dispatchRunSelection)
           .from(heartbeatRuns)
           .where(and(
@@ -19593,22 +19731,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             recoveryLaneCursor
               ? sql`(${heartbeatRuns.createdAt}, ${heartbeatRuns.id}) > (${recoveryLaneCursor.createdAt}::timestamptz, ${recoveryLaneCursor.id}::uuid)`
               : undefined,
-            deferredRunIds?.size
-              ? notInArray(heartbeatRuns.id, [...deferredRunIds])
-              : undefined,
           ))
           .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
           .limit(queuedRunDispatchScanLimit);
-        if (batch.length === 0) {
+        if (rawBatch.length === 0) {
           recoveryLaneExhausted = true;
           break;
         }
-        const lastRun = batch[batch.length - 1]!;
+        const lastRun = rawBatch[rawBatch.length - 1]!;
         recoveryLaneCursor = {
           createdAt: lastRun.dispatchCreatedAtCursor,
           id: lastRun.id,
         };
-        if (batch.length < queuedRunDispatchScanLimit) recoveryLaneExhausted = true;
+        if (rawBatch.length < queuedRunDispatchScanLimit) recoveryLaneExhausted = true;
+
+        // Match the main/critical dispatch scans: admission-refused emergency
+        // rows are filtered after the raw cursor-bearing probe. Keeping them out
+        // of SQL with NOT IN makes PostgreSQL walk the deferred prefix under the
+        // per-agent start lock; capturing the raw cursor first lets even a fully
+        // deferred page advance in bounded work.
+        const batch = deferredRunIds?.size
+          ? rawBatch.filter((run) => !deferredRunIds.has(run.id))
+          : rawBatch;
 
         const issueIdsToLoad = new Set<string>();
         for (const run of batch) {
@@ -19750,7 +19894,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         let absoluteLaneBatches = 0;
         while (absoluteLaneBatches < queuedRunDispatchMaxScanBatches) {
           absoluteLaneBatches += 1;
-          const batch: DispatchRun[] = await db
+          const batch = await db
             .select(dispatchRunSelection)
             .from(heartbeatRuns)
             .where(and(
@@ -24966,9 +25110,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     async function persistProviderCapacityRetry(gateResult: PenstockAvailabilityGateDenyResult) {
-      const resumeAtIso = gateResult.resumeAt ? gateResult.resumeAt.toISOString() : null;
-      const scheduledRetryAt =
-        gateResult.resumeAt ?? new Date(Date.now() + CCROTATE_CAPACITY_DEFAULT_RETRY_DELAY_MS);
+      // BLO-23438: the provider's advertised reset is a hint, not a commitment.
+      // Honouring it verbatim parked ~76 runs five days out off one denial, and
+      // because `scheduled_retry` coalesces without resetting `scheduledRetryAt`
+      // every later wake on the task inherited that horizon. Clamp to a ceiling
+      // so we re-probe, and jitter so a cohort denied against one reset does not
+      // release in lockstep.
+      //
+      // `retryNotBefore` carries the CLAMPED instant, not the advertised one.
+      // Several paths treat it as a retry floor rather than as documentation --
+      // scheduleBoundedRetryForRun pushes a bounded retry out to it whenever it
+      // is later than the computed due time -- so leaving a five-day advertised
+      // value there would reintroduce the very park this clamp removes, on the
+      // next failure of the same run. The provider's claim is preserved
+      // verbatim under its own key instead.
+      const capacityRetryPlan = resolveCcrotateCapacityRetry({
+        resumeAt: gateResult.resumeAt,
+        now: new Date(),
+        defaultRetryDelayMs: CCROTATE_CAPACITY_DEFAULT_RETRY_DELAY_MS,
+      });
+      const advertisedResumeAtIso = gateResult.resumeAt ? gateResult.resumeAt.toISOString() : null;
+      const scheduledRetryAt = capacityRetryPlan.retryAt;
+      const resumeAtIso = scheduledRetryAt.toISOString();
       // BLO-18859 review follow-up: a capacity deferral is late, not lost — but
       // only if whoever promotes this run can still tell which delivery it
       // settles. Derive the label here, where `opts` is in hand and the exact
@@ -24985,6 +25148,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         penstockModel: gateResult.model,
         ...(githubReviewWakeReason !== null ? { githubReviewWakeReason } : {}),
         ...(resumeAtIso ? { penstockResumeAt: resumeAtIso } : {}),
+        ...(advertisedResumeAtIso ? { penstockAdvertisedResumeAt: advertisedResumeAtIso } : {}),
+        ...(capacityRetryPlan.clampedFromIso
+          ? { penstockCapacityParkClampedFrom: capacityRetryPlan.clampedFromIso }
+          : {}),
       };
       const retryContextSnapshot = githubReviewWakeReason !== null
         ? { ...retryContextSnapshotBase, [GITHUB_REVIEW_DELIVERY_COUNT_KEY]: 1 }
@@ -25092,6 +25259,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             resultJson: {
               errorFamily: "rate_limit_exhausted",
               ...(resumeAtIso ? { retryNotBefore: resumeAtIso, transientRetryNotBefore: resumeAtIso } : {}),
+              ...(advertisedResumeAtIso
+                ? { penstockAdvertisedResumeAt: advertisedResumeAtIso }
+                : {}),
+              ...(capacityRetryPlan.clampedFromIso
+                ? { penstockCapacityParkClampedFrom: capacityRetryPlan.clampedFromIso }
+                : {}),
               penstockProvider: gateResult.provider,
               penstockModel: gateResult.model,
               penstockReason: gateResult.reason,
@@ -25860,6 +26033,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               idempotencyKey: opts.idempotencyKey ?? null,
               finishedAt: now,
             });
+            // This action has no plugin-event mapping, so no outbox write can
+            // escape the transaction; keep the default publication semantics.
             await logActivity(tx as unknown as Db, {
               companyId: issue.companyId,
               actorType: "system",
@@ -26084,44 +26259,38 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
           if (recentTerminalRuns.length > 0) {
             const sampleRunIds = recentTerminalRuns.map((sampleRun) => sampleRun.id);
-            const progressRows = await tx
-              .select({ runId: activityLog.runId })
+            const lastRunFinishedAt = recentTerminalRuns[0]?.finishedAt ?? null;
+            // Single pass over the actions the throttle can ever need: rows
+            // attributed to a sampled run (progress) plus rows created after
+            // the newest run finished (new input). evaluateIssueRewakeThrottle
+            // decides, per row, which of those two questions it answers —
+            // including the actor check that keeps a self-authored status
+            // comment from counting as either (BLO-23081).
+            const activityRows = await tx
+              .select({
+                runId: activityLog.runId,
+                action: activityLog.action,
+                agentId: activityLog.agentId,
+                createdAt: activityLog.createdAt,
+              })
               .from(activityLog)
               .where(
                 and(
                   eq(activityLog.companyId, agent.companyId),
                   eq(activityLog.entityType, "issue"),
                   eq(activityLog.entityId, issue.id),
-                  inArray(activityLog.runId, sampleRunIds),
-                  inArray(activityLog.action, ISSUE_PROGRESS_ACTIVITY_ACTIONS),
+                  inArray(activityLog.action, ISSUE_NEW_INPUT_ACTIVITY_ACTIONS),
+                  lastRunFinishedAt
+                    ? or(inArray(activityLog.runId, sampleRunIds), gt(activityLog.createdAt, lastRunFinishedAt))
+                    : inArray(activityLog.runId, sampleRunIds),
                 ),
               );
-            const lastRunFinishedAt = recentTerminalRuns[0]?.finishedAt ?? null;
-            const newInputRows = lastRunFinishedAt
-              ? await tx
-                .select({ id: activityLog.id })
-                .from(activityLog)
-                .where(
-                  and(
-                    eq(activityLog.companyId, agent.companyId),
-                    eq(activityLog.entityType, "issue"),
-                    eq(activityLog.entityId, issue.id),
-                    gt(activityLog.createdAt, lastRunFinishedAt),
-                    inArray(activityLog.action, ISSUE_NEW_INPUT_ACTIVITY_ACTIONS),
-                  ),
-                )
-                .limit(1)
-              : [];
 
             const throttleDecision = evaluateIssueRewakeThrottle({
               now: throttleNow,
+              agentId,
               recentTerminalRuns,
-              runIdsWithIssueProgress: new Set(
-                progressRows
-                  .map((row) => row.runId)
-                  .filter((runId): runId is string => Boolean(runId)),
-              ),
-              hasNewIssueInputSinceLastRun: newInputRows.length > 0,
+              activityRows,
             });
 
             if (throttleDecision.blocked) {
