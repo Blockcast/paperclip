@@ -7503,6 +7503,106 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     )).toHaveLength(0);
   });
 
+  it("keeps a finalizer-created continuation in_progress until its queued retry dispatches", async () => {
+    const { agentId, issueId, runId, wakeupRequestId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+    });
+    const startedAt = new Date("2026-03-19T00:00:00.000Z");
+
+    // Recreate the normal finalization shape rather than using the stranded
+    // sweep fixture as-is: the source run is live and owns both lock columns,
+    // and checkout recorded the tier it promoted. cancelRun drives the real
+    // releaseIssueExecutionAndPromote -> queued continuation -> dispatcher path.
+    await db
+      .update(heartbeatRuns)
+      .set({
+        status: "running",
+        startedAt,
+        finishedAt: null,
+        error: null,
+        errorCode: null,
+        updatedAt: startedAt,
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    await db
+      .update(agentWakeupRequests)
+      .set({
+        status: "running",
+        claimedAt: startedAt,
+        finishedAt: null,
+        error: null,
+        updatedAt: startedAt,
+      })
+      .where(eq(agentWakeupRequests.id, wakeupRequestId));
+    await db
+      .update(issues)
+      .set({
+        checkoutRunId: runId,
+        executionRunId: runId,
+        executionAgentNameKey: "codexcoder",
+        executionLockedAt: startedAt,
+        checkoutRestoreStatus: "todo",
+      })
+      .where(eq(issues.id, issueId));
+
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      // Give the continuation an explicit disposition so this regression stays
+      // focused on dispatch. A successful run with detected progress and no
+      // disposition now intentionally enters the successful-handoff workflow
+      // and remains in_progress.
+      await db
+        .update(issues)
+        .set({
+          status: "todo",
+          checkoutRestoreStatus: null,
+          updatedAt: new Date(),
+        })
+        .where(eq(issues.id, issueId));
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: "Parked the continuation after confirming dispatch.",
+        resultJson: { summary: "Parked the continuation after confirming dispatch." },
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    await heartbeat.cancelRun(runId, "exercise finalizer continuation recovery");
+
+    const continuation = await waitForValue(async () => {
+      const rows = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.agentId, agentId));
+      return rows.find((row) => row.id !== runId) ?? null;
+    });
+    if (!continuation) throw new Error("Expected finalizer to queue a continuation retry");
+
+    expect(continuation.contextSnapshot).toMatchObject({
+      issueId,
+      retryOfRunId: runId,
+      retryReason: "issue_continuation_needed",
+    });
+
+    // Before the regression fix, the source finalizer restored this row to
+    // `todo` before it created the retry. claimQueuedRun then cancelled the
+    // retry for no longer being `in_progress`, so the adapter never ran.
+    const settledContinuation = await waitForRunToSettle(heartbeat, continuation.id, 10_000);
+    expect(settledContinuation?.status).toBe("succeeded");
+    expect(mockAdapterExecute.mock.calls.some(([context]) => context.runId === continuation.id)).toBe(true);
+
+    const sourceAfter = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(sourceAfter).toMatchObject({ status: "todo", checkoutRestoreStatus: null });
+  });
+
   it.each([
     ["failed", "adapter_failed"],
     ["failed", "process_lost"],

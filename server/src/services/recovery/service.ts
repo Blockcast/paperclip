@@ -45,6 +45,7 @@ import {
   issueTreeControlService,
 } from "../issue-tree-control.js";
 import { TERMINAL_HEARTBEAT_RUN_STATUSES, externalWaitFromDescription, issueService } from "../issues.js";
+import { restoreCheckoutPromotedStatus } from "../issue-checkout-status.js";
 import {
   applyIssueMonitorPolicyTransition,
   derivePersistedMonitorState,
@@ -2936,6 +2937,13 @@ export function recoveryService(
             eq(issues.executionRunId, input.run.id),
           ),
         );
+
+      // The run is finalized; if it never wrote a status of its own, undo the
+      // `in_progress` its checkout wrote (BLO-20649).
+      await restoreCheckoutPromotedStatus(tx, {
+        issueId: input.sourceIssue.id,
+        companyId: input.run.companyId,
+      });
 
       return updatedRun;
     });
