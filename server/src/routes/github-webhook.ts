@@ -307,6 +307,85 @@ function hasPrReviewerAgentRequestMarker(body: string | null | undefined): boole
   return typeof body === "string" && PR_REVIEWER_AGENT_REQUEST_MARKER_PATTERN.test(body);
 }
 
+// BLO-23059: Claude Code Review posts its "this integration is paused/disabled"
+// org-settings notice as a FORMAL pull_request_review (state COMMENTED, commit_id
+// = current head), not as a plain comment. Measured 2026-08-07:
+// `org:Blockcast "Claude Code Review is paused for this repository" type:pr` →
+// 98 hits across Network-Operator-Portal, magma, multicast, trafficcontrol and
+// others, and every sampled one is a review object rather than a comment.
+//
+// A review object with a prNumber drives BOTH wakes in this handler — the
+// reviewer counter-review pass (shouldFirePrReviewerWake) and the PR-author wake
+// (the `isPrWake` fallback, which fires regardless of
+// isActionableReviewFeedbackContext). The author wake renders the prRole:"author"
+// directive, "a reviewer just posted findings on YOUR pull request … push a
+// follow-up commit addressing them". There are no findings: the body is addressed
+// to a GitHub org admin. So the directive asserts something false, and an agent
+// that trusts it over the body is pushed toward inventing a change to "address"
+// or reporting that it addressed feedback it never received.
+//
+// The existing body heuristic does NOT catch this and is not the right tool:
+// hasActionablePrReviewFeedback already returns false here (verified against the
+// verbatim body of review 4887250738 on Network-Operator-Portal#657), which is
+// exactly why only the findings-shaped comment is skipped while both wakes still
+// fire. Suppression has to drop the EVENT, which is what returning null does.
+//
+// Deliberately a NAMED-INSTANCE filter, not a general "findings-free review"
+// heuristic. The obvious risk in suppressing at the webhook is eating a
+// legitimately terse review ("LGTM", "one nit inline"), and a findings-free rule
+// would do precisely that. All three conditions below must hold, so a short
+// human review is never a candidate:
+//
+//   1. The author is a Claude Code Review App identity — BOTH a `[bot]`-suffixed
+//      login AND a GitHub-reported user type of "Bot". A human (or another bot)
+//      quoting the notice text — in a review that discusses this very issue — is
+//      not suppressed.
+//   2. The body carries the notice's own heading AND its paused/disabled
+//      sentence. Matched against the RAW body, before clampReviewBody, so a long
+//      body cannot fail the match by truncation.
+//   3. The body has no actionable findings. Belt-and-braces: if claude[bot] ever
+//      ships a review that both carries the notice and flags something, the
+//      findings win and the event is delivered.
+//
+// Every failure mode of this predicate is fail-OPEN — an unmatched notice simply
+// wakes as it does today. If Anthropic reworks the notice text, we regress to the
+// current behaviour rather than silently dropping real reviews.
+//
+// The `[bot]` suffix is REQUIRED, not optional (Ally review on #1255). GitHub
+// reserves the bracketed suffix for App identities and forbids `[`/`]` in user
+// logins, so requiring it already excludes the `claude` and `claude-code` User
+// accounts — both of which exist as ordinary registerable logins, and either of
+// which could review a PR quoting this notice (this repo's own PRs discuss it).
+// The user-type gate below is the independent second half of that narrowing: it
+// comes from GitHub rather than from our own spelling of the login, so an
+// alternate future service login is only ever suppressed once GitHub itself has
+// confirmed it is Bot-typed.
+const CLAUDE_CODE_REVIEW_BOT_LOGIN_PATTERN = /^claude(?:-code)?\[bot\]$/i;
+const CLAUDE_CODE_REVIEW_NOTICE_HEADING_PATTERN = /^[ \t]*#{1,6}[ \t]*Claude Code Review[ \t]*$/im;
+const CLAUDE_CODE_REVIEW_NOTICE_SENTENCE_PATTERN =
+  /\bClaude Code Review is (?:paused|disabled) for this repository\b/i;
+
+function isClaudeCodeReviewServiceNotice(
+  rawBody: string | null | undefined,
+  state: string | null | undefined,
+  authorLogin: string | null | undefined,
+  authorType: string | null | undefined,
+): boolean {
+  // A service notice is always COMMENTED. An APPROVED or CHANGES_REQUESTED
+  // review carries a merge-gate signal that must reach the author regardless of
+  // what its body says.
+  if (state?.trim().toLowerCase() !== "commented") return false;
+  if (typeof authorLogin !== "string") return false;
+  if (!CLAUDE_CODE_REVIEW_BOT_LOGIN_PATTERN.test(authorLogin.trim())) return false;
+  // GitHub's own classification of the account, independent of how the login is
+  // spelled. Absent or non-Bot => fail open and deliver the event.
+  if (typeof authorType !== "string" || authorType.trim().toLowerCase() !== "bot") return false;
+  if (typeof rawBody !== "string") return false;
+  if (!CLAUDE_CODE_REVIEW_NOTICE_HEADING_PATTERN.test(rawBody)) return false;
+  if (!CLAUDE_CODE_REVIEW_NOTICE_SENTENCE_PATTERN.test(rawBody)) return false;
+  return !hasActionablePrReviewFeedback(rawBody, state);
+}
+
 function isActionablePrReviewComment(
   body: string | null | undefined,
   authorLogin: string | null | undefined,
@@ -636,6 +715,21 @@ function resolveEventContext(
       // silences this genuine request, and until now did so with zero trace.
       reason: "missing_marker" | "marker_disqualified_by_heading";
     }) => void;
+    // BLO-23059: invoked when a pull_request_review.submitted delivery was
+    // dropped as a Claude Code Review service notice. Separate from
+    // onSuppressedReviewRequest because the two describe different objects — a
+    // review has no comment id and its own html_url — and because a dropped
+    // review kills BOTH the reviewer and the author wake, where a dropped
+    // request only ever suppressed the reviewer one. Same rationale for the
+    // callback shape: keeps resolveEventContext pure and lets the suppression be
+    // asserted directly rather than through a log spy.
+    onSuppressedReviewSubmission?: (info: {
+      repoFullName: string | null;
+      prNumber: number | null;
+      reviewAuthorLogin: string | null;
+      reviewState: string | null;
+      reviewUrl: string | null;
+    }) => void;
   } = {},
 ): ResolvedEventContext | null {
   const repository = payload.repository as Record<string, unknown> | undefined;
@@ -912,10 +1006,12 @@ function resolveEventContext(
       const pr = payload.pull_request as Record<string, unknown> | undefined;
       const collected = collectFromPullRequest(pr);
       const review = payload.review as Record<string, unknown> | undefined;
-      const reviewBody = clampReviewBody(review?.body as string | null | undefined);
+      const rawReviewBody = (review?.body as string | null | undefined) ?? null;
+      const reviewBody = clampReviewBody(rawReviewBody);
       const reviewState = (review?.state as string | undefined) ?? null;
       const reviewUser = review?.user as Record<string, unknown> | undefined;
       const reviewAuthorLogin = (reviewUser?.login as string | undefined) ?? null;
+      const reviewAuthorType = (reviewUser?.type as string | undefined) ?? null;
       const reviewUrl = readStringField(review, "html_url");
       const reviewIdRaw = review?.id;
       const reviewId = typeof reviewIdRaw === "number" ? reviewIdRaw : null;
@@ -927,6 +1023,20 @@ function resolveEventContext(
       // this drives labels feedback against a commit the reviewer never saw,
       // defeating the stale-review signal it exists to provide.
       const reviewCommitId = readStringField(review, "commit_id");
+      // BLO-23059: drop the Claude Code Review paused/disabled org-settings
+      // notice before it becomes a wake. See isClaudeCodeReviewServiceNotice for
+      // why this is dropped at the event rather than filtered at either wake
+      // site, and for the three conditions that keep a terse human review safe.
+      if (isClaudeCodeReviewServiceNotice(rawReviewBody, reviewState, reviewAuthorLogin, reviewAuthorType)) {
+        options.onSuppressedReviewSubmission?.({
+          repoFullName,
+          prNumber: collected.number,
+          reviewAuthorLogin,
+          reviewState,
+          reviewUrl,
+        });
+        return null;
+      }
       return {
         identifiers: collected.ids,
         wakeReason: "github_pr_review_submitted",
@@ -3133,6 +3243,29 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
           message,
         );
       },
+      // BLO-23059: the paused-notice drop kills two wakes (reviewer counter-review
+      // and PR author), so it is the higher-impact silent drop of the two and
+      // needs the same structured trace. `info` at this level rather than
+      // `warn`: unlike the missing-marker case there is nothing to fix — the
+      // suppression is the intended steady state for as long as Code Review
+      // stays unlinked, and the CEO recorded that decision on BLO-23059.
+      onSuppressedReviewSubmission: (info) => {
+        logger.info(
+          {
+            event: eventName,
+            deliveryId,
+            repoFullName: info.repoFullName,
+            prNumber: info.prNumber,
+            reviewAuthorLogin: info.reviewAuthorLogin,
+            reviewState: info.reviewState,
+            reviewUrl: info.reviewUrl,
+            suppressionReason: "claude_code_review_service_notice",
+          },
+          "github webhook wakes skipped: claude[bot] submitted a formal review whose body is the " +
+            "Claude Code Review paused/disabled org-settings notice, not findings (BLO-23059); " +
+            "neither the reviewer counter-review wake nor the PR-author wake was enqueued",
+        );
+      },
     });
 
     // BLO-21078: fleet-wide visibility into workflow_run conclusions, so a
@@ -4167,6 +4300,7 @@ export const __test_buildPrReviewerTaskLockKeys = buildPrReviewerTaskLockKeys;
 export const __test_buildDependabotAlertIssueBody = buildDependabotAlertIssueBody;
 export const __test_resolveDependabotAlertContext = resolveDependabotAlertContext;
 export const __test_hasActionablePrReviewFeedback = hasActionablePrReviewFeedback;
+export const __test_isClaudeCodeReviewServiceNotice = isClaudeCodeReviewServiceNotice;
 export const __test_buildPrReviewFeedbackComment = buildPrReviewFeedbackComment;
 export const __test_buildIssueBackLinkBody = buildIssueBackLinkBody;
 export const __test_commentsContainBackLinkMarker = commentsContainBackLinkMarker;
