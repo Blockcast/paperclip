@@ -482,11 +482,13 @@ async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<Cl
       (entry): entry is [string, string] => typeof entry[1] === "string",
     ),
   );
-  const configuredTimeoutSec = Object.prototype.hasOwnProperty.call(config, "timeoutSec")
+  const persistedTimeoutSec = Object.prototype.hasOwnProperty.call(config, "timeoutSec")
     ? asNumber(config.timeoutSec, 0)
-    : executionTargetIsRemote
-      ? 0
-      : DEFAULT_CLAUDE_LOCAL_TIMEOUT_SEC;
+    : 0;
+  const configuredTimeoutSec =
+    !executionTargetIsRemote && persistedTimeoutSec === 0
+      ? DEFAULT_CLAUDE_LOCAL_TIMEOUT_SEC
+      : persistedTimeoutSec;
   const timeoutSec = resolveAdapterExecutionTargetTimeoutSec(executionTarget, configuredTimeoutSec);
   const graceSec = asNumber(config.graceSec, 20);
   await ensureAdapterExecutionTargetRuntimeCommandInstalled({

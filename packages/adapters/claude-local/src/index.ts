@@ -68,7 +68,7 @@ ACP fields (only when engine="acp"):
 - warmHandleIdleMs (number, optional, default 0): keep the ACP process warm for this many ms after a successful run
 
 Operational fields:
-- timeoutSec (number, optional): run timeout in seconds (local Claude CLI default: 21600 / 6 hours; set 0 to disable). SSH keeps its historical unlimited default. Remote sandboxes retain their execution-target backstop; use a negative value for an explicit sandbox opt-out.
+- timeoutSec (number, optional): run timeout in seconds (local Claude CLI default: 21600 / 6 hours; legacy stored zero also uses this default). SSH keeps its historical unlimited default. Use a negative value for an explicit local or sandbox opt-out; remote sandboxes otherwise retain their execution-target backstop.
 - graceSec (number, optional): SIGTERM grace period in seconds
 
 Notes:
