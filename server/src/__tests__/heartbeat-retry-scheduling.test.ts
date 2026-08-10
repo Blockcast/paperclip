@@ -1589,8 +1589,8 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
 
     // Probe errored or no PR context => no flag recorded at all. Absence must be
     // read as "unproven", NOT as "safe to retry": a stale-killed run really was
-    // running and may have posted. This is the case that distinguishes this gate
-    // from job_missing/k8s_pod_schedule_failed, where the pod provably never ran.
+    // running and may have posted. This is distinct from the pre-invocation
+    // process_lost path, where no adapter work was recorded.
     expect(
       shouldScheduleAutomaticRunRetry({
         errorCode: "external_lifecycle_stale_killed",
@@ -1609,8 +1609,8 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
   });
 
   it("BLO-18030: does not retry a stale-killed run outside a PR-review context", () => {
-    // Leak guard, matching k8s_concurrent_run_blocked / job_missing: a proven-no-
-    // review issue run must stay terminal rather than re-queueing arbitrary work.
+    // Leak guard, matching k8s_concurrent_run_blocked: a proven-no-review issue
+    // run must stay terminal rather than re-queueing arbitrary work.
     expect(
       shouldScheduleAutomaticRunRetry({
         errorCode: "external_lifecycle_stale_killed",
@@ -1918,46 +1918,56 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
   });
 
   // BLO-10448 — scheduler-level transient infra failures retry gate
-  it.each(["k8s_pod_schedule_failed", "job_missing"])(
-    "BLO-10448: retries %s on a pr_review wake (work never ran)",
-    (errorCode) => {
-      expect(
-        shouldScheduleAutomaticRunRetry({
-          errorCode,
-          resultJson: {},
-          contextSnapshot: { wakeReason: "github_pr_opened", reviewKind: "pr_review", githubPrNumber: 408 },
-        }),
-      ).toBe(true);
-      // thin snapshot (taskKey-only) — webhook-driven reviewer wakes get trimmed
-      expect(
-        shouldScheduleAutomaticRunRetry({
-          errorCode,
-          resultJson: {},
-          contextSnapshot: { taskKey: "pr_review:Blockcast/Network-Operator-Portal:408" },
-        }),
-      ).toBe(true);
-    },
-  );
+  it("BLO-10448: retries k8s_pod_schedule_failed on a pr_review wake", () => {
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "k8s_pod_schedule_failed",
+        resultJson: {},
+        contextSnapshot: { wakeReason: "github_pr_opened", reviewKind: "pr_review", githubPrNumber: 408 },
+      }),
+    ).toBe(true);
+    // thin snapshot (taskKey-only) — webhook-driven reviewer wakes get trimmed
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "k8s_pod_schedule_failed",
+        resultJson: {},
+        contextSnapshot: { taskKey: "pr_review:Blockcast/Network-Operator-Portal:408" },
+      }),
+    ).toBe(true);
+  });
 
-  it.each(["k8s_pod_schedule_failed", "job_missing"])(
-    "BLO-10448: does NOT retry %s on non-PR wakes (BLO-7913 leak guard)",
-    (errorCode) => {
+  it("BLO-10448: does NOT retry k8s_pod_schedule_failed on non-PR wakes (BLO-7913 leak guard)", () => {
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "k8s_pod_schedule_failed",
+        resultJson: {},
+        contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
+      }),
+    ).toBe(false);
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "k8s_pod_schedule_failed",
+        resultJson: {},
+        contextSnapshot: {},
+      }),
+    ).toBe(false);
+  });
+
+  it("does not replay job_missing, even on a PR-review wake with stale transient metadata", () => {
+    for (const contextSnapshot of [
+      { wakeReason: "github_pr_opened", reviewKind: "pr_review", githubPrNumber: 408 },
+      { taskKey: "pr_review:Blockcast/Network-Operator-Portal:408" },
+      { issueId: randomUUID(), wakeReason: "issue_assigned" },
+    ]) {
       expect(
         shouldScheduleAutomaticRunRetry({
-          errorCode,
-          resultJson: {},
-          contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
+          errorCode: "job_missing",
+          resultJson: { errorFamily: "transient_upstream" },
+          contextSnapshot,
         }),
       ).toBe(false);
-      expect(
-        shouldScheduleAutomaticRunRetry({
-          errorCode,
-          resultJson: {},
-          contextSnapshot: {},
-        }),
-      ).toBe(false);
-    },
-  );
+    }
+  });
 
   // BLO-17456: when a PR-review chain exhausts, the reviewer never posts its
   // required status, so the PR sits on "Expected — waiting for status" forever.

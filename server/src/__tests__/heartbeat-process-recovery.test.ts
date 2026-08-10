@@ -258,6 +258,7 @@ import {
   INTERACTION_CONTINUATION_INFRA_WAKE_REASON,
   heartbeatService,
   redactDetectedSuccessfulRunProgressSummaryForBoard,
+  shouldScheduleAutomaticRunRetry,
 } from "../services/heartbeat.ts";
 import { setPluginEventBus, setPluginEventOutboxDb } from "../services/activity-log.js";
 import { pollOnce as drainPluginEventOutbox } from "../services/plugin-event-outbox.js";
@@ -1749,7 +1750,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(run?.errorCode).toBe("process_lost");
   });
 
-  it("immediately reaps a fresh exact-missing Job after restart when no adapter owner remains", async () => {
+  it("records adapter invocation evidence when reaping a fresh exact-missing Job", async () => {
     const jobName = "agent-opencode-restart-missing";
     const { companyId, agentId, runId } = await seedRunFixture({
       adapterType: "opencode_k8s",
@@ -1776,10 +1777,15 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const result = await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
 
     expect(result.runIds).toContain(runId);
-    expect(await heartbeat.getRun(runId)).toMatchObject({
+    const finalizedRun = await heartbeat.getRun(runId);
+    expect(finalizedRun).toMatchObject({
       status: "failed",
       errorCode: "job_missing",
+      resultJson: {
+        externalLifecycleRecovery: expect.objectContaining({ adapterInvocationStarted: true }),
+      },
     });
+    expect(finalizedRun && shouldScheduleAutomaticRunRetry(finalizedRun)).toBe(false);
     const persistedReservation = await db
       .select()
       .from(externalRuntimeReservations)
@@ -1866,10 +1872,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .toBe(true);
   });
 
-  it("does not preserve a local review claim without trusted-App GitHub evidence", async () => {
+  it("does not replay a missing-Job review claim without trusted-App GitHub evidence", async () => {
     const jobName = "agent-opencode-untrusted-review-claim";
     const headSha = "075a9aeff53a229199ab0583e916f33c22459983";
-    const { companyId, agentId, runId } = await seedRunFixture({
+    const { companyId, agentId, issueId, runId } = await seedRunFixture({
       adapterType: "opencode_k8s",
       agentStatus: "idle",
       externalRunId: jobName,
@@ -1903,15 +1909,28 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       prNumber: 1648,
       headSha,
     });
-    expect(await heartbeat.getRun(runId)).toMatchObject({
+    const finalizedRun = await heartbeat.getRun(runId);
+    expect(finalizedRun).toMatchObject({
       status: "failed",
-      errorCode: "pr_review_output_missing",
+      errorCode: "job_missing",
+      resultJson: {
+        externalLifecycleRecovery: expect.objectContaining({
+          adapterInvocationStarted: true,
+          prReviewErrorCode: "pr_review_output_missing",
+        }),
+      },
     });
+    expect(finalizedRun && shouldScheduleAutomaticRunRetry(finalizedRun)).toBe(false);
     const retries = await db
       .select()
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.retryOfRunId, runId));
-    expect(retries).toHaveLength(1);
+    expect(retries.some((retry) =>
+      retry.status === "scheduled_retry" ||
+      (retry.contextSnapshot as Record<string, unknown> | null)?.source === "issue.continuation_recovery"
+    )).toBe(false);
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("blocked");
   });
 
   async function recoverClaimedReviewWithUnavailableVerification(kind: "result" | "throw") {
@@ -1954,20 +1973,32 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   it("keeps a missing-Job review claim fail-closed when GitHub returns an error", async () => {
     await expect(recoverClaimedReviewWithUnavailableVerification("result")).resolves.toMatchObject({
       status: "failed",
-      errorCode: "pr_review_verification_unavailable",
-      error: expect.stringContaining("reviews_http_503"),
+      errorCode: "job_missing",
+      resultJson: {
+        externalLifecycleRecovery: expect.objectContaining({
+          adapterInvocationStarted: true,
+          prReviewErrorCode: "pr_review_verification_unavailable",
+          prReviewErrorMessage: expect.stringContaining("reviews_http_503"),
+        }),
+      },
     });
   });
 
   it("keeps a missing-Job review claim fail-closed when GitHub verification throws", async () => {
     await expect(recoverClaimedReviewWithUnavailableVerification("throw")).resolves.toMatchObject({
       status: "failed",
-      errorCode: "pr_review_verification_unavailable",
-      error: expect.stringContaining("verification_threw"),
+      errorCode: "job_missing",
+      resultJson: {
+        externalLifecycleRecovery: expect.objectContaining({
+          adapterInvocationStarted: true,
+          prReviewErrorCode: "pr_review_verification_unavailable",
+          prReviewErrorMessage: expect.stringContaining("verification_threw"),
+        }),
+      },
     });
   });
 
-  it("fails and retries once when a PR-review request comment is not outcome evidence", async () => {
+  it("does not replay a missing-Job PR review when a request comment is not outcome evidence", async () => {
     const jobName = "agent-opencode-review-lost";
     const headSha = "075a9aeff53a229199ab0583e916f33c22459983";
     const { companyId, agentId, runId } = await seedRunFixture({
@@ -2007,14 +2038,22 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(mockGithubHasReviewerEvidenceForPr).toHaveBeenCalledTimes(1);
     expect(await heartbeat.getRun(runId)).toMatchObject({
       status: "failed",
-      errorCode: "pr_review_output_missing",
+      errorCode: "job_missing",
+      resultJson: {
+        externalLifecycleRecovery: expect.objectContaining({
+          adapterInvocationStarted: true,
+          prReviewErrorCode: "pr_review_output_missing",
+        }),
+      },
     });
     const retries = await db
       .select()
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.retryOfRunId, runId));
-    expect(retries).toHaveLength(1);
-    expect(retries[0]).toMatchObject({ status: "scheduled_retry", scheduledRetryAttempt: 1 });
+    expect(retries.some((retry) =>
+      retry.status === "scheduled_retry" ||
+      (retry.contextSnapshot as Record<string, unknown> | null)?.source === "issue.continuation_recovery"
+    )).toBe(false);
   });
 
   it("does not treat generic run artifacts as a completed missing-Job outcome", async () => {

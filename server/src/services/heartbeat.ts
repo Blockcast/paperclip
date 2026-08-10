@@ -972,9 +972,24 @@ export async function probeStaleKillReviewEvidence(
   }
 }
 
+// A confirmed missing external-lifecycle Job is finalized only after the
+// adapter-invocation phase. The Job may therefore have completed a
+// non-idempotent external action before it disappeared. Keep this distinct from
+// process_lost, which covers the pre-invocation loss path.
+function isReplayUnsafeExternalLifecycleTerminalOutcome(
+  run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode">,
+) {
+  return run.errorCode === "job_missing";
+}
+
 export function shouldScheduleAutomaticRunRetry(
   run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson" | "contextSnapshot">,
 ) {
+  // Reject before reading merged result metadata: finalization retains prior
+  // transient-family fields, which must not turn an ambiguous missing-Job
+  // outcome into a replay.
+  if (isReplayUnsafeExternalLifecycleTerminalOutcome(run)) return false;
+
   // BLO-18030: a hard-stale-kill force-terminates a Job that was claimed but
   // silent past EXTERNAL_LIFECYCLE_HARD_STALE_MS. That left pr_review wakes with
   // no recovery whatsoever: the run is terminal with no bounded retry, and the
@@ -983,12 +998,12 @@ export function shouldScheduleAutomaticRunRetry(
   // `dispatch_failed`). Net effect observed 2026-07-25 on PR #1758: the review
   // simply never happened and nothing surfaced it.
   //
-  // Unlike job_missing/k8s_pod_schedule_failed (where the pod provably never
-  // ran), a stale-killed run WAS running, so it may have already posted. Gate on
-  // the same shape of durable proof used for job_failed: retry only when the
-  // reconciler's GitHub probe definitively found no reviewer evidence at this
-  // head. A probe error or a found review records no flag / `true` and stays
-  // terminal, so this can never double-post a review.
+  // Unlike the pre-invocation process_lost path, a stale-killed run WAS running,
+  // so it may have already posted. Gate on the same shape of durable proof used
+  // for job_failed: retry only when the reconciler's GitHub probe definitively
+  // found no reviewer evidence at this head. A probe error or a found review
+  // records no flag / `true` and stays terminal, so this can never double-post a
+  // review.
   //
   // This branch MUST stay above readTransientRecoveryContractFromRun: stale-kill
   // finalization merges into the run's prior resultJson, so a retained
@@ -1045,14 +1060,12 @@ export function shouldScheduleAutomaticRunRetry(
   }
 
   // BLO-10448: scheduler-level transient infra failures where the agent pod
-  // never ran — the node pool was momentarily saturated (k8s_pod_schedule_failed:
-  // Unschedulable / image-pull / schedule-timeout) or the external-lifecycle Job
-  // vanished before completion (job_missing). The work never started, so re-queue
-  // pr_review wakes with bounded backoff to let the review land once capacity
-  // frees, instead of silently dropping it (observed on the Ally reviewer path:
-  // a single Unschedulable burst dropped a PR review with no retry). Non-PR wakes
-  // stay terminal, matching the k8s_concurrent_run_blocked leak guard above.
-  if (run.errorCode === "k8s_pod_schedule_failed" || run.errorCode === "job_missing") {
+  // never ran — the node pool was momentarily saturated
+  // (k8s_pod_schedule_failed: Unschedulable / image-pull / schedule-timeout).
+  // Re-queue pr_review wakes with bounded backoff to let the review land once
+  // capacity frees, instead of silently dropping it. Non-PR wakes stay terminal,
+  // matching the k8s_concurrent_run_blocked leak guard above.
+  if (run.errorCode === "k8s_pod_schedule_failed") {
     return isPrReviewRetryContext(parseObject(run.contextSnapshot));
   }
 
@@ -16623,8 +16636,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           jobMessage: input.jobStatus?.message ?? null,
         }
       : externalLifecycleTerminalOutcome(input.jobStatus, preserveRecordedOutcome);
+    const jobMissingTerminalOutcome = baseTerminalOutcome?.errorCode === "job_missing";
     const terminalOutcome =
-      baseTerminalOutcome && prReviewIncompleteOverride && !input.staleKill
+      baseTerminalOutcome && prReviewIncompleteOverride && !input.staleKill && !jobMissingTerminalOutcome
         ? {
             ...baseTerminalOutcome,
             errorCode: prReviewIncompleteOverride.errorCode,
@@ -16633,9 +16647,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         : baseTerminalOutcome;
     if (!terminalOutcome) return false;
 
-    const adapterInvocationStarted = terminalOutcome.errorCode === "job_failed"
-      ? await hasAdapterInvocationEvent(input.run.id)
-      : null;
+    const adapterInvocationStarted =
+      baseTerminalOutcome?.errorCode === "job_failed" || jobMissingTerminalOutcome
+        ? await hasAdapterInvocationEvent(input.run.id)
+        : null;
 
     // Read the pod's terminal container state while the pod still exists. This
     // is the only point in the lifecycle where it is still available.
@@ -16654,6 +16669,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             jobPhase: terminalOutcome.jobPhase,
             jobReason: terminalOutcome.jobReason,
             jobMessage: terminalOutcome.jobMessage,
+            ...(jobMissingTerminalOutcome && prReviewIncompleteOverride
+              ? {
+                  prReviewErrorCode: prReviewIncompleteOverride.errorCode,
+                  prReviewErrorMessage: prReviewIncompleteOverride.errorMessage,
+                }
+              : {}),
             ...(adapterInvocationStarted !== null ? { adapterInvocationStarted } : {}),
             ...(containerDiagnostics ? { containerDiagnostics } : {}),
           },
@@ -16768,6 +16789,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const finalizationAgent = await getAgent(finalizedRun.agentId);
     if (
       terminalOutcome.status === "failed" &&
+      !isReplayUnsafeExternalLifecycleTerminalOutcome(finalizedRun) &&
       shouldScheduleAutomaticRunRetry(finalizedRun) &&
       finalizationAgent
     ) {
@@ -24573,6 +24595,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const shouldBlockReviewRecovery =
           !recoveryAgentInvokable ||
           !recoveryAgent ||
+          isReplayUnsafeExternalLifecycleTerminalOutcome(run) ||
           isExecutionReviewParticipantRecoveryRun(run);
         if (shouldBlockReviewRecovery) {
           return {
@@ -24684,6 +24707,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const shouldBlockImmediately =
         !recoveryAgentInvokable ||
         !recoveryAgent ||
+        isReplayUnsafeExternalLifecycleTerminalOutcome(run) ||
         isWorkspaceValidationFailedRun(run) ||
         isConfigurationIncompleteFailedRun(run) ||
         didAutomaticRecoveryFail(run, issue.status === "todo" ? "assignment_recovery" : "issue_continuation_needed");

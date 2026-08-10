@@ -667,6 +667,9 @@ export function summarizeRunFailureForIssueComment(run: LatestIssueRun, now = Da
 const NON_RETRYABLE_RUN_ERROR_CODES = new Set<string>([
   "workspace_import_conflict",
   "workspace_repo_mismatch",
+  // A confirmed missing external-lifecycle Job can have completed work after
+  // adapter invocation. Escalate instead of creating a replacement run.
+  "job_missing",
 ]);
 
 function isNonRetryableTerminalRun(latestRun: LatestIssueRun) {
@@ -841,6 +844,9 @@ const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
   "budget_blocked",
   "budget_exhausted",
   "issue_paused",
+  // The reaper emits this only after adapter invocation, so a continuation
+  // replay could duplicate a durable external side effect.
+  "job_missing",
   DEPENDENCY_BLOCKED_ERROR_CODE,
 ]);
 
