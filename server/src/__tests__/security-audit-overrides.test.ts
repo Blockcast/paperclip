@@ -126,9 +126,15 @@ describe("PEN-1198 audit dependency remediation", () => {
           "utf8",
         );
 
-        expect(fixturePackageJson.pnpm.overrides.nanoid).toBe(">=5.1.16 <6");
+        expect(
+          fixturePackageJson.pnpm.overrides["nanoid@>=4 <5.1.16"],
+        ).toBe("5.1.16");
         expect(lockfile).toMatch(
           /^  nanoid@5\.1\.16:\n    resolution: \{integrity: .+\}$/m,
+        );
+        expect(lockfile).toMatch(/^  nanoid@3\.\d+\.\d+:/m);
+        expect(lockfile).toMatch(
+          /^  postcss@[^:]+:\n    dependencies:\n      nanoid: 3\.\d+\.\d+$/m,
         );
 
         const vulnerableVersions = Array.from(
