@@ -963,6 +963,34 @@ describe("github-webhook pure helpers", () => {
     expect(__test_shouldFirePrReviewerWake(ctx)).toBe(true);
   });
 
+  // Review finding (PR #1125): the reviewed-head provenance must be the
+  // review's own immutable `commit_id`, not `pull_request.head.sha` -- the
+  // latter reflects whatever the branch is at NOW, which can have advanced
+  // past what the review actually looked at by the time this webhook is
+  // processed.
+  it("prefers review.commit_id over pull_request.head.sha for headSha when the branch has since advanced (PR #1125 review finding)", () => {
+    const ctx = __test_resolveEventContext("pull_request_review", {
+      action: "submitted",
+      pull_request: {
+        number: 953,
+        title: "feat(cdn): BLO-5269 aggregator",
+        body: null,
+        html_url: "https://github.com/Blockcast/magma/pull/953",
+        // The branch has advanced past what this review actually reviewed.
+        head: { ref: "feat/BLO-5269", sha: "advanced-after-review" },
+      },
+      review: {
+        body: "Critical: PushExtCDNCacheHitRates POSTs to a read-only serializer.",
+        state: "commented",
+        html_url: "https://github.com/Blockcast/magma/pull/953#pullrequestreview-99",
+        user: { login: "ally" },
+        commit_id: "reviewed-this-commit",
+      },
+      repository: { full_name: "Blockcast/magma" },
+    });
+    expect(ctx).toMatchObject({ headSha: "reviewed-this-commit" });
+  });
+
   it("flags the reviewer's own pull_request_review.submitted as a self-echo (BLO-15799)", () => {
     const reviewCtx = (login: string) =>
       __test_resolveEventContext("pull_request_review", {
@@ -4263,6 +4291,213 @@ describeEmbeddedPostgres("github-webhook route", () => {
         (c) => (c.metadata as Record<string, unknown> | null)?.kind === "github_pr_review_feedback_escalation",
       ),
     ).toHaveLength(1);
+  });
+
+  // Review finding (PR #1125): isIssueMonitorTriggered used to infer
+  // "triggered" from the historical columns alone (monitorLastTriggeredAt /
+  // monitorAttemptCount), which stay populated forever once a monitor has
+  // ever fired -- even after it was later explicitly cleared. A cleared
+  // monitor has a live wake path again (whatever cleared it re-armed or
+  // resolved the issue's execution), so escalating past it is a false
+  // escalation, exactly the noise AC #5's manager-wake exists to avoid
+  // manufacturing.
+  it("does not escalate when the assignee's monitor was explicitly cleared, even though historical trigger columns are still set (PR #1125 review finding)", async () => {
+    const companyId = randomUUID();
+    const managerId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Test",
+      issuePrefix: "PEN",
+      defaultResponsibleUserId: "test-board-user",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: managerId,
+      companyId,
+      name: "Manager",
+      role: "engineer",
+      status: "running",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "TestAgent",
+      role: "engineer",
+      status: "idle",
+      reportsTo: managerId,
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Test issue",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      issueNumber: 1126,
+      identifier: "PEN-1126",
+      // Historical columns still carry a prior trigger -- exactly as they
+      // would right after a monitor was cleared, since nothing zeroes them.
+      monitorNextCheckAt: null,
+      monitorLastTriggeredAt: new Date(),
+      monitorAttemptCount: 1,
+      executionState: { monitor: { status: "cleared", clearedAt: new Date().toISOString(), clearReason: "resolved" } },
+    });
+
+    const app = buildApp({ prReviewerBotLogin: "allyblockcast[bot]" });
+    const blockingReview = reviewSubmittedFeedbackPayload({
+      prNumber: 850,
+      reviewId: 335,
+      state: "changes_requested",
+      headSha: "sha-cleared",
+      identifier: "PEN-1126",
+    });
+    const res = await sendReviewSubmitted(app, blockingReview, "delivery-monitor-cleared");
+
+    expect(res.status).toBe(200);
+    expect(res.body.escalated ?? []).toEqual([]);
+
+    const commentsAfterCleared = await db
+      .select({ metadata: issueComments.metadata })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    expect(
+      commentsAfterCleared.filter(
+        (c) => (c.metadata as Record<string, unknown> | null)?.kind === "github_pr_review_feedback_escalation",
+      ),
+    ).toHaveLength(0);
+
+    const managerWakes = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, managerId));
+    expect(managerWakes).toEqual([]);
+  });
+
+  // Review finding (PR #1125): escalation used to be gated on the outer
+  // caller's reopen.commentInserted, so once the feedback comment for a
+  // review existed (including from a first, otherwise-successful delivery),
+  // no later redelivery could ever retry a failed escalation -- a transient
+  // failure between the escalation comment write and the manager wakeup
+  // permanently dropped the manager wake. This reproduces that exact window:
+  // the escalation comment exists but the manager was never woken (the
+  // simulated failure point), then a redelivery of the same review must
+  // complete the wake without double-posting the escalation comment.
+  it("retries a stalled manager escalation on redelivery without duplicating the escalation comment (PR #1125 review finding)", async () => {
+    const companyId = randomUUID();
+    const managerId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Test",
+      issuePrefix: "PEN",
+      defaultResponsibleUserId: "test-board-user",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: managerId,
+      companyId,
+      name: "Manager",
+      role: "engineer",
+      status: "running",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "TestAgent",
+      role: "engineer",
+      status: "idle",
+      reportsTo: managerId,
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Test issue",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      issueNumber: 1126,
+      identifier: "PEN-1126",
+      monitorNextCheckAt: null,
+      monitorLastTriggeredAt: new Date(),
+      monitorAttemptCount: 1,
+    });
+
+    const app = buildApp({ prReviewerBotLogin: "allyblockcast[bot]" });
+    const blockingReview = reviewSubmittedFeedbackPayload({
+      prNumber: 850,
+      reviewId: 336,
+      state: "changes_requested",
+      headSha: "sha-stalled",
+      identifier: "PEN-1126",
+    });
+    const firstRes = await sendReviewSubmitted(app, blockingReview, "delivery-escalation-stall-1");
+    expect(firstRes.status).toBe(200);
+    expect(firstRes.body.escalated).toEqual([
+      { issueIdentifier: "PEN-1126", ownerAgentId: managerId, ownerType: "agent", cycles: 0 },
+    ]);
+
+    // Simulate the failure window this finding is about: the escalation
+    // comment landed, but the manager wake did not (e.g. heartbeat.wakeup
+    // threw after the comment insert committed). Mutate the recorded wake's
+    // idempotency key rather than deleting the row -- a heartbeat run FKs to
+    // it -- so the retry's idempotency lookup finds nothing, exactly as it
+    // would if the wake had never been recorded.
+    await db
+      .update(agentWakeupRequests)
+      .set({ idempotencyKey: "consumed-by-test-simulated-failure" })
+      .where(eq(agentWakeupRequests.agentId, managerId));
+
+    // GitHub redelivers the identical review (new delivery id, same review
+    // id -- the feedback comment already exists and dedupes).
+    const secondRes = await sendReviewSubmitted(app, blockingReview, "delivery-escalation-stall-2");
+    expect(secondRes.status).toBe(200);
+    expect(secondRes.body.escalated).toEqual([
+      { issueIdentifier: "PEN-1126", ownerAgentId: managerId, ownerType: "agent", cycles: 0 },
+    ]);
+
+    const escalationOnly = (
+      await db
+        .select({ metadata: issueComments.metadata })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, issueId))
+    ).filter((r) => (r.metadata as Record<string, unknown> | null)?.kind === "github_pr_review_feedback_escalation");
+    // The comment was NOT duplicated even though escalation ran twice.
+    expect(escalationOnly).toHaveLength(1);
+
+
+    // The wake, however, was successfully redriven on retry: the original
+    // (idempotency-key-mutated) row is still there, plus a fresh one from
+    // the retry with the real idempotency key restored.
+    const managerWakes = await db
+      .select({ idempotencyKey: agentWakeupRequests.idempotencyKey })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, managerId));
+    expect(managerWakes).toHaveLength(2);
+    expect(managerWakes.some((w) => w.idempotencyKey === "consumed-by-test-simulated-failure")).toBe(true);
+    expect(
+      managerWakes.some(
+        (w) => w.idempotencyKey?.startsWith("unseen_blocking_review_escalation:") && w.idempotencyKey !== "consumed-by-test-simulated-failure",
+      ),
+    ).toBe(true);
   });
 
   function dependabotPayload(severity: string, action = "created", alertNumber = 58) {
