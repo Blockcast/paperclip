@@ -116,10 +116,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # Lockfile PRs are bot-generated, policy-exempt, and carry no required
-          # checks, so merge immediately. `gh pr merge --auto` needs repo-level
-          # auto-merge, which is disabled here and 404s, leaving every refresh
-          # PR stranded for a manual merge. Merge directly; fall back to --auto
-          # only if a branch-protection rule is ever added that blocks it.
-          gh pr merge --squash --delete-branch "${{ steps.upsert-pr.outputs.pr_url }}" \
-            || gh pr merge --auto --squash --delete-branch "${{ steps.upsert-pr.outputs.pr_url }}"
+          # The merge queue owns the eventual merge and rejects --delete-branch
+          # because it is asynchronous. Keep the refresh branch: the next run
+          # deliberately force-updates it before reusing its PR.
+          gh pr merge --squash "${{ steps.upsert-pr.outputs.pr_url }}" \
+            || gh pr merge --auto --squash "${{ steps.upsert-pr.outputs.pr_url }}"
