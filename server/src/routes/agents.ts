@@ -94,7 +94,7 @@ import {
   isTruthyRuntimeEnvValue,
   resolveWorktreeRunExecutionActivationState,
 } from "../services/instance-settings.js";
-import { isIssueHeldByForeignRun } from "../services/issue-run-holding.js";
+import { loadAgentInboxLite } from "../services/agent-inbox-lite.js";
 import { logger } from "../middleware/logger.js";
 import { runClaudeLogin } from "@paperclipai/adapter-claude-local/server";
 import { DEFAULT_CODEX_LOCAL_BYPASS_APPROVALS_AND_SANDBOX } from "@paperclipai/adapter-codex-local";
@@ -2446,48 +2446,21 @@ export function agentRoutes(
 
     const issuesSvc = issueService(db);
     const recoveryActionsSvc = issueRecoveryActionService(db);
-    const rows = await issuesSvc.list(req.actor.companyId, {
-      assigneeAgentId: req.actor.agentId,
-      status: "todo,in_progress,blocked",
-      includeRoutineExecutions: true,
-      limit: ISSUE_LIST_DEFAULT_LIMIT,
-    });
     const worktreeActivation = await resolveWorktreeRunExecutionActivationState({
       getExperimental: () => instanceSettingsService(db).getExperimental(),
     });
     const isWorktreeRuntime = isTruthyRuntimeEnvValue(process.env.PAPERCLIP_IN_WORKTREE);
-    const eligibleRows = !isWorktreeRuntime
-      ? rows
-      : worktreeActivation.armed
-      ? rows.filter((issue) => new Date(issue.createdAt) >= new Date(worktreeActivation.cutoff))
-      : [];
-    const issueIds = eligibleRows.map((issue) => issue.id);
-    const [dependencyReadiness, recoveryActionByIssue] = await Promise.all([
-      issuesSvc.listDependencyReadiness(req.actor.companyId, issueIds),
-      recoveryActionsSvc.listActiveForIssues(req.actor.companyId, issueIds),
-    ]);
-
-    // BLO-19001: never offer an issue that a *different* live run already holds.
-    //
-    // Dispatch enforces one-live-run-per-issue only for runs that already carry
-    // an issueId. An autonomous heartbeat run carries none, so it is dispatched
-    // freely and then self-selects here — landing on an issue a sibling run of
-    // this same agent is mid-way through. Under a shared worktree both runs then
-    // edit one tree, and a routine `rm -rf node_modules` in one destroys the
-    // other's state.
-    //
-    // Suppressed rather than flagged: a flag only works if every agent honours
-    // it, and in the observed incident an in-thread warning did not stop the
-    // next run from selecting the same issue 8 minutes later.
     const callerRunId = req.actor.runId ?? null;
-    const nowMs = Date.now();
-    const offeredRows = eligibleRows.filter((issue) => {
-      const held = isIssueHeldByForeignRun({
-        activeRun: issue.activeRun,
-        callerRunId,
-        nowMs,
-      });
-      if (held) {
+    res.json(await loadAgentInboxLite({
+      issuesSvc,
+      recoveryActionsSvc,
+      companyId: req.actor.companyId,
+      agentId: req.actor.agentId,
+      callerRunId,
+      limit: ISSUE_LIST_DEFAULT_LIMIT,
+      isWorktreeRuntime,
+      worktreeActivation,
+      onWithheldForeignRun: (issue) => {
         logger.info(
           {
             agentId: req.actor.agentId,
@@ -2498,28 +2471,8 @@ export function agentRoutes(
           },
           "inbox-lite: withheld issue already held by another live run of this agent",
         );
-      }
-      return !held;
-    });
-
-    res.json(
-      offeredRows.map((issue) => ({
-        id: issue.id,
-        identifier: issue.identifier,
-        title: issue.title,
-        status: issue.status,
-        priority: issue.priority,
-        projectId: issue.projectId,
-        goalId: issue.goalId,
-        parentId: issue.parentId,
-        updatedAt: issue.updatedAt,
-        activeRun: issue.activeRun,
-        activeRecoveryAction: recoveryActionByIssue.get(issue.id) ?? null,
-        dependencyReady: dependencyReadiness.get(issue.id)?.isDependencyReady ?? true,
-        unresolvedBlockerCount: dependencyReadiness.get(issue.id)?.unresolvedBlockerCount ?? 0,
-        unresolvedBlockerIssueIds: dependencyReadiness.get(issue.id)?.unresolvedBlockerIssueIds ?? [],
-      })),
-    );
+      },
+    }));
   });
 
   router.get("/agents/me/inbox/mine", async (req, res) => {
