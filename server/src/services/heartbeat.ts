@@ -15068,14 +15068,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             // additional availability path is a queued/retry row that never
             // started, which checkout can cancel and adopt once this run starts.
             notInArray(heartbeatRuns.status, TERMINAL_HEARTBEAT_RUN_STATUS_VALUES),
-            not(
-              and(
-                inArray(
-                  heartbeatRuns.status,
-                  [...ISSUE_EXECUTION_LOCK_REAPABLE_NEVER_STARTED_RUN_STATUSES],
-                ),
-                isNull(heartbeatRuns.startedAt),
+            // De Morgan of `NOT (reapable AND never-started)`. Written as the
+            // disjunction rather than `not(and(...))` because drizzle's `and()`
+            // is `SQL | undefined` while `not()` demands a non-optional
+            // `SQLWrapper`. Both legs are NOT NULL booleans — `status` is
+            // non-nullable and `IS NULL` never yields NULL — so this is an exact
+            // equivalent, not a three-valued-logic approximation.
+            or(
+              notInArray(
+                heartbeatRuns.status,
+                [...ISSUE_EXECUTION_LOCK_REAPABLE_NEVER_STARTED_RUN_STATUSES],
               ),
+              isNotNull(heartbeatRuns.startedAt),
             ),
           ),
         ),
