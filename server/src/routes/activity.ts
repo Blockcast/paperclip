@@ -18,6 +18,32 @@ const createActivitySchema = z.object({
   details: z.record(z.unknown()).optional().nullable(),
 });
 
+const COMPANY_ACTIVITY_QUERY_PARAMS = new Set(["agentId", "entityType", "entityId", "action", "limit"]);
+
+// A filter value of "" (e.g. `?action=`) is not a meaningful value for any of these keys — reject it
+// rather than letting it fall through as `undefined` and silently widen the query (BLO-21979).
+const companyActivityQuerySchema = z.object({
+  agentId: z.string().min(1).optional(),
+  entityType: z.string().min(1).optional(),
+  entityId: z.string().min(1).optional(),
+  action: z.string().min(1).optional(),
+  limit: z.string().optional(),
+});
+
+const uuidQueryParamSchema = z.string().uuid();
+
+// A caller who mistypes or invents a filter key on an audit surface must not get a plausible-looking
+// unfiltered page back — that reads as "verified absent" instead of "filter never applied" (BLO-21979).
+function rejectUnsupportedQueryParams(req: { query: Record<string, unknown> }, res: any, allowed: Set<string>) {
+  const unsupported = Object.keys(req.query).filter((key) => !allowed.has(key)).sort();
+  if (unsupported.length === 0) return true;
+  res.status(400).json({
+    error: `Unsupported query parameter${unsupported.length === 1 ? "" : "s"}: ${unsupported.join(", ")}`,
+    unsupportedParams: unsupported,
+  });
+  return false;
+}
+
 export function activityRoutes(db: Db) {
   const router = Router();
   const svc = activityService(db);
@@ -76,15 +102,54 @@ export function activityRoutes(db: Db) {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     if (!(await assertCompanyScopeReadAllowed(req, res, companyId))) return;
+    if (!rejectUnsupportedQueryParams(req, res, COMPANY_ACTIVITY_QUERY_PARAMS)) return;
+
+    const parsedQuery = companyActivityQuerySchema.safeParse(req.query);
+    if (!parsedQuery.success) {
+      const emptyParams = [...new Set(parsedQuery.error.issues.map((issue) => String(issue.path[0])))].sort();
+      res.status(400).json({
+        error: `Query parameter${emptyParams.length === 1 ? "" : "s"} must not be empty: ${emptyParams.join(", ")}`,
+        emptyParams,
+      });
+      return;
+    }
+
+    // openapi.ts documents `agentId` as a UUID; enforce that at runtime too, otherwise a malformed
+    // value (e.g. `?agentId=not-a-uuid`) reaches the Drizzle `eq` against the UUID column and Postgres
+    // rejects it, turning a client input error into an unhandled 500 instead of the documented 400 (BLO-21979).
+    if (parsedQuery.data.agentId !== undefined && !uuidQueryParamSchema.safeParse(parsedQuery.data.agentId).success) {
+      res.status(400).json({
+        error: "Query parameter agentId must be a valid UUID",
+        invalidParams: ["agentId"],
+      });
+      return;
+    }
 
     const filters = {
       companyId,
-      agentId: req.query.agentId as string | undefined,
-      entityType: req.query.entityType as string | undefined,
-      entityId: req.query.entityId as string | undefined,
-      limit: normalizeActivityLimit(Number(req.query.limit)),
+      agentId: parsedQuery.data.agentId,
+      entityType: parsedQuery.data.entityType,
+      entityId: parsedQuery.data.entityId,
+      action: parsedQuery.data.action,
+      limit: normalizeActivityLimit(Number(parsedQuery.data.limit)),
     };
     const result = await svc.list(filters);
+    // Echoes the filter actually applied (as opposed to the query string sent) so a caller can tell
+    // "filter applied, zero matches" apart from "filter never applied" without changing the array response shape.
+    // Percent-encoded because HTTP header values must be Latin-1/ASCII — a raw non-ASCII action value
+    // (e.g. `?action=%E2%98%83`) would otherwise crash the response with ERR_INVALID_CHAR (BLO-21979).
+    res.setHeader(
+      "X-Applied-Filters",
+      encodeURIComponent(
+        JSON.stringify({
+          agentId: filters.agentId ?? null,
+          entityType: filters.entityType ?? null,
+          entityId: filters.entityId ?? null,
+          action: filters.action ?? null,
+          limit: filters.limit,
+        }),
+      ),
+    );
     res.json(result);
   });
 
@@ -105,6 +170,7 @@ export function activityRoutes(db: Db) {
     const issue = await getAccessibleResource(req, res, resolveIssueByRef(rawId), "Issue not found");
     if (!issue) return;
     if (!(await assertIssueReadAllowed(req, res, issue))) return;
+    if (!rejectUnsupportedQueryParams(req, res, new Set())) return;
     const result = await svc.forIssue(issue.id);
     res.json(result);
   });
@@ -114,6 +180,7 @@ export function activityRoutes(db: Db) {
     const issue = await getAccessibleResource(req, res, resolveIssueByRef(rawId), "Issue not found");
     if (!issue) return;
     if (!(await assertIssueReadAllowed(req, res, issue))) return;
+    if (!rejectUnsupportedQueryParams(req, res, new Set())) return;
     const result = await svc.runsForIssue(issue.companyId, issue.id);
     res.json(result);
   });
@@ -121,6 +188,7 @@ export function activityRoutes(db: Db) {
   router.get("/heartbeat-runs/:runId/issues", async (req, res) => {
     assertAuthenticated(req);
     const runId = req.params.runId as string;
+    if (!rejectUnsupportedQueryParams(req, res, new Set())) return;
     const run = await heartbeat.getRun(runId);
     if (!run || !hasCompanyAccess(req, run.companyId)) {
       // Return `200 []` for both "doesn't exist" and "cross-tenant" — preserves the

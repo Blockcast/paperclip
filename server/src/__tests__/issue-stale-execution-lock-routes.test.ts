@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
@@ -11,6 +11,7 @@ import {
   createDb,
   heartbeatRuns,
   issueComments,
+  issueExecutionDecisions,
   issueRelations,
   issues,
 } from "@paperclipai/db";
@@ -20,6 +21,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
+import { issueService } from "../services/issues.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -43,6 +45,7 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
 
   afterEach(async () => {
     await db.delete(issueComments);
+    await db.delete(issueExecutionDecisions);
     await db.delete(issueRelations);
     await db.delete(activityLog);
     await db.delete(issues);
@@ -268,6 +271,155 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
         errorCode: null,
       },
     });
+  });
+
+  it("rejects a post-adoption stale PATCH when ownership transfers before the final write", async () => {
+    const { companyId, agentId, failedRunId, currentRunId } = await seedCompanyAgentAndRuns();
+    const nextRunId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: nextRunId,
+      companyId,
+      agentId,
+      status: "running",
+      invocationSource: "manual",
+      startedAt: new Date(),
+      createdAt: new Date("2026-01-01T00:02:00.000Z"),
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Post-adoption transfer",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: failedRunId,
+      executionRunId: failedRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date(),
+    });
+
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS test_post_adoption_transfer_config (
+        issue_id uuid PRIMARY KEY,
+        next_run_id uuid NOT NULL
+      )
+    `);
+    await db.execute(sql`
+      INSERT INTO test_post_adoption_transfer_config (issue_id, next_run_id)
+      VALUES (${issueId}, ${nextRunId})
+      ON CONFLICT (issue_id) DO UPDATE SET next_run_id = EXCLUDED.next_run_id
+    `);
+    await db.execute(sql`
+      CREATE OR REPLACE FUNCTION test_transfer_issue_after_adoption()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      AS $$
+      DECLARE
+        configured_next_run_id uuid;
+      BEGIN
+        SELECT next_run_id
+        INTO configured_next_run_id
+        FROM test_post_adoption_transfer_config
+        WHERE issue_id = NEW.id;
+
+        IF configured_next_run_id IS NOT NULL
+           AND NEW.checkout_run_id IS DISTINCT FROM configured_next_run_id THEN
+          UPDATE issues
+          SET checkout_run_id = configured_next_run_id,
+              execution_run_id = configured_next_run_id,
+              execution_locked_at = now(),
+              updated_at = now()
+          WHERE id = NEW.id;
+        END IF;
+
+        RETURN NEW;
+      END;
+      $$;
+    `);
+    await db.execute(sql`
+      DROP TRIGGER IF EXISTS test_transfer_issue_after_adoption ON issues
+    `);
+    await db.execute(sql`
+      CREATE TRIGGER test_transfer_issue_after_adoption
+      AFTER UPDATE OF checkout_run_id ON issues
+      FOR EACH ROW
+      WHEN (OLD.checkout_run_id IS DISTINCT FROM NEW.checkout_run_id)
+      EXECUTE FUNCTION test_transfer_issue_after_adoption()
+    `);
+
+    try {
+      const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+        .patch(`/api/issues/${issueId}`)
+        .send({ title: "Stale post-adoption write" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+
+      const row = await db
+        .select({
+          title: issues.title,
+          checkoutRunId: issues.checkoutRunId,
+          executionRunId: issues.executionRunId,
+        })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]);
+      expect(row).toEqual({
+        title: "Post-adoption transfer",
+        checkoutRunId: nextRunId,
+        executionRunId: nextRunId,
+      });
+    } finally {
+      await db.execute(sql`DROP TRIGGER IF EXISTS test_transfer_issue_after_adoption ON issues`);
+      await db.execute(sql`DROP FUNCTION IF EXISTS test_transfer_issue_after_adoption()`);
+      await db.execute(sql`DROP TABLE IF EXISTS test_post_adoption_transfer_config`);
+    }
+  });
+
+  it("allows an assigned agent PATCH while another wake is only queued", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Queued wake without execution ownership",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+      executionRunId: null,
+    });
+    const queuedWakeupId = randomUUID();
+    const queuedRunId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: queuedWakeupId,
+      companyId,
+      agentId,
+      source: "assignment",
+      status: "queued",
+      runId: queuedRunId,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: queuedRunId,
+      companyId,
+      agentId,
+      status: "queued",
+      invocationSource: "assignment",
+      wakeupRequestId: queuedWakeupId,
+      contextSnapshot: { issueId },
+    });
+
+    const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ title: "Assignee can still update" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.title).toBe("Assignee can still update");
+    const queuedRun = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, queuedRunId))
+      .then((rows) => rows[0] ?? null);
+    expect(queuedRun?.status).not.toBe("running");
   });
 
   it("allows a same-agent current run to close an issue owned by a stale adapter_failed checkout run", async () => {
@@ -822,9 +974,10 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
     // was cleared by releaseIssueExecutionAndPromote, but checkoutRunId stayed
     // pinned to the dead run. The new agent's POST /checkout would 409 forever
     // without the clearCheckoutRunIfTerminal helper in svc.checkout.
-    const { companyId, agentId, failedRunId, currentRunId } = await seedCompanyAgentAndRuns();
+    const { companyId, failedRunId } = await seedCompanyAgentAndRuns();
     const issueId = randomUUID();
     const otherAgentId = randomUUID();
+    const otherRunId = randomUUID();
     await db.insert(agents).values({
       id: otherAgentId,
       companyId,
@@ -835,6 +988,16 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
       adapterConfig: {},
       runtimeConfig: {},
       permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: otherRunId,
+      companyId,
+      agentId: otherAgentId,
+      status: "running",
+      invocationSource: "on_demand",
+      triggerDetail: "manual",
+      contextSnapshot: { issueId },
+      startedAt: new Date(),
     });
     await db.insert(issues).values({
       id: issueId,
@@ -851,7 +1014,7 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
       executionLockedAt: null,
     });
 
-    const res = await request(createApp(agentActor(companyId, otherAgentId, currentRunId)))
+    const res = await request(createApp(agentActor(companyId, otherAgentId, otherRunId)))
       .post(`/api/issues/${issueId}/checkout`)
       .send({
         agentId: otherAgentId,
@@ -873,17 +1036,127 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
     expect(row).toEqual({
       status: "in_progress",
       assigneeAgentId: otherAgentId,
-      checkoutRunId: currentRunId,
-      executionRunId: currentRunId,
+      checkoutRunId: otherRunId,
+      executionRunId: otherRunId,
     });
   });
 
+  it("does not stamp executionRunId when checkout's actor run finalizes while waiting on the issue row", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Checkout run finalized while waiting",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: null,
+      executionRunId: null,
+      executionAgentNameKey: null,
+      executionLockedAt: null,
+    });
+
+    let releaseIssueLock!: () => void;
+    let issueLockHeld!: () => void;
+    const issueLockHeldPromise = new Promise<void>((resolve) => {
+      issueLockHeld = resolve;
+    });
+    const releaseIssueLockPromise = new Promise<void>((resolve) => {
+      releaseIssueLock = resolve;
+    });
+    const lockTransaction = db.transaction(async (tx) => {
+      await tx
+        .select({ id: issues.id })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .for("update");
+      issueLockHeld();
+      await releaseIssueLockPromise;
+    });
+
+    await issueLockHeldPromise;
+    const checkoutPromise = issueService(db).checkout(
+      issueId,
+      agentId,
+      ["todo", "backlog", "blocked"],
+      currentRunId,
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await db
+      .update(heartbeatRuns)
+      .set({
+        status: "succeeded",
+        finishedAt: new Date(),
+      })
+      .where(eq(heartbeatRuns.id, currentRunId));
+
+    releaseIssueLock();
+    await expect(checkoutPromise).rejects.toMatchObject({ status: 409 });
+    await lockTransaction;
+
+    const issue = await db
+      .select({ status: issues.status, checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue).toEqual({
+      status: "todo",
+      checkoutRunId: null,
+      executionRunId: null,
+    });
+  });
+
+  it("does not return idempotent checkout success when the existing owner run finalizes", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Existing checkout owner finalized while waiting",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: currentRunId,
+      executionRunId: currentRunId,
+      executionAgentNameKey: "test-agent",
+      executionLockedAt: new Date(),
+    });
+
+    let releaseIssueLock!: () => void;
+    let issueLockHeld!: () => void;
+    const issueLockHeldPromise = new Promise<void>((resolve) => { issueLockHeld = resolve; });
+    const releaseIssueLockPromise = new Promise<void>((resolve) => { releaseIssueLock = resolve; });
+    const lockTransaction = db.transaction(async (tx) => {
+      await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, issueId)).for("update");
+      issueLockHeld();
+      await releaseIssueLockPromise;
+    });
+
+    await issueLockHeldPromise;
+    const checkoutPromise = issueService(db).checkout(
+      issueId,
+      agentId,
+      ["todo", "backlog", "blocked"],
+      currentRunId,
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "succeeded", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, currentRunId));
+
+    releaseIssueLock();
+    await expect(checkoutPromise).rejects.toMatchObject({ status: 409 });
+    await lockTransaction;
+  });
+
   // BLO-19848 end-to-end: the assignee must be able to transition an issue whose
-  // executionRunId is pinned by a non-live run, without a board user or a manual
-  // reconciler. This is the BLO-18307 shape — checkout and execution both name
-  // one run parked at `scheduled_retry` — which returned 409 to three close
-  // attempts over ~1d7h while the issue's fix was already merged.
-  it("lets the assignee transition after the sweeper reclaims a scheduled_retry lock (BLO-19848)", async () => {
+  // checkout and execution locks both name a never-started scheduled retry,
+  // without waiting for a board user or a manual reconciler.
+  it("lets the assignee transition after reaping a scheduled_retry lock (BLO-19848)", async () => {
     const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
     const wedgedRunId = randomUUID();
     const issueId = randomUUID();
@@ -913,30 +1186,1323 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
       executionLockedAt: new Date(Date.now() - 31 * 60 * 60 * 1000),
     });
 
-    // Before the reconcile window elapses the lock is honoured, which is the
-    // intended behaviour — a parked retry is not reclaimed on sight.
-    const wedged = await request(createApp(agentActor(companyId, agentId, currentRunId)))
-      .patch(`/api/issues/${issueId}`)
-      .send({ status: "done" });
-    expect(wedged.status).toBe(409);
-    expect(wedged.body?.error ?? wedged.body?.message).toContain("Issue run ownership conflict");
-
-    const { heartbeatService } = await import("../services/heartbeat.ts");
-    const sweep = await heartbeatService(db).sweepStaleIssueLocks();
-    expect(sweep.cleared).toBe(1);
-
     const recovered = await request(createApp(agentActor(companyId, agentId, currentRunId)))
       .patch(`/api/issues/${issueId}`)
       .send({ status: "done" });
     expect(recovered.status, JSON.stringify(recovered.body)).toBe(200);
     expect(recovered.body.status).toBe("done");
 
-    // The wedged run row is left alone — reclaiming the lock must not cancel it.
+    // Reaping prevents the never-started owner from later starting against a
+    // status that the assignee has already transitioned.
     const run = await db
       .select({ status: heartbeatRuns.status })
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, wedgedRunId))
       .then((rows) => rows[0]);
-    expect(run?.status).toBe("scheduled_retry");
+    expect(run?.status).toBe("cancelled");
   });
+
+  // BLO-20321: a run that exists but has never executed (`queued` /
+  // `scheduled_retry`, startedAt null) is non-terminal, so the old
+  // terminal-only staleness test treated it as a live owner and answered the
+  // assignee's own write with 409. That made WIP monotonic — checkout adds WIP
+  // without a lock, parking or closing needs one, and the lock was held by the
+  // very queue backlog being drained.
+  describe("never-started execution lock owners (BLO-20321)", () => {
+    async function seedIssueOwnedByRun(input: {
+      companyId: string;
+      agentId: string;
+      ownerRunId: string;
+      title: string;
+    }) {
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId: input.companyId,
+        title: input.title,
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: input.agentId,
+        checkoutRunId: input.ownerRunId,
+        executionRunId: input.ownerRunId,
+        executionAgentNameKey: "codexcoder",
+        executionLockedAt: new Date(),
+      });
+      return issueId;
+    }
+
+    async function seedNeverStartedOwnerRun(input: {
+      companyId: string;
+      agentId: string;
+      status: "queued" | "scheduled_retry";
+    }) {
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId: input.companyId,
+        agentId: input.agentId,
+        status: input.status,
+        invocationSource: "assignment",
+        // The defining property: dispatched but never executed.
+        startedAt: null,
+        scheduledRetryAt:
+          input.status === "scheduled_retry" ? new Date(Date.now() + 60_000) : undefined,
+        createdAt: new Date("2026-01-01T00:00:00.000Z"),
+      });
+      return runId;
+    }
+
+    it("lets the assignee PATCH an issue whose execution lock is held by a queued run", async () => {
+      const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+      const queuedOwnerRunId = await seedNeverStartedOwnerRun({
+        companyId,
+        agentId,
+        status: "queued",
+      });
+      const issueId = await seedIssueOwnedByRun({
+        companyId,
+        agentId,
+        ownerRunId: queuedOwnerRunId,
+        title: "Queued owner blocks its own assignee",
+      });
+
+      const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "todo" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+      const row = await db
+        .select({ status: issues.status, executionRunId: issues.executionRunId })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]);
+      expect(row?.status).toBe("todo");
+      // The lock moved to the acting run rather than staying with the queued one.
+      expect(row?.executionRunId).not.toBe(queuedOwnerRunId);
+    });
+
+    it("cancels the superseded queued run so it cannot start against the new status", async () => {
+      const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+      const queuedOwnerRunId = await seedNeverStartedOwnerRun({
+        companyId,
+        agentId,
+        status: "queued",
+      });
+      const issueId = await seedIssueOwnedByRun({
+        companyId,
+        agentId,
+        ownerRunId: queuedOwnerRunId,
+        title: "Superseded queued owner is reaped",
+      });
+      // cancelStaleIssueContextRuns targets runs by contextSnapshot.issueId.
+      await db
+        .update(heartbeatRuns)
+        .set({ contextSnapshot: { issueId } })
+        .where(eq(heartbeatRuns.id, queuedOwnerRunId));
+
+      await request(createApp(agentActor(companyId, agentId, currentRunId)))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "todo" })
+        .expect(200);
+
+      const ownerRun = await db
+        .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, queuedOwnerRunId))
+        .then((rows) => rows[0]);
+      expect(ownerRun?.status).toBe("cancelled");
+      // Reaped by whichever adoption path won; both cancel the superseded run.
+      expect(["issue_checkout_adopted", "issue_execution_lock_adopted"]).toContain(
+        ownerRun?.errorCode,
+      );
+    });
+
+    it("lets the assignee PATCH an issue whose execution lock is held by a scheduled_retry run", async () => {
+      const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+      const retryOwnerRunId = await seedNeverStartedOwnerRun({
+        companyId,
+        agentId,
+        status: "scheduled_retry",
+      });
+      const issueId = await seedIssueOwnedByRun({
+        companyId,
+        agentId,
+        ownerRunId: retryOwnerRunId,
+        title: "Retry-scheduled owner blocks its own assignee",
+      });
+
+      const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "cancelled" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+      const row = await db
+        .select({ status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]);
+      expect(row?.status).toBe("cancelled");
+    });
+
+    it("lets the assignee release an issue whose checkout run never started", async () => {
+      const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+      const queuedOwnerRunId = await seedNeverStartedOwnerRun({
+        companyId,
+        agentId,
+        status: "queued",
+      });
+      const issueId = await seedIssueOwnedByRun({
+        companyId,
+        agentId,
+        ownerRunId: queuedOwnerRunId,
+        title: "Release past a queued owner",
+      });
+
+      const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+        .post(`/api/issues/${issueId}/release`)
+        .send();
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+      const row = await db
+        .select({
+          status: issues.status,
+          assigneeAgentId: issues.assigneeAgentId,
+          checkoutRunId: issues.checkoutRunId,
+          executionRunId: issues.executionRunId,
+        })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]);
+      expect(row).toEqual({
+        status: "todo",
+        assigneeAgentId: null,
+        checkoutRunId: null,
+        executionRunId: null,
+      });
+    });
+
+    it.each(["todo", "blocked", "in_review", "backlog"] as const)(
+      "reaps a divergent queued execution owner when releasing a %s issue",
+      async (status) => {
+        const { companyId, agentId, failedRunId, currentRunId } = await seedCompanyAgentAndRuns();
+        const queuedExecutionRunId = await seedNeverStartedOwnerRun({
+          companyId,
+          agentId,
+          status: "queued",
+        });
+        const issueId = randomUUID();
+        await db.insert(issues).values({
+          id: issueId,
+          companyId,
+          title: `Release ${status} with divergent owners`,
+          status,
+          priority: "high",
+          assigneeAgentId: agentId,
+          checkoutRunId: failedRunId,
+          executionRunId: queuedExecutionRunId,
+          executionAgentNameKey: "codexcoder",
+          executionLockedAt: new Date(),
+        });
+
+        const response = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+          .post(`/api/issues/${issueId}/release`)
+          .send();
+        expect(response.status, JSON.stringify(response.body)).toBe(200);
+
+        const issue = await db
+          .select({
+            status: issues.status,
+            assigneeAgentId: issues.assigneeAgentId,
+            checkoutRunId: issues.checkoutRunId,
+            executionRunId: issues.executionRunId,
+          })
+          .from(issues)
+          .where(eq(issues.id, issueId))
+          .then((rows) => rows[0]);
+        expect(issue).toEqual({
+          status: "todo",
+          assigneeAgentId: null,
+          checkoutRunId: null,
+          executionRunId: null,
+        });
+
+        const executionOwner = await db
+          .select({
+            status: heartbeatRuns.status,
+            contextSnapshot: heartbeatRuns.contextSnapshot,
+            errorCode: heartbeatRuns.errorCode,
+          })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, queuedExecutionRunId))
+          .then((rows) => rows[0]);
+        expect(executionOwner).toEqual({
+          status: "cancelled",
+          contextSnapshot: null,
+          errorCode: "issue_released",
+        });
+      },
+    );
+
+    it("reaps a context-less queued execution owner when a board user releases the issue", async () => {
+      const { companyId, agentId, failedRunId } = await seedCompanyAgentAndRuns();
+      const queuedExecutionRunId = await seedNeverStartedOwnerRun({
+        companyId,
+        agentId,
+        status: "queued",
+      });
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Board release with divergent owners",
+        status: "todo",
+        priority: "high",
+        assigneeAgentId: agentId,
+        checkoutRunId: failedRunId,
+        executionRunId: queuedExecutionRunId,
+        executionAgentNameKey: "codexcoder",
+        executionLockedAt: new Date(),
+      });
+
+      const response = await request(createApp(boardActor(companyId)))
+        .post(`/api/issues/${issueId}/release`)
+        .send();
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+
+      const issue = await db
+        .select({
+          status: issues.status,
+          assigneeAgentId: issues.assigneeAgentId,
+          checkoutRunId: issues.checkoutRunId,
+          executionRunId: issues.executionRunId,
+        })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]);
+      expect(issue).toEqual({
+        status: "todo",
+        assigneeAgentId: null,
+        checkoutRunId: null,
+        executionRunId: null,
+      });
+
+      const executionOwner = await db
+        .select({
+          status: heartbeatRuns.status,
+          contextSnapshot: heartbeatRuns.contextSnapshot,
+          errorCode: heartbeatRuns.errorCode,
+        })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, queuedExecutionRunId))
+        .then((rows) => rows[0]);
+      expect(executionOwner).toEqual({
+        status: "cancelled",
+        contextSnapshot: null,
+        errorCode: "issue_released",
+      });
+    });
+
+    it("does not let a non-assignee release a non-in-progress issue", async () => {
+      const { companyId, agentId, failedRunId, currentRunId } = await seedCompanyAgentAndRuns();
+      const peerAgentId = randomUUID();
+      await db.insert(agents).values({
+        id: peerAgentId,
+        companyId,
+        name: "PeerAgent",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Non-assignee release remains forbidden",
+        status: "todo",
+        priority: "high",
+        assigneeAgentId: agentId,
+        checkoutRunId: failedRunId,
+        executionRunId: failedRunId,
+      });
+
+      const response = await request(createApp(agentActor(companyId, peerAgentId, currentRunId)))
+        .post(`/api/issues/${issueId}/release`)
+        .send();
+      expect(response.status, JSON.stringify(response.body)).toBe(403);
+
+      const issue = await db
+        .select({
+          status: issues.status,
+          assigneeAgentId: issues.assigneeAgentId,
+          checkoutRunId: issues.checkoutRunId,
+          executionRunId: issues.executionRunId,
+        })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]);
+      expect(issue).toEqual({
+        status: "todo",
+        assigneeAgentId: agentId,
+        checkoutRunId: failedRunId,
+        executionRunId: failedRunId,
+      });
+    });
+
+    it("still refuses when the owning run is genuinely running under a different run id", async () => {
+      const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+      const runningOwnerRunId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: runningOwnerRunId,
+        companyId,
+        agentId,
+        status: "running",
+        invocationSource: "assignment",
+        // Started — this is a real owner, and the race protection must hold.
+        startedAt: new Date(),
+        createdAt: new Date("2026-01-01T00:00:00.000Z"),
+      });
+      const issueId = await seedIssueOwnedByRun({
+        companyId,
+        agentId,
+        ownerRunId: runningOwnerRunId,
+        title: "Live owner still conflicts",
+      });
+
+      const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "todo" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body.error).toBe("Issue run ownership conflict");
+    });
+
+    it("does not widen the authorization boundary for a non-assignee peer", async () => {
+      const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+      const peerAgentId = randomUUID();
+      await db.insert(agents).values({
+        id: peerAgentId,
+        companyId,
+        name: "PeerAgent",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      const queuedOwnerRunId = await seedNeverStartedOwnerRun({
+        companyId,
+        agentId,
+        status: "queued",
+      });
+      const issueId = await seedIssueOwnedByRun({
+        companyId,
+        agentId,
+        ownerRunId: queuedOwnerRunId,
+        title: "Peer cannot ride the reap path",
+      });
+
+      const res = await request(createApp(agentActor(companyId, peerAgentId, currentRunId)))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "todo" });
+
+      // Reaping happens strictly downstream of authorization, so a peer without a
+      // grant is refused before it is ever reached.
+      expect(res.status, JSON.stringify(res.body)).not.toBe(200);
+      expect([403, 409]).toContain(res.status);
+
+      const row = await db
+        .select({ status: issues.status, assigneeAgentId: issues.assigneeAgentId })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]);
+      expect(row).toEqual({ status: "in_progress", assigneeAgentId: agentId });
+    });
+
+    it.each(["queued", "scheduled_retry"] as const)(
+      "keeps dispatch claim and %s-owner adoption mutually exclusive",
+      async (ownerStatus) => {
+        for (let attempt = 0; attempt < 8; attempt += 1) {
+          const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+          const ownerRunId = await seedNeverStartedOwnerRun({ companyId, agentId, status: ownerStatus });
+          const issueId = await seedIssueOwnedByRun({
+            companyId,
+            agentId,
+            ownerRunId,
+            title: `${ownerStatus} dispatch race ${attempt}`,
+          });
+
+          const [patchResponse, claimed] = await Promise.all([
+            request(createApp(agentActor(companyId, agentId, currentRunId)))
+              .patch(`/api/issues/${issueId}`)
+              .send({ title: `attempt ${attempt}` }),
+            db
+              .update(heartbeatRuns)
+              .set({ status: "running", startedAt: new Date(), updatedAt: new Date() })
+              .where(
+                and(
+                  eq(heartbeatRuns.id, ownerRunId),
+                  eq(heartbeatRuns.status, ownerStatus),
+                  isNull(heartbeatRuns.startedAt),
+                ),
+              )
+              .returning({ id: heartbeatRuns.id }),
+          ]);
+
+          const owner = await db
+            .select({ status: heartbeatRuns.status })
+            .from(heartbeatRuns)
+            .where(eq(heartbeatRuns.id, ownerRunId))
+            .then((rows) => rows[0]);
+          if (patchResponse.status === 200) {
+            expect(claimed).toHaveLength(0);
+            expect(owner?.status).toBe("cancelled");
+          } else {
+            expect(patchResponse.status, JSON.stringify(patchResponse.body)).toBe(409);
+            expect(claimed).toHaveLength(1);
+            expect(owner?.status).toBe("running");
+          }
+
+          await db.delete(issues).where(eq(issues.id, issueId));
+          await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, ownerRunId));
+        }
+      },
+    );
+
+    it("does not replace a divergent live execution owner during checkout adoption or release", async () => {
+      const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+      const queuedCheckoutRunId = await seedNeverStartedOwnerRun({ companyId, agentId, status: "queued" });
+      const liveExecutionRunId = randomUUID();
+      const issueId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: liveExecutionRunId,
+        companyId,
+        agentId,
+        status: "running",
+        invocationSource: "assignment",
+        startedAt: new Date(),
+      });
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Divergent owner protection",
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+        checkoutRunId: queuedCheckoutRunId,
+        executionRunId: liveExecutionRunId,
+        executionAgentNameKey: "codexcoder",
+        executionLockedAt: new Date(),
+      });
+
+      const app = createApp(agentActor(companyId, agentId, currentRunId));
+      const patchResponse = await request(app)
+        .patch(`/api/issues/${issueId}`)
+        .send({ title: "Must not land" });
+      expect(patchResponse.status, JSON.stringify(patchResponse.body)).toBe(409);
+
+      const releaseResponse = await request(app)
+        .post(`/api/issues/${issueId}/release`)
+        .send();
+      expect(releaseResponse.status, JSON.stringify(releaseResponse.body)).toBe(409);
+
+      const row = await db
+        .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]);
+      expect(row).toEqual({
+        checkoutRunId: queuedCheckoutRunId,
+        executionRunId: liveExecutionRunId,
+      });
+    });
+
+    it("does not clear a reapable execution owner behind a divergent live checkout owner", async () => {
+      const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+      const liveCheckoutRunId = randomUUID();
+      const queuedExecutionRunId = await seedNeverStartedOwnerRun({
+        companyId,
+        agentId,
+        status: "queued",
+      });
+      const issueId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: liveCheckoutRunId,
+        companyId,
+        agentId,
+        status: "running",
+        invocationSource: "assignment",
+        startedAt: new Date(),
+        createdAt: new Date("2026-01-01T00:00:00.000Z"),
+      });
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Live checkout owner protection",
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+        checkoutRunId: liveCheckoutRunId,
+        executionRunId: queuedExecutionRunId,
+        executionAgentNameKey: "codexcoder",
+        executionLockedAt: new Date(),
+      });
+      await db
+        .update(heartbeatRuns)
+        .set({ contextSnapshot: { issueId } })
+        .where(eq(heartbeatRuns.id, currentRunId));
+
+      const response = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+        .patch(`/api/issues/${issueId}`)
+        .send({ title: "Must not land" });
+      expect(response.status, JSON.stringify(response.body)).toBe(409);
+
+      const row = await db
+        .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]);
+      expect(row).toEqual({
+        checkoutRunId: liveCheckoutRunId,
+        executionRunId: queuedExecutionRunId,
+      });
+
+      const owners = await db
+        .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(inArray(heartbeatRuns.id, [liveCheckoutRunId, queuedExecutionRunId]));
+      expect(new Map(owners.map((owner) => [owner.id, owner.status]))).toEqual(
+        new Map([
+          [liveCheckoutRunId, "running"],
+          [queuedExecutionRunId, "queued"],
+        ]),
+      );
+    });
+
+    it("does not replace a divergent live checkout owner behind a terminal execution owner", async () => {
+      const { companyId, agentId, currentRunId, failedRunId } = await seedCompanyAgentAndRuns();
+      const liveCheckoutRunId = randomUUID();
+      const issueId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: liveCheckoutRunId,
+        companyId,
+        agentId,
+        status: "running",
+        invocationSource: "assignment",
+        startedAt: new Date(),
+      });
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Terminal execution owner behind live checkout owner",
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+        checkoutRunId: liveCheckoutRunId,
+        executionRunId: failedRunId,
+        executionAgentNameKey: "codexcoder",
+        executionLockedAt: new Date(),
+      });
+
+      const response = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+        .post(`/api/issues/${issueId}/checkout`)
+        .send({ agentId, expectedStatuses: ["in_progress"] });
+      expect(response.status, JSON.stringify(response.body)).toBe(409);
+
+      const row = await db
+        .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]);
+      expect(row).toEqual({
+        checkoutRunId: liveCheckoutRunId,
+        executionRunId: null,
+      });
+    });
+
+    it("does not accept same-run checkout ownership behind a divergent live execution owner", async () => {
+      const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+      const liveExecutionRunId = randomUUID();
+      const issueId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: liveExecutionRunId,
+        companyId,
+        agentId,
+        status: "running",
+        invocationSource: "assignment",
+        startedAt: new Date(),
+      });
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Same checkout owner behind live execution owner",
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+        checkoutRunId: currentRunId,
+        executionRunId: liveExecutionRunId,
+        executionAgentNameKey: "codexcoder",
+        executionLockedAt: new Date(),
+      });
+
+      const app = createApp(agentActor(companyId, agentId, currentRunId));
+      const checkoutResponse = await request(app)
+        .post(`/api/issues/${issueId}/checkout`)
+        .send({ agentId, expectedStatuses: ["in_progress"] });
+      expect(checkoutResponse.status, JSON.stringify(checkoutResponse.body)).toBe(409);
+
+      const patchResponse = await request(app)
+        .patch(`/api/issues/${issueId}`)
+        .send({ title: "Must not land" });
+      expect(patchResponse.status, JSON.stringify(patchResponse.body)).toBe(409);
+
+      const row = await db
+        .select({
+          title: issues.title,
+          checkoutRunId: issues.checkoutRunId,
+          executionRunId: issues.executionRunId,
+        })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]);
+      expect(row).toEqual({
+        title: "Same checkout owner behind live execution owner",
+        checkoutRunId: currentRunId,
+        executionRunId: liveExecutionRunId,
+      });
+    });
+
+    it("reaps divergent never-started owners when checking out a todo issue", async () => {
+      const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+      const queuedCheckoutRunId = await seedNeverStartedOwnerRun({
+        companyId,
+        agentId,
+        status: "queued",
+      });
+      const queuedExecutionRunId = await seedNeverStartedOwnerRun({
+        companyId,
+        agentId,
+        status: "queued",
+      });
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Divergent never-started owner recovery",
+        status: "todo",
+        priority: "high",
+        assigneeAgentId: agentId,
+        checkoutRunId: queuedCheckoutRunId,
+        executionRunId: queuedExecutionRunId,
+        executionAgentNameKey: "codexcoder",
+        executionLockedAt: new Date(),
+      });
+
+      const response = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+        .post(`/api/issues/${issueId}/checkout`)
+        .send({ agentId, expectedStatuses: ["todo"] });
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+      expect(response.body).toMatchObject({
+        status: "in_progress",
+        checkoutRunId: currentRunId,
+        executionRunId: currentRunId,
+      });
+
+      const owners = await db
+        .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(inArray(heartbeatRuns.id, [queuedCheckoutRunId, queuedExecutionRunId]));
+      expect(new Map(owners.map((owner) => [owner.id, owner.status]))).toEqual(
+        new Map([
+          [queuedCheckoutRunId, "cancelled"],
+          [queuedExecutionRunId, "cancelled"],
+        ]),
+      );
+    });
+
+    it("reaps a queued execution owner behind a terminal checkout owner on todo checkout", async () => {
+      const { companyId, agentId, failedRunId, currentRunId } = await seedCompanyAgentAndRuns();
+      const queuedExecutionRunId = await seedNeverStartedOwnerRun({
+        companyId,
+        agentId,
+        status: "queued",
+      });
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Terminal checkout with divergent queued execution owner",
+        status: "todo",
+        priority: "high",
+        assigneeAgentId: agentId,
+        checkoutRunId: failedRunId,
+        executionRunId: queuedExecutionRunId,
+        executionAgentNameKey: "codexcoder",
+        executionLockedAt: new Date(),
+      });
+
+      const response = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+        .post(`/api/issues/${issueId}/checkout`)
+        .send({ agentId, expectedStatuses: ["todo"] });
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+      expect(response.body).toMatchObject({
+        status: "in_progress",
+        checkoutRunId: currentRunId,
+        executionRunId: currentRunId,
+      });
+
+      const owners = await db
+        .select({
+          id: heartbeatRuns.id,
+          status: heartbeatRuns.status,
+          errorCode: heartbeatRuns.errorCode,
+        })
+        .from(heartbeatRuns)
+        .where(inArray(heartbeatRuns.id, [failedRunId, queuedExecutionRunId]));
+      expect(new Map(owners.map((owner) => [owner.id, {
+        status: owner.status,
+        errorCode: owner.errorCode,
+      }]))).toEqual(
+        new Map([
+          [failedRunId, { status: "failed", errorCode: null }],
+          [queuedExecutionRunId, {
+            status: "cancelled",
+            errorCode: "issue_execution_lock_reaped",
+          }],
+        ]),
+      );
+    });
+  });
+
+  it("allows only one concurrent decision from a participant whose assignee drifted", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const divergedAssigneeAgentId = randomUUID();
+    const stageId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(agents).values({
+      id: divergedAssigneeAgentId,
+      companyId,
+      name: "DivergedAssignee",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const executionState = {
+      status: "pending",
+      currentStageId: stageId,
+      currentStageIndex: 0,
+      currentStageType: "review",
+      currentParticipant: { type: "agent", agentId },
+      returnAssignee: { type: "agent", agentId: divergedAssigneeAgentId },
+      completedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+    };
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Concurrent participant decision",
+      status: "in_review",
+      priority: "high",
+      assigneeAgentId: divergedAssigneeAgentId,
+      checkoutRunId: currentRunId,
+      executionRunId: currentRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date(),
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [{
+          id: stageId,
+          type: "review",
+          approvalsNeeded: 1,
+          participants: [{ type: "agent", agentId }],
+        }],
+      },
+      executionState,
+    });
+
+    const app = createApp(agentActor(companyId, agentId, currentRunId));
+    const [first, second] = await Promise.all([
+      request(app).patch(`/api/issues/${issueId}`).send({ status: "done", comment: "Approve one" }),
+      request(app).patch(`/api/issues/${issueId}`).send({ status: "done", comment: "Approve two" }),
+    ]);
+    expect(
+      [first.status, second.status].sort(),
+      JSON.stringify([first.body, second.body]),
+    ).toEqual([200, 409]);
+
+    const decisions = await db
+      .select({ id: issueExecutionDecisions.id })
+      .from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.issueId, issueId));
+    expect(decisions).toHaveLength(1);
+  });
+
+  it("rejects a decision update derived from a stale execution policy", async () => {
+    const { companyId, agentId } = await seedCompanyAgentAndRuns();
+    const issueId = randomUUID();
+    const originalPolicy = {
+      mode: "normal",
+      commentRequired: true,
+      stages: [],
+    };
+    const revisedPolicy = {
+      ...originalPolicy,
+      stages: [{
+        id: randomUUID(),
+        type: "review",
+        approvalsNeeded: 1,
+        participants: [{ type: "agent", agentId }],
+      }],
+    };
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Policy CAS",
+      status: "in_review",
+      priority: "high",
+      assigneeAgentId: agentId,
+      executionPolicy: originalPolicy,
+      executionState: { status: "idle" },
+    });
+    await db.update(issues).set({ executionPolicy: revisedPolicy }).where(eq(issues.id, issueId));
+
+    await expect(issueService(db).update(issueId, {
+      status: "done",
+      expectedCurrentExecutionState: { status: "idle" },
+      expectedCurrentExecutionPolicy: originalPolicy,
+    })).rejects.toMatchObject({ status: 409 });
+
+    const row = await db
+      .select({ status: issues.status, executionPolicy: issues.executionPolicy })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({ status: "in_review", executionPolicy: revisedPolicy });
+  });
+
+  it("rejects a stale current-run ordinary update after run ownership transfers", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const nextRunId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: nextRunId,
+      companyId,
+      agentId,
+      status: "running",
+      invocationSource: "manual",
+      startedAt: new Date(),
+      createdAt: new Date("2026-01-01T00:02:00.000Z"),
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Current-run ordinary snapshot",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: currentRunId,
+      executionRunId: currentRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date(),
+    });
+    await db
+      .update(issues)
+      .set({ checkoutRunId: nextRunId, executionRunId: nextRunId })
+      .where(eq(issues.id, issueId));
+
+    await expect(issueService(db).update(issueId, {
+      title: "Stale ordinary write",
+      expectedCurrentCheckoutRunId: currentRunId,
+      expectedCurrentExecutionRunId: currentRunId,
+    })).rejects.toMatchObject({ status: 409 });
+
+    const row = await db
+      .select({
+        title: issues.title,
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({
+      title: "Current-run ordinary snapshot",
+      checkoutRunId: nextRunId,
+      executionRunId: nextRunId,
+    });
+  });
+
+  it("rejects a stale current-run execution-state update after run ownership transfers", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const nextRunId = randomUUID();
+    const issueId = randomUUID();
+    const stageId = randomUUID();
+    const executionPolicy = {
+      mode: "normal",
+      commentRequired: true,
+      stages: [{
+        id: stageId,
+        type: "review",
+        approvalsNeeded: 1,
+        participants: [{ type: "agent", agentId }],
+      }],
+    };
+    const executionState = {
+      status: "pending",
+      currentStageId: stageId,
+      currentStageIndex: 0,
+      currentStageType: "review",
+      currentParticipant: { type: "agent", agentId },
+      returnAssignee: { type: "agent", agentId },
+      completedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+      reviewRequest: null,
+    };
+    await db.insert(heartbeatRuns).values({
+      id: nextRunId,
+      companyId,
+      agentId,
+      status: "running",
+      invocationSource: "manual",
+      startedAt: new Date(),
+      createdAt: new Date("2026-01-01T00:02:00.000Z"),
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Current-run execution-state snapshot",
+      status: "in_review",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: currentRunId,
+      executionRunId: currentRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date(),
+      executionPolicy,
+      executionState,
+    });
+    const snapshot = await db
+      .select({
+        status: issues.status,
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+        executionPolicy: issues.executionPolicy,
+        executionState: issues.executionState,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] as {
+        status: string;
+        checkoutRunId: string;
+        executionRunId: string;
+        executionPolicy: Record<string, unknown>;
+        executionState: Record<string, unknown>;
+      });
+    const nextState = {
+      ...snapshot.executionState,
+      reviewRequest: { instructions: "Review after ownership transfer." },
+    };
+    await db
+      .update(issues)
+      .set({ checkoutRunId: nextRunId, executionRunId: nextRunId })
+      .where(eq(issues.id, issueId));
+
+    await expect(issueService(db).update(issueId, {
+      executionState: nextState,
+      expectedCurrentStatus: snapshot.status,
+      expectedCurrentExecutionState: snapshot.executionState,
+      expectedCurrentExecutionPolicy: snapshot.executionPolicy,
+      expectedCurrentCheckoutRunId: snapshot.checkoutRunId,
+      expectedCurrentExecutionRunId: snapshot.executionRunId,
+    })).rejects.toMatchObject({ status: 409 });
+
+    const row = await db
+      .select({
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+        executionState: issues.executionState,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({
+      checkoutRunId: nextRunId,
+      executionRunId: nextRunId,
+      executionState: snapshot.executionState,
+    });
+  });
+
+  it.each(["review_request", "decision"] as const)(
+    "rejects the stale writer when %s commits first from a shared snapshot",
+    async (firstWriter) => {
+      const { companyId, agentId } = await seedCompanyAgentAndRuns();
+      const issueId = randomUUID();
+      const stageId = randomUUID();
+      const executionPolicy = {
+        mode: "normal",
+        commentRequired: true,
+        stages: [{
+          id: stageId,
+          type: "review",
+          approvalsNeeded: 1,
+          participants: [{ type: "agent", agentId }],
+        }],
+      };
+      const executionState = {
+        status: "pending",
+        currentStageId: stageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId },
+        returnAssignee: { type: "agent", agentId },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+        reviewRequest: null,
+      };
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: `Review request and decision race: ${firstWriter}`,
+        status: "in_review",
+        priority: "high",
+        assigneeAgentId: agentId,
+        executionPolicy,
+        executionState,
+      });
+
+      const persistedSnapshot = await db
+        .select({
+          status: issues.status,
+          executionState: issues.executionState,
+          executionPolicy: issues.executionPolicy,
+        })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0] as {
+          status: string;
+          executionState: typeof executionState;
+          executionPolicy: typeof executionPolicy;
+        });
+      const reviewRequestState = {
+        ...persistedSnapshot.executionState,
+        reviewRequest: { instructions: "Review the concurrent update." },
+      };
+      const decisionState = {
+        ...persistedSnapshot.executionState,
+        status: "completed",
+        currentStageId: null,
+        currentStageIndex: null,
+        currentStageType: null,
+        currentParticipant: null,
+        returnAssignee: null,
+        completedStageIds: [stageId],
+        lastDecisionId: randomUUID(),
+        lastDecisionOutcome: "approved",
+        reviewRequest: null,
+      };
+
+      const svc = issueService(db);
+      const firstState = firstWriter === "review_request" ? reviewRequestState : decisionState;
+      const secondState = firstWriter === "review_request" ? decisionState : reviewRequestState;
+      await svc.update(issueId, {
+        executionState: firstState,
+        expectedCurrentStatus: persistedSnapshot.status,
+        expectedCurrentExecutionState: persistedSnapshot.executionState,
+        expectedCurrentExecutionPolicy: persistedSnapshot.executionPolicy,
+      });
+      await expect(svc.update(issueId, {
+        executionState: secondState,
+        expectedCurrentStatus: persistedSnapshot.status,
+        expectedCurrentExecutionState: persistedSnapshot.executionState,
+        expectedCurrentExecutionPolicy: persistedSnapshot.executionPolicy,
+      })).rejects.toMatchObject({ status: 409 });
+
+      const row = await db
+        .select({ executionState: issues.executionState })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]);
+      expect(row?.executionState).toEqual(firstState);
+    },
+  );
+
+  async function seedPendingReviewStageIssue(title: string) {
+    const { companyId, agentId } = await seedCompanyAgentAndRuns();
+    const issueId = randomUUID();
+    const stageId = randomUUID();
+    const executionPolicy = {
+      mode: "normal",
+      commentRequired: true,
+      stages: [{
+        id: stageId,
+        type: "review",
+        approvalsNeeded: 1,
+        participants: [{ type: "agent", agentId }],
+      }],
+    };
+    const executionState = {
+      status: "pending",
+      currentStageId: stageId,
+      currentStageIndex: 0,
+      currentStageType: "review",
+      currentParticipant: { type: "agent", agentId },
+      returnAssignee: { type: "agent", agentId },
+      completedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+      reviewRequest: null,
+    };
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title,
+      status: "in_review",
+      priority: "high",
+      assigneeAgentId: agentId,
+      executionPolicy,
+      executionState,
+    });
+    return { agentId, issueId, stageId, executionPolicy, executionState };
+  }
+
+  it.each(["review_request", "decision"] as const)(
+    "rejects a stale %s write after release commits first",
+    async (writer) => {
+      const seeded = await seedPendingReviewStageIssue(`Release wins before ${writer}`);
+      const persistedSnapshot = await db
+        .select({
+          status: issues.status,
+          executionState: issues.executionState,
+          executionPolicy: issues.executionPolicy,
+        })
+        .from(issues)
+        .where(eq(issues.id, seeded.issueId))
+        .then((rows) => rows[0] as {
+          status: string;
+          executionState: typeof seeded.executionState;
+          executionPolicy: typeof seeded.executionPolicy;
+        });
+      const nextState = writer === "review_request"
+        ? {
+            ...persistedSnapshot.executionState,
+            reviewRequest: { instructions: "Review after release." },
+          }
+        : {
+            ...persistedSnapshot.executionState,
+            status: "completed",
+            currentStageId: null,
+            currentStageIndex: null,
+            currentStageType: null,
+            currentParticipant: null,
+            returnAssignee: null,
+            completedStageIds: [seeded.stageId],
+            lastDecisionId: randomUUID(),
+            lastDecisionOutcome: "approved",
+            reviewRequest: null,
+          };
+
+      const svc = issueService(db);
+      await svc.release(seeded.issueId, seeded.agentId);
+
+      await expect(svc.update(seeded.issueId, {
+        ...(writer === "decision" ? { status: "done" as const } : {}),
+        executionState: nextState,
+        expectedCurrentStatus: persistedSnapshot.status,
+        expectedCurrentExecutionState: persistedSnapshot.executionState,
+        expectedCurrentExecutionPolicy: persistedSnapshot.executionPolicy,
+      })).rejects.toMatchObject({ status: 409 });
+
+      const row = await db
+        .select({
+          status: issues.status,
+          assigneeAgentId: issues.assigneeAgentId,
+          executionState: issues.executionState,
+        })
+        .from(issues)
+        .where(eq(issues.id, seeded.issueId))
+        .then((rows) => rows[0]);
+      expect(row).toEqual({
+        status: "todo",
+        assigneeAgentId: null,
+        executionState: persistedSnapshot.executionState,
+      });
+    },
+  );
+
+  it.each(["review_request", "decision"] as const)(
+    "keeps the issue released when release follows a current %s write",
+    async (writer) => {
+      const seeded = await seedPendingReviewStageIssue(`Release follows ${writer}`);
+      const persistedSnapshot = await db
+        .select({
+          status: issues.status,
+          executionState: issues.executionState,
+          executionPolicy: issues.executionPolicy,
+        })
+        .from(issues)
+        .where(eq(issues.id, seeded.issueId))
+        .then((rows) => rows[0] as {
+          status: string;
+          executionState: typeof seeded.executionState;
+          executionPolicy: typeof seeded.executionPolicy;
+        });
+      const nextState = writer === "review_request"
+        ? {
+            ...persistedSnapshot.executionState,
+            reviewRequest: { instructions: "Review before release." },
+          }
+        : {
+            ...persistedSnapshot.executionState,
+            status: "completed",
+            currentStageId: null,
+            currentStageIndex: null,
+            currentStageType: null,
+            currentParticipant: null,
+            returnAssignee: null,
+            completedStageIds: [seeded.stageId],
+            lastDecisionId: randomUUID(),
+            lastDecisionOutcome: "approved",
+            reviewRequest: null,
+          };
+
+      const svc = issueService(db);
+      await svc.update(seeded.issueId, {
+        ...(writer === "decision" ? { status: "done" as const } : {}),
+        executionState: nextState,
+        expectedCurrentStatus: persistedSnapshot.status,
+        expectedCurrentExecutionState: persistedSnapshot.executionState,
+        expectedCurrentExecutionPolicy: persistedSnapshot.executionPolicy,
+      });
+      await svc.release(seeded.issueId, seeded.agentId);
+
+      const row = await db
+        .select({
+          status: issues.status,
+          assigneeAgentId: issues.assigneeAgentId,
+          executionState: issues.executionState,
+        })
+        .from(issues)
+        .where(eq(issues.id, seeded.issueId))
+        .then((rows) => rows[0]);
+      expect(row).toEqual({
+        status: "todo",
+        assigneeAgentId: null,
+        executionState: nextState,
+      });
+    },
+  );
+
 });

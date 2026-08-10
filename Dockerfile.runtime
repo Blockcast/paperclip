@@ -64,13 +64,14 @@ RUN usermod -u "$USER_UID" --non-unique node \
 # Keep unrelated runtime rebuilds reproducible. Bump these versions
 # deliberately after adapter smoke/regression testing.
 #
-# OpenCode 1.4.3 failed OpenAI Responses streams that include reasoning output items
-# before the assistant message, surfacing as UnknownError/exit 1
-# in opencode_k8s review runs while the upstream provider returned 200.
+# OpenCode 1.18.5 reverted unsafe OpenAI Responses phase handling that could hand
+# an intermediate response.in_progress frame to the final JSON parser. Keep the
+# replay smoke next to the pin so every runtime image proves the released binary.
 ARG CLAUDE_CODE_VERSION=2.1.210
 ARG CODEX_CLI_VERSION=0.144.4
-ARG OPENCODE_AI_VERSION=1.15.12
+ARG OPENCODE_AI_VERSION=1.18.11
 ARG GEMINI_CLI_VERSION=0.50.0
+COPY scripts/smoke/opencode-responses-replay.mjs /tmp/opencode-responses-replay.mjs
 RUN --mount=type=cache,target=/root/.npm,sharing=locked \
   npm install --global --omit=dev --cache /root/.npm \
     "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
@@ -80,7 +81,9 @@ RUN --mount=type=cache,target=/root/.npm,sharing=locked \
   && claude --version | grep -Fq "${CLAUDE_CODE_VERSION}" \
   && codex --version | grep -Fq "${CODEX_CLI_VERSION}" \
   && test "$(opencode --version)" = "${OPENCODE_AI_VERSION}" \
-  && test "$(gemini --version)" = "${GEMINI_CLI_VERSION}"
+  && test "$(gemini --version)" = "${GEMINI_CLI_VERSION}" \
+  && node /tmp/opencode-responses-replay.mjs \
+  && rm /tmp/opencode-responses-replay.mjs
 
 RUN mkdir -p /paperclip /paperclip/.local/bin /opt/paperclip-bundled-adapters \
   && ln -sf /usr/local/bin/claude /paperclip/.local/bin/claude \

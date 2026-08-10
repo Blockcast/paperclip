@@ -3768,6 +3768,8 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
         );
         const envKeys = Object.keys(normalizedEnv ?? {}).sort();
         const secretRefs = secretRefsFromEnv(normalizedEnv);
+        // This action has no plugin-event mapping, so no outbox write can
+        // escape the transaction; keep the default publication semantics.
         await logActivity(txDb, {
           companyId: input.companyId,
           ...activityActorPatch(input.actor),
