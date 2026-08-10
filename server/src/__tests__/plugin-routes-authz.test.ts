@@ -2245,6 +2245,16 @@ describe.sequential("plugin config secret masking (BLO-20794)", () => {
 // assertions keep that decision honest, so that widening the gate has to be a
 // deliberate edit to this file rather than a silent side effect.
 describe.sequential("plugin state routes stay board-only for agent actors (BLO-22120)", () => {
+  // These assertions are all `not.toHaveBeenCalled()` on the shared hoisted
+  // `mockRegistry`, so without clearing here the block inherits whatever calls
+  // the preceding describe happened to make and fails for a reason that has
+  // nothing to do with the board-only gate it exists to protect. Every other
+  // describe in this file already does this; this one was relying on the last
+  // test before it happening to be a 403 case (BLO-20957).
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
   it("rejects an agent actor with 403 when it tries to enumerate plugin state", async () => {
     const { app } = await createApp(agentActor());
 

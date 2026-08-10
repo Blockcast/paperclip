@@ -98,19 +98,21 @@ describeEmbeddedPostgres(
     /**
      * Insert a run. `createdAt` is passed explicitly so ordering is under the
      * test's control; identical timestamps are deliberate in the
-     * single-tick case.
+     * single-tick case. `trigger` defaults to `"schedule"` because that is the
+     * only kind the streak is allowed to count.
      */
     async function insertRun(
       companyId: string | null,
       status: "succeeded" | "failed",
       createdAt: Date,
       error: string | null = null,
+      trigger: "schedule" | "manual" | "retry" = "schedule",
     ) {
       await db.insert(pluginJobRuns).values({
         jobId,
         pluginId,
         companyId,
-        trigger: "schedule",
+        trigger,
         status,
         error,
         createdAt,
@@ -187,6 +189,64 @@ describeEmbeddedPostgres(
 
       expect(streaks).toHaveLength(1);
       expect(streaks[0]?.companyId).toBeNull();
+    });
+
+    // Ally review round 2 of PR #1145: the streak counted every run row
+    // regardless of `trigger`, while `/plugins/alerts/plugin-health` presents
+    // the result at severity `page` as a *sustained scheduled-job* failure.
+    // Both directions of that mismatch are exercised here.
+
+    it("does NOT page on failed manual runs while the schedule is green", async () => {
+      // An operator hand-triggering a broken job three times is activity a
+      // human is already watching; it must not manufacture an on-call page.
+      await insertRun(companyA, "succeeded", t(1));
+      await insertRun(companyA, "failed", t(2), "manual boom", "manual");
+      await insertRun(companyA, "failed", t(3), "manual boom", "manual");
+      await insertRun(companyA, "failed", t(4), "manual boom", "manual");
+
+      const streaks = await pluginJobStore(db).listJobsWithFailureStreak(3);
+
+      expect(streaks).toHaveLength(0);
+    });
+
+    it("does NOT page on repeated retries of one failure", async () => {
+      // Retrying the same broken run three times is one failure, not three.
+      await insertRun(companyA, "succeeded", t(1));
+      await insertRun(companyA, "failed", t(2), "retry boom", "retry");
+      await insertRun(companyA, "failed", t(3), "retry boom", "retry");
+      await insertRun(companyA, "failed", t(4), "retry boom", "retry");
+
+      const streaks = await pluginJobStore(db).listJobsWithFailureStreak(3);
+
+      expect(streaks).toHaveLength(0);
+    });
+
+    it("STILL pages a dead schedule that manual successes are interleaved through", async () => {
+      // The missed-page direction: an operator hand-running the job green in
+      // between ticks must not mask a schedule that is failing every tick.
+      await insertRun(companyA, "failed", t(1), "company context is required");
+      await insertRun(companyA, "succeeded", t(2), null, "manual");
+      await insertRun(companyA, "failed", t(3), "company context is required");
+      await insertRun(companyA, "succeeded", t(4), null, "manual");
+      await insertRun(companyA, "failed", t(5), "company context is required");
+
+      const streaks = await pluginJobStore(db).listJobsWithFailureStreak(3);
+
+      expect(streaks).toHaveLength(1);
+      expect(streaks[0]?.companyId).toBe(companyA);
+      expect(streaks[0]?.consecutiveFailures).toBe(3);
+    });
+
+    it("does not page a tenant whose only history is manual", async () => {
+      // No scheduled runs at all means no scheduled-job streak to report,
+      // even though every row on file is `failed`.
+      await insertRun(companyB, "failed", t(1), "manual only", "manual");
+      await insertRun(companyB, "failed", t(2), "manual only", "manual");
+      await insertRun(companyB, "failed", t(3), "manual only", "manual");
+
+      const streaks = await pluginJobStore(db).listJobsWithFailureStreak(3);
+
+      expect(streaks).toHaveLength(0);
     });
 
     it("is stable across polls when a fan-out writes identical timestamps", async () => {

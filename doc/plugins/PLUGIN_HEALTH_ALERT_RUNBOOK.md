@@ -42,7 +42,7 @@ scope it needs. That failure only ever showed up as an ERROR log line
 | `pluginKey` | Stable plugin key |
 | `jobId` | UUID of the `plugin_jobs` row |
 | `jobKey` | Job key from the manifest, e.g. `check-alert-escalations` |
-| `consecutiveFailures` | How many of the job's most recent runs were `failed` |
+| `consecutiveFailures` | How many of the job's most recent *scheduled* runs were `failed` |
 | `lastError` | Error message from the most recent failed run, or `null` |
 | `summary` | Human-readable one-liner for the alert |
 | `description` | Full description including the last error |
@@ -52,6 +52,16 @@ in `server/src/routes/plugins.ts`) are *all* `failed` — one transient blip doe
 not page. This alert requires job-scheduling routes to be wired with
 `jobDeps` (the default in production); it is silently omitted where they are
 not (e.g. a stripped-down test harness).
+
+**Only `trigger: "schedule"` runs count.** Manual (`POST .../jobs/:key/trigger`)
+and `retry` runs are excluded from the streak in both directions, so:
+
+- Hand-triggering a known-broken job, or retrying one failure several times,
+  cannot manufacture a page — that activity already has a human attached.
+- Conversely, hand-running the job green in between ticks does **not** clear or
+  mask a schedule that is failing every tick. If you are debugging a firing
+  alert by triggering the job manually, expect the alert to keep firing until a
+  *scheduled* run succeeds; a green manual run is not the all-clear.
 
 ---
 
