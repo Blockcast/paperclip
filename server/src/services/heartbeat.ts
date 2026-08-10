@@ -15169,7 +15169,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                   [...ISSUE_EXECUTION_LOCK_REAPABLE_NEVER_STARTED_RUN_STATUSES],
                 ),
                 isNull(heartbeatRuns.startedAt),
-              ),
+              )!,
             ),
           ),
         ),
