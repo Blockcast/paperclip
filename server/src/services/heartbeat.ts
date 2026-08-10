@@ -331,6 +331,7 @@ import {
   withRecoveryModelProfileHint,
 } from "./recovery/model-profile-hint.js";
 import { recoveryService, STALE_PRE_CLAIM_ISSUE_LOCK_MS } from "./recovery/service.js";
+import { PROVIDER_CAPACITY_MAX_HORIZON_MS } from "./provider-capacity-horizon-bound.js";
 import { productivityReviewService } from "./productivity-review.js";
 import { resolveRequiredSuccessfulRunHandoffOnValidPath } from "./successful-run-handoff-state.js";
 import { taskWatchdogService } from "./task-watchdogs.js";
@@ -3793,10 +3794,10 @@ const PROVIDER_CAPACITY_RETRY_IN_PATTERN = /\bretry\s+in\s+(\d+(?:\.\d+)?)\s*(?:
 const PROVIDER_CAPACITY_RESET_PROVENANCE_SOURCE = "server_parse_provider_capacity_horizon";
 
 // A horizon further out than this is not parked on verbatim: a bad parse (or a
-// provider bug) must not silently sideline an issue for days. 24h comfortably
-// covers the capacity windows we have measured directly — the BLO-18278 fault
-// asked for ~2h40m — while bounding the blast radius of a wrong read.
-const PROVIDER_CAPACITY_MAX_HORIZON_MS = 24 * 60 * 60 * 1000;
+// provider bug) must not silently sideline an issue for days. The bound is
+// imported, not declared: it is shared with the recovery reader, and
+// provider-capacity-horizon-bound.ts records why the two cannot be chosen
+// independently.
 
 // BLO-18285: what an over-cap horizon means, and why it is no longer discarded.
 //
@@ -3828,15 +3829,44 @@ export type ProviderCapacityHorizon =
   | { kind: "usable"; at: Date }
   | { kind: "over_horizon"; advertisedAt: Date; parkAt: Date };
 
+// Which fields may push a run into the 24h over-cap park, and which may only
+// confirm an instant we were already willing to honor.
+//
+// `message` / `error` are populated by the SDK and the adapters; `result` and
+// `summary` are model-authored (claude-local's parse.ts assigns the SDK final
+// result event verbatim, so `resultJson.result` is the agent's own prose and
+// `summary` is derived from it). That is the same split
+// TRANSIENT_UPSTREAM_TEXT_KEYS already draws for the hint-less classifier, and
+// for the same reason.
+//
+// The asymmetry below is deliberate. A `usable` reading parks on an instant
+// inside a window we are willing to honor anyway, and which fields may supply
+// one was settled — and pinned by test — in BLO-18278. An `over_horizon`
+// reading is a much stronger claim: it sidelines the issue for a full 24h on
+// the strength of a figure we have explicitly decided not to trust. Model prose
+// must not be able to make that claim. Without this, a genuine structured 429
+// arriving alongside prose that merely *quotes* some unrelated far-future reset
+// ("the gateway said capacity resets 2031-01-01") satisfies the over-cap gate
+// and parks the issue for a day.
+const PROVIDER_CAPACITY_MACHINE_AUTHORED_TEXT_KEYS = ["message", "error"] as const;
+const PROVIDER_CAPACITY_HORIZON_TEXT_KEYS = ["result", "message", "error", "summary"] as const;
+
 export function resolveProviderCapacityHorizon(
   input: { resultJson?: Record<string, unknown> | null; errorMessage?: string | null },
   now = Date.now(),
 ): ProviderCapacityHorizon {
   const resultJson = input.resultJson ?? null;
-  const candidates: unknown[] = [input.errorMessage];
+  // `machineAuthored` gates the over-cap park only. Iteration order is
+  // unchanged from the usable-path behavior BLO-18278 shipped.
+  const candidates: { text: unknown; machineAuthored: boolean }[] = [
+    { text: input.errorMessage, machineAuthored: true },
+  ];
   if (resultJson) {
-    for (const key of ["result", "message", "error", "summary"] as const) {
-      candidates.push(resultJson[key]);
+    for (const key of PROVIDER_CAPACITY_HORIZON_TEXT_KEYS) {
+      candidates.push({
+        text: resultJson[key],
+        machineAuthored: (PROVIDER_CAPACITY_MACHINE_AUTHORED_TEXT_KEYS as readonly string[]).includes(key),
+      });
     }
   }
 
@@ -3844,7 +3874,8 @@ export function resolveProviderCapacityHorizon(
   // still wins outright. Only when no candidate yields one does an over-cap
   // reading become the answer.
   let overHorizon: { kind: "over_horizon"; advertisedAt: Date; parkAt: Date } | null = null;
-  const noteOverHorizon = (advertisedMs: number) => {
+  const noteOverHorizon = (advertisedMs: number, machineAuthored: boolean) => {
+    if (!machineAuthored) return;
     overHorizon ??= {
       kind: "over_horizon",
       advertisedAt: new Date(advertisedMs),
@@ -3852,7 +3883,7 @@ export function resolveProviderCapacityHorizon(
     };
   };
 
-  for (const candidate of candidates) {
+  for (const { text: candidate, machineAuthored } of candidates) {
     if (typeof candidate !== "string") continue;
 
     // An absolute timestamp is authoritative when present: it survives any
@@ -3863,7 +3894,7 @@ export function resolveProviderCapacityHorizon(
       const parsed = new Date(absolute).getTime();
       if (Number.isFinite(parsed) && parsed > now) {
         if (parsed - now <= PROVIDER_CAPACITY_MAX_HORIZON_MS) return { kind: "usable", at: new Date(parsed) };
-        noteOverHorizon(parsed);
+        noteOverHorizon(parsed, machineAuthored);
       }
       // A parsed-but-unusable absolute horizon (already elapsed, or beyond the
       // cap) is a deliberate answer for THIS field rather than a reason to fall
@@ -3880,7 +3911,7 @@ export function resolveProviderCapacityHorizon(
         if (seconds * 1000 <= PROVIDER_CAPACITY_MAX_HORIZON_MS) {
           return { kind: "usable", at: new Date(now + Math.ceil(seconds * 1000)) };
         }
-        noteOverHorizon(now + Math.ceil(seconds * 1000));
+        noteOverHorizon(now + Math.ceil(seconds * 1000), machineAuthored);
       }
     }
   }
