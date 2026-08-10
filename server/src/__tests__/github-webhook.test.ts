@@ -33,6 +33,7 @@ import {
   __test_commentsContainBackLinkMarker,
   __test_extractPaperclipIdentifiers,
   __test_hasActionablePrReviewFeedback,
+  __test_isClaudeCodeReviewServiceNotice,
   __test_isReviewerSelfEchoReview,
   __test_isSelfReviewedPr,
   __test_hasPrReviewerRequestMention,
@@ -7218,5 +7219,196 @@ describe("self-review non-convergence detection (BLO-13353)", () => {
     expect(__test_isSelfReviewedPr(ctx(null), "allyblockcast[bot]")).toBe(false);
     expect(__test_isSelfReviewedPr(ctx("allyblockcast[bot]"), null)).toBe(false);
     expect(__test_isSelfReviewedPr(ctx("allyblockcast[bot]"), "")).toBe(false);
+  });
+});
+
+// BLO-23059: Claude Code Review's "paused" org-settings notice arrives as a
+// FORMAL pull_request_review (state COMMENTED, commit_id = current head), so
+// BLO-21489's existence + non-staleness check passes it and both wakes fire —
+// the reviewer counter-review pass and the PR-author wake whose directive claims
+// "a reviewer just posted findings on YOUR pull request".
+describe("claude[bot] Code Review service notice suppression (BLO-23059)", () => {
+  // Verbatim body of review 4887250738 on Blockcast/Network-Operator-Portal#657,
+  // read from the GitHub API on 2026-08-10. Do not paraphrase: the whole point of
+  // the filter is that it keys on this exact notice rather than on the absence of
+  // findings.
+  const PAUSED_NOTICE_BODY = [
+    "## Claude Code Review",
+    "",
+    "**Claude Code Review is paused for this repository.** To reconnect it, an admin of this " +
+      "repository's GitHub organization (or the account owner, for personal repositories) who can " +
+      "also manage your Claude organization's Code Review settings needs to re-link GitHub in " +
+      "[Code Review settings](https://claude.ai/admin-settings/claude-code). This is a one-time step.",
+    "",
+    "<sub>Tip: disable this comment in your organization's " +
+      "[Code Review settings](https://claude.ai/admin-settings/claude-code).</sub>",
+  ].join("\n");
+
+  const reviewPayload = (
+    overrides: { body?: string; state?: string; login?: string; type?: string | null } = {},
+  ) => ({
+    action: "submitted",
+    pull_request: {
+      number: 657,
+      title: "cdnplus-a8: pin the measured tint population",
+      head: { ref: "feat/cdnplus-a8", sha: "3ff9b6390000000000000000000000000000000a" },
+      user: { login: "allyblockcast[bot]" },
+    },
+    review: {
+      body: overrides.body ?? PAUSED_NOTICE_BODY,
+      state: overrides.state ?? "commented",
+      html_url:
+        "https://github.com/Blockcast/Network-Operator-Portal/pull/657#pullrequestreview-4887250738",
+      user: {
+        login: overrides.login ?? "claude[bot]",
+        // GitHub's own account classification. "type" in overrides is honoured
+        // even when explicitly null, so the absent-field case is testable.
+        type: "type" in overrides ? overrides.type : "Bot",
+      },
+    },
+    repository: { full_name: "Blockcast/Network-Operator-Portal" },
+  });
+
+  const resolve = (
+    payload: ReturnType<typeof reviewPayload>,
+    onSuppressedReviewSubmission?: (info: unknown) => void,
+  ) =>
+    __test_resolveEventContext("pull_request_review", payload, {
+      prReviewerBotLogin: "allyblockcast[bot]",
+      ...(onSuppressedReviewSubmission ? { onSuppressedReviewSubmission } : {}),
+    });
+
+  it("drops the paused notice at the event, killing both wakes", () => {
+    const ctx = resolve(reviewPayload());
+    // null context is the common ancestor of BOTH wake sites: the reviewer wake
+    // (shouldFirePrReviewerWake) and the PR-author wake (the `isPrWake` fallback,
+    // which fires for any github_pr_* reason with a prNumber regardless of
+    // isActionableReviewFeedbackContext).
+    expect(ctx).toBeNull();
+    expect(__test_shouldFirePrReviewerWake(ctx)).toBe(false);
+  });
+
+  it("reports the suppression with review-shaped provenance", () => {
+    const seen: unknown[] = [];
+    expect(resolve(reviewPayload(), (info) => seen.push(info))).toBeNull();
+    expect(seen).toEqual([
+      {
+        repoFullName: "Blockcast/Network-Operator-Portal",
+        prNumber: 657,
+        reviewAuthorLogin: "claude[bot]",
+        reviewState: "commented",
+        reviewUrl:
+          "https://github.com/Blockcast/Network-Operator-Portal/pull/657#pullrequestreview-4887250738",
+      },
+    ]);
+  });
+
+  it("does not suppress a terse but genuine review — the false-suppression case", () => {
+    // The named objection to filtering at the webhook. A findings-free rule would
+    // eat these; a named-instance rule cannot, because neither carries the notice.
+    for (const body of ["LGTM", "One nit inline, otherwise good.", ""]) {
+      const ctx = resolve(reviewPayload({ body }));
+      expect(ctx, `terse body ${JSON.stringify(body)} must survive`).not.toBeNull();
+      expect(ctx?.wakeReason).toBe("github_pr_review_submitted");
+    }
+  });
+
+  it("does not suppress a human or a non-Claude bot quoting the notice", () => {
+    // Someone discussing THIS issue in a review must still reach the author.
+    for (const login of ["kkroo", "allyblockcast[bot]", "dependabot[bot]"]) {
+      const ctx = resolve(reviewPayload({ login }));
+      expect(ctx, `login ${login} must survive`).not.toBeNull();
+    }
+  });
+
+  it("does not suppress the bare `claude` / `claude-code` USER accounts", () => {
+    // Ally review on #1255: the login matcher originally made the `[bot]` suffix
+    // optional, so these two — ordinary registerable GitHub logins, not the App —
+    // matched. A person on either account reviewing a PR that quotes the notice
+    // (this repo's own PRs do) would have had BOTH their wakes silently dropped.
+    // Suffix required + type gate, so each of the three shapes below fails alone.
+    for (const [login, type] of [
+      ["claude", "User"],
+      ["claude-code", "User"],
+      // Right login shape, but GitHub does not call it a Bot — fail open.
+      ["claude[bot]", "User"],
+    ] as const) {
+      const ctx = resolve(reviewPayload({ login, type }));
+      expect(ctx, `${login} (${type}) must survive`).not.toBeNull();
+      expect(ctx?.wakeReason).toBe("github_pr_review_submitted");
+    }
+  });
+
+  it("fails open when the payload carries no user type at all", () => {
+    // Absent `type` must not be read as Bot: an unrecognised payload shape
+    // regresses to today's behaviour rather than dropping a real review.
+    const ctx = resolve(reviewPayload({ type: null }));
+    expect(ctx).not.toBeNull();
+  });
+
+  it("does not suppress a claude[bot] review that carries the notice AND findings", () => {
+    const ctx = resolve(
+      reviewPayload({ body: `${PAUSED_NOTICE_BODY}\n\n### Critical Issues (1)\n- auth bypass.` }),
+    );
+    expect(ctx).not.toBeNull();
+    expect(__test_hasActionablePrReviewFeedback(ctx?.reviewBody, ctx?.reviewState)).toBe(true);
+  });
+
+  it("does not suppress a merge-gate review state", () => {
+    // APPROVED / CHANGES_REQUESTED carry a gate signal regardless of body text.
+    for (const state of ["approved", "changes_requested", "dismissed"]) {
+      expect(resolve(reviewPayload({ state })), `state ${state} must survive`).not.toBeNull();
+    }
+  });
+
+  describe("isClaudeCodeReviewServiceNotice — predicate", () => {
+    const notice = (body: string, state = "commented", login = "claude[bot]", type = "Bot") =>
+      __test_isClaudeCodeReviewServiceNotice(body, state, login, type);
+
+    it("matches the paused and disabled variants under any heading depth", () => {
+      expect(notice(PAUSED_NOTICE_BODY)).toBe(true);
+      expect(
+        notice("### Claude Code Review\n\nClaude Code Review is disabled for this repository."),
+      ).toBe(true);
+    });
+
+    it("requires the heading, the sentence, and a Claude author together", () => {
+      // Sentence without the heading.
+      expect(notice("Claude Code Review is paused for this repository.")).toBe(false);
+      // Heading without the sentence.
+      expect(notice("## Claude Code Review\n\nTwo findings below.")).toBe(false);
+      // Both, wrong author.
+      expect(notice(PAUSED_NOTICE_BODY, "commented", "kkroo")).toBe(false);
+      // A heading that merely mentions the phrase mid-line is not the notice heading.
+      expect(
+        notice("## Notes on Claude Code Review\n\nClaude Code Review is paused for this repository."),
+      ).toBe(false);
+    });
+
+    it("requires the [bot] suffix AND a Bot user type", () => {
+      // The two halves of the Ally-#1255 narrowing, pinned independently so
+      // neither can be dropped without reddening a test.
+      expect(notice(PAUSED_NOTICE_BODY, "commented", "claude")).toBe(false);
+      expect(notice(PAUSED_NOTICE_BODY, "commented", "claude-code")).toBe(false);
+      expect(notice(PAUSED_NOTICE_BODY, "commented", "claude[bot]", "User")).toBe(false);
+      expect(notice(PAUSED_NOTICE_BODY, "commented", "claude-code[bot]", "Bot")).toBe(true);
+    });
+
+    it("rejects absent author or body rather than throwing", () => {
+      expect(notice(PAUSED_NOTICE_BODY, "commented", null as unknown as string)).toBe(false);
+      expect(notice(null as unknown as string)).toBe(false);
+      expect(
+        __test_isClaudeCodeReviewServiceNotice(PAUSED_NOTICE_BODY, null, "claude[bot]", "Bot"),
+      ).toBe(false);
+      // Absent user type => fail open.
+      expect(
+        __test_isClaudeCodeReviewServiceNotice(
+          PAUSED_NOTICE_BODY,
+          "commented",
+          "claude[bot]",
+          null,
+        ),
+      ).toBe(false);
+    });
   });
 });
