@@ -220,6 +220,14 @@ describe("paperclip MCP tools", () => {
     });
   });
 
+  it("documents duplicate candidates as advisory and independent of allowDuplicate", () => {
+    const tool = getTool("paperclipCreateIssue");
+
+    expect(tool.description).toContain("advisory `duplicateCandidates`");
+    expect(tool.description).toContain("never refuse the create");
+    expect(tool.description).toContain("independent of `allowDuplicate`");
+  });
+
   it("defaults issue document format to markdown", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       mockJsonResponse({ key: "plan", latestRevisionNumber: 2 }),
@@ -485,7 +493,7 @@ describe("paperclip MCP tools", () => {
     const tool = getTool("paperclipCreateApproval");
     await tool.execute({
       type: "hire_agent",
-      payload: { branch: "pap-1167" },
+      payload: { title: "Approve agent hire", branch: "pap-1167" },
       issueIds: ["44444444-4444-4444-4444-444444444444"],
     });
 
@@ -497,9 +505,45 @@ describe("paperclip MCP tools", () => {
     expect(init.method).toBe("POST");
     expect(JSON.parse(String(init.body))).toEqual({
       type: "hire_agent",
-      payload: { branch: "pap-1167" },
+      payload: { title: "Approve agent hire", branch: "pap-1167" },
       issueIds: ["44444444-4444-4444-4444-444444444444"],
     });
+  });
+
+  it("publishes payload.title as required for approval creation", () => {
+    const tool = getTool("paperclipCreateApproval");
+    const payloadSchema = tool.schema.shape.payload;
+
+    expect(Object.keys(payloadSchema.shape)).toContain("title");
+    expect(tool.schema.safeParse({
+      type: "hire_agent",
+      payload: { branch: "pap-1167" },
+    }).success).toBe(false);
+    expect(tool.schema.safeParse({
+      type: "hire_agent",
+      payload: { title: "Approve agent hire", branch: "pap-1167" },
+    }).success).toBe(true);
+  });
+
+  it("omits approval resubmit payload when no replacement payloadJson is supplied", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      mockJsonResponse({ id: "approval-1" }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclipApprovalDecision");
+    await tool.execute({
+      approvalId: "55555555-5555-5555-5555-555555555555",
+      action: "resubmit",
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(String(url)).toBe(
+      "http://localhost:3100/api/approvals/55555555-5555-5555-5555-555555555555/resubmit",
+    );
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(String(init.body))).toEqual({});
   });
 
   it("rejects invalid generic request paths", async () => {
@@ -724,5 +768,45 @@ describe("paperclip MCP tools", () => {
     expect(response.content[0]?.text).toContain("No accessible company with prefix");
     // Only the company-list call happened; no cross-company request was attempted.
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  // BLO-18466: a CEO PATCH denied with 403 came back success-shaped, so the
+  // caller read `priority` off the result, got nothing, and reported the
+  // priority as raised when the field had not moved. The denial must reach the
+  // agent as a failure, not as an object that merely lacks the field.
+  it("surfaces a denied paperclipUpdateIssue as an MCP error rather than a success", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      mockJsonResponse({ error: "deny_missing_grant", boundary: "grant" }, 403),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclipUpdateIssue");
+    const response = await tool.execute({
+      issueId: "75901b6e-8c97-40e1-8576-514de1f3f972",
+      priority: "critical",
+    });
+
+    expect(response.isError).toBe(true);
+
+    const payload = JSON.parse(response.content[0]!.text) as Record<string, unknown>;
+    expect(payload.status).toBe(403);
+    expect(payload.body).toMatchObject({ error: "deny_missing_grant" });
+    // The precise failure mode: no `priority` key to misread as "unchanged".
+    expect(payload).not.toHaveProperty("priority");
+  });
+
+  it("does not mark a successful paperclipUpdateIssue as an error", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      mockJsonResponse({ id: "75901b6e-8c97-40e1-8576-514de1f3f972", priority: "critical" }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await getTool("paperclipUpdateIssue").execute({
+      issueId: "75901b6e-8c97-40e1-8576-514de1f3f972",
+      priority: "critical",
+    });
+
+    expect(response.isError).toBeUndefined();
+    expect(JSON.parse(response.content[0]!.text)).toMatchObject({ priority: "critical" });
   });
 });

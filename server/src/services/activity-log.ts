@@ -23,6 +23,12 @@ const ACTIVITY_ACTION_TO_PLUGIN_EVENT: Readonly<Record<string, PluginEventType>>
   approval_approved: "approval.decided",
   approval_rejected: "approval.decided",
   approval_revision_requested: "approval.decided",
+  // A withdrawal is a terminal transition out of `pending` exactly like the three
+  // above, so plugin mirrors must see it or they keep showing the approval as
+  // open forever. There is no dedicated `approval.withdrawn` plugin event; adding
+  // one would break existing subscribers that already treat `approval.decided` as
+  // "this approval left the queue", so it maps onto that.
+  approval_withdrawn: "approval.decided",
   budget_soft_threshold_crossed: "budget.incident.opened",
   budget_hard_threshold_crossed: "budget.incident.opened",
   budget_incident_resolved: "budget.incident.resolved",
@@ -85,6 +91,32 @@ export function publishPluginDomainEvent(event: PluginEvent): void {
     );
 }
 
+/**
+ * Enqueue through the caller's own db handle -- typically an open transaction --
+ * and await it, so the outbox row commits or rolls back with the state change
+ * that produced it.
+ *
+ * `publishPluginDomainEvent` above writes through the module-global `_outboxDb`,
+ * a different connection from any caller transaction. That is fine for the
+ * common non-transactional caller, but inside a transaction it means the event
+ * commits independently: if the transaction then fails, the state change is
+ * undone while plugins have already been told it happened. For a terminal
+ * approval transition that phantom is durable and drives every plugin mirror.
+ *
+ * The tradeoff is deliberate: unlike the fire-and-forget path, a failed insert
+ * here fails the caller's transaction rather than being swallowed. That is the
+ * point -- we would rather refuse the withdrawal than report one that did not
+ * happen.
+ */
+async function enqueuePluginDomainEventAtomically(db: Db, event: PluginEvent): Promise<void> {
+  await db.insert(pluginEventOutbox).values({
+    eventId: event.eventId,
+    companyId: event.companyId,
+    eventType: event.eventType,
+    payload: event as unknown as Record<string, unknown>,
+  });
+}
+
 export interface LogActivityInput {
   companyId: string;
   actorType: "agent" | "user" | "system" | "plugin";
@@ -106,6 +138,16 @@ export interface LogActivityInput {
    * applied; the key-based secret scrubber is not (see logActivity for why).
    */
   pluginEventPayloadExtra?: Record<string, unknown> | null;
+  /**
+   * Enqueue the plugin domain event through the `db` handle passed to
+   * logActivity instead of the module-global outbox connection, and await it.
+   *
+   * Set this when calling logActivity inside a transaction whose rollback must
+   * also retract the plugin event -- otherwise the event commits independently
+   * and survives the rollback. See enqueuePluginDomainEventAtomically for the
+   * failure-semantics tradeoff this accepts.
+   */
+  atomicPluginEvent?: boolean;
 }
 
 function readNonEmptyString(value: unknown) {
@@ -167,7 +209,33 @@ export async function resolveResponsibleUserIdForActivity(db: Db, input: LogActi
   return readNonEmptyString(company?.defaultResponsibleUserId);
 }
 
-export async function logActivity(db: Db, input: LogActivityInput) {
+/**
+ * Emits the side effects of a logged activity: the in-process live event and
+ * the cross-tier plugin outbox enqueue. Both escape any enclosing database
+ * transaction (the live emitter is in-memory; the outbox writes on its own
+ * `_outboxDb` handle), so a caller that logs inside a transaction must defer
+ * this until after commit — see `logActivity`'s `deferPublish` option.
+ */
+export type ActivityPublish = () => void;
+
+const NOOP_ACTIVITY_PUBLISH: ActivityPublish = () => {};
+
+/**
+ * Writes an activity_log row and publishes the corresponding live/plugin
+ * events.
+ *
+ * Pass `{ deferPublish: true }` when `db` is a transaction: publication is then
+ * returned to the caller instead of firing inline, so it can run after commit.
+ * Publishing inline from inside a transaction lets consumers race the row's
+ * visibility, and turns a later commit failure into a phantom event for an
+ * activity that never happened. The returned function is a no-op unless
+ * `deferPublish` was set, so existing callers can keep ignoring the result.
+ */
+export async function logActivity(
+  db: Db,
+  input: LogActivityInput,
+  options?: { deferPublish?: boolean },
+): Promise<ActivityPublish> {
   const currentUserRedactionOptions = {
     enabled: (await instanceSettingsService(db).getGeneral()).censorUsernameInLogs,
   };
@@ -189,23 +257,8 @@ export async function logActivity(db: Db, input: LogActivityInput) {
     details: redactedDetails,
   });
 
-  publishLiveEvent({
-    companyId: input.companyId,
-    type: "activity.logged",
-    payload: {
-      actorType: input.actorType,
-      actorId: input.actorId,
-      action: input.action,
-      entityType: input.entityType,
-      entityId: input.entityId,
-      agentId: input.agentId ?? null,
-      runId: input.runId ?? null,
-      responsibleUserId,
-      details: redactedDetails,
-    },
-  });
-
   const pluginEventType = eventTypeForActivityAction(input.action);
+  let pluginEvent: PluginEvent | null = null;
   if (pluginEventType) {
     // Event-only payload extras: merged into the emitted plugin event but never
     // written to the activity_log row above. We apply the current-user / PII
@@ -221,7 +274,7 @@ export async function logActivity(db: Db, input: LogActivityInput) {
           currentUserRedactionOptions,
         ) as Record<string, unknown>)
       : null;
-    const event: PluginEvent = {
+    pluginEvent = {
       eventId: randomUUID(),
       eventType: pluginEventType,
       occurredAt: new Date().toISOString(),
@@ -238,6 +291,35 @@ export async function logActivity(db: Db, input: LogActivityInput) {
         responsibleUserId,
       },
     };
-    publishPluginDomainEvent(event);
   }
+
+  if (pluginEvent && input.atomicPluginEvent) {
+    await enqueuePluginDomainEventAtomically(db, pluginEvent);
+  }
+
+  const publish: ActivityPublish = () => {
+    publishLiveEvent({
+      companyId: input.companyId,
+      type: "activity.logged",
+      payload: {
+        actorType: input.actorType,
+        actorId: input.actorId,
+        action: input.action,
+        entityType: input.entityType,
+        entityId: input.entityId,
+        agentId: input.agentId ?? null,
+        runId: input.runId ?? null,
+        responsibleUserId,
+        details: redactedDetails,
+      },
+    });
+
+    if (pluginEvent && !input.atomicPluginEvent) {
+      publishPluginDomainEvent(pluginEvent);
+    }
+  };
+
+  if (options?.deferPublish) return publish;
+  publish();
+  return NOOP_ACTIVITY_PUBLISH;
 }

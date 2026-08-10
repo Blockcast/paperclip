@@ -2,10 +2,11 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { and, eq } from "drizzle-orm";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { and, eq, sql } from "drizzle-orm";
 import {
   agents,
+  approvals,
   companies,
   companySecretBindings,
   companySecretProviderConfigs,
@@ -18,7 +19,19 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { agentService } from "../services/agents.ts";
+import { approvalService } from "../services/approvals.ts";
 import { secretService } from "../services/secrets.js";
+
+const mockEnsureBuiltInAgent = vi.hoisted(() => vi.fn());
+const mockNotifyHireApproved = vi.hoisted(() => vi.fn());
+
+vi.mock("../services/built-in-agents.js", () => ({
+  builtInAgentService: () => ({ ensure: mockEnsureBuiltInAgent }),
+}));
+
+vi.mock("../services/hire-hook.js", () => ({
+  notifyHireApproved: mockNotifyHireApproved,
+}));
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -43,11 +56,18 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
     db = createDb(started.connectionString);
   }, 120_000);
 
+  beforeEach(() => {
+    mockNotifyHireApproved.mockResolvedValue(undefined);
+  });
+
   afterEach(async () => {
+    mockEnsureBuiltInAgent.mockReset();
+    mockNotifyHireApproved.mockReset();
     await db.delete(companySecretBindings);
     await db.delete(companySecretVersions);
     await db.delete(companySecrets);
     await db.delete(companySecretProviderConfigs);
+    await db.delete(approvals);
     await db.delete(agents);
     await db.delete(companies);
   });
@@ -72,6 +92,548 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
     });
     return companyId;
   }
+
+  async function seedAgentRow(
+    companyId: string,
+    overrides: Partial<typeof agents.$inferInsert>,
+  ) {
+    const id = randomUUID();
+    await db.insert(agents).values({
+      id,
+      companyId,
+      name: `Agent ${id.slice(0, 8)}`,
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+      spentMonthlyCents: 0,
+      lastHeartbeatAt: null,
+      ...overrides,
+    });
+    return id;
+  }
+
+  it("enforces external-lifecycle concurrency at the persistence boundary", async () => {
+    const companyId = await seedCompany();
+    const agents = agentService(db);
+    const base = {
+      role: "engineer" as const,
+      status: "idle" as const,
+      adapterConfig: {},
+      spentMonthlyCents: 0,
+      lastHeartbeatAt: null,
+    };
+
+    const external = await agents.create(companyId, {
+      ...base,
+      name: "External Default",
+      adapterType: "opencode_k8s",
+      runtimeConfig: {},
+    });
+    expect(external.runtimeConfig).toMatchObject({
+      heartbeat: { maxConcurrentRuns: 16 },
+    });
+
+    const local = await agents.create(companyId, {
+      ...base,
+      name: "Local High Concurrency",
+      adapterType: "codex_local",
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 50 } },
+    });
+    expect(local.runtimeConfig).toMatchObject({
+      heartbeat: { maxConcurrentRuns: 50 },
+    });
+
+    await expect(agents.create(companyId, {
+      ...base,
+      name: "External Over Cap",
+      adapterType: "opencode_k8s",
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 17 } },
+    })).rejects.toMatchObject({ status: 422 });
+    await expect(agents.update(external.id, {
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 17 } },
+    })).rejects.toMatchObject({ status: 422 });
+    await expect(agents.update(local.id, {
+      adapterType: "opencode_k8s",
+    })).rejects.toMatchObject({ status: 422 });
+
+    const pending = await agents.create(companyId, {
+      ...base,
+      name: "Pending External",
+      status: "pending_approval",
+      adapterType: "opencode_k8s",
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 15 } },
+    });
+    await expect(agents.activatePendingApproval(pending.id, {
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 17 } },
+    })).rejects.toMatchObject({ status: 422 });
+
+    const switched = await agents.update(local.id, {
+      adapterType: "opencode_k8s",
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 15 } },
+    });
+    expect(switched).toMatchObject({
+      adapterType: "opencode_k8s",
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 15 } },
+    });
+  });
+
+  it("normalizes missing external-lifecycle concurrency on service update and activation", async () => {
+    const companyId = await seedCompany();
+    const service = agentService(db);
+
+    const externalId = await seedAgentRow(companyId, {
+      name: "Legacy External",
+      adapterType: "opencode_k8s",
+      runtimeConfig: {},
+    });
+    const updated = await service.update(externalId, { runtimeConfig: {} });
+    expect(updated).toMatchObject({
+      adapterType: "opencode_k8s",
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 16 } },
+    });
+
+    const switchId = await seedAgentRow(companyId, {
+      name: "Legacy Local",
+      adapterType: "codex_local",
+      runtimeConfig: {},
+    });
+    const switched = await service.update(switchId, { adapterType: "opencode_k8s" });
+    expect(switched).toMatchObject({
+      adapterType: "opencode_k8s",
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 16 } },
+    });
+
+    const pendingId = await seedAgentRow(companyId, {
+      name: "Pending External",
+      status: "pending_approval",
+      adapterType: "opencode_k8s",
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 15 } },
+    });
+    const activated = await service.activatePendingApproval(pendingId, { runtimeConfig: {} });
+    expect(activated).toMatchObject({
+      activated: true,
+      agent: {
+        adapterType: "opencode_k8s",
+        runtimeConfig: { heartbeat: { maxConcurrentRuns: 16 } },
+      },
+    });
+  });
+
+  it("clamps inherited legacy external concurrency while rejecting explicit over-cap requests", async () => {
+    const companyId = await seedCompany();
+    const service = agentService(db);
+
+    const externalId = await seedAgentRow(companyId, {
+      name: "Legacy Default External",
+      adapterType: "opencode_k8s",
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 20, wakeOnDemand: false } },
+    });
+    const updated = await service.update(externalId, {
+      runtimeConfig: { heartbeat: { wakeOnDemand: true } },
+    });
+    expect(updated).toMatchObject({
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 16, wakeOnDemand: true } },
+    });
+    await expect(service.update(externalId, {
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 20 } },
+    })).rejects.toMatchObject({ status: 422 });
+
+    const pendingId = await seedAgentRow(companyId, {
+      name: "Legacy Default Pending External",
+      status: "pending_approval",
+      adapterType: "opencode_k8s",
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 20 } },
+    });
+    await expect(service.activatePendingApproval(pendingId, {
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 20 } },
+    })).resolves.toMatchObject({
+      activated: true,
+      agent: {
+        runtimeConfig: { heartbeat: { maxConcurrentRuns: 16 } },
+      },
+    });
+  });
+
+  it("validates external-lifecycle concurrency against the locked row after concurrent updates", async () => {
+    const companyId = await seedCompany();
+    const agentId = await seedAgentRow(companyId, {
+      name: "Concurrent Local",
+      adapterType: "codex_local",
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 15 } },
+    });
+
+    let pendingUpdate!: Promise<{ status: "resolved"; value: unknown } | { status: "rejected"; error: unknown }>;
+    await db.transaction(async (tx) => {
+      await tx.execute(sql`select ${agents.id} from ${agents} where ${agents.id} = ${agentId} for update`);
+      pendingUpdate = agentService(db)
+        .update(agentId, { adapterType: "opencode_k8s" })
+        .then(
+          (value) => ({ status: "resolved" as const, value }),
+          (error) => ({ status: "rejected" as const, error }),
+        );
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      await tx
+        .update(agents)
+        .set({
+          runtimeConfig: { heartbeat: { maxConcurrentRuns: 50 } },
+          updatedAt: new Date(),
+        })
+        .where(eq(agents.id, agentId));
+    });
+
+    const result = await pendingUpdate;
+    expect(result.status).toBe("rejected");
+    if (result.status !== "rejected") return;
+    expect(result.error).toMatchObject({ status: 422 });
+
+    const row = await db
+      .select({ adapterType: agents.adapterType, runtimeConfig: agents.runtimeConfig })
+      .from(agents)
+      .where(eq(agents.id, agentId))
+      .then((rows) => rows[0]);
+    expect(row).toMatchObject({
+      adapterType: "codex_local",
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 50 } },
+    });
+  });
+
+  it("merges partial runtime patches against the locked row", async () => {
+    const companyId = await seedCompany();
+    const agentId = await seedAgentRow(companyId, {
+      name: "Concurrent Partial Runtime Update",
+      adapterType: "opencode_k8s",
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 15, wakeOnDemand: false } },
+    });
+    const service = agentService(db);
+
+    let pendingUpdate!: ReturnType<typeof service.update>;
+    await db.transaction(async (tx) => {
+      await tx.execute(sql`select ${agents.id} from ${agents} where ${agents.id} = ${agentId} for update`);
+      pendingUpdate = service.update(agentId, {
+        runtimeConfig: { heartbeat: { wakeOnDemand: true } },
+      });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      await tx.update(agents).set({
+        runtimeConfig: { heartbeat: { maxConcurrentRuns: 12, wakeOnDemand: false } },
+      }).where(eq(agents.id, agentId));
+    });
+
+    await expect(pendingUpdate).resolves.toMatchObject({
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 12, wakeOnDemand: true } },
+    });
+  });
+
+  it("does not reject from an invalid runtime snapshot repaired before locking", async () => {
+    const companyId = await seedCompany();
+    const agentId = await seedAgentRow(companyId, {
+      name: "Legacy Invalid External Runtime",
+      adapterType: "opencode_k8s",
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 17 } },
+    });
+    const service = agentService(db);
+
+    let pendingUpdate!: ReturnType<typeof service.update>;
+    let settled = false;
+    await db.transaction(async (tx) => {
+      await tx.execute(sql`select ${agents.id} from ${agents} where ${agents.id} = ${agentId} for update`);
+      pendingUpdate = service.update(agentId, { adapterType: "opencode_k8s" });
+      void pendingUpdate.finally(() => {
+        settled = true;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(settled).toBe(false);
+      await tx.update(agents).set({
+        runtimeConfig: { heartbeat: { maxConcurrentRuns: 15 } },
+      }).where(eq(agents.id, agentId));
+    });
+
+    await expect(pendingUpdate).resolves.toMatchObject({
+      adapterType: "opencode_k8s",
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 15 } },
+    });
+  });
+
+  it("activates from the locked pending-agent runtime without losing a concurrent update", async () => {
+    const companyId = await seedCompany();
+    const agentId = await seedAgentRow(companyId, {
+      name: "Concurrent Pending Activation",
+      status: "pending_approval",
+      adapterType: "opencode_k8s",
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 15, wakeOnDemand: false } },
+    });
+    const service = agentService(db);
+
+    let pendingActivation!: ReturnType<typeof service.activatePendingApproval>;
+    let settled = false;
+    await db.transaction(async (tx) => {
+      await tx.execute(sql`select ${agents.id} from ${agents} where ${agents.id} = ${agentId} for update`);
+      pendingActivation = service.activatePendingApproval(agentId, { role: "reviewer" });
+      void pendingActivation.finally(() => {
+        settled = true;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(settled).toBe(false);
+      await tx.update(agents).set({
+        runtimeConfig: { heartbeat: { maxConcurrentRuns: 12, wakeOnDemand: true } },
+      }).where(eq(agents.id, agentId));
+    });
+
+    await expect(pendingActivation).resolves.toMatchObject({
+      activated: true,
+      agent: {
+        status: "idle",
+        role: "reviewer",
+        runtimeConfig: { heartbeat: { maxConcurrentRuns: 12, wakeOnDemand: true } },
+      },
+    });
+  });
+
+  it("preserves concurrent runtime changes through the production hire approval path", async () => {
+    const companyId = await seedCompany();
+    const agentId = await seedAgentRow(companyId, {
+      name: "Production Approval Race",
+      status: "pending_approval",
+      adapterType: "opencode_k8s",
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 15, wakeOnDemand: false } },
+    });
+    const requestedRuntimeConfig = {
+      heartbeat: { maxConcurrentRuns: 15, wakeOnDemand: false },
+    };
+    const approvalId = randomUUID();
+    await db.insert(approvals).values({
+      id: approvalId,
+      companyId,
+      type: "hire_agent",
+      status: "pending",
+      requestedByUserId: "requester",
+      payload: {
+        agentId,
+        name: "Production Approval Race",
+        role: "engineer",
+        adapterType: "opencode_k8s",
+        adapterConfig: {},
+        runtimeConfig: requestedRuntimeConfig,
+        budgetMonthlyCents: 0,
+        requestedConfigurationSnapshot: {
+          adapterType: "opencode_k8s",
+          adapterConfig: {},
+          runtimeConfig: requestedRuntimeConfig,
+        },
+      },
+      updatedAt: new Date(),
+    });
+
+    let pendingApproval!: ReturnType<ReturnType<typeof approvalService>["approve"]>;
+    let settled = false;
+    await db.transaction(async (tx) => {
+      await tx.execute(sql`select ${agents.id} from ${agents} where ${agents.id} = ${agentId} for update`);
+      pendingApproval = approvalService(db).approve(approvalId, "board-user", "Approved");
+      void pendingApproval.finally(() => {
+        settled = true;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(settled).toBe(false);
+      await tx.update(agents).set({
+        runtimeConfig: { heartbeat: { maxConcurrentRuns: 12, wakeOnDemand: true } },
+      }).where(eq(agents.id, agentId));
+    });
+
+    await expect(pendingApproval).resolves.toMatchObject({ applied: true });
+    await expect(agentService(db).getById(agentId)).resolves.toMatchObject({
+      status: "idle",
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 12, wakeOnDemand: true } },
+    });
+  });
+
+  it("rolls back approval when the pending agent changes state before activation", async () => {
+    const companyId = await seedCompany();
+    const agentId = await seedAgentRow(companyId, {
+      name: "Concurrent Termination",
+      status: "pending_approval",
+      adapterType: "opencode_k8s",
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 15 } },
+    });
+    const approvalId = randomUUID();
+    await db.insert(approvals).values({
+      id: approvalId,
+      companyId,
+      type: "hire_agent",
+      status: "pending",
+      requestedByUserId: "requester",
+      payload: {
+        agentId,
+        name: "Concurrent Termination",
+        role: "engineer",
+        adapterType: "opencode_k8s",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { maxConcurrentRuns: 15 } },
+        budgetMonthlyCents: 5000,
+      },
+      updatedAt: new Date(),
+    });
+
+    let pendingApproval!: ReturnType<ReturnType<typeof approvalService>["approve"]>;
+    await db.transaction(async (tx) => {
+      await tx.execute(sql`select ${agents.id} from ${agents} where ${agents.id} = ${agentId} for update`);
+      pendingApproval = approvalService(db).approve(approvalId, "board-user", "Approved");
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      await tx.update(agents).set({ status: "terminated" }).where(eq(agents.id, agentId));
+    });
+
+    await expect(pendingApproval).rejects.toMatchObject({
+      status: 409,
+      details: {
+        code: "pending_approval_agent_not_activatable",
+        agentId,
+      },
+    });
+    await expect(approvalService(db).getById(approvalId)).resolves.toMatchObject({
+      status: "pending",
+      decidedByUserId: null,
+      decidedAt: null,
+    });
+    await expect(agentService(db).getById(agentId)).resolves.toMatchObject({
+      status: "terminated",
+    });
+    expect(mockNotifyHireApproved).not.toHaveBeenCalled();
+  });
+
+  it("keeps legacy approval runtime payloads as full replacements", async () => {
+    const companyId = await seedCompany();
+    const agentId = await seedAgentRow(companyId, {
+      name: "Legacy Approval Runtime Replacement",
+      status: "pending_approval",
+      adapterType: "opencode_k8s",
+      runtimeConfig: {
+        heartbeat: { enabled: true, wakeOnDemand: true, maxConcurrentRuns: 15 },
+      },
+    });
+    const approvalId = randomUUID();
+    await db.insert(approvals).values({
+      id: approvalId,
+      companyId,
+      type: "hire_agent",
+      status: "pending",
+      requestedByUserId: "requester",
+      payload: {
+        agentId,
+        name: "Legacy Approval Runtime Replacement",
+        role: "engineer",
+        adapterType: "opencode_k8s",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { enabled: true, maxConcurrentRuns: 15 } },
+        budgetMonthlyCents: 0,
+      },
+      updatedAt: new Date(),
+    });
+
+    await expect(approvalService(db).approve(approvalId, "board-user", "Approved")).resolves.toMatchObject({
+      applied: true,
+    });
+    await expect(agentService(db).getById(agentId)).resolves.toMatchObject({
+      status: "idle",
+      runtimeConfig: { heartbeat: { enabled: true, maxConcurrentRuns: 15 } },
+    });
+    const activated = await agentService(db).getById(agentId);
+    expect(activated?.runtimeConfig).not.toHaveProperty("heartbeat.wakeOnDemand");
+  });
+
+  it("rolls back approval resolution when legacy activation validation fails", async () => {
+    const companyId = await seedCompany();
+    const agentId = await seedAgentRow(companyId, {
+      name: "Legacy Approval Above External Limit",
+      status: "pending_approval",
+      adapterType: "opencode_k8s",
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 15 } },
+    });
+    const approvalId = randomUUID();
+    await db.insert(approvals).values({
+      id: approvalId,
+      companyId,
+      type: "hire_agent",
+      status: "pending",
+      requestedByUserId: "requester",
+      payload: {
+        agentId,
+        name: "Legacy Approval Above External Limit",
+        role: "engineer",
+        adapterType: "opencode_k8s",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { maxConcurrentRuns: 17 } },
+        budgetMonthlyCents: 0,
+      },
+      updatedAt: new Date(),
+    });
+
+    await expect(
+      approvalService(db).approve(approvalId, "board-user", "Approved"),
+    ).rejects.toMatchObject({ status: 422 });
+
+    await expect(approvalService(db).getById(approvalId)).resolves.toMatchObject({
+      status: "pending",
+      decidedByUserId: null,
+      decidedAt: null,
+    });
+    await expect(agentService(db).getById(agentId)).resolves.toMatchObject({
+      status: "pending_approval",
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 15 } },
+    });
+  });
+
+  it("does not reconcile built-in files before approval database work commits", async () => {
+    const companyId = await seedCompany();
+    const agentId = await seedAgentRow(companyId, {
+      name: "Built-in Approval Rollback",
+      status: "pending_approval",
+      adapterType: "codex_local",
+    });
+    const approvalId = randomUUID();
+    await db.insert(approvals).values({
+      id: approvalId,
+      companyId,
+      type: "hire_agent",
+      status: "pending",
+      requestedByUserId: "requester",
+      payload: {
+        agentId,
+        name: "Built-in Approval Rollback",
+        role: "engineer",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        budgetMonthlyCents: 5000,
+        sourceBuiltInAgentKey: "briefs",
+      },
+      updatedAt: new Date(),
+    });
+    await db.execute(sql`
+      alter table budget_policies
+      add constraint test_reject_approved_hire_budget check (amount < 1)
+    `);
+
+    try {
+      await expect(
+        approvalService(db).approve(approvalId, "board-user", "Approved"),
+      ).rejects.toThrow();
+
+      expect(mockEnsureBuiltInAgent).not.toHaveBeenCalled();
+      await expect(approvalService(db).getById(approvalId)).resolves.toMatchObject({
+        status: "pending",
+      });
+      await expect(agentService(db).getById(agentId)).resolves.toMatchObject({
+        status: "pending_approval",
+        budgetMonthlyCents: 0,
+      });
+    } finally {
+      await db.execute(sql`
+        alter table budget_policies
+        drop constraint test_reject_approved_hire_budget
+      `);
+    }
+  });
 
   it("creates agent secret bindings when a new agent persists secret_ref env", async () => {
     const companyId = await seedCompany();

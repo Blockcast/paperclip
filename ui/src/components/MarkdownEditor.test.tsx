@@ -270,8 +270,9 @@ describe("MarkdownEditor", () => {
       );
     });
 
-    await flush();
-    expect(container.textContent).toContain("Loaded plan body");
+    await vi.waitFor(() => {
+      expect(container.textContent).toContain("Loaded plan body");
+    });
 
     await act(async () => {
       root.unmount();

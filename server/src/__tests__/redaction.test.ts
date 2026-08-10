@@ -3,6 +3,7 @@ import {
   REDACTED_EVENT_VALUE,
   redactAgentConfigPayload,
   redactApprovalPayloadByType,
+  redactApprovalPayloadForDisplay,
   redactEventPayload,
   redactSensitiveText,
   sanitizeRecord,
@@ -162,6 +163,288 @@ describe("redaction", () => {
 
     expect(result?.args).toEqual(["--api-key", "not-a-command-secret"]);
     expect(result?.argv).toEqual(["--api-key", REDACTED_EVENT_VALUE]);
+  });
+});
+
+// BLO-20810: `SECRET_PAYLOAD_KEY_RE` matches secret-ish *substrings* anywhere
+// in a key name by design (so compound keys like `webhookAuthToken` still
+// trigger), but that means "author" trips on "auth" and "no_secrets_in_payload"
+// trips on "secret" even though neither value is a credential. The value must
+// also look opaque/credential-shaped before it gets blanked.
+describe("sanitizeRecord value-shape gate (BLO-20810)", () => {
+  it("does not redact prose or evidence links under a key that merely contains a secret-ish substring", () => {
+    const input = {
+      ask_2_author_identity: "PR #1898 was authored by the app account, not a human.",
+      no_secrets_in_payload: "No secret values are present in this payload.",
+      "links.PR_1898_app_authored": "https://github.com/Blockcast/paperclip/pull/1898",
+    };
+
+    expect(redactEventPayload(structuredClone(input))).toEqual(input);
+  });
+
+  it("still redacts a real key/token-shaped value under the same kind of key", () => {
+    const result = redactEventPayload({
+      ask_2_author_identity: "ghp_1234567890abcdefghijklmnopqrstuvwxyz",
+      requestedAuthorization: "sk-live-abc123def456",
+    });
+
+    expect(result?.ask_2_author_identity).toBe(REDACTED_EVENT_VALUE);
+    expect(result?.requestedAuthorization).toBe(REDACTED_EVENT_VALUE);
+  });
+
+  it("still redacts an Authorization header value with a Bearer scheme prefix", () => {
+    // Mirrors mcpServers.*.headers.Authorization, which must stay redacted —
+    // a scheme prefix ("Bearer ") shouldn't be enough to read as prose.
+    const result = redactEventPayload({ Authorization: "Bearer gbrain_at_secret_12345" });
+
+    expect(result?.Authorization).toBe(REDACTED_EVENT_VALUE);
+  });
+
+  it("still redacts a multi-line PEM private key (whitespace must not exempt it)", () => {
+    const pem =
+      "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7VJTUt9Us8cKB\n-----END PRIVATE KEY-----";
+
+    const result = redactEventPayload({
+      ORC8R_PRIVATE_KEY: pem,
+      certifierPrivateKey: pem,
+    });
+
+    expect(result?.ORC8R_PRIVATE_KEY).toBe(REDACTED_EVENT_VALUE);
+    expect(result?.certifierPrivateKey).toBe(REDACTED_EVENT_VALUE);
+  });
+
+  it("still redacts a connection string carrying an inline password (URL shape must not exempt it)", () => {
+    const result = redactEventPayload({
+      connectionString: "postgres://app_user:hunter2@db.internal:5432/prod",
+    });
+
+    expect(result?.connectionString).toBe(REDACTED_EVENT_VALUE);
+  });
+
+  it("redacts a PEM key via redactAgentConfigPayload too", () => {
+    const pem = "-----BEGIN EC PRIVATE KEY-----\nMHcCAQEE...\n-----END EC PRIVATE KEY-----";
+
+    const result = redactAgentConfigPayload({ certifierPrivateKey: pem });
+
+    expect(result?.certifierPrivateKey).toBe(REDACTED_EVENT_VALUE);
+  });
+
+  it("still leaves a plain URL without embedded credentials readable under a secret-ish key", () => {
+    const result = redactEventPayload({
+      "links.PR_1898_app_authored": "https://github.com/Blockcast/paperclip/pull/1898",
+    });
+
+    expect(result?.["links.PR_1898_app_authored"]).toBe(
+      "https://github.com/Blockcast/paperclip/pull/1898",
+    );
+  });
+
+  it("recurses into non-string values under a secret-ish key instead of nuking the whole structure", () => {
+    const result = redactEventPayload({
+      authorInfo: {
+        note: "Verified via GitHub App identity.",
+        token: "ghp_abcdefghijklmnopqrstuvwxyz123456",
+      },
+      authoredPrLinks: ["https://github.com/x/y/pull/1", "sk-live-not-a-url-secret"],
+    });
+
+    expect(result?.authorInfo).toEqual({
+      note: "Verified via GitHub App identity.",
+      token: REDACTED_EVENT_VALUE,
+    });
+    expect(result?.authoredPrLinks).toEqual([
+      "https://github.com/x/y/pull/1",
+      REDACTED_EVENT_VALUE,
+    ]);
+  });
+
+  // Important finding (#943 review): a single-word identity under an
+  // ambiguous tier-2 key ("author" contains "auth") is not credential-shaped
+  // — only whitespace was ever checked before, so short opaque-looking words
+  // like "octocat" were redacted despite carrying no secret.
+  it("does not redact a one-word identity value or an array of them under an ambiguous key", () => {
+    const result = redactEventPayload({
+      author: "octocat",
+      authors: ["alice", "bob"],
+    });
+
+    expect(result?.author).toBe("octocat");
+    expect(result?.authors).toEqual(["alice", "bob"]);
+  });
+
+  // Critical 2 (#943 review): the object branch of the old
+  // `sanitizeSecretMatchedValue` delegated to `sanitizeRecord`, which re-tested
+  // each child by its OWN key name and silently dropped the parent's
+  // sensitivity — `{ authorization: { value: "ghp_...", current: "..." } }`
+  // leaked both fields because neither child key ("value"/"current") is
+  // itself secret-shaped. `authorization` is a Tier-1 stem, so every
+  // descendant leaf must be redacted regardless of the child's own key name.
+  it("inherits tier-1 sensitivity into object descendants regardless of the child's own key name", () => {
+    const result = redactEventPayload({
+      authorization: { value: "ghp_1234567890abcdefghijklmnopqrstuvwxyz", current: "some-other-detail" },
+    });
+
+    expect(result?.authorization).toEqual({
+      value: REDACTED_EVENT_VALUE,
+      current: REDACTED_EVENT_VALUE,
+    });
+  });
+
+  // Critical 1 (#943 review): the old URL exemption treated ANY url-shaped
+  // value without inline `user:pass@` userinfo as safe, so a presigned or
+  // signed-query URL under a secret-ish key displayed in full. Tier-1 keys
+  // close most of this by being unconditional (apiKey below never even
+  // reaches the value-shape test); this also pins the narrow credential test
+  // itself for a Tier-2 key carrying a signed URL.
+  it("still redacts a presigned/signed-query URL under a secret-ish key", () => {
+    const result = redactEventPayload({
+      apiKey: "https://hooks.slack.test/services/T000/B000/signed-webhook-value",
+      base_url: "https://example.test/callback?token=abc123def456",
+    });
+
+    expect(result?.apiKey).toBe(REDACTED_EVENT_VALUE);
+    expect(result?.base_url).toBe(REDACTED_EVENT_VALUE);
+  });
+
+  // CTO finding (#943 review, post-tiering): the URL branch returned "safe"
+  // for any URL without `user:pass@` userinfo or a `?token=`-style query, so
+  // a capability URL that embeds its credential directly in the path (a
+  // Slack incoming-webhook shape: no userinfo, no query string) displayed in
+  // full under a Tier-2 key. `base_url` is Tier 2, so unlike the `apiKey`
+  // case above (Tier 1, redacts unconditionally without ever reaching
+  // `looksLikeCredentialValue`), this is the case that actually exercises
+  // the URL branch's path-segment gate. Mutation check: reverting only the
+  // `hasOpaqueUrlPathSegment` gate (i.e. the pre-fix URL branch) makes this
+  // assertion fail while every other test in this file still passes.
+  it("still redacts a Tier-2 key's URL that embeds its credential as a bare path segment", () => {
+    const result = redactEventPayload({
+      base_url: "https://hooks.slack.test/services/T000/B000/AbCdEfGhIjKlMnOpQrSt99",
+    });
+
+    expect(result?.base_url).toBe(REDACTED_EVENT_VALUE);
+  });
+
+  it("does not redact a Tier-2 key's URL whose path segments are all short", () => {
+    const result = redactEventPayload({
+      base_url: "https://github.com/Blockcast/paperclip/pull/1898",
+    });
+
+    expect(result?.base_url).toBe("https://github.com/Blockcast/paperclip/pull/1898");
+  });
+
+  // Ally review (#943): a spaced passphrase or cookie value was exempted by
+  // the old whitespace check. Both key stems are Tier-1 now, so the value
+  // shape never matters.
+  it("still redacts a spaced passphrase and a spaced cookie value", () => {
+    const result = redactEventPayload({
+      password: "correct horse battery staple",
+      sessionCookie: "session id=abc123; path=/; secure flag set",
+    });
+
+    expect(result?.password).toBe(REDACTED_EVENT_VALUE);
+    expect(result?.sessionCookie).toBe(REDACTED_EVENT_VALUE);
+  });
+
+  it("still redacts a long opaque token under an ambiguous key even without a known prefix", () => {
+    const result = redactEventPayload({
+      userAuthContext: "a1B2c3D4e5F6g7H8i9J0k1L2m3N4",
+    });
+
+    expect(result?.userAuthContext).toBe(REDACTED_EVENT_VALUE);
+  });
+
+  // Residual finding (#943 review, post-tiering): `auth`/`secret` as a whole
+  // token in a short key (<=2 tokens) is an ordinary credential field name,
+  // not the "author"/"no_secrets_in_payload" collision Tier 2 exists for —
+  // it must not fall through `looksLikeCredentialValue`'s length/shape gate
+  // just because the value happens to be short.
+  it("redacts a short value under a real auth/secret field name regardless of length or shape", () => {
+    const result = redactEventPayload({
+      secret: "hunter2",
+      client_secret: "s3cr3t99",
+      webhook_secret: "abc123XY",
+      auth: "pw12345",
+      clientSecret: "another-short-one",
+    });
+
+    expect(result?.secret).toBe(REDACTED_EVENT_VALUE);
+    expect(result?.client_secret).toBe(REDACTED_EVENT_VALUE);
+    expect(result?.webhook_secret).toBe(REDACTED_EVENT_VALUE);
+    expect(result?.auth).toBe(REDACTED_EVENT_VALUE);
+    expect(result?.clientSecret).toBe(REDACTED_EVENT_VALUE);
+  });
+
+  it("does not promote base_url, or sentence-shaped/multi-token keys, to tier 1", () => {
+    const input = {
+      base_url: "short",
+      author: "octocat",
+      authors: ["alice", "bob"],
+      ask_2_author_identity: "PR #1898 was authored by the app account, not a human.",
+      no_secrets_in_payload: "No secret values are present in this payload.",
+    };
+
+    expect(redactEventPayload(structuredClone(input))).toEqual(input);
+  });
+
+  // Critical (#943 review, post-tiering): a Tier-2 parent (`authorInfo`
+  // contains "auth" but isn't a Tier-1 stem) used to suppress every child's
+  // own classification, so `password`/`apiKey`/`token` — all Tier-1 stems —
+  // leaked wholesale underneath it. A child's own tier must win when it's
+  // stronger than the inherited one.
+  it("redacts tier-1 child keys unconditionally even beneath an ambiguous tier-2 parent", () => {
+    const result = redactEventPayload({
+      authorInfo: {
+        password: "hunter2",
+        apiKey: "abc123",
+        token: "short-token",
+        note: "Verified via GitHub App identity.",
+      },
+    });
+
+    expect(result?.authorInfo).toEqual({
+      password: REDACTED_EVENT_VALUE,
+      apiKey: REDACTED_EVENT_VALUE,
+      token: REDACTED_EVENT_VALUE,
+      note: "Verified via GitHub App identity.",
+    });
+  });
+});
+
+describe("redactApprovalPayloadForDisplay (BLO-20810)", () => {
+  it("names the scrubbed field instead of an ambiguous bare sentinel, and reports it", () => {
+    const payload = {
+      ask_2_author_identity: "PR #1898 was authored by the app account, not a human.",
+      requestedAuthorization: "sk-live-abc123def456",
+    };
+
+    const { payload: displayed, redactedFields } = redactApprovalPayloadForDisplay(
+      "request_board_approval",
+      payload,
+    );
+
+    expect(displayed.ask_2_author_identity).toBe(payload.ask_2_author_identity);
+    expect(displayed.requestedAuthorization).toBe(
+      "[redacted by secret scanner: requestedAuthorization]",
+    );
+    expect(redactedFields).toEqual(["requestedAuthorization"]);
+  });
+
+  it("returns no redactedFields when nothing was actually scrubbed", () => {
+    const { payload, redactedFields } = redactApprovalPayloadForDisplay("request_board_approval", {
+      note: "everything here is plain prose",
+    });
+
+    expect(payload).toEqual({ note: "everything here is plain prose" });
+    expect(redactedFields).toEqual([]);
+  });
+
+  it("leaves hire_agent's structural redaction as the bare sentinel (BLO-18969 contract)", () => {
+    const { payload, redactedFields } = redactApprovalPayloadForDisplay("hire_agent", {
+      adapterConfig: { env: { FOO: "value-under-a-key-no-regex-matches" } },
+    });
+
+    expect(payload).toEqual({ adapterConfig: { env: { FOO: REDACTED_EVENT_VALUE } } });
+    expect(redactedFields).toEqual([]);
   });
 });
 

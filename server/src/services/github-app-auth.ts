@@ -212,6 +212,40 @@ export type ReviewerEvidenceResult =
   | { found: false }
   | { error: string };
 
+export type PullRequestGateResult =
+  | { state: "open" | "closed"; merged: boolean }
+  | { error: string };
+
+export async function githubGetPullRequestGate(input: {
+  repoFullName: string;
+  prNumber: number;
+}): Promise<PullRequestGateResult> {
+  const tokenResult = await getInstallationTokenResult();
+  if (!tokenResult.ok) return { error: tokenResult.reason };
+
+  const apiBase = gitHubApiBase(GITHUB_HOST);
+  let res: Response;
+  try {
+    res = await ghFetch(`${apiBase}/repos/${input.repoFullName}/pulls/${input.prNumber}`, {
+      headers: { ...GITHUB_API_HEADERS, authorization: `Bearer ${tokenResult.token}` },
+    });
+  } catch {
+    return { error: "pull_request_fetch_failed" };
+  }
+  if (!res.ok) {
+    const classified = await classifyGithubHttpFailure("pull_request", res);
+    return { error: classified.reason };
+  }
+  const body = (await res.json().catch(() => null)) as {
+    state?: string;
+    merged?: boolean;
+  } | null;
+  if (body?.state !== "open" && body?.state !== "closed") {
+    return { error: "pull_request_state_missing" };
+  }
+  return { state: body.state, merged: body.merged === true };
+}
+
 /** Extract the leading 7-40 hex chars of a head SHA, or null. */
 function headShaHex(headSha: string | null | undefined): string | null {
   if (!headSha) return null;

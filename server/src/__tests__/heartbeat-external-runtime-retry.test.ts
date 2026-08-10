@@ -27,6 +27,10 @@ import { cleanupHeartbeatTestState } from "./helpers/cleanup-heartbeat-test-stat
 import {
   bindExternalRuntimeReservationIsolation,
   claimRunWithExternalRuntimeSlot,
+  ExternalRuntimeIsolationConflictError,
+  markExternalRuntimeReservationLaunching,
+  recordExpectedExternalRuntimeJobName,
+  recordExternalRuntimeJobIdentity,
   releaseExternalRuntimeReservation,
 } from "../services/external-runtime-reservations.js";
 
@@ -1174,5 +1178,171 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
 
     expect(reservation.releasedAt).toBeNull();
     expect(reservation.state).toBe("launched");
+  }, 120_000);
+
+  // BLO-21256: audit of whether ExternalRuntimeIsolationConflictError -- the
+  // sole trigger for deferRunForK8sIsolationConflict() (heartbeat.ts's outer
+  // catch reacts only to that type) -- can be raised for a run after its own
+  // Job has already been created. It cannot, by construction:
+  // bindExternalRuntimeReservationIsolation only reaches the
+  // legacyWriter-check/UPDATE code that can throw the conflict error while the
+  // reservation's isolationMode is still the "pending"/"legacy" placeholder
+  // (the `replaceableBinding` gate). Once a real isolationMode/isolationKey is
+  // bound -- which happens strictly before Job identity is ever stamped, since
+  // markExternalRuntimeReservationLaunching/recordExpectedExternalRuntimeJobName/
+  // recordExternalRuntimeJobIdentity all require state to have already left
+  // "reserved" via a successful (non-throwing) bind -- any further bind
+  // attempt on that same reservation either no-ops (exact key match) or throws
+  // a plain drift Error, never ExternalRuntimeIsolationConflictError. This
+  // test pins both halves: the conflict mechanism is real (a still-pending
+  // contender loses to an active writer), and it is categorically unreachable
+  // once the run's own Job has been created. If a future refactor weakens the
+  // `replaceableBinding` gate (e.g. moves isolation binding to after Job
+  // creation, or lets an already-bound reservation re-enter the throw path),
+  // this test fails.
+  it("cannot raise ExternalRuntimeIsolationConflictError for a run whose Job has already been created (BLO-21256)", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const jobHolderRunId = randomUUID();
+    const contenderRunId = randomUUID();
+    const sharedIsolationKey = `workspace:${randomUUID()}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "External Runtime Post-Launch Conflict Co",
+      issuePrefix: "EPL",
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Claude K8s Post-Launch",
+      role: "engineer",
+      status: "active",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {
+        heartbeat: { enabled: true, wakeOnDemand: true, maxConcurrentRuns: 2, concurrencyEnabled: true },
+      },
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values([
+      {
+        id: jobHolderRunId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "queued",
+        contextSnapshot: {},
+      },
+      {
+        id: contenderRunId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "queued",
+        contextSnapshot: {},
+      },
+    ]);
+
+    // Take the job-holder run all the way through the real production
+    // sequence: claim -> bind -> launching -> expected name -> Job identity
+    // stamped. This is "createNamespacedJob has already been issued" for it.
+    const jobHolderClaim = await claimRunWithExternalRuntimeSlot(db, jobHolderRunId, new Date(), 0);
+    expect(jobHolderClaim).not.toBeNull();
+    await bindExternalRuntimeReservationIsolation(db, {
+      runId: jobHolderRunId,
+      reservationId: jobHolderClaim!.reservation.id,
+      isolationMode: "workspace",
+      isolationKey: sharedIsolationKey,
+    });
+    const launching = await markExternalRuntimeReservationLaunching(db, jobHolderRunId);
+    expect(launching).not.toBeNull();
+    await recordExpectedExternalRuntimeJobName(db, {
+      runId: jobHolderRunId,
+      jobName: "already-created-job",
+      reservationId: launching!.id,
+      slotId: launching!.slotId,
+    });
+    const launched = await recordExternalRuntimeJobIdentity(db, {
+      runId: jobHolderRunId,
+      reservationId: launching!.id,
+      slotId: launching!.slotId,
+      jobName: "already-created-job",
+      jobUid: "already-created-job-uid",
+    });
+    expect(launched).toMatchObject({ state: "launched", jobName: "already-created-job" });
+
+    // Control case: the conflict mechanism is real. A second, still-pending
+    // reservation contending for the SAME key against the now-active writer
+    // above throws ExternalRuntimeIsolationConflictError, as designed.
+    const contenderClaim = await claimRunWithExternalRuntimeSlot(db, contenderRunId, new Date(), 1);
+    expect(contenderClaim).not.toBeNull();
+    let contenderError: unknown;
+    try {
+      await bindExternalRuntimeReservationIsolation(db, {
+        runId: contenderRunId,
+        reservationId: contenderClaim!.reservation.id,
+        isolationMode: "workspace",
+        isolationKey: sharedIsolationKey,
+      });
+    } catch (err) {
+      contenderError = err;
+    }
+    expect(contenderError).toBeInstanceOf(ExternalRuntimeIsolationConflictError);
+    expect((contenderError as InstanceType<typeof ExternalRuntimeIsolationConflictError>).conflictingRunId).toBe(
+      jobHolderRunId,
+    );
+
+    // The load-bearing assertion: re-binding the JOB-HOLDER's own reservation
+    // to a different key (e.g. a resumed/duplicate dispatch pass recomputing
+    // isolation identity) must NEVER raise ExternalRuntimeIsolationConflictError.
+    // If it did, deferRunForK8sIsolationConflict() would push this run back to
+    // queued/started_at:null with external_run_id nulled while the Job stamped
+    // above keeps running -- exactly the stranding this issue audited for.
+    let rebindError: unknown;
+    try {
+      await bindExternalRuntimeReservationIsolation(db, {
+        runId: jobHolderRunId,
+        reservationId: launching!.id,
+        isolationMode: "run",
+        isolationKey: `run:${jobHolderRunId}`,
+      });
+    } catch (err) {
+      rebindError = err;
+    }
+    expect(rebindError).not.toBeInstanceOf(ExternalRuntimeIsolationConflictError);
+    expect(rebindError).toBeInstanceOf(Error);
+    expect((rebindError as Error).message).toMatch(/isolation binding drift/);
+
+    // And the reservation/run backing the live Job were left untouched by the
+    // rejected re-bind attempt -- no stranding.
+    const jobHolderReservationAfter = await db
+      .select()
+      .from(externalRuntimeReservations)
+      .where(eq(externalRuntimeReservations.runId, jobHolderRunId))
+      .then((rows) => rows[0]);
+    expect(jobHolderReservationAfter).toMatchObject({
+      state: "launched",
+      isolationMode: "workspace",
+      isolationKey: sharedIsolationKey,
+      jobName: "already-created-job",
+      jobUid: "already-created-job-uid",
+      releasedAt: null,
+    });
+    const jobHolderRunAfter = await db
+      .select({
+        status: heartbeatRuns.status,
+        startedAt: heartbeatRuns.startedAt,
+        externalRunId: heartbeatRuns.externalRunId,
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, jobHolderRunId))
+      .then((rows) => rows[0]);
+    expect(jobHolderRunAfter?.status).toBe("running");
+    expect(jobHolderRunAfter?.startedAt).not.toBeNull();
   }, 120_000);
 });

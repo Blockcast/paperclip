@@ -193,8 +193,19 @@ function createLiveRunsDbStub(rows: Array<Record<string, unknown>>) {
               agentName: row.agentName,
               activeCount: agentRows.length,
               queuedCount: queuedRows.length,
+              // BLO-20396: the real driver returns this aggregate as a
+              // timestamp STRING, not a Date. `sql<Date | null>` only sets the
+              // compile-time generic; drizzle's postgres-js mapper runs for
+              // column references, not raw expressions. This stub used to hand
+              // back a Date — reproducing the declared type instead of the
+              // driver's actual output — which is exactly why the endpoint
+              // could 500 in production on `oldestQueuedAt.getTime()` while
+              // every test here passed.
               oldestQueuedAt: queuedRows.length > 0
                 ? new Date(Math.min(...queuedRows.map((candidate) => (candidate.createdAt as Date).getTime())))
+                  .toISOString()
+                  .replace("T", " ")
+                  .replace("Z", "+00")
                 : null,
             }];
           }),
@@ -957,6 +968,43 @@ describe("PR review queue observability route", () => {
       oldestQueuedAgeMs: null,
     });
     expect(res.body.agents[1].runs[0].disposition).toBe("adapter_failed");
+    vi.useRealTimers();
+  });
+
+  it("returns 200 with usable timestamps when the driver hands back a string aggregate (BLO-20396)", async () => {
+    // Regression guard for the production 500:
+    //   "group.oldestQueuedAt.getTime is not a function"
+    // `min(created_at)` is a raw sql<> expression, so drizzle never decodes it
+    // to a Date and postgres-js yields the wire string. The stub above now
+    // reproduces that, so this fails without the boundary coercion.
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-25T12:00:00.000Z"));
+    const contextSnapshot = {
+      reviewKind: "pr_review",
+      githubRepoFullName: "Blockcast/paperclip",
+      githubPrNumber: 812,
+      githubHeadSha: "abcdef123456",
+    };
+    const { db } = createLiveRunsDbStub([
+      {
+        id: "queued-1",
+        agentId: routeAgentId,
+        agentName: "Ally",
+        status: "queued",
+        errorCode: null,
+        contextSnapshot,
+        createdAt: new Date("2026-07-25T11:10:00.000Z"),
+        startedAt: null,
+        finishedAt: null,
+      },
+    ]);
+    const app = await createApp(db);
+
+    const res = await request(app).get("/api/companies/company-1/pr-review-queue");
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.agents[0].oldestQueuedAt).toBe("2026-07-25T11:10:00.000Z");
+    expect(res.body.agents[0].oldestQueuedAgeMs).toBe(3_000_000);
     vi.useRealTimers();
   });
 

@@ -2,8 +2,10 @@
 
 import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { useEffect, useState } from "react";
+import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { queryKeys } from "@/lib/queryKeys";
 import { ReviewQueueCard } from "./ReviewQueueCard";
 
 const listActionRequestsMock = vi.hoisted(() => vi.fn());
@@ -81,7 +83,11 @@ function pendingRequest() {
 async function flushReact() {
   await act(async () => {
     await Promise.resolve();
-    await new Promise((resolve) => window.setTimeout(resolve, 0));
+    if (vi.isFakeTimers()) {
+      await vi.advanceTimersByTimeAsync(0);
+    } else {
+      await new Promise((resolve) => window.setTimeout(resolve, 0));
+    }
   });
 }
 
@@ -89,6 +95,44 @@ function buttonContaining(text: string): HTMLButtonElement | undefined {
   return Array.from(document.body.querySelectorAll("button")).find(
     (button) => button.textContent?.includes(text),
   ) as HTMLButtonElement | undefined;
+}
+
+function ActiveEmptyReviewCountObserver() {
+  const [showReview, setShowReview] = useState(false);
+  const query = useQuery({
+    queryKey: queryKeys.tools.actionRequests("company-1", "pending"),
+    queryFn: () => listActionRequestsMock("company-1", "pending"),
+    staleTime: 30_000,
+  });
+
+  useEffect(() => {
+    if (query.isSuccess) setShowReview(true);
+  }, [query.isSuccess]);
+
+  return showReview ? <ReviewQueueCard emptyState="reassure" /> : null;
+}
+
+function ActiveInFlightReviewCountObserver() {
+  const [showReview, setShowReview] = useState(false);
+  const query = useQuery({
+    queryKey: queryKeys.tools.actionRequests("company-1", "pending"),
+    queryFn: () => listActionRequestsMock("company-1", "pending"),
+    staleTime: 30_000,
+  });
+
+  useEffect(() => {
+    if (query.fetchStatus === "fetching") setShowReview(true);
+  }, [query.fetchStatus]);
+
+  return showReview ? <ReviewQueueCard emptyState="reassure" /> : null;
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
 }
 
 describe("ReviewQueueCard", () => {
@@ -105,18 +149,21 @@ describe("ReviewQueueCard", () => {
 
   afterEach(() => {
     act(() => root?.unmount());
+    vi.useRealTimers();
     container.remove();
     document.body.innerHTML = "";
     vi.clearAllMocks();
   });
 
-  async function render() {
-    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  async function render(
+    client = new QueryClient({ defaultOptions: { queries: { retry: false } } }),
+    connectionId?: string,
+  ) {
     root = createRoot(container);
     await act(async () => {
       root.render(
         <QueryClientProvider client={client}>
-          <ReviewQueueCard emptyState="reassure" />
+          <ReviewQueueCard emptyState="reassure" connectionId={connectionId} />
         </QueryClientProvider>,
       );
     });
@@ -149,5 +196,176 @@ describe("ReviewQueueCard", () => {
       { approvalThreshold: 1 },
     );
     expect(pushToastMock).toHaveBeenCalledWith(expect.objectContaining({ title: "Always allowed" }));
+  });
+
+  it("refetches on mount when a cached empty pending queue is still fresh", async () => {
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 30_000 } },
+    });
+    client.setQueryData(queryKeys.tools.actionRequests("company-1", "pending"), {
+      actionRequests: [],
+    });
+
+    await render(client);
+    await flushReact();
+
+    expect(listActionRequestsMock).toHaveBeenCalledWith("company-1", "pending");
+    expect(buttonContaining("Allow once")).toBeTruthy();
+  });
+
+  it("refetches on mount when another active observer has fresh empty pending data", async () => {
+    listActionRequestsMock
+      .mockResolvedValueOnce({ actionRequests: [] })
+      .mockResolvedValue({ actionRequests: [pendingRequest()] });
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 30_000 } },
+    });
+
+    root = createRoot(container);
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={client}>
+          <ActiveEmptyReviewCountObserver />
+        </QueryClientProvider>,
+      );
+    });
+
+    await vi.waitFor(() => {
+      expect(listActionRequestsMock).toHaveBeenCalledTimes(2);
+      expect(buttonContaining("Allow once")).toBeTruthy();
+    });
+  });
+
+  it("waits for an in-flight shared fetch before spending the mount refetch", async () => {
+    const firstFetch = deferred<{ actionRequests: ReturnType<typeof pendingRequest>[] }>();
+    listActionRequestsMock
+      .mockImplementationOnce(() => firstFetch.promise)
+      .mockResolvedValue({ actionRequests: [pendingRequest()] });
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 30_000 } },
+    });
+
+    root = createRoot(container);
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={client}>
+          <ActiveInFlightReviewCountObserver />
+        </QueryClientProvider>,
+      );
+    });
+
+    await vi.waitFor(() => {
+      expect(listActionRequestsMock).toHaveBeenCalledTimes(1);
+    });
+
+    await act(async () => {
+      firstFetch.resolve({ actionRequests: [] });
+      await firstFetch.promise;
+    });
+
+    await vi.waitFor(() => {
+      expect(listActionRequestsMock).toHaveBeenCalledTimes(2);
+      expect(buttonContaining("Allow once")).toBeTruthy();
+    });
+  });
+
+  it("keeps refreshing an empty mounted queue so externally-created pending requests appear", async () => {
+    vi.useFakeTimers();
+    let pendingCreated = false;
+    listActionRequestsMock.mockImplementation(async () => ({
+      actionRequests: pendingCreated ? [pendingRequest()] : [],
+    }));
+
+    await render();
+
+    expect(listActionRequestsMock).toHaveBeenCalledTimes(2);
+    expect(document.body.textContent).toContain("Nothing is waiting for your OK right now.");
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    await flushReact();
+    expect(listActionRequestsMock).toHaveBeenCalledTimes(3);
+    expect(document.body.textContent).toContain("Nothing is waiting for your OK right now.");
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    await flushReact();
+    expect(listActionRequestsMock).toHaveBeenCalledTimes(4);
+    expect(document.body.textContent).toContain("Nothing is waiting for your OK right now.");
+
+    pendingCreated = true;
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    await flushReact();
+    expect(listActionRequestsMock).toHaveBeenCalledTimes(5);
+    await vi.waitFor(() => expect(buttonContaining("Allow once")).toBeTruthy(), {
+      timeout: 500,
+      interval: 10,
+    });
+    expect(listActionRequestsMock).toHaveBeenCalledTimes(5);
+  });
+
+  it("does not enter the fast empty-queue polling loop after request failures", async () => {
+    vi.useFakeTimers();
+    listActionRequestsMock.mockRejectedValue(new Error("action request API down"));
+
+    await render();
+
+    expect(listActionRequestsMock).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    await flushReact();
+    expect(listActionRequestsMock).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(18_000);
+    });
+    await flushReact();
+    expect(listActionRequestsMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps refreshing an empty connection-scoped queue when other connections have requests", async () => {
+    vi.useFakeTimers();
+    let scopedPendingCreated = false;
+    const unrelatedRequest = {
+      ...pendingRequest(),
+      request: {
+        ...pendingRequest().request,
+        id: "request-other",
+      },
+      connectionId: "connection-other",
+    };
+    listActionRequestsMock.mockImplementation(async () => ({
+      actionRequests: scopedPendingCreated ? [unrelatedRequest, pendingRequest()] : [unrelatedRequest],
+    }));
+
+    await render(undefined, "connection-1");
+
+    expect(listActionRequestsMock).toHaveBeenCalledTimes(2);
+    expect(document.body.textContent).toContain("Nothing is waiting for your OK right now.");
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    await flushReact();
+    expect(listActionRequestsMock).toHaveBeenCalledTimes(3);
+
+    scopedPendingCreated = true;
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    await flushReact();
+    expect(listActionRequestsMock).toHaveBeenCalledTimes(4);
+    await vi.waitFor(() => expect(buttonContaining("Allow once")).toBeTruthy(), {
+      timeout: 500,
+      interval: 10,
+    });
   });
 });

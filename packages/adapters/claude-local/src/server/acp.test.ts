@@ -373,16 +373,24 @@ describe("claude_local ACP lane", () => {
     await fs.mkdir(path.dirname(commandPath), { recursive: true });
     await fs.writeFile(commandPath, "#!/usr/bin/env sh\n", "utf8");
     setNodeVersion("v22.12.0");
+    const previousApiKey = process.env.ANTHROPIC_API_KEY;
+    delete process.env.ANTHROPIC_API_KEY;
 
-    const result = await testClaudeAcpEnvironment({
-      adapterType: "claude_local",
-      companyId: "company-1",
-      config: {
-        engine: "acp",
-        cwd: root,
-        agentCommand: commandPath,
-      },
-    });
+    let result;
+    try {
+      result = await testClaudeAcpEnvironment({
+        adapterType: "claude_local",
+        companyId: "company-1",
+        config: {
+          engine: "acp",
+          cwd: root,
+          agentCommand: commandPath,
+        },
+      });
+    } finally {
+      if (previousApiKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = previousApiKey;
+    }
 
     expect(result.status).toBe("pass");
     expect(result.checks).toContainEqual(

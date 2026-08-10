@@ -4,6 +4,10 @@ description: Self-hosted Paperclip AI — company orchestration platform with a 
 type: application
 version: 0.1.0
 appVersion: "v2026.416.0"
+# The api Deployment's topologySpreadConstraints (BLO-20901) uses minDomains
+# (GA in 1.30) and matchLabelKeys (beta, default-enabled since 1.27). 1.30 is
+# the binding floor between the two.
+kubeVersion: ">=1.30.0-0"
 keywords:
   - paperclip
   - ai

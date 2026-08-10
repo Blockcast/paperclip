@@ -139,7 +139,9 @@ describe("FileViewerSheet copy actions", () => {
     await click("Copy file contents");
 
     expect(writeText).toHaveBeenCalledWith("hello from the file");
-    expect(document.body.textContent).toContain("Copied contents");
+    await vi.waitFor(() => {
+      expect(document.body.textContent).toContain("Copied contents");
+    });
   });
 
   it("copies the current file view link and shows confirmation", async () => {
@@ -148,7 +150,9 @@ describe("FileViewerSheet copy actions", () => {
     await click("Copy link to this file view");
 
     expect(writeText).toHaveBeenCalledWith(window.location.href);
-    expect(document.body.textContent).toContain("Copied link");
+    await vi.waitFor(() => {
+      expect(document.body.textContent).toContain("Copied link");
+    });
   });
 
   it("renders a keyboard-addressable file tree resize separator", () => {

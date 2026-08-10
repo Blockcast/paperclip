@@ -137,6 +137,98 @@ describeEmbeddedPostgres("external runtime reservations", () => {
     expect(runs.filter((run) => run.status === "queued")).toHaveLength(1);
   });
 
+  it("does not claim a PR review task already running on another reviewer", async () => {
+    const [followUpRunId] = await seedQueuedRuns(1);
+    const ownerAgentId = randomUUID();
+    const taskKey = "pr_review:Blockcast/paperclip:1014";
+    const now = new Date("2026-08-04T12:00:00.000Z");
+
+    await db.insert(agents).values({
+      id: ownerAgentId,
+      companyId,
+      name: "Existing Review Owner",
+      role: "engineer",
+      status: "running",
+      adapterType: "opencode_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({ contextSnapshot: { taskKey, reviewKind: "pr_review" } })
+      .where(eq(heartbeatRuns.id, followUpRunId));
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId: ownerAgentId,
+      status: "running",
+      contextSnapshot: { taskKey, reviewKind: "pr_review" },
+      startedAt: now,
+    });
+
+    const claim = await claimRunWithExternalRuntimeSlotPool(db, followUpRunId, now, 3, {
+      exclusivePrReviewTaskKey: taskKey,
+    });
+
+    expect(claim).toBeNull();
+    expect(await db.select().from(externalRuntimeReservations)).toHaveLength(0);
+    const followUp = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, followUpRunId))
+      .then((rows) => rows[0] ?? null);
+    expect(followUp?.status).toBe("queued");
+  });
+
+  it("atomically serializes concurrent PR review claims across reviewers", async () => {
+    const [firstRunId, secondRunId] = await seedQueuedRuns(2);
+    const secondReviewerId = randomUUID();
+    const taskKey = "pr_review:Blockcast/paperclip:1015";
+    const now = new Date("2026-08-04T12:05:00.000Z");
+
+    await db.insert(agents).values({
+      id: secondReviewerId,
+      companyId,
+      name: "Second Review Claimant",
+      role: "engineer",
+      status: "idle",
+      adapterType: "opencode_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({ contextSnapshot: { taskKey, reviewKind: "pr_review" } })
+      .where(eq(heartbeatRuns.id, firstRunId));
+    await db
+      .update(heartbeatRuns)
+      .set({
+        agentId: secondReviewerId,
+        contextSnapshot: { taskKey, reviewKind: "pr_review" },
+      })
+      .where(eq(heartbeatRuns.id, secondRunId));
+
+    const claims = await Promise.all([
+      claimRunWithExternalRuntimeSlotPool(db, firstRunId, now, 2, {
+        exclusivePrReviewTaskKey: taskKey,
+      }),
+      claimRunWithExternalRuntimeSlotPool(db, secondRunId, now, 2, {
+        exclusivePrReviewTaskKey: taskKey,
+      }),
+    ]);
+
+    expect(claims.filter(Boolean)).toHaveLength(1);
+    const runs = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(inArray(heartbeatRuns.id, [firstRunId, secondRunId]));
+    expect(runs.filter((run) => run.status === "running")).toHaveLength(1);
+    expect(runs.filter((run) => run.status === "queued")).toHaveLength(1);
+    expect(await db.select().from(externalRuntimeReservations)).toHaveLength(1);
+  });
+
   it("clears parked retry error metadata when an external runtime run is claimed", async () => {
     const [runId] = await seedQueuedRuns(1);
     const claimedAt = new Date("2026-07-14T12:30:00.000Z");

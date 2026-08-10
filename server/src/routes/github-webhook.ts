@@ -53,7 +53,10 @@ import {
   githubPostIssueComment,
 } from "../services/github-app-auth.js";
 import { recoveryService } from "../services/recovery/service.js";
-import { recordGithubReviewRequestDelivery } from "../services/metrics.js";
+import {
+  recordGithubReviewRequestDelivery,
+  recordGithubWorkflowRunConclusion,
+} from "../services/metrics.js";
 import {
   recordMergedPullRequest,
   enrichAuthoredLocForRow,
@@ -399,6 +402,76 @@ function githubPrUrl(repoFullName: string | null, prNumber: number | null, expli
   if (!repoFullName || prNumber === null) return null;
   return `https://github.com/${repoFullName}/pull/${prNumber}`;
 }
+
+// BLO-21078 AC3: a `cancelled` workflow_run conclusion is not, by itself,
+// evidence of an infrastructure kill -- this repo's `pr.yml` sets
+// `concurrency.cancel-in-progress: true`, so a routine force-push produces
+// the exact same conclusion (and, per the issue's own investigation, the
+// exact same "every lane dies at one instant" shape). The mass-cancellation
+// alert can only be trustworthy if it excludes that benign case, and doing
+// so needs no GitHub API call: every workflow_run delivery (not just
+// `completed`) carries `head_branch` and the run's own `created_at`, so we
+// can track "the newest run id seen for this branch" purely from the
+// sequence of webhook deliveries already arriving, then ask -- at the
+// moment an older run finishes `cancelled` -- whether a newer run for the
+// same branch already existed by then. If so, GitHub's own
+// `cancel-in-progress` explains the cancellation and it is not incident
+// signal.
+const MAX_TRACKED_WORKFLOW_RUN_BRANCHES = 500;
+const recentWorkflowRunsByBranch = new Map<string, { runId: number; createdAt: number }>();
+
+function workflowRunBranchKey(repoFullName: string, headBranch: string): string {
+  return `${repoFullName}#${headBranch}`;
+}
+
+function recordWorkflowRunSighting(
+  repoFullName: string | null,
+  headBranch: string | null,
+  runId: number | null,
+  createdAt: number,
+): void {
+  if (!repoFullName || !headBranch || runId === null || !Number.isFinite(createdAt)) return;
+  const key = workflowRunBranchKey(repoFullName, headBranch);
+  const existing = recentWorkflowRunsByBranch.get(key);
+  // Guards against both a genuinely older re-delivery and this same run's
+  // own later webhooks (its `requested`/`in_progress`/`completed` actions
+  // share one `created_at`, so a strict `>` never lets a run evict a
+  // strictly newer sibling that already superseded it).
+  if (existing && existing.createdAt >= createdAt) return;
+  // Delete-then-set so the key moves to the end for LRU-style eviction below.
+  recentWorkflowRunsByBranch.delete(key);
+  recentWorkflowRunsByBranch.set(key, { runId, createdAt });
+  while (recentWorkflowRunsByBranch.size > MAX_TRACKED_WORKFLOW_RUN_BRANCHES) {
+    const oldestKey = recentWorkflowRunsByBranch.keys().next().value;
+    if (oldestKey === undefined) break;
+    recentWorkflowRunsByBranch.delete(oldestKey);
+  }
+}
+
+/**
+ * Whether a `cancelled` conclusion for (repoFullName, headBranch, runId) is
+ * explained by a newer run on the same branch that already existed by the
+ * time this one finished (`updatedAt`) -- i.e. ordinary `cancel-in-progress`
+ * supersession rather than an unexplained kill.
+ */
+function classifyWorkflowRunSupersession(
+  repoFullName: string | null,
+  headBranch: string | null,
+  runId: number | null,
+  updatedAt: number,
+): "superseded" | "none" {
+  if (!repoFullName || !headBranch || runId === null || !Number.isFinite(updatedAt)) return "none";
+  const latest = recentWorkflowRunsByBranch.get(workflowRunBranchKey(repoFullName, headBranch));
+  if (!latest || latest.runId === runId) return "none";
+  return latest.createdAt <= updatedAt ? "superseded" : "none";
+}
+
+export function __resetWorkflowRunSupersessionTrackingForTest(): void {
+  recentWorkflowRunsByBranch.clear();
+}
+
+export const __test_recordWorkflowRunSighting = recordWorkflowRunSighting;
+export const __test_classifyWorkflowRunSupersession = classifyWorkflowRunSupersession;
 
 // PR→issue back-link (BLO-13353, #973 symptom-1). A hidden marker makes the
 // one-time post idempotent across redeliveries/reopens: if any existing PR
@@ -1176,37 +1249,58 @@ async function recordDependabotTerminalReceipt(
   }
 
   const externalKey = `${input.originId}:${input.alert.action}:${input.deliveryId ?? "no-delivery"}`;
-  const existingReceipt = await db
+  // BLO-19037: this used to be a read-then-insert (SELECT for an existing
+  // receipt, then INSERT if none was found) which is a check-then-write race
+  // across paperclip-api's replicas -- two concurrent deliveries of the same
+  // event can both observe "no existing receipt" before either writes.
+  // idempotencyKey rides the already-deployed partial unique index
+  // (issue_comments_issue_system_idempotency_idx on issueId+idempotencyKey,
+  // scoped to system comments) so the insert is a single atomic upsert:
+  // ON CONFLICT DO NOTHING makes the external key authoritative in the
+  // database rather than in application logic, independent of replica count.
+  //
+  // BLO-19037 review follow-up: the migration that introduced
+  // idempotency_key left historical receipt comments nullable. Those rows
+  // still carry metadata.externalKey, so preserve one metadata-key lookup
+  // before the atomic insert or the first replay after deploy creates a
+  // duplicate that the partial unique index cannot see.
+  const legacyReceipt = await db
     .select({ id: issueComments.id })
     .from(issueComments)
-    .where(
-      and(
-        eq(issueComments.issueId, issue.id),
-        sql`${issueComments.metadata}->>'kind' = 'github_dependabot_terminal_receipt'`,
-        sql`${issueComments.metadata}->>'externalKey' = ${externalKey}`,
-      ),
-    )
+    .where(and(
+      eq(issueComments.companyId, input.companyId),
+      eq(issueComments.issueId, issue.id),
+      eq(issueComments.authorType, "system"),
+      isNull(issueComments.idempotencyKey),
+      isNull(issueComments.deletedAt),
+      sql`${issueComments.metadata}->>'kind' = 'github_dependabot_terminal_receipt'`,
+      sql`${issueComments.metadata}->>'externalKey' = ${externalKey}`,
+    ))
     .limit(1)
     .then((rows) => rows[0] ?? null);
 
-  if (!existingReceipt) {
-    await db.insert(issueComments).values({
-      companyId: input.companyId,
-      issueId: issue.id,
-      authorType: "system",
-      body: receiptBody,
-      metadata: {
-        kind: "github_dependabot_terminal_receipt",
-        source: "github",
-        externalKey,
-        repoFullName: input.repoFullName,
-        alertNumber: input.alert.alertNumber,
-        action: input.alert.action,
-        deliveryId: input.deliveryId,
-        dismissalReason: input.alert.dismissalReason,
-        dismissalComment: input.alert.dismissalComment,
-      } as never,
-    });
+  if (!legacyReceipt) {
+    await db
+      .insert(issueComments)
+      .values({
+        companyId: input.companyId,
+        issueId: issue.id,
+        authorType: "system",
+        idempotencyKey: externalKey,
+        body: receiptBody,
+        metadata: {
+          kind: "github_dependabot_terminal_receipt",
+          source: "github",
+          externalKey,
+          repoFullName: input.repoFullName,
+          alertNumber: input.alert.alertNumber,
+          action: input.alert.action,
+          deliveryId: input.deliveryId,
+          dismissalReason: input.alert.dismissalReason,
+          dismissalComment: input.alert.dismissalComment,
+        } as never,
+      })
+      .onConflictDoNothing();
   }
 
   if (hasCompleteTerminalEvidence && issue.status !== "done") {
@@ -1922,6 +2016,40 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
         );
       },
     });
+
+    // BLO-21078: fleet-wide visibility into workflow_run conclusions, so a
+    // mass-cancellation wave (GitHub cancelling live runners mid-job across
+    // unrelated PRs, as opposed to an ordinary per-PR `failure`) is a metric
+    // instead of something only noticed by an author reading job conclusions.
+    if (eventName === "workflow_run") {
+      const workflowRun = payload.workflow_run as Record<string, unknown> | undefined;
+      const repository = payload.repository as Record<string, unknown> | undefined;
+      const repoFullName = readStringField(repository, "full_name");
+      const headBranch = readStringField(workflowRun, "head_branch");
+      const runIdValue = workflowRun?.id;
+      const runId = typeof runIdValue === "number" ? runIdValue : null;
+      const createdAt = Date.parse(readStringField(workflowRun, "created_at") ?? "");
+      // Feed the supersession tracker off every action (requested/in_progress/
+      // completed), not just `completed` — a superseding run's existence has
+      // to be observed before the superseded run's own `completed` delivery
+      // arrives, and that superseding run is very often still mid-flight (not
+      // yet completed) at that moment.
+      recordWorkflowRunSighting(repoFullName, headBranch, runId, createdAt);
+
+      // `context` is only non-null here for a *completed* workflow_run (see
+      // the `action !== "completed"` guard in resolveEventContext's
+      // workflow_run case) — exactly the terminal event this counter wants
+      // once per run.
+      if (context) {
+        const conclusion = readStringField(workflowRun, "conclusion");
+        const updatedAt = Date.parse(readStringField(workflowRun, "updated_at") ?? "");
+        const supersession =
+          conclusion === "cancelled"
+            ? classifyWorkflowRunSupersession(repoFullName, headBranch, runId, updatedAt)
+            : "none";
+        recordGithubWorkflowRunConclusion(conclusion, supersession);
+      }
+    }
 
     // A closed or newly-drafted PR cannot produce useful reviewer work. Retire
     // every queued or scheduled-retry run for its stable task scope so it does
@@ -2710,6 +2838,17 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
               ? { githubPrReviewAuthorLogin: reviewAuthorLogin }
               : {}),
             ...(actionableReviewFeedback ? { githubReviewFeedbackActionable: true } : {}),
+            // BLO-19522: carry the request comment onto the AUTHOR wake too,
+            // not just the reviewer wake. The review-request directive says
+            // who asked and shows the ask, which is the difference between
+            // "a review was requested" (true, actionable by nobody) and the
+            // feedback directive this path used to borrow.
+            ...(context.wakeReason === "github_pr_review_requested" && context.commentBody
+              ? { githubPrReviewRequestBody: context.commentBody }
+              : {}),
+            ...(context.wakeReason === "github_pr_review_requested" && context.commentAuthorLogin
+              ? { githubPrReviewRequestAuthorLogin: context.commentAuthorLogin }
+              : {}),
           },
           // Coalesce rapid bursts on the same PR/event so a single review
           // submission can't fan into N author runs. Parallel to the

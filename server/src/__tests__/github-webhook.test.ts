@@ -19,7 +19,7 @@ import {
   issueRecoveryActions,
   issues,
 } from "@paperclipai/db";
-import { and, eq, inArray, sql } from "drizzle-orm";
+import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 import {
   __test_backLinkAbsoluteUrl,
   __test_buildDependabotAlertIssueBody,
@@ -27,6 +27,7 @@ import {
   __test_buildPrReviewerTaskKey,
   __test_buildPrReviewerWakeIdempotencyKey,
   __test_buildPrReviewFeedbackComment,
+  __test_classifyWorkflowRunSupersession,
   __test_commentsContainBackLinkMarker,
   __test_extractPaperclipIdentifiers,
   __test_hasActionablePrReviewFeedback,
@@ -38,10 +39,12 @@ import {
   __test_hasAllyConsolidatedReviewHeader,
   __test_idempotentWakeStatuses,
   __test_prReviewerWakeIdempotencyScope,
+  __test_recordWorkflowRunSighting,
   __test_resolveDependabotAlertContext,
   __test_resolveEventContext,
   __test_shouldFirePrReviewerWake,
   __test_verifyGithubSignature,
+  __resetWorkflowRunSupersessionTrackingForTest,
   githubWebhookRoutes,
   type GithubWebhookConfig,
 } from "../routes/github-webhook.js";
@@ -1156,6 +1159,99 @@ describe("github-webhook pure helpers", () => {
   it("returns null for dependabot payloads without a numeric alert number", () => {
     expect(__test_resolveDependabotAlertContext({ action: "created", alert: {} })).toBeNull();
     expect(__test_resolveDependabotAlertContext({ action: "created" })).toBeNull();
+  });
+});
+
+describe("workflow_run supersession classification (BLO-21078 AC3)", () => {
+  beforeEach(() => {
+    __resetWorkflowRunSupersessionTrackingForTest();
+  });
+
+  it("classifies none when no other run has been sighted on the branch", () => {
+    expect(
+      __test_classifyWorkflowRunSupersession("Blockcast/paperclip", "blo-1-x", 100, Date.parse("2026-08-02T19:34:01Z")),
+    ).toBe("none");
+  });
+
+  it("classifies none for the run's own sighting (same runId is not a supersession)", () => {
+    const createdAt = Date.parse("2026-08-02T19:31:32Z");
+    __test_recordWorkflowRunSighting("Blockcast/paperclip", "cto/blo-18278-capacity-reset", 930, createdAt);
+    expect(
+      __test_classifyWorkflowRunSupersession(
+        "Blockcast/paperclip",
+        "cto/blo-18278-capacity-reset",
+        930,
+        Date.parse("2026-08-02T19:34:01Z"),
+      ),
+    ).toBe("none");
+  });
+
+  it("classifies superseded when a newer run on the same branch already existed by the time this one ended", () => {
+    // Mirrors the benign shape from BLO-21078's own investigation: run
+    // 30796167940 on staff/blo-20742-ally-concurrency-v2, created 08:07:35Z,
+    // cancelled 08:22:15Z after a newer push created a run at 08:21:26Z.
+    __test_recordWorkflowRunSighting(
+      "Blockcast/paperclip",
+      "staff/blo-20742-ally-concurrency-v2",
+      30796167940,
+      Date.parse("2026-08-03T08:07:35Z"),
+    );
+    __test_recordWorkflowRunSighting(
+      "Blockcast/paperclip",
+      "staff/blo-20742-ally-concurrency-v2",
+      30796200001,
+      Date.parse("2026-08-03T08:21:26Z"),
+    );
+    expect(
+      __test_classifyWorkflowRunSupersession(
+        "Blockcast/paperclip",
+        "staff/blo-20742-ally-concurrency-v2",
+        30796167940,
+        Date.parse("2026-08-03T08:22:15Z"),
+      ),
+    ).toBe("superseded");
+  });
+
+  it("classifies none when the only newer sighting arrived after this run already ended", () => {
+    // The genuine-kill shape: nothing newer existed yet when this run died.
+    __test_recordWorkflowRunSighting("Blockcast/paperclip", "blo-20613-claude-oom-signal", 1, Date.parse("2026-08-02T19:13:27Z"));
+    expect(
+      __test_classifyWorkflowRunSupersession(
+        "Blockcast/paperclip",
+        "blo-20613-claude-oom-signal",
+        1,
+        Date.parse("2026-08-02T19:34:01Z"),
+      ),
+    ).toBe("none");
+    // A later push on the same branch, sighted only after the cancellation
+    // instant, must not retroactively mark the earlier kill as superseded.
+    __test_recordWorkflowRunSighting("Blockcast/paperclip", "blo-20613-claude-oom-signal", 2, Date.parse("2026-08-02T20:00:00Z"));
+    expect(
+      __test_classifyWorkflowRunSupersession(
+        "Blockcast/paperclip",
+        "blo-20613-claude-oom-signal",
+        1,
+        Date.parse("2026-08-02T19:34:01Z"),
+      ),
+    ).toBe("none");
+  });
+
+  it("keeps branches independent -- a supersession on one branch never leaks onto another", () => {
+    __test_recordWorkflowRunSighting("Blockcast/paperclip", "branch-a", 1, Date.parse("2026-08-02T19:00:00Z"));
+    __test_recordWorkflowRunSighting("Blockcast/paperclip", "branch-a", 2, Date.parse("2026-08-02T19:05:00Z"));
+    __test_recordWorkflowRunSighting("Blockcast/paperclip", "branch-b", 3, Date.parse("2026-08-02T19:00:00Z"));
+    expect(
+      __test_classifyWorkflowRunSupersession("Blockcast/paperclip", "branch-b", 3, Date.parse("2026-08-02T19:10:00Z")),
+    ).toBe("none");
+  });
+
+  it("ignores an out-of-order (older) sighting so it cannot regress an already-newer record", () => {
+    __test_recordWorkflowRunSighting("Blockcast/paperclip", "branch-c", 2, Date.parse("2026-08-02T19:10:00Z"));
+    // A late/duplicate delivery for an older run must not evict the newer one.
+    __test_recordWorkflowRunSighting("Blockcast/paperclip", "branch-c", 1, Date.parse("2026-08-02T19:05:00Z"));
+    expect(
+      __test_classifyWorkflowRunSupersession("Blockcast/paperclip", "branch-c", 1, Date.parse("2026-08-02T19:11:00Z")),
+    ).toBe("superseded");
   });
 });
 
@@ -4007,6 +4103,117 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(receipts[0]!.body).toContain("Action: `fixed`");
     expect(receipts[0]!.body).toContain("GitHub delivery: `delivery-fixed`");
     expect(receipts[0]!.body).toContain("no Dependabot REST or GraphQL query was used");
+  });
+
+  it("dedupes terminal delivery replays against legacy metadata-key receipts", async () => {
+    const { agentId } = await seedCompanyAndAgent({ agentName: "Release Engineer" });
+    const app = buildApp({ dependabotAgentId: agentId });
+
+    await postDependabot(app, dependabotPayload("critical", "created"), "delivery-created");
+
+    const [issue] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.originId, "github-dependabot:Blockcast/paperclip#58"));
+    expect(issue?.status).toBe("todo");
+
+    const externalKey = "github-dependabot:Blockcast/paperclip#58:fixed:delivery-fixed";
+    await db.insert(issueComments).values({
+      companyId: issue!.companyId,
+      issueId: issue!.id,
+      authorType: "system",
+      idempotencyKey: null,
+      body: "legacy terminal receipt",
+      metadata: {
+        kind: "github_dependabot_terminal_receipt",
+        source: "github",
+        externalKey,
+        repoFullName: "Blockcast/paperclip",
+        alertNumber: 58,
+        action: "fixed",
+        deliveryId: "delivery-fixed",
+      } as never,
+    });
+
+    const terminal = await postDependabot(app, dependabotPayload("critical", "fixed"), "delivery-fixed");
+    expect(terminal.status).toBe(200);
+
+    const [closedIssue] = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, issue!.id));
+    expect(closedIssue?.status).toBe("done");
+
+    const receipts = await db
+      .select({
+        body: issueComments.body,
+        idempotencyKey: issueComments.idempotencyKey,
+      })
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.issueId, issue!.id),
+          isNull(issueComments.deletedAt),
+          sql`${issueComments.metadata}->>'kind' = 'github_dependabot_terminal_receipt'`,
+        ),
+      );
+    expect(receipts).toEqual([
+      {
+        body: "legacy terminal receipt",
+        idempotencyKey: null,
+      },
+    ]);
+  });
+
+  // BLO-19037: the receipt dedup guard was a read-then-insert -- two
+  // concurrent deliveries of the same event both observe "no existing
+  // receipt" before either writes, so both write. A *sequential* replay (the
+  // "records a terminal webhook receipt" test above, and the orphan-issue
+  // test below) does not exercise that window: each request's INSERT
+  // completes and commits before the next request runs its SELECT. Firing
+  // both requests through `Promise.all` interleaves them at the same await
+  // boundaries a second paperclip-api replica would race across.
+  it("dedupes concurrent replays of the same terminal delivery to a single receipt comment", async () => {
+    const { agentId } = await seedCompanyAndAgent({ agentName: "Release Engineer" });
+    const app = buildApp({ dependabotAgentId: agentId });
+
+    await postDependabot(app, dependabotPayload("critical", "created"), "delivery-created");
+
+    // Warm the connection pool to >=2 physical connections before racing.
+    // Every prior test in this suite runs its queries sequentially, so by
+    // this point the pool has settled on exactly one warm connection; firing
+    // only two concurrent requests here would let the first reuse that warm
+    // connection while the second cold-establishes a brand new one (tens of
+    // ms on embedded Postgres), which is slow enough that the first request
+    // always finishes before the second even starts its query -- masking the
+    // race instead of exercising it.
+    await Promise.all(Array.from({ length: 4 }, () => db.execute(sql`select 1`)));
+
+    const terminalPayload = dependabotPayload("critical", "fixed");
+    const [first, second] = await Promise.all([
+      postDependabot(app, terminalPayload, "delivery-fixed-concurrent"),
+      postDependabot(app, terminalPayload, "delivery-fixed-concurrent"),
+    ]);
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+
+    const [issue] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.originId, "github-dependabot:Blockcast/paperclip#58"));
+    expect(issue?.status).toBe("done");
+
+    const receipts = await db
+      .select()
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.issueId, issue!.id),
+          sql`${issueComments.metadata}->>'kind' = 'github_dependabot_terminal_receipt'`,
+        ),
+      );
+    expect(receipts).toHaveLength(1);
+    expect(receipts[0]!.body).toContain("GitHub delivery: `delivery-fixed-concurrent`");
   });
 
   it("records dismissal evidence before closing a Dependabot alert issue", async () => {

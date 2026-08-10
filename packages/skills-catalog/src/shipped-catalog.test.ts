@@ -68,6 +68,8 @@ const AUTHORING_COMMAND_PATTERNS = [
  * token file is the only selector that works — but `GH_TOKEN`, `--with-token`
  * and `gh auth` recipes are rejected too: they silently do *nothing* in these
  * pods, so documenting one next to an authoring command is a bug either way.
+ * The cluster SSH key (BLO-21854) is a third swap path: it authenticates to
+ * GitHub as a human account outside the App installation entirely.
  */
 const CREDENTIAL_SELECTOR_PATTERNS = [
   { name: "token-file selection", pattern: /PAPERCLIP_GITHUB_TOKEN_FILE\s*=/ },
@@ -76,6 +78,7 @@ const CREDENTIAL_SELECTOR_PATTERNS = [
   { name: "GITHUB_TOKEN assignment", pattern: /\bGITHUB_TOKEN\s*=/ },
   { name: "gh auth --with-token", pattern: /--with-token\b/ },
   { name: "gh auth login/switch", pattern: /\bgh\s+auth\s+(?:login|switch)\b/ },
+  { name: "literal cluster SSH key path", pattern: /\/paperclip\/\.ssh\/id_ed25519/ },
 ];
 
 /**
@@ -89,8 +92,9 @@ printf '%s\\n' "$*" >> "$GH_LOG"
 case "$1 $2" in
   "api user")
     if [ "$GH_SCENARIO" = "seat-identity" ]; then echo '{"login":"allyblockcast"}'; exit 0; fi
+    if [ "$GH_SCENARIO" = "app-identity" ]; then echo '{"message":"Resource not accessible by integration","status":"403"}' >&2; exit 1; fi
     if [ "$GH_SCENARIO" = "gh-broken" ]; then echo "dial tcp: lookup api.github.com" >&2; exit 1; fi
-    echo '{"message":"Resource not accessible by integration","status":"403"}' >&2; exit 1 ;;
+    echo '{"login":"kkroo"}' ;;
   "pr view")
     if [ "$3" = "7" ]; then
       [ "$GH_SCENARIO" = "view-fails" ] && { echo "gh: HTTP 500" >&2; exit 1; }
@@ -107,10 +111,11 @@ case "$1 $2" in
       echo '{"headRefName":"feat","baseRefName":"main","headRefOid":"'"$ORIG"'","title":"T","body":"B"}'; exit 0
     fi
     case "$GH_SCENARIO" in
+      app-author)  echo '{"headRefOid":"'"$ORIG"'","baseRefName":"main","author":{"login":"app/allyblockcast"}}' ;;
       seat-author) echo '{"headRefOid":"'"$ORIG"'","baseRefName":"main","author":{"login":"allyblockcast"}}' ;;
-      wrong-base)  echo '{"headRefOid":"'"$ORIG"'","baseRefName":"release","author":{"login":"app/allyblockcast"}}' ;;
-      moved-head)  echo '{"headRefOid":"'"$MOVED"'","baseRefName":"main","author":{"login":"app/allyblockcast"}}' ;;
-      *) echo '{"headRefOid":"'"$ORIG"'","baseRefName":"main","author":{"login":"app/allyblockcast"}}' ;;
+      wrong-base)  echo '{"headRefOid":"'"$ORIG"'","baseRefName":"release","author":{"login":"kkroo"}}' ;;
+      moved-head)  echo '{"headRefOid":"'"$MOVED"'","baseRefName":"main","author":{"login":"kkroo"}}' ;;
+      *) echo '{"headRefOid":"'"$ORIG"'","baseRefName":"main","author":{"login":"kkroo"}}' ;;
     esac ;;
   "api repos"*)
     [ "$GH_SCENARIO" = "ref-fails" ] && { echo "gh: HTTP 404" >&2; exit 1; }
@@ -182,7 +187,7 @@ function credentialViolations(markdown: string): { authoringBlocks: number; viol
   return { authoringBlocks: authoringBlocks.length, violations };
 }
 
-/** The destructive seat-authored-PR recovery, ready to run against a stub `gh`. */
+/** The destructive reviewer-identity PR recovery, ready to run against a stub `gh`. */
 function extractRecoveryRecipe(markdown: string): string | null {
   const recovery = fencedBlocks(markdown)
     .filter((block) => EXECUTABLE_FENCE_INFO.has(block.info))
@@ -399,16 +404,54 @@ describe("shipped skills catalog", () => {
     expect(remoteExecPattern.test(rampSkill)).toBe(false);
   });
 
-  it("authors PRs under the App token and never under the user seat", async () => {
+  it("keeps protected PR authoring separate from the reviewer identities", async () => {
     const content = await readFile(GITHUB_PR_WORKFLOW_SKILL, "utf8");
 
-    // The review bot's formal APPROVE comes from the `allyblockcast` user seat, so a
-    // seat-authored PR makes author == approver and can never clear `review/ally-complete`.
-    expect(content).toContain("Author and push under the default App token.");
+    // Protected PRs need the App/Bot review plus any singleton user evidence on the
+    // same head. Neither reviewer identity can also be the PR author.
+    expect(content).toContain("A protected PR that requires `review/ally-complete` must be authored by an");
+    expect(content).toContain("not by `app/allyblockcast[bot]` and not by the");
+    expect(content).toContain("For a non-App-authored PR, both evidence shapes must be current on the same head.");
+    expect(content).toContain("For an App-authored PR, there is no gate-authorizing App review path");
+    expect(content).toContain("A user-seat approval is team evidence, not a");
+    expect(content).toContain("substitute for the Bot/App review");
     expect(content).not.toContain("author your PR under it");
+    expect(content).not.toContain("If the review is clean and the PR is App-authored, submit the formal approval");
 
     // The seat is not a reviewing credential either.
     expect(content).toContain("Never submit a formal review under the user-seat token.");
+  });
+
+  it("documents stacked PR constraints and retargeting before merge queue", async () => {
+    const content = await readFile(GITHUB_PR_WORKFLOW_SKILL, "utf8");
+
+    expect(content).toContain("Use stacked PRs only when a follow-up change truly depends");
+    expect(content).toContain("reviewed as an incremental diff against that base branch");
+    expect(content).toContain("Stack: parent #<number>");
+    expect(content).toMatch(/change base to\s+<default-branch>, reconcile child commits, verify final diff, request fresh\s+review/);
+    expect(content).toContain("change the child PR's configured base to");
+    expect(content).toContain("reconcile the child commits for the parent's");
+    expect(content).toContain("Verify the final base and diff before continuing");
+    expect(content).toContain("request a fresh exact-head review");
+    expect(content).toContain("after that fresh review/approval and the required checks are current");
+    expect(content).toMatch(/Protected branch\s+rules not configured for this branch/);
+  });
+
+  it("names the cluster SSH key in the credential model and forbids any GitHub use (BLO-21854)", async () => {
+    const content = await readFile(GITHUB_PR_WORKFLOW_SKILL, "utf8");
+
+    // Scope the core assertions to the Cluster SSH key bullet itself, not the whole
+    // file — a test that only checks substrings survive anywhere would stay green
+    // even if the entry were removed or weakened and the strings persisted elsewhere.
+    const sshKeyEntry = /- \*\*Cluster SSH key\*\*[\s\S]*?See BLO-21854\./.exec(content)?.[0];
+    expect(sshKeyEntry, "Cluster SSH key credential entry not found").toBeTruthy();
+    expect(sshKeyEntry).toContain("/paperclip/.ssh/id_ed25519");
+    expect(sshKeyEntry).toContain("sfo12-public");
+    expect(sshKeyEntry).toContain("home-residential");
+    expect(sshKeyEntry).toContain("Never use this key for any GitHub operation");
+
+    // The authoring rule must extend the prohibition explicitly, not just imply it.
+    expect(content).toContain("never over the cluster SSH key either");
   });
 
   it("never selects a non-default credential in an authoring or review recipe", async () => {
@@ -442,24 +485,39 @@ describe("shipped skills catalog", () => {
     expect(gitPushResult.violations).not.toEqual([]);
   });
 
-  describe("seat-authored PR recovery", () => {
+  it("rejects an authoring recipe that points git at the cluster SSH key (BLO-21854)", () => {
+    // The scanner defended only against token-based selectors before this key was
+    // documented. A GIT_SSH_COMMAND aimed at the cluster key is the same class of
+    // bypass — it must also fail the scan, or a future edit could reintroduce
+    // exactly the credential swap BLO-21854 found as a recipe here.
+    const sshKeyPush = ["```sh", "GIT_SSH_COMMAND='ssh -i /paperclip/.ssh/id_ed25519' git push origin HEAD", "```"].join("\n");
+
+    const result = credentialViolations(sshKeyPush);
+    expect(result.authoringBlocks, "git push must register as an authoring command").toBe(1);
+    expect(result.violations).not.toEqual([]);
+  });
+
+  describe("shared reviewer identity PR recovery", () => {
     it("is present, SHA-preserving, and fails closed on its own reads", async () => {
       const content = await readFile(GITHUB_PR_WORKFLOW_SKILL, "utf8");
       const recipe = extractRecoveryRecipe(content);
-      expect(recipe, "expected a shell fence recovering a seat-authored PR").toBeTruthy();
+      expect(recipe, "expected a shell fence recovering a reviewer-identity-authored PR").toBeTruthy();
       // `set -e` is what makes an unanticipated failure reach the rollback trap
       // rather than falling through to the next destructive line.
       expect(recipe).toMatch(/set\s+-euo\s+pipefail/);
       expect(recipe).toMatch(/trap\s+rollback\s+EXIT/);
       expect(recipe).toMatch(/trap\s+'handle_signal INT'\s+INT/);
       expect(recipe).toMatch(/trap\s+'handle_signal TERM'\s+TERM/);
+      expect(recipe).toContain("not authenticated as an independent author");
+      expect(recipe).toContain("authored by reviewer identity");
     });
 
     // Every pre-close failure must abort with the review artifact still open.
     // These are the fail-open cases: a read that errors, or one that returns a
     // null field, leaves an empty SHA that compares equal to an empty remote SHA.
     it.each([
-      ["seat-identity", "a user-seat login instead of the App"],
+      ["app-identity", "the App installation instead of an independent author"],
+      ["seat-identity", "the user-seat login instead of an independent author"],
       ["gh-broken", "an identity probe that cannot reach GitHub"],
       ["view-fails", "a failed metadata read"],
       ["null-sha", "a null headRefOid"],
@@ -477,6 +535,7 @@ describe("shipped skills catalog", () => {
     it.each([
       ["create-fails", false],
       ["blank-url", false],
+      ["app-author", true],
       ["seat-author", true],
       ["wrong-base", true],
       ["moved-head", true],

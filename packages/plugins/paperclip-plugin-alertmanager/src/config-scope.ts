@@ -15,6 +15,7 @@
 
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import { DEFAULT_ISSUE_ROUTE_MAP, DEFAULT_OWNER_MAP } from "./constants.js";
+import { recordCredentialResolution } from "./credential-health.js";
 import type {
   AlertmanagerPluginConfig,
   IssueRouteMap,
@@ -101,6 +102,12 @@ export async function resolveWebhookToken(
     ctx.logger.error(
       `paperclip-plugin-alertmanager: webhookTokenRef is configured${forCompany}, but secret-ref webhook auth requires host-side verification before the worker is invoked`,
     );
+    // This throws, so the delivery never reaches `handleWebhook` and never
+    // reaches the recorder there — record it here or `onHealth()` reports `ok`
+    // for a company whose every delivery fails (BLO-20572). This is the exact
+    // posture BLO-20219's planned cutover to `webhookTokenRef` would produce,
+    // so it must be the loudest case, not the silent one.
+    if (companyId) recordCredentialResolution(companyId, null);
     throw new CompanyScopeUnavailableError(
       `webhookTokenRef${forCompany} requires host-side webhook verification`,
     );
@@ -183,6 +190,9 @@ export async function resolveCompanyScope(
     ctx.logger.error(
       `paperclip-plugin-alertmanager: failed to load config for company ${companyId}: ${String(err)}`,
     );
+    // Deliberately NOT recorded as a credential fault: a config-RPC blip is
+    // transient and may not hold on retry, so recording it would flap the
+    // health surface on infrastructure noise rather than on misconfiguration.
     throw new CompanyScopeUnavailableError(
       `could not load config for company ${companyId}: ${String(err)}`,
     );
@@ -191,11 +201,26 @@ export async function resolveCompanyScope(
     ctx.logger.error(
       `paperclip-plugin-alertmanager: no stored config for company ${companyId} — failing delivery so Alertmanager retries`,
     );
+    // No stored config means neither `webhookToken` nor `webhookTokenRef` is
+    // set, which is precisely the "no credential resolvable" condition — and it
+    // throws before `handleWebhook`, so record it here (BLO-20572).
+    recordCredentialResolution(companyId, null);
     throw new CompanyScopeUnavailableError(
       `no stored config for company ${companyId}`,
     );
   }
   const config = buildConfig(raw as unknown as AlertmanagerPluginConfig);
+
+  // Resolve (and record) the credential BEFORE the routing check below.
+  // Credential validity and routing validity are independent faults, but the
+  // routing check used to run first and throw, so a company with a routing
+  // mismatch never reached this line at all: a company with no credential
+  // *and* a mismatch was invisible to health, and a company that fixed its
+  // credential but still had a stale mismatch could never clear a prior
+  // degraded entry, because the mismatch always threw before recording ran
+  // again (BLO-20572 review feedback on PR #948).
+  const token = await resolveWebhookToken(ctx, config, companyId);
+  recordCredentialResolution(companyId, token);
 
   // The host picked this delivery's tenant when it matched the endpoint key;
   // `defaultCompanyId` is just an operator-typed field inside that tenant's own
@@ -215,13 +240,14 @@ export async function resolveCompanyScope(
     ctx.logger.error(
       `paperclip-plugin-alertmanager: company ${companyId} has defaultCompanyId=${config.defaultCompanyId} — refusing to file its alerts under another tenant`,
     );
+    // A permanent misconfiguration, but a routing one, not (necessarily) a
+    // credential one — the credential state above already recorded the truth
+    // for this company independent of this throw, so a good token isn't
+    // misreported as missing just because routing also failed.
     throw new CompanyScopeUnavailableError(
       `defaultCompanyId ${config.defaultCompanyId} does not match delivering company ${companyId}`,
     );
   }
 
-  return {
-    config,
-    token: await resolveWebhookToken(ctx, config, companyId),
-  };
+  return { config, token };
 }

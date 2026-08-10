@@ -46,12 +46,17 @@ function installStubs(ids: { uid: number; gid: number; nodeUid?: number; nodeGid
   for (const cmd of ["usermod", "groupmod", "chown", "mkdir", "ln"]) {
     writeStub(cmd, `echo "${cmd} $*" >> "${logFile}"`);
   }
+  writeStub("google-chrome", "exit 0");
   writeStub("gosu", `echo "gosu $*" >> "${logFile}"\nshift\nexec "$@"`);
 }
 
 async function runEntrypoint(env: Record<string, string> = {}) {
   const result = await execFileAsync("sh", [ENTRYPOINT, "echo", "ENTRYPOINT-CMD-RAN"], {
-    env: { PATH: `${stubDir}:${process.env.PATH}`, ...env },
+    env: {
+      PATH: `${stubDir}:${process.env.PATH}`,
+      CHROME_BIN: join(stubDir, "google-chrome"),
+      ...env,
+    },
   });
   const calls = existsSync(logFile) ? readFileSync(logFile, "utf8") : "";
   return { stdout: result.stdout, stderr: result.stderr, calls };
@@ -98,7 +103,8 @@ describe("docker-entrypoint.sh", () => {
 
     expect(stdout).toContain("ENTRYPOINT-CMD-RAN");
     expect(stderr).toBe("");
-    expect(calls).toBe("");
+    expect(calls).toContain("mkdir -p /paperclip/bin");
+    expect(calls).toContain(`ln -sf ${join(stubDir, "google-chrome")} /paperclip/bin/google-chrome`);
   });
 
   it("execs directly with a warning for an arbitrary non-root UID (OpenShift-style)", async () => {
@@ -108,7 +114,7 @@ describe("docker-entrypoint.sh", () => {
 
     expect(stdout).toContain("ENTRYPOINT-CMD-RAN");
     expect(stderr).toContain("running unprivileged as 1234:1234; cannot remap to requested 1000:1000");
-    expect(calls).toBe("");
+    expect(calls).toContain("mkdir -p /paperclip/bin");
   });
 
   it("execs directly with a warning on a non-root GID mismatch", async () => {
@@ -118,6 +124,18 @@ describe("docker-entrypoint.sh", () => {
 
     expect(stdout).toContain("ENTRYPOINT-CMD-RAN");
     expect(stderr).toContain("running unprivileged as 1000:1001; cannot remap to requested 1000:1000");
-    expect(calls).toBe("");
+    expect(calls).toContain("mkdir -p /paperclip/bin");
+  });
+
+  it("does not abort an arbitrary-UID command when the PVC is not writable", async () => {
+    installStubs({ uid: 1234, gid: 1234 });
+    writeStub("mkdir", `echo "mkdir $*" >> "${logFile}"\nexit 1`);
+
+    const { stdout, stderr, calls } = await runEntrypoint();
+
+    expect(stdout).toContain("ENTRYPOINT-CMD-RAN");
+    expect(stderr).toContain("/paperclip/bin is not writable; browser link not installed");
+    expect(calls).toContain("mkdir -p /paperclip/bin");
+    expect(calls).not.toContain("ln -sf");
   });
 });

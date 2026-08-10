@@ -30,6 +30,7 @@ import {
 import {
   describeClaudeFailure,
   detectClaudeLoginRequired,
+  isClaudeProviderQuotaError,
   isClaudeTransientUpstreamError,
   parseClaudeStreamJson,
 } from "./parse.js";
@@ -539,13 +540,26 @@ export async function testEnvironment(
           (stdoutFallback ? truncateDetail(stdoutFallback) : "") ||
           detail ||
           "";
-        const transient = isClaudeTransientUpstreamError({
+        const providerQuota = isClaudeProviderQuotaError({
+          parsed,
+          stdout: probe.stdout,
+          stderr: probe.stderr,
+        });
+        const transient = !providerQuota && isClaudeTransientUpstreamError({
           parsed,
           stdout: probe.stdout,
           stderr: probe.stderr,
         });
         checks.push(
-          transient
+          providerQuota
+            ? {
+                code: "claude_hello_probe_provider_quota",
+                level: "warn",
+                message: "Claude hello probe hit a provider quota limit.",
+                ...(failureDetail ? { detail: failureDetail } : {}),
+                hint: "Wait for the quota window to reset or select another Claude account.",
+              }
+            : transient
             ? {
                 code: "claude_hello_probe_transient_upstream",
                 level: "warn",

@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, Loader2, ShieldQuestion, X } from "lucide-react";
 import type { ToolActionRequestListItem } from "@paperclipai/shared";
@@ -10,6 +10,8 @@ import { timeAgo } from "@/lib/timeAgo";
 import { toolsApi } from "@/api/tools";
 import { Button } from "@/components/ui/button";
 import { MarkdownBody } from "@/components/MarkdownBody";
+
+const VISIBLE_EMPTY_QUEUE_REFRESH_MS = 2_000;
 
 /**
  * "Ask first" review queue (M1b float / M9 card, PAP-10859).
@@ -32,18 +34,32 @@ export function ReviewQueueCard({
   heading?: string;
 }) {
   const { selectedCompanyId } = useCompany();
+  const didRefetchOnMountForCompany = useRef<string | null>(null);
 
   const query = useQuery({
     queryKey: queryKeys.tools.actionRequests(selectedCompanyId ?? "__none__", "pending"),
     queryFn: () => toolsApi.listActionRequests(selectedCompanyId!, "pending"),
     enabled: !!selectedCompanyId,
-    refetchInterval: 20_000,
+    staleTime: 0,
+    refetchOnMount: false,
+    refetchInterval: (state) => {
+      const visibleItems = filterActionRequests(state.state.data?.actionRequests, connectionId);
+      return emptyState !== "hidden" && state.state.status === "success" && visibleItems.length === 0
+        ? VISIBLE_EMPTY_QUEUE_REFRESH_MS
+        : 20_000;
+    },
   });
 
   const items = useMemo(() => {
-    const all = query.data?.actionRequests ?? [];
-    return connectionId ? all.filter((item) => item.connectionId === connectionId) : all;
+    return filterActionRequests(query.data?.actionRequests, connectionId);
   }, [query.data, connectionId]);
+
+  useEffect(() => {
+    if (!selectedCompanyId || didRefetchOnMountForCompany.current === selectedCompanyId) return;
+    if (query.dataUpdatedAt === 0 || query.fetchStatus === "fetching") return;
+    didRefetchOnMountForCompany.current = selectedCompanyId;
+    void query.refetch();
+  }, [query.dataUpdatedAt, query.fetchStatus, query.refetch, selectedCompanyId]);
 
   if (!selectedCompanyId) return null;
   if (query.isLoading) return null;
@@ -73,6 +89,14 @@ export function ReviewQueueCard({
       </div>
     </section>
   );
+}
+
+function filterActionRequests(
+  actionRequests: ToolActionRequestListItem[] | undefined,
+  connectionId?: string,
+) {
+  const all = actionRequests ?? [];
+  return connectionId ? all.filter((item) => item.connectionId === connectionId) : all;
 }
 
 function ReviewRow({ companyId, item }: { companyId: string; item: ToolActionRequestListItem }) {

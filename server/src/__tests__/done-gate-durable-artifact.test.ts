@@ -409,11 +409,58 @@ describeEmbeddedPostgres("PATCH /issues/:id done-execution gate — durable arti
     expect(response.body.details).toMatchObject({ reason: "no_execution_run_and_no_pr_evidence" });
   });
 
-  // (c) Regression guard for the original gate behaviour.
-  it("accepts a close when an execution run is still held, with no artifact and no pr-link", async () => {
+  // (c) BLO-20691 — the false-positive close path.
+  //
+  // `executionRunId` is a DISPATCH lock: `heartbeat.ts` stamps it on a merely
+  // queued run and never touches `checkoutRunId`, and the process-loss retry
+  // path stamps it while explicitly nulling checkout. Under the old predicate
+  // (`existingExecutionRunId != null → pass`) this state closed the issue on
+  // comment-only prose, so anything that made the dispatcher touch an issue
+  // satisfied the gate. Observed on BLO-20192: the same deliverable was
+  // rejected at 04:43 with no run, then accepted at 04:45 once a queued run
+  // held the lock.
+  //
+  // This case FAILS against master (it returns 200 there) and is the whole
+  // point of the change.
+  it("rejects a close held open only by a queued dispatch lock that never reached checkout", async () => {
     await enableDoneExecutionGate();
     const { companyId, issueId, agentId, runId } = await seedInReviewIssue();
-    await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
+    await addFindingsComment(companyId, issueId, agentId, runId);
+    // Exactly what the dispatcher writes: the lock, with checkout still null.
+    await db
+      .update(issues)
+      .set({ executionRunId: runId, checkoutRunId: null })
+      .where(eq(issues.id, issueId));
+
+    const response = await patchToDone(agentId, companyId, runId, issueId);
+
+    expect(response.status).toBe(422);
+    expect(response.body.details).toMatchObject({
+      reason: "no_execution_run_and_no_pr_evidence",
+      issueId,
+    });
+    const [persisted] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(persisted.status).toBe("in_review");
+    // The premise: the lock really was held, and it really was not a checkout.
+    expect(persisted.executionRunId).toBe(runId);
+    expect(persisted.checkoutRunId).toBeNull();
+  });
+
+  // (d) BLO-19081's regression guard, restated against the column that means
+  // what it was always assumed to mean.
+  //
+  // The genuine single-patch close: a run checked the issue out (which sets
+  // `checkoutRunId` AND `executionRunId` together — see the checkout path in
+  // issues.ts), did the work, and closes straight from `in_progress` while the
+  // lock is still held. This must keep passing with no artifact and no pr-link;
+  // blocking it would trade one false negative for another.
+  it("accepts a genuine single-patch in_progress -> done close by the run that checked out", async () => {
+    await enableDoneExecutionGate();
+    const { companyId, issueId, agentId, runId } = await seedInReviewIssue();
+    await db
+      .update(issues)
+      .set({ status: "in_progress", checkoutRunId: runId, executionRunId: runId })
+      .where(eq(issues.id, issueId));
 
     const response = await patchToDone(agentId, companyId, runId, issueId);
 

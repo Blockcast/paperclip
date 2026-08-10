@@ -101,6 +101,9 @@ export const statusBadge: Record<string, string> = {
   // Approval statuses
   pending_approval: "bg-amber-100 text-amber-700 dark:bg-amber-900/50 dark:text-amber-300",
   revision_requested: "bg-amber-100 text-amber-700 dark:bg-amber-900/50 dark:text-amber-300",
+  // Requester rescinded its own ask — deliberately neutral, not the red of a
+  // board denial, so the queue does not read obsolescence as rejection.
+  withdrawn: "bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300",
   approved: "bg-green-100 text-green-700 dark:bg-green-900/50 dark:text-green-300",
   rejected: "bg-red-100 text-red-700 dark:bg-red-900/50 dark:text-red-300",
 

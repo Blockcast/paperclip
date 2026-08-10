@@ -29,19 +29,9 @@ const script = path.join(repoRoot, "scripts", "run-vitest-stable.mjs");
 const vitestConfig = path.join(repoRoot, "vitest.config.ts");
 
 // Packages that are in vitest.config.ts but deliberately NOT yet run by CI.
-// Every entry needs a tracking issue. Shrinking this to empty is the goal;
-// adding to it requires a conscious decision, which is the entire point.
-//
-// BLO-20172: all six are red on master today, so wiring them into CI without
-// repairing them first would just turn every PR red. Tracked, not forgotten.
-const KNOWN_UNCOVERED = new Map([
-  ["@paperclipai/adapter-claude-local", "BLO-20172"],
-  ["@paperclipai/adapter-cursor-cloud", "BLO-20172"],
-  ["@paperclipai/adapter-cursor-local", "BLO-20172"],
-  ["@paperclipai/adapter-gemini-local", "BLO-20172"],
-  ["@paperclipai/adapter-grok-local", "BLO-20172"],
-  ["@paperclipai/adapter-pi-local", "BLO-20172"],
-]);
+// Every entry needs a tracking issue; keep this empty unless a package has an
+// explicit, temporary exception.
+const KNOWN_UNCOVERED = new Map();
 
 function readConfiguredProjectDirs() {
   const source = readFileSync(vitestConfig, "utf8");

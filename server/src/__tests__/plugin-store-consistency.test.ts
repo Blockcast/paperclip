@@ -250,7 +250,7 @@ describeEmbeddedPostgres("torn plugin store — activation fails closed", () => 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-plugin-store-consistency-");
     db = createDb(tempDb.connectionString);
-  }, 20_000);
+  }, 120_000);
 
   afterEach(async () => {
     await db.delete(plugins);

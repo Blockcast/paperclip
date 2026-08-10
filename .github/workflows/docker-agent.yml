@@ -115,6 +115,48 @@ jobs:
             exit 1
           fi
           ffmpeg_image="${ffmpeg_ref%:*}@${ffmpeg_digest}"
+
+          # BLO-23128: pim-multicast-gateway's own runtime-stage moq_mmt
+          # assertion (FFmpeg/Dockerfile) can report a false "CACHED" pass —
+          # every layer up to and including that RUN step replayed from
+          # BuildKit's registry cache across several `:stable` pushes between
+          # 2026-08-02 and 2026-08-07 while the digest kept changing, so the
+          # assertion was never actually re-executed against the bits that
+          # got pushed. Their own gate cannot be trusted to have caught a
+          # regression; verify independently, for real, before spending a
+          # 90-minute toolchain build on a binary that will fail our own
+          # Dockerfile.agent-toolchain assertion 30+ minutes in. Do not trust
+          # a cached "success" anywhere in this check — always pull fresh and
+          # run ffmpeg for real.
+          verify_moq_mmt() {
+            local image="$1"
+            if ! docker pull "$image" >&2; then
+              return 1
+            fi
+            docker run --rm --entrypoint ffmpeg "$image" -hide_banner -muxers 2>&1 \
+              | node .github/scripts/check-ffmpeg-muxer.mjs moq_mmt
+          }
+
+          # Last digest independently confirmed (via a genuinely fresh,
+          # non-cached pim-multicast-gateway build — run 30878851125,
+          # job 91895934948, 2026-08-04T05:26:01Z) to carry moq_mmt. Used
+          # only when the live :stable resolution fails our check, so a
+          # flaky upstream channel can't strand the whole delivery chain
+          # again. Bump this if the pin itself ever goes stale/removed from
+          # the registry; owning team for the underlying flakiness is
+          # Multicast (Blockcast/pim-multicast-gateway, Blockcast/FFmpeg).
+          ffmpeg_fallback_digest="sha256:15fdef4d18915d287bdce9a700f7999e197f5a01341f006388879d8993f2835c"
+
+          if ! verify_moq_mmt "$ffmpeg_image"; then
+            echo "::warning::ffmpeg-publisher ${ffmpeg_image} (resolved from ${ffmpeg_ref}) is missing the moq_mmt muxer. Falling back to the last independently-verified-good digest instead of failing the whole delivery chain (BLO-23128). File/escalate to MulticastEngineer: the moq_mmt regression is upstream in Blockcast/pim-multicast-gateway's ffmpeg-publisher:stable channel, not this repo."
+            ffmpeg_image="${ffmpeg_ref%:*}@${ffmpeg_fallback_digest}"
+            if ! verify_moq_mmt "$ffmpeg_image"; then
+              echo "::error::pinned fallback ffmpeg-publisher digest ${ffmpeg_fallback_digest} is ALSO missing moq_mmt (or failed to pull). Both the live :stable resolution and the hardcoded fallback are broken — do not weaken this assertion. Escalate to MulticastEngineer / pim-multicast-gateway owners for a genuinely-verified digest before retrying." >&2
+              exit 1
+            fi
+            echo "Using pinned fallback ffmpeg-publisher digest ${ffmpeg_fallback_digest}"
+          fi
+
           toolchain_tag="$(scripts/container-base-tag.sh agent-toolchain "$runtime_image" "$ffmpeg_image")"
           toolchain_image="harbor.blockcast.net/paperclip-agent/paperclip-agent-toolchain:${toolchain_tag}"
           if docker buildx imagetools inspect "$runtime_image" >/dev/null 2>&1; then
@@ -180,10 +222,8 @@ jobs:
             ${{ steps.bases.outputs.toolchain_image }}
             harbor.blockcast.net/paperclip-agent/paperclip-agent-toolchain:latest
 
-      # Mirror the server image's tag scheme: `sha-<7>-k8s-vendored` per
-      # commit + `latest-k8s-vendored` floating tag on master. The
-      # adapter's `config.image` will pin a specific sha tag; `latest` is
-      # for ad-hoc pulls and devbox parity.
+      # Publish only the immutable candidate tag here. The floating tag is
+      # promoted to the verified digest after the restricted smoke passes.
       - name: Docker meta
         id: meta
         uses: docker/metadata-action@v6
@@ -192,9 +232,9 @@ jobs:
             harbor.blockcast.net/paperclip-agent/paperclip-agent
           tags: |
             type=raw,value=sha-${{ steps.sha.outputs.short }}-k8s-vendored
-            type=raw,value=latest-k8s-vendored,enable={{is_default_branch}}
 
       - name: Build and push
+        id: build
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -228,6 +268,48 @@ jobs:
           cache-to: type=registry,ref=harbor.blockcast.net/paperclip-agent/paperclip-agent:buildcache-v7,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Smoke test restricted headless screenshot
+        env:
+          AGENT_IMAGE: harbor.blockcast.net/paperclip-agent/paperclip-agent@${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker pull "$AGENT_IMAGE"
+          docker run --rm \
+            --user 1000:1000 \
+            --read-only \
+            --security-opt no-new-privileges \
+            --cap-drop ALL \
+            --tmpfs /paperclip:rw,nosuid,size=16m \
+            --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+            --env HOME=/tmp \
+            "$AGENT_IMAGE" \
+            paperclip-browser-smoke
+
+      - name: Promote verified agent image
+        env:
+          CANDIDATE_IMAGE: harbor.blockcast.net/paperclip-agent/paperclip-agent@${{ steps.build.outputs.digest }}
+          FLOATING_IMAGE: harbor.blockcast.net/paperclip-agent/paperclip-agent:latest-k8s-vendored
+          EXPECTED_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create --tag "$FLOATING_IMAGE" "$CANDIDATE_IMAGE"
+          # `imagetools create` re-assembles the manifest index around the
+          # source image (buildx attaches provenance/SBOM attestations), so the
+          # floating tag's INDEX digest is legitimately different from the
+          # candidate IMAGE digest. Asserting equality therefore failed on
+          # every promotion — verified 2026-08-08 on run 31250770598, where the
+          # push itself reported DONE and `latest-k8s-vendored` correctly
+          # resolved to an index referencing the expected digest, yet the step
+          # still exited 1. Assert what actually matters: the tag we publish
+          # must CONTAIN the image we just built and smoke-tested.
+          if ! docker buildx imagetools inspect "$FLOATING_IMAGE" --raw \
+               | grep -qF "$EXPECTED_DIGEST"; then
+            echo "ERROR: $FLOATING_IMAGE does not reference the verified image $EXPECTED_DIGEST"
+            echo "--- floating tag manifest ---"
+            docker buildx imagetools inspect "$FLOATING_IMAGE" --raw || true
+            exit 1
+          fi
 
       # BLO-4141: Auto-bump per-agent adapter_config.image so the freshly
       # built tag actually lands on running agents. Without this, the new
@@ -310,4 +392,47 @@ jobs:
           if [ "$failed" -gt 0 ]; then
             echo "::error::${failed} company bump(s) failed"
             exit 1
+          fi
+
+  # BLO-23128: this workflow runs strictly sequentially and is triggered by
+  # `workflow_run`, after the merge gate — a red step here (build, smoke,
+  # promote, or bump) previously just skipped every following step with no
+  # required check or notification anywhere. The whole chain went dark for
+  # ~6 days (2026-08-02 to 2026-08-07) with CI and the merge queue both
+  # reporting green the entire time. File (or refresh) a tracking issue so a
+  # dead delivery lane is loud instead of silent. Runs on ubuntu-latest, not
+  # arc-dind — it only needs `gh`, not the self-hosted build toolchain.
+  alert-on-failure:
+    needs: build-and-push
+    if: always() && needs.build-and-push.result == 'failure' && github.event_name != 'workflow_dispatch'
+    runs-on: arc-light
+    permissions:
+      issues: write
+    steps:
+      - name: File or refresh a tracking issue for the failed build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+        run: |
+          set -euo pipefail
+          title="Docker (agent base) is failing on master"
+          existing="$(gh issue list --repo "$REPO" --state open --search "in:title \"$title\"" --json number --jq '.[0].number // empty')"
+          body="$(cat <<EOF
+          \`Docker (agent base)\` failed on master at commit ${HEAD_SHA}.
+
+          Run: ${RUN_URL}
+
+          While this workflow is red, steps \`Promote verified agent image\` and
+          \`Bump agent image refs in cluster\` never execute — no agent image change
+          reaches the cluster until it's fixed. See BLO-23128 for the incident where
+          this went unnoticed for ~6 days; check that issue and its comments for the
+          last confirmed root cause before starting a fresh investigation.
+          EOF
+          )"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$REPO" --body "$body"
+          else
+            gh issue create --repo "$REPO" --title "$title" --body "$body"
           fi
