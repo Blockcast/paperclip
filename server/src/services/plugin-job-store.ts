@@ -495,6 +495,16 @@ export function pluginJobStore(db: Db) {
      * (`companyId IS NULL`) form their own group rather than being dropped,
      * so a plugin with no configured companies can still page.
      *
+     * Only `trigger: "schedule"` runs count. `/plugins/alerts/plugin-health`
+     * presents this as a *sustained scheduled-job* failure at `severity: page`,
+     * and manual/retry runs do not carry that meaning: three failed
+     * hand-triggered runs — or an operator retrying one broken run three times
+     * while the cron ticks green — would otherwise manufacture an on-call page
+     * out of activity that is, by definition, already being watched by a human.
+     * The inverse matters just as much: interleaved manual runs are exactly what
+     * would break the all-failed window and hide a genuinely dead schedule, the
+     * same missed-page direction the per-company grouping above exists to close.
+     *
      * Loops per active job (and per company within it) rather than a single
      * windowed query: `plugin_jobs` rows are few (one per manifest-declared
      * job per installed plugin), companies per plugin are a handful, and this
@@ -533,7 +543,12 @@ export function pluginJobStore(db: Db) {
         const companyRows = await db
           .selectDistinct({ companyId: pluginJobRuns.companyId })
           .from(pluginJobRuns)
-          .where(eq(pluginJobRuns.jobId, job.id));
+          .where(
+            and(
+              eq(pluginJobRuns.jobId, job.id),
+              eq(pluginJobRuns.trigger, "schedule"),
+            ),
+          );
 
         for (const { companyId } of companyRows) {
           const recentRuns = await db
@@ -542,6 +557,7 @@ export function pluginJobStore(db: Db) {
             .where(
               and(
                 eq(pluginJobRuns.jobId, job.id),
+                eq(pluginJobRuns.trigger, "schedule"),
                 companyId === null
                   ? isNull(pluginJobRuns.companyId)
                   : eq(pluginJobRuns.companyId, companyId),
