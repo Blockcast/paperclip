@@ -458,11 +458,32 @@ export function selectAgedHumanGatedIssues(
 /**
  * Age histogram over the scanned population, for justifying (and re-justifying)
  * the threshold against the real distribution rather than a guessed number.
+ *
+ * The bucket bounds are caller configuration, so they are validated at the
+ * boundary for the same reason {@link validateEscalationThresholds} validates
+ * the threshold map: a bad bound does not fail, it *renders*. With no bounds at
+ * all every issue falls through to the overflow bucket, whose label interpolates
+ * `bounds[-1]` and comes back as the literal string `undefinedd+` — one
+ * mislabelled bucket holding the entire population, presented with exactly the
+ * confidence of a correct histogram. A non-finite bound is the same failure
+ * spelled differently: every `humanSilenceDays < NaN` comparison is false, so
+ * that bucket silently counts nothing and its population lands in overflow too.
  */
 export function humanGatedAgeHistogram(
   scanned: AgedHumanGatedIssue[],
   bucketUpperBoundsDays: number[] = [7, 14, 21, 30, 45, 60, 90],
 ): Array<{ label: string; count: number }> {
+  if (bucketUpperBoundsDays.length === 0) {
+    throw new Error("bucketUpperBoundsDays must configure at least one bucket");
+  }
+  for (const upper of bucketUpperBoundsDays) {
+    if (typeof upper !== "number" || !Number.isFinite(upper) || upper < 0) {
+      throw new Error(
+        `bucketUpperBoundsDays must contain finite, non-negative day counts, received ${String(upper)}`,
+      );
+    }
+  }
+
   const bounds = [...bucketUpperBoundsDays].sort((a, b) => a - b);
   const buckets = bounds.map((upper, index) => ({
     label: index === 0 ? `<${upper}d` : `${bounds[index - 1]}-${upper}d`,
