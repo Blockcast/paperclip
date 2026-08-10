@@ -81,7 +81,7 @@ async function main() {
     assertIncludes(lockfile, "multer@2.2.0:", "lockfile");
     assertIncludes(lockfile, "'@babel/core@7.29.7':", "lockfile");
     assertIncludes(lockfile, "esbuild@0.28.1:", "lockfile");
-    assertIncludes(lockfile, "js-yaml@4.3.0:", "lockfile");
+    assertIncludes(lockfile, "js-yaml@4.3.1:", "lockfile");
     const uiViteConfig = await readFile(join(fixtureRoot, "ui/vite.config.ts"), "utf8");
     assertIncludes(uiViteConfig, 'const UI_ESBUILD_TARGET = "es2022";', "ui vite config");
     assertIncludes(uiViteConfig, "optimizeDeps", "ui vite config");
