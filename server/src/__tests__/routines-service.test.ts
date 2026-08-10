@@ -1537,6 +1537,81 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect(run.linkedIssueId).toBe(running.issue.id);
   });
 
+  // BLO-23379 review follow-up: the guarantee above must not depend on how many
+  // parked rows sort ahead of the running one. A bounded scan ordered by
+  // `updatedAt` drops the running row out of the window once enough newer parks
+  // exist, and dispatch then fires alongside genuinely in-flight work. Seed more
+  // parked issues than the scan window to pin that the live lookup is
+  // independent of it.
+  it("does not let more parked issues than the scan window shadow a running one", async () => {
+    const { agentId, companyId, issueSvc, routine, svc } = await seedFixture();
+
+    await db
+      .update(routines)
+      .set({ concurrencyPolicy: "skip_if_active" })
+      .where(eq(routines.id, routine.id));
+
+    const running = await seedGatingExecutionIssue({
+      companyId,
+      agentId,
+      routine,
+      issueSvc,
+      runStatus: "running",
+      updatedAt: new Date("2026-03-20T12:01:00.000Z"),
+    });
+
+    // ROUTINE_LIVE_EXECUTION_ISSUE_SCAN_LIMIT is 10; go past it so the running
+    // row provably falls outside any top-N window.
+    const parkedCount = 12;
+    for (let index = 0; index < parkedCount; index += 1) {
+      await seedGatingExecutionIssue({
+        companyId,
+        agentId,
+        routine,
+        issueSvc,
+        runStatus: "scheduled_retry",
+        scheduledRetryAt: new Date(Date.now() + 6 * 24 * 60 * 60 * 1000),
+        // All newer than the running issue, so every one of them sorts ahead.
+        updatedAt: new Date(Date.parse("2026-03-20T12:05:00.000Z") + index * 60_000),
+      });
+    }
+
+    const run = await svc.runRoutine(routine.id, { source: "schedule" });
+
+    expect(run.status).toBe("skipped");
+    expect(run.linkedIssueId).toBe(running.issue.id);
+  });
+
+  // BLO-23379 review follow-up: `always_enqueue` never consults `activeIssue` to
+  // gate dispatch, so nothing is bypassed when it fires past a parked row.
+  // Counting one there would make the metric fire on every long-parked issue of
+  // every always_enqueue routine -- a false positive on the operational signal.
+  it("does not count a bypass for always_enqueue, which never gates on an active issue", async () => {
+    const { agentId, companyId, issueSvc, routine, svc } = await seedFixture();
+
+    await db
+      .update(routines)
+      .set({ concurrencyPolicy: "always_enqueue" })
+      .where(eq(routines.id, routine.id));
+
+    const parked = await seedGatingExecutionIssue({
+      companyId,
+      agentId,
+      routine,
+      issueSvc,
+      runStatus: "scheduled_retry",
+      scheduledRetryAt: new Date(Date.now() + 6 * 24 * 60 * 60 * 1000),
+      updatedAt: new Date("2026-03-20T12:01:00.000Z"),
+    });
+
+    resetRoutineDispatchMetrics();
+    const run = await svc.runRoutine(routine.id, { source: "schedule" });
+
+    expect(run.status).toBe("issue_created");
+    expect(run.linkedIssueId).not.toBe(parked.issue.id);
+    expect(getRoutineDispatchMetric("routine_dispatch_bypassed_parked_execution_issue")).toBe(0);
+  });
+
   it("does not coalesce live routine runs with different resolved variables", async () => {
     const { companyId, agentId, projectId, svc } = await seedFixture();
     const variableRoutine = await svc.create(
