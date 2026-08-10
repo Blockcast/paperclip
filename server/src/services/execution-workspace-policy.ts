@@ -42,6 +42,12 @@ function parseExecutionWorkspaceStrategy(raw: unknown): ExecutionWorkspaceStrate
     ...(typeof parsed.worktreeParentDir === "string" ? { worktreeParentDir: parsed.worktreeParentDir } : {}),
     ...(typeof parsed.provisionCommand === "string" ? { provisionCommand: parsed.provisionCommand } : {}),
     ...(typeof parsed.teardownCommand === "string" ? { teardownCommand: parsed.teardownCommand } : {}),
+    // BLO-19063: per-run worktree isolation. Only the explicit opt-in survives
+    // the round trip; anything else falls back to the per_issue default rather
+    // than persisting an unrecognized scope.
+    ...(parsed.runScope === "per_run" || parsed.runScope === "per_issue"
+      ? { runScope: parsed.runScope }
+      : {}),
   };
 }
 

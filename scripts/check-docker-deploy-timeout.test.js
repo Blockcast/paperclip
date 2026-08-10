@@ -89,6 +89,27 @@ test("master pushes cannot cancel protected manual deploy builds", () => {
   );
 });
 
+test("manual Docker deploys use a run-attempt-scoped candidate tag", () => {
+  const buildJob = getBuildJobBlock();
+  const deployJob = getDeployJobBlock();
+
+  assert.match(buildJob, /image_tag: \$\{\{ steps\.image_tag\.outputs\.value \}\}/);
+  assert.match(
+    buildJob,
+    /value="sha-\$\{TARGET_SHORT\}-run-\$\{GITHUB_RUN_ID\}-\$\{GITHUB_RUN_ATTEMPT\}-k8s-vendored"/,
+  );
+  assert.match(buildJob, /type=raw,value=\$\{\{ steps\.image_tag\.outputs\.value \}\}/);
+
+  const handedOffTags = deployJob.match(
+    /TAG: \$\{\{ needs\.build-and-push\.outputs\.image_tag \}\}/g,
+  );
+  assert.equal(handedOffTags?.length, 4);
+  assert.doesNotMatch(
+    deployJob,
+    /TAG: sha-\$\{\{ steps\.target\.outputs\.short \}\}-k8s-vendored/,
+  );
+});
+
 test("Docker deploy job verifies registry tooling before inspecting the artifact", () => {
   const deployJob = getDeployJobBlock();
   const setup = deployJob.indexOf("uses: docker/setup-buildx-action@v4");
