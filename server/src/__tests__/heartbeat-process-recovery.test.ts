@@ -5620,11 +5620,14 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       ));
     expect(postReleaseFirstIssueRuns).toHaveLength(0);
 
-    await heartbeat.triggerIssueMonitor(issueId, {
-      now: new Date("2099-12-01T12:00:01.000Z"),
-      actorType: "system",
-      actorId: "test-monitor",
+    const synchronizedWake = await heartbeat.wakeup(agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "github_pr_synchronized",
+      payload: { issueId },
+      contextSnapshot: { issueId, wakeReason: "github_pr_synchronized" },
     });
+    expect(synchronizedWake).not.toBeNull();
     const resumedFirstIssueRuns = await db
       .select({ id: heartbeatRuns.id })
       .from(heartbeatRuns)

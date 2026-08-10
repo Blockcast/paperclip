@@ -207,6 +207,7 @@ const EXTERNAL_WAIT_RESUME_WAKE_REASONS = new Set([
   "github_pr_closed",
   "github_pr_converted_to_draft",
   "github_pr_review_submitted",
+  "github_pr_synchronized",
   "issue_monitor_due",
 ]);
 const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON = "execution_review_participant_recovery";
