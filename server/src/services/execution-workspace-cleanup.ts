@@ -139,7 +139,7 @@ export async function collectDueExecutionWorkspaces(input: {
     const scheduleRenewal = () => {
       renewalTimer = setTimeout(() => {
         void renewClaim().catch(() => {
-          renewalStopped = true;
+          if (!renewalStopped) scheduleRenewal();
         });
       }, Math.max(25, Math.floor(claimDurationMs / 3)));
       renewalTimer.unref();

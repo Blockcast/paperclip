@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
   companies,
@@ -59,6 +59,7 @@ describeEmbeddedPostgres("run-scoped execution workspace cleanup", () => {
   }, 120_000);
 
   afterEach(async () => {
+    vi.restoreAllMocks();
     await db.delete(workspaceOperations);
     await db.delete(executionWorkspaces);
     await db.delete(heartbeatRuns);
@@ -238,6 +239,42 @@ describeEmbeddedPostgres("run-scoped execution workspace cleanup", () => {
       .update(executionWorkspaces)
       .set({ status: "cleanup_pending", cleanupEligibleAt: new Date() })
       .where(eq(executionWorkspaces.id, fixture.executionWorkspaceId));
+
+    const firstSweep = collectDueExecutionWorkspaces({
+      db,
+      companyId: fixture.companyId,
+      claimDurationMs: 200,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const secondSweep = await collectDueExecutionWorkspaces({
+      db,
+      companyId: fixture.companyId,
+      claimDurationMs: 200,
+    });
+
+    expect(secondSweep).toMatchObject({ selected: 0, claimed: 0, cleaned: 0, failed: 0 });
+    await expect(firstSweep).resolves.toMatchObject({ selected: 1, claimed: 1, cleaned: 1, failed: 0 });
+  });
+
+  it("recovers lease renewal after a transient database failure", async () => {
+    const fixture = await provisionPersistedWorkspace();
+    await db
+      .update(projectWorkspaces)
+      .set({ cleanupCommand: "sleep 1" })
+      .where(eq(projectWorkspaces.id, fixture.projectWorkspaceId));
+    await db
+      .update(executionWorkspaces)
+      .set({ status: "cleanup_pending", cleanupEligibleAt: new Date() })
+      .where(eq(executionWorkspaces.id, fixture.executionWorkspaceId));
+
+    const originalUpdate = db.update.bind(db);
+    let executionWorkspaceUpdateCount = 0;
+    vi.spyOn(db, "update").mockImplementation(((table) => {
+      if (table === executionWorkspaces && ++executionWorkspaceUpdateCount === 2) {
+        throw new Error("transient renewal failure");
+      }
+      return originalUpdate(table);
+    }) as typeof db.update);
 
     const firstSweep = collectDueExecutionWorkspaces({
       db,
