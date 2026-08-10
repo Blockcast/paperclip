@@ -143,6 +143,30 @@ const ISSUE_LIST_RELATED_QUERY_CHUNK_SIZE = 500;
 export const MAX_CHILD_ISSUES_CREATED_BY_HELPER = 25;
 const MAX_CHILD_COMPLETION_SUMMARIES = 20;
 const CHILD_COMPLETION_SUMMARY_BODY_MAX_CHARS = 500;
+
+function preserveInReviewExecutionStageCheckoutCondition() {
+  return sql`(
+    ${issues.status} = 'in_review'
+    AND ${issues.executionState} ->> 'status' = 'pending'
+    AND coalesce(${issues.executionState} -> 'currentParticipant', 'null'::jsonb) <> 'null'::jsonb
+  )`;
+}
+
+function checkoutStatusForCurrentRow() {
+  return sql<string>`CASE
+    WHEN ${preserveInReviewExecutionStageCheckoutCondition()} THEN 'in_review'
+    ELSE 'in_progress'
+  END`;
+}
+
+function checkoutStartedAtForCurrentRow(now: Date) {
+  const nowIso = now.toISOString();
+  return sql<Date | null>`CASE
+    WHEN ${preserveInReviewExecutionStageCheckoutCondition()} THEN ${issues.startedAt}
+    WHEN ${issues.status} = 'in_progress' THEN ${issues.startedAt}
+    ELSE ${nowIso}::timestamptz
+  END`;
+}
 // Non-human author sentinels that agents post under. These ARE eligible for
 // agent-attribution derivation even though `local-board` is also materialized
 // as a row in the `user` table (it is the implicit board admin). Genuine human
@@ -9620,6 +9644,10 @@ export function issueService(db: Db) {
           or(isNull(issues.checkoutRunId), eq(issues.checkoutRunId, checkoutRunId)),
         )
         : and(eq(issues.assigneeAgentId, agentId), isNull(issues.checkoutRunId));
+      const unassignedAgentCheckoutCondition = and(
+        isNull(issues.assigneeAgentId),
+        isNull(issues.assigneeUserId),
+      );
       const executionLockCondition = checkoutRunId
         ? or(isNull(issues.executionRunId), eq(issues.executionRunId, checkoutRunId))
         : isNull(issues.executionRunId);
@@ -9649,8 +9677,8 @@ export function issueService(db: Db) {
             assigneeUserId: null,
             checkoutRunId,
             ...checkoutExecutionPatch,
-            status: "in_progress",
-            startedAt: now,
+            status: checkoutStatusForCurrentRow(),
+            startedAt: checkoutStartedAtForCurrentRow(now),
             updatedAt: now,
           })
           .where(
@@ -9658,8 +9686,8 @@ export function issueService(db: Db) {
               eq(issues.id, id),
               inArray(issues.status, expectedStatuses),
               activeRecoveryOwnerCondition
-                ? or(isNull(issues.assigneeAgentId), sameRunAssigneeCondition, activeRecoveryOwnerCondition)
-                : or(isNull(issues.assigneeAgentId), sameRunAssigneeCondition),
+                ? or(unassignedAgentCheckoutCondition, sameRunAssigneeCondition, activeRecoveryOwnerCondition)
+                : or(unassignedAgentCheckoutCondition, sameRunAssigneeCondition),
               executionLockCondition,
             ),
           )
@@ -9766,14 +9794,13 @@ export function issueService(db: Db) {
 
       // Adopt stale executionRunId — if the execution lock points to a terminal/missing run, clear it and proceed.
       // Only adopts when the caller's expectedStatuses guard still holds; preserves any existing assigneeUserId
-      // and preserves the original startedAt when the issue is already in_progress.
+      // and preserves the original startedAt when the issue is already in progress or in a pending review stage.
       //
       // BLO-20321 deliberately left this branch terminal-only. Checkout is not
       // where the WIP defect bites (checkout adds WIP; it is parking/closing that
       // was blocked), and widening here would change which branch handles a
-      // never-started owner — this one preserves startedAt, the
-      // clearStaleExecutionLock fallback below resets it. A never-started owner
-      // now falls through to that fallback and is adopted there.
+      // never-started owner — this one preserves startedAt. A never-started owner
+      // falls through to the clearStaleExecutionLock fallback below.
       if (
         checkoutRunId &&
         current.executionRunId &&
@@ -9798,11 +9825,11 @@ export function issueService(db: Db) {
                 assigneeAgentId: agentId,
                 checkoutRunId,
                 ...checkoutExecutionPatch,
-                status: "in_progress",
+                status: checkoutStatusForCurrentRow(),
                 updatedAt: now,
               };
               if (current.status !== "in_progress") {
-                adoptionSet.startedAt = now;
+                adoptionSet.startedAt = checkoutStartedAtForCurrentRow(now);
               }
               return tx
                 .update(issues)
@@ -9815,7 +9842,7 @@ export function issueService(db: Db) {
                     current.checkoutRunId
                       ? eq(issues.checkoutRunId, current.checkoutRunId)
                       : isNull(issues.checkoutRunId),
-                    or(isNull(issues.assigneeAgentId), eq(issues.assigneeAgentId, agentId)),
+                    or(unassignedAgentCheckoutCondition, eq(issues.assigneeAgentId, agentId)),
                   ),
                 )
                 .returning()
@@ -9886,8 +9913,8 @@ export function issueService(db: Db) {
                   assigneeUserId: null,
                   checkoutRunId,
                   ...checkoutExecutionPatch,
-                  status: "in_progress",
-                  startedAt: now,
+                  status: checkoutStatusForCurrentRow(),
+                  startedAt: checkoutStartedAtForCurrentRow(now),
                   updatedAt: now,
                 })
                 .where(
@@ -9898,9 +9925,7 @@ export function issueService(db: Db) {
                     current.checkoutRunId
                       ? eq(issues.checkoutRunId, current.checkoutRunId)
                       : isNull(issues.checkoutRunId),
-                    current.assigneeAgentId
-                      ? eq(issues.assigneeAgentId, current.assigneeAgentId)
-                      : isNull(issues.assigneeAgentId),
+                    or(unassignedAgentCheckoutCondition, eq(issues.assigneeAgentId, agentId)),
                   ),
                 )
                 .returning()
@@ -9918,31 +9943,6 @@ export function issueService(db: Db) {
             return enriched;
           }
         }
-      }
-
-      // in_review is intentionally not claimable via checkout (it is excluded from every
-      // caller's expectedStatuses, matching shouldAutoCheckoutIssueForWake). When the caller
-      // already owns the issue and there is no active checkout/execution owner, the generic
-      // "Issue checkout conflict" 409 is misleading: there is no owner to conflict with. Surface
-      // a typed 422 pointing at the review-mutation path instead — the assignee can already
-      // PATCH/comment/close their own in_review issue without checkout (BLO-8454).
-      if (
-        current.status === "in_review" &&
-        current.assigneeAgentId === agentId &&
-        current.checkoutRunId == null &&
-        current.executionRunId == null
-      ) {
-        throw unprocessable("Issue in review is not checked out", {
-          code: "issue_in_review_not_checkoutable",
-          issueId: current.id,
-          status: current.status,
-          assigneeAgentId: current.assigneeAgentId,
-          checkoutRunId: current.checkoutRunId,
-          executionRunId: current.executionRunId,
-          supportedMutationPath:
-            "Assignees may update, comment on, or close their own in_review issue directly via " +
-            "PATCH /issues/{id} without checkout. To resume active work, PATCH status to in_progress first.",
-        });
       }
 
       throw conflict("Issue checkout conflict", {
