@@ -2082,6 +2082,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       assigneeRunCommentCountLastHour,
       assigneeRunCommentCountLastSixHours,
       latestComments,
+      mostRecentDispatchAt,
       costRow,
     ] = await Promise.all([
       countIssueRunsSince(sourceIssue.companyId, sourceAgent.id, sourceIssue.id, oneHourAgo),
@@ -2106,6 +2107,20 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         .orderBy(desc(issueComments.createdAt), desc(issueComments.id))
         .limit(5)
         .then((rows) => rows.map((row) => row.comment)),
+      // `latestRuns` is ordered by creation time and capped, while a run can be
+      // dispatched after a newer-created run. Anchor to the true latest
+      // dispatch across the issue instead of inferring it from that sample.
+      db
+        .select({ mostRecentDispatchAt: sql<Date | null>`max(${heartbeatRuns.startedAt})` })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, sourceIssue.companyId),
+            eq(heartbeatRuns.agentId, sourceAgent.id),
+            issueRunScopeSql(sourceIssue.id),
+          ),
+        )
+        .then((rows) => coerceDate(rows[0]?.mostRecentDispatchAt)),
       db
         .select({ costCents: sql<number>`coalesce(sum(${costEvents.costCents}), 0)::int` })
         .from(costEvents)
@@ -2116,7 +2131,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     const activeRunCount = latestRuns.filter((run) =>
       ACTIVE_RUN_STATUSES.includes(run.status as (typeof ACTIVE_RUN_STATUSES)[number]),
     ).length;
-    const activeStartedAt = sourceIssue.startedAt ?? sourceIssue.executionLockedAt ?? null;
+    const issueEpisodeStartedAt = sourceIssue.startedAt ?? sourceIssue.executionLockedAt ?? null;
     // BLO-19848: clamp the episode end to the last moment execution was
     // attributable to a live run, so a wedged holder cannot accrue "active"
     // time on work that already finished. See nonLiveExecutionHoldSince.
@@ -2128,6 +2143,14 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           .limit(1)
           .then((rows) => rows[0] ?? null)
       : null;
+    const currentHolderNeverDispatched = executionRun?.status === "queued" && !executionRun.startedAt;
+    const activeStartedAt =
+      mostRecentDispatchAt &&
+      (!issueEpisodeStartedAt || mostRecentDispatchAt.getTime() >= issueEpisodeStartedAt.getTime())
+        ? mostRecentDispatchAt
+        : currentHolderNeverDispatched
+          ? null
+          : issueEpisodeStartedAt;
     const nonLiveHoldSince = nonLiveExecutionHoldSince(sourceIssue, executionRun, now);
     // Clamping below activeStartedAt collapses to 0 via Math.max — i.e. a holder
     // that went non-live before the episode began contributes no active time.

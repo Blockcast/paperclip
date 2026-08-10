@@ -1321,6 +1321,154 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(review?.description).toContain("Primary trigger: `long_active_duration`");
   });
 
+  it("anchors long_active_duration to the most recent dispatch instead of checkout", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const checkoutAt = new Date(now.getTime() - 7 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: checkoutAt });
+
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      status: "queued",
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      startedAt: null,
+      contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+      createdAt: checkoutAt,
+      updatedAt: checkoutAt,
+    });
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 1,
+      now: new Date(now.getTime() - 4 * 60 * 60 * 1000),
+      withRunComments: true,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  it("does not treat a queued, never-started execution holder as a long active episode", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const checkoutAt = new Date(now.getTime() - 12 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: checkoutAt });
+
+    await pinExecutionRun({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      status: "queued",
+      lockedAt: checkoutAt,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  it("keeps long_active_duration for an unattended issue with no execution attempt", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 12 * 60 * 60 * 1000),
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+  });
+
+  it("keeps long_active_duration once a real dispatch exceeds the threshold", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 12 * 60 * 60 * 1000),
+    });
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 1,
+      now: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      status: "running",
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+  });
+
+  it("uses the true latest dispatch when creation and dispatch order diverge", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 8 * 60 * 60 * 1000),
+    });
+    const olderCreatedAt = new Date(now.getTime() - 7 * 60 * 60 * 1000);
+    const newerCreatedAt = new Date(now.getTime() - 6 * 60 * 60 * 1000 - 50 * 60_000);
+
+    await db.insert(heartbeatRuns).values([
+      {
+        id: randomUUID(),
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        status: "succeeded",
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        startedAt: new Date(now.getTime() - 30 * 60_000),
+        finishedAt: new Date(now.getTime() - 20 * 60_000),
+        contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+        livenessState: "advanced",
+        createdAt: olderCreatedAt,
+        updatedAt: olderCreatedAt,
+      },
+      {
+        id: randomUUID(),
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        status: "succeeded",
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        startedAt: new Date(now.getTime() - 6 * 60 * 60 * 1000 - 5 * 60_000),
+        finishedAt: new Date(now.getTime() - 6 * 60 * 60 * 1000),
+        contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+        livenessState: "advanced",
+        createdAt: newerCreatedAt,
+        updatedAt: newerCreatedAt,
+      },
+    ]);
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
   // BLO-21003: the monitor came due seconds ago, but `monitorNextCheckAt` lapsing
   // is not proof its wake was serviced — dispatch (tick pickup, K8s Job creation,
   // pod scheduling) is asynchronous and a reconcile pass can land inside that gap
