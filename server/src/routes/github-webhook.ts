@@ -823,10 +823,24 @@ function resolveEventContext(
       const prUrl = githubPrUrl(repoFullName, prNumber, readStringField(issue, "html_url"));
       const commentUrl = readStringField(comment, "html_url");
       return {
+        // BLO-23267: identifiers used to MATCH a Paperclip issue must come
+        // only from the PR's own title/body (`issue.title`/`issue.body` here
+        // -- GitHub's issue_comment payload calls the PR "issue"), never from
+        // the free-text comment body. paperclip-identifiers.ts's own operator
+        // guard says PR->issue attribution keys on branch/title/body and
+        // nothing else; commentBody used to be folded in here too, which let
+        // an identifier mentioned only in REVIEW PROSE (e.g. a reviewer
+        // narrating an unrelated incident as background) attribute a
+        // Changes-Requested wake to that unrelated issue. Live case: Ally's
+        // comment on Blockcast/paperclip#1125 narrated the BLO-20775 stall as
+        // motivation, and the substring match alone fired a wake on
+        // BLO-20775 even though #1125 has nothing to do with it -- its own
+        // linked issue (BLO-19497) is carried correctly via issue.body/title.
+        // commentBody is still returned below for display/logging, just not
+        // fed into matching.
         identifiers: extractPaperclipIdentifiers(
           issue.title as string | undefined,
           issue.body as string | undefined,
-          commentBody,
         ),
         wakeReason: reviewerRequest ? "github_pr_review_requested" : "github_pr_review_feedback",
         prNumber,

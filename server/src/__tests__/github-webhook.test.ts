@@ -4059,6 +4059,92 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(wakesAfterRound2.some((w) => w.reason === "github_pr_review_feedback")).toBe(true);
   });
 
+  // BLO-23267 (CEO follow-up, #1125 live specimen): an issue identifier that
+  // appears ONLY in the review's narrative prose -- not in the reviewed PR's
+  // own title/body -- must not attribute a Changes-Requested wake to that
+  // issue. Live case: a comment-shaped Ally review on Blockcast/paperclip#1125
+  // (which is actually bound to BLO-20775's sibling PEN-1126) narrated the
+  // unrelated BLO-20775 stall as motivation; the substring match alone fired
+  // a wake on BLO-20775 within 246ms even though #1125 has no relationship
+  // to it -- its own PR was #1123 (a different PR entirely). ACM-9099 here
+  // stands in for that unrelated issue: it exists (different company/prefix
+  // so it can't collide with PEN-1126 in the seed helper), it is bound to a
+  // DIFFERENT PR, and its identifier shows up only inside this review's prose.
+  it("does not wake an issue whose identifier appears only in the review's narrative prose, not the reviewed PR's own title/body (BLO-23267 / #1125)", async () => {
+    const { agentId, issueId } = await seedIssueWithIdentifier("PEN-1126", { status: "in_review" });
+    const { agentId: unrelatedAgentId, issueId: unrelatedIssueId } = await seedIssueWithIdentifier("ACM-9099", {
+      status: "in_review",
+    });
+    const app = buildApp({ prReviewerBotLogin: "allyblockcast[bot]" });
+
+    const payload = {
+      action: "created",
+      issue: {
+        number: 269,
+        title: "Fix hosted vault onboarding",
+        // The PR's own binding -- this is the only issue this review should
+        // be able to affect.
+        body: "Closes PEN-1126",
+        html_url: "https://github.com/Blockcast/penstock-llm-proxy-core/pull/269",
+        pull_request: { url: "https://api.github.com/repos/Blockcast/penstock-llm-proxy-core/pulls/269" },
+        user: { login: "codex-bot" },
+      },
+      comment: {
+        id: 5231388259,
+        body: [
+          "## Ally — Consolidated PR Review",
+          "",
+          "Reviewed head: 3cb288e711d900283d3562b3adc9431f1a206a5f",
+          "",
+          "### Critical Issues (0)",
+          "",
+          "### Important Issues (1)",
+          // ACM-9099 appears here ONLY as background narrative about a
+          // different incident -- never in this PR's own title/body.
+          "- **[docs]** Note: this fix is motivated by the ACM-9099 stall this cycle, which sat unattended for hours.",
+          "",
+          "### Recommended Action",
+          "1. Tighten the wording of the motivation paragraph.",
+        ].join("\n"),
+        html_url: "https://github.com/Blockcast/penstock-llm-proxy-core/pull/269#issuecomment-5231388259",
+        user: { login: "allyblockcast[bot]" },
+      },
+      repository: { full_name: "Blockcast/penstock-llm-proxy-core" },
+    };
+    const signed = signedRequest(payload);
+    const res = await request(app)
+      .post("/api/webhooks/github")
+      .set("x-github-event", "issue_comment")
+      .set("x-hub-signature-256", signed.signature)
+      .set("x-github-delivery", "delivery-blo23267-prose-mention")
+      .set("content-type", "application/json")
+      .send(signed.body);
+
+    expect(res.status).toBe(200);
+    // The PR's own bound issue still gets its legitimate wake...
+    expect(res.body.reopened).toEqual([{ issueIdentifier: "PEN-1126", commentId: expect.any(String) }]);
+    expect(res.body.wakes).toEqual([{ issueIdentifier: "PEN-1126", agentId }]);
+    // ...but the issue mentioned only in prose must not appear anywhere in
+    // the response: not reopened, not woken, not even "skipped" (skipped
+    // implies it was matched and then deliberately passed over -- it must
+    // never have been matched at all).
+    expect(res.body.reopened).not.toContainEqual(expect.objectContaining({ issueIdentifier: "ACM-9099" }));
+    expect(res.body.wakes).not.toContainEqual(expect.objectContaining({ issueIdentifier: "ACM-9099" }));
+    expect(res.body.skipped ?? []).not.toContainEqual(expect.objectContaining({ issueIdentifier: "ACM-9099" }));
+
+    const unrelatedComments = await db
+      .select({ id: issueComments.id })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, unrelatedIssueId));
+    expect(unrelatedComments).toEqual([]);
+
+    const unrelatedWakes = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, unrelatedAgentId));
+    expect(unrelatedWakes).toEqual([]);
+  });
+
   it("still emits the review-feedback comment and escalates to the manager when the assignee's monitor is triggered with no scheduled re-check (BLO-19497 AC #5)", async () => {
     const companyId = randomUUID();
     const managerId = randomUUID();
