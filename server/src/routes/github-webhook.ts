@@ -34,6 +34,7 @@ import {
   companies,
   heartbeatRuns,
   issueComments,
+  issueWorkProducts,
   issues,
 } from "@paperclipai/db";
 import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
@@ -49,8 +50,10 @@ import { logger } from "../middleware/logger.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { extractPaperclipIdentifiers } from "../services/paperclip-identifiers.js";
 import {
+  githubGetPullRequestState,
   githubListIssueCommentBodies,
   githubPostIssueComment,
+  type GitHubPullRequestStateResult,
 } from "../services/github-app-auth.js";
 import { recoveryService } from "../services/recovery/service.js";
 import {
@@ -62,9 +65,21 @@ import {
   enrichAuthoredLocForRow,
   type RecordMergedPullRequestInput,
 } from "../services/issue-pull-requests.js";
+import { workProductService } from "../services/work-products.js";
+import {
+  buildPullRequestWorkProductFields,
+  PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE,
+  PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID,
+  pullRequestWorkProductNeedsReconciliation,
+  pullRequestExternalId,
+} from "../services/pull-request-work-products.js";
 
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type PrReviewerSelectionDb = Pick<Db | DbTransaction, "select">;
+type PullRequestStateResolver = (input: {
+  repoFullName: string;
+  prNumber: number;
+}) => Promise<GitHubPullRequestStateResult>;
 
 // Keep lock contention well below GitHub's webhook timeout. The winner holds
 // one pooled connection while heartbeat commits through another; createDb's
@@ -142,6 +157,11 @@ export interface GithubWebhookConfig {
     HeartbeatServiceOptions,
     "paperclipNodeRole" | "penstockAvailabilityGate" | "skipQueuedRunDispatch"
   >;
+  /**
+   * Test/embedding override for the authoritative GitHub PR read used only
+   * when two distinct lifecycle webhooks share an `updated_at` timestamp.
+   */
+  pullRequestStateResolver?: PullRequestStateResolver;
 }
 
 // Identifier extraction (`extractPaperclipIdentifiers`) lives in
@@ -546,6 +566,7 @@ interface ResolvedEventContext {
   prUrl?: string | null;
   eventUrl?: string | null;
   headSha?: string | null;
+  prPreviousHeadSha?: string | null;
   // pull_request_review.submitted only — drives the author-facing directive
   // so the assignee wake's prompt carries the reviewer's findings without
   // needing a separate `gh pr view` shellout.
@@ -573,10 +594,16 @@ interface ResolvedEventContext {
   // deliberately NOT captured: the link keys on the BLO- ref, never the author.
   prMerged?: boolean;
   prMergedAt?: string | null;
+  prUpdatedAt?: string | null;
+  prState?: "open" | "closed" | null;
   prAdditions?: number | null;
   prDeletions?: number | null;
   prBranch?: string | null;
   prBody?: string | null;
+  // pull_request events only. The raw GitHub `action`, retained so the
+  // work-product upsert (BLO-19566) can describe the PR's state without
+  // reverse-mapping it out of wakeReason.
+  prAction?: string | null;
 }
 
 // Cap review body in contextSnapshot so the heartbeat-run row stays small.
@@ -900,6 +927,7 @@ function resolveEventContext(
       };
       const head = pr?.head as Record<string, unknown> | undefined;
       const merged = pr?.merged === true;
+      const prState = pr?.state === "open" || pr?.state === "closed" ? pr.state : null;
       return {
         identifiers: collected.ids,
         wakeReason: reasonByAction[action] ?? "github_pull_request",
@@ -909,6 +937,7 @@ function resolveEventContext(
         prUrl: collected.url,
         eventUrl: collected.url,
         headSha: collected.headSha,
+        prPreviousHeadSha: readStringField(payload, "before"),
         prAuthorLogin: collected.authorLogin,
         prDraft: pr?.draft === true,
         // Merge metadata for forward-capture. additions/deletions are present
@@ -916,10 +945,13 @@ function resolveEventContext(
         // pulls/{n}/files fetch (enrichment), so it is not read here.
         prMerged: action === "closed" ? merged : undefined,
         prMergedAt: readStringField(pr, "merged_at"),
+        prUpdatedAt: readStringField(pr, "updated_at"),
+        prState,
         prAdditions: typeof pr?.additions === "number" ? (pr.additions as number) : null,
         prDeletions: typeof pr?.deletions === "number" ? (pr.deletions as number) : null,
         prBranch: (head?.ref as string | undefined) ?? null,
         prBody: (pr?.body as string | undefined) ?? null,
+        prAction: action,
       };
     }
     default:
@@ -2474,7 +2506,54 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       }
     })();
 
-    if (!context || context.identifiers.length === 0) {
+    if (!context) {
+      res.status(200).json({
+        ok: true,
+        ignored: "no_paperclip_identifier",
+        reviewerWakeFired,
+        reviewerRunsCancelled,
+        dependabotWakeFired,
+      });
+      return;
+    }
+
+    const pullRequestWorkProductExternalId =
+      eventName === "pull_request" &&
+      context.prNumber !== null &&
+      context.repoFullName
+        ? pullRequestExternalId(context.repoFullName, context.prNumber)
+        : null;
+    const previouslyLinkedPullRequestIssues = pullRequestWorkProductExternalId
+      ? await db
+        .select({
+          id: issues.id,
+          companyId: issues.companyId,
+          identifier: issues.identifier,
+          assigneeAgentId: issues.assigneeAgentId,
+          status: issues.status,
+          executionState: issues.executionState,
+        })
+        .from(issueWorkProducts)
+        .innerJoin(
+          issues,
+          and(
+            eq(issues.id, issueWorkProducts.issueId),
+            eq(issues.companyId, issueWorkProducts.companyId),
+          ),
+        )
+        .where(
+          and(
+            eq(issueWorkProducts.provider, "github"),
+            eq(issueWorkProducts.type, "pull_request"),
+            eq(issueWorkProducts.externalId, pullRequestWorkProductExternalId),
+            sql`${issueWorkProducts.metadata}->>'source' = ${PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE}`,
+            sql`${issueWorkProducts.sourceTrust}->>'promotedByActorType' = 'system'`,
+            sql`${issueWorkProducts.sourceTrust}->>'promotedByActorId' = ${PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID}`,
+          ),
+        )
+      : [];
+
+    if (context.identifiers.length === 0 && previouslyLinkedPullRequestIssues.length === 0) {
       res.status(200).json({
         ok: true,
         ignored: "no_paperclip_identifier",
@@ -2502,6 +2581,12 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       .from(issues);
     const matched = matchedIssues.filter(
       (row) => row.identifier && context.identifiers.includes(row.identifier),
+    );
+    const pullRequestWorkProductTargets = [
+      ...matched,
+      ...previouslyLinkedPullRequestIssues,
+    ].filter((row, index, rows) =>
+      rows.findIndex((candidate) => candidate.companyId === row.companyId && candidate.id === row.id) === index
     );
 
     // Merged-PR forward-capture (BLO-9117). When a PR closes as merged, persist
@@ -2543,6 +2628,140 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
           { err, prNumber: context.prNumber, repoFullName: context.repoFullName },
           "merged-PR forward-capture persist failed",
         );
+      }
+    }
+
+    // PR work-product upsert (BLO-19566 AC4). Liveness/productivity accounting
+    // is blind to PR progress unless the issue carries a first-class
+    // `pull_request` work product: the productivity reviewer's own verdict
+    // criteria ask for "a non-stale PR/MR link in the source issue's evidence",
+    // and nothing was ever writing one. An agent shipping commits to an open PR
+    // therefore read as zero progress (BLO-19541 misfired on exactly this).
+    //
+    // Runs for every PR event and every matched issue, including terminal and
+    // unassigned ones -- the row is evidence about the PR, not a wake. Keyed on
+    // repo#number so pushes update one row per issue instead of appending.
+    // Best-effort: a persist failure must never break the wake path, mirroring
+    // the merged-PR forward-capture above.
+    let workProductsUpserted = 0;
+    if (
+      eventName === "pull_request" &&
+      context.prNumber !== null &&
+      context.repoFullName &&
+      pullRequestWorkProductTargets.length > 0
+    ) {
+      const fields = buildPullRequestWorkProductFields({
+        repoFullName: context.repoFullName,
+        prNumber: context.prNumber,
+        prTitle: context.prTitle ?? null,
+        prUrl: context.prUrl ?? null,
+        headSha: context.headSha ?? null,
+        previousHeadSha: context.prPreviousHeadSha ?? null,
+        prBranch: context.prBranch ?? null,
+        prDraft: context.prDraft,
+        prMerged: context.prMerged,
+        prMergedAt: context.prMergedAt ?? null,
+        prUpdatedAt: context.prUpdatedAt ?? null,
+        prState: context.prState ?? null,
+        action: context.prAction ?? "",
+      });
+      let authoritativeFieldsPromise: Promise<ReturnType<typeof buildPullRequestWorkProductFields> | null> | null = null;
+      const authoritativeFields = async () => {
+        if (authoritativeFieldsPromise) return authoritativeFieldsPromise;
+        authoritativeFieldsPromise = (async () => {
+          let state: GitHubPullRequestStateResult;
+          try {
+            state = config.pullRequestStateResolver
+              ? await config.pullRequestStateResolver({
+                  repoFullName: context.repoFullName!,
+                  prNumber: context.prNumber!,
+                })
+              : await githubGetPullRequestState({
+                  repoFullName: context.repoFullName!,
+                  prNumber: context.prNumber!,
+                });
+          } catch (err) {
+            logger.warn(
+              { err, prNumber: context.prNumber, repoFullName: context.repoFullName },
+              "authoritative pull_request state reconciliation threw",
+            );
+            return null;
+          }
+          if ("error" in state) {
+            logger.warn(
+              { reason: state.error, prNumber: context.prNumber, repoFullName: context.repoFullName },
+              "authoritative pull_request state reconciliation unavailable",
+            );
+            return null;
+          }
+          return buildPullRequestWorkProductFields({
+            repoFullName: context.repoFullName!,
+            prNumber: context.prNumber!,
+            prTitle: state.title ?? context.prTitle ?? null,
+            prUrl: state.url ?? context.prUrl ?? null,
+            headSha: state.headSha,
+            previousHeadSha: null,
+            prBranch: state.branch,
+            prDraft: state.draft,
+            prMerged: state.merged,
+            prMergedAt: state.mergedAt,
+            prUpdatedAt: state.updatedAt,
+            prState: state.state,
+            action: state.merged || state.state === "closed"
+              ? "closed"
+              : state.draft
+                ? "converted_to_draft"
+                : "synchronize",
+          });
+        })();
+        return authoritativeFieldsPromise;
+      };
+      const workProducts = workProductService(db);
+      for (const issue of pullRequestWorkProductTargets) {
+        try {
+          const workProduct = await workProducts.upsertByExternalId(
+            issue.id,
+            issue.companyId,
+            { provider: "github", type: "pull_request", externalId: fields.externalId },
+            {
+              title: fields.title,
+              url: fields.url,
+              status: fields.status,
+              metadata: fields.metadata,
+              sourceTrust: fields.sourceTrust,
+            },
+          );
+          if (pullRequestWorkProductNeedsReconciliation(workProduct?.metadata)) {
+            const currentFields = await authoritativeFields();
+            if (currentFields) {
+              await workProducts.upsertByExternalId(
+                issue.id,
+                issue.companyId,
+                { provider: "github", type: "pull_request", externalId: currentFields.externalId },
+                {
+                  title: currentFields.title,
+                  url: currentFields.url,
+                  status: currentFields.status,
+                  metadata: currentFields.metadata,
+                  sourceTrust: currentFields.sourceTrust,
+                },
+                { forceAuthoritative: true },
+              );
+            }
+          }
+          workProductsUpserted += 1;
+        } catch (err) {
+          logger.error(
+            {
+              err,
+              issueId: issue.id,
+              identifier: issue.identifier,
+              prNumber: context.prNumber,
+              repoFullName: context.repoFullName,
+            },
+            "pull_request work product upsert failed",
+          );
+        }
       }
     }
 
@@ -2603,7 +2822,6 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       });
       return;
     }
-
     const heartbeat = heartbeatService(db, {
       pluginWorkerManager: config.pluginWorkerManager,
       ...config.heartbeatOptions,
@@ -2896,6 +3114,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       skipped,
       reopened,
       reviewerRunsCancelled,
+      ...(workProductsUpserted > 0 ? { workProductsUpserted } : {}),
       ...(backLinked.length ? { backLinked } : {}),
       ...(escalated.length ? { escalated } : {}),
     });

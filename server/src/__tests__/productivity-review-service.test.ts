@@ -13,6 +13,7 @@ import {
   issueApprovals,
   issueComments,
   issueRelations,
+  issueWorkProducts,
   issues,
   plugins,
   pluginState,
@@ -34,6 +35,7 @@ import {
 } from "../services/productivity-review.js";
 import { logActivity } from "../services/activity-log.js";
 import { RECOVERY_ORIGIN_KINDS } from "../services/recovery/origins.js";
+import { PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST } from "../services/pull-request-work-products.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -468,6 +470,388 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(reviews[0]?.description).toContain("Primary trigger: `no_comment_streak`");
     expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 10");
     expect(reviews[0]?.description).toContain("Runtime-failure streak (terminal, never-executed runs): 0");
+  });
+
+  // BLO-19566 AC4. The productivity reviewer's verdict criteria ask for "a
+  // non-stale PR/MR link in the source issue's evidence", but collectEvidence
+  // never queried one, so an assignee pushing commits to an open PR produced an
+  // evidence pack indistinguishable from an idle issue. BLO-19541 misfired on
+  // exactly this: it reported "0/6h runs, none recorded" while PR #806 had
+  // commits from that same morning.
+  describe("pull-request evidence (BLO-19566)", () => {
+    async function seedIssueWithPullRequest(opts: {
+      prUpdatedAt: Date;
+      status?: string;
+      metadata?: Record<string, unknown> | null;
+      url?: string | null;
+      createdByRunId?: string | null;
+    }) {
+      const seeded = await seedAssignedIssue();
+      await db.insert(issueWorkProducts).values({
+        companyId: seeded.companyId,
+        issueId: seeded.issueId,
+        type: "pull_request",
+        provider: "github",
+        externalId: "Blockcast/paperclip#806",
+        title: "Widen the authz grant",
+        url: opts.url === undefined ? "https://github.com/Blockcast/paperclip/pull/806" : opts.url,
+        status: opts.status ?? "ready_for_review",
+        metadata: opts.metadata === undefined
+          ? { source: "github_pull_request_webhook", sourceEventOrder: 10 }
+          : opts.metadata,
+        sourceTrust: PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST,
+        createdByRunId: opts.createdByRunId ?? null,
+        createdAt: opts.prUpdatedAt,
+        updatedAt: opts.prUpdatedAt,
+      });
+      return seeded;
+    }
+
+    it("surfaces a recently-pushed PR instead of reporting zero progress signal", async () => {
+      const now = new Date("2026-04-30T12:00:00.000Z");
+      // Pushed 2h ago -- inside the 6h window the AC names.
+      const seeded = await seedIssueWithPullRequest({
+        prUpdatedAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+      });
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+      });
+
+      const service = productivityReviewService(db);
+      await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+      const reviews = await listProductivityReviews(seeded.companyId);
+      expect(reviews).toHaveLength(1);
+      const description = reviews[0]?.description ?? "";
+      // The regression this guards: the line used to be absent entirely.
+      expect(description).toContain("Linked pull request:");
+      expect(description).toContain("https://github.com/Blockcast/paperclip/pull/806");
+      expect(description).toContain("non-stale");
+      expect(description).not.toContain("Linked pull request: none recorded");
+      // And the manager is told the PR satisfies the second verdict criterion,
+      // so a live PR is not read as "no concrete progress signal".
+      expect(description).toContain("The second signal is already present");
+    });
+
+    it("counts a fresh draft PR as concrete progress", async () => {
+      const now = new Date("2026-04-30T12:00:00.000Z");
+      const seeded = await seedIssueWithPullRequest({
+        prUpdatedAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+        status: "draft",
+      });
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+      });
+
+      const service = productivityReviewService(db);
+      await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+      const description = (await listProductivityReviews(seeded.companyId))[0]?.description ?? "";
+      expect(description).toContain("`draft`");
+      expect(description).toContain("progress-eligible");
+      expect(description).toContain("The second signal is already present");
+    });
+
+    it("does not count a freshly closed unmerged PR as concrete progress", async () => {
+      const now = new Date("2026-04-30T12:00:00.000Z");
+      const seeded = await seedIssueWithPullRequest({
+        prUpdatedAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+        status: "closed",
+      });
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+      });
+
+      const service = productivityReviewService(db);
+      await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+      const description = (await listProductivityReviews(seeded.companyId))[0]?.description ?? "";
+      expect(description).toContain("Linked pull request:");
+      expect(description).toContain("`closed`");
+      expect(description).toContain("non-stale");
+      expect(description).toContain("not progress-eligible");
+      expect(description).not.toContain("The second signal is already present");
+    });
+
+    it("does not count a same-second PR whose authoritative state is still pending", async () => {
+      const now = new Date("2026-04-30T12:00:00.000Z");
+      const seeded = await seedIssueWithPullRequest({
+        prUpdatedAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+        metadata: {
+          source: "github_pull_request_webhook",
+          sourceEventOrder: 10,
+          sourceStateVerification: "pending",
+        },
+      });
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+      });
+
+      const service = productivityReviewService(db);
+      await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+      const description = (await listProductivityReviews(seeded.companyId))[0]?.description ?? "";
+      expect(description).toContain("Linked pull request: none recorded");
+      expect(description).not.toContain("The second signal is already present");
+    });
+
+    it("lets an older fresh progress PR satisfy the signal when a newer closed PR exists", async () => {
+      const now = new Date("2026-04-30T12:00:00.000Z");
+      const seeded = await seedIssueWithPullRequest({
+        prUpdatedAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+      });
+      await db.insert(issueWorkProducts).values({
+        companyId: seeded.companyId,
+        issueId: seeded.issueId,
+        type: "pull_request",
+        provider: "github",
+        externalId: "Blockcast/paperclip#807",
+        title: "Closed unmerged follow-up",
+        url: "https://github.com/Blockcast/paperclip/pull/807",
+        status: "closed",
+        metadata: { source: "github_pull_request_webhook", sourceEventOrder: 20 },
+        sourceTrust: PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST,
+        createdAt: new Date(now.getTime() - 60 * 60 * 1000),
+        updatedAt: new Date(now.getTime() - 60 * 60 * 1000),
+      });
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+      });
+
+      const service = productivityReviewService(db);
+      await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+      const description = (await listProductivityReviews(seeded.companyId))[0]?.description ?? "";
+      expect(description).toContain("https://github.com/Blockcast/paperclip/pull/806");
+      expect(description).toContain("`ready_for_review`");
+      expect(description).toContain("The second signal is already present");
+      expect(description).not.toContain("https://github.com/Blockcast/paperclip/pull/807");
+    });
+
+    it("counts a freshly merged PR as concrete progress", async () => {
+      const now = new Date("2026-04-30T12:00:00.000Z");
+      const seeded = await seedIssueWithPullRequest({
+        prUpdatedAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+        status: "merged",
+        metadata: { source: "github_pull_request_webhook", sourceEventOrder: 30 },
+      });
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+      });
+
+      const service = productivityReviewService(db);
+      await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+      const description = (await listProductivityReviews(seeded.companyId))[0]?.description ?? "";
+      expect(description).toContain("`merged`");
+      expect(description).toContain("The second signal is already present");
+    });
+
+    it("reads a delayed first delivery as stale by GitHub event time, not DB receipt time", async () => {
+      // A first webhook delivery can land long after the PR event (retry,
+      // backfill, outage drain). The row then inserts with `updatedAt = now`,
+      // so aging off `updatedAt` advertises an already-dead PR as fresh
+      // progress for another 24h. Age must come from the GitHub event time.
+      const now = new Date("2026-04-30T12:00:00.000Z");
+      const seeded = await seedAssignedIssue();
+      const threeDaysAgoMs = now.getTime() - 3 * 24 * 60 * 60 * 1000;
+      await db.insert(issueWorkProducts).values({
+        companyId: seeded.companyId,
+        issueId: seeded.issueId,
+        type: "pull_request",
+        provider: "github",
+        externalId: "Blockcast/paperclip#806",
+        title: "Widen the authz grant",
+        url: "https://github.com/Blockcast/paperclip/pull/806",
+        status: "ready_for_review",
+        metadata: {
+          source: "github_pull_request_webhook",
+          sourceEventOrder: 10,
+          sourceEventTimestamp: new Date(threeDaysAgoMs).toISOString(),
+          sourceEventTimestampMs: threeDaysAgoMs,
+        },
+        sourceTrust: PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST,
+        createdByRunId: null,
+        // Receipt time is "now" -- the delayed delivery.
+        createdAt: now,
+        updatedAt: now,
+      });
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+      });
+
+      const service = productivityReviewService(db);
+      await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+      const description = (await listProductivityReviews(seeded.companyId))[0]?.description ?? "";
+      const prLine = description.split("\n").find((line) => line.includes("Linked pull request:")) ?? "";
+      expect(prLine).not.toBe("");
+      // Aged from the GitHub event time (3d), not the "now" receipt time.
+      // Asserted on the PR line specifically: the manager's verdict criteria
+      // quote the phrase "non-stale" too, so a whole-description match would
+      // pass regardless of what this line says.
+      expect(prLine).toContain("2026-04-27T12:00:00.000Z");
+      expect(prLine).toContain(", stale,");
+      expect(prLine).not.toContain("non-stale");
+      expect(description).not.toContain("The second signal is already present");
+    });
+
+    it("ignores actor-authored GitHub PR rows without webhook provenance", async () => {
+      const now = new Date("2026-04-30T12:00:00.000Z");
+      const seeded = await seedAssignedIssue();
+      const runs = await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+      });
+      await db.insert(issueWorkProducts).values({
+        companyId: seeded.companyId,
+        issueId: seeded.issueId,
+        type: "pull_request",
+        provider: "github",
+        externalId: "Blockcast/paperclip#806",
+        title: "Actor-authored PR claim",
+        url: "https://github.com/Blockcast/paperclip/pull/806",
+        status: "ready_for_review",
+        metadata: { source: "manual" },
+        createdByRunId: runs[0]?.id ?? null,
+        createdAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+        updatedAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+      });
+
+      const service = productivityReviewService(db);
+      await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+      const description = (await listProductivityReviews(seeded.companyId))[0]?.description ?? "";
+      expect(description).toContain("Linked pull request: none recorded");
+      expect(description).not.toContain("The second signal is already present");
+    });
+
+    it("ignores rows that spoof webhook metadata without server provenance", async () => {
+      const now = new Date("2026-04-30T12:00:00.000Z");
+      const seeded = await seedAssignedIssue();
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+      });
+      await db.insert(issueWorkProducts).values({
+        companyId: seeded.companyId,
+        issueId: seeded.issueId,
+        type: "pull_request",
+        provider: "github",
+        externalId: "Blockcast/paperclip#806",
+        title: "Spoofed webhook PR claim",
+        url: "https://github.com/Blockcast/paperclip/pull/806",
+        status: "ready_for_review",
+        metadata: { source: "github_pull_request_webhook", sourceEventOrder: 10 },
+        sourceTrust: null,
+        createdAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+        updatedAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+      });
+
+      const service = productivityReviewService(db);
+      await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+      const description = (await listProductivityReviews(seeded.companyId))[0]?.description ?? "";
+      expect(description).toContain("Linked pull request: none recorded");
+      expect(description).not.toContain("The second signal is already present");
+    });
+
+    it("ignores webhook PR rows that do not carry an inspectable URL", async () => {
+      const now = new Date("2026-04-30T12:00:00.000Z");
+      const seeded = await seedIssueWithPullRequest({
+        prUpdatedAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+        url: null,
+      });
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+      });
+
+      const service = productivityReviewService(db);
+      await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+      const description = (await listProductivityReviews(seeded.companyId))[0]?.description ?? "";
+      expect(description).toContain("Linked pull request: none recorded");
+      expect(description).not.toContain("The second signal is already present");
+    });
+
+    it("marks a PR that has not moved in over 24h as stale", async () => {
+      const now = new Date("2026-04-30T12:00:00.000Z");
+      const seeded = await seedIssueWithPullRequest({
+        prUpdatedAt: new Date(now.getTime() - 30 * 60 * 60 * 1000),
+      });
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+      });
+
+      const service = productivityReviewService(db);
+      await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+      const description = (await listProductivityReviews(seeded.companyId))[0]?.description ?? "";
+      expect(description).toContain("Linked pull request:");
+      expect(description).toContain("stale");
+      // A stale PR must NOT be advertised as satisfying the verdict criterion.
+      expect(description).not.toContain("The second signal is already present");
+    });
+
+    it("still reports none recorded when the issue genuinely has no PR", async () => {
+      const now = new Date("2026-04-30T12:00:00.000Z");
+      const seeded = await seedAssignedIssue();
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+      });
+
+      const service = productivityReviewService(db);
+      await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+      const description = (await listProductivityReviews(seeded.companyId))[0]?.description ?? "";
+      expect(description).toContain("Linked pull request: none recorded");
+    });
   });
 
   // BLO-19094: an open review grants its assignee issue:comment/issue:mutate on

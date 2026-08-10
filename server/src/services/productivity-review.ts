@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, asc, desc, eq, gt, gte, inArray, isNull, lt, lte, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, inArray, isNotNull, isNull, lt, lte, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { clampIssueRequestDepth } from "@paperclipai/shared";
 import {
@@ -14,6 +14,7 @@ import {
   issueApprovals,
   issueComments,
   issueRelations,
+  issueWorkProducts,
   issues,
   linearIssueLinks,
   projects,
@@ -36,6 +37,10 @@ import {
 } from "./recovery/model-profile-hint.js";
 import { RECOVERY_ORIGIN_KINDS } from "./recovery/origins.js";
 import { runUsageTokenCounts } from "./recovery/zero-token-startup-failure.js";
+import {
+  PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE,
+  PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID,
+} from "./pull-request-work-products.js";
 
 export const PRODUCTIVITY_REVIEW_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.issueProductivityReview;
 export const DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS = 10;
@@ -65,6 +70,12 @@ export const DEFAULT_PRODUCTIVITY_REVIEW_MONITOR_LAPSE_SERVICE_GRACE_MS =
   DEFAULT_HEARTBEAT_SCHEDULER_INTERVAL_MS + ISSUE_MONITOR_WAKE_CLAIM_TTL_MS;
 
 const PRODUCTIVITY_REVIEW_RESERVATION_STALE_MS = 5 * 60 * 1000;
+/**
+ * Window in which a linked PR counts as a non-stale progress signal, matching
+ * the "created or updated in the last 24h" wording in the Manager Decision
+ * block below (BLO-19566 AC4).
+ */
+export const PRODUCTIVITY_REVIEW_PR_FRESH_MS = 24 * 60 * 60 * 1000;
 const TERMINAL_RUN_STATUSES = ["succeeded", "interrupted", "failed", "cancelled", "timed_out"] as const;
 const ACTIVE_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const MAX_CANDIDATE_ISSUES = 250;
@@ -133,6 +144,45 @@ type ProductivityReviewThresholds = {
   monitorDispatchBatchSize: number;
 };
 
+type PullRequestEvidence = {
+  title: string;
+  url: string | null;
+  status: string;
+  externalId: string | null;
+  /** GitHub event time of the newest PR event (not DB receipt time). */
+  updatedAt: Date;
+  /** Age of the newest PR event at evidence-collection time. */
+  ageMs: number;
+};
+
+const PRODUCTIVITY_REVIEW_PROGRESS_PR_STATUS_VALUES = ["ready_for_review", "draft", "merged"] as const;
+const PRODUCTIVITY_REVIEW_PROGRESS_PR_STATUSES = new Set<string>(PRODUCTIVITY_REVIEW_PROGRESS_PR_STATUS_VALUES);
+const PRODUCTIVITY_REVIEW_WEBHOOK_PR_METADATA_SOURCE = PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE;
+
+/**
+ * Effective chronology for a PR work product: the GitHub event time the row was
+ * built from, falling back to DB receipt time only when the row predates that
+ * field. Used for both "which PR is newest" and "how old is it" so a delayed
+ * delivery cannot present a stale PR as fresh (BLO-19566).
+ */
+const pullRequestEffectiveEventAtSql = sql`coalesce(
+  case
+    when ${issueWorkProducts.metadata}->>'sourceEventTimestampMs' ~ '^[0-9]+$'
+      then to_timestamp((${issueWorkProducts.metadata}->>'sourceEventTimestampMs')::bigint / 1000.0)
+    else null
+  end,
+  ${issueWorkProducts.updatedAt}
+)`;
+
+type PullRequestEvidenceRow = {
+  title: string;
+  url: string | null;
+  status: string;
+  externalId: string | null;
+  updatedAt: Date;
+  sourceEventTimestampMs: string | number | null;
+};
+
 type ProductivityReviewEvidence = {
   trigger: ProductivityReviewTrigger;
   triggerReasons: string[];
@@ -166,6 +216,14 @@ type ProductivityReviewEvidence = {
   costCents: number;
   usageSamples: Array<{ runId: string; usageJson: Record<string, unknown> | null }>;
   nextAction: string | null;
+  /**
+   * Newest `pull_request` work product on the source issue, or null when the
+   * issue carries none (BLO-19566 AC4). The reviewer's verdict criteria ask for
+   * "a non-stale PR/MR link in the source issue's evidence"; before this the
+   * evidence pack had no PR field at all, so an assignee pushing commits to an
+   * open PR was indistinguishable from one doing nothing.
+   */
+  latestPullRequest: PullRequestEvidence | null;
   thresholds: ProductivityReviewThresholds;
   generatedAt: Date;
   routineOnlySamplingWindow: boolean;
@@ -587,6 +645,47 @@ function formatMonitorGating(gating: NonNullable<ProductivityReviewEvidence["mon
     return `${split} (no monitor armed during this episode; previous monitor lapsed at ${gating.priorLapseAt.toISOString()}, before it began)`;
   }
   return `${split} (no monitor armed during this episode)`;
+}
+
+function isFreshPullRequest(pr: PullRequestEvidence | null): pr is PullRequestEvidence {
+  return pr !== null && pr.ageMs <= PRODUCTIVITY_REVIEW_PR_FRESH_MS;
+}
+
+function isProgressPullRequest(pr: PullRequestEvidence | null): pr is PullRequestEvidence {
+  return isFreshPullRequest(pr) && PRODUCTIVITY_REVIEW_PROGRESS_PR_STATUSES.has(pr.status);
+}
+
+function toPullRequestEvidence(row: PullRequestEvidenceRow | null, now: Date): PullRequestEvidence | null {
+  if (!row) return null;
+  // Prefer the GitHub event time; `updatedAt` is only a fallback for rows
+  // written before the source timestamp was recorded.
+  const sourceMs = Number(row.sourceEventTimestampMs);
+  const eventAt = Number.isFinite(sourceMs) && row.sourceEventTimestampMs !== null
+    ? new Date(sourceMs)
+    : row.updatedAt;
+  return {
+    title: row.title,
+    url: row.url ?? null,
+    status: row.status,
+    externalId: row.externalId ?? null,
+    updatedAt: eventAt,
+    ageMs: Math.max(0, now.getTime() - eventAt.getTime()),
+  };
+}
+
+/**
+ * Render the linked PR for the evidence pack (BLO-19566 AC4). Reads "none
+ * recorded" only when the issue genuinely has no PR work product -- which is
+ * now a real signal rather than, as before, the only possible output.
+ */
+function formatPullRequestEvidence(pr: PullRequestEvidence | null) {
+  if (!pr) return "none recorded";
+  const ref = pr.url ?? pr.externalId ?? pr.title;
+  const freshness = isFreshPullRequest(pr) ? "non-stale" : "stale";
+  const progress = PRODUCTIVITY_REVIEW_PROGRESS_PR_STATUSES.has(pr.status)
+    ? "progress-eligible"
+    : "not progress-eligible";
+  return `${ref} \`${pr.status}\`, last activity ${pr.updatedAt.toISOString()} (${msToHuman(pr.ageMs)} ago, ${freshness}, ${progress})`;
 }
 
 function isMonitorScheduledSuppression(
@@ -2075,6 +2174,32 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       noCommentStreak += 1;
     }
 
+    const pullRequestFreshCutoff = new Date(now.getTime() - PRODUCTIVITY_REVIEW_PR_FRESH_MS);
+    const pullRequestEvidenceSelect = {
+      title: issueWorkProducts.title,
+      url: issueWorkProducts.url,
+      status: issueWorkProducts.status,
+      externalId: issueWorkProducts.externalId,
+      updatedAt: issueWorkProducts.updatedAt,
+      sourceEventTimestampMs: sql<string | number | null>`case
+        when ${issueWorkProducts.metadata}->>'sourceEventTimestampMs' ~ '^[0-9]+$'
+          then (${issueWorkProducts.metadata}->>'sourceEventTimestampMs')::bigint
+        else null
+      end`,
+    };
+    const trustedPullRequestEvidenceWhere = and(
+      eq(issueWorkProducts.companyId, sourceIssue.companyId),
+      eq(issueWorkProducts.issueId, sourceIssue.id),
+      eq(issueWorkProducts.provider, "github"),
+      eq(issueWorkProducts.type, "pull_request"),
+      isNotNull(issueWorkProducts.externalId),
+      isNotNull(issueWorkProducts.url),
+      sql`${issueWorkProducts.metadata}->>'source' = ${PRODUCTIVITY_REVIEW_WEBHOOK_PR_METADATA_SOURCE}`,
+      sql`${issueWorkProducts.sourceTrust}->>'promotedByActorType' = 'system'`,
+      sql`${issueWorkProducts.sourceTrust}->>'promotedByActorId' = ${PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID}`,
+      sql`coalesce(${issueWorkProducts.metadata}->>'sourceStateVerification', 'verified') <> 'pending'`,
+    );
+
     const [
       runCountLastHour,
       runCountLastSixHours,
@@ -2083,6 +2208,8 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       assigneeRunCommentCountLastSixHours,
       latestComments,
       costRow,
+      latestPullRequestRow,
+      progressPullRequestRow,
     ] = await Promise.all([
       countIssueRunsSince(sourceIssue.companyId, sourceAgent.id, sourceIssue.id, oneHourAgo),
       countIssueRunsSince(sourceIssue.companyId, sourceAgent.id, sourceIssue.id, sixHoursAgo),
@@ -2111,6 +2238,37 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         .from(costEvents)
         .where(and(eq(costEvents.companyId, sourceIssue.companyId), eq(costEvents.issueId, sourceIssue.id)))
         .then((rows) => rows[0] ?? { costCents: 0 }),
+      // BLO-19566 AC4: newest PR linked to this issue. Written by the GitHub
+      // webhook on every pull_request event.
+      //
+      // Ordered and aged by the *GitHub* event time, not `updatedAt`. The row's
+      // `updatedAt` is DB receipt time, so a first delivery that arrives late
+      // (retry, backfill, outage drain) inserts with `updatedAt = now` and would
+      // advertise an already-stale PR as fresh progress for another day. Falls
+      // back to `updatedAt` only for rows with no recorded source timestamp.
+      db
+        .select(pullRequestEvidenceSelect)
+        .from(issueWorkProducts)
+        .where(trustedPullRequestEvidenceWhere)
+        .orderBy(desc(pullRequestEffectiveEventAtSql))
+        .limit(1)
+        .then((rows) => rows[0] ?? null),
+      // The verdict criterion is satisfied by any fresh progress-eligible PR,
+      // not necessarily the newest PR overall. A newer closed-unmerged PR must
+      // not hide an older open/draft/merged PR that is still fresh.
+      db
+        .select(pullRequestEvidenceSelect)
+        .from(issueWorkProducts)
+        .where(
+          and(
+            trustedPullRequestEvidenceWhere,
+            inArray(issueWorkProducts.status, [...PRODUCTIVITY_REVIEW_PROGRESS_PR_STATUS_VALUES]),
+            sql`${pullRequestEffectiveEventAtSql} >= ${pullRequestFreshCutoff.toISOString()}::timestamptz`,
+          ),
+        )
+        .orderBy(desc(pullRequestEffectiveEventAtSql))
+        .limit(1)
+        .then((rows) => rows[0] ?? null),
     ]);
 
     const activeRunCount = latestRuns.filter((run) =>
@@ -2162,6 +2320,8 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     const nonLiveHoldMs = episodeMs === null
       ? trailingHoldMs
       : Math.min(episodeMs, leadingParkMs + trailingHoldMs);
+
+    const latestPullRequest = toPullRequestEvidence(progressPullRequestRow ?? latestPullRequestRow, now);
 
     const noComment = noCommentStreak >= thresholds.noCommentStreakRuns;
     // Reuses `noCommentStreakRuns` as the sample-size threshold: both streaks
@@ -2269,6 +2429,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         .slice(0, 3)
         .map((run) => ({ runId: run.id, usageJson: run.usageJson ?? null })),
       nextAction: latestRuns.find((run) => run.nextAction)?.nextAction ?? null,
+      latestPullRequest,
       thresholds,
       generatedAt: now,
       routineOnlySamplingWindow,
@@ -2381,6 +2542,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       `- Runs in rolling windows: ${evidence.runCountLastHour}/1h, ${evidence.runCountLastSixHours}/6h`,
       `- Assignee run-linked comments total/window: ${evidence.commentCount} total, ${evidence.commentCountLastHour}/1h, ${evidence.commentCountLastSixHours}/6h`,
       `- Cost events total: ${evidence.costCents} cents`,
+      `- Linked pull request: ${formatPullRequestEvidence(evidence.latestPullRequest)}`,
       `- Current next action: ${evidence.nextAction ? truncateInline(evidence.nextAction, 500) : "none recorded"}`,
       "",
       "## Thresholds",
@@ -2418,6 +2580,14 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           "- An assignee run-linked comment in the last 6h that contains a `Next action:` line",
           "- A non-stale PR/MR link in the source issue's evidence (created or updated in the last 24h)",
           "- A recent test result, artifact commit, or workspace deliverable in the last 6h",
+          ...(isProgressPullRequest(evidence.latestPullRequest)
+            ? [
+                "",
+                `> The second signal is already present: ${formatPullRequestEvidence(evidence.latestPullRequest)}.`,
+                "> PR activity is recorded from the GitHub webhook, so this is deliverable progress even",
+                "> when the run/comment counters above read zero.",
+              ]
+            : []),
           "",
           "If none of these signals is present, the correct verdict is one of:",
           "- Request decomposition (the work is too large for a single heartbeat issue and needs to be split)",
@@ -2442,6 +2612,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         ? [`- Elapsed accounting: ${formatMonitorGating(evidence.monitorGating)}`]
         : []),
       `- Next action: ${evidence.nextAction ? truncateInline(evidence.nextAction, 300) : "none recorded"}`,
+      `- Linked pull request: ${formatPullRequestEvidence(evidence.latestPullRequest)}`,
     ].join("\n");
   }
 

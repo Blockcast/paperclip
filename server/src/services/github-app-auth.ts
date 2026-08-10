@@ -216,6 +216,20 @@ export type PullRequestGateResult =
   | { state: "open" | "closed"; merged: boolean }
   | { error: string };
 
+export interface GitHubPullRequestState {
+  state: "open" | "closed";
+  merged: boolean;
+  draft: boolean;
+  title: string | null;
+  url: string | null;
+  headSha: string | null;
+  branch: string | null;
+  mergedAt: string | null;
+  updatedAt: string | null;
+}
+
+export type GitHubPullRequestStateResult = GitHubPullRequestState | { error: string };
+
 export async function githubGetPullRequestGate(input: {
   repoFullName: string;
   prNumber: number;
@@ -244,6 +258,61 @@ export async function githubGetPullRequestGate(input: {
     return { error: "pull_request_state_missing" };
   }
   return { state: body.state, merged: body.merged === true };
+}
+
+/**
+ * Fetch the current canonical state for a PR. Webhook payload timestamps are
+ * only second-resolution, so two distinct lifecycle changes can share one
+ * timestamp and cannot be ordered from deliveries alone. Callers use this
+ * narrow read only to settle that ambiguous case; an API failure leaves the
+ * evidence pending rather than guessing which delivery is newer.
+ */
+export async function githubGetPullRequestState(input: {
+  repoFullName: string;
+  prNumber: number;
+}): Promise<GitHubPullRequestStateResult> {
+  const tokenResult = await getInstallationTokenResult();
+  if (!tokenResult.ok) return { error: tokenResult.reason };
+
+  const apiBase = gitHubApiBase(GITHUB_HOST);
+  let res: Response;
+  try {
+    res = await ghFetch(`${apiBase}/repos/${input.repoFullName}/pulls/${input.prNumber}`, {
+      headers: { ...GITHUB_API_HEADERS, authorization: `Bearer ${tokenResult.token}` },
+    });
+  } catch {
+    return { error: "pull_request_fetch_failed" };
+  }
+  if (!res.ok) {
+    const classified = await classifyGithubHttpFailure("pull_request", res);
+    return { error: classified.reason };
+  }
+  const body = (await res.json().catch(() => null)) as {
+    state?: unknown;
+    merged?: unknown;
+    draft?: unknown;
+    title?: unknown;
+    html_url?: unknown;
+    merged_at?: unknown;
+    updated_at?: unknown;
+    head?: { sha?: unknown; ref?: unknown } | null;
+  } | null;
+  if (body?.state !== "open" && body?.state !== "closed") {
+    return { error: "pull_request_state_missing" };
+  }
+  const stringOrNull = (value: unknown) =>
+    typeof value === "string" && value.trim().length > 0 ? value : null;
+  return {
+    state: body.state,
+    merged: body.merged === true,
+    draft: body.draft === true,
+    title: stringOrNull(body.title),
+    url: stringOrNull(body.html_url),
+    headSha: stringOrNull(body.head?.sha),
+    branch: stringOrNull(body.head?.ref),
+    mergedAt: stringOrNull(body.merged_at),
+    updatedAt: stringOrNull(body.updated_at),
+  };
 }
 
 /** Extract the leading 7-40 hex chars of a head SHA, or null. */

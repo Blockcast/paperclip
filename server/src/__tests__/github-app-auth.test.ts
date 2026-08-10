@@ -19,6 +19,7 @@ import {
   getInstallationToken,
   getInstallationTokenResult,
   githubGetPullRequestGate,
+  githubGetPullRequestState,
   githubHasReviewerEvidenceForPr,
   githubGetLatestCommitStatusForContext,
   githubPostCommitStatus,
@@ -197,6 +198,58 @@ describe("githubGetPullRequestGate", () => {
     await expect(githubGetPullRequestGate({
       repoFullName: "Blockcast/paperclip",
       prNumber: 847,
+    })).resolves.toEqual({ error: "pull_request_http_503" });
+  });
+});
+
+describe("githubGetPullRequestState", () => {
+  it("returns the canonical lifecycle and head fields used to settle ambiguous webhook deliveries", async () => {
+    setCreds();
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL) => {
+      if (String(url).includes("/access_tokens")) {
+        return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
+      }
+      expect(String(url)).toContain("/repos/Blockcast/paperclip/pulls/920");
+      return jsonResponse({
+        state: "closed",
+        merged: false,
+        draft: false,
+        title: "Close the ambiguous lifecycle",
+        html_url: "https://github.com/Blockcast/paperclip/pull/920",
+        merged_at: null,
+        updated_at: "2026-08-10T12:00:00Z",
+        head: { sha: "deadbeef", ref: "fix/blo-19566" },
+      });
+    }));
+
+    await expect(githubGetPullRequestState({
+      repoFullName: "Blockcast/paperclip",
+      prNumber: 920,
+    })).resolves.toEqual({
+      state: "closed",
+      merged: false,
+      draft: false,
+      title: "Close the ambiguous lifecycle",
+      url: "https://github.com/Blockcast/paperclip/pull/920",
+      headSha: "deadbeef",
+      branch: "fix/blo-19566",
+      mergedAt: null,
+      updatedAt: "2026-08-10T12:00:00Z",
+    });
+  });
+
+  it("returns an explicit error instead of guessing when the current state cannot be fetched", async () => {
+    setCreds();
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL) => {
+      if (String(url).includes("/access_tokens")) {
+        return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
+      }
+      return jsonResponse({ message: "unavailable" }, false, 503);
+    }));
+
+    await expect(githubGetPullRequestState({
+      repoFullName: "Blockcast/paperclip",
+      prNumber: 920,
     })).resolves.toEqual({ error: "pull_request_http_503" });
   });
 });
