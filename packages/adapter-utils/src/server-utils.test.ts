@@ -555,6 +555,39 @@ describe("runChildProcess", () => {
   });
 
   it.skipIf(process.platform === "win32")(
+    "keeps timeout escalation armed after the direct child exits",
+    async () => {
+      const result = await runChildProcess(
+        randomUUID(),
+        process.execPath,
+        [
+          "-e",
+          [
+            "const { spawn } = require('node:child_process');",
+            "const child = spawn(process.execPath, ['-e', `process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)`], { stdio: 'ignore' });",
+            "process.stdout.write(String(child.pid));",
+            "setInterval(() => {}, 1000);",
+          ].join(" "),
+        ],
+        {
+          cwd: process.cwd(),
+          env: {},
+          timeoutSec: 1,
+          graceSec: 1,
+          onLog: async () => {},
+          onSpawn: async () => {},
+        },
+      );
+
+      const descendantPid = Number.parseInt(result.stdout.trim(), 10);
+      expect(result.timedOut).toBe(true);
+      expect(result.signal).toBe("SIGTERM");
+      expect(Number.isInteger(descendantPid) && descendantPid > 0).toBe(true);
+      expect(await waitForPidExit(descendantPid, 2_000)).toBe(true);
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
     "force-kills a child that ignores SIGTERM once the grace window elapses",
     async () => {
       // Residual hang case: a child that installs a SIGTERM handler which
