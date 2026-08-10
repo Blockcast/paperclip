@@ -314,12 +314,18 @@ export function approvalService(db: Db) {
         throw unprocessable("Approval requester must be either an agent or a user, not both");
       }
 
+      // Routed through insertApprovalRecord() (BLO-22705), matching create() above,
+      // rather than a direct db.insert(approvals) — this is the same HTTP-validated
+      // (createApprovalSchema) caller-supplied-payload boundary, and going through
+      // the shared helper keeps every db.insert(approvals) call site in this file
+      // covered by approval-payload-title-guard.test.ts instead of needing its own
+      // allowlist entry.
       async function insertNew(client: Db, normalizedKey: string | null) {
-        const approval = await client
-          .insert(approvals)
-          .values({ ...data, companyId, idempotencyKey: normalizedKey })
-          .returning()
-          .then((rows) => rows[0]);
+        const approval = await insertApprovalRecord(client, {
+          ...data,
+          companyId,
+          idempotencyKey: normalizedKey,
+        }).then((rows) => rows[0]);
         await options.afterCreate?.(client, approval);
         return { approval, deduplicated: false };
       }
