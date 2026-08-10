@@ -210,19 +210,32 @@ merge API, and the MCP `create_or_update_file`/`push_files` tools, which are
 thin wrappers over the same endpoints) default `commit.author` to the
 *authenticated* identity whenever the caller doesn't supply one — so **every
 agent's commit made through that path is stamped `allyblockcast[bot]`**,
-regardless of which agent actually wrote it. `git push` is unaffected: git
-reads `user.name`/`user.email` from local config, which is already set
-per-agent (e.g. `<agentnamekey>@paperclip.blockcast.net`), so a pushed commit
-correctly carries the acting agent's identity.
+regardless of which agent actually wrote it. `git push` reads
+`user.name`/`user.email` from the checkout's *local* git config instead, so
+it is not subject to this server-side default — but that only produces a
+correctly-attributed commit if the local config actually holds your own
+per-agent identity (e.g. `<agentnamekey>@paperclip.blockcast.net`). It is not
+guaranteed to: **a 2026-08-10 sweep of 71 checkouts under `/paperclip/work`
+found 11 with local config already stamped to the shared App identity and 18
+with no local identity set at all (BLO-23894)**. `policy` failing on a
+commit you made with `git push` is therefore not proof of a REST/MCP write —
+check `git config user.email` in the checkout first.
 
 This is a controlled, reproduced finding (BLO-21416), not a hunch — do not
 re-derive it or re-file it as a fresh misattribution report:
 
-- **Use `git push` for every repo commit.** It is the only write path that is
-  already correctly per-agent. Do not use the MCP `create_or_update_file` /
+- **Use `git push` for every repo commit.** It is the only write path that
+  *can* be correctly per-agent. Do not use the MCP `create_or_update_file` /
   `push_files` tools to land commits — they have no `author` field in their
   schema, so there is no way to override the App stamp through them, and using
   them silently erases your authorship.
+- **Verify your checkout's local identity before you push, don't assume it.**
+  Run `git config user.email`. If it is unset or equals
+  `290875700+allyblockcast[bot]@users.noreply.github.com` or
+  `allyblockcast[bot]@users.noreply.github.com`, set it yourself:
+  `git config user.email "<agentnamekey>@paperclip.blockcast.net"` and
+  `git config user.name "<YourAgentName>"`. This is a known, unfixed
+  provisioning gap (BLO-23894), not a hypothetical.
 - If you must create a commit via the raw API (no local checkout available),
   use `gh api` directly and pass an explicit author, e.g.:
   ```bash
@@ -241,6 +254,15 @@ re-derive it or re-file it as a fresh misattribution report:
 - **Merge and squash-merge commits are legitimately App-attributed** — GitHub
   itself creates those via the merge API on your behalf. This is out of
   scope; don't flag them.
+- **The gate matches only the numeric-prefixed App email
+  (`290875700+allyblockcast[bot]@users.noreply.github.com`), deliberately not
+  the bare `allyblockcast[bot]@users.noreply.github.com`.** That bare form is
+  the `graphify-reindex` bot's own legitimate `git push` identity, verified
+  against real PRs (#789, #944) — widening the match would flag its
+  commits. If your checkout's local `user.email` shows the bare form, that
+  is still a misconfigured checkout (see above): fix the local config; do
+  not ask the gate to catch it, it cannot distinguish the two cases by email
+  alone.
 - CI enforces this going forward on every `paperclip` PR
   (`scripts/check-commit-author-attribution.mjs`, wired into `pr.yml`); an
   on-demand cross-repo audit mode (`--audit-merged`) covers
