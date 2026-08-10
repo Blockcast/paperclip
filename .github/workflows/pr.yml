@@ -191,6 +191,16 @@ jobs:
       - name: Test general-server shard partition
         run: node --test ./scripts/__tests__/run-vitest-stable-shard.test.mjs
 
+      # BLO-24241: unlike the step above (a hard-required, generous-floor
+      # sanity check), this one asserts strict 100% manifest coverage and is
+      # allowed to fail. A missing suite shows up as a real red X on this
+      # step, naming the exact suites and the one-line fix, without failing
+      # `policy` and skipping build/typecheck/e2e for the whole PR the way
+      # the old bare >=90% assertion did.
+      - name: Check shard duration manifest freshness (non-blocking)
+        continue-on-error: true
+        run: node --test ./scripts/check-shard-manifest-freshness.test.mjs
+
       - name: Test vitest project coverage
         run: node --test ./scripts/__tests__/vitest-project-coverage.test.mjs
 

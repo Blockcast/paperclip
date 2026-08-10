@@ -1,0 +1,163 @@
+name: Refresh Shard Manifest
+
+# Keeps scripts/general-server-shard-durations.json from silently going stale
+# (BLO-24241). The manifest's own $comment says it should be refreshed "when
+# shard timing drifts materially", but nothing measured that drift before
+# this workflow existed -- refresh depended entirely on a human noticing
+# (which is how #1117 hit the old 90% coverage cliff, and how the 138s+
+# heartbeat-queued-backlog-convergence suite spent a stretch silently
+# absorbing the median weight instead of its own). This runs on a schedule
+# instead, mirroring one real ARC PR run: a 4-way general-server shard
+# matrix, merged into a single manifest update, opened as a PR the same way
+# refresh-lockfile.yml opens lockfile refreshes.
+#
+# Deliberately opens a PR rather than pushing straight to master: unlike a
+# lockfile refresh (mechanically regenerated, always safe), a duration
+# manifest update is worth a diff a human can skim for a suite that
+# regressed or improved by an order of magnitude before it starts steering
+# the shard matrix.
+
+on:
+  schedule:
+    - cron: "23 5 * * 1" # Monday 05:23 UTC -- clear of the hourly/half-hourly pile-up
+  workflow_dispatch:
+
+concurrency:
+  group: refresh-shard-manifest-master
+  cancel-in-progress: false
+
+jobs:
+  measure:
+    name: Measure shard ${{ matrix.shard_index }}
+    runs-on: default
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        shard_index: [0, 1, 2, 3]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 9.15.4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Measure this shard's suite durations
+        run: |
+          node scripts/measure-general-server-shard-durations.mjs \
+            --all \
+            --shard-index ${{ matrix.shard_index }} \
+            --shard-count 4 \
+            --output /tmp/shard-${{ matrix.shard_index }}.json
+
+      - name: Upload measured durations
+        uses: actions/upload-artifact@v4
+        with:
+          name: shard-durations-${{ matrix.shard_index }}
+          path: /tmp/shard-${{ matrix.shard_index }}.json
+          retention-days: 1
+          if-no-files-found: error
+
+  refresh:
+    needs: [measure]
+    runs-on: default
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Download measured durations
+        uses: actions/download-artifact@v4
+        with:
+          pattern: shard-durations-*
+          path: /tmp/shard-durations
+          merge-multiple: true
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Merge shards into the manifest
+        run: |
+          node - <<'EOF'
+          const { readFileSync, writeFileSync, readdirSync } = require("node:fs");
+          const path = require("node:path");
+
+          const manifestPath = path.join(process.cwd(), "scripts", "general-server-shard-durations.json");
+          const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+
+          const shardDir = "/tmp/shard-durations";
+          let measured = {};
+          for (const file of readdirSync(shardDir)) {
+            const shard = JSON.parse(readFileSync(path.join(shardDir, file), "utf8"));
+            measured = { ...measured, ...shard };
+          }
+
+          const merged = { ...manifest.durations, ...measured };
+          const sorted = {};
+          for (const key of Object.keys(merged).sort()) {
+            sorted[key] = merged[key];
+          }
+          manifest.durations = sorted;
+
+          const runId = process.env.GITHUB_RUN_ID;
+          const today = new Date().toISOString().slice(0, 10);
+          manifest["$comment"] =
+            `Per-suite Vitest elapsed durations (ms) for the general-server lane, used by scripts/general-server-shard.mjs to balance suites across the PR shard matrix. Sampled from the four .github/workflows/refresh-shard-manifest.yml shard jobs in run ${runId} on ${today}. Suites absent from that run use the median fallback; the same workflow re-samples this weekly so it does not need a human to notice drift.`;
+
+          writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + "\n");
+          console.log(`Merged ${Object.keys(measured).length} measured suite(s) into ${Object.keys(manifest.durations).length} total manifest entries.`);
+          EOF
+
+      - name: Create or update pull request
+        id: upsert-pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO_OWNER: ${{ github.repository_owner }}
+        run: |
+          if git diff --quiet -- scripts/general-server-shard-durations.json; then
+            echo "Manifest unchanged, nothing to do."
+            echo "pr_url=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          BRANCH="chore/refresh-shard-manifest"
+          git config user.name "shard-manifest-bot"
+          git config user.email "shard-manifest-bot@users.noreply.github.com"
+
+          git checkout -B "$BRANCH"
+          git add scripts/general-server-shard-durations.json
+          git commit -m "ci: refresh general-server shard durations"
+          git push --force origin "$BRANCH"
+
+          pr_url="$(
+            gh pr list --state open --head "$BRANCH" --json url,headRepositoryOwner \
+              --jq ".[] | select(.headRepositoryOwner.login == \"$REPO_OWNER\") | .url" |
+            head -n 1
+          )"
+          if [ -z "$pr_url" ]; then
+            pr_url="$(gh pr create \
+              --head "$BRANCH" \
+              --title "ci: refresh general-server shard durations" \
+              --body "Auto-generated weekly refresh of scripts/general-server-shard-durations.json from a live 4-way general-server measurement run (BLO-24241). Review for any suite whose duration moved by an order of magnitude before merging -- everything else is routine drift.")"
+            echo "Created new PR: $pr_url"
+          else
+            echo "PR already exists: $pr_url"
+          fi
+          echo "pr_url=$pr_url" >> "$GITHUB_OUTPUT"

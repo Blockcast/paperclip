@@ -1,5 +1,5 @@
 {
-  "$comment": "Per-suite Vitest elapsed durations (ms) for the general-server lane, used by scripts/general-server-shard.mjs to balance suites across the PR shard matrix. Sampled from the four successful ARC PR jobs in run 31248977534 on 2026-08-08. Suites absent from that run are intentionally omitted and use the median fallback.",
+  "$comment": "Per-suite Vitest elapsed durations (ms) for the general-server lane, used by scripts/general-server-shard.mjs to balance suites across the PR shard matrix. Sampled from the four successful ARC PR jobs in run 31248977534 on 2026-08-08, topped up on 2026-08-10 (BLO-24241) with locally measured durations for the 3 suites that run added after the sample (ccrotate-capacity-retry, execution-workspace-per-run-isolation, human-gated-ageing) so coverage is 100% again. Suites absent from both sources use the median fallback; .github/workflows/refresh-shard-manifest.yml re-samples this from a real ARC run on a schedule so it does not need a human to notice drift.",
   "unit": "ms",
   "durations": {
     "server/src/__tests__/ac-policy-assignee-routing.test.ts": 19,
@@ -58,6 +58,7 @@
     "server/src/__tests__/budgets-service.test.ts": 4803,
     "server/src/__tests__/build-commit.test.ts": 6,
     "server/src/__tests__/built-in-agents.test.ts": 29548,
+    "server/src/__tests__/ccrotate-capacity-retry.test.ts": 29,
     "server/src/__tests__/ccrotate-plugin-retirement.test.ts": 14,
     "server/src/__tests__/ccrotate-target.test.ts": 9,
     "server/src/__tests__/change-consent-gate.test.ts": 5402,
@@ -127,6 +128,7 @@
     "server/src/__tests__/evidence-gate-wiring.test.ts": 65,
     "server/src/__tests__/evidence-gate.test.ts": 79,
     "server/src/__tests__/execution-lock-orphan-cleanup.test.ts": 5464,
+    "server/src/__tests__/execution-workspace-per-run-isolation.test.ts": 1980,
     "server/src/__tests__/execution-workspace-policy.test.ts": 20,
     "server/src/__tests__/execution-workspaces-derive-agent-cwd.test.ts": 4,
     "server/src/__tests__/execution-workspaces-service.test.ts": 49219,
@@ -215,6 +217,7 @@
     "server/src/__tests__/helpers/cleanup-heartbeat-test-state.test.ts": 7738,
     "server/src/__tests__/hire-hook.test.ts": 21,
     "server/src/__tests__/http-log-policy.test.ts": 11,
+    "server/src/__tests__/human-gated-ageing.test.ts": 85,
     "server/src/__tests__/in-review-gate.test.ts": 10,
     "server/src/__tests__/inbox-dismissals.test.ts": 8466,
     "server/src/__tests__/instance-settings-service.test.ts": 45,
