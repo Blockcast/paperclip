@@ -5405,6 +5405,75 @@ function isEffectivelyDependencyReadyForDispatch(
   return allowsIssueInteractionWake(contextSnapshot);
 }
 
+/**
+ * The single definition of "is this queued run's issue actually claimable
+ * right now" (BLO-22091). Every dispatch lane's eligibility test
+ * (`foundReadyCritical`, `foundReadyRecovery`, `foundReadyAbsolute`) calls
+ * this and nothing else, so a future change to any one screen cannot
+ * silently desynchronize the lanes from what the claim path actually
+ * accepts — the exact shape of leaks 2-5 (BLO-21792), which were each one
+ * site re-deriving this verdict slightly differently from the others.
+ *
+ * Three screens, matching what `claimQueuedRun` applies to a routine
+ * (non-reopen) queued run:
+ *   1. The issue must exist and be non-terminal (`TERMINAL_ISSUE_STATUSES`).
+ *   2. It must not be a k8s-isolation retry still waiting on its timestamp.
+ *   3. It must be dependency-ready, or exempted via a verified issue-
+ *      interaction wake (`isEffectivelyDependencyReadyForDispatch` above).
+ *
+ * `claimQueuedRun`'s own dependency-blocker gate calls
+ * `isEffectivelyDependencyReadyForDispatch` directly rather than this whole
+ * predicate, and the `dispatchRank` invocation below calls the narrower
+ * sibling `isDispatchRankReady` instead of this — see that function's
+ * comment for why terminal-status can't be folded in there without
+ * reintroducing an unbounded wait for a different exemption.
+ */
+function isRunClaimable(
+  contextSnapshot: Record<string, unknown> | null | undefined,
+  issue: { status: string } | null | undefined,
+  readiness: { isDependencyReady: boolean } | null | undefined,
+  now: Date,
+): boolean {
+  if (!issue || TERMINAL_ISSUE_STATUSES.has(issue.status)) return false;
+  if (isK8sIsolationRetryDeferred(contextSnapshot, now)) return false;
+  return isEffectivelyDependencyReadyForDispatch(contextSnapshot, readiness);
+}
+
+/**
+ * `dispatchRank`'s `ready` screen (BLO-22091). Deliberately narrower than
+ * `isRunClaimable` above: it omits the terminal-issue check on purpose.
+ *
+ * By the time a row reaches the ranking step, `queuedRuns` has already been
+ * pruned for terminal issues by the main scan via `evaluateQueuedRunStaleness`
+ * — the same function `claimQueuedRun` itself uses — which lets a
+ * `resumeIntent`/wake-comment-carrying row survive against a done/cancelled
+ * issue so a comment can reopen it. That pruning is authoritative and
+ * resume-intent-aware; this function must not re-exclude what it already
+ * decided to keep. If it did, `dispatchRank`'s `!ready` branch never ages
+ * (a row that "cannot be claimed" must not escalate to the front, however
+ * long it has waited — see that function) so a legitimately-claimable
+ * reopened row would rank `12+` forever and starve exactly the way this
+ * ticket exists to prevent, just via a different exemption than leak 5's.
+ *
+ * The lanes above don't have this problem: they already excluded terminal
+ * issues from their own candidate batches unconditionally before this fix
+ * (via `criticalIssueById`'s filter, lane B's `candidates` filter, and lane
+ * C's inline check), so a resume-intent-exempted terminal row was already
+ * never surfaced as "found ready" by any lane — `isRunClaimable` preserves
+ * that pre-existing behavior rather than changing it. Only `dispatchRank`'s
+ * `ready` previously had *no* terminal screen at all (trusting the upstream
+ * prune), so adding the full `isRunClaimable` there — rather than this
+ * narrower sibling — would have been a net new regression, not a fix.
+ */
+function isDispatchRankReady(
+  contextSnapshot: Record<string, unknown> | null | undefined,
+  readiness: { isDependencyReady: boolean } | null | undefined,
+  now: Date,
+): boolean {
+  if (isK8sIsolationRetryDeferred(contextSnapshot, now)) return false;
+  return isEffectivelyDependencyReadyForDispatch(contextSnapshot, readiness);
+}
+
 async function listUnresolvedBlockerSummaries(
   dbOrTx: Pick<Db, "select">,
   companyId: string,
@@ -15261,11 +15330,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       const dependencyReadiness = await issuesSvc.listDependencyReadiness(run.companyId, [issueId]);
       const readiness = dependencyReadiness.get(issueId);
-      const unresolvedBlockerCount = readiness?.unresolvedBlockerCount ?? 0;
-      issueDependencyReadyForAutoCheckout = unresolvedBlockerCount === 0;
-      if (unresolvedBlockerCount > 0 && !allowsIssueInteractionWake(context)) {
+      issueDependencyReadyForAutoCheckout = readiness?.isDependencyReady ?? true;
+      // Consumes the exact same predicate every dispatch lane and dispatchRank
+      // call for this screen (`isRunClaimable`, BLO-22091) instead of
+      // re-deriving the blocker-count/interaction-wake boolean locally — that
+      // local re-derivation is how leak 5 (BLO-21792) happened: this gate and
+      // the lanes agreed by convention, not by construction, until they didn't.
+      if (!isEffectivelyDependencyReadyForDispatch(context, readiness)) {
         await cancelQueuedRunForBlockedDependencies(run, issueId, readiness?.unresolvedBlockerIssueIds ?? []);
-        logger.info({ runId: run.id, issueId, unresolvedBlockerCount }, "claimQueuedRun: cancelled blocked queued run");
+        logger.info(
+          { runId: run.id, issueId, unresolvedBlockerCount: readiness?.unresolvedBlockerCount ?? 0 },
+          "claimQueuedRun: cancelled blocked queued run",
+        );
         return null;
       }
 
@@ -19666,15 +19742,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         for (const { issue } of criticalBatch) issueById.set(issue.id, issue);
         // Dependency-ready is not necessarily claimable: isolation retries
         // remain queued until their retry timestamp. Keep paging past them so
-        // a deferred head row cannot hide runnable emergency work.
+        // a deferred head row cannot hide runnable emergency work. Calls the
+        // single `isRunClaimable` predicate (BLO-22091) rather than
+        // re-deriving its screens here.
         foundReadyCritical = criticalRuns.some((run) => {
           const snapshot = parseObject(run.contextSnapshot);
           const issueId = readNonEmptyString(snapshot.issueId);
-          return Boolean(
-            issueId
-            && isEffectivelyDependencyReadyForDispatch(snapshot, batchReadiness.get(issueId))
-            && !isK8sIsolationRetryDeferred(snapshot, dispatchNow)
-          );
+          const issue = issueId ? issueById.get(issueId) : null;
+          return isRunClaimable(snapshot, issue, issueId ? batchReadiness.get(issueId) : null, dispatchNow);
         });
         if (foundReadyCritical || criticalLaneExhausted) break;
       }
@@ -19782,14 +19857,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
         const batchReadiness = await listQueuedRunDependencyReadiness(agent.companyId, candidates);
         for (const [issueId, readiness] of batchReadiness) dependencyReadiness.set(issueId, readiness);
+        // Calls the single `isRunClaimable` predicate (BLO-22091) rather than
+        // re-deriving its screens here; `candidates` is already terminal-
+        // filtered above, so the issue lookup below is never null in practice.
         foundReadyRecovery = candidates.some((run) => {
           const snapshot = parseObject(run.contextSnapshot);
           const issueId = readNonEmptyString(snapshot.issueId);
-          return Boolean(
-            issueId
-            && isEffectivelyDependencyReadyForDispatch(snapshot, batchReadiness.get(issueId))
-            && !isK8sIsolationRetryDeferred(snapshot, dispatchNow)
-          );
+          const issue = issueId ? issueById.get(issueId) : null;
+          return isRunClaimable(snapshot, issue, issueId ? batchReadiness.get(issueId) : null, dispatchNow);
         });
         if (foundReadyRecovery || recoveryLaneExhausted) break;
       }
@@ -19947,22 +20022,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           for (const [issueId, readiness] of batchReadiness) dependencyReadiness.set(issueId, readiness);
           // "Eligible" must mean the same thing the claim loop means, or the
           // lane stops paging on a row that will not in fact be claimed and the
-          // masking survives in a narrower form. A row counts only if it has a
-          // live issue, is *effectively* dependency-ready (see
-          // `isEffectivelyDependencyReadyForDispatch` — a blocked issue whose
-          // wake is an interaction wake IS claimable), and is not an isolation
-          // retry still waiting on its timestamp — the same screens the claim
-          // path applies, matching how lane A defines `foundReadyCritical`.
+          // masking survives in a narrower form. Calls the single
+          // `isRunClaimable` predicate (BLO-22091) — the same one lane A, lane
+          // B, and the dispatchRank invocation below call — so this can no
+          // longer independently drift from what `claimQueuedRun` decides.
           foundReadyAbsolute = batch.some((run) => {
             const snapshot = parseObject(run.contextSnapshot);
             const issueId = readNonEmptyString(snapshot.issueId);
-            if (!issueId) return false;
-            const issue = issueById.get(issueId);
-            if (!issue || TERMINAL_ISSUE_STATUSES.has(issue.status)) return false;
-            return Boolean(
-              isEffectivelyDependencyReadyForDispatch(snapshot, batchReadiness.get(issueId))
-              && !isK8sIsolationRetryDeferred(snapshot, dispatchNow)
-            );
+            const issue = issueId ? issueById.get(issueId) : null;
+            return isRunClaimable(snapshot, issue, issueId ? batchReadiness.get(issueId) : null, dispatchNow);
           });
           if (foundReadyAbsolute || absoluteLaneExhausted) break;
         }
@@ -20250,10 +20318,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       for (const queuedRun of queuedRuns) {
         const snapshot = parseObject(queuedRun.contextSnapshot);
         const issueId = readNonEmptyString(snapshot.issueId);
-        const ready = issueId
-          ? isEffectivelyDependencyReadyForDispatch(snapshot, dependencyReadiness.get(issueId))
-          : true;
         const issue = issueId ? issueById.get(issueId) : null;
+        // Calls the single `isRunClaimable` predicate (BLO-22091) so a row's
+        // rank can never disagree with the lanes above about what "ready"
+        // means for the screens that stay identical at every stage. This
+        // previously called `isEffectivelyDependencyReadyForDispatch` alone,
+        // which only screens dependency-readiness: an isolation-retry-
+        // deferred row that was otherwise dependency-ready read `ready: true`
+        // here, so once it aged past the absolute floor it ranked
+        // `ABSOLUTE_STARVATION_DISPATCH_RANK` — the very front of the queue —
+        // despite `claimQueuedRun` refusing it unconditionally at claim time.
+        // Deliberately `isDispatchRankReady`, not the lanes' `isRunClaimable`
+        // — see that function's comment for why terminal-status must stay
+        // out of this specific screen.
+        const ready = issueId ? isDispatchRankReady(snapshot, dependencyReadiness.get(issueId), dispatchNow) : true;
         // Require both recoveryActionId AND source:"issue_recovery_action" (every
         // enqueueWakeup call in recovery/service.ts stamps both together) so this
         // stays an explicit, narrowly-scoped coupling rather than any future wake
