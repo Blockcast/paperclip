@@ -154,6 +154,23 @@ export type AgentJobFailureDiagnostics = {
   logTailTruncated: boolean;
 };
 
+/**
+ * Derive the most specific safe failure code from terminal app-container
+ * diagnostics. The Job-level `Failed` condition is kept as the fallback when
+ * diagnostics are unavailable or do not identify an OOM/exit-137 failure.
+ */
+export function classifyAgentJobFailureErrorCode(
+  diagnostics: AgentJobFailureDiagnostics | null,
+): "oom_killed" | "exit_137" | null {
+  const failedApps = diagnostics?.containers.filter(
+    (entry) => entry.kind === "app" && (entry.exitCode ?? 0) !== 0,
+  ) ?? [];
+  if (failedApps.some((entry) => entry.reason?.toLowerCase() === "oomkilled")) {
+    return "oom_killed";
+  }
+  return failedApps.some((entry) => entry.exitCode === 137) ? "exit_137" : null;
+}
+
 type ClientState =
   | { kind: "uninitialized" }
   | { kind: "unavailable"; reason: string }
