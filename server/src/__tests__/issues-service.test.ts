@@ -598,6 +598,32 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     });
   });
 
+  it("returns the active aggregate winner for sequential alertmanager creates", async () => {
+    const companyId = await seedAssignableAgentCompany();
+    const originFingerprint =
+      'alert-aggregate:v1:["HindsightConsolidationStalled",null]';
+    const first = await svc.create(companyId, {
+      title: "First alert series",
+      status: "todo",
+      priority: "high",
+      originKind: "plugin:paperclip-plugin-alertmanager",
+      originId: "series-1",
+      originFingerprint,
+    });
+
+    const second = await svc.create(companyId, {
+      title: "Concurrent alert series",
+      status: "todo",
+      priority: "high",
+      originKind: "plugin:paperclip-plugin-alertmanager",
+      originId: "series-2",
+      originFingerprint,
+    });
+
+    expect(second.id).toBe(first.id);
+    expect(second.identifier).toBe(first.identifier);
+  });
+
   function agentRow(companyId: string, input: {
     id: string;
     name: string;
