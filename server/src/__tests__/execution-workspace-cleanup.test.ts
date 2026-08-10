@@ -227,4 +227,31 @@ describeEmbeddedPostgres("run-scoped execution workspace cleanup", () => {
       .then((rows) => rows[0]);
     expect(row).toMatchObject({ status: "archived", cleanupEligibleAt: null });
   });
+
+  it("renews an active cleanup claim so an expired initial lease cannot run concurrently", async () => {
+    const fixture = await provisionPersistedWorkspace();
+    await db
+      .update(projectWorkspaces)
+      .set({ cleanupCommand: "sleep 1" })
+      .where(eq(projectWorkspaces.id, fixture.projectWorkspaceId));
+    await db
+      .update(executionWorkspaces)
+      .set({ status: "cleanup_pending", cleanupEligibleAt: new Date() })
+      .where(eq(executionWorkspaces.id, fixture.executionWorkspaceId));
+
+    const firstSweep = collectDueExecutionWorkspaces({
+      db,
+      companyId: fixture.companyId,
+      claimDurationMs: 200,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const secondSweep = await collectDueExecutionWorkspaces({
+      db,
+      companyId: fixture.companyId,
+      claimDurationMs: 200,
+    });
+
+    expect(secondSweep).toMatchObject({ selected: 0, claimed: 0, cleaned: 0, failed: 0 });
+    await expect(firstSweep).resolves.toMatchObject({ selected: 1, claimed: 1, cleaned: 1, failed: 0 });
+  });
 });

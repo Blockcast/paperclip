@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { and, eq, inArray, isNull, lte, sql } from "drizzle-orm";
 import {
   executionWorkspaces,
@@ -85,9 +86,11 @@ export async function collectDueExecutionWorkspaces(input: {
   companyId?: string;
   now?: Date;
   limit?: number;
+  claimDurationMs?: number;
 }): Promise<ExecutionWorkspaceCleanupSweepResult> {
   const now = input.now ?? new Date();
   const limit = Math.max(1, Math.min(input.limit ?? 20, 100));
+  const claimDurationMs = Math.max(100, input.claimDurationMs ?? CLEANUP_CLAIM_MS);
   await markTerminalRunScopedWorkspacesEligible({ db: input.db, companyId: input.companyId, now });
   const conditions = [
     lte(executionWorkspaces.cleanupEligibleAt, now),
@@ -111,11 +114,13 @@ export async function collectDueExecutionWorkspaces(input: {
   };
 
   for (const candidate of candidates) {
-    const claimUntil = new Date(now.getTime() + CLEANUP_CLAIM_MS);
+    const claimId = randomUUID();
+    const claimUntil = new Date(now.getTime() + claimDurationMs);
     const claimed = await input.db
       .update(executionWorkspaces)
       .set({
         cleanupEligibleAt: claimUntil,
+        metadata: sql`coalesce(${executionWorkspaces.metadata}, '{}'::jsonb) || jsonb_build_object('cleanupClaimId', ${claimId}::text)`,
         updatedAt: now,
       })
       .where(and(
@@ -128,6 +133,38 @@ export async function collectDueExecutionWorkspaces(input: {
       .then((rows) => rows[0] ?? null);
     if (!claimed) continue;
     result.claimed += 1;
+
+    let renewalTimer: ReturnType<typeof setTimeout> | null = null;
+    let renewalStopped = false;
+    const scheduleRenewal = () => {
+      renewalTimer = setTimeout(() => {
+        void renewClaim().catch(() => {
+          renewalStopped = true;
+        });
+      }, Math.max(25, Math.floor(claimDurationMs / 3)));
+      renewalTimer.unref();
+    };
+    const renewClaim = async () => {
+      if (renewalStopped) return;
+      const renewedAt = new Date();
+      const renewed = await input.db
+        .update(executionWorkspaces)
+        .set({
+          cleanupEligibleAt: new Date(renewedAt.getTime() + claimDurationMs),
+          updatedAt: renewedAt,
+        })
+        .where(and(
+          eq(executionWorkspaces.id, claimed.id),
+          sql`${executionWorkspaces.metadata} ->> 'cleanupClaimId' = ${claimId}`,
+          isNull(executionWorkspaces.closedAt),
+          inArray(executionWorkspaces.status, ["cleanup_pending", "cleanup_failed"]),
+        ))
+        .returning({ id: executionWorkspaces.id });
+      if (renewed.length > 0 && !renewalStopped) {
+        scheduleRenewal();
+      }
+    };
+    scheduleRenewal();
 
     try {
       await stopRuntimeServicesForExecutionWorkspace({
@@ -164,42 +201,60 @@ export async function collectDueExecutionWorkspaces(input: {
         }),
       });
       if (cleanup.cleaned) {
-        await input.db
+        const archived = await input.db
           .update(executionWorkspaces)
           .set({
             status: "archived",
             closedAt: now,
             cleanupEligibleAt: null,
             cleanupReason: cleanup.warnings.join(" | ") || null,
+            metadata: sql`${executionWorkspaces.metadata} - 'cleanupClaimId'`,
             updatedAt: new Date(),
           })
-          .where(eq(executionWorkspaces.id, claimed.id));
-        result.cleaned += 1;
+          .where(and(
+            eq(executionWorkspaces.id, claimed.id),
+            sql`${executionWorkspaces.metadata} ->> 'cleanupClaimId' = ${claimId}`,
+          ))
+          .returning({ id: executionWorkspaces.id });
+        result.cleaned += archived.length;
       } else {
-        await input.db
+        const failed = await input.db
           .update(executionWorkspaces)
           .set({
             status: "cleanup_failed",
             closedAt: null,
             cleanupEligibleAt: new Date(now.getTime() + CLEANUP_RETRY_MS),
             cleanupReason: cleanup.warnings.join(" | ") || "workspace artifacts remain after cleanup",
+            metadata: sql`${executionWorkspaces.metadata} - 'cleanupClaimId'`,
             updatedAt: new Date(),
           })
-          .where(eq(executionWorkspaces.id, claimed.id));
-        result.failed += 1;
+          .where(and(
+            eq(executionWorkspaces.id, claimed.id),
+            sql`${executionWorkspaces.metadata} ->> 'cleanupClaimId' = ${claimId}`,
+          ))
+          .returning({ id: executionWorkspaces.id });
+        result.failed += failed.length;
       }
     } catch (error) {
-      await input.db
+      const failed = await input.db
         .update(executionWorkspaces)
         .set({
           status: "cleanup_failed",
           closedAt: null,
           cleanupEligibleAt: new Date(now.getTime() + CLEANUP_RETRY_MS),
           cleanupReason: error instanceof Error ? error.message : String(error),
+          metadata: sql`${executionWorkspaces.metadata} - 'cleanupClaimId'`,
           updatedAt: new Date(),
         })
-        .where(eq(executionWorkspaces.id, claimed.id));
-      result.failed += 1;
+        .where(and(
+          eq(executionWorkspaces.id, claimed.id),
+          sql`${executionWorkspaces.metadata} ->> 'cleanupClaimId' = ${claimId}`,
+        ))
+        .returning({ id: executionWorkspaces.id });
+      result.failed += failed.length;
+    } finally {
+      renewalStopped = true;
+      if (renewalTimer) clearTimeout(renewalTimer);
     }
   }
 
