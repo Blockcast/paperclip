@@ -230,11 +230,21 @@ const NOOP_ACTIVITY_PUBLISH: ActivityPublish = () => {};
  * visibility, and turns a later commit failure into a phantom event for an
  * activity that never happened. The returned function is a no-op unless
  * `deferPublish` was set, so existing callers can keep ignoring the result.
+ *
+ * Pass `{ transactionalOutbox: true }` when losing the plugin event would be a
+ * durability bug rather than a missed notification. Normally the outbox enqueue is
+ * fire-and-forget on its own handle, and a failure is only warned about — fine for
+ * a best-effort notification, wrong for a caller whose retry is gated on the
+ * activity row existing: the retry sees the row, concludes the work is done, and
+ * the event is lost for good. With this option the outbox row is INSERTed and
+ * awaited on the caller's `db` handle, so when that handle is a transaction the
+ * activity row and its event commit together or not at all. Live publication stays
+ * best-effort either way.
  */
 export async function logActivity(
   db: Db,
   input: LogActivityInput,
-  options?: { deferPublish?: boolean },
+  options?: { deferPublish?: boolean; transactionalOutbox?: boolean; eventId?: string },
 ): Promise<ActivityPublish> {
   const currentUserRedactionOptions = {
     enabled: (await instanceSettingsService(db).getGeneral()).censorUsernameInLogs,
@@ -257,25 +267,26 @@ export async function logActivity(
     details: redactedDetails,
   });
 
+  // Built here rather than inside `publish` so the transactional path can persist
+  // the very same event the live path would have emitted.
   const pluginEventType = eventTypeForActivityAction(input.action);
-  let pluginEvent: PluginEvent | null = null;
-  if (pluginEventType) {
-    // Event-only payload extras: merged into the emitted plugin event but never
-    // written to the activity_log row above. We apply the current-user / PII
-    // redactor but deliberately NOT the key-based secret scrubber
-    // (sanitizeRecord): it false-positives on legitimate field names such as
-    // "authorName" (the "auth" secret-key pattern) and would mangle the faithful
-    // comment body the Linear bridge exists to mirror. Comment-body secret
-    // scrubbing is not applied anywhere else in comment sync, so doing it only
-    // here would be both inconsistent and lossy.
-    const redactedEventExtra = input.pluginEventPayloadExtra
-      ? (redactCurrentUserValue(
-          input.pluginEventPayloadExtra,
-          currentUserRedactionOptions,
-        ) as Record<string, unknown>)
-      : null;
-    pluginEvent = {
-      eventId: randomUUID(),
+  // Event-only payload extras: merged into the emitted plugin event but never
+  // written to the activity_log row above. We apply the current-user / PII
+  // redactor but deliberately NOT the key-based secret scrubber
+  // (sanitizeRecord): it false-positives on legitimate field names such as
+  // "authorName" (the "auth" secret-key pattern) and would mangle the faithful
+  // comment body the Linear bridge exists to mirror. Comment-body secret
+  // scrubbing is not applied anywhere else in comment sync, so doing it only
+  // here would be both inconsistent and lossy.
+  const redactedEventExtra = input.pluginEventPayloadExtra
+    ? (redactCurrentUserValue(
+        input.pluginEventPayloadExtra,
+        currentUserRedactionOptions,
+      ) as Record<string, unknown>)
+    : null;
+  const pluginEvent: PluginEvent | null = pluginEventType
+    ? {
+      eventId: options?.eventId ?? randomUUID(),
       eventType: pluginEventType,
       occurredAt: new Date().toISOString(),
       actorId: input.actorId,
@@ -290,10 +301,11 @@ export async function logActivity(
         runId: input.runId ?? null,
         responsibleUserId,
       },
-    };
-  }
-
-  if (pluginEvent && input.atomicPluginEvent) {
+    }
+    : null;
+  const durablePluginOutbox =
+    input.atomicPluginEvent === true || options?.transactionalOutbox === true;
+  if (pluginEvent && durablePluginOutbox) {
     await enqueuePluginDomainEventAtomically(db, pluginEvent);
   }
 
@@ -314,9 +326,8 @@ export async function logActivity(
       },
     });
 
-    if (pluginEvent && !input.atomicPluginEvent) {
-      publishPluginDomainEvent(pluginEvent);
-    }
+    // Already durably enqueued above; re-publishing would duplicate the event.
+    if (pluginEvent && !durablePluginOutbox) publishPluginDomainEvent(pluginEvent);
   };
 
   if (options?.deferPublish) return publish;

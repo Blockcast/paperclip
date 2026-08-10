@@ -71,6 +71,7 @@ export { cycles } from "./cycles.js";
 export { issueCycles } from "./issue_cycles.js";
 export { issueApprovals } from "./issue_approvals.js";
 export { issueComments } from "./issue_comments.js";
+export { issueCommentEffects } from "./issue_comment_effects.js";
 export { issueCreateIdempotencyKeys } from "./issue_create_idempotency_keys.js";
 export { issueThreadInteractions } from "./issue_thread_interactions.js";
 export { issueTreeHolds } from "./issue_tree_holds.js";

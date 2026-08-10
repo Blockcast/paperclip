@@ -175,6 +175,7 @@ import {
   commentAuthorCanGrantIssueMention,
   getActiveCompanyMembership,
 } from "../services/authorization.js";
+import { findWakeIdempotencyReceipt } from "../services/wake-idempotency.js";
 import { environmentService } from "../services/environments.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
 import { redactEventPayload, redactSensitiveText } from "../redaction.js";
@@ -207,6 +208,14 @@ import {
   type TrustPresetResolution,
 } from "../services/trust-preset-resolver.js";
 import { externalObjectService } from "../services/external-objects.js";
+import {
+  enqueueCommentEffects,
+  getEffectResult,
+  hasCommentEffects,
+  processCommentEffects,
+  type CommentEffectIntent,
+  type CommentEffectRow,
+} from "../services/issue-comment-effects.js";
 
 export const ISSUE_CREATE_DUPLICATE_CANDIDATE_WINDOW_DAYS = 30;
 export const ISSUE_CREATE_DUPLICATE_CANDIDATE_ROW_CAP = 200;
@@ -2991,6 +3000,7 @@ export function issueRoutes(
     createIssueDuplicateCandidateActivityTimeoutMs?: number;
     createIssueDuplicateCandidateCorpusFilter?: CreateIssueDuplicateCandidateCorpusFilter;
     createIssueBeforeResponseHook?: () => Promise<void>;
+    registerCommentEffectProcessor?: (processor: (commentId: string) => Promise<unknown>) => void;
   } = {},
 ) {
   const router = Router();
@@ -3867,6 +3877,230 @@ export function issueRoutes(
       });
     }
   }
+
+  type PersistedCommentActor = {
+    actorType: "agent" | "user";
+    actorId: string;
+    agentId: string | null;
+    runId: string | null;
+    agentApiKeyId: string | null;
+  };
+
+  function persistedCommentActor(actor: ReturnType<typeof getActorInfo>): PersistedCommentActor {
+    return {
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId ?? null,
+      runId: actor.runId ?? null,
+      agentApiKeyId: actor.agentApiKeyId ?? null,
+    };
+  }
+
+  async function buildKeyedCommentEffectIntents(input: {
+    issue: IssueRouteSnapshot;
+    comment: typeof issueComments.$inferSelect;
+    actor: ReturnType<typeof getActorInfo>;
+    referenceSummaryBefore: Awaited<ReturnType<typeof issueReferencesSvc.listIssueReferenceSummary>>;
+  }): Promise<CommentEffectIntent[]> {
+    const actor = persistedCommentActor(input.actor);
+    const effects: CommentEffectIntent[] = [
+      {
+        effectKind: "references_sync",
+        effectKey: "references_sync",
+        payload: { referenceSummaryBefore: input.referenceSummaryBefore },
+      },
+      { effectKind: "comment_activity", effectKey: "comment_activity", payload: { actor } },
+      { effectKind: "interaction_expiry", effectKey: "interaction_expiry", payload: { actor } },
+      { effectKind: "recovery_revalidation", effectKey: "recovery_revalidation", payload: { actor } },
+    ];
+
+    const wakeups = new Map<string, { agentId: string; wakeup: IssueWakeupRequest }>();
+    const assigneeId = input.issue.assigneeAgentId;
+    const selfComment = actor.actorType === "agent" && actor.actorId === assigneeId;
+    if (assigneeId && !selfComment && !isClosedIssueStatus(input.issue.status)) {
+      wakeups.set(`${assigneeId}:${input.issue.id}`, {
+        agentId: assigneeId,
+        wakeup: {
+          source: "automation",
+          triggerDetail: "system",
+          reason: "issue_commented",
+          payload: { issueId: input.issue.id, commentId: input.comment.id, mutation: "comment" },
+          requestedByActorType: actor.actorType,
+          requestedByActorId: actor.actorId,
+          idempotencyKey: `issue_comment:${input.comment.id}:assignee:${assigneeId}`,
+          contextSnapshot: {
+            issueId: input.issue.id,
+            taskId: input.issue.id,
+            commentId: input.comment.id,
+            wakeCommentId: input.comment.id,
+            source: "issue.comment",
+            wakeReason: "issue_commented",
+          },
+        },
+      });
+    }
+
+    const mentionedIds = await svc.findMentionedAgents(input.issue.companyId, input.comment.body);
+    for (const mentionedId of mentionedIds) {
+      if (actor.actorType === "agent" && actor.actorId === mentionedId) continue;
+      const key = `${mentionedId}:${input.issue.id}`;
+      if (wakeups.has(key)) continue;
+      wakeups.set(key, {
+        agentId: mentionedId,
+        wakeup: {
+          source: "automation",
+          triggerDetail: "system",
+          reason: "issue_comment_mentioned",
+          payload: { issueId: input.issue.id, commentId: input.comment.id },
+          requestedByActorType: actor.actorType,
+          requestedByActorId: actor.actorId,
+          idempotencyKey: `issue_comment:${input.comment.id}:mention:${mentionedId}`,
+          contextSnapshot: {
+            issueId: input.issue.id,
+            taskId: input.issue.id,
+            commentId: input.comment.id,
+            wakeCommentId: input.comment.id,
+            wakeReason: "issue_comment_mentioned",
+            source: "comment.mention",
+          },
+        },
+      });
+    }
+    for (const { agentId, wakeup } of wakeups.values()) {
+      effects.push({
+        effectKind: "wake",
+        effectKey: `wake:${agentId}:${input.issue.id}`,
+        payload: { agentId, wakeup },
+      });
+    }
+    effects.push({ effectKind: "watchdog_evaluation", effectKey: "watchdog_evaluation", payload: { runId: actor.runId } });
+    if (actor.runId) {
+      effects.push({ effectKind: "run_activity", effectKey: "run_activity", payload: { runId: actor.runId } });
+    }
+    return effects;
+  }
+
+  async function executeKeyedCommentEffect(effect: CommentEffectRow) {
+    const [comment] = await db.select().from(issueComments).where(eq(issueComments.id, effect.commentId)).limit(1);
+    const issue = await svc.getById(effect.issueId);
+    if (!comment || !issue) throw new Error(`Comment effect target is missing: ${effect.id}`);
+    const payload = effect.payload as Record<string, any>;
+    const actor = payload.actor as PersistedCommentActor | undefined;
+
+    switch (effect.effectKind) {
+      case "references_sync": {
+        await issueReferencesSvc.syncComment(comment.id);
+        const after = await issueReferencesSvc.listIssueReferenceSummary(issue.id);
+        return issueReferencesSvc.diffIssueReferenceSummary(payload.referenceSummaryBefore, after) as unknown as Record<string, unknown>;
+      }
+      case "comment_activity": {
+        if (await hasIssueCommentAddedActivity({ issueId: issue.id, commentId: comment.id })) return;
+        if (!actor) throw new Error("Comment activity effect is missing actor context");
+        const referenceEffect = await getEffectResult(db, comment.id, "references_sync");
+        const diff = referenceEffect?.result as any;
+        // The activity row and its plugin event must land together. The guard above
+        // treats the activity row as proof the event was emitted, so if the event
+        // were enqueued fire-and-forget and failed, the retry would skip this
+        // branch and the `issue.comment.created` event would be lost permanently.
+        // Committing both in one transaction makes the guard's premise true.
+        const publish = await db.transaction(async (tx) =>
+          logActivity(tx as unknown as typeof db, {
+            companyId: issue.companyId,
+            actorType: actor.actorType,
+            actorId: actor.actorId,
+            agentId: actor.agentId,
+            runId: actor.runId,
+            agentApiKeyId: actor.agentApiKeyId,
+            action: "issue.comment_added",
+            entityType: "issue",
+            entityId: issue.id,
+            details: {
+              commentId: comment.id,
+              bodySnippet: comment.body.slice(0, 120),
+              identifier: issue.identifier,
+              issueTitle: issue.title,
+              ...summarizeIssueReferenceActivityDetails({
+                addedReferencedIssues: (diff?.addedReferencedIssues ?? []).map(summarizeIssueRelationForActivity),
+                removedReferencedIssues: (diff?.removedReferencedIssues ?? []).map(summarizeIssueRelationForActivity),
+                currentReferencedIssues: (diff?.currentReferencedIssues ?? []).map(summarizeIssueRelationForActivity),
+              }),
+            },
+            pluginEventPayloadExtra: {
+              issueId: issue.id,
+              body: comment.body,
+              authorName: await resolveCommentAuthorName(actor as ReturnType<typeof getActorInfo>),
+            },
+          }, { deferPublish: true, transactionalOutbox: true }),
+        );
+        // Live fan-out only, after commit: durable delivery is already enqueued.
+        publish();
+        return;
+      }
+      case "interaction_expiry": {
+        if (!actor) throw new Error("Interaction expiry effect is missing actor context");
+        const expired = await issueThreadInteractionsSvc.expireRequestConfirmationsSupersededByComment(
+          issue,
+          comment,
+          { agentId: actor.agentId, userId: actor.actorType === "user" ? actor.actorId : null },
+        );
+        await logExpiredRequestConfirmations({
+          issue,
+          interactions: expired,
+          actor: actor as ReturnType<typeof getActorInfo>,
+          source: "issue.comment",
+        });
+        return { expiredInteractionIds: expired.map((interaction) => interaction.id) };
+      }
+      case "recovery_revalidation":
+        if (!actor) throw new Error("Recovery effect is missing actor context");
+        await revalidateActiveSourceRecovery({
+          issue,
+          trigger: "comment",
+          actor: actor as ReturnType<typeof getActorInfo>,
+        });
+        return;
+      case "wake": {
+        const agentId = payload.agentId;
+        if (typeof agentId !== "string" || !payload.wakeup) throw new Error("Wake effect payload is invalid");
+        const wakeup = payload.wakeup as IssueWakeupRequest;
+        // `heartbeat.wakeup` is the one sink here that is not naturally
+        // idempotent across "executed, then died before the ledger recorded it".
+        // Its own coalescing only merges a wake into a still-queued/running run,
+        // so once the first run finishes, a reclaim after lease expiry would
+        // create a SECOND run for one comment. The wake carries a deterministic
+        // idempotency key (`issue_comment:<commentId>:assignee|mention:<target>`),
+        // and an accepted wake request keeps that key on a row that outlives the
+        // run — so the key doubles as a durable receipt we can check first.
+        //
+        // Safe against the check-then-act race because effect claims serialize
+        // execution of this effect: only the claim holder reaches this line.
+        const idempotencyKey = wakeup.idempotencyKey;
+        if (typeof idempotencyKey === "string" && idempotencyKey.length > 0) {
+          const receipt = await findWakeIdempotencyReceipt(db, {
+            companyId: issue.companyId,
+            idempotencyKey,
+          });
+          if (receipt) return { wakeSkipped: "already_accepted", wakeupRequestId: receipt.id };
+        }
+        await heartbeat.wakeup(agentId, wakeup);
+        return;
+      }
+      case "watchdog_evaluation":
+        await taskWatchdogsSvc.reconcileForIssueAndAncestors(issue.companyId, issue.id, {
+          runId: typeof payload.runId === "string" ? payload.runId : null,
+        });
+        return;
+      case "run_activity":
+        if (typeof payload.runId === "string") await heartbeat.reportRunActivity(payload.runId);
+        return;
+      default:
+        throw new Error(`Unknown comment effect kind: ${effect.effectKind}`);
+    }
+  }
+
+  const processKeyedCommentEffects = (commentId: string) =>
+    processCommentEffects(db, commentId, executeKeyedCommentEffect);
+  opts.registerCommentEffectProcessor?.(processKeyedCommentEffects);
 
   function parseDateQuery(value: unknown, field: string) {
     if (typeof value !== "string" || value.trim().length === 0) return undefined;
@@ -12809,17 +13043,38 @@ export function issueRoutes(
           requestedByActorId: actor.actorId,
         });
       } else {
-        comment = await svc.addComment(id, req.body.body, {
+        const commentActor = {
           agentId: actor.agentId ?? undefined,
           userId: actor.actorType === "user" ? actor.actorId : undefined,
           runId: actor.runId,
-        }, {
+        };
+        const commentOptions = {
           authorType: req.body.authorType ?? (actor.actorType === "agent" ? "agent" : "user"),
           presentation: req.body.presentation ?? null,
           metadata: req.body.metadata ?? null,
           idempotencyKey: req.body.idempotencyKey ?? null,
           sourceTrust: await sourceTrustForActorWrite(currentIssue, actor),
-        });
+        };
+        if (req.body.idempotencyKey) {
+          comment = await db.transaction(async (tx) => {
+            const accepted = await svc.addComment(id, req.body.body, commentActor, commentOptions, tx);
+            const effects = await buildKeyedCommentEffectIntents({
+              issue: currentIssue,
+              comment: accepted,
+              actor,
+              referenceSummaryBefore: commentReferenceSummaryBefore,
+            });
+            await enqueueCommentEffects(tx as unknown as Db, {
+              companyId: currentIssue.companyId,
+              issueId: currentIssue.id,
+              commentId: accepted.id,
+              effects,
+            });
+            return accepted;
+          });
+        } else {
+          comment = await svc.addComment(id, req.body.body, commentActor, commentOptions);
+        }
       }
     }
 
@@ -12833,6 +13088,28 @@ export function issueRoutes(
         res.status(200).json(comment);
         return;
       }
+    }
+
+    if (req.body.idempotencyKey) {
+      if (idempotentReplay) {
+        if (!(await hasCommentEffects(db, comment.id))) {
+          const effects = await buildKeyedCommentEffectIntents({
+            issue: currentIssue,
+            comment,
+            actor,
+            referenceSummaryBefore: commentReferenceSummaryBefore,
+          });
+          await enqueueCommentEffects(db, {
+            companyId: currentIssue.companyId,
+            issueId: currentIssue.id,
+            commentId: comment.id,
+            effects,
+          });
+        }
+      }
+      await processKeyedCommentEffects(comment.id);
+      res.status(idempotentReplay ? 200 : 201).json(comment);
+      return;
     }
 
     if (commentReferenceDiff === null) {
@@ -13147,9 +13424,6 @@ export function issueRoutes(
     })();
 
     await queueTaskWatchdogEvaluation(currentIssue, actor.runId);
-    if (req.body.idempotencyKey) {
-      await svc.markCommentIdempotencyProcessed(comment.id);
-    }
     res.status(idempotentReplay ? 200 : 201).json(comment);
   });
 
