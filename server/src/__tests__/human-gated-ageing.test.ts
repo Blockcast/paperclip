@@ -599,6 +599,37 @@ describe("threshold and reporting", () => {
       { label: "90d+", count: 1 },
     ]);
   });
+
+  /**
+   * BLO-19777 review round 4. Bucket bounds are caller configuration, and a bad
+   * one does not fail — it renders. Both cases below used to return a single
+   * bucket holding the whole population under a nonsense label, which is this
+   * module's headline defect (a confident answer built from input it could not
+   * use) one function over.
+   */
+  it("rejects an empty bucket-bound array instead of rendering an `undefinedd+` bucket", () => {
+    const report = buildHumanGatedAgeingReport(
+      [issue({ id: "d10", lastHumanTouchAt: daysAgo(10) })],
+      { now: NOW, escalateAfterDaysByPriority: flat(30) },
+    );
+
+    expect(() => humanGatedAgeHistogram(report.scanned, [])).toThrow(
+      /must configure at least one bucket/,
+    );
+  });
+
+  it("rejects a non-finite or negative bucket bound", () => {
+    const report = buildHumanGatedAgeingReport(
+      [issue({ id: "d10", lastHumanTouchAt: daysAgo(10) })],
+      { now: NOW, escalateAfterDaysByPriority: flat(30) },
+    );
+
+    for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, -1]) {
+      expect(() => humanGatedAgeHistogram(report.scanned, [7, bad, 30])).toThrow(
+        /finite, non-negative day counts/,
+      );
+    }
+  });
 });
 
 /**
