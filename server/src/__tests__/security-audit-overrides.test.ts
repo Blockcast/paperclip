@@ -32,6 +32,7 @@ async function copyLockfileFixture(fixtureRoot: string) {
       "--",
       "package.json",
       "**/package.json",
+      "pnpm-lock.yaml",
       "pnpm-workspace.yaml",
       ".npmrc",
       "pnpmfile.cjs",
@@ -104,9 +105,9 @@ describe("PEN-1198 audit dependency remediation", () => {
       try {
         await copyLockfileFixture(fixtureRoot);
 
-        // Human and agent PRs do not commit pnpm-lock.yaml. Recreate the
-        // policy-job artifact from workspace manifests in a disposable fixture
-        // before asserting the resolved dependency graph.
+        // Human and agent PRs do not commit lockfile changes. Seed the fixture
+        // from the tracked base lockfile, then recreate the policy-job artifact
+        // from the current workspace manifests before checking the graph.
         await execFileAsync(
           "pnpm",
           [
