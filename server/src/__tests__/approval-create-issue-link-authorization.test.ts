@@ -155,6 +155,21 @@ function decideByAssignee() {
   });
 }
 
+/**
+ * Clears the boundary with a plain grant, so the evaluator reaches the
+ * assignee-mismatch branch instead of short-circuiting on `!decision.allowed`.
+ * This is the only way to reach the 409 checkout-conflict verdict: a boundary
+ * refusal is permanent, so it is a 403 and never a conflict.
+ */
+function decideAllowingBoundary() {
+  mockAccessService.decide.mockImplementation(async (input: any) => {
+    if (input.action === "tasks:manage_active_checkouts") {
+      return { allowed: false, action: input.action, reason: "deny_missing_grant", explanation: "" };
+    }
+    return { allowed: true, action: input.action, reason: "allow_explicit_grant", explanation: "" };
+  });
+}
+
 beforeEach(() => {
   vi.resetModules();
   vi.clearAllMocks();
@@ -264,6 +279,54 @@ describe("POST /companies/:companyId/approvals — issueIds authorization (BLO-2
 
     expect([200, 201], JSON.stringify(res.body)).toContain(res.status);
     expect(mockIssueApprovalService.linkManyForApproval).toHaveBeenCalled();
+  });
+
+  it("returns 409, not 403, when the only refusal is another agent's active checkout", async () => {
+    // The evaluator distinguishes a retryable checkout conflict from a permanent
+    // boundary refusal, matching the contract `assertAgentIssueMutationAllowed`
+    // establishes on `POST /issues/:id/approvals`. Collapsing it to 403 would tell
+    // the caller its request can never succeed when it succeeds once the other
+    // agent's checkout ends.
+    decideAllowingBoundary();
+    mockIssueService.getById.mockResolvedValue(
+      makeIssue({ id: PEER_ISSUE_ID, assigneeAgentId: PEER_AGENT_ID, status: "in_progress" }),
+    );
+
+    const res = await request(await createApp(agentActor()))
+      .post(`/api/companies/${COMPANY_ID}/approvals`)
+      .send(createBody([PEER_ISSUE_ID]));
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.error).toContain(PEER_ISSUE_ID);
+    expect(res.body.details.refusals[0]).toMatchObject({
+      issueId: PEER_ISSUE_ID,
+      status: 409,
+      reason: "deny_active_checkout",
+      boundary: "checkout",
+    });
+    expect(mockApprovalService.createWithIdempotency).not.toHaveBeenCalled();
+  });
+
+  it("takes the stricter 403 when a set mixes a checkout conflict with a boundary refusal", async () => {
+    // "Retry this" is only true if every refusal clears on its own, and a set
+    // containing one permanent refusal never does. Per-entry `status` still lets a
+    // caller splitting the batch see which id was merely conflicting.
+    decideAllowingBoundary();
+    mockIssueService.getById.mockImplementation(async (id: string) =>
+      id === PEER_ISSUE_ID
+        ? makeIssue({ id: PEER_ISSUE_ID, assigneeAgentId: PEER_AGENT_ID, status: "in_progress" })
+        : makeIssue({ id, assigneeAgentId: PEER_AGENT_ID, createdByAgentId: PEER_AGENT_ID, status: "todo" }),
+    );
+
+    const res = await request(await createApp(agentActor()))
+      .post(`/api/companies/${COMPANY_ID}/approvals`)
+      .send(createBody([PEER_ISSUE_ID, OTHER_PEER_ISSUE_ID]));
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.details.refusedIssueIds).toEqual([PEER_ISSUE_ID, OTHER_PEER_ISSUE_ID]);
+    expect(res.body.details.refusals.map((refusal: { status: number }) => refusal.status)).toEqual([
+      409, 403,
+    ]);
   });
 
   it("refuses a creator/manager-chain grant, which is comment-only", async () => {

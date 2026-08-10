@@ -130,7 +130,7 @@ export function approvalRoutes(
    * `evaluateAgentIssueApprovalLinkAuthorization`.
    *
    * Every id is evaluated before responding, rather than short-circuiting on the
-   * first refusal, so the 403 can name the whole refused set. An agent that
+   * first refusal, so the refusal can name the whole refused set. An agent that
    * learned about its refusals one id per request would file one approval per
    * round trip just to enumerate them.
    *
@@ -138,6 +138,21 @@ export function approvalRoutes(
    * deliberately passed through untouched: `linkManyForApproval` already rejects
    * them (404 / 422), and duplicating that here would change this route's error
    * semantics for a case that is not an authorization question.
+   *
+   * ## Why the response status is not always 403
+   *
+   * The evaluator distinguishes a *retryable* refusal — the issue is `in_progress`
+   * under another agent's checkout — and reports it as 409, matching the conflict
+   * contract `assertAgentIssueMutationAllowed` establishes on the dedicated link
+   * route. Collapsing that to 403 would tell a caller its request can never
+   * succeed when in fact it succeeds once the other agent's checkout ends, so the
+   * verdict's status is preserved here.
+   *
+   * A set can mix the two. The response then takes the *stricter* reading, 403:
+   * "retry this" is only true if every refusal clears on its own, and a set
+   * containing one permanent boundary refusal never does. Each entry still carries
+   * its own `status`, so a caller splitting a mixed batch can see which ids were
+   * merely conflicting.
    */
   async function assertIssueLinksAllowed(
     req: Request,
@@ -147,7 +162,7 @@ export function approvalRoutes(
   ) {
     if (req.actor.type !== "agent" || issueIds.length === 0) return true;
 
-    const refusals: Array<Record<string, unknown>> = [];
+    const refusals: Array<{ issueId: string; status: 403 | 409 } & Record<string, unknown>> = [];
     for (const issueId of issueIds) {
       const issue = await issuesSvc.getById(issueId);
       if (!issue || issue.companyId !== companyId) continue;
@@ -155,6 +170,7 @@ export function approvalRoutes(
       if (verdict.allowed) continue;
       refusals.push({
         issueId,
+        status: verdict.status,
         reason: verdict.reason,
         boundary: verdict.boundary,
         error: verdict.error,
@@ -163,13 +179,18 @@ export function approvalRoutes(
 
     if (refusals.length === 0) return true;
 
-    res.status(403).json({
-      error:
-        "Approval cannot be linked to issues this actor is not authorized on: " +
-        refusals.map((refusal) => refusal.issueId).join(", "),
+    const everyRefusalIsCheckoutConflict = refusals.every((refusal) => refusal.status === 409);
+    const refusedIssueIds = refusals.map((refusal) => refusal.issueId);
+
+    res.status(everyRefusalIsCheckoutConflict ? 409 : 403).json({
+      error: everyRefusalIsCheckoutConflict
+        ? "Approval cannot be linked to issues checked out by another agent: " +
+          refusedIssueIds.join(", ")
+        : "Approval cannot be linked to issues this actor is not authorized on: " +
+          refusedIssueIds.join(", "),
       details: {
         companyId,
-        refusedIssueIds: refusals.map((refusal) => refusal.issueId),
+        refusedIssueIds,
         refusals,
         securityPrinciples: ["Least Privilege", "Complete Mediation", "Fail Securely"],
       },
