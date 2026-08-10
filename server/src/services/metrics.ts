@@ -26,8 +26,16 @@ import {
   resetBlockerResolvedWakeMetrics,
   snapshotBlockerResolvedWakeMetrics,
 } from "./blocker-resolved-wake-metrics.js";
+import {
+  resetRoutineDispatchMetrics,
+  snapshotRoutineDispatchMetrics,
+} from "./routine-dispatch-metrics.js";
 
 export const CONCURRENT_RUN_BLOCKED_METRIC = "claude_k8s_concurrent_run_blocked_total";
+// BLO-23379: routine dispatch bypassed a long-parked execution issue instead of
+// letting it gate the fire. Non-zero means a quota/capacity park was overridden;
+// zero while a routine is quiet means it is genuinely gated on in-flight work.
+export const ROUTINE_DISPATCH_METRIC = "paperclip_routine_dispatch_total";
 export const AUTH_REQUEST_METRIC = "paperclip_auth_request_total";
 export const HEARTBEAT_RUN_FAILED_METRIC = "paperclip_heartbeat_run_failed_total";
 export const DEP_BLOCKED_WAKEUP_METRIC = "paperclip_dependency_blocked_wakeup_total";
@@ -1762,9 +1770,17 @@ export async function renderMetrics(): Promise<{ contentType: string; body: stri
       ([outcome, value]) => `${BLOCKER_RESOLVED_WAKEUP_METRIC}{outcome="${outcome}"} ${value}`,
     ),
   ].join("\n");
+  const routineDispatchSnapshot = snapshotRoutineDispatchMetrics();
+  const routineDispatchBody = [
+    `# HELP ${ROUTINE_DISPATCH_METRIC} Count of routine dispatch gating outcomes, labeled by outcome. routine_dispatch_bypassed_parked_execution_issue = a fire proceeded past an execution issue parked on a long-horizon scheduled_retry rather than being silently skipped for the whole park.`,
+    `# TYPE ${ROUTINE_DISPATCH_METRIC} counter`,
+    ...Object.entries(routineDispatchSnapshot).map(
+      ([outcome, value]) => `${ROUTINE_DISPATCH_METRIC}{outcome="${outcome}"} ${value}`,
+    ),
+  ].join("\n");
   return {
     contentType: reg.contentType,
-    body: `${await reg.metrics()}\n${depBlockedBody}\n${blockerResolvedBody}\n`,
+    body: `${await reg.metrics()}\n${depBlockedBody}\n${blockerResolvedBody}\n${routineDispatchBody}\n`,
   };
 }
 
@@ -1794,4 +1810,5 @@ export function __resetMetricsForTest(): void {
   authRequest = null;
   resetDepBlockedMetrics();
   resetBlockerResolvedWakeMetrics();
+  resetRoutineDispatchMetrics();
 }

@@ -76,9 +76,25 @@ import {
 import { queueIssueAssignmentWakeup, type IssueAssignmentWakeupDeps } from "./issue-assignment-wakeup.js";
 import { logActivity } from "./activity-log.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
+import { incrementRoutineDispatchMetric } from "./routine-dispatch-metrics.js";
 
 const OPEN_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked"];
 const LIVE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"];
+// BLO-23379: a `scheduled_retry` heartbeat run only counts as "live" for
+// routine dispatch gating (skip_if_active / coalesce_if_active) while its
+// retry is due within this horizon. Provider-quota parks (`ccrotate_capacity`)
+// routinely schedule `scheduledRetryAt` days out; treating that as "live"
+// gated a routine's `skip_if_active` fire for the full park -- see BLO-23347,
+// parked to +6d, which silently disabled routine 4756349d for that entire
+// window. 6h mirrors STALE_PRE_CLAIM_ISSUE_LOCK_MS in recovery/service.ts,
+// chosen there for the identical reasoning: a park's horizon must not be the
+// thing that decides how long something else stays gated on it.
+const ROUTINE_LIVE_SCHEDULED_RETRY_HORIZON_MS = 6 * 60 * 60 * 1000;
+// BLO-23379: how many open execution issues to examine when deciding whether a
+// routine fire is gated. Only the first genuinely-live one matters, but a
+// quota-parked row can sort ahead of it, so a single-row lookup would report
+// "nothing live" while a run is in flight. Bounded to keep the scan cheap.
+const ROUTINE_LIVE_EXECUTION_ISSUE_SCAN_LIMIT = 10;
 const TERMINAL_ISSUE_STATUSES = new Set(["done", "cancelled"]);
 const MAX_CATCH_UP_RUNS = 25;
 const MAX_ROUTINE_REVISIONS = 100;
@@ -1405,64 +1421,128 @@ export function routineService(
     );
   }
 
+  // BLO-23379: whether a joined heartbeat run still counts as "live" for
+  // routine dispatch gating. `queued`/`running` always do. `scheduled_retry`
+  // only does while its retry is due within ROUTINE_LIVE_SCHEDULED_RETRY_HORIZON_MS
+  // -- a park scheduled further out than that is treated as not-live so it
+  // stops silently disabling skip_if_active/coalesce_if_active dispatch for
+  // the whole park duration.
+  function isHeartbeatRunLiveForRoutineDispatch(
+    status: string,
+    scheduledRetryAt: Date | null,
+    now: Date,
+  ): boolean {
+    if (status !== "scheduled_retry") return true;
+    if (!scheduledRetryAt) return true;
+    return scheduledRetryAt.getTime() - now.getTime() <= ROUTINE_LIVE_SCHEDULED_RETRY_HORIZON_MS;
+  }
+
+  function logBypassedParkedExecutionIssue(params: {
+    routineId: string;
+    issueId: string;
+    issueIdentifier: string | null;
+    runStatus: string;
+    scheduledRetryAt: Date | null;
+  }) {
+    incrementRoutineDispatchMetric("routine_dispatch_bypassed_parked_execution_issue");
+    logger.warn(
+      {
+        routineId: params.routineId,
+        issueId: params.issueId,
+        issueIdentifier: params.issueIdentifier,
+        runStatus: params.runStatus,
+        scheduledRetryAt: params.scheduledRetryAt?.toISOString() ?? null,
+        horizonMs: ROUTINE_LIVE_SCHEDULED_RETRY_HORIZON_MS,
+      },
+      "routine dispatch bypassing long-parked execution issue for skip_if_active/coalesce_if_active gating",
+    );
+  }
+
   async function findLiveExecutionIssue(
     routine: typeof routines.$inferSelect,
     executor: Db = db,
     dispatchFingerprint?: string | null,
     origin?: { kind: string; id: string | null },
+    // Only the dispatch path should emit the bypass warn/metric. The routine
+    // read path calls this too (to surface `activeIssue`), and counting those
+    // would turn a dispatch-bypass counter into a page-view counter.
+    options?: { observeBypass?: boolean },
   ) {
     const fingerprintCondition = routineExecutionFingerprintCondition(dispatchFingerprint);
     const originKind = origin?.kind ?? "routine_execution";
     const originId = origin?.id ?? routine.id;
-    const executionBoundIssue = await executor
-      .select()
-      .from(issues)
-      .innerJoin(
-        heartbeatRuns,
-        and(
-          eq(heartbeatRuns.id, issues.executionRunId),
-          inArray(heartbeatRuns.status, LIVE_HEARTBEAT_RUN_STATUSES),
-        ),
-      )
-      .where(
-        and(
-          eq(issues.companyId, routine.companyId),
-          eq(issues.originKind, originKind),
-          eq(issues.originId, originId),
-          inArray(issues.status, OPEN_ISSUE_STATUSES),
-          visibleIssueCondition(),
-          ...(fingerprintCondition ? [fingerprintCondition] : []),
-        ),
-      )
-      .orderBy(desc(issues.updatedAt), desc(issues.createdAt))
-      .limit(1)
-      .then((rows) => rows[0]?.issues ?? null);
-    if (executionBoundIssue) return executionBoundIssue;
+    const now = new Date();
+    const issueCondition = and(
+      eq(issues.companyId, routine.companyId),
+      eq(issues.originKind, originKind),
+      eq(issues.originId, originId),
+      inArray(issues.status, OPEN_ISSUE_STATUSES),
+      visibleIssueCondition(),
+      ...(fingerprintCondition ? [fingerprintCondition] : []),
+    );
 
-    return executor
-      .select()
-      .from(issues)
-      .innerJoin(
-        heartbeatRuns,
-        and(
-          eq(heartbeatRuns.companyId, issues.companyId),
-          inArray(heartbeatRuns.status, LIVE_HEARTBEAT_RUN_STATUSES),
-          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = cast(${issues.id} as text)`,
-        ),
-      )
-      .where(
-        and(
-          eq(issues.companyId, routine.companyId),
-          eq(issues.originKind, originKind),
-          eq(issues.originId, originId),
-          inArray(issues.status, OPEN_ISSUE_STATUSES),
-          visibleIssueCondition(),
-          ...(fingerprintCondition ? [fingerprintCondition] : []),
-        ),
-      )
-      .orderBy(desc(issues.updatedAt), desc(issues.createdAt))
-      .limit(1)
-      .then((rows) => rows[0]?.issues ?? null);
+    const selectCandidateRows = (joinCondition: ReturnType<typeof and>) =>
+      executor
+        .select({
+          issue: issues,
+          runStatus: heartbeatRuns.status,
+          runScheduledRetryAt: heartbeatRuns.scheduledRetryAt,
+        })
+        .from(issues)
+        .innerJoin(heartbeatRuns, joinCondition)
+        .where(issueCondition)
+        .orderBy(desc(issues.updatedAt), desc(issues.createdAt))
+        .limit(ROUTINE_LIVE_EXECUTION_ISSUE_SCAN_LIMIT);
+
+    // BLO-23379: scan a bounded window rather than a single row. The most
+    // recently touched open execution issue can be quota-parked while an older
+    // one is genuinely running; gating must follow the running one, so a parked
+    // row must not shadow a live row behind it.
+    const parkedRows: Array<{
+      issue: typeof issues.$inferSelect;
+      runStatus: string;
+      runScheduledRetryAt: Date | null;
+    }> = [];
+    const joinConditions = [
+      and(
+        eq(heartbeatRuns.id, issues.executionRunId),
+        inArray(heartbeatRuns.status, LIVE_HEARTBEAT_RUN_STATUSES),
+      ),
+      and(
+        eq(heartbeatRuns.companyId, issues.companyId),
+        inArray(heartbeatRuns.status, LIVE_HEARTBEAT_RUN_STATUSES),
+        sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = cast(${issues.id} as text)`,
+      ),
+    ];
+
+    for (const joinCondition of joinConditions) {
+      const rows = await selectCandidateRows(joinCondition);
+      for (const row of rows) {
+        if (isHeartbeatRunLiveForRoutineDispatch(row.runStatus, row.runScheduledRetryAt, now)) {
+          return row.issue;
+        }
+        parkedRows.push(row);
+      }
+    }
+
+    // Nothing genuinely live. Any parked rows we passed over are the reason
+    // this fire is about to proceed instead of being gated -- surface each one
+    // exactly once (the two joins can return the same issue).
+    if (options?.observeBypass) {
+      const loggedIssueIds = new Set<string>();
+      for (const row of parkedRows) {
+        if (loggedIssueIds.has(row.issue.id)) continue;
+        loggedIssueIds.add(row.issue.id);
+        logBypassedParkedExecutionIssue({
+          routineId: routine.id,
+          issueId: row.issue.id,
+          issueIdentifier: row.issue.identifier,
+          runStatus: row.runStatus,
+          scheduledRetryAt: row.runScheduledRetryAt,
+        });
+      }
+    }
+    return null;
   }
 
   async function finalizeRun(runId: string, patch: Partial<typeof routineRuns.$inferInsert>, executor: Db = db) {
@@ -1758,7 +1838,7 @@ export function routineService(
         const activeIssue = await findLiveExecutionIssue(input.routine, txDb, dispatchFingerprint, {
           kind: issueOriginKind,
           id: issueOriginId,
-        });
+        }, { observeBypass: true });
         if (activeIssue && input.routine.concurrencyPolicy !== "always_enqueue") {
           const status = input.routine.concurrencyPolicy === "skip_if_active" ? "skipped" : "coalesced";
           if (manualRunnerUserId) {
