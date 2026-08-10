@@ -539,6 +539,38 @@ function copyHeader(
   }
 }
 
+/**
+ * Per-request audit line: who (source IP) called what (matched prefix +
+ * JSON-RPC method, and tool name for tools/call) through the gateway. This
+ * is the only record of gateway callers — the upstream MCP servers log only
+ * an opaque session id, and `upstreamCallCounts`/session counts are fan-out
+ * artifacts of the aggregate endpoint (one aggregate initialize/tools/list
+ * touches every upstream), not a per-caller count. Emitted exactly once per
+ * inbound HTTP request regardless of outcome; never includes the request
+ * body, `authorization` header value, or tool-call arguments.
+ */
+function logMcpRequest(
+  req: http.IncomingMessage,
+  requestId: string,
+  prefix: string,
+  method: string,
+  tool?: string,
+): void {
+  // eslint-disable-next-line no-console
+  console.log(JSON.stringify({
+    event: "mcp_gateway_request",
+    requestId,
+    sourceIp: req.socket.remoteAddress ?? "unknown",
+    prefix,
+    method,
+    ...(tool ? { tool } : {}),
+  }));
+}
+
+function jsonRpcMethodLabel(req: http.IncomingMessage, message: JsonRpcRequest | null): string {
+  return message?.method ?? req.method ?? "unknown";
+}
+
 function writeResponse(
   res: http.ServerResponse,
   result: ForwardResult,
@@ -563,6 +595,7 @@ async function handleRequest(
   res: http.ServerResponse,
   state: GatewayState,
 ): Promise<void> {
+  const requestId = randomUUID();
   const url = req.url ?? "/";
   const pathName = url.split("?", 1)[0] ?? "/";
 
@@ -585,7 +618,7 @@ async function handleRequest(
   }
 
   if (pathName === "/mcp" || pathName.startsWith("/mcp/")) {
-    await handleAggregateRequest(req, res, state);
+    await handleAggregateRequest(req, res, state, requestId);
     return;
   }
 
@@ -615,6 +648,13 @@ async function handleRequest(
     const v = req.headers[MCP_SESSION_HEADER];
     return Array.isArray(v) ? v[0] : (v as string | undefined);
   })();
+
+  const inboundMessage = parseJsonRpcRequest(bodyText);
+  const logMethod = jsonRpcMethodLabel(req, inboundMessage);
+  const logTool = logMethod === "tools/call" && typeof inboundMessage?.params?.name === "string"
+    ? inboundMessage.params.name
+    : undefined;
+  logMcpRequest(req, requestId, prefix, logMethod, logTool);
 
   // Circuit breaker: if this upstream has been failing (hung / OOMing /
   // unreachable), fail fast with 503 instead of forwarding into it and
@@ -657,6 +697,7 @@ async function handleAggregateRequest(
   req: http.IncomingMessage,
   res: http.ServerResponse,
   state: GatewayState,
+  requestId: string,
 ): Promise<void> {
   await ensurePersistedSessionsLoaded(state);
   const body = await readBody(req);
@@ -668,6 +709,18 @@ async function handleAggregateRequest(
   })();
   const clientSessionId = inboundSessionId || randomUUID();
   const initializePayload = looksLikeInitializeRequest(bodyText) ? body : buildDefaultInitializePayload();
+
+  // Exactly one line per inbound request, even for `initialize`/`tools/list`,
+  // which fan out to every upstream below — the requestId (and, for
+  // `tools/call`, the resolved prefix) is what makes that fan-out
+  // attributable to a single caller rather than ten indistinguishable lines.
+  const logMethod = jsonRpcMethodLabel(req, message);
+  const logTool = logMethod === "tools/call" && typeof message?.params?.name === "string"
+    ? message.params.name
+    : undefined;
+  const logToolSeparatorIndex = logTool ? logTool.indexOf("__") : -1;
+  const logPrefix = logToolSeparatorIndex > 0 ? logTool!.slice(0, logToolSeparatorIndex) : "*";
+  logMcpRequest(req, requestId, logPrefix, logMethod, logTool);
 
   if (!message?.method) {
     res.statusCode = 400;

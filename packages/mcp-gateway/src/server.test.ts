@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { AddressInfo } from "node:net";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { MCP_SESSION_HEADER } from "./session-keepalive.js";
 import { buildInitializeReplayHeaders, createGatewayServer, loadGatewayConfig, type GatewayState } from "./server.js";
 import { CircuitBreaker } from "./circuit-breaker.js";
@@ -1663,6 +1663,95 @@ describe("mcp gateway lifecycle compatibility", () => {
       "tools/call",
       "initialize",
     ]);
+  });
+});
+
+describe("mcp gateway request logging", () => {
+  it("logs source ip, matched prefix, and tool name for a direct tools/call, and never leaks the Authorization header or arguments", async () => {
+    const upstream = await createStrictMcpUpstream([{ name: "ping", description: "Ping" }]);
+    const gateway = await createGateway(upstream.url);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    try {
+      const response = await fetch(gateway.url, {
+        method: "POST",
+        headers: { ...jsonHeaders(), authorization: "Bearer super-secret-caller-token" },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "tools/call",
+          params: { name: "ping", arguments: { secret: "arg-value" } },
+        }),
+      });
+      expect(response.status).toBe(200);
+
+      const lines = logSpy.mock.calls.map((call) => String(call[0]));
+      const requestLine = lines.find((line) => line.includes("mcp_gateway_request"));
+      expect(requestLine).toBeTruthy();
+      const parsed = JSON.parse(requestLine!) as Record<string, unknown>;
+      expect(parsed).toMatchObject({ prefix: "k8s-admin", method: "tools/call", tool: "ping" });
+      expect(parsed.sourceIp).toBeTruthy();
+      expect(parsed.requestId).toBeTruthy();
+
+      for (const line of lines) {
+        expect(line).not.toContain("super-secret-caller-token");
+        expect(line).not.toContain("arg-value");
+      }
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  it("bounds aggregate fan-out to exactly one log line per inbound initialize request", async () => {
+    const alpha = await createStrictMcpUpstream([{ name: "search", description: "Alpha search" }]);
+    const beta = await createStrictMcpUpstream([{ name: "search", description: "Beta search" }]);
+    const gateway = await createAggregateGateway({
+      alpha: { url: alpha.url, credentialHeaders: [] },
+      beta: { url: beta.url, credentialHeaders: [] },
+    });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    try {
+      const response = await postJson(gateway.url, { jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
+      expect(response.status).toBe(200);
+
+      const requestLines = logSpy.mock.calls
+        .map((call) => String(call[0]))
+        .filter((line) => line.includes("mcp_gateway_request"));
+      expect(requestLines).toHaveLength(1);
+      expect(JSON.parse(requestLines[0]) as Record<string, unknown>).toMatchObject({ method: "initialize" });
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  it("logs the qualified tool name and resolved prefix for an aggregate tools/call", async () => {
+    const upstream = await createStrictMcpUpstream([{ name: "inspect", description: "Inspect" }]);
+    const gateway = await createAggregateGateway({ "k8s-admin": { url: upstream.url, credentialHeaders: [] } });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    try {
+      const response = await postJson(
+        gateway.url,
+        { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "k8s-admin__inspect", arguments: {} } },
+        { ...jsonHeaders("aggregate-session"), authorization: "Bearer super-secret-caller-token" },
+      );
+      expect(response.status).toBe(200);
+
+      const lines = logSpy.mock.calls.map((call) => String(call[0]));
+      const requestLine = lines.find((line) => line.includes("mcp_gateway_request"));
+      expect(requestLine).toBeTruthy();
+      expect(JSON.parse(requestLine!) as Record<string, unknown>).toMatchObject({
+        prefix: "k8s-admin",
+        method: "tools/call",
+        tool: "k8s-admin__inspect",
+      });
+      for (const line of lines) {
+        expect(line).not.toContain("super-secret-caller-token");
+      }
+    } finally {
+      logSpy.mockRestore();
+    }
   });
 });
 
