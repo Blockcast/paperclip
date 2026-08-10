@@ -43,6 +43,7 @@ import {
   type RoutineRevisionSnapshotV1,
 } from "@paperclipai/shared";
 import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
+import { logger } from "../middleware/logger.js";
 import { routineService } from "./routines.js";
 import { secretService } from "./secrets.js";
 import type { IssueAssignmentWakeupDeps } from "./issue-assignment-wakeup.js";
@@ -3722,7 +3723,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
             fieldPath: "env",
           }) as Record<string, EnvBinding>;
       const actorPatch = routineActorPatch(input.actor);
-      const updatedRoutine = await db.transaction(async (tx) => {
+      const { updatedRoutine, publish } = await db.transaction(async (tx) => {
         const txDb = tx as unknown as Db;
         await tx.execute(sql`select id from ${routines} where ${routines.id} = ${routineId} for update`);
         const locked = await txDb
@@ -3768,9 +3769,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
         );
         const envKeys = Object.keys(normalizedEnv ?? {}).sort();
         const secretRefs = secretRefsFromEnv(normalizedEnv);
-        // This action has no plugin-event mapping, so no outbox write can
-        // escape the transaction; keep the default publication semantics.
-        await logActivity(txDb, {
+        const activityPublish = await logActivity(txDb, {
           companyId: input.companyId,
           ...activityActorPatch(input.actor),
           action: "pipeline.stage_automation_env_updated",
@@ -3788,9 +3787,18 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
             routineRevisionId: routineWithRevision.latestRevisionId,
             routineRevisionNumber: routineWithRevision.latestRevisionNumber,
           },
-        });
-        return routineWithRevision;
+        }, { deferPublish: true });
+        return { updatedRoutine: routineWithRevision, publish: activityPublish };
       });
+
+      try {
+        publish();
+      } catch (err) {
+        logger.warn(
+          { err, companyId: input.companyId, pipelineId: input.pipelineId, stageId: input.stageId },
+          "updated pipeline stage automation env but failed to publish its activity event",
+        );
+      }
 
       return derivedStageAutomationPayload(updatedRoutine);
     },

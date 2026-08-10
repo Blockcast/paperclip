@@ -22,6 +22,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { cleanupHeartbeatTestState } from "./helpers/cleanup-heartbeat-test-state.js";
 import { registerServerAdapter, unregisterServerAdapter } from "../adapters/index.ts";
+import { subscribeCompanyLiveEvents } from "../services/live-events.js";
 import {
   BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS,
   CAPACITY_BLOCKED_HEARTBEAT_RETRY_MAX_ATTEMPTS,
@@ -1151,6 +1152,192 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       .where(eq(agents.id, agentId))
       .then((rows) => rows[0] ?? null);
     expect(agent?.id).toBe(agentId);
+  });
+
+  // BLO-21605: the workspace-quarantine branch of `scheduleBoundedRetry` used
+  // to fire `logActivity` from inside its `db.transaction` callback, so a
+  // consumer could receive `activity.logged` before the workspace's
+  // `archived` status committed, and a rolled-back transaction still emitted
+  // an event for a quarantine that never took effect.
+  async function seedQuarantineFixture(workspaceId: string, workspaceName: string) {
+    const { companyId, agentId, issueId, runId, now } = await seedMaxTurnFixture({ issueStatus: "in_review" });
+    const projectId = randomUUID();
+    const validation = {
+      reason: "git_worktree_branch_incoherence",
+      fingerprint: `workspace_incoherence:v1:sha256:${workspaceName}`,
+      executionWorkspaceId: workspaceId,
+      expectedBranch: workspaceName,
+      actualBranch: "feat/skill-studio-test-runs",
+      cleanliness: "clean" as const,
+    };
+
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Paperclip App",
+      status: "in_progress",
+    });
+    await db.insert(executionWorkspaces).values({
+      id: workspaceId,
+      companyId,
+      projectId,
+      sourceIssueId: issueId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: workspaceName,
+      status: "active",
+      cwd: `/workspace/${workspaceName}`,
+      baseRef: "origin/master",
+      branchName: workspaceName,
+      providerType: "git_worktree",
+      providerRef: `/workspace/${workspaceName}`,
+      metadata: { existing: true },
+    });
+    await db
+      .update(issues)
+      .set({
+        projectId,
+        executionWorkspaceId: workspaceId,
+        executionWorkspacePreference: "reuse_existing",
+        executionWorkspaceSettings: { mode: "isolated_workspace" },
+      })
+      .where(eq(issues.id, issueId));
+
+    const interactionId = randomUUID();
+    await db
+      .update(heartbeatRuns)
+      .set({
+        error: "workspace validation failed before dispatch",
+        errorCode: "workspace_validation_failed",
+        resultJson: { workspaceValidation: validation },
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "issue_commented",
+          mutation: "interaction",
+          interactionId,
+          interactionKind: "request_confirmation",
+          interactionStatus: "accepted",
+        },
+      })
+      .where(eq(heartbeatRuns.id, runId));
+
+    return { companyId, agentId, issueId, runId, now };
+  }
+
+  // Subscribes to `activity.logged` for the given action and, at the moment
+  // each event fires, kicks off a `snapshot()` read on a connection outside
+  // the transaction that logged it. Whether that read observes the committed
+  // effect is what distinguishes "published after commit" from "published
+  // from inside the transaction".
+  function captureActivityEvents<T>(companyId: string, action: string, snapshot: () => Promise<T>) {
+    const seen: { valueAtPublish: Promise<T> }[] = [];
+    const unsubscribe = subscribeCompanyLiveEvents(companyId, (event) => {
+      if (event.type !== "activity.logged") return;
+      const payload = event.payload as Record<string, unknown>;
+      if (payload.action !== action) return;
+      seen.push({ valueAtPublish: snapshot() });
+    });
+    return { seen, stop: unsubscribe };
+  }
+
+  it("emits no activity.logged event when the workspace-quarantine transaction fails to commit", async () => {
+    const workspaceId = randomUUID();
+    const { companyId, runId, now } = await seedQuarantineFixture(workspaceId, "rollback-workspace");
+
+    // Runs the real transaction -- workspace archival and the activity_log
+    // insert both succeed -- then aborts it, standing in for a commit-time
+    // failure.
+    const rollbackDb = new Proxy(db, {
+      get(target, property, receiver) {
+        if (property === "transaction") {
+          return (callback: (tx: unknown) => Promise<unknown>, ...rest: unknown[]) =>
+            (target.transaction as unknown as (
+              cb: (tx: unknown) => Promise<unknown>,
+              ...args: unknown[]
+            ) => Promise<unknown>)(async (tx) => {
+              await callback(tx);
+              throw new Error("simulated commit failure after insert");
+            }, ...rest);
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    }) as typeof db;
+    const rollbackHeartbeat = heartbeatService(rollbackDb);
+
+    const events = captureActivityEvents(
+      companyId,
+      "execution_workspace.workspace_validation_quarantined",
+      () => db
+        .select({ status: executionWorkspaces.status })
+        .from(executionWorkspaces)
+        .where(eq(executionWorkspaces.id, workspaceId))
+        .then((rows) => rows[0]?.status ?? null),
+    );
+    try {
+      await expect(rollbackHeartbeat.scheduleBoundedRetry(runId, {
+        now,
+        random: () => 0.5,
+        retryReason: INTERACTION_CONTINUATION_INFRA_RETRY_REASON,
+        wakeReason: INTERACTION_CONTINUATION_INFRA_WAKE_REASON,
+        maxAttempts: 3,
+      })).rejects.toBeDefined();
+    } finally {
+      events.stop();
+    }
+
+    expect(
+      events.seen,
+      "a rolled-back quarantine must not publish a phantom activity event",
+    ).toHaveLength(0);
+    const workspace = await db
+      .select({ status: executionWorkspaces.status })
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, workspaceId))
+      .then((rows) => rows[0] ?? null);
+    expect(workspace?.status).toBe("active");
+    const activity = await db
+      .select({ id: activityLog.id })
+      .from(activityLog)
+      .where(eq(activityLog.entityId, workspaceId));
+    expect(activity).toHaveLength(0);
+  });
+
+  it("publishes execution_workspace.workspace_validation_quarantined only once the archived status is visible", async () => {
+    const workspaceId = randomUUID();
+    const { companyId, runId, now } = await seedQuarantineFixture(workspaceId, "visible-workspace");
+
+    const events = captureActivityEvents(
+      companyId,
+      "execution_workspace.workspace_validation_quarantined",
+      () => db
+        .select({ status: executionWorkspaces.status })
+        .from(executionWorkspaces)
+        .where(eq(executionWorkspaces.id, workspaceId))
+        .then((rows) => rows[0]?.status ?? null),
+    );
+    try {
+      const scheduled = await heartbeat.scheduleBoundedRetry(runId, {
+        now,
+        random: () => 0.5,
+        retryReason: INTERACTION_CONTINUATION_INFRA_RETRY_REASON,
+        wakeReason: INTERACTION_CONTINUATION_INFRA_WAKE_REASON,
+        maxAttempts: 3,
+      });
+      expect(scheduled.outcome).toBe("scheduled");
+    } finally {
+      events.stop();
+    }
+
+    expect(events.seen).toHaveLength(1);
+    // Read taken from inside the event listener, on a connection outside the
+    // quarantining transaction: the "archived" status is only visible there
+    // after commit, so a pre-commit publication would observe the stale
+    // "active" status instead.
+    await expect(
+      events.seen[0]!.valueAtPublish,
+      "the archived status must already be visible to other connections when the event fires",
+    ).resolves.toBe("archived");
   });
 
   it("does not quarantine another issue's workspace when validation payload is stale", async () => {

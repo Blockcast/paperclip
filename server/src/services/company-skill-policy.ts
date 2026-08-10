@@ -13,7 +13,8 @@ import {
   type SkillPolicySourceType,
 } from "@paperclipai/shared";
 import { conflict, forbidden, notFound } from "../errors.js";
-import { logActivity, type LogActivityInput } from "./activity-log.js";
+import { logger } from "../middleware/logger.js";
+import { logActivity, type ActivityPublish, type LogActivityInput } from "./activity-log.js";
 
 export type SkillPolicyPrincipal = {
   type: "agent" | "board";
@@ -192,7 +193,7 @@ export function companySkillPolicyService(db: Db) {
     policy: SkillPolicyDocument;
     activity: Omit<LogActivityInput, "companyId" | "action" | "entityType" | "entityId" | "details">;
   }) {
-    return db.transaction(async (tx) => {
+    const { result, publish } = await db.transaction(async (tx) => {
       const transactionDb = tx as unknown as Db;
       const policy = skillPolicyDocumentSchema.parse(input.policy);
       const existing = await tx
@@ -246,7 +247,7 @@ export function companySkillPolicyService(db: Db) {
           });
         }
       }
-      await logActivity(transactionDb, {
+      const activityPublish = await logActivity(transactionDb, {
         ...input.activity,
         companyId: input.companyId,
         action: "company.skill_policy_replaced",
@@ -258,34 +259,56 @@ export function companySkillPolicyService(db: Db) {
           defaultEffect: policy.defaultEffect,
           ruleCount: policy.rules.length,
         },
-      });
-      return { ...policy, revision: nextRevision, materialized: true } satisfies EffectiveSkillPolicy;
+      }, { deferPublish: true });
+      return {
+        result: { ...policy, revision: nextRevision, materialized: true } satisfies EffectiveSkillPolicy,
+        publish: activityPublish,
+      };
     });
+    try {
+      publish();
+    } catch (err) {
+      logger.warn(
+        { err, companyId: input.companyId, revision: result.revision },
+        "replaced company skill policy but failed to publish its activity event",
+      );
+    }
+    return result;
   }
 
   async function reset(input: {
     companyId: string;
     activity: Omit<LogActivityInput, "companyId" | "action" | "entityType" | "entityId" | "details">;
   }) {
-    return db.transaction(async (tx) => {
+    const { result, publish } = await db.transaction(async (tx) => {
       const transactionDb = tx as unknown as Db;
+      let activityPublish: ActivityPublish = () => {};
       const existing = await tx
         .delete(companySkillPolicies)
         .where(eq(companySkillPolicies.companyId, input.companyId))
         .returning({ revision: companySkillPolicies.revision })
         .then((rows) => rows[0] ?? null);
       if (existing) {
-        await logActivity(transactionDb, {
+        activityPublish = await logActivity(transactionDb, {
           ...input.activity,
           companyId: input.companyId,
           action: "company.skill_policy_reset",
           entityType: "company_skill_policy",
           entityId: input.companyId,
           details: { previousRevision: existing.revision, newRevision: 0 },
-        });
+        }, { deferPublish: true });
       }
-      return { ...OPEN_DEFAULT_POLICY, rules: [] };
+      return { result: { ...OPEN_DEFAULT_POLICY, rules: [] }, publish: activityPublish };
     });
+    try {
+      publish();
+    } catch (err) {
+      logger.warn(
+        { err, companyId: input.companyId },
+        "reset company skill policy but failed to publish its activity event",
+      );
+    }
+    return result;
   }
 
   return { get, resolveAgentPrincipal, evaluate, replace, reset };

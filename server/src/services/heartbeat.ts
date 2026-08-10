@@ -175,7 +175,7 @@ import {
   evaluateIssueRewakeThrottle,
   isThrottleCandidateIssueRewake,
 } from "./issue-rewake-throttle.js";
-import { logActivity, publishPluginDomainEvent, type LogActivityInput } from "./activity-log.js";
+import { logActivity, publishPluginDomainEvent, type ActivityPublish, type LogActivityInput } from "./activity-log.js";
 import { githubGetPullRequestGate, githubHasReviewerEvidenceForPr } from "./github-app-auth.js";
 import { loadConfig } from "../config.js";
 import { enqueueGithubCommitStatusDelivery } from "./github-status-delivery-outbox.js";
@@ -14226,6 +14226,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           outcome: "scheduled";
           run: typeof heartbeatRuns.$inferSelect;
           reusedExisting: boolean;
+          activityPublish?: ActivityPublish;
         }
       | {
           outcome: "not_scheduled";
@@ -14242,6 +14243,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         };
 
     const scheduleResult = await db.transaction(async (tx): Promise<ScheduledRetryTransactionResult> => {
+      let activityPublish: ActivityPublish | undefined;
       if (retryReason === INTERACTION_CONTINUATION_INFRA_RETRY_REASON) {
         if (issueId) {
           await tx.execute(
@@ -14556,9 +14558,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 eq(executionWorkspaces.companyId, run.companyId),
               ));
 
-            // This action has no plugin-event mapping, so no outbox write can
-            // escape the transaction; keep the default publication semantics.
-            await logActivity(tx as unknown as Db, {
+            activityPublish = await logActivity(tx as unknown as Db, {
               companyId: run.companyId,
               actorType: "system",
               actorId: "heartbeat",
@@ -14568,7 +14568,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               entityType: "execution_workspace",
               entityId: failedWorkspace.id,
               details: quarantine,
-            });
+            }, { deferPublish: true });
             detachWorkspaceFromIssue = issueWorkspace.executionWorkspaceId === failedExecutionWorkspaceId;
           }
         }
@@ -14596,8 +14596,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         outcome: "scheduled",
         run: scheduledRun,
         reusedExisting: false,
+        activityPublish,
       };
     });
+
+    if (scheduleResult.outcome === "scheduled" && scheduleResult.activityPublish) {
+      try {
+        scheduleResult.activityPublish();
+      } catch (err) {
+        logger.warn(
+          { err, runId: run.id, issueId },
+          "scheduled workspace validation retry but failed to publish its activity event",
+        );
+      }
+    }
 
     if (scheduleResult.outcome === "not_scheduled") {
       await appendRunEvent(run, await nextRunEventSeq(run.id), {
@@ -26033,9 +26045,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               idempotencyKey: opts.idempotencyKey ?? null,
               finishedAt: now,
             });
-            // This action has no plugin-event mapping, so no outbox write can
-            // escape the transaction; keep the default publication semantics.
-            await logActivity(tx as unknown as Db, {
+            const activityPublish = await logActivity(tx as unknown as Db, {
               companyId: issue.companyId,
               actorType: "system",
               actorId: "system",
@@ -26055,8 +26065,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 resolvedStrategy,
                 hasResolvablePriorSessionWorkspace,
               },
-            });
-            return { kind: "skipped" as const };
+            }, { deferPublish: true });
+            return { kind: "skipped" as const, activityPublish };
           }
         }
 
@@ -26451,6 +26461,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
         return { kind: "queued" as const, run: newRun };
       });
+
+      if ("activityPublish" in outcome && outcome.activityPublish) {
+        try {
+          outcome.activityPublish();
+        } catch (err) {
+          logger.warn(
+            { err, issueId, agentId },
+            "blocked unrunnable workspace but failed to publish its activity event",
+          );
+        }
+      }
 
       if (outcome.kind === "deferred" || outcome.kind === "skipped" || outcome.kind === "dep_blocked_scheduled") return null;
       if (outcome.kind === "coalesced") {
