@@ -114,6 +114,21 @@ const RECORD_SEPARATOR = "\u001e";
  * silently treated as pre-cutoff. Omitting `cutoffMs` preserves the
  * historical, uncut assertion; `--audit-merged` relies on that default so it
  * keeps reporting pre-cutoff violations as advisory record.
+ *
+ * Deliberately compares against author date, not committer date, even though
+ * author date is the field a caller can set directly (`git commit --date`,
+ * `GIT_AUTHOR_DATE`, or the low-level Git Data API's `author.date` param —
+ * though NOT the Contents/Merge API paths this gate actually polices, which
+ * set both dates server-side to request time and accept no caller-supplied
+ * date at all). Author date still wins, because committer date does not
+ * survive the operation this cutoff exists to tolerate: rebasing an
+ * already-open, already-reviewed PR resets committer date to "now" while
+ * leaving author date untouched (verified empirically; `git merge` / GitHub's
+ * default "Update branch" does not touch either date). Keying the cutoff on
+ * committer date would silently re-flag every rebased pre-cutoff commit as a
+ * fresh violation — reproducing the exact incident BLO-23894 exists to fix —
+ * to close a forgery path that, on the two write paths this gate is scoped
+ * to, does not exist. See the PR #1265 review thread for the full trade-off.
  */
 export function findAttributionOffenses(commits, { cutoffMs } = {}) {
   return commits.filter((commit) => {

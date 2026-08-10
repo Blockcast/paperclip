@@ -228,6 +228,51 @@ test("findLocalRangeOffenses still flags an App-attributed commit authored after
   }
 });
 
+test("findLocalRangeOffenses keeps grandfathering a pre-cutoff commit after an ordinary rebase (PR #1265 review)", () => {
+  // Pins the trade-off documented on findAttributionOffenses: the cutoff
+  // keys on author date, not committer date, specifically because `git
+  // rebase` resets committer date to "now" while leaving author date alone.
+  // If this test ever fails, the reason is almost certainly that someone
+  // switched the comparison to committer date — which would silently
+  // re-flag every rebased pre-cutoff PR, reproducing the BLO-23894 incident.
+  const repoRoot = mkdtempSync(path.join(os.tmpdir(), "attribution-test-cutoff-rebase-"));
+  try {
+    const git = (args, env) =>
+      execFileSync("git", args, { cwd: repoRoot, encoding: "utf8", env: { ...process.env, ...env } });
+    git(["init", "-q", "-b", "main"]);
+    git(["config", "user.name", "Test"]);
+    git(["config", "user.email", "base@example.com"]);
+    git(["-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "base", "-q"]);
+    const base = git(["rev-parse", "HEAD"]).trim();
+
+    git(["checkout", "-q", "-b", "feature"]);
+    git(["config", "user.email", APP_NOREPLY_EMAIL]);
+    git(["-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "pre-cutoff api-path commit", "-q"], {
+      GIT_AUTHOR_DATE: "2026-08-05T16:46:12Z",
+      GIT_COMMITTER_DATE: "2026-08-06T01:15:46Z",
+    });
+
+    // Base moves forward (e.g. another PR merges into main) after the
+    // cutoff, and the feature branch is rebased onto it — routine upkeep
+    // for an already-open PR, not a new commit.
+    git(["checkout", "-q", "main"]);
+    git(["config", "user.email", "base@example.com"]);
+    git(["-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "unrelated main work", "-q"]);
+    git(["checkout", "-q", "feature"]);
+    git(["-c", "commit.gpgsign=false", "rebase", "main", "-q"]);
+    const head = git(["rev-parse", "HEAD"]).trim();
+
+    // Committer date on the rebased commit is "now" (post-cutoff); author
+    // date is untouched. The grandfather clause must still clear it.
+    const committerDate = git(["log", "-1", "--format=%cI", head]).trim();
+    assert.ok(Date.parse(committerDate) >= ATTRIBUTION_GATE_CUTOFF_MS);
+
+    assert.deepEqual(findLocalRangeOffenses({ repoRoot, base, head }).map((o) => o.message), []);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
 test("auditRepoCommitAttribution flags App-attributed commits across the injected PR's own commit list", async () => {
   const commitsPage = JSON.stringify([
     {
