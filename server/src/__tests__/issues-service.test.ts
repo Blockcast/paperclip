@@ -9956,4 +9956,80 @@ describeEmbeddedPostgres("issueService.update expectedCurrentStatus (BLO-18797)"
     expect(updated?.title).toBe("Renamed without a precondition");
     expect(updated?.status).toBe("in_progress");
   });
+
+  // BLO-22876 review: the manager-chain reroute grant is conditioned on the
+  // assignee being non-invokable, and that status lives in `agents` — a WHERE
+  // clause on `issues` cannot pin it. These cover the paused-to-active race
+  // between the route's eligibility read and this write.
+  it("applies the reroute when the assignee is still non-invokable at write time", async () => {
+    const { companyId, issueId, agentId } = await seedBlockedIssue();
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, agentId));
+
+    const successorAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: successorAgentId,
+      companyId,
+      name: "SuccessorEngineer",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const updated = await svc.update(issueId, {
+      assigneeAgentId: successorAgentId,
+      expectedCurrentAssigneeAgentId: agentId,
+      expectedCurrentAssigneeAgentNonInvokable: true,
+    });
+
+    expect(updated?.assigneeAgentId).toBe(successorAgentId);
+  });
+
+  it.each([
+    ["reassign", (successorAgentId: string) => ({ assigneeAgentId: successorAgentId })],
+    ["cancel", () => ({ status: "cancelled" as const })],
+  ])(
+    "rejects a manager-chain %s with 409 when the assignee is resumed before the write",
+    async (_kind, buildPatch) => {
+      const { companyId, issueId, agentId } = await seedBlockedIssue();
+      await db.update(agents).set({ status: "paused" }).where(eq(agents.id, agentId));
+
+      const successorAgentId = randomUUID();
+      await db.insert(agents).values({
+        id: successorAgentId,
+        companyId,
+        name: "SuccessorEngineer",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+
+      // Stand in for the concurrent resume that lands between the route's
+      // `agentsSvc.getById()` eligibility read and this write. Without the
+      // locked re-read the manager would reassign or cancel an issue held by a
+      // live report, which the ordinary issue:mutate boundary denies.
+      await db.update(agents).set({ status: "running" }).where(eq(agents.id, agentId));
+
+      await expect(
+        svc.update(issueId, {
+          ...buildPatch(successorAgentId),
+          expectedCurrentAssigneeAgentId: agentId,
+          expectedCurrentAssigneeAgentNonInvokable: true,
+        }),
+      ).rejects.toMatchObject({ status: 409 });
+
+      const row = await db
+        .select({ status: issues.status, assigneeAgentId: issues.assigneeAgentId })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]);
+      expect(row?.status).toBe("blocked");
+      expect(row?.assigneeAgentId).toBe(agentId);
+    },
+  );
 });
