@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, gte, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, inArray, isNull, lt, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
@@ -25,6 +25,7 @@ import {
   issueRelations,
   issueThreadInteractions,
   issues,
+  workspaceOperations,
 } from "@paperclipai/db";
 import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
 import { runningProcesses } from "../../adapters/index.js";
@@ -113,6 +114,10 @@ export const DEFAULT_LIVENESS_REESCALATION_COOLDOWN_MS = 60 * 60 * 1000;
 // reset and is routinely days away; letting that horizon set the lock lifetime
 // took the issue out of service for the whole park, for its own assignee.
 export const STALE_PRE_CLAIM_ISSUE_LOCK_MS = 6 * 60 * 60 * 1000;
+export const ISSUE_ASSIGNMENT_RECOVERY_PER_AGENT_SWEEP_LIMIT = 5;
+const ASSIGNMENT_RECOVERY_CAPACITY_RESERVATION_STATUS = "assignment_recovery_capacity_reserved";
+// Enqueue normally finishes in seconds; an hour-old reservation has lost its owning process.
+const ASSIGNMENT_RECOVERY_CAPACITY_RESERVATION_TTL_MS = 60 * 60 * 1000;
 // Keep in sync with heartbeat.ts requiresIssueExecutionRetryLock(). These
 // retry kinds must retain issue.executionRunId through promotion: the promotion
 // path gates on the lock under FOR UPDATE, and the pre-start staleness check
@@ -810,13 +815,33 @@ const TRANSIENT_INFRA_CONTINUATION_ERROR_CODES = new Set<string>([
   "process_lost",
 ]);
 
+// BLO-19124: emitted by the dispatcher's dependency gate (see heartbeat.ts
+// `cancelQueuedRunForBlockedDependencies`) when `listDependencyReadiness` reports
+// the issue is not dependency-ready. A member of NON_RETRYABLE_CONTINUATION_ERROR_CODES
+// so it does not burn retry attempts — but unlike the other members it is not an
+// error condition at all, so it must not escalate as a stranded issue.
+const DEPENDENCY_BLOCKED_ERROR_CODE = "issue_dependencies_blocked";
+// Longer than heartbeat.ts reconcileResolvedBlockerDependents()'s default
+// minBlockerResolvedAgeMs. A blocker that just became dependency-ready may still
+// be waiting for the normal edge-triggered or first sweep dependency-resolved
+// wake to land.
+const DEPENDENCY_RESOLVED_WAKE_GRACE_MS = 6 * 60 * 1000;
+// A dependency-resolved wake only proves an observable execution path while it
+// is still being delivered. A completed row is historical idempotency evidence,
+// not evidence that its dependent made progress.
+const LIVE_ISSUE_BLOCKERS_RESOLVED_WAKE_STATUSES = new Set([
+  "queued",
+  "deferred_issue_execution",
+  "claimed",
+]);
+
 const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
   "agent_not_invokable",
   "agent_not_found",
   "budget_blocked",
   "budget_exhausted",
   "issue_paused",
-  "issue_dependencies_blocked",
+  DEPENDENCY_BLOCKED_ERROR_CODE,
 ]);
 
 // A continuation cancelled with this code is a *deliberate wait* (the latest run
@@ -1703,6 +1728,126 @@ export function recoveryService(
       .then((rows) => Boolean(rows[0]));
   }
 
+  async function latestDependencyReadinessTransitionAt(companyId: string, blockerIssueIds: string[]) {
+    const uniqueBlockerIssueIds = [...new Set(blockerIssueIds.filter(Boolean))];
+    if (uniqueBlockerIssueIds.length === 0) return null;
+    const blockerRows = await db
+      .select({
+        id: issues.id,
+        completedAt: issues.completedAt,
+        executionWorkspaceId: issues.executionWorkspaceId,
+      })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          inArray(issues.id, uniqueBlockerIssueIds),
+          eq(issues.status, "done"),
+        ),
+      )
+      .then((rows) => rows);
+
+    const readyAtByBlocker = new Map<string, Date | null>(
+      blockerRows.map((row) => [row.id, row.completedAt ?? null]),
+    );
+    const blockerWorkspacePairs = blockerRows.flatMap((row) =>
+      row.executionWorkspaceId
+        ? [{ blockerIssueId: row.id, executionWorkspaceId: row.executionWorkspaceId }]
+        : []
+    );
+
+    if (blockerWorkspacePairs.length > 0) {
+      const blockerWorkspaceKeys = new Set(
+        blockerWorkspacePairs.map((pair) => `${pair.blockerIssueId}:${pair.executionWorkspaceId}`),
+      );
+      const executionWorkspaceIds = [
+        ...new Set(blockerWorkspacePairs.map((pair) => pair.executionWorkspaceId)),
+      ];
+      const finalizeRows = await db
+        .select({
+          issueId: workspaceOperations.issueId,
+          executionWorkspaceId: workspaceOperations.executionWorkspaceId,
+          finishedAt: workspaceOperations.finishedAt,
+          startedAt: workspaceOperations.startedAt,
+        })
+        .from(workspaceOperations)
+        .where(
+          and(
+            eq(workspaceOperations.companyId, companyId),
+            inArray(workspaceOperations.executionWorkspaceId, executionWorkspaceIds),
+            eq(workspaceOperations.phase, "workspace_finalize"),
+            eq(workspaceOperations.status, "succeeded"),
+            or(inArray(workspaceOperations.issueId, uniqueBlockerIssueIds), isNull(workspaceOperations.issueId)),
+          ),
+        );
+
+      const latestAttributedByBlockerWorkspace = new Map<string, Date>();
+      const latestUnattributedByWorkspace = new Map<string, Date>();
+      for (const row of finalizeRows) {
+        if (!row.executionWorkspaceId) continue;
+        // A successful finalization restores readiness when it completes, not
+        // when it begins. Keep `startedAt` only as a compatibility fallback for
+        // legacy succeeded rows that predate (or failed to persist) `finishedAt`.
+        const finalizedAt = row.finishedAt ?? row.startedAt;
+        if (row.issueId) {
+          const key = `${row.issueId}:${row.executionWorkspaceId}`;
+          if (!blockerWorkspaceKeys.has(key)) continue;
+          const current = latestAttributedByBlockerWorkspace.get(key);
+          if (!current || finalizedAt > current) latestAttributedByBlockerWorkspace.set(key, finalizedAt);
+          continue;
+        }
+        const current = latestUnattributedByWorkspace.get(row.executionWorkspaceId);
+        if (!current || finalizedAt > current) latestUnattributedByWorkspace.set(row.executionWorkspaceId, finalizedAt);
+      }
+
+      for (const pair of blockerWorkspacePairs) {
+        const finalizedAt = latestAttributedByBlockerWorkspace.get(`${pair.blockerIssueId}:${pair.executionWorkspaceId}`)
+          ?? latestUnattributedByWorkspace.get(pair.executionWorkspaceId)
+          ?? null;
+        if (!finalizedAt) continue;
+        const current = readyAtByBlocker.get(pair.blockerIssueId) ?? null;
+        if (!current || finalizedAt > current) readyAtByBlocker.set(pair.blockerIssueId, finalizedAt);
+      }
+    }
+
+    let latestReadyAt: Date | null = null;
+    for (const readyAt of readyAtByBlocker.values()) {
+      if (readyAt && (!latestReadyAt || readyAt > latestReadyAt)) latestReadyAt = readyAt;
+    }
+    return latestReadyAt;
+  }
+
+  function isWithinDependencyResolvedWakeGrace(completedAt: Date | null, now = new Date()) {
+    return completedAt !== null && now.getTime() - completedAt.getTime() < DEPENDENCY_RESOLVED_WAKE_GRACE_MS;
+  }
+
+  async function hasObservableDependencyResolvedWakePath(input: {
+    issue: typeof issues.$inferSelect;
+    blockerIssueIds: string[];
+  }) {
+    const blockerIssueIds = [...new Set(input.blockerIssueIds.filter(Boolean))];
+    const assigneeAgentId = input.issue.assigneeAgentId;
+    if (!assigneeAgentId || blockerIssueIds.length === 0) return false;
+    const idempotencyKeys = blockerIssueIds.map((blockerIssueId) =>
+      buildIssueBlockersResolvedWakeIdempotencyKey({
+        dependentIssueId: input.issue.id,
+        resolvedBlockerIssueId: blockerIssueId,
+      })
+    );
+    const existingWake = await findExistingIssueBlockersResolvedWakeForAnyKey(db, {
+      companyId: input.issue.companyId,
+      idempotencyKeys,
+    });
+    if (existingWake && LIVE_ISSUE_BLOCKERS_RESOLVED_WAKE_STATUSES.has(existingWake.status)) return true;
+
+    const [activeExecutionPath, queuedIssueWake, pendingWakeInteraction] = await Promise.all([
+      hasActiveExecutionPath(input.issue.companyId, input.issue.id, assigneeAgentId),
+      hasQueuedIssueWake(input.issue.companyId, input.issue.id, assigneeAgentId),
+      hasPendingWakeInteraction(input.issue.companyId, input.issue.id),
+    ]);
+    return activeExecutionPath || queuedIssueWake || pendingWakeInteraction;
+  }
+
   async function getLatestAcceptedContinuationInteraction(companyId: string, issueId: string) {
     return db
       .select({
@@ -1888,6 +2033,79 @@ export function recoveryService(
         source: "issue.assigned_todo_liveness_dispatch",
       }, "normal_model"),
     });
+  }
+
+  async function enqueueWithAssignmentRecoveryCapacity<T>(
+    issue: Pick<typeof issues.$inferSelect, "companyId">,
+    agentId: string,
+    enqueue: () => Promise<T | null | undefined>,
+  ): Promise<T | null> {
+    // Reserve under the cross-replica lock, then release the transaction's
+    // connection before enqueueWakeup acquires its own connection.
+    const reservationId = await db.transaction(async (tx) => {
+      await tx.execute(
+        sql`select pg_advisory_xact_lock(hashtextextended(${issue.companyId} || ':assignment_recovery:' || ${agentId}, 0))`,
+      );
+
+      await tx.delete(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, issue.companyId),
+        eq(agentWakeupRequests.agentId, agentId),
+        eq(agentWakeupRequests.status, ASSIGNMENT_RECOVERY_CAPACITY_RESERVATION_STATUS),
+        lt(agentWakeupRequests.updatedAt, new Date(Date.now() - ASSIGNMENT_RECOVERY_CAPACITY_RESERVATION_TTL_MS)),
+      ));
+
+      const liveAssignmentRecoveryRuns = await tx
+        .select({ count: sql<number>`count(*)::int` })
+        .from(heartbeatRuns)
+        .where(and(
+          eq(heartbeatRuns.companyId, issue.companyId),
+          eq(heartbeatRuns.agentId, agentId),
+          inArray(heartbeatRuns.status, ["queued", "scheduled_retry", "running"]),
+          or(
+            sql`${heartbeatRuns.contextSnapshot} ->> 'retryReason' = 'assignment_recovery'`,
+            sql`${heartbeatRuns.contextSnapshot} ->> 'source' = 'issue.assigned_todo_liveness_dispatch'`,
+          ),
+        ))
+        .then((rows) => Number(rows[0]?.count ?? 0));
+
+      const activeReservations = await tx
+        .select({ count: sql<number>`count(*)::int` })
+        .from(agentWakeupRequests)
+        .where(and(
+          eq(agentWakeupRequests.companyId, issue.companyId),
+          eq(agentWakeupRequests.agentId, agentId),
+          eq(agentWakeupRequests.status, ASSIGNMENT_RECOVERY_CAPACITY_RESERVATION_STATUS),
+        ))
+        .then((rows) => Number(rows[0]?.count ?? 0));
+
+      if (
+        liveAssignmentRecoveryRuns + activeReservations >=
+        ISSUE_ASSIGNMENT_RECOVERY_PER_AGENT_SWEEP_LIMIT
+      ) {
+        return null;
+      }
+
+      return tx
+        .insert(agentWakeupRequests)
+        .values({
+          companyId: issue.companyId,
+          agentId,
+          source: "automation",
+          triggerDetail: "system",
+          reason: "issue_assignment_recovery_capacity_reservation",
+          status: ASSIGNMENT_RECOVERY_CAPACITY_RESERVATION_STATUS,
+        })
+        .returning({ id: agentWakeupRequests.id })
+        .then((rows) => rows[0]?.id ?? null);
+    });
+
+    if (!reservationId) return null;
+
+    try {
+      return await enqueue() ?? null;
+    } finally {
+      await db.delete(agentWakeupRequests).where(eq(agentWakeupRequests.id, reservationId));
+    }
   }
 
   async function isInvocationBudgetBlocked(issue: typeof issues.$inferSelect, agentId: string) {
@@ -5083,6 +5301,17 @@ export function recoveryService(
       if (fresh.status !== input.previousStatus && fresh.status !== "blocked") return null;
 
       const recoveryCause = resolveStrandedRecoveryCause(input.latestRun, input.recoveryCause);
+      // The sweep's preflight readiness check can be invalidated by a blocker
+      // that is added or reopened while this escalation waits for its per-issue
+      // advisory lock. Re-read through this transaction immediately before the
+      // first recovery side effect so a now-blocked dependent stays with its
+      // assignee for the normal dependency wake path.
+      if (input.latestRun?.errorCode === DEPENDENCY_BLOCKED_ERROR_CODE) {
+        const readiness = await issuesSvc
+          .listDependencyReadiness(fresh.companyId, [fresh.id], tx)
+          .then((rows) => rows.get(fresh.id));
+        if (readiness && !readiness.isDependencyReady) return null;
+      }
       const { action, hasNewActivitySinceLastAttempt } = await ensureSourceScopedStrandedRecoveryAction({
         issue: fresh,
         previousStatus: input.previousStatus,
@@ -5637,9 +5866,16 @@ export function recoveryService(
             sql`${issues.assigneeAgentId} is not null`,
             eq(issues.status, "in_review"),
           ),
+          sql`not exists (
+            select 1
+            from ${heartbeatRuns} live_execution_run
+            where live_execution_run.id = ${issues.executionRunId}
+              and live_execution_run.status in ('queued', 'running', 'scheduled_retry')
+          )`,
           opts?.issueCreatedAtGte ? gte(issues.createdAt, opts.issueCreatedAtGte) : undefined,
         ),
-      );
+      )
+      .orderBy(asc(issues.companyId), asc(issues.assigneeAgentId), asc(issues.createdAt), asc(issues.id));
 
     const result = {
       assignmentDispatched: 0,
@@ -5655,12 +5891,12 @@ export function recoveryService(
       zeroTokenStartupFailureBlocked: 0,
       zeroTokenSessionResetRetried: 0,
       waitingOnReviewResolved: 0,
+      dependencyWaitSkipped: 0,
       providerQuotaMonitored: 0,
       recentProgressExempted: 0,
       skipped: 0,
       issueIds: [] as string[],
     };
-
     for (const issue of candidates) {
       const executionState = issue.status === "in_review"
         ? parseIssueExecutionState(issue.executionState)
@@ -6086,7 +6322,9 @@ export function recoveryService(
             continue;
           }
 
-          const queued = await enqueueInitialAssignedTodoDispatch(issue, agentId);
+          const queued = await enqueueWithAssignmentRecoveryCapacity(issue, agentId, () =>
+            enqueueInitialAssignedTodoDispatch(issue, agentId)
+          );
           if (queued) {
             result.assignmentDispatched += 1;
             result.issueIds.push(issue.id);
@@ -6187,14 +6425,16 @@ export function recoveryService(
           continue;
         }
 
-        const queued = await enqueueStrandedIssueRecovery({
-          issueId: issue.id,
-          agentId,
-          reason: "issue_assignment_recovery",
-          retryReason: "assignment_recovery",
-          source: "issue.assignment_recovery",
-          retryOfRunId: latestRun.id,
-        });
+        const queued = await enqueueWithAssignmentRecoveryCapacity(issue, agentId, () =>
+          enqueueStrandedIssueRecovery({
+            issueId: issue.id,
+            agentId,
+            reason: "issue_assignment_recovery",
+            retryReason: "assignment_recovery",
+            source: "issue.assignment_recovery",
+            retryOfRunId: latestRun.id,
+          })
+        );
         if (queued) {
           result.dispatchRequeued += 1;
           result.issueIds.push(issue.id);
@@ -6452,6 +6692,44 @@ export function recoveryService(
             // `failed` is a genuine park failure (evidence-gate rejection
             // because there's nothing reviewable yet, or a transient update
             // failure). Fall through to the normal blocked recovery path.
+          }
+        }
+
+        // BLO-19124: `issue_dependencies_blocked` is a *wait*, not a failure. The
+        // dispatcher emits it when `listDependencyReadiness` says the issue is not
+        // dependency-ready, and its own cancellation reason promises "Paperclip will
+        // wake the assignee when blockers resolve" — that wake comes from
+        // `listWakeableBlockedDependents` when the blocker closes. It shares the
+        // non-retryable Set with genuine failures (`agent_not_invokable`,
+        // `budget_exhausted`) only because neither should burn retry attempts, and
+        // that co-tenancy made every correctly-sequenced DAG node escalate as a
+        // strand: 158 of 161 active recovery actions on one inbox, all 158 with a
+        // genuinely unresolved blocker. Escalating them is worse than a no-op —
+        // `escalateStrandedAssignedIssue` reassigns the issue to a recovery owner, so
+        // the dependency wake then fires at an agent that is no longer the assignee.
+        // Re-evaluate readiness *now* (not from the run's stale evidence): if the
+        // dispatcher's own gate would still refuse, there is nothing an owner can do,
+        // so skip. Keep escalating when the issue is dependency-ready, because
+        // "dependency-blocked with nothing blocking it" is a real defect and is
+        // exactly the `blocked`-with-zero-blockers state this ticket forbids.
+        if (classification.errorCode === DEPENDENCY_BLOCKED_ERROR_CODE) {
+          const readinessMap = await issuesSvc.listDependencyReadiness(issue.companyId, [issue.id]);
+          const readiness = readinessMap.get(issue.id);
+          if (readiness && !readiness.isDependencyReady) {
+            result.dependencyWaitSkipped += 1;
+            result.skipped += 1;
+            continue;
+          }
+          if (readiness?.isDependencyReady && readiness.blockerIssueIds.length > 0) {
+            const latestDependencyReadyAt = await latestDependencyReadinessTransitionAt(issue.companyId, readiness.blockerIssueIds);
+            if (
+              isWithinDependencyResolvedWakeGrace(latestDependencyReadyAt) ||
+              await hasObservableDependencyResolvedWakePath({ issue, blockerIssueIds: readiness.blockerIssueIds })
+            ) {
+              result.dependencyWaitSkipped += 1;
+              result.skipped += 1;
+              continue;
+            }
           }
         }
 
@@ -8049,20 +8327,10 @@ export function recoveryService(
       return TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status);
     };
 
-    // BLO-18995: a lock can also be held by a run that never started. Four
-    // enqueue paths stamp executionRunId/executionLockedAt at *enqueue* time
-    // alongside a freshly-inserted `queued` run (enqueueMissingIssueCommentRetry,
-    // enqueueProcessLossRetry, and the two recovery-wake inserts), rather than
-    // lazily at claim time the way claimQueuedRun does. `queued` is neither
-    // missing nor terminal, so isCleanable() above returns false forever and
-    // this sweeper — the designated backstop — never clears it. Meanwhile
-    // enqueueWakeup parks every subsequent wake for that issue as
-    // `deferred_issue_execution` behind the apparent live holder, and those
-    // deferred wakes are only promoted by releaseIssueExecutionAndPromote when
-    // the holding run finishes. A run that is never claimed therefore strands
-    // them indefinitely, with no timeout anywhere in the path. Observed in
-    // production: BLO-18939 held executionLockedAt for a run still `queued`
-    // with startedAt null.
+    // BLO-18995: older deployments stamped executionRunId/executionLockedAt at
+    // enqueue time. Keep cleaning those persisted pre-claim locks after the
+    // writer paths move to claim-time locking; otherwise an upgraded instance
+    // can retain a queued lock indefinitely.
     //
     // Bound it: once a pre-claim lock has been held longer than
     // STALE_PRE_CLAIM_ISSUE_LOCK_MS, treat it as cleanable. Clearing is safe
@@ -8572,16 +8840,6 @@ export function recoveryService(
             skippedDeferredWakeIds.push(deferred.id);
             continue;
           }
-
-          await tx
-            .update(issues)
-            .set({
-              executionRunId: newRun.id,
-              executionAgentNameKey: normalizeAgentNameKey(deferredAgent.name),
-              executionLockedAt: now,
-              updatedAt: now,
-            })
-            .where(and(eq(issues.id, updated.id), eq(issues.assigneeAgentId, deferredAgent.id)));
 
           return {
             updated,

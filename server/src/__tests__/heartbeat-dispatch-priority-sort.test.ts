@@ -41,6 +41,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { cleanupHeartbeatTestState } from "./helpers/cleanup-heartbeat-test-state.js";
 import { heartbeatService } from "../services/heartbeat.js";
+import { issueService } from "../services/issues.js";
 import { _settleDetachedAgentStartLockWorkForTesting } from "../services/agent-start-lock.js";
 import { runningProcesses } from "../adapters/index.js";
 
@@ -143,6 +144,489 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
   afterAll(async () => {
     runningProcesses.clear();
     await tempDb?.cleanup();
+  });
+
+  it("claims an assigned todo issue through auto-checkout (BLO-20088 regression)", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const wakeId = randomUUID();
+    const runId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "TestCo",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "TestAgent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Assigned todo work",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+    });
+
+    await db.insert(agentWakeupRequests).values({
+      id: wakeId,
+      companyId,
+      agentId,
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId },
+      status: "queued",
+      runId,
+    });
+
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "queued",
+      wakeupRequestId: wakeId,
+      contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+    });
+
+    let releaseAdapter: (() => void) | null = null;
+    const adapterStarted = new Promise<void>((resolve) => {
+      mockAdapterExecute.mockImplementationOnce(async () => {
+        resolve();
+        await new Promise<void>((release) => {
+          releaseAdapter = release;
+        });
+        return {
+          exitCode: 0,
+          signal: null as string | null,
+          timedOut: false,
+          errorMessage: null as string | null,
+          resultJson: { exitCode: 0 },
+          provider: "test",
+          model: "test-model",
+        };
+      });
+    });
+
+    const resumePromise = heartbeat.resumeQueuedRuns();
+    try {
+      await adapterStarted;
+
+      const lockedIssue = await db
+        .select({
+          status: issues.status,
+          executionRunId: issues.executionRunId,
+        })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0] ?? null);
+
+      expect(lockedIssue).toEqual({
+        status: "in_progress",
+        executionRunId: runId,
+      });
+    } finally {
+      releaseAdapter?.();
+      await resumePromise;
+      await heartbeat.drainInFlightExecutions(10_000);
+    }
+  });
+
+  it("does not claim an assigned todo issue when a blocker is added while claim waits", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = "00000000-0000-4000-8000-000000000001";
+    const blockerIssueId = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+    const wakeId = randomUUID();
+    const runId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Claim blocker race",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "BlockedClaimAgent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    await db.insert(issues).values([
+      {
+        id: issueId,
+        companyId,
+        title: "Assigned work gains blocker",
+        status: "todo",
+        priority: "high",
+        assigneeAgentId: agentId,
+        issueNumber: 1,
+        identifier: `${issuePrefix}-1`,
+      },
+      {
+        id: blockerIssueId,
+        companyId,
+        title: "Late blocker",
+        status: "done",
+        priority: "high",
+        issueNumber: 2,
+        identifier: `${issuePrefix}-2`,
+      },
+    ]);
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerIssueId,
+      relatedIssueId: issueId,
+      type: "blocks",
+    });
+    await db.insert(agentWakeupRequests).values({
+      id: wakeId,
+      companyId,
+      agentId,
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId },
+      status: "queued",
+      runId,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "queued",
+      wakeupRequestId: wakeId,
+      contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+    });
+
+    let releaseIssueLock!: () => void;
+    let issueLockHeld!: () => void;
+    const issueLockHeldPromise = new Promise<void>((resolve) => { issueLockHeld = resolve; });
+    const releaseIssueLockPromise = new Promise<void>((resolve) => { releaseIssueLock = resolve; });
+    const lockTransaction = db.transaction(async (tx) => {
+      await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, issueId)).for("update");
+      issueLockHeld();
+      await releaseIssueLockPromise;
+    });
+
+    await issueLockHeldPromise;
+    const resumePromise = heartbeat.resumeQueuedRuns();
+    let runReachedRunning = false;
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const status = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0]?.status);
+      if (status === "running") {
+        runReachedRunning = true;
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(runReachedRunning).toBe(true);
+
+    await db.update(issues).set({ status: "todo" }).where(eq(issues.id, blockerIssueId));
+    releaseIssueLock();
+    await lockTransaction;
+    await resumePromise;
+
+    const [run, issue] = await Promise.all([
+      db.select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null),
+      db.select({ status: issues.status, executionRunId: issues.executionRunId }).from(issues)
+        .where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null),
+    ]);
+    expect(run?.status).toBe("cancelled");
+    expect(issue).toEqual({ status: "todo", executionRunId: null });
+    expect(mockAdapterExecute.mock.calls.some(([input]) => input.runId === runId)).toBe(false);
+  });
+
+  it("does not deadlock claim against blocker relation replacement in reverse UUID order", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const blockerIssueId = "00000000-0000-4000-8000-000000000001";
+    const issueId = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+    const wakeId = randomUUID();
+    const runId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const blockerLockKey = `paperclip:issue-blockers:${companyId}:${issueId}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Claim relation lock order",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "RelationRaceAgent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    await db.insert(issues).values([
+      {
+        id: blockerIssueId,
+        companyId,
+        title: "Pre-existing blocker",
+        status: "done",
+        priority: "high",
+        issueNumber: 1,
+        identifier: `${issuePrefix}-1`,
+      },
+      {
+        id: issueId,
+        companyId,
+        title: "Assigned work with relation race",
+        status: "todo",
+        priority: "high",
+        assigneeAgentId: agentId,
+        issueNumber: 2,
+        identifier: `${issuePrefix}-2`,
+      },
+    ]);
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerIssueId,
+      relatedIssueId: issueId,
+      type: "blocks",
+    });
+    await db.insert(agentWakeupRequests).values({
+      id: wakeId,
+      companyId,
+      agentId,
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId },
+      status: "queued",
+      runId,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "queued",
+      wakeupRequestId: wakeId,
+      contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+    });
+
+    let releaseRelationWriter!: () => void;
+    let blockerLockHeld!: () => void;
+    const blockerLockHeldPromise = new Promise<void>((resolve) => {
+      blockerLockHeld = resolve;
+    });
+    const releaseRelationWriterPromise = new Promise<void>((resolve) => {
+      releaseRelationWriter = resolve;
+    });
+    const relationWriter = db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${blockerLockKey}, 0))`);
+      await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, blockerIssueId)).for("update");
+      await tx.update(issues).set({ status: "todo" }).where(eq(issues.id, blockerIssueId));
+      blockerLockHeld();
+      await releaseRelationWriterPromise;
+      await issueService(db).update(issueId, { blockedByIssueIds: [blockerIssueId] }, tx);
+    });
+
+    await blockerLockHeldPromise;
+    const resumePromise = heartbeat.resumeQueuedRuns();
+    let claimWaitedForIssueLock = false;
+    try {
+      const lockWaitDeadline = Date.now() + 60_000;
+      while (Date.now() < lockWaitDeadline) {
+        const waitingRows = await db.execute(sql<{ waiting: boolean }>`
+          select exists (
+            select 1
+            from pg_stat_activity
+            where datname = current_database()
+              and pid <> pg_backend_pid()
+              and wait_event_type = 'Lock'
+          ) as waiting
+        `);
+        if (Array.from(waitingRows)[0]?.waiting) {
+          claimWaitedForIssueLock = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      expect(claimWaitedForIssueLock).toBe(true);
+    } finally {
+      releaseRelationWriter();
+    }
+
+    await expect(relationWriter).resolves.toBeUndefined();
+    await expect(resumePromise).resolves.toBeUndefined();
+    const [run, issue] = await Promise.all([
+      db.select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null),
+      db.select({ executionRunId: issues.executionRunId }).from(issues).where(eq(issues.id, issueId))
+        .then((rows) => rows[0] ?? null),
+    ]);
+    expect(run?.status).toBe("cancelled");
+    expect(issue?.executionRunId).toBeNull();
+    expect(mockAdapterExecute.mock.calls.some(([input]) => input.runId === runId)).toBe(false);
+  });
+
+  it("waits for an in-flight blocker insertion before claiming issue execution", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const blockerIssueId = randomUUID();
+    const issueId = randomUUID();
+    const wakeId = randomUUID();
+    const runId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const blockerLockKey = `paperclip:issue-blockers:${companyId}:${issueId}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Claim blocker insertion race",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "BlockerInsertionRaceAgent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    await db.insert(issues).values([
+      {
+        id: blockerIssueId,
+        companyId,
+        title: "Uncommitted new blocker",
+        status: "todo",
+        priority: "high",
+        issueNumber: 1,
+        identifier: `${issuePrefix}-1`,
+      },
+      {
+        id: issueId,
+        companyId,
+        title: "Assigned work awaiting blocker insertion",
+        status: "todo",
+        priority: "high",
+        assigneeAgentId: agentId,
+        issueNumber: 2,
+        identifier: `${issuePrefix}-2`,
+      },
+    ]);
+    await db.insert(agentWakeupRequests).values({
+      id: wakeId,
+      companyId,
+      agentId,
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId },
+      status: "queued",
+      runId,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "queued",
+      wakeupRequestId: wakeId,
+      contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+    });
+
+    let releaseRelationWriter!: () => void;
+    let relationWriterReady!: () => void;
+    const relationWriterReadyPromise = new Promise<void>((resolve) => {
+      relationWriterReady = resolve;
+    });
+    const releaseRelationWriterPromise = new Promise<void>((resolve) => {
+      releaseRelationWriter = resolve;
+    });
+    const relationWriter = db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${blockerLockKey}, 0))`);
+      await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, blockerIssueId)).for("update");
+      relationWriterReady();
+      await releaseRelationWriterPromise;
+      await issueService(db).update(issueId, { blockedByIssueIds: [blockerIssueId] }, tx);
+    });
+
+    await relationWriterReadyPromise;
+    const resumePromise = heartbeat.resumeQueuedRuns();
+    let claimWaitedForRelationWriter = false;
+    try {
+      const lockWaitDeadline = Date.now() + 60_000;
+      while (Date.now() < lockWaitDeadline) {
+        const waitingRows = await db.execute(sql<{ waiting: boolean }>`
+          select exists (
+            select 1
+            from pg_stat_activity
+            where datname = current_database()
+              and pid <> pg_backend_pid()
+              and wait_event_type = 'Lock'
+          ) as waiting
+        `);
+        if (Array.from(waitingRows)[0]?.waiting) {
+          claimWaitedForRelationWriter = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      expect(claimWaitedForRelationWriter).toBe(true);
+    } finally {
+      releaseRelationWriter();
+    }
+
+    await expect(relationWriter).resolves.toBeUndefined();
+    await expect(resumePromise).resolves.toBeUndefined();
+    const [run, issue] = await Promise.all([
+      db.select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null),
+      db.select({ executionRunId: issues.executionRunId }).from(issues).where(eq(issues.id, issueId))
+        .then((rows) => rows[0] ?? null),
+    ]);
+    expect(run?.status).toBe("cancelled");
+    expect(issue?.executionRunId).toBeNull();
+    expect(mockAdapterExecute.mock.calls.some(([input]) => input.runId === runId)).toBe(false);
   });
 
   it("dispatches high-priority todo ahead of low-priority in_progress (BLO-12990 regression)", async () => {
@@ -3858,6 +4342,169 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     },
     180_000,
   );
+
+  it("advances the recovery lane through fully deferred admission-refusal pages", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const staleSlotRunId = randomUUID();
+    const issuePrefix = `D${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const baseCreatedAt = new Date(Date.now() - 5 * 60 * 1000);
+    const recoveryRunIds = Array.from({ length: 5 }, () => randomUUID());
+    const recoveryIssueIds = Array.from({ length: recoveryRunIds.length }, () => randomUUID());
+    let recoveryContinuationSchedules = 0;
+    let refusalStatusReads = 0;
+    let releasedStaleSlot = false;
+    let sawFullyDeferredRecoveryPage = false;
+
+    const boundedHeartbeat = heartbeatService(db, {
+      penstockGate: allowPenstockGate,
+      queuedRunDispatchBounds: { scanLimit: 2, maxScanBatches: 1, maxResumePasses: 12 },
+      beforeQueuedDispatchRefusalStatusReadForTest: async () => {
+        refusalStatusReads += 1;
+      },
+      afterQueuedDispatchContinuationScheduledForTest: async (event) => {
+        if (event.reason !== "resume_recovery_lane" || releasedStaleSlot) return;
+        recoveryContinuationSchedules += 1;
+        if (recoveryContinuationSchedules <= refusalStatusReads) return;
+        sawFullyDeferredRecoveryPage = true;
+        releasedStaleSlot = true;
+        await db
+          .update(externalRuntimeReservations)
+          .set({
+            state: "released",
+            releasedAt: new Date(),
+            releaseReason: "test_slot_released_after_deferred_page",
+            updatedAt: new Date(),
+          })
+          .where(eq(externalRuntimeReservations.runId, staleSlotRunId));
+      },
+    });
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "RecoveryLaneDeferredPagesCo",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "RecoveryLaneDeferredPagesAgent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { enabled: true, wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    await db.insert(issues).values(
+      recoveryIssueIds.map((issueId, index) => ({
+        id: issueId,
+        companyId,
+        title: `Recovery lane candidate ${index + 1}`,
+        status: "todo" as const,
+        priority: "medium" as const,
+        assigneeAgentId: agentId,
+        issueNumber: index + 1,
+        identifier: `${issuePrefix}-${index + 1}`,
+      })),
+    );
+
+    await db.insert(heartbeatRuns).values({
+      id: staleSlotRunId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "succeeded",
+      contextSnapshot: {},
+      startedAt: new Date(baseCreatedAt.getTime() - 60_000),
+      finishedAt: new Date(baseCreatedAt.getTime() - 30_000),
+      createdAt: new Date(baseCreatedAt.getTime() - 60_000),
+      updatedAt: new Date(baseCreatedAt.getTime() - 30_000),
+    });
+    await db.insert(externalRuntimeReservations).values({
+      companyId,
+      agentId,
+      runId: staleSlotRunId,
+      slotId: 0,
+      state: "launched",
+      jobName: `paperclip-agent-${staleSlotRunId}`,
+      jobUid: randomUUID(),
+      isolationMode: "run",
+      isolationKey: `run:${staleSlotRunId}`,
+      isolationBoundAt: new Date(baseCreatedAt.getTime() - 60_000),
+      reservedAt: new Date(baseCreatedAt.getTime() - 60_000),
+      launchingAt: new Date(baseCreatedAt.getTime() - 60_000),
+      launchedAt: new Date(baseCreatedAt.getTime() - 30_000),
+      createdAt: new Date(baseCreatedAt.getTime() - 60_000),
+      updatedAt: new Date(baseCreatedAt.getTime() - 30_000),
+    });
+
+    for (const [index, runId] of recoveryRunIds.entries()) {
+      const wakeId = randomUUID();
+      const recoveryActionId = randomUUID();
+      const issueId = recoveryIssueIds[index]!;
+      const createdAt = new Date(baseCreatedAt.getTime() + index);
+      await db.insert(agentWakeupRequests).values({
+        id: wakeId,
+        companyId,
+        agentId,
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "source_scoped_recovery_action",
+        payload: { issueId, recoveryActionId },
+        status: "queued",
+        runId,
+        requestedAt: createdAt,
+        updatedAt: createdAt,
+      });
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "queued",
+        wakeupRequestId: wakeId,
+        contextSnapshot: {
+          issueId,
+          wakeReason: "source_scoped_recovery_action",
+          source: "issue_recovery_action",
+          recoveryActionId,
+        },
+        createdAt,
+        updatedAt: createdAt,
+      });
+    }
+
+    const dispatchedRunIds: string[] = [];
+    mockAdapterExecute.mockImplementation(async (args: { runId: string }) => {
+      dispatchedRunIds.push(args.runId);
+      return {
+        exitCode: 0,
+        signal: null as string | null,
+        timedOut: false,
+        errorMessage: null as string | null,
+        resultJson: { exitCode: 0 },
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    await boundedHeartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(boundedHeartbeat, recoveryRunIds[2]!, 60_000);
+
+    expect(sawFullyDeferredRecoveryPage).toBe(true);
+    expect(releasedStaleSlot).toBe(true);
+    expect(refusalStatusReads).toBe(2);
+    // The first successful dispatch must come from beyond the fully deferred
+    // page. Earlier refused work may settle asynchronously after that point.
+    expect(dispatchedRunIds).toContain(recoveryRunIds[2]);
+    expect(dispatchedRunIds[0]).toBe(recoveryRunIds[2]);
+    await boundedHeartbeat.drainInFlightExecutions(60_000);
+  }, 180_000);
 
   it("retries a lone emergency run after atomic admission refusal", async () => {
     const companyId = randomUUID();

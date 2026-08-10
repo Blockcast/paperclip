@@ -482,11 +482,21 @@ describeEmbeddedPostgres("queued backlog convergence (BLO-20396)", () => {
     // BLO-20396 (second review follow-up). Paging fixed the fixed-prefix
     // starvation at 200 rows but reintroduced it at the hard ceiling: a pass
     // stops after QUEUED_RUN_DISPATCH_MAX_SCAN_BATCHES batches, and if every
-    // one of those 2,000 rows is dependency-blocked it prunes nothing, claims
+    // one of those rows is dependency-blocked it prunes nothing, claims
     // nothing, and schedules nothing — so the next pass rescans the identical
     // prefix forever. The previous test's 210 blocked rows sit *below* the
-    // ceiling and so could not catch this; this fixture puts the runnable row
-    // past it.
+    // production-sized ceiling and so could not catch this; this fixture puts
+    // the runnable row past it.
+    //
+    // BLO-22418: exceeding the *production* ceiling (200 * 10 = 2,000) took
+    // 2,010+ seeded rows, and draining them made this test's pass/fail track
+    // wall-clock drain time (86s unloaded, up to ~468s on a loaded runner)
+    // instead of the resume-past-ceiling property it asserts — a slow runner
+    // failed with no code defect present. A test-local bounded instance
+    // narrows scanLimit/maxScanBatches so the same ceiling-crossing property —
+    // a resumed pass, not one pass scanning forever, reaches work beyond the
+    // cap — is exercised with 13 rows, in milliseconds, with no change to
+    // production bounds.
     const companyId = randomUUID();
     const agentId = randomUUID();
     const issuePrefix = `C${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
@@ -567,11 +577,21 @@ describeEmbeddedPostgres("queued backlog convergence (BLO-20396)", () => {
 
     const blockerIssueId = addIssue("in_progress", "high");
 
-    // QUEUED_RUN_DISPATCH_SCAN_LIMIT (200) * QUEUED_RUN_DISPATCH_MAX_SCAN_BATCHES
-    // (10) = 2,000 rows is everything one pass may read. Go past it.
+    // A test-local bounded instance: scanLimit(5) * maxScanBatches(2) = a
+    // 10-row ceiling per pass, instead of production's 200 * 10 = 2,000. Same
+    // cap arithmetic and the same startNextQueuedRunForAgent resume path
+    // (queuedRunDispatchBounds is test-only injection — see heartbeat.ts),
+    // exercised at a scale that runs in milliseconds instead of minutes.
+    const boundedHeartbeat = heartbeatService(db, {
+      penstockGate: allowPenstockGate,
+      queuedRunDispatchBounds: { scanLimit: 5, maxScanBatches: 2 },
+    });
+
+    // 12 dependency-blocked rows: more than the 10-row ceiling, so the first
+    // pass cannot reach all of them and must resume to make progress.
     const blockedRunIds: string[] = [];
     const relationRows: Array<typeof issueRelations.$inferInsert> = [];
-    for (let i = 0; i < 2_010; i += 1) {
+    for (let i = 0; i < 12; i += 1) {
       const dependentIssueId = addIssue("todo", "critical");
       relationRows.push({
         companyId,
@@ -581,49 +601,19 @@ describeEmbeddedPostgres("queued backlog convergence (BLO-20396)", () => {
       });
       blockedRunIds.push(addQueuedRun(dependentIssueId, i * 1000));
     }
-    expect(blockedRunIds.length).toBeGreaterThan(2_000);
+    expect(blockedRunIds.length).toBeGreaterThan(10);
 
     // The one runnable row, newest of all and beyond the ceiling.
     const runnableIssueId = addIssue("todo", "high");
     const runnableRunId = addQueuedRun(runnableIssueId, 5_000_000);
 
-    // Chunk the inserts: a single statement for thousands of rows would blow
-    // past Postgres' 65,535 bind-parameter limit.
-    const insertChunked = async <T>(
-      rows: T[],
-      insert: (chunk: T[]) => Promise<unknown>,
-    ) => {
-      for (let i = 0; i < rows.length; i += 500) {
-        await insert(rows.slice(i, i + 500));
-      }
-    };
-    await insertChunked(issueRows, (chunk) => db.insert(issues).values(chunk));
-    await insertChunked(relationRows, (chunk) => db.insert(issueRelations).values(chunk));
-    await insertChunked(wakeRows, (chunk) => db.insert(agentWakeupRequests).values(chunk));
-    await insertChunked(runRows, (chunk) => db.insert(heartbeatRuns).values(chunk));
+    await db.insert(issues).values(issueRows);
+    await db.insert(issueRelations).values(relationRows);
+    await db.insert(agentWakeupRequests).values(wakeRows);
+    await db.insert(heartbeatRuns).values(runRows);
 
-    await heartbeat.resumeQueuedRuns();
-    // BLO-20885: this drain budget is a hang guard, not an assertion about
-    // speed, so it must clear the slowest legitimate run by a wide margin. At
-    // 120s it did not: cancelling 2,010 dependency-blocked rows measured 80s of
-    // the budget on an unloaded CI shard and 144s on a loaded one, so the
-    // convergence assertion below started reporting a *timing* result — it
-    // failed whenever the shard happened to be busy, which is a property of the
-    // runner and not of the code under test. `drainInFlightExecutions` returns
-    // as soon as the in-flight set empties, so a wider bound costs nothing on a
-    // healthy run and only extends the genuinely-broken one.
-    //
-    // Raising it does not weaken what this test guards. The regression it
-    // exists to catch is non-convergence — a pass that rescans the identical
-    // 2,000-row prefix forever and therefore never reaches the runnable row at
-    // all. That fails at any budget; no amount of extra time rescues it. What
-    // the old bound could not distinguish was "never converges" from "converged
-    // slower than this arbitrary number", and only the first is a defect.
-    //
-    // 420s keeps ~180s of the enclosing 600s test timeout for fixture insert
-    // and the assertions, so a real hang still surfaces here rather than as a
-    // bare vitest timeout with no diagnostic.
-    await heartbeat.drainInFlightExecutions(420_000);
+    await boundedHeartbeat.resumeQueuedRuns();
+    await boundedHeartbeat.drainInFlightExecutions(10_000);
 
     // Reached via the resumed continuation, not by one pass scanning forever.
     const [runnableAfter] = await db
@@ -634,12 +624,13 @@ describeEmbeddedPostgres("queued backlog convergence (BLO-20396)", () => {
 
     // Blocked rows past the ceiling are resolved too, once a resumed pass
     // reaches them — not silently abandoned beyond the scan bound.
-    const blockedStillQueued = await db
+    const blockedAfter = await db
       .select({ status: heartbeatRuns.status })
       .from(heartbeatRuns)
-      .where(inArray(heartbeatRuns.id, blockedRunIds.slice(0, 500)));
-    expect(blockedStillQueued.every((row) => row.status === "cancelled")).toBe(true);
-  }, 600_000);
+      .where(inArray(heartbeatRuns.id, blockedRunIds));
+    expect(blockedAfter).toHaveLength(12);
+    expect(blockedAfter.every((row) => row.status === "cancelled")).toBe(true);
+  }, 20_000);
 
   it("dispatches a newer critical run ahead of an older low-priority prefix", async () => {
     // BLO-20396 (second review follow-up). Collection walks the queue
