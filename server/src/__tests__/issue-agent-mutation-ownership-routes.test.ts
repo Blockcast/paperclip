@@ -1425,6 +1425,121 @@ describe("agent issue mutation checkout ownership", () => {
     expect(res.body.error).toBe("Only the assignee agent or a board user can manage issue monitors");
   });
 
+  // BLO-24191: the production shape the two tests above miss. Productivity
+  // reviews are routed UP the reporting chain, so the reviewer is nearly
+  // always a manager of the assignee — and a manager holds
+  // `tasks:manage_active_checkouts` over its reports (`allow_manager_chain`),
+  // while a legacy agent-creator such as the CTO holds it over everyone. That
+  // override is the check immediately preceding the reviewer override in the
+  // same branch, so it returned first, the reviewer relation went unrecorded,
+  // and the monitor gate refused the write while advertising the relation in
+  // `allowedRelations`. The decide mock above denies the override, which is why
+  // the fix was invisible to it.
+  const productivityReviewDecideWithCheckoutOverride = async (input: { action: string }) =>
+    input.action === "tasks:manage_active_checkouts"
+      ? {
+        allowed: true,
+        action: input.action,
+        reason: "allow_manager_chain",
+        explanation: "Allowed because the actor manages the issue assignee in the reporting chain.",
+      }
+      : productivityReviewDecideWithRuntimeManage(input);
+
+  it("lets a productivity-review owner who also manages the assignee arm the monitor", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({
+      status: "in_progress",
+      assigneeAgentId: peerAgentId,
+      executionPolicy: null,
+    }));
+    mockAccessService.decide.mockImplementation(productivityReviewDecideWithCheckoutOverride);
+
+    const res = await request(await createApp(ownerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        executionPolicy: {
+          monitor: {
+            nextCheckAt: "2026-08-17T00:00:00.000Z",
+            notes: "snooze window ordered by productivity review",
+          },
+        },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      issueId,
+      expect.objectContaining({
+        executionPolicy: expect.objectContaining({
+          monitor: expect.objectContaining({
+            notes: "snooze window ordered by productivity review",
+            // BLO-24191 AC #2: a reviewer-armed monitor stays
+            // `assignee`-scheduled, NOT `board`. `board` exempts a monitor from
+            // the BLO-18294 convergence guard entirely, and stamping it from an
+            // agent actor would hand an agent the unbounded-polling escape
+            // hatch that guard exists to close. It is also not needed for the
+            // case that motivated the question: the post-stall re-arm rule is
+            // enforced against the ACTOR's identity
+            // (`sameAssigneeResetAfterPriorStall` in issue-execution-policy.ts),
+            // not against `scheduledBy`, so a reviewer — structurally not the
+            // stalled assignee — already resets the counters. Pinned by
+            // issue-monitor-convergence-guard.test.ts, "lets a non-assignee
+            // reset stale consecutive bookkeeping after a stalled issue leaves
+            // blocked".
+            scheduledBy: "assignee",
+          }),
+        }),
+      }),
+    );
+  });
+
+  it("records the reviewer source-mutation audit even when the checkout override authorizes the PATCH", async () => {
+    // The audit entry and the monitor gate read the same signal, so the gate
+    // fix is only durable if the signal itself is recorded off the boundary
+    // reason rather than off which early return happened to fire.
+    mockIssueService.getById.mockResolvedValue(makeIssue({
+      status: "in_progress",
+      assigneeAgentId: peerAgentId,
+    }));
+    mockAccessService.decide.mockImplementation(productivityReviewDecideWithCheckoutOverride);
+
+    const res = await request(await createApp(ownerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "todo" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(productivitySourceMutationAuditCalls()).toHaveLength(1);
+    expect(productivitySourceMutationAuditCalls()[0]?.[1]).toMatchObject({
+      details: { reviewerAgentId: ownerAgentId, previousAssigneeAgentId: peerAgentId },
+    });
+  });
+
+  it("does not record the reviewer audit when the actor holds no productivity-review grant", async () => {
+    // Fail-closed check on the widened recording site: the checkout override
+    // alone must not manufacture a reviewer relation.
+    mockIssueService.getById.mockResolvedValue(makeIssue({
+      status: "in_progress",
+      assigneeAgentId: peerAgentId,
+      executionPolicy: null,
+    }));
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+      allowed: true,
+      action: input.action,
+      reason: input.action === "issue:mutate" ? "allow_manager_chain" : "allow_test_default",
+      explanation: "Allowed without any productivity-review grant.",
+    }));
+
+    const res = await request(await createApp(ownerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        executionPolicy: {
+          monitor: { nextCheckAt: "2026-08-17T00:00:00.000Z", notes: "no review grant" },
+        },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toBe("Only the assignee agent or a board user can manage issue monitors");
+    expect(productivitySourceMutationAuditCalls()).toHaveLength(0);
+  });
+
   // The comment route's current-execution-run short-circuit returns a bare
   // `true`, discarding the decision reason. A previous owner whose stale
   // execution lock still matches therefore reaches the route WITHOUT an
