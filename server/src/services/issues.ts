@@ -93,6 +93,10 @@ import {
 import { mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
 import { buildInitialIssueMonitorFields, normalizeIssueExecutionPolicy } from "./issue-execution-policy.js";
 import { instanceSettingsService } from "./instance-settings.js";
+import {
+  assertNotDuplicatePrReviewIssue,
+  lockPrReviewIssueScopes,
+} from "./pr-review-duplicate-issue-guard.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { redactSensitiveText } from "../redaction.js";
 import { resolveIssueGoalId, resolveNextIssueGoalId } from "./issue-goal-fallback.js";
@@ -8338,6 +8342,18 @@ export function issueService(db: Db) {
         return await db.transaction(async (tx) => {
         const idempotencyKey = rawIdempotencyKey?.trim() || null;
         const normalizedTitle = normalizeCreateIssueTitle(issueData.title);
+        if (issueData.assigneeAgentId) {
+          // Acquire the PR scope before the title/idempotency locks below. The
+          // later duplicate check intentionally stays after replay so a prior
+          // successful create remains idempotent while the transaction lock
+          // makes any racing webhook wake visible first.
+          await lockPrReviewIssueScopes(tx, {
+            companyId,
+            assigneeAgentId: issueData.assigneeAgentId,
+            title: issueData.title,
+            description: issueData.description,
+          });
+        }
         if (allowDuplicate === false) {
           const titleGuardKey =
             `issue-create:title:${companyId}:${issueData.parentId ?? "root"}:${normalizedTitle}`;
@@ -8403,6 +8419,20 @@ export function issueService(db: Db) {
           const [enriched] = await withIssueLabels(tx, [existingIssue]);
           const [withRelations] = await withIssueRelationSummaries(companyId, [enriched], tx);
           return withRelations;
+        }
+        if (issueData.assigneeAgentId) {
+          // Guarded here rather than in routes/issues.ts so every create path is
+          // covered — POST /issues, POST /issues/:id/children, and the
+          // accepted-plan decomposition bulk create all funnel through here.
+          // It runs after idempotency/recent-title replay so a successful create
+          // keeps replaying as the same issue instead of turning into a hard
+          // rejection if a live PR review appears between attempts (BLO-20526).
+          await assertNotDuplicatePrReviewIssue(tx, {
+            companyId,
+            assigneeAgentId: issueData.assigneeAgentId,
+            title: issueData.title,
+            description: issueData.description,
+          });
         }
 
         // Create can mutate the same issue graph as update via parentId and

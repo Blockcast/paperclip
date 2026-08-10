@@ -62,15 +62,36 @@ import {
   enrichAuthoredLocForRow,
   type RecordMergedPullRequestInput,
 } from "../services/issue-pull-requests.js";
+import { matchesTaskKey, normalizePrReviewRepoFullName } from "../services/pr-review-duplicate-issue-guard.js";
+import { HttpError } from "../errors.js";
 
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type PrReviewerSelectionDb = Pick<Db | DbTransaction, "select">;
 
-// Keep lock contention well below GitHub's webhook timeout. The winner holds
-// one pooled connection while heartbeat commits through another; createDb's
-// default pool satisfies the required minimum of two connections.
+// Keep lock contention well below GitHub's webhook timeout. If this bounded
+// serialization layer times out, return a retryable error rather than dispatch
+// outside the lock and violate the issue-create duplicate guard. The winner
+// holds one pooled connection while heartbeat commits through another;
+// createDb's default pool satisfies the required minimum of two.
 const PR_REVIEWER_TASK_LOCK_TIMEOUT_MS = 2_000;
 const PR_REVIEWER_TASK_LOCK_RETRY_MS = 25;
+const ACTIVE_PR_REVIEWER_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
+
+class PrReviewerTaskLockTimeoutError extends Error {
+  constructor() {
+    super("timed out acquiring PR reviewer task assignment lock");
+    this.name = "PrReviewerTaskLockTimeoutError";
+  }
+}
+
+class PrReviewerTaskLockContentionError extends HttpError {
+  constructor() {
+    super(503, "PR reviewer dispatch is contended; retry this webhook delivery", {
+      code: "pr_reviewer_dispatch_contended",
+    });
+    this.name = "PrReviewerTaskLockContentionError";
+  }
+}
 
 export interface GithubWebhookConfig {
   /**
@@ -1430,6 +1451,9 @@ function buildPrReviewerWakeIdempotencyKey(
   context: ResolvedEventContext & { prNumber: number },
   deliveryId: string | null,
 ) {
+  // Phase one of the casing transition keeps writes readable by old pods.
+  // Compatibility reads and dual locks must deploy everywhere before a later
+  // release can safely normalize persisted keys.
   const repo = context.repoFullName ?? "unknown";
   if (typeof context.prNumber !== "number") {
     logger.error(
@@ -1481,8 +1505,35 @@ function buildPrReviewerWakeIdempotencyKey(
 // stay stable across heads for one PR. Head-awareness for review requests lives
 // in heartbeat's coalescing decision instead (BLO-18953).
 function buildPrReviewerTaskKey(context: ResolvedEventContext & { prNumber: number }) {
+  // Keep the legacy spelling during the compatibility rollout. New pods can
+  // read either spelling; pre-normalization pods can only read this one.
   const repo = context.repoFullName ?? "unknown";
   return `pr_review:${repo}:${context.prNumber}`;
+}
+
+/**
+ * Advisory-lock namespaces to hold while dispatching one PR's reviewer wake.
+ *
+ * The lock id is `hashtextextended(taskKey, 0)`, so changing the *spelling* of
+ * the task key changes the namespace. Phase one keeps writing the raw,
+ * mixed-case `repoFullName` so old readers can still see new rows, but
+ * compatibility-aware pods lock both that namespace and the future normalized
+ * namespace. A later release can switch producers only after every pod can read
+ * and lock both spellings.
+ *
+ * Hold BOTH namespaces until no pre-normalization pod remains. Sorted, so
+ * every caller acquires the pair in one order and two peers contending for the
+ * same PR cannot livelock each other by grabbing opposite halves. Retire this
+ * alongside the `lower()` legs in pr-review-duplicate-issue-guard.
+ */
+function buildPrReviewerTaskLockKeys(
+  context: ResolvedEventContext & { prNumber: number },
+): string[] {
+  const legacyCasing = buildPrReviewerTaskKey(context);
+  const normalized =
+    `pr_review:${normalizePrReviewRepoFullName(context.repoFullName ?? "unknown")}` +
+    `:${context.prNumber}`;
+  return [...new Set([normalized, legacyCasing])].sort();
 }
 
 type PrReviewerWakeupOptions = NonNullable<Parameters<ReturnType<typeof heartbeatService>["wakeup"]>[1]> & {
@@ -1580,7 +1631,7 @@ async function selectPrReviewerAgentId(
     .where(
       and(
         inArray(heartbeatRuns.agentId, activeAgentIds),
-        inArray(heartbeatRuns.status, ["queued", "running"]),
+        inArray(heartbeatRuns.status, [...ACTIVE_PR_REVIEWER_RUN_STATUSES]),
       ),
     )
     .groupBy(heartbeatRuns.agentId);
@@ -1616,9 +1667,9 @@ async function findActivePrReviewerForTask(
     .where(
       and(
         inArray(heartbeatRuns.agentId, [...configuredAgentIds]),
-        inArray(heartbeatRuns.status, ["queued", "running"]),
+        inArray(heartbeatRuns.status, [...ACTIVE_PR_REVIEWER_RUN_STATUSES]),
         inArray(agents.status, ["idle", "running"]),
-        eq(heartbeatRuns.contextTaskKey, taskKey),
+        matchesTaskKey(heartbeatRuns.contextTaskKey, taskKey),
       ),
     )
     .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
@@ -1628,31 +1679,40 @@ async function findActivePrReviewerForTask(
 
 async function withPrReviewerTaskLock<T>(
   db: Db,
-  taskKey: string,
+  taskKeys: readonly string[],
   action: (tx: DbTransaction) => Promise<T>,
 ): Promise<T> {
   const deadline = Date.now() + PR_REVIEWER_TASK_LOCK_TIMEOUT_MS;
+  // Sorted at the call site (buildPrReviewerTaskLockKeys); re-sorted here so a
+  // future caller passing an unordered pair still cannot invert the order.
+  const lockKeys = [...new Set(taskKeys)].sort();
+  if (lockKeys.length === 0) throw new Error("PR reviewer task lock requires at least one key");
 
   while (true) {
     // Do not block a pooled connection while another request owns the lock:
     // the winner needs a second connection for heartbeat's enqueue transaction.
     const outcome = await db.transaction(async (tx) => {
-      const rows = await tx.execute(
-        sql`select pg_try_advisory_xact_lock(hashtextextended(${taskKey}, 0)) as acquired`,
-      );
-      const row = Array.isArray(rows) ? rows[0] : null;
-      if (
-        !row ||
-        typeof row !== "object" ||
-        (row as Record<string, unknown>).acquired !== true
-      ) {
-        return { acquired: false as const };
+      // All-or-nothing: the locks are xact-scoped, so returning early releases
+      // whichever prefix we did acquire when this transaction ends. Partial
+      // ownership never escapes the retry loop.
+      for (const lockKey of lockKeys) {
+        const rows = await tx.execute(
+          sql`select pg_try_advisory_xact_lock(hashtextextended(${lockKey}, 0)) as acquired`,
+        );
+        const row = Array.isArray(rows) ? rows[0] : null;
+        if (
+          !row ||
+          typeof row !== "object" ||
+          (row as Record<string, unknown>).acquired !== true
+        ) {
+          return { acquired: false as const };
+        }
       }
       return { acquired: true as const, value: await action(tx) };
     });
     if (outcome.acquired) return outcome.value;
     if (Date.now() >= deadline) {
-      throw new Error("timed out acquiring PR reviewer task assignment lock");
+      throw new PrReviewerTaskLockTimeoutError();
     }
     await new Promise((resolve) => setTimeout(resolve, PR_REVIEWER_TASK_LOCK_RETRY_MS));
   }
@@ -2178,7 +2238,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
         const idempotentStatuses = idempotentWakeStatuses(
           prReviewerWakeIdempotencyScope(context, deliveryId),
         );
-        return await withPrReviewerTaskLock(db, reviewerTaskKey, async (tx) => {
+        const dispatchReviewerWake = async (tx: DbTransaction) => {
           // The wake insert commits through heartbeat's own transaction. Keep
           // this transaction-scoped lock held until that commit is visible so
           // concurrent first events for one PR re-check affinity instead of
@@ -2189,7 +2249,18 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
             .where(
               and(
                 inArray(agentWakeupRequests.agentId, reviewerAgentIds),
-                eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
+                // Case-insensitive on the repo segment, for the same reason the
+                // task-key lookups are. Phase one retains legacy-spelled writes
+                // for old-reader safety, but normalized rows may already exist
+                // from a canary or interrupted rollout. Byte-exact equality
+                // would make those rows invisible and let a redelivery queue a
+                // duplicate — worst when the original run is terminal and task
+                // coalescing has nothing live to catch it. Reviewer keys are
+                // `pr_review:<repo>:<n>:<suffix>`, so they carry the shared
+                // predicate's `pr_review:` prefix; the suffix segments (wake
+                // reason, numeric comment id, GitHub delivery uuid) are already
+                // lowercase, so folding case cannot merge two distinct requests.
+                matchesTaskKey(agentWakeupRequests.idempotencyKey, idempotencyKey),
                 inArray(agentWakeupRequests.status, idempotentStatuses),
               ),
             )
@@ -2277,8 +2348,28 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
           // response body cannot claim reviewerWakeFired for a wake that did
           // not produce a run.
           return false;
-        });
+        };
+        try {
+          return await withPrReviewerTaskLock(
+            db,
+            buildPrReviewerTaskLockKeys(context),
+            dispatchReviewerWake,
+          );
+        } catch (err) {
+          if (!(err instanceof PrReviewerTaskLockTimeoutError)) throw err;
+          logger.warn(
+            {
+              agentIds: reviewerAgentIds,
+              event: eventName,
+              prNumber: context.prNumber,
+              repoFullName: context.repoFullName,
+            },
+            "github webhook reviewer lock timed out; asking GitHub to retry",
+          );
+          throw new PrReviewerTaskLockContentionError();
+        }
       } catch (err) {
+        if (err instanceof PrReviewerTaskLockContentionError) throw err;
         logger.error(
           {
             err,
@@ -2918,6 +3009,7 @@ export const __test_buildPrReviewerWakeIdempotencyKey = buildPrReviewerWakeIdemp
 export const __test_prReviewerWakeIdempotencyScope = prReviewerWakeIdempotencyScope;
 export const __test_idempotentWakeStatuses = idempotentWakeStatuses;
 export const __test_buildPrReviewerTaskKey = buildPrReviewerTaskKey;
+export const __test_buildPrReviewerTaskLockKeys = buildPrReviewerTaskLockKeys;
 export const __test_buildDependabotAlertIssueBody = buildDependabotAlertIssueBody;
 export const __test_resolveDependabotAlertContext = resolveDependabotAlertContext;
 export const __test_hasActionablePrReviewFeedback = hasActionablePrReviewFeedback;

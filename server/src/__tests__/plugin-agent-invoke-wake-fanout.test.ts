@@ -142,7 +142,7 @@ describeEmbeddedPostgres("plugin agents.invoke wake fan-out", () => {
 
     const taskKeys = Array.from(
       { length: 10 },
-      (_, i) => `pr_review:Blockcast/pim-multicast-gateway:${1800 + i}`,
+      (_, i) => `pr_review:blockcast/pim-multicast-gateway:${1800 + i}`,
     );
 
     const results = await Promise.all(
@@ -218,7 +218,7 @@ describeEmbeddedPostgres("plugin agents.invoke wake fan-out", () => {
       companyId,
       prompt: "Review penstock-llm-proxy-core#880",
       reason: "pr_review_requested",
-      taskKey: "pr_review:Blockcast/penstock-llm-proxy-core:880",
+      taskKey: "pr_review:blockcast/penstock-llm-proxy-core:880",
       idempotencyKey: deliveryId,
     });
 
@@ -227,7 +227,7 @@ describeEmbeddedPostgres("plugin agents.invoke wake fan-out", () => {
       companyId,
       prompt: "Review penstock-llm-proxy-core#880",
       reason: "pr_review_requested",
-      taskKey: "pr_review:Blockcast/penstock-llm-proxy-core:880",
+      taskKey: "pr_review:blockcast/penstock-llm-proxy-core:880",
       idempotencyKey: deliveryId,
     });
 

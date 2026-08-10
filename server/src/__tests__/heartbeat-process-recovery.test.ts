@@ -1800,7 +1800,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       externalRunId: jobName,
       contextSnapshot: {
         reviewKind: "pr_review",
-        taskKey: `pr_review:Blockcast/onprem-k8s:1648:${headSha}`,
+        taskKey: `pr_review:blockcast/onprem-k8s:1648:${headSha}`,
         githubRepoFullName: "Blockcast/onprem-k8s",
         githubPrNumber: 1648,
         githubHeadSha: headSha,
@@ -1875,7 +1875,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       externalRunId: jobName,
       contextSnapshot: {
         reviewKind: "pr_review",
-        taskKey: `pr_review:Blockcast/onprem-k8s:1648:${headSha}`,
+        taskKey: `pr_review:blockcast/onprem-k8s:1648:${headSha}`,
         githubRepoFullName: "Blockcast/onprem-k8s",
         githubPrNumber: 1648,
         githubHeadSha: headSha,
@@ -1923,7 +1923,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       externalRunId: jobName,
       contextSnapshot: {
         reviewKind: "pr_review",
-        taskKey: `pr_review:Blockcast/onprem-k8s:1648:${headSha}`,
+        taskKey: `pr_review:blockcast/onprem-k8s:1648:${headSha}`,
         githubRepoFullName: "Blockcast/onprem-k8s",
         githubPrNumber: 1648,
         githubHeadSha: headSha,
@@ -1976,7 +1976,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       externalRunId: jobName,
       contextSnapshot: {
         reviewKind: "pr_review",
-        taskKey: `pr_review:Blockcast/onprem-k8s:1648:${headSha}`,
+        taskKey: `pr_review:blockcast/onprem-k8s:1648:${headSha}`,
         githubRepoFullName: "Blockcast/onprem-k8s",
         githubPrNumber: 1648,
         githubHeadSha: headSha,
@@ -3279,7 +3279,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .set({
         contextSnapshot: {
           reviewKind: "pr_review",
-          taskKey: `pr_review:Blockcast/onprem-k8s:1648:${headSha}`,
+          taskKey: `pr_review:blockcast/onprem-k8s:1648:${headSha}`,
           githubRepoFullName: "Blockcast/onprem-k8s",
           githubPrNumber: 1648,
           githubHeadSha: headSha,

@@ -409,12 +409,12 @@ describeEmbeddedPostgres(
         {
           id: "older-unrelated-review-1",
           createdAt: new Date(queuedAt - 8 * 60_000),
-          contextSnapshot: { taskKey: "pr_review:Blockcast/onprem-k8s:42" },
+          contextSnapshot: { taskKey: "pr_review:blockcast/onprem-k8s:42" },
         },
         {
           id: "older-unrelated-review-2",
           createdAt: new Date(queuedAt - 4 * 60_000),
-          contextSnapshot: { taskKey: "pr_review:Blockcast/hindsight:7" },
+          contextSnapshot: { taskKey: "pr_review:blockcast/hindsight:7" },
         },
       ];
       const afterIssueWork = { contextSnapshot: { issueId: "unrelated-issue-work" } };
