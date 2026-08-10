@@ -29,6 +29,7 @@ const mockIssueService = vi.hoisted(() => ({
   list: vi.fn(),
   listAttachments: vi.fn(),
   listComments: vi.fn(),
+  lockPendingInReviewRunOwnership: vi.fn(async () => ({ id: issueId })),
   listWakeableBlockedDependents: vi.fn(),
   remove: vi.fn(),
   removeAttachment: vi.fn(),
@@ -1038,6 +1039,7 @@ describe("agent issue mutation checkout ownership", () => {
         blockedByIssueIds: [],
         actorAgentId: peerAgentId,
       }),
+      expect.anything(),
     );
   });
 
@@ -1103,6 +1105,7 @@ describe("agent issue mutation checkout ownership", () => {
         assigneeUserId: null,
         actorAgentId: peerAgentId,
       }),
+      expect.anything(),
     );
     expect(mockAccessService.decide).not.toHaveBeenCalledWith(expect.objectContaining({
       action: "tasks:assign",
@@ -3605,6 +3608,7 @@ describe("agent issue mutation checkout ownership", () => {
         expectedCurrentCheckoutRunId: ownerRunId,
         expectedCurrentExecutionRunId: ownerRunId,
       }),
+      expect.anything(),
     );
     const [, patch] = mockIssueService.update.mock.calls.at(-1) as [string, Record<string, unknown>];
     expect(patch.executionState).toMatchObject({

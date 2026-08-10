@@ -775,9 +775,11 @@ export function externalObjectService(
       actor?: Pick<LogActivityInput, "actorType" | "actorId" | "agentId" | "runId">;
       force?: boolean;
       now?: Date;
+      persist?: <T>(write: (dbOrTx: any) => Promise<T>) => Promise<T>;
     },
   ) {
     const now = input.now ?? new Date();
+    const persist = input.persist ?? (<T>(write: (dbOrTx: any) => Promise<T>) => write(db));
     const object = await db
       .select()
       .from(externalObjects)
@@ -791,7 +793,7 @@ export function externalObjectService(
     const pluginResult = await resolveViaPluginProvider(db, opts.pluginWorkerManager, object);
     const resolver = pluginResult ? null : resolverRegistry.find(object);
     if (!pluginResult && !resolver) {
-      const [updated] = await db
+      const [updated] = await persist<Array<typeof externalObjects.$inferSelect>>((dbOrTx) => dbOrTx
         .update(externalObjects)
         .set({
           liveness: visibleLiveness(object, now) === "fresh" ? "stale" : object.liveness,
@@ -799,13 +801,13 @@ export function externalObjectService(
           updatedAt: now,
         })
         .where(and(eq(externalObjects.id, object.id), eq(externalObjects.companyId, object.companyId)))
-        .returning();
+        .returning());
       return { object: toObjectPayload(updated ?? object, now), refreshed: false, reason: "no_resolver" as const };
     }
 
     const result = pluginResult ?? await resolver!.resolve({ companyId: object.companyId, object });
     if (!result.ok) {
-      const [updated] = await db
+      const [updated] = await persist<Array<typeof externalObjects.$inferSelect>>((dbOrTx) => dbOrTx
         .update(externalObjects)
         .set({
           liveness: result.liveness,
@@ -816,7 +818,7 @@ export function externalObjectService(
           updatedAt: now,
         })
         .where(and(eq(externalObjects.id, object.id), eq(externalObjects.companyId, object.companyId)))
-        .returning();
+        .returning());
       publishLiveEvent({
         companyId: object.companyId,
         type: "external_object.updated",
@@ -847,37 +849,40 @@ export function externalObjectService(
       nextRefreshAt: addSeconds(now, snapshot.ttlSeconds ?? DEFAULT_REFRESH_TTL_SECONDS),
       updatedAt: now,
     };
-    const [updated] = await db
-      .update(externalObjects)
-      .set({
-        ...patch,
-        lastChangedAt: objectChanged(object, { ...object, ...patch }) ? now : object.lastChangedAt,
-      })
-      .where(and(eq(externalObjects.id, object.id), eq(externalObjects.companyId, object.companyId)))
-      .returning();
-    const next = updated ?? object;
-    if (objectChanged(object, next) && input.actor) {
-      await logActivity(db, {
-        companyId: object.companyId,
-        actorType: input.actor.actorType,
-        actorId: input.actor.actorId,
-        agentId: input.actor.agentId,
-        runId: input.actor.runId,
-        action: "external_object.status_changed",
-        entityType: "external_object",
-        entityId: object.id,
-        details: {
-          providerKey: object.providerKey,
-          objectType: object.objectType,
-          statusCategory: next.statusCategory,
-          statusLabel: next.statusLabel,
-          _previous: {
-            statusCategory: object.statusCategory,
-            statusLabel: object.statusLabel,
+    const next = await persist(async (dbOrTx) => {
+      const [updated] = await dbOrTx
+        .update(externalObjects)
+        .set({
+          ...patch,
+          lastChangedAt: objectChanged(object, { ...object, ...patch }) ? now : object.lastChangedAt,
+        })
+        .where(and(eq(externalObjects.id, object.id), eq(externalObjects.companyId, object.companyId)))
+        .returning();
+      const persisted = updated ?? object;
+      if (objectChanged(object, persisted) && input.actor) {
+        await logActivity(dbOrTx, {
+          companyId: object.companyId,
+          actorType: input.actor.actorType,
+          actorId: input.actor.actorId,
+          agentId: input.actor.agentId,
+          runId: input.actor.runId,
+          action: "external_object.status_changed",
+          entityType: "external_object",
+          entityId: object.id,
+          details: {
+            providerKey: object.providerKey,
+            objectType: object.objectType,
+            statusCategory: persisted.statusCategory,
+            statusLabel: persisted.statusLabel,
+            _previous: {
+              statusCategory: object.statusCategory,
+              statusLabel: object.statusLabel,
+            },
           },
-        },
-      });
-    }
+        });
+      }
+      return persisted;
+    });
     publishLiveEvent({
       companyId: object.companyId,
       type: "external_object.updated",
@@ -890,6 +895,7 @@ export function externalObjectService(
     companyId: string;
     objectIds?: string[];
     actor?: Pick<LogActivityInput, "actorType" | "actorId" | "agentId" | "runId">;
+    persist?: <T>(write: (dbOrTx: any) => Promise<T>) => Promise<T>;
   }) {
     if (!(await isEnabled())) return [];
     const groups = await listForIssue(issueId);
@@ -898,7 +904,11 @@ export function externalObjectService(
       .filter((id) => !input.objectIds || input.objectIds.includes(id));
     const results = [];
     for (const objectId of objectIds) {
-      results.push(await refreshObject(objectId, { companyId: input.companyId, actor: input.actor }));
+      results.push(await refreshObject(objectId, {
+        companyId: input.companyId,
+        actor: input.actor,
+        persist: input.persist,
+      }));
     }
     return results;
   }

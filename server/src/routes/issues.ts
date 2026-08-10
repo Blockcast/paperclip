@@ -76,6 +76,7 @@ import {
   type IssueBlockerDiagnosticNode,
   type IssueBlockerDiagnosticsReadiness,
   type IssueBlockerDiagnosticsResponse,
+  type IssueComment,
   type IssueSubtreeDiagnosticEdge,
   type IssueSubtreeDiagnosticNode,
   type IssueSubtreeDiagnosticsResponse,
@@ -2991,6 +2992,7 @@ export function issueRoutes(
     createIssueDuplicateCandidateActivityTimeoutMs?: number;
     createIssueDuplicateCandidateCorpusFilter?: CreateIssueDuplicateCandidateCorpusFilter;
     createIssueBeforeResponseHook?: () => Promise<void>;
+    pendingInReviewMutationBeforeGuardHook?: (issueId: string) => Promise<void>;
   } = {},
 ) {
   const router = Router();
@@ -3147,6 +3149,26 @@ export function issueRoutes(
     pluginWorkerManager: opts.pluginWorkerManager,
     enabled: async () => (await instanceSettings.getExperimental()).enableExternalObjects === true,
   });
+  const issueSvcFor = (dbOrTx: any) => dbOrTx === db ? svc : issueService(dbOrTx);
+  const issueApprovalsSvcFor = (dbOrTx: any) =>
+    dbOrTx === db ? issueApprovalsSvc : issueApprovalService(dbOrTx);
+  const recoveryActionsSvcFor = (dbOrTx: any) =>
+    dbOrTx === db ? recoveryActionsSvc : issueRecoveryActionService(dbOrTx);
+  const workProductsSvcFor = (dbOrTx: any) =>
+    dbOrTx === db ? workProductsSvc : workProductService(dbOrTx);
+  const documentsSvcFor = (dbOrTx: any) =>
+    dbOrTx === db ? documentsSvc : documentService(dbOrTx);
+  const documentAnnotationsSvcFor = (dbOrTx: any) =>
+    dbOrTx === db ? documentAnnotationsSvc : documentAnnotationService(dbOrTx);
+  const issueThreadInteractionsSvcFor = (dbOrTx: any) =>
+    dbOrTx === db ? issueThreadInteractionsSvc : issueThreadInteractionService(dbOrTx);
+  const taskWatchdogsSvcFor = (dbOrTx: any) => dbOrTx === db
+    ? taskWatchdogsSvc
+    : taskWatchdogFactory?.(dbOrTx, {
+      enqueueWakeup: opts.taskWatchdogEnqueueWakeup === undefined
+        ? heartbeat.wakeup
+        : opts.taskWatchdogEnqueueWakeup ?? undefined,
+    }) ?? noopTaskWatchdogService();
   const routinesSvc = routineService(db, {
     pluginWorkerManager: opts.pluginWorkerManager,
   });
@@ -4095,6 +4117,7 @@ export function issueRoutes(
     createdByAgentId?: string | null;
     checkoutRunId?: string | null;
     executionRunId?: string | null;
+    executionState?: unknown;
   };
 
   type IssueCommentAuthorizationResult =
@@ -4126,7 +4149,143 @@ export function issueRoutes(
         reason: "deny_missing_run_id";
         boundary: "run";
         remediation: string;
+      }
+    | {
+        allowed: false;
+        kind: "run_ownership_conflict";
+        status: 409;
+        error: "Issue run ownership conflict";
+        reason: "deny_active_checkout";
+        details: Record<string, unknown>;
       };
+
+  function isPendingInReviewExecutionStage(issue: {
+    status: string;
+    executionState?: unknown;
+  }) {
+    if (issue.status !== "in_review") return false;
+    if (!issue.executionState || typeof issue.executionState !== "object") return false;
+    return (issue.executionState as { status?: unknown }).status === "pending";
+  }
+
+  type PendingInReviewRunOwnershipReceipt = {
+    issueId: string;
+    status: string;
+    assigneeAgentId: string | null;
+    assigneeUserId: string | null;
+    checkoutRunId: string | null;
+    executionRunId: string | null;
+    executionState: Record<string, unknown> | null;
+    executionPolicy: Record<string, unknown> | null;
+  };
+
+  function pendingInReviewRunOwnershipReceipt(
+    req: Request,
+    issue: {
+      id: string;
+      status: string;
+      assigneeAgentId?: string | null;
+      assigneeUserId?: string | null;
+      checkoutRunId?: string | null;
+      executionRunId?: string | null;
+      executionState?: unknown;
+      executionPolicy?: unknown;
+    },
+  ): PendingInReviewRunOwnershipReceipt | null {
+    if (req.actor.type !== "agent" || issue.status !== "in_review") return null;
+    return {
+      issueId: issue.id,
+      status: issue.status,
+      assigneeAgentId: issue.assigneeAgentId ?? null,
+      assigneeUserId: issue.assigneeUserId ?? null,
+      checkoutRunId: issue.checkoutRunId ?? null,
+      executionRunId: issue.executionRunId ?? null,
+      executionState:
+        issue.executionState && typeof issue.executionState === "object"
+          ? issue.executionState as Record<string, unknown>
+          : null,
+      executionPolicy:
+        issue.executionPolicy && typeof issue.executionPolicy === "object"
+          ? issue.executionPolicy as Record<string, unknown>
+          : null,
+    };
+  }
+
+  async function withPendingInReviewRunOwnershipGuard<T>(
+    req: Request,
+    issue: {
+      id: string;
+      status: string;
+      assigneeAgentId?: string | null;
+      assigneeUserId?: string | null;
+      checkoutRunId?: string | null;
+      executionRunId?: string | null;
+      executionState?: unknown;
+      executionPolicy?: unknown;
+    },
+    write: (dbOrTx: any, context: { inTransaction: boolean }) => Promise<T>,
+    options: { alwaysTransaction?: boolean } = {},
+  ): Promise<T> {
+    const receipt = pendingInReviewRunOwnershipReceipt(req, issue);
+    if (!receipt && !options.alwaysTransaction) return write(db, { inTransaction: false });
+    if (receipt) await opts.pendingInReviewMutationBeforeGuardHook?.(receipt.issueId);
+    return db.transaction(async (tx) => {
+      if (receipt) {
+        const guarded = await issueSvcFor(tx).lockPendingInReviewRunOwnership(receipt, tx);
+        if (!guarded) {
+          throw conflict("Issue run ownership conflict", {
+            issueId: receipt.issueId,
+            expectedStatus: receipt.status,
+            expectedCheckoutRunId: receipt.checkoutRunId,
+            expectedExecutionRunId: receipt.executionRunId,
+          });
+        }
+      }
+      return write(tx, { inTransaction: true });
+    });
+  }
+
+  function actorOwnsAllIssueRunLocks(
+    req: Request,
+    issue: { checkoutRunId?: string | null; executionRunId?: string | null },
+  ) {
+    const runId = readAgentRunId(req);
+    if (!runId) return false;
+    return (
+      (!issue.checkoutRunId || issue.checkoutRunId === runId) &&
+      (!issue.executionRunId || issue.executionRunId === runId)
+    );
+  }
+
+  function issueRunOwnershipWritePreconditions(
+    req: Request,
+    issue: {
+      status: string;
+      assigneeAgentId?: string | null;
+      assigneeUserId?: string | null;
+      checkoutRunId?: string | null;
+      executionRunId?: string | null;
+      executionState?: unknown;
+      executionPolicy?: unknown;
+    },
+  ) {
+    if (req.actor.type !== "agent" || issue.status !== "in_review") return {};
+    return {
+      expectedCurrentStatus: issue.status,
+      expectedCurrentAssigneeAgentId: issue.assigneeAgentId ?? null,
+      expectedCurrentAssigneeUserId: issue.assigneeUserId ?? null,
+      expectedCurrentCheckoutRunId: issue.checkoutRunId ?? null,
+      expectedCurrentExecutionRunId: issue.executionRunId ?? null,
+      expectedCurrentExecutionState:
+        issue.executionState && typeof issue.executionState === "object"
+          ? issue.executionState as Record<string, unknown>
+          : null,
+      expectedCurrentExecutionPolicy:
+        issue.executionPolicy && typeof issue.executionPolicy === "object"
+          ? issue.executionPolicy as Record<string, unknown>
+          : null,
+    };
+  }
 
   async function evaluateFreshTaskWatchdogSourceMutation(
     scope: Awaited<ReturnType<typeof resolveTaskWatchdogMutationScope>>,
@@ -4207,6 +4366,24 @@ export function issueRoutes(
       };
     }
 
+    if (isPendingInReviewExecutionStage(issue) && (issue.checkoutRunId || issue.executionRunId)) {
+      if (!readAgentRunId(req)) return missingAgentRunIdCommentAuthorization();
+      if (!actorOwnsAllIssueRunLocks(req, issue)) {
+        return {
+          allowed: false,
+          kind: "run_ownership_conflict",
+          status: 409,
+          error: "Issue run ownership conflict",
+          reason: "deny_active_checkout",
+          details: {
+            issueId: issue.id,
+            checkoutRunId: issue.checkoutRunId ?? null,
+            executionRunId: issue.executionRunId ?? null,
+          },
+        };
+      }
+    }
+
     const watchdogDecision = await evaluateTaskWatchdogScopedIssueCommentAuthorization(req, issue);
     if (watchdogDecision) return watchdogDecision;
 
@@ -4281,6 +4458,14 @@ export function issueRoutes(
       return { canComment: true as const, reason: authorization.reason, remediation: null };
     }
     if (authorization.kind === "agent_auth_required") return null;
+    if (authorization.kind === "run_ownership_conflict") {
+      return {
+        canComment: false as const,
+        reason: authorization.reason,
+        boundary: "run",
+        remediation: "Another run owns this pending review stage. Exit without mutating the issue.",
+      };
+    }
     return {
       canComment: false as const,
       reason: authorization.reason,
@@ -4738,6 +4923,14 @@ export function issueRoutes(
         responseStatus: authorization.status,
       });
       res.status(authorization.status).json({ error: authorization.error });
+      return false;
+    }
+    if (authorization.kind === "run_ownership_conflict") {
+      await recordDeniedIssueWrite(req, issue, "issue:comment", {
+        reason: authorization.reason,
+        responseStatus: authorization.status,
+      });
+      res.status(authorization.status).json({ error: authorization.error, details: authorization.details });
       return false;
     }
     if (authorization.kind === "watchdog_denied") {
@@ -5233,6 +5426,28 @@ export function issueRoutes(
     const actorAgentId = req.actor.agentId;
     if (!actorAgentId) {
       res.status(403).json({ error: "Agent authentication required" });
+      return false;
+    }
+    if (
+      isPendingInReviewExecutionStage(issue) &&
+      (issue.checkoutRunId || issue.executionRunId) &&
+      !actorOwnsAllIssueRunLocks(req, issue)
+    ) {
+      const runId = requireAgentRunId(req, res);
+      if (!runId) return false;
+      await recordDeniedIssueWrite(req, issue, "issue:mutate", {
+        reason: "deny_active_checkout",
+        responseStatus: 409,
+      });
+      res.status(409).json({
+        error: "Issue run ownership conflict",
+        details: {
+          issueId: issue.id,
+          checkoutRunId: issue.checkoutRunId ?? null,
+          executionRunId: issue.executionRunId ?? null,
+          actorRunId: runId,
+        },
+      });
       return false;
     }
     if (options.allowScopedRecoveryOwnerSourceMutation) {
@@ -7442,15 +7657,17 @@ export function issueRoutes(
 
     const actor = getActorInfo(req);
     const existingWatchdog = await taskWatchdogsSvc.getActiveForIssue(issue.companyId, issue.id);
-    const { watchdog, created } = await taskWatchdogsSvc.upsertForIssue(issue.companyId, issue.id, {
-      agentId: req.body.agentId,
-      instructions: req.body.instructions,
-      actor: {
-        agentId: actor.agentId,
-        userId: actor.actorType === "user" ? actor.actorId : null,
-        runId: actor.runId,
-      },
-    });
+    const { watchdog, created } = await withPendingInReviewRunOwnershipGuard(req, issue, (dbOrTx) =>
+      taskWatchdogsSvcFor(dbOrTx).upsertForIssue(issue.companyId, issue.id, {
+        agentId: req.body.agentId,
+        instructions: req.body.instructions,
+        actor: {
+          agentId: actor.agentId,
+          userId: actor.actorType === "user" ? actor.actorId : null,
+          runId: actor.runId,
+        },
+      }),
+    );
     await logActivity(db, {
       companyId: issue.companyId,
       actorType: actor.actorType,
@@ -7482,11 +7699,13 @@ export function issueRoutes(
     if (await assertLowTrustControlPlaneDenied(req, res, issue.companyId, issue)) return;
 
     const actor = getActorInfo(req);
-    const disabled = await taskWatchdogsSvc.disableForIssue(issue.companyId, issue.id, {
-      agentId: actor.agentId,
-      userId: actor.actorType === "user" ? actor.actorId : null,
-      runId: actor.runId,
-    });
+    const disabled = await withPendingInReviewRunOwnershipGuard(req, issue, (dbOrTx) =>
+      taskWatchdogsSvcFor(dbOrTx).disableForIssue(issue.companyId, issue.id, {
+        agentId: actor.agentId,
+        userId: actor.actorType === "user" ? actor.actorId : null,
+        runId: actor.runId,
+      }),
+    );
     if (disabled) {
       await logActivity(db, {
         companyId: issue.companyId,
@@ -7595,7 +7814,7 @@ export function issueRoutes(
     });
 
     const actionStatus = outcome === "cancelled" ? "cancelled" : "resolved";
-    const result = await db.transaction(async (tx) => {
+    const result = await withPendingInReviewRunOwnershipGuard(req, existing, async (tx) => {
       let issue = existing;
       if (outcome === "blocked") {
         const unresolvedBlockers = await tx
@@ -7617,7 +7836,7 @@ export function issueRoutes(
       }
 
       if (sourceIssueStatus) {
-        const updatedIssue = await svc.update(
+        const updatedIssue = await issueSvcFor(tx).update(
           id,
           {
             status: sourceIssueStatus,
@@ -7631,7 +7850,7 @@ export function issueRoutes(
         issue = updatedIssue;
       }
 
-      const recoveryAction = await recoveryActionsSvc.resolveActiveForIssue(
+      const recoveryAction = await recoveryActionsSvcFor(tx).resolveActiveForIssue(
         {
           companyId: existing.companyId,
           sourceIssueId: existing.id,
@@ -7645,7 +7864,7 @@ export function issueRoutes(
       if (!recoveryAction) throw notFound("Active recovery action not found");
 
       return { issue, recoveryAction };
-    });
+    }, { alwaysTransaction: true });
 
     await routinesSvc.syncRunStatusForIssue(result.issue.id);
 
@@ -7795,6 +8014,7 @@ export function issueRoutes(
       companyId: issue.companyId,
       objectIds: req.body.objectIds,
       actor,
+      persist: (write) => withPendingInReviewRunOwnershipGuard(req, issue, write),
     });
     await logActivity(db, {
       companyId: issue.companyId,
@@ -7885,7 +8105,9 @@ export function issueRoutes(
 
       const { actor, annotationActor } = annotationActorInput(req);
       const referenceSummaryBefore = await issueReferencesSvc.listIssueReferenceSummary(issue.id);
-      const thread = await documentAnnotationsSvc.createThread(issue.id, keyParsed.data, req.body, annotationActor);
+      const thread = await withPendingInReviewRunOwnershipGuard(req, issue, (dbOrTx) =>
+        documentAnnotationsSvcFor(dbOrTx).createThread(issue.id, keyParsed.data, req.body, annotationActor),
+      );
       const firstComment = thread.comments[0];
       if (firstComment) await issueReferencesSvc.syncAnnotationComment(firstComment.id);
       const referenceSummaryAfter = await issueReferencesSvc.listIssueReferenceSummary(issue.id);
@@ -7959,12 +8181,14 @@ export function issueRoutes(
 
       const { actor, annotationActor } = annotationActorInput(req);
       const referenceSummaryBefore = await issueReferencesSvc.listIssueReferenceSummary(issue.id);
-      const comment = await documentAnnotationsSvc.addComment(
-        issue.id,
-        keyParsed.data,
-        req.params.threadId as string,
-        req.body,
-        annotationActor,
+      const comment = await withPendingInReviewRunOwnershipGuard(req, issue, (dbOrTx) =>
+        documentAnnotationsSvcFor(dbOrTx).addComment(
+          issue.id,
+          keyParsed.data,
+          req.params.threadId as string,
+          req.body,
+          annotationActor,
+        ),
       );
       await issueReferencesSvc.syncAnnotationComment(comment.id);
       const referenceSummaryAfter = await issueReferencesSvc.listIssueReferenceSummary(issue.id);
@@ -8012,12 +8236,14 @@ export function issueRoutes(
         return;
       }
       const { actor, annotationActor } = annotationActorInput(req);
-      const thread = await documentAnnotationsSvc.updateThread(
-        issue.id,
-        keyParsed.data,
-        req.params.threadId as string,
-        req.body,
-        annotationActor,
+      const thread = await withPendingInReviewRunOwnershipGuard(req, issue, (dbOrTx) =>
+        documentAnnotationsSvcFor(dbOrTx).updateThread(
+          issue.id,
+          keyParsed.data,
+          req.params.threadId as string,
+          req.body,
+          annotationActor,
+        ),
       );
       await logActivity(db, {
         companyId: issue.companyId,
@@ -8058,20 +8284,22 @@ export function issueRoutes(
     const actor = getActorInfo(req);
     const sourceTrust = await sourceTrustForActorWrite(issue, actor);
     const referenceSummaryBefore = await issueReferencesSvc.listIssueReferenceSummary(issue.id);
-    const result = await documentsSvc.upsertIssueDocument({
-      issueId: issue.id,
-      key: keyParsed.data,
-      title: req.body.title ?? null,
-      format: req.body.format,
-      body: req.body.body,
-      changeSummary: req.body.changeSummary ?? null,
-      baseRevisionId: req.body.baseRevisionId ?? null,
-      createdByAgentId: actor.agentId ?? null,
-      createdByUserId: actor.actorType === "user" ? actor.actorId : null,
-      createdByRunId: actor.runId ?? null,
-      sourceTrust,
-      lockedDocumentStrategy: req.actor.type === "agent" ? "create_new_document" : "conflict",
-    });
+    const result = await withPendingInReviewRunOwnershipGuard(req, issue, (dbOrTx) =>
+      documentsSvcFor(dbOrTx).upsertIssueDocument({
+        issueId: issue.id,
+        key: keyParsed.data,
+        title: req.body.title ?? null,
+        format: req.body.format,
+        body: req.body.body,
+        changeSummary: req.body.changeSummary ?? null,
+        baseRevisionId: req.body.baseRevisionId ?? null,
+        createdByAgentId: actor.agentId ?? null,
+        createdByUserId: actor.actorType === "user" ? actor.actorId : null,
+        createdByRunId: actor.runId ?? null,
+        sourceTrust,
+        lockedDocumentStrategy: req.actor.type === "agent" ? "create_new_document" : "conflict",
+      }),
+    );
     const doc = result.document;
     const redirectedFromLockedDocument =
       "redirectedFromLockedDocument" in result ? result.redirectedFromLockedDocument : null;
@@ -8286,13 +8514,15 @@ export function issueRoutes(
 
       const actor = getActorInfo(req);
       const referenceSummaryBefore = await issueReferencesSvc.listIssueReferenceSummary(issue.id);
-      const result = await documentsSvc.restoreIssueDocumentRevision({
-        issueId: issue.id,
-        key: keyParsed.data,
-        revisionId,
-        createdByAgentId: actor.agentId ?? null,
-        createdByUserId: actor.actorType === "user" ? actor.actorId : null,
-      });
+      const result = await withPendingInReviewRunOwnershipGuard(req, issue, (dbOrTx) =>
+        documentsSvcFor(dbOrTx).restoreIssueDocumentRevision({
+          issueId: issue.id,
+          key: keyParsed.data,
+          revisionId,
+          createdByAgentId: actor.agentId ?? null,
+          createdByUserId: actor.actorType === "user" ? actor.actorId : null,
+        }),
+      );
       await issueReferencesSvc.syncDocument(result.document.id);
       const referenceSummaryAfter = await issueReferencesSvc.listIssueReferenceSummary(issue.id);
       await externalObjectsSvc.syncDocumentSafely(result.document.id);
@@ -8480,7 +8710,9 @@ export function issueRoutes(
         metadata: req.body.metadata ?? null,
       });
     }
-    const product = await workProductsSvc.createForIssue(issue.id, issue.companyId, createInput);
+    const product = await withPendingInReviewRunOwnershipGuard(req, issue, (dbOrTx) =>
+      workProductsSvcFor(dbOrTx).createForIssue(issue.id, issue.companyId, createInput),
+    );
     if (!product) {
       res.status(422).json({ error: "Invalid work product payload" });
       return;
@@ -8541,7 +8773,7 @@ export function issueRoutes(
       promotedByActorId: actor.actorId,
       promotedAt,
     });
-    const product = await db.transaction(async (tx) => {
+    const product = await withPendingInReviewRunOwnershipGuard(req, issue, async (tx) => {
       const markPromoted = { sourceTrust: promotionTrust, updatedAt: promotedAt };
       const updatedSource = await (async () => {
         if (req.body.sourceArtifactKind === "issue") {
@@ -8612,8 +8844,8 @@ export function issueRoutes(
           createdByRunId: actor.runId ?? null,
         })
         .returning()
-        .then((rows) => rows[0] ?? null);
-    });
+        .then((rows: Array<typeof issueWorkProducts.$inferSelect>) => rows[0] ?? null);
+    }, { alwaysTransaction: true });
     if (!product) {
       res.status(422).json({ error: "Source artifact is not quarantined low-trust output" });
       return;
@@ -8676,10 +8908,12 @@ export function issueRoutes(
       }
     }
     const sourceTrust = await sourceTrustForActorWrite(issue, actor);
-    const product = await workProductsSvc.update(id, {
-      ...patch,
-      ...(sourceTrust ? { sourceTrust } : {}),
-    });
+    const product = await withPendingInReviewRunOwnershipGuard(req, issue, (dbOrTx) =>
+      workProductsSvcFor(dbOrTx).update(id, {
+        ...patch,
+        ...(sourceTrust ? { sourceTrust } : {}),
+      }),
+    );
     if (!product) {
       res.status(404).json({ error: "Work product not found" });
       return;
@@ -8716,7 +8950,9 @@ export function issueRoutes(
     }
     if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
     if (!(await assertDeliverableMutationAllowedByRunContext(req, res, issue))) return;
-    const removed = await workProductsSvc.remove(id);
+    const removed = await withPendingInReviewRunOwnershipGuard(req, issue, (dbOrTx) =>
+      workProductsSvcFor(dbOrTx).remove(id),
+    );
     if (!removed) {
       res.status(404).json({ error: "Work product not found" });
       return;
@@ -8924,10 +9160,12 @@ export function issueRoutes(
     if (!(await assertCanManageIssueApprovalLinks(req, res, issue.companyId))) return;
 
     const actor = getActorInfo(req);
-    await issueApprovalsSvc.link(id, req.body.approvalId, {
-      agentId: actor.agentId,
-      userId: actor.actorType === "user" ? actor.actorId : null,
-    });
+    await withPendingInReviewRunOwnershipGuard(req, issue, (dbOrTx) =>
+      issueApprovalsSvcFor(dbOrTx).link(id, req.body.approvalId, {
+        agentId: actor.agentId,
+        userId: actor.actorType === "user" ? actor.actorId : null,
+      }),
+    );
 
     await logActivity(db, {
       companyId: issue.companyId,
@@ -8955,7 +9193,9 @@ export function issueRoutes(
     if (!(await assertApprovalMutationAllowedByRunContext(req, res, issue))) return;
     if (!(await assertCanManageIssueApprovalLinks(req, res, issue.companyId))) return;
 
-    await issueApprovalsSvc.unlink(id, approvalId);
+    await withPendingInReviewRunOwnershipGuard(req, issue, (dbOrTx) =>
+      issueApprovalsSvcFor(dbOrTx).unlink(id, approvalId),
+    );
 
     const actor = getActorInfo(req);
     await logActivity(db, {
@@ -9500,7 +9740,7 @@ export function issueRoutes(
     }
 
     const actor = getActorInfo(req);
-    const normalizedChildren = [];
+    const normalizedChildren: Parameters<typeof svc.decomposeAcceptedPlan>[1]["children"] = [];
     for (const child of requestedChildren) {
       const executionPolicy = applyActorMonitorScheduledBy(
         normalizeIssueExecutionPolicy(child.executionPolicy),
@@ -9550,16 +9790,28 @@ export function issueRoutes(
           status: "blocked",
           blockedByIssueIds: mergeIssueBlockerIds(normalizedChildren[index].blockedByIssueIds, blockerIssueId),
         };
-        serializedBlockedChildIds.add(normalizedChildren[index].id);
+        serializedBlockedChildIds.add(normalizedChildren[index].id!);
       }
     }
 
+    const ownershipReceipt = pendingInReviewRunOwnershipReceipt(req, sourceIssue);
     const result = await svc.decomposeAcceptedPlan(sourceIssue.id, {
       acceptedPlanRevisionId: req.body.acceptedPlanRevisionId,
       children: normalizedChildren,
       actorAgentId: actor.agentId,
       actorUserId: actor.actorType === "user" ? actor.actorId : null,
       actorRunId: actor.runId ?? null,
+      expectedSourceIssueRunOwnership: ownershipReceipt
+        ? {
+            status: ownershipReceipt.status,
+            assigneeAgentId: ownershipReceipt.assigneeAgentId,
+            assigneeUserId: ownershipReceipt.assigneeUserId,
+            checkoutRunId: ownershipReceipt.checkoutRunId,
+            executionRunId: ownershipReceipt.executionRunId,
+            executionState: ownershipReceipt.executionState,
+            executionPolicy: ownershipReceipt.executionPolicy,
+          }
+        : null,
     });
 
     await logActivity(db, {
@@ -10234,32 +10486,56 @@ export function issueRoutes(
           }
         : {};
 
+    // Keep PATCH fields, an execution decision, and an optional bundled comment
+    // inside one ownership-guard transaction. Resolve trust before that row lock
+    // so the comment cannot observe a separately committed field update.
+    const commentSourceTrust = commentBody
+      ? await sourceTrustForActorWrite({
+          id: existing.id,
+          companyId: existing.companyId,
+          projectId:
+            updateFields.projectId === undefined
+              ? existing.projectId
+              : updateFields.projectId as string | null,
+          executionPolicy:
+            updateFields.executionPolicy === undefined
+              ? existing.executionPolicy
+              : updateFields.executionPolicy,
+        }, actor)
+      : null;
+
+    let comment: IssueComment | null = null;
     let issue;
+    const updateIssue = (
+      dbOrTx: any,
+      inTransaction: boolean,
+      data: Parameters<typeof svc.update>[1],
+    ) =>
+      inTransaction
+        ? issueSvcFor(dbOrTx).update(id, data, dbOrTx)
+        : svc.update(id, data);
     try {
       if (transition.decision && decisionId) {
         const decision = transition.decision;
-        issue = await db.transaction(async (tx) => {
-          const updated = await svc.update(
-            id,
-            {
-              ...updateFields,
-              actorAgentId: actor.agentId ?? null,
-              actorUserId: actor.actorType === "user" ? actor.actorId : null,
-              ...executionSnapshotPreconditions,
-              ...currentRunMutationPreconditions,
-              ...(delegateRecoveryPatchInFlight
-                ? {
-                    expectedCurrentStatus: "blocked",
-                    // BLO-18797: allow_manager_chain was granted because this
-                    // assignee is a report of the actor. Pin it too, or a
-                    // reassignment to an unrelated agent that keeps the row
-                    // blocked would still satisfy an id+status predicate.
-                    expectedCurrentAssigneeAgentId: existing.assigneeAgentId,
-                  }
-                : {}),
-            },
-            tx,
-          );
+        const result = await withPendingInReviewRunOwnershipGuard(req, existing, async (tx, { inTransaction }) => {
+          const updated = await updateIssue(tx, inTransaction, {
+            ...updateFields,
+            actorAgentId: actor.agentId ?? null,
+            actorUserId: actor.actorType === "user" ? actor.actorId : null,
+            ...executionSnapshotPreconditions,
+            ...issueRunOwnershipWritePreconditions(req, existing),
+            ...currentRunMutationPreconditions,
+            ...(delegateRecoveryPatchInFlight
+              ? {
+                  expectedCurrentStatus: "blocked",
+                  // BLO-18797: allow_manager_chain was granted because this
+                  // assignee is a report of the actor. Pin it too, or a
+                  // reassignment to an unrelated agent that keeps the row
+                  // blocked would still satisfy an id+status predicate.
+                  expectedCurrentAssigneeAgentId: existing.assigneeAgentId,
+                }
+              : {}),
+          });
           if (!updated) return null;
 
           await tx.insert(issueExecutionDecisions).values({
@@ -10275,24 +10551,58 @@ export function issueRoutes(
             createdByRunId: actor.runId ?? null,
           });
 
-          return updated;
-        });
+          const createdComment = commentBody
+            ? await issueSvcFor(tx).addComment(id, commentBody, {
+              agentId: actor.agentId ?? undefined,
+              userId: actor.actorType === "user" ? actor.actorId : undefined,
+              runId: actor.runId,
+            }, {
+              sourceTrust: commentSourceTrust,
+            }, tx)
+            : null;
+
+          return { updated, comment: createdComment };
+        }, { alwaysTransaction: true });
+        if (result) {
+          issue = result.updated;
+          comment = result.comment;
+        }
       } else {
-        issue = await svc.update(id, {
-          ...updateFields,
-          actorAgentId: actor.agentId ?? null,
-          actorUserId: actor.actorType === "user" ? actor.actorId : null,
-          ...executionSnapshotPreconditions,
-          ...currentRunMutationPreconditions,
-          ...(delegateRecoveryPatchInFlight
-            ? {
-                expectedCurrentStatus: "blocked",
-                // See the transactional branch above: the assignee is an
-                // authorization-relevant snapshot field for allow_manager_chain.
-                expectedCurrentAssigneeAgentId: existing.assigneeAgentId,
-              }
-            : {}),
-        });
+        const result = await withPendingInReviewRunOwnershipGuard(req, existing, async (tx, { inTransaction }) => {
+          const updated = await updateIssue(tx, inTransaction, {
+            ...updateFields,
+            actorAgentId: actor.agentId ?? null,
+            actorUserId: actor.actorType === "user" ? actor.actorId : null,
+            ...executionSnapshotPreconditions,
+            ...issueRunOwnershipWritePreconditions(req, existing),
+            ...currentRunMutationPreconditions,
+            ...(delegateRecoveryPatchInFlight
+              ? {
+                  expectedCurrentStatus: "blocked",
+                  // See the transactional branch above: the assignee is an
+                  // authorization-relevant snapshot field for allow_manager_chain.
+                  expectedCurrentAssigneeAgentId: existing.assigneeAgentId,
+                }
+                : {}),
+          });
+          if (!updated) return null;
+
+          const createdComment = commentBody
+            ? await issueSvcFor(tx).addComment(id, commentBody, {
+              agentId: actor.agentId ?? undefined,
+              userId: actor.actorType === "user" ? actor.actorId : undefined,
+              runId: actor.runId,
+            }, {
+              sourceTrust: commentSourceTrust,
+            }, tx)
+            : null;
+
+          return { updated, comment: createdComment };
+        }, { alwaysTransaction: Boolean(commentBody) });
+        if (result) {
+          issue = result.updated;
+          comment = result.comment;
+        }
       }
     } catch (err) {
       if (err instanceof HttpError && err.status === 422) {
@@ -10787,17 +11097,9 @@ export function issueRoutes(
       }
     }
 
-    let comment = null;
-    if (commentBody) {
+    if (comment) {
       const commentReferenceSummaryBefore = updateReferenceSummaryAfter
         ?? await issueReferencesSvc.listIssueReferenceSummary(issue.id);
-      comment = await svc.addComment(id, commentBody, {
-        agentId: actor.agentId ?? undefined,
-        userId: actor.actorType === "user" ? actor.actorId : undefined,
-        runId: actor.runId,
-      }, {
-        sourceTrust: await sourceTrustForActorWrite(issue, actor),
-      });
       await issueReferencesSvc.syncComment(comment.id);
       await externalObjectsSvc.syncCommentSafely(comment.id);
       const commentReferenceSummaryAfter = await issueReferencesSvc.listIssueReferenceSummary(issue.id);
@@ -11192,7 +11494,9 @@ export function issueRoutes(
     if (!(await assertAgentIssueMutationAllowed(req, res, existing))) return;
     const attachments = await svc.listAttachments(id);
 
-    const issue = await svc.remove(id);
+    const issue = await withPendingInReviewRunOwnershipGuard(req, existing, (dbOrTx) =>
+      issueSvcFor(dbOrTx).remove(id),
+    );
     if (!issue) {
       res.status(404).json({ error: "Issue not found" });
       return;
@@ -11267,8 +11571,23 @@ export function issueRoutes(
       activeRecoveryActionForCheckout.sourceIssueId === issue.id &&
       (activeRecoveryActionForCheckout.status === "active" || activeRecoveryActionForCheckout.status === "escalated") &&
       activeRecoveryActionForCheckout.ownerAgentId === req.body.agentId;
+    const checkoutActorIsPendingExecutionParticipant =
+      req.actor.type === "agent" &&
+      req.actor.agentId === req.body.agentId &&
+      issue.status === "in_review" &&
+      (() => {
+        const executionState = parseIssueExecutionState(issue.executionState);
+        return executionState?.status === "pending" && actorMatchesExecutionParticipant(
+          { actorType: "agent", actorId: req.body.agentId },
+          executionState.currentParticipant,
+        );
+      })();
 
-    if (issue.assigneeAgentId !== req.body.agentId && !allowSourceScopedRecoveryOwnerCheckout) {
+    if (
+      issue.assigneeAgentId !== req.body.agentId &&
+      !allowSourceScopedRecoveryOwnerCheckout &&
+      !checkoutActorIsPendingExecutionParticipant
+    ) {
       try {
         await assertCanAssignTasks(req, issue.companyId, {
           issueId: issue.id,
@@ -11314,6 +11633,7 @@ export function issueRoutes(
     if (req.actor.type === "agent" && !checkoutRunId) return;
     const updated = await svc.checkout(id, req.body.agentId, req.body.expectedStatuses, checkoutRunId, {
       allowSourceScopedRecoveryOwner: allowSourceScopedRecoveryOwnerCheckout,
+      ...(checkoutActorIsPendingExecutionParticipant ? { allowPendingExecutionParticipant: true } : {}),
       recoveryActionId: activeRecoveryActionForCheckout?.id ?? null,
       recoveryActionStatus: activeRecoveryActionForCheckout?.status ?? null,
     });
@@ -11396,10 +11716,12 @@ export function issueRoutes(
     const actorRunId = requireAgentRunId(req, res);
     if (req.actor.type === "agent" && !actorRunId) return;
 
-    const released = await svc.release(
-      id,
-      req.actor.type === "agent" ? req.actor.agentId : undefined,
-      actorRunId,
+    const released = await withPendingInReviewRunOwnershipGuard(req, existing, (dbOrTx) =>
+      issueSvcFor(dbOrTx).release(
+        id,
+        req.actor.type === "agent" ? req.actor.agentId : undefined,
+        actorRunId,
+      ),
     );
     if (!released) {
       res.status(404).json({ error: "Issue not found" });
@@ -11533,13 +11855,15 @@ export function issueRoutes(
       throw unprocessable("payload.toolAction is server-owned metadata and cannot be supplied when creating an interaction");
     }
 
-    const interaction = await issueThreadInteractionService(db).create(issue, {
-      ...req.body,
-      sourceRunId: req.actor.type === "agent" ? agentSourceRunId : req.body.sourceRunId ?? null,
-    }, {
-      agentId: actor.agentId,
-      userId: actor.actorType === "user" ? actor.actorId : null,
-    });
+    const interaction = await withPendingInReviewRunOwnershipGuard(req, issue, (dbOrTx) =>
+      issueThreadInteractionsSvcFor(dbOrTx).create(issue, {
+        ...req.body,
+        sourceRunId: req.actor.type === "agent" ? agentSourceRunId : req.body.sourceRunId ?? null,
+      }, {
+        agentId: actor.agentId,
+        userId: actor.actorType === "user" ? actor.actorId : null,
+      }),
+    );
 
     await logActivity(db, {
       companyId: issue.companyId,
@@ -12100,7 +12424,9 @@ export function issueRoutes(
         return;
       }
 
-      const removed = await svc.removeComment(commentId);
+      const removed = await withPendingInReviewRunOwnershipGuard(req, issue, (dbOrTx) =>
+        issueSvcFor(dbOrTx).removeComment(commentId),
+      );
       if (!removed) {
         res.status(404).json({ error: "Comment not found" });
         return;
@@ -12141,39 +12467,41 @@ export function issueRoutes(
     }
 
     let annotationCleanup = { deletedCommentIds: [] as string[], resolvedThreadIds: [] as string[] };
-    const deleted = await svc.tombstoneComment(
-      commentId,
-      {
-        actorType: actor.actorType,
-        agentId: actor.agentId,
-        userId: actor.actorType === "user" ? actor.actorId : null,
-        runId: actor.runId,
-      },
-      {
-        afterTombstone: async (deletedComment, tx) => {
-          await issueReferencesSvc.syncComment(deletedComment.id, tx);
-          await externalObjectsSvc.syncCommentSafely(deletedComment.id, tx);
-          annotationCleanup = await documentAnnotationsSvc.cleanupForIssueCommentDeletion(issue.id, deletedComment.id, {
-            actorType: actor.actorType,
-            actorId: actor.actorId,
-            agentId: actor.agentId,
-            userId: actor.actorType === "user" ? actor.actorId : null,
-            runId: actor.runId,
-          }, tx);
-          await Promise.all(
-            annotationCleanup.deletedCommentIds.flatMap((annotationCommentId) => [
-              issueReferencesSvc.deleteCommentSource(annotationCommentId, tx),
-              externalObjectsSvc.syncCommentSafely(annotationCommentId, tx),
-            ]),
-          );
-          await decisionTrainingSvc.scrubDeletedComments({
-            companyId: issue.companyId,
-            issueId: issue.id,
-            commentIds: [deletedComment.id, ...annotationCleanup.deletedCommentIds],
-            deletedAt: deletedComment.deletedAt ?? new Date(),
-          }, tx);
+    const deleted = await withPendingInReviewRunOwnershipGuard(req, issue, (dbOrTx) =>
+      issueSvcFor(dbOrTx).tombstoneComment(
+        commentId,
+        {
+          actorType: actor.actorType,
+          agentId: actor.agentId,
+          userId: actor.actorType === "user" ? actor.actorId : null,
+          runId: actor.runId,
         },
-      },
+        {
+          afterTombstone: async (deletedComment, tx) => {
+            await issueReferencesSvc.syncComment(deletedComment.id, tx);
+            await externalObjectsSvc.syncCommentSafely(deletedComment.id, tx);
+            annotationCleanup = await documentAnnotationsSvc.cleanupForIssueCommentDeletion(issue.id, deletedComment.id, {
+              actorType: actor.actorType,
+              actorId: actor.actorId,
+              agentId: actor.agentId,
+              userId: actor.actorType === "user" ? actor.actorId : null,
+              runId: actor.runId,
+            }, tx);
+            await Promise.all(
+              annotationCleanup.deletedCommentIds.flatMap((annotationCommentId) => [
+                issueReferencesSvc.deleteCommentSource(annotationCommentId, tx),
+                externalObjectsSvc.syncCommentSafely(annotationCommentId, tx),
+              ]),
+            );
+            await decisionTrainingSvc.scrubDeletedComments({
+              companyId: issue.companyId,
+              issueId: issue.id,
+              commentIds: [deletedComment.id, ...annotationCleanup.deletedCommentIds],
+              deletedAt: deletedComment.deletedAt ?? new Date(),
+            }, tx);
+          },
+        },
+      ),
     );
     if (!deleted) {
       res.status(404).json({ error: "Comment not found" });
@@ -12715,6 +13043,7 @@ export function issueRoutes(
           status: typeof transition.patch.status === "string" ? transition.patch.status : "done",
           actorAgentId: actor.agentId ?? null,
           actorUserId: actor.actorType === "user" ? actor.actorId : null,
+          ...issueRunOwnershipWritePreconditions(req, currentIssue),
         };
 
         const sourceTrust = await sourceTrustForActorWrite(currentIssue, actor);
@@ -12729,19 +13058,12 @@ export function issueRoutes(
           issue: NonNullable<Awaited<ReturnType<typeof svc.update>>>;
         };
         try {
-          txResult = await db.transaction(async (tx) => {
-            const insertedComment = await svc.addComment(
-              id,
-              req.body.body,
-              {
-                agentId: actor.agentId ?? undefined,
-                userId: actor.actorType === "user" ? actor.actorId : undefined,
-                runId: actor.runId,
-              },
-              commentOptions,
-              tx,
-            );
-            const updated = await svc.update(id, {
+          txResult = await withPendingInReviewRunOwnershipGuard(req, currentIssue, async (tx) => {
+            // Lock and transition the issue before inserting the FK-backed
+            // comment. Concurrent approval inserts otherwise each hold KEY
+            // SHARE on the issue row and can deadlock while upgrading to the
+            // FOR UPDATE lock taken by svc.update.
+            const updated = await issueSvcFor(tx).update(id, {
               ...updatePatch,
               expectedCurrentStatus: currentIssue.status,
               expectedCurrentExecutionState:
@@ -12754,6 +13076,17 @@ export function issueRoutes(
                   : null,
             }, tx);
             if (!updated) throw new AutoApprovalIssueMissingError();
+            const insertedComment = await issueSvcFor(tx).addComment(
+              id,
+              req.body.body,
+              {
+                agentId: actor.agentId ?? undefined,
+                userId: actor.actorType === "user" ? actor.actorId : undefined,
+                runId: actor.runId,
+              },
+              commentOptions,
+              tx,
+            );
 
             if (transition.decision && decisionId) {
               await tx.insert(issueExecutionDecisions).values({
@@ -12771,7 +13104,7 @@ export function issueRoutes(
             }
 
             return { comment: insertedComment, issue: updated };
-          });
+          }, { alwaysTransaction: true });
         } catch (err) {
           if (err instanceof AutoApprovalIssueMissingError) {
             res.status(404).json({ error: "Issue not found" });
@@ -12809,17 +13142,23 @@ export function issueRoutes(
           requestedByActorId: actor.actorId,
         });
       } else {
-        comment = await svc.addComment(id, req.body.body, {
+        const commentActor = {
           agentId: actor.agentId ?? undefined,
           userId: actor.actorType === "user" ? actor.actorId : undefined,
           runId: actor.runId,
-        }, {
+        };
+        const plainCommentOptions = {
           authorType: req.body.authorType ?? (actor.actorType === "agent" ? "agent" : "user"),
           presentation: req.body.presentation ?? null,
           metadata: req.body.metadata ?? null,
           idempotencyKey: req.body.idempotencyKey ?? null,
           sourceTrust: await sourceTrustForActorWrite(currentIssue, actor),
-        });
+        };
+        comment = await withPendingInReviewRunOwnershipGuard(req, currentIssue, (dbOrTx) =>
+          dbOrTx === db
+            ? svc.addComment(id, req.body.body, commentActor, plainCommentOptions)
+            : issueSvcFor(dbOrTx).addComment(id, req.body.body, commentActor, plainCommentOptions, dbOrTx),
+        );
       }
     }
 
@@ -13319,18 +13658,30 @@ export function issueRoutes(
       body: file.buffer,
     });
 
-    const attachment = await svc.createAttachment({
-      issueId,
-      issueCommentId: parsedMeta.data.issueCommentId ?? null,
-      provider: stored.provider,
-      objectKey: stored.objectKey,
-      contentType: stored.contentType,
-      byteSize: stored.byteSize,
-      sha256: stored.sha256,
-      originalFilename: stored.originalFilename,
-      createdByAgentId: actor.agentId,
-      createdByUserId: actor.actorType === "user" ? actor.actorId : null,
-    });
+    let attachment;
+    try {
+      attachment = await withPendingInReviewRunOwnershipGuard(req, issue, (dbOrTx) =>
+        issueSvcFor(dbOrTx).createAttachment({
+          issueId,
+          issueCommentId: parsedMeta.data.issueCommentId ?? null,
+          provider: stored.provider,
+          objectKey: stored.objectKey,
+          contentType: stored.contentType,
+          byteSize: stored.byteSize,
+          sha256: stored.sha256,
+          originalFilename: stored.originalFilename,
+          createdByAgentId: actor.agentId,
+          createdByUserId: actor.actorType === "user" ? actor.actorId : null,
+        }),
+      );
+    } catch (err) {
+      try {
+        await storage.deleteObject(companyId, stored.objectKey);
+      } catch (cleanupErr) {
+        logger.warn({ err: cleanupErr, issueId, objectKey: stored.objectKey }, "failed to clean up rejected attachment upload");
+      }
+      throw err;
+    }
 
     await logActivity(db, {
       companyId,
@@ -13426,16 +13777,18 @@ export function issueRoutes(
     if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
     if (!(await assertDeliverableMutationAllowedByRunContext(req, res, issue))) return;
 
+    const removed = await withPendingInReviewRunOwnershipGuard(req, issue, (dbOrTx) =>
+      issueSvcFor(dbOrTx).removeAttachment(attachmentId),
+    );
+    if (!removed) {
+      res.status(404).json({ error: "Attachment not found" });
+      return;
+    }
+
     try {
       await storage.deleteObject(attachment.companyId, attachment.objectKey);
     } catch (err) {
       logger.warn({ err, attachmentId }, "storage delete failed while removing attachment");
-    }
-
-    const removed = await svc.removeAttachment(attachmentId);
-    if (!removed) {
-      res.status(404).json({ error: "Attachment not found" });
-      return;
     }
 
     const actor = getActorInfo(req);
