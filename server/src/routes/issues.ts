@@ -7630,6 +7630,21 @@ export function issueRoutes(
     const parsedOffset = rawOffset !== undefined && /^\d+$/.test(rawOffset)
       ? Number.parseInt(rawOffset, 10)
       : null;
+    // BLO-24495: this endpoint only ever implemented limit/offset. `page`/`perPage`
+    // were silently dropped (never read from req.query), so every page number
+    // replayed the same limit/offset-default window with no error. Reject
+    // explicitly instead of returning a confident, wrong result set.
+    const unsupportedPaginationParams = [
+      ...(req.query.page !== undefined ? ["page"] : []),
+      ...(req.query.perPage !== undefined ? ["perPage"] : []),
+    ];
+    if (unsupportedPaginationParams.length > 0) {
+      res.status(400).json({
+        error: "page/perPage pagination is not supported on this endpoint; use limit and offset instead",
+        unsupportedParams: unsupportedPaginationParams,
+      });
+      return;
+    }
     const attention = req.query.attention as string | undefined;
     const sortField = req.query.sortField as string | undefined;
     const sortDir = req.query.sortDir as string | undefined;
