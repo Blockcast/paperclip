@@ -7,8 +7,16 @@
  * authenticated identity when none is supplied. Every agent pod shares one
  * credential — the `allyblockcast[bot]` GitHub App installation (id
  * 290875700) — so any agent writing via that path gets stamped with the App,
- * not the acting agent. `git push` (git config identity set per-agent) is
- * unaffected. See AGENTS.md §9 and the BLO-21416 issue for the full writeup.
+ * not the acting agent. `git push` reads `user.name`/`user.email` from the
+ * checkout's local git config instead, so it is NOT subject to this
+ * server-side default — but that only produces a correctly-attributed commit
+ * if the checkout's local config actually holds a per-agent identity. A
+ * 2026-08-10 sweep of 71 checkouts (BLO-23894) found 11 with local config
+ * stamped to the shared App identity and 18 with no local identity set at
+ * all, so `git push` failing this gate is a live, not just historical,
+ * failure mode — check `git config user.email` in the checkout before
+ * assuming the write path is the cause. See AGENTS.md §9 and the BLO-21416
+ * issue for the full writeup.
  *
  * Two independent modes, one shared assertion (`findAttributionOffenses`):
  *
@@ -391,7 +399,7 @@ async function main() {
       console.error(`  ${offense.sha.slice(0, 7)} "${offense.message}" — ${offense.authorEmail}`);
     }
     console.error(
-      "\nThis means the commit was created via the GitHub REST/MCP write path (contents API, merge API, or `create_or_update_file`/`push_files`), which always stamps the shared App credential — never `git push`. Use `git push` for repo commits; see AGENTS.md §9 (BLO-21416).",
+      "\nThis means either the commit was created via the GitHub REST/MCP write path (contents API, merge API, or `create_or_update_file`/`push_files`, which always stamps the shared App credential), OR it was made with `git push` from a checkout whose local git config itself holds the App identity — run `git config user.email` in this checkout to tell which. The first case: use `git push` instead. The second case: `git push` will not fix it until the checkout's local `user.email`/`user.name` is set to your own per-agent identity (BLO-23894 found this local-config gap on 11 of 71 sampled checkouts). See AGENTS.md §9 (BLO-21416).",
     );
     process.exit(1);
   }
