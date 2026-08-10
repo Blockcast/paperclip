@@ -3,10 +3,12 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import process from "node:process";
 import test from "node:test";
 
 import {
   APP_NOREPLY_EMAIL,
+  ATTRIBUTION_GATE_CUTOFF_MS,
   auditRepoCommitAttribution,
   AUDIT_PR_LIST_MAX,
   COMMITS_API_MAX,
@@ -68,6 +70,60 @@ test("findAttributionOffenses defaults an absent parentCount to 1 (non-merge)", 
   assert.equal(offenses.length, 1);
 });
 
+test("findAttributionOffenses with a cutoff clears an App-attributed commit authored before it (BLO-23894)", () => {
+  const offenses = findAttributionOffenses(
+    [
+      {
+        sha: "962a",
+        authorEmail: APP_NOREPLY_EMAIL,
+        authorDate: "2026-08-05T16:46:12Z",
+        parentCount: 1,
+        message: "pre-cutoff API write",
+      },
+    ],
+    { cutoffMs: ATTRIBUTION_GATE_CUTOFF_MS },
+  );
+  assert.deepEqual(offenses, []);
+});
+
+test("findAttributionOffenses with a cutoff still flags an App-attributed commit authored after it (BLO-23894)", () => {
+  const offenses = findAttributionOffenses(
+    [
+      {
+        sha: "newb",
+        authorEmail: APP_NOREPLY_EMAIL,
+        authorDate: "2026-08-09T12:00:00Z",
+        parentCount: 1,
+        message: "post-cutoff API write",
+      },
+    ],
+    { cutoffMs: ATTRIBUTION_GATE_CUTOFF_MS },
+  );
+  assert.equal(offenses.length, 1);
+  assert.equal(offenses[0].sha, "newb");
+});
+
+test("findAttributionOffenses without a cutoff ignores authorDate entirely (audit mode stays historical)", () => {
+  const offenses = findAttributionOffenses([
+    {
+      sha: "962a",
+      authorEmail: APP_NOREPLY_EMAIL,
+      authorDate: "2026-08-05T16:46:12Z",
+      parentCount: 1,
+      message: "pre-cutoff API write",
+    },
+  ]);
+  assert.equal(offenses.length, 1);
+});
+
+test("findAttributionOffenses with a cutoff fails closed on a missing authorDate", () => {
+  const offenses = findAttributionOffenses(
+    [{ sha: "a", authorEmail: APP_NOREPLY_EMAIL, parentCount: 1, message: "no date" }],
+    { cutoffMs: ATTRIBUTION_GATE_CUTOFF_MS },
+  );
+  assert.equal(offenses.length, 1);
+});
+
 test("findLocalRangeOffenses reads non-merge commits from a real git range and flags App-attributed ones", () => {
   const repoRoot = mkdtempSync(path.join(os.tmpdir(), "attribution-test-"));
   try {
@@ -115,6 +171,58 @@ test("findLocalRangeOffenses excludes merge commits via --no-merges", () => {
     // excluded by --no-merges regardless of its own author.
     assert.equal(offenses.length, 2);
     assert.ok(offenses.every((o) => o.message !== "Merge branch feature"));
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test("findLocalRangeOffenses grandfathers an App-attributed commit authored before the BLO-23894 cutoff", () => {
+  const repoRoot = mkdtempSync(path.join(os.tmpdir(), "attribution-test-cutoff-"));
+  try {
+    const git = (args, env) =>
+      execFileSync("git", args, { cwd: repoRoot, encoding: "utf8", env: { ...process.env, ...env } });
+    git(["init", "-q"]);
+    git(["config", "user.name", "Test"]);
+    git(["config", "user.email", "base@example.com"]);
+    git(["-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "base", "-q"]);
+    const base = git(["rev-parse", "HEAD"]).trim();
+
+    git(["config", "user.email", APP_NOREPLY_EMAIL]);
+    git(["-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "pre-cutoff api-path commit", "-q"], {
+      GIT_AUTHOR_DATE: "2026-08-05T16:46:12Z",
+      GIT_COMMITTER_DATE: "2026-08-06T01:15:46Z",
+    });
+    const head = git(["rev-parse", "HEAD"]).trim();
+
+    // Real PR #962 shape (BLO-23894): App-stamped author, rebased in by a
+    // human hours later — the offense is unsatisfiable, so it must clear.
+    assert.deepEqual(findLocalRangeOffenses({ repoRoot, base, head }), []);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test("findLocalRangeOffenses still flags an App-attributed commit authored after the BLO-23894 cutoff", () => {
+  const repoRoot = mkdtempSync(path.join(os.tmpdir(), "attribution-test-cutoff-forward-"));
+  try {
+    const git = (args, env) =>
+      execFileSync("git", args, { cwd: repoRoot, encoding: "utf8", env: { ...process.env, ...env } });
+    git(["init", "-q"]);
+    git(["config", "user.name", "Test"]);
+    git(["config", "user.email", "base@example.com"]);
+    git(["-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "base", "-q"]);
+    const base = git(["rev-parse", "HEAD"]).trim();
+
+    git(["config", "user.email", APP_NOREPLY_EMAIL]);
+    git(["-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "post-cutoff api-path commit", "-q"], {
+      GIT_AUTHOR_DATE: "2026-08-09T12:00:00Z",
+      GIT_COMMITTER_DATE: "2026-08-09T12:00:00Z",
+    });
+    const head = git(["rev-parse", "HEAD"]).trim();
+
+    const offenses = findLocalRangeOffenses({ repoRoot, base, head });
+    assert.equal(offenses.length, 1);
+    assert.equal(offenses[0].message, "post-cutoff api-path commit");
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }

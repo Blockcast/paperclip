@@ -32,6 +32,25 @@
  *      no count-based window can establish which PRs merged most recently.
  *
  * Both modes are read-only: this script never posts, comments, or writes.
+ *
+ * ## Grandfather cutoff (BLO-23894)
+ *
+ * The local-range gate (mode 1, the one that actually blocks a PR) only
+ * enforces on commits *authored* on or after `ATTRIBUTION_GATE_CUTOFF` —
+ * when this gate itself landed on master (`e7162b906` / `3fa6e41d8`). A
+ * commit authored before that date cannot be brought into compliance: the
+ * App stamp already erased the acting agent's identity, so there is no
+ * correct author to rewrite it to. Guessing one would write a false
+ * attribution — the exact harm this gate exists to prevent. Squashing or
+ * force-pushing to "fix" a pre-cutoff commit is worse still: it relabels
+ * other contributors' correctly-attributed commits, or rewrites/orphans
+ * history that predates the rule. See BLO-23894 for the full incident (it
+ * retroactively blocked ≥13 already-open, already-reviewed PRs).
+ *
+ * `--audit-merged` mode deliberately does NOT apply this cutoff — it is
+ * advisory only (never blocks a merge) and stays a complete historical
+ * record, including pre-cutoff violations, so `findAttributionOffenses`
+ * only filters by cutoff when a caller opts in via `{ cutoffMs }`.
  */
 import { execFileSync } from "node:child_process";
 import path from "node:path";
@@ -67,21 +86,44 @@ export const AUDIT_PR_LIST_MAX = 300;
  */
 export const COMMITS_API_MAX = 250;
 
+/**
+ * The moment this gate itself became knowable: when `e7162b906` /
+ * `3fa6e41d8` landed on master (committer date of the latter — both were
+ * merged in the same rebase-merge). Commits authored before this cannot be
+ * held to a rule that did not exist yet; see the "Grandfather cutoff"
+ * section in the module docblock (BLO-23894) and AGENTS.md §9 for why this
+ * is a scoping decision, not a bypass.
+ */
+export const ATTRIBUTION_GATE_CUTOFF = "2026-08-09T01:38:20Z";
+export const ATTRIBUTION_GATE_CUTOFF_MS = Date.parse(ATTRIBUTION_GATE_CUTOFF);
+
 const UNIT_SEPARATOR = "\u001f";
 const RECORD_SEPARATOR = "\u001e";
 
 /**
  * Shared assertion: given normalized non-merge-or-merge-tagged commit
  * records, return the ones stamped with the shared App identity.
- * `commits` entries: { sha, authorEmail, parentCount, message, context? }.
- * A `parentCount` of 2+ is a merge commit and is always out of scope,
- * independent of which mode produced the record (defensive — mode 1 already
- * excludes these via `--no-merges`).
+ * `commits` entries: { sha, authorEmail, authorDate, parentCount, message,
+ * context? }. A `parentCount` of 2+ is a merge commit and is always out of
+ * scope, independent of which mode produced the record (defensive — mode 1
+ * already excludes these via `--no-merges`).
+ *
+ * `cutoffMs`, if given, additionally excludes commits authored strictly
+ * before it (BLO-23894's grandfather clause) — a commit with a missing or
+ * unparseable `authorDate` fails closed (stays an offense) rather than being
+ * silently treated as pre-cutoff. Omitting `cutoffMs` preserves the
+ * historical, uncut assertion; `--audit-merged` relies on that default so it
+ * keeps reporting pre-cutoff violations as advisory record.
  */
-export function findAttributionOffenses(commits) {
-  return commits.filter(
-    (commit) => (commit.parentCount ?? 1) <= 1 && commit.authorEmail === APP_NOREPLY_EMAIL,
-  );
+export function findAttributionOffenses(commits, { cutoffMs } = {}) {
+  return commits.filter((commit) => {
+    if ((commit.parentCount ?? 1) > 1) return false;
+    if (commit.authorEmail !== APP_NOREPLY_EMAIL) return false;
+    if (cutoffMs === undefined) return true;
+    const authorMs = Date.parse(commit.authorDate ?? "");
+    if (!Number.isFinite(authorMs)) return true;
+    return authorMs >= cutoffMs;
+  });
 }
 
 function parseLocalGitLog(rawOutput) {
@@ -90,8 +132,8 @@ function parseLocalGitLog(rawOutput) {
     .map((record) => record.trim())
     .filter(Boolean)
     .map((record) => {
-      const [sha, authorEmail, subject] = record.split(UNIT_SEPARATOR);
-      return { sha, authorEmail, parentCount: 1, message: subject ?? "" };
+      const [sha, authorEmail, authorDate, subject] = record.split(UNIT_SEPARATOR);
+      return { sha, authorEmail, authorDate, parentCount: 1, message: subject ?? "" };
     });
 }
 
@@ -99,16 +141,24 @@ function parseLocalGitLog(rawOutput) {
  * Local mode: non-merge commits in `base..head` of a checked-out repo.
  * `execFileSync` (argv array, no shell) — `base`/`head` are refs/SHAs from
  * trusted CI-provided env, but this avoids any shell-injection surface either way.
+ * Applies the BLO-23894 grandfather cutoff by default — this is the gate
+ * that actually blocks a PR, so pre-cutoff commits are out of scope.
  */
-export function findLocalRangeOffenses({ repoRoot, base, head, execFile = execFileSync } = {}) {
-  const format = `%H${UNIT_SEPARATOR}%ae${UNIT_SEPARATOR}%s${RECORD_SEPARATOR}`;
+export function findLocalRangeOffenses({
+  repoRoot,
+  base,
+  head,
+  execFile = execFileSync,
+  cutoffMs = ATTRIBUTION_GATE_CUTOFF_MS,
+} = {}) {
+  const format = `%H${UNIT_SEPARATOR}%ae${UNIT_SEPARATOR}%aI${UNIT_SEPARATOR}%s${RECORD_SEPARATOR}`;
   const rawOutput = execFile(
     "git",
     ["log", "--no-merges", `--format=${format}`, `${base}..${head}`],
     { cwd: repoRoot, encoding: "utf8", maxBuffer: 32 * 1024 * 1024 },
   );
   const commits = parseLocalGitLog(rawOutput);
-  return findAttributionOffenses(commits);
+  return findAttributionOffenses(commits, { cutoffMs });
 }
 
 /**
@@ -192,6 +242,7 @@ export async function auditRepoCommitAttribution({ repo, since, ghApi }) {
     const normalized = commits.map((commit) => ({
       sha: commit.sha,
       authorEmail: commit.commit?.author?.email ?? null,
+      authorDate: commit.commit?.author?.date ?? null,
       parentCount: commit.parents?.length ?? 1,
       message: (commit.commit?.message ?? "").split("\n")[0],
     }));
