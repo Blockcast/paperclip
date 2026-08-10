@@ -10283,5 +10283,73 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         .where(eq(issueRecoveryActions.id, later.action.id));
       expect(staleAction?.attemptCount).toBe(later.action.attemptCount);
     });
+
+    // BLO-22795: the selection-window race above is FENCED by the claim. This one is the
+    // accepted residual -- a disposition committed after the claim commits, which the
+    // claim cannot fence because `enqueueWakeup` runs in its own transaction. The
+    // decision was to measure it rather than close it (an outbox only relocates the
+    // window; an in-transaction enqueue self-blocks). This test pins the measurement, so
+    // the decision stays revisitable on evidence.
+    it("counts a delivered wake whose issue was unblocked after the claim committed", async () => {
+      const seeded = await seedUndeliveredRecoveryWake();
+      await neutralizeRecoveryWake(seeded.agentId);
+      await clearBackstopCooldown(seeded.action.id);
+
+      let mutated = false;
+      const recovery = recoveryService(db, {
+        // Mutating inside the enqueue is the only faithful injection point for this
+        // window: it commits strictly after the claim committed and no later than the
+        // moment the wake lands, which is exactly the interval under test.
+        enqueueWakeup: vi.fn(async (agentId: string) => {
+          if (!mutated) {
+            mutated = true;
+            await db
+              .update(issues)
+              .set({ status: "in_progress" })
+              .where(eq(issues.id, seeded.issueId));
+          }
+          return { id: randomUUID(), agentId } as never;
+        }),
+      });
+
+      const result = await recovery.reconcileStrandedRecoveryWakeBackstop({
+        companyId: seeded.companyId,
+      });
+
+      expect(mutated).toBe(true);
+      // The wake really was delivered -- this is a spoiled delivery, not a skip. Asserting
+      // both keeps the counter honest: it must never be reachable via the fenced path.
+      expect(result.issueIds).toContain(seeded.issueId);
+      expect(result.healed).toBe(1);
+      expect(result.staleAfterClaimDelivered).toBe(1);
+      expect(result.staleSnapshotSkipped).toBe(0);
+      // Budget accounting is unchanged by the measurement: a delivered wake still spends
+      // exactly one attempt and is NOT refunded (the owner was genuinely woken).
+      const [action] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.id, seeded.action.id));
+      expect(action?.attemptCount).toBe(seeded.action.attemptCount + 1);
+    });
+
+    it("does not count a clean delivery as a post-claim stale wake", async () => {
+      const seeded = await seedUndeliveredRecoveryWake();
+      await neutralizeRecoveryWake(seeded.agentId);
+      await clearBackstopCooldown(seeded.action.id);
+
+      const recovery = recoveryService(db, {
+        enqueueWakeup: vi.fn(async (agentId: string) => ({ id: randomUUID(), agentId } as never)),
+      });
+
+      const result = await recovery.reconcileStrandedRecoveryWakeBackstop({
+        companyId: seeded.companyId,
+      });
+
+      expect(result.issueIds).toContain(seeded.issueId);
+      expect(result.healed).toBe(1);
+      // The control for the test above: without a concurrent mutation the counter stays
+      // at zero, so a nonzero reading in production means the window, not the detector.
+      expect(result.staleAfterClaimDelivered).toBe(0);
+    });
   });
 });

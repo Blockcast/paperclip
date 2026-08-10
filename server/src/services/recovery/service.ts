@@ -8084,6 +8084,10 @@ export function recoveryService(
       // Claim lost to a concurrent disposition: the issue was unblocked/reassigned, or
       // the action's owner changed, between candidate selection and the claim.
       staleSnapshotSkipped: 0,
+      // BLO-22795: wakes DELIVERED whose disposition changed in the claim->enqueue
+      // window -- the accepted residual race, measured rather than fenced. See the
+      // decision note at the claim site; this is a counter, not a guard.
+      staleAfterClaimDelivered: 0,
       livePathSkipped: 0,
       interactionSkipped: 0,
       pauseHoldSkipped: 0,
@@ -8286,6 +8290,39 @@ export function recoveryService(
           }
         };
 
+        // ACCEPTED RACE (BLO-22795) -- read this before "fixing" it.
+        //
+        // The claim above committed. `enqueueWakeup` below is a separate transaction, so
+        // a disposition committed in between (issue unblocked, issue reassigned, action
+        // owner changed) still produces a wake for a disposition that no longer holds,
+        // and a process exit in the same window spends an attempt that never delivered.
+        // We deliberately do NOT close this, because it cannot be closed here:
+        //
+        //  - Making the enqueue atomic with the claim is the only true fix, and it is
+        //    barred by mechanism, not by taste: `enqueueWakeup` may claim the issue
+        //    synchronously, so running it inside the claim's transaction self-blocks.
+        //    That is the same constraint documented at the original escalation dispatch
+        //    site (see "Dispatch after releasing the stage row lock" above).
+        //  - An outbox/delivery-intent row does not close it either; it only moves the
+        //    window into the dispatcher's own revalidate->enqueue step. Note that the
+        //    committed recovery action ALREADY is that durable intent, and this backstop
+        //    already is its dispatcher -- an outbox here is a dispatcher for the
+        //    dispatcher, whose commit->enqueue gap would want a third backstop.
+        //  - Re-reading the snapshot immediately before the enqueue is theatre: it
+        //    narrows the window while reading in review like a fix.
+        //
+        // The residual damage is bounded on both halves. A stale wake costs one wasted
+        // run, not a correctness violation: `source_scoped_recovery_action` is excluded
+        // from `isAutoCheckoutWakeReason`, so it cannot seize an issue an operator just
+        // reassigned, and the woken run re-reads the recovery action and issue fresh at
+        // dispatch. An undelivered spent attempt costs at most one of `maxAttempts`,
+        // with `timeoutAt` -- creation-anchored, independent of `attemptCount` -- still
+        // retiring the action; that is the identical bounded over-count already accepted
+        // for a failed refund in `escalateStrandedAssignedIssue`.
+        //
+        // So it is measured instead of fenced: `staleAfterClaimDelivered` counts
+        // deliveries this window actually spoiled, so the decision is revisitable on
+        // evidence rather than on argument.
         let wakeDelivered = false;
         try {
           const wake = await deps.enqueueWakeup(ownerAgentId, {
@@ -8347,6 +8384,52 @@ export function recoveryService(
               recoveryActionAttemptCount: claimedAttemptCount,
             },
           });
+
+          // Measure the accepted window documented above. Strictly observational: the
+          // wake is already delivered and nothing here can un-send it, so this must
+          // never alter control flow or throw -- a measurement failure would otherwise
+          // turn a healed issue into a logged error. Runs only on the delivered path,
+          // so it costs one extra read per actual redelivery.
+          try {
+            const [postDelivery, [postIssue]] = await Promise.all([
+              recoveryActionsSvc.getActiveForIssue(companyId, candidate.id),
+              db
+                .select({ status: issues.status, assigneeAgentId: issues.assigneeAgentId })
+                .from(issues)
+                .where(eq(issues.id, candidate.id))
+                .limit(1),
+            ]);
+            const spoiled = !postDelivery ||
+              postDelivery.id !== action.id ||
+              postDelivery.ownerAgentId !== ownerAgentId ||
+              !postIssue ||
+              postIssue.status !== "blocked" ||
+              postIssue.assigneeAgentId !== candidate.assigneeAgentId;
+            if (spoiled) {
+              result.staleAfterClaimDelivered += 1;
+              logger.warn(
+                {
+                  issueId: candidate.id,
+                  identifier: candidate.identifier,
+                  recoveryActionId: action.id,
+                  recoveryOwnerAgentId: ownerAgentId,
+                  claimedAttemptCount,
+                  observedStatus: postIssue?.status ?? null,
+                  observedAssigneeAgentId: postIssue?.assigneeAgentId ?? null,
+                  observedOwnerAgentId: postDelivery?.ownerAgentId ?? null,
+                  observedActionId: postDelivery?.id ?? null,
+                },
+                // Stable message -- this is the queryable signal behind the BLO-22795
+                // decision. Renaming it silently blinds that decision's review.
+                "stranded recovery wake backstop delivered a wake whose disposition changed after the claim",
+              );
+            }
+          } catch (staleCheckErr) {
+            logger.warn(
+              { err: staleCheckErr, issueId: candidate.id, recoveryActionId: action.id },
+              "failed to measure stranded recovery wake backstop post-claim staleness",
+            );
+          }
         } catch (err) {
           // Only refund when the wake itself never landed. A throw from the activity
           // write *after* a delivered wake must not give the attempt back -- the owner
