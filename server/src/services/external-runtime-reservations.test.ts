@@ -204,6 +204,51 @@ describeEmbeddedPostgres("external runtime reservations", () => {
     expect(run.externalRunId).toBe("agent-opencode-run-1");
   });
 
+  // BLO-23009 (review follow-up): `jobUid` is optional, so the first observation
+  // of a Job can land without one. When a later observation supplies the UID, the
+  // steady-state guard compares NULL against it and misses, falling through to the
+  // update path -- which enriched the row (wanted) but also re-booked `launched`
+  // for a Job that was already launched (not wanted).
+  it("does not re-book a launched event when a late observation supplies the Job UID", async () => {
+    const [runId] = await seedQueuedRuns(1);
+    await claimRunWithExternalRuntimeSlot(db, runId, new Date());
+    await markExternalRuntimeReservationLaunching(db, runId);
+    await recordExpectedExternalRuntimeJobName(db, { runId, jobName: "agent-opencode-run-1" });
+
+    // First observation carries no UID -- this is the real transition.
+    const first = await recordExternalRuntimeJobIdentity(db, {
+      runId,
+      jobName: "agent-opencode-run-1",
+    });
+    expect(first?.state).toBe("launched");
+    expect(first?.jobUid).toBeNull();
+    expect(eventCount((await renderMetrics()).body, "launched")).toBe(1);
+
+    __resetMetricsForTest();
+    const enriched = await recordExternalRuntimeJobIdentity(db, {
+      runId,
+      jobName: "agent-opencode-run-1",
+      jobUid: "uid-1",
+    });
+
+    // The UID is still persisted -- the enrichment must not be lost...
+    expect(enriched?.id).toBe(first?.id);
+    expect(enriched?.state).toBe("launched");
+    expect(enriched?.jobUid).toBe("uid-1");
+    // ...but no state transition happened, so no second `launched` event.
+    expect(eventCount((await renderMetrics()).body, "launched")).toBe(0);
+
+    // And once the UID is stored, further re-observations take the steady-state
+    // branch and stay silent too.
+    __resetMetricsForTest();
+    await recordExternalRuntimeJobIdentity(db, {
+      runId,
+      jobName: "agent-opencode-run-1",
+      jobUid: "uid-1",
+    });
+    expect(eventCount((await renderMetrics()).body, "launched")).toBe(0);
+  });
+
   it("atomically fills a bounded slot pool without over-claiming", async () => {
     const runIds = await seedQueuedRuns(3);
     const now = new Date("2026-07-14T12:00:00.000Z");

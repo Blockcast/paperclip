@@ -679,7 +679,13 @@ export async function recordExternalRuntimeJobIdentity(
       .update(heartbeatRuns)
       .set({ externalRunId: input.jobName, updatedAt: now })
       .where(and(eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.status, "running")));
-    return { reservation: updated, transitioned: true };
+    // `jobUid` is optional, so an already-`launched` reservation can reach here
+    // when a later observation finally supplies the UID: the steady-state guard
+    // above compares `existing.jobUid === input.jobUid`, which is NULL vs the new
+    // UID. That enrichment is wanted, but it is not a state transition -- deriving
+    // `transitioned` from the prior state keeps the one-event-per-transition
+    // contract instead of booking a second `launched` for the same Job.
+    return { reservation: updated, transitioned: existing.state !== "launched" };
   });
 
   if (outcome?.transitioned) {
