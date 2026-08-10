@@ -1412,12 +1412,28 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     // `manual` is user-initiated and so bypasses the ccrotate availability gate,
     // keeping this hermetic. The adoption path under test is shared by every
     // wake source.
-    await heartbeat.enqueueWakeup(agentId, {
+    const wake = await heartbeat.enqueueWakeup(agentId, {
       source: "manual",
       reason: "issue_assigned",
       contextSnapshot: { issueId },
       payload: { issueId },
     });
+
+    // The assertion that survives master's 8446c1011. That commit stopped the
+    // legacy fallback from re-stamping `executionLockedAt` for a non-`running`
+    // holder, which fixes the visible renewal — but it still assigns the park to
+    // `activeExecutionRun`, so a same-agent wake is *coalesced into a run that
+    // will not execute until its deadline* and produces nothing. Observed in
+    // production on BLO-22438: two comments, both absorbed, zero runs.
+    //
+    // enqueueWakeup returns the run row itself, and the coalesce branch returns
+    // the run it merged into — so absorption is exactly `wake.id === wedgedRunId`
+    // with the park's own status. Asserting the fresh `queued` run positively
+    // keeps this non-vacuous: a suppressed wake returns null, which would
+    // satisfy any `not.toBe` on its own.
+    expect(wake).not.toBeNull();
+    expect(wake?.id).not.toBe(wedgedRunId);
+    expect(wake?.status).toBe("queued");
 
     const afterWake = await db
       .select({
@@ -1442,7 +1458,7 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
 
     // Idempotent under wake volume: the bound is on the run, not on the wake, so
     // repeat wakes cannot walk it back.
-    await heartbeat.enqueueWakeup(agentId, {
+    const secondWake = await heartbeat.enqueueWakeup(agentId, {
       source: "manual",
       reason: "issue_assigned",
       contextSnapshot: { issueId },
@@ -1454,6 +1470,7 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0]);
     expect(afterSecondWake?.executionRunId).not.toBe(wedgedRunId);
+    expect(secondWake?.run?.id).not.toBe(wedgedRunId);
   });
 
   // BLO-22060 review follow-up: the bound must not be status-scoped. The sweep
@@ -1549,7 +1566,7 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     expect(released?.status).toBe("queued");
     expect(released?.issueLockReleaseCount).toBe(1);
 
-    await heartbeat.enqueueWakeup(agentId, {
+    const wake = await heartbeat.enqueueWakeup(agentId, {
       source: "manual",
       reason: "issue_assigned",
       contextSnapshot: { issueId },
@@ -1562,6 +1579,12 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0]);
     expect(afterWake?.executionRunId).not.toBe(wedgedRunId);
+    // Not just un-stamped — un-absorbed. A released holder must not swallow the
+    // wake as a coalesce target either (see the scheduled_retry case above).
+    // The positive `queued` assertion keeps this non-vacuous.
+    expect(wake).not.toBeNull();
+    expect(wake?.id).not.toBe(wedgedRunId);
+    expect(wake?.status).toBe("queued");
   });
 
   it("does not let a wake re-adopt a silent running run whose lock the sweep released (BLO-22060)", async () => {
@@ -1594,7 +1617,7 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     expect(released?.status).toBe("running");
     expect(released?.issueLockReleaseCount).toBe(1);
 
-    await heartbeat.enqueueWakeup(agentId, {
+    const wake = await heartbeat.enqueueWakeup(agentId, {
       source: "manual",
       reason: "issue_assigned",
       contextSnapshot: { issueId },
@@ -1607,6 +1630,12 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0]);
     expect(afterWake?.executionRunId).not.toBe(wedgedRunId);
+    // Not just un-stamped — un-absorbed. A released holder must not swallow the
+    // wake as a coalesce target either (see the scheduled_retry case above).
+    // The positive `queued` assertion keeps this non-vacuous.
+    expect(wake).not.toBeNull();
+    expect(wake?.id).not.toBe(wedgedRunId);
+    expect(wake?.status).toBe("queued");
   });
 
   it("does not let a released park evade the bound by being promoted to queued (BLO-22060)", async () => {
@@ -1647,7 +1676,7 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     expect(promoted?.status).toBe("queued");
     expect(promoted?.issueLockReleaseCount).toBe(1);
 
-    await heartbeat.enqueueWakeup(agentId, {
+    const wake = await heartbeat.enqueueWakeup(agentId, {
       source: "manual",
       reason: "issue_assigned",
       contextSnapshot: { issueId },
@@ -1660,6 +1689,12 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0]);
     expect(afterWake?.executionRunId).not.toBe(wedgedRunId);
+    // Not just un-stamped — un-absorbed. A released holder must not swallow the
+    // wake as a coalesce target either (see the scheduled_retry case above).
+    // The positive `queued` assertion keeps this non-vacuous.
+    expect(wake).not.toBeNull();
+    expect(wake?.id).not.toBe(wedgedRunId);
+    expect(wake?.status).toBe("queued");
   });
 
   it.each([
