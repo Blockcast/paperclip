@@ -380,6 +380,75 @@ describe("github-webhook pure helpers", () => {
     ).toEqual({ owning: ["BLO-1"] });
   });
 
+  it("measures the indented-code threshold from the list container (BLO-23893)", () => {
+    // The four-column code threshold is relative to the enclosing CONTAINER,
+    // exactly as the closing-fence allowance already was. A list continuation
+    // expands to four RAW columns while sitting only two columns inside the
+    // item's content, so measuring from column zero threw away an ordinary
+    // visible paragraph as "code" and lost the owner it declared. marked 16.4.2
+    // renders this as `<li>item\n   Refs: BLO-1</li>` -- a paragraph, no <pre>.
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: "- item\n \tRefs: BLO-1" }),
+    ).toEqual({ owning: ["BLO-1"] });
+
+    // The counter-cases that keep this from becoming a leak. Four columns PAST
+    // the container is still code, at root and at depth -- marked renders both
+    // inside <pre><code>. This is the direction that matters: the relative
+    // measurement must not make genuinely-fenced-off text eligible to own.
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: ["- item", "", "      Refs: BLO-999"].join("\n") }),
+    ).toEqual({ owning: [] });
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: ["- a", "  - b", "", "        Refs: BLO-999"].join("\n"),
+      }),
+    ).toEqual({ owning: [] });
+
+    // With no container at all the threshold is unchanged from column zero, so
+    // the BLO-20886 mixed space-tab case above does not regress.
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: "  \tRefs: BLO-999" }),
+    ).toEqual({ owning: [] });
+  });
+
+  it("does not open an HTML comment from an indented-code delimiter (BLO-23893)", () => {
+    // Comment state used to advance before the indented-code early-out, so a
+    // `    <!--` -- which CommonMark renders literally, escaped, inside
+    // <pre><code> -- opened a comment that then swallowed every following
+    // VISIBLE line up to the next `-->`, suppressing an owner a reader of the
+    // PR can plainly see. Fail-closed, but still a dropped wake.
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: ["    <!--", "Issue: BLO-1"].join("\n") }),
+    ).toEqual({ owning: ["BLO-1"] });
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: ["    <!--", "Refs: BLO-2"].join("\n") }),
+    ).toEqual({ owning: ["BLO-2"] });
+
+    // The converse must hold too: indentation does not create a code block
+    // INSIDE an open HTML block, so an indented `-->` still closes the comment
+    // rather than wedging it open forever. marked closes it here.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: ["<!--", "    hidden -->", "Issue: BLO-3"].join("\n"),
+      }),
+    ).toEqual({ owning: ["BLO-3"] });
+
+    // And the fail-closed guarantees are untouched: a real comment still hides
+    // its body, an unterminated one still swallows the rest, and a comment
+    // opened on a fence-opener line still hides its own body.
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: ["<!--", "Issue: BLO-999", "-->"].join("\n") }),
+    ).toEqual({ owning: [] });
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: ["<!--", "Issue: BLO-999"].join("\n") }),
+    ).toEqual({ owning: [] });
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: ["```x <!--", "```", "Issue: BLO-999", "-->"].join("\n"),
+      }),
+    ).toEqual({ owning: [] });
+  });
+
   it("does not manufacture a branch owner from a version number (BLO-20886)", () => {
     // Uppercasing a whole branch to match the uppercase-only identifier
     // pattern also turns ordinary words-followed-by-a-number into

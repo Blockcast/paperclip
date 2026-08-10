@@ -167,8 +167,9 @@ function expandedColumns(text: string): number {
  * the mixed forms that expand to the same width -- ` \t`, `  \t`, `   \t` --
  * were not, so an ownership label inside an indented example stayed eligible
  * to claim the PR. Counting columns instead of matching two literal prefixes
- * closes the whole family at once. Stops early: nothing above the threshold
- * needs a precise width.
+ * closes the whole family at once. The full width is returned rather than
+ * stopping at the threshold, because the caller subtracts the enclosing list
+ * container's content column before comparing.
  */
 function leadingIndentColumns(line: string): number {
   let columns = 0;
@@ -176,7 +177,6 @@ function leadingIndentColumns(line: string): number {
     if (char === " ") columns += 1;
     else if (char === "\t") columns += 4 - (columns % 4);
     else break;
-    if (columns >= 4) return columns;
   }
   return columns;
 }
@@ -228,16 +228,32 @@ function* visibleMarkdownLines(body: string): Generator<string> {
       continue;
     }
 
-    // Comment state is advanced before any early-out below, so a multi-line
-    // comment that opens on a skipped line still hides its own body.
-    const { visible, open } = stripHtmlComments(line, htmlComment);
-    htmlComment = open;
-
     // Indentation is read from the raw line because that is what determines
     // CommonMark block structure, and checked before the fence so an indented
     // ``` is code rather than a fence opener.
+    //
+    // Four columns makes an indented code block, but the threshold is measured
+    // from the enclosing CONTAINER rather than from column zero -- the same
+    // relativity the closing fence already honours. A list continuation like
+    // `- item` / ` \tRefs: BLO-1` expands to four raw columns while sitting only
+    // two columns inside the item's content, so measuring absolutely discarded
+    // an ordinary visible paragraph as code and lost the owner it declared.
     const indent = leadingIndentColumns(line);
-    if (indent >= 4) continue;
+    const indentContainerColumn = listContentColumns.filter((column) => column <= indent).pop() ?? 0;
+    // Indentation only opens a code block in a leaf-block position. Inside an
+    // open HTML comment there is no such position -- the block runs to its
+    // `-->` regardless of indentation -- so the check is suppressed there, and
+    // an indented `-->` still closes the comment.
+    if (!htmlComment && indent - indentContainerColumn >= 4) continue;
+
+    // Comment state is advanced before the fence early-out below, so a
+    // multi-line comment that opens on a skipped fence line still hides its own
+    // body. It is advanced AFTER the indented-code check above, though: `    <!--`
+    // is rendered literally in a code block, and opening a comment from it
+    // swallowed every following visible line up to the next `-->`, suppressing
+    // an owner a reader of the PR can plainly see.
+    const { visible, open } = stripHtmlComments(line, htmlComment);
+    htmlComment = open;
 
     // Track list containers before reading the fence, so a fence opened on the
     // same line as its marker (`- ```md`) sees its own item.
