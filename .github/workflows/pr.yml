@@ -704,7 +704,7 @@ jobs:
     runs-on: arc-e2e
     # The serial browser suite now covers 43 flows and remained active through
     # test 42 when ARC enforced the previous 30-minute job ceiling.
-    timeout-minutes: 60
+    timeout-minutes: 75
 
     steps:
       - name: Checkout repository
