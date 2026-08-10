@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
 import { eq } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { activityLog, agents, companies, companyMemberships, createDb, heartbeatRuns, issues, principalPermissionGrants } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -12,6 +12,7 @@ import { errorHandler } from "../middleware/index.js";
 import {
   __clearIssueListResponseCacheForTests,
   __getIssueListResponseCacheSizeForTests,
+  __setIssueListResponseCacheEntryForTests,
   ISSUE_LIST_SERVER_CACHE_MAX_ENTRIES,
   issueRoutes,
 } from "../routes/issues.js";
@@ -550,40 +551,22 @@ describeEmbeddedPostgres("issue list routes assigneeAgentId filter", () => {
     expect(second.headers["x-paperclip-request-cache"]).toBe("hit");
   });
 
-  it("bounds compact issue-list server cache entries", async () => {
-    const companyId = randomUUID();
-    const issueId = randomUUID();
+  it("bounds compact issue-list server cache entries", () => {
+    // Exercise the same insert-and-trim path real requests use, but avoid
+    // 261 HTTP round trips through Express and Postgres. This test is fully
+    // synchronous, so it cannot time out mid-mutation and leak state into a
+    // later test.
+    const syntheticEntry = {
+      response: { kind: "compact" as const, body: [], etag: "test-etag", cacheControl: "no-store" },
+      expiresAt: Date.now() + 1_000,
+      staleUntil: Date.now() + 5_000,
+    };
 
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: uniqueIssuePrefix(),
-      requireBoardApprovalForNewAgents: false,
-    });
-    await seedCloudTenantMember(companyId);
-    await db.insert(issues).values({
-      id: issueId,
-      companyId,
-      title: "Bounded cache issue",
-      status: "todo",
-      priority: "medium",
-    });
-
-    const app = createApp(companyId);
-    const fixedNow = Date.now();
-    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(fixedNow);
-    try {
-      for (let index = 0; index < ISSUE_LIST_SERVER_CACHE_MAX_ENTRIES + 5; index += 1) {
-        const res = await request(app)
-          .get(`/api/companies/${companyId}/issues`)
-          .query({ view: "compact", limit: "20", q: `cache-key-${index}` });
-        expect(res.status, JSON.stringify(res.body)).toBe(200);
-      }
-
-      expect(__getIssueListResponseCacheSizeForTests()).toBe(ISSUE_LIST_SERVER_CACHE_MAX_ENTRIES);
-    } finally {
-      nowSpy.mockRestore();
+    for (let index = 0; index < ISSUE_LIST_SERVER_CACHE_MAX_ENTRIES + 5; index += 1) {
+      __setIssueListResponseCacheEntryForTests(`cache-key-${index}`, syntheticEntry);
     }
+
+    expect(__getIssueListResponseCacheSizeForTests()).toBe(ISSUE_LIST_SERVER_CACHE_MAX_ENTRIES);
   });
 
   it("logs request_storm_detected for identical in-flight compact issue-list fanout without query values", async () => {
