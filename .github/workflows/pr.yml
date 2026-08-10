@@ -182,6 +182,20 @@ jobs:
           PAPERCLIP_RELEASE_BOOTSTRAP_BASE_SHA="$PR_BASE_SHA" \
             node ./scripts/check-release-package-bootstrap.mjs "${changed_paths[@]}"
 
+      # BLO-24169: this runs unconditionally (not gated on whether this PR's
+      # own diff touches a manifest) because a merge-queue batch can land a
+      # package.json bump next to a stale, already-committed pnpm-lock.yaml —
+      # the diff that broke master touched neither file in *this* PR. The
+      # "Validate dependency resolution when manifests change" step below
+      # only regenerates an in-memory lockfile for jobs to consume; it never
+      # asserts the committed lockfile itself is consistent, which is exactly
+      # the gap that let 08b6f4491 take the whole queue down.
+      - name: Check pnpm-lock.yaml overrides/patchedDependencies consistency
+        run: node ./scripts/check-lockfile-overrides-consistency.mjs
+
+      - name: Test lockfile overrides consistency guard
+        run: node --test ./scripts/check-lockfile-overrides-consistency.test.mjs
+
       - name: Validate dependency resolution when manifests change
         id: regen_lockfile
         run: |
