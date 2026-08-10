@@ -832,7 +832,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   async function seedStrandedIssueFixture(input: {
     status: "todo" | "in_progress";
     runStatus: "failed" | "timed_out" | "cancelled" | "succeeded";
-    retryReason?: "assignment_recovery" | "issue_continuation_needed" | "execution_review_participant_recovery" | null;
+    retryReason?: "assignment_recovery" | "issue_continuation_needed" | "execution_review_participant_recovery" | "session_unavailable" | "zero_token_session_reset" | null;
     runSource?: string | null;
     assignToUser?: boolean;
     activePauseHold?: boolean;
@@ -841,6 +841,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     runError?: string | null;
     resultJson?: Record<string, unknown> | null;
     monitorNextCheckAt?: Date | null;
+    runUsageJson?: Record<string, unknown> | null;
+    adapterType?: string;
+    agentStatus?: "idle" | "error";
+    scheduledRetryAttempt?: number;
   }) {
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -864,8 +868,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       companyId,
       name: "CodexCoder",
       role: "engineer",
-      status: "idle",
-      adapterType: "codex_local",
+      status: input.agentStatus ?? "idle",
+      errorReason: input.agentStatus === "error" ? input.runError ?? "run failed before issue advanced" : null,
+      adapterType: input.adapterType ?? "codex_local",
       adapterConfig: {},
       runtimeConfig: {},
       permissions: {},
@@ -899,6 +904,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       contextSnapshot: {
         issueId,
         taskId: issueId,
+        adapterType: input.adapterType ?? "codex_local",
         wakeReason: input.retryReason === "assignment_recovery"
           ? "issue_assignment_recovery"
           : input.retryReason ?? "issue_assigned",
@@ -916,6 +922,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         : ("runError" in input ? input.runError : "run failed before issue advanced"),
       livenessState: input.livenessState ?? null,
       resultJson: input.resultJson ?? null,
+      usageJson: input.runUsageJson ?? null,
+      scheduledRetryAttempt: input.scheduledRetryAttempt ?? 0,
     });
 
     await db.insert(issues).values([
@@ -8234,6 +8242,341 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(comments).toHaveLength(1);
     expect(comments[0]?.body).toContain("zero-token startup wedge");
     expect(comments[0]?.body).toContain("reset");
+  });
+
+  it("startup reconciliation clears a stale opencode_k8s session and queues immediate recovery", async () => {
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      runErrorCode: "adapter_failed",
+      runError: "Session unavailable",
+      adapterType: "opencode_k8s",
+      agentStatus: "error",
+    });
+
+    const historicalTaskKey = randomUUID();
+    const failedRun = await db
+      .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0]!);
+    const { adapterType: _adapterType, ...legacyContextSnapshot } = failedRun.contextSnapshot ?? {};
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: { ...legacyContextSnapshot, taskKey: historicalTaskKey },
+        sessionIdBefore: "stale-opencode-session",
+      })
+      .where(eq(heartbeatRuns.id, runId));
+
+    await db.insert(agentTaskSessions).values({
+      companyId,
+      agentId,
+      adapterType: "opencode_k8s",
+      taskKey: historicalTaskKey,
+      sessionParamsJson: { sessionId: "stale-opencode-session" },
+      sessionDisplayId: "stale-opencode-session",
+    });
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.zeroTokenSessionResetRetried).toBe(1);
+    expect(result.escalated).toBe(0);
+    await expect(
+      db.select().from(agentTaskSessions).where(eq(agentTaskSessions.agentId, agentId)),
+    ).resolves.toHaveLength(0);
+
+    const wakeRows = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakeRows.some((row) => row.reason === "issue_zero_token_session_reset")).toBe(true);
+    const retryRun = await db
+      .select({ retryOfRunId: heartbeatRuns.retryOfRunId })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.retryOfRunId, runId))
+      .then((rows) => rows[0] ?? null);
+    expect(retryRun?.retryOfRunId).toBe(runId);
+  });
+
+  it("accounts for a session reset attempt before a fast claimant can schedule another retry", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      runErrorCode: "session_unavailable",
+      runError: "Session unavailable",
+      adapterType: "opencode_k8s",
+    });
+
+    await db.insert(agentTaskSessions).values({
+      companyId,
+      agentId,
+      adapterType: "opencode_k8s",
+      taskKey: issueId,
+      sessionParamsJson: { sessionId: "stale-racing-session" },
+      sessionDisplayId: "stale-racing-session",
+    });
+
+    let raced = false;
+    let observedAttempt: number | null = null;
+    let secondScheduleOutcome: string | null = null;
+    let raceHeartbeat!: ReturnType<typeof heartbeatService>;
+    raceHeartbeat = createHeartbeat({
+      penstockAvailabilityGate: allowPenstockGate,
+      skipQueuedRunDispatch: true,
+      beforeQueuedRunDispatchForTest: async (queuedRun) => {
+        if (raced || queuedRun.contextSnapshot?.retryReason !== "zero_token_session_reset") return;
+        raced = true;
+        observedAttempt = queuedRun.scheduledRetryAttempt;
+        await expect(
+          db.select().from(agentTaskSessions).where(eq(agentTaskSessions.agentId, agentId)),
+        ).resolves.toHaveLength(0);
+
+        await db
+          .update(issues)
+          .set({ executionRunId: queuedRun.id })
+          .where(eq(issues.id, issueId));
+        const failedReset = await db
+          .update(heartbeatRuns)
+          .set({
+            status: "failed",
+            errorCode: "session_unavailable",
+            error: "Session unavailable",
+            usageJson: { inputTokens: 0, outputTokens: 0 },
+            finishedAt: new Date(),
+          })
+          .where(eq(heartbeatRuns.id, queuedRun.id))
+          .returning()
+          .then((rows) => rows[0]!);
+        const firstSchedule = await raceHeartbeat.scheduleBoundedRetry(failedReset.id, {
+          retryReason: "session_unavailable",
+          wakeReason: "session_unavailable_retry",
+          maxAttempts: 2,
+          delayMs: 30_000,
+        });
+        if (firstSchedule.outcome !== "scheduled") {
+          throw new Error(`Expected the fast claimant to schedule attempt 2: ${JSON.stringify(firstSchedule)}`);
+        }
+
+        await db
+          .update(heartbeatRuns)
+          .set({
+            status: "failed",
+            errorCode: "session_unavailable",
+            error: "Session unavailable",
+            usageJson: { inputTokens: 0, outputTokens: 0 },
+            finishedAt: new Date(),
+          })
+          .where(eq(heartbeatRuns.id, firstSchedule.run.id));
+        const secondSchedule = await raceHeartbeat.scheduleBoundedRetry(firstSchedule.run.id, {
+          retryReason: "session_unavailable",
+          wakeReason: "session_unavailable_retry",
+          maxAttempts: 2,
+          delayMs: 30_000,
+        });
+        secondScheduleOutcome = secondSchedule.outcome;
+      },
+    });
+
+    const result = await raceHeartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.zeroTokenSessionResetRetried).toBe(1);
+    expect(observedAttempt).toBe(1);
+    expect(secondScheduleOutcome).toBe("retry_exhausted");
+    const retryRuns = await db
+      .select({ attempt: heartbeatRuns.scheduledRetryAttempt })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(retryRuns.filter((run) => run.attempt > 0).map((run) => run.attempt).sort()).toEqual([1, 2]);
+  });
+
+  it("does not clear the current assignee session from an older assignee failure", async () => {
+    const { companyId, agentId: previousAgentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      runErrorCode: "adapter_failed",
+      runError: "Session unavailable",
+      adapterType: "opencode_k8s",
+    });
+    const currentAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: currentAgentId,
+      companyId,
+      name: "CurrentOpenCodeAgent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "opencode_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.update(issues).set({ assigneeAgentId: currentAgentId }).where(eq(issues.id, issueId));
+    await db.insert(agentTaskSessions).values({
+      companyId,
+      agentId: currentAgentId,
+      adapterType: "opencode_k8s",
+      taskKey: issueId,
+      sessionParamsJson: { sessionId: "healthy-current-session" },
+      sessionDisplayId: "healthy-current-session",
+    });
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.zeroTokenSessionResetRetried).toBe(0);
+    await expect(
+      db.select().from(agentTaskSessions).where(eq(agentTaskSessions.agentId, currentAgentId)),
+    ).resolves.toHaveLength(1);
+    const wakeRows = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, currentAgentId));
+    expect(wakeRows.some((row) => row.reason === "issue_zero_token_session_reset")).toBe(false);
+    expect(previousAgentId).not.toBe(currentAgentId);
+  });
+
+  it("does not treat legacy session-unavailable text as an OpenCode failure for other adapters", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      runErrorCode: "adapter_failed",
+      runError: "Session unavailable",
+      adapterType: "claude_k8s",
+    });
+    await db.insert(agentTaskSessions).values({
+      companyId,
+      agentId,
+      adapterType: "claude_k8s",
+      taskKey: issueId,
+      sessionParamsJson: { sessionId: "healthy-claude-session" },
+      sessionDisplayId: "healthy-claude-session",
+    });
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.zeroTokenSessionResetRetried).toBe(0);
+    await expect(
+      db.select().from(agentTaskSessions).where(eq(agentTaskSessions.agentId, agentId)),
+    ).resolves.toHaveLength(1);
+  });
+
+  it("does not reclassify a historical non-OpenCode failure after adapter reconfiguration", async () => {
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      runErrorCode: "adapter_failed",
+      runError: "Session unavailable",
+      adapterType: "claude_k8s",
+    });
+    const historicalTaskKey = randomUUID();
+    const failedRun = await db
+      .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0]!);
+    const { adapterType: _adapterType, ...legacyContextSnapshot } = failedRun.contextSnapshot ?? {};
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: { ...legacyContextSnapshot, taskKey: historicalTaskKey },
+        sessionIdBefore: "historical-claude-session",
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    await db.insert(agentTaskSessions).values({
+      companyId,
+      agentId,
+      adapterType: "claude_k8s",
+      taskKey: historicalTaskKey,
+      sessionParamsJson: { sessionId: "historical-claude-session" },
+      sessionDisplayId: "historical-claude-session",
+    });
+    await db.update(agents).set({ adapterType: "opencode_k8s" }).where(eq(agents.id, agentId));
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.zeroTokenSessionResetRetried).toBe(0);
+    expect(result.escalated).toBe(1);
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("blocked");
+  });
+
+  it("does not clear a reconfigured adapter session after a typed OpenCode failure", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      runErrorCode: "session_unavailable",
+      runError: "Session unavailable",
+      adapterType: "opencode_k8s",
+    });
+    await db.update(agents).set({ adapterType: "claude_k8s" }).where(eq(agents.id, agentId));
+    await db.insert(agentTaskSessions).values({
+      companyId,
+      agentId,
+      adapterType: "claude_k8s",
+      taskKey: issueId,
+      sessionParamsJson: { sessionId: "healthy-claude-session" },
+      sessionDisplayId: "healthy-claude-session",
+    });
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.zeroTokenSessionResetRetried).toBe(0);
+    expect(result.escalated).toBe(1);
+    await expect(
+      db.select().from(agentTaskSessions).where(eq(agentTaskSessions.agentId, agentId)),
+    ).resolves.toHaveLength(1);
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("blocked");
+  });
+
+  it("blocks an exhausted ordinary session-unavailable chain without starting a reset chain", async () => {
+    const { agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "session_unavailable",
+      runErrorCode: "session_unavailable",
+      runError: "Session unavailable",
+      runUsageJson: { inputTokens: 0, outputTokens: 0 },
+      adapterType: "opencode_k8s",
+      scheduledRetryAttempt: 2,
+    });
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.zeroTokenSessionResetRetried).toBe(0);
+    expect(result.zeroTokenStartupFailureBlocked).toBe(1);
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("blocked");
+    const wakeRows = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakeRows.some((row) => row.reason === "issue_zero_token_session_reset")).toBe(false);
+  });
+
+  it("blocks an exhausted session-unavailable reset chain without another wake", async () => {
+    const { agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "zero_token_session_reset",
+      runErrorCode: "session_unavailable",
+      runError: "Session unavailable",
+      runUsageJson: { inputTokens: 0, outputTokens: 0 },
+      adapterType: "opencode_k8s",
+      scheduledRetryAttempt: 2,
+    });
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.zeroTokenSessionResetRetried).toBe(0);
+    expect(result.zeroTokenStartupFailureBlocked).toBe(1);
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("blocked");
+    const wakeRows = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakeRows.some((row) => row.reason === "issue_zero_token_session_reset")).toBe(false);
+    expect(wakeRows.some((row) => row.reason === "session_unavailable_retry")).toBe(false);
   });
 
   // BLO-10889: if the reset-and-retry attempt ALSO fails with the same
