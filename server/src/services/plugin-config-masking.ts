@@ -433,7 +433,21 @@ export function maskPluginConfigJson(
   ): unknown {
     // A pointer names a secret without disclosing it — keep it, minus baggage.
     if (isSecretPointerCandidate(value)) {
-      return sanitizeSecretPointer(value) ?? mask(value);
+      const pointer = sanitizeSecretPointer(value);
+      if (!pointer) return mask(value);
+      // Dropping the baggage from the *response* is not enough. A caller can
+      // post it back: `mergeMaskedPluginConfig` preserves submitted extras, so
+      // `{ type: "secret_ref", secretId, value: "live" }` reaches the worker
+      // intact via `validateConfig`. Unless "live" is recorded here, the
+      // diagnostic scrubbing in `POST /config/test` does not know it is a
+      // secret and hands it back in a warning, an error, or an RPC failure —
+      // reflected out of the endpoint whose whole job is to mask it.
+      if (collector) {
+        for (const [childKey, childValue] of Object.entries(value)) {
+          if (!(childKey in pointer)) collectStringLeaves(childValue, collector);
+        }
+      }
+      return pointer;
     }
 
     if (nodesDeclareSecret(nodes)) {

@@ -985,3 +985,86 @@ describe("collectPluginConfigSecretValues — structured declared secrets", () =
     expect(JSON.stringify(diagnostic)).not.toContain("live-password");
   });
 });
+
+describe("collectPluginConfigSecretValues — pointer baggage", () => {
+  // Round-7 finding: `sanitizeSecretPointer` drops the fields a pointer schema
+  // does not own, so they never appear in the masked GET — but the collector
+  // never saw them either. `mergeMaskedPluginConfig` preserves submitted
+  // extras, so a posted `{ type: "secret_ref", secretId, value: "live" }`
+  // reaches `validateConfig` intact and a worker echoing "live" leaked it
+  // straight back out of POST /config/test.
+  const POINTER_SCHEMA = {
+    type: "object",
+    properties: {
+      apiKeyRef: { type: "string", format: "secret-ref" },
+      endpoint: { type: "string" },
+    },
+  };
+
+  it("collects plaintext riding along with a well-formed secret_ref pointer", () => {
+    const values = collectPluginConfigSecretValues(
+      {
+        apiKeyRef: { type: "secret_ref", secretId: SECRET_ID, version: "latest", value: SECRET },
+        endpoint: "https://a.example.com",
+      },
+      POINTER_SCHEMA,
+    );
+
+    expect(values).toContain(SECRET);
+    // Pointer metadata names the secret without disclosing it. Collecting it
+    // would feed an unbounded substring replacement and corrupt diagnostics.
+    expect(values).not.toContain(SECRET_ID);
+    expect(values).not.toContain("latest");
+    expect(values).not.toContain("https://a.example.com");
+  });
+
+  it("collects baggage riding along with a user_secret_ref pointer", () => {
+    const values = collectPluginConfigSecretValues(
+      { apiKeyRef: { type: "user_secret_ref", key: "OPENAI_KEY", value: SECRET } },
+      POINTER_SCHEMA,
+    );
+
+    expect(values).toContain(SECRET);
+    expect(values).not.toContain("OPENAI_KEY");
+  });
+
+  it("collects baggage nested at arbitrary depth beside a pointer", () => {
+    const values = collectPluginConfigSecretValues(
+      {
+        apiKeyRef: {
+          type: "secret_ref",
+          secretId: SECRET_ID,
+          resolved: { cached: ["live-deep"] },
+        },
+      },
+      POINTER_SCHEMA,
+    );
+
+    expect(values).toContain("live-deep");
+  });
+
+  it("still masks a malformed pointer wholesale rather than trusting its shape", () => {
+    // No `secretId`, so it is not a well-formed pointer — it must be masked,
+    // and every leaf beneath it recorded.
+    const values = collectPluginConfigSecretValues(
+      { apiKeyRef: { type: "secret_ref", value: SECRET } },
+      POINTER_SCHEMA,
+    );
+
+    expect(values).toContain(SECRET);
+  });
+
+  it("redacts pointer baggage out of a worker diagnostic", () => {
+    const values = collectPluginConfigSecretValues(
+      { apiKeyRef: { type: "secret_ref", secretId: SECRET_ID, value: SECRET } },
+      POINTER_SCHEMA,
+    );
+
+    const diagnostic = redactSecretValuesDeep(
+      { warnings: [`401 rejected for ${SECRET}`], detail: { echoed: SECRET } },
+      values,
+    );
+
+    expect(JSON.stringify(diagnostic)).not.toContain(SECRET);
+  });
+});

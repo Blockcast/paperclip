@@ -2042,6 +2042,116 @@ describe.sequential("plugin config secret masking (BLO-20794)", () => {
       ],
     });
   }, 20_000);
+
+  // ---------------------------------------------------------------------------
+  // Round-7 review finding (BLO-20871): pointer baggage
+  // ---------------------------------------------------------------------------
+
+  // `sanitizeSecretPointer` keeps only a pointer's schema-owned fields, so a
+  // stray `value` never appears in the masked GET. That is not the whole story:
+  // `mergeMaskedPluginConfig` preserves submitted extras, so a caller can post
+  // the baggage back and it reaches `validateConfig` intact. The collector did
+  // not record it, so a worker echoing it returned live plaintext from the very
+  // endpoint that exists to mask it.
+  const INJECTED = "live-injected-plaintext";
+  const pointerWithBaggage = {
+    type: "secret_ref",
+    secretId: "77777777-7777-4777-8777-777777777777",
+    value: INJECTED,
+  };
+
+  it("redacts plaintext bolted onto a posted pointer from worker warnings", async () => {
+    maskingPlugin();
+    seedConfigStore({ endpoint: "https://alerts.example.com" });
+    const workerCall = vi.fn().mockResolvedValue({
+      ok: true,
+      warnings: [`bound ${INJECTED} for delivery`],
+    });
+    const { app } = await createApp(adminActor(), {}, {
+      bridgeDeps: { workerManager: { isRunning: () => true, call: workerCall } },
+    });
+
+    const res = await request(app)
+      .post(`/api/plugins/${pluginId}/config/test`)
+      .send({
+        companyId: companyA,
+        configJson: { apiKeyRef: pointerWithBaggage, endpoint: "https://alerts.example.com" },
+      });
+
+    // The baggage really does survive the merge and reach the worker — without
+    // that, this test would pass for the wrong reason.
+    expect(workerCall.mock.calls[0]?.[2]?.config?.apiKeyRef).toEqual(pointerWithBaggage);
+    expect(res.status).toBe(200);
+    expect(JSON.stringify(res.body)).not.toContain(INJECTED);
+    expect(res.body.message).toContain("for delivery");
+  }, 20_000);
+
+  it("redacts plaintext bolted onto a posted pointer from worker errors", async () => {
+    maskingPlugin();
+    seedConfigStore({ endpoint: "https://alerts.example.com" });
+    const workerCall = vi.fn().mockResolvedValue({
+      ok: false,
+      errors: [`upstream rejected ${INJECTED}`],
+    });
+    const { app } = await createApp(adminActor(), {}, {
+      bridgeDeps: { workerManager: { isRunning: () => true, call: workerCall } },
+    });
+
+    const res = await request(app)
+      .post(`/api/plugins/${pluginId}/config/test`)
+      .send({
+        companyId: companyA,
+        configJson: { apiKeyRef: pointerWithBaggage, endpoint: "https://alerts.example.com" },
+      });
+
+    expect(res.status).toBe(200);
+    expect(res.body.valid).toBe(false);
+    expect(JSON.stringify(res.body)).not.toContain(INJECTED);
+    expect(res.body.message).toContain("upstream rejected");
+  }, 20_000);
+
+  it("redacts plaintext bolted onto a posted pointer from a thrown worker error", async () => {
+    maskingPlugin();
+    seedConfigStore({ endpoint: "https://alerts.example.com" });
+    const workerCall = vi.fn().mockRejectedValue(
+      new Error(`connect failed using ${INJECTED}`),
+    );
+    const { app } = await createApp(adminActor(), {}, {
+      bridgeDeps: { workerManager: { isRunning: () => true, call: workerCall } },
+    });
+
+    const res = await request(app)
+      .post(`/api/plugins/${pluginId}/config/test`)
+      .send({
+        companyId: companyA,
+        configJson: { apiKeyRef: pointerWithBaggage, endpoint: "https://alerts.example.com" },
+      });
+
+    expect(JSON.stringify(res.body)).not.toContain(INJECTED);
+  }, 20_000);
+
+  it("keeps the pointer itself readable — baggage is dropped, binding is not", async () => {
+    // Over-collecting would be its own bug: the collected values feed an
+    // unbounded substring replacement, so masking `secretId` would corrupt any
+    // diagnostic naming the binding.
+    maskingPlugin();
+    seedConfigStore({
+      apiKeyRef: { type: "secret_ref", secretId: pointerWithBaggage.secretId, value: INJECTED },
+      endpoint: "https://alerts.example.com",
+    });
+    const { app } = await createApp(adminActor());
+
+    const res = await request(app)
+      .get(`/api/plugins/${pluginId}/config`)
+      .query({ companyId: companyA });
+
+    expect(res.status).toBe(200);
+    expect(JSON.stringify(res.body)).not.toContain(INJECTED);
+    expect(res.body.configJson.apiKeyRef).toEqual({
+      type: "secret_ref",
+      secretId: pointerWithBaggage.secretId,
+    });
+  }, 20_000);
 });
 
 // BLO-22120: these three plugin-state routes are board-only BY DESIGN.
