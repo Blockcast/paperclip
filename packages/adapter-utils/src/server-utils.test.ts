@@ -24,6 +24,7 @@ import {
   UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
   UNMANAGED_BACKGROUND_TASK_STOP_REASON,
   WATCHDOG_DEFAULT_MANDATE,
+  type ProcessLifecycleEvent,
 } from "./server-utils.js";
 
 function isPidAlive(pid: number) {
@@ -407,6 +408,59 @@ describe("runChildProcess", () => {
     expect(result.exitCode).toBe(0);
     expect(result.timedOut).toBe(false);
     expect(result.stdout).toBe("done");
+  });
+
+  it("reports value-safe spawn, first-byte, exit, and close lifecycle events", async () => {
+    const lifecycle: ProcessLifecycleEvent[] = [];
+    const result = await runChildProcess(
+      randomUUID(),
+      process.execPath,
+      ["-e", "process.stdout.write('out');process.stderr.write('err');"],
+      {
+        cwd: process.cwd(),
+        env: {},
+        timeoutSec: 5,
+        graceSec: 1,
+        onLog: async () => {},
+        onLifecycle: async (event) => {
+          lifecycle.push(event);
+        },
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(lifecycle.map((event) => event.stage)).toEqual([
+      "spawn_attempted",
+      "spawned",
+      "first_output",
+      "first_output",
+      "exit",
+      "close",
+    ]);
+    expect(lifecycle.filter((event) => event.stage === "first_output").map((event) => event.stream).sort()).toEqual([
+      "stderr",
+      "stdout",
+    ]);
+    expect(lifecycle).not.toEqual(expect.arrayContaining([expect.objectContaining({ output: expect.anything() })]));
+  });
+
+  it("does not report a failed spawn as spawned", async () => {
+    const lifecycle: ProcessLifecycleEvent[] = [];
+
+    await expect(
+      runChildProcess(randomUUID(), path.join(os.tmpdir(), `missing-${randomUUID()}`), [], {
+        cwd: process.cwd(),
+        env: {},
+        timeoutSec: 5,
+        graceSec: 1,
+        onLog: async () => {},
+        onLifecycle: async (event) => {
+          lifecycle.push(event);
+        },
+      }),
+    ).rejects.toThrow("Failed to start command");
+
+    expect(lifecycle.map((event) => event.stage)).toEqual(["spawn_attempted", "error"]);
   });
 
   it("waits for onSpawn before sending stdin to the child", async () => {

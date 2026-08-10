@@ -93,6 +93,22 @@ console.log(JSON.stringify({ type: "result", session_id: ${JSON.stringify(sessio
   await fs.chmod(commandPath, 0o755);
 }
 
+async function writeStallingClaudeCommand(
+  commandPath: string,
+  options: { emitOutput?: boolean } = {},
+): Promise<void> {
+  const script = `#!/usr/bin/env node
+if (process.argv.includes("--help")) {
+  process.stdout.write("Usage: claude [options]\\n  --print\\n  --model <id>\\n");
+  process.exit(0);
+}
+${options.emitOutput ? "process.stdout.write('started');" : ""}
+setInterval(() => {}, 1000);
+`;
+  await fs.writeFile(commandPath, script, "utf8");
+  await fs.chmod(commandPath, 0o755);
+}
+
 async function writeHelpWithoutEffortClaudeCommand(commandPath: string): Promise<void> {
   const script = `#!/usr/bin/env node
 const fs = require("node:fs");
@@ -399,6 +415,128 @@ function createLocalSandboxRunner() {
 }
 
 describe("claude execute", () => {
+  it("bounds a zero-output process and emits value-safe lifecycle evidence", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-zero-output-"));
+    const { workspace, commandPath, restore } = await setupExecuteEnv(root);
+    const events: Array<{ eventType: string; payload?: Record<string, unknown> }> = [];
+    await writeStallingClaudeCommand(commandPath);
+    try {
+      const result = await execute({
+        runId: "run-zero-output",
+        agent: {
+          id: "agent-zero-output",
+          companyId: "co-1",
+          name: "Zero output",
+          adapterType: "claude_local",
+          adapterConfig: { engine: "cli" },
+        },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: {
+          engine: "cli",
+          cwd: workspace,
+          timeoutSec: 1,
+          graceSec: 1,
+          promptTemplate: "Do work.",
+        },
+        context: {},
+        onLog: async () => {},
+        onEvent: async (event) => {
+          events.push(event);
+        },
+      });
+
+      expect(result).toMatchObject({
+        timedOut: true,
+        errorCode: "timeout",
+        errorFamily: "transient_upstream",
+        resultJson: { timedOutBeforeOutput: true },
+      });
+      const lifecycle = events.filter((event) => event.eventType === "adapter.process.lifecycle");
+      expect(lifecycle.map((event) => event.payload?.stage)).toEqual([
+        "spawn_attempted",
+        "spawned",
+        "timeout_signal",
+        "exit",
+        "close",
+      ]);
+      expect(lifecycle.some((event) => event.payload?.stage === "first_output")).toBe(false);
+      expect(lifecycle.every((event) => !Object.hasOwn(event.payload ?? {}, "output"))).toBe(true);
+    } finally {
+      restore();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not mark a timeout retryable after process output", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-output-timeout-"));
+    const { workspace, commandPath, restore } = await setupExecuteEnv(root);
+    await writeStallingClaudeCommand(commandPath, { emitOutput: true });
+    try {
+      const result = await execute({
+        runId: "run-output-timeout",
+        agent: {
+          id: "agent-output-timeout",
+          companyId: "co-1",
+          name: "Output timeout",
+          adapterType: "claude_local",
+          adapterConfig: { engine: "cli" },
+        },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: {
+          engine: "cli",
+          cwd: workspace,
+          timeoutSec: 1,
+          graceSec: 1,
+          promptTemplate: "Do work.",
+        },
+        context: {},
+        onLog: async () => {},
+      });
+
+      expect(result).toMatchObject({ timedOut: true, errorCode: "timeout" });
+      expect(result.errorFamily).toBeUndefined();
+      expect(result.resultJson).toBeUndefined();
+    } finally {
+      restore();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not mark a customized zero-output command retryable", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-custom-timeout-"));
+    const { workspace, commandPath, restore } = await setupExecuteEnv(root);
+    await writeStallingClaudeCommand(commandPath);
+    try {
+      const result = await execute({
+        runId: "run-custom-timeout",
+        agent: {
+          id: "agent-custom-timeout",
+          companyId: "co-1",
+          name: "Custom timeout",
+          adapterType: "claude_local",
+          adapterConfig: { engine: "cli" },
+        },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: {
+          engine: "cli",
+          command: commandPath,
+          cwd: workspace,
+          timeoutSec: 1,
+          graceSec: 1,
+          promptTemplate: "Do work.",
+        },
+        context: {},
+        onLog: async () => {},
+      });
+
+      expect(result).toMatchObject({ timedOut: true, errorCode: "timeout" });
+      expect(result.errorFamily).toBeUndefined();
+    } finally {
+      restore();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("uses a strict per-agent MCP config only when managed servers are present", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-mcp-config-"));
     const { workspace, commandPath, capturePath, restore } = await setupExecuteEnv(root);

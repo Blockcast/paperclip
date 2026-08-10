@@ -33,6 +33,7 @@ import {
   heartbeatService,
   isRetryableInteractionContinuationInfrastructureFailure,
   probeStaleKillReviewEvidence,
+  resolveAutomaticRunRetryOpts,
   shouldScheduleAutomaticRunRetry,
 } from "../services/heartbeat.js";
 
@@ -805,6 +806,66 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         },
       }),
     ).toBe(true);
+  });
+
+  it("treats explicitly transient adapter timeouts as retry-eligible", () => {
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "timeout",
+        resultJson: { errorFamily: "transient_upstream" },
+        contextSnapshot: { wakeReason: "timer" },
+      }),
+    ).toBe(true);
+
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "timeout",
+        resultJson: {},
+        contextSnapshot: { wakeReason: "timer" },
+      }),
+    ).toBe(false);
+  });
+
+  it("limits automatic timeout recovery to one scheduled retry", async () => {
+    const runId = randomUUID();
+    const now = new Date("2026-08-10T19:00:00.000Z");
+    await seedRetryFixture({
+      runId,
+      companyId: randomUUID(),
+      agentId: randomUUID(),
+      now,
+      errorCode: "timeout",
+      errorFamily: "transient_upstream",
+      adapterType: "claude_local",
+      contextSnapshot: { wakeReason: "timer" },
+    });
+
+    const retryOpts = resolveAutomaticRunRetryOpts({ errorCode: "timeout" });
+    expect(retryOpts).toEqual({ maxAttempts: 1 });
+    const scheduled = await heartbeat.scheduleBoundedRetry(runId, {
+      now,
+      random: () => 0.5,
+      ...retryOpts,
+    });
+    expect(scheduled).toMatchObject({ outcome: "scheduled", attempt: 1, maxAttempts: 1 });
+    if (scheduled.outcome !== "scheduled") return;
+
+    await db
+      .update(heartbeatRuns)
+      .set({
+        status: "timed_out",
+        errorCode: "timeout",
+        resultJson: { errorFamily: "transient_upstream" },
+      })
+      .where(eq(heartbeatRuns.id, scheduled.run.id));
+
+    await expect(
+      heartbeat.scheduleBoundedRetry(scheduled.run.id, {
+        now,
+        random: () => 0.5,
+        ...retryOpts,
+      }),
+    ).resolves.toMatchObject({ outcome: "retry_exhausted", maxAttempts: 1 });
   });
 
   it("schedules accepted interaction continuation infra retries while the issue is in_review", async () => {

@@ -1110,9 +1110,12 @@ export function selectAgedPrReviewRunForFairDispatch(
  * retry, or undefined to use the default transient-failure opts. Called only
  * when `shouldScheduleAutomaticRunRetry` already returned true.
  */
-function resolveAutomaticRunRetryOpts(
+export function resolveAutomaticRunRetryOpts(
   run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode">,
 ) {
+  if (run.errorCode === "timeout") {
+    return { maxAttempts: 1 };
+  }
   if (run.errorCode === "k8s_concurrent_run_blocked") {
     return {
       retryReason: CAPACITY_BLOCKED_HEARTBEAT_RETRY_REASON,
@@ -23537,7 +23540,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               },
             });
           }
-        } else if (outcome === "failed" && shouldScheduleAutomaticRunRetry(livenessRun)) {
+        } else if (
+          (outcome === "failed" || outcome === "timed_out") &&
+          shouldScheduleAutomaticRunRetry(livenessRun)
+        ) {
           await scheduleBoundedRetryForRun(livenessRun, agent, resolveAutomaticRunRetryOpts(livenessRun));
         }
         const issueCommentPolicyResult = await finalizeIssueCommentPolicy(livenessRun, agent);

@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
-import type { RunProcessResult } from "@paperclipai/adapter-utils/server-utils";
+import type { ProcessLifecycleEvent, RunProcessResult } from "@paperclipai/adapter-utils/server-utils";
 import {
   adapterExecutionTargetIsRemote,
   adapterExecutionTargetRemoteCwd,
@@ -87,7 +87,7 @@ import { markAccountExhausted } from "./ccrotate-state.js";
 import { readFileSync as readFileSyncNode } from "node:fs";
 import os from "node:os";
 import { buildClaudeExecutionPermissionArgs } from "./permissions.js";
-import { SANDBOX_INSTALL_COMMAND } from "../index.js";
+import { DEFAULT_CLAUDE_LOCAL_TIMEOUT_SEC, SANDBOX_INSTALL_COMMAND } from "../index.js";
 import {
   createClaudeAcpExecutor,
   formatClaudeAcpFallbackMessage,
@@ -482,10 +482,12 @@ async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<Cl
       (entry): entry is [string, string] => typeof entry[1] === "string",
     ),
   );
-  const timeoutSec = resolveAdapterExecutionTargetTimeoutSec(
-    executionTarget,
-    asNumber(config.timeoutSec, 0),
-  );
+  const configuredTimeoutSec = Object.prototype.hasOwnProperty.call(config, "timeoutSec")
+    ? asNumber(config.timeoutSec, 0)
+    : executionTargetIsRemote
+      ? 0
+      : DEFAULT_CLAUDE_LOCAL_TIMEOUT_SEC;
+  const timeoutSec = resolveAdapterExecutionTargetTimeoutSec(executionTarget, configuredTimeoutSec);
   const graceSec = asNumber(config.graceSec, 20);
   await ensureAdapterExecutionTargetRuntimeCommandInstalled({
     runId,
@@ -1059,6 +1061,35 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   };
 
   const runAttempt = async (resumeSessionId: string | null) => {
+    const attemptStartedAt = Date.now();
+    // These events describe the directly managed child. Remote transports need
+    // transport-level termination/progress proof before equivalent claims are safe.
+    const onProcessLifecycle = ctx.onEvent && !executionTargetIsRemote
+      ? async (event: ProcessLifecycleEvent) => {
+          const observedAtMs = Date.parse(event.observedAt);
+          await ctx.onEvent?.({
+            eventType: "adapter.process.lifecycle",
+            stream: "system",
+            level:
+              event.stage === "error" || event.stage === "timeout_signal" || event.stage === "kill_signal"
+                ? "warn"
+                : "info",
+            message: `claude_local process ${event.stage}`,
+            payload: {
+              stage: event.stage,
+              observedAt: event.observedAt,
+              elapsedMs: Number.isNaN(observedAtMs) ? Math.max(0, Date.now() - attemptStartedAt) : Math.max(0, observedAtMs - attemptStartedAt),
+              ...(event.pid !== undefined ? { pid: event.pid } : {}),
+              ...(event.processGroupId !== undefined ? { processGroupId: event.processGroupId } : {}),
+              ...(event.stream ? { stream: event.stream } : {}),
+              ...(event.signal !== undefined ? { signal: event.signal } : {}),
+              ...(event.exitCode !== undefined ? { exitCode: event.exitCode } : {}),
+              ...(event.errorCode !== undefined ? { errorCode: event.errorCode } : {}),
+              ...(event.timedOut !== undefined ? { timedOut: event.timedOut } : {}),
+            },
+          });
+        }
+      : undefined;
     const attemptInstructionsFilePath = resumeSessionId ? undefined : effectiveInstructionsFilePath;
     const args = buildClaudeArgs(resumeSessionId, attemptInstructionsFilePath);
     const commandNotes: string[] = [];
@@ -1101,6 +1132,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       timeoutSec,
       graceSec,
       onSpawn,
+      onLifecycle: onProcessLifecycle,
       onRuntimeProgress: ctx.onRuntimeProgress,
       onLog,
       runLogTail: paperclipBridge?.runLogTail,
@@ -1138,12 +1170,24 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         : undefined;
 
     if (proc.timedOut) {
+      const timedOutBeforeOutput =
+        !executionTargetIsRemote &&
+        command === "claude" &&
+        extraArgs.length === 0 &&
+        proc.stdout.length === 0 &&
+        proc.stderr.length === 0;
       return {
         exitCode: proc.exitCode,
         signal: proc.signal,
         timedOut: true,
         errorMessage: `Timed out after ${timeoutSec}s`,
         errorCode: "timeout",
+        ...(timedOutBeforeOutput
+          ? {
+              errorFamily: "transient_upstream" as const,
+              resultJson: { timedOutBeforeOutput: true },
+            }
+          : {}),
         errorMeta,
         clearSession: Boolean(opts.clearSessionOnMissingSession),
       };

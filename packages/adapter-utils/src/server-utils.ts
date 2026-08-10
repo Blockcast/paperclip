@@ -26,6 +26,26 @@ export interface RunProcessResult {
   terminalResultCleanup?: TerminalResultCleanupEvidence | null;
 }
 
+export interface ProcessLifecycleEvent {
+  stage:
+    | "spawn_attempted"
+    | "spawned"
+    | "error"
+    | "first_output"
+    | "timeout_signal"
+    | "kill_signal"
+    | "exit"
+    | "close";
+  observedAt: string;
+  pid?: number;
+  processGroupId?: number | null;
+  stream?: "stdout" | "stderr";
+  signal?: NodeJS.Signals | null;
+  exitCode?: number | null;
+  errorCode?: string | null;
+  timedOut?: boolean;
+}
+
 export interface TerminalResultCleanupOptions {
   hasTerminalResult: (output: { stdout: string; stderr: string }) => boolean;
   graceMs?: number;
@@ -62,6 +82,7 @@ interface SpawnTarget {
 type RemoteExecutionSpec = SshRemoteExecutionSpec;
 
 type ChildProcessWithEvents = ChildProcess & {
+  on(event: "spawn", listener: () => void): ChildProcess;
   on(event: "error", listener: (err: Error) => void): ChildProcess;
   on(
     event: "exit",
@@ -3045,6 +3066,7 @@ export async function runChildProcess(
     onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
     onLogError?: (err: unknown, runId: string, message: string) => void;
     onSpawn?: (meta: { pid: number; processGroupId: number | null; startedAt: string }) => Promise<void>;
+    onLifecycle?: (event: ProcessLifecycleEvent) => Promise<void>;
     terminalResultCleanup?: TerminalResultCleanupOptions;
     stdin?: string;
     remoteExecution?: RemoteExecutionSpec | null;
@@ -3083,6 +3105,14 @@ export async function runChildProcess(
       localProcessSandbox: opts.localProcessSandbox ?? null,
     })
       .then((target) => {
+        let lifecycleChain: Promise<void> = Promise.resolve();
+        const emitLifecycle = (event: ProcessLifecycleEvent) => {
+          if (!opts.onLifecycle) return;
+          lifecycleChain = lifecycleChain
+            .then(() => opts.onLifecycle?.(event))
+            .catch((err) => onLogError(err, runId, "failed to record child process lifecycle"));
+        };
+        emitLifecycle({ stage: "spawn_attempted", observedAt: new Date().toISOString() });
         const childEnv = { ...mergedEnv, ...target.env };
         for (const [key, value] of Object.entries(childEnv)) {
           if (value === undefined) delete childEnv[key];
@@ -3096,7 +3126,6 @@ export async function runChildProcess(
         }) as ChildProcessWithEvents;
         const startedAt = new Date().toISOString();
         const processGroupId = resolveProcessGroupId(child);
-
         const spawnPersistPromise =
           typeof child.pid === "number" && child.pid > 0 && opts.onSpawn
             ? opts.onSpawn({ pid: child.pid, processGroupId, startedAt }).catch((err) => {
@@ -3116,8 +3145,12 @@ export async function runChildProcess(
         let terminalCleanupForceKilled = false;
         let terminalCleanupTimer: NodeJS.Timeout | null = null;
         let terminalCleanupKillTimer: NodeJS.Timeout | null = null;
+        let timeoutKillTimer: NodeJS.Timeout | null = null;
         let terminalResultStdoutScanOffset = 0;
         let terminalResultStderrScanOffset = 0;
+        let firstStdoutSeen = false;
+        let firstStderrSeen = false;
+        let childError: Error | null = null;
 
         const clearTerminalCleanupTimers = () => {
           if (terminalCleanupTimer) clearTimeout(terminalCleanupTimer);
@@ -3169,8 +3202,19 @@ export async function runChildProcess(
             ? setTimeout(() => {
                 timedOut = true;
                 clearTerminalCleanupTimers();
+                emitLifecycle({
+                  stage: "timeout_signal",
+                  observedAt: new Date().toISOString(),
+                  signal: "SIGTERM",
+                });
                 signalRunningProcess({ child, processGroupId }, "SIGTERM");
-                setTimeout(() => {
+                timeoutKillTimer = setTimeout(() => {
+                  timeoutKillTimer = null;
+                  emitLifecycle({
+                    stage: "kill_signal",
+                    observedAt: new Date().toISOString(),
+                    signal: "SIGKILL",
+                  });
                   signalRunningProcess({ child, processGroupId }, "SIGKILL");
                 }, Math.max(1, opts.graceSec) * 1000);
               }, opts.timeoutSec * 1000)
@@ -3181,6 +3225,14 @@ export async function runChildProcess(
           if (!readable) return;
           readable.pause();
           const text = String(chunk);
+          if (!firstStdoutSeen && text.length > 0) {
+            firstStdoutSeen = true;
+            emitLifecycle({
+              stage: "first_output",
+              observedAt: new Date().toISOString(),
+              stream: "stdout",
+            });
+          }
           stdout = appendWithCap(stdout, text);
           maybeArmTerminalResultCleanup();
           logChain = logChain
@@ -3197,6 +3249,14 @@ export async function runChildProcess(
           if (!readable) return;
           readable.pause();
           const text = String(chunk);
+          if (!firstStderrSeen && text.length > 0) {
+            firstStderrSeen = true;
+            emitLifecycle({
+              stage: "first_output",
+              observedAt: new Date().toISOString(),
+              stream: "stderr",
+            });
+          }
           stderr = appendWithCap(stderr, text);
           maybeArmTerminalResultCleanup();
           logChain = logChain
@@ -3226,29 +3286,62 @@ export async function runChildProcess(
           });
         }
 
+        child.on("spawn", () => {
+          if (typeof child.pid !== "number" || child.pid <= 0) return;
+          emitLifecycle({
+            stage: "spawned",
+            observedAt: new Date().toISOString(),
+            pid: child.pid,
+            processGroupId,
+          });
+        });
+
         child.on("error", (err: Error) => {
+          childError = err;
           if (timeout) clearTimeout(timeout);
+          if (timeoutKillTimer) clearTimeout(timeoutKillTimer);
           clearTerminalCleanupTimers();
           runningProcesses.delete(runId);
           void target.cleanup?.();
           const errno = (err as NodeJS.ErrnoException).code;
+          emitLifecycle({
+            stage: "error",
+            observedAt: new Date().toISOString(),
+            errorCode: errno ?? null,
+          });
           const pathValue = mergedEnv.PATH ?? mergedEnv.Path ?? "";
           const msg =
             errno === "ENOENT"
               ? `Failed to start command "${command}" in "${opts.cwd}". Verify adapter command, working directory, and PATH (${pathValue}).`
               : `Failed to start command "${command}" in "${opts.cwd}": ${err.message}`;
-          reject(new Error(msg));
+          void lifecycleChain.finally(() => reject(new Error(msg)));
         });
 
-        child.on("exit", () => {
+        child.on("exit", (code, signal) => {
+          emitLifecycle({
+            stage: "exit",
+            observedAt: new Date().toISOString(),
+            exitCode: code,
+            signal,
+            timedOut,
+          });
           maybeArmTerminalResultCleanup();
         });
 
         child.on("close", (code: number | null, signal: NodeJS.Signals | null) => {
           if (timeout) clearTimeout(timeout);
+          if (timeoutKillTimer) clearTimeout(timeoutKillTimer);
           clearTerminalCleanupTimers();
           runningProcesses.delete(runId);
-          void logChain.finally(() => {
+          if (childError) return;
+          emitLifecycle({
+            stage: "close",
+            observedAt: new Date().toISOString(),
+            exitCode: code,
+            signal,
+            timedOut,
+          });
+          void Promise.allSettled([logChain, lifecycleChain]).finally(() => {
             void Promise.resolve()
               .then(() => target.cleanup?.())
               .finally(() => {
