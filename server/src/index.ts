@@ -56,6 +56,7 @@ import {
   toolAccessService,
 } from "./services/index.js";
 import { resolveWorktreeRunExecutionActivationState } from "./services/instance-settings.js";
+import { collectDueExecutionWorkspaces } from "./services/execution-workspace-cleanup.js";
 import {
   parseAdapterRegistryEnv,
   reconcileAdapterAvailability,
@@ -1220,6 +1221,15 @@ export async function startServer(): Promise<StartedServer> {
           logger.error({ err }, "startup stale-lock sweeper failed");
         }
 
+        try {
+          const swept = await collectDueExecutionWorkspaces({ db });
+          if (swept.claimed > 0 || swept.failed > 0) {
+            logger.warn({ ...swept }, "startup execution-workspace cleanup sweep processed due workspaces");
+          }
+        } catch (err) {
+          logger.error({ err }, "startup execution-workspace cleanup sweep failed");
+        }
+
         // BLO-21621: terminalize queued runs whose issue lock has already
         // moved on or gone empty, so a detached run cannot sit invisible to
         // every other recovery sweep indefinitely.
@@ -1320,6 +1330,16 @@ export async function startServer(): Promise<StartedServer> {
             "heartbeat runtime-status sweeper cleared expired entries",
           );
         }
+
+        trackHeartbeatSchedulerWork(collectDueExecutionWorkspaces({ db })
+          .then((swept) => {
+            if (swept.claimed > 0 || swept.failed > 0) {
+              logger.warn({ ...swept }, "periodic execution-workspace cleanup sweep processed due workspaces");
+            }
+          })
+          .catch((err) => {
+            logger.error({ err }, "periodic execution-workspace cleanup sweep failed");
+          }));
 
         if (!(await heartbeat.resolveSchedulingSuppression()).suppressed) {
           trackHeartbeatSchedulerWork(heartbeat

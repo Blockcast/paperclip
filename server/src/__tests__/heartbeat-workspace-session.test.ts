@@ -2072,6 +2072,8 @@ describe("effective run execution workspace config freshness", () => {
 
   it.each([
     { name: "missing", status: null },
+    { name: "pending cleanup", status: "cleanup_pending" },
+    { name: "failed cleanup", status: "cleanup_failed" },
     { name: "archived", status: "archived" },
   ])("fails loudly when the inherited workspace row is $name", async ({ status }) => {
     const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({
