@@ -8858,6 +8858,17 @@ export function issueService(db: Db) {
         expectedCurrentExecutionPolicy?: Record<string, unknown> | null;
       },
       dbOrTx: any = db,
+      // BLO-18643 follow-up: an optional compare-and-swap guard on the write itself.
+      // A caller that read the row earlier (e.g. under an advisory lock, in a separate
+      // statement or transaction) and validated its status before deciding to mutate
+      // has no guarantee that status is still current by the time this runs -- any
+      // non-lock-holding writer (a human reviewer's PATCH, a different code path) can
+      // land in between. `expectedStatus` and `expectedUpdatedAt` fold those checks
+      // into the UPDATE's WHERE clause so the write is atomic: if the row's status or
+      // freshness marker has moved on, zero rows match, the update is a no-op, and this
+      // returns null exactly like "row missing" does today -- instead of
+      // unconditionally overwriting whatever the row now says.
+      options?: { expectedStatus?: string[]; expectedUpdatedAt?: Date | string },
     ) => {
       const existing = await dbOrTx
         .select()
@@ -9326,7 +9337,7 @@ export function issueService(db: Db) {
             );
           }
         }
-        const writePreconditions = [
+        const conflictPreconditions = [
           ...(expectedCurrentStatus === undefined ? [] : [eq(issues.status, expectedCurrentStatus)]),
           ...(expectedCurrentAssigneeAgentId === undefined
             ? []
@@ -9374,6 +9385,40 @@ export function issueService(db: Db) {
             throw unprocessable("Issue is blocked by unresolved blockers", { unresolvedBlockerIssueIds });
           }
         }
+        const casPreconditions = options?.expectedStatus?.length
+          ? [inArray(issues.status, options.expectedStatus)]
+          : [];
+        if (options?.expectedUpdatedAt instanceof Date) {
+          // BLO-18829: compare over a half-open millisecond window, NOT with a bare
+          // `eq`. `issues.updated_at` is `timestamp with time zone`, which Postgres
+          // stores at microsecond precision, but a JS `Date` holds only milliseconds --
+          // so a Date obtained by reading this column is a *truncation* of the value on
+          // disk, and `eq(updatedAt, thatDate)` is unsatisfiable for every row still
+          // holding a `defaultNow()`/`now()` value. Left as `eq`, this branch is a
+          // permanently-closed guard: in `escalateStrandedAssignedIssue` a CAS miss
+          // throws the rollback sentinel, so the whole escalation transaction reverts
+          // and stranded issues silently stop escalating (no recovery action, no
+          // monitor, no owner wake) -- the under-escalation outcome AC-3 forbids.
+          //
+          // Prefer the string-token form below, which is exact. This branch exists for
+          // callers that only hold a Date and accepts 1ms granularity as the cost.
+          //
+          // Expressed with drizzle's typed timestamp operators rather than
+          // `date_trunc('milliseconds', ...) = $1`, because a raw `sql` fragment loses
+          // the column type and postgres.js then refuses to bind a JS Date ("must be of
+          // type string or Buffer, received Date"). Also index-friendly.
+          casPreconditions.push(
+            gte(issues.updatedAt, options.expectedUpdatedAt),
+            lt(issues.updatedAt, new Date(options.expectedUpdatedAt.getTime() + 1)),
+          );
+        } else if (typeof options?.expectedUpdatedAt === "string") {
+          // Raw database token, used when the caller must preserve Postgres
+          // microseconds that a JavaScript Date would truncate. Exact -- this is the
+          // form `escalateStrandedAssignedIssue` uses, pairing with a
+          // `${issues.updatedAt}::text` projection on the read side.
+          casPreconditions.push(sql`${issues.updatedAt}::text = ${options.expectedUpdatedAt}`);
+        }
+        const writePreconditions = [...conflictPreconditions, ...casPreconditions];
         const updated = await tx
           .update(issues)
           .set(patch)
@@ -9389,7 +9434,7 @@ export function issueService(db: Db) {
           // changed an authorization-relevant field after the snapshot check
           // above — the precondition genuinely failed, so surface 409 rather
           // than the 404 that a bare `return null` would produce.
-          if (writePreconditions.length > 0) {
+          if (conflictPreconditions.length > 0) {
             throw conflict("Issue changed before the update could be applied", {
               issueId: id,
               ...(expectedCurrentStatus === undefined ? {} : { expectedStatus: expectedCurrentStatus }),

@@ -1321,7 +1321,14 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         .where(eq(agentWakeupRequests.agentId, input.agentId));
       return wakeups.find((wakeup) => {
         const payload = wakeup.payload as Record<string, unknown> | null;
-        return payload?.issueId === input.issueId &&
+        // BLO-18829: require `runId`. The escalation writes a durable wake-outbox
+        // marker inside its transaction and only dispatches the real wake AFTER
+        // commit, so between those two points a payload-identical row exists with
+        // no run attached. Without this guard the poll latches onto that marker the
+        // instant it appears and returns a wake that was merely *owed*, making the
+        // `contextSnapshot` assertion below dereference a run that does not exist.
+        return wakeup.runId !== null &&
+          payload?.issueId === input.issueId &&
           payload?.sourceIssueId === input.issueId &&
           payload?.strandedRunId === input.runId &&
           payload?.recoveryActionId === action.id;
@@ -5457,7 +5464,94 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   );
 
   it(
-    "BLO-18669: a genuine review-park failure still escalates to blocked",
+    "BLO-18829: a non-evidence-gate fault in the review-waiting park is contained per-issue -- the " +
+      "sweep survives, the issue's status is untouched, and it is not escalated on the fault",
+    async () => {
+      const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+        status: "in_progress",
+        runStatus: "cancelled",
+        retryReason: "issue_continuation_needed",
+        runErrorCode: "issue_continuation_waiting_on_review",
+        runError: "Continuation parked: issue is waiting on review/approval",
+      });
+
+      // Same fired-but-unrescheduled monitor shape as the BLO-18643 test above, so this
+      // candidate reaches parkReviewWaitingContinuationIssue's own db.transaction().
+      await db
+        .update(issues)
+        .set({
+          monitorNextCheckAt: null,
+          monitorLastTriggeredAt: new Date("2026-07-29T03:52:37.000Z"),
+          monitorAttemptCount: 1,
+          monitorScheduledBy: "assignee",
+        })
+        .where(eq(issues.id, issueId));
+
+      // The park paths now rethrow anything that is not the evidence gate, rather than
+      // relabelling it "nothing to review" and escalating on that basis. Inject exactly
+      // that class of fault -- a plain non-HttpError, standing in for a programming error
+      // or an unrelated service fault -- on the first transaction the pass opens, using
+      // the same seam as the cycle-fault test above.
+      const transactionSpy = vi.spyOn(db, "transaction");
+      let faultThrown = false;
+      transactionSpy.mockImplementationOnce(async () => {
+        faultThrown = true;
+        throw new Error("synthetic non-evidence-gate fault inside the review-waiting park");
+      });
+
+      heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+      let result: Awaited<ReturnType<typeof heartbeat.reconcileStrandedAssignedIssues>>;
+      try {
+        // The whole point: this must RESOLVE. Before the runParkAttempt boundary the
+        // fault propagated out of here and aborted recovery for every remaining
+        // candidate in the company, not just this one.
+        result = await heartbeat.reconcileStrandedAssignedIssues();
+      } finally {
+        transactionSpy.mockRestore();
+      }
+
+      expect(faultThrown).toBe(true);
+      expect(result.parkFaulted).toBe(1);
+      expect(result.reviewWaitingParked).toBe(0);
+      // Not escalated: reporting a fault as "stranded and unreviewable" is the lie the
+      // rethrow exists to remove, so a faulted candidate is left for the next pass.
+      expect(result.escalated).toBe(0);
+      expect(result.issueIds).not.toContain(issueId);
+
+      const untouched = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0] ?? null);
+      expect(untouched?.status).toBe("in_progress");
+      expect(untouched?.assigneeAgentId).toBe(agentId);
+      await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual([]);
+
+      const recoveryActions = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)));
+      expect(recoveryActions).toHaveLength(0);
+
+      // The next sweep pass, with no injected fault, still parks it normally -- the
+      // boundary skips the candidate, it does not poison it.
+      const recovered = await heartbeat.reconcileStrandedAssignedIssues();
+      expect(recovered.parkFaulted).toBe(0);
+      expect(recovered.reviewWaitingParked).toBe(1);
+      expect(recovered.escalated).toBe(0);
+
+      const parked = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0] ?? null);
+      expect(parked?.status).toBe("in_review");
+    },
+  );
+
+  it(
+    "BLO-18614/BLO-18643: a genuine review-park failure (evidence gate rejects in_review) still " +
+      "escalates to blocked instead of being silently skipped",
     async () => {
       const { companyId, issueId } = await seedStrandedIssueFixture({
         status: "in_progress",
@@ -5467,9 +5561,13 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         runError: "Continuation parked: issue is waiting on review/approval",
       });
 
-      // The "pr" evidence shape requires a PR link. Leaving it absent makes the
-      // `in_review` transition throw from the evidence gate; this is a true
-      // park failure, not the already-parked race.
+      // Label the issue "pr" (DEFAULT_EVIDENCE_REGISTRY requires "pr-link" for that
+      // label) and leave it with no PR-link evidence, so the in_review transition's
+      // evidence gate returns verdict "block" (unlabeledFallback is false because the
+      // label matched a registry entry) and issuesSvc.update throws `unprocessable`
+      // inside parkNoDependencyReviewWaitingIssue. This is a genuine park failure, not
+      // a race with an earlier successful park -- distinct from the BLO-18643 case
+      // above where `fresh.status !== "in_progress"` because someone already parked it.
       const labelId = randomUUID();
       await db.insert(labels).values({ id: labelId, companyId, name: "pr", color: "#000000" });
       await db.insert(issueLabels).values({ issueId, labelId, companyId });
@@ -5489,6 +5587,106 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         .from(issueRecoveryActions)
         .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)));
       expect(recoveryActions).toHaveLength(1);
+    },
+  );
+
+  it(
+    "BLO-18760: a triggered-monitor park rejected by the evidence gate escalates that issue and " +
+      "lets the rest of the sweep finish",
+    async () => {
+      // The combination the two tests above miss. BLO-18643 taught hasActiveMonitorPath
+      // to treat a fired-but-unrescheduled monitor as active, which routes issues into
+      // parkReviewWaitingContinuationIssue -- and that park's in_review update was not
+      // guarded against evidence-gate rejection the way the no-dependency park is. So a
+      // `pr`-labelled issue with no PR link threw `unprocessable` straight out of
+      // db.transaction and out of the per-issue loop, aborting the entire sweep: this
+      // issue never escalated AND every issue behind it went unreconciled.
+      const failing = await seedStrandedIssueFixture({
+        status: "in_progress",
+        runStatus: "cancelled",
+        retryReason: "issue_continuation_needed",
+        runErrorCode: "issue_continuation_waiting_on_review",
+        runError: "Continuation parked: issue is waiting on review/approval",
+      });
+
+      // Fired, never rescheduled -> hasActiveMonitorPath returns true.
+      await db
+        .update(issues)
+        .set({
+          monitorNextCheckAt: null,
+          monitorLastTriggeredAt: new Date("2026-07-29T03:52:37.000Z"),
+          monitorAttemptCount: 1,
+          monitorScheduledBy: "assignee",
+          monitorNotes: "PR #811: watching for CI green + review decision.",
+        })
+        .where(eq(issues.id, failing.issueId));
+
+      // ...and no reviewable evidence, so the in_review transition is rejected.
+      const labelId = randomUUID();
+      await db.insert(labels).values({
+        id: labelId,
+        companyId: failing.companyId,
+        name: "pr",
+        color: "#000000",
+      });
+      await db.insert(issueLabels).values({
+        issueId: failing.issueId,
+        labelId,
+        companyId: failing.companyId,
+      });
+
+      // A second, independent stranded issue (own company) that parks cleanly. It is the
+      // canary for "the sweep kept going": the sweep is global and its per-issue order is
+      // not fixed, but an uncaught throw kills the whole call either way, so asserting
+      // BOTH issues reached their correct terminal state is order-independent.
+      const healthy = await seedStrandedIssueFixture({
+        status: "in_progress",
+        runStatus: "cancelled",
+        retryReason: "issue_continuation_needed",
+        runErrorCode: "issue_continuation_waiting_on_review",
+        runError: "Continuation parked: issue is waiting on review/approval",
+      });
+      await db
+        .update(issues)
+        .set({
+          monitorNextCheckAt: null,
+          monitorLastTriggeredAt: new Date("2026-07-29T03:52:37.000Z"),
+          monitorAttemptCount: 1,
+          monitorScheduledBy: "assignee",
+          monitorNotes: "PR #812: watching for CI green + review decision.",
+        })
+        .where(eq(issues.id, healthy.issueId));
+
+      heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+
+      const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+      // The un-reviewable issue degraded to `blocked` instead of being counted a skip.
+      expect(result.escalated).toBe(1);
+      const escalated = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, failing.issueId))
+        .then((rows) => rows[0] ?? null);
+      expect(escalated?.status).toBe("blocked");
+      const failingActions = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(and(
+          eq(issueRecoveryActions.companyId, failing.companyId),
+          eq(issueRecoveryActions.sourceIssueId, failing.issueId),
+        ));
+      expect(failingActions).toHaveLength(1);
+
+      // The canary was still reconciled in the same pass.
+      expect(result.reviewWaitingParked).toBe(1);
+      const parked = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, healthy.issueId))
+        .then((rows) => rows[0] ?? null);
+      expect(parked?.status).toBe("in_review");
+      expect(result.issueIds).toEqual(expect.arrayContaining([failing.issueId, healthy.issueId]));
     },
   );
 
@@ -8520,6 +8718,26 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       Array.from({ length: 8 }, () => heartbeat.reconcileStrandedAssignedIssues()),
     );
     expect(results.every((result) => result.status === "fulfilled")).toBe(true);
+    // BLO-18829: count the sweeps that actually escalated rather than assuming all 8
+    // do. Escalation is now one advisory-lock-serialized transaction, so it takes
+    // long enough that the later sweeps run their candidate query after the issue is
+    // already `blocked` -- and a `blocked` issue is not a stranded candidate, so those
+    // sweeps legitimately no-op instead of racing. How many win that race is a timing
+    // artifact of sweep scheduling, not a property worth pinning.
+    //
+    // The property that IS worth pinning is the one this test is named for, and
+    // asserting equality against the observed escalation count states it far more
+    // precisely than the old hard-coded `8` ever did: every escalation that ran
+    // bumped the SAME action exactly once -- no duplicate action, no lost or
+    // double-counted attempt. Probed on the failing head: escalations, sweeps that
+    // saw the issue, and attemptCount all agreed at 6, i.e. nothing was being lost;
+    // the literal `8` was simply describing scheduling luck on the old, faster,
+    // non-atomic path.
+    const escalatedTotal = results.reduce(
+      (sum, result) => sum + (result.status === "fulfilled" ? result.value.escalated : 0),
+      0,
+    );
+    expect(escalatedTotal).toBeGreaterThan(0);
 
     const actions = await db
       .select()
@@ -8530,7 +8748,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         eq(issueRecoveryActions.status, "active"),
       ));
     expect(actions).toHaveLength(1);
-    expect(actions[0]?.attemptCount).toBe(8);
+    expect(actions[0]?.attemptCount).toBe(escalatedTotal);
     await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual([]);
   });
 
