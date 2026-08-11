@@ -282,6 +282,7 @@ import {
   setAgentWakeupTerminalFailedOldestAgeSeconds,
   terminalFailedWakeScopeForTaskKey,
   setExternalLifecycleRunningRuns,
+  recordExternalLifecycleRunSilenceGap,
 } from "./metrics.js";
 import { runQuotaExhaustedHook } from "./quota-exhausted-hook.js";
 import { runLifecycleHook } from "./lifecycle-hook.js";
@@ -16909,6 +16910,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (!finalizedRun) finalizedRun = await getRun(input.run.id);
     if (!finalizedRun) return true;
 
+    // BLO-20815: additive-only telemetry, no behavioral effect. Uses the same
+    // signal precedence as the dispatcher's own staleness filter (see
+    // startNextQueuedRunForAgent below) so the metric measures exactly what
+    // EXTERNAL_LIFECYCLE_STALE_MS/EXTERNAL_LIFECYCLE_HARD_STALE_MS key on.
+    recordExternalLifecycleRunSilenceGap({
+      adapter: input.adapterType,
+      status: terminalOutcome.status,
+      run: finalizedRun,
+      finalizedAt: input.now,
+    });
+
     finalizedRun = await classifyAndPersistRunLiveness(finalizedRun, resultJson) ?? finalizedRun;
 
     // BLO-10448: job_missing (and any other automatically-retryable terminal
@@ -24306,8 +24318,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * escalation then moves the issue to `blocked` while its replacement is
    * already pending, which is exactly the strand this path exists to prevent.
    *
-   * Mirrors `hasQueuedIssueWake` in recovery/service.ts. Callers MUST evaluate
-   * this last in their condition chain so the query stays off the hot path.
+   * A materialized run is an executable replacement when it matches the issue,
+   * participant, and active stage. A bare wake is only sufficient when it is the
+   * dedicated participant-recovery wake with those same exact coordinates.
+   * Callers MUST evaluate this last in their condition chain so the queries stay
+   * off the hot path.
    */
   async function hasQueuedReplacementIssueWake(
     dbOrTx: typeof db | Parameters<Parameters<typeof db.transaction>[0]>[0],
@@ -24316,6 +24331,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     participantAgentId: string,
     stageId: string,
   ) {
+    const replacementRun = await dbOrTx
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, companyId),
+          eq(heartbeatRuns.agentId, participantAgentId),
+          inArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES]),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+          sql`coalesce(
+            ${heartbeatRuns.contextSnapshot} -> 'executionStage' ->> 'stageId',
+            ${heartbeatRuns.contextSnapshot} ->> 'currentStageId'
+          ) = ${stageId}`,
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (replacementRun) return true;
+
     return dbOrTx
       .select({ id: agentWakeupRequests.id })
       .from(agentWakeupRequests)
@@ -28376,6 +28410,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ...(options.eventPayload ? { payload: options.eventPayload } : {}),
       });
       await releaseIssueExecutionAndPromote(cancelled);
+      if (agent && hasExternalLifecycle(agent.adapterType)) {
+        // BLO-20815: additive-only telemetry (see finalizeExternalLifecycleTerminalRun).
+        recordExternalLifecycleRunSilenceGap({
+          adapter: agent.adapterType,
+          status: "cancelled",
+          run: cancelled,
+          finalizedAt: finishedAt,
+        });
+      }
     }
 
     // RCA 2026-05-06: external-lifecycle adapters (claude_k8s, opencode_k8s)
@@ -28414,8 +28457,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .where(and(eq(heartbeatRuns.agentId, agentId), inArray(heartbeatRuns.status, [...CANCELLABLE_HEARTBEAT_RUN_STATUSES])));
 
     for (const run of runs) {
+      const finishedAt = new Date();
       await setRunStatus(run.id, "cancelled", {
-        finishedAt: new Date(),
+        finishedAt,
         error: reason,
         errorCode,
         ...(agent ? {
@@ -28428,9 +28472,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
 
       await setWakeupStatus(run.wakeupRequestId, "cancelled", {
-        finishedAt: new Date(),
+        finishedAt,
         error: reason,
       });
+
+      if (agent && hasExternalLifecycle(agent.adapterType)) {
+        // BLO-20815: additive-only telemetry (see finalizeExternalLifecycleTerminalRun).
+        recordExternalLifecycleRunSilenceGap({
+          adapter: agent.adapterType,
+          status: "cancelled",
+          run,
+          finalizedAt: finishedAt,
+        });
+      }
 
       const running = runningProcesses.get(run.id);
       if (running) {
