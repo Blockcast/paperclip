@@ -479,11 +479,15 @@ export function loadConfig(): Config {
     heartbeatSchedulerIntervalMs: Math.max(10000, Number(process.env.HEARTBEAT_SCHEDULER_INTERVAL_MS) || 30000),
     recoveryActionMaxAttempts: Math.max(
       1,
-      Number(process.env.RECOVERY_ACTION_MAX_ATTEMPTS) || 6,
+      // Preserve the existing wake-owner budget unless an operator explicitly
+      // opts into a new bound through the configurable setting.
+      Number(process.env.RECOVERY_ACTION_MAX_ATTEMPTS) || 5,
     ),
     recoveryActionTimeoutMs: Math.max(
       60 * 60_000,
-      Number(process.env.RECOVERY_ACTION_TIMEOUT_MS) || 72 * 60 * 60_000,
+      // Preserve the existing six-hour horizon for deployments that do not
+      // supply an override.
+      Number(process.env.RECOVERY_ACTION_TIMEOUT_MS) || 6 * 60 * 60_000,
     ),
     paperclipNodeRole,
     paperclipWorkersInternalUrl:
