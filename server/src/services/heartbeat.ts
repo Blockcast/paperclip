@@ -3790,7 +3790,14 @@ const TRANSIENT_UPSTREAM_STATUS_CODES = new Set(["503", "529"]);
 // set: its pattern is anchored at the start of the string and matches a
 // structured `{"code":"allocation_missing"}` payload, which prose quoting the
 // literal cannot satisfy.
-const TRANSIENT_UPSTREAM_TEXT_KEYS = ["message", "error"] as const;
+//
+// BLO-24490: this is now ONE definition rather than two identical ones. The
+// provider-capacity horizon reader draws the same line for the same reason, and
+// two copies of "which fields can the model author" is exactly the kind of pair
+// that drifts apart silently. A future divergence should be a deliberate act
+// with its own comment, not the default outcome of editing one copy.
+const MODEL_UNAUTHORED_RESULT_JSON_TEXT_KEYS = ["message", "error"] as const;
+const TRANSIENT_UPSTREAM_TEXT_KEYS = MODEL_UNAUTHORED_RESULT_JSON_TEXT_KEYS;
 const TRANSIENT_UPSTREAM_TEXT_PATTERNS = [
   /API Error:\s*(?:503|529)\b/i,
   /service\s+(?:is\s+)?(?:temporarily\s+)?unavailable/i,
@@ -4022,29 +4029,40 @@ const PROVIDER_CAPACITY_RESET_PROVENANCE_SOURCE = "server_parse_provider_capacit
 // status quo — a permanent strand inside 18 minutes — does not.
 export type ProviderCapacityHorizon =
   | { kind: "none" }
-  | { kind: "usable"; at: Date }
+  | { kind: "usable"; at: Date; machineAuthored: boolean }
   | { kind: "over_horizon"; advertisedAt: Date; parkAt: Date };
 
-// Which fields may push a run into the 24h over-cap park, and which may only
-// confirm an instant we were already willing to honor.
+// Which fields the model can author, and therefore which readings need
+// corroboration before they may sideline an issue.
 //
-// `message` / `error` are populated by the SDK and the adapters; `result` and
-// `summary` are model-authored (claude-local's parse.ts assigns the SDK final
-// result event verbatim, so `resultJson.result` is the agent's own prose and
-// `summary` is derived from it). That is the same split
-// TRANSIENT_UPSTREAM_TEXT_KEYS already draws for the hint-less classifier, and
-// for the same reason.
+// `message` / `error` are populated by the SDK and the adapters. `result` and
+// `summary` are model-authored on a clean run — claude-local's parse.ts assigns
+// the SDK final-result event verbatim, so `resultJson.result` is the agent's own
+// prose and `summary` derives from it. Same split, same reason, as
+// TRANSIENT_UPSTREAM_TEXT_KEYS, and now literally the same constant.
 //
-// The asymmetry below is deliberate. A `usable` reading parks on an instant
-// inside a window we are willing to honor anyway, and which fields may supply
-// one was settled — and pinned by test — in BLO-18278. An `over_horizon`
-// reading is a much stronger claim: it sidelines the issue for a full 24h on
-// the strength of a figure we have explicitly decided not to trust. Model prose
-// must not be able to make that claim. Without this, a genuine structured 429
-// arriving alongside prose that merely *quotes* some unrelated far-future reset
-// ("the gateway said capacity resets 2031-01-01") satisfies the over-cap gate
-// and parks the issue for a day.
-const PROVIDER_CAPACITY_MACHINE_AUTHORED_TEXT_KEYS = ["message", "error"] as const;
+// BLO-24490: `result` is nonetheless kept as a *candidate*, because it is
+// dual-provenance rather than simply untrusted. When the SDK terminates on an
+// API error it puts the API error text into `result` — see the real Penstock
+// capacity payload pinned at claude-local/src/server/parse.test.ts:482
+// (`{ is_error: true, result: "API Error: Request rejected (429) · …capacity may
+// reset at …" }`). Dropping `result` outright would delete our only reader of
+// that surface on any adapter that funnels the fault there without also setting
+// `errorMessage`, re-opening the BLO-18278 strand. So provenance gates trust,
+// not readership.
+//
+// Both park paths are gated the same way, and that symmetry is the point of
+// BLO-24490. An `over_horizon` reading refuses model prose outright: it is a
+// claim we have already decided not to believe on its face, so nothing the model
+// writes may make it. A `usable` reading from model prose is admitted only with
+// the same observed-429 corroboration the over-cap and structured paths require.
+// Without that, a run could be sidelined for up to 24h — the same harm the
+// over-cap gate exists to prevent — by prose that merely *quotes* an unrelated
+// reset ("the gateway said capacity resets tomorrow"). The previous asymmetry
+// left the weakest signal the least gated: the adapter-parsed structured
+// `retryNotBefore`, the most trustworthy input in this path, needed a 429 while
+// model prose needed nothing.
+const PROVIDER_CAPACITY_MACHINE_AUTHORED_TEXT_KEYS = MODEL_UNAUTHORED_RESULT_JSON_TEXT_KEYS;
 const PROVIDER_CAPACITY_HORIZON_TEXT_KEYS = ["result", "message", "error", "summary"] as const;
 
 export function resolveProviderCapacityHorizon(
@@ -4052,8 +4070,9 @@ export function resolveProviderCapacityHorizon(
   now = Date.now(),
 ): ProviderCapacityHorizon {
   const resultJson = input.resultJson ?? null;
-  // `machineAuthored` gates the over-cap park only. Iteration order is
-  // unchanged from the usable-path behavior BLO-18278 shipped.
+  // `machineAuthored` is reported on the result, not applied here: this function
+  // answers "what horizon does this text state, and who wrote it", and the call
+  // site decides what that earns. Iteration order is unchanged from BLO-18278.
   const candidates: { text: unknown; machineAuthored: boolean }[] = [
     { text: input.errorMessage, machineAuthored: true },
   ];
@@ -4079,6 +4098,20 @@ export function resolveProviderCapacityHorizon(
     };
   };
 
+  // BLO-24490: candidate order is errorMessage → result → message → error →
+  // summary, so `result` is reached before the two machine-authored resultJson
+  // fields. Returning on the first usable hit would hand a payload carrying both
+  // model prose and genuine provider text the *model's* horizon, and then make
+  // it earn a 429 the machine-authored one would not have needed. A
+  // machine-authored reading therefore wins outright; a model-authored one is
+  // remembered the same way an over-cap reading already is.
+  let modelAuthoredUsable: { kind: "usable"; at: Date; machineAuthored: false } | null = null;
+  const noteUsable = (atMs: number, machineAuthored: boolean): ProviderCapacityHorizon | null => {
+    if (machineAuthored) return { kind: "usable", at: new Date(atMs), machineAuthored: true };
+    modelAuthoredUsable ??= { kind: "usable", at: new Date(atMs), machineAuthored: false };
+    return null;
+  };
+
   for (const { text: candidate, machineAuthored } of candidates) {
     if (typeof candidate !== "string") continue;
 
@@ -4089,7 +4122,11 @@ export function resolveProviderCapacityHorizon(
     if (absolute) {
       const parsed = new Date(absolute).getTime();
       if (Number.isFinite(parsed) && parsed > now) {
-        if (parsed - now <= PROVIDER_CAPACITY_MAX_HORIZON_MS) return { kind: "usable", at: new Date(parsed) };
+        if (parsed - now <= PROVIDER_CAPACITY_MAX_HORIZON_MS) {
+          const resolved = noteUsable(parsed, machineAuthored);
+          if (resolved) return resolved;
+          continue;
+        }
         noteOverHorizon(parsed, machineAuthored);
       }
       // A parsed-but-unusable absolute horizon (already elapsed, or beyond the
@@ -4105,14 +4142,19 @@ export function resolveProviderCapacityHorizon(
       const seconds = Number.parseFloat(relativeSeconds);
       if (Number.isFinite(seconds) && seconds > 0) {
         if (seconds * 1000 <= PROVIDER_CAPACITY_MAX_HORIZON_MS) {
-          return { kind: "usable", at: new Date(now + Math.ceil(seconds * 1000)) };
+          const resolved = noteUsable(now + Math.ceil(seconds * 1000), machineAuthored);
+          if (resolved) return resolved;
+          continue;
         }
         noteOverHorizon(now + Math.ceil(seconds * 1000), machineAuthored);
       }
     }
   }
 
-  return overHorizon ?? { kind: "none" };
+  // A usable reading of either provenance still outranks an over-cap one, as it
+  // did before: the call site, not this function, decides what the model-authored
+  // case earns.
+  return modelAuthoredUsable ?? overHorizon ?? { kind: "none" };
 }
 
 // Back-compat surface: "the instant we may park on verbatim", which is exactly
@@ -24247,11 +24289,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               errorMessage: adapterResult.errorMessage,
             })
           : ({ kind: "none" } as const);
-      const providerCapacityResetAt =
-        resolvedProviderCapacityHorizon.kind === "usable" ? resolvedProviderCapacityHorizon.at : null;
       const providerCapacityResetStatusEvidence = providerCapacityThrottleOverride
         ? readProviderCapacityResetStatusEvidence(adapterResult.resultJson)
         : null;
+      // BLO-24490: a horizon read out of a machine-authored surface parks as it
+      // always has. One read out of model-authored prose (`resultJson.result` /
+      // `summary`) needs the same observed 429 the over-cap and structured paths
+      // below require.
+      //
+      // The `usable` / `over_horizon` split is a bound on the *number*, not a
+      // statement about who wrote it: a usable park at 23h59m sidelines an issue
+      // as thoroughly as the over-cap park at 24h. Gating one on provenance and
+      // not the other put the strongest gate on the strongest evidence — the
+      // adapter-parsed structured hint — and no gate at all on the weakest.
+      // Corroboration is cheap here because the genuine k8s payload carries it:
+      // the fault text arrives in `errorMessage` alongside `api_error_status`
+      // 429, so it clears on provenance anyway and never reaches this branch.
+      const providerCapacityResetAt =
+        resolvedProviderCapacityHorizon.kind === "usable" &&
+        (resolvedProviderCapacityHorizon.machineAuthored ||
+          providerCapacityResetStatusEvidence?.statusCode === 429)
+          ? resolvedProviderCapacityHorizon.at
+          : null;
       // BLO-18285: the provider stated a horizon we will not park on verbatim.
       // Park at the cap instead of discarding it — discarding drops the run onto
       // the rate-limit family's flat 90s curve, which exhausts inside ~18min and
