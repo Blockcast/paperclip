@@ -59,16 +59,30 @@ likely it is.
 `scripts/merge-queue-eviction-detector.mjs`): GitHub fires
 `pull_request` `action=dequeued` for every queue removal, including a
 successful merge. The workflow waits out a short race window, then confirms
-the PR is genuinely unmerged, enumerates `merge_group` runs for that PR's
-queue head, and classifies the eviction:
+the PR is genuinely unmerged, reads the PR's own timeline to find the
+boundaries of the queue attempt that just ended (`selectLatestQueueAttemptWindow`
+— the most recent `added_to_merge_queue` paired with the next
+`removed_from_merge_queue` after it, so a prior queue attempt for the same PR
+can't leak into this one), enumerates `merge_group` runs created inside that
+window (`buildRunSearchWindow`, `gh run list --created <window>`), and
+classifies the eviction:
 
-- **zero `merge_group` runs at that head → `conflict_unstageable`** (this
-  shape),
+- **zero `merge_group` runs found inside that attempt's window → `conflict_unstageable`**
+  (this shape),
 - **a run exists and concluded `failure` → `check_failure`** (the automatic
   shape above — should already have produced its own signal; a detector hit
   here means something upstream is missing evidence),
 - **a run exists, did not fail, PR still unmerged → `manual`** (the stalled-head
-  procedure's manual dequeue, or a GitHub-side timeout).
+  procedure's manual dequeue, or a GitHub-side timeout),
+- **the run-list lookup hit its 500-run sample cap with no match → `unknown`**
+  (an incomplete sample isn't proof of zero — don't guess conflict on a
+  truncated result; this is a deliberately conservative bailout, distinct
+  from the three real causes above).
+
+Bounding the lookup to the specific attempt's time window (rather than an
+unbounded newest-N sample across the whole repo's history) is what makes the
+zero-runs signal trustworthy even on a busy repo, and what keeps a re-queued
+PR's earlier attempt from being misread as this attempt's outcome.
 
 It posts the classification as a PR comment carrying a
 `<!-- paperclip:merge-queue-eviction -->` marker; `github-webhook.ts`
@@ -82,25 +96,33 @@ closes the gap for an agent-authored PR, which has no human watching it.
 hand — this is exactly what the detector automates:
 
 ```
-# 1. Confirm the eviction and its timing from the PR's own timeline.
+# 1. Confirm the eviction and its timing from the PR's own timeline. If the
+#    PR has been queued more than once, use the LAST added_to_merge_queue /
+#    removed_from_merge_queue pair -- that is the attempt this eviction
+#    belongs to.
 gh api repos/Blockcast/paperclip/issues/<PR_NUMBER>/timeline --paginate \
   | jq '.[] | select(.event | test("_merge_queue$")) | {event, created_at}'
 ```
 
 ```
-# 2. Enumerate every merge_group run in the relevant window and confirm
-#    none of them belongs to this PR (head branch
-#    gh-readonly-queue/<base>/pr-<PR_NUMBER>-<sha>).
+# 2. Enumerate merge_group runs created inside that attempt's window (with a
+#    few minutes of buffer on each side) and confirm none of them belongs to
+#    this PR (head branch gh-readonly-queue/<base>/pr-<PR_NUMBER>-<sha>).
+#    Bounding by --created is what keeps this correct on a busy repo -- an
+#    unbounded --limit 500 can silently drop a real run on a busy day.
 gh run list --repo Blockcast/paperclip --event merge_group \
+  --created "<enqueued_at - 5m>..<removed_at + 5m>" \
   --json databaseId,headBranch,status,conclusion,createdAt --limit 500 \
   | jq --arg pr "pr-<PR_NUMBER>-" '[.[] | select(.headBranch | startswith("gh-readonly-queue/") and contains($pr))]'
 ```
 
 An empty array from step 2, alongside a `removed_from_merge_queue` event and
 no matching `merged` event from step 1, is the conflict/un-stageable
-signature. Fix is routine: rebase the PR onto the current base and re-add it
-to the queue — this runbook exists for the missing *signal*, not for a
-special repair procedure.
+signature — provided the result count from step 2 is below the 500-run cap
+(if it isn't, treat the result as inconclusive, not as zero, and widen or
+narrow the window). Fix is routine: rebase the PR onto the current base and
+re-add it to the queue — this runbook exists for the missing *signal*, not
+for a special repair procedure.
 
 A PR whose queue entry is evicted must not be left reporting a stale
 "enqueued" state anywhere an agent might read it as progress: the detector's
