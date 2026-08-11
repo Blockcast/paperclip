@@ -2240,7 +2240,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     ).toBe(false);
   });
 
-  it.each(["job_failed"])(
+  it.each(["job_failed", "oom_killed", "exit_137"])(
     "retries %s only when durable evidence proves adapter invocation never began",
     (errorCode) => {
       expect(
