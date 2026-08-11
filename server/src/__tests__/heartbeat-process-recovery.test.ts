@@ -4463,10 +4463,12 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(handoffWakeups).toHaveLength(1);
     expect(handoffWakeups[0]?.idempotencyKey).toBe(`finish_successful_run_handoff:${issueId}:${runId}:1`);
     expect(handoffWakeups[0]?.payload).not.toHaveProperty("modelProfile");
-    expect(handoffWakeups[0]?.payload).not.toHaveProperty("recoveryIntent");
-    expect(handoffWakeups[0]?.payload).not.toHaveProperty("allowDeliverableWork");
-    expect(handoffWakeups[0]?.payload).not.toHaveProperty("allowDocumentUpdates");
-    expect(handoffWakeups[0]?.payload).not.toHaveProperty("resumeRequiresNormalModel");
+    expect(handoffWakeups[0]?.payload).toMatchObject({
+      recoveryIntent: "planning_only",
+      allowDeliverableWork: false,
+      allowDocumentUpdates: true,
+      resumeRequiresNormalModel: false,
+    });
 
     const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
     expect(issue?.status).toBe("in_progress");

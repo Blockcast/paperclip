@@ -2658,6 +2658,53 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueApprovalService.unlink).not.toHaveBeenCalled();
   });
 
+  it("allows planning-only recovery to update its issue document but blocks implementation artifacts", async () => {
+    const app = await createApp(
+      ownerActor(),
+      createRunContextDb({
+        recoveryIntent: "planning_only",
+        allowDeliverableWork: false,
+        allowDocumentUpdates: true,
+        resumeRequiresNormalModel: false,
+      }),
+    );
+
+    await request(app)
+      .put(`/api/issues/${issueId}/documents/plan`)
+      .send({ format: "markdown", body: "# bounded plan update" })
+      .expect(200);
+    const artifactRes = await request(app).post(`/api/issues/${issueId}/work-products`).send({
+      type: "artifact",
+      provider: "test",
+      title: "Implementation artifact",
+    });
+
+    expect(artifactRes.status, JSON.stringify(artifactRes.body)).toBe(403);
+    expect(artifactRes.body.error).toContain("Planning-only recovery runs can update issue documents");
+    expect(mockDocumentService.upsertIssueDocument).toHaveBeenCalled();
+    expect(mockWorkProductService.createForIssue).not.toHaveBeenCalled();
+  });
+
+  it("blocks planning-only recovery from linking approvals", async () => {
+    const app = await createApp(
+      ownerActor(),
+      createRunContextDb({
+        recoveryIntent: "planning_only",
+        allowDeliverableWork: false,
+        allowDocumentUpdates: true,
+        resumeRequiresNormalModel: false,
+      }),
+    );
+
+    const res = await request(app).post(`/api/issues/${issueId}/approvals`).send({
+      approvalId: "88888888-8888-4888-8888-888888888888",
+    });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toContain("Planning-only recovery runs cannot link or unlink approvals");
+    expect(mockIssueApprovalService.link).not.toHaveBeenCalled();
+  });
+
   it.each([
     [
       "issue create",

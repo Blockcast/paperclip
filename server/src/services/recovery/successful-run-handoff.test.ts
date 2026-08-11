@@ -109,15 +109,19 @@ describe("successful run handoff decision", () => {
     expect(decision.kind).toBe("enqueue");
     if (decision.kind !== "enqueue") return;
     expect(decision.payload).not.toHaveProperty("modelProfile");
-    expect(decision.payload).not.toHaveProperty("recoveryIntent");
-    expect(decision.payload).not.toHaveProperty("allowDeliverableWork");
-    expect(decision.payload).not.toHaveProperty("allowDocumentUpdates");
-    expect(decision.payload).not.toHaveProperty("resumeRequiresNormalModel");
+    expect(decision.payload).toMatchObject({
+      recoveryIntent: "planning_only",
+      allowDeliverableWork: false,
+      allowDocumentUpdates: true,
+      resumeRequiresNormalModel: false,
+    });
     expect(decision.contextSnapshot).not.toHaveProperty("modelProfile");
-    expect(decision.contextSnapshot).not.toHaveProperty("recoveryIntent");
-    expect(decision.contextSnapshot).not.toHaveProperty("allowDeliverableWork");
-    expect(decision.contextSnapshot).not.toHaveProperty("allowDocumentUpdates");
-    expect(decision.contextSnapshot).not.toHaveProperty("resumeRequiresNormalModel");
+    expect(decision.contextSnapshot).toMatchObject({
+      recoveryIntent: "planning_only",
+      allowDeliverableWork: false,
+      allowDocumentUpdates: true,
+      resumeRequiresNormalModel: false,
+    });
     expect(decision.instruction).toContain("normal-model planning continuation");
     expect(decision.instruction).toContain("Complete the required plan or issue-document update");
     expect(decision.instruction).not.toContain("document or plan updates are not allowed");
