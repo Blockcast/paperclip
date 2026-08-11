@@ -267,19 +267,32 @@ re-derive it or re-file it as a fresh misattribution report:
   (`scripts/check-commit-author-attribution.mjs`, wired into `pr.yml`); an
   on-demand cross-repo audit mode (`--audit-merged`) covers
   `Blockcast/trafficcontrol` and `Blockcast/paperclip` for retroactive checks.
-- **Commits authored before 2026-08-09T01:38:20Z are grandfathered, not
-  exempted (BLO-23894).** That is when the gate above landed on master
-  (`e7162b906` / `3fa6e41d8`) — the first moment the rule was knowable. A
-  commit dated before it cannot be brought into compliance: the App stamp
-  already destroyed the acting agent's identity, so there is no correct
-  author to rewrite it to, and guessing one would write a false attribution —
-  the exact harm this gate exists to prevent. **If `policy` fails your PR on
-  a commit that predates the cutoff, that's a gate bug** (file it against
-  BLO-23894's owner) — don't work around it: squashing relabels other
-  contributors' correctly-attributed commits under one author, and
-  force-pushing rewrites a human contributor's history and can orphan
-  branches stacked on top. `--audit-merged` still reports pre-cutoff
-  violations; treat those as historical record, not something to fix.
+- **Commits authored before 2026-08-09T01:38:20Z (`ATTRIBUTION_GATE_CUTOFF`)
+  are grandfathered by an explicit SHA allowlist, not a date comparison
+  (BLO-23894).** That timestamp is when the gate above landed on master
+  (`e7162b906` / `3fa6e41d8`) — the first moment the rule was knowable — and
+  it still bounds which commits are *eligible* for grandfathering, but the
+  gate no longer trusts a commit's own `authorDate` to decide the question:
+  `authorDate` is caller-controlled (`GIT_AUTHOR_DATE`, `git commit --date`)
+  on the `git push` write path this gate also polices, so a pure date cutoff
+  can be defeated by backdating a brand-new violation straight past it. The
+  actual grandfather list is `GRANDFATHERED_OFFENSE_SHAS` in
+  `scripts/check-commit-author-attribution.mjs` — a finite, enumerated set of
+  the specific pre-cutoff commit shas this gate cannot ask anyone to fix (the
+  App stamp already destroyed the acting agent's identity, so there is no
+  correct author to rewrite it to, and guessing one would write a false
+  attribution — the exact harm this gate exists to prevent). **If `policy`
+  fails your PR on a commit that genuinely predates the cutoff (its
+  `authorDate` is verifiably before it) and isn't clearing, that's either a
+  gap in the allowlist or your commit got a new sha from a local `git
+  rebase`** (file either against BLO-23894's owner, with the sha, to add it)
+  — don't work around it: squashing relabels other contributors'
+  correctly-attributed commits under one author, and force-pushing rewrites a
+  human contributor's history and can orphan branches stacked on top. An
+  ordinary GitHub "Update branch" (merge) leaves a grandfathered commit's sha
+  untouched and does not trigger this. `--audit-merged` still reports
+  pre-cutoff violations; treat those as historical record, not something to
+  fix.
 
 ## 10. UI Expectations
 

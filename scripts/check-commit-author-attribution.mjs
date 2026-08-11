@@ -41,24 +41,48 @@
  *
  * Both modes are read-only: this script never posts, comments, or writes.
  *
- * ## Grandfather cutoff (BLO-23894)
+ * ## Grandfathered pre-cutoff commits are SHA-pinned, not date-cut (BLO-23894)
  *
- * The local-range gate (mode 1, the one that actually blocks a PR) only
- * enforces on commits *authored* on or after `ATTRIBUTION_GATE_CUTOFF` —
- * when this gate itself landed on master (`e7162b906` / `3fa6e41d8`). A
- * commit authored before that date cannot be brought into compliance: the
- * App stamp already erased the acting agent's identity, so there is no
- * correct author to rewrite it to. Guessing one would write a false
- * attribution — the exact harm this gate exists to prevent. Squashing or
- * force-pushing to "fix" a pre-cutoff commit is worse still: it relabels
- * other contributors' correctly-attributed commits, or rewrites/orphans
- * history that predates the rule. See BLO-23894 for the full incident (it
- * retroactively blocked ≥13 already-open, already-reviewed PRs).
+ * The local-range gate (mode 1, the one that actually blocks a PR) clears a
+ * commit if its full SHA is in `GRANDFATHERED_OFFENSE_SHAS` — an explicit,
+ * enumerated allowlist of the specific pre-existing App-attributed commits
+ * that predate the gate itself (`e7162b906` / `3fa6e41d8`, landed
+ * `ATTRIBUTION_GATE_CUTOFF`). Those commits cannot be brought into
+ * compliance: the App stamp already erased the acting agent's identity, so
+ * there is no correct author to rewrite them to, and guessing one would
+ * write a false attribution — the exact harm this gate exists to prevent.
+ * Squashing or force-pushing to "fix" one is worse still: it relabels other
+ * contributors' correctly-attributed commits, or rewrites/orphans history
+ * that predates the rule.
  *
- * `--audit-merged` mode deliberately does NOT apply this cutoff — it is
+ * This grandfathering used to key on `authorDate < cutoff` instead of a SHA
+ * allowlist. That was reverted: `authorDate` is caller-controlled
+ * (`GIT_AUTHOR_DATE`, `git commit --date`) on the `git push` write path this
+ * gate also has to police (see AGENTS.md §9 — 11-of-71 sampled checkouts
+ * already carry a misconfigured local identity), so a date cutoff can be
+ * defeated by backdating a brand-new, otherwise-non-compliant commit straight
+ * past the gate. A commit's SHA is not caller-choosable in the same way — it
+ * is a hash of the commit's own content, parent, and metadata — so pinning by
+ * SHA is immune to that forgery. The allowlist is finite and was built by
+ * enumerating every commit meeting the App-identity/non-merge/pre-cutoff
+ * predicate across every open `Blockcast/paperclip` PR as of the audit below;
+ * it is not a standing exemption; it does not grow.
+ *
+ * Trade-off, stated rather than hidden: an ordinary GitHub "Update branch"
+ * (a merge, which is what this repo's queue uses — verified via PR #1265's
+ * own `mergeStateStatus`) leaves the original commit's SHA untouched, so a
+ * grandfathered PR stays clear across it. An explicit local `git rebase`
+ * instead *rewrites* the commit (new parent → new commit hash even if the
+ * diff is byte-identical), which would drop it off the allowlist and re-trip
+ * the gate. That failure mode is fail-closed (blocks, doesn't silently pass)
+ * and the fix is cheap and forgery-free: add the new SHA to the allowlist.
+ * It was accepted over keeping any date-keyed fallback, which would
+ * reopen the exact backdating hole this change closes.
+ *
+ * `--audit-merged` mode deliberately does NOT apply this allowlist — it is
  * advisory only (never blocks a merge) and stays a complete historical
- * record, including pre-cutoff violations, so `findAttributionOffenses`
- * only filters by cutoff when a caller opts in via `{ cutoffMs }`.
+ * record, including pre-cutoff violations, so `findAttributionOffenses` only
+ * filters by allowlist when a caller opts in via `{ allowlist }`.
  */
 import { execFileSync } from "node:child_process";
 import path from "node:path";
@@ -97,13 +121,68 @@ export const COMMITS_API_MAX = 250;
 /**
  * The moment this gate itself became knowable: when `e7162b906` /
  * `3fa6e41d8` landed on master (committer date of the latter — both were
- * merged in the same rebase-merge). Commits authored before this cannot be
- * held to a rule that did not exist yet; see the "Grandfather cutoff"
- * section in the module docblock (BLO-23894) and AGENTS.md §9 for why this
- * is a scoping decision, not a bypass.
+ * merged in the same rebase-merge). Retained for provenance and as the
+ * predicate used to build `GRANDFATHERED_OFFENSE_SHAS` below — it is no
+ * longer read at enforcement time (see "Grandfathered pre-cutoff commits are
+ * SHA-pinned, not date-cut" in the module docblock, BLO-23894).
  */
 export const ATTRIBUTION_GATE_CUTOFF = "2026-08-09T01:38:20Z";
 export const ATTRIBUTION_GATE_CUTOFF_MS = Date.parse(ATTRIBUTION_GATE_CUTOFF);
+
+/**
+ * Explicit, enumerated allowlist of pre-cutoff App-attributed non-merge
+ * commits (BLO-23894). Built by scanning every commit on every OPEN
+ * `Blockcast/paperclip` PR (168 as of 2026-08-11, via
+ * `GET /pulls/{n}/commits` per PR) for the same predicate `policy` enforces
+ * — App-authored, non-merge, `authorDate < ATTRIBUTION_GATE_CUTOFF` — a
+ * superset of the ≥13-PR sample in BLO-23894's own blast-radius scan (which
+ * covered only the 100 most-recently-created open PRs and so missed #927,
+ * #1019, #1036, and #1049, all outside that window). Two commits found in
+ * the same scan were deliberately EXCLUDED because their `authorDate` is
+ * *after* the cutoff (PR #1125 `aafae6d5b`, PR #1220 `d656a840b`/`28bee6a6c`)
+ * — those are live, real violations the gate is correctly enforcing on, not
+ * grandfather candidates; their authors need to fix them via `git push` from
+ * a correctly-configured checkout per AGENTS.md §9.
+ *
+ * This list only ever needs new entries for commits that predate the cutoff
+ * above (a closed, non-growing condition) or for a grandfathered commit
+ * whose SHA changed because it was rebased rather than merge-updated (see
+ * the docblock trade-off) — never for an ordinary new PR.
+ */
+export const GRANDFATHERED_OFFENSE_SHAS = new Set([
+  // #927
+  "28291ce01869d6b523d79fd63a4a57eb408c8bb0",
+  "eb9e6f9ea1f0c3f2a01c98ae5157edeb274788ad",
+  "ead90a12af947358733d788113043f7df9354827",
+  "863da8a2b9ce15e42391f7e9e17e931c60e74e98",
+  // #962
+  "7c689686ac5a365f3282ef4b33859ff15cf99282",
+  "17532d7f1f62c8823c18091e3b617f9cebcd4a51",
+  // #1019
+  "ef6251ee65fdc6e05a171c0b30f4dccf2d1ce4ab",
+  // #1036
+  "8fc0eb49261df104755c502224444d70e1ccae74",
+  // #1049
+  "42bfd84996c855f153b669d903053a3cd13d9668",
+  "3345ee7829130ef8c7a167a4a106a655f426c42b",
+  // #1091
+  "d0cd0fb16ef8cc9ab25710c521833733dae291ea",
+  // #1126
+  "cb120b0e334ebb8d2d318d0a3d7cf37a161fce97",
+  // #1133 and #1148 share this commit (stacked branches)
+  "96203de637f5c7b33807b09a27e4cf7b8d00d6e5",
+  // #1138
+  "ef139fad81017ff0d1c595e2096ad6ec84ee94f1",
+  // #1148
+  "447fd5e91c1ab8112b6f986c340bc1ca4c23cdb9",
+  // #1155
+  "dd81c36c96528d60f40e19e426a922e4299d8214",
+  "96985884ec0772b84390517a567f0e770ce49038",
+  // #1161
+  "b54c3bc2635b5b8e5836c4959734d854a24cae88",
+  // #1165
+  "d3e6ea9fc7ed472ff3c4cb9448b3144298827fc2",
+]);
 
 const UNIT_SEPARATOR = "\u001f";
 const RECORD_SEPARATOR = "\u001e";
@@ -116,36 +195,21 @@ const RECORD_SEPARATOR = "\u001e";
  * scope, independent of which mode produced the record (defensive — mode 1
  * already excludes these via `--no-merges`).
  *
- * `cutoffMs`, if given, additionally excludes commits authored strictly
- * before it (BLO-23894's grandfather clause) — a commit with a missing or
- * unparseable `authorDate` fails closed (stays an offense) rather than being
- * silently treated as pre-cutoff. Omitting `cutoffMs` preserves the
- * historical, uncut assertion; `--audit-merged` relies on that default so it
- * keeps reporting pre-cutoff violations as advisory record.
- *
- * Deliberately compares against author date, not committer date, even though
- * author date is the field a caller can set directly (`git commit --date`,
- * `GIT_AUTHOR_DATE`, or the low-level Git Data API's `author.date` param —
- * though NOT the Contents/Merge API paths this gate actually polices, which
- * set both dates server-side to request time and accept no caller-supplied
- * date at all). Author date still wins, because committer date does not
- * survive the operation this cutoff exists to tolerate: rebasing an
- * already-open, already-reviewed PR resets committer date to "now" while
- * leaving author date untouched (verified empirically; `git merge` / GitHub's
- * default "Update branch" does not touch either date). Keying the cutoff on
- * committer date would silently re-flag every rebased pre-cutoff commit as a
- * fresh violation — reproducing the exact incident BLO-23894 exists to fix —
- * to close a forgery path that, on the two write paths this gate is scoped
- * to, does not exist. See the PR #1265 review thread for the full trade-off.
+ * `allowlist`, if given (a `Set` of full 40-char lowercase SHAs), additionally
+ * clears any commit whose `sha` is a member — BLO-23894's grandfather clause,
+ * SHA-pinned rather than date-keyed so it cannot be defeated by a caller
+ * backdating `authorDate`. `sha` is matched case-insensitively (lowercased
+ * before comparison) since callers may not normalize case; a missing `sha`
+ * cannot match and stays an offense. Omitting `allowlist` preserves the
+ * historical, unfiltered assertion; `--audit-merged` relies on that default
+ * so it keeps reporting pre-cutoff violations as advisory record.
  */
-export function findAttributionOffenses(commits, { cutoffMs } = {}) {
+export function findAttributionOffenses(commits, { allowlist } = {}) {
   return commits.filter((commit) => {
     if ((commit.parentCount ?? 1) > 1) return false;
     if (commit.authorEmail !== APP_NOREPLY_EMAIL) return false;
-    if (cutoffMs === undefined) return true;
-    const authorMs = Date.parse(commit.authorDate ?? "");
-    if (!Number.isFinite(authorMs)) return true;
-    return authorMs >= cutoffMs;
+    if (allowlist === undefined) return true;
+    return !allowlist.has(String(commit.sha ?? "").toLowerCase());
   });
 }
 
@@ -164,15 +228,16 @@ function parseLocalGitLog(rawOutput) {
  * Local mode: non-merge commits in `base..head` of a checked-out repo.
  * `execFileSync` (argv array, no shell) — `base`/`head` are refs/SHAs from
  * trusted CI-provided env, but this avoids any shell-injection surface either way.
- * Applies the BLO-23894 grandfather cutoff by default — this is the gate
- * that actually blocks a PR, so pre-cutoff commits are out of scope.
+ * Applies the BLO-23894 grandfather allowlist by default — this is the gate
+ * that actually blocks a PR, so pre-cutoff, allowlisted commits are out of
+ * scope.
  */
 export function findLocalRangeOffenses({
   repoRoot,
   base,
   head,
   execFile = execFileSync,
-  cutoffMs = ATTRIBUTION_GATE_CUTOFF_MS,
+  allowlist = GRANDFATHERED_OFFENSE_SHAS,
 } = {}) {
   const format = `%H${UNIT_SEPARATOR}%ae${UNIT_SEPARATOR}%aI${UNIT_SEPARATOR}%s${RECORD_SEPARATOR}`;
   const rawOutput = execFile(
@@ -181,7 +246,7 @@ export function findLocalRangeOffenses({
     { cwd: repoRoot, encoding: "utf8", maxBuffer: 32 * 1024 * 1024 },
   );
   const commits = parseLocalGitLog(rawOutput);
-  return findAttributionOffenses(commits, { cutoffMs });
+  return findAttributionOffenses(commits, { allowlist });
 }
 
 /**
@@ -399,7 +464,7 @@ async function main() {
       console.error(`  ${offense.sha.slice(0, 7)} "${offense.message}" — ${offense.authorEmail}`);
     }
     console.error(
-      "\nThis means either the commit was created via the GitHub REST/MCP write path (contents API, merge API, or `create_or_update_file`/`push_files`, which always stamps the shared App credential), OR it was made with `git push` from a checkout whose local git config itself holds the App identity — run `git config user.email` in this checkout to tell which. The first case: use `git push` instead. The second case: `git push` will not fix it until the checkout's local `user.email`/`user.name` is set to your own per-agent identity (BLO-23894 found this local-config gap on 11 of 71 sampled checkouts). See AGENTS.md §9 (BLO-21416).",
+      "\nThis means either the commit was created via the GitHub REST/MCP write path (contents API, merge API, or `create_or_update_file`/`push_files`, which always stamps the shared App credential), OR it was made with `git push` from a checkout whose local git config itself holds the App identity — run `git config user.email` in this checkout to tell which. The first case: use `git push` instead. The second case: `git push` will not fix it until the checkout's local `user.email`/`user.name` is set to your own per-agent identity (BLO-23894 found this local-config gap on 11 of 71 sampled checkouts). See AGENTS.md §9 (BLO-21416).\n\nIf this commit genuinely predates the gate (authored before ATTRIBUTION_GATE_CUTOFF, e.g. it was already open and reviewed before the rule existed, or it's a grandfathered PR that got rebased and changed SHA) it is unfixable in place — file against BLO-23894's owner to add its SHA to GRANDFATHERED_OFFENSE_SHAS rather than rewriting history.",
     );
     process.exit(1);
   }
