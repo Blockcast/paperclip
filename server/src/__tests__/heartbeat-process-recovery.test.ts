@@ -1317,7 +1317,14 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         .where(eq(agentWakeupRequests.agentId, input.agentId));
       return wakeups.find((wakeup) => {
         const payload = wakeup.payload as Record<string, unknown> | null;
-        return payload?.issueId === input.issueId &&
+        // BLO-18829: require `runId`. The escalation writes a durable wake-outbox
+        // marker inside its transaction and only dispatches the real wake AFTER
+        // commit, so between those two points a payload-identical row exists with
+        // no run attached. Without this guard the poll latches onto that marker the
+        // instant it appears and returns a wake that was merely *owed*, making the
+        // `contextSnapshot` assertion below dereference a run that does not exist.
+        return wakeup.runId !== null &&
+          payload?.issueId === input.issueId &&
           payload?.sourceIssueId === input.issueId &&
           payload?.strandedRunId === input.runId &&
           payload?.recoveryActionId === action.id;
@@ -7917,6 +7924,26 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       Array.from({ length: 8 }, () => heartbeat.reconcileStrandedAssignedIssues()),
     );
     expect(results.every((result) => result.status === "fulfilled")).toBe(true);
+    // BLO-18829: count the sweeps that actually escalated rather than assuming all 8
+    // do. Escalation is now one advisory-lock-serialized transaction, so it takes
+    // long enough that the later sweeps run their candidate query after the issue is
+    // already `blocked` -- and a `blocked` issue is not a stranded candidate, so those
+    // sweeps legitimately no-op instead of racing. How many win that race is a timing
+    // artifact of sweep scheduling, not a property worth pinning.
+    //
+    // The property that IS worth pinning is the one this test is named for, and
+    // asserting equality against the observed escalation count states it far more
+    // precisely than the old hard-coded `8` ever did: every escalation that ran
+    // bumped the SAME action exactly once -- no duplicate action, no lost or
+    // double-counted attempt. Probed on the failing head: escalations, sweeps that
+    // saw the issue, and attemptCount all agreed at 6, i.e. nothing was being lost;
+    // the literal `8` was simply describing scheduling luck on the old, faster,
+    // non-atomic path.
+    const escalatedTotal = results.reduce(
+      (sum, result) => sum + (result.status === "fulfilled" ? result.value.escalated : 0),
+      0,
+    );
+    expect(escalatedTotal).toBeGreaterThan(0);
 
     const actions = await db
       .select()
@@ -7927,7 +7954,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         eq(issueRecoveryActions.status, "active"),
       ));
     expect(actions).toHaveLength(1);
-    expect(actions[0]?.attemptCount).toBe(8);
+    expect(actions[0]?.attemptCount).toBe(escalatedTotal);
     await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual([]);
   });
 

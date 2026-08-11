@@ -4101,11 +4101,18 @@ export function recoveryService(
    * is a row in that shape, written on the escalation's transaction.
    *
    * The row is inserted pessimistically (already `dispatch_failed`, i.e. "owed but not
-   * yet delivered") and flipped to `dispatch_recovered` once the post-commit dispatch
-   * succeeds. That ordering is what makes the wake durable: if the process dies between
-   * commit and dispatch, the row is already on disk and the reconciler delivers it. If
-   * the CAS loses instead, the row rolls back with the rest of the escalation and no
-   * wake is ever owed.
+   * yet delivered") and DELETED once the post-commit dispatch succeeds. That ordering is
+   * what makes the wake durable: if the process dies between commit and dispatch, the row
+   * is already on disk and the reconciler delivers it. If the CAS loses instead, the row
+   * rolls back with the rest of the escalation and no wake is ever owed.
+   *
+   * It is deleted rather than retained as `dispatch_recovered` because this row is an IOU,
+   * not a wake, yet it carries the real wake's `agentId`/`reason`/`payload` -- so any
+   * reader that does not filter on status counts it as a second delivered wake. Retaining
+   * it made every escalation show up twice (see `dispatchDurableRecoveryWakeOutboxRow`).
+   * The row carries `dispatchRetry.deleteOnRecover` so the *reconciler* honours the same
+   * rule when it is the one that delivers the wake; otherwise the phantom simply moved to
+   * the durable-retry path instead of being removed from it.
    */
   const RECOVERY_WAKE_OUTBOX_FIRST_RETRY_MS = 60_000;
 
@@ -4131,6 +4138,16 @@ export function recoveryService(
             nextAttemptAt: new Date(now.getTime() + RECOVERY_WAKE_OUTBOX_FIRST_RETRY_MS).toISOString(),
             originalOpts: input.opts as Record<string, unknown>,
             lastError: null,
+            // Tells reconcileFailedWakeDispatches that this row is an IOU, not a wake
+            // request: once it replays the wake successfully the debt is paid and the row
+            // must be DELETED, not stamped `dispatch_recovered`. Without it the reconciler
+            // -- the very path this outbox exists to feed -- retains a payload-identical
+            // row with `runId: null` forever, which is exactly the phantom duplicate the
+            // inline delete below removes on the happy path (BLO-18829 review follow-up).
+            // Carried inside `dispatchRetry` rather than the wake payload so it never
+            // reaches the replayed wake: the reconciler enqueues `originalOpts`, and
+            // `originalOpts.payload` is the caller's payload untouched by this envelope.
+            deleteOnRecover: true,
           },
         },
         status: "dispatch_failed",
@@ -4149,26 +4166,20 @@ export function recoveryService(
     | { delivered: true }
     | { delivered: false; cause: "enqueue_not_delivered" | "enqueue_threw"; error?: unknown };
 
+  async function deleteDurableRecoveryWakeOutboxRow(outboxRowId: string): Promise<void> {
+    await db
+      .delete(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, outboxRowId));
+  }
+
   async function dispatchDurableRecoveryWakeOutboxRow(input: {
     outboxRowId: string;
     agentId: string;
     opts: RecoveryWakeupOptions;
   }): Promise<DurableRecoveryWakeDispatchResult> {
+    let run: Awaited<ReturnType<typeof deps.enqueueWakeup>>;
     try {
-      const run = await deps.enqueueWakeup(input.agentId, input.opts);
-      if (!run) {
-        logger.warn(
-          { agentId: input.agentId, outboxRowId: input.outboxRowId },
-          "stranded recovery wake dispatch returned no run after commit; left durable for reconcileFailedWakeDispatches",
-        );
-        return { delivered: false, cause: "enqueue_not_delivered" };
-      }
-      const now = new Date();
-      await db
-        .update(agentWakeupRequests)
-        .set({ status: "dispatch_recovered", finishedAt: now, updatedAt: now })
-        .where(eq(agentWakeupRequests.id, input.outboxRowId));
-      return { delivered: true };
+      run = await deps.enqueueWakeup(input.agentId, input.opts);
     } catch (err) {
       // Leave the row `dispatch_failed` on purpose -- that is precisely the state
       // reconcileFailedWakeDispatches selects on, so the wake is retried with backoff
@@ -4179,6 +4190,75 @@ export function recoveryService(
       );
       return { delivered: false, cause: "enqueue_threw", error: err };
     }
+    if (!run) {
+      logger.warn(
+        { agentId: input.agentId, outboxRowId: input.outboxRowId },
+        "stranded recovery wake dispatch returned no run after commit; left durable for reconcileFailedWakeDispatches",
+      );
+      return { delivered: false, cause: "enqueue_not_delivered" };
+    }
+    // BLO-18829 follow-up: DELETE the marker rather than flipping it to
+    // `dispatch_recovered`. The marker is an IOU ("a wake is owed"), not a wake --
+    // but it lives in `agent_wakeup_requests` carrying the real wake's `agentId`,
+    // `reason` and `payload`, so while it exists it is indistinguishable from the
+    // delivered wake to every reader that does not filter on status. Left behind,
+    // each escalation permanently doubles: `getWakeDiagnostics` (issues.ts) shows a
+    // phantom wake with `runId: null` next to the real one, and any agentId+reason
+    // or agentId+payload count returns 2. Once the debt is paid the IOU has no
+    // reader, so the honest representation is its absence.
+    //
+    // Deliberately OUTSIDE the enqueue try: a cleanup failure must not be reported
+    // as `delivered: false`. The wake really was delivered, so refunding the attempt
+    // would be wrong.
+    //
+    // What a cleanup failure must NOT do is leave the row `dispatch_failed`, because
+    // that is the reconciler's selection predicate and **nothing dedupes this path on
+    // `idempotencyKey`** -- `enqueueWakeup` only writes the key, it never reads it,
+    // and the sole reader (`findExistingRunLivenessContinuationWake`) is caller-side
+    // and scoped to run-liveness continuations. See the BLO-18996 note on
+    // `resolveSourceScopedStrandedRecoveryWakePlan`, which relies on that same fact.
+    // So a retained `dispatch_failed` marker does not get de-duplicated on replay: it
+    // enqueues a second real run. Retry the delete, then fall back to a terminal
+    // status the reconciler never selects. That trades a duplicate agent run (real
+    // cost) for a phantom diagnostics row (noise) -- the right way round.
+    try {
+      await deleteDurableRecoveryWakeOutboxRow(input.outboxRowId);
+    } catch (firstError) {
+      try {
+        await deleteDurableRecoveryWakeOutboxRow(input.outboxRowId);
+      } catch (secondError) {
+        try {
+          const now = new Date();
+          await db
+            .update(agentWakeupRequests)
+            .set({
+              status: "dispatch_superseded",
+              error: "wake was delivered inline; outbox marker cleanup failed",
+              finishedAt: now,
+              updatedAt: now,
+            })
+            .where(eq(agentWakeupRequests.id, input.outboxRowId));
+          logger.warn(
+            { err: secondError, firstErr: firstError, agentId: input.agentId, outboxRowId: input.outboxRowId },
+            "stranded recovery wake delivered but outbox row deletion failed twice; marked "
+              + "dispatch_superseded so the reconciler cannot redeliver (phantom row retained)",
+          );
+        } catch (terminalError) {
+          logger.warn(
+            {
+              err: terminalError,
+              deleteErr: secondError,
+              firstErr: firstError,
+              agentId: input.agentId,
+              outboxRowId: input.outboxRowId,
+            },
+            "stranded recovery wake delivered but outbox marker could not be deleted or retired; "
+              + "reconciler may redeliver a duplicate wake (nothing dedupes this path)",
+          );
+        }
+      }
+    }
+    return { delivered: true };
   }
 
   type SourceScopedStrandedRecoveryWakeInput = {
