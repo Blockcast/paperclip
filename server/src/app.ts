@@ -650,6 +650,7 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
       prReviewerBotLogin: appConfig.prReviewerBotLogin || null,
       reviewGateAuthority: appConfig.githubReviewGateCaptureEnabled
         ? {
+            authorityEnabled: appConfig.githubReviewGateEnabled,
             repositories: appConfig.githubReviewGateRepositories,
             statusContext: appConfig.prReviewGateStatusContext,
             expectedAppId: appConfig.githubReviewGateExpectedAppId,
