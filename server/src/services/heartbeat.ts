@@ -10741,14 +10741,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const watchedRunId = monitor.gateSignals
         ?.find((signal) => signal.startsWith(ISSUE_MONITOR_DISPATCH_WATCHDOG_GATE_PREFIX))
         ?.slice(ISSUE_MONITOR_DISPATCH_WATCHDOG_GATE_PREFIX.length) ?? null;
-      const watchedRun = watchedRunId
+      const readWatchedRun = async () => watchedRunId
         ? await db
-          .select({ status: heartbeatRuns.status, startedAt: heartbeatRuns.startedAt })
+          .select({
+            status: heartbeatRuns.status,
+            startedAt: heartbeatRuns.startedAt,
+            agentId: heartbeatRuns.agentId,
+          })
           .from(heartbeatRuns)
           .where(eq(heartbeatRuns.id, watchedRunId))
           .then((rows) => rows[0] ?? null)
         : null;
-      if (!watchedRun || watchedRun.status !== "queued" || watchedRun.startedAt) {
+      const watchedRunIsWaiting = (
+        run: { status: string; startedAt: Date | null } | null,
+      ): run is { status: string; startedAt: null; agentId: string } =>
+        Boolean(run) && run!.status === "queued" && !run!.startedAt;
+      const settleWatchdogAsRecovered = async (
+        run: { status: string; startedAt: Date | null } | null,
+        redispatched: boolean,
+      ) => {
         await db
           .update(issues)
           .set({
@@ -10773,12 +10784,81 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           details: {
             identifier: claimed.identifier,
             watchedRunId,
-            watchedRunStatus: watchedRun?.status ?? "missing",
-            watchedRunStartedAt: watchedRun?.startedAt?.toISOString() ?? null,
+            watchedRunStatus: run?.status ?? "missing",
+            watchedRunStartedAt: run?.startedAt?.toISOString() ?? null,
+            redispatched,
           },
         });
         return { outcome: "skipped" as const, reason: "watched run is no longer waiting for dispatch" };
+      };
+
+      const watchedRun = await readWatchedRun();
+      if (!watchedRunIsWaiting(watchedRun)) {
+        return settleWatchdogAsRecovered(watchedRun, false);
       }
+
+      // The watched run is STILL queued. Falling through to enqueueWakeup here
+      // accomplishes nothing: this issue's task scope already owns that queued
+      // run, so coalescePendingTaskScopeWake merges into it and returns without
+      // ever calling startNextQueuedRunForAgent. The triggered patch would then
+      // clear monitorNextCheckAt, leaving the issue re-lapsed with the same
+      // undeliverable run — the watchdog would "recover" the strand forever
+      // without moving it (BLO-22860). Push the dispatcher directly instead.
+      await startNextQueuedRunForAgent(watchedRun.agentId, {
+        reason: "issue_monitor_dispatch_watchdog",
+      });
+      const redispatchedRun = await readWatchedRun();
+      if (!watchedRunIsWaiting(redispatchedRun)) {
+        return settleWatchdogAsRecovered(redispatchedRun, true);
+      }
+
+      // Still stuck after an explicit dispatch pass. Re-arm rather than consume
+      // the timer, but count the attempt so this is bounded: once maxAttempts is
+      // reached the clearReason path below surfaces/escalates the issue instead
+      // of polling a run that never moves.
+      if (!clearReason) {
+        const retryCheckAt = new Date(input.now.getTime() + ISSUE_MONITOR_DISPATCH_REARM_DELAY_MS);
+        const retryPolicy = normalizeIssueExecutionPolicy({
+          ...policy,
+          monitor: { ...monitor, nextCheckAt: retryCheckAt.toISOString() },
+        });
+        if (retryPolicy?.monitor) {
+          await db
+            .update(issues)
+            .set({
+              ...buildIssueMonitorDispatchRearmPatch({
+                issue: claimed,
+                policy: retryPolicy,
+                attemptCount: nextAttemptCount,
+              }),
+              updatedAt: input.now,
+            })
+            .where(eq(issues.id, claimed.id));
+          await logActivity(db, {
+            companyId: claimed.companyId,
+            actorType: input.actorType,
+            actorId: input.actorId,
+            agentId: input.agentId,
+            runId: input.runId,
+            action: "issue.monitor_dispatch_watchdog_redispatched",
+            entityType: "issue",
+            entityId: claimed.id,
+            details: {
+              identifier: claimed.identifier,
+              watchedRunId,
+              watchedRunAgentId: watchedRun.agentId,
+              nextCheckAt: retryCheckAt.toISOString(),
+              monitorAttemptCount: nextAttemptCount,
+            },
+          });
+          return {
+            outcome: "rearmed" as const,
+            reason: "watched run is still queued after an explicit dispatch pass",
+          };
+        }
+      }
+      // Attempts exhausted — fall through to clearIssueMonitorAndRecover so the
+      // strand is surfaced to a human/recovery lane rather than polled forever.
     }
 
     if (clearReason) {
