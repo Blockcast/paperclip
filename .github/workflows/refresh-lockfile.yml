@@ -32,10 +32,33 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 24
-          cache: pnpm
 
       - name: Refresh pnpm lockfile
         run: pnpm install --lockfile-only --ignore-scripts --no-frozen-lockfile
+
+      - name: Resolve pnpm store cache
+        id: pnpm-cache
+        shell: bash
+        run: |
+          echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+          echo "arch=$(node -p 'process.arch')" >> "$GITHUB_OUTPUT"
+
+      - name: Restore pnpm store
+        id: pnpm-cache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ steps.pnpm-cache.outputs.path }}
+          key: node-cache-${{ runner.os }}-${{ steps.pnpm-cache.outputs.arch }}-pnpm-${{ hashFiles('pnpm-lock.yaml') }}
+
+      - name: Populate pnpm store
+        run: pnpm fetch --frozen-lockfile
+
+      - name: Save populated pnpm store
+        if: success() && steps.pnpm-cache-restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.pnpm-cache.outputs.path }}
+          key: node-cache-${{ runner.os }}-${{ steps.pnpm-cache.outputs.arch }}-pnpm-${{ hashFiles('pnpm-lock.yaml') }}
 
       - name: Fail on unexpected file changes
         run: |

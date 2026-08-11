@@ -1440,8 +1440,15 @@
     {
       "idx": 213,
       "version": "7",
-      "when": 1786357800000,
-      "tag": "0213_execution_workspace_cleanup_eligible_index",
+      "when": 1786360409322,
+      "tag": "0213_issue_checkout_restore_status",
+      "breakpoints": true
+    },
+    {
+      "idx": 214,
+      "version": "7",
+      "when": 1786360409323,
+      "tag": "0214_execution_workspace_cleanup_eligible_index",
       "breakpoints": true
     }
   ]
