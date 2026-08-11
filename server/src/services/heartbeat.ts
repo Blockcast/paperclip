@@ -14336,6 +14336,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           details: Record<string, unknown>;
         };
 
+    // Session recovery must reserve the issue while the fresh-session retry is
+    // parked. Other retry families retain their existing release-at-schedule
+    // behavior.
+    const retainsIssueExecutionLockWhileScheduled =
+      retryReason === SESSION_UNAVAILABLE_HEARTBEAT_RETRY_REASON ||
+      retryReason === ZERO_TOKEN_SESSION_RESET_RETRY_REASON;
+
     const scheduleResult = await db.transaction(async (tx): Promise<ScheduledRetryTransactionResult> => {
       if (retryReason === INTERACTION_CONTINUATION_INFRA_RETRY_REASON) {
         if (issueId) {
@@ -14673,9 +14680,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         await tx
           .update(issues)
           .set({
-            executionRunId: null,
-            executionAgentNameKey: null,
-            executionLockedAt: null,
+            executionRunId: retainsIssueExecutionLockWhileScheduled ? scheduledRun.id : null,
+            executionAgentNameKey: retainsIssueExecutionLockWhileScheduled
+              ? normalizeAgentNameKey(agent.name)
+              : null,
+            executionLockedAt: retainsIssueExecutionLockWhileScheduled ? now : null,
             ...(detachWorkspaceFromIssue
               ? {
                   executionWorkspaceId: null,
