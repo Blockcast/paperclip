@@ -17,6 +17,7 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+      actions: read
 
     steps:
       - name: Checkout repository
@@ -98,3 +99,36 @@ jobs:
           # deliberately force-updates it before reusing its PR.
           gh pr merge --squash "${{ steps.upsert-pr.outputs.pr_url }}" \
             || gh pr merge --auto --squash "${{ steps.upsert-pr.outputs.pr_url }}"
+
+      # BLO-24150: the direct squash above sometimes falls through to --auto,
+      # which then waits on this PR's own required checks. If those checks'
+      # *workflow runs* are sitting in `action_required` (observed 2026-07-21
+      # and 2026-08-10, ~2.5h before a human happened to notice and click
+      # "Approve and run"), --auto silently waits forever with no signal
+      # anywhere that a human is needed — during which every frozen install
+      # on master (PRs and merge-queue entries alike) keeps failing. Make
+      # that stall loud instead of silent.
+      - name: Alert if the merge stalled on an unapproved workflow run
+        if: steps.upsert-pr.outputs.pr_url != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pr_url="${{ steps.upsert-pr.outputs.pr_url }}"
+          state="$(gh pr view "$pr_url" --json state --jq .state)"
+          if [ "$state" = "MERGED" ]; then
+            echo "Lockfile PR merged cleanly, nothing to alert on."
+            exit 0
+          fi
+
+          head_sha="$(gh pr view "$pr_url" --json headRefOid --jq .headRefOid)"
+          action_required_count="$(
+            gh api "repos/${{ github.repository }}/actions/runs?head_sha=$head_sha&per_page=50" \
+              --jq '[.workflow_runs[] | select(.status == "action_required")] | length'
+          )"
+
+          if [ "${action_required_count:-0}" -gt 0 ]; then
+            gh pr comment "$pr_url" --body "🚨 **Self-heal stalled on a human approval gate (BLO-24150).** \`$action_required_count\` workflow run(s) on this commit are sitting in \`action_required\` — CI cannot start until someone clicks *Approve and run* on this PR's checks (Actions tab → this PR → pending runs). Until then \`--auto\` merge will wait indefinitely while every \`pnpm install --frozen-lockfile\` job on \`master\`, every PR, and every merge-queue entry keeps failing with \`ERR_PNPM_LOCKFILE_CONFIG_MISMATCH\`-style install errors. See https://paperclip.blockcast.net/BLO/issues/BLO-24150 for the known mechanism and prior occurrences (2026-07-21, 2026-08-10)."
+            echo "Posted stall alert: $action_required_count run(s) awaiting approval."
+          else
+            echo "PR not yet merged but no action_required runs found (state=$state) — likely still mid-flight, not stalled."
+          fi
