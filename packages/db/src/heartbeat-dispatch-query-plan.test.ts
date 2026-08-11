@@ -284,6 +284,99 @@ const PRIORITY_LANE_ISSUE_LOOKUP = `
      AND id IN (${LANE_ISSUE_IDS.map((id) => `'${id}'::uuid`).join(", ")})
 `;
 
+/**
+ * BLO-20736. Two depths, both well past SCAN_LIMIT and an order of magnitude
+ * apart, so a single shared ceiling can distinguish bounded work from work that
+ * tracks the backlog.
+ */
+const DISPATCH_HEAD_DEPTHS = [1_000, 5_000] as const;
+
+/**
+ * The head page as the dispatcher reads it now: ONLY the keyset columns.
+ *
+ * Every column here lives in heartbeat_runs_agent_dispatch_idx behind the
+ * (agent_id, status) prefix, so the page is served entirely from the index with
+ * no heap access — an ordered `Index Only Scan` that stops after SCAN_LIMIT
+ * entries. That is what makes the plan insensitive to the cardinality
+ * underestimate: with no heap fetches to pay for, the ordered path's
+ * LIMIT-scaled cost stays ~10 whether the planner believes 126 rows or 5167,
+ * while the bitmap alternative must still materialize the whole match set
+ * before its sort can emit a single row.
+ *
+ * `created_at::text` mirrors the dispatcher exactly, cast and all: it carries
+ * the cursor as text so postgres' microsecond timestamps survive a round trip
+ * through a JS Date, which only has millisecond resolution. The cast is applied
+ * on top of an indexed column, so the page is still served index-only — but the
+ * projection has to match production or this plan is not the production plan.
+ */
+const DISPATCH_HEAD_PROBE = `
+  SELECT created_at::text AS dispatch_created_at_cursor, id FROM heartbeat_runs
+   WHERE agent_id = '${AGENT}'::uuid
+     AND status = 'queued'
+   ORDER BY created_at ASC, id ASC
+   LIMIT ${SCAN_LIMIT}
+`;
+
+const DISPATCH_HEAD_PROBE_CURSOR = `
+  SELECT created_at::text AS dispatch_created_at_cursor, id FROM heartbeat_runs
+   WHERE agent_id = '${AGENT}'::uuid
+     AND status = 'queued'
+     AND (created_at, id) > (now() - interval '90000 seconds', '00000000-0000-4000-8000-000000000000'::uuid)
+   ORDER BY created_at ASC, id ASC
+   LIMIT ${SCAN_LIMIT}
+`;
+
+function dispatchHeadProbeQuery(cursor: { createdAt: string; id: string } | null = null) {
+  return `
+    SELECT created_at::text AS dispatch_created_at_cursor, id FROM heartbeat_runs
+     WHERE agent_id = '${AGENT}'::uuid
+       AND status = 'queued'
+       ${cursor ? `AND (created_at, id) > ('${cursor.createdAt}'::timestamptz, '${cursor.id}'::uuid)` : ""}
+     ORDER BY created_at ASC, id ASC
+     LIMIT ${SCAN_LIMIT}
+  `;
+}
+
+/**
+ * A deep queue whose rows are physically INTERLEAVED with everyone else's.
+ *
+ * `seed` above appends the agent's backlog in one block, which packs it into a
+ * few dozen heap pages — and against clustering that tight, bitmap+sort really
+ * is the cheaper plan, so asserting the ordered plan there would be asserting
+ * the wrong thing. Spreading one queued row per stride puts each on its own
+ * heap page (`Heap Blocks: exact=<depth>`), which is what a queue accumulated
+ * over time actually looks like.
+ *
+ * VACUUM, not just ANALYZE: index-only scans are costed against the visibility
+ * map, and a never-vacuumed table reports relallvisible = 0 and gets bitmap+sort
+ * regardless of projection. Production is continuously autovacuumed, so
+ * vacuuming here is what makes the fixture honest rather than what makes it
+ * pass.
+ */
+async function seedInterleavedQueue(sql: postgres.Sql, depth: number) {
+  await sql.unsafe(`SET session_replication_role = replica`);
+  const stride = Math.floor(TOTAL_RUNS / depth);
+  await sql.unsafe(`
+    INSERT INTO heartbeat_runs (company_id, agent_id, status, created_at, updated_at, context_snapshot)
+    SELECT
+      '${COMPANY}'::uuid,
+      CASE WHEN series % ${stride} = 0
+        THEN '${AGENT}'::uuid
+        ELSE ('33333333-3333-4333-8333-' || lpad((series % 50)::text, 12, '0'))::uuid END,
+      CASE WHEN series % ${stride} = 0 OR series % 200 = 0 THEN 'queued' ELSE 'completed' END,
+      now() - ((series % 100000) || ' seconds')::interval,
+      now(),
+      jsonb_build_object(
+        'issueId', '00000000-0000-4000-8000-' || lpad(((series % ${TOTAL_ISSUES}) + 1)::text, 12, '0'),
+        'source', 'heartbeat_timer'
+      )
+    FROM generate_series(1, ${TOTAL_RUNS}) AS series
+  `);
+  await sql.unsafe(`SET session_replication_role = origin`);
+  await sql.unsafe(`VACUUM ANALYZE heartbeat_runs`);
+}
+
+
 describeEmbeddedPostgres("BLO-20396 dispatch query plans", () => {
   it("uses the dispatch index for the keyset scan and bounds the priority lane", async () => {
     const database = await startEmbeddedPostgresTestDatabase("paperclip-blo20396-plan-");
@@ -482,4 +575,164 @@ describeEmbeddedPostgres("BLO-20396 dispatch query plans", () => {
     expect(rowsInspected(laneRecovery.root)).toBeLessThanOrEqual(RECOVERY_LANE_ABSOLUTE_BOUND);
     expect(RECOVERY_LANE_ABSOLUTE_BOUND).toBeLessThan(DEEP_BACKLOG_ROWS / 10);
   }, 300_000);
+
+  /**
+   * BLO-20736: the head scan's own bound, at production-shaped depth.
+   *
+   * The first test's `not.toContain("Sort")` assertion passed for the wrong
+   * reason. At AGENT_QUEUED_ROWS = 350, packed densely at the tail of the heap,
+   * PostgreSQL estimated the match set at a handful of rows and the ordered
+   * index scan won by a hair — not because the plan was robust, but because the
+   * estimate was tiny. `agent_id = X` and `status = 'queued'` are estimated
+   * independently and multiplied, and they are in fact almost perfectly
+   * correlated, so the estimate is wildly low: measured 200x low at depth 1000
+   * (rows=5 vs 1000) and 42x low at depth 5000 (rows=120 vs 5000). Deepen the
+   * queue and the planner flips to `Bitmap Heap Scan` + top-N `Sort`, which
+   * cannot emit until it has consumed its whole input — so the dispatcher reads
+   * and sorts the agent's ENTIRE queue to return SCAN_LIMIT rows, under the
+   * strict per-agent start lock, and it gets worse as the backlog grows.
+   *
+   * Two properties are asserted, at two depths, against the SAME ceiling:
+   * the head page is served by an ordered index-only scan with no Sort, and the
+   * work it does is independent of queue depth. One depth cannot show the
+   * second property, which is the one that actually matters.
+   *
+   * The fixture interleaves the agent's rows one per stride across the whole
+   * insert order. The original packed 1000 rows into ~38 heap blocks, where
+   * bitmap+sort is genuinely the better plan and the good plan is not worth
+   * asserting. Interleaved, each queued row sits on its own heap page
+   * (`Heap Blocks: exact=<depth>` in the report), which is the production shape.
+   *
+   * The fixture is also VACUUMed, and that is load-bearing rather than
+   * incidental: an index-only scan is costed cheaply only when the visibility
+   * map reports most pages all-visible, and on a NEVER-vacuumed table
+   * (relallvisible = 0) the planner falls back to bitmap+sort even for this
+   * projection. Production is continuously autovacuumed and the cost model reads
+   * the table-wide relallvisible/relpages fraction, so a vacuumed fixture is the
+   * honest one. Churn alone does not break it — updating every queued row and
+   * re-ANALYZEing without a VACUUM still plans index-only.
+   */
+  it("bounds the dispatch head scan independently of queue depth", async () => {
+    const report: string[] = [];
+    /**
+     * Same ceiling for every depth. Deriving it from the depth would make the
+     * assertion vacuous: the whole claim is that the work does NOT grow.
+     */
+    const HEAD_ABSOLUTE_BOUND = SCAN_LIMIT * 3;
+
+    for (const depth of DISPATCH_HEAD_DEPTHS) {
+      const database = await startEmbeddedPostgresTestDatabase(`paperclip-blo20736-${depth}-`);
+      cleanups.push(database.cleanup);
+      const sql = postgres(database.connectionString, { max: 1, onnotice: () => {} });
+      cleanups.push(async () => sql.end());
+
+      await seedInterleavedQueue(sql, depth);
+      const [{ queued }] = await sql.unsafe(
+        `SELECT count(*)::int AS queued FROM heartbeat_runs
+          WHERE agent_id = '${AGENT}'::uuid AND status = 'queued'`,
+      ) as Array<{ queued: number }>;
+      expect(queued).toBe(depth);
+
+      const record = (title: string, plan: { text: string; root: Record<string, unknown> }) => {
+        report.push(`\n===== ${title} =====\n${plan.text}\n-- rows inspected: ${rowsInspected(plan.root)}`);
+        if (PLAN_REPORT) fs.writeFileSync(PLAN_REPORT, report.join("\n"));
+      };
+
+      // The shape the dispatcher used to issue, MEASURED but not asserted on —
+      // it is the before-evidence for why the projection changed, and pinning
+      // it would lock in the bad plan as a requirement.
+      record(`depth ${depth}: head scan BEFORE (SELECT *)`, await explain(sql, DISPATCH_QUERY));
+
+      const probe = await explain(sql, DISPATCH_HEAD_PROBE);
+      record(`depth ${depth}: head probe (created_at, id only)`, probe);
+
+      expect(indexesUsed(probe.root)).toContain(DISPATCH_INDEX);
+      expect(scanKinds(probe.root)).not.toContain("Seq Scan");
+      expect(scanKinds(probe.root)).not.toContain("Bitmap Heap Scan");
+      // Ordered straight off the index. A Sort here would mean the whole match
+      // set is consumed before the first row is emitted, which is the defect.
+      expect(planNodes(probe.root).map((n) => n["Node Type"])).not.toContain("Sort");
+      expect(scanKinds(probe.root)).toContain("Index Only Scan");
+      expect(rowsInspected(probe.root)).toBeLessThanOrEqual(HEAD_ABSOLUTE_BOUND);
+
+      // Same, resumed mid-queue: the cursor must be satisfied BY the index, not
+      // rechecked after it, or every resumed pass re-walks the discarded prefix.
+      const probeCursor = await explain(sql, DISPATCH_HEAD_PROBE_CURSOR);
+      record(`depth ${depth}: head probe, resumed`, probeCursor);
+      const probeCursorNode = indexScanNode(probeCursor.root, DISPATCH_INDEX);
+      expect(probeCursorNode).not.toBeNull();
+      expect(String(probeCursorNode?.["Index Cond"] ?? "")).toMatch(KEYSET_PREDICATE);
+      expect(String(probeCursorNode?.["Filter"] ?? "")).not.toMatch(KEYSET_PREDICATE);
+      expect(planNodes(probeCursor.root).map((n) => n["Node Type"])).not.toContain("Sort");
+      expect(rowsInspected(probeCursor.root)).toBeLessThanOrEqual(HEAD_ABSOLUTE_BOUND);
+
+      // Deferred emergency-admission refusals are filtered *after* the raw
+      // cursor-bearing probe in production. If they were pushed into SQL as
+      // `NOT IN (...)`, PostgreSQL would have to keep walking the ordered index
+      // until it found SCAN_LIMIT non-deferred rows or proved none remained.
+      // Simulate several pages of deferred ids: each raw probe remains bounded,
+      // advances from the unfiltered page, and liveness reaches the next
+      // non-deferred page.
+      const deferredRows = await sql.unsafe(
+        `SELECT created_at::text AS created_at_text, id::text AS id FROM heartbeat_runs
+          WHERE agent_id = '${AGENT}'::uuid AND status = 'queued'
+          ORDER BY created_at ASC, id ASC
+          LIMIT ${SCAN_LIMIT * 3}`,
+      ) as Array<{ created_at_text: string; id: string }>;
+      expect(deferredRows).toHaveLength(SCAN_LIMIT * 3);
+      const deferredIds = new Set(deferredRows.map((row) => row.id));
+      let deferredCursor: { createdAt: string; id: string } | null = null;
+      for (let pass = 0; pass < 3; pass += 1) {
+        const deferredProbeQuery = dispatchHeadProbeQuery(deferredCursor);
+        const deferredProbe = await explain(sql, deferredProbeQuery);
+        record(`depth ${depth}: deferred raw probe pass ${pass + 1}`, deferredProbe);
+        expect(rowsInspected(deferredProbe.root)).toBeLessThanOrEqual(HEAD_ABSOLUTE_BOUND);
+
+        const rawPage = await sql.unsafe(deferredProbeQuery) as Array<{
+          dispatch_created_at_cursor: string;
+          id: string;
+        }>;
+        expect(rawPage).toHaveLength(SCAN_LIMIT);
+        expect(rawPage.every((row) => deferredIds.has(row.id))).toBe(true);
+        const last = rawPage[rawPage.length - 1]!;
+        deferredCursor = { createdAt: last.dispatch_created_at_cursor, id: last.id };
+      }
+      const afterDeferredRows = await sql.unsafe(dispatchHeadProbeQuery(deferredCursor)) as Array<{
+        dispatch_created_at_cursor: string;
+        id: string;
+      }>;
+      expect(afterDeferredRows).toHaveLength(SCAN_LIMIT);
+      expect(afterDeferredRows.every((row) => !deferredIds.has(row.id))).toBe(true);
+
+      // Phase 2 hydrates exactly the probed page by primary key, so it is bounded
+      // by SCAN_LIMIT and not by the queue behind it.
+      const pageIds = (await sql.unsafe(
+        `SELECT id FROM heartbeat_runs
+          WHERE agent_id = '${AGENT}'::uuid AND status = 'queued'
+          ORDER BY created_at ASC, id ASC LIMIT ${SCAN_LIMIT}`,
+      ) as Array<{ id: string }>).map((row) => `'${row.id}'::uuid`);
+      // Phase 2 hydrates exactly the probed page by primary key, so it is bounded
+      // by SCAN_LIMIT and not by the queue behind it. The id list is the ONLY
+      // predicate on purpose: adding `AND status = 'queued'` here makes the
+      // dispatch index look attractive again and PostgreSQL drives the fetch
+      // from it instead of the primary key, reintroducing the unbounded shape.
+      // The dispatcher re-checks status in JS instead.
+      const hydrate = await explain(
+        sql,
+        `SELECT * FROM heartbeat_runs WHERE id IN (${pageIds.join(", ")})`,
+      );
+      record(`depth ${depth}: page hydrate by primary key`, hydrate);
+      expect(indexesUsed(hydrate.root)).toContain("heartbeat_runs_pkey");
+      expect(scanKinds(hydrate.root)).not.toContain("Seq Scan");
+      expect(rowsInspected(hydrate.root)).toBeLessThanOrEqual(HEAD_ABSOLUTE_BOUND * 2);
+
+      while (cleanups.length > 0) await cleanups.pop()?.();
+    }
+
+    // The two depths are far enough apart, and deep enough, that a plan whose
+    // work tracks the backlog cannot satisfy one ceiling at both.
+    expect(DISPATCH_HEAD_DEPTHS[0]).toBeGreaterThanOrEqual(SCAN_LIMIT * 5);
+    expect(DISPATCH_HEAD_DEPTHS[1]).toBeGreaterThanOrEqual(DISPATCH_HEAD_DEPTHS[0]! * 5);
+    expect(HEAD_ABSOLUTE_BOUND).toBeLessThan(DISPATCH_HEAD_DEPTHS[0]! / 1.5);
+  }, 900_000);
 });

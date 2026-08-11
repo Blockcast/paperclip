@@ -241,6 +241,11 @@ type ProductivityReviewServiceDeps = {
   beforeFinalMonitorSuppressionRevalidation?: (evidence: ProductivityReviewEvidence) => Promise<void> | void;
   afterFinalMonitorReviewReservation?: (evidence: ProductivityReviewEvidence, review: IssueRow) => Promise<void> | void;
   beforeStaleReservationRecoveryFinalize?: (review: IssueRow, sourceIssue: IssueRow) => Promise<void> | void;
+  afterStaleReservationRecoveryFinalize?: (
+    review: IssueRow,
+    sourceIssue: IssueRow,
+    finalized: boolean,
+  ) => Promise<void> | void;
 };
 
 class MonitorSuppressedBeforeCreateError extends Error {
@@ -2424,6 +2429,8 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           "- Block with an unblock owner (the work needs human direction; name the gate)",
           "- Stop/cancel (the work is not delivering value and should be wound down)",
           "- Continue with a snooze window (only if the assignee has a clear next step but no surface evidence yet)",
+          "",
+          "If you choose \"Block with an unblock owner\", file the escalation in this same run: create a `request_board_approval` approval with this review's source issue in `issueIds`, naming the gate and the exact human action needed. The source link is required and the source must be authorized before the approval is created — an unlinked card reaches a human with no context, and a review run may not attach arbitrary same-company issues. A stated gate with no approval card reaches nobody, and polling a human-only gate is not a substitute. This review runs on the cheap status-only profile, which is permitted to create that one approval type and no other.",
         ]),
     ].join("\n");
   }
@@ -2510,7 +2517,9 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           },
           "productivity review reservation recovered and finalized",
         );
-        return finalized.finalized || finish.createdActivityInserted || finish.assignmentWakeProcessed
+        // Finalization and finish use separate locks, so side-effect ownership
+        // identifies the single reconciler that completed creation.
+        return finish.createdActivityInserted || finish.assignmentWakeProcessed
           ? { kind: "created" as const, reviewIssueId: finalized.review.id }
           : { kind: "existing" as const, reviewIssueId: finalized.review.id };
       }
@@ -2938,12 +2947,19 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           description: review.description ?? `Review productivity for ${sourceIssue.identifier ?? sourceIssue.title}`,
           generatedAt: input.now,
         });
+        await deps?.afterStaleReservationRecoveryFinalize?.(
+          finalized.review,
+          sourceIssue,
+          finalized.finalized,
+        );
         const finish = await finishCreatedProductivityReview(
           finalized.review,
           reservationRecoveryFinishEvidence(sourceIssue, input.now),
           review.assigneeAgentId,
         );
-        if (finalized.finalized || finish.createdActivityInserted || finish.assignmentWakeProcessed) {
+        // Finalization and finish use separate locks, so side-effect ownership
+        // identifies the single reconciler that completed creation.
+        if (finish.createdActivityInserted || finish.assignmentWakeProcessed) {
           result.created += 1;
           result.reviewIssueIds.push(finalized.review.id);
         } else {
