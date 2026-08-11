@@ -30,6 +30,7 @@ on:
 
 permissions:
   contents: read
+  issues: read
   pull-requests: write
   actions: read
 
