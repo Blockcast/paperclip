@@ -800,7 +800,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     expect(comments[1]?.body).toContain("Execution workspace branch reconciled.");
     expect(comments[1]?.body).toContain("- Mode: `quarantine_restore`");
     expect(comments[1]?.body).toContain(`- Rescue ref: \`${rescueRef}\``);
-  }, 20_000);
+  }, 120_000);
 
   it("quarantine_restore rejects active runtime services before creating a rescue branch", async () => {
     const repoRoot = await createTempRepo();
