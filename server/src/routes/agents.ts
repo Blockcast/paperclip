@@ -4229,6 +4229,111 @@ export function agentRoutes(
     });
   });
 
+  /**
+   * Which agents cannot run right now, and until when (BLO-24011).
+   *
+   * A `scheduled_retry` park is invisible at fleet level today: the only way to
+   * discover that an agent is parked is to invoke a heartbeat on it and notice
+   * you got an existing run back. During the 2026-08-09 capacity incident that
+   * meant a critical issue sat assigned to a frozen agent, looking owned,
+   * because nothing answered "is this agent actually able to work?".
+   *
+   * Ordered soonest-due first so the tail of the list is the part that needs
+   * attention, and `overdueMs` is computed server-side because a park whose due
+   * time has passed without the sweep promoting it is a different failure from
+   * a park that is simply long.
+   */
+  router.get("/companies/:companyId/parked-agents", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+
+    const { reason, limit = 200 } = z.object({
+      reason: z.string().min(1).max(64).optional(),
+      limit: z.coerce.number().int().min(1).max(1000).optional(),
+    }).parse(req.query);
+
+    const now = new Date();
+    const rows = await db
+      .select({
+        runId: heartbeatRuns.id,
+        agentId: heartbeatRuns.agentId,
+        agentName: agentsTable.name,
+        agentStatus: agentsTable.status,
+        adapterType: agentsTable.adapterType,
+        scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
+        scheduledRetryAttempt: heartbeatRuns.scheduledRetryAttempt,
+        scheduledRetryReason: heartbeatRuns.scheduledRetryReason,
+        errorCode: heartbeatRuns.errorCode,
+        createdAt: heartbeatRuns.createdAt,
+        // The park metadata (advertised reset, clamped-from horizon) lives only
+        // in result_json — the generated columns project summary/error, not these.
+        resultJson: heartbeatRuns.resultJson,
+      })
+      .from(heartbeatRuns)
+      .innerJoin(agentsTable, eq(agentsTable.id, heartbeatRuns.agentId))
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, companyId),
+          eq(heartbeatRuns.status, "scheduled_retry"),
+          ...(reason ? [eq(heartbeatRuns.scheduledRetryReason, reason)] : []),
+        ),
+      )
+      .orderBy(asc(heartbeatRuns.scheduledRetryAt))
+      .limit(limit + 1);
+
+    const truncated = rows.length > limit;
+    // Same per-agent read decision the agents list applies, so an agent caller
+    // sees exactly the agents it is already allowed to see — this endpoint adds
+    // a schedule view, not a new visibility boundary.
+    const visible = await filterAgentsForActor(
+      req,
+      rows.slice(0, limit).map((row) => ({ ...row, id: row.agentId, companyId })),
+      companyId,
+    );
+    const parked = visible.map((row) => {
+      const result = (row.resultJson ?? {}) as Record<string, unknown>;
+      const dueMs = row.scheduledRetryAt?.getTime() ?? null;
+      return {
+        agentId: row.agentId,
+        agentName: row.agentName,
+        agentStatus: row.agentStatus,
+        adapterType: row.adapterType,
+        runId: row.runId,
+        reason: row.scheduledRetryReason,
+        attempt: row.scheduledRetryAttempt,
+        errorCode: row.errorCode,
+        parkedSince: row.createdAt,
+        scheduledRetryAt: row.scheduledRetryAt,
+        retryInMs: dueMs === null ? null : Math.max(0, dueMs - now.getTime()),
+        // A park that is already due but still sitting here means the promotion
+        // sweep is not draining it — the freeze mode this endpoint exists for.
+        overdueMs: dueMs === null ? null : Math.max(0, now.getTime() - dueMs),
+        // What the provider asked for, beside what we actually booked, so the
+        // two can be compared without opening the run.
+        penstockProvider: typeof result.penstockProvider === "string" ? result.penstockProvider : null,
+        penstockModel: typeof result.penstockModel === "string" ? result.penstockModel : null,
+        penstockRetryAfterSeconds:
+          typeof result.penstockRetryAfterSeconds === "number" ? result.penstockRetryAfterSeconds : null,
+        penstockAdvertisedResumeAt:
+          typeof result.penstockAdvertisedResumeAt === "string" ? result.penstockAdvertisedResumeAt : null,
+        capacityParkClampedFrom:
+          typeof result.penstockCapacityParkClampedFrom === "string"
+            ? result.penstockCapacityParkClampedFrom
+            : null,
+      };
+    });
+
+    res.json({
+      generatedAt: now,
+      reason: reason ?? null,
+      limit,
+      truncated,
+      parkedCount: parked.length,
+      overdueCount: parked.filter((entry) => (entry.overdueMs ?? 0) > 0).length,
+      agents: parked,
+    });
+  });
+
   router.get("/companies/:companyId/live-runs", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);

@@ -329,6 +329,21 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
       },
     ),
     makeTool(
+      "paperclipListParkedAgents",
+      "Answer \"which agents cannot run right now, and until when?\". Lists agents whose heartbeat run is parked on a scheduled retry, soonest-due first, with the retry reason, attempt number, and — for provider-capacity parks — what the provider advertised beside what was actually booked. Use this instead of invoking a heartbeat on each agent to discover it is frozen. Filter with reason (e.g. ccrotate_capacity).",
+      z.object({ companyId: companyIdOptional, reason: z.string().min(1).max(64).optional(), limit: z.number().int().min(1).max(1000).optional() }),
+      async ({ companyId, reason, limit }) => {
+        const resolved = await client.resolveCompany({ override: companyId });
+        const query = new URLSearchParams();
+        if (reason) query.set("reason", reason);
+        if (limit !== undefined) query.set("limit", String(limit));
+        const suffix = query.size > 0 ? `?${query.toString()}` : "";
+        return client.requestJson("GET", `/companies/${resolved}/parked-agents${suffix}`, {
+          companyId: resolved,
+        });
+      },
+    ),
+    makeTool(
       "paperclipGetAgent",
       "Get one agent's full record by id: status, budget (monthly cap + spend), pause/error reason, and org-chain health.",
       z.object({ agentId: z.string().min(1), companyId: companyIdOptional }),
