@@ -95,6 +95,13 @@ describe("parseProviderCapacityResetHorizon", () => {
     ).toBe(resetIso);
   });
 
+  // BLO-18278 settled which fields this PARSER reads, and BLO-24490 deliberately
+  // left that intact: all four still yield the instant. Parsing and parking are
+  // different questions. What a model-authored reading now earns is decided at
+  // the call site — it needs an observed 429, exactly as the over-cap and
+  // structured paths do — so this assertion is about text, not disposition. Do
+  // not read it as "prose alone can park a run"; see the resolver's
+  // `machineAuthored` cases below and the e2e pair at the bottom of this file.
   it("reads the horizon from resultJson text fields too", () => {
     for (const key of ["result", "message", "error", "summary"] as const) {
       expect(
@@ -258,17 +265,76 @@ describe("resolveProviderCapacityHorizon separates silence from an over-cap adve
     }
   });
 
-  // Prose is untrusted for the over-cap claim only. Which fields may supply a
-  // *usable* instant was settled in BLO-18278 and is asserted above — this pins
-  // that the narrowing did not silently change it.
-  it("still reads a within-cap horizon from model prose", () => {
+  // BLO-24490: the resolver still READS a within-cap horizon out of model prose
+  // — `result` is dual-provenance, carrying the SDK's API-error text whenever
+  // `is_error` is true (see claude-local/src/server/parse.test.ts:482), so
+  // dropping it would lose genuine capacity payloads on any adapter that funnels
+  // the fault there. What changed is that it now says WHO wrote it, and the call
+  // site makes an untrusted reading earn an observed 429.
+  it("still reads a within-cap horizon from model prose, flagged as model-authored", () => {
+    const usableIso = new Date(now + 60_000).toISOString();
+    for (const key of ["result", "summary"] as const) {
+      const resolved = resolveProviderCapacityHorizon(
+        { resultJson: { [key]: `capacity may reset at ${usableIso}` } },
+        now,
+      );
+      expect(resolved.kind).toBe("usable");
+      expect(resolved.kind === "usable" && resolved.at.toISOString()).toBe(usableIso);
+      expect(resolved.kind === "usable" && resolved.machineAuthored).toBe(false);
+    }
+  });
+
+  it("flags a within-cap horizon from a machine-authored field as machine-authored", () => {
+    const usableIso = new Date(now + 60_000).toISOString();
+    for (const input of [
+      { errorMessage: `capacity may reset at ${usableIso}` },
+      { resultJson: { message: `capacity may reset at ${usableIso}` } },
+      { resultJson: { error: `capacity may reset at ${usableIso}` } },
+    ]) {
+      const resolved = resolveProviderCapacityHorizon(input, now);
+      expect(resolved.kind).toBe("usable");
+      expect(resolved.kind === "usable" && resolved.machineAuthored).toBe(true);
+    }
+  });
+
+  // Candidate order is errorMessage → result → message → error → summary, so
+  // `result` is reached before the machine-authored resultJson fields. Returning
+  // on the first usable hit would report the model's instant and then make it
+  // earn a 429 the machine-authored one beside it never needed. The genuine
+  // horizon must win outright, not lose a race to iteration order.
+  it("prefers a machine-authored horizon over model prose seen first", () => {
+    const proseIso = new Date(now + 23 * 60 * 60 * 1000).toISOString();
+    const genuineIso = new Date(now + 60_000).toISOString();
+    const resolved = resolveProviderCapacityHorizon(
+      {
+        resultJson: {
+          result: `capacity may reset at ${proseIso}`,
+          message: `capacity may reset at ${genuineIso}`,
+        },
+      },
+      now,
+    );
+    expect(resolved.kind).toBe("usable");
+    expect(resolved.kind === "usable" && resolved.at.toISOString()).toBe(genuineIso);
+    expect(resolved.kind === "usable" && resolved.machineAuthored).toBe(true);
+  });
+
+  // A usable reading of either provenance still outranks an over-cap one, as it
+  // did before BLO-24490 — the model-authored case is deferred, not demoted.
+  it("keeps a model-authored usable horizon ahead of a machine-authored over-cap one", () => {
     const usableIso = new Date(now + 60_000).toISOString();
     const resolved = resolveProviderCapacityHorizon(
-      { resultJson: { summary: `capacity may reset at ${usableIso}` } },
+      {
+        resultJson: {
+          result: `capacity may reset at ${usableIso}`,
+          message: "capacity may reset at 2031-01-01T00:00:00.000Z",
+        },
+      },
       now,
     );
     expect(resolved.kind).toBe("usable");
     expect(resolved.kind === "usable" && resolved.at.toISOString()).toBe(usableIso);
+    expect(resolved.kind === "usable" && resolved.machineAuthored).toBe(false);
   });
 });
 
@@ -301,6 +367,19 @@ const STRUCTURED_429_TEST_ADAPTER = "provider_capacity_horizon_structured_test";
 const OVER_CAP_429_TEST_ADAPTER = "provider_capacity_horizon_over_cap_test";
 const PROSE_OVER_CAP_429_TEST_ADAPTER = "provider_capacity_horizon_prose_over_cap_test";
 const NON_429_OVER_CAP_TEST_ADAPTER = "provider_capacity_horizon_non_429_over_cap_test";
+// BLO-24490: the within-cap counterparts. `usable` was the half #1142 left
+// ungated, and it is reachable end-to-end from model prose ALONE — no provider
+// status anywhere in the payload. isRateLimitExhausted's path 3 scans
+// `result`/`summary` for cap text, so the same sentence both classifies the run
+// as throttled and supplies the horizon.
+const PROSE_USABLE_NO_429_TEST_ADAPTER = "provider_capacity_horizon_prose_usable_no_429_test";
+const PROSE_USABLE_WITH_429_TEST_ADAPTER = "provider_capacity_horizon_prose_usable_with_429_test";
+// Within the 24h cap, so it never reaches the over-cap path — but still nearly a
+// full day of sidelining, which is the harm this issue is about.
+const PROSE_USABLE_HORIZON_MS = 23 * 60 * 60 * 1000;
+const PROSE_USABLE_MESSAGE = (resetIso: string) =>
+  `I hit my usage limit partway through. The gateway earlier said capacity may reset at ${resetIso}, ` +
+  `so I stopped rather than retry.`;
 
 if (!embeddedPostgresSupport.supported) {
   console.warn(
@@ -337,6 +416,12 @@ describeEmbeddedPostgres("provider 429 advertising a capacity reset honors that 
   // which is now in the past and would resolve as an elapsed horizon.
   const overCapAdvertisedAt = new Date(Date.now() + OVER_CAP_RETRY_SECONDS * 1000);
   const overCapAdvertisedIso = overCapAdvertisedAt.toISOString();
+
+  // BLO-24490: within the cap, so `resolveProviderCapacityHorizon` reports it
+  // `usable` and the over-cap gate never sees it — yet it sidelines the issue
+  // for 23h all the same.
+  const proseUsableAt = new Date(Date.now() + PROSE_USABLE_HORIZON_MS);
+  const proseUsableIso = proseUsableAt.toISOString();
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-provider-capacity-horizon-");
@@ -464,6 +549,46 @@ describeEmbeddedPostgres("provider 429 advertising a capacity reset honors that 
       }),
       testEnvironment: testEnvironment(NON_429_OVER_CAP_TEST_ADAPTER),
     });
+
+    // BLO-24490: the whole failure mode, with NO provider signal of any kind.
+    // One sentence of the agent's own summary does both jobs — "usage limit"
+    // trips isRateLimitExhausted's path-3 text scan so the run classifies as
+    // throttled, and "capacity may reset at <23h>" then supplies the horizon.
+    // There is no `api_error_status`, no `error_status`, no 429 in
+    // `errorMessage`: nothing here came from the provider. This must take the
+    // ordinary flat hop.
+    registerServerAdapter({
+      type: PROSE_USABLE_NO_429_TEST_ADAPTER,
+      execute: async () => ({
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        resultJson: { result: PROSE_USABLE_MESSAGE(proseUsableIso) } as Record<string, unknown>,
+      }),
+      testEnvironment: testEnvironment(PROSE_USABLE_NO_429_TEST_ADAPTER),
+    });
+
+    // The control for the case above, and the reason this is corroboration
+    // rather than a ban on prose: identical text, plus a 429 the server actually
+    // observed. `result` is dual-provenance — it carries the SDK's own API-error
+    // text when `is_error` is true — so a genuine capacity payload that lands
+    // only there must still park, or the fix would have re-opened BLO-18278 on
+    // the adapters this server-side parser exists to cover.
+    registerServerAdapter({
+      type: PROSE_USABLE_WITH_429_TEST_ADAPTER,
+      execute: async () => ({
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        resultJson: {
+          ...BLO_18278_RESULT_JSON,
+          result: PROSE_USABLE_MESSAGE(proseUsableIso),
+        } as Record<string, unknown>,
+      }),
+      testEnvironment: testEnvironment(PROSE_USABLE_WITH_429_TEST_ADAPTER),
+    });
   }, 120_000);
 
   afterAll(async () => {
@@ -473,6 +598,8 @@ describeEmbeddedPostgres("provider 429 advertising a capacity reset honors that 
     unregisterServerAdapter(OVER_CAP_429_TEST_ADAPTER);
     unregisterServerAdapter(PROSE_OVER_CAP_429_TEST_ADAPTER);
     unregisterServerAdapter(NON_429_OVER_CAP_TEST_ADAPTER);
+    unregisterServerAdapter(PROSE_USABLE_NO_429_TEST_ADAPTER);
+    unregisterServerAdapter(PROSE_USABLE_WITH_429_TEST_ADAPTER);
     await cleanupHeartbeatTestState(db, heartbeat, {
       errorLabel: "provider capacity horizon cleanup",
       drainTimeoutMs: 30_000,
@@ -781,5 +908,72 @@ describeEmbeddedPostgres("provider 429 advertising a capacity reset honors that 
     expect(retryRun?.status).toBe("scheduled_retry");
     const scheduledInMs = (retryRun?.scheduledRetryAt?.getTime() ?? 0) - startedAt;
     expect(scheduledInMs).toBeLessThan(PROVIDER_CAPACITY_MAX_HORIZON_MS * 0.1);
+  }, 60_000);
+
+  // BLO-24490 — the load-bearing case. #1142 closed the over-cap half of this
+  // and deliberately left the within-cap half open; this closes it.
+  //
+  // Nothing in this payload came from the provider. The agent's own summary says
+  // "usage limit", which classifies the run as throttled, and "capacity may reset
+  // at <23h>", which supplies the horizon. Two readings of one sentence the model
+  // wrote were enough to sideline the issue until tomorrow. The `usable` /
+  // `over_horizon` line is a bound on the number, not a statement about who wrote
+  // it — 23h is not meaningfully safer than 24h — so the same corroboration
+  // applies on both sides of it.
+  it("does not park a within-cap horizon that only model prose stated", async () => {
+    const { agentId } = await seedAgent(PROSE_USABLE_NO_429_TEST_ADAPTER);
+    const startedAt = Date.now();
+
+    const run = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
+    expect(run).not.toBeNull();
+
+    const failedRun = await waitForRunToFinish(heartbeat, run!.id, 20_000);
+    expect(failedRun?.status).toBe("failed");
+    // The prose still classifies the fault — only the horizon is refused.
+    expect(failedRun?.errorCode).toBe("rate_limit_exhausted");
+
+    const resultJson = failedRun?.resultJson as Record<string, unknown> | null;
+    expect(resultJson?.retryNotBefore ?? null).toBeNull();
+    expect(resultJson?.providerCapacityResetAt ?? null).toBeNull();
+    expect(resultJson?.providerCapacityResetProvenance ?? null).toBeNull();
+
+    await expect
+      .poll(() => countRetriesOf(run!.id), { timeout: 5_000, interval: 50 })
+      .toBe(1);
+
+    const retryRun = await retryRowOf(run!.id);
+    expect(retryRun?.status).toBe("scheduled_retry");
+
+    // Fails without the call-site gate: this lands ~23h out instead of ~90s.
+    const scheduledInMs = (retryRun?.scheduledRetryAt?.getTime() ?? 0) - startedAt;
+    expect(scheduledInMs).toBeLessThan(RATE_LIMIT_HEARTBEAT_RETRY_DELAY_MS * 2);
+    expect(scheduledInMs).toBeLessThan(PROSE_USABLE_HORIZON_MS * 0.1);
+  }, 60_000);
+
+  // The control, and the half that keeps this a bound rather than a removal.
+  // Same prose, same field, plus a 429 the server observed — a real capacity
+  // payload landing in `result`, which is what the SDK does when `is_error` is
+  // true. This must still park at the advertised instant. Without it, a green
+  // suite would be equally consistent with having simply stopped reading
+  // `result` at all, which is the change BLO-24490 explicitly rejected.
+  it("still parks a within-cap prose horizon corroborated by an observed 429", async () => {
+    const { agentId } = await seedAgent(PROSE_USABLE_WITH_429_TEST_ADAPTER);
+
+    const run = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
+    expect(run).not.toBeNull();
+
+    const failedRun = await waitForRunToFinish(heartbeat, run!.id, 20_000);
+    expect(failedRun?.status).toBe("failed");
+
+    const resultJson = failedRun?.resultJson as Record<string, unknown> | null;
+    expect(resultJson?.providerCapacityResetAt).toBe(proseUsableIso);
+
+    await expect
+      .poll(() => countRetriesOf(run!.id), { timeout: 5_000, interval: 50 })
+      .toBe(1);
+
+    const retryRun = await retryRowOf(run!.id);
+    expect(retryRun?.status).toBe("scheduled_retry");
+    expect(retryRun?.scheduledRetryAt?.toISOString()).toBe(proseUsableIso);
   }, 60_000);
 });
