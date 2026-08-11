@@ -27,6 +27,7 @@ import { buildPaperclipWakePayload } from "../services/heartbeat.js";
 import { computeIssueMonitorGateFingerprint } from "../services/issue-execution-policy.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
 import { issueService } from "../services/issues.js";
+import { subscribeCompanyLiveEvents } from "../services/live-events.js";
 import {
   STRANDED_RECOVERY_MAX_OWNER_WAKE_ATTEMPTS,
   STRANDED_RECOVERY_OWNER_WAKE_HORIZON_MS,
@@ -414,6 +415,46 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     return { companyId, managerId, coderId, sourceIssueId, prefix, sourceIssue: sourceIssue! };
   }
 
+  async function seedPendingReviewRecovery() {
+    const fixture = await seedCompany();
+    const stageId = randomUUID();
+    const executionState = {
+      status: "pending" as const,
+      currentStageId: stageId,
+      currentStageIndex: 0,
+      currentStageType: "review" as const,
+      currentParticipant: { type: "agent" as const, agentId: fixture.managerId, userId: null },
+      returnAssignee: { type: "agent" as const, agentId: fixture.coderId, userId: null },
+      reviewRequest: null,
+      completedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+    };
+    await db.update(issues).set({
+      status: "in_review",
+      executionState,
+    }).where(eq(issues.id, fixture.sourceIssueId));
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, fixture.sourceIssueId))
+      .then((rows) => rows[0]!);
+    const latestRun = {
+      id: randomUUID(),
+      companyId: fixture.companyId,
+      agentId: fixture.managerId,
+      status: "failed",
+      errorCode: "adapter_failed",
+      error: "reviewer adapter failed",
+      contextSnapshot: { issueId: fixture.sourceIssueId, executionStage: { stageId } },
+      resultJson: null,
+      usageJson: null,
+      livenessState: null,
+      createdAt: new Date(),
+    } as const;
+    return { ...fixture, stageId, issue, latestRun };
+  }
+
   async function seedHeartbeatRun(input: {
     companyId: string;
     agentId: string;
@@ -481,6 +522,265 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(second.evidence).toMatchObject({ latestRunId: "run-2" });
     expect(await svc.getActiveForIssue(companyId, sourceIssueId)).toMatchObject({ id: first.id });
     expect(await svc.getActiveForIssue(randomUUID(), sourceIssueId)).toBeNull();
+  });
+
+  it.each([
+    ["job_missing", "in_progress"],
+    ["job_missing", "todo"],
+    ["job_missing", "in_review"],
+    ["k8s_pod_schedule_failed", "in_progress"],
+    ["k8s_pod_schedule_failed", "todo"],
+    ["k8s_pod_schedule_failed", "in_review"],
+  ] as const)("does not enqueue recovery work after %s leaves an issue %s", async (errorCode, status) => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    let stageId: string | null = null;
+    if (status === "in_review") {
+      stageId = randomUUID();
+      await db.update(issues).set({
+        status,
+        executionPolicy: {
+          mode: "normal",
+          commentRequired: true,
+          stages: [{
+            id: stageId,
+            type: "review",
+            approvalsNeeded: 1,
+            participants: [{ id: randomUUID(), type: "agent", agentId: coderId, userId: null }],
+          }],
+        },
+        executionState: {
+          status: "pending",
+          currentStageId: stageId,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: coderId, userId: null },
+          returnAssignee: { type: "agent", agentId: coderId, userId: null },
+          reviewRequest: null,
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+        },
+      }).where(eq(issues.id, sourceIssueId));
+    } else if (status === "todo") {
+      await db.update(issues).set({ status }).where(eq(issues.id, sourceIssueId));
+    }
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId: coderId,
+      invocationSource: "automation",
+      status: "failed",
+      error: "External lifecycle Job is missing while heartbeat run is still running",
+      errorCode,
+      resultJson: {
+        externalLifecycleRecovery: { adapterInvocationStarted: true },
+      },
+      contextSnapshot: {
+        issueId: sourceIssueId,
+        ...(stageId ? { executionStage: { stageId, stageType: "review" } } : {}),
+      },
+      startedAt: new Date("2026-07-26T13:45:00.000Z"),
+      finishedAt: new Date("2026-07-26T13:52:00.000Z"),
+    });
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result).toMatchObject({
+      continuationRequeued: 0,
+      dispatchRequeued: 0,
+      reviewParticipantRequeued: 0,
+      escalated: 1,
+    });
+    expect(enqueueWakeup).toHaveBeenCalledTimes(1);
+    expect(enqueueWakeup.mock.calls[0]?.[1]).toMatchObject({
+      reason: "source_scoped_recovery_action",
+      contextSnapshot: {
+        allowDeliverableWork: false,
+        recoveryIntent: "status_only",
+      },
+    });
+    const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(updatedIssue).toMatchObject({ status: "blocked" });
+    const comments = await db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, sourceIssueId));
+    expect(comments.some(({ body }) => body.includes("non-retryable failure"))).toBe(true);
+  });
+
+  it("does not escalate a stale review failure after the active stage advances", async () => {
+    const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
+    const staleStageId = randomUUID();
+    const activeStageId = randomUUID();
+    const executionState = (stageId: string, participantAgentId: string) => ({
+      status: "pending" as const,
+      currentStageId: stageId,
+      currentStageIndex: 0,
+      currentStageType: "review" as const,
+      currentParticipant: { type: "agent" as const, agentId: participantAgentId, userId: null },
+      returnAssignee: { type: "agent" as const, agentId: coderId, userId: null },
+      reviewRequest: null,
+      completedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+    });
+    await db.update(issues).set({
+      status: "in_review",
+      executionState: executionState(staleStageId, managerId),
+    }).where(eq(issues.id, sourceIssueId));
+    const staleIssue = await db.select().from(issues).where(eq(issues.id, sourceIssueId)).then((rows) => rows[0]!);
+    const staleRun = {
+      id: randomUUID(),
+      companyId,
+      agentId: managerId,
+      status: "failed",
+      errorCode: "job_missing",
+      error: "External lifecycle Job disappeared after adapter invocation",
+      contextSnapshot: { issueId: sourceIssueId, executionStage: { stageId: staleStageId } },
+      resultJson: null,
+      usageJson: null,
+      livenessState: null,
+      createdAt: new Date(),
+    } as const;
+
+    await db.update(issues).set({
+      executionState: executionState(activeStageId, coderId),
+    }).where(eq(issues.id, sourceIssueId));
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const updated = await recovery.escalateStrandedAssignedIssue({
+      issue: staleIssue,
+      previousStatus: "in_review",
+      latestRun: staleRun,
+      recoveryCause: "execution_review_participant_recovery",
+      recoveryOwnerAgentId: managerId,
+      expectedReviewStage: {
+        stageId: staleStageId,
+        participantAgentId: managerId,
+        executionRunId: null,
+      },
+    });
+
+    expect(updated).toBeNull();
+    expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+    const [freshIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(freshIssue).toMatchObject({
+      status: "in_review",
+      executionState: {
+        currentStageId: activeStageId,
+        currentParticipant: { type: "agent", agentId: coderId },
+      },
+    });
+  });
+
+  it("redelivers a review-stage recovery wake after post-commit dispatch failure", async () => {
+    const { companyId, managerId, sourceIssueId, stageId, issue, latestRun } = await seedPendingReviewRecovery();
+    const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
+    enqueueWakeup.mockRejectedValueOnce(new Error("wake dispatch unavailable"));
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    await expect(recovery.escalateStrandedAssignedIssue({
+      issue,
+      previousStatus: "in_review",
+      latestRun,
+      recoveryCause: "execution_review_participant_recovery",
+      recoveryOwnerAgentId: managerId,
+      expectedReviewStage: {
+        stageId,
+        participantAgentId: managerId,
+        executionRunId: null,
+      },
+    })).rejects.toThrow("wake dispatch unavailable");
+
+    const [blockedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(blockedIssue).toMatchObject({ status: "blocked" });
+    const [action] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssueId));
+    expect(action).toMatchObject({ status: "active", ownerAgentId: managerId });
+
+    const retryNow = new Date();
+    await db
+      .update(issueRecoveryActions)
+      .set({ lastAttemptAt: new Date(retryNow.getTime() - 31 * 60 * 1000) })
+      .where(eq(issueRecoveryActions.id, action!.id));
+
+    const repaired = await recovery.reconcileStrandedRecoveryWakeBackstop({
+      companyId,
+      now: retryNow,
+      cooldownMs: 30 * 60 * 1000,
+    });
+
+    expect(repaired).toMatchObject({ healed: 1, issueIds: [sourceIssueId] });
+    expect(enqueueWakeup).toHaveBeenCalledTimes(2);
+    expect(enqueueWakeup.mock.calls[1]?.[1]).toMatchObject({
+      reason: "source_scoped_recovery_action",
+      payload: {
+        issueId: sourceIssueId,
+        recoveryActionId: action!.id,
+        backstop: "stranded_recovery_wake_backstop",
+      },
+      contextSnapshot: {
+        issueId: sourceIssueId,
+        recoveryActionId: action!.id,
+        backstop: "stranded_recovery_wake_backstop",
+      },
+    });
+  });
+
+  it("publishes the committed review-stage escalation activity", async () => {
+    const { companyId, managerId, sourceIssueId, stageId, issue, latestRun } = await seedPendingReviewRecovery();
+    const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const seen: unknown[] = [];
+    const unsubscribe = subscribeCompanyLiveEvents(companyId, (event) => {
+      seen.push(event);
+    });
+
+    try {
+      await recovery.escalateStrandedAssignedIssue({
+        issue,
+        previousStatus: "in_review",
+        latestRun,
+        recoveryCause: "execution_review_participant_recovery",
+        recoveryOwnerAgentId: managerId,
+        expectedReviewStage: {
+          stageId,
+          participantAgentId: managerId,
+          executionRunId: null,
+        },
+      });
+    } finally {
+      unsubscribe();
+    }
+
+    expect(seen).toContainEqual(expect.objectContaining({
+      type: "activity.logged",
+      payload: expect.objectContaining({
+        action: "issue.updated",
+        entityId: sourceIssueId,
+        details: expect.objectContaining({
+          status: "blocked",
+          source: "recovery.reconcile_execution_review_participant",
+        }),
+      }),
+    }));
+    const activity = await db
+      .select({ id: activityLog.id, action: activityLog.action, details: activityLog.details })
+      .from(activityLog)
+      .where(and(eq(activityLog.companyId, companyId), eq(activityLog.entityId, sourceIssueId)));
+    expect(activity).toContainEqual(expect.objectContaining({
+      action: "issue.updated",
+      details: expect.objectContaining({
+        source: "recovery.reconcile_execution_review_participant",
+      }),
+    }));
   });
 
   it("escalates stranded assigned work into a source action instead of a recovery issue", async () => {
@@ -896,7 +1196,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       errorCode: "adapter_failed",
       startedAt: new Date("2026-07-15T20:00:00.000Z"),
       finishedAt: new Date("2026-07-15T20:01:00.000Z"),
-      contextSnapshot: { issueId: sourceIssueId },
+      contextSnapshot: { issueId: sourceIssueId, executionStage: { stageId, stageType: "review" } },
     });
     const enqueueWakeup = vi.fn(async () => null);
     const recovery = recoveryService(db, { enqueueWakeup });
@@ -957,7 +1257,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       errorCode: "adapter_failed",
       startedAt: new Date("2026-07-15T20:00:00.000Z"),
       finishedAt: new Date("2026-07-15T20:01:00.000Z"),
-      contextSnapshot: { issueId: sourceIssueId },
+      contextSnapshot: { issueId: sourceIssueId, executionStage: { stageId, stageType: "review" } },
     });
     const enqueueWakeup = vi.fn(async () => null);
     const recovery = recoveryService(db, { enqueueWakeup });
@@ -1044,7 +1344,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       errorCode: "adapter_failed",
       startedAt: new Date("2026-07-15T20:00:00.000Z"),
       finishedAt: new Date("2026-07-15T20:01:00.000Z"),
-      contextSnapshot: { issueId: sourceIssueId },
+      contextSnapshot: { issueId: sourceIssueId, executionStage: { stageId, stageType: "review" } },
     }, {
       id: assigneeRunId,
       companyId,
@@ -1116,7 +1416,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       errorCode: "adapter_failed",
       startedAt: new Date("2026-07-15T20:00:00.000Z"),
       finishedAt: new Date("2026-07-15T20:01:00.000Z"),
-      contextSnapshot: { issueId: sourceIssueId },
+      contextSnapshot: { issueId: sourceIssueId, executionStage: { stageId, stageType: "review" } },
     });
     const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() } as never));
     const recovery = recoveryService(db, { enqueueWakeup });

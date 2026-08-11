@@ -21,6 +21,11 @@ test("PR verification runs for merge-queue heads with event-appropriate diff SHA
     "merge-group runs must not re-evaluate PR-only lockfile exemptions without author/branch metadata",
   );
   assert.match(workflow, /\n  verify:\n/);
+  assert.match(
+    workflow,
+    /\n  verify:\n(?:    [^\n]*\n)*?    if: \$\{\{ always\(\) && !cancelled\(\) \}\}\n/,
+    "a cancelled workflow must not materialize verify and retain the merge-group concurrency lock",
+  );
 });
 
 // BLO-20867: extract the actual `run:` shell script from the `verify` job's
