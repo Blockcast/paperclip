@@ -209,6 +209,7 @@ import {
   TERMINAL_HEARTBEAT_RUN_STATUSES,
 } from "./issue-execution-lock.js";
 import {
+  releaseIssueRunOwnership,
   restoreCheckoutPromotedStatus,
   restoreCheckoutPromotedStatuses,
 } from "./issue-checkout-status.js";
@@ -15723,21 +15724,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       error: reason,
     });
 
-    await db
-      .update(issues)
-      .set({
-        executionRunId: null,
-        executionAgentNameKey: null,
-        executionLockedAt: null,
-        updatedAt: now,
-      })
-      .where(
-        and(
-          eq(issues.companyId, run.companyId),
-          eq(issues.id, issueId),
-          eq(issues.executionRunId, run.id),
-        ),
-      );
+    await releaseIssueRunOwnership(db, {
+      issueId,
+      companyId: run.companyId,
+      runId: run.id,
+      updatedAt: now,
+    });
     // The run was cancelled before it could advance anything, so undo the
     // `in_progress` its checkout wrote (BLO-20649).
     await restoreCheckoutPromotedStatus(db, { issueId, companyId: run.companyId });
@@ -15961,21 +15953,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       error: staleness.reason,
     });
 
-    await db
-      .update(issues)
-      .set({
-        executionRunId: null,
-        executionAgentNameKey: null,
-        executionLockedAt: null,
-        updatedAt: now,
-      })
-      .where(
-        and(
-          eq(issues.companyId, run.companyId),
-          eq(issues.id, issueId),
-          eq(issues.executionRunId, run.id),
-        ),
-      );
+    await releaseIssueRunOwnership(db, {
+      issueId,
+      companyId: run.companyId,
+      runId: run.id,
+      updatedAt: now,
+    });
     // The run was cancelled before it could advance anything, so undo the
     // `in_progress` its checkout wrote (BLO-20649).
     await restoreCheckoutPromotedStatus(db, { issueId, companyId: run.companyId });
@@ -16994,7 +16977,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       runId: input.run.id,
     });
     const deferredCheckoutRestoreIssueId = finalizedRun.status === "succeeded"
-      ? readRuntimeStatusIssueIdCandidate(finalizedRun) ?? null
+      ? issueIdFromRunContext(finalizedRun.contextSnapshot) ?? null
       : null;
     const promotedRunDispatched = await releaseIssueExecutionAndPromote(finalizedRun, {
       deferPrimaryCheckoutRestoration: deferredCheckoutRestoreIssueId !== null,
@@ -23767,7 +23750,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
         const issueCommentPolicyResult = await finalizeIssueCommentPolicy(livenessRun, agent);
         const deferredCheckoutRestoreIssueId = livenessRun.status === "succeeded"
-          ? readRuntimeStatusIssueIdCandidate(livenessRun) ?? null
+          ? issueIdFromRunContext(livenessRun.contextSnapshot) ?? null
           : null;
         const promotedRunDispatched = await releaseIssueExecutionAndPromote(livenessRun, {
           suppressImmediateRecovery,
@@ -24431,7 +24414,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     } = {},
   ): Promise<boolean> {
     const runContext = parseObject(run.contextSnapshot);
-    const contextIssueId = readNonEmptyString(runContext.issueId);
+    const contextIssueId = issueIdFromRunContext(runContext);
     const taskKey = deriveTaskKeyWithHeartbeatFallback(runContext, null);
     const recoveryAgent = await getAgent(run.agentId);
     const recoveryAgentInvokable =

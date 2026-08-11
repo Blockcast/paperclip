@@ -1,9 +1,54 @@
-import { and, eq, inArray, isNotNull, sql } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, or, sql } from "drizzle-orm";
 import { heartbeatRuns, issues, type Db } from "@paperclipai/db";
 import { TERMINAL_HEARTBEAT_RUN_STATUS_VALUES } from "./issue-execution-lock.js";
 
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type DbOrTransaction = Db | DbTransaction;
+
+/**
+ * Clear every issue-ownership column that still points at a terminalizing run.
+ *
+ * Each column is guarded independently so a stale finalizer cannot erase a
+ * newer execution claim. The checkout column must be released alongside the
+ * execution lock: restoring the queue-tier status while leaving a terminal
+ * checkout owner behind makes the restored issue impossible to check out.
+ */
+export async function releaseIssueRunOwnership(
+  dbOrTx: DbOrTransaction,
+  target: { issueId: string; companyId: string; runId: string; updatedAt?: Date },
+): Promise<boolean> {
+  const released = await dbOrTx
+    .update(issues)
+    .set({
+      checkoutRunId: sql<string | null>`case
+        when ${issues.checkoutRunId} = ${target.runId} then null
+        else ${issues.checkoutRunId}
+      end`,
+      executionRunId: sql<string | null>`case
+        when ${issues.executionRunId} = ${target.runId} then null
+        else ${issues.executionRunId}
+      end`,
+      executionAgentNameKey: sql<string | null>`case
+        when ${issues.executionRunId} = ${target.runId} then null
+        else ${issues.executionAgentNameKey}
+      end`,
+      executionLockedAt: sql<Date | null>`case
+        when ${issues.executionRunId} = ${target.runId} then null
+        else ${issues.executionLockedAt}
+      end`,
+      updatedAt: target.updatedAt ?? new Date(),
+    })
+    .where(
+      and(
+        eq(issues.id, target.issueId),
+        eq(issues.companyId, target.companyId),
+        or(eq(issues.checkoutRunId, target.runId), eq(issues.executionRunId, target.runId)),
+      ),
+    )
+    .returning({ id: issues.id });
+
+  return released.length > 0;
+}
 
 /**
  * The guard shared by both restore entry points: a checkout promotion may only be
