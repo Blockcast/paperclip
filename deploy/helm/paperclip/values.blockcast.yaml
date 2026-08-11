@@ -52,6 +52,14 @@ env:
         secretKeyRef:
           name: paperclip-database-url
           key: url
+    # Production PostgreSQL backups are owned by the paperclip-pg-backup
+    # CronJob in Blockcast/onprem-k8s. It writes validated custom-format dumps
+    # to the dedicated backup PVC and authoritative Azure Blob destination,
+    # with freshness/failure alerting from kube-state-metrics. Do not also run
+    # Paperclip's local .sql.gz scheduler against paperclip-data: that creates a
+    # second retention policy and reports stale health for an obsolete path.
+    - name: PAPERCLIP_DB_BACKUP_ENABLED
+      value: "false"
     # Shared bearer token so paperclip-plugin-alertmanager auto-config matches
     # the cluster's monitoring/alertmanager-receivers Secret. Same value, two
     # namespaces. Bootstrap reads this at startup via
