@@ -73,6 +73,7 @@ import {
   updateUserSecretValueSchema,
   // Approval
   createApprovalSchema,
+  listApprovalsQuerySchema,
   resolveApprovalSchema,
   requestApprovalRevisionSchema,
   resubmitApprovalSchema,
@@ -1509,7 +1510,7 @@ registry.registerPath({
   method: "get",
   path: "/api/agents/me/inbox-lite",
   tags: ["agents"],
-  summary: "Get current agent inbox (lite)",
+  summary: "Get current agent inbox (lite) — todo, in_progress, blocked (in_review excluded)",
   responses: { 200: r.ok(), 401: r.unauthorized },
 });
 
@@ -2841,8 +2842,14 @@ registry.registerPath({
   path: "/api/companies/{companyId}/approvals",
   tags: ["approvals"],
   summary: "List approvals in a company",
-  request: { params: z.object({ companyId: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  description:
+    "view=full (default) returns whole payload bodies. Use view=count or view=summary for a cheap " +
+    "existence check before filing a new approval — summary omits payload and adds a derived label.",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    query: listApprovalsQuerySchema,
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
 });
 
 registry.registerPath({
@@ -3725,6 +3732,21 @@ registry.registerPath({
     params: z.object({ companyId: z.string() }),
     query: z.object({
       lookbackHours: z.coerce.number().int().min(1).max(168).optional(),
+      limit: z.coerce.number().int().min(1).max(1000).optional(),
+    }),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/parked-agents",
+  tags: ["runs"],
+  summary: "List agents parked on a scheduled retry, and when each is due to run again",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    query: z.object({
+      reason: z.string().min(1).max(64).optional(),
       limit: z.coerce.number().int().min(1).max(1000).optional(),
     }),
   },
