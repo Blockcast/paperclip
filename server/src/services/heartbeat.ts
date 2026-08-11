@@ -29263,6 +29263,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           finalizedAt: finishedAt,
         });
       }
+      // BLO-21460: cancellation never released the run's ephemeral
+      // environment lease (releaseEnvironmentLeasesForRun is called on every
+      // other terminal path -- interrupted-shutdown, normal finalize,
+      // process_lost -- but not here), so a cancelled run's lease sat active
+      // until something else incidentally reconciled it. Idempotent: safe to
+      // call even if the run never held a lease or was already released by a
+      // prior cancel attempt.
+      await releaseEnvironmentLeasesForRun({
+        runId: cancelled.id,
+        companyId: cancelled.companyId,
+        agentId: cancelled.agentId,
+        status: cancelled.status,
+        failureReason: reason,
+      });
     }
 
     // RCA 2026-05-06: external-lifecycle adapters (claude_k8s, opencode_k8s)
@@ -29284,6 +29298,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         logger.warn(
           { runId: run.id, error: error instanceof Error ? error.message : String(error) },
           "cancelRun: cascade Job delete failed (run still finalized as cancelled)",
+        );
+      }
+    }
+
+    // BLO-21460: reservation release for a cancelled run previously depended
+    // entirely on `reapOrphanedRuns`, which itself only runs when a queued
+    // run triggers dispatch for this same agent (see
+    // `startNextQueuedRunForAgent`). An agent cancelled with no queued work
+    // behind it left the reservation in `release_pending` indefinitely,
+    // holding a concurrency slot until unrelated dispatch pressure elsewhere
+    // happened to reconcile it -- exactly how the 2026-08-03 incident
+    // exhausted executor capacity. Trigger the same, already-verified
+    // reconciler here so a cancel reconciles its own reservation immediately
+    // instead of waiting on pressure that may never come. Workers-tier only,
+    // matching the existing `paperclipNodeRole === "api"` dispatch fence --
+    // the API tier does not own Job lifecycle and must not touch it.
+    if (agent && hasExternalLifecycle(agent.adapterType) && paperclipNodeRole !== "api") {
+      try {
+        await reapOrphanedRuns({ suppressDispatchAfterReap: true });
+      } catch (error) {
+        logger.warn(
+          { runId: run.id, error: error instanceof Error ? error.message : String(error) },
+          "cancelRun: post-cancel reservation reconciliation failed (run still finalized as cancelled)",
         );
       }
     }
@@ -29346,6 +29383,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
       await releaseIssueExecutionAndPromote(run);
 
+      // BLO-21460: mirrors the environment-lease release added to
+      // cancelRunInternal -- bulk agent cancel never released the lease
+      // either. Idempotent; safe on repeat cancel.
+      await releaseEnvironmentLeasesForRun({
+        runId: run.id,
+        companyId: run.companyId,
+        agentId: run.agentId,
+        status: "cancelled",
+        failureReason: reason,
+      });
+
       // Mirrors the cascade in cancelRunInternal — bulk agent cancel must
       // also release the k8s Job slot for external-lifecycle runs.
       if (agent && hasExternalLifecycle(agent.adapterType)) {
@@ -29361,6 +29409,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             "cancelActiveForAgent: cascade Job delete failed (run still finalized as cancelled)",
           );
         }
+      }
+    }
+
+    // BLO-21460: reconcile reservations for the whole agent once after the
+    // loop rather than per-run inside it -- reapOrphanedRuns scans globally,
+    // so calling it once here already covers every run just cancelled above.
+    // See cancelRunInternal for the full rationale.
+    if (agent && hasExternalLifecycle(agent.adapterType) && paperclipNodeRole !== "api" && runs.length > 0) {
+      try {
+        await reapOrphanedRuns({ suppressDispatchAfterReap: true });
+      } catch (error) {
+        logger.warn(
+          { agentId, error: error instanceof Error ? error.message : String(error) },
+          "cancelActiveForAgent: post-cancel reservation reconciliation failed (runs still finalized as cancelled)",
+        );
       }
     }
 
