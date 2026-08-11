@@ -608,7 +608,7 @@ describe("threshold and reporting", () => {
    * use) one function over.
    */
   it("rejects an empty bucket-bound array instead of rendering an `undefinedd+` bucket", () => {
-    const report = buildHumanGatedAgeingReport(
+    const report = selectAgedHumanGatedIssues(
       [issue({ id: "d10", lastHumanTouchAt: daysAgo(10) })],
       { now: NOW, escalateAfterDaysByPriority: flat(30) },
     );
@@ -619,7 +619,7 @@ describe("threshold and reporting", () => {
   });
 
   it("rejects a non-finite or negative bucket bound", () => {
-    const report = buildHumanGatedAgeingReport(
+    const report = selectAgedHumanGatedIssues(
       [issue({ id: "d10", lastHumanTouchAt: daysAgo(10) })],
       { now: NOW, escalateAfterDaysByPriority: flat(30) },
     );

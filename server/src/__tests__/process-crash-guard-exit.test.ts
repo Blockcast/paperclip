@@ -79,7 +79,7 @@ function runFixture(kind: "throw" | "reject", padBytes: number, strictRejections
 function runFixtureWithStalledStderr(): Promise<StalledCrashResult> {
   return new Promise((resolve, reject) => {
     const child = spawn(tsx, [fixture, "throw", "0", "prefill-stderr"], {
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: ["pipe", "pipe", "pipe"],
     });
     child.stderr.pause();
 
@@ -99,6 +99,7 @@ function runFixtureWithStalledStderr(): Promise<StalledCrashResult> {
         child.kill("SIGKILL");
         reject(new Error("crash guard did not exit while stderr was stalled"));
       }, 2_000);
+      child.stdin.end("CRASH\n");
     });
 
     child.on("error", reject);

@@ -34,10 +34,22 @@ const repoRoot = path.resolve(
 
 const MARKER = "paperclip.blockcast.net/approval-plan-sha256";
 const DEPLOYED_COMMIT = "paperclip.blockcast.net/deployed-commit";
+const DEPLOY_NAMESPACE = "paperclip";
 // Any 64-hex string exercises the plumbing; the real value is a SHA-256 the
 // release job computes from the unstamped render.
 const SAMPLE = "a".repeat(64);
 const SAMPLE_COMMIT = "0123456789abcdef0123456789abcdef01234567";
+
+function parseYaml(yaml) {
+  const parsed = JSON.parse(
+    execFileSync("yq", ["eval", "-o=json", "."], {
+      input: yaml,
+      encoding: "utf8",
+    }),
+  );
+  parsed.metadata.namespace ??= DEPLOY_NAMESPACE;
+  return parsed;
+}
 
 function renderApiDeployment(extraArgs = []) {
   const yaml = execFileSync(
@@ -56,15 +68,7 @@ function renderApiDeployment(extraArgs = []) {
     ],
     { cwd: repoRoot, encoding: "utf8" },
   );
-  // kubectl is the YAML->JSON reader here purely so the comparison below is
-  // structural rather than textual; --dry-run=client needs no cluster.
-  return JSON.parse(
-    execFileSync("kubectl", ["create", "--dry-run=client", "-o", "json", "-f", "-"], {
-      input: yaml,
-      encoding: "utf8",
-      stdio: ["pipe", "pipe", "ignore"],
-    }),
-  );
+  return parseYaml(yaml);
 }
 
 function stampApiDeployment(deployment, marker = SAMPLE, deployedCommit = "") {
@@ -79,16 +83,11 @@ function stampApiDeployment(deployment, marker = SAMPLE, deployedCommit = "") {
         ...process.env,
         PAPERCLIP_APPROVAL_PLAN_SHA256: marker,
         PAPERCLIP_DEPLOYED_COMMIT: deployedCommit,
+        PAPERCLIP_DEPLOY_NAMESPACE: DEPLOY_NAMESPACE,
       },
     },
   );
-  return JSON.parse(
-    execFileSync("kubectl", ["create", "--dry-run=client", "-o", "json", "-f", "-"], {
-      input: yaml,
-      encoding: "utf8",
-      stdio: ["pipe", "pipe", "ignore"],
-    }),
-  );
+  return parseYaml(yaml);
 }
 
 function markerFor(deployment) {

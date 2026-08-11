@@ -12,6 +12,7 @@ import {
   githubCommitStatusDeliveries,
   heartbeatRunEvents,
   heartbeatRuns,
+  issueComments,
   issueRelations,
   issues,
   projects,
@@ -21,7 +22,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { cleanupHeartbeatTestState } from "./helpers/cleanup-heartbeat-test-state.js";
-import { registerServerAdapter, unregisterServerAdapter } from "../adapters/index.ts";
+import { registerServerAdapter, runningProcesses, unregisterServerAdapter } from "../adapters/index.ts";
 import {
   BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS,
   CAPACITY_BLOCKED_HEARTBEAT_RETRY_MAX_ATTEMPTS,
@@ -33,6 +34,8 @@ import {
   heartbeatService,
   isRetryableInteractionContinuationInfrastructureFailure,
   probeStaleKillReviewEvidence,
+  SESSION_UNAVAILABLE_HEARTBEAT_RETRY_DELAY_MS,
+  SESSION_UNAVAILABLE_HEARTBEAT_RETRY_MAX_ATTEMPTS,
   shouldScheduleAutomaticRunRetry,
 } from "../services/heartbeat.js";
 
@@ -2086,6 +2089,369 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     ).toBe(false);
   });
 
+  it("retries session-unavailable failures independent of the heartbeat interval", () => {
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "session_unavailable",
+        resultJson: {},
+        contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
+      }),
+    ).toBe(true);
+    expect(SESSION_UNAVAILABLE_HEARTBEAT_RETRY_DELAY_MS).toBeLessThanOrEqual(2 * 60 * 1000);
+    expect(SESSION_UNAVAILABLE_HEARTBEAT_RETRY_MAX_ATTEMPTS).toBe(2);
+  });
+
+  it("preserves the zero-token reset marker on a session-unavailable retry", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const issueId = randomUUID();
+    const now = new Date();
+    await seedQueuedRunFixture({
+      companyId,
+      agentId,
+      runId,
+      now,
+      contextSnapshot: {
+        issueId,
+        wakeReason: "issue_zero_token_session_reset",
+        retryReason: "zero_token_session_reset",
+      },
+    });
+    mockAdapterExecute.mockResolvedValueOnce({
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      errorMessage: "Session unavailable",
+      errorCode: "session_unavailable",
+      summary: "failed",
+      resultJson: {},
+      provider: "test",
+      model: "test-model",
+    });
+
+    await heartbeat.__test_executeRunForTesting(runId);
+
+    const failedRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    const retryRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.retryOfRunId, runId))
+      .then((rows) => rows[0] ?? null);
+    expect(retryRun?.scheduledRetryReason).toBe("zero_token_session_reset");
+    expect(retryRun?.contextSnapshot).toMatchObject({
+      retryReason: "zero_token_session_reset",
+      wakeReason: "session_unavailable_retry",
+      scheduledRetryAttempt: 1,
+    });
+    expect(failedRun?.contextSnapshot).toMatchObject({ adapterType: "codex_local" });
+  });
+
+  it("keeps session reset retries separate from ordinary retries with the same parent and attempt", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const rootRunId = randomUUID();
+    const activeRunId = randomUUID();
+    const issueId = randomUUID();
+    const now = new Date();
+    await seedQueuedRunFixture({
+      companyId,
+      agentId,
+      runId: activeRunId,
+      now,
+      contextSnapshot: {
+        issueId,
+        taskKey: issueId,
+        wakeReason: "session_unavailable_retry",
+        retryReason: "session_unavailable",
+      },
+    });
+    await db.insert(heartbeatRuns).values({
+      id: rootRunId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "failed",
+      errorCode: "session_unavailable",
+      error: "Session unavailable",
+      finishedAt: new Date(now.getTime() - 1_000),
+      contextSnapshot: { issueId, taskKey: issueId },
+      createdAt: new Date(now.getTime() - 1_000),
+      updatedAt: new Date(now.getTime() - 1_000),
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({
+        status: "running",
+        startedAt: now,
+        retryOfRunId: rootRunId,
+        scheduledRetryAttempt: 1,
+        scheduledRetryReason: "session_unavailable",
+      })
+      .where(eq(heartbeatRuns.id, activeRunId));
+    runningProcesses.set(activeRunId, {
+      child: {} as never,
+      graceSec: 0,
+      processGroupId: null,
+    });
+
+    try {
+      await heartbeat.wakeup(agentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_zero_token_session_reset",
+        payload: { issueId },
+        contextSnapshot: {
+          issueId,
+          taskKey: issueId,
+          retryOfRunId: rootRunId,
+          retryReason: "zero_token_session_reset",
+          scheduledRetryAttempt: 1,
+        },
+        retryOfRunId: rootRunId,
+        scheduledRetryAttempt: 1,
+      });
+
+      const wakeRows = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.agentId, agentId));
+      expect(wakeRows.some((row) => row.reason === "retry_execution_duplicate")).toBe(false);
+      const deferredReset = wakeRows.find((row) => row.status === "deferred_issue_execution");
+      expect(deferredReset).not.toBeNull();
+      const deferredContext = (
+        deferredReset?.payload as {
+          _paperclipWakeContext?: { retryReason?: string };
+        } | null
+      )?._paperclipWakeContext;
+      expect(deferredContext?.retryReason).toBe("zero_token_session_reset");
+    } finally {
+      runningProcesses.delete(activeRunId);
+    }
+  });
+
+  it("partitions deferred retries by family while coalescing exact duplicates", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const rootRunId = randomUUID();
+    const activeRunId = randomUUID();
+    const issueId = randomUUID();
+    const now = new Date();
+    await seedQueuedRunFixture({
+      companyId,
+      agentId,
+      runId: activeRunId,
+      now,
+      contextSnapshot: { issueId, taskKey: issueId, wakeReason: "issue_assigned" },
+    });
+    await db.insert(heartbeatRuns).values({
+      id: rootRunId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "failed",
+      errorCode: "session_unavailable",
+      error: "Session unavailable",
+      finishedAt: new Date(now.getTime() - 1_000),
+      contextSnapshot: { issueId, taskKey: issueId },
+      createdAt: new Date(now.getTime() - 1_000),
+      updatedAt: new Date(now.getTime() - 1_000),
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "running", startedAt: now })
+      .where(eq(heartbeatRuns.id, activeRunId));
+    runningProcesses.set(activeRunId, {
+      child: {} as never,
+      graceSec: 0,
+      processGroupId: null,
+    });
+
+    const enqueueRetry = (retryReason: "session_unavailable" | "zero_token_session_reset") =>
+      heartbeat.wakeup(agentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: `${retryReason}_retry`,
+        payload: { issueId },
+        contextSnapshot: {
+          issueId,
+          taskKey: issueId,
+          retryOfRunId: rootRunId,
+          retryReason,
+          scheduledRetryAttempt: 1,
+        },
+        retryOfRunId: rootRunId,
+        scheduledRetryAttempt: 1,
+      });
+
+    try {
+      await enqueueRetry("session_unavailable");
+      await enqueueRetry("session_unavailable");
+      await enqueueRetry("zero_token_session_reset");
+
+      const deferredRows = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.status, "deferred_issue_execution"));
+      expect(deferredRows).toHaveLength(2);
+      const deferredByReason = new Map(
+        deferredRows.map((row) => {
+          const context = (
+            row.payload as {
+              _paperclipWakeContext?: { retryReason?: string };
+            } | null
+          )?._paperclipWakeContext;
+          return [context?.retryReason, row] as const;
+        }),
+      );
+      expect(deferredByReason.get("session_unavailable")?.coalescedCount).toBe(1);
+      expect(deferredByReason.get("zero_token_session_reset")?.coalescedCount).toBe(0);
+    } finally {
+      runningProcesses.delete(activeRunId);
+    }
+  });
+
+  it("does not queue generic recovery after the final session-unavailable attempt fails", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const issueId = randomUUID();
+    const now = new Date();
+    await seedQueuedRunFixture({
+      companyId,
+      agentId,
+      runId,
+      now,
+      contextSnapshot: {
+        issueId,
+        taskKey: issueId,
+        wakeReason: "session_unavailable_retry",
+        retryReason: "session_unavailable",
+      },
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({ scheduledRetryAttempt: 2, scheduledRetryReason: "session_unavailable" })
+      .where(eq(heartbeatRuns.id, runId));
+    mockAdapterExecute.mockResolvedValueOnce({
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      errorMessage: "Session unavailable",
+      errorCode: "session_unavailable",
+      summary: "failed",
+      resultJson: {},
+      provider: "test",
+      model: "test-model",
+    });
+
+    await heartbeat.__test_executeRunForTesting(runId);
+
+    const followupRuns = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, companyId), sql`${heartbeatRuns.id} <> ${runId}`));
+    expect(followupRuns).toHaveLength(0);
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]);
+    expect(issue?.executionRunId).toBeNull();
+  });
+
+  it("keeps a deferred comment wake separate when a stale session reset is cancelled", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const rootRunId = randomUUID();
+    const activeRunId = randomUUID();
+    const issueId = randomUUID();
+    const commentId = randomUUID();
+    const now = new Date();
+    await seedQueuedRunFixture({
+      companyId,
+      agentId,
+      runId: activeRunId,
+      now,
+      contextSnapshot: { issueId, taskKey: issueId, wakeReason: "issue_assigned" },
+    });
+    await db.insert(heartbeatRuns).values({
+      id: rootRunId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "failed",
+      errorCode: "session_unavailable",
+      error: "Session unavailable",
+      finishedAt: new Date(now.getTime() - 1_000),
+      contextSnapshot: { issueId, taskKey: issueId },
+      createdAt: new Date(now.getTime() - 1_000),
+      updatedAt: new Date(now.getTime() - 1_000),
+    });
+    await db.insert(issueComments).values({
+      id: commentId,
+      companyId,
+      issueId,
+      body: "Please continue with the new information.",
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "running", startedAt: now })
+      .where(eq(heartbeatRuns.id, activeRunId));
+    runningProcesses.set(activeRunId, {
+      child: {} as never,
+      graceSec: 0,
+      processGroupId: null,
+    });
+
+    try {
+      await heartbeat.wakeup(agentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_zero_token_session_reset",
+        payload: { issueId },
+        contextSnapshot: {
+          issueId,
+          taskKey: issueId,
+          retryOfRunId: rootRunId,
+          retryReason: "zero_token_session_reset",
+          scheduledRetryAttempt: 1,
+        },
+        retryOfRunId: rootRunId,
+        scheduledRetryAttempt: 1,
+      });
+      await heartbeat.wakeup(agentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_commented",
+        payload: { issueId, commentId },
+        contextSnapshot: { issueId, taskKey: issueId, wakeCommentId: commentId },
+      });
+
+      const deferredBeforeRelease = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.status, "deferred_issue_execution"));
+      expect(deferredBeforeRelease).toHaveLength(2);
+    } finally {
+      runningProcesses.delete(activeRunId);
+    }
+
+    await heartbeat.cancelRun(activeRunId, "test release");
+
+    const deferredAfterRelease = await db.select().from(agentWakeupRequests);
+    expect(deferredAfterRelease.some((row) => row.error?.includes("superseded"))).toBe(true);
+    const promotedCommentRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, companyId), sql`${heartbeatRuns.id} <> ${activeRunId}`, sql`${heartbeatRuns.id} <> ${rootRunId}`))
+      .then((rows) => rows.find((row) => row.contextSnapshot?.wakeCommentId === commentId) ?? null);
+    expect(promotedCommentRun).not.toBeNull();
+  });
+
   // BLO-9147 AC1 — thin-snapshot adapter_failed retry gate
   it("BLO-9147 AC1: retries adapter_failed on pr_review run with thin snapshot (no githubPrNumber)", () => {
     // The persisted contextSnapshot only carries reviewKind (no githubPrNumber).
@@ -2182,74 +2548,23 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     ).toBe(false);
   });
 
-  it("retries job_failed only when durable evidence proves adapter invocation never began", () => {
-    expect(
-      shouldScheduleAutomaticRunRetry({
-        errorCode: "job_failed",
-        resultJson: { externalLifecycleRecovery: { adapterInvocationStarted: false } },
-        contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
-      }),
-    ).toBe(true);
-    expect(
-      shouldScheduleAutomaticRunRetry({
-        errorCode: "job_failed",
-        resultJson: { externalLifecycleRecovery: { adapterInvocationStarted: true } },
-        contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
-      }),
-    ).toBe(false);
-    expect(
-      shouldScheduleAutomaticRunRetry({
-        errorCode: "job_failed",
-        resultJson: {},
-        contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
-      }),
-    ).toBe(false);
-    expect(
-      shouldScheduleAutomaticRunRetry({
-        errorCode: "job_failed",
-        resultJson: {},
-        contextSnapshot: { wakeReason: "heartbeat_timer" },
-      }),
-    ).toBe(false);
-    expect(
-      shouldScheduleAutomaticRunRetry({
-        errorCode: "job_failed",
-        resultJson: {},
-        contextSnapshot: null,
-      }),
-    ).toBe(false);
-    expect(JOB_FAILED_HEARTBEAT_RETRY_MAX_ATTEMPTS).toBe(4);
-  });
-
-  it("BLO-9147 AC2: CAPACITY_BLOCKED_HEARTBEAT_RETRY_MAX_ATTEMPTS exceeds rate-limit cap (12)", () => {
-    expect(CAPACITY_BLOCKED_HEARTBEAT_RETRY_MAX_ATTEMPTS).toBeGreaterThan(12);
-  });
-
-  // BLO-10448 — scheduler-level transient infra failures retry gate
-  it.each(["k8s_pod_schedule_failed", "job_missing"])(
-    "BLO-10448: retries %s on a pr_review wake (work never ran)",
+  it.each(["job_failed"])(
+    "retries %s only when durable evidence proves adapter invocation never began",
     (errorCode) => {
       expect(
         shouldScheduleAutomaticRunRetry({
           errorCode,
-          resultJson: {},
-          contextSnapshot: { wakeReason: "github_pr_opened", reviewKind: "pr_review", githubPrNumber: 408 },
+          resultJson: { externalLifecycleRecovery: { adapterInvocationStarted: false } },
+          contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
         }),
       ).toBe(true);
-      // thin snapshot (taskKey-only) — webhook-driven reviewer wakes get trimmed
       expect(
         shouldScheduleAutomaticRunRetry({
           errorCode,
-          resultJson: {},
-          contextSnapshot: { taskKey: "pr_review:Blockcast/Network-Operator-Portal:408" },
+          resultJson: { externalLifecycleRecovery: { adapterInvocationStarted: true } },
+          contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
         }),
-      ).toBe(true);
-    },
-  );
-
-  it.each(["k8s_pod_schedule_failed", "job_missing"])(
-    "BLO-10448: does NOT retry %s on non-PR wakes (BLO-7913 leak guard)",
-    (errorCode) => {
+      ).toBe(false);
       expect(
         shouldScheduleAutomaticRunRetry({
           errorCode,
@@ -2261,11 +2576,63 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         shouldScheduleAutomaticRunRetry({
           errorCode,
           resultJson: {},
-          contextSnapshot: {},
+          contextSnapshot: { wakeReason: "heartbeat_timer" },
+        }),
+      ).toBe(false);
+      expect(
+        shouldScheduleAutomaticRunRetry({
+          errorCode,
+          resultJson: {},
+          contextSnapshot: null,
+        }),
+      ).toBe(false);
+      expect(JOB_FAILED_HEARTBEAT_RETRY_MAX_ATTEMPTS).toBe(4);
+    },
+  );
+
+  it("does not retry job_missing even with synthetic never-invoked evidence", () => {
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "job_missing",
+        resultJson: { externalLifecycleRecovery: { adapterInvocationStarted: false } },
+        contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
+      }),
+    ).toBe(false);
+  });
+
+  it.each(["job_missing", "k8s_pod_schedule_failed"])(
+    "does not let stale transient metadata replay %s",
+    (errorCode) => {
+      expect(
+        shouldScheduleAutomaticRunRetry({
+          errorCode,
+          resultJson: { errorFamily: "transient_upstream" },
+          contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
         }),
       ).toBe(false);
     },
   );
+
+  it("BLO-9147 AC2: CAPACITY_BLOCKED_HEARTBEAT_RETRY_MAX_ATTEMPTS exceeds rate-limit cap (12)", () => {
+    expect(CAPACITY_BLOCKED_HEARTBEAT_RETRY_MAX_ATTEMPTS).toBeGreaterThan(12);
+  });
+
+  it("does not retry ambiguous k8s_pod_schedule_failed outcomes", () => {
+    for (const contextSnapshot of [
+      { wakeReason: "github_pr_opened", reviewKind: "pr_review", githubPrNumber: 408 },
+      { taskKey: "pr_review:Blockcast/Network-Operator-Portal:408" },
+      { issueId: randomUUID(), wakeReason: "issue_assigned" },
+      {},
+    ]) {
+      expect(
+        shouldScheduleAutomaticRunRetry({
+          errorCode: "k8s_pod_schedule_failed",
+          resultJson: {},
+          contextSnapshot,
+        }),
+      ).toBe(false);
+    }
+  });
 
   // BLO-17456: when a PR-review chain exhausts, the reviewer never posts its
   // required status, so the PR sits on "Expected — waiting for status" forever.
@@ -2550,6 +2917,34 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
           issueId: fixture.issueId,
         });
       }
+    },
+  );
+
+  it.each(["session_unavailable", "zero_token_session_reset"] as const)(
+    "schedules %s retries for an assigned todo issue while leaving its execution lock free until claim",
+    async (retryReason) => {
+      const fixture = await seedMaxTurnFixture({ issueStatus: "todo" });
+      const scheduled = await heartbeat.scheduleBoundedRetry(fixture.runId, {
+        now: fixture.now,
+        retryReason,
+        wakeReason: `${retryReason}_retry`,
+        maxAttempts: 2,
+        delayMs: 1_000,
+      });
+
+      expect(scheduled.outcome).toBe("scheduled");
+      if (scheduled.outcome !== "scheduled") return;
+      expect(scheduled.run).toMatchObject({
+        status: "scheduled_retry",
+        scheduledRetryAttempt: 1,
+        scheduledRetryReason: retryReason,
+      });
+      const issue = await db
+        .select({ executionRunId: issues.executionRunId, status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, fixture.issueId))
+        .then((rows) => rows[0] ?? null);
+      expect(issue).toEqual({ executionRunId: null, status: "todo" });
     },
   );
 
