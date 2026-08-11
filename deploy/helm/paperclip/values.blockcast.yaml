@@ -443,6 +443,20 @@ prometheusRule:
   labels:
     release: kube-prometheus-stack
 
+# ENABLED, unlike the two CRD-backed resources above (BLO-20171). The reason
+# they are off does not apply here: this renders a core `ConfigMap`, and
+# paperclip-ci-deploy is bound to ClusterRole/admin in this namespace
+# (RoleBinding paperclip-ci-deploy-admin), which covers configmaps. It is the
+# monitoring.coreos.com CRDs that admin does not reach.
+#
+# orc8r-user-grafana's dashboard sidecar watches `grafana_dashboard=1` with
+# NAMESPACE=ALL, so this ConfigMap is adopted straight out of the paperclip
+# namespace with no orc8r-side change. `cluster` is the only datasource on that
+# Grafana that can see paperclip_* series.
+grafanaDashboard:
+  enabled: true
+  datasourceUid: cluster
+
 networkPolicy:
   enabled: true
   allowFromNamespaces:

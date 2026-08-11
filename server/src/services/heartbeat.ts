@@ -208,6 +208,11 @@ import {
   TERMINAL_HEARTBEAT_RUN_STATUS_VALUES,
   TERMINAL_HEARTBEAT_RUN_STATUSES,
 } from "./issue-execution-lock.js";
+import {
+  releaseIssueRunOwnership,
+  restoreCheckoutPromotedStatus,
+  restoreCheckoutPromotedStatuses,
+} from "./issue-checkout-status.js";
 import { resolveStaleDependabotAlertWakeIssue } from "./dependabot-alert-issues.js";
 import { createToolGatewayService } from "./tool-gateway.js";
 import { toolAccessService } from "./tool-access.js";
@@ -282,6 +287,7 @@ import {
   setAgentWakeupTerminalFailedOldestAgeSeconds,
   terminalFailedWakeScopeForTaskKey,
   setExternalLifecycleRunningRuns,
+  recordExternalLifecycleRunSilenceGap,
 } from "./metrics.js";
 import { runQuotaExhaustedHook } from "./quota-exhausted-hook.js";
 import { runLifecycleHook } from "./lifecycle-hook.js";
@@ -1000,6 +1006,12 @@ export async function probeStaleKillReviewEvidence(
 export function shouldScheduleAutomaticRunRetry(
   run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson" | "contextSnapshot">,
 ) {
+  // These outcomes can follow non-idempotent external work. Reject them before
+  // reading merged result metadata, which may contain a stale transient family.
+  if (run.errorCode === "job_missing" || run.errorCode === "k8s_pod_schedule_failed") {
+    return false;
+  }
+
   // BLO-18030: a hard-stale-kill force-terminates a Job that was claimed but
   // silent past EXTERNAL_LIFECYCLE_HARD_STALE_MS. That left pr_review wakes with
   // no recovery whatsoever: the run is terminal with no bounded retry, and the
@@ -1049,6 +1061,8 @@ export function shouldScheduleAutomaticRunRetry(
     run.errorCode === "pr_review_output_missing" ||
     run.errorCode === "pr_review_verification_unavailable"
   ) {
+    const recovery = parseObject(parseObject(run.resultJson).externalLifecycleRecovery);
+    if (recovery.adapterInvocationStarted === true) return false;
     return isPrReviewRetryContext(parseObject(run.contextSnapshot));
   }
 
@@ -1061,28 +1075,17 @@ export function shouldScheduleAutomaticRunRetry(
     return isIssueRun || isPrReviewRetryContext(contextSnapshot);
   }
 
-  // A failed external-lifecycle Job may have performed non-idempotent work.
-  // Retry only when the reconciler durably proved adapter invocation never
-  // began; lock/status gates alone cannot make partial external writes safe.
+  // A failed external-lifecycle Job may have performed non-idempotent work. Retry
+  // only when the reconciler durably proved adapter invocation never began;
+  // lock/status gates alone cannot make partial external writes safe. A missing
+  // Job is only produced after adapter.invoke and therefore never reaches this
+  // safe state; pre-invocation disappearance is process_lost instead.
   if (run.errorCode === "job_failed") {
     const recovery = parseObject(parseObject(run.resultJson).externalLifecycleRecovery);
     return isIssueRun && recovery.adapterInvocationStarted === false;
   }
 
-  // BLO-10448: scheduler-level transient infra failures where the agent pod
-  // never ran — the node pool was momentarily saturated (k8s_pod_schedule_failed:
-  // Unschedulable / image-pull / schedule-timeout) or the external-lifecycle Job
-  // vanished before completion (job_missing). The work never started, so re-queue
-  // pr_review wakes with bounded backoff to let the review land once capacity
-  // frees, instead of silently dropping it (observed on the Ally reviewer path:
-  // a single Unschedulable burst dropped a PR review with no retry). Non-PR wakes
-  // stay terminal, matching the k8s_concurrent_run_blocked leak guard above.
-  if (run.errorCode === "k8s_pod_schedule_failed" || run.errorCode === "job_missing") {
-    return isPrReviewRetryContext(parseObject(run.contextSnapshot));
-  }
-
   if (run.errorCode === "session_unavailable") return true;
-
   if (run.errorCode !== "adapter_failed" && run.errorCode !== "process_lost") return false;
 
   // BLO-9147 AC1: gate on wakeReason/reviewKind/taskKey from the persisted
@@ -2484,6 +2487,20 @@ async function hasGitPushRemote(cwd: string | null | undefined) {
     if (pushUrl) return true;
   }
   return false;
+}
+
+function isNonRetryablePrReviewTerminalOutcome(
+  run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson" | "contextSnapshot">,
+) {
+  if (run.errorCode === "job_missing" || run.errorCode === "k8s_pod_schedule_failed") return true;
+  if (
+    run.errorCode !== "pr_review_output_missing" &&
+    run.errorCode !== "pr_review_verification_unavailable"
+  ) {
+    return false;
+  }
+  const recovery = parseObject(parseObject(run.resultJson).externalLifecycleRecovery);
+  return recovery.adapterInvocationStarted === true;
 }
 
 export async function assertGitWorktreeBaseWorkspaceReady(input: {
@@ -9344,9 +9361,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * delivery logging; the heartbeat lifecycle only records that the work was
    * durably queued. (BLO-17456)
    */
-  async function queueExhaustedPrReviewGateStatus(
+  async function queueFailedPrReviewGateStatus(
     run: typeof heartbeatRuns.$inferSelect,
     contextSnapshot: Record<string, unknown>,
+    reason: "retry_exhausted" | "non_retryable_external_lifecycle",
+    dbOrTx: Db | DbTransaction = db,
+    appendEvent = true,
   ) {
     const target = resolvePrReviewGateStatusTarget(
       contextSnapshot,
@@ -9354,25 +9374,37 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     );
     if (!target) return;
 
-    const delivery = await enqueueGithubCommitStatusDelivery(db, {
+    const delivery = await enqueueGithubCommitStatusDelivery(dbOrTx, {
       companyId: run.companyId,
       sourceRunId: run.id,
       repoFullName: target.repoFullName,
       sha: target.sha,
       context: target.context,
       state: "failure",
-      description: "Paperclip reviewer run exhausted its automatic retries; no review was posted.",
+      description: reason === "retry_exhausted"
+        ? "Paperclip reviewer run exhausted its automatic retries; no review was posted."
+        : "Paperclip reviewer run ended ambiguously and was not replayed; no review was confirmed.",
       targetUrl: target.prUrl,
       prNumber: target.prNumber,
       prUrl: target.prUrl,
     });
+    if (appendEvent) await appendFailedPrReviewGateStatusEvent(run, target, reason, delivery);
+    return delivery;
+  }
+
+  async function appendFailedPrReviewGateStatusEvent(
+    run: typeof heartbeatRuns.$inferSelect,
+    target: NonNullable<ReturnType<typeof resolvePrReviewGateStatusTarget>>,
+    reason: "retry_exhausted" | "non_retryable_external_lifecycle",
+    delivery: Awaited<ReturnType<typeof enqueueGithubCommitStatusDelivery>>,
+  ) {
     await appendRunEvent(run, await nextRunEventSeq(run.id), {
       eventType: "lifecycle",
       stream: "system",
       level: "info",
       message:
         delivery.status === "queued" || delivery.status === "processing"
-          ? `Queued PR-review gate status failure delivery for ${target.context} on ${target.repoFullName}@${target.sha.slice(0, 7)} after retry exhaustion`
+          ? `Queued PR-review gate status failure delivery for ${target.context} on ${target.repoFullName}@${target.sha.slice(0, 7)} after ${reason === "retry_exhausted" ? "retry exhaustion" : "a non-retryable external lifecycle failure"}`
           : `PR-review gate status failure delivery for ${target.context} on ${target.repoFullName}@${target.sha.slice(0, 7)} is already ${delivery.status}`,
       payload: {
         deliveryId: delivery.id,
@@ -11710,11 +11742,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   async function handleRunLivenessContinuation(run: typeof heartbeatRuns.$inferSelect) {
     const livenessState = run.livenessState as RunLivenessState | null;
-    if (livenessState !== "plan_only" && livenessState !== "empty_response") return;
+    if (livenessState !== "plan_only" && livenessState !== "empty_response") return false;
 
     const context = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(context.issueId);
-    if (!issueId) return;
+    if (!issueId) return false;
 
     const [issue, agent] = await Promise.all([
       db
@@ -11769,7 +11801,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           trigger: productivityHold.trigger,
           reason: productivityHold.reason,
         });
-        return;
+        return false;
       }
     }
 
@@ -11809,10 +11841,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         issueId,
         comment: decision.comment,
       });
-      return;
+      return false;
     }
 
-    if (decision.kind !== "enqueue") return;
+    if (decision.kind !== "enqueue") return Boolean(existingWake);
 
     const continuationRun = await enqueueWakeup(run.agentId, {
       source: "automation",
@@ -11834,6 +11866,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         })
         .where(eq(heartbeatRuns.id, run.id));
     }
+    return Boolean(continuationRun);
   }
 
   function issueUiLink(issue: Pick<typeof issues.$inferSelect, "id" | "identifier">) {
@@ -11908,10 +11941,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   async function handleSuccessfulRunHandoff(run: typeof heartbeatRuns.$inferSelect, agent: typeof agents.$inferSelect) {
-    if (run.status !== "succeeded") return;
+    if (run.status !== "succeeded") return false;
     const context = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(context.issueId) ?? readNonEmptyString(context.taskId);
-    if (!issueId) return;
+    if (!issueId) return false;
 
     const issue = await db
       .select({
@@ -12123,7 +12156,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
     }
 
-    if (decision.kind !== "enqueue" || !issue) return;
+    if (decision.kind !== "enqueue" || !issue) {
+      return Boolean(activeExecutionPath || queuedWake || existingWake);
+    }
 
     if (hasUnmanagedBackgroundTaskEvidence(parseObject(run.resultJson))) {
       await db
@@ -12146,7 +12181,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       requestedByActorType: "system",
       requestedByActorId: "heartbeat",
     });
-    if (!handoffRun) return;
+    if (!handoffRun) return false;
 
     await addSuccessfulRunHandoffCommentOnce({
       issue,
@@ -12173,6 +12208,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         issue: issueUiLink(issue),
       },
     });
+    return true;
   }
 
   async function appendRunEvent(
@@ -13417,6 +13453,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             eq(issues.executionRunId, cancelled.id),
           ),
         );
+      // The gate cancelled this run before it could do anything, so undo the
+      // `in_progress` its checkout wrote (BLO-20649).
+      await restoreCheckoutPromotedStatus(db, {
+        issueId: gate.issueId,
+        companyId: cancelled.companyId,
+      });
     }
 
     await appendRunEvent(cancelled, await nextRunEventSeq(cancelled.id), {
@@ -13768,6 +13810,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                   updatedAt: now,
                 })
                 .where(and(eq(issues.id, depIssueId), eq(issues.executionRunId, exhausted.id)));
+              // Retry budget is spent and no run will resume this issue, so the
+              // checkout promotion has to come back off (BLO-20649).
+              await restoreCheckoutPromotedStatus(db, {
+                issueId: depIssueId,
+                companyId: exhausted.companyId,
+              });
             }
             return { outcome: "not_promoted", run: exhausted };
           }
@@ -14139,7 +14187,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // GitHub-evidence read and transient GitHub/token failures can retry.
       // Opt-in and swallowed so status delivery can never alter exhaustion
       // handling.
-      await queueExhaustedPrReviewGateStatus(run, contextSnapshot).catch((error) => {
+      await queueFailedPrReviewGateStatus(run, contextSnapshot, "retry_exhausted").catch((error) => {
         logger.warn(
           { err: error, runId: run.id },
           "failed to queue exhausted PR-review gate status",
@@ -15676,21 +15724,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       error: reason,
     });
 
-    await db
-      .update(issues)
-      .set({
-        executionRunId: null,
-        executionAgentNameKey: null,
-        executionLockedAt: null,
-        updatedAt: now,
-      })
-      .where(
-        and(
-          eq(issues.companyId, run.companyId),
-          eq(issues.id, issueId),
-          eq(issues.executionRunId, run.id),
-        ),
-      );
+    await releaseIssueRunOwnership(db, {
+      issueId,
+      companyId: run.companyId,
+      runId: run.id,
+      updatedAt: now,
+    });
+    // The run was cancelled before it could advance anything, so undo the
+    // `in_progress` its checkout wrote (BLO-20649).
+    await restoreCheckoutPromotedStatus(db, { issueId, companyId: run.companyId });
 
     await appendRunEvent(cancelled, await nextRunEventSeq(cancelled.id), {
       eventType: "lifecycle",
@@ -15911,21 +15953,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       error: staleness.reason,
     });
 
-    await db
-      .update(issues)
-      .set({
-        executionRunId: null,
-        executionAgentNameKey: null,
-        executionLockedAt: null,
-        updatedAt: now,
-      })
-      .where(
-        and(
-          eq(issues.companyId, run.companyId),
-          eq(issues.id, issueId),
-          eq(issues.executionRunId, run.id),
-        ),
-      );
+    await releaseIssueRunOwnership(db, {
+      issueId,
+      companyId: run.companyId,
+      runId: run.id,
+      updatedAt: now,
+    });
+    // The run was cancelled before it could advance anything, so undo the
+    // `in_progress` its checkout wrote (BLO-20649).
+    await restoreCheckoutPromotedStatus(db, { issueId, companyId: run.companyId });
 
     await appendRunEvent(cancelled, await nextRunEventSeq(cancelled.id), {
       eventType: "lifecycle",
@@ -16744,7 +16780,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
       : externalLifecycleTerminalOutcome(input.jobStatus, preserveRecordedOutcome);
     const terminalOutcome =
-      baseTerminalOutcome && prReviewIncompleteOverride && !input.staleKill
+      baseTerminalOutcome && prReviewIncompleteOverride && !input.staleKill &&
+        baseTerminalOutcome.errorCode !== "job_missing"
         ? {
             ...baseTerminalOutcome,
             errorCode: prReviewIncompleteOverride.errorCode,
@@ -16753,7 +16790,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         : baseTerminalOutcome;
     if (!terminalOutcome) return false;
 
-    const adapterInvocationStarted = terminalOutcome.errorCode === "job_failed"
+    const adapterInvocationStarted =
+        baseTerminalOutcome?.errorCode === "job_failed" || baseTerminalOutcome?.errorCode === "job_missing"
       ? await hasAdapterInvocationEvent(input.run.id)
       : null;
 
@@ -16774,6 +16812,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             jobPhase: terminalOutcome.jobPhase,
             jobReason: terminalOutcome.jobReason,
             jobMessage: terminalOutcome.jobMessage,
+            ...(prReviewIncompleteOverride
+              ? {
+                  prReviewErrorCode: prReviewIncompleteOverride.errorCode,
+                  prReviewErrorMessage: prReviewIncompleteOverride.errorMessage,
+                }
+              : {}),
             ...(adapterInvocationStarted !== null ? { adapterInvocationStarted } : {}),
             ...(containerDiagnostics ? { containerDiagnostics } : {}),
           },
@@ -16874,6 +16918,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (!finalizedRun) finalizedRun = await getRun(input.run.id);
     if (!finalizedRun) return true;
 
+    // BLO-20815: additive-only telemetry, no behavioral effect. Uses the same
+    // signal precedence as the dispatcher's own staleness filter (see
+    // startNextQueuedRunForAgent below) so the metric measures exactly what
+    // EXTERNAL_LIFECYCLE_STALE_MS/EXTERNAL_LIFECYCLE_HARD_STALE_MS key on.
+    recordExternalLifecycleRunSilenceGap({
+      adapter: input.adapterType,
+      status: terminalOutcome.status,
+      run: finalizedRun,
+      finalizedAt: input.now,
+    });
+
     finalizedRun = await classifyAndPersistRunLiveness(finalizedRun, resultJson) ?? finalizedRun;
 
     // BLO-10448: job_missing (and any other automatically-retryable terminal
@@ -16888,6 +16943,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const finalizationAgent = await getAgent(finalizedRun.agentId);
     if (
       terminalOutcome.status === "failed" &&
+      adapterInvocationStarted !== true &&
       shouldScheduleAutomaticRunRetry(finalizedRun) &&
       finalizationAgent
     ) {
@@ -16920,10 +16976,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       errorCode: terminalOutcome.errorCode,
       runId: input.run.id,
     });
-    const promotedRunDispatched = await releaseIssueExecutionAndPromote(finalizedRun);
-    await handleRunLivenessContinuation(finalizedRun);
+    const deferredCheckoutRestoreIssueId = finalizedRun.status === "succeeded"
+      ? issueIdFromRunContext(finalizedRun.contextSnapshot) ?? null
+      : null;
+    const promotedRunDispatched = await releaseIssueExecutionAndPromote(finalizedRun, {
+      deferPrimaryCheckoutRestoration: deferredCheckoutRestoreIssueId !== null,
+    });
+    const livenessContinuationOwnsCheckout = await handleRunLivenessContinuation(finalizedRun);
+    let successfulHandoffOwnsCheckout = false;
     if (finalizationAgent) {
-      await handleSuccessfulRunHandoff(finalizedRun, finalizationAgent);
+      successfulHandoffOwnsCheckout = await handleSuccessfulRunHandoff(finalizedRun, finalizationAgent);
+    }
+    if (
+      deferredCheckoutRestoreIssueId &&
+      !promotedRunDispatched &&
+      !livenessContinuationOwnsCheckout &&
+      !successfulHandoffOwnsCheckout
+    ) {
+      await restoreCheckoutPromotedStatus(db, {
+        issueId: deferredCheckoutRestoreIssueId,
+        companyId: finalizedRun.companyId,
+      });
     }
     await appendRunEvent(finalizedRun, await nextRunEventSeq(finalizedRun.id), {
       eventType: "lifecycle",
@@ -23676,12 +23749,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
         }
         const issueCommentPolicyResult = await finalizeIssueCommentPolicy(livenessRun, agent);
-        await releaseIssueExecutionAndPromote(
-          livenessRun,
-          suppressImmediateRecovery ? { suppressImmediateRecovery: true } : undefined,
-        );
-        await handleRunLivenessContinuation(livenessRun);
-        await handleSuccessfulRunHandoff(
+        const deferredCheckoutRestoreIssueId = livenessRun.status === "succeeded"
+          ? issueIdFromRunContext(livenessRun.contextSnapshot) ?? null
+          : null;
+        const promotedRunDispatched = await releaseIssueExecutionAndPromote(livenessRun, {
+          suppressImmediateRecovery,
+          deferPrimaryCheckoutRestoration: deferredCheckoutRestoreIssueId !== null,
+        });
+        const livenessContinuationOwnsCheckout = await handleRunLivenessContinuation(livenessRun);
+        const successfulHandoffOwnsCheckout = await handleSuccessfulRunHandoff(
           issueCommentPolicyResult.outcome === "retry_queued" || issueCommentPolicyResult.outcome === "retry_exhausted"
             ? {
               ...livenessRun,
@@ -23690,6 +23766,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             : livenessRun,
           agent,
         );
+        if (
+          deferredCheckoutRestoreIssueId &&
+          !promotedRunDispatched &&
+          !livenessContinuationOwnsCheckout &&
+          !successfulHandoffOwnsCheckout
+        ) {
+          await restoreCheckoutPromotedStatus(db, {
+            issueId: deferredCheckoutRestoreIssueId,
+            companyId: livenessRun.companyId,
+          });
+        }
 
         // Dependency wake re-check: if this run's issue was marked done mid-run,
         // the route-time `issue_blockers_resolved` wake may have been gated by
@@ -24250,12 +24337,84 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     );
   }
 
+  function buildNonRetryableExecutionReviewParticipantComment(input: {
+    latestRun: Pick<typeof heartbeatRuns.$inferSelect, "error" | "errorCode"> | null | undefined;
+  }) {
+    const failureSummary = summarizeRunFailureForIssueComment(input.latestRun);
+    return (
+      "Paperclip skipped automatic recovery for the pending execution-review participant because the run may have " +
+      `performed non-idempotent work before its external lifecycle failed.${failureSummary ?? ""} ` +
+      "Moving it to `blocked` with a source-scoped recovery action instead of risking a duplicate review or artifact."
+    );
+  }
+
+  /**
+   * BLO-18106: master's `8446c1011` ("bind issue locks only for running runs")
+   * moved the `issues.executionRunId` write from *enqueue* time to *claim*
+   * time. The supersession guard above (`issue.executionRunId !== run.id`) was
+   * written against the enqueue-time binding, so a replacement review run that
+   * is queued but not yet claimed is invisible to it -- and the review-participant
+   * escalation then moves the issue to `blocked` while its replacement is
+   * already pending, which is exactly the strand this path exists to prevent.
+   *
+   * A materialized run is an executable replacement when it matches the issue,
+   * participant, and active stage. A bare wake is only sufficient when it is the
+   * dedicated participant-recovery wake with those same exact coordinates.
+   * Callers MUST evaluate this last in their condition chain so the queries stay
+   * off the hot path.
+   */
+  async function hasQueuedReplacementIssueWake(
+    dbOrTx: typeof db | Parameters<Parameters<typeof db.transaction>[0]>[0],
+    companyId: string,
+    issueId: string,
+    participantAgentId: string,
+    stageId: string,
+  ) {
+    const replacementRun = await dbOrTx
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, companyId),
+          eq(heartbeatRuns.agentId, participantAgentId),
+          inArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES]),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+          sql`coalesce(
+            ${heartbeatRuns.contextSnapshot} -> 'executionStage' ->> 'stageId',
+            ${heartbeatRuns.contextSnapshot} ->> 'currentStageId'
+          ) = ${stageId}`,
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (replacementRun) return true;
+
+    return dbOrTx
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.companyId, companyId),
+          eq(agentWakeupRequests.agentId, participantAgentId),
+          eq(agentWakeupRequests.status, "queued"),
+          eq(agentWakeupRequests.reason, EXECUTION_REVIEW_PARTICIPANT_RECOVERY_WAKE_REASON),
+          sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
+          sql`${agentWakeupRequests.payload} ->> 'currentStageId' = ${stageId}`,
+        ),
+      )
+      .limit(1)
+      .then((rows) => Boolean(rows[0]));
+  }
+
   async function releaseIssueExecutionAndPromote(
     run: typeof heartbeatRuns.$inferSelect,
-    options: { suppressImmediateRecovery?: boolean } = {},
+    options: {
+      suppressImmediateRecovery?: boolean;
+      deferPrimaryCheckoutRestoration?: boolean;
+    } = {},
   ): Promise<boolean> {
     const runContext = parseObject(run.contextSnapshot);
-    const contextIssueId = readNonEmptyString(runContext.issueId);
+    const contextIssueId = issueIdFromRunContext(runContext);
     const taskKey = deriveTaskKeyWithHeartbeatFallback(runContext, null);
     const recoveryAgent = await getAgent(run.agentId);
     const recoveryAgentInvokable =
@@ -24266,6 +24425,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const recoverySessionBefore = recoveryAgentInvokable
       ? await resolveSessionBeforeForWakeup(recoveryAgent, taskKey)
       : null;
+    let gateDelivery: Awaited<ReturnType<typeof enqueueGithubCommitStatusDelivery>> | null = null;
     const promotionResult = await db.transaction(async (tx) => {
       // Lock the context issue (if any) AND every issue that still references this run.
       //
@@ -24317,6 +24477,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ),
         )
         .orderBy(asc(issues.id));
+      const candidateIssueIds = candidateIssues.map((candidate) => candidate.id);
 
       // Clear orphaned execution-lock columns that still point at this finalizing
       // run, across every sibling issue in one statement so it scales with N
@@ -24362,9 +24523,143 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         (contextIssueId
           ? candidateIssues.find((candidate) => candidate.id === contextIssueId)
           : candidateIssues[0]) ?? null;
+      const primaryIssueId = issue?.id ?? null;
 
-      if (!issue) return null;
-      if (issue.executionRunId && issue.executionRunId !== run.id) return null;
+      // Restoring a checkout promotion must wait until this finalizer has decided
+      // whether its primary issue has a replacement execution path. A continuation
+      // retry requires persisted `in_progress` when it is claimed; restoring first
+      // would leave the in-memory `issue` snapshot looking eligible while the new
+      // queued retry is cancelled by its own staleness gate. Siblings, and a primary
+      // issue with no replacement path, still restore inside this transaction.
+      const completePromotion = async <T>(
+        result: T,
+        completionOptions: { retainPrimaryCheckoutPromotion?: boolean } = {},
+      ): Promise<T> => {
+        const retainPrimaryCheckoutPromotion =
+          options.deferPrimaryCheckoutRestoration ||
+          completionOptions.retainPrimaryCheckoutPromotion;
+        const issueIds = retainPrimaryCheckoutPromotion && primaryIssueId
+          ? candidateIssueIds.filter((issueId) => issueId !== primaryIssueId)
+          : candidateIssueIds;
+        await restoreCheckoutPromotedStatuses(tx, {
+          issueIds,
+          companyId: run.companyId,
+        });
+        return result;
+      };
+
+      if (!issue) {
+        if (isNonRetryablePrReviewTerminalOutcome(run)) {
+          gateDelivery = await queueFailedPrReviewGateStatus(
+            run,
+            runContext,
+            "non_retryable_external_lifecycle",
+            tx,
+            false,
+          ) ?? null;
+        }
+        return completePromotion(null);
+      }
+      const activeExecutionState = parseIssueExecutionState(issue.executionState);
+      const finalizedRunExecutionStage = parseObject(runContext.executionStage);
+      const finalizedRunStageId =
+        readNonEmptyString(finalizedRunExecutionStage.stageId) ?? readNonEmptyString(runContext.currentStageId);
+      const activeParticipant = activeExecutionState?.status === "pending"
+        ? activeExecutionState.currentParticipant
+        : null;
+      // BLO-18106: the failed-PR-review gate is a durable, PR-visible artifact.
+      // Writing it once the review stage has already advanced marks the PR
+      // failed for a stage this run no longer owns -- e.g. a replacement run
+      // has since taken the stage and may have completed the review. Only
+      // suppress when the move is *provable* (both stage ids known and
+      // different); an unknown stage stays fail-open so genuine failures still
+      // surface on the PR.
+      const finalizedRunStageSuperseded =
+        finalizedRunStageId !== null &&
+        activeExecutionState?.currentStageId != null &&
+        activeExecutionState.currentStageId !== finalizedRunStageId;
+      if (issue.executionRunId && issue.executionRunId !== run.id) {
+        logger.info(
+          { issueId: issue.id, finalizingRunId: run.id, activeExecutionRunId: issue.executionRunId },
+          "skipping terminal-run recovery because a newer issue execution is active",
+        );
+        return completePromotion({ kind: "superseded" as const });
+      }
+      // A corrective successful-run handoff that still records no disposition
+      // must remain WIP for the exhausted-handoff reconciler. Its checkout is no
+      // longer a temporary queue-tier promotion once the corrective run itself
+      // succeeds, so consume the restore marker before the guarded restoration.
+      // This runs after the supersession guard so a stale finalizer cannot erase
+      // the marker owned by a newer running execution.
+      if (
+        run.status === "succeeded" &&
+        (
+          runContext.handoffRequired === true ||
+          readNonEmptyString(runContext.wakeReason) === FINISH_SUCCESSFUL_RUN_HANDOFF_REASON
+        )
+      ) {
+        await tx
+          .update(issues)
+          .set({
+            checkoutRestoreStatus: null,
+            updatedAt: new Date(),
+          })
+          .where(
+            and(
+              eq(issues.id, issue.id),
+              eq(issues.companyId, run.companyId),
+              eq(issues.status, "in_progress"),
+            ),
+          );
+      }
+      if (isNonRetryablePrReviewTerminalOutcome(run) && !finalizedRunStageSuperseded) {
+        // The outbox row is part of the ownership decision: a replacement run
+        // cannot claim this issue until both the lock release and delivery
+        // intent commit. Publishing the informational event can remain best
+        // effort after commit because the outbox is the durable artifact.
+        gateDelivery = await queueFailedPrReviewGateStatus(
+          run,
+          runContext,
+          "non_retryable_external_lifecycle",
+          tx,
+          false,
+        ) ?? null;
+      }
+      if (
+        isNonRetryablePrReviewTerminalOutcome(run) &&
+        issue.status === "in_review" &&
+        !issue.assigneeUserId &&
+        finalizedRunStageId !== null &&
+        finalizedRunStageId === activeExecutionState?.currentStageId &&
+        activeParticipant?.type === "agent" &&
+        activeParticipant.agentId === run.agentId &&
+        isExecutionReviewParticipantRecoveryEligibleRun(run) &&
+        // Evaluated last on purpose: keeps the extra query off the hot path.
+        !(await hasQueuedReplacementIssueWake(
+          tx,
+          issue.companyId,
+          issue.id,
+          activeParticipant.agentId,
+          finalizedRunStageId,
+        ))
+      ) {
+        return completePromotion(
+          {
+            kind: "blocked" as const,
+            issue,
+            previousStatus: issue.status,
+            comment: buildNonRetryableExecutionReviewParticipantComment({ latestRun: run }),
+            recoveryCause: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_CAUSE,
+            recoveryOwnerAgentId: activeParticipant.agentId,
+            expectedReviewStage: {
+              stageId: finalizedRunStageId,
+              participantAgentId: run.agentId,
+              executionRunId: null,
+            },
+          },
+          { retainPrimaryCheckoutPromotion: true },
+        );
+      }
 
       // Pre-dispatch validation recovery: if the finalizing run failed before
       // adapter launch, surface the primary issue for the blocked-recovery comment path.
@@ -24377,17 +24672,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         issue.assigneeAgentId === run.agentId
       ) {
         const configurationIncomplete = isConfigurationIncompleteFailedRun(run);
-        return {
-          kind: "blocked" as const,
-          issue,
-          previousStatus: issue.status,
-          comment: configurationIncomplete
-            ? buildConfigurationIncompleteRecoveryComment({ latestRun: run })
-            : buildWorkspaceValidationRecoveryComment({ latestRun: run }),
-          recoveryCause: configurationIncomplete
-            ? CONFIGURATION_INCOMPLETE_RECOVERY_CAUSE
-            : WORKSPACE_VALIDATION_RECOVERY_CAUSE,
-        };
+        return completePromotion(
+          {
+            kind: "blocked" as const,
+            issue,
+            previousStatus: issue.status,
+            comment: configurationIncomplete
+              ? buildConfigurationIncompleteRecoveryComment({ latestRun: run })
+              : buildWorkspaceValidationRecoveryComment({ latestRun: run }),
+            recoveryCause: configurationIncomplete
+              ? CONFIGURATION_INCOMPLETE_RECOVERY_CAUSE
+              : WORKSPACE_VALIDATION_RECOVERY_CAUSE,
+            recoveryOwnerAgentId: undefined,
+            expectedReviewStage: undefined,
+          },
+          { retainPrimaryCheckoutPromotion: true },
+        );
       }
 
 
@@ -24679,11 +24979,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           })
           .where(eq(agentWakeupRequests.id, deferred.id));
 
-        return {
-          kind: "promoted" as const,
-          run: newRun,
-          reopenedActivity,
-        };
+        return completePromotion(
+          {
+            kind: "promoted" as const,
+            run: newRun,
+            reopenedActivity,
+          },
+          { retainPrimaryCheckoutPromotion: true },
+        );
       }
 
       const findExistingExecutionPath = (agentId?: string | null) =>
@@ -24724,9 +25027,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const currentParticipant = executionState?.status === "pending"
         ? executionState.currentParticipant
         : null;
+      const reviewRunContext = parseObject(run.contextSnapshot);
+      const runExecutionStage = parseObject(reviewRunContext.executionStage);
+      const runStageId =
+        readNonEmptyString(runExecutionStage.stageId) ?? readNonEmptyString(reviewRunContext.currentStageId);
       const issueNeedsReviewParticipantRecovery =
         issue.status === "in_review" &&
         !issue.assigneeUserId &&
+        runStageId !== null &&
+        runStageId === executionState?.currentStageId &&
         currentParticipant?.type === "agent" &&
         currentParticipant.agentId === run.agentId &&
         isExecutionReviewParticipantRecoveryEligibleRun(run) &&
@@ -24736,21 +25045,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       if (issueNeedsReviewParticipantRecovery) {
         const existingReviewParticipantExecutionPath = await findExistingExecutionPath(currentParticipant.agentId);
+        const reviewRecoveryHasReplacementPath = Boolean(
+          existingReviewParticipantExecutionPath || issueHasPersistedMonitor,
+        );
         if (
           options.suppressImmediateRecovery ||
-          existingReviewParticipantExecutionPath ||
-          issueHasPersistedMonitor ||
+          reviewRecoveryHasReplacementPath ||
           await isAutomaticRecoverySuppressedByPauseHold(db, issue.companyId, issue.id, treeControlSvc)
         ) {
-          return { kind: "released" as const };
+          return completePromotion(
+            { kind: "released" as const },
+            { retainPrimaryCheckoutPromotion: reviewRecoveryHasReplacementPath },
+          );
         }
 
         if (issue.originKind === RECOVERY_ORIGIN_KINDS.strandedIssueRecovery) {
-          return {
-            kind: "blocked_recovery_in_place" as const,
-            issue,
-            previousStatus: issue.status,
-          };
+          return completePromotion(
+            {
+              kind: "blocked_recovery_in_place" as const,
+              issue,
+              previousStatus: issue.status,
+            },
+            { retainPrimaryCheckoutPromotion: true },
+          );
         }
 
         const shouldBlockReviewRecovery =
@@ -24758,14 +25075,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           !recoveryAgent ||
           isExecutionReviewParticipantRecoveryRun(run);
         if (shouldBlockReviewRecovery) {
-          return {
-            kind: "blocked" as const,
-            issue,
-            previousStatus: issue.status,
-            comment: buildExecutionReviewParticipantRecoveryComment({ latestRun: run }),
-            recoveryCause: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_CAUSE,
-            recoveryOwnerAgentId: currentParticipant.agentId,
-          };
+          return completePromotion(
+            {
+              kind: "blocked" as const,
+              issue,
+              previousStatus: issue.status,
+              comment: buildExecutionReviewParticipantRecoveryComment({ latestRun: run }),
+              recoveryCause: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_CAUSE,
+              recoveryOwnerAgentId: currentParticipant.agentId,
+              expectedReviewStage: {
+                stageId: runStageId,
+                participantAgentId: run.agentId,
+                executionRunId: null,
+              },
+            },
+            { retainPrimaryCheckoutPromotion: true },
+          );
         }
 
         const now = new Date();
@@ -24828,10 +25153,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           })
           .where(eq(agentWakeupRequests.id, wakeupRequest.id));
 
-        return {
-          kind: "queued_recovery" as const,
-          run: queuedRun,
-        };
+        return completePromotion(
+          {
+            kind: "queued_recovery" as const,
+            run: queuedRun,
+          },
+          { retainPrimaryCheckoutPromotion: true },
+        );
       }
 
       const issueNeedsImmediateRecovery =
@@ -24840,33 +25168,37 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         issue.assigneeAgentId === run.agentId &&
         (run.status === "failed" || run.status === "timed_out" || run.status === "cancelled");
 
-      if (!issueNeedsImmediateRecovery) {
-        return { kind: "released" as const };
-      }
-      if (options.suppressImmediateRecovery) {
-        return { kind: "released" as const };
-      }
+      if (!issueNeedsImmediateRecovery) return completePromotion({ kind: "released" as const });
+      if (options.suppressImmediateRecovery) return completePromotion({ kind: "released" as const });
 
       const existingExecutionPath = await findExistingExecutionPath();
-      if (existingExecutionPath || issueHasPersistedMonitor || await findExplicitBlockerPath()) {
-        return { kind: "released" as const };
+      const immediateRecoveryHasReplacementPath = Boolean(existingExecutionPath || issueHasPersistedMonitor);
+      if (immediateRecoveryHasReplacementPath || await findExplicitBlockerPath()) {
+        return completePromotion(
+          { kind: "released" as const },
+          { retainPrimaryCheckoutPromotion: immediateRecoveryHasReplacementPath },
+        );
       }
 
       if (await isAutomaticRecoverySuppressedByPauseHold(db, issue.companyId, issue.id, treeControlSvc, tx)) {
-        return { kind: "released" as const };
+        return completePromotion({ kind: "released" as const });
       }
 
       if (issue.originKind === RECOVERY_ORIGIN_KINDS.strandedIssueRecovery) {
-        return {
-          kind: "blocked_recovery_in_place" as const,
-          issue,
-          previousStatus: issue.status,
-        };
+        return completePromotion(
+          {
+            kind: "blocked_recovery_in_place" as const,
+            issue,
+            previousStatus: issue.status,
+          },
+          { retainPrimaryCheckoutPromotion: true },
+        );
       }
 
       const shouldBlockImmediately =
         !recoveryAgentInvokable ||
         !recoveryAgent ||
+        isNonRetryablePrReviewTerminalOutcome(run) ||
         isWorkspaceValidationFailedRun(run) ||
         isConfigurationIncompleteFailedRun(run) ||
         didAutomaticRecoveryFail(run, issue.status === "todo" ? "assignment_recovery" : "issue_continuation_needed");
@@ -24881,17 +25213,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 status: issue.status as "todo" | "in_progress",
                 latestRun: run,
               });
-        return {
-          kind: "blocked" as const,
-          issue,
-          previousStatus: issue.status,
-          comment,
-          recoveryCause: workspaceValidationFailure
-            ? WORKSPACE_VALIDATION_RECOVERY_CAUSE
-            : configurationIncompleteFailure
-              ? CONFIGURATION_INCOMPLETE_RECOVERY_CAUSE
-              : undefined,
-        };
+        return completePromotion(
+          {
+            kind: "blocked" as const,
+            issue,
+            previousStatus: issue.status,
+            comment,
+            recoveryCause: workspaceValidationFailure
+              ? WORKSPACE_VALIDATION_RECOVERY_CAUSE
+              : configurationIncompleteFailure
+                ? CONFIGURATION_INCOMPLETE_RECOVERY_CAUSE
+                : undefined,
+            recoveryOwnerAgentId: undefined,
+            expectedReviewStage: undefined,
+          },
+          { retainPrimaryCheckoutPromotion: true },
+        );
       }
 
       const retryReason = issue.status === "todo" ? "assignment_recovery" : "issue_continuation_needed";
@@ -24974,11 +25311,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         })
         .where(eq(agentWakeupRequests.id, wakeupRequest.id));
 
-      return {
-        kind: "queued_recovery" as const,
-        run: queuedRun,
-      };
+      return completePromotion(
+        {
+          kind: "queued_recovery" as const,
+          run: queuedRun,
+        },
+        { retainPrimaryCheckoutPromotion: true },
+      );
     });
+
+    if (gateDelivery) {
+      const target = resolvePrReviewGateStatusTarget(
+        runContext,
+        loadConfig().prReviewGateStatusContext,
+      );
+      if (target) await appendFailedPrReviewGateStatusEvent(
+        run,
+        target,
+        "non_retryable_external_lifecycle",
+        gateDelivery,
+      ).catch((error) => {
+        logger.warn(
+          { err: error, runId: run.id },
+          "failed to append non-retryable PR-review gate status event",
+        );
+      });
+    }
 
     if (promotionResult?.kind === "blocked") {
       await recovery.escalateStrandedAssignedIssue({
@@ -24995,6 +25353,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 ? EXECUTION_REVIEW_PARTICIPANT_RECOVERY_CAUSE
               : undefined,
         recoveryOwnerAgentId: promotionResult.recoveryOwnerAgentId,
+        expectedReviewStage:
+          "expectedReviewStage" in promotionResult ? promotionResult.expectedReviewStage : undefined,
       });
       return false;
     }
@@ -25008,7 +25368,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       return false;
     }
 
-    const promotedRun = promotionResult?.run ?? null;
+    const promotedRun = promotionResult && "run" in promotionResult ? promotionResult.run : null;
     if (!promotedRun) return false;
 
     if (promotionResult?.kind === "promoted" && promotionResult.reopenedActivity) {
@@ -28180,6 +28540,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ...(options.eventPayload ? { payload: options.eventPayload } : {}),
       });
       await releaseIssueExecutionAndPromote(cancelled);
+      if (agent && hasExternalLifecycle(agent.adapterType)) {
+        // BLO-20815: additive-only telemetry (see finalizeExternalLifecycleTerminalRun).
+        recordExternalLifecycleRunSilenceGap({
+          adapter: agent.adapterType,
+          status: "cancelled",
+          run: cancelled,
+          finalizedAt: finishedAt,
+        });
+      }
     }
 
     // RCA 2026-05-06: external-lifecycle adapters (claude_k8s, opencode_k8s)
@@ -28218,8 +28587,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .where(and(eq(heartbeatRuns.agentId, agentId), inArray(heartbeatRuns.status, [...CANCELLABLE_HEARTBEAT_RUN_STATUSES])));
 
     for (const run of runs) {
+      const finishedAt = new Date();
       await setRunStatus(run.id, "cancelled", {
-        finishedAt: new Date(),
+        finishedAt,
         error: reason,
         errorCode,
         ...(agent ? {
@@ -28232,9 +28602,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
 
       await setWakeupStatus(run.wakeupRequestId, "cancelled", {
-        finishedAt: new Date(),
+        finishedAt,
         error: reason,
       });
+
+      if (agent && hasExternalLifecycle(agent.adapterType)) {
+        // BLO-20815: additive-only telemetry (see finalizeExternalLifecycleTerminalRun).
+        recordExternalLifecycleRunSilenceGap({
+          adapter: agent.adapterType,
+          status: "cancelled",
+          run,
+          finalizedAt: finishedAt,
+        });
+      }
 
       const running = runningProcesses.get(run.id);
       if (running) {
