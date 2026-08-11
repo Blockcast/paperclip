@@ -78,6 +78,11 @@ const PRODUCTIVITY_REVIEW_RESERVATION_STALE_MS = 5 * 60 * 1000;
  */
 export const PRODUCTIVITY_REVIEW_PR_FRESH_MS = 24 * 60 * 60 * 1000;
 const TERMINAL_RUN_STATUSES = ["succeeded", "interrupted", "failed", "cancelled", "timed_out"] as const;
+// BLO-25410: NOT a lock predicate — this only counts recent runs for the review
+// narrative (`activeRunCount`), and never decides whether an issue is
+// checkoutable. Enumeration is fine here because an unknown status simply goes
+// uncounted in a report. Checkoutability and `activeRun` hydration use the
+// terminal complement instead — see `issue-execution-lock.ts`.
 const ACTIVE_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const MAX_CANDIDATE_ISSUES = 250;
 const MAX_RUNS_FOR_STREAK = 100;
