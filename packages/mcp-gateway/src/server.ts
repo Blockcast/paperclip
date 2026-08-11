@@ -638,18 +638,31 @@ async function handleRequest(
     const slashIdx = trimmed.indexOf("/");
     return slashIdx === -1 ? trimmed : trimmed.slice(0, slashIdx);
   })();
-  await ensurePersistedSessionsLoaded(state);
+  // Body consumption and session-store setup can throw (aborted connection,
+  // stream error, disk error loading persisted sessions) before we've parsed
+  // enough of the request to log it — that would leave exactly the failing
+  // calls unaccounted for in the audit trail. Emit a fallback line (matched
+  // prefix + HTTP method) if anything in here throws, so every request that
+  // reaches this function logs exactly once either way.
+  let body: Buffer;
+  let bodyText: string;
+  let inboundMessage: JsonRpcRequest | null;
+  try {
+    await ensurePersistedSessionsLoaded(state);
+    body = await readBody(req);
+    bodyText = body.toString("utf8");
+    inboundMessage = parseJsonRpcRequest(bodyText);
+  } catch (e) {
+    logMcpRequest(req, requestId, prefix, jsonRpcMethodLabel(req, null));
+    throw e;
+  }
   const store = getOrCreateStore(state, prefix);
   state.upstreamCallCounts.set(prefix, (state.upstreamCallCounts.get(prefix) ?? 0) + 1);
-
-  const body = await readBody(req);
-  const bodyText = body.toString("utf8");
   const clientSessionId = (() => {
     const v = req.headers[MCP_SESSION_HEADER];
     return Array.isArray(v) ? v[0] : (v as string | undefined);
   })();
 
-  const inboundMessage = parseJsonRpcRequest(bodyText);
   const logMethod = jsonRpcMethodLabel(req, inboundMessage);
   const logTool = logMethod === "tools/call" && typeof inboundMessage?.params?.name === "string"
     ? inboundMessage.params.name
@@ -699,10 +712,20 @@ async function handleAggregateRequest(
   state: GatewayState,
   requestId: string,
 ): Promise<void> {
-  await ensurePersistedSessionsLoaded(state);
-  const body = await readBody(req);
-  const bodyText = body.toString("utf8");
-  const message = parseJsonRpcRequest(bodyText);
+  // See the matching comment in handleRequest: log a fallback line if setup
+  // or body consumption throws, so a failure here isn't left unaccounted for.
+  let body: Buffer;
+  let bodyText: string;
+  let message: JsonRpcRequest | null;
+  try {
+    await ensurePersistedSessionsLoaded(state);
+    body = await readBody(req);
+    bodyText = body.toString("utf8");
+    message = parseJsonRpcRequest(bodyText);
+  } catch (e) {
+    logMcpRequest(req, requestId, "*", jsonRpcMethodLabel(req, null));
+    throw e;
+  }
   const inboundSessionId = (() => {
     const v = req.headers[MCP_SESSION_HEADER];
     return Array.isArray(v) ? v[0] : (v as string | undefined);
