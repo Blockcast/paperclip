@@ -1602,7 +1602,7 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
               triggerDetail: "system",
               reason: "issue_assigned",
               idempotencyKey,
-              payload: { taskKey: "issue:BLO-25726" },
+              payload: GITHUB_REVIEW_PAYLOAD,
             },
           },
         },
@@ -1626,6 +1626,11 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
       const runs = await runsForAgent(agentId);
       expect(runs).toHaveLength(1);
       expect(runs[0]?.id).toBe(deliveredRunId);
+      // ...and the delivery is not counted a second time. The row is genuinely
+      // recovered, but its `queued` was counted when the earlier attempt
+      // delivered it; counting again would push `queued` past `received` and
+      // break the funnel invariant BLO-18859 relies on.
+      expect(await deliveryCount("queued")).toBe(0);
     });
 
     it("does NOT suppress a recurring key whose earlier delivery predates this marker", async () => {
