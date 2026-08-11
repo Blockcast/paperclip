@@ -108,6 +108,7 @@ import {
 } from "../services/default-agent-instructions.js";
 import { getTelemetryClient } from "../telemetry.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
+import { evaluateAgentIssueApprovalLinkAuthorization } from "./issue-approval-link-authorization.js";
 import { recoveryService } from "../services/recovery/service.js";
 import { resolveCoreTrustPreset } from "../services/trust-preset-resolver.js";
 import { readObject } from "../lib/objects.js";
@@ -1214,6 +1215,57 @@ export function agentRoutes(
       values.push(input.sourceIssueId);
     }
     return Array.from(new Set(values));
+  }
+
+  /**
+   * BLO-24699: the third door to a row in `issue_approvals`.
+   *
+   * `POST /companies/:companyId/agent-hires` links its `sourceIssueIds` through the
+   * same `linkManyForApproval` as the other two routes, which validates only that
+   * each id exists in the approval's company — the BLO-23763 hole, a third time.
+   * This route's `agents:create` gate happens to admit only the population the old
+   * `assertCanManageIssueApprovalLinks` gate did (2 of 16 agents on this company's
+   * roster), which bounds the exposure but does not close it: nothing stopped a
+   * hire approval from being attached to an issue its filer has no authority over.
+   *
+   * Evaluated through the shared evaluator so all three doors agree. Ids that do
+   * not resolve, or resolve into another company, are passed through untouched —
+   * `linkManyForApproval` already rejects those, and duplicating that here would
+   * change this route's error semantics for a case that is not an authorization
+   * question. This mirrors `assertIssueLinksAllowed` in `approvals.ts`.
+   */
+  async function assertHireSourceIssueLinksAllowed(
+    req: Request,
+    companyId: string,
+    sourceIssueIds: string[],
+  ) {
+    if (req.actor.type !== "agent" || sourceIssueIds.length === 0) return;
+    const issuesSvc = issueService(db);
+    const refusals: Array<Record<string, unknown>> = [];
+    for (const issueId of sourceIssueIds) {
+      const issue = await issuesSvc.getById(issueId);
+      if (!issue || issue.companyId !== companyId) continue;
+      const verdict = await evaluateAgentIssueApprovalLinkAuthorization({ access }, req, issue);
+      if (verdict.allowed) continue;
+      refusals.push({
+        issueId,
+        status: verdict.status,
+        reason: verdict.reason,
+        boundary: verdict.boundary,
+        error: verdict.error,
+      });
+    }
+    if (refusals.length === 0) return;
+    throw forbidden(
+      "Hire approval cannot be linked to issues this actor is not authorized on: " +
+        refusals.map((refusal) => refusal.issueId).join(", "),
+      {
+        companyId,
+        refusedIssueIds: refusals.map((refusal) => refusal.issueId),
+        refusals,
+        securityPrinciples: ["Least Privilege", "Complete Mediation", "Fail Securely"],
+      },
+    );
   }
 
   function asRecord(value: unknown): Record<string, unknown> | null {
@@ -2698,6 +2750,7 @@ export function agentRoutes(
     const companyId = req.params.companyId as string;
     await assertCanCreateAgentsForCompany(req, companyId);
     const sourceIssueIds = parseSourceIssueIds(req.body);
+    await assertHireSourceIssueLinksAllowed(req, companyId, sourceIssueIds);
     const {
       desiredSkills: requestedDesiredSkills,
       instructionsBundle,

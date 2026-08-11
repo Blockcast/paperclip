@@ -207,6 +207,10 @@ import {
   type TrustPresetResolution,
 } from "../services/trust-preset-resolver.js";
 import { externalObjectService } from "../services/external-objects.js";
+import {
+  evaluateAgentIssueApprovalLinkAuthorization,
+  type IssueApprovalLinkAuthorizationIssue,
+} from "./issue-approval-link-authorization.js";
 
 export const ISSUE_CREATE_DUPLICATE_CANDIDATE_WINDOW_DAYS = 30;
 export const ISSUE_CREATE_DUPLICATE_CANDIDATE_ROW_CAP = 200;
@@ -3904,6 +3908,56 @@ export function issueRoutes(
     }
     if (actorAgent.role === "ceo" || Boolean(actorAgent.permissions?.canCreateAgents)) return true;
     res.status(403).json({ error: "Missing permission to link approvals" });
+    return false;
+  }
+
+  /**
+   * BLO-24699: the *attach* half of the approval-link boundary, decided through the
+   * same evaluator as `POST /companies/:companyId/approvals` so the two doors to a
+   * row in `issue_approvals` cannot reach different verdicts for the same
+   * (actor, issue) pair.
+   *
+   * ## Why this route no longer runs `assertCanManageIssueApprovalLinks`
+   *
+   * That gate is company-scoped — `role === "ceo" || permissions.canCreateAgents` —
+   * and never looks at the issue. It was not a boundary so much as an accident of
+   * which door an agent picked: the identical end state was always reachable by
+   * filing the approval with an `issueIds` array instead, which is the channel
+   * BLO-23036 requires for `request_board_approval` escalations. Measured against
+   * this company's roster on 2026-08-11, the gate admits 2 of 16 agents (CEO, CTO)
+   * on this route while excluding none of the other 14 from the create route.
+   *
+   * Copying the gate onto create instead (the symmetric fix) was rejected: it would
+   * let those 14 agents file an escalation card but not attach it to the issue it
+   * concerns, which is precisely the context-free escalation BLO-23036 exists to
+   * close.
+   *
+   * The only capability this relaxation adds is attaching a *pre-existing* approval,
+   * and that discloses nothing new: `GET /approvals/:id` and
+   * `GET /companies/:companyId/approvals` are gated by the same `company_scope:read`
+   * as create, so any agent that can file an approval can already read every
+   * approval in its company.
+   *
+   * `DELETE /issues/:id/approvals/:approvalId` deliberately keeps the privileged
+   * gate — see the note there.
+   */
+  async function assertIssueApprovalLinkAllowed(
+    req: Request,
+    res: Response,
+    issue: IssueApprovalLinkAuthorizationIssue,
+  ) {
+    assertCompanyAccess(req, issue.companyId);
+    const verdict = await evaluateAgentIssueApprovalLinkAuthorization({ access }, req, issue);
+    if (verdict.allowed) return true;
+    res.status(verdict.status).json({
+      error: verdict.error,
+      details: {
+        ...verdict.details,
+        reason: verdict.reason,
+        boundary: verdict.boundary,
+        securityPrinciples: ["Least Privilege", "Complete Mediation", "Fail Securely"],
+      },
+    });
     return false;
   }
 
@@ -8919,9 +8973,15 @@ export function issueRoutes(
     const id = req.params.id as string;
     const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
     if (!issue) return;
-    if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
     if (!(await assertApprovalMutationAllowedByRunContext(req, res, issue))) return;
-    if (!(await assertCanManageIssueApprovalLinks(req, res, issue.companyId))) return;
+    // BLO-24699: the shared evaluator replaces the former
+    // `assertAgentIssueMutationAllowed` + `assertCanManageIssueApprovalLinks` pair,
+    // so this route and `POST /companies/:companyId/approvals` reach the same
+    // verdict. It is a faithful mirror of the mutation helper's boundary that
+    // additionally honours the productivity-review grant (BLO-23036) and does not
+    // seize the issue's checkout lock merely to annotate it. The 409 conflict
+    // contract for another agent's active checkout is preserved by the evaluator.
+    if (!(await assertIssueApprovalLinkAllowed(req, res, issue))) return;
 
     const actor = getActorInfo(req);
     await issueApprovalsSvc.link(id, req.body.approvalId, {
@@ -8953,6 +9013,14 @@ export function issueRoutes(
     if (!issue) return;
     if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
     if (!(await assertApprovalMutationAllowedByRunContext(req, res, issue))) return;
+    // BLO-24699: unlink deliberately keeps the privileged CEO/`canCreateAgents`
+    // gate that the attach route above dropped. The equivalence argument does not
+    // reach here: detaching is not reachable through approval create by any actor,
+    // so there is no second door for the two to agree with. It is also the
+    // destructive direction — removing a board escalation from the issue it
+    // concerns is the context-loss failure BLO-23036 exists to close, and no
+    // escalation path depends on an ordinary agent being able to do it. Curation
+    // stays privileged; attaching does not.
     if (!(await assertCanManageIssueApprovalLinks(req, res, issue.companyId))) return;
 
     await issueApprovalsSvc.unlink(id, approvalId);
