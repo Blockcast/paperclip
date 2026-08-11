@@ -32524,6 +32524,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (queueOutcome.kind === "skipped") return null;
     if (queueOutcome.kind === "coalesced") return queueOutcome.run;
     if (queueOutcome.kind === "already_delivered") {
+      // Tell the caller this was NOT a new queue, so it does not count a second
+      // `queued` for a delivery already counted (see WakeSuppressionOutcome).
+      if (suppression) suppression.alreadyDelivered = true;
       // No new run was committed, so there is no post-commit dispatch work to
       // do here: whichever wake first delivered under this key owns that run's
       // lifecycle, and `resumeQueuedRuns` re-drives it if it is still queued.
@@ -32721,6 +32724,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     durableSkipReason: string | null;
     providerCapacityDeferred: boolean;
     dependencyBlockedRetryAt: Date | null;
+    /**
+     * BLO-25726: set when the enqueue-time idempotency claim returned an
+     * already-delivered run instead of committing a new one. The caller gets a
+     * truthy run either way, so without this flag a redelivery is
+     * indistinguishable from a fresh queue and the reconciler counts a second
+     * `queued` for a delivery that was already counted -- inflating a funnel
+     * whose arithmetic (`received == queued + suppressed + dead_lettered`) the
+     * BLO-18859 comments treat as load-bearing.
+     */
+    alreadyDelivered: boolean;
   };
 
   async function wakeupWithDispatchRetry(agentId: string, opts: WakeupOptions = {}) {
@@ -32733,12 +32746,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       durableSkipReason: null,
       providerCapacityDeferred: false,
       dependencyBlockedRetryAt: null,
+      alreadyDelivered: false,
     };
     let lastError: unknown;
     for (let attempt = 0; attempt <= WAKE_DISPATCH_RETRY_BACKOFF_MS.length; attempt++) {
       suppression.durableSkipReason = null;
       suppression.providerCapacityDeferred = false;
       suppression.dependencyBlockedRetryAt = null;
+      suppression.alreadyDelivered = false;
       try {
         const result = await enqueueWakeup(agentId, opts, suppression);
         if (!result && githubReviewReason !== null) {
@@ -33000,6 +33015,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         durableSkipReason: null,
         providerCapacityDeferred: false,
         dependencyBlockedRetryAt: null,
+        alreadyDelivered: false,
       };
       try {
         // BLO-25726: this is a REdelivery -- the wake was attempted at least
@@ -33082,7 +33098,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // (received = queued + suppressed + dead_lettered + in-flight chains);
         // without it a reconciler-recovered delivery would leave a permanent
         // phantom received-without-queued gap that reads as loss (BLO-18859).
-        if (githubReviewReason !== null) {
+        //
+        // BLO-25726: except when the enqueue-time claim handed back a run an
+        // earlier attempt had already queued and counted. The row is still
+        // genuinely `dispatch_recovered` -- the wake IS delivered -- but the
+        // delivery was counted then, and counting it again would inflate
+        // `queued` past `received`.
+        if (githubReviewReason !== null && !suppression.alreadyDelivered) {
           recordGithubReviewRequestDelivery({ state: "queued", reason: githubReviewReason });
         }
       } catch (err) {
