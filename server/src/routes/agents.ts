@@ -1233,6 +1233,14 @@ export function agentRoutes(
    * `linkManyForApproval` already rejects those, and duplicating that here would
    * change this route's error semantics for a case that is not an authorization
    * question. This mirrors `assertIssueLinksAllowed` in `approvals.ts`.
+   *
+   * The evaluator's *status* is preserved, not just its verdict: an issue that is
+   * `in_progress` under another agent's checkout is a **retryable** refusal, and the
+   * other two doors report it as 409. Collapsing that to 403 here would tell a
+   * caller its hire can never succeed when in fact it succeeds once the other
+   * agent's checkout ends. A mixed set takes the stricter reading, 403 — "retry
+   * this" is only true if every refusal clears on its own — with each entry's own
+   * status retained in `details.refusals`.
    */
   async function assertHireSourceIssueLinksAllowed(
     req: Request,
@@ -1241,7 +1249,7 @@ export function agentRoutes(
   ) {
     if (req.actor.type !== "agent" || sourceIssueIds.length === 0) return;
     const issuesSvc = issueService(db);
-    const refusals: Array<Record<string, unknown>> = [];
+    const refusals: Array<{ issueId: string; status: 403 | 409 } & Record<string, unknown>> = [];
     for (const issueId of sourceIssueIds) {
       const issue = await issuesSvc.getById(issueId);
       if (!issue || issue.companyId !== companyId) continue;
@@ -1256,15 +1264,26 @@ export function agentRoutes(
       });
     }
     if (refusals.length === 0) return;
+
+    const everyRefusalIsCheckoutConflict = refusals.every((refusal) => refusal.status === 409);
+    const refusedIssueIds = refusals.map((refusal) => refusal.issueId);
+    const details = {
+      companyId,
+      refusedIssueIds,
+      refusals,
+      securityPrinciples: ["Least Privilege", "Complete Mediation", "Fail Securely"],
+    };
+    if (everyRefusalIsCheckoutConflict) {
+      throw conflict(
+        "Hire approval cannot be linked to issues checked out by another agent: " +
+          refusedIssueIds.join(", "),
+        details,
+      );
+    }
     throw forbidden(
       "Hire approval cannot be linked to issues this actor is not authorized on: " +
-        refusals.map((refusal) => refusal.issueId).join(", "),
-      {
-        companyId,
-        refusedIssueIds: refusals.map((refusal) => refusal.issueId),
-        refusals,
-        securityPrinciples: ["Least Privilege", "Complete Mediation", "Fail Securely"],
-      },
+        refusedIssueIds.join(", "),
+      details,
     );
   }
 
@@ -2750,7 +2769,6 @@ export function agentRoutes(
     const companyId = req.params.companyId as string;
     await assertCanCreateAgentsForCompany(req, companyId);
     const sourceIssueIds = parseSourceIssueIds(req.body);
-    await assertHireSourceIssueLinksAllowed(req, companyId, sourceIssueIds);
     const {
       desiredSkills: requestedDesiredSkills,
       instructionsBundle,
@@ -2815,6 +2833,15 @@ export function agentRoutes(
     }
 
     const requiresApproval = company.requireBoardApprovalForNewAgents;
+    // BLO-24699: only the approval-creating path links `sourceIssueIds`, so only it
+    // is authorized. When the company does not require board approval the ids are
+    // discarded and no `issue_approvals` row is ever created — refusing the hire
+    // there would deny a legitimate agent creation over a link that was never going
+    // to happen. Runs after `requiresApproval` is known but before `svc.create`, so
+    // a refusal never leaves a persisted agent behind.
+    if (requiresApproval) {
+      await assertHireSourceIssueLinksAllowed(req, companyId, sourceIssueIds);
+    }
     const status = requiresApproval ? "pending_approval" : "idle";
     const createdAgent = await svc.create(companyId, {
       id: hiredAgentId,

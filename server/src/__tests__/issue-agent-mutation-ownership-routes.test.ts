@@ -2532,7 +2532,21 @@ describe("agent issue mutation checkout ownership", () => {
 
     expect(res.status, JSON.stringify(res.body)).toBe(403);
     expect(res.body.error).toContain(expectedError);
-    expect(mockIssueService.assertCheckoutOwner).toHaveBeenCalledWith(issueId, ownerAgentId, ownerRunId);
+    // BLO-24699: the approval *attach* route no longer runs
+    // `assertAgentIssueMutationAllowed`, so it no longer probes checkout ownership —
+    // it decides through the side-effect-free
+    // `evaluateAgentIssueApprovalLinkAuthorization` shared with approval create, and
+    // holding the run-level checkout lock is bookkeeping about who is *executing* an
+    // issue rather than who may annotate it. Asserted positively rather than skipped,
+    // so a reintroduced lock probe fails here. Every other case in this table —
+    // including approval *unlink*, which deliberately kept the old pair — still
+    // probes ownership, and the cheap/status-only refusal itself is unchanged for
+    // all of them.
+    if (_name === "issue approval link") {
+      expect(mockIssueService.assertCheckoutOwner).not.toHaveBeenCalled();
+    } else {
+      expect(mockIssueService.assertCheckoutOwner).toHaveBeenCalledWith(issueId, ownerAgentId, ownerRunId);
+    }
     expect(mockWorkProductService.createForIssue).not.toHaveBeenCalled();
     expect(mockWorkProductService.update).not.toHaveBeenCalled();
     expect(mockWorkProductService.remove).not.toHaveBeenCalled();

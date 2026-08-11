@@ -40,7 +40,11 @@ const mockAccessService = vi.hoisted(() => ({
   ensureMembership: vi.fn(),
   setPrincipalPermission: vi.fn(),
 }));
-const mockAgentService = vi.hoisted(() => ({ getById: vi.fn() }));
+const mockAgentService = vi.hoisted(() => ({
+  getById: vi.fn(),
+  create: vi.fn(),
+  listByCompany: vi.fn(),
+}));
 const mockIssueService = vi.hoisted(() => ({ getById: vi.fn() }));
 const mockIssueApprovalService = vi.hoisted(() => ({ linkManyForApproval: vi.fn() }));
 const mockApprovalService = vi.hoisted(() => ({ create: vi.fn() }));
@@ -52,7 +56,7 @@ const mockSecretService = vi.hoisted(() => ({
 }));
 const mockLogActivity = vi.hoisted(() => vi.fn());
 
-async function createApp() {
+async function createApp(requireBoardApprovalForNewAgents = true) {
   vi.doMock("../services/index.js", () => ({
     agentService: () => mockAgentService,
     agentInstructionsService: () => ({}),
@@ -87,7 +91,7 @@ async function createApp() {
   const db = {
     select: vi.fn(() => ({
       from: vi.fn(() => ({
-        where: vi.fn(async () => [{ id: COMPANY_ID, requireBoardApprovalForNewAgents: true }]),
+        where: vi.fn(async () => [{ id: COMPANY_ID, requireBoardApprovalForNewAgents }]),
       })),
     })),
   };
@@ -148,7 +152,47 @@ beforeEach(() => {
   mockIssueService.getById.mockResolvedValue(null);
   mockIssueApprovalService.linkManyForApproval.mockResolvedValue(undefined);
   mockLogActivity.mockResolvedValue(undefined);
+  mockAgentService.create.mockImplementation(async (companyId: string, input: Record<string, unknown>) => ({
+    ...input,
+    companyId,
+    permissions: null,
+    adapterConfig: {},
+    runtimeConfig: {},
+  }));
+  mockAgentService.listByCompany.mockResolvedValue([]);
+  mockAccessService.ensureMembership.mockResolvedValue(undefined);
+  mockAccessService.setPrincipalPermission.mockResolvedValue(undefined);
+  mockAccessService.getMembership.mockResolvedValue(null);
+  mockAccessService.listPrincipalGrants.mockResolvedValue([]);
 });
+
+/** Peer's issue, `in_progress`: the evaluator's retryable refusal, not a permanent one. */
+function decideClearingBoundary() {
+  mockAccessService.decide.mockImplementation(async (input: any) => {
+    if (input.action === "tasks:manage_active_checkouts") {
+      return { allowed: false, action: input.action, reason: "deny_missing_grant", explanation: "" };
+    }
+    return { allowed: true, action: input.action, reason: "allow_explicit_grant", explanation: "" };
+  });
+}
+
+function peerIssue(overrides: Record<string, unknown> = {}) {
+  return {
+    id: PEER_ISSUE_ID,
+    companyId: COMPANY_ID,
+    projectId: null,
+    parentId: null,
+    status: "todo",
+    assigneeAgentId: PEER_AGENT_ID,
+    assigneeUserId: null,
+    createdByAgentId: PEER_AGENT_ID,
+    originKind: null,
+    originId: null,
+    checkoutRunId: null,
+    executionRunId: null,
+    ...overrides,
+  };
+}
 
 describe("agent-hires sourceIssueIds authorization (BLO-24699)", () => {
   it("refuses a sourceIssueIds entry the hiring agent is not authorized on, and links nothing", async () => {
@@ -209,5 +253,43 @@ describe("agent-hires sourceIssueIds authorization (BLO-24699)", () => {
       .send(hireBody([PEER_ISSUE_ID]));
 
     expect(res.status).not.toBe(403);
+  }, ROUTE_IMPORT_TIMEOUT_MS);
+
+  it("reports a peer's in_progress checkout as a retryable 409, matching the other two doors", async () => {
+    // The status, not just the verdict, has to agree across the three doors: a
+    // checkout conflict clears once the other agent's run ends, so collapsing it to
+    // 403 would tell the caller its hire can never succeed.
+    decideClearingBoundary();
+    mockIssueService.getById.mockImplementation(async (id: string) =>
+      id === PEER_ISSUE_ID ? peerIssue({ status: "in_progress" }) : null,
+    );
+
+    const res = await request(await createApp())
+      .post(`/api/companies/${COMPANY_ID}/agent-hires`)
+      .send(hireBody([PEER_ISSUE_ID]));
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.error).toContain(PEER_ISSUE_ID);
+    expect(mockIssueApprovalService.linkManyForApproval).not.toHaveBeenCalled();
+  }, ROUTE_IMPORT_TIMEOUT_MS);
+
+  it("does NOT refuse when the company requires no board approval, since nothing is linked", async () => {
+    // `linkManyForApproval` only runs inside the `requiresApproval` branch. With
+    // approvals off, `sourceIssueIds` are discarded and no `issue_approvals` row is
+    // created — refusing here would deny a legitimate hire over a link that was
+    // never going to happen.
+    mockIssueService.getById.mockImplementation(async (id: string) =>
+      id === PEER_ISSUE_ID ? peerIssue() : null,
+    );
+
+    const res = await request(await createApp(false))
+      .post(`/api/companies/${COMPANY_ID}/agent-hires`)
+      .send(hireBody([PEER_ISSUE_ID]));
+
+    expect(res.status, JSON.stringify(res.body)).not.toBe(403);
+    expect(res.status, JSON.stringify(res.body)).not.toBe(409);
+    // Proves the hire actually proceeded rather than merely failing some other way.
+    expect(mockAgentService.create).toHaveBeenCalled();
+    expect(mockIssueApprovalService.linkManyForApproval).not.toHaveBeenCalled();
   }, ROUTE_IMPORT_TIMEOUT_MS);
 });
