@@ -10,6 +10,7 @@ import {
 } from "@paperclipai/shared";
 import {
   agents,
+  agentTaskSessions,
   agentWakeupRequests,
   approvals,
   activityLog,
@@ -25,6 +26,7 @@ import {
   issueRelations,
   issueThreadInteractions,
   issues,
+  workspaceOperations,
 } from "@paperclipai/db";
 import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
 import { runningProcesses } from "../../adapters/index.js";
@@ -83,11 +85,12 @@ import {
 } from "./model-profile-hint.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
 import {
+  isLegacySessionUnavailableAdapterMismatch,
   isZeroTokenStartupFailureRun,
   isZeroTokenSessionResetRetryRun,
+  SESSION_UNAVAILABLE_RECOVERY_MAX_ATTEMPTS,
   ZERO_TOKEN_SESSION_RESET_RETRY_REASON,
 } from "./zero-token-startup-failure.js";
-import { clearAgentTaskSessions } from "./session-reset.js";
 
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["interrupted", "failed", "cancelled", "timed_out"] as const;
@@ -310,6 +313,8 @@ type RecoveryWakeupOptions = {
   requestedByActorType?: "user" | "agent" | "system";
   requestedByActorId?: string | null;
   contextSnapshot?: Record<string, unknown>;
+  retryOfRunId?: string | null;
+  scheduledRetryAttempt?: number;
 };
 
 type RecoveryWakeup = (
@@ -339,6 +344,8 @@ type LatestIssueRun = Pick<
   | "livenessState"
   | "resultJson"
   | "usageJson"
+  | "sessionIdBefore"
+  | "scheduledRetryAttempt"
   | "createdAt"
   | "finishedAt"
 > | null;
@@ -814,13 +821,33 @@ const TRANSIENT_INFRA_CONTINUATION_ERROR_CODES = new Set<string>([
   "process_lost",
 ]);
 
+// BLO-19124: emitted by the dispatcher's dependency gate (see heartbeat.ts
+// `cancelQueuedRunForBlockedDependencies`) when `listDependencyReadiness` reports
+// the issue is not dependency-ready. A member of NON_RETRYABLE_CONTINUATION_ERROR_CODES
+// so it does not burn retry attempts — but unlike the other members it is not an
+// error condition at all, so it must not escalate as a stranded issue.
+const DEPENDENCY_BLOCKED_ERROR_CODE = "issue_dependencies_blocked";
+// Longer than heartbeat.ts reconcileResolvedBlockerDependents()'s default
+// minBlockerResolvedAgeMs. A blocker that just became dependency-ready may still
+// be waiting for the normal edge-triggered or first sweep dependency-resolved
+// wake to land.
+const DEPENDENCY_RESOLVED_WAKE_GRACE_MS = 6 * 60 * 1000;
+// A dependency-resolved wake only proves an observable execution path while it
+// is still being delivered. A completed row is historical idempotency evidence,
+// not evidence that its dependent made progress.
+const LIVE_ISSUE_BLOCKERS_RESOLVED_WAKE_STATUSES = new Set([
+  "queued",
+  "deferred_issue_execution",
+  "claimed",
+]);
+
 const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
   "agent_not_invokable",
   "agent_not_found",
   "budget_blocked",
   "budget_exhausted",
   "issue_paused",
-  "issue_dependencies_blocked",
+  DEPENDENCY_BLOCKED_ERROR_CODE,
 ]);
 
 // A continuation cancelled with this code is a *deliberate wait* (the latest run
@@ -1391,6 +1418,8 @@ export function recoveryService(
     livenessState: heartbeatRuns.livenessState,
     resultJson: heartbeatRuns.resultJson,
     usageJson: heartbeatRuns.usageJson,
+    sessionIdBefore: heartbeatRuns.sessionIdBefore,
+    scheduledRetryAttempt: heartbeatRuns.scheduledRetryAttempt,
     createdAt: heartbeatRuns.createdAt,
     finishedAt: heartbeatRuns.finishedAt,
   } as const;
@@ -1548,6 +1577,8 @@ export function recoveryService(
         livenessState: heartbeatRuns.livenessState,
         resultJson: heartbeatRuns.resultJson,
         usageJson: heartbeatRuns.usageJson,
+        sessionIdBefore: heartbeatRuns.sessionIdBefore,
+        scheduledRetryAttempt: heartbeatRuns.scheduledRetryAttempt,
         createdAt: heartbeatRuns.createdAt,
         finishedAt: heartbeatRuns.finishedAt,
       })
@@ -1707,6 +1738,126 @@ export function recoveryService(
       .then((rows) => Boolean(rows[0]));
   }
 
+  async function latestDependencyReadinessTransitionAt(companyId: string, blockerIssueIds: string[]) {
+    const uniqueBlockerIssueIds = [...new Set(blockerIssueIds.filter(Boolean))];
+    if (uniqueBlockerIssueIds.length === 0) return null;
+    const blockerRows = await db
+      .select({
+        id: issues.id,
+        completedAt: issues.completedAt,
+        executionWorkspaceId: issues.executionWorkspaceId,
+      })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          inArray(issues.id, uniqueBlockerIssueIds),
+          eq(issues.status, "done"),
+        ),
+      )
+      .then((rows) => rows);
+
+    const readyAtByBlocker = new Map<string, Date | null>(
+      blockerRows.map((row) => [row.id, row.completedAt ?? null]),
+    );
+    const blockerWorkspacePairs = blockerRows.flatMap((row) =>
+      row.executionWorkspaceId
+        ? [{ blockerIssueId: row.id, executionWorkspaceId: row.executionWorkspaceId }]
+        : []
+    );
+
+    if (blockerWorkspacePairs.length > 0) {
+      const blockerWorkspaceKeys = new Set(
+        blockerWorkspacePairs.map((pair) => `${pair.blockerIssueId}:${pair.executionWorkspaceId}`),
+      );
+      const executionWorkspaceIds = [
+        ...new Set(blockerWorkspacePairs.map((pair) => pair.executionWorkspaceId)),
+      ];
+      const finalizeRows = await db
+        .select({
+          issueId: workspaceOperations.issueId,
+          executionWorkspaceId: workspaceOperations.executionWorkspaceId,
+          finishedAt: workspaceOperations.finishedAt,
+          startedAt: workspaceOperations.startedAt,
+        })
+        .from(workspaceOperations)
+        .where(
+          and(
+            eq(workspaceOperations.companyId, companyId),
+            inArray(workspaceOperations.executionWorkspaceId, executionWorkspaceIds),
+            eq(workspaceOperations.phase, "workspace_finalize"),
+            eq(workspaceOperations.status, "succeeded"),
+            or(inArray(workspaceOperations.issueId, uniqueBlockerIssueIds), isNull(workspaceOperations.issueId)),
+          ),
+        );
+
+      const latestAttributedByBlockerWorkspace = new Map<string, Date>();
+      const latestUnattributedByWorkspace = new Map<string, Date>();
+      for (const row of finalizeRows) {
+        if (!row.executionWorkspaceId) continue;
+        // A successful finalization restores readiness when it completes, not
+        // when it begins. Keep `startedAt` only as a compatibility fallback for
+        // legacy succeeded rows that predate (or failed to persist) `finishedAt`.
+        const finalizedAt = row.finishedAt ?? row.startedAt;
+        if (row.issueId) {
+          const key = `${row.issueId}:${row.executionWorkspaceId}`;
+          if (!blockerWorkspaceKeys.has(key)) continue;
+          const current = latestAttributedByBlockerWorkspace.get(key);
+          if (!current || finalizedAt > current) latestAttributedByBlockerWorkspace.set(key, finalizedAt);
+          continue;
+        }
+        const current = latestUnattributedByWorkspace.get(row.executionWorkspaceId);
+        if (!current || finalizedAt > current) latestUnattributedByWorkspace.set(row.executionWorkspaceId, finalizedAt);
+      }
+
+      for (const pair of blockerWorkspacePairs) {
+        const finalizedAt = latestAttributedByBlockerWorkspace.get(`${pair.blockerIssueId}:${pair.executionWorkspaceId}`)
+          ?? latestUnattributedByWorkspace.get(pair.executionWorkspaceId)
+          ?? null;
+        if (!finalizedAt) continue;
+        const current = readyAtByBlocker.get(pair.blockerIssueId) ?? null;
+        if (!current || finalizedAt > current) readyAtByBlocker.set(pair.blockerIssueId, finalizedAt);
+      }
+    }
+
+    let latestReadyAt: Date | null = null;
+    for (const readyAt of readyAtByBlocker.values()) {
+      if (readyAt && (!latestReadyAt || readyAt > latestReadyAt)) latestReadyAt = readyAt;
+    }
+    return latestReadyAt;
+  }
+
+  function isWithinDependencyResolvedWakeGrace(completedAt: Date | null, now = new Date()) {
+    return completedAt !== null && now.getTime() - completedAt.getTime() < DEPENDENCY_RESOLVED_WAKE_GRACE_MS;
+  }
+
+  async function hasObservableDependencyResolvedWakePath(input: {
+    issue: typeof issues.$inferSelect;
+    blockerIssueIds: string[];
+  }) {
+    const blockerIssueIds = [...new Set(input.blockerIssueIds.filter(Boolean))];
+    const assigneeAgentId = input.issue.assigneeAgentId;
+    if (!assigneeAgentId || blockerIssueIds.length === 0) return false;
+    const idempotencyKeys = blockerIssueIds.map((blockerIssueId) =>
+      buildIssueBlockersResolvedWakeIdempotencyKey({
+        dependentIssueId: input.issue.id,
+        resolvedBlockerIssueId: blockerIssueId,
+      })
+    );
+    const existingWake = await findExistingIssueBlockersResolvedWakeForAnyKey(db, {
+      companyId: input.issue.companyId,
+      idempotencyKeys,
+    });
+    if (existingWake && LIVE_ISSUE_BLOCKERS_RESOLVED_WAKE_STATUSES.has(existingWake.status)) return true;
+
+    const [activeExecutionPath, queuedIssueWake, pendingWakeInteraction] = await Promise.all([
+      hasActiveExecutionPath(input.issue.companyId, input.issue.id, assigneeAgentId),
+      hasQueuedIssueWake(input.issue.companyId, input.issue.id, assigneeAgentId),
+      hasPendingWakeInteraction(input.issue.companyId, input.issue.id),
+    ]);
+    return activeExecutionPath || queuedIssueWake || pendingWakeInteraction;
+  }
+
   async function getLatestAcceptedContinuationInteraction(companyId: string, issueId: string) {
     return db
       .select({
@@ -1770,6 +1921,8 @@ export function recoveryService(
         livenessState: heartbeatRuns.livenessState,
         resultJson: heartbeatRuns.resultJson,
         usageJson: heartbeatRuns.usageJson,
+        sessionIdBefore: heartbeatRuns.sessionIdBefore,
+        scheduledRetryAttempt: heartbeatRuns.scheduledRetryAttempt,
         createdAt: heartbeatRuns.createdAt,
         finishedAt: heartbeatRuns.finishedAt,
       })
@@ -1857,20 +2010,12 @@ export function recoveryService(
         ...(input.retryOfRunId ? { retryOfRunId: input.retryOfRunId } : {}),
         ...(input.extraContext ?? {}),
       }, "normal_model"),
+      retryOfRunId: input.retryOfRunId,
+      scheduledRetryAttempt:
+        typeof input.extraContext?.scheduledRetryAttempt === "number"
+          ? input.extraContext.scheduledRetryAttempt
+          : undefined,
     });
-
-    if (queued && input.retryOfRunId) {
-      return db
-        .update(heartbeatRuns)
-        .set({
-          retryOfRunId: input.retryOfRunId,
-          updatedAt: new Date(),
-        })
-        .where(eq(heartbeatRuns.id, queued.id))
-        .returning()
-        .then((rows) => rows[0] ?? queued);
-    }
-
     return queued;
   }
 
@@ -5160,6 +5305,17 @@ export function recoveryService(
       if (fresh.status !== input.previousStatus && fresh.status !== "blocked") return null;
 
       const recoveryCause = resolveStrandedRecoveryCause(input.latestRun, input.recoveryCause);
+      // The sweep's preflight readiness check can be invalidated by a blocker
+      // that is added or reopened while this escalation waits for its per-issue
+      // advisory lock. Re-read through this transaction immediately before the
+      // first recovery side effect so a now-blocked dependent stays with its
+      // assignee for the normal dependency wake path.
+      if (input.latestRun?.errorCode === DEPENDENCY_BLOCKED_ERROR_CODE) {
+        const readiness = await issuesSvc
+          .listDependencyReadiness(fresh.companyId, [fresh.id], tx)
+          .then((rows) => rows.get(fresh.id));
+        if (readiness && !readiness.isDependencyReady) return null;
+      }
       const { action, hasNewActivitySinceLastAttempt } = await ensureSourceScopedStrandedRecoveryAction({
         issue: fresh,
         previousStatus: input.previousStatus,
@@ -5539,13 +5695,14 @@ export function recoveryService(
   async function resetSessionAndRetryZeroTokenFailure(input: {
     issue: typeof issues.$inferSelect;
     agent: typeof agents.$inferSelect;
-    latestRun: LatestIssueRun;
+    latestRun: NonNullable<LatestIssueRun>;
   }) {
-    await clearAgentTaskSessions(db, input.issue.companyId, input.agent.id, {
-      taskKey: input.issue.id,
-      adapterType: input.agent.adapterType,
-    });
-
+    const taskKey =
+      readNonEmptyString(parseObject(input.latestRun.contextSnapshot).taskKey) ?? input.issue.id;
+    const scheduledRetryAttempt = Math.min(
+      (input.latestRun.scheduledRetryAttempt ?? 0) + 1,
+      SESSION_UNAVAILABLE_RECOVERY_MAX_ATTEMPTS,
+    );
     const queued = await enqueueStrandedIssueRecovery({
       issueId: input.issue.id,
       agentId: input.agent.id,
@@ -5553,6 +5710,7 @@ export function recoveryService(
       retryReason: ZERO_TOKEN_SESSION_RESET_RETRY_REASON,
       source: "issue.zero_token_session_reset_recovery",
       retryOfRunId: input.latestRun?.id ?? null,
+      extraContext: { scheduledRetryAttempt, taskKey },
     });
     if (!queued) return null;
 
@@ -5567,6 +5725,75 @@ export function recoveryService(
     );
 
     return queued;
+  }
+
+  function sessionUnavailableAdapterMismatch(input: {
+    latestRun: LatestIssueRun;
+    agent: typeof agents.$inferSelect | null;
+    historicalAdapterType?: string | null;
+  }): { historicalAdapterType: string; currentAdapterType: string } | null {
+    if (!input.latestRun || !input.agent || input.latestRun.agentId !== input.agent.id) return null;
+    const historicalAdapterType =
+      readNonEmptyString(input.historicalAdapterType) ??
+      readNonEmptyString(parseObject(input.latestRun.contextSnapshot).adapterType);
+    const currentAdapterType = readNonEmptyString(input.agent.adapterType);
+    if (
+      !historicalAdapterType ||
+      !currentAdapterType ||
+      historicalAdapterType === currentAdapterType ||
+      (input.latestRun.errorCode?.trim() !== "session_unavailable" &&
+        !isLegacySessionUnavailableAdapterMismatch({
+          run: { ...input.latestRun, adapterType: historicalAdapterType },
+          currentAdapterType,
+        }))
+    ) {
+      return null;
+    }
+    return { historicalAdapterType, currentAdapterType };
+  }
+
+  async function resolveSessionUnavailableRunAdapterType(input: {
+    issue: typeof issues.$inferSelect;
+    latestRun: NonNullable<LatestIssueRun>;
+  }) {
+    const snapshottedAdapterType = readNonEmptyString(
+      parseObject(input.latestRun.contextSnapshot).adapterType,
+    );
+    if (snapshottedAdapterType || !input.latestRun.sessionIdBefore) {
+      return snapshottedAdapterType;
+    }
+    const taskKey =
+      readNonEmptyString(parseObject(input.latestRun.contextSnapshot).taskKey) ?? input.issue.id;
+
+    return db
+      .select({ adapterType: agentTaskSessions.adapterType })
+      .from(agentTaskSessions)
+      .where(
+        and(
+          eq(agentTaskSessions.companyId, input.issue.companyId),
+          eq(agentTaskSessions.agentId, input.latestRun.agentId),
+          eq(agentTaskSessions.taskKey, taskKey),
+          eq(agentTaskSessions.sessionDisplayId, input.latestRun.sessionIdBefore),
+        ),
+      )
+      .limit(1)
+      .then((rows) => readNonEmptyString(rows[0]?.adapterType));
+  }
+
+  function buildSessionUnavailableAdapterMismatchComment(input: {
+    previousStatus: "todo" | "in_progress";
+    historicalAdapterType: string;
+    currentAdapterType: string;
+  }) {
+    const verb = input.previousStatus === "todo" ? "dispatch" : "continuation";
+    return (
+      `Paperclip detected a \`Session unavailable\` ${verb} failure from ` +
+      `\`${input.historicalAdapterType}\`, but the assigned agent now uses ` +
+      `\`${input.currentAdapterType}\`. This run is not eligible for the OpenCode ` +
+      "session-reset path, and retrying it under the new adapter would reclassify stale " +
+      "runtime evidence. Moving it to `blocked` so an operator can restart the work " +
+      "intentionally under the current adapter or clear the stale failure."
+    );
   }
 
   async function persistAdapterFailureRecoveryClassification(
@@ -5739,6 +5966,7 @@ export function recoveryService(
       zeroTokenStartupFailureBlocked: 0,
       zeroTokenSessionResetRetried: 0,
       waitingOnReviewResolved: 0,
+      dependencyWaitSkipped: 0,
       providerQuotaMonitored: 0,
       recentProgressExempted: 0,
       skipped: 0,
@@ -6207,7 +6435,44 @@ export function recoveryService(
           continue;
         }
 
-        if (isZeroTokenStartupFailureRun(latestRun)) {
+        const todoHistoricalAdapterType = await resolveSessionUnavailableRunAdapterType({ issue, latestRun });
+        const todoSessionUnavailableAdapterMismatch =
+          sessionUnavailableAdapterMismatch({
+            latestRun,
+            agent,
+            historicalAdapterType: todoHistoricalAdapterType,
+          });
+        if (todoSessionUnavailableAdapterMismatch) {
+          if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, latestRun)) {
+            // BLO-8050: operator just unblocked; skip re-escalation on stale evidence.
+            result.skipped += 1;
+            continue;
+          }
+          const updated = await escalateStrandedAssignedIssue({
+            issue,
+            previousStatus: "todo",
+            latestRun,
+            comment: buildSessionUnavailableAdapterMismatchComment({
+              previousStatus: "todo",
+              ...todoSessionUnavailableAdapterMismatch,
+            }),
+          });
+          if (updated) {
+            result.escalated += 1;
+            result.issueIds.push(issue.id);
+          } else {
+            result.skipped += 1;
+          }
+          continue;
+        }
+
+        if (
+          latestRun.agentId === agentId &&
+          isZeroTokenStartupFailureRun({
+            ...latestRun,
+            adapterType: todoHistoricalAdapterType,
+          })
+        ) {
           if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, latestRun)) {
             // BLO-8050: operator just unblocked; skip re-escalation on stale evidence.
             result.skipped += 1;
@@ -6461,7 +6726,45 @@ export function recoveryService(
         }
         continue;
       }
-      if (isZeroTokenStartupFailureRun(latestRun)) {
+      const continuationHistoricalAdapterType = latestRun
+        ? await resolveSessionUnavailableRunAdapterType({ issue, latestRun })
+        : null;
+      const continuationSessionUnavailableAdapterMismatch =
+        sessionUnavailableAdapterMismatch({
+          latestRun,
+          agent,
+          historicalAdapterType: continuationHistoricalAdapterType,
+        });
+      if (continuationSessionUnavailableAdapterMismatch) {
+        if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, latestRun)) {
+          // BLO-8050: operator just unblocked; skip re-escalation on stale evidence.
+          result.skipped += 1;
+          continue;
+        }
+        const updated = await escalateStrandedAssignedIssue({
+          issue,
+          previousStatus: "in_progress",
+          latestRun,
+          comment: buildSessionUnavailableAdapterMismatchComment({
+            previousStatus: "in_progress",
+            ...continuationSessionUnavailableAdapterMismatch,
+          }),
+        });
+        if (updated) {
+          result.escalated += 1;
+          result.issueIds.push(issue.id);
+        } else {
+          result.skipped += 1;
+        }
+        continue;
+      }
+      if (
+        latestRun?.agentId === agentId &&
+        isZeroTokenStartupFailureRun({
+          ...latestRun,
+          adapterType: continuationHistoricalAdapterType,
+        })
+      ) {
         if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, latestRun)) {
           // BLO-8050: operator just unblocked; skip re-escalation on stale evidence.
           result.skipped += 1;
@@ -6539,6 +6842,44 @@ export function recoveryService(
             // `failed` is a genuine park failure (evidence-gate rejection
             // because there's nothing reviewable yet, or a transient update
             // failure). Fall through to the normal blocked recovery path.
+          }
+        }
+
+        // BLO-19124: `issue_dependencies_blocked` is a *wait*, not a failure. The
+        // dispatcher emits it when `listDependencyReadiness` says the issue is not
+        // dependency-ready, and its own cancellation reason promises "Paperclip will
+        // wake the assignee when blockers resolve" — that wake comes from
+        // `listWakeableBlockedDependents` when the blocker closes. It shares the
+        // non-retryable Set with genuine failures (`agent_not_invokable`,
+        // `budget_exhausted`) only because neither should burn retry attempts, and
+        // that co-tenancy made every correctly-sequenced DAG node escalate as a
+        // strand: 158 of 161 active recovery actions on one inbox, all 158 with a
+        // genuinely unresolved blocker. Escalating them is worse than a no-op —
+        // `escalateStrandedAssignedIssue` reassigns the issue to a recovery owner, so
+        // the dependency wake then fires at an agent that is no longer the assignee.
+        // Re-evaluate readiness *now* (not from the run's stale evidence): if the
+        // dispatcher's own gate would still refuse, there is nothing an owner can do,
+        // so skip. Keep escalating when the issue is dependency-ready, because
+        // "dependency-blocked with nothing blocking it" is a real defect and is
+        // exactly the `blocked`-with-zero-blockers state this ticket forbids.
+        if (classification.errorCode === DEPENDENCY_BLOCKED_ERROR_CODE) {
+          const readinessMap = await issuesSvc.listDependencyReadiness(issue.companyId, [issue.id]);
+          const readiness = readinessMap.get(issue.id);
+          if (readiness && !readiness.isDependencyReady) {
+            result.dependencyWaitSkipped += 1;
+            result.skipped += 1;
+            continue;
+          }
+          if (readiness?.isDependencyReady && readiness.blockerIssueIds.length > 0) {
+            const latestDependencyReadyAt = await latestDependencyReadinessTransitionAt(issue.companyId, readiness.blockerIssueIds);
+            if (
+              isWithinDependencyResolvedWakeGrace(latestDependencyReadyAt) ||
+              await hasObservableDependencyResolvedWakePath({ issue, blockerIssueIds: readiness.blockerIssueIds })
+            ) {
+              result.dependencyWaitSkipped += 1;
+              result.skipped += 1;
+              continue;
+            }
           }
         }
 
@@ -8490,6 +8831,7 @@ export function recoveryService(
               name: agents.name,
               reportsTo: agents.reportsTo,
               status: agents.status,
+              adapterType: agents.adapterType,
             })
             .from(agents)
             .where(eq(agents.id, deferred.agentId))
@@ -8608,6 +8950,51 @@ export function recoveryService(
           }
 
           const now = new Date();
+          const promotedRetryOfRunId = readNonEmptyString(promotedContextSnapshot.retryOfRunId);
+          const promotedScheduledRetryAttempt = promotedContextSnapshot.scheduledRetryAttempt;
+          if (
+            readNonEmptyString(promotedContextSnapshot.retryReason) ===
+            ZERO_TOKEN_SESSION_RESET_RETRY_REASON
+          ) {
+            const latestIssueRunId = await tx
+              .select({ id: heartbeatRuns.id })
+              .from(heartbeatRuns)
+              .where(
+                and(
+                  eq(heartbeatRuns.companyId, updated.companyId),
+                  sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${updated.id}`,
+                ),
+              )
+              .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
+              .limit(1)
+              .then((rows) => rows[0]?.id ?? null);
+            if (!promotedRetryOfRunId || latestIssueRunId !== promotedRetryOfRunId) {
+              skippedDeferredWakeIds.push(deferred.id);
+              await tx
+                .update(agentWakeupRequests)
+                .set({
+                  status: "cancelled",
+                  finishedAt: now,
+                  error: "Deferred session reset was superseded by newer issue execution",
+                  updatedAt: now,
+                })
+                .where(eq(agentWakeupRequests.id, deferred.id));
+              continue;
+            }
+            await tx
+              .delete(agentTaskSessions)
+              .where(
+                and(
+                  eq(agentTaskSessions.companyId, updated.companyId),
+                  eq(agentTaskSessions.agentId, deferredAgent.id),
+                  eq(
+                    agentTaskSessions.taskKey,
+                    readNonEmptyString(promotedContextSnapshot.taskKey) ?? updated.id,
+                  ),
+                  eq(agentTaskSessions.adapterType, deferredAgent.adapterType),
+                ),
+              );
+          }
           const newRun = await tx
             .insert(heartbeatRuns)
             .values({
@@ -8619,6 +9006,13 @@ export function recoveryService(
               wakeupRequestId: deferred.id,
               contextSnapshot: promotedContextSnapshot,
               responsibleUserId: updated.responsibleUserId,
+              retryOfRunId: promotedRetryOfRunId,
+              scheduledRetryAttempt:
+                typeof promotedScheduledRetryAttempt === "number" &&
+                Number.isInteger(promotedScheduledRetryAttempt) &&
+                promotedScheduledRetryAttempt >= 0
+                  ? promotedScheduledRetryAttempt
+                  : undefined,
               updatedAt: now,
             })
             .returning({ id: heartbeatRuns.id })

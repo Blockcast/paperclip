@@ -180,6 +180,27 @@ describeEmbeddedPostgres("secretService", () => {
     ).rejects.toThrow(/same company/i);
   });
 
+  it("rejects credential-shaped values under benign keys in strict mode", async () => {
+    const companyId = await seedCompany();
+    const svc = secretService(db);
+
+    await expect(
+      svc.normalizeEnvBindingsForPersistence(
+        companyId,
+        { CONFIG: { type: "plain", value: "ghp_0123456789abcdef0123456789abcdef" } },
+        { strictMode: true },
+      ),
+    ).rejects.toThrow(/strict secret mode/i);
+
+    await expect(
+      svc.normalizeEnvBindingsForPersistence(
+        companyId,
+        { EMPTY_TOKEN: { type: "plain", value: "   " } },
+        { strictMode: true },
+      ),
+    ).resolves.toEqual({ EMPTY_TOKEN: { type: "plain", value: "   " } });
+  });
+
   it("prevents duplicate bindings for a target config path", async () => {
     const companyId = await seedCompany();
     const svc = secretService(db);

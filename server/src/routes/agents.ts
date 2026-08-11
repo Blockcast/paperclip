@@ -94,7 +94,7 @@ import {
   isTruthyRuntimeEnvValue,
   resolveWorktreeRunExecutionActivationState,
 } from "../services/instance-settings.js";
-import { isIssueHeldByForeignRun } from "../services/issue-run-holding.js";
+import { loadAgentInboxLite } from "../services/agent-inbox-lite.js";
 import { logger } from "../middleware/logger.js";
 import { runClaudeLogin } from "@paperclipai/adapter-claude-local/server";
 import { DEFAULT_CODEX_LOCAL_BYPASS_APPROVALS_AND_SANDBOX } from "@paperclipai/adapter-codex-local";
@@ -2446,48 +2446,21 @@ export function agentRoutes(
 
     const issuesSvc = issueService(db);
     const recoveryActionsSvc = issueRecoveryActionService(db);
-    const rows = await issuesSvc.list(req.actor.companyId, {
-      assigneeAgentId: req.actor.agentId,
-      status: "todo,in_progress,blocked",
-      includeRoutineExecutions: true,
-      limit: ISSUE_LIST_DEFAULT_LIMIT,
-    });
     const worktreeActivation = await resolveWorktreeRunExecutionActivationState({
       getExperimental: () => instanceSettingsService(db).getExperimental(),
     });
     const isWorktreeRuntime = isTruthyRuntimeEnvValue(process.env.PAPERCLIP_IN_WORKTREE);
-    const eligibleRows = !isWorktreeRuntime
-      ? rows
-      : worktreeActivation.armed
-      ? rows.filter((issue) => new Date(issue.createdAt) >= new Date(worktreeActivation.cutoff))
-      : [];
-    const issueIds = eligibleRows.map((issue) => issue.id);
-    const [dependencyReadiness, recoveryActionByIssue] = await Promise.all([
-      issuesSvc.listDependencyReadiness(req.actor.companyId, issueIds),
-      recoveryActionsSvc.listActiveForIssues(req.actor.companyId, issueIds),
-    ]);
-
-    // BLO-19001: never offer an issue that a *different* live run already holds.
-    //
-    // Dispatch enforces one-live-run-per-issue only for runs that already carry
-    // an issueId. An autonomous heartbeat run carries none, so it is dispatched
-    // freely and then self-selects here — landing on an issue a sibling run of
-    // this same agent is mid-way through. Under a shared worktree both runs then
-    // edit one tree, and a routine `rm -rf node_modules` in one destroys the
-    // other's state.
-    //
-    // Suppressed rather than flagged: a flag only works if every agent honours
-    // it, and in the observed incident an in-thread warning did not stop the
-    // next run from selecting the same issue 8 minutes later.
     const callerRunId = req.actor.runId ?? null;
-    const nowMs = Date.now();
-    const offeredRows = eligibleRows.filter((issue) => {
-      const held = isIssueHeldByForeignRun({
-        activeRun: issue.activeRun,
-        callerRunId,
-        nowMs,
-      });
-      if (held) {
+    res.json(await loadAgentInboxLite({
+      issuesSvc,
+      recoveryActionsSvc,
+      companyId: req.actor.companyId,
+      agentId: req.actor.agentId,
+      callerRunId,
+      limit: ISSUE_LIST_DEFAULT_LIMIT,
+      isWorktreeRuntime,
+      worktreeActivation,
+      onWithheldForeignRun: (issue) => {
         logger.info(
           {
             agentId: req.actor.agentId,
@@ -2498,28 +2471,8 @@ export function agentRoutes(
           },
           "inbox-lite: withheld issue already held by another live run of this agent",
         );
-      }
-      return !held;
-    });
-
-    res.json(
-      offeredRows.map((issue) => ({
-        id: issue.id,
-        identifier: issue.identifier,
-        title: issue.title,
-        status: issue.status,
-        priority: issue.priority,
-        projectId: issue.projectId,
-        goalId: issue.goalId,
-        parentId: issue.parentId,
-        updatedAt: issue.updatedAt,
-        activeRun: issue.activeRun,
-        activeRecoveryAction: recoveryActionByIssue.get(issue.id) ?? null,
-        dependencyReady: dependencyReadiness.get(issue.id)?.isDependencyReady ?? true,
-        unresolvedBlockerCount: dependencyReadiness.get(issue.id)?.unresolvedBlockerCount ?? 0,
-        unresolvedBlockerIssueIds: dependencyReadiness.get(issue.id)?.unresolvedBlockerIssueIds ?? [],
-      })),
-    );
+      },
+    }));
   });
 
   router.get("/agents/me/inbox/mine", async (req, res) => {
@@ -4226,6 +4179,111 @@ export function agentRoutes(
             : null,
           runs: group.runs,
         })),
+    });
+  });
+
+  /**
+   * Which agents cannot run right now, and until when (BLO-24011).
+   *
+   * A `scheduled_retry` park is invisible at fleet level today: the only way to
+   * discover that an agent is parked is to invoke a heartbeat on it and notice
+   * you got an existing run back. During the 2026-08-09 capacity incident that
+   * meant a critical issue sat assigned to a frozen agent, looking owned,
+   * because nothing answered "is this agent actually able to work?".
+   *
+   * Ordered soonest-due first so the tail of the list is the part that needs
+   * attention, and `overdueMs` is computed server-side because a park whose due
+   * time has passed without the sweep promoting it is a different failure from
+   * a park that is simply long.
+   */
+  router.get("/companies/:companyId/parked-agents", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+
+    const { reason, limit = 200 } = z.object({
+      reason: z.string().min(1).max(64).optional(),
+      limit: z.coerce.number().int().min(1).max(1000).optional(),
+    }).parse(req.query);
+
+    const now = new Date();
+    const rows = await db
+      .select({
+        runId: heartbeatRuns.id,
+        agentId: heartbeatRuns.agentId,
+        agentName: agentsTable.name,
+        agentStatus: agentsTable.status,
+        adapterType: agentsTable.adapterType,
+        scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
+        scheduledRetryAttempt: heartbeatRuns.scheduledRetryAttempt,
+        scheduledRetryReason: heartbeatRuns.scheduledRetryReason,
+        errorCode: heartbeatRuns.errorCode,
+        createdAt: heartbeatRuns.createdAt,
+        // The park metadata (advertised reset, clamped-from horizon) lives only
+        // in result_json — the generated columns project summary/error, not these.
+        resultJson: heartbeatRuns.resultJson,
+      })
+      .from(heartbeatRuns)
+      .innerJoin(agentsTable, eq(agentsTable.id, heartbeatRuns.agentId))
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, companyId),
+          eq(heartbeatRuns.status, "scheduled_retry"),
+          ...(reason ? [eq(heartbeatRuns.scheduledRetryReason, reason)] : []),
+        ),
+      )
+      .orderBy(asc(heartbeatRuns.scheduledRetryAt))
+      .limit(limit + 1);
+
+    const truncated = rows.length > limit;
+    // Same per-agent read decision the agents list applies, so an agent caller
+    // sees exactly the agents it is already allowed to see — this endpoint adds
+    // a schedule view, not a new visibility boundary.
+    const visible = await filterAgentsForActor(
+      req,
+      rows.slice(0, limit).map((row) => ({ ...row, id: row.agentId, companyId })),
+      companyId,
+    );
+    const parked = visible.map((row) => {
+      const result = (row.resultJson ?? {}) as Record<string, unknown>;
+      const dueMs = row.scheduledRetryAt?.getTime() ?? null;
+      return {
+        agentId: row.agentId,
+        agentName: row.agentName,
+        agentStatus: row.agentStatus,
+        adapterType: row.adapterType,
+        runId: row.runId,
+        reason: row.scheduledRetryReason,
+        attempt: row.scheduledRetryAttempt,
+        errorCode: row.errorCode,
+        parkedSince: row.createdAt,
+        scheduledRetryAt: row.scheduledRetryAt,
+        retryInMs: dueMs === null ? null : Math.max(0, dueMs - now.getTime()),
+        // A park that is already due but still sitting here means the promotion
+        // sweep is not draining it — the freeze mode this endpoint exists for.
+        overdueMs: dueMs === null ? null : Math.max(0, now.getTime() - dueMs),
+        // What the provider asked for, beside what we actually booked, so the
+        // two can be compared without opening the run.
+        penstockProvider: typeof result.penstockProvider === "string" ? result.penstockProvider : null,
+        penstockModel: typeof result.penstockModel === "string" ? result.penstockModel : null,
+        penstockRetryAfterSeconds:
+          typeof result.penstockRetryAfterSeconds === "number" ? result.penstockRetryAfterSeconds : null,
+        penstockAdvertisedResumeAt:
+          typeof result.penstockAdvertisedResumeAt === "string" ? result.penstockAdvertisedResumeAt : null,
+        capacityParkClampedFrom:
+          typeof result.penstockCapacityParkClampedFrom === "string"
+            ? result.penstockCapacityParkClampedFrom
+            : null,
+      };
+    });
+
+    res.json({
+      generatedAt: now,
+      reason: reason ?? null,
+      limit,
+      truncated,
+      parkedCount: parked.length,
+      overdueCount: parked.filter((entry) => (entry.overdueMs ?? 0) > 0).length,
+      agents: parked,
     });
   });
 
