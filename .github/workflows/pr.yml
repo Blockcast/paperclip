@@ -499,7 +499,7 @@ jobs:
     # Serialized server suites run inside the four general-server matrix jobs,
     # so general_tests remains the required aggregate for both test families.
     name: verify
-    if: ${{ always() }}
+    if: ${{ always() && !cancelled() }}
     needs:
       [
         helm_chart,
