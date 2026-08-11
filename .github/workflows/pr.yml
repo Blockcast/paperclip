@@ -287,6 +287,9 @@ jobs:
       - name: Check server tests for undefined identifiers
         run: pnpm run check:test-undefined-symbols
 
+      - name: Test undefined-identifier guard failure modes
+        run: node --test scripts/check-test-undefined-symbols.test.mjs
+
       - name: Verify release registry test coverage
         run: pnpm run test:release-registry
 
