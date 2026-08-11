@@ -5262,6 +5262,43 @@ export function issueRoutes(
       return activeRecoveryAction?.ownerAgentId === actorAgentId;
     };
     const boundaryDecision = await decideIssueAccess(req, issue, "issue:mutate");
+    // BLO-24191: recording the reviewer relation is deliberately separated from
+    // *returning* on it. The return below still happens only where PR #853 put
+    // it (inside the another-agent's-issue branch, after the run-ownership
+    // checks); this only notes that the boundary said the actor holds an open
+    // productivity review of this issue.
+    //
+    // The two were fused, and that made the relation unobservable for the
+    // reviewer it matters most for. `hasActiveCheckoutManagementOverride` is
+    // the check immediately preceding that override in the same branch, and it
+    // returns true for any actor holding `tasks:manage_active_checkouts` over
+    // the assignee — which every manager does via `allow_manager_chain`, and
+    // every legacy agent-creator (the CTO) does unconditionally. Productivity
+    // reviews are routed up the reporting chain, so the reviewer is nearly
+    // always exactly that actor: the PATCH was allowed by the checkout
+    // override, the callback never ran, and `assertCanManageIssueMonitor` then
+    // refused the monitor write while its own `allowedRelations` advertised the
+    // relation the caller held (BLO-23544, live 2026-08-10 against deployed
+    // e307f937b).
+    //
+    // No widening: the boundary reason is `allow_productivity_review_grant`
+    // only when authorization.ts matched the full predicate (open, non-hidden,
+    // agent-scoped review whose server-stamped `originId` is this issue), and
+    // the monitor gate still requires `runtime:manage` on top. Routes that do
+    // not opt in (`DELETE /issues/:id` and friends) pass neither the flag nor
+    // the callback and are untouched.
+    let productivityReviewOwnerRecorded = false;
+    const recordProductivityReviewOwnerAuthorization = () => {
+      if (productivityReviewOwnerRecorded) return;
+      if (!options.allowProductivityReviewOwner) return;
+      if (!boundaryDecision.allowed || boundaryDecision.reason !== "allow_productivity_review_grant") return;
+      productivityReviewOwnerRecorded = true;
+      options.onProductivityReviewOwnerMutationAllowed?.({
+        reviewerAgentId: actorAgentId,
+        previousAssigneeAgentId: issue.assigneeAgentId,
+        issueStatus: issue.status,
+      });
+    };
     let creatorOrManagerChainDecision =
       boundaryDecision.allowed && isCreatorOrManagerChainDecision(boundaryDecision)
         ? boundaryDecision
@@ -5294,6 +5331,12 @@ export function issueRoutes(
         return false;
       }
     }
+    // The boundary has spoken and it allowed (or was rescued into an allow).
+    // Record the reviewer relation here, before any of the early returns below
+    // can mask it. Recording is not authorizing: nothing downstream reads this
+    // except the monitor gate on `PATCH /issues/:id` and the source-mutation
+    // activity entry, and both only run once this helper has returned true.
+    recordProductivityReviewOwnerAuthorization();
     if (await isActiveRecoveryActionOwner()) return true;
     // BLO-18113 / BLO-18797: creator / manager-chain grants are comment-only
     // in authorization.ts. The one mutation they may carry is a tightly-shaped
@@ -5362,15 +5405,16 @@ export function issueRoutes(
       // anyway. This is checked before the creator/manager-chain deny below;
       // the two are mutually exclusive by reason, so the order is for clarity
       // rather than correctness.
+      //
+      // BLO-24191: the recorder is idempotent and has normally already run
+      // above, so reaching this branch does not double-log. It is still called
+      // here so this override keeps working if the earlier call site ever
+      // moves.
       if (
         options.allowProductivityReviewOwner &&
         boundaryDecision.reason === "allow_productivity_review_grant"
       ) {
-        options.onProductivityReviewOwnerMutationAllowed?.({
-          reviewerAgentId: actorAgentId,
-          previousAssigneeAgentId: issue.assigneeAgentId,
-          issueStatus: issue.status,
-        });
+        recordProductivityReviewOwnerAuthorization();
         return true;
       }
       if (creatorOrManagerChainDecision) {
