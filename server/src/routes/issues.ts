@@ -10082,6 +10082,20 @@ export function issueRoutes(
     // all outside the allowlist, so the only trigger that can reach this line
     // with a decision in hand is `blockedByIssueIds` — the BLO-18163 use case.
     // Any non-allowlisted field nulls the decision and restores the guard.
+    //
+    // Follow-up finding (BLO-19951, after merge): this term is currently
+    // REDUNDANT, and deliberately kept as defence in depth rather than reverted.
+    // `issue:coordination_metadata` allows solely via isManagerOf(actor,
+    // assignee), and `tasks:manage_active_checkouts` allows on that same
+    // relation — which `assertRecoveryActionAuthority` consults, and returns
+    // true on, before it can 403. So a non-null decision implies the guard
+    // would already have passed, and no 403 this term suppresses can actually
+    // occur. It matters only if those two authorities are ever decoupled, at
+    // which point it silently becomes a live bypass of the recovery-owner
+    // check — so the coupling is pinned by a real-service test
+    // ("couples coordination-metadata authority to active-checkout
+    // management", authorization-service.test.ts). If that test fails, revisit
+    // this line before relaxing it further.
     if (
       recoveryRelevantSourceMutationRequested &&
       !coordinationMetadataDecision &&

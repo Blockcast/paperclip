@@ -5579,6 +5579,21 @@ describe("agent issue mutation checkout ownership", () => {
       // (issues.ts:4560) without granting recovery authority. Deliberately not
       // the checkout-management override: that one satisfies both gates, so it
       // could never show the contrast.
+      //
+      // BLO-19951 follow-up — read these two cases for what they are. The stub
+      // below returns issue:coordination_metadata=allow while leaving
+      // tasks:manage_active_checkouts denied, and the real authorization
+      // service CANNOT emit that pair: coordination metadata allows solely via
+      // isManagerOf(actor, assignee), and that same relation allows
+      // manage_active_checkouts, which assertRecoveryActionAuthority accepts
+      // before it can 403. So no live actor reaches the guard holding a
+      // coordination decision, and the carve-out is presently unreachable —
+      // these cases document the wiring and the intended behaviour if the two
+      // authorities are ever decoupled, not a state production can exhibit.
+      // The coupling that makes them hypothetical is pinned against the real
+      // service in authorization-service.test.ts ("couples coordination-metadata
+      // authority to active-checkout management"); if that test fails, these
+      // stop being hypothetical and the carve-out needs re-review.
       describe("actor that reaches the recovery guard", () => {
         const reviewOwnerWithCoordinationDecide = async (input: { action: string }) => ({
           allowed: input.action === "issue:read"
@@ -5609,7 +5624,9 @@ describe("agent issue mutation checkout ownership", () => {
         });
 
         // Same actor, same issue, same open recovery action — only the patch
-        // shape differs. This pair is the carve-out's whole contract.
+        // shape differs. This pair is the carve-out's contract as written, but
+        // see the note above: the actor shape it needs is one the real service
+        // cannot produce today.
         it("lets the same actor through for an allowlisted blocker edit", async () => {
           const res = await request(await createApp(peerActor()))
             .patch(`/api/issues/${issueId}`)
