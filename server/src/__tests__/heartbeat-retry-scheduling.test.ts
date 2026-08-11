@@ -2613,7 +2613,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
   );
 
   it.each(["session_unavailable", "zero_token_session_reset"] as const)(
-    "schedules %s retries for an assigned todo issue while retaining its execution lock",
+    "schedules %s retries for an assigned todo issue while leaving its execution lock free until claim",
     async (retryReason) => {
       const fixture = await seedMaxTurnFixture({ issueStatus: "todo" });
       const scheduled = await heartbeat.scheduleBoundedRetry(fixture.runId, {
@@ -2636,7 +2636,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         .from(issues)
         .where(eq(issues.id, fixture.issueId))
         .then((rows) => rows[0] ?? null);
-      expect(issue).toEqual({ executionRunId: scheduled.run.id, status: "todo" });
+      expect(issue).toEqual({ executionRunId: null, status: "todo" });
     },
   );
 
