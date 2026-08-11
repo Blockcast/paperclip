@@ -56,6 +56,11 @@ async function waitForTextMatch(read: () => string, pattern: RegExp, timeoutMs =
   return read().match(pattern);
 }
 
+// Loaded CI hosts may need more than one second to start a nested Node process.
+// These tests cover timeout signaling, not process-start latency.
+const PROCESS_TREE_TEST_TIMEOUT_SEC = 5;
+const PROCESS_TREE_TEST_BUDGET_MS = 15_000;
+
 describe("buildInvocationEnvForLogs", () => {
   it("redacts inline secrets from resolved command metadata", () => {
     const loggedEnv = buildInvocationEnvForLogs(
@@ -540,7 +545,7 @@ describe("runChildProcess", () => {
       {
         cwd: process.cwd(),
         env: {},
-        timeoutSec: 1,
+        timeoutSec: PROCESS_TREE_TEST_TIMEOUT_SEC,
         graceSec: 1,
         onLog: async () => {},
         onSpawn: async () => {},
@@ -552,7 +557,7 @@ describe("runChildProcess", () => {
     expect(Number.isInteger(descendantPid) && descendantPid > 0).toBe(true);
 
     expect(await waitForPidExit(descendantPid!, 2_000)).toBe(true);
-  });
+  }, PROCESS_TREE_TEST_BUDGET_MS);
 
   it.skipIf(process.platform === "win32")(
     "keeps timeout escalation armed after the direct child exits",
@@ -610,7 +615,7 @@ describe("runChildProcess", () => {
         {
           cwd: process.cwd(),
           env: {},
-          timeoutSec: 1,
+          timeoutSec: PROCESS_TREE_TEST_TIMEOUT_SEC,
           graceSec: 1,
           onLog: async () => {},
           onSpawn: async () => {},
@@ -623,6 +628,7 @@ describe("runChildProcess", () => {
       expect(Number.isInteger(childPid) && childPid > 0).toBe(true);
       expect(await waitForPidExit(childPid, 2_000)).toBe(true);
     },
+    PROCESS_TREE_TEST_BUDGET_MS,
   );
 
   it.skipIf(process.platform === "win32")(

@@ -241,6 +241,11 @@ type ProductivityReviewServiceDeps = {
   beforeFinalMonitorSuppressionRevalidation?: (evidence: ProductivityReviewEvidence) => Promise<void> | void;
   afterFinalMonitorReviewReservation?: (evidence: ProductivityReviewEvidence, review: IssueRow) => Promise<void> | void;
   beforeStaleReservationRecoveryFinalize?: (review: IssueRow, sourceIssue: IssueRow) => Promise<void> | void;
+  afterStaleReservationRecoveryFinalize?: (
+    review: IssueRow,
+    sourceIssue: IssueRow,
+    finalized: boolean,
+  ) => Promise<void> | void;
 };
 
 class MonitorSuppressedBeforeCreateError extends Error {
@@ -2510,7 +2515,9 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           },
           "productivity review reservation recovered and finalized",
         );
-        return finalized.finalized || finish.createdActivityInserted || finish.assignmentWakeProcessed
+        // Finalization and finish use separate locks, so side-effect ownership
+        // identifies the single reconciler that completed creation.
+        return finish.createdActivityInserted || finish.assignmentWakeProcessed
           ? { kind: "created" as const, reviewIssueId: finalized.review.id }
           : { kind: "existing" as const, reviewIssueId: finalized.review.id };
       }
@@ -2938,12 +2945,19 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           description: review.description ?? `Review productivity for ${sourceIssue.identifier ?? sourceIssue.title}`,
           generatedAt: input.now,
         });
+        await deps?.afterStaleReservationRecoveryFinalize?.(
+          finalized.review,
+          sourceIssue,
+          finalized.finalized,
+        );
         const finish = await finishCreatedProductivityReview(
           finalized.review,
           reservationRecoveryFinishEvidence(sourceIssue, input.now),
           review.assigneeAgentId,
         );
-        if (finalized.finalized || finish.createdActivityInserted || finish.assignmentWakeProcessed) {
+        // Finalization and finish use separate locks, so side-effect ownership
+        // identifies the single reconciler that completed creation.
+        if (finish.createdActivityInserted || finish.assignmentWakeProcessed) {
           result.created += 1;
           result.reviewIssueIds.push(finalized.review.id);
         } else {
