@@ -8,7 +8,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./test-embedded-postgres.js";
 
-const MIGRATION_FILE = "0212_repair_successful_runs_mislabeled_timed_out.sql";
+const MIGRATION_FILE = "0214_repair_successful_runs_mislabeled_timed_out.sql";
 const cleanups: Array<() => Promise<void>> = [];
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
