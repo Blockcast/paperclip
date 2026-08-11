@@ -1826,7 +1826,7 @@ export async function renderMetrics(): Promise<{ contentType: string; body: stri
   ].join("\n");
   const routineDispatchSnapshot = snapshotRoutineDispatchMetrics();
   const routineDispatchBody = [
-    `# HELP ${ROUTINE_DISPATCH_METRIC} Count of routine dispatch gating outcomes, labeled by outcome. routine_dispatch_bypassed_parked_execution_issue = a fire proceeded past an execution issue parked on a long-horizon scheduled_retry rather than being silently skipped for the whole park.`,
+    `# HELP ${ROUTINE_DISPATCH_METRIC} Count of routine dispatch gating outcomes, labeled by outcome. routine_dispatch_bypassed_parked_execution_issue = a fire proceeded past an execution issue parked on a long-horizon scheduled_retry rather than being silently skipped for the whole park. routine_dispatch_bypassed_stale_execution_issue = a fire proceeded past an execution issue whose run was left queued or running past the run-age horizon.`,
     `# TYPE ${ROUTINE_DISPATCH_METRIC} counter`,
     ...Object.entries(routineDispatchSnapshot).map(
       ([outcome, value]) => `${ROUTINE_DISPATCH_METRIC}{outcome="${outcome}"} ${value}`,

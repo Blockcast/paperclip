@@ -865,6 +865,22 @@ describe("routine dispatch metrics counters (BLO-23379)", () => {
     );
   });
 
+  // BLO-25692: the stale-run bypass is a sibling label, not a replacement --
+  // both must render, or an operator cannot tell a provider-quota park from an
+  // execution that stalled or overran.
+  it("renders the stale-execution-issue bypass counter alongside the parked one", async () => {
+    incrementRoutineDispatchMetric("routine_dispatch_bypassed_stale_execution_issue");
+    incrementRoutineDispatchMetric("routine_dispatch_bypassed_parked_execution_issue");
+
+    const { body } = await renderMetrics();
+    expect(body).toContain(
+      `${ROUTINE_DISPATCH_METRIC}{outcome="routine_dispatch_bypassed_stale_execution_issue"} 1`,
+    );
+    expect(body).toContain(
+      `${ROUTINE_DISPATCH_METRIC}{outcome="routine_dispatch_bypassed_parked_execution_issue"} 1`,
+    );
+  });
+
   it("starts at zero so a quiet routine is distinguishable from a bypassed one", () => {
     const snap = snapshotRoutineDispatchMetrics();
     for (const value of Object.values(snap)) {
