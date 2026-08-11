@@ -24305,8 +24305,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * escalation then moves the issue to `blocked` while its replacement is
    * already pending, which is exactly the strand this path exists to prevent.
    *
-   * Mirrors `hasQueuedIssueWake` in recovery/service.ts. Callers MUST evaluate
-   * this last in their condition chain so the query stays off the hot path.
+   * A materialized run is an executable replacement when it matches the issue,
+   * participant, and active stage. A bare wake is only sufficient when it is the
+   * dedicated participant-recovery wake with those same exact coordinates.
+   * Callers MUST evaluate this last in their condition chain so the queries stay
+   * off the hot path.
    */
   async function hasQueuedReplacementIssueWake(
     dbOrTx: typeof db | Parameters<Parameters<typeof db.transaction>[0]>[0],
@@ -24315,6 +24318,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     participantAgentId: string,
     stageId: string,
   ) {
+    const replacementRun = await dbOrTx
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, companyId),
+          eq(heartbeatRuns.agentId, participantAgentId),
+          inArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES]),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+          sql`coalesce(
+            ${heartbeatRuns.contextSnapshot} -> 'executionStage' ->> 'stageId',
+            ${heartbeatRuns.contextSnapshot} ->> 'currentStageId'
+          ) = ${stageId}`,
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (replacementRun) return true;
+
     return dbOrTx
       .select({ id: agentWakeupRequests.id })
       .from(agentWakeupRequests)

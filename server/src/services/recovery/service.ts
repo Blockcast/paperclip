@@ -1757,6 +1757,32 @@ export function recoveryService(
       .then((rows) => Boolean(rows[0]));
   }
 
+  async function hasQueuedExecutionReviewParticipantRecoveryWake(
+    companyId: string,
+    issueId: string,
+    participantAgentId: string,
+    stageId: string,
+  ) {
+    return db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.companyId, companyId),
+          eq(agentWakeupRequests.agentId, participantAgentId),
+          eq(agentWakeupRequests.status, "queued"),
+          eq(agentWakeupRequests.reason, EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON),
+          sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
+          sql`coalesce(
+            ${agentWakeupRequests.payload} ->> 'currentStageId',
+            ${agentWakeupRequests.payload} -> 'executionStage' ->> 'stageId'
+          ) = ${stageId}`,
+        ),
+      )
+      .limit(1)
+      .then((rows) => Boolean(rows[0]));
+  }
+
   async function latestDependencyReadinessTransitionAt(companyId: string, blockerIssueIds: string[]) {
     const uniqueBlockerIssueIds = [...new Set(blockerIssueIds.filter(Boolean))];
     if (uniqueBlockerIssueIds.length === 0) return null;
@@ -6432,10 +6458,22 @@ export function recoveryService(
         }
 
         const participantContinuationClassification = classifyContinuationFailure(participantLatestRun);
+        const queuedParticipantRecovery = agentInvokable
+          ? await hasQueuedExecutionReviewParticipantRecoveryWake(
+              issue.companyId,
+              issue.id,
+              participantAgentId,
+              pendingExecutionState.currentStageId,
+            )
+          : false;
         if (
           isUnsuccessfulTerminalIssueRun(participantLatestRun) &&
           participantContinuationClassification.kind === "non_retryable"
         ) {
+          if (queuedParticipantRecovery) {
+            result.skipped += 1;
+            continue;
+          }
           if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, participantLatestRun)) {
             result.skipped += 1;
             continue;
@@ -6532,6 +6570,11 @@ export function recoveryService(
           } else {
             result.skipped += 1;
           }
+          continue;
+        }
+
+        if (queuedParticipantRecovery) {
+          result.skipped += 1;
           continue;
         }
 
