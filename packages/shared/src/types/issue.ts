@@ -420,6 +420,7 @@ export type IssueBlockedInboxReason =
   | "blocked_by_assigned_backlog_issue"
   | "blocked_by_uninvokable_assignee"
   | "blocked_by_cancelled_issue"
+  | "blocked_without_blockers"
   | "blocked_chain_stalled"
   | "invalid_review_participant"
   | "in_review_without_action_path"
