@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 
 const script = fileURLToPath(new URL("./check-github-runner-labels.mjs", import.meta.url));
 const repoRoot = path.resolve(path.dirname(script), "..");
-const prE2eRunnerPattern = /\n  e2e:\n(?:(?!\n  [A-Za-z0-9_-]+:)[\s\S])*?\n    runs-on: arc-e2e\n/;
+const prE2eRunnerPattern = /\n  e2e:\n(?:(?!\n  [A-Za-z0-9_-]+:)[\s\S])*?\n    runs-on: \$\{\{ github\.event_name == 'merge_group' && 'arc-merge-queue' \|\| 'arc-e2e' \}\}\n/;
 
 test("runner-label guard accepts only ARC workflows", async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-runner-labels-"));
@@ -95,17 +95,17 @@ test("runner-label guard accepts only ARC workflows", async (t) => {
   });
 });
 
-test("PR e2e workflow uses the dedicated ARC e2e runner", async () => {
+test("PR e2e workflow isolates pull requests and merge groups", async () => {
   const workflow = await readFile(path.join(repoRoot, ".github/workflows/pr.yml"), "utf8");
   assert.match(
     workflow,
     prE2eRunnerPattern,
-    "expected the PR e2e job to run on arc-e2e",
+    "expected PR e2e on arc-e2e and merge-group e2e on arc-merge-queue",
   );
 
   const driftedWorkflow = `${workflow.replace(
+    "\n    runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-e2e' }}\n",
     "\n    runs-on: arc-e2e\n",
-    "\n    runs-on: default\n",
   )}\n  later-job:\n    runs-on: arc-e2e\n`;
   assert.doesNotMatch(
     driftedWorkflow,
