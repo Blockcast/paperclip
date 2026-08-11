@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, notInArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -801,7 +801,15 @@ export function attentionService(db: Db) {
         .where(and(
           eq(issueRecoveryActions.companyId, companyId),
           inArray(issueRecoveryActions.status, [...OPEN_RECOVERY_STATUSES]),
-          inArray(issueRecoveryActions.ownerType, [...HUMAN_RECOVERY_OWNER_TYPES]),
+          // BLO-24662: an `escalated` action surfaces regardless of who nominally owns it.
+          // The status is only ever written by the horizon sweep, and it means the action
+          // has stopped waking its agent owner entirely — so gating it on an already-human
+          // owner would drop exactly the rows that most need a human. An agent-owned action
+          // that can no longer wake anyone is a human matter by definition.
+          or(
+            inArray(issueRecoveryActions.ownerType, [...HUMAN_RECOVERY_OWNER_TYPES]),
+            eq(issueRecoveryActions.status, "escalated"),
+          ),
         ))
         .orderBy(desc(issueRecoveryActions.updatedAt), desc(issueRecoveryActions.id));
       const recoveryIssueMap = await issueSummaryMap(
@@ -836,7 +844,7 @@ export function attentionService(db: Db) {
             },
           },
           whyNow: recovery.status === "escalated"
-            ? "Recovery action escalated to a human owner."
+            ? "Recovery action passed its auto-recovery horizon and no longer wakes anyone."
             : "Recovery action is assigned to a human owner.",
           decisionVerbs: decisionVerbs(
             { id: "resolve", label: "Resolve", description: "Record the recovery outcome." },
@@ -844,7 +852,8 @@ export function attentionService(db: Db) {
             { id: "cancel", label: "Cancel", description: "Cancel the recovery action." },
           ),
           inlineResolvable: false,
-          entryRule: "issue_recovery_actions.status in ('active','escalated') and owner_type in ('user','board')",
+          entryRule:
+            "issue_recovery_actions.status in ('active','escalated') and (owner_type in ('user','board') or status = 'escalated')",
           exitRule: "Recovery action resolves, is cancelled, or moves back to an agent/system owner.",
           dedupKey,
           severity: recovery.status === "escalated" ? "high" : "medium",
