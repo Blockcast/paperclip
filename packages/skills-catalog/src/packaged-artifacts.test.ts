@@ -1,6 +1,6 @@
 import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync } from "node:fs";
+import { existsSync, mkdtempSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -35,16 +35,14 @@ describe("skills catalog package artifacts", () => {
   });
 
   it("packs dist manifest and catalog files for npm artifact consumers", () => {
-    let metadata = readPackMetadata(createPackDestination());
-
-    if (!metadata.files.some((entry) => entry.path === "dist/generated/catalog.json")) {
+    if (!existsSync(path.join(packageRoot, "dist/generated/catalog.json"))) {
       execFileSync("pnpm", ["--filter", "@paperclipai/skills-catalog", "build"], {
         cwd: packageRoot,
         stdio: "ignore",
       });
-      metadata = readPackMetadata(createPackDestination());
     }
 
+    const metadata = readPackMetadata(createPackDestination());
     const paths = metadata.files.map((entry) => entry.path);
 
     expect(paths).toContain("dist/generated/catalog.json");

@@ -1151,7 +1151,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     expect(issue?.executionRunId).toBeNull();
   });
 
-  it("promotes deferred issue wakes when a queued holder is cancelled by the daily run cap", async () => {
+  it("promotes deferred issue wakes with retry lineage when a queued holder is cancelled by the daily run cap", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent({
       heartbeatConfig: {
         maxDailyRuns: 1,
@@ -1231,6 +1231,9 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
         _paperclipWakeContext: {
           issueId,
           wakeReason: "issue_mention",
+          retryReason: "session_unavailable",
+          retryOfRunId: queuedRunId,
+          scheduledRetryAttempt: 2,
         },
       },
       status: "deferred_issue_execution",
@@ -1255,13 +1258,21 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       .where(eq(agentWakeupRequests.id, deferredWakeupId));
     const [promotedRun] = deferred?.runId
       ? await db
-        .select({ agentId: heartbeatRuns.agentId })
+        .select({
+          agentId: heartbeatRuns.agentId,
+          retryOfRunId: heartbeatRuns.retryOfRunId,
+          scheduledRetryAttempt: heartbeatRuns.scheduledRetryAttempt,
+        })
         .from(heartbeatRuns)
         .where(eq(heartbeatRuns.id, deferred.runId))
       : [];
 
     expect(deferred?.status).not.toBe("deferred_issue_execution");
-    expect(promotedRun?.agentId).toBe(peerAgentId);
+    expect(promotedRun).toMatchObject({
+      agentId: peerAgentId,
+      retryOfRunId: queuedRunId,
+      scheduledRetryAttempt: 2,
+    });
   });
 
   it("cancels queued runs when the issue assignee changes before the run starts", async () => {

@@ -15,8 +15,12 @@
 export const ZERO_TOKEN_STARTUP_FAILURE_ERROR_CODES = new Set<string>([
   "context_overflow",
   "context_length_exceeded",
+  "session_unavailable",
   "startup_error_pre_model",
 ]);
+
+const LEGACY_SESSION_UNAVAILABLE_ERROR_RE = /\bsession\s+unavailable\b/i;
+const OPENCODE_ADAPTER_TYPES = new Set(["opencode_local", "opencode_k8s"]);
 
 // Heartbeat-run terminal statuses that represent an unsuccessful outcome.
 // Mirrors UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES in heartbeat.ts /
@@ -30,7 +34,9 @@ const UNSUCCESSFUL_TERMINAL_STATUSES = new Set<string>([
 
 export type ZeroTokenStartupFailureRunInput =
   | {
+    adapterType?: string | null;
     status?: string | null;
+    error?: string | null;
     errorCode?: string | null;
     usageJson?: Record<string, unknown> | null;
   }
@@ -65,6 +71,35 @@ export function runUsageTokenCounts(
   };
 }
 
+function readAdapterType(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+export function isLegacySessionUnavailableAdapterFailure(
+  run: Pick<NonNullable<ZeroTokenStartupFailureRunInput>, "error" | "errorCode"> | null | undefined,
+): boolean {
+  const errorCode = typeof run?.errorCode === "string" ? run.errorCode.trim() : "";
+  return (
+    errorCode === "adapter_failed" &&
+    typeof run?.error === "string" &&
+    LEGACY_SESSION_UNAVAILABLE_ERROR_RE.test(run.error)
+  );
+}
+
+export function isLegacySessionUnavailableAdapterMismatch(input: {
+  run: ZeroTokenStartupFailureRunInput;
+  currentAdapterType?: string | null;
+}): boolean {
+  const historicalAdapterType = readAdapterType(input.run?.adapterType);
+  const currentAdapterType = readAdapterType(input.currentAdapterType);
+  return Boolean(
+    historicalAdapterType &&
+      currentAdapterType &&
+      historicalAdapterType !== currentAdapterType &&
+      isLegacySessionUnavailableAdapterFailure(input.run),
+  );
+}
+
 // True when a run's most recent terminal failure is a structural, pre-model
 // startup wedge that produced zero token usage. The recovery sweep uses this
 // to gate `stranded_issue_recovery` wrapper creation: for this family the
@@ -76,7 +111,12 @@ export function isZeroTokenStartupFailureRun(
   if (!run) return false;
   if (!run.status || !UNSUCCESSFUL_TERMINAL_STATUSES.has(run.status)) return false;
   const errorCode = typeof run.errorCode === "string" ? run.errorCode.trim() : "";
-  if (!errorCode || !ZERO_TOKEN_STARTUP_FAILURE_ERROR_CODES.has(errorCode)) return false;
+  const isLegacySessionUnavailable =
+    OPENCODE_ADAPTER_TYPES.has(readAdapterType(run.adapterType) ?? "") &&
+    isLegacySessionUnavailableAdapterFailure(run);
+  if (!isLegacySessionUnavailable && (!errorCode || !ZERO_TOKEN_STARTUP_FAILURE_ERROR_CODES.has(errorCode))) {
+    return false;
+  }
   const { inputTokens, outputTokens } = runUsageTokenCounts(run.usageJson);
   return inputTokens === 0 && outputTokens === 0;
 }
@@ -86,6 +126,8 @@ export function isZeroTokenStartupFailureRun(
 // reset-and-retry attempt for a zero-token startup failure (see
 // resetSessionAndRetryZeroTokenFailure in recovery/service.ts).
 export const ZERO_TOKEN_SESSION_RESET_RETRY_REASON = "zero_token_session_reset";
+export const SESSION_UNAVAILABLE_RECOVERY_RETRY_REASON = "session_unavailable";
+export const SESSION_UNAVAILABLE_RECOVERY_MAX_ATTEMPTS = 2;
 
 // True when the latest run was itself dispatched as that one-shot
 // reset-and-retry attempt and failed again with the same zero-token
@@ -95,11 +137,17 @@ export const ZERO_TOKEN_SESSION_RESET_RETRY_REASON = "zero_token_session_reset";
 // when the wedge isn't actually session-poisoning (e.g. a genuinely
 // oversized workspace tripping context_overflow every time).
 export function isZeroTokenSessionResetRetryRun(
-  run: { contextSnapshot?: Record<string, unknown> | null } | null | undefined,
+  run: {
+    contextSnapshot?: Record<string, unknown> | null;
+    scheduledRetryAttempt?: number | null;
+  } | null | undefined,
 ): boolean {
   const context = run?.contextSnapshot;
   if (!context || typeof context !== "object") return false;
   const retryReason = context.retryReason;
-  return typeof retryReason === "string" && retryReason === ZERO_TOKEN_SESSION_RESET_RETRY_REASON;
+  if (retryReason === ZERO_TOKEN_SESSION_RESET_RETRY_REASON) return true;
+  return (
+    retryReason === SESSION_UNAVAILABLE_RECOVERY_RETRY_REASON &&
+    (run?.scheduledRetryAttempt ?? 0) >= SESSION_UNAVAILABLE_RECOVERY_MAX_ATTEMPTS
+  );
 }
-
