@@ -128,7 +128,10 @@ import {
   workProductService,
 } from "../services/index.js";
 import { buildPlanReviewContext } from "../services/plan-review-context.js";
-import { hydrateSuccessfulRunHandoffLiveness } from "../services/successful-run-handoff-state.js";
+import {
+  hydrateSuccessfulRunHandoffLiveness,
+  resolveSuccessfulRunHandoffForTerminalIssues,
+} from "../services/successful-run-handoff-state.js";
 import {
   TASK_WATCHDOG_ORIGIN_KIND,
   resolveTaskWatchdogMutationScope,
@@ -1082,6 +1085,9 @@ async function listSuccessfulRunHandoffStates(
     const state = successfulRunHandoffStateFromActivity(row);
     if (state) states.set(row.entityId, state);
   }
+  // Unconditional, and before liveness: a handoff on a closed issue is moot
+  // regardless of whether this caller wants liveness hydrated (BLO-16074).
+  await resolveSuccessfulRunHandoffForTerminalIssues(db, companyId, states);
   return options?.hydrateLiveness === false
     ? states
     : hydrateSuccessfulRunHandoffLiveness(db, companyId, states);
