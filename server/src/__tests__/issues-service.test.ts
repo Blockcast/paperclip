@@ -47,7 +47,10 @@ import {
   parseExecutiveHoldMarkerTimestamp,
 } from "../services/issues.ts";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
-import { restoreCheckoutPromotedStatus } from "../services/issue-checkout-status.ts";
+import {
+  releaseIssueRunOwnership,
+  restoreCheckoutPromotedStatus,
+} from "../services/issue-checkout-status.ts";
 import {
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE,
@@ -741,6 +744,62 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
       await svc.clearExecutionRunIfTerminal(issue.id);
 
       expect(await readIssue(issue.id)).toMatchObject({ status: "in_progress", restore: "todo" });
+    });
+
+    it("releases an old checkout without erasing a newer execution owner", async () => {
+      const { companyId, agentId, issue, runId } = await seedCheckoutFixture("todo");
+      await svc.checkout(issue.id, agentId, ["todo"], runId);
+
+      const retryRunId = randomUUID();
+      const retryLockedAt = new Date("2026-08-11T12:00:00.000Z");
+      await db.insert(heartbeatRuns).values({
+        id: retryRunId,
+        companyId,
+        agentId,
+        status: "running",
+        invocationSource: "manual",
+      });
+      await db
+        .update(issues)
+        .set({
+          executionRunId: retryRunId,
+          executionAgentNameKey: "restorecoder",
+          executionLockedAt: retryLockedAt,
+        })
+        .where(eq(issues.id, issue.id));
+      await finishRun(runId);
+
+      expect(
+        await releaseIssueRunOwnership(db, {
+          issueId: issue.id,
+          companyId,
+          runId,
+        }),
+      ).toBe(true);
+
+      const released = await db
+        .select({
+          status: issues.status,
+          checkoutRunId: issues.checkoutRunId,
+          executionRunId: issues.executionRunId,
+          executionAgentNameKey: issues.executionAgentNameKey,
+          executionLockedAt: issues.executionLockedAt,
+          checkoutRestoreStatus: issues.checkoutRestoreStatus,
+        })
+        .from(issues)
+        .where(eq(issues.id, issue.id))
+        .then((rows) => rows[0] ?? null);
+      expect(released).toMatchObject({
+        status: "in_progress",
+        checkoutRunId: null,
+        executionRunId: retryRunId,
+        executionAgentNameKey: "restorecoder",
+        executionLockedAt: retryLockedAt,
+        checkoutRestoreStatus: "todo",
+      });
+      await expect(
+        restoreCheckoutPromotedStatus(db, { issueId: issue.id, companyId }),
+      ).resolves.toBe(false);
     });
 
     it("restores a pre-existing strand to todo when dispatch re-adopts and releases it", async () => {

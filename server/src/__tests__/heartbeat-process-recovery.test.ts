@@ -4312,6 +4312,79 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(activity.some((event) => event.action === "issue.successful_run_handoff_required")).toBe(true);
   });
 
+  it("defers checkout restoration for taskId-only successful handoffs", async () => {
+    const { companyId, agentId, runId, issueId } = await seedQueuedIssueRunFixture();
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: {
+          taskId: issueId,
+          wakeReason: "issue_assigned",
+        },
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    await db
+      .update(issues)
+      .set({ checkoutRestoreStatus: "todo" })
+      .where(eq(issues.id, issueId));
+    mockAdapterExecute.mockImplementationOnce(async (ctx: { runId: string }) => {
+      await db.insert(issueComments).values({
+        companyId,
+        issueId,
+        authorAgentId: agentId,
+        createdByRunId: ctx.runId,
+        body: "Implemented the taskId-only work but did not choose a final disposition.",
+      });
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: "Implemented the taskId-only work but did not choose a final disposition.",
+        resultJson: {
+          summary: "Implemented the taskId-only work but did not choose a final disposition.",
+        },
+        provider: "test",
+        model: "test-model",
+      };
+    });
+    heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+
+    await heartbeat.resumeQueuedRuns();
+    const sourceRun = await waitForRunToSettle(heartbeat, runId, 10_000);
+    expect(sourceRun?.status).toBe("succeeded");
+
+    const handoffRun = await waitForValue(async () => {
+      const rows = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.agentId, agentId));
+      return rows.find((row) => {
+        if (row.id === runId) return false;
+        const context = row.contextSnapshot as Record<string, unknown> | null;
+        return context?.wakeReason === "finish_successful_run_handoff";
+      }) ?? null;
+    });
+    expect(handoffRun).toBeTruthy();
+    if (!handoffRun) throw new Error("Expected taskId-only successful handoff run");
+
+    const settledHandoff = await waitForRunToSettle(heartbeat, handoffRun.id, 10_000);
+    expect(settledHandoff?.status).toBe("succeeded");
+    expect(mockAdapterExecute.mock.calls.some(([context]) => context.runId === handoffRun.id)).toBe(true);
+
+    const sourceAfter = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(sourceAfter).toMatchObject({
+      status: "in_progress",
+      checkoutRunId: null,
+      executionRunId: null,
+      checkoutRestoreStatus: null,
+    });
+  });
+
   it("requeues a missing-disposition handoff when the previous corrective wake was cancelled", async () => {
     const { companyId, agentId, runId, issueId } = await seedQueuedIssueRunFixture();
     const idempotencyKey = `finish_successful_run_handoff:${issueId}:${runId}:1`;
