@@ -1445,6 +1445,190 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(result.created).toBe(0);
   });
 
+
+  // BLO-25722: both BLO-19848 helpers read a single row — the issue's current
+  // `executionRunId` holder — so an episode made of a *chain* of runs kept
+  // silently re-absorbing every earlier row's queue wait. Once the last row
+  // reached `running` the tail clamp released, elapsed ran uncapped from
+  // issues.started_at, and `monitorGatingBreakdown` reported the lot as
+  // unattended. BLO-23547's review claimed "13h 23m unattended" for BLO-21395
+  // when 710 of those 802 minutes (88.5%) were queue->start latency across three
+  // sequential runs, each waiting hours for a slot while its agent sat pinned at
+  // maxConcurrentRuns (BLO-23699). Timings below are that episode's real chain.
+  async function insertRunChain(input: {
+    companyId: string;
+    agentId: string;
+    issueId: string;
+    runs: Array<{
+      createdAt: Date;
+      startedAt: Date | null;
+      finishedAt?: Date | null;
+      status: string;
+      lastOutputAt?: Date | null;
+    }>;
+    lockedAt: Date;
+  }) {
+    const rows = input.runs.map((run) => ({
+      id: randomUUID(),
+      companyId: input.companyId,
+      agentId: input.agentId,
+      status: run.status,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      startedAt: run.startedAt,
+      finishedAt: run.finishedAt ?? null,
+      lastOutputAt: run.lastOutputAt ?? null,
+      contextSnapshot: { issueId: input.issueId, taskId: input.issueId },
+      // Every run in this chain executed model turns; only their *queue* time is
+      // at issue, so none of them may be filtered as never-executed (BLO-21769).
+      livenessState: "advanced",
+      usageJson: { input_tokens: 1000, output_tokens: 500 },
+      logBytes: 4096,
+      createdAt: run.createdAt,
+      updatedAt: run.createdAt,
+    }));
+    await db.insert(heartbeatRuns).values(rows);
+    // The live run holds the lock; a merely-queued sibling never does. Callers
+    // therefore pass the holder last, whatever the createdAt ordering.
+    const holder = rows[rows.length - 1]!;
+    await db
+      .update(issues)
+      .set({ executionRunId: holder.id, checkoutRunId: holder.id, executionLockedAt: input.lockedAt })
+      .where(eq(issues.id, input.issueId));
+    return rows;
+  }
+
+  it("excludes the queue wait of every run in a retry chain, not just the current holder (BLO-25722)", async () => {
+    // BLO-23547's chain, replayed: 232m + 301m + 178m queued across three
+    // sequential runs. The third is live right now, so the single-row tail clamp
+    // releases entirely and the pre-fix elapsed was the full 15h18m episode.
+    const now = new Date("2026-08-09T13:00:00.000Z");
+    const episodeStart = new Date("2026-08-08T21:42:00.000Z");
+    const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: episodeStart });
+    await insertRunChain({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      lockedAt: episodeStart,
+      runs: [
+        {
+          createdAt: episodeStart,
+          startedAt: new Date("2026-08-09T01:34:00.000Z"), // 232m queued
+          finishedAt: new Date("2026-08-09T01:36:00.000Z"),
+          status: "failed",
+        },
+        {
+          createdAt: new Date("2026-08-09T01:36:00.000Z"),
+          startedAt: new Date("2026-08-09T06:37:00.000Z"), // 301m queued
+          finishedAt: new Date("2026-08-09T06:45:00.000Z"),
+          status: "failed",
+        },
+        {
+          createdAt: new Date("2026-08-09T06:46:00.000Z"),
+          startedAt: new Date("2026-08-09T09:44:00.000Z"), // 178m queued
+          status: "running",
+          lastOutputAt: new Date(now.getTime() - 60 * 1000),
+        },
+      ],
+    });
+    const service = productivityReviewService(db);
+
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    // 918m episode - 711m of queue wait = 3h27m attributable, under the 6h
+    // threshold. Pre-fix this fired on 15h18m.
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  it("reports the whole chain's queue wait in the non-live hold line, not the holder's alone (BLO-25722)", async () => {
+    // Same chain, but the live segment is long enough that the trigger still
+    // fires — so the evidence block is generated and the excluded total is
+    // readable. The holder's own queue wait is 178m ("2h 58m"); asserting the
+    // chain total ("11h 51m" = 232+301+178) is what distinguishes a multi-row
+    // exclusion from the single-row one that shipped with BLO-19848.
+    const now = new Date("2026-08-09T19:00:00.000Z");
+    const episodeStart = new Date("2026-08-08T21:42:00.000Z");
+    const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: episodeStart });
+    await insertRunChain({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      lockedAt: episodeStart,
+      runs: [
+        {
+          createdAt: episodeStart,
+          startedAt: new Date("2026-08-09T01:34:00.000Z"),
+          finishedAt: new Date("2026-08-09T01:36:00.000Z"),
+          status: "failed",
+        },
+        {
+          createdAt: new Date("2026-08-09T01:36:00.000Z"),
+          startedAt: new Date("2026-08-09T06:37:00.000Z"),
+          finishedAt: new Date("2026-08-09T06:45:00.000Z"),
+          status: "failed",
+        },
+        {
+          createdAt: new Date("2026-08-09T06:46:00.000Z"),
+          startedAt: new Date("2026-08-09T09:44:00.000Z"),
+          status: "running",
+          lastOutputAt: new Date(now.getTime() - 60 * 1000),
+        },
+      ],
+    });
+    const service = productivityReviewService(db);
+
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+    expect(review?.description).toContain("Excluded as non-live execution hold: 11h 51m");
+    // 1278m episode - 711m excluded. The unattended figure drops with it: pre-fix
+    // this read "21h 18m unattended", charging the queue wait to the assignee.
+    expect(review?.description).toContain("9h 27m unattended");
+    expect(review?.description).not.toContain("21h 18m unattended");
+  });
+
+  it("does not exclude a queue wait that overlapped another run's live work (BLO-25722)", async () => {
+    // The over-correction guard. A run sitting `queued` while a *different* run
+    // works the same issue is not idle time; unioning its wait unguarded would
+    // withhold real working time from the trigger. Here the second run is
+    // enqueued 10m into a 7h live run, so only the 10m before that run started
+    // is genuinely non-live.
+    const now = new Date("2026-08-09T19:00:00.000Z");
+    const episodeStart = new Date("2026-08-09T11:50:00.000Z");
+    const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: episodeStart });
+    await insertRunChain({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      lockedAt: episodeStart,
+      runs: [
+        {
+          // Enqueued while the run below is live, and still waiting for a slot.
+          createdAt: new Date("2026-08-09T12:10:00.000Z"),
+          startedAt: null,
+          status: "queued",
+        },
+        {
+          createdAt: new Date("2026-08-09T11:50:00.000Z"),
+          startedAt: new Date("2026-08-09T12:00:00.000Z"), // 10m queued
+          status: "running",
+          lastOutputAt: new Date(now.getTime() - 60 * 1000),
+        },
+      ],
+    });
+    const service = productivityReviewService(db);
+
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    // 430m episode - 10m = 7h of live work, still reviewable.
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Excluded as non-live execution hold: 10m");
+  });
+
   it("keeps long_active_duration monotonic just past the running silence boundary (BLO-19848)", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const episodeStart = new Date(now.getTime() - 7 * 60 * 60 * 1000);

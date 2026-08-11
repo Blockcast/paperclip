@@ -452,6 +452,162 @@ function liveSegmentStartedAt(executionRun: HeartbeatRunRow | null, now: Date): 
   return parkEndedAt;
 }
 
+/** Half-open [start, end) in epoch ms. */
+type MsInterval = { start: number; end: number };
+
+function unionIntervals(intervals: MsInterval[]): MsInterval[] {
+  const sorted = intervals.filter((i) => i.end > i.start).sort((a, b) => a.start - b.start);
+  const merged: MsInterval[] = [];
+  for (const interval of sorted) {
+    const last = merged[merged.length - 1];
+    if (last && interval.start <= last.end) {
+      last.end = Math.max(last.end, interval.end);
+    } else {
+      merged.push({ ...interval });
+    }
+  }
+  return merged;
+}
+
+function subtractIntervals(base: MsInterval[], cuts: MsInterval[]): MsInterval[] {
+  let remaining = base;
+  for (const cut of unionIntervals(cuts)) {
+    const next: MsInterval[] = [];
+    for (const span of remaining) {
+      if (cut.end <= span.start || cut.start >= span.end) {
+        next.push(span);
+        continue;
+      }
+      if (cut.start > span.start) next.push({ start: span.start, end: cut.start });
+      if (cut.end < span.end) next.push({ start: cut.end, end: span.end });
+    }
+    remaining = next;
+  }
+  return remaining;
+}
+
+function clipInterval(interval: MsInterval, start: number, end: number): MsInterval | null {
+  const clipped = { start: Math.max(interval.start, start), end: Math.min(interval.end, end) };
+  return clipped.end > clipped.start ? clipped : null;
+}
+
+function totalIntervalMs(intervals: MsInterval[]) {
+  return intervals.reduce((sum, interval) => sum + (interval.end - interval.start), 0);
+}
+
+function isTerminalRunStatus(status: string) {
+  return TERMINAL_RUN_STATUSES.includes(status as (typeof TERMINAL_RUN_STATUSES)[number]);
+}
+
+/**
+ * BLO-25722: the span a run existed but had not begun executing — `createdAt`
+ * until it was claimed.
+ *
+ * This is the shape BLO-23699 measured: runs waiting 3–5h between creation and
+ * start while their agent sat pinned at `maxConcurrentRuns`. A run that never
+ * started at all is non-live for its whole life, whether it is still `queued`
+ * or died queued.
+ */
+function runQueueWaitInterval(run: HeartbeatRunRow, now: Date): MsInterval | null {
+  const createdAt = coerceDate(run.createdAt);
+  if (!createdAt || Number.isNaN(createdAt.getTime())) return null;
+  const startedAt = coerceDate(run.startedAt);
+  const endAt = startedAt
+    ?? (isTerminalRunStatus(run.status) ? coerceDate(run.finishedAt) ?? now : now);
+  const interval = { start: createdAt.getTime(), end: endAt.getTime() };
+  return interval.end > interval.start ? interval : null;
+}
+
+/**
+ * BLO-25722: the span a run was demonstrably executing, used only to protect
+ * queue waits from over-exclusion — a run sitting `queued` while a *different*
+ * run works the same issue is not idle time, and subtracting the live span is
+ * what keeps that from being withheld from the trigger.
+ *
+ * Liveness matches `nonLiveExecutionHoldSince`: a `running` row counts until it
+ * goes silent past NON_LIVE_EXECUTION_SILENCE_MS. A `running` row carrying a
+ * past `scheduledRetryAt` starts at that park boundary rather than at its
+ * preserved pre-park `startedAt`, for the reason `liveSegmentStartedAt`
+ * documents — otherwise the promoted row's live span would swallow its own park.
+ */
+function runLiveInterval(run: HeartbeatRunRow, now: Date): MsInterval | null {
+  const startedAt = coerceDate(run.startedAt);
+  if (!startedAt || Number.isNaN(startedAt.getTime())) return null;
+  const parkEndedAt = liveSegmentStartedAt(run, now);
+  const start = parkEndedAt && parkEndedAt.getTime() > startedAt.getTime() ? parkEndedAt : startedAt;
+
+  const lastSignal = latestDate(run.lastUsefulActionAt, run.lastOutputAt, startedAt);
+  let end: Date | null;
+  if (isTerminalRunStatus(run.status)) {
+    end = coerceDate(run.finishedAt) ?? lastSignal;
+  } else if (run.status === "running") {
+    const silentFrom = lastSignal ? lastSignal.getTime() + NON_LIVE_EXECUTION_SILENCE_MS : now.getTime();
+    end = new Date(Math.min(now.getTime(), silentFrom));
+  } else {
+    // queued / scheduled_retry carrying a startedAt: a row that executed and has
+    // since re-parked. Its live span ended at its last signal.
+    end = lastSignal;
+  }
+  if (!end) return null;
+  const interval = { start: start.getTime(), end: end.getTime() };
+  return interval.end > interval.start ? interval : null;
+}
+
+/**
+ * BLO-25722: every interval in the current episode that no run was executing
+ * through, across *all* the episode's runs — not just the one currently holding
+ * `executionRunId`.
+ *
+ * `nonLiveExecutionHoldSince` and `liveSegmentStartedAt` each read a single row,
+ * so they only see the episode's current holder. When an episode is a chain of
+ * sequential runs — created, queued for hours, replaced by a retry — only the
+ * last row's status reaches the clamp. Once that row is `running` the clamp
+ * releases and every earlier row's queue wait is silently re-absorbed as active
+ * time, which `monitorGatingBreakdown` then reports as unattended. BLO-23547's
+ * review claimed "13h 23m unattended" for BLO-21395 when 710 of those 802
+ * minutes (88.5%) were queue→start latency across three sequential runs.
+ *
+ * Caller-supplied `seedNonLive` carries the single-row exclusions the two
+ * existing helpers derive (leading park, trailing hold); this unions the
+ * per-run queue waits on top and subtracts anything a run was provably
+ * executing through, so concurrent runs cannot double-exclude.
+ *
+ * Deliberately does NOT treat a gap between runs — an interval with no run row
+ * at all — as non-live. That is an issue nothing is dispatched against, which
+ * `nonLiveExecutionHoldSince`'s contract keeps as full wall-clock precisely so
+ * a genuinely unowned `in_progress` issue still trips the trigger.
+ *
+ * Two deliberate under-counts remain, both in the safe direction for a trigger
+ * whose failure mode is firing on work that was not running: `runs` is the
+ * MAX_RUNS_FOR_STREAK sample, so an episode with more runs than that loses its
+ * oldest; and a *non-holder* row that executed and then re-parked contributes
+ * only its queue wait, since no column records when that park began.
+ */
+function episodeNonLiveHoldMs(input: {
+  runs: HeartbeatRunRow[];
+  seedNonLive: MsInterval[];
+  episodeStartMs: number;
+  episodeEndMs: number;
+  now: Date;
+}) {
+  const { runs, seedNonLive, episodeStartMs, episodeEndMs, now } = input;
+  if (episodeEndMs <= episodeStartMs) return 0;
+
+  const queueWaits = runs
+    .map((run) => runQueueWaitInterval(run, now))
+    .filter((interval): interval is MsInterval => interval !== null);
+  const liveSpans = runs
+    .map((run) => runLiveInterval(run, now))
+    .filter((interval): interval is MsInterval => interval !== null);
+
+  const attributableQueueWaits = subtractIntervals(unionIntervals(queueWaits), liveSpans);
+  const clipped = [...seedNonLive, ...attributableQueueWaits]
+    .map((interval) => clipInterval(interval, episodeStartMs, episodeEndMs))
+    .filter((interval): interval is MsInterval => interval !== null);
+
+  return totalIntervalMs(unionIntervals(clipped));
+}
+
 function isTerminalIssueStatus(status: string | null | undefined) {
   return status === "done" || status === "cancelled";
 }
@@ -2152,6 +2308,15 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     // It must not extend `noCommentStreak` — the agent was never given a
     // chance to comment — so it is filtered out of the walk entirely rather
     // than counted as silence or treated as a streak-breaker.
+    //
+    // BLO-25722 (AC4), stated explicitly rather than assumed: the multi-row
+    // queue-wait gap is scoped to `long_active_duration` ONLY. These two streaks
+    // count *runs*, not wall-clock, and they walk `terminalRuns` — a run still
+    // sitting `queued` is not terminal, so queue latency neither extends nor
+    // breaks either streak. A run that queued for hours, started, then died
+    // without a turn does count toward `runtimeFailureStreak`, but on its
+    // outcome, not its queue time; that is BLO-21769's deliberate design and is
+    // unaffected by anything here.
     let runtimeFailureStreak = 0;
     let runtimeFailureSawMeasuredZero = false;
     let runtimeFailureSawInferred = false;
@@ -2250,22 +2415,30 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       && liveSegmentStart.getTime() > activeStartedAt.getTime()
       ? liveSegmentStart
       : activeStartedAt;
-    const elapsedMs = sourceIssue.status === "in_progress" && attributableStartAt
-      ? Math.max(0, attributableEndAt.getTime() - attributableStartAt.getTime())
-      : null;
-    // Total wall-clock withheld from the trigger: the leading park plus the
-    // trailing non-live hold. Bounded by the episode so the two exclusions
-    // cannot report more than the episode actually spans.
-    const leadingParkMs = activeStartedAt && attributableStartAt
-      ? Math.max(0, attributableStartAt.getTime() - activeStartedAt.getTime())
-      : 0;
-    const trailingHoldMs = Math.max(0, now.getTime() - attributableEndAt.getTime());
+    // Wall-clock withheld from the trigger. The two single-row exclusions above
+    // seed it — the leading park and the trailing non-live hold — and BLO-25722
+    // unions the queue wait of every other run in the episode on top, because a
+    // retry chain's earlier rows are invisible to both helpers. Bounded by the
+    // episode, so the exclusions cannot report more than the episode spans.
     const episodeMs = activeStartedAt
       ? Math.max(0, now.getTime() - activeStartedAt.getTime())
       : null;
-    const nonLiveHoldMs = episodeMs === null
+    const trailingHoldMs = Math.max(0, now.getTime() - attributableEndAt.getTime());
+    const nonLiveHoldMs = episodeMs === null || !activeStartedAt || !attributableStartAt
       ? trailingHoldMs
-      : Math.min(episodeMs, leadingParkMs + trailingHoldMs);
+      : episodeNonLiveHoldMs({
+          runs: latestRuns,
+          seedNonLive: [
+            { start: activeStartedAt.getTime(), end: attributableStartAt.getTime() },
+            { start: attributableEndAt.getTime(), end: now.getTime() },
+          ],
+          episodeStartMs: activeStartedAt.getTime(),
+          episodeEndMs: now.getTime(),
+          now,
+        });
+    const elapsedMs = sourceIssue.status === "in_progress" && attributableStartAt && episodeMs !== null
+      ? Math.max(0, episodeMs - nonLiveHoldMs)
+      : null;
 
     const noComment = noCommentStreak >= thresholds.noCommentStreakRuns;
     // Reuses `noCommentStreakRuns` as the sample-size threshold: both streaks
@@ -2475,7 +2648,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       `- Current active elapsed time: ${msToHuman(evidence.elapsedMs)}`,
       ...(evidence.nonLiveHoldMs > 0
         ? [
-            `- Excluded as non-live execution hold: ${msToHuman(evidence.nonLiveHoldMs)} (issue's executionRunId parked or pinned by a run that was not live; not counted toward the trigger — BLO-19848)`,
+            `- Excluded as non-live execution hold: ${msToHuman(evidence.nonLiveHoldMs)} (episode time no run was executing through — a parked or non-live executionRunId holder, plus every episode run's queue wait before it was claimed; not counted toward the trigger — BLO-19848, BLO-25722)`,
           ]
         : []),
       ...(evidence.monitorGating
