@@ -3877,7 +3877,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
         return;
       }
       if (gateDelivery.matched) {
-        if (gateDelivery.requiresRevocation) {
+        if (gateDelivery.requiresRevocation && config.reviewGateAuthority.authorityEnabled) {
           const revocation = await activateGithubReviewGateDelivery(db, gateDelivery.deliveryDbId);
           if (!revocation.ok) {
             logger.error(

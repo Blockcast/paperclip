@@ -55,6 +55,7 @@ const REVIEW_HEAD = "3333333333333333333333333333333333333333";
 const PR_URL = `https://github.com/${REPO}/pull/${PR_NUMBER}`;
 
 const authorityConfig: GithubReviewGateAuthorityConfig = {
+  authorityEnabled: true,
   repositories: [REPO],
   statusContext: "review/ally-complete",
   expectedAppId: "3966421",
