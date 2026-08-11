@@ -844,6 +844,13 @@ const AUTHENTICATED_OPERATIONS = new Set([
 const INSTANCE_ADMIN_OPERATIONS = new Set([
   "POST /api/companies",
   "POST /api/plugins/install",
+  // Plugin config carries plaintext credentials, so all three operations sit
+  // behind assertInstanceAdmin at runtime. They are listed here so the
+  // generated x-paperclip-authorization metadata matches that gate rather than
+  // falling through to the /api/plugins board-only default.
+  "GET /api/plugins/{pluginId}/config",
+  "POST /api/plugins/{pluginId}/config",
+  "POST /api/plugins/{pluginId}/config/test",
   "POST /api/instance/reset",
   "POST /api/instance/database-backups",
   "POST /api/service-account-tokens",

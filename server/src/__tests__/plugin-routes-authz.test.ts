@@ -1701,6 +1701,47 @@ describe.sequential("plugin config secret masking (BLO-20794)", () => {
     expect(JSON.stringify(store.configJson)).not.toContain("token-alpha-live");
   }, 20_000);
 
+  it("refuses a save whose masked array entries duplicate one identity", async () => {
+    // BLO-20871 review finding: matching uniquely against STORAGE is not enough
+    // when the INCOMING array is ambiguous. Both entries claim "alpha", so a
+    // storage-only uniqueness check would restore `token-alpha-live` into the
+    // attacker-controlled entry as well, re-homing a live credential.
+    maskingPlugin({
+      type: "object",
+      properties: {
+        endpoint: { type: "string" },
+        targets: {
+          type: "array",
+          items: { type: "object", "x-paperclip-identity": "name" },
+        },
+      },
+    });
+    const store = seedConfigStore({
+      targets: [
+        { name: "alpha", token: "token-alpha-live" },
+        { name: "beta", token: "token-beta-live" },
+      ],
+    });
+    const { app } = await createApp(adminActor());
+
+    const res = await request(app)
+      .post(`/api/plugins/${pluginId}/config`)
+      .send({
+        companyId: companyA,
+        configJson: {
+          targets: [
+            { name: "alpha", endpoint: "https://attacker.example.com", token: "__redacted__" },
+            { name: "alpha", token: "__redacted__" },
+          ],
+        },
+      });
+
+    expect(res.status).toBe(400);
+    // Storage is untouched, so nothing leaked even in the refusal path.
+    expect(JSON.stringify(store.configJson)).not.toContain("attacker.example.com");
+    expect(JSON.stringify(res.body)).not.toContain("token-alpha-live");
+  }, 20_000);
+
   it("rejects the save when a masked array entry cannot be matched to storage", async () => {
     // No stable identity on the entries, and the array shrank — restoring by
     // position could only guess, so the write is refused outright.

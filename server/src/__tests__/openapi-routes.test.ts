@@ -225,6 +225,20 @@ describe("openapi routes", () => {
       actor: "board",
       instanceAdmin: true,
     });
+    // Plugin config holds plaintext credentials and is gated by
+    // assertInstanceAdmin at runtime. Without an explicit entry these fall
+    // through to the /api/plugins board-only default, publishing metadata that
+    // contradicts the gate — so assert all three, not just one.
+    for (const [path, method] of [
+      ["/api/plugins/{pluginId}/config", "get"],
+      ["/api/plugins/{pluginId}/config", "post"],
+      ["/api/plugins/{pluginId}/config/test", "post"],
+    ] as const) {
+      expect(spec.paths[path][method]["x-paperclip-authorization"]).toEqual({
+        actor: "board",
+        instanceAdmin: true,
+      });
+    }
     expect(spec.paths["/api/execution-workspaces/{id}/reconcile-branch"].post.security).toEqual([
       { BoardSessionAuth: [] },
       { BoardApiKeyAuth: [] },

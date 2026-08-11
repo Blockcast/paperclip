@@ -802,6 +802,22 @@ export function mergeMaskedPluginConfig(
   ): unknown[] {
     const identityKey = designatedIdentityKey(nodes, root);
 
+    // Uniqueness has to hold on BOTH sides. A stored identity matched uniquely
+    // is not proof on its own: two incoming entries sharing one identity each
+    // resolve to that same stored entry, so the live secret is restored into a
+    // second, caller-controlled entry whose siblings (endpoint, method, …) can
+    // differ freely. That re-homes a credential rather than preserving it.
+    // Counted once up front so a large array stays linear.
+    const incomingIdentityCounts = new Map<unknown, number>();
+    if (identityKey) {
+      for (const entry of incoming) {
+        if (!isPlainRecord(entry)) continue;
+        const value = identityValue(entry, identityKey);
+        if (value === undefined) continue;
+        incomingIdentityCounts.set(value, (incomingIdentityCounts.get(value) ?? 0) + 1);
+      }
+    }
+
     return incoming
       .map((entry, index) => {
         const entryPath = `${path}.${index}`;
@@ -814,7 +830,8 @@ export function mergeMaskedPluginConfig(
         let storedEntry: unknown;
 
         if (identityKey && isPlainRecord(entry)) {
-          // Proof 1: a manifest-designated immutable identity, matched uniquely.
+          // Proof 1: a manifest-designated immutable identity, matched uniquely
+          // in the stored array AND unambiguous in the incoming one.
           const wanted = identityValue(entry, identityKey);
           const matches =
             wanted === undefined
@@ -823,7 +840,10 @@ export function mergeMaskedPluginConfig(
                   (candidate) =>
                     isPlainRecord(candidate) && identityValue(candidate, identityKey) === wanted,
                 );
-          storedEntry = matches.length === 1 ? matches[0] : undefined;
+          storedEntry =
+            matches.length === 1 && incomingIdentityCounts.get(wanted) === 1
+              ? matches[0]
+              : undefined;
         } else if (incoming.length === storedArray.length) {
           // Proof 2: same shape, same place, identical but for the secrets.
           const positional = storedArray[index];

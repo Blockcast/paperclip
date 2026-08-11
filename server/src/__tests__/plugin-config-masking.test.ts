@@ -674,6 +674,54 @@ describe("mergeMaskedPluginConfig — array entry identity", () => {
     });
   });
 
+  it("refuses to restore when two incoming entries claim the same identity", () => {
+    // The exfiltration shape: a unique match in the STORED array is not proof
+    // on its own. Both incoming entries name "alpha", so both would otherwise
+    // resolve to the one stored alpha and receive `token-alpha` — planting a
+    // live credential on an entry pointing somewhere the caller chose.
+    const result = merge(
+      {
+        targets: [
+          { name: "alpha", url: "https://attacker.example.com", token: PLUGIN_CONFIG_SECRET_MASK },
+          { name: "alpha", url: "https://a.example.com", token: PLUGIN_CONFIG_SECRET_MASK },
+        ],
+      },
+      STORED_TARGETS,
+      IDENTITY_SCHEMA,
+    );
+
+    const serialized = JSON.stringify(result.configJson);
+    expect(serialized).not.toContain("token-alpha");
+    expect(serialized).not.toContain("token-beta");
+    expect(serialized).not.toContain(PLUGIN_CONFIG_SECRET_MASK);
+    expect(result.unresolvedMaskPaths).toEqual(["targets.0", "targets.1"]);
+  });
+
+  it("still restores a duplicated identity's siblings once the ambiguity is gone", () => {
+    // Guards the fix against over-reach: uniqueness is judged per identity
+    // value, so an unambiguous "beta" is unaffected by a duplicated "alpha".
+    const result = merge(
+      {
+        targets: [
+          { name: "alpha", url: "https://a.example.com", token: PLUGIN_CONFIG_SECRET_MASK },
+          { name: "alpha", url: "https://attacker.example.com", token: PLUGIN_CONFIG_SECRET_MASK },
+          { name: "beta", url: "https://b.example.com", token: PLUGIN_CONFIG_SECRET_MASK },
+        ],
+      },
+      STORED_TARGETS,
+      IDENTITY_SCHEMA,
+    );
+
+    expect(result.unresolvedMaskPaths).toEqual(["targets.0", "targets.1"]);
+    const targets = (result.configJson as { targets: Record<string, unknown>[] }).targets;
+    expect(targets[2]).toEqual({
+      name: "beta",
+      url: "https://b.example.com",
+      token: "token-beta",
+    });
+    expect(JSON.stringify([targets[0], targets[1]])).not.toContain("token-alpha");
+  });
+
   it("refuses a reorder when no identity is designated, rather than guessing", () => {
     // Without `x-paperclip-identity` nothing proves that the entry now at index
     // 0 is the entry that was stored at index 0, so both are refused.
