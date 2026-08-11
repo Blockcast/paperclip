@@ -2294,6 +2294,8 @@ describeEmbeddedPostgres("productivity review service", () => {
     let waitingReconcilers = 0;
     const bothReconcilersReady = deferred();
     const releaseReconcilers = deferred();
+    const finalizeWinnerWaiting = deferred();
+    const releaseFinalizeWinner = deferred();
     const service = productivityReviewService(db, {
       async beforeStaleReservationRecoveryFinalize(review, sourceIssue) {
         if (review.id !== reviewId || sourceIssue.id !== seeded.issueId) return;
@@ -2301,8 +2303,18 @@ describeEmbeddedPostgres("productivity review service", () => {
         if (waitingReconcilers === 2) bothReconcilersReady.resolve();
         await releaseReconcilers.promise;
       },
+      async afterStaleReservationRecoveryFinalize(review, sourceIssue, finalized) {
+        if (review.id !== reviewId || sourceIssue.id !== seeded.issueId) return;
+        if (finalized) {
+          finalizeWinnerWaiting.resolve();
+          await releaseFinalizeWinner.promise;
+          return;
+        }
+        await finalizeWinnerWaiting.promise;
+      },
       async enqueueWakeup(agentId, opts) {
         wakeups.push({ agentId, opts });
+        releaseFinalizeWinner.resolve();
         return { id: randomUUID() };
       },
     });

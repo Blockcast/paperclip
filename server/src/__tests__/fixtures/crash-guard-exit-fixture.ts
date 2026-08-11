@@ -11,8 +11,9 @@
  *           stack breadcrumb, past the 64 KB pipe buffer. Real postgres errors
  *           embed query text and get large; padding makes the pressure
  *           deterministic instead of hoping a stack is big enough.
- * argv[4] — "prefill-stderr" fills the pipe first and reports observed stream
- *           backpressure on stdout before triggering the crash.
+ * argv[4] — "prefill-stderr" fills the pipe first, reports observed stream
+ *           backpressure on stdout, then waits for a parent ack on stdin
+ *           before triggering the crash.
  */
 
 import { installProcessCrashGuard } from "../../process-crash-guard.js";
@@ -27,22 +28,31 @@ installProcessCrashGuard({
   logger: { error: () => {}, flush: () => {} },
 });
 
-if (prefillStderr) {
-  const accepted = process.stderr.write("P".repeat(200_000));
-  if (accepted) throw new Error("stderr did not report backpressure");
-  process.stdout.write("BACKPRESSURE\n");
-}
-
 const message = `BOOM_SENTINEL${padBytes > 0 ? ` ${"P".repeat(padBytes)}` : ""}`;
 
-if (kind === "reject") {
-  setImmediate(() => {
-    void Promise.reject(new Error(message));
-  });
-} else {
+function triggerCrash(): void {
+  if (kind === "reject") {
+    setImmediate(() => {
+      void Promise.reject(new Error(message));
+    });
+    return;
+  }
+
   // `setImmediate` reproduces the shape of the production crash: a throw from a
   // macrotask with no frame of ours on the stack (postgres `nextWrite`).
   setImmediate(() => {
     throw new Error(message);
   });
+}
+
+if (prefillStderr) {
+  const accepted = process.stderr.write("P".repeat(200_000));
+  if (accepted) throw new Error("stderr did not report backpressure");
+
+  // Do not let child exit race the parent's stdout listener. The ack arrives
+  // only after the parent has observed backpressure and started its deadline.
+  process.stdin.once("data", triggerCrash);
+  process.stdout.write("BACKPRESSURE\n");
+} else {
+  triggerCrash();
 }
