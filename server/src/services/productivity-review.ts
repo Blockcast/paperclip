@@ -35,6 +35,7 @@ import {
   withRecoveryModelProfileHint,
 } from "./recovery/model-profile-hint.js";
 import { RECOVERY_ORIGIN_KINDS } from "./recovery/origins.js";
+import { extractNextActionFromText } from "./run-liveness.js";
 import { runUsageTokenCounts } from "./recovery/zero-token-startup-failure.js";
 
 export const PRODUCTIVITY_REVIEW_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.issueProductivityReview;
@@ -69,6 +70,17 @@ const TERMINAL_RUN_STATUSES = ["succeeded", "interrupted", "failed", "cancelled"
 const ACTIVE_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const MAX_CANDIDATE_ISSUES = 250;
 const MAX_RUNS_FOR_STREAK = 100;
+const MAX_NEXT_ACTION_COMMENT_CANDIDATES = 20;
+const NEXT_ACTION_COMMENT_CANDIDATE_PATTERN = [
+  "(^|[[:space:]])([-*]|[0-9]+[.])?[[:space:]]*next( steps?| action)?[[:space:]]*:",
+  [
+    "(^|[[:space:]])",
+    "(i'll|i will|i am going to|i'm going to|let me|i need to|next(,| i will| i'll)?|my next step is|the next step is)",
+    "[[:space:]]+(first[[:space:]]+)?",
+    "(inspect|check|review|look|investigate|analy[sz]e|open|read|start|begin|work on|implement|fix|test|update|create|add)",
+    "([^[:alpha:]]|$)",
+  ].join(""),
+].join("|");
 const MAX_PARENT_WALK_DEPTH = 25;
 // BLO-19848: how long a `running` execution holder may go without a genuine
 // activity signal before its elapsed time stops being attributed to live work.
@@ -201,6 +213,8 @@ type ProductivityReviewEvidence = {
   costCents: number;
   usageSamples: Array<{ runId: string; usageJson: Record<string, unknown> | null }>;
   nextAction: string | null;
+  queuedUndispatchedRunCount: number;
+  oldestQueuedUndispatchedRunAgeMs: number | null;
   thresholds: ProductivityReviewThresholds;
   generatedAt: Date;
   routineOnlySamplingWindow: boolean;
@@ -2173,6 +2187,33 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       .then((rows) => rows[0]?.count ?? 0);
   }
 
+  async function findCommentNextAction(
+    sourceIssue: IssueRow,
+    sourceAgent: AgentRow,
+    thresholds: ProductivityReviewThresholds,
+    now: Date,
+  ) {
+    const lookbackStart = new Date(now.getTime() - thresholds.longActiveMs);
+    const rows = await db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.companyId, sourceIssue.companyId),
+          eq(issueComments.issueId, sourceIssue.id),
+          eq(issueComments.authorAgentId, sourceAgent.id),
+          sql`${issueComments.createdAt} >= ${lookbackStart.toISOString()}::timestamptz`,
+          sql`${issueComments.body} ~* ${NEXT_ACTION_COMMENT_CANDIDATE_PATTERN}`,
+        ),
+      )
+      .orderBy(desc(issueComments.createdAt), desc(issueComments.id))
+      .limit(MAX_NEXT_ACTION_COMMENT_CANDIDATES);
+
+    return rows
+      .map((comment) => extractNextActionFromText(comment.body))
+      .find((line): line is string => Boolean(line)) ?? null;
+  }
+
   async function collectEvidence(
     sourceIssue: IssueRow,
     sourceAgent: AgentRow,
@@ -2256,6 +2297,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       assigneeRunCommentCountLastHour,
       assigneeRunCommentCountLastSixHours,
       latestComments,
+      mostRecentDispatchAt,
       costRow,
     ] = await Promise.all([
       countIssueRunsSince(sourceIssue.companyId, sourceAgent.id, sourceIssue.id, oneHourAgo),
@@ -2280,6 +2322,22 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         .orderBy(desc(issueComments.createdAt), desc(issueComments.id))
         .limit(5)
         .then((rows) => rows.map((row) => row.comment)),
+      // BLO-19604: `latestRuns` is ordered by `createdAt`, not `startedAt` — a run created
+      // earlier can be dispatched later than a run created after it, so scanning that array
+      // for the first `startedAt` can pick a stale dispatch timestamp (or, once more than
+      // `MAX_RUNS_FOR_STREAK` runs exist, miss the true most-recent dispatch entirely because
+      // it fell outside the createdAt-ordered sample). Query `max(startedAt)` directly instead.
+      db
+        .select({ mostRecentDispatchAt: sql<Date | null>`max(${heartbeatRuns.startedAt})` })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, sourceIssue.companyId),
+            eq(heartbeatRuns.agentId, sourceAgent.id),
+            issueRunScopeSql(sourceIssue.id),
+          ),
+        )
+        .then((rows) => coerceDate(rows[0]?.mostRecentDispatchAt)),
       db
         .select({ costCents: sql<number>`coalesce(sum(${costEvents.costCents}), 0)::int` })
         .from(costEvents)
@@ -2290,7 +2348,32 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     const activeRunCount = latestRuns.filter((run) =>
       ACTIVE_RUN_STATUSES.includes(run.status as (typeof ACTIVE_RUN_STATUSES)[number]),
     ).length;
-    const activeStartedAt = sourceIssue.startedAt ?? sourceIssue.executionLockedAt ?? null;
+    // BLO-19604: a run stuck in `queued` never reaches `startedAt`, so it must not anchor
+    // the episode. `mostRecentDispatchAt` is a direct `max(startedAt)` over every run
+    // touching this issue (queried above, not derived from the createdAt-ordered
+    // `latestRuns` sample) — that is real evidence the agent was working, unlike a
+    // queued-but-unclaimed row.
+    //
+    // BLO-22016 (BLO-18846 / run `9e49405e`, ~17.75h queued with zero tokens executed): a
+    // dispatch is only evidence for the *current* episode if it happened at or after the
+    // current checkout. But the checkout-time fallback is not simply wrong to keep in all
+    // cases — an issue that never even got a run *at all* (no monitor armed, dispatcher
+    // never acted) is exactly the "unattended episode" scenario the monitor-gating tests
+    // below (BLO-19067/BLO-21003) intentionally still want to catch as wall-clock
+    // unattended time, and a live/terminal execution holder pinned via `executionRunId`
+    // (BLO-19848) never populates `startedAt` at all — that liveness is tracked instead via
+    // `lastOutputAt`/`lastUsefulActionAt`/status and clamped below by
+    // `nonLiveExecutionHoldSince`, so it must keep anchoring on `issueEpisodeStartedAt` too.
+    // The one case that must return `null` instead of falling back to checkout time is
+    // narrower: the issue's *current* execution holder (`sourceIssue.executionRunId`,
+    // fetched below as `executionRun`) is itself still `queued` and has never started. That
+    // is real, specific evidence the system tried to dispatch and is stuck — a dispatch-lag
+    // problem (BLO-21116 et al.), not a long-active-episode problem; the
+    // `queuedUndispatchedRunCount` evidence field further down is where that gets surfaced
+    // instead of silently inflating this trigger. `elapsedMs` below already treats a null
+    // `activeStartedAt` as "no episode to measure," which withholds `long_active_duration`
+    // without touching `no_comment_streak`/`high_churn`.
+    const issueEpisodeStartedAt = sourceIssue.startedAt ?? sourceIssue.executionLockedAt ?? null;
     // BLO-19848: clamp the episode end to the last moment execution was
     // attributable to a live run, so a wedged holder cannot accrue "active"
     // time on work that already finished. See nonLiveExecutionHoldSince.
@@ -2302,6 +2385,14 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           .limit(1)
           .then((rows) => rows[0] ?? null)
       : null;
+    const currentHolderNeverDispatched = executionRun?.status === "queued" && !executionRun.startedAt;
+    const activeStartedAt =
+      mostRecentDispatchAt &&
+      (!issueEpisodeStartedAt || mostRecentDispatchAt.getTime() >= issueEpisodeStartedAt.getTime())
+        ? mostRecentDispatchAt
+        : currentHolderNeverDispatched
+          ? null
+          : issueEpisodeStartedAt;
     const nonLiveHoldSince = nonLiveExecutionHoldSince(sourceIssue, executionRun, now);
     // Clamping below activeStartedAt collapses to 0 via Math.max — i.e. a holder
     // that went non-live before the episode began contributes no active time.
@@ -2469,6 +2560,35 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       };
     }
 
+    // BLO-19604: `run.nextAction` is only populated when that specific run's own
+    // liveness classification saw the text (e.g. a comment posted after that run had
+    // already been classified is invisible to it). Before reporting "none recorded" —
+    // which reads as "the assignee left no next step" — fall back to scanning the
+    // assignee's own recent comments directly, the same way run-liveness classification
+    // would have. This is a genuine fallback, not just a relabelled null: it recovers a
+    // `Next action:`/`Next:` line the structured field missed. Sourced from
+    // `findCommentNextAction` (queried directly against `issueComments`, no join on
+    // `heartbeatRuns`) rather than `latestComments`, since a plain assignee comment with no
+    // `createdByRunId` is exactly the kind of comment this fallback exists to recover, and
+    // `latestComments`'s inner join excludes it. Keep that fallback lazy and projected: the
+    // common structured path should not transfer or parse the assignee's full comment window.
+    const structuredNextAction = latestRuns.find((run) => run.nextAction)?.nextAction ?? null;
+    const commentNextAction = structuredNextAction
+      ? null
+      : await findCommentNextAction(sourceIssue, sourceAgent, thresholds, now);
+    const nextAction = structuredNextAction ?? commentNextAction;
+
+    // BLO-19604 AC4: a run that never left `queued` no longer inflates elapsed (see
+    // `activeStartedAt` above), but silently dropping it out of the picture would leave a
+    // reviewer with no explanation for why the episode looks shorter than the issue's raw
+    // age. Surface it explicitly instead of reaping it here — reaping/re-dispatch ceilings
+    // are the dispatcher's job (BLO-21116 / BLO-19954), not this evaluator's.
+    const queuedUndispatchedRuns = latestRuns.filter((run) => run.status === "queued" && !run.startedAt);
+    const oldestQueuedUndispatchedRun = queuedUndispatchedRuns.reduce<HeartbeatRunRow | null>(
+      (oldest, run) => (!oldest || run.createdAt.getTime() < oldest.createdAt.getTime() ? run : oldest),
+      null,
+    );
+
     return {
       trigger,
       triggerReasons,
@@ -2496,7 +2616,11 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         .filter((run) => run.usageJson)
         .slice(0, 3)
         .map((run) => ({ runId: run.id, usageJson: run.usageJson ?? null })),
-      nextAction: latestRuns.find((run) => run.nextAction)?.nextAction ?? null,
+      nextAction,
+      queuedUndispatchedRunCount: queuedUndispatchedRuns.length,
+      oldestQueuedUndispatchedRunAgeMs: oldestQueuedUndispatchedRun
+        ? Math.max(0, now.getTime() - oldestQueuedUndispatchedRun.createdAt.getTime())
+        : null,
       thresholds,
       generatedAt: now,
       routineOnlySamplingWindow,
@@ -2612,6 +2736,11 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       `- Runs in rolling windows: ${evidence.runCountLastHour}/1h, ${evidence.runCountLastSixHours}/6h`,
       `- Assignee run-linked comments total/window: ${evidence.commentCount} total, ${evidence.commentCountLastHour}/1h, ${evidence.commentCountLastSixHours}/6h`,
       `- Cost events total: ${evidence.costCents} cents`,
+      ...(evidence.queuedUndispatchedRunCount > 0
+        ? [
+          `- Queued, never-dispatched runs in sample: ${evidence.queuedUndispatchedRunCount} (oldest ${msToHuman(evidence.oldestQueuedUndispatchedRunAgeMs)} old) — excluded from the elapsed-time figure above; a run stuck in \`queued\` is a dispatch problem, not evidence of a long-running episode`,
+        ]
+        : []),
       `- Current next action: ${evidence.nextAction ? truncateInline(evidence.nextAction, 500) : "none recorded"}`,
       "",
       "## Thresholds",
