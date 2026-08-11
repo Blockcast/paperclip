@@ -154,6 +154,18 @@ export type AgentJobFailureDiagnostics = {
   logTailTruncated: boolean;
 };
 
+export function classifyAgentJobFailureErrorCode(
+  diagnostics: AgentJobFailureDiagnostics | null,
+): "oom_killed" | "exit_137" | null {
+  const failedApps = diagnostics?.containers.filter(
+    (entry) => entry.kind === "app" && (entry.exitCode ?? 0) !== 0,
+  ) ?? [];
+  if (failedApps.some((entry) => entry.reason?.toLowerCase() === "oomkilled")) {
+    return "oom_killed";
+  }
+  return failedApps.some((entry) => entry.exitCode === 137) ? "exit_137" : null;
+}
+
 type ClientState =
   | { kind: "uninitialized" }
   | { kind: "unavailable"; reason: string }
