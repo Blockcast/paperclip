@@ -14,7 +14,7 @@ if [[ -n "$deployed_commit" && ! "$deployed_commit" =~ ^[0-9a-f]{40}$ ]]; then
   exit 2
 fi
 
-for dependency in ruby kubectl jq sha256sum; do
+for dependency in ruby yq jq sha256sum; do
   if ! command -v "$dependency" >/dev/null 2>&1; then
     echo "required command not found: ${dependency}" >&2
     exit 2
@@ -65,15 +65,21 @@ puts YAML.dump(deployment)
 '
 ruby -ryaml -e "$EXTRACT_UNSTAMPED_RUBY_CODE" "$marker" "$rendered" "$deployed_commit" >"$unstamped"
 
-kubectl_args=(create --dry-run=client -o json -f "$unstamped")
-if [[ -n "${PAPERCLIP_DEPLOY_NAMESPACE:-}" ]]; then
-  kubectl_args+=(--namespace "$PAPERCLIP_DEPLOY_NAMESPACE")
-fi
+deploy_namespace="${PAPERCLIP_DEPLOY_NAMESPACE:-default}"
 
+# `kubectl create --dry-run=client` still performs API discovery. Use the
+# runner-pinned parser and add the namespace kubectl previously defaulted so
+# the approval-plan hash stays byte-for-byte compatible on tokenless runners.
 canonical_unstamped="$(
-  kubectl "${kubectl_args[@]}" |
-    jq -cS --arg key "paperclip.blockcast.net/approval-plan-sha256" '
-      del(.spec.template.metadata.annotations[$key])
+  yq eval -o=json '.' "$unstamped" |
+    jq -cS \
+      --arg key "paperclip.blockcast.net/approval-plan-sha256" \
+      --arg namespace "$deploy_namespace" '
+      if ((.metadata.namespace // "") | length) == 0
+        then .metadata.namespace = $namespace
+        else .
+      end
+      | del(.spec.template.metadata.annotations[$key])
       | if ((.spec.template.metadata.annotations // {}) | length) == 0
         then del(.spec.template.metadata.annotations)
         else .
