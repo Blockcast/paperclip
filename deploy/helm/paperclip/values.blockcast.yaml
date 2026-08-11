@@ -262,6 +262,17 @@ env:
       value: "openai/gpt-5.6-sol,openai/gpt-5.6-terra,openai/gpt-5.5"
     - name: PAPERCLIP_CODEX_PROVIDERS
       value: '{"providers":{"penstock":{"name":"Penstock OpenAI gateway","base_url":"https://api.penstock.run/v1","env_key":"OPENAI_API_KEY","wire_api":"responses"}},"model_provider":"penstock"}'
+    # BLO-25308 / BLO-21812: fleet default ServiceAccount for claude_k8s agent
+    # Job pods. paperclip-adapter-claude-k8s's resolveServiceAccountName()
+    # (merge commit c5d1389f) resolves per-agent adapterConfig.serviceAccountName
+    # first, then this env var, then refuses to build the Job manifest — it no
+    # longer lets an unset value silently fall through to the namespace `default`
+    # ServiceAccount (which has no cluster-scoped read; see BLO-21499/BLO-21812).
+    # Must be live before or in the same rollout as any adapter build carrying
+    # that resolver, or every claude_k8s agent without a per-agent
+    # serviceAccountName hard-fails at Job build instead of launching.
+    - name: PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME
+      value: paperclip
 
 # Worker tier also runs plugin workers and scheduled plugin jobs. Linear's
 # periodic sync can transiently burn CPU over large BLO backlogs; keep enough
