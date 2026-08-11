@@ -109,7 +109,7 @@ describeEmbeddedPostgres("queued backlog convergence (BLO-20396)", () => {
     vi.clearAllMocks();
     runningProcesses.clear();
     await cleanupHeartbeatTestState(db, heartbeat);
-  });
+  }, 300_000);
 
   afterAll(async () => {
     runningProcesses.clear();

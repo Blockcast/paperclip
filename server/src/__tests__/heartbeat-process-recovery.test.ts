@@ -832,7 +832,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   async function seedStrandedIssueFixture(input: {
     status: "todo" | "in_progress";
     runStatus: "failed" | "timed_out" | "cancelled" | "succeeded";
-    retryReason?: "assignment_recovery" | "issue_continuation_needed" | "execution_review_participant_recovery" | null;
+    retryReason?: "assignment_recovery" | "issue_continuation_needed" | "execution_review_participant_recovery" | "session_unavailable" | "zero_token_session_reset" | null;
     runSource?: string | null;
     assignToUser?: boolean;
     activePauseHold?: boolean;
@@ -841,6 +841,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     runError?: string | null;
     resultJson?: Record<string, unknown> | null;
     monitorNextCheckAt?: Date | null;
+    runUsageJson?: Record<string, unknown> | null;
+    adapterType?: string;
+    agentStatus?: "idle" | "error";
+    scheduledRetryAttempt?: number;
   }) {
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -864,8 +868,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       companyId,
       name: "CodexCoder",
       role: "engineer",
-      status: "idle",
-      adapterType: "codex_local",
+      status: input.agentStatus ?? "idle",
+      errorReason: input.agentStatus === "error" ? input.runError ?? "run failed before issue advanced" : null,
+      adapterType: input.adapterType ?? "codex_local",
       adapterConfig: {},
       runtimeConfig: {},
       permissions: {},
@@ -899,6 +904,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       contextSnapshot: {
         issueId,
         taskId: issueId,
+        adapterType: input.adapterType ?? "codex_local",
         wakeReason: input.retryReason === "assignment_recovery"
           ? "issue_assignment_recovery"
           : input.retryReason ?? "issue_assigned",
@@ -916,6 +922,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         : ("runError" in input ? input.runError : "run failed before issue advanced"),
       livenessState: input.livenessState ?? null,
       resultJson: input.resultJson ?? null,
+      usageJson: input.runUsageJson ?? null,
+      scheduledRetryAttempt: input.scheduledRetryAttempt ?? 0,
     });
 
     await db.insert(issues).values([
@@ -4641,6 +4649,498 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     ).toBe(true);
   });
 
+  // BLO-19124: `issue_dependencies_blocked` is the dispatcher declining to run an
+  // issue whose blockers are still open — a wait, not a failure. It shares
+  // NON_RETRYABLE_CONTINUATION_ERROR_CODES with genuine failures, which made every
+  // correctly-sequenced DAG node escalate as a strand (158 of 161 active recovery
+  // actions on one inbox). These two cases are deliberately disjoint: the guard must
+  // key on live blockers, not on the error code, so suppressing the code wholesale
+  // fails the second test and escalating it wholesale fails the first.
+  it("does not escalate a dependency-blocked continuation while a blocker is still open", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "cancelled",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "issue_dependencies_blocked",
+      runError:
+        "Cancelled because issue dependencies are still blocked; Paperclip will wake the assignee when blockers resolve",
+    });
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const openBlockerId = randomUUID();
+
+    await db.insert(issues).values({
+      id: openBlockerId,
+      companyId,
+      title: "Upstream work that genuinely is not done yet",
+      status: "in_progress",
+      priority: "medium",
+      issueNumber: 20,
+      identifier: `${issuePrefix}-20`,
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: openBlockerId,
+      relatedIssueId: issueId,
+      type: "blocks",
+    });
+
+    heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.dependencyWaitSkipped).toBe(1);
+    expect(result.escalated).toBe(0);
+    expect(result.issueIds).toEqual([]);
+
+    // The issue is left exactly as the dispatcher left it: still owned by its real
+    // assignee, not re-`blocked`, and not handed to a recovery owner. Reassignment is
+    // the specific harm — the dependency wake fires at `assigneeAgentId`, so moving
+    // ownership would send it to an agent that no longer owns the work.
+    const source = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(source?.status).toBe("in_progress");
+    expect(source?.assigneeAgentId).toBe(agentId);
+
+    // No recovery action, no recovery issue, no comment.
+    const recoveryIssues = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stranded_issue_recovery")));
+    expect(recoveryIssues).toHaveLength(0);
+
+    const recoveryActions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)));
+    expect(recoveryActions).toHaveLength(0);
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(0);
+  });
+
+  it("does not escalate a dependency-blocked continuation while a fresh blockers-resolved wake can still land", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "cancelled",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "issue_dependencies_blocked",
+      runError:
+        "Cancelled because issue dependencies are still blocked; Paperclip will wake the assignee when blockers resolve",
+    });
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const freshDoneBlockerId = randomUUID();
+
+    await db.insert(issues).values({
+      id: freshDoneBlockerId,
+      companyId,
+      title: "Upstream work that just finished",
+      status: "done",
+      priority: "medium",
+      issueNumber: 21,
+      identifier: `${issuePrefix}-21`,
+      completedAt: new Date(),
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: freshDoneBlockerId,
+      relatedIssueId: issueId,
+      type: "blocks",
+    });
+
+    heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.dependencyWaitSkipped).toBe(1);
+    expect(result.escalated).toBe(0);
+    expect(result.issueIds).toEqual([]);
+
+    const source = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(source?.status).toBe("in_progress");
+    expect(source?.assigneeAgentId).toBe(agentId);
+
+    const recoveryActions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)));
+    expect(recoveryActions).toHaveLength(0);
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(0);
+  });
+
+  it("does not escalate a dependency-blocked continuation when finalization started before grace but completed recently", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "cancelled",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "issue_dependencies_blocked",
+      runError:
+        "Cancelled because issue dependencies are still blocked; Paperclip will wake the assignee when blockers resolve",
+    });
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const projectId = randomUUID();
+    const projectWorkspaceId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+    const doneBlockerId = randomUUID();
+    const finalizationStartedAt = new Date(Date.now() - 10 * 60 * 1000);
+    const finalizationFinishedAt = new Date(Date.now() - 1_000);
+
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Dependency finalize project",
+      status: "in_progress",
+    });
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId,
+      companyId,
+      projectId,
+      name: "Dependency finalize workspace",
+      sourceType: "git_worktree",
+    });
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "Dependency finalize execution workspace",
+      providerType: "git_worktree",
+    });
+    await db.insert(issues).values({
+      id: doneBlockerId,
+      companyId,
+      projectId,
+      title: "Upstream work that finalized after completion",
+      status: "done",
+      priority: "medium",
+      issueNumber: 22,
+      identifier: `${issuePrefix}-22`,
+      completedAt: new Date(Date.now() - 10 * 60 * 1000),
+      executionWorkspaceId,
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: doneBlockerId,
+      relatedIssueId: issueId,
+      type: "blocks",
+    });
+    await db.insert(workspaceOperations).values({
+      companyId,
+      executionWorkspaceId,
+      issueId: doneBlockerId,
+      phase: "workspace_finalize",
+      status: "succeeded",
+      startedAt: finalizationStartedAt,
+      finishedAt: finalizationFinishedAt,
+    });
+
+    heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.dependencyWaitSkipped).toBe(1);
+    expect(result.escalated).toBe(0);
+    expect(result.issueIds).toEqual([]);
+
+    const source = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(source?.status).toBe("in_progress");
+    expect(source?.assigneeAgentId).toBe(agentId);
+
+    const recoveryActions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)));
+    expect(recoveryActions).toHaveLength(0);
+  });
+
+  it("does not escalate a dependency-blocked continuation on the first recovery pass at the sweep threshold", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "cancelled",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "issue_dependencies_blocked",
+      runError:
+        "Cancelled because issue dependencies are still blocked; Paperclip will wake the assignee when blockers resolve",
+    });
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const thresholdDoneBlockerId = randomUUID();
+
+    await db.insert(issues).values({
+      id: thresholdDoneBlockerId,
+      companyId,
+      title: "Upstream work at sweep threshold",
+      status: "done",
+      priority: "medium",
+      issueNumber: 23,
+      identifier: `${issuePrefix}-23`,
+      completedAt: new Date(Date.now() - 5 * 60 * 1000),
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: thresholdDoneBlockerId,
+      relatedIssueId: issueId,
+      type: "blocks",
+    });
+
+    heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.dependencyWaitSkipped).toBe(1);
+    expect(result.escalated).toBe(0);
+    expect(result.issueIds).toEqual([]);
+
+    const source = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(source?.status).toBe("in_progress");
+    expect(source?.assigneeAgentId).toBe(agentId);
+  });
+
+  it("does not escalate a dependency-blocked continuation while an exact dependency wake is still queued", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "cancelled",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "issue_dependencies_blocked",
+      runError:
+        "Cancelled because issue dependencies are still blocked; Paperclip will wake the assignee when blockers resolve",
+    });
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const doneBlockerId = randomUUID();
+
+    await db.insert(issues).values({
+      id: doneBlockerId,
+      companyId,
+      title: "Upstream work with emitted dependency wake",
+      status: "done",
+      priority: "medium",
+      issueNumber: 24,
+      identifier: `${issuePrefix}-24`,
+      completedAt: new Date(Date.now() - 10 * 60 * 1000),
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: doneBlockerId,
+      relatedIssueId: issueId,
+      type: "blocks",
+    });
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_blockers_resolved",
+      payload: {
+        issueId,
+        resolvedBlockerIssueId: doneBlockerId,
+        blockerIssueIds: [doneBlockerId],
+      },
+      status: "queued",
+      idempotencyKey: `issue_blockers_resolved:${issueId}:${doneBlockerId}`,
+    });
+
+    heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.dependencyWaitSkipped).toBe(1);
+    expect(result.escalated).toBe(0);
+    expect(result.issueIds).toEqual([]);
+
+    const recoveryActions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)));
+    expect(recoveryActions).toHaveLength(0);
+  });
+
+  it("escalates a dependency-blocked continuation after its historical blockers-resolved wake completed without progress", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "cancelled",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "issue_dependencies_blocked",
+      runError:
+        "Cancelled because issue dependencies are still blocked; Paperclip will wake the assignee when blockers resolve",
+    });
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const doneBlockerId = randomUUID();
+
+    await db.insert(issues).values({
+      id: doneBlockerId,
+      companyId,
+      title: "Upstream work whose wake did not restore a continuation",
+      status: "done",
+      priority: "medium",
+      issueNumber: 25,
+      identifier: `${issuePrefix}-25`,
+      completedAt: new Date(Date.now() - 10 * 60 * 1000),
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: doneBlockerId,
+      relatedIssueId: issueId,
+      type: "blocks",
+    });
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_blockers_resolved",
+      payload: {
+        issueId,
+        resolvedBlockerIssueId: doneBlockerId,
+        blockerIssueIds: [doneBlockerId],
+      },
+      status: "completed",
+      finishedAt: new Date(Date.now() - 10 * 60 * 1000),
+      idempotencyKey: `issue_blockers_resolved:${issueId}:${doneBlockerId}`,
+    });
+
+    heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.dependencyWaitSkipped).toBe(0);
+    expect(result.escalated).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const recoveryActions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)));
+    expect(recoveryActions).toHaveLength(1);
+  });
+
+  it("still escalates a dependency-blocked continuation when nothing is actually blocking it", async () => {
+    const { companyId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "cancelled",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "issue_dependencies_blocked",
+      runError:
+        "Cancelled because issue dependencies are still blocked; Paperclip will wake the assignee when blockers resolve",
+    });
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const doneBlockerId = randomUUID();
+
+    // A blocker that has since completed: readiness is restored, so the issue reports
+    // "dependency-blocked" with nothing blocking it. That is a genuine defect and must
+    // stay visible rather than being swallowed by the new guard.
+    await db.insert(issues).values({
+      id: doneBlockerId,
+      companyId,
+      title: "Upstream work that already finished",
+      status: "done",
+      priority: "medium",
+      issueNumber: 21,
+      identifier: `${issuePrefix}-21`,
+      completedAt: new Date(Date.now() - 10 * 60 * 1000),
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: doneBlockerId,
+      relatedIssueId: issueId,
+      type: "blocks",
+    });
+
+    heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.dependencyWaitSkipped).toBe(0);
+    expect(result.escalated).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
+  });
+
+  it.each(["added", "reopened"] as const)(
+    "does not escalate a dependency-blocked continuation when a blocker is %s after readiness preflight",
+    async (change) => {
+      const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+        status: "in_progress",
+        runStatus: "cancelled",
+        retryReason: "issue_continuation_needed",
+        runErrorCode: "issue_dependencies_blocked",
+        runError:
+          "Cancelled because issue dependencies are still blocked; Paperclip will wake the assignee when blockers resolve",
+      });
+      const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+      const blockerIssueId = randomUUID();
+
+      if (change === "reopened") {
+        await db.insert(issues).values({
+          id: blockerIssueId,
+          companyId,
+          title: "Previously completed dependency",
+          status: "done",
+          priority: "medium",
+          issueNumber: 26,
+          identifier: `${issuePrefix}-26`,
+          completedAt: new Date(Date.now() - 10 * 60 * 1000),
+        });
+        await db.insert(issueRelations).values({
+          companyId,
+          issueId: blockerIssueId,
+          relatedIssueId: issueId,
+          type: "blocks",
+        });
+      }
+
+      // The outer sweep has already classified the issue as dependency-ready
+      // before it calls `escalateStrandedAssignedIssue`. Inject the relation
+      // change just before that method opens its advisory-lock transaction so
+      // the locked re-read, rather than the stale preflight, decides whether
+      // recovery side effects are allowed.
+      const originalTransaction = db.transaction.bind(db);
+      const transactionSpy = vi.spyOn(db, "transaction");
+      let blockerMutationApplied = false;
+      transactionSpy.mockImplementationOnce(async (callback: any) => {
+        if (change === "added") {
+          await db.insert(issues).values({
+            id: blockerIssueId,
+            companyId,
+            title: "Dependency added during escalation",
+            status: "in_progress",
+            priority: "medium",
+            issueNumber: 26,
+            identifier: `${issuePrefix}-26`,
+          });
+          await db.insert(issueRelations).values({
+            companyId,
+            issueId: blockerIssueId,
+            relatedIssueId: issueId,
+            type: "blocks",
+          });
+        } else {
+          await db
+            .update(issues)
+            .set({ status: "in_progress", completedAt: null })
+            .where(eq(issues.id, blockerIssueId));
+        }
+        blockerMutationApplied = true;
+        return originalTransaction(callback);
+      });
+
+      heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+      let result: Awaited<ReturnType<typeof heartbeat.reconcileStrandedAssignedIssues>>;
+      try {
+        result = await heartbeat.reconcileStrandedAssignedIssues();
+      } finally {
+        transactionSpy.mockRestore();
+      }
+
+      expect(blockerMutationApplied).toBe(true);
+      expect(result.escalated).toBe(0);
+      expect(result.issueIds).not.toContain(issueId);
+
+      const source = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+      expect(source?.status).toBe("in_progress");
+      expect(source?.assigneeAgentId).toBe(agentId);
+      await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual([blockerIssueId]);
+
+      const recoveryActions = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)));
+      expect(recoveryActions).toHaveLength(0);
+    },
+  );
+
   it("parks a review-waiting continuation when an open child blocker would create a cycle", async () => {
     const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
       status: "in_progress",
@@ -7742,6 +8242,341 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(comments).toHaveLength(1);
     expect(comments[0]?.body).toContain("zero-token startup wedge");
     expect(comments[0]?.body).toContain("reset");
+  });
+
+  it("startup reconciliation clears a stale opencode_k8s session and queues immediate recovery", async () => {
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      runErrorCode: "adapter_failed",
+      runError: "Session unavailable",
+      adapterType: "opencode_k8s",
+      agentStatus: "error",
+    });
+
+    const historicalTaskKey = randomUUID();
+    const failedRun = await db
+      .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0]!);
+    const { adapterType: _adapterType, ...legacyContextSnapshot } = failedRun.contextSnapshot ?? {};
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: { ...legacyContextSnapshot, taskKey: historicalTaskKey },
+        sessionIdBefore: "stale-opencode-session",
+      })
+      .where(eq(heartbeatRuns.id, runId));
+
+    await db.insert(agentTaskSessions).values({
+      companyId,
+      agentId,
+      adapterType: "opencode_k8s",
+      taskKey: historicalTaskKey,
+      sessionParamsJson: { sessionId: "stale-opencode-session" },
+      sessionDisplayId: "stale-opencode-session",
+    });
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.zeroTokenSessionResetRetried).toBe(1);
+    expect(result.escalated).toBe(0);
+    await expect(
+      db.select().from(agentTaskSessions).where(eq(agentTaskSessions.agentId, agentId)),
+    ).resolves.toHaveLength(0);
+
+    const wakeRows = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakeRows.some((row) => row.reason === "issue_zero_token_session_reset")).toBe(true);
+    const retryRun = await db
+      .select({ retryOfRunId: heartbeatRuns.retryOfRunId })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.retryOfRunId, runId))
+      .then((rows) => rows[0] ?? null);
+    expect(retryRun?.retryOfRunId).toBe(runId);
+  });
+
+  it("accounts for a session reset attempt before a fast claimant can schedule another retry", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      runErrorCode: "session_unavailable",
+      runError: "Session unavailable",
+      adapterType: "opencode_k8s",
+    });
+
+    await db.insert(agentTaskSessions).values({
+      companyId,
+      agentId,
+      adapterType: "opencode_k8s",
+      taskKey: issueId,
+      sessionParamsJson: { sessionId: "stale-racing-session" },
+      sessionDisplayId: "stale-racing-session",
+    });
+
+    let raced = false;
+    let observedAttempt: number | null = null;
+    let secondScheduleOutcome: string | null = null;
+    let raceHeartbeat!: ReturnType<typeof heartbeatService>;
+    raceHeartbeat = createHeartbeat({
+      penstockAvailabilityGate: allowPenstockGate,
+      skipQueuedRunDispatch: true,
+      beforeQueuedRunDispatchForTest: async (queuedRun) => {
+        if (raced || queuedRun.contextSnapshot?.retryReason !== "zero_token_session_reset") return;
+        raced = true;
+        observedAttempt = queuedRun.scheduledRetryAttempt;
+        await expect(
+          db.select().from(agentTaskSessions).where(eq(agentTaskSessions.agentId, agentId)),
+        ).resolves.toHaveLength(0);
+
+        await db
+          .update(issues)
+          .set({ executionRunId: queuedRun.id })
+          .where(eq(issues.id, issueId));
+        const failedReset = await db
+          .update(heartbeatRuns)
+          .set({
+            status: "failed",
+            errorCode: "session_unavailable",
+            error: "Session unavailable",
+            usageJson: { inputTokens: 0, outputTokens: 0 },
+            finishedAt: new Date(),
+          })
+          .where(eq(heartbeatRuns.id, queuedRun.id))
+          .returning()
+          .then((rows) => rows[0]!);
+        const firstSchedule = await raceHeartbeat.scheduleBoundedRetry(failedReset.id, {
+          retryReason: "session_unavailable",
+          wakeReason: "session_unavailable_retry",
+          maxAttempts: 2,
+          delayMs: 30_000,
+        });
+        if (firstSchedule.outcome !== "scheduled") {
+          throw new Error(`Expected the fast claimant to schedule attempt 2: ${JSON.stringify(firstSchedule)}`);
+        }
+
+        await db
+          .update(heartbeatRuns)
+          .set({
+            status: "failed",
+            errorCode: "session_unavailable",
+            error: "Session unavailable",
+            usageJson: { inputTokens: 0, outputTokens: 0 },
+            finishedAt: new Date(),
+          })
+          .where(eq(heartbeatRuns.id, firstSchedule.run.id));
+        const secondSchedule = await raceHeartbeat.scheduleBoundedRetry(firstSchedule.run.id, {
+          retryReason: "session_unavailable",
+          wakeReason: "session_unavailable_retry",
+          maxAttempts: 2,
+          delayMs: 30_000,
+        });
+        secondScheduleOutcome = secondSchedule.outcome;
+      },
+    });
+
+    const result = await raceHeartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.zeroTokenSessionResetRetried).toBe(1);
+    expect(observedAttempt).toBe(1);
+    expect(secondScheduleOutcome).toBe("retry_exhausted");
+    const retryRuns = await db
+      .select({ attempt: heartbeatRuns.scheduledRetryAttempt })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(retryRuns.filter((run) => run.attempt > 0).map((run) => run.attempt).sort()).toEqual([1, 2]);
+  });
+
+  it("does not clear the current assignee session from an older assignee failure", async () => {
+    const { companyId, agentId: previousAgentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      runErrorCode: "adapter_failed",
+      runError: "Session unavailable",
+      adapterType: "opencode_k8s",
+    });
+    const currentAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: currentAgentId,
+      companyId,
+      name: "CurrentOpenCodeAgent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "opencode_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.update(issues).set({ assigneeAgentId: currentAgentId }).where(eq(issues.id, issueId));
+    await db.insert(agentTaskSessions).values({
+      companyId,
+      agentId: currentAgentId,
+      adapterType: "opencode_k8s",
+      taskKey: issueId,
+      sessionParamsJson: { sessionId: "healthy-current-session" },
+      sessionDisplayId: "healthy-current-session",
+    });
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.zeroTokenSessionResetRetried).toBe(0);
+    await expect(
+      db.select().from(agentTaskSessions).where(eq(agentTaskSessions.agentId, currentAgentId)),
+    ).resolves.toHaveLength(1);
+    const wakeRows = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, currentAgentId));
+    expect(wakeRows.some((row) => row.reason === "issue_zero_token_session_reset")).toBe(false);
+    expect(previousAgentId).not.toBe(currentAgentId);
+  });
+
+  it("does not treat legacy session-unavailable text as an OpenCode failure for other adapters", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      runErrorCode: "adapter_failed",
+      runError: "Session unavailable",
+      adapterType: "claude_k8s",
+    });
+    await db.insert(agentTaskSessions).values({
+      companyId,
+      agentId,
+      adapterType: "claude_k8s",
+      taskKey: issueId,
+      sessionParamsJson: { sessionId: "healthy-claude-session" },
+      sessionDisplayId: "healthy-claude-session",
+    });
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.zeroTokenSessionResetRetried).toBe(0);
+    await expect(
+      db.select().from(agentTaskSessions).where(eq(agentTaskSessions.agentId, agentId)),
+    ).resolves.toHaveLength(1);
+  });
+
+  it("does not reclassify a historical non-OpenCode failure after adapter reconfiguration", async () => {
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      runErrorCode: "adapter_failed",
+      runError: "Session unavailable",
+      adapterType: "claude_k8s",
+    });
+    const historicalTaskKey = randomUUID();
+    const failedRun = await db
+      .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0]!);
+    const { adapterType: _adapterType, ...legacyContextSnapshot } = failedRun.contextSnapshot ?? {};
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: { ...legacyContextSnapshot, taskKey: historicalTaskKey },
+        sessionIdBefore: "historical-claude-session",
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    await db.insert(agentTaskSessions).values({
+      companyId,
+      agentId,
+      adapterType: "claude_k8s",
+      taskKey: historicalTaskKey,
+      sessionParamsJson: { sessionId: "historical-claude-session" },
+      sessionDisplayId: "historical-claude-session",
+    });
+    await db.update(agents).set({ adapterType: "opencode_k8s" }).where(eq(agents.id, agentId));
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.zeroTokenSessionResetRetried).toBe(0);
+    expect(result.escalated).toBe(1);
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("blocked");
+  });
+
+  it("does not clear a reconfigured adapter session after a typed OpenCode failure", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      runErrorCode: "session_unavailable",
+      runError: "Session unavailable",
+      adapterType: "opencode_k8s",
+    });
+    await db.update(agents).set({ adapterType: "claude_k8s" }).where(eq(agents.id, agentId));
+    await db.insert(agentTaskSessions).values({
+      companyId,
+      agentId,
+      adapterType: "claude_k8s",
+      taskKey: issueId,
+      sessionParamsJson: { sessionId: "healthy-claude-session" },
+      sessionDisplayId: "healthy-claude-session",
+    });
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.zeroTokenSessionResetRetried).toBe(0);
+    expect(result.escalated).toBe(1);
+    await expect(
+      db.select().from(agentTaskSessions).where(eq(agentTaskSessions.agentId, agentId)),
+    ).resolves.toHaveLength(1);
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("blocked");
+  });
+
+  it("blocks an exhausted ordinary session-unavailable chain without starting a reset chain", async () => {
+    const { agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "session_unavailable",
+      runErrorCode: "session_unavailable",
+      runError: "Session unavailable",
+      runUsageJson: { inputTokens: 0, outputTokens: 0 },
+      adapterType: "opencode_k8s",
+      scheduledRetryAttempt: 2,
+    });
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.zeroTokenSessionResetRetried).toBe(0);
+    expect(result.zeroTokenStartupFailureBlocked).toBe(1);
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("blocked");
+    const wakeRows = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakeRows.some((row) => row.reason === "issue_zero_token_session_reset")).toBe(false);
+  });
+
+  it("blocks an exhausted session-unavailable reset chain without another wake", async () => {
+    const { agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "zero_token_session_reset",
+      runErrorCode: "session_unavailable",
+      runError: "Session unavailable",
+      runUsageJson: { inputTokens: 0, outputTokens: 0 },
+      adapterType: "opencode_k8s",
+      scheduledRetryAttempt: 2,
+    });
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.zeroTokenSessionResetRetried).toBe(0);
+    expect(result.zeroTokenStartupFailureBlocked).toBe(1);
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("blocked");
+    const wakeRows = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakeRows.some((row) => row.reason === "issue_zero_token_session_reset")).toBe(false);
+    expect(wakeRows.some((row) => row.reason === "session_unavailable_retry")).toBe(false);
   });
 
   // BLO-10889: if the reset-and-retry attempt ALSO fails with the same

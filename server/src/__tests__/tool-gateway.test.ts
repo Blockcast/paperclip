@@ -692,6 +692,7 @@ describeEmbeddedPostgres("tool gateway acceptance", () => {
   });
 
   it("throttles named gateway bearer auth failures without leaking bearer material", async () => {
+    const now = Date.now();
     const company = await createCompany(db);
     const [profile] = await db.insert(toolProfiles).values({
       companyId: company.id,
@@ -700,6 +701,7 @@ describeEmbeddedPostgres("tool gateway acceptance", () => {
       defaultAction: "deny",
     }).returning();
     const gateway = createTestToolGatewayService(db, {
+      now: () => now,
       mcpGatewayProtocolLimits: {
         authFailures: { max: 1, windowMs: 60_000 },
       },
@@ -794,6 +796,7 @@ describeEmbeddedPostgres("tool gateway acceptance", () => {
   });
 
   it("shares public gateway auth limiter counters across service instances", async () => {
+    const now = Date.now();
     const company = await createCompany(db);
     const [profile] = await db.insert(toolProfiles).values({
       companyId: company.id,
@@ -802,6 +805,7 @@ describeEmbeddedPostgres("tool gateway acceptance", () => {
       defaultAction: "deny",
     }).returning();
     const serviceA = createTestToolGatewayService(db, {
+      now: () => now,
       mcpGatewayProtocolLimits: {
         authFailures: { max: 1, windowMs: 60_000 },
       },
@@ -811,6 +815,7 @@ describeEmbeddedPostgres("tool gateway acceptance", () => {
       body: { name: "Public auth limiter shared", profileId: profile.id },
     });
     const serviceB = createTestToolGatewayService(db, {
+      now: () => now,
       mcpGatewayProtocolLimits: {
         authFailures: { max: 1, windowMs: 60_000 },
       },
