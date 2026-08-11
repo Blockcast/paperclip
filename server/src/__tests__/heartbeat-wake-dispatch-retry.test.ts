@@ -1701,5 +1701,73 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
       expect(runs).toHaveLength(2);
       expect(runs.some((r) => r.id !== oldRunId && r.status === "queued")).toBe(true);
     });
+
+    it("leaves a live claim alone but reclaims an expired one, and only one stealer wins", async () => {
+      // The claim is a lease, not a lock: an unexpiring claim would turn a crash
+      // mid-dispatch into permanent stranding (the due-rows fast path only looks
+      // at `dispatch_failed`), which is worse than the duplicate being closed.
+      // Both halves of that lease are asserted here, plus the race on the steal.
+      const { agentId, companyId } = await seedCompanyAndAgent();
+      const now = new Date();
+      const seedClaimed = async (claimedAt: Date) => {
+        const id = randomUUID();
+        await db.insert(agentWakeupRequests).values({
+          id,
+          companyId,
+          agentId,
+          source: "automation",
+          triggerDetail: "system",
+          reason: "github_pr_opened",
+          payload: {
+            dispatchRetry: {
+              attempts: 1,
+              nextAttemptAt: new Date(now.getTime() - 1000).toISOString(),
+              originalOpts: {
+                source: "automation",
+                triggerDetail: "system",
+                reason: "github_pr_opened",
+                payload: { taskKey: `pr_review:Blockcast/test#25726-${claimedAt.getTime()}` },
+              },
+            },
+          },
+          status: "dispatch_retrying",
+          claimedAt,
+        });
+        return id;
+      };
+
+      // A peer claimed this one seconds ago: still working, hands off.
+      const liveId = await seedClaimed(new Date(now.getTime() - 30_000));
+      expect((await heartbeat.reconcileFailedWakeDispatches(now)).recovered).toBe(0);
+      expect(await runsForAgent(agentId)).toHaveLength(0);
+      const [live] = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, liveId));
+      expect(live?.status).toBe("dispatch_retrying");
+
+      // A peer claimed this one an hour ago and never came back: reclaim it,
+      // but exactly once even when two passes both see it as expired.
+      const expiredId = await seedClaimed(new Date(now.getTime() - 60 * 60_000));
+      const stealerB = heartbeatService(db, { skipQueuedRunDispatch: true });
+      let interleaved = 0;
+      let stealerBRecovered: number | null = null;
+      const stealerA = heartbeatService(db, {
+        skipQueuedRunDispatch: true,
+        beforeWakeDispatchClaimForTest: async (row) => {
+          if (interleaved > 0 || row.id !== expiredId) return;
+          interleaved += 1;
+          stealerBRecovered = (await stealerB.reconcileFailedWakeDispatches(now)).recovered;
+        },
+      });
+
+      const stealerAResult = await stealerA.reconcileFailedWakeDispatches(now);
+
+      expect(interleaved).toBe(1);
+      expect(stealerBRecovered).toBe(1);
+      expect(stealerAResult.recovered).toBe(0);
+      // One reclaim == one run, not two.
+      expect(await runsForAgent(agentId)).toHaveLength(1);
+    });
   });
 });

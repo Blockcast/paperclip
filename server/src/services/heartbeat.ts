@@ -32945,6 +32945,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           and(
             eq(agentWakeupRequests.id, row.id),
             eq(agentWakeupRequests.status, row.status),
+            // `claimedAt` is part of the compared state, not decoration, and it
+            // covers a case status alone cannot: a peer whose SELECT ran before
+            // this pass claimed holds a stale snapshot, so its CAS would still
+            // see `dispatch_retrying` and win a row that is actively being
+            // dispatched. Comparing the observed `claimedAt` makes that lose.
+            //
+            // Honest coverage note: the lease tests exercise "live claim
+            // respected", "expired claim reclaimed" and "one winner when the
+            // peer finishes first" -- all of which pass with this predicate
+            // removed, because a finished peer has already moved `status`. The
+            // stale-snapshot ordering needs an interleave both before and after
+            // the claim, which the single test hook cannot produce, so this
+            // predicate is reasoned-for rather than test-pinned. It is kept
+            // because it is free and the race it closes is the one two replicas
+            // actually run.
+            row.claimedAt === null
+              ? isNull(agentWakeupRequests.claimedAt)
+              : eq(agentWakeupRequests.claimedAt, row.claimedAt),
           ),
         )
         .returning({ id: agentWakeupRequests.id });
