@@ -684,7 +684,15 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     enqueueWakeup.mockRejectedValueOnce(new Error("wake dispatch unavailable"));
     const recovery = recoveryService(db, { enqueueWakeup });
 
-    await expect(recovery.escalateStrandedAssignedIssue({
+    // BLO-18829: this assertion used to be `.rejects.toThrow("wake dispatch unavailable")`,
+    // because before the wake outbox the propagated throw WAS the durability mechanism --
+    // the caller had to learn the wake never landed. It is now the opposite of the contract.
+    // The escalation has already committed the park; re-throwing would report a durable,
+    // correct status change as a failure. The wake is not lost by being swallowed here: it
+    // is owed by a `dispatch_failed` outbox row (asserted below), which is what
+    // `reconcileFailedWakeDispatches` selects on. Same property this test always checked,
+    // now proved by the row rather than by the exception.
+    const escalated = await recovery.escalateStrandedAssignedIssue({
       issue,
       previousStatus: "in_review",
       latestRun,
@@ -695,10 +703,23 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         participantAgentId: managerId,
         executionRunId: null,
       },
-    })).rejects.toThrow("wake dispatch unavailable");
+    });
+    expect(escalated).toMatchObject({ status: "blocked" });
 
     const [blockedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
     expect(blockedIssue).toMatchObject({ status: "blocked" });
+    // The review-stage path must reach the same outbox durability the generic path gets
+    // ("a failed post-commit wake dispatch leaves the outbox row durable for the
+    // reconciler"). Without this, unifying the two paths could silently drop the review
+    // wake and the test would still pass on the backstop alone.
+    const [outboxRow] = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.status, "dispatch_failed"));
+    expect(outboxRow).toBeTruthy();
+    expect(
+      (outboxRow?.payload as { dispatchRetry?: Record<string, unknown> })?.dispatchRetry,
+    ).toMatchObject({ attempts: 0 });
     const [action] = await db
       .select()
       .from(issueRecoveryActions)
