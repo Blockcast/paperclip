@@ -268,9 +268,9 @@ import {
   resolveHotRestartReportPath,
   writeHotRestartIntent,
 } from "../services/hot-restart.ts";
+import { loadConfig } from "../config.js";
 import { secretService } from "../services/secrets.ts";
 import {
-  STRANDED_RECOVERY_MAX_OWNER_WAKE_ATTEMPTS,
   SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_BODY,
   SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY,
   SUCCESSFUL_RUN_MISSING_STATE_REASON,
@@ -284,6 +284,7 @@ import {
 } from "@paperclipai/adapter-utils/server-utils";
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+const defaultRecoveryActionMaxAttempts = loadConfig().recoveryActionMaxAttempts;
 
 const allowPenstockGate = {
   checkAdapter: async () => ({ allow: true as const }),
@@ -1294,7 +1295,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       // BLO-18996: owner-wake recovery actions now carry a wake budget so a named owner
       // who cannot discharge the action stops being re-woken forever. Only the causes
       // that never wake an owner (provider-quota waits, manual-repair holds) stay null.
-      maxAttempts: STRANDED_RECOVERY_MAX_OWNER_WAKE_ATTEMPTS,
+      maxAttempts: defaultRecoveryActionMaxAttempts,
     });
 
     expect(action.evidence).toMatchObject({
