@@ -27,6 +27,7 @@ import { buildPaperclipWakePayload, heartbeatService } from "../services/heartbe
 import { computeIssueMonitorGateFingerprint } from "../services/issue-execution-policy.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
 import { issueService } from "../services/issues.js";
+import { subscribeCompanyLiveEvents } from "../services/live-events.js";
 import {
   STRANDED_RECOVERY_MAX_OWNER_WAKE_ATTEMPTS,
   STRANDED_RECOVERY_OWNER_WAKE_HORIZON_MS,
@@ -239,6 +240,96 @@ describe("issueRecoveryActionService", () => {
     });
     expect(updates.at(-1)).toMatchObject({ timeoutAt: originalHorizon });
   });
+
+  // BLO-20263. The handoff comment grant's TTL is measured from this anchor, so if
+  // ordinary sweep churn refreshed it the grant would never expire — which is the
+  // failure mode the ticket exists to close, not a cosmetic detail.
+  it("re-anchors the handoff grant on a real transfer but not on sweep churn", async () => {
+    const staleAnchor = new Date("2026-05-01T00:00:00.000Z");
+    let row = makeRecoveryActionRow({
+      id: "existing-action",
+      previousOwnerAgentId: "agent-previous",
+      ownerAgentId: "agent-owner",
+      evidence: { latestRunId: "run-1", recoveryHandoffGrantAnchorAt: staleAnchor.toISOString() },
+    });
+    const updates: Record<string, unknown>[] = [];
+    const makeSelectQuery = () => ({
+      from() {
+        return this;
+      },
+      where() {
+        return this;
+      },
+      orderBy() {
+        return this;
+      },
+      limit() {
+        return Promise.resolve(row ? [row] : []);
+      },
+    });
+    const fakeDb = {
+      select: vi.fn(() => makeSelectQuery()),
+      update: vi.fn(() => ({
+        set: vi.fn((patch: Record<string, unknown>) => ({
+          where: vi.fn(() => ({
+            returning: vi.fn(async () => {
+              updates.push(patch);
+              row = { ...row, ...patch };
+              return [row];
+            }),
+          })),
+        })),
+      })),
+      insert: vi.fn(),
+    };
+    const svc = issueRecoveryActionService(fakeDb as never);
+    const sweep = (previousOwnerAgentId: string | null) => svc.upsertSourceScoped({
+      companyId: "company-1",
+      sourceIssueId: "source-1",
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: "agent-owner",
+      previousOwnerAgentId,
+      cause: "stranded_assigned_issue",
+      fingerprint: `source-scoped:fingerprint:${randomUUID()}`,
+      evidence: { latestRunId: "run-2" },
+      nextAction: "Hand the diagnosis to the recovery owner.",
+    });
+
+    // A re-sweep naming the SAME previous owner is not a new transfer. The anchor
+    // must survive it even though `evidence` is otherwise replaced wholesale and
+    // `lastAttemptAt` is pushed forward on this very write.
+    const resweep = await sweep("agent-previous");
+    expect(resweep.evidence).toMatchObject({
+      latestRunId: "run-2",
+      recoveryHandoffGrantAnchorAt: staleAnchor.toISOString(),
+    });
+    expect(updates.at(-1)?.lastAttemptAt).toBeInstanceOf(Date);
+
+    // An omitted previous owner carries the existing one forward, so it is also
+    // not a transfer and must not re-anchor.
+    const carried = await sweep(null);
+    expect(carried.evidence).toMatchObject({
+      recoveryHandoffGrantAnchorAt: staleAnchor.toISOString(),
+    });
+
+    // A production recovery re-sweep sees the issue assigned to the recovery owner
+    // from the previous pass. That input must not make the owner the new grant
+    // subject or refresh the TTL anchor.
+    const recoveryOwnerChurn = await sweep("agent-owner");
+    expect(recoveryOwnerChurn).toMatchObject({ previousOwnerAgentId: "agent-previous" });
+    expect(recoveryOwnerChurn.evidence).toMatchObject({
+      recoveryHandoffGrantAnchorAt: staleAnchor.toISOString(),
+    });
+
+    // Handing the issue away from a DIFFERENT agent is a real transfer: that agent
+    // is owed a fresh channel, so the anchor moves to now.
+    const transferred = await sweep("agent-second-previous");
+    const anchor = (transferred.evidence as Record<string, unknown>).recoveryHandoffGrantAnchorAt;
+    expect(typeof anchor).toBe("string");
+    expect(new Date(anchor as string).getTime()).toBeGreaterThan(staleAnchor.getTime());
+    expect(transferred).toMatchObject({ previousOwnerAgentId: "agent-second-previous" });
+  });
 });
 
 if (!embeddedPostgresSupport.supported) {
@@ -324,6 +415,46 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     return { companyId, managerId, coderId, sourceIssueId, prefix, sourceIssue: sourceIssue! };
   }
 
+  async function seedPendingReviewRecovery() {
+    const fixture = await seedCompany();
+    const stageId = randomUUID();
+    const executionState = {
+      status: "pending" as const,
+      currentStageId: stageId,
+      currentStageIndex: 0,
+      currentStageType: "review" as const,
+      currentParticipant: { type: "agent" as const, agentId: fixture.managerId, userId: null },
+      returnAssignee: { type: "agent" as const, agentId: fixture.coderId, userId: null },
+      reviewRequest: null,
+      completedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+    };
+    await db.update(issues).set({
+      status: "in_review",
+      executionState,
+    }).where(eq(issues.id, fixture.sourceIssueId));
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, fixture.sourceIssueId))
+      .then((rows) => rows[0]!);
+    const latestRun = {
+      id: randomUUID(),
+      companyId: fixture.companyId,
+      agentId: fixture.managerId,
+      status: "failed",
+      errorCode: "adapter_failed",
+      error: "reviewer adapter failed",
+      contextSnapshot: { issueId: fixture.sourceIssueId, executionStage: { stageId } },
+      resultJson: null,
+      usageJson: null,
+      livenessState: null,
+      createdAt: new Date(),
+    } as const;
+    return { ...fixture, stageId, issue, latestRun };
+  }
+
   async function seedHeartbeatRun(input: {
     companyId: string;
     agentId: string;
@@ -393,6 +524,265 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(await svc.getActiveForIssue(randomUUID(), sourceIssueId)).toBeNull();
   });
 
+  it.each([
+    ["job_missing", "in_progress"],
+    ["job_missing", "todo"],
+    ["job_missing", "in_review"],
+    ["k8s_pod_schedule_failed", "in_progress"],
+    ["k8s_pod_schedule_failed", "todo"],
+    ["k8s_pod_schedule_failed", "in_review"],
+  ] as const)("does not enqueue recovery work after %s leaves an issue %s", async (errorCode, status) => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    let stageId: string | null = null;
+    if (status === "in_review") {
+      stageId = randomUUID();
+      await db.update(issues).set({
+        status,
+        executionPolicy: {
+          mode: "normal",
+          commentRequired: true,
+          stages: [{
+            id: stageId,
+            type: "review",
+            approvalsNeeded: 1,
+            participants: [{ id: randomUUID(), type: "agent", agentId: coderId, userId: null }],
+          }],
+        },
+        executionState: {
+          status: "pending",
+          currentStageId: stageId,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: coderId, userId: null },
+          returnAssignee: { type: "agent", agentId: coderId, userId: null },
+          reviewRequest: null,
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+        },
+      }).where(eq(issues.id, sourceIssueId));
+    } else if (status === "todo") {
+      await db.update(issues).set({ status }).where(eq(issues.id, sourceIssueId));
+    }
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId: coderId,
+      invocationSource: "automation",
+      status: "failed",
+      error: "External lifecycle Job is missing while heartbeat run is still running",
+      errorCode,
+      resultJson: {
+        externalLifecycleRecovery: { adapterInvocationStarted: true },
+      },
+      contextSnapshot: {
+        issueId: sourceIssueId,
+        ...(stageId ? { executionStage: { stageId, stageType: "review" } } : {}),
+      },
+      startedAt: new Date("2026-07-26T13:45:00.000Z"),
+      finishedAt: new Date("2026-07-26T13:52:00.000Z"),
+    });
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result).toMatchObject({
+      continuationRequeued: 0,
+      dispatchRequeued: 0,
+      reviewParticipantRequeued: 0,
+      escalated: 1,
+    });
+    expect(enqueueWakeup).toHaveBeenCalledTimes(1);
+    expect(enqueueWakeup.mock.calls[0]?.[1]).toMatchObject({
+      reason: "source_scoped_recovery_action",
+      contextSnapshot: {
+        allowDeliverableWork: false,
+        recoveryIntent: "status_only",
+      },
+    });
+    const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(updatedIssue).toMatchObject({ status: "blocked" });
+    const comments = await db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, sourceIssueId));
+    expect(comments.some(({ body }) => body.includes("non-retryable failure"))).toBe(true);
+  });
+
+  it("does not escalate a stale review failure after the active stage advances", async () => {
+    const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
+    const staleStageId = randomUUID();
+    const activeStageId = randomUUID();
+    const executionState = (stageId: string, participantAgentId: string) => ({
+      status: "pending" as const,
+      currentStageId: stageId,
+      currentStageIndex: 0,
+      currentStageType: "review" as const,
+      currentParticipant: { type: "agent" as const, agentId: participantAgentId, userId: null },
+      returnAssignee: { type: "agent" as const, agentId: coderId, userId: null },
+      reviewRequest: null,
+      completedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+    });
+    await db.update(issues).set({
+      status: "in_review",
+      executionState: executionState(staleStageId, managerId),
+    }).where(eq(issues.id, sourceIssueId));
+    const staleIssue = await db.select().from(issues).where(eq(issues.id, sourceIssueId)).then((rows) => rows[0]!);
+    const staleRun = {
+      id: randomUUID(),
+      companyId,
+      agentId: managerId,
+      status: "failed",
+      errorCode: "job_missing",
+      error: "External lifecycle Job disappeared after adapter invocation",
+      contextSnapshot: { issueId: sourceIssueId, executionStage: { stageId: staleStageId } },
+      resultJson: null,
+      usageJson: null,
+      livenessState: null,
+      createdAt: new Date(),
+    } as const;
+
+    await db.update(issues).set({
+      executionState: executionState(activeStageId, coderId),
+    }).where(eq(issues.id, sourceIssueId));
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const updated = await recovery.escalateStrandedAssignedIssue({
+      issue: staleIssue,
+      previousStatus: "in_review",
+      latestRun: staleRun,
+      recoveryCause: "execution_review_participant_recovery",
+      recoveryOwnerAgentId: managerId,
+      expectedReviewStage: {
+        stageId: staleStageId,
+        participantAgentId: managerId,
+        executionRunId: null,
+      },
+    });
+
+    expect(updated).toBeNull();
+    expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+    const [freshIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(freshIssue).toMatchObject({
+      status: "in_review",
+      executionState: {
+        currentStageId: activeStageId,
+        currentParticipant: { type: "agent", agentId: coderId },
+      },
+    });
+  });
+
+  it("redelivers a review-stage recovery wake after post-commit dispatch failure", async () => {
+    const { companyId, managerId, sourceIssueId, stageId, issue, latestRun } = await seedPendingReviewRecovery();
+    const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
+    enqueueWakeup.mockRejectedValueOnce(new Error("wake dispatch unavailable"));
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    await expect(recovery.escalateStrandedAssignedIssue({
+      issue,
+      previousStatus: "in_review",
+      latestRun,
+      recoveryCause: "execution_review_participant_recovery",
+      recoveryOwnerAgentId: managerId,
+      expectedReviewStage: {
+        stageId,
+        participantAgentId: managerId,
+        executionRunId: null,
+      },
+    })).rejects.toThrow("wake dispatch unavailable");
+
+    const [blockedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(blockedIssue).toMatchObject({ status: "blocked" });
+    const [action] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssueId));
+    expect(action).toMatchObject({ status: "active", ownerAgentId: managerId });
+
+    const retryNow = new Date();
+    await db
+      .update(issueRecoveryActions)
+      .set({ lastAttemptAt: new Date(retryNow.getTime() - 31 * 60 * 1000) })
+      .where(eq(issueRecoveryActions.id, action!.id));
+
+    const repaired = await recovery.reconcileStrandedRecoveryWakeBackstop({
+      companyId,
+      now: retryNow,
+      cooldownMs: 30 * 60 * 1000,
+    });
+
+    expect(repaired).toMatchObject({ healed: 1, issueIds: [sourceIssueId] });
+    expect(enqueueWakeup).toHaveBeenCalledTimes(2);
+    expect(enqueueWakeup.mock.calls[1]?.[1]).toMatchObject({
+      reason: "source_scoped_recovery_action",
+      payload: {
+        issueId: sourceIssueId,
+        recoveryActionId: action!.id,
+        backstop: "stranded_recovery_wake_backstop",
+      },
+      contextSnapshot: {
+        issueId: sourceIssueId,
+        recoveryActionId: action!.id,
+        backstop: "stranded_recovery_wake_backstop",
+      },
+    });
+  });
+
+  it("publishes the committed review-stage escalation activity", async () => {
+    const { companyId, managerId, sourceIssueId, stageId, issue, latestRun } = await seedPendingReviewRecovery();
+    const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const seen: unknown[] = [];
+    const unsubscribe = subscribeCompanyLiveEvents(companyId, (event) => {
+      seen.push(event);
+    });
+
+    try {
+      await recovery.escalateStrandedAssignedIssue({
+        issue,
+        previousStatus: "in_review",
+        latestRun,
+        recoveryCause: "execution_review_participant_recovery",
+        recoveryOwnerAgentId: managerId,
+        expectedReviewStage: {
+          stageId,
+          participantAgentId: managerId,
+          executionRunId: null,
+        },
+      });
+    } finally {
+      unsubscribe();
+    }
+
+    expect(seen).toContainEqual(expect.objectContaining({
+      type: "activity.logged",
+      payload: expect.objectContaining({
+        action: "issue.updated",
+        entityId: sourceIssueId,
+        details: expect.objectContaining({
+          status: "blocked",
+          source: "recovery.reconcile_execution_review_participant",
+        }),
+      }),
+    }));
+    const activity = await db
+      .select({ id: activityLog.id, action: activityLog.action, details: activityLog.details })
+      .from(activityLog)
+      .where(and(eq(activityLog.companyId, companyId), eq(activityLog.entityId, sourceIssueId)));
+    expect(activity).toContainEqual(expect.objectContaining({
+      action: "issue.updated",
+      details: expect.objectContaining({
+        source: "recovery.reconcile_execution_review_participant",
+      }),
+    }));
+  });
+
   it("escalates stranded assigned work into a source action instead of a recovery issue", async () => {
     const { companyId, managerId, coderId, sourceIssue } = await seedCompany();
     // A DELIVERED wake returns the queued run. Null models one of `enqueueWakeup`'s
@@ -436,7 +826,11 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       companyId,
       kind: "stranded_assigned_issue",
       status: "active",
-      previousOwnerAgentId: managerId,
+      // BLO-20263: the CODER, not the manager — see the longer note on the
+      // latest-run-IDs test above. Both sweeps replay the coder's own failed run, so
+      // the second sweep is recovery observing its own reassignment and must leave the
+      // grant subject alone. `managerId` here asserted the pre-fix behaviour.
+      previousOwnerAgentId: coderId,
       returnOwnerAgentId: managerId,
       cause: "stranded_assigned_issue",
       attemptCount: 2,
@@ -457,6 +851,53 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       sourceIssueId: sourceIssue.id,
       recoveryCause: "stranded_assigned_issue",
     });
+  });
+
+  // BLO-19954: paired with the test above. A routine-execution issue whose
+  // only run was cancelled because another open routine-execution issue
+  // already owns the dispatch lock is benign, intentional control flow under
+  // `always_enqueue` + a single-owner dispatcher -- not a strand. It must
+  // reach a terminal `cancelled` status directly, with zero recovery actions
+  // and no owner wake, unlike the `adapter_failed` case above which still
+  // escalates to `blocked` with one recovery action and one wake.
+  it("cancels a duplicate-suppressed routine-execution run instead of creating a recovery action", async () => {
+    const { sourceIssue } = await seedCompany();
+    const enqueueWakeup = vi.fn<
+      (agentId: string, opts?: { payload?: unknown }) => Promise<{ id: string }>
+    >(async () => ({ id: randomUUID() }));
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const latestRun = {
+      id: randomUUID(),
+      agentId: sourceIssue.assigneeAgentId,
+      status: "cancelled",
+      error:
+        "Cancelled because another open routine execution issue already owns this dispatch lock; " +
+        "the owner run will continue the work",
+      errorCode: "routine_execution_duplicate_suppressed",
+      contextSnapshot: { retryReason: "issue_continuation_needed" },
+      livenessState: null,
+      resultJson: null,
+      usageJson: null,
+      createdAt: new Date(),
+    } as const;
+
+    const updated = await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun,
+      comment: "Automatic continuation recovery failed.",
+    });
+    expect(updated).toMatchObject({ status: "cancelled" });
+
+    const actionRows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+    expect(actionRows).toHaveLength(0);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+
+    const [finalIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
+    expect(finalIssue).toMatchObject({ status: "cancelled", assigneeAgentId: sourceIssue.assigneeAgentId });
   });
 
   it.each([
@@ -755,7 +1196,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       errorCode: "adapter_failed",
       startedAt: new Date("2026-07-15T20:00:00.000Z"),
       finishedAt: new Date("2026-07-15T20:01:00.000Z"),
-      contextSnapshot: { issueId: sourceIssueId },
+      contextSnapshot: { issueId: sourceIssueId, executionStage: { stageId, stageType: "review" } },
     });
     const enqueueWakeup = vi.fn(async () => null);
     const recovery = recoveryService(db, { enqueueWakeup });
@@ -816,7 +1257,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       errorCode: "adapter_failed",
       startedAt: new Date("2026-07-15T20:00:00.000Z"),
       finishedAt: new Date("2026-07-15T20:01:00.000Z"),
-      contextSnapshot: { issueId: sourceIssueId },
+      contextSnapshot: { issueId: sourceIssueId, executionStage: { stageId, stageType: "review" } },
     });
     const enqueueWakeup = vi.fn(async () => null);
     const recovery = recoveryService(db, { enqueueWakeup });
@@ -903,7 +1344,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       errorCode: "adapter_failed",
       startedAt: new Date("2026-07-15T20:00:00.000Z"),
       finishedAt: new Date("2026-07-15T20:01:00.000Z"),
-      contextSnapshot: { issueId: sourceIssueId },
+      contextSnapshot: { issueId: sourceIssueId, executionStage: { stageId, stageType: "review" } },
     }, {
       id: assigneeRunId,
       companyId,
@@ -975,7 +1416,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       errorCode: "adapter_failed",
       startedAt: new Date("2026-07-15T20:00:00.000Z"),
       finishedAt: new Date("2026-07-15T20:01:00.000Z"),
-      contextSnapshot: { issueId: sourceIssueId },
+      contextSnapshot: { issueId: sourceIssueId, executionStage: { stageId, stageType: "review" } },
     });
     const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() } as never));
     const recovery = recoveryService(db, { enqueueWakeup });
@@ -1142,7 +1583,15 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       companyId,
       kind: "stranded_assigned_issue",
       status: "active",
-      previousOwnerAgentId: managerId,
+      // BLO-20263: the CODER, not the manager. Both sweeps replay a failure of the
+      // coder's own run (`agentId: coderId` on both), and the second sweep only sees
+      // recovery's own reassignment of the issue to the manager. The manager never ran
+      // and never failed, so it is not a handoff subject and must not displace the
+      // coder — the agent that actually lost `allow_self`. This expectation previously
+      // read `managerId`, which encoded the sliding-anchor bug fixed on this branch.
+      // Note the run IDs differ across the two sweeps here: the discriminator is whose
+      // run failed, not which run, so a new run ID alone must not refresh the subject.
+      previousOwnerAgentId: coderId,
       returnOwnerAgentId: managerId,
       cause: "stranded_assigned_issue",
       attemptCount: 2,
@@ -1388,6 +1837,239 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(exhaustionComments).toHaveLength(2);
     expect(exhaustionComments.some((body) => body.includes(`(owner \`${managerId}\`)`))).toBe(true);
     expect(exhaustionComments.some((body) => body.includes(`(owner \`${secondManagerId}\`)`))).toBe(true);
+  });
+
+  it("does not refresh the handoff grant when recovery sweeps through its own owner churn", async () => {
+    const companyId = randomUUID();
+    const ceoId = randomUUID();
+    const ctoId = randomUUID();
+    const emId = randomUUID();
+    const engId = randomUUID();
+    const sourceIssueId = randomUUID();
+    const prefix = `HC${companyId.replaceAll("-", "").slice(0, 6).toUpperCase()}`;
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Handoff Churn Co",
+      issuePrefix: prefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+    const agentBase = {
+      companyId,
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    } as const;
+    await db.insert(agents).values([
+      { ...agentBase, id: ceoId, name: "CEO", role: "ceo" },
+      { ...agentBase, id: ctoId, name: "CTO", role: "cto", reportsTo: ceoId },
+      { ...agentBase, id: emId, name: "EM", role: "engineer", reportsTo: ctoId },
+      { ...agentBase, id: engId, name: "Eng", role: "engineer", reportsTo: emId },
+    ]);
+    await db.insert(issues).values({
+      id: sourceIssueId,
+      companyId,
+      title: "Recovery owner churn should not refresh handoff grant",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: engId,
+      issueNumber: 1,
+      identifier: `${prefix}-1`,
+    });
+
+    const enqueueWakeup = vi.fn<
+      (agentId: string, opts?: { payload?: unknown }) => Promise<{ id: string }>
+    >(async () => ({ id: randomUUID() }));
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const sweep = async () => {
+      const [fresh] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      await recovery.escalateStrandedAssignedIssue({
+        issue: fresh!,
+        previousStatus: "in_progress",
+        latestRun: {
+          id: randomUUID(),
+          agentId: engId,
+          status: "failed",
+          error: "adapter failed",
+          errorCode: "adapter_failed",
+          contextSnapshot: { retryReason: "issue_continuation_needed" },
+          livenessState: "needs_followup",
+          resultJson: null,
+          usageJson: null,
+          createdAt: new Date(),
+        },
+        comment: "Automatic continuation recovery failed.",
+      });
+    };
+    const handoffAnchor = (evidence: unknown) => {
+      expect(evidence && typeof evidence === "object" && !Array.isArray(evidence)).toBe(true);
+      return (evidence as Record<string, unknown>).recoveryHandoffGrantAnchorAt;
+    };
+
+    const firstSweepAt = new Date("2026-08-02T01:00:00.000Z");
+    const secondSweepAt = new Date("2026-08-02T05:00:00.000Z");
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(firstSweepAt);
+      await sweep();
+      const [firstAction] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, sourceIssueId));
+      expect(firstAction).toMatchObject({
+        previousOwnerAgentId: engId,
+        ownerAgentId: emId,
+        returnOwnerAgentId: engId,
+      });
+      const firstAnchor = handoffAnchor(firstAction!.evidence);
+      expect(firstAnchor).toBe(firstSweepAt.toISOString());
+
+      vi.setSystemTime(secondSweepAt);
+      await sweep();
+      const [secondAction] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, sourceIssueId));
+      expect(secondAction).toMatchObject({
+        previousOwnerAgentId: engId,
+        ownerAgentId: ctoId,
+        returnOwnerAgentId: emId,
+      });
+      expect(handoffAnchor(secondAction!.evidence)).toBe(firstAnchor);
+    } finally {
+      vi.useRealTimers();
+    }
+
+    expect(enqueueWakeup.mock.calls.map((call) => call[0])).toEqual([emId, ctoId]);
+    const [sourceIssue] = await db
+      .select({ assigneeAgentId: issues.assigneeAgentId })
+      .from(issues)
+      .where(eq(issues.id, sourceIssueId));
+    expect(sourceIssue?.assigneeAgentId).toBe(ctoId);
+  });
+
+  it("refreshes the handoff grant onto a recovery owner that fails on its own run", async () => {
+    // The companion to the churn test above, and the case owner identity alone cannot
+    // see. Both sweeps here pass `previousOwnerAgentId === existing.ownerAgentId`; the
+    // churn test's second sweep replays ENG's failure, this one has EM genuinely fail
+    // on its own run after taking over. Suppressing the refresh here would leave ENG as
+    // the grant subject on ENG's stale anchor while EM — the agent that just lost
+    // `allow_self` holding the freshest diagnosis — is routed away with no comment
+    // channel at all, which is the exact deprivation #827 exists to prevent.
+    const companyId = randomUUID();
+    const ceoId = randomUUID();
+    const ctoId = randomUUID();
+    const emId = randomUUID();
+    const engId = randomUUID();
+    const sourceIssueId = randomUUID();
+    const prefix = `HT${companyId.replaceAll("-", "").slice(0, 6).toUpperCase()}`;
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Handoff Takeover Co",
+      issuePrefix: prefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+    const agentBase = {
+      companyId,
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    } as const;
+    await db.insert(agents).values([
+      { ...agentBase, id: ceoId, name: "CEO", role: "ceo" },
+      { ...agentBase, id: ctoId, name: "CTO", role: "cto", reportsTo: ceoId },
+      { ...agentBase, id: emId, name: "EM", role: "engineer", reportsTo: ctoId },
+      { ...agentBase, id: engId, name: "Eng", role: "engineer", reportsTo: emId },
+    ]);
+    await db.insert(issues).values({
+      id: sourceIssueId,
+      companyId,
+      title: "Recovery owner failing on its own run earns the handoff grant",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: engId,
+      issueNumber: 1,
+      identifier: `${prefix}-1`,
+    });
+
+    const enqueueWakeup = vi.fn<
+      (agentId: string, opts?: { payload?: unknown }) => Promise<{ id: string }>
+    >(async () => ({ id: randomUUID() }));
+    const recovery = recoveryService(db, { enqueueWakeup });
+    // `runAgentId` is the whole point of this test: it is the only input that differs
+    // between replay churn and a newly failed recovery owner.
+    const sweep = async (runAgentId: string) => {
+      const [fresh] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      await recovery.escalateStrandedAssignedIssue({
+        issue: fresh!,
+        previousStatus: "in_progress",
+        latestRun: {
+          id: randomUUID(),
+          agentId: runAgentId,
+          status: "failed",
+          error: "adapter failed",
+          errorCode: "adapter_failed",
+          contextSnapshot: { retryReason: "issue_continuation_needed" },
+          livenessState: "needs_followup",
+          resultJson: null,
+          usageJson: null,
+          createdAt: new Date(),
+        },
+        comment: "Automatic continuation recovery failed.",
+      });
+    };
+    const handoffAnchor = (evidence: unknown) => {
+      expect(evidence && typeof evidence === "object" && !Array.isArray(evidence)).toBe(true);
+      return (evidence as Record<string, unknown>).recoveryHandoffGrantAnchorAt;
+    };
+    const readAction = async () => {
+      const [row] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, sourceIssueId));
+      return row!;
+    };
+
+    const firstSweepAt = new Date("2026-08-02T01:00:00.000Z");
+    const secondSweepAt = new Date("2026-08-02T05:00:00.000Z");
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      // A (ENG) fails; recovery hands the issue to B (EM) and reassigns it to B.
+      vi.setSystemTime(firstSweepAt);
+      await sweep(engId);
+      const firstAction = await readAction();
+      expect(firstAction).toMatchObject({
+        previousOwnerAgentId: engId,
+        ownerAgentId: emId,
+      });
+      expect(handoffAnchor(firstAction.evidence)).toBe(firstSweepAt.toISOString());
+      const [afterFirst] = await db
+        .select({ assigneeAgentId: issues.assigneeAgentId })
+        .from(issues)
+        .where(eq(issues.id, sourceIssueId));
+      expect(afterFirst?.assigneeAgentId).toBe(emId);
+
+      // B now fails on ITS OWN distinct run. The sweep still passes
+      // `previousOwnerAgentId = EM` (the current assignee) and `existing.ownerAgentId`
+      // is still EM — byte-identical to the churn case on owner identity alone.
+      vi.setSystemTime(secondSweepAt);
+      await sweep(emId);
+      const secondAction = await readAction();
+      expect(secondAction.evidence).toMatchObject({ latestRunAgentId: emId });
+      // B becomes the grant subject, on a fresh anchor, while ownership routes to C.
+      expect(secondAction).toMatchObject({
+        previousOwnerAgentId: emId,
+        ownerAgentId: ctoId,
+      });
+      expect(handoffAnchor(secondAction.evidence)).toBe(secondSweepAt.toISOString());
+    } finally {
+      vi.useRealTimers();
+    }
+
+    expect(enqueueWakeup.mock.calls.map((call) => call[0])).toEqual([emId, ctoId]);
   });
 
   it("bounds the wakes even when recovery ownership ping-pongs and never spends one owner's budget", async () => {

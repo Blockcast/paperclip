@@ -292,6 +292,12 @@ ENV PATH=/home/node/.npm-global/bin:$PATH
 # two .so files straight from the publisher image so the binary's ABI is
 # satisfied regardless of the base distro's codec versions. libnuma1 is
 # libx265.so.199's transitive dep and is not otherwise pulled in.
+#
+# libsrt.so.1.5 is a THIRD drift, missed when this stage was written: trixie
+# ships libsrt.so.1.5 only via libsrt1.5-openssl/libsrt1.5-gnutls, and neither
+# is installed here, so the copied binary could not load at all. Copy it from
+# the publisher like the other two rather than apt-installing, so the TLS
+# backend matches the one the binary was linked against.
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
        libx264-164 libaom3 libopus0 libnuma1 \
@@ -301,13 +307,51 @@ COPY --from=ffmpeg-publisher \
      /usr/lib/x86_64-linux-gnu/libx265.so.199* /usr/lib/x86_64-linux-gnu/
 COPY --from=ffmpeg-publisher \
      /usr/lib/x86_64-linux-gnu/libvpx.so.7*   /usr/lib/x86_64-linux-gnu/
+COPY --from=ffmpeg-publisher \
+     /usr/lib/x86_64-linux-gnu/libsrt.so.1.5* /usr/lib/x86_64-linux-gnu/
 RUN ldconfig
 COPY --from=ffmpeg-publisher \
      /usr/local/bin/ffmpeg  /usr/local/bin/ffmpeg
 COPY --from=ffmpeg-publisher \
      /usr/local/bin/ffprobe /usr/local/bin/ffprobe
-RUN ffmpeg -hide_banner -muxers 2>&1 | grep -qE '(^|[[:space:]])moq_mmt([[:space:]]|$)' \
-  || (echo 'ERROR: moq_mmt muxer missing from copied ffmpeg' && exit 1)
+# Prove every copied binary actually EXECUTES before asserting on muxer output.
+# The muxer grep alone cannot tell "ffmpeg ran and lacks moq_mmt" apart from
+# "ffmpeg never started", because a dynamic-linker error also produces output
+# with no moq_mmt in it. That ambiguity cost five days: the missing
+# libsrt.so.1.5 above surfaced as 'moq_mmt muxer missing from copied ffmpeg'
+# on every build from 2026-08-04 onward, while the publisher image had the
+# muxer the whole time. Print what actually happened instead of swallowing it.
+#
+# Running `-version` rather than grepping `ldd` output is deliberate: it fails
+# closed on ANY startup failure, not just the ones that print "not found"
+# (`ldd` can exit nonzero for other reasons, and a grep-based check silently
+# passes those). `ldd` is still printed, but only as a diagnostic hint after a
+# failure. The glob covers every ff* binary the COPY steps land, so adding
+# ffplay later cannot slip past the check; a zero count is itself a failure.
+RUN set -eu; \
+    checked=0; \
+    for bin in /usr/local/bin/ff*; do \
+      [ -x "$bin" ] || continue; \
+      checked=$((checked + 1)); \
+      if ! out="$("$bin" -version 2>&1)"; then \
+        echo "ERROR: $bin failed to execute:"; \
+        echo "$out"; \
+        echo "--- ldd $bin ---"; \
+        ldd "$bin" 2>&1 || true; \
+        echo "HINT: the publisher is bookworm-based; copy any 'not found' .so from"; \
+        echo "      ffmpeg-publisher above, as done for libx265/libvpx/libsrt."; \
+        exit 1; \
+      fi; \
+    done; \
+    [ "$checked" -gt 0 ] || { \
+      echo 'ERROR: no executable /usr/local/bin/ff* found — the COPY steps above did not land.'; \
+      exit 1; }; \
+    echo "verified $checked ffmpeg binaries execute"
+RUN muxers="$(ffmpeg -hide_banner -muxers 2>&1)" || { \
+      echo 'ERROR: ffmpeg failed to run; output was:'; echo "$muxers"; exit 1; }; \
+    printf '%s\n' "$muxers" | grep -qE '(^|[[:space:]])moq_mmt([[:space:]]|$)' \
+      || { echo 'ERROR: moq_mmt muxer missing from copied ffmpeg; ffmpeg -muxers said:'; \
+           printf '%s\n' "$muxers"; exit 1; }
 
 # Hand back to the non-root `node` user — paperclip's docker-entrypoint.sh
 # runs as that uid (matches the host user mapping established in the base

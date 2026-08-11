@@ -1220,6 +1220,18 @@ export async function startServer(): Promise<StartedServer> {
           logger.error({ err }, "startup stale-lock sweeper failed");
         }
 
+        // BLO-21621: terminalize queued runs whose issue lock has already
+        // moved on or gone empty, so a detached run cannot sit invisible to
+        // every other recovery sweep indefinitely.
+        try {
+          const detached = await heartbeat.reconcileDetachedQueuedRuns();
+          if (detached.terminalized > 0) {
+            logger.warn({ ...detached }, "startup detached-queued-run sweeper terminalized stale runs");
+          }
+        } catch (err) {
+          logger.error({ err }, "startup detached-queued-run sweeper failed");
+        }
+
         const promotion = await heartbeat.promoteDueScheduledRetries();
         await heartbeat.resumeQueuedRuns();
         const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
@@ -1371,6 +1383,20 @@ export async function startServer(): Promise<StartedServer> {
               logger.error({ err }, "periodic stale-lock sweeper failed");
             }));
 
+          // BLO-21621: same cadence as the stale-lock sweeper above — a
+          // detached queued run is only reachable once its lock has already
+          // gone stale, so the two run back to back.
+          trackHeartbeatSchedulerWork(heartbeat
+            .reconcileDetachedQueuedRuns()
+            .then((detached) => {
+              if (detached.terminalized > 0) {
+                logger.warn({ ...detached }, "periodic detached-queued-run sweeper terminalized stale runs");
+              }
+            })
+            .catch((err) => {
+              logger.error({ err }, "periodic detached-queued-run sweeper failed");
+            }));
+
           // Periodically reap orphaned runs (5-min staleness threshold) and make sure
           // persisted queued work is still being driven forward.
           trackHeartbeatSchedulerWork(heartbeat
@@ -1497,6 +1523,26 @@ export async function startServer(): Promise<StartedServer> {
       runReconcilerSweepTick();
       setInterval(runReconcilerSweepTick, reconcilerIntervalMs);
     }
+  }
+
+  // Stranded-blocked-issue reconciler (BLO-21523 phase 1). Worker-tier
+  // singleton, same rationale as the merged-PR reconciler above: drains
+  // issues left `status = 'blocked'` after their last blocker cleared, which
+  // are otherwise permanently unreachable (no dispatch, no wake path). Kicks
+  // off once on startup, then on interval; each pass re-checks its own
+  // predicate at UPDATE time, so it's safe to run from every worker replica.
+  if (config.strandedBlockedIssueReconcilerEnabled && config.paperclipNodeRole !== "api") {
+    const { startStrandedBlockedIssueReconciler } = await import(
+      "./services/stranded-blocked-issue-reconciler.js"
+    );
+    logger.info(
+      { intervalMinutes: config.strandedBlockedIssueReconcilerIntervalMinutes },
+      "Stranded-blocked-issue reconciler enabled (BLO-21523)",
+    );
+    startStrandedBlockedIssueReconciler(
+      db,
+      config.strandedBlockedIssueReconcilerIntervalMinutes * 60 * 1000,
+    );
   }
 
   // Wait for external adapters to finish loading before accepting requests.

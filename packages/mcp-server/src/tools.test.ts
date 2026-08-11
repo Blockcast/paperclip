@@ -189,7 +189,7 @@ describe("paperclip MCP tools", () => {
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(JSON.parse(String(init.body))).toEqual({
       agentId: "22222222-2222-2222-2222-222222222222",
-      expectedStatuses: ["todo", "backlog", "blocked"],
+      expectedStatuses: ["todo", "backlog", "blocked", "in_review"],
     });
   });
 
@@ -218,6 +218,14 @@ describe("paperclip MCP tools", () => {
       requestDepth: 0,
       allowDuplicate: false,
     });
+  });
+
+  it("documents duplicate candidates as advisory and independent of allowDuplicate", () => {
+    const tool = getTool("paperclipCreateIssue");
+
+    expect(tool.description).toContain("advisory `duplicateCandidates`");
+    expect(tool.description).toContain("never refuse the create");
+    expect(tool.description).toContain("independent of `allowDuplicate`");
   });
 
   it("defaults issue document format to markdown", async () => {
@@ -485,7 +493,7 @@ describe("paperclip MCP tools", () => {
     const tool = getTool("paperclipCreateApproval");
     await tool.execute({
       type: "hire_agent",
-      payload: { branch: "pap-1167" },
+      payload: { title: "Approve agent hire", branch: "pap-1167" },
       issueIds: ["44444444-4444-4444-4444-444444444444"],
     });
 
@@ -497,9 +505,45 @@ describe("paperclip MCP tools", () => {
     expect(init.method).toBe("POST");
     expect(JSON.parse(String(init.body))).toEqual({
       type: "hire_agent",
-      payload: { branch: "pap-1167" },
+      payload: { title: "Approve agent hire", branch: "pap-1167" },
       issueIds: ["44444444-4444-4444-4444-444444444444"],
     });
+  });
+
+  it("publishes payload.title as required for approval creation", () => {
+    const tool = getTool("paperclipCreateApproval");
+    const payloadSchema = tool.schema.shape.payload;
+
+    expect(Object.keys(payloadSchema.shape)).toContain("title");
+    expect(tool.schema.safeParse({
+      type: "hire_agent",
+      payload: { branch: "pap-1167" },
+    }).success).toBe(false);
+    expect(tool.schema.safeParse({
+      type: "hire_agent",
+      payload: { title: "Approve agent hire", branch: "pap-1167" },
+    }).success).toBe(true);
+  });
+
+  it("omits approval resubmit payload when no replacement payloadJson is supplied", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      mockJsonResponse({ id: "approval-1" }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclipApprovalDecision");
+    await tool.execute({
+      approvalId: "55555555-5555-5555-5555-555555555555",
+      action: "resubmit",
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(String(url)).toBe(
+      "http://localhost:3100/api/approvals/55555555-5555-5555-5555-555555555555/resubmit",
+    );
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(String(init.body))).toEqual({});
   });
 
   it("rejects invalid generic request paths", async () => {
@@ -764,5 +808,35 @@ describe("paperclip MCP tools", () => {
 
     expect(response.isError).toBeUndefined();
     expect(JSON.parse(response.content[0]!.text)).toMatchObject({ priority: "critical" });
+  });
+
+  it("queries parked agents with an optional reason filter", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      mockJsonResponse({ parkedCount: 1, agents: [{ agentName: "PlatformSREEngineer" }] }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await getTool("paperclipListParkedAgents").execute({
+      reason: "ccrotate_capacity",
+      limit: 50,
+    });
+
+    const [url] = fetchMock.mock.calls[0] as [string];
+    expect(String(url)).toContain("/companies/11111111-1111-1111-1111-111111111111/parked-agents");
+    expect(String(url)).toContain("reason=ccrotate_capacity");
+    expect(String(url)).toContain("limit=50");
+    expect(response.isError).toBeUndefined();
+    expect(JSON.parse(response.content[0]!.text)).toMatchObject({ parkedCount: 1 });
+  });
+
+  it("omits the parked-agents query string when no filters are given", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(mockJsonResponse({ parkedCount: 0, agents: [] }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await getTool("paperclipListParkedAgents").execute({});
+
+    const [url] = fetchMock.mock.calls[0] as [string];
+    expect(String(url)).toContain("/parked-agents");
+    expect(String(url)).not.toContain("?");
   });
 });

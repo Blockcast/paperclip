@@ -201,6 +201,51 @@ running `gh auth setup-git`, which writes a `gh.real` helper that cannot read
 the token file. Widening an installation's repository selection is never the
 right remedy for these symptoms.
 
+### Commit attribution is write-path dependent, not agent dependent (BLO-21416)
+
+Every agent pod authenticates as the same shared credential — the
+`allyblockcast[bot]` GitHub App installation (id `290875700`). GitHub's REST
+commit-creation endpoints (`PUT /repos/{owner}/{repo}/contents/{path}`, the
+merge API, and the MCP `create_or_update_file`/`push_files` tools, which are
+thin wrappers over the same endpoints) default `commit.author` to the
+*authenticated* identity whenever the caller doesn't supply one — so **every
+agent's commit made through that path is stamped `allyblockcast[bot]`**,
+regardless of which agent actually wrote it. `git push` is unaffected: git
+reads `user.name`/`user.email` from local config, which is already set
+per-agent (e.g. `<agentnamekey>@paperclip.blockcast.net`), so a pushed commit
+correctly carries the acting agent's identity.
+
+This is a controlled, reproduced finding (BLO-21416), not a hunch — do not
+re-derive it or re-file it as a fresh misattribution report:
+
+- **Use `git push` for every repo commit.** It is the only write path that is
+  already correctly per-agent. Do not use the MCP `create_or_update_file` /
+  `push_files` tools to land commits — they have no `author` field in their
+  schema, so there is no way to override the App stamp through them, and using
+  them silently erases your authorship.
+- If you must create a commit via the raw API (no local checkout available),
+  use `gh api` directly and pass an explicit author, e.g.:
+  ```bash
+  gh api repos/{owner}/{repo}/contents/{path} -X PUT \
+    -f message="..." -f content="$(base64 -w0 file)" -f branch="..." \
+    -f 'author[name]=<AgentName>' -f 'author[email]=<agentnamekey>@paperclip.blockcast.net'
+  ```
+  `gh api` is a call site you control, so the explicit `author` sticks —
+  unlike the MCP tool, which has no equivalent field to set.
+- **Do not read `commit.author.login == allyblockcast[bot]` as identifying a
+  specific agent (or the reviewer `allyblockcast` user account, id
+  `296676656` — a distinct principal from the App, id `290875700`).** It
+  identifies the write path, not the author. It also does not identify
+  `allyblockcast[bot]`-the-reviewer's own commits, if any — the App has no
+  commits of its own; it is a shared write credential every agent inherits.
+- **Merge and squash-merge commits are legitimately App-attributed** — GitHub
+  itself creates those via the merge API on your behalf. This is out of
+  scope; don't flag them.
+- CI enforces this going forward on every `paperclip` PR
+  (`scripts/check-commit-author-attribution.mjs`, wired into `pr.yml`); an
+  on-demand cross-repo audit mode (`--audit-merged`) covers
+  `Blockcast/trafficcontrol` and `Blockcast/paperclip` for retroactive checks.
+
 ## 10. UI Expectations
 
 - Keep routes and nav aligned with available API surface

@@ -8,6 +8,7 @@ export type IssueLivenessState =
   | "blocked_by_assigned_backlog_issue"
   | "blocked_by_uninvokable_assignee"
   | "blocked_by_cancelled_issue"
+  | "blocked_without_blockers"
   | "invalid_review_participant"
   | "in_review_without_action_path";
 
@@ -33,6 +34,11 @@ export interface IssueLivenessIssueInput {
   lastActivityAt?: Date | null;
   monitorNextCheckAt?: Date | string | null;
   monitorAttemptCount?: number | null;
+  // BLO-24662: the issue's description declares an `external owner:` / `external action:`
+  // pair, i.e. a human gate narrated in prose rather than modelled as a blocker edge.
+  // Consumed only by `blocked_without_blockers`, which is the one rule that
+  // would otherwise read that deliberate parking as a dead end.
+  hasExternalWaitOwner?: boolean | null;
 }
 
 export interface IssueLivenessRelationInput {
@@ -179,6 +185,35 @@ function monitorFromIssue(issue: IssueLivenessIssueInput) {
   const policyMonitor = readRecord(readRecord(issue.executionPolicy)?.monitor);
   const stateMonitor = readRecord(readRecord(issue.executionState)?.monitor);
   return { policyMonitor, stateMonitor };
+}
+
+const REVIEW_STAGE_TYPES = new Set(["review", "approval"]);
+
+/**
+ * Evidence that a review workflow was actually configured on the issue.
+ *
+ * `executionState` is a shared envelope, not a review-only structure: arming a
+ * monitor populates it on issues that never had a review stage. So a non-null
+ * `executionState` is not proof of a review workflow (BLO-20725). Without this
+ * gate, every `in_review` issue whose monitor fired and was never re-armed fell
+ * into the unresolvable-participant branch and produced a recovery issue telling
+ * its owner to repair a review participant that was never configured — while an
+ * otherwise identical issue that had never armed a monitor was left alone.
+ */
+function hasConfiguredReviewWorkflow(issue: IssueLivenessIssueInput) {
+  const state = readRecord(issue.executionState);
+  if (state) {
+    if (typeof state.currentStageId === "string" && state.currentStageId.length > 0) return true;
+    if (typeof state.currentStageType === "string" && REVIEW_STAGE_TYPES.has(state.currentStageType)) return true;
+    if (readRecord(state.reviewRequest)) return true;
+  }
+
+  const stages = readRecord(issue.executionPolicy)?.stages;
+  if (!Array.isArray(stages)) return false;
+  return stages.some((stage) => {
+    const type = readRecord(stage)?.type;
+    return typeof type === "string" && REVIEW_STAGE_TYPES.has(type);
+  });
 }
 
 function hasScheduledMonitor(issue: IssueLivenessIssueInput, nowMs: number) {
@@ -420,6 +455,94 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
       hasWaitingPath(issue.companyId, issue.id, openRecoveryIssues);
   }
 
+  /**
+   * Does this issue still have a blocker edge that could plausibly resolve?
+   *
+   * `done` is the only status that retires an edge here. A `cancelled` blocker
+   * deliberately still counts as unresolved, because that shape has its own, more
+   * specific finding (`blocked_by_cancelled_issue`) and treating it as retired would
+   * reclassify it as a dead end and lose the "remove this edge" instruction.
+   */
+  function hasUnresolvedBlockerEdge(issue: IssueLivenessIssueInput) {
+    return (blockersByBlockedIssueId.get(issue.id) ?? []).some((relation) => {
+      if (relation.companyId !== issue.companyId) return false;
+      const blocker = issuesById.get(relation.blockerIssueId);
+      return Boolean(blocker && blocker.companyId === issue.companyId && blocker.status !== "done");
+    });
+  }
+
+  /**
+   * Does this issue have any blocker edge at all to a real, same-company issue?
+   *
+   * Distinct from `hasUnresolvedBlockerEdge`, and the difference is load-bearing. An issue
+   * blocked behind a blocker set that has all gone `done` is NOT terminal: it is the
+   * resolved-dependency case, and `reconcileResolvedDependencyWakeBackstop` exists to wake
+   * it — in the same sweep. Reporting it here would raise a critical finding against work
+   * that is already being healed automatically. The dead-end rule therefore keys on "no
+   * edge exists at all", which is the shape BLO-24662 actually describes.
+   */
+  function hasAnyBlockerEdge(issue: IssueLivenessIssueInput) {
+    return (blockersByBlockedIssueId.get(issue.id) ?? []).some((relation) => {
+      if (relation.companyId !== issue.companyId) return false;
+      const blocker = issuesById.get(relation.blockerIssueId);
+      return Boolean(blocker && blocker.companyId === issue.companyId);
+    });
+  }
+
+  /**
+   * BLO-24662: `status: blocked` with no blocker edge at all is silently terminal.
+   *
+   * `blocked` means "waiting on a dependency to resolve". With an empty blocker set
+   * there is nothing that *can* resolve, so no edge will ever fire a wake — and the row
+   * is indistinguishable at a glance from a legitimately-blocked issue, which is what
+   * makes it dangerous: it reads as healthy waiting. On BLO-20995 this state held for
+   * ~13h and emitted nothing, while the detector fired two levels up the stack on the
+   * one issue in the chain that was completely healthy.
+   *
+   * The bare two-field check would over-fire: an agent may legitimately set `blocked`
+   * while narrating a human gate. So the caller gates this on `hasExplicitWaitingPath`
+   * first, which is what distinguishes "parked with someone owning the next action"
+   * (monitor armed, human assignee, pending interaction/approval, live run, open
+   * recovery issue) from "parked with nothing that can ever wake it" — plus
+   * `hasExternalWaitOwner`, which covers the same intent expressed in prose rather than
+   * in structure. That last one is deliberately scoped to this rule instead of folded
+   * into `hasExplicitWaitingPath`: an external owner named in a description does not make
+   * an unassigned or cancelled blocker acceptable, so the other rules must keep firing.
+   */
+  function isDeadEndBlocked(issue: IssueLivenessIssueInput) {
+    return issue.status === "blocked" &&
+      !hasAnyBlockerEdge(issue) &&
+      !issue.hasExternalWaitOwner;
+  }
+
+  function blockedWithoutBlockersFinding(
+    source: IssueLivenessIssueInput,
+    deadEnd: IssueLivenessIssueInput,
+    dependencyPath: IssueLivenessIssueInput[],
+  ): IssueLivenessFinding {
+    const ownerCandidates = ownerCandidatesForRecoveryIssue(deadEnd, input.agents, agentsById, {
+      includeStalledAssignee: true,
+    });
+    const isSelf = deadEnd.id === source.id;
+
+    return finding({
+      issue: source,
+      state: "blocked_without_blockers",
+      reason: isSelf
+        ? `${issueLabel(deadEnd)} is blocked with no unresolved blockers and no wake, active run, human owner, interaction, approval, monitor, or recovery issue owning the next action, so nothing can ever unblock it.`
+        : `${issueLabel(source)} is blocked by ${issueLabel(deadEnd)}, which is itself blocked with no unresolved blockers and no wake, active run, human owner, interaction, approval, monitor, or recovery issue owning the next action.`,
+      dependencyPath,
+      recoveryIssue: deadEnd,
+      recommendedOwnerCandidateAgentIds: ownerCandidates.map((candidate) => candidate.agentId),
+      recommendedOwnerCandidates: ownerCandidates,
+      recommendedAction:
+        `Review ${issueLabel(deadEnd)} and give it a next action: move it back to todo/in_progress so its assignee wakes, ` +
+        `add the blocker it is actually waiting on, assign a human owner or interaction if it is intentionally parked, ` +
+        `or close it if it is no longer required.`,
+      blockerIssueId: deadEnd.id,
+    });
+  }
+
   function reviewFinding(
     source: IssueLivenessIssueInput,
     reviewIssue: IssueLivenessIssueInput,
@@ -456,7 +579,7 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
 
     if (principalIsResolvableUser(participant)) return null;
 
-    if (reviewIssue.executionState) {
+    if (hasConfiguredReviewWorkflow(reviewIssue)) {
       return finding({
         issue: source,
         state: "invalid_review_participant",
@@ -470,7 +593,10 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
       });
     }
 
-    // User-assigned reviews are operator territory -- escalation belongs
+    // Reached when no review workflow was ever configured -- "in review" here
+    // means "awaiting review", not "review workflow corrupt", so the honest
+    // finding is in_review_without_action_path below rather than a participant
+    // repair. User-assigned reviews are operator territory -- escalation belongs
     // upstream of paperclip's automation. Agent-assigned and unassigned
     // both surface findings; routing fans out to the chain of command via
     // ownerCandidates so unassigned issues don't sit silently forever.
@@ -521,6 +647,14 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
     }
 
     if (hasExplicitWaitingPath(blocker)) return null;
+
+    // Before the assignee-shaped checks below: a blocked blocker with nothing left to
+    // wait on is a dead end regardless of who it is assigned to, and saying so names the
+    // real defect. The invokable-assignee path in particular returns null further down,
+    // which is exactly how BLO-20995 stayed silent.
+    if (blocker.status === "blocked" && isDeadEndBlocked(blocker)) {
+      return blockedWithoutBlockersFinding(source, blocker, dependencyPath);
+    }
 
     if (blocker.status === "in_review") {
       return reviewFinding(source, blocker, dependencyPath);
@@ -619,22 +753,32 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
   }
 
   for (const issue of input.issues) {
-    const hasUnresolvedBlockerEdge = (blockersByBlockedIssueId.get(issue.id) ?? []).some((relation) => {
-      if (relation.companyId !== issue.companyId) return false;
-      const blocker = issuesById.get(relation.blockerIssueId);
-      return Boolean(blocker && blocker.companyId === issue.companyId && blocker.status !== "done");
-    });
     const shouldInspectBlockedChain = issue.status === "blocked" || (
       issue.status !== "done" &&
       issue.status !== "cancelled" &&
       Boolean(issue.assigneeAgentId) &&
-      hasUnresolvedBlockerEdge
+      hasUnresolvedBlockerEdge(issue)
     );
 
     let chainFinding: IssueLivenessFinding | null = null;
     if (shouldInspectBlockedChain) {
       if (unresolvedBlockers.has(issue.id)) continue;
       chainFinding = firstBlockedChainFinding(issue, issue, [issue], new Set());
+
+      // The dead-end shape has no blocker edge to walk, so the chain search above cannot
+      // reach it — `firstBlockedChainFinding` iterates relations and this issue has none
+      // that still matter. Reported against the issue itself, which is the node that is
+      // actually stuck (BLO-24662). Issues that ARE somebody's unresolved blocker took
+      // the `continue` above and surface through their blocked parent instead, so the
+      // finding still names this leaf without being emitted twice.
+      if (
+        !chainFinding &&
+        isDeadEndBlocked(issue) &&
+        !hasExplicitWaitingPath(issue)
+      ) {
+        chainFinding = blockedWithoutBlockersFinding(issue, issue, [issue]);
+      }
+
       if (chainFinding) findings.push(chainFinding);
     }
 
