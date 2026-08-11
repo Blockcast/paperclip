@@ -563,7 +563,11 @@ describeEmbeddedPostgres("productivity review service", () => {
     const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
 
     expect(result.created).toBe(0);
-    expect(result.skipped).toBe(1);
+    // Reported under its own counter, not folded into the generic `skipped`
+    // bucket: this ticket exists because the loop was invisible, so the
+    // suppression has to be countable on its own.
+    expect(result.dependencyBlockedSuppressed).toBe(1);
+    expect(result.skipped).toBe(0);
     expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
   });
 
@@ -610,8 +614,260 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 10");
     expect(reviews[0]?.description).toContain("Runtime-failure streak (terminal, never-executed runs): 0");
     expect(reviews[0]?.description).toContain(
-      "Non-executing runs in sample window (excluded from streaks above): 3 (dominant errorCode: `issue_dependencies_blocked`)",
+      "Non-executing runs in sample window (excluded from streaks above): 3 (dominant errorCode: `issue_dependencies_blocked`, 3 of 3)",
     );
+  });
+
+  // BLO-22436 (review follow-up): dependency-gate cancellations are transparent
+  // to the runtime-failure walk, not streak-breakers — symmetrically with
+  // `noCommentStreak`. This is the BLO-20815 ordering: genuine infra failures
+  // with newer dependency-gate cancellations layered on top. Breaking the walk
+  // on the cancellations would mask the real infra streak behind them, which is
+  // precisely the signal a platform owner needs. A cancelled-before-dispatch run
+  // is no evidence the runtime was healthy — nothing was attempted.
+  it("sees through newer dependency-gate cancellations to a genuine infra-failure streak (BLO-22436)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    // Newest: dependency-gate cancellations. The blocker has since resolved (no
+    // relation row), so the generation gate does not apply.
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 3,
+      now,
+      status: "cancelled",
+      livenessState: null,
+      usageJson: null,
+      errorCode: "issue_dependencies_blocked",
+    });
+    // Older: a genuine zero-token infra-failure streak.
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now: new Date(now.getTime() - 4 * 60_000),
+      status: "failed",
+      livenessState: "failed",
+      usageJson: null,
+      errorCode: "job_failed",
+    });
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const reviews = await listProductivityReviews(seeded.companyId);
+    expect(reviews[0]?.description).toContain("Primary trigger: `runtime_failure_streak`");
+    expect(reviews[0]?.description).toContain("Runtime-failure streak (terminal, never-executed runs): 10");
+    expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 0");
+    // 13 non-executing runs, and no single errorCode holds a majority is false
+    // here — job_failed is 10 of 13, a strict majority — so it is named.
+    expect(reviews[0]?.description).toContain(
+      "Non-executing runs in sample window (excluded from streaks above): 13 (dominant errorCode: `job_failed`, 10 of 13)",
+    );
+  });
+
+  // BLO-22436 (review follow-up): with an even split, naming a "dominant"
+  // errorCode would be decided by run ordering and read as a definite diagnosis
+  // of the window. Report that there isn't one instead.
+  it("declines to name a dominant errorCode when no code holds a strict majority (BLO-22436)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 5,
+      now,
+      status: "cancelled",
+      livenessState: null,
+      usageJson: null,
+      errorCode: "issue_dependencies_blocked",
+    });
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 5,
+      now: new Date(now.getTime() - 6 * 60_000),
+      status: "failed",
+      livenessState: "failed",
+      usageJson: null,
+      errorCode: "job_failed",
+    });
+
+    const service = productivityReviewService(db);
+    await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    const reviews = await listProductivityReviews(seeded.companyId);
+    expect(reviews).toHaveLength(1);
+    expect(reviews[0]?.description).toContain(
+      "Non-executing runs in sample window (excluded from streaks above): 10 (no single dominant errorCode)",
+    );
+  });
+
+  // BLO-22436 (review follow-up): the generation exemption must not leak into
+  // `isProductivityReviewContinuationHoldActive`, which maps a `null` evidence
+  // return to `held: false`. Gating inside `collectEvidence` would mean adding a
+  // blocker to an issue under an active soft-stop hold silently released the
+  // hold — converting a clean hold into dispatch/cancel churn, dropping the
+  // `issue.productivity_review_continuation_held` activity signal, and leaving a
+  // real hole for interaction wakes, which the dependency dispatch gate lets
+  // through. The intended behaviour is that the hold is unaffected by blockers.
+  it("keeps an open soft-stop continuation hold active after its source becomes dependency-blocked (BLO-22436)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+    });
+    const service = productivityReviewService(db);
+    await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(1);
+
+    const heldBefore = await service.isProductivityReviewContinuationHoldActive({
+      companyId: seeded.companyId,
+      issueId: seeded.issueId,
+      agentId: seeded.coderId,
+      now,
+    });
+    expect(heldBefore.held).toBe(true);
+
+    await addBlocker({
+      companyId: seeded.companyId,
+      issuePrefix: seeded.issuePrefix,
+      blockedIssueId: seeded.issueId,
+    });
+
+    const heldAfter = await service.isProductivityReviewContinuationHoldActive({
+      companyId: seeded.companyId,
+      issueId: seeded.issueId,
+      agentId: seeded.coderId,
+      now,
+    });
+    expect(heldAfter.held).toBe(true);
+    if (!heldAfter.held) return;
+    expect(heldAfter.trigger).toBe("no_comment_streak");
+  });
+
+  // BLO-22436 (review follow-up): generation skipping blocked sources is only
+  // half the fix. `createOrUpdateReview` is the only path that refreshes an open
+  // review, so a review minted *before* the blocker was added would be stranded
+  // open forever — never refreshed, never closed. That is exactly the loop this
+  // ticket closes: the documented remedy for a flagged platform fault is to
+  // model it as a `blockedBy` edge, so the remedy would otherwise freeze a
+  // review pointing at an assignee who provably cannot act on it.
+  it("closes an open no-comment review once its source issue becomes dependency-blocked (BLO-22436)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    const reviewId = randomUUID();
+    await db.insert(issues).values({
+      id: reviewId,
+      companyId: seeded.companyId,
+      title: "Review productivity for source",
+      status: "todo",
+      priority: "medium",
+      parentId: seeded.issueId,
+      originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+      originId: seeded.issueId,
+      originFingerprint: `productivity-review:${seeded.issueId}`,
+      issueNumber: 2,
+      identifier: `${seeded.issuePrefix}-2`,
+      createdAt: now,
+      updatedAt: now,
+    });
+    await logActivity(db, {
+      companyId: seeded.companyId,
+      actorType: "system",
+      actorId: "system",
+      action: "issue.productivity_review_created",
+      entityType: "issue",
+      entityId: reviewId,
+      details: { trigger: "no_comment_streak", sourceIssueId: seeded.issueId },
+    });
+    await addBlocker({
+      companyId: seeded.companyId,
+      issuePrefix: seeded.issuePrefix,
+      blockedIssueId: seeded.issueId,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.closedDependencyBlockedReviews).toBe(1);
+    expect(result.closedTerminalSourceReviews).toBe(0);
+    expect(result.closedSuppressedMonitorReviews).toBe(0);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.status).toBe("done");
+    expect(review?.completedAt).toEqual(now);
+
+    const closeEntries = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.action, "issue.productivity_review_suppressed_open_review_closed"));
+    expect(closeEntries).toHaveLength(1);
+    expect(closeEntries[0]?.entityId).toBe(reviewId);
+    expect(closeEntries[0]?.details).toMatchObject({
+      suppressedBy: "dependency_blocked",
+      sourceIssueId: seeded.issueId,
+      unresolvedBlockerCount: 1,
+    });
+  });
+
+  // BLO-22436 (review follow-up): the close is scoped to the triggers the
+  // dependency gate causes. `high_churn` is a record of runs that DID execute
+  // and DID burn cost — a blocker added afterwards does not make that untrue,
+  // and closing on it would let a flagged agent retire its own
+  // cost-accountability artifact just by adding a `blockedBy` edge. Fails closed.
+  it("does not close an open high-churn review when its source becomes dependency-blocked (BLO-22436)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    const reviewId = randomUUID();
+    await db.insert(issues).values({
+      id: reviewId,
+      companyId: seeded.companyId,
+      title: "Review productivity for source",
+      status: "todo",
+      priority: "medium",
+      parentId: seeded.issueId,
+      originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+      originId: seeded.issueId,
+      originFingerprint: `productivity-review:${seeded.issueId}`,
+      issueNumber: 2,
+      identifier: `${seeded.issuePrefix}-2`,
+      createdAt: now,
+      updatedAt: now,
+    });
+    await logActivity(db, {
+      companyId: seeded.companyId,
+      actorType: "system",
+      actorId: "system",
+      action: "issue.productivity_review_created",
+      entityType: "issue",
+      entityId: reviewId,
+      details: { trigger: "high_churn", sourceIssueId: seeded.issueId },
+    });
+    await addBlocker({
+      companyId: seeded.companyId,
+      issuePrefix: seeded.issuePrefix,
+      blockedIssueId: seeded.issueId,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.closedDependencyBlockedReviews).toBe(0);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.status).toBe("todo");
   });
 
   // BLO-19094: an open review grants its assignee issue:comment/issue:mutate on
