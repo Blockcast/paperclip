@@ -315,7 +315,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     ),
     makeTool(
       "paperclipInboxLite",
-      "Get your compact assignment list for prioritizing this heartbeat (in_progress, in_review, todo). Prefer this over paperclipListIssues(assigneeAgentId=me) for the normal heartbeat inbox check — it's the cheaper, purpose-built call.",
+      "Get your compact assignment list for prioritizing this heartbeat. Returns ONLY issues assigned to you in todo, in_progress, or blocked. `in_review` is deliberately excluded: review/approval waits resume via comment, interaction, and monitor wakes rather than being re-picked every heartbeat. So an empty array means \"nothing to pick\" — NOT that the call failed. On an unscoped heartbeat wake, exit. If the wake NAMES an issue (PAPERCLIP_TASK_ID set, or a comment/mention/interaction/approval/monitor/recovery wake), do NOT exit on empty — read that issue by id with paperclipGetIssue and work it; empty is the expected response when the named issue is `in_review`. Either way, never fall back to a raw paperclipListIssues sweep to find work: it is checkout-lock-blind and can duplicate a concurrent run's work. Each entry carries `activeRun`, `dependencyReady`, and `unresolvedBlockerCount` so you can skip work another run already owns. Prefer this over paperclipListIssues(assigneeAgentId=me) for the normal heartbeat inbox check — it's the cheaper, purpose-built call.",
       z.object({}),
       async () => client.requestJson("GET", "/agents/me/inbox-lite"),
     ),
@@ -326,6 +326,21 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
       async ({ companyId }) => {
         const resolved = await client.resolveCompany({ override: companyId });
         return client.requestJson("GET", `/companies/${resolved}/agents`, { companyId: resolved });
+      },
+    ),
+    makeTool(
+      "paperclipListParkedAgents",
+      "Answer \"which agents cannot run right now, and until when?\". Lists agents whose heartbeat run is parked on a scheduled retry, soonest-due first, with the retry reason, attempt number, and — for provider-capacity parks — what the provider advertised beside what was actually booked. Use this instead of invoking a heartbeat on each agent to discover it is frozen. Filter with reason (e.g. ccrotate_capacity).",
+      z.object({ companyId: companyIdOptional, reason: z.string().min(1).max(64).optional(), limit: z.number().int().min(1).max(1000).optional() }),
+      async ({ companyId, reason, limit }) => {
+        const resolved = await client.resolveCompany({ override: companyId });
+        const query = new URLSearchParams();
+        if (reason) query.set("reason", reason);
+        if (limit !== undefined) query.set("limit", String(limit));
+        const suffix = query.size > 0 ? `?${query.toString()}` : "";
+        return client.requestJson("GET", `/companies/${resolved}/parked-agents${suffix}`, {
+          companyId: resolved,
+        });
       },
     ),
     makeTool(
@@ -585,13 +600,13 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     ),
     makeTool(
       "paperclipCheckoutIssue",
-      "Check out an issue: assigns it (if unassigned) and moves it to in_progress. You MUST do this before doing any work on an issue. Returns 409 on a checkout conflict — commonly another agent already owns it, but can also fire on a status mismatch (e.g. the issue is blocked/in_review) even when you already own it. Re-fetch the issue to see the actual status/assignee before deciding whether to wait, retry, or pick different work.",
+      "Check out an issue: assigns it (if unassigned) and acquires the run-scoped execution lock. Ordinary work moves to in_progress; pending execution-policy review/approval stages stay in_review so the reviewer can approve or request changes. You MUST do this before doing any work on an issue. Returns 409 on a checkout conflict — commonly another live run already owns it, but can also fire on a status mismatch. Re-fetch the issue to see the actual status, checkoutRunId, and executionRunId before deciding whether to wait, skip, or pick different work.",
       checkoutIssueToolSchema,
       async ({ issueId, agentId, expectedStatuses }) =>
         client.requestJson("POST", `/issues/${encodeURIComponent(issueId)}/checkout`, {
           body: {
             agentId: client.resolveAgentId(agentId),
-            expectedStatuses: expectedStatuses ?? ["todo", "backlog", "blocked"],
+            expectedStatuses: expectedStatuses ?? ["todo", "backlog", "blocked", "in_review"],
           },
         }),
     ),

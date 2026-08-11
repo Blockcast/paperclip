@@ -868,4 +868,192 @@ describe("issue graph liveness classifier", () => {
       expect(findings).toEqual([]);
     });
   });
+
+  describe("blocked with no unresolved blockers (BLO-24662)", () => {
+    const deadEndId = "dead-end-1";
+
+    function deadEnd(overrides: Record<string, unknown> = {}) {
+      return issue({
+        id: deadEndId,
+        identifier: "BLO-20995",
+        title: "Contrast tokens for --success and --error fills",
+        status: "blocked",
+        assigneeAgentId: coderId,
+        ...overrides,
+      });
+    }
+
+    it("surfaces a standalone blocked issue that has no blocker edges at all", () => {
+      const findings = classifyIssueGraphLiveness({
+        issues: [deadEnd()],
+        relations: [],
+        agents: [agent(), manager],
+      });
+
+      expect(findings).toHaveLength(1);
+      const [finding] = findings;
+      expect(finding!.state).toBe("blocked_without_blockers");
+      expect(finding!.severity).toBe("critical");
+      // AC4: both the finding subject and the recovery target are the stuck node itself.
+      expect(finding!.issueId).toBe(deadEndId);
+      expect(finding!.recoveryIssueId).toBe(deadEndId);
+      expect(finding!.reason).toContain("BLO-20995");
+      expect(finding!.reason).toContain("nothing can ever unblock it");
+      expect(finding!.incidentKey).toContain("blocked_without_blockers");
+    });
+
+    it("surfaces it even when the assignee is perfectly invokable", () => {
+      // The regression that kept BLO-20995 silent for ~13h: every assignee-shaped rule
+      // returned null because the assignee was healthy, so the dead end emitted nothing.
+      const findings = classifyIssueGraphLiveness({
+        issues: [deadEnd({ assigneeAgentId: coderId })],
+        relations: [],
+        agents: [agent({ status: "running" }), manager],
+      });
+
+      expect(findings.map((entry) => entry.state)).toEqual(["blocked_without_blockers"]);
+      expect(findings[0]!.recommendedOwnerAgentId).toBe(coderId);
+    });
+
+    it("defers a fully-done blocker set to the resolved-dependency backstop", () => {
+      // NOT a dead end. `reconcileResolvedDependencyWakeBackstop` wakes this issue in the
+      // same sweep, so raising a critical finding here would duplicate an automatic heal.
+      // The dead-end rule is about an issue with no blocker edge at all.
+      const findings = classifyIssueGraphLiveness({
+        issues: [
+          deadEnd(),
+          issue({ id: blockerId, identifier: "BLO-1", title: "Shipped", status: "done" }),
+        ],
+        relations: [{ companyId, blockerIssueId: blockerId, blockedIssueId: deadEndId }],
+        agents: [agent(), manager],
+      });
+
+      expect(findings).toEqual([]);
+    });
+
+    it("names the stuck leaf, not the healthy ancestor blocked behind it (AC4)", () => {
+      // The BLO-22927 -> BLO-20995 shape. The ancestor is correctly blocked and waiting;
+      // the dead end is two levels down and is what an operator has to act on.
+      const ancestorId = "ancestor-1";
+      const findings = classifyIssueGraphLiveness({
+        issues: [
+          issue({ id: ancestorId, identifier: "BLO-22927", title: "Coverage gaps", status: "blocked" }),
+          deadEnd(),
+        ],
+        relations: [{ companyId, blockerIssueId: deadEndId, blockedIssueId: ancestorId }],
+        agents: [agent(), manager],
+      });
+
+      expect(findings).toHaveLength(1);
+      const [finding] = findings;
+      expect(finding!.state).toBe("blocked_without_blockers");
+      // Reported against the ancestor (that is the issue being inspected) but the
+      // recovery target -- the node an operator is sent to -- is the actual dead end.
+      expect(finding!.issueId).toBe(ancestorId);
+      expect(finding!.recoveryIssueId).toBe(deadEndId);
+      expect(finding!.dependencyPath.map((entry) => entry.issueId)).toEqual([ancestorId, deadEndId]);
+      expect(finding!.reason).toContain("BLO-20995");
+    });
+
+    it("stays silent when a human owns the next action", () => {
+      const findings = classifyIssueGraphLiveness({
+        issues: [deadEnd({ assigneeAgentId: null, assigneeUserId: "user-1" })],
+        relations: [],
+        agents: [agent(), manager],
+      });
+
+      expect(findings).toEqual([]);
+    });
+
+    it("stays silent when a monitor is still scheduled", () => {
+      const now = new Date("2026-08-09T00:00:00.000Z");
+      const findings = classifyIssueGraphLiveness({
+        issues: [deadEnd({ monitorNextCheckAt: new Date("2026-08-09T01:00:00.000Z") })],
+        relations: [],
+        agents: [agent(), manager],
+        now,
+      });
+
+      expect(findings).toEqual([]);
+    });
+
+    it("stays silent when a run is active or a wake is queued", () => {
+      const base = { issues: [deadEnd()], relations: [], agents: [agent(), manager] };
+
+      expect(classifyIssueGraphLiveness({
+        ...base,
+        activeRuns: [{ companyId, issueId: deadEndId, agentId: coderId, status: "running" }],
+      })).toEqual([]);
+      expect(classifyIssueGraphLiveness({
+        ...base,
+        queuedWakeRequests: [{ companyId, issueId: deadEndId, agentId: coderId, status: "queued" }],
+      })).toEqual([]);
+    });
+
+    it("stays silent when an interaction, approval, or recovery issue owns the next action", () => {
+      const base = { issues: [deadEnd()], relations: [], agents: [agent(), manager] };
+      const waiting = [{ companyId, issueId: deadEndId, status: "pending" }];
+
+      expect(classifyIssueGraphLiveness({ ...base, pendingInteractions: waiting })).toEqual([]);
+      expect(classifyIssueGraphLiveness({ ...base, pendingApprovals: waiting })).toEqual([]);
+      expect(classifyIssueGraphLiveness({ ...base, openRecoveryIssues: waiting })).toEqual([]);
+    });
+
+    it("does not fire for non-blocked statuses", () => {
+      for (const status of ["todo", "in_progress", "in_review", "backlog", "done", "cancelled"]) {
+        const findings = classifyIssueGraphLiveness({
+          issues: [deadEnd({ status })],
+          relations: [],
+          agents: [agent(), manager],
+        });
+        expect(
+          findings.some((entry) => entry.state === "blocked_without_blockers"),
+          `status ${status} should not produce a dead-end finding`,
+        ).toBe(false);
+      }
+    });
+
+    it("stays silent when the description parks the issue on an external human owner", () => {
+      // The ticket's own caveat: an agent may set `blocked` while narrating a human gate
+      // rather than modelling it as an edge. `hasExternalWaitOwner` carries that signal in.
+      const findings = classifyIssueGraphLiveness({
+        issues: [deadEnd({ hasExternalWaitOwner: true })],
+        relations: [],
+        agents: [agent(), manager],
+      });
+
+      expect(findings).toEqual([]);
+    });
+
+    it("still reports other states for an externally-parked issue", () => {
+      // The external-wait signal is scoped to the dead-end rule only. An external owner
+      // named in prose does not make a cancelled blocker acceptable.
+      const findings = classifyIssueGraphLiveness({
+        issues: [
+          deadEnd({ hasExternalWaitOwner: true }),
+          issue({ id: blockerId, identifier: "BLO-2", title: "Abandoned", status: "cancelled" }),
+        ],
+        relations: [{ companyId, blockerIssueId: blockerId, blockedIssueId: deadEndId }],
+        agents: [agent(), manager],
+      });
+
+      expect(findings.map((entry) => entry.state)).toEqual(["blocked_by_cancelled_issue"]);
+    });
+
+    it("defers to blocked_by_cancelled_issue when the only blocker is cancelled", () => {
+      // A cancelled blocker is still an edge that has to be removed, and that rule
+      // carries the "replace this blocker" instruction -- reclassifying it as a dead
+      // end would lose it.
+      const findings = classifyIssueGraphLiveness({
+        issues: [
+          deadEnd(),
+          issue({ id: blockerId, identifier: "BLO-2", title: "Abandoned", status: "cancelled" }),
+        ],
+        relations: [{ companyId, blockerIssueId: blockerId, blockedIssueId: deadEndId }],
+        agents: [agent(), manager],
+      });
+
+      expect(findings.map((entry) => entry.state)).toEqual(["blocked_by_cancelled_issue"]);
+    });
+  });
 });

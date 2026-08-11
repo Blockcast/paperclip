@@ -113,6 +113,80 @@ export function resolveCcrotateCapacityRetry(
 }
 
 /**
+ * Every `resultJson` key that describes *which* capacity denial parked a run
+ * (BLO-24011). Enumerated so a re-defer can clear the previous decision wholesale
+ * before writing the current one: a key that is absent from the new decision must
+ * disappear rather than linger with the old gate's value.
+ */
+const CCROTATE_CAPACITY_DECISION_KEYS = [
+  "retryNotBefore",
+  "transientRetryNotBefore",
+  "penstockProvider",
+  "penstockModel",
+  "penstockReason",
+  "penstockRetryAfterSeconds",
+  "penstockAdvertisedResumeAt",
+  "penstockCapacityParkClampedFrom",
+] as const;
+
+export interface CcrotateCapacityDecision {
+  /** The clamped instant the run will actually re-probe at. */
+  retryAtIso: string;
+  provider?: string | null;
+  model?: string | null;
+  reason?: string | null;
+  retryAfterSeconds?: number | null;
+  /** What the provider advertised on *this* denial, ISO-8601, or null. */
+  advertisedResumeAtIso: string | null;
+  /** The advertised horizon this decision declined to honour, or null. */
+  clampedFromIso: string | null;
+}
+
+/**
+ * Project a capacity denial onto a run's `resultJson` (BLO-24011).
+ *
+ * A `ccrotate_capacity` park is re-decided every time the run comes due and the
+ * pool is still exhausted, but the promotion-time re-defer used to update only
+ * `scheduledRetryAttempt`/`scheduledRetryAt` — leaving every descriptive field
+ * behind from the *first* denial. That is how the incident row came to read
+ * `penstockRetryAfterSeconds: 3834` and `retryNotBefore: 08:00Z` beside a
+ * `scheduledRetryAt` four days out: two different gate decisions, one row, and
+ * no way to tell from the row that the 3834s figure had been superseded.
+ *
+ * Both writers go through here so the two can no longer drift, and so a reader
+ * can trust that every `penstock*` field describes the park the row currently
+ * holds.
+ */
+export function applyCcrotateCapacityDecision(
+  previous: Record<string, unknown>,
+  decision: CcrotateCapacityDecision,
+): Record<string, unknown> {
+  const next: Record<string, unknown> = { ...previous };
+  for (const key of CCROTATE_CAPACITY_DECISION_KEYS) {
+    delete next[key];
+  }
+  next.errorFamily = "rate_limit_exhausted";
+  // `retryNotBefore` is a *floor* consumed by scheduleBoundedRetryForRun, so it
+  // carries the clamped instant. The provider's own claim lives under
+  // `penstockAdvertisedResumeAt`, where nothing reschedules off it.
+  next.retryNotBefore = decision.retryAtIso;
+  next.transientRetryNotBefore = decision.retryAtIso;
+  if (decision.provider != null) next.penstockProvider = decision.provider;
+  if (decision.model != null) next.penstockModel = decision.model;
+  if (decision.reason != null) next.penstockReason = decision.reason;
+  if (decision.retryAfterSeconds != null) {
+    next.penstockRetryAfterSeconds = decision.retryAfterSeconds;
+  }
+  if (decision.advertisedResumeAtIso !== null) {
+    next.penstockAdvertisedResumeAt = decision.advertisedResumeAtIso;
+  }
+  if (decision.clampedFromIso !== null) {
+    next.penstockCapacityParkClampedFrom = decision.clampedFromIso;
+  }
+  return next;
+}
+
+/**
  * Ceiling for a `retryNotBefore` floor supplied by a finalized run (BLO-23438).
  *
  * Deliberately far looser than CCROTATE_CAPACITY_MAX_PARK_MS. This bounds the
