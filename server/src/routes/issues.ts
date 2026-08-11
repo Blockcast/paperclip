@@ -5916,6 +5916,15 @@ export function issueRoutes(
       context.resumeRequiresNormalModel === true;
   }
 
+  function isPlanningOnlyRecoveryContext(contextSnapshot: unknown) {
+    if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return false;
+    const context = contextSnapshot as Record<string, unknown>;
+    return context.recoveryIntent === "planning_only" &&
+      context.allowDeliverableWork === false &&
+      context.allowDocumentUpdates === true &&
+      context.resumeRequiresNormalModel === false;
+  }
+
   function requestsCheapIssueAssigneeModelProfile(input: { assigneeAdapterOverrides?: unknown }) {
     const overrides = input.assigneeAdapterOverrides;
     return !!overrides &&
@@ -5975,19 +5984,24 @@ export function issueRoutes(
     req: Request,
     res: Response,
     issue: { id: string; companyId: string },
+    mutationKind: "document" | "deliverable" = "deliverable",
   ) {
     const run = await loadActorRunContext(req, issue.companyId);
     if (!run) return true;
-    if (!isStatusOnlyCheapRecoveryContext(run.contextSnapshot)) return true;
+    const statusOnly = isStatusOnlyCheapRecoveryContext(run.contextSnapshot);
+    const planningOnly = isPlanningOnlyRecoveryContext(run.contextSnapshot);
+    if (!statusOnly && (!planningOnly || mutationKind === "document")) return true;
 
     res.status(403).json({
-      error: "Cheap status-only recovery runs cannot update issue documents, plans, or deliverable artifacts",
+      error: planningOnly
+        ? "Planning-only recovery runs can update issue documents but cannot create or modify deliverable artifacts"
+        : "Cheap status-only recovery runs cannot update issue documents, plans, or deliverable artifacts",
       details: {
         issueId: issue.id,
         runId: run.id,
-        modelProfile: "cheap",
-        recoveryIntent: "status_only",
-        resumeRequiresNormalModel: true,
+        ...(statusOnly ? { modelProfile: "cheap" } : {}),
+        recoveryIntent: planningOnly ? "planning_only" : "status_only",
+        resumeRequiresNormalModel: statusOnly,
       },
     });
     return false;
@@ -6000,19 +6014,22 @@ export function issueRoutes(
   ) {
     const run = await loadActorRunContext(req, issue.companyId);
     if (!run) return true;
-    if (!isStatusOnlyCheapRecoveryContext(run.contextSnapshot)) return true;
+    const statusOnly = isStatusOnlyCheapRecoveryContext(run.contextSnapshot);
+    const planningOnly = isPlanningOnlyRecoveryContext(run.contextSnapshot);
+    if (!statusOnly && !planningOnly) return true;
 
     res.status(403).json({
       error:
-        "Cheap status-only recovery runs cannot link or unlink approvals; to escalate from this run, " +
-        "create a `request_board_approval` with the run context's source issue in `issueIds` instead",
+        planningOnly
+          ? "Planning-only recovery runs cannot link or unlink approvals"
+          : "Cheap status-only recovery runs cannot link or unlink approvals; to escalate from this run, " +
+            "create a `request_board_approval` with the run context's source issue in `issueIds` instead",
       details: {
         issueId: issue.id,
         runId: run.id,
-        modelProfile: "cheap",
-        recoveryIntent: "status_only",
-        resumeRequiresNormalModel: true,
-        allowedApprovalType: "request_board_approval",
+        ...(statusOnly ? { modelProfile: "cheap", allowedApprovalType: "request_board_approval" } : {}),
+        recoveryIntent: planningOnly ? "planning_only" : "status_only",
+        resumeRequiresNormalModel: statusOnly,
       },
     });
     return false;
@@ -8099,7 +8116,7 @@ export function issueRoutes(
     const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
     if (!issue) return;
     if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
-    if (!(await assertDeliverableMutationAllowedByRunContext(req, res, issue))) return;
+    if (!(await assertDeliverableMutationAllowedByRunContext(req, res, issue, "document"))) return;
     const keyParsed = issueDocumentKeySchema.safeParse(String(req.params.key ?? "").trim().toLowerCase());
     if (!keyParsed.success) {
       res.status(400).json({ error: "Invalid document key", details: keyParsed.error.issues });
@@ -8328,7 +8345,7 @@ export function issueRoutes(
       const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
       if (!issue) return;
       if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
-      if (!(await assertDeliverableMutationAllowedByRunContext(req, res, issue))) return;
+      if (!(await assertDeliverableMutationAllowedByRunContext(req, res, issue, "document"))) return;
       const keyParsed = issueDocumentKeySchema.safeParse(String(req.params.key ?? "").trim().toLowerCase());
       if (!keyParsed.success) {
         res.status(400).json({ error: "Invalid document key", details: keyParsed.error.issues });

@@ -455,7 +455,7 @@ export function decideSuccessfulRunHandoff(input: {
     sourceRunId: run.id,
     workMode: issue.workMode,
   });
-  const workClass = issue.workMode === "planning" ? "normal_model" : "status_only";
+  const workClass = issue.workMode === "planning" ? "planning_only" : "status_only";
   const payloadInput = {
     issueId: issue.id,
     taskId: issue.id,
@@ -474,8 +474,8 @@ export function decideSuccessfulRunHandoff(input: {
     ...(input.taskKey ? { taskKey: input.taskKey } : {}),
     instruction,
   };
-  const payload = workClass === "normal_model"
-    ? withRecoveryModelProfileHint(payloadInput, "normal_model")
+  const payload = workClass === "planning_only"
+    ? withRecoveryModelProfileHint(payloadInput, "planning_only")
     : withRecoveryModelProfileHint(payloadInput, "status_only");
 
   return {
@@ -487,12 +487,12 @@ export function decideSuccessfulRunHandoff(input: {
     }),
     payload,
     instruction,
-    contextSnapshot: workClass === "normal_model"
+    contextSnapshot: workClass === "planning_only"
       ? withRecoveryModelProfileHint({
         ...payload,
         wakeReason: FINISH_SUCCESSFUL_RUN_HANDOFF_REASON,
         livenessState: input.livenessState,
-      }, "normal_model")
+      }, "planning_only")
       : withRecoveryModelProfileHint({
         ...payload,
         wakeReason: FINISH_SUCCESSFUL_RUN_HANDOFF_REASON,
