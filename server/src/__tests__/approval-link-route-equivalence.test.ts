@@ -331,6 +331,49 @@ describe("approval-link authorization is the same at both doors (BLO-24699)", ()
     expect(verdictOf(link.status)).toBe(verdictOf(create.status));
   }, ROUTE_IMPORT_TIMEOUT_MS);
 
+  it("refuses an own-issue actor denied company_scope:read through EITHER door", async () => {
+    // The gap Ally found in review of PR #1293: relaxing the link route onto the
+    // issue-scoped evaluator dropped the *approval*-side check that create has
+    // always run, so the doors were equivalent only for actors holding both.
+    // `authorization.ts` denies `company_scope:read` outright to task-bridge keys,
+    // skill-test run tokens, and low-trust-preset agents while still allowing
+    // `issue:mutate` on their own issue — exactly this actor. Since
+    // `GET /issues/:id/approvals` returns linked approvals to anyone who can read
+    // the issue, an allow here would let such an actor attach a guessed approval id
+    // to its own issue and read the row back: an approval-read bypass, not a link.
+    //
+    // Fails against 51b6297 with `expected 'allow' to be 403` on the link door —
+    // the create door already refused, which is what made it a divergence.
+    mockAccessService.decide.mockImplementation(async (input: any) => {
+      if (input.action === "company_scope:read") {
+        return { allowed: false, action: input.action, reason: "deny_scope", explanation: "" };
+      }
+      if (input.action === "tasks:manage_active_checkouts") {
+        return { allowed: false, action: input.action, reason: "deny_missing_grant", explanation: "" };
+      }
+      return { allowed: true, action: input.action, reason: "allow_assignee", explanation: "" };
+    });
+    mockIssueService.getById.mockImplementation(async (id: string) =>
+      id === OWN_ISSUE_ID ? makeIssue() : null,
+    );
+
+    const link = await attachViaLinkRoute(agentActor(), OWN_ISSUE_ID);
+    const create = await attachViaCreateRoute(agentActor(), OWN_ISSUE_ID);
+
+    expect(verdictOf(link.status), JSON.stringify(link.body)).toBe(403);
+    expect(verdictOf(create.status), JSON.stringify(create.body)).toBe(403);
+    expect(verdictOf(link.status)).toBe(verdictOf(create.status));
+    // Not merely the right status: no `issue_approvals` row may exist afterwards,
+    // since the row is what makes the approval readable via the issue.
+    expect(mockIssueApprovalService.link).not.toHaveBeenCalled();
+    expect(mockIssueApprovalService.linkManyForApproval).not.toHaveBeenCalled();
+    // Both doors must refuse for the *approval* reason, not incidentally on the
+    // issue boundary — otherwise this passes for the wrong reason if the issue-side
+    // check ever tightens.
+    expect(link.body.error).toBe("Approvals are outside this actor's authorization boundary");
+    expect(create.body.error).toBe(link.body.error);
+  }, ROUTE_IMPORT_TIMEOUT_MS);
+
   it("keeps the privileged gate on unlink, which has no second door to agree with", async () => {
     mockIssueService.getById.mockImplementation(async (id: string) =>
       id === OWN_ISSUE_ID ? makeIssue() : null,

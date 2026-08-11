@@ -3912,6 +3912,31 @@ export function issueRoutes(
   }
 
   /**
+   * BLO-24699: the approval-side half of the attach boundary. Deliberately mirrors
+   * `assertApprovalAccessAllowed` in `routes/approvals.ts` — same action, same
+   * resource, same 403 body — because the point of this route's relaxation is that
+   * the two doors to a row in `issue_approvals` decide alike. Any drift here
+   * reopens the asymmetry the relaxation closed, just on the approval side instead
+   * of the issue side.
+   *
+   * Scoped to `issue.companyId` rather than reloading the approval: `link()` calls
+   * `assertIssueAndApprovalSameCompany` and rejects a cross-company pair with 422,
+   * so for every link that could succeed the two companies are the same one.
+   *
+   * Ordinary agents hold `company_scope:read`, so this is a no-op for them and the
+   * BLO-23036 escalation path is untouched. What it excludes is the scoped-key
+   * classes `authorization.ts` denies the action outright while still allowing
+   * `issue:mutate` on their own issue: task-bridge keys, skill-test run tokens, and
+   * low-trust-preset agents — all of which the dropped
+   * `assertCanManageIssueApprovalLinks` gate happened to keep off this route.
+   */
+  async function assertApprovalReadAllowed(req: Request, res: Response, companyId: string) {
+    if (await actorCanReadCompanyScope(req, companyId)) return true;
+    res.status(403).json({ error: "Approvals are outside this actor's authorization boundary" });
+    return false;
+  }
+
+  /**
    * BLO-24699: the *attach* half of the approval-link boundary, decided through the
    * same evaluator as `POST /companies/:companyId/approvals` so the two doors to a
    * row in `issue_approvals` cannot reach different verdicts for the same
@@ -3932,11 +3957,22 @@ export function issueRoutes(
    * concerns, which is precisely the context-free escalation BLO-23036 exists to
    * close.
    *
-   * The only capability this relaxation adds is attaching a *pre-existing* approval,
-   * and that discloses nothing new: `GET /approvals/:id` and
+   * The only capability this relaxation adds is attaching a *pre-existing* approval.
+   * For an ordinary agent that discloses nothing new: `GET /approvals/:id` and
    * `GET /companies/:companyId/approvals` are gated by the same `company_scope:read`
    * as create, so any agent that can file an approval can already read every
    * approval in its company.
+   *
+   * That argument covers ordinary agents and *only* ordinary agents. It does not
+   * hold for the scoped-key classes `authorization.ts` denies `company_scope:read`
+   * outright while still allowing `issue:mutate` on their own issue — task-bridge
+   * keys, skill-test run tokens, and low-trust-preset agents. For those, attaching
+   * would have been a genuinely new read: `GET /issues/:id/approvals` returns the
+   * linked approvals to any actor that can read the issue, so a guessed approval id
+   * attached to their own issue would come back readable. The dropped gate happened
+   * to exclude them; `assertApprovalReadAllowed` on the route now excludes them on
+   * purpose, which is also what makes the two doors actually equivalent rather than
+   * equivalent-for-agents. Found in review of PR #1293.
    *
    * `DELETE /issues/:id/approvals/:approvalId` deliberately keeps the privileged
    * gate — see the note there.
@@ -8974,6 +9010,21 @@ export function issueRoutes(
     const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
     if (!issue) return;
     if (!(await assertApprovalMutationAllowedByRunContext(req, res, issue))) return;
+    // BLO-24699: the approval-side half, which create has always run and this route
+    // did not — so the doors were equivalent only for actors holding both halves.
+    // `GET /issues/:id/approvals` returns linked approvals to any actor that can
+    // read the issue, so without this an actor that may mutate its own issue but
+    // may not read approvals could attach an arbitrary approval id and read the row
+    // back. See `assertApprovalReadAllowed` for who that excludes and why ordinary
+    // agents (and so the BLO-23036 escalation path) are unaffected.
+    //
+    // Ordered *after* the run-context check, where create has it before: the two
+    // orderings differ only in which 403 an actor failing both is told about, never
+    // in the allow/deny verdict the equivalence contract is about. The cheap
+    // status-only refusal is the more specific of the two and names the delegation
+    // path an agent needs, and BLO-23036 AC #2 requires that constraint stay visible
+    // rather than being masked by a generic boundary message.
+    if (!(await assertApprovalReadAllowed(req, res, issue.companyId))) return;
     // BLO-24699: the shared evaluator replaces the former
     // `assertAgentIssueMutationAllowed` + `assertCanManageIssueApprovalLinks` pair,
     // so this route and `POST /companies/:companyId/approvals` reach the same
