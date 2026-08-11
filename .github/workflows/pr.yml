@@ -9,7 +9,11 @@ on:
       - checks_requested
 
 concurrency:
-  group: pr-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.run_id }}
+  # Pull requests are stable by number. A merge-group head SHA changes every
+  # time GitHub re-stages the queue, so key the sole active build for each
+  # merge-queue base branch instead. The repository merge queue is configured
+  # with maximumEntriesToBuild=1; a newer generation must replace the old one.
+  group: pr-${{ github.event.pull_request.number || github.event.merge_group.base_ref || github.run_id }}
   cancel-in-progress: true
 
 env:
@@ -78,6 +82,9 @@ jobs:
 
       - name: Test CI cache and Docker runner routing
         run: node --test ./scripts/__tests__/ci-cache-routing.test.mjs
+
+      - name: Test merge-group concurrency key
+        run: node --test ./scripts/__tests__/merge-group-concurrency.test.mjs
 
       - name: Reject git push in adapter/runtime code
         run: node ./scripts/check-no-git-push.mjs

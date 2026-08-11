@@ -285,7 +285,7 @@ import {
   type PenstockAvailabilityGate,
   type PenstockAvailabilityGateDenyResult,
 } from "./penstock-availability-gate.js";
-import { resolveCcrotateCapacityRetry, clampTransientRetryHorizon } from "./ccrotate-capacity-retry.js";
+import { resolveCcrotateCapacityRetry, clampTransientRetryHorizon, applyCcrotateCapacityDecision } from "./ccrotate-capacity-retry.js";
 import {
   evaluateExecutionAllowlist,
   isExecutionForcedToKubernetes,
@@ -13583,9 +13583,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           defaultRetryDelayMs: CCROTATE_CAPACITY_DEFAULT_RETRY_DELAY_MS,
         });
         const nextDueAt = capacityRetryPlan.retryAt;
+        // BLO-24011: re-decide the *whole* park, not just when it lands. This
+        // update used to touch attempt/due only, so the row kept describing the
+        // first denial — the incident row read `penstockRetryAfterSeconds: 3834`
+        // and `retryNotBefore: 08:00Z` against a `scheduledRetryAt` four days
+        // out, which is two decisions wearing one row and reads like a
+        // scheduler bug rather than a second, later denial.
+        const nextResultJson = applyCcrotateCapacityDecision(parseObject(dueRun.resultJson), {
+          retryAtIso: nextDueAt.toISOString(),
+          provider: capacity.penstockProvider,
+          model: capacity.penstockModel,
+          reason: capacity.reason,
+          retryAfterSeconds: capacity.penstockRetryAfterSeconds,
+          advertisedResumeAtIso: capacity.resumeAt ? capacity.resumeAt.toISOString() : null,
+          clampedFromIso: capacityRetryPlan.clampedFromIso,
+        });
         const rescheduled = await db
           .update(heartbeatRuns)
-          .set({ scheduledRetryAttempt: nextAttempt, scheduledRetryAt: nextDueAt, updatedAt: now })
+          .set({
+            scheduledRetryAttempt: nextAttempt,
+            scheduledRetryAt: nextDueAt,
+            resultJson: nextResultJson,
+            updatedAt: now,
+          })
           .where(
             and(
               eq(heartbeatRuns.id, dueRun.id),
@@ -25293,20 +25313,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             scheduledRetryReason: CCROTATE_CAPACITY_RETRY_REASON,
             scheduledRetryAttempt: 0,
             errorCode: "rate_limit_exhausted",
-            resultJson: {
-              errorFamily: "rate_limit_exhausted",
-              ...(resumeAtIso ? { retryNotBefore: resumeAtIso, transientRetryNotBefore: resumeAtIso } : {}),
-              ...(advertisedResumeAtIso
-                ? { penstockAdvertisedResumeAt: advertisedResumeAtIso }
-                : {}),
-              ...(capacityRetryPlan.clampedFromIso
-                ? { penstockCapacityParkClampedFrom: capacityRetryPlan.clampedFromIso }
-                : {}),
-              penstockProvider: gateResult.provider,
-              penstockModel: gateResult.model,
-              penstockReason: gateResult.reason,
-              penstockRetryAfterSeconds: gateResult.retryAfterSeconds,
-            },
+            // Shared with the promotion-time re-defer (BLO-24011) so the two
+            // writers cannot drift in which fields describe the current park.
+            resultJson: applyCcrotateCapacityDecision(
+              {},
+              {
+                retryAtIso: resumeAtIso,
+                provider: gateResult.provider,
+                model: gateResult.model,
+                reason: gateResult.reason,
+                retryAfterSeconds: gateResult.retryAfterSeconds,
+                advertisedResumeAtIso: advertisedResumeAtIso,
+                clampedFromIso: capacityRetryPlan.clampedFromIso,
+              },
+            ),
             contextSnapshot: retryContextSnapshot,
           })
           .returning()
