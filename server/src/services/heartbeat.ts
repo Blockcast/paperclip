@@ -3927,12 +3927,56 @@ export function isHeartbeatCooldownActive(args: {
   return { active: true, remainingSec: Math.ceil((cooldownMs - elapsedMs) / 1000) };
 }
 
+/**
+ * Wake statuses that count as "this wake was already delivered" for the
+ * enqueue-time idempotency claim in enqueueWakeup (BLO-25726).
+ *
+ * Kept identical to `IDEMPOTENT_WAKE_STATUSES` in
+ * services/recovery/run-liveness-continuations.ts, whose caller-side check was
+ * the only reader of `idempotency_key` before this. Two readers disagreeing on
+ * "delivered" would let a wake be suppressed by one and re-driven by the other.
+ */
+const IDEMPOTENT_WAKE_DELIVERED_STATUSES = ["queued", "deferred_issue_execution", "completed"];
+
 interface WakeupOptions {
   source?: "timer" | "assignment" | "on_demand" | "automation";
   triggerDetail?: "manual" | "ping" | "callback" | "system";
   reason?: string | null;
   payload?: Record<string, unknown> | null;
   idempotencyKey?: string | null;
+  /**
+   * Opt in to the server-side enqueue-time idempotency claim (BLO-25726): when
+   * set with an `idempotencyKey`, enqueueWakeup returns the run already
+   * delivered under that key instead of committing a second one.
+   *
+   * Opt-IN rather than always-on, and this is the load-bearing part. Not every
+   * key in this system is unique per intended delivery -- `issues.ts`'s
+   * `blockers_resolved:<blockerId>:<dependentId>` carries no event-instance or
+   * time component, so the same key legitimately recurs every time that blocker
+   * is re-added and re-resolved. Deduping it unconditionally would silently
+   * suppress a real wake forever: under-wake, which is the harmful direction,
+   * traded for the bounded over-wake this issue exists to remove.
+   *
+   * So the claim is scoped to REDELIVERY -- the reconciler re-driving a wake it
+   * has already attempted, where "same key" really does mean "same delivery".
+   * Every existing caller (including run-liveness continuations, which dedupe
+   * caller-side in recovery/run-liveness-continuations.ts) is unaffected.
+   */
+  dedupeOnIdempotencyKey?: boolean;
+  /**
+   * Lower bound on `requested_at` for the idempotency claim above (BLO-25726).
+   *
+   * Without it the claim is unbounded in time, and that reintroduces under-wake
+   * through a side door: a recurring key (`blockers_resolved:<a>:<b>`) whose
+   * FIRST delivery completed months ago, and whose SECOND, genuinely new
+   * delivery happens to take the dispatch-retry path, would match that ancient
+   * `completed` row and be suppressed as "already delivered".
+   *
+   * The reconciler therefore passes its own marker's `requestedAt`: a delivery
+   * recorded at or after the moment this attempt was first recorded is THIS
+   * delivery, and anything older is a different one that merely reused the key.
+   */
+  dedupeDeliveredSince?: Date | null;
   requestedByActorType?: "user" | "agent" | "system";
   requestedByActorId?: string | null;
   contextSnapshot?: Record<string, unknown>;
@@ -10328,6 +10372,29 @@ export interface HeartbeatServiceOptions {
   /** Test-only hook after a queued run commits and before dispatch can claim it. */
   beforeQueuedRunDispatchForTest?: (
     run: typeof heartbeatRuns.$inferSelect,
+  ) => Promise<void> | void;
+  /**
+   * Test-only crash injection for the post-commit window (BLO-25726). Invoked
+   * INSIDE enqueueWakeup's post-commit guard, so throwing here reproduces
+   * "the run committed but acknowledgement was lost" -- the window that used to
+   * make `wakeupWithDispatchRetry` re-enqueue and commit a duplicate run.
+   *
+   * Distinct from `beforeQueuedRunDispatchForTest`, which is intentionally
+   * outside that guard so test assertions inside it still surface.
+   */
+  failAfterQueuedRunCommitForTest?: (
+    run: typeof heartbeatRuns.$inferSelect,
+  ) => Promise<void> | void;
+  /**
+   * Test-only interleaving point for the reconciler's claim CAS (BLO-25726).
+   * Invoked after the due-rows select and before the claim, so a test can let a
+   * competing pass run to completion in between and reproduce the two-replica
+   * race deterministically. Racing two `reconcileFailedWakeDispatches` calls
+   * with `Promise.all` does NOT reproduce it -- the first pass reliably finishes
+   * before the second one selects, so the test passes with the claim removed.
+   */
+  beforeWakeDispatchClaimForTest?: (
+    row: typeof agentWakeupRequests.$inferSelect,
   ) => Promise<void> | void;
 }
 
@@ -32270,6 +32337,53 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         return { kind: "coalesced" as const, run: coalescedGithubStateRun };
       }
 
+      // BLO-25726: enqueue-time idempotency claim. Before this, enqueueWakeup
+      // WROTE `idempotencyKey` on every row and never READ it -- the only reader
+      // in the server was caller-side (recovery/run-liveness-continuations.ts),
+      // so a redelivery of an already-delivered wake committed a second run.
+      //
+      // The live-status set matches that caller-side reader deliberately, so the
+      // two agree on what "already delivered" means; `dispatch_failed`,
+      // `skipped` and the terminal `dispatch_*` states are all absent from it,
+      // which is what lets a genuinely-undelivered wake still be re-driven.
+      if (opts.dedupeOnIdempotencyKey && opts.idempotencyKey) {
+        const alreadyDelivered = await tx
+          .select({ id: agentWakeupRequests.id, runId: agentWakeupRequests.runId })
+          .from(agentWakeupRequests)
+          .where(
+            and(
+              eq(agentWakeupRequests.companyId, agent.companyId),
+              eq(agentWakeupRequests.idempotencyKey, opts.idempotencyKey),
+              inArray(agentWakeupRequests.status, IDEMPOTENT_WAKE_DELIVERED_STATUSES),
+              isNotNull(agentWakeupRequests.runId),
+              // Scopes the claim to THIS delivery; see dedupeDeliveredSince.
+              opts.dedupeDeliveredSince
+                ? gte(agentWakeupRequests.requestedAt, opts.dedupeDeliveredSince)
+                : undefined,
+            ),
+          )
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (alreadyDelivered?.runId) {
+          const deliveredRun = await tx
+            .select()
+            .from(heartbeatRuns)
+            .where(eq(heartbeatRuns.id, alreadyDelivered.runId))
+            .limit(1)
+            .then((rows) => rows[0] ?? null);
+          // Only short-circuit on a run we can actually hand back. A row whose
+          // run has since been hard-deleted would otherwise dedupe into
+          // nothing, turning the duplicate this closes into a dropped wake.
+          if (deliveredRun) {
+            return {
+              kind: "already_delivered" as const,
+              run: deliveredRun,
+              wakeupRequestId: alreadyDelivered.id,
+            };
+          }
+        }
+      }
+
       const wakeupRequest = await tx
         .insert(agentWakeupRequests)
         .values({
@@ -32332,22 +32446,81 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     if (queueOutcome.kind === "skipped") return null;
     if (queueOutcome.kind === "coalesced") return queueOutcome.run;
+    if (queueOutcome.kind === "already_delivered") {
+      // No new run was committed, so there is no post-commit dispatch work to
+      // do here: whichever wake first delivered under this key owns that run's
+      // lifecycle, and `resumeQueuedRuns` re-drives it if it is still queued.
+      logger.info(
+        {
+          agentId,
+          idempotencyKey: opts.idempotencyKey,
+          runId: queueOutcome.run.id,
+          wakeupRequestId: queueOutcome.wakeupRequestId,
+        },
+        "wake was already delivered under this idempotency key; returning the existing run instead "
+          + "of committing a duplicate (BLO-25726)",
+      );
+      return queueOutcome.run;
+    }
     const newRun = queueOutcome.run;
 
-    publishLiveEvent({
-      companyId: newRun.companyId,
-      type: "heartbeat.run.queued",
-      payload: {
-        runId: newRun.id,
-        agentId: newRun.agentId,
-        invocationSource: newRun.invocationSource,
-        triggerDetail: newRun.triggerDetail,
-        wakeupRequestId: newRun.wakeupRequestId,
-      },
-    });
+    // BLO-25726: everything past this point is post-commit. The wake row and
+    // its queued run are durable, so this wake HAS succeeded -- but the work
+    // below still touches the DB (`startNextQueuedRunForAgent` re-reads the
+    // agent, its invokability and its running runs, and can reap or cancel),
+    // and before this guard a transient failure in any of it propagated out of
+    // enqueueWakeup into `wakeupWithDispatchRetry`'s catch, which re-ran the
+    // whole enqueue: every scheduling gate re-evaluated, and a committed run
+    // reported as a failed dispatch.
+    //
+    // Measured scope, not assumed: reverting this guard does NOT currently
+    // produce a second run, because wake coalescing merges the retry into the
+    // still-`queued` first run. So this is not the duplicate-run fix it was
+    // first written as -- coalescing is. It is kept because relying on
+    // coalescing here would be relying on a coincidence: the coalesce arms are
+    // conditional (`hasInitialRetryMetadata` skips one) and only match while the
+    // run is still queued, so a shape that misses them would duplicate. Not
+    // re-driving committed work is the invariant; coalescing is a backstop.
+    //
+    // Swallowing is safe because dispatch is recoverable: `resumeQueuedRuns`
+    // re-drives every queued run at startup and on each scheduler tick, and the
+    // API tier already relies on that -- `startNextQueuedRunForAgent` returns
+    // early there by design, leaving runs queued for the workers tier. A run
+    // that misses its inline dispatch is late, not lost.
+    try {
+      publishLiveEvent({
+        companyId: newRun.companyId,
+        type: "heartbeat.run.queued",
+        payload: {
+          runId: newRun.id,
+          agentId: newRun.agentId,
+          invocationSource: newRun.invocationSource,
+          triggerDetail: newRun.triggerDetail,
+          wakeupRequestId: newRun.wakeupRequestId,
+        },
+      });
+    } catch (err) {
+      logger.error(
+        { err, agentId: agent.id, runId: newRun.id },
+        "post-commit wake live-event publish failed; the queued run is committed (BLO-25726)",
+      );
+    }
 
+    // Deliberately OUTSIDE the guard below. This hook carries test assertions
+    // (`await expect(...)` inside it), and swallowing its throw would convert a
+    // failed assertion into a silently passing test.
     await options.beforeQueuedRunDispatchForTest?.(newRun);
-    await startNextQueuedRunForAgent(agent.id);
+
+    try {
+      await options.failAfterQueuedRunCommitForTest?.(newRun);
+      await startNextQueuedRunForAgent(agent.id);
+    } catch (err) {
+      logger.error(
+        { err, agentId: agent.id, runId: newRun.id, wakeupRequestId: newRun.wakeupRequestId },
+        "post-commit wake dispatch failed; the queued run is committed and resumeQueuedRuns will "
+          + "re-drive it, so the wake is not retried (retrying would duplicate the run) (BLO-25726)",
+      );
+    }
 
     return newRun;
   }
@@ -32609,6 +32782,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   const DISPATCH_RETRY_MAX_ATTEMPTS = DISPATCH_RETRY_RECONCILE_BACKOFF_MS.length;
 
   /**
+   * How long a `dispatch_retrying` claim stays valid before another pass may
+   * steal it (BLO-25726).
+   *
+   * The claim below is what stops two concurrent reconciler passes from both
+   * re-dispatching one row, but a claim with no expiry converts a crash
+   * mid-dispatch into permanent stranding: the due-rows query only selects
+   * `dispatch_failed`, so a row left `dispatch_retrying` by a dead process is
+   * never looked at again. Stranding is the harmful failure direction here --
+   * strictly worse than the duplicate this issue is closing -- so the claim is
+   * a lease, not a lock.
+   *
+   * Sized well above the longest plausible `enqueueWakeup` (its slowest arm is
+   * a handful of queries plus `startNextQueuedRunForAgent`, all under a second
+   * in practice) so a merely-slow pass is never robbed by a healthy peer, and
+   * a steal means the holder really is gone.
+   */
+  const DISPATCH_RETRY_CLAIM_LEASE_MS = 10 * 60_000;
+
+  /**
    * Periodic reconciliation for `dispatch_failed` rows written by
    * wakeupWithDispatchRetry. Retries the original wakeup() call with
    * increasing backoff; a business-rule HttpError (the underlying condition
@@ -32617,6 +32809,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * After DISPATCH_RETRY_MAX_ATTEMPTS the row is marked
    * `dispatch_failed_exhausted` -- terminal and queryable/alertable, never
    * silently dropped again.
+   *
+   * BLO-25726: every row is claimed with a conditional status CAS before it is
+   * dispatched. The heartbeat scheduler is not leader-elected and is not gated
+   * on `paperclipNodeRole`, so it runs on every replica (paperclip-api is
+   * deployed at 2) -- before the claim, both replicas selected the same due row
+   * and both called `enqueueWakeup`, committing two queued runs for one wake.
    */
   async function reconcileFailedWakeDispatches(now: Date = new Date()) {
     // BLO-14395 review follow-up: filter+order by due-ness (the JSON
@@ -32625,12 +32823,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // escalated further out occupy the whole fetched batch under a backlog,
     // starving younger rows that were actually due right now.
     const nextAttemptAtExpr = sql`(${agentWakeupRequests.payload} -> 'dispatchRetry' ->> 'nextAttemptAt')::timestamptz`;
+    const claimLeaseFloor = new Date(now.getTime() - DISPATCH_RETRY_CLAIM_LEASE_MS);
     const dueRows = await db
       .select()
       .from(agentWakeupRequests)
       .where(
         and(
-          eq(agentWakeupRequests.status, "dispatch_failed"),
+          // Expired `dispatch_retrying` leases are re-selected here so a pass
+          // that died mid-dispatch cannot strand the row (see the lease const).
+          or(
+            eq(agentWakeupRequests.status, "dispatch_failed"),
+            and(
+              eq(agentWakeupRequests.status, "dispatch_retrying"),
+              lt(agentWakeupRequests.claimedAt, claimLeaseFloor),
+            ),
+          ),
           sql`${nextAttemptAtExpr} <= ${now.toISOString()}::timestamptz`,
         ),
       )
@@ -32643,6 +32850,35 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     let stillFailing = 0;
 
     for (const row of dueRows) {
+      await options.beforeWakeDispatchClaimForTest?.(row);
+      // BLO-25726: claim the row before dispatching. The CAS is on the exact
+      // status we selected under, so of two concurrent passes over the same
+      // row exactly one updates a row and the loser sees rowCount 0 and skips
+      // -- including the steal-an-expired-lease case, where the loser's CAS
+      // fails because the winner already moved the status.
+      //
+      // Deliberately NOT `SELECT ... FOR UPDATE SKIP LOCKED`: that would hold
+      // a row lock across `enqueueWakeup`, which opens its own transactions on
+      // other connections, inviting pool starvation and lock-order deadlock on
+      // a path whose whole purpose is recovering from failure.
+      const claimed = await db
+        .update(agentWakeupRequests)
+        .set({ status: "dispatch_retrying", claimedAt: now, updatedAt: now })
+        .where(
+          and(
+            eq(agentWakeupRequests.id, row.id),
+            eq(agentWakeupRequests.status, row.status),
+          ),
+        )
+        .returning({ id: agentWakeupRequests.id });
+      if (claimed.length === 0) {
+        logger.debug(
+          { wakeupRequestId: row.id, agentId: row.agentId },
+          "wake dispatch row was claimed by a concurrent reconciler pass; skipping (BLO-25726)",
+        );
+        continue;
+      }
+
       const payload = parseObject(row.payload);
       const retryState = parseObject(payload.dispatchRetry) as {
         attempts?: number;
@@ -32671,7 +32907,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         dependencyBlockedRetryAt: null,
       };
       try {
-        const recoveredRun = await enqueueWakeup(row.agentId, originalOpts, suppression);
+        // BLO-25726: this is a REdelivery -- the wake was attempted at least
+        // once already, and a prior attempt may have committed a run before
+        // dying without retiring this row (the crash-after-commit window; the
+        // claim lease above deliberately re-selects such a row rather than
+        // stranding it). Opting into the enqueue-time claim is what makes the
+        // re-drive return that run instead of committing a second one.
+        const recoveredRun = await enqueueWakeup(
+          row.agentId,
+          {
+            ...originalOpts,
+            dedupeOnIdempotencyKey: true,
+            // This marker's own creation time bounds the claim, so a recurring
+            // key's older, unrelated delivery cannot suppress this one.
+            dedupeDeliveredSince: row.requestedAt,
+          },
+          suppression,
+        );
         if (!recoveredRun) {
           // enqueueWakeup declined the wake rather than failing it: it wrote a
           // status="skipped" row and returned null. Marking the original row
@@ -32792,6 +33044,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         await db
           .update(agentWakeupRequests)
           .set({
+            // Re-arm explicitly. The claim above moved this row to
+            // `dispatch_retrying`, and the due-rows query's fast path only
+            // selects `dispatch_failed` -- leaving the status alone here would
+            // park the row until its 10-minute lease expired, turning every
+            // transient failure into a 10-minute stall (BLO-25726).
+            status: "dispatch_failed",
+            claimedAt: null,
             payload: {
               ...payload,
               dispatchRetry: {

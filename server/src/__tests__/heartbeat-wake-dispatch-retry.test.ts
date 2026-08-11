@@ -1416,4 +1416,290 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
       });
     });
   });
+
+  // BLO-25726: wake delivery was not idempotent at enqueue time. Three distinct
+  // ways one wake became two agent runs, each covered below. Every assertion
+  // here counts `heartbeat_runs` rows, not `agent_wakeup_requests` rows -- the
+  // defect is a duplicate RUN (an agent actually executing twice); a duplicate
+  // bookkeeping row would be harmless.
+  describe("enqueue-time wake idempotency (BLO-25726)", () => {
+    async function runsForAgent(agentId: string) {
+      return db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+    }
+
+    it("does not re-enter enqueue when acknowledgement is lost after the run commits", async () => {
+      // Fails once, inside enqueueWakeup's post-commit window: the run and its
+      // wake row are already durable, and only the acknowledgement is lost.
+      // Before the fix this propagated into wakeupWithDispatchRetry's catch,
+      // which re-ran the WHOLE enqueue -- re-evaluating every scheduling gate
+      // and reporting a committed run as a failed dispatch.
+      //
+      // Scope note, established by running this against a control with only the
+      // guard reverted: the second enqueue does NOT produce a second run today,
+      // because wake coalescing merges it into the still-`queued` first run.
+      // So the guard's value is not "prevents a duplicate run" in this shape --
+      // it is that a committed run stops being re-driven and mislabelled. The
+      // discriminating observable is therefore the coalesce counter: reverting
+      // the guard bumps it, because a redundant second enqueue really happened.
+      const { agentId } = await seedCompanyAndAgent();
+      let injected = 0;
+      const lossyHeartbeat = heartbeatService(db, {
+        skipQueuedRunDispatch: true,
+        failAfterQueuedRunCommitForTest: () => {
+          injected += 1;
+          if (injected === 1) throw new Error("simulated post-commit acknowledgement loss (BLO-25726)");
+        },
+      });
+
+      const run = await lossyHeartbeat.wakeup(agentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "github_pr_opened",
+        payload: { taskKey: "pr_review:Blockcast/test#25726" },
+      });
+
+      expect(injected).toBe(1);
+      // The wake still succeeds: the run is committed, so reporting failure
+      // would be a lie that also re-drives work already done.
+      expect(run).not.toBeNull();
+      expect(await runsForAgent(agentId)).toHaveLength(1);
+
+      const wakeRows = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.agentId, agentId));
+      // Exactly one wake row == exactly one enqueue pass ran. Reverting the
+      // guard makes this 2: the retry re-enters enqueue and the coalesce arms
+      // record their own row (`status: "coalesced"`) beside the original
+      // `queued` one. Counting every row rather than only the `queued` one
+      // matters -- an earlier version of this assertion filtered to `queued`,
+      // passed against the control, and proved nothing.
+      expect(wakeRows).toHaveLength(1);
+      expect(wakeRows[0]?.status).toBe("queued");
+      expect(wakeRows[0]?.coalescedCount ?? 0).toBe(0);
+      // Nothing was recorded as needing recovery -- there is nothing to recover.
+      expect(wakeRows.some((r) => r.status === "dispatch_failed")).toBe(false);
+    });
+
+    it("dispatches once when two concurrent reconciler passes race over one dispatch_failed row", async () => {
+      // The heartbeat scheduler is not leader-elected and is not gated on
+      // paperclipNodeRole, so it runs on every replica (paperclip-api is
+      // deployed at 2). Before the claim CAS, both replicas selected the same
+      // due row and both re-dispatched it.
+      //
+      // The interleaving is forced rather than hoped for: `Promise.all` over two
+      // passes does NOT reproduce this, because the first pass reliably finishes
+      // before the second one runs its select, so such a test passes with the
+      // claim deleted. `beforeWakeDispatchClaimForTest` pins the ordering --
+      // pass A has already selected the row, and pass B then runs to completion
+      // before A attempts its claim.
+      const { agentId, companyId } = await seedCompanyAndAgent();
+      const now = new Date();
+      await db.insert(agentWakeupRequests).values({
+        id: randomUUID(),
+        companyId,
+        agentId,
+        source: "automation",
+        triggerDetail: "system",
+        reason: "github_pr_opened",
+        payload: {
+          dispatchRetry: {
+            attempts: 1,
+            nextAttemptAt: new Date(now.getTime() - 1000).toISOString(),
+            originalOpts: {
+              source: "automation",
+              triggerDetail: "system",
+              reason: "github_pr_opened",
+              payload: { taskKey: "pr_review:Blockcast/test#25726-race" },
+            },
+          },
+        },
+        status: "dispatch_failed",
+      });
+
+      // Pass B: an ordinary reconciler, standing in for the other replica.
+      const passB = heartbeatService(db, { skipQueuedRunDispatch: true });
+      let interleaved = 0;
+      let passBResult: Awaited<ReturnType<typeof passB.reconcileFailedWakeDispatches>> | null = null;
+      const passA = heartbeatService(db, {
+        skipQueuedRunDispatch: true,
+        beforeWakeDispatchClaimForTest: async () => {
+          if (interleaved > 0) return;
+          interleaved += 1;
+          passBResult = await passB.reconcileFailedWakeDispatches(now);
+        },
+      });
+
+      const passAResult = await passA.reconcileFailedWakeDispatches(now);
+
+      expect(interleaved).toBe(1);
+      // Both passes saw the row as due; exactly one of them owned it.
+      expect(passBResult!.recovered).toBe(1);
+      expect(passAResult.recovered).toBe(0);
+      expect(await runsForAgent(agentId)).toHaveLength(1);
+      // One re-dispatch == one new wake row beside the original marker.
+      const wakeRows = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.agentId, agentId));
+      expect(wakeRows).toHaveLength(2);
+    });
+
+    it("returns the already-delivered run instead of a second one when a redelivery repeats an idempotency key", async () => {
+      // The crash-after-commit window: a prior reconciler pass committed a run
+      // and died before retiring its row, so the row is still selectable. The
+      // claim lease deliberately re-selects such a row rather than stranding
+      // it, which makes the enqueue-time key check the thing that has to stop
+      // the duplicate.
+      const { agentId, companyId } = await seedCompanyAndAgent();
+      const now = new Date();
+      const idempotencyKey = "detached_queued_run_recovery:blo-25726-fixture";
+      // Explicit timestamps, because the claim is bounded by them and insert
+      // order must not be what the assertion secretly depends on. Real
+      // ordering: the marker is recorded when the attempt first fails (markerAt),
+      // and the run that leaked out of a later pass is recorded after it.
+      const markerAt = new Date(now.getTime() - 5 * 60_000);
+      const deliveredAt = new Date(now.getTime() - 60_000);
+
+      const deliveredRunId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: deliveredRunId,
+        companyId,
+        agentId,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status: "queued",
+        responsibleUserId: "responsible-user",
+      });
+      // The prior delivery, still live (`queued`) and pointing at that run.
+      await db.insert(agentWakeupRequests).values({
+        id: randomUUID(),
+        companyId,
+        agentId,
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_assigned",
+        status: "queued",
+        idempotencyKey,
+        runId: deliveredRunId,
+        requestedAt: deliveredAt,
+      });
+      // The un-retired marker the reconciler will now re-drive.
+      const staleMarkerId = randomUUID();
+      await db.insert(agentWakeupRequests).values({
+        id: staleMarkerId,
+        companyId,
+        agentId,
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_assigned",
+        payload: {
+          dispatchRetry: {
+            attempts: 1,
+            nextAttemptAt: new Date(now.getTime() - 1000).toISOString(),
+            originalOpts: {
+              source: "automation",
+              triggerDetail: "system",
+              reason: "issue_assigned",
+              idempotencyKey,
+              payload: { taskKey: "issue:BLO-25726" },
+            },
+          },
+        },
+        status: "dispatch_failed",
+        idempotencyKey,
+        requestedAt: markerAt,
+      });
+
+      const result = await heartbeat.reconcileFailedWakeDispatches(now);
+
+      // Recovered, because the wake genuinely IS delivered -- just by the
+      // earlier attempt. The marker must be retired either way, or it is
+      // re-driven forever.
+      expect(result.recovered).toBe(1);
+      const [marker] = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, staleMarkerId));
+      expect(marker?.status).toBe("dispatch_recovered");
+      // The whole point: still one run, and it is the original.
+      const runs = await runsForAgent(agentId);
+      expect(runs).toHaveLength(1);
+      expect(runs[0]?.id).toBe(deliveredRunId);
+    });
+
+    it("does NOT suppress a recurring key whose earlier delivery predates this marker", async () => {
+      // Guards the deliberate scoping of the claim, in the dimension that is
+      // easy to get wrong. `issues.ts` mints
+      // `blockers_resolved:<blockerId>:<dependentId>` with no event-instance or
+      // time component, so that exact key legitimately recurs every time the
+      // blocker is re-added and re-resolved. An unbounded claim would match the
+      // FIRST delivery's long-completed row and suppress the second, real wake
+      // forever -- under-wake, which is worse than the bounded over-wake this
+      // issue removes.
+      const { agentId, companyId } = await seedCompanyAndAgent();
+      const now = new Date();
+      const recurringKey = "blockers_resolved:blocker-1:dependent-1";
+
+      // An old, completed delivery under the same key.
+      const oldRunId = randomUUID();
+      const longAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+      await db.insert(heartbeatRuns).values({
+        id: oldRunId,
+        companyId,
+        agentId,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status: "completed",
+        responsibleUserId: "responsible-user",
+      });
+      await db.insert(agentWakeupRequests).values({
+        id: randomUUID(),
+        companyId,
+        agentId,
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_blockers_resolved",
+        status: "completed",
+        idempotencyKey: recurringKey,
+        runId: oldRunId,
+        requestedAt: longAgo,
+      });
+
+      // A NEW delivery of the same key that failed and is now being re-driven.
+      const markerId = randomUUID();
+      await db.insert(agentWakeupRequests).values({
+        id: markerId,
+        companyId,
+        agentId,
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_blockers_resolved",
+        payload: {
+          dispatchRetry: {
+            attempts: 1,
+            nextAttemptAt: new Date(now.getTime() - 1000).toISOString(),
+            originalOpts: {
+              source: "automation",
+              triggerDetail: "system",
+              reason: "issue_blockers_resolved",
+              idempotencyKey: recurringKey,
+              payload: { taskKey: "issue:BLO-25726-recurring" },
+            },
+          },
+        },
+        status: "dispatch_failed",
+        idempotencyKey: recurringKey,
+        requestedAt: now,
+      });
+
+      const result = await heartbeat.reconcileFailedWakeDispatches(now);
+      expect(result.recovered).toBe(1);
+
+      // A genuinely new run, not the 30-day-old one.
+      const runs = await runsForAgent(agentId);
+      expect(runs).toHaveLength(2);
+      expect(runs.some((r) => r.id !== oldRunId && r.status === "queued")).toBe(true);
+    });
+  });
 });
