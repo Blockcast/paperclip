@@ -13234,15 +13234,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // for the whole of recovery. Capture whether it landed: reporting `created`
       // while this matched zero rows is what let recovery record that the retry
       // owned a lock it never acquired.
+      //
+      // MERGE NOTE (master -> this branch, BLO-21526 chain): master's copy of
+      // this block *releases* the lock (sets all four columns null) under its
+      // lazy-locking model, where a queued run owns no lock and acquires one at
+      // checkout. This branch *hands the lock over* to the retry. The textual
+      // merge silently spliced master's null-setting body into this branch's
+      // wrapper, producing an update that released the lock while still
+      // reporting `issueLockTransferred` — caught by the four
+      // "does not release the issue execution lock ..." tests in
+      // heartbeat-worker-crash-marking.test.ts. Restored to this branch's
+      // reviewed behaviour so the merge changes no semantics on either side;
+      // which model should survive is a real design question for this PR's
+      // review, not something a merge-forward should decide.
       let issueLockTransferred = false;
       if (issueId) {
         const transferred = await tx
           .update(issues)
           .set({
             checkoutRunId: null,
-            executionRunId: null,
-            executionAgentNameKey: null,
-            executionLockedAt: null,
+            executionRunId: retryRun.id,
+            executionAgentNameKey: normalizeAgentNameKey(agent.name),
+            executionLockedAt: now,
             updatedAt: now,
           })
           .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId), eq(issues.executionRunId, run.id)))

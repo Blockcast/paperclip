@@ -185,6 +185,10 @@ vi.mock("@paperclipai/db", () => ({
   inspectMigrations: vi.fn(async () => ({ status: "upToDate" })),
   applyPendingMigrations: vi.fn(),
   reconcilePendingMigrationHistory: vi.fn(async () => ({ repairedMigrations: [] })),
+  // `ensureMigrations` calls this on every startup, including "already applied"
+  // (BLO-21526). Without it in the mock every test that reaches `startServer`
+  // dies on "No export is defined on the @paperclipai/db mock".
+  ensurePendingConcurrentIndexes: vi.fn(async () => []),
   formatDatabaseBackupResult: vi.fn(() => "ok"),
   runDatabaseBackup: vi.fn(),
   authUsers: {},
