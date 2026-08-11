@@ -80,11 +80,14 @@ import {
 import {
   defaultIssueExecutionWorkspaceSettingsForProject,
   gateProjectExecutionWorkspacePolicy,
+  hasReusableExecutionWorkspaceBinding,
   issueExecutionWorkspaceModeForPersistedWorkspace,
   isUnrunnableWorktreeCombo,
   parseIssueExecutionWorkspaceSettings,
   parseProjectExecutionWorkspacePolicy,
   resolvePinnedIssueWorkspaceStrategyType,
+  WORKSPACE_PREFLIGHT_BLOCKED_ACTIVITY_ACTION,
+  WORKSPACE_PREFLIGHT_STATE_ACTIVITY_ACTIONS,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION,
@@ -282,7 +285,7 @@ function recordBlockedPromotionAwaitingUserSkip(input: {
   commentId: string;
   commentCreatedAt: Date;
   reason: string;
-  triggerPath: "blocker_done" | "resolved_blocker_sweep";
+  triggerPath: BlockedIssueAutoResumeTriggerPath;
 }) {
   const details = {
     event: BLOCKED_PROMOTION_AWAITING_USER_EVENT,
@@ -931,6 +934,23 @@ export type IssueDependencyReadiness = {
   allBlockersDone: boolean;
   isDependencyReady: boolean;
 };
+export type BlockedIssueAutoResumeSuppressionReason =
+  | "pending_interaction"
+  | "pending_approval"
+  | "latest_agent_comment_awaiting_user"
+  | "executive_hold"
+  | "workspace_preflight_blocked"
+  | "active_recovery_action"
+  | "monitor_gate"
+  | "convergence_stalled";
+export type BlockedIssueAutoResumeSuppression = {
+  issueId: string;
+  reason: BlockedIssueAutoResumeSuppressionReason;
+};
+export type BlockedIssueAutoResumeTriggerPath =
+  | "blocker_done"
+  | "resolved_blocker_sweep"
+  | "stranded_blocked_reconciler";
 export type ChildIssueCompletionSummary = {
   id: string;
   identifier: string | null;
@@ -1363,7 +1383,7 @@ export async function runWorkspaceIsFinalized(
   return latest.phase === "workspace_finalize" && latest.status === "succeeded";
 }
 
-async function listIssueDependencyReadinessMap(
+export async function listIssueDependencyReadinessMap(
   dbOrTx: Pick<Db, "select">,
   companyId: string,
   issueIds: string[],
@@ -3601,6 +3621,224 @@ export function findActiveExecutiveHold(
       : null;
   }
   return null;
+}
+
+export async function listBlockedIssueAutoResumeSuppressions(
+  dbOrTx: Pick<Db, "select">,
+  companyId: string,
+  issueIds: string[],
+  options: { triggerPath?: BlockedIssueAutoResumeTriggerPath } = {},
+): Promise<Map<string, BlockedIssueAutoResumeSuppression>> {
+  const uniqueIssueIds = [...new Set(issueIds.filter(Boolean))];
+  const suppressions = new Map<string, BlockedIssueAutoResumeSuppression>();
+  if (uniqueIssueIds.length === 0) return suppressions;
+
+  const addSuppression = (issueId: string, reason: BlockedIssueAutoResumeSuppressionReason) => {
+    if (suppressions.has(issueId)) return false;
+    suppressions.set(issueId, { issueId, reason });
+    return true;
+  };
+
+  const pendingInteractionRows = await dbOrTx
+    .select({ issueId: issueThreadInteractions.issueId })
+    .from(issueThreadInteractions)
+    .where(
+      and(
+        eq(issueThreadInteractions.companyId, companyId),
+        inArray(issueThreadInteractions.issueId, uniqueIssueIds),
+        inArray(issueThreadInteractions.status, BLOCKER_ATTENTION_PENDING_INTERACTION_STATUSES),
+      ),
+    );
+  for (const row of pendingInteractionRows) addSuppression(row.issueId, "pending_interaction");
+
+  const pendingApprovalRows = await dbOrTx
+    .select({ issueId: issueApprovals.issueId })
+    .from(issueApprovals)
+    .innerJoin(approvals, eq(issueApprovals.approvalId, approvals.id))
+    .where(
+      and(
+        eq(issueApprovals.companyId, companyId),
+        inArray(issueApprovals.issueId, uniqueIssueIds),
+        inArray(approvals.status, BLOCKER_ATTENTION_PENDING_APPROVAL_STATUSES),
+      ),
+    );
+  for (const row of pendingApprovalRows) addSuppression(row.issueId, "pending_approval");
+
+  const awaitingUserInputByIssueId = await findBlockedPromotionsAwaitingUserInput(
+    dbOrTx,
+    companyId,
+    uniqueIssueIds,
+  );
+  for (const [issueId, awaitingUserInput] of awaitingUserInputByIssueId) {
+    if (!addSuppression(issueId, "latest_agent_comment_awaiting_user")) continue;
+    if (options.triggerPath) {
+      recordBlockedPromotionAwaitingUserSkip({
+        issueId,
+        ...awaitingUserInput,
+        triggerPath: options.triggerPath,
+      });
+    }
+  }
+
+  const commentRows = await dbOrTx
+    .select({
+      id: issueComments.id,
+      issueId: issueComments.issueId,
+      body: issueComments.body,
+      createdAt: issueComments.createdAt,
+      authorRole: agents.role,
+    })
+    .from(issueComments)
+    .leftJoin(agents, eq(agents.id, issueComments.authorAgentId))
+    .where(and(eq(issueComments.companyId, companyId), inArray(issueComments.issueId, uniqueIssueIds)))
+    .orderBy(desc(issueComments.createdAt));
+
+  const commentsByIssueId = new Map<string, typeof commentRows>();
+  for (const row of commentRows) {
+    const list = commentsByIssueId.get(row.issueId) ?? [];
+    list.push(row);
+    commentsByIssueId.set(row.issueId, list);
+  }
+
+  const now = new Date();
+  for (const issueId of uniqueIssueIds) {
+    const hold = findActiveExecutiveHold(commentsByIssueId.get(issueId) ?? [], now);
+    if (hold && addSuppression(issueId, "executive_hold")) {
+      logger.debug(
+        { issueId, until: hold.until.toISOString(), holdCommentId: hold.commentId },
+        `blocked_issue_auto_resume: suppressed for issue=${issueId} until=${hold.until.toISOString()} hold_comment=${hold.commentId}`,
+      );
+    }
+  }
+
+  // The latest blocked/cleared activity is the durable preflight state, like
+  // successful-run handoff activity. Older failures remain audit history. A
+  // still-blocked state is also rechecked against the two documented operator
+  // remediations, so a direct project/workspace repair cannot be held hostage
+  // by an earlier event while the retry is being scheduled.
+  const workspacePreflightRows = await dbOrTx
+    .select({ issueId: activityLog.entityId, action: activityLog.action })
+    .from(activityLog)
+    .where(
+      and(
+        eq(activityLog.companyId, companyId),
+        eq(activityLog.entityType, "issue"),
+        inArray(activityLog.action, WORKSPACE_PREFLIGHT_STATE_ACTIVITY_ACTIONS),
+        inArray(activityLog.entityId, uniqueIssueIds),
+      ),
+    )
+    .orderBy(desc(activityLog.createdAt), desc(activityLog.id));
+  const latestWorkspacePreflightStateByIssueId = new Map<string, string>();
+  for (const row of workspacePreflightRows) {
+    if (!latestWorkspacePreflightStateByIssueId.has(row.issueId)) {
+      latestWorkspacePreflightStateByIssueId.set(row.issueId, row.action);
+    }
+  }
+  const workspacePreflightIssueIds = [...latestWorkspacePreflightStateByIssueId]
+    .filter(([, action]) => action === WORKSPACE_PREFLIGHT_BLOCKED_ACTIVITY_ACTION)
+    .map(([issueId]) => issueId);
+  if (workspacePreflightIssueIds.length > 0) {
+    const workspaceStateRows = await dbOrTx
+      .select({
+        id: issues.id,
+        projectId: issues.projectId,
+        projectWorkspaceId: issues.projectWorkspaceId,
+        executionWorkspaceId: issues.executionWorkspaceId,
+        executionWorkspacePreference: issues.executionWorkspacePreference,
+      })
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), inArray(issues.id, workspacePreflightIssueIds)));
+    const reusableExecutionWorkspaceIds = [...new Set(
+      workspaceStateRows.flatMap((row) =>
+        hasReusableExecutionWorkspaceBinding({
+          executionWorkspaceId: row.executionWorkspaceId,
+          executionWorkspacePreference: row.executionWorkspacePreference,
+        }) && row.executionWorkspaceId
+          ? [row.executionWorkspaceId]
+          : []),
+    )];
+    const liveReusableExecutionWorkspaceIds = new Set<string>();
+    if (reusableExecutionWorkspaceIds.length > 0) {
+      const workspaceRows = await dbOrTx
+        .select({ id: executionWorkspaces.id, status: executionWorkspaces.status })
+        .from(executionWorkspaces)
+        .where(and(
+          eq(executionWorkspaces.companyId, companyId),
+          inArray(executionWorkspaces.id, reusableExecutionWorkspaceIds),
+        ));
+      for (const workspace of workspaceRows) {
+        if (workspace.status !== "archived") {
+          liveReusableExecutionWorkspaceIds.add(workspace.id);
+        }
+      }
+    }
+    for (const row of workspaceStateRows) {
+      const hasLiveReusableExecutionWorkspace =
+        row.executionWorkspaceId !== null &&
+        hasReusableExecutionWorkspaceBinding({
+          executionWorkspaceId: row.executionWorkspaceId,
+          executionWorkspacePreference: row.executionWorkspacePreference,
+        }) &&
+        liveReusableExecutionWorkspaceIds.has(row.executionWorkspaceId);
+      const stillUnresolved =
+        !row.projectId &&
+        !row.projectWorkspaceId &&
+        !hasLiveReusableExecutionWorkspace;
+      if (stillUnresolved) addSuppression(row.id, "workspace_preflight_blocked");
+    }
+  }
+
+  const recoveryRows = await dbOrTx
+    .select({ issueId: issueRecoveryActions.sourceIssueId })
+    .from(issueRecoveryActions)
+    .where(
+      and(
+        eq(issueRecoveryActions.companyId, companyId),
+        inArray(issueRecoveryActions.sourceIssueId, uniqueIssueIds),
+        inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
+      ),
+    );
+  for (const row of recoveryRows) {
+    if (row.issueId) addSuppression(row.issueId, "active_recovery_action");
+  }
+
+  const monitorRows = await dbOrTx
+    .select({
+      id: issues.id,
+      hasGateSignals: sql<boolean>`
+        COALESCE(
+          CASE
+            WHEN jsonb_typeof(${issues.executionState} -> 'monitor' -> 'gateSignals') = 'array'
+              THEN jsonb_array_length(${issues.executionState} -> 'monitor' -> 'gateSignals')
+            ELSE 0
+          END,
+          0
+        ) > 0
+      `,
+      isConvergenceStalled: sql<boolean>`
+        COALESCE(${issues.executionState} -> 'monitor' ->> 'clearReason', '') = 'convergence_stalled'
+        OR COALESCE(
+          CASE
+            WHEN (${issues.executionState} -> 'monitor' ->> 'convergenceStallCount') ~ '^-?[0-9]+$'
+              THEN (${issues.executionState} -> 'monitor' ->> 'convergenceStallCount')::int
+            ELSE 0
+          END,
+          0
+        ) > 0
+        OR (${issues.executionState} -> 'monitor' ->> 'convergenceStalledAssigneeAgentId') IS NOT NULL
+      `,
+    })
+    .from(issues)
+    .where(and(eq(issues.companyId, companyId), inArray(issues.id, uniqueIssueIds)));
+  for (const row of monitorRows) {
+    if (row.hasGateSignals) {
+      addSuppression(row.id, "monitor_gate");
+    } else if (row.isConvergenceStalled) {
+      addSuppression(row.id, "convergence_stalled");
+    }
+  }
+
+  return suppressions;
 }
 
 const BLOCKED_INBOX_TERMINAL_STATUSES = ["done", "cancelled"] as const;
@@ -7538,61 +7776,15 @@ export function issueService(db: Db) {
       const blockedCandidateIds = withReadiness
         .filter(({ candidate }) => candidate.status === "blocked")
         .map(({ candidate }) => candidate.id);
-
-      const suppressedIssueIds = new Set<string>();
-      if (blockedCandidateIds.length > 0) {
-        const awaitingUserInputByIssueId = await findBlockedPromotionsAwaitingUserInput(
-          db,
-          blockerIssue.companyId,
-          blockedCandidateIds,
-        );
-        for (const [issueId, awaitingUserInput] of awaitingUserInputByIssueId) {
-          suppressedIssueIds.add(issueId);
-          recordBlockedPromotionAwaitingUserSkip({
-            issueId,
-            ...awaitingUserInput,
-            triggerPath: "blocker_done",
-          });
-        }
-
-        const commentRows = await db
-          .select({
-            id: issueComments.id,
-            issueId: issueComments.issueId,
-            body: issueComments.body,
-            createdAt: issueComments.createdAt,
-            authorRole: agents.role,
-          })
-          .from(issueComments)
-          .leftJoin(agents, eq(agents.id, issueComments.authorAgentId))
-          .where(
-            and(
-              eq(issueComments.companyId, blockerIssue.companyId),
-              inArray(issueComments.issueId, blockedCandidateIds),
-            ),
-          )
-          .orderBy(desc(issueComments.createdAt));
-
-        const commentsByIssueId = new Map<string, typeof commentRows>();
-        for (const row of commentRows) {
-          const list = commentsByIssueId.get(row.issueId) ?? [];
-          list.push(row);
-          commentsByIssueId.set(row.issueId, list);
-        }
-
-        const now = new Date();
-        for (const issueId of blockedCandidateIds) {
-          const candidateComments = commentsByIssueId.get(issueId) ?? [];
-          const hold = findActiveExecutiveHold(candidateComments, now);
-          if (hold) {
-            suppressedIssueIds.add(issueId);
-            logger.debug(
-              { issueId, until: hold.until.toISOString(), holdCommentId: hold.commentId },
-              `blockers_resolved_sweep: suppressed for issue=${issueId} until=${hold.until.toISOString()} hold_comment=${hold.commentId}`,
-            );
-          }
-        }
-      }
+      const suppressedIssueIds = blockedCandidateIds.length === 0
+        ? new Set<string>()
+        : new Set(
+            (
+              await listBlockedIssueAutoResumeSuppressions(db, blockerIssue.companyId, blockedCandidateIds, {
+                triggerPath: "blocker_done",
+              })
+            ).keys(),
+          );
 
       return withReadiness
         .filter(({ candidate }) => !suppressedIssueIds.has(candidate.id))
@@ -7834,69 +8026,12 @@ export function issueService(db: Db) {
         ids.push(issueId);
         blockedResultIdsByCompanyId.set(candidateCompanyId, ids);
       }
-      const awaitingUserInputByIssueId = new Map<string, {
-        commentId: string;
-        commentCreatedAt: Date;
-        reason: string;
-      }>();
+      const suppressedIssueIds = new Set<string>();
       for (const [candidateCompanyId, issueIds] of blockedResultIdsByCompanyId) {
-        const companyResults = await findBlockedPromotionsAwaitingUserInput(db, candidateCompanyId, issueIds);
-        for (const [issueId, awaitingUserInput] of companyResults) {
-          awaitingUserInputByIssueId.set(issueId, awaitingUserInput);
-        }
-      }
-      for (const [issueId, awaitingUserInput] of awaitingUserInputByIssueId) {
-        recordBlockedPromotionAwaitingUserSkip({
-          issueId,
-          ...awaitingUserInput,
+        const companySuppressions = await listBlockedIssueAutoResumeSuppressions(db, candidateCompanyId, issueIds, {
           triggerPath: "resolved_blocker_sweep",
         });
-      }
-
-      const pendingConfirmationRows = await db
-        .select({ issueId: issueThreadInteractions.issueId })
-        .from(issueThreadInteractions)
-        .where(and(
-          inArray(issueThreadInteractions.issueId, blockedResultIds),
-          eq(issueThreadInteractions.kind, "request_confirmation"),
-          eq(issueThreadInteractions.status, "pending"),
-        ));
-      const suppressedIssueIds = new Set<string>([
-        ...pendingConfirmationRows.map((row) => row.issueId),
-        ...awaitingUserInputByIssueId.keys(),
-      ]);
-
-      const commentRows = await db
-        .select({
-          id: issueComments.id,
-          issueId: issueComments.issueId,
-          body: issueComments.body,
-          createdAt: issueComments.createdAt,
-          authorRole: agents.role,
-        })
-        .from(issueComments)
-        .leftJoin(agents, eq(agents.id, issueComments.authorAgentId))
-        .where(inArray(issueComments.issueId, blockedResultIds))
-        .orderBy(desc(issueComments.createdAt));
-
-      const commentsByIssueId = new Map<string, typeof commentRows>();
-      for (const row of commentRows) {
-        const list = commentsByIssueId.get(row.issueId) ?? [];
-        list.push(row);
-        commentsByIssueId.set(row.issueId, list);
-      }
-
-      const now = new Date();
-      for (const issueId of blockedResultIds) {
-        const candidateComments = commentsByIssueId.get(issueId) ?? [];
-        const hold = findActiveExecutiveHold(candidateComments, now);
-        if (hold) {
-          suppressedIssueIds.add(issueId);
-          logger.debug(
-            { issueId, until: hold.until.toISOString(), holdCommentId: hold.commentId },
-            `blockers_resolved_sweep: suppressed for issue=${issueId} until=${hold.until.toISOString()} hold_comment=${hold.commentId}`,
-          );
-        }
+        for (const issueId of companySuppressions.keys()) suppressedIssueIds.add(issueId);
       }
       return suppressedIssueIds.size === 0
         ? resultsAfterExplicitWaitingSuppression
