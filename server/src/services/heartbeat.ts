@@ -208,6 +208,11 @@ import {
   TERMINAL_HEARTBEAT_RUN_STATUS_VALUES,
   TERMINAL_HEARTBEAT_RUN_STATUSES,
 } from "./issue-execution-lock.js";
+import {
+  releaseIssueRunOwnership,
+  restoreCheckoutPromotedStatus,
+  restoreCheckoutPromotedStatuses,
+} from "./issue-checkout-status.js";
 import { resolveStaleDependabotAlertWakeIssue } from "./dependabot-alert-issues.js";
 import { createToolGatewayService } from "./tool-gateway.js";
 import { toolAccessService } from "./tool-access.js";
@@ -11789,11 +11794,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   async function handleRunLivenessContinuation(run: typeof heartbeatRuns.$inferSelect) {
     const livenessState = run.livenessState as RunLivenessState | null;
-    if (livenessState !== "plan_only" && livenessState !== "empty_response") return;
+    if (livenessState !== "plan_only" && livenessState !== "empty_response") return false;
 
     const context = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(context.issueId);
-    if (!issueId) return;
+    if (!issueId) return false;
 
     const [issue, agent] = await Promise.all([
       db
@@ -11848,7 +11853,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           trigger: productivityHold.trigger,
           reason: productivityHold.reason,
         });
-        return;
+        return false;
       }
     }
 
@@ -11888,10 +11893,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         issueId,
         comment: decision.comment,
       });
-      return;
+      return false;
     }
 
-    if (decision.kind !== "enqueue") return;
+    if (decision.kind !== "enqueue") return Boolean(existingWake);
 
     const continuationRun = await enqueueWakeup(run.agentId, {
       source: "automation",
@@ -11913,6 +11918,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         })
         .where(eq(heartbeatRuns.id, run.id));
     }
+    return Boolean(continuationRun);
   }
 
   function issueUiLink(issue: Pick<typeof issues.$inferSelect, "id" | "identifier">) {
@@ -11987,10 +11993,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   async function handleSuccessfulRunHandoff(run: typeof heartbeatRuns.$inferSelect, agent: typeof agents.$inferSelect) {
-    if (run.status !== "succeeded") return;
+    if (run.status !== "succeeded") return false;
     const context = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(context.issueId) ?? readNonEmptyString(context.taskId);
-    if (!issueId) return;
+    if (!issueId) return false;
 
     const issue = await db
       .select({
@@ -12202,7 +12208,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
     }
 
-    if (decision.kind !== "enqueue" || !issue) return;
+    if (decision.kind !== "enqueue" || !issue) {
+      return Boolean(activeExecutionPath || queuedWake || existingWake);
+    }
 
     if (hasUnmanagedBackgroundTaskEvidence(parseObject(run.resultJson))) {
       await db
@@ -12225,7 +12233,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       requestedByActorType: "system",
       requestedByActorId: "heartbeat",
     });
-    if (!handoffRun) return;
+    if (!handoffRun) return false;
 
     await addSuccessfulRunHandoffCommentOnce({
       issue,
@@ -12252,6 +12260,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         issue: issueUiLink(issue),
       },
     });
+    return true;
   }
 
   async function appendRunEvent(
@@ -13496,6 +13505,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             eq(issues.executionRunId, cancelled.id),
           ),
         );
+      // The gate cancelled this run before it could do anything, so undo the
+      // `in_progress` its checkout wrote (BLO-20649).
+      await restoreCheckoutPromotedStatus(db, {
+        issueId: gate.issueId,
+        companyId: cancelled.companyId,
+      });
     }
 
     await appendRunEvent(cancelled, await nextRunEventSeq(cancelled.id), {
@@ -13847,6 +13862,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                   updatedAt: now,
                 })
                 .where(and(eq(issues.id, depIssueId), eq(issues.executionRunId, exhausted.id)));
+              // Retry budget is spent and no run will resume this issue, so the
+              // checkout promotion has to come back off (BLO-20649).
+              await restoreCheckoutPromotedStatus(db, {
+                issueId: depIssueId,
+                companyId: exhausted.companyId,
+              });
             }
             return { outcome: "not_promoted", run: exhausted };
           }
@@ -15755,21 +15776,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       error: reason,
     });
 
-    await db
-      .update(issues)
-      .set({
-        executionRunId: null,
-        executionAgentNameKey: null,
-        executionLockedAt: null,
-        updatedAt: now,
-      })
-      .where(
-        and(
-          eq(issues.companyId, run.companyId),
-          eq(issues.id, issueId),
-          eq(issues.executionRunId, run.id),
-        ),
-      );
+    await releaseIssueRunOwnership(db, {
+      issueId,
+      companyId: run.companyId,
+      runId: run.id,
+      updatedAt: now,
+    });
+    // The run was cancelled before it could advance anything, so undo the
+    // `in_progress` its checkout wrote (BLO-20649).
+    await restoreCheckoutPromotedStatus(db, { issueId, companyId: run.companyId });
 
     await appendRunEvent(cancelled, await nextRunEventSeq(cancelled.id), {
       eventType: "lifecycle",
@@ -15990,21 +16005,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       error: staleness.reason,
     });
 
-    await db
-      .update(issues)
-      .set({
-        executionRunId: null,
-        executionAgentNameKey: null,
-        executionLockedAt: null,
-        updatedAt: now,
-      })
-      .where(
-        and(
-          eq(issues.companyId, run.companyId),
-          eq(issues.id, issueId),
-          eq(issues.executionRunId, run.id),
-        ),
-      );
+    await releaseIssueRunOwnership(db, {
+      issueId,
+      companyId: run.companyId,
+      runId: run.id,
+      updatedAt: now,
+    });
+    // The run was cancelled before it could advance anything, so undo the
+    // `in_progress` its checkout wrote (BLO-20649).
+    await restoreCheckoutPromotedStatus(db, { issueId, companyId: run.companyId });
 
     await appendRunEvent(cancelled, await nextRunEventSeq(cancelled.id), {
       eventType: "lifecycle",
@@ -17019,10 +17028,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       errorCode: terminalOutcome.errorCode,
       runId: input.run.id,
     });
-    const promotedRunDispatched = await releaseIssueExecutionAndPromote(finalizedRun);
-    await handleRunLivenessContinuation(finalizedRun);
+    const deferredCheckoutRestoreIssueId = finalizedRun.status === "succeeded"
+      ? issueIdFromRunContext(finalizedRun.contextSnapshot) ?? null
+      : null;
+    const promotedRunDispatched = await releaseIssueExecutionAndPromote(finalizedRun, {
+      deferPrimaryCheckoutRestoration: deferredCheckoutRestoreIssueId !== null,
+    });
+    const livenessContinuationOwnsCheckout = await handleRunLivenessContinuation(finalizedRun);
+    let successfulHandoffOwnsCheckout = false;
     if (finalizationAgent) {
-      await handleSuccessfulRunHandoff(finalizedRun, finalizationAgent);
+      successfulHandoffOwnsCheckout = await handleSuccessfulRunHandoff(finalizedRun, finalizationAgent);
+    }
+    if (
+      deferredCheckoutRestoreIssueId &&
+      !promotedRunDispatched &&
+      !livenessContinuationOwnsCheckout &&
+      !successfulHandoffOwnsCheckout
+    ) {
+      await restoreCheckoutPromotedStatus(db, {
+        issueId: deferredCheckoutRestoreIssueId,
+        companyId: finalizedRun.companyId,
+      });
     }
     await appendRunEvent(finalizedRun, await nextRunEventSeq(finalizedRun.id), {
       eventType: "lifecycle",
@@ -23801,12 +23827,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
         }
         const issueCommentPolicyResult = await finalizeIssueCommentPolicy(livenessRun, agent);
-        await releaseIssueExecutionAndPromote(
-          livenessRun,
-          suppressImmediateRecovery ? { suppressImmediateRecovery: true } : undefined,
-        );
-        await handleRunLivenessContinuation(livenessRun);
-        await handleSuccessfulRunHandoff(
+        const deferredCheckoutRestoreIssueId = livenessRun.status === "succeeded"
+          ? issueIdFromRunContext(livenessRun.contextSnapshot) ?? null
+          : null;
+        const promotedRunDispatched = await releaseIssueExecutionAndPromote(livenessRun, {
+          suppressImmediateRecovery,
+          deferPrimaryCheckoutRestoration: deferredCheckoutRestoreIssueId !== null,
+        });
+        const livenessContinuationOwnsCheckout = await handleRunLivenessContinuation(livenessRun);
+        const successfulHandoffOwnsCheckout = await handleSuccessfulRunHandoff(
           issueCommentPolicyResult.outcome === "retry_queued" || issueCommentPolicyResult.outcome === "retry_exhausted"
             ? {
               ...livenessRun,
@@ -23815,6 +23844,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             : livenessRun,
           agent,
         );
+        if (
+          deferredCheckoutRestoreIssueId &&
+          !promotedRunDispatched &&
+          !livenessContinuationOwnsCheckout &&
+          !successfulHandoffOwnsCheckout
+        ) {
+          await restoreCheckoutPromotedStatus(db, {
+            issueId: deferredCheckoutRestoreIssueId,
+            companyId: livenessRun.companyId,
+          });
+        }
 
         // Dependency wake re-check: if this run's issue was marked done mid-run,
         // the route-time `issue_blockers_resolved` wake may have been gated by
@@ -24446,10 +24486,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   async function releaseIssueExecutionAndPromote(
     run: typeof heartbeatRuns.$inferSelect,
-    options: { suppressImmediateRecovery?: boolean } = {},
+    options: {
+      suppressImmediateRecovery?: boolean;
+      deferPrimaryCheckoutRestoration?: boolean;
+    } = {},
   ): Promise<boolean> {
     const runContext = parseObject(run.contextSnapshot);
-    const contextIssueId = readNonEmptyString(runContext.issueId);
+    const contextIssueId = issueIdFromRunContext(runContext);
     const taskKey = deriveTaskKeyWithHeartbeatFallback(runContext, null);
     const recoveryAgent = await getAgent(run.agentId);
     const recoveryAgentInvokable =
@@ -24512,6 +24555,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ),
         )
         .orderBy(asc(issues.id));
+      const candidateIssueIds = candidateIssues.map((candidate) => candidate.id);
 
       // Clear orphaned execution-lock columns that still point at this finalizing
       // run, across every sibling issue in one statement so it scales with N
@@ -24557,6 +24601,30 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         (contextIssueId
           ? candidateIssues.find((candidate) => candidate.id === contextIssueId)
           : candidateIssues[0]) ?? null;
+      const primaryIssueId = issue?.id ?? null;
+
+      // Restoring a checkout promotion must wait until this finalizer has decided
+      // whether its primary issue has a replacement execution path. A continuation
+      // retry requires persisted `in_progress` when it is claimed; restoring first
+      // would leave the in-memory `issue` snapshot looking eligible while the new
+      // queued retry is cancelled by its own staleness gate. Siblings, and a primary
+      // issue with no replacement path, still restore inside this transaction.
+      const completePromotion = async <T>(
+        result: T,
+        completionOptions: { retainPrimaryCheckoutPromotion?: boolean } = {},
+      ): Promise<T> => {
+        const retainPrimaryCheckoutPromotion =
+          options.deferPrimaryCheckoutRestoration ||
+          completionOptions.retainPrimaryCheckoutPromotion;
+        const issueIds = retainPrimaryCheckoutPromotion && primaryIssueId
+          ? candidateIssueIds.filter((issueId) => issueId !== primaryIssueId)
+          : candidateIssueIds;
+        await restoreCheckoutPromotedStatuses(tx, {
+          issueIds,
+          companyId: run.companyId,
+        });
+        return result;
+      };
 
       if (!issue) {
         if (isNonRetryablePrReviewTerminalOutcome(run)) {
@@ -24568,7 +24636,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             false,
           ) ?? null;
         }
-        return null;
+        return completePromotion(null);
       }
       const activeExecutionState = parseIssueExecutionState(issue.executionState);
       const finalizedRunExecutionStage = parseObject(runContext.executionStage);
@@ -24593,7 +24661,34 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           { issueId: issue.id, finalizingRunId: run.id, activeExecutionRunId: issue.executionRunId },
           "skipping terminal-run recovery because a newer issue execution is active",
         );
-        return { kind: "superseded" as const };
+        return completePromotion({ kind: "superseded" as const });
+      }
+      // A corrective successful-run handoff that still records no disposition
+      // must remain WIP for the exhausted-handoff reconciler. Its checkout is no
+      // longer a temporary queue-tier promotion once the corrective run itself
+      // succeeds, so consume the restore marker before the guarded restoration.
+      // This runs after the supersession guard so a stale finalizer cannot erase
+      // the marker owned by a newer running execution.
+      if (
+        run.status === "succeeded" &&
+        (
+          runContext.handoffRequired === true ||
+          readNonEmptyString(runContext.wakeReason) === FINISH_SUCCESSFUL_RUN_HANDOFF_REASON
+        )
+      ) {
+        await tx
+          .update(issues)
+          .set({
+            checkoutRestoreStatus: null,
+            updatedAt: new Date(),
+          })
+          .where(
+            and(
+              eq(issues.id, issue.id),
+              eq(issues.companyId, run.companyId),
+              eq(issues.status, "in_progress"),
+            ),
+          );
       }
       if (isNonRetryablePrReviewTerminalOutcome(run) && !finalizedRunStageSuperseded) {
         // The outbox row is part of the ownership decision: a replacement run
@@ -24626,19 +24721,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           finalizedRunStageId,
         ))
       ) {
-        return {
-          kind: "blocked" as const,
-          issue,
-          previousStatus: issue.status,
-          comment: buildNonRetryableExecutionReviewParticipantComment({ latestRun: run }),
-          recoveryCause: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_CAUSE,
-          recoveryOwnerAgentId: activeParticipant.agentId,
-          expectedReviewStage: {
-            stageId: finalizedRunStageId,
-            participantAgentId: run.agentId,
-            executionRunId: null,
+        return completePromotion(
+          {
+            kind: "blocked" as const,
+            issue,
+            previousStatus: issue.status,
+            comment: buildNonRetryableExecutionReviewParticipantComment({ latestRun: run }),
+            recoveryCause: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_CAUSE,
+            recoveryOwnerAgentId: activeParticipant.agentId,
+            expectedReviewStage: {
+              stageId: finalizedRunStageId,
+              participantAgentId: run.agentId,
+              executionRunId: null,
+            },
           },
-        };
+          { retainPrimaryCheckoutPromotion: true },
+        );
       }
 
       // Pre-dispatch validation recovery: if the finalizing run failed before
@@ -24652,17 +24750,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         issue.assigneeAgentId === run.agentId
       ) {
         const configurationIncomplete = isConfigurationIncompleteFailedRun(run);
-        return {
-          kind: "blocked" as const,
-          issue,
-          previousStatus: issue.status,
-          comment: configurationIncomplete
-            ? buildConfigurationIncompleteRecoveryComment({ latestRun: run })
-            : buildWorkspaceValidationRecoveryComment({ latestRun: run }),
-          recoveryCause: configurationIncomplete
-            ? CONFIGURATION_INCOMPLETE_RECOVERY_CAUSE
-            : WORKSPACE_VALIDATION_RECOVERY_CAUSE,
-        };
+        return completePromotion(
+          {
+            kind: "blocked" as const,
+            issue,
+            previousStatus: issue.status,
+            comment: configurationIncomplete
+              ? buildConfigurationIncompleteRecoveryComment({ latestRun: run })
+              : buildWorkspaceValidationRecoveryComment({ latestRun: run }),
+            recoveryCause: configurationIncomplete
+              ? CONFIGURATION_INCOMPLETE_RECOVERY_CAUSE
+              : WORKSPACE_VALIDATION_RECOVERY_CAUSE,
+            recoveryOwnerAgentId: undefined,
+            expectedReviewStage: undefined,
+          },
+          { retainPrimaryCheckoutPromotion: true },
+        );
       }
 
 
@@ -24954,11 +25057,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           })
           .where(eq(agentWakeupRequests.id, deferred.id));
 
-        return {
-          kind: "promoted" as const,
-          run: newRun,
-          reopenedActivity,
-        };
+        return completePromotion(
+          {
+            kind: "promoted" as const,
+            run: newRun,
+            reopenedActivity,
+          },
+          { retainPrimaryCheckoutPromotion: true },
+        );
       }
 
       const findExistingExecutionPath = (agentId?: string | null) =>
@@ -25017,21 +25123,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       if (issueNeedsReviewParticipantRecovery) {
         const existingReviewParticipantExecutionPath = await findExistingExecutionPath(currentParticipant.agentId);
+        const reviewRecoveryHasReplacementPath = Boolean(
+          existingReviewParticipantExecutionPath || issueHasPersistedMonitor,
+        );
         if (
           options.suppressImmediateRecovery ||
-          existingReviewParticipantExecutionPath ||
-          issueHasPersistedMonitor ||
+          reviewRecoveryHasReplacementPath ||
           await isAutomaticRecoverySuppressedByPauseHold(db, issue.companyId, issue.id, treeControlSvc)
         ) {
-          return { kind: "released" as const };
+          return completePromotion(
+            { kind: "released" as const },
+            { retainPrimaryCheckoutPromotion: reviewRecoveryHasReplacementPath },
+          );
         }
 
         if (issue.originKind === RECOVERY_ORIGIN_KINDS.strandedIssueRecovery) {
-          return {
-            kind: "blocked_recovery_in_place" as const,
-            issue,
-            previousStatus: issue.status,
-          };
+          return completePromotion(
+            {
+              kind: "blocked_recovery_in_place" as const,
+              issue,
+              previousStatus: issue.status,
+            },
+            { retainPrimaryCheckoutPromotion: true },
+          );
         }
 
         const shouldBlockReviewRecovery =
@@ -25039,19 +25153,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           !recoveryAgent ||
           isExecutionReviewParticipantRecoveryRun(run);
         if (shouldBlockReviewRecovery) {
-          return {
-            kind: "blocked" as const,
-            issue,
-            previousStatus: issue.status,
-            comment: buildExecutionReviewParticipantRecoveryComment({ latestRun: run }),
-            recoveryCause: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_CAUSE,
-            recoveryOwnerAgentId: currentParticipant.agentId,
-            expectedReviewStage: {
-              stageId: runStageId,
-              participantAgentId: run.agentId,
-              executionRunId: null,
+          return completePromotion(
+            {
+              kind: "blocked" as const,
+              issue,
+              previousStatus: issue.status,
+              comment: buildExecutionReviewParticipantRecoveryComment({ latestRun: run }),
+              recoveryCause: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_CAUSE,
+              recoveryOwnerAgentId: currentParticipant.agentId,
+              expectedReviewStage: {
+                stageId: runStageId,
+                participantAgentId: run.agentId,
+                executionRunId: null,
+              },
             },
-          };
+            { retainPrimaryCheckoutPromotion: true },
+          );
         }
 
         const now = new Date();
@@ -25114,10 +25231,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           })
           .where(eq(agentWakeupRequests.id, wakeupRequest.id));
 
-        return {
-          kind: "queued_recovery" as const,
-          run: queuedRun,
-        };
+        return completePromotion(
+          {
+            kind: "queued_recovery" as const,
+            run: queuedRun,
+          },
+          { retainPrimaryCheckoutPromotion: true },
+        );
       }
 
       const issueNeedsImmediateRecovery =
@@ -25126,28 +25246,31 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         issue.assigneeAgentId === run.agentId &&
         (run.status === "failed" || run.status === "timed_out" || run.status === "cancelled");
 
-      if (!issueNeedsImmediateRecovery) {
-        return { kind: "released" as const };
-      }
-      if (options.suppressImmediateRecovery) {
-        return { kind: "released" as const };
-      }
+      if (!issueNeedsImmediateRecovery) return completePromotion({ kind: "released" as const });
+      if (options.suppressImmediateRecovery) return completePromotion({ kind: "released" as const });
 
       const existingExecutionPath = await findExistingExecutionPath();
-      if (existingExecutionPath || issueHasPersistedMonitor || await findExplicitBlockerPath()) {
-        return { kind: "released" as const };
+      const immediateRecoveryHasReplacementPath = Boolean(existingExecutionPath || issueHasPersistedMonitor);
+      if (immediateRecoveryHasReplacementPath || await findExplicitBlockerPath()) {
+        return completePromotion(
+          { kind: "released" as const },
+          { retainPrimaryCheckoutPromotion: immediateRecoveryHasReplacementPath },
+        );
       }
 
       if (await isAutomaticRecoverySuppressedByPauseHold(db, issue.companyId, issue.id, treeControlSvc, tx)) {
-        return { kind: "released" as const };
+        return completePromotion({ kind: "released" as const });
       }
 
       if (issue.originKind === RECOVERY_ORIGIN_KINDS.strandedIssueRecovery) {
-        return {
-          kind: "blocked_recovery_in_place" as const,
-          issue,
-          previousStatus: issue.status,
-        };
+        return completePromotion(
+          {
+            kind: "blocked_recovery_in_place" as const,
+            issue,
+            previousStatus: issue.status,
+          },
+          { retainPrimaryCheckoutPromotion: true },
+        );
       }
 
       const shouldBlockImmediately =
@@ -25168,17 +25291,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 status: issue.status as "todo" | "in_progress",
                 latestRun: run,
               });
-        return {
-          kind: "blocked" as const,
-          issue,
-          previousStatus: issue.status,
-          comment,
-          recoveryCause: workspaceValidationFailure
-            ? WORKSPACE_VALIDATION_RECOVERY_CAUSE
-            : configurationIncompleteFailure
-              ? CONFIGURATION_INCOMPLETE_RECOVERY_CAUSE
-              : undefined,
-        };
+        return completePromotion(
+          {
+            kind: "blocked" as const,
+            issue,
+            previousStatus: issue.status,
+            comment,
+            recoveryCause: workspaceValidationFailure
+              ? WORKSPACE_VALIDATION_RECOVERY_CAUSE
+              : configurationIncompleteFailure
+                ? CONFIGURATION_INCOMPLETE_RECOVERY_CAUSE
+                : undefined,
+            recoveryOwnerAgentId: undefined,
+            expectedReviewStage: undefined,
+          },
+          { retainPrimaryCheckoutPromotion: true },
+        );
       }
 
       const retryReason = issue.status === "todo" ? "assignment_recovery" : "issue_continuation_needed";
@@ -25261,10 +25389,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         })
         .where(eq(agentWakeupRequests.id, wakeupRequest.id));
 
-      return {
-        kind: "queued_recovery" as const,
-        run: queuedRun,
-      };
+      return completePromotion(
+        {
+          kind: "queued_recovery" as const,
+          run: queuedRun,
+        },
+        { retainPrimaryCheckoutPromotion: true },
+      );
     });
 
     if (gateDelivery) {
