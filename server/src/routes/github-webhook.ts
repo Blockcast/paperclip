@@ -3773,6 +3773,15 @@ const IDEMPOTENT_REVIEWER_WAKE_STATUSES = [
   // already prevents any real duplicate execution if the exhausted retry chain
   // and the fresh attempt ever raced.
   "dispatch_failed",
+  // BLO-25726: `dispatch_retrying` is the same "pending in-flight retry" state
+  // as `dispatch_failed` -- it is what a row is set to for the duration of one
+  // reconciler re-dispatch. Omitting it would silently narrow this deferral:
+  // before that status existed, a row being actively re-dispatched still read
+  // as `dispatch_failed` and deferred here, so leaving it out would make a
+  // webhook event arriving mid-dispatch enqueue a second wake. Its claim is
+  // lease-bounded, so a crashed holder defers new events for at most that
+  // lease -- the same bounded wait this list already accepts above.
+  "dispatch_retrying",
   "dispatch_recovered",
   "dispatch_superseded",
 ];
