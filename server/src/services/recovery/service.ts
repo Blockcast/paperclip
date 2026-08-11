@@ -4445,7 +4445,7 @@ export function recoveryService(
     const hasNewActivitySinceLastAttempt = !previousAttemptAt
       || input.issue.lastActivityAt > previousAttemptAt;
 
-    const action = await actionSvc.upsertSourceScoped({
+    const action = await recoveryActionsSvc.upsertSourceScoped({
       companyId: input.issue.companyId,
       sourceIssueId: input.issue.id,
       kind: strandedRecoveryActionKind(recoveryCause),
@@ -5609,6 +5609,16 @@ export function recoveryService(
     };
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
   }) {
+    // Captured BEFORE the type-predicate guard below. `isRoutineExecutionDuplicateSuppressedRun`
+    // is declared `latestRun is NonNullable<LatestIssueRun>`, so TypeScript's *negative*
+    // narrowing subtracts that entire type and treats `input.latestRun` as `null` for the rest
+    // of this function body. That inference is wrong -- a run that merely is not
+    // duplicate-suppressed is still a run -- but it was invisible while every consumer sat
+    // inside the `db.transaction` callback, because a closure resets narrowing on a property
+    // access. BLO-18829 moved the notification block out to post-commit, which put those
+    // consumers in the narrowed scope and collapsed them to `never`. Read the run through this
+    // local instead of re-deriving it from `input`.
+    const latestRun: LatestIssueRun = input.latestRun;
     if (isRoutineExecutionDuplicateSuppressedRun(input.latestRun)) {
       return cancelDuplicateSuppressedRoutineExecutionIssue(input.issue, input.latestRun);
     }
@@ -5867,7 +5877,7 @@ export function recoveryService(
     try {
       if (!isProviderQuotaWait) {
         const prefix = await getCompanyIssuePrefix(fresh.companyId);
-        const workspacePreflightHandoffCause = describeWorkspacePreflightRecoveryCause(input.latestRun);
+        const workspacePreflightHandoffCause = describeWorkspacePreflightRecoveryCause(latestRun);
         const recoveryOwner = action.ownerAgentId ? await getAgent(action.ownerAgentId) : null;
         const sourceAssignee = fresh.assigneeAgentId ? await getAgent(fresh.assigneeAgentId) : null;
         let notice: SuccessfulRunHandoffNotice | null = null;
@@ -5877,13 +5887,13 @@ export function recoveryService(
             sourceRun: input.successfulRunHandoffEvidence.sourceRunId
               ? { id: input.successfulRunHandoffEvidence.sourceRunId, status: "succeeded" }
               : null,
-            correctiveRun: input.latestRun ? { id: input.latestRun.id, status: input.latestRun.status } : null,
+            correctiveRun: latestRun ? { id: latestRun.id, status: latestRun.status } : null,
             sourceAssignee,
             recoveryIssue: null,
             recoveryActionId: action.id,
             recoveryOwner,
             latestIssueStatus: fresh.status,
-            latestHandoffRunStatus: input.latestRun?.status ?? "unknown",
+            latestHandoffRunStatus: latestRun?.status ?? "unknown",
             missingDisposition: input.successfulRunHandoffEvidence.missingDisposition,
           });
         }
@@ -6067,9 +6077,9 @@ export function recoveryService(
                   ? "recovery.reconcile_execution_review_participant"
               : "recovery.reconcile_stranded_assigned_issue",
           recoveryCause,
-          latestRunId: input.latestRun?.id ?? null,
-          latestRunStatus: input.latestRun?.status ?? null,
-          latestRunErrorCode: input.latestRun?.errorCode ?? null,
+          latestRunId: latestRun?.id ?? null,
+          latestRunStatus: latestRun?.status ?? null,
+          latestRunErrorCode: latestRun?.errorCode ?? null,
           recoveryActionId: action.id,
           recoveryActionAttemptCount: action.attemptCount,
           // BLO-18996: the fields a "which recovery actions have stopped making progress"
