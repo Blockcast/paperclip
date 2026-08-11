@@ -16,17 +16,22 @@ vi.mock("../services/github-review-gate-authority.js", () => ({
 }));
 
 import { githubWebhookRoutes } from "../routes/github-webhook.js";
+import type { GithubReviewGateAuthorityConfig } from "../services/github-review-gate-authority.js";
 
 const webhookSecret = "review-gate-route-test-secret";
-const reviewGateAuthority = {
+const reviewGateAuthority: GithubReviewGateAuthorityConfig = {
+  authorityEnabled: true,
   repositories: ["Blockcast/penstock-llm-proxy-core"],
   statusContext: "review/ally-complete",
   expectedAppId: "3966421",
   expectedInstallationId: "138085375",
-} as const;
+};
 const db = {} as Db;
 
-function buildApp(routeDb: Db = db) {
+function buildApp(
+  routeDb: Db = db,
+  authorityConfig: GithubReviewGateAuthorityConfig = reviewGateAuthority,
+) {
   const app = express();
   app.use(
     express.json({
@@ -39,7 +44,7 @@ function buildApp(routeDb: Db = db) {
     "/api/webhooks/github",
     githubWebhookRoutes(routeDb, {
       webhookSecret,
-      reviewGateAuthority,
+      reviewGateAuthority: authorityConfig,
     }),
   );
   return app;
@@ -60,9 +65,10 @@ async function postWebhook(input: {
   payload: Record<string, unknown>;
   signature?: string;
   routeDb?: Db;
+  authorityConfig?: GithubReviewGateAuthorityConfig;
 }) {
   const signed = signedRequest(input.payload);
-  return request(buildApp(input.routeDb))
+  return request(buildApp(input.routeDb, input.authorityConfig))
     .post("/api/webhooks/github")
     .set("content-type", "application/json")
     .set("x-github-event", input.eventName)
@@ -116,6 +122,42 @@ describe("github review-gate authority route", () => {
       config: reviewGateAuthority,
     });
     expect(activateGithubReviewGateDelivery).toHaveBeenCalledWith(db, "durable-row");
+  });
+
+  it("captures durably without authority-side GitHub effects during capture-only rollout", async () => {
+    enqueueGithubReviewGateDelivery.mockResolvedValue({
+      matched: true,
+      queued: true,
+      duplicate: false,
+      requiresRevocation: true,
+      deliveryDbId: "captured-row",
+      repoFullName: "Blockcast/penstock-llm-proxy-core",
+      prNumber: 1085,
+    });
+    const captureOnlyConfig: GithubReviewGateAuthorityConfig = {
+      ...reviewGateAuthority,
+      authorityEnabled: false,
+    };
+
+    const response = await postWebhook({
+      eventName: "pull_request",
+      deliveryId: "delivery-capture-only",
+      authorityConfig: captureOnlyConfig,
+      payload: {
+        action: "synchronize",
+        repository: { full_name: "Blockcast/penstock-llm-proxy-core" },
+      },
+    });
+
+    expect(response.status).toBe(202);
+    expect(response.body).toMatchObject({
+      reviewGateDeliveryQueued: true,
+      deliveryId: "delivery-capture-only",
+    });
+    expect(enqueueGithubReviewGateDelivery).toHaveBeenCalledWith(
+      expect.objectContaining({ config: captureOnlyConfig }),
+    );
+    expect(activateGithubReviewGateDelivery).not.toHaveBeenCalled();
   });
 
   it("returns a retryable failure when the synchronous pending revocation fails", async () => {

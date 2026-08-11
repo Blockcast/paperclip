@@ -36,6 +36,8 @@ const REVIEWED_HEAD_PATTERN = /(?:^|\n)[ \t]*_?reviewed head:[ \t]*([0-9a-f]{40}
 type DeliveryRow = typeof githubReviewGateDeliveries.$inferSelect;
 
 export interface GithubReviewGateAuthorityConfig {
+  /** False during the capture-only rollout, before this producer owns authority effects. */
+  authorityEnabled: boolean;
   repositories: readonly string[];
   statusContext: string;
   expectedAppId: string;
