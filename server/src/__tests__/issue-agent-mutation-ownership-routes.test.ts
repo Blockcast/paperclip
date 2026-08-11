@@ -1540,6 +1540,114 @@ describe("agent issue mutation checkout ownership", () => {
     expect(productivitySourceMutationAuditCalls()).toHaveLength(0);
   });
 
+  // BLO-24421: consolidated regression coverage for all four acceptance
+  // criteria, so CI carries one case that fails if the BLO-24191 fix (above)
+  // regresses. The DB-level half of AC #3 — a `done`/`cancelled` review no
+  // longer satisfying `agentHasProductivityReviewGrantOnIssue` — is covered
+  // in authorization-service.test.ts ("does not let a productivity review
+  // grant access once it reaches a terminal status"); this suite mocks the
+  // access service directly, so it re-asserts the route-scoping half instead.
+  describe("BLO-24421: monitor guard admits the review grant regardless of match order", () => {
+    it("AC1: lets an open review's owner re-arm the monitor via PATCH /issues/:id", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({
+        status: "in_progress",
+        assigneeAgentId: peerAgentId,
+        executionPolicy: null,
+      }));
+      mockAccessService.decide.mockImplementation(productivityReviewDecideWithRuntimeManage);
+
+      const res = await request(await createApp(ownerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({
+          executionPolicy: {
+            monitor: { nextCheckAt: "2026-08-17T00:00:00.000Z", notes: "BLO-24421 AC1" },
+          },
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({
+          executionPolicy: expect.objectContaining({
+            monitor: expect.objectContaining({
+              nextCheckAt: "2026-08-17T00:00:00.000Z",
+              notes: "BLO-24421 AC1",
+            }),
+          }),
+        }),
+      );
+    });
+
+    it("AC2: still 403s an actor with no qualifying relation to the issue", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({
+        status: "in_progress",
+        assigneeAgentId: peerAgentId,
+        executionPolicy: null,
+      }));
+      mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+        allowed: false,
+        action: input.action,
+        reason: "deny_missing_grant",
+        explanation: "No agent permission mapping exists for this action.",
+      }));
+
+      const res = await request(await createApp(ownerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({
+          executionPolicy: {
+            monitor: { nextCheckAt: "2026-08-17T00:00:00.000Z", notes: "BLO-24421 AC2" },
+          },
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+      expect(productivitySourceMutationAuditCalls()).toHaveLength(0);
+    });
+
+    it("AC3: keeps the forced-wake route closed to a review owner even though PATCH now honours the grant", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({
+        status: "in_progress",
+        assigneeAgentId: peerAgentId,
+        executionPolicy: null,
+      }));
+      mockAccessService.decide.mockImplementation(productivityReviewDecideWithRuntimeManage);
+
+      const res = await request(await createApp(ownerActor()))
+        .post(`/api/issues/${issueId}/monitor/check-now`);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe("Only the assignee agent or a board user can manage issue monitors");
+    });
+
+    it("AC4: admits the review-grant holder even when a broader allow-path (manager chain) also matches", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({
+        status: "in_progress",
+        assigneeAgentId: peerAgentId,
+        executionPolicy: null,
+      }));
+      mockAccessService.decide.mockImplementation(productivityReviewDecideWithCheckoutOverride);
+
+      const res = await request(await createApp(ownerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({
+          executionPolicy: {
+            monitor: { nextCheckAt: "2026-08-17T00:00:00.000Z", notes: "BLO-24421 AC4" },
+          },
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({
+          executionPolicy: expect.objectContaining({
+            monitor: expect.objectContaining({ notes: "BLO-24421 AC4" }),
+          }),
+        }),
+      );
+      expect(productivitySourceMutationAuditCalls()).toHaveLength(1);
+    });
+  });
+
   // The comment route's current-execution-run short-circuit returns a bare
   // `true`, discarding the decision reason. A previous owner whose stale
   // execution lock still matches therefore reaches the route WITHOUT an
