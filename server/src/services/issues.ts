@@ -4038,7 +4038,13 @@ async function listSuccessfulRunHandoffMapForIssues(
     : hydrateSuccessfulRunHandoffLiveness(dbOrTx, companyId, states);
 }
 
-function externalWaitFromDescription(description: string | null): { owner: string; action: string } | null {
+/**
+ * Parses the `external owner:` / `external action:` pair an agent writes into a
+ * description to park an issue on a human gate. Exported so the liveness sweep can see
+ * the same signal (BLO-24662) — a gate narrated in prose is still a gate, and without it
+ * the `blocked_without_blockers` rule reads deliberate parking as a dead end.
+ */
+export function externalWaitFromDescription(description: string | null): { owner: string; action: string } | null {
   if (!description) return null;
   const owner = description.match(/^\s*external owner\s*:\s*(.+)$/im)?.[1]?.trim();
   const action = description.match(/^\s*external action\s*:\s*(.+)$/im)?.[1]?.trim();
@@ -4373,6 +4379,7 @@ async function listIssueBlockedInboxAttentionMap(
       executionState: issue.executionState,
       monitorNextCheckAt: issue.monitorNextCheckAt,
       monitorAttemptCount: issue.monitorAttemptCount,
+      hasExternalWaitOwner: externalWaitFromDescription(issue.description ?? null) !== null,
     })),
     relations: graphRelations,
     agents: companyAgents,
@@ -4553,6 +4560,8 @@ async function listIssueBlockedInboxAttentionMap(
                 return "Assign active owner";
               case "blocked_by_cancelled_issue":
                 return "Replace blocker";
+              case "blocked_without_blockers":
+                return "Give it a next action";
               case "invalid_review_participant":
                 return "Repair review participant";
               case "in_review_without_action_path":
