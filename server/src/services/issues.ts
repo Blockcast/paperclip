@@ -81,6 +81,7 @@ import { logger } from "../middleware/logger.js";
 import { parseObject } from "../adapters/utils.js";
 import {
   hydrateSuccessfulRunHandoffLiveness,
+  resolveSuccessfulRunHandoffForTerminalIssues,
   SUCCESSFUL_RUN_HANDOFF_LIVE_WAKE_STATUSES,
 } from "./successful-run-handoff-state.js";
 import {
@@ -4044,6 +4045,9 @@ async function listSuccessfulRunHandoffMapForIssues(
     }
   }
 
+  // Unconditional, and before liveness: a handoff on a closed issue is moot
+  // regardless of whether this caller wants liveness hydrated (BLO-16074).
+  await resolveSuccessfulRunHandoffForTerminalIssues(dbOrTx, companyId, states);
   return options?.hydrateLiveness === false
     ? states
     : hydrateSuccessfulRunHandoffLiveness(dbOrTx, companyId, states);
