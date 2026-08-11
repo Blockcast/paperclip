@@ -17,7 +17,7 @@
 import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { agents, agentWakeupRequests, companies, createDb, heartbeatRuns, issues } from "@paperclipai/db";
+import { agents, agentWakeupRequests, companies, createDb, heartbeatRuns, issueRecoveryActions, issues } from "@paperclipai/db";
 import {
   CCROTATE_CAPACITY_RETRY_REASON,
   GITHUB_REVIEW_DELIVERY_COUNT_KEY,
@@ -348,6 +348,119 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
 
     const [row] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeupRequestId));
     expect(row?.status).toBe("dispatch_superseded");
+  });
+
+  // BLO-18829 (Ally review): a recovery wake-outbox row freezes `agentId` at write time, but
+  // `upsertSourceScoped` reassigns a recovery action's owner IN PLACE. Replaying the row on the
+  // stale agentId wakes an agent that no longer owns the recovery -- a wasted run charged to the
+  // wrong budget. These two cases are each other's control: same row shape, same reconcile call,
+  // differing only in whether the action's owner still matches.
+  describe("recovery wake-outbox rows whose owner was reassigned (BLO-18829)", () => {
+    async function seedRecoveryOutboxRow(opts: { reassignOwnerTo?: "other" }) {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const otherAgentId = randomUUID();
+      await db.insert(agents).values({
+        id: otherAgentId,
+        companyId,
+        name: "Replacement owner",
+        role: "engineer",
+        status: "idle",
+        adapterType: "claude_k8s",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      const sourceIssueId = randomUUID();
+      await db.insert(issues).values({
+        id: sourceIssueId,
+        companyId,
+        title: "Stranded work",
+        status: "blocked",
+        priority: "high",
+        assigneeAgentId: agentId,
+      });
+      const recoveryActionId = randomUUID();
+      await db.insert(issueRecoveryActions).values({
+        id: recoveryActionId,
+        companyId,
+        sourceIssueId,
+        kind: "stranded_assigned_issue",
+        status: "active",
+        // The whole point: the row below still names `agentId`.
+        ownerAgentId: opts.reassignOwnerTo === "other" ? otherAgentId : agentId,
+        cause: "execution_stalled",
+        fingerprint: `source-scoped:${sourceIssueId}`,
+        nextAction: "restore a live execution path",
+      });
+
+      const wakeupRequestId = randomUUID();
+      const now = new Date();
+      await db.insert(agentWakeupRequests).values({
+        id: wakeupRequestId,
+        companyId,
+        agentId,
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "source_scoped_recovery_action",
+        payload: {
+          issueId: sourceIssueId,
+          recoveryActionId,
+          dispatchRetry: {
+            attempts: 0,
+            nextAttemptAt: new Date(now.getTime() - 1000).toISOString(),
+            // `deleteOnRecover` is what marks this row as a recovery outbox IOU rather
+            // than an ordinary dispatch-retry row.
+            deleteOnRecover: true,
+            originalOpts: {
+              source: "assignment",
+              triggerDetail: "system",
+              reason: "source_scoped_recovery_action",
+              payload: { issueId: sourceIssueId, recoveryActionId },
+            },
+          },
+        },
+        status: "dispatch_failed",
+      });
+      return { companyId, agentId, otherAgentId, wakeupRequestId, recoveryActionId, now };
+    }
+
+    it("retires the row instead of waking the former owner", async () => {
+      const { agentId, wakeupRequestId, now } = await seedRecoveryOutboxRow({ reassignOwnerTo: "other" });
+
+      const result = await heartbeat.reconcileFailedWakeDispatches(now);
+      expect(result.superseded).toBe(1);
+      expect(result.recovered).toBe(0);
+
+      const [row] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeupRequestId));
+      expect(row?.status).toBe("dispatch_superseded");
+      expect(row?.error).toContain("reassigned");
+
+      // No wake for the stale owner. The current owner is reached by
+      // reconcileStrandedRecoveryWakeBackstop, not by replaying this row.
+      const queuedForStaleOwner = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(and(eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.status, "queued")));
+      expect(queuedForStaleOwner).toHaveLength(0);
+    });
+
+    it("still replays the row when the action's owner is unchanged", async () => {
+      const { agentId, wakeupRequestId, now } = await seedRecoveryOutboxRow({});
+
+      const result = await heartbeat.reconcileFailedWakeDispatches(now);
+      expect(result.superseded).toBe(0);
+      expect(result.recovered).toBe(1);
+
+      // deleteOnRecover: the IOU is removed once paid rather than left as a phantom.
+      const rows = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeupRequestId));
+      expect(rows).toHaveLength(0);
+
+      const queuedForOwner = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(and(eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.status, "queued")));
+      expect(queuedForOwner.length).toBeGreaterThan(0);
+    });
   });
 
   // BLO-18859: the four-state delivery counter. These assert the two states

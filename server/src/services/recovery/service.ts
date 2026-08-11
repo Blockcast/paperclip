@@ -5874,7 +5874,30 @@ export function recoveryService(
     const { fresh, action, isProviderQuotaWait, recoveryCause, blockerIds, needsHumanDecision } =
       postCommitNotifications;
 
+    // BLO-18829 (Ally review): these post-commit steps are INDEPENDENT of one another, so
+    // each gets its own catch. They used to share one broad `try`, which meant the first
+    // failure silently cancelled every later step -- an escalation comment that failed to
+    // post also lost the activity-log row and the needs-human-decision event, and the loss
+    // read as a single warning rather than three dropped side effects. Steps that genuinely
+    // depend on the shared setup below (prefix / recovery owner / notice) stay inside the
+    // outer `try`, because skipping those when the setup fails is correct.
+    const runPostCommitStep = async (step: string, fn: () => Promise<void>) => {
+      try {
+        await fn();
+      } catch (err) {
+        logger.warn(
+          { err, issueId: fresh.id, recoveryActionId: action.id, step },
+          "stranded recovery post-commit step failed; later steps and wake dispatch still run",
+        );
+      }
+    };
     try {
+      // NOTE: this guard extends to the END of the notification block below -- the
+      // escalation comment, the exhaustion notice, the activity log AND the
+      // needs-human-decision event are all inside it, despite being indented as though
+      // they were siblings. That preserves the pre-#820 behaviour, where a provider-quota
+      // wait took an early `return` past all four: a transient capacity park is not an
+      // escalation and must not announce itself as one.
       if (!isProviderQuotaWait) {
         const prefix = await getCompanyIssuePrefix(fresh.companyId);
         const workspacePreflightHandoffCause = describeWorkspacePreflightRecoveryCause(latestRun);
@@ -5942,6 +5965,7 @@ export function recoveryService(
           recoveryCause === "workspace_validation_failed" ||
           recoveryCause === "configuration_incomplete" ||
           announcesReassignment;
+        await runPostCommitStep("escalation_comment", async () => {
         if (shouldPostEscalationComment) {
           const escalationCommentMarker = announcesReassignment
             ? reassignmentMarker
@@ -5977,11 +6001,13 @@ export function recoveryService(
           }
         }
         }
+        });
       // BLO-18996: the wake budget is spent, so no further sweep will wake anyone for
       // this action. Say so once, on the source issue, rather than letting the loop go
       // quiet with no explanation — a silent stop reads exactly like a silent re-fire to
       // whoever is looking at the issue. Keyed on the action id so it lands once per
       // action, not once per subsequent sweep.
+      await runPostCommitStep("wake_budget_exhaustion_notice", async () => {
       if (strandedRecoveryWakeAttemptsExhausted(action)) {
         // Which bound stopped it, because the operator's next move differs: a spent
         // per-owner budget can be restored by handing the action to a different owner, but
@@ -6051,7 +6077,9 @@ export function recoveryService(
           );
         }
       }
+      });
 
+      await runPostCommitStep("escalation_activity_log", async () => {
       await logActivity(db, {
         companyId: fresh.companyId,
         actorType: "system",
@@ -6104,7 +6132,9 @@ export function recoveryService(
         // and there is no publish thunk to thread back out.
         deferPublish: false,
       });
+      });
 
+      await runPostCommitStep("needs_human_decision_event", async () => {
       if (needsHumanDecision) {
         const assigneeAgent = fresh.assigneeAgentId
           ? await db
@@ -6120,6 +6150,7 @@ export function recoveryService(
           blockedByIssueIds: blockerIds,
         });
       }
+      });
       }
     } catch (err) {
       logger.warn(

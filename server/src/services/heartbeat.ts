@@ -27553,6 +27553,61 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // would leave a permanent phantom with `runId: null`.
       const deleteOnRecover = retryState.deleteOnRecover === true;
 
+      // BLO-18829 (Ally review): `row.agentId` is frozen at the moment the outbox row was
+      // written. A recovery action can be handed to a different owner between then and this
+      // replay (`upsertSourceScoped` updates the active row in place, so reassignment does
+      // not create a new action), and re-dispatching on the stale agentId wakes an agent who
+      // no longer owns the recovery -- one wasted run, charged to the wrong budget, acting on
+      // an issue it can no longer PATCH as assignee.
+      //
+      // Retire rather than retarget. Retargeting would mean rewriting a payload and
+      // contextSnapshot that name the old owner, and it is unnecessary: the current owner is
+      // already covered by reconcileStrandedRecoveryWakeBackstop, which selects active
+      // actions on `blocked` issues with no queued wake and delivers to whoever owns the
+      // action NOW. `dispatch_superseded` is a terminal status this reconciler never
+      // re-selects, so the stale row cannot come back on a later pass.
+      const outboxRecoveryActionId = typeof payload.recoveryActionId === "string"
+        ? payload.recoveryActionId
+        : null;
+      if (deleteOnRecover && outboxRecoveryActionId) {
+        const owner = await db
+          .select({ ownerAgentId: issueRecoveryActions.ownerAgentId })
+          .from(issueRecoveryActions)
+          .where(and(
+            eq(issueRecoveryActions.id, outboxRecoveryActionId),
+            eq(issueRecoveryActions.companyId, row.companyId),
+          ))
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        // Only skip on a *known* different owner. A missing action row means the action was
+        // deleted, and a null owner means board escalation — neither is evidence that this
+        // row's agent is the wrong target, so those keep the existing replay behaviour.
+        if (owner?.ownerAgentId && owner.ownerAgentId !== row.agentId) {
+          await db
+            .update(agentWakeupRequests)
+            .set({
+              status: "dispatch_superseded",
+              error: "recovery action was reassigned to a different owner before this wake could "
+                + "be replayed; the stranded-recovery wake backstop delivers to the current owner",
+              finishedAt: now,
+              updatedAt: now,
+            })
+            .where(eq(agentWakeupRequests.id, row.id));
+          superseded += 1;
+          logger.warn(
+            {
+              wakeupRequestId: row.id,
+              staleAgentId: row.agentId,
+              currentOwnerAgentId: owner.ownerAgentId,
+              recoveryActionId: outboxRecoveryActionId,
+            },
+            "recovery wake outbox row named a former recovery owner; retired it instead of "
+              + "waking the stale owner (backstop delivers to the current owner)",
+          );
+          continue;
+        }
+      }
+
       const attempts = (retryState.attempts ?? 0) + 1;
       const originalOpts = retryState.originalOpts ?? {};
       // Recovered from the round-tripped originalOpts, so a row written before
