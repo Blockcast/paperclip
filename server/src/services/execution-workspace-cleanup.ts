@@ -114,117 +114,107 @@ export async function collectDueExecutionWorkspaces(input: {
   };
 
   for (const candidate of candidates) {
-    const claimId = randomUUID();
-    const claimUntil = new Date(now.getTime() + claimDurationMs);
-    const claimed = await input.db
-      .update(executionWorkspaces)
-      .set({
-        cleanupEligibleAt: claimUntil,
-        metadata: sql`coalesce(${executionWorkspaces.metadata}, '{}'::jsonb) || jsonb_build_object('cleanupClaimId', ${claimId}::text)`,
-        updatedAt: now,
-      })
-      .where(and(
-        eq(executionWorkspaces.id, candidate.id),
-        lte(executionWorkspaces.cleanupEligibleAt, now),
-        isNull(executionWorkspaces.closedAt),
-        inArray(executionWorkspaces.status, ["cleanup_pending", "cleanup_failed"]),
-      ))
-      .returning()
-      .then((rows) => rows[0] ?? null);
-    if (!claimed) continue;
-    result.claimed += 1;
-
-    let renewalTimer: ReturnType<typeof setTimeout> | null = null;
-    let renewalStopped = false;
-    const scheduleRenewal = () => {
-      renewalTimer = setTimeout(() => {
-        void renewClaim().catch(() => {
-          if (!renewalStopped) scheduleRenewal();
-        });
-      }, Math.max(25, Math.floor(claimDurationMs / 3)));
-      renewalTimer.unref();
-    };
-    const renewClaim = async () => {
-      if (renewalStopped) return;
-      const renewedAt = new Date();
-      const renewed = await input.db
+    await input.db.transaction(async (tx) => {
+      const claimId = randomUUID();
+      const claimUntil = new Date(now.getTime() + claimDurationMs);
+      // Keep the claimed row locked until teardown finishes. A competing sweep
+      // may wait, but it cannot acquire the claim and touch the same filesystem.
+      // If this worker exits, PostgreSQL rolls the claim back and releases it.
+      const claimed = await tx
         .update(executionWorkspaces)
         .set({
-          cleanupEligibleAt: new Date(renewedAt.getTime() + claimDurationMs),
-          updatedAt: renewedAt,
+          cleanupEligibleAt: claimUntil,
+          metadata: sql`coalesce(${executionWorkspaces.metadata}, '{}'::jsonb) || jsonb_build_object('cleanupClaimId', ${claimId}::text)`,
+          updatedAt: now,
         })
         .where(and(
-          eq(executionWorkspaces.id, claimed.id),
-          sql`${executionWorkspaces.metadata} ->> 'cleanupClaimId' = ${claimId}`,
+          eq(executionWorkspaces.id, candidate.id),
+          lte(executionWorkspaces.cleanupEligibleAt, now),
           isNull(executionWorkspaces.closedAt),
           inArray(executionWorkspaces.status, ["cleanup_pending", "cleanup_failed"]),
         ))
-        .returning({ id: executionWorkspaces.id });
-      if (renewed.length > 0 && !renewalStopped) {
-        scheduleRenewal();
-      }
-    };
-    scheduleRenewal();
+        .returning()
+        .then((rows) => rows[0] ?? null);
+      if (!claimed) return;
+      result.claimed += 1;
 
-    try {
-      await stopRuntimeServicesForExecutionWorkspace({
-        db: input.db,
-        executionWorkspaceId: claimed.id,
-        workspaceCwd: claimed.cwd,
-      });
-      const [projectWorkspace, projectPolicy] = await Promise.all([
-        claimed.projectWorkspaceId
-          ? input.db
-            .select({ cwd: projectWorkspaces.cwd, cleanupCommand: projectWorkspaces.cleanupCommand })
-            .from(projectWorkspaces)
-            .where(and(
-              eq(projectWorkspaces.id, claimed.projectWorkspaceId),
-              eq(projectWorkspaces.companyId, claimed.companyId),
-            ))
-            .then((rows) => rows[0] ?? null)
-          : null,
-        input.db
-          .select({ executionWorkspacePolicy: projects.executionWorkspacePolicy })
-          .from(projects)
-          .where(and(eq(projects.id, claimed.projectId), eq(projects.companyId, claimed.companyId)))
-          .then((rows) => parseProjectExecutionWorkspacePolicy(rows[0]?.executionWorkspacePolicy)),
-      ]);
-      const config = readExecutionWorkspaceConfig(claimed.metadata);
-      const cleanup = await cleanupExecutionWorkspaceArtifacts({
-        workspace: claimed,
-        projectWorkspace,
-        cleanupCommand: config?.cleanupCommand ?? null,
-        teardownCommand: config?.teardownCommand ?? projectPolicy?.workspaceStrategy?.teardownCommand ?? null,
-        recorder: workspaceOperationService(input.db).createRecorder({
-          companyId: claimed.companyId,
+      try {
+        await stopRuntimeServicesForExecutionWorkspace({
+          db: input.db,
           executionWorkspaceId: claimed.id,
-        }),
-      });
-      if (cleanup.cleaned) {
-        const archived = await input.db
-          .update(executionWorkspaces)
-          .set({
-            status: "archived",
-            closedAt: now,
-            cleanupEligibleAt: null,
-            cleanupReason: cleanup.warnings.join(" | ") || null,
-            metadata: sql`${executionWorkspaces.metadata} - 'cleanupClaimId'`,
-            updatedAt: new Date(),
-          })
-          .where(and(
-            eq(executionWorkspaces.id, claimed.id),
-            sql`${executionWorkspaces.metadata} ->> 'cleanupClaimId' = ${claimId}`,
-          ))
-          .returning({ id: executionWorkspaces.id });
-        result.cleaned += archived.length;
-      } else {
-        const failed = await input.db
+          workspaceCwd: claimed.cwd,
+        });
+        const [projectWorkspace, projectPolicy] = await Promise.all([
+          claimed.projectWorkspaceId
+            ? input.db
+              .select({ cwd: projectWorkspaces.cwd, cleanupCommand: projectWorkspaces.cleanupCommand })
+              .from(projectWorkspaces)
+              .where(and(
+                eq(projectWorkspaces.id, claimed.projectWorkspaceId),
+                eq(projectWorkspaces.companyId, claimed.companyId),
+              ))
+              .then((rows) => rows[0] ?? null)
+            : null,
+          input.db
+            .select({ executionWorkspacePolicy: projects.executionWorkspacePolicy })
+            .from(projects)
+            .where(and(eq(projects.id, claimed.projectId), eq(projects.companyId, claimed.companyId)))
+            .then((rows) => parseProjectExecutionWorkspacePolicy(rows[0]?.executionWorkspacePolicy)),
+        ]);
+        const config = readExecutionWorkspaceConfig(claimed.metadata);
+        const cleanup = await cleanupExecutionWorkspaceArtifacts({
+          workspace: claimed,
+          projectWorkspace,
+          cleanupCommand: config?.cleanupCommand ?? null,
+          teardownCommand: config?.teardownCommand ?? projectPolicy?.workspaceStrategy?.teardownCommand ?? null,
+          recorder: workspaceOperationService(input.db).createRecorder({
+            companyId: claimed.companyId,
+            executionWorkspaceId: claimed.id,
+          }),
+        });
+        if (cleanup.cleaned) {
+          const archived = await tx
+            .update(executionWorkspaces)
+            .set({
+              status: "archived",
+              closedAt: now,
+              cleanupEligibleAt: null,
+              cleanupReason: cleanup.warnings.join(" | ") || null,
+              metadata: sql`${executionWorkspaces.metadata} - 'cleanupClaimId'`,
+              updatedAt: new Date(),
+            })
+            .where(and(
+              eq(executionWorkspaces.id, claimed.id),
+              sql`${executionWorkspaces.metadata} ->> 'cleanupClaimId' = ${claimId}`,
+            ))
+            .returning({ id: executionWorkspaces.id });
+          result.cleaned += archived.length;
+        } else {
+          const failed = await tx
+            .update(executionWorkspaces)
+            .set({
+              status: "cleanup_failed",
+              closedAt: null,
+              cleanupEligibleAt: new Date(now.getTime() + CLEANUP_RETRY_MS),
+              cleanupReason: cleanup.warnings.join(" | ") || "workspace artifacts remain after cleanup",
+              metadata: sql`${executionWorkspaces.metadata} - 'cleanupClaimId'`,
+              updatedAt: new Date(),
+            })
+            .where(and(
+              eq(executionWorkspaces.id, claimed.id),
+              sql`${executionWorkspaces.metadata} ->> 'cleanupClaimId' = ${claimId}`,
+            ))
+            .returning({ id: executionWorkspaces.id });
+          result.failed += failed.length;
+        }
+      } catch (error) {
+        const failed = await tx
           .update(executionWorkspaces)
           .set({
             status: "cleanup_failed",
             closedAt: null,
             cleanupEligibleAt: new Date(now.getTime() + CLEANUP_RETRY_MS),
-            cleanupReason: cleanup.warnings.join(" | ") || "workspace artifacts remain after cleanup",
+            cleanupReason: error instanceof Error ? error.message : String(error),
             metadata: sql`${executionWorkspaces.metadata} - 'cleanupClaimId'`,
             updatedAt: new Date(),
           })
@@ -235,27 +225,7 @@ export async function collectDueExecutionWorkspaces(input: {
           .returning({ id: executionWorkspaces.id });
         result.failed += failed.length;
       }
-    } catch (error) {
-      const failed = await input.db
-        .update(executionWorkspaces)
-        .set({
-          status: "cleanup_failed",
-          closedAt: null,
-          cleanupEligibleAt: new Date(now.getTime() + CLEANUP_RETRY_MS),
-          cleanupReason: error instanceof Error ? error.message : String(error),
-          metadata: sql`${executionWorkspaces.metadata} - 'cleanupClaimId'`,
-          updatedAt: new Date(),
-        })
-        .where(and(
-          eq(executionWorkspaces.id, claimed.id),
-          sql`${executionWorkspaces.metadata} ->> 'cleanupClaimId' = ${claimId}`,
-        ))
-        .returning({ id: executionWorkspaces.id });
-      result.failed += failed.length;
-    } finally {
-      renewalStopped = true;
-      if (renewalTimer) clearTimeout(renewalTimer);
-    }
+    });
   }
 
   return result;
