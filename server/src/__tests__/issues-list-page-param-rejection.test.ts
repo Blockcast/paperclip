@@ -1,6 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { describe, expect, it } from "vitest";
+import { parseUnsupportedPaginationParams } from "../services/issues.ts";
 
 /**
  * Regression test for BLO-24495.
@@ -10,17 +11,16 @@ import { describe, expect, it } from "vitest";
  * caller using `page=N` got the same limit/offset-default window back on
  * every page with no error — a silent-wrong-data bug, not a crash. Mirrors
  * the reject-with-400 branch added at `server/src/routes/issues.ts` right
- * after the limit/offset parsing, without requiring a database.
+ * after the limit/offset parsing, importing the same
+ * `parseUnsupportedPaginationParams` helper the route calls so the test
+ * actually regresses if that contract changes — not a copy of it.
  */
 
 function buildApp() {
   const app = express();
   app.use(express.json());
   app.get("/api/companies/:companyId/issues", (req, res) => {
-    const unsupportedPaginationParams = [
-      ...(req.query.page !== undefined ? ["page"] : []),
-      ...(req.query.perPage !== undefined ? ["perPage"] : []),
-    ];
+    const unsupportedPaginationParams = parseUnsupportedPaginationParams(req.query);
     if (unsupportedPaginationParams.length > 0) {
       res.status(400).json({
         error: "page/perPage pagination is not supported on this endpoint; use limit and offset instead",
