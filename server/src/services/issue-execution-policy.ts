@@ -1392,6 +1392,17 @@ export function buildIssueMonitorTriggeredPatch(input: {
 export function buildIssueMonitorDispatchRearmPatch(input: {
   issue: IssueLike;
   policy: IssueExecutionPolicy;
+  /**
+   * Attempt count to persist. Defaults to restoring the attempt the undelivered
+   * wake consumed — the tick-detected lapse path, where the wake never ran and
+   * so must not count against maxAttempts.
+   *
+   * The watchdog *dispatch* path passes the already-incremented count instead:
+   * that fire did real work (it re-dispatched the stuck run), so it consumes an
+   * attempt and the retry loop stays bounded by maxAttempts rather than
+   * re-arming forever against a run that never moves (BLO-22860).
+   */
+  attemptCount?: number;
 }) {
   const existingState = parseIssueExecutionState(input.issue.executionState);
   const currentMonitorState = derivePersistedMonitorState({
@@ -1399,7 +1410,7 @@ export function buildIssueMonitorDispatchRearmPatch(input: {
     state: existingState,
     policy: input.policy,
   });
-  const restoredAttemptCount = Math.max(0, (currentMonitorState?.attemptCount ?? 1) - 1);
+  const restoredAttemptCount = input.attemptCount ?? Math.max(0, (currentMonitorState?.attemptCount ?? 1) - 1);
   const previousMonitorState = currentMonitorState
     ? { ...currentMonitorState, attemptCount: restoredAttemptCount }
     : null;
