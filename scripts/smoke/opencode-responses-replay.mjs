@@ -15,6 +15,9 @@ const SECRET_MARKERS = [
 ];
 const MAX_CAPTURE_BYTES = 16 * 1024;
 const MAX_REQUEST_BYTES = 1024 * 1024;
+// OpenCode startup and tool-turn processing can exceed 30 seconds on loaded ARC
+// hosts. Keep the replay bounded while leaving margin below the 15-minute job cap.
+const REPLAY_PROCESS_TIMEOUT_MS = 90_000;
 
 const response = (id, output = [], extra = {}) => ({
   id,
@@ -318,7 +321,10 @@ const runOpenCode = (binary, cwd, config, message) =>
     child.stdout.on("data", (chunk) => capture(chunk, "stdout"));
     child.stderr.on("data", (chunk) => capture(chunk, "stderr"));
     child.once("error", reject);
-    const timer = setTimeout(() => child.kill("SIGKILL"), 30_000);
+    const timer = setTimeout(
+      () => child.kill("SIGKILL"),
+      REPLAY_PROCESS_TIMEOUT_MS,
+    );
     child.once("close", (code, signal) => {
       clearTimeout(timer);
       resolve({

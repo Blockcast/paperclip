@@ -70,7 +70,12 @@ async function createApp(actorOverrides: Record<string, unknown> = {}) {
   return app;
 }
 
-function createRouteDb(contextSnapshot: Record<string, unknown> = {}, runId = "run-1", agentId = "agent-1") {
+function createRouteDb(
+  contextSnapshot: Record<string, unknown> = {},
+  runId = "run-1",
+  agentId = "agent-1",
+  sourceIssue: Record<string, unknown> | null = null,
+) {
   const runRows = [{
     id: runId,
     companyId: "company-1",
@@ -82,7 +87,7 @@ function createRouteDb(contextSnapshot: Record<string, unknown> = {}, runId = "r
       from: vi.fn(() => ({
         where: vi.fn(() => ({
           then: async (resolve: (rows: unknown[]) => unknown) => resolve(
-            Object.keys(selection).includes("contextSnapshot") ? runRows : [],
+            Object.keys(selection).includes("contextSnapshot") ? runRows : sourceIssue ? [sourceIssue] : [],
           ),
         })),
       })),
@@ -90,7 +95,11 @@ function createRouteDb(contextSnapshot: Record<string, unknown> = {}, runId = "r
   } as any;
 }
 
-async function createAgentApp(options: { runId?: string; contextSnapshot?: Record<string, unknown> } = {}) {
+async function createAgentApp(options: {
+  runId?: string;
+  contextSnapshot?: Record<string, unknown>;
+  sourceIssue?: Record<string, unknown> | null;
+} = {}) {
   const [{ errorHandler }, { approvalRoutes }] = await Promise.all([
     import("../middleware/index.js"),
     import("../routes/approvals.js"),
@@ -108,7 +117,12 @@ async function createAgentApp(options: { runId?: string; contextSnapshot?: Recor
     };
     next();
   });
-  app.use("/api", approvalRoutes(createRouteDb(options.contextSnapshot, options.runId ?? "run-1")));
+  app.use("/api", approvalRoutes(createRouteDb(
+    options.contextSnapshot,
+    options.runId ?? "run-1",
+    "agent-1",
+    options.sourceIssue,
+  )));
   app.use(errorHandler);
   return app;
 }
@@ -902,24 +916,238 @@ describe("approval routes idempotent retries", () => {
     });
   });
 
-  it("blocks status-only recovery runs from creating approvals", async () => {
+  // BLO-23036: a productivity-review run is a cheap status-only run, and one of the four verdicts
+  // Paperclip itself offers is "block with an unblock owner". A board escalation is the only channel
+  // that reaches a human, so the reviewing manager has to be able to file one in the run that reaches
+  // the verdict — otherwise it states a gate it cannot escalate and the stall the review exists to
+  // catch is silently reproduced.
+  const STATUS_ONLY_CONTEXT = {
+    modelProfile: "cheap",
+    recoveryIntent: "status_only",
+    allowDeliverableWork: false,
+    allowDocumentUpdates: false,
+    resumeRequiresNormalModel: true,
+  } as const;
+  const REVIEW_ISSUE_ID = "22222222-2222-4222-8222-222222222222";
+  const SOURCE_ISSUE_ID = "11111111-1111-4111-8111-111111111111";
+  const UNRELATED_ISSUE_ID = "33333333-3333-4333-8333-333333333333";
+  const PRODUCTIVITY_REVIEW_CONTEXT = {
+    ...STATUS_ONLY_CONTEXT,
+    issueId: REVIEW_ISSUE_ID,
+    taskId: REVIEW_ISSUE_ID,
+    sourceIssueId: SOURCE_ISSUE_ID,
+  } as const;
+  const SOURCE_ISSUE = {
+    id: SOURCE_ISSUE_ID,
+    companyId: "company-1",
+    projectId: "project-1",
+    parentId: null,
+    // Keep this assigned to another agent: the route must pass the actual ownership fields into
+    // access.decide rather than treating an ID-only source resource as an unassigned issue.
+    assigneeAgentId: "source-owner",
+    assigneeUserId: null,
+    createdByAgentId: "source-creator",
+    status: "blocked",
+    originKind: null,
+    originId: null,
+  } as const;
+
+  function mockEscalationCreate() {
+    mockApprovalService.create.mockResolvedValue({
+      id: "approval-escalation",
+      companyId: "company-1",
+      type: "request_board_approval",
+      requestedByAgentId: "agent-1",
+      requestedByUserId: null,
+      status: "pending",
+      payload: { title: "Unblock owner needed for BLO-22206" },
+      decisionNote: null,
+      decidedByUserId: null,
+      decidedAt: null,
+      createdAt: new Date("2026-08-09T00:00:00.000Z"),
+      updatedAt: new Date("2026-08-09T00:00:00.000Z"),
+    });
+    mockIssueApprovalService.linkManyForApproval.mockResolvedValue(undefined);
+  }
+
+  it("lets a status-only recovery run file an authorized board escalation linked only to its source issue", async () => {
+    mockEscalationCreate();
+
     const res = await request(await createAgentApp({
-      contextSnapshot: {
-        modelProfile: "cheap",
-        recoveryIntent: "status_only",
-        allowDeliverableWork: false,
-        allowDocumentUpdates: false,
-        resumeRequiresNormalModel: true,
-      },
+      contextSnapshot: { ...PRODUCTIVITY_REVIEW_CONTEXT },
+      sourceIssue: { ...SOURCE_ISSUE },
     }))
       .post("/api/companies/company-1/approvals")
       .send({
         type: "request_board_approval",
-        payload: { title: "Approve hosting spend" },
+        payload: { title: "Unblock owner needed for BLO-22206" },
+        issueIds: [SOURCE_ISSUE_ID],
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
+      action: "issue:mutate",
+      resource: expect.objectContaining({
+        type: "issue",
+        issueId: SOURCE_ISSUE_ID,
+        assigneeAgentId: "source-owner",
+        createdByAgentId: "source-creator",
+        status: "blocked",
+      }),
+      scope: expect.objectContaining({ issueId: SOURCE_ISSUE_ID }),
+    }));
+    expect(mockApprovalService.create).toHaveBeenCalled();
+    expect(mockIssueApprovalService.linkManyForApproval).toHaveBeenCalledWith(
+      "approval-escalation",
+      [SOURCE_ISSUE_ID],
+      expect.anything(),
+    );
+  });
+
+  it("refuses an unlinked status-only board escalation before source authorization or creation", async () => {
+    const res = await request(await createAgentApp({
+      contextSnapshot: { ...PRODUCTIVITY_REVIEW_CONTEXT },
+      sourceIssue: { ...SOURCE_ISSUE },
+    }))
+      .post("/api/companies/company-1/approvals")
+      .send({
+        type: "request_board_approval",
+        payload: { title: "Unblock owner needed" },
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(403);
-    expect(res.body.error).toContain("Cheap status-only recovery runs cannot create or modify approvals");
+    expect(res.body.error).toContain("must link its board escalation to the source issue");
+    expect(mockAccessService.decide).not.toHaveBeenCalledWith(expect.objectContaining({ action: "issue:mutate" }));
+    expect(mockApprovalService.create).not.toHaveBeenCalled();
+    expect(mockIssueApprovalService.linkManyForApproval).not.toHaveBeenCalled();
+  });
+
+  it("refuses the review issue as a substitute for the source issue", async () => {
+    const res = await request(await createAgentApp({
+      contextSnapshot: { ...PRODUCTIVITY_REVIEW_CONTEXT },
+      sourceIssue: { ...SOURCE_ISSUE },
+    }))
+      .post("/api/companies/company-1/approvals")
+      .send({
+        type: "request_board_approval",
+        payload: { title: "Unblock owner needed" },
+        issueIds: [REVIEW_ISSUE_ID],
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.details.sourceIssueId).toBe(SOURCE_ISSUE_ID);
+    expect(mockAccessService.decide).not.toHaveBeenCalledWith(expect.objectContaining({ action: "issue:mutate" }));
+    expect(mockApprovalService.create).not.toHaveBeenCalled();
+    expect(mockIssueApprovalService.linkManyForApproval).not.toHaveBeenCalled();
+  });
+
+  it("refuses a source-linked escalation that also attaches an arbitrary same-company issue", async () => {
+    const res = await request(await createAgentApp({
+      contextSnapshot: { ...PRODUCTIVITY_REVIEW_CONTEXT },
+      sourceIssue: { ...SOURCE_ISSUE },
+    }))
+      .post("/api/companies/company-1/approvals")
+      .send({
+        type: "request_board_approval",
+        payload: { title: "Unblock owner needed" },
+        issueIds: [SOURCE_ISSUE_ID, UNRELATED_ISSUE_ID],
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toContain("may only link a board escalation to its source issue");
+    expect(res.body.details.unrelatedIssueIds).toEqual([UNRELATED_ISSUE_ID]);
+    expect(mockAccessService.decide).not.toHaveBeenCalledWith(expect.objectContaining({ action: "issue:mutate" }));
+    expect(mockApprovalService.create).not.toHaveBeenCalled();
+    expect(mockIssueApprovalService.linkManyForApproval).not.toHaveBeenCalled();
+  });
+
+  it("refuses a source-linked escalation when the source is unavailable in the run company", async () => {
+    const res = await request(await createAgentApp({
+      contextSnapshot: { ...PRODUCTIVITY_REVIEW_CONTEXT },
+      sourceIssue: null,
+    }))
+      .post("/api/companies/company-1/approvals")
+      .send({
+        type: "request_board_approval",
+        payload: { title: "Unblock owner needed" },
+        issueIds: [SOURCE_ISSUE_ID],
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toContain("source issue is unavailable in this company");
+    expect(mockAccessService.decide).not.toHaveBeenCalledWith(expect.objectContaining({ action: "issue:mutate" }));
+    expect(mockApprovalService.create).not.toHaveBeenCalled();
+    expect(mockIssueApprovalService.linkManyForApproval).not.toHaveBeenCalled();
+  });
+
+  it("refuses a source-linked escalation when source authorization denies mutation", async () => {
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => (
+      input.action === "issue:mutate"
+        ? {
+            allowed: false,
+            action: "issue:mutate",
+            reason: "deny_missing_grant",
+            explanation: "Source issue is outside the actor's authorization boundary.",
+          }
+        : {
+            allowed: true,
+            action: input.action,
+            reason: "allow_test",
+            explanation: "Allowed by test mock.",
+          }
+    ));
+
+    const res = await request(await createAgentApp({
+      contextSnapshot: { ...PRODUCTIVITY_REVIEW_CONTEXT },
+      sourceIssue: { ...SOURCE_ISSUE },
+    }))
+      .post("/api/companies/company-1/approvals")
+      .send({
+        type: "request_board_approval",
+        payload: { title: "Unblock owner needed" },
+        issueIds: [SOURCE_ISSUE_ID],
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toContain("not authorized to escalate its source issue");
+    expect(res.body.details.authorizationReason).toBe("deny_missing_grant");
+    expect(mockApprovalService.create).not.toHaveBeenCalled();
+    expect(mockIssueApprovalService.linkManyForApproval).not.toHaveBeenCalled();
+  });
+
+  it("refuses a status-only board escalation when the run context has no source issue", async () => {
+    const res = await request(await createAgentApp({
+      contextSnapshot: { ...STATUS_ONLY_CONTEXT, issueId: REVIEW_ISSUE_ID },
+    }))
+      .post("/api/companies/company-1/approvals")
+      .send({
+        type: "request_board_approval",
+        payload: { title: "Unblock owner needed" },
+        issueIds: [SOURCE_ISSUE_ID],
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toContain("has no source issue");
+    expect(mockApprovalService.create).not.toHaveBeenCalled();
+    expect(mockIssueApprovalService.linkManyForApproval).not.toHaveBeenCalled();
+  });
+
+  it("still blocks a status-only recovery run from creating non-escalation approvals", async () => {
+    mockSecretService.normalizeHireApprovalPayloadForPersistence.mockResolvedValue({ title: "Hire an SRE" });
+
+    const res = await request(await createAgentApp({
+      contextSnapshot: { ...PRODUCTIVITY_REVIEW_CONTEXT },
+      sourceIssue: { ...SOURCE_ISSUE },
+    }))
+      .post("/api/companies/company-1/approvals")
+      .send({
+        type: "hire_agent",
+        payload: { title: "Hire an SRE" },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toContain("request_board_approval");
+    expect(res.body.details.allowedApprovalType).toBe("request_board_approval");
     expect(mockApprovalService.create).not.toHaveBeenCalled();
     expect(mockIssueApprovalService.linkManyForApproval).not.toHaveBeenCalled();
   });
@@ -947,7 +1175,7 @@ describe("approval routes idempotent retries", () => {
       .send({ payload: { title: "Retry" } });
 
     expect(res.status, JSON.stringify(res.body)).toBe(403);
-    expect(res.body.error).toContain("Cheap status-only recovery runs cannot create or modify approvals");
+    expect(res.body.error).toContain("can only create `request_board_approval` approvals");
     expect(mockApprovalService.resubmit).not.toHaveBeenCalled();
   });
 
@@ -974,7 +1202,7 @@ describe("approval routes idempotent retries", () => {
       .send({ body: "please approve" });
 
     expect(res.status, JSON.stringify(res.body)).toBe(403);
-    expect(res.body.error).toContain("Cheap status-only recovery runs cannot create or modify approvals");
+    expect(res.body.error).toContain("can only create `request_board_approval` approvals");
     expect(mockApprovalService.addComment).not.toHaveBeenCalled();
   });
 });
