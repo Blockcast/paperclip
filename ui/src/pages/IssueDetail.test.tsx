@@ -2688,6 +2688,25 @@ describe("canBoardManageRuntime", () => {
       }),
     ).toBe(true);
   });
+
+  // /cli-auth/me also answers for agent actors (BLO-21021): `userId` is an agent
+  // id, `user` is null, and `memberships` is empty — which would otherwise hit
+  // the companyIds fallback above and read as "manage".
+  for (const source of ["agent_jwt", "agent_key"]) {
+    it(`denies an ${source} agent identity despite a matching companyId`, () => {
+      expect(
+        canBoardManageRuntime("company-1", {
+          companyIds: ["company-1"],
+          memberships: [],
+          isInstanceAdmin: false,
+          source,
+          keyId: null,
+          user: null,
+          userId: "d2ade02d-112c-4da2-b61f-2301254a154c",
+        }),
+      ).toBe(false);
+    });
+  }
 });
 
 describe("readRecoveryReconcileWorkspaceId", () => {

@@ -64,6 +64,7 @@ const BLO_18278_ERROR_MESSAGE = (resetIso: string) =>
 // What the SDK's final event carries for this fault. `api_error_status` 429 is
 // the surface isRateLimitExhausted keys on.
 const BLO_18278_RESULT_JSON = { api_error_status: 429 } as const;
+const PROVIDER_CAPACITY_RESET_PROVENANCE_SOURCE = "server_parse_provider_capacity_horizon";
 
 describe("parseProviderCapacityResetHorizon", () => {
   const now = Date.parse("2026-07-26T18:50:31.000Z");
@@ -145,6 +146,7 @@ const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 const HINTED_429_TEST_ADAPTER = "provider_capacity_horizon_test";
 const UNHINTED_429_TEST_ADAPTER = "provider_capacity_horizon_control_test";
+const STRUCTURED_429_TEST_ADAPTER = "provider_capacity_horizon_structured_test";
 
 if (!embeddedPostgresSupport.supported) {
   console.warn(
@@ -204,8 +206,10 @@ describeEmbeddedPostgres("provider 429 advertising a capacity reset honors that 
       testEnvironment: testEnvironment(HINTED_429_TEST_ADAPTER),
     });
 
-    // Control: the same 429 with the capacity horizon stripped — the shape we
-    // get when the provider rejects without advertising a reset.
+    // Control: the same 429 with the capacity horizon stripped from the server
+    // parse surfaces — the shape we get when the provider rejects without
+    // advertising a reset. It deliberately tries to smuggle persisted reset
+    // fields through adapter-owned resultJson; finalization must strip them.
     registerServerAdapter({
       type: UNHINTED_429_TEST_ADAPTER,
       execute: async () => ({
@@ -213,15 +217,44 @@ describeEmbeddedPostgres("provider 429 advertising a capacity reset honors that 
         signal: null,
         timedOut: false,
         errorMessage: "API Error: Request rejected (429) · provider capacity temporarily unavailable",
-        resultJson: { ...BLO_18278_RESULT_JSON } as Record<string, unknown>,
+        resultJson: {
+          ...BLO_18278_RESULT_JSON,
+          providerCapacityResetAt: advertisedResetIso,
+          providerCapacityResetProvenance: {
+            source: PROVIDER_CAPACITY_RESET_PROVENANCE_SOURCE,
+            errorFamily: "rate_limit_exhausted",
+            observedStatusCode: 429,
+          },
+        } as Record<string, unknown>,
       }),
       testEnvironment: testEnvironment(UNHINTED_429_TEST_ADAPTER),
+    });
+
+    // The structured counterpart: claude-local/codex-local parse the horizon
+    // adapter-side and hand back `retryNotBefore`, which makes the server's
+    // prose parser skip this result entirely. Before the follow-up fix that
+    // meant such a run reached recovery with NO provenance at all and was
+    // forced into the generic rate-limit/quota wording — discarding a 429 we
+    // can substantiate from `api_error_status` sitting right beside the hint.
+    registerServerAdapter({
+      type: STRUCTURED_429_TEST_ADAPTER,
+      execute: async () => ({
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+        // No prose horizon anywhere — the parser must not be what rescues this.
+        errorMessage: "API Error: Request rejected (429) · provider capacity temporarily unavailable",
+        retryNotBefore: advertisedResetIso,
+        resultJson: { ...BLO_18278_RESULT_JSON } as Record<string, unknown>,
+      }),
+      testEnvironment: testEnvironment(STRUCTURED_429_TEST_ADAPTER),
     });
   }, 120_000);
 
   afterAll(async () => {
     unregisterServerAdapter(HINTED_429_TEST_ADAPTER);
     unregisterServerAdapter(UNHINTED_429_TEST_ADAPTER);
+    unregisterServerAdapter(STRUCTURED_429_TEST_ADAPTER);
     await cleanupHeartbeatTestState(db, heartbeat, {
       errorLabel: "provider capacity horizon cleanup",
       drainTimeoutMs: 30_000,
@@ -292,6 +325,14 @@ describeEmbeddedPostgres("provider 429 advertising a capacity reset honors that 
     expect(resultJson?.retryNotBefore).toBe(advertisedResetIso);
     expect(resultJson?.transientRetryNotBefore).toBe(advertisedResetIso);
     expect(resultJson?.providerCapacityResetAt).toBe(advertisedResetIso);
+    expect(resultJson?.providerCapacityResetProvenance).toEqual({
+      source: PROVIDER_CAPACITY_RESET_PROVENANCE_SOURCE,
+      errorFamily: "rate_limit_exhausted",
+      observedStatusCode: 429,
+      observedStatusField: "api_error_status",
+      observedCause: "rate_limit_exhausted",
+      horizonSource: "server_prose_parse",
+    });
 
     await expect
       .poll(() => countRetriesOf(run!.id), { timeout: 5_000, interval: 50 })
@@ -316,11 +357,49 @@ describeEmbeddedPostgres("provider 429 advertising a capacity reset honors that 
     expect(scheduledInMs).toBeGreaterThan(RATE_LIMIT_HEARTBEAT_RETRY_DELAY_MS * 10);
   }, 60_000);
 
+  // The structured sibling of the case above. An adapter that parses the
+  // horizon itself skips the server's prose parser, so before this fix it
+  // reached recovery with no provenance and lost the 429 diagnosis — on exactly
+  // the adapters that report the fault most precisely.
+  it("substantiates a structured retryNotBefore paired with an observed 429", async () => {
+    const { agentId } = await seedAgent(STRUCTURED_429_TEST_ADAPTER);
+
+    const run = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
+    expect(run).not.toBeNull();
+
+    const failedRun = await waitForRunToFinish(heartbeat, run!.id, 20_000);
+    expect(failedRun?.status).toBe("failed");
+    expect(failedRun?.errorCode).toBe("rate_limit_exhausted");
+
+    const resultJson = failedRun?.resultJson as Record<string, unknown> | null;
+    expect(resultJson?.errorFamily).toBe("rate_limit_exhausted");
+    expect(resultJson?.retryNotBefore).toBe(advertisedResetIso);
+
+    // The horizon is re-derived server-side and re-emitted canonically rather
+    // than trusted verbatim, so the value the comment can quote is ours.
+    expect(resultJson?.providerCapacityResetAt).toBe(advertisedResetIso);
+    expect(resultJson?.providerCapacityResetProvenance).toEqual({
+      source: PROVIDER_CAPACITY_RESET_PROVENANCE_SOURCE,
+      errorFamily: "rate_limit_exhausted",
+      observedStatusCode: 429,
+      observedStatusField: "api_error_status",
+      observedCause: "rate_limit_exhausted",
+      horizonSource: "adapter_structured_retry_not_before",
+    });
+
+    // And it still parks at the advertised instant rather than stranding.
+    await expect
+      .poll(() => countRetriesOf(run!.id), { timeout: 5_000, interval: 50 })
+      .toBe(1);
+    const retryRun = await retryRowOf(run!.id);
+    expect(retryRun?.status).toBe("scheduled_retry");
+    expect(retryRun?.scheduledRetryAt?.toISOString()).toBe(advertisedResetIso);
+  }, 60_000);
+
   // Pins the causal claim: it is the advertised horizon, not merely the 429
   // family, that moves the schedule. The same fault without one still parks in
   // `scheduled_retry` (so it does not strand either) but takes the flat hop.
-  it("falls back to the flat hop when the same 429 advertises no reset", async () => {
-    const { agentId } = await seedAgent(UNHINTED_429_TEST_ADAPTER);
+  it("falls back to the flat hop when the same 429 advertises no reset", async () => {    const { agentId } = await seedAgent(UNHINTED_429_TEST_ADAPTER);
     const startedAt = Date.now();
 
     const run = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
@@ -332,6 +411,7 @@ describeEmbeddedPostgres("provider 429 advertising a capacity reset honors that 
     const resultJson = failedRun?.resultJson as Record<string, unknown> | null;
     expect(resultJson?.retryNotBefore ?? null).toBeNull();
     expect(resultJson?.providerCapacityResetAt ?? null).toBeNull();
+    expect(resultJson?.providerCapacityResetProvenance ?? null).toBeNull();
 
     await expect
       .poll(() => countRetriesOf(run!.id), { timeout: 5_000, interval: 50 })

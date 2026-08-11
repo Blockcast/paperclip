@@ -3,7 +3,7 @@ export type AgentShellCommandDecision =
   | { action: "block"; reason: "full_environment_dump" };
 
 const SAFE_ENV_INSPECTION_RE = /(?:^|[\s;&|()])(?:\.\/scripts\/safe-env-inspect\.mjs|scripts\/safe-env-inspect\.mjs|safe-env-inspect|paperclip-safe-env)(?:\s|$)/;
-const SHELL_WRAPPER_RE = /^(?:\/bin\/)?(?:ba|z|)?sh\s+-l?c\s+(["'])([\s\S]*)\1\s*$/;
+const SHELL_COMMAND_PREFIX_RE = /^(?:\/bin\/)?(?:ba|z|)?sh\s+-l?c(?:\s+|$)/;
 const FULL_ENV_DUMP_RE = new RegExp([
   String.raw`(?:^|[;&|]\s*)(?:command\s+)?(?:\/usr\/bin\/)?(?:env|printenv)(?:\s*(?:[;&|]|$))`,
   String.raw`(?:^|[;&|]\s*)(?:set)(?:\s*(?:[;&|]|$))`,
@@ -13,12 +13,33 @@ const FULL_ENV_DUMP_RE = new RegExp([
   String.raw`\/proc\/(?:self|\d+)\/environ`,
 ].join("|"), "i");
 
+function readShellCommandArgument(input: string): string {
+  const rest = input.trimStart();
+  if (!rest) return "";
+  const quote = rest[0];
+  if (quote === "'" || quote === '"') {
+    let out = "";
+    for (let i = 1; i < rest.length; i += 1) {
+      const ch = rest[i];
+      if (ch === quote) return out;
+      if (quote === '"' && ch === "\\" && i + 1 < rest.length) {
+        i += 1;
+        out += rest[i] ?? "";
+      } else {
+        out += ch;
+      }
+    }
+    return out;
+  }
+  return /^[^\s]+/.exec(rest)?.[0] ?? "";
+}
+
 function unwrapShell(command: string): string {
   let current = command.trim();
   for (let i = 0; i < 3; i += 1) {
-    const match = SHELL_WRAPPER_RE.exec(current);
+    const match = SHELL_COMMAND_PREFIX_RE.exec(current);
     if (!match) return current;
-    current = match[2] ?? current;
+    current = readShellCommandArgument(current.slice(match[0].length));
   }
   return current;
 }
@@ -26,7 +47,7 @@ function unwrapShell(command: string): string {
 export function classifyAgentShellCommand(command: string): AgentShellCommandDecision {
   const normalized = unwrapShell(command).trim();
   if (!normalized) return { action: "allow", reason: "not_environment_dump" };
-  if (SAFE_ENV_INSPECTION_RE.test(normalized)) return { action: "allow", reason: "safe_env_inspection" };
   if (FULL_ENV_DUMP_RE.test(normalized)) return { action: "block", reason: "full_environment_dump" };
+  if (SAFE_ENV_INSPECTION_RE.test(normalized)) return { action: "allow", reason: "safe_env_inspection" };
   return { action: "allow", reason: "not_environment_dump" };
 }

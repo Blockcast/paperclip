@@ -103,6 +103,10 @@ api:
   # only be obtained by rendering the chart unstamped first. A hand-set value
   # makes `approve-paperclip-api-digest.sh` refuse the plan.
   approvalPlanSha256: ""
+  # -- Exact Git commit SHA deployed by the release job (BLO-22032), stamped
+  # onto the API pod template as `paperclip.blockcast.net/deployed-commit`.
+  # 40 lowercase hex, or empty to render no annotation.
+  deployedCommit: ""
 
 # -- Kubernetes Service exposing the HTTP UI/API.
 service:

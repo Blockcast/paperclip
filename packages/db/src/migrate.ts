@@ -24,7 +24,7 @@ async function main(): Promise<void> {
 
     // Runs every time, not only when migrations were just applied: a
     // migration that already recorded complete on a past deploy (BLO-21526 —
-    // migration 0212 records complete on a populated database without
+    // migration 0214 records complete on a populated database without
     // building its index) would otherwise never get this checked again.
     const indexResults = await ensurePendingConcurrentIndexes(resolved.connectionString);
     for (const result of indexResults) {

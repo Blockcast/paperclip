@@ -20,7 +20,10 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { authorizationService } from "../services/authorization.js";
+import {
+  authorizationService,
+  commentAuthorCanGrantIssueMention,
+} from "../services/authorization.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -165,6 +168,30 @@ async function grantUserPermission(
     grantedByUserId: "owner",
   });
 }
+
+describe("comment mention grant predicate", () => {
+  it("matches wake eligibility to the author identities that can grant issue access", () => {
+    const base = {
+      mentionedAgentId: "mentioned-agent",
+      issueAssigneeAgentId: "assignee-agent",
+      authorUserIsActiveMember: false,
+    };
+
+    expect(commentAuthorCanGrantIssueMention({
+      ...base,
+      authorAgentId: "unrelated-agent",
+    })).toBe(false);
+    expect(commentAuthorCanGrantIssueMention({
+      ...base,
+      authorAgentId: "assignee-agent",
+    })).toBe(true);
+    expect(commentAuthorCanGrantIssueMention({
+      ...base,
+      authorAgentId: null,
+      authorUserIsActiveMember: true,
+    })).toBe(true);
+  });
+});
 
 describeEmbeddedPostgres("authorization service", () => {
   let db!: ReturnType<typeof createDb>;
@@ -1324,6 +1351,124 @@ describeEmbeddedPostgres("authorization service", () => {
     })).resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
   });
 
+  it("expires the recovery handoff comment grant once the TTL elapses, even while the action stays active", async () => {
+    const company = await createCompany(db, "RecoveryHandoffTtl");
+    const project = await createProject(db, company.id, "RecoveryHandoffTtlTarget");
+    const previousOwner = await createAgent(db, company.id, { role: "engineer" });
+    const recoveryOwner = await createAgent(db, company.id, { role: "cto" });
+    const unrelatedAgent = await createAgent(db, company.id, { role: "qa" });
+    const issue = await createIssue(db, company.id, {
+      title: "Recovery-transferred handoff target with an aged grant",
+      projectId: project.id,
+      assigneeAgentId: recoveryOwner.id,
+    });
+
+    const authorization = authorizationService(db);
+    const resource = {
+      type: "issue",
+      companyId: company.id,
+      issueId: issue.id,
+      projectId: issue.projectId,
+      assigneeAgentId: recoveryOwner.id,
+      status: "blocked",
+    } as const;
+    const actorFor = (agentId: string) =>
+      ({ type: "agent", agentId, companyId: company.id, source: "agent_key" }) as const;
+    const commentDecision = (agentId: string) =>
+      authorization.decide({ actor: actorFor(agentId), action: "issue:comment", resource });
+    const mutateDecision = (agentId: string) =>
+      authorization.decide({ actor: actorFor(agentId), action: "issue:mutate", resource });
+
+    // The clock is controlled through the anchor the TTL is measured from rather
+    // than by faking timers, so this exercises the same read path production uses.
+    const anchorAgo = (ms: number) =>
+      ({ recoveryHandoffGrantAnchorAt: new Date(Date.now() - ms).toISOString() });
+    const HOUR = 60 * 60 * 1000;
+
+    const [action] = await db.insert(issueRecoveryActions).values({
+      companyId: company.id,
+      sourceIssueId: issue.id,
+      kind: "stranded_assigned_issue",
+      status: "active",
+      ownerType: "agent",
+      ownerAgentId: recoveryOwner.id,
+      previousOwnerAgentId: previousOwner.id,
+      returnOwnerAgentId: previousOwner.id,
+      cause: "stranded_assigned_issue",
+      fingerprint: `fingerprint-${randomUUID()}`,
+      nextAction: "Hand the diagnosis to the recovery owner.",
+      evidence: anchorAgo(23 * HOUR),
+    }).returning();
+    expect(action?.id).toBeTruthy();
+
+    // (a) just inside the TTL, behaviour is unchanged from #827.
+    await expect(commentDecision(previousOwner.id))
+      .resolves.toMatchObject({ allowed: true, reason: "allow_recovery_handoff_grant" });
+    // (c) and it is still comment-only inside the window.
+    await expect(mutateDecision(previousOwner.id))
+      .resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+    // (d) an unrelated agent gets nothing inside the window.
+    await expect(commentDecision(unrelatedAgent.id))
+      .resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+
+    // Age the transfer past the TTL. The action is deliberately left `active` —
+    // that is the whole point: 0 of 119 rows measured had ever been resolved, so
+    // the pre-existing state bound never fires (BLO-20263).
+    await db
+      .update(issueRecoveryActions)
+      .set({ evidence: anchorAgo(25 * HOUR) })
+      .where(eq(issueRecoveryActions.id, action!.id));
+
+    // (b) the grant has lapsed on time alone.
+    await expect(commentDecision(previousOwner.id))
+      .resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+    // (c) mutate is still denied outside the window.
+    await expect(mutateDecision(previousOwner.id))
+      .resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+    // (d) as is the unrelated agent.
+    await expect(commentDecision(unrelatedAgent.id))
+      .resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+
+    // The action really is still active, so this is a time bound and not the
+    // pre-existing resolve/cancel bound firing under another name.
+    const [stillActive] = await db
+      .select({ status: issueRecoveryActions.status })
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action!.id));
+    expect(stillActive?.status).toBe("active");
+
+    // The recovery owner is unaffected throughout — it holds the issue.
+    await expect(mutateDecision(recoveryOwner.id))
+      .resolves.toMatchObject({ allowed: true, reason: "allow_self" });
+
+    // Sweep churn must not renew an expired grant. `upsertSourceScoped` rewrites
+    // `lastAttemptAt` on every pass of an unresolved action, so anchoring the TTL
+    // there would have made it unexpirable — a TTL that reads as bounded and is not.
+    await db
+      .update(issueRecoveryActions)
+      .set({ lastAttemptAt: new Date(), updatedAt: new Date(), attemptCount: 42 })
+      .where(eq(issueRecoveryActions.id, action!.id));
+    await expect(commentDecision(previousOwner.id))
+      .resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+
+    // Rows written before the anchor key existed fall back to `createdAt`, which is
+    // how the 117 aged grants this ticket was filed about lapse at deploy.
+    await db
+      .update(issueRecoveryActions)
+      .set({ evidence: {}, createdAt: new Date(Date.now() - 9 * 24 * HOUR) })
+      .where(eq(issueRecoveryActions.id, action!.id));
+    await expect(commentDecision(previousOwner.id))
+      .resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+
+    // ...and a legacy row created inside the window still works.
+    await db
+      .update(issueRecoveryActions)
+      .set({ evidence: {}, createdAt: new Date(Date.now() - 1 * HOUR) })
+      .where(eq(issueRecoveryActions.id, action!.id));
+    await expect(commentDecision(previousOwner.id))
+      .resolves.toMatchObject({ allowed: true, reason: "allow_recovery_handoff_grant" });
+  });
+
   it("does not open a recovery handoff channel when the escalation kept the previous owner assigned", async () => {
     const company = await createCompany(db, "RecoveryHandoffBoardOwned");
     const project = await createProject(db, company.id, "RecoveryHandoffBoardTarget");
@@ -2009,7 +2154,7 @@ describeEmbeddedPostgres("authorization service", () => {
     })).resolves.toMatchObject({ allowed: false, reason: "deny_low_trust_boundary" });
   });
 
-  it("allows active board-user comments to create mention-scoped issue grants", async () => {
+  it("requires an active board-user membership for mention-scoped issue grants", async () => {
     const company = await createCompany(db, "MentionCommentBoardGrant");
     const allowedProject = await createProject(db, company.id, "MentionBoardAllowed");
     const targetProject = await createProject(db, company.id, "MentionBoardTarget");
@@ -2033,13 +2178,6 @@ describeEmbeddedPostgres("authorization service", () => {
       assigneeAgentId: ownerAgent.id,
     });
     const boardUserId = `user-${randomUUID()}`;
-    await db.insert(companyMemberships).values({
-      companyId: company.id,
-      principalType: "user",
-      principalId: boardUserId,
-      status: "active",
-      membershipRole: "member",
-    });
     await db.insert(issueComments).values({
       companyId: company.id,
       issueId: issue.id,
@@ -2057,7 +2195,22 @@ describeEmbeddedPostgres("authorization service", () => {
       status: issue.status,
     } as const;
 
-    await expect(authorizationService(db).decide({
+    const authorization = authorizationService(db);
+    await expect(authorization.decide({
+      actor,
+      action: "issue:comment",
+      resource,
+    })).resolves.toMatchObject({ allowed: false });
+
+    await db.insert(companyMemberships).values({
+      companyId: company.id,
+      principalType: "user",
+      principalId: boardUserId,
+      status: "active",
+      membershipRole: "member",
+    });
+
+    await expect(authorization.decide({
       actor,
       action: "issue:comment",
       resource,

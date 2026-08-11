@@ -21,10 +21,10 @@ export type ConcurrentIndexEnsureResult = {
 
 /**
  * Deferred `CREATE INDEX CONCURRENTLY` migrations that decline to raise when
- * their index is absent on a populated database (BLO-21526). Migration 0212
+ * their index is absent on a populated database (BLO-21526). Migration 0214
  * (see its header) chose a `RAISE NOTICE`-and-continue over the raise-and-stall
  * pattern used elsewhere in this directory — deliberately, since raising there
- * would roll back 0211's `ADD COLUMN` in the same migration-file transaction —
+ * would roll back 0213's `ADD COLUMN` in the same migration-file transaction —
  * and the production migration client suppresses notices
  * (`packages/db/src/client.ts`'s `onnotice: () => {}`), so nothing else ever
  * surfaces the gap or closes it. This module is that missing enforcement step:
@@ -33,7 +33,7 @@ export type ConcurrentIndexEnsureResult = {
  * not leave a valid index behind, so a skipped or failed build fails the
  * deploy visibly instead of silently.
  *
- * `accessMethod`/`keyColumns`/`predicate` mirror the structural check 0212's
+ * `accessMethod`/`keyColumns`/`predicate` mirror the structural check 0214's
  * own `DO` block runs before trusting a same-named index (BLO-21526 review):
  * a valid, ready index by this name on the wrong table/columns/access
  * method/predicate is not the index this guard exists to guarantee, even
@@ -44,17 +44,17 @@ export type ConcurrentIndexEnsureResult = {
  * missing on a populated table (confirmed by reading each file — they all
  * follow the "IF to_regclass(...) IS NULL THEN ... RAISE EXCEPTION" shape),
  * so deploy-time absence already fails the migration step visibly without
- * this module's help. Add an entry here only for a migration that, like 0212,
+ * this module's help. Add an entry here only for a migration that, like 0214,
  * chooses not to raise.
  */
 export const PENDING_CONCURRENT_INDEXES: readonly ConcurrentIndexSpec[] = [
   {
-    migration: "0212_heartbeat_runs_crash_recovery_index.sql",
+    migration: "0214_heartbeat_runs_crash_recovery_index.sql",
     name: "heartbeat_runs_crash_recovery_pending_idx",
     table: "heartbeat_runs",
     accessMethod: "btree",
     keyColumns: ["finished_at", "id"],
-    // Matches 0212's own paren- and whitespace-insensitive comparison target
+    // Matches 0214's own paren- and whitespace-insensitive comparison target
     // exactly (see that migration's structural check) so the two validators
     // can't silently drift apart.
     predicate: "error_code = 'worker_crashed'::text AND crash_recovery_completed_at IS NULL",
@@ -110,7 +110,7 @@ type IndexState = "absent" | "build-incomplete" | "wrong-definition" | "valid";
 // flags true.
 //
 // A row with both flags true is structurally checked against `spec` (table,
-// access method, key columns, and predicate — same shape 0212's own `DO`
+// access method, key columns, and predicate — same shape 0214's own `DO`
 // block checks) before being trusted as "valid": a same-named index on the
 // wrong definition is not this guard's index, and unlike a genuine
 // build-incomplete leftover it is not safe to silently drop and rebuild (it

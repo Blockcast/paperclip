@@ -12,6 +12,7 @@ import {
   githubCommitStatusDeliveries,
   heartbeatRunEvents,
   heartbeatRuns,
+  issueComments,
   issueRelations,
   issues,
   projects,
@@ -21,7 +22,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { cleanupHeartbeatTestState } from "./helpers/cleanup-heartbeat-test-state.js";
-import { registerServerAdapter, unregisterServerAdapter } from "../adapters/index.ts";
+import { registerServerAdapter, runningProcesses, unregisterServerAdapter } from "../adapters/index.ts";
 import {
   BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS,
   CAPACITY_BLOCKED_HEARTBEAT_RETRY_MAX_ATTEMPTS,
@@ -32,6 +33,9 @@ import {
   MAX_TURN_CONTINUATION_WAKE_REASON,
   heartbeatService,
   isRetryableInteractionContinuationInfrastructureFailure,
+  probeStaleKillReviewEvidence,
+  SESSION_UNAVAILABLE_HEARTBEAT_RETRY_DELAY_MS,
+  SESSION_UNAVAILABLE_HEARTBEAT_RETRY_MAX_ATTEMPTS,
   shouldScheduleAutomaticRunRetry,
 } from "../services/heartbeat.js";
 
@@ -888,7 +892,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       .from(issues)
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
-    expect(issue?.executionRunId).toBe(scheduled.run.id);
+    expect(issue?.executionRunId).toBeNull();
   });
 
   it("does not retry the permanent claude_k8s agent-home workspace failure", () => {
@@ -1076,7 +1080,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
     expect(issue).toMatchObject({
-      executionRunId: scheduled.run.id,
+      executionRunId: null,
       executionWorkspaceId: null,
       executionWorkspacePreference: null,
       executionWorkspaceSettings: { mode: "isolated_workspace" },
@@ -1268,7 +1272,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
     expect(issue).toMatchObject({
-      executionRunId: scheduled.run.id,
+      executionRunId: null,
       executionWorkspaceId: foreignWorkspaceId,
       executionWorkspacePreference: "reuse_existing",
     });
@@ -1396,7 +1400,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
     expect(issue).toMatchObject({
-      executionRunId: scheduled.run.id,
+      executionRunId: null,
       executionWorkspaceId: currentWorkspaceId,
       executionWorkspacePreference: "reuse_existing",
     });
@@ -1545,6 +1549,214 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     ).toBe(false);
   });
 
+  // BLO-18030 — external_lifecycle_stale_killed retry gate.
+  //
+  // The 2026-07-25 PR #1758 incident: a pr_review wake was claimed, went silent,
+  // and was force-killed at EXTERNAL_LIFECYCLE_HARD_STALE_MS. The run was left
+  // terminal with NO bounded retry (this predicate returned false), and its
+  // agent_wakeup_requests row was set to `failed`, which
+  // reconcileFailedWakeDispatches never selects. The review simply never
+  // happened. These tests pin the retry on, and pin the double-review guard that
+  // makes it safe.
+  it("BLO-18030: retries a stale-killed pr_review run once the probe proved no review landed", () => {
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "external_lifecycle_stale_killed",
+        resultJson: { externalLifecycleRecovery: { reviewEvidenceFound: false } },
+        contextSnapshot: { taskKey: "pr_review:Blockcast/pim-multicast-gateway:1758" },
+      }),
+    ).toBe(true);
+
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "external_lifecycle_stale_killed",
+        resultJson: { externalLifecycleRecovery: { reviewEvidenceFound: false } },
+        contextSnapshot: {
+          wakeReason: "github_pr_synchronized",
+          reviewKind: "pr_review",
+          githubPrNumber: 1758,
+        },
+      }),
+    ).toBe(true);
+  });
+
+  it("BLO-18030: never retries a stale-killed run that may already have posted a review", () => {
+    // A review WAS found at this head -- retrying would double-review.
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "external_lifecycle_stale_killed",
+        resultJson: { externalLifecycleRecovery: { reviewEvidenceFound: true } },
+        contextSnapshot: { taskKey: "pr_review:Blockcast/pim-multicast-gateway:1758" },
+      }),
+    ).toBe(false);
+
+    // Probe errored or no PR context => no flag recorded at all. Absence must be
+    // read as "unproven", NOT as "safe to retry": a stale-killed run really was
+    // running and may have posted. This is the case that distinguishes this gate
+    // from job_missing/k8s_pod_schedule_failed, where the pod provably never ran.
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "external_lifecycle_stale_killed",
+        resultJson: { externalLifecycleRecovery: { reason: "external_lifecycle_stale_killed" } },
+        contextSnapshot: { taskKey: "pr_review:Blockcast/pim-multicast-gateway:1758" },
+      }),
+    ).toBe(false);
+
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "external_lifecycle_stale_killed",
+        resultJson: {},
+        contextSnapshot: { taskKey: "pr_review:Blockcast/pim-multicast-gateway:1758" },
+      }),
+    ).toBe(false);
+  });
+
+  it("BLO-18030: does not retry a stale-killed run outside a PR-review context", () => {
+    // Leak guard, matching k8s_concurrent_run_blocked / job_missing: a proven-no-
+    // review issue run must stay terminal rather than re-queueing arbitrary work.
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "external_lifecycle_stale_killed",
+        resultJson: { externalLifecycleRecovery: { reviewEvidenceFound: false } },
+        contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
+      }),
+    ).toBe(false);
+
+    // A present-but-not-pr_review taskKey must also be rejected, so a future
+    // weakening of isPrReviewRetryContext is caught here too.
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "external_lifecycle_stale_killed",
+        resultJson: { externalLifecycleRecovery: { reviewEvidenceFound: false } },
+        contextSnapshot: { taskKey: `issue:${randomUUID()}:42`, wakeReason: "issue_assigned" },
+      }),
+    ).toBe(false);
+
+    // Malformed snapshot must not throw and must stay terminal.
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "external_lifecycle_stale_killed",
+        resultJson: { externalLifecycleRecovery: { reviewEvidenceFound: false } },
+        contextSnapshot: null,
+      }),
+    ).toBe(false);
+  });
+
+  // BLO-18030 review (Important): the stale-kill gate must be evaluated BEFORE
+  // readTransientRecoveryContractFromRun's unconditional `return true`.
+  // Stale-kill finalization merges into the run's PRIOR resultJson, so a run
+  // that hit a transient upstream error earlier in its life keeps that
+  // errorFamily on the record. With the gate ordered after the transient check,
+  // that retained family authorized the retry before the review-evidence gate
+  // ran at all — reintroducing exactly the double-review the gate exists to
+  // prevent, and only for runs carrying stale transient metadata (which is why
+  // the original ordering looked correct in every other test above).
+  it("BLO-18030: a retained transient errorFamily cannot bypass the stale-kill evidence gate", () => {
+    for (const errorFamily of ["transient_upstream", "rate_limit_exhausted", "provider_quota"]) {
+      // Unproven evidence + retained transient family => still terminal.
+      expect(
+        shouldScheduleAutomaticRunRetry({
+          errorCode: "external_lifecycle_stale_killed",
+          resultJson: {
+            errorFamily,
+            externalLifecycleRecovery: { reason: "external_lifecycle_stale_killed" },
+          },
+          contextSnapshot: { taskKey: "pr_review:Blockcast/pim-multicast-gateway:1758" },
+        }),
+      ).toBe(false);
+
+      // A review WAS found + retained transient family => still terminal.
+      expect(
+        shouldScheduleAutomaticRunRetry({
+          errorCode: "external_lifecycle_stale_killed",
+          resultJson: {
+            errorFamily,
+            externalLifecycleRecovery: { reviewEvidenceFound: true },
+          },
+          contextSnapshot: { taskKey: "pr_review:Blockcast/pim-multicast-gateway:1758" },
+        }),
+      ).toBe(false);
+
+      // Proven-no-review still retries: hoisting the gate must not disable it.
+      expect(
+        shouldScheduleAutomaticRunRetry({
+          errorCode: "external_lifecycle_stale_killed",
+          resultJson: {
+            errorFamily,
+            externalLifecycleRecovery: { reviewEvidenceFound: false },
+          },
+          contextSnapshot: { taskKey: "pr_review:Blockcast/pim-multicast-gateway:1758" },
+        }),
+      ).toBe(true);
+    }
+
+    // Non-stale-kill runs must keep the transient fast-path untouched.
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "adapter_failed",
+        resultJson: { errorFamily: "transient_upstream" },
+        contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
+      }),
+    ).toBe(true);
+  });
+
+  // BLO-18030 review (Important): the stale-kill probe must require the wake's
+  // EXACT head. githubHasReviewerEvidenceForPr keys its comment-mode pass on a
+  // head prefix and falls back to fetching the PR's current head when the wake
+  // carried none; if that fetch fails there is no prefix, the comment-mode pass
+  // is skipped, and the probe can answer `{found: false}` while a comment-mode
+  // review exists. Everywhere else that false negative is merely additive —
+  // here it authorizes a retry, i.e. a double review. An unresolved head must
+  // therefore read as unproven (null), never false.
+  //
+  // Each case below returns before any network call, so this pins the guard
+  // itself rather than GitHub behaviour.
+  it("BLO-18030: the stale-kill probe reports an unresolved head as unproven, never as no-review", async () => {
+    // pr_review context, resolvable repo + PR, but the wake carried no head SHA.
+    await expect(
+      probeStaleKillReviewEvidence({
+        contextSnapshot: {
+          reviewKind: "pr_review",
+          githubRepoFullName: "Blockcast/pim-multicast-gateway",
+          githubPrNumber: 1758,
+        },
+      }),
+    ).resolves.toBeNull();
+
+    // Present-but-blank head SHA must not be treated as resolved.
+    await expect(
+      probeStaleKillReviewEvidence({
+        contextSnapshot: {
+          reviewKind: "pr_review",
+          githubRepoFullName: "Blockcast/pim-multicast-gateway",
+          githubPrNumber: 1758,
+          githubHeadSha: "   ",
+        },
+      }),
+    ).resolves.toBeNull();
+
+    // No repo => nothing to probe against.
+    await expect(
+      probeStaleKillReviewEvidence({
+        contextSnapshot: {
+          reviewKind: "pr_review",
+          githubPrNumber: 1758,
+          githubHeadSha: "448bff43a1b2c3d4e5f60718293a4b5c6d7e8f90",
+        },
+      }),
+    ).resolves.toBeNull();
+
+    // Not a PR-review wake at all.
+    await expect(
+      probeStaleKillReviewEvidence({
+        contextSnapshot: { wakeReason: "issue_assigned", issueId: randomUUID() },
+      }),
+    ).resolves.toBeNull();
+
+    // Malformed snapshot must not throw.
+    await expect(probeStaleKillReviewEvidence({ contextSnapshot: null })).resolves.toBeNull();
+  });
+
   it("does not retry plain adapter failures when the wake is not an idempotent PR review", () => {
     expect(
       shouldScheduleAutomaticRunRetry({
@@ -1567,6 +1779,369 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         },
       }),
     ).toBe(false);
+  });
+
+  it("retries session-unavailable failures independent of the heartbeat interval", () => {
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "session_unavailable",
+        resultJson: {},
+        contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
+      }),
+    ).toBe(true);
+    expect(SESSION_UNAVAILABLE_HEARTBEAT_RETRY_DELAY_MS).toBeLessThanOrEqual(2 * 60 * 1000);
+    expect(SESSION_UNAVAILABLE_HEARTBEAT_RETRY_MAX_ATTEMPTS).toBe(2);
+  });
+
+  it("preserves the zero-token reset marker on a session-unavailable retry", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const issueId = randomUUID();
+    const now = new Date();
+    await seedQueuedRunFixture({
+      companyId,
+      agentId,
+      runId,
+      now,
+      contextSnapshot: {
+        issueId,
+        wakeReason: "issue_zero_token_session_reset",
+        retryReason: "zero_token_session_reset",
+      },
+    });
+    mockAdapterExecute.mockResolvedValueOnce({
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      errorMessage: "Session unavailable",
+      errorCode: "session_unavailable",
+      summary: "failed",
+      resultJson: {},
+      provider: "test",
+      model: "test-model",
+    });
+
+    await heartbeat.__test_executeRunForTesting(runId);
+
+    const failedRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    const retryRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.retryOfRunId, runId))
+      .then((rows) => rows[0] ?? null);
+    expect(retryRun?.scheduledRetryReason).toBe("zero_token_session_reset");
+    expect(retryRun?.contextSnapshot).toMatchObject({
+      retryReason: "zero_token_session_reset",
+      wakeReason: "session_unavailable_retry",
+      scheduledRetryAttempt: 1,
+    });
+    expect(failedRun?.contextSnapshot).toMatchObject({ adapterType: "codex_local" });
+  });
+
+  it("keeps session reset retries separate from ordinary retries with the same parent and attempt", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const rootRunId = randomUUID();
+    const activeRunId = randomUUID();
+    const issueId = randomUUID();
+    const now = new Date();
+    await seedQueuedRunFixture({
+      companyId,
+      agentId,
+      runId: activeRunId,
+      now,
+      contextSnapshot: {
+        issueId,
+        taskKey: issueId,
+        wakeReason: "session_unavailable_retry",
+        retryReason: "session_unavailable",
+      },
+    });
+    await db.insert(heartbeatRuns).values({
+      id: rootRunId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "failed",
+      errorCode: "session_unavailable",
+      error: "Session unavailable",
+      finishedAt: new Date(now.getTime() - 1_000),
+      contextSnapshot: { issueId, taskKey: issueId },
+      createdAt: new Date(now.getTime() - 1_000),
+      updatedAt: new Date(now.getTime() - 1_000),
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({
+        status: "running",
+        startedAt: now,
+        retryOfRunId: rootRunId,
+        scheduledRetryAttempt: 1,
+        scheduledRetryReason: "session_unavailable",
+      })
+      .where(eq(heartbeatRuns.id, activeRunId));
+    runningProcesses.set(activeRunId, {
+      child: {} as never,
+      graceSec: 0,
+      processGroupId: null,
+    });
+
+    try {
+      await heartbeat.wakeup(agentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_zero_token_session_reset",
+        payload: { issueId },
+        contextSnapshot: {
+          issueId,
+          taskKey: issueId,
+          retryOfRunId: rootRunId,
+          retryReason: "zero_token_session_reset",
+          scheduledRetryAttempt: 1,
+        },
+        retryOfRunId: rootRunId,
+        scheduledRetryAttempt: 1,
+      });
+
+      const wakeRows = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.agentId, agentId));
+      expect(wakeRows.some((row) => row.reason === "retry_execution_duplicate")).toBe(false);
+      const deferredReset = wakeRows.find((row) => row.status === "deferred_issue_execution");
+      expect(deferredReset).not.toBeNull();
+      const deferredContext = (
+        deferredReset?.payload as {
+          _paperclipWakeContext?: { retryReason?: string };
+        } | null
+      )?._paperclipWakeContext;
+      expect(deferredContext?.retryReason).toBe("zero_token_session_reset");
+    } finally {
+      runningProcesses.delete(activeRunId);
+    }
+  });
+
+  it("partitions deferred retries by family while coalescing exact duplicates", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const rootRunId = randomUUID();
+    const activeRunId = randomUUID();
+    const issueId = randomUUID();
+    const now = new Date();
+    await seedQueuedRunFixture({
+      companyId,
+      agentId,
+      runId: activeRunId,
+      now,
+      contextSnapshot: { issueId, taskKey: issueId, wakeReason: "issue_assigned" },
+    });
+    await db.insert(heartbeatRuns).values({
+      id: rootRunId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "failed",
+      errorCode: "session_unavailable",
+      error: "Session unavailable",
+      finishedAt: new Date(now.getTime() - 1_000),
+      contextSnapshot: { issueId, taskKey: issueId },
+      createdAt: new Date(now.getTime() - 1_000),
+      updatedAt: new Date(now.getTime() - 1_000),
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "running", startedAt: now })
+      .where(eq(heartbeatRuns.id, activeRunId));
+    runningProcesses.set(activeRunId, {
+      child: {} as never,
+      graceSec: 0,
+      processGroupId: null,
+    });
+
+    const enqueueRetry = (retryReason: "session_unavailable" | "zero_token_session_reset") =>
+      heartbeat.wakeup(agentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: `${retryReason}_retry`,
+        payload: { issueId },
+        contextSnapshot: {
+          issueId,
+          taskKey: issueId,
+          retryOfRunId: rootRunId,
+          retryReason,
+          scheduledRetryAttempt: 1,
+        },
+        retryOfRunId: rootRunId,
+        scheduledRetryAttempt: 1,
+      });
+
+    try {
+      await enqueueRetry("session_unavailable");
+      await enqueueRetry("session_unavailable");
+      await enqueueRetry("zero_token_session_reset");
+
+      const deferredRows = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.status, "deferred_issue_execution"));
+      expect(deferredRows).toHaveLength(2);
+      const deferredByReason = new Map(
+        deferredRows.map((row) => {
+          const context = (
+            row.payload as {
+              _paperclipWakeContext?: { retryReason?: string };
+            } | null
+          )?._paperclipWakeContext;
+          return [context?.retryReason, row] as const;
+        }),
+      );
+      expect(deferredByReason.get("session_unavailable")?.coalescedCount).toBe(1);
+      expect(deferredByReason.get("zero_token_session_reset")?.coalescedCount).toBe(0);
+    } finally {
+      runningProcesses.delete(activeRunId);
+    }
+  });
+
+  it("does not queue generic recovery after the final session-unavailable attempt fails", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const issueId = randomUUID();
+    const now = new Date();
+    await seedQueuedRunFixture({
+      companyId,
+      agentId,
+      runId,
+      now,
+      contextSnapshot: {
+        issueId,
+        taskKey: issueId,
+        wakeReason: "session_unavailable_retry",
+        retryReason: "session_unavailable",
+      },
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({ scheduledRetryAttempt: 2, scheduledRetryReason: "session_unavailable" })
+      .where(eq(heartbeatRuns.id, runId));
+    mockAdapterExecute.mockResolvedValueOnce({
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      errorMessage: "Session unavailable",
+      errorCode: "session_unavailable",
+      summary: "failed",
+      resultJson: {},
+      provider: "test",
+      model: "test-model",
+    });
+
+    await heartbeat.__test_executeRunForTesting(runId);
+
+    const followupRuns = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, companyId), sql`${heartbeatRuns.id} <> ${runId}`));
+    expect(followupRuns).toHaveLength(0);
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]);
+    expect(issue?.executionRunId).toBeNull();
+  });
+
+  it("keeps a deferred comment wake separate when a stale session reset is cancelled", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const rootRunId = randomUUID();
+    const activeRunId = randomUUID();
+    const issueId = randomUUID();
+    const commentId = randomUUID();
+    const now = new Date();
+    await seedQueuedRunFixture({
+      companyId,
+      agentId,
+      runId: activeRunId,
+      now,
+      contextSnapshot: { issueId, taskKey: issueId, wakeReason: "issue_assigned" },
+    });
+    await db.insert(heartbeatRuns).values({
+      id: rootRunId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "failed",
+      errorCode: "session_unavailable",
+      error: "Session unavailable",
+      finishedAt: new Date(now.getTime() - 1_000),
+      contextSnapshot: { issueId, taskKey: issueId },
+      createdAt: new Date(now.getTime() - 1_000),
+      updatedAt: new Date(now.getTime() - 1_000),
+    });
+    await db.insert(issueComments).values({
+      id: commentId,
+      companyId,
+      issueId,
+      body: "Please continue with the new information.",
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "running", startedAt: now })
+      .where(eq(heartbeatRuns.id, activeRunId));
+    runningProcesses.set(activeRunId, {
+      child: {} as never,
+      graceSec: 0,
+      processGroupId: null,
+    });
+
+    try {
+      await heartbeat.wakeup(agentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_zero_token_session_reset",
+        payload: { issueId },
+        contextSnapshot: {
+          issueId,
+          taskKey: issueId,
+          retryOfRunId: rootRunId,
+          retryReason: "zero_token_session_reset",
+          scheduledRetryAttempt: 1,
+        },
+        retryOfRunId: rootRunId,
+        scheduledRetryAttempt: 1,
+      });
+      await heartbeat.wakeup(agentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_commented",
+        payload: { issueId, commentId },
+        contextSnapshot: { issueId, taskKey: issueId, wakeCommentId: commentId },
+      });
+
+      const deferredBeforeRelease = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.status, "deferred_issue_execution"));
+      expect(deferredBeforeRelease).toHaveLength(2);
+    } finally {
+      runningProcesses.delete(activeRunId);
+    }
+
+    await heartbeat.cancelRun(activeRunId, "test release");
+
+    const deferredAfterRelease = await db.select().from(agentWakeupRequests);
+    expect(deferredAfterRelease.some((row) => row.error?.includes("superseded"))).toBe(true);
+    const promotedCommentRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, companyId), sql`${heartbeatRuns.id} <> ${activeRunId}`, sql`${heartbeatRuns.id} <> ${rootRunId}`))
+      .then((rows) => rows.find((row) => row.contextSnapshot?.wakeCommentId === commentId) ?? null);
+    expect(promotedCommentRun).not.toBeNull();
   });
 
   // BLO-9147 AC1 — thin-snapshot adapter_failed retry gate
@@ -1665,74 +2240,23 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     ).toBe(false);
   });
 
-  it("retries job_failed only when durable evidence proves adapter invocation never began", () => {
-    expect(
-      shouldScheduleAutomaticRunRetry({
-        errorCode: "job_failed",
-        resultJson: { externalLifecycleRecovery: { adapterInvocationStarted: false } },
-        contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
-      }),
-    ).toBe(true);
-    expect(
-      shouldScheduleAutomaticRunRetry({
-        errorCode: "job_failed",
-        resultJson: { externalLifecycleRecovery: { adapterInvocationStarted: true } },
-        contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
-      }),
-    ).toBe(false);
-    expect(
-      shouldScheduleAutomaticRunRetry({
-        errorCode: "job_failed",
-        resultJson: {},
-        contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
-      }),
-    ).toBe(false);
-    expect(
-      shouldScheduleAutomaticRunRetry({
-        errorCode: "job_failed",
-        resultJson: {},
-        contextSnapshot: { wakeReason: "heartbeat_timer" },
-      }),
-    ).toBe(false);
-    expect(
-      shouldScheduleAutomaticRunRetry({
-        errorCode: "job_failed",
-        resultJson: {},
-        contextSnapshot: null,
-      }),
-    ).toBe(false);
-    expect(JOB_FAILED_HEARTBEAT_RETRY_MAX_ATTEMPTS).toBe(4);
-  });
-
-  it("BLO-9147 AC2: CAPACITY_BLOCKED_HEARTBEAT_RETRY_MAX_ATTEMPTS exceeds rate-limit cap (12)", () => {
-    expect(CAPACITY_BLOCKED_HEARTBEAT_RETRY_MAX_ATTEMPTS).toBeGreaterThan(12);
-  });
-
-  // BLO-10448 — scheduler-level transient infra failures retry gate
-  it.each(["k8s_pod_schedule_failed", "job_missing"])(
-    "BLO-10448: retries %s on a pr_review wake (work never ran)",
+  it.each(["job_failed"])(
+    "retries %s only when durable evidence proves adapter invocation never began",
     (errorCode) => {
       expect(
         shouldScheduleAutomaticRunRetry({
           errorCode,
-          resultJson: {},
-          contextSnapshot: { wakeReason: "github_pr_opened", reviewKind: "pr_review", githubPrNumber: 408 },
+          resultJson: { externalLifecycleRecovery: { adapterInvocationStarted: false } },
+          contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
         }),
       ).toBe(true);
-      // thin snapshot (taskKey-only) — webhook-driven reviewer wakes get trimmed
       expect(
         shouldScheduleAutomaticRunRetry({
           errorCode,
-          resultJson: {},
-          contextSnapshot: { taskKey: "pr_review:Blockcast/Network-Operator-Portal:408" },
+          resultJson: { externalLifecycleRecovery: { adapterInvocationStarted: true } },
+          contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
         }),
-      ).toBe(true);
-    },
-  );
-
-  it.each(["k8s_pod_schedule_failed", "job_missing"])(
-    "BLO-10448: does NOT retry %s on non-PR wakes (BLO-7913 leak guard)",
-    (errorCode) => {
+      ).toBe(false);
       expect(
         shouldScheduleAutomaticRunRetry({
           errorCode,
@@ -1744,11 +2268,63 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         shouldScheduleAutomaticRunRetry({
           errorCode,
           resultJson: {},
-          contextSnapshot: {},
+          contextSnapshot: { wakeReason: "heartbeat_timer" },
+        }),
+      ).toBe(false);
+      expect(
+        shouldScheduleAutomaticRunRetry({
+          errorCode,
+          resultJson: {},
+          contextSnapshot: null,
+        }),
+      ).toBe(false);
+      expect(JOB_FAILED_HEARTBEAT_RETRY_MAX_ATTEMPTS).toBe(4);
+    },
+  );
+
+  it("does not retry job_missing even with synthetic never-invoked evidence", () => {
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "job_missing",
+        resultJson: { externalLifecycleRecovery: { adapterInvocationStarted: false } },
+        contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
+      }),
+    ).toBe(false);
+  });
+
+  it.each(["job_missing", "k8s_pod_schedule_failed"])(
+    "does not let stale transient metadata replay %s",
+    (errorCode) => {
+      expect(
+        shouldScheduleAutomaticRunRetry({
+          errorCode,
+          resultJson: { errorFamily: "transient_upstream" },
+          contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
         }),
       ).toBe(false);
     },
   );
+
+  it("BLO-9147 AC2: CAPACITY_BLOCKED_HEARTBEAT_RETRY_MAX_ATTEMPTS exceeds rate-limit cap (12)", () => {
+    expect(CAPACITY_BLOCKED_HEARTBEAT_RETRY_MAX_ATTEMPTS).toBeGreaterThan(12);
+  });
+
+  it("does not retry ambiguous k8s_pod_schedule_failed outcomes", () => {
+    for (const contextSnapshot of [
+      { wakeReason: "github_pr_opened", reviewKind: "pr_review", githubPrNumber: 408 },
+      { taskKey: "pr_review:Blockcast/Network-Operator-Portal:408" },
+      { issueId: randomUUID(), wakeReason: "issue_assigned" },
+      {},
+    ]) {
+      expect(
+        shouldScheduleAutomaticRunRetry({
+          errorCode: "k8s_pod_schedule_failed",
+          resultJson: {},
+          contextSnapshot,
+        }),
+      ).toBe(false);
+    }
+  });
 
   // BLO-17456: when a PR-review chain exhausts, the reviewer never posts its
   // required status, so the PR sits on "Expected — waiting for status" forever.
@@ -2003,10 +2579,15 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         delayMs: 1_000,
       });
       expect(staleLock).toMatchObject({
-        outcome: "not_scheduled",
-        errorCode: "issue_execution_lock_changed",
-        issueId: staleLockFixture.issueId,
+        outcome: "scheduled",
       });
+      if (staleLock.outcome !== "scheduled") return;
+      const staleLockIssue = await db
+        .select({ executionRunId: issues.executionRunId })
+        .from(issues)
+        .where(eq(issues.id, staleLockFixture.issueId))
+        .then((rows) => rows[0] ?? null);
+      expect(staleLockIssue?.executionRunId).toBeNull();
     },
   );
 
@@ -2028,6 +2609,34 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
           issueId: fixture.issueId,
         });
       }
+    },
+  );
+
+  it.each(["session_unavailable", "zero_token_session_reset"] as const)(
+    "schedules %s retries for an assigned todo issue while leaving its execution lock free until claim",
+    async (retryReason) => {
+      const fixture = await seedMaxTurnFixture({ issueStatus: "todo" });
+      const scheduled = await heartbeat.scheduleBoundedRetry(fixture.runId, {
+        now: fixture.now,
+        retryReason,
+        wakeReason: `${retryReason}_retry`,
+        maxAttempts: 2,
+        delayMs: 1_000,
+      });
+
+      expect(scheduled.outcome).toBe("scheduled");
+      if (scheduled.outcome !== "scheduled") return;
+      expect(scheduled.run).toMatchObject({
+        status: "scheduled_retry",
+        scheduledRetryAttempt: 1,
+        scheduledRetryReason: retryReason,
+      });
+      const issue = await db
+        .select({ executionRunId: issues.executionRunId, status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, fixture.issueId))
+        .then((rows) => rows[0] ?? null);
+      expect(issue).toEqual({ executionRunId: null, status: "todo" });
     },
   );
 

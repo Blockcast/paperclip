@@ -40,7 +40,7 @@ import {
 import type { PluginToolDispatcher } from "../services/plugin-tool-dispatcher.js";
 import { mcpGatewayProtocolRoutes, toolGatewayRoutes } from "../routes/tool-gateway.js";
 import { toolAccessService } from "../services/tool-access.js";
-import { createToolGatewayService, ToolGatewayHttpError } from "../services/tool-gateway.js";
+import { backfillPendingActionRequestSignature, createToolGatewayService, ToolGatewayHttpError } from "../services/tool-gateway.js";
 import { secretService } from "../services/secrets.js";
 import { createKvDemoHttpServer, type KvDemoHttpServer } from "../../../packages/kv-demo-mcp-server/src/http.js";
 import {
@@ -692,6 +692,7 @@ describeEmbeddedPostgres("tool gateway acceptance", () => {
   });
 
   it("throttles named gateway bearer auth failures without leaking bearer material", async () => {
+    const now = Date.now();
     const company = await createCompany(db);
     const [profile] = await db.insert(toolProfiles).values({
       companyId: company.id,
@@ -700,6 +701,7 @@ describeEmbeddedPostgres("tool gateway acceptance", () => {
       defaultAction: "deny",
     }).returning();
     const gateway = createTestToolGatewayService(db, {
+      now: () => now,
       mcpGatewayProtocolLimits: {
         authFailures: { max: 1, windowMs: 60_000 },
       },
@@ -794,6 +796,7 @@ describeEmbeddedPostgres("tool gateway acceptance", () => {
   });
 
   it("shares public gateway auth limiter counters across service instances", async () => {
+    const now = Date.now();
     const company = await createCompany(db);
     const [profile] = await db.insert(toolProfiles).values({
       companyId: company.id,
@@ -802,6 +805,7 @@ describeEmbeddedPostgres("tool gateway acceptance", () => {
       defaultAction: "deny",
     }).returning();
     const serviceA = createTestToolGatewayService(db, {
+      now: () => now,
       mcpGatewayProtocolLimits: {
         authFailures: { max: 1, windowMs: 60_000 },
       },
@@ -811,6 +815,7 @@ describeEmbeddedPostgres("tool gateway acceptance", () => {
       body: { name: "Public auth limiter shared", profileId: profile.id },
     });
     const serviceB = createTestToolGatewayService(db, {
+      now: () => now,
       mcpGatewayProtocolLimits: {
         authFailures: { max: 1, windowMs: 60_000 },
       },
@@ -1702,7 +1707,7 @@ rl.on("line", (line) => {
         .where(eq(activityLog.action, "tool_gateway.call_completed"));
       expect(activity.details).toMatchObject({
         headerSummary: {
-          credentialHeaderNames: "***REDACTED***",
+          credentialHeaderNames: ["***REDACTED***"],
           passthroughHeaderNames: ["x-client-request-id"],
           droppedPassthroughHeaderNames: expect.arrayContaining([
             "authorization",
@@ -1796,7 +1801,7 @@ rl.on("line", (line) => {
         .where(eq(activityLog.action, "tool_gateway.call_completed"));
       expect(activity.details).toMatchObject({
         headerSummary: {
-          credentialHeaderNames: "***REDACTED***",
+          credentialHeaderNames: [],
           passthroughHeaderNames: ["x-client-request-id"],
           droppedPassthroughHeaderNames: expect.arrayContaining([
             "authorization",
@@ -4044,5 +4049,77 @@ rl.on("line", (line) => {
       },
       (error) => expectGatewayError(error, 403, "run_context_mismatch"),
     );
+  });
+
+  it("backfillPendingActionRequestSignature refuses to resurrect an action request the review-queue sweep already cancelled (BLO-21490)", async () => {
+    // requestApprovalForRecordedToolCall() computes the approval snapshot
+    // and signature, THEN calls this same guarded backfill before it ever
+    // creates the (slow) board interaction. If the review-queue integrity
+    // sweep cancels the row as stale in the gap before that backfill runs,
+    // the guard must make the write a no-op rather than silently stamping
+    // a signature onto a request that's already dead — a "signed but
+    // cancelled forever" row that's invisible to both the queue and any
+    // later cleanup.
+    const company = await createCompany(db);
+    const [invocation] = await db.insert(toolInvocations).values({
+      companyId: company.id,
+      toolName: "kv_set",
+    }).returning();
+    const [actionRequest] = await db.insert(toolActionRequests).values({
+      companyId: company.id,
+      invocationId: invocation!.id,
+      status: "pending",
+      canonicalArgumentsHash: "args-hash",
+      canonicalArgumentsSummary: { summary: "{}", sha256: "args-hash", sizeBytes: 2 },
+      signedArguments: null,
+    }).returning();
+
+    // Simulate the review-queue integrity sweep winning the race.
+    await db
+      .update(toolActionRequests)
+      .set({ status: "cancelled", resolvedAt: new Date(), updatedAt: new Date() })
+      .where(eq(toolActionRequests.id, actionRequest!.id));
+
+    const result = await backfillPendingActionRequestSignature(db, actionRequest!.id, {
+      canonicalArgumentsHash: "args-hash",
+      canonicalArgumentsSummary: { summary: "{}", sha256: "args-hash", sizeBytes: 2 },
+      signedArguments: "late-signature-payload",
+      previewMarkdown: "Approve kv_set?",
+      expiresAt: new Date(Date.now() + 60 * 60 * 1000),
+    });
+
+    expect(result).toBeNull();
+    const [row] = await db.select().from(toolActionRequests).where(eq(toolActionRequests.id, actionRequest!.id));
+    expect(row!.status).toBe("cancelled");
+    expect(row!.signedArguments).toBeNull();
+  });
+
+  it("backfillPendingActionRequestSignature signs a still-pending action request", async () => {
+    const company = await createCompany(db);
+    const [invocation] = await db.insert(toolInvocations).values({
+      companyId: company.id,
+      toolName: "kv_set",
+    }).returning();
+    const [actionRequest] = await db.insert(toolActionRequests).values({
+      companyId: company.id,
+      invocationId: invocation!.id,
+      status: "pending",
+      canonicalArgumentsHash: "args-hash",
+      canonicalArgumentsSummary: { summary: "{}", sha256: "args-hash", sizeBytes: 2 },
+      signedArguments: null,
+    }).returning();
+
+    const result = await backfillPendingActionRequestSignature(db, actionRequest!.id, {
+      canonicalArgumentsHash: "updated-hash",
+      canonicalArgumentsSummary: { summary: "{\"key\":1}", sha256: "updated-hash", sizeBytes: 9 },
+      signedArguments: "signature-payload",
+      previewMarkdown: "Approve kv_set?",
+      expiresAt: new Date(Date.now() + 60 * 60 * 1000),
+    });
+
+    expect(result).toMatchObject({ id: actionRequest!.id, status: "pending", signedArguments: "signature-payload" });
+    const [row] = await db.select().from(toolActionRequests).where(eq(toolActionRequests.id, actionRequest!.id));
+    expect(row!.status).toBe("pending");
+    expect(row!.signedArguments).toBe("signature-payload");
   });
 });

@@ -54,12 +54,16 @@ export const THROTTLED_ISSUE_REWAKE_REASONS: ReadonlySet<string> = new Set([
  * Activity actions that count as issue-visible progress when attributed to a
  * run. Deliberately narrower than run-liveness "concrete action evidence":
  * tool calls inside the workspace do not move the issue, so they do not reset
- * the streak — a run must leave a comment, mutation, document, work product,
+ * the streak — a run must leave a mutation, document, work product,
  * interaction, or scheduled continuation behind.
+ *
+ * `issue.comment_added` is deliberately excluded: a bare comment carries no
+ * state change, so on its own it must not count as progress (BLO-23081) — see
+ * `isIssueRewakeProgressActivity` / `isIssueRewakeNewInputActivity` below for
+ * how comments are handled instead.
  */
 export const ISSUE_PROGRESS_ACTIVITY_ACTIONS: string[] = [
   "issue.updated",
-  "issue.comment_added",
   "issue.created",
   "issue.child_created",
   "issue.assigned",
@@ -82,18 +86,64 @@ export const ISSUE_PROGRESS_ACTIVITY_ACTIONS: string[] = [
   "issue.approval_linked",
 ];
 
+/** Comment activity is handled separately — see the actor-aware helpers below. */
+export const ISSUE_COMMENT_ADDED_ACTION = "issue.comment_added";
+
 /**
  * Activity on the issue that counts as new external input since the last run
  * finished — anything a waiting agent should be woken for, including board
- * responses to interactions.
+ * responses to interactions and comments from anyone other than the
+ * evaluating agent itself.
  */
 export const ISSUE_NEW_INPUT_ACTIVITY_ACTIONS: string[] = [
   ...ISSUE_PROGRESS_ACTIVITY_ACTIONS,
+  ISSUE_COMMENT_ADDED_ACTION,
   "issue.thread_interaction_accepted",
   "issue.thread_interaction_answered",
   "issue.thread_interaction_item_verdicts_submitted",
   "issue.blockers_resolved_wake_emitted",
 ];
+
+const ISSUE_PROGRESS_ACTIVITY_ACTION_SET: ReadonlySet<string> = new Set(ISSUE_PROGRESS_ACTIVITY_ACTIONS);
+const ISSUE_NEW_INPUT_ACTIVITY_ACTION_SET: ReadonlySet<string> = new Set(ISSUE_NEW_INPUT_ACTIVITY_ACTIONS);
+
+/**
+ * A single issue-activity row as needed by the throttle: which run (if any)
+ * produced it, who performed it, and when.
+ */
+export interface IssueRewakeActivityRow {
+  runId: string | null;
+  action: string;
+  /** Acting agent id, or null for a user/system actor. */
+  agentId: string | null;
+  createdAt: Date;
+}
+
+/**
+ * Whether an activity row counts as issue-visible progress for streak
+ * purposes. A bare comment never does — a run must also leave a real
+ * mutation behind (BLO-23081); commenting alongside a real mutation still
+ * counts via the mutation's own action.
+ */
+export function isIssueRewakeProgressActivity(row: Pick<IssueRewakeActivityRow, "action">): boolean {
+  return ISSUE_PROGRESS_ACTIVITY_ACTION_SET.has(row.action);
+}
+
+/**
+ * Whether an activity row counts as new external input the throttled agent
+ * should be woken for. A comment authored by the evaluating agent itself is
+ * a status ping, not new input; the identical comment from anyone else
+ * (another agent, a board user) still bypasses the throttle immediately.
+ */
+export function isIssueRewakeNewInputActivity(
+  row: IssueRewakeActivityRow,
+  evaluatingAgentId: string,
+): boolean {
+  if (row.action === ISSUE_COMMENT_ADDED_ACTION) {
+    return row.agentId !== evaluatingAgentId;
+  }
+  return ISSUE_NEW_INPUT_ACTIVITY_ACTION_SET.has(row.action);
+}
 
 export interface IssueRewakeCandidateInput {
   reason: string | null;
@@ -122,12 +172,16 @@ export interface RecentIssueRunSample {
 
 export interface IssueRewakeThrottleInput {
   now: Date;
+  /** The agent whose wake is being evaluated. */
+  agentId: string;
   /** Terminal runs for the same (agent, issue), newest finish first. */
   recentTerminalRuns: RecentIssueRunSample[];
-  /** Runs among the sample that produced issue-visible progress. */
-  runIdsWithIssueProgress: ReadonlySet<string>;
-  /** New issue input landed after the newest run finished. */
-  hasNewIssueInputSinceLastRun: boolean;
+  /**
+   * Issue activity rows relevant to this decision: anything attributed to a
+   * sampled run (for progress) and anything created after the newest run's
+   * finish time (for new input). Order does not matter.
+   */
+  activityRows: IssueRewakeActivityRow[];
 }
 
 export type IssueRewakeThrottleDecision =
@@ -150,14 +204,30 @@ export function computeIssueRewakeCooldownMs(noProgressStreak: number): number {
 export function evaluateIssueRewakeThrottle(input: IssueRewakeThrottleInput): IssueRewakeThrottleDecision {
   const runs = input.recentTerminalRuns;
   if (runs.length === 0) return { blocked: false, noProgressStreak: 0 };
-  if (input.hasNewIssueInputSinceLastRun) return { blocked: false, noProgressStreak: 0 };
+
+  const lastRunFinishedAt = runs[0]?.finishedAt ?? null;
+  const hasNewIssueInputSinceLastRun =
+    lastRunFinishedAt !== null &&
+    input.activityRows.some(
+      (row) =>
+        row.createdAt.getTime() > lastRunFinishedAt.getTime() &&
+        isIssueRewakeNewInputActivity(row, input.agentId),
+    );
+  if (hasNewIssueInputSinceLastRun) return { blocked: false, noProgressStreak: 0 };
+
+  const runIdsWithIssueProgress = new Set(
+    input.activityRows
+      .filter(isIssueRewakeProgressActivity)
+      .map((row) => row.runId)
+      .filter((runId): runId is string => Boolean(runId)),
+  );
 
   let noProgressStreak = 0;
   for (const run of runs) {
     // A failed/cancelled/interrupted run breaks the streak: its follow-up is
     // recovery, not a redundant re-poll, and must not be delayed.
     if (run.status !== "succeeded" || !run.finishedAt) break;
-    if (input.runIdsWithIssueProgress.has(run.id)) break;
+    if (runIdsWithIssueProgress.has(run.id)) break;
     noProgressStreak += 1;
   }
 
@@ -165,7 +235,6 @@ export function evaluateIssueRewakeThrottle(input: IssueRewakeThrottleInput): Is
     return { blocked: false, noProgressStreak };
   }
 
-  const lastRunFinishedAt = runs[0]?.finishedAt;
   if (!lastRunFinishedAt) return { blocked: false, noProgressStreak };
 
   const cooldownMs = computeIssueRewakeCooldownMs(noProgressStreak);

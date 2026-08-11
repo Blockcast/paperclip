@@ -1179,10 +1179,10 @@ describeEmbeddedPostgres("heartbeat worker-crash marking and recovery convergenc
     expect((await readRun(run.id)).crashRecoveryCompletedAt).not.toBeNull();
   });
 
-  // BLO-21526: migration 0211 declines to build the candidate index inline on a
+  // BLO-21526: migration 0214 declines to build the candidate index inline on a
   // populated table (an inline build would hold ACCESS EXCLUSIVE for its
   // duration) and raises a NOTICE instead — which the production client
-  // swallows via `onnotice: () => {}`. So a populated deployment records 0211 as
+  // swallows via `onnotice: () => {}`. So a populated deployment records 0214 as
   // complete with the index absent and no visible signal. Without the index the
   // oldest-first candidate scan is a sequential scan plus a top-N sort, which is
   // fine once per process at startup but not every 30s on every scheduler

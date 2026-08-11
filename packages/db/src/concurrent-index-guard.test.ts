@@ -1,5 +1,5 @@
 /**
- * BLO-21526: migration 0212 records complete on a populated `heartbeat_runs`
+ * BLO-21526: migration 0214 records complete on a populated `heartbeat_runs`
  * table without building `heartbeat_runs_crash_recovery_pending_idx` — it
  * only `RAISE NOTICE`s, and the production migration client suppresses
  * notices (`client.ts`'s `onnotice: () => {}`). Nothing else in the migration
@@ -7,7 +7,7 @@
  * explicit, verifiable step instead of a comment operators are expected to
  * notice. These tests exercise `ensurePendingConcurrentIndexes` standing in
  * for that step: given the exact "migration recorded complete, index absent"
- * state 0212 leaves behind, it must build the index and fail loudly — never
+ * state 0214 leaves behind, it must build the index and fail loudly — never
  * silently — if the build does not leave a valid index in place.
  */
 import { afterEach, describe, expect, it } from "vitest";
@@ -39,11 +39,11 @@ afterEach(async () => {
 async function seedPopulatedDatabaseWithoutIndex() {
   const database = await startEmbeddedPostgresTestDatabase("paperclip-concurrent-index-guard-");
   cleanups.push(database.cleanup);
-  // Applying migrations against an empty database builds 0212's index
+  // Applying migrations against an empty database builds 0214's index
   // inline (it is only deferred once the table is populated), so exercising
   // the "populated, index absent" state this guard exists for means
   // populating the table and dropping the index afterward — the same shape
-  // migration 0212 itself leaves behind on a real populated deploy.
+  // migration 0214 itself leaves behind on a real populated deploy.
   await applyPendingMigrations(database.connectionString);
 
   const sql = postgres(database.connectionString, { max: 1, onnotice: () => {} });
@@ -60,7 +60,7 @@ async function seedPopulatedDatabaseWithoutIndex() {
 }
 
 describeEmbeddedPostgres("ensurePendingConcurrentIndexes", () => {
-  it("builds the deferred index migration 0212 leaves absent on a populated table", async () => {
+  it("builds the deferred index migration 0214 leaves absent on a populated table", async () => {
     const { database, sql } = await seedPopulatedDatabaseWithoutIndex();
 
     const results = await ensurePendingConcurrentIndexes(database.connectionString);
@@ -107,7 +107,7 @@ describeEmbeddedPostgres("ensurePendingConcurrentIndexes", () => {
   it("throws — rather than reporting success — when the online build does not leave a valid index", async () => {
     const { database } = await seedPopulatedDatabaseWithoutIndex();
     const brokenSpec: ConcurrentIndexSpec = {
-      migration: "0212_heartbeat_runs_crash_recovery_index.sql",
+      migration: "0214_heartbeat_runs_crash_recovery_index.sql",
       name: INDEX_NAME,
       table: "heartbeat_runs",
       accessMethod: "btree",
@@ -139,7 +139,7 @@ describeEmbeddedPostgres("ensurePendingConcurrentIndexes", () => {
     );
 
     await expect(ensurePendingConcurrentIndexes(database.connectionString)).rejects.toThrow(
-      /does not match migration 0212_heartbeat_runs_crash_recovery_index\.sql's definition/,
+      /does not match migration 0214_heartbeat_runs_crash_recovery_index\.sql's definition/,
     );
 
     const [{ indisvalid }] = await sql<{ indisvalid: boolean }[]>`

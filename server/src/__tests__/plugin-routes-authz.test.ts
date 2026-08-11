@@ -6,6 +6,7 @@ import { ragHealthBucketCache } from "../routes/plugins.js";
 const mockRegistry = vi.hoisted(() => ({
   getById: vi.fn(),
   getByKey: vi.fn(),
+  listInstalled: vi.fn(),
   listByStatus: vi.fn(),
   upsertConfig: vi.fn(),
   getCompanySettings: vi.fn(),
@@ -53,6 +54,10 @@ async function createApp(
     jobDeps?: unknown;
     toolDeps?: unknown;
     bridgeDeps?: unknown;
+    workerProxy?: {
+      nodeRole: "api" | "worker" | "all";
+      workersInternalUrl: string | null;
+    };
     captureJsonContext?: (context: unknown, body: unknown) => void;
   } = {},
 ) {
@@ -89,6 +94,7 @@ async function createApp(
     undefined,
     routeOverrides.toolDeps as never,
     routeOverrides.bridgeDeps as never,
+    routeOverrides.workerProxy,
   ));
   app.use(errorHandler);
 
@@ -1458,5 +1464,117 @@ describe.sequential("GET /api/plugins/alerts/plugin-health", () => {
     const res = await request(app).get("/api/plugins/alerts/plugin-health");
     expect(res.status).toBe(403);
     expect(mockRegistry.listByStatus).not.toHaveBeenCalled();
+  });
+});
+
+// BLO-22120: these three plugin-state routes are board-only BY DESIGN.
+//
+// `assertBoardOrgAccess` -> `assertBoard` tests `req.actor.type`, not a grant, so no
+// agent identity can reach them and no grant widens them. The BLO-18556 hygiene
+// routine was rewritten (revision 3) to stop instructing an agent to call them; these
+// assertions keep that decision honest, so that widening the gate has to be a
+// deliberate edit to this file rather than a silent side effect.
+describe.sequential("plugin state routes stay board-only for agent actors (BLO-22120)", () => {
+  it("rejects an agent actor with 403 when it tries to enumerate plugin state", async () => {
+    const { app } = await createApp(agentActor());
+
+    const res = await request(app).get("/api/plugins");
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toBe("Board access required");
+    expect(mockRegistry.listInstalled).not.toHaveBeenCalled();
+    expect(mockRegistry.listByStatus).not.toHaveBeenCalled();
+  });
+
+  it("rejects an agent actor with 403 when it tries to read bridge reverse mappings", async () => {
+    const call = vi.fn();
+    const { app } = await createApp(agentActor(), {}, {
+      bridgeDeps: { workerManager: { call } },
+    });
+
+    const res = await request(app)
+      .post(`/api/plugins/${pluginId}/bridge/data`)
+      .send({ key: "connection-status" });
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toBe("Board access required");
+    expect(call).not.toHaveBeenCalled();
+    expect(mockRegistry.getById).not.toHaveBeenCalled();
+  });
+
+  it("rejects an agent actor before API-tier bridge proxying can reach a worker", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ handledBy: "worker" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+
+    try {
+      const workerProxy = {
+        nodeRole: "api" as const,
+        workersInternalUrl: "http://paperclip-worker.internal",
+      };
+      const { app: agentApp } = await createApp(agentActor(), {}, { workerProxy });
+
+      const agentRes = await request(agentApp)
+        .post(`/api/plugins/${pluginId}/bridge/data`)
+        .send({ key: "connection-status" });
+
+      expect(agentRes.status).toBe(403);
+      expect(agentRes.body.error).toBe("Board access required");
+      expect(fetchSpy).not.toHaveBeenCalled();
+
+      const { app: boardApp } = await createApp(boardActor(), {}, { workerProxy });
+      const boardRes = await request(boardApp)
+        .post(`/api/plugins/${pluginId}/bridge/data`)
+        .send({ key: "connection-status" });
+
+      expect(boardRes.status).toBe(200);
+      expect(boardRes.body).toEqual({ handledBy: "worker" });
+      expect(fetchSpy).toHaveBeenCalledOnce();
+      expect(String(fetchSpy.mock.calls[0]?.[0])).toBe(
+        `http://paperclip-worker.internal/api/plugins/${pluginId}/bridge/data`,
+      );
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+
+  it("rejects an agent actor with 403 when it tries to list plugin sync jobs", async () => {
+    const jobStore = { listJobs: vi.fn() };
+    const { app } = await createApp(agentActor(), {}, {
+      jobDeps: { scheduler: {}, jobStore },
+    });
+
+    const res = await request(app).get(`/api/plugins/${pluginId}/jobs`);
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toBe("Board access required");
+    expect(mockRegistry.getById).not.toHaveBeenCalled();
+    expect(jobStore.listJobs).not.toHaveBeenCalled();
+  });
+
+  // Pins gate ORDERING: with the deps unwired a board actor falls through to 501
+  // "not enabled". An agent never gets that far. If the 403 above ever became an
+  // artifact of missing deps rather than the board gate, this contrast would break.
+  it.each([
+    ["bridge data", "post", `/api/plugins/${pluginId}/bridge/data`, { key: "connection-status" }],
+    ["plugin jobs", "get", `/api/plugins/${pluginId}/jobs`, undefined],
+  ] as const)("board actor reaches the %s handler body (501) where an agent is stopped at the gate (403)", async (_label, method, path, body) => {
+    const { app: agentApp } = await createApp(agentActor());
+    const agentRes = method === "get"
+      ? await request(agentApp).get(path)
+      : await request(agentApp).post(path).send(body);
+    expect(agentRes.status).toBe(403);
+    expect(agentRes.body.error).toBe("Board access required");
+
+    const { app: boardApp } = await createApp(boardActor());
+
+    const res = method === "get"
+      ? await request(boardApp).get(path)
+      : await request(boardApp).post(path).send(body);
+
+    expect(res.status).toBe(501);
   });
 });

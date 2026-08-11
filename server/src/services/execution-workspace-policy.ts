@@ -14,6 +14,12 @@ export const WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION =
   "Attach a project to the task, or bind a reusable execution workspace, then retry.";
 export const WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE =
   `This task is set to run in an isolated git worktree, but it has no project and no reusable execution workspace to create the worktree from. ${WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION}`;
+export const WORKSPACE_PREFLIGHT_BLOCKED_ACTIVITY_ACTION = "issue.workspace_preflight_blocked";
+export const WORKSPACE_PREFLIGHT_CLEARED_ACTIVITY_ACTION = "issue.workspace_preflight_cleared";
+export const WORKSPACE_PREFLIGHT_STATE_ACTIVITY_ACTIONS = [
+  WORKSPACE_PREFLIGHT_BLOCKED_ACTIVITY_ACTION,
+  WORKSPACE_PREFLIGHT_CLEARED_ACTIVITY_ACTION,
+] as const;
 
 type WorkspaceStrategyType = ExecutionWorkspaceStrategy["type"];
 
@@ -42,6 +48,12 @@ function parseExecutionWorkspaceStrategy(raw: unknown): ExecutionWorkspaceStrate
     ...(typeof parsed.worktreeParentDir === "string" ? { worktreeParentDir: parsed.worktreeParentDir } : {}),
     ...(typeof parsed.provisionCommand === "string" ? { provisionCommand: parsed.provisionCommand } : {}),
     ...(typeof parsed.teardownCommand === "string" ? { teardownCommand: parsed.teardownCommand } : {}),
+    // BLO-19063: per-run worktree isolation. Only the explicit opt-in survives
+    // the round trip; anything else falls back to the per_issue default rather
+    // than persisting an unrecognized scope.
+    ...(parsed.runScope === "per_run" || parsed.runScope === "per_issue"
+      ? { runScope: parsed.runScope }
+      : {}),
   };
 }
 

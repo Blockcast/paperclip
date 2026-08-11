@@ -44,7 +44,7 @@ import { classifyRisk, toolAccessService } from "../services/tool-access.js";
 import { toolAccessPolicyService } from "../services/tool-access-policy.js";
 import { secretService } from "../services/secrets.js";
 import { canonicalToolArguments, signToolArguments } from "../services/tool-content-guards.js";
-import { createToolGatewayService, type ToolGatewayService } from "../services/tool-gateway.js";
+import { createToolGatewayService, backfillPendingActionRequestSignature, type ToolGatewayService } from "../services/tool-gateway.js";
 import { toolAccessRoutes } from "../routes/tool-access.js";
 import { errorHandler } from "../middleware/index.js";
 
@@ -3378,6 +3378,9 @@ describeEmbeddedPostgres("tool access service", () => {
       canonicalArguments,
       signingSecret: "old-secret",
     });
+    // Older than the signing grace period so the auto-cancel path treats
+    // them as stale rather than as still-in-flight (BLO-21490).
+    const staleCreatedAt = new Date(Date.now() - 60_000);
     const [validRequest, missingSignatureRequest, oldSecretRequest] = await db.insert(toolActionRequests).values([
       {
         companyId: company.id,
@@ -3386,6 +3389,7 @@ describeEmbeddedPostgres("tool access service", () => {
         canonicalArgumentsHash: "args-hash",
         canonicalArgumentsSummary: { summary: canonicalArguments, sha256: "args-hash", sizeBytes: canonicalArguments.length },
         signedArguments: validSignedArguments,
+        createdAt: staleCreatedAt,
       },
       {
         companyId: company.id,
@@ -3394,6 +3398,7 @@ describeEmbeddedPostgres("tool access service", () => {
         canonicalArgumentsHash: "args-hash",
         canonicalArgumentsSummary: { summary: canonicalArguments, sha256: "args-hash", sizeBytes: canonicalArguments.length },
         signedArguments: null,
+        createdAt: staleCreatedAt,
       },
       {
         companyId: company.id,
@@ -3402,6 +3407,7 @@ describeEmbeddedPostgres("tool access service", () => {
         canonicalArgumentsHash: "args-hash",
         canonicalArgumentsSummary: { summary: canonicalArguments, sha256: "args-hash", sizeBytes: canonicalArguments.length },
         signedArguments: oldSecretSignedArguments,
+        createdAt: staleCreatedAt,
       },
     ]).returning();
 
@@ -3413,6 +3419,284 @@ describeEmbeddedPostgres("tool access service", () => {
     expect(statusById.get(validRequest.id)).toBe("pending");
     expect(statusById.get(missingSignatureRequest.id)).toBe("cancelled");
     expect(statusById.get(oldSecretRequest.id)).toBe("cancelled");
+  });
+
+  it("does not cancel a freshly-created pending action request that hasn't finished signing yet, but also doesn't expose it in the queue (BLO-21490)", async () => {
+    // recordInvocation() inserts the pending row before the async
+    // approval-snapshot + signing step backfills signedArguments. A review
+    // queue read landing in that window must not permanently cancel the
+    // request just because it hasn't been signed yet. But it must also not
+    // display the unsigned row: approving it before the backfill lands
+    // would fail signature verification and deny what may be a perfectly
+    // valid in-flight request (Ally review on PR #1107). It should simply
+    // be absent from this read and reappear once signed.
+    const company = await createCompany(db);
+    const [application] = await db.insert(toolApplications).values({
+      companyId: company.id,
+      name: `Action review app ${randomUUID()}`,
+      type: "mcp_http",
+      status: "active",
+    }).returning();
+    const [connection] = await db.insert(toolConnections).values({
+      companyId: company.id,
+      applicationId: application.id,
+      name: `Action review connection ${randomUUID()}`,
+      transport: "remote_http",
+      status: "active",
+      enabled: true,
+      config: { url: "https://fixture.example/mcp" },
+    }).returning();
+    const [catalogEntry] = await db.insert(toolCatalogEntries).values({
+      companyId: company.id,
+      applicationId: application.id,
+      connectionId: connection.id,
+      name: "kv_set",
+      toolName: "kv_set",
+      title: "KV Set",
+      riskLevel: "write",
+      isWrite: true,
+      status: "active",
+      versionHash: "v1",
+      schemaHash: "s1",
+    }).returning();
+    const canonicalArguments = canonicalToolArguments({ key: "alpha", value: "one" });
+    const [inFlightInvocation] = await db.insert(toolInvocations).values({
+      companyId: company.id,
+      applicationId: application.id,
+      connectionId: connection.id,
+      catalogEntryId: catalogEntry.id,
+      toolName: "kv_set",
+      argumentsHash: "args-hash",
+      argumentsSummary: { summary: canonicalArguments, sha256: "args-hash", sizeBytes: canonicalArguments.length },
+      policyDecision: "require_approval" as const,
+      approvalState: "pending" as const,
+      status: "awaiting_approval" as const,
+    }).returning();
+    const [inFlightRequest] = await db.insert(toolActionRequests).values({
+      companyId: company.id,
+      invocationId: inFlightInvocation.id,
+      status: "pending",
+      canonicalArgumentsHash: "args-hash",
+      canonicalArgumentsSummary: { summary: canonicalArguments, sha256: "args-hash", sizeBytes: canonicalArguments.length },
+      signedArguments: null,
+      createdAt: new Date(),
+    }).returning();
+
+    const list = await toolAccessService(db).listActionRequests(company.id, "pending");
+    const [row] = await db.select().from(toolActionRequests).where(eq(toolActionRequests.id, inFlightRequest.id));
+
+    expect(list).toEqual([]);
+    expect(row.status).toBe("pending");
+  });
+
+  it("never leaves a stale-unsigned row cancelled once the signer has backfilled a valid signature for it, even when that backfill races the sweep's cancel write (BLO-21490)", async () => {
+    // Ally's review of PR #1107 (Important #2): the cleanup sweep reads
+    // signedArguments===null, decides a stale row is cancel-worthy, then
+    // writes status="cancelled" predicated only on (company, id,
+    // status="pending"). If the async signer's backfill lands in between —
+    // same CAS shape as the original insert-then-sign race — the sweep's
+    // write has no way to tell the row is no longer the invalid state it
+    // observed, and cancels a request the signer just validated. The fix
+    // adds an isNull(signedArguments) predicate to that write so it can only
+    // ever cancel a row that is *still* unsigned at write time.
+    vi.stubEnv("PAPERCLIP_TOOL_ACTION_SIGNING_SECRET", "current-secret");
+    const company = await createCompany(db);
+    const [application] = await db.insert(toolApplications).values({
+      companyId: company.id,
+      name: `Action review app ${randomUUID()}`,
+      type: "mcp_http",
+      status: "active",
+    }).returning();
+    const [connection] = await db.insert(toolConnections).values({
+      companyId: company.id,
+      applicationId: application.id,
+      name: `Action review connection ${randomUUID()}`,
+      transport: "remote_http",
+      status: "active",
+      enabled: true,
+      config: { url: "https://fixture.example/mcp" },
+    }).returning();
+    const [catalogEntry] = await db.insert(toolCatalogEntries).values({
+      companyId: company.id,
+      applicationId: application.id,
+      connectionId: connection.id,
+      name: "kv_set",
+      toolName: "kv_set",
+      title: "KV Set",
+      riskLevel: "write",
+      isWrite: true,
+      status: "active",
+      versionHash: "v1",
+      schemaHash: "s1",
+    }).returning();
+    const canonicalArguments = canonicalToolArguments({ key: "race", value: "one" });
+    const [invocation] = await db.insert(toolInvocations).values({
+      companyId: company.id,
+      applicationId: application.id,
+      connectionId: connection.id,
+      catalogEntryId: catalogEntry.id,
+      toolName: "kv_set",
+      argumentsHash: "args-hash",
+      argumentsSummary: { summary: canonicalArguments, sha256: "args-hash", sizeBytes: canonicalArguments.length },
+      policyDecision: "require_approval" as const,
+      approvalState: "pending" as const,
+      status: "awaiting_approval" as const,
+    }).returning();
+    // Past the grace cutoff, so a read that still sees signedArguments===null
+    // classifies it as cancel-worthy rather than still-initializing.
+    const staleCreatedAt = new Date(Date.now() - 60_000);
+    const [staleRequest] = await db.insert(toolActionRequests).values({
+      companyId: company.id,
+      invocationId: invocation.id,
+      status: "pending",
+      canonicalArgumentsHash: "args-hash",
+      canonicalArgumentsSummary: { summary: canonicalArguments, sha256: "args-hash", sizeBytes: canonicalArguments.length },
+      signedArguments: null,
+      createdAt: staleCreatedAt,
+    }).returning();
+
+    const signedArguments = signToolArguments({
+      invocationId: invocation.id,
+      toolName: invocation.toolName,
+      canonicalArguments,
+    });
+
+    // Race the sweep's read-then-cancel against the signer's backfill for
+    // real, against the actual database, rather than asserting one fixed
+    // ordering — the invariant below must hold regardless of which wins.
+    await Promise.all([
+      toolAccessService(db).listActionRequests(company.id, "pending"),
+      backfillPendingActionRequestSignature(db, staleRequest.id, {
+        canonicalArgumentsHash: "args-hash",
+        canonicalArgumentsSummary: { summary: canonicalArguments, sha256: "args-hash", sizeBytes: canonicalArguments.length },
+        signedArguments,
+        previewMarkdown: "preview",
+        expiresAt: new Date(Date.now() + 60 * 60 * 1000),
+      }),
+    ]);
+
+    const [row] = await db.select().from(toolActionRequests).where(eq(toolActionRequests.id, staleRequest.id));
+    if (row.signedArguments !== null) {
+      expect(row.status).toBe("pending");
+    } else {
+      expect(row.status).toBe("cancelled");
+    }
+  });
+
+  it("cancels a freshly-created action request with an already-invalid signature immediately, without waiting out the grace period (BLO-21490)", async () => {
+    // The signing grace only exists to cover signedArguments===null (the
+    // row's uninitialized state before the async backfill lands). A row
+    // that already carries a signature — malformed, or signed with the
+    // wrong secret — is a real integrity failure and must not be exposed
+    // in the review queue just because it happens to be fresh.
+    vi.stubEnv("PAPERCLIP_TOOL_ACTION_SIGNING_SECRET", "current-secret");
+    const company = await createCompany(db);
+    const [application] = await db.insert(toolApplications).values({
+      companyId: company.id,
+      name: `Action review app ${randomUUID()}`,
+      type: "mcp_http",
+      status: "active",
+    }).returning();
+    const [connection] = await db.insert(toolConnections).values({
+      companyId: company.id,
+      applicationId: application.id,
+      name: `Action review connection ${randomUUID()}`,
+      transport: "remote_http",
+      status: "active",
+      enabled: true,
+      config: { url: "https://fixture.example/mcp" },
+    }).returning();
+    const [catalogEntry] = await db.insert(toolCatalogEntries).values({
+      companyId: company.id,
+      applicationId: application.id,
+      connectionId: connection.id,
+      name: "kv_set",
+      toolName: "kv_set",
+      title: "KV Set",
+      riskLevel: "write",
+      isWrite: true,
+      status: "active",
+      versionHash: "v1",
+      schemaHash: "s1",
+    }).returning();
+    const canonicalArguments = canonicalToolArguments({ key: "alpha", value: "one" });
+    const [malformedInvocation, wrongSecretInvocation] = await db.insert(toolInvocations).values([1, 2].map(() => ({
+      companyId: company.id,
+      applicationId: application.id,
+      connectionId: connection.id,
+      catalogEntryId: catalogEntry.id,
+      toolName: "kv_set",
+      argumentsHash: "args-hash",
+      argumentsSummary: { summary: canonicalArguments, sha256: "args-hash", sizeBytes: canonicalArguments.length },
+      policyDecision: "require_approval" as const,
+      approvalState: "pending" as const,
+      status: "awaiting_approval" as const,
+    }))).returning();
+    const wrongSecretSignedArguments = signToolArguments({
+      invocationId: wrongSecretInvocation.id,
+      toolName: wrongSecretInvocation.toolName,
+      canonicalArguments,
+      signingSecret: "not-the-current-secret",
+    });
+    const freshCreatedAt = new Date();
+    const [malformedRequest, wrongSecretRequest] = await db.insert(toolActionRequests).values([
+      {
+        companyId: company.id,
+        invocationId: malformedInvocation.id,
+        status: "pending",
+        canonicalArgumentsHash: "args-hash",
+        canonicalArgumentsSummary: { summary: canonicalArguments, sha256: "args-hash", sizeBytes: canonicalArguments.length },
+        signedArguments: "not-a-real-signature-payload",
+        createdAt: freshCreatedAt,
+      },
+      {
+        companyId: company.id,
+        invocationId: wrongSecretInvocation.id,
+        status: "pending",
+        canonicalArgumentsHash: "args-hash",
+        canonicalArgumentsSummary: { summary: canonicalArguments, sha256: "args-hash", sizeBytes: canonicalArguments.length },
+        signedArguments: wrongSecretSignedArguments,
+        createdAt: freshCreatedAt,
+      },
+    ]).returning();
+
+    const list = await toolAccessService(db).listActionRequests(company.id, "pending");
+    const rows = await db.select().from(toolActionRequests);
+    const statusById = new Map(rows.map((row) => [row.id, row.status]));
+
+    expect(list).toEqual([]);
+    expect(statusById.get(malformedRequest.id)).toBe("cancelled");
+    expect(statusById.get(wrongSecretRequest.id)).toBe("cancelled");
+  });
+
+  it("cancels a freshly-created action request whose invocation is missing immediately, without waiting out the grace period (BLO-21490)", async () => {
+    // The invocation lookup in listActionRequests is scoped to the
+    // requesting company. A request row that references an invocation
+    // belonging to a *different* company (a data-integrity mismatch — the
+    // FK itself doesn't enforce company scoping) is indistinguishable from
+    // "still signing" by createdAt alone, but it can never actually finish
+    // signing. The grace period must not exempt it just because it's fresh.
+    const company = await createCompany(db);
+    const otherCompany = await createCompany(db);
+    const [otherCompanyInvocation] = await db.insert(toolInvocations).values({
+      companyId: otherCompany.id,
+      toolName: "kv_set",
+    }).returning();
+    const [orphanedRequest] = await db.insert(toolActionRequests).values({
+      companyId: company.id,
+      invocationId: otherCompanyInvocation.id,
+      status: "pending",
+      canonicalArgumentsHash: "args-hash",
+      canonicalArgumentsSummary: { summary: "{}", sha256: "args-hash", sizeBytes: 2 },
+      signedArguments: null,
+      createdAt: new Date(),
+    }).returning();
+
+    const list = await toolAccessService(db).listActionRequests(company.id, "pending");
+    const [row] = await db.select().from(toolActionRequests).where(eq(toolActionRequests.id, orphanedRequest.id));
+
+    expect(list).toEqual([]);
+    expect(row.status).toBe("cancelled");
   });
 
   it("tracks new profile tools, reviews mixed allow/block decisions, and clears pending counts", async () => {
