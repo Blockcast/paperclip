@@ -3,7 +3,7 @@ import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
-import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNotNull, isNull, lt, lte, ne, not, notInArray, or, sql, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, exists, getTableColumns, gt, gte, inArray, isNotNull, isNull, lt, lte, ne, not, notInArray, or, sql, type SQL } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
@@ -202,6 +202,12 @@ import {
   WorkspaceRepoMismatchError,
 } from "./workspace-runtime.js";
 import { issueService } from "./issues.js";
+import {
+  ISSUE_EXECUTION_LOCK_HOLDING_RUN_STATUSES,
+  ISSUE_EXECUTION_LOCK_REAPABLE_NEVER_STARTED_RUN_STATUSES,
+  TERMINAL_HEARTBEAT_RUN_STATUS_VALUES,
+  TERMINAL_HEARTBEAT_RUN_STATUSES,
+} from "./issue-execution-lock.js";
 import { resolveStaleDependabotAlertWakeIssue } from "./dependabot-alert-issues.js";
 import { createToolGatewayService } from "./tool-gateway.js";
 import { toolAccessService } from "./tool-access.js";
@@ -247,6 +253,9 @@ import {
   resolveEffectiveWorkspaceStrategyType,
   resolveExecutionWorkspaceEnvironmentId,
   resolveExecutionWorkspaceMode,
+  WORKSPACE_PREFLIGHT_BLOCKED_ACTIVITY_ACTION,
+  WORKSPACE_PREFLIGHT_CLEARED_ACTIVITY_ACTION,
+  WORKSPACE_PREFLIGHT_STATE_ACTIVITY_ACTIONS,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION,
@@ -501,7 +510,10 @@ const MAX_INLINE_WAKE_COMMENTS = 8;
 const MAX_INLINE_WAKE_COMMENT_BODY_CHARS = 4_000;
 const MAX_INLINE_WAKE_COMMENT_BODY_TOTAL_CHARS = 12_000;
 const execFile = promisify(execFileCallback);
-const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
+// Same notion as ISSUE_EXECUTION_LOCK_HOLDING_RUN_STATUSES (a run that has not
+// terminalized still owns its issue lock); sourced from there so the two cannot
+// drift apart again. See issue-execution-lock.ts for the drift this closed.
+const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ISSUE_EXECUTION_LOCK_HOLDING_RUN_STATUSES;
 const TASK_SCOPE_COALESCIBLE_RUN_STATUSES = ["queued", "scheduled_retry"] as const;
 const CANCELLABLE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const HEARTBEAT_RUN_TERMINAL_STATUSES = ["succeeded", "interrupted", "failed", "cancelled", "timed_out"] as const;
@@ -15111,7 +15123,57 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return cancelled;
   }
 
+  /**
+   * Whether a generic timer wake has any work this run could actually pick up.
+   *
+   * BLO-19749: this used to count assigned issues by STATUS alone, which made
+   * `skipTimerWhenNoActionableWork` unable to suppress the wakes that actually
+   * waste runs. An issue in `todo`/`in_progress` whose execution lock is already
+   * held by a live run is *not* available to a fresh timer wake — `checkout()`
+   * 409s on it — so a wake that finds only such issues burns a full run and
+   * exits having done nothing. Observed on a UXDesigner timer wake where both
+   * candidate issues 409'd and available work was genuinely zero.
+   *
+   * Availability is therefore checked against the same lock columns `checkout()`
+   * blocks on, including its never-started-lock adoption path. A `queued` or
+   * `scheduled_retry` holder with `startedAt: null` is reclaimable by the timer
+   * run after it starts, so it is actionable; every other non-terminal holder —
+   * including another run of this same agent or a future persisted status — is a
+   * run this wake would lose to.
+   *
+   * Deliberately still counted as actionable: an issue whose blockers are
+   * unresolved. `checkout()` 422s on those, so they are not workable either, but
+   * suppressing their wakes would remove the only path by which an agent notices
+   * and escalates an ageing blocker. Unavailable-because-busy is transient;
+   * unavailable-because-blocked needs someone to look.
+   */
   async function hasActionableTimerWork(agent: typeof agents.$inferSelect) {
+    const heldByNonReapableRun = exists(
+      db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, issues.companyId),
+            or(eq(heartbeatRuns.id, issues.checkoutRunId), eq(heartbeatRuns.id, issues.executionRunId)),
+            // Keep this as the terminal complement rather than enumerating known
+            // holding statuses. `checkout()` retains every non-terminal status,
+            // including a status introduced by a newer deployment. Its only
+            // additional availability path is a queued/retry row that never
+            // started, which checkout can cancel and adopt once this run starts.
+            notInArray(heartbeatRuns.status, TERMINAL_HEARTBEAT_RUN_STATUS_VALUES),
+            not(
+              and(
+                inArray(
+                  heartbeatRuns.status,
+                  [...ISSUE_EXECUTION_LOCK_REAPABLE_NEVER_STARTED_RUN_STATUSES],
+                ),
+                isNull(heartbeatRuns.startedAt),
+              )!,
+            ),
+          ),
+        ),
+    );
     const row = await db
       .select({ id: issues.id })
       .from(issues)
@@ -15122,6 +15184,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           isNull(issues.assigneeUserId),
           isNull(issues.hiddenAt),
           inArray(issues.status, [...TIMER_ACTIONABLE_ISSUE_STATUSES]),
+          not(heldByNonReapableRun),
         ),
       )
       .limit(1)
@@ -26164,7 +26227,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               actorId: "system",
               agentId,
               runId: null,
-              action: "issue.workspace_preflight_blocked",
+              action: WORKSPACE_PREFLIGHT_BLOCKED_ACTIVITY_ACTION,
               entityType: "issue",
               entityId: issue.id,
               details: {
@@ -26180,6 +26243,45 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               },
             });
             return { kind: "skipped" as const };
+          }
+        }
+
+        // Workspace-preflight activity represents the current unresolved
+        // hold, not a permanent historical fact. Only append a resolved event
+        // when this retry has passed the preflight path, so an operator repair
+        // unblocks later dependency promotion without producing an event for
+        // every ordinary wake.
+        if (!activeExecutionRun && issue.status !== "done" && issue.status !== "cancelled") {
+          const latestWorkspacePreflightState = await tx
+            .select({ action: activityLog.action })
+            .from(activityLog)
+            .where(and(
+              eq(activityLog.companyId, issue.companyId),
+              eq(activityLog.entityType, "issue"),
+              eq(activityLog.entityId, issue.id),
+              inArray(activityLog.action, WORKSPACE_PREFLIGHT_STATE_ACTIVITY_ACTIONS),
+            ))
+            .orderBy(desc(activityLog.createdAt), desc(activityLog.id))
+            .limit(1)
+            .then((rows) => rows[0] ?? null);
+          if (latestWorkspacePreflightState?.action === WORKSPACE_PREFLIGHT_BLOCKED_ACTIVITY_ACTION) {
+            await logActivity(tx as unknown as Db, {
+              companyId: issue.companyId,
+              actorType: "system",
+              actorId: "system",
+              agentId,
+              runId: null,
+              action: WORKSPACE_PREFLIGHT_CLEARED_ACTIVITY_ACTION,
+              entityType: "issue",
+              entityId: issue.id,
+              details: {
+                code: WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE,
+                reason: "A retry passed workspace preflight after the workspace configuration was repaired.",
+                requestedReason: reason,
+                source,
+                triggerDetail,
+              },
+            });
           }
         }
 
