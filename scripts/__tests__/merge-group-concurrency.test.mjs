@@ -27,6 +27,18 @@ test("merge-group re-stages share one concurrency group per base queue", () => {
   assert.match(concurrency, /cancel-in-progress: true/);
 });
 
+test("merge-group control gates use the dedicated queue runner pool", () => {
+  const runnerExpression =
+    /runs-on: \$\{\{ github\.event_name == 'merge_group' && 'arc-merge-queue' \|\| 'arc-light' \}\}/;
+  const jobs = [
+    extractBlock("\n  policy:\n", "\n  helm_chart:\n"),
+    extractBlock("\n  helm_chart:\n", "\n  typecheck_release_registry:\n"),
+    extractBlock("\n  verify:\n", "\n  build:\n"),
+  ];
+
+  for (const job of jobs) assert.match(job, runnerExpression);
+});
+
 test("policy CI pins the merge-group concurrency contract", () => {
   const policy = extractBlock("\n  policy:\n", "\n  helm_chart:\n");
 

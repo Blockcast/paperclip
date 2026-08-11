@@ -22,7 +22,9 @@ env:
 
 jobs:
   policy:
-    runs-on: arc-light
+    # A merge-group is the sole landing candidate and must not wait behind the
+    # pull-request review backlog that saturates arc-light.
+    runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-light' }}
     timeout-minutes: 5
     outputs:
       lockfile_regenerated: ${{ steps.regen_lockfile.outputs.regenerated }}
@@ -217,7 +219,7 @@ jobs:
   # the gate that every unrelated PR depends on.
   helm_chart:
     name: Helm chart
-    runs-on: arc-light
+    runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-light' }}
     timeout-minutes: 10
 
     steps:
@@ -513,7 +515,7 @@ jobs:
         opencode_responses_replay,
         build,
       ]
-    runs-on: arc-light
+    runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-light' }}
     timeout-minutes: 5
 
     steps:
