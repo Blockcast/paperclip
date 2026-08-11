@@ -1,5 +1,6 @@
 import http from "node:http";
 import fs from "node:fs";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import type { AddressInfo } from "node:net";
@@ -223,6 +224,31 @@ function postJson(
     headers: res.headers,
     json: async () => JSON.parse(res.body),
   }));
+}
+
+// Announces a body larger than what it actually sends, then destroys the
+// socket before the announced Content-Length is reached — this is what an
+// aborted upload / dropped client connection looks like to readBody()'s
+// `for await` iteration over the request stream, and is the failure mode the
+// audit-coverage regression test below exercises.
+function destroySocketMidBody(url: string): Promise<void> {
+  const parsed = new URL(url);
+  return new Promise((resolve) => {
+    const socket = net.connect(Number(parsed.port), parsed.hostname, () => {
+      socket.write(
+        `POST ${parsed.pathname} HTTP/1.1\r\n` +
+          `Host: ${parsed.host}\r\n` +
+          "Content-Type: application/json\r\n" +
+          "Content-Length: 200\r\n\r\n" +
+          '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ping"',
+      );
+      setTimeout(() => {
+        socket.destroy();
+        setTimeout(resolve, 150);
+      }, 50);
+    });
+    socket.on("error", () => undefined);
+  });
 }
 
 async function createHangingUpstream(): Promise<{ url: string }> {
@@ -1751,6 +1777,50 @@ describe("mcp gateway request logging", () => {
       }
     } finally {
       logSpy.mockRestore();
+    }
+  });
+
+  it("logs one fallback line (matched prefix, HTTP method) when body consumption fails on the direct route", async () => {
+    const upstream = await createStrictMcpUpstream([{ name: "ping", description: "Ping" }]);
+    const gateway = await createGateway(upstream.url);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    try {
+      await destroySocketMidBody(gateway.url);
+
+      const requestLines = logSpy.mock.calls
+        .map((call) => String(call[0]))
+        .filter((line) => line.includes("mcp_gateway_request"));
+      expect(requestLines).toHaveLength(1);
+      expect(JSON.parse(requestLines[0]) as Record<string, unknown>).toMatchObject({
+        prefix: "k8s-admin",
+        method: "POST",
+      });
+      expect((JSON.parse(requestLines[0]) as Record<string, unknown>).tool).toBeUndefined();
+    } finally {
+      logSpy.mockRestore();
+      errorSpy.mockRestore();
+    }
+  });
+
+  it("logs one fallback line (prefix '*', HTTP method) when body consumption fails on the aggregate route", async () => {
+    const upstream = await createStrictMcpUpstream([{ name: "ping", description: "Ping" }]);
+    const gateway = await createAggregateGateway({ "k8s-admin": { url: upstream.url, credentialHeaders: [] } });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    try {
+      await destroySocketMidBody(gateway.url);
+
+      const requestLines = logSpy.mock.calls
+        .map((call) => String(call[0]))
+        .filter((line) => line.includes("mcp_gateway_request"));
+      expect(requestLines).toHaveLength(1);
+      expect(JSON.parse(requestLines[0]) as Record<string, unknown>).toMatchObject({ prefix: "*", method: "POST" });
+    } finally {
+      logSpy.mockRestore();
+      errorSpy.mockRestore();
     }
   });
 });
