@@ -843,6 +843,103 @@ describe("issue update comment wakeups", () => {
     expect(mockIssueService.markCommentIdempotencyProcessed).not.toHaveBeenCalled();
   });
 
+  it("does not enqueue a keyed mention wake when an agent cannot grant reply access", async () => {
+    const existing = makeIssue({
+      assigneeAgentId: ASSIGNEE_AGENT_ID,
+      assigneeUserId: null,
+      status: "in_progress",
+    });
+    const comment = {
+      id: "comment-keyed-non-assignee-mention",
+      issueId: existing.id,
+      companyId: existing.companyId,
+      authorType: "agent",
+      authorAgentId: PREVIOUS_AGENT_ID,
+      authorUserId: null,
+      body: `[@QA](agent://${MENTIONED_AGENT_ID}) please inspect this`,
+      presentation: null,
+      metadata: null,
+      idempotencyKey: "mention:unauthorized",
+      idempotencyProcessedAt: null,
+      createdAt: new Date("2026-08-11T00:00:00.000Z"),
+      updatedAt: new Date("2026-08-11T00:00:00.000Z"),
+    };
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.addComment.mockResolvedValue(comment);
+    mockIssueService.findMentionedAgents.mockResolvedValue([MENTIONED_AGENT_ID]);
+
+    const res = await request(await createApp({
+      type: "agent",
+      agentId: PREVIOUS_AGENT_ID,
+      companyId: existing.companyId,
+      source: "agent_key",
+    }))
+      .post(`/api/issues/${existing.id}/comments`)
+      .send({ body: comment.body, idempotencyKey: comment.idempotencyKey });
+
+    expect(res.status).toBe(201);
+    expect(mockCommentEffects.enqueueCommentEffects).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        effects: expect.not.arrayContaining([
+          expect.objectContaining({
+            effectKind: "wake",
+            payload: expect.objectContaining({ agentId: MENTIONED_AGENT_ID }),
+          }),
+        ]),
+      }),
+    );
+  });
+
+  it("enqueues a keyed mention wake when an active member grants reply access", async () => {
+    const existing = makeIssue({
+      assigneeAgentId: null,
+      assigneeUserId: "active-user",
+      status: "in_progress",
+    });
+    const comment = {
+      id: "comment-keyed-member-mention",
+      issueId: existing.id,
+      companyId: existing.companyId,
+      authorType: "user",
+      authorAgentId: null,
+      authorUserId: "active-user",
+      body: `[@QA](agent://${MENTIONED_AGENT_ID}) please inspect this`,
+      presentation: null,
+      metadata: null,
+      idempotencyKey: "mention:authorized",
+      idempotencyProcessedAt: null,
+      createdAt: new Date("2026-08-11T00:00:00.000Z"),
+      updatedAt: new Date("2026-08-11T00:00:00.000Z"),
+    };
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.addComment.mockResolvedValue(comment);
+    mockIssueService.findMentionedAgents.mockResolvedValue([MENTIONED_AGENT_ID]);
+
+    const res = await request(await createApp({
+      type: "board",
+      userId: "active-user",
+      companyIds: [existing.companyId],
+      source: "session",
+      isInstanceAdmin: false,
+    }))
+      .post(`/api/issues/${existing.id}/comments`)
+      .send({ body: comment.body, idempotencyKey: comment.idempotencyKey });
+
+    expect(res.status).toBe(201);
+    expect(mockCommentEffects.enqueueCommentEffects).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        effects: expect.arrayContaining([
+          expect.objectContaining({
+            effectKind: "wake",
+            payload: expect.objectContaining({ agentId: MENTIONED_AGENT_ID }),
+          }),
+        ]),
+      }),
+    );
+  });
+
   it("does not route a plain-text agent name on a human-owned issue comment", async () => {
     const existing = makeIssue({
       assigneeAgentId: null,

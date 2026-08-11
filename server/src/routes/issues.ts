@@ -4018,8 +4018,23 @@ export function issueRoutes(
     }
 
     const mentionedIds = await svc.findMentionedAgents(input.issue.companyId, input.comment.body);
+    let authorUserIsActiveMember = false;
+    if (mentionedIds.length > 0 && actor.actorType === "user") {
+      try {
+        authorUserIsActiveMember = Boolean(
+          await getActiveCompanyMembership(db, input.issue.companyId, "user", actor.actorId),
+        );
+      } catch (err) {
+        logger.warn({ err, issueId: input.issue.id }, "failed to resolve keyed comment author membership for @-mentions");
+      }
+    }
     for (const mentionedId of mentionedIds) {
-      if (actor.actorType === "agent" && actor.actorId === mentionedId) continue;
+      if (!commentAuthorCanGrantIssueMention({
+        mentionedAgentId: mentionedId,
+        issueAssigneeAgentId: input.issue.assigneeAgentId,
+        authorAgentId: actor.actorType === "agent" ? actor.actorId : null,
+        authorUserIsActiveMember,
+      })) continue;
       const key = `${mentionedId}:${input.issue.id}`;
       if (wakeups.has(key)) continue;
       wakeups.set(key, {
