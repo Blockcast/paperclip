@@ -144,6 +144,25 @@ test("selectLatestQueueAttemptWindow falls back to `now` when still enqueued (no
   assert.equal(window.dequeuedAt, new Date(now).toISOString());
 });
 
+test("selectLatestQueueAttemptWindow ignores a re-enqueue that lands after `now` (Ally review #1220, grace-period race)", () => {
+  // The PR is dequeued (evicted) at 13:55:45, then manually re-added at
+  // 13:56:10 -- inside this run's 60s post-dequeue grace-period sleep. `now`
+  // is captured at trigger time (13:55:50), before that re-enqueue landed.
+  // The window must still classify the dequeue that triggered this run, not
+  // jump onto the brand-new attempt that has no runs yet.
+  const events = [
+    { event: "added_to_merge_queue", created_at: "2026-08-08T09:24:35Z" },
+    { event: "removed_from_merge_queue", created_at: "2026-08-08T13:55:45Z" },
+    { event: "added_to_merge_queue", created_at: "2026-08-08T13:56:10Z" },
+  ];
+  const now = Date.parse("2026-08-08T13:55:50Z");
+  const window = selectLatestQueueAttemptWindow(events, { now });
+  assert.deepEqual(window, {
+    enqueuedAt: "2026-08-08T09:24:35.000Z",
+    dequeuedAt: "2026-08-08T13:55:45.000Z",
+  });
+});
+
 test("selectLatestQueueAttemptWindow returns null when no added_to_merge_queue event exists", () => {
   const window = selectLatestQueueAttemptWindow(
     [{ event: "labeled", created_at: "2026-08-08T09:00:00Z" }],

@@ -39,6 +39,17 @@ export function filterMergeGroupRunsForPr(runs, { base, prNumber }) {
  * the MOST RECENT enqueue/dequeue pair so the run lookup can be bounded to
  * it.
  *
+ * `now` must be captured when this run was triggered (before any
+ * merge-race grace-period sleep), not when this function is called. Ally
+ * review #1220 (third pass): the detector sleeps up to `graceMs` before
+ * reading the timeline; a PR re-added to the queue during that sleep adds a
+ * fresh `added_to_merge_queue` event with no run yet. Picking "whatever is
+ * latest by the time we wake up" would jump onto that brand-new attempt and
+ * misclassify it `conflict_unstageable` instead of classifying the actual
+ * dequeue that triggered this run. Filtering enqueue candidates to
+ * `at <= now` keeps the window anchored to the attempt that had already
+ * ended when the triggering webhook fired.
+ *
  * @param {Array<{ event: string, created_at: string }>} timelineEvents
  * @param {{ now: number }} opts
  * @returns {{ enqueuedAt: string, dequeuedAt: string } | null}
@@ -50,7 +61,7 @@ export function selectLatestQueueAttemptWindow(timelineEvents, { now }) {
     .filter((e) => Number.isFinite(e.at))
     .sort((a, b) => a.at - b.at);
 
-  const enqueues = events.filter((e) => e.event === "added_to_merge_queue");
+  const enqueues = events.filter((e) => e.event === "added_to_merge_queue" && e.at <= now);
   if (enqueues.length === 0) return null;
   const lastEnqueue = enqueues[enqueues.length - 1];
 
@@ -212,6 +223,13 @@ async function main() {
     return;
   }
 
+  // Captured before the grace-period sleep below, not after: this run
+  // exists to classify the dequeue that triggered it. A PR re-enqueued
+  // during the sleep must not shift `selectLatestQueueAttemptWindow`'s
+  // window onto that fresh, run-less attempt (Ally review #1220, third
+  // pass -- see the function's doc comment).
+  const triggeredAt = Date.now();
+
   let pr = ghPrView(repo, prNumber);
   if (!pr.merged) {
     // Guard against the race where `dequeued` fires for the queue's own
@@ -224,7 +242,7 @@ async function main() {
   }
 
   const timeline = ghTimeline(repo, prNumber);
-  const attemptWindow = selectLatestQueueAttemptWindow(timeline, { now: Date.now() });
+  const attemptWindow = selectLatestQueueAttemptWindow(timeline, { now: triggeredAt });
 
   let allRuns;
   if (attemptWindow) {

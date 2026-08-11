@@ -58,14 +58,19 @@ likely it is.
 **Detection is automated** (`.github/workflows/merge-queue-eviction-detector.yml`,
 `scripts/merge-queue-eviction-detector.mjs`): GitHub fires
 `pull_request` `action=dequeued` for every queue removal, including a
-successful merge. The workflow waits out a short race window, then confirms
-the PR is genuinely unmerged, reads the PR's own timeline to find the
-boundaries of the queue attempt that just ended (`selectLatestQueueAttemptWindow`
-— the most recent `added_to_merge_queue` paired with the next
-`removed_from_merge_queue` after it, so a prior queue attempt for the same PR
-can't leak into this one), enumerates `merge_group` runs created inside that
-window (`buildRunSearchWindow`, `gh run list --created <window>`), and
-classifies the eviction:
+successful merge. The workflow captures its own trigger time first, then
+waits out a short merge-race grace period, then confirms the PR is genuinely
+unmerged, reads the PR's own timeline to find the boundaries of the queue
+attempt that just ended (`selectLatestQueueAttemptWindow` — the most recent
+`added_to_merge_queue` **that had already happened by the captured trigger
+time** paired with the next `removed_from_merge_queue` after it). Anchoring
+to the trigger time, not to whenever the function happens to run, matters
+twice over: it keeps a prior queue attempt for the same PR from leaking into
+this one, and it keeps a PR that gets manually re-added to the queue *during*
+the grace-period sleep from having its brand-new, run-less attempt misread as
+this attempt's outcome (Ally review #1220, third pass). It then enumerates
+`merge_group` runs created inside that window (`buildRunSearchWindow`,
+`gh run list --created <window>`), and classifies the eviction:
 
 - **zero `merge_group` runs found inside that attempt's window → `conflict_unstageable`**
   (this shape),
