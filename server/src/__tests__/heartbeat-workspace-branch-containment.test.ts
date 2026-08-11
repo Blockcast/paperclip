@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { and, eq, inArray } from "drizzle-orm";
+import { and, desc, eq, inArray } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -39,6 +39,9 @@ import { cleanupHeartbeatTestState } from "./helpers/cleanup-heartbeat-test-stat
 import { heartbeatService } from "../services/heartbeat.ts";
 import { instanceSettingsService } from "../services/instance-settings.ts";
 import {
+  WORKSPACE_PREFLIGHT_BLOCKED_ACTIVITY_ACTION,
+  WORKSPACE_PREFLIGHT_CLEARED_ACTIVITY_ACTION,
+  WORKSPACE_PREFLIGHT_STATE_ACTIVITY_ACTIONS,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION,
@@ -1027,7 +1030,7 @@ describeEmbeddedPostgres("heartbeat workspace branch containment", () => {
       .from(activityLog)
       .where(eq(activityLog.entityId, issueId))
       .then((rows) => rows[0] ?? null);
-    expect(activity?.action).toBe("issue.workspace_preflight_blocked");
+    expect(activity?.action).toBe(WORKSPACE_PREFLIGHT_BLOCKED_ACTIVITY_ACTION);
     expect(activity?.details).toMatchObject({
       code: WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE,
       reason: WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE,
@@ -1035,6 +1038,35 @@ describeEmbeddedPostgres("heartbeat workspace branch containment", () => {
       resolvedMode: "isolated_workspace",
       resolvedStrategy: "git_worktree",
       hasResolvablePriorSessionWorkspace: false,
+    });
+
+    await db
+      .update(issues)
+      .set({ executionWorkspaceSettings: { mode: "agent_default" }, updatedAt: new Date() })
+      .where(eq(issues.id, issueId));
+    const retriedRun = await heartbeat.wakeup(agentId, {
+      source: "assignment",
+      triggerDetail: "workspace_repaired",
+      reason: "workspace_preflight_repaired",
+      payload: { issueId },
+      contextSnapshot: { issueId, wakeReason: "workspace_preflight_repaired" },
+    });
+
+    expect(retriedRun).not.toBeNull();
+    const latestPreflightActivity = await db
+      .select({ action: activityLog.action, details: activityLog.details })
+      .from(activityLog)
+      .where(and(
+        eq(activityLog.entityId, issueId),
+        inArray(activityLog.action, WORKSPACE_PREFLIGHT_STATE_ACTIVITY_ACTIONS),
+      ))
+      .orderBy(desc(activityLog.createdAt), desc(activityLog.id))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    expect(latestPreflightActivity?.action).toBe(WORKSPACE_PREFLIGHT_CLEARED_ACTIVITY_ACTION);
+    expect(latestPreflightActivity?.details).toMatchObject({
+      code: WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE,
+      requestedReason: "workspace_preflight_repaired",
     });
   });
 
