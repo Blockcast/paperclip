@@ -1510,7 +1510,7 @@ registry.registerPath({
   method: "get",
   path: "/api/agents/me/inbox-lite",
   tags: ["agents"],
-  summary: "Get current agent inbox (lite)",
+  summary: "Get current agent inbox (lite) — todo, in_progress, blocked (in_review excluded)",
   responses: { 200: r.ok(), 401: r.unauthorized },
 });
 
@@ -3740,6 +3740,21 @@ registry.registerPath({
 
 registry.registerPath({
   method: "get",
+  path: "/api/companies/{companyId}/parked-agents",
+  tags: ["runs"],
+  summary: "List agents parked on a scheduled retry, and when each is due to run again",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    query: z.object({
+      reason: z.string().min(1).max(64).optional(),
+      limit: z.coerce.number().int().min(1).max(1000).optional(),
+    }),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "get",
   path: "/api/companies/{companyId}/live-runs",
   tags: ["runs"],
   summary: "List live runs for a company",
@@ -4992,6 +5007,9 @@ registry.registerPath({
   path: "/api/plugins/{pluginId}/config",
   tags: ["plugins"],
   summary: "Get company-scoped plugin config",
+  description:
+    "Requires instance admin. Secret-bearing values are returned as `__redacted__`; " +
+    "posting the response back unchanged preserves the stored secret.",
   request: {
     params: z.object({ pluginId: z.string() }),
     query: z.object({ companyId: z.string() }),
@@ -5004,6 +5022,9 @@ registry.registerPath({
   path: "/api/plugins/{pluginId}/config",
   tags: ["plugins"],
   summary: "Set company-scoped plugin config",
+  description:
+    "Requires instance admin. A field sent as `__redacted__` keeps its stored value; " +
+    "the sentinel is never persisted.",
   request: {
     params: z.object({ pluginId: z.string() }),
     body: jsonBody(z.object({ companyId: z.string(), configJson: z.record(z.unknown()) })),
@@ -5016,6 +5037,9 @@ registry.registerPath({
   path: "/api/plugins/{pluginId}/config/test",
   tags: ["plugins"],
   summary: "Test company-scoped plugin config",
+  description:
+    "Requires instance admin. Restores masked (`__redacted__`) fields from stored config " +
+    "before handing them to the plugin worker.",
   request: {
     params: z.object({ pluginId: z.string() }),
     body: jsonBody(z.object({ companyId: z.string(), configJson: z.record(z.unknown()) })),

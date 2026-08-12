@@ -124,6 +124,28 @@ function denyingGateAtBarrier(expectedChecks: number): PenstockAvailabilityGate 
   };
 }
 
+/**
+ * Deferring gate that advertises a `Retry-After` in seconds, deriving `resumeAt`
+ * from it the way penstock does. `denyingGate` pins `retryAfterSeconds: null`,
+ * which cannot express the BLO-24011 incident — the whole point of that row is
+ * the advertised seconds figure sitting beside a contradictory park.
+ */
+function denyingGateWithRetryAfter(retryAfterSeconds: number): PenstockAvailabilityGate {
+  return {
+    async checkAdapter(_input: PenstockAvailabilityGateCheckInput): Promise<PenstockAvailabilityGateResult> {
+      return {
+        allow: false,
+        provider: "anthropic",
+        reason: "penstock.model_capacity_unavailable",
+        model: "claude-sonnet-5[1m]",
+        resumeAt: new Date(Date.now() + retryAfterSeconds * 1000),
+        retryAfterSeconds,
+      };
+    },
+    _resetForTesting() {},
+  };
+}
+
 describeEmbeddedPostgres("heartbeat ccrotate capacity-defer → scheduled retry", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
@@ -166,7 +188,7 @@ describeEmbeddedPostgres("heartbeat ccrotate capacity-defer → scheduled retry"
 
   it("coalesces concurrent capacity deferrals for one task across service instances", async () => {
     const { agentId } = await seedAgent();
-    const taskKey = "pr_review:Blockcast/linux-amt:123";
+    const taskKey = "pr_review:blockcast/linux-amt:123";
     const penstockAvailabilityGate = denyingGateAtBarrier(2);
     const firstApi = heartbeatService(db, {
       penstockAvailabilityGate,
@@ -496,6 +518,73 @@ describeEmbeddedPostgres("heartbeat ccrotate capacity-defer → scheduled retry"
       nextResumeAt.getTime()
         + (nextResumeAt.getTime() - dueAt.getTime()) * CCROTATE_CAPACITY_PARK_JITTER_RATIO
         + 1,
+    );
+  });
+
+  it("keeps the run row describing the current denial across a two-gate re-defer", async () => {
+    // Replays the BLO-24011 incident end to end. PlatformSREEngineer's run was
+    // parked by one denial advertising 3834s (~64 min), then re-deferred at
+    // promotion by a *second* denial advertising ~4.6 days. The row that
+    // operators read afterwards mixed the two: `penstockRetryAfterSeconds: 3834`
+    // and `retryNotBefore: 08:00Z` from the first gate, `scheduledRetryAt` four
+    // days out from the second. Two orders of magnitude apart, on attempt 1,
+    // with nothing in the row explaining why.
+    const INCIDENT_RETRY_AFTER_SECONDS = 3834;
+    const PROMOTION_RETRY_AFTER_SECONDS = 395_987;
+    const { agentId } = await seedAgent();
+
+    const seeding = heartbeatService(db, {
+      penstockAvailabilityGate: denyingGateWithRetryAfter(INCIDENT_RETRY_AFTER_SECONDS),
+      skipQueuedRunDispatch: true,
+    });
+    await seeding.wakeup(agentId, { source: "assignment", triggerDetail: "system" });
+
+    const readRun = async () =>
+      db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.agentId, agentId))
+        .then((rows) => rows[0] ?? null);
+
+    const parked = await readRun();
+    const firstResult = (parked?.resultJson ?? {}) as Record<string, unknown>;
+    expect(firstResult.penstockRetryAfterSeconds).toBe(INCIDENT_RETRY_AFTER_SECONDS);
+    expect(firstResult.retryNotBefore).toBe(parked!.scheduledRetryAt!.toISOString());
+
+    // Second denial, now advertising ~4.6 days, evaluated at promotion time.
+    const promoting = heartbeatService(db, {
+      penstockAvailabilityGate: denyingGateWithRetryAfter(PROMOTION_RETRY_AFTER_SECONDS),
+      skipQueuedRunDispatch: true,
+    });
+    const promotion = await promoting.promoteDueScheduledRetries(parked!.scheduledRetryAt!);
+    expect(promotion.promoted).toBe(0);
+
+    const row = await readRun();
+    const result = (row?.resultJson ?? {}) as Record<string, unknown>;
+    expect(row?.status).toBe("scheduled_retry");
+    expect(row?.scheduledRetryAttempt).toBe(1);
+
+    // AC: attempt 1 never books a multi-day park, however long the provider asks.
+    const parkMs = row!.scheduledRetryAt!.getTime() - Date.now();
+    expect(parkMs, "attempt 1 must not park for days").toBeLessThan(24 * 60 * 60 * 1000);
+    expect(parkMs).toBeGreaterThan(0);
+
+    // AC: the row's own retry floor and its scheduled instant agree, rather than
+    // disagreeing by two orders of magnitude. This is the assertion the incident
+    // row would have failed.
+    expect(result.retryNotBefore).toBe(row!.scheduledRetryAt!.toISOString());
+    expect(result.transientRetryNotBefore).toBe(row!.scheduledRetryAt!.toISOString());
+
+    // Every descriptive field now describes the *second* denial. The superseded
+    // 3834s figure must be gone, not sitting beside a park it no longer explains.
+    expect(result.penstockRetryAfterSeconds).toBe(PROMOTION_RETRY_AFTER_SECONDS);
+    expect(result.penstockRetryAfterSeconds).not.toBe(INCIDENT_RETRY_AFTER_SECONDS);
+    // ...and the horizon we declined is recorded, so the clamp is legible from
+    // the row without reading the scheduler.
+    const clampedFrom = result.penstockCapacityParkClampedFrom;
+    expect(typeof clampedFrom).toBe("string");
+    expect(new Date(clampedFrom as string).getTime()).toBeGreaterThan(
+      row!.scheduledRetryAt!.getTime(),
     );
   });
 

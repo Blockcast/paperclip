@@ -14,6 +14,12 @@ export const WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION =
   "Attach a project to the task, or bind a reusable execution workspace, then retry.";
 export const WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE =
   `This task is set to run in an isolated git worktree, but it has no project and no reusable execution workspace to create the worktree from. ${WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION}`;
+export const WORKSPACE_PREFLIGHT_BLOCKED_ACTIVITY_ACTION = "issue.workspace_preflight_blocked";
+export const WORKSPACE_PREFLIGHT_CLEARED_ACTIVITY_ACTION = "issue.workspace_preflight_cleared";
+export const WORKSPACE_PREFLIGHT_STATE_ACTIVITY_ACTIONS = [
+  WORKSPACE_PREFLIGHT_BLOCKED_ACTIVITY_ACTION,
+  WORKSPACE_PREFLIGHT_CLEARED_ACTIVITY_ACTION,
+] as const;
 
 type WorkspaceStrategyType = ExecutionWorkspaceStrategy["type"];
 
@@ -325,4 +331,79 @@ export function buildExecutionWorkspaceAdapterConfig(input: {
   }
 
   return nextConfig;
+}
+
+/**
+ * BLO-19063: the `workspaceStrategy` that workspace realization will actually
+ * see, i.e. after the issue-level adapterConfig overlay.
+ *
+ * `buildExecutionWorkspaceAdapterConfig` resolves the strategy across the three
+ * *policy* layers, but it is not the last word: `mergeModelProfileAdapterConfig`
+ * shallow-spreads `issue.assigneeAdapterOverrides.adapterConfig` over its
+ * result, and that object is free-form (`z.record(z.string(), z.unknown())`,
+ * `validators/issue.ts`) and overlaid last. So an issue override carrying
+ * `workspaceStrategy` silently replaces the policy-resolved one — including
+ * re-introducing it after the mode gate above deleted it.
+ *
+ * That is the merged value `realizeExecutionWorkspace` reads `runScope` from, so
+ * anything predicting realization has to read it from here too. Both callers
+ * share this one function precisely so the prediction cannot drift from the
+ * merge: `mergeModelProfileAdapterConfig` uses it to *produce* the merged
+ * strategy, and `executionWorkspaceUsesPerRunScope` uses it to *predict* the
+ * same value before the merge exists.
+ *
+ * Returns `{ present: false }` when no layer supplies a strategy, which is
+ * distinct from supplying an empty one: the caller must delete the key rather
+ * than write `undefined`.
+ */
+export function resolveOverlaidWorkspaceStrategy(input: {
+  baseConfig: Record<string, unknown>;
+  issueAdapterConfig: Record<string, unknown> | null | undefined;
+}): { present: boolean; value: unknown } {
+  // Mirror shallow-spread semantics exactly: an own key on the overlay wins even
+  // when its value is `undefined`, because `{...base, ...overlay}` would too.
+  if (input.issueAdapterConfig && Object.hasOwn(input.issueAdapterConfig, "workspaceStrategy")) {
+    return { present: true, value: input.issueAdapterConfig.workspaceStrategy };
+  }
+  if (Object.hasOwn(input.baseConfig, "workspaceStrategy")) {
+    return { present: true, value: input.baseConfig.workspaceStrategy };
+  }
+  return { present: false, value: undefined };
+}
+
+/**
+ * BLO-19063: will this issue's workspace be realized with a per-run scope?
+ *
+ * `runScope` can be set on any of three policy layers — issue settings, project
+ * policy, or the agent's `adapterConfig` — and the precedence between them (plus
+ * the mode gating that drops `workspaceStrategy` entirely outside
+ * `isolated_workspace`) lives in `buildExecutionWorkspaceAdapterConfig`. So this
+ * asks that function rather than re-deriving the chain: the reuse guard must see
+ * exactly the strategy realization will see, and a second copy of the precedence
+ * would be free to drift away from it.
+ *
+ * `issueAdapterConfig` is then layered on for the same reason — see
+ * `resolveOverlaidWorkspaceStrategy`. Reading the policy layers alone left this
+ * predicate disagreeing with realization whenever an issue override supplied a
+ * strategy, which is both a false negative (restore a `per_run` workspace, the
+ * exact isolation failure this guard exists to prevent) and a false positive
+ * (provision a fresh workspace for a run that did not need one).
+ *
+ * The comparison is `=== "per_run"` on the raw string to match
+ * `resolveExecutionWorkspaceRunScope` in workspace-runtime.ts, which normalises
+ * every other value to `per_issue`.
+ */
+export function executionWorkspaceUsesPerRunScope(input: {
+  agentConfig: Record<string, unknown>;
+  projectPolicy: ProjectExecutionWorkspacePolicy | null;
+  issueSettings: IssueExecutionWorkspaceSettings | null;
+  mode: ParsedExecutionWorkspaceMode;
+  legacyUseProjectWorkspace: boolean | null;
+  issueAdapterConfig?: Record<string, unknown> | null;
+}): boolean {
+  const strategy = resolveOverlaidWorkspaceStrategy({
+    baseConfig: buildExecutionWorkspaceAdapterConfig(input),
+    issueAdapterConfig: input.issueAdapterConfig,
+  });
+  return asString(parseObject(strategy.value).runScope, "") === "per_run";
 }

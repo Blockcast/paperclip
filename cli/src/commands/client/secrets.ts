@@ -11,6 +11,8 @@ import type {
   SecretProvider,
   SecretProviderDescriptor,
 } from "@paperclipai/shared";
+import { isPlausiblySensitiveEnvValue, isSensitiveEnvKey } from "@paperclipai/shared";
+export { SENSITIVE_ENV_KEY_RE, isSensitiveEnvKey } from "@paperclipai/shared";
 import {
   addCommonClientOptions,
   apiPath,
@@ -100,8 +102,11 @@ export interface InlineSecretMigrationCandidate {
   existingSecretId: string | null;
 }
 
-const SENSITIVE_ENV_KEY_RE =
-  /(^token$|[-_]?token$|api[-_]?key|access[-_]?token|auth(?:_?token)?|authorization|bearer|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring)/i;
+export interface SkippedPlausiblySensitiveEnvKey {
+  agentId: string;
+  agentName: string;
+  envKey: string;
+}
 
 const DEFAULT_DECLARATION_INCLUDE: CompanyPortabilityInclude = {
   company: true,
@@ -127,16 +132,30 @@ export function parseSecretsInclude(input: string | undefined): CompanyPortabili
   return include;
 }
 
-export function isSensitiveEnvKey(key: string): boolean {
-  return SENSITIVE_ENV_KEY_RE.test(key);
-}
-
 export function toPlainEnvValue(binding: unknown): string | null {
   if (typeof binding === "string") return binding;
   if (typeof binding !== "object" || binding === null || Array.isArray(binding)) return null;
   const record = binding as Record<string, unknown>;
   if (record.type === "plain" && typeof record.value === "string") return record.value;
   return null;
+}
+
+export function collectSkippedPlausiblySensitiveEnvKeys(
+  agents: Agent[],
+): SkippedPlausiblySensitiveEnvKey[] {
+  const skipped: SkippedPlausiblySensitiveEnvKey[] = [];
+  for (const agent of agents) {
+    const env = asRecord(agent.adapterConfig.env);
+    if (!env) continue;
+    for (const [envKey, binding] of Object.entries(env)) {
+      const plain = toPlainEnvValue(binding);
+      if (plain === null || plain.trim().length === 0) continue;
+      if (!isSensitiveEnvKey(envKey) && isPlausiblySensitiveEnvValue(plain)) {
+        skipped.push({ agentId: agent.id, agentName: agent.name, envKey });
+      }
+    }
+  }
+  return skipped;
 }
 
 export function buildInlineMigrationSecretName(agentId: string, key: string): string {
@@ -286,6 +305,7 @@ async function migrateInlineEnv(opts: SecretMigrateInlineEnvOptions): Promise<vo
   const agents = (await ctx.api.get<Agent[]>(apiPath`/api/companies/${companyId}/agents`)) ?? [];
   const secrets = (await ctx.api.get<CompanySecret[]>(apiPath`/api/companies/${companyId}/secrets`)) ?? [];
   const candidates = collectInlineSecretMigrationCandidates(agents, secrets);
+  const skippedPlausiblySensitiveKeys = collectSkippedPlausiblySensitiveEnvKeys(agents);
 
   if (!opts.apply) {
     printOutput(
@@ -295,6 +315,7 @@ async function migrateInlineEnv(opts: SecretMigrateInlineEnvOptions): Promise<vo
         secretsToCreate: candidates.filter((candidate) => !candidate.existingSecretId).length,
         secretsToRotate: candidates.filter((candidate) => candidate.existingSecretId).length,
         candidates,
+        skippedPlausiblySensitiveKeys,
       },
       { json: ctx.json },
     );

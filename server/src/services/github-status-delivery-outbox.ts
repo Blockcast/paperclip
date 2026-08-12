@@ -15,6 +15,7 @@ import {
 } from "./github-app-auth.js";
 
 type DeliveryRow = typeof githubCommitStatusDeliveries.$inferSelect;
+type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type DeliveryTerminalStatus = "delivered" | "skipped" | "failed" | "failed_permanent";
 
 const POLL_INTERVAL_MS = 5_000;
@@ -355,7 +356,7 @@ async function processDelivery(db: Db, row: DeliveryRow): Promise<void> {
 }
 
 export async function enqueueGithubCommitStatusDelivery(
-  db: Db,
+  db: Db | DbTransaction,
   input: EnqueueGithubCommitStatusDeliveryInput,
 ): Promise<DeliveryRow> {
   const now = new Date();

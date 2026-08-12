@@ -11,18 +11,20 @@ PGID=${USER_GID:-1000}
 # from starting, especially under an arbitrary non-root UID.
 install_browser_link() {
     browser=${CHROME_BIN:-/usr/local/bin/google-chrome}
+    browser_bin=${PAPERCLIP_HOME:-/paperclip}/bin
+    browser_link=$browser_bin/google-chrome
     [ -x "$browser" ] || return 0
 
-    if [ -L /paperclip/bin ] || { [ -e /paperclip/bin ] && [ ! -d /paperclip/bin ]; }; then
-        echo "docker-entrypoint.sh: refusing unsafe browser link destination /paperclip/bin" >&2
+    if [ -L "$browser_bin" ] || { [ -e "$browser_bin" ] && [ ! -d "$browser_bin" ]; }; then
+        echo "docker-entrypoint.sh: refusing unsafe browser link destination $browser_bin" >&2
         return 0
     fi
-    if ! mkdir -p /paperclip/bin 2>/dev/null; then
-        echo "docker-entrypoint.sh: /paperclip/bin is not writable; browser link not installed" >&2
+    if ! mkdir -p "$browser_bin" 2>/dev/null; then
+        echo "docker-entrypoint.sh: $browser_bin is not writable; browser link not installed" >&2
         return 0
     fi
-    if ! ln -sf "$browser" /paperclip/bin/google-chrome 2>/dev/null; then
-        echo "docker-entrypoint.sh: could not install browser link in /paperclip/bin" >&2
+    if ! ln -sfn "$browser" "$browser_link" 2>/dev/null; then
+        echo "docker-entrypoint.sh: could not install browser link in $browser_bin" >&2
     fi
 }
 

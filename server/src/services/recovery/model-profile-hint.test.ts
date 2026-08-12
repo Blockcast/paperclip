@@ -33,6 +33,16 @@ describe("recovery model profile policy", () => {
     });
   });
 
+  it("keeps planning recovery on the normal model with a document-only guard context", () => {
+    expect(withRecoveryModelProfileHint({ issueId: "issue-1" }, "planning_only")).toEqual({
+      issueId: "issue-1",
+      recoveryIntent: "planning_only",
+      allowDeliverableWork: false,
+      allowDocumentUpdates: true,
+      resumeRequiresNormalModel: false,
+    });
+  });
+
   it("can scrub copied downstream source-work contexts without applying a profile", () => {
     expect(scrubRecoveryModelProfileHints({
       taskId: "source-task",
