@@ -59,6 +59,7 @@ import {
   normalizeSessionParams,
   shouldResetTaskSessionForWake,
   mergeModelProfileAdapterConfig,
+  resolveContainedWorkspaceSubpath,
   type ResolvedWorkspaceForRunSuccess,
 } from "../services/heartbeat.js";
 import { applyRunScopeToBranchName } from "../services/workspace-runtime.js";
@@ -3935,6 +3936,48 @@ describe("isNonPrimaryWorkspaceTarget", () => {
         rowsInCreationOrder: [{ id: "paperclip-primary-ws", isPrimary: true }],
       }),
     ).toBe(true);
+  });
+});
+
+describe("resolveContainedWorkspaceSubpath", () => {
+  // BLO-25415: a git_repo workspace may declare a repo-relative cwd such as
+  // "packages/iwa". Before the fix that raw string reached fs.stat() and was
+  // resolved against the API process's cwd, so the run failed
+  // `preferred_workspace_unrealizable` naming a path that looked correct while
+  // the real checkout sat on disk untouched.
+  it("joins a repo-relative subpath onto the realized checkout", () => {
+    expect(resolveContainedWorkspaceSubpath("/managed/pim-multicast-gateway", "packages/iwa")).toBe(
+      "/managed/pim-multicast-gateway/packages/iwa",
+    );
+  });
+
+  it("normalizes redundant segments that stay inside the checkout", () => {
+    expect(resolveContainedWorkspaceSubpath("/managed/repo", "./packages/../packages/iwa")).toBe(
+      "/managed/repo/packages/iwa",
+    );
+  });
+
+  it("allows the checkout root itself", () => {
+    expect(resolveContainedWorkspaceSubpath("/managed/repo", ".")).toBe("/managed/repo");
+  });
+
+  it("refuses a subpath that escapes the checkout", () => {
+    // cwd is operator-supplied config, so traversal must not point a run at an
+    // unrelated repo on the shared PVC.
+    expect(() => resolveContainedWorkspaceSubpath("/managed/repo", "../other-repo")).toThrow(
+      /resolves outside its checkout/,
+    );
+    expect(() => resolveContainedWorkspaceSubpath("/managed/repo", "../../../etc")).toThrow(
+      /resolves outside its checkout/,
+    );
+  });
+
+  it("refuses a sibling directory sharing the checkout name prefix", () => {
+    // Guards the startsWith() containment check against "/managed/repo-evil"
+    // being treated as inside "/managed/repo".
+    expect(() => resolveContainedWorkspaceSubpath("/managed/repo", "../repo-evil")).toThrow(
+      /resolves outside its checkout/,
+    );
   });
 });
 
