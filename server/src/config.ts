@@ -118,6 +118,11 @@ export interface Config {
   feedbackExportBackendToken: string | undefined;
   heartbeatSchedulerEnabled: boolean;
   heartbeatSchedulerIntervalMs: number;
+  // Bounds stamped on newly-created wake_owner recovery actions. They remain
+  // attached to the action for its lifetime, so a later config change cannot
+  // extend a recovery attempt that has already started.
+  recoveryActionMaxAttempts: number;
+  recoveryActionTimeoutMs: number;
   // Process role for HA topology. When set to "api", the process serves
   // HTTP traffic only — no in-process plugin workers, no heartbeat
   // scheduler. When set to "worker", the process owns the heartbeat
@@ -494,6 +499,18 @@ export function loadConfig(): Config {
         ? false
         : process.env.HEARTBEAT_SCHEDULER_ENABLED !== "false",
     heartbeatSchedulerIntervalMs: Math.max(10000, Number(process.env.HEARTBEAT_SCHEDULER_INTERVAL_MS) || 30000),
+    recoveryActionMaxAttempts: Math.max(
+      1,
+      // Preserve the existing wake-owner budget unless an operator explicitly
+      // opts into a new bound through the configurable setting.
+      Number(process.env.RECOVERY_ACTION_MAX_ATTEMPTS) || 5,
+    ),
+    recoveryActionTimeoutMs: Math.max(
+      60 * 60_000,
+      // Preserve the existing six-hour horizon for deployments that do not
+      // supply an override.
+      Number(process.env.RECOVERY_ACTION_TIMEOUT_MS) || 6 * 60 * 60_000,
+    ),
     paperclipNodeRole,
     paperclipWorkersInternalUrl:
       process.env.PAPERCLIP_WORKERS_INTERNAL_URL?.trim().replace(/\/+$/, "") || null,

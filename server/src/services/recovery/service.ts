@@ -28,6 +28,7 @@ import {
   issues,
   workspaceOperations,
 } from "@paperclipai/db";
+import { loadConfig } from "../../config.js";
 import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
 import { runningProcesses } from "../../adapters/index.js";
 import { visibleIssueCondition } from "../issue-visibility.js";
@@ -102,6 +103,33 @@ export const ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS = 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS = 4 * 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS = 30 * 60 * 1000;
 export const DEFAULT_LIVENESS_REESCALATION_COOLDOWN_MS = 60 * 60 * 1000;
+
+type RecoveryActionBoundsConfig = {
+  maxAttempts: number;
+  timeoutMs: number;
+};
+
+/**
+ * Read bounds when creating an action so deployments can tune newly-created
+ * recovery work without changing actions that are already in flight.
+ */
+function recoveryActionBoundsConfig(): RecoveryActionBoundsConfig {
+  const config = loadConfig();
+  return {
+    maxAttempts: config.recoveryActionMaxAttempts,
+    timeoutMs: config.recoveryActionTimeoutMs,
+  };
+}
+
+/** Bounds persisted on the first wake_owner escalation for an action. */
+function recoveryActionBoundsAtCreation(now: Date): { maxAttempts: number; timeoutAt: Date } {
+  const bounds = recoveryActionBoundsConfig();
+  return {
+    maxAttempts: bounds.maxAttempts,
+    timeoutAt: new Date(now.getTime() + bounds.timeoutMs),
+  };
+}
+
 // BLO-18995: how long an issue execution lock may be held by a run that has
 // not yet been claimed (status still `queued`/`scheduled_retry`, startedAt
 // null) before sweepStaleIssueLocks treats it as stale and clears it.
@@ -239,6 +267,10 @@ export const STRANDED_RECENT_PROGRESS_EXEMPTION_MS = Math.max(
  * BLO-18996: hard ceiling on how many times one source-scoped recovery action may wake
  * an owner before the sweep stops re-firing it.
  *
+ * Retained as a compatibility export for callers that still inspect the legacy
+ * environment setting. Newly-created actions use `recoveryActionBoundsConfig`
+ * and `RECOVERY_ACTION_MAX_ATTEMPTS` instead.
+ *
  * Every wake this action mints is discretionary — nothing downstream verifies that the
  * owner it names can actually discharge it. When the owner cannot (the reported case: a
  * `stranded_assigned_issue` action named an owner who was then 403'd by `issue:comment`
@@ -259,6 +291,8 @@ export const STRANDED_RECOVERY_MAX_OWNER_WAKE_ATTEMPTS = Math.max(
 
 /**
  * BLO-18996: outer horizon on the same loop, in wall-clock time rather than attempts.
+ * Newly-created actions use `recoveryActionBoundsConfig` and
+ * `RECOVERY_ACTION_TIMEOUT_MS`; this static value remains for compatibility.
  *
  * `attemptCount` is a per-OWNER budget — it restarts when the action changes hands, which is
  * what makes a genuinely reassigned owner reachable again. But owner identity is not stable
@@ -4455,6 +4489,7 @@ export function recoveryService(
       ? await getAgent(input.issue.assigneeAgentId)
       : null;
     const now = new Date();
+    const boundsAtCreation = wakesOwner ? recoveryActionBoundsAtCreation(now) : null;
 
     // Read existing action before upsert so we can compare lastAttemptAt against
     // issue.lastActivityAt and suppress duplicate non-assignee wakes when nothing changed.
@@ -4532,18 +4567,12 @@ export function recoveryService(
       monitorPolicy: recoveryCause === "provider_quota" && !ownerAgentId
         ? { type: "wait_recovery", retryAgentId: routing.returnOwnerAgentId }
         : null,
-      // BLO-18996: only the wake-an-owner shape gets a budget. The monitor-only and
-      // manual-repair shapes above return early from
-      // `enqueueSourceScopedStrandedRecoveryWake` by design and are expected to sit open
-      // across many sweeps, so giving them a ceiling would manufacture a spurious
-      // exhaustion. `wakesOwner` is the same predicate those early returns implement.
-      maxAttempts: wakesOwner ? STRANDED_RECOVERY_MAX_OWNER_WAKE_ATTEMPTS : null,
-      // The creation-anchored outer horizon for the same shape. `upsertSourceScoped`
-      // preserves an existing `timeoutAt`, so this only takes effect on the insert that
-      // opens the action — which is what makes it immune to the owner ping-pong that
-      // restarts `attemptCount`. Recomputed from `now` on every sweep but discarded on all
-      // but the first, deliberately.
-      timeoutAt: wakesOwner ? new Date(now.getTime() + STRANDED_RECOVERY_OWNER_WAKE_HORIZON_MS) : null,
+      // Only the wake-owner shape gets creation-time bounds. The monitor-only and
+      // manual-repair shapes deliberately remain unbounded because neither path
+      // performs an owner wake. `upsertSourceScoped` preserves these fields after
+      // insertion, so owner churn cannot turn this into a sliding horizon.
+      maxAttempts: boundsAtCreation?.maxAttempts ?? null,
+      timeoutAt: boundsAtCreation?.timeoutAt ?? null,
       lastAttemptAt: now,
     });
 
