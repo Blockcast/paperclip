@@ -688,6 +688,7 @@ describe("github-webhook pure helpers", () => {
       commentId: 7001,
       commentAuthorLogin: "allyblockcast[bot]",
       commentUrl: "https://github.com/Blockcast/onprem-k8s/pull/1659#issuecomment-7001",
+      reason: "missing_marker",
     });
 
     // With the marker it is a real request, so there is nothing to report.
@@ -725,6 +726,80 @@ describe("github-webhook pure helpers", () => {
     const human = resolve("@ally please review the RBAC scoping", "kkroo");
     expect(human.context).toMatchObject({ wakeReason: "github_pr_review_requested" });
     expect(human.suppressed).toHaveLength(0);
+  });
+
+  it("reports a marker-prefixed agent request disqualified by an incidental heading match (BLO-21618)", () => {
+    // The second invisible drop this file had: a genuine marker-prefixed agent
+    // request (marker + mention, exactly what BLO-18865 exists to recognize)
+    // whose body ALSO contains a standalone line matching the Ally
+    // consolidated-review heading -- e.g. quoting a prior review while asking
+    // for a fresh pass. `agentReviewRequest`'s heading exclusion (load-bearing
+    // for keeping the #583 loop closed on Ally's own output) disqualifies it,
+    // and until now the original suppression report ALSO excluded
+    // heading-bearing bodies, so this case left zero trace: no wake, no log,
+    // no counter. Observed as the root-cause candidate investigated for
+    // Blockcast/paperclip#993 (BLO-21618) before that PR's own request bodies
+    // were confirmed clean of this pattern.
+    const resolve = (body: string) => {
+      const suppressed: { reason: string }[] = [];
+      const context = __test_resolveEventContext(
+        "issue_comment",
+        {
+          action: "created",
+          issue: {
+            number: 993,
+            title: "BLO-21309 recovery-stale-issue-lock-sweep basis swap",
+            pull_request: { url: "https://api.github.com/repos/Blockcast/paperclip/pulls/993" },
+          },
+          comment: {
+            id: 5170314705,
+            body,
+            user: { login: "allyblockcast[bot]" },
+            html_url: "https://github.com/Blockcast/paperclip/pull/993#issuecomment-5170314705",
+          },
+          repository: { full_name: "Blockcast/paperclip" },
+        },
+        {
+          prReviewerBotLogin: "allyblockcast[bot]",
+          onSuppressedReviewRequest: (info) => suppressed.push(info as { reason: string }),
+        },
+      );
+      return { context, suppressed };
+    };
+
+    // Marker + mention + an incidental heading-shaped line quoting the prior
+    // review: disqualified, but now reported with its own distinguishable
+    // reason instead of vanishing.
+    const disqualified = resolve(
+      "<!-- paperclip:review-request -->\n@ally re-review at head 1620f3a.\n\n" +
+        "For context, your last pass here:\n## Ally — Consolidated PR Review\nsaid the lock basis was fine.",
+    );
+    expect(disqualified.context).toBeNull();
+    expect(disqualified.suppressed).toHaveLength(1);
+    expect(disqualified.suppressed[0]).toMatchObject({
+      repoFullName: "Blockcast/paperclip",
+      prNumber: 993,
+      commentId: 5170314705,
+      commentAuthorLogin: "allyblockcast[bot]",
+      reason: "marker_disqualified_by_heading",
+    });
+
+    // Same marker and mention, no heading collision: an ordinary honoured
+    // request, nothing to report. (This is the actual shape of #993's two
+    // real review-request comments.)
+    const clean = resolve(
+      "<!-- paperclip:review-request -->\n@ally please review at head df19e7b — BLO-21309.\n\n" +
+        "Focus on the one judgement call: this inverts a deliberate, tested behavior.",
+    );
+    expect(clean.context).toMatchObject({ wakeReason: "github_pr_review_requested" });
+    expect(clean.suppressed).toHaveLength(0);
+
+    // Ally's own routine output is never marker-prefixed (the marker must be
+    // the literal first byte; Ally's output opens with the heading instead),
+    // so the new branch cannot fire on a genuine self-echo.
+    const selfEcho = resolve("## Ally — Consolidated PR Review\n\nNo blocking findings.");
+    expect(selfEcho.context).toBeNull();
+    expect(selfEcho.suppressed).toHaveLength(0);
   });
 
   it("keeps the #583 self-refire loop closed: a quoted or reviewer-output marker is not a request (BLO-18865)", () => {
