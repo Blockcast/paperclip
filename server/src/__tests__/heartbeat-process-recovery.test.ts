@@ -6793,6 +6793,71 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   );
 
   it(
+    "BLO-24782: a `triggered` monitor past the grace bound is no longer believed by the " +
+      "monitor-gated park, which hands the issue to the ungated no-dependency park instead",
+    async () => {
+      // Same fixture as the BLO-18643 control above -- the population the
+      // `hasActiveMonitorPath` gate actually governs -- but with the trigger instant 48h in
+      // the past instead of 30s ago.
+      //
+      // What this pins, and what the pure-helper unit tests cannot: the *gate* stops
+      // believing an abandoned watch. Before the bound, `hasActiveMonitorPath` was true for
+      // any age of trigger, so this issue was parked by
+      // `parkReviewWaitingContinuationIssue` (source `..._review_waiting_continuation`),
+      // which RESOLVES the recovery action as "restored" on the strength of a monitor path
+      // that does not exist.
+      //
+      // Deliberately NOT asserting an escalation here, which is what I first expected and
+      // got wrong. A second, monitor-agnostic branch
+      // (`parkNoDependencyReviewWaitingIssue`, source `..._no_dependency_park`) catches this
+      // population by design -- its whole premise is "no dependency and no active monitor
+      // path" -- so a deliberate review wait still parks `in_review` rather than being
+      // re-escalated to `blocked`. That is the BLO-16146 protection working, and the reason
+      // this fix does not strand-then-escalate a genuine review wait. The observable
+      // difference is therefore WHICH branch parks it, which is exactly what the activity
+      // source below distinguishes.
+      const { agentId, issueId } = await seedStrandedIssueFixture({
+        status: "in_progress",
+        runStatus: "cancelled",
+        retryReason: "issue_continuation_needed",
+        runErrorCode: "issue_continuation_waiting_on_review",
+        runError: "Continuation parked: issue is waiting on review/approval",
+      });
+
+      await db
+        .update(issues)
+        .set({
+          monitorNextCheckAt: null,
+          monitorLastTriggeredAt: new Date(Date.now() - 48 * 60 * 60_000),
+          monitorAttemptCount: 5,
+          monitorScheduledBy: "assignee",
+        })
+        .where(eq(issues.id, issueId));
+
+      heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+
+      const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+      // Still parked, never escalated to `blocked` -- the review wait is respected.
+      expect(result.escalated).toBe(0);
+      expect(result.reviewWaitingParked).toBe(1);
+      const parked = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+      expect(parked?.status).toBe("in_review");
+      expect(parked?.assigneeAgentId).toBe(agentId);
+
+      const activity = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId));
+      const parkSources = activity
+        .filter((event) => event.action === "issue.updated")
+        .map((event) => (event.details as { source?: string } | null)?.source);
+
+      // The bound took effect: the monitor-gated branch declined, so the ungated
+      // no-dependency branch is the one that parked it.
+      expect(parkSources).toContain("recovery.reconcile_review_waiting_no_dependency_park");
+      expect(parkSources).not.toContain("recovery.reconcile_review_waiting_continuation");
+    },
+  );
+
+  it(
     "BLO-18669: a genuine review-park failure still escalates to blocked",
     async () => {
       const { companyId, issueId } = await seedStrandedIssueFixture({
