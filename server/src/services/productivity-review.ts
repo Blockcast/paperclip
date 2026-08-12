@@ -541,6 +541,16 @@ function runQueueWaitInterval(run: HeartbeatRunRow, now: Date): MsInterval | nul
   const createdAt = coerceDate(run.createdAt);
   if (!createdAt || Number.isNaN(createdAt.getTime())) return null;
   const startedAt = coerceDate(run.startedAt);
+  // BLO-22331 boundary: a run parked in `scheduled_retry` that never started is
+  // in a deliberate backoff, not waiting for a concurrency slot. That span is
+  // owned by `currentCapacityScheduledRetry`/`capacityGating`, which suppresses
+  // only while the retry is still due in the future and deliberately lets
+  // `long_active_duration` fire once it sits overdue and unpromoted. Counting it
+  // as queue wait here would zero `elapsedMs` and re-suppress that signal
+  // indefinitely — the exact condition BLO-22331's guard exists to prevent.
+  // A run that did start still contributes its genuine createdAt→startedAt wait,
+  // whatever status it later reached.
+  if (!startedAt && run.status === "scheduled_retry") return null;
   const endAt = startedAt
     ?? (isTerminalRunStatus(run.status) ? coerceDate(run.finishedAt) ?? now : now);
   const interval = { start: createdAt.getTime(), end: endAt.getTime() };
@@ -635,6 +645,8 @@ function episodeNonLiveHoldMs(input: {
     .filter((interval): interval is MsInterval => interval !== null);
 
   return totalIntervalMs(unionIntervals(clipped));
+}
+
 /**
  * BLO-23248/BLO-22331: the fleet-capacity-retry state of the run currently
  * heading this issue's execution history (`latestRuns[0]`), independent of
