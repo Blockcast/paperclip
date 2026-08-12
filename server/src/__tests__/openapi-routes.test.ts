@@ -149,6 +149,50 @@ function loadSpecRoutes() {
   return { spec, routes };
 }
 
+// Matches a direct `assertInstanceAdmin(req)` / `await assertInstanceAdmin(req)`
+// call. The `\s*\)` deliberately excludes the `assertInstanceAdmin(req: Request)`
+// declarations, so a route file that defines its own guard is not a false hit.
+const INSTANCE_ADMIN_GUARD_PATTERN = /\bassertInstanceAdmin\s*\(\s*req\s*\)/;
+
+// Handlers that reach `assertInstanceAdmin` on only some code paths, so the
+// operation as a whole does NOT require instance admin and must stay classified
+// `board`. Classifying these would overstate the requirement, which misleads a
+// spec-driven consumer just as badly as understating it.
+const CONDITIONAL_INSTANCE_ADMIN_OPERATIONS = new Set([
+  // access.ts: instance admin is required only to revoke a `bootstrap_ceo` invite.
+  "POST /api/invites/{inviteId}/revoke",
+]);
+
+// Route handlers that enforce instance admin, derived from the route sources.
+// Segments run from one `router.<method>(` literal to the next, so a helper
+// defined between two route registrations would attach to the preceding route;
+// no such helper exists today, and the assertion below fails loudly if one lands.
+function loadInstanceAdminGuardedRoutes() {
+  const routes = new Set<string>();
+
+  for (const file of fs.readdirSync(ROUTES_DIR).filter((entry) => entry.endsWith(".ts"))) {
+    if (explicitOpenApiCoverageExclusions.has(file)) continue;
+    const prefix = apiPrefixes[file];
+    if (!prefix) continue;
+
+    const source = fs.readFileSync(path.join(ROUTES_DIR, file), "utf8");
+    const matches = [...source.matchAll(ROUTE_LITERAL_PATTERN)];
+
+    matches.forEach((match, index) => {
+      const start = match.index ?? 0;
+      const end = index + 1 < matches.length ? (matches[index + 1].index ?? source.length) : source.length;
+      if (!INSTANCE_ADMIN_GUARD_PATTERN.test(source.slice(start, end))) return;
+
+      const method = match[1].toUpperCase();
+      const key = `${method} ${normalizeExpressPath(resolveMountedPath(file, prefix, match[2]))}`;
+      if (CONDITIONAL_INSTANCE_ADMIN_OPERATIONS.has(key)) return;
+      routes.add(key);
+    });
+  }
+
+  return routes;
+}
+
 describe("openapi routes", () => {
   it("serves the generated OpenAPI document", async () => {
     const res = await request(createApp()).get("/api/openapi.json");
@@ -246,5 +290,54 @@ describe("openapi routes", () => {
     expect(spec.paths["/api/invites/{token}/accept"].post.responses["202"]).toBeDefined();
     expect(spec.paths["/api/board-api-keys"].post.responses["201"]).toBeDefined();
     expect(spec.paths["/api/companies/import"].post.responses["202"]).toBeDefined();
+  });
+
+  it("classifies every instance-admin-guarded route as instance_admin", () => {
+    const { spec } = loadSpecRoutes();
+    const guarded = [...loadInstanceAdminGuardedRoutes()].sort();
+
+    // Guards against the parser silently matching nothing and passing vacuously.
+    expect(guarded.length).toBeGreaterThan(10);
+
+    const misclassified = guarded.filter((key) => {
+      const separator = key.indexOf(" ");
+      const method = key.slice(0, separator).toLowerCase();
+      const routePath = key.slice(separator + 1);
+      const operation = spec.paths?.[routePath]?.[method] as Record<string, unknown> | undefined;
+      const authorization = operation?.["x-paperclip-authorization"] as { instanceAdmin?: boolean } | undefined;
+      return authorization?.instanceAdmin !== true;
+    });
+
+    expect(misclassified).toEqual([]);
+  });
+
+  it("documents instance admin on the plugin config operations", () => {
+    const { spec } = loadSpecRoutes();
+
+    // BLO-26526: the routes enforce instance admin, but `BOARD_ONLY_PREFIXES`
+    // resolved these to plain `board`, so the spec understated the requirement
+    // on the exact endpoints that hold plugin credentials.
+    for (const [routePath, method] of [
+      ["/api/plugins/{pluginId}/config", "get"],
+      ["/api/plugins/{pluginId}/config", "post"],
+      ["/api/plugins/{pluginId}/config/test", "post"],
+    ] as const) {
+      expect(spec.paths[routePath][method]["x-paperclip-authorization"]).toEqual({
+        actor: "board",
+        instanceAdmin: true,
+      });
+    }
+  });
+
+  it("keeps conditionally-guarded operations out of the instance-admin set", () => {
+    const { spec } = loadSpecRoutes();
+
+    // Instance admin is required only for `bootstrap_ceo` invites, so the
+    // operation as a whole must not advertise it. Asserted on `instanceAdmin`
+    // rather than the whole object so a legitimate change to the base actor
+    // level does not masquerade as this regression.
+    expect(spec.paths["/api/invites/{inviteId}/revoke"].post["x-paperclip-authorization"]).not.toHaveProperty(
+      "instanceAdmin",
+    );
   });
 });
