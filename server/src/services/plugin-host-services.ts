@@ -1607,7 +1607,10 @@ export function buildHostServices(
           repoUrl: row?.repoUrl ?? project.codebase.repoUrl,
           repoRef: row?.repoRef ?? project.codebase.repoRef,
           defaultRef: row?.defaultRef ?? project.codebase.defaultRef,
-          isPrimary: true,
+          // BLO-26184: report whether this was an explicit choice or a
+          // fallback guess rather than always claiming "true" — a plugin
+          // reading this as fact previously had no way to tell the two apart.
+          isPrimary: project.primaryWorkspaceSource === "explicit",
           createdAt: (row?.createdAt ?? project.createdAt).toISOString(),
           updatedAt: (row?.updatedAt ?? project.updatedAt).toISOString(),
         };
@@ -1652,7 +1655,9 @@ export function buildHostServices(
           repoUrl: row?.repoUrl ?? project.codebase.repoUrl,
           repoRef: row?.repoRef ?? project.codebase.repoRef,
           defaultRef: row?.defaultRef ?? project.codebase.defaultRef,
-          isPrimary: true,
+          // BLO-26184: see getPrimaryWorkspace above — do not claim explicit
+          // choice for a fallback guess.
+          isPrimary: project.primaryWorkspaceSource === "explicit",
           createdAt: (row?.createdAt ?? project.createdAt).toISOString(),
           updatedAt: (row?.updatedAt ?? project.updatedAt).toISOString(),
         };

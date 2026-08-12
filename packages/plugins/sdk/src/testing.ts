@@ -1144,6 +1144,7 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
             },
             workspaces: [],
             primaryWorkspace: null,
+            primaryWorkspaceSource: "none" as const,
             managedByPlugin: {
               id: `managed-${projects.size + 1}`,
               pluginId: manifest.id,

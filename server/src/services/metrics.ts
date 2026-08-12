@@ -21,6 +21,7 @@
  */
 
 import { Counter, Gauge, Histogram, Registry, collectDefaultMetrics } from "prom-client";
+import { logger } from "../middleware/logger.js";
 import { resetDepBlockedMetrics, snapshotDepBlockedMetrics } from "./dep-blocked-metrics.js";
 import {
   resetBlockerResolvedWakeMetrics,
@@ -37,6 +38,19 @@ export const CONCURRENT_RUN_BLOCKED_METRIC = "claude_k8s_concurrent_run_blocked_
 // zero while a routine is quiet means it is genuinely gated on in-flight work.
 export const ROUTINE_DISPATCH_METRIC = "paperclip_routine_dispatch_total";
 export const AUTH_REQUEST_METRIC = "paperclip_auth_request_total";
+/**
+ * Project primary-workspace fallback counter (BLO-26184). Incremented once
+ * per resolution of a project that has >=1 workspace but no row flagged
+ * `isPrimary` — i.e. `pickPrimaryWorkspace` fell through to the
+ * earliest-created row instead of an explicit choice. Measured fleet exposure
+ * is 0/80 non-archived projects (see BLO-23599); this counter is the
+ * alertable signal that would have caught that drift on day one. No labels —
+ * cardinality is bounded by call volume, not by project identity (the
+ * offending `project_id` goes on the paired structured log line instead, to
+ * keep this series a plain fleet-wide total). A sustained non-zero rate means
+ * a project has drifted into the ambiguous state and should be re-flagged.
+ */
+export const PROJECT_PRIMARY_WORKSPACE_FALLBACK_METRIC = "paperclip_project_primary_workspace_fallback_total";
 export const HEARTBEAT_RUN_FAILED_METRIC = "paperclip_heartbeat_run_failed_total";
 export const DEP_BLOCKED_WAKEUP_METRIC = "paperclip_dependency_blocked_wakeup_total";
 /**
@@ -979,6 +993,7 @@ let authRequest: Counter<"operation" | "outcome"> | null = null;
 let agentHeartbeatAge: Gauge<"agent_id"> | null = null;
 let agentHeartbeatInterval: Gauge<"agent_id"> | null = null;
 let agentErrorDuration: Gauge<"agent_id"> | null = null;
+let projectPrimaryWorkspaceFallback: Counter | null = null;
 
 function ensureRegistry(): {
   registry: Registry;
@@ -1008,6 +1023,7 @@ function ensureRegistry(): {
   agentHeartbeatAgeGauge: Gauge<"agent_id">;
   agentHeartbeatIntervalGauge: Gauge<"agent_id">;
   agentErrorDurationGauge: Gauge<"agent_id">;
+  projectPrimaryWorkspaceFallbackCounter: Counter;
 } {
   if (
     !registry
@@ -1037,6 +1053,7 @@ function ensureRegistry(): {
     || !agentHeartbeatAge
     || !agentHeartbeatInterval
     || !agentErrorDuration
+    || !projectPrimaryWorkspaceFallback
   ) {
     registry = new Registry();
     concurrentRunBlocked = new Counter({
@@ -1396,6 +1413,17 @@ function ensureRegistry(): {
       labelNames: ["agent_id"],
       registers: [registry],
     });
+    projectPrimaryWorkspaceFallback = new Counter({
+      name: PROJECT_PRIMARY_WORKSPACE_FALLBACK_METRIC,
+      help:
+        "Count of project primary-workspace resolutions that fell through to the "
+        + "earliest-created workspace because no row was flagged isPrimary (BLO-26184). "
+        + "Measured fleet exposure is 0/80 non-archived projects; a sustained non-zero "
+        + "rate means a project has drifted into the ambiguous state. The offending "
+        + "project_id is on the paired structured log line, not this series' labels.",
+      registers: [registry],
+    });
+    projectPrimaryWorkspaceFallback.inc(0);
     // Process/runtime metrics make the scrape target carry meaningful data even
     // before any refusal is reported (manual-verification check #3 on BLO-8328).
     collectDefaultMetrics({ register: registry });
@@ -1428,6 +1456,7 @@ function ensureRegistry(): {
     agentHeartbeatAgeGauge: agentHeartbeatAge,
     agentHeartbeatIntervalGauge: agentHeartbeatInterval,
     agentErrorDurationGauge: agentErrorDuration,
+    projectPrimaryWorkspaceFallbackCounter: projectPrimaryWorkspaceFallback,
   };
 }
 
@@ -1952,6 +1981,21 @@ export function setAgentLivenessMetrics(
   }
 }
 
+/**
+ * Record a project primary-workspace resolution that fell through to the
+ * earliest-created row (BLO-26184). Callers should invoke this only when the
+ * project has >=1 workspace and none is flagged `isPrimary` — never for a
+ * 0-workspace project (that resolves `null`, not a fallback guess) or a
+ * project with an explicit primary.
+ */
+export function recordProjectPrimaryWorkspaceFallback(projectId: string): void {
+  ensureRegistry().projectPrimaryWorkspaceFallbackCounter.inc();
+  logger.warn(
+    { projectId },
+    "project primary-workspace resolved via earliest-created fallback (no row flagged isPrimary)",
+  );
+}
+
 export async function renderMetrics(): Promise<{ contentType: string; body: string }> {
   const reg = getMetricsRegistry();
   const depBlockedSnapshot = snapshotDepBlockedMetrics();
@@ -2013,6 +2057,7 @@ export function __resetMetricsForTest(): void {
   agentHeartbeatAge = null;
   agentHeartbeatInterval = null;
   agentErrorDuration = null;
+  projectPrimaryWorkspaceFallback = null;
   resetDepBlockedMetrics();
   resetBlockerResolvedWakeMetrics();
   resetRoutineDispatchMetrics();
