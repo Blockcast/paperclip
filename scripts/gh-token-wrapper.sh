@@ -20,6 +20,10 @@ set -eu
 TOKEN_FILE="${PAPERCLIP_GITHUB_TOKEN_FILE:-/paperclip/.secrets/github-token/token}"
 REAL_GH="${GH_TOKEN_WRAPPER_REAL_GH:-/usr/bin/gh.real}"
 GH_SELF="${GH_TOKEN_WRAPPER_SELF:-/usr/bin/gh}"
+# Absolute, not `git` via PATH: some pods reorder PATH ahead of this image's
+# own bin dirs (this is precisely the class of drift BLO-25702 is about), and
+# a shadowing `git` could behave arbitrarily differently underneath us here.
+GIT_BIN="${GH_TOKEN_WRAPPER_GIT:-/usr/bin/git}"
 
 # `gh auth setup-git` asks the running `gh` binary to report its own on-disk
 # path (via /proc/self/exe, not argv[0]) and writes that path into git's
@@ -47,23 +51,42 @@ exec_real_gh() {
   exec "${REAL_GH}" "$@"
 }
 
-# Best-effort repair of the file `gh auth setup-git` (directly, or via `gh
-# auth login`'s internal call to the same logic) just wrote — always
-# `--global`, i.e. "${HOME}/.gitconfig" — gh has no notion of this wrapper's
-# split HOME-per-workspace layout. Scoped to lines that literally mention
-# REAL_GH's credential-helper invocation, so it never touches an unrelated
+# Best-effort repair of whatever `gh auth setup-git` (directly, or via `gh
+# auth login`'s internal call to the same logic) just wrote with `--global`.
+# gh has no notion of this wrapper's split HOME-per-workspace layout, so it
+# always ends up in whichever file `git config --global` itself resolves for
+# the current environment: normally "${HOME}/.gitconfig", but
+# "$XDG_CONFIG_HOME/git/config" instead when that file already exists (see
+# the FILES section of git-config(1)). Repairing through `git config` rather
+# than sed on a path we guess means git resolves that file for us, so both
+# locations are covered without this script needing to know which one
+# applies (BLO-25702 review S2 on PR #1311 — the sed version only ever
+# checked "${HOME}/.gitconfig").
+#
+# `--fixed-value` treats both the search pattern and (implicitly, since we
+# only ever pass the literal value we just searched for) the value we match
+# on as exact strings, not regexes — REAL_GH/GH_SELF come from
+# GH_TOKEN_WRAPPER_REAL_GH/GH_TOKEN_WRAPPER_SELF, caller-controlled env vars,
+# and the prior sed-based version only escaped "." in them, so a path
+# containing "#", "&", "\", or another sed/regex metacharacter could corrupt
+# the gitconfig instead of failing loudly (BLO-25702 review, same PR).
+# Scoped to the exact value gh's own setup-git logic writes — a shell-out
+# credential helper pointing at REAL_GH — so it never touches an unrelated
 # helper a caller configured on purpose.
 fix_setup_git_credential_helper() {
-  gitconfig="${HOME:-}/.gitconfig"
   [ -n "${HOME:-}" ] || return 0
-  [ -f "${gitconfig}" ] || return 0
-  case "$(cat "${gitconfig}" 2>/dev/null || true)" in
-    *"${REAL_GH} auth git-credential"*)
-      escaped_real_gh=$(printf '%s' "${REAL_GH}" | sed 's/\./\\./g')
-      sed -i "s#${escaped_real_gh} auth git-credential#${GH_SELF} auth git-credential#g" "${gitconfig}" 2>/dev/null || true
-      echo "gh-token-wrapper: gh auth setup-git (directly or via gh auth login) wrote a credential helper pointing at ${REAL_GH} (its own on-disk path, per BLO-25702); rewrote ${gitconfig} to route through ${GH_SELF} instead" >&2
-      ;;
-  esac
+
+  broken_value="!${REAL_GH} auth git-credential"
+  fixed_value="!${GH_SELF} auth git-credential"
+
+  matches=$("${GIT_BIN}" config --global --fixed-value --get-regexp '^credential\..*\.helper$' "${broken_value}" 2>/dev/null) || return 0
+
+  echo "${matches}" | while IFS=' ' read -r key value; do
+    [ -n "${key}" ] || continue
+    "${GIT_BIN}" config --global --fixed-value --replace-all "${key}" "${fixed_value}" "${broken_value}" 2>/dev/null || true
+  done
+
+  echo "gh-token-wrapper: gh auth setup-git (directly or via gh auth login) wrote a credential helper pointing at ${REAL_GH} (its own on-disk path, per BLO-25702); rewrote the global git config to route through ${GH_SELF} instead" >&2
 }
 
 # GH_SEAT_TOKEN_VALUE carries a token *value* rather than a path, for
