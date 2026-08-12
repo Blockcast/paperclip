@@ -589,6 +589,28 @@ export function setIssueExecutionPolicyMonitorScheduledBy(
   };
 }
 
+/**
+ * Merge a requested monitor into an existing policy rather than replacing the
+ * policy outright.
+ *
+ * `PATCH /issues/:id` writes `executionPolicy` wholesale, which is correct for
+ * an actor who already holds general mutation authority over the issue. It is
+ * wrong for the narrow manager-chain monitor re-arm (BLO-22860): that actor is
+ * *not* the assignee and holds no general mutation grant, so restoring a lapsed
+ * timer must not also drop the report's `stages`, `reviewPreset`,
+ * `authorizationPolicy` or `mode` as a side effect.
+ */
+export function mergeIssueExecutionPolicyMonitor(
+  previous: IssueExecutionPolicy | null,
+  monitor: IssueExecutionMonitorPolicy | null,
+): IssueExecutionPolicy | null {
+  if (!monitor) return previous;
+  if (!previous) {
+    return { mode: "normal", commentRequired: true, stages: [], monitor };
+  }
+  return { ...previous, monitor };
+}
+
 export function normalizeIssueExecutionPolicy(input: unknown): IssueExecutionPolicy | null {
   if (input == null) return null;
   const parsed = issueExecutionPolicySchema.safeParse(input);
@@ -1362,6 +1384,44 @@ export function buildIssueMonitorTriggeredPatch(input: {
     monitorWakeRequestedAt: null,
     monitorLastTriggeredAt: input.triggeredAt,
     monitorAttemptCount: nextMonitorState.attemptCount,
+    monitorNotes: nextMonitorState.notes,
+    monitorScheduledBy: nextMonitorState.scheduledBy,
+  };
+}
+
+export function buildIssueMonitorDispatchRearmPatch(input: {
+  issue: IssueLike;
+  policy: IssueExecutionPolicy;
+  /**
+   * Attempt count to persist. Defaults to restoring the attempt the undelivered
+   * wake consumed — the tick-detected lapse path, where the wake never ran and
+   * so must not count against maxAttempts.
+   *
+   * The watchdog *dispatch* path passes the already-incremented count instead:
+   * that fire did real work (it re-dispatched the stuck run), so it consumes an
+   * attempt and the retry loop stays bounded by maxAttempts rather than
+   * re-arming forever against a run that never moves (BLO-22860).
+   */
+  attemptCount?: number;
+}) {
+  const existingState = parseIssueExecutionState(input.issue.executionState);
+  const currentMonitorState = derivePersistedMonitorState({
+    issue: input.issue,
+    state: existingState,
+    policy: input.policy,
+  });
+  const restoredAttemptCount = input.attemptCount ?? Math.max(0, (currentMonitorState?.attemptCount ?? 1) - 1);
+  const previousMonitorState = currentMonitorState
+    ? { ...currentMonitorState, attemptCount: restoredAttemptCount }
+    : null;
+  const nextMonitorState = buildScheduledMonitorState(previousMonitorState, input.policy.monitor!);
+
+  return {
+    executionPolicy: input.policy as unknown as Record<string, unknown>,
+    executionState: executionStateWithMonitor(existingState, nextMonitorState) as Record<string, unknown> | null,
+    monitorNextCheckAt: new Date(input.policy.monitor!.nextCheckAt),
+    monitorWakeRequestedAt: null,
+    monitorAttemptCount: restoredAttemptCount,
     monitorNotes: nextMonitorState.notes,
     monitorScheduledBy: nextMonitorState.scheduledBy,
   };

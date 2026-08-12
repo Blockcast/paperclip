@@ -51,6 +51,7 @@ import {
   linkIssueApprovalSchema,
   issueDocumentKeySchema,
   ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
+  ISSUE_STATUS_ADJUDICATION_DOCUMENT_KEY,
   ISSUE_WATCHDOG_DISCOVERY_KINDS,
   TASK_WATCHDOG_PRODUCT_BUG_ORIGIN_KIND,
   rejectIssueThreadInteractionSchema,
@@ -63,6 +64,7 @@ import {
   updateIssueSchema,
   getClosedIsolatedExecutionWorkspaceMessage,
   isClosedIsolatedExecutionWorkspace,
+  isAgentStatusInvokable,
   isUuidLike,
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
   type CompactIssue,
@@ -128,7 +130,10 @@ import {
   workProductService,
 } from "../services/index.js";
 import { buildPlanReviewContext } from "../services/plan-review-context.js";
-import { hydrateSuccessfulRunHandoffLiveness } from "../services/successful-run-handoff-state.js";
+import {
+  hydrateSuccessfulRunHandoffLiveness,
+  resolveSuccessfulRunHandoffForTerminalIssues,
+} from "../services/successful-run-handoff-state.js";
 import {
   TASK_WATCHDOG_ORIGIN_KIND,
   resolveTaskWatchdogMutationScope,
@@ -184,6 +189,7 @@ import {
 } from "../services/company-search-rate-limit.js";
 import {
   applyIssueExecutionPolicyTransition,
+  mergeIssueExecutionPolicyMonitor,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
   redactIssueMonitorExternalRef,
@@ -1055,7 +1061,7 @@ async function listSuccessfulRunHandoffStates(
   db: Db,
   companyId: string,
   issueIds: string[],
-  options?: { hydrateLiveness?: boolean },
+  options?: { hydrateLiveness?: boolean; foldTerminal?: boolean },
 ): Promise<Map<string, SuccessfulRunHandoffState>> {
   if (issueIds.length === 0) return new Map();
   const rows = await db
@@ -1081,6 +1087,13 @@ async function listSuccessfulRunHandoffStates(
     if (states.has(row.entityId)) continue;
     const state = successfulRunHandoffStateFromActivity(row);
     if (state) states.set(row.entityId, state);
+  }
+  // Before liveness: a handoff on a closed issue is moot regardless of whether
+  // this caller wants liveness hydrated (BLO-16074). Callers that use this map to
+  // decide whether to WRITE the resolution activity row must opt out — folding
+  // first would make the pending handoff invisible and swallow the audit event.
+  if (options?.foldTerminal !== false) {
+    await resolveSuccessfulRunHandoffForTerminalIssues(db, companyId, states);
   }
   return options?.hydrateLiveness === false
     ? states
@@ -2001,6 +2014,7 @@ async function assertCanManageIssueMonitor(
     // `assertAgentIssueMutationAllowed` has already allowed this mutation via
     // `allow_productivity_review_grant` (BLO-19723). See the call site.
     productivityReviewOwnerAuthorized?: boolean;
+    managerMonitorRearmAuthorized?: boolean;
   } = {},
 ) {
   if (!monitorChanged) return;
@@ -2038,6 +2052,7 @@ async function assertCanManageIssueMonitor(
   //   * still behind `runtime:manage` above — the review grant substitutes for
   //     the assignee *relation*, not for the runtime capability.
   if (options.productivityReviewOwnerAuthorized) return;
+  if (options.managerMonitorRearmAuthorized) return;
   throw forbidden(
     "Only the assignee agent or a board user can manage issue monitors",
     {
@@ -2051,6 +2066,7 @@ async function assertCanManageIssueMonitor(
         "the issue's assignee agent",
         "the agent holding the issue's current execution run",
         "the owner of an open productivity review of this issue (PATCH /issues/:id only)",
+        "a manager in the assignee's reporting chain re-arming a triggered monitor (PATCH /issues/:id only)",
       ],
     },
   );
@@ -2806,6 +2822,10 @@ function trimIssueListResponseCache() {
 function setIssueListResponseCacheEntry(key: string, entry: IssueListCacheEntry) {
   touchIssueListResponseCacheEntry(key, entry);
   trimIssueListResponseCache();
+}
+
+export function __setIssueListResponseCacheEntryForTests(key: string, entry: IssueListCacheEntry) {
+  setIssueListResponseCacheEntry(key, entry);
 }
 
 function decrementIssueListActorClientInflight(actorClientKey: string) {
@@ -5178,6 +5198,64 @@ export function issueRoutes(
     );
   }
 
+  function isManagerChainNonInvokableAssigneeReroutePatch(body: unknown) {
+    if (!body || typeof body !== "object" || Array.isArray(body)) return false;
+    const patch = body as Record<string, unknown>;
+    const keys = Object.keys(patch);
+    if (keys.length !== 1) return false;
+    return keys[0] === "assigneeAgentId" || (keys[0] === "status" && patch.status === "cancelled");
+  }
+
+  async function decideManagerChainNonInvokableAssigneeReroute(
+    req: Request,
+    issue: Parameters<typeof decideIssueAccess>[1],
+  ) {
+    if (req.actor.type !== "agent" || !req.actor.agentId) return null;
+    if (req.actor.companyId !== issue.companyId || !issue.assigneeAgentId) return null;
+    if (!isManagerChainNonInvokableAssigneeReroutePatch(req.body)) return null;
+
+    const commentDecision = await decideIssueAccess(req, issue, "issue:comment");
+    if (commentDecision.reason !== "allow_manager_chain") return null;
+
+    const assignee = await agentsSvc.getById(issue.assigneeAgentId);
+    if (!assignee || assignee.companyId !== issue.companyId || isAgentStatusInvokable(assignee.status)) return null;
+    return commentDecision;
+  }
+
+  function isLapsedMonitorRearmPatch(
+    issue: {
+      status: string;
+      executionState?: unknown;
+      monitorNextCheckAt?: Date | null;
+    },
+    body: Record<string, unknown>,
+  ) {
+    if (!["in_progress", "in_review"].includes(issue.status) || issue.monitorNextCheckAt) return false;
+    if (Object.keys(body).length !== 1 || body.executionPolicy == null) return false;
+    const currentMonitor = parseIssueExecutionState(issue.executionState)?.monitor ?? null;
+    if (currentMonitor?.status !== "triggered") return false;
+    // The capability this unlocks is a monitor re-arm and nothing else. A body
+    // carrying only `executionPolicy` is NOT sufficient to establish that:
+    // `executionPolicy` is a whole-policy replace, so a policy that merely
+    // *contains* a monitor alongside `stages` or `authorizationPolicy` would let
+    // a manager rewrite a report's workflow and authorization configuration
+    // through a path that deliberately skips the ordinary mutation boundary.
+    //
+    // Checked on the *normalized* policy rather than the request's key set:
+    // `validate(updateIssueRouteSchema)` has already replaced req.body with the
+    // parsed result, and unlike the top-level `.partial()` object the nested
+    // policy schema does fire its defaults — a monitor-only policy arrives here
+    // as `{mode, commentRequired, stages, monitor}`. So key presence proves
+    // nothing and only the values do. `mode`/`commentRequired` are not checked
+    // because the merge at the write site keeps the report's own values and
+    // discards everything the request carried except the monitor.
+    const requestedPolicy = normalizeIssueExecutionPolicy(body.executionPolicy);
+    if (!requestedPolicy?.monitor) return false;
+    if (requestedPolicy.stages.length > 0) return false;
+    if (requestedPolicy.reviewPreset || requestedPolicy.authorizationPolicy) return false;
+    return true;
+  }
+
   async function assertAgentIssueMutationAllowed(
     req: Request,
     res: Response,
@@ -5209,6 +5287,9 @@ export function issueRoutes(
         executionRunId: string | null;
       }) => void;
       allowCoordinationMetadata?: boolean;
+      allowManagerChainNonInvokableReroute?: boolean;
+      onManagerChainNonInvokableRerouteAllowed?: () => void;
+      allowManagerMonitorRearm?: boolean;
       /**
        * PATCH /issues/:id only: when an execution-stage currentParticipant and
        * issue assignee diverge, the participant must still be able to submit a
@@ -5251,6 +5332,9 @@ export function issueRoutes(
     // inside this shared helper reaches ~two dozen mutation routes, so the
     // gate has to live at the caller that knows what is being written.
     if (options.allowCoordinationMetadata) {
+      return true;
+    }
+    if (options.allowManagerMonitorRearm) {
       return true;
     }
     if (isCurrentIssueExecutionRun(req, issue)) {
@@ -5305,6 +5389,13 @@ export function issueRoutes(
         : null;
     if (!boundaryDecision.allowed) {
       if (await isActiveRecoveryActionOwner()) return true;
+      if (options.allowManagerChainNonInvokableReroute) {
+        const rerouteDecision = await decideManagerChainNonInvokableAssigneeReroute(req, issue);
+        if (rerouteDecision) {
+          options.onManagerChainNonInvokableRerouteAllowed?.();
+          return true;
+        }
+      }
       if (
         options.allowCreatorOrManagerChainOwnership &&
         isCreatorOrManagerChainRecoveryPatch(issue, req.body as Record<string, unknown>)
@@ -5912,6 +6003,15 @@ export function issueRoutes(
       context.resumeRequiresNormalModel === true;
   }
 
+  function isPlanningOnlyRecoveryContext(contextSnapshot: unknown) {
+    if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return false;
+    const context = contextSnapshot as Record<string, unknown>;
+    return context.recoveryIntent === "planning_only" &&
+      context.allowDeliverableWork === false &&
+      context.allowDocumentUpdates === true &&
+      context.resumeRequiresNormalModel === false;
+  }
+
   function requestsCheapIssueAssigneeModelProfile(input: { assigneeAdapterOverrides?: unknown }) {
     const overrides = input.assigneeAdapterOverrides;
     return !!overrides &&
@@ -5967,23 +6067,51 @@ export function issueRoutes(
     return false;
   }
 
+  /**
+   * Gate deliverable-shaped writes on the actor's recovery run class.
+   *
+   * `documentKey` is consulted ONLY for `mutationKind: "document"`, and only to
+   * carve out the status-adjudication key for status-only runs (BLO-25868).
+   * Callers that cannot name a key pass nothing and get the strict behaviour, so
+   * omitting it can never widen the gate.
+   */
   async function assertDeliverableMutationAllowedByRunContext(
     req: Request,
     res: Response,
     issue: { id: string; companyId: string },
+    mutationKind: "document" | "deliverable" | "annotation" = "deliverable",
+    documentKey?: string,
   ) {
     const run = await loadActorRunContext(req, issue.companyId);
     if (!run) return true;
-    if (!isStatusOnlyCheapRecoveryContext(run.contextSnapshot)) return true;
+    const statusOnly = isStatusOnlyCheapRecoveryContext(run.contextSnapshot);
+    const planningOnly = isPlanningOnlyRecoveryContext(run.contextSnapshot);
+    // A status-only run may record its verdict, and only its verdict. Without
+    // this the done gate's 422 (`no_execution_run_and_no_pr_evidence`) and this
+    // 403 were both reachable for the same actor on the same issue, demanding a
+    // durable artifact while forbidding the only call that produces one — a
+    // deadlock no re-wake could clear. Narrow by construction: one exact key, on
+    // the upsert route alone, so plans, other document keys, annotations and
+    // work products stay barred.
+    const writesStatusAdjudication = mutationKind === "document" &&
+      documentKey === ISSUE_STATUS_ADJUDICATION_DOCUMENT_KEY;
+    if (statusOnly && writesStatusAdjudication) return true;
+    if (!statusOnly && (!planningOnly || mutationKind === "document")) return true;
 
     res.status(403).json({
-      error: "Cheap status-only recovery runs cannot update issue documents, plans, or deliverable artifacts",
+      error: planningOnly
+        ? "Planning-only recovery runs can update issue documents but cannot create or modify annotations or deliverable artifacts"
+        : "Cheap status-only recovery runs cannot update issue documents, plans, or deliverable artifacts. " +
+          `To record a status conclusion and close, PUT /api/issues/:id/documents/${ISSUE_STATUS_ADJUDICATION_DOCUMENT_KEY} ` +
+          "with the verdict and the evidence it rests on; producing the deliverable itself needs a normal-model run.",
       details: {
         issueId: issue.id,
         runId: run.id,
-        modelProfile: "cheap",
-        recoveryIntent: "status_only",
-        resumeRequiresNormalModel: true,
+        ...(statusOnly
+          ? { modelProfile: "cheap", allowedDocumentKey: ISSUE_STATUS_ADJUDICATION_DOCUMENT_KEY }
+          : {}),
+        recoveryIntent: planningOnly ? "planning_only" : "status_only",
+        resumeRequiresNormalModel: statusOnly,
       },
     });
     return false;
@@ -5996,19 +6124,22 @@ export function issueRoutes(
   ) {
     const run = await loadActorRunContext(req, issue.companyId);
     if (!run) return true;
-    if (!isStatusOnlyCheapRecoveryContext(run.contextSnapshot)) return true;
+    const statusOnly = isStatusOnlyCheapRecoveryContext(run.contextSnapshot);
+    const planningOnly = isPlanningOnlyRecoveryContext(run.contextSnapshot);
+    if (!statusOnly && !planningOnly) return true;
 
     res.status(403).json({
       error:
-        "Cheap status-only recovery runs cannot link or unlink approvals; to escalate from this run, " +
-        "create a `request_board_approval` with the run context's source issue in `issueIds` instead",
+        planningOnly
+          ? "Planning-only recovery runs cannot link or unlink approvals"
+          : "Cheap status-only recovery runs cannot link or unlink approvals; to escalate from this run, " +
+            "create a `request_board_approval` with the run context's source issue in `issueIds` instead",
       details: {
         issueId: issue.id,
         runId: run.id,
-        modelProfile: "cheap",
-        recoveryIntent: "status_only",
-        resumeRequiresNormalModel: true,
-        allowedApprovalType: "request_board_approval",
+        ...(statusOnly ? { modelProfile: "cheap", allowedApprovalType: "request_board_approval" } : {}),
+        recoveryIntent: planningOnly ? "planning_only" : "status_only",
+        resumeRequiresNormalModel: statusOnly,
       },
     });
     return false;
@@ -7924,6 +8055,7 @@ export function issueRoutes(
       const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
       if (!issue) return;
       if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
+      if (!(await assertDeliverableMutationAllowedByRunContext(req, res, issue, "annotation"))) return;
       const keyParsed = issueDocumentKeySchema.safeParse(String(req.params.key ?? "").trim().toLowerCase());
       if (!keyParsed.success) {
         res.status(400).json({ error: "Invalid document key", details: keyParsed.error.issues });
@@ -7998,6 +8130,7 @@ export function issueRoutes(
       const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
       if (!issue) return;
       if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
+      if (!(await assertDeliverableMutationAllowedByRunContext(req, res, issue, "annotation"))) return;
       const keyParsed = issueDocumentKeySchema.safeParse(String(req.params.key ?? "").trim().toLowerCase());
       if (!keyParsed.success) {
         res.status(400).json({ error: "Invalid document key", details: keyParsed.error.issues });
@@ -8053,6 +8186,7 @@ export function issueRoutes(
       const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
       if (!issue) return;
       if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
+      if (!(await assertDeliverableMutationAllowedByRunContext(req, res, issue, "annotation"))) return;
       const keyParsed = issueDocumentKeySchema.safeParse(String(req.params.key ?? "").trim().toLowerCase());
       if (!keyParsed.success) {
         res.status(400).json({ error: "Invalid document key", details: keyParsed.error.issues });
@@ -8095,12 +8229,14 @@ export function issueRoutes(
     const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
     if (!issue) return;
     if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
-    if (!(await assertDeliverableMutationAllowedByRunContext(req, res, issue))) return;
+    // Key must be parsed BEFORE the run-class gate: it decides whether a
+    // status-only run is writing the one document key it is allowed (BLO-25868).
     const keyParsed = issueDocumentKeySchema.safeParse(String(req.params.key ?? "").trim().toLowerCase());
     if (!keyParsed.success) {
       res.status(400).json({ error: "Invalid document key", details: keyParsed.error.issues });
       return;
     }
+    if (!(await assertDeliverableMutationAllowedByRunContext(req, res, issue, "document", keyParsed.data))) return;
 
     const actor = getActorInfo(req);
     const sourceTrust = await sourceTrustForActorWrite(issue, actor);
@@ -8324,7 +8460,7 @@ export function issueRoutes(
       const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
       if (!issue) return;
       if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
-      if (!(await assertDeliverableMutationAllowedByRunContext(req, res, issue))) return;
+      if (!(await assertDeliverableMutationAllowedByRunContext(req, res, issue, "document"))) return;
       const keyParsed = issueDocumentKeySchema.safeParse(String(req.params.key ?? "").trim().toLowerCase());
       if (!keyParsed.success) {
         res.status(400).json({ error: "Invalid document key", details: keyParsed.error.issues });
@@ -9806,6 +9942,7 @@ export function issueRoutes(
           executionRunId: existing.executionRunId ?? null,
         }
       : null;
+    let managerChainNonInvokableRerouteAllowed = false;
     // BLO-18289: coordination-metadata allowlist. Evaluated before the boundary
     // check so a manager holding tasks:assign can curate the dependency graph
     // on a report's issue; null whenever the body is not exclusively
@@ -9825,6 +9962,15 @@ export function issueRoutes(
         coordinationMetadataFields,
       )
       : null;
+    const managerMonitorRearmDecision =
+      req.actor.type === "agent" &&
+      isLapsedMonitorRearmPatch(existing, req.body as Record<string, unknown>)
+        ? await decideIssueAccess(req, existing, "issue:comment")
+        : null;
+    const managerMonitorRearmAuthorized = Boolean(
+      managerMonitorRearmDecision &&
+      managerMonitorRearmDecision.reason === "allow_manager_chain",
+    );
     if (!(await assertAgentIssueMutationAllowed(
       req,
       res,
@@ -9841,6 +9987,11 @@ export function issueRoutes(
         },
         allowCoordinationMetadata: coordinationMetadataDecision !== null,
         allowExecutionStageParticipantDecision: true,
+        allowManagerChainNonInvokableReroute: true,
+        onManagerChainNonInvokableRerouteAllowed: () => {
+          managerChainNonInvokableRerouteAllowed = true;
+        },
+        allowManagerMonitorRearm: managerMonitorRearmAuthorized,
         // BLO-18797: the delegate-recovery path. The helper additionally
         // requires a blocked -> todo patch containing only status and
         // blockedByIssueIds.
@@ -9862,6 +10013,8 @@ export function issueRoutes(
       !!existing.assigneeAgentId &&
       existing.assigneeAgentId !== req.actor.agentId &&
       isCreatorOrManagerChainRecoveryPatch(existing, req.body as Record<string, unknown>);
+    const authorizationPinnedAssignee =
+      delegateRecoveryPatchInFlight || managerChainNonInvokableRerouteAllowed;
     if (!(await assertCheapRecoveryIssueAssigneeProfileAllowed(req, res, existing, req.body))) return;
 
     const actor = getActorInfo(req);
@@ -9939,6 +10092,20 @@ export function issueRoutes(
     // all outside the allowlist, so the only trigger that can reach this line
     // with a decision in hand is `blockedByIssueIds` — the BLO-18163 use case.
     // Any non-allowlisted field nulls the decision and restores the guard.
+    //
+    // Follow-up finding (BLO-19951, after merge): this term is currently
+    // REDUNDANT, and deliberately kept as defence in depth rather than reverted.
+    // `issue:coordination_metadata` allows solely via isManagerOf(actor,
+    // assignee), and `tasks:manage_active_checkouts` allows on that same
+    // relation — which `assertRecoveryActionAuthority` consults, and returns
+    // true on, before it can 403. So a non-null decision implies the guard
+    // would already have passed, and no 403 this term suppresses can actually
+    // occur. It matters only if those two authorities are ever decoupled, at
+    // which point it silently becomes a live bypass of the recovery-owner
+    // check — so the coupling is pinned by a real-service test
+    // ("couples coordination-metadata authority to active-checkout
+    // management", authorization-service.test.ts). If that test fails, revisit
+    // this line before relaxing it further.
     if (
       recoveryRelevantSourceMutationRequested &&
       !coordinationMetadataDecision &&
@@ -10106,10 +10273,21 @@ export function issueRoutes(
       });
     }
     if (req.body.executionPolicy !== undefined) {
-      updateFields.executionPolicy = applyActorMonitorScheduledBy(
+      const requestedExecutionPolicy = applyActorMonitorScheduledBy(
         normalizeIssueExecutionPolicy(req.body.executionPolicy),
         actor.actorType,
       );
+      // A manager-chain re-arm is authorized to restore a *timer*, not to
+      // rewrite the policy. `isLapsedMonitorRearmPatch` already rejects a
+      // request carrying anything but a monitor; merging rather than replacing
+      // closes the other half — the write itself must not silently drop stages,
+      // reviewPreset, authorizationPolicy or mode that the assignee set.
+      updateFields.executionPolicy = managerMonitorRearmAuthorized
+        ? mergeIssueExecutionPolicyMonitor(
+          normalizeIssueExecutionPolicy(existing.executionPolicy ?? null),
+          requestedExecutionPolicy?.monitor ?? null,
+        )
+        : requestedExecutionPolicy;
     }
     const previousExecutionPolicy = normalizeIssueExecutionPolicy(existing.executionPolicy ?? null);
     const nextExecutionPolicy =
@@ -10135,6 +10313,7 @@ export function issueRoutes(
         // the reason differs, the audit stays null, and this guard keeps its
         // pre-existing behaviour — fail-closed.
         productivityReviewOwnerAuthorized: productivityReviewSourceMutationAudit.current !== null,
+        managerMonitorRearmAuthorized,
       },
     );
 
@@ -10294,14 +10473,21 @@ export function issueRoutes(
               actorUserId: actor.actorType === "user" ? actor.actorId : null,
               ...executionSnapshotPreconditions,
               ...currentRunMutationPreconditions,
-              ...(delegateRecoveryPatchInFlight
+              ...(authorizationPinnedAssignee
                 ? {
-                    expectedCurrentStatus: "blocked",
+                    ...(delegateRecoveryPatchInFlight ? { expectedCurrentStatus: "blocked" } : {}),
                     // BLO-18797: allow_manager_chain was granted because this
                     // assignee is a report of the actor. Pin it too, or a
                     // reassignment to an unrelated agent that keeps the row
                     // blocked would still satisfy an id+status predicate.
                     expectedCurrentAssigneeAgentId: existing.assigneeAgentId,
+                    // BLO-22876 review: the reroute grant additionally rests on
+                    // that assignee being non-invokable, which lives in `agents`
+                    // and so cannot be pinned by an `issues` WHERE clause. Pin
+                    // it as a locked write-time re-read instead.
+                    ...(managerChainNonInvokableRerouteAllowed
+                      ? { expectedCurrentAssigneeAgentNonInvokable: true }
+                      : {}),
                   }
                 : {}),
             },
@@ -10331,12 +10517,16 @@ export function issueRoutes(
           actorUserId: actor.actorType === "user" ? actor.actorId : null,
           ...executionSnapshotPreconditions,
           ...currentRunMutationPreconditions,
-          ...(delegateRecoveryPatchInFlight
+          ...(authorizationPinnedAssignee
             ? {
-                expectedCurrentStatus: "blocked",
+                ...(delegateRecoveryPatchInFlight ? { expectedCurrentStatus: "blocked" } : {}),
                 // See the transactional branch above: the assignee is an
-                // authorization-relevant snapshot field for allow_manager_chain.
+                // authorization-relevant snapshot field for allow_manager_chain,
+                // and its invokability is one for the BLO-22876 reroute grant.
                 expectedCurrentAssigneeAgentId: existing.assigneeAgentId,
+                ...(managerChainNonInvokableRerouteAllowed
+                  ? { expectedCurrentAssigneeAgentNonInvokable: true }
+                  : {}),
               }
             : {}),
         });
@@ -10635,7 +10825,14 @@ export function issueRoutes(
     const explicitlyRecordedSuccessfulRunDisposition =
       actor.actorType === "user" && req.body.status !== undefined && issue.status !== "in_progress";
     if (explicitlyRecordedSuccessfulRunDisposition) {
-      await listSuccessfulRunHandoffStates(db, issue.companyId, [issue.id], { hydrateLiveness: false })
+      // foldTerminal:false — this read decides whether to WRITE the durable
+      // resolution row, and `issue` is already terminal by the time we get here.
+      // Letting the terminal fold run would report the handoff as resolved and
+      // skip the write, losing sourceRunId/correctiveRunId/resolvedByStatus.
+      await listSuccessfulRunHandoffStates(db, issue.companyId, [issue.id], {
+        hydrateLiveness: false,
+        foldTerminal: false,
+      })
         .then(async (handoffStates) => {
           const handoff = handoffStates.get(issue.id);
           if (handoff?.state !== "required" && handoff?.state !== "escalated") return;

@@ -993,4 +993,96 @@ describeEmbeddedPostgres("PATCH /issues/:id done-execution gate — durable arti
 
     expect(response.status).toBe(200);
   });
+
+  /**
+   * BLO-25868 — the two gates must not both fire for one actor on one issue.
+   *
+   * Reproduction, from run `1567e104` on BLO-22798: an issue whose deliverable is
+   * not code (no PR to cite) and whose lock was long since released, owned by a
+   * cheap status-only recovery run. The close gate demanded a durable artifact
+   * (422) and the artifact route refused this actor (403), so the run that owned
+   * the issue could not close it by any path.
+   */
+  async function markRunStatusOnly(runId: string) {
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: {
+          modelProfile: "cheap",
+          recoveryIntent: "status_only",
+          allowDeliverableWork: false,
+          allowDocumentUpdates: false,
+          resumeRequiresNormalModel: true,
+        },
+      })
+      .where(eq(heartbeatRuns.id, runId));
+  }
+
+  it("lets a cheap status-only run record a verdict and close a non-code issue with no PR", async () => {
+    await enableDoneExecutionGate();
+    const { companyId, issueId, agentId, runId } = await seedInReviewIssue();
+    await markRunStatusOnly(runId);
+    await addFindingsComment(companyId, issueId, agentId, runId);
+    const app = createApp(agentId, companyId, runId);
+
+    // Premise: prose alone still does not close it. This is the 422 side of the
+    // pair. Asserted on `reason` only, so that the assertion that FAILS on
+    // unfixed master is the deadlock below, not a message-copy difference.
+    const beforeArtifact = await patchToDone(agentId, companyId, runId, issueId);
+    expect(beforeArtifact.status).toBe(422);
+    expect(beforeArtifact.body.details).toMatchObject({ reason: "no_execution_run_and_no_pr_evidence" });
+
+    // The 403 side. THIS is the line that fails on unfixed master: the actor the
+    // 422 just sent here was refused, leaving no third option. Both halves of
+    // the pair were reachable for one actor on one issue.
+    const adjudication = await request(app)
+      .put(`/api/issues/${issueId}/documents/status-adjudication`)
+      .send({
+        format: "markdown",
+        body: [
+          "## Verdict: resolved",
+          "Acceptance criteria were met by the routine revision landed 2026-08-10T21:00Z.",
+          "No code deliverable, so there is no PR to cite.",
+        ].join("\n"),
+      });
+    // 201: the route creates the document.
+    expect(adjudication.status, JSON.stringify(adjudication.body)).toBe(201);
+    expect(adjudication.body.key).toBe("status-adjudication");
+
+    const response = await patchToDone(agentId, companyId, runId, issueId);
+
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    const [persisted] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(persisted.status).toBe("done");
+    // The premise of the reproduction: no legacy escape hatch was available.
+    expect(persisted.executionRunId).toBeNull();
+    expect(persisted.checkoutRunId).toBeNull();
+    // And the refusal names the step that is actually reachable for this actor.
+    expect(beforeArtifact.body.details.statusOnlyDocumentKey).toBe("status-adjudication");
+  });
+
+  it("still bars a cheap status-only run from writing a plan or any other document key", async () => {
+    await enableDoneExecutionGate();
+    const { companyId, issueId, agentId, runId } = await seedInReviewIssue();
+    await markRunStatusOnly(runId);
+    const app = createApp(agentId, companyId, runId);
+
+    for (const key of ["plan", "findings", "deliverable"]) {
+      const res = await request(app)
+        .put(`/api/issues/${issueId}/documents/${key}`)
+        .send({ format: "markdown", body: "# work product this run must not author" });
+
+      expect(res.status, `${key}: ${JSON.stringify(res.body)}`).toBe(403);
+      expect(res.body.error).toContain("Cheap status-only recovery runs cannot update issue documents");
+      expect(res.body.details).toMatchObject({
+        modelProfile: "cheap",
+        recoveryIntent: "status_only",
+        allowedDocumentKey: "status-adjudication",
+      });
+    }
+
+    // And the barred keys really did not land, so the close still fails.
+    const response = await patchToDone(agentId, companyId, runId, issueId);
+    expect(response.status).toBe(422);
+  });
 });

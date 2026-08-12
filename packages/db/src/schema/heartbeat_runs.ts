@@ -70,6 +70,16 @@ export const heartbeatRuns = pgTable(
     continuationAttempt: integer("continuation_attempt").notNull().default(0),
     lastUsefulActionAt: timestamp("last_useful_action_at", { withTimezone: true }),
     nextAction: text("next_action"),
+    // Nullable, no column default (BLO-21116 review follow-up): stamped only
+    // by the specific transitions that put a run back into `queued` after it
+    // was something else (promoteScheduledRetryRun, deferRunForK8sIsolationConflict).
+    // A fresh `queued` insert leaves this null and ages off createdAt via the
+    // coalesce in refreshQueuedRunAgeMetrics -- createdAt IS the queue-entry
+    // time for a brand-new row, so there is nothing to stamp there. Without
+    // this column the age gauge read a promoted retry's full `scheduled_retry`
+    // backoff (hours) as queued-dispatch wait (minutes), manufacturing the
+    // exact false-stranded-run signal BLO-21116 exists to kill.
+    queuedAt: timestamp("queued_at", { withTimezone: true }),
     contextSnapshot: jsonb("context_snapshot").$type<Record<string, unknown>>(),
     // Generated stored columns mirroring the hot context_snapshot keys.
     // See migration 0079. Populated automatically by Postgres on insert /

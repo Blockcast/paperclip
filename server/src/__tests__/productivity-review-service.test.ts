@@ -194,6 +194,8 @@ describeEmbeddedPostgres("productivity review service", () => {
     withRunComments?: boolean;
     contextSource?: string;
     status?: string;
+    startedAt?: Date | null;
+    nextAction?: string | null;
     livenessState?: string | null;
     usageJson?: Record<string, unknown> | null;
     logBytes?: number | null;
@@ -209,15 +211,15 @@ describeEmbeddedPostgres("productivity review service", () => {
         status: input.status ?? "succeeded",
         invocationSource: "assignment",
         triggerDetail: "system",
-        startedAt: createdAt,
-        finishedAt: new Date(createdAt.getTime() + 30_000),
+        startedAt: input.startedAt === undefined ? createdAt : input.startedAt,
+        finishedAt: (input.status ?? "succeeded") === "succeeded" ? new Date(createdAt.getTime() + 30_000) : null,
         contextSnapshot: input.contextSource
           ? { issueId: input.issueId, taskId: input.issueId, source: input.contextSource }
           : { issueId: input.issueId, taskId: input.issueId },
         livenessState: input.livenessState !== undefined ? input.livenessState : "advanced",
         usageJson: input.usageJson !== undefined ? input.usageJson : undefined,
         logBytes: input.logBytes !== undefined ? input.logBytes : undefined,
-        nextAction: "Continue processing the next batch.",
+        nextAction: input.nextAction === undefined ? "Continue processing the next batch." : input.nextAction,
         createdAt,
         updatedAt: createdAt,
       });
@@ -763,6 +765,243 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(cappedRefresh.updated).toBe(0);
     expect(cappedRefresh.existing).toBe(1);
     expect(await listRefreshComments(review!.id)).toHaveLength(DEFAULT_PRODUCTIVITY_REVIEW_MAX_REFRESH_COMMENTS);
+  });
+
+  describe("BLO-22105: refresh regenerates the description on a trigger flip", () => {
+    it("regenerates the Manager Decision block when a no_comment_streak review flips to runtime_failure_streak", async () => {
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const seeded = await seedAssignedIssue();
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+      });
+
+      const service = productivityReviewService(db);
+      await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+      const [review] = await listProductivityReviews(seeded.companyId);
+      expect(review?.description).toContain("Primary trigger: `no_comment_streak`");
+      expect(review?.description).toContain("Request decomposition");
+
+      const refreshAt = new Date(now.getTime() + DEFAULT_PRODUCTIVITY_REVIEW_REFRESH_INTERVAL_MS);
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now: refreshAt,
+        status: "failed",
+        livenessState: "failed",
+        usageJson: { inputTokens: 0, outputTokens: 0 },
+      });
+
+      const refresh = await service.reconcileProductivityReviews({ now: refreshAt, companyId: seeded.companyId });
+      expect(refresh.updated).toBe(1);
+
+      const [refreshedReview] = await listProductivityReviews(seeded.companyId);
+      expect(refreshedReview?.id).toBe(review!.id);
+      expect(refreshedReview?.description).toContain("Primary trigger: `runtime_failure_streak`");
+      expect(refreshedReview?.description).toContain("do not decompose, block, or cancel");
+      expect(refreshedReview?.description).not.toContain("Request decomposition");
+    });
+
+    it("regenerates the Manager Decision block when a runtime_failure_streak review flips to no_comment_streak", async () => {
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const seeded = await seedAssignedIssue();
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+        status: "failed",
+        livenessState: "failed",
+        usageJson: { inputTokens: 0, outputTokens: 0 },
+      });
+
+      const service = productivityReviewService(db);
+      await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+      const [review] = await listProductivityReviews(seeded.companyId);
+      expect(review?.description).toContain("Primary trigger: `runtime_failure_streak`");
+      expect(review?.description).toContain("do not decompose, block, or cancel");
+
+      const refreshAt = new Date(now.getTime() + DEFAULT_PRODUCTIVITY_REVIEW_REFRESH_INTERVAL_MS);
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now: refreshAt,
+      });
+
+      const refresh = await service.reconcileProductivityReviews({ now: refreshAt, companyId: seeded.companyId });
+      expect(refresh.updated).toBe(1);
+
+      const [refreshedReview] = await listProductivityReviews(seeded.companyId);
+      expect(refreshedReview?.id).toBe(review!.id);
+      expect(refreshedReview?.description).toContain("Primary trigger: `no_comment_streak`");
+      expect(refreshedReview?.description).toContain("Request decomposition");
+      expect(refreshedReview?.description).not.toContain("do not decompose, block, or cancel");
+    });
+
+    it("does not rewrite the description when the refresh observes the same trigger", async () => {
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const seeded = await seedAssignedIssue();
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+      });
+
+      const service = productivityReviewService(db);
+      await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+      const [review] = await listProductivityReviews(seeded.companyId);
+      const originalDescription = review!.description;
+
+      const refreshAt = new Date(now.getTime() + DEFAULT_PRODUCTIVITY_REVIEW_REFRESH_INTERVAL_MS);
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now: refreshAt,
+      });
+
+      const refresh = await service.reconcileProductivityReviews({ now: refreshAt, companyId: seeded.companyId });
+      expect(refresh.updated).toBe(1);
+
+      const [refreshedReview] = await listProductivityReviews(seeded.companyId);
+      expect(refreshedReview?.description).toBe(originalDescription);
+    });
+
+    it("still regenerates a stale description after the refresh-comment cap is reached, without posting another comment", async () => {
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const seeded = await seedAssignedIssue();
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+      });
+
+      const service = productivityReviewService(db);
+      await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+      const [review] = await listProductivityReviews(seeded.companyId);
+
+      // Exhaust the DEFAULT_PRODUCTIVITY_REVIEW_MAX_REFRESH_COMMENTS cap (3)
+      // with unchanged-trigger refreshes, exactly like the existing
+      // "caps refresh comments" coverage above.
+      let cursor = now;
+      for (let i = 0; i < DEFAULT_PRODUCTIVITY_REVIEW_MAX_REFRESH_COMMENTS; i += 1) {
+        cursor = new Date(cursor.getTime() + DEFAULT_PRODUCTIVITY_REVIEW_REFRESH_INTERVAL_MS);
+        await insertRuns({
+          companyId: seeded.companyId,
+          agentId: seeded.coderId,
+          issueId: seeded.issueId,
+          count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+          now: cursor,
+        });
+        await service.reconcileProductivityReviews({ now: cursor, companyId: seeded.companyId });
+      }
+      expect(await listRefreshComments(review!.id)).toHaveLength(DEFAULT_PRODUCTIVITY_REVIEW_MAX_REFRESH_COMMENTS);
+
+      // The cap is now hit. A further refresh that only repeats the same
+      // trigger should stay throttled...
+      const stillNoOpAt = new Date(cursor.getTime() + DEFAULT_PRODUCTIVITY_REVIEW_REFRESH_INTERVAL_MS);
+      const noOpRefresh = await service.reconcileProductivityReviews({
+        now: stillNoOpAt,
+        companyId: seeded.companyId,
+      });
+      expect(noOpRefresh.updated).toBe(0);
+      expect(noOpRefresh.existing).toBe(1);
+
+      // ...but a trigger flip must still correct the Manager Decision block —
+      // the comment cap bounds comment churn, not correctness of the guidance.
+      const flipAt = new Date(stillNoOpAt.getTime() + DEFAULT_PRODUCTIVITY_REVIEW_REFRESH_INTERVAL_MS);
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now: flipAt,
+        status: "failed",
+        livenessState: "failed",
+        usageJson: { inputTokens: 0, outputTokens: 0 },
+      });
+      const flipRefresh = await service.reconcileProductivityReviews({ now: flipAt, companyId: seeded.companyId });
+      expect(flipRefresh.updated).toBe(1);
+
+      const [afterFlip] = await listProductivityReviews(seeded.companyId);
+      expect(afterFlip?.description).toContain("Primary trigger: `runtime_failure_streak`");
+      expect(afterFlip?.description).toContain("do not decompose, block, or cancel");
+      // No new comment: the cap still bounds comment churn.
+      expect(await listRefreshComments(review!.id)).toHaveLength(DEFAULT_PRODUCTIVITY_REVIEW_MAX_REFRESH_COMMENTS);
+    });
+
+    it("preserves a description edited concurrently with a trigger-flip refresh instead of clobbering it", async () => {
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const seeded = await seedAssignedIssue();
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+      });
+
+      const service = productivityReviewService(db);
+      await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+      const [review] = await listProductivityReviews(seeded.companyId);
+      expect(review?.description).toContain("Primary trigger: `no_comment_streak`");
+
+      const refreshAt = new Date(now.getTime() + DEFAULT_PRODUCTIVITY_REVIEW_REFRESH_INTERVAL_MS);
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now: refreshAt,
+        status: "failed",
+        livenessState: "failed",
+        usageJson: { inputTokens: 0, outputTokens: 0 },
+      });
+
+      const concurrentlyEditedDescription = `${review!.description}\n\nManager note: escalating directly, do not overwrite.`;
+
+      // Simulate a human editing the review issue's description directly
+      // (e.g. via the issues API) in the window between this refresh's outer
+      // read of `existing` and the transaction's guarded UPDATE. The
+      // advisory lock only serializes this refresh path against itself; it
+      // says nothing about a plain issue edit landing concurrently.
+      const originalTransaction = db.transaction.bind(db);
+      const transactionSpy = vi.spyOn(db, "transaction").mockImplementation(
+        (async (...args: Parameters<typeof db.transaction>) => {
+          await db
+            .update(issues)
+            .set({ description: concurrentlyEditedDescription })
+            .where(eq(issues.id, review!.id));
+          return originalTransaction(...args);
+        }) as typeof db.transaction,
+      );
+
+      try {
+        const refresh = await service.reconcileProductivityReviews({ now: refreshAt, companyId: seeded.companyId });
+        // The refresh comment still gets appended — only the description
+        // overwrite lost the race.
+        expect(refresh.updated).toBe(1);
+      } finally {
+        transactionSpy.mockRestore();
+      }
+
+      const [afterRefresh] = await listProductivityReviews(seeded.companyId);
+      expect(afterRefresh?.description).toBe(concurrentlyEditedDescription);
+      expect(afterRefresh?.description).not.toContain("Primary trigger: `runtime_failure_streak`");
+    });
   });
 
   it("allows only one productivity review per source issue in 24 hours", async () => {
@@ -1491,6 +1730,143 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(review?.description).toContain("Primary trigger: `long_active_duration`");
   });
 
+  // BLO-23248/BLO-22331: a capacity-class `scheduled_retry` (fleet
+  // ccrotate/penstock model-provider exhaustion) clears `issue.executionRunId`
+  // to null the moment it is scheduled (`scheduleBoundedRetryForRun` in
+  // heartbeat.ts), so the BLO-19848 `nonLiveExecutionHoldSince` clamp above
+  // — which only sees a hold via `issue.executionRunId` — never engages for
+  // this state and the whole park counts as unattended. These fixtures
+  // reproduce that exact state (heartbeat run present and issue-scoped via
+  // `contextSnapshot`, but `issue.executionRunId` left null) rather than
+  // using `pinExecutionRun`, which sets the pointer this bug is about the
+  // absence of.
+  async function insertCapacityScheduledRetryRun(input: {
+    companyId: string;
+    agentId: string;
+    issueId: string;
+    createdAt: Date;
+    scheduledRetryAt: Date;
+    scheduledRetryReason?: string | null;
+    errorCode?: string | null;
+  }) {
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId: input.companyId,
+      agentId: input.agentId,
+      status: "scheduled_retry",
+      invocationSource: "automation",
+      triggerDetail: "system",
+      errorCode: input.errorCode ?? "rate_limit_exhausted",
+      scheduledRetryAt: input.scheduledRetryAt,
+      scheduledRetryAttempt: 0,
+      scheduledRetryReason: input.scheduledRetryReason ?? "ccrotate_capacity",
+      contextSnapshot: { issueId: input.issueId, taskId: input.issueId },
+      createdAt: input.createdAt,
+      updatedAt: input.createdAt,
+    });
+    return { runId };
+  }
+
+  it("does not fire long_active_duration while a capacity-class scheduled_retry is still due in the future, even though issue.executionRunId is null (BLO-23248/BLO-22331)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const episodeStart = new Date(now.getTime() - 7 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: episodeStart });
+    await insertCapacityScheduledRetryRun({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      createdAt: episodeStart,
+      scheduledRetryAt: new Date(now.getTime() + 5 * 24 * 60 * 60 * 1000),
+    });
+    // Sanity: reproduce the reported bug state directly — the issue's
+    // execution pointer is null while a live scheduled_retry row exists for it.
+    const [issueRow] = await db.select().from(issues).where(eq(issues.id, seeded.issueId));
+    expect(issueRow?.executionRunId).toBeNull();
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  it("still fires long_active_duration once an overdue capacity retry sits unpromoted, naming the capacity stall rather than the assignee (BLO-22331 no-indefinite-suppression guard)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const episodeStart = new Date(now.getTime() - 7 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: episodeStart });
+    const { runId } = await insertCapacityScheduledRetryRun({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      createdAt: episodeStart,
+      // Due an hour ago and never promoted/dispatched: a genuinely wedged
+      // retry chain, which BLO-22331's AC requires to remain reviewable
+      // rather than suppressed forever.
+      scheduledRetryAt: new Date(now.getTime() - 60 * 60 * 1000),
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+    expect(review?.description).toContain("capacity-stalled behind an overdue");
+    expect(review?.description).toContain("fleet-capacity signal, not assignee inactivity");
+    expect(review?.description).toContain(`run \`${runId}\``);
+    expect(review?.description).toContain(`Capacity-stall accounting:`);
+  });
+
+  it("surfaces the capacity-stalled bucket in evidence and does not let long_active_duration ride along when a different trigger fires (BLO-23248 AC)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const episodeStart = new Date(now.getTime() - 7 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: episodeStart });
+    // 10 terminal, turn-executing runs with no comments — trips
+    // no_comment_streak on its own, independent of the capacity retry.
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now: episodeStart,
+    });
+    // The most recent run for the issue is the still-future capacity retry —
+    // `latestRuns[0]`, so it (not the older terminal runs) drives
+    // `capacityGating`. It must be STRICTLY newer than every streak run:
+    // `insertRuns` stamps its newest row at exactly `now`, so seeding this at
+    // `episodeStart` too tied the head of the `desc(createdAt), desc(id)`
+    // ordering, leaving the winner to be decided by which `randomUUID()` sorted
+    // higher — a ~50/50 flake that passed locally and failed in CI.
+    // `scheduled_retry` is in ACTIVE_RUN_STATUSES, not TERMINAL_RUN_STATUSES, so
+    // moving it later keeps it out of the `no_comment_streak` walk unchanged.
+    await insertCapacityScheduledRetryRun({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      createdAt: new Date(episodeStart.getTime() + 60_000),
+      scheduledRetryAt: new Date(now.getTime() + 5 * 24 * 60 * 60 * 1000),
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    // no_comment_streak fired on its own merits; long_active_duration was
+    // eligible on elapsed time (7h > default 6h threshold) but suppressed.
+    expect(review?.description).toContain("Primary trigger: `no_comment_streak`");
+    expect(review?.description).not.toContain("Primary trigger: `long_active_duration`");
+    expect(review?.description).toContain("Capacity-stall accounting:");
+    expect(review?.description).toContain("capacity-stalled");
+  });
+
   it("suppresses long-active productivity reviews for deliberate future monitor waits", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const monitorNextCheckAt = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
@@ -1542,6 +1918,343 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(result.monitorScheduledSuppressed).toBe(0);
     const [review] = await listProductivityReviews(seeded.companyId);
     expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+  });
+
+  // BLO-19604 live reproduction (BLO-19570 against BLO-18285): the issue entered
+  // in_progress 7h ago (past the 6h threshold), but the assignee has been actively
+  // dispatching and completing runs the whole time — only the run enqueued right
+  // alongside the original checkout is still stuck `queued`, never dispatched. Prior
+  // to the fix, elapsed time was computed purely from the issue's own `startedAt`, so
+  // the queued run's age was irrelevant but the raw checkout age alone still tripped
+  // `long_active_duration` even though real work was landing minutes before this
+  // evaluation. The episode anchor must track the most recent *dispatched* run instead.
+  it("does not raise long_active_duration when only a queued, never-dispatched run is stale but recent runs were actually dispatched", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const sevenHoursAgo = new Date(now.getTime() - 7 * 60 * 60 * 1000);
+    const fourHoursAgo = new Date(now.getTime() - 4 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: sevenHoursAgo,
+    });
+
+    // The run enqueued alongside the original checkout: still `queued`, never claimed,
+    // `startedAt` null. Its age (7h) must not leak into the elapsed-time figure.
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 1,
+      now: sevenHoursAgo,
+      status: "queued",
+      startedAt: null,
+      nextAction: null,
+    });
+
+    // Real, dispatched work landing well inside the 6h window.
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 3,
+      now: fourHoursAgo,
+      withRunComments: true,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  // BLO-22016 live reproduction (BLO-18846 / run `9e49405e`): the issue was checked out
+  // ~12h ago and its current execution holder (`executionRunId`) is still `queued` — it
+  // never reached `startedAt` at all, so no work has executed in this episode. Before the
+  // fix, `activeStartedAt` fell back to the checkout timestamp whenever there was no
+  // in-episode dispatch, so this reported ~12h of "active" time despite zero tokens ever
+  // executing. That is a dispatch-lag problem (surfaced via `queuedUndispatchedRunCount`
+  // in evidence, tracked separately under BLO-21116 et al.), not a long-active-episode
+  // problem. Uses `pinExecutionRun` (not `insertRuns`) so `sourceIssue.executionRunId`
+  // is populated, matching the real checkout invariant — a checked-out issue always has
+  // an execution holder, whether or not that holder has started.
+  it("does not raise long_active_duration when the current execution holder is still queued and has never started (BLO-22016 / BLO-18846)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const twelveHoursAgo = new Date(now.getTime() - 12 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: twelveHoursAgo,
+    });
+
+    await pinExecutionRun({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      status: "queued",
+      lockedAt: twelveHoursAgo,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  // Contrast case: no run row exists at all since checkout — nothing was even attempted,
+  // as distinct from "a run was queued but never started" above. This is the existing,
+  // deliberately-tested "unattended episode" scenario (see the monitor-gating tests
+  // below, e.g. "reports the whole episode as unattended when no monitor was ever
+  // armed") and must keep firing on raw wall-clock time; the BLO-22016 fix must not
+  // desensitize this case just because it also involves zero dispatched runs.
+  it("still raises long_active_duration when a checked-out issue has no run at all, unlike a queued-never-started run", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const twelveHoursAgo = new Date(now.getTime() - 12 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: twelveHoursAgo,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+  });
+
+  // Control: once the previously-queued run actually starts executing and stays live past
+  // the threshold, the trigger must still fire — the fix must not desensitize the detector
+  // for genuine stalls, only for queue residency that was never real work.
+  it("still creates a long_active_duration review once the run actually starts and runs past the threshold", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const checkoutAt = new Date(now.getTime() - 12 * 60 * 60 * 1000);
+    const dispatchedAt = new Date(now.getTime() - 7 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: checkoutAt,
+    });
+
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 1,
+      now: dispatchedAt,
+      status: "running",
+      startedAt: dispatchedAt,
+      nextAction: null,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+  });
+
+  // Ally review on PR #1036: `mostRecentDispatchAt` must be a true `max(startedAt)`, not
+  // "the `startedAt` of whichever sampled run happens to have the greatest `createdAt`".
+  // Here an older-created run is dispatched *more* recently than a newer-created run that
+  // was dispatched almost immediately — creation order and dispatch order diverge. Scanning
+  // `createdAt`-ordered runs for the first non-null `startedAt` would hit the newer-created,
+  // earlier-dispatched run first and anchor the episode to a stale timestamp, crossing the
+  // 6h threshold and firing a false `long_active_duration`.
+  it("anchors elapsed time to the true max(startedAt) when creation order and dispatch order diverge", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 8 * 60 * 60 * 1000),
+    });
+
+    // Created earlier, but dispatched last — the true most recent dispatch.
+    const olderCreatedAt = new Date(now.getTime() - 7 * 60 * 60 * 1000);
+    const olderRunId = randomUUID();
+    // Created later than the run above, but dispatched shortly after creation — the run a
+    // createdAt-ordered `.find()` would hit first.
+    const newerCreatedAt = new Date(now.getTime() - 6 * 60 * 60 * 1000 - 50 * 60_000);
+    const newerRunId = randomUUID();
+
+    await db.insert(heartbeatRuns).values([
+      {
+        id: olderRunId,
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        status: "succeeded",
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        startedAt: new Date(now.getTime() - 30 * 60_000),
+        finishedAt: new Date(now.getTime() - 20 * 60_000),
+        contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+        livenessState: "advanced",
+        nextAction: null,
+        createdAt: olderCreatedAt,
+        updatedAt: olderCreatedAt,
+      },
+      {
+        id: newerRunId,
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        status: "succeeded",
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        startedAt: new Date(now.getTime() - 6 * 60 * 60 * 1000 - 5 * 60_000),
+        finishedAt: new Date(now.getTime() - 6 * 60 * 60 * 1000),
+        contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+        livenessState: "advanced",
+        nextAction: null,
+        createdAt: newerCreatedAt,
+        updatedAt: newerCreatedAt,
+      },
+    ]);
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  // BLO-19604 AC2: `run.nextAction` is only populated by that run's own liveness
+  // classification, which can miss a `Next` line the assignee posted in a plain issue
+  // comment. Reporting "none recorded" in that case reads as "no next step exists" when
+  // one plainly does — the report must recover it from the assignee's own comments.
+  it("recovers a Next line from an assignee comment instead of reporting 'none recorded'", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    const runs = await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 10,
+      now,
+      nextAction: null,
+    });
+    await db.insert(issueComments).values({
+      companyId: seeded.companyId,
+      issueId: seeded.issueId,
+      authorAgentId: seeded.coderId,
+      createdByRunId: runs[0]?.id,
+      body: "Made progress on the import job.\n\nNext: verify the retry backoff against the new queue depth metric.",
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `high_churn`");
+    expect(review?.description).not.toContain("Current next action: none recorded");
+    expect(review?.description).toContain(
+      "Current next action: verify the retry backoff against the new queue depth metric.",
+    );
+  });
+
+  // Ally review on PR #1036: the `commentNextAction` fallback (added above) must find a
+  // `Next:` line even when the comment has no `createdByRunId` at all — a genuinely plain
+  // issue comment, not one merely detached from the run it was posted alongside. The
+  // `latestComments` query used for report rendering inner-joins `heartbeatRuns` on that
+  // column and would silently exclude this comment, which is exactly the case the fallback
+  // exists to recover.
+  it("recovers a Next line from an assignee comment with no createdByRunId link", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 10,
+      now,
+      nextAction: null,
+    });
+    await db.insert(issueComments).values({
+      companyId: seeded.companyId,
+      issueId: seeded.issueId,
+      authorAgentId: seeded.coderId,
+      createdByRunId: null,
+      body: "Made progress on the import job.\n\nNext: verify the retry backoff against the new queue depth metric.",
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    // A comment with no `createdByRunId` cannot break the no-comment streak (it is not a
+    // "run-created issue comment"), so this fires `no_comment_streak` rather than
+    // `high_churn` — that trigger choice is unrelated to what this test is verifying.
+    expect(review?.description).toContain("Primary trigger: `no_comment_streak`");
+    expect(review?.description).not.toContain("Current next action: none recorded");
+    expect(review?.description).toContain(
+      "Current next action: verify the retry backoff against the new queue depth metric.",
+    );
+  });
+
+  it("recovers a Next line even after newer non-matching assignee comments", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 10,
+      now,
+      nextAction: null,
+    });
+    const matchingCommentAt = new Date(now.getTime() - 20 * 60_000);
+    await db.insert(issueComments).values([
+      {
+        companyId: seeded.companyId,
+        issueId: seeded.issueId,
+        authorAgentId: seeded.coderId,
+        createdByRunId: null,
+        body: "Made progress on the import job.\n\nNext: verify the retry backoff against the new queue depth metric.",
+        createdAt: matchingCommentAt,
+        updatedAt: matchingCommentAt,
+      },
+      ...Array.from({ length: 6 }, (_, index) => {
+        const createdAt = new Date(now.getTime() - (6 - index) * 60_000);
+        return {
+          companyId: seeded.companyId,
+          issueId: seeded.issueId,
+          authorAgentId: seeded.coderId,
+          createdByRunId: null,
+          body: `Status update ${index + 1}: still validating the import job.`,
+          createdAt,
+          updatedAt: createdAt,
+        };
+      }),
+    ]);
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).not.toContain("Current next action: none recorded");
+    expect(review?.description).toContain(
+      "Current next action: verify the retry backoff against the new queue depth metric.",
+    );
   });
 
   // BLO-21003: the monitor came due seconds ago, but `monitorNextCheckAt` lapsing
