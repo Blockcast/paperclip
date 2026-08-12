@@ -309,7 +309,12 @@ import {
   type PenstockAvailabilityGate,
   type PenstockAvailabilityGateDenyResult,
 } from "./penstock-availability-gate.js";
-import { resolveCcrotateCapacityRetry, clampTransientRetryHorizon, applyCcrotateCapacityDecision } from "./ccrotate-capacity-retry.js";
+import {
+  resolveCcrotateCapacityRetry,
+  clampTransientRetryHorizon,
+  applyCcrotateCapacityDecision,
+  TRANSIENT_HORIZON_CLAMP_MIN_ATTEMPTS,
+} from "./ccrotate-capacity-retry.js";
 import {
   evaluateExecutionAllowlist,
   isExecutionForcedToKubernetes,
@@ -1980,9 +1985,23 @@ export function computeBoundedTransientHeartbeatRetrySchedule(
   attempt: number,
   now = new Date(),
   random: () => number = Math.random,
+  // BLO-23525: a run whose retryNotBefore floor is being clamped (see
+  // scheduleBoundedRetryForRun) needs more attempts than the exponential
+  // curve has hops for, so it can keep re-probing until the clamped floor's
+  // coverage catches up with the longest recorded outage. Hintless callers
+  // never pass this, so their ceiling — and therefore their behavior — is
+  // unchanged: attempt still cannot exceed the curve's own length there,
+  // because maxAttempts defaults to it.
+  maxAttempts: number = BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS,
 ) {
   if (!Number.isInteger(attempt) || attempt <= 0) return null;
-  const baseDelayMs = BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS[attempt - 1];
+  if (attempt > maxAttempts) return null;
+  // Beyond the curve's own hops, hold at the last (largest) one rather than
+  // returning null — the caller's clamped floor is what actually decides
+  // `dueAt` past this point (it is far larger than any hop here), this only
+  // has to stay non-null so the attempt is not misreported as exhausted.
+  const lastHopIndex = BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length - 1;
+  const baseDelayMs = BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS[Math.min(attempt - 1, lastHopIndex)];
   if (typeof baseDelayMs !== "number") return null;
   const sample = Math.min(1, Math.max(0, random()));
   const jitterMultiplier = 1 + (((sample * 2) - 1) * BOUNDED_TRANSIENT_HEARTBEAT_RETRY_JITTER_RATIO);
@@ -1992,7 +2011,7 @@ export function computeBoundedTransientHeartbeatRetrySchedule(
     baseDelayMs,
     delayMs,
     dueAt: new Date(now.getTime() + delayMs),
-    maxAttempts: BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS,
+    maxAttempts,
   };
 }
 
@@ -14402,6 +14421,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       retryReason === BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON
         ? readTransientRecoveryContractFromRun(run)
         : null;
+    const transientRetryNotBefore = transientRecovery?.retryNotBefore ?? null;
+    // BLO-23438/BLO-23525: every family reaching this branch with a floor
+    // that will be clamped (see `clampTransientHorizon`, applied further
+    // below) needs enough attempts for the clamp's per-attempt ceiling to add
+    // up to the longest recorded outage. `rate_limit_exhausted` already
+    // clears that bar at its own 12-attempt ceiling (12 * 24h = 288h).
+    // `provider_quota` is excluded because its floor is never clamped — it is
+    // a contractual session/billing boundary, not a capacity estimate, so
+    // raising its attempt count here would just burn retries against a wall.
+    // That leaves generic `transient_upstream`: its ordinary ceiling (4) is
+    // sized for hintless exponential backoff and covers only 96h once a floor
+    // is clamped to 24h per attempt — short of BLO-22844's 124.8h. Raise it
+    // only when a floor is actually present so hintless transient-upstream
+    // retries (no floor) keep their original 4-attempt ceiling untouched.
+    const clampTransientHorizon =
+      transientRetryNotBefore !== null && transientRecovery?.errorFamily !== "provider_quota";
     // Pick the schedule curve based on the recovery family. Rate-limit gets
     // a flat short delay (gate is the actual decider); generic transient
     // upstream gets the original exponential backoff. Upstream's explicit
@@ -14410,7 +14445,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const isRateLimitFamily = transientRecovery?.errorFamily === "rate_limit_exhausted";
     const maxAttemptsForFamily = isRateLimitFamily
       ? RATE_LIMIT_HEARTBEAT_RETRY_MAX_ATTEMPTS
-      : maxAttempts;
+      : clampTransientHorizon
+        ? Math.max(maxAttempts, TRANSIENT_HORIZON_CLAMP_MIN_ATTEMPTS)
+        : maxAttempts;
     const computedBaseSchedule = opts?.delayMs != null
       ? nextAttempt <= maxAttemptsForFamily
         ? {
@@ -14424,7 +14461,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       : nextAttempt <= maxAttemptsForFamily
         ? isRateLimitFamily
           ? computeRateLimitHeartbeatRetrySchedule(nextAttempt, now, opts?.random)
-          : computeBoundedTransientHeartbeatRetrySchedule(nextAttempt, now, opts?.random)
+          : computeBoundedTransientHeartbeatRetrySchedule(nextAttempt, now, opts?.random, maxAttemptsForFamily)
         : null;
     const baseSchedule = computedBaseSchedule
       ? { ...computedBaseSchedule, maxAttempts: maxAttemptsForFamily }
@@ -14433,7 +14470,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       agent.adapterType === "codex_local" && transientRecovery?.errorFamily === "transient_upstream"
         ? resolveCodexTransientFallbackMode(nextAttempt)
         : null;
-    const transientRetryNotBefore = transientRecovery?.retryNotBefore ?? null;
     const contextSnapshot = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(contextSnapshot.issueId);
 
@@ -14517,15 +14553,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // a ceiling any run finalized with a far-future `retryNotBefore` parks until
     // that instant — the in-run k8s ccrotate path breaks out precisely to hand
     // this scheduler a multi-day reset, so clamping the capacity gate alone
-    // leaves this route to the same freeze wide open.
-    //
-    // `provider_quota` is deliberately exempt. That family carries a contractual
-    // window boundary (a session/billing reset), not a capacity estimate:
-    // retrying before it fails deterministically, so clamping would just burn
-    // attempts against a wall. The horizons this ticket is about are capacity
-    // guesses, which are the ones that go stale or arrive fabricated.
-    const clampTransientHorizon =
-      transientRetryNotBefore !== null && transientRecovery?.errorFamily !== "provider_quota";
+    // leaves this route to the same freeze wide open. `clampTransientHorizon`
+    // (computed above, alongside the attempt ceiling it is paired with) is
+    // reused here rather than re-derived, so the cap and the ceiling can never
+    // read that condition differently for the same run.
     const clampedTransientRetry =
       clampTransientHorizon && transientRetryNotBefore
         ? clampTransientRetryHorizon({ retryNotBefore: transientRetryNotBefore, now })
