@@ -1,7 +1,7 @@
 # Stranded queued runs (an issue looks active, but nothing is executing)
 
 Source: `server/src/services/queued-run-age-metrics.ts` (`refreshQueuedRunAgeMetrics`), `server/src/services/metrics.ts` (`QUEUED_RUN_OLDEST_AGE_METRIC`, `setQueuedRunOldestAgeMetrics`)
-Trigger: alert `PaperclipQueuedRunStranded` — `max(paperclip_queued_run_oldest_age_seconds) by (agent_id) > 1800` for 5m
+Trigger: alert `PaperclipQueuedRunStranded` — `max(paperclip_queued_run_oldest_age_seconds) by (agent_id) > 1440` for 5m
 Owner: Platform / SRE (BLO-21116)
 
 ## The invariant
@@ -37,15 +37,23 @@ Before BLO-21116, a stranded `queued` run was invisible:
 ### Step 1 — find the rows for the paged agent
 
 ```sql
-select id, agent_id, status, created_at, now() - created_at as age,
+select id, agent_id, status, created_at, queued_at,
+       now() - coalesce(queued_at, created_at) as age,
        context_snapshot ->> 'issueId' as issue_id,
        context_snapshot ->> 'wakeReason' as wake_reason
 from heartbeat_runs
 where status = 'queued'
   and agent_id = '<agent_id from the alert>'
-order by created_at asc
+order by coalesce(queued_at, created_at) asc
 limit 10;
 ```
+
+`queued_at` is null for a run that entered `queued` fresh (where `created_at`
+already is the queue-entry time); it is stamped only when an *existing* row
+is requeued (a promoted `scheduled_retry`, or a `running` deferred back to
+`queued`). Use `coalesce(queued_at, created_at)` for age and ordering, the
+same expression the gauge itself uses — a bare `created_at` can show a
+retried row as hours older than the `$value` that actually fired.
 
 ### Step 2 — tell starvation apart from a dropped dispatch
 
