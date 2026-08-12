@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { and, eq } from "drizzle-orm";
 import { companies, companyMemberships, createDb, issueRelations, issues } from "@paperclipai/db";
 import {
@@ -74,7 +74,13 @@ describeEmbeddedPostgres("issue PATCH blockedByIssueIds persistence", () => {
     return { companyId, prefix };
   }
 
-  async function seedIssue(companyId: string, prefix: string, issueNumber: number, title: string) {
+  async function seedIssue(
+    companyId: string,
+    prefix: string,
+    issueNumber: number,
+    title: string,
+    opts: { status?: string; assigneeAgentId?: string | null } = {},
+  ) {
     const issueId = randomUUID();
     await db.insert(issues).values({
       id: issueId,
@@ -82,11 +88,21 @@ describeEmbeddedPostgres("issue PATCH blockedByIssueIds persistence", () => {
       issueNumber,
       identifier: `${prefix}-${issueNumber}`,
       title,
-      status: "todo",
+      status: opts.status ?? "todo",
       priority: "medium",
       createdByUserId: "cloud-user-1",
+      assigneeAgentId: opts.assigneeAgentId ?? null,
     });
     return issueId;
+  }
+
+  async function statusOf(issueId: string) {
+    const row = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    return row?.status ?? null;
   }
 
   it("persists blockedByIssueIds set via PATCH and surfaces both sides", async () => {
@@ -181,4 +197,71 @@ describeEmbeddedPostgres("issue PATCH blockedByIssueIds persistence", () => {
     expect(cycle.status, JSON.stringify(cycle.body)).toBe(422);
     expect(String(cycle.body.error ?? "")).toContain("Blocking relations cannot contain cycles");
   });
+
+  // BLO-21523 phase 2: clearing an issue's last blocker must recompute
+  // `status` eagerly, not just the relation edges. These three tests cover
+  // each clearing path named in the issue's acceptance criteria.
+
+  it("removing the last blockedByIssueIds edge flips a blocked issue to todo", async () => {
+    const { companyId, prefix } = await seedCompany();
+    const blockerA = await seedIssue(companyId, prefix, 40, "Blocker A");
+    const blockedId = await seedIssue(companyId, prefix, 41, "Blocked issue", { status: "blocked" });
+    const app = createApp(companyId);
+
+    await db
+      .insert(issueRelations)
+      .values({ companyId, issueId: blockerA, relatedIssueId: blockedId, type: "blocks" });
+
+    const cleared = await request(app)
+      .patch(`/api/issues/${blockedId}`)
+      .send({ blockedByIssueIds: [] });
+    expect(cleared.status, JSON.stringify(cleared.body)).toBe(200);
+    expect(cleared.body.blockedBy).toEqual([]);
+
+    await vi.waitFor(async () => {
+      expect(await statusOf(blockedId)).toBe("todo");
+    });
+  });
+
+  it("a blocker closing done flips its dependent from blocked to todo", async () => {
+    const { companyId, prefix } = await seedCompany();
+    const blockerA = await seedIssue(companyId, prefix, 50, "Blocker A");
+    const dependentId = await seedIssue(companyId, prefix, 51, "Dependent issue", { status: "blocked" });
+    const app = createApp(companyId);
+
+    await db
+      .insert(issueRelations)
+      .values({ companyId, issueId: blockerA, relatedIssueId: dependentId, type: "blocks" });
+
+    const closed = await request(app).patch(`/api/issues/${blockerA}`).send({ status: "done" });
+    expect(closed.status, JSON.stringify(closed.body)).toBe(200);
+
+    await vi.waitFor(async () => {
+      expect(await statusOf(dependentId)).toBe("todo");
+    });
+    const dependentRead = await request(app).get(`/api/issues/${dependentId}`);
+    expect(dependentRead.body.blockedBy?.map((r: { id: string }) => r.id)).toEqual([blockerA]);
+  });
+
+  it("a blocker being cancelled leaves the dependent blocked (cancelled is not resolved)", async () => {
+    const { companyId, prefix } = await seedCompany();
+    const blockerA = await seedIssue(companyId, prefix, 60, "Blocker A");
+    const dependentId = await seedIssue(companyId, prefix, 61, "Dependent issue", { status: "blocked" });
+    const app = createApp(companyId);
+
+    await db
+      .insert(issueRelations)
+      .values({ companyId, issueId: blockerA, relatedIssueId: dependentId, type: "blocks" });
+
+    const cancelled = await request(app).patch(`/api/issues/${blockerA}`).send({ status: "cancelled" });
+    expect(cancelled.status, JSON.stringify(cancelled.body)).toBe(200);
+
+    // Give the fire-and-forget wake/recompute path a beat to run, then assert
+    // it stayed blocked — there is no positive signal to wait on here, so
+    // this polls the negative for a short, bounded window instead of
+    // asserting immediately after the response.
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    expect(await statusOf(dependentId)).toBe("blocked");
+  });
 });
+
