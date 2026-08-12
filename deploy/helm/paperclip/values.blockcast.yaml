@@ -387,6 +387,23 @@ secret:
 # StatefulSet runs the heartbeat executeRun finalization where the check fires.
 githubApp:
   enabled: true
+  # Comment-shaped Ally review gate (BLO-21907 / BLO-26602). Setting this makes
+  # the server publish a success/failure commit status for Ally's consolidated
+  # PR-review comments; it does NOT block anything until the same context is
+  # marked required on the `master` branch-protection rule. That second step is
+  # human-only (agent tokens get 403 on branch protection) and is deliberately
+  # sequenced after this one: GitHub's required-checks picker only offers
+  # contexts it has observed recently, and this repo has never carried a commit
+  # status, so the context has to be posted at least once before a human can
+  # select it. Until then this is observe-only.
+  prCommentReviewGateStatusContext: "review/ally-comment"
+  # NOTE: `prReviewGateStatusContext` is intentionally left unset here. Its only
+  # writer posts state=failure (reviewer chain exhausted / ended ambiguously) —
+  # nothing in the server ever posts success for it, and no workflow or script
+  # in this repo posts it either. It is meant to red-flag an already-required
+  # context owned by an external writer (as on onprem-k8s). Marking it required
+  # on this repo would leave every healthy PR at "Expected — waiting for status"
+  # forever. Do not enable + require it here without a success writer.
 
 # paperclip-plugin-gbrain reads per-agent OAuth client credentials through
 # Penstock/Authbot. The mounted Secret below contains only the managed service
