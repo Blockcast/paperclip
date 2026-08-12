@@ -11,6 +11,54 @@ import { execFileSync } from "node:child_process";
 
 const RUN_LIST_LIMIT = 500;
 const WINDOW_BUFFER_MS = 5 * 60 * 1000;
+// Ally review #1220 (4th pass): a dequeue event that hasn't replicated to the
+// /timeline endpoint yet must not be treated as absent forever -- retry a
+// short, bounded number of times before declining to classify. Total added
+// latency (15s) is negligible against the 15-minute notification budget and
+// the workflow's own 5-minute job timeout.
+const DEQUEUE_REPLICATION_RETRIES = 3;
+const DEQUEUE_REPLICATION_RETRY_DELAY_MS = 5000;
+
+// Mirrors server/src/services/paperclip-identifiers.ts's PAPERCLIP_IDENTIFIER_PATTERN,
+// but case-insensitive: this repo's branch-naming convention is lowercase
+// (e.g. `blo-23395-merge-queue-eviction-detector`), and this function's whole
+// job is recovering an identifier from that branch name, not just from
+// title/body text an agent may have typed in canonical case. Always emits
+// the canonical uppercase form so the webhook's case-sensitive extractor
+// matches it back out of the comment text this script posts.
+// Duplicated (not imported) because this script runs standalone via `node`
+// with no build step, outside the server's TS project. Keep the two in sync.
+const PAPERCLIP_IDENTIFIER_PATTERN = /\b([a-z][a-z0-9]{1,9}-\d{1,6}(?:\/\d{1,6})*)\b/gi;
+const PAPERCLIP_COMPACT_IDENTIFIER_PATTERN = /^([a-z][a-z0-9]{1,9})-(\d{1,6})((?:\/\d{1,6})*)$/i;
+
+function expandPaperclipIdentifierToken(token) {
+  const match = token.match(PAPERCLIP_COMPACT_IDENTIFIER_PATTERN);
+  if (!match) return [token.toUpperCase()];
+  const prefix = match[1].toUpperCase();
+  const tailNumbers = (match[3] ?? "").split("/").filter(Boolean);
+  return [match[2], ...tailNumbers].map((number) => `${prefix}-${number}`);
+}
+
+/**
+ * Ally review #1220 (4th pass): the webhook's `issue_comment` handler
+ * extracts identifiers from the PR's title/body/comment text, but the
+ * `issue_comment` payload carries no branch name -- a PR linked to Paperclip
+ * only through its branch (no ticket ref in the title or body) is dropped as
+ * `no_paperclip_identifier` and never wakes anyone. Embedding the identifier
+ * directly in this comment's own body closes that gap without touching the
+ * shared webhook extractor, since `commentBody` is already one of its
+ * sources.
+ */
+export function extractPaperclipIdentifiers(...sources) {
+  const found = new Set();
+  for (const source of sources) {
+    if (!source) continue;
+    for (const match of source.matchAll(PAPERCLIP_IDENTIFIER_PATTERN)) {
+      if (match[1]) for (const id of expandPaperclipIdentifierToken(match[1])) found.add(id);
+    }
+  }
+  return Array.from(found);
+}
 
 /**
  * The merge queue stages a PR onto a synthetic branch named
@@ -50,9 +98,17 @@ export function filterMergeGroupRunsForPr(runs, { base, prNumber }) {
  * `at <= now` keeps the window anchored to the attempt that had already
  * ended when the triggering webhook fired.
  *
+ * `dequeuedAt` is never fabricated. Ally review #1220 (4th pass): the
+ * `/timeline` endpoint can lag behind the `pull_request.dequeued` webhook
+ * that triggered this run -- substituting `now` when no removal is observed
+ * yet let an active or freshly-requeued attempt with no run be misread as a
+ * `conflict_unstageable` eviction that never happened. `dequeuedAt: null`
+ * signals "enqueue found, no removal observed yet" so the caller can retry
+ * instead of guessing.
+ *
  * @param {Array<{ event: string, created_at: string }>} timelineEvents
  * @param {{ now: number }} opts
- * @returns {{ enqueuedAt: string, dequeuedAt: string } | null}
+ * @returns {{ enqueuedAt: string, dequeuedAt: string | null } | null}
  */
 export function selectLatestQueueAttemptWindow(timelineEvents, { now }) {
   const events = (timelineEvents ?? [])
@@ -74,7 +130,7 @@ export function selectLatestQueueAttemptWindow(timelineEvents, { now }) {
 
   return {
     enqueuedAt: new Date(lastEnqueue.at).toISOString(),
-    dequeuedAt: dequeueAfter ? new Date(dequeueAfter.at).toISOString() : new Date(now).toISOString(),
+    dequeuedAt: dequeueAfter ? new Date(dequeueAfter.at).toISOString() : null,
   };
 }
 
@@ -129,20 +185,29 @@ function ghPrView(repo, prNumber) {
     // version in the fleet (confirmed absent on 2.46.0, present on newer
     // releases). `state === "MERGED"` is the same fact via a field every
     // version exposes.
-    "--json", "number,state,mergedAt,baseRefName,headRefOid,title,url",
+    "--json", "number,state,mergedAt,baseRefName,headRefName,headRefOid,title,body,url",
   ]);
   const raw = JSON.parse(out);
   return { ...raw, merged: raw.state === "MERGED" };
 }
 
 function ghTimeline(repo, prNumber) {
-  // `--slurp` wraps each page's array into an outer array so pagination
-  // doesn't produce back-to-back top-level arrays that JSON.parse can't
-  // handle in one call. Available since gh 2.32.0, well below the oldest
-  // fleet version this script already assumes (2.46.0, see ghPrView above).
-  const out = run(["gh", "api", `repos/${repo}/issues/${prNumber}/timeline`, "--paginate", "--slurp"]);
-  const pages = JSON.parse(out);
-  return pages.flat();
+  // `--paginate --slurp` would be the obvious way to merge pages into one
+  // array, but `--slurp` is NOT available on every gh CLI version in the
+  // fleet -- confirmed absent on 2.46.0 (`unknown flag: --slurp`), which is
+  // the version this script otherwise already assumes as a floor (see
+  // ghPrView above). `--jq '.[] | {...}'` has been supported for far
+  // longer and, combined with `--paginate`, emits one flattened element per
+  // output line across every page -- no outer-array wrapping needed, and
+  // NDJSON-style line splitting works identically on any gh version.
+  const out = run([
+    "gh", "api", `repos/${repo}/issues/${prNumber}/timeline`,
+    "--paginate", "--jq", ".[] | {event, created_at}",
+  ]);
+  return out
+    .split("\n")
+    .filter((line) => line.trim().length > 0)
+    .map((line) => JSON.parse(line));
 }
 
 function ghMergeGroupRuns(repo, createdRange) {
@@ -179,7 +244,7 @@ function parseArgs(argv) {
   return args;
 }
 
-function buildEvictionCommentBody({ repo, prNumber, classification, mergeGroupRunCount, base }) {
+function buildEvictionCommentBody({ repo, prNumber, classification, mergeGroupRunCount, base, identifiers }) {
   const causeLine = {
     conflict_unstageable:
       "**conflict / un-stageable rebase** -- the queue never created a `merge_group` run for this PR's head " +
@@ -207,6 +272,10 @@ function buildEvictionCommentBody({ repo, prNumber, classification, mergeGroupRu
     "",
     "Re-add this PR to the merge queue once the underlying issue is resolved (rebase onto the current base for " +
       "an un-stageable eviction; fix the failing check; or confirm with whoever dequeued it manually).",
+    // Ally review #1220 (4th pass): embedded so the webhook's issue_comment
+    // handler (which has no branch name to fall back on) can still route the
+    // wake for a PR linked to Paperclip only through its branch.
+    ...(identifiers && identifiers.length > 0 ? ["", `Linked issue: ${identifiers.join(", ")}`] : []),
   ].join("\n");
 }
 
@@ -217,18 +286,27 @@ async function main() {
   if (!repo || !Number.isFinite(prNumber)) {
     console.error(
       "usage: merge-queue-eviction-detector.mjs --repo <owner/repo> --pr <number> " +
-        "[--comment true] [--grace-ms 60000]",
+        "[--comment true] [--grace-ms 60000] [--triggered-at <ISO timestamp>]",
     );
     process.exitCode = 2;
     return;
   }
 
-  // Captured before the grace-period sleep below, not after: this run
-  // exists to classify the dequeue that triggered it. A PR re-enqueued
-  // during the sleep must not shift `selectLatestQueueAttemptWindow`'s
-  // window onto that fresh, run-less attempt (Ally review #1220, third
-  // pass -- see the function's doc comment).
-  const triggeredAt = Date.now();
+  // Ally review #1220 (4th pass): `Date.now()` here is when the runner
+  // actually started this script -- not when GitHub emitted
+  // `pull_request.dequeued`. If the job is queued waiting for a runner
+  // (this fleet has had real capacity incidents that delay job start --
+  // BLO-25481/BLO-24992/BLO-25596) and the PR is re-enqueued during that
+  // wait, a `Date.now()` anchor would treat that fresh, run-less re-enqueue
+  // as eligible and misclassify it `conflict_unstageable`. `--triggered-at`
+  // carries the workflow run's own creation timestamp (set by the workflow
+  // right after checkout, from `gh api .../actions/runs/<run_id>`), which
+  // reflects when the webhook was received, not when a runner became free.
+  // Falls back to `Date.now()` for manual `workflow_dispatch` replay, which
+  // has no run-creation timestamp to anchor to and isn't racing a live queue.
+  const triggeredAtArg = args["triggered-at"];
+  const parsedTriggeredAt = triggeredAtArg ? Date.parse(triggeredAtArg) : NaN;
+  const triggeredAt = Number.isFinite(parsedTriggeredAt) ? parsedTriggeredAt : Date.now();
 
   let pr = ghPrView(repo, prNumber);
   if (!pr.merged) {
@@ -241,8 +319,27 @@ async function main() {
     }
   }
 
-  const timeline = ghTimeline(repo, prNumber);
-  const attemptWindow = selectLatestQueueAttemptWindow(timeline, { now: triggeredAt });
+  let attemptWindow = selectLatestQueueAttemptWindow(ghTimeline(repo, prNumber), { now: triggeredAt });
+  // Ally review #1220 (4th pass): `dequeuedAt: null` means the enqueue we
+  // anchored to has no observed removal yet -- the /timeline endpoint may
+  // simply not have replicated the dequeue that triggered this run. Retry a
+  // few times before declining to classify; never fabricate a timestamp.
+  for (
+    let attempt = 0;
+    attemptWindow && attemptWindow.dequeuedAt === null && attempt < DEQUEUE_REPLICATION_RETRIES;
+    attempt += 1
+  ) {
+    await new Promise((resolve) => setTimeout(resolve, DEQUEUE_REPLICATION_RETRY_DELAY_MS));
+    attemptWindow = selectLatestQueueAttemptWindow(ghTimeline(repo, prNumber), { now: triggeredAt });
+  }
+  if (attemptWindow && attemptWindow.dequeuedAt === null) {
+    console.error(
+      `${repo}#${prNumber}'s queue attempt enqueued at ${attemptWindow.enqueuedAt} still has no observed ` +
+        `removed_from_merge_queue event after ${DEQUEUE_REPLICATION_RETRIES} retries; declining to classify ` +
+        "rather than risk a false eviction notice. Re-run manually once the timeline has caught up.",
+    );
+    return;
+  }
 
   let allRuns;
   if (attemptWindow) {
@@ -278,12 +375,14 @@ async function main() {
   console.log(JSON.stringify(result, null, 2));
 
   if (classification !== "merged" && args.comment === "true") {
+    const identifiers = extractPaperclipIdentifiers(pr.headRefName, pr.title, pr.body);
     const body = buildEvictionCommentBody({
       repo,
       prNumber,
       classification,
       mergeGroupRunCount: mergeGroupRuns.length,
       base: pr.baseRefName,
+      identifiers,
     });
     run(["gh", "pr", "comment", String(prNumber), "--repo", repo, "--body", body]);
   }

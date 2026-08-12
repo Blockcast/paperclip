@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   buildRunSearchWindow,
   classifyMergeQueueEviction,
+  extractPaperclipIdentifiers,
   filterMergeGroupRunsForPr,
   mergeQueueHeadBranchPrefix,
   selectLatestQueueAttemptWindow,
@@ -136,12 +137,14 @@ test("selectLatestQueueAttemptWindow is unaffected by event order in the input a
   });
 });
 
-test("selectLatestQueueAttemptWindow falls back to `now` when still enqueued (no matching removal yet)", () => {
+test("selectLatestQueueAttemptWindow reports dequeuedAt: null when still enqueued (no matching removal yet), never a fabricated timestamp (Ally review #1220, 4th pass)", () => {
+  // The old behavior substituted `now` for a missing removal, which could
+  // misclassify an active or freshly-requeued attempt with no run yet as a
+  // real eviction. The caller must retry or decline, not guess.
   const events = [{ event: "added_to_merge_queue", created_at: "2026-08-08T09:24:35Z" }];
   const now = Date.parse("2026-08-08T09:30:00Z");
   const window = selectLatestQueueAttemptWindow(events, { now });
-  assert.equal(window.enqueuedAt, "2026-08-08T09:24:35.000Z");
-  assert.equal(window.dequeuedAt, new Date(now).toISOString());
+  assert.deepEqual(window, { enqueuedAt: "2026-08-08T09:24:35.000Z", dequeuedAt: null });
 });
 
 test("selectLatestQueueAttemptWindow ignores a re-enqueue that lands after `now` (Ally review #1220, grace-period race)", () => {
@@ -177,4 +180,26 @@ test("buildRunSearchWindow buffers the window by 5 minutes on each side", () => 
     dequeuedAt: "2026-08-08T13:55:45.000Z",
   });
   assert.equal(range, "2026-08-08T09:19:35.000Z..2026-08-08T14:00:45.000Z");
+});
+
+test("extractPaperclipIdentifiers finds a ref in the branch name when title/body carry none (Ally review #1220, 4th pass)", () => {
+  // The webhook's issue_comment handler has no branch name to fall back on;
+  // this is the detector's own safety net -- embed the ref straight into the
+  // comment body it posts so the shared extractor's commentBody source
+  // picks it up regardless of what the PR's title/body say.
+  const ids = extractPaperclipIdentifiers("blo-23395-merge-queue-eviction-detector", "Add a detector", null);
+  assert.deepEqual(ids, ["BLO-23395"]);
+});
+
+test("extractPaperclipIdentifiers dedupes across sources and expands compact refs", () => {
+  const ids = extractPaperclipIdentifiers(
+    "fix/BLO-3182-thing",
+    "Fixes BLO-3182 and BLO-3763/3764",
+    "See also (BLO-3182)",
+  );
+  assert.deepEqual(new Set(ids), new Set(["BLO-3182", "BLO-3763", "BLO-3764"]));
+});
+
+test("extractPaperclipIdentifiers returns empty for a branch/title/body with no ticket ref", () => {
+  assert.deepEqual(extractPaperclipIdentifiers("chore/tidy-up", "Tidy up", null), []);
 });

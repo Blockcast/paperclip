@@ -58,19 +58,38 @@ likely it is.
 **Detection is automated** (`.github/workflows/merge-queue-eviction-detector.yml`,
 `scripts/merge-queue-eviction-detector.mjs`): GitHub fires
 `pull_request` `action=dequeued` for every queue removal, including a
-successful merge. The workflow captures its own trigger time first, then
-waits out a short merge-race grace period, then confirms the PR is genuinely
-unmerged, reads the PR's own timeline to find the boundaries of the queue
-attempt that just ended (`selectLatestQueueAttemptWindow` — the most recent
-`added_to_merge_queue` **that had already happened by the captured trigger
+successful merge. The workflow resolves its own trigger time from the
+workflow run's creation timestamp (`gh api .../actions/runs/<run_id>`,
+captured as its own step right after checkout) — **not** `Date.now()` inside
+the script, which reflects when a runner became free to execute it, not when
+the webhook fired. Under a real runner-capacity delay (this fleet has had
+them — BLO-25481/BLO-24992/BLO-25596), a PR could be re-enqueued and
+dequeued again while this job was still waiting for a runner; anchoring to
+the runner's own start time would misread that fresh, run-less attempt as
+this attempt's outcome (Ally review #1220, 4th pass). It then waits out a
+short merge-race grace period, confirms the PR is genuinely unmerged, and
+reads the PR's own timeline to find the boundaries of the queue attempt that
+just ended (`selectLatestQueueAttemptWindow` — the most recent
+`added_to_merge_queue` **that had already happened by the resolved trigger
 time** paired with the next `removed_from_merge_queue` after it). Anchoring
 to the trigger time, not to whenever the function happens to run, matters
 twice over: it keeps a prior queue attempt for the same PR from leaking into
 this one, and it keeps a PR that gets manually re-added to the queue *during*
 the grace-period sleep from having its brand-new, run-less attempt misread as
-this attempt's outcome (Ally review #1220, third pass). It then enumerates
-`merge_group` runs created inside that window (`buildRunSearchWindow`,
-`gh run list --created <window>`), and classifies the eviction:
+this attempt's outcome (Ally review #1220, third pass).
+
+If the enqueue it anchors to has no matching `removed_from_merge_queue` event
+yet — the `/timeline` endpoint lagging behind the webhook that triggered this
+run — the detector never fabricates a timestamp to fill the gap (Ally review
+#1220, 4th pass: that gap previously read as "evicted right now," which could
+misclassify a still-active or freshly-requeued attempt with no run yet as a
+false eviction). It retries the timeline a few times with a short delay
+first; if the removal still hasn't appeared, it logs a warning and exits
+without posting anything, rather than risk a false notice.
+
+It then enumerates `merge_group` runs created inside that window
+(`buildRunSearchWindow`, `gh run list --created <window>`), and classifies
+the eviction:
 
 - **zero `merge_group` runs found inside that attempt's window → `conflict_unstageable`**
   (this shape),
@@ -88,6 +107,13 @@ Bounding the lookup to the specific attempt's time window (rather than an
 unbounded newest-N sample across the whole repo's history) is what makes the
 zero-runs signal trustworthy even on a busy repo, and what keeps a re-queued
 PR's earlier attempt from being misread as this attempt's outcome.
+
+The posted comment also embeds any Paperclip identifier the detector can
+recover from the PR's branch name, title, or body (Ally review #1220, 4th
+pass): the webhook's `issue_comment` handler has no branch name to fall back
+on, so a PR linked to Paperclip only through its branch (no ticket ref in
+the title or body text) would otherwise be dropped as `no_paperclip_identifier`
+and never wake anyone.
 
 It posts the classification as a PR comment carrying a
 `<!-- paperclip:merge-queue-eviction -->` marker; `github-webhook.ts`

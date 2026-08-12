@@ -52,6 +52,22 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.base.ref || github.event.repository.default_branch }}
 
+      # BLO-23395 (Ally review #1220, 4th pass): the run's own creation
+      # timestamp reflects when GitHub received the `dequeued` webhook, not
+      # when a runner became free to execute this job -- unlike `Date.now()`
+      # inside the script, it isn't skewed by ARC capacity delays (this fleet
+      # has had real ones: BLO-25481/BLO-24992/BLO-25596). Only meaningful on
+      # the real `pull_request` trigger; `workflow_dispatch` manual replay
+      # has no run to look up and isn't racing a live queue anyway.
+      - name: Resolve trigger timestamp
+        id: trigger_time
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          created_at=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}" --jq .created_at)
+          echo "created_at=$created_at" >> "$GITHUB_OUTPUT"
+
       - name: Classify eviction and notify PR author
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -59,4 +75,5 @@ jobs:
           node scripts/merge-queue-eviction-detector.mjs \
             --repo "${{ github.event.pull_request.base.repo.full_name || inputs.repo }}" \
             --pr "${{ github.event.pull_request.number || inputs.pr_number }}" \
+            --triggered-at "${{ steps.trigger_time.outputs.created_at }}" \
             --comment "${{ github.event_name == 'pull_request' && 'true' || inputs.comment }}"
