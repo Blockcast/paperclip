@@ -2381,6 +2381,36 @@ export function resolveContainedWorkspaceSubpath(checkoutDir: string, subpath: s
   return resolved;
 }
 
+// Workspace source types that own their `cwd` outright: the path is a host
+// location (or a remote provider's), not a subdirectory of a checkout we
+// manage. A relative `cwd` on one of these keeps its prior meaning rather than
+// being redirected into a managed checkout dir.
+const NON_REPO_WORKSPACE_SOURCE_TYPES = new Set(["local_path", "non_git_path", "remote_managed"]);
+
+/**
+ * Decide whether a workspace's `cwd` is a repo-relative subdirectory that must
+ * be joined onto its managed checkout, returning that subpath (or null to use
+ * `cwd` as-is).
+ *
+ * Only repo-backed workspaces qualify. `repoUrl` is required rather than
+ * inferred from `sourceType` because `source_type` is an unconstrained text
+ * column — production carries at least one row typed `"git"` rather than
+ * `"git_repo"` — and because without a repo there is nothing for the path to
+ * be relative to: `ensureManagedProjectWorkspace` would mkdir an empty
+ * directory that the subsequent stat can never satisfy. See BLO-25415.
+ */
+export function resolveRepoRelativeWorkspaceCwd(workspace: {
+  cwd?: string | null;
+  sourceType?: string | null;
+  repoUrl?: string | null;
+}): string | null {
+  const cwd = readNonEmptyString(workspace.cwd);
+  if (!cwd || cwd === REPO_ONLY_CWD_SENTINEL || path.isAbsolute(cwd)) return null;
+  if (NON_REPO_WORKSPACE_SOURCE_TYPES.has(readNonEmptyString(workspace.sourceType) ?? "")) return null;
+  if (!readNonEmptyString(workspace.repoUrl)) return null;
+  return cwd;
+}
+
 async function ensureManagedProjectWorkspace(input: {
   companyId: string;
   projectId: string;
@@ -11767,7 +11797,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       for (const workspace of realizationCandidates) {
         let projectCwd = readNonEmptyString(workspace.cwd);
         let managedWorkspaceWarning: string | null = null;
-        // A workspace cwd is either an absolute host path or — for a git_repo
+        // A workspace cwd is either an absolute host path or — for a repo-backed
         // workspace — a repo-relative subdirectory such as "packages/iwa". The
         // relative form only resolves once the repo is checked out, so realize
         // the managed checkout first and join the subpath inside it. Without
@@ -11776,10 +11806,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // run then failed `preferred_workspace_unrealizable` quoting a path
         // that looks correct, and no amount of cloning could satisfy it. See
         // BLO-25415.
-        const repoRelativeCwd =
-          projectCwd && projectCwd !== REPO_ONLY_CWD_SENTINEL && !path.isAbsolute(projectCwd)
-            ? projectCwd
-            : null;
+        const repoRelativeCwd = resolveRepoRelativeWorkspaceCwd(workspace);
         if (!projectCwd || projectCwd === REPO_ONLY_CWD_SENTINEL || repoRelativeCwd) {
           try {
             const managedWorkspace = await ensureManagedProjectWorkspace({

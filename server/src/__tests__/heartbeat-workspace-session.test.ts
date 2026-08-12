@@ -60,6 +60,7 @@ import {
   shouldResetTaskSessionForWake,
   mergeModelProfileAdapterConfig,
   resolveContainedWorkspaceSubpath,
+  resolveRepoRelativeWorkspaceCwd,
   type ResolvedWorkspaceForRunSuccess,
 } from "../services/heartbeat.js";
 import { applyRunScopeToBranchName } from "../services/workspace-runtime.js";
@@ -3978,6 +3979,58 @@ describe("resolveContainedWorkspaceSubpath", () => {
     expect(() => resolveContainedWorkspaceSubpath("/managed/repo", "../repo-evil")).toThrow(
       /resolves outside its checkout/,
     );
+  });
+});
+
+describe("resolveRepoRelativeWorkspaceCwd", () => {
+  // BLO-25415: only a repo-backed workspace has a checkout for a relative cwd
+  // to be relative to. Redirecting other source types into a managed checkout
+  // dir would change their meaning — and, via ensureManagedProjectWorkspace's
+  // repoUrl-less branch, mkdir an empty directory on the shared PVC that the
+  // subsequent stat can never satisfy.
+  const repoUrl = "https://github.com/Blockcast/pim-multicast-gateway.git";
+
+  it("returns the subpath for a repo-backed workspace with a relative cwd", () => {
+    expect(
+      resolveRepoRelativeWorkspaceCwd({ cwd: "packages/iwa", sourceType: "git_repo", repoUrl }),
+    ).toBe("packages/iwa");
+  });
+
+  it("accepts a repo-backed workspace whose source_type is not the canonical spelling", () => {
+    // source_type is an unconstrained text column; production carries a "git"
+    // row. An allowlist keyed on "git_repo" would silently skip it.
+    expect(resolveRepoRelativeWorkspaceCwd({ cwd: "packages/iwa", sourceType: "git", repoUrl })).toBe(
+      "packages/iwa",
+    );
+  });
+
+  it("leaves an absolute cwd untouched", () => {
+    expect(
+      resolveRepoRelativeWorkspaceCwd({ cwd: "/managed/repo/packages/iwa", sourceType: "git_repo", repoUrl }),
+    ).toBeNull();
+  });
+
+  it("leaves an empty cwd and the repo-only sentinel untouched", () => {
+    expect(resolveRepoRelativeWorkspaceCwd({ cwd: null, sourceType: "git_repo", repoUrl })).toBeNull();
+    expect(
+      resolveRepoRelativeWorkspaceCwd({ cwd: "/__paperclip_repo_only__", sourceType: "git_repo", repoUrl }),
+    ).toBeNull();
+  });
+
+  it("leaves a relative local_path / non_git_path / remote_managed cwd untouched", () => {
+    // These own their cwd outright — they must keep the prior semantics rather
+    // than being redirected into a managed checkout.
+    for (const sourceType of ["local_path", "non_git_path", "remote_managed"]) {
+      expect(resolveRepoRelativeWorkspaceCwd({ cwd: "packages/iwa", sourceType, repoUrl })).toBeNull();
+    }
+  });
+
+  it("leaves a relative cwd untouched when the workspace has no repo", () => {
+    // Nothing for the path to be relative to; taking the managed-checkout
+    // branch would create an empty directory and still fail the stat.
+    expect(
+      resolveRepoRelativeWorkspaceCwd({ cwd: "packages/iwa", sourceType: "git_repo", repoUrl: null }),
+    ).toBeNull();
   });
 });
 
