@@ -528,7 +528,7 @@ export const DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS = 24;
  * monitor with no configured limit remains unbounded.
  */
 export function exhaustedMonitorClearReason(input: {
-  monitor: IssueExecutionMonitorPolicy | null;
+  monitor: Pick<IssueExecutionMonitorPolicy, "timeoutAt" | "maxAttempts"> | null;
   attemptCount: number;
   now: Date;
   defaultMaxAttempts?: number | null;
