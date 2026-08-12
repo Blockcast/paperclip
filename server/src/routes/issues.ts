@@ -12452,11 +12452,18 @@ export function issueRoutes(
         // blocker's `done` transition may have freed — including unassigned
         // ones no wake ever targets — so the fix isn't just "the agent got
         // told," it's "the row is dispatchable."
-        const blockedDependentIds = await listBlockedDependentIssueIds(db, issue.companyId, issue.id);
-        if (blockedDependentIds.length > 0) {
-          await recomputeBlockedIssuesStatusIfReady(db, issue.companyId, blockedDependentIds, {
-            triggerPath: "eager_status_recompute",
-          });
+        try {
+          const blockedDependentIds = await listBlockedDependentIssueIds(db, issue.companyId, issue.id);
+          if (blockedDependentIds.length > 0) {
+            await recomputeBlockedIssuesStatusIfReady(db, issue.companyId, blockedDependentIds, {
+              triggerPath: "eager_status_recompute",
+            });
+          }
+        } catch (err) {
+          logger.warn(
+            { err, issueId: issue.id },
+            "failed to recompute blocked dependents' status after blocker resolved",
+          );
         }
       }
 
@@ -12472,9 +12479,13 @@ export function issueRoutes(
           existing.assigneeAgentId !== issue.assigneeAgentId
         );
       if (statusRecomputeCandidate) {
-        await recomputeBlockedIssuesStatusIfReady(db, issue.companyId, [issue.id], {
-          triggerPath: "eager_status_recompute",
-        });
+        try {
+          await recomputeBlockedIssuesStatusIfReady(db, issue.companyId, [issue.id], {
+            triggerPath: "eager_status_recompute",
+          });
+        } catch (err) {
+          logger.warn({ err, issueId: issue.id }, "failed to recompute blocked status after blocker-transition");
+        }
       }
 
       const restoredBlockedReadyDependency = statusRecomputeCandidate && issue.assigneeAgentId;
@@ -14627,11 +14638,25 @@ export function issueRoutes(
         // BLO-21523 phase 2: see the matching comment on the PATCH /issues/:id
         // becameDone block — flip status for every blocked dependent this
         // transition may have freed, not just the ones with a wake target.
-        const blockedDependentIds = await listBlockedDependentIssueIds(db, currentIssue.companyId, currentIssue.id);
-        if (blockedDependentIds.length > 0) {
-          await recomputeBlockedIssuesStatusIfReady(db, currentIssue.companyId, blockedDependentIds, {
-            triggerPath: "eager_status_recompute",
-          });
+        // This whole block is `await`-ed before the comment response is sent
+        // (unlike the PATCH route's fire-and-forget wake dispatch), so a
+        // recompute failure must not fail the comment-post request itself.
+        try {
+          const blockedDependentIds = await listBlockedDependentIssueIds(
+            db,
+            currentIssue.companyId,
+            currentIssue.id,
+          );
+          if (blockedDependentIds.length > 0) {
+            await recomputeBlockedIssuesStatusIfReady(db, currentIssue.companyId, blockedDependentIds, {
+              triggerPath: "eager_status_recompute",
+            });
+          }
+        } catch (err) {
+          logger.warn(
+            { err, issueId: currentIssue.id },
+            "failed to recompute blocked dependents' status after blocker resolved",
+          );
         }
       }
 
