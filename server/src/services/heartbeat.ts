@@ -17422,9 +17422,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "agentId">,
   ) {
     const reservation = await getActiveExternalRuntimeReservation(db, run.id);
-    if (!reservation?.jobName || !reservation.jobUid) {
+    // BLO-20482: split "no reservation at all" from "reservation without Job
+    // identity". Both still refuse the delete and return "mismatch" (every
+    // caller treats anything other than "deleted"/"missing" as fail-closed),
+    // but only the second is anomalous.
+    //
+    // No ACTIVE reservation is an expected, benign outcome, not a failure: a
+    // Job only ever exists alongside a reservation carrying its name/UID, so
+    // there is nothing to target and nothing was leaked. The cancel cascade
+    // reaches this deliberately — see cancelRunInternal, where the dispatcher
+    // may already have released the terminal run's reservation before the
+    // cascade runs. Logging it at error poisoned the API error rate (~13
+    // occurrences per 26 minutes, all with reservationId: null) and buried
+    // real failures.
+    if (!reservation) {
+      logger.debug(
+        { runId: run.id, reservationId: null },
+        "skipping external-runtime Job deletion: no active reservation to target",
+      );
+      return "mismatch" as const;
+    }
+    // A PERSISTED reservation missing its Job name/UID is a genuine anomaly:
+    // we recorded the reservation but never its Job identity, so a Job may be
+    // running that we cannot safely target. Keep this at error.
+    if (!reservation.jobName || !reservation.jobUid) {
       logger.error(
-        { runId: run.id, reservationId: reservation?.id ?? null },
+        { runId: run.id, reservationId: reservation.id },
         "refusing external-runtime Job deletion without persisted name and UID",
       );
       return "mismatch" as const;
