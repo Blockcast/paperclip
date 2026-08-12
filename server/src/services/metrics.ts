@@ -20,14 +20,22 @@
  * @module server/services/metrics
  */
 
-import { Counter, Gauge, Registry, collectDefaultMetrics } from "prom-client";
+import { Counter, Gauge, Histogram, Registry, collectDefaultMetrics } from "prom-client";
 import { resetDepBlockedMetrics, snapshotDepBlockedMetrics } from "./dep-blocked-metrics.js";
 import {
   resetBlockerResolvedWakeMetrics,
   snapshotBlockerResolvedWakeMetrics,
 } from "./blocker-resolved-wake-metrics.js";
+import {
+  resetRoutineDispatchMetrics,
+  snapshotRoutineDispatchMetrics,
+} from "./routine-dispatch-metrics.js";
 
 export const CONCURRENT_RUN_BLOCKED_METRIC = "claude_k8s_concurrent_run_blocked_total";
+// BLO-23379: routine dispatch bypassed a long-parked execution issue instead of
+// letting it gate the fire. Non-zero means a quota/capacity park was overridden;
+// zero while a routine is quiet means it is genuinely gated on in-flight work.
+export const ROUTINE_DISPATCH_METRIC = "paperclip_routine_dispatch_total";
 export const AUTH_REQUEST_METRIC = "paperclip_auth_request_total";
 export const HEARTBEAT_RUN_FAILED_METRIC = "paperclip_heartbeat_run_failed_total";
 export const DEP_BLOCKED_WAKEUP_METRIC = "paperclip_dependency_blocked_wakeup_total";
@@ -70,6 +78,14 @@ export const AGENT_NO_USAGE_STREAK_METRIC = "paperclip_agent_zero_token_complete
 export const EXTERNAL_RUNTIME_RESERVATION_EVENTS_METRIC = "paperclip_external_runtime_reservation_events_total";
 export const EXTERNAL_RUNTIME_RESERVATIONS_ACTIVE_METRIC = "paperclip_external_runtime_reservations_active";
 export const EXTERNAL_RUNTIME_RESERVATION_OLDEST_AGE_METRIC = "paperclip_external_runtime_reservation_oldest_age_seconds";
+// BLO-21116: age of the oldest `queued` heartbeatRuns row per agent. A
+// dispatchable run sitting in `queued` for a long time is exactly the
+// "invisible strand" this issue reports -- it looks like an active issue with
+// an assignee and a run, but nothing is executing, and nothing else pages on
+// it. Labeled by bounded agent_id (same allow-list guardrail as
+// CONCURRENT_RUN_BLOCKED_METRIC) so `max(...) by (agent_id) > threshold`
+// identifies which agent is starved.
+export const QUEUED_RUN_OLDEST_AGE_METRIC = "paperclip_queued_run_oldest_age_seconds";
 /**
  * process_lost reap counter (BLO-16184, parent BLO-12292). Incremented once at
  * the reaper's `process_lost` mint, labeled by bounded `adapter`
@@ -778,6 +794,98 @@ export function normalizeExternalAdapter(adapter: string | null | undefined): st
 }
 
 /**
+ * BLO-20815: terminal silence-gap histogram for external-lifecycle runs.
+ * Observes `finalizedAt - COALESCE(lastUsefulActionAt, lastOutputAt, startedAt)`
+ * at run finalization — the exact same precedence the dispatcher's staleness
+ * filter uses in startNextQueuedRunForAgent (heartbeat.ts) to decide whether a
+ * running run is stale. Labeled by adapter and terminal status so the
+ * `status="succeeded"` population (healthy quiet gaps) can be read separately
+ * from the failed/cancelled population (zombie/stuck candidates). This metric
+ * is additive-only: it does not gate dispatch, slot accounting, or kill
+ * decisions.
+ *
+ * Buckets deliberately span the EXTERNAL_LIFECYCLE_STALE_MS (15m) /
+ * EXTERNAL_LIFECYCLE_HARD_STALE_MS (45m) decision range with resolution where
+ * it matters, so a `histogram_quantile` against the `succeeded` population can
+ * be compared directly against the 45m destructive-kill floor.
+ */
+export const EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_METRIC = "paperclip_external_lifecycle_run_silence_gap_seconds";
+
+export const EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_BUCKETS_SECONDS = [
+  60, 300, 600, 900, 1200, 1800, 2700, 3600, 5400, 7200,
+];
+
+/**
+ * Companion last-value gauge to {@link EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_METRIC}
+ * (BLO-20815 review follow-up, Ally/gstack-review on PR #947): a classic
+ * Prometheus Histogram cannot expose an exact max — values above the last
+ * finite bucket collapse into `+Inf`, and the exported bucket/count/sum series
+ * retain no per-observation maximum. This gauge is set to the *last observed*
+ * silence-gap value per adapter/status on every {@link recordExternalLifecycleRunSilenceGap}
+ * call. Reset/window semantics: it is a plain last-write gauge with no reset
+ * or decay — the true rolling max is recovered at query time via
+ * `max_over_time(...[7d])`, which reads every scraped sample in the window
+ * (a process restart only affects samples *after* the restart; earlier peak
+ * samples already persisted in Prometheus TSDB are unaffected). The one
+ * accepted gap: two observations for the same adapter/status landing within a
+ * single scrape interval can have the smaller one overwritten before it is
+ * ever scraped — acceptable given external-lifecycle run finalizations are
+ * infrequent relative to the scrape interval.
+ */
+export const EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_LAST_METRIC =
+  "paperclip_external_lifecycle_run_silence_gap_seconds_last";
+
+/**
+ * Bounded terminal-status allow-list for {@link EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_METRIC}.
+ * Mirrors HEARTBEAT_RUN_TERMINAL_STATUSES (heartbeat.ts) minus "interrupted",
+ * which external-lifecycle runs do not reach. Anything else (including a
+ * future new terminal status) collapses to "other" so the label cannot be
+ * inflated by an unbounded/typo'd status string.
+ */
+export const KNOWN_EXTERNAL_LIFECYCLE_TERMINAL_STATUSES = [
+  "succeeded",
+  "failed",
+  "cancelled",
+  "timed_out",
+] as const;
+export const UNKNOWN_EXTERNAL_LIFECYCLE_TERMINAL_STATUS = "other";
+const knownExternalLifecycleTerminalStatusSet: ReadonlySet<string> = new Set(
+  KNOWN_EXTERNAL_LIFECYCLE_TERMINAL_STATUSES,
+);
+
+export function normalizeExternalLifecycleTerminalStatus(status: string | null | undefined): string {
+  return typeof status === "string" && knownExternalLifecycleTerminalStatusSet.has(status)
+    ? status
+    : UNKNOWN_EXTERNAL_LIFECYCLE_TERMINAL_STATUS;
+}
+
+export interface ExternalLifecycleSilenceGapRunSignals {
+  lastUsefulActionAt: Date | string | null | undefined;
+  lastOutputAt: Date | string | null | undefined;
+  startedAt: Date | string | null | undefined;
+}
+
+/**
+ * Compute the terminal silence gap in seconds for an external-lifecycle run,
+ * using the exact `lastUsefulActionAt > lastOutputAt > startedAt` precedence
+ * the dispatcher's staleness filter uses (heartbeat.ts:
+ * startNextQueuedRunForAgent). Returns null when no signal timestamp is
+ * available at all (e.g. a queued/scheduled_retry run cancelled before it
+ * ever started) — callers must skip observing in that case rather than
+ * recording a meaningless gap against `finalizedAt`.
+ */
+export function computeExternalLifecycleSilenceGapSeconds(
+  run: ExternalLifecycleSilenceGapRunSignals,
+  finalizedAt: Date,
+): number | null {
+  const signalAt = run.lastUsefulActionAt ?? run.lastOutputAt ?? run.startedAt;
+  if (!signalAt) return null;
+  const signalMs = new Date(signalAt).getTime();
+  if (!Number.isFinite(signalMs)) return null;
+  return Math.max(0, (finalizedAt.getTime() - signalMs) / 1000);
+}
+
+/**
  * Map a raw process_lost failure message to a bounded bucket by matching the
  * fixed substrings the reaper stamps. Order matters only in that each substring
  * is unique to one bucket. Never returns the raw string (unbounded cardinality).
@@ -816,6 +924,8 @@ let externalRuntimeReservationsActive: Gauge | null = null;
 let externalRuntimeReservationOldestAge: Gauge | null = null;
 let processLostTotal: Counter<"adapter" | "error_bucket" | "classification"> | null = null;
 let externalLifecycleRunningRuns: Gauge<"adapter"> | null = null;
+let externalLifecycleRunSilenceGap: Histogram<"adapter" | "status"> | null = null;
+let externalLifecycleRunSilenceGapLast: Gauge<"adapter" | "status"> | null = null;
 let processLostLivenessNull: Counter | null = null;
 let orphanedManagedPodReaped: Counter<"adapter"> | null = null;
 let githubReviewRequestDelivery: Counter<"state" | "reason"> | null = null;
@@ -824,6 +934,7 @@ let githubReviewRequestDeadLetterUnresolved: Gauge<"reason"> | null = null;
 let agentWakeupTerminalFailedUnresolved: Gauge<"error_code" | "scope"> | null = null;
 let agentWakeupTerminalFailedOldestAge: Gauge<"scope"> | null = null;
 let githubWorkflowRunConclusion: Counter<"conclusion" | "supersession"> | null = null;
+let queuedRunOldestAge: Gauge<"agent_id"> | null = null;
 let authRequest: Counter<"operation" | "outcome"> | null = null;
 
 function ensureRegistry(): {
@@ -838,6 +949,8 @@ function ensureRegistry(): {
   externalRuntimeReservationOldestAgeGauge: Gauge;
   processLostTotalCounter: Counter<"adapter" | "error_bucket" | "classification">;
   externalLifecycleRunningRunsGauge: Gauge<"adapter">;
+  externalLifecycleRunSilenceGapHistogram: Histogram<"adapter" | "status">;
+  externalLifecycleRunSilenceGapLastGauge: Gauge<"adapter" | "status">;
   processLostLivenessNullCounter: Counter;
   orphanedManagedPodReapedCounter: Counter<"adapter">;
   githubReviewRequestDeliveryCounter: Counter<"state" | "reason">;
@@ -846,6 +959,7 @@ function ensureRegistry(): {
   agentWakeupTerminalFailedUnresolvedGauge: Gauge<"error_code" | "scope">;
   agentWakeupTerminalFailedOldestAgeGauge: Gauge<"scope">;
   githubWorkflowRunConclusionCounter: Counter<"conclusion" | "supersession">;
+  queuedRunOldestAgeGauge: Gauge<"agent_id">;
   authRequestCounter: Counter<"operation" | "outcome">;
 } {
   if (
@@ -860,6 +974,8 @@ function ensureRegistry(): {
     || !externalRuntimeReservationOldestAge
     || !processLostTotal
     || !externalLifecycleRunningRuns
+    || !externalLifecycleRunSilenceGap
+    || !externalLifecycleRunSilenceGapLast
     || !processLostLivenessNull
     || !orphanedManagedPodReaped
     || !githubReviewRequestDelivery
@@ -868,6 +984,7 @@ function ensureRegistry(): {
     || !agentWakeupTerminalFailedUnresolved
     || !agentWakeupTerminalFailedOldestAge
     || !githubWorkflowRunConclusion
+    || !queuedRunOldestAge
     || !authRequest
   ) {
     registry = new Registry();
@@ -957,6 +1074,30 @@ function ensureRegistry(): {
         + "DENOMINATOR for " + PROCESS_LOST_TOTAL_METRIC + ": a 0 process_lost count is only "
         + "'healthy' when this is above a floor — otherwise there were simply no runs to lose.",
       labelNames: ["adapter"],
+      registers: [registry],
+    });
+    externalLifecycleRunSilenceGap = new Histogram({
+      name: EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_METRIC,
+      help:
+        "Terminal silence gap in seconds for external-lifecycle runs (BLO-20815): "
+        + "finalizedAt minus the same lastUsefulActionAt > lastOutputAt > startedAt "
+        + "signal the dispatcher's staleness filter uses. Labeled by bounded adapter "
+        + "and terminal status; read the status=\"succeeded\" population's p99 against "
+        + "EXTERNAL_LIFECYCLE_HARD_STALE_MS (45m) to judge whether a shorter destructive-"
+        + "kill floor leaves a safe margin.",
+      labelNames: ["adapter", "status"],
+      buckets: EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_BUCKETS_SECONDS,
+      registers: [registry],
+    });
+    externalLifecycleRunSilenceGapLast = new Gauge({
+      name: EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_LAST_METRIC,
+      help:
+        "Last-observed silence-gap seconds per adapter/status, companion to "
+        + EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_METRIC + " (BLO-20815): a classic "
+        + "Histogram cannot expose an exact max (values above the last finite "
+        + "bucket collapse into +Inf). Read the true rolling max via "
+        + "max_over_time(...[7d]) against this gauge instead.",
+      labelNames: ["adapter", "status"],
       registers: [registry],
     });
     processLostLivenessNull = new Counter({
@@ -1135,6 +1276,19 @@ function ensureRegistry(): {
         githubWorkflowRunConclusion.inc({ conclusion, supersession }, 0);
       }
     }
+    queuedRunOldestAge = new Gauge({
+      name: QUEUED_RUN_OLDEST_AGE_METRIC,
+      help:
+        "Age in seconds of the oldest `queued` heartbeat run for an agent (BLO-21116). "
+        + "Refreshed on scrape from a live MIN(created_at) aggregate, not a Prometheus "
+        + "`for:` clause -- same reasoning as " + AGENT_WAKEUP_TERMINAL_FAILED_OLDEST_AGE_METRIC
+        + ": `for:` measures how long the alert expression has been true, not the age of "
+        + "any one row. Reset-then-set every refresh (see setQueuedRunOldestAgeMetrics) so an "
+        + "agent whose queue drains to empty reads back an explicit 0 rather than a frozen "
+        + "stale value or an absent series. Labeled by bounded agent_id.",
+      labelNames: ["agent_id"],
+      registers: [registry],
+    });
     authRequest = new Counter({
       name: AUTH_REQUEST_METRIC,
       help:
@@ -1164,6 +1318,8 @@ function ensureRegistry(): {
     externalRuntimeReservationOldestAgeGauge: externalRuntimeReservationOldestAge,
     processLostTotalCounter: processLostTotal,
     externalLifecycleRunningRunsGauge: externalLifecycleRunningRuns,
+    externalLifecycleRunSilenceGapHistogram: externalLifecycleRunSilenceGap,
+    externalLifecycleRunSilenceGapLastGauge: externalLifecycleRunSilenceGapLast,
     processLostLivenessNullCounter: processLostLivenessNull,
     orphanedManagedPodReapedCounter: orphanedManagedPodReaped,
     githubReviewRequestDeliveryCounter: githubReviewRequestDelivery,
@@ -1172,6 +1328,7 @@ function ensureRegistry(): {
     agentWakeupTerminalFailedUnresolvedGauge: agentWakeupTerminalFailedUnresolved,
     agentWakeupTerminalFailedOldestAgeGauge: agentWakeupTerminalFailedOldestAge,
     githubWorkflowRunConclusionCounter: githubWorkflowRunConclusion,
+    queuedRunOldestAgeGauge: queuedRunOldestAge,
     authRequestCounter: authRequest,
   };
 }
@@ -1390,6 +1547,39 @@ export function setExternalLifecycleRunningRuns(byAdapter: Record<string, number
   if (other > 0) gauge.set({ adapter: UNKNOWN_EXTERNAL_ADAPTER }, other);
 }
 
+/**
+ * Observe one external-lifecycle run's terminal silence gap (BLO-20815). Call
+ * once per run at finalization (reap-driven completion/force-kill, or manual
+ * cancel), passing the run's raw signal timestamps and the exact instant it
+ * was finalized. Returns null (and records nothing) when the run has no
+ * signal timestamp at all — a queued/scheduled_retry run cancelled before it
+ * ever started has no meaningful silence gap to report. Otherwise returns the
+ * normalized labels and the observed value (useful for logging/tests).
+ *
+ * Also updates {@link EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_LAST_METRIC}, the
+ * last-value companion gauge that makes the population max queryable via
+ * `max_over_time(...[7d])` (the histogram alone cannot answer that — see the
+ * gauge's own doc comment).
+ */
+export function recordExternalLifecycleRunSilenceGap(input: {
+  adapter: string | null | undefined;
+  status: string | null | undefined;
+  run: ExternalLifecycleSilenceGapRunSignals;
+  finalizedAt: Date;
+}): { adapter: string; status: string; silenceGapSeconds: number } | null {
+  const silenceGapSeconds = computeExternalLifecycleSilenceGapSeconds(input.run, input.finalizedAt);
+  if (silenceGapSeconds === null) return null;
+  const labels = {
+    adapter: normalizeExternalAdapter(input.adapter),
+    status: normalizeExternalLifecycleTerminalStatus(input.status),
+  };
+  const registered = ensureRegistry();
+  registered.externalLifecycleRunSilenceGapHistogram.observe(labels, silenceGapSeconds);
+  registered.externalLifecycleRunSilenceGapLastGauge.set(labels, silenceGapSeconds);
+  return { ...labels, silenceGapSeconds };
+}
+
+
 /** Record one reap cycle that was blind to kube (BLO-16184 denominator #2). */
 export function recordProcessLostLivenessNull(): void {
   ensureRegistry().processLostLivenessNullCounter.inc();
@@ -1575,6 +1765,35 @@ export function recordGithubWorkflowRunConclusion(
   return conclusionLabel;
 }
 
+/**
+ * Snapshot the oldest-`queued`-run age per agent (BLO-21116). Reset-then-set,
+ * same reasoning as {@link setExternalLifecycleRunningRuns}: an agent absent
+ * from `entries` must read back an explicit 0, not a frozen stale value from
+ * before its queue drained -- that explicit 0 is what lets an alert on this
+ * series resolve. `knownAgentIds` bounds the label the same way
+ * {@link recordConcurrentRunBlocked} does; an id outside that set collapses to
+ * `UNKNOWN_AGENT_ID` instead of minting an unbounded series.
+ */
+export function setQueuedRunOldestAgeMetrics(
+  entries: ReadonlyArray<{ agentId: string | null | undefined; ageSeconds: number }>,
+  knownAgentIds: ReadonlySet<string>,
+): void {
+  const gauge = ensureRegistry().queuedRunOldestAgeGauge;
+  gauge.reset();
+  const oldestByAgentId = new Map<string, number>();
+  for (const entry of entries) {
+    const agentId = normalizeAgentId(entry.agentId, knownAgentIds);
+    const ageSeconds = Number.isFinite(entry.ageSeconds) ? Math.max(0, entry.ageSeconds) : 0;
+    const current = oldestByAgentId.get(agentId);
+    if (current === undefined || ageSeconds > current) oldestByAgentId.set(agentId, ageSeconds);
+  }
+  for (const agentId of knownAgentIds) {
+    gauge.set({ agent_id: agentId }, oldestByAgentId.get(agentId) ?? 0);
+  }
+  const unknownAge = oldestByAgentId.get(UNKNOWN_AGENT_ID);
+  if (unknownAge !== undefined) gauge.set({ agent_id: UNKNOWN_AGENT_ID }, unknownAge);
+}
+
 export function recordAuthRequest(input: {
   operation: string | null | undefined;
   outcome: string | null | undefined;
@@ -1605,9 +1824,17 @@ export async function renderMetrics(): Promise<{ contentType: string; body: stri
       ([outcome, value]) => `${BLOCKER_RESOLVED_WAKEUP_METRIC}{outcome="${outcome}"} ${value}`,
     ),
   ].join("\n");
+  const routineDispatchSnapshot = snapshotRoutineDispatchMetrics();
+  const routineDispatchBody = [
+    `# HELP ${ROUTINE_DISPATCH_METRIC} Count of routine dispatch gating outcomes, labeled by outcome. routine_dispatch_bypassed_parked_execution_issue = a fire proceeded past an execution issue parked on a long-horizon scheduled_retry rather than being silently skipped for the whole park.`,
+    `# TYPE ${ROUTINE_DISPATCH_METRIC} counter`,
+    ...Object.entries(routineDispatchSnapshot).map(
+      ([outcome, value]) => `${ROUTINE_DISPATCH_METRIC}{outcome="${outcome}"} ${value}`,
+    ),
+  ].join("\n");
   return {
     contentType: reg.contentType,
-    body: `${await reg.metrics()}\n${depBlockedBody}\n${blockerResolvedBody}\n`,
+    body: `${await reg.metrics()}\n${depBlockedBody}\n${blockerResolvedBody}\n${routineDispatchBody}\n`,
   };
 }
 
@@ -1624,6 +1851,8 @@ export function __resetMetricsForTest(): void {
   externalRuntimeReservationOldestAge = null;
   processLostTotal = null;
   externalLifecycleRunningRuns = null;
+  externalLifecycleRunSilenceGap = null;
+  externalLifecycleRunSilenceGapLast = null;
   processLostLivenessNull = null;
   orphanedManagedPodReaped = null;
   githubReviewRequestDelivery = null;
@@ -1632,7 +1861,9 @@ export function __resetMetricsForTest(): void {
   agentWakeupTerminalFailedUnresolved = null;
   agentWakeupTerminalFailedOldestAge = null;
   githubWorkflowRunConclusion = null;
+  queuedRunOldestAge = null;
   authRequest = null;
   resetDepBlockedMetrics();
   resetBlockerResolvedWakeMetrics();
+  resetRoutineDispatchMetrics();
 }

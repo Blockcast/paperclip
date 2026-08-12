@@ -221,6 +221,17 @@ vi.mock("../services/k8s-job-liveness.ts", () => ({
   deleteAgentJobExact: mockDeleteAgentJobsForRun,
   deleteAgentJobsForRun: mockDeleteAgentJobsByRunId,
   hasActiveJobForAgent: mockHasActiveJobForAgent,
+  classifyAgentJobFailureErrorCode: (diagnostics: {
+    containers?: Array<{ kind?: string | null; exitCode?: number | null; reason?: string | null }>;
+  } | null) => {
+    const failedApps = diagnostics?.containers?.filter(
+      (entry) => entry.kind === "app" && (entry.exitCode ?? 0) !== 0,
+    ) ?? [];
+    if (failedApps.some((entry) => entry.reason?.toLowerCase() === "oomkilled")) {
+      return "oom_killed";
+    }
+    return failedApps.some((entry) => entry.exitCode === 137) ? "exit_137" : null;
+  },
 }));
 vi.mock("../services/local-service-supervisor.js", async () => {
   const actual = await vi.importActual<typeof import("../services/local-service-supervisor.js")>(
@@ -263,14 +274,20 @@ import {
 } from "../services/heartbeat.ts";
 import { setPluginEventBus, setPluginEventOutboxDb } from "../services/activity-log.js";
 import { pollOnce as drainPluginEventOutbox } from "../services/plugin-event-outbox.js";
+import { subscribeCompanyLiveEvents } from "../services/live-events.js";
+import {
+  clearHeartbeatRunRuntimeStatus,
+  getHeartbeatRunRuntimeStatus,
+  setHeartbeatRunRuntimeStatus,
+} from "../services/heartbeat-run-runtime-status.js";
 import {
   readHotRestartIntent,
   resolveHotRestartReportPath,
   writeHotRestartIntent,
 } from "../services/hot-restart.ts";
+import { loadConfig } from "../config.js";
 import { secretService } from "../services/secrets.ts";
 import {
-  STRANDED_RECOVERY_MAX_OWNER_WAKE_ATTEMPTS,
   SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_BODY,
   SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY,
   SUCCESSFUL_RUN_MISSING_STATE_REASON,
@@ -284,6 +301,7 @@ import {
 } from "@paperclipai/adapter-utils/server-utils";
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+const defaultRecoveryActionMaxAttempts = loadConfig().recoveryActionMaxAttempts;
 
 const allowPenstockGate = {
   checkAdapter: async () => ({ allow: true as const }),
@@ -1294,7 +1312,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       // BLO-18996: owner-wake recovery actions now carry a wake budget so a named owner
       // who cannot discharge the action stops being re-woken forever. Only the causes
       // that never wake an owner (provider-quota waits, manual-repair holds) stay null.
-      maxAttempts: STRANDED_RECOVERY_MAX_OWNER_WAKE_ATTEMPTS,
+      maxAttempts: defaultRecoveryActionMaxAttempts,
     });
 
     expect(action.evidence).toMatchObject({
@@ -1815,6 +1833,177 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
+  it("records an external-finalizer failure immediately after the terminal claim", async () => {
+    __resetMetricsForTest();
+    const jobName = "agent-opencode-missing-metric";
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      processPid: null,
+      processGroupId: null,
+      includeIssue: false,
+      externalRunId: jobName,
+      lastOutputAt: new Date(),
+    });
+    await seedAdapterInvokeEvent({ companyId, agentId, runId });
+    await seedLaunchedReservation({ companyId, agentId, runId, jobName });
+    mockListManagedAgentJobs.mockResolvedValueOnce([]);
+    mockReadAgentJobRunStatusByName.mockResolvedValueOnce({
+      phase: "missing",
+      reason: "NotFound",
+      name: jobName,
+    });
+
+    const originalUpdate = db.update.bind(db);
+    const updateSpy = vi.spyOn(db, "update").mockImplementation(((table) => {
+      if (table === agentWakeupRequests) throw new Error("wakeup persistence unavailable");
+      return originalUpdate(table);
+    }) as typeof db.update);
+
+    try {
+      await expect(
+        heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true }),
+      ).rejects.toThrow("wakeup persistence unavailable");
+      expect(await heartbeat.getRun(runId)).toMatchObject({
+        status: "failed",
+        errorCode: "job_missing",
+      });
+      const { body: metrics } = await renderMetrics();
+      expect(metrics.split("\n")).toContain(
+        'paperclip_heartbeat_run_failed_total{agent_id="unknown",issue_id="none",adapter="opencode_k8s",error_code="job_missing",invocation_source="other",isolation_mode="unknown"} 1',
+      );
+    } finally {
+      updateSpy.mockRestore();
+      __resetMetricsForTest();
+    }
+  });
+
+  it("recovers terminal ownership and side effects after connection failures", async () => {
+    __resetMetricsForTest();
+    const jobName = "agent-opencode-ambiguous-terminal-claim";
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      processPid: null,
+      processGroupId: null,
+      includeIssue: false,
+      externalRunId: jobName,
+      lastOutputAt: new Date(),
+    });
+    await seedAdapterInvokeEvent({ companyId, agentId, runId });
+    await seedLaunchedReservation({ companyId, agentId, runId, jobName });
+    mockListManagedAgentJobs.mockResolvedValueOnce([]).mockResolvedValueOnce([]);
+    mockReadAgentJobRunStatusByName.mockResolvedValue({
+      phase: "missing",
+      reason: "NotFound",
+      name: jobName,
+    });
+    setHeartbeatRunRuntimeStatus({
+      companyId,
+      issueId: null,
+      agentId,
+      runId,
+      phase: "run_activity",
+      message: "Waiting for external lifecycle reconciliation",
+    });
+    const liveEvents: Array<{ type: string; payload: Record<string, unknown> }> = [];
+    const unsubscribe = subscribeCompanyLiveEvents(companyId, (event) => {
+      liveEvents.push(event);
+    });
+
+    const originalUpdate = db.update.bind(db);
+    const originalSelect = db.select.bind(db);
+    let injectAmbiguousResponse = true;
+    let injectOwnershipReadFailure = true;
+    const updateSpy = vi.spyOn(db, "update").mockImplementation(((table) => {
+      const updateBuilder = originalUpdate(table);
+      if (table !== heartbeatRuns) return updateBuilder;
+
+      const originalSet = updateBuilder.set.bind(updateBuilder);
+      updateBuilder.set = ((values: Record<string, unknown>) => {
+        const setBuilder = originalSet(values);
+        const recovery = (values.resultJson as { externalLifecycleRecovery?: unknown } | undefined)
+          ?.externalLifecycleRecovery as { terminalClaimToken?: unknown } | undefined;
+        if (!recovery?.terminalClaimToken) return setBuilder;
+
+        const originalWhere = setBuilder.where.bind(setBuilder);
+        setBuilder.where = ((condition: Parameters<typeof originalWhere>[0]) => {
+          const whereBuilder = originalWhere(condition);
+          const originalReturning = whereBuilder.returning.bind(whereBuilder);
+          whereBuilder.returning = ((...args: Parameters<typeof originalReturning>) => {
+            const query = originalReturning(...args);
+            const originalThen = query.then.bind(query);
+            query.then = (async (...thenArgs: Parameters<typeof originalThen>) => {
+              const rows = await originalThen(...thenArgs);
+              if (injectAmbiguousResponse) {
+                injectAmbiguousResponse = false;
+                throw Object.assign(new Error("connection lost after commit"), { code: "08006" });
+              }
+              return rows;
+            }) as typeof query.then;
+            return query;
+          }) as typeof whereBuilder.returning;
+          return whereBuilder;
+        }) as typeof setBuilder.where;
+        return setBuilder;
+      }) as typeof updateBuilder.set;
+      return updateBuilder;
+    }) as typeof db.update);
+    const selectSpy = vi
+      .spyOn(db, "select")
+      .mockImplementation(((...args: Parameters<typeof db.select>) => {
+        if (!injectAmbiguousResponse && injectOwnershipReadFailure) {
+          injectOwnershipReadFailure = false;
+          throw Object.assign(new Error("connection unavailable during ownership read"), {
+            code: "08006",
+          });
+        }
+        return originalSelect(...args);
+      }) as typeof db.select);
+
+    const sample =
+      'paperclip_heartbeat_run_failed_total{agent_id="unknown",issue_id="none",adapter="opencode_k8s",error_code="job_missing",invocation_source="other",isolation_mode="unknown"} 1';
+    try {
+      const firstPass = await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+      expect(firstPass.runIds).toContain(runId);
+      expect(await heartbeat.getRun(runId)).toMatchObject({
+        status: "failed",
+        errorCode: "job_missing",
+      });
+      expect((await renderMetrics()).body.split("\n")).toContain(sample);
+      expect(getHeartbeatRunRuntimeStatus(runId)).toBeNull();
+      await drainOutbox();
+      expect(
+        liveEvents.filter(
+          (event) => event.type === "heartbeat.run.status" && event.payload.runId === runId,
+        ),
+      ).toHaveLength(1);
+      expect(
+        emittedPluginEvents.filter(
+          (event) => event.eventType === "agent.run.failed" && event.entityId === runId,
+        ),
+      ).toHaveLength(1);
+
+      await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+      expect((await renderMetrics()).body.split("\n")).toContain(sample);
+      await drainOutbox();
+      expect(
+        liveEvents.filter(
+          (event) => event.type === "heartbeat.run.status" && event.payload.runId === runId,
+        ),
+      ).toHaveLength(1);
+      expect(
+        emittedPluginEvents.filter(
+          (event) => event.eventType === "agent.run.failed" && event.entityId === runId,
+        ),
+      ).toHaveLength(1);
+    } finally {
+      unsubscribe();
+      clearHeartbeatRunRuntimeStatus(runId);
+      selectSpy.mockRestore();
+      updateSpy.mockRestore();
+      __resetMetricsForTest();
+    }
+  });
+
   it("preserves an exact-head GitHub review when its external Job disappears", async () => {
     const jobName = "agent-opencode-review-posted";
     const headSha = "075a9aeff53a229199ab0583e916f33c22459983";
@@ -1824,7 +2013,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       externalRunId: jobName,
       contextSnapshot: {
         reviewKind: "pr_review",
-        taskKey: `pr_review:Blockcast/onprem-k8s:1648:${headSha}`,
+        taskKey: `pr_review:blockcast/onprem-k8s:1648:${headSha}`,
         githubRepoFullName: "Blockcast/onprem-k8s",
         githubPrNumber: 1648,
         githubHeadSha: headSha,
@@ -1899,7 +2088,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       externalRunId: jobName,
       contextSnapshot: {
         reviewKind: "pr_review",
-        taskKey: `pr_review:Blockcast/onprem-k8s:1648:${headSha}`,
+        taskKey: `pr_review:blockcast/onprem-k8s:1648:${headSha}`,
         githubRepoFullName: "Blockcast/onprem-k8s",
         githubPrNumber: 1648,
         githubHeadSha: headSha,
@@ -2038,7 +2227,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       externalRunId: jobName,
       contextSnapshot: {
         reviewKind: "pr_review",
-        taskKey: `pr_review:Blockcast/onprem-k8s:1648:${headSha}`,
+        taskKey: `pr_review:blockcast/onprem-k8s:1648:${headSha}`,
         githubRepoFullName: "Blockcast/onprem-k8s",
         githubPrNumber: 1648,
         githubHeadSha: headSha,
@@ -2103,7 +2292,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       externalRunId: jobName,
       contextSnapshot: {
         reviewKind: "pr_review",
-        taskKey: `pr_review:Blockcast/onprem-k8s:1648:${headSha}`,
+        taskKey: `pr_review:blockcast/onprem-k8s:1648:${headSha}`,
         githubRepoFullName: "Blockcast/onprem-k8s",
         githubPrNumber: 1648,
         githubHeadSha: headSha,
@@ -3416,7 +3605,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .set({
         contextSnapshot: {
           reviewKind: "pr_review",
-          taskKey: `pr_review:Blockcast/onprem-k8s:1648:${headSha}`,
+          taskKey: `pr_review:blockcast/onprem-k8s:1648:${headSha}`,
           githubRepoFullName: "Blockcast/onprem-k8s",
           githubPrNumber: 1648,
           githubHeadSha: headSha,
@@ -4319,6 +4508,79 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(activity.some((event) => event.action === "issue.successful_run_handoff_required")).toBe(true);
   });
 
+  it("defers checkout restoration for taskId-only successful handoffs", async () => {
+    const { companyId, agentId, runId, issueId } = await seedQueuedIssueRunFixture();
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: {
+          taskId: issueId,
+          wakeReason: "issue_assigned",
+        },
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    await db
+      .update(issues)
+      .set({ checkoutRestoreStatus: "todo" })
+      .where(eq(issues.id, issueId));
+    mockAdapterExecute.mockImplementationOnce(async (ctx: { runId: string }) => {
+      await db.insert(issueComments).values({
+        companyId,
+        issueId,
+        authorAgentId: agentId,
+        createdByRunId: ctx.runId,
+        body: "Implemented the taskId-only work but did not choose a final disposition.",
+      });
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: "Implemented the taskId-only work but did not choose a final disposition.",
+        resultJson: {
+          summary: "Implemented the taskId-only work but did not choose a final disposition.",
+        },
+        provider: "test",
+        model: "test-model",
+      };
+    });
+    heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+
+    await heartbeat.resumeQueuedRuns();
+    const sourceRun = await waitForRunToSettle(heartbeat, runId, 10_000);
+    expect(sourceRun?.status).toBe("succeeded");
+
+    const handoffRun = await waitForValue(async () => {
+      const rows = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.agentId, agentId));
+      return rows.find((row) => {
+        if (row.id === runId) return false;
+        const context = row.contextSnapshot as Record<string, unknown> | null;
+        return context?.wakeReason === "finish_successful_run_handoff";
+      }) ?? null;
+    });
+    expect(handoffRun).toBeTruthy();
+    if (!handoffRun) throw new Error("Expected taskId-only successful handoff run");
+
+    const settledHandoff = await waitForRunToSettle(heartbeat, handoffRun.id, 10_000);
+    expect(settledHandoff?.status).toBe("succeeded");
+    expect(mockAdapterExecute.mock.calls.some(([context]) => context.runId === handoffRun.id)).toBe(true);
+
+    const sourceAfter = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(sourceAfter).toMatchObject({
+      status: "in_progress",
+      checkoutRunId: null,
+      executionRunId: null,
+      checkoutRestoreStatus: null,
+    });
+  });
+
   it("requeues a missing-disposition handoff when the previous corrective wake was cancelled", async () => {
     const { companyId, agentId, runId, issueId } = await seedQueuedIssueRunFixture();
     const idempotencyKey = `finish_successful_run_handoff:${issueId}:${runId}:1`;
@@ -4382,6 +4644,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
   it("queues one missing-disposition handoff for artifact-producing successful runs left in progress", async () => {
     const { companyId, agentId, runId, issueId } = await seedQueuedIssueRunFixture();
+    await db.update(issues).set({ workMode: "planning" }).where(eq(issues.id, issueId));
     mockAdapterExecute.mockImplementationOnce(async (ctx: { runId: string }) => {
       const documentId = randomUUID();
       const revisionId = randomUUID();
@@ -4468,6 +4731,13 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(classifiedRun?.livenessState).toBe("advanced");
     expect(handoffWakeups).toHaveLength(1);
     expect(handoffWakeups[0]?.idempotencyKey).toBe(`finish_successful_run_handoff:${issueId}:${runId}:1`);
+    expect(handoffWakeups[0]?.payload).not.toHaveProperty("modelProfile");
+    expect(handoffWakeups[0]?.payload).toMatchObject({
+      recoveryIntent: "planning_only",
+      allowDeliverableWork: false,
+      allowDocumentUpdates: true,
+      resumeRequiresNormalModel: false,
+    });
 
     const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
     expect(issue?.status).toBe("in_progress");
@@ -7699,6 +7969,106 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(await db.select().from(issueRecoveryActions).where(
       eq(issueRecoveryActions.sourceIssueId, issueId),
     )).toHaveLength(0);
+  });
+
+  it("keeps a finalizer-created continuation in_progress until its queued retry dispatches", async () => {
+    const { agentId, issueId, runId, wakeupRequestId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+    });
+    const startedAt = new Date("2026-03-19T00:00:00.000Z");
+
+    // Recreate the normal finalization shape rather than using the stranded
+    // sweep fixture as-is: the source run is live and owns both lock columns,
+    // and checkout recorded the tier it promoted. cancelRun drives the real
+    // releaseIssueExecutionAndPromote -> queued continuation -> dispatcher path.
+    await db
+      .update(heartbeatRuns)
+      .set({
+        status: "running",
+        startedAt,
+        finishedAt: null,
+        error: null,
+        errorCode: null,
+        updatedAt: startedAt,
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    await db
+      .update(agentWakeupRequests)
+      .set({
+        status: "running",
+        claimedAt: startedAt,
+        finishedAt: null,
+        error: null,
+        updatedAt: startedAt,
+      })
+      .where(eq(agentWakeupRequests.id, wakeupRequestId));
+    await db
+      .update(issues)
+      .set({
+        checkoutRunId: runId,
+        executionRunId: runId,
+        executionAgentNameKey: "codexcoder",
+        executionLockedAt: startedAt,
+        checkoutRestoreStatus: "todo",
+      })
+      .where(eq(issues.id, issueId));
+
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      // Give the continuation an explicit disposition so this regression stays
+      // focused on dispatch. A successful run with detected progress and no
+      // disposition now intentionally enters the successful-handoff workflow
+      // and remains in_progress.
+      await db
+        .update(issues)
+        .set({
+          status: "todo",
+          checkoutRestoreStatus: null,
+          updatedAt: new Date(),
+        })
+        .where(eq(issues.id, issueId));
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: "Parked the continuation after confirming dispatch.",
+        resultJson: { summary: "Parked the continuation after confirming dispatch." },
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    await heartbeat.cancelRun(runId, "exercise finalizer continuation recovery");
+
+    const continuation = await waitForValue(async () => {
+      const rows = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.agentId, agentId));
+      return rows.find((row) => row.id !== runId) ?? null;
+    });
+    if (!continuation) throw new Error("Expected finalizer to queue a continuation retry");
+
+    expect(continuation.contextSnapshot).toMatchObject({
+      issueId,
+      retryOfRunId: runId,
+      retryReason: "issue_continuation_needed",
+    });
+
+    // Before the regression fix, the source finalizer restored this row to
+    // `todo` before it created the retry. claimQueuedRun then cancelled the
+    // retry for no longer being `in_progress`, so the adapter never ran.
+    const settledContinuation = await waitForRunToSettle(heartbeat, continuation.id, 10_000);
+    expect(settledContinuation?.status).toBe("succeeded");
+    expect(mockAdapterExecute.mock.calls.some(([context]) => context.runId === continuation.id)).toBe(true);
+
+    const sourceAfter = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(sourceAfter).toMatchObject({ status: "todo", checkoutRestoreStatus: null });
   });
 
   it.each([

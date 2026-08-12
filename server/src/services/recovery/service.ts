@@ -28,6 +28,7 @@ import {
   issues,
   workspaceOperations,
 } from "@paperclipai/db";
+import { loadConfig } from "../../config.js";
 import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
 import { runningProcesses } from "../../adapters/index.js";
 import { visibleIssueCondition } from "../issue-visibility.js";
@@ -36,6 +37,7 @@ import { logger } from "../../middleware/logger.js";
 import { isPidAlive, isProcessGroupAlive, terminateLocalService } from "../local-service-supervisor.js";
 import { redactCurrentUserText } from "../../log-redaction.js";
 import { redactSensitiveText } from "../../redaction.js";
+import { PROVIDER_CAPACITY_MAX_HORIZON_MS } from "../provider-capacity-horizon-bound.js";
 import { logActivity } from "../activity-log.js";
 import { budgetService } from "../budgets.js";
 import { instanceSettingsService } from "../instance-settings.js";
@@ -45,6 +47,7 @@ import {
   issueTreeControlService,
 } from "../issue-tree-control.js";
 import { TERMINAL_HEARTBEAT_RUN_STATUSES, externalWaitFromDescription, issueService } from "../issues.js";
+import { releaseIssueRunOwnership, restoreCheckoutPromotedStatus } from "../issue-checkout-status.js";
 import {
   applyIssueMonitorPolicyTransition,
   derivePersistedMonitorState,
@@ -100,6 +103,33 @@ export const ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS = 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS = 4 * 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS = 30 * 60 * 1000;
 export const DEFAULT_LIVENESS_REESCALATION_COOLDOWN_MS = 60 * 60 * 1000;
+
+type RecoveryActionBoundsConfig = {
+  maxAttempts: number;
+  timeoutMs: number;
+};
+
+/**
+ * Read bounds when creating an action so deployments can tune newly-created
+ * recovery work without changing actions that are already in flight.
+ */
+function recoveryActionBoundsConfig(): RecoveryActionBoundsConfig {
+  const config = loadConfig();
+  return {
+    maxAttempts: config.recoveryActionMaxAttempts,
+    timeoutMs: config.recoveryActionTimeoutMs,
+  };
+}
+
+/** Bounds persisted on the first wake_owner escalation for an action. */
+function recoveryActionBoundsAtCreation(now: Date): { maxAttempts: number; timeoutAt: Date } {
+  const bounds = recoveryActionBoundsConfig();
+  return {
+    maxAttempts: bounds.maxAttempts,
+    timeoutAt: new Date(now.getTime() + bounds.timeoutMs),
+  };
+}
+
 // BLO-18995: how long an issue execution lock may be held by a run that has
 // not yet been claimed (status still `queued`/`scheduled_retry`, startedAt
 // null) before sweepStaleIssueLocks treats it as stale and clears it.
@@ -237,6 +267,10 @@ export const STRANDED_RECENT_PROGRESS_EXEMPTION_MS = Math.max(
  * BLO-18996: hard ceiling on how many times one source-scoped recovery action may wake
  * an owner before the sweep stops re-firing it.
  *
+ * Retained as a compatibility export for callers that still inspect the legacy
+ * environment setting. Newly-created actions use `recoveryActionBoundsConfig`
+ * and `RECOVERY_ACTION_MAX_ATTEMPTS` instead.
+ *
  * Every wake this action mints is discretionary — nothing downstream verifies that the
  * owner it names can actually discharge it. When the owner cannot (the reported case: a
  * `stranded_assigned_issue` action named an owner who was then 403'd by `issue:comment`
@@ -257,6 +291,8 @@ export const STRANDED_RECOVERY_MAX_OWNER_WAKE_ATTEMPTS = Math.max(
 
 /**
  * BLO-18996: outer horizon on the same loop, in wall-clock time rather than attempts.
+ * Newly-created actions use `recoveryActionBoundsConfig` and
+ * `RECOVERY_ACTION_TIMEOUT_MS`; this static value remains for compatibility.
  *
  * `attemptCount` is a per-OWNER budget — it restarts when the action changes hands, which is
  * what makes a genuinely reassigned owner reachable again. But owner identity is not stable
@@ -530,10 +566,15 @@ const PROVIDER_CAPACITY_RESET_INSTANT_PATTERN =
   /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
 
 // The horizon was advertised during the run that recorded it, and the write side
-// caps an accepted horizon at 24h past finalization. Bound the read lower side
-// by run creation and the upper side by run finish (falling back to creation)
-// so long-running jobs can still report a horizon parsed near the end.
-const PROVIDER_CAPACITY_RESET_MAX_SKEW_MS = 24 * 60 * 60 * 1000;
+// caps an accepted horizon at PROVIDER_CAPACITY_MAX_HORIZON_MS past
+// finalization. Bound the read lower side by run creation and the upper side by
+// run finish (falling back to creation) so long-running jobs can still report a
+// horizon parsed near the end.
+//
+// This is the SAME constant the writer caps with, deliberately — an over-cap
+// park lands exactly on the upper bound below, so the two diverging would
+// silently refuse every such horizon on read.
+const PROVIDER_CAPACITY_RESET_MAX_SKEW_MS = PROVIDER_CAPACITY_MAX_HORIZON_MS;
 
 type ProviderCapacityResetBounds = {
   lowerBoundAt: Date | null;
@@ -585,6 +626,12 @@ function readProviderCapacityResetProvenance(resultJson: Record<string, unknown>
   return {
     errorFamily: family,
     observedStatusCode: normalizeHttpStatusCode(provenance.observedStatusCode),
+    // BLO-18285: present only when the run parked at the horizon cap rather
+    // than on the instant the provider named. `providerCapacityResetAt` is then
+    // OUR checkpoint, not the provider's claim — so any sentence attributing it
+    // to the provider has to use this field instead, or it states something the
+    // provider never said.
+    advertisedResetAt: readNonEmptyString(provenance.advertisedResetAt) ?? null,
   };
 }
 
@@ -599,6 +646,11 @@ type ProviderCapacityResetRead = {
   // signal — neither implies a 429 capacity event, so neither may be reported
   // as one.
   is429Capacity: boolean;
+  // BLO-18285: set when `resetAt` is our capped checkpoint rather than the
+  // provider's own instant. Distinguishing them keeps the strand comment
+  // honest: at the checkpoint the ADVERTISED window has not elapsed, so the
+  // "that horizon has since elapsed" wording below would be simply untrue.
+  advertisedResetAt: string | null;
 };
 
 function readProviderCapacityResetAt(
@@ -615,12 +667,18 @@ function readProviderCapacityResetAt(
   const explicit = provenance
     ? canonicalizeCapacityResetInstant(resultJson.providerCapacityResetAt, bounds)
     : null;
-  if (explicit) return { resetAt: explicit, is429Capacity: provenance?.observedStatusCode === 429 };
+  if (explicit) {
+    return {
+      resetAt: explicit,
+      is429Capacity: provenance?.observedStatusCode === 429,
+      advertisedResetAt: provenance?.advertisedResetAt ?? null,
+    };
+  }
 
   const advertised =
     canonicalizeCapacityResetInstant(resultJson.retryNotBefore, bounds) ??
     canonicalizeCapacityResetInstant(resultJson.transientRetryNotBefore, bounds);
-  return advertised ? { resetAt: advertised, is429Capacity: false } : null;
+  return advertised ? { resetAt: advertised, is429Capacity: false, advertisedResetAt: null } : null;
 }
 
 export function summarizeRunFailureForIssueComment(run: LatestIssueRun, now = Date.now()) {
@@ -661,6 +719,41 @@ export function summarizeRunFailureForIssueComment(run: LatestIssueRun, now = Da
   const capacityReset = readProviderCapacityResetAt(run);
   if (capacityReset) {
     const suffix = errorCode ? ` (surfaced as \`${errorCode}\`)` : "";
+
+    // BLO-18285: an over-cap park. `resetAt` here is OUR checkpoint, not the
+    // provider's instant, so it must not be attributed to the provider — and
+    // the elapsed-horizon branch below must not fire on it, because reaching
+    // the checkpoint says nothing about the advertised window, which is still
+    // open by construction. Report both numbers and what each one means.
+    if (capacityReset.advertisedResetAt) {
+      const cause =
+        `provider capacity throttle (429) — the provider advertised a capacity reset at ` +
+        `${capacityReset.advertisedResetAt}, further out than we are willing to park on a single ` +
+        `unverified estimate`;
+      // Same cadence problem as the advertised-horizon branch below: a sweep
+      // routinely reads this run long after it failed. Past our own checkpoint
+      // the present tense is simply false — there is no live park left to
+      // describe — and "it parks again" would promise a retry path that only
+      // exists if something actually re-ran. Both readings sent operators
+      // waiting on a park that had already lapsed.
+      //
+      // What stays unclaimed past the checkpoint is whether the *advertised*
+      // window reopened: the checkpoint is our bound, not the provider's, so
+      // reaching it is no evidence either way. Hence "recheck", not "expired".
+      const checkpointAtMs = Date.parse(capacityReset.resetAt);
+      const checkpointStillAhead = Number.isFinite(checkpointAtMs) && checkpointAtMs > now;
+      return checkpointStillAhead
+        ? ` Latest retry failure: ${cause}${suffix}. The run is parked until ${capacityReset.resetAt} ` +
+            `to recheck capacity rather than waiting out the full advertised window; if the throttle is ` +
+            `still in force then, it parks again. This is transient and self-healing — the issue is ` +
+            `waiting on provider capacity, not on a broken runtime.`
+        : ` Latest retry failure: ${cause}${suffix}. Paperclip capped the park at ` +
+            `${capacityReset.resetAt}, and that checkpoint has since passed, so this is no longer a ` +
+            `live park. Reaching our own checkpoint says nothing about whether the advertised window ` +
+            `reopened — recheck current provider capacity and whether a further retry was actually ` +
+            `scheduled before either waiting on this window or diagnosing a different blocker.`;
+    }
+
     const cause = capacityReset.is429Capacity
       ? `provider capacity throttle (429) — the provider advertised a capacity reset at ${capacityReset.resetAt}`
       : `provider rate-limit/quota window — the provider advertised availability no earlier than ${capacityReset.resetAt}`;
@@ -754,6 +847,7 @@ function isCheckoutAdoptionCancelledRun(
 // `cancelClaimedRunForRoutineExecutionDuplicate` (heartbeat.ts) for where the
 // run itself is cancelled with this code.
 const ROUTINE_EXECUTION_DUPLICATE_SUPPRESSED_ERROR_CODE = "routine_execution_duplicate_suppressed";
+const ISSUE_TERMINAL_STATUS_ERROR_CODE = "issue_terminal_status";
 
 function isRoutineExecutionDuplicateSuppressedRun(
   latestRun: LatestIssueRun,
@@ -761,6 +855,15 @@ function isRoutineExecutionDuplicateSuppressedRun(
   return (
     latestRun?.status === "cancelled" &&
     readNonEmptyString(latestRun.errorCode) === ROUTINE_EXECUTION_DUPLICATE_SUPPRESSED_ERROR_CODE
+  );
+}
+
+function isTerminalDispatchRaceRun(
+  latestRun: LatestIssueRun,
+): latestRun is NonNullable<LatestIssueRun> {
+  return (
+    latestRun?.status === "cancelled" &&
+    readNonEmptyString(latestRun.errorCode) === ISSUE_TERMINAL_STATUS_ERROR_CODE
   );
 }
 
@@ -978,6 +1081,18 @@ const PROVIDER_QUOTA_ERROR_RE =
   /(?:you(?:'|’)ve hit your usage limit|usage limit(?: reached| exceeded)?|provider quota|quota (?:limit )?exceeded|model (?:is )?at capacity)/i;
 const CONFIGURATION_INCOMPLETE_ERROR_RE =
   /(?:model_not_found|model [^\n]{0,120} not found|missing (?:api )?(?:key|credentials?)|credentials? (?:are |is )?missing|no (?:api )?(?:key|credentials?) (?:was |were )?(?:found|configured|provided)|api key (?:is )?(?:not set|unavailable))/i;
+// BLO-21116: a truncated/malformed adapter response is a transport-level parse
+// fault, not evidence about credentials. Before this guard, the config-incomplete
+// regex ran against `errorCode + error + JSON.stringify(resultJson)` — the FULL
+// raw (possibly truncated) response payload — so an unparseable blob could
+// false-positive match one of the config phrases via unrelated substring content
+// (e.g. a partial JSON fragment that happens to contain "model ... not found").
+// A match here permanently latches the issue into `manual_repair_required`
+// (service.ts enqueueSourceScopedStrandedRecoveryWake) telling the owner to bind
+// a secret that was never actually missing — an unperformable repair with no
+// automatic retry path. Observed live on BLO-18991: `adapter_failed` — "JSON
+// parsing failed: Text: {"type":"response.completed","response":{..." (truncated).
+const ADAPTER_RESPONSE_PARSE_FAILURE_RE = /json parsing failed/i;
 
 export type AdapterFailureRecoveryClassification =
   | { kind: "provider_quota"; retryAt: Date; parsedResetTime: boolean }
@@ -1064,10 +1179,30 @@ export function classifyAdapterFailureForRecovery(
     return null;
   }
   const resultJson = parseObject(latestRun.resultJson);
-  const error = [latestRun.errorCode ?? "", latestRun.error ?? "", JSON.stringify(resultJson)].join("\n");
-  if (latestRun.errorCode === "configuration_incomplete" || CONFIGURATION_INCOMPLETE_ERROR_RE.test(error)) {
+  const rawError = latestRun.error ?? "";
+  // BLO-21116: an `adapter_failed` whose own message names a response-parse
+  // failure means resultJson is an untrusted/truncated payload, not a source of
+  // classification evidence -- exclude it from the combined search string so a
+  // stray substring inside the raw blob cannot false-positive as a config or
+  // quota phrase, and never let it read as configuration_incomplete.
+  const isResponseParseFailure =
+    latestRun.errorCode === "adapter_failed" && ADAPTER_RESPONSE_PARSE_FAILURE_RE.test(rawError);
+  const error = [latestRun.errorCode ?? "", rawError, isResponseParseFailure ? "" : JSON.stringify(resultJson)]
+    .join("\n");
+  if (
+    !isResponseParseFailure &&
+    (latestRun.errorCode === "configuration_incomplete" || CONFIGURATION_INCOMPLETE_ERROR_RE.test(error))
+  ) {
     return { kind: "configuration_incomplete" };
   }
+  // Same untrusted-payload reasoning as the configuration_incomplete guard
+  // above: `error` still carries `rawError` verbatim (only `resultJson` was
+  // dropped from the join), so a response-parse-failure payload containing a
+  // phrase like "quota exceeded" or "model is at capacity" would otherwise
+  // still satisfy PROVIDER_QUOTA_ERROR_RE below and misclassify as
+  // provider_quota instead of configuration_incomplete -- the same defect
+  // class, just the other branch (Ally review, 2026-08-04).
+  if (isResponseParseFailure) return null;
   if (latestRun.errorCode !== "provider_quota" && !PROVIDER_QUOTA_ERROR_RE.test(error)) return null;
 
   const persistedRetryAt = readNonEmptyString(resultJson.retryNotBefore) ??
@@ -2946,21 +3081,19 @@ export function recoveryService(
           .where(and(eq(agentWakeupRequests.id, input.run.wakeupRequestId), eq(agentWakeupRequests.companyId, input.run.companyId)));
       }
 
-      await tx
-        .update(issues)
-        .set({
-          executionRunId: null,
-          executionAgentNameKey: null,
-          executionLockedAt: null,
-          updatedAt: input.now,
-        })
-        .where(
-          and(
-            eq(issues.id, input.sourceIssue.id),
-            eq(issues.companyId, input.run.companyId),
-            eq(issues.executionRunId, input.run.id),
-          ),
-        );
+      await releaseIssueRunOwnership(tx, {
+        issueId: input.sourceIssue.id,
+        companyId: input.run.companyId,
+        runId: input.run.id,
+        updatedAt: input.now,
+      });
+
+      // The run is finalized; if it never wrote a status of its own, undo the
+      // `in_progress` its checkout wrote (BLO-20649).
+      await restoreCheckoutPromotedStatus(tx, {
+        issueId: input.sourceIssue.id,
+        companyId: input.run.companyId,
+      });
 
       return updatedRun;
     });
@@ -4435,6 +4568,7 @@ export function recoveryService(
       ? await getAgent(input.issue.assigneeAgentId)
       : null;
     const now = new Date();
+    const boundsAtCreation = wakesOwner ? recoveryActionBoundsAtCreation(now) : null;
 
     // Read existing action before upsert so we can compare lastAttemptAt against
     // issue.lastActivityAt and suppress duplicate non-assignee wakes when nothing changed.
@@ -4512,17 +4646,16 @@ export function recoveryService(
       monitorPolicy: recoveryCause === "provider_quota" && !ownerAgentId
         ? { type: "wait_recovery", retryAgentId: routing.returnOwnerAgentId }
         : null,
-      // BLO-18996: only the wake-an-owner shape gets a budget. The monitor-only and
-      // manual-repair shapes above return no wake plan by design and are expected to sit open
-      // across many sweeps, so giving them a ceiling would manufacture a spurious
-      // exhaustion. `wakesOwner` is the same predicate those early returns implement.
-      maxAttempts: wakesOwner ? STRANDED_RECOVERY_MAX_OWNER_WAKE_ATTEMPTS : null,
-      // The creation-anchored outer horizon for the same shape. `upsertSourceScoped`
-      // preserves an existing `timeoutAt`, so this only takes effect on the insert that
-      // opens the action — which is what makes it immune to the owner ping-pong that
-      // restarts `attemptCount`. Recomputed from `now` on every sweep but discarded on all
-      // but the first, deliberately.
-      timeoutAt: wakesOwner ? new Date(now.getTime() + STRANDED_RECOVERY_OWNER_WAKE_HORIZON_MS) : null,
+      // Only the wake-owner shape gets creation-time bounds. The monitor-only and
+      // manual-repair shapes deliberately remain unbounded because neither path
+      // performs an owner wake — `wakesOwner` (which gates `boundsAtCreation` above) is
+      // the same predicate those early returns implement, so giving those shapes a
+      // ceiling would manufacture a spurious exhaustion. `upsertSourceScoped` preserves
+      // these fields after insertion, so owner churn cannot turn this into a sliding
+      // horizon: the creation-anchored `timeoutAt` is what stays immune to the owner
+      // ping-pong that restarts `attemptCount` (BLO-18996).
+      maxAttempts: boundsAtCreation?.maxAttempts ?? null,
+      timeoutAt: boundsAtCreation?.timeoutAt ?? null,
       lastAttemptAt: now,
     }, executor);
 
@@ -6609,6 +6742,15 @@ export function recoveryService(
       }
 
       let latestRun = await getLatestIssueRun(issue.companyId, issue.id);
+      // `issue_terminal_status` means this queued dispatch was correctly
+      // cancelled while the issue was terminal. The candidate query above has
+      // already established that the issue is non-terminal now, so this is
+      // stale lifecycle evidence rather than a failure to escalate or a reason
+      // to keep skipping the issue forever. Clear it before classification,
+      // but retain the flag so an `in_progress` issue reaches the normal
+      // continuation re-dispatch below instead of the generic no-run skip.
+      const reopenedAfterTerminalDispatchRace = isTerminalDispatchRaceRun(latestRun);
+      if (reopenedAfterTerminalDispatchRace) latestRun = null;
       // Set when this issue's newest run is a handover marker whose successor
       // can no longer be identified. Distinguishes "adopted, then the lock was
       // cleaned up" from "this issue genuinely has no run history at all" —
@@ -7280,7 +7422,8 @@ export function recoveryService(
         !latestRun &&
         !issue.checkoutRunId &&
         !issue.executionRunId &&
-        !adoptionHandoverLostSuccessor
+        !adoptionHandoverLostSuccessor &&
+        !reopenedAfterTerminalDispatchRace
       ) {
         result.skipped += 1;
         continue;

@@ -199,6 +199,11 @@ githubApp:
   # chain silently wedges the PR. Empty (default) -> the server posts no status.
   # Requires the App to hold `statuses: write` on the target repos.
   prReviewGateStatusContext: ""
+  # -- Commit-status context for Ally's comment-shaped consolidated reviews.
+  # Empty (default) leaves this fully inert. When set, mark the same context
+  # required in branch protection so Critical/Important comment findings block
+  # the head they explicitly attest to. Requires `statuses: write`.
+  prCommentReviewGateStatusContext: ""
 
 # -- Pod spec knobs.
 pod:
@@ -414,6 +419,26 @@ serviceMonitor:
   # Example: `[{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: monitoring}}}]`.
   scrapeAllowFromNamespaces: []
 
+# Grafana dashboards shipped as sidecar-adopted ConfigMaps (BLO-20171).
+#
+# Unlike `prometheusRule` below, this is safe to enable on Blockcast: the
+# paperclip-ci-deploy ServiceAccount holds ClusterRole/admin in the release
+# namespace, which covers core `configmaps` but not the monitoring.coreos.com
+# CRDs. See templates/grafana-dashboard.yaml for the full reasoning.
+grafanaDashboard:
+  # -- Render Grafana dashboard ConfigMaps for a `grafana_dashboard`-watching sidecar.
+  enabled: false
+  # -- Label the Grafana dashboard sidecar watches for.
+  sidecarLabel: grafana_dashboard
+  # -- Value that label must carry. Quoted on render because sidecars compare strings.
+  sidecarLabelValue: "1"
+  # -- Grafana datasource **uid** the dashboard panels query. Must be a Prometheus that scrapes the paperclip control plane; `thanos` and `prometheus-monitoring` do not.
+  datasourceUid: cluster
+  # -- Grafana folder to file the dashboard under, via the `grafana_folder` annotation. Empty leaves it in the sidecar's default folder.
+  folder: ""
+  # -- Extra labels to merge onto the dashboard ConfigMaps.
+  extraLabels: {}
+
 # -- Prometheus Operator rules for Paperclip runtime health. Requires the
 # `monitoring.coreos.com/v1` CRDs and the ServiceMonitor scrape above. Disabled
 # by default so the chart still installs on clusters without the operator.
@@ -454,6 +479,8 @@ prometheusRule:
   githubDeliveryDeadLetterWindow: 30m
   # -- How long a non-zero dead-letter rate must persist before firing. Kept short: a dead-lettered delivery is already terminal, so there is nothing to self-resolve.
   githubDeliveryDeadLetterFor: 5m
+  # -- Grafana URL for the review-request delivery funnel dashboard, surfaced on the dead-letter alert so the page carries its own panel link (BLO-20171). Must match the `uid` in dashboards/github-review-request-funnel.json.
+  githubDeliveryDashboardUrl: "https://stats.orc8r.blockcast.net/d/paperclip-review-request-funnel"
   # -- Rolling window for outage-like terminal suppression of GitHub review-request wakes (BLO-18859).
   githubDeliverySuppressionWindow: 30m
   # -- How long outage-like suppression must persist before firing. Same reasoning as the dead-letter alert: suppression is terminal, nothing self-resolves.
@@ -464,6 +491,12 @@ prometheusRule:
   wakeTerminalFailedFor: 5m
   # -- Runbook for the terminal-failed wake alert, linked from its annotation.
   wakeTerminalFailedRunbookUrl: "https://github.com/Blockcast/paperclip/blob/master/runbooks/agent-wakeup-terminal-failed.md"
+  # -- How long an agent's oldest `queued` heartbeat_runs row may sit before firing (BLO-21116). Expressed in SECONDS and compared against paperclip_queued_run_oldest_age_seconds, which carries the real per-agent age -- see wakeTerminalFailedAgeSeconds above for why this is a threshold on an age gauge rather than a `for:` duration over a count. Matches this issue's own AC ("alert firing before the age exceeds ~30m"). Set to 1440 (24m), not 1800 (30m): `for:` below stacks its 5m hold on top of the threshold, so a bare 1800 would not fire until 2100s (35m) of real age -- past the AC. 1440 + 300 = 1740s (29m), same headroom as the matching `Blockcast/onprem-k8s#2013` fix for the rule that actually deploys.
+  queuedRunStrandedAgeSeconds: 1440
+  # -- Scrape-flap tolerance only (BLO-21116). The ageing lives in queuedRunStrandedAgeSeconds above; it stacks on top of that threshold rather than testing independently, which is why the threshold is 1440 and not 1800.
+  queuedRunStrandedFor: 5m
+  # -- Runbook for the queued-run-stranded alert, linked from its annotation.
+  queuedRunStrandedRunbookUrl: "https://github.com/Blockcast/paperclip/blob/master/runbooks/queued-run-stranded.md"
   # -- Prometheus regex of suppression causes that mean an outage rather than a deliberate decline (BLO-18859). Expected policy declines (company.inactive, heartbeat.cooldown.active, heartbeat.disabled, heartbeat.wakeOnDemand.disabled, budget.blocked, agent.not_invokable, heartbeat.worktree_execution_cutoff, issue_tree_hold_active) are excluded so they never page. `other` is included: it is the bucket for a skip reason missing from KNOWN_GITHUB_SUPPRESSION_CAUSES, and an untriaged cause is not a known-good decline.
   githubDeliverySuppressionOutageCauses: "heartbeat.scheduling_suppressed|dispatch_rejected|other"
   # -- Additional PrometheusRule groups appended verbatim.

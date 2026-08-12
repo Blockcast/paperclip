@@ -65,12 +65,17 @@ import {
   issueCommentAuthorTypeSchema,
   issueCommentMetadataSchema,
   issueCommentPresentationSchema,
+  isAgentStatusInvokable,
   isUuidLike,
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
   SYSTEM_ISSUE_DOCUMENT_KEYS,
 } from "@paperclipai/shared";
 import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
 import { incrementBlockerResolvedWakeMetric } from "./blocker-resolved-wake-metrics.js";
+import {
+  checkoutRestoreStatusExpression,
+  restoreCheckoutPromotedStatus,
+} from "./issue-checkout-status.js";
 import { logger } from "../middleware/logger.js";
 import { parseObject } from "../adapters/utils.js";
 import {
@@ -101,6 +106,10 @@ import {
   TERMINAL_HEARTBEAT_RUN_STATUSES,
 } from "./issue-execution-lock.js";
 import { instanceSettingsService } from "./instance-settings.js";
+import {
+  assertNotDuplicatePrReviewIssue,
+  lockPrReviewIssueScopes,
+} from "./pr-review-duplicate-issue-guard.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { redactSensitiveText } from "../redaction.js";
 import { resolveIssueGoalId, resolveNextIssueGoalId } from "./issue-goal-fallback.js";
@@ -3336,6 +3345,7 @@ const issueListSelect = {
   assigneeAgentId: issues.assigneeAgentId,
   assigneeUserId: issues.assigneeUserId,
   checkoutRunId: issues.checkoutRunId,
+  checkoutRestoreStatus: issues.checkoutRestoreStatus,
   executionRunId: issues.executionRunId,
   executionAgentNameKey: issues.executionAgentNameKey,
   executionLockedAt: issues.executionLockedAt,
@@ -6042,6 +6052,7 @@ export function issueService(db: Db) {
           checkoutRunId: input.actorRunId,
           executionRunId: input.actorRunId,
           executionLockedAt: now,
+          checkoutRestoreStatus: checkoutRestoreStatusExpression,
           updatedAt: now,
         })
         .where(
@@ -6175,6 +6186,7 @@ export function issueService(db: Db) {
           checkoutRunId: input.actorRunId,
           executionRunId: input.actorRunId,
           executionLockedAt: now,
+          checkoutRestoreStatus: checkoutRestoreStatusExpression,
           updatedAt: now,
         })
         .where(
@@ -6272,6 +6284,7 @@ export function issueService(db: Db) {
           checkoutRunId: input.actorRunId,
           executionRunId: input.actorRunId,
           executionLockedAt: now,
+          checkoutRestoreStatus: checkoutRestoreStatusExpression,
           updatedAt: now,
         })
         .where(
@@ -6313,7 +6326,7 @@ export function issueService(db: Db) {
         sql`select ${issues.id} from ${issues} where ${issues.id} = ${issueId} for update`,
       );
       const issue = await tx
-        .select({ executionRunId: issues.executionRunId })
+        .select({ executionRunId: issues.executionRunId, companyId: issues.companyId })
         .from(issues)
         .where(eq(issues.id, issueId))
         .then((rows) => rows[0] ?? null);
@@ -6345,6 +6358,10 @@ export function issueService(db: Db) {
         )
         .returning({ id: issues.id })
         .then((rows) => rows[0] ?? null);
+
+      if (updated) {
+        await restoreCheckoutPromotedStatus(tx, { issueId, companyId: issue.companyId });
+      }
 
       return Boolean(updated);
     });
@@ -6500,7 +6517,11 @@ export function issueService(db: Db) {
         sql`select ${issues.id} from ${issues} where ${issues.id} = ${issueId} for update`,
       );
       const issue = await tx
-        .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+        .select({
+          checkoutRunId: issues.checkoutRunId,
+          executionRunId: issues.executionRunId,
+          companyId: issues.companyId,
+        })
         .from(issues)
         .where(eq(issues.id, issueId))
         .then((rows) => rows[0] ?? null);
@@ -6548,6 +6569,10 @@ export function issueService(db: Db) {
         )
         .returning({ id: issues.id })
         .then((rows) => rows[0] ?? null);
+
+      if (updated) {
+        await restoreCheckoutPromotedStatus(tx, { issueId, companyId: issue.companyId });
+      }
 
       return Boolean(updated);
     });
@@ -8525,6 +8550,18 @@ export function issueService(db: Db) {
         return await db.transaction(async (tx) => {
         const idempotencyKey = rawIdempotencyKey?.trim() || null;
         const normalizedTitle = normalizeCreateIssueTitle(issueData.title);
+        if (issueData.assigneeAgentId) {
+          // Acquire the PR scope before the title/idempotency locks below. The
+          // later duplicate check intentionally stays after replay so a prior
+          // successful create remains idempotent while the transaction lock
+          // makes any racing webhook wake visible first.
+          await lockPrReviewIssueScopes(tx, {
+            companyId,
+            assigneeAgentId: issueData.assigneeAgentId,
+            title: issueData.title,
+            description: issueData.description,
+          });
+        }
         if (allowDuplicate === false) {
           const titleGuardKey =
             `issue-create:title:${companyId}:${issueData.parentId ?? "root"}:${normalizedTitle}`;
@@ -8590,6 +8627,20 @@ export function issueService(db: Db) {
           const [enriched] = await withIssueLabels(tx, [existingIssue]);
           const [withRelations] = await withIssueRelationSummaries(companyId, [enriched], tx);
           return withRelations;
+        }
+        if (issueData.assigneeAgentId) {
+          // Guarded here rather than in routes/issues.ts so every create path is
+          // covered — POST /issues, POST /issues/:id/children, and the
+          // accepted-plan decomposition bulk create all funnel through here.
+          // It runs after idempotency/recent-title replay so a successful create
+          // keeps replaying as the same issue instead of turning into a hard
+          // rejection if a live PR review appears between attempts (BLO-20526).
+          await assertNotDuplicatePrReviewIssue(tx, {
+            companyId,
+            assigneeAgentId: issueData.assigneeAgentId,
+            title: issueData.title,
+            description: issueData.description,
+          });
         }
 
         // Create can mutate the same issue graph as update via parentId and
@@ -9028,6 +9079,21 @@ export function issueService(db: Db) {
          */
         expectedCurrentAssigneeAgentId?: string | null;
         /**
+         * BLO-22876 review: the manager-chain reroute grant is conditioned on the
+         * current assignee being *non-invokable*. Unlike the guard above, that
+         * fact lives in `agents`, not `issues`, so no WHERE clause on the target
+         * row can pin it — the route's `agentsSvc.getById()` read and this write
+         * would otherwise straddle a `paused -> running` resume and let a manager
+         * reassign or cancel an issue held by a live report.
+         *
+         * Set to re-read the assignee's row inside this transaction under
+         * `FOR SHARE` and 409 if it has become invokable. The lock is what makes
+         * this a write-time snapshot: a concurrent resume either commits first
+         * (we read the new status and reject) or blocks until we commit (the row
+         * was still non-invokable for the whole write).
+         */
+        expectedCurrentAssigneeAgentNonInvokable?: boolean;
+        /**
          * Pins run ownership that authorized a current-run agent mutation. A force
          * release and checkout transfer can leave status/execution JSON unchanged
          * while replacing the owning run; stale output from the former owner must
@@ -9071,6 +9137,7 @@ export function issueService(db: Db) {
         actorUserId,
         expectedCurrentStatus,
         expectedCurrentAssigneeAgentId,
+        expectedCurrentAssigneeAgentNonInvokable,
         expectedCurrentCheckoutRunId,
         expectedCurrentExecutionRunId,
         expectedCurrentExecutionState,
@@ -9216,6 +9283,15 @@ export function issueService(db: Db) {
         ...issueData,
         updatedAt: new Date(),
       };
+      // An explicit status write means a run (or a human) decided where this
+      // issue belongs, so there is no longer a checkout promotion to undo. Drop
+      // the restore marker and the automatic reset in
+      // `restoreCheckoutPromotedStatus` becomes a no-op — including for a
+      // deliberate write of `in_progress`, which must survive the run that set
+      // it. See BLO-20649.
+      if (issueData.status && issueData.checkoutRestoreStatus === undefined) {
+        patch.checkoutRestoreStatus = null;
+      }
       if (doneTransitionEvidenceVerdict) {
         patch.lastEvidenceVerdict = doneTransitionEvidenceVerdict;
         patch.lastEvidenceVerdictEvaluatedAt = new Date(doneTransitionEvidenceVerdict.evaluatedAt);
@@ -9390,6 +9466,46 @@ export function issueService(db: Db) {
           .where(eq(issues.id, id))
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!lockedExisting) return null;
+
+        // BLO-22876 review: close the invokability time-of-check/time-of-use gap.
+        // The caller's authorization rested on the assignee being non-invokable,
+        // read outside this transaction. Re-read it here under `FOR SHARE`, which
+        // both serializes against a concurrent `paused -> running` resume and
+        // holds that row until we commit, so the status we authorize on is the
+        // status in force for the whole write.
+        if (expectedCurrentAssigneeAgentNonInvokable) {
+          const assigneeAgentId = lockedExisting.assigneeAgentId;
+          if (!assigneeAgentId) {
+            throw conflict("Issue assignee changed before the update could be applied", {
+              issueId: id,
+              currentAssigneeAgentId: null,
+            });
+          }
+          await tx.execute(
+            sql`SELECT ${agents.id} FROM ${agents}
+                WHERE ${eq(agents.id, assigneeAgentId)}
+                FOR SHARE`,
+          );
+          const lockedAssignee = await tx
+            .select({ id: agents.id, companyId: agents.companyId, status: agents.status })
+            .from(agents)
+            .where(eq(agents.id, assigneeAgentId))
+            .then((rows: Array<{ id: string; companyId: string; status: string }>) => rows[0] ?? null);
+          if (
+            !lockedAssignee ||
+            lockedAssignee.companyId !== lockedExisting.companyId ||
+            isAgentStatusInvokable(lockedAssignee.status)
+          ) {
+            throw conflict(
+              "Issue assignee became execution-eligible before the update could be applied",
+              {
+                issueId: id,
+                assigneeAgentId,
+                currentAssigneeAgentStatus: lockedAssignee?.status ?? null,
+              },
+            );
+          }
+        }
 
         let nextProjectId = issueData.projectId !== undefined
           ? issueData.projectId
@@ -9886,6 +10002,7 @@ export function issueService(db: Db) {
             checkoutRunId,
             ...checkoutExecutionPatch,
             status: checkoutStatusForCurrentRow(),
+            checkoutRestoreStatus: checkoutRestoreStatusExpression,
             startedAt: checkoutStartedAtForCurrentRow(now),
             updatedAt: now,
           })
@@ -9962,6 +10079,7 @@ export function issueService(db: Db) {
             .set({
               checkoutRunId,
               ...checkoutExecutionPatch,
+              checkoutRestoreStatus: checkoutRestoreStatusExpression,
               updatedAt: adoptionNow,
             })
             .where(
@@ -10034,6 +10152,7 @@ export function issueService(db: Db) {
                 checkoutRunId,
                 ...checkoutExecutionPatch,
                 status: checkoutStatusForCurrentRow(),
+                checkoutRestoreStatus: checkoutRestoreStatusExpression,
                 updatedAt: now,
               };
               if (current.status !== "in_progress") {
@@ -10122,6 +10241,7 @@ export function issueService(db: Db) {
                   checkoutRunId,
                   ...checkoutExecutionPatch,
                   status: checkoutStatusForCurrentRow(),
+                  checkoutRestoreStatus: checkoutRestoreStatusExpression,
                   startedAt: checkoutStartedAtForCurrentRow(now),
                   updatedAt: now,
                 })
@@ -10409,6 +10529,7 @@ export function issueService(db: Db) {
               checkoutRunId: actorRunId,
               executionRunId: actorRunId,
               executionLockedAt: new Date(),
+              checkoutRestoreStatus: checkoutRestoreStatusExpression,
               updatedAt: new Date(),
             })
             .where(

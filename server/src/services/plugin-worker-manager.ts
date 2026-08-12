@@ -641,6 +641,16 @@ export function createPluginWorkerHandle(
       return companyId ? { companyId } : null;
     }
 
+    // The scheduler dispatches a scheduled job once per company configured
+    // for the plugin (BLO-20957) and stamps that company onto `job.companyId`
+    // for the dispatch. Honor it the same way the other per-method scopes
+    // above are honored, so the job's own company-scoped host calls made
+    // during this invocation succeed instead of being denied.
+    if (method === "runJob" && isRecord(params.job)) {
+      const companyId = readNonEmptyString(params.job.companyId);
+      return companyId ? { companyId } : null;
+    }
+
     return null;
   }
 
@@ -651,10 +661,12 @@ export function createPluginWorkerHandle(
     const derived = deriveInvocationScope(method, params);
     if (derived) return derived;
 
-    // Plugin job declarations predate company-scoped plugin config and remain
-    // instance-level. A worker with exactly one configured company can safely
-    // run those legacy jobs in that sole scope; ambiguous workers stay
-    // instance-scoped and the normal host guards reject company access.
+    // Fallback for runJob callers that don't stamp an explicit per-dispatch
+    // company scope (e.g. a manual "run now" trigger — BLO-20957 only
+    // updated the scheduled-tick dispatch path). A worker with exactly one
+    // configured company can safely run those legacy jobs in that sole
+    // scope; ambiguous workers stay instance-scoped and the normal host
+    // guards reject company access rather than guessing a tenant.
     if (method === "runJob" && options.bootstrapCompanyId) {
       return { companyId: options.bootstrapCompanyId };
     }
