@@ -705,6 +705,248 @@ describe("handleWebhook — dedup on re-fire", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// BLO-24234 — operator suppression is bounded and observable
+//
+// The pre-existing contract (test above) is that an operator closing an alert
+// issue by hand suppresses re-opens. That is deliberate and preserved. What was
+// wrong was that the suppression was *permanent* and *silent*: the re-fire
+// emitted only `firing.deduped`, indistinguishable from a healthy re-fire
+// against an open issue, so a delivered page could produce no visible artifact
+// forever. These tests pin the four decision points.
+// ---------------------------------------------------------------------------
+
+describe("handleWebhook — operator suppression (BLO-24234)", () => {
+  const suppressedState = (
+    overrides: Partial<AlertStateRecord> = {},
+  ): AlertStateRecord => ({
+    paperclipIssueId: "issue-existing",
+    paperclipCompanyId: "company-1",
+    assigneeUserId: "user-42",
+    assigneeAgentId: null,
+    alertname: "CiliumPolicyDropsHigh",
+    severity: "critical",
+    firstSeenAt: "2026-04-29T08:00:00Z",
+    lastFiredAt: "2026-04-29T08:00:00Z",
+    resolvedAt: null,
+    ...overrides,
+  });
+
+  const hoursAgo = (h: number) => new Date(Date.now() - h * 60 * 60 * 1000).toISOString();
+
+  it("stamps the suppression anchor and emits firing.suppressed on first sight", async () => {
+    const { ctx, mocks } = mkCtx();
+    mocks.state.get.mockResolvedValueOnce(suppressedState());
+    mocks.issues.get.mockResolvedValueOnce({ id: "issue-existing", status: "cancelled" });
+
+    await handleWebhook(ctx, baseConfig(), TOKEN, baseInput());
+
+    expect(mocks.issues.update).not.toHaveBeenCalled();
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.firing.suppressed",
+      1,
+      { alertname: "CiliumPolicyDropsHigh", severity: "critical" },
+    );
+    // The anchor must be persisted, or the window can never expire.
+    const written = mocks.state.set.mock.calls.at(-1)?.[1] as AlertStateRecord;
+    expect(written.operatorSuppressedAt).toEqual(expect.any(String));
+    expect(Date.parse(written.operatorSuppressedAt as string)).toBeGreaterThan(0);
+    // A muted fingerprint is a warning, not routine.
+    expect(mocks.logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining("suppressing re-open until"),
+    );
+  });
+
+  it("keeps suppressing — and preserves the original anchor — inside the window", async () => {
+    const { ctx, mocks } = mkCtx();
+    const anchor = hoursAgo(5);
+    mocks.state.get.mockResolvedValueOnce(
+      suppressedState({ operatorSuppressedAt: anchor }),
+    );
+    mocks.issues.get.mockResolvedValueOnce({ id: "issue-existing", status: "cancelled" });
+
+    await handleWebhook(ctx, baseConfig(), TOKEN, baseInput());
+
+    expect(mocks.issues.update).not.toHaveBeenCalled();
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.firing.suppressed",
+      1,
+      expect.any(Object),
+    );
+    // Re-anchoring on every re-fire would make the window slide forever and
+    // recreate the permanent mute this change exists to remove.
+    const written = mocks.state.set.mock.calls.at(-1)?.[1] as AlertStateRecord;
+    expect(written.operatorSuppressedAt).toBe(anchor);
+  });
+
+  it("re-opens once the suppression window expires, with an explanatory comment", async () => {
+    const { ctx, mocks } = mkCtx();
+    mocks.state.get.mockResolvedValueOnce(
+      suppressedState({ operatorSuppressedAt: hoursAgo(25) }),
+    );
+    mocks.issues.get.mockResolvedValueOnce({ id: "issue-existing", status: "cancelled" });
+
+    await handleWebhook(ctx, baseConfig(), TOKEN, baseInput());
+
+    expect(mocks.issues.update).toHaveBeenCalledWith(
+      "issue-existing",
+      expect.objectContaining({ status: "todo" }),
+      "company-1",
+    );
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.firing.suppression_expired",
+      1,
+      { alertname: "CiliumPolicyDropsHigh", severity: "critical" },
+    );
+    expect(mocks.issues.createComment).toHaveBeenCalledWith(
+      "issue-existing",
+      expect.stringContaining("kept firing past"),
+      "company-1",
+    );
+    const written = mocks.state.set.mock.calls.at(-1)?.[1] as AlertStateRecord;
+    expect(written.operatorSuppressedAt).toBeNull();
+  });
+
+  it("re-arms the escalation ladder on a suppression-expiry re-open", async () => {
+    const { ctx, mocks } = mkCtx();
+    mocks.state.get.mockResolvedValueOnce(
+      suppressedState({
+        operatorSuppressedAt: hoursAgo(25),
+        // Frozen while the issue sat closed; a re-open that left these alone
+        // would surface the issue but never page anyone about it again.
+        nextEscalationAt: "2026-04-29T09:00:00Z",
+        escalationComplete: true,
+      }),
+    );
+    mocks.issues.get.mockResolvedValueOnce({ id: "issue-existing", status: "cancelled" });
+
+    await handleWebhook(ctx, baseConfig(), TOKEN, baseInput());
+
+    const written = mocks.state.set.mock.calls.at(-1)?.[1] as AlertStateRecord;
+    expect(written.nextEscalationAt).not.toBe("2026-04-29T09:00:00Z");
+    expect(Date.parse(written.nextEscalationAt as string)).toBeGreaterThan(Date.now());
+  });
+
+  it("suppresses indefinitely when operatorSuppressionHours=0", async () => {
+    const { ctx, mocks } = mkCtx();
+    const config = { ...baseConfig(), operatorSuppressionHours: 0 };
+    mocks.state.get.mockResolvedValueOnce(
+      suppressedState({ operatorSuppressedAt: hoursAgo(24 * 365) }),
+    );
+    mocks.issues.get.mockResolvedValueOnce({ id: "issue-existing", status: "cancelled" });
+
+    await handleWebhook(ctx, config, TOKEN, baseInput());
+
+    expect(mocks.issues.update).not.toHaveBeenCalled();
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.firing.suppressed",
+      1,
+      expect.any(Object),
+    );
+  });
+
+  it("clears a stale suppression anchor once the issue is open again", async () => {
+    const { ctx, mocks } = mkCtx();
+    mocks.state.get.mockResolvedValueOnce(
+      suppressedState({ operatorSuppressedAt: hoursAgo(5) }),
+    );
+    mocks.issues.get.mockResolvedValueOnce({ id: "issue-existing", status: "in_progress" });
+
+    await handleWebhook(ctx, baseConfig(), TOKEN, baseInput());
+
+    // Body refresh, no status change — the ordinary re-fire path.
+    const updatePatch = mocks.issues.update.mock.calls[0][1];
+    expect(updatePatch.status).toBeUndefined();
+    // A carried-over anchor would let a later close inherit an already-expired
+    // window and re-open immediately, defeating the operator's decision.
+    const written = mocks.state.set.mock.calls.at(-1)?.[1] as AlertStateRecord;
+    expect(written.operatorSuppressedAt).toBeNull();
+  });
+
+  it("re-anchors rather than muting forever when the anchor is unparseable", async () => {
+    const { ctx, mocks } = mkCtx();
+    mocks.state.get.mockResolvedValueOnce(
+      suppressedState({ operatorSuppressedAt: "not-a-timestamp" }),
+    );
+    mocks.issues.get.mockResolvedValueOnce({ id: "issue-existing", status: "cancelled" });
+
+    await handleWebhook(ctx, baseConfig(), TOKEN, baseInput());
+
+    const written = mocks.state.set.mock.calls.at(-1)?.[1] as AlertStateRecord;
+    expect(Date.parse(written.operatorSuppressedAt as string)).toBeGreaterThan(0);
+  });
+
+  it("reports a re-fire whose tracked issue has vanished", async () => {
+    const { ctx, mocks } = mkCtx();
+    mocks.state.get.mockResolvedValueOnce(suppressedState());
+    mocks.issues.get.mockResolvedValueOnce(null);
+
+    await handleWebhook(ctx, baseConfig(), TOKEN, baseInput());
+
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.firing.issue_missing",
+      1,
+      { alertname: "CiliumPolicyDropsHigh", severity: "critical" },
+    );
+    expect(mocks.issues.update).not.toHaveBeenCalled();
+  });
+
+  it("does not bank a suppression anchor when the issue RPC failed", async () => {
+    const { ctx, mocks } = mkCtx();
+    mocks.state.get.mockResolvedValueOnce(suppressedState());
+    mocks.issues.get.mockRejectedValueOnce(new Error("issues.get exploded"));
+
+    await handleWebhook(ctx, baseConfig(), TOKEN, baseInput());
+
+    // Persisting an anchor off a call that never landed would start the
+    // suppression clock on a status nobody actually observed.
+    const written = mocks.state.set.mock.calls.at(-1)?.[1] as AlertStateRecord;
+    expect(written.operatorSuppressedAt).toBeNull();
+  });
+
+  it("restarts the ladder on resolve→re-fire even when the issue is already open", async () => {
+    // Regression guard: an operator can re-open the issue by hand between the
+    // resolve and the re-fire, which makes this a plain description refresh
+    // rather than a plugin re-open. `handleResolved` has still nulled
+    // `nextEscalationAt` and set `escalationComplete`, so gating the ladder
+    // restart on the re-open branch would leave this alert permanently
+    // un-escalatable.
+    const { ctx, mocks } = mkCtx();
+    mocks.state.get.mockResolvedValueOnce(
+      suppressedState({
+        resolvedAt: "2026-04-29T09:00:00Z",
+        nextEscalationAt: null,
+        escalationComplete: true,
+        escalationAttempt: 3,
+      }),
+    );
+    mocks.issues.get.mockResolvedValueOnce({ id: "issue-existing", status: "todo" });
+
+    await handleWebhook(ctx, baseConfig(), TOKEN, baseInput());
+
+    const written = mocks.state.set.mock.calls.at(-1)?.[1] as AlertStateRecord;
+    expect(written.escalationComplete).toBe(false);
+    expect(written.escalationAttempt).toBe(0);
+    expect(Date.parse(written.nextEscalationAt as string)).toBeGreaterThan(Date.now());
+  });
+
+  it("preserves the suppression anchor when the issue could not be read", async () => {
+    const { ctx, mocks } = mkCtx();
+    const anchor = hoursAgo(5);
+    mocks.state.get.mockResolvedValueOnce(
+      suppressedState({ operatorSuppressedAt: anchor }),
+    );
+    mocks.issues.get.mockResolvedValueOnce(null);
+
+    await handleWebhook(ctx, baseConfig(), TOKEN, baseInput());
+
+    // Dropping it would restart the window on the next readable re-fire,
+    // extending the mute past what the operator's close bought.
+    const written = mocks.state.set.mock.calls.at(-1)?.[1] as AlertStateRecord;
+    expect(written.operatorSuppressedAt).toBe(anchor);
+  });
+});
+
 describe("handleWebhook — resolved", () => {
   it("posts a comment when autoCloseOnResolve=false", async () => {
     const { ctx, mocks } = mkCtx();
