@@ -11,6 +11,7 @@ import { describe, expect, it, vi, beforeEach } from "vitest";
 import {
   AlertDeliveryIncompleteError,
   WebhookUnauthorizedError,
+  decideRefire,
   handleWebhook,
   verifyBearerToken,
 } from "../webhook-handler.js";
@@ -1850,5 +1851,142 @@ describe("BLO-20467 — firing retries are idempotent across create/state-write"
     };
     expect(persisted.nextEscalationAt).toEqual(expect.any(String));
     expect(persisted.escalationComplete).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// decideRefire — the re-fire decision table as a pure function (BLO-24234)
+//
+// The handler tests above drive these branches through a whole webhook
+// delivery, which is the right level for asserting side effects (metrics,
+// comments, state writes). These assert the decision itself, so the table in
+// the README has a direct, cheap counterpart in code — and so a future change
+// to the branch order fails here with an obvious diff rather than as a
+// surprising side effect three layers up.
+// ---------------------------------------------------------------------------
+
+describe("decideRefire", () => {
+  const NOW = Date.parse("2026-05-01T12:00:00Z");
+  const cfg = (hours?: number): AlertmanagerPluginConfig => ({
+    defaultCompanyId: "company-1",
+    ...(hours === undefined ? {} : { operatorSuppressionHours: hours }),
+  });
+  const ago = (h: number) => new Date(NOW - h * 60 * 60 * 1000).toISOString();
+
+  it("refreshes any non-terminal issue regardless of suppression state", () => {
+    for (const status of ["todo", "in_progress", "in_review", "blocked"]) {
+      expect(
+        decideRefire({ status }, { resolvedAt: null, operatorSuppressedAt: ago(99) }, cfg(), NOW),
+      ).toEqual({ kind: "refresh" });
+    }
+  });
+
+  it("re-opens a terminal issue the plugin closed on resolve", () => {
+    for (const status of ["done", "cancelled"]) {
+      expect(
+        decideRefire({ status }, { resolvedAt: ago(1), operatorSuppressedAt: null }, cfg(), NOW),
+      ).toEqual({ kind: "reopen", reason: "plugin_resolved" });
+    }
+  });
+
+  it("suppresses an operator close, anchoring on first observation", () => {
+    expect(
+      decideRefire({ status: "cancelled" }, { resolvedAt: null, operatorSuppressedAt: null }, cfg(), NOW),
+    ).toEqual({
+      kind: "suppressed",
+      suppressedAt: new Date(NOW).toISOString(),
+      firstObservation: true,
+    });
+  });
+
+  it("keeps the original anchor while inside the window", () => {
+    const anchor = ago(23);
+    expect(
+      decideRefire({ status: "cancelled" }, { resolvedAt: null, operatorSuppressedAt: anchor }, cfg(), NOW),
+    ).toEqual({ kind: "suppressed", suppressedAt: anchor, firstObservation: false });
+  });
+
+  it("re-opens once the window has elapsed", () => {
+    expect(
+      decideRefire({ status: "cancelled" }, { resolvedAt: null, operatorSuppressedAt: ago(24) }, cfg(), NOW),
+    ).toEqual({ kind: "reopen", reason: "suppression_expired" });
+  });
+
+  it("treats the boundary as expired, not as still-suppressed", () => {
+    // Exactly 24h. `>=` matters: a `>` here would leave a re-fire landing on
+    // the tick suppressed for another whole window.
+    const anchor = new Date(NOW - 24 * 60 * 60 * 1000).toISOString();
+    expect(
+      decideRefire({ status: "cancelled" }, { resolvedAt: null, operatorSuppressedAt: anchor }, cfg(), NOW).kind,
+    ).toBe("reopen");
+  });
+
+  it("honours a custom window", () => {
+    const existing = { resolvedAt: null, operatorSuppressedAt: ago(2) };
+    expect(decideRefire({ status: "cancelled" }, existing, cfg(1), NOW).kind).toBe("reopen");
+    expect(decideRefire({ status: "cancelled" }, existing, cfg(4), NOW).kind).toBe("suppressed");
+  });
+
+  it("never expires when operatorSuppressionHours is 0", () => {
+    expect(
+      decideRefire(
+        { status: "cancelled" },
+        { resolvedAt: null, operatorSuppressedAt: ago(24 * 365) },
+        cfg(0),
+        NOW,
+      ).kind,
+    ).toBe("suppressed");
+  });
+
+  it("falls back to the default window for nonsense settings", () => {
+    // A negative or NaN setting must not read as 0 ("mute forever") — that
+    // would turn a config typo into a silently unpageable alert.
+    for (const bad of [-5, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(
+        decideRefire(
+          { status: "cancelled" },
+          { resolvedAt: null, operatorSuppressedAt: ago(25) },
+          cfg(bad),
+          NOW,
+        ).kind,
+      ).toBe("reopen");
+    }
+  });
+
+  it("re-anchors an unparseable anchor instead of muting forever", () => {
+    expect(
+      decideRefire(
+        { status: "cancelled" },
+        { resolvedAt: null, operatorSuppressedAt: "garbage" },
+        cfg(),
+        NOW,
+      ),
+    ).toEqual({
+      kind: "suppressed",
+      suppressedAt: new Date(NOW).toISOString(),
+      firstObservation: true,
+    });
+  });
+
+  it("reports a missing issue", () => {
+    for (const missing of [null, undefined]) {
+      expect(
+        decideRefire(missing, { resolvedAt: ago(1), operatorSuppressedAt: null }, cfg(), NOW),
+      ).toEqual({ kind: "issue_missing" });
+    }
+  });
+
+  it("prefers the plugin-resolved re-open over suppression when both could apply", () => {
+    // A row carrying both a resolve and a stale anchor is a close→re-fire→
+    // close→resolve history. The resolve is the more recent fact, so this must
+    // not be read as an operator mute.
+    expect(
+      decideRefire(
+        { status: "cancelled" },
+        { resolvedAt: ago(1), operatorSuppressedAt: ago(2) },
+        cfg(),
+        NOW,
+      ),
+    ).toEqual({ kind: "reopen", reason: "plugin_resolved" });
   });
 });
