@@ -9425,6 +9425,8 @@ export interface HeartbeatServiceOptions {
    * background executeRun's finally-block transactions. Production unaffected.
    */
   skipQueuedRunDispatch?: boolean;
+  /** Test-only hook for exercising the monitor select/claim race. */
+  issueMonitorClaimHook?: (issueId: string) => Promise<void>;
   /**
    * Node role for this process (mirrors config.paperclipNodeRole; wired from
    * index.ts). On the "api" tier, run dispatch (claim + `executeRun`) is fenced
@@ -11582,6 +11584,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     let recovered = 0;
 
     for (const due of expiredMonitors) {
+      await options.issueMonitorClaimHook?.(due.id);
       const claimed = await db.transaction(async (tx) => {
         if (!await tryLockIssueMonitorQueue(tx)) return null;
         const [updated] = await tx
@@ -11594,6 +11597,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             and(
               eq(issues.id, due.id),
               isNull(issues.monitorNextCheckAt),
+              isNull(issues.assigneeUserId),
+              sql`${issues.assigneeAgentId} is not null`,
+              inArray(issues.status, ["in_progress", "in_review"]),
               expiredMonitorTimeoutCondition,
               or(
                 isNull(issues.monitorWakeRequestedAt),
