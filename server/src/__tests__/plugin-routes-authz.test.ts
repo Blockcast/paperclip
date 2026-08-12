@@ -47,6 +47,23 @@ vi.mock("../services/live-events.js", () => ({
   publishGlobalLiveEvent: vi.fn(),
 }));
 
+/**
+ * The plugin-config write path runs its read/modify/write inside one
+ * transaction guarded by `pg_advisory_xact_lock` (BLO-26529), so the fake `db`
+ * these suites pass has to offer `transaction`. Each test here drives a single
+ * request at a time, so running the callback inline against a no-op `execute`
+ * models it faithfully; the concurrent interleaving that lock exists for is
+ * covered by `plugin-config-write-race.test.ts`.
+ */
+function withTransactionSupport(db: unknown) {
+  const candidate = (db ?? {}) as Record<string, unknown>;
+  if (typeof candidate.transaction === "function") return candidate;
+  return {
+    ...candidate,
+    transaction: async (fn: (tx: unknown) => Promise<unknown>) => fn({ execute: async () => {} }),
+  };
+}
+
 async function createApp(
   actor: Record<string, unknown>,
   loaderOverrides: Record<string, unknown> = {},
@@ -89,7 +106,7 @@ async function createApp(
     next();
   });
   app.use("/api", pluginRoutes(
-    (routeOverrides.db ?? {}) as never,
+    withTransactionSupport(routeOverrides.db ?? {}) as never,
     loader as never,
     routeOverrides.jobDeps as never,
     undefined,
