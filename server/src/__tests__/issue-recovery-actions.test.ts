@@ -4527,7 +4527,13 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       expect(heartbeatComments[0]!.body).toContain("external_lifecycle_stale_killed");
     });
 
-    it("does not post a second heartbeat when user code already ran before stranding", async () => {
+    // BLO-24543: `lastUsefulActionAt` is too permissive to gate this on -- a
+    // single early activity event (e.g. checkout) sets it without the run ever
+    // reaching the runbook's own emission step. This is the literal BLO-21235
+    // shape and must post a receipt: it fails against #1203's original
+    // `lastUsefulActionAt IS NOT NULL` predicate (which returned early and
+    // posted nothing here) and passes against the receipt-absence predicate.
+    it("posts a heartbeat when lastUsefulActionAt is set but no receipt exists on the alert surface (BLO-21235 shape)", async () => {
       const { companyId, managerId, coderId, prefix } = await seedCompany();
       const { alertIssueId, routineId } = await seedRoutineWithAlertSurface({
         companyId,
@@ -4544,9 +4550,9 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         issueNumber: 502,
       });
 
-      // Evidence the agent actually ran and did work -- this is what a normal
-      // completion, or a run that reached the runbook's own in-run failure
-      // heartbeat, both leave behind.
+      // A single early activity event sets `lastUsefulActionAt` -- almost
+      // certainly the checkout, not an emission -- and the run still strands
+      // without ever reaching the runbook's emission step.
       await db.insert(heartbeatRuns).values({
         id: randomUUID(),
         companyId,
@@ -4580,8 +4586,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       });
 
       // The source issue still gets the ordinary recovery-owner escalation
-      // comment -- only the cross-post to the routine's alert surface is
-      // suppressed.
+      // comment, in addition to the scheduler receipt on the alert surface.
       const sourceComments = await db
         .select({ id: issueComments.id })
         .from(issueComments)
@@ -4589,10 +4594,82 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       expect(sourceComments.length).toBeGreaterThan(0);
 
       const alertSurfaceComments = await db
-        .select({ id: issueComments.id })
+        .select({ body: issueComments.body, idempotencyKey: issueComments.idempotencyKey })
         .from(issueComments)
         .where(eq(issueComments.issueId, alertIssueId));
-      expect(alertSurfaceComments).toHaveLength(0);
+      expect(alertSurfaceComments).toHaveLength(1);
+      const windowKey = triggeredAt.toISOString();
+      expect(alertSurfaceComments[0]!.idempotencyKey).toBe(
+        `scheduler-heartbeat:${routineId}:${windowKey}`,
+      );
+      expect(alertSurfaceComments[0]!.body).toContain("carried no");
+      expect(alertSurfaceComments[0]!.body).toContain(`agent-health:${windowKey}:*`);
+      expect(alertSurfaceComments[0]!.body).toContain("run_crashed");
+    });
+
+    // Control case for the receipt-absence predicate: a window that already
+    // has the runbook's own normal emission on the alert surface must not get
+    // a second, scheduler-side receipt -- regardless of `lastUsefulActionAt`.
+    it("does not post a heartbeat when the window already carries a normal agent-health receipt", async () => {
+      const { companyId, managerId, coderId, prefix } = await seedCompany();
+      const { alertIssueId, routineId } = await seedRoutineWithAlertSurface({
+        companyId,
+        prefix,
+        assigneeAgentId: managerId,
+      });
+      const triggeredAt = new Date("2026-08-06T12:00:00.000Z");
+      const { issue } = await seedRoutineExecutionIssue({
+        companyId,
+        prefix,
+        assigneeAgentId: coderId,
+        routineId,
+        triggeredAt,
+        issueNumber: 503,
+      });
+      const windowKey = triggeredAt.toISOString();
+
+      // The runbook already emitted its own normal receipt for this window
+      // before the issue stranded (e.g. a retry ran the runbook to
+      // completion, then a later duplicate sweep still stranded the original
+      // issue).
+      await db.insert(issueComments).values({
+        id: randomUUID(),
+        companyId,
+        issueId: alertIssueId,
+        authorType: "system",
+        body: "Agent health sweep completed normally for this window.",
+        idempotencyKey: `agent-health:${windowKey}:c722100afingerprint`,
+      });
+
+      const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
+      const recovery = recoveryService(db, { enqueueWakeup });
+      const staleKillRun = {
+        id: randomUUID(),
+        agentId: coderId,
+        status: "failed",
+        error: "External lifecycle Job stale-killed",
+        errorCode: "external_lifecycle_stale_killed",
+        contextSnapshot: { retryReason: "issue_continuation_needed" },
+        livenessState: null,
+        resultJson: null,
+        usageJson: null,
+        createdAt: new Date(),
+      } as const;
+      await recovery.escalateStrandedAssignedIssue({
+        issue,
+        previousStatus: "in_progress",
+        latestRun: staleKillRun,
+      });
+
+      const alertSurfaceComments = await db
+        .select({ idempotencyKey: issueComments.idempotencyKey })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, alertIssueId));
+      // Only the pre-seeded normal emission -- no scheduler receipt added,
+      // and no window ever carries both a normal emission that pre-dates the
+      // strand and a scheduler receipt.
+      expect(alertSurfaceComments).toHaveLength(1);
+      expect(alertSurfaceComments[0]!.idempotencyKey).toBe(`agent-health:${windowKey}:c722100afingerprint`);
     });
   });
 

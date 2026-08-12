@@ -17,6 +17,13 @@ export const RECOVERY_KEY_PREFIXES = {
   schedulerFailureHeartbeat: "scheduler-heartbeat",
 } as const;
 
+// BLO-24543: the routine runbook's own free-text idempotency-key convention
+// for a normal emission on its alert surface (`agent-health:<windowKey>:<fingerprint>`).
+// This is a per-runbook convention this service does not own -- see the
+// namespace ruling below -- so it is kept separate from RECOVERY_KEY_PREFIXES,
+// which are keys this service is allowed to WRITE. This one is READ-only.
+export const AGENT_HEALTH_RECEIPT_KEY_PREFIX = "agent-health";
+
 export type RecoveryOriginKind = typeof RECOVERY_ORIGIN_KINDS[keyof typeof RECOVERY_ORIGIN_KINDS];
 export type RecoveryReasonKind = typeof RECOVERY_REASON_KINDS[keyof typeof RECOVERY_REASON_KINDS];
 export type RecoveryKeyPrefix = typeof RECOVERY_KEY_PREFIXES[keyof typeof RECOVERY_KEY_PREFIXES];
@@ -78,4 +85,15 @@ export function buildSchedulerFailureHeartbeatKey(input: {
     input.routineId,
     input.windowKey,
   ].join(":");
+}
+
+// BLO-24543: SQL LIKE pattern for "this window already has a normal
+// emission." `windowKey` is an ISO-8601 timestamp (no `%`/`_` wildcard
+// characters), so this is a literal prefix match, not a real glob. Reading
+// this prefix is the receipt-absence predicate itself -- it replaces the old
+// `lastUsefulActionAt IS NOT NULL` proxy, which was too permissive: a run can
+// set that column off a single early activity event (e.g. checkout) and then
+// still strand before ever reaching the runbook's own emission step.
+export function buildAgentHealthReceiptKeyLikePattern(windowKey: string) {
+  return `${AGENT_HEALTH_RECEIPT_KEY_PREFIX}:${windowKey}:%`;
 }
