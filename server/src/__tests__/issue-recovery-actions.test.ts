@@ -4123,14 +4123,13 @@ describeEmbeddedPostgres("issue recovery actions", () => {
 
     // Ally's review of PR #824: the sibling test above deliberately leaves the
     // dead adopter holding the lock, so it never exercises what production
-    // actually does next. `clearCheckoutRunIfTerminal` nulls BOTH lock columns
-    // once the adopter is terminal (services/issues.ts) — after which
-    // `getCheckoutAdoptingRun` has no run id to resolve and returns null. The
-    // handover marker is still the newest run scoped to this issue and always
-    // will be, so without the successor-less branch every later sweep walks the
-    // same path and the no-run/no-lock guard skips the issue forever: a genuine
-    // strand that never gets recovered.
-    it("recovers the adopted issue after the adopter terminates and production cleanup clears the lock", async () => {
+    // actually does next. Terminal cleanup now clears both lock columns and
+    // restores the queue status captured by checkout (BLO-20649). For a legacy
+    // in-progress row with no marker, adoption captures `todo` as the fallback,
+    // so recovery must use the normal assigned-todo dispatch instead of reading
+    // the cancelled handover marker as a spent continuation or stranding the
+    // issue with no successor.
+    it("restores and re-dispatches the adopted issue after the adopter terminates", async () => {
       const { companyId, coderId, sourceIssueId, adoptingRunId } = await seedAdoptedCheckout({
         adoptingRunStatus: "running",
       });
@@ -4150,29 +4149,42 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       // so the test fails if that helper's clearing behaviour ever changes.
       await expect(issueService(db).clearCheckoutRunIfTerminal(sourceIssueId)).resolves.toBe(true);
       const [afterCleanup] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
-      expect(afterCleanup).toMatchObject({ checkoutRunId: null, executionRunId: null });
+      expect(afterCleanup).toMatchObject({
+        status: "todo",
+        checkoutRunId: null,
+        checkoutRestoreStatus: null,
+        executionRunId: null,
+      });
 
       const enqueueWakeup = vi.fn(async () => null);
       const recovery = recoveryService(db, { enqueueWakeup });
       const result = await recovery.reconcileStrandedAssignedIssues();
 
-      // Recovered, not skipped: the assignee is woken to continue its own
-      // issue. The wake call is the signal rather than `continuationRequeued`,
-      // because the mocked `enqueueWakeup` returns null and the counter only
-      // moves on a truthy queue result.
+      // Recovered, not skipped: restoration puts the issue back through normal
+      // assigned-todo liveness. The wake call is the signal because the mocked
+      // `enqueueWakeup` returns null and the counter only moves on a truthy
+      // queue result.
       expect(result).toMatchObject({ escalated: 0 });
       expect(enqueueWakeup).toHaveBeenCalledWith(
         coderId,
         expect.objectContaining({
-          reason: "issue_continuation_needed",
-          payload: expect.objectContaining({ issueId: sourceIssueId }),
+          source: "assignment",
+          reason: "issue_assigned",
+          payload: expect.objectContaining({
+            issueId: sourceIssueId,
+            mutation: "assigned_todo_liveness_dispatch",
+          }),
+          contextSnapshot: expect.objectContaining({
+            issueId: sourceIssueId,
+            source: "issue.assigned_todo_liveness_dispatch",
+          }),
         }),
       );
       // And still no escalation citing the handover marker as the cause.
       expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
       const [afterSweep] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
       expect(afterSweep).toMatchObject({
-        status: "in_progress",
+        status: "todo",
         assigneeAgentId: coderId,
       });
     });

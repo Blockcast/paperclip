@@ -196,6 +196,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     status?: string;
     livenessState?: string | null;
     usageJson?: Record<string, unknown> | null;
+    logBytes?: number | null;
   }) {
     const runs: Array<typeof heartbeatRuns.$inferInsert> = [];
     for (let index = 0; index < input.count; index += 1) {
@@ -215,6 +216,7 @@ describeEmbeddedPostgres("productivity review service", () => {
           : { issueId: input.issueId, taskId: input.issueId },
         livenessState: input.livenessState !== undefined ? input.livenessState : "advanced",
         usageJson: input.usageJson !== undefined ? input.usageJson : undefined,
+        logBytes: input.logBytes !== undefined ? input.logBytes : undefined,
         nextAction: "Continue processing the next batch.",
         createdAt,
         updatedAt: createdAt,
@@ -457,6 +459,227 @@ describeEmbeddedPostgres("productivity review service", () => {
       status: "failed",
       livenessState: "failed",
       usageJson: { inputTokens: 500, outputTokens: 200 },
+    });
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const reviews = await listProductivityReviews(seeded.companyId);
+    expect(reviews).toHaveLength(1);
+    expect(reviews[0]?.description).toContain("Primary trigger: `no_comment_streak`");
+    expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 10");
+    expect(reviews[0]?.description).toContain("Runtime-failure streak (terminal, never-executed runs): 0");
+  });
+
+  // BLO-22097: a post-model failure whose result event never arrives leaves
+  // `usageJson: null` even though the model produced output — null usage is
+  // unknown, not a measured zero. `logBytes` far above the boilerplate-only
+  // ceiling corroborates that a turn actually ran, so the run must count
+  // toward `no_comment_streak` rather than being dropped from the walk as
+  // never-executed.
+  it("counts a claude_truncated-shaped run (null usage, high logBytes) toward the no-comment streak (BLO-22097)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+      status: "failed",
+      livenessState: "failed",
+      usageJson: null,
+      logBytes: 844_801,
+    });
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const reviews = await listProductivityReviews(seeded.companyId);
+    expect(reviews).toHaveLength(1);
+    expect(reviews[0]?.description).toContain("Primary trigger: `no_comment_streak`");
+    expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 10");
+    expect(reviews[0]?.description).toContain("Runtime-failure streak (terminal, never-executed runs): 0");
+  });
+
+  // BLO-22097 positive control: a large log does not override an *explicit*
+  // measured zero. 111,337 bytes is the largest confirmed-zero-usage log
+  // observed across the BLO-19924/BLO-21091/BLO-21025 samples — `logBytes`
+  // must not promote this run out of never-executed just because it is big.
+  it("still excludes an explicit-zero-usage run from the no-comment streak even at the 111,337-byte logBytes boundary (BLO-22097 positive control)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+      status: "failed",
+      livenessState: "failed",
+      usageJson: { inputTokens: 0, outputTokens: 0 },
+      logBytes: 111_337,
+    });
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const reviews = await listProductivityReviews(seeded.companyId);
+    expect(reviews).toHaveLength(1);
+    expect(reviews[0]?.description).toContain("Primary trigger: `runtime_failure_streak`");
+    expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 0");
+    expect(reviews[0]?.description).toContain("Runtime-failure streak (terminal, never-executed runs): 10");
+  });
+
+  // BLO-22097 positive control: null usage plus null logBytes (never
+  // dispatched / crashlooped before any log was captured) must keep
+  // classifying as never-executed — the #1041 false-positive fix must not
+  // regress just because the corroboration path is new.
+  it("still excludes a null-usage, null-logBytes crashloop run from the no-comment streak (BLO-22097 positive control)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+      status: "failed",
+      livenessState: "failed",
+      usageJson: null,
+      logBytes: null,
+    });
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const reviews = await listProductivityReviews(seeded.companyId);
+    expect(reviews).toHaveLength(1);
+    expect(reviews[0]?.description).toContain("Primary trigger: `runtime_failure_streak`");
+    expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 0");
+    expect(reviews[0]?.description).toContain("Runtime-failure streak (terminal, never-executed runs): 10");
+    // BLO-22097 Ally follow-up: usage was never recorded for this run — the
+    // evidence must not claim a measured "0 input/output tokens".
+    expect(reviews[0]?.description).toContain(
+      "usage telemetry unavailable — low/missing log volume consistent with no model turn",
+    );
+    expect(reviews[0]?.description).not.toContain("0 input/output tokens");
+    // BLO-22097 Ally follow-up: an inferred basis must not assert the
+    // definitive "produced zero model turns" / "never given a chance to act"
+    // claims — those are only true for a measured basis. The trigger reason
+    // and Manager Decision text must both use hedged wording instead.
+    expect(reviews[0]?.description).toContain(
+      "consecutive terminal runs show no evidence of a model turn",
+    );
+    expect(reviews[0]?.description).not.toContain("produced zero model turns");
+    expect(reviews[0]?.description).toContain(
+      "consistent with the assignee never being given a chance to act, though missing usage telemetry means this cannot be confirmed",
+    );
+    expect(reviews[0]?.description).not.toContain("the assignee was never given a chance to act.");
+  });
+
+  // BLO-22097 Ally follow-up: a streak that mixes an explicit measured zero
+  // with missing-usage runs must report the "mixed" basis, and the
+  // trigger/manager-facing claims must stay hedged (not the definitive
+  // "measured" wording) since not every run in the streak is actually
+  // measured.
+  it("reports a mixed usage basis with hedged wording for a streak mixing measured-zero and inferred runs (BLO-22097)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    const streak = DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS;
+    const runs: Array<typeof heartbeatRuns.$inferInsert> = [];
+    for (let index = 0; index < streak; index += 1) {
+      const createdAt = new Date(now.getTime() - index * 60_000);
+      runs.push({
+        id: randomUUID(),
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        status: "failed",
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        startedAt: createdAt,
+        finishedAt: new Date(createdAt.getTime() + 30_000),
+        contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+        livenessState: "failed",
+        // Alternate between an explicit measured zero and missing usage so
+        // the streak walk sees both bases.
+        usageJson: index % 2 === 0 ? { inputTokens: 0, outputTokens: 0 } : null,
+        logBytes: index % 2 === 0 ? 500 : null,
+        nextAction: "Continue processing the next batch.",
+        createdAt,
+        updatedAt: createdAt,
+      });
+    }
+    await db.insert(heartbeatRuns).values(runs);
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const reviews = await listProductivityReviews(seeded.companyId);
+    expect(reviews).toHaveLength(1);
+    expect(reviews[0]?.description).toContain("Primary trigger: `runtime_failure_streak`");
+    expect(reviews[0]?.description).toContain(`Runtime-failure streak (terminal, never-executed runs): ${streak}`);
+    expect(reviews[0]?.description).toContain(
+      "usage telemetry unavailable for some runs (low/missing log volume consistent with no model turn), explicit 0 input/output tokens for the rest",
+    );
+    expect(reviews[0]?.description).toContain(
+      "consecutive terminal runs show no evidence of a model turn",
+    );
+    expect(reviews[0]?.description).not.toContain("produced zero model turns");
+    expect(reviews[0]?.description).toContain(
+      "consistent with the assignee never being given a chance to act, though missing usage telemetry means this cannot be confirmed",
+    );
+    expect(reviews[0]?.description).not.toContain("the assignee was never given a chance to act.");
+  });
+
+  // BLO-22097 Ally follow-up: pin the inclusive boundary of
+  // `NEVER_EXECUTED_UNKNOWN_USAGE_LOG_BYTES_CEILING` (200,000 bytes) itself,
+  // through a null-usage run rather than the explicit-zero-usage boundary
+  // control above (which bypasses this comparison entirely).
+  it("still excludes a null-usage run from the no-comment streak at the 200,000-byte logBytes ceiling, inclusive (BLO-22097)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+      status: "failed",
+      livenessState: "failed",
+      usageJson: null,
+      logBytes: 200_000,
+    });
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const reviews = await listProductivityReviews(seeded.companyId);
+    expect(reviews).toHaveLength(1);
+    expect(reviews[0]?.description).toContain("Primary trigger: `runtime_failure_streak`");
+    expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 0");
+    expect(reviews[0]?.description).toContain("Runtime-failure streak (terminal, never-executed runs): 10");
+  });
+
+  it("counts a null-usage run toward the no-comment streak one byte past the 200,000-byte logBytes ceiling (BLO-22097)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+      status: "failed",
+      livenessState: "failed",
+      usageJson: null,
+      logBytes: 200_001,
     });
 
     const service = productivityReviewService(db);
@@ -1266,6 +1489,143 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(result.created).toBe(1);
     const [review] = await listProductivityReviews(seeded.companyId);
     expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+  });
+
+  // BLO-23248/BLO-22331: a capacity-class `scheduled_retry` (fleet
+  // ccrotate/penstock model-provider exhaustion) clears `issue.executionRunId`
+  // to null the moment it is scheduled (`scheduleBoundedRetryForRun` in
+  // heartbeat.ts), so the BLO-19848 `nonLiveExecutionHoldSince` clamp above
+  // — which only sees a hold via `issue.executionRunId` — never engages for
+  // this state and the whole park counts as unattended. These fixtures
+  // reproduce that exact state (heartbeat run present and issue-scoped via
+  // `contextSnapshot`, but `issue.executionRunId` left null) rather than
+  // using `pinExecutionRun`, which sets the pointer this bug is about the
+  // absence of.
+  async function insertCapacityScheduledRetryRun(input: {
+    companyId: string;
+    agentId: string;
+    issueId: string;
+    createdAt: Date;
+    scheduledRetryAt: Date;
+    scheduledRetryReason?: string | null;
+    errorCode?: string | null;
+  }) {
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId: input.companyId,
+      agentId: input.agentId,
+      status: "scheduled_retry",
+      invocationSource: "automation",
+      triggerDetail: "system",
+      errorCode: input.errorCode ?? "rate_limit_exhausted",
+      scheduledRetryAt: input.scheduledRetryAt,
+      scheduledRetryAttempt: 0,
+      scheduledRetryReason: input.scheduledRetryReason ?? "ccrotate_capacity",
+      contextSnapshot: { issueId: input.issueId, taskId: input.issueId },
+      createdAt: input.createdAt,
+      updatedAt: input.createdAt,
+    });
+    return { runId };
+  }
+
+  it("does not fire long_active_duration while a capacity-class scheduled_retry is still due in the future, even though issue.executionRunId is null (BLO-23248/BLO-22331)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const episodeStart = new Date(now.getTime() - 7 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: episodeStart });
+    await insertCapacityScheduledRetryRun({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      createdAt: episodeStart,
+      scheduledRetryAt: new Date(now.getTime() + 5 * 24 * 60 * 60 * 1000),
+    });
+    // Sanity: reproduce the reported bug state directly — the issue's
+    // execution pointer is null while a live scheduled_retry row exists for it.
+    const [issueRow] = await db.select().from(issues).where(eq(issues.id, seeded.issueId));
+    expect(issueRow?.executionRunId).toBeNull();
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  it("still fires long_active_duration once an overdue capacity retry sits unpromoted, naming the capacity stall rather than the assignee (BLO-22331 no-indefinite-suppression guard)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const episodeStart = new Date(now.getTime() - 7 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: episodeStart });
+    const { runId } = await insertCapacityScheduledRetryRun({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      createdAt: episodeStart,
+      // Due an hour ago and never promoted/dispatched: a genuinely wedged
+      // retry chain, which BLO-22331's AC requires to remain reviewable
+      // rather than suppressed forever.
+      scheduledRetryAt: new Date(now.getTime() - 60 * 60 * 1000),
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+    expect(review?.description).toContain("capacity-stalled behind an overdue");
+    expect(review?.description).toContain("fleet-capacity signal, not assignee inactivity");
+    expect(review?.description).toContain(`run \`${runId}\``);
+    expect(review?.description).toContain(`Capacity-stall accounting:`);
+  });
+
+  it("surfaces the capacity-stalled bucket in evidence and does not let long_active_duration ride along when a different trigger fires (BLO-23248 AC)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const episodeStart = new Date(now.getTime() - 7 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: episodeStart });
+    // 10 terminal, turn-executing runs with no comments — trips
+    // no_comment_streak on its own, independent of the capacity retry.
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now: episodeStart,
+    });
+    // The most recent run for the issue is the still-future capacity retry —
+    // `latestRuns[0]`, so it (not the older terminal runs) drives
+    // `capacityGating`. It must be STRICTLY newer than every streak run:
+    // `insertRuns` stamps its newest row at exactly `now`, so seeding this at
+    // `episodeStart` too tied the head of the `desc(createdAt), desc(id)`
+    // ordering, leaving the winner to be decided by which `randomUUID()` sorted
+    // higher — a ~50/50 flake that passed locally and failed in CI.
+    // `scheduled_retry` is in ACTIVE_RUN_STATUSES, not TERMINAL_RUN_STATUSES, so
+    // moving it later keeps it out of the `no_comment_streak` walk unchanged.
+    await insertCapacityScheduledRetryRun({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      createdAt: new Date(episodeStart.getTime() + 60_000),
+      scheduledRetryAt: new Date(now.getTime() + 5 * 24 * 60 * 60 * 1000),
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    // no_comment_streak fired on its own merits; long_active_duration was
+    // eligible on elapsed time (7h > default 6h threshold) but suppressed.
+    expect(review?.description).toContain("Primary trigger: `no_comment_streak`");
+    expect(review?.description).not.toContain("Primary trigger: `long_active_duration`");
+    expect(review?.description).toContain("Capacity-stall accounting:");
+    expect(review?.description).toContain("capacity-stalled");
   });
 
   it("suppresses long-active productivity reviews for deliberate future monitor waits", async () => {

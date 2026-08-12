@@ -36,6 +36,7 @@ import { logger } from "../../middleware/logger.js";
 import { isPidAlive, isProcessGroupAlive, terminateLocalService } from "../local-service-supervisor.js";
 import { redactCurrentUserText } from "../../log-redaction.js";
 import { redactSensitiveText } from "../../redaction.js";
+import { PROVIDER_CAPACITY_MAX_HORIZON_MS } from "../provider-capacity-horizon-bound.js";
 import { logActivity } from "../activity-log.js";
 import { budgetService } from "../budgets.js";
 import { instanceSettingsService } from "../instance-settings.js";
@@ -44,7 +45,8 @@ import {
   isVerifiedIssueTreeControlInteractionWake,
   issueTreeControlService,
 } from "../issue-tree-control.js";
-import { TERMINAL_HEARTBEAT_RUN_STATUSES, issueService } from "../issues.js";
+import { TERMINAL_HEARTBEAT_RUN_STATUSES, externalWaitFromDescription, issueService } from "../issues.js";
+import { releaseIssueRunOwnership, restoreCheckoutPromotedStatus } from "../issue-checkout-status.js";
 import {
   applyIssueMonitorPolicyTransition,
   derivePersistedMonitorState,
@@ -505,10 +507,15 @@ const PROVIDER_CAPACITY_RESET_INSTANT_PATTERN =
   /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
 
 // The horizon was advertised during the run that recorded it, and the write side
-// caps an accepted horizon at 24h past finalization. Bound the read lower side
-// by run creation and the upper side by run finish (falling back to creation)
-// so long-running jobs can still report a horizon parsed near the end.
-const PROVIDER_CAPACITY_RESET_MAX_SKEW_MS = 24 * 60 * 60 * 1000;
+// caps an accepted horizon at PROVIDER_CAPACITY_MAX_HORIZON_MS past
+// finalization. Bound the read lower side by run creation and the upper side by
+// run finish (falling back to creation) so long-running jobs can still report a
+// horizon parsed near the end.
+//
+// This is the SAME constant the writer caps with, deliberately — an over-cap
+// park lands exactly on the upper bound below, so the two diverging would
+// silently refuse every such horizon on read.
+const PROVIDER_CAPACITY_RESET_MAX_SKEW_MS = PROVIDER_CAPACITY_MAX_HORIZON_MS;
 
 type ProviderCapacityResetBounds = {
   lowerBoundAt: Date | null;
@@ -560,6 +567,12 @@ function readProviderCapacityResetProvenance(resultJson: Record<string, unknown>
   return {
     errorFamily: family,
     observedStatusCode: normalizeHttpStatusCode(provenance.observedStatusCode),
+    // BLO-18285: present only when the run parked at the horizon cap rather
+    // than on the instant the provider named. `providerCapacityResetAt` is then
+    // OUR checkpoint, not the provider's claim — so any sentence attributing it
+    // to the provider has to use this field instead, or it states something the
+    // provider never said.
+    advertisedResetAt: readNonEmptyString(provenance.advertisedResetAt) ?? null,
   };
 }
 
@@ -574,6 +587,11 @@ type ProviderCapacityResetRead = {
   // signal — neither implies a 429 capacity event, so neither may be reported
   // as one.
   is429Capacity: boolean;
+  // BLO-18285: set when `resetAt` is our capped checkpoint rather than the
+  // provider's own instant. Distinguishing them keeps the strand comment
+  // honest: at the checkpoint the ADVERTISED window has not elapsed, so the
+  // "that horizon has since elapsed" wording below would be simply untrue.
+  advertisedResetAt: string | null;
 };
 
 function readProviderCapacityResetAt(
@@ -590,12 +608,18 @@ function readProviderCapacityResetAt(
   const explicit = provenance
     ? canonicalizeCapacityResetInstant(resultJson.providerCapacityResetAt, bounds)
     : null;
-  if (explicit) return { resetAt: explicit, is429Capacity: provenance?.observedStatusCode === 429 };
+  if (explicit) {
+    return {
+      resetAt: explicit,
+      is429Capacity: provenance?.observedStatusCode === 429,
+      advertisedResetAt: provenance?.advertisedResetAt ?? null,
+    };
+  }
 
   const advertised =
     canonicalizeCapacityResetInstant(resultJson.retryNotBefore, bounds) ??
     canonicalizeCapacityResetInstant(resultJson.transientRetryNotBefore, bounds);
-  return advertised ? { resetAt: advertised, is429Capacity: false } : null;
+  return advertised ? { resetAt: advertised, is429Capacity: false, advertisedResetAt: null } : null;
 }
 
 export function summarizeRunFailureForIssueComment(run: LatestIssueRun, now = Date.now()) {
@@ -636,6 +660,41 @@ export function summarizeRunFailureForIssueComment(run: LatestIssueRun, now = Da
   const capacityReset = readProviderCapacityResetAt(run);
   if (capacityReset) {
     const suffix = errorCode ? ` (surfaced as \`${errorCode}\`)` : "";
+
+    // BLO-18285: an over-cap park. `resetAt` here is OUR checkpoint, not the
+    // provider's instant, so it must not be attributed to the provider — and
+    // the elapsed-horizon branch below must not fire on it, because reaching
+    // the checkpoint says nothing about the advertised window, which is still
+    // open by construction. Report both numbers and what each one means.
+    if (capacityReset.advertisedResetAt) {
+      const cause =
+        `provider capacity throttle (429) — the provider advertised a capacity reset at ` +
+        `${capacityReset.advertisedResetAt}, further out than we are willing to park on a single ` +
+        `unverified estimate`;
+      // Same cadence problem as the advertised-horizon branch below: a sweep
+      // routinely reads this run long after it failed. Past our own checkpoint
+      // the present tense is simply false — there is no live park left to
+      // describe — and "it parks again" would promise a retry path that only
+      // exists if something actually re-ran. Both readings sent operators
+      // waiting on a park that had already lapsed.
+      //
+      // What stays unclaimed past the checkpoint is whether the *advertised*
+      // window reopened: the checkpoint is our bound, not the provider's, so
+      // reaching it is no evidence either way. Hence "recheck", not "expired".
+      const checkpointAtMs = Date.parse(capacityReset.resetAt);
+      const checkpointStillAhead = Number.isFinite(checkpointAtMs) && checkpointAtMs > now;
+      return checkpointStillAhead
+        ? ` Latest retry failure: ${cause}${suffix}. The run is parked until ${capacityReset.resetAt} ` +
+            `to recheck capacity rather than waiting out the full advertised window; if the throttle is ` +
+            `still in force then, it parks again. This is transient and self-healing — the issue is ` +
+            `waiting on provider capacity, not on a broken runtime.`
+        : ` Latest retry failure: ${cause}${suffix}. Paperclip capped the park at ` +
+            `${capacityReset.resetAt}, and that checkpoint has since passed, so this is no longer a ` +
+            `live park. Reaching our own checkpoint says nothing about whether the advertised window ` +
+            `reopened — recheck current provider capacity and whether a further retry was actually ` +
+            `scheduled before either waiting on this window or diagnosing a different blocker.`;
+    }
+
     const cause = capacityReset.is429Capacity
       ? `provider capacity throttle (429) — the provider advertised a capacity reset at ${capacityReset.resetAt}`
       : `provider rate-limit/quota window — the provider advertised availability no earlier than ${capacityReset.resetAt}`;
@@ -1751,6 +1810,32 @@ export function recoveryService(
           eq(agentWakeupRequests.status, "queued"),
           sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
           agentId ? eq(agentWakeupRequests.agentId, agentId) : sql`true`,
+        ),
+      )
+      .limit(1)
+      .then((rows) => Boolean(rows[0]));
+  }
+
+  async function hasQueuedExecutionReviewParticipantRecoveryWake(
+    companyId: string,
+    issueId: string,
+    participantAgentId: string,
+    stageId: string,
+  ) {
+    return db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.companyId, companyId),
+          eq(agentWakeupRequests.agentId, participantAgentId),
+          eq(agentWakeupRequests.status, "queued"),
+          eq(agentWakeupRequests.reason, EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON),
+          sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
+          sql`coalesce(
+            ${agentWakeupRequests.payload} ->> 'currentStageId',
+            ${agentWakeupRequests.payload} -> 'executionStage' ->> 'stageId'
+          ) = ${stageId}`,
         ),
       )
       .limit(1)
@@ -2895,21 +2980,19 @@ export function recoveryService(
           .where(and(eq(agentWakeupRequests.id, input.run.wakeupRequestId), eq(agentWakeupRequests.companyId, input.run.companyId)));
       }
 
-      await tx
-        .update(issues)
-        .set({
-          executionRunId: null,
-          executionAgentNameKey: null,
-          executionLockedAt: null,
-          updatedAt: input.now,
-        })
-        .where(
-          and(
-            eq(issues.id, input.sourceIssue.id),
-            eq(issues.companyId, input.run.companyId),
-            eq(issues.executionRunId, input.run.id),
-          ),
-        );
+      await releaseIssueRunOwnership(tx, {
+        issueId: input.sourceIssue.id,
+        companyId: input.run.companyId,
+        runId: input.run.id,
+        updatedAt: input.now,
+      });
+
+      // The run is finalized; if it never wrote a status of its own, undo the
+      // `in_progress` its checkout wrote (BLO-20649).
+      await restoreCheckoutPromotedStatus(tx, {
+        issueId: input.sourceIssue.id,
+        companyId: input.run.companyId,
+      });
 
       return updatedRun;
     });
@@ -6432,10 +6515,22 @@ export function recoveryService(
         }
 
         const participantContinuationClassification = classifyContinuationFailure(participantLatestRun);
+        const queuedParticipantRecovery = agentInvokable
+          ? await hasQueuedExecutionReviewParticipantRecoveryWake(
+              issue.companyId,
+              issue.id,
+              participantAgentId,
+              pendingExecutionState.currentStageId,
+            )
+          : false;
         if (
           isUnsuccessfulTerminalIssueRun(participantLatestRun) &&
           participantContinuationClassification.kind === "non_retryable"
         ) {
+          if (queuedParticipantRecovery) {
+            result.skipped += 1;
+            continue;
+          }
           if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, participantLatestRun)) {
             result.skipped += 1;
             continue;
@@ -6532,6 +6627,11 @@ export function recoveryService(
           } else {
             result.skipped += 1;
           }
+          continue;
+        }
+
+        if (queuedParticipantRecovery) {
+          result.skipped += 1;
           continue;
         }
 
@@ -7269,6 +7369,10 @@ export function recoveryService(
           lastActivityAt: issues.lastActivityAt,
           monitorNextCheckAt: issues.monitorNextCheckAt,
           monitorAttemptCount: issues.monitorAttemptCount,
+          // BLO-24662: only used to derive the `hasExternalWaitOwner` boolean below. The
+          // prose itself never reaches the classifier — a description can carry
+          // external-wait details that are redacted on read.
+          description: issues.description,
         })
         .from(issues)
         .where(
@@ -7416,7 +7520,10 @@ export function recoveryService(
     });
 
     return classifyIssueGraphLiveness({
-      issues: issueRows,
+      issues: issueRows.map(({ description, ...issue }) => ({
+        ...issue,
+        hasExternalWaitOwner: externalWaitFromDescription(description ?? null) !== null,
+      })),
       relations: relationRows,
       agents: agentRows,
       activeRuns: activeRunRows.map((row) => ({
@@ -8358,6 +8465,114 @@ export function recoveryService(
   }
 
   /**
+   * BLO-24662: move recovery actions that have burned their wake horizon out of `active`.
+   *
+   * `strandedRecoveryWakeAttemptsExhausted` already makes every sweep skip these, and
+   * `escalateStrandedAssignedIssue` posts a one-time "horizon reached" notice — but only
+   * on a pass that re-escalates the same issue. Once an issue stops being a candidate for
+   * that sweep, nothing runs again and the row keeps reporting `status: "active"` forever:
+   * a recovery that spent its entire window without a single attempt, indistinguishable
+   * from one that is working. BLO-20995 sat that way at `attemptCount: 0 / 5` for 13h.
+   *
+   * This is the missing unconditional pass. It is independent of liveness findings and of
+   * the source issue's status, and — like the wake backstop beside it — stays enabled when
+   * automatic liveness escalation is off, because it re-routes an already-committed action
+   * rather than creating recovery work.
+   */
+  async function reconcileExpiredRecoveryWakeHorizons(opts?: {
+    runId?: string | null;
+    companyId?: string | null;
+    now?: Date;
+    limit?: number;
+  }) {
+    const result = { checked: 0, escalated: 0, announced: 0, actionIds: [] as string[], issueIds: [] as string[] };
+    const now = opts?.now ?? new Date();
+
+    const expired = await recoveryActionsSvc.escalateExpiredWakeHorizons({
+      now,
+      companyId: opts?.companyId ?? null,
+      limit: opts?.limit,
+    });
+    result.checked = expired.length;
+    if (expired.length === 0) return result;
+
+    for (const action of expired) {
+      result.escalated += 1;
+      result.actionIds.push(action.id);
+      result.issueIds.push(action.sourceIssueId);
+
+      logger.warn(
+        {
+          actionId: action.id,
+          companyId: action.companyId,
+          sourceIssueId: action.sourceIssueId,
+          cause: action.cause,
+          ownerAgentId: action.ownerAgentId,
+          attemptCount: action.attemptCount,
+          maxAttempts: action.maxAttempts,
+          timeoutAt: action.timeoutAt,
+          runId: opts?.runId ?? null,
+        },
+        "recovery action passed its wake horizon and was escalated out of active",
+      );
+
+      // Same marker text and the same exact-match dedup as the notice in
+      // `escalateStrandedAssignedIssue`, so whichever path gets there first wins and the
+      // other stays quiet — the operator sees one horizon notice per action, not two.
+      const horizonAt = action.timeoutAt instanceof Date
+        ? action.timeoutAt.toISOString()
+        : String(action.timeoutAt);
+      const marker = `Recovery wake horizon reached for action \`${action.id}\` (horizon \`${horizonAt}\`)`;
+      const alreadyAnnounced = await db
+        .select({ id: issueComments.id })
+        .from(issueComments)
+        .where(and(
+          eq(issueComments.issueId, action.sourceIssueId),
+          eq(issueComments.authorType, "system"),
+          sql`${issueComments.body} LIKE ${`%${escapeLikePattern(marker)}%`} ESCAPE '\\'`,
+        ))
+        .limit(1)
+        .then((rows) => rows.length > 0);
+      if (alreadyAnnounced) continue;
+
+      try {
+        await issuesSvc.addComment(
+          action.sourceIssueId,
+          [
+            `${marker}.`,
+            "",
+            "This recovery action passed its auto-recovery horizon without being discharged, so Paperclip has " +
+              "stopped waking anyone for it and has moved it out of `active` to `escalated`. It now needs a human " +
+              "or a board operator to resolve it.",
+            "",
+            `- Attempts: ${action.attemptCount} (budget ${action.maxAttempts})`,
+            `- Auto-recovery horizon: ${horizonAt}`,
+            `- Cause: \`${action.cause}\``,
+            action.attemptCount === 0
+              ? "- Note: this action never made a single wake attempt before its window closed, so the stranding it " +
+                "was opened to repair was never actually worked."
+              : "- Note: reassigning will NOT restore the wake budget — the horizon above is fixed for the life of " +
+                "the action, so a new owner does not get fresh attempts.",
+            "- Next action: discharge or cancel this recovery action, or record an intentional manual resolution.",
+          ].join("\n"),
+          {},
+          { authorType: "system" },
+        );
+        result.announced += 1;
+      } catch (error) {
+        // The status transition is the load-bearing half and is already committed; a failed
+        // comment must not roll it back or abort the rest of the batch.
+        logger.warn(
+          { err: error, actionId: action.id, sourceIssueId: action.sourceIssueId },
+          "failed to announce recovery wake horizon expiry on source issue",
+        );
+      }
+    }
+
+    return result;
+  }
+
+  /**
    * Retries delivery for a blocked issue whose active recovery action committed but whose
    * owner wake did not. Review-stage escalation intentionally dispatches after committing
    * its stage-row transaction; a process exit or enqueue failure in that gap must therefore
@@ -8673,6 +8888,9 @@ export function recoveryService(
       strandedRecoveryWakeDeferredOrFailed: 0,
       strandedRecoveryWakeEnqueueFailed: 0,
       strandedRecoveryWakeIssueIds: [] as string[],
+      expiredRecoveryHorizonsEscalated: 0,
+      expiredRecoveryHorizonsAnnounced: 0,
+      expiredRecoveryHorizonIssueIds: [] as string[],
       issueIds: [] as string[],
       escalationIssueIds: [] as string[],
       retiredRecoveryIssueIds: obsoleteRecoveryCleanup.retiredIssueIds,
@@ -8708,6 +8926,18 @@ export function recoveryService(
     result.strandedRecoveryWakeDeferredOrFailed = strandedRecoveryWakeBackstop.deferredOrFailed;
     result.strandedRecoveryWakeEnqueueFailed = strandedRecoveryWakeBackstop.enqueueFailed;
     result.strandedRecoveryWakeIssueIds = strandedRecoveryWakeBackstop.issueIds;
+
+    // Also independent of liveness findings, and for the same reason: this only retires an
+    // already-committed action that has stopped waking anyone, so it must keep running when
+    // automatic liveness escalation is disabled. It is the pass that stops a spent recovery
+    // from reading as healthy (BLO-24662).
+    const expiredHorizons = await reconcileExpiredRecoveryWakeHorizons({
+      runId: opts?.runId ?? null,
+      now,
+    });
+    result.expiredRecoveryHorizonsEscalated = expiredHorizons.escalated;
+    result.expiredRecoveryHorizonsAnnounced = expiredHorizons.announced;
+    result.expiredRecoveryHorizonIssueIds = expiredHorizons.issueIds;
 
     if (!autoRecoveryEnabled) {
       result.skippedAutoRecoveryDisabled = findings.length;
@@ -9734,6 +9964,7 @@ export function recoveryService(
     buildIssueGraphLivenessAutoRecoveryPreview,
     reconcileResolvedDependencyWakeBackstop,
     reconcileStrandedRecoveryWakeBackstop,
+    reconcileExpiredRecoveryWakeHorizons,
     reconcileIssueGraphLiveness,
     readRecoveryTimerIntervalMs,
   };

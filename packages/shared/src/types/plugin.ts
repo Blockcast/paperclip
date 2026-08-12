@@ -54,6 +54,34 @@ export type JsonSchema = {
    * `x-paperclip-advanced` is not true.
    */
   "x-paperclip-group"?: string;
+  /**
+   * Marks a property as secret-bearing, so the host masks its value in every
+   * config API response and restores the stored value when an unchanged masked
+   * payload is posted back (BLO-20794).
+   *
+   * Use this to cover an ordinary `type: "string"` credential without moving it
+   * to `format: "secret-ref"`. The standard `writeOnly: true` keyword is
+   * honoured identically; prefer this marker when `writeOnly`'s other form
+   * semantics are unwanted.
+   *
+   * Setting it to `false` opts the property out of the host's key-name
+   * heuristic — use it for a field whose name looks credential-ish (`token`,
+   * `secret`, …) but whose value is not sensitive.
+   */
+  "x-paperclip-secret"?: boolean;
+  /**
+   * Names the property that immutably identifies an entry of this array, e.g.
+   * `items: { "x-paperclip-identity": "id" }`.
+   *
+   * Declaring it is a promise that the named property never changes for a given
+   * entry. That promise is what lets the host restore a masked secret onto an
+   * entry that moved or was edited (BLO-20871). Without it, a masked array entry
+   * is restored only when the array is otherwise byte-identical, and any
+   * reorder, insertion, deletion or edit forces the operator to re-enter the
+   * secret — deliberately, because an inferred identity can re-home a live
+   * credential onto the wrong entry.
+   */
+  "x-paperclip-identity"?: string;
   [key: string]: unknown;
 };
 

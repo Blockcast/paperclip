@@ -1,0 +1,66 @@
+{{/*
+  Grafana dashboard for the GitHub review-request delivery funnel (BLO-20171).
+
+  WHY THIS IS A ConfigMap AND NOT A PrometheusRule-SHAPED NO-OP
+  -------------------------------------------------------------
+  Read templates/prometheusrule.yaml first: that resource is disabled on
+  Blockcast because the paperclip-ci-deploy ServiceAccount has no RBAC on
+  prometheusrules.monitoring.coreos.com, so enabling it 403s the whole
+  release. This template is NOT in that trap, and the difference was verified
+  rather than assumed:
+
+    paperclip-ci-deploy is bound to ClusterRole/admin in the paperclip
+    namespace (RoleBinding paperclip-ci-deploy-admin). The built-in admin role
+    covers core resources including configmaps; it does NOT cover the
+    monitoring.coreos.com CRDs, which is exactly why the PrometheusRule fails
+    and this does not.
+
+  HOW IT REACHES GRAFANA
+  ----------------------
+  The cluster's operator Grafana (orc8r-user-grafana in production-orc8r) runs
+  a kiwigrid/k8s-sidecar dashboard watcher configured with:
+
+      LABEL=grafana_dashboard   LABEL_VALUE=1   RESOURCE=configmap
+      NAMESPACE=ALL             METHOD=WATCH
+
+  NAMESPACE=ALL is the load-bearing part: the sidecar adopts a labelled
+  ConfigMap from ANY namespace, so this renders into the paperclip release
+  namespace and needs no change in the orc8r chart or its namespace. Verified
+  against the live Deployment on 2026-08-08.
+
+  DATASOURCE
+  ----------
+  Pinned by uid to `cluster` (http://prometheus.monitoring.svc:9090), which is
+  the only datasource on that Grafana that can see paperclip_* series. It is
+  provisioned in the grafana-datasources ConfigMap and was confirmed live via
+  Grafana's own API on 2026-08-08 -- an earlier read of BLO-21025 assumed this
+  datasource still had to be added, and that assumption was stale. Do not
+  retarget this at `thanos` or `prometheus-monitoring`: neither scrapes the
+  paperclip control plane, so the dashboard would render "No data".
+
+  The JSON lives in dashboards/ and is loaded with .Files.Get rather than being
+  templated inline, because Grafana legendFormat uses {{ label }} syntax that
+  Helm would otherwise try to evaluate. Only the datasource uid is substituted.
+*/}}
+{{- if .Values.grafanaDashboard.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "paperclip.fullname" . }}-grafana-dashboard-review-request-funnel
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "paperclip.labels" . | nindent 4 }}
+    {{ .Values.grafanaDashboard.sidecarLabel }}: {{ .Values.grafanaDashboard.sidecarLabelValue | quote }}
+    {{- with .Values.grafanaDashboard.extraLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with .Values.grafanaDashboard.folder }}
+  annotations:
+    grafana_folder: {{ . | quote }}
+  {{- end }}
+data:
+  github-review-request-funnel.json: |
+    {{- .Files.Get "dashboards/github-review-request-funnel.json"
+          | replace "__PAPERCLIP_DS_UID__" .Values.grafanaDashboard.datasourceUid
+          | nindent 4 }}
+{{- end }}

@@ -71,6 +71,10 @@ import {
 } from "@paperclipai/shared";
 import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
 import { incrementBlockerResolvedWakeMetric } from "./blocker-resolved-wake-metrics.js";
+import {
+  checkoutRestoreStatusExpression,
+  restoreCheckoutPromotedStatus,
+} from "./issue-checkout-status.js";
 import { logger } from "../middleware/logger.js";
 import { parseObject } from "../adapters/utils.js";
 import {
@@ -3336,6 +3340,7 @@ const issueListSelect = {
   assigneeAgentId: issues.assigneeAgentId,
   assigneeUserId: issues.assigneeUserId,
   checkoutRunId: issues.checkoutRunId,
+  checkoutRestoreStatus: issues.checkoutRestoreStatus,
   executionRunId: issues.executionRunId,
   executionAgentNameKey: issues.executionAgentNameKey,
   executionLockedAt: issues.executionLockedAt,
@@ -4038,7 +4043,13 @@ async function listSuccessfulRunHandoffMapForIssues(
     : hydrateSuccessfulRunHandoffLiveness(dbOrTx, companyId, states);
 }
 
-function externalWaitFromDescription(description: string | null): { owner: string; action: string } | null {
+/**
+ * Parses the `external owner:` / `external action:` pair an agent writes into a
+ * description to park an issue on a human gate. Exported so the liveness sweep can see
+ * the same signal (BLO-24662) — a gate narrated in prose is still a gate, and without it
+ * the `blocked_without_blockers` rule reads deliberate parking as a dead end.
+ */
+export function externalWaitFromDescription(description: string | null): { owner: string; action: string } | null {
   if (!description) return null;
   const owner = description.match(/^\s*external owner\s*:\s*(.+)$/im)?.[1]?.trim();
   const action = description.match(/^\s*external action\s*:\s*(.+)$/im)?.[1]?.trim();
@@ -4373,6 +4384,7 @@ async function listIssueBlockedInboxAttentionMap(
       executionState: issue.executionState,
       monitorNextCheckAt: issue.monitorNextCheckAt,
       monitorAttemptCount: issue.monitorAttemptCount,
+      hasExternalWaitOwner: externalWaitFromDescription(issue.description ?? null) !== null,
     })),
     relations: graphRelations,
     agents: companyAgents,
@@ -4553,6 +4565,8 @@ async function listIssueBlockedInboxAttentionMap(
                 return "Assign active owner";
               case "blocked_by_cancelled_issue":
                 return "Replace blocker";
+              case "blocked_without_blockers":
+                return "Give it a next action";
               case "invalid_review_participant":
                 return "Repair review participant";
               case "in_review_without_action_path":
@@ -6033,6 +6047,7 @@ export function issueService(db: Db) {
           checkoutRunId: input.actorRunId,
           executionRunId: input.actorRunId,
           executionLockedAt: now,
+          checkoutRestoreStatus: checkoutRestoreStatusExpression,
           updatedAt: now,
         })
         .where(
@@ -6166,6 +6181,7 @@ export function issueService(db: Db) {
           checkoutRunId: input.actorRunId,
           executionRunId: input.actorRunId,
           executionLockedAt: now,
+          checkoutRestoreStatus: checkoutRestoreStatusExpression,
           updatedAt: now,
         })
         .where(
@@ -6263,6 +6279,7 @@ export function issueService(db: Db) {
           checkoutRunId: input.actorRunId,
           executionRunId: input.actorRunId,
           executionLockedAt: now,
+          checkoutRestoreStatus: checkoutRestoreStatusExpression,
           updatedAt: now,
         })
         .where(
@@ -6304,7 +6321,7 @@ export function issueService(db: Db) {
         sql`select ${issues.id} from ${issues} where ${issues.id} = ${issueId} for update`,
       );
       const issue = await tx
-        .select({ executionRunId: issues.executionRunId })
+        .select({ executionRunId: issues.executionRunId, companyId: issues.companyId })
         .from(issues)
         .where(eq(issues.id, issueId))
         .then((rows) => rows[0] ?? null);
@@ -6336,6 +6353,10 @@ export function issueService(db: Db) {
         )
         .returning({ id: issues.id })
         .then((rows) => rows[0] ?? null);
+
+      if (updated) {
+        await restoreCheckoutPromotedStatus(tx, { issueId, companyId: issue.companyId });
+      }
 
       return Boolean(updated);
     });
@@ -6491,7 +6512,11 @@ export function issueService(db: Db) {
         sql`select ${issues.id} from ${issues} where ${issues.id} = ${issueId} for update`,
       );
       const issue = await tx
-        .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+        .select({
+          checkoutRunId: issues.checkoutRunId,
+          executionRunId: issues.executionRunId,
+          companyId: issues.companyId,
+        })
         .from(issues)
         .where(eq(issues.id, issueId))
         .then((rows) => rows[0] ?? null);
@@ -6539,6 +6564,10 @@ export function issueService(db: Db) {
         )
         .returning({ id: issues.id })
         .then((rows) => rows[0] ?? null);
+
+      if (updated) {
+        await restoreCheckoutPromotedStatus(tx, { issueId, companyId: issue.companyId });
+      }
 
       return Boolean(updated);
     });
@@ -9196,6 +9225,15 @@ export function issueService(db: Db) {
         ...issueData,
         updatedAt: new Date(),
       };
+      // An explicit status write means a run (or a human) decided where this
+      // issue belongs, so there is no longer a checkout promotion to undo. Drop
+      // the restore marker and the automatic reset in
+      // `restoreCheckoutPromotedStatus` becomes a no-op — including for a
+      // deliberate write of `in_progress`, which must survive the run that set
+      // it. See BLO-20649.
+      if (issueData.status && issueData.checkoutRestoreStatus === undefined) {
+        patch.checkoutRestoreStatus = null;
+      }
       if (doneTransitionEvidenceVerdict) {
         patch.lastEvidenceVerdict = doneTransitionEvidenceVerdict;
         patch.lastEvidenceVerdictEvaluatedAt = new Date(doneTransitionEvidenceVerdict.evaluatedAt);
@@ -9832,6 +9870,7 @@ export function issueService(db: Db) {
             checkoutRunId,
             ...checkoutExecutionPatch,
             status: checkoutStatusForCurrentRow(),
+            checkoutRestoreStatus: checkoutRestoreStatusExpression,
             startedAt: checkoutStartedAtForCurrentRow(now),
             updatedAt: now,
           })
@@ -9908,6 +9947,7 @@ export function issueService(db: Db) {
             .set({
               checkoutRunId,
               ...checkoutExecutionPatch,
+              checkoutRestoreStatus: checkoutRestoreStatusExpression,
               updatedAt: adoptionNow,
             })
             .where(
@@ -9980,6 +10020,7 @@ export function issueService(db: Db) {
                 checkoutRunId,
                 ...checkoutExecutionPatch,
                 status: checkoutStatusForCurrentRow(),
+                checkoutRestoreStatus: checkoutRestoreStatusExpression,
                 updatedAt: now,
               };
               if (current.status !== "in_progress") {
@@ -10068,6 +10109,7 @@ export function issueService(db: Db) {
                   checkoutRunId,
                   ...checkoutExecutionPatch,
                   status: checkoutStatusForCurrentRow(),
+                  checkoutRestoreStatus: checkoutRestoreStatusExpression,
                   startedAt: checkoutStartedAtForCurrentRow(now),
                   updatedAt: now,
                 })
@@ -10355,6 +10397,7 @@ export function issueService(db: Db) {
               checkoutRunId: actorRunId,
               executionRunId: actorRunId,
               executionLockedAt: new Date(),
+              checkoutRestoreStatus: checkoutRestoreStatusExpression,
               updatedAt: new Date(),
             })
             .where(

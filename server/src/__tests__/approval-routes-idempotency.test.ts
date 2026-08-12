@@ -1152,6 +1152,27 @@ describe("approval routes idempotent retries", () => {
     expect(mockIssueApprovalService.linkManyForApproval).not.toHaveBeenCalled();
   });
 
+  it("blocks planning-only recovery from creating even board-escalation approvals", async () => {
+    const res = await request(await createAgentApp({
+      contextSnapshot: {
+        recoveryIntent: "planning_only",
+        allowDeliverableWork: false,
+        allowDocumentUpdates: true,
+        resumeRequiresNormalModel: false,
+      },
+    }))
+      .post("/api/companies/company-1/approvals")
+      .send({
+        type: "request_board_approval",
+        payload: { title: "Not part of a planning deliverable" },
+        issueIds: [SOURCE_ISSUE_ID],
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toContain("Planning-only recovery runs cannot create or modify approvals");
+    expect(mockApprovalService.create).not.toHaveBeenCalled();
+  });
+
   it("blocks status-only recovery runs from resubmitting approvals", async () => {
     mockApprovalService.getById.mockResolvedValue({
       id: "approval-7",

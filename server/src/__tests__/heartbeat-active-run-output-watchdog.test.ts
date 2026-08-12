@@ -519,6 +519,7 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
       sourceStatus: "done",
       sameRunTerminalEvidence: "activity",
     });
+    await db.update(issues).set({ checkoutRunId: runId }).where(eq(issues.id, issueId));
 
     const result = await heartbeat.scanSilentActiveRuns({ now, companyId });
 
@@ -545,6 +546,7 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     });
 
     const [source] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(source?.checkoutRunId).toBeNull();
     expect(source?.executionRunId).toBeNull();
     const [agent] = await db.select().from(agents).where(eq(agents.id, coderId));
     expect(agent?.status).toBe("idle");
