@@ -36,7 +36,7 @@ import {
   issueComments,
   issues,
 } from "@paperclipai/db";
-import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import { heartbeatService, type HeartbeatServiceOptions } from "../services/heartbeat.js";
 import { issueService } from "../services/issues.js";
 import {
@@ -1883,23 +1883,70 @@ async function reopenInReviewIssueForActionablePrFeedback(
   const externalKey = buildPrFeedbackExternalKey(context, deliveryId);
   const now = new Date();
   const result = await db.transaction(async (tx) => {
-    const existingComment = externalKey
-      ? await tx
-        .select({ id: issueComments.id })
-        .from(issueComments)
-        .where(and(
-          eq(issueComments.issueId, issue.id),
-          sql`${issueComments.metadata}->>'kind' = 'github_pr_review_feedback'`,
-          sql`${issueComments.metadata}->>'externalKey' = ${externalKey}`,
-        ))
-        .limit(1)
-        .then((rows) => rows[0] ?? null)
-      : null;
+    // Review finding (PR #1125, discovered while fixing the escalation
+    // comment's own read-then-insert below): this was a SELECT-by-externalKey
+    // then INSERT-if-none-found -- the same check-then-write race. Two
+    // concurrent redeliveries of the same review can both observe "no
+    // existing feedback comment" before either commits, posting the same
+    // review's feedback twice -- and each racer's insert mints its own row
+    // id, so `commentId` (which escalateUnseenBlockingReviewFeedback keys its
+    // own dedup on) is no longer stable across the race either. Set
+    // idempotencyKey on the insert so it rides the partial unique index
+    // (issue_comments_issue_system_idempotency_idx) and use
+    // ON CONFLICT DO NOTHING + a follow-up read to resolve to whichever row
+    // actually won, mirroring the BLO-19037 dependabot-receipt pattern.
+    let commentInserted = false;
+    let commentId: string | null = null;
+    if (externalKey) {
+      const insertedRow = await tx
+        .insert(issueComments)
+        .values({
+          companyId: issue.companyId,
+          issueId: issue.id,
+          authorType: "system",
+          idempotencyKey: externalKey,
+          body: buildPrReviewFeedbackComment(context),
+          metadata: {
+            kind: "github_pr_review_feedback",
+            source: "github",
+            externalKey,
+            repoFullName: context.repoFullName,
+            prNumber: context.prNumber,
+            deliveryId,
+          } as never,
+        })
+        .onConflictDoNothing()
+        .returning({ id: issueComments.id })
+        .then((rows) => rows[0] ?? null);
 
-    const commentInserted = !existingComment;
-    const commentId: string | null = existingComment
-      ? existingComment.id
-      : await tx
+      if (insertedRow) {
+        commentInserted = true;
+        commentId = insertedRow.id;
+      } else {
+        // Lost the race (or this is a genuine redelivery): find the row that
+        // won, via the idempotencyKey the unique index enforces on. Also
+        // check the legacy metadata-only lookup for feedback comments
+        // written before this dedup existed (no idempotencyKey set).
+        commentId = await tx
+          .select({ id: issueComments.id })
+          .from(issueComments)
+          .where(and(
+            eq(issueComments.issueId, issue.id),
+            or(
+              eq(issueComments.idempotencyKey, externalKey),
+              and(
+                isNull(issueComments.idempotencyKey),
+                sql`${issueComments.metadata}->>'kind' = 'github_pr_review_feedback'`,
+                sql`${issueComments.metadata}->>'externalKey' = ${externalKey}`,
+              ),
+            ),
+          ))
+          .limit(1)
+          .then((rows) => rows[0]?.id ?? null);
+      }
+    } else {
+      commentInserted = true;
+      commentId = await tx
         .insert(issueComments)
         .values({
           companyId: issue.companyId,
@@ -1909,7 +1956,7 @@ async function reopenInReviewIssueForActionablePrFeedback(
           metadata: {
             kind: "github_pr_review_feedback",
             source: "github",
-            externalKey: externalKey ?? null,
+            externalKey: null,
             repoFullName: context.repoFullName,
             prNumber: context.prNumber,
             deliveryId,
@@ -1917,6 +1964,7 @@ async function reopenInReviewIssueForActionablePrFeedback(
         })
         .returning({ id: issueComments.id })
         .then((rows): string | null => rows[0]?.id ?? null);
+    }
 
     let reopened = false;
     if (issue.status === "in_review" && effectiveAssigneeAgentId) {
@@ -2039,36 +2087,30 @@ async function escalateUnseenBlockingReviewFeedback(
     return { escalated: false, managerAgentId: manager.id };
   }
 
-  // Review finding (PR #1125): the escalation comment commits before
-  // heartbeat.wakeup below. If the wake call throws, the comment is already
-  // persisted but no wake was ever recorded -- hasExistingWakeWithIdempotencyKey
-  // above would then find nothing and (now that the caller no longer gates
-  // this function on commentInserted) retry the whole thing on the next
-  // redelivery, which would double-post the escalation comment. Dedupe the
-  // comment itself on the same idempotencyKey, mirroring
-  // reopenInReviewIssueForActionablePrFeedback's existingComment lookup, so a
-  // retry after a partial failure reuses the comment and only redrives the wake.
-  const existingEscalationComment = await db
-    .select({ id: issueComments.id })
-    .from(issueComments)
-    .where(
-      and(
-        eq(issueComments.issueId, input.issue.id),
-        sql`${issueComments.metadata}->>'externalKey' = ${idempotencyKey}`,
-      ),
-    )
-    .limit(1)
-    .then((rows) => rows[0] ?? null);
-
+  // Review finding (PR #1125): a prior read-then-insert (SELECT for an
+  // existing escalation comment by metadata.externalKey, then INSERT if none
+  // was found) is a check-then-write race across paperclip-api's replicas --
+  // two concurrent redeliveries of the same review event can both observe "no
+  // existing comment" before either writes, double-posting the escalation.
+  // Set idempotencyKey on the insert so it rides the already-deployed partial
+  // unique index (issue_comments_issue_system_idempotency_idx on
+  // issueId+idempotencyKey, scoped to system comments) and use
+  // ON CONFLICT DO NOTHING to make the key authoritative in the database
+  // rather than in application logic. No legacy metadata-only rows exist for
+  // this comment kind (github_pr_review_feedback_escalation is new in this
+  // PR), so unlike reopenInReviewIssueForActionablePrFeedback's dependabot
+  // receipt there is no pre-idempotencyKey data to fall back to.
   const prLine =
     input.context.repoFullName && input.context.prNumber !== null
       ? [`- PR: ${input.context.repoFullName}#${input.context.prNumber}`]
       : [];
-  if (!existingEscalationComment) {
-    await db.insert(issueComments).values({
+  await db
+    .insert(issueComments)
+    .values({
       companyId: input.issue.companyId,
       issueId: input.issue.id,
       authorType: "system",
+      idempotencyKey,
       body: [
         "## Blocking review feedback escalated",
         "",
@@ -2087,8 +2129,8 @@ async function escalateUnseenBlockingReviewFeedback(
         escalatedToAgentId: manager.id,
         escalatedFromAgentId: assignee.id,
       } as never,
-    });
-  }
+    })
+    .onConflictDoNothing();
 
   await heartbeat.wakeup(manager.id, {
     source: "automation",

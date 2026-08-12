@@ -4500,6 +4500,95 @@ describeEmbeddedPostgres("github-webhook route", () => {
     ).toBe(true);
   });
 
+  // Ally review on PR #1125: escalateUnseenBlockingReviewFeedback's comment
+  // write was a read-then-insert (SELECT by metadata.externalKey, then
+  // INSERT if none found) -- the same check-then-write race BLO-19037 fixed
+  // for the dependabot receipt path above. Two concurrent redeliveries of the
+  // identical review can both observe "no existing escalation comment"
+  // before either commits, double-posting the escalation. Firing both
+  // requests through `Promise.all` interleaves them at the same await
+  // boundaries a second paperclip-api replica would race across.
+  it("dedupes concurrent redeliveries of the same blocking review to a single escalation comment", async () => {
+    const companyId = randomUUID();
+    const managerId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Test",
+      issuePrefix: "PEN",
+      defaultResponsibleUserId: "test-board-user",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: managerId,
+      companyId,
+      name: "Manager",
+      role: "engineer",
+      status: "running",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "TestAgent",
+      role: "engineer",
+      status: "idle",
+      reportsTo: managerId,
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Test issue",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      issueNumber: 1127,
+      identifier: "PEN-1127",
+      monitorNextCheckAt: null,
+      monitorLastTriggeredAt: new Date(),
+      monitorAttemptCount: 1,
+    });
+
+    const app = buildApp({ prReviewerBotLogin: "allyblockcast[bot]" });
+    const blockingReview = reviewSubmittedFeedbackPayload({
+      prNumber: 851,
+      reviewId: 337,
+      state: "changes_requested",
+      headSha: "sha-race",
+      identifier: "PEN-1127",
+    });
+
+    // Warm the connection pool to >=2 physical connections before racing --
+    // see the dependabot concurrency test above for why this is necessary.
+    await Promise.all(Array.from({ length: 4 }, () => db.execute(sql`select 1`)));
+
+    const [first, second] = await Promise.all([
+      sendReviewSubmitted(app, blockingReview, "delivery-escalation-race"),
+      sendReviewSubmitted(app, blockingReview, "delivery-escalation-race"),
+    ]);
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+
+    const escalationComments = await db
+      .select()
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.issueId, issueId),
+          sql`${issueComments.metadata}->>'kind' = 'github_pr_review_feedback_escalation'`,
+        ),
+      );
+    expect(escalationComments).toHaveLength(1);
+  });
+
   function dependabotPayload(severity: string, action = "created", alertNumber = 58) {
     return {
       action,
