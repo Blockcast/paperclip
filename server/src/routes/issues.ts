@@ -3567,6 +3567,16 @@ export function issueRoutes(
       return "Recovery action became stale because the source issue now has a human owner.";
     }
 
+    // Parking an issue in `backlog` retires its recovery action (BLO-25907). `backlog` is
+    // deliberately not dispatchable, so an action left active there names an owner wake that
+    // no sweep will ever deliver — `reconcileStrandedAssignedIssues` covers only
+    // todo/in_progress/in_review. Folding here retires it at the moment of the park; the
+    // backstop sweep folds rows that were parked before this branch existed, or parked by a
+    // path that never reaches this classifier.
+    if (issue.status === "backlog") {
+      return "Recovery action became stale because the source issue was parked in backlog, which is not dispatchable.";
+    }
+
     if ((issue.status === "todo" || issue.status === "in_progress") && issue.assigneeAgentId) {
       return `Recovery action became stale because the source issue is ${issue.status} with an agent owner.`;
     }

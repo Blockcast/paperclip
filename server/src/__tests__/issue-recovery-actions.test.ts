@@ -19,6 +19,7 @@ import {
   routines,
   routineRuns,
 } from "@paperclipai/db";
+import { ISSUE_STATUSES, type IssueStatus } from "@paperclipai/shared";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -32,6 +33,10 @@ import { issueService } from "../services/issues.js";
 import { subscribeCompanyLiveEvents } from "../services/live-events.js";
 import { loadConfig } from "../config.js";
 import {
+  RECOVERY_SWEEP_COVERED_ISSUE_STATUSES,
+  STRANDED_ASSIGNED_ISSUE_STATUSES,
+  STRANDED_RECOVERY_WAKE_BACKSTOP_FOLD_ONLY_STATUSES,
+  STRANDED_RECOVERY_WAKE_BACKSTOP_ISSUE_STATUSES,
   recoveryService,
   strandedRecoveryWakeAttemptsExhausted,
 } from "../services/recovery/service.js";
@@ -4588,6 +4593,134 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         .from(issueComments)
         .where(eq(issueComments.issueId, alertIssueId));
       expect(alertSurfaceComments).toHaveLength(0);
+    });
+  });
+
+  /**
+   * BLO-25907 / BLO-16074 gap 3. An assigned `backlog` issue carrying an active recovery
+   * action used to be selected by no sweep at all: `reconcileStrandedAssignedIssues` filters
+   * to todo/in_progress/in_review and the wake backstop filtered to blocked. The action stayed
+   * active forever and the issue stayed silent — BLO-16074 itself sat that way for 27 days.
+   */
+  describe("backlog recovery actions are folded, not stranded", () => {
+    async function seedBacklogRecovery() {
+      const fixture = await seedCompany();
+      await db
+        .update(issues)
+        .set({ status: "backlog", assigneeAgentId: fixture.coderId })
+        .where(eq(issues.id, fixture.sourceIssueId));
+      const [action] = await db
+        .insert(issueRecoveryActions)
+        .values({
+          companyId: fixture.companyId,
+          sourceIssueId: fixture.sourceIssueId,
+          kind: "stranded_assigned_issue",
+          cause: "stranded_assigned_issue",
+          status: "active",
+          ownerType: "agent",
+          ownerAgentId: fixture.managerId,
+          returnOwnerAgentId: fixture.coderId,
+          fingerprint: `source_scoped_recovery:${fixture.companyId}:${fixture.sourceIssueId}:backlog`,
+          evidence: {},
+          nextAction: "Wake the owner to re-drive the stranded issue.",
+        })
+        .returning();
+      return { ...fixture, action: action! };
+    }
+
+    it("folds the action to cancelled with a note naming backlog, without waking the owner", async () => {
+      const { companyId, sourceIssueId, action } = await seedBacklogRecovery();
+      const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
+      const recovery = recoveryService(db, { enqueueWakeup });
+
+      const result = await recovery.reconcileStrandedRecoveryWakeBackstop({ companyId });
+
+      // Selected by the sweep (it is no longer invisible) but folded rather than woken:
+      // `backlog` is deliberately not dispatchable.
+      expect(result).toMatchObject({
+        checked: 1,
+        healed: 0,
+        backlogParkedResolved: 1,
+        issueIds: [sourceIssueId],
+      });
+      expect(enqueueWakeup).not.toHaveBeenCalled();
+
+      const [folded] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.id, action.id));
+      expect(folded).toMatchObject({ status: "cancelled", outcome: "cancelled" });
+      expect(folded?.resolvedAt).toBeTruthy();
+      expect(folded?.resolutionNote).toContain("backlog");
+
+      // The issue itself is left parked. Folding retires the action; it does not
+      // resurrect work the owner deliberately shelved.
+      const [issue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(issue).toMatchObject({ status: "backlog" });
+    });
+
+    it("is folded by exactly one sweep — the stranded-assigned sweep still ignores backlog", async () => {
+      const { sourceIssueId, action } = await seedBacklogRecovery();
+      const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
+      const recovery = recoveryService(db, { enqueueWakeup });
+
+      const result = await recovery.reconcileStrandedAssignedIssues();
+
+      expect(result.issueIds).not.toContain(sourceIssueId);
+      expect(enqueueWakeup).not.toHaveBeenCalled();
+      const [untouched] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.id, action.id));
+      expect(untouched).toMatchObject({ status: "active" });
+    });
+
+    it("is idempotent — a second pass finds nothing left to fold", async () => {
+      const { companyId, action } = await seedBacklogRecovery();
+      const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
+      const recovery = recoveryService(db, { enqueueWakeup });
+
+      await recovery.reconcileStrandedRecoveryWakeBackstop({ companyId });
+      const second = await recovery.reconcileStrandedRecoveryWakeBackstop({ companyId });
+
+      expect(second).toMatchObject({ checked: 0, backlogParkedResolved: 0 });
+      const [stillFolded] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.id, action.id));
+      expect(stillFolded).toMatchObject({ status: "cancelled" });
+    });
+
+    /**
+     * The invariant, not the instance. Every non-terminal status must be selectable by some
+     * sweep; otherwise an active recovery action on it is a zombie no reconciler can service.
+     * Adding a status to `ISSUE_STATUSES` without routing it fails here rather than silently
+     * reopening BLO-16074 gap 3.
+     */
+    it("covers every non-terminal issue status across the union of sweep filters", () => {
+      const terminal: readonly IssueStatus[] = ["done", "cancelled"];
+      const nonTerminal = ISSUE_STATUSES.filter((status) => !terminal.includes(status));
+      const covered = new Set<IssueStatus>(RECOVERY_SWEEP_COVERED_ISSUE_STATUSES);
+
+      const uncovered = nonTerminal.filter((status) => !covered.has(status));
+      expect(uncovered).toEqual([]);
+
+      // ...and each is claimed by exactly one sweep, so a status cannot be both woken and
+      // folded by two passes racing each other.
+      for (const status of nonTerminal) {
+        const claimants = [
+          STRANDED_ASSIGNED_ISSUE_STATUSES,
+          STRANDED_RECOVERY_WAKE_BACKSTOP_ISSUE_STATUSES,
+        ].filter((filter) => (filter as readonly IssueStatus[]).includes(status));
+        expect(claimants).toHaveLength(1);
+      }
+
+      // Fold-only statuses must be a subset of what the backstop actually selects, or the
+      // fold branch is unreachable.
+      for (const status of STRANDED_RECOVERY_WAKE_BACKSTOP_FOLD_ONLY_STATUSES) {
+        expect(STRANDED_RECOVERY_WAKE_BACKSTOP_ISSUE_STATUSES as readonly IssueStatus[])
+          .toContain(status);
+      }
     });
   });
 });
