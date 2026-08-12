@@ -135,6 +135,83 @@ describe("extractRepoReferences — misc", () => {
   });
 });
 
+describe("extractRepoReferences — citations are not location claims", () => {
+  // Each case below is a real false positive from the BLO-20341 sweep over
+  // 100 live sub-issues.
+  it("BLO-24543: ignores a pull-request link", () => {
+    expect(
+      extractRepoReferences(
+        "AC4 is not satisfied by the predicate shipped in [#1203](https://github.com/Blockcast/paperclip/pull/1203).",
+      ),
+    ).toEqual([]);
+  });
+
+  it("BLO-23732: ignores an actions-run link", () => {
+    expect(
+      extractRepoReferences(
+        "| [30991505142](https://github.com/Blockcast/shaka-player/actions/runs/30991505142) | success |",
+      ),
+    ).toEqual([]);
+  });
+
+  const citationPaths = ["issues/12", "commit/abc1234", "compare/a...b", "releases/tag/v1", "security/advisories"];
+  for (const path of citationPaths) {
+    it(`ignores a /${path.split("/")[0]} link`, () => {
+      expect(extractRepoReferences(`see https://github.com/Blockcast/magma/${path} for detail`)).toEqual([]);
+    });
+  }
+
+  it("still accepts a blob link, which names a code location", () => {
+    const refs = extractRepoReferences(
+      "the templating is at https://github.com/Blockcast/paperclip/blob/master/server/src/index.ts",
+    );
+    expect(refs.map((r) => r.slug)).toEqual(["blockcast/paperclip"]);
+  });
+
+  it("still accepts a plain repo link", () => {
+    expect(
+      extractRepoReferences("move it to https://github.com/Blockcast/paperclip").map((r) => r.slug),
+    ).toEqual(["blockcast/paperclip"]);
+  });
+
+  it("ignores a truncated link that leaves a one-character repo name", () => {
+    expect(extractRepoReferences("| [31303188009](https://github.com/Blockcast/s")).toEqual([]);
+  });
+});
+
+describe("extractRepoReferences — branch names are not repos", () => {
+  it("BLO-23599: ignores a branch name that looks like a slug", () => {
+    expect(
+      extractRepoReferences(
+        "The stale shared workspace is a multicast checkout parked on `codex/blo-17910-settlement-core` — the branch of PR #386.",
+      ),
+    ).toEqual([]);
+  });
+
+  const branchy = ["`cto/blo-20341-guard`", "`feat/new-thing`", "`dependabot/npm_and_yarn/foo`", "`release/v2`"];
+  for (const branch of branchy) {
+    it(`ignores the branch-prefixed slug ${branch}`, () => {
+      expect(extractRepoReferences(`the repo has a branch ${branch} open`)).toEqual([]);
+    });
+  }
+
+  it("a git-ref cue beats a known owner", () => {
+    expect(
+      extractRepoReferences("rebase onto the `Blockcast/some-branch` ref", {
+        knownOwners: ["Blockcast"],
+      }),
+    ).toEqual([]);
+  });
+
+  it("still accepts a known-owner slug with no git-ref cue", () => {
+    expect(
+      extractRepoReferences("swap `Blockcast/shaka-player` onto the canonical action", {
+        knownOwners: ["Blockcast"],
+      }).map((r) => r.slug),
+    ).toEqual(["blockcast/shaka-player"]);
+  });
+});
+
 describe("parseRepoIdentity", () => {
   it("normalizes an https workspace repoUrl", () => {
     expect(parseRepoIdentity("https://github.com/Blockcast/paperclip.git")).toMatchObject({
