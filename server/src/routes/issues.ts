@@ -1992,9 +1992,11 @@ async function assertCanManageIssueMonitor(
   req: Request,
   companyId: string,
   issue: {
+    id?: string | null;
     assigneeAgentId?: string | null;
     checkoutRunId?: string | null;
     executionRunId?: string | null;
+    executionState?: unknown;
   },
   monitorChanged: boolean,
   options: {
@@ -2002,6 +2004,9 @@ async function assertCanManageIssueMonitor(
     // `assertAgentIssueMutationAllowed` has already allowed this mutation via
     // `allow_productivity_review_grant` (BLO-19723). See the call site.
     productivityReviewOwnerAuthorized?: boolean;
+    // BLO-21947: set only by `PATCH /issues/:id`. Opts this call into the
+    // manager convergence-stall recovery branch below.
+    managerConvergenceRecoveryAllowed?: boolean;
   } = {},
 ) {
   if (!monitorChanged) return;
@@ -2039,6 +2044,44 @@ async function assertCanManageIssueMonitor(
   //   * still behind `runtime:manage` above — the review grant substitutes for
   //     the assignee *relation*, not for the runtime capability.
   if (options.productivityReviewOwnerAuthorized) return;
+  // BLO-21947: the convergence-stall deadlock. `issue-execution-policy.ts`
+  // refuses a re-arm by the assignee once a monitor has been cleared for
+  // `convergence_stalled` — "must be re-armed by a non-assignee actor" — while
+  // every branch above admits only the assignee, its execution run, the board,
+  // or a productivity-review owner. The intersection for a stalled monitor was
+  // therefore a human board user, so the platform mandated a recovery actor
+  // class it never provisioned, and the manager the productivity-review
+  // generator routes these to bounced off this exact throw.
+  //
+  // Narrow on purpose, mirroring the branch above:
+  //   * opt-in per route — only `PATCH /issues/:id` sets the flag, so monitor
+  //     writes folded into issue creation and the forced wake
+  //     `POST /issues/:id/monitor/check-now` stay closed to a manager.
+  //   * gated on the *observed* stalled state, not on the caller's say-so: the
+  //     monitor must currently be cleared with `clearReason` of
+  //     `convergence_stalled`. That is the auditable precondition, and it is
+  //     the only state in which the assignee is barred from self-recovery.
+  //   * still behind `runtime:manage` above, and behind a dedicated
+  //     `issue:recover_monitor` decision that requires manager-chain over the
+  //     assignee *and* an explicit `tasks:assign` grant.
+  if (options.managerConvergenceRecoveryAllowed && req.actor.type === "agent") {
+    const monitorState = parseIssueExecutionState(issue.executionState)?.monitor ?? null;
+    const convergenceStalled =
+      monitorState?.status === "cleared" && monitorState?.clearReason === "convergence_stalled";
+    if (convergenceStalled) {
+      const recoveryDecision = await accessSvc.decide({
+        actor: req.actor,
+        action: "issue:recover_monitor",
+        resource: {
+          type: "issue",
+          companyId,
+          issueId: issue.id ?? null,
+          assigneeAgentId: issue.assigneeAgentId ?? null,
+        },
+      });
+      if (recoveryDecision.allowed) return;
+    }
+  }
   throw forbidden(
     "Only the assignee agent or a board user can manage issue monitors",
     {
@@ -2052,6 +2095,7 @@ async function assertCanManageIssueMonitor(
         "the issue's assignee agent",
         "the agent holding the issue's current execution run",
         "the owner of an open productivity review of this issue (PATCH /issues/:id only)",
+        "an agent that manages the assignee, when the monitor is cleared for convergence_stalled (PATCH /issues/:id only)",
       ],
     },
   );
@@ -10200,6 +10244,11 @@ export function issueRoutes(
         // the reason differs, the audit stays null, and this guard keeps its
         // pre-existing behaviour — fail-closed.
         productivityReviewOwnerAuthorized: productivityReviewSourceMutationAudit.current !== null,
+        // BLO-21947: PATCH is the only route that can re-arm a stalled monitor,
+        // so it is the only one that opts into the manager recovery branch.
+        // The guard re-derives the convergence-stalled precondition from
+        // `existing.executionState` itself — nothing here asserts it.
+        managerConvergenceRecoveryAllowed: true,
       },
     );
 

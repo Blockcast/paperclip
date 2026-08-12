@@ -71,7 +71,9 @@ export type AuthorizationAction =
   | "issue:coordination_metadata"
   | "issue:mutate"
   | "issue:read"
+  | "issue:recover_monitor"
   | "project:read"
+  | "run:recover_stranded"
   | "runtime:manage"
   | "secrets:read";
 
@@ -175,6 +177,16 @@ function permissionForAction(action: AuthorizationAction): PermissionKey | null 
   // the dedicated branch also requires the actor to manage the issue assignee.
   // Mapping it here would silently drop that second half of the check.
   if (action === "issue:coordination_metadata") return null;
+  // BLO-21947: the two stranded-execution recovery actions are unmapped for the
+  // same reason as coordination-metadata above. Each requires the actor to
+  // manage the stalled agent *in addition to* holding `tasks:assign`, and each
+  // is further gated by an auditable precondition enforced at the route
+  // (never-dispatched run / convergence-stalled monitor). Mapping either here
+  // would let the generic `permissionKey` fallback satisfy it on the grant
+  // alone, silently dropping both the manager-chain half and — because the
+  // route only consults the precondition after the decision allows — leaving
+  // the widening far broader than intended.
+  if (action === "run:recover_stranded" || action === "issue:recover_monitor") return null;
   return action;
 }
 
@@ -538,9 +550,19 @@ function activeResponsibleUserCanAuthorizeIssueAction(
     // action and the agent-side decision would never be reached. It is a
     // strict subset of issue:mutate, so it cannot be gated more loosely by
     // sharing that action's active-non-viewer bar.
+    // BLO-21947: the stranded-execution recovery actions join for the same
+    // reason. Neither has a board permission mapping, so without this the
+    // responsible-user intersection returns `deny_unsupported_action` and the
+    // agent-side decision — which is where the manager-chain check lives — is
+    // never consulted. Both are strictly narrower than `issue:mutate` (they
+    // cancel a run that never started, or re-arm a monitor the platform itself
+    // refuses to let the assignee re-arm), so sharing that action's
+    // active-non-viewer bar cannot gate them more loosely.
     (action === "issue:comment"
       || action === "issue:mutate"
-      || action === "issue:coordination_metadata")
+      || action === "issue:coordination_metadata"
+      || action === "issue:recover_monitor"
+      || action === "run:recover_stranded")
   );
 }
 
@@ -2263,6 +2285,75 @@ export function authorizationService(db: Db) {
     //
     // Callers must still enforce the FIELD allowlist; this decides only
     // "may this actor touch coordination metadata on this issue at all".
+    // BLO-21947: recovery authority over a run belonging to an agent this
+    // actor manages. Deliberately mirrors `issue:coordination_metadata`
+    // below — manager-chain AND an explicit `tasks:assign` grant — for the
+    // same reason: the grant is held unscoped by nearly every agent, so the
+    // grant alone would let any agent cancel any other agent's runs.
+    //
+    // This decides only "may this actor recover executions owned by that
+    // agent at all". The *precondition* that makes the cancel non-destructive
+    // (the run never dispatched: `startedAt === null`, so no process, no
+    // tokens, no side effects) is enforced by the route, exactly as the field
+    // allowlist is for coordination-metadata. A `running` run stays board-only.
+    if (input.action === "run:recover_stranded") {
+      const resource = input.resource.type === "agent" ? input.resource : null;
+      const targetAgentId = resource?.agentId ?? null;
+      if (!targetAgentId) {
+        return deny({
+          action: input.action,
+          reason: "deny_scope",
+          explanation: "Stranded-run recovery requires the run's owning agent as the resource.",
+        });
+      }
+      if (targetAgentId === actorAgentId) {
+        // An agent recovering its own run needs no widening: it is the
+        // assignee, and this action exists purely for the cross-agent case
+        // that the assignee's own broken wake path cannot serve.
+        return deny({
+          action: input.action,
+          reason: "deny_scope",
+          explanation: "Stranded-run recovery authority applies only to runs owned by another agent.",
+        });
+      }
+      if (!(await isManagerOf(companyId, actorAgentId, targetAgentId))) {
+        return deny({
+          action: input.action,
+          reason: "deny_scope",
+          explanation: "Actor does not manage the run's owning agent in the reporting chain.",
+        });
+      }
+      return decideWithTaskAssignmentGrants("agent", actorAgentId);
+    }
+
+    // BLO-21947: re-arm authority over a monitor on an issue assigned to an
+    // agent this actor manages. This closes a literal self-contradiction:
+    // `issue-execution-policy.ts` refuses a convergence-stalled re-arm by the
+    // assignee ("must be re-armed by a non-assignee actor") while
+    // `assertCanManageIssueMonitor` refuses every non-assignee below board —
+    // so the platform mandated an actor class it never provisioned. Same
+    // manager-chain + grant shape; the route gates on the monitor actually
+    // being cleared for `convergence_stalled`.
+    if (input.action === "issue:recover_monitor") {
+      const resource = input.resource.type === "issue" ? input.resource : null;
+      const assigneeAgentId = resource?.assigneeAgentId ?? null;
+      if (!assigneeAgentId || assigneeAgentId === actorAgentId) {
+        return deny({
+          action: input.action,
+          reason: "deny_scope",
+          explanation: "Monitor-recovery authority applies only to issues assigned to another agent.",
+        });
+      }
+      if (!(await isManagerOf(companyId, actorAgentId, assigneeAgentId))) {
+        return deny({
+          action: input.action,
+          reason: "deny_scope",
+          explanation: "Actor does not manage the issue assignee in the reporting chain.",
+        });
+      }
+      return decideWithTaskAssignmentGrants("agent", actorAgentId);
+    }
+
     if (input.action === "issue:coordination_metadata") {
       const resource = input.resource.type === "issue" ? input.resource : null;
       const assigneeAgentId = resource?.assigneeAgentId ?? null;
