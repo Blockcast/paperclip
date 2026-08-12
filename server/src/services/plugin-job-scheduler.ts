@@ -12,6 +12,15 @@
  * 1. **Tick loop** — A `setInterval`-based loop fires every `tickIntervalMs`
  *    (default 30s). Each tick scans for due jobs and dispatches them.
  *
+ * 1a. **Per-company fan-out** — A due job dispatches once per company
+ *    configured for the plugin (via `listConfigCompanyIds`), each call
+ *    carrying its own `{ companyId }` invocation scope, rather than one
+ *    process-wide call. A plugin configured by zero companies dispatches
+ *    once with no company scope (instance-level job). Before this
+ *    (BLO-20957) a plugin configured by more than one company got an
+ *    unscoped dispatch and every company-scoped host call the job made was
+ *    denied.
+ *
  * 2. **Cron parsing & next-run calculation** — Uses the lightweight built-in
  *    cron parser ({@link parseCron}, {@link nextCronTick}) to compute the
  *    `nextRunAt` timestamp after each run or when a new job is registered.
@@ -37,6 +46,7 @@
 import { and, eq, lte, or } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { pluginJobs, pluginJobRuns } from "@paperclipai/db";
+import type { PluginJobRunTrigger } from "@paperclipai/shared";
 import type { PluginJobStore } from "./plugin-job-store.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { parseCron, nextCronTick, validateCron } from "./cron.js";
@@ -69,6 +79,14 @@ export interface PluginJobSchedulerOptions {
   jobStore: PluginJobStore;
   /** Worker process manager for RPC calls. */
   workerManager: PluginWorkerManager;
+  /**
+   * Enumerate the companies with saved configuration for a plugin. Scheduled
+   * dispatch calls this once per due job and fans out to one `runJob` call
+   * per configured company, each with its own host-issued invocation scope,
+   * instead of a single process-wide dispatch that only ever worked for
+   * exactly one configured company (BLO-20957).
+   */
+  listConfigCompanyIds: (pluginId: string) => Promise<string[]>;
   /** Interval between scheduler ticks in ms (default: 30s). */
   tickIntervalMs?: number;
   /** Timeout for individual job RPC calls in ms (default: 5min). */
@@ -81,8 +99,17 @@ export interface PluginJobSchedulerOptions {
  * Result of a manual job trigger.
  */
 export interface TriggerJobResult {
-  /** The created run ID. */
+  /**
+   * The first created run ID.
+   *
+   * Retained for callers that predate the BLO-20957 per-company fan-out and
+   * only ever expected one run. Prefer {@link TriggerJobResult.runIds}, which
+   * is the complete set — a manual trigger on a plugin configured by six
+   * companies now creates six runs, and this field names only one of them.
+   */
   runId: string;
+  /** Every run created by this trigger — one per company scope dispatched. */
+  runIds: string[];
   /** The job ID that was triggered. */
   jobId: string;
 }
@@ -185,6 +212,7 @@ export interface PluginJobScheduler {
  *   db,
  *   jobStore,
  *   workerManager,
+ *   listConfigCompanyIds: (pluginId) => pluginRegistry.listConfigCompanyIds(pluginId),
  * });
  *
  * // Start the tick loop
@@ -207,6 +235,7 @@ export function createPluginJobScheduler(
     db,
     jobStore,
     workerManager,
+    listConfigCompanyIds,
     tickIntervalMs = DEFAULT_TICK_INTERVAL_MS,
     jobTimeoutMs = DEFAULT_JOB_TIMEOUT_MS,
     maxConcurrentJobs = DEFAULT_MAX_CONCURRENT_JOBS,
@@ -337,27 +366,146 @@ export function createPluginJobScheduler(
   // -----------------------------------------------------------------------
 
   /**
-   * Dispatch a single job run — create the run record, call the worker,
-   * record the result, and advance the schedule pointer.
+   * Dispatch a single due job — fan out to one company-scoped `runJob` call
+   * per company configured for the plugin, then advance the schedule
+   * pointer once the whole fan-out settles.
+   *
+   * Before BLO-20957 this made exactly one process-wide `runJob` call, which
+   * only ever carried a company invocation scope when the plugin happened to
+   * have exactly one configured company (`bootstrapCompanyId`). Any plugin
+   * configured by more than one company got an unscoped dispatch, and every
+   * company-scoped host call the job made (`ctx.issues.list`,
+   * `ctx.config.get(companyId)`, ...) was denied with "company context is
+   * required" — silently, because the RPC still "succeeded" up to that
+   * denial and the failure only showed up as an ERROR log line.
    */
   async function dispatchJob(
     job: typeof pluginJobs.$inferSelect,
   ): Promise<void> {
-    const { id: jobId, pluginId, jobKey, schedule } = job;
+    const { id: jobId, pluginId, jobKey } = job;
     const jobLog = log.child({ jobId, pluginId, jobKey });
 
-    // Mark as active (overlap prevention)
+    // Mark as active (overlap prevention) for the whole job across every
+    // company dispatch, so a slow fan-out can't let the next tick pile a
+    // second dispatch for the same job on top.
     activeJobs.add(jobId);
+
+    try {
+      let companyIds: string[];
+      try {
+        companyIds = await listConfigCompanyIds(pluginId);
+      } catch (err) {
+        // Fail CLOSED. Treating an enumeration error as "zero configured
+        // companies" would fall through to a single unscoped dispatch, and
+        // for a worker like alertmanager that dispatch returns normally
+        // without doing any work — so a registry/DB outage would silently
+        // skip every tenant while recording `succeeded`, feeding the health
+        // signal the exact opposite of the truth. Record a failed run
+        // instead: the schedule pointer still advances in `finally` (so the
+        // job recovers on its own once the registry is healthy) but the
+        // failure is visible to `listJobsWithFailureStreak` and pages if it
+        // persists. The unscoped fallback below is reserved strictly for a
+        // *successful* empty enumeration.
+        const errorMessage = err instanceof Error ? err.message : String(err);
+        jobLog.error(
+          { err: errorMessage },
+          "failed to enumerate configured companies for scheduled dispatch — failing closed, not dispatching",
+        );
+        await recordEnumerationFailure(job, errorMessage);
+        return;
+      }
+
+      const dispatches = companyIds.length > 0
+        ? companyIds.map((companyId) => dispatchJobRun(job, companyId, "schedule"))
+        : [dispatchJobRun(job, null, "schedule")];
+
+      await Promise.allSettled(dispatches);
+    } finally {
+      // Remove from active set
+      activeJobs.delete(jobId);
+
+      // Always advance the schedule pointer (even on failure)
+      try {
+        await advanceSchedulePointer(job);
+      } catch (err) {
+        jobLog.error(
+          { err: err instanceof Error ? err.message : String(err) },
+          "failed to advance schedule pointer",
+        );
+      }
+    }
+  }
+
+  /**
+   * Record a `failed` run for a tick that could not even determine which
+   * companies to dispatch to.
+   *
+   * Without this the fail-closed path in {@link dispatchJob} would be
+   * *invisible*: no run row at all means no failure for the streak detector
+   * to see, so a registry outage would look exactly like a job that simply
+   * wasn't due. The run is deliberately instance-scoped (`companyId: null`)
+   * because the whole point is that the company set is unknown.
+   *
+   * Best-effort: if we cannot even write the run row (the same outage may
+   * well be a DB outage), log and move on rather than throwing out of the
+   * dispatch path and skipping the schedule-pointer advance.
+   */
+  async function recordEnumerationFailure(
+    job: typeof pluginJobs.$inferSelect,
+    errorMessage: string,
+  ): Promise<void> {
+    const jobLog = log.child({
+      jobId: job.id,
+      pluginId: job.pluginId,
+      jobKey: job.jobKey,
+    });
+    try {
+      const run = await jobStore.createRun({
+        jobId: job.id,
+        pluginId: job.pluginId,
+        trigger: "schedule",
+        companyId: null,
+      });
+      await jobStore.completeRun(run.id, {
+        status: "failed",
+        error: `Failed to enumerate configured companies: ${errorMessage}`,
+        durationMs: 0,
+      });
+    } catch (err) {
+      jobLog.error(
+        { err: err instanceof Error ? err.message : String(err) },
+        "failed to record company-enumeration failure run",
+      );
+    }
+  }
+
+  /**
+   * Run one company-scoped (or instance-scoped, when `companyId` is `null`)
+   * dispatch of `job`: create its own run record, call the worker with that
+   * company stamped onto `job.companyId`, and record the result. Failures
+   * are caught and recorded here, never rethrown, so one company's failure
+   * in a fan-out cannot cancel the others (`Promise.allSettled` in
+   * {@link dispatchJob} would already isolate them, but recording must not
+   * depend on that).
+   */
+  async function dispatchJobRun(
+    job: typeof pluginJobs.$inferSelect,
+    companyId: string | null,
+    trigger: PluginJobRunTrigger,
+  ): Promise<void> {
+    const { id: jobId, pluginId, jobKey } = job;
+    const jobLog = log.child({ jobId, pluginId, jobKey, companyId });
 
     let runId: string | undefined;
     const startedAt = Date.now();
 
     try {
-      // 1. Create run record
+      // 1. Create run record, scoped to this company
       const run = await jobStore.createRun({
         jobId,
         pluginId,
-        trigger: "schedule",
+        trigger,
+        companyId,
       });
       runId = run.id;
 
@@ -366,7 +514,7 @@ export function createPluginJobScheduler(
       // 2. Mark run as running
       await jobStore.markRunning(runId);
 
-      // 3. Call worker via RPC
+      // 3. Call worker via RPC, with this company as the invocation scope
       await workerManager.call(
         pluginId,
         "runJob",
@@ -374,8 +522,9 @@ export function createPluginJobScheduler(
           job: {
             jobKey,
             runId,
-            trigger: "schedule" as const,
+            trigger,
             scheduledAt: (job.nextRunAt ?? new Date()).toISOString(),
+            companyId,
           },
         },
         jobTimeoutMs,
@@ -415,19 +564,6 @@ export function createPluginJobScheduler(
             "failed to record job failure",
           );
         }
-      }
-    } finally {
-      // Remove from active set
-      activeJobs.delete(jobId);
-
-      // 5. Always advance the schedule pointer (even on failure)
-      try {
-        await advanceSchedulePointer(job);
-      } catch (err) {
-        jobLog.error(
-          { err: err instanceof Error ? err.message : String(err) },
-          "failed to advance schedule pointer",
-        );
       }
     }
   }
@@ -482,31 +618,109 @@ export function createPluginJobScheduler(
       );
     }
 
-    // Create the run and dispatch (non-blocking)
-    const run = await jobStore.createRun({
-      jobId,
-      pluginId: job.pluginId,
-      trigger,
-    });
+    // Fan out per configured company, exactly like the scheduled path
+    // (BLO-20957). Before this, a manual "run now" created a single run with
+    // no `companyId`, so every worker that requires a company scope — which
+    // is now the norm — returned early without doing any work while the run
+    // was recorded as `succeeded`. A "run now" that reports success and does
+    // nothing is worse than one that fails.
+    let companyIds: string[];
+    try {
+      companyIds = await listConfigCompanyIds(job.pluginId);
+    } catch (err) {
+      // Fail closed, and loudly: this path is synchronous to an operator
+      // clicking "run now", so surfacing the error beats dispatching an
+      // unscoped no-op that looks like it worked.
+      const message = err instanceof Error ? err.message : String(err);
+      throw new Error(
+        `Cannot trigger job "${job.jobKey}": failed to enumerate configured companies: ${message}`,
+      );
+    }
+
+    // A *successful* empty enumeration still gets one instance-scoped run —
+    // some plugins legitimately have no company config and their jobs do
+    // instance-wide work.
+    const scopes: Array<string | null> =
+      companyIds.length > 0 ? [...companyIds] : [null];
+
+    // Create every run row up front so the caller gets the full set back
+    // before dispatch begins.
+    const runs = await Promise.all(
+      scopes.map((companyId) =>
+        jobStore.createRun({
+          jobId,
+          pluginId: job.pluginId,
+          trigger,
+          companyId,
+        }),
+      ),
+    );
+
+    const dispatchTargets = runs.map((run, index) => ({
+      runId: run.id,
+      companyId: scopes[index] ?? null,
+    }));
 
     // Dispatch in background — don't block the caller
-    void dispatchManualRun(job, run.id, trigger);
+    void dispatchManualRuns(job, dispatchTargets, trigger);
 
-    return { runId: run.id, jobId };
+    return {
+      runId: runs[0]!.id,
+      runIds: runs.map((run) => run.id),
+      jobId,
+    };
   }
 
   /**
-   * Dispatch a manually triggered job run.
+   * Dispatch every run of a manual/retry fan-out, holding the job's
+   * overlap-prevention slot for the whole set.
+   *
+   * `activeJobs` is added/removed once around the entire fan-out rather than
+   * per run: the entries are keyed by `jobId`, so per-run bookkeeping would
+   * let the first run to finish clear the slot while its siblings are still
+   * executing, and the next tick could then pile a second dispatch on top.
+   */
+  async function dispatchManualRuns(
+    job: typeof pluginJobs.$inferSelect,
+    targets: Array<{ runId: string; companyId: string | null }>,
+    trigger: "manual" | "retry",
+  ): Promise<void> {
+    activeJobs.add(job.id);
+    try {
+      await Promise.allSettled(
+        targets.map((target) =>
+          dispatchManualRun(job, target.runId, target.companyId, trigger),
+        ),
+      );
+    } finally {
+      activeJobs.delete(job.id);
+    }
+  }
+
+  /**
+   * Dispatch a single manually triggered job run, scoped to one company
+   * (or instance-scoped when `companyId` is `null`).
+   *
+   * Overlap prevention is handled by the caller
+   * ({@link dispatchManualRuns}), which holds the job's slot across the
+   * whole fan-out.
    */
   async function dispatchManualRun(
     job: typeof pluginJobs.$inferSelect,
     runId: string,
+    companyId: string | null,
     trigger: "manual" | "retry",
   ): Promise<void> {
     const { id: jobId, pluginId, jobKey } = job;
-    const jobLog = log.child({ jobId, pluginId, jobKey, runId, trigger });
+    const jobLog = log.child({
+      jobId,
+      pluginId,
+      jobKey,
+      runId,
+      trigger,
+      companyId,
+    });
 
-    activeJobs.add(jobId);
     const startedAt = Date.now();
 
     try {
@@ -521,6 +735,11 @@ export function createPluginJobScheduler(
             runId,
             trigger,
             scheduledAt: new Date().toISOString(),
+            // Stamp the company so the worker's job context carries a real
+            // scope. Without this the handler's `job.companyId` guard trips
+            // and the run is recorded `succeeded` having done nothing
+            // (BLO-20957).
+            companyId,
           },
         },
         jobTimeoutMs,
@@ -552,8 +771,6 @@ export function createPluginJobScheduler(
           "failed to record manual job failure",
         );
       }
-    } finally {
-      activeJobs.delete(jobId);
     }
   }
 

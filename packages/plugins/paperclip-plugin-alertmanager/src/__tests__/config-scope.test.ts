@@ -15,6 +15,7 @@ import {
   CompanyScopeUnavailableError,
   isEmptyConfig,
   resolveCompanyScope,
+  resolveEscalationSweepConfig,
   resolveWebhookToken,
 } from "../config-scope.js";
 import type { AlertmanagerPluginConfig } from "../types.js";
@@ -255,6 +256,70 @@ describe("resolveCompanyScope", () => {
       CompanyScopeUnavailableError,
     );
     expect(mocks.logger.error).toHaveBeenCalled();
+  });
+});
+
+describe("resolveEscalationSweepConfig (BLO-20957)", () => {
+  const COMPANY_B = "b1d3f3d3-adc9-48af-beb1-013a18368d84";
+
+  it("resolves each company's own config independently for its own dispatch", async () => {
+    // The host now dispatches `check-alert-escalations` once per configured
+    // company (BLO-20957), each with its own invocation scope, instead of a
+    // single process-wide dispatch tied to whichever company saved config
+    // last (BLO-20595). Two dispatches for two companies must never bleed
+    // into each other.
+    const { ctx, mocks } = mkCtx({
+      configByCompany: {
+        [COMPANY_A]: { defaultCompanyId: COMPANY_A, escalationDelayMinutes: 5 },
+        [COMPANY_B]: { defaultCompanyId: COMPANY_B, escalationDelayMinutes: 30 },
+      },
+    });
+
+    const a = await resolveEscalationSweepConfig(ctx, COMPANY_A);
+    const b = await resolveEscalationSweepConfig(ctx, COMPANY_B);
+
+    expect(a?.defaultCompanyId).toBe(COMPANY_A);
+    expect(b?.defaultCompanyId).toBe(COMPANY_B);
+    expect(mocks.config.get).toHaveBeenCalledWith(COMPANY_A);
+    expect(mocks.config.get).toHaveBeenCalledWith(COMPANY_B);
+  });
+
+  it("adopts the dispatch's company as defaultCompanyId when the row omits it", async () => {
+    const { ctx } = mkCtx({
+      configByCompany: { [COMPANY_A]: { webhookToken: TOKEN } },
+    });
+
+    const config = await resolveEscalationSweepConfig(ctx, COMPANY_A);
+
+    expect(config?.defaultCompanyId).toBe(COMPANY_A);
+  });
+
+  it("returns null, not another tenant's config, for a company with no stored config", async () => {
+    const { ctx } = mkCtx({
+      configByCompany: { [COMPANY_A]: { defaultCompanyId: COMPANY_A } },
+    });
+
+    await expect(resolveEscalationSweepConfig(ctx, COMPANY_B)).resolves.toBeNull();
+  });
+
+  it("refuses to sweep one company's alerts under another company's defaultCompanyId", async () => {
+    const { ctx, mocks } = mkCtx({
+      configByCompany: {
+        [COMPANY_A]: { defaultCompanyId: COMPANY_B },
+      },
+    });
+
+    await expect(resolveEscalationSweepConfig(ctx, COMPANY_A)).resolves.toBeNull();
+    expect(mocks.logger.error).toHaveBeenCalled();
+  });
+
+  it("propagates a config-read failure so the run records as failed, rather than skipping silently", async () => {
+    const { ctx, mocks } = mkCtx({
+      configByCompany: { [COMPANY_A]: { defaultCompanyId: COMPANY_A } },
+    });
+    mocks.config.get.mockRejectedValueOnce(new Error("db down"));
+
+    await expect(resolveEscalationSweepConfig(ctx, COMPANY_A)).rejects.toThrow("db down");
   });
 });
 
