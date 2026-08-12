@@ -1058,7 +1058,7 @@ async function listSuccessfulRunHandoffStates(
   db: Db,
   companyId: string,
   issueIds: string[],
-  options?: { hydrateLiveness?: boolean },
+  options?: { hydrateLiveness?: boolean; foldTerminal?: boolean },
 ): Promise<Map<string, SuccessfulRunHandoffState>> {
   if (issueIds.length === 0) return new Map();
   const rows = await db
@@ -1085,9 +1085,13 @@ async function listSuccessfulRunHandoffStates(
     const state = successfulRunHandoffStateFromActivity(row);
     if (state) states.set(row.entityId, state);
   }
-  // Unconditional, and before liveness: a handoff on a closed issue is moot
-  // regardless of whether this caller wants liveness hydrated (BLO-16074).
-  await resolveSuccessfulRunHandoffForTerminalIssues(db, companyId, states);
+  // Before liveness: a handoff on a closed issue is moot regardless of whether
+  // this caller wants liveness hydrated (BLO-16074). Callers that use this map to
+  // decide whether to WRITE the resolution activity row must opt out — folding
+  // first would make the pending handoff invisible and swallow the audit event.
+  if (options?.foldTerminal !== false) {
+    await resolveSuccessfulRunHandoffForTerminalIssues(db, companyId, states);
+  }
   return options?.hydrateLiveness === false
     ? states
     : hydrateSuccessfulRunHandoffLiveness(db, companyId, states);
@@ -10641,7 +10645,14 @@ export function issueRoutes(
     const explicitlyRecordedSuccessfulRunDisposition =
       actor.actorType === "user" && req.body.status !== undefined && issue.status !== "in_progress";
     if (explicitlyRecordedSuccessfulRunDisposition) {
-      await listSuccessfulRunHandoffStates(db, issue.companyId, [issue.id], { hydrateLiveness: false })
+      // foldTerminal:false — this read decides whether to WRITE the durable
+      // resolution row, and `issue` is already terminal by the time we get here.
+      // Letting the terminal fold run would report the handoff as resolved and
+      // skip the write, losing sourceRunId/correctiveRunId/resolvedByStatus.
+      await listSuccessfulRunHandoffStates(db, issue.companyId, [issue.id], {
+        hydrateLiveness: false,
+        foldTerminal: false,
+      })
         .then(async (handoffStates) => {
           const handoff = handoffStates.get(issue.id);
           if (handoff?.state !== "required" && handoff?.state !== "escalated") return;
