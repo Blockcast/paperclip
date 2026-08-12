@@ -4492,6 +4492,35 @@ describeEmbeddedPostgres("github-webhook route", () => {
     });
   });
 
+  // BLO-26613: the Dependabot alert route has exactly one configured owner
+  // and no fallback. A paused (or otherwise uninvokable) configured agent
+  // must not receive the new alert issue silently -- it should file
+  // unassigned so `allow_company_agent` lets any agent pick it up. The wake
+  // to the paused agent itself still fails (heartbeat.wakeup rejects a
+  // paused target and the error is caught/logged a few lines below) --
+  // that is a pre-existing, separate mechanism this change does not touch.
+  // The point of this test is that the ISSUE doesn't silently inherit the
+  // paused assignee merely because the wake attempt happened to fail too.
+  it("files a new dependabot alert issue unassigned when the configured agent is paused", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent({ agentName: "Release Engineer" });
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, agentId));
+    const app = buildApp({ dependabotAgentId: agentId });
+
+    const res = await postDependabot(app, dependabotPayload("critical"));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ dependabotWakeFired: false });
+
+    const [issue] = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "github_dependabot_alert")));
+    expect(issue).toBeTruthy();
+    expect(issue!.assigneeAgentId).toBeNull();
+    expect(issue!.assigneeUserId).toBeNull();
+    expect(issue!.status).toBe("todo");
+  });
+
   it("dedupes a redelivered dependabot created alert via the idempotency key", async () => {
     const { agentId } = await seedCompanyAndAgent({ agentName: "Release Engineer" });
     const app = buildApp({ dependabotAgentId: agentId });
