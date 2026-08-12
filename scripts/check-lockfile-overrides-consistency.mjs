@@ -10,9 +10,41 @@
 // --frozen-lockfile` on master until someone notices. This script makes that
 // drift a deterministic, dependency-free, pre-merge failure instead.
 
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+
+const RFC4648_BASE32_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+
+// Reproduces @pnpm/crypto.base32-hash's createBase32HashFromFile, which is
+// what pnpm 9.x uses to compute a patchedDependencies[*].hash: normalize
+// CRLF to LF, MD5 the content, RFC4648 base32-encode the digest, strip
+// padding, lowercase. Verified against this repo's own committed patch
+// hashes (e.g. patches/brace-expansion@5.0.9.patch -> the hash already
+// recorded for it in pnpm-lock.yaml) so the check stays dependency-free —
+// no `pnpm install` is needed to catch a stale hash.
+function computePnpmPatchHash(content) {
+  const digest = createHash("md5")
+    .update(content.split("\r\n").join("\n"), "utf8")
+    .digest();
+
+  let bits = 0;
+  let value = 0;
+  let output = "";
+  for (const byte of digest) {
+    value = (value << 8) | byte;
+    bits += 8;
+    while (bits >= 5) {
+      output += RFC4648_BASE32_ALPHABET[(value >>> (bits - 5)) & 31];
+      bits -= 5;
+    }
+  }
+  if (bits > 0) {
+    output += RFC4648_BASE32_ALPHABET[(value << (5 - bits)) & 31];
+  }
+  return output.toLowerCase();
+}
 
 function unquoteYamlScalar(raw) {
   const trimmed = raw.trim();
@@ -86,8 +118,14 @@ function parsePatchedDependenciesBlock(lockfileText) {
  * Compares package.json's `pnpm.overrides` / `pnpm.patchedDependencies`
  * against the corresponding blocks in pnpm-lock.yaml. Returns a list of
  * human-readable mismatch descriptions; an empty list means consistent.
+ *
+ * When `repoRoot` is given, also verifies each patch file on disk hashes to
+ * the value pnpm-lock.yaml recorded for it — catching a patch-content-only
+ * edit that leaves the declared `path` (and therefore the override/patch
+ * key comparisons above) unchanged. Omitted in tests that only exercise the
+ * path/override comparisons against synthetic fixtures with no files on disk.
  */
-export function findLockfileOverrideMismatches(packageJsonText, lockfileText) {
+export function findLockfileOverrideMismatches(packageJsonText, lockfileText, { repoRoot } = {}) {
   const packageJson = JSON.parse(packageJsonText);
   const declaredOverrides = packageJson.pnpm?.overrides ?? {};
   const declaredPatches = packageJson.pnpm?.patchedDependencies ?? {};
@@ -134,11 +172,36 @@ export function findLockfileOverrideMismatches(packageJsonText, lockfileText) {
       );
       continue;
     }
-    const lockedPath = lockedPatches.get(key).path;
-    if (lockedPath !== declaredPath) {
+    const lockedEntry = lockedPatches.get(key);
+    if (lockedEntry.path !== declaredPath) {
       mismatches.push(
-        `pnpm.patchedDependencies["${key}"] = "${declaredPath}" in package.json but pnpm-lock.yaml records path "${lockedPath}"`,
+        `pnpm.patchedDependencies["${key}"] = "${declaredPath}" in package.json but pnpm-lock.yaml records path "${lockedEntry.path}"`,
       );
+      continue;
+    }
+
+    // Path matches, so a stale hash is invisible to every check above —
+    // this is the gap a patch-content-only edit falls through (BLO-24169
+    // review follow-up). Only checkable when we have a repoRoot to read the
+    // actual patch file from.
+    if (repoRoot && lockedEntry.hash) {
+      const patchFilePath = path.join(repoRoot, declaredPath);
+      let patchContent;
+      try {
+        patchContent = readFileSync(patchFilePath, "utf8");
+      } catch (error) {
+        if (error.code !== "ENOENT") throw error;
+        mismatches.push(
+          `pnpm.patchedDependencies["${key}"] points to "${declaredPath}", which does not exist in the repository`,
+        );
+        continue;
+      }
+      const actualHash = computePnpmPatchHash(patchContent);
+      if (actualHash !== lockedEntry.hash) {
+        mismatches.push(
+          `pnpm-lock.yaml's patchedDependencies["${key}"].hash ("${lockedEntry.hash}") doesn't match the content hash of the committed "${declaredPath}" ("${actualHash}") — run "pnpm install --lockfile-only" and commit the result`,
+        );
+      }
     }
   }
 
@@ -158,7 +221,7 @@ function main() {
   const packageJsonText = readFileSync(path.join(repoRoot, "package.json"), "utf8");
   const lockfileText = readFileSync(path.join(repoRoot, "pnpm-lock.yaml"), "utf8");
 
-  const mismatches = findLockfileOverrideMismatches(packageJsonText, lockfileText);
+  const mismatches = findLockfileOverrideMismatches(packageJsonText, lockfileText, { repoRoot });
   if (mismatches.length === 0) {
     console.log("pnpm-lock.yaml overrides/patchedDependencies match package.json.");
     return;
