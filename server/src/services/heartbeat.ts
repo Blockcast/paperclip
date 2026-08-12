@@ -2308,15 +2308,41 @@ function deriveRepoNameFromRepoUrl(repoUrl: string | null): string | null {
 // anything that escapes the checkout root. `cwd` is operator-supplied config,
 // so a value like "../../../etc" must not be able to point a run outside the
 // repo it declared. See BLO-25415.
-export function resolveContainedWorkspaceSubpath(checkoutDir: string, subpath: string): string {
+//
+// Containment is enforced twice, because the two escapes are different:
+//   - lexically, against `..` traversal and sibling-prefix paths; and
+//   - after symlink resolution, because the checkout's *contents* are
+//     repo-controlled. A repo carrying `packages/iwa -> /etc` passes the
+//     lexical check and then fs.stat() follows the link, launching the run
+//     outside the checkout on a PVC shared with every other repo.
+//
+// The realpath pass is skipped when the target does not exist: there is
+// nothing to follow, and the caller's own fs.stat() is what reports it
+// missing. Resolving the root separately matters too — the managed dir may
+// itself sit behind a symlink, which would otherwise fail containment for a
+// perfectly legitimate subpath.
+export async function resolveContainedWorkspaceSubpath(
+  checkoutDir: string,
+  subpath: string,
+): Promise<string> {
   const root = path.resolve(checkoutDir);
   const resolved = path.resolve(root, subpath);
-  if (resolved !== root && !resolved.startsWith(`${root}${path.sep}`)) {
+  assertPathContained(root, resolved, subpath);
+
+  const realRoot = await fs.realpath(root).catch(() => null);
+  const realResolved = await fs.realpath(resolved).catch(() => null);
+  if (realRoot && realResolved) {
+    assertPathContained(realRoot, realResolved, subpath);
+  }
+  return resolved;
+}
+
+function assertPathContained(root: string, candidate: string, subpath: string): void {
+  if (candidate !== root && !candidate.startsWith(`${root}${path.sep}`)) {
     throw new Error(
       `Project workspace cwd "${subpath}" resolves outside its checkout "${root}".`,
     );
   }
-  return resolved;
 }
 
 // Workspace source types that own their `cwd` outright: the path is a host
@@ -11481,7 +11507,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               repoUrl: readNonEmptyString(workspace.repoUrl),
             });
             projectCwd = repoRelativeCwd
-              ? resolveContainedWorkspaceSubpath(managedWorkspace.cwd, repoRelativeCwd)
+              ? await resolveContainedWorkspaceSubpath(managedWorkspace.cwd, repoRelativeCwd)
               : managedWorkspace.cwd;
             managedWorkspaceWarning = managedWorkspace.warning;
           } catch (error) {
