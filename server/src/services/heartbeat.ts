@@ -84,16 +84,21 @@ import {
 } from "@paperclipai/db";
 import { conflict, HttpError, notFound } from "../errors.js";
 import { logger } from "../middleware/logger.js";
-import { describeDbError, isDbError, runWithTransientDbRetry } from "../lib/db-retry.js";
+import { describeDbError, findPgError, isDbError, runWithTransientDbRetry } from "../lib/db-retry.js";
 import { publishLiveEvent } from "./live-events.js";
 import { canClaimPrReviewTask } from "./pr-review-dispatch-lock.js";
 import { normalizeResponsibleUserDenialCode } from "./responsible-user-denial-run-outcomes.js";
+import {
+  matchesTaskKey,
+  taskKeysMatch,
+} from "./pr-review-duplicate-issue-guard.js";
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
 import {
   deleteAgentJobExact,
   deleteAgentJobsForRun,
   deleteAgentPodExact,
   captureAgentJobFailureDiagnostics,
+  classifyAgentJobFailureErrorCode,
   hasActiveJobForAgent,
   indexUniqueAgentJobRunStatuses,
   listAgentJobRunStatuses,
@@ -1083,7 +1088,11 @@ export function shouldScheduleAutomaticRunRetry(
   // lock/status gates alone cannot make partial external writes safe. A missing
   // Job is only produced after adapter.invoke and therefore never reaches this
   // safe state; pre-invocation disappearance is process_lost instead.
-  if (run.errorCode === "job_failed") {
+  if (
+    run.errorCode === "job_failed" ||
+    run.errorCode === "oom_killed" ||
+    run.errorCode === "exit_137"
+  ) {
     const recovery = parseObject(parseObject(run.resultJson).externalLifecycleRecovery);
     return isIssueRun && recovery.adapterInvocationStarted === false;
   }
@@ -1154,7 +1163,11 @@ function resolveAutomaticRunRetryOpts(
       delayMs: CAPACITY_BLOCKED_HEARTBEAT_RETRY_DELAY_MS,
     };
   }
-  if (run.errorCode === "job_failed") {
+  if (
+    run.errorCode === "job_failed" ||
+    run.errorCode === "oom_killed" ||
+    run.errorCode === "exit_137"
+  ) {
     return {
       retryReason: JOB_FAILED_HEARTBEAT_RETRY_REASON,
       wakeReason: JOB_FAILED_HEARTBEAT_RETRY_WAKE_REASON,
@@ -5229,6 +5242,7 @@ export function buildHeartbeatRunFailedMetricInput(input: {
   k8sRunIsolation: { isolationMode: string } | null;
 }) {
   const contextSnapshotObj = parseObject(input.run.contextSnapshot);
+  const persistedIsolation = parseObject(contextSnapshotObj.paperclipK8sIsolation);
   return {
     agentId: input.agent.id,
     issueId: input.issueId,
@@ -5237,7 +5251,8 @@ export function buildHeartbeatRunFailedMetricInput(input: {
     invocationSource:
       readNonEmptyString(contextSnapshotObj.wakeReason) ??
       readNonEmptyString(contextSnapshotObj.retryReason),
-    isolationMode: input.k8sRunIsolation?.isolationMode ?? null,
+    isolationMode:
+      input.k8sRunIsolation?.isolationMode ?? readNonEmptyString(persistedIsolation.isolationMode),
   };
 }
 
@@ -5470,6 +5485,9 @@ function derivePaperclipPrTaskKey(
   const prNumber = readPrNumberFromWakeContext(contextSnapshot, payload);
   if (prNumber === null) return null;
 
+  // Casing compatibility is a two-phase rollout. Keep producing the legacy
+  // GitHub spelling until every reader understands both old and normalized
+  // keys; otherwise an old pod can miss a row written by a new pod.
   const repoFullName = readPrRepoFullNameFromWakeContext(contextSnapshot, payload) ?? "unknown";
 
   return `pr_review:${repoFullName}:${prNumber}`;
@@ -7490,7 +7508,9 @@ function runTaskKey(run: typeof heartbeatRuns.$inferSelect) {
 }
 
 function isSameTaskScope(left: string | null, right: string | null) {
-  return (left ?? null) === (right ?? null);
+  // Shared with the SQL predicate so the execution path and the coalescing
+  // query agree about legacy mixed-case pr_review keys during the transition.
+  return taskKeysMatch(left, right);
 }
 
 function isGithubStateChangeWake(contextSnapshot: Record<string, unknown> | null | undefined) {
@@ -7635,7 +7655,9 @@ async function coalescePendingTaskScopeWake(input: {
         eq(heartbeatRuns.companyId, input.companyId),
         eq(heartbeatRuns.agentId, input.agentId),
         inArray(heartbeatRuns.status, coalescibleStatuses),
-        eq(heartbeatRuns.contextTaskKey, input.taskKey),
+        // Shared casing-compatibility predicate: a normalized pr_review key must
+        // still coalesce into a legacy mixed-case run while those drain.
+        matchesTaskKey(heartbeatRuns.contextTaskKey, input.taskKey),
       ),
     )
     .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
@@ -11811,64 +11833,106 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // BLO-16998: same transient-retry rationale as setRunStatus — the guarded
     // finalize UPDATE is idempotent (status set-by-id, gated on the expected
     // current status) so replaying it on a transient failure is safe.
-    const updated = await runWithTransientDbRetry(
-      () =>
-        db
-          .update(heartbeatRuns)
-          .set({ status, ...patch, updatedAt: new Date() })
-          .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, expectedStatus)))
-          .returning()
-          .then((rows) => rows[0] ?? null),
-      {
-        onRetry: ({ attempt, error }) =>
-          logger.warn(
-            {
-              runId,
-              status,
-              attempt,
-              sqlstate: (error as { code?: string } | null)?.code,
-              err: error,
-            },
-            `${label} write hit a transient db error; retrying (BLO-16998)`,
-          ),
-      },
-    );
-
-    if (updated) {
-      if (isHeartbeatRunTerminalStatus(updated.status)) {
-        clearHeartbeatRunRuntimeStatus(updated.id);
-      }
-      publishLiveEvent({
-        companyId: updated.companyId,
-        type: "heartbeat.run.status",
-        payload: {
-          runId: updated.id,
-          agentId: updated.agentId,
-          status: updated.status,
-          invocationSource: updated.invocationSource,
-          triggerDetail: updated.triggerDetail,
-          error: updated.error ?? null,
-          errorCode: updated.errorCode ?? null,
-          startedAt: updated.startedAt ? new Date(updated.startedAt).toISOString() : null,
-          finishedAt: updated.finishedAt ? new Date(updated.finishedAt).toISOString() : null,
+    let updated: typeof heartbeatRuns.$inferSelect | null = null;
+    let ambiguousWriteError: unknown = null;
+    try {
+      updated = await runWithTransientDbRetry(
+        () =>
+          db
+            .update(heartbeatRuns)
+            .set({ status, ...patch, updatedAt: new Date() })
+            .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, expectedStatus)))
+            .returning()
+            .then((rows) => rows[0] ?? null),
+        {
+          onRetry: ({ attempt, error }) =>
+            logger.warn(
+              {
+                runId,
+                status,
+                attempt,
+                sqlstate: (error as { code?: string } | null)?.code,
+                err: error,
+              },
+              `${label} write hit a transient db error; retrying (BLO-16998)`,
+            ),
         },
-      });
-      publishRunLifecyclePluginEvent(updated);
-      if (TERMINAL_RUN_STATUSES.has(updated.status)) {
-        void refreshExternalRuntimeReservationMetrics(db).catch((err) => {
-          logger.warn({ err, runId: updated.id }, "failed to refresh external-runtime reservation metrics");
-        });
+      );
+    } catch (error) {
+      let cause: unknown = error;
+      for (let depth = 0; depth < 6 && cause && typeof cause === "object"; depth += 1) {
+        const record = cause as { code?: unknown; cause?: unknown };
+        if (typeof record.code === "string" && record.code.startsWith("08")) {
+          ambiguousWriteError = error;
+          break;
+        }
+        cause = record.cause;
       }
-      return { run: updated, updated: true as const };
+      if (!ambiguousWriteError) throw error;
     }
 
-    const current = await db
-      .select()
-      .from(heartbeatRuns)
-      .where(eq(heartbeatRuns.id, runId))
-      .then((rows) => rows[0] ?? null);
+    let current: typeof heartbeatRuns.$inferSelect | null = updated;
+    if (!current) {
+      for (let attempt = 1; attempt <= 3; attempt += 1) {
+        try {
+          current = await db
+            .select()
+            .from(heartbeatRuns)
+            .where(eq(heartbeatRuns.id, runId))
+            .then((rows) => rows[0] ?? null);
+          break;
+        } catch (error) {
+          if (!findPgError(error)?.code.startsWith("08") || attempt === 3) throw error;
+          logger.warn(
+            { runId, status, attempt, err: error },
+            `${label} ownership read hit a connection error; retrying`,
+          );
+          await new Promise((resolve) => setTimeout(resolve, 25 * attempt));
+        }
+      }
 
-    return { run: current, updated: false as const };
+      // A transient connection failure can hide a committed UPDATE result. The
+      // token is written atomically with the terminal transition, so only this
+      // invocation can recover ownership; later reconciler passes use new tokens.
+      const patchClaimToken = readNonEmptyString(
+        parseObject(parseObject(patch?.resultJson).externalLifecycleRecovery).terminalClaimToken,
+      );
+      const currentClaimToken = readNonEmptyString(
+        parseObject(parseObject(current?.resultJson).externalLifecycleRecovery).terminalClaimToken,
+      );
+      if (!current || !patchClaimToken || currentClaimToken !== patchClaimToken) {
+        if (ambiguousWriteError && (!current || current.status === expectedStatus)) {
+          throw ambiguousWriteError;
+        }
+        return { run: current, updated: false as const };
+      }
+    }
+
+    if (isHeartbeatRunTerminalStatus(current.status)) {
+      clearHeartbeatRunRuntimeStatus(current.id);
+    }
+    publishLiveEvent({
+      companyId: current.companyId,
+      type: "heartbeat.run.status",
+      payload: {
+        runId: current.id,
+        agentId: current.agentId,
+        status: current.status,
+        invocationSource: current.invocationSource,
+        triggerDetail: current.triggerDetail,
+        error: current.error ?? null,
+        errorCode: current.errorCode ?? null,
+        startedAt: current.startedAt ? new Date(current.startedAt).toISOString() : null,
+        finishedAt: current.finishedAt ? new Date(current.finishedAt).toISOString() : null,
+      },
+    });
+    publishRunLifecyclePluginEvent(current);
+    if (TERMINAL_RUN_STATUSES.has(current.status)) {
+      void refreshExternalRuntimeReservationMetrics(db).catch((err) => {
+        logger.warn({ err, runId: current.id }, "failed to refresh external-runtime reservation metrics");
+      });
+    }
+    return { run: current, updated: true as const };
   }
 
   function publishRunLifecyclePluginEvent(run: typeof heartbeatRuns.$inferSelect) {
@@ -16997,7 +17061,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           jobMessage: input.jobStatus?.message ?? null,
         }
       : externalLifecycleTerminalOutcome(input.jobStatus, preserveRecordedOutcome);
-    const terminalOutcome =
+    let terminalOutcome =
       baseTerminalOutcome && prReviewIncompleteOverride && !input.staleKill &&
         baseTerminalOutcome.errorCode !== "job_missing"
         ? {
@@ -17018,7 +17082,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const containerDiagnostics = terminalOutcome.errorCode === "job_failed"
       ? await captureFailedJobContainerDiagnostics(input.run, input.jobStatus)
       : null;
+    const containerFailureCode = classifyAgentJobFailureErrorCode(containerDiagnostics);
+    if (containerFailureCode) {
+      terminalOutcome = {
+        ...terminalOutcome,
+        errorCode: containerFailureCode,
+        error: `${terminalOutcome.error}; app container ${containerFailureCode}`,
+        recoveryReason: containerFailureCode,
+      };
+    }
 
+    const terminalClaimToken = randomUUID();
     let resultJson = mergeRunStopMetadataForAgent(
       { adapterType: input.adapterType, adapterConfig: parseObject(input.adapterConfig) },
       terminalOutcome.status,
@@ -17026,6 +17100,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         resultJson: {
           ...parseObject(input.run.resultJson),
           externalLifecycleRecovery: {
+            terminalClaimToken,
             reason: terminalOutcome.recoveryReason,
             jobPhase: terminalOutcome.jobPhase,
             jobReason: terminalOutcome.jobReason,
@@ -17045,7 +17120,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       },
     );
 
-    let finalizedRun: Awaited<ReturnType<typeof setRunStatus>>;
+    const finalizationAgent = await getAgent(input.run.agentId);
+    const claim = await setRunStatusIfRunning(input.run.id, terminalOutcome.status, {
+      error: terminalOutcome.error,
+      errorCode: terminalOutcome.errorCode,
+      finishedAt: input.now,
+      resultJson,
+    });
+    if (!claim.updated) return false;
+    let finalizedRun = claim.run;
+    if (terminalOutcome.status === "failed" && finalizationAgent) {
+      recordHeartbeatRunFailed(buildHeartbeatRunFailedMetricInput({
+        agent: finalizationAgent,
+        issueId: readNonEmptyString(parseObject(finalizedRun.contextSnapshot).issueId),
+        run: finalizedRun,
+        k8sRunIsolation: null,
+      }));
+    }
+
     let terminalJobQuiesced = input.jobStatus?.phase !== "active";
     if (input.staleKill) {
       // BLO-13176: claim the run terminally BEFORE the destructive Job delete.
@@ -17057,14 +17149,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // swap on status=running means only one pass wins the transition; the
       // losers no-op. If the Job delete then fails, the run is already terminal
       // and cleanupTerminalExternalLifecycleJobs reaps its lingering Job next pass.
-      const claim = await setRunStatusIfRunning(input.run.id, terminalOutcome.status, {
-        error: terminalOutcome.error,
-        errorCode: terminalOutcome.errorCode,
-        finishedAt: input.now,
-        resultJson,
-      });
-      if (!claim.updated) return false;
-      finalizedRun = claim.run;
       // BLO-12996: the Job is still phase:active but the run has been silent
       // past EXTERNAL_LIFECYCLE_HARD_STALE_MS. Force-terminate the live Job so
       // the slot (and node CPU) is reclaimed and the dispatcher's
@@ -17118,15 +17202,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           resultJson = mergedResultJson;
         }
       }
-    } else {
-      const claim = await setRunStatusIfRunning(input.run.id, terminalOutcome.status, {
-        error: terminalOutcome.error,
-        errorCode: terminalOutcome.errorCode,
-        finishedAt: input.now,
-        resultJson,
-      });
-      if (!claim.updated) return false;
-      finalizedRun = claim.run;
     }
     await setWakeupStatus(input.run.wakeupRequestId, terminalOutcome.wakeupStatus, {
       finishedAt: input.now,
@@ -17158,7 +17233,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // reviewer path). Mirror the liveness retry decision so the bounded re-queue
     // fires for these reconciler-finalized failures as well. Non-pr / non-retryable
     // codes return false from the predicate and stay terminal (BLO-7913 leak guard).
-    const finalizationAgent = await getAgent(finalizedRun.agentId);
     if (
       terminalOutcome.status === "failed" &&
       adapterInvocationStarted !== true &&
@@ -28738,7 +28812,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           and(
             eq(heartbeatRuns.agentId, agentId),
             inArray(heartbeatRuns.status, TASK_SCOPE_COALESCIBLE_RUN_STATUSES),
-            eq(heartbeatRuns.contextTaskKey, taskKey),
+            // Same casing-compatibility predicate as coalescing: the close/draft
+            // sweep must still cancel a legacy mixed-case run for this PR.
+            matchesTaskKey(heartbeatRuns.contextTaskKey, taskKey),
           ),
         )
         .returning();

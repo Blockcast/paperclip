@@ -7,6 +7,7 @@ import { redactCurrentUserText } from "../log-redaction.js";
 import { logActivity, type LogActivityInput } from "./activity-log.js";
 import { REDACTED_EVENT_VALUE, redactApprovalPayloadByType } from "../redaction.js";
 import { agentService } from "./agents.js";
+import { insertApprovalRecord } from "./approval-insert.js";
 import { budgetService } from "./budgets.js";
 import { notifyHireApproved } from "./hire-hook.js";
 import { instanceSettingsService } from "./instance-settings.js";
@@ -280,12 +281,13 @@ export function approvalService(db: Db) {
       return rows[0] ?? null;
     },
 
+    // Routed through insertApprovalRecord() (BLO-22705) rather than a direct
+    // db.insert(approvals) so this generic, caller-supplied-payload boundary
+    // can't silently file a card with no title/name/summary/recommendedAction
+    // to render. The HTTP route additionally enforces payload.title via
+    // createApprovalSchema before calling this.
     create: (companyId: string, data: Omit<typeof approvals.$inferInsert, "companyId">) =>
-      db
-        .insert(approvals)
-        .values({ ...data, companyId })
-        .returning()
-        .then((rows) => rows[0]),
+      insertApprovalRecord(db, { ...data, companyId }).then((rows) => rows[0]),
 
     /**
      * Create, replaying an existing undecided approval when the same requester reuses
@@ -312,12 +314,18 @@ export function approvalService(db: Db) {
         throw unprocessable("Approval requester must be either an agent or a user, not both");
       }
 
+      // Routed through insertApprovalRecord() (BLO-22705), matching create() above,
+      // rather than a direct db.insert(approvals) — this is the same HTTP-validated
+      // (createApprovalSchema) caller-supplied-payload boundary, and going through
+      // the shared helper keeps every db.insert(approvals) call site in this file
+      // covered by approval-payload-title-guard.test.ts instead of needing its own
+      // allowlist entry.
       async function insertNew(client: Db, normalizedKey: string | null) {
-        const approval = await client
-          .insert(approvals)
-          .values({ ...data, companyId, idempotencyKey: normalizedKey })
-          .returning()
-          .then((rows) => rows[0]);
+        const approval = await insertApprovalRecord(client, {
+          ...data,
+          companyId,
+          idempotencyKey: normalizedKey,
+        }).then((rows) => rows[0]);
         await options.afterCreate?.(client, approval);
         return { approval, deduplicated: false };
       }

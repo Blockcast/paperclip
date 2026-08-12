@@ -40,6 +40,7 @@ import {
   __test_idempotentWakeStatuses,
   __test_prReviewerWakeIdempotencyScope,
   __test_recordWorkflowRunSighting,
+  __test_resolvePrCommentReviewGateWebhookTrigger,
   __test_resolveDependabotAlertContext,
   __test_resolveEventContext,
   __test_shouldFirePrReviewerWake,
@@ -58,6 +59,8 @@ import {
   __resetMetricsForTest,
   getMetricsRegistry,
 } from "../services/metrics.js";
+import { issueService } from "../services/issues.js";
+import { errorHandler } from "../middleware/index.js";
 
 /**
  * Sum {@link GITHUB_REVIEW_REQUEST_DELIVERY_METRIC} across every `reason`
@@ -1358,6 +1361,89 @@ describe("workflow_run supersession classification (BLO-21078 AC3)", () => {
   });
 });
 
+describe("comment-review gate webhook trigger", () => {
+  const repo = "Blockcast/paperclip";
+  const head = "1234567890abcdef1234567890abcdef12345678";
+  const reviewer = "allyblockcast[bot]";
+
+  function issueCommentPayload(author = reviewer, body = "## Ally — Consolidated PR Review\n### Important Issues (0)") {
+    return {
+      action: "created",
+      repository: { full_name: repo },
+      issue: {
+        number: 1049,
+        html_url: `https://github.com/${repo}/pull/1049`,
+        pull_request: { url: `https://api.github.com/repos/${repo}/pulls/1049` },
+      },
+      comment: { user: { login: author }, body },
+    };
+  }
+
+  it("triggers for a trusted Ally PR comment even with no Paperclip identifier", () => {
+    expect(
+      __test_resolvePrCommentReviewGateWebhookTrigger(
+        "issue_comment",
+        issueCommentPayload(),
+        reviewer,
+      ),
+    ).toEqual({
+      repoFullName: repo,
+      prNumber: 1049,
+      prUrl: `https://github.com/${repo}/pull/1049`,
+    });
+  });
+
+  it("rejects a same-shaped human comment and a prose mention of the heading", () => {
+    expect(
+      __test_resolvePrCommentReviewGateWebhookTrigger(
+        "issue_comment",
+        issueCommentPayload("allyblockcast"),
+        reviewer,
+      ),
+    ).toBeNull();
+    expect(
+      __test_resolvePrCommentReviewGateWebhookTrigger(
+        "issue_comment",
+        issueCommentPayload(reviewer, "Please revisit your Ally — Consolidated PR Review."),
+        reviewer,
+      ),
+    ).toBeNull();
+  });
+
+  it.each(["opened", "reopened", "synchronize"])("starts a fresh status check on pull_request.%s", (action) => {
+    expect(
+      __test_resolvePrCommentReviewGateWebhookTrigger(
+        "pull_request",
+        {
+          action,
+          repository: { full_name: repo },
+          pull_request: { number: 1049, html_url: `https://github.com/${repo}/pull/1049`, head: { sha: head } },
+        },
+        reviewer,
+      ),
+    ).toEqual({
+      repoFullName: repo,
+      prNumber: 1049,
+      headSha: head,
+      prUrl: `https://github.com/${repo}/pull/1049`,
+    });
+  });
+
+  it("does not run on unrelated PR lifecycle actions", () => {
+    expect(
+      __test_resolvePrCommentReviewGateWebhookTrigger(
+        "pull_request",
+        {
+          action: "closed",
+          repository: { full_name: repo },
+          pull_request: { number: 1049, head: { sha: head } },
+        },
+        reviewer,
+      ),
+    ).toBeNull();
+  });
+});
+
 describeEmbeddedPostgres("github-webhook route", () => {
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   let db: ReturnType<typeof createDb>;
@@ -1392,7 +1478,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
     await tempDb?.cleanup();
   }, 60_000);
 
-  function buildApp(config: Pick<GithubWebhookConfig, "prReviewerAgentIds" | "prReviewerAgentId" | "prReviewerBotLogin" | "selfReviewEscalationThreshold" | "dependabotAgentId" | "dependabotMinSeverity" | "heartbeatOptions"> = {}) {
+  function buildApp(config: Pick<GithubWebhookConfig, "prReviewerAgentIds" | "prReviewerAgentId" | "prReviewerBotLogin" | "runPrCommentReviewGateCheck" | "selfReviewEscalationThreshold" | "dependabotAgentId" | "dependabotMinSeverity" | "heartbeatOptions"> = {}) {
     const app = express();
     app.use(express.json({
       verify: (req, _res, buf) => {
@@ -1402,12 +1488,17 @@ describeEmbeddedPostgres("github-webhook route", () => {
     app.use("/api/webhooks/github", githubWebhookRoutes(db, {
       webhookSecret,
       ...config,
+      runPrCommentReviewGateCheck: config.runPrCommentReviewGateCheck ?? (async () => ({
+        posted: false as const,
+        reason: "not_configured" as const,
+      })),
       heartbeatOptions: {
         penstockAvailabilityGate: allowPenstockGate,
         skipQueuedRunDispatch: true,
         ...config.heartbeatOptions,
       },
     }));
+    app.use(errorHandler);
     return app;
   }
 
@@ -1569,6 +1660,57 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(res.body).toMatchObject({ ignored: "no_matching_issue", identifiers: ["UNKNOWN-1234"] });
   });
 
+  it("runs the comment-review gate for a trusted Ally comment without a Paperclip identifier", async () => {
+    const calls: Array<{
+      repoFullName: string;
+      prNumber: number;
+      headSha?: string | null;
+      prUrl?: string | null;
+    }> = [];
+    let markCalled!: () => void;
+    const called = new Promise<void>((resolve) => {
+      markCalled = resolve;
+    });
+    const app = buildApp({
+      prReviewerBotLogin: "allyblockcast[bot]",
+      runPrCommentReviewGateCheck: async (input) => {
+        calls.push(input);
+        markCalled();
+        return { posted: true, verdict: { state: "success", reason: "test" } };
+      },
+    });
+    const payload = {
+      action: "created",
+      repository: { full_name: "Blockcast/paperclip" },
+      issue: {
+        number: 1049,
+        title: "No tracker reference here",
+        pull_request: { url: "https://api.github.com/repos/Blockcast/paperclip/pulls/1049" },
+      },
+      comment: {
+        user: { login: "allyblockcast[bot]" },
+        body: "## Ally — Consolidated PR Review\n### Important Issues (0)",
+      },
+    };
+    const { body, signature } = signedRequest(payload);
+
+    const response = await request(app)
+      .post("/api/webhooks/github")
+      .set("x-github-event", "issue_comment")
+      .set("x-hub-signature-256", signature)
+      .set("content-type", "application/json")
+      .send(body);
+    await called;
+
+    expect(response.status).toBe(200);
+    expect(response.body).toMatchObject({ ignored: "no_paperclip_identifier" });
+    expect(calls).toEqual([{
+      repoFullName: "Blockcast/paperclip",
+      prNumber: 1049,
+      prUrl: "https://github.com/Blockcast/paperclip/pull/1049",
+    }]);
+  });
+
   it("leaves reviewer wakes queued when the webhook runs on the API tier", async () => {
     const { agentId } = await seedCompanyAndAgent({ agentName: "Ally" });
     const app = buildApp({
@@ -1710,7 +1852,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
     }));
   });
 
-  it("assigns PR review wakes to the least-loaded active reviewer", async () => {
+  it("counts scheduled retries when assigning to the least-loaded active reviewer", async () => {
     const { companyId, agentId: busyReviewerId } = await seedCompanyAndAgent({
       agentName: "Ally",
     });
@@ -1731,8 +1873,10 @@ describeEmbeddedPostgres("github-webhook route", () => {
       agentId: busyReviewerId,
       invocationSource: "automation",
       triggerDetail: "system",
-      status: "queued",
-      contextSnapshot: { taskKey: "pr_review:Blockcast/magma:975" },
+      status: "scheduled_retry",
+      scheduledRetryAt: new Date(Date.now() + 5 * 60 * 1000),
+      scheduledRetryReason: "ccrotate_capacity",
+      contextSnapshot: { taskKey: "pr_review:blockcast/magma:975" },
     });
 
     const app = buildApp({ prReviewerAgentIds: [busyReviewerId, idleReviewerId] });
@@ -1836,7 +1980,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
       invocationSource: "automation",
       triggerDetail: "system",
       status: "queued",
-      contextSnapshot: { taskKey: "pr_review:Blockcast/magma:975" },
+      contextSnapshot: { taskKey: "pr_review:blockcast/magma:975" },
     });
 
     const app = buildApp({
@@ -1933,6 +2077,91 @@ describeEmbeddedPostgres("github-webhook route", () => {
       .where(inArray(heartbeatRuns.agentId, [firstReviewerId, secondReviewerId]));
     expect(runs).toHaveLength(1);
   });
+
+  it("returns a retryable error instead of bypassing an issue-create PR lock", async () => {
+    const { companyId, agentId: reviewerId } = await seedCompanyAndAgent({ agentName: "Ally" });
+    const app = buildApp({ prReviewerAgentIds: [reviewerId] });
+    const taskKey = "pr_review:blockcast/paperclip:20526";
+    let releaseIssueCreate!: () => void;
+    let reportGuardPassed!: () => void;
+    const guardPassed = new Promise<void>((resolve) => {
+      reportGuardPassed = resolve;
+    });
+    const release = new Promise<void>((resolve) => {
+      releaseIssueCreate = resolve;
+    });
+    const previousReviewerIds = process.env.PAPERCLIP_PR_REVIEWER_AGENT_IDS;
+    process.env.PAPERCLIP_PR_REVIEWER_AGENT_IDS = reviewerId;
+    const issueCreate = issueService(db).create(companyId, {
+      title: "Review Blockcast/paperclip PR #20526",
+      description: "Please review https://github.com/blockcast/paperclip/pull/20526.",
+      assigneeAgentId: reviewerId,
+      status: "todo",
+      priority: "medium",
+      beforeSideEffects: async () => {
+        reportGuardPassed();
+        await release;
+      },
+    });
+    try {
+      await Promise.race([
+        guardPassed,
+        issueCreate.then(() => {
+          throw new Error("issue create committed before reaching the guarded pause");
+        }),
+      ]);
+
+      const payload = {
+        action: "opened",
+        pull_request: {
+          number: 20526,
+          title: "Do not lose a contended review wake",
+          body: null,
+          head: { ref: "cto/blo-20526" },
+        },
+        repository: { full_name: "Blockcast/paperclip" },
+      };
+      const { body, signature } = signedRequest(payload);
+      const contended = await request(app)
+        .post("/api/webhooks/github")
+        .set("x-github-event", "pull_request")
+        .set("x-hub-signature-256", signature)
+        .set("x-github-delivery", "delivery-blo-20526-lock-contention")
+        .set("content-type", "application/json")
+        .send(body);
+
+      expect(contended.status).toBe(503);
+      expect(contended.body).toMatchObject({
+        code: "pr_reviewer_dispatch_contended",
+      });
+      expect(await db
+        .select({ contextTaskKey: heartbeatRuns.contextTaskKey })
+        .from(heartbeatRuns)
+        .where(and(
+          eq(heartbeatRuns.agentId, reviewerId),
+          sql`lower(${heartbeatRuns.contextTaskKey}) = ${taskKey}`,
+        )))
+        .toHaveLength(0);
+    } finally {
+      releaseIssueCreate();
+      try {
+        await issueCreate;
+      } finally {
+        if (previousReviewerIds === undefined) delete process.env.PAPERCLIP_PR_REVIEWER_AGENT_IDS;
+        else process.env.PAPERCLIP_PR_REVIEWER_AGENT_IDS = previousReviewerIds;
+      }
+    }
+
+    expect(await db.select().from(issues).where(eq(issues.companyId, companyId))).toHaveLength(1);
+    expect(await db
+      .select({ contextTaskKey: heartbeatRuns.contextTaskKey })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.agentId, reviewerId),
+        sql`lower(${heartbeatRuns.contextTaskKey}) = ${taskKey}`,
+      )))
+      .toHaveLength(0);
+  }, 10_000);
 
   it("counts a review-request delivery as received+queued once, and does not count a deduped replay (BLO-18859)", async () => {
     __resetMetricsForTest();
@@ -2115,8 +2344,14 @@ describeEmbeddedPostgres("github-webhook route", () => {
       .from(heartbeatRuns)
       .where(inArray(heartbeatRuns.agentId, [firstReviewerId, secondReviewerId]));
     expect(runs).toHaveLength(1);
+    // Which member of the pool wins the initial tie is a sha256(taskKey)
+    // spreading detail, not the property under test — asserting a specific id
+    // re-breaks this test every time the task key's spelling changes. What must
+    // hold is that the follow-up delivery lands on whoever already owns the PR,
+    // producing exactly one run carrying the newest head.
+    const owningReviewerId = runs[0]!.agentId;
+    expect([firstReviewerId, secondReviewerId]).toContain(owningReviewerId);
     expect(runs[0]).toMatchObject({
-      agentId: firstReviewerId,
       contextSnapshot: expect.objectContaining({
         taskKey: "pr_review:Blockcast/magma:976",
         githubPrNumber: 976,
@@ -2133,12 +2368,97 @@ describeEmbeddedPostgres("github-webhook route", () => {
       .from(agentWakeupRequests)
       .where(inArray(agentWakeupRequests.agentId, [firstReviewerId, secondReviewerId]));
     expect(wakes).toHaveLength(2);
-    expect(wakes.every((wake) => wake.agentId === firstReviewerId)).toBe(true);
+    expect(wakes.every((wake) => wake.agentId === owningReviewerId)).toBe(true);
     expect(wakes).toContainEqual(expect.objectContaining({
       status: "coalesced",
       idempotencyKey:
         "pr_review:Blockcast/magma:976:github_pr_synchronized:delivery:delivery-review-pool-affinity-synchronized",
     }));
+  });
+
+  it("keeps follow-up wakes with the reviewer whose PR run is scheduled for retry", async () => {
+    const { companyId, agentId: firstReviewerId } = await seedCompanyAndAgent({
+      agentName: "Ally",
+    });
+    const secondReviewerId = randomUUID();
+    await db.insert(agents).values({
+      id: secondReviewerId,
+      companyId,
+      name: "Ally 2",
+      role: "engineer",
+      status: "idle",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const taskKey = "pr_review:Blockcast/magma:977";
+    await db.insert(heartbeatRuns).values([
+      {
+        id: randomUUID(),
+        companyId,
+        agentId: firstReviewerId,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status: "scheduled_retry",
+        scheduledRetryAt: new Date(Date.now() + 5 * 60 * 1000),
+        scheduledRetryReason: "ccrotate_capacity",
+        contextSnapshot: {
+          taskKey,
+          reviewKind: "pr_review",
+          githubPrNumber: 977,
+          githubRepoFullName: "Blockcast/magma",
+        },
+      },
+      {
+        id: randomUUID(),
+        companyId,
+        agentId: firstReviewerId,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status: "queued",
+        contextSnapshot: { taskKey: "pr_review:Blockcast/other:1" },
+      },
+    ]);
+
+    const app = buildApp({ prReviewerAgentIds: [firstReviewerId, secondReviewerId] });
+    const delivery = signedRequest({
+      action: "synchronize",
+      pull_request: {
+        number: 977,
+        title: "Keep scheduled retry affinity",
+        body: null,
+        html_url: "https://github.com/Blockcast/magma/pull/977",
+        head: { ref: "review-pool-retry-affinity", sha: "second-head" },
+      },
+      repository: { full_name: "Blockcast/magma" },
+    });
+    const response = await request(app)
+      .post("/api/webhooks/github")
+      .set("x-github-event", "pull_request")
+      .set("x-hub-signature-256", delivery.signature)
+      .set("x-github-delivery", "delivery-review-pool-retry-affinity")
+      .set("content-type", "application/json")
+      .send(delivery.body);
+
+    expect(response.status).toBe(200);
+    expect(response.body.reviewerWakeFired).toBe(true);
+    const prRuns = await db
+      .select({ agentId: heartbeatRuns.agentId, status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.contextTaskKey, taskKey));
+    expect(prRuns).toEqual([{ agentId: firstReviewerId, status: "scheduled_retry" }]);
+    const [wake] = await db
+      .select({ agentId: agentWakeupRequests.agentId, status: agentWakeupRequests.status })
+      .from(agentWakeupRequests)
+      .where(
+        eq(
+          agentWakeupRequests.idempotencyKey,
+          "pr_review:Blockcast/magma:977:github_pr_synchronized:delivery:delivery-review-pool-retry-affinity",
+        ),
+      );
+    expect(wake).toEqual({ agentId: firstReviewerId, status: "coalesced" });
   });
 
   it("serializes concurrent first events for the same PR before assigning a reviewer", async () => {
@@ -2159,7 +2479,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
       permissions: {},
     });
 
-    const taskKey = "pr_review:Blockcast/magma:978";
+    const taskKey = "pr_review:blockcast/magma:978";
     let reportLockAcquired!: () => void;
     let releaseLock!: () => void;
     const lockAcquired = new Promise<void>((resolve) => {
@@ -2476,7 +2796,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
       runtimeConfig: {},
       permissions: {},
     });
-    const taskKey = "pr_review:Blockcast/paperclip:981";
+    const taskKey = "pr_review:blockcast/paperclip:981";
     const wakeupIds = [randomUUID(), randomUUID()];
     const runIds = [randomUUID(), randomUUID()];
 
@@ -2569,7 +2889,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
       runtimeConfig: {},
       permissions: {},
     });
-    const taskKey = "pr_review:Blockcast/paperclip:982";
+    const taskKey = "pr_review:blockcast/paperclip:982";
     const runId = randomUUID();
 
     await db.insert(heartbeatRuns).values({
@@ -2633,6 +2953,75 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(authorWakes).toEqual([]);
   });
 
+  it("dedups a legacy-spelled redelivery against a normalized idempotency key (BLO-20526 rollout regression)", async () => {
+    const reviewerAgentId = randomUUID();
+    const { companyId } = await seedCompanyAndAgent();
+    await db.insert(agents).values({
+      id: reviewerAgentId,
+      companyId,
+      name: "Ally",
+      role: "engineer",
+      status: "idle",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const app = buildApp({ prReviewerAgentId: reviewerAgentId });
+    const deliveryId = "delivery-redelivered-across-rollout";
+
+    // A normalized row can already exist from a canary or interrupted rollout.
+    // Phase-one producers retain the legacy spelling for old-reader safety, so
+    // the compatibility read must also work in this direction.
+    const normalizedIdempotencyKey = `pr_review:blockcast/paperclip:631:github_pr_synchronized:delivery:${deliveryId}`;
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId: reviewerAgentId,
+      source: "github",
+      reason: "github_pr_synchronized",
+      idempotencyKey: normalizedIdempotencyKey,
+      status: "queued",
+      payload: { taskKey: "pr_review:blockcast/paperclip:631" },
+    });
+
+    // GitHub reuses the delivery id when it retries a delivery, so this is the
+    // same request arriving again through the phase-one legacy producer.
+    const redelivery = signedRequest({
+      action: "synchronize",
+      pull_request: {
+        number: 631,
+        title: "feat(issues): reject duplicate PR-review issues",
+        body: null,
+        html_url: "https://github.com/Blockcast/paperclip/pull/631",
+        head: { ref: "cto/blo-20526-guard", sha: "5ec17d77" },
+      },
+      repository: { full_name: "Blockcast/paperclip" },
+    });
+    const res = await request(app)
+      .post("/api/webhooks/github")
+      .set("x-github-event", "pull_request")
+      .set("x-hub-signature-256", redelivery.signature)
+      .set("x-github-delivery", deliveryId)
+      .set("content-type", "application/json")
+      .send(redelivery.body);
+
+    expect(res.status).toBe(200);
+
+    // Byte-exact equality makes the normalized row invisible to the legacy
+    // spelling and queues a SECOND review. Exactly one wake must remain.
+    const reviewerWakes = await db
+      .select({
+        idempotencyKey: agentWakeupRequests.idempotencyKey,
+        status: agentWakeupRequests.status,
+      })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, reviewerAgentId));
+    expect(reviewerWakes).toEqual([
+      { idempotencyKey: normalizedIdempotencyKey, status: "queued" },
+    ]);
+  });
+
   it("does not permanently block reviewer wakes once a dispatch retry chain is exhausted (BLO-14395 regression)", async () => {
     const reviewerAgentId = randomUUID();
     const { companyId } = await seedCompanyAndAgent();
@@ -2664,7 +3053,8 @@ describeEmbeddedPostgres("github-webhook route", () => {
     // Simulate a prior synchronize event whose wake dispatch retried and
     // exhausted (5 attempts, all failed) under the old stable key. Fresh
     // synchronize deliveries must not be blocked by that stale row.
-    const staleIdempotencyKey = "pr_review:Blockcast/paperclip:630:github_pr_synchronized";
+    const staleIdempotencyKey = "pr_review:blockcast/paperclip:630:github_pr_synchronized";
+    // Canonical mixed-case: the phase-one producer preserves GitHub's spelling.
     const freshIdempotencyKey =
       "pr_review:Blockcast/paperclip:630:github_pr_synchronized:delivery:delivery-post-exhaustion";
     await db.insert(agentWakeupRequests).values({
@@ -2674,7 +3064,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
       reason: "github_pr_synchronized",
       idempotencyKey: staleIdempotencyKey,
       status: "dispatch_failed_exhausted",
-      payload: { taskKey: "pr_review:Blockcast/paperclip:630" },
+      payload: { taskKey: "pr_review:blockcast/paperclip:630" },
     });
 
     const fresh = signedRequest(synchronizePayload("freshsha"));
@@ -2733,7 +3123,8 @@ describeEmbeddedPostgres("github-webhook route", () => {
     // A prior synchronize was reviewed to COMPLETION on an earlier head under
     // the old stable key. Fresh synchronize deliveries must not be blocked by
     // that stale row.
-    const staleIdempotencyKey = "pr_review:Blockcast/paperclip:813:github_pr_synchronized";
+    const staleIdempotencyKey = "pr_review:blockcast/paperclip:813:github_pr_synchronized";
+    // Canonical mixed-case: the phase-one producer preserves GitHub's spelling.
     const freshIdempotencyKey =
       "pr_review:Blockcast/paperclip:813:github_pr_synchronized:delivery:delivery-fixup-after-completed-review";
     await db.insert(agentWakeupRequests).values({
@@ -2743,7 +3134,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
       reason: "github_pr_synchronized",
       idempotencyKey: staleIdempotencyKey,
       status: "completed",
-      payload: { taskKey: "pr_review:Blockcast/paperclip:813", headSha: "oldhead" },
+      payload: { taskKey: "pr_review:blockcast/paperclip:813", headSha: "oldhead" },
     });
 
     // Author pushes a fixup; the review gate is now pending on the new head. A
@@ -2790,6 +3181,10 @@ describeEmbeddedPostgres("github-webhook route", () => {
       permissions: {},
     });
 
+    // Phase-one producers keep GitHub's canonical mixed-case spelling, so this
+    // is the key the route actually writes. The seeded stale row below stays
+    // lowercase on purpose: it stands in for a row a normalized build wrote,
+    // and the compatibility read has to see across the two spellings.
     const idempotencyKey = "pr_review:Blockcast/magma:1368:github_pr_opened";
     await db.insert(agentWakeupRequests).values({
       companyId,
@@ -2798,7 +3193,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
       reason: "github_pr_opened",
       idempotencyKey,
       status: "completed",
-      payload: { taskKey: "pr_review:Blockcast/magma:1368" },
+      payload: { taskKey: "pr_review:blockcast/magma:1368" },
     });
 
     const app = buildApp({ prReviewerAgentId: reviewerAgentId });
@@ -2875,7 +3270,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
     let prNumber = 700;
     for (const status of ["dispatch_failed", "dispatch_recovered", "dispatch_superseded"] as const) {
       prNumber += 1;
-      const idempotencyKey = `pr_review:Blockcast/paperclip:${prNumber}:github_pr_opened`;
+      const idempotencyKey = `pr_review:blockcast/paperclip:${prNumber}:github_pr_opened`;
       await db.insert(agentWakeupRequests).values({
         companyId,
         agentId: reviewerAgentId,
@@ -2883,7 +3278,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
         reason: "github_pr_opened",
         idempotencyKey,
         status,
-        payload: { taskKey: `pr_review:Blockcast/paperclip:${prNumber}` },
+        payload: { taskKey: `pr_review:blockcast/paperclip:${prNumber}` },
       });
 
       const { body, signature } = signedRequest(openedPayload(prNumber));

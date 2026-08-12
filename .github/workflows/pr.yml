@@ -96,9 +96,12 @@ jobs:
 
       - name: Reject App-attributed commits on the PR (BLO-21416)
         # Non-merge commits stamped with the shared allyblockcast[bot] App
-        # identity mean the commit was created via the GitHub REST/MCP write
-        # path (contents API, merge API, `create_or_update_file`/
-        # `push_files`) instead of `git push` — see AGENTS.md §9. Uses the
+        # identity mean either the commit was created via the GitHub
+        # REST/MCP write path (contents API, merge API,
+        # `create_or_update_file`/`push_files`), OR it was made with `git
+        # push` from a checkout whose local git config itself holds the App
+        # identity — measured on 11 of 71 sampled checkouts (BLO-23894), so
+        # `git push` is not a guaranteed fix. See AGENTS.md §9. Uses the
         # already-checked-out history (fetch-depth: 0 above), no new token.
         #
         # There is deliberately NO branch exemption. The graphify-reindex bot

@@ -28,15 +28,16 @@ import { computeIssueMonitorGateFingerprint } from "../services/issue-execution-
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
 import { issueService } from "../services/issues.js";
 import { subscribeCompanyLiveEvents } from "../services/live-events.js";
+import { loadConfig } from "../config.js";
 import {
-  STRANDED_RECOVERY_MAX_OWNER_WAKE_ATTEMPTS,
-  STRANDED_RECOVERY_OWNER_WAKE_HORIZON_MS,
   recoveryService,
   strandedRecoveryWakeAttemptsExhausted,
 } from "../services/recovery/service.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+const defaultRecoveryActionMaxAttempts = loadConfig().recoveryActionMaxAttempts;
+const defaultRecoveryActionTimeoutMs = loadConfig().recoveryActionTimeoutMs;
 
 /**
  * BLO-18996 (review follow-up): lets one test make `releaseWakeAttempt` fail.
@@ -1634,7 +1635,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     // matters is that N escalations produce fewer than N wakes. On master there is no
     // budget at all, so all N fire and that comparison is what fails.
     const ESCALATIONS = 7;
-    expect(STRANDED_RECOVERY_MAX_OWNER_WAKE_ATTEMPTS).toBeLessThan(ESCALATIONS);
+    expect(defaultRecoveryActionMaxAttempts).toBeLessThan(ESCALATIONS);
     for (let attempt = 0; attempt < ESCALATIONS; attempt += 1) {
       await recovery.escalateStrandedAssignedIssue({
         issue: sourceIssue,
@@ -1647,7 +1648,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     // The unbounded-loop assertion: the sweep stopped paying for wakes that cannot make
     // progress, well before it ran out of escalations to perform.
     expect(enqueueWakeup.mock.calls.length).toBeLessThan(ESCALATIONS);
-    expect(enqueueWakeup.mock.calls.length).toBe(STRANDED_RECOVERY_MAX_OWNER_WAKE_ATTEMPTS);
+    expect(enqueueWakeup.mock.calls.length).toBe(defaultRecoveryActionMaxAttempts);
 
     const [actionRow] = await db
       .select()
@@ -1656,7 +1657,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(actionRow).toMatchObject({
       status: "active",
       attemptCount: ESCALATIONS,
-      maxAttempts: STRANDED_RECOVERY_MAX_OWNER_WAKE_ATTEMPTS,
+      maxAttempts: defaultRecoveryActionMaxAttempts,
     });
 
     const commentBodies = await db
@@ -1676,7 +1677,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       latestRun: { ...baseRun, id: randomUUID() },
       comment: "Automatic continuation recovery failed.",
     });
-    expect(enqueueWakeup.mock.calls.length).toBe(STRANDED_RECOVERY_MAX_OWNER_WAKE_ATTEMPTS);
+    expect(enqueueWakeup.mock.calls.length).toBe(defaultRecoveryActionMaxAttempts);
     const repeatedAnnouncements = await db
       .select({ body: issueComments.body })
       .from(issueComments)
@@ -1687,6 +1688,64 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         )
       );
     expect(repeatedAnnouncements).toHaveLength(1);
+  });
+
+  it("stamps configured bounds when creating a wake-owner recovery action", async () => {
+    const previousMaxAttempts = process.env.RECOVERY_ACTION_MAX_ATTEMPTS;
+    const previousTimeoutMs = process.env.RECOVERY_ACTION_TIMEOUT_MS;
+    const configuredMaxAttempts = 9;
+    const configuredTimeoutMs = 2 * 60 * 60 * 1000;
+    const now = new Date("2026-08-11T12:00:00.000Z");
+
+    process.env.RECOVERY_ACTION_MAX_ATTEMPTS = String(configuredMaxAttempts);
+    process.env.RECOVERY_ACTION_TIMEOUT_MS = String(configuredTimeoutMs);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(now);
+    try {
+      const { coderId, sourceIssue } = await seedCompany();
+      const recovery = recoveryService(db, {
+        enqueueWakeup: async () => ({ id: randomUUID() }),
+      });
+
+      await recovery.escalateStrandedAssignedIssue({
+        issue: sourceIssue,
+        previousStatus: "in_progress",
+        latestRun: {
+          id: randomUUID(),
+          agentId: coderId,
+          status: "failed",
+          error: "adapter failed",
+          errorCode: "adapter_failed",
+          contextSnapshot: { retryReason: "issue_continuation_needed" },
+          livenessState: "needs_followup",
+          resultJson: null,
+          usageJson: null,
+          createdAt: now,
+        },
+        comment: "Automatic continuation recovery failed.",
+      });
+
+      const [action] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+      expect(action).toMatchObject({ maxAttempts: configuredMaxAttempts });
+      expect(action?.timeoutAt).not.toBeNull();
+      expect(new Date(action!.timeoutAt as unknown as string).getTime())
+        .toBe(now.getTime() + configuredTimeoutMs);
+    } finally {
+      vi.useRealTimers();
+      if (previousMaxAttempts === undefined) {
+        delete process.env.RECOVERY_ACTION_MAX_ATTEMPTS;
+      } else {
+        process.env.RECOVERY_ACTION_MAX_ATTEMPTS = previousMaxAttempts;
+      }
+      if (previousTimeoutMs === undefined) {
+        delete process.env.RECOVERY_ACTION_TIMEOUT_MS;
+      } else {
+        process.env.RECOVERY_ACTION_TIMEOUT_MS = previousTimeoutMs;
+      }
+    }
   });
 
   it("restores the wake budget for a replacement recovery owner and keeps the old owner's spent budget", async () => {
@@ -1754,7 +1813,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       enqueueWakeup.mock.calls.filter((call) => call[0] === agentId).length;
 
     // 1. Spend the whole budget against the first owner.
-    const ESCALATIONS = STRANDED_RECOVERY_MAX_OWNER_WAKE_ATTEMPTS + 2;
+    const ESCALATIONS = defaultRecoveryActionMaxAttempts + 2;
     for (let attempt = 0; attempt < ESCALATIONS; attempt += 1) {
       await recovery.escalateStrandedAssignedIssue({
         issue: sourceIssue,
@@ -1763,13 +1822,13 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         comment: "Automatic continuation recovery failed.",
       });
     }
-    expect(wakesTo(managerId)).toBe(STRANDED_RECOVERY_MAX_OWNER_WAKE_ATTEMPTS);
+    expect(wakesTo(managerId)).toBe(defaultRecoveryActionMaxAttempts);
     const [exhaustedAction] = await db
       .select()
       .from(issueRecoveryActions)
       .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
     expect(exhaustedAction).toMatchObject({ status: "active", ownerAgentId: managerId });
-    expect(exhaustedAction!.attemptCount).toBeGreaterThan(STRANDED_RECOVERY_MAX_OWNER_WAKE_ATTEMPTS);
+    expect(exhaustedAction!.attemptCount).toBeGreaterThan(defaultRecoveryActionMaxAttempts);
 
     // 2. Hand the work to the other reporting line, then sweep again through the real path.
     await db
@@ -1819,9 +1878,9 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         comment: "Automatic continuation recovery failed.",
       });
     }
-    expect(wakesTo(secondManagerId)).toBe(STRANDED_RECOVERY_MAX_OWNER_WAKE_ATTEMPTS);
+    expect(wakesTo(secondManagerId)).toBe(defaultRecoveryActionMaxAttempts);
     // The first owner's budget stayed spent — the reset is scoped to the new owner.
-    expect(wakesTo(managerId)).toBe(STRANDED_RECOVERY_MAX_OWNER_WAKE_ATTEMPTS);
+    expect(wakesTo(managerId)).toBe(defaultRecoveryActionMaxAttempts);
 
     // 5. And the new owner's exhaustion is announced on its own terms, rather than being
     //    deduped away by the first owner's notice on the same reused action row.
@@ -2151,7 +2210,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       });
     };
 
-    const SWEEPS = STRANDED_RECOVERY_MAX_OWNER_WAKE_ATTEMPTS * 4;
+    const SWEEPS = defaultRecoveryActionMaxAttempts * 4;
     for (let i = 0; i < SWEEPS; i += 1) await sweep();
 
     // Ownership really is churning, and no single owner ever spent the attempt budget —
@@ -2160,7 +2219,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .select()
       .from(issueRecoveryActions)
       .where(eq(issueRecoveryActions.sourceIssueId, sourceIssueId));
-    expect(action!.attemptCount).toBeLessThanOrEqual(STRANDED_RECOVERY_MAX_OWNER_WAKE_ATTEMPTS);
+    expect(action!.attemptCount).toBeLessThanOrEqual(defaultRecoveryActionMaxAttempts);
     const distinctOwnersWoken = new Set(enqueueWakeup.mock.calls.map((call) => call[0]));
     expect(distinctOwnersWoken.size).toBeGreaterThan(1);
 
@@ -2168,7 +2227,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(action!.timeoutAt).not.toBeNull();
     const horizon = new Date(action!.timeoutAt as unknown as string).getTime();
     const created = new Date(action!.createdAt as unknown as string).getTime();
-    expect(horizon - created).toBeLessThanOrEqual(STRANDED_RECOVERY_OWNER_WAKE_HORIZON_MS + 5_000);
+    expect(horizon - created).toBeLessThanOrEqual(defaultRecoveryActionTimeoutMs + 5_000);
 
     // Once past the horizon the loop stops for everyone, regardless of whose turn it is.
     const wakesBeforeHorizon = enqueueWakeup.mock.calls.length;
@@ -2246,7 +2305,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       });
     };
 
-    const ESCALATIONS = STRANDED_RECOVERY_MAX_OWNER_WAKE_ATTEMPTS + 3;
+    const ESCALATIONS = defaultRecoveryActionMaxAttempts + 3;
     for (let i = 0; i < ESCALATIONS; i += 1) await sweep();
 
     // Precondition: this really is the owned provider-quota shape, not the monitor-only one.
@@ -2264,10 +2323,10 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     // assertion that should fail if this regresses.
     const wakesToOwner = enqueueWakeup.mock.calls.filter((call) => call[0] === managerId).length;
     expect(wakesToOwner).toBeLessThan(ESCALATIONS);
-    expect(wakesToOwner).toBe(STRANDED_RECOVERY_MAX_OWNER_WAKE_ATTEMPTS);
+    expect(wakesToOwner).toBe(defaultRecoveryActionMaxAttempts);
 
     // ...and the row carries the same budget and horizon as any other wake_owner action.
-    expect(action!.maxAttempts).toBe(STRANDED_RECOVERY_MAX_OWNER_WAKE_ATTEMPTS);
+    expect(action!.maxAttempts).toBe(defaultRecoveryActionMaxAttempts);
     expect(action!.timeoutAt).not.toBeNull();
   }, 120_000);
 
@@ -2370,7 +2429,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     // Same row, now owned and budgeted — the precondition that makes the horizon load-bearing.
     expect(bounded).toMatchObject({
       ownerAgentId: managerId,
-      maxAttempts: STRANDED_RECOVERY_MAX_OWNER_WAKE_ATTEMPTS,
+      maxAttempts: defaultRecoveryActionMaxAttempts,
     });
 
     // The fix, asserted as behaviour first: the new owner actually gets woken. Before it, the
@@ -2431,7 +2490,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .where(eq(issueRecoveryActions.sourceIssueId, sourceIssueId));
     expect(bounded).toMatchObject({
       ownerAgentId: managerId,
-      maxAttempts: STRANDED_RECOVERY_MAX_OWNER_WAKE_ATTEMPTS,
+      maxAttempts: defaultRecoveryActionMaxAttempts,
     });
     expect(wakesToManager()).toBe(1);
     const originalHorizonMs = new Date(bounded!.timeoutAt as unknown as string).getTime();
@@ -2468,7 +2527,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .where(eq(issueRecoveryActions.id, bounded!.id));
     expect(rebounded).toMatchObject({
       ownerAgentId: managerId,
-      maxAttempts: STRANDED_RECOVERY_MAX_OWNER_WAKE_ATTEMPTS,
+      maxAttempts: defaultRecoveryActionMaxAttempts,
     });
     expect(new Date(rebounded!.timeoutAt as unknown as string).getTime()).toBe(originalHorizonMs);
     expect(wakesToManager()).toBe(1);
@@ -2499,7 +2558,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     // the counter moved but not the consequence: the point of the leak is that it drives the
     // action into exhaustion, after which the guard skips the enqueue permanently. Only
     // FAILURES > maxAttempts exercises that.
-    const FAILURES = STRANDED_RECOVERY_MAX_OWNER_WAKE_ATTEMPTS + 1;
+    const FAILURES = defaultRecoveryActionMaxAttempts + 1;
     let enqueueFails = true;
     // NOTE (BLO-18996 review follow-up): the delivered branch must return a RUN, not null.
     // `enqueueWakeup` returns null on all nine of its non-delivery paths, so a null-returning
@@ -2545,7 +2604,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     // the wake budget and not some unbounded bookkeeping counter.
     expect(action).toMatchObject({
       ownerAgentId: managerId,
-      maxAttempts: STRANDED_RECOVERY_MAX_OWNER_WAKE_ATTEMPTS,
+      maxAttempts: defaultRecoveryActionMaxAttempts,
     });
     // Every sweep tried to wake and every one of them threw, so the enqueue was genuinely
     // exercised — the assertion below is not passing because nothing happened. Pre-fix this
@@ -2595,7 +2654,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
 
     // Deliberately more than the budget: below it we would only prove the counter did not
     // move, not the consequence — that the deferrals never drive the action into exhaustion.
-    const DEFERRALS = STRANDED_RECOVERY_MAX_OWNER_WAKE_ATTEMPTS + 2;
+    const DEFERRALS = defaultRecoveryActionMaxAttempts + 2;
     let deferred = true;
     const queuedRun = { id: randomUUID() } as never;
     const enqueueWakeup = vi.fn(async () => (deferred ? null : queuedRun));
@@ -2631,7 +2690,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     // budget rather than unbounded bookkeeping.
     expect(action).toMatchObject({
       ownerAgentId: managerId,
-      maxAttempts: STRANDED_RECOVERY_MAX_OWNER_WAKE_ATTEMPTS,
+      maxAttempts: defaultRecoveryActionMaxAttempts,
     });
     // Every sweep genuinely reached the enqueue — the assertions below are not passing
     // because the guard skipped the call.
@@ -2692,7 +2751,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .where(eq(issueRecoveryActions.sourceIssueId, sourceIssueId));
     expect(afterFirst).toMatchObject({
       ownerAgentId: managerId,
-      maxAttempts: STRANDED_RECOVERY_MAX_OWNER_WAKE_ATTEMPTS,
+      maxAttempts: defaultRecoveryActionMaxAttempts,
       attemptCount: 1,
     });
     expect(enqueueWakeup).toHaveBeenCalledTimes(1);
@@ -2731,7 +2790,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     const { managerId, coderId, sourceIssueId } = await seedCompany();
     await db.update(agents).set({ status: "paused" }).where(eq(agents.id, coderId));
 
-    const FAILURES = STRANDED_RECOVERY_MAX_OWNER_WAKE_ATTEMPTS + 1;
+    const FAILURES = defaultRecoveryActionMaxAttempts + 1;
     let enqueueFails = true;
     const queuedRun = { id: randomUUID() } as never;
     const enqueueWakeup = vi.fn(async () => {
@@ -2777,7 +2836,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .where(eq(issueRecoveryActions.sourceIssueId, sourceIssueId));
     expect(action).toMatchObject({
       ownerAgentId: managerId,
-      maxAttempts: STRANDED_RECOVERY_MAX_OWNER_WAKE_ATTEMPTS,
+      maxAttempts: defaultRecoveryActionMaxAttempts,
     });
     expect(enqueueWakeup.mock.calls.length).toBe(FAILURES);
     // The retry landed every time, so the budget is intact despite every first write failing.

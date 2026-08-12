@@ -18,9 +18,11 @@ import {
   mintAppJwt,
   getInstallationToken,
   getInstallationTokenResult,
+  githubFetchPrHeadSha,
   githubGetPullRequestGate,
   githubHasReviewerEvidenceForPr,
   githubGetLatestCommitStatusForContext,
+  githubListIssueCommentsWithTimestamps,
   githubPostCommitStatus,
   githubPostCommitStatusDetailed,
   githubReviewerAppSlug,
@@ -198,6 +200,21 @@ describe("githubGetPullRequestGate", () => {
       repoFullName: "Blockcast/paperclip",
       prNumber: 847,
     })).resolves.toEqual({ error: "pull_request_http_503" });
+  });
+});
+
+describe("githubFetchPrHeadSha", () => {
+  it("uses the installation token to resolve the complete current head", async () => {
+    setCreds();
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL) => {
+      const value = String(url);
+      if (value.includes("/access_tokens")) return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
+      expect(value).toContain("/repos/Blockcast/paperclip/pulls/1049");
+      return jsonResponse({ head: { sha: "ABCDEF1234567890ABCDEF1234567890ABCDEF12" } });
+    }));
+
+    await expect(githubFetchPrHeadSha({ repoFullName: "Blockcast/paperclip", prNumber: 1049 }))
+      .resolves.toBe("abcdef1234567890abcdef1234567890abcdef12");
   });
 });
 
@@ -598,5 +615,52 @@ describe("githubPostCommitStatus (BLO-17456)", () => {
     await expect(
       githubPostCommitStatus({ repoFullName, sha, context, state: "failure" }),
     ).resolves.toBe(false);
+  });
+});
+
+describe("githubListIssueCommentsWithTimestamps", () => {
+  const repoFullName = "Blockcast/paperclip";
+  const prNumber = 1049;
+
+  function commentPage(count: number, label: string) {
+    return Array.from({ length: count }, (_, index) => ({
+      user: { login: "allyblockcast[bot]" },
+      body: `${label}-${index}`,
+      created_at: "2026-08-04T20:09:19Z",
+    }));
+  }
+
+  it("reads beyond the historical ten-page limit", async () => {
+    setCreds();
+    const pages = [
+      ...Array.from({ length: 12 }, (_, index) => commentPage(100, `page-${index + 1}`)),
+      commentPage(37, "page-13"),
+    ];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string | URL) => {
+        const value = String(url);
+        if (value.includes("/access_tokens")) return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
+        const page = Number(value.match(/[?&]page=(\d+)/)?.[1] ?? "1");
+        return jsonResponse(pages[page - 1] ?? []);
+      }),
+    );
+
+    await expect(githubListIssueCommentsWithTimestamps({ repoFullName, prNumber })).resolves.toHaveLength(1237);
+  });
+
+  it("fails closed rather than returning a partial history at the safety backstop", async () => {
+    setCreds();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string | URL) => {
+        if (String(url).includes("/access_tokens")) {
+          return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
+        }
+        return jsonResponse(commentPage(100, "full"));
+      }),
+    );
+
+    await expect(githubListIssueCommentsWithTimestamps({ repoFullName, prNumber })).resolves.toBeNull();
   });
 });

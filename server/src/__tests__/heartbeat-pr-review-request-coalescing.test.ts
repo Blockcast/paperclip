@@ -32,7 +32,7 @@ const allowPenstockGate = {
   _resetForTesting: () => {},
 };
 
-const TASK_KEY = "pr_review:Blockcast/pim-multicast-gateway:1888";
+const TASK_KEY = "pr_review:blockcast/pim-multicast-gateway:1888";
 
 // Shape produced by githubWebhookRoutes' reviewer wake (see
 // buildPrReviewerTaskKey + githubContextMetadata in routes/github-webhook.ts).
