@@ -20,8 +20,10 @@ See `docs/specs/2026-04-29-alertmanager-plugin-spec.md` for the full design.
 - Deduplicates by `alert.fingerprint` per spec §5.3 — re-fires bump the
   state row and refresh the issue body, they don't create a second issue.
 - Re-opens issues the plugin auto-cancelled on resolve when the same
-  fingerprint re-fires (§8.3 option A), while preserving operator-cancelled
-  suppressions.
+  fingerprint re-fires (§8.3 option A). An issue closed by an *operator* while
+  its alert was still firing suppresses re-opens instead — but only for
+  `operatorSuppressionHours` (default 24h), after which a still-firing alert
+  re-opens it with an explanatory comment. See "Operator suppression" below.
 - Resolves issues per `autoCloseOnResolve`: either close the issue (status
   → cancelled) or post an `Alert resolved at <ts>` comment.
 - Renders observability drill-in links (Grafana / Tempo / Pyroscope / Hubble
@@ -57,6 +59,7 @@ Configured per-instance via the host's plugin settings UI. Schema lives in
 | `acceptOnlyLabels`   | object  | no       | Accept-only label filter, e.g. `{ paperclip: "true" }`. |
 | `severityToPriority` | object  | no       | Override the default severity map. |
 | `autoCloseOnResolve` | boolean | no       | Defaults to true (status → cancelled). Set false for comment-only. |
+| `operatorSuppressionHours` | number | no  | How long an operator-closed issue mutes re-fires before the plugin re-opens it anyway. Defaults to 24. `0` = suppress indefinitely (pre-BLO-24234 behaviour). |
 | `ownerMap`           | object  | no       | `{ <labelKey>: { <labelValue>: <email> } }`. |
 | `issueRouteMap`      | object  | no       | `{ <labelKey>: { <labelValue>: { projectId, goalId, assigneeAgentId, status } } }`. |
 
@@ -192,6 +195,45 @@ ending in `_url` is ignored.
 | `flow_query_url` | Hubble flow query |
 | `runbook_url`    | Runbook |
 | (alert.generatorURL) | Source query in Prometheus |
+
+### Operator suppression, and what a re-fire does (BLO-24234)
+
+Every re-fire of a known fingerprint takes exactly one of four branches. The
+branch is decided by `decideRefire()` in `webhook-handler.ts` and each one emits
+a distinct metric, so "the alert delivered but I see no issue" is answerable
+from telemetry rather than by reading the issue body's `Started:` timestamp.
+
+| Issue status at re-fire | `resolvedAt` in state | Outcome | Metric |
+|---|---|---|---|
+| open (any non-terminal) | — | refresh description | `alertmanager.firing.deduped` |
+| `done` / `cancelled` | set (plugin closed it on resolve) | re-open → `todo` | `alertmanager.firing.reopened` |
+| `done` / `cancelled` | null (**operator** closed it) — inside window | stay closed, stay quiet | `alertmanager.firing.suppressed` |
+| `done` / `cancelled` | null — window expired | re-open → `todo` + comment | `alertmanager.firing.suppression_expired` |
+| issue unreadable / deleted | — | leave state intact | `alertmanager.firing.issue_missing` |
+
+`alertmanager.firing.deduped` is still emitted on **every** re-fire, so existing
+dashboards keep working; the metrics above narrate what the re-fire actually did.
+
+**Why the window exists.** Closing an alert issue by hand means "stop nagging
+me", and the plugin honours that. But an unbounded mute is a footgun: a
+fingerprint is `hash(sorted(labels))`, so a provider-agnostic alert such as
+`LLMProxyHighErrorRate` re-uses **one** fingerprint across every future root
+cause. Before this change, one operator closing a noisy issue muted that alert
+permanently — the webhook kept delivering 200s, the state row kept updating, and
+nothing was visible in any open-status view. That is the failure mode behind the
+2026-08-08 investigation in BLO-23405/BLO-24234.
+
+Suppression is anchored on the **first re-fire observed against the closed
+issue**, not on the close itself (the plugin never sees the close), and the
+anchor is not refreshed by later re-fires — otherwise the window would slide
+forever and never expire. Closing the issue again after a re-open starts a fresh
+window. Set `operatorSuppressionHours: 0` to restore the old unbounded mute.
+
+**Known asymmetry, deliberate:** if the state row is lost *and* the issue is
+terminal, `recoverStateFromIssue()` declines to adopt it and a fresh issue is
+filed instead. After a state loss the plugin cannot tell whether the close was
+its own or an operator's, and for a paging system a visible duplicate is a safer
+failure than an inherited mute.
 
 ## Security
 

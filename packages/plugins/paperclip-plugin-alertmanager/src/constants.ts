@@ -82,6 +82,17 @@ export const DEFAULT_ESCALATION_DEADLINE_MINUTES: Record<string, number> = {
  */
 export const DEFAULT_COVER_DEDUP_WINDOW_MINUTES = 120;
 
+/**
+ * How long an operator-closed issue mutes re-fires of its fingerprint before
+ * the plugin re-opens it anyway (BLO-24234).
+ *
+ * 24h is chosen to outlast a single on-call shift — long enough that closing a
+ * noisy issue actually buys quiet for the rest of the day, short enough that a
+ * still-firing alert cannot stay invisible across a handover. Operators who
+ * want the old unbounded mute can set `operatorSuppressionHours: 0`.
+ */
+export const DEFAULT_OPERATOR_SUPPRESSION_HOURS = 24;
+
 /** Default owner routes shipped with the bundled Blockcast Alertmanager plugin. */
 export const DEFAULT_OWNER_MAP: OwnerMap = {
   class: {
