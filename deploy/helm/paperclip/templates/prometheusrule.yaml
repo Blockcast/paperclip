@@ -63,19 +63,23 @@
   STATUS of the BLO-21460 runtime-resource-reconciliation-stuck alert, same
   auditability rule:
 
-    - Merged on both authoritative onprem-k8s files by
-      Blockcast/onprem-k8s#2119 (branch
-      platformsre/blo-21460-runtime-resource-reconciliation-alert), merged
-      2026-08-11. Verify:
-        gh api repos/Blockcast/onprem-k8s/contents/monitoring/prometheus-configmap.yaml \
-          --jq '.content' | base64 -d | grep PaperclipRuntimeResourceReconciliationStuck
+    - NOT yet merged as of 2026-08-12. Open on both authoritative onprem-k8s
+      files as Blockcast/onprem-k8s#2119 (branch
+      platformsre/blo-21460-runtime-resource-reconciliation-alert). Its own
+      PR body deliberately holds merge until this paperclip-side PR lands
+      (the rule reads metrics only this PR adds), then still needs the usual
+      manual `monitoring-rules` Argo sync afterward. Verify current state:
+        gh pr view 2119 --repo Blockcast/onprem-k8s --json state,mergedAt
 
-    - It reads two metrics this PR adds
-      (paperclip_external_runtime_reservations_release_pending,
-      paperclip_environment_leases_orphaned_active) — inert on the control
-      plane until this paperclip PR lands, but the alert rule itself is
-      already live in onprem-k8s. Same manual `monitoring-rules` Argo sync
-      gate as above applies to the mirror below.
+    - The onprem-k8s expr already includes the scheduler-down / missing-
+      telemetry guard (commit 3faf0da, addressing a review finding that a
+      bare `max(metric) > 0` is silent when the scheduler itself is down and
+      both series go absent rather than reading 0): it ORs in
+      `absent(paperclip_external_runtime_reservations_release_pending)`,
+      `absent(paperclip_environment_leases_orphaned_active)`, and
+      `up{job="paperclip-control-plane"} == 0` (with its own `absent()`
+      guard). The mirror below is kept in lockstep with that fixed expr —
+      do not let it regress to the bare `max(...) > 0` form.
 */}}
 {{- if .Values.prometheusRule.enabled }}
 apiVersion: monitoring.coreos.com/v1
