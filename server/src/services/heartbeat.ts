@@ -1190,6 +1190,31 @@ function resolveAutomaticRunRetryOpts(
   return undefined;
 }
 
+/**
+ * BLO-25517: `8446c1011` ("bind issue locks only for running runs") and
+ * `76304affd` (PR #1245, BLO-18012, "Recover unavailable OpenCode sessions")
+ * landed ~15 minutes apart and disagreed about whether a `scheduled_retry`
+ * run holds `issues.executionRunId` while parked. `8446c1011` set the global
+ * default: it does not — `scheduleBoundedRetryForRun` always clears the
+ * issue's execution lock before parking a run in `scheduled_retry`, and
+ * `issueExecutionRetryLockAvailable` below treats a `null` lock as available.
+ * A parked run holding the lock is what strands an issue no other run can
+ * claim.
+ *
+ * `76304affd` needed the OpenCode-recovery path (`session_unavailable`,
+ * `zero_token_session_reset`) to survive a retry cycle even when the issue
+ * has fallen back to `todo` (not `in_progress`) and even though nothing
+ * holds its lock in the meantime. Rather than reverting to the old
+ * hold-the-lock-while-parked semantic, that need is met by a narrower
+ * predicate scoped only to this recovery case: these two reasons are
+ * included here so `evaluateScheduledRetryGate` still runs the
+ * `issueExecutionRetryLockAvailable` claim-conflict check at *scheduling*
+ * time (refusing to park if a different run has since taken the issue), but
+ * are excluded from `requiresInProgressIssueRetry` below so scheduling does
+ * not also require `in_progress`. The issue itself stays unlocked
+ * (`executionRunId: null`) for the whole parked window, same as every other
+ * retry reason.
+ */
 function requiresIssueExecutionRetryLock(retryReason: string | null | undefined) {
   return (
     retryReason === MAX_TURN_CONTINUATION_RETRY_REASON ||
@@ -1211,6 +1236,9 @@ function issueExecutionRetryLockAvailable(
   );
 }
 
+// See BLO-25517 comment above requiresIssueExecutionRetryLock: session_unavailable
+// and zero_token_session_reset are deliberately excluded here so their retries can
+// be scheduled for a `todo` (not just `in_progress`) issue.
 function requiresInProgressIssueRetry(retryReason: string | null | undefined) {
   return (
     requiresIssueExecutionRetryLock(retryReason) &&
