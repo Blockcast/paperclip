@@ -4,8 +4,13 @@ import { describe, it } from "node:test";
 import { pathToFileURL } from "node:url";
 
 import {
+  assertHeadSha,
   assertPrListComplete,
   attestedHead,
+  distinctVerdicts,
+  duplicateCredentialSubmissions,
+  findAdvisories,
+  findPrAdvisories,
   findPrViolations,
   findViolations,
   hasBlockingFindings,
@@ -319,5 +324,170 @@ describe("assertPrListComplete", () => {
 
   it("tolerates a nullish list", () => {
     assert.doesNotThrow(() => assertPrListComplete(undefined, "o/r", 10));
+  });
+});
+
+const APP_UID = 290875700;
+const USER_UID = 296676656;
+
+/** The dual-credential shape measured live: one body, two accounts, one head. */
+function credentialPair(body) {
+  return [
+    { ...review({ id: 11, state: "APPROVED", body }), user: { login: "allyblockcast[bot]", id: APP_UID } },
+    { ...review({ id: 12, state: "APPROVED", body }), user: { login: "allyblockcast", id: USER_UID } },
+  ];
+}
+
+describe("duplicateCredentialSubmissions", () => {
+  const body = `## Ally — Consolidated PR Review\nReviewed head: ${HEAD}\n`;
+
+  it("groups an identical body posted under the App and the User account", () => {
+    const groups = duplicateCredentialSubmissions(credentialPair(body), HEAD);
+    assert.equal(groups.length, 1);
+    assert.deepEqual(groups[0].map((r) => r.id), [11, 12]);
+  });
+
+  it("does not group two identical bodies from the SAME account — that is a retry, not a credential split", () => {
+    const reviews = credentialPair(body).map((r) => ({ ...r, user: { login: "allyblockcast", id: USER_UID } }));
+    assert.deepEqual(duplicateCredentialSubmissions(reviews, HEAD), []);
+  });
+
+  it("does not group two DIFFERENT bodies across the two accounts — those are two real verdicts", () => {
+    const [app, user] = credentialPair(body);
+    assert.deepEqual(
+      duplicateCredentialSubmissions([app, { ...user, body: `${body}\n### Important Issues (1)\n- something` }], HEAD),
+      [],
+    );
+  });
+
+  it("ignores a review recorded against a different head", () => {
+    const [app, user] = credentialPair(body);
+    assert.deepEqual(duplicateCredentialSubmissions([app, { ...user, commit_id: OTHER }], HEAD), []);
+  });
+});
+
+describe("distinctVerdicts", () => {
+  const body = `## Ally — Consolidated PR Review\nReviewed head: ${HEAD}\n`;
+
+  it("collapses a dual-credential pair to the single verdict it is", () => {
+    assert.deepEqual(distinctVerdicts(credentialPair(body), HEAD).map((r) => r.id), [11]);
+  });
+
+  it("keeps a same-account duplicate, so a retry still trips I1", () => {
+    const reviews = credentialPair(body).map((r) => ({ ...r, user: { login: "allyblockcast", id: USER_UID } }));
+    assert.equal(distinctVerdicts(reviews, HEAD).length, 2);
+  });
+});
+
+describe("I1 after dual-credential collapse", () => {
+  const body = `## Ally — Consolidated PR Review\nReviewed head: ${HEAD}\n`;
+
+  it("does not fire on a dual-credential pair", () => {
+    const violations = findPrViolations({ number: 1129, headSha: HEAD, reviews: credentialPair(body) });
+    assert.deepEqual(violations.filter((v) => v.startsWith("I1")), []);
+  });
+
+  it("still fires when the two accounts submit genuinely different verdicts", () => {
+    const [app, user] = credentialPair(body);
+    const blocker = { ...app, body: `${body}\n### Important Issues (1)\n- real finding` };
+    const violations = findPrViolations({ number: 876, headSha: HEAD, reviews: [blocker, user] });
+    assert.equal(violations.filter((v) => v.startsWith("I1")).length, 1);
+  });
+
+  it("reports the pair as a non-fatal advisory instead", () => {
+    const advisories = findPrAdvisories({ number: 1129, headSha: HEAD, reviews: credentialPair(body) });
+    assert.equal(advisories.length, 1);
+    assert.match(advisories[0], /A1 PR #1129 .*submitted 2× under different credentials/);
+    assert.match(advisories[0], /BLO-22916/);
+  });
+});
+
+describe("I2d — APPROVED with no attestation line", () => {
+  it("fires on the #1114 shape: a short APPROVED that attests nothing", () => {
+    const reviews = [
+      review({
+        id: 4879433972,
+        state: "APPROVED",
+        body: "Approved the current CI head. The implementation is unchanged; this head only retriggers checks.",
+      }),
+    ];
+    const violations = findPrViolations({ number: 1114, headSha: HEAD, reviews });
+    assert.equal(violations.filter((v) => v.startsWith("I2d")).length, 1);
+  });
+
+  it("does not fire on an APPROVED that does attest the head", () => {
+    const reviews = [review({ id: 1, state: "APPROVED" })];
+    assert.deepEqual(
+      findPrViolations({ number: 1, headSha: HEAD, reviews }).filter((v) => v.startsWith("I2d")),
+      [],
+    );
+  });
+
+  it("does not fire on a COMMENTED review with no attestation — only an approval claims soundness", () => {
+    const reviews = [review({ id: 1, state: "COMMENTED", body: "no attestation here" })];
+    assert.deepEqual(
+      findPrViolations({ number: 1, headSha: HEAD, reviews }).filter((v) => v.startsWith("I2d")),
+      [],
+    );
+  });
+});
+
+describe("assertHeadSha", () => {
+  it("passes a well-formed 40-hex head", () => {
+    const row = { number: 1, headRefOid: HEAD };
+    assert.equal(assertHeadSha(row, "o/r"), row);
+  });
+
+  for (const bad of [undefined, null, "", "not-a-sha", HEAD.slice(0, 39), HEAD.toUpperCase()]) {
+    it(`throws on ${JSON.stringify(bad)} rather than asserting nothing`, () => {
+      assert.throws(() => assertHeadSha({ number: 7, headRefOid: bad }, "o/r"), /no usable headRefOid/);
+    });
+  }
+
+  it("names the PR so the failure is actionable", () => {
+    assert.throws(() => assertHeadSha({ number: 42, headRefOid: null }, "o/r"), /o\/r#42/);
+  });
+});
+
+describe("a falsy head would otherwise silently pass a maximal violation", () => {
+  it("finds every invariant broken at the real head", () => {
+    const reviews = [
+      review({ id: 1, state: "APPROVED", body: `Reviewed head: ${OTHER}\n### Critical Issues (3)\n- boom` }),
+      review({ id: 2, state: "COMMENTED", body: `Reviewed head: ${HEAD}\n### Important Issues (1)\n- boom` }),
+    ];
+    assert.ok(findPrViolations({ number: 9, headSha: HEAD, reviews }).length >= 4);
+  });
+
+  it("finds nothing at all when the head is falsy — which is why assertHeadSha exists", () => {
+    const reviews = [
+      review({ id: 1, state: "APPROVED", body: `Reviewed head: ${OTHER}\n### Critical Issues (3)\n- boom` }),
+      review({ id: 2, state: "COMMENTED", body: `Reviewed head: ${HEAD}\n### Important Issues (1)\n- boom` }),
+    ];
+    for (const head of [undefined, null, ""]) {
+      assert.deepEqual(findPrViolations({ number: 9, headSha: head, reviews }), []);
+    }
+  });
+});
+
+describe("findAdvisories across PRs", () => {
+  // Caught by mutation-check: neutering findAdvisories to `return []` left the
+  // whole suite green, because only findPrAdvisories was exercised. The plural
+  // wrapper is what main() calls, so it needs its own case.
+  const body = `## Ally — Consolidated PR Review\nReviewed head: ${HEAD}\n`;
+
+  it("aggregates advisories from every PR", () => {
+    const prs = [
+      { number: 1129, headSha: HEAD, reviews: credentialPair(body) },
+      { number: 1127, headSha: HEAD, reviews: credentialPair(body) },
+    ];
+    const advisories = findAdvisories(prs);
+    assert.equal(advisories.length, 2);
+    assert.match(advisories[0], /PR #1129/);
+    assert.match(advisories[1], /PR #1127/);
+  });
+
+  it("returns nothing for a clean set, and tolerates a nullish one", () => {
+    assert.deepEqual(findAdvisories([{ number: 1, headSha: HEAD, reviews: [review({ id: 1 })] }]), []);
+    assert.deepEqual(findAdvisories(undefined), []);
   });
 });
