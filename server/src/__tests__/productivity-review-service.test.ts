@@ -1629,6 +1629,70 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(review?.description).toContain("Excluded as non-live execution hold: 10m");
   });
 
+  it("excludes queue wait from a retry chain longer than the streak sample cap (BLO-25722)", async () => {
+    // Review follow-up: duration accounting originally reused `latestRuns`,
+    // which is capped at MAX_RUNS_FOR_STREAK (100) for streak walking. A chain
+    // longer than the cap silently dropped its OLDEST queue-wait intervals —
+    // reviving the false positive first on the worst-wedged issues, the ones
+    // with the most runs. Duration accounting is now scoped by the episode
+    // window instead of by run count.
+    //
+    // 140 runs x (20m queued + 2m live). Correct attributable time is the 280m
+    // of live work, well under the 6h threshold. Capped at the newest 100, the
+    // 40 oldest runs' 800m of queue wait reverts to "elapsed" and the episode
+    // reads 18h — firing the exact review this change exists to prevent.
+    const episodeStart = new Date("2026-08-01T00:00:00.000Z");
+    const runCount = 140;
+    const cycleMs = 22 * 60 * 1000;
+    const now = new Date(episodeStart.getTime() + runCount * cycleMs);
+    const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: episodeStart });
+    const runs = Array.from({ length: runCount }, (_, i) => {
+      const createdAt = new Date(episodeStart.getTime() + i * cycleMs);
+      const startedAt = new Date(createdAt.getTime() + 20 * 60 * 1000);
+      const isLast = i === runCount - 1;
+      return isLast
+        ? {
+            createdAt,
+            startedAt,
+            status: "running",
+            lastOutputAt: new Date(now.getTime() - 60 * 1000),
+          }
+        : {
+            createdAt,
+            startedAt,
+            finishedAt: new Date(startedAt.getTime() + 2 * 60 * 1000),
+            status: "failed",
+          };
+    });
+    const inserted = await insertRunChain({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      lockedAt: episodeStart,
+      runs,
+    });
+    // Every run comments, so `no_comment_streak` cannot fire on a chain this
+    // long and confound what is under test here: `long_active_duration`'s
+    // duration accounting alone.
+    await db.insert(issueComments).values(
+      inserted.map((run, index) => ({
+        companyId: seeded.companyId,
+        issueId: seeded.issueId,
+        authorAgentId: seeded.coderId,
+        createdByRunId: run.id,
+        body: `Progress update ${index}`,
+        createdAt: run.createdAt as Date,
+        updatedAt: run.createdAt as Date,
+      })),
+    );
+    const service = productivityReviewService(db);
+
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
   it("keeps long_active_duration monotonic just past the running silence boundary (BLO-19848)", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const episodeStart = new Date(now.getTime() - 7 * 60 * 60 * 1000);

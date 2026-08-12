@@ -2500,6 +2500,33 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     // unions the queue wait of every other run in the episode on top, because a
     // retry chain's earlier rows are invisible to both helpers. Bounded by the
     // episode, so the exclusions cannot report more than the episode spans.
+    //
+    // Deliberately NOT `latestRuns`: that sample is capped at
+    // MAX_RUNS_FOR_STREAK for streak walking, and a retry chain longer than the
+    // cap would silently drop its oldest queue-wait intervals — re-charging the
+    // assignee for exactly the queue time this exclusion exists to remove, and
+    // reviving the false positive on the worst-wedged issues (the ones with the
+    // most runs) first. Scoped by the episode window instead of by run count: a
+    // run that finished before the episode began contributes no interval that
+    // survives clipping to [activeStartedAt, now], so this is the smallest set
+    // that is provably sufficient.
+    const episodeRuns = activeStartedAt
+      ? await db
+          .select()
+          .from(heartbeatRuns)
+          .where(
+            and(
+              eq(heartbeatRuns.companyId, sourceIssue.companyId),
+              eq(heartbeatRuns.agentId, sourceAgent.id),
+              issueRunScopeSql(sourceIssue.id),
+              or(
+                isNull(heartbeatRuns.finishedAt),
+                gte(heartbeatRuns.finishedAt, activeStartedAt),
+              ),
+            ),
+          )
+          .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
+      : [];
     const episodeMs = activeStartedAt
       ? Math.max(0, now.getTime() - activeStartedAt.getTime())
       : null;
@@ -2507,7 +2534,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     const nonLiveHoldMs = episodeMs === null || !activeStartedAt || !attributableStartAt
       ? trailingHoldMs
       : episodeNonLiveHoldMs({
-          runs: latestRuns,
+          runs: episodeRuns,
           seedNonLive: [
             { start: activeStartedAt.getTime(), end: attributableStartAt.getTime() },
             { start: attributableEndAt.getTime(), end: now.getTime() },
