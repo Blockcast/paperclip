@@ -381,7 +381,7 @@ fi
 echo "STUB-GH-REAL $*"
 `;
 
-function runSetupGit(dir, { args = ["auth", "setup-git"], setHome = true } = {}) {
+function runSetupGit(dir, { args = ["auth", "setup-git"], setHome = true, preExistingXdgGitConfig = false } = {}) {
   const stubGhPath = path.join(dir, "gh.real");
   writeFileSync(stubGhPath, SETUP_GIT_STUB_GH_SOURCE);
   chmodSync(stubGhPath, 0o755);
@@ -390,15 +390,23 @@ function runSetupGit(dir, { args = ["auth", "setup-git"], setHome = true } = {})
   mkdirSync(homeDir, { recursive: true });
   const selfGhPath = path.join(dir, "gh");
 
+  // Per git-config(1): `--global` writes to "$XDG_CONFIG_HOME/git/config"
+  // instead of "${HOME}/.gitconfig" when that XDG file already exists.
+  // Pre-creating it here is how the XDG-repair test below exercises that
+  // branch; every other test isolates against it by pointing XDG_CONFIG_HOME
+  // at a path that does not exist, so it doesn't affect them.
+  const xdgConfigHome = path.join(dir, preExistingXdgGitConfig ? "xdg" : "xdg-does-not-exist");
+  const xdgGitConfigPath = path.join(xdgConfigHome, "git", "config");
+  if (preExistingXdgGitConfig) {
+    mkdirSync(path.dirname(xdgGitConfigPath), { recursive: true });
+    writeFileSync(xdgGitConfigPath, "");
+  }
+
   const env = sanitizedEnv({
     GH_TOKEN_WRAPPER_REAL_GH: stubGhPath,
     GH_TOKEN_WRAPPER_SELF: selfGhPath,
     PAPERCLIP_GITHUB_TOKEN_FILE: path.join(dir, "does-not-exist"),
-    // Isolate from whatever XDG_CONFIG_HOME the test process inherited: if
-    // "$XDG_CONFIG_HOME/git/config" already exists, `git config --global`
-    // writes there instead of "$HOME/.gitconfig", which would make this test
-    // check the wrong file rather than exercise a real behavior difference.
-    XDG_CONFIG_HOME: path.join(dir, "xdg-does-not-exist"),
+    XDG_CONFIG_HOME: xdgConfigHome,
   });
   if (setHome) {
     env.HOME = homeDir;
@@ -409,7 +417,8 @@ function runSetupGit(dir, { args = ["auth", "setup-git"], setHome = true } = {})
   const proc = spawnSync("sh", [WRAPPER, ...args], { env, encoding: "utf8" });
   const gitconfigPath = path.join(homeDir, ".gitconfig");
   const gitconfig = existsSync(gitconfigPath) ? readFileSync(gitconfigPath, "utf8") : null;
-  return { proc, gitconfig, gitconfigPath, selfGhPath, stubGhPath };
+  const xdgGitConfig = existsSync(xdgGitConfigPath) ? readFileSync(xdgGitConfigPath, "utf8") : null;
+  return { proc, gitconfig, gitconfigPath, xdgGitConfig, xdgGitConfigPath, selfGhPath, stubGhPath };
 }
 
 test("gh auth setup-git's broken gh.real helper is rewritten back to the wrapper (BLO-25702)", () => {
@@ -425,7 +434,7 @@ test("gh auth setup-git's broken gh.real helper is rewritten back to the wrapper
     // ...and neither may still shell out to the raw binary.
     assert.doesNotMatch(gitconfig, new RegExp(stubGhPath.replace(/\//g, "\\/")));
 
-    assert.match(proc.stderr, /rewrote .*\.gitconfig to route through/);
+    assert.match(proc.stderr, /rewrote the global git config to route through/);
   });
 });
 
@@ -447,7 +456,91 @@ test("gh auth login's internal setup-git write is also rewritten back to the wra
     assert.match(gitconfig, /"https:\/\/gist\.github\.com"/);
     assert.doesNotMatch(gitconfig, new RegExp(stubGhPath.replace(/\//g, "\\/")));
 
-    assert.match(proc.stderr, /rewrote .*\.gitconfig to route through/);
+    assert.match(proc.stderr, /rewrote the global git config to route through/);
+  });
+});
+
+test("gh.real helper written to $XDG_CONFIG_HOME/git/config is also rewritten (BLO-25702 review S2, PR #1311)", () => {
+  // Ally's review on PR #1311 flagged that the repair only ever inspected
+  // "${HOME}/.gitconfig", but `git config --global` writes to
+  // "$XDG_CONFIG_HOME/git/config" instead whenever that file already exists
+  // (git-config(1)) — a pod that set up an XDG git config before `gh auth
+  // setup-git`/`gh auth login` ran would silently keep the broken gh.real
+  // helper forever, with the wrapper reporting nothing wrong. This pins that
+  // the repair finds and fixes that file too, and leaves ~/.gitconfig alone
+  // since gh/git never wrote to it in this scenario.
+  withTempDir((dir) => {
+    const { proc, gitconfig, xdgGitConfig, selfGhPath, stubGhPath } = runSetupGit(dir, {
+      preExistingXdgGitConfig: true,
+    });
+    assert.equal(proc.status, 0, `wrapper exited non-zero: ${proc.stderr}`);
+    assert.equal(gitconfig, null, "gh auth setup-git should not have touched ~/.gitconfig here");
+    assert.ok(xdgGitConfig, "expected gh auth setup-git to write $XDG_CONFIG_HOME/git/config");
+
+    assert.match(xdgGitConfig, new RegExp(`!${selfGhPath.replace(/\//g, "\\/")} auth git-credential`, "g"));
+    assert.match(xdgGitConfig, /"https:\/\/github\.com"/);
+    assert.match(xdgGitConfig, /"https:\/\/gist\.github\.com"/);
+    assert.doesNotMatch(xdgGitConfig, new RegExp(stubGhPath.replace(/\//g, "\\/")));
+
+    assert.match(proc.stderr, /rewrote the global git config to route through/);
+  });
+});
+
+test("a REAL_GH/GH_SELF path containing sed/regex metacharacters is repaired without corrupting the gitconfig (BLO-25702 review, PR #1311)", () => {
+  // The CTO's review on PR #1311 flagged a second defect with the same root
+  // cause as Ally's: the original repair ran the caller-controlled
+  // REAL_GH/GH_SELF paths through a hand-built `sed` substitution that only
+  // escaped ".", using "#" as the s### delimiter and interpolating GH_SELF
+  // unescaped into the replacement. A path containing "#", "&", "\", or
+  // another sed/regex metacharacter would corrupt the file instead of
+  // failing loudly. The current repair never builds a sed script at all —
+  // it goes through `git config --fixed-value`, which treats both paths as
+  // exact strings end to end — so this pins that a maximally hostile path
+  // (with a "#" delimiter clash, an "&" whole-match backreference, and a
+  // literal backslash) round-trips correctly.
+  withTempDir((dir) => {
+    const nastyDir = path.join(dir, "gh#real&dir\\with-backslash");
+    mkdirSync(nastyDir, { recursive: true });
+    const stubGhPath = path.join(nastyDir, "gh.real");
+    writeFileSync(stubGhPath, SETUP_GIT_STUB_GH_SOURCE);
+    chmodSync(stubGhPath, 0o755);
+
+    const nastySelfDir = path.join(dir, "gh#self&dir\\also-backslash");
+    mkdirSync(nastySelfDir, { recursive: true });
+    const selfGhPath = path.join(nastySelfDir, "gh");
+
+    const homeDir = path.join(dir, "home");
+    mkdirSync(homeDir, { recursive: true });
+
+    const env = sanitizedEnv({
+      GH_TOKEN_WRAPPER_REAL_GH: stubGhPath,
+      GH_TOKEN_WRAPPER_SELF: selfGhPath,
+      PAPERCLIP_GITHUB_TOKEN_FILE: path.join(dir, "does-not-exist"),
+      XDG_CONFIG_HOME: path.join(dir, "xdg-does-not-exist"),
+      HOME: homeDir,
+    });
+
+    const proc = spawnSync("sh", [WRAPPER, "auth", "setup-git"], { env, encoding: "utf8" });
+    assert.equal(proc.status, 0, `wrapper exited non-zero: ${proc.stderr}`);
+
+    const gitconfigPath = path.join(homeDir, ".gitconfig");
+    const gitconfig = readFileSync(gitconfigPath, "utf8");
+
+    // A corrupted file (the old sed bug) would either fail to parse or drop
+    // the well-formed helper line; `git config --get` is the authoritative
+    // check that git itself still considers the file valid and the value
+    // fully intact, backslash and all. Calls /usr/bin/git directly (not bare
+    // `git`) for the same hermeticity reason as SETUP_GIT_STUB_GH_SOURCE
+    // above — whatever else PATH resolves "git" to in the sandbox this
+    // suite happens to run in must not matter here.
+    const helper = spawnSync(
+      "/usr/bin/git",
+      ["config", "--file", gitconfigPath, "--get", "credential.https://github.com.helper"],
+      { encoding: "utf8" },
+    );
+    assert.equal(helper.status, 0, `git could not read the repaired file: ${helper.stderr}`);
+    assert.equal(helper.stdout.trim(), `!${selfGhPath} auth git-credential`);
+    assert.doesNotMatch(gitconfig, new RegExp(stubGhPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   });
 });
 
