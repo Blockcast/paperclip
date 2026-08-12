@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   PLUGIN_CONFIG_SECRET_MASK,
+  TRAVERSED_SCHEMA_KEYWORDS,
   collectPluginConfigSecretValues,
   maskPluginConfigJson,
   mergeMaskedPluginConfig,
@@ -1378,4 +1379,95 @@ describe("maskPluginConfigJson — uninterpretable schema keywords fail closed (
       extra: { note: "visible" },
     });
   });
+});
+
+describe("maskPluginConfigJson — every traversed keyword is really walked (BLO-26530)", () => {
+  const SENTINEL = "sentinel-traversal-drift-plaintext";
+  /** Innocuously named, so only the schema marker can cover it. */
+  const MARKER = { type: "string", writeOnly: true };
+
+  /**
+   * One case per member of `TRAVERSED_SCHEMA_KEYWORDS`, each hiding the marker so
+   * that *only* the named keyword can reach it.
+   *
+   * `TRAVERSED_SCHEMA_KEYWORDS` is what exempts a keyword from the fail-closed
+   * guard, so a keyword listed there but not actually walked is silently ignored
+   * rather than masked — which is precisely how the markers behind `if` / `then`
+   * / `else` / `dependentSchemas` / `contains` came back as plaintext. This table
+   * plus the completeness assertion below make that drift impossible: adding a
+   * keyword to the set without walking it fails here.
+   */
+  const cases: Record<string, { schema: Record<string, unknown>; config: Record<string, unknown> }> = {
+    // --- same instance location -------------------------------------------
+    $ref: {
+      schema: { $ref: "#/$defs/covered", $defs: { covered: { properties: { lookaside: MARKER } } } },
+      config: { lookaside: SENTINEL },
+    },
+    allOf: { schema: { allOf: [{ properties: { lookaside: MARKER } }] }, config: { lookaside: SENTINEL } },
+    anyOf: { schema: { anyOf: [{ properties: { lookaside: MARKER } }] }, config: { lookaside: SENTINEL } },
+    oneOf: { schema: { oneOf: [{ properties: { lookaside: MARKER } }] }, config: { lookaside: SENTINEL } },
+    not: { schema: { not: { properties: { lookaside: MARKER } } }, config: { lookaside: SENTINEL } },
+    if: { schema: { if: { properties: { lookaside: MARKER } } }, config: { lookaside: SENTINEL } },
+    then: { schema: { then: { properties: { lookaside: MARKER } } }, config: { lookaside: SENTINEL } },
+    else: { schema: { else: { properties: { lookaside: MARKER } } }, config: { lookaside: SENTINEL } },
+    dependentSchemas: {
+      schema: { dependentSchemas: { mode: { properties: { lookaside: MARKER } } } },
+      config: { mode: "managed", lookaside: SENTINEL },
+    },
+    dependencies: {
+      schema: { dependencies: { mode: { properties: { lookaside: MARKER } } } },
+      config: { mode: "managed", lookaside: SENTINEL },
+    },
+    // --- child by property key --------------------------------------------
+    properties: { schema: { properties: { lookaside: MARKER } }, config: { lookaside: SENTINEL } },
+    patternProperties: {
+      schema: { patternProperties: { "^look": MARKER } },
+      config: { lookaside: SENTINEL },
+    },
+    additionalProperties: {
+      schema: { additionalProperties: MARKER },
+      config: { lookaside: SENTINEL },
+    },
+    unevaluatedProperties: {
+      schema: { unevaluatedProperties: MARKER },
+      config: { lookaside: SENTINEL },
+    },
+    // --- child by array index ---------------------------------------------
+    items: {
+      schema: { properties: { list: { type: "array", items: MARKER } } },
+      config: { list: [SENTINEL] },
+    },
+    prefixItems: {
+      schema: { properties: { list: { type: "array", prefixItems: [MARKER] } } },
+      config: { list: [SENTINEL] },
+    },
+    additionalItems: {
+      schema: {
+        properties: { list: { type: "array", items: [{ type: "string" }], additionalItems: MARKER } },
+      },
+      config: { list: ["visible-first", SENTINEL] },
+    },
+    contains: {
+      schema: { properties: { list: { type: "array", contains: MARKER } } },
+      config: { list: [SENTINEL] },
+    },
+    unevaluatedItems: {
+      schema: { properties: { list: { type: "array", unevaluatedItems: MARKER } } },
+      config: { list: [SENTINEL] },
+    },
+  };
+
+  it("has a case for every traversed keyword", () => {
+    // Fails when a keyword is added to the set without a case proving the walk
+    // enters it — the drift this suite exists to prevent.
+    expect(Object.keys(cases).sort()).toEqual([...TRAVERSED_SCHEMA_KEYWORDS].sort());
+  });
+
+  for (const [keyword, { schema, config }] of Object.entries(cases)) {
+    it(`reaches a marker hidden behind \`${keyword}\``, () => {
+      const masked = maskPluginConfigJson(config, { type: "object", ...schema });
+
+      expect(JSON.stringify(masked)).not.toContain(SENTINEL);
+    });
+  }
 });
