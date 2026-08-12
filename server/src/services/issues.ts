@@ -115,6 +115,11 @@ import {
 import { redactCurrentUserText } from "../log-redaction.js";
 import { redactSensitiveText } from "../redaction.js";
 import { resolveIssueGoalId, resolveNextIssueGoalId } from "./issue-goal-fallback.js";
+import {
+  evaluateIssueRepoBinding,
+  formatIssueRepoBindingComment,
+  issueRepoBindingCommentIdempotencyKey,
+} from "./issue-repo-binding-guard.js";
 import { getRunLogStore } from "./run-log-store.js";
 import { getTelemetryClient } from "../telemetry.js";
 import { getDefaultCompanyGoal } from "./goals.js";
@@ -8587,8 +8592,13 @@ export function issueService(db: Db) {
       // sync. Cleanup errors are logged-and-swallowed to avoid masking the
       // original failure that triggered the rollback.
       let createdLinearIssueId: string | null = null;
+      // BLO-20341: the repo-binding advisory must not fire for a create that
+      // was deduplicated into an existing issue — that issue already got (or
+      // correctly declined) its comment when it was really created.
+      let deduplicatedIntoExistingIssue = false;
+      let createdIssue;
       try {
-        return await db.transaction(async (tx) => {
+        createdIssue = await db.transaction(async (tx) => {
         const idempotencyKey = rawIdempotencyKey?.trim() || null;
         const normalizedTitle = normalizeCreateIssueTitle(issueData.title);
         if (issueData.assigneeAgentId) {
@@ -8665,6 +8675,7 @@ export function issueService(db: Db) {
               .onConflictDoNothing();
           }
           if (deduplicationReason) onDeduplicated?.(deduplicationReason);
+          deduplicatedIntoExistingIssue = true;
           const [enriched] = await withIssueLabels(tx, [existingIssue]);
           const [withRelations] = await withIssueRelationSummaries(companyId, [enriched], tx);
           return withRelations;
@@ -9085,6 +9096,49 @@ export function issueService(db: Db) {
         }
         throw err;
       }
+
+      // BLO-20341: advisory repo-binding check. Deliberately runs *after* the
+      // create tx has committed, so a failure here cannot roll back the issue,
+      // and every error is swallowed — an advisory comment must never be able
+      // to fail an issue create. Skipped for dedup replays, whose target issue
+      // was already evaluated when it was really created.
+      if (!deduplicatedIntoExistingIssue && createdIssue?.id) {
+        try {
+          const signal = await evaluateIssueRepoBinding({
+            db,
+            companyId,
+            description: createdIssue.description,
+            parentId: createdIssue.parentId,
+            projectId: createdIssue.projectId,
+            projectWorkspaceId: createdIssue.projectWorkspaceId,
+            executionWorkspaceId: createdIssue.executionWorkspaceId,
+          });
+          if (signal) {
+            await db
+              .insert(issueComments)
+              .values({
+                companyId,
+                issueId: createdIssue.id,
+                authorType: "system",
+                idempotencyKey: issueRepoBindingCommentIdempotencyKey(createdIssue.id),
+                body: formatIssueRepoBindingComment(signal),
+                presentation: {
+                  kind: "system_notice",
+                  tone: "warning",
+                  title: "Possible repo binding mismatch",
+                  detailsDefaultOpen: false,
+                },
+              })
+              .onConflictDoNothing();
+          }
+        } catch (guardErr) {
+          logger.warn(
+            { err: guardErr, issueId: createdIssue.id, companyId },
+            "issue repo binding guard failed",
+          );
+        }
+      }
+      return createdIssue;
     },
 
     update: async (
