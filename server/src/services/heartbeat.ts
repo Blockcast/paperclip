@@ -82,6 +82,7 @@ import {
   workspaceOperations,
 } from "@paperclipai/db";
 import { conflict, HttpError, notFound } from "../errors.js";
+import { UNDISPATCHED_HEARTBEAT_RUN_STATUSES } from "./stranded-run-recovery.js";
 import { logger } from "../middleware/logger.js";
 import { describeDbError, isDbError, runWithTransientDbRetry } from "../lib/db-retry.js";
 import { publishLiveEvent } from "./live-events.js";
@@ -11503,12 +11504,42 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return setRunStatusIfCurrentStatus(runId, "queued", status, patch, "setRunStatusIfQueued");
   }
 
+  /**
+   * BLO-21947: compare-and-swap a run that is still provably UNDISPATCHED.
+   *
+   * The non-board stranded-run recovery route authorizes a cancel *because* the
+   * run never started — no process, no tokens, no side effects. It evaluated
+   * that on a snapshot read before `await access.decide(...)`, then handed the
+   * id to the generic cancel, which re-reads and will happily cancel a
+   * `running` run and terminate its process group. A dispatcher claim in that
+   * window turns a cancel authorized as harmless into one that kills live work.
+   *
+   * Gating the write on `status IN (queued, scheduled_retry) AND started_at IS
+   * NULL` makes the precondition hold at the instant of the write rather than
+   * at the instant of the read, so the loser of the race changes nothing.
+   */
+  async function setRunStatusIfUndispatched(
+    runId: string,
+    status: string,
+    patch?: Partial<typeof heartbeatRuns.$inferInsert>,
+  ) {
+    return setRunStatusIfCurrentStatus(
+      runId,
+      UNDISPATCHED_HEARTBEAT_RUN_STATUSES,
+      status,
+      patch,
+      "setRunStatusIfUndispatched",
+      isNull(heartbeatRuns.startedAt),
+    );
+  }
+
   async function setRunStatusIfCurrentStatus(
     runId: string,
-    expectedStatus: string,
+    expectedStatus: string | readonly string[],
     status: string,
     patch: Partial<typeof heartbeatRuns.$inferInsert> | undefined,
     label: string,
+    extraCondition?: SQL,
   ) {
     // BLO-16998: same transient-retry rationale as setRunStatus — the guarded
     // finalize UPDATE is idempotent (status set-by-id, gated on the expected
@@ -11518,7 +11549,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         db
           .update(heartbeatRuns)
           .set({ status, ...patch, updatedAt: new Date() })
-          .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, expectedStatus)))
+          .where(and(
+            eq(heartbeatRuns.id, runId),
+            typeof expectedStatus === "string"
+              ? eq(heartbeatRuns.status, expectedStatus)
+              : inArray(heartbeatRuns.status, [...expectedStatus]),
+            ...(extraCondition ? [extraCondition] : []),
+          ))
           .returning()
           .then((rows) => rows[0] ?? null),
       {
@@ -27665,6 +27702,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     resultJson?: Record<string, unknown>;
     eventMessage?: string;
     eventPayload?: Record<string, unknown>;
+    // BLO-21947: only cancel while the run is provably undispatched, and make
+    // that hold at the instant of the write rather than the instant of the
+    // read. Set by the non-board stranded-run recovery route, whose whole
+    // safety argument is that the run never started. Throws `conflict` when the
+    // dispatcher wins the race, so the caller reports 409 instead of silently
+    // having killed live work.
+    requireUndispatched?: boolean;
   };
 
   async function cancelPendingRunsForTaskInternal(
@@ -27755,6 +27799,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const run = await getRun(runId);
     if (!run) throw notFound("Heartbeat run not found");
     if (!CANCELLABLE_HEARTBEAT_RUN_STATUSES.includes(run.status as (typeof CANCELLABLE_HEARTBEAT_RUN_STATUSES)[number])) return run;
+    // BLO-21947: cheap pre-check so an already-dispatched run reports 409
+    // without any of the teardown below. The authoritative guarantee is the
+    // compare-and-swap on the status write — this read can go stale, that
+    // cannot.
+    if (
+      options.requireUndispatched &&
+      (run.startedAt != null
+        || run.processPid != null
+        || run.processGroupId != null
+        || !UNDISPATCHED_HEARTBEAT_RUN_STATUSES.includes(
+          run.status as (typeof UNDISPATCHED_HEARTBEAT_RUN_STATUSES)[number],
+        ))
+    ) {
+      throw conflict("Run is no longer undispatched; refusing to cancel dispatched work.");
+    }
     const agent = await getAgent(run.agentId);
     const errorCode = options.errorCode ?? "cancelled";
     const resultJson = agent
@@ -27767,6 +27826,33 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ...(options.resultJson ?? {}),
         }
       : options.resultJson;
+
+    const finishedAt = new Date();
+    // BLO-21947: claim the row BEFORE any teardown.
+    //
+    // Ordering is the whole point. The teardown below terminates the run's
+    // process group, and it runs before the status write — so doing the
+    // compare-and-swap in its usual place would let a dispatcher claim the run,
+    // let this call kill the freshly-started process, and only *then* refuse
+    // with 409. The caller would read "conflict, nothing happened" over work
+    // that had already been destroyed. Swapping first means the loser of the
+    // race changes nothing at all.
+    //
+    // The CAS gates on `status IN (queued, scheduled_retry) AND started_at IS
+    // NULL` — the precondition the non-board recovery grant was authorized
+    // against, now evaluated at the instant of the write rather than at the
+    // instant of the read.
+    const undispatchedClaim = options.requireUndispatched
+      ? await setRunStatusIfUndispatched(run.id, "cancelled", {
+        finishedAt,
+        error: reason,
+        errorCode,
+        ...(resultJson ? { resultJson } : {}),
+      })
+      : null;
+    if (undispatchedClaim && !undispatchedClaim.updated) {
+      throw conflict("Run was dispatched concurrently; cancel refused.");
+    }
 
     const running = runningProcesses.get(run.id);
     try {
@@ -27786,13 +27872,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       runningProcesses.delete(run.id);
     }
 
-    const finishedAt = new Date();
-    const cancelled = await setRunStatus(run.id, "cancelled", {
-      finishedAt,
-      error: reason,
-      errorCode,
-      ...(resultJson ? { resultJson } : {}),
-    });
+    const cancelled = undispatchedClaim
+      ? undispatchedClaim.run
+      : await setRunStatus(run.id, "cancelled", {
+        finishedAt,
+        error: reason,
+        errorCode,
+        ...(resultJson ? { resultJson } : {}),
+      });
 
     await setWakeupStatus(run.wakeupRequestId, "cancelled", {
       finishedAt,

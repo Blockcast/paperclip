@@ -2069,4 +2069,194 @@ describe("issue execution policy routes", () => {
       );
     });
   });
+
+  // BLO-21947: route-level coverage for the manager convergence-stall monitor
+  // recovery grant.
+  //
+  // This describe block exists because the authorization-service tests could
+  // not have caught the defect it pins. Those tests call `access.decide`
+  // directly and prove `issue:recover_monitor` resolves for a manager — but
+  // they cannot prove `PATCH /issues/:id` ever *asks*. It does not, unaided:
+  // `assertAgentIssueMutationAllowed` denies the manager at the `issue:mutate`
+  // boundary and returns before `assertCanManageIssueMonitor` is called at all,
+  // so the recovery branch is unreachable for the one actor class it was
+  // written for. Only a test driving the full route composition shows that.
+  describe("BLO-21947 manager convergence-stall monitor recovery", () => {
+    const STALLED_ISSUE_ID = "a1a1a1a1-a1a1-4a1a-8a1a-a1a1a1a1a1a1";
+    const STALLED_ASSIGNEE_ID = "b2b2b2b2-b2b2-4b2b-8b2b-b2b2b2b2b2b2";
+    const MANAGER_AGENT_ID = "c3c3c3c3-c3c3-4c3c-8c3c-c3c3c3c3c3c3";
+
+    /**
+     * Mirrors the real authorization service for a manager acting on an issue
+     * assigned to a report. The harness default in `beforeEach` allows
+     * `issue:mutate` for *any* agent, which is precisely the over-permissive
+     * shape that would hide this bug — so each entry below is pinned to the
+     * source line that justifies it:
+     *
+     *   issue:mutate                  deny  — `allow_manager_chain` is gated to
+     *                                         `issue:comment` (authorization.ts,
+     *                                         "input.action === \"issue:comment\" &&
+     *                                         ... isManagerOf(...)").
+     *   issue:comment                 allow — same branch, matching action.
+     *   tasks:manage_active_checkouts allow — separate manager-chain branch.
+     *   runtime:manage                allow — capability the guard sits behind.
+     *   issue:recover_monitor         allow — the grant this PR adds.
+     */
+    function mockManagerAuthorization() {
+      mockAccessService.decide.mockImplementation(async (input: { actor?: { type?: string }; action?: string }) => {
+        if (input.actor?.type === "board") {
+          return { allowed: true, action: input.action, reason: "allow_board", explanation: "board" };
+        }
+        const allowed = [
+          "company_scope:read",
+          "issue:read",
+          "issue:comment",
+          "tasks:manage_active_checkouts",
+          "runtime:manage",
+          "issue:recover_monitor",
+        ].includes(input.action ?? "");
+        return {
+          allowed,
+          action: input.action,
+          reason: allowed ? "allow_manager_chain" : "deny_missing_grant",
+          explanation: allowed ? "Allowed because the actor manages the issue assignee in the reporting chain." : `Missing permission: ${input.action ?? "action"}`,
+        };
+      });
+    }
+
+    function stalledIssue(clearReason: string | null) {
+      // Must satisfy `issueExecutionStateSchema` in full — `parseIssueExecutionState`
+      // safeParses and returns null on any miss, which would silently make the
+      // recovery predicate false and turn a real pass into a misleading 403.
+      const monitor = clearReason
+        ? {
+            status: "cleared",
+            clearReason,
+            clearedAt: "2026-08-11T18:12:11.166Z",
+            nextCheckAt: null,
+            lastTriggeredAt: "2026-08-11T18:12:11.166Z",
+            notes: "gate unchanged",
+            scheduledBy: "assignee",
+            attemptCount: 4,
+          }
+        : {
+            status: "scheduled",
+            clearReason: null,
+            clearedAt: null,
+            nextCheckAt: "2099-12-01T12:00:00.000Z",
+            lastTriggeredAt: null,
+            notes: "gate unchanged",
+            scheduledBy: "assignee",
+            attemptCount: 1,
+          };
+      return {
+        id: STALLED_ISSUE_ID,
+        companyId: "company-1",
+        status: "in_progress",
+        assigneeAgentId: STALLED_ASSIGNEE_ID,
+        assigneeUserId: null,
+        checkoutRunId: null,
+        executionRunId: null,
+        createdByUserId: "local-board",
+        createdByAgentId: null,
+        identifier: "PAP-21947",
+        title: "Stalled monitor",
+        executionPolicy: null,
+        executionState: {
+          status: "idle",
+          currentStageId: null,
+          currentStageIndex: null,
+          currentStageType: null,
+          currentParticipant: null,
+          returnAssignee: null,
+          reviewRequest: null,
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+          monitor,
+        },
+        monitorAttemptCount: 4,
+        monitorNextCheckAt: null,
+        monitorLastTriggeredAt: null,
+        monitorNotes: null,
+        monitorScheduledBy: "assignee",
+      };
+    }
+
+    const rearmBody = {
+      executionPolicy: {
+        monitor: {
+          nextCheckAt: "2099-12-01T12:00:00.000Z",
+          scheduledBy: "assignee",
+          notes: "re-armed by manager after convergence stall",
+        },
+      },
+    };
+
+    beforeEach(() => {
+      mockManagerAuthorization();
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...stalledIssue("convergence_stalled"),
+        ...patch,
+        updatedAt: new Date(),
+      }));
+    });
+
+    it("lets a managing agent re-arm a monitor cleared for convergence_stalled", async () => {
+      mockIssueService.getById.mockResolvedValue(stalledIssue("convergence_stalled"));
+
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: MANAGER_AGENT_ID,
+        companyId: "company-1",
+        runId: "manager-run-1",
+      }))
+        .patch(`/api/issues/${STALLED_ISSUE_ID}`)
+        .send(rearmBody);
+
+      // The specific failure this pins: before the mutation guard opts into the
+      // recovery shape, this is 403 "Agent cannot mutate another agent's issue"
+      // from `assertAgentIssueMutationAllowed` — i.e. the request never reaches
+      // `assertCanManageIssueMonitor`, so the recovery branch is dead code.
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      const patch = mockIssueService.update.mock.calls.at(-1)?.[1] as Record<string, unknown>;
+      expect(patch.monitorNextCheckAt).toEqual(new Date("2099-12-01T12:00:00.000Z"));
+    });
+
+    it("still refuses a managing agent when the monitor is not convergence-stalled", async () => {
+      mockIssueService.getById.mockResolvedValue(stalledIssue(null));
+
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: MANAGER_AGENT_ID,
+        companyId: "company-1",
+        runId: "manager-run-1",
+      }))
+        .patch(`/api/issues/${STALLED_ISSUE_ID}`)
+        .send(rearmBody);
+
+      expect(res.status).toBe(403);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("refuses a managing agent a non-monitor mutation on the same issue", async () => {
+      // The bypass must be shaped to the monitor recovery only. A manager that
+      // can re-arm a stalled monitor must not thereby be able to rewrite the
+      // issue, which is what a blanket `return true` in the shared mutation
+      // guard would grant across ~two dozen routes (the PR #814 lesson).
+      mockIssueService.getById.mockResolvedValue(stalledIssue("convergence_stalled"));
+
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: MANAGER_AGENT_ID,
+        companyId: "company-1",
+        runId: "manager-run-1",
+      }))
+        .patch(`/api/issues/${STALLED_ISSUE_ID}`)
+        .send({ ...rearmBody, description: "manager rewrote the body" });
+
+      expect(res.status).toBe(403);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+  });
 });

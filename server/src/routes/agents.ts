@@ -4388,6 +4388,12 @@ export function agentRoutes(
       strandedRecovery
         ? "Cancelled by a managing agent: run was never dispatched (stranded-run recovery)"
         : undefined,
+      // BLO-21947: `evaluateStrandedRunRecovery` above ran against a snapshot
+      // read before `await access.decide(...)`, so by now the dispatcher may
+      // have claimed the run. This makes the cancel compare-and-swap on the
+      // same precondition the grant was authorized against, and 409 rather
+      // than kill live work if it lost the race.
+      strandedRecovery ? { requireUndispatched: true } : undefined,
     );
 
     if (run) {

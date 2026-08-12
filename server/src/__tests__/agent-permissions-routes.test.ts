@@ -2044,5 +2044,65 @@ describe.sequential("agent permission routes", () => {
       expect(res.status).toBe(200);
       expect(mockHeartbeatService.cancelRun).toHaveBeenCalled();
     });
+
+    // BLO-21947 TOCTOU. `evaluateStrandedRunRecovery` runs against a snapshot
+    // taken before `await access.decide(...)`, and the generic cancel re-reads
+    // and will cancel a `running` run — terminating its process group. So a
+    // cancel authorized *only* because the run was undispatched could destroy
+    // live work if the dispatcher claimed it inside that window. The route must
+    // hand the precondition down to the write as a compare-and-swap.
+    it("requires the cancel to compare-and-swap on the undispatched precondition", async () => {
+      mockHeartbeatService.getRun.mockResolvedValue(strandedRun);
+      mockHeartbeatService.cancelRun.mockResolvedValue({ ...strandedRun, status: "cancelled" });
+      allowRecovery();
+
+      const app = await createApp(agentActor());
+      await requestApp(app, (baseUrl) =>
+        request(baseUrl).post("/api/heartbeat-runs/run-1/cancel").send({}));
+
+      expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith(
+        "run-1",
+        expect.any(String),
+        expect.objectContaining({ requireUndispatched: true }),
+      );
+    });
+
+    it("does not constrain a board cancel to the undispatched precondition", async () => {
+      mockHeartbeatService.getRun.mockResolvedValue({
+        ...strandedRun,
+        status: "running",
+        startedAt: new Date(),
+        processPid: 4242,
+      });
+      mockHeartbeatService.cancelRun.mockResolvedValue({ ...strandedRun, status: "cancelled" });
+
+      const app = await createApp({
+        type: "board",
+        userId: "board-user",
+        source: "session",
+        isInstanceAdmin: false,
+        companyIds: [companyId],
+      });
+      await requestApp(app, (baseUrl) =>
+        request(baseUrl).post("/api/heartbeat-runs/run-1/cancel").send({}));
+
+      const options = mockHeartbeatService.cancelRun.mock.calls.at(-1)?.[2];
+      expect(options?.requireUndispatched).toBeUndefined();
+    });
+
+    it("surfaces a lost compare-and-swap as 409 rather than a silent success", async () => {
+      const { conflict } = await import("../errors.js");
+      mockHeartbeatService.getRun.mockResolvedValue(strandedRun);
+      mockHeartbeatService.cancelRun.mockRejectedValue(
+        conflict("Run was dispatched concurrently; cancel refused."),
+      );
+      allowRecovery();
+
+      const app = await createApp(agentActor());
+      const res = await requestApp(app, (baseUrl) =>
+        request(baseUrl).post("/api/heartbeat-runs/run-1/cancel").send({}));
+
+      expect(res.status).toBe(409);
+    });
   });
 });
