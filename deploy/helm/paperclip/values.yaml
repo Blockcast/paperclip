@@ -491,6 +491,12 @@ prometheusRule:
   wakeTerminalFailedFor: 5m
   # -- Runbook for the terminal-failed wake alert, linked from its annotation.
   wakeTerminalFailedRunbookUrl: "https://github.com/Blockcast/paperclip/blob/master/runbooks/agent-wakeup-terminal-failed.md"
+  # -- How long an agent's oldest `queued` heartbeat_runs row may sit before firing (BLO-21116). Expressed in SECONDS and compared against paperclip_queued_run_oldest_age_seconds, which carries the real per-agent age -- see wakeTerminalFailedAgeSeconds above for why this is a threshold on an age gauge rather than a `for:` duration over a count. Matches this issue's own AC ("alert firing before the age exceeds ~30m"). Set to 1440 (24m), not 1800 (30m): `for:` below stacks its 5m hold on top of the threshold, so a bare 1800 would not fire until 2100s (35m) of real age -- past the AC. 1440 + 300 = 1740s (29m), same headroom as the matching `Blockcast/onprem-k8s#2013` fix for the rule that actually deploys.
+  queuedRunStrandedAgeSeconds: 1440
+  # -- Scrape-flap tolerance only (BLO-21116). The ageing lives in queuedRunStrandedAgeSeconds above; it stacks on top of that threshold rather than testing independently, which is why the threshold is 1440 and not 1800.
+  queuedRunStrandedFor: 5m
+  # -- Runbook for the queued-run-stranded alert, linked from its annotation.
+  queuedRunStrandedRunbookUrl: "https://github.com/Blockcast/paperclip/blob/master/runbooks/queued-run-stranded.md"
   # -- Prometheus regex of suppression causes that mean an outage rather than a deliberate decline (BLO-18859). Expected policy declines (company.inactive, heartbeat.cooldown.active, heartbeat.disabled, heartbeat.wakeOnDemand.disabled, budget.blocked, agent.not_invokable, heartbeat.worktree_execution_cutoff, issue_tree_hold_active) are excluded so they never page. `other` is included: it is the bucket for a skip reason missing from KNOWN_GITHUB_SUPPRESSION_CAUSES, and an untriaged cause is not a known-good decline.
   githubDeliverySuppressionOutageCauses: "heartbeat.scheduling_suppressed|dispatch_rejected|other"
   # -- Additional PrometheusRule groups appended verbatim.

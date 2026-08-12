@@ -766,11 +766,21 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect(duePromotion).toEqual({ promoted: 1, runIds: [scheduled.run.id] });
 
     const promotedRun = await db
-      .select({ status: heartbeatRuns.status })
+      .select({ status: heartbeatRuns.status, queuedAt: heartbeatRuns.queuedAt, createdAt: heartbeatRuns.createdAt })
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, scheduled.run.id))
       .then((rows) => rows[0] ?? null);
     expect(promotedRun?.status).toBe("queued");
+    // BLO-21116 (Ally review, onprem-k8s#2013): promotion out of
+    // scheduled_retry must reset the queued-age clock to the promotion
+    // instant, not leave the gauge reading this row's original createdAt --
+    // otherwise the queued-run-age gauge reports this run's full retry
+    // backoff as dispatch-queue wait the moment it is promoted. (createdAt
+    // itself isn't compared here: this test's synthetic clock predates the
+    // sandbox's real wall clock, and the retry row's createdAt defaults to
+    // the latter at insert time -- an artifact of the test harness, not of
+    // the promotion logic under test.)
+    expect(promotedRun?.queuedAt?.toISOString()).toBe(expectedDueAt.toISOString());
   });
 
   it("treats idempotent GitHub PR-review adapter failures as retry-eligible", () => {
