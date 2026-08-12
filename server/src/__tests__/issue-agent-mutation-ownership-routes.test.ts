@@ -56,6 +56,13 @@ const mockDocumentService = vi.hoisted(() => ({
   upsertIssueDocument: vi.fn(),
 }));
 
+const mockDocumentAnnotationService = vi.hoisted(() => ({
+  createThread: vi.fn(),
+  addComment: vi.fn(),
+  updateThread: vi.fn(),
+  remapOpenThreadsForDocument: vi.fn(async () => []),
+}));
+
 const mockWorkProductService = vi.hoisted(() => ({
   createForIssue: vi.fn(),
   getById: vi.fn(),
@@ -157,7 +164,7 @@ function registerRouteMocks() {
   }));
 
   vi.doMock("../services/documents.js", () => ({
-    documentAnnotationService: () => ({ remapOpenThreadsForDocument: async () => [] }),
+    documentAnnotationService: () => mockDocumentAnnotationService,
     documentService: () => mockDocumentService,
   }));
 
@@ -188,7 +195,7 @@ function registerRouteMocks() {
       completeTestRunForIssue: vi.fn(async () => null),
     }),
     companyService: () => mockCompanyService,
-    documentAnnotationService: () => ({ remapOpenThreadsForDocument: async () => [] }),
+    documentAnnotationService: () => mockDocumentAnnotationService,
     documentService: () => mockDocumentService,
     executionWorkspaceService: () => ({}),
     feedbackService: () => ({
@@ -2656,6 +2663,100 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueService.removeAttachment).not.toHaveBeenCalled();
     expect(mockIssueApprovalService.link).not.toHaveBeenCalled();
     expect(mockIssueApprovalService.unlink).not.toHaveBeenCalled();
+  });
+
+  it("allows planning-only recovery to update its issue document but blocks implementation artifacts", async () => {
+    const app = await createApp(
+      ownerActor(),
+      createRunContextDb({
+        recoveryIntent: "planning_only",
+        allowDeliverableWork: false,
+        allowDocumentUpdates: true,
+        resumeRequiresNormalModel: false,
+      }),
+    );
+
+    await request(app)
+      .put(`/api/issues/${issueId}/documents/plan`)
+      .send({ format: "markdown", body: "# bounded plan update" })
+      .expect(200);
+    const artifactRes = await request(app).post(`/api/issues/${issueId}/work-products`).send({
+      type: "artifact",
+      provider: "test",
+      title: "Implementation artifact",
+    });
+
+    expect(artifactRes.status, JSON.stringify(artifactRes.body)).toBe(403);
+    expect(artifactRes.body.error).toContain("Planning-only recovery runs can update issue documents");
+    expect(mockDocumentService.upsertIssueDocument).toHaveBeenCalled();
+    expect(mockWorkProductService.createForIssue).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [
+      "annotation thread creation",
+      (app: express.Express) => request(app)
+        .post(`/api/issues/${issueId}/documents/plan/annotations`)
+        .send({
+          baseRevisionId: "88888888-8888-4888-8888-888888888888",
+          baseRevisionNumber: 1,
+          selector: {
+            quote: { exact: "selected", prefix: "", suffix: "" },
+            position: { normalizedStart: 0, normalizedEnd: 8, markdownStart: 0, markdownEnd: 8 },
+          },
+          body: "Review this",
+        }),
+    ],
+    [
+      "annotation comment creation",
+      (app: express.Express) => request(app)
+        .post(`/api/issues/${issueId}/documents/plan/annotations/88888888-8888-4888-8888-888888888888/comments`)
+        .send({ body: "Review reply" }),
+    ],
+    [
+      "annotation thread update",
+      (app: express.Express) => request(app)
+        .patch(`/api/issues/${issueId}/documents/plan/annotations/88888888-8888-4888-8888-888888888888`)
+        .send({ status: "resolved" }),
+    ],
+  ])("blocks planning-only recovery from %s", async (_name, sendRequest) => {
+    const app = await createApp(
+      ownerActor(),
+      createRunContextDb({
+        recoveryIntent: "planning_only",
+        allowDeliverableWork: false,
+        allowDocumentUpdates: true,
+        resumeRequiresNormalModel: false,
+      }),
+    );
+
+    const res = await sendRequest(app);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toContain("cannot create or modify annotations");
+    expect(mockDocumentAnnotationService.createThread).not.toHaveBeenCalled();
+    expect(mockDocumentAnnotationService.addComment).not.toHaveBeenCalled();
+    expect(mockDocumentAnnotationService.updateThread).not.toHaveBeenCalled();
+  });
+
+  it("blocks planning-only recovery from linking approvals", async () => {
+    const app = await createApp(
+      ownerActor(),
+      createRunContextDb({
+        recoveryIntent: "planning_only",
+        allowDeliverableWork: false,
+        allowDocumentUpdates: true,
+        resumeRequiresNormalModel: false,
+      }),
+    );
+
+    const res = await request(app).post(`/api/issues/${issueId}/approvals`).send({
+      approvalId: "88888888-8888-4888-8888-888888888888",
+    });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toContain("Planning-only recovery runs cannot link or unlink approvals");
+    expect(mockIssueApprovalService.link).not.toHaveBeenCalled();
   });
 
   it.each([
