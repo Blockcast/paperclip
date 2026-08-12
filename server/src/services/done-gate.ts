@@ -108,6 +108,30 @@
  * being an oversight for them.
  *
  * Wired behind the instance flag `enableDoneExecutionGate` (default off).
+ *
+ * ## Ruling: the status-only actor must be able to satisfy this gate (BLO-25868)
+ *
+ * The durable-artifact path above is the ONLY route to `done` for work with no
+ * PR and no live checkout. That made the gate unsatisfiable — not merely hard —
+ * for one class of actor: a cheap status-only recovery run, which the route
+ * layer bars from writing issue documents at all. Both entry points into that
+ * class hold the issue's lock (`stranded_assigned_issue` recovery, and the
+ * `issue_productivity_review` raised to unblock it), so neither the recovery run
+ * nor the displaced assignee could produce the artifact. BLO-22798 burned 9 runs
+ * across 3 agents on that deadlock with none of the spend on the actual work.
+ *
+ * The gate is unchanged. The fix is on the other side: that actor may now write
+ * exactly one key, `ISSUE_STATUS_ADJUDICATION_DOCUMENT_KEY`, which qualifies
+ * here like any other non-plan, non-system key. Recording a verdict is status
+ * work — the thing this run class IS authorized to do — while authoring the
+ * deliverable still requires a normal-model run.
+ *
+ * This costs the gate nothing it was protecting. Both security properties hold:
+ * the key is unreachable from the comment thread, and its revision is
+ * server-attributed to a real run. The residual — a checked-out run writing a
+ * thin verdict rather than a real one — is the same accepted residual as the
+ * narrating checked-out run above, and is answered the same way: by a reviewer
+ * opening the artifact, not by the gate.
  */
 
 export interface DoneGateInput {

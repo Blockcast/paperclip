@@ -1455,7 +1455,14 @@
       "idx": 215,
       "version": "7",
       "when": 1786360409324,
-      "tag": "0215_execution_workspace_cleanup_eligible_index",
+      "tag": "0215_heartbeat_runs_queued_at",
+      "breakpoints": true
+    },
+    {
+      "idx": 216,
+      "version": "7",
+      "when": 1786360409325,
+      "tag": "0216_execution_workspace_cleanup_eligible_index",
       "breakpoints": true
     }
   ]
