@@ -137,7 +137,7 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
   }
 
   const GITHUB_REVIEW_PAYLOAD = {
-    taskKey: "pr_review:Blockcast/paperclip#18859",
+    taskKey: "pr_review:blockcast/paperclip#18859",
     source: "github",
     reviewKind: "pr_review",
   } as const;
@@ -177,7 +177,7 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
       source: "automation",
       triggerDetail: "system",
       reason: "github_pr_opened",
-      payload: { taskKey: "pr_review:Blockcast/test#1" },
+      payload: { taskKey: "pr_review:blockcast/test#1" },
     });
     expect(run).not.toBeNull();
 
@@ -268,7 +268,7 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
             source: "automation",
             triggerDetail: "system",
             reason: "github_pr_opened",
-            payload: { taskKey: "pr_review:Blockcast/test#42" },
+            payload: { taskKey: "pr_review:blockcast/test#42" },
           },
         },
       },

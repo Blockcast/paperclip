@@ -56,6 +56,13 @@ const mockDocumentService = vi.hoisted(() => ({
   upsertIssueDocument: vi.fn(),
 }));
 
+const mockDocumentAnnotationService = vi.hoisted(() => ({
+  createThread: vi.fn(),
+  addComment: vi.fn(),
+  updateThread: vi.fn(),
+  remapOpenThreadsForDocument: vi.fn(async () => []),
+}));
+
 const mockWorkProductService = vi.hoisted(() => ({
   createForIssue: vi.fn(),
   getById: vi.fn(),
@@ -157,7 +164,7 @@ function registerRouteMocks() {
   }));
 
   vi.doMock("../services/documents.js", () => ({
-    documentAnnotationService: () => ({ remapOpenThreadsForDocument: async () => [] }),
+    documentAnnotationService: () => mockDocumentAnnotationService,
     documentService: () => mockDocumentService,
   }));
 
@@ -188,7 +195,7 @@ function registerRouteMocks() {
       completeTestRunForIssue: vi.fn(async () => null),
     }),
     companyService: () => mockCompanyService,
-    documentAnnotationService: () => ({ remapOpenThreadsForDocument: async () => [] }),
+    documentAnnotationService: () => mockDocumentAnnotationService,
     documentService: () => mockDocumentService,
     executionWorkspaceService: () => ({}),
     feedbackService: () => ({
@@ -1540,6 +1547,114 @@ describe("agent issue mutation checkout ownership", () => {
     expect(productivitySourceMutationAuditCalls()).toHaveLength(0);
   });
 
+  // BLO-24421: consolidated regression coverage for all four acceptance
+  // criteria, so CI carries one case that fails if the BLO-24191 fix (above)
+  // regresses. The DB-level half of AC #3 — a `done`/`cancelled` review no
+  // longer satisfying `agentHasProductivityReviewGrantOnIssue` — is covered
+  // in authorization-service.test.ts ("does not let a productivity review
+  // grant access once it reaches a terminal status"); this suite mocks the
+  // access service directly, so it re-asserts the route-scoping half instead.
+  describe("BLO-24421: monitor guard admits the review grant regardless of match order", () => {
+    it("AC1: lets an open review's owner re-arm the monitor via PATCH /issues/:id", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({
+        status: "in_progress",
+        assigneeAgentId: peerAgentId,
+        executionPolicy: null,
+      }));
+      mockAccessService.decide.mockImplementation(productivityReviewDecideWithRuntimeManage);
+
+      const res = await request(await createApp(ownerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({
+          executionPolicy: {
+            monitor: { nextCheckAt: "2026-08-17T00:00:00.000Z", notes: "BLO-24421 AC1" },
+          },
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({
+          executionPolicy: expect.objectContaining({
+            monitor: expect.objectContaining({
+              nextCheckAt: "2026-08-17T00:00:00.000Z",
+              notes: "BLO-24421 AC1",
+            }),
+          }),
+        }),
+      );
+    });
+
+    it("AC2: still 403s an actor with no qualifying relation to the issue", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({
+        status: "in_progress",
+        assigneeAgentId: peerAgentId,
+        executionPolicy: null,
+      }));
+      mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+        allowed: false,
+        action: input.action,
+        reason: "deny_missing_grant",
+        explanation: "No agent permission mapping exists for this action.",
+      }));
+
+      const res = await request(await createApp(ownerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({
+          executionPolicy: {
+            monitor: { nextCheckAt: "2026-08-17T00:00:00.000Z", notes: "BLO-24421 AC2" },
+          },
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+      expect(productivitySourceMutationAuditCalls()).toHaveLength(0);
+    });
+
+    it("AC3: keeps the forced-wake route closed to a review owner even though PATCH now honours the grant", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({
+        status: "in_progress",
+        assigneeAgentId: peerAgentId,
+        executionPolicy: null,
+      }));
+      mockAccessService.decide.mockImplementation(productivityReviewDecideWithRuntimeManage);
+
+      const res = await request(await createApp(ownerActor()))
+        .post(`/api/issues/${issueId}/monitor/check-now`);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe("Only the assignee agent or a board user can manage issue monitors");
+    });
+
+    it("AC4: admits the review-grant holder even when a broader allow-path (manager chain) also matches", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({
+        status: "in_progress",
+        assigneeAgentId: peerAgentId,
+        executionPolicy: null,
+      }));
+      mockAccessService.decide.mockImplementation(productivityReviewDecideWithCheckoutOverride);
+
+      const res = await request(await createApp(ownerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({
+          executionPolicy: {
+            monitor: { nextCheckAt: "2026-08-17T00:00:00.000Z", notes: "BLO-24421 AC4" },
+          },
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({
+          executionPolicy: expect.objectContaining({
+            monitor: expect.objectContaining({ notes: "BLO-24421 AC4" }),
+          }),
+        }),
+      );
+      expect(productivitySourceMutationAuditCalls()).toHaveLength(1);
+    });
+  });
+
   // The comment route's current-execution-run short-circuit returns a bare
   // `true`, discarding the decision reason. A previous owner whose stale
   // execution lock still matches therefore reaches the route WITHOUT an
@@ -2658,6 +2773,100 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueApprovalService.unlink).not.toHaveBeenCalled();
   });
 
+  it("allows planning-only recovery to update its issue document but blocks implementation artifacts", async () => {
+    const app = await createApp(
+      ownerActor(),
+      createRunContextDb({
+        recoveryIntent: "planning_only",
+        allowDeliverableWork: false,
+        allowDocumentUpdates: true,
+        resumeRequiresNormalModel: false,
+      }),
+    );
+
+    await request(app)
+      .put(`/api/issues/${issueId}/documents/plan`)
+      .send({ format: "markdown", body: "# bounded plan update" })
+      .expect(200);
+    const artifactRes = await request(app).post(`/api/issues/${issueId}/work-products`).send({
+      type: "artifact",
+      provider: "test",
+      title: "Implementation artifact",
+    });
+
+    expect(artifactRes.status, JSON.stringify(artifactRes.body)).toBe(403);
+    expect(artifactRes.body.error).toContain("Planning-only recovery runs can update issue documents");
+    expect(mockDocumentService.upsertIssueDocument).toHaveBeenCalled();
+    expect(mockWorkProductService.createForIssue).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [
+      "annotation thread creation",
+      (app: express.Express) => request(app)
+        .post(`/api/issues/${issueId}/documents/plan/annotations`)
+        .send({
+          baseRevisionId: "88888888-8888-4888-8888-888888888888",
+          baseRevisionNumber: 1,
+          selector: {
+            quote: { exact: "selected", prefix: "", suffix: "" },
+            position: { normalizedStart: 0, normalizedEnd: 8, markdownStart: 0, markdownEnd: 8 },
+          },
+          body: "Review this",
+        }),
+    ],
+    [
+      "annotation comment creation",
+      (app: express.Express) => request(app)
+        .post(`/api/issues/${issueId}/documents/plan/annotations/88888888-8888-4888-8888-888888888888/comments`)
+        .send({ body: "Review reply" }),
+    ],
+    [
+      "annotation thread update",
+      (app: express.Express) => request(app)
+        .patch(`/api/issues/${issueId}/documents/plan/annotations/88888888-8888-4888-8888-888888888888`)
+        .send({ status: "resolved" }),
+    ],
+  ])("blocks planning-only recovery from %s", async (_name, sendRequest) => {
+    const app = await createApp(
+      ownerActor(),
+      createRunContextDb({
+        recoveryIntent: "planning_only",
+        allowDeliverableWork: false,
+        allowDocumentUpdates: true,
+        resumeRequiresNormalModel: false,
+      }),
+    );
+
+    const res = await sendRequest(app);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toContain("cannot create or modify annotations");
+    expect(mockDocumentAnnotationService.createThread).not.toHaveBeenCalled();
+    expect(mockDocumentAnnotationService.addComment).not.toHaveBeenCalled();
+    expect(mockDocumentAnnotationService.updateThread).not.toHaveBeenCalled();
+  });
+
+  it("blocks planning-only recovery from linking approvals", async () => {
+    const app = await createApp(
+      ownerActor(),
+      createRunContextDb({
+        recoveryIntent: "planning_only",
+        allowDeliverableWork: false,
+        allowDocumentUpdates: true,
+        resumeRequiresNormalModel: false,
+      }),
+    );
+
+    const res = await request(app).post(`/api/issues/${issueId}/approvals`).send({
+      approvalId: "88888888-8888-4888-8888-888888888888",
+    });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toContain("Planning-only recovery runs cannot link or unlink approvals");
+    expect(mockIssueApprovalService.link).not.toHaveBeenCalled();
+  });
+
   it.each([
     [
       "issue create",
@@ -3453,6 +3662,143 @@ describe("agent issue mutation checkout ownership", () => {
     expect(deleteRes.status, JSON.stringify(deleteRes.body)).toBe(403);
     expect(deleteRes.body.details).toMatchObject({ reason: "deny_missing_grant", boundary: "grant" });
     expect(mockIssueService.remove).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["reassign", { assigneeAgentId: peerAgentId }],
+    ["cancel", { status: "cancelled" }],
+  ])("allows a manager-chain agent to %s an issue held by a non-invokable assignee", async (_kind, body) => {
+    useProductionIssueAuthorization([
+      makeAgent(peerAgentId),
+      makeAgent(ownerAgentId, { reportsTo: peerAgentId, status: "paused" }),
+    ]);
+    mockAgentService.getById.mockResolvedValue(makeAgent(ownerAgentId, { reportsTo: peerAgentId, status: "paused" }));
+    mockAgentService.resolveByReference.mockResolvedValue({ ambiguous: false, agent: makeAgent(peerAgentId) });
+    mockIssueService.getById.mockResolvedValue(makeIssue({ assigneeAgentId: ownerAgentId }));
+
+    const res = await request(await createApp(peerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send(body);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalled();
+    const [, patch] = mockIssueService.update.mock.calls.at(-1) as [string, Record<string, unknown>];
+    expect(patch).toMatchObject({
+      ...body,
+      expectedCurrentAssigneeAgentId: ownerAgentId,
+      // BLO-22876 review: the grant rests on the assignee being non-invokable,
+      // which lives in `agents` and so cannot be pinned by an `issues` WHERE
+      // clause. The route must ask the service to re-read it under lock, or the
+      // eligibility check and the write straddle a `paused -> running` resume.
+      expectedCurrentAssigneeAgentNonInvokable: true,
+    });
+  });
+
+  it.each([
+    ["reassign", { assigneeAgentId: peerAgentId }],
+    ["cancel", { status: "cancelled" }],
+  ])("denies a manager-chain %s when the current assignee is invokable", async (_kind, body) => {
+    useProductionIssueAuthorization([
+      makeAgent(peerAgentId),
+      makeAgent(ownerAgentId, { reportsTo: peerAgentId, status: "active" }),
+    ]);
+    mockAgentService.getById.mockResolvedValue(makeAgent(ownerAgentId, { reportsTo: peerAgentId, status: "active" }));
+    mockIssueService.getById.mockResolvedValue(makeIssue({ assigneeAgentId: ownerAgentId }));
+
+    const res = await request(await createApp(peerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send(body);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.details).toMatchObject({ reason: "deny_missing_grant", boundary: "grant" });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("keeps DELETE denied to a manager-chain agent when the assignee is non-invokable", async () => {
+    useProductionIssueAuthorization([
+      makeAgent(peerAgentId),
+      makeAgent(ownerAgentId, { reportsTo: peerAgentId, status: "paused" }),
+    ]);
+    mockAgentService.getById.mockResolvedValue(makeAgent(ownerAgentId, { reportsTo: peerAgentId, status: "paused" }));
+    mockIssueService.getById.mockResolvedValue(makeIssue({ assigneeAgentId: ownerAgentId }));
+
+    const res = await request(await createApp(peerActor())).delete(`/api/issues/${issueId}`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.details).toMatchObject({ reason: "deny_missing_grant", boundary: "grant" });
+    expect(mockIssueService.remove).not.toHaveBeenCalled();
+  });
+
+  // BLO-22876 review: the reroute is route-scoped by construction — only
+  // `PATCH /api/issues/:id` passes `allowManagerChainNonInvokableReroute`, and
+  // the option defaults false everywhere else. Assert that boundary directly
+  // for each excluded route class rather than resting on DELETE alone, so a
+  // later caller that adds the opt-in to one of them trips a test.
+  const excludedRouteApprovalId = "88888888-8888-4888-8888-888888888881";
+  const excludedRouteAttachmentId = "88888888-8888-4888-8888-888888888882";
+  const excludedRouteCases: Array<[string, (agent: request.SuperTest<request.Test>) => request.Test, () => void]> = [
+    [
+      "watchdog upsert",
+      (agent) => agent.put(`/api/issues/${issueId}/watchdog`).send({ agentId: peerAgentId, instructions: "watch it" }),
+      () => expect(mockTaskWatchdogService.upsertForIssue).not.toHaveBeenCalled(),
+    ],
+    [
+      "watchdog delete",
+      (agent) => agent.delete(`/api/issues/${issueId}/watchdog`),
+      () => expect(mockTaskWatchdogService.disableForIssue).not.toHaveBeenCalled(),
+    ],
+    [
+      "document upsert",
+      (agent) => agent.put(`/api/issues/${issueId}/documents/plan`).send({ body: "# Plan", format: "markdown" }),
+      () => expect(mockDocumentService.upsertIssueDocument).not.toHaveBeenCalled(),
+    ],
+    [
+      "approval link",
+      (agent) => agent.post(`/api/issues/${issueId}/approvals`).send({ approvalId: excludedRouteApprovalId }),
+      () => expect(mockIssueApprovalService.link).not.toHaveBeenCalled(),
+    ],
+  ];
+
+  it.each(excludedRouteCases)(
+    "keeps %s denied to a manager-chain agent when the assignee is non-invokable",
+    async (_kind, send, assertNotCalled) => {
+      useProductionIssueAuthorization([
+        makeAgent(peerAgentId),
+        makeAgent(ownerAgentId, { reportsTo: peerAgentId, status: "paused" }),
+      ]);
+      mockAgentService.getById.mockResolvedValue(
+        makeAgent(ownerAgentId, { reportsTo: peerAgentId, status: "paused" }),
+      );
+      mockIssueService.getById.mockResolvedValue(makeIssue({ assigneeAgentId: ownerAgentId }));
+
+      const res = await send(request(await createApp(peerActor())));
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.details).toMatchObject({ reason: "deny_missing_grant", boundary: "grant" });
+      assertNotCalled();
+    },
+  );
+
+  it("keeps attachment delete denied to a manager-chain agent when the assignee is non-invokable", async () => {
+    useProductionIssueAuthorization([
+      makeAgent(peerAgentId),
+      makeAgent(ownerAgentId, { reportsTo: peerAgentId, status: "paused" }),
+    ]);
+    mockAgentService.getById.mockResolvedValue(makeAgent(ownerAgentId, { reportsTo: peerAgentId, status: "paused" }));
+    const attachmentId = excludedRouteAttachmentId;
+    mockIssueService.getAttachmentById.mockResolvedValue({
+      id: attachmentId,
+      companyId,
+      issueId,
+      objectKey: "attachments/blo-22876.txt",
+    });
+    mockIssueService.getById.mockResolvedValue(makeIssue({ assigneeAgentId: ownerAgentId }));
+
+    const res = await request(await createApp(peerActor())).delete(`/api/attachments/${attachmentId}`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.details).toMatchObject({ reason: "deny_missing_grant", boundary: "grant" });
+    expect(mockIssueService.removeAttachment).not.toHaveBeenCalled();
   });
 
   it.each(commentGrantMutationDenialCases)(

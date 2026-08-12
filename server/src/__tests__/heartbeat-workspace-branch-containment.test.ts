@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { and, eq, inArray } from "drizzle-orm";
+import { and, desc, eq, inArray } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -38,7 +38,11 @@ import {
 import { cleanupHeartbeatTestState } from "./helpers/cleanup-heartbeat-test-state.js";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { instanceSettingsService } from "../services/instance-settings.ts";
+import { subscribeCompanyLiveEvents } from "../services/live-events.ts";
 import {
+  WORKSPACE_PREFLIGHT_BLOCKED_ACTIVITY_ACTION,
+  WORKSPACE_PREFLIGHT_CLEARED_ACTIVITY_ACTION,
+  WORKSPACE_PREFLIGHT_STATE_ACTIVITY_ACTIONS,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION,
@@ -877,6 +881,72 @@ describeEmbeddedPostgres("heartbeat workspace branch containment", () => {
     return service;
   };
 
+  async function seedProjectlessIsolatedIssue() {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const issueIdentifier = `${issuePrefix}-1`;
+
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Acme",
+      issuePrefix,
+      status: "active",
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {
+        heartbeat: {
+          wakeOnDemand: true,
+          maxConcurrentRuns: 1,
+        },
+      },
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Projectless isolated worktree",
+      status: "todo",
+      workMode: "standard",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      responsibleUserId: "responsible-user",
+      issueNumber: 1,
+      identifier: issueIdentifier,
+      executionWorkspaceSettings: {
+        mode: "isolated_workspace",
+        workspaceStrategy: { type: "git_worktree" },
+      },
+    });
+    return { companyId, agentId, issueId };
+  }
+
+  // Subscribes to `activity.logged` for the given action and, at the moment
+  // each event fires, kicks off a `snapshot()` read on a connection outside
+  // the transaction that logged it. Whether that read observes the committed
+  // effect is what distinguishes "published after commit" from "published
+  // from inside the transaction".
+  function captureActivityEvents<T>(companyId: string, action: string, snapshot: () => Promise<T>) {
+    const seen: { valueAtPublish: Promise<T> }[] = [];
+    const unsubscribe = subscribeCompanyLiveEvents(companyId, (event) => {
+      if (event.type !== "activity.logged") return;
+      const payload = event.payload as Record<string, unknown>;
+      if (payload.action !== action) return;
+      seen.push({ valueAtPublish: snapshot() });
+    });
+    return { seen, stop: unsubscribe };
+  }
+
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-branch-containment-");
     db = createDb(tempDb.connectionString);
@@ -1027,7 +1097,7 @@ describeEmbeddedPostgres("heartbeat workspace branch containment", () => {
       .from(activityLog)
       .where(eq(activityLog.entityId, issueId))
       .then((rows) => rows[0] ?? null);
-    expect(activity?.action).toBe("issue.workspace_preflight_blocked");
+    expect(activity?.action).toBe(WORKSPACE_PREFLIGHT_BLOCKED_ACTIVITY_ACTION);
     expect(activity?.details).toMatchObject({
       code: WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE,
       reason: WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE,
@@ -1036,6 +1106,138 @@ describeEmbeddedPostgres("heartbeat workspace branch containment", () => {
       resolvedStrategy: "git_worktree",
       hasResolvablePriorSessionWorkspace: false,
     });
+
+    await db
+      .update(issues)
+      .set({ executionWorkspaceSettings: { mode: "agent_default" }, updatedAt: new Date() })
+      .where(eq(issues.id, issueId));
+    const retriedRun = await heartbeat.wakeup(agentId, {
+      source: "assignment",
+      triggerDetail: "workspace_repaired",
+      reason: "workspace_preflight_repaired",
+      payload: { issueId },
+      contextSnapshot: { issueId, wakeReason: "workspace_preflight_repaired" },
+    });
+
+    expect(retriedRun).not.toBeNull();
+    const latestPreflightActivity = await db
+      .select({ action: activityLog.action, details: activityLog.details })
+      .from(activityLog)
+      .where(and(
+        eq(activityLog.entityId, issueId),
+        inArray(activityLog.action, WORKSPACE_PREFLIGHT_STATE_ACTIVITY_ACTIONS),
+      ))
+      .orderBy(desc(activityLog.createdAt), desc(activityLog.id))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    expect(latestPreflightActivity?.action).toBe(WORKSPACE_PREFLIGHT_CLEARED_ACTIVITY_ACTION);
+    expect(latestPreflightActivity?.details).toMatchObject({
+      code: WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE,
+      requestedReason: "workspace_preflight_repaired",
+    });
+  });
+
+  // BLO-21605: the preflight-block branch of `enqueueWakeup` used to fire
+  // `logActivity` from inside its `db.transaction` callback, so a consumer
+  // could receive `activity.logged` before the issue's `blocked` status
+  // committed, and a rolled-back transaction still emitted an event for a
+  // block that never took effect.
+  it("emits no activity.logged event when the workspace-preflight-block transaction fails to commit", async () => {
+    const { companyId, agentId, issueId } = await seedProjectlessIsolatedIssue();
+
+    // Runs the real transaction -- issue update, comment insert, wakeup
+    // request insert, and the activity_log insert all succeed -- then aborts
+    // it, standing in for a commit-time failure.
+    const rollbackDb = new Proxy(db, {
+      get(target, property, receiver) {
+        if (property === "transaction") {
+          return (callback: (tx: unknown) => Promise<unknown>, ...rest: unknown[]) =>
+            (target.transaction as unknown as (
+              cb: (tx: unknown) => Promise<unknown>,
+              ...args: unknown[]
+            ) => Promise<unknown>)(async (tx) => {
+              await callback(tx);
+              throw new Error("simulated commit failure after insert");
+            }, ...rest);
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    }) as Db;
+    const rollbackHeartbeat = heartbeatService(rollbackDb);
+    heartbeatServices.add(rollbackHeartbeat);
+
+    const events = captureActivityEvents(
+      companyId,
+      "issue.workspace_preflight_blocked",
+      () => db
+        .select({ status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]?.status ?? null),
+    );
+    try {
+      await expect(rollbackHeartbeat.wakeup(agentId, {
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "issue_assigned",
+        payload: { issueId },
+        contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+      })).rejects.toBeDefined();
+    } finally {
+      events.stop();
+    }
+
+    expect(
+      events.seen,
+      "a rolled-back preflight block must not publish a phantom activity event",
+    ).toHaveLength(0);
+    const issue = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("todo");
+    const activity = await db
+      .select({ id: activityLog.id })
+      .from(activityLog)
+      .where(eq(activityLog.entityId, issueId));
+    expect(activity).toHaveLength(0);
+  }, 15_000);
+
+  it("publishes issue.workspace_preflight_blocked only once the blocked status is visible", async () => {
+    const { companyId, agentId, issueId } = await seedProjectlessIsolatedIssue();
+
+    const events = captureActivityEvents(
+      companyId,
+      "issue.workspace_preflight_blocked",
+      () => db
+        .select({ status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]?.status ?? null),
+    );
+    try {
+      const run = await createHeartbeat().wakeup(agentId, {
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "issue_assigned",
+        payload: { issueId },
+        contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+      });
+      expect(run).toBeNull();
+    } finally {
+      events.stop();
+    }
+
+    expect(events.seen).toHaveLength(1);
+    // Read taken from inside the event listener, on a connection outside the
+    // blocking transaction: the "blocked" status is only visible there after
+    // commit, so a pre-commit publication would observe the stale "todo"
+    // status instead.
+    await expect(
+      events.seen[0]!.valueAtPublish,
+      "the blocked status must already be visible to other connections when the event fires",
+    ).resolves.toBe("blocked");
   });
 
   it.each([

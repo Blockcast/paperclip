@@ -23,6 +23,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { cleanupHeartbeatTestState } from "./helpers/cleanup-heartbeat-test-state.js";
 import { registerServerAdapter, runningProcesses, unregisterServerAdapter } from "../adapters/index.ts";
+import { subscribeCompanyLiveEvents } from "../services/live-events.js";
 import {
   BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS,
   CAPACITY_BLOCKED_HEARTBEAT_RETRY_MAX_ATTEMPTS,
@@ -38,6 +39,10 @@ import {
   SESSION_UNAVAILABLE_HEARTBEAT_RETRY_MAX_ATTEMPTS,
   shouldScheduleAutomaticRunRetry,
 } from "../services/heartbeat.js";
+import {
+  MAX_TRANSIENT_RETRY_HORIZON_MS,
+  TRANSIENT_HORIZON_CLAMP_MIN_ATTEMPTS,
+} from "../services/ccrotate-capacity-retry.js";
 
 const mockAdapterExecute = vi.hoisted(() =>
   vi.fn(async () => ({
@@ -803,7 +808,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         errorCode: "process_lost",
         resultJson: {},
         contextSnapshot: {
-          taskKey: "pr_review:Blockcast/paperclip:976",
+          taskKey: "pr_review:blockcast/paperclip:976",
           wakeReason: "process_lost_retry",
         },
       }),
@@ -1156,6 +1161,192 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect(agent?.id).toBe(agentId);
   });
 
+  // BLO-21605: the workspace-quarantine branch of `scheduleBoundedRetry` used
+  // to fire `logActivity` from inside its `db.transaction` callback, so a
+  // consumer could receive `activity.logged` before the workspace's
+  // `archived` status committed, and a rolled-back transaction still emitted
+  // an event for a quarantine that never took effect.
+  async function seedQuarantineFixture(workspaceId: string, workspaceName: string) {
+    const { companyId, agentId, issueId, runId, now } = await seedMaxTurnFixture({ issueStatus: "in_review" });
+    const projectId = randomUUID();
+    const validation = {
+      reason: "git_worktree_branch_incoherence",
+      fingerprint: `workspace_incoherence:v1:sha256:${workspaceName}`,
+      executionWorkspaceId: workspaceId,
+      expectedBranch: workspaceName,
+      actualBranch: "feat/skill-studio-test-runs",
+      cleanliness: "clean" as const,
+    };
+
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Paperclip App",
+      status: "in_progress",
+    });
+    await db.insert(executionWorkspaces).values({
+      id: workspaceId,
+      companyId,
+      projectId,
+      sourceIssueId: issueId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: workspaceName,
+      status: "active",
+      cwd: `/workspace/${workspaceName}`,
+      baseRef: "origin/master",
+      branchName: workspaceName,
+      providerType: "git_worktree",
+      providerRef: `/workspace/${workspaceName}`,
+      metadata: { existing: true },
+    });
+    await db
+      .update(issues)
+      .set({
+        projectId,
+        executionWorkspaceId: workspaceId,
+        executionWorkspacePreference: "reuse_existing",
+        executionWorkspaceSettings: { mode: "isolated_workspace" },
+      })
+      .where(eq(issues.id, issueId));
+
+    const interactionId = randomUUID();
+    await db
+      .update(heartbeatRuns)
+      .set({
+        error: "workspace validation failed before dispatch",
+        errorCode: "workspace_validation_failed",
+        resultJson: { workspaceValidation: validation },
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "issue_commented",
+          mutation: "interaction",
+          interactionId,
+          interactionKind: "request_confirmation",
+          interactionStatus: "accepted",
+        },
+      })
+      .where(eq(heartbeatRuns.id, runId));
+
+    return { companyId, agentId, issueId, runId, now };
+  }
+
+  // Subscribes to `activity.logged` for the given action and, at the moment
+  // each event fires, kicks off a `snapshot()` read on a connection outside
+  // the transaction that logged it. Whether that read observes the committed
+  // effect is what distinguishes "published after commit" from "published
+  // from inside the transaction".
+  function captureActivityEvents<T>(companyId: string, action: string, snapshot: () => Promise<T>) {
+    const seen: { valueAtPublish: Promise<T> }[] = [];
+    const unsubscribe = subscribeCompanyLiveEvents(companyId, (event) => {
+      if (event.type !== "activity.logged") return;
+      const payload = event.payload as Record<string, unknown>;
+      if (payload.action !== action) return;
+      seen.push({ valueAtPublish: snapshot() });
+    });
+    return { seen, stop: unsubscribe };
+  }
+
+  it("emits no activity.logged event when the workspace-quarantine transaction fails to commit", async () => {
+    const workspaceId = randomUUID();
+    const { companyId, runId, now } = await seedQuarantineFixture(workspaceId, "rollback-workspace");
+
+    // Runs the real transaction -- workspace archival and the activity_log
+    // insert both succeed -- then aborts it, standing in for a commit-time
+    // failure.
+    const rollbackDb = new Proxy(db, {
+      get(target, property, receiver) {
+        if (property === "transaction") {
+          return (callback: (tx: unknown) => Promise<unknown>, ...rest: unknown[]) =>
+            (target.transaction as unknown as (
+              cb: (tx: unknown) => Promise<unknown>,
+              ...args: unknown[]
+            ) => Promise<unknown>)(async (tx) => {
+              await callback(tx);
+              throw new Error("simulated commit failure after insert");
+            }, ...rest);
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    }) as typeof db;
+    const rollbackHeartbeat = heartbeatService(rollbackDb);
+
+    const events = captureActivityEvents(
+      companyId,
+      "execution_workspace.workspace_validation_quarantined",
+      () => db
+        .select({ status: executionWorkspaces.status })
+        .from(executionWorkspaces)
+        .where(eq(executionWorkspaces.id, workspaceId))
+        .then((rows) => rows[0]?.status ?? null),
+    );
+    try {
+      await expect(rollbackHeartbeat.scheduleBoundedRetry(runId, {
+        now,
+        random: () => 0.5,
+        retryReason: INTERACTION_CONTINUATION_INFRA_RETRY_REASON,
+        wakeReason: INTERACTION_CONTINUATION_INFRA_WAKE_REASON,
+        maxAttempts: 3,
+      })).rejects.toBeDefined();
+    } finally {
+      events.stop();
+    }
+
+    expect(
+      events.seen,
+      "a rolled-back quarantine must not publish a phantom activity event",
+    ).toHaveLength(0);
+    const workspace = await db
+      .select({ status: executionWorkspaces.status })
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, workspaceId))
+      .then((rows) => rows[0] ?? null);
+    expect(workspace?.status).toBe("active");
+    const activity = await db
+      .select({ id: activityLog.id })
+      .from(activityLog)
+      .where(eq(activityLog.entityId, workspaceId));
+    expect(activity).toHaveLength(0);
+  });
+
+  it("publishes execution_workspace.workspace_validation_quarantined only once the archived status is visible", async () => {
+    const workspaceId = randomUUID();
+    const { companyId, runId, now } = await seedQuarantineFixture(workspaceId, "visible-workspace");
+
+    const events = captureActivityEvents(
+      companyId,
+      "execution_workspace.workspace_validation_quarantined",
+      () => db
+        .select({ status: executionWorkspaces.status })
+        .from(executionWorkspaces)
+        .where(eq(executionWorkspaces.id, workspaceId))
+        .then((rows) => rows[0]?.status ?? null),
+    );
+    try {
+      const scheduled = await heartbeat.scheduleBoundedRetry(runId, {
+        now,
+        random: () => 0.5,
+        retryReason: INTERACTION_CONTINUATION_INFRA_RETRY_REASON,
+        wakeReason: INTERACTION_CONTINUATION_INFRA_WAKE_REASON,
+        maxAttempts: 3,
+      });
+      expect(scheduled.outcome).toBe("scheduled");
+    } finally {
+      events.stop();
+    }
+
+    expect(events.seen).toHaveLength(1);
+    // Read taken from inside the event listener, on a connection outside the
+    // quarantining transaction: the "archived" status is only visible there
+    // after commit, so a pre-commit publication would observe the stale
+    // "active" status instead.
+    await expect(
+      events.seen[0]!.valueAtPublish,
+      "the archived status must already be visible to other connections when the event fires",
+    ).resolves.toBe("archived");
+  });
+
   it("does not quarantine another issue's workspace when validation payload is stale", async () => {
     const { companyId, issueId, runId, now } = await seedMaxTurnFixture({ issueStatus: "in_review" });
     const projectId = randomUUID();
@@ -1487,7 +1678,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       shouldScheduleAutomaticRunRetry({
         errorCode: "pr_review_output_missing",
         resultJson: {},
-        contextSnapshot: { taskKey: "pr_review:Blockcast/pim-multicast-gateway:1656" },
+        contextSnapshot: { taskKey: "pr_review:blockcast/pim-multicast-gateway:1656" },
       }),
     ).toBe(true);
 
@@ -1536,7 +1727,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       shouldScheduleAutomaticRunRetry({
         errorCode: "pr_review_verification_unavailable",
         resultJson: {},
-        contextSnapshot: { taskKey: "pr_review:Blockcast/onprem-k8s:1817" },
+        contextSnapshot: { taskKey: "pr_review:blockcast/onprem-k8s:1817" },
       }),
     ).toBe(true);
 
@@ -2169,7 +2360,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       shouldScheduleAutomaticRunRetry({
         errorCode: "adapter_failed",
         resultJson: {},
-        contextSnapshot: { taskKey: "pr_review:Blockcast/ally:888" },
+        contextSnapshot: { taskKey: "pr_review:blockcast/ally:888" },
       }),
     ).toBe(true);
   });
@@ -2215,7 +2406,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       shouldScheduleAutomaticRunRetry({
         errorCode: "k8s_concurrent_run_blocked",
         resultJson: {},
-        contextSnapshot: { taskKey: "pr_review:Blockcast/ally:100" },
+        contextSnapshot: { taskKey: "pr_review:blockcast/ally:100" },
       }),
     ).toBe(true);
   });
@@ -2240,74 +2431,23 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     ).toBe(false);
   });
 
-  it("retries job_failed only when durable evidence proves adapter invocation never began", () => {
-    expect(
-      shouldScheduleAutomaticRunRetry({
-        errorCode: "job_failed",
-        resultJson: { externalLifecycleRecovery: { adapterInvocationStarted: false } },
-        contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
-      }),
-    ).toBe(true);
-    expect(
-      shouldScheduleAutomaticRunRetry({
-        errorCode: "job_failed",
-        resultJson: { externalLifecycleRecovery: { adapterInvocationStarted: true } },
-        contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
-      }),
-    ).toBe(false);
-    expect(
-      shouldScheduleAutomaticRunRetry({
-        errorCode: "job_failed",
-        resultJson: {},
-        contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
-      }),
-    ).toBe(false);
-    expect(
-      shouldScheduleAutomaticRunRetry({
-        errorCode: "job_failed",
-        resultJson: {},
-        contextSnapshot: { wakeReason: "heartbeat_timer" },
-      }),
-    ).toBe(false);
-    expect(
-      shouldScheduleAutomaticRunRetry({
-        errorCode: "job_failed",
-        resultJson: {},
-        contextSnapshot: null,
-      }),
-    ).toBe(false);
-    expect(JOB_FAILED_HEARTBEAT_RETRY_MAX_ATTEMPTS).toBe(4);
-  });
-
-  it("BLO-9147 AC2: CAPACITY_BLOCKED_HEARTBEAT_RETRY_MAX_ATTEMPTS exceeds rate-limit cap (12)", () => {
-    expect(CAPACITY_BLOCKED_HEARTBEAT_RETRY_MAX_ATTEMPTS).toBeGreaterThan(12);
-  });
-
-  // BLO-10448 — scheduler-level transient infra failures retry gate
-  it.each(["k8s_pod_schedule_failed", "job_missing"])(
-    "BLO-10448: retries %s on a pr_review wake (work never ran)",
+  it.each(["job_failed", "oom_killed", "exit_137"])(
+    "retries %s only when durable evidence proves adapter invocation never began",
     (errorCode) => {
       expect(
         shouldScheduleAutomaticRunRetry({
           errorCode,
-          resultJson: {},
-          contextSnapshot: { wakeReason: "github_pr_opened", reviewKind: "pr_review", githubPrNumber: 408 },
+          resultJson: { externalLifecycleRecovery: { adapterInvocationStarted: false } },
+          contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
         }),
       ).toBe(true);
-      // thin snapshot (taskKey-only) — webhook-driven reviewer wakes get trimmed
       expect(
         shouldScheduleAutomaticRunRetry({
           errorCode,
-          resultJson: {},
-          contextSnapshot: { taskKey: "pr_review:Blockcast/Network-Operator-Portal:408" },
+          resultJson: { externalLifecycleRecovery: { adapterInvocationStarted: true } },
+          contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
         }),
-      ).toBe(true);
-    },
-  );
-
-  it.each(["k8s_pod_schedule_failed", "job_missing"])(
-    "BLO-10448: does NOT retry %s on non-PR wakes (BLO-7913 leak guard)",
-    (errorCode) => {
+      ).toBe(false);
       expect(
         shouldScheduleAutomaticRunRetry({
           errorCode,
@@ -2319,11 +2459,63 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         shouldScheduleAutomaticRunRetry({
           errorCode,
           resultJson: {},
-          contextSnapshot: {},
+          contextSnapshot: { wakeReason: "heartbeat_timer" },
+        }),
+      ).toBe(false);
+      expect(
+        shouldScheduleAutomaticRunRetry({
+          errorCode,
+          resultJson: {},
+          contextSnapshot: null,
+        }),
+      ).toBe(false);
+      expect(JOB_FAILED_HEARTBEAT_RETRY_MAX_ATTEMPTS).toBe(4);
+    },
+  );
+
+  it("does not retry job_missing even with synthetic never-invoked evidence", () => {
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "job_missing",
+        resultJson: { externalLifecycleRecovery: { adapterInvocationStarted: false } },
+        contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
+      }),
+    ).toBe(false);
+  });
+
+  it.each(["job_missing", "k8s_pod_schedule_failed"])(
+    "does not let stale transient metadata replay %s",
+    (errorCode) => {
+      expect(
+        shouldScheduleAutomaticRunRetry({
+          errorCode,
+          resultJson: { errorFamily: "transient_upstream" },
+          contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
         }),
       ).toBe(false);
     },
   );
+
+  it("BLO-9147 AC2: CAPACITY_BLOCKED_HEARTBEAT_RETRY_MAX_ATTEMPTS exceeds rate-limit cap (12)", () => {
+    expect(CAPACITY_BLOCKED_HEARTBEAT_RETRY_MAX_ATTEMPTS).toBeGreaterThan(12);
+  });
+
+  it("does not retry ambiguous k8s_pod_schedule_failed outcomes", () => {
+    for (const contextSnapshot of [
+      { wakeReason: "github_pr_opened", reviewKind: "pr_review", githubPrNumber: 408 },
+      { taskKey: "pr_review:blockcast/network-operator-portal:408" },
+      { issueId: randomUUID(), wakeReason: "issue_assigned" },
+      {},
+    ]) {
+      expect(
+        shouldScheduleAutomaticRunRetry({
+          errorCode: "k8s_pod_schedule_failed",
+          resultJson: {},
+          contextSnapshot,
+        }),
+      ).toBe(false);
+    }
+  });
 
   // BLO-17456: when a PR-review chain exhausts, the reviewer never posts its
   // required status, so the PR sits on "Expected — waiting for status" forever.
@@ -2612,7 +2804,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
   );
 
   it.each(["session_unavailable", "zero_token_session_reset"] as const)(
-    "schedules %s retries for an assigned todo issue while retaining its execution lock",
+    "schedules %s retries for an assigned todo issue while leaving its execution lock free until claim",
     async (retryReason) => {
       const fixture = await seedMaxTurnFixture({ issueStatus: "todo" });
       const scheduled = await heartbeat.scheduleBoundedRetry(fixture.runId, {
@@ -2635,7 +2827,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         .from(issues)
         .where(eq(issues.id, fixture.issueId))
         .then((rows) => rows[0] ?? null);
-      expect(issue).toEqual({ executionRunId: scheduled.run.id, status: "todo" });
+      expect(issue).toEqual({ executionRunId: null, status: "todo" });
     },
   );
 
@@ -3524,5 +3716,144 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect((wakeupRequest?.payload as Record<string, unknown> | null)?.transientRetryNotBefore).toBe(
       retryNotBefore.toISOString(),
     );
+  });
+
+  // BLO-23525: the prose-parser path (parseProviderCapacityResetHorizon ->
+  // resultJson.retryNotBefore -> this scheduler's transientRetryNotBefore
+  // override) used to honor an advertised horizon verbatim. It now shares
+  // clampTransientRetryHorizon with the capacity-gate path (BLO-23438), with
+  // its own attempt ceiling raised so the clamp cannot silently reintroduce
+  // BLO-23438's exhaustion trap on this route.
+  it("BLO-23525: clamps a transient_upstream retry-not-before beyond the horizon ceiling instead of parking for the full advertised window", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const now = new Date("2026-08-09T00:00:00.000Z");
+    // 130h out: beyond both the 24h per-attempt cap and BLO-22844's 124.8h
+    // worst case, so a single attempt must not be able to honor it verbatim.
+    const advertisedRetryNotBefore = new Date(now.getTime() + 130 * 60 * 60 * 1000);
+
+    await seedRetryFixture({
+      runId,
+      companyId,
+      agentId,
+      now,
+      errorCode: "adapter_failed",
+      errorFamily: "transient_upstream",
+      retryNotBefore: advertisedRetryNotBefore.toISOString(),
+    });
+
+    const scheduled = await heartbeat.scheduleBoundedRetry(runId, {
+      now,
+      random: () => 0.5,
+    });
+
+    expect(scheduled.outcome).toBe("scheduled");
+    if (scheduled.outcome !== "scheduled") return;
+    // Clamped to the ceiling, not the (later) advertised horizon.
+    expect(scheduled.dueAt.getTime()).toBe(now.getTime() + MAX_TRANSIENT_RETRY_HORIZON_MS);
+    expect(scheduled.attempt).toBe(1);
+    // The family's ceiling was raised so 24h-per-attempt re-probing has
+    // enough attempts left to reach BLO-22844's 124.8h worst case.
+    expect(scheduled.maxAttempts).toBe(TRANSIENT_HORIZON_CLAMP_MIN_ATTEMPTS);
+    expect(scheduled.maxAttempts).toBeGreaterThan(BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length);
+
+    const retryRun = await db
+      .select({ contextSnapshot: heartbeatRuns.contextSnapshot, scheduledRetryAt: heartbeatRuns.scheduledRetryAt })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, scheduled.run.id))
+      .then((rows) => rows[0] ?? null);
+
+    expect(retryRun?.scheduledRetryAt?.getTime()).toBe(now.getTime() + MAX_TRANSIENT_RETRY_HORIZON_MS);
+    const contextSnapshot = (retryRun?.contextSnapshot as Record<string, unknown> | null) ?? {};
+    // The clamped instant is what downstream retry logic acts on...
+    expect(contextSnapshot.transientRetryNotBefore).toBe(advertisedRetryNotBefore.toISOString());
+    // ...but the declined advertised horizon stays legible on the row.
+    expect(contextSnapshot.transientRetryHorizonClampedFrom).toBe(advertisedRetryNotBefore.toISOString());
+  });
+
+  it("BLO-23525: keeps re-probing a clamped transient_upstream horizon across attempts, and only exhausts past the raised ceiling", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const now = new Date("2026-08-09T00:00:00.000Z");
+    const advertisedRetryNotBefore = new Date(now.getTime() + 200 * 60 * 60 * 1000);
+
+    // Seed as the run that just failed on the *last* attempt the raised
+    // ceiling allows, still carrying the same far-future advertised horizon
+    // (the provider outage has not resolved).
+    await seedRetryFixture({
+      runId,
+      companyId,
+      agentId,
+      now,
+      errorCode: "adapter_failed",
+      errorFamily: "transient_upstream",
+      retryNotBefore: advertisedRetryNotBefore.toISOString(),
+      scheduledRetryAttempt: TRANSIENT_HORIZON_CLAMP_MIN_ATTEMPTS - 1,
+    });
+
+    const lastAllowedAttempt = await heartbeat.scheduleBoundedRetry(runId, {
+      now,
+      random: () => 0.5,
+    });
+
+    expect(lastAllowedAttempt.outcome).toBe("scheduled");
+    if (lastAllowedAttempt.outcome !== "scheduled") return;
+    expect(lastAllowedAttempt.attempt).toBe(TRANSIENT_HORIZON_CLAMP_MIN_ATTEMPTS);
+    expect(lastAllowedAttempt.dueAt.getTime()).toBe(now.getTime() + MAX_TRANSIENT_RETRY_HORIZON_MS);
+
+    await cleanupRetryFixture();
+
+    // One attempt further — still the same unresolved outage — must exhaust
+    // rather than clamp-and-park again indefinitely.
+    const exhaustedRunId = randomUUID();
+    await seedRetryFixture({
+      runId: exhaustedRunId,
+      companyId: randomUUID(),
+      agentId: randomUUID(),
+      now,
+      errorCode: "adapter_failed",
+      errorFamily: "transient_upstream",
+      retryNotBefore: advertisedRetryNotBefore.toISOString(),
+      scheduledRetryAttempt: TRANSIENT_HORIZON_CLAMP_MIN_ATTEMPTS,
+    });
+
+    const exhausted = await heartbeat.scheduleBoundedRetry(exhaustedRunId, {
+      now,
+      random: () => 0.5,
+    });
+
+    expect(exhausted).toEqual({
+      outcome: "retry_exhausted",
+      attempt: TRANSIENT_HORIZON_CLAMP_MIN_ATTEMPTS + 1,
+      maxAttempts: TRANSIENT_HORIZON_CLAMP_MIN_ATTEMPTS,
+    });
+  });
+
+  it("BLO-23525: leaves the ordinary hintless transient_upstream ceiling (no retry-not-before) untouched at 4 attempts", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const now = new Date("2026-08-09T00:00:00.000Z");
+
+    await seedRetryFixture({
+      runId,
+      companyId,
+      agentId,
+      now,
+      errorCode: "adapter_failed",
+      errorFamily: "transient_upstream",
+      scheduledRetryAttempt: BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length - 1,
+    });
+
+    const lastHintlessAttempt = await heartbeat.scheduleBoundedRetry(runId, {
+      now,
+      random: () => 0.5,
+    });
+
+    expect(lastHintlessAttempt.outcome).toBe("scheduled");
+    if (lastHintlessAttempt.outcome !== "scheduled") return;
+    expect(lastHintlessAttempt.maxAttempts).toBe(BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length);
   });
 });

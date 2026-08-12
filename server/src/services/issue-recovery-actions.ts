@@ -1,4 +1,4 @@
-import { and, desc, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNotNull, lte, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { issueRecoveryActions } from "@paperclipai/db";
 import type {
@@ -220,7 +220,7 @@ function isUniqueRecoveryActionConflict(error: unknown) {
   );
 }
 
-export function issueRecoveryActionService(db: Db) {
+export function issueRecoveryActionService(db: DbOrTransaction) {
   const upsertQueues = new Map<string, Promise<void>>();
 
   async function runExclusiveUpsert<T>(
@@ -398,7 +398,13 @@ export function issueRecoveryActionService(db: Db) {
         .set({
           recoveryIssueId: input.recoveryIssueId ?? null,
           kind: input.kind,
-          status: "active",
+          // BLO-24662: `escalated` is sticky. A row reaches it only by burning the
+          // creation-anchored `timeoutAt`, and that horizon is fixed for the life of the
+          // action — no owner change restores it (see the `timeoutAt` preservation note
+          // below). Re-setting `active` here would silently un-retire an action on the very
+          // next sweep and put it straight back into the invisible state the transition
+          // exists to end.
+          status: existing.status === "escalated" ? "escalated" : "active",
           ownerType,
           ownerAgentId: input.ownerAgentId ?? null,
           ownerUserId: input.ownerUserId ?? null,
@@ -535,6 +541,71 @@ export function issueRecoveryActionService(db: Db) {
       );
   }
 
+  /**
+   * BLO-24662: retire recovery actions that have burned their creation-anchored horizon.
+   *
+   * `strandedRecoveryWakeAttemptsExhausted` already stops every sweep from waking anyone
+   * for these, but nothing ever wrote that fact to the row, so a spent action kept
+   * reporting `status: "active"` indefinitely. On BLO-20995 that was a
+   * `stranded_assigned_issue` action sitting at `attemptCount: 0 / 5` more than 13h past
+   * its `timeoutAt` and still reading as active — the mechanism that exists to catch
+   * strandings, itself stranded, and invisible precisely because `active` is the healthy
+   * value.
+   *
+   * `escalated` rather than a terminal status, deliberately. It is the status the schema
+   * already reserves for "past automatic recovery, needs a human", the attention feed
+   * already renders it at `severity: high`, and — critically — it stays inside
+   * `ACTIVE_RECOVERY_ACTION_STATUSES`, so the row keeps holding
+   * `issue_recovery_actions_active_source_uq`. A terminal status would free that slot and
+   * let the next sweep open a brand-new action with a fresh budget and a fresh horizon,
+   * reinstating the unbounded re-fire loop BLO-18996 closed.
+   *
+   * Only rows that carry a budget are eligible (`maxAttempts is not null`), matching the
+   * gate in `strandedRecoveryWakeAttemptsExhausted`: the monitor-only and manual-repair
+   * shapes are expected to sit open across many sweeps and a `timeoutAt` on those belongs
+   * to the provider-quota scheduler's `retryAt`, not to a wake horizon.
+   *
+   * The `status` re-check inside the UPDATE is what makes concurrent sweeps safe: only
+   * rows this call actually transitioned come back, so the caller announces once.
+   */
+  async function escalateExpiredWakeHorizons(input: {
+    now?: Date;
+    companyId?: string | null;
+    limit?: number;
+  } = {}): Promise<IssueRecoveryAction[]> {
+    const now = input.now ?? new Date();
+    const limit = Math.max(1, Math.floor(input.limit ?? 200));
+    const candidatePredicates = [
+      eq(issueRecoveryActions.status, "active"),
+      isNotNull(issueRecoveryActions.maxAttempts),
+      isNotNull(issueRecoveryActions.timeoutAt),
+      lte(issueRecoveryActions.timeoutAt, now),
+    ];
+    if (input.companyId) {
+      candidatePredicates.push(eq(issueRecoveryActions.companyId, input.companyId));
+    }
+
+    const candidateIds = await db
+      .select({ id: issueRecoveryActions.id })
+      .from(issueRecoveryActions)
+      .where(and(...candidatePredicates))
+      .orderBy(asc(issueRecoveryActions.timeoutAt))
+      .limit(limit)
+      .then((rows) => rows.map((row) => row.id));
+    if (candidateIds.length === 0) return [];
+
+    const updated = await db
+      .update(issueRecoveryActions)
+      .set({ status: "escalated", updatedAt: now })
+      .where(and(
+        inArray(issueRecoveryActions.id, candidateIds),
+        eq(issueRecoveryActions.status, "active"),
+      ))
+      .returning();
+
+    return updated.map(toReadModel);
+  }
+
   async function resolveActiveForIssue(
     input: ResolveIssueRecoveryActionInput,
     dbOrTx: DbOrTransaction = db,
@@ -577,6 +648,7 @@ export function issueRecoveryActionService(db: Db) {
     getActiveForIssue,
     listActiveForIssues,
     resolveActiveForIssue,
+    escalateExpiredWakeHorizons,
     upsertSourceScoped,
     releaseWakeAttempt,
   };

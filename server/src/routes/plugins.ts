@@ -78,6 +78,13 @@ import {
 } from "./authz.js";
 import { validateInstanceConfig } from "../services/plugin-config-validator.js";
 import {
+  collectPluginConfigSecretValues,
+  maskPluginConfigJson,
+  mergeMaskedPluginConfig,
+  redactSecretValuesDeep,
+  redactSecretValuesFromText,
+} from "../services/plugin-config-masking.js";
+import {
   findLocalFolderDeclaration,
   getStoredLocalFolders,
   inspectPluginLocalFolder,
@@ -157,7 +164,7 @@ interface PluginHealthCheckResult {
   lastError?: string;
 }
 
-interface PluginHealthAlert {
+interface PluginErrorAlert {
   alertname: "PaperclipPluginError";
   severity: "page";
   pluginId: string;
@@ -168,6 +175,45 @@ interface PluginHealthAlert {
   description: string;
   updatedAt: string;
 }
+
+/**
+ * A scheduled plugin job whose most recent runs all failed (BLO-20957 AC #3).
+ * The plugin worker itself may be perfectly healthy — `status: "ready"` — so
+ * this is a distinct alert shape from {@link PluginErrorAlert} rather than a
+ * variant of it, and it is the surfaced signal for a job that structurally
+ * cannot obtain the company scope it needs (e.g. zero configured companies
+ * for a plugin whose job requires one) instead of only an ERROR log line.
+ */
+interface PluginScheduledJobFailingAlert {
+  alertname: "PaperclipPluginScheduledJobFailing";
+  severity: "page";
+  pluginId: string;
+  pluginKey: string;
+  jobId: string;
+  jobKey: string;
+  /**
+   * The tenant whose runs are failing, or `null` for an instance-scoped run.
+   * Streaks are computed per `(jobId, companyId)` since the BLO-20957
+   * per-company fan-out, so an alert without this is not actionable: the
+   * responder cannot tell which of six tenants is broken.
+   */
+  companyId: string | null;
+  consecutiveFailures: number;
+  lastError: string | null;
+  summary: string;
+  description: string;
+}
+
+type PluginHealthAlert = PluginErrorAlert | PluginScheduledJobFailingAlert;
+
+/**
+ * Minimum number of consecutive `failed` runs a scheduled job needs before
+ * `/plugins/alerts/plugin-health` reports it as firing (BLO-20957 AC #3).
+ * 3 tolerates one transient blip (a timeout, a momentary DB hiccup) while
+ * still catching a structurally broken job — one denied every tick — well
+ * before an operator would notice it any other way.
+ */
+const SCHEDULED_JOB_FAILURE_STREAK_THRESHOLD = 3;
 
 type RagHealthPluginError = {
   id: string;
@@ -1028,9 +1074,17 @@ export function pluginRoutes(
    * GET /api/plugins/alerts/plugin-health
    *
    * Polling endpoint for paging integrations (Prometheus JSON exporter,
-   * Alertmanager webhook receiver, or direct on-call script). Returns only
-   * plugins in `error` state; ready, disabled, and paused plugins are
-   * suppressed by the `listByStatus("error")` filter.
+   * Alertmanager webhook receiver, or direct on-call script). Two alert
+   * shapes:
+   *
+   * - `PaperclipPluginError` — the plugin worker itself is in `error` state
+   *   (crashed, failed to initialize, ...); ready/disabled/paused plugins
+   *   are suppressed by the `listByStatus("error")` filter.
+   * - `PaperclipPluginScheduledJobFailing` — the worker is healthy but one
+   *   of its scheduled jobs has failed its last {@link SCHEDULED_JOB_FAILURE_STREAK_THRESHOLD}
+   *   consecutive runs (BLO-20957 AC #3: a job that cannot obtain the
+   *   company scope it needs must surface here, not only as an ERROR log
+   *   line nobody greps for).
    *
    * Paging integration path: configure a Prometheus JSON exporter or
    * Alertmanager receiver to poll this route with a board token on a
@@ -1044,7 +1098,7 @@ export function pluginRoutes(
   router.get("/plugins/alerts/plugin-health", async (req, res) => {
     assertBoardOrgAccess(req);
     const erroredPlugins = await registry.listByStatus("error");
-    const alerts: PluginHealthAlert[] = erroredPlugins.map((plugin) => {
+    const errorAlerts: PluginHealthAlert[] = erroredPlugins.map((plugin) => {
       const lastError = plugin.lastError ?? null;
       return {
         alertname: "PaperclipPluginError",
@@ -1061,6 +1115,37 @@ export function pluginRoutes(
       };
     });
 
+    const jobAlerts: PluginHealthAlert[] = [];
+    if (jobDeps) {
+      const streaks = await jobDeps.jobStore.listJobsWithFailureStreak(
+        SCHEDULED_JOB_FAILURE_STREAK_THRESHOLD,
+      );
+      for (const streak of streaks) {
+        const plugin = await resolvePlugin(registry, streak.job.pluginId);
+        if (!plugin) continue; // job's plugin was hard-deleted; nothing to page on
+        const scopeLabel =
+          streak.companyId === null
+            ? "instance-scoped (no company)"
+            : `company ${streak.companyId}`;
+        jobAlerts.push({
+          alertname: "PaperclipPluginScheduledJobFailing",
+          severity: "page",
+          pluginId: plugin.id,
+          pluginKey: plugin.pluginKey,
+          jobId: streak.job.id,
+          jobKey: streak.job.jobKey,
+          companyId: streak.companyId,
+          consecutiveFailures: streak.consecutiveFailures,
+          lastError: streak.lastError,
+          summary: `Scheduled job "${streak.job.jobKey}" on plugin ${plugin.pluginKey} has failed its last ${streak.consecutiveFailures} runs for ${scopeLabel}`,
+          description: streak.lastError
+            ? `Job "${streak.job.jobKey}" (plugin ${plugin.pluginKey}, ${plugin.id}) has failed ${streak.consecutiveFailures} consecutive runs for ${scopeLabel}. Last error: ${streak.lastError}`
+            : `Job "${streak.job.jobKey}" (plugin ${plugin.pluginKey}, ${plugin.id}) has failed ${streak.consecutiveFailures} consecutive runs for ${scopeLabel}.`,
+        });
+      }
+    }
+
+    const alerts = [...errorAlerts, ...jobAlerts];
     res.json({
       status: alerts.length > 0 ? "firing" : "ok",
       alerts,
@@ -2515,11 +2600,23 @@ export function pluginRoutes(
    * Returns the `PluginConfig` record if one exists, or `null` if the plugin
    * has not yet been configured.
    *
+   * **Authority (BLO-20794):** instance admin, matching the POST write side.
+   * This row holds live plugin credentials, so reading it is at least as
+   * sensitive as writing it; the previous `assertBoardOrgAccess` gate let any
+   * board actor with one company membership read every plugin's secrets.
+   *
+   * **Masking:** secret-bearing values are replaced with `__redacted__` before
+   * the row leaves the process — defence in depth behind the authority gate,
+   * and what keeps the secret off an admin's screen and out of a browser cache.
+   * Secret *pointers* survive intact so the config form can still render the
+   * binding. POST restores anything echoed back unchanged, so a read/write
+   * round-trip is lossless (see `plugin-config-masking.ts`).
+   *
    * Response: `PluginConfig | null`
    * Errors: 404 if plugin not found
    */
   router.get("/plugins/:pluginId/config", async (req, res) => {
-    assertBoardOrgAccess(req);
+    assertInstanceAdmin(req);
     const { pluginId } = req.params;
     const companyId = requirePluginConfigCompanyId(req, req.query.companyId);
 
@@ -2530,7 +2627,16 @@ export function pluginRoutes(
     }
 
     const config = await registry.getConfig(plugin.id, companyId);
-    res.json(config);
+    if (!config) {
+      res.json(config);
+      return;
+    }
+
+    const schema = plugin.manifestJson?.instanceConfigSchema;
+    res.json({
+      ...config,
+      configJson: maskPluginConfigJson(config.configJson, schema),
+    });
   });
 
   /**
@@ -2577,11 +2683,35 @@ export function pluginRoutes(
       delete body.configJson.devUiUrl;
     }
 
+    // Restore any value the caller echoed back as the mask sentinel from the
+    // masked GET (BLO-20794). Must run before validation: `__redacted__` would
+    // otherwise fail a `pattern`/`minLength` constraint on the secret field, and
+    // must run before the secret-ref extraction so bindings are read from the
+    // real stored pointers.
+    const storedConfig = await registry.getConfig(plugin.id, companyId);
+    const merged = mergeMaskedPluginConfig(
+      body.configJson,
+      storedConfig && typeof storedConfig === "object" ? storedConfig.configJson : null,
+      plugin.manifestJson?.instanceConfigSchema,
+    );
+    // A sentinel inside an array that was reordered or had entries removed
+    // cannot be resolved without risking re-homing the credential onto a
+    // different entry. Refuse the write and make the operator re-enter it.
+    if (merged.unresolvedMaskPaths.length > 0) {
+      res.status(400).json({
+        error:
+          "Masked secret values could not be matched to stored configuration because the surrounding array changed. Re-enter the affected secrets explicitly.",
+        unresolvedMaskPaths: merged.unresolvedMaskPaths,
+      });
+      return;
+    }
+    const configJson = merged.configJson;
+
     // Validate configJson against the plugin's instanceConfigSchema (if declared).
     // This ensures CLI/API callers get the same validation the UI performs client-side.
     const schema = plugin.manifestJson?.instanceConfigSchema;
     if (schema && Object.keys(schema).length > 0) {
-      const validation = validateInstanceConfig(body.configJson, schema);
+      const validation = validateInstanceConfig(configJson, schema);
       if (!validation.valid) {
         res.status(400).json({
           error: "Configuration does not match the plugin's instanceConfigSchema",
@@ -2592,7 +2722,7 @@ export function pluginRoutes(
     }
 
     try {
-      const secretRefs = extractSecretRefBindingsFromConfig(body.configJson, schema);
+      const secretRefs = extractSecretRefBindingsFromConfig(configJson, schema);
       await validatePluginSecretRefsForCompany(companyId, secretRefs);
       await secretService(db).syncSecretRefsForTarget(
         companyId,
@@ -2603,14 +2733,14 @@ export function pluginRoutes(
 
       const result = await registry.upsertConfig(plugin.id, companyId, {
         companyId,
-        configJson: body.configJson,
+        configJson,
       });
       await logPluginMutationActivity(req, "plugin.config.updated", plugin.id, {
         pluginId: plugin.id,
         pluginKey: plugin.pluginKey,
         companyId,
         secretRefCount: secretRefs.length,
-        configKeyCount: Object.keys(body.configJson).length,
+        configKeyCount: Object.keys(configJson).length,
       });
 
       // Notify the running worker about the config change (PLUGIN_SPEC §25.4.4).
@@ -2622,7 +2752,7 @@ export function pluginRoutes(
           await bridgeDeps.workerManager.call(
             plugin.id,
             "configChanged",
-            { config: body.configJson, companyId },
+            { config: configJson, companyId },
           );
         } catch (rpcErr) {
           if (
@@ -2641,7 +2771,13 @@ export function pluginRoutes(
         }
       }
 
-      res.json(result);
+      // Mask the echo for the same reason the GET is masked — the persisted row
+      // holds plaintext and this response would otherwise hand it straight back.
+      res.json(
+        result
+          ? { ...result, configJson: maskPluginConfigJson(result.configJson, schema) }
+          : result,
+      );
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       res.status(400).json({ error: message });
@@ -2669,7 +2805,11 @@ export function pluginRoutes(
    * - 502 if the worker is unavailable
    */
   router.post("/plugins/:pluginId/config/test", async (req, res) => {
-    assertBoardOrgAccess(req);
+    // Instance admin, matching GET and POST on this resource (BLO-20794). This
+    // handler restores masked-out stored secrets before handing the config to
+    // the worker, so a lesser actor could otherwise post `__redacted__` and have
+    // the real credential exercised against a destination of their choosing.
+    assertInstanceAdmin(req);
 
     if (!bridgeDeps) {
       res.status(501).json({ error: "Plugin bridge is not enabled" });
@@ -2698,10 +2838,34 @@ export function pluginRoutes(
       return;
     }
 
-    // Fast schema-level rejection before hitting the worker RPC.
     const schema = plugin.manifestJson?.instanceConfigSchema;
+    // Preserve values discarded while canonicalizing the submitted config. The
+    // worker receives the normalized value below, while this pre-merge set
+    // keeps diagnostics redacted if they reflect discarded request material.
+    const submittedSecretValues = collectPluginConfigSecretValues(body.configJson, schema);
+
+    // Same masked round-trip as the save path: testing an unmodified config
+    // read back from the masked GET must exercise the stored secret, not the
+    // sentinel.
+    const storedTestConfig = await registry.getConfig(plugin.id, companyId);
+    const mergedTest = mergeMaskedPluginConfig(
+      body.configJson,
+      storedTestConfig && typeof storedTestConfig === "object" ? storedTestConfig.configJson : null,
+      plugin.manifestJson?.instanceConfigSchema,
+    );
+    if (mergedTest.unresolvedMaskPaths.length > 0) {
+      res.status(400).json({
+        error:
+          "Masked secret values could not be matched to stored configuration because the surrounding array changed. Re-enter the affected secrets explicitly.",
+        unresolvedMaskPaths: mergedTest.unresolvedMaskPaths,
+      });
+      return;
+    }
+    const testConfigJson = mergedTest.configJson;
+
+    // Fast schema-level rejection before hitting the worker RPC.
     if (schema && Object.keys(schema).length > 0) {
-      const validation = validateInstanceConfig(body.configJson, schema);
+      const validation = validateInstanceConfig(testConfigJson, schema);
       if (!validation.valid) {
         res.status(400).json({
           error: "Configuration does not match the plugin's instanceConfigSchema",
@@ -2711,14 +2875,26 @@ export function pluginRoutes(
       }
     }
 
+    // The worker is handed restored plaintext, and both its diagnostics and any
+    // error it throws are author-controlled strings that flow back to the
+    // client. Scrub the secrets out of everything this handler emits, so a
+    // worker cannot echo a credential through the endpoint whose whole job is
+    // to mask it (BLO-20871).
+    const testSecretValues = [
+      ...new Set([
+        ...submittedSecretValues,
+        ...collectPluginConfigSecretValues(testConfigJson, schema),
+      ]),
+    ];
+
     try {
-      const secretRefs = extractSecretRefBindingsFromConfig(body.configJson, schema);
+      const secretRefs = extractSecretRefBindingsFromConfig(testConfigJson, schema);
       await validatePluginSecretRefsForCompany(companyId, secretRefs);
 
       const result = await bridgeDeps.workerManager.call(
         plugin.id,
         "validateConfig",
-        { config: body.configJson },
+        { config: testConfigJson },
       );
 
       // The worker returns PluginConfigValidationResult { ok, warnings?, errors? }
@@ -2727,12 +2903,12 @@ export function pluginRoutes(
         const warningText = result.warnings?.length
           ? `Warnings: ${result.warnings.join("; ")}`
           : undefined;
-        res.json({ valid: true, message: warningText });
+        res.json({ valid: true, message: redactSecretValuesFromText(warningText, testSecretValues) });
       } else {
         const errorText = result.errors?.length
           ? result.errors.join("; ")
           : "Configuration validation failed.";
-        res.json({ valid: false, message: errorText });
+        res.json({ valid: false, message: redactSecretValuesFromText(errorText, testSecretValues) });
       }
     } catch (err) {
       // If the worker does not implement validateConfig, return a structured response
@@ -2748,8 +2924,14 @@ export function pluginRoutes(
         return;
       }
 
-      // Worker unavailable or other RPC errors
-      const bridgeError = mapRpcErrorToBridgeError(err);
+      // Worker unavailable or other RPC errors. Both `message` and the
+      // free-form `details` come from the worker, so redact across the whole
+      // payload — structurally, not by stringify/replace/parse, which would
+      // miss a credential containing a quote or backslash.
+      const bridgeError = redactSecretValuesDeep(
+        mapRpcErrorToBridgeError(err),
+        testSecretValues,
+      );
       res.status(502).json(bridgeError);
     }
   });
