@@ -822,6 +822,7 @@ function isCheckoutAdoptionCancelledRun(
 // `cancelClaimedRunForRoutineExecutionDuplicate` (heartbeat.ts) for where the
 // run itself is cancelled with this code.
 const ROUTINE_EXECUTION_DUPLICATE_SUPPRESSED_ERROR_CODE = "routine_execution_duplicate_suppressed";
+const ISSUE_TERMINAL_STATUS_ERROR_CODE = "issue_terminal_status";
 
 function isRoutineExecutionDuplicateSuppressedRun(
   latestRun: LatestIssueRun,
@@ -829,6 +830,15 @@ function isRoutineExecutionDuplicateSuppressedRun(
   return (
     latestRun?.status === "cancelled" &&
     readNonEmptyString(latestRun.errorCode) === ROUTINE_EXECUTION_DUPLICATE_SUPPRESSED_ERROR_CODE
+  );
+}
+
+function isTerminalDispatchRaceRun(
+  latestRun: LatestIssueRun,
+): latestRun is NonNullable<LatestIssueRun> {
+  return (
+    latestRun?.status === "cancelled" &&
+    readNonEmptyString(latestRun.errorCode) === ISSUE_TERMINAL_STATUS_ERROR_CODE
   );
 }
 
@@ -6253,6 +6263,15 @@ export function recoveryService(
       }
 
       let latestRun = await getLatestIssueRun(issue.companyId, issue.id);
+      // `issue_terminal_status` means this queued dispatch was correctly
+      // cancelled while the issue was terminal. The candidate query above has
+      // already established that the issue is non-terminal now, so this is
+      // stale lifecycle evidence rather than a failure to escalate or a reason
+      // to keep skipping the issue forever. Clear it before classification,
+      // but retain the flag so an `in_progress` issue reaches the normal
+      // continuation re-dispatch below instead of the generic no-run skip.
+      const reopenedAfterTerminalDispatchRace = isTerminalDispatchRaceRun(latestRun);
+      if (reopenedAfterTerminalDispatchRace) latestRun = null;
       // Set when this issue's newest run is a handover marker whose successor
       // can no longer be identified. Distinguishes "adopted, then the lock was
       // cleaned up" from "this issue genuinely has no run history at all" —
@@ -6924,7 +6943,8 @@ export function recoveryService(
         !latestRun &&
         !issue.checkoutRunId &&
         !issue.executionRunId &&
-        !adoptionHandoverLostSuccessor
+        !adoptionHandoverLostSuccessor &&
+        !reopenedAfterTerminalDispatchRace
       ) {
         result.skipped += 1;
         continue;

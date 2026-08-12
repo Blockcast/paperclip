@@ -854,6 +854,56 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
   });
 
+  it("re-dispatches an issue reopened after terminal dispatch cancellation", async () => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    const queuedRunId = randomUUID();
+    const queuedAt = new Date("2026-08-11T04:45:00.000Z");
+
+    // Model the real order of events: a queued dispatch is cancelled because
+    // the issue is terminal, then an operator legitimately reopens the issue.
+    await db.insert(heartbeatRuns).values({
+      id: queuedRunId,
+      companyId,
+      agentId: coderId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "queued",
+      contextSnapshot: { issueId: sourceIssueId, wakeReason: "issue_assigned" },
+      createdAt: queuedAt,
+    });
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, sourceIssueId));
+    await db
+      .update(heartbeatRuns)
+      .set({
+        status: "cancelled",
+        errorCode: "issue_terminal_status",
+        error: "Cancelled because issue reached terminal status (done) before the queued run could start",
+        finishedAt: new Date("2026-08-11T04:46:00.000Z"),
+      })
+      .where(eq(heartbeatRuns.id, queuedRunId));
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, sourceIssueId));
+
+    const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result).toMatchObject({ continuationRequeued: 1, escalated: 0 });
+    expect(enqueueWakeup).toHaveBeenCalledWith(
+      coderId,
+      expect.objectContaining({
+        reason: "issue_continuation_needed",
+        contextSnapshot: expect.objectContaining({
+          issueId: sourceIssueId,
+          retryReason: "issue_continuation_needed",
+          source: "issue.continuation_recovery",
+        }),
+      }),
+    );
+    expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
+    const [finalIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(finalIssue).toMatchObject({ status: "in_progress", assigneeAgentId: coderId });
+  });
+
   // BLO-19954: paired with the test above. A routine-execution issue whose
   // only run was cancelled because another open routine-execution issue
   // already owns the dispatch lock is benign, intentional control flow under
