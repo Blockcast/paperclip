@@ -104,20 +104,21 @@ jobs:
         # `git push` is not a guaranteed fix. See AGENTS.md §9. Uses the
         # already-checked-out history (fetch-depth: 0 above), no new token.
         #
-        # There is deliberately NO branch exemption. The graphify-reindex bot
-        # commits via `git push` under its own git identity
-        # (`allyblockcast[bot]@users.noreply.github.com`), which is not the
-        # REST-path stamp this gate matches
-        # (`290875700+allyblockcast[bot]@users.noreply.github.com`) — measured
-        # by running this script over the real graphify PRs #789 and #944:
-        # both pass. A `github.head_ref`-keyed exemption was therefore
-        # protecting against a rejection that never happens, while being both
-        # a fork bypass (any fork can name its branch `bot/graphify-reindex`,
+        # The App stamps this identity under more than one email spelling
+        # (BLO-26647 — id-prefix optional, any digits) and the matcher covers
+        # all of them. There is deliberately NO branch exemption for the
+        # graphify-reindex bot, which shares the bare spelling
+        # (`allyblockcast[bot]@users.noreply.github.com`) but is excluded by
+        # AUTHOR NAME instead (`NON_AGENT_PROCESS_AUTHOR_NAMES` in the
+        # script — email alone can't tell the two apart, see the script's
+        # docblock). A `github.head_ref`-keyed exemption here would be both a
+        # fork bypass (any fork can name its branch `bot/graphify-reindex`,
         # and `head_ref` carries no repository identity) and a merge-queue
         # false-reject (`head_ref` is empty in `merge_group`). Pinned by the
-        # graphify-identity case in check-commit-author-attribution.test.mjs —
-        # if that test starts failing, the bot moved onto the REST write path
-        # and the right fix is to move it back, not to re-add an exemption.
+        # graphify-identity cases in check-commit-author-attribution.test.mjs —
+        # if those start failing, the bot's author name changed: update
+        # `NON_AGENT_PROCESS_AUTHOR_NAMES` to match, don't re-add a branch
+        # exemption.
         run: node ./scripts/check-commit-author-attribution.mjs --base "$PR_BASE_SHA" --head "$PR_HEAD_SHA"
 
       - name: Test commit-author-attribution check
