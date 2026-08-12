@@ -1027,3 +1027,355 @@ describe("collectPluginConfigSecretValues — structured declared secrets", () =
     expect(JSON.stringify(diagnostic)).not.toContain("live-password");
   });
 });
+
+// ---------------------------------------------------------------------------
+// BLO-26530 — masking gaps found by paranoid review of the merged BLO-20871 work
+// ---------------------------------------------------------------------------
+
+describe("mergeMaskedPluginConfig — duplicate incoming identities (BLO-26530)", () => {
+  const IDENTITY_SCHEMA = {
+    type: "object",
+    properties: {
+      targets: {
+        type: "array",
+        items: {
+          type: "object",
+          "x-paperclip-identity": "name",
+          properties: { name: { type: "string" }, url: { type: "string" } },
+        },
+      },
+    },
+  };
+
+  it("refuses to clone one stored credential onto two entries claiming the same identity", () => {
+    // Uniqueness was proven only in storage, so both incoming entries matched
+    // the single stored `alpha` and both were handed `token-alpha` — including
+    // the entry pointing at an endpoint the operator never gave it to.
+    const result = merge(
+      {
+        targets: [
+          { name: "alpha", url: "https://a.example.com", token: PLUGIN_CONFIG_SECRET_MASK },
+          { name: "alpha", url: "https://attacker.example.com", token: PLUGIN_CONFIG_SECRET_MASK },
+        ],
+      },
+      { targets: [{ name: "alpha", url: "https://a.example.com", token: "token-alpha" }] },
+      IDENTITY_SCHEMA,
+    );
+
+    expect(result.unresolvedMaskPaths).toEqual(["targets.0", "targets.1"]);
+    expect(JSON.stringify(result.configJson)).not.toContain("token-alpha");
+    // Nor may the sentinel itself be left behind for persistence.
+    expect(JSON.stringify(result.configJson)).not.toContain(PLUGIN_CONFIG_SECRET_MASK);
+  });
+
+  it("refuses a duplicated identity even when only one of the two entries is masked", () => {
+    const result = merge(
+      {
+        targets: [
+          { name: "alpha", url: "https://a.example.com", token: PLUGIN_CONFIG_SECRET_MASK },
+          { name: "alpha", url: "https://attacker.example.com", token: "operator-supplied" },
+        ],
+      },
+      { targets: [{ name: "alpha", url: "https://a.example.com", token: "token-alpha" }] },
+      IDENTITY_SCHEMA,
+    );
+
+    expect(result.unresolvedMaskPaths).toEqual(["targets.0"]);
+    expect(JSON.stringify(result.configJson)).not.toContain("token-alpha");
+    // An entry carrying no sentinel is still the caller's own value.
+    expect(result.configJson).toEqual({
+      targets: [
+        { name: "alpha", url: "https://a.example.com" },
+        { name: "alpha", url: "https://attacker.example.com", token: "operator-supplied" },
+      ],
+    });
+  });
+
+  it("refuses when storage itself holds the identity twice, so neither side is proof", () => {
+    const result = merge(
+      { targets: [{ name: "alpha", url: "https://a.example.com", token: PLUGIN_CONFIG_SECRET_MASK }] },
+      {
+        targets: [
+          { name: "alpha", url: "https://a.example.com", token: "token-one" },
+          { name: "alpha", url: "https://b.example.com", token: "token-two" },
+        ],
+      },
+      IDENTITY_SCHEMA,
+    );
+
+    expect(result.unresolvedMaskPaths).toEqual(["targets.0"]);
+    expect(JSON.stringify(result.configJson)).not.toContain("token-one");
+    expect(JSON.stringify(result.configJson)).not.toContain("token-two");
+  });
+
+  it("still restores by identity when it is unique on both sides", () => {
+    // Guards the fix against over-correction: the ergonomic path a manifest buys
+    // by declaring `x-paperclip-identity` must survive.
+    const stored = {
+      targets: [
+        { name: "alpha", url: "https://a.example.com", token: "token-alpha" },
+        { name: "beta", url: "https://b.example.com", token: "token-beta" },
+      ],
+    };
+    const result = merge(
+      {
+        targets: [
+          { name: "beta", url: "https://b.example.com", token: PLUGIN_CONFIG_SECRET_MASK },
+          { name: "alpha", url: "https://a.example.com", token: PLUGIN_CONFIG_SECRET_MASK },
+        ],
+      },
+      stored,
+      IDENTITY_SCHEMA,
+    );
+
+    expect(result.unresolvedMaskPaths).toEqual([]);
+    expect(result.configJson).toEqual({
+      targets: [
+        { name: "beta", url: "https://b.example.com", token: "token-beta" },
+        { name: "alpha", url: "https://a.example.com", token: "token-alpha" },
+      ],
+    });
+  });
+
+  it("does not conflate a numeric identity with its string form", () => {
+    const stored = { targets: [{ id: 1, token: "token-numeric" }] };
+    const result = merge(
+      {
+        targets: [
+          { id: 1, token: PLUGIN_CONFIG_SECRET_MASK },
+          { id: "1", token: PLUGIN_CONFIG_SECRET_MASK },
+        ],
+      },
+      stored,
+      {
+        type: "object",
+        properties: {
+          targets: { type: "array", items: { type: "object", "x-paperclip-identity": "id" } },
+        },
+      },
+    );
+
+    // `1` is unique on both sides and resolves; `"1"` matches no stored entry.
+    expect(result.unresolvedMaskPaths).toEqual(["targets.1"]);
+    expect(result.configJson).toEqual({
+      targets: [{ id: 1, token: "token-numeric" }, { id: "1" }],
+    });
+  });
+});
+
+describe("maskPluginConfigJson — conditional and dependent schemas (BLO-26530)", () => {
+  const SENTINEL = "sentinel-conditional-plaintext";
+  /** Innocuously named, so only the schema marker can cover it. */
+  const LOOKASIDE = { type: "string", writeOnly: true };
+
+  const cases: Record<string, Record<string, unknown>> = {
+    then: {
+      type: "object",
+      if: { properties: { mode: { const: "managed" } } },
+      then: { properties: { lookaside: LOOKASIDE } },
+    },
+    else: {
+      type: "object",
+      if: { properties: { mode: { const: "never-matches" } } },
+      else: { properties: { lookaside: LOOKASIDE } },
+    },
+    if: {
+      type: "object",
+      if: { properties: { lookaside: LOOKASIDE } },
+    },
+    not: {
+      type: "object",
+      not: { properties: { lookaside: LOOKASIDE } },
+    },
+    dependentSchemas: {
+      type: "object",
+      dependentSchemas: { mode: { properties: { lookaside: LOOKASIDE } } },
+    },
+    "draft-07 dependencies": {
+      type: "object",
+      dependencies: { mode: { properties: { lookaside: LOOKASIDE } } },
+    },
+  };
+
+  for (const [label, schema] of Object.entries(cases)) {
+    it(`masks a secret declared behind \`${label}\``, () => {
+      const masked = maskPluginConfigJson({ mode: "managed", lookaside: SENTINEL }, schema);
+
+      expect(JSON.stringify(masked)).not.toContain(SENTINEL);
+      expect(masked).toEqual({ mode: "managed", lookaside: PLUGIN_CONFIG_SECRET_MASK });
+    });
+
+    it(`round-trips a secret declared behind \`${label}\` losslessly`, () => {
+      const stored = { mode: "managed", lookaside: SENTINEL };
+      const masked = maskPluginConfigJson(stored, schema) as Record<string, unknown>;
+      const result = merge(JSON.parse(JSON.stringify(masked)), stored, schema);
+
+      expect(result.unresolvedMaskPaths).toEqual([]);
+      expect(result.configJson).toEqual(stored);
+    });
+  }
+
+  it.each([
+    ["writeOnly", { type: "string", writeOnly: true }],
+    ["format: secret-ref", { format: "secret-ref" }],
+    ["x-paperclip-secret", { type: "string", "x-paperclip-secret": true }],
+  ])("masks a %s marker hidden behind a conditional branch", (_label, marker) => {
+    // The acceptance criteria name all three markers, so each is exercised
+    // through a branch the walk previously skipped rather than only `writeOnly`.
+    const masked = maskPluginConfigJson(
+      { mode: "managed", lookaside: SENTINEL },
+      {
+        type: "object",
+        if: { properties: { mode: { const: "managed" } } },
+        then: { properties: { lookaside: marker } },
+      },
+    );
+
+    expect(JSON.stringify(masked)).not.toContain(SENTINEL);
+    expect(masked).toEqual({ mode: "managed", lookaside: PLUGIN_CONFIG_SECRET_MASK });
+  });
+
+  it("does not let a `dependencies` required-list array break masking", () => {
+    // The draft-07 array form is a required-list, not a schema. It must be
+    // ignored rather than treated as an uninterpretable keyword.
+    const masked = maskPluginConfigJson(
+      { mode: "managed", endpoint: "https://alerts.example.com" },
+      { type: "object", dependencies: { mode: ["endpoint"] } },
+    );
+
+    expect(masked).toEqual({ mode: "managed", endpoint: "https://alerts.example.com" });
+  });
+
+  it("masks a secret declared behind array `contains`", () => {
+    const masked = maskPluginConfigJson(
+      { list: [{ lookaside: SENTINEL }] },
+      {
+        type: "object",
+        properties: {
+          list: { type: "array", contains: { properties: { lookaside: LOOKASIDE } } },
+        },
+      },
+    );
+
+    expect(JSON.stringify(masked)).not.toContain(SENTINEL);
+  });
+
+  it("masks a secret declared behind `unevaluatedItems`", () => {
+    const masked = maskPluginConfigJson(
+      { list: [{ lookaside: SENTINEL }] },
+      {
+        type: "object",
+        properties: {
+          list: { type: "array", unevaluatedItems: { properties: { lookaside: LOOKASIDE } } },
+        },
+      },
+    );
+
+    expect(JSON.stringify(masked)).not.toContain(SENTINEL);
+  });
+
+  it("masks a secret declared behind `unevaluatedProperties`", () => {
+    const masked = maskPluginConfigJson(
+      { lookaside: SENTINEL },
+      { type: "object", unevaluatedProperties: LOOKASIDE },
+    );
+
+    expect(JSON.stringify(masked)).not.toContain(SENTINEL);
+  });
+
+  it("honours an explicit exemption inside a conditional branch", () => {
+    // Fail-closed must not override an author who spoke about the exact field.
+    const masked = maskPluginConfigJson(
+      { mode: "managed", lookaside: "not-a-secret" },
+      {
+        type: "object",
+        if: { properties: { mode: { const: "managed" } } },
+        then: { properties: { lookaside: { type: "string", "x-paperclip-secret": false } } },
+      },
+    );
+
+    expect(masked).toEqual({ mode: "managed", lookaside: "not-a-secret" });
+  });
+});
+
+describe("maskPluginConfigJson — uninterpretable schema keywords fail closed (BLO-26530)", () => {
+  const SENTINEL = "sentinel-unsupported-keyword-plaintext";
+
+  const cases: Record<string, Record<string, unknown>> = {
+    // Indirection this module deliberately does not resolve.
+    $dynamicRef: { type: "object", $dynamicRef: "#node" },
+    $recursiveRef: { type: "object", $recursiveRef: "#" },
+    // A schema over a string's decoded content, which the value walk never
+    // reaches — a marker inside it would otherwise be invisible.
+    contentSchema: { type: "object", contentSchema: { type: "object" } },
+    // A keyword from a future draft, or a typo, must not become a hiding place.
+    unrecognised: { type: "object", frobnicateSchema: { properties: { lookaside: {} } } },
+  };
+
+  for (const [label, schema] of Object.entries(cases)) {
+    it(`masks string leaves rather than trusting \`${label}\``, () => {
+      const masked = maskPluginConfigJson({ lookaside: SENTINEL }, schema);
+
+      expect(JSON.stringify(masked)).not.toContain(SENTINEL);
+    });
+  }
+
+  it("keeps the structure so the config stays editable and round-trippable", () => {
+    // Fail-closed here forces suspicion, not a wholesale mask: collapsing the
+    // whole config to one sentinel would leave the operator no form to edit and
+    // nothing for the merge to restore into.
+    const schema = { type: "object", frobnicateSchema: {} };
+    const stored = { nested: { lookaside: SENTINEL, count: 3 }, flag: true };
+
+    const masked = maskPluginConfigJson(stored, schema) as Record<string, unknown>;
+    expect(masked).toEqual({
+      nested: { lookaside: PLUGIN_CONFIG_SECRET_MASK, count: 3 },
+      flag: true,
+    });
+
+    const result = merge(JSON.parse(JSON.stringify(masked)), stored, schema);
+    expect(result.unresolvedMaskPaths).toEqual([]);
+    expect(result.configJson).toEqual(stored);
+  });
+
+  it("leaves an ordinary manifest-shaped schema fully in the clear", () => {
+    // Guards the allowlist against being too narrow: every keyword a real
+    // plugin manifest uses today must stay inert.
+    const masked = maskPluginConfigJson(
+      {
+        endpoint: "https://alerts.example.com",
+        actor: "user",
+        retries: 3,
+        enabled: true,
+        labels: ["a", "b"],
+        extra: { note: "visible" },
+      },
+      {
+        $schema: "https://json-schema.org/draft/2020-12/schema",
+        $id: "https://example.com/manifest",
+        type: "object",
+        title: "Example config",
+        description: "Example",
+        required: ["endpoint"],
+        additionalProperties: { type: "object" },
+        "x-paperclip-ui-order": ["endpoint"],
+        properties: {
+          endpoint: { type: "string", format: "uri", title: "Endpoint", maxLength: 200 },
+          actor: { type: "string", enum: ["user", "app"], default: "user" },
+          retries: { type: "integer", minimum: 0, maximum: 10 },
+          enabled: { type: "boolean", default: false },
+          labels: { type: "array", items: { type: "string" }, uniqueItems: true, minItems: 0 },
+        },
+      },
+    );
+
+    expect(masked).toEqual({
+      endpoint: "https://alerts.example.com",
+      actor: "user",
+      retries: 3,
+      enabled: true,
+      labels: ["a", "b"],
+      extra: { note: "visible" },
+    });
+  });
+});

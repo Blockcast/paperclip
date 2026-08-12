@@ -200,6 +200,138 @@ function declaresSecret(node: SchemaNode): boolean {
 const UNRESOLVED_REF_NODE: SchemaNode = Object.freeze({ "x-paperclip-secret": true });
 
 /**
+ * A node injected where the schema at this location could not be fully
+ * understood — it carries a keyword this module neither traverses nor knows to
+ * be harmless (see {@link hasUnsupportedSchemaKeyword}).
+ *
+ * Unlike {@link UNRESOLVED_REF_NODE} this does not mask the location wholesale;
+ * it forces the name-heuristic's "suspect" state on, so every string *leaf* at
+ * and beneath the location is masked while the structure survives. That is
+ * enough to satisfy "never emit plaintext" — plaintext is a string — without
+ * collapsing an entire config to a single sentinel, which would leave the
+ * operator no editable form and nothing for
+ * {@link mergeMaskedPluginConfig} to restore into.
+ */
+const AMBIGUOUS_SCHEMA_NODE: SchemaNode = Object.freeze({ "x-paperclip-ambiguous": true });
+
+/**
+ * Keywords whose values are subschemas, and which this module walks.
+ *
+ * Grouped by the instance location the subschema applies to, because that
+ * decides *where* the walk has to consider it: the same location
+ * ({@link expandSchemaNodes}), a child by key ({@link childNodesForKey}), or a
+ * child by index ({@link childNodesForIndex}). A schema-bearing keyword handled
+ * at the wrong level is as good as not handled at all.
+ */
+const TRAVERSED_SCHEMA_KEYWORDS: ReadonlySet<string> = new Set([
+  // Same instance location.
+  "$ref",
+  "allOf",
+  "anyOf",
+  "oneOf",
+  "not",
+  "if",
+  "then",
+  "else",
+  "dependentSchemas",
+  "dependencies",
+  // Child by property key.
+  "properties",
+  "patternProperties",
+  "additionalProperties",
+  "unevaluatedProperties",
+  // Child by array index.
+  "items",
+  "prefixItems",
+  "additionalItems",
+  "contains",
+  "unevaluatedItems",
+]);
+
+/**
+ * Keywords that cannot hide a secret marker over any value this module walks —
+ * annotations, scalar assertions, and definition containers only reachable via
+ * `$ref`.
+ *
+ * `propertyNames` is inert here because its subschema constrains property *name*
+ * strings, and names are deliberately outside the masking contract (see
+ * {@link collectStringLeaves}).
+ *
+ * Deliberately absent, so they fail closed: `$dynamicRef` / `$recursiveRef`
+ * (indirection this module does not resolve) and `contentSchema` (a schema over
+ * a string's decoded content, which the walk never reaches as a value).
+ */
+const INERT_SCHEMA_KEYWORDS: ReadonlySet<string> = new Set([
+  "type",
+  "format",
+  "title",
+  "description",
+  "default",
+  "examples",
+  "example",
+  "enum",
+  "const",
+  "required",
+  "deprecated",
+  "readOnly",
+  "writeOnly",
+  "nullable",
+  "minLength",
+  "maxLength",
+  "pattern",
+  "minimum",
+  "maximum",
+  "exclusiveMinimum",
+  "exclusiveMaximum",
+  "multipleOf",
+  "minItems",
+  "maxItems",
+  "uniqueItems",
+  "minContains",
+  "maxContains",
+  "minProperties",
+  "maxProperties",
+  "propertyNames",
+  "contentEncoding",
+  "contentMediaType",
+  "discriminator",
+  "xml",
+  "externalDocs",
+  "$defs",
+  "definitions",
+  "$schema",
+  "$id",
+  "$comment",
+  "$anchor",
+  "$vocabulary",
+]);
+
+/**
+ * Whether this node carries a keyword that is neither walked
+ * ({@link TRAVERSED_SCHEMA_KEYWORDS}) nor known harmless
+ * ({@link INERT_SCHEMA_KEYWORDS}).
+ *
+ * An allowlist rather than a denylist of known-dangerous keywords, so a keyword
+ * added to JSON Schema — or a typo'd one — fails closed on arrival instead of
+ * silently becoming a place to hide a `writeOnly` marker. That inverts the
+ * BLO-26530 failure: `if` / `then` / `else` / `dependentSchemas` / `contains`
+ * were untraversed, and a secret declared inside one came back as plaintext.
+ *
+ * `x-` vendor extensions are exempt. They are annotations by convention (this
+ * module's own markers live there), and treating every unrecognised one as
+ * suspicious would mask configs over a UI hint.
+ */
+function hasUnsupportedSchemaKeyword(node: SchemaNode): boolean {
+  for (const key of Object.keys(node)) {
+    if (TRAVERSED_SCHEMA_KEYWORDS.has(key)) continue;
+    if (INERT_SCHEMA_KEYWORDS.has(key)) continue;
+    if (key.startsWith("x-")) continue;
+    return true;
+  }
+  return false;
+}
+
+/**
  * Resolve a local JSON-Pointer `$ref` (`#/$defs/credential`) against the root
  * schema. Returns `null` for anything non-local or unresolvable, which the
  * caller turns into {@link UNRESOLVED_REF_NODE}.
@@ -226,19 +358,24 @@ function resolveLocalRef(ref: string, root: SchemaNode | null): SchemaNode | nul
 }
 
 /**
- * Flatten a set of schema nodes through the composition keywords and local
- * `$ref` indirection, so a marker sitting on an `allOf` / `anyOf` / `oneOf`
- * *branch node itself*, or on a `$defs` entry a field points at, is seen rather
- * than only markers on that branch's `properties`.
+ * Flatten a set of schema nodes through every keyword whose subschema applies to
+ * the *same* instance location — composition (`allOf` / `anyOf` / `oneOf`),
+ * conditionals (`if` / `then` / `else`), dependent schemas, `not`, and local
+ * `$ref` indirection — so a marker sitting on such a branch node itself, or on a
+ * `$defs` entry a field points at, is seen rather than only markers on that
+ * branch's `properties`.
  *
- * Applicability is deliberately not evaluated: a value covered by any branch of
- * a composition is treated as covered by all of them. Masking is fail-closed —
- * a field that is secret in only one `oneOf` branch must not be emitted in the
- * clear just because another branch would have permitted it.
+ * Applicability is deliberately not evaluated: a value covered by any branch is
+ * treated as covered by all of them. Masking is fail-closed — a field that is
+ * secret in only one `oneOf` branch, or only in the `else` arm, must not be
+ * emitted in the clear just because another branch would have permitted it. This
+ * is why `if` is traversed alongside `then`/`else`, and why `dependentSchemas` is
+ * traversed without checking whether its trigger property is present.
  *
  * `$ref` targets are resolved against `root`. A ref that is external, dangling,
  * or cyclic contributes {@link UNRESOLVED_REF_NODE} instead, so an unreadable
- * declaration masks rather than leaks.
+ * declaration masks rather than leaks. A node carrying a keyword this module does
+ * not understand contributes {@link AMBIGUOUS_SCHEMA_NODE} for the same reason.
  */
 function expandSchemaNodes(nodes: SchemaNode[], root: SchemaNode | null = null): SchemaNode[] {
   const expanded: SchemaNode[] = [];
@@ -251,6 +388,8 @@ function expandSchemaNodes(nodes: SchemaNode[], root: SchemaNode | null = null):
     if (seen.has(node)) continue; // cycle or diamond — already accounted for
     seen.add(node);
     expanded.push(node);
+
+    if (hasUnsupportedSchemaKeyword(node)) expanded.push(AMBIGUOUS_SCHEMA_NODE);
 
     const ref = node.$ref;
     if (typeof ref === "string") {
@@ -271,6 +410,23 @@ function expandSchemaNodes(nodes: SchemaNode[], root: SchemaNode | null = null):
         if (isPlainRecord(branch)) stack.push(branch);
       }
     }
+
+    // Conditional arms and `not` are single subschemas over this same location.
+    for (const keyword of ["if", "then", "else", "not"] as const) {
+      const branch = node[keyword];
+      if (isPlainRecord(branch)) stack.push(branch);
+    }
+
+    // `dependentSchemas` (2020-12) and the schema form of draft-07
+    // `dependencies` map a trigger property to a subschema over this location.
+    // The array form of `dependencies` is a required-list, not a schema.
+    for (const keyword of ["dependentSchemas", "dependencies"] as const) {
+      const dependents = node[keyword];
+      if (!isPlainRecord(dependents)) continue;
+      for (const dependent of Object.values(dependents)) {
+        if (isPlainRecord(dependent)) stack.push(dependent);
+      }
+    }
   }
 
   return expanded;
@@ -278,8 +434,9 @@ function expandSchemaNodes(nodes: SchemaNode[], root: SchemaNode | null = null):
 
 /**
  * Schema nodes that govern `record[key]`, honouring `properties`,
- * `patternProperties` and `additionalProperties` (the last only when neither of
- * the former claims the key, matching JSON Schema evaluation order).
+ * `patternProperties` and `additionalProperties` / `unevaluatedProperties` (the
+ * latter two only when neither of the former claims the key, matching JSON Schema
+ * evaluation order).
  */
 function childNodesForKey(nodes: SchemaNode[], key: string): SchemaNode[] {
   const children: SchemaNode[] = [];
@@ -309,8 +466,11 @@ function childNodesForKey(nodes: SchemaNode[], key: string): SchemaNode[] {
       }
     }
 
-    const additionalProperties = node.additionalProperties;
-    if (!claimed && isPlainRecord(additionalProperties)) children.push(additionalProperties);
+    if (claimed) continue;
+    for (const keyword of ["additionalProperties", "unevaluatedProperties"] as const) {
+      const fallback = node[keyword];
+      if (isPlainRecord(fallback)) children.push(fallback);
+    }
   }
 
   return children;
@@ -320,6 +480,11 @@ function childNodesForKey(nodes: SchemaNode[], key: string): SchemaNode[] {
  * Schema nodes that govern `array[index]`, honouring the 2020-12 `prefixItems`
  * + `items` pair as well as the draft-07 tuple form (`items` as an array with
  * `additionalItems` for the tail).
+ *
+ * `contains` applies to *at least one* entry without saying which, so it is
+ * applied to every index. That over-masks a `contains`-declared secret onto
+ * sibling entries, which is the fail-closed direction: the alternative is
+ * emitting the one entry it did govern in the clear.
  */
 function childNodesForIndex(nodes: SchemaNode[], index: number): SchemaNode[] {
   const children: SchemaNode[] = [];
@@ -343,6 +508,11 @@ function childNodesForIndex(nodes: SchemaNode[], index: number): SchemaNode[] {
       }
     } else if (isPlainRecord(items) && !claimedByTuple) {
       children.push(items);
+    }
+
+    if (isPlainRecord(node.contains)) children.push(node.contains);
+    if (!claimedByTuple && isPlainRecord(node.unevaluatedItems)) {
+      children.push(node.unevaluatedItems);
     }
   }
 
@@ -371,6 +541,16 @@ function nodesDeclareSecretRef(nodes: SchemaNode[]): boolean {
 
 function nodesDeclareNotSecret(nodes: SchemaNode[]): boolean {
   return nodes.some((node) => node["x-paperclip-secret"] === false);
+}
+
+/**
+ * Whether the schema at this location carries a keyword this module could not
+ * interpret, per {@link AMBIGUOUS_SCHEMA_NODE}. Every string leaf at and beneath
+ * such a location is masked, because a secret marker may be hiding in the part
+ * of the schema that was not understood.
+ */
+function nodesAreAmbiguous(nodes: SchemaNode[]): boolean {
+  return nodes.some((node) => node["x-paperclip-ambiguous"] === true);
 }
 
 /**
@@ -476,11 +656,12 @@ export function maskPluginConfigJson(
       return mask(value);
     }
 
-    // An explicit `x-paperclip-secret: false` wins over the heuristic, and over
-    // a suspicious ancestor.
+    // An explicit `x-paperclip-secret: false` wins over the heuristic, over a
+    // suspicious ancestor, and over an uninterpretable schema keyword — the
+    // author has spoken about this exact field.
     const suspect = nodesDeclareNotSecret(nodes)
       ? false
-      : inheritedSuspect || (key !== null && matchesSecretFieldName(key));
+      : inheritedSuspect || nodesAreAmbiguous(nodes) || (key !== null && matchesSecretFieldName(key));
 
     if (isPlainRecord(value)) {
       const result: Record<string, unknown> = {};
@@ -627,6 +808,26 @@ function containsMask(value: unknown): boolean {
 }
 
 /**
+ * How many times each usable identity value occurs among `entries`.
+ *
+ * Keyed by the raw scalar, so `1` and `"1"` stay distinct — matching the strict
+ * comparison used to find the stored counterpart.
+ */
+function identityOccurrences(
+  entries: readonly unknown[],
+  identityKey: string,
+): Map<string | number, number> {
+  const counts = new Map<string | number, number>();
+  for (const entry of entries) {
+    if (!isPlainRecord(entry)) continue;
+    const value = identityValue(entry, identityKey);
+    if (value === undefined) continue;
+    counts.set(value, (counts.get(value) ?? 0) + 1);
+  }
+  return counts;
+}
+
+/**
  * A value usable as an array entry's identity: a non-empty scalar that is not
  * itself masked (a masked identity would match everything).
  */
@@ -714,13 +915,17 @@ function matchesIgnoringMask(incoming: unknown, stored: unknown): boolean {
  *   it.
  * - *Position.* Reordering `[["x",mask],["y",mask]]` swaps which endpoint each
  *   credential belongs to.
+ * - *Duplicated identity.* Posting the same designated identity twice, each with
+ *   a masked secret, would restore one stored credential onto both entries —
+ *   cloning it onto a URL the operator never gave it to.
  *
  * So a masked entry is restored only on one of two proofs:
  *
  * 1. The manifest designates an immutable identity property via
- *    `x-paperclip-identity`, and exactly one stored entry carries that identity.
- *    Declaring it asserts the property never changes for a given entry, which is
- *    what makes reorder and edit safe.
+ *    `x-paperclip-identity`, and that identity is carried by exactly one stored
+ *    entry *and* exactly one incoming entry. Declaring it asserts the property
+ *    never changes for a given entry, which is what makes reorder and edit safe;
+ *    requiring uniqueness on both sides is what stops a duplicate from cloning.
  * 2. Failing that, the arrays are the same length and the entry at the same
  *    index is exactly this entry with its secrets blanked
  *    ({@link matchesIgnoringMask}). Anything else — a reorder, an insertion, a
@@ -819,6 +1024,13 @@ export function mergeMaskedPluginConfig(
     nodes: SchemaNode[],
   ): unknown[] {
     const identityKey = designatedIdentityKey(nodes, root);
+    // Uniqueness must hold on the *incoming* side too. Proving only that one
+    // stored entry carries the identity lets two posted entries claiming the
+    // same identity both restore that single credential — cloning it onto an
+    // entry the operator never held it for, e.g. a second endpoint URL.
+    const incomingIdentityCounts = identityKey
+      ? identityOccurrences(incoming, identityKey)
+      : null;
 
     return incoming
       .map((entry, index) => {
@@ -832,15 +1044,17 @@ export function mergeMaskedPluginConfig(
         let storedEntry: unknown;
 
         if (identityKey && isPlainRecord(entry)) {
-          // Proof 1: a manifest-designated immutable identity, matched uniquely.
+          // Proof 1: a manifest-designated immutable identity, carried by
+          // exactly one incoming entry and exactly one stored entry.
           const wanted = identityValue(entry, identityKey);
-          const matches =
-            wanted === undefined
-              ? []
-              : storedArray.filter(
-                  (candidate) =>
-                    isPlainRecord(candidate) && identityValue(candidate, identityKey) === wanted,
-                );
+          const uniqueIncoming =
+            wanted !== undefined && incomingIdentityCounts?.get(wanted) === 1;
+          const matches = uniqueIncoming
+            ? storedArray.filter(
+                (candidate) =>
+                  isPlainRecord(candidate) && identityValue(candidate, identityKey) === wanted,
+              )
+            : [];
           storedEntry = matches.length === 1 ? matches[0] : undefined;
         } else if (incoming.length === storedArray.length) {
           // Proof 2: same shape, same place, identical but for the secrets.
