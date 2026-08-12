@@ -4,6 +4,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockWakeup = vi.hoisted(() => vi.fn(async () => undefined));
 const mockFindExistingIssueBlockersResolvedWake = vi.hoisted(() => vi.fn(async () => null));
+const mockListBlockedDependentIssueIds = vi.hoisted(() => vi.fn(async () => []));
+const mockRecomputeBlockedIssuesStatusIfReady = vi.hoisted(() => vi.fn(async () => []));
 const mockIssueService = vi.hoisted(() => ({
   getAncestors: vi.fn(),
   getById: vi.fn(),
@@ -106,6 +108,20 @@ vi.mock("../services/issue-dependency-wakeups.js", async () => {
   };
 });
 
+// BLO-21523 phase 2: routes/issues.ts calls these two directly against the
+// real `db` (not through the mocked issueService above). This suite passes
+// a fake `{} as any` db, so leaving them un-mocked would throw inside the
+// fire-and-forget wake dispatch block on every becameDone/blockedByIssueIds
+// path these tests exercise.
+vi.mock("../services/issues.js", async () => {
+  const actual = await vi.importActual<typeof import("../services/issues.js")>("../services/issues.js");
+  return {
+    ...actual,
+    listBlockedDependentIssueIds: mockListBlockedDependentIssueIds,
+    recomputeBlockedIssuesStatusIfReady: mockRecomputeBlockedIssuesStatusIfReady,
+  };
+});
+
 async function createApp() {
   const [{ issueRoutes }, { errorHandler }] = await Promise.all([
     vi.importActual<typeof import("../routes/issues.js")>("../routes/issues.js"),
@@ -136,6 +152,8 @@ describe("issue dependency wakeups in issue routes", () => {
     vi.doUnmock("../middleware/index.js");
     vi.clearAllMocks();
     mockFindExistingIssueBlockersResolvedWake.mockResolvedValue(null);
+    mockListBlockedDependentIssueIds.mockResolvedValue([]);
+    mockRecomputeBlockedIssuesStatusIfReady.mockResolvedValue([]);
     mockIssueService.getAncestors.mockResolvedValue([]);
     mockIssueService.getComment.mockResolvedValue(null);
     mockIssueService.getCommentCursor.mockResolvedValue({

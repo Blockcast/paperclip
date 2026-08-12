@@ -1145,7 +1145,8 @@ export type BlockedIssueAutoResumeSuppression = {
 export type BlockedIssueAutoResumeTriggerPath =
   | "blocker_done"
   | "resolved_blocker_sweep"
-  | "stranded_blocked_reconciler";
+  | "stranded_blocked_reconciler"
+  | "eager_status_recompute";
 export type ChildIssueCompletionSummary = {
   id: string;
   identifier: string | null;
@@ -4147,6 +4148,88 @@ export async function listBlockedIssueAutoResumeSuppressions(
   }
 
   return suppressions;
+}
+
+/**
+ * BLO-21523 phase 2: eager status recompute. Clearing a `blocked` issue's
+ * last unresolved blocker (blocker closed `done`, or the `blockedByIssueIds`
+ * edge removed directly) does not by itself move `status` off `blocked` —
+ * every write path up to this point only recomputed readiness to decide
+ * whether to send a wake, never to flip the row. Without this, a dependent is
+ * indistinguishable from a genuine block to any status-filtered scheduler or
+ * queue view until the next `stranded-blocked-issue-reconciler` sweep (or
+ * forever, for an unassigned issue no wake ever targets).
+ *
+ * Call this right after any write that can leave one or more `blocked`
+ * issues newly dependency-ready. Reuses the reconciler's own
+ * readiness/suppression predicate (`listIssueDependencyReadinessMap` +
+ * `listBlockedIssueAutoResumeSuppressions`) so the eager path and the sweep
+ * can never drift apart. `blocked` -> `todo` matches BLO-21523's accepted
+ * safe default.
+ */
+export async function recomputeBlockedIssuesStatusIfReady(
+  dbOrTx: Db,
+  companyId: string,
+  issueIds: string[],
+  options: { triggerPath?: BlockedIssueAutoResumeTriggerPath } = {},
+): Promise<string[]> {
+  const uniqueIssueIds = [...new Set(issueIds.filter(Boolean))];
+  if (uniqueIssueIds.length === 0) return [];
+
+  const [readinessMap, suppressions] = await Promise.all([
+    listIssueDependencyReadinessMap(dbOrTx, companyId, uniqueIssueIds),
+    listBlockedIssueAutoResumeSuppressions(dbOrTx, companyId, uniqueIssueIds, options),
+  ]);
+
+  const eligibleIds = uniqueIssueIds.filter((issueId) => {
+    const readiness = readinessMap.get(issueId);
+    return readiness?.isDependencyReady === true && !suppressions.has(issueId);
+  });
+  if (eligibleIds.length === 0) return [];
+
+  // Re-checks `status = 'blocked'` at write time, same as the reconciler —
+  // a concurrent writer that already moved the issue off `blocked` (or
+  // re-blocked it) since the readiness read above is skipped, not clobbered.
+  const flipped = await dbOrTx
+    .update(issues)
+    .set({ status: "todo", updatedAt: new Date() })
+    .where(
+      and(
+        inArray(issues.id, eligibleIds),
+        eq(issues.companyId, companyId),
+        eq(issues.status, "blocked"),
+      ),
+    )
+    .returning({ id: issues.id });
+  return flipped.map((row) => row.id);
+}
+
+/**
+ * All `blocked`-status dependents of `blockerIssueId`, regardless of
+ * assignee. Companion to `listWakeableBlockedDependents`, which drops
+ * unassigned candidates because it exists to decide wake targets — an eager
+ * status recompute has no such restriction, since an unassigned `blocked`
+ * issue with zero unresolved blockers is exactly as stranded as an assigned
+ * one and nothing else will ever flip it.
+ */
+export async function listBlockedDependentIssueIds(
+  dbOrTx: Db,
+  companyId: string,
+  blockerIssueId: string,
+): Promise<string[]> {
+  const rows = await dbOrTx
+    .select({ id: issues.id })
+    .from(issueRelations)
+    .innerJoin(issues, eq(issueRelations.relatedIssueId, issues.id))
+    .where(
+      and(
+        eq(issueRelations.companyId, companyId),
+        eq(issueRelations.type, "blocks"),
+        eq(issueRelations.issueId, blockerIssueId),
+        eq(issues.status, "blocked"),
+      ),
+    );
+  return rows.map((row) => row.id);
 }
 
 const BLOCKED_INBOX_TERMINAL_STATUSES = ["done", "cancelled"] as const;

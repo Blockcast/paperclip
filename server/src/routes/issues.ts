@@ -174,6 +174,8 @@ import {
   ISSUE_WAKE_DIAGNOSTICS_LOOKBACK_DAYS,
   ISSUE_WAKE_DIAGNOSTICS_MAX_ACTIVITY_RECORDS,
   ISSUE_WAKE_DIAGNOSTICS_MAX_WAKE_REQUESTS,
+  listBlockedDependentIssueIds,
+  recomputeBlockedIssuesStatusIfReady,
 } from "../services/issues.js";
 import {
   authorizationBoundaryLabel,
@@ -12445,16 +12447,37 @@ export function issueRoutes(
             mutation: "blocker_done",
           });
         }
+        // BLO-21523 phase 2: the wake above only reaches assigned, wakeable
+        // dependents. Flip `status` for every `blocked` dependent this
+        // blocker's `done` transition may have freed — including unassigned
+        // ones no wake ever targets — so the fix isn't just "the agent got
+        // told," it's "the row is dispatchable."
+        const blockedDependentIds = await listBlockedDependentIssueIds(db, issue.companyId, issue.id);
+        if (blockedDependentIds.length > 0) {
+          await recomputeBlockedIssuesStatusIfReady(db, issue.companyId, blockedDependentIds, {
+            triggerPath: "eager_status_recompute",
+          });
+        }
       }
 
-      const restoredBlockedReadyDependency =
+      // BLO-21523 phase 2: same trigger condition the wake below uses, minus
+      // the assignee requirement — clearing this issue's own last blocker
+      // (via `blockedByIssueIds`) must recompute its `status` even when it
+      // has no assignee yet to wake.
+      const statusRecomputeCandidate =
         issue.status === "blocked" &&
-        issue.assigneeAgentId &&
         (
           existing.status !== "blocked" ||
           Array.isArray(req.body.blockedByIssueIds) ||
           existing.assigneeAgentId !== issue.assigneeAgentId
         );
+      if (statusRecomputeCandidate) {
+        await recomputeBlockedIssuesStatusIfReady(db, issue.companyId, [issue.id], {
+          triggerPath: "eager_status_recompute",
+        });
+      }
+
+      const restoredBlockedReadyDependency = statusRecomputeCandidate && issue.assigneeAgentId;
       if (restoredBlockedReadyDependency && typeof dependencyReadinessSvc.getDependencyReadiness === "function") {
         const readiness = await dependencyReadinessSvc.getDependencyReadiness(issue.id);
         const resolvedBlockerIssueId = readiness.blockerIssueIds[0] ?? null;
@@ -14599,6 +14622,15 @@ export function issueRoutes(
             dependentIssueId: dependent.id,
             resolvedBlockerIssueId: currentIssue.id,
             blockerIssueIds: dependent.blockerIssueIds,
+          });
+        }
+        // BLO-21523 phase 2: see the matching comment on the PATCH /issues/:id
+        // becameDone block — flip status for every blocked dependent this
+        // transition may have freed, not just the ones with a wake target.
+        const blockedDependentIds = await listBlockedDependentIssueIds(db, currentIssue.companyId, currentIssue.id);
+        if (blockedDependentIds.length > 0) {
+          await recomputeBlockedIssuesStatusIfReady(db, currentIssue.companyId, blockedDependentIds, {
+            triggerPath: "eager_status_recompute",
           });
         }
       }
