@@ -14538,6 +14538,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           status: "queued",
           error: null,
           errorCode: null,
+          // BLO-21116 (Ally review, onprem-k8s#2013): this row can have sat in
+          // scheduled_retry backoff for hours; queuedAt resets its dispatch
+          // wait clock to this promotion instant so the age gauge measures
+          // time queued for a slot, not lifetime since createdAt.
+          queuedAt: now,
           updatedAt: now,
         })
         .where(
@@ -21360,6 +21365,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         processGroupId: null,
         processStartedAt: null,
         contextSnapshot: context,
+        // BLO-21116 (Ally review, onprem-k8s#2013): this run was already
+        // running, so its createdAt can be old; queuedAt resets its
+        // dispatch-wait clock to this re-queue instant, same reasoning as
+        // promoteScheduledRetryRun above.
+        queuedAt: now,
         updatedAt: now,
       })
       .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "running")))

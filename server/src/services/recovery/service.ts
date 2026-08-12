@@ -1056,6 +1056,18 @@ const PROVIDER_QUOTA_ERROR_RE =
   /(?:you(?:'|’)ve hit your usage limit|usage limit(?: reached| exceeded)?|provider quota|quota (?:limit )?exceeded|model (?:is )?at capacity)/i;
 const CONFIGURATION_INCOMPLETE_ERROR_RE =
   /(?:model_not_found|model [^\n]{0,120} not found|missing (?:api )?(?:key|credentials?)|credentials? (?:are |is )?missing|no (?:api )?(?:key|credentials?) (?:was |were )?(?:found|configured|provided)|api key (?:is )?(?:not set|unavailable))/i;
+// BLO-21116: a truncated/malformed adapter response is a transport-level parse
+// fault, not evidence about credentials. Before this guard, the config-incomplete
+// regex ran against `errorCode + error + JSON.stringify(resultJson)` — the FULL
+// raw (possibly truncated) response payload — so an unparseable blob could
+// false-positive match one of the config phrases via unrelated substring content
+// (e.g. a partial JSON fragment that happens to contain "model ... not found").
+// A match here permanently latches the issue into `manual_repair_required`
+// (service.ts enqueueSourceScopedStrandedRecoveryWake) telling the owner to bind
+// a secret that was never actually missing — an unperformable repair with no
+// automatic retry path. Observed live on BLO-18991: `adapter_failed` — "JSON
+// parsing failed: Text: {"type":"response.completed","response":{..." (truncated).
+const ADAPTER_RESPONSE_PARSE_FAILURE_RE = /json parsing failed/i;
 
 export type AdapterFailureRecoveryClassification =
   | { kind: "provider_quota"; retryAt: Date; parsedResetTime: boolean }
@@ -1142,10 +1154,30 @@ export function classifyAdapterFailureForRecovery(
     return null;
   }
   const resultJson = parseObject(latestRun.resultJson);
-  const error = [latestRun.errorCode ?? "", latestRun.error ?? "", JSON.stringify(resultJson)].join("\n");
-  if (latestRun.errorCode === "configuration_incomplete" || CONFIGURATION_INCOMPLETE_ERROR_RE.test(error)) {
+  const rawError = latestRun.error ?? "";
+  // BLO-21116: an `adapter_failed` whose own message names a response-parse
+  // failure means resultJson is an untrusted/truncated payload, not a source of
+  // classification evidence -- exclude it from the combined search string so a
+  // stray substring inside the raw blob cannot false-positive as a config or
+  // quota phrase, and never let it read as configuration_incomplete.
+  const isResponseParseFailure =
+    latestRun.errorCode === "adapter_failed" && ADAPTER_RESPONSE_PARSE_FAILURE_RE.test(rawError);
+  const error = [latestRun.errorCode ?? "", rawError, isResponseParseFailure ? "" : JSON.stringify(resultJson)]
+    .join("\n");
+  if (
+    !isResponseParseFailure &&
+    (latestRun.errorCode === "configuration_incomplete" || CONFIGURATION_INCOMPLETE_ERROR_RE.test(error))
+  ) {
     return { kind: "configuration_incomplete" };
   }
+  // Same untrusted-payload reasoning as the configuration_incomplete guard
+  // above: `error` still carries `rawError` verbatim (only `resultJson` was
+  // dropped from the join), so a response-parse-failure payload containing a
+  // phrase like "quota exceeded" or "model is at capacity" would otherwise
+  // still satisfy PROVIDER_QUOTA_ERROR_RE below and misclassify as
+  // provider_quota instead of configuration_incomplete -- the same defect
+  // class, just the other branch (Ally review, 2026-08-04).
+  if (isResponseParseFailure) return null;
   if (latestRun.errorCode !== "provider_quota" && !PROVIDER_QUOTA_ERROR_RE.test(error)) return null;
 
   const persistedRetryAt = readNonEmptyString(resultJson.retryNotBefore) ??
