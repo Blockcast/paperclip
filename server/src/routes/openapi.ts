@@ -5543,6 +5543,11 @@ for (const route of [
   ["get", "/api/companies/{companyId}/search", "Search company data"],
   ["get", "/api/companies/{companyId}/search/extract", "Extract company search matches"],
   ["get", "/api/companies/{companyId}/issues/count", "Count issues in a company"],
+  [
+    "get",
+    "/api/companies/{companyId}/issues/open-assignment-census",
+    "Authoritative per-agent open-assignment census (single snapshot, not paginated)",
+  ],
 ] as const) {
   registerCurrentRoute({
     method: route[0],

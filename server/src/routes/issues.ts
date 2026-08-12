@@ -116,6 +116,7 @@ import {
   inboxAgentPolicyService,
   ISSUE_LIST_DEFAULT_LIMIT,
   ISSUE_LIST_MAX_LIMIT,
+  OPEN_ISSUE_STATUSES,
   issueReferenceService,
   issueService,
   type IssueFilters,
@@ -7092,6 +7093,88 @@ export function issueRoutes(
 
     const count = await svc.count(companyId, blockedCountFilters);
     res.json({ count });
+  });
+
+  /**
+   * Authoritative open-assignment census.
+   *
+   * `GET /companies/:id/issues` silently clamps `limit` to ISSUE_LIST_MAX_LIMIT
+   * and returns a bare array with no total and no cursor, so a caller cannot
+   * tell a complete page from a truncated one, and offset paging over a
+   * mutating collection double-counts and drops rows. Consumers that need
+   * exact per-agent open counts (the agent-health sweep) must read them here
+   * instead of reconstructing them from that population.
+   */
+  router.get("/companies/:companyId/issues/open-assignment-census", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    if (isTaskBridgeKeyActor(req)) {
+      res.status(403).json({ error: "Task bridge keys cannot use company-wide issue census APIs" });
+      return;
+    }
+    if (req.query.limit !== undefined || req.query.offset !== undefined) {
+      res.status(400).json({
+        error: "open-assignment-census is not paginated and does not accept limit or offset",
+      });
+      return;
+    }
+
+    const rawStatus = req.query.status;
+    let status: string[] | undefined;
+    if (rawStatus !== undefined) {
+      const candidates = (Array.isArray(rawStatus) ? rawStatus : [rawStatus])
+        .flatMap((value) => String(value).split(","))
+        .map((value) => value.trim())
+        .filter((value) => value.length > 0);
+      const invalid = candidates.filter((value) => !OPEN_ISSUE_STATUSES.includes(
+        value as typeof OPEN_ISSUE_STATUSES[number],
+      ));
+      if (candidates.length === 0 || invalid.length > 0) {
+        res.status(400).json({
+          error: `status must be a subset of ${OPEN_ISSUE_STATUSES.join(",")}`,
+        });
+        return;
+      }
+      status = [...new Set(candidates)];
+    }
+
+    const censusFilters = {
+      status,
+      includeRoutineExecutions:
+        req.query.includeRoutineExecutions === "true" || req.query.includeRoutineExecutions === "1",
+      includePluginOperations:
+        req.query.includePluginOperations === "true" || req.query.includePluginOperations === "1",
+    };
+
+    // The census is a company-wide aggregate: it cannot be assembled from a
+    // per-actor visibility filter without losing the single-snapshot property
+    // that makes it authoritative. Actors without company-scope read get an
+    // explicit refusal rather than a silently narrowed census that would look
+    // exact and be wrong.
+    if (!(await actorCanReadCompanyScope(req, companyId))) {
+      const trustResolution = req.actor.type === "agent"
+        ? await resolveAgentTrustForIssue({
+            agentId: req.actor.agentId,
+            runId: req.actor.runId,
+          }, companyId, null)
+        : null;
+      if (trustResolution?.kind === "denied") {
+        throw forbidden(trustResolution.detail);
+      }
+      if (trustResolution?.kind === "low_trust_review") {
+        res.json(await svc.openAssignmentCensus(companyId, {
+          ...censusFilters,
+          lowTrustBoundary: trustResolution.boundary,
+        }));
+        return;
+      }
+      res.status(403).json({
+        error: "open-assignment-census requires company-scope read access",
+      });
+      return;
+    }
+
+    res.json(await svc.openAssignmentCensus(companyId, censusFilters));
   });
 
   router.get("/companies/:companyId/labels", async (req, res) => {

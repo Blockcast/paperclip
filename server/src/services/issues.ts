@@ -145,6 +145,19 @@ const ISSUE_PARENT_ANCESTRY_VALIDATION_MAX_DEPTH = 256;
 const MAX_ISSUE_COMMENT_PAGE_LIMIT = 500;
 export const ISSUE_LIST_DEFAULT_LIMIT = 500;
 export const ISSUE_LIST_MAX_LIMIT = 1000;
+/**
+ * Non-terminal issue statuses. This is the population an "open assignment"
+ * census covers; `done` and `cancelled` are excluded.
+ */
+export const OPEN_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked"] as const;
+/**
+ * Safety bound on the number of per-agent groups a single census may return.
+ * A company has tens of agents, so this never fires in practice — but the
+ * contract must be able to *say* it was truncated rather than silently
+ * returning a prefix, which is exactly the failure mode this census exists to
+ * remove (`limit=10000` silently clamped to 1000 with no completion signal).
+ */
+export const OPEN_ASSIGNMENT_CENSUS_MAX_AGENT_GROUPS = 5000;
 const BLOCKED_PROMOTION_AWAITING_USER_EVENT = "sweep_blocked_promotion_skipped_awaiting_user";
 const BLOCKED_PROMOTION_AWAITING_USER_COUNTER = "sweep.blocked_promotion_skipped_awaiting_user";
 export const ISSUE_BLOCKER_DIAGNOSTICS_MAX_BLOCKERS = 100;
@@ -748,8 +761,63 @@ export interface IssueFilters {
   sortDir?: "asc" | "desc";
 }
 
-type IssueRow = typeof issues.$inferSelect;
-type IssueLabelRow = typeof labels.$inferSelect;
+/**
+ * Filters accepted by the open-assignment census. Deliberately a small subset
+ * of {@link IssueFilters}: the census is an authoritative company-wide
+ * aggregate, so it takes only the knobs that change which issues are "open
+ * work" and none of the pagination/sort knobs that would make it partial.
+ */
+export interface OpenAssignmentCensusFilters {
+  /** Statuses treated as open. Defaults to {@link OPEN_ISSUE_STATUSES}. */
+  status?: string | readonly string[];
+  includeRoutineExecutions?: boolean;
+  includePluginOperations?: boolean;
+  lowTrustBoundary?: LowTrustBoundary & { companyId: string };
+}
+
+export interface OpenAssignmentCensusIssueIdentity {
+  id: string;
+  identifier: string | null;
+  title: string;
+  status: string;
+  priority: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface OpenAssignmentCensusAgentRow {
+  assigneeAgentId: string;
+  openCount: number;
+  highestPriority: string;
+  highestPriorityIssue: OpenAssignmentCensusIssueIdentity;
+  countsByStatus: Record<string, number>;
+  countsByPriority: Record<string, number>;
+}
+
+export interface OpenAssignmentCensus {
+  companyId: string;
+  censusAt: string;
+  /** Statuses the census counted, echoed so a consumer never has to guess. */
+  openStatuses: string[];
+  /**
+   * `true` when the returned `agents` array is the entire per-agent grouping.
+   * The only way this is `false` is the {@link OPEN_ASSIGNMENT_CENSUS_MAX_AGENT_GROUPS}
+   * safety bound; there is no silent row cap.
+   */
+  complete: boolean;
+  truncated: boolean;
+  agentGroupCount: number;
+  totals: {
+    open: number;
+    openAssignedToAgents: number;
+    openAssignedToUsers: number;
+    openUnassigned: number;
+    agentsWithOpenWork: number;
+  };
+  agents: OpenAssignmentCensusAgentRow[];
+}
+
+type IssueRow = typeof issues.$inferSelect;type IssueLabelRow = typeof labels.$inferSelect;
 type IssuePlanDecompositionRow = typeof issuePlanDecompositions.$inferSelect;
 type IssueActiveRunRow = {
   id: string;
@@ -6880,6 +6948,180 @@ export function issueService(db: Db) {
         .from(issues)
         .where(and(...conditions));
       return Number(row?.count ?? 0);
+    },
+
+    /**
+     * Authoritative per-agent open-assignment census for one company.
+     *
+     * Why this exists: `GET /companies/:id/issues` silently clamps `limit` to
+     * {@link ISSUE_LIST_MAX_LIMIT} and returns a bare array — no total, no
+     * cursor — so a caller cannot distinguish "1000 rows is everything" from
+     * "1000 rows is a truncated prefix", and offset paging over a mutating
+     * collection duplicates and drops rows. Callers that need exact counts must
+     * not derive them from that population.
+     *
+     * The completeness guarantee is structural, not advisory: the whole census
+     * is computed by ONE SQL statement. Postgres evaluates a statement against
+     * a single MVCC snapshot, so concurrent inserts, status changes, and
+     * re-assignments either land wholly inside the census or wholly outside it.
+     * There is no window in which an issue can be counted twice or missed.
+     * Keep it one statement — splitting the totals and the per-agent grouping
+     * into two round trips reintroduces exactly the tearing this removes.
+     *
+     * `highestPriorityIssue` is deterministic: priority rank ascending, then
+     * `createdAt` ascending, then `id` ascending. A stable tiebreak matters
+     * because the agent-health fingerprint hashes this identity.
+     */
+    openAssignmentCensus: async (
+      companyId: string,
+      filters?: OpenAssignmentCensusFilters,
+    ): Promise<OpenAssignmentCensus> => {
+      const requestedStatuses = parseStatusFilter(filters?.status);
+      const openStatuses = requestedStatuses.length > 0
+        ? requestedStatuses
+        : [...OPEN_ISSUE_STATUSES];
+
+      const conditions: SQL[] = [
+        eq(issues.companyId, companyId),
+        visibleIssueCondition(),
+        inArray(issues.status, openStatuses),
+      ];
+      if (!filters?.includePluginOperations) conditions.push(nonPluginOperationIssueCondition());
+      if (!filters?.includeRoutineExecutions) conditions.push(nonRoutineExecutionIssueCondition());
+      const lowTrustCondition = lowTrustBoundaryIssueCondition(companyId, filters?.lowTrustBoundary);
+      if (lowTrustCondition) conditions.push(lowTrustCondition);
+
+      const priorityRank = sql`CASE ${issues.priority}
+        WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END`;
+      // One extra group is fetched so `truncated` reflects reality rather than
+      // "we happened to return exactly the cap".
+      const groupFetchLimit = OPEN_ASSIGNMENT_CENSUS_MAX_AGENT_GROUPS + 1;
+
+      const result = await db.execute(sql`
+        WITH scope AS (
+          SELECT
+            ${issues.id} AS id,
+            ${issues.identifier} AS identifier,
+            ${issues.title} AS title,
+            ${issues.status} AS status,
+            ${issues.priority} AS priority,
+            ${issues.assigneeAgentId} AS assignee_agent_id,
+            ${issues.assigneeUserId} AS assignee_user_id,
+            ${issues.createdAt} AS created_at,
+            ${issues.updatedAt} AS updated_at,
+            ${priorityRank} AS priority_rank
+          FROM ${issues}
+          WHERE ${and(...conditions)}
+        ),
+        agent_scope AS (
+          SELECT * FROM scope WHERE assignee_agent_id IS NOT NULL
+        ),
+        per_agent AS (
+          SELECT
+            assignee_agent_id,
+            -- sum(), not count(): the inner query is already grouped by status,
+            -- so count(*) here would return the number of distinct statuses.
+            sum(status_count)::int AS open_count,
+            jsonb_object_agg(status_key, status_count) AS counts_by_status
+          FROM (
+            SELECT assignee_agent_id, status AS status_key, count(*)::int AS status_count
+            FROM agent_scope
+            GROUP BY assignee_agent_id, status
+          ) AS by_status
+          GROUP BY assignee_agent_id
+        ),
+        per_agent_priority AS (
+          SELECT assignee_agent_id, jsonb_object_agg(priority, priority_count) AS counts_by_priority
+          FROM (
+            SELECT assignee_agent_id, priority, count(*)::int AS priority_count
+            FROM agent_scope
+            GROUP BY assignee_agent_id, priority
+          ) AS by_priority
+          GROUP BY assignee_agent_id
+        ),
+        top_issue AS (
+          SELECT DISTINCT ON (assignee_agent_id)
+            assignee_agent_id, id, identifier, title, status, priority, created_at, updated_at
+          FROM agent_scope
+          ORDER BY assignee_agent_id, priority_rank ASC, created_at ASC, id ASC
+        ),
+        agent_rows AS (
+          SELECT
+            p.assignee_agent_id,
+            p.open_count,
+            t.priority AS highest_priority,
+            jsonb_build_object(
+              'id', t.id,
+              'identifier', t.identifier,
+              'title', t.title,
+              'status', t.status,
+              'priority', t.priority,
+              'createdAt', to_char(t.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
+              'updatedAt', to_char(t.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
+            ) AS highest_priority_issue,
+            p.counts_by_status,
+            COALESCE(pp.counts_by_priority, '{}'::jsonb) AS counts_by_priority
+          FROM per_agent p
+          JOIN top_issue t ON t.assignee_agent_id = p.assignee_agent_id
+          LEFT JOIN per_agent_priority pp ON pp.assignee_agent_id = p.assignee_agent_id
+          ORDER BY p.open_count DESC, p.assignee_agent_id ASC
+          LIMIT ${groupFetchLimit}
+        )
+        SELECT jsonb_build_object(
+          'censusAt', to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
+          'agentGroupCount', (SELECT count(*)::int FROM per_agent),
+          'totals', jsonb_build_object(
+            'open', (SELECT count(*)::int FROM scope),
+            'openAssignedToAgents', (SELECT count(*)::int FROM agent_scope),
+            'openAssignedToUsers', (
+              SELECT count(*)::int FROM scope
+              WHERE assignee_agent_id IS NULL AND assignee_user_id IS NOT NULL
+            ),
+            'openUnassigned', (
+              SELECT count(*)::int FROM scope
+              WHERE assignee_agent_id IS NULL AND assignee_user_id IS NULL
+            ),
+            'agentsWithOpenWork', (SELECT count(*)::int FROM per_agent)
+          ),
+          'agents', COALESCE((
+            SELECT jsonb_agg(jsonb_build_object(
+              'assigneeAgentId', assignee_agent_id,
+              'openCount', open_count,
+              'highestPriority', highest_priority,
+              'highestPriorityIssue', highest_priority_issue,
+              'countsByStatus', counts_by_status,
+              'countsByPriority', counts_by_priority
+            )) FROM agent_rows
+          ), '[]'::jsonb)
+        ) AS census
+      `);
+
+      const resultRows = (result as unknown as { rows?: Array<{ census?: unknown }> }).rows
+        ?? (result as unknown as Array<{ census?: unknown }>);
+      const payload = (Array.isArray(resultRows) ? resultRows[0]?.census : undefined) as
+        | (Omit<OpenAssignmentCensus, "companyId" | "openStatuses" | "complete" | "truncated">
+          & { totals?: Partial<OpenAssignmentCensus["totals"]> })
+        | undefined;
+
+      const agents = (payload?.agents ?? []) as OpenAssignmentCensusAgentRow[];
+      const truncated = agents.length > OPEN_ASSIGNMENT_CENSUS_MAX_AGENT_GROUPS;
+
+      return {
+        companyId,
+        censusAt: payload?.censusAt ?? new Date().toISOString(),
+        openStatuses,
+        complete: !truncated,
+        truncated,
+        agentGroupCount: Number(payload?.agentGroupCount ?? 0),
+        totals: {
+          open: Number(payload?.totals?.open ?? 0),
+          openAssignedToAgents: Number(payload?.totals?.openAssignedToAgents ?? 0),
+          openAssignedToUsers: Number(payload?.totals?.openAssignedToUsers ?? 0),
+          openUnassigned: Number(payload?.totals?.openUnassigned ?? 0),
+          agentsWithOpenWork: Number(payload?.totals?.agentsWithOpenWork ?? 0),
+        },
+        agents: truncated ? agents.slice(0, OPEN_ASSIGNMENT_CENSUS_MAX_AGENT_GROUPS) : agents,
+      };
     },
 
     countUnreadTouchedByUser: async (

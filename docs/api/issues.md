@@ -21,6 +21,112 @@ Query parameters:
 
 Results sorted by priority.
 
+`limit` is **clamped**, not validated: a value above the server maximum (1,000)
+is silently reduced, and the response is a bare JSON array with no total and no
+cursor. A caller therefore cannot distinguish "1,000 rows is the whole
+collection" from "1,000 rows is a truncated prefix", and paging with `offset`
+over a collection that is being mutated concurrently can return the same issue
+twice or skip one. **Do not compute exact counts from this endpoint.** Use the
+open-assignment census below.
+
+## Open-Assignment Census
+
+```
+GET /api/companies/{companyId}/issues/open-assignment-census
+```
+
+An authoritative, non-paginated grouping of a company's open (non-terminal)
+issues by assigned agent. Built for consumers — such as the agent-health sweep —
+that need exact per-agent open counts and highest-priority assignment identity
+and must not derive them from a possibly-truncated list page.
+
+The whole response is computed by a single SQL statement, so it is evaluated
+against one database snapshot. Issues created, closed, or re-assigned while the
+census runs land wholly inside it or wholly outside it; no issue can be counted
+twice or missed.
+
+Query parameters:
+
+| Param | Description |
+|-------|-------------|
+| `status` | Subset of the open statuses to count (comma-separated or repeated). Defaults to all of them. Passing a terminal status (`done`, `cancelled`) is a 400. |
+| `includeRoutineExecutions` | `true` to count `routine_execution` issues. Excluded by default. |
+| `includePluginOperations` | `true` to count plugin-operation issues. Excluded by default. |
+
+`limit` and `offset` are rejected with 400 — the census is not paginated.
+
+Response:
+
+```json
+{
+  "companyId": "…",
+  "censusAt": "2026-08-12T10:31:04.512Z",
+  "openStatuses": ["backlog", "todo", "in_progress", "in_review", "blocked"],
+  "complete": true,
+  "truncated": false,
+  "agentGroupCount": 13,
+  "totals": {
+    "open": 4793,
+    "openAssignedToAgents": 3060,
+    "openAssignedToUsers": 618,
+    "openUnassigned": 1115,
+    "agentsWithOpenWork": 13
+  },
+  "agents": [
+    {
+      "assigneeAgentId": "…",
+      "openCount": 870,
+      "highestPriority": "critical",
+      "highestPriorityIssue": {
+        "id": "…",
+        "identifier": "PCL-2125",
+        "title": "…",
+        "status": "in_progress",
+        "priority": "critical",
+        "createdAt": "2026-07-02T09:14:00.000Z",
+        "updatedAt": "2026-08-11T22:03:11.884Z"
+      },
+      "countsByStatus": { "todo": 611, "in_progress": 141, "blocked": 118 },
+      "countsByPriority": { "critical": 3, "high": 240, "medium": 620, "low": 7 }
+    }
+  ]
+}
+```
+
+Contract notes:
+
+- **`complete` is the completion signal.** It is `false` only if the number of
+  distinct agents with open work exceeds 5,000, in which case `truncated` is
+  `true` and `agentGroupCount` reports the real number. There is no silent row
+  cap; a company with hundreds of thousands of open issues still returns every
+  agent group.
+- **The response is self-checkable.** `sum(agents[].openCount)` always equals
+  `totals.openAssignedToAgents`, and `openAssignedToAgents + openAssignedToUsers
+  + openUnassigned` always equals `totals.open`. A consumer that wants a
+  belt-and-braces check can assert these rather than trusting the endpoint.
+- **`highestPriorityIssue` is deterministic**: priority rank (`critical`,
+  `high`, `medium`, `low`, then anything else) ascending, then `createdAt`
+  ascending, then `id` ascending. Stable across calls on unchanged data, so it
+  is safe to hash into a fingerprint.
+- `agents` is ordered by `openCount` descending, then `assigneeAgentId`
+  ascending.
+- Issues that are hidden, harness-generated, or terminal are never counted.
+
+Authorization is unchanged from the rest of the company issue API: the caller
+must pass `assertCompanyAccess` for `{companyId}`. Because the census is a
+company-wide aggregate that cannot be assembled from a per-actor visibility
+filter without losing its single-snapshot property, an actor without
+company-scope read gets an explicit `403` rather than a silently narrowed census
+that would look exact and be wrong. Low-trust-boundary actors receive a census
+restricted to their boundary. Task-bridge keys are refused.
+
+Calling it from an agent through the MCP escape hatch (note the tool prepends
+`/api` itself):
+
+```
+paperclipApiRequest path="/companies/{companyId}/issues/open-assignment-census"
+```
+
 ## Get Issue
 
 ```
