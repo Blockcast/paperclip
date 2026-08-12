@@ -25,26 +25,32 @@ GH_SELF="${GH_TOKEN_WRAPPER_SELF:-/usr/bin/gh}"
 # path (via /proc/self/exe, not argv[0]) and writes that path into git's
 # credential.*.helper. Because this wrapper delegates by `exec`, the running
 # binary *is* REAL_GH by the time that happens — so a plain exec here
-# reproduces BLO-25702 verbatim: `gh auth setup-git` (run directly, or via an
-# interactive `gh auth login` prompt) silently overwrites the correct
-# system-level helper from Dockerfile.runtime with one that shells out to
-# gh.real, which never reads TOKEN_FILE and returns no credential. Route only
-# this subcommand through a non-exec call so the helper it just wrote can be
-# rewritten back to this wrapper afterward, instead of either reproducing the
-# regression or silently skipping a command the caller explicitly asked for.
+# reproduces BLO-25702 verbatim. Two callers can trigger the write:
+# `gh auth setup-git` directly, and `gh auth login`, which runs the identical
+# setup-git logic internally when it prompts (or is told, e.g. via
+# `--git-protocol https`) to authenticate git — by the time that internal
+# call happens, `gh auth login` has *already* been exec'd into REAL_GH, so it
+# hits the bug the same way a direct `setup-git` call would. Route both
+# subcommands through a non-exec call so the helper that was just written can
+# be rewritten back to this wrapper afterward, instead of either reproducing
+# the regression or silently skipping a command the caller explicitly asked
+# for.
 exec_real_gh() {
-  if [ "${1:-}" = "auth" ] && [ "${2:-}" = "setup-git" ]; then
-    status=0
-    "${REAL_GH}" "$@" || status=$?
-    fix_setup_git_credential_helper
-    exit "${status}"
-  fi
+  case "${1:-} ${2:-}" in
+    "auth setup-git" | "auth login")
+      status=0
+      "${REAL_GH}" "$@" || status=$?
+      fix_setup_git_credential_helper
+      exit "${status}"
+      ;;
+  esac
   exec "${REAL_GH}" "$@"
 }
 
-# Best-effort repair of the file `gh auth setup-git` just wrote (always
+# Best-effort repair of the file `gh auth setup-git` (directly, or via `gh
+# auth login`'s internal call to the same logic) just wrote — always
 # `--global`, i.e. "${HOME}/.gitconfig" — gh has no notion of this wrapper's
-# split HOME-per-workspace layout). Scoped to lines that literally mention
+# split HOME-per-workspace layout. Scoped to lines that literally mention
 # REAL_GH's credential-helper invocation, so it never touches an unrelated
 # helper a caller configured on purpose.
 fix_setup_git_credential_helper() {
@@ -55,7 +61,7 @@ fix_setup_git_credential_helper() {
     *"${REAL_GH} auth git-credential"*)
       escaped_real_gh=$(printf '%s' "${REAL_GH}" | sed 's/\./\\./g')
       sed -i "s#${escaped_real_gh} auth git-credential#${GH_SELF} auth git-credential#g" "${gitconfig}" 2>/dev/null || true
-      echo "gh-token-wrapper: gh auth setup-git wrote a credential helper pointing at ${REAL_GH} (its own on-disk path, per BLO-25702); rewrote ${gitconfig} to route through ${GH_SELF} instead" >&2
+      echo "gh-token-wrapper: gh auth setup-git (directly or via gh auth login) wrote a credential helper pointing at ${REAL_GH} (its own on-disk path, per BLO-25702); rewrote ${gitconfig} to route through ${GH_SELF} instead" >&2
       ;;
   esac
 }

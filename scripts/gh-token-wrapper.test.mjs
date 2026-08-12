@@ -364,8 +364,13 @@ test("Dockerfile.runtime points git's credential helper at the wrapper, not gh.r
 // on-disk location rather than argv[0]. Calls /usr/bin/git directly (not
 // bare `git`) so the test is hermetic against whatever else PATH resolves
 // "git" to in the sandbox this suite happens to run in.
+// `gh auth login` writes the identical credential helper as a side effect of
+// its own internal setup-git step (interactively-accepted, or via
+// `--git-protocol https`) — this stub reproduces that by handling "auth
+// login" exactly like "auth setup-git", so tests can pin the wrapper's
+// interception of both entry points into the same regression.
 const SETUP_GIT_STUB_GH_SOURCE = `#!/bin/sh
-if [ "$1" = "auth" ] && [ "$2" = "setup-git" ]; then
+if { [ "$1" = "auth" ] && [ "$2" = "setup-git" ]; } || { [ "$1" = "auth" ] && [ "$2" = "login" ]; }; then
   SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
   /usr/bin/git config --global credential."https://github.com".helper ""
   /usr/bin/git config --global --add credential."https://github.com".helper "!\${SELF} auth git-credential"
@@ -418,6 +423,28 @@ test("gh auth setup-git's broken gh.real helper is rewritten back to the wrapper
     assert.match(gitconfig, /"https:\/\/github\.com"/);
     assert.match(gitconfig, /"https:\/\/gist\.github\.com"/);
     // ...and neither may still shell out to the raw binary.
+    assert.doesNotMatch(gitconfig, new RegExp(stubGhPath.replace(/\//g, "\\/")));
+
+    assert.match(proc.stderr, /rewrote .*\.gitconfig to route through/);
+  });
+});
+
+test("gh auth login's internal setup-git write is also rewritten back to the wrapper (BLO-25702 review S1)", () => {
+  // Ally's review on PR #1311 flagged that the wrapper only special-cased a
+  // top-level `gh auth setup-git`: when `gh auth login` runs the identical
+  // logic internally (interactively-accepted, or via `--git-protocol
+  // https`), the wrapper had already exec'd into REAL_GH for the `login`
+  // command, so the repair never ran and the original BLO-25702 failure mode
+  // survived under `gh auth login`. This pins that `auth login` is
+  // intercepted the same way `auth setup-git` is.
+  withTempDir((dir) => {
+    const { proc, gitconfig, selfGhPath, stubGhPath } = runSetupGit(dir, { args: ["auth", "login"] });
+    assert.equal(proc.status, 0, `wrapper exited non-zero: ${proc.stderr}`);
+    assert.ok(gitconfig, "expected gh auth login to write ~/.gitconfig");
+
+    assert.match(gitconfig, new RegExp(`!${selfGhPath.replace(/\//g, "\\/")} auth git-credential`, "g"));
+    assert.match(gitconfig, /"https:\/\/github\.com"/);
+    assert.match(gitconfig, /"https:\/\/gist\.github\.com"/);
     assert.doesNotMatch(gitconfig, new RegExp(stubGhPath.replace(/\//g, "\\/")));
 
     assert.match(proc.stderr, /rewrote .*\.gitconfig to route through/);
