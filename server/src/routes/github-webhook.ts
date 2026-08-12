@@ -46,6 +46,7 @@ import {
   GITHUB_DEPENDABOT_WEBHOOK_DIAGNOSTIC_ORIGIN_KIND,
   findOpenDependabotAlertIssue,
   recordDependabotWebhookDiagnostic,
+  resolveDependabotIssueAssigneeId,
 } from "../services/dependabot-alert-issues.js";
 import { logger } from "../middleware/logger.js";
 import { HttpError } from "../errors.js";
@@ -1389,6 +1390,7 @@ async function resolveDependabotAlertIssue(
   const existing = await findOpenDependabotAlertIssue(db, input.companyId, input.originId);
   if (existing) return { id: existing.id, identifier: existing.identifier, reused: true };
 
+  const assigneeAgentId = await resolveDependabotIssueAssigneeId(db, input.companyId, input.assigneeAgentId);
   const priority = DEPENDABOT_SEVERITY_TO_ISSUE_PRIORITY[input.alert.severity] ?? "medium";
   const title = `Dependabot ${input.alert.severity} alert: ${input.alert.packageName ?? "unknown package"} in ${input.repoFullName}#${input.alert.alertNumber}`;
   const description = buildDependabotAlertIssueBody({ repoFullName: input.repoFullName, alert: input.alert });
@@ -1399,7 +1401,7 @@ async function resolveDependabotAlertIssue(
       description,
       status: "todo",
       priority,
-      assigneeAgentId: input.assigneeAgentId,
+      assigneeAgentId,
       originKind: GITHUB_DEPENDABOT_ALERT_ORIGIN_KIND,
       originId: input.originId,
       originFingerprint: input.originId,
@@ -1488,6 +1490,7 @@ async function recordDependabotTerminalReceipt(
   }
 
   if (!issue) {
+    const assigneeAgentId = await resolveDependabotIssueAssigneeId(db, input.companyId, input.assigneeAgentId);
     issue = await issueService(db).create(input.companyId, {
       title: `Dependabot terminal receipt: ${input.repoFullName}#${input.alert.alertNumber} ${input.alert.action}`,
       description: [
@@ -1503,7 +1506,7 @@ async function recordDependabotTerminalReceipt(
       ].join("\n"),
       status: hasCompleteTerminalEvidence ? "done" : "todo",
       priority: DEPENDABOT_SEVERITY_TO_ISSUE_PRIORITY[input.alert.severity] ?? "medium",
-      assigneeAgentId: input.assigneeAgentId,
+      assigneeAgentId,
       originKind: GITHUB_DEPENDABOT_ALERT_ORIGIN_KIND,
       originId: input.originId,
       originFingerprint: input.originId,

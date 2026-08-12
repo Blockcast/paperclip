@@ -5,13 +5,54 @@
  * backfill for wakes enqueued before the scoping fix landed). Split out so
  * heartbeat.ts doesn't need to import from a route module.
  */
-import { type Db, issues } from "@paperclipai/db";
+import { type Db, agents, issues } from "@paperclipai/db";
 import { and, desc, eq, isNull, notInArray } from "drizzle-orm";
 import { issueService } from "./issues.js";
+import { evaluateAgentInvokabilityFromDb } from "./agent-invokability.js";
 import { logger } from "../middleware/logger.js";
 
 export const GITHUB_DEPENDABOT_ALERT_ORIGIN_KIND = "github_dependabot_alert";
 export const GITHUB_DEPENDABOT_WEBHOOK_DIAGNOSTIC_ORIGIN_KIND = "github_dependabot_webhook_diagnostic";
+
+// BLO-26613: the Dependabot alert path has exactly one configured owner
+// (PAPERCLIP_DEPENDABOT_AGENT_ID) and no fallback owner. Issue creation
+// here used to assign that configured agent unconditionally -- if it is
+// paused, terminated, or otherwise uninvokable, every new alert (and
+// diagnostic/terminal-receipt row) silently queued on a dead run path with
+// no signal. Resolve to the configured agent when it's invokable; otherwise
+// fall back to unassigned so `allow_company_agent` lets any agent pick the
+// issue up, and log distinctly so this can back a fleet-level alert rule
+// separate from the per-issue `blocked_by_uninvokable_assignee` escalation.
+export async function resolveDependabotIssueAssigneeId(
+  db: Db,
+  companyId: string,
+  configuredAgentId: string,
+): Promise<string | null> {
+  const agent = await db
+    .select({
+      id: agents.id,
+      companyId: agents.companyId,
+      name: agents.name,
+      reportsTo: agents.reportsTo,
+      status: agents.status,
+    })
+    .from(agents)
+    .where(eq(agents.id, configuredAgentId))
+    .then((rows) => rows[0] ?? null);
+  const invokability = await evaluateAgentInvokabilityFromDb(db, agent);
+  if (invokability.invokable) return configuredAgentId;
+
+  logger.warn(
+    {
+      companyId,
+      configuredAgentId,
+      reason: invokability.reason,
+      message: invokability.message,
+    },
+    "dependabot alert route's configured assignee is not invokable; filing issue unassigned instead of silently assigning it",
+  );
+  return null;
+}
 
 export async function findOpenDependabotAlertIssue(db: Db, companyId: string, originId: string) {
   return db
@@ -67,6 +108,8 @@ export async function recordDependabotWebhookDiagnostic(
     .then((rows) => rows[0] ?? null);
   if (existing) return { issueId: existing.id };
 
+  const assigneeAgentId = await resolveDependabotIssueAssigneeId(db, input.companyId, input.assigneeAgentId);
+
   const title = `Dependabot webhook payload could not be scoped (${input.repoFullName ?? "unknown repo"})`;
   const description = [
     `A \`dependabot_alert\` webhook delivery could not be resolved into a scoped alert. ${input.reason}`,
@@ -87,7 +130,7 @@ export async function recordDependabotWebhookDiagnostic(
       description,
       status: "todo",
       priority: "high",
-      assigneeAgentId: input.assigneeAgentId,
+      assigneeAgentId,
       originKind: GITHUB_DEPENDABOT_WEBHOOK_DIAGNOSTIC_ORIGIN_KIND,
       originId,
       originFingerprint: originId,
