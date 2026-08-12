@@ -199,6 +199,11 @@ githubApp:
   # chain silently wedges the PR. Empty (default) -> the server posts no status.
   # Requires the App to hold `statuses: write` on the target repos.
   prReviewGateStatusContext: ""
+  # -- Commit-status context for Ally's comment-shaped consolidated reviews.
+  # Empty (default) leaves this fully inert. When set, mark the same context
+  # required in branch protection so Critical/Important comment findings block
+  # the head they explicitly attest to. Requires `statuses: write`.
+  prCommentReviewGateStatusContext: ""
 
 # -- Pod spec knobs.
 pod:

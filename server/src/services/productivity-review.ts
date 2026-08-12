@@ -35,6 +35,7 @@ import {
   withRecoveryModelProfileHint,
 } from "./recovery/model-profile-hint.js";
 import { RECOVERY_ORIGIN_KINDS } from "./recovery/origins.js";
+import { extractNextActionFromText } from "./run-liveness.js";
 import { runUsageTokenCounts } from "./recovery/zero-token-startup-failure.js";
 
 export const PRODUCTIVITY_REVIEW_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.issueProductivityReview;
@@ -69,6 +70,17 @@ const TERMINAL_RUN_STATUSES = ["succeeded", "interrupted", "failed", "cancelled"
 const ACTIVE_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const MAX_CANDIDATE_ISSUES = 250;
 const MAX_RUNS_FOR_STREAK = 100;
+const MAX_NEXT_ACTION_COMMENT_CANDIDATES = 20;
+const NEXT_ACTION_COMMENT_CANDIDATE_PATTERN = [
+  "(^|[[:space:]])([-*]|[0-9]+[.])?[[:space:]]*next( steps?| action)?[[:space:]]*:",
+  [
+    "(^|[[:space:]])",
+    "(i'll|i will|i am going to|i'm going to|let me|i need to|next(,| i will| i'll)?|my next step is|the next step is)",
+    "[[:space:]]+(first[[:space:]]+)?",
+    "(inspect|check|review|look|investigate|analy[sz]e|open|read|start|begin|work on|implement|fix|test|update|create|add)",
+    "([^[:alpha:]]|$)",
+  ].join(""),
+].join("|");
 const MAX_PARENT_WALK_DEPTH = 25;
 // BLO-19848: how long a `running` execution holder may go without a genuine
 // activity signal before its elapsed time stops being attributed to live work.
@@ -77,6 +89,23 @@ const MAX_PARENT_WALK_DEPTH = 25;
 // constant rather than an import to avoid coupling the detector to the recovery
 // service's module graph.
 const NON_LIVE_EXECUTION_SILENCE_MS = 2 * 60 * 60 * 1000;
+// BLO-23248/BLO-22331: a capacity-class `scheduled_retry` — the fleet's
+// ccrotate/penstock model-provider pool is exhausted, not a per-run hiccup —
+// parks the assignee's issue for hours to days with nothing the assignee can
+// do about it. Mirrors CCROTATE_CAPACITY_RETRY_REASON in heartbeat.ts,
+// duplicated locally (not imported) because heartbeat.ts imports
+// productivityReviewService from this module; importing back would be
+// circular. scheduledRetryReason is the primary signal; errorCode is a
+// fallback for rows written before the reason was recorded on this path.
+const CAPACITY_RETRY_REASON = "ccrotate_capacity";
+const CAPACITY_RETRY_ERROR_CODE = "rate_limit_exhausted";
+// Share of the active episode that must be capacity-stalled before
+// `long_active_duration` treats the episode as a fleet-capacity artifact
+// rather than assignee inactivity (BLO-23248 AC2). Chosen so a brand-new
+// capacity park (which is nearly all of a fresh episode) always suppresses,
+// while an episode that was already long *before* the retry started still
+// fires on its own unattended time.
+const CAPACITY_STALL_DOMINANT_SHARE = 0.5;
 export const PRODUCTIVITY_REVIEW_REFRESH_COMMENT_PREFIX = "Productivity review evidence refreshed.";
 const PRODUCTIVITY_REVIEW_CREATED_ACTION = "issue.productivity_review_created";
 const PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_STARTED_ACTION =
@@ -167,11 +196,25 @@ type ProductivityReviewEvidence = {
     armedUntil: Date | null;
     gatedIsUpperBound: boolean;
   } | null;
+  // BLO-23248: elapsed time attributable to the issue's current run sitting
+  // in a capacity-class `scheduled_retry` (fleet model-provider exhaustion) —
+  // a third bucket distinct from monitor-gated and unattended time. null when
+  // the current run (latestRuns[0]) is not such a retry.
+  capacityGating: {
+    stalledMs: number;
+    runId: string;
+    scheduledRetryAt: Date;
+    retryReason: string | null;
+    errorCode: string | null;
+    overdue: boolean;
+  } | null;
   latestRuns: HeartbeatRunRow[];
   latestComments: Array<typeof issueComments.$inferSelect>;
   costCents: number;
   usageSamples: Array<{ runId: string; usageJson: Record<string, unknown> | null }>;
   nextAction: string | null;
+  queuedUndispatchedRunCount: number;
+  oldestQueuedUndispatchedRunAgeMs: number | null;
   thresholds: ProductivityReviewThresholds;
   generatedAt: Date;
   routineOnlySamplingWindow: boolean;
@@ -452,6 +495,40 @@ function liveSegmentStartedAt(executionRun: HeartbeatRunRow | null, now: Date): 
   return parkEndedAt;
 }
 
+/**
+ * BLO-23248/BLO-22331: the fleet-capacity-retry state of the run currently
+ * heading this issue's execution history (`latestRuns[0]`), independent of
+ * `issue.executionRunId`. That pointer reads null for the entire time a run
+ * sits parked in `scheduled_retry`: `scheduleBoundedRetryForRun` clears the
+ * issue's execution lock the moment it inserts the retry row (heartbeat.ts),
+ * so `nonLiveExecutionHoldSince` — which only clamps a hold it can see via
+ * `issue.executionRunId` — never engages for this state, and the full
+ * wall-clock park gets counted as unattended (root cause: BLO-22331).
+ * `latestRuns` is scoped to this issue and ordered by `createdAt` desc (see
+ * `issueRunScopeSql`), so its head is this episode's current attempt
+ * regardless of which pointer the issue row carries.
+ *
+ * Returns null unless the current run is a capacity-class `scheduled_retry`.
+ * A transient-failure or dependency-blocked retry is a different, per-run
+ * condition the assignee can legitimately be asked about, so it is
+ * deliberately excluded — this only covers the fleet-wide model-provider
+ * exhaustion shape.
+ */
+function currentCapacityScheduledRetry(
+  latestRuns: HeartbeatRunRow[],
+  now: Date,
+): { run: HeartbeatRunRow; scheduledRetryAt: Date; overdue: boolean } | null {
+  const currentRun = latestRuns[0];
+  if (!currentRun || currentRun.status !== "scheduled_retry") return null;
+  const isCapacityClass =
+    currentRun.scheduledRetryReason === CAPACITY_RETRY_REASON
+    || currentRun.errorCode === CAPACITY_RETRY_ERROR_CODE;
+  if (!isCapacityClass) return null;
+  const scheduledRetryAt = coerceDate(currentRun.scheduledRetryAt);
+  if (!scheduledRetryAt) return null;
+  return { run: currentRun, scheduledRetryAt, overdue: scheduledRetryAt.getTime() <= now.getTime() };
+}
+
 function isTerminalIssueStatus(status: string | null | undefined) {
   return status === "done" || status === "cancelled";
 }
@@ -598,6 +675,13 @@ function formatMonitorGating(gating: NonNullable<ProductivityReviewEvidence["mon
     return `${split} (no monitor armed during this episode; previous monitor lapsed at ${gating.priorLapseAt.toISOString()}, before it began)`;
   }
   return `${split} (no monitor armed during this episode)`;
+}
+
+function formatCapacityGating(gating: NonNullable<ProductivityReviewEvidence["capacityGating"]>) {
+  const dueClause = gating.overdue
+    ? `due ${gating.scheduledRetryAt.toISOString()}, overdue and not yet promoted`
+    : `due ${gating.scheduledRetryAt.toISOString()}`;
+  return `${msToHumanFine(gating.stalledMs)} capacity-stalled (run \`${gating.runId}\` parked \`scheduled_retry\` on \`${gating.retryReason ?? gating.errorCode ?? "unknown"}\`, ${dueClause})`;
 }
 
 function isMonitorScheduledSuppression(
@@ -749,6 +833,25 @@ function formatTrigger(trigger: ProductivityReviewTrigger) {
 // observed boilerplate ceiling and well below the observed executed-run
 // floor — see BLO-22097 for the full sample tables.
 const NEVER_EXECUTED_UNKNOWN_USAGE_LOG_BYTES_CEILING = 200_000;
+
+const PRODUCTIVITY_REVIEW_TRIGGERS: readonly ProductivityReviewTrigger[] = [
+  "no_comment_streak",
+  "long_active_duration",
+  "high_churn",
+  "runtime_failure_streak",
+];
+
+// BLO-22105: `buildReviewMarkdown` bakes the trigger that produced it into the
+// `- Primary trigger:` line. Reading it back out of the persisted description
+// (rather than, say, the last activity-log entry) means the comparison is
+// against exactly what a reader currently sees, so a refresh regenerates
+// precisely when the visible Manager Decision guidance is actually stale.
+function extractReviewTriggerFromDescription(description: string | null): ProductivityReviewTrigger | null {
+  if (!description) return null;
+  const match = description.match(/^- Primary trigger: `([a-z_]+)`/m);
+  const candidate = match?.[1];
+  return PRODUCTIVITY_REVIEW_TRIGGERS.find((trigger) => trigger === candidate) ?? null;
+}
 
 // True when a run's most recent classification is `failed` liveness AND it
 // burned zero input+output tokens. That combination means the agent never
@@ -2103,6 +2206,33 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       .then((rows) => rows[0]?.count ?? 0);
   }
 
+  async function findCommentNextAction(
+    sourceIssue: IssueRow,
+    sourceAgent: AgentRow,
+    thresholds: ProductivityReviewThresholds,
+    now: Date,
+  ) {
+    const lookbackStart = new Date(now.getTime() - thresholds.longActiveMs);
+    const rows = await db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.companyId, sourceIssue.companyId),
+          eq(issueComments.issueId, sourceIssue.id),
+          eq(issueComments.authorAgentId, sourceAgent.id),
+          sql`${issueComments.createdAt} >= ${lookbackStart.toISOString()}::timestamptz`,
+          sql`${issueComments.body} ~* ${NEXT_ACTION_COMMENT_CANDIDATE_PATTERN}`,
+        ),
+      )
+      .orderBy(desc(issueComments.createdAt), desc(issueComments.id))
+      .limit(MAX_NEXT_ACTION_COMMENT_CANDIDATES);
+
+    return rows
+      .map((comment) => extractNextActionFromText(comment.body))
+      .find((line): line is string => Boolean(line)) ?? null;
+  }
+
   async function collectEvidence(
     sourceIssue: IssueRow,
     sourceAgent: AgentRow,
@@ -2186,6 +2316,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       assigneeRunCommentCountLastHour,
       assigneeRunCommentCountLastSixHours,
       latestComments,
+      mostRecentDispatchAt,
       costRow,
     ] = await Promise.all([
       countIssueRunsSince(sourceIssue.companyId, sourceAgent.id, sourceIssue.id, oneHourAgo),
@@ -2210,6 +2341,22 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         .orderBy(desc(issueComments.createdAt), desc(issueComments.id))
         .limit(5)
         .then((rows) => rows.map((row) => row.comment)),
+      // BLO-19604: `latestRuns` is ordered by `createdAt`, not `startedAt` — a run created
+      // earlier can be dispatched later than a run created after it, so scanning that array
+      // for the first `startedAt` can pick a stale dispatch timestamp (or, once more than
+      // `MAX_RUNS_FOR_STREAK` runs exist, miss the true most-recent dispatch entirely because
+      // it fell outside the createdAt-ordered sample). Query `max(startedAt)` directly instead.
+      db
+        .select({ mostRecentDispatchAt: sql<Date | null>`max(${heartbeatRuns.startedAt})` })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, sourceIssue.companyId),
+            eq(heartbeatRuns.agentId, sourceAgent.id),
+            issueRunScopeSql(sourceIssue.id),
+          ),
+        )
+        .then((rows) => coerceDate(rows[0]?.mostRecentDispatchAt)),
       db
         .select({ costCents: sql<number>`coalesce(sum(${costEvents.costCents}), 0)::int` })
         .from(costEvents)
@@ -2220,7 +2367,32 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     const activeRunCount = latestRuns.filter((run) =>
       ACTIVE_RUN_STATUSES.includes(run.status as (typeof ACTIVE_RUN_STATUSES)[number]),
     ).length;
-    const activeStartedAt = sourceIssue.startedAt ?? sourceIssue.executionLockedAt ?? null;
+    // BLO-19604: a run stuck in `queued` never reaches `startedAt`, so it must not anchor
+    // the episode. `mostRecentDispatchAt` is a direct `max(startedAt)` over every run
+    // touching this issue (queried above, not derived from the createdAt-ordered
+    // `latestRuns` sample) — that is real evidence the agent was working, unlike a
+    // queued-but-unclaimed row.
+    //
+    // BLO-22016 (BLO-18846 / run `9e49405e`, ~17.75h queued with zero tokens executed): a
+    // dispatch is only evidence for the *current* episode if it happened at or after the
+    // current checkout. But the checkout-time fallback is not simply wrong to keep in all
+    // cases — an issue that never even got a run *at all* (no monitor armed, dispatcher
+    // never acted) is exactly the "unattended episode" scenario the monitor-gating tests
+    // below (BLO-19067/BLO-21003) intentionally still want to catch as wall-clock
+    // unattended time, and a live/terminal execution holder pinned via `executionRunId`
+    // (BLO-19848) never populates `startedAt` at all — that liveness is tracked instead via
+    // `lastOutputAt`/`lastUsefulActionAt`/status and clamped below by
+    // `nonLiveExecutionHoldSince`, so it must keep anchoring on `issueEpisodeStartedAt` too.
+    // The one case that must return `null` instead of falling back to checkout time is
+    // narrower: the issue's *current* execution holder (`sourceIssue.executionRunId`,
+    // fetched below as `executionRun`) is itself still `queued` and has never started. That
+    // is real, specific evidence the system tried to dispatch and is stuck — a dispatch-lag
+    // problem (BLO-21116 et al.), not a long-active-episode problem; the
+    // `queuedUndispatchedRunCount` evidence field further down is where that gets surfaced
+    // instead of silently inflating this trigger. `elapsedMs` below already treats a null
+    // `activeStartedAt` as "no episode to measure," which withholds `long_active_duration`
+    // without touching `no_comment_streak`/`high_churn`.
+    const issueEpisodeStartedAt = sourceIssue.startedAt ?? sourceIssue.executionLockedAt ?? null;
     // BLO-19848: clamp the episode end to the last moment execution was
     // attributable to a live run, so a wedged holder cannot accrue "active"
     // time on work that already finished. See nonLiveExecutionHoldSince.
@@ -2232,6 +2404,14 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           .limit(1)
           .then((rows) => rows[0] ?? null)
       : null;
+    const currentHolderNeverDispatched = executionRun?.status === "queued" && !executionRun.startedAt;
+    const activeStartedAt =
+      mostRecentDispatchAt &&
+      (!issueEpisodeStartedAt || mostRecentDispatchAt.getTime() >= issueEpisodeStartedAt.getTime())
+        ? mostRecentDispatchAt
+        : currentHolderNeverDispatched
+          ? null
+          : issueEpisodeStartedAt;
     const nonLiveHoldSince = nonLiveExecutionHoldSince(sourceIssue, executionRun, now);
     // Clamping below activeStartedAt collapses to 0 via Math.max — i.e. a holder
     // that went non-live before the episode began contributes no active time.
@@ -2267,13 +2447,58 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       ? trailingHoldMs
       : Math.min(episodeMs, leadingParkMs + trailingHoldMs);
 
+    // BLO-23248: the portion of elapsedMs attributable to the current run
+    // sitting in a capacity-class scheduled_retry, reported as its own
+    // evidence bucket distinct from monitor-gated/unattended (BLO-22331).
+    // stalledSince clamps to the episode start so a retry chain that outlives
+    // this episode (rare, but possible across a park→dispatch→re-park cycle)
+    // cannot report more capacity-stall time than the episode actually spans.
+    const capacityRetry = currentCapacityScheduledRetry(latestRuns, now);
+    const capacityGating = capacityRetry && attributableStartAt && elapsedMs !== null
+      ? (() => {
+          const stalledSince = latestDate(capacityRetry.run.createdAt, attributableStartAt) ?? attributableStartAt;
+          const stalledMs = Math.max(0, Math.min(elapsedMs, now.getTime() - stalledSince.getTime()));
+          return {
+            stalledMs,
+            runId: capacityRetry.run.id,
+            scheduledRetryAt: capacityRetry.scheduledRetryAt,
+            retryReason: capacityRetry.run.scheduledRetryReason,
+            errorCode: capacityRetry.run.errorCode,
+            overdue: capacityRetry.overdue,
+          };
+        })()
+      : null;
+    const capacityDominant = Boolean(
+      capacityGating
+        && elapsedMs !== null
+        && elapsedMs > 0
+        && capacityGating.stalledMs / elapsedMs > CAPACITY_STALL_DOMINANT_SHARE,
+    );
+    // Only suppress while the retry is genuinely still backing off
+    // (`scheduledRetryAt` in the future). Per BLO-22331 AC, this must not
+    // become indefinite: once due passes and the run sits unpromoted, that is
+    // itself the wedged-retry-chain signal the detector should surface (see
+    // BLO-22094's overdue-scheduled-retry gauge for the fleet-level view) —
+    // so `longActive` is allowed to fire again, with the evidence block and
+    // trigger-reason qualifier below naming the capacity stall explicitly
+    // rather than leaving the primary-trigger line reading as pure assignee
+    // inactivity.
+    const capacityDominantAndDue = capacityDominant && capacityGating !== null && !capacityGating.overdue;
+
     const noComment = noCommentStreak >= thresholds.noCommentStreakRuns;
     // Reuses `noCommentStreakRuns` as the sample-size threshold: both streaks
     // ask "how many consecutive terminal runs is suspicious", just over
     // disjoint filters (turn-executing vs never-executed). A separate config
     // knob would be redundant surface for the same question.
     const runtimeFailure = runtimeFailureStreak >= thresholds.noCommentStreakRuns;
-    const longActive = elapsedMs !== null && elapsedMs >= thresholds.longActiveMs;
+    // BLO-23248: while the dominant share of the episode is capacity-stalled
+    // AND that retry is still due in the future (fleet model-provider
+    // exhaustion the assignee cannot act on), long_active_duration does not
+    // fire — mirrors how a pending monitor/approval gate suppresses this same
+    // trigger below, just folded into the boolean rather than a parallel gate
+    // object, since (like those gates) this only ever affects
+    // `long_active_duration` specifically and never the other triggers.
+    const longActive = elapsedMs !== null && elapsedMs >= thresholds.longActiveMs && !capacityDominantAndDue;
     const highChurn =
       runCountLastHour >= thresholds.highChurnHourly ||
       assigneeRunCommentCountLastHour >= thresholds.highChurnHourly ||
@@ -2287,7 +2512,16 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       triggerReasons.push(formatRuntimeFailureTriggerClaim(runtimeFailureStreak, runtimeFailureUsageBasis));
     }
     if (noComment) triggerReasons.push(`${noCommentStreak} consecutive terminal, turn-executing issue-linked runs had no run-created issue comment`);
-    if (longActive) triggerReasons.push(`current active episode has lasted ${msToHuman(elapsedMs)}`);
+    if (longActive) {
+      // BLO-23248: this only fires while capacity-dominant when the retry is
+      // *overdue* (capacityDominantAndDue already excluded the still-backing-off
+      // case above) — a stuck retry chain the assignee still cannot act on, so
+      // name the cause explicitly rather than reading as assignee inactivity.
+      const capacityNote = capacityDominant && capacityGating
+        ? ` — ${msToHuman(capacityGating.stalledMs)} of that is capacity-stalled behind an overdue \`scheduled_retry\` (run \`${capacityGating.runId}\`, due ${capacityGating.scheduledRetryAt.toISOString()}, not yet promoted); this is a fleet-capacity signal, not assignee inactivity`
+        : "";
+      triggerReasons.push(`current active episode has lasted ${msToHuman(elapsedMs)}${capacityNote}`);
+    }
     if (highChurn) {
       triggerReasons.push(
         `${runCountLastHour} runs/${assigneeRunCommentCountLastHour} assignee-run comments in 1h; ${runCountLastSixHours} runs/${assigneeRunCommentCountLastSixHours} assignee-run comments in 6h`,
@@ -2345,6 +2579,35 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       };
     }
 
+    // BLO-19604: `run.nextAction` is only populated when that specific run's own
+    // liveness classification saw the text (e.g. a comment posted after that run had
+    // already been classified is invisible to it). Before reporting "none recorded" —
+    // which reads as "the assignee left no next step" — fall back to scanning the
+    // assignee's own recent comments directly, the same way run-liveness classification
+    // would have. This is a genuine fallback, not just a relabelled null: it recovers a
+    // `Next action:`/`Next:` line the structured field missed. Sourced from
+    // `findCommentNextAction` (queried directly against `issueComments`, no join on
+    // `heartbeatRuns`) rather than `latestComments`, since a plain assignee comment with no
+    // `createdByRunId` is exactly the kind of comment this fallback exists to recover, and
+    // `latestComments`'s inner join excludes it. Keep that fallback lazy and projected: the
+    // common structured path should not transfer or parse the assignee's full comment window.
+    const structuredNextAction = latestRuns.find((run) => run.nextAction)?.nextAction ?? null;
+    const commentNextAction = structuredNextAction
+      ? null
+      : await findCommentNextAction(sourceIssue, sourceAgent, thresholds, now);
+    const nextAction = structuredNextAction ?? commentNextAction;
+
+    // BLO-19604 AC4: a run that never left `queued` no longer inflates elapsed (see
+    // `activeStartedAt` above), but silently dropping it out of the picture would leave a
+    // reviewer with no explanation for why the episode looks shorter than the issue's raw
+    // age. Surface it explicitly instead of reaping it here — reaping/re-dispatch ceilings
+    // are the dispatcher's job (BLO-21116 / BLO-19954), not this evaluator's.
+    const queuedUndispatchedRuns = latestRuns.filter((run) => run.status === "queued" && !run.startedAt);
+    const oldestQueuedUndispatchedRun = queuedUndispatchedRuns.reduce<HeartbeatRunRow | null>(
+      (oldest, run) => (!oldest || run.createdAt.getTime() < oldest.createdAt.getTime() ? run : oldest),
+      null,
+    );
+
     return {
       trigger,
       triggerReasons,
@@ -2364,6 +2627,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       elapsedMs,
       nonLiveHoldMs,
       monitorGating: monitorGatingBreakdown(sourceIssue, attributableStartAt, elapsedMs, now),
+      capacityGating,
       latestRuns: latestRuns.slice(0, 5),
       latestComments,
       costCents: costRow.costCents,
@@ -2371,7 +2635,11 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         .filter((run) => run.usageJson)
         .slice(0, 3)
         .map((run) => ({ runId: run.id, usageJson: run.usageJson ?? null })),
-      nextAction: latestRuns.find((run) => run.nextAction)?.nextAction ?? null,
+      nextAction,
+      queuedUndispatchedRunCount: queuedUndispatchedRuns.length,
+      oldestQueuedUndispatchedRunAgeMs: oldestQueuedUndispatchedRun
+        ? Math.max(0, now.getTime() - oldestQueuedUndispatchedRun.createdAt.getTime())
+        : null,
       thresholds,
       generatedAt: now,
       routineOnlySamplingWindow,
@@ -2481,9 +2749,17 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       ...(evidence.monitorGating
         ? [`- Elapsed accounting: ${formatMonitorGating(evidence.monitorGating)}`]
         : []),
+      ...(evidence.capacityGating
+        ? [`- Capacity-stall accounting: ${formatCapacityGating(evidence.capacityGating)}`]
+        : []),
       `- Runs in rolling windows: ${evidence.runCountLastHour}/1h, ${evidence.runCountLastSixHours}/6h`,
       `- Assignee run-linked comments total/window: ${evidence.commentCount} total, ${evidence.commentCountLastHour}/1h, ${evidence.commentCountLastSixHours}/6h`,
       `- Cost events total: ${evidence.costCents} cents`,
+      ...(evidence.queuedUndispatchedRunCount > 0
+        ? [
+          `- Queued, never-dispatched runs in sample: ${evidence.queuedUndispatchedRunCount} (oldest ${msToHuman(evidence.oldestQueuedUndispatchedRunAgeMs)} old) — excluded from the elapsed-time figure above; a run stuck in \`queued\` is a dispatch problem, not evidence of a long-running episode`,
+        ]
+        : []),
       `- Current next action: ${evidence.nextAction ? truncateInline(evidence.nextAction, 500) : "none recorded"}`,
       "",
       "## Thresholds",
@@ -2545,6 +2821,9 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       `- Runs/assignee comments: ${evidence.runCountLastHour}/${evidence.commentCountLastHour} in 1h, ${evidence.runCountLastSixHours}/${evidence.commentCountLastSixHours} in 6h`,
       ...(evidence.monitorGating
         ? [`- Elapsed accounting: ${formatMonitorGating(evidence.monitorGating)}`]
+        : []),
+      ...(evidence.capacityGating
+        ? [`- Capacity-stall accounting: ${formatCapacityGating(evidence.capacityGating)}`]
         : []),
       `- Next action: ${evidence.nextAction ? truncateInline(evidence.nextAction, 300) : "none recorded"}`,
     ].join("\n");
@@ -2674,20 +2953,59 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
 
         const refreshState = await getRefreshCommentState(evidence.sourceIssue.companyId, existing.id, tx);
         const lastRefreshAt = refreshState.latestCreatedAt ?? existing.createdAt;
-        if (
-          refreshState.count >= opts.thresholds.maxRefreshComments ||
-          evidence.generatedAt.getTime() - lastRefreshAt.getTime() < effectiveRefreshIntervalMs
-        ) {
+        // The hard-floor interval gates everything below, including the
+        // description rewrite — a trigger flip must not be usable to force
+        // more writes than a normal refresh already allows.
+        if (evidence.generatedAt.getTime() - lastRefreshAt.getTime() < effectiveRefreshIntervalMs) {
           return { throttled: true as const, lastRefreshAt };
         }
 
-        await addRefreshComment(
-          existing.id,
-          buildRefreshComment(evidence, opts.prefix),
-          evidence.generatedAt,
-          tx,
-        );
-        return { throttled: false as const, lastRefreshAt };
+        // BLO-22105: the Manager Decision block is trigger-conditional (see
+        // buildReviewMarkdown), so a review whose live trigger has flipped since
+        // it was created/last regenerated is showing stale — potentially
+        // under-enforcing — remedy guidance. Regenerate only on an actual flip
+        // (never on unparseable/legacy descriptions) and only inside this same
+        // throttle-gated branch, so a trigger flip cannot be used to force a
+        // description write more often than the hard-floor interval allows.
+        const previousTrigger = extractReviewTriggerFromDescription(existing.description);
+        const descriptionStale = previousTrigger !== null && previousTrigger !== evidence.trigger;
+        let descriptionRegenerated = false;
+        if (descriptionStale) {
+          // `existing.description` was read outside this transaction. The
+          // advisory lock only serializes this refresh path against itself —
+          // it says nothing about a human editing the review issue's
+          // description directly in between. Guard the overwrite with the
+          // description we actually read so a concurrent edit loses the race
+          // cleanly (0 rows matched, nothing clobbered) instead of being
+          // silently discarded.
+          const [updatedRow] = await tx
+            .update(issues)
+            .set({ description: buildReviewMarkdown(evidence, opts.prefix), updatedAt: evidence.generatedAt })
+            .where(and(eq(issues.id, existing.id), eq(issues.description, existing.description as string)))
+            .returning({ id: issues.id });
+          descriptionRegenerated = updatedRow !== undefined;
+        }
+
+        // `maxRefreshComments` bounds refresh-comment churn, not the
+        // correctness of the durable Manager Decision guidance. Gating the
+        // description rewrite on it too would mean a review that outlives the
+        // cap could never self-correct after a trigger flip — exactly the
+        // staleness this fix exists to close. Only the comment emission is
+        // capped; the interval check above still applies to both.
+        const commentCapped = refreshState.count >= opts.thresholds.maxRefreshComments;
+        if (!commentCapped) {
+          await addRefreshComment(
+            existing.id,
+            buildRefreshComment(evidence, opts.prefix),
+            evidence.generatedAt,
+            tx,
+          );
+        }
+
+        if (commentCapped && !descriptionRegenerated) {
+          return { throttled: true as const, lastRefreshAt };
+        }
+        return { throttled: false as const, lastRefreshAt, descriptionRegenerated };
       });
 
       if (refreshOutcome.throttled) {
@@ -2698,7 +3016,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
             lastRefreshAt: refreshOutcome.lastRefreshAt.toISOString(),
             minIntervalMs: effectiveRefreshIntervalMs,
           },
-          "productivity review refresh throttled: previous refresh within hard-floor window",
+          "productivity review refresh throttled: within hard-floor window or comment cap reached with no stale description to fix",
         );
         return { kind: "existing" as const, reviewIssueId: existing.id };
       }
@@ -2717,6 +3035,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           noCommentStreak: evidence.noCommentStreak,
           runCountLastHour: evidence.runCountLastHour,
           commentCountLastHour: evidence.commentCountLastHour,
+          descriptionRegenerated: refreshOutcome.descriptionRegenerated,
         },
       });
       return { kind: "updated" as const, reviewIssueId: existing.id };

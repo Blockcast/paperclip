@@ -73,6 +73,15 @@ function isStatusOnlyCheapRecoveryContext(contextSnapshot: unknown) {
     context.resumeRequiresNormalModel === true;
 }
 
+function isPlanningOnlyRecoveryContext(contextSnapshot: unknown) {
+  if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return false;
+  const context = contextSnapshot as Record<string, unknown>;
+  return context.recoveryIntent === "planning_only" &&
+    context.allowDeliverableWork === false &&
+    context.allowDocumentUpdates === true &&
+    context.resumeRequiresNormalModel === false;
+}
+
 export function approvalRoutes(
   db: Db,
   options: { pluginWorkerManager?: PluginWorkerManager } = {},
@@ -125,7 +134,9 @@ export function approvalRoutes(
       .where(eq(heartbeatRuns.id, runId))
       .then((rows) => rows[0] ?? null);
     if (!run || run.companyId !== companyId || run.agentId !== req.actor.agentId) return true;
-    if (!isStatusOnlyCheapRecoveryContext(run.contextSnapshot)) return true;
+    const statusOnly = isStatusOnlyCheapRecoveryContext(run.contextSnapshot);
+    const planningOnly = isPlanningOnlyRecoveryContext(run.contextSnapshot);
+    if (!statusOnly && !planningOnly) return true;
 
     const refuse = (error: string, extra: Record<string, unknown> = {}) => {
       res.status(403).json({
@@ -133,15 +144,21 @@ export function approvalRoutes(
         details: {
           companyId,
           runId: run.id,
-          modelProfile: "cheap",
-          recoveryIntent: "status_only",
-          resumeRequiresNormalModel: true,
-          allowedApprovalType: BOARD_ESCALATION_APPROVAL_TYPE,
+          ...(statusOnly ? {
+            modelProfile: "cheap",
+            allowedApprovalType: BOARD_ESCALATION_APPROVAL_TYPE,
+          } : {}),
+          recoveryIntent: planningOnly ? "planning_only" : "status_only",
+          resumeRequiresNormalModel: statusOnly,
           ...extra,
         },
       });
       return false;
     };
+
+    if (planningOnly) {
+      return refuse("Planning-only recovery runs cannot create or modify approvals");
+    }
 
     if (options.requestedType !== BOARD_ESCALATION_APPROVAL_TYPE) {
       return refuse(

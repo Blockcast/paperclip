@@ -1466,6 +1466,122 @@ describe.sequential("GET /api/plugins/alerts/plugin-health", () => {
     expect(res.status).toBe(403);
     expect(mockRegistry.listByStatus).not.toHaveBeenCalled();
   });
+
+  it("BLO-20957: surfaces a scheduled job with a sustained failure streak, even when the plugin worker itself is healthy", async () => {
+    mockRegistry.listByStatus.mockResolvedValue([]);
+    mockRegistry.getById.mockResolvedValue({
+      id: pluginId,
+      pluginKey: "paperclip-plugin-alertmanager",
+    });
+    const jobStore = {
+      listJobsWithFailureStreak: vi.fn().mockResolvedValue([
+        {
+          job: { id: "job-1", pluginId, jobKey: "check-alert-escalations" },
+          companyId: "company-a",
+          consecutiveFailures: 3,
+          lastError: 'Plugin is not allowed to perform "issues.list": company context is required',
+        },
+      ]),
+    };
+    const { app } = await createApp(boardActor(), {}, {
+      jobDeps: { scheduler: {}, jobStore },
+    });
+
+    const res = await request(app).get("/api/plugins/alerts/plugin-health");
+
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe("firing");
+    expect(res.body.alerts).toHaveLength(1);
+    const alert = res.body.alerts[0];
+    expect(alert.alertname).toBe("PaperclipPluginScheduledJobFailing");
+    expect(alert.severity).toBe("page");
+    expect(alert.pluginId).toBe(pluginId);
+    expect(alert.pluginKey).toBe("paperclip-plugin-alertmanager");
+    expect(alert.jobKey).toBe("check-alert-escalations");
+    expect(alert.consecutiveFailures).toBe(3);
+    expect(alert.lastError).toContain("company context is required");
+    expect(jobStore.listJobsWithFailureStreak).toHaveBeenCalledWith(3);
+  });
+
+  it("BLO-20957 review: names the failing tenant, so a responder knows which of N companies is broken", async () => {
+    mockRegistry.listByStatus.mockResolvedValue([]);
+    mockRegistry.getById.mockResolvedValue({
+      id: pluginId,
+      pluginKey: "paperclip-plugin-slack",
+    });
+    // Two tenants of the same job failing independently must produce two
+    // distinct, individually-actionable alerts — not one smeared alert.
+    const jobStore = {
+      listJobsWithFailureStreak: vi.fn().mockResolvedValue([
+        {
+          job: { id: "job-1", pluginId, jobKey: "commit-pending-approvals" },
+          companyId: "company-a",
+          consecutiveFailures: 3,
+          lastError: "company context is required",
+        },
+        {
+          job: { id: "job-1", pluginId, jobKey: "commit-pending-approvals" },
+          companyId: "company-b",
+          consecutiveFailures: 4,
+          lastError: "company context is required",
+        },
+      ]),
+    };
+    const { app } = await createApp(boardActor(), {}, {
+      jobDeps: { scheduler: {}, jobStore },
+    });
+
+    const res = await request(app).get("/api/plugins/alerts/plugin-health");
+
+    expect(res.status).toBe(200);
+    expect(res.body.alerts).toHaveLength(2);
+    expect(res.body.alerts.map((a: { companyId: string }) => a.companyId).sort()).toEqual([
+      "company-a",
+      "company-b",
+    ]);
+    // The tenant must be legible from the human-facing text too, not only
+    // from a machine field.
+    expect(res.body.alerts[0].description).toContain("company-a");
+  });
+
+  it("BLO-20957 review: labels an instance-scoped streak instead of emitting a bare null company", async () => {
+    mockRegistry.listByStatus.mockResolvedValue([]);
+    mockRegistry.getById.mockResolvedValue({
+      id: pluginId,
+      pluginKey: "paperclip-plugin-alertmanager",
+    });
+    const jobStore = {
+      listJobsWithFailureStreak: vi.fn().mockResolvedValue([
+        {
+          job: { id: "job-1", pluginId, jobKey: "check-alert-escalations" },
+          companyId: null,
+          consecutiveFailures: 3,
+          lastError: "Failed to enumerate configured companies: registry unavailable",
+        },
+      ]),
+    };
+    const { app } = await createApp(boardActor(), {}, {
+      jobDeps: { scheduler: {}, jobStore },
+    });
+
+    const res = await request(app).get("/api/plugins/alerts/plugin-health");
+
+    expect(res.status).toBe(200);
+    const alert = res.body.alerts[0];
+    expect(alert.companyId).toBeNull();
+    expect(alert.description).toContain("instance-scoped");
+  });
+
+  it("does not query job failure streaks when no job scheduling dependencies are wired", async () => {
+    mockRegistry.listByStatus.mockResolvedValue([]);
+    const { app } = await createApp(boardActor());
+
+    const res = await request(app).get("/api/plugins/alerts/plugin-health");
+
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe("ok");
+    expect(res.body.alerts).toEqual([]);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -2129,6 +2245,16 @@ describe.sequential("plugin config secret masking (BLO-20794)", () => {
 // assertions keep that decision honest, so that widening the gate has to be a
 // deliberate edit to this file rather than a silent side effect.
 describe.sequential("plugin state routes stay board-only for agent actors (BLO-22120)", () => {
+  // These assertions are all `not.toHaveBeenCalled()` on the shared hoisted
+  // `mockRegistry`, so without clearing here the block inherits whatever calls
+  // the preceding describe happened to make and fails for a reason that has
+  // nothing to do with the board-only gate it exists to protect. Every other
+  // describe in this file already does this; this one was relying on the last
+  // test before it happening to be a 403 case (BLO-20957).
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
   it("rejects an agent actor with 403 when it tries to enumerate plugin state", async () => {
     const { app } = await createApp(agentActor());
 
