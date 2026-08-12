@@ -222,8 +222,13 @@ const AMBIGUOUS_SCHEMA_NODE: SchemaNode = Object.freeze({ "x-paperclip-ambiguous
  * ({@link expandSchemaNodes}), a child by key ({@link childNodesForKey}), or a
  * child by index ({@link childNodesForIndex}). A schema-bearing keyword handled
  * at the wrong level is as good as not handled at all.
+ *
+ * Exported for the drift test: listing a keyword here asserts the walk enters
+ * it, and a keyword listed but not actually walked would be silently *ignored*
+ * rather than failing closed — the exact shape of the BLO-26530 defect. The test
+ * hides a marker behind every member and requires each one to mask.
  */
-const TRAVERSED_SCHEMA_KEYWORDS: ReadonlySet<string> = new Set([
+export const TRAVERSED_SCHEMA_KEYWORDS: ReadonlySet<string> = new Set([
   // Same instance location.
   "$ref",
   "allOf",
