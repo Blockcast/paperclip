@@ -2304,6 +2304,21 @@ function deriveRepoNameFromRepoUrl(repoUrl: string | null): string | null {
   }
 }
 
+// Join a repo-relative workspace subpath onto its realized checkout, refusing
+// anything that escapes the checkout root. `cwd` is operator-supplied config,
+// so a value like "../../../etc" must not be able to point a run outside the
+// repo it declared. See BLO-25415.
+export function resolveContainedWorkspaceSubpath(checkoutDir: string, subpath: string): string {
+  const root = path.resolve(checkoutDir);
+  const resolved = path.resolve(root, subpath);
+  if (resolved !== root && !resolved.startsWith(`${root}${path.sep}`)) {
+    throw new Error(
+      `Project workspace cwd "${subpath}" resolves outside its checkout "${root}".`,
+    );
+  }
+  return resolved;
+}
+
 async function ensureManagedProjectWorkspace(input: {
   companyId: string;
   projectId: string;
@@ -11418,14 +11433,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       for (const workspace of realizationCandidates) {
         let projectCwd = readNonEmptyString(workspace.cwd);
         let managedWorkspaceWarning: string | null = null;
-        if (!projectCwd || projectCwd === REPO_ONLY_CWD_SENTINEL) {
+        // A workspace cwd is either an absolute host path or — for a git_repo
+        // workspace — a repo-relative subdirectory such as "packages/iwa". The
+        // relative form only resolves once the repo is checked out, so realize
+        // the managed checkout first and join the subpath inside it. Without
+        // this the raw relative string reached the fs.stat() below and was
+        // resolved against the API process's own cwd, which never matches: the
+        // run then failed `preferred_workspace_unrealizable` quoting a path
+        // that looks correct, and no amount of cloning could satisfy it. See
+        // BLO-25415.
+        const repoRelativeCwd =
+          projectCwd && projectCwd !== REPO_ONLY_CWD_SENTINEL && !path.isAbsolute(projectCwd)
+            ? projectCwd
+            : null;
+        if (!projectCwd || projectCwd === REPO_ONLY_CWD_SENTINEL || repoRelativeCwd) {
           try {
             const managedWorkspace = await ensureManagedProjectWorkspace({
               companyId: agent.companyId,
               projectId: workspaceProjectId ?? resolvedProjectId ?? workspace.projectId,
               repoUrl: readNonEmptyString(workspace.repoUrl),
             });
-            projectCwd = managedWorkspace.cwd;
+            projectCwd = repoRelativeCwd
+              ? resolveContainedWorkspaceSubpath(managedWorkspace.cwd, repoRelativeCwd)
+              : managedWorkspace.cwd;
             managedWorkspaceWarning = managedWorkspace.warning;
           } catch (error) {
             if (preferredWorkspace?.id === workspace.id) {
