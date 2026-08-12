@@ -31,7 +31,9 @@ jobs:
     # Pushes publish immutable images; manual releases rebuild the approved SHA
     # so the deploy job can bind Helm to this run's recorded digest.
     if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
-    runs-on: arc-dind
+    # This job only needs a BuildKit client. Keep it off the warm-seeded DinD
+    # pool and execute the build on the persistent, Ceph-backed amd64 builders.
+    runs-on: arc-paperclip-buildkit
     timeout-minutes: 90
     concurrency:
       # A master push may supersede another publish build, but it must never
@@ -142,19 +144,43 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # BuildKit cache is local to each StatefulSet ordinal. Ephemeral ARC
+      # client IPs make Service session affinity ineffective between runs, so
+      # route each build class to a stable cache owner. The ClusterIP remains a
+      # bounded availability fallback when the preferred ordinal is unhealthy.
+      - name: Select BuildKit endpoint
+        id: buildkit-endpoint
+        env:
+          PREFERRED_ORDINAL: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${PREFERRED_ORDINAL}" =~ ^[01]$ ]]; then
+            echo "Invalid BuildKit ordinal: ${PREFERRED_ORDINAL}" >&2
+            exit 1
+          fi
+
+          probe_buildkit() {
+            local host="$1"
+            local timeout_seconds="$2"
+            timeout "${timeout_seconds}" nc -z -w "${timeout_seconds}" "${host}" 1234
+          }
+
+          preferred="buildkit-amd64-${PREFERRED_ORDINAL}.buildkit-amd64-headless.ci.svc.cluster.local"
+          fallback="buildkit-amd64.ci.svc.cluster.local"
+          host="${preferred}"
+          if ! probe_buildkit "${preferred}" 5; then
+            echo "::warning::Preferred BuildKit ${preferred} is unavailable; using the healthy service endpoint"
+            host="${fallback}"
+            probe_buildkit "${fallback}" 10
+          fi
+          echo "endpoint=tcp://${host}:1234" >> "$GITHUB_OUTPUT"
+          echo "Using BuildKit endpoint tcp://${host}:1234"
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
         with:
-          # Tear the builder down at end-of-job so a corrupt content-store
-          # blob can't survive into the next run. Commit 822ebd0 bumped
-          # buildcache v2->v3 after the same `short read: expected
-          # 29780174 bytes but got 0: unexpected EOF` symptom — that fix
-          # held until v3 itself accumulated the same bad blob and master
-          # builds started failing again with the identical byte count.
-          # The persistent docker-container builder + registry cache
-          # combination is what carries the corruption forward; an
-          # ephemeral builder per run breaks the loop.
-          cleanup: true
+          driver: remote
+          endpoint: ${{ steps.buildkit-endpoint.outputs.endpoint }}
 
       # Runtime packages and global CLIs change far less often than /app.
       # Address the base by its inputs and only build it when that exact image
@@ -218,6 +244,7 @@ jobs:
       # Tag scheme matches values.blockcast.yaml's expectation:
       #   - `sha-<7>-k8s-vendored` per-commit tag for push builds
       #   - `sha-<7>-run-<run>-<attempt>-k8s-vendored` private manual candidate
+      #   - `buildcache-<full-sha>-k8s-vendored` exact cache shared by retries
       #   - `latest-k8s-vendored` floating tag for ad-hoc pulls
       # The `-k8s-vendored` suffix marks a kkroo-fork build (vendored
       # adapter tarballs + ccrotate kkroo patch baked in via the
@@ -230,6 +257,7 @@ jobs:
             harbor.blockcast.net/paperclip/paperclip
           tags: |
             type=raw,value=${{ steps.image_tag.outputs.value }}
+            type=raw,value=buildcache-${{ steps.target.outputs.full }}-k8s-vendored
             type=raw,value=latest-k8s-vendored,enable=${{ github.ref == 'refs/heads/master' && github.event_name != 'workflow_dispatch' }}
 
       - name: Build and push
@@ -238,7 +266,10 @@ jobs:
         with:
           context: .
           platforms: linux/amd64
-          push: true
+          # Gzip level 1 cuts CPU spent materializing newly changed application
+          # layers. Keep force-compression disabled so imported cache layers
+          # retain their existing blobs instead of being recompressed.
+          outputs: type=image,push=true,compression=gzip,compression-level=1
           # Skip SBOM + provenance attestations. v6 adds them by default,
           # which makes the registry serve an OCI image index with
           # attestation-manifest entries containing very small blobs (550–750
@@ -251,14 +282,13 @@ jobs:
           sbom: false
           build-args: |
             RUNTIME_IMAGE=${{ steps.runtime.outputs.image }}
-          # Keep cache reads on Harbor, but publish current cache metadata
-          # inline with the image that this step already pushes. A separate
-          # mode=max registry exporter made deploy-critical builds wait after
-          # the image was available (run 29811211280 spent 164 s preparing the
-          # cache graph and only 16 s sending it). The frozen v6 cache remains
-          # a read-only migration fallback; latest-k8s-vendored becomes the
-          # continuously refreshed inline cache without a second exporter.
+          # Read the exact commit graph first. Manual release candidates use a
+          # run-scoped deployment tag, so without this stable cache tag a retry
+          # cannot address its earlier graph. The floating and frozen caches
+          # remain fallbacks for the first build of a commit. Cache metadata is
+          # published inline with all image tags to avoid a second exporter.
           cache-from: |
+            type=registry,ref=harbor.blockcast.net/paperclip/paperclip:buildcache-${{ steps.target.outputs.full }}-k8s-vendored
             type=registry,ref=harbor.blockcast.net/paperclip/paperclip:latest-k8s-vendored
             type=registry,ref=harbor.blockcast.net/paperclip/paperclip:buildcache-v6
           cache-to: type=inline

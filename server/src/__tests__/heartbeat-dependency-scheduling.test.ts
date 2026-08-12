@@ -1042,7 +1042,7 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
         id: blockedIssueId,
         companyId,
         title: "QA validation",
-        status: "blocked",
+        status: "in_progress",
         priority: "medium",
         assigneeAgentId: agentId,
         responsibleUserId: "responsible-user",
@@ -1124,9 +1124,11 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     await db
       .update(issues)
       .set({
+        checkoutRunId: blockedRunId,
         executionRunId: blockedRunId,
         executionAgentNameKey: "qa-checker",
         executionLockedAt: new Date(),
+        checkoutRestoreStatus: "todo",
       })
       .where(eq(issues.id, blockedIssueId));
 
@@ -1162,9 +1164,12 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
         .then((rows) => rows[0] ?? null),
       db
         .select({
+          status: issues.status,
+          checkoutRunId: issues.checkoutRunId,
           executionRunId: issues.executionRunId,
           executionAgentNameKey: issues.executionAgentNameKey,
           executionLockedAt: issues.executionLockedAt,
+          checkoutRestoreStatus: issues.checkoutRestoreStatus,
         })
         .from(issues)
         .where(eq(issues.id, blockedIssueId))
@@ -1183,9 +1188,12 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     expect(blockedWakeup?.status).toBe("skipped");
     expect(blockedWakeup?.error).toContain("dependencies are still blocked");
     expect(blockedIssue).toMatchObject({
+      status: "todo",
+      checkoutRunId: null,
       executionRunId: null,
       executionAgentNameKey: null,
       executionLockedAt: null,
+      checkoutRestoreStatus: null,
     });
     expect(readyRun?.status).toBe("succeeded");
     // The cancelled blocked run must not have reached the adapter; the

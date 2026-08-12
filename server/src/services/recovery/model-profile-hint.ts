@@ -1,12 +1,19 @@
 export const RECOVERY_MODEL_PROFILE_KEY = "cheap" as const;
 
-export type RecoveryModelProfileWorkClass = "status_only" | "normal_model";
+export type RecoveryModelProfileWorkClass = "status_only" | "planning_only" | "normal_model";
 
 export const STATUS_ONLY_RECOVERY_GUARD_CONTEXT = {
   recoveryIntent: "status_only",
   allowDeliverableWork: false,
   allowDocumentUpdates: false,
   resumeRequiresNormalModel: true,
+} as const;
+
+export const PLANNING_ONLY_RECOVERY_GUARD_CONTEXT = {
+  recoveryIntent: "planning_only",
+  allowDeliverableWork: false,
+  allowDocumentUpdates: true,
+  resumeRequiresNormalModel: false,
 } as const;
 
 const RECOVERY_MODEL_PROFILE_HINT_KEYS = [
@@ -37,6 +44,10 @@ export function withRecoveryModelProfileHint<T extends Record<string, unknown>>(
 ): WithoutRecoveryModelProfileHints<T>;
 export function withRecoveryModelProfileHint<T extends Record<string, unknown>>(
   input: T,
+  workClass: "planning_only",
+): WithoutRecoveryModelProfileHints<T> & typeof PLANNING_ONLY_RECOVERY_GUARD_CONTEXT;
+export function withRecoveryModelProfileHint<T extends Record<string, unknown>>(
+  input: T,
   workClass: "status_only",
 ): WithoutRecoveryModelProfileHints<T> & typeof STATUS_ONLY_RECOVERY_GUARD_CONTEXT & {
   modelProfile: typeof RECOVERY_MODEL_PROFILE_KEY;
@@ -46,11 +57,19 @@ export function withRecoveryModelProfileHint<T extends Record<string, unknown>>(
   workClass: RecoveryModelProfileWorkClass,
 ):
   | WithoutRecoveryModelProfileHints<T>
+  | (WithoutRecoveryModelProfileHints<T> & typeof PLANNING_ONLY_RECOVERY_GUARD_CONTEXT)
   | (WithoutRecoveryModelProfileHints<T> & typeof STATUS_ONLY_RECOVERY_GUARD_CONTEXT & {
     modelProfile: typeof RECOVERY_MODEL_PROFILE_KEY;
   }) {
   if (workClass === "normal_model") {
     return scrubRecoveryModelProfileHints(input);
+  }
+
+  if (workClass === "planning_only") {
+    return {
+      ...scrubRecoveryModelProfileHints(input),
+      ...PLANNING_ONLY_RECOVERY_GUARD_CONTEXT,
+    };
   }
 
   return {

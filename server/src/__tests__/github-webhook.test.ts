@@ -19,7 +19,7 @@ import {
   issueRecoveryActions,
   issues,
 } from "@paperclipai/db";
-import { and, eq, inArray, sql } from "drizzle-orm";
+import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 import {
   __test_backLinkAbsoluteUrl,
   __test_buildDependabotAlertIssueBody,
@@ -688,6 +688,7 @@ describe("github-webhook pure helpers", () => {
       commentId: 7001,
       commentAuthorLogin: "allyblockcast[bot]",
       commentUrl: "https://github.com/Blockcast/onprem-k8s/pull/1659#issuecomment-7001",
+      reason: "missing_marker",
     });
 
     // With the marker it is a real request, so there is nothing to report.
@@ -725,6 +726,80 @@ describe("github-webhook pure helpers", () => {
     const human = resolve("@ally please review the RBAC scoping", "kkroo");
     expect(human.context).toMatchObject({ wakeReason: "github_pr_review_requested" });
     expect(human.suppressed).toHaveLength(0);
+  });
+
+  it("reports a marker-prefixed agent request disqualified by an incidental heading match (BLO-21618)", () => {
+    // The second invisible drop this file had: a genuine marker-prefixed agent
+    // request (marker + mention, exactly what BLO-18865 exists to recognize)
+    // whose body ALSO contains a standalone line matching the Ally
+    // consolidated-review heading -- e.g. quoting a prior review while asking
+    // for a fresh pass. `agentReviewRequest`'s heading exclusion (load-bearing
+    // for keeping the #583 loop closed on Ally's own output) disqualifies it,
+    // and until now the original suppression report ALSO excluded
+    // heading-bearing bodies, so this case left zero trace: no wake, no log,
+    // no counter. Observed as the root-cause candidate investigated for
+    // Blockcast/paperclip#993 (BLO-21618) before that PR's own request bodies
+    // were confirmed clean of this pattern.
+    const resolve = (body: string) => {
+      const suppressed: { reason: string }[] = [];
+      const context = __test_resolveEventContext(
+        "issue_comment",
+        {
+          action: "created",
+          issue: {
+            number: 993,
+            title: "BLO-21309 recovery-stale-issue-lock-sweep basis swap",
+            pull_request: { url: "https://api.github.com/repos/Blockcast/paperclip/pulls/993" },
+          },
+          comment: {
+            id: 5170314705,
+            body,
+            user: { login: "allyblockcast[bot]" },
+            html_url: "https://github.com/Blockcast/paperclip/pull/993#issuecomment-5170314705",
+          },
+          repository: { full_name: "Blockcast/paperclip" },
+        },
+        {
+          prReviewerBotLogin: "allyblockcast[bot]",
+          onSuppressedReviewRequest: (info) => suppressed.push(info as { reason: string }),
+        },
+      );
+      return { context, suppressed };
+    };
+
+    // Marker + mention + an incidental heading-shaped line quoting the prior
+    // review: disqualified, but now reported with its own distinguishable
+    // reason instead of vanishing.
+    const disqualified = resolve(
+      "<!-- paperclip:review-request -->\n@ally re-review at head 1620f3a.\n\n" +
+        "For context, your last pass here:\n## Ally — Consolidated PR Review\nsaid the lock basis was fine.",
+    );
+    expect(disqualified.context).toBeNull();
+    expect(disqualified.suppressed).toHaveLength(1);
+    expect(disqualified.suppressed[0]).toMatchObject({
+      repoFullName: "Blockcast/paperclip",
+      prNumber: 993,
+      commentId: 5170314705,
+      commentAuthorLogin: "allyblockcast[bot]",
+      reason: "marker_disqualified_by_heading",
+    });
+
+    // Same marker and mention, no heading collision: an ordinary honoured
+    // request, nothing to report. (This is the actual shape of #993's two
+    // real review-request comments.)
+    const clean = resolve(
+      "<!-- paperclip:review-request -->\n@ally please review at head df19e7b — BLO-21309.\n\n" +
+        "Focus on the one judgement call: this inverts a deliberate, tested behavior.",
+    );
+    expect(clean.context).toMatchObject({ wakeReason: "github_pr_review_requested" });
+    expect(clean.suppressed).toHaveLength(0);
+
+    // Ally's own routine output is never marker-prefixed (the marker must be
+    // the literal first byte; Ally's output opens with the heading instead),
+    // so the new branch cannot fire on a genuine self-echo.
+    const selfEcho = resolve("## Ally — Consolidated PR Review\n\nNo blocking findings.");
+    expect(selfEcho.context).toBeNull();
+    expect(selfEcho.suppressed).toHaveLength(0);
   });
 
   it("keeps the #583 self-refire loop closed: a quoted or reviewer-output marker is not a request (BLO-18865)", () => {
@@ -4103,6 +4178,117 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(receipts[0]!.body).toContain("Action: `fixed`");
     expect(receipts[0]!.body).toContain("GitHub delivery: `delivery-fixed`");
     expect(receipts[0]!.body).toContain("no Dependabot REST or GraphQL query was used");
+  });
+
+  it("dedupes terminal delivery replays against legacy metadata-key receipts", async () => {
+    const { agentId } = await seedCompanyAndAgent({ agentName: "Release Engineer" });
+    const app = buildApp({ dependabotAgentId: agentId });
+
+    await postDependabot(app, dependabotPayload("critical", "created"), "delivery-created");
+
+    const [issue] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.originId, "github-dependabot:Blockcast/paperclip#58"));
+    expect(issue?.status).toBe("todo");
+
+    const externalKey = "github-dependabot:Blockcast/paperclip#58:fixed:delivery-fixed";
+    await db.insert(issueComments).values({
+      companyId: issue!.companyId,
+      issueId: issue!.id,
+      authorType: "system",
+      idempotencyKey: null,
+      body: "legacy terminal receipt",
+      metadata: {
+        kind: "github_dependabot_terminal_receipt",
+        source: "github",
+        externalKey,
+        repoFullName: "Blockcast/paperclip",
+        alertNumber: 58,
+        action: "fixed",
+        deliveryId: "delivery-fixed",
+      } as never,
+    });
+
+    const terminal = await postDependabot(app, dependabotPayload("critical", "fixed"), "delivery-fixed");
+    expect(terminal.status).toBe(200);
+
+    const [closedIssue] = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, issue!.id));
+    expect(closedIssue?.status).toBe("done");
+
+    const receipts = await db
+      .select({
+        body: issueComments.body,
+        idempotencyKey: issueComments.idempotencyKey,
+      })
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.issueId, issue!.id),
+          isNull(issueComments.deletedAt),
+          sql`${issueComments.metadata}->>'kind' = 'github_dependabot_terminal_receipt'`,
+        ),
+      );
+    expect(receipts).toEqual([
+      {
+        body: "legacy terminal receipt",
+        idempotencyKey: null,
+      },
+    ]);
+  });
+
+  // BLO-19037: the receipt dedup guard was a read-then-insert -- two
+  // concurrent deliveries of the same event both observe "no existing
+  // receipt" before either writes, so both write. A *sequential* replay (the
+  // "records a terminal webhook receipt" test above, and the orphan-issue
+  // test below) does not exercise that window: each request's INSERT
+  // completes and commits before the next request runs its SELECT. Firing
+  // both requests through `Promise.all` interleaves them at the same await
+  // boundaries a second paperclip-api replica would race across.
+  it("dedupes concurrent replays of the same terminal delivery to a single receipt comment", async () => {
+    const { agentId } = await seedCompanyAndAgent({ agentName: "Release Engineer" });
+    const app = buildApp({ dependabotAgentId: agentId });
+
+    await postDependabot(app, dependabotPayload("critical", "created"), "delivery-created");
+
+    // Warm the connection pool to >=2 physical connections before racing.
+    // Every prior test in this suite runs its queries sequentially, so by
+    // this point the pool has settled on exactly one warm connection; firing
+    // only two concurrent requests here would let the first reuse that warm
+    // connection while the second cold-establishes a brand new one (tens of
+    // ms on embedded Postgres), which is slow enough that the first request
+    // always finishes before the second even starts its query -- masking the
+    // race instead of exercising it.
+    await Promise.all(Array.from({ length: 4 }, () => db.execute(sql`select 1`)));
+
+    const terminalPayload = dependabotPayload("critical", "fixed");
+    const [first, second] = await Promise.all([
+      postDependabot(app, terminalPayload, "delivery-fixed-concurrent"),
+      postDependabot(app, terminalPayload, "delivery-fixed-concurrent"),
+    ]);
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+
+    const [issue] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.originId, "github-dependabot:Blockcast/paperclip#58"));
+    expect(issue?.status).toBe("done");
+
+    const receipts = await db
+      .select()
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.issueId, issue!.id),
+          sql`${issueComments.metadata}->>'kind' = 'github_dependabot_terminal_receipt'`,
+        ),
+      );
+    expect(receipts).toHaveLength(1);
+    expect(receipts[0]!.body).toContain("GitHub delivery: `delivery-fixed-concurrent`");
   });
 
   it("records dismissal evidence before closing a Dependabot alert issue", async () => {

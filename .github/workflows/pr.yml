@@ -9,20 +9,22 @@ on:
       - checks_requested
 
 concurrency:
-  group: pr-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.run_id }}
+  # Pull requests are stable by number. A merge-group head SHA changes every
+  # time GitHub re-stages the queue, so key the sole active build for each
+  # merge-queue base branch instead. The repository merge queue is configured
+  # with maximumEntriesToBuild=1; a newer generation must replace the old one.
+  group: pr-${{ github.event.pull_request.number || github.event.merge_group.base_ref || github.run_id }}
   cancel-in-progress: true
 
 env:
-  SCCACHE_GHA_ENABLED: "true"
-  RUSTC_WRAPPER: sccache
-  CC: "sccache gcc"
-  CXX: "sccache g++"
   PR_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
   PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
 
 jobs:
   policy:
-    runs-on: arc-light
+    # A merge-group is the sole landing candidate and must not wait behind the
+    # pull-request review backlog that saturates arc-light.
+    runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-light' }}
     timeout-minutes: 5
     outputs:
       lockfile_regenerated: ${{ steps.regen_lockfile.outputs.regenerated }}
@@ -80,11 +82,43 @@ jobs:
       - name: Validate Docker deploy timeout margin
         run: node --test ./scripts/check-docker-deploy-timeout.test.js
 
+      - name: Test CI cache and Docker runner routing
+        run: node --test ./scripts/__tests__/ci-cache-routing.test.mjs
+
+      - name: Test merge-group concurrency key
+        run: node --test ./scripts/__tests__/merge-group-concurrency.test.mjs
+
       - name: Reject git push in adapter/runtime code
         run: node ./scripts/check-no-git-push.mjs
 
       - name: Test no-git-push check
         run: node --test ./scripts/check-no-git-push.test.mjs
+
+      - name: Reject App-attributed commits on the PR (BLO-21416)
+        # Non-merge commits stamped with the shared allyblockcast[bot] App
+        # identity mean the commit was created via the GitHub REST/MCP write
+        # path (contents API, merge API, `create_or_update_file`/
+        # `push_files`) instead of `git push` — see AGENTS.md §9. Uses the
+        # already-checked-out history (fetch-depth: 0 above), no new token.
+        #
+        # There is deliberately NO branch exemption. The graphify-reindex bot
+        # commits via `git push` under its own git identity
+        # (`allyblockcast[bot]@users.noreply.github.com`), which is not the
+        # REST-path stamp this gate matches
+        # (`290875700+allyblockcast[bot]@users.noreply.github.com`) — measured
+        # by running this script over the real graphify PRs #789 and #944:
+        # both pass. A `github.head_ref`-keyed exemption was therefore
+        # protecting against a rejection that never happens, while being both
+        # a fork bypass (any fork can name its branch `bot/graphify-reindex`,
+        # and `head_ref` carries no repository identity) and a merge-queue
+        # false-reject (`head_ref` is empty in `merge_group`). Pinned by the
+        # graphify-identity case in check-commit-author-attribution.test.mjs —
+        # if that test starts failing, the bot moved onto the REST write path
+        # and the right fix is to move it back, not to re-add an exemption.
+        run: node ./scripts/check-commit-author-attribution.mjs --base "$PR_BASE_SHA" --head "$PR_HEAD_SHA"
+
+      - name: Test commit-author-attribution check
+        run: node --test ./scripts/check-commit-author-attribution.test.mjs
 
       - name: Test gh token wrapper
         run: node --test ./scripts/gh-token-wrapper.test.mjs
@@ -181,11 +215,11 @@ jobs:
   # unstamped render, which is only sound while stamping perturbs nothing else.
   #
   # Deliberately its own job rather than a step in `policy`: it needs helm and
-  # kubectl, and a tooling regression in provisioning those should not take down
-  # the gate that every unrelated PR depends on.
+  # the runner image's pinned yq, and a tooling regression in provisioning those
+  # should not take down the gate that every unrelated PR depends on.
   helm_chart:
     name: Helm chart
-    runs-on: arc-light
+    runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-light' }}
     timeout-minutes: 10
 
     steps:
@@ -199,12 +233,6 @@ jobs:
 
       - name: Install helm
         uses: azure/setup-helm@v4
-
-      # Only ever invoked as `kubectl create --dry-run=client -o json`, i.e. as
-      # an offline YAML reader so the render comparisons are structural rather
-      # than textual. No cluster credential is used or needed.
-      - name: Install kubectl
-        uses: azure/setup-kubectl@v4
 
       - name: Test Helm chart renders
         run: node --test ./deploy/helm/paperclip/tests/*.test.mjs
@@ -234,6 +262,7 @@ jobs:
           version: 9.15.4
 
       - name: Restore regenerated PR lockfile (if policy uploaded one)
+        if: needs.policy.outputs.lockfile_regenerated == '1'
         uses: actions/download-artifact@v4
         continue-on-error: true
         with:
@@ -245,9 +274,6 @@ jobs:
         with:
           node-version: 24
           cache: pnpm
-
-      - name: Set up GHA-backed sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -286,6 +312,7 @@ jobs:
           version: 9.15.4
 
       - name: Restore regenerated PR lockfile (if policy uploaded one)
+        if: needs.policy.outputs.lockfile_regenerated == '1'
         uses: actions/download-artifact@v4
         continue-on-error: true
         with:
@@ -381,6 +408,64 @@ jobs:
       - name: Replay framed and malformed Responses streams
         run: node scripts/smoke/opencode-responses-replay.mjs
 
+  opencode_k8s_seed_cold_start:
+    name: k8s-ro seed transport cold start
+    needs: [policy]
+    # BLO-23422: the general-server shard already runs this suite once. This lane
+    # exists to prove the cold-start property specifically — OpenCode migrates its
+    # SQLite store once per state home, and the suite creates a fresh one per run,
+    # so each iteration below is a genuine cold start rather than a warmed repeat.
+    runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-paperclip-general' }}
+    # Must cover the suite's own worst case, not the observed ~25s: each iteration
+    # allows 270s for the beforeAll migration (MIGRATION_TIMEOUT_MS + 30s) plus 150s
+    # for the test (TEST_TIMEOUT_MS), so three iterations can reach 21 minutes before
+    # checkout, setup, and install. A 20-minute cap would have GitHub kill the job in
+    # precisely the slow-cold-migration case this lane exists to catch, discarding the
+    # diagnostics the watchdog is meant to preserve. Keep this above 3 * (270s + 150s)
+    # plus setup margin if either budget in the suite changes.
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 9.15.4
+
+      - name: Restore regenerated PR lockfile (if policy uploaded one)
+        if: needs.policy.outputs.lockfile_regenerated == '1'
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: pr-lockfile
+          path: .
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Match the sibling test lanes, which reach vitest through `pnpm test:run:*`
+      # and so always relink stale workspace packages first. This lane invokes
+      # vitest directly, so it has to run the preflight itself.
+      - name: Ensure workspace package links
+        run: pnpm run preflight:workspace-links
+
+      - name: Run the focused regression three times from a clean OpenCode home
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            echo "::group::k8s-ro seed transport cold start ${attempt}/3"
+            pnpm vitest run server/src/__tests__/opencode-k8s-seed-transport.test.ts
+            echo "::endgroup::"
+          done
+
   general_tests:
     name: General tests (${{ matrix.group_label }})
     needs: [policy]
@@ -436,6 +521,7 @@ jobs:
           version: 9.15.4
 
       - name: Restore regenerated PR lockfile (if policy uploaded one)
+        if: needs.policy.outputs.lockfile_regenerated == '1'
         uses: actions/download-artifact@v4
         continue-on-error: true
         with:
@@ -447,9 +533,6 @@ jobs:
         with:
           node-version: 24
           cache: pnpm
-
-      - name: Set up GHA-backed sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -541,7 +624,7 @@ jobs:
     # Serialized server suites run inside the four general-server matrix jobs,
     # so general_tests remains the required aggregate for both test families.
     name: verify
-    if: ${{ always() }}
+    if: ${{ always() && !cancelled() }}
     needs:
       [
         helm_chart,
@@ -549,10 +632,11 @@ jobs:
         general_tests,
         worktree_install,
         opencode_responses_replay,
+        opencode_k8s_seed_cold_start,
         build,
         vendor_claude_k8s,
       ]
-    runs-on: arc-light
+    runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-light' }}
     timeout-minutes: 5
 
     steps:
@@ -583,6 +667,7 @@ jobs:
           GENERAL_TESTS_RESULT: ${{ needs.general_tests.result }}
           WORKTREE_INSTALL_RESULT: ${{ needs.worktree_install.result }}
           OPENCODE_RESPONSES_REPLAY_RESULT: ${{ needs.opencode_responses_replay.result }}
+          OPENCODE_K8S_SEED_COLD_START_RESULT: ${{ needs.opencode_k8s_seed_cold_start.result }}
           BUILD_RESULT: ${{ needs.build.result }}
           VENDOR_CLAUDE_K8S_RESULT: ${{ needs.vendor_claude_k8s.result }}
         run: |
@@ -592,6 +677,7 @@ jobs:
             general_tests
             worktree_install
             opencode_responses_replay
+            opencode_k8s_seed_cold_start
             build
             vendor_claude_k8s
           )
@@ -601,6 +687,7 @@ jobs:
             "$GENERAL_TESTS_RESULT"
             "$WORKTREE_INSTALL_RESULT"
             "$OPENCODE_RESPONSES_REPLAY_RESULT"
+            "$OPENCODE_K8S_SEED_COLD_START_RESULT"
             "$BUILD_RESULT"
             "$VENDOR_CLAUDE_K8S_RESULT"
           )
@@ -658,6 +745,7 @@ jobs:
           version: 9.15.4
 
       - name: Restore regenerated PR lockfile (if policy uploaded one)
+        if: needs.policy.outputs.lockfile_regenerated == '1'
         uses: actions/download-artifact@v4
         continue-on-error: true
         with:
@@ -669,9 +757,6 @@ jobs:
         with:
           node-version: 24
           cache: pnpm
-
-      - name: Set up GHA-backed sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -700,6 +785,7 @@ jobs:
           version: 9.15.4
 
       - name: Restore regenerated PR lockfile (if policy uploaded one)
+        if: needs.policy.outputs.lockfile_regenerated == '1'
         uses: actions/download-artifact@v4
         continue-on-error: true
         with:
@@ -711,9 +797,6 @@ jobs:
         with:
           node-version: 24
           cache: pnpm
-
-      - name: Set up GHA-backed sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -744,12 +827,12 @@ jobs:
 
   e2e:
     needs: [policy]
-    # Keep the long browser suite off the org-wide default pool so PR bursts
-    # cannot hold shared capacity for the full e2e runtime.
-    runs-on: arc-e2e
+    # Keep PR browser suites off the org-wide default pool. Merge groups use
+    # the queue's reserved capacity so unrelated repos cannot delay admission.
+    runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-e2e' }}
     # The serial browser suite now covers 43 flows and remained active through
     # test 42 when ARC enforced the previous 30-minute job ceiling.
-    timeout-minutes: 60
+    timeout-minutes: 75
 
     steps:
       - name: Checkout repository
@@ -761,6 +844,7 @@ jobs:
           version: 9.15.4
 
       - name: Restore regenerated PR lockfile (if policy uploaded one)
+        if: needs.policy.outputs.lockfile_regenerated == '1'
         uses: actions/download-artifact@v4
         continue-on-error: true
         with:
@@ -772,9 +856,6 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
-
-      - name: Set up GHA-backed sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile

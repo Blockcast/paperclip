@@ -613,6 +613,14 @@ function resolveEventContext(
       commentId: number | null;
       commentAuthorLogin: string | null;
       commentUrl: string | null;
+      // BLO-21618: two distinct drops share this callback. "missing_marker" is
+      // the original BLO-18273 case (bare alias, no marker at all).
+      // "marker_disqualified_by_heading" is a marker-bearing agent request
+      // whose body ALSO happens to contain a standalone Ally-consolidated-
+      // review-heading line (see hasAllyConsolidatedReviewHeading) — the same
+      // exclusion that correctly silences Ally's own review echoes also
+      // silences this genuine request, and until now did so with zero trace.
+      reason: "missing_marker" | "marker_disqualified_by_heading";
     }) => void;
   } = {},
 ): ResolvedEventContext | null {
@@ -795,20 +803,52 @@ function resolveEventContext(
       // for why the bare alias (and not the general mention pattern) is the
       // discriminator: the general one also matches the commitperclip gate's
       // `@allyblockcast[bot]` nudge, whose suppression is correct.
-      if (
-        !reviewerRequest &&
-        !reviewFeedback &&
+      // BLO-21618: a SECOND invisible drop, sitting right next to the one
+      // above. `agentReviewRequest` requires `!hasAllyConsolidatedReviewHeading`
+      // so Ally's own posted reviews (which legitimately carry both the bare
+      // alias AND the heading) never re-arm the #583 loop — see the guard
+      // comment on `agentReviewRequest`. But that same exclusion also disarms
+      // a genuine marker-prefixed agent request whose body happens to contain
+      // a standalone heading-shaped line (e.g. quoting/describing a prior
+      // Ally review while asking for a fresh pass). That request had the
+      // marker AND the mention — everything the marker path exists to
+      // recognize — and still fell out of here as silent `null`, because the
+      // ORIGINAL suppression report (below) deliberately excludes
+      // heading-bearing bodies too (to avoid reporting Ally's routine, marker-
+      // less reviews as "suppressed requests"). Marker presence is the
+      // discriminator that makes the two cases distinguishable: Ally's own
+      // output is never marker-prefixed (the marker must be the literal first
+      // byte, and Ally's output opens with the heading), so gating on the
+      // marker here cannot fire on a genuine self-echo.
+      const markerRequestDisqualifiedByHeading =
         commentAuthorIsReviewerBot &&
-        hasPrReviewerBareAliasMention(commentBody) &&
-        !hasAllyConsolidatedReviewHeading(commentBody)
-      ) {
-        options.onSuppressedReviewRequest?.({
-          repoFullName,
-          prNumber: (issue.number as number | undefined) ?? null,
-          commentId: (comment?.id as number | undefined) ?? null,
-          commentAuthorLogin,
-          commentUrl: readStringField(comment, "html_url"),
-        });
+        hasPrReviewerAgentRequestMarker(commentBody) &&
+        hasAllyConsolidatedReviewHeading(commentBody) &&
+        hasPrReviewerRequestMention(commentBody);
+      if (!reviewerRequest && !reviewFeedback) {
+        if (
+          commentAuthorIsReviewerBot &&
+          hasPrReviewerBareAliasMention(commentBody) &&
+          !hasAllyConsolidatedReviewHeading(commentBody)
+        ) {
+          options.onSuppressedReviewRequest?.({
+            repoFullName,
+            prNumber: (issue.number as number | undefined) ?? null,
+            commentId: (comment?.id as number | undefined) ?? null,
+            commentAuthorLogin,
+            commentUrl: readStringField(comment, "html_url"),
+            reason: "missing_marker",
+          });
+        } else if (markerRequestDisqualifiedByHeading) {
+          options.onSuppressedReviewRequest?.({
+            repoFullName,
+            prNumber: (issue.number as number | undefined) ?? null,
+            commentId: (comment?.id as number | undefined) ?? null,
+            commentAuthorLogin,
+            commentUrl: readStringField(comment, "html_url"),
+            reason: "marker_disqualified_by_heading",
+          });
+        }
       }
       if (!reviewerRequest && !reviewFeedback) return null;
       // BLO-9293: on a PR's issue_comment payload, `issue.user.login` is the PR
@@ -1249,37 +1289,58 @@ async function recordDependabotTerminalReceipt(
   }
 
   const externalKey = `${input.originId}:${input.alert.action}:${input.deliveryId ?? "no-delivery"}`;
-  const existingReceipt = await db
+  // BLO-19037: this used to be a read-then-insert (SELECT for an existing
+  // receipt, then INSERT if none was found) which is a check-then-write race
+  // across paperclip-api's replicas -- two concurrent deliveries of the same
+  // event can both observe "no existing receipt" before either writes.
+  // idempotencyKey rides the already-deployed partial unique index
+  // (issue_comments_issue_system_idempotency_idx on issueId+idempotencyKey,
+  // scoped to system comments) so the insert is a single atomic upsert:
+  // ON CONFLICT DO NOTHING makes the external key authoritative in the
+  // database rather than in application logic, independent of replica count.
+  //
+  // BLO-19037 review follow-up: the migration that introduced
+  // idempotency_key left historical receipt comments nullable. Those rows
+  // still carry metadata.externalKey, so preserve one metadata-key lookup
+  // before the atomic insert or the first replay after deploy creates a
+  // duplicate that the partial unique index cannot see.
+  const legacyReceipt = await db
     .select({ id: issueComments.id })
     .from(issueComments)
-    .where(
-      and(
-        eq(issueComments.issueId, issue.id),
-        sql`${issueComments.metadata}->>'kind' = 'github_dependabot_terminal_receipt'`,
-        sql`${issueComments.metadata}->>'externalKey' = ${externalKey}`,
-      ),
-    )
+    .where(and(
+      eq(issueComments.companyId, input.companyId),
+      eq(issueComments.issueId, issue.id),
+      eq(issueComments.authorType, "system"),
+      isNull(issueComments.idempotencyKey),
+      isNull(issueComments.deletedAt),
+      sql`${issueComments.metadata}->>'kind' = 'github_dependabot_terminal_receipt'`,
+      sql`${issueComments.metadata}->>'externalKey' = ${externalKey}`,
+    ))
     .limit(1)
     .then((rows) => rows[0] ?? null);
 
-  if (!existingReceipt) {
-    await db.insert(issueComments).values({
-      companyId: input.companyId,
-      issueId: issue.id,
-      authorType: "system",
-      body: receiptBody,
-      metadata: {
-        kind: "github_dependabot_terminal_receipt",
-        source: "github",
-        externalKey,
-        repoFullName: input.repoFullName,
-        alertNumber: input.alert.alertNumber,
-        action: input.alert.action,
-        deliveryId: input.deliveryId,
-        dismissalReason: input.alert.dismissalReason,
-        dismissalComment: input.alert.dismissalComment,
-      } as never,
-    });
+  if (!legacyReceipt) {
+    await db
+      .insert(issueComments)
+      .values({
+        companyId: input.companyId,
+        issueId: issue.id,
+        authorType: "system",
+        idempotencyKey: externalKey,
+        body: receiptBody,
+        metadata: {
+          kind: "github_dependabot_terminal_receipt",
+          source: "github",
+          externalKey,
+          repoFullName: input.repoFullName,
+          alertNumber: input.alert.alertNumber,
+          action: input.alert.action,
+          deliveryId: input.deliveryId,
+          dismissalReason: input.alert.dismissalReason,
+          dismissalComment: input.alert.dismissalComment,
+        } as never,
+      })
+      .onConflictDoNothing();
   }
 
   if (hasCompleteTerminalEvidence && issue.status !== "done") {
@@ -1973,11 +2034,21 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
     const payload = (req.body ?? {}) as Record<string, unknown>;
     const context = resolveEventContext(eventName, payload, {
       prReviewerBotLogin: config.prReviewerBotLogin,
-      // BLO-18273: surface the one silent drop in this handler. An agent that
-      // asks for review without the `<!-- paperclip:review-request -->` marker
-      // gets no wake and no error; this is the only trace it ever leaves, so
-      // it names the fix in the message rather than just the symptom.
+      // BLO-18273/BLO-21618: surface both silent drops in this handler — an
+      // agent request missing the marker, and a marker-bearing agent request
+      // disqualified by an incidental heading match (see the two reasons on
+      // `onSuppressedReviewRequest`). Neither produces a wake or an error
+      // otherwise; this callback is the only trace either ever leaves.
       onSuppressedReviewRequest: (info) => {
+        const message =
+          info.reason === "marker_disqualified_by_heading"
+            ? "github webhook reviewer wake skipped: @ally request carries a valid start-of-body " +
+              "<!-- paperclip:review-request --> marker, but its body also contains a standalone Ally " +
+              "consolidated-review heading, so the self-echo guard (BLO-15799/BLO-18865) treated it as the " +
+              "reviewer's own output (BLO-21618); no review was requested"
+            : "github webhook reviewer wake skipped: @ally request authored by the reviewer bot login carries no " +
+              "start-of-body <!-- paperclip:review-request --> marker, so it is indistinguishable from the " +
+              "reviewer's own output (BLO-18865/BLO-18273); no review was requested";
         logger.warn(
           {
             event: eventName,
@@ -1987,11 +2058,12 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
             commentId: info.commentId,
             commentAuthorLogin: info.commentAuthorLogin,
             commentUrl: info.commentUrl,
-            suppressionReason: "reviewer_bot_authored_request_missing_marker",
+            suppressionReason:
+              info.reason === "marker_disqualified_by_heading"
+                ? "reviewer_bot_authored_request_disqualified_by_heading"
+                : "reviewer_bot_authored_request_missing_marker",
           },
-          "github webhook reviewer wake skipped: @ally request authored by the reviewer bot login carries no " +
-            "start-of-body <!-- paperclip:review-request --> marker, so it is indistinguishable from the " +
-            "reviewer's own output (BLO-18865/BLO-18273); no review was requested",
+          message,
         );
       },
     });

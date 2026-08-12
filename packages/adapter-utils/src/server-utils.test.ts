@@ -55,6 +55,11 @@ async function waitForTextMatch(read: () => string, pattern: RegExp, timeoutMs =
   return read().match(pattern);
 }
 
+// Loaded CI hosts may need more than one second to start a nested Node process.
+// These tests cover timeout signaling, not process-start latency.
+const PROCESS_TREE_TEST_TIMEOUT_SEC = 5;
+const PROCESS_TREE_TEST_BUDGET_MS = 15_000;
+
 describe("buildInvocationEnvForLogs", () => {
   it("redacts inline secrets from resolved command metadata", () => {
     const loggedEnv = buildInvocationEnvForLogs(
@@ -486,7 +491,7 @@ describe("runChildProcess", () => {
       {
         cwd: process.cwd(),
         env: {},
-        timeoutSec: 1,
+        timeoutSec: PROCESS_TREE_TEST_TIMEOUT_SEC,
         graceSec: 1,
         onLog: async () => {},
         onSpawn: async () => {},
@@ -498,7 +503,7 @@ describe("runChildProcess", () => {
     expect(Number.isInteger(descendantPid) && descendantPid > 0).toBe(true);
 
     expect(await waitForPidExit(descendantPid!, 2_000)).toBe(true);
-  });
+  }, PROCESS_TREE_TEST_BUDGET_MS);
 
   it.skipIf(process.platform === "win32")(
     "force-kills a child that ignores SIGTERM once the grace window elapses",
@@ -523,7 +528,7 @@ describe("runChildProcess", () => {
         {
           cwd: process.cwd(),
           env: {},
-          timeoutSec: 1,
+          timeoutSec: PROCESS_TREE_TEST_TIMEOUT_SEC,
           graceSec: 1,
           onLog: async () => {},
           onSpawn: async () => {},
@@ -536,6 +541,7 @@ describe("runChildProcess", () => {
       expect(Number.isInteger(childPid) && childPid > 0).toBe(true);
       expect(await waitForPidExit(childPid, 2_000)).toBe(true);
     },
+    PROCESS_TREE_TEST_BUDGET_MS,
   );
 
   it.skipIf(process.platform === "win32")(
@@ -930,6 +936,22 @@ describe("renderPaperclipWakePrompt", () => {
     const fallbackPrompt = renderPaperclipWakePrompt({ ...base, fallbackFetchNeeded: true });
     expect(fallbackPrompt).toContain("Only fetch the API thread");
     expect(fallbackPrompt).toContain("- fallback fetch needed: yes");
+  });
+
+  it("prohibits credential-bearing GitHub diagnostics on fresh and resumed wakes", () => {
+    const payload = {
+      reason: "issue_assigned",
+      issue: { id: "issue-1", identifier: "PAP-1581", title: "Check GitHub auth" },
+    };
+
+    for (const prompt of [
+      renderPaperclipWakePrompt(payload),
+      renderPaperclipWakePrompt(payload, { resumedSession: true }),
+    ]) {
+      expect(prompt).toContain("never run `gh auth status`");
+      expect(prompt).toContain("`gh api user --jq .login`");
+      expect(prompt).toContain("never emit credential values");
+    }
   });
 
   it("renders the execution workspace branch guard only on non-resumed sessions", () => {

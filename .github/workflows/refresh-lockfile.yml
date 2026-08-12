@@ -32,10 +32,33 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 24
-          cache: pnpm
 
       - name: Refresh pnpm lockfile
         run: pnpm install --lockfile-only --ignore-scripts --no-frozen-lockfile
+
+      - name: Resolve pnpm store cache
+        id: pnpm-cache
+        shell: bash
+        run: |
+          echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+          echo "arch=$(node -p 'process.arch')" >> "$GITHUB_OUTPUT"
+
+      - name: Restore pnpm store
+        id: pnpm-cache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ steps.pnpm-cache.outputs.path }}
+          key: node-cache-${{ runner.os }}-${{ steps.pnpm-cache.outputs.arch }}-pnpm-${{ hashFiles('pnpm-lock.yaml') }}
+
+      - name: Populate pnpm store
+        run: pnpm fetch --frozen-lockfile
+
+      - name: Save populated pnpm store
+        if: success() && steps.pnpm-cache-restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.pnpm-cache.outputs.path }}
+          key: node-cache-${{ runner.os }}-${{ steps.pnpm-cache.outputs.arch }}-pnpm-${{ hashFiles('pnpm-lock.yaml') }}
 
       - name: Fail on unexpected file changes
         run: |
@@ -93,10 +116,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # Lockfile PRs are bot-generated, policy-exempt, and carry no required
-          # checks, so merge immediately. `gh pr merge --auto` needs repo-level
-          # auto-merge, which is disabled here and 404s, leaving every refresh
-          # PR stranded for a manual merge. Merge directly; fall back to --auto
-          # only if a branch-protection rule is ever added that blocks it.
-          gh pr merge --squash --delete-branch "${{ steps.upsert-pr.outputs.pr_url }}" \
-            || gh pr merge --auto --squash --delete-branch "${{ steps.upsert-pr.outputs.pr_url }}"
+          # The merge queue owns the eventual merge and rejects --delete-branch
+          # because it is asynchronous. Keep the refresh branch: the next run
+          # deliberately force-updates it before reusing its PR.
+          gh pr merge --squash "${{ steps.upsert-pr.outputs.pr_url }}" \
+            || gh pr merge --auto --squash "${{ steps.upsert-pr.outputs.pr_url }}"
