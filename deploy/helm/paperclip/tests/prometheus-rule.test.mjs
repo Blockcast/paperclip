@@ -390,3 +390,51 @@ test("PaperclipQueuedRunStranded is agent-keyed, gauge-thresholded, and links it
   );
 });
 
+test("PaperclipRuntimeResourceReconciliationStuck pins both backlog gauges and the scheduler-down backstop (BLO-21460)", () => {
+  const rendered = renderChart(["--set", "prometheusRule.enabled=true"]);
+
+  assert.match(rendered, /alert: PaperclipRuntimeResourceReconciliationStuck/);
+  const [, expr] = rendered.match(
+    /alert: PaperclipRuntimeResourceReconciliationStuck[\s\S]*?\n\s+expr: >-?\n([\s\S]*?)\n\s+for:/,
+  ) ?? [];
+  assert.ok(expr, "runtime-resource-reconciliation-stuck alert must render an expr");
+
+  // Pin both backlog gauges. Either alone would leave the other resource
+  // type's leak silent -- the 2026-08-03 incident involved both a reservation
+  // and a lease left behind by the same cancelled runs.
+  assert.match(
+    expr,
+    /max\(paperclip_external_runtime_reservations_release_pending\) > 0/,
+    "must page on a stuck release-pending external-runtime reservation",
+  );
+  assert.match(
+    expr,
+    /max\(paperclip_environment_leases_orphaned_active\) > 0/,
+    "must page on an orphaned-active environment lease",
+  );
+
+  // The scheduler-down backstop this test exists to pin: a bare
+  // `max(metric) > 0` per series is silent for the exact failure mode the
+  // alert's own rationale names -- the scheduler crash-loops (as it did
+  // during the incident), the /metrics scrape stops, both series go ABSENT
+  // (not zero), and max() over an empty vector never fires. This paperclip
+  // chart copy regressed to that silent, pre-fix form once already (fixed
+  // alongside this test) after onprem-k8s#2119 added the backstop on review;
+  // catch a second regression here instead of relying on manual diffing
+  // against a PR in a different repo.
+  assert.match(
+    expr,
+    /absent\(paperclip_external_runtime_reservations_release_pending\)/,
+    "must page when the release-pending gauge itself goes missing (scheduler down)",
+  );
+  assert.match(
+    expr,
+    /absent\(paperclip_environment_leases_orphaned_active\)/,
+    "must page when the orphaned-lease gauge itself goes missing (scheduler down)",
+  );
+  assert.match(
+    expr,
+    /up\{job="paperclip-control-plane"\}\)\s*==\s*0/,
+    "must page directly on the control-plane scrape target going down, not only via its absent() metrics",
+  );
+});
