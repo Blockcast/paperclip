@@ -314,20 +314,33 @@ describeEmbeddedPostgres("BLO-20341 issue repo binding guard", () => {
 
   it("never fails or rolls back an issue create when the guard cannot run", async () => {
     const seed = await seedTwoProjectCompany();
-    // Drop the table the guard reads so its query throws. The create must
-    // still succeed — an advisory comment is not allowed to break creation.
-    await db.execute(sql.raw(`ALTER TABLE "project_workspaces" RENAME TO "project_workspaces_hidden"`));
+    // Fail *only* the guard's own write. Renaming a table the guard reads is
+    // not usable here: create() resolves and validates the same workspace
+    // rows (that inheritance is the defect under test), so it would break the
+    // create rather than the guard. A CHECK constraint keyed on the advisory
+    // body is surgical — nothing else inserts that text.
+    await db.execute(sql.raw(
+      `ALTER TABLE "issue_comments" ADD CONSTRAINT "blo20341_guard_probe" CHECK (body NOT LIKE '%Repo binding check%')`,
+    ));
     try {
       const child = await svc.create(seed.companyId, {
         parentId: seed.parentIssueId,
         projectId: seed.productProjectId,
+        projectWorkspaceId: seed.productWorkspaceId,
         title: "Create survives a broken guard",
         description: "Fix lives in https://github.com/Blockcast/paperclip.",
       });
       expect(child.id).toBeTruthy();
+      // The issue exists and is readable — the guard failure was swallowed.
+      const persisted = await db
+        .select({ id: issues.id })
+        .from(issues)
+        .where(eq(issues.id, child.id))
+        .then((rows) => rows[0] ?? null);
+      expect(persisted).not.toBeNull();
       expect(await guardComments(child.id)).toHaveLength(0);
     } finally {
-      await db.execute(sql.raw(`ALTER TABLE "project_workspaces_hidden" RENAME TO "project_workspaces"`));
+      await db.execute(sql.raw(`ALTER TABLE "issue_comments" DROP CONSTRAINT "blo20341_guard_probe"`));
     }
   });
 

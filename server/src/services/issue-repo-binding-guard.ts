@@ -45,7 +45,10 @@ export type ReferencedRepoResolution =
   | { kind: "no_workspace" };
 
 export type ReferencedRepo = {
+  /** Lowercased `owner/repo`. */
   slug: string;
+  /** `owner/repo` in its original casing, for display. */
+  display: string;
   key: string;
   matchedText: string;
   confidence: RepoReference["confidence"];
@@ -59,6 +62,8 @@ export type IssueRepoBindingSignal = {
    */
   kind: "bound_mismatch" | "unbound_issue";
   boundRepoSlug: string | null;
+  /** Bound `owner/repo` in its original casing, for display. */
+  boundRepoDisplay: string | null;
   boundWorkspaceName: string | null;
   boundSource: IssueRepoBindingSource | null;
   references: ReferencedRepo[];
@@ -148,6 +153,7 @@ export async function evaluateIssueRepoBinding(
     const match = workspacesByRepoKey.get(ref.key);
     return {
       slug: ref.slug,
+      display: `${ref.owner}/${ref.repo}`,
       key: ref.key,
       matchedText: ref.matchedText,
       confidence: ref.confidence,
@@ -165,6 +171,7 @@ export async function evaluateIssueRepoBinding(
   return {
     kind: bound?.identityKey ? "bound_mismatch" : "unbound_issue",
     boundRepoSlug: bound?.slug ?? null,
+    boundRepoDisplay: bound?.display ?? null,
     boundWorkspaceName: bound?.workspaceName ?? null,
     boundSource: bound?.source ?? null,
     references: resolvedReferences,
@@ -174,6 +181,7 @@ export async function evaluateIssueRepoBinding(
 type BoundRepo = {
   identityKey: string | null;
   slug: string | null;
+  display: string | null;
   workspaceName: string | null;
   source: IssueRepoBindingSource;
 };
@@ -205,6 +213,7 @@ async function resolveBoundRepo(
       return {
         identityKey: identity?.key ?? null,
         slug: identity?.slug ?? null,
+        display: identity ? `${identity.owner}/${identity.repo}` : null,
         workspaceName: row.name ?? null,
         source: "execution_workspace",
       };
@@ -218,6 +227,7 @@ async function resolveBoundRepo(
       return {
         identityKey: identity?.key ?? null,
         slug: identity?.slug ?? null,
+        display: identity ? `${identity.owner}/${identity.repo}` : null,
         workspaceName: row.workspaceName,
         source: "project_workspace",
       };
@@ -233,6 +243,7 @@ async function resolveBoundRepo(
       return {
         identityKey: identity?.key ?? null,
         slug: identity?.slug ?? null,
+        display: identity ? `${identity.owner}/${identity.repo}` : null,
         workspaceName: row.workspaceName,
         source: "project_primary",
       };
@@ -265,7 +276,7 @@ export function formatIssueRepoBindingComment(signal: IssueRepoBindingSignal): s
   } else {
     const workspace = signal.boundWorkspaceName ? ` \`${signal.boundWorkspaceName}\`` : "";
     const source = signal.boundSource ? BOUND_SOURCE_LABEL[signal.boundSource] : "workspace";
-    lines.push(`- **Bound to:** \`${signal.boundRepoSlug}\` (${source}${workspace})`);
+    lines.push(`- **Bound to:** \`${signal.boundRepoDisplay ?? signal.boundRepoSlug}\` (${source}${workspace})`);
   }
 
   for (const ref of signal.references) {
@@ -274,7 +285,7 @@ export function formatIssueRepoBindingComment(signal: IssueRepoBindingSignal): s
         ? `bound in project **${ref.resolution.projectName}**` +
           (ref.resolution.workspaceName ? ` (workspace \`${ref.resolution.workspaceName}\`)` : "")
         : "**no workspace in this company binds this repo**";
-    lines.push(`- **Description names:** \`${ref.slug}\` — ${where}`);
+    lines.push(`- **Description names:** \`${ref.display}\` — ${where}`);
   }
 
   lines.push("");
