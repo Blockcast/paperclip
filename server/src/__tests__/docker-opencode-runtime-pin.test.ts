@@ -83,6 +83,9 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
     expect(serverDockerfile).toContain("add anthropic/claude-opus-5 to the");
     expect(serverDockerfile).toContain("bound the pre-Job live-Job list to 15 seconds");
     expect(serverDockerfile).toContain("PEN-1305 permission.bash env-dump deny");
+    expect(serverDockerfile).toContain(
+      "start completion grace only after\n# the log stream exits and preserve successful finite-timeout runs",
+    );
     expect(serverDockerfile).toContain("disable opencode's turn-zero workspace");
     expect(serverDockerfile).toContain("snapshot: false");
     expect(serverDockerfile).toContain("opencode config/auth writers respect XDG_*");
@@ -130,12 +133,22 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
     expect(dockerWorkflow.match(/runs-on: arc-paperclip-buildkit/g)).toHaveLength(1);
     expect(dockerWorkflow).not.toContain("runs-on: arc-dind");
     expect(dockerWorkflow).toContain("driver: remote");
-    expect(dockerWorkflow).toContain("endpoint: tcp://buildkit-amd64.ci.svc.cluster.local:1234");
+    expect(dockerWorkflow).toContain(
+      "endpoint: ${{ steps.buildkit-endpoint.outputs.endpoint }}",
+    );
+    expect(dockerWorkflow).toContain(
+      "buildkit-amd64-${PREFERRED_ORDINAL}.buildkit-amd64-headless.ci.svc.cluster.local",
+    );
     expect(dockerWorkflow.match(/runs-on: arc-deploy/g)).toHaveLength(1);
     expect(dockerWorkflow).toContain(
       "if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}",
     );
     expect(dockerAgentWorkflow.match(/runs-on: arc-dind/g)).toHaveLength(1);
+    expect(dockerAgentWorkflow).toContain("driver: remote");
+    expect(dockerAgentWorkflow).toContain('PREFERRED_ORDINAL: "1"');
+    expect(dockerAgentWorkflow).toContain(
+      "endpoint: ${{ steps.buildkit-endpoint.outputs.endpoint }}",
+    );
     expect(dockerAgentWorkflow).not.toContain("runs-on: arc-deploy");
     expect(dockerWorkflow).not.toContain("runs-on: self-hosted");
     expect(dockerAgentWorkflow).not.toContain("runs-on: self-hosted");

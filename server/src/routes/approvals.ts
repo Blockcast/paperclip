@@ -1,6 +1,6 @@
 import { Router, type Request } from "express";
-import { eq } from "drizzle-orm";
-import { heartbeatRuns, type Db } from "@paperclipai/db";
+import { and, eq } from "drizzle-orm";
+import { heartbeatRuns, issues, type Db } from "@paperclipai/db";
 import {
   addApprovalCommentSchema,
   createApprovalSchema,
@@ -44,6 +44,25 @@ function approvalResolutionResponse<T extends { type: string; payload: Record<st
   };
 }
 
+// A status-only recovery run is barred from approval work because approvals carry expensive or
+// destructive side effects once resolved. Filing a board escalation is the one exception: the card
+// is inert until a human resolves it, and it is the only channel that reaches a human at all.
+//
+// A manager delivering the productivity-review verdict "block with an unblock owner" has to be able
+// to execute that verdict in the same run that reaches it. Without this escape the review can state
+// a gate it cannot escalate, and the natural failure mode — believing the escalation implied by the
+// verdict exists — silently reproduces the stall the review was created to catch. See BLO-23036.
+//
+// Deliberately create-only: resubmit/withdraw/comment never pass a requested type, so they stay
+// barred regardless of the target approval's type.
+const BOARD_ESCALATION_APPROVAL_TYPE = "request_board_approval";
+
+function statusOnlyEscalationSourceIssueId(contextSnapshot: unknown): string | null {
+  if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return null;
+  const sourceIssueId = (contextSnapshot as Record<string, unknown>).sourceIssueId;
+  return typeof sourceIssueId === "string" && sourceIssueId.trim() ? sourceIssueId : null;
+}
+
 function isStatusOnlyCheapRecoveryContext(contextSnapshot: unknown) {
   if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return false;
   const context = contextSnapshot as Record<string, unknown>;
@@ -52,6 +71,15 @@ function isStatusOnlyCheapRecoveryContext(contextSnapshot: unknown) {
     context.allowDeliverableWork === false &&
     context.allowDocumentUpdates === false &&
     context.resumeRequiresNormalModel === true;
+}
+
+function isPlanningOnlyRecoveryContext(contextSnapshot: unknown) {
+  if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return false;
+  const context = contextSnapshot as Record<string, unknown>;
+  return context.recoveryIntent === "planning_only" &&
+    context.allowDeliverableWork === false &&
+    context.allowDocumentUpdates === true &&
+    context.resumeRequiresNormalModel === false;
 }
 
 export function approvalRoutes(
@@ -85,7 +113,12 @@ export function approvalRoutes(
     return false;
   }
 
-  async function assertApprovalMutationAllowedByRunContext(req: Request, res: any, companyId: string) {
+  async function assertApprovalMutationAllowedByRunContext(
+    req: Request,
+    res: any,
+    companyId: string,
+    options: { requestedType?: unknown; requestedIssueIds?: unknown } = {},
+  ) {
     if (req.actor.type !== "agent") return true;
     const runId = req.actor.runId?.trim();
     if (!runId || !req.actor.agentId) return true;
@@ -101,19 +134,125 @@ export function approvalRoutes(
       .where(eq(heartbeatRuns.id, runId))
       .then((rows) => rows[0] ?? null);
     if (!run || run.companyId !== companyId || run.agentId !== req.actor.agentId) return true;
-    if (!isStatusOnlyCheapRecoveryContext(run.contextSnapshot)) return true;
+    const statusOnly = isStatusOnlyCheapRecoveryContext(run.contextSnapshot);
+    const planningOnly = isPlanningOnlyRecoveryContext(run.contextSnapshot);
+    if (!statusOnly && !planningOnly) return true;
 
-    res.status(403).json({
-      error: "Cheap status-only recovery runs cannot create or modify approvals",
-      details: {
-        companyId,
-        runId: run.id,
-        modelProfile: "cheap",
-        recoveryIntent: "status_only",
-        resumeRequiresNormalModel: true,
+    const refuse = (error: string, extra: Record<string, unknown> = {}) => {
+      res.status(403).json({
+        error,
+        details: {
+          companyId,
+          runId: run.id,
+          ...(statusOnly ? {
+            modelProfile: "cheap",
+            allowedApprovalType: BOARD_ESCALATION_APPROVAL_TYPE,
+          } : {}),
+          recoveryIntent: planningOnly ? "planning_only" : "status_only",
+          resumeRequiresNormalModel: statusOnly,
+          ...extra,
+        },
+      });
+      return false;
+    };
+
+    if (planningOnly) {
+      return refuse("Planning-only recovery runs cannot create or modify approvals");
+    }
+
+    if (options.requestedType !== BOARD_ESCALATION_APPROVAL_TYPE) {
+      return refuse(
+        "Cheap status-only recovery runs can only create `request_board_approval` approvals; " +
+        "every other approval create/modify action requires a normal-model run",
+      );
+    }
+
+    const sourceIssueId = statusOnlyEscalationSourceIssueId(run.contextSnapshot);
+    if (!sourceIssueId) {
+      return refuse(
+        "This status-only run cannot file a board escalation: its run context has no source issue",
+      );
+    }
+
+    const requestedIssueIds = Array.isArray(options.requestedIssueIds)
+      ? Array.from(new Set(options.requestedIssueIds.filter((value): value is string => typeof value === "string")))
+      : [];
+    if (!requestedIssueIds.includes(sourceIssueId)) {
+      return refuse(
+        "A status-only run must link its board escalation to the source issue from its run context",
+        { sourceIssueId },
+      );
+    }
+
+    const unrelatedIssueIds = requestedIssueIds.filter((issueId) => issueId !== sourceIssueId);
+    if (unrelatedIssueIds.length > 0) {
+      return refuse(
+        "A status-only run may only link a board escalation to its source issue",
+        { sourceIssueId, unrelatedIssueIds },
+      );
+    }
+
+    // Do not authorize from an ID alone: authorization decisions depend on the source issue's
+    // current assignee, origin, and scope. Passing a partial resource would make an assigned source
+    // look unassigned and could trigger the generic company-agent allow path. The source is looked
+    // up and authorized before the approval is created or linked.
+    const sourceIssue = await db
+      .select({
+        id: issues.id,
+        companyId: issues.companyId,
+        projectId: issues.projectId,
+        parentId: issues.parentId,
+        assigneeAgentId: issues.assigneeAgentId,
+        assigneeUserId: issues.assigneeUserId,
+        createdByAgentId: issues.createdByAgentId,
+        status: issues.status,
+        originKind: issues.originKind,
+        originId: issues.originId,
+      })
+      .from(issues)
+      .where(and(eq(issues.id, sourceIssueId), eq(issues.companyId, companyId)))
+      .then((rows) => rows[0] ?? null);
+    if (!sourceIssue) {
+      return refuse(
+        "This status-only run cannot file a board escalation: its source issue is unavailable in this company",
+        { sourceIssueId },
+      );
+    }
+
+    const sourceAuthorization = await access.decide({
+      actor: req.actor,
+      action: "issue:mutate",
+      resource: {
+        type: "issue",
+        companyId: sourceIssue.companyId,
+        issueId: sourceIssue.id,
+        projectId: sourceIssue.projectId,
+        parentIssueId: sourceIssue.parentId,
+        assigneeAgentId: sourceIssue.assigneeAgentId,
+        assigneeUserId: sourceIssue.assigneeUserId,
+        createdByAgentId: sourceIssue.createdByAgentId ?? null,
+        status: sourceIssue.status,
+        originKind: sourceIssue.originKind,
+        originId: sourceIssue.originId ?? null,
+      },
+      scope: {
+        issueId: sourceIssue.id,
+        projectId: sourceIssue.projectId,
+        parentIssueId: sourceIssue.parentId,
+        assigneeAgentId: sourceIssue.assigneeAgentId,
+        assigneeUserId: sourceIssue.assigneeUserId,
+        originKind: sourceIssue.originKind ?? null,
+        originId: sourceIssue.originId ?? null,
       },
     });
-    return false;
+    if (!sourceAuthorization.allowed) {
+      return refuse(
+        "This status-only run is not authorized to escalate its source issue",
+        { sourceIssueId, authorizationReason: sourceAuthorization.reason },
+      );
+    }
+
+    return true;
   }
 
   router.get("/companies/:companyId/approvals", async (req, res) => {
@@ -165,12 +304,15 @@ export function approvalRoutes(
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     if (!(await assertApprovalAccessAllowed(req, res, companyId))) return;
-    if (!(await assertApprovalMutationAllowedByRunContext(req, res, companyId))) return;
     const rawIssueIds = req.body.issueIds;
     const issueIds = Array.isArray(rawIssueIds)
       ? rawIssueIds.filter((value: unknown): value is string => typeof value === "string")
       : [];
     const uniqueIssueIds = Array.from(new Set(issueIds));
+    if (!(await assertApprovalMutationAllowedByRunContext(req, res, companyId, {
+      requestedType: req.body.type,
+      requestedIssueIds: uniqueIssueIds,
+    }))) return;
     const { issueIds: _issueIds, ...approvalInput } = req.body;
     const normalizedPayload =
       approvalInput.type === "hire_agent"

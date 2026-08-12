@@ -21,6 +21,11 @@ test("PR verification runs for merge-queue heads with event-appropriate diff SHA
     "merge-group runs must not re-evaluate PR-only lockfile exemptions without author/branch metadata",
   );
   assert.match(workflow, /\n  verify:\n/);
+  assert.match(
+    workflow,
+    /\n  verify:\n(?:    [^\n]*\n)*?    if: \$\{\{ always\(\) && !cancelled\(\) \}\}\n/,
+    "a cancelled workflow must not materialize verify and retain the merge-group concurrency lock",
+  );
 });
 
 // BLO-20867: extract the actual `run:` shell script from the `verify` job's
@@ -54,6 +59,7 @@ function runVerifyStep(results) {
     GENERAL_TESTS_RESULT: results.general_tests ?? "success",
     WORKTREE_INSTALL_RESULT: results.worktree_install ?? "success",
     OPENCODE_RESPONSES_REPLAY_RESULT: results.opencode_responses_replay ?? "success",
+    OPENCODE_K8S_SEED_COLD_START_RESULT: results.opencode_k8s_seed_cold_start ?? "success",
     BUILD_RESULT: results.build ?? "success",
   };
   return spawnSync("bash", ["-c", script], { env, encoding: "utf8" });
@@ -64,20 +70,25 @@ test("verify step passes when every lane succeeds", () => {
   assert.equal(result.status, 0);
 });
 
-for (const [laneResult, annotation] of [
-  ["failure", "failure"],
-  ["skipped", "skipped"],
-  ["cancelled", "cancelled"],
+for (const [lane, laneLabel] of [
+  ["opencode_responses_replay", "OpenCode Responses replay"],
+  ["opencode_k8s_seed_cold_start", "k8s-ro seed transport cold start"],
 ]) {
-  test(`verify step rejects an OpenCode Responses replay ${laneResult}`, () => {
-    const result = runVerifyStep({ opencode_responses_replay: laneResult });
-    assert.notEqual(result.status, 0);
-    assert.match(
-      result.stdout,
-      new RegExp(`::error title=verify: lane ${annotation}::`),
-    );
-    assert.match(result.stdout, /opencode_responses_replay/);
-  });
+  for (const [laneResult, annotation] of [
+    ["failure", "failure"],
+    ["skipped", "skipped"],
+    ["cancelled", "cancelled"],
+  ]) {
+    test(`verify step rejects a ${laneLabel} ${laneResult}`, () => {
+      const result = runVerifyStep({ [lane]: laneResult });
+      assert.notEqual(result.status, 0);
+      assert.match(
+        result.stdout,
+        new RegExp(`::error title=verify: lane ${annotation}::`),
+      );
+      assert.match(result.stdout, new RegExp(lane));
+    });
+  }
 }
 
 test("verify step exits non-zero and annotates a cancelled lane without asserting a specific cause", () => {
