@@ -887,9 +887,12 @@ export function pluginRoutes(
   async function validatePluginSecretRefsForCompany(
     companyId: string,
     refs: ReturnType<typeof extractSecretRefBindingsFromConfig>,
+    // Callers inside a transaction pass the tx handle so the existence check
+    // sees the same snapshot as the write it is guarding (BLO-26529).
+    dbOrTx: Db = db,
   ): Promise<void> {
     if (refs.length === 0) return;
-    const secretsSvc = secretService(db);
+    const secretsSvc = secretService(dbOrTx);
     const checked = new Set<string>();
     for (const ref of refs) {
       if (checked.has(ref.secretId)) continue;
@@ -2683,58 +2686,96 @@ export function pluginRoutes(
       delete body.configJson.devUiUrl;
     }
 
-    // Restore any value the caller echoed back as the mask sentinel from the
-    // masked GET (BLO-20794). Must run before validation: `__redacted__` would
-    // otherwise fail a `pattern`/`minLength` constraint on the secret field, and
-    // must run before the secret-ref extraction so bindings are read from the
-    // real stored pointers.
-    const storedConfig = await registry.getConfig(plugin.id, companyId);
-    const merged = mergeMaskedPluginConfig(
-      body.configJson,
-      storedConfig && typeof storedConfig === "object" ? storedConfig.configJson : null,
-      plugin.manifestJson?.instanceConfigSchema,
-    );
-    // A sentinel inside an array that was reordered or had entries removed
-    // cannot be resolved without risking re-homing the credential onto a
-    // different entry. Refuse the write and make the operator re-enter it.
-    if (merged.unresolvedMaskPaths.length > 0) {
-      res.status(400).json({
-        error:
-          "Masked secret values could not be matched to stored configuration because the surrounding array changed. Re-enter the affected secrets explicitly.",
-        unresolvedMaskPaths: merged.unresolvedMaskPaths,
-      });
-      return;
-    }
-    const configJson = merged.configJson;
-
-    // Validate configJson against the plugin's instanceConfigSchema (if declared).
-    // This ensures CLI/API callers get the same validation the UI performs client-side.
     const schema = plugin.manifestJson?.instanceConfigSchema;
-    if (schema && Object.keys(schema).length > 0) {
-      const validation = validateInstanceConfig(configJson, schema);
-      if (!validation.valid) {
-        res.status(400).json({
-          error: "Configuration does not match the plugin's instanceConfigSchema",
-          fieldErrors: validation.errors,
-        });
-        return;
-      }
-    }
+    const postedConfigJson = body.configJson;
 
     try {
-      const secretRefs = extractSecretRefBindingsFromConfig(configJson, schema);
-      await validatePluginSecretRefsForCompany(companyId, secretRefs);
-      await secretService(db).syncSecretRefsForTarget(
-        companyId,
-        { targetType: "plugin", targetId: plugin.id },
-        secretRefs,
-        { replaceAll: true },
-      );
+      // The mask-restore read and the whole-row write must be one atomic unit
+      // (BLO-26529). Splitting them loses updates: request A rotates a secret
+      // S0 -> S1 and commits inside the window between request B's
+      // `getConfig()` snapshot and B's `upsertConfig()`, so B restores the
+      // stale S0 from its own snapshot and silently reverts the rotation.
+      //
+      // `pg_advisory_xact_lock` rather than `SELECT ... FOR UPDATE` because the
+      // `plugin_config` row does not exist before the first save, and a row
+      // lock on a row that isn't there serialises nothing. The lock is held
+      // until commit/rollback, so the restore always reads the newest committed
+      // config and the sentinel resolves to whatever actually survives — which
+      // is what makes a stale masked response unable to revert a rotation.
+      const outcome = await db.transaction(async (tx) => {
+        const txDb = tx as unknown as Db;
+        await tx.execute(
+          sql`select pg_advisory_xact_lock(hashtextextended(${`paperclip:plugin-config:${plugin.id}:${companyId}`}, 0))`,
+        );
 
-      const result = await registry.upsertConfig(plugin.id, companyId, {
-        companyId,
-        configJson,
+        const txRegistry = pluginRegistryService(txDb);
+
+        // Restore any value the caller echoed back as the mask sentinel from the
+        // masked GET (BLO-20794). Must run before validation: `__redacted__` would
+        // otherwise fail a `pattern`/`minLength` constraint on the secret field, and
+        // must run before the secret-ref extraction so bindings are read from the
+        // real stored pointers.
+        const storedConfig = await txRegistry.getConfig(plugin.id, companyId);
+        const merged = mergeMaskedPluginConfig(
+          postedConfigJson,
+          storedConfig && typeof storedConfig === "object" ? storedConfig.configJson : null,
+          schema,
+        );
+        // A sentinel inside an array that was reordered or had entries removed
+        // cannot be resolved without risking re-homing the credential onto a
+        // different entry. Refuse the write and make the operator re-enter it.
+        if (merged.unresolvedMaskPaths.length > 0) {
+          return {
+            ok: false as const,
+            body: {
+              error:
+                "Masked secret values could not be matched to stored configuration because the surrounding array changed. Re-enter the affected secrets explicitly.",
+              unresolvedMaskPaths: merged.unresolvedMaskPaths,
+            },
+          };
+        }
+        const configJson = merged.configJson;
+
+        // Validate configJson against the plugin's instanceConfigSchema (if declared).
+        // This ensures CLI/API callers get the same validation the UI performs client-side.
+        if (schema && Object.keys(schema).length > 0) {
+          const validation = validateInstanceConfig(configJson, schema);
+          if (!validation.valid) {
+            return {
+              ok: false as const,
+              body: {
+                error: "Configuration does not match the plugin's instanceConfigSchema",
+                fieldErrors: validation.errors,
+              },
+            };
+          }
+        }
+
+        // Secret-ref bindings are synchronised inside the same transaction so
+        // they commit with — and roll back with — the config version that wins.
+        const secretRefs = extractSecretRefBindingsFromConfig(configJson, schema);
+        await validatePluginSecretRefsForCompany(companyId, secretRefs, txDb);
+        await secretService(txDb).syncSecretRefsForTarget(
+          companyId,
+          { targetType: "plugin", targetId: plugin.id },
+          secretRefs,
+          { replaceAll: true },
+        );
+
+        const result = await txRegistry.upsertConfig(plugin.id, companyId, {
+          companyId,
+          configJson,
+        });
+        return { ok: true as const, result, configJson, secretRefs };
       });
+
+      if (!outcome.ok) {
+        res.status(400).json(outcome.body);
+        return;
+      }
+
+      const { result, configJson, secretRefs } = outcome;
+
       await logPluginMutationActivity(req, "plugin.config.updated", plugin.id, {
         pluginId: plugin.id,
         pluginKey: plugin.pluginKey,
@@ -2743,6 +2784,9 @@ export function pluginRoutes(
         configKeyCount: Object.keys(configJson).length,
       });
 
+      // Worker notification runs after the transaction commits: it is a network
+      // round-trip to another process, and holding the config lock across it
+      // would stall every other admin save for the duration of an RPC timeout.
       // Notify the running worker about the config change (PLUGIN_SPEC §25.4.4).
       // If the worker implements onConfigChanged, send the new config via RPC.
       // If it doesn't (METHOD_NOT_IMPLEMENTED), restart the worker so it picks
