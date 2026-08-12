@@ -77,6 +77,7 @@ import {
 } from "./successful-run-handoff.js";
 import {
   RECOVERY_ORIGIN_KINDS,
+  buildAgentHealthReceiptKeyLikePattern,
   buildIssueGraphLivenessLeafKey,
   buildSchedulerFailureHeartbeatKey,
   isStrandedIssueRecoveryOriginKind,
@@ -5479,11 +5480,27 @@ export function recoveryService(
   // "routine_execution"`; every other stranded-issue escalation path is
   // unaffected.
   //
-  // "Never ran user code" is evidenced by the absence of ANY `heartbeat_runs`
-  // row for this issue with `lastUsefulActionAt` set. That is also the reason
-  // this never double-posts for a normal completion or for a runbook-emitted
-  // failure heartbeat: both require the agent to have actually produced output,
-  // which sets `lastUsefulActionAt` on at least one run.
+  // BLO-24543: the predicate is receipt absence for THIS window on the alert
+  // surface, not run status or an activity proxy. The prior `lastUsefulActionAt
+  // IS NOT NULL` check was too permissive -- BLO-21235's run set that column
+  // 3s in off a single checkout-shaped activity event, then succeeded without
+  // ever reaching the runbook's own emission step, then stranded. That proxy
+  // suppressed the receipt on the exact window this predicate exists to catch.
+  // A window that already carries the runbook's own `agent-health:<windowKey>:*`
+  // receipt on the alert surface got a normal emission and needs no scheduler
+  // receipt; this is the only thing that suppresses emission now.
+  //
+  // The receipt is phrased as a timestamped observation ("as of <T>, this
+  // window carried no receipt"), never a terminal claim ("this window will
+  // never run"). That sentence cannot be falsified by a later retry that
+  // succeeds and emits normally -- the pair reads as "stranded, then
+  // recovered," not a contradiction -- so this intentionally does not wait
+  // for the window to become unretriable and does not retract/supersede a
+  // receipt once posted. Emitting the correct-but-early receipt trades a
+  // possible harmless "stranded, then recovered" pair for the latency that is
+  // the entire point of this alarm; a queue-age or "never ran" threshold would
+  // be undecidable at emission time (a run can sit `queued` for a very long
+  // time and then execute normally) and is deliberately not added.
   async function postRoutineSchedulerFailureHeartbeat(input: {
     issue: typeof issues.$inferSelect;
     recoveryCause: StrandedRecoveryCause;
@@ -5503,17 +5520,6 @@ export function recoveryService(
       // most routines don't parent their executions under a tracking issue.
       if (!routine || !routine.parentIssueId) return;
 
-      const ranUserCode = await db
-        .select({ id: heartbeatRuns.id })
-        .from(heartbeatRuns)
-        .where(and(
-          eq(heartbeatRuns.contextIssueId, issue.id),
-          sql`${heartbeatRuns.lastUsefulActionAt} IS NOT NULL`,
-        ))
-        .limit(1)
-        .then((rows) => rows.length > 0);
-      if (ranUserCode) return;
-
       const run = issue.originRunId
         ? await db
           .select({ triggeredAt: routineRuns.triggeredAt })
@@ -5522,19 +5528,30 @@ export function recoveryService(
           .then((rows) => rows[0] ?? null)
         : null;
       const windowKey = (run?.triggeredAt ?? issue.createdAt).toISOString();
+
+      const hasNormalEmission = await db
+        .select({ id: issueComments.id })
+        .from(issueComments)
+        .where(and(
+          eq(issueComments.issueId, routine.parentIssueId),
+          sql`${issueComments.idempotencyKey} LIKE ${buildAgentHealthReceiptKeyLikePattern(windowKey)}`,
+        ))
+        .limit(1)
+        .then((rows) => rows.length > 0);
+      if (hasNormalEmission) return;
+
       const idempotencyKey = buildSchedulerFailureHeartbeatKey({ routineId: routine.id, windowKey });
       const failureClass = latestRun?.errorCode ?? recoveryCause;
+      const observedAt = new Date().toISOString();
 
       await issuesSvc.addComment(
         routine.parentIssueId,
         [
-          `**Scheduler-side failure heartbeat.** Routine \`${routine.title}\` (\`${routine.id}\`) window ` +
-            `\`${windowKey}\` reached \`issue_created\` but never executed user code, so the runbook's own ` +
-            "pre-flight heartbeat could not run for this window.",
+          `**Scheduler-side failure heartbeat.** As of \`${observedAt}\`, window \`${windowKey}\` of routine ` +
+            `\`${routine.title}\` (\`${routine.id}\`) carried no \`agent-health:${windowKey}:*\` receipt on this ` +
+            `issue; execution issue ${issueUiLink(issue, prefix)} stranded with class \`${failureClass}\`.`,
           "",
-          `- Execution issue: ${issueUiLink(issue, prefix)}`,
           `- Routine run: \`${issue.originRunId ?? "unknown"}\``,
-          `- Failure class: \`${failureClass}\``,
           `- Idempotency key: \`${idempotencyKey}\``,
         ].join("\n"),
         {},
