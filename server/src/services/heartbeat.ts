@@ -233,6 +233,7 @@ import {
   buildIssueMonitorDispatchRearmPatch,
   buildIssueMonitorClearedPatch,
   buildIssueMonitorTriggeredPatch,
+  derivePersistedMonitorState,
   exhaustedMonitorClearReason,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
@@ -10655,8 +10656,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     monitorScheduledBy: string | null;
   }
 
+  type IssueExecutionMonitorPolicyLike = Pick<
+    IssueExecutionMonitorPolicy,
+    "serviceName" | "timeoutAt" | "maxAttempts" | "recoveryPolicy"
+  >;
+
   function monitorRecoveryPolicy(
-    monitor: IssueExecutionMonitorPolicy | null,
+    monitor: Pick<IssueExecutionMonitorPolicy, "recoveryPolicy"> | null,
   ): IssueExecutionMonitorRecoveryPolicy {
     return monitor?.recoveryPolicy ?? "wake_owner";
   }
@@ -10667,7 +10673,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     nextAttemptCount: number;
     clearReason: IssueExecutionMonitorClearReason;
     recoveryPolicy: IssueExecutionMonitorRecoveryPolicy;
-    monitor: IssueExecutionMonitorPolicy | null;
+    monitor: IssueExecutionMonitorPolicyLike | null;
     source: "manual" | "scheduled";
   }) {
     return {
@@ -10736,7 +10742,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     nextAttemptCount: number;
     clearReason: IssueExecutionMonitorClearReason;
     recoveryPolicy: IssueExecutionMonitorRecoveryPolicy;
-    monitor: IssueExecutionMonitorPolicy | null;
+    monitor: IssueExecutionMonitorPolicyLike | null;
     actorType: "user" | "agent" | "system";
     actorId: string;
     agentId: string | null;
@@ -10889,7 +10895,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     nextAttemptCount: number;
     clearReason: IssueExecutionMonitorClearReason;
     recoveryPolicy: IssueExecutionMonitorRecoveryPolicy;
-    monitor: IssueExecutionMonitorPolicy | null;
+    monitor: IssueExecutionMonitorPolicyLike | null;
     now: Date;
     actorType: "user" | "agent" | "system";
     actorId: string;
@@ -11514,6 +11520,140 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       checked: dueMonitors.length,
       triggered,
       skipped,
+    };
+  }
+
+  /**
+   * BLO-25865: `tickDueIssueMonitors` above claims work strictly off
+   * `monitorNextCheckAt`. The moment a monitor fires, `dispatchClaimedIssueMonitor`
+   * sets `monitorNextCheckAt` to null *optimistically* — before the woken run has
+   * actually re-armed it — which is correct for the common case (the run re-arms
+   * or clears the monitor within its own turn) but leaves a permanent gap: a
+   * monitor whose woken run never re-arms it (dies, gets reassigned, or the
+   * assignee simply never calls back) drops out of `tickDueIssueMonitors`'s
+   * `WHERE monitorNextCheckAt IS NOT NULL` predicate forever. Nothing else
+   * re-evaluates it, so `exhaustedMonitorClearReason` — which already knows how
+   * to compare `timeoutAt` against `now` — never runs again, `clearedAt`/
+   * `clearReason` are never set, and the configured `recoveryPolicy` (typically
+   * `wake_owner`) never fires. Observed live: BLO-21020 and BLO-22798, both stuck
+   * in `executionState.monitor.status: "triggered"` with `nextCheckAt: null` for
+   * days past their `timeoutAt`.
+   *
+   * This sweep is the missing second half: it scans for monitors that are
+   * `triggered` (fired, not yet cleared) with a null `nextCheckAt` and a
+   * `timeoutAt` that has passed, and routes them through the exact same
+   * clear-and-recover pipeline `tickDueIssueMonitors` uses for exhaustion — so a
+   * monitor always reaches a terminal `cleared` state with its `recoveryPolicy`
+   * honoured, regardless of whether the run that consumed the last trigger ever
+   * called back. `attemptCount`/`maxAttempts` are deliberately not re-evaluated
+   * here beyond what `exhaustedMonitorClearReason` already does — this sweep
+   * exists to catch a stalled *trigger*, not to retune bounds.
+   */
+  async function tickExpiredIssueMonitors(now = new Date()) {
+    const staleClaimThreshold = new Date(now.getTime() - 5 * 60 * 1000);
+    const expiredMonitorTimeoutCondition = and(
+      sql`${issues.executionState} -> 'monitor' ->> 'status' = 'triggered'`,
+      sql`(${issues.executionState} -> 'monitor' ->> 'timeoutAt') is not null`,
+      sql`(${issues.executionState} -> 'monitor' ->> 'timeoutAt')::timestamptz <= ${now.toISOString()}`,
+    );
+
+    const expiredMonitors = await db
+      .select(issueMonitorDispatchColumns)
+      .from(issues)
+      .innerJoin(companies, eq(companies.id, issues.companyId))
+      .where(
+        and(
+          eq(companies.status, "active"),
+          isNull(issues.monitorNextCheckAt),
+          isNull(issues.assigneeUserId),
+          sql`${issues.assigneeAgentId} is not null`,
+          inArray(issues.status, ["in_progress", "in_review"]),
+          expiredMonitorTimeoutCondition,
+          or(
+            isNull(issues.monitorWakeRequestedAt),
+            lt(issues.monitorWakeRequestedAt, staleClaimThreshold),
+          ),
+        ),
+      )
+      .orderBy(asc(issues.updatedAt), asc(issues.id))
+      .limit(50);
+
+    let checked = 0;
+    let recovered = 0;
+
+    for (const due of expiredMonitors) {
+      const claimed = await db.transaction(async (tx) => {
+        if (!await tryLockIssueMonitorQueue(tx)) return null;
+        const [updated] = await tx
+          .update(issues)
+          .set({
+            monitorWakeRequestedAt: now,
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(issues.id, due.id),
+              isNull(issues.monitorNextCheckAt),
+              expiredMonitorTimeoutCondition,
+              or(
+                isNull(issues.monitorWakeRequestedAt),
+                lt(issues.monitorWakeRequestedAt, staleClaimThreshold),
+              ),
+            ),
+          )
+          .returning();
+        return (updated ?? null) as IssueMonitorDispatchRow | null;
+      });
+
+      if (!claimed) continue;
+      checked += 1;
+
+      try {
+        const policy = normalizeIssueExecutionPolicy(claimed.executionPolicy ?? null);
+        const existingState = parseIssueExecutionState(claimed.executionState);
+        const currentMonitorState = derivePersistedMonitorState({ issue: claimed, state: existingState, policy });
+        if (!currentMonitorState || currentMonitorState.status !== "triggered") {
+          // Raced with a concurrent clear/re-arm between the select above and this claim.
+          continue;
+        }
+
+        const monitor: IssueExecutionMonitorPolicyLike = {
+          serviceName: currentMonitorState.serviceName ?? null,
+          timeoutAt: currentMonitorState.timeoutAt ?? null,
+          maxAttempts: currentMonitorState.maxAttempts ?? null,
+          recoveryPolicy: currentMonitorState.recoveryPolicy ?? null,
+        };
+        const clearReason = exhaustedMonitorClearReason({
+          monitor,
+          attemptCount: currentMonitorState.attemptCount,
+          now,
+        }) ?? "timeout_exceeded";
+        const recoveryPolicy = monitorRecoveryPolicy(monitor);
+
+        await clearIssueMonitorAndRecover({
+          claimed,
+          policy,
+          scheduledAtIso: currentMonitorState.timeoutAt ?? now.toISOString(),
+          nextAttemptCount: currentMonitorState.attemptCount,
+          clearReason,
+          recoveryPolicy,
+          monitor,
+          now,
+          actorType: "system",
+          actorId: "heartbeat_scheduler",
+          agentId: null,
+          runId: null,
+          activitySource: "scheduled",
+        });
+        recovered += 1;
+      } catch (err) {
+        logger.error({ err, issueId: claimed.id }, "expired issue monitor recovery failed");
+      }
+    }
+
+    return {
+      checked,
+      recovered,
     };
   }
 
@@ -30168,6 +30308,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         : null;
     },
     __test_tickDueIssueMonitors: (now?: Date) => tickDueIssueMonitors(now),
+    __test_tickExpiredIssueMonitors: (now?: Date) => tickExpiredIssueMonitors(now),
     // Override-aware scheduling-suppression check (honors the worktree
     // run-execution experimental setting). Callers outside the service that
     // gate on suppression should prefer this over the env-only resolver.
@@ -30367,14 +30508,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
 
       const issueMonitors = await tickDueIssueMonitors(now);
+      const expiredIssueMonitors = await tickExpiredIssueMonitors(now);
 
       return {
-        checked: checked + issueMonitors.checked,
+        checked: checked + issueMonitors.checked + expiredIssueMonitors.checked,
         enqueued: enqueued + issueMonitors.triggered,
-        skipped: skipped + issueMonitors.skipped,
+        skipped: skipped + issueMonitors.skipped + expiredIssueMonitors.recovered,
         idleSkipped,
       };
     },
+
 
     cancelRun: (runId: string, reason?: string, options?: CancelRunOptions) => cancelRunInternal(runId, reason, options),
 
