@@ -1173,29 +1173,49 @@ describeEmbeddedPostgres("queued backlog convergence (BLO-20396)", () => {
     // Every row here is issue-less and equal-ranked: no priority lane, no
     // completion-triggered issue continuation. Position is the only variable,
     // so what the second pass claims says exactly where it started scanning.
+    //
+    // BLO-22418: this used the production-sized window (scanLimit(200) *
+    // maxScanBatches(10) = 2,000), which took 4,100+ seeded rows to get one row
+    // past it. Seeding that many rows (chunked inserts) and scanning them made
+    // this test's pass/fail track how fast the runner could seed+scan rather
+    // than the resume-past-the-window property it asserts — on a loaded runner
+    // it exhausted `waitForStarted`'s timeout before the first adapter
+    // execution even started. A test-local bounded instance narrows the window
+    // to scanLimit(5) * maxScanBatches(2) = 10 rows, exercising the identical
+    // "cursor advances to the scan boundary, not to right after the claim"
+    // property with 12 rows instead of 4,100.
+    const boundedHeartbeat = heartbeatService(db, {
+      penstockGate: allowPenstockGate,
+      queuedRunDispatchBounds: { scanLimit: 5, maxScanBatches: 2 },
+    });
+    const windowRows = 10;
     const { agentId, issuelessRunIds } = await seedDeepClaimableBacklog({
       maxConcurrentRuns: 1,
-      issuelessRows: 4_100,
+      issuelessRows: windowRows + 2,
     });
     const adapter = gateAdapterExecutions();
-    const windowRows = 2_000;
 
-    // The first pass reads the first 2,000 rows and claims the oldest.
-    await heartbeat.resumeQueuedRuns();
-    expect(await adapter.waitForStarted(1)).toBe(1);
-    expect(adapter.started[0]).toBe(issuelessRunIds[0]);
+    // Cleanup must run even if an assertion below throws — otherwise a gated
+    // adapter execution is left holding an open promise and an undrained
+    // queued run leaks into later tests in this file.
+    try {
+      // The first pass reads the first `windowRows` rows and claims the oldest.
+      await boundedHeartbeat.resumeQueuedRuns();
+      expect(await adapter.waitForStarted(1)).toBe(1);
+      expect(adapter.started[0]).toBe(issuelessRunIds[0]);
 
-    // Free the slot. The next pass must continue from the scan boundary, so it
-    // claims the oldest row PAST the window — not the head's second row.
-    adapter.releaseAll();
-    expect(await adapter.waitForStarted(2)).toBe(2);
-    const claimedPosition = issuelessRunIds.indexOf(adapter.started[1]);
-    expect(claimedPosition).toBeGreaterThanOrEqual(windowRows);
-
-    await stopBacklog(agentId);
-    adapter.disarm();
-    await heartbeat.drainInFlightExecutions(60_000);
-  }, 600_000);
+      // Free the slot. The next pass must continue from the scan boundary, so
+      // it claims the oldest row PAST the window — not the head's second row.
+      adapter.releaseAll();
+      expect(await adapter.waitForStarted(2)).toBe(2);
+      const claimedPosition = issuelessRunIds.indexOf(adapter.started[1]);
+      expect(claimedPosition).toBeGreaterThanOrEqual(windowRows);
+    } finally {
+      await stopBacklog(agentId);
+      adapter.disarm();
+      await boundedHeartbeat.drainInFlightExecutions(10_000);
+    }
+  }, 20_000);
 
   it("reaches a critical row behind the cursor while earlier claims are still executing", async () => {
     // BLO-20396 (fourth review follow-up). The dangerous shape is a row that
