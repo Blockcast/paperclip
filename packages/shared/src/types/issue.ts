@@ -420,6 +420,7 @@ export type IssueBlockedInboxReason =
   | "blocked_by_assigned_backlog_issue"
   | "blocked_by_uninvokable_assignee"
   | "blocked_by_cancelled_issue"
+  | "blocked_without_blockers"
   | "blocked_chain_stalled"
   | "invalid_review_participant"
   | "in_review_without_action_path"
@@ -476,7 +477,8 @@ export interface IssueBlockedInboxAttention {
 export type IssueProductivityReviewTrigger =
   | "no_comment_streak"
   | "long_active_duration"
-  | "high_churn";
+  | "high_churn"
+  | "runtime_failure_streak";
 
 export interface IssueProductivityReview {
   reviewIssueId: string;

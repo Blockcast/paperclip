@@ -243,7 +243,7 @@ describeEmbeddedPostgres("heartbeat issue rewake throttle", () => {
     expect(recoveryWake).not.toBeNull();
   });
 
-  it("does not throttle when a recent run produced issue-visible progress", async () => {
+  it("does not throttle when a recent run produced a real issue mutation", async () => {
     const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
 
     await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 40 });
@@ -254,10 +254,64 @@ describeEmbeddedPostgres("heartbeat issue rewake throttle", () => {
       actorId: agentId,
       agentId,
       runId: progressRunId,
+      action: "issue.updated",
+      entityType: "issue",
+      entityId: issueId,
+      createdAt: new Date(Date.now() - 11_000),
+    });
+
+    const wake = await assignmentWake(agentId, issueId);
+    expect(wake).not.toBeNull();
+  });
+
+  it("still throttles when the only activity on a run is the agent's own status comment (BLO-23081)", async () => {
+    const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
+
+    await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 40 });
+    const commentOnlyRunId = await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 10 });
+    await db.insert(activityLog).values({
+      companyId,
+      actorType: "agent",
+      actorId: agentId,
+      agentId,
+      runId: commentOnlyRunId,
       action: "issue.comment_added",
       entityType: "issue",
       entityId: issueId,
       createdAt: new Date(Date.now() - 11_000),
+    });
+
+    const wake = await assignmentWake(agentId, issueId);
+    expect(wake).toBeNull();
+    expect((await latestWakeRequest(agentId))?.reason).toBe("issue_rewake_throttled");
+  });
+
+  it("a comment from a different agent still bypasses the throttle immediately (BLO-23081)", async () => {
+    const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
+    const otherAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: otherAgentId,
+      companyId,
+      name: "OtherReviewer",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 40 });
+    await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 10 });
+    await db.insert(activityLog).values({
+      companyId,
+      actorType: "agent",
+      actorId: otherAgentId,
+      agentId: otherAgentId,
+      action: "issue.comment_added",
+      entityType: "issue",
+      entityId: issueId,
+      createdAt: new Date(Date.now() - 5_000),
     });
 
     const wake = await assignmentWake(agentId, issueId);
@@ -285,7 +339,7 @@ describeEmbeddedPostgres("heartbeat issue rewake throttle", () => {
       actorId: agentId,
       agentId,
       runId: progressRunId,
-      action: "issue.comment_added",
+      action: "issue.updated",
       entityType: "issue",
       entityId: otherIssueId,
       createdAt: new Date(Date.now() - 11_000),

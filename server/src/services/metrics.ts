@@ -20,14 +20,22 @@
  * @module server/services/metrics
  */
 
-import { Counter, Gauge, Registry, collectDefaultMetrics } from "prom-client";
+import { Counter, Gauge, Histogram, Registry, collectDefaultMetrics } from "prom-client";
 import { resetDepBlockedMetrics, snapshotDepBlockedMetrics } from "./dep-blocked-metrics.js";
 import {
   resetBlockerResolvedWakeMetrics,
   snapshotBlockerResolvedWakeMetrics,
 } from "./blocker-resolved-wake-metrics.js";
+import {
+  resetRoutineDispatchMetrics,
+  snapshotRoutineDispatchMetrics,
+} from "./routine-dispatch-metrics.js";
 
 export const CONCURRENT_RUN_BLOCKED_METRIC = "claude_k8s_concurrent_run_blocked_total";
+// BLO-23379: routine dispatch bypassed a long-parked execution issue instead of
+// letting it gate the fire. Non-zero means a quota/capacity park was overridden;
+// zero while a routine is quiet means it is genuinely gated on in-flight work.
+export const ROUTINE_DISPATCH_METRIC = "paperclip_routine_dispatch_total";
 export const AUTH_REQUEST_METRIC = "paperclip_auth_request_total";
 export const HEARTBEAT_RUN_FAILED_METRIC = "paperclip_heartbeat_run_failed_total";
 export const DEP_BLOCKED_WAKEUP_METRIC = "paperclip_dependency_blocked_wakeup_total";
@@ -482,6 +490,74 @@ export function normalizeGithubSuppressionCause(cause: string | null | undefined
     : UNKNOWN_GITHUB_SUPPRESSION_CAUSE;
 }
 
+/**
+ * Terminal-conclusion counter for GitHub Actions `workflow_run` completions
+ * received over the webhook (BLO-21078). Exists to make a fleet-wide mass
+ * runner-kill visible as a metric instead of only as a wave of misattributed
+ * red checks: on 2026-08-02 19:34–19:57Z, GitHub gracefully cancelled
+ * multiple in-flight `PR` workflow runs across unrelated PRs/branches (post
+ * steps still ran, ruling out an ARC/k8s runner death) with no ARC event
+ * spike and no repo-side cancel automation to explain it — the incident had
+ * no metric surface at all, so the only way to notice it was an author
+ * manually reading job conclusions.
+ *
+ * One increment per completed `workflow_run` webhook delivery, labeled by
+ * the bounded `conclusion` (see {@link KNOWN_WORKFLOW_RUN_CONCLUSIONS}) and,
+ * for `cancelled` only, `supersession`. Deliberately excludes repo/workflow
+ * name to keep cardinality fixed regardless of fleet growth — this counter's
+ * whole job is "how many terminal runs of each kind arrived recently".
+ *
+ * `supersession` exists because `cancelled` alone is not incident signal:
+ * this repo's `pr.yml` sets `concurrency.cancel-in-progress: true`, so an
+ * ordinary force-push produces the identical conclusion (BLO-21078's own
+ * investigation clocked 101 of 196 cancellations in a 2026-08-01/08-02
+ * sample as exactly this, and confirmed the "every lane dies at once, red
+ * `verify`, unexpanded matrix names" shape it produces is indistinguishable
+ * from a genuine infra kill by shape alone). `supersession="superseded"`
+ * means a newer run on the same branch already existed when this run ended
+ * — see `recordGithubWorkflowRunConclusion`'s caller in github-webhook.ts
+ * for how that is determined. The mass-cancellation alert must key on
+ * `conclusion="cancelled",supersession="none"`, not `conclusion="cancelled"`
+ * alone — see the `PaperclipGithubWorkflowRunMassCancellation` rule.
+ */
+export const GITHUB_WORKFLOW_RUN_CONCLUSION_METRIC = "paperclip_github_workflow_run_conclusion_total";
+
+export const KNOWN_WORKFLOW_RUN_CONCLUSIONS = [
+  "success",
+  "failure",
+  "cancelled",
+  "skipped",
+  "timed_out",
+  "action_required",
+  "neutral",
+  "stale",
+  "startup_failure",
+] as const;
+
+export const UNKNOWN_WORKFLOW_RUN_CONCLUSION = "other";
+
+const knownWorkflowRunConclusionSet: ReadonlySet<string> = new Set(KNOWN_WORKFLOW_RUN_CONCLUSIONS);
+
+export function normalizeWorkflowRunConclusion(conclusion: string | null | undefined): string {
+  return typeof conclusion === "string" && knownWorkflowRunConclusionSet.has(conclusion)
+    ? conclusion
+    : UNKNOWN_WORKFLOW_RUN_CONCLUSION;
+}
+
+// Only meaningful for conclusion="cancelled" — every other conclusion always
+// records "none" (there is no supersession question to ask of a run that
+// wasn't cancelled). Two values keeps this a flat cardinality multiplier of
+// 2 rather than an open-ended label.
+export const KNOWN_WORKFLOW_RUN_SUPERSESSIONS = ["none", "superseded"] as const;
+
+const knownWorkflowRunSupersessionSet: ReadonlySet<string> = new Set(KNOWN_WORKFLOW_RUN_SUPERSESSIONS);
+
+export function normalizeWorkflowRunSupersession(supersession: string | null | undefined): string {
+  return typeof supersession === "string" && knownWorkflowRunSupersessionSet.has(supersession)
+    ? supersession
+    : "none";
+}
+
 export const KNOWN_AUTH_OPERATIONS = [
   "oidc_start",
   "oidc_callback",
@@ -710,6 +786,98 @@ export function normalizeExternalAdapter(adapter: string | null | undefined): st
 }
 
 /**
+ * BLO-20815: terminal silence-gap histogram for external-lifecycle runs.
+ * Observes `finalizedAt - COALESCE(lastUsefulActionAt, lastOutputAt, startedAt)`
+ * at run finalization — the exact same precedence the dispatcher's staleness
+ * filter uses in startNextQueuedRunForAgent (heartbeat.ts) to decide whether a
+ * running run is stale. Labeled by adapter and terminal status so the
+ * `status="succeeded"` population (healthy quiet gaps) can be read separately
+ * from the failed/cancelled population (zombie/stuck candidates). This metric
+ * is additive-only: it does not gate dispatch, slot accounting, or kill
+ * decisions.
+ *
+ * Buckets deliberately span the EXTERNAL_LIFECYCLE_STALE_MS (15m) /
+ * EXTERNAL_LIFECYCLE_HARD_STALE_MS (45m) decision range with resolution where
+ * it matters, so a `histogram_quantile` against the `succeeded` population can
+ * be compared directly against the 45m destructive-kill floor.
+ */
+export const EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_METRIC = "paperclip_external_lifecycle_run_silence_gap_seconds";
+
+export const EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_BUCKETS_SECONDS = [
+  60, 300, 600, 900, 1200, 1800, 2700, 3600, 5400, 7200,
+];
+
+/**
+ * Companion last-value gauge to {@link EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_METRIC}
+ * (BLO-20815 review follow-up, Ally/gstack-review on PR #947): a classic
+ * Prometheus Histogram cannot expose an exact max — values above the last
+ * finite bucket collapse into `+Inf`, and the exported bucket/count/sum series
+ * retain no per-observation maximum. This gauge is set to the *last observed*
+ * silence-gap value per adapter/status on every {@link recordExternalLifecycleRunSilenceGap}
+ * call. Reset/window semantics: it is a plain last-write gauge with no reset
+ * or decay — the true rolling max is recovered at query time via
+ * `max_over_time(...[7d])`, which reads every scraped sample in the window
+ * (a process restart only affects samples *after* the restart; earlier peak
+ * samples already persisted in Prometheus TSDB are unaffected). The one
+ * accepted gap: two observations for the same adapter/status landing within a
+ * single scrape interval can have the smaller one overwritten before it is
+ * ever scraped — acceptable given external-lifecycle run finalizations are
+ * infrequent relative to the scrape interval.
+ */
+export const EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_LAST_METRIC =
+  "paperclip_external_lifecycle_run_silence_gap_seconds_last";
+
+/**
+ * Bounded terminal-status allow-list for {@link EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_METRIC}.
+ * Mirrors HEARTBEAT_RUN_TERMINAL_STATUSES (heartbeat.ts) minus "interrupted",
+ * which external-lifecycle runs do not reach. Anything else (including a
+ * future new terminal status) collapses to "other" so the label cannot be
+ * inflated by an unbounded/typo'd status string.
+ */
+export const KNOWN_EXTERNAL_LIFECYCLE_TERMINAL_STATUSES = [
+  "succeeded",
+  "failed",
+  "cancelled",
+  "timed_out",
+] as const;
+export const UNKNOWN_EXTERNAL_LIFECYCLE_TERMINAL_STATUS = "other";
+const knownExternalLifecycleTerminalStatusSet: ReadonlySet<string> = new Set(
+  KNOWN_EXTERNAL_LIFECYCLE_TERMINAL_STATUSES,
+);
+
+export function normalizeExternalLifecycleTerminalStatus(status: string | null | undefined): string {
+  return typeof status === "string" && knownExternalLifecycleTerminalStatusSet.has(status)
+    ? status
+    : UNKNOWN_EXTERNAL_LIFECYCLE_TERMINAL_STATUS;
+}
+
+export interface ExternalLifecycleSilenceGapRunSignals {
+  lastUsefulActionAt: Date | string | null | undefined;
+  lastOutputAt: Date | string | null | undefined;
+  startedAt: Date | string | null | undefined;
+}
+
+/**
+ * Compute the terminal silence gap in seconds for an external-lifecycle run,
+ * using the exact `lastUsefulActionAt > lastOutputAt > startedAt` precedence
+ * the dispatcher's staleness filter uses (heartbeat.ts:
+ * startNextQueuedRunForAgent). Returns null when no signal timestamp is
+ * available at all (e.g. a queued/scheduled_retry run cancelled before it
+ * ever started) — callers must skip observing in that case rather than
+ * recording a meaningless gap against `finalizedAt`.
+ */
+export function computeExternalLifecycleSilenceGapSeconds(
+  run: ExternalLifecycleSilenceGapRunSignals,
+  finalizedAt: Date,
+): number | null {
+  const signalAt = run.lastUsefulActionAt ?? run.lastOutputAt ?? run.startedAt;
+  if (!signalAt) return null;
+  const signalMs = new Date(signalAt).getTime();
+  if (!Number.isFinite(signalMs)) return null;
+  return Math.max(0, (finalizedAt.getTime() - signalMs) / 1000);
+}
+
+/**
  * Map a raw process_lost failure message to a bounded bucket by matching the
  * fixed substrings the reaper stamps. Order matters only in that each substring
  * is unique to one bucket. Never returns the raw string (unbounded cardinality).
@@ -748,6 +916,8 @@ let externalRuntimeReservationsActive: Gauge | null = null;
 let externalRuntimeReservationOldestAge: Gauge | null = null;
 let processLostTotal: Counter<"adapter" | "error_bucket" | "classification"> | null = null;
 let externalLifecycleRunningRuns: Gauge<"adapter"> | null = null;
+let externalLifecycleRunSilenceGap: Histogram<"adapter" | "status"> | null = null;
+let externalLifecycleRunSilenceGapLast: Gauge<"adapter" | "status"> | null = null;
 let processLostLivenessNull: Counter | null = null;
 let orphanedManagedPodReaped: Counter<"adapter"> | null = null;
 let githubReviewRequestDelivery: Counter<"state" | "reason"> | null = null;
@@ -755,6 +925,7 @@ let githubReviewRequestSuppression: Counter<"cause" | "reason"> | null = null;
 let githubReviewRequestDeadLetterUnresolved: Gauge<"reason"> | null = null;
 let agentWakeupTerminalFailedUnresolved: Gauge<"error_code" | "scope"> | null = null;
 let agentWakeupTerminalFailedOldestAge: Gauge<"scope"> | null = null;
+let githubWorkflowRunConclusion: Counter<"conclusion" | "supersession"> | null = null;
 let authRequest: Counter<"operation" | "outcome"> | null = null;
 
 function ensureRegistry(): {
@@ -769,6 +940,8 @@ function ensureRegistry(): {
   externalRuntimeReservationOldestAgeGauge: Gauge;
   processLostTotalCounter: Counter<"adapter" | "error_bucket" | "classification">;
   externalLifecycleRunningRunsGauge: Gauge<"adapter">;
+  externalLifecycleRunSilenceGapHistogram: Histogram<"adapter" | "status">;
+  externalLifecycleRunSilenceGapLastGauge: Gauge<"adapter" | "status">;
   processLostLivenessNullCounter: Counter;
   orphanedManagedPodReapedCounter: Counter<"adapter">;
   githubReviewRequestDeliveryCounter: Counter<"state" | "reason">;
@@ -776,6 +949,7 @@ function ensureRegistry(): {
   githubReviewRequestDeadLetterUnresolvedGauge: Gauge<"reason">;
   agentWakeupTerminalFailedUnresolvedGauge: Gauge<"error_code" | "scope">;
   agentWakeupTerminalFailedOldestAgeGauge: Gauge<"scope">;
+  githubWorkflowRunConclusionCounter: Counter<"conclusion" | "supersession">;
   authRequestCounter: Counter<"operation" | "outcome">;
 } {
   if (
@@ -790,6 +964,8 @@ function ensureRegistry(): {
     || !externalRuntimeReservationOldestAge
     || !processLostTotal
     || !externalLifecycleRunningRuns
+    || !externalLifecycleRunSilenceGap
+    || !externalLifecycleRunSilenceGapLast
     || !processLostLivenessNull
     || !orphanedManagedPodReaped
     || !githubReviewRequestDelivery
@@ -797,6 +973,7 @@ function ensureRegistry(): {
     || !githubReviewRequestDeadLetterUnresolved
     || !agentWakeupTerminalFailedUnresolved
     || !agentWakeupTerminalFailedOldestAge
+    || !githubWorkflowRunConclusion
     || !authRequest
   ) {
     registry = new Registry();
@@ -886,6 +1063,30 @@ function ensureRegistry(): {
         + "DENOMINATOR for " + PROCESS_LOST_TOTAL_METRIC + ": a 0 process_lost count is only "
         + "'healthy' when this is above a floor — otherwise there were simply no runs to lose.",
       labelNames: ["adapter"],
+      registers: [registry],
+    });
+    externalLifecycleRunSilenceGap = new Histogram({
+      name: EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_METRIC,
+      help:
+        "Terminal silence gap in seconds for external-lifecycle runs (BLO-20815): "
+        + "finalizedAt minus the same lastUsefulActionAt > lastOutputAt > startedAt "
+        + "signal the dispatcher's staleness filter uses. Labeled by bounded adapter "
+        + "and terminal status; read the status=\"succeeded\" population's p99 against "
+        + "EXTERNAL_LIFECYCLE_HARD_STALE_MS (45m) to judge whether a shorter destructive-"
+        + "kill floor leaves a safe margin.",
+      labelNames: ["adapter", "status"],
+      buckets: EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_BUCKETS_SECONDS,
+      registers: [registry],
+    });
+    externalLifecycleRunSilenceGapLast = new Gauge({
+      name: EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_LAST_METRIC,
+      help:
+        "Last-observed silence-gap seconds per adapter/status, companion to "
+        + EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_METRIC + " (BLO-20815): a classic "
+        + "Histogram cannot expose an exact max (values above the last finite "
+        + "bucket collapse into +Inf). Read the true rolling max via "
+        + "max_over_time(...[7d]) against this gauge instead.",
+      labelNames: ["adapter", "status"],
       registers: [registry],
     });
     processLostLivenessNull = new Counter({
@@ -1046,6 +1247,24 @@ function ensureRegistry(): {
     for (const scope of TERMINAL_FAILED_WAKE_SCOPES) {
       agentWakeupTerminalFailedOldestAge.set({ scope }, 0);
     }
+    githubWorkflowRunConclusion = new Counter({
+      name: GITHUB_WORKFLOW_RUN_CONCLUSION_METRIC,
+      help:
+        "Count of completed GitHub Actions workflow_run webhook deliveries, labeled by "
+        + "bounded conclusion and, for cancelled, whether a newer run on the same branch "
+        + "already superseded it (BLO-21078). One increment per completed run regardless "
+        + "of whether it matched a paperclip identifier. "
+        + "`increase(...{conclusion=\"cancelled\",supersession=\"none\"}[window])` catches a "
+        + "fleet-wide mass-cancellation wave without also tripping on ordinary "
+        + "cancel-in-progress force-push churn, which carries supersession=\"superseded\".",
+      labelNames: ["conclusion", "supersession"],
+      registers: [registry],
+    });
+    for (const conclusion of [...KNOWN_WORKFLOW_RUN_CONCLUSIONS, UNKNOWN_WORKFLOW_RUN_CONCLUSION]) {
+      for (const supersession of KNOWN_WORKFLOW_RUN_SUPERSESSIONS) {
+        githubWorkflowRunConclusion.inc({ conclusion, supersession }, 0);
+      }
+    }
     authRequest = new Counter({
       name: AUTH_REQUEST_METRIC,
       help:
@@ -1075,6 +1294,8 @@ function ensureRegistry(): {
     externalRuntimeReservationOldestAgeGauge: externalRuntimeReservationOldestAge,
     processLostTotalCounter: processLostTotal,
     externalLifecycleRunningRunsGauge: externalLifecycleRunningRuns,
+    externalLifecycleRunSilenceGapHistogram: externalLifecycleRunSilenceGap,
+    externalLifecycleRunSilenceGapLastGauge: externalLifecycleRunSilenceGapLast,
     processLostLivenessNullCounter: processLostLivenessNull,
     orphanedManagedPodReapedCounter: orphanedManagedPodReaped,
     githubReviewRequestDeliveryCounter: githubReviewRequestDelivery,
@@ -1082,6 +1303,7 @@ function ensureRegistry(): {
     githubReviewRequestDeadLetterUnresolvedGauge: githubReviewRequestDeadLetterUnresolved,
     agentWakeupTerminalFailedUnresolvedGauge: agentWakeupTerminalFailedUnresolved,
     agentWakeupTerminalFailedOldestAgeGauge: agentWakeupTerminalFailedOldestAge,
+    githubWorkflowRunConclusionCounter: githubWorkflowRunConclusion,
     authRequestCounter: authRequest,
   };
 }
@@ -1300,6 +1522,39 @@ export function setExternalLifecycleRunningRuns(byAdapter: Record<string, number
   if (other > 0) gauge.set({ adapter: UNKNOWN_EXTERNAL_ADAPTER }, other);
 }
 
+/**
+ * Observe one external-lifecycle run's terminal silence gap (BLO-20815). Call
+ * once per run at finalization (reap-driven completion/force-kill, or manual
+ * cancel), passing the run's raw signal timestamps and the exact instant it
+ * was finalized. Returns null (and records nothing) when the run has no
+ * signal timestamp at all — a queued/scheduled_retry run cancelled before it
+ * ever started has no meaningful silence gap to report. Otherwise returns the
+ * normalized labels and the observed value (useful for logging/tests).
+ *
+ * Also updates {@link EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_LAST_METRIC}, the
+ * last-value companion gauge that makes the population max queryable via
+ * `max_over_time(...[7d])` (the histogram alone cannot answer that — see the
+ * gauge's own doc comment).
+ */
+export function recordExternalLifecycleRunSilenceGap(input: {
+  adapter: string | null | undefined;
+  status: string | null | undefined;
+  run: ExternalLifecycleSilenceGapRunSignals;
+  finalizedAt: Date;
+}): { adapter: string; status: string; silenceGapSeconds: number } | null {
+  const silenceGapSeconds = computeExternalLifecycleSilenceGapSeconds(input.run, input.finalizedAt);
+  if (silenceGapSeconds === null) return null;
+  const labels = {
+    adapter: normalizeExternalAdapter(input.adapter),
+    status: normalizeExternalLifecycleTerminalStatus(input.status),
+  };
+  const registered = ensureRegistry();
+  registered.externalLifecycleRunSilenceGapHistogram.observe(labels, silenceGapSeconds);
+  registered.externalLifecycleRunSilenceGapLastGauge.set(labels, silenceGapSeconds);
+  return { ...labels, silenceGapSeconds };
+}
+
+
 /** Record one reap cycle that was blind to kube (BLO-16184 denominator #2). */
 export function recordProcessLostLivenessNull(): void {
   ensureRegistry().processLostLivenessNullCounter.inc();
@@ -1464,6 +1719,27 @@ export function setAgentWakeupTerminalFailedOldestAgeSeconds(
   }
 }
 
+/**
+ * Record one completed GitHub Actions `workflow_run` webhook delivery
+ * (BLO-21078). Call exactly once per completed run, regardless of whether it
+ * matched a paperclip identifier — the counter's job is fleet-wide visibility
+ * into conclusion mix, not per-issue attribution. `supersession` is only
+ * meaningful when `conclusion` is `"cancelled"`; pass `"none"` (or omit) for
+ * every other conclusion.
+ */
+export function recordGithubWorkflowRunConclusion(
+  conclusion: string | null | undefined,
+  supersession?: string | null,
+): string {
+  const conclusionLabel = normalizeWorkflowRunConclusion(conclusion);
+  const supersessionLabel = normalizeWorkflowRunSupersession(supersession);
+  ensureRegistry().githubWorkflowRunConclusionCounter.inc({
+    conclusion: conclusionLabel,
+    supersession: supersessionLabel,
+  });
+  return conclusionLabel;
+}
+
 export function recordAuthRequest(input: {
   operation: string | null | undefined;
   outcome: string | null | undefined;
@@ -1494,9 +1770,17 @@ export async function renderMetrics(): Promise<{ contentType: string; body: stri
       ([outcome, value]) => `${BLOCKER_RESOLVED_WAKEUP_METRIC}{outcome="${outcome}"} ${value}`,
     ),
   ].join("\n");
+  const routineDispatchSnapshot = snapshotRoutineDispatchMetrics();
+  const routineDispatchBody = [
+    `# HELP ${ROUTINE_DISPATCH_METRIC} Count of routine dispatch gating outcomes, labeled by outcome. routine_dispatch_bypassed_parked_execution_issue = a fire proceeded past an execution issue parked on a long-horizon scheduled_retry rather than being silently skipped for the whole park.`,
+    `# TYPE ${ROUTINE_DISPATCH_METRIC} counter`,
+    ...Object.entries(routineDispatchSnapshot).map(
+      ([outcome, value]) => `${ROUTINE_DISPATCH_METRIC}{outcome="${outcome}"} ${value}`,
+    ),
+  ].join("\n");
   return {
     contentType: reg.contentType,
-    body: `${await reg.metrics()}\n${depBlockedBody}\n${blockerResolvedBody}\n`,
+    body: `${await reg.metrics()}\n${depBlockedBody}\n${blockerResolvedBody}\n${routineDispatchBody}\n`,
   };
 }
 
@@ -1513,6 +1797,8 @@ export function __resetMetricsForTest(): void {
   externalRuntimeReservationOldestAge = null;
   processLostTotal = null;
   externalLifecycleRunningRuns = null;
+  externalLifecycleRunSilenceGap = null;
+  externalLifecycleRunSilenceGapLast = null;
   processLostLivenessNull = null;
   orphanedManagedPodReaped = null;
   githubReviewRequestDelivery = null;
@@ -1520,7 +1806,9 @@ export function __resetMetricsForTest(): void {
   githubReviewRequestDeadLetterUnresolved = null;
   agentWakeupTerminalFailedUnresolved = null;
   agentWakeupTerminalFailedOldestAge = null;
+  githubWorkflowRunConclusion = null;
   authRequest = null;
   resetDepBlockedMetrics();
   resetBlockerResolvedWakeMetrics();
+  resetRoutineDispatchMetrics();
 }

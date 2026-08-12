@@ -56,7 +56,7 @@ describe("paperclip agent Dockerfile", () => {
     expect(dockerfileRuntime).toContain("FROM ${RUNTIME_BASE_IMAGE}");
     expect(dockerfileRuntime).toContain("ARG CLAUDE_CODE_VERSION=2.1.210");
     expect(dockerfileRuntime).toContain("ARG CODEX_CLI_VERSION=0.144.4");
-    expect(dockerfileRuntime).toContain("ARG OPENCODE_AI_VERSION=1.15.12");
+    expect(dockerfileRuntime).toContain("ARG OPENCODE_AI_VERSION=1.18.11");
     expect(dockerfileRuntime).toContain("ARG GEMINI_CLI_VERSION=0.50.0");
     expect(dockerfileRuntime).not.toContain("@latest");
   });
@@ -127,6 +127,7 @@ describe("paperclip agent Dockerfile", () => {
 
   it("derives stable image tags from their declared inputs", () => {
     const script = path.join(repoRoot, "scripts/container-base-tag.sh");
+    const tagScript = readFileSync(script, "utf8");
     const runtimeBaseImage = `harbor.blockcast.net/paperclip/node@sha256:${"c".repeat(64)}`;
     const runtimeTag = execFileSync("bash", [script, "runtime", runtimeBaseImage], {
       cwd: repoRoot,
@@ -151,6 +152,7 @@ describe("paperclip agent Dockerfile", () => {
 
     expect(runtimeTag).toMatch(/^runtime-[a-f0-9]{20}$/);
     expect(changedRuntimeBaseTag).not.toBe(runtimeTag);
+    expect(tagScript).toContain("scripts/smoke/opencode-responses-replay.mjs");
     expect(toolchainTag).toMatch(/^toolchain-[a-f0-9]{20}$/);
     expect(changedFfmpegTag).not.toBe(toolchainTag);
   });

@@ -47,6 +47,7 @@ import { routineService } from "./routines.js";
 import { secretService } from "./secrets.js";
 import type { IssueAssignmentWakeupDeps } from "./issue-assignment-wakeup.js";
 import { logActivity } from "./activity-log.js";
+import { logger } from "../middleware/logger.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
 import { authorizationService } from "./authorization.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
@@ -3722,7 +3723,12 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
             fieldPath: "env",
           }) as Record<string, EnvBinding>;
       const actorPatch = routineActorPatch(input.actor);
-      const updatedRoutine = await db.transaction(async (tx) => {
+      // logActivity's publisher escapes the transaction (in-process emitter +
+      // plugin outbox insert on its own handle), so it is returned from the
+      // transaction rather than fired inline — capturing it as the
+      // transaction's return value means a rollback throws past the
+      // `publish()` call below rather than falling through to it.
+      const { updatedRoutine, publish } = await db.transaction(async (tx) => {
         const txDb = tx as unknown as Db;
         await tx.execute(sql`select id from ${routines} where ${routines.id} = ${routineId} for update`);
         const locked = await txDb
@@ -3768,7 +3774,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
         );
         const envKeys = Object.keys(normalizedEnv ?? {}).sort();
         const secretRefs = secretRefsFromEnv(normalizedEnv);
-        await logActivity(txDb, {
+        const activityPublish = await logActivity(txDb, {
           companyId: input.companyId,
           ...activityActorPatch(input.actor),
           action: "pipeline.stage_automation_env_updated",
@@ -3786,9 +3792,18 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
             routineRevisionId: routineWithRevision.latestRevisionId,
             routineRevisionNumber: routineWithRevision.latestRevisionNumber,
           },
-        });
-        return routineWithRevision;
+        }, { deferPublish: true });
+        return { updatedRoutine: routineWithRevision, publish: activityPublish };
       });
+      // Reached only on commit; a rollback throws straight past this.
+      try {
+        publish();
+      } catch (err) {
+        logger.warn(
+          { err, companyId: input.companyId, stageId: input.stageId },
+          "failed to publish pipeline.stage_automation_env_updated activity event",
+        );
+      }
 
       return derivedStageAutomationPayload(updatedRoutine);
     },

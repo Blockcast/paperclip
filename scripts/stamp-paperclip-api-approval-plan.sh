@@ -8,8 +8,13 @@ if [[ ! "$marker" =~ ^[0-9a-f]{64}$ ]]; then
   echo "PAPERCLIP_APPROVAL_PLAN_SHA256 must be 64 lowercase hex characters" >&2
   exit 2
 fi
+deployed_commit="${PAPERCLIP_DEPLOYED_COMMIT:-}"
+if [[ -n "$deployed_commit" && ! "$deployed_commit" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "PAPERCLIP_DEPLOYED_COMMIT must be 40 lowercase hex characters when set" >&2
+  exit 2
+fi
 
-for dependency in ruby kubectl jq sha256sum; do
+for dependency in ruby yq jq sha256sum; do
   if ! command -v "$dependency" >/dev/null 2>&1; then
     echo "required command not found: ${dependency}" >&2
     exit 2
@@ -24,6 +29,7 @@ cat >"$rendered"
 
 EXTRACT_UNSTAMPED_RUBY_CODE='
 marker = ARGV.fetch(0)
+deployed_commit = ARGV.fetch(2)
 docs = YAML.load_stream(File.read(ARGV.fetch(1))).compact
 matches = docs.select do |doc|
   doc.is_a?(Hash) &&
@@ -43,22 +49,37 @@ if annotations
     abort "Deployment/paperclip-api already carries a different approval-plan marker"
   end
   annotations.delete("paperclip.blockcast.net/approval-plan-sha256")
-  template_metadata.delete("annotations") if annotations.empty?
+  existing_commit = annotations["paperclip.blockcast.net/deployed-commit"]
+  if !deployed_commit.empty? && existing_commit && existing_commit != deployed_commit
+    abort "Deployment/paperclip-api already carries a different deployed-commit annotation"
+  end
+end
+if !deployed_commit.empty?
+  annotations = (template_metadata["annotations"] ||= {})
+  annotations["paperclip.blockcast.net/deployed-commit"] = deployed_commit
+else
+  template_metadata.delete("annotations") if annotations&.empty?
 end
 deployment.dig("spec", "template").delete("metadata") if template_metadata.empty?
 puts YAML.dump(deployment)
 '
-ruby -ryaml -e "$EXTRACT_UNSTAMPED_RUBY_CODE" "$marker" "$rendered" >"$unstamped"
+ruby -ryaml -e "$EXTRACT_UNSTAMPED_RUBY_CODE" "$marker" "$rendered" "$deployed_commit" >"$unstamped"
 
-kubectl_args=(create --dry-run=client -o json -f "$unstamped")
-if [[ -n "${PAPERCLIP_DEPLOY_NAMESPACE:-}" ]]; then
-  kubectl_args+=(--namespace "$PAPERCLIP_DEPLOY_NAMESPACE")
-fi
+deploy_namespace="${PAPERCLIP_DEPLOY_NAMESPACE:-default}"
 
+# `kubectl create --dry-run=client` still performs API discovery. Use the
+# runner-pinned parser and add the namespace kubectl previously defaulted so
+# the approval-plan hash stays byte-for-byte compatible on tokenless runners.
 canonical_unstamped="$(
-  kubectl "${kubectl_args[@]}" |
-    jq -cS --arg key "paperclip.blockcast.net/approval-plan-sha256" '
-      del(.spec.template.metadata.annotations[$key])
+  yq eval -o=json '.' "$unstamped" |
+    jq -cS \
+      --arg key "paperclip.blockcast.net/approval-plan-sha256" \
+      --arg namespace "$deploy_namespace" '
+      if ((.metadata.namespace // "") | length) == 0
+        then .metadata.namespace = $namespace
+        else .
+      end
+      | del(.spec.template.metadata.annotations[$key])
       | if ((.spec.template.metadata.annotations // {}) | length) == 0
         then del(.spec.template.metadata.annotations)
         else .
@@ -77,6 +98,7 @@ fi
 
 STAMP_RUBY_CODE='
 marker = ARGV.fetch(0)
+deployed_commit = ARGV.fetch(2)
 docs = YAML.load_stream(File.read(ARGV.fetch(1))).compact
 matches = docs.select do |doc|
   doc.is_a?(Hash) &&
@@ -94,8 +116,13 @@ existing = annotations["paperclip.blockcast.net/approval-plan-sha256"]
 if existing && existing != marker
   abort "Deployment/paperclip-api already carries a different approval-plan marker"
 end
+existing_commit = annotations["paperclip.blockcast.net/deployed-commit"]
+if !deployed_commit.empty? && existing_commit && existing_commit != deployed_commit
+  abort "Deployment/paperclip-api already carries a different deployed-commit annotation"
+end
 annotations["paperclip.blockcast.net/approval-plan-sha256"] = marker
+annotations["paperclip.blockcast.net/deployed-commit"] = deployed_commit unless deployed_commit.empty?
 
 docs.each { |doc| puts YAML.dump(doc) }
 '
-ruby -ryaml -e "$STAMP_RUBY_CODE" "$marker" "$rendered"
+ruby -ryaml -e "$STAMP_RUBY_CODE" "$marker" "$rendered" "$deployed_commit"

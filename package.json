@@ -16,6 +16,7 @@
     "build": "pnpm run preflight:workspace-links && pnpm -r build",
     "typecheck": "pnpm run preflight:workspace-links && pnpm -r typecheck",
     "typecheck:build-gaps": "pnpm run preflight:workspace-links && pnpm --filter @paperclipai/plugin-sdk ensure-build-deps && pnpm --filter @paperclipai/server build && node scripts/run-typecheck-build-gaps.mjs",
+    "check:test-undefined-symbols": "node scripts/check-test-undefined-symbols.mjs",
     "test": "pnpm run test:run",
     "test:watch": "pnpm run preflight:workspace-links && vitest",
     "test:run": "pnpm run preflight:workspace-links && node scripts/run-vitest-stable.mjs",
@@ -71,9 +72,13 @@
     "postinstall": "node scripts/link-plugin-dev-sdk.mjs"
   },
   "devDependencies": {
+    "@paperclipai/db": "workspace:^",
+    "@paperclipai/shared": "workspace:^",
     "@playwright/test": "^1.58.2",
     "cross-env": "^10.1.0",
+    "drizzle-orm": "0.45.2",
     "esbuild": "^0.28.1",
+    "tsx": "^4.23.1",
     "typescript": "^5.7.3",
     "vitest": "^4.1.8"
   },
@@ -116,9 +121,10 @@
         ]
       },
       "js-yaml": {
-        "patchedRange": ">=4.3.0 <5",
+        "patchedRange": ">=4.3.1 <5",
         "advisories": [
-          "GHSA-h67p-54hq-rp68"
+          "GHSA-h67p-54hq-rp68",
+          "GHSA-5p4m-2wfm-xmqj"
         ]
       },
       "esbuild": {
@@ -134,7 +140,7 @@
     "patchedDependencies": {
       "embedded-postgres@18.1.0-beta.16": "patches/embedded-postgres@18.1.0-beta.16.patch",
       "postgres@3.4.9": "patches/postgres@3.4.9.patch",
-      "brace-expansion@5.0.8": "patches/brace-expansion@5.0.8.patch"
+      "brace-expansion@5.0.9": "patches/brace-expansion@5.0.9.patch"
     },
     "overrides": {
       "rollup": ">=4.59.0",
@@ -151,14 +157,15 @@
       "qs": "^6.15.2",
       "postcss": "^8.5.18",
       "uuid": "^11.1.1",
+      "nanoid": ">=5.1.16 <6",
       "ip-address": "^10.3.1",
       "picomatch": "^4.0.4",
       "@anthropic-ai/sdk": ">=0.91.1",
-      "brace-expansion": "5.0.8",
+      "brace-expansion": "5.0.9",
       "@tootallnate/once": "^2.0.1",
       "form-data": ">=4.0.6",
       "@babel/core": ">=7.29.7 <8",
-      "js-yaml": ">=4.3.0 <5",
+      "js-yaml": ">=4.3.1 <5",
       "esbuild": ">=0.28.1 <0.29",
       "@connectrpc/connect-node>undici": ">=6.27.0 <7",
       "jsdom>undici": ">=7.29.0 <8",

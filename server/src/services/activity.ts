@@ -24,6 +24,7 @@ export interface ActivityFilters {
   agentId?: string;
   entityType?: string;
   entityId?: string;
+  action?: string;
   limit?: number;
 }
 
@@ -330,14 +331,19 @@ export function activityService(db: Db) {
       const conditions = [eq(activityLog.companyId, filters.companyId)];
       const limit = normalizeActivityLimit(filters.limit);
 
-      if (filters.agentId) {
+      // `!== undefined` (not truthiness): an explicitly-passed empty string must still narrow the
+      // query to zero rows rather than silently falling through to the unfiltered feed (BLO-21979).
+      if (filters.agentId !== undefined) {
         conditions.push(eq(activityLog.agentId, filters.agentId));
       }
-      if (filters.entityType) {
+      if (filters.entityType !== undefined) {
         conditions.push(eq(activityLog.entityType, filters.entityType));
       }
-      if (filters.entityId) {
+      if (filters.entityId !== undefined) {
         conditions.push(eq(activityLog.entityId, filters.entityId));
+      }
+      if (filters.action !== undefined) {
+        conditions.push(eq(activityLog.action, filters.action));
       }
 
       return db
