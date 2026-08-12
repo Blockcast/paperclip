@@ -51,6 +51,7 @@ import {
   linkIssueApprovalSchema,
   issueDocumentKeySchema,
   ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
+  ISSUE_STATUS_ADJUDICATION_DOCUMENT_KEY,
   ISSUE_WATCHDOG_DISCOVERY_KINDS,
   TASK_WATCHDOG_PRODUCT_BUG_ORIGIN_KIND,
   rejectIssueThreadInteractionSchema,
@@ -6014,26 +6015,49 @@ export function issueRoutes(
     return false;
   }
 
+  /**
+   * Gate deliverable-shaped writes on the actor's recovery run class.
+   *
+   * `documentKey` is consulted ONLY for `mutationKind: "document"`, and only to
+   * carve out the status-adjudication key for status-only runs (BLO-25868).
+   * Callers that cannot name a key pass nothing and get the strict behaviour, so
+   * omitting it can never widen the gate.
+   */
   async function assertDeliverableMutationAllowedByRunContext(
     req: Request,
     res: Response,
     issue: { id: string; companyId: string },
     mutationKind: "document" | "deliverable" | "annotation" = "deliverable",
+    documentKey?: string,
   ) {
     const run = await loadActorRunContext(req, issue.companyId);
     if (!run) return true;
     const statusOnly = isStatusOnlyCheapRecoveryContext(run.contextSnapshot);
     const planningOnly = isPlanningOnlyRecoveryContext(run.contextSnapshot);
+    // A status-only run may record its verdict, and only its verdict. Without
+    // this the done gate's 422 (`no_execution_run_and_no_pr_evidence`) and this
+    // 403 were both reachable for the same actor on the same issue, demanding a
+    // durable artifact while forbidding the only call that produces one — a
+    // deadlock no re-wake could clear. Narrow by construction: one exact key, on
+    // the upsert route alone, so plans, other document keys, annotations and
+    // work products stay barred.
+    const writesStatusAdjudication = mutationKind === "document" &&
+      documentKey === ISSUE_STATUS_ADJUDICATION_DOCUMENT_KEY;
+    if (statusOnly && writesStatusAdjudication) return true;
     if (!statusOnly && (!planningOnly || mutationKind === "document")) return true;
 
     res.status(403).json({
       error: planningOnly
         ? "Planning-only recovery runs can update issue documents but cannot create or modify annotations or deliverable artifacts"
-        : "Cheap status-only recovery runs cannot update issue documents, plans, or deliverable artifacts",
+        : "Cheap status-only recovery runs cannot update issue documents, plans, or deliverable artifacts. " +
+          `To record a status conclusion and close, PUT /api/issues/:id/documents/${ISSUE_STATUS_ADJUDICATION_DOCUMENT_KEY} ` +
+          "with the verdict and the evidence it rests on; producing the deliverable itself needs a normal-model run.",
       details: {
         issueId: issue.id,
         runId: run.id,
-        ...(statusOnly ? { modelProfile: "cheap" } : {}),
+        ...(statusOnly
+          ? { modelProfile: "cheap", allowedDocumentKey: ISSUE_STATUS_ADJUDICATION_DOCUMENT_KEY }
+          : {}),
         recoveryIntent: planningOnly ? "planning_only" : "status_only",
         resumeRequiresNormalModel: statusOnly,
       },
@@ -8153,12 +8177,14 @@ export function issueRoutes(
     const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
     if (!issue) return;
     if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
-    if (!(await assertDeliverableMutationAllowedByRunContext(req, res, issue, "document"))) return;
+    // Key must be parsed BEFORE the run-class gate: it decides whether a
+    // status-only run is writing the one document key it is allowed (BLO-25868).
     const keyParsed = issueDocumentKeySchema.safeParse(String(req.params.key ?? "").trim().toLowerCase());
     if (!keyParsed.success) {
       res.status(400).json({ error: "Invalid document key", details: keyParsed.error.issues });
       return;
     }
+    if (!(await assertDeliverableMutationAllowedByRunContext(req, res, issue, "document", keyParsed.data))) return;
 
     const actor = getActorInfo(req);
     const sourceTrust = await sourceTrustForActorWrite(issue, actor);
