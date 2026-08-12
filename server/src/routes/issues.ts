@@ -213,6 +213,7 @@ import {
   type TrustPresetResolution,
 } from "../services/trust-preset-resolver.js";
 import { externalObjectService } from "../services/external-objects.js";
+import { STATUS_ONLY_RECOVERY_RESUME_GUIDANCE } from "../services/recovery/model-profile-hint.js";
 
 export const ISSUE_CREATE_DUPLICATE_CANDIDATE_WINDOW_DAYS = 30;
 export const ISSUE_CREATE_DUPLICATE_CANDIDATE_ROW_CAP = 200;
@@ -6403,6 +6404,7 @@ export function issueRoutes(
         modelProfile: "cheap",
         recoveryIntent: "status_only",
         resumeRequiresNormalModel: true,
+        ...STATUS_ONLY_RECOVERY_RESUME_GUIDANCE,
       },
     });
     if (issue.id) {
@@ -6455,7 +6457,11 @@ export function issueRoutes(
         issueId: issue.id,
         runId: run.id,
         ...(statusOnly
-          ? { modelProfile: "cheap", allowedDocumentKey: ISSUE_STATUS_ADJUDICATION_DOCUMENT_KEY }
+          ? {
+            modelProfile: "cheap",
+            allowedDocumentKey: ISSUE_STATUS_ADJUDICATION_DOCUMENT_KEY,
+            ...STATUS_ONLY_RECOVERY_RESUME_GUIDANCE,
+          }
           : {}),
         recoveryIntent: planningOnly ? "planning_only" : "status_only",
         resumeRequiresNormalModel: statusOnly,
@@ -6484,7 +6490,13 @@ export function issueRoutes(
       details: {
         issueId: issue.id,
         runId: run.id,
-        ...(statusOnly ? { modelProfile: "cheap", allowedApprovalType: "request_board_approval" } : {}),
+        ...(statusOnly
+          ? {
+            modelProfile: "cheap",
+            allowedApprovalType: "request_board_approval",
+            ...STATUS_ONLY_RECOVERY_RESUME_GUIDANCE,
+          }
+          : {}),
         recoveryIntent: planningOnly ? "planning_only" : "status_only",
         resumeRequiresNormalModel: statusOnly,
       },
