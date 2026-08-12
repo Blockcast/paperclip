@@ -10701,6 +10701,191 @@ describeEmbeddedPostgres(
       expect(row?.status).toBe("blocked");
     });
 
+    // BLO-26403: the race above commits its edge with a direct `issueRelations`
+    // insert, so it never exercises the lock sequence a real blocker add takes.
+    // These cases drive the concurrent add through the production `update()`
+    // entry point — the only path that reaches `syncBlockedByIssueIds` for an
+    // already-existing issue — and pin the acquisition order inside `runUpdate`.
+
+    function sleep(ms: number) {
+      return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
+    /**
+     * Drizzle wraps driver errors in a `Failed query: …` error whose own `code`
+     * is undefined, so both the deadlock assertion and the lock-order probe have
+     * to walk the cause chain to see PostgreSQL's real SQLSTATE.
+     */
+    function describeError(error: unknown) {
+      const codes: string[] = [];
+      const messages: string[] = [];
+      let current: unknown = error;
+      for (let depth = 0; current && depth < 10; depth += 1) {
+        const candidate = current as { code?: unknown; message?: unknown; cause?: unknown };
+        if (typeof candidate.code === "string") codes.push(candidate.code);
+        if (typeof candidate.message === "string") messages.push(candidate.message);
+        current = candidate.cause;
+      }
+      return { codes, message: messages.join(" | ") || String(error) };
+    }
+
+    async function seedStandaloneBlocker(companyId: string) {
+      const blockerId = randomUUID();
+      await db.insert(issues).values({
+        id: blockerId,
+        companyId,
+        title: "Upstream blocker racing the unpark",
+        status: "todo",
+        priority: "high",
+      });
+      return blockerId;
+    }
+
+    /**
+     * Parks both service calls on a row lock we hold, so the order they were
+     * started in is the order they commit in. Whichever starts first takes the
+     * company parent advisory and the blocker-relation advisory and then waits
+     * on the row; the other queues behind the company advisory. Releasing the
+     * row lets them drain in start order, which is what makes each interleaving
+     * deterministic rather than a timing coin-flip.
+     */
+    async function raceUnparkAgainstBlockerAdd(order: "add-first" | "unpark-first") {
+      const { companyId, issueId, agentId } = await seedBlockedIssue();
+      const blockerId = await seedStandaloneBlocker(companyId);
+
+      const rowHeld = deferred<void>();
+      const releaseRow = deferred<void>();
+      const holder = db.transaction(async (tx) => {
+        await tx.execute(
+          sql`select ${issues.id} from ${issues} where ${issues.id} = ${issueId} for update`,
+        );
+        rowHeld.resolve();
+        await releaseRow.promise;
+      });
+      await rowHeld.promise;
+
+      const startUnpark = () => unpark(issueId, agentId);
+      // The production blocker add: `svc.update` -> `runUpdate` -> `syncBlockedByIssueIds`.
+      const startAdd = () => svc.update(issueId, { blockedByIssueIds: [blockerId] });
+
+      const first = order === "add-first" ? startAdd() : startUnpark();
+      const firstSettled = first.catch(() => undefined);
+      await sleep(75);
+      const second = order === "add-first" ? startUnpark() : startAdd();
+      const secondSettled = second.catch(() => undefined);
+      await sleep(75);
+
+      releaseRow.resolve();
+      await holder;
+
+      const results = await Promise.allSettled([first, second]);
+      void firstSettled;
+      void secondSettled;
+
+      for (const result of results) {
+        if (result.status === "rejected") {
+          const described = describeError(result.reason);
+          // 40P01 is PostgreSQL's deadlock_detected.
+          expect(described.codes).not.toContain("40P01");
+          expect(described.message).not.toMatch(/deadlock/i);
+        }
+      }
+
+      const status = await db
+        .select({ status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]?.status);
+
+      return { results, blockerId, blockerIds: await readBlockerIds(issueId), status };
+    }
+
+    it("does not deadlock when a production blocker add commits before the guarded unpark", async () => {
+      const { results, blockerId, blockerIds, status } = await raceUnparkAgainstBlockerAdd("add-first");
+
+      // The add lands first, so the guard's readiness re-assert sees a live
+      // unresolved blocker and refuses rather than deleting the fresh edge.
+      expect(results[0]?.status).toBe("fulfilled");
+      expect(results[1]).toMatchObject({
+        status: "rejected",
+        reason: expect.objectContaining({
+          status: 409,
+          details: expect.objectContaining({ reason: "delegate_recovery_unresolved_blockers" }),
+        }),
+      });
+      expect(blockerIds).toEqual([blockerId]);
+      expect(status).toBe("blocked");
+    });
+
+    it("does not deadlock when the guarded unpark commits before a production blocker add", async () => {
+      const { results, blockerId, blockerIds, status } = await raceUnparkAgainstBlockerAdd("unpark-first");
+
+      // The unpark wins the row: it clears nothing (there was nothing to clear)
+      // and the add then applies its edge on top of the unparked row.
+      expect(results.every((result) => result.status === "fulfilled")).toBe(true);
+      expect(blockerIds).toEqual([blockerId]);
+      expect(status).toBe("todo");
+    });
+
+    it("takes the blocker-relation advisory lock before touching the issue row", async () => {
+      const { companyId, issueId, agentId } = await seedBlockedIssue();
+
+      const advisoryHeld = deferred<void>();
+      const releaseAdvisory = deferred<void>();
+      const lockKey = `paperclip:issue-blockers:${companyId}:${issueId}`;
+      const holder = db.transaction(async (tx) => {
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`);
+        advisoryHeld.resolve();
+        await releaseAdvisory.promise;
+      });
+      await advisoryHeld.promise;
+
+      const unparkPromise = unpark(issueId, agentId);
+      const unparkSettled = unparkPromise.catch(() => undefined);
+
+      // Wait for the unpark to actually park on the advisory lock rather than
+      // sleeping blind — otherwise a probe that ran before the unpark reached
+      // any lock would pass vacuously.
+      let parked = false;
+      for (let attempt = 0; attempt < 100 && !parked; attempt += 1) {
+        const rows = await db.execute(
+          sql`select count(*)::int as waiting from pg_locks where locktype = 'advisory' and not granted`,
+        );
+        parked = Number((rows as unknown as Array<{ waiting: number }>)[0]?.waiting ?? 0) > 0;
+        if (!parked) await sleep(20);
+      }
+      expect(parked).toBe(true);
+
+      // `runUpdate` takes `lockIssueBlockerRelations` before the row's
+      // `FOR UPDATE`, so a unpark parked on the advisory has not touched the
+      // row yet and this probe succeeds. If `.update(issues)` were hoisted above
+      // that call, the row would already be write-locked here and PostgreSQL
+      // would raise 55P03 (lock_not_available) instead.
+      const probe = await db
+        .transaction(async (tx) => {
+          await tx.execute(
+            sql`select ${issues.id} from ${issues} where ${issues.id} = ${issueId} for update nowait`,
+          );
+          return { acquired: true as const };
+        })
+        .catch((error: unknown) => {
+          const described = describeError(error);
+          return {
+            // 55P03 is lock_not_available — the row was already write-locked,
+            // which means the row lock was taken before the advisory lock.
+            acquired: described.codes.includes("55P03") ? ("row-already-locked" as const) : described.codes,
+            message: described.message,
+          };
+        });
+
+      releaseAdvisory.resolve();
+      await holder;
+      await unparkSettled;
+
+      expect(probe).toEqual({ acquired: true });
+      await expect(unparkPromise).resolves.toMatchObject({ status: "todo" });
+    });
+
     it("still unparks a row with no blockers at all", async () => {
       const { issueId, agentId } = await seedBlockedIssue();
 
