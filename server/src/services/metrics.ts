@@ -107,6 +107,56 @@ export const PROCESS_LOST_LIVENESS_NULL_METRIC = "paperclip_process_lost_livenes
  */
 export const ORPHANED_MANAGED_POD_REAPED_METRIC = "paperclip_orphaned_managed_pod_reaped_total";
 /**
+ * gbrain-context recall-prefetch outcome counter (BLO-25892).
+ *
+ * Incremented once per `agent.run.started` prefetch, at the single server-side
+ * write path (`pluginStateStore.set`, `stateKey="gbrain-context"`,
+ * `scopeKind="run"`) rather than inside the gbrain plugin worker — the worker
+ * runs out-of-process with no access to this registry, whereas every prefetch
+ * result already round-trips through `ctx.state.set` to persist to
+ * `plugin_state`, so hooking the existing write is free of a second RPC.
+ *
+ * This exists because container-restart-count monitoring is structurally
+ * blind to a recall outage: the 2026-08-08T11:00–22:00Z incident (1,629
+ * failed `traverse_graph` calls, 0 successes for 11h) left `gbrain-mcp`'s
+ * restart count untouched, because the fetch failed at the transport layer
+ * while the pod's own liveness probe (not routed through the same Service
+ * path) kept passing. `rate(...{status="error"}[15m])` crossing a threshold
+ * catches that class of failure regardless of whether the backing pod ever
+ * restarts.
+ *
+ * Labels: `status`, bounded to {@link KNOWN_GBRAIN_RECALL_STATUSES} (else
+ * "other" — see {@link normalizeGbrainRecallStatus}). Cardinality is fixed at
+ * 7 series, independent of agent/company/issue.
+ */
+export const GBRAIN_RECALL_METRIC = "paperclip_gbrain_recall_total";
+
+/**
+ * Closed set of `CachedRecallStatus` values from
+ * `packages/plugins/paperclip-plugin-gbrain/src/recall.ts`. Duplicated here
+ * (rather than imported) to keep this module's cardinality guardrail
+ * self-contained and independent of the plugin package's exports drifting.
+ */
+export const KNOWN_GBRAIN_RECALL_STATUSES = [
+  "ok",
+  "no-issue-page",
+  "empty",
+  "island",
+  "skipped",
+  "error",
+] as const;
+
+export const UNKNOWN_GBRAIN_RECALL_STATUS = "other";
+
+const knownGbrainRecallStatusSet: ReadonlySet<string> = new Set(KNOWN_GBRAIN_RECALL_STATUSES);
+
+export function normalizeGbrainRecallStatus(status: string | null | undefined): string {
+  return typeof status === "string" && knownGbrainRecallStatusSet.has(status)
+    ? status
+    : UNKNOWN_GBRAIN_RECALL_STATUS;
+}
+
+/**
  * GitHub review-request delivery-state counter (BLO-18859, parent BLO-18848).
  * One series per (`state`, `reason`) so an operator can read the full delivery
  * funnel for reviewer wakes driven by the in-tree GitHub receiver
@@ -919,6 +969,7 @@ let agentWakeupTerminalFailedUnresolved: Gauge<"error_code" | "scope"> | null = 
 let agentWakeupTerminalFailedOldestAge: Gauge<"scope"> | null = null;
 let githubWorkflowRunConclusion: Counter<"conclusion" | "supersession"> | null = null;
 let authRequest: Counter<"operation" | "outcome"> | null = null;
+let gbrainRecallTotal: Counter<"status"> | null = null;
 
 function ensureRegistry(): {
   registry: Registry;
@@ -943,6 +994,7 @@ function ensureRegistry(): {
   agentWakeupTerminalFailedOldestAgeGauge: Gauge<"scope">;
   githubWorkflowRunConclusionCounter: Counter<"conclusion" | "supersession">;
   authRequestCounter: Counter<"operation" | "outcome">;
+  gbrainRecallCounter: Counter<"status">;
 } {
   if (
     !registry
@@ -967,6 +1019,7 @@ function ensureRegistry(): {
     || !agentWakeupTerminalFailedOldestAge
     || !githubWorkflowRunConclusion
     || !authRequest
+    || !gbrainRecallTotal
   ) {
     registry = new Registry();
     concurrentRunBlocked = new Counter({
@@ -1270,6 +1323,20 @@ function ensureRegistry(): {
         authRequest.inc({ operation, outcome }, 0);
       }
     }
+    gbrainRecallTotal = new Counter({
+      name: GBRAIN_RECALL_METRIC,
+      help:
+        "Count of gbrain-context recall-prefetch outcomes (BLO-25892), labeled by bounded "
+        + "status (ok/no-issue-page/empty/island/skipped/error/other). Incremented at the "
+        + "pluginStateStore.set write path, once per agent.run.started prefetch. Detects a "
+        + "recall outage independent of gbrain-mcp container restart count -- see "
+        + GBRAIN_RECALL_METRIC + "'s doc comment for the 2026-08-08 incident this closes.",
+      labelNames: ["status"],
+      registers: [registry],
+    });
+    for (const status of [...KNOWN_GBRAIN_RECALL_STATUSES, UNKNOWN_GBRAIN_RECALL_STATUS]) {
+      gbrainRecallTotal.inc({ status }, 0);
+    }
     // Process/runtime metrics make the scrape target carry meaningful data even
     // before any refusal is reported (manual-verification check #3 on BLO-8328).
     collectDefaultMetrics({ register: registry });
@@ -1297,6 +1364,7 @@ function ensureRegistry(): {
     agentWakeupTerminalFailedOldestAgeGauge: agentWakeupTerminalFailedOldestAge,
     githubWorkflowRunConclusionCounter: githubWorkflowRunConclusion,
     authRequestCounter: authRequest,
+    gbrainRecallCounter: gbrainRecallTotal,
   };
 }
 
@@ -1744,6 +1812,18 @@ export function recordAuthRequest(input: {
   return labels;
 }
 
+/**
+ * Increment {@link GBRAIN_RECALL_METRIC} for one gbrain-context prefetch
+ * outcome. Called from `pluginStateStore.set` on every `stateKey="gbrain-context"`
+ * write rather than from the plugin worker itself (BLO-25892) -- see the
+ * metric's doc comment for why.
+ */
+export function recordGbrainRecallOutcome(status: string | null | undefined): { status: string } {
+  const labels = { status: normalizeGbrainRecallStatus(status) };
+  ensureRegistry().gbrainRecallCounter.inc(labels);
+  return labels;
+}
+
 export async function renderMetrics(): Promise<{ contentType: string; body: string }> {
   const reg = getMetricsRegistry();
   const depBlockedSnapshot = snapshotDepBlockedMetrics();
@@ -1792,6 +1872,7 @@ export function __resetMetricsForTest(): void {
   agentWakeupTerminalFailedOldestAge = null;
   githubWorkflowRunConclusion = null;
   authRequest = null;
+  gbrainRecallTotal = null;
   resetDepBlockedMetrics();
   resetBlockerResolvedWakeMetrics();
 }

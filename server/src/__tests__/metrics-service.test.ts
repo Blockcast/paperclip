@@ -53,6 +53,10 @@ import {
   computeExternalLifecycleSilenceGapSeconds,
   normalizeExternalLifecycleTerminalStatus,
   recordExternalLifecycleRunSilenceGap,
+  GBRAIN_RECALL_METRIC,
+  UNKNOWN_GBRAIN_RECALL_STATUS,
+  normalizeGbrainRecallStatus,
+  recordGbrainRecallOutcome,
 } from "../services/metrics.js";
 import {
   getDepBlockedMetric,
@@ -838,5 +842,32 @@ describe("computeExternalLifecycleSilenceGapSeconds + recordExternalLifecycleRun
     expect(body).not.toContain(
       `${EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_LAST_METRIC}{adapter="claude_k8s",status="cancelled"}`,
     );
+  });
+});
+
+describe("recordGbrainRecallOutcome + renderMetrics (BLO-25892)", () => {
+  it("zero-initializes every known status plus 'other' before any event", async () => {
+    const { body } = await renderMetrics();
+    expect(body).toContain(`# TYPE ${GBRAIN_RECALL_METRIC} counter`);
+    for (const status of ["ok", "no-issue-page", "empty", "island", "skipped", "error", "other"]) {
+      expect(body).toContain(`${GBRAIN_RECALL_METRIC}{status="${status}"} 0`);
+    }
+  });
+
+  it("increments the matching status series", async () => {
+    recordGbrainRecallOutcome("error");
+    recordGbrainRecallOutcome("error");
+    recordGbrainRecallOutcome("ok");
+    const { body } = await renderMetrics();
+    expect(body).toContain(`${GBRAIN_RECALL_METRIC}{status="error"} 2`);
+    expect(body).toContain(`${GBRAIN_RECALL_METRIC}{status="ok"} 1`);
+  });
+
+  it("collapses an unrecognized or missing status into 'other' (cardinality guardrail)", async () => {
+    expect(normalizeGbrainRecallStatus("not-a-real-status")).toBe(UNKNOWN_GBRAIN_RECALL_STATUS);
+    expect(normalizeGbrainRecallStatus(undefined)).toBe(UNKNOWN_GBRAIN_RECALL_STATUS);
+    recordGbrainRecallOutcome(undefined);
+    const { body } = await renderMetrics();
+    expect(body).toContain(`${GBRAIN_RECALL_METRIC}{status="other"} 1`);
   });
 });

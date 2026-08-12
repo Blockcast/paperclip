@@ -7,6 +7,24 @@ import type {
   ListPluginState,
 } from "@paperclipai/shared";
 import { notFound } from "../errors.js";
+import { recordGbrainRecallOutcome } from "./metrics.js";
+
+/**
+ * gbrain-context recall outcomes are counted here rather than in the gbrain
+ * plugin worker (BLO-25892): the worker runs out-of-process with no access to
+ * the server's Prometheus registry, but every prefetch result already
+ * round-trips through this exact write path to persist to `plugin_state`, so
+ * hooking it is free of a second RPC. See metrics.ts's GBRAIN_RECALL_METRIC
+ * doc comment for the 2026-08-08 outage this detection path closes.
+ */
+const GBRAIN_CONTEXT_STATE_KEY = "gbrain-context";
+
+function maybeRecordGbrainRecallOutcome(input: SetPluginState): void {
+  if (input.scopeKind !== "run" || input.stateKey !== GBRAIN_CONTEXT_STATE_KEY) return;
+  const value = input.value as { status?: unknown } | null | undefined;
+  const status = typeof value?.status === "string" ? value.status : undefined;
+  recordGbrainRecallOutcome(status);
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -165,6 +183,7 @@ export function pluginStateStore(db: Db) {
             updatedAt: new Date(),
           },
         });
+      maybeRecordGbrainRecallOutcome(input);
     },
 
     /**
