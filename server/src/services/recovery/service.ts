@@ -36,6 +36,7 @@ import { logger } from "../../middleware/logger.js";
 import { isPidAlive, isProcessGroupAlive, terminateLocalService } from "../local-service-supervisor.js";
 import { redactCurrentUserText } from "../../log-redaction.js";
 import { redactSensitiveText } from "../../redaction.js";
+import { PROVIDER_CAPACITY_MAX_HORIZON_MS } from "../provider-capacity-horizon-bound.js";
 import { logActivity } from "../activity-log.js";
 import { budgetService } from "../budgets.js";
 import { instanceSettingsService } from "../instance-settings.js";
@@ -45,6 +46,7 @@ import {
   issueTreeControlService,
 } from "../issue-tree-control.js";
 import { TERMINAL_HEARTBEAT_RUN_STATUSES, externalWaitFromDescription, issueService } from "../issues.js";
+import { releaseIssueRunOwnership, restoreCheckoutPromotedStatus } from "../issue-checkout-status.js";
 import {
   applyIssueMonitorPolicyTransition,
   derivePersistedMonitorState,
@@ -505,10 +507,15 @@ const PROVIDER_CAPACITY_RESET_INSTANT_PATTERN =
   /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
 
 // The horizon was advertised during the run that recorded it, and the write side
-// caps an accepted horizon at 24h past finalization. Bound the read lower side
-// by run creation and the upper side by run finish (falling back to creation)
-// so long-running jobs can still report a horizon parsed near the end.
-const PROVIDER_CAPACITY_RESET_MAX_SKEW_MS = 24 * 60 * 60 * 1000;
+// caps an accepted horizon at PROVIDER_CAPACITY_MAX_HORIZON_MS past
+// finalization. Bound the read lower side by run creation and the upper side by
+// run finish (falling back to creation) so long-running jobs can still report a
+// horizon parsed near the end.
+//
+// This is the SAME constant the writer caps with, deliberately — an over-cap
+// park lands exactly on the upper bound below, so the two diverging would
+// silently refuse every such horizon on read.
+const PROVIDER_CAPACITY_RESET_MAX_SKEW_MS = PROVIDER_CAPACITY_MAX_HORIZON_MS;
 
 type ProviderCapacityResetBounds = {
   lowerBoundAt: Date | null;
@@ -560,6 +567,12 @@ function readProviderCapacityResetProvenance(resultJson: Record<string, unknown>
   return {
     errorFamily: family,
     observedStatusCode: normalizeHttpStatusCode(provenance.observedStatusCode),
+    // BLO-18285: present only when the run parked at the horizon cap rather
+    // than on the instant the provider named. `providerCapacityResetAt` is then
+    // OUR checkpoint, not the provider's claim — so any sentence attributing it
+    // to the provider has to use this field instead, or it states something the
+    // provider never said.
+    advertisedResetAt: readNonEmptyString(provenance.advertisedResetAt) ?? null,
   };
 }
 
@@ -574,6 +587,11 @@ type ProviderCapacityResetRead = {
   // signal — neither implies a 429 capacity event, so neither may be reported
   // as one.
   is429Capacity: boolean;
+  // BLO-18285: set when `resetAt` is our capped checkpoint rather than the
+  // provider's own instant. Distinguishing them keeps the strand comment
+  // honest: at the checkpoint the ADVERTISED window has not elapsed, so the
+  // "that horizon has since elapsed" wording below would be simply untrue.
+  advertisedResetAt: string | null;
 };
 
 function readProviderCapacityResetAt(
@@ -590,12 +608,18 @@ function readProviderCapacityResetAt(
   const explicit = provenance
     ? canonicalizeCapacityResetInstant(resultJson.providerCapacityResetAt, bounds)
     : null;
-  if (explicit) return { resetAt: explicit, is429Capacity: provenance?.observedStatusCode === 429 };
+  if (explicit) {
+    return {
+      resetAt: explicit,
+      is429Capacity: provenance?.observedStatusCode === 429,
+      advertisedResetAt: provenance?.advertisedResetAt ?? null,
+    };
+  }
 
   const advertised =
     canonicalizeCapacityResetInstant(resultJson.retryNotBefore, bounds) ??
     canonicalizeCapacityResetInstant(resultJson.transientRetryNotBefore, bounds);
-  return advertised ? { resetAt: advertised, is429Capacity: false } : null;
+  return advertised ? { resetAt: advertised, is429Capacity: false, advertisedResetAt: null } : null;
 }
 
 export function summarizeRunFailureForIssueComment(run: LatestIssueRun, now = Date.now()) {
@@ -636,6 +660,41 @@ export function summarizeRunFailureForIssueComment(run: LatestIssueRun, now = Da
   const capacityReset = readProviderCapacityResetAt(run);
   if (capacityReset) {
     const suffix = errorCode ? ` (surfaced as \`${errorCode}\`)` : "";
+
+    // BLO-18285: an over-cap park. `resetAt` here is OUR checkpoint, not the
+    // provider's instant, so it must not be attributed to the provider — and
+    // the elapsed-horizon branch below must not fire on it, because reaching
+    // the checkpoint says nothing about the advertised window, which is still
+    // open by construction. Report both numbers and what each one means.
+    if (capacityReset.advertisedResetAt) {
+      const cause =
+        `provider capacity throttle (429) — the provider advertised a capacity reset at ` +
+        `${capacityReset.advertisedResetAt}, further out than we are willing to park on a single ` +
+        `unverified estimate`;
+      // Same cadence problem as the advertised-horizon branch below: a sweep
+      // routinely reads this run long after it failed. Past our own checkpoint
+      // the present tense is simply false — there is no live park left to
+      // describe — and "it parks again" would promise a retry path that only
+      // exists if something actually re-ran. Both readings sent operators
+      // waiting on a park that had already lapsed.
+      //
+      // What stays unclaimed past the checkpoint is whether the *advertised*
+      // window reopened: the checkpoint is our bound, not the provider's, so
+      // reaching it is no evidence either way. Hence "recheck", not "expired".
+      const checkpointAtMs = Date.parse(capacityReset.resetAt);
+      const checkpointStillAhead = Number.isFinite(checkpointAtMs) && checkpointAtMs > now;
+      return checkpointStillAhead
+        ? ` Latest retry failure: ${cause}${suffix}. The run is parked until ${capacityReset.resetAt} ` +
+            `to recheck capacity rather than waiting out the full advertised window; if the throttle is ` +
+            `still in force then, it parks again. This is transient and self-healing — the issue is ` +
+            `waiting on provider capacity, not on a broken runtime.`
+        : ` Latest retry failure: ${cause}${suffix}. Paperclip capped the park at ` +
+            `${capacityReset.resetAt}, and that checkpoint has since passed, so this is no longer a ` +
+            `live park. Reaching our own checkpoint says nothing about whether the advertised window ` +
+            `reopened — recheck current provider capacity and whether a further retry was actually ` +
+            `scheduled before either waiting on this window or diagnosing a different blocker.`;
+    }
+
     const cause = capacityReset.is429Capacity
       ? `provider capacity throttle (429) — the provider advertised a capacity reset at ${capacityReset.resetAt}`
       : `provider rate-limit/quota window — the provider advertised availability no earlier than ${capacityReset.resetAt}`;
@@ -2921,21 +2980,19 @@ export function recoveryService(
           .where(and(eq(agentWakeupRequests.id, input.run.wakeupRequestId), eq(agentWakeupRequests.companyId, input.run.companyId)));
       }
 
-      await tx
-        .update(issues)
-        .set({
-          executionRunId: null,
-          executionAgentNameKey: null,
-          executionLockedAt: null,
-          updatedAt: input.now,
-        })
-        .where(
-          and(
-            eq(issues.id, input.sourceIssue.id),
-            eq(issues.companyId, input.run.companyId),
-            eq(issues.executionRunId, input.run.id),
-          ),
-        );
+      await releaseIssueRunOwnership(tx, {
+        issueId: input.sourceIssue.id,
+        companyId: input.run.companyId,
+        runId: input.run.id,
+        updatedAt: input.now,
+      });
+
+      // The run is finalized; if it never wrote a status of its own, undo the
+      // `in_progress` its checkout wrote (BLO-20649).
+      await restoreCheckoutPromotedStatus(tx, {
+        issueId: input.sourceIssue.id,
+        companyId: input.run.companyId,
+      });
 
       return updatedRun;
     });

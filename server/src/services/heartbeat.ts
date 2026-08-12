@@ -208,6 +208,11 @@ import {
   TERMINAL_HEARTBEAT_RUN_STATUS_VALUES,
   TERMINAL_HEARTBEAT_RUN_STATUSES,
 } from "./issue-execution-lock.js";
+import {
+  releaseIssueRunOwnership,
+  restoreCheckoutPromotedStatus,
+  restoreCheckoutPromotedStatuses,
+} from "./issue-checkout-status.js";
 import { resolveStaleDependabotAlertWakeIssue } from "./dependabot-alert-issues.js";
 import { createToolGatewayService } from "./tool-gateway.js";
 import { toolAccessService } from "./tool-access.js";
@@ -326,6 +331,7 @@ import {
   withRecoveryModelProfileHint,
 } from "./recovery/model-profile-hint.js";
 import { recoveryService, STALE_PRE_CLAIM_ISSUE_LOCK_MS } from "./recovery/service.js";
+import { PROVIDER_CAPACITY_MAX_HORIZON_MS } from "./provider-capacity-horizon-bound.js";
 import { productivityReviewService } from "./productivity-review.js";
 import { resolveRequiredSuccessfulRunHandoffOnValidPath } from "./successful-run-handoff-state.js";
 import { taskWatchdogService } from "./task-watchdogs.js";
@@ -3787,25 +3793,97 @@ const PROVIDER_CAPACITY_RESET_AT_PATTERN =
 const PROVIDER_CAPACITY_RETRY_IN_PATTERN = /\bretry\s+in\s+(\d+(?:\.\d+)?)\s*(?:s\b|secs?\b|seconds?\b)/i;
 const PROVIDER_CAPACITY_RESET_PROVENANCE_SOURCE = "server_parse_provider_capacity_horizon";
 
-// An advertised horizon further out than this is treated as unusable rather
-// than parked on: a bad parse (or a provider bug) must not silently sideline an
-// issue for days. 24h comfortably covers real capacity windows — the observed
-// fault asked for ~2h40m — while bounding the blast radius of a wrong read.
-const PROVIDER_CAPACITY_MAX_HORIZON_MS = 24 * 60 * 60 * 1000;
+// A horizon further out than this is not parked on verbatim: a bad parse (or a
+// provider bug) must not silently sideline an issue for days. The bound is
+// imported, not declared: it is shared with the recovery reader, and
+// provider-capacity-horizon-bound.ts records why the two cannot be chosen
+// independently.
 
-export function parseProviderCapacityResetHorizon(
+// BLO-18285: what an over-cap horizon means, and why it is no longer discarded.
+//
+// The cap above used to collapse into a bare `null`, which made "the provider
+// advertised nothing" and "the provider advertised 88.8h" indistinguishable to
+// every caller. That conflation is the bug: an over-cap 429 then fell through
+// to the rate-limit family's flat 90s curve (12 attempts, ~18min of post-gate
+// retries) and exhausted entirely inside a window that was still closed —
+// BackoffLimitExceeded, then `stranded_assigned_issue`. Live proof: run
+// b48c8b30 on BLO-18285 itself, which advertised `retry in 319565s` (88.8h) and
+// took the 90s hop ~592x short.
+//
+// So the failure got *worse* as the provider got more informative: a hint-less
+// 503 earns the exponential transient_upstream curve (2m/10m/30m/2h), while a
+// 429 that stated its horizon precisely earned the flat curve and a strand.
+// Re-curving is not a fix either — 2h42m of exponential backoff still lands
+// inside 88.8h. The only disposition that does not strand is to park.
+//
+// We therefore park AT the cap rather than on the advertised instant: the
+// original blast-radius concern is preserved (we never sideline an issue for
+// the multi-day figure we do not trust), while the run lands in a
+// `scheduled_retry` — a live execution path to hasActiveExecutionPath, so the
+// strand sweep leaves the issue alone. If the window is genuinely still closed
+// 24h later, the next attempt parks another 24h. That converges across a
+// multi-day outage without ever requiring operator intervention, which the
+// status quo — a permanent strand inside 18 minutes — does not.
+export type ProviderCapacityHorizon =
+  | { kind: "none" }
+  | { kind: "usable"; at: Date }
+  | { kind: "over_horizon"; advertisedAt: Date; parkAt: Date };
+
+// Which fields may push a run into the 24h over-cap park, and which may only
+// confirm an instant we were already willing to honor.
+//
+// `message` / `error` are populated by the SDK and the adapters; `result` and
+// `summary` are model-authored (claude-local's parse.ts assigns the SDK final
+// result event verbatim, so `resultJson.result` is the agent's own prose and
+// `summary` is derived from it). That is the same split
+// TRANSIENT_UPSTREAM_TEXT_KEYS already draws for the hint-less classifier, and
+// for the same reason.
+//
+// The asymmetry below is deliberate. A `usable` reading parks on an instant
+// inside a window we are willing to honor anyway, and which fields may supply
+// one was settled — and pinned by test — in BLO-18278. An `over_horizon`
+// reading is a much stronger claim: it sidelines the issue for a full 24h on
+// the strength of a figure we have explicitly decided not to trust. Model prose
+// must not be able to make that claim. Without this, a genuine structured 429
+// arriving alongside prose that merely *quotes* some unrelated far-future reset
+// ("the gateway said capacity resets 2031-01-01") satisfies the over-cap gate
+// and parks the issue for a day.
+const PROVIDER_CAPACITY_MACHINE_AUTHORED_TEXT_KEYS = ["message", "error"] as const;
+const PROVIDER_CAPACITY_HORIZON_TEXT_KEYS = ["result", "message", "error", "summary"] as const;
+
+export function resolveProviderCapacityHorizon(
   input: { resultJson?: Record<string, unknown> | null; errorMessage?: string | null },
   now = Date.now(),
-): Date | null {
+): ProviderCapacityHorizon {
   const resultJson = input.resultJson ?? null;
-  const candidates: unknown[] = [input.errorMessage];
+  // `machineAuthored` gates the over-cap park only. Iteration order is
+  // unchanged from the usable-path behavior BLO-18278 shipped.
+  const candidates: { text: unknown; machineAuthored: boolean }[] = [
+    { text: input.errorMessage, machineAuthored: true },
+  ];
   if (resultJson) {
-    for (const key of ["result", "message", "error", "summary"] as const) {
-      candidates.push(resultJson[key]);
+    for (const key of PROVIDER_CAPACITY_HORIZON_TEXT_KEYS) {
+      candidates.push({
+        text: resultJson[key],
+        machineAuthored: (PROVIDER_CAPACITY_MACHINE_AUTHORED_TEXT_KEYS as readonly string[]).includes(key),
+      });
     }
   }
 
-  for (const candidate of candidates) {
+  // Remembered, not returned early: a usable horizon on any later candidate
+  // still wins outright. Only when no candidate yields one does an over-cap
+  // reading become the answer.
+  let overHorizon: { kind: "over_horizon"; advertisedAt: Date; parkAt: Date } | null = null;
+  const noteOverHorizon = (advertisedMs: number, machineAuthored: boolean) => {
+    if (!machineAuthored) return;
+    overHorizon ??= {
+      kind: "over_horizon",
+      advertisedAt: new Date(advertisedMs),
+      parkAt: new Date(now + PROVIDER_CAPACITY_MAX_HORIZON_MS),
+    };
+  };
+
+  for (const { text: candidate, machineAuthored } of candidates) {
     if (typeof candidate !== "string") continue;
 
     // An absolute timestamp is authoritative when present: it survives any
@@ -3814,26 +3892,42 @@ export function parseProviderCapacityResetHorizon(
     const absolute = candidate.match(PROVIDER_CAPACITY_RESET_AT_PATTERN)?.[1];
     if (absolute) {
       const parsed = new Date(absolute).getTime();
-      if (Number.isFinite(parsed) && parsed > now && parsed - now <= PROVIDER_CAPACITY_MAX_HORIZON_MS) {
-        return new Date(parsed);
+      if (Number.isFinite(parsed) && parsed > now) {
+        if (parsed - now <= PROVIDER_CAPACITY_MAX_HORIZON_MS) return { kind: "usable", at: new Date(parsed) };
+        noteOverHorizon(parsed, machineAuthored);
       }
-      // A parsed-but-unusable absolute horizon (already elapsed, or absurdly
-      // far out) is a deliberate no-hint answer for THIS field rather than a
-      // reason to fall back to the relative form in the same string, which
-      // would disagree with it.
+      // A parsed-but-unusable absolute horizon (already elapsed, or beyond the
+      // cap) is a deliberate answer for THIS field rather than a reason to fall
+      // back to the relative form in the same string, which would disagree with
+      // it. An elapsed horizon stays `none`: it describes a window that has
+      // already reopened, so there is nothing to wait for.
       continue;
     }
 
     const relativeSeconds = candidate.match(PROVIDER_CAPACITY_RETRY_IN_PATTERN)?.[1];
     if (relativeSeconds) {
       const seconds = Number.parseFloat(relativeSeconds);
-      if (Number.isFinite(seconds) && seconds > 0 && seconds * 1000 <= PROVIDER_CAPACITY_MAX_HORIZON_MS) {
-        return new Date(now + Math.ceil(seconds * 1000));
+      if (Number.isFinite(seconds) && seconds > 0) {
+        if (seconds * 1000 <= PROVIDER_CAPACITY_MAX_HORIZON_MS) {
+          return { kind: "usable", at: new Date(now + Math.ceil(seconds * 1000)) };
+        }
+        noteOverHorizon(now + Math.ceil(seconds * 1000), machineAuthored);
       }
     }
   }
 
-  return null;
+  return overHorizon ?? { kind: "none" };
+}
+
+// Back-compat surface: "the instant we may park on verbatim", which is exactly
+// the usable case. Callers that must distinguish an over-cap advertisement from
+// silence call resolveProviderCapacityHorizon directly.
+export function parseProviderCapacityResetHorizon(
+  input: { resultJson?: Record<string, unknown> | null; errorMessage?: string | null },
+  now = Date.now(),
+): Date | null {
+  const resolved = resolveProviderCapacityHorizon(input, now);
+  return resolved.kind === "usable" ? resolved.at : null;
 }
 
 function readProviderCapacityResetStatusEvidence(
@@ -11737,11 +11831,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   async function handleRunLivenessContinuation(run: typeof heartbeatRuns.$inferSelect) {
     const livenessState = run.livenessState as RunLivenessState | null;
-    if (livenessState !== "plan_only" && livenessState !== "empty_response") return;
+    if (livenessState !== "plan_only" && livenessState !== "empty_response") return false;
 
     const context = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(context.issueId);
-    if (!issueId) return;
+    if (!issueId) return false;
 
     const [issue, agent] = await Promise.all([
       db
@@ -11796,7 +11890,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           trigger: productivityHold.trigger,
           reason: productivityHold.reason,
         });
-        return;
+        return false;
       }
     }
 
@@ -11836,10 +11930,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         issueId,
         comment: decision.comment,
       });
-      return;
+      return false;
     }
 
-    if (decision.kind !== "enqueue") return;
+    if (decision.kind !== "enqueue") return Boolean(existingWake);
 
     const continuationRun = await enqueueWakeup(run.agentId, {
       source: "automation",
@@ -11861,6 +11955,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         })
         .where(eq(heartbeatRuns.id, run.id));
     }
+    return Boolean(continuationRun);
   }
 
   function issueUiLink(issue: Pick<typeof issues.$inferSelect, "id" | "identifier">) {
@@ -11935,10 +12030,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   async function handleSuccessfulRunHandoff(run: typeof heartbeatRuns.$inferSelect, agent: typeof agents.$inferSelect) {
-    if (run.status !== "succeeded") return;
+    if (run.status !== "succeeded") return false;
     const context = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(context.issueId) ?? readNonEmptyString(context.taskId);
-    if (!issueId) return;
+    if (!issueId) return false;
 
     const issue = await db
       .select({
@@ -11947,6 +12042,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         identifier: issues.identifier,
         title: issues.title,
         status: issues.status,
+        workMode: issues.workMode,
         assigneeAgentId: issues.assigneeAgentId,
         assigneeUserId: issues.assigneeUserId,
         executionState: issues.executionState,
@@ -12150,7 +12246,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
     }
 
-    if (decision.kind !== "enqueue" || !issue) return;
+    if (decision.kind !== "enqueue" || !issue) {
+      return Boolean(activeExecutionPath || queuedWake || existingWake);
+    }
 
     if (hasUnmanagedBackgroundTaskEvidence(parseObject(run.resultJson))) {
       await db
@@ -12173,7 +12271,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       requestedByActorType: "system",
       requestedByActorId: "heartbeat",
     });
-    if (!handoffRun) return;
+    if (!handoffRun) return false;
 
     await addSuccessfulRunHandoffCommentOnce({
       issue,
@@ -12200,6 +12298,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         issue: issueUiLink(issue),
       },
     });
+    return true;
   }
 
   async function appendRunEvent(
@@ -13444,6 +13543,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             eq(issues.executionRunId, cancelled.id),
           ),
         );
+      // The gate cancelled this run before it could do anything, so undo the
+      // `in_progress` its checkout wrote (BLO-20649).
+      await restoreCheckoutPromotedStatus(db, {
+        issueId: gate.issueId,
+        companyId: cancelled.companyId,
+      });
     }
 
     await appendRunEvent(cancelled, await nextRunEventSeq(cancelled.id), {
@@ -13795,6 +13900,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                   updatedAt: now,
                 })
                 .where(and(eq(issues.id, depIssueId), eq(issues.executionRunId, exhausted.id)));
+              // Retry budget is spent and no run will resume this issue, so the
+              // checkout promotion has to come back off (BLO-20649).
+              await restoreCheckoutPromotedStatus(db, {
+                issueId: depIssueId,
+                companyId: exhausted.companyId,
+              });
             }
             return { outcome: "not_promoted", run: exhausted };
           }
@@ -15703,21 +15814,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       error: reason,
     });
 
-    await db
-      .update(issues)
-      .set({
-        executionRunId: null,
-        executionAgentNameKey: null,
-        executionLockedAt: null,
-        updatedAt: now,
-      })
-      .where(
-        and(
-          eq(issues.companyId, run.companyId),
-          eq(issues.id, issueId),
-          eq(issues.executionRunId, run.id),
-        ),
-      );
+    await releaseIssueRunOwnership(db, {
+      issueId,
+      companyId: run.companyId,
+      runId: run.id,
+      updatedAt: now,
+    });
+    // The run was cancelled before it could advance anything, so undo the
+    // `in_progress` its checkout wrote (BLO-20649).
+    await restoreCheckoutPromotedStatus(db, { issueId, companyId: run.companyId });
 
     await appendRunEvent(cancelled, await nextRunEventSeq(cancelled.id), {
       eventType: "lifecycle",
@@ -15938,21 +16043,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       error: staleness.reason,
     });
 
-    await db
-      .update(issues)
-      .set({
-        executionRunId: null,
-        executionAgentNameKey: null,
-        executionLockedAt: null,
-        updatedAt: now,
-      })
-      .where(
-        and(
-          eq(issues.companyId, run.companyId),
-          eq(issues.id, issueId),
-          eq(issues.executionRunId, run.id),
-        ),
-      );
+    await releaseIssueRunOwnership(db, {
+      issueId,
+      companyId: run.companyId,
+      runId: run.id,
+      updatedAt: now,
+    });
+    // The run was cancelled before it could advance anything, so undo the
+    // `in_progress` its checkout wrote (BLO-20649).
+    await restoreCheckoutPromotedStatus(db, { issueId, companyId: run.companyId });
 
     await appendRunEvent(cancelled, await nextRunEventSeq(cancelled.id), {
       eventType: "lifecycle",
@@ -16967,10 +17066,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       errorCode: terminalOutcome.errorCode,
       runId: input.run.id,
     });
-    const promotedRunDispatched = await releaseIssueExecutionAndPromote(finalizedRun);
-    await handleRunLivenessContinuation(finalizedRun);
+    const deferredCheckoutRestoreIssueId = finalizedRun.status === "succeeded"
+      ? issueIdFromRunContext(finalizedRun.contextSnapshot) ?? null
+      : null;
+    const promotedRunDispatched = await releaseIssueExecutionAndPromote(finalizedRun, {
+      deferPrimaryCheckoutRestoration: deferredCheckoutRestoreIssueId !== null,
+    });
+    const livenessContinuationOwnsCheckout = await handleRunLivenessContinuation(finalizedRun);
+    let successfulHandoffOwnsCheckout = false;
     if (finalizationAgent) {
-      await handleSuccessfulRunHandoff(finalizedRun, finalizationAgent);
+      successfulHandoffOwnsCheckout = await handleSuccessfulRunHandoff(finalizedRun, finalizationAgent);
+    }
+    if (
+      deferredCheckoutRestoreIssueId &&
+      !promotedRunDispatched &&
+      !livenessContinuationOwnsCheckout &&
+      !successfulHandoffOwnsCheckout
+    ) {
+      await restoreCheckoutPromotedStatus(db, {
+        issueId: deferredCheckoutRestoreIssueId,
+        companyId: finalizedRun.companyId,
+      });
     }
     await appendRunEvent(finalizedRun, await nextRunEventSeq(finalizedRun.id), {
       eventType: "lifecycle",
@@ -23061,10 +23177,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               const inRunHorizonBudgetMs =
                 (K8S_CCROTATE_IN_RUN_RETRY_MAX_ATTEMPTS - ccrotateRetryAttempt) *
                 K8S_CCROTATE_IN_RUN_RETRY_MAX_DELAY_MS;
-              const advertisedResetAt = parseProviderCapacityResetHorizon({
+              // BLO-18285: an over-cap advertisement counts here too. It is the
+              // strongest possible evidence the in-run loop cannot outlast the
+              // window — it exceeds the budget by definition — yet the verbatim
+              // parser reports it as no hint at all, so the loop used to spend
+              // every remaining attempt inside a window measured in days.
+              const inRunCapacityHorizon = resolveProviderCapacityHorizon({
                 resultJson: adapterResult.resultJson,
                 errorMessage: adapterResult.errorMessage,
               });
+              const advertisedResetAt =
+                inRunCapacityHorizon.kind === "usable"
+                  ? inRunCapacityHorizon.at
+                  : inRunCapacityHorizon.kind === "over_horizon"
+                    ? inRunCapacityHorizon.advertisedAt
+                    : null;
               if (advertisedResetAt && advertisedResetAt.getTime() - Date.now() > inRunHorizonBudgetMs) {
                 await appendRunEvent(currentRun, seq++, {
                   eventType: "lifecycle",
@@ -23074,6 +23201,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                     "provider advertised a capacity reset beyond the in-run retry budget; deferring to a scheduled retry at that reset",
                   payload: {
                     advertisedResetAt: advertisedResetAt.toISOString(),
+                    overHorizon: inRunCapacityHorizon.kind === "over_horizon",
                     inRunHorizonBudgetMs,
                     attemptsUsed: ccrotateRetryAttempt,
                     maxAttempts: K8S_CCROTATE_IN_RUN_RETRY_MAX_ATTEMPTS,
@@ -23316,16 +23444,33 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // structured case is not unhandled: it is picked up a few lines down.
       const providerCapacityThrottleOverride =
         rateLimitExhaustedOverride || providerThrottledNoProgressOverride;
-      const providerCapacityResetAt =
+      const resolvedProviderCapacityHorizon =
         providerCapacityThrottleOverride && !adapterResult.retryNotBefore
-          ? parseProviderCapacityResetHorizon({
+          ? resolveProviderCapacityHorizon({
               resultJson: adapterResult.resultJson,
               errorMessage: adapterResult.errorMessage,
             })
-          : null;
+          : ({ kind: "none" } as const);
+      const providerCapacityResetAt =
+        resolvedProviderCapacityHorizon.kind === "usable" ? resolvedProviderCapacityHorizon.at : null;
       const providerCapacityResetStatusEvidence = providerCapacityThrottleOverride
         ? readProviderCapacityResetStatusEvidence(adapterResult.resultJson)
         : null;
+      // BLO-18285: the provider stated a horizon we will not park on verbatim.
+      // Park at the cap instead of discarding it — discarding drops the run onto
+      // the rate-limit family's flat 90s curve, which exhausts inside ~18min and
+      // strands whenever the real window is longer than that.
+      //
+      // Gated on an observed 429 for the same reason the structured path below
+      // is: the throttle families also fire for 401 cap-windows and legacy quota
+      // signals, and without corroboration a stray far-future timestamp quoted
+      // in unrelated tool output could park a run for 24h. With it, the only way
+      // here is a genuine capacity 429 that named a window past the cap.
+      const providerCapacityOverHorizonParkAt =
+        resolvedProviderCapacityHorizon.kind === "over_horizon" &&
+        providerCapacityResetStatusEvidence?.statusCode === 429
+          ? resolvedProviderCapacityHorizon.parkAt
+          : null;
       // The structured counterpart of the prose horizon above. Gated on the
       // server having actually observed a 429 on this result: the throttle
       // families also fire for 401 cap-windows and legacy quota signals, and a
@@ -23334,13 +23479,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const structuredProviderCapacityResetAt =
         providerCapacityThrottleOverride &&
         !providerCapacityResetAt &&
+        !providerCapacityOverHorizonParkAt &&
         providerCapacityResetStatusEvidence?.statusCode === 429
           ? canonicalizeAdapterCapacityResetInstant(adapterResult.retryNotBefore)
           : null;
       const persistedProviderCapacityResetAt =
-        providerCapacityResetAt ?? structuredProviderCapacityResetAt;
+        providerCapacityResetAt ?? providerCapacityOverHorizonParkAt ?? structuredProviderCapacityResetAt;
       const effectiveRetryNotBefore =
-        adapterResult.retryNotBefore ?? providerCapacityResetAt?.toISOString() ?? null;
+        adapterResult.retryNotBefore ??
+        providerCapacityResetAt?.toISOString() ??
+        providerCapacityOverHorizonParkAt?.toISOString() ??
+        null;
       let prReviewCompletionEvidence = outcome === "succeeded"
         ? evaluatePrReviewCompletionEvidence(context, {
           resultJson: adapterResult.resultJson ?? null,
@@ -23552,7 +23701,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                           : "provider_throttled_no_progress",
                         horizonSource: providerCapacityResetAt
                           ? "server_prose_parse"
-                          : "adapter_structured_retry_not_before",
+                          : providerCapacityOverHorizonParkAt
+                            ? "server_prose_parse_over_horizon_park"
+                            : "adapter_structured_retry_not_before",
+                        // BLO-18285: an over-cap park is deliberately NOT the
+                        // instant the provider named, so record what it actually
+                        // asked for. Without this the persisted run says only
+                        // "park at +24h" and the 88.8h advertisement — the whole
+                        // reason this is not a verbatim park — is unrecoverable.
+                        ...(providerCapacityOverHorizonParkAt &&
+                        resolvedProviderCapacityHorizon.kind === "over_horizon"
+                          ? {
+                              advertisedResetAt:
+                                resolvedProviderCapacityHorizon.advertisedAt.toISOString(),
+                              horizonCapMs: PROVIDER_CAPACITY_MAX_HORIZON_MS,
+                            }
+                          : {}),
                       },
                     }
                   : {}),
@@ -23723,12 +23887,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
         }
         const issueCommentPolicyResult = await finalizeIssueCommentPolicy(livenessRun, agent);
-        await releaseIssueExecutionAndPromote(
-          livenessRun,
-          suppressImmediateRecovery ? { suppressImmediateRecovery: true } : undefined,
-        );
-        await handleRunLivenessContinuation(livenessRun);
-        await handleSuccessfulRunHandoff(
+        const deferredCheckoutRestoreIssueId = livenessRun.status === "succeeded"
+          ? issueIdFromRunContext(livenessRun.contextSnapshot) ?? null
+          : null;
+        const promotedRunDispatched = await releaseIssueExecutionAndPromote(livenessRun, {
+          suppressImmediateRecovery,
+          deferPrimaryCheckoutRestoration: deferredCheckoutRestoreIssueId !== null,
+        });
+        const livenessContinuationOwnsCheckout = await handleRunLivenessContinuation(livenessRun);
+        const successfulHandoffOwnsCheckout = await handleSuccessfulRunHandoff(
           issueCommentPolicyResult.outcome === "retry_queued" || issueCommentPolicyResult.outcome === "retry_exhausted"
             ? {
               ...livenessRun,
@@ -23737,6 +23904,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             : livenessRun,
           agent,
         );
+        if (
+          deferredCheckoutRestoreIssueId &&
+          !promotedRunDispatched &&
+          !livenessContinuationOwnsCheckout &&
+          !successfulHandoffOwnsCheckout
+        ) {
+          await restoreCheckoutPromotedStatus(db, {
+            issueId: deferredCheckoutRestoreIssueId,
+            companyId: livenessRun.companyId,
+          });
+        }
 
         // Dependency wake re-check: if this run's issue was marked done mid-run,
         // the route-time `issue_blockers_resolved` wake may have been gated by
@@ -24368,10 +24546,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   async function releaseIssueExecutionAndPromote(
     run: typeof heartbeatRuns.$inferSelect,
-    options: { suppressImmediateRecovery?: boolean } = {},
+    options: {
+      suppressImmediateRecovery?: boolean;
+      deferPrimaryCheckoutRestoration?: boolean;
+    } = {},
   ): Promise<boolean> {
     const runContext = parseObject(run.contextSnapshot);
-    const contextIssueId = readNonEmptyString(runContext.issueId);
+    const contextIssueId = issueIdFromRunContext(runContext);
     const taskKey = deriveTaskKeyWithHeartbeatFallback(runContext, null);
     const recoveryAgent = await getAgent(run.agentId);
     const recoveryAgentInvokable =
@@ -24434,6 +24615,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ),
         )
         .orderBy(asc(issues.id));
+      const candidateIssueIds = candidateIssues.map((candidate) => candidate.id);
 
       // Clear orphaned execution-lock columns that still point at this finalizing
       // run, across every sibling issue in one statement so it scales with N
@@ -24479,6 +24661,30 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         (contextIssueId
           ? candidateIssues.find((candidate) => candidate.id === contextIssueId)
           : candidateIssues[0]) ?? null;
+      const primaryIssueId = issue?.id ?? null;
+
+      // Restoring a checkout promotion must wait until this finalizer has decided
+      // whether its primary issue has a replacement execution path. A continuation
+      // retry requires persisted `in_progress` when it is claimed; restoring first
+      // would leave the in-memory `issue` snapshot looking eligible while the new
+      // queued retry is cancelled by its own staleness gate. Siblings, and a primary
+      // issue with no replacement path, still restore inside this transaction.
+      const completePromotion = async <T>(
+        result: T,
+        completionOptions: { retainPrimaryCheckoutPromotion?: boolean } = {},
+      ): Promise<T> => {
+        const retainPrimaryCheckoutPromotion =
+          options.deferPrimaryCheckoutRestoration ||
+          completionOptions.retainPrimaryCheckoutPromotion;
+        const issueIds = retainPrimaryCheckoutPromotion && primaryIssueId
+          ? candidateIssueIds.filter((issueId) => issueId !== primaryIssueId)
+          : candidateIssueIds;
+        await restoreCheckoutPromotedStatuses(tx, {
+          issueIds,
+          companyId: run.companyId,
+        });
+        return result;
+      };
 
       if (!issue) {
         if (isNonRetryablePrReviewTerminalOutcome(run)) {
@@ -24490,7 +24696,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             false,
           ) ?? null;
         }
-        return null;
+        return completePromotion(null);
       }
       const activeExecutionState = parseIssueExecutionState(issue.executionState);
       const finalizedRunExecutionStage = parseObject(runContext.executionStage);
@@ -24515,7 +24721,34 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           { issueId: issue.id, finalizingRunId: run.id, activeExecutionRunId: issue.executionRunId },
           "skipping terminal-run recovery because a newer issue execution is active",
         );
-        return { kind: "superseded" as const };
+        return completePromotion({ kind: "superseded" as const });
+      }
+      // A corrective successful-run handoff that still records no disposition
+      // must remain WIP for the exhausted-handoff reconciler. Its checkout is no
+      // longer a temporary queue-tier promotion once the corrective run itself
+      // succeeds, so consume the restore marker before the guarded restoration.
+      // This runs after the supersession guard so a stale finalizer cannot erase
+      // the marker owned by a newer running execution.
+      if (
+        run.status === "succeeded" &&
+        (
+          runContext.handoffRequired === true ||
+          readNonEmptyString(runContext.wakeReason) === FINISH_SUCCESSFUL_RUN_HANDOFF_REASON
+        )
+      ) {
+        await tx
+          .update(issues)
+          .set({
+            checkoutRestoreStatus: null,
+            updatedAt: new Date(),
+          })
+          .where(
+            and(
+              eq(issues.id, issue.id),
+              eq(issues.companyId, run.companyId),
+              eq(issues.status, "in_progress"),
+            ),
+          );
       }
       if (isNonRetryablePrReviewTerminalOutcome(run) && !finalizedRunStageSuperseded) {
         // The outbox row is part of the ownership decision: a replacement run
@@ -24548,19 +24781,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           finalizedRunStageId,
         ))
       ) {
-        return {
-          kind: "blocked" as const,
-          issue,
-          previousStatus: issue.status,
-          comment: buildNonRetryableExecutionReviewParticipantComment({ latestRun: run }),
-          recoveryCause: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_CAUSE,
-          recoveryOwnerAgentId: activeParticipant.agentId,
-          expectedReviewStage: {
-            stageId: finalizedRunStageId,
-            participantAgentId: run.agentId,
-            executionRunId: null,
+        return completePromotion(
+          {
+            kind: "blocked" as const,
+            issue,
+            previousStatus: issue.status,
+            comment: buildNonRetryableExecutionReviewParticipantComment({ latestRun: run }),
+            recoveryCause: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_CAUSE,
+            recoveryOwnerAgentId: activeParticipant.agentId,
+            expectedReviewStage: {
+              stageId: finalizedRunStageId,
+              participantAgentId: run.agentId,
+              executionRunId: null,
+            },
           },
-        };
+          { retainPrimaryCheckoutPromotion: true },
+        );
       }
 
       // Pre-dispatch validation recovery: if the finalizing run failed before
@@ -24574,17 +24810,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         issue.assigneeAgentId === run.agentId
       ) {
         const configurationIncomplete = isConfigurationIncompleteFailedRun(run);
-        return {
-          kind: "blocked" as const,
-          issue,
-          previousStatus: issue.status,
-          comment: configurationIncomplete
-            ? buildConfigurationIncompleteRecoveryComment({ latestRun: run })
-            : buildWorkspaceValidationRecoveryComment({ latestRun: run }),
-          recoveryCause: configurationIncomplete
-            ? CONFIGURATION_INCOMPLETE_RECOVERY_CAUSE
-            : WORKSPACE_VALIDATION_RECOVERY_CAUSE,
-        };
+        return completePromotion(
+          {
+            kind: "blocked" as const,
+            issue,
+            previousStatus: issue.status,
+            comment: configurationIncomplete
+              ? buildConfigurationIncompleteRecoveryComment({ latestRun: run })
+              : buildWorkspaceValidationRecoveryComment({ latestRun: run }),
+            recoveryCause: configurationIncomplete
+              ? CONFIGURATION_INCOMPLETE_RECOVERY_CAUSE
+              : WORKSPACE_VALIDATION_RECOVERY_CAUSE,
+            recoveryOwnerAgentId: undefined,
+            expectedReviewStage: undefined,
+          },
+          { retainPrimaryCheckoutPromotion: true },
+        );
       }
 
 
@@ -24876,11 +25117,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           })
           .where(eq(agentWakeupRequests.id, deferred.id));
 
-        return {
-          kind: "promoted" as const,
-          run: newRun,
-          reopenedActivity,
-        };
+        return completePromotion(
+          {
+            kind: "promoted" as const,
+            run: newRun,
+            reopenedActivity,
+          },
+          { retainPrimaryCheckoutPromotion: true },
+        );
       }
 
       const findExistingExecutionPath = (agentId?: string | null) =>
@@ -24939,21 +25183,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       if (issueNeedsReviewParticipantRecovery) {
         const existingReviewParticipantExecutionPath = await findExistingExecutionPath(currentParticipant.agentId);
+        const reviewRecoveryHasReplacementPath = Boolean(
+          existingReviewParticipantExecutionPath || issueHasPersistedMonitor,
+        );
         if (
           options.suppressImmediateRecovery ||
-          existingReviewParticipantExecutionPath ||
-          issueHasPersistedMonitor ||
+          reviewRecoveryHasReplacementPath ||
           await isAutomaticRecoverySuppressedByPauseHold(db, issue.companyId, issue.id, treeControlSvc)
         ) {
-          return { kind: "released" as const };
+          return completePromotion(
+            { kind: "released" as const },
+            { retainPrimaryCheckoutPromotion: reviewRecoveryHasReplacementPath },
+          );
         }
 
         if (issue.originKind === RECOVERY_ORIGIN_KINDS.strandedIssueRecovery) {
-          return {
-            kind: "blocked_recovery_in_place" as const,
-            issue,
-            previousStatus: issue.status,
-          };
+          return completePromotion(
+            {
+              kind: "blocked_recovery_in_place" as const,
+              issue,
+              previousStatus: issue.status,
+            },
+            { retainPrimaryCheckoutPromotion: true },
+          );
         }
 
         const shouldBlockReviewRecovery =
@@ -24961,19 +25213,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           !recoveryAgent ||
           isExecutionReviewParticipantRecoveryRun(run);
         if (shouldBlockReviewRecovery) {
-          return {
-            kind: "blocked" as const,
-            issue,
-            previousStatus: issue.status,
-            comment: buildExecutionReviewParticipantRecoveryComment({ latestRun: run }),
-            recoveryCause: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_CAUSE,
-            recoveryOwnerAgentId: currentParticipant.agentId,
-            expectedReviewStage: {
-              stageId: runStageId,
-              participantAgentId: run.agentId,
-              executionRunId: null,
+          return completePromotion(
+            {
+              kind: "blocked" as const,
+              issue,
+              previousStatus: issue.status,
+              comment: buildExecutionReviewParticipantRecoveryComment({ latestRun: run }),
+              recoveryCause: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_CAUSE,
+              recoveryOwnerAgentId: currentParticipant.agentId,
+              expectedReviewStage: {
+                stageId: runStageId,
+                participantAgentId: run.agentId,
+                executionRunId: null,
+              },
             },
-          };
+            { retainPrimaryCheckoutPromotion: true },
+          );
         }
 
         const now = new Date();
@@ -25036,10 +25291,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           })
           .where(eq(agentWakeupRequests.id, wakeupRequest.id));
 
-        return {
-          kind: "queued_recovery" as const,
-          run: queuedRun,
-        };
+        return completePromotion(
+          {
+            kind: "queued_recovery" as const,
+            run: queuedRun,
+          },
+          { retainPrimaryCheckoutPromotion: true },
+        );
       }
 
       const issueNeedsImmediateRecovery =
@@ -25048,28 +25306,31 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         issue.assigneeAgentId === run.agentId &&
         (run.status === "failed" || run.status === "timed_out" || run.status === "cancelled");
 
-      if (!issueNeedsImmediateRecovery) {
-        return { kind: "released" as const };
-      }
-      if (options.suppressImmediateRecovery) {
-        return { kind: "released" as const };
-      }
+      if (!issueNeedsImmediateRecovery) return completePromotion({ kind: "released" as const });
+      if (options.suppressImmediateRecovery) return completePromotion({ kind: "released" as const });
 
       const existingExecutionPath = await findExistingExecutionPath();
-      if (existingExecutionPath || issueHasPersistedMonitor || await findExplicitBlockerPath()) {
-        return { kind: "released" as const };
+      const immediateRecoveryHasReplacementPath = Boolean(existingExecutionPath || issueHasPersistedMonitor);
+      if (immediateRecoveryHasReplacementPath || await findExplicitBlockerPath()) {
+        return completePromotion(
+          { kind: "released" as const },
+          { retainPrimaryCheckoutPromotion: immediateRecoveryHasReplacementPath },
+        );
       }
 
       if (await isAutomaticRecoverySuppressedByPauseHold(db, issue.companyId, issue.id, treeControlSvc, tx)) {
-        return { kind: "released" as const };
+        return completePromotion({ kind: "released" as const });
       }
 
       if (issue.originKind === RECOVERY_ORIGIN_KINDS.strandedIssueRecovery) {
-        return {
-          kind: "blocked_recovery_in_place" as const,
-          issue,
-          previousStatus: issue.status,
-        };
+        return completePromotion(
+          {
+            kind: "blocked_recovery_in_place" as const,
+            issue,
+            previousStatus: issue.status,
+          },
+          { retainPrimaryCheckoutPromotion: true },
+        );
       }
 
       const shouldBlockImmediately =
@@ -25090,17 +25351,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 status: issue.status as "todo" | "in_progress",
                 latestRun: run,
               });
-        return {
-          kind: "blocked" as const,
-          issue,
-          previousStatus: issue.status,
-          comment,
-          recoveryCause: workspaceValidationFailure
-            ? WORKSPACE_VALIDATION_RECOVERY_CAUSE
-            : configurationIncompleteFailure
-              ? CONFIGURATION_INCOMPLETE_RECOVERY_CAUSE
-              : undefined,
-        };
+        return completePromotion(
+          {
+            kind: "blocked" as const,
+            issue,
+            previousStatus: issue.status,
+            comment,
+            recoveryCause: workspaceValidationFailure
+              ? WORKSPACE_VALIDATION_RECOVERY_CAUSE
+              : configurationIncompleteFailure
+                ? CONFIGURATION_INCOMPLETE_RECOVERY_CAUSE
+                : undefined,
+            recoveryOwnerAgentId: undefined,
+            expectedReviewStage: undefined,
+          },
+          { retainPrimaryCheckoutPromotion: true },
+        );
       }
 
       const retryReason = issue.status === "todo" ? "assignment_recovery" : "issue_continuation_needed";
@@ -25183,10 +25449,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         })
         .where(eq(agentWakeupRequests.id, wakeupRequest.id));
 
-      return {
-        kind: "queued_recovery" as const,
-        run: queuedRun,
-      };
+      return completePromotion(
+        {
+          kind: "queued_recovery" as const,
+          run: queuedRun,
+        },
+        { retainPrimaryCheckoutPromotion: true },
+      );
     });
 
     if (gateDelivery) {

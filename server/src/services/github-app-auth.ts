@@ -5,9 +5,9 @@
  * heartbeat.ts) is a text heuristic over the agent's free-text summary; it
  * flags `pr_review_output_missing` whenever the summary lacks a recognized
  * posted-review / skip marker. In practice that misfires on legitimate runs
- * (idempotency skips, comment-mode reviews) — the PR *was* reviewed, but the
- * phrasing wasn't matched. This module lets the server check the authoritative
- * source — GitHub — before keeping that `missing` verdict.
+ * (for example, an idempotency skip or a formal App approval) — the PR *was*
+ * reviewed, but the phrasing wasn't matched. This module lets the server check
+ * the authoritative source — GitHub — before keeping that `missing` verdict.
  *
  * The server has no ambient GitHub token, so we mint short-lived **installation
  * tokens** from the GitHub App creds (`paperclip-github-app-creds`, surfaced via
@@ -81,12 +81,6 @@ export function githubReviewerIdentityMatches(login: string, configuredLogin: st
   // GitHub usernames cannot contain `[`/`]` or `/`, so a user account cannot
   // register either accepted App representation and collide with this match.
   return candidate === `${appSlug}[bot]` || candidate === `app/${appSlug}`;
-}
-
-function githubReviewerApprovalSeatMatches(login: string, configuredLogin: string): boolean {
-  const candidate = exactGithubLogin(login);
-  const appSlug = githubReviewerAppSlug(configuredLogin);
-  return Boolean(candidate && appSlug && candidate === appSlug);
 }
 
 /**
@@ -208,7 +202,7 @@ export async function getInstallationToken(nowMs: number = Date.now()): Promise<
 }
 
 export type ReviewerEvidenceResult =
-  | { found: true; via: "review" | "comment" }
+  | { found: true; via: "review" }
   | { found: false }
   | { error: string };
 
@@ -253,11 +247,9 @@ function headShaHex(headSha: string | null | undefined): string | null {
 }
 
 /**
- * Fetch the PR's current head SHA. Used only as a fallback when the wake didn't
- * carry one (BLO-10878): a null head SHA used to disable the comment-mode check
- * entirely (`headPrefix` null), so comment-mode reviews on PRs whose wake lacked
- * a head SHA were never recognized → false `pr_review_output_missing`. Returns
- * null on any non-OK / failed fetch so the caller keeps its lenient fallback.
+ * Fetch the PR's current head SHA when the reviewer wake omitted one. The App
+ * gate is tied to that exact commit; a missing/unreadable PR head therefore
+ * fails closed rather than accepting review evidence for an arbitrary commit.
  */
 async function fetchPrHeadSha(
   apiBase: string,
@@ -276,70 +268,19 @@ async function fetchPrHeadSha(
   }
 }
 
-// BLO-10878 cause #2: cap the at-or-newer `compare` fan-out so a comment-heavy PR
-// (many embedded hex strings) can't trigger an unbounded number of API calls.
-const MAX_AT_OR_NEWER_COMPARES = 10;
-
 /**
- * GitHub commit comparison status of `head` relative to `base`
- * (`ahead` | `behind` | `identical` | `diverged`), or null on any non-OK / failed
- * fetch. An unknown SHA (e.g. a non-commit hex scraped from a comment) 404s → null,
- * so the caller simply skips that candidate rather than failing the whole check.
- */
-async function compareCommitStatus(
-  apiBase: string,
-  repoFullName: string,
-  baseSha: string,
-  headSha: string,
-  headers: Record<string, string>,
-): Promise<string | null> {
-  try {
-    const res = await ghFetch(`${apiBase}/repos/${repoFullName}/compare/${baseSha}...${headSha}`, { headers });
-    if (!res.ok) return null;
-    const body = (await res.json().catch(() => null)) as { status?: string } | null;
-    return typeof body?.status === "string" ? body.status : null;
-  } catch {
-    return null;
-  }
-}
-
-function consolidatedReviewHead(body: string): string | null {
-  if (!/(?:^|\n)\s*## Ally — Consolidated PR Review\s*(?=\n|$)/.test(body)) {
-    return null;
-  }
-  const attestations = Array.from(
-    body.matchAll(/(?:^|\n)\s*_?\s*reviewed head:\s*([0-9a-f]{40})\s*_?\s*(?=\n|$)/gi),
-    (match) => match[1]!.toLowerCase(),
-  );
-  return attestations.length === 1 ? attestations[0]! : null;
-}
-
-/**
- * Authoritatively check whether the reviewer bot left a review or comment for
- * THIS PR head on GitHub before a claimed PR-review run can complete.
+ * Authoritatively check whether the reviewer GitHub App approved THIS PR's
+ * required head before a claimed PR-review run can complete.
  *
- * Found when either:
- *  - a review authored by the bot has `commit_id === headSha` (precise: reviewed
- *    this exact head), or
- *  - an APPROVED review authored by the same-slug user seat has the canonical
- *    consolidated-review body and exactly one standalone full-SHA `Reviewed head:`
- *    attestation (covers GitHub's App-self-review restriction), or
- *  - an issue comment authored by the bot has the canonical consolidated-review
- *    heading and exactly one standalone full-SHA `Reviewed head:` attestation
- *    (covers comment-mode reviews on bot-authored PRs, which carry no commit_id).
- *
- * If no exact-head match is found, a second pass (BLO-10878 cause #2) credits a
- * bot review/comment whose head is a DESCENDANT of the wake head — the PR
- * commonly advances between the reviewer-wake and the review, so Ally reviews a
- * newer commit than the one the wake carried. Each off-head candidate SHA is
- * checked with GitHub `compare` and accepted only when the candidate is "ahead"
- * of (or "identical" to) the wake head; "behind"/"diverged" are rejected, so a
- * genuinely-unreviewed newer head still flags. Bounded by MAX_AT_OR_NEWER_COMPARES.
+ * Found only when an APPROVED formal review from the configured App is recorded
+ * on the exact wake head, or on the PR's resolved current head when the wake
+ * omitted it. The same-slug user seat is a separate team-evidence lane; issue
+ * comments and descendant reviews cannot satisfy this App gate.
  *
  * Returns `{error}` on invalid configuration, missing creds/token, or any non-OK
- * or failed reviews/comments fetch. Callers fail completion closed with a
- * retryable verification-unavailable error. A failed `compare` only skips that
- * candidate because the second pass is additive and cannot downgrade a verdict.
+ * or failed reviews fetch. Callers fail completion closed with a retryable
+ * verification-unavailable error. An unresolved required head returns
+ * `{found:false}` and never accepts arbitrary review evidence.
  */
 export async function githubHasReviewerEvidenceForPr(input: {
   repoFullName: string;
@@ -356,20 +297,12 @@ export async function githubHasReviewerEvidenceForPr(input: {
 
   const headers = { ...GITHUB_API_HEADERS, authorization: `Bearer ${token}` };
   const apiBase = gitHubApiBase(GITHUB_HOST);
-  // BLO-10878: when the wake didn't carry a head SHA, fall back to the PR's
-  // current head so the comment-mode check (keyed on `headPrefix`) still runs.
-  // Previously a null head SHA skipped comments entirely and only the formal-
-  // review loop ran, missing Ally's frequent comment-mode reviews.
   const headSha =
     headShaHex(input.headSha) ?? (await fetchPrHeadSha(apiBase, input.repoFullName, input.prNumber, headers));
-  const headPrefix = headShaHex(headSha);
+  if (!headSha) return { found: false };
 
-  // Off-head bot review/comment SHAs collected during the exact-head passes below;
-  // consumed by the at-or-newer fallback (cause #2) only when no exact match found.
-  const reviewCandidates: string[] = [];
-  const commentCandidates: string[] = [];
-
-  // 1) Formal reviews — match the bot author at this exact head commit.
+  // Only a formal APPROVED review from the configured App at the required exact
+  // head can satisfy the protected App lane.
   try {
     for (let page = 1; page <= 10; page += 1) {
       const url = `${apiBase}/repos/${input.repoFullName}/pulls/${input.prNumber}/reviews?per_page=100&page=${page}`;
@@ -382,86 +315,19 @@ export async function githubHasReviewerEvidenceForPr(input: {
         user?: { login?: string };
         commit_id?: string | null;
         state?: string | null;
-        body?: string | null;
       }>;
       for (const review of batch) {
         const authorLogin = review.user?.login ?? "";
         const commitId = headShaHex(review.commit_id);
         if (githubReviewerIdentityMatches(authorLogin, botLogin)) {
-          if (!headSha) return { found: true, via: "review" };
-          if (commitId === headSha) return { found: true, via: "review" };
-          if (commitId) reviewCandidates.push(commitId);
-          continue;
-        }
-        if (githubReviewerApprovalSeatMatches(authorLogin, botLogin)) {
           if ((review.state ?? "").toUpperCase() !== "APPROVED") continue;
-          const reviewedHead = consolidatedReviewHead(review.body ?? "");
-          if (!reviewedHead) continue;
-          if (!headSha) return { found: true, via: "review" };
-          if (reviewedHead === headSha) return { found: true, via: "review" };
-          // Formal user-seat approvals are trusted only from the dedicated
-          // reviewer pipeline's canonical body. The at-or-newer fallback still
-          // proves this self-attested SHA is a real descendant before crediting it.
-          reviewCandidates.push(reviewedHead);
+          if (commitId === headSha) return { found: true, via: "review" };
         }
       }
       if (batch.length < 100) break;
     }
   } catch {
     return { error: "reviews_fetch_failed" };
-  }
-
-  // 2) Issue comments — accept only the server-controlled consolidated-review
-  // shape. A request comment can contain the exact SHA, so an arbitrary substring
-  // match is not durable evidence that the external review side effect happened.
-  if (headPrefix) {
-    try {
-      for (let page = 1; page <= 10; page += 1) {
-        const url = `${apiBase}/repos/${input.repoFullName}/issues/${input.prNumber}/comments?per_page=100&page=${page}`;
-        const res = await ghFetch(url, { headers });
-        if (!res.ok) {
-          const classified = await classifyGithubHttpFailure("comments", res);
-          return { error: classified.reason };
-        }
-        const batch = (await res.json()) as Array<{ user?: { login?: string }; body?: string }>;
-        for (const comment of batch) {
-          if (!githubReviewerIdentityMatches(comment.user?.login ?? "", botLogin)) continue;
-          const rawBody = comment.body ?? "";
-          const reviewedHead = consolidatedReviewHead(rawBody);
-          if (!reviewedHead) continue;
-          if (reviewedHead === headSha) return { found: true, via: "comment" };
-          commentCandidates.push(reviewedHead);
-        }
-        if (batch.length < 100) break;
-      }
-    } catch {
-      return { error: "comments_fetch_failed" };
-    }
-  }
-
-  // 3) At-or-newer fallback (BLO-10878 cause #2): no exact-head match, but a bot
-  // review/comment may sit on a DESCENDANT of the wake head (the PR advanced
-  // between the wake and the review). Check off-head candidates newest-first
-  // (reviews, then comments) and credit the first that is "ahead"/"identical";
-  // "behind"/"diverged" — and unknown-SHA 404s — are skipped, so a genuinely
-  // unreviewed newer head still flags. Compare fan-out is bounded.
-  if (headSha) {
-    const seen = new Set<string>([headSha]);
-    let compares = 0;
-    const passes: Array<{ shas: string[]; via: "review" | "comment" }> = [
-      { shas: reviewCandidates.slice().reverse(), via: "review" },
-      { shas: commentCandidates.slice().reverse(), via: "comment" },
-    ];
-    for (const { shas, via } of passes) {
-      for (const sha of shas) {
-        if (compares >= MAX_AT_OR_NEWER_COMPARES) break;
-        if (seen.has(sha)) continue;
-        seen.add(sha);
-        compares += 1;
-        const status = await compareCommitStatus(apiBase, input.repoFullName, headSha, sha, headers);
-        if (status === "ahead" || status === "identical") return { found: true, via };
-      }
-    }
   }
 
   return { found: false };
