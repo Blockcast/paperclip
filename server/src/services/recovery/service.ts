@@ -5664,6 +5664,11 @@ export function recoveryService(
           hasNewActivitySinceLastAttempt,
           needsHumanDecision,
           blockerIds,
+          // BLO-21395: `null` suppresses the scheduler-side failure heartbeat. A provider
+          // capacity park is not a strand the system has committed to — it may still
+          // self-heal on retry — so emitting here would post a dark-window receipt about a
+          // window that is very likely still live. Non-null on the stranding path below.
+          schedulerFailureHeartbeat: null,
         };
       }
 
@@ -5908,9 +5913,10 @@ export function recoveryService(
         blockerIds,
         publishEscalationActivity,
         // BLO-21395: the scheduler-side failure heartbeat is cross-posted after this
-        // transaction commits, and `prefix` is only derived in here. Threading it out
-        // beats a second `getCompanyIssuePrefix` round trip on the same company.
-        prefix,
+        // transaction commits, and `prefix` is only derived in here — threading it out
+        // beats a second `getCompanyIssuePrefix` round trip on the same company. Non-null
+        // marks this as a real strand, distinguishing it from the provider-quota park above.
+        schedulerFailureHeartbeat: { prefix },
       };
     });
     if (!escalation) return null;
@@ -5963,13 +5969,16 @@ export function recoveryService(
     // surface, so a window that stranded before its runbook could emit is never silent.
     // Deliberately after commit, next to the other deferred side-effects: this writes a
     // comment to a *different* issue, and inside the transaction a failure to post would
-    // roll back an escalation that is otherwise correct and already decided.
-    await postRoutineSchedulerFailureHeartbeat({
-      issue: escalation.fresh,
-      recoveryCause: escalation.recoveryCause,
-      latestRun: input.latestRun,
-      prefix: escalation.prefix,
-    });
+    // roll back an escalation that is otherwise correct and already decided. `null` means
+    // the provider-quota park path, which must not emit — see the early return above.
+    if (escalation.schedulerFailureHeartbeat) {
+      await postRoutineSchedulerFailureHeartbeat({
+        issue: escalation.fresh,
+        recoveryCause: escalation.recoveryCause,
+        latestRun: input.latestRun,
+        prefix: escalation.schedulerFailureHeartbeat.prefix,
+      });
+    }
 
     return escalation.updated;
   }
