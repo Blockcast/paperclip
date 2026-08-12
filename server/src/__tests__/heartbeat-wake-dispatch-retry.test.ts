@@ -1560,6 +1560,7 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
       // and the run that leaked out of a later pass is recorded after it.
       const markerAt = new Date(now.getTime() - 5 * 60_000);
       const deliveredAt = new Date(now.getTime() - 60_000);
+      const staleMarkerId = randomUUID();
 
       const deliveredRunId = randomUUID();
       await db.insert(heartbeatRuns).values({
@@ -1572,6 +1573,13 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
         responsibleUserId: "responsible-user",
       });
       // The prior delivery, still live (`queued`) and pointing at that run.
+      // Stamped with the marker's id, because that is what an earlier pass over
+      // THIS marker writes -- the claim matches on delivery identity, not on a
+      // time window (Ally review on #1313, Important 1).
+      //
+      // A row written before that stamp existed carries no token and so will
+      // not match, which during a rolling deploy degrades to the pre-existing
+      // bounded over-wake (one extra run) rather than to under-wake.
       await db.insert(agentWakeupRequests).values({
         id: randomUUID(),
         companyId,
@@ -1582,10 +1590,10 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
         status: "queued",
         idempotencyKey,
         runId: deliveredRunId,
+        payload: { __wakeRedeliveryOf: staleMarkerId },
         requestedAt: deliveredAt,
       });
       // The un-retired marker the reconciler will now re-drive.
-      const staleMarkerId = randomUUID();
       await db.insert(agentWakeupRequests).values({
         id: staleMarkerId,
         companyId,
@@ -1638,10 +1646,15 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
       // easy to get wrong. `issues.ts` mints
       // `blockers_resolved:<blockerId>:<dependentId>` with no event-instance or
       // time component, so that exact key legitimately recurs every time the
-      // blocker is re-added and re-resolved. An unbounded claim would match the
+      // blocker is re-added and re-resolved. An unscoped claim would match the
       // FIRST delivery's long-completed row and suppress the second, real wake
       // forever -- under-wake, which is worse than the bounded over-wake this
       // issue removes.
+      //
+      // The scoping mechanism is the delivery token, not a time window: the old
+      // row below is nobody's redelivery and so carries no token. The sibling
+      // case where the unrelated delivery is NEWER than the marker -- which a
+      // time window got wrong -- is covered separately below.
       const { agentId, companyId } = await seedCompanyAndAgent();
       const now = new Date();
       const recurringKey = "blockers_resolved:blocker-1:dependent-1";
@@ -1773,6 +1786,234 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
       expect(stealerAResult.recovered).toBe(0);
       // One reclaim == one run, not two.
       expect(await runsForAgent(agentId)).toHaveLength(1);
+    });
+
+    it("dispatches its own wake when a LATER independent delivery reuses the recurring key", async () => {
+      // Ally review on #1313, Important 1. The claim was first scoped by a
+      // LOWER bound on the marker's `requestedAt`, which is wrong in the
+      // harmful direction: given an old retryable marker M and a later, wholly
+      // unrelated recurrence of the same key, M matched the NEWER row, marked
+      // itself `dispatch_recovered`, and its own wake was never dispatched at
+      // all -- silent under-wake.
+      //
+      // The delivery token fixes it by identity: only a row M's own redelivery
+      // stamped can satisfy M.
+      const { agentId, companyId } = await seedCompanyAndAgent();
+      const now = new Date();
+      const recurringKey = "blockers_resolved:blocker-2:dependent-2";
+
+      // M: failed 10 minutes ago, due now.
+      const markerId = randomUUID();
+      await db.insert(agentWakeupRequests).values({
+        id: markerId,
+        companyId,
+        agentId,
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_blockers_resolved",
+        payload: {
+          dispatchRetry: {
+            attempts: 1,
+            nextAttemptAt: new Date(now.getTime() - 1000).toISOString(),
+            originalOpts: {
+              source: "automation",
+              triggerDetail: "system",
+              reason: "issue_blockers_resolved",
+              idempotencyKey: recurringKey,
+              payload: { taskKey: "issue:BLO-25726-later-recurrence" },
+            },
+          },
+        },
+        status: "dispatch_failed",
+        idempotencyKey: recurringKey,
+        requestedAt: new Date(now.getTime() - 10 * 60_000),
+      });
+
+      // A later, INDEPENDENT delivery of the same recurring key -- the blocker
+      // was re-added and re-resolved. It is `queued` with a live run, and its
+      // requestedAt is AFTER M's, so the old lower-bound predicate matched it.
+      // It carries no redelivery token, because it is nobody's redelivery.
+      const unrelatedRunId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: unrelatedRunId,
+        companyId,
+        agentId,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status: "queued",
+        responsibleUserId: "responsible-user",
+      });
+      await db.insert(agentWakeupRequests).values({
+        id: randomUUID(),
+        companyId,
+        agentId,
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_blockers_resolved",
+        status: "queued",
+        idempotencyKey: recurringKey,
+        runId: unrelatedRunId,
+        requestedAt: new Date(now.getTime() - 60_000),
+      });
+
+      const result = await heartbeat.reconcileFailedWakeDispatches(now);
+      expect(result.recovered).toBe(1);
+
+      // The discriminating assertion: M produced a run of its OWN. With the
+      // lower bound restored this is 1 -- M silently adopts the unrelated
+      // delivery's run and its wake is lost.
+      const runs = await runsForAgent(agentId);
+      expect(runs).toHaveLength(2);
+      expect(runs.some((r) => r.id !== unrelatedRunId)).toBe(true);
+    });
+
+    it("treats an already-`claimed` delivery as delivered rather than queueing a second run", async () => {
+      // Ally review on #1313, Important 3. A wake moves `queued` -> `claimed`
+      // when a worker picks its run up. With `claimed` missing from the
+      // delivered-status set, a reconciler that crashed between claiming the
+      // delivery and retiring its marker found no delivered row on the next
+      // pass and queued a SECOND run -- for a wake that was not merely
+      // delivered but already executing.
+      const { agentId, companyId } = await seedCompanyAndAgent();
+      const now = new Date();
+      const key = "wake_redelivery:BLO-25726-claimed";
+
+      const markerId = randomUUID();
+      await db.insert(agentWakeupRequests).values({
+        id: markerId,
+        companyId,
+        agentId,
+        source: "automation",
+        triggerDetail: "system",
+        reason: "github_pr_opened",
+        payload: {
+          dispatchRetry: {
+            attempts: 1,
+            nextAttemptAt: new Date(now.getTime() - 1000).toISOString(),
+            originalOpts: {
+              source: "automation",
+              triggerDetail: "system",
+              reason: "github_pr_opened",
+              idempotencyKey: key,
+              payload: { taskKey: "pr_review:Blockcast/test#25726-claimed" },
+            },
+          },
+        },
+        status: "dispatch_failed",
+        idempotencyKey: key,
+        requestedAt: new Date(now.getTime() - 10 * 60_000),
+      });
+
+      // The delivery a previous pass over THIS marker committed (hence the
+      // token) before dying without retiring it. A worker has since picked the
+      // run up, so the wake row is `claimed`, not `queued`.
+      const deliveredRunId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: deliveredRunId,
+        companyId,
+        agentId,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status: "running",
+        responsibleUserId: "responsible-user",
+      });
+      await db.insert(agentWakeupRequests).values({
+        id: randomUUID(),
+        companyId,
+        agentId,
+        source: "automation",
+        triggerDetail: "system",
+        reason: "github_pr_opened",
+        status: "claimed",
+        idempotencyKey: key,
+        runId: deliveredRunId,
+        claimedAt: new Date(now.getTime() - 5 * 60_000),
+        payload: { __wakeRedeliveryOf: markerId },
+        requestedAt: new Date(now.getTime() - 9 * 60_000),
+      });
+
+      const result = await heartbeat.reconcileFailedWakeDispatches(now);
+      expect(result.recovered).toBe(1);
+
+      // Exactly one run, and it is the one already executing. With `claimed`
+      // absent from the delivered set this is 2.
+      const runs = await runsForAgent(agentId);
+      expect(runs).toHaveLength(1);
+      expect(runs[0]?.id).toBe(deliveredRunId);
+
+      const [marker] = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, markerId));
+      expect(marker?.status).toBe("dispatch_recovered");
+    });
+
+    it("discards its outcome when its claim expired and was reclaimed mid-dispatch", async () => {
+      // Ally review on #1313, Important 2. The claim was only half a lease:
+      // every terminal and re-arm write matched on `id` alone, so a pass that
+      // ran past its ten-minute lease could stamp its outcome over the state of
+      // whoever had legitimately reclaimed the row -- reopening the concurrent
+      // redelivery the claim exists to prevent.
+      const { agentId, companyId } = await seedCompanyAndAgent();
+      const now = new Date();
+      const markerId = randomUUID();
+      await db.insert(agentWakeupRequests).values({
+        id: markerId,
+        companyId,
+        agentId,
+        source: "automation",
+        triggerDetail: "system",
+        reason: "github_pr_opened",
+        payload: {
+          dispatchRetry: {
+            attempts: 1,
+            nextAttemptAt: new Date(now.getTime() - 1000).toISOString(),
+            originalOpts: {
+              source: "automation",
+              triggerDetail: "system",
+              reason: "github_pr_opened",
+              payload: { taskKey: "pr_review:Blockcast/test#25726-fence" },
+            },
+          },
+        },
+        status: "dispatch_failed",
+        requestedAt: new Date(now.getTime() - 10 * 60_000),
+      });
+
+      // Simulate the lease lapsing DURING this pass's dispatch: by the time it
+      // comes to record its outcome, a new owner holds the row under a fresh
+      // claim. Injected after the run commits, which is exactly where a slow
+      // pass would lose its lease.
+      const stolenClaimAt = new Date(now.getTime() + 60_000);
+      let stolen = 0;
+      const slowPass = heartbeatService(db, {
+        skipQueuedRunDispatch: true,
+        beforeQueuedRunDispatchForTest: async () => {
+          if (stolen > 0) return;
+          stolen += 1;
+          await db
+            .update(agentWakeupRequests)
+            .set({ status: "dispatch_retrying", claimedAt: stolenClaimAt })
+            .where(eq(agentWakeupRequests.id, markerId));
+        },
+      });
+
+      const result = await slowPass.reconcileFailedWakeDispatches(now);
+      expect(stolen).toBe(1);
+
+      // It must not report an outcome it no longer owned. Without the fence
+      // this is 1.
+      expect(result.recovered).toBe(0);
+
+      // And the new owner's claim must survive intact. Without the fence the
+      // row reads `dispatch_recovered` with a null claim, so the new owner's
+      // own write later lands on a row someone else already retired.
+      const [marker] = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, markerId));
+      expect(marker?.status).toBe("dispatch_retrying");
+      expect(marker?.claimedAt?.getTime()).toBe(stolenClaimAt.getTime());
     });
   });
 });
