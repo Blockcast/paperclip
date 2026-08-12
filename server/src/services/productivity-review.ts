@@ -106,6 +106,17 @@ const CAPACITY_RETRY_ERROR_CODE = "rate_limit_exhausted";
 // while an episode that was already long *before* the retry started still
 // fires on its own unattended time.
 const CAPACITY_STALL_DOMINANT_SHARE = 0.5;
+// BLO-26165: `heartbeatRuns.issueCommentStatus` defaults to (and is explicitly
+// re-stamped) `not_applicable` by `finalizeIssueCommentPolicy` (heartbeat.ts)
+// for any run whose wake reason never required a comment in the first place —
+// including a run whose adapter container was never created at all (a
+// pre-adapter setup failure such as `preferred_workspace_unrealizable`; see
+// BLO-23096). That subsystem is authoritative on "was a comment ever
+// expected here" independent of whether `classifyAndPersistRunLiveness`
+// managed to run, which is the axis `isNeverExecutedRun` depends on. Runs
+// this excludes are reported separately as `neverInvokedRunCount` rather than
+// folded into `runtimeFailureStreak`, since the two signals can disagree.
+const NEVER_INVOKED_ISSUE_COMMENT_STATUS = "not_applicable";
 export const PRODUCTIVITY_REVIEW_REFRESH_COMMENT_PREFIX = "Productivity review evidence refreshed.";
 const PRODUCTIVITY_REVIEW_CREATED_ACTION = "issue.productivity_review_created";
 const PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_STARTED_ACTION =
@@ -175,6 +186,15 @@ type ProductivityReviewEvidence = {
   // `isNeverExecutedRun`. Evidence text must not claim "0 input/output
   // tokens" for a run where usage was never recorded at all.
   runtimeFailureUsageBasis: "measured" | "inferred" | "mixed" | null;
+  // BLO-26165: count of terminal runs excluded from the `noCommentStreak` walk
+  // because `issueCommentStatus === "not_applicable"` — the comment-requirement
+  // subsystem (`finalizeIssueCommentPolicy` in heartbeat.ts) already determined
+  // no comment was ever expected from them. Distinct from `runtimeFailureStreak`
+  // (a heuristic over `livenessState`/`usageJson`/`logBytes` that can miss a
+  // pre-adapter setup failure whose liveness classification never ran) so the
+  // evidence block can tell a reviewer "this many runs never had a chance to
+  // comment" apart from "this many runs executed and stayed silent."
+  neverInvokedRunCount: number;
   totalRunCount: number;
   terminalRunCount: number;
   activeRunCount: number;
@@ -874,9 +894,10 @@ function choosePrimaryTrigger(input: {
   // runs that never got a model turn, that is the root cause worth surfacing
   // first — an agent that never executed cannot also be judged unproductive
   // (BLO-21769). `no_comment_streak` only ever counts turn-executing runs
-  // (see `isNeverExecutedRun` filtering in `collectEvidence`), so the two
-  // streaks are drawn from disjoint run sets and can coexist without this
-  // ordering being arbitrary.
+  // that were actually expected to comment (see `isNeverExecutedRun` and the
+  // `NEVER_INVOKED_ISSUE_COMMENT_STATUS` filtering in `collectEvidence`,
+  // BLO-26165), so the two streaks are drawn from disjoint run sets and can
+  // coexist without this ordering being arbitrary.
   if (input.runtimeFailure) return "runtime_failure_streak";
   if (input.noComment) return "no_comment_streak";
   if (input.highChurn) return "high_churn";
@@ -2382,8 +2403,26 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
             ? "inferred"
             : "measured";
     const executedTerminalRuns = terminalRuns.filter((run) => !isNeverExecutedRun(run));
+    // BLO-26165: a run stamped `issueCommentStatus: "not_applicable"` was
+    // never expected to comment in the first place — either because its
+    // adapter container was never created (BLO-23096: `preferred_workspace_
+    // unrealizable` / `adapter_failed` setup failures, where `usageJson`,
+    // `logBytes`, and `logStore`/`logRef` all stay null) or because
+    // `finalizeIssueCommentPolicy` classified its wake reason as one that
+    // never required a comment. Either way, counting it as a silent run
+    // misattributes an infrastructure or policy fact to the assignee.
+    // Excluded here rather than folded into `isNeverExecutedRun` because the
+    // two signals are independent and can disagree — `issueCommentStatus` is
+    // written by a separate subsystem that does not depend on
+    // `classifyAndPersistRunLiveness` having successfully run.
+    const neverInvokedRunCount = terminalRuns.filter(
+      (run) => run.issueCommentStatus === NEVER_INVOKED_ISSUE_COMMENT_STATUS,
+    ).length;
+    const noCommentEligibleRuns = executedTerminalRuns.filter(
+      (run) => run.issueCommentStatus !== NEVER_INVOKED_ISSUE_COMMENT_STATUS,
+    );
     let noCommentStreak = 0;
-    for (const run of executedTerminalRuns) {
+    for (const run of noCommentEligibleRuns) {
       if (commentRunIds.has(run.id)) break;
       noCommentStreak += 1;
     }
@@ -2602,7 +2641,12 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     if (runtimeFailure) {
       triggerReasons.push(formatRuntimeFailureTriggerClaim(runtimeFailureStreak, runtimeFailureUsageBasis));
     }
-    if (noComment) triggerReasons.push(`${noCommentStreak} consecutive terminal, turn-executing issue-linked runs had no run-created issue comment`);
+    if (noComment) {
+      const neverInvokedNote = neverInvokedRunCount > 0
+        ? ` (${neverInvokedRunCount} additional never-invoked run(s) in the sampled window excluded, not counted toward this streak)`
+        : "";
+      triggerReasons.push(`${noCommentStreak} consecutive terminal, turn-executing issue-linked runs had no run-created issue comment${neverInvokedNote}`);
+    }
     if (longActive) {
       // BLO-23248: this only fires while capacity-dominant when the retry is
       // *overdue* (capacityDominantAndDue already excluded the still-backing-off
@@ -2736,6 +2780,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       noCommentStreak,
       runtimeFailureStreak,
       runtimeFailureUsageBasis,
+      neverInvokedRunCount,
       totalRunCount: latestRuns.length,
       terminalRunCount: terminalRuns.length,
       activeRunCount,
@@ -2860,6 +2905,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       `- Active queued/running/scheduled runs: ${evidence.activeRunCount}`,
       `- No-comment streak (terminal, turn-executing runs): ${evidence.noCommentStreak}`,
       `- Runtime-failure streak (terminal, never-executed runs): ${evidence.runtimeFailureStreak}`,
+      `- Never-invoked runs excluded (terminal, \`issueCommentStatus: not_applicable\`, BLO-26165): ${evidence.neverInvokedRunCount}`,
       `- Current active elapsed time: ${msToHuman(evidence.elapsedMs)}`,
       ...(evidence.nonLiveHoldMs > 0
         ? [
@@ -2938,6 +2984,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       `- Reasons: ${evidence.triggerReasons.join("; ")}`,
       `- No-comment streak: ${evidence.noCommentStreak}`,
       `- Runtime-failure streak: ${evidence.runtimeFailureStreak}`,
+      `- Never-invoked runs excluded: ${evidence.neverInvokedRunCount}`,
       `- Runs/assignee comments: ${evidence.runCountLastHour}/${evidence.commentCountLastHour} in 1h, ${evidence.runCountLastSixHours}/${evidence.commentCountLastSixHours} in 6h`,
       ...(evidence.monitorGating
         ? [`- Elapsed accounting: ${formatMonitorGating(evidence.monitorGating)}`]
