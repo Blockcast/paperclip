@@ -704,6 +704,7 @@ export type {
   AdapterEnvironmentTestResult,
   AssetImage,
   Project,
+  PrimaryWorkspaceSource,
   ProjectBudgetSummary,
   ProjectCodebase,
   ProjectCodebaseOrigin,

@@ -78,6 +78,7 @@ import {
   restoreCheckoutPromotedStatus,
 } from "./issue-checkout-status.js";
 import { logger } from "../middleware/logger.js";
+import { recordProjectPrimaryWorkspaceFallback } from "./metrics.js";
 import { parseObject } from "../adapters/utils.js";
 import {
   hydrateSuccessfulRunHandoffLiveness,
@@ -11804,7 +11805,13 @@ export function issueService(db: Db) {
             createdAt: workspace.createdAt,
             updatedAt: workspace.updatedAt,
           }));
-          const primaryWorkspace = workspaces.find((workspace) => workspace.isPrimary) ?? workspaces[0] ?? null;
+          const explicitPrimaryWorkspace = workspaces.find((workspace) => workspace.isPrimary) ?? null;
+          const primaryWorkspace = explicitPrimaryWorkspace ?? workspaces[0] ?? null;
+          // BLO-26184: same silent-guess shape as projects.ts's pickPrimaryWorkspace —
+          // surface it on the same fallback counter/log rather than a second blind spot.
+          if (!explicitPrimaryWorkspace && workspaces.length > 1) {
+            recordProjectPrimaryWorkspaceFallback(r.id);
+          }
           projectMap.set(r.id, {
             ...r,
             workspaces,
