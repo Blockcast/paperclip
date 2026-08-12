@@ -3936,8 +3936,27 @@ export function isHeartbeatCooldownActive(args: {
  * services/recovery/run-liveness-continuations.ts, whose caller-side check was
  * the only reader of `idempotency_key` before this. Two readers disagreeing on
  * "delivered" would let a wake be suppressed by one and re-driven by the other.
+ *
+ * `claimed` belongs here for the same reason `queued` does, and leaving it out
+ * was the bug: a wake moves `queued` -> `claimed` precisely when a worker picks
+ * its run up (setWakeupStatus below), so a reconciler that crashed between
+ * claiming the delivery and retiring the retry marker would find no delivered
+ * row on the next pass and queue a SECOND run for a wake that was not merely
+ * delivered but already executing (BLO-25726, Ally review on #1313).
  */
-const IDEMPOTENT_WAKE_DELIVERED_STATUSES = ["queued", "deferred_issue_execution", "completed"];
+const IDEMPOTENT_WAKE_DELIVERED_STATUSES = ["queued", "claimed", "deferred_issue_execution", "completed"];
+
+/**
+ * Payload key carrying {@link WakeupOptions.dedupeDeliveryToken} on the row a
+ * redelivery inserts, so a later pass over the same retry marker can recognise
+ * ITS OWN delivery rather than any row that merely reused the idempotency key
+ * (BLO-25726).
+ *
+ * Stamped alongside the caller's payload rather than inside it: the caller's
+ * payload round-trips into `dispatchRetry.originalOpts` on a marker, and a
+ * token buried there would be replayed onto an unrelated future attempt.
+ */
+const WAKE_REDELIVERY_TOKEN_KEY = "__wakeRedeliveryOf";
 
 interface WakeupOptions {
   source?: "timer" | "assignment" | "on_demand" | "automation";
@@ -3965,19 +3984,35 @@ interface WakeupOptions {
    */
   dedupeOnIdempotencyKey?: boolean;
   /**
-   * Lower bound on `requested_at` for the idempotency claim above (BLO-25726).
+   * Unambiguous identity of the delivery being claimed (BLO-25726).
    *
-   * Without it the claim is unbounded in time, and that reintroduces under-wake
-   * through a side door: a recurring key (`blockers_resolved:<a>:<b>`) whose
-   * FIRST delivery completed months ago, and whose SECOND, genuinely new
-   * delivery happens to take the dispatch-retry path, would match that ancient
-   * `completed` row and be suppressed as "already delivered".
+   * The claim cannot key on `idempotencyKey` alone, because not every key in
+   * this system is unique per intended delivery: `blockers_resolved:<a>:<b>`
+   * carries no event-instance or time component and legitimately recurs every
+   * time that blocker is re-added and re-resolved.
    *
-   * The reconciler therefore passes its own marker's `requestedAt`: a delivery
-   * recorded at or after the moment this attempt was first recorded is THIS
-   * delivery, and anything older is a different one that merely reused the key.
+   * This was first bounded by the retry marker's own `requestedAt`, and that
+   * bound is only a LOWER one -- which is wrong in the harmful direction, as
+   * Ally caught on #1313. Given an old retryable marker M and a later, wholly
+   * independent recurrence of the same key, M's reconcile pass matches the
+   * NEWER row, marks itself `dispatch_recovered`, and M's own wake is never
+   * dispatched at all: silent under-wake, the exact failure this issue exists
+   * to avoid trading for.
+   *
+   * So the claim matches on delivery identity instead of on a time window.
+   * enqueueWakeup stamps this token into the row it inserts (see
+   * WAKE_REDELIVERY_TOKEN_KEY) and matches on that stamp, so a redelivery can
+   * only ever be satisfied by a row that this same marker produced. The
+   * reconciler passes its marker's id, which makes the token stable across
+   * lease steals too: a pass that reclaims an expired lease re-derives the same
+   * token and therefore finds the previous owner's committed run.
+   *
+   * A row written before this stamp existed carries no token and so will not
+   * match -- that degrades to the pre-existing bounded over-wake (one extra
+   * run), never to under-wake, which is the correct way for it to fail during a
+   * rolling deploy.
    */
-  dedupeDeliveredSince?: Date | null;
+  dedupeDeliveryToken?: string | null;
   requestedByActorType?: "user" | "agent" | "system";
   requestedByActorId?: string | null;
   contextSnapshot?: Record<string, unknown>;
@@ -32433,9 +32468,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               eq(agentWakeupRequests.idempotencyKey, opts.idempotencyKey),
               inArray(agentWakeupRequests.status, IDEMPOTENT_WAKE_DELIVERED_STATUSES),
               isNotNull(agentWakeupRequests.runId),
-              // Scopes the claim to THIS delivery; see dedupeDeliveredSince.
-              opts.dedupeDeliveredSince
-                ? gte(agentWakeupRequests.requestedAt, opts.dedupeDeliveredSince)
+              // Identity, not a time window: only a row THIS marker's own
+              // redelivery stamped can satisfy it. A later independent
+              // recurrence of the same recurring key carries a different token
+              // and cannot be mistaken for this delivery. See
+              // dedupeDeliveryToken.
+              opts.dedupeDeliveryToken
+                ? sql`${agentWakeupRequests.payload} ->> ${WAKE_REDELIVERY_TOKEN_KEY} = ${opts.dedupeDeliveryToken}`
                 : undefined,
             ),
           )
@@ -32469,7 +32508,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           source,
           triggerDetail,
           reason,
-          payload,
+          // Stamp the redelivery token (BLO-25726) only on the row we actually
+          // insert, so the claim above can later identify THIS delivery. Kept
+          // out of the shared `payload` variable on purpose: that value is also
+          // handed to the coalesce helpers and round-trips into a marker's
+          // `dispatchRetry.originalOpts`, where a stale token would be replayed
+          // onto an unrelated future attempt.
+          payload: opts.dedupeDeliveryToken
+            ? { ...(payload ?? {}), [WAKE_REDELIVERY_TOKEN_KEY]: opts.dedupeDeliveryToken }
+            : payload,
           status: "queued",
           requestedByActorType: opts.requestedByActorType ?? null,
           requestedByActorId: opts.requestedByActorId ?? null,
@@ -32989,6 +33036,49 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         continue;
       }
 
+      /**
+       * Fenced write of this row's outcome (BLO-25726, Ally review on #1313).
+       *
+       * The claim above is only half a lease. Every terminal and re-arm write
+       * below used to match on `id` alone, so once this pass ran past its
+       * ten-minute lease and another reconciler legitimately reclaimed the row,
+       * this pass could still stamp its own outcome over the new owner's live
+       * `dispatch_retrying` state -- reopening exactly the concurrent
+       * redelivery the claim exists to prevent, and silently clobbering a claim
+       * that had already been granted to someone else.
+       *
+       * The fence is the claim itself: our own `claimedAt` plus the status we
+       * moved the row to. A later owner necessarily holds a different
+       * `claimedAt` (a reclaim can only happen a full lease later), so its row
+       * no longer matches and our write becomes a no-op we can detect.
+       *
+       * Returns whether the write landed; callers must gate their counters on
+       * it, so a lost fence is never reported as a delivery outcome this pass
+       * did not actually get to own.
+       */
+      const finishClaimedRow = async (values: Record<string, unknown>) => {
+        const updated = await db
+          .update(agentWakeupRequests)
+          .set(values)
+          .where(
+            and(
+              eq(agentWakeupRequests.id, row.id),
+              eq(agentWakeupRequests.status, "dispatch_retrying"),
+              eq(agentWakeupRequests.claimedAt, now),
+            ),
+          )
+          .returning({ id: agentWakeupRequests.id });
+        if (updated.length === 0) {
+          logger.warn(
+            { wakeupRequestId: row.id, agentId: row.agentId },
+            "wake dispatch claim expired and was reclaimed before this pass finished; discarding "
+              + "its outcome rather than overwriting the new owner (BLO-25726)",
+          );
+          return false;
+        }
+        return true;
+      };
+
       const payload = parseObject(row.payload);
       const retryState = parseObject(payload.dispatchRetry) as {
         attempts?: number;
@@ -33029,9 +33119,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           {
             ...originalOpts,
             dedupeOnIdempotencyKey: true,
-            // This marker's own creation time bounds the claim, so a recurring
-            // key's older, unrelated delivery cannot suppress this one.
-            dedupeDeliveredSince: row.requestedAt,
+            // This marker's own id is the delivery identity, so a recurring
+            // key's later, unrelated delivery cannot be mistaken for this one
+            // -- and a pass that steals an expired lease derives the SAME
+            // token, so it finds the previous owner's committed run instead of
+            // queueing a second one.
+            dedupeDeliveryToken: row.id,
           },
           suppression,
         );
@@ -33050,17 +33143,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // `suppressed` would both mislabel it and (having no skip reason)
           // page the outage alert via the `other` cause on an ordinary provider
           // rate-limit (BLO-18859 review follow-up).
-          await db
-            .update(agentWakeupRequests)
-            .set({
-              status: "dispatch_superseded",
-              error: suppression.providerCapacityDeferred
-                ? "re-dispatch was deferred by the provider-capacity gate (scheduled_retry run committed)"
-                : "re-dispatch was declined by a scheduling gate (enqueueWakeup returned null)",
-              finishedAt: now,
-              updatedAt: now,
-            })
-            .where(eq(agentWakeupRequests.id, row.id));
+          const fenced = await finishClaimedRow({
+            status: "dispatch_superseded",
+            error: suppression.providerCapacityDeferred
+              ? "re-dispatch was deferred by the provider-capacity gate (scheduled_retry run committed)"
+              : "re-dispatch was declined by a scheduling gate (enqueueWakeup returned null)",
+            finishedAt: now,
+            updatedAt: now,
+          });
+          if (!fenced) continue;
           superseded += 1;
           if (githubReviewReason !== null) {
             if (suppression.providerCapacityDeferred) {
@@ -33088,10 +33179,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           );
           continue;
         }
-        await db
-          .update(agentWakeupRequests)
-          .set({ status: "dispatch_recovered", finishedAt: now, updatedAt: now })
-          .where(eq(agentWakeupRequests.id, row.id));
+        const fenced = await finishClaimedRow({
+          status: "dispatch_recovered",
+          finishedAt: now,
+          updatedAt: now,
+        });
+        if (!fenced) continue;
         recovered += 1;
         // The delivery reached the queued state after all, just later than the
         // inline path. Counting it here keeps the funnel arithmetic closed
@@ -33109,15 +33202,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
       } catch (err) {
         if (err instanceof HttpError) {
-          await db
-            .update(agentWakeupRequests)
-            .set({
-              status: "dispatch_superseded",
-              error: err.message,
-              finishedAt: now,
-              updatedAt: now,
-            })
-            .where(eq(agentWakeupRequests.id, row.id));
+          const fenced = await finishClaimedRow({
+            status: "dispatch_superseded",
+            error: err.message,
+            finishedAt: now,
+            updatedAt: now,
+          });
+          if (!fenced) continue;
           superseded += 1;
           // `dispatch_superseded` is terminal — the reconciler's query only
           // picks up `dispatch_failed` rows, so nothing re-arms this one. Left
@@ -33134,15 +33225,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
 
         if (attempts >= DISPATCH_RETRY_MAX_ATTEMPTS) {
-          await db
-            .update(agentWakeupRequests)
-            .set({
-              status: "dispatch_failed_exhausted",
-              error: err instanceof Error ? err.message : String(err),
-              finishedAt: now,
-              updatedAt: now,
-            })
-            .where(eq(agentWakeupRequests.id, row.id));
+          const fenced = await finishClaimedRow({
+            status: "dispatch_failed_exhausted",
+            error: err instanceof Error ? err.message : String(err),
+            finishedAt: now,
+            updatedAt: now,
+          });
+          if (!fenced) continue;
           exhausted += 1;
           // Terminal: the row is now dispatch_failed_exhausted and the
           // reconciler never re-arms it, so this review request will never
@@ -33158,28 +33247,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
 
         const backoffMs = DISPATCH_RETRY_RECONCILE_BACKOFF_MS[attempts] ?? DISPATCH_RETRY_RECONCILE_BACKOFF_MS.at(-1)!;
-        await db
-          .update(agentWakeupRequests)
-          .set({
-            // Re-arm explicitly. The claim above moved this row to
-            // `dispatch_retrying`, and the due-rows query's fast path only
-            // selects `dispatch_failed` -- leaving the status alone here would
-            // park the row until its 10-minute lease expired, turning every
-            // transient failure into a 10-minute stall (BLO-25726).
-            status: "dispatch_failed",
-            claimedAt: null,
-            payload: {
-              ...payload,
-              dispatchRetry: {
-                ...retryState,
-                attempts,
-                nextAttemptAt: new Date(now.getTime() + backoffMs).toISOString(),
-                lastError: err instanceof Error ? err.message : String(err),
-              },
+        const fenced = await finishClaimedRow({
+          // Re-arm explicitly. The claim above moved this row to
+          // `dispatch_retrying`, and the due-rows query's fast path only
+          // selects `dispatch_failed` -- leaving the status alone here would
+          // park the row until its 10-minute lease expired, turning every
+          // transient failure into a 10-minute stall (BLO-25726).
+          status: "dispatch_failed",
+          claimedAt: null,
+          payload: {
+            ...payload,
+            dispatchRetry: {
+              ...retryState,
+              attempts,
+              nextAttemptAt: new Date(now.getTime() + backoffMs).toISOString(),
+              lastError: err instanceof Error ? err.message : String(err),
             },
-            updatedAt: now,
-          })
-          .where(eq(agentWakeupRequests.id, row.id));
+          },
+          updatedAt: now,
+        });
+        if (!fenced) continue;
         stillFailing += 1;
       }
     }
