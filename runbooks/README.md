@@ -38,3 +38,9 @@ platform cannot resolve automatically. Each runbook should be:
   actively in-progress but nothing is executing, and it manufactures false
   productivity-review escalations. Trigger: alert `PaperclipQueuedRunStranded`,
   or `max(paperclip_queued_run_oldest_age_seconds) by (agent_id) > 1800`.
+- [`productivity-review-monitor-rearm.md`](productivity-review-monitor-rearm.md)
+  — you are adjudicating an open productivity review and the reviewed issue's
+  monitor has lapsed (`status: "triggered"`, `nextCheckAt: null`, no active
+  run): the supported one-call repair path, and why the `PATCH {status:
+  "todo"}` bounce is superseded. Trigger: review evidence reads `monitor
+  lapsed at …, never re-armed`.

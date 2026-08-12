@@ -1414,6 +1414,74 @@ describe("agent issue mutation checkout ownership", () => {
     );
   });
 
+  // BLO-24149: the exact stranded shape a productivity review exists to
+  // catch — in_progress, monitor triggered, nextCheckAt null, and genuinely
+  // no active run (checkoutRunId/executionRunId both null, not merely a run
+  // still `queued`). Distinct from BLO-22860's dispatch-lapse sweep, which
+  // only re-arms a monitor whose run is still queued-but-undispatched; this
+  // asserts the review owner can restore the timer directly even when there
+  // is no run at all to wait on, matching the ticket's literal verifying
+  // signal.
+  it("lets a productivity-review owner restore a scheduled execution path on a fully stranded issue (BLO-24149)", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({
+      status: "in_progress",
+      assigneeAgentId: peerAgentId,
+      executionPolicy: null,
+      checkoutRunId: null,
+      executionRunId: null,
+      executionState: {
+        status: "idle",
+        currentStageId: null,
+        currentStageIndex: null,
+        currentStageType: null,
+        currentParticipant: null,
+        returnAssignee: null,
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+        monitor: {
+          status: "triggered",
+          nextCheckAt: null,
+          lastTriggeredAt: "2026-08-07T17:46:55.000Z",
+          attemptCount: 1,
+          notes: "wake consumed, never re-armed",
+          scheduledBy: "assignee",
+          clearedAt: null,
+          clearReason: null,
+        },
+      },
+      monitorNextCheckAt: null,
+    }));
+    mockAccessService.decide.mockImplementation(productivityReviewDecideWithRuntimeManage);
+
+    const res = await request(await createApp(ownerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        executionPolicy: {
+          monitor: {
+            nextCheckAt: "2026-08-12T18:00:00.000Z",
+            notes: "restored by productivity review continue verdict",
+            scheduledBy: "assignee",
+          },
+        },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      issueId,
+      expect.objectContaining({
+        executionPolicy: expect.objectContaining({
+          monitor: expect.objectContaining({
+            nextCheckAt: "2026-08-12T18:00:00.000Z",
+            notes: "restored by productivity review continue verdict",
+          }),
+        }),
+      }),
+    );
+    expect(productivitySourceMutationAuditCalls()).toHaveLength(1);
+  });
+
   it("lets a manager-chain agent re-arm a report's triggered monitor without broader mutation access", async () => {
     mockIssueService.getById.mockResolvedValue(makeIssue({
       status: "in_progress",
