@@ -85,6 +85,9 @@ jobs:
       - name: Test CI cache and Docker runner routing
         run: node --test ./scripts/__tests__/ci-cache-routing.test.mjs
 
+      - name: Validate opencode_k8s adapter pin
+        run: node --test ./scripts/opencode-k8s-runtime-cache-pin.test.js
+
       - name: Test merge-group concurrency key
         run: node --test ./scripts/__tests__/merge-group-concurrency.test.mjs
 
