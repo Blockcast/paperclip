@@ -68,6 +68,7 @@ describeEmbeddedPostgres("BLO-20341 issue repo binding guard", () => {
 
   const PAPERCLIP_REPO = "https://github.com/Blockcast/paperclip.git";
   const TRAFFICCONTROL_REPO = "https://github.com/Blockcast/trafficcontrol.git";
+  const ONPREM_REPO = "https://github.com/Blockcast/onprem-k8s.git";
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-repo-binding-");
@@ -257,33 +258,47 @@ describeEmbeddedPostgres("BLO-20341 issue repo binding guard", () => {
 
   it("prefers the pinned execution workspace over the project binding", async () => {
     const seed = await seedTwoProjectCompany();
+    const secondaryWorkspaceId = randomUUID();
     const executionWorkspaceId = randomUUID();
+
+    // The control-plane project owns two repos (as the real Paperclip project
+    // does: paperclip + onprem-k8s). An execution workspace must belong to the
+    // issue's project, so this is the realistic way a pinned workspace can
+    // disagree with the project's primary binding.
+    await db.insert(projectWorkspaces).values({
+      id: secondaryWorkspaceId,
+      companyId: seed.companyId,
+      projectId: seed.controlPlaneProjectId,
+      name: "onprem-k8s",
+      isPrimary: false,
+      repoUrl: ONPREM_REPO,
+    });
 
     await db.insert(executionWorkspaces).values({
       id: executionWorkspaceId,
       companyId: seed.companyId,
       projectId: seed.controlPlaneProjectId,
-      projectWorkspaceId: seed.controlPlaneWorkspaceId,
+      projectWorkspaceId: secondaryWorkspaceId,
       mode: "shared_workspace",
       strategyType: "project_primary",
-      name: "paperclip-shared",
+      name: "onprem-k8s-shared",
       status: "active",
       providerType: "local_fs",
-      repoUrl: PAPERCLIP_REPO,
+      repoUrl: ONPREM_REPO,
     });
 
-    // Bound (via the pinned execution workspace) to paperclip and naming
-    // paperclip: the project row still points at trafficcontrol, so a guard
-    // that ignored the execution workspace would false-positive here.
+    // Pinned to onprem-k8s and naming onprem-k8s: silent. A guard that read
+    // the project's primary workspace (paperclip) instead would false-positive.
     const child = await svc.create(seed.companyId, {
       parentId: seed.parentIssueId,
-      projectId: seed.productProjectId,
-      projectWorkspaceId: seed.productWorkspaceId,
+      projectId: seed.controlPlaneProjectId,
+      projectWorkspaceId: seed.controlPlaneWorkspaceId,
       executionWorkspaceId,
-      title: "Control-plane fix pinned to the paperclip worktree",
-      description: "Change lands in https://github.com/Blockcast/paperclip.",
+      title: "Chart change pinned to the onprem-k8s worktree",
+      description: "Change lands in https://github.com/Blockcast/onprem-k8s.",
     });
 
+    expect(child.executionWorkspaceId).toBe(executionWorkspaceId);
     expect(await guardComments(child.id)).toHaveLength(0);
   });
 
