@@ -4045,8 +4045,10 @@ async function listSuccessfulRunHandoffMapForIssues(
     }
   }
 
-  // Unconditional, and before liveness: a handoff on a closed issue is moot
-  // regardless of whether this caller wants liveness hydrated (BLO-16074).
+  // Before liveness: a handoff on a closed issue is moot regardless of whether
+  // this caller wants liveness hydrated (BLO-16074). Unconditional here because
+  // every caller of this helper is a read path; the route-side twin takes a
+  // `foldTerminal` opt-out because one of its callers gates an activity-row write.
   await resolveSuccessfulRunHandoffForTerminalIssues(dbOrTx, companyId, states);
   return options?.hydrateLiveness === false
     ? states
