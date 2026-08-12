@@ -29,18 +29,18 @@ The safe path depends on the PR author:
 1. An independent author is neither the `app/allyblockcast` App nor the
    `allyblockcast` User. If the PR is independently authored, obtain both
    reviews on the same exact head SHA:
-   - an exact-head review from the `allyblockcast` GitHub App, which supplies
-     the evidence accepted by `review/ally-complete`; and
+   - an exact-head approval from the `allyblockcast` GitHub App, which is the
+     only review accepted by `review/ally-complete`; and
    - a separate exact-head approval from the `allyblockcast` User seat, which
      satisfies the singleton `Blockcast/onprem-k8s-ally-reviewer` team rule.
-2. If either required reviewer identity authored the PR, it cannot supply its
-   own required review. Reopen the exact intended diff under an independent
-   author, link the source PR and its review evidence, and obtain both reviews
-   above on the replacement PR's exact head.
-3. Do not treat App comments as a formal App review. Do not treat the User-seat
-   approval as satisfying `review/ally-complete`, or the App review as
-   satisfying the singleton-team approval. Never expose or distribute either
-   credential.
+2. If the PR is authored by `app/allyblockcast`, the App cannot self-review.
+   Reopen the exact intended head under an independent author, link the source
+   PR and its review evidence, and obtain both reviews above on the replacement
+   PR's exact head. Apply the same replacement rule if the User seat authored
+   the PR, since it cannot supply its own required review.
+3. Do not treat App comments or the User-seat approval as satisfying
+   `review/ally-complete`, or the App review as satisfying the singleton-team
+   approval. Never expose or distribute either credential.
 
 The distinct GitHub User account named `allyblockcast` can satisfy the
 protected team approval when it is a member of
@@ -63,11 +63,12 @@ unmerged App-authored PR #2011. Do not use #2011 as evidence of the deployed
 routing state.
 
 The remaining routing requirement is to collect two independent review
-artifacts on one immutable head. The Paperclip agent normally authors PRs as
-the App identity `allyblockcast[bot]`. A PR authored by either the App or the
-`allyblockcast` User requires an independent-author replacement because its
-author cannot provide the corresponding required review. The App and User
-then provide their distinct review artifacts on that same replacement head.
+artifacts on one immutable head: an exact-head App approval accepted by
+`review/ally-complete` and an exact-head User approval for the singleton team
+rule. The Paperclip agent normally authors PRs as the App identity
+`allyblockcast[bot]`, so those PRs must be reopened under an independent author
+before the App can approve the exact head. The App and User then provide their
+distinct review artifacts on that same replacement head.
 
 ## Ageing an unanswered review request (BLO-24517)
 
