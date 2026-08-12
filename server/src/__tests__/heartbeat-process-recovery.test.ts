@@ -6652,11 +6652,19 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
       // Replay BLO-18614's exact monitor shape: the monitor already fired
       // (`status: "triggered"`) and was never rescheduled (`monitorNextCheckAt: null`).
+      //
+      // BLO-24782: the trigger instant is relative to now, not the literal
+      // `2026-07-29T03:52:37Z` copied from the incident. This test is about the 21s
+      // recurrence below -- a *fresh* trigger the assignee is still plausibly about to
+      // re-arm -- and a fixed literal silently ages into a 14-day-stale monitor, which
+      // is now (correctly) a different case with the opposite expected outcome. Keeping
+      // it relative is what makes this a control for the grace bound rather than a
+      // casualty of it.
       await db
         .update(issues)
         .set({
           monitorNextCheckAt: null,
-          monitorLastTriggeredAt: new Date("2026-07-29T03:52:37.000Z"),
+          monitorLastTriggeredAt: new Date(Date.now() - 30_000),
           monitorAttemptCount: 1,
           monitorScheduledBy: "assignee",
           monitorNotes: "PR #806 (Blockcast/paperclip): watching for CI green + Ally review decision before merge.",
@@ -6724,6 +6732,63 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       expect(
         activity.some((event) => (event.details as { status?: string } | null)?.status === "blocked"),
       ).toBe(false);
+    },
+  );
+
+  it(
+    "BLO-24782: a past-due monitorNextCheckAt is no longer a durable wait path, so a succeeded " +
+      "run's issue is seen by the sweep again instead of stranding forever",
+    async () => {
+      // `hasPersistedDurableWaitPath` used to read `if (issue.monitorNextCheckAt) return true`,
+      // accepting a check instant already in the past -- strictly looser than
+      // `hasActiveMonitorPath`, so the two disagreed about the same lapsed monitor. A
+      // succeeded run plus a long-past check instant meant the sweep skipped the issue on
+      // this tick and on every tick after it, forever.
+      //
+      // Note the remedy is a continuation wake, NOT an escalation: for a succeeded run the
+      // sweep re-pokes the assignee rather than escalating. So this population is restored
+      // to a live wake path directly, without passing through `issue_recovery_actions` and
+      // therefore without relying on the BLO-19124 reaper.
+      await seedStrandedIssueFixture({
+        status: "in_progress",
+        runStatus: "succeeded",
+        monitorNextCheckAt: new Date(Date.now() - 48 * 60 * 60_000),
+      });
+
+      heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+
+      const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+      // The point of the fix: the issue is no longer invisible to the sweep. Before, the
+      // past-due check instant satisfied `hasPersistedDurableWaitPath` and the issue was
+      // skipped on this tick and every tick after it, forever.
+      expect(result.skipped).toBe(0);
+      // Having been seen, it re-acquires a live wake path -- for a *succeeded* run the
+      // designed remedy is a continuation wake (re-poke the assignee), not an escalation.
+      // Wake delivery itself is covered by the continuation branch's own tests; what is
+      // new here is that this issue reaches that branch at all.
+      expect(result.successfulContinuationObserved).toBe(1);
+    },
+  );
+
+  it(
+    "BLO-24782: a still-future monitorNextCheckAt remains a durable wait path",
+    async () => {
+      // Control for the bound above: the sweep must still skip an issue whose monitor is
+      // genuinely live, or the fix would trade a stranding bug for a stampede.
+      const { issueId } = await seedStrandedIssueFixture({
+        status: "in_progress",
+        runStatus: "succeeded",
+        monitorNextCheckAt: new Date(Date.now() + 60 * 60_000),
+      });
+
+      heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+
+      const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+      expect(result.escalated).toBe(0);
+      expect(result.skipped).toBe(1);
+      expect(result.issueIds).not.toContain(issueId);
     },
   );
 
@@ -11428,11 +11493,19 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   });
 
   it("preserves a persisted issue monitor as the durable external-wait path", async () => {
+    // BLO-24782: this check instant is relative to the real clock, not the literal
+    // `2026-03-19T01:00:00Z` that matched `seedStrandedIssueFixture`'s notional now. The
+    // intent is "a monitor scheduled an hour out is a durable wait", but the sweep
+    // compares against the wall clock, so the literal had silently aged into a
+    // five-months-past instant. The old `if (issue.monitorNextCheckAt) return true`
+    // accepted any non-null value, which is exactly why the fixture never had to be
+    // honest about time -- and is the same looseness this issue removes.
+    const monitorNextCheckAt = new Date(Date.now() + 60 * 60_000);
     const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
       status: "in_progress",
       runStatus: "succeeded",
       livenessState: "advanced",
-      monitorNextCheckAt: new Date("2026-03-19T01:00:00.000Z"),
+      monitorNextCheckAt,
       resultJson: {
         summary: "Waiting for the deploy to settle; monitor is scheduled.",
         externalWait: { kind: "issue_monitor", durable: true },
@@ -11447,7 +11520,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
     expect(issue?.status).toBe("in_progress");
-    expect(issue?.monitorNextCheckAt?.toISOString()).toBe("2026-03-19T01:00:00.000Z");
+    expect(issue?.monitorNextCheckAt?.toISOString()).toBe(monitorNextCheckAt.toISOString());
 
     const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
     expect(runs).toHaveLength(1);

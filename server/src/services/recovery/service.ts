@@ -1918,6 +1918,31 @@ function buildLivenessOriginalIssueComment(finding: IssueLivenessFinding, escala
   ].join("\n");
 }
 
+/**
+ * BLO-24782: bounds how long a monitor that has fired but has not been re-armed
+ * still counts as a live wake path.
+ *
+ * Exported (and pure) because the whole defect was an *unbounded* belief that no
+ * test could pin: `status: "triggered"` is synthesized from `monitorLastTriggeredAt`
+ * / `monitorAttemptCount`, columns that are never cleared when a monitor lapses, so
+ * "fired once" and "fired 8 days ago and abandoned" were the same value.
+ *
+ * A missing or unparseable `lastTriggeredAt` reads as NOT live. That is the whole
+ * point: an unbounded triggered state of unknown age is exactly the stuck shape, and
+ * treating it as live is what strands the issue. The real trigger path always stamps
+ * the column (`buildTriggeredMonitorState`), so this only catches degenerate rows.
+ */
+export function isLapsedMonitorStillLive(input: {
+  lastTriggeredAt: string | null;
+  now: number;
+  graceMs: number;
+}): boolean {
+  if (!input.lastTriggeredAt) return false;
+  const triggeredAt = Date.parse(input.lastTriggeredAt);
+  if (!Number.isFinite(triggeredAt)) return false;
+  return input.now - triggeredAt < input.graceMs;
+}
+
 export function recoveryService(
   db: Db,
   deps: {
@@ -2432,7 +2457,13 @@ export function recoveryService(
   }
 
   async function hasPersistedDurableWaitPath(issue: typeof issues.$inferSelect) {
-    if (issue.monitorNextCheckAt) return true;
+    // BLO-24782: this used to be `if (issue.monitorNextCheckAt) return true`, which
+    // accepted a check instant already in the past -- a strictly looser reading than
+    // `hasActiveMonitorPath`, so the two disagreed about whether the same lapsed
+    // monitor was a live wake path. Delegating makes that divergence unrepresentable
+    // rather than merely tested for: there is now one definition of "the monitor is
+    // still a live wake path", and it is bounded.
+    if (hasActiveMonitorPath(issue)) return true;
 
     return db
       .select({ id: issueRelations.issueId })
@@ -5884,12 +5915,28 @@ export function recoveryService(
     // re-arming `monitorNextCheckAt`. Reading "fired, not yet rescheduled" as "no
     // monitor" let the stranded-assigned sweep race the park gate and re-escalate a
     // deliberate review wait to `blocked` (BLO-16146 recurrence).
+    //
+    // BLO-24782: that belief has to expire. `derivePersistedMonitorState` synthesizes
+    // `status: "triggered"` from `monitorLastTriggeredAt` / `monitorAttemptCount`
+    // alone, and neither column is ever cleared on the lapse path -- so without a
+    // bound, an issue whose monitor has *ever* fired reads as a live wake path
+    // forever. Nothing re-arms it when the very wake that would have started the
+    // continuation run is what lapsed, so the state is terminal: the sweep never
+    // escalates, no `issue_recovery_actions` row is created, and the BLO-19124
+    // reaper cannot see the issue even in principle. Measured 2026-08-12: 22 of the
+    // CTO's 89 `in_progress` issues in exactly this state, the oldest `critical` and
+    // stuck 207h.
     const monitor = derivePersistedMonitorState({
       issue,
       state: parseIssueExecutionState(issue.executionState),
       policy: null,
     });
-    return monitor?.status === "triggered";
+    if (monitor?.status !== "triggered") return false;
+    return isLapsedMonitorStillLive({
+      lastTriggeredAt: monitor.lastTriggeredAt,
+      now: Date.now(),
+      graceMs: loadConfig().lapsedMonitorGraceMs,
+    });
   }
 
   type ReviewWaitingParkOutcome = "parked" | "already_parked" | "lost_race" | "failed";
