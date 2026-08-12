@@ -38,6 +38,10 @@ import {
   SESSION_UNAVAILABLE_HEARTBEAT_RETRY_MAX_ATTEMPTS,
   shouldScheduleAutomaticRunRetry,
 } from "../services/heartbeat.js";
+import {
+  MAX_TRANSIENT_RETRY_HORIZON_MS,
+  TRANSIENT_HORIZON_CLAMP_MIN_ATTEMPTS,
+} from "../services/ccrotate-capacity-retry.js";
 
 const mockAdapterExecute = vi.hoisted(() =>
   vi.fn(async () => ({
@@ -3525,5 +3529,144 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect((wakeupRequest?.payload as Record<string, unknown> | null)?.transientRetryNotBefore).toBe(
       retryNotBefore.toISOString(),
     );
+  });
+
+  // BLO-23525: the prose-parser path (parseProviderCapacityResetHorizon ->
+  // resultJson.retryNotBefore -> this scheduler's transientRetryNotBefore
+  // override) used to honor an advertised horizon verbatim. It now shares
+  // clampTransientRetryHorizon with the capacity-gate path (BLO-23438), with
+  // its own attempt ceiling raised so the clamp cannot silently reintroduce
+  // BLO-23438's exhaustion trap on this route.
+  it("BLO-23525: clamps a transient_upstream retry-not-before beyond the horizon ceiling instead of parking for the full advertised window", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const now = new Date("2026-08-09T00:00:00.000Z");
+    // 130h out: beyond both the 24h per-attempt cap and BLO-22844's 124.8h
+    // worst case, so a single attempt must not be able to honor it verbatim.
+    const advertisedRetryNotBefore = new Date(now.getTime() + 130 * 60 * 60 * 1000);
+
+    await seedRetryFixture({
+      runId,
+      companyId,
+      agentId,
+      now,
+      errorCode: "adapter_failed",
+      errorFamily: "transient_upstream",
+      retryNotBefore: advertisedRetryNotBefore.toISOString(),
+    });
+
+    const scheduled = await heartbeat.scheduleBoundedRetry(runId, {
+      now,
+      random: () => 0.5,
+    });
+
+    expect(scheduled.outcome).toBe("scheduled");
+    if (scheduled.outcome !== "scheduled") return;
+    // Clamped to the ceiling, not the (later) advertised horizon.
+    expect(scheduled.dueAt.getTime()).toBe(now.getTime() + MAX_TRANSIENT_RETRY_HORIZON_MS);
+    expect(scheduled.attempt).toBe(1);
+    // The family's ceiling was raised so 24h-per-attempt re-probing has
+    // enough attempts left to reach BLO-22844's 124.8h worst case.
+    expect(scheduled.maxAttempts).toBe(TRANSIENT_HORIZON_CLAMP_MIN_ATTEMPTS);
+    expect(scheduled.maxAttempts).toBeGreaterThan(BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length);
+
+    const retryRun = await db
+      .select({ contextSnapshot: heartbeatRuns.contextSnapshot, scheduledRetryAt: heartbeatRuns.scheduledRetryAt })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, scheduled.run.id))
+      .then((rows) => rows[0] ?? null);
+
+    expect(retryRun?.scheduledRetryAt?.getTime()).toBe(now.getTime() + MAX_TRANSIENT_RETRY_HORIZON_MS);
+    const contextSnapshot = (retryRun?.contextSnapshot as Record<string, unknown> | null) ?? {};
+    // The clamped instant is what downstream retry logic acts on...
+    expect(contextSnapshot.transientRetryNotBefore).toBe(advertisedRetryNotBefore.toISOString());
+    // ...but the declined advertised horizon stays legible on the row.
+    expect(contextSnapshot.transientRetryHorizonClampedFrom).toBe(advertisedRetryNotBefore.toISOString());
+  });
+
+  it("BLO-23525: keeps re-probing a clamped transient_upstream horizon across attempts, and only exhausts past the raised ceiling", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const now = new Date("2026-08-09T00:00:00.000Z");
+    const advertisedRetryNotBefore = new Date(now.getTime() + 200 * 60 * 60 * 1000);
+
+    // Seed as the run that just failed on the *last* attempt the raised
+    // ceiling allows, still carrying the same far-future advertised horizon
+    // (the provider outage has not resolved).
+    await seedRetryFixture({
+      runId,
+      companyId,
+      agentId,
+      now,
+      errorCode: "adapter_failed",
+      errorFamily: "transient_upstream",
+      retryNotBefore: advertisedRetryNotBefore.toISOString(),
+      scheduledRetryAttempt: TRANSIENT_HORIZON_CLAMP_MIN_ATTEMPTS - 1,
+    });
+
+    const lastAllowedAttempt = await heartbeat.scheduleBoundedRetry(runId, {
+      now,
+      random: () => 0.5,
+    });
+
+    expect(lastAllowedAttempt.outcome).toBe("scheduled");
+    if (lastAllowedAttempt.outcome !== "scheduled") return;
+    expect(lastAllowedAttempt.attempt).toBe(TRANSIENT_HORIZON_CLAMP_MIN_ATTEMPTS);
+    expect(lastAllowedAttempt.dueAt.getTime()).toBe(now.getTime() + MAX_TRANSIENT_RETRY_HORIZON_MS);
+
+    await cleanupRetryFixture();
+
+    // One attempt further — still the same unresolved outage — must exhaust
+    // rather than clamp-and-park again indefinitely.
+    const exhaustedRunId = randomUUID();
+    await seedRetryFixture({
+      runId: exhaustedRunId,
+      companyId: randomUUID(),
+      agentId: randomUUID(),
+      now,
+      errorCode: "adapter_failed",
+      errorFamily: "transient_upstream",
+      retryNotBefore: advertisedRetryNotBefore.toISOString(),
+      scheduledRetryAttempt: TRANSIENT_HORIZON_CLAMP_MIN_ATTEMPTS,
+    });
+
+    const exhausted = await heartbeat.scheduleBoundedRetry(exhaustedRunId, {
+      now,
+      random: () => 0.5,
+    });
+
+    expect(exhausted).toEqual({
+      outcome: "retry_exhausted",
+      attempt: TRANSIENT_HORIZON_CLAMP_MIN_ATTEMPTS + 1,
+      maxAttempts: TRANSIENT_HORIZON_CLAMP_MIN_ATTEMPTS,
+    });
+  });
+
+  it("BLO-23525: leaves the ordinary hintless transient_upstream ceiling (no retry-not-before) untouched at 4 attempts", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const now = new Date("2026-08-09T00:00:00.000Z");
+
+    await seedRetryFixture({
+      runId,
+      companyId,
+      agentId,
+      now,
+      errorCode: "adapter_failed",
+      errorFamily: "transient_upstream",
+      scheduledRetryAttempt: BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length - 1,
+    });
+
+    const lastHintlessAttempt = await heartbeat.scheduleBoundedRetry(runId, {
+      now,
+      random: () => 0.5,
+    });
+
+    expect(lastHintlessAttempt.outcome).toBe("scheduled");
+    if (lastHintlessAttempt.outcome !== "scheduled") return;
+    expect(lastHintlessAttempt.maxAttempts).toBe(BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length);
   });
 });
