@@ -36,6 +36,7 @@ const ACTIVITY_ACTION_TO_PLUGIN_EVENT: Readonly<Record<string, PluginEventType>>
 
 let _pluginEventBus: PluginEventBus | null = null;
 let _outboxDb: Db | null = null;
+let _outboxEnqueueTail: Promise<void> | null = null;
 
 /** Wire the plugin event bus so domain events are forwarded to plugins. */
 export function setPluginEventBus(bus: PluginEventBus): void {
@@ -68,27 +69,42 @@ function eventTypeForActivityAction(action: string): PluginEventType | null {
  * in-process: the worker-tier poller (plugin-event-outbox.ts) is the sole
  * emitter, so events raised on any tier (notably the API tier, where plugins
  * are not loaded) reliably reach subscribed plugins. One writer + one emitter
- * ⇒ no double-delivery. Fire-and-forget to keep the signature synchronous.
+ * ⇒ no double-delivery. Writes are serialized within this process so the
+ * database `seq` reflects call order even though this remains fire-and-forget.
+ * Each insert is still best-effort: a failure is logged and does not block the
+ * next event or surface to the activity caller.
  */
 export function publishPluginDomainEvent(event: PluginEvent): void {
-  if (!_outboxDb) {
+  const outboxDb = _outboxDb;
+  if (!outboxDb) {
     logger.warn(
       { eventType: event.eventType, eventId: event.eventId },
       "plugin event outbox db not set; dropping event",
     );
     return;
   }
-  void _outboxDb
-    .insert(pluginEventOutbox)
-    .values({
-      eventId: event.eventId,
-      companyId: event.companyId,
-      eventType: event.eventType,
-      payload: event as unknown as Record<string, unknown>,
-    })
-    .catch((err) =>
-      logger.warn({ err, eventType: event.eventType }, "failed to enqueue plugin event to outbox"),
-    );
+  const values = {
+    eventId: event.eventId,
+    companyId: event.companyId,
+    eventType: event.eventType,
+    payload: event as unknown as Record<string, unknown>,
+  };
+
+  const enqueue = async () => {
+    try {
+      await outboxDb.insert(pluginEventOutbox).values(values);
+    } catch (err) {
+      logger.warn({ err, eventType: event.eventType }, "failed to enqueue plugin event to outbox");
+    }
+  };
+  // Start the first writer immediately, preserving the original detached timing.
+  // Later calls chain behind it, so they cannot claim an earlier `seq`.
+  const pending = _outboxEnqueueTail
+    ? _outboxEnqueueTail.then(enqueue, enqueue)
+    : enqueue();
+  // Keep an unexpected failure from poisoning the chain or becoming unhandled;
+  // normal insert failures are already logged and swallowed above.
+  _outboxEnqueueTail = pending.catch(() => {});
 }
 
 /**
