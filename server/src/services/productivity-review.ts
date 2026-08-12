@@ -195,6 +195,13 @@ type ProductivityReviewEvidence = {
     priorLapseAt: Date | null;
     armedUntil: Date | null;
     gatedIsUpperBound: boolean;
+    // BLO-25877: set (to the same instant as `lapsedAt`) only when the row's
+    // *current* `monitorNextCheckAt` is null at `lapsedAt` — i.e. the monitor's
+    // last transition was a fire, not an abandoned schedule. Distinguishes
+    // "did its job, nothing has re-armed it since" from a genuinely stuck
+    // monitor so `formatMonitorGating` doesn't blame the wrong thing.
+    firedAt: Date | null;
+    successorRunId: string | null;
   } | null;
   // BLO-23248: elapsed time attributable to the issue's current run sitting
   // in a capacity-class `scheduled_retry` (fleet model-provider exhaustion) —
@@ -236,17 +243,23 @@ type MonitorScheduledSuppression = {
   sourceIssue: IssueRow;
   sourceAgent: AgentRow;
   elapsedMs: number | null;
-  monitorNextCheckAt: Date;
+  // BLO-25877: null in the just-fired branch — firing clears `monitorNextCheckAt`
+  // atomically with `monitorLastTriggeredAt` (buildIssueMonitorTriggeredPatch), so a
+  // suppression raised on that branch has no future check to report. See
+  // `monitorLastTriggeredAt` below for the timestamp that branch does carry.
+  monitorNextCheckAt: Date | null;
   monitorScheduledBy: string;
   monitorWakeRequestedAt: Date | null;
+  monitorLastTriggeredAt: Date | null;
   thresholds: ProductivityReviewThresholds;
   generatedAt: Date;
 };
 
 type PendingMonitorForReviewSuppression = {
-  monitorNextCheckAt: Date;
+  monitorNextCheckAt: Date | null;
   monitorScheduledBy: string;
   monitorWakeRequestedAt: Date | null;
+  monitorLastTriggeredAt: Date | null;
 };
 
 type ApprovalGatedSuppression = {
@@ -568,11 +581,42 @@ function deliberatePendingMonitor(
   backlogGraceMs = 0,
 ): PendingMonitorForReviewSuppression | null {
   const future = strictFutureMonitor(issue, now);
-  if (future) return { ...future, monitorWakeRequestedAt: null };
+  if (future) return { ...future, monitorWakeRequestedAt: null, monitorLastTriggeredAt: null };
 
-  const monitorNextCheckAt = coerceDate(issue.monitorNextCheckAt);
   const monitorScheduledBy = issue.monitorScheduledBy;
-  if (!monitorNextCheckAt || !isMonitorSuppressionActor(monitorScheduledBy)) return null;
+  const effectiveGraceMs = Math.max(thresholds.monitorLapseServiceGraceMs, backlogGraceMs);
+  const monitorNextCheckAt = coerceDate(issue.monitorNextCheckAt);
+
+  if (!monitorNextCheckAt) {
+    // BLO-25877: firing clears `monitorNextCheckAt` atomically with
+    // `monitorLastTriggeredAt` (buildIssueMonitorTriggeredPatch). A caller here
+    // reads its own fresh copy of the issue (`getCurrentIssue`), taken *after*
+    // this evidence pass's issue snapshot — a monitor that fires in that gap
+    // reads as "nothing pending" on the first guard below even though the fire
+    // itself, by construction, enqueued a successor run: the strongest
+    // available evidence the issue is attended. Cover that just-fired window on
+    // the same grace footing as a lapsed-but-unserviced monitor below, and
+    // symmetric with `monitorHasFreshWakeClaim`'s claimed-but-not-yet-dispatched
+    // window. This is a tolerate-the-transition fix, not a snapshot-consistent
+    // read: it does not make the evidence read and this read atomic, it makes
+    // "fired since the evidence read" its own recognized state instead of an
+    // absence.
+    const monitorLastTriggeredAt = coerceDate(issue.monitorLastTriggeredAt);
+    if (
+      monitorLastTriggeredAt &&
+      isMonitorSuppressionActor(monitorScheduledBy) &&
+      now.getTime() - monitorLastTriggeredAt.getTime() <= effectiveGraceMs
+    ) {
+      return {
+        monitorNextCheckAt: null,
+        monitorScheduledBy,
+        monitorWakeRequestedAt: null,
+        monitorLastTriggeredAt,
+      };
+    }
+    return null;
+  }
+  if (!isMonitorSuppressionActor(monitorScheduledBy)) return null;
 
   // BLO-21003: `monitorNextCheckAt` lapsing is not proof its wake has been
   // serviced. For new-review suppression, keep treating it as pending while
@@ -582,9 +626,8 @@ function deliberatePendingMonitor(
   // open review would start the resolved-review snooze before dispatch succeeds.
   const dueAgeMs = now.getTime() - monitorNextCheckAt.getTime();
   const monitorWakeRequestedAt = monitorHasFreshWakeClaim(issue, now);
-  const effectiveGraceMs = Math.max(thresholds.monitorLapseServiceGraceMs, backlogGraceMs);
   if (dueAgeMs > effectiveGraceMs && !monitorWakeRequestedAt) return null;
-  return { monitorNextCheckAt, monitorScheduledBy, monitorWakeRequestedAt };
+  return { monitorNextCheckAt, monitorScheduledBy, monitorWakeRequestedAt, monitorLastTriggeredAt: null };
 }
 
 /**
@@ -600,7 +643,13 @@ function deliberatePendingMonitor(
  * `gatedIsUpperBound` so the manager-facing line carries the qualifier too.
  * This is reporting only — it does not gate whether the review fires.
  */
-function monitorGatingBreakdown(issue: IssueRow, activeStartedAt: Date | null, elapsedMs: number | null, now: Date) {
+function monitorGatingBreakdown(
+  issue: IssueRow,
+  activeStartedAt: Date | null,
+  elapsedMs: number | null,
+  now: Date,
+  latestRuns: HeartbeatRunRow[],
+) {
   if (elapsedMs === null || !activeStartedAt) return null;
   const armedUntil = coerceDate(issue.monitorNextCheckAt);
   const lastTriggeredAt = coerceDate(issue.monitorLastTriggeredAt);
@@ -618,6 +667,8 @@ function monitorGatingBreakdown(issue: IssueRow, activeStartedAt: Date | null, e
       priorLapseAt: null,
       armedUntil,
       gatedIsUpperBound: true,
+      firedAt: null,
+      successorRunId: null,
     };
   }
 
@@ -632,6 +683,8 @@ function monitorGatingBreakdown(issue: IssueRow, activeStartedAt: Date | null, e
       priorLapseAt: null,
       armedUntil: null,
       gatedIsUpperBound: false,
+      firedAt: null,
+      successorRunId: null,
     };
   }
   const lapsedAt = new Date(Math.max(...lapseCandidates.map((d) => d.getTime())));
@@ -647,8 +700,24 @@ function monitorGatingBreakdown(issue: IssueRow, activeStartedAt: Date | null, e
       priorLapseAt: lapsedAt,
       armedUntil: null,
       gatedIsUpperBound: false,
+      firedAt: null,
+      successorRunId: null,
     };
   }
+
+  // BLO-25877: a null `armedUntil` at this point means the row's *current*
+  // `monitorNextCheckAt` is null — the monitor's last transition was a fire
+  // (which clears it atomically with `monitorLastTriggeredAt`,
+  // `buildIssueMonitorTriggeredPatch`), not an abandoned schedule that a
+  // non-null, past `armedUntil` would represent. Firing enqueues a successor
+  // run by construction, so name it when it's still within the runs sampled
+  // for this evidence pass; a null `successorRunId` here just means the run
+  // fell outside that sample, not that one doesn't exist.
+  const successorRunId = armedUntil === null
+    ? (latestRuns
+        .filter((run) => run.createdAt.getTime() >= lapsedAt.getTime())
+        .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())[0]?.id ?? null)
+    : null;
 
   const gatedMs = Math.min(elapsedMs, lapsedAt.getTime() - activeStartedAt.getTime());
   return {
@@ -658,6 +727,8 @@ function monitorGatingBreakdown(issue: IssueRow, activeStartedAt: Date | null, e
     priorLapseAt: null,
     armedUntil: null,
     gatedIsUpperBound: false,
+    firedAt: armedUntil === null ? lapsedAt : null,
+    successorRunId,
   };
 }
 
@@ -669,6 +740,13 @@ function formatMonitorGating(gating: NonNullable<ProductivityReviewEvidence["mon
   const split = `${gated}, ${unattended}`;
   if (gating.armedUntil) {
     return `${split} (monitor armed until ${gating.armedUntil.toISOString()}; arm time is not recorded, so monitor-gated time is an upper bound)`;
+  }
+  // BLO-25877: a monitor that fired at its scheduled check and enqueued a
+  // successor demands the opposite reader action from one that silently
+  // stopped — do not collapse the two into "never re-armed".
+  if (gating.firedAt) {
+    const successor = gating.successorRunId ? ` (run \`${gating.successorRunId}\`)` : "";
+    return `${split} (monitor fired on schedule at ${gating.firedAt.toISOString()} and enqueued a successor run${successor}; nothing has re-armed it since)`;
   }
   if (gating.lapsedAt) return `${split} (monitor lapsed at ${gating.lapsedAt.toISOString()}, never re-armed)`;
   if (gating.priorLapseAt) {
@@ -1904,9 +1982,10 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       sourceIssueId: suppression.sourceIssue.id,
       trigger: suppression.trigger,
       suppressedBy: "monitor_scheduled",
-      monitorNextCheckAt: suppression.monitorNextCheckAt.toISOString(),
+      monitorNextCheckAt: suppression.monitorNextCheckAt?.toISOString() ?? null,
       monitorScheduledBy: suppression.monitorScheduledBy,
       monitorWakeRequestedAt: suppression.monitorWakeRequestedAt?.toISOString() ?? null,
+      monitorLastTriggeredAt: suppression.monitorLastTriggeredAt?.toISOString() ?? null,
       elapsedMs: suppression.elapsedMs,
     };
     await logActivity(db, {
@@ -2498,6 +2577,18 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     // trigger below, just folded into the boolean rather than a parallel gate
     // object, since (like those gates) this only ever affects
     // `long_active_duration` specifically and never the other triggers.
+    //
+    // BLO-25877: deliberately raw `elapsedMs` here, not the monitor-gated split.
+    // Trigger selection (and therefore every other trigger's suppression
+    // bookkeeping) must stay exactly as it was — the monitor-gated subtraction
+    // below is an *additional*, later gate on whether a `long_active_duration`
+    // review actually gets created, not a change to what counts as long-active
+    // in the first place. Folding the subtraction in here made the predicate
+    // itself go false for issues whose monitor is still safely inside
+    // `currentPendingMonitorForReviewSuppression`'s grace/backlog window — that
+    // bypassed the suppression bookkeeping (and its `monitorScheduledSuppressed`
+    // accounting) for dozens of already-covered backlog-grace scenarios instead
+    // of just narrowing the small genuinely-new case this issue targets.
     const longActive = elapsedMs !== null && elapsedMs >= thresholds.longActiveMs && !capacityDominantAndDue;
     const highChurn =
       runCountLastHour >= thresholds.highChurnHourly ||
@@ -2574,9 +2665,38 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         monitorNextCheckAt: monitor.monitorNextCheckAt,
         monitorScheduledBy: monitor.monitorScheduledBy,
         monitorWakeRequestedAt: monitor.monitorWakeRequestedAt,
+        monitorLastTriggeredAt: monitor.monitorLastTriggeredAt,
         thresholds,
         generatedAt: now,
       };
+    }
+
+    // BLO-25877: computed once here — after both suppression gates above have had
+    // their chance to hold this review back — and reused as-is for the report-text
+    // field further down, rather than recomputed there.
+    const monitorGating = monitorGatingBreakdown(sourceIssue, attributableStartAt, elapsedMs, now, latestRuns);
+    // Neither suppression gate above catches every "monitor accounted for most of
+    // this episode" case: `currentPendingMonitorForReviewSuppression` only covers a
+    // monitor that is still armed or within its lapse grace, not one that lapsed a
+    // long time ago and was never re-armed. For that remaining case, only the
+    // *measured* gated component (`gatedIsUpperBound === false`) is safe to subtract
+    // from the elapsed time before comparing to the threshold — the still-armed
+    // branch reports `gatedMs: elapsedMs` as a deliberate upper bound (no column
+    // records monitor arm time), so treating its `unattendedMs: 0` as authoritative
+    // would make `long_active_duration` structurally unfireable for any issue with a
+    // monitor armed however briefly, which is the indefinite-suppression hazard
+    // BLO-22331 AC2 forbids — and that branch is already fully suppressed above
+    // anyway, so it never reaches this check with anything but `gatedIsUpperBound:
+    // true`. Checked here rather than folded into `longActive` above so trigger
+    // selection and the other three triggers' suppression bookkeeping are
+    // unaffected — see the comment on `longActive`.
+    if (
+      trigger === "long_active_duration" &&
+      monitorGating &&
+      !monitorGating.gatedIsUpperBound &&
+      monitorGating.unattendedMs < thresholds.longActiveMs
+    ) {
+      return null;
     }
 
     // BLO-19604: `run.nextAction` is only populated when that specific run's own
@@ -2626,7 +2746,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       commentCountLastSixHours: assigneeRunCommentCountLastSixHours,
       elapsedMs,
       nonLiveHoldMs,
-      monitorGating: monitorGatingBreakdown(sourceIssue, attributableStartAt, elapsedMs, now),
+      monitorGating,
       capacityGating,
       latestRuns: latestRuns.slice(0, 5),
       latestComments,
@@ -3095,6 +3215,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           monitorNextCheckAt: monitor.monitorNextCheckAt,
           monitorScheduledBy: monitor.monitorScheduledBy,
           monitorWakeRequestedAt: monitor.monitorWakeRequestedAt,
+          monitorLastTriggeredAt: monitor.monitorLastTriggeredAt,
           thresholds: evidence.thresholds,
           generatedAt: evidence.generatedAt,
         });
@@ -3157,6 +3278,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           monitorNextCheckAt: monitor.monitorNextCheckAt,
           monitorScheduledBy: monitor.monitorScheduledBy,
           monitorWakeRequestedAt: monitor.monitorWakeRequestedAt,
+          monitorLastTriggeredAt: monitor.monitorLastTriggeredAt,
           thresholds: evidence.thresholds,
           generatedAt: evidence.generatedAt,
         });

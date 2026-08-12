@@ -1912,6 +1912,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     const result = await productivityReviewService(db).reconcileProductivityReviews({
       now,
       companyId: seeded.companyId,
+      thresholds: { longActiveMs: 60_000 },
     });
 
     expect(result.created).toBe(1);
@@ -2389,6 +2390,7 @@ describeEmbeddedPostgres("productivity review service", () => {
         monitorLapseServiceGraceMs: 6 * 60_000,
         monitorSchedulerIntervalMs: 60_000,
         monitorDispatchBatchSize: 50,
+        longActiveMs: 60_000,
       },
     });
 
@@ -2439,6 +2441,128 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
   });
 
+  // BLO-25877: `currentPendingMonitorForReviewSuppression` issues its own, fresher
+  // `getCurrentIssue` read than the one evidence assembly saw. A monitor that fires
+  // in that gap clears `monitorNextCheckAt` to null — `buildIssueMonitorTriggeredPatch`
+  // clears it atomically with setting `monitorLastTriggeredAt` — so the suppression
+  // check used to see "nothing pending" on its very first guard, even though the fire
+  // itself is the strongest possible evidence the issue is attended (it enqueues a
+  // successor run by construction). This is the exact BLO-25527 replay: fails on
+  // pre-fix code because `deliberatePendingMonitor` returned null purely because
+  // `monitorNextCheckAt` was null, never looking at how recently it got that way.
+  it("suppresses long-active reviews for a monitor that fired within grace and cleared monitorNextCheckAt", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const monitorLastTriggeredAt = new Date(now.getTime() - 2_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - (41 * 60 * 60 * 1000)), // 1d 17h episode
+      monitorNextCheckAt: null,
+      monitorScheduledBy: "assignee",
+      monitorLastTriggeredAt,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(result.monitorScheduledSuppressed).toBe(1);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+
+    const activities = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.action, "issue.productivity_review_suppressed"));
+    expect(activities).toHaveLength(1);
+    expect(activities[0]?.details).toMatchObject({
+      suppressedBy: "monitor_scheduled",
+      monitorNextCheckAt: null,
+      monitorScheduledBy: "assignee",
+      monitorLastTriggeredAt: monitorLastTriggeredAt.toISOString(),
+    });
+  });
+
+  // BLO-25877 AC: the just-fired suppression above must stay bounded, mirroring
+  // BLO-22331 AC2 — a monitor that fired long ago and was never re-armed since is
+  // exactly the unattended-stall signal this trigger exists to catch, not something
+  // an old firing should shield forever.
+  it("still fires long-active review for a monitor that fired long ago and was never re-armed", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 41 * 60 * 60 * 1000),
+      monitorNextCheckAt: null,
+      monitorScheduledBy: "assignee",
+      monitorLastTriggeredAt: new Date(now.getTime() - 24 * 60 * 60 * 1000),
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    expect(result.monitorScheduledSuppressed).toBe(0);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+  });
+
+  // BLO-25877 defect 2: `longActive` used to compare raw `elapsedMs` against the
+  // threshold, ignoring the monitor-gated split computed for the report text. A
+  // monitor that lapsed early in a long episode and was never serviced again must
+  // still subtract the measured (non-upper-bound) gated span, leaving the genuine
+  // unattended remainder to trip the threshold.
+  it("subtracts only the measured monitor-gated span from the long-active predicate", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const activeStartedAt = new Date(now.getTime() - 20 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: activeStartedAt,
+      monitorNextCheckAt: new Date(activeStartedAt.getTime() + 5 * 60 * 1000),
+      monitorScheduledBy: "assignee",
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    expect(result.monitorScheduledSuppressed).toBe(0);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("5m monitor-gated, 19h 55m unattended");
+    expect(review?.description).toContain("monitor lapsed at");
+    expect(review?.description).toContain("never re-armed");
+  });
+
+  // BLO-25877 defect 2 regression guard: the still-armed branch reports
+  // `unattendedMs: 0` as a deliberate, documented upper bound (no arm-time column
+  // exists), not a measured value. Wiring it into the predicate wholesale would make
+  // `long_active_duration` structurally unfireable for any issue with a monitor armed
+  // however briefly — asserting only `created: 0` here would not catch that
+  // regression, since a wrongly-zeroed predicate also produces `created: 0`, just via
+  // "never triggered" instead of "triggered, then suppressed". Assert
+  // `monitorScheduledSuppressed: 1` to distinguish the two.
+  it("keeps the still-armed branch on the pending-monitor gate instead of feeding unattendedMs:0 into the predicate", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 15 * 60 * 60 * 1000),
+      monitorNextCheckAt: new Date(now.getTime() + 60_000),
+      monitorScheduledBy: "assignee",
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(result.monitorScheduledSuppressed).toBe(1);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
   it("does not renew backlog grace forever behind a non-draining predecessor", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const monitorNextCheckAt = new Date(now.getTime() - 10 * 60_000);
@@ -2470,6 +2594,7 @@ describeEmbeddedPostgres("productivity review service", () => {
         monitorLapseServiceGraceMs: 60_000,
         monitorSchedulerIntervalMs: 60_000,
         monitorDispatchBatchSize: 50,
+        longActiveMs: 60_000,
       },
     });
 
@@ -2534,6 +2659,7 @@ describeEmbeddedPostgres("productivity review service", () => {
         monitorLapseServiceGraceMs: 60_000,
         monitorSchedulerIntervalMs: 60_000,
         monitorDispatchBatchSize: 50,
+        longActiveMs: 60_000,
       },
     });
 
@@ -2797,7 +2923,9 @@ describeEmbeddedPostgres("productivity review service", () => {
     }).reconcileProductivityReviews({
       now,
       companyId: seeded.companyId,
-      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+      // BLO-25877: 10m unattended residue must clear `longActiveMs` for
+      // `collectEvidence` to reach the monitor-suppression hooks under test here.
+      thresholds: { monitorLapseServiceGraceMs: 60_000, longActiveMs: 60_000 },
     });
 
     expect(result.created).toBe(0);
@@ -2838,7 +2966,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     }).reconcileProductivityReviews({
       now,
       companyId: seeded.companyId,
-      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+      thresholds: { monitorLapseServiceGraceMs: 60_000, longActiveMs: 60_000 },
     });
 
     expect(result.created).toBe(0);
@@ -2883,7 +3011,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     }).reconcileProductivityReviews({
       now,
       companyId: seeded.companyId,
-      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+      thresholds: { monitorLapseServiceGraceMs: 60_000, longActiveMs: 60_000 },
     });
 
     expect(result.failed).toBe(0);
@@ -2933,6 +3061,7 @@ describeEmbeddedPostgres("productivity review service", () => {
         monitorLapseServiceGraceMs: 60_000,
         monitorSchedulerIntervalMs: 60_000,
         monitorDispatchBatchSize: 50,
+        longActiveMs: 60_000,
       },
     });
 
@@ -2981,6 +3110,7 @@ describeEmbeddedPostgres("productivity review service", () => {
         monitorLapseServiceGraceMs: 60_000,
         monitorSchedulerIntervalMs: 60_000,
         monitorDispatchBatchSize: 50,
+        longActiveMs: 60_000,
       },
     });
 
@@ -3027,6 +3157,7 @@ describeEmbeddedPostgres("productivity review service", () => {
         monitorLapseServiceGraceMs: 60_000,
         monitorSchedulerIntervalMs: 60_000,
         monitorDispatchBatchSize: 50,
+        longActiveMs: 60_000,
       },
     });
 
@@ -3307,7 +3438,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     const replayed = await service.reconcileProductivityReviews({
       now,
       companyId: seeded.companyId,
-      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+      thresholds: { monitorLapseServiceGraceMs: 60_000, longActiveMs: 60_000 },
     });
     expect(replayed.created).toBe(1);
     expect(replayed.failed).toBe(0);
@@ -3321,7 +3452,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     const second = await service.reconcileProductivityReviews({
       now,
       companyId: seeded.companyId,
-      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+      thresholds: { monitorLapseServiceGraceMs: 60_000, longActiveMs: 60_000 },
     });
     expect(second.created).toBe(0);
     expect(second.existing).toBe(1);
@@ -3375,7 +3506,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     const first = await service.reconcileProductivityReviews({
       now,
       companyId: seeded.companyId,
-      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+      thresholds: { monitorLapseServiceGraceMs: 60_000, longActiveMs: 60_000 },
     });
     expect(first.created).toBe(1);
     expect(wakeups).toHaveLength(1);
@@ -3385,7 +3516,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     const second = await service.reconcileProductivityReviews({
       now,
       companyId: seeded.companyId,
-      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+      thresholds: { monitorLapseServiceGraceMs: 60_000, longActiveMs: 60_000 },
     });
     expect(second.created).toBe(1);
     expect(wakeups).toHaveLength(2);
@@ -3426,14 +3557,14 @@ describeEmbeddedPostgres("productivity review service", () => {
     const first = service.reconcileProductivityReviews({
       now: scanStartedAt,
       companyId: seeded.companyId,
-      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+      thresholds: { monitorLapseServiceGraceMs: 60_000, longActiveMs: 60_000 },
     });
     await firstWakeStarted.promise;
 
     const second = await service.reconcileProductivityReviews({
       now: scanStartedAt,
       companyId: seeded.companyId,
-      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+      thresholds: { monitorLapseServiceGraceMs: 60_000, longActiveMs: 60_000 },
     });
 
     expect(second.created).toBe(0);
@@ -3501,7 +3632,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     const replayed = await service.reconcileProductivityReviews({
       now,
       companyId: seeded.companyId,
-      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+      thresholds: { monitorLapseServiceGraceMs: 60_000, longActiveMs: 60_000 },
     });
     expect(replayed.created).toBe(1);
     expect(wakeups).toHaveLength(0);
@@ -3544,7 +3675,7 @@ describeEmbeddedPostgres("productivity review service", () => {
         service.reconcileProductivityReviews({
           now,
           companyId: seeded.companyId,
-          thresholds: { monitorLapseServiceGraceMs: 60_000 },
+          thresholds: { monitorLapseServiceGraceMs: 60_000, longActiveMs: 60_000 },
         }),
         1_000,
         "productivity review wake enqueue row-lock replay",
@@ -3823,12 +3954,18 @@ describeEmbeddedPostgres("productivity review service", () => {
   // unsupervised and must still fire exactly as it does today. Without this
   // case, a fix that simply disabled the trigger (e.g. always suppressing)
   // would pass the positive test above too.
+  // BLO-25877: past the service grace window is necessary but not sufficient once
+  // `longActive` subtracts the measured monitor-gated span — the monitor here lapses
+  // near the *start* of the episode (not 10 minutes before `now`, as this test used
+  // to set up) so the genuinely-unattended remainder still clears the default 6h
+  // threshold on its own, the same way an 8h-old, never-re-armed lapse would.
   it("still creates a long-active review when the monitor lapsed well past the service grace window", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
+    const startedAt = new Date(now.getTime() - 7 * 60 * 60 * 1000);
     const seeded = await seedAssignedIssue({
       status: "in_progress",
-      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
-      monitorNextCheckAt: new Date(now.getTime() - 10 * 60 * 1000),
+      startedAt,
+      monitorNextCheckAt: new Date(startedAt.getTime() + 5 * 60 * 1000),
       monitorScheduledBy: "assignee",
     });
 
@@ -3843,37 +3980,42 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(review?.description).toContain("Primary trigger: `long_active_duration`");
   });
 
-  // BLO-21003 AC3: even outside the suppression window (monitor already
-  // triggered, `monitorNextCheckAt` cleared), a sub-minute nonzero unattended
-  // residue must not floor to `0m` — that reads as "measured and zero" rather
-  // than "sub-minute and real". Replays the BLO-19772 shape (14h10m elapsed,
-  // wake serviced ~29s after the monitor came due) but reports the residue
-  // directly as seconds instead of flooring it away.
+  // BLO-21003 AC3 / BLO-25877: even outside the suppression window (monitor already
+  // lapsed, well past grace), a sub-minute nonzero unattended residue must not floor
+  // to `0m` — that reads as "measured and zero" rather than "sub-minute and real".
+  // Replays the BLO-19772 shape (14h10m elapsed, wake serviced ~45s after the monitor
+  // came due) but reports the residue directly as seconds instead of flooring it
+  // away. Uses a non-null, never-triggered `monitorNextCheckAt` (not
+  // `monitorLastTriggeredAt`) so this exercises the "lapsed, unserviced" gating branch
+  // rather than BLO-25877's just-fired suppression branch, and shrinks both grace and
+  // the long-active threshold so a 45s residue is both past grace and past threshold
+  // without inflating the episode.
   it("reports a sub-minute unattended residue in seconds instead of flooring it to 0m", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const startedAt = new Date(now.getTime() - (14 * 60 + 10) * 60 * 1000);
-    const monitorLastTriggeredAt = new Date(now.getTime() - 45_000);
+    const monitorNextCheckAt = new Date(now.getTime() - 45_000);
     const seeded = await seedAssignedIssue({
       status: "in_progress",
       startedAt,
-      monitorNextCheckAt: null,
+      monitorNextCheckAt,
       monitorScheduledBy: "assignee",
-      monitorLastTriggeredAt,
     });
 
     const result = await productivityReviewService(db).reconcileProductivityReviews({
       now,
       companyId: seeded.companyId,
+      thresholds: { monitorLapseServiceGraceMs: 10_000, longActiveMs: 30_000 },
     });
 
     expect(result.created).toBe(1);
     expect(result.monitorScheduledSuppressed).toBe(0);
     const [review] = await listProductivityReviews(seeded.companyId);
     expect(review?.description).toContain(
-      `- Elapsed accounting: 14h 9m monitor-gated, 45s unattended (monitor lapsed at ${monitorLastTriggeredAt.toISOString()}, never re-armed)`,
+      `- Elapsed accounting: 14h 9m monitor-gated, 45s unattended (monitor lapsed at ${monitorNextCheckAt.toISOString()}, never re-armed)`,
     );
     expect(review?.description).not.toContain("0m unattended");
   });
+
 
   it("reports the whole episode as unattended when no monitor was ever armed", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
@@ -3901,6 +4043,12 @@ describeEmbeddedPostgres("productivity review service", () => {
   // first 1h23m of the 15h53m episode was monitor-gated. The review therefore
   // still fires (correctly: 14h30m genuinely unattended), and the evidence block
   // must make that split legible to the adjudicating manager.
+  //
+  // BLO-25877: a null `monitorNextCheckAt` with `monitorLastTriggeredAt` set means
+  // the monitor's last transition was a fire, not an abandoned schedule — the text
+  // now says so ("fired on schedule ... and enqueued a successor run") rather than
+  // "lapsed, never re-armed", which BLO-25877 reserves for a monitor that is
+  // actually stuck. No successor run is named here because none was seeded.
   it("splits monitor-gated from unattended elapsed time when the monitor lapsed (BLO-19067 replay)", async () => {
     const startedAt = new Date("2026-07-30T21:13:34.758Z");
     const monitorLastTriggeredAt = new Date("2026-07-30T22:36:42.405Z");
@@ -3923,7 +4071,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     const [review] = await listProductivityReviews(seeded.companyId);
     expect(review?.description).toContain("Current active elapsed time: 15h 53m");
     expect(review?.description).toContain(
-      `- Elapsed accounting: 1h 23m monitor-gated, 14h 30m unattended (monitor lapsed at ${monitorLastTriggeredAt.toISOString()}, never re-armed)`,
+      `- Elapsed accounting: 1h 23m monitor-gated, 14h 30m unattended (monitor fired on schedule at ${monitorLastTriggeredAt.toISOString()} and enqueued a successor run; nothing has re-armed it since)`,
     );
   });
 
