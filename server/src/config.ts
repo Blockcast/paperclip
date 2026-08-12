@@ -142,6 +142,18 @@ export interface Config {
   // extend a recovery attempt that has already started.
   recoveryActionMaxAttempts: number;
   recoveryActionTimeoutMs: number;
+  // BLO-24782: how long a monitor that has already fired (`status: "triggered"`)
+  // but has not been re-armed still counts as a live wake path. Past this bound
+  // the recovery sweep treats the issue as having no wake path and escalates it
+  // normally, which is what creates the `issue_recovery_actions` row that the
+  // BLO-19124 reaper then bounds.
+  //
+  // Deliberately a separate knob from `recoveryActionTimeoutMs` even though the
+  // defaults match: one bounds the lifetime of a recovery attempt that has
+  // started, the other bounds how long an un-re-armed watch is believed. They
+  // are independently choosable and collapsing them would make raising either
+  // one silently move the other.
+  lapsedMonitorGraceMs: number;
   // Process role for HA topology. When set to "api", the process serves
   // HTTP traffic only — no in-process plugin workers, no heartbeat
   // scheduler. When set to "worker", the process owns the heartbeat
@@ -866,6 +878,14 @@ export function loadConfig(): Config {
       [process.env.RECOVERY_ACTION_TIMEOUT_MS],
       NUMERIC_SETTING_BOUNDS.recoveryActionTimeoutMs,
       "recoveryActionTimeoutMs",
+    ),
+    lapsedMonitorGraceMs: Math.max(
+      // Floor well above a continuation run's turnaround. The BLO-16146 race
+      // this grace exists to avoid is measured in seconds, so no operator
+      // setting may shrink it to the point where the sweep can beat a run
+      // that is legitimately about to re-arm.
+      15 * 60_000,
+      Number(process.env.LAPSED_MONITOR_GRACE_MS) || 6 * 60 * 60_000,
     ),
     paperclipNodeRole,
     paperclipWorkersInternalUrl:
