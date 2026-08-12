@@ -1,5 +1,6 @@
 import { applyPendingMigrations, inspectMigrations } from "./client.js";
 import { resolveMigrationConnection } from "./migration-runtime.js";
+import { ensureOnlineIndexPrerequisites } from "./precreate-online-indexes.js";
 
 async function main(): Promise<void> {
   const resolved = await resolveMigrationConnection();
@@ -11,6 +12,13 @@ async function main(): Promise<void> {
     if (before.status === "upToDate") {
       console.log("No pending migrations");
       return;
+    }
+
+    const precreated = await ensureOnlineIndexPrerequisites(resolved.connectionString, {
+      log: (message) => console.log(`[precreate-online-indexes] ${message}`),
+    });
+    for (const result of precreated) {
+      console.log(`[precreate-online-indexes] ${result.migration}: ${result.indexName} -> ${result.action}`);
     }
 
     console.log(`Applying ${before.pendingMigrations.length} pending migration(s)...`);

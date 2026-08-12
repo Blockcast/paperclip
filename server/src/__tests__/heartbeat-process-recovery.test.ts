@@ -6170,6 +6170,318 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(mockDeleteAgentJobsForRun).toHaveBeenCalledWith(expect.objectContaining({ runId }));
   });
 
+  describe("BLO-21460: cancellation releases reservations and leases", () => {
+    async function getReservation(runId: string) {
+      return db
+        .select()
+        .from(externalRuntimeReservations)
+        .where(eq(externalRuntimeReservations.runId, runId))
+        .then((rows) => rows[0] ?? null);
+    }
+
+    async function getLease(leaseId: string) {
+      return db
+        .select()
+        .from(environmentLeases)
+        .where(eq(environmentLeases.id, leaseId))
+        .then((rows) => rows[0] ?? null);
+    }
+
+    it("releases the reservation immediately (no wait for the next sweep) when the Job is confirmed gone", async () => {
+      const { companyId, agentId, runId } = await seedRunFixture({
+        adapterType: "claude_k8s",
+        processPid: null,
+        processGroupId: null,
+        agentStatus: "running",
+        includeIssue: false,
+      });
+      const reservation = await seedLaunchedReservation({ companyId, agentId, runId });
+      mockReadAgentJobRunStatusByName.mockImplementation(async (name) =>
+        name === reservation.jobName
+          ? { phase: "missing" as const, reason: "NotFound" as const, name }
+          : null,
+      );
+
+      const cancelled = await heartbeat.cancelRun(runId);
+      expect(cancelled?.status).toBe("cancelled");
+
+      const row = await getReservation(runId);
+      expect(row?.state).toBe("released");
+      expect(row?.releasedAt).toBeTruthy();
+    });
+
+    it("does NOT release the reservation while the Job is still confirmed active (present runtime Job)", async () => {
+      const { companyId, agentId, runId } = await seedRunFixture({
+        adapterType: "claude_k8s",
+        processPid: null,
+        processGroupId: null,
+        agentStatus: "running",
+        includeIssue: false,
+      });
+      const reservation = await seedLaunchedReservation({ companyId, agentId, runId });
+      // deleteExactExternalRuntimeJob's own delete attempt is mocked to
+      // "succeed" by the module default, but the independent reconciler
+      // re-verifies against the cluster and must refuse to release a slot
+      // out from under a Job it can still observe running.
+      mockReadAgentJobRunStatusByName.mockImplementation(async (name) =>
+        name === reservation.jobName
+          ? { phase: "active" as const, name, uid: reservation.jobUid }
+          : null,
+      );
+
+      await heartbeat.cancelRun(runId);
+
+      const row = await getReservation(runId);
+      expect(row?.state).toBe("release_pending");
+      expect(row?.releasedAt).toBeNull();
+    });
+
+    it("releases the environment lease immediately on cancel", async () => {
+      const { companyId, agentId, runId, issueId } = await seedRunFixture({
+        agentStatus: "running",
+        includeIssue: true,
+      });
+      const { leaseId } = await seedEnvironmentLeaseFixture({ companyId, runId, issueId });
+
+      const cancelled = await heartbeat.cancelRun(runId);
+      expect(cancelled?.status).toBe("cancelled");
+
+      const lease = await getLease(leaseId);
+      expect(lease?.status).toBe("expired");
+      expect(lease?.releasedAt).toBeTruthy();
+    });
+
+    it("crash/retry: a repeated cancelRun call heals a lease and reservation left behind by an interrupted first cancellation", async () => {
+      const { companyId, agentId, runId, issueId } = await seedRunFixture({
+        adapterType: "claude_k8s",
+        processPid: null,
+        processGroupId: null,
+        agentStatus: "running",
+        includeIssue: true,
+      });
+      const reservation = await seedLaunchedReservation({ companyId, agentId, runId });
+      const { leaseId } = await seedEnvironmentLeaseFixture({ companyId, runId, issueId });
+
+      // Simulate a process that crashed AFTER writing status='cancelled' but
+      // BEFORE releasing either resource: write the terminal status directly,
+      // bypassing cancelRunInternal entirely. The DB trigger still fires on
+      // this UPDATE (migration 0128), flipping the reservation to
+      // release_pending; the lease is untouched because nothing reconciles
+      // leases outside cancelRunInternal / reapOrphanedRuns.
+      await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() }).where(eq(heartbeatRuns.id, runId));
+      expect((await getReservation(runId))?.state).toBe("release_pending");
+      expect((await getLease(leaseId))?.status).toBe("active");
+
+      mockReadAgentJobRunStatusByName.mockImplementation(async (name) =>
+        name === reservation.jobName
+          ? { phase: "missing" as const, reason: "NotFound" as const, name }
+          : null,
+      );
+
+      // The run is already terminal, so this call takes the "already
+      // terminal, retry cleanup" branch rather than the normal cancel flow.
+      const result = await heartbeat.cancelRun(runId);
+      expect(result?.status).toBe("cancelled");
+
+      const row = await getReservation(runId);
+      expect(row?.state).toBe("released");
+      expect(row?.releasedAt).toBeTruthy();
+      const lease = await getLease(leaseId);
+      expect(lease?.status).toBe("expired");
+      expect(lease?.releasedAt).toBeTruthy();
+    });
+
+    it("repeated cancelRun calls after a clean cancel are a no-op (idempotent, no error, no double release)", async () => {
+      const { companyId, agentId, runId, issueId } = await seedRunFixture({
+        adapterType: "claude_k8s",
+        processPid: null,
+        processGroupId: null,
+        agentStatus: "running",
+        includeIssue: true,
+      });
+      const reservation = await seedLaunchedReservation({ companyId, agentId, runId });
+      const { leaseId } = await seedEnvironmentLeaseFixture({ companyId, runId, issueId });
+      mockReadAgentJobRunStatusByName.mockImplementation(async (name) =>
+        name === reservation.jobName
+          ? { phase: "missing" as const, reason: "NotFound" as const, name }
+          : null,
+      );
+
+      await heartbeat.cancelRun(runId);
+      const afterFirst = await getReservation(runId);
+      const leaseAfterFirst = await getLease(leaseId);
+
+      await expect(heartbeat.cancelRun(runId)).resolves.toBeTruthy();
+
+      const afterSecond = await getReservation(runId);
+      const leaseAfterSecond = await getLease(leaseId);
+      expect(afterSecond?.releasedAt?.getTime()).toBe(afterFirst?.releasedAt?.getTime());
+      expect(leaseAfterSecond?.releasedAt?.getTime()).toBe(leaseAfterFirst?.releasedAt?.getTime());
+    });
+
+    it("partial-release state: heals only the resource still stuck when the other already released cleanly", async () => {
+      const { companyId, agentId, runId, issueId } = await seedRunFixture({
+        adapterType: "claude_k8s",
+        processPid: null,
+        processGroupId: null,
+        agentStatus: "running",
+        includeIssue: true,
+      });
+      const reservation = await seedLaunchedReservation({ companyId, agentId, runId });
+      const { leaseId } = await seedEnvironmentLeaseFixture({ companyId, runId, issueId });
+
+      // Simulate a crash that got as far as releasing the lease but not the
+      // reservation: mark the run terminal and the lease already released,
+      // leave the reservation exactly where the trigger would leave it.
+      const finishedAt = new Date();
+      await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt }).where(eq(heartbeatRuns.id, runId));
+      await db.update(environmentLeases).set({ status: "expired", releasedAt: finishedAt }).where(eq(environmentLeases.id, leaseId));
+      mockReadAgentJobRunStatusByName.mockImplementation(async (name) =>
+        name === reservation.jobName
+          ? { phase: "missing" as const, reason: "NotFound" as const, name }
+          : null,
+      );
+
+      await heartbeat.cancelRun(runId);
+
+      const row = await getReservation(runId);
+      expect(row?.state).toBe("released");
+      const lease = await getLease(leaseId);
+      // Untouched by the retry pass beyond its already-released state.
+      expect(lease?.releasedAt?.getTime()).toBe(finishedAt.getTime());
+    });
+
+    it("cancelActiveForAgent releases the lease and reservation for every cancelled run (bulk path)", async () => {
+      const { companyId, agentId, runId: runId1, issueId: issueId1 } = await seedRunFixture({
+        adapterType: "claude_k8s",
+        processPid: null,
+        processGroupId: null,
+        agentStatus: "running",
+        includeIssue: true,
+      });
+      // A second run for the SAME agent/company (seedRunFixture always mints
+      // its own fresh company+agent, so it cannot be reused here) — proves
+      // the bulk path releases every run's resources, not just the first.
+      const runId2 = randomUUID();
+      const issueId2 = randomUUID();
+      const now = new Date("2026-03-19T00:00:00.000Z");
+      await db.insert(heartbeatRuns).values({
+        id: runId2,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "running",
+        contextSnapshot: { issueId: issueId2 },
+        processPid: null,
+        processGroupId: null,
+        startedAt: now,
+        createdAt: now,
+        updatedAt: now,
+        lastOutputAt: new Date(),
+      });
+      await db.insert(issues).values({
+        id: issueId2,
+        companyId,
+        title: "Second concurrent run for bulk-cancel fixture",
+        status: "in_progress",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        checkoutRunId: runId2,
+        executionRunId: runId2,
+        responsibleUserId: "responsible-user",
+        issueNumber: 2,
+        identifier: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}-2`,
+      });
+      // Per-run isolation (not the "shared" mode seedLaunchedReservation
+      // defaults to) so both reservations can be "launched" concurrently for
+      // the same agent — mirrors how a real multi-slot agent's reservations
+      // are keyed, and avoids external_runtime_reservations_active_isolation_writer_idx.
+      const reservation1 = await seedLaunchedReservation({ companyId, agentId, runId: runId1, slotId: 0 });
+      const reservation2 = await db
+        .insert(externalRuntimeReservations)
+        .values({
+          companyId,
+          agentId,
+          runId: runId2,
+          slotId: 1,
+          state: "launched",
+          expectedJobName: "agent-job-run2",
+          jobName: "agent-job-run2",
+          jobUid: `uid-${runId2}`,
+          isolationMode: "run",
+          isolationKey: `run:${runId2}`,
+          isolationBoundAt: now,
+          reservedAt: now,
+          launchingAt: now,
+          launchedAt: now,
+          createdAt: now,
+          updatedAt: now,
+        })
+        .returning()
+        .then((rows) => rows[0]!);
+      const { leaseId: leaseId1 } = await seedEnvironmentLeaseFixture({ companyId, runId: runId1, issueId: issueId1 });
+      const { leaseId: leaseId2 } = await seedEnvironmentLeaseFixture({ companyId, runId: runId2, issueId: issueId2 });
+      mockReadAgentJobRunStatusByName.mockImplementation(async (name) => {
+        if (name === reservation1.jobName || name === reservation2.jobName) {
+          return { phase: "missing" as const, reason: "NotFound" as const, name };
+        }
+        return null;
+      });
+
+      const count = await heartbeat.cancelActiveForAgent(agentId);
+      expect(count).toBe(2);
+
+      for (const [runId, leaseId] of [[runId1, leaseId1], [runId2, leaseId2]] as const) {
+        expect((await getReservation(runId))?.state).toBe("released");
+        expect((await getLease(leaseId))?.status).toBe("expired");
+      }
+    });
+
+    it("reconcileOrphanedEnvironmentLeases (periodic sweep) releases a lease orphaned without any cancelRun call", async () => {
+      const { companyId, runId, issueId } = await seedRunFixture({
+        runStatus: "failed",
+        processPid: null,
+        processGroupId: null,
+        includeIssue: true,
+      });
+      const { leaseId } = await seedEnvironmentLeaseFixture({ companyId, runId, issueId });
+
+      const releasedCount = await heartbeat.reconcileOrphanedEnvironmentLeases();
+      expect(releasedCount).toBe(1);
+
+      const lease = await getLease(leaseId);
+      expect(lease?.status).toBe("failed");
+      expect(lease?.releasedAt).toBeTruthy();
+
+      // A second pass is a clean no-op — nothing left to reconcile.
+      expect(await heartbeat.reconcileOrphanedEnvironmentLeases()).toBe(0);
+    });
+
+    it("refreshOrphanedRuntimeResourceMetrics reads 0 once reconciliation has cleared the backlog", async () => {
+      const { companyId, agentId, runId, issueId } = await seedRunFixture({
+        adapterType: "claude_k8s",
+        runStatus: "failed",
+        processPid: null,
+        processGroupId: null,
+        includeIssue: true,
+      });
+      const reservation = await seedLaunchedReservation({ companyId, agentId, runId });
+      await seedEnvironmentLeaseFixture({ companyId, runId, issueId });
+      mockReadAgentJobRunStatusByName.mockImplementation(async (name) =>
+        name === reservation.jobName
+          ? { phase: "missing" as const, reason: "NotFound" as const, name }
+          : null,
+      );
+
+      await heartbeat.reapOrphanedRuns();
+
+      const metrics = await renderMetrics();
+      expect(metrics.body).toMatch(/paperclip_external_runtime_reservations_release_pending 0\b/);
+      expect(metrics.body).toMatch(/paperclip_environment_leases_orphaned_active 0\b/);
+    });
+  });
+
   it("reaper deletes stale live external-lifecycle Jobs whose heartbeat run is already terminal", async () => {
     const stale = new Date(Date.now() - 6 * 60 * 1000);
     const { companyId, agentId, runId } = await seedRunFixture({

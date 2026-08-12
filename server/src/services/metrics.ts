@@ -87,6 +87,35 @@ export const EXTERNAL_RUNTIME_RESERVATION_OLDEST_AGE_METRIC = "paperclip_externa
 // identifies which agent is starved.
 export const QUEUED_RUN_OLDEST_AGE_METRIC = "paperclip_queued_run_oldest_age_seconds";
 /**
+ * BLO-21460 (2026-08-03 incident follow-up). Unlike the two metrics above
+ * (which count every unreleased reservation, healthy in-flight ones
+ * included), these two count only the backlog left AFTER each reconciliation
+ * pass — reservations still in `release_pending` (or an orphaned prelaunch
+ * state) whose Job was confirmed gone/terminal but the row didn't clear, and
+ * the oldest such row's age. In steady state both are 0: the periodic
+ * reconciler (`reapOrphanedRuns` -> `reconcileReleasePendingExternalRuntimeReservations`,
+ * every `heartbeatSchedulerIntervalMs`) and cancellation's own inline release
+ * should always be able to clear a confirmed-terminal reservation. A
+ * sustained non-zero count means reconciliation itself is failing (e.g. the
+ * scheduler is down, as it was during the incident, or the kube API is
+ * unreachable) and slots are leaking toward executor capacity exhaustion.
+ * Alert threshold: any non-zero value sustained >10 min warrants operator
+ * attention; page if oldest age exceeds a few multiples of the scheduler
+ * interval.
+ */
+export const EXTERNAL_RUNTIME_RESERVATIONS_RELEASE_PENDING_METRIC = "paperclip_external_runtime_reservations_release_pending";
+export const EXTERNAL_RUNTIME_RESERVATION_RELEASE_PENDING_OLDEST_AGE_METRIC = "paperclip_external_runtime_reservation_release_pending_oldest_age_seconds";
+/**
+ * BLO-21460. Ephemeral environment leases (`environment_leases.status =
+ * 'active'`) whose heartbeat run has already reached a terminal status —
+ * i.e. leases cancellation or normal finalization should have released but
+ * didn't. Same alerting posture as the release-pending reservation pair
+ * above: 0 in steady state, any sustained non-zero count is a leak heading
+ * toward environment/executor capacity exhaustion.
+ */
+export const ENVIRONMENT_LEASES_ORPHANED_ACTIVE_METRIC = "paperclip_environment_leases_orphaned_active";
+export const ENVIRONMENT_LEASES_ORPHANED_OLDEST_AGE_METRIC = "paperclip_environment_leases_orphaned_oldest_age_seconds";
+/**
  * process_lost reap counter (BLO-16184, parent BLO-12292). Incremented once at
  * the reaper's `process_lost` mint, labeled by bounded `adapter`
  * (claude_k8s/opencode_k8s/other), `error_bucket` (the fixed reaper failure
@@ -922,6 +951,10 @@ let agentZeroTokenCompletedRunStreak: Gauge<"agent_id" | "adapter"> | null = nul
 let externalRuntimeReservationEvents: Counter<"event"> | null = null;
 let externalRuntimeReservationsActive: Gauge | null = null;
 let externalRuntimeReservationOldestAge: Gauge | null = null;
+let externalRuntimeReservationsReleasePending: Gauge | null = null;
+let externalRuntimeReservationReleasePendingOldestAge: Gauge | null = null;
+let environmentLeasesOrphanedActive: Gauge | null = null;
+let environmentLeasesOrphanedOldestAge: Gauge | null = null;
 let processLostTotal: Counter<"adapter" | "error_bucket" | "classification"> | null = null;
 let externalLifecycleRunningRuns: Gauge<"adapter"> | null = null;
 let externalLifecycleRunSilenceGap: Histogram<"adapter" | "status"> | null = null;
@@ -947,6 +980,10 @@ function ensureRegistry(): {
   externalRuntimeReservationEventsCounter: Counter<"event">;
   externalRuntimeReservationsActiveGauge: Gauge;
   externalRuntimeReservationOldestAgeGauge: Gauge;
+  externalRuntimeReservationsReleasePendingGauge: Gauge;
+  externalRuntimeReservationReleasePendingOldestAgeGauge: Gauge;
+  environmentLeasesOrphanedActiveGauge: Gauge;
+  environmentLeasesOrphanedOldestAgeGauge: Gauge;
   processLostTotalCounter: Counter<"adapter" | "error_bucket" | "classification">;
   externalLifecycleRunningRunsGauge: Gauge<"adapter">;
   externalLifecycleRunSilenceGapHistogram: Histogram<"adapter" | "status">;
@@ -972,6 +1009,10 @@ function ensureRegistry(): {
     || !externalRuntimeReservationEvents
     || !externalRuntimeReservationsActive
     || !externalRuntimeReservationOldestAge
+    || !externalRuntimeReservationsReleasePending
+    || !externalRuntimeReservationReleasePendingOldestAge
+    || !environmentLeasesOrphanedActive
+    || !environmentLeasesOrphanedOldestAge
     || !processLostTotal
     || !externalLifecycleRunningRuns
     || !externalLifecycleRunSilenceGap
@@ -1052,6 +1093,32 @@ function ensureRegistry(): {
     externalRuntimeReservationOldestAge = new Gauge({
       name: EXTERNAL_RUNTIME_RESERVATION_OLDEST_AGE_METRIC,
       help: "Age in seconds of the oldest unreleased external-runtime slot reservation.",
+      registers: [registry],
+    });
+    externalRuntimeReservationsReleasePending = new Gauge({
+      name: EXTERNAL_RUNTIME_RESERVATIONS_RELEASE_PENDING_METRIC,
+      help:
+        "Reservations confirmed releasable (Job gone/terminal) that reconciliation still had "
+        + "not cleared as of the last pass. 0 in steady state; sustained non-zero means "
+        + "reconciliation itself is failing (BLO-21460).",
+      registers: [registry],
+    });
+    externalRuntimeReservationReleasePendingOldestAge = new Gauge({
+      name: EXTERNAL_RUNTIME_RESERVATION_RELEASE_PENDING_OLDEST_AGE_METRIC,
+      help: "Age in seconds of the oldest reservation counted by " + EXTERNAL_RUNTIME_RESERVATIONS_RELEASE_PENDING_METRIC + ".",
+      registers: [registry],
+    });
+    environmentLeasesOrphanedActive = new Gauge({
+      name: ENVIRONMENT_LEASES_ORPHANED_ACTIVE_METRIC,
+      help:
+        "Ephemeral environment leases still 'active' whose heartbeat run is already terminal. "
+        + "0 in steady state; sustained non-zero means lease release did not run for that run "
+        + "(BLO-21460).",
+      registers: [registry],
+    });
+    environmentLeasesOrphanedOldestAge = new Gauge({
+      name: ENVIRONMENT_LEASES_ORPHANED_OLDEST_AGE_METRIC,
+      help: "Age in seconds of the oldest lease counted by " + ENVIRONMENT_LEASES_ORPHANED_ACTIVE_METRIC + ".",
       registers: [registry],
     });
     processLostTotal = new Counter({
@@ -1316,6 +1383,10 @@ function ensureRegistry(): {
     externalRuntimeReservationEventsCounter: externalRuntimeReservationEvents,
     externalRuntimeReservationsActiveGauge: externalRuntimeReservationsActive,
     externalRuntimeReservationOldestAgeGauge: externalRuntimeReservationOldestAge,
+    externalRuntimeReservationsReleasePendingGauge: externalRuntimeReservationsReleasePending,
+    externalRuntimeReservationReleasePendingOldestAgeGauge: externalRuntimeReservationReleasePendingOldestAge,
+    environmentLeasesOrphanedActiveGauge: environmentLeasesOrphanedActive,
+    environmentLeasesOrphanedOldestAgeGauge: environmentLeasesOrphanedOldestAge,
     processLostTotalCounter: processLostTotal,
     externalLifecycleRunningRunsGauge: externalLifecycleRunningRuns,
     externalLifecycleRunSilenceGapHistogram: externalLifecycleRunSilenceGap,
@@ -1500,6 +1571,31 @@ export function setExternalRuntimeReservationMetrics(input: {
   const metrics = ensureRegistry();
   metrics.externalRuntimeReservationsActiveGauge.set(Math.max(0, input.active));
   metrics.externalRuntimeReservationOldestAgeGauge.set(Math.max(0, input.oldestAgeSeconds));
+}
+
+/**
+ * BLO-21460. Set from the residual backlog measured AFTER each reconciliation
+ * pass (`reapOrphanedRuns` -> `reconcileReleasePendingExternalRuntimeReservations`),
+ * not the pre-pass candidate count — see the metric's doc comment for why 0 is
+ * the only healthy steady-state value.
+ */
+export function setReleasePendingExternalRuntimeReservationMetrics(input: {
+  count: number;
+  oldestAgeSeconds: number;
+}): void {
+  const metrics = ensureRegistry();
+  metrics.externalRuntimeReservationsReleasePendingGauge.set(Math.max(0, input.count));
+  metrics.externalRuntimeReservationReleasePendingOldestAgeGauge.set(Math.max(0, input.oldestAgeSeconds));
+}
+
+/** BLO-21460. Same residual-after-reconciliation convention as above, for leases. */
+export function setOrphanedEnvironmentLeaseMetrics(input: {
+  active: number;
+  oldestAgeSeconds: number;
+}): void {
+  const metrics = ensureRegistry();
+  metrics.environmentLeasesOrphanedActiveGauge.set(Math.max(0, input.active));
+  metrics.environmentLeasesOrphanedOldestAgeGauge.set(Math.max(0, input.oldestAgeSeconds));
 }
 
 /**
@@ -1849,6 +1945,10 @@ export function __resetMetricsForTest(): void {
   externalRuntimeReservationEvents = null;
   externalRuntimeReservationsActive = null;
   externalRuntimeReservationOldestAge = null;
+  externalRuntimeReservationsReleasePending = null;
+  externalRuntimeReservationReleasePendingOldestAge = null;
+  environmentLeasesOrphanedActive = null;
+  environmentLeasesOrphanedOldestAge = null;
   processLostTotal = null;
   externalLifecycleRunningRuns = null;
   externalLifecycleRunSilenceGap = null;
