@@ -199,6 +199,13 @@ describeEmbeddedPostgres("productivity review service", () => {
     livenessState?: string | null;
     usageJson?: Record<string, unknown> | null;
     logBytes?: number | null;
+    // BLO-26165: defaults to a value distinct from the DB's own default of
+    // `"not_applicable"` so existing fixtures — which model a run that
+    // genuinely executed and simply produced no comment — are not silently
+    // excluded from the no-comment-streak walk by the new
+    // `NEVER_INVOKED_ISSUE_COMMENT_STATUS` filter. Pass `"not_applicable"`
+    // explicitly to model a never-invoked run (BLO-23096).
+    issueCommentStatus?: string;
   }) {
     const runs: Array<typeof heartbeatRuns.$inferInsert> = [];
     for (let index = 0; index < input.count; index += 1) {
@@ -219,6 +226,7 @@ describeEmbeddedPostgres("productivity review service", () => {
         livenessState: input.livenessState !== undefined ? input.livenessState : "advanced",
         usageJson: input.usageJson !== undefined ? input.usageJson : undefined,
         logBytes: input.logBytes !== undefined ? input.logBytes : undefined,
+        issueCommentStatus: input.issueCommentStatus ?? "retry_exhausted",
         nextAction: input.nextAction === undefined ? "Continue processing the next batch." : input.nextAction,
         createdAt,
         updatedAt: createdAt,
@@ -472,6 +480,112 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(reviews[0]?.description).toContain("Primary trigger: `no_comment_streak`");
     expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 10");
     expect(reviews[0]?.description).toContain("Runtime-failure streak (terminal, never-executed runs): 0");
+  });
+
+  // BLO-26165: a run stamped `issueCommentStatus: "not_applicable"` never
+  // had an adapter container created for it (BLO-23096: `preferred_workspace_
+  // unrealizable` / `adapter_failed` setup failures — the same shape as this
+  // fixture's runs, but with `livenessState: null` because classification
+  // never ran, which is exactly the case `isNeverExecutedRun`'s
+  // `livenessState !== "failed"` check cannot catch). There was nothing
+  // capable of writing a comment, so it must not count toward
+  // `no_comment_streak`.
+  it("excludes never-invoked runs (issueCommentStatus: not_applicable) from the no-comment streak, even when the never-executed liveness heuristic misses them (BLO-26165)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    // Mirrors the BLO-23096 fixture: 25 consecutive terminal runs whose
+    // adapter never started. `livenessState: null` means `isNeverExecutedRun`
+    // alone would NOT exclude these (it requires `livenessState === "failed"`)
+    // — only the new `issueCommentStatus` predicate does. Anchored 2h before
+    // `now` (outside the 1h/6h high_churn windows) so that once no_comment_streak
+    // and runtime_failure_streak are both correctly suppressed, the fixture
+    // doesn't accidentally trip `high_churn` instead — this test is only about
+    // proving no review fires at all.
+    const insertNow = new Date(now.getTime() - 2 * 60 * 60 * 1000);
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 25,
+      now: insertNow,
+      status: "failed",
+      livenessState: null,
+      usageJson: null,
+      logBytes: null,
+      issueCommentStatus: "not_applicable",
+    });
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(0);
+    const reviews = await listProductivityReviews(seeded.companyId);
+    expect(reviews).toHaveLength(0);
+  });
+
+  it("still fires no_comment_streak on a streak of executed, comment-required-but-missed runs (BLO-26165 control)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+      issueCommentStatus: "retry_exhausted",
+    });
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const reviews = await listProductivityReviews(seeded.companyId);
+    expect(reviews).toHaveLength(1);
+    expect(reviews[0]?.description).toContain("Primary trigger: `no_comment_streak`");
+    expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 10");
+    expect(reviews[0]?.description).toContain(
+      "Never-invoked runs excluded (terminal, `issueCommentStatus: not_applicable`, BLO-26165): 0",
+    );
+  });
+
+  it("distinguishes never-invoked runs from executed-but-silent runs in the same sampled window (BLO-26165)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    // Most recent 5 runs never invoked (adapter never started, not_applicable).
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 5,
+      now,
+      status: "failed",
+      livenessState: null,
+      usageJson: null,
+      logBytes: null,
+      issueCommentStatus: "not_applicable",
+    });
+    // Older 10 runs genuinely executed and stayed silent.
+    const olderNow = new Date(now.getTime() - 6 * 60_000);
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now: olderNow,
+      issueCommentStatus: "retry_exhausted",
+    });
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const reviews = await listProductivityReviews(seeded.companyId);
+    expect(reviews).toHaveLength(1);
+    expect(reviews[0]?.description).toContain("Primary trigger: `no_comment_streak`");
+    expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 10");
+    expect(reviews[0]?.description).toContain(
+      "Never-invoked runs excluded (terminal, `issueCommentStatus: not_applicable`, BLO-26165): 5",
+    );
   });
 
   // BLO-22097: a post-model failure whose result event never arrives leaves
