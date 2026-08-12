@@ -5102,10 +5102,43 @@ export function issueRoutes(
     return present;
   }
 
+  type CoordinationMetadataDecision = Awaited<ReturnType<typeof access.decide>>;
+
+  // BLO-19912: the outcome of the coordination-metadata gate.
+  //
+  // `null` (returned by `decideCoordinationMetadataPatch`) means the path never
+  // applied — wrong actor kind, wrong company, or the actor already holds
+  // ordinary mutation authority over this issue. Nothing was attempted, so
+  // there is nothing to record. A `refused` outcome means a coordinator did
+  // reach the gate and was turned away, which is the operator-visible signal
+  // that was previously missing.
+  type CoordinationMetadataOutcome =
+    | { kind: "allowed"; decision: CoordinationMetadataDecision }
+    | {
+      kind: "refused";
+      refusalReason: "execution_lock";
+      blockedFields: string[];
+      executionRunId: string;
+    }
+    | {
+      kind: "refused";
+      refusalReason: "authorization_denied";
+      // Ally review of cd1ecd253: named `boundaryReason`, never
+      // `authorizationReason`. `logActivity` runs details through
+      // `sanitizeRecord`, whose secret-key matcher treats any key containing
+      // "authorization" as credential material (`server/src/redaction.ts`), so
+      // the persisted value came back `***REDACTED***` — the audit row silently
+      // lost the one field that says *why* the refusal happened. The
+      // `issue_write_denied` details use `boundaryReason` for the same enum,
+      // which is the precedent this now follows.
+      boundaryReason: CoordinationMetadataDecision["reason"];
+    };
+
   // BLO-18289: decide whether this agent may take the coordination-metadata
   // path on this issue. Returns the authorization decision when the path is
-  // available, or null when it is not (caller then falls through to the
-  // ordinary, unchanged mutation boundary).
+  // available, a refusal when the actor reached the gate and was turned away,
+  // or null when the path never applied. In both non-`allowed` cases the caller
+  // falls through to the ordinary, unchanged mutation boundary.
   async function decideCoordinationMetadataPatch(
     req: Request,
     issue: {
@@ -5117,10 +5150,17 @@ export function issueRoutes(
       assigneeAgentId: string | null;
       assigneeUserId: string | null;
       blockedByIssueIds: string[] | null;
-      executionRunId?: string | null;
+      // BLO-19912: required, deliberately not `executionRunId?: string | null`.
+      // This is the field the execution-sensitive branch below keys on, and an
+      // optional declaration lets a future caller pass an object without it,
+      // have the gate read "no lock", and permit a parentId / projectId /
+      // projectWorkspaceId rebind on a *running* issue. That fails open, where
+      // the BLO-18289 blocker bug failed closed. `blockedByIssueIds` was
+      // tightened to required in b3a240ec for exactly this reason.
+      executionRunId: string | null;
     },
     fields: string[],
-  ) {
+  ): Promise<CoordinationMetadataOutcome | null> {
     if (req.actor.type !== "agent" || !req.actor.agentId) return null;
     if (req.actor.companyId !== issue.companyId) return null;
     // Self-owned and unassigned issues already have ordinary mutation
@@ -5129,9 +5169,12 @@ export function issueRoutes(
     // Rebinding execution context or adding blockers under a live execution
     // lock can silently strand another agent's run; refuse the coordination
     // path so the request falls through to the standard mutation boundary.
-    if (
-      issue.executionRunId &&
-      fields.some((field) => {
+    //
+    // `filter` rather than `some` only so the refusal record can name the
+    // offending fields; a non-empty filter is the same predicate as `some`, so
+    // which requests are refused is unchanged.
+    const executionBlockedFields = issue.executionRunId
+      ? fields.filter((field) => {
         if (field === "blockedByIssueIds") {
           return !coordinationBlockerPatchOnlyRemoves(
             issue.blockedByIssueIds,
@@ -5140,8 +5183,14 @@ export function issueRoutes(
         }
         return COORDINATION_METADATA_EXECUTION_SENSITIVE_FIELDS.has(field);
       })
-    ) {
-      return null;
+      : [];
+    if (issue.executionRunId && executionBlockedFields.length > 0) {
+      return {
+        kind: "refused",
+        refusalReason: "execution_lock",
+        blockedFields: executionBlockedFields,
+        executionRunId: issue.executionRunId,
+      };
     }
     const decision = await access.decide({
       actor: req.actor,
@@ -5164,7 +5213,271 @@ export function issueRoutes(
         assigneeUserId: issue.assigneeUserId,
       },
     });
-    return decision.allowed ? decision : null;
+    return decision.allowed
+      ? { kind: "allowed", decision }
+      : { kind: "refused", refusalReason: "authorization_denied", boundaryReason: decision.reason };
+  }
+
+  const COORDINATION_METADATA_REFUSAL_ACTION = "issue.coordination_metadata_refused";
+  const COORDINATION_METADATA_REFUSAL_DEDUPE_WINDOW_MS = 5 * 60_000;
+  const COORDINATION_METADATA_REFUSAL_AGGREGATE_MAX_RECORDS = 5;
+
+  // Ally review of be5cd310d finding 2, extended by its reviews of 5d985942b
+  // and cd1ecd253. Keying the dedupe on (reason, fields) alone collapsed
+  // refusals that are materially different evidence: a lock refusal against a
+  // *different* holding run, a denial whose boundary reason changed, or an
+  // otherwise identical denial after the issue was reassigned — all vanished as
+  // "duplicates" inside the window, losing exactly the transition an operator is
+  // watching for.
+  //
+  // The epoch — (assignee, holding run) — is split out because it does double
+  // duty: it discriminates the signature, and it scopes the aggregate cap below
+  // so a burst of denials in one epoch cannot starve the next one.
+  function coordinationMetadataRefusalEpoch(issue: {
+    assigneeAgentId: string | null;
+    executionRunId: string | null;
+  }) {
+    return `assignee=${issue.assigneeAgentId ?? "none"}|lock=${issue.executionRunId ?? "none"}`;
+  }
+
+  function coordinationMetadataRefusalSignature(input: {
+    runId: string | null;
+    agentApiKeyId: string | null;
+    refusalEpoch: string;
+    fieldsKey: string;
+    outcome: Extract<CoordinationMetadataOutcome, { kind: "refused" }>;
+  }) {
+    const base =
+      `${input.outcome.refusalReason}|run=${input.runId ?? "none"}|key=${input.agentApiKeyId ?? "none"}` +
+      `|${input.refusalEpoch}|fields=${input.fieldsKey}`;
+    return input.outcome.refusalReason === "execution_lock"
+      ? `${base}|blocked=${[...input.outcome.blockedFields].sort().join(",")}`
+      : `${base}|authz=${input.outcome.boundaryReason}`;
+  }
+
+  async function hasRecentCoordinationMetadataRefusal(input: {
+    executor: Pick<typeof db, "select">;
+    companyId: string;
+    actorId: string;
+    issueId: string;
+    refusalSignature: string;
+  }) {
+    const windowStart = new Date(Date.now() - COORDINATION_METADATA_REFUSAL_DEDUPE_WINDOW_MS);
+    const [existing] = await input.executor
+      .select({ entityId: activityLog.entityId })
+      .from(activityLog)
+      .where(and(
+        eq(activityLog.companyId, input.companyId),
+        eq(activityLog.actorType, "agent"),
+        eq(activityLog.actorId, input.actorId),
+        eq(activityLog.action, COORDINATION_METADATA_REFUSAL_ACTION),
+        eq(activityLog.entityType, "issue"),
+        eq(activityLog.entityId, input.issueId),
+        gte(activityLog.createdAt, windowStart),
+        sql`${activityLog.details} ->> 'refusalSignature' = ${input.refusalSignature}`,
+      ))
+      .limit(1);
+    return Boolean(existing);
+  }
+
+  // Ally review of cd1ecd253, finding 1. A single actor/issue bucket let five
+  // authorization denials exhaust the budget and then swallow the very
+  // transitions this record exists to capture — the first refusal after a
+  // reassignment, or after an execution lock appeared. The bucket is therefore
+  // scoped to the epoch (assignee, holding run): churn inside one epoch still
+  // caps at five, and a genuinely new epoch opens a fresh budget so its
+  // transition is always recorded.
+  //
+  // The bound this buys is path-scoped, and only that. Neither
+  // `assigneeAgentId` nor `status` is in COORDINATION_METADATA_FIELDS, so no
+  // patch reaching *this* function can reassign the issue or take/release its
+  // execution lock: within one epoch the cap genuinely holds at five.
+  //
+  // It does NOT hold as a blanket property, because other routes move the
+  // epoch. `POST /issues/:id/checkout` reassigns `assigneeAgentId` behind
+  // `assertCanAssignTasks` alone, and `tasks:assign` resolves in simple mode
+  // via `allow_simple_company_member` with no manager-chain check — whereas
+  // `issue:coordination_metadata` additionally requires
+  // `isManagerOf(companyId, actor, assignee)`. So an actor `deny_scope`'d here
+  // for not managing the assignee can still self-checkout the same issue and
+  // mint a fresh `(assignee, lock)` epoch, and by churning checkout/handoff
+  // cycles can open new five-record budgets over time.
+  //
+  // That is accepted rather than fixed here, on two grounds: each reset is
+  // itself an audited `issue.checked_out` event, so the churn is visible in
+  // the same log a reader of these records is already in; and once the actor
+  // holds the issue this path returns `null` for it outright (see the
+  // self-assignee guard in `decideCoordinationMetadataPatch`), so it cannot
+  // farm refusals against its own assignment. Closing it properly would need a
+  // per-issue ceiling independent of epoch — which would reintroduce the exact
+  // swallowing of transitions that the epoch scoping above exists to fix, so it
+  // is not a drop-in tightening. Contrast `runId`, which the actor *can* churn
+  // directly — see the note on the aggregate cap in the recorder below.
+  async function countRecentCoordinationMetadataRefusals(input: {
+    executor: Pick<typeof db, "select">;
+    companyId: string;
+    actorId: string;
+    issueId: string;
+    refusalEpoch: string;
+  }) {
+    const windowStart = new Date(Date.now() - COORDINATION_METADATA_REFUSAL_DEDUPE_WINDOW_MS);
+    const rows = await input.executor
+      .select({ refusalId: activityLog.id })
+      .from(activityLog)
+      .where(and(
+        eq(activityLog.companyId, input.companyId),
+        eq(activityLog.actorType, "agent"),
+        eq(activityLog.actorId, input.actorId),
+        eq(activityLog.action, COORDINATION_METADATA_REFUSAL_ACTION),
+        eq(activityLog.entityType, "issue"),
+        eq(activityLog.entityId, input.issueId),
+        gte(activityLog.createdAt, windowStart),
+        sql`${activityLog.details} ->> 'refusalEpoch' = ${input.refusalEpoch}`,
+      ))
+      .limit(COORDINATION_METADATA_REFUSAL_AGGREGATE_MAX_RECORDS);
+    return rows.length;
+  }
+
+  // BLO-19912: the refusal counterpart to the `issue.coordination_metadata_updated`
+  // audit below. A coordinator that reached the gate and was turned away left no
+  // trace at all: the request fell through to the ordinary boundary, and an
+  // attempted workspace rebind or blocker addition against a live run — the
+  // thing an operator reviewing this authority most wants to see — was invisible.
+  // Same channel as the success path so both sides of the gate are queryable
+  // together.
+  //
+  // This records the *coordination path's* decision, not the request's final
+  // outcome: a refused actor can still be authorized further down by an
+  // unrelated path (checkout-management override, recovery-action owner), and
+  // the record stands either way.
+  //
+  // Ally review of be5cd310d, finding 1. Admission was an unlocked
+  // check-then-insert, which bounds nothing: concurrent refusals all miss the
+  // probe and all insert. The first revision of this comment claimed a bound it
+  // did not deliver and argued the record could therefore fail *open* on a
+  // probe failure. Both halves are withdrawn. Admission and insertion now run in
+  // one transaction serialized on an advisory lock keyed to
+  // (company, actor, issue) — the same shape `recordDeniedIssueWrite` uses, and
+  // for the same reason — and it fails *closed*, because a throw in here means
+  // the database is unhealthy and an unbounded insert path is worst precisely
+  // then. The lock is per-actor-per-issue, so it never serializes unrelated
+  // traffic.
+  //
+  // Ally review of 5d985942b, finding 1. An earlier revision argued no aggregate
+  // cap was needed because every signature component is server-derived from a
+  // closed set. That is wrong, and the counterexample is `runId`: under
+  // agent-API-key auth `resolveRunAttribution` constrains the
+  // `X-Paperclip-Run-Id` header only to a run belonging to that agent
+  // (`server/src/middleware/auth.ts`) — no recency or liveness check — so an
+  // actor can cycle its own historical run ids and mint a fresh signature per
+  // request. The advisory lock bounds concurrent duplicates; it bounds nothing
+  // sequential. So the cap goes in, alongside — not instead of — the
+  // exact-signature dedupe, which still collapses genuinely repeated evidence,
+  // and scoped per epoch so churn in one epoch cannot swallow the next one's
+  // first record (see countRecentCoordinationMetadataRefusals).
+  //
+  // Best-effort end to end: this is observability on an authorization decision
+  // that has already been made, so nothing here may change the outcome of the
+  // request.
+  async function recordRefusedCoordinationMetadataPatch(
+    req: Request,
+    issue: {
+      id: string;
+      companyId: string;
+      identifier?: string | null;
+      assigneeAgentId: string | null;
+      executionRunId: string | null;
+    },
+    fields: string[],
+    outcome: Extract<CoordinationMetadataOutcome, { kind: "refused" }>,
+  ) {
+    if (req.actor.type !== "agent" || !req.actor.agentId) return;
+    const fieldsKey = [...fields].sort().join(",");
+    try {
+      const actor = getActorInfo(req);
+      const refusalEpoch = coordinationMetadataRefusalEpoch(issue);
+      const refusalSignature = coordinationMetadataRefusalSignature({
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+        refusalEpoch,
+        fieldsKey,
+        outcome,
+      });
+      const lockKey =
+        `paperclip:coordination-metadata-refused:${issue.companyId}:${actor.actorId}:${issue.id}`;
+      // The transaction hands the publisher back rather than firing it:
+      // `activity.logged` and the plugin outbox both escape the transaction, so
+      // emitting inline lets a consumer read the event before the row is
+      // visible, and turns a rolled-back transaction into an event for a record
+      // that does not exist.
+      const publishRecorded = await db.transaction(async (tx): Promise<ActivityPublish | null> => {
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`);
+        if (await hasRecentCoordinationMetadataRefusal({
+          executor: tx,
+          companyId: issue.companyId,
+          actorId: actor.actorId,
+          issueId: issue.id,
+          refusalSignature,
+        })) return null;
+        // Checked after the exact-signature dedupe so a repeated attempt
+        // collapses onto its existing row instead of consuming budget: a burst
+        // of one refusal must not evict the capacity that distinct evidence
+        // needs.
+        if (await countRecentCoordinationMetadataRefusals({
+          executor: tx,
+          companyId: issue.companyId,
+          actorId: actor.actorId,
+          issueId: issue.id,
+          refusalEpoch,
+        }) >= COORDINATION_METADATA_REFUSAL_AGGREGATE_MAX_RECORDS) return null;
+        // A drizzle transaction is structurally a `Db` minus `$client`, which
+        // `logActivity` never touches. Same cast, and same reasoning, as
+        // `recordDeniedIssueWrite`.
+        return await logActivity(tx as unknown as typeof db, {
+          companyId: issue.companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          agentApiKeyId: actor.agentApiKeyId,
+          action: COORDINATION_METADATA_REFUSAL_ACTION,
+          entityType: "issue",
+          entityId: issue.id,
+          issueId: issue.id,
+          details: {
+            identifier: issue.identifier ?? null,
+            path: "coordination_metadata_allowlist",
+            outcome: "refused",
+            refusalReason: outcome.refusalReason,
+            fields,
+            fieldsKey,
+            refusalSignature,
+            refusalEpoch,
+            assigneeAgentId: issue.assigneeAgentId,
+            issueExecutionRunId: issue.executionRunId,
+            ...(outcome.refusalReason === "execution_lock"
+              ? { blockedFields: outcome.blockedFields, executionRunId: outcome.executionRunId }
+              : { boundaryReason: outcome.boundaryReason }),
+          },
+        }, { deferPublish: true });
+      });
+      // Reached only on commit; a rollback throws straight past this.
+      try {
+        publishRecorded?.();
+      } catch (err) {
+        // Distinct from the catch below: the record itself is committed and
+        // recoverable, only its notification failed.
+        logger.warn(
+          { err, issueId: issue.id, refusalReason: outcome.refusalReason },
+          "BLO-19912: recorded a refused coordination-metadata patch but failed to publish its activity event",
+        );
+      }
+    } catch (err) {
+      logger.warn(
+        { err, issueId: issue.id, refusalReason: outcome.refusalReason },
+        "BLO-19912: failed to record refused coordination-metadata patch",
+      );
+    }
   }
 
   function isCreatorOrManagerChainRecoveryPatch(
@@ -9874,7 +10187,7 @@ export function issueRoutes(
     if (coordinationMetadataFields?.includes("blockedByIssueIds")) {
       existingRelations = await svc.getRelationSummaries(existing.id);
     }
-    const coordinationMetadataDecision = coordinationMetadataFields
+    const coordinationMetadataOutcome = coordinationMetadataFields
       ? await decideCoordinationMetadataPatch(
         req,
         {
@@ -9884,6 +10197,20 @@ export function issueRoutes(
         coordinationMetadataFields,
       )
       : null;
+    const coordinationMetadataDecision = coordinationMetadataOutcome?.kind === "allowed"
+      ? coordinationMetadataOutcome.decision
+      : null;
+    // BLO-19912: record the refusal before the boundary check, which returns
+    // early on denial. The record is the trace of the coordination attempt
+    // itself and must survive whichever way the fall-through resolves.
+    if (coordinationMetadataOutcome?.kind === "refused" && coordinationMetadataFields) {
+      await recordRefusedCoordinationMetadataPatch(
+        req,
+        existing,
+        coordinationMetadataFields,
+        coordinationMetadataOutcome,
+      );
+    }
     if (!(await assertAgentIssueMutationAllowed(
       req,
       res,
@@ -10468,7 +10795,15 @@ export function issueRoutes(
           path: "coordination_metadata_allowlist",
           fields: coordinationMetadataFields,
           assigneeAgentId: existing.assigneeAgentId,
-          authorizationReason: coordinationMetadataDecision.reason,
+          // BLO-19912: renamed from `authorizationReason`, which BLO-18289
+          // shipped and which has been persisting as `***REDACTED***` ever
+          // since — `sanitizeRecord`'s secret-key matcher treats any key
+          // containing "authorization" as credential material. Ally caught this
+          // on the new refusal record; the bug is identical here, one line
+          // away, so it is fixed rather than left to be rediscovered. This does
+          // change a persisted key on an existing audit record, but the old key
+          // only ever held a redaction placeholder, so no consumer loses data.
+          boundaryReason: coordinationMetadataDecision.reason,
         },
       });
     }
