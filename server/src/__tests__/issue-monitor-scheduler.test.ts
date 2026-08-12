@@ -970,5 +970,42 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       clearReason: null,
     });
   });
-});
 
+  it.each([
+    ["user reassignment", { assigneeUserId: "board-user" }],
+    ["terminal status", { status: "done" }],
+  ])("does not recover an expired monitor when %s races the claim", async (_label, mutation) => {
+    const { issueId, agentId, timeoutAt } = await seedExpiredTriggeredFixture();
+    const heartbeat = createHeartbeatWithClaimRace(issueId, mutation);
+    const tickAt = new Date(timeoutAt.getTime() + 60 * 60 * 1000);
+
+    await heartbeat.tickTimers(tickAt);
+
+    const recoveryWakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .then((rows) => rows.filter((row) => row.reason === "issue_monitor_recovery"));
+    expect(recoveryWakeups).toHaveLength(0);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(issue.monitorWakeRequestedAt).toBeNull();
+    expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({
+      status: "triggered",
+      clearReason: null,
+    });
+  });
+
+  function createHeartbeatWithClaimRace(
+    issueId: string,
+    mutation: { assigneeUserId?: string; status?: "done" },
+  ) {
+    const service = heartbeatService(db, {
+      issueMonitorClaimHook: async () => {
+        await db.update(issues).set(mutation).where(eq(issues.id, issueId));
+      },
+    });
+    heartbeatServices.add(service);
+    return service;
+  }
+});
