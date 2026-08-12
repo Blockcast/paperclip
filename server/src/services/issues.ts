@@ -69,6 +69,7 @@ import {
   isUuidLike,
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
   SYSTEM_ISSUE_DOCUMENT_KEYS,
+  ISSUE_STATUS_ADJUDICATION_DOCUMENT_KEY,
 } from "@paperclipai/shared";
 import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
 import { incrementBlockerResolvedWakeMetric } from "./blocker-resolved-wake-metrics.js";
@@ -9624,8 +9625,14 @@ export function issueService(db: Db) {
             })
           ) {
             throw unprocessable(
-              "Issue cannot be marked done without execution evidence (no execution run, no pr-link evidence, and no run-attributed durable artifact). Attach a PR link, or write the deliverable to an issue document (PUT /api/issues/:id/documents/:key) before closing — a comment body is not sufficient.",
-              { reason: "no_execution_run_and_no_pr_evidence", issueId: id },
+              "Issue cannot be marked done without execution evidence (no execution run, no pr-link evidence, and no run-attributed durable artifact). " +
+                "Attach a PR link, or write the deliverable to an issue document (PUT /api/issues/:id/documents/:key) before closing — a comment body is not sufficient. " +
+                `A cheap status-only recovery run, which may not author deliverables, records its verdict at PUT /api/issues/:id/documents/${ISSUE_STATUS_ADJUDICATION_DOCUMENT_KEY} instead.`,
+              {
+                reason: "no_execution_run_and_no_pr_evidence",
+                issueId: id,
+                statusOnlyDocumentKey: ISSUE_STATUS_ADJUDICATION_DOCUMENT_KEY,
+              },
             );
           }
         }
