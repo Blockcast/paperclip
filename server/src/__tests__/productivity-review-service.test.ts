@@ -1224,6 +1224,10 @@ describeEmbeddedPostgres("productivity review service", () => {
       livenessState: null,
       usageJson: null,
       errorCode: "issue_dependencies_blocked",
+      // BLO-22436 (Ally follow-up): model the gate's actual write.
+      // `cancelQueuedRunForBlockedDependencies` never calls
+      // `finalizeIssueCommentPolicy`, so the column stays at its DB default.
+      issueCommentStatus: "not_applicable",
     });
 
     const service = productivityReviewService(db);
@@ -1268,6 +1272,41 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
   });
 
+  // BLO-22436 (Ally follow-up): the generation gate is scoped to the same
+  // trigger set the close path already trusts (`isDependencyBlockedClosableTrigger`).
+  // `high_churn` is a record of runs that DID execute and DID burn cost — a
+  // blocker added afterwards does not make that untrue. Skipping generation
+  // unconditionally would let a flagged agent retire its own
+  // cost-accountability artifact one cycle early just by adding a `blockedBy`
+  // edge, which is exactly the evasion the close path already refuses (see
+  // "does not close an open high-churn review when its source becomes
+  // dependency-blocked" below).
+  it("still generates a high-churn review for a dependency-blocked issue (BLO-22436)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 10,
+      now,
+      withRunComments: true,
+    });
+    await addBlocker({
+      companyId: seeded.companyId,
+      issuePrefix: seeded.issuePrefix,
+      blockedIssueId: seeded.issueId,
+    });
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    expect(result.dependencyBlockedSuppressed).toBe(0);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `high_churn`");
+  });
+
   // BLO-22436: once the blocker resolves (or the edge is removed), the same
   // issue is reviewable again, and its historical dependency-blocked
   // cancellations must be reported as their own line item — not folded into
@@ -1290,6 +1329,8 @@ describeEmbeddedPostgres("productivity review service", () => {
       livenessState: null,
       usageJson: null,
       errorCode: "issue_dependencies_blocked",
+      // BLO-22436 (Ally follow-up): model the gate's actual write (see note above).
+      issueCommentStatus: "not_applicable",
     });
     // 10 older runs: genuinely executed and silent.
     const olderNow = new Date(now.getTime() - 4 * 60_000);
@@ -1311,7 +1352,13 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 10");
     expect(reviews[0]?.description).toContain("Runtime-failure streak (terminal, never-executed runs): 0");
     expect(reviews[0]?.description).toContain(
-      "Non-executing runs in sample window (excluded from streaks above): 3 (dominant errorCode: `issue_dependencies_blocked`, 3 of 3)",
+      "Never-invoked runs excluded (terminal, `issueCommentStatus: not_applicable`, BLO-26165): 3",
+    );
+    // BLO-22436 (Ally follow-up): all 3 non-executing runs are also counted
+    // above as never-invoked — the evidence block must say so rather than
+    // rendering two adjacent counts that read as independent.
+    expect(reviews[0]?.description).toContain(
+      "Non-executing runs in sample window (excluded from streaks above): 3 (3 already counted above as never-invoked) (dominant errorCode: `issue_dependencies_blocked`, 3 of 3)",
     );
   });
 
@@ -1337,6 +1384,8 @@ describeEmbeddedPostgres("productivity review service", () => {
       livenessState: null,
       usageJson: null,
       errorCode: "issue_dependencies_blocked",
+      // BLO-22436 (Ally follow-up): model the gate's actual write (see note above).
+      issueCommentStatus: "not_applicable",
     });
     // Older: a genuine zero-token infra-failure streak.
     await insertRuns({
@@ -1360,9 +1409,11 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(reviews[0]?.description).toContain("Runtime-failure streak (terminal, never-executed runs): 10");
     expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 0");
     // 13 non-executing runs, and no single errorCode holds a majority is false
-    // here — job_failed is 10 of 13, a strict majority — so it is named.
+    // here — job_failed is 10 of 13, a strict majority — so it is named. Only
+    // the 3 dependency-gate cancellations are also never-invoked; the 10
+    // genuine infra failures are not (BLO-22436 Ally follow-up).
     expect(reviews[0]?.description).toContain(
-      "Non-executing runs in sample window (excluded from streaks above): 13 (dominant errorCode: `job_failed`, 10 of 13)",
+      "Non-executing runs in sample window (excluded from streaks above): 13 (3 already counted above as never-invoked, 10 additional) (dominant errorCode: `job_failed`, 10 of 13)",
     );
   });
 
@@ -1382,6 +1433,8 @@ describeEmbeddedPostgres("productivity review service", () => {
       livenessState: null,
       usageJson: null,
       errorCode: "issue_dependencies_blocked",
+      // BLO-22436 (Ally follow-up): model the gate's actual write (see note above).
+      issueCommentStatus: "not_applicable",
     });
     await insertRuns({
       companyId: seeded.companyId,
@@ -1401,7 +1454,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     const reviews = await listProductivityReviews(seeded.companyId);
     expect(reviews).toHaveLength(1);
     expect(reviews[0]?.description).toContain(
-      "Non-executing runs in sample window (excluded from streaks above): 10 (no single dominant errorCode)",
+      "Non-executing runs in sample window (excluded from streaks above): 10 (5 already counted above as never-invoked, 5 additional) (no single dominant errorCode)",
     );
   });
 
