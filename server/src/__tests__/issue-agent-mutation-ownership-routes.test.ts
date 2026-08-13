@@ -1414,6 +1414,233 @@ describe("agent issue mutation checkout ownership", () => {
     );
   });
 
+  it("lets a manager-chain agent re-arm a report's triggered monitor without broader mutation access", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({
+      status: "in_progress",
+      assigneeAgentId: peerAgentId,
+      executionPolicy: null,
+      executionState: {
+        status: "idle",
+        currentStageId: null,
+        currentStageIndex: null,
+        currentStageType: null,
+        currentParticipant: null,
+        returnAssignee: null,
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+        monitor: {
+          status: "triggered",
+          nextCheckAt: null,
+          lastTriggeredAt: "2026-08-07T12:00:00.000Z",
+          attemptCount: 1,
+          notes: "wake run did not dispatch",
+          scheduledBy: "assignee",
+          clearedAt: null,
+          clearReason: null,
+        },
+      },
+      monitorNextCheckAt: null,
+    }));
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => {
+      if (input.action === "issue:comment") {
+        return {
+          allowed: true,
+          action: input.action,
+          reason: "allow_manager_chain",
+          explanation: "Actor manages the assignee.",
+        };
+      }
+      if (input.action === "runtime:manage" || input.action === "issue:read") {
+        return {
+          allowed: true,
+          action: input.action,
+          reason: "allow_explicit_grant",
+          explanation: "Allowed by test grant.",
+        };
+      }
+      return {
+        allowed: false,
+        action: input.action,
+        reason: "deny_missing_grant",
+        explanation: "No general issue mutation grant.",
+      };
+    });
+
+    const res = await request(await createApp(ownerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        executionPolicy: {
+          monitor: {
+            nextCheckAt: "2026-08-07T14:00:00.000Z",
+            notes: "manager restored lapsed monitor",
+            scheduledBy: "assignee",
+          },
+        },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      issueId,
+      expect.objectContaining({
+        executionPolicy: expect.objectContaining({
+          monitor: expect.objectContaining({ notes: "manager restored lapsed monitor" }),
+        }),
+      }),
+    );
+  });
+
+  // BLO-22860 (Ally review on #1187). The manager-chain re-arm deliberately
+  // skips the ordinary mutation boundary, so its gate has to be keyed on the
+  // *policy* being a monitor re-arm, not merely on the request body having a
+  // single `executionPolicy` key. `executionPolicy` is a whole-policy replace:
+  // if a policy carrying a monitor alongside `stages` or `authorizationPolicy`
+  // were accepted, a manager could rewrite a report's workflow and
+  // authorization configuration with no general mutation grant.
+  const lapsedMonitorState = {
+    status: "idle",
+    currentStageId: null,
+    currentStageIndex: null,
+    currentStageType: null,
+    currentParticipant: null,
+    returnAssignee: null,
+    reviewRequest: null,
+    completedStageIds: [],
+    lastDecisionId: null,
+    lastDecisionOutcome: null,
+    monitor: {
+      status: "triggered",
+      nextCheckAt: null,
+      lastTriggeredAt: "2026-08-07T12:00:00.000Z",
+      attemptCount: 1,
+      notes: "wake run did not dispatch",
+      scheduledBy: "assignee",
+      clearedAt: null,
+      clearReason: null,
+    },
+  };
+
+  function mockManagerChainOverReport() {
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => {
+      if (input.action === "issue:comment") {
+        return {
+          allowed: true,
+          action: input.action,
+          reason: "allow_manager_chain",
+          explanation: "Actor manages the assignee.",
+        };
+      }
+      if (input.action === "runtime:manage" || input.action === "issue:read") {
+        return {
+          allowed: true,
+          action: input.action,
+          reason: "allow_explicit_grant",
+          explanation: "Allowed by test grant.",
+        };
+      }
+      return {
+        allowed: false,
+        action: input.action,
+        reason: "deny_missing_grant",
+        explanation: "No general issue mutation grant.",
+      };
+    });
+  }
+
+  it.each([
+    [
+      "stages",
+      {
+        monitor: {
+          nextCheckAt: "2026-08-07T14:00:00.000Z",
+          notes: "re-arm",
+          scheduledBy: "assignee",
+        },
+        stages: [
+          { type: "review", participants: [{ type: "agent", agentId: staleAgentId }] },
+        ],
+      },
+    ],
+    [
+      "authorizationPolicy",
+      {
+        monitor: {
+          nextCheckAt: "2026-08-07T14:00:00.000Z",
+          notes: "re-arm",
+          scheduledBy: "assignee",
+        },
+        authorizationPolicy: { trustPreset: "low_trust_review" },
+      },
+    ],
+  ])(
+    "refuses a manager-chain monitor re-arm whose policy also carries %s",
+    async (_label, executionPolicy) => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({
+        status: "in_progress",
+        assigneeAgentId: peerAgentId,
+        executionPolicy: null,
+        executionState: lapsedMonitorState,
+        monitorNextCheckAt: null,
+      }));
+      mockManagerChainOverReport();
+
+      const res = await request(await createApp(ownerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ executionPolicy });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    },
+  );
+
+  it("preserves a report's stages and authorizationPolicy when a manager re-arms the monitor", async () => {
+    // The gate above keeps `stages` out of the *request*; this keeps the write
+    // itself non-destructive. `executionPolicy` replaces wholesale, so without
+    // a merge a legitimate monitor-only re-arm would still drop the assignee's
+    // stages and authorization policy as a side effect of restoring a timer.
+    mockIssueService.getById.mockResolvedValue(makeIssue({
+      status: "in_progress",
+      assigneeAgentId: peerAgentId,
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [
+          { type: "review", participants: [{ type: "agent", agentId: staleAgentId }] },
+        ],
+        authorizationPolicy: { trustPreset: "low_trust_review" },
+      },
+      executionState: lapsedMonitorState,
+      monitorNextCheckAt: null,
+    }));
+    mockManagerChainOverReport();
+
+    const res = await request(await createApp(ownerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        executionPolicy: {
+          monitor: {
+            nextCheckAt: "2026-08-07T14:00:00.000Z",
+            notes: "manager restored lapsed monitor",
+            scheduledBy: "assignee",
+          },
+        },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const written = mockIssueService.update.mock.calls.at(-1)?.[1] as {
+      executionPolicy: {
+        monitor: { notes: string };
+        stages: { participants: { agentId: string }[] }[];
+        authorizationPolicy?: { trustPreset: string };
+      };
+    };
+    expect(written.executionPolicy.monitor.notes).toBe("manager restored lapsed monitor");
+    expect(written.executionPolicy.stages).toHaveLength(1);
+    expect(written.executionPolicy.stages[0].participants[0].agentId).toBe(staleAgentId);
+    expect(written.executionPolicy.authorizationPolicy?.trustPreset).toBe("low_trust_review");
+  });
+
   it("keeps the monitor gate closed to a productivity-review owner outside PATCH /issues/:id", async () => {
     // The forced-wake route shares the same helper but never passes the
     // reviewer-authorized option, so it must stay closed even though PATCH
@@ -3422,7 +3649,12 @@ describe("agent issue mutation checkout ownership", () => {
       expect.any(Object),
     );
     expect(mockDocumentService.upsertIssueDocument).toHaveBeenCalled();
-    expect(mockWorkProductService.update).toHaveBeenCalledWith("product-1", { title: "Updated product" });
+    // `sourceTrust: null` is the actor-write provenance restamp (BLO-19566): an
+    // actor edit never inherits the system trust a webhook-written row carries.
+    expect(mockWorkProductService.update).toHaveBeenCalledWith("product-1", {
+      title: "Updated product",
+      sourceTrust: null,
+    });
   });
 
   it("preserves board mutations on active checkouts", async () => {
@@ -4363,6 +4595,27 @@ describe("agent issue mutation checkout ownership", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(403);
     expect(res.body.error).toBe("createdByRunId must match the authenticated agent run");
     expect(mockWorkProductService.update).not.toHaveBeenCalled();
+  });
+
+  it("clears webhook provenance when an actor updates a work product (BLO-19566)", async () => {
+    // Productivity review treats a PR row carrying system webhook source-trust
+    // as progress-eligible evidence, keyed on `updatedAt`. Conditionally
+    // spreading the actor's resolved trust left that system stamp in place on
+    // an actor edit while the update refreshed `updatedAt`, so an assignee
+    // could PATCH a stale webhook row into fresh, trusted evidence about their
+    // own issue. An actor write now always restamps provenance.
+    const app = await createApp(ownerActor());
+
+    const res = await request(app).patch("/api/work-products/product-1").send({
+      status: "merged",
+      url: "https://github.com/Blockcast/paperclip/pull/999",
+    });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockWorkProductService.update).toHaveBeenCalledWith(
+      "product-1",
+      expect.objectContaining({ sourceTrust: null }),
+    );
   });
 
   it("rejects board-created work products with a foreign-company run id", async () => {
@@ -5352,6 +5605,21 @@ describe("agent issue mutation checkout ownership", () => {
       // (issues.ts:4560) without granting recovery authority. Deliberately not
       // the checkout-management override: that one satisfies both gates, so it
       // could never show the contrast.
+      //
+      // BLO-19951 follow-up — read these two cases for what they are. The stub
+      // below returns issue:coordination_metadata=allow while leaving
+      // tasks:manage_active_checkouts denied, and the real authorization
+      // service CANNOT emit that pair: coordination metadata allows solely via
+      // isManagerOf(actor, assignee), and that same relation allows
+      // manage_active_checkouts, which assertRecoveryActionAuthority accepts
+      // before it can 403. So no live actor reaches the guard holding a
+      // coordination decision, and the carve-out is presently unreachable —
+      // these cases document the wiring and the intended behaviour if the two
+      // authorities are ever decoupled, not a state production can exhibit.
+      // The coupling that makes them hypothetical is pinned against the real
+      // service in authorization-service.test.ts ("couples coordination-metadata
+      // authority to active-checkout management"); if that test fails, these
+      // stop being hypothetical and the carve-out needs re-review.
       describe("actor that reaches the recovery guard", () => {
         const reviewOwnerWithCoordinationDecide = async (input: { action: string }) => ({
           allowed: input.action === "issue:read"
@@ -5382,7 +5650,9 @@ describe("agent issue mutation checkout ownership", () => {
         });
 
         // Same actor, same issue, same open recovery action — only the patch
-        // shape differs. This pair is the carve-out's whole contract.
+        // shape differs. This pair is the carve-out's contract as written, but
+        // see the note above: the actor shape it needs is one the real service
+        // cannot produce today.
         it("lets the same actor through for an allowlisted blocker edit", async () => {
           const res = await request(await createApp(peerActor()))
             .patch(`/api/issues/${issueId}`)

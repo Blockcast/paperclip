@@ -370,6 +370,25 @@ export const SYSTEM_ISSUE_DOCUMENT_KEYS = [
 ] as const;
 export type SystemIssueDocumentKey = (typeof SYSTEM_ISSUE_DOCUMENT_KEYS)[number];
 
+/**
+ * The one issue-document key a cheap status-only recovery run may write (BLO-25868).
+ *
+ * Such a run is barred from authoring deliverables — it must not invent work
+ * product — but it IS authorized to reach a status conclusion. Those two facts
+ * used to deadlock: the done gate refuses a close that has no execution run and
+ * no PR link unless a run-attributed durable artifact exists
+ * (`no_execution_run_and_no_pr_evidence`), while the artifact route refused this
+ * actor outright. A non-code deliverable with no PR therefore could not be
+ * closed by the run that owned it, and re-waking never helped.
+ *
+ * This key is the narrow escape: a verdict recording WHY the run concluded the
+ * issue is resolved, citing evidence that already existed. It is deliberately
+ * NOT a system key and NOT `plan`, so it qualifies for the done gate; and it is
+ * the ONLY key the status-only bar exempts, so plans and deliverable documents
+ * stay barred. See `done-gate.ts` and `assertDeliverableMutationAllowedByRunContext`.
+ */
+export const ISSUE_STATUS_ADJUDICATION_DOCUMENT_KEY = "status-adjudication" as const;
+
 const SYSTEM_ISSUE_DOCUMENT_KEY_SET = new Set<string>(SYSTEM_ISSUE_DOCUMENT_KEYS);
 
 export function isSystemIssueDocumentKey(key: string): key is SystemIssueDocumentKey {

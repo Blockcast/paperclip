@@ -18,6 +18,7 @@ import {
   issueComments,
   issueRecoveryActions,
   issues,
+  issueWorkProducts,
 } from "@paperclipai/db";
 import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 import {
@@ -60,6 +61,7 @@ import {
   getMetricsRegistry,
 } from "../services/metrics.js";
 import { resolveOwningPaperclipIdentifiers } from "../services/paperclip-identifiers.js";
+import { PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID } from "../services/pull-request-work-products.js";
 import { issueService } from "../services/issues.js";
 import { errorHandler } from "../middleware/index.js";
 
@@ -2025,6 +2027,695 @@ describeEmbeddedPostgres("github-webhook route", () => {
       .where(eq(heartbeatRuns.agentId, agentId));
     expect(runs).toHaveLength(1);
     expect(runs[0]?.status).toBe("queued");
+  });
+
+  // BLO-19566 AC4. Before this, nothing wrote a `pull_request` work product,
+  // so productivity/liveness accounting -- whose own verdict criteria ask for
+  // "a non-stale PR/MR link in the source issue's evidence" -- could never find
+  // one, and an assignee pushing commits to an open PR read as zero progress.
+  describe("pull_request work products", () => {
+    function prPayload(opts: {
+      action: string;
+      identifier: string;
+      number?: number;
+      title?: string | null;
+      draft?: boolean;
+      merged?: boolean;
+      beforeSha?: string | null;
+      headSha?: string;
+      updatedAt?: string;
+    }) {
+      const defaultUpdatedAtByAction: Record<string, string> = {
+        opened: "2026-04-30T10:00:00Z",
+        synchronize: "2026-04-30T10:05:00Z",
+        ready_for_review: "2026-04-30T10:10:00Z",
+        converted_to_draft: "2026-04-30T10:10:00Z",
+        closed: "2026-04-30T10:15:00Z",
+        reopened: "2026-04-30T10:20:00Z",
+      };
+      return {
+        action: opts.action,
+        ...(opts.beforeSha ? { before: opts.beforeSha } : {}),
+        pull_request: {
+          number: opts.number ?? 4242,
+          title: opts.title === undefined ? `Fix ${opts.identifier}` : opts.title,
+          body: null,
+          html_url: `https://github.com/Blockcast/paperclip/pull/${opts.number ?? 4242}`,
+          updated_at: opts.updatedAt ?? defaultUpdatedAtByAction[opts.action] ?? "2026-04-30T10:00:00Z",
+          draft: opts.draft ?? false,
+          merged: opts.merged ?? false,
+          head: { ref: `fix/${opts.identifier.toLowerCase()}`, sha: opts.headSha ?? "head-one" },
+        },
+        repository: { full_name: "Blockcast/paperclip" },
+      };
+    }
+
+    async function postPr(
+      app: express.Express,
+      payload: Record<string, unknown>,
+      deliveryId: string,
+    ) {
+      const { body, signature } = signedRequest(payload);
+      return request(app)
+        .post("/api/webhooks/github")
+        .set("x-github-event", "pull_request")
+        .set("x-hub-signature-256", signature)
+        .set("x-github-delivery", deliveryId)
+        .set("content-type", "application/json")
+        .send(body);
+    }
+
+    it("creates a pull_request work product on the referenced issue", async () => {
+      const { issueId } = await seedIssueWithIdentifier("BLO-40001");
+      const app = buildApp();
+
+      const res = await postPr(app, prPayload({ action: "opened", identifier: "BLO-40001" }), "wp-opened");
+      expect(res.status).toBe(200);
+
+      const rows = await db
+        .select()
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({
+        type: "pull_request",
+        provider: "github",
+        externalId: "Blockcast/paperclip#4242",
+        url: "https://github.com/Blockcast/paperclip/pull/4242",
+        status: "ready_for_review",
+        title: "Fix BLO-40001",
+      });
+      expect(rows[0]?.metadata).toMatchObject({
+        source: "github_pull_request_webhook",
+        sourceEventOrder: 10,
+        sourceEventActionOrder: 10,
+        sourceEventTimestamp: "2026-04-30T10:00:00.000Z",
+      });
+      expect(rows[0]?.sourceTrust).toMatchObject({
+        preset: "standard",
+        disposition: "promoted",
+        promotedByActorType: "system",
+        promotedByActorId: PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID,
+      });
+    });
+
+    it("updates the same row on a later push instead of appending one per event", async () => {
+      const { issueId } = await seedIssueWithIdentifier("BLO-40002");
+      const app = buildApp();
+
+      await postPr(app, prPayload({ action: "opened", identifier: "BLO-40002", number: 4243 }), "wp-seq-1");
+      const afterOpen = await db
+        .select({ id: issueWorkProducts.id, updatedAt: issueWorkProducts.updatedAt })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      expect(afterOpen).toHaveLength(1);
+
+      await postPr(
+        app,
+        prPayload({
+          action: "synchronize",
+          identifier: "BLO-40002",
+          number: 4243,
+          headSha: "head-two",
+          updatedAt: "2026-04-30T10:15:00Z",
+        }),
+        "wp-seq-2",
+      );
+
+      const afterPush = await db
+        .select()
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      // One PR, one row -- the identity excludes the head SHA on purpose.
+      expect(afterPush).toHaveLength(1);
+      expect(afterPush[0]?.id).toBe(afterOpen[0]?.id);
+      expect(afterPush[0]?.metadata).toMatchObject({ headSha: "head-two", lastEventAction: "synchronize" });
+      // updatedAt is what liveness reads as "the PR moved"; it must advance.
+      expect(afterPush[0]!.updatedAt.getTime()).toBeGreaterThanOrEqual(afterOpen[0]!.updatedAt.getTime());
+    });
+
+    it("records the terminal state when the PR merges", async () => {
+      const { issueId } = await seedIssueWithIdentifier("BLO-40003");
+      const app = buildApp();
+
+      await postPr(app, prPayload({ action: "opened", identifier: "BLO-40003", number: 4244 }), "wp-merge-1");
+      await postPr(
+        app,
+        prPayload({ action: "closed", identifier: "BLO-40003", number: 4244, merged: true }),
+        "wp-merge-2",
+      );
+
+      const rows = await db
+        .select({ status: issueWorkProducts.status })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.status).toBe("merged");
+    });
+
+    it("does not let a stale synchronize event overwrite a terminal merge state", async () => {
+      const { issueId } = await seedIssueWithIdentifier("BLO-40006");
+      const app = buildApp();
+
+      await postPr(app, prPayload({ action: "opened", identifier: "BLO-40006", number: 4247 }), "wp-order-1");
+      await postPr(
+        app,
+        prPayload({
+          action: "closed",
+          identifier: "BLO-40006",
+          number: 4247,
+          merged: true,
+          headSha: "merge-head",
+          updatedAt: "2026-04-30T10:20:00Z",
+        }),
+        "wp-order-2",
+      );
+      const afterMerge = await db
+        .select({ updatedAt: issueWorkProducts.updatedAt })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId))
+        .then((rows) => rows[0]);
+      await postPr(
+        app,
+        prPayload({
+          action: "synchronize",
+          identifier: "BLO-40006",
+          number: 4247,
+          headSha: "stale-sync-head",
+          updatedAt: "2026-04-30T10:10:00Z",
+        }),
+        "wp-order-3",
+      );
+
+      const rows = await db
+        .select({
+          status: issueWorkProducts.status,
+          metadata: issueWorkProducts.metadata,
+          updatedAt: issueWorkProducts.updatedAt,
+        })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.status).toBe("merged");
+      expect(rows[0]?.metadata).toMatchObject({
+        headSha: "merge-head",
+        lastEventAction: "closed",
+        sourceEventOrder: 30,
+      });
+      expect(rows[0]?.updatedAt.getTime()).toBe(afterMerge?.updatedAt.getTime());
+    });
+
+    it("accepts a newer reopened event after a closed PR", async () => {
+      const { issueId } = await seedIssueWithIdentifier("BLO-40008");
+      const app = buildApp();
+
+      await postPr(app, prPayload({
+        action: "opened",
+        identifier: "BLO-40008",
+        number: 4249,
+        updatedAt: "2026-04-30T10:00:00Z",
+      }), "wp-reopen-1");
+      await postPr(app, prPayload({
+        action: "closed",
+        identifier: "BLO-40008",
+        number: 4249,
+        merged: false,
+        updatedAt: "2026-04-30T10:10:00Z",
+      }), "wp-reopen-2");
+      await postPr(app, prPayload({
+        action: "reopened",
+        identifier: "BLO-40008",
+        number: 4249,
+        headSha: "reopened-head",
+        updatedAt: "2026-04-30T10:20:00Z",
+      }), "wp-reopen-3");
+
+      const rows = await db
+        .select({ status: issueWorkProducts.status, metadata: issueWorkProducts.metadata })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.status).toBe("ready_for_review");
+      expect(rows[0]?.metadata).toMatchObject({
+        headSha: "reopened-head",
+        lastEventAction: "reopened",
+        sourceEventTimestamp: "2026-04-30T10:20:00.000Z",
+      });
+    });
+
+    // GitHub's `pull_request.updated_at` is second-granular, so a rapid
+    // close/reopen pair carries an identical timestamp and the two true source
+    // orders are indistinguishable. Action rank can only satisfy one of them, so
+    // the tie resolves toward the terminal state: keeping an open state on a
+    // truly-closed PR is permanent (a closed PR emits nothing further), whereas
+    // keeping a closed state on a truly-open PR is corrected by the next event.
+    // Both orders are covered here, plus the self-correction that pays for the
+    // one we deliberately get wrong.
+    it("keeps closed for a same-second reopened event after a closed PR", async () => {
+      const { issueId } = await seedIssueWithIdentifier("BLO-40020");
+      const app = buildApp();
+
+      await postPr(app, prPayload({
+        action: "closed",
+        identifier: "BLO-40020",
+        number: 4260,
+        merged: false,
+        updatedAt: "2026-04-30T10:00:00Z",
+      }), "wp-same-second-reopen-1");
+      await postPr(app, prPayload({
+        action: "reopened",
+        identifier: "BLO-40020",
+        number: 4260,
+        headSha: "same-second-reopen-head",
+        updatedAt: "2026-04-30T10:00:00Z",
+      }), "wp-same-second-reopen-2");
+
+      const rows = await db
+        .select({ status: issueWorkProducts.status, metadata: issueWorkProducts.metadata })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.status).toBe("closed");
+      expect(rows[0]?.metadata).toMatchObject({ lastEventAction: "closed" });
+    });
+
+    it("restores a genuinely reopened PR on the next strictly-later event", async () => {
+      // The cost of resolving the ambiguous tie toward `closed` is bounded: a PR
+      // that really is open emits further events, and the first one carrying a
+      // later `updated_at` is accepted outright.
+      const { issueId } = await seedIssueWithIdentifier("BLO-40023");
+      const app = buildApp();
+
+      await postPr(app, prPayload({
+        action: "closed",
+        identifier: "BLO-40023",
+        number: 4263,
+        merged: false,
+        updatedAt: "2026-04-30T10:00:00Z",
+      }), "wp-same-second-selfheal-1");
+      await postPr(app, prPayload({
+        action: "reopened",
+        identifier: "BLO-40023",
+        number: 4263,
+        updatedAt: "2026-04-30T10:00:00Z",
+      }), "wp-same-second-selfheal-2");
+      await postPr(app, prPayload({
+        action: "synchronize",
+        identifier: "BLO-40023",
+        number: 4263,
+        headSha: "selfheal-head",
+        updatedAt: "2026-04-30T10:00:01Z",
+      }), "wp-same-second-selfheal-3");
+
+      const rows = await db
+        .select({ status: issueWorkProducts.status, metadata: issueWorkProducts.metadata })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.status).toBe("ready_for_review");
+      expect(rows[0]?.metadata).toMatchObject({
+        headSha: "selfheal-head",
+        lastEventAction: "synchronize",
+      });
+    });
+
+    it("applies a distinct same-second push instead of retaining stale head metadata", async () => {
+      const { issueId } = await seedIssueWithIdentifier("BLO-40021");
+      const app = buildApp();
+
+      await postPr(app, prPayload({
+        action: "opened",
+        identifier: "BLO-40021",
+        number: 4261,
+        headSha: "first-head",
+        updatedAt: "2026-04-30T10:00:00Z",
+      }), "wp-same-second-push-1");
+      await postPr(app, prPayload({
+        action: "synchronize",
+        identifier: "BLO-40021",
+        number: 4261,
+        headSha: "second-head",
+        beforeSha: "first-head",
+        updatedAt: "2026-04-30T10:00:00Z",
+      }), "wp-same-second-push-2");
+
+      const rows = await db
+        .select({ metadata: issueWorkProducts.metadata })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.metadata).toMatchObject({
+        headSha: "second-head",
+        previousHeadSha: "first-head",
+        lastEventAction: "synchronize",
+      });
+    });
+
+    it("keeps closed when a same-second close follows a reopen, whether delayed or genuine", async () => {
+      // This used to assert the reopen survives, on the reading that such a
+      // close must be a delayed redelivery. That reading is not available from
+      // the payloads: a genuinely stale close carries the *old* close's
+      // `updated_at` and is already rejected on timestamp before reaching the
+      // tie-break (covered below), so everything that gets here is same-second
+      // and genuinely ambiguous -- byte-identical whether the close came first
+      // or second. It is also the order rank alone gets wrong: the incoming
+      // close ranks 30 below the stored reopen's 40, so a pure rank tie-break
+      // would leave this PR `ready_for_review` and progress-eligible forever.
+      const { issueId } = await seedIssueWithIdentifier("BLO-40024");
+      const app = buildApp();
+
+      await postPr(app, prPayload({
+        action: "reopened",
+        identifier: "BLO-40024",
+        number: 4264,
+        headSha: "same-second-reopened-head",
+        updatedAt: "2026-04-30T10:00:00Z",
+      }), "wp-same-second-reverse-reopen-1");
+      await postPr(app, prPayload({
+        action: "closed",
+        identifier: "BLO-40024",
+        number: 4264,
+        merged: false,
+        headSha: "same-second-closed-head",
+        updatedAt: "2026-04-30T10:00:00Z",
+      }), "wp-same-second-reverse-reopen-2");
+
+      const rows = await db
+        .select({ status: issueWorkProducts.status, metadata: issueWorkProducts.metadata })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.status).toBe("closed");
+      expect(rows[0]?.metadata).toMatchObject({
+        headSha: "same-second-closed-head",
+        lastEventAction: "closed",
+      });
+    });
+
+    it("still rejects a genuinely older close on timestamp, not on rank", async () => {
+      const { issueId } = await seedIssueWithIdentifier("BLO-40025");
+      const app = buildApp();
+
+      await postPr(app, prPayload({
+        action: "reopened",
+        identifier: "BLO-40025",
+        number: 4265,
+        headSha: "older-close-reopened-head",
+        updatedAt: "2026-04-30T10:05:00Z",
+      }), "wp-older-close-1");
+      await postPr(app, prPayload({
+        action: "closed",
+        identifier: "BLO-40025",
+        number: 4265,
+        merged: false,
+        updatedAt: "2026-04-30T10:00:00Z",
+      }), "wp-older-close-2");
+
+      const rows = await db
+        .select({ status: issueWorkProducts.status, metadata: issueWorkProducts.metadata })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.status).toBe("ready_for_review");
+      expect(rows[0]?.metadata).toMatchObject({
+        headSha: "older-close-reopened-head",
+        lastEventAction: "reopened",
+      });
+    });
+
+    it("keeps the newest same-second push when deliveries arrive newest first", async () => {
+      const { issueId } = await seedIssueWithIdentifier("BLO-40024");
+      const app = buildApp();
+
+      await postPr(app, prPayload({
+        action: "synchronize",
+        identifier: "BLO-40024",
+        number: 4264,
+        beforeSha: "second-head",
+        headSha: "third-head",
+        updatedAt: "2026-04-30T10:00:00Z",
+      }), "wp-same-second-reverse-push-1");
+      await postPr(app, prPayload({
+        action: "synchronize",
+        identifier: "BLO-40024",
+        number: 4264,
+        beforeSha: "first-head",
+        headSha: "second-head",
+        updatedAt: "2026-04-30T10:00:00Z",
+      }), "wp-same-second-reverse-push-2");
+
+      const rows = await db
+        .select({ metadata: issueWorkProducts.metadata })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.metadata).toMatchObject({
+        headSha: "third-head",
+        previousHeadSha: "second-head",
+        lastEventAction: "synchronize",
+      });
+    });
+
+    it("does not let a same-second stray event un-merge a merged PR", async () => {
+      // `merged` is absorbing: the same-second reopen allowance must not become
+      // a path for demoting a terminal merge.
+      const { issueId } = await seedIssueWithIdentifier("BLO-40022");
+      const app = buildApp();
+
+      await postPr(app, prPayload({
+        action: "closed",
+        identifier: "BLO-40022",
+        number: 4262,
+        merged: true,
+        updatedAt: "2026-04-30T10:00:00Z",
+      }), "wp-same-second-merged-1");
+      await postPr(app, prPayload({
+        action: "reopened",
+        identifier: "BLO-40022",
+        number: 4262,
+        headSha: "post-merge-head",
+        updatedAt: "2026-04-30T10:00:00Z",
+      }), "wp-same-second-merged-2");
+
+      const rows = await db
+        .select({ status: issueWorkProducts.status })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.status).toBe("merged");
+    });
+
+    it("ignores delayed equal-rank deliveries instead of refreshing PR liveness", async () => {
+      const { issueId } = await seedIssueWithIdentifier("BLO-40009");
+      const app = buildApp();
+
+      await postPr(app, prPayload({
+        action: "opened",
+        identifier: "BLO-40009",
+        number: 4250,
+        headSha: "opened-head",
+        updatedAt: "2026-04-30T10:00:00Z",
+      }), "wp-equal-rank-1");
+      await postPr(app, prPayload({
+        action: "synchronize",
+        identifier: "BLO-40009",
+        number: 4250,
+        headSha: "newer-sync-head",
+        updatedAt: "2026-04-30T10:20:00Z",
+      }), "wp-equal-rank-2");
+      const afterNewerSync = await db
+        .select({ updatedAt: issueWorkProducts.updatedAt })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId))
+        .then((rows) => rows[0]);
+
+      await postPr(app, prPayload({
+        action: "synchronize",
+        identifier: "BLO-40009",
+        number: 4250,
+        headSha: "stale-sync-head",
+        updatedAt: "2026-04-30T10:05:00Z",
+      }), "wp-equal-rank-3");
+
+      const rows = await db
+        .select({
+          metadata: issueWorkProducts.metadata,
+          updatedAt: issueWorkProducts.updatedAt,
+        })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.metadata).toMatchObject({
+        headSha: "newer-sync-head",
+        lastEventAction: "synchronize",
+        sourceEventTimestamp: "2026-04-30T10:20:00.000Z",
+      });
+      expect(rows[0]?.updatedAt.getTime()).toBe(afterNewerSync?.updatedAt.getTime());
+    });
+
+    it("does not refresh updatedAt for an exact webhook redelivery", async () => {
+      const { issueId } = await seedIssueWithIdentifier("BLO-40010");
+      const app = buildApp();
+      const payload = prPayload({
+        action: "synchronize",
+        identifier: "BLO-40010",
+        number: 4251,
+        headSha: "same-head",
+        updatedAt: "2026-04-30T10:30:00Z",
+      });
+
+      await postPr(app, payload, "wp-redelivery-1");
+      const afterFirst = await db
+        .select({ updatedAt: issueWorkProducts.updatedAt })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId))
+        .then((rows) => rows[0]);
+
+      await postPr(app, payload, "wp-redelivery-2");
+
+      const rows = await db
+        .select({ metadata: issueWorkProducts.metadata, updatedAt: issueWorkProducts.updatedAt })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.metadata).toMatchObject({
+        headSha: "same-head",
+        sourceEventTimestamp: "2026-04-30T10:30:00.000Z",
+      });
+      expect(rows[0]?.updatedAt.getTime()).toBe(afterFirst?.updatedAt.getTime());
+    });
+
+    it("keeps updating a previously linked PR row after the identifier is removed", async () => {
+      const { issueId } = await seedIssueWithIdentifier("BLO-40007");
+      const app = buildApp();
+
+      await postPr(app, prPayload({ action: "opened", identifier: "BLO-40007", number: 4248 }), "wp-link-1");
+      const syncWithoutIdentifier = await postPr(
+        app,
+        prPayload({
+          action: "synchronize",
+          identifier: "no-ticket",
+          number: 4248,
+          title: "Retitled without paperclip id",
+          headSha: "head-without-id",
+        }),
+        "wp-link-2",
+      );
+      expect(syncWithoutIdentifier.status).toBe(200);
+      expect(syncWithoutIdentifier.body).toMatchObject({ ignored: "no_matching_issue" });
+
+      let rows = await db
+        .select({ status: issueWorkProducts.status, metadata: issueWorkProducts.metadata })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.status).toBe("ready_for_review");
+      expect(rows[0]?.metadata).toMatchObject({
+        headSha: "head-without-id",
+        lastEventAction: "synchronize",
+      });
+
+      const closeWithoutIdentifier = await postPr(
+        app,
+        prPayload({
+          action: "closed",
+          identifier: "no-ticket",
+          number: 4248,
+          title: "Retitled without paperclip id",
+          merged: true,
+          headSha: "merge-without-id",
+        }),
+        "wp-link-3",
+      );
+      expect(closeWithoutIdentifier.status).toBe(200);
+      expect(closeWithoutIdentifier.body).toMatchObject({ ignored: "no_matching_issue" });
+
+      rows = await db
+        .select({ status: issueWorkProducts.status, metadata: issueWorkProducts.metadata })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.status).toBe("merged");
+      expect(rows[0]?.metadata).toMatchObject({
+        headSha: "merge-without-id",
+        lastEventAction: "closed",
+        sourceEventOrder: 30,
+      });
+    });
+
+    it("does not treat actor-created PR rows as previous webhook links", async () => {
+      const { companyId, issueId } = await seedIssueWithIdentifier("BLO-40011");
+      const app = buildApp();
+      await db.insert(issueWorkProducts).values({
+        companyId,
+        issueId,
+        type: "pull_request",
+        provider: "github",
+        externalId: "Blockcast/paperclip#4252",
+        title: "Actor-authored PR claim",
+        url: "https://github.com/Blockcast/paperclip/pull/4252",
+        status: "ready_for_review",
+        metadata: { source: "manual", headSha: "manual-head" },
+        sourceTrust: null,
+      });
+
+      const res = await postPr(
+        app,
+        prPayload({
+          action: "synchronize",
+          identifier: "no-ticket",
+          number: 4252,
+          title: "Retitled without paperclip id",
+          headSha: "webhook-head",
+          updatedAt: "2026-04-30T10:45:00Z",
+        }),
+        "wp-manual-link-1",
+      );
+
+      expect(res.status).toBe(200);
+      expect(res.body).toMatchObject({ ignored: "no_paperclip_identifier" });
+      const rows = await db
+        .select({
+          metadata: issueWorkProducts.metadata,
+          sourceTrust: issueWorkProducts.sourceTrust,
+          updatedAt: issueWorkProducts.updatedAt,
+        })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.metadata).toEqual({ source: "manual", headSha: "manual-head" });
+      expect(rows[0]?.sourceTrust).toBeNull();
+    });
+
+    it("records a draft PR as draft rather than ready_for_review", async () => {
+      const { issueId } = await seedIssueWithIdentifier("BLO-40004");
+      const app = buildApp();
+
+      await postPr(
+        app,
+        prPayload({ action: "opened", identifier: "BLO-40004", number: 4245, draft: true }),
+        "wp-draft",
+      );
+
+      const rows = await db
+        .select({ status: issueWorkProducts.status })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      expect(rows[0]?.status).toBe("draft");
+    });
+
+    it("writes a row for an unassigned issue (evidence about the PR, not a wake)", async () => {
+      const { issueId } = await seedIssueWithIdentifier("BLO-40005", { assignee: false });
+      const app = buildApp();
+
+      await postPr(app, prPayload({ action: "opened", identifier: "BLO-40005", number: 4246 }), "wp-unassigned");
+
+      const rows = await db
+        .select({ id: issueWorkProducts.id })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      expect(rows).toHaveLength(1);
+    });
   });
 
   it("does not coalesce reviewer PR wakes into a thin null-scope automation run (BLO-7457)", async () => {

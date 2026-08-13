@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
@@ -105,6 +106,47 @@ test("handles quoted keys and values the same as unquoted ones", () => {
 test("the repo's own package.json and pnpm-lock.yaml are consistent right now", () => {
   const packageJson = readFileSync(path.join(repoRoot, "package.json"), "utf8");
   const lockfile = readFileSync(path.join(repoRoot, "pnpm-lock.yaml"), "utf8");
+
+  assert.deepEqual(findLockfileOverrideMismatches(packageJson, lockfile, { repoRoot }), []);
+});
+
+// Reviewer follow-up on BLO-24169 (#1273): the checks above only compare the
+// *path* recorded for a patch, not the hash. Editing an existing patch
+// file's content — without touching package.json or renaming the patch —
+// changes what pnpm must apply but leaves every field these checks look at
+// unchanged, so the drift was previously invisible until `pnpm install
+// --frozen-lockfile` rejected the stale hash on master.
+test("flags a patch file whose content no longer matches the lockfile's recorded hash", () => {
+  const fixtureDir = mkdtempSync(path.join(tmpdir(), "lockfile-patch-hash-"));
+  try {
+    writeFileSync(path.join(fixtureDir, "some-package@1.0.0.patch"), "diff --git a/index.js b/index.js\n");
+
+    const packageJson = minimalPackageJson({}, { "some-package@1.0.0": "some-package@1.0.0.patch" });
+    const lockfile = minimalLockfile({
+      overrides: {},
+      patches: {
+        "some-package@1.0.0": { hash: "thishashisstale00000000000", path: "some-package@1.0.0.patch" },
+      },
+    });
+
+    const mismatches = findLockfileOverrideMismatches(packageJson, lockfile, { repoRoot: fixtureDir });
+    assert.ok(
+      mismatches.some((m) => m.includes('patchedDependencies["some-package@1.0.0"].hash') && m.includes("doesn't match")),
+      `expected a stale patch-hash mismatch, got: ${JSON.stringify(mismatches)}`,
+    );
+  } finally {
+    rmSync(fixtureDir, { recursive: true, force: true });
+  }
+});
+
+test("does not flag patch hashes when repoRoot is omitted (path-only fixtures with no files on disk)", () => {
+  const packageJson = minimalPackageJson({}, { "some-package@1.0.0": "some-package@1.0.0.patch" });
+  const lockfile = minimalLockfile({
+    overrides: {},
+    patches: {
+      "some-package@1.0.0": { hash: "whatever-not-checked-here00", path: "some-package@1.0.0.patch" },
+    },
+  });
 
   assert.deepEqual(findLockfileOverrideMismatches(packageJson, lockfile), []);
 });

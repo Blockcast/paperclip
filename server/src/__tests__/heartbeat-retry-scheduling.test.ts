@@ -77,7 +77,7 @@ vi.mock("../adapters/index.ts", async () => {
   return {
     ...actual,
     getServerAdapter: vi.fn((type: string) =>
-      type === "provider_quota_test"
+      type === "provider_quota_test" || type === "zero_turn_transient_test"
         ? actual.getServerAdapter(type)
         : {
             supportsLocalAgentJwt: false,
@@ -90,6 +90,11 @@ vi.mock("../adapters/index.ts", async () => {
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 const PROVIDER_QUOTA_TEST_ADAPTER = "provider_quota_test";
+// BLO-24166: an adapter that fails the way the 2026-08-08 streak did — a
+// transient upstream error that burned a whole run without producing a single
+// model token. Drives the real executeRun finalizer so the slot-release
+// ordering is observed on the production path, not hand-arranged by the test.
+const ZERO_TURN_TRANSIENT_ADAPTER = "zero_turn_transient_test";
 
 if (!embeddedPostgresSupport.supported) {
   console.warn(
@@ -143,6 +148,32 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         testedAt: new Date().toISOString(),
       }),
     });
+    registerServerAdapter({
+      type: ZERO_TURN_TRANSIENT_ADAPTER,
+      execute: async () => ({
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+        errorMessage: "upstream connection reset",
+        errorCode: "adapter_failed",
+        errorFamily: "transient_upstream",
+        summary: "failed",
+        // Zero model turns: the run held a slot and produced nothing.
+        usage: { inputTokens: 0, outputTokens: 0 },
+        resultJson: {
+          errorFamily: "transient_upstream",
+          usage: { inputTokens: 0, outputTokens: 0 },
+        },
+        provider: "test",
+        model: "test-model",
+      }),
+      testEnvironment: async () => ({
+        adapterType: ZERO_TURN_TRANSIENT_ADAPTER,
+        status: "pass",
+        checks: [],
+        testedAt: new Date().toISOString(),
+      }),
+    });
   }, 60_000);
 
   afterEach(async () => {
@@ -163,6 +194,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
 
   afterAll(async () => {
     unregisterServerAdapter(PROVIDER_QUOTA_TEST_ADAPTER);
+    unregisterServerAdapter(ZERO_TURN_TRANSIENT_ADAPTER);
     await tempDb?.cleanup();
   });
 
@@ -771,11 +803,297 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect(duePromotion).toEqual({ promoted: 1, runIds: [scheduled.run.id] });
 
     const promotedRun = await db
-      .select({ status: heartbeatRuns.status })
+      .select({ status: heartbeatRuns.status, queuedAt: heartbeatRuns.queuedAt, createdAt: heartbeatRuns.createdAt })
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, scheduled.run.id))
       .then((rows) => rows[0] ?? null);
     expect(promotedRun?.status).toBe("queued");
+    // BLO-21116 (Ally review, onprem-k8s#2013): promotion out of
+    // scheduled_retry must reset the queued-age clock to the promotion
+    // instant, not leave the gauge reading this row's original createdAt --
+    // otherwise the queued-run-age gauge reports this run's full retry
+    // backoff as dispatch-queue wait the moment it is promoted. (createdAt
+    // itself isn't compared here: this test's synthetic clock predates the
+    // sandbox's real wall clock, and the retry row's createdAt defaults to
+    // the latter at insert time -- an artifact of the test harness, not of
+    // the promotion logic under test.)
+    expect(promotedRun?.queuedAt?.toISOString()).toBe(expectedDueAt.toISOString());
+  });
+
+  // BLO-24166 (split from BLO-23699 AC3): a provider blip on 2026-08-08 burned
+  // 606 zero-model-turn runs on one agent, and the open question was whether
+  // each one kept holding its concurrency slot across its whole retry chain —
+  // which would convert a short upstream outage directly into hours of queue
+  // latency for unrelated work on that agent.
+  //
+  // It does not, and this test pins the two independent reasons so a refactor
+  // cannot silently reintroduce the double-count:
+  //
+  //   1. Ordering — the terminal compare-and-swap (`setRunStatusIfRunning`,
+  //      heartbeat.ts, which moves the row out of `running` and stamps
+  //      `finishedAt` in one UPDATE) runs BEFORE `scheduleBoundedRetryForRun`
+  //      on both finalize paths.
+  //   2. Structure — a retry row is inserted `scheduled_retry` and promoted to
+  //      `queued`, while a slot is counted ONLY for `status = 'running'`
+  //      (`countRunningRunsForAgent` / `listRunningRunsForAgent`). A retry
+  //      therefore holds no slot at any point before it wins one itself.
+  //
+  // Reason 2 is the load-bearing one: it holds even if reason 1 is violated,
+  // so the second half of this test deliberately enqueues a retry while the
+  // parent is still `running` and asserts the slot count still does not grow.
+  it("BLO-24166: a zero-model-turn liveness failure releases its concurrency slot before its retry is enqueued", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const failedRunId = randomUUID();
+    const now = new Date("2026-08-08T11:11:09.000Z");
+
+    const countSlotHoldingRuns = () =>
+      db
+        .select({ count: sql<number>`count(*)::int` })
+        .from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "running")))
+        .then((rows) => rows[0]?.count ?? 0);
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "PlatformSREEngineer",
+      role: "engineer",
+      status: "active",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {
+        heartbeat: {
+          wakeOnDemand: true,
+          maxConcurrentRuns: 3,
+          concurrencyEnabled: true,
+        },
+      },
+      permissions: {},
+    });
+
+    // The run as it looked while executing: occupying a slot, and — the case
+    // under test — having produced not a single model token.
+    await db.insert(heartbeatRuns).values({
+      id: failedRunId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "running",
+      startedAt: now,
+      usageJson: { inputTokens: 0, outputTokens: 0 },
+      contextSnapshot: {
+        issueId: randomUUID(),
+        wakeReason: "issue_assigned",
+      },
+      updatedAt: now,
+      createdAt: now,
+    });
+
+    expect(await countSlotHoldingRuns()).toBe(1);
+
+    // Production finalize order: terminal first, retry second.
+    await db
+      .update(heartbeatRuns)
+      .set({
+        status: "failed",
+        error: "upstream connection reset",
+        errorCode: "claude_transient_upstream",
+        finishedAt: now,
+        livenessState: "failed",
+        livenessReason: "Run ended with failed (claude_transient_upstream)",
+        updatedAt: now,
+      })
+      .where(and(eq(heartbeatRuns.id, failedRunId), eq(heartbeatRuns.status, "running")));
+
+    // The slot is already free at this point — before any retry exists.
+    expect(await countSlotHoldingRuns()).toBe(0);
+
+    const scheduled = await heartbeat.scheduleBoundedRetry(failedRunId, {
+      now,
+      random: () => 0.5,
+    });
+    expect(scheduled.outcome).toBe("scheduled");
+    if (scheduled.outcome !== "scheduled") return;
+
+    const retryRun = await db
+      .select({ status: heartbeatRuns.status, retryOfRunId: heartbeatRuns.retryOfRunId })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, scheduled.run.id))
+      .then((rows) => rows[0] ?? null);
+
+    // The retry is parked, not running: enqueuing it allocates no slot, so the
+    // agent's full concurrency is available to unrelated work immediately.
+    expect(retryRun).toMatchObject({ status: "scheduled_retry", retryOfRunId: failedRunId });
+    expect(await countSlotHoldingRuns()).toBe(0);
+
+    // Promotion moves it to `queued` — still not a slot. It must win one
+    // through the ordinary dispatch gate like any other queued run.
+    const promotion = await heartbeat.promoteDueScheduledRetries(
+      new Date(now.getTime() + BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS[0]),
+    );
+    expect(promotion).toEqual({ promoted: 1, runIds: [scheduled.run.id] });
+    expect(await countSlotHoldingRuns()).toBe(0);
+
+    // Structural guarantee, independent of ordering: even when a retry is
+    // enqueued against a parent that is STILL `running`, the retry does not
+    // add a slot-holding row. Only the parent's own single slot is counted.
+    const stillRunningId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: stillRunningId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "running",
+      startedAt: now,
+      usageJson: { inputTokens: 0, outputTokens: 0 },
+      contextSnapshot: {
+        issueId: randomUUID(),
+        wakeReason: "issue_assigned",
+      },
+      updatedAt: now,
+      createdAt: now,
+    });
+    expect(await countSlotHoldingRuns()).toBe(1);
+
+    const racedRetry = await heartbeat.scheduleBoundedRetry(stillRunningId, {
+      now,
+      random: () => 0.5,
+    });
+    expect(racedRetry.outcome).toBe("scheduled");
+    if (racedRetry.outcome !== "scheduled") return;
+
+    expect(await countSlotHoldingRuns()).toBe(1);
+  });
+
+  it("BLO-24166: the real zero-model-turn failure path leaves the parent terminal at the moment its retry row is inserted", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+
+    // The test above hand-performs the terminal transition, so it pins the
+    // structural guarantee (a retry row is never `running`) but CANNOT catch a
+    // regression that moves retry scheduling ahead of `setRunStatusIfRunning`
+    // in executeRun — it would observe the pre-arranged terminal row and pass.
+    // This one drives the genuine failure through the production finalizer and
+    // observes the ordering from inside the retry INSERT itself, via an AFTER
+    // INSERT trigger that records the parent's status at that instant. That is
+    // the invariant stated in the issue title, asserted causally rather than by
+    // comparing timestamps written by two different clocks.
+    await db.execute(sql`
+      create table if not exists blo24166_retry_insert_observations (
+        retry_run_id uuid primary key,
+        parent_run_id uuid not null,
+        parent_status text not null,
+        retry_status text not null
+      )
+    `);
+    await db.execute(sql`
+      create or replace function blo24166_observe_retry_insert() returns trigger as $$
+      begin
+        insert into blo24166_retry_insert_observations
+          (retry_run_id, parent_run_id, parent_status, retry_status)
+        select new.id, new.retry_of_run_id, parent.status, new.status
+        from heartbeat_runs parent
+        where parent.id = new.retry_of_run_id
+        on conflict (retry_run_id) do nothing;
+        return null;
+      end;
+      $$ language plpgsql
+    `);
+    // `retry_of_run_id <> id` excludes the in-place process_lost retry, which
+    // points at its own row and is not a parent/child pair at all.
+    await db.execute(sql`
+      create or replace trigger blo24166_observe_retry_insert
+      after insert on heartbeat_runs
+      for each row when (new.retry_of_run_id is not null and new.retry_of_run_id <> new.id)
+      execute function blo24166_observe_retry_insert()
+    `);
+
+    try {
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+        defaultResponsibleUserId: "responsible-user",
+      });
+
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: "PlatformSREEngineer",
+        role: "engineer",
+        status: "idle",
+        adapterType: ZERO_TURN_TRANSIENT_ADAPTER,
+        adapterConfig: {},
+        runtimeConfig: {
+          heartbeat: {
+            wakeOnDemand: true,
+            maxConcurrentRuns: 3,
+            concurrencyEnabled: true,
+          },
+        },
+        permissions: {},
+      });
+
+      const run = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
+      expect(run).not.toBeNull();
+
+      const failedRun = await waitForRunToFinish(heartbeat, run!.id);
+      expect(failedRun?.status).toBe("failed");
+      // The case under test: a full run consumed, not one model token produced.
+      const usage = (failedRun?.usageJson as Record<string, unknown> | null) ?? {};
+      expect(Number(usage.outputTokens ?? 0)).toBe(0);
+
+      await expect
+        .poll(
+          () =>
+            db
+              .select({ id: heartbeatRuns.id })
+              .from(heartbeatRuns)
+              .where(eq(heartbeatRuns.retryOfRunId, run!.id))
+              .then((rows) => rows.length),
+          { timeout: 10_000, interval: 50 },
+        )
+        .toBe(1);
+
+      const observations = await db
+        .execute(
+          sql`select parent_run_id, parent_status, retry_status
+              from blo24166_retry_insert_observations
+              where parent_run_id = ${run!.id}`,
+        )
+        .then((result) => (result as unknown as { rows?: Record<string, unknown>[] }).rows ?? result);
+
+      const rows = observations as Record<string, unknown>[];
+      expect(rows).toHaveLength(1);
+      // The assertion that the hand-arranged test cannot make: when the retry
+      // row came into existence, the parent had ALREADY left `running`, so its
+      // slot was free. Reordering executeRun to schedule the retry before
+      // setRunStatusIfRunning turns this into "running" and fails the test.
+      expect(rows[0].parent_status).not.toBe("running");
+      expect(rows[0].parent_status).toBe("failed");
+      expect(rows[0].retry_status).toBe("scheduled_retry");
+
+      const slotHolders = await db
+        .select({ count: sql<number>`count(*)::int` })
+        .from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "running")))
+        .then((r) => r[0]?.count ?? 0);
+      expect(slotHolders).toBe(0);
+    } finally {
+      await db.execute(sql`drop trigger if exists blo24166_observe_retry_insert on heartbeat_runs`);
+      await db.execute(sql`drop function if exists blo24166_observe_retry_insert()`);
+      await db.execute(sql`drop table if exists blo24166_retry_insert_observations`);
+    }
   });
 
   it("treats idempotent GitHub PR-review adapter failures as retry-eligible", () => {
