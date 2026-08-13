@@ -830,21 +830,21 @@ describe("setPluginErrorStatus (BLO-21092)", () => {
 });
 
 describe("setPluginStatusCollectorLastSuccessSeconds (BLO-21092 review follow-up)", () => {
-  it("is zero-initialized at registration, so a collector that never succeeds reads as maximally stale rather than absent", async () => {
+  it("registers no series until first set -- unlike a bare gauge, prom-client does not auto-publish a labeled gauge at 0 (Ally review: this is what keeps the API tier, which never calls this setter, from freezing the series at 0 and permanently satisfying a staleness alert)", async () => {
     const { body } = await renderMetrics();
     expect(body).toContain(`# TYPE ${PLUGIN_STATUS_COLLECTOR_LAST_SUCCESS_METRIC} gauge`);
-    expect(body).toContain(`${PLUGIN_STATUS_COLLECTOR_LAST_SUCCESS_METRIC} 0`);
+    expect(body).not.toContain(`${PLUGIN_STATUS_COLLECTOR_LAST_SUCCESS_METRIC}{`);
   });
 
-  it("reports the exact unix-seconds value passed in, and only advances on an explicit call", async () => {
+  it("reports the exact unix-seconds value passed in under role=\"worker\", and only advances on an explicit call", async () => {
     setPluginStatusCollectorLastSuccessSeconds(1_700_000_000);
     let body = (await renderMetrics()).body;
-    expect(body).toContain(`${PLUGIN_STATUS_COLLECTOR_LAST_SUCCESS_METRIC} 1700000000`);
+    expect(body).toContain(`${PLUGIN_STATUS_COLLECTOR_LAST_SUCCESS_METRIC}{role="worker"} 1700000000`);
 
     // A second success tick advances it; nothing else can move it backward or forward.
     setPluginStatusCollectorLastSuccessSeconds(1_700_000_030);
     body = (await renderMetrics()).body;
-    expect(body).toContain(`${PLUGIN_STATUS_COLLECTOR_LAST_SUCCESS_METRIC} 1700000030`);
+    expect(body).toContain(`${PLUGIN_STATUS_COLLECTOR_LAST_SUCCESS_METRIC}{role="worker"} 1700000030`);
   });
 });
 

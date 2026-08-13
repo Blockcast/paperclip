@@ -51,7 +51,7 @@ describe("startPluginStatusCollector", () => {
     expect(body).toContain(
       `${PLUGIN_ERROR_METRIC}{plugin_id="a",plugin_key="lucitra.plugin-secrets"} 1`,
     );
-    expect(body).toContain(`${PLUGIN_STATUS_COLLECTOR_LAST_SUCCESS_METRIC} 1700000000`);
+    expect(body).toContain(`${PLUGIN_STATUS_COLLECTOR_LAST_SUCCESS_METRIC}{role="worker"} 1700000000`);
     stop();
   });
 
@@ -84,7 +84,7 @@ describe("startPluginStatusCollector", () => {
     // render no series -- the point is the collector's OWN health signal
     // below is what tells them apart).
     expect(body).not.toContain(`${PLUGIN_ERROR_METRIC}{`);
-    expect(body).toContain(`${PLUGIN_STATUS_COLLECTOR_LAST_SUCCESS_METRIC} 0`);
+    expect(body).toContain(`${PLUGIN_STATUS_COLLECTOR_LAST_SUCCESS_METRIC}{role="worker"} 0`);
     stop();
   });
 
@@ -111,7 +111,7 @@ describe("startPluginStatusCollector", () => {
     expect(body).toContain(
       `${PLUGIN_ERROR_METRIC}{plugin_id="a",plugin_key="lucitra.plugin-secrets"} 0`,
     );
-    expect(body).toContain(`${PLUGIN_STATUS_COLLECTOR_LAST_SUCCESS_METRIC} 1700000000`);
+    expect(body).toContain(`${PLUGIN_STATUS_COLLECTOR_LAST_SUCCESS_METRIC}{role="worker"} 1700000000`);
 
     // Advance the clock and fire the interval tick, which now rejects.
     tick = 1_700_000_600_000;
@@ -126,7 +126,7 @@ describe("startPluginStatusCollector", () => {
     );
     // But the success gauge did NOT advance to the new tick time, which is
     // exactly what lets (time() - this) > threshold detect the stall.
-    expect(body).toContain(`${PLUGIN_STATUS_COLLECTOR_LAST_SUCCESS_METRIC} 1700000000`);
+    expect(body).toContain(`${PLUGIN_STATUS_COLLECTOR_LAST_SUCCESS_METRIC}{role="worker"} 1700000000`);
     stop();
   });
 });

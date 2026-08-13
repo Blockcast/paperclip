@@ -72,6 +72,14 @@ export function startPluginStatusCollector(
   let ticking = false;
   let stopped = false;
 
+  // Zero-init here, not in metrics.ts's ensureRegistry -- ensureRegistry runs
+  // on every tier (including the API tier, which never calls this function),
+  // so a registry-time zero-init would freeze the gauge at 0 on every API pod
+  // and permanently false-fire a (time() - this) staleness alert against an
+  // API-tier scrape target. Setting it here means the series exists (reading
+  // maximally stale) only on the tier that can ever make it fresh again.
+  setPluginStatusCollectorLastSuccessSeconds(0);
+
   async function tick(): Promise<void> {
     if (ticking || stopped) return;
     ticking = true;

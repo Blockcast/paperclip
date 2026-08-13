@@ -767,8 +767,11 @@ test("PaperclipPluginStatusCollectorStale watches the collector's own heartbeat,
   ) ?? [];
   assert.match(
     expr,
-    /^\(time\(\) - paperclip_plugin_status_collector_last_success_timestamp_seconds\) > \d+$/,
-    "collector-stale alert must key on time() minus the last-success gauge, not on paperclip_plugin_error itself",
+    /^\(time\(\) - paperclip_plugin_status_collector_last_success_timestamp_seconds\{role="worker"\}\) > \d+$/,
+    "collector-stale alert must key on time() minus the last-success gauge, not on paperclip_plugin_error itself, "
+      + "and must select role=\"worker\" -- Ally review: the gauge is a bare (zero-label) series is what prom-client "
+      + "auto-publishes at 0 from construction alone with no .set() call, so without this label an API-tier pod "
+      + "(which never starts the collector) would freeze the series at 0 and permanently satisfy this expr there",
   );
 
   const [, forWindow] = rendered.match(
@@ -780,5 +783,46 @@ test("PaperclipPluginStatusCollectorStale watches the collector's own heartbeat,
     rendered,
     /alert: PaperclipPluginStatusCollectorStale[\s\S]*?runbook_url: "[^"]*runbooks\/plugin-error\.md"/,
     "collector-stale alert must link the runbook",
+  );
+});
+
+test("PaperclipPluginStatusCollectorStale's role label prevents an API-tier target from permanently satisfying the expr (BLO-21092 Ally review: mixed API/worker topology)", () => {
+  // Simulates production's actual mixed topology at the PromQL level, since
+  // this repo's Helm tests render text rather than evaluate rules against
+  // live series (no promtool in this environment). paperclip_plugin_error and
+  // the collector-freshness gauge are worker-tier-only in reality; the API
+  // tier's /metrics registers the SAME metric names (shared registry code)
+  // but, per the Ally fix, never calls the setter that would attach the
+  // role="worker" label -- so an API-tier scrape contributes no series for
+  // this metric name at all. A regex-selected instant vector like
+  // `metric{role="worker"}` is unaffected by unrelated series under the same
+  // name; only an unlabeled/wildcard selector would wrongly match both.
+  const rendered = execFileSync(
+    "helm",
+    [
+      "template",
+      "paperclip",
+      "deploy/helm/paperclip",
+      "--namespace",
+      "paperclip",
+      "-f",
+      "deploy/helm/paperclip/values.blockcast.yaml",
+      "--show-only",
+      "templates/prometheusrule.yaml",
+      "--set",
+      "prometheusRule.enabled=true",
+    ],
+    { cwd: repoRoot, encoding: "utf8" },
+  );
+
+  const [, expr] = rendered.match(
+    /alert: PaperclipPluginStatusCollectorStale[\s\S]*?\n\s+expr: (.+)\n/,
+  ) ?? [];
+  assert.ok(expr, "collector-stale alert must render an expr");
+  assert.doesNotMatch(
+    expr,
+    /paperclip_plugin_status_collector_last_success_timestamp_seconds\s*[)>]/,
+    "the metric selector must not be a bare/unlabeled reference -- a bare gauge is what auto-publishes at 0 on "
+      + "every tier including API, which is exactly the false-fire this alert must not reintroduce",
   );
 });
