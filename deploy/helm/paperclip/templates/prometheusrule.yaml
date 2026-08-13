@@ -521,10 +521,20 @@ spec:
           # re-serving the last-known snapshot forever, hiding both a new
           # error and a recovery. This alert watches the collector's own
           # heartbeat instead of the plugin data it produces. The gauge is
-          # zero-initialized at process start, so a collector that never
-          # succeeds even once pages within pluginStatusCollectorStaleFor
-          # rather than staying silent forever.
-          expr: (time() - paperclip_plugin_status_collector_last_success_timestamp_seconds) > {{ .Values.prometheusRule.pluginStatusCollectorStaleSeconds }}
+          # labeled by a constant role="worker" and only ever .set() by
+          # startPluginStatusCollector itself, right before its first tick --
+          # NOT zero-initialized by ensureRegistry, which runs on every tier.
+          # A bare (zero-label) gauge would auto-publish at 0 the instant
+          # ensureRegistry constructs it, with no .set() call required, so the
+          # label is load-bearing: production scrapes both the `paperclip`
+          # (API) and `paperclip-workers` Services, and the API tier never
+          # starts this collector (app.ts gates plugin lifecycle to
+          # paperclipNodeRole !== "api"), so without the label this series
+          # would render frozen at 0 forever on the API target and
+          # permanently satisfy this expr there. With the label, the series
+          # is simply absent on an API-tier scrape -- `time() - <absent>`
+          # never evaluates -- until the worker tier's first successful tick.
+          expr: (time() - paperclip_plugin_status_collector_last_success_timestamp_seconds{role="worker"}) > {{ .Values.prometheusRule.pluginStatusCollectorStaleSeconds }}
           for: {{ .Values.prometheusRule.pluginStatusCollectorStaleFor }}
           labels:
             severity: warning

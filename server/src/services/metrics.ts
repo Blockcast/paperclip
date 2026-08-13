@@ -424,6 +424,22 @@ export const PLUGIN_ERROR_METRIC = "paperclip_plugin_error";
  * on staleness here catches exactly the case a plain `paperclip_plugin_error
  * == 1` rule cannot: the collector itself is dead, so no plugin is reporting
  * anything, healthy or not.
+ *
+ * Labeled by a constant `role="worker"` even though the value never varies —
+ * NOT for cardinality, but because prom-client auto-publishes a bare
+ * (zero-label) Gauge at value 0 the moment it is constructed, with no `.set()`
+ * call required (confirmed against prom-client 15.1.3). `ensureRegistry` runs
+ * on every tier, including the API tier, which never starts the collector
+ * (`app.ts` gates it to `paperclipNodeRole !== "api"`), so a bare Gauge here
+ * would auto-publish frozen at 0 on every API pod forever -- and since
+ * production scrapes both the `paperclip` and `paperclip-workers` Services,
+ * `time() - 0 > threshold` would be permanently true on the API target
+ * regardless of worker health. A *labeled* Gauge with no `.set()` call
+ * renders no series at all (also confirmed against prom-client 15.1.3), so
+ * this only ever appears once {@link startPluginStatusCollector} sets it --
+ * which happens only on the tier that can ever make it fresh again. An
+ * API-tier scrape of this series is simply absent, and `time() - <absent>`
+ * correctly never evaluates.
  */
 export const PLUGIN_STATUS_COLLECTOR_LAST_SUCCESS_METRIC =
   "paperclip_plugin_status_collector_last_success_timestamp_seconds";
@@ -1068,7 +1084,7 @@ let queuedRunOldestAge: Gauge<"agent_id"> | null = null;
 let overdueScheduledRetryOldestAge: Gauge<"agent_id"> | null = null;
 let overdueScheduledRetryAgeMetricsRefreshSuccess: Gauge | null = null;
 let pluginError: Gauge<"plugin_id" | "plugin_key"> | null = null;
-let pluginStatusCollectorLastSuccess: Gauge | null = null;
+let pluginStatusCollectorLastSuccess: Gauge<"role"> | null = null;
 let authRequest: Counter<"operation" | "outcome"> | null = null;
 let agentHeartbeatAge: Gauge<"agent_id"> | null = null;
 let agentHeartbeatInterval: Gauge<"agent_id"> | null = null;
@@ -1102,7 +1118,7 @@ function ensureRegistry(): {
   overdueScheduledRetryOldestAgeGauge: Gauge<"agent_id">;
   overdueScheduledRetryAgeMetricsRefreshSuccessGauge: Gauge;
   pluginErrorGauge: Gauge<"plugin_id" | "plugin_key">;
-  pluginStatusCollectorLastSuccessGauge: Gauge;
+  pluginStatusCollectorLastSuccessGauge: Gauge<"role">;
   authRequestCounter: Counter<"operation" | "outcome">;
   agentHeartbeatAgeGauge: Gauge<"agent_id">;
   agentHeartbeatIntervalGauge: Gauge<"agent_id">;
@@ -1503,12 +1519,18 @@ function ensureRegistry(): {
         + "rejection -- first tick or any later one -- leaves this unchanged, so "
         + PLUGIN_ERROR_METRIC + " can keep serving a stale or (on a first-tick "
         + "failure) entirely absent snapshot while looking otherwise healthy. "
-        + "Initialized to 0 at registration so 'never succeeded' reads as "
-        + "maximally stale rather than as a missing series. Alert via "
-        + "(time() - this) exceeding several collector intervals.",
+        + "Labeled by a constant role=\"worker\" -- not for cardinality, but "
+        + "because a bare (zero-label) Gauge auto-publishes at value 0 the "
+        + "moment ensureRegistry constructs it, with no .set() call required, "
+        + "which would freeze this series at 0 forever on the API tier (which "
+        + "never starts the collector) and permanently false-fire a "
+        + "(time() - this) alert there. A labeled Gauge renders no series "
+        + "until first .set(), which startPluginStatusCollector does once, "
+        + "itself, immediately before its first tick -- so the series exists "
+        + "(and reads maximally stale) only on the tier that can refresh it.",
+      labelNames: ["role"],
       registers: [registry],
     });
-    pluginStatusCollectorLastSuccess.set(0);
     authRequest = new Counter({
       name: AUTH_REQUEST_METRIC,
       help:
@@ -2167,9 +2189,11 @@ export function setPluginErrorStatus(entries: ReadonlyArray<PluginErrorStatusEnt
  * Record a successful plugin-status collector tick (BLO-21092 review
  * follow-up). Callers pass unix seconds, not milliseconds -- the collector
  * owns the clock so this stays a pure setter and unit-tests deterministically.
+ * The `role="worker"` label is constant (see {@link PLUGIN_STATUS_COLLECTOR_LAST_SUCCESS_METRIC})
+ * -- this is the only caller, and it only ever runs on the worker tier.
  */
 export function setPluginStatusCollectorLastSuccessSeconds(unixSeconds: number): void {
-  ensureRegistry().pluginStatusCollectorLastSuccessGauge.set(unixSeconds);
+  ensureRegistry().pluginStatusCollectorLastSuccessGauge.set({ role: "worker" }, unixSeconds);
 }
 
 export function recordAuthRequest(input: {

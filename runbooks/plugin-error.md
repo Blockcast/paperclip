@@ -71,12 +71,22 @@ kubectl logs -n <namespace> -l app=paperclip,paperclip-node-role=worker --since=
 
 The fix depends entirely on `last_error`:
 
-- **Expired/invalid credential** — rotate it via the plugin's config UI, or
-  `GET /api/plugins/<id>/config` to fetch the current `configJson`, edit the
-  field, and `POST` the **complete** object back to
-  `/api/plugins/<id>/config` (this endpoint replaces the stored config
-  wholesale — it is not a partial patch, so omitting existing keys deletes
-  them), then re-enable.
+- **Expired/invalid credential** — rotate it via the plugin's config UI, or:
+  1. `GET /api/plugins/<id>/config?companyId=<companyId>` — `companyId` is a
+     **required query param** (server returns 400 without it); the response
+     is the config row itself, not a wrapper object, and any secret field
+     reads back as a `__redacted__` sentinel rather than its real value.
+  2. Edit only the field(s) that need to change. Leave `__redacted__` fields
+     alone — the server reinstates each one from the previously-stored value
+     before saving, so re-sending the sentinel does not clobber the secret.
+  3. `POST /api/plugins/<id>/config` with a JSON body shaped exactly
+     `{ "companyId": "<companyId>", "configJson": { ...the edited config } }`.
+     Posting the bare `configJson` value as the top-level body (no
+     `companyId`, no `configJson` wrapper key) returns 400. This call
+     replaces the stored config wholesale — it is not a partial patch, so
+     omitting existing keys deletes them.
+
+  Then re-enable.
 - **Broken manifest / bad deploy** — roll back the plugin package, or fix and
   reinstall.
 - **Unknown / needs investigation** — pull the worker pod logs for the full
