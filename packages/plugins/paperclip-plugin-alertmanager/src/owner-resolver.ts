@@ -6,6 +6,7 @@
  */
 
 import type { PluginContext } from "@paperclipai/plugin-sdk";
+import { isAgentStatusInvokable } from "@paperclipai/shared";
 import {
   ASSIGNEE_OVERRIDE_ANNOTATION,
   ASSIGNEE_OVERRIDE_LABEL,
@@ -169,4 +170,30 @@ export async function resolveAssigneeUserId(
 
 function normalizeEmail(email: string): string {
   return email.trim().toLowerCase();
+}
+
+/**
+ * BLO-26613: mirror of the Dependabot alert path's invokability guard
+ * (server/src/services/dependabot-alert-issues.ts `resolveDependabotIssueAssigneeId`).
+ * A label-override, owner-map, or issue-route resolution can name an agentId
+ * unconditionally; if that agent is paused, terminated, or otherwise
+ * uninvokable, the issue used to be assigned to it anyway, and — unlike an
+ * inert `todo` row — the alert keeps re-firing against a dead run path while
+ * looking handled. Falls back to unassigned so `allow_company_agent` lets any
+ * agent pick it up, and logs distinctly so this backs a fleet-level signal
+ * separate from the per-issue `blocked_by_uninvokable_assignee` escalation.
+ */
+export async function resolveInvokableAssigneeAgentId(
+  ctx: Pick<PluginContext, "agents" | "logger">,
+  companyId: string,
+  agentId: string | undefined,
+): Promise<string | undefined> {
+  if (!agentId) return undefined;
+  const agent = await ctx.agents.get(agentId, companyId);
+  if (agent && isAgentStatusInvokable(agent.status)) return agentId;
+
+  ctx.logger.warn(
+    `alertmanager: resolved assignee ${agentId} is not invokable (status=${agent?.status ?? "not-found"}); filing issue unassigned instead of silently assigning it`,
+  );
+  return undefined;
 }

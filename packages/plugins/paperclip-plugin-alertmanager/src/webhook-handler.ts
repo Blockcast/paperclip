@@ -23,7 +23,10 @@ import {
   severityToPriority,
 } from "./issue-mapping.js";
 import { resolveIssueRoute } from "./issue-route-resolver.js";
-import { resolveAssigneeUserId } from "./owner-resolver.js";
+import {
+  resolveAssigneeUserId,
+  resolveInvokableAssigneeAgentId,
+} from "./owner-resolver.js";
 import { escalationDeadlineMs, recordSourceResolvedAndCloseCovers } from "./escalation.js";
 import { recordCredentialResolution } from "./credential-health.js";
 import {
@@ -299,16 +302,23 @@ export async function handleFiring(
   const routeAssigneeUserId = routeHasAssigneeUserId
     ? nonEmptyString(issueRoute?.assigneeUserId ?? undefined)
     : undefined;
-  const createAssigneeAgentId = ownerOverride
+  const resolvedAssigneeAgentId = ownerOverride
     ? assigneeAgentId
     : routeAssigneeAgentId ?? assigneeAgentId;
-  const createAssigneeUserId = createAssigneeAgentId
+  const createAssigneeUserId = resolvedAssigneeAgentId
     ? undefined
     : ownerOverride
       ? assigneeUserId
       : routeHasAssigneeUserId
         ? routeAssigneeUserId
         : assigneeUserId;
+  // BLO-26613: don't silently hand a new issue to an agent that can't act on
+  // it — see resolveInvokableAssigneeAgentId for why.
+  const createAssigneeAgentId = await resolveInvokableAssigneeAgentId(
+    ctx,
+    companyId,
+    resolvedAssigneeAgentId,
+  );
   const routeProjectId = nonEmptyString(issueRoute?.projectId);
   const routeGoalId = nonEmptyString(issueRoute?.goalId);
   const routeStatus = issueRoute?.status;
