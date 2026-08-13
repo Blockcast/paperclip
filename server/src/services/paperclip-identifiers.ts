@@ -53,12 +53,23 @@ export type PullRequestLinkSource = "branch_ref" | "title_ref" | "body_ref" | "r
  * branch (option (A): the branchTemplate injects the issue ref into the branch
  * name, so a branch match is the strongest, process-enforced signal), then
  * title, then body. Returns null if none of the fields carry it.
+ *
+ * The branch tier MUST use the same case-insensitive, segment-anchored
+ * extractor that decides ownership (BLO-20886). Real branches are lowercase and
+ * PAPERCLIP_IDENTIFIER_PATTERN is uppercase-only, so classifying the branch with
+ * the broad extractor made a lowercase branch-only owner -- `cto/blo-20886-...`,
+ * the shape branchTemplate actually produces -- resolve to nothing here even
+ * though ownership had already accepted it. It then fell through to `body_ref`;
+ * if the body also mentioned a related issue in the same company, both
+ * candidates carried equal strength and insertion order decided which one a
+ * merged PR was persisted against, so the authoritative branch owner could lose
+ * to a bare `Related:` mention.
  */
 export function resolveLinkSourceForIdentifier(
   identifier: string,
   fields: { branch?: string | null; title?: string | null; body?: string | null },
 ): PullRequestLinkSource | null {
-  if (extractPaperclipIdentifiers(fields.branch).includes(identifier)) return "branch_ref";
+  if (extractBranchIdentifiers(fields.branch).includes(identifier)) return "branch_ref";
   if (extractPaperclipIdentifiers(fields.title).includes(identifier)) return "title_ref";
   if (extractPaperclipIdentifiers(fields.body).includes(identifier)) return "body_ref";
   return null;
@@ -112,9 +123,171 @@ const OWNING_REFERENCE_LABEL_PATTERN =
 // OPEN, which fails closed to "no owning reference" -- the safe direction,
 // since the caller then drops the wake or sends it to the reviewer rather than
 // guessing an owner.
-const MARKDOWN_FENCE_PATTERN = /^ {0,3}(?:[-*+]|\d{1,3}[.)])?[ \t]*(`{3,}|~{3,})(.*)$/;
+const MARKDOWN_FENCE_PATTERN = /^( {0,3}(?:[-*+]|\d{1,3}[.)])?[ \t]*)(`{3,}|~{3,})(.*)$/;
+// A CLOSING fence is a strictly narrower grammar than an opening one, and
+// reusing the opener here was a real leak: the opener tolerates a list marker
+// (`- ```) because a fence nested in a list item is ordinary Markdown, but
+// CommonMark gives a closing fence no such latitude -- it admits the marker run
+// and then nothing but whitespace. A line like `- ``` ` sitting inside an open
+// fence is therefore CONTENT, and accepting it as the close reopened the
+// remainder of the block to ownership matching, exposing a following `Refs:`
+// example exactly the way an unfenced one would.
+//
+// Leading whitespace is CAPTURED rather than bounded at three spaces, because
+// the three-space allowance is relative to the fence's CONTAINER, not to column
+// zero. A fence opened inside a nested list item (`  - ```md`) has its content
+// and its closer indented to match that container, so the closer legitimately
+// carries four or more raw spaces. Bounding it at three meant such a fence never
+// closed: the scanner swallowed the rest of the body and suppressed every
+// genuinely visible `Refs:`/`Issue:` line after it, dropping an owning wake that
+// should have been delivered. The caller compares this indent against the
+// opener's own marker column -- see visibleMarkdownLines -- which keeps the
+// closer no more permissive than CommonMark allows for that container.
+const MARKDOWN_FENCE_CLOSE_PATTERN = /^([ \t]*)(`{3,}|~{3,})[ \t]*$/;
 const TRAILING_NON_OWNING_LABEL_PATTERN =
   /(?:[;,][ \t]*|[ \t]+)(?:related|supersedes?|see[ \t]+also)[ \t]*:/i;
+
+/**
+ * Expand `text` to CommonMark columns, where a tab advances to the next
+ * 4-column tab stop. Every non-tab character counts as one column, so this also
+ * measures a prefix that includes a list marker.
+ */
+function expandedColumns(text: string): number {
+  let columns = 0;
+  for (const char of text) columns += char === "\t" ? 4 - (columns % 4) : 1;
+  return columns;
+}
+
+/**
+ * Leading indentation of `line` in CommonMark columns, where a tab advances to
+ * the next 4-column tab stop rather than counting as one character.
+ *
+ * Four columns makes an indented code block, which is why this matters here:
+ * a literal `    ` and a literal `\t` were both already treated as code, but
+ * the mixed forms that expand to the same width -- ` \t`, `  \t`, `   \t` --
+ * were not, so an ownership label inside an indented example stayed eligible
+ * to claim the PR. Counting columns instead of matching two literal prefixes
+ * closes the whole family at once. The full width is returned rather than
+ * stopping at the threshold, because the caller subtracts the enclosing list
+ * container's content column before comparing.
+ */
+function leadingIndentColumns(line: string): number {
+  let columns = 0;
+  for (const char of line) {
+    if (char === " ") columns += 1;
+    else if (char === "\t") columns += 4 - (columns % 4);
+    else break;
+  }
+  return columns;
+}
+
+// A list-item marker, used only to track how far the enclosing container
+// indents its content -- see the closing-fence allowance in
+// visibleMarkdownLines. Requires whitespace after the marker so that a setext
+// underline (`---`) or a `*emphasis*` line is not mistaken for a list.
+const MARKDOWN_LIST_ITEM_PATTERN = /^([ \t]*)([-*+]|\d{1,3}[.)])([ \t]+)/;
+
+/**
+ * Yield the lines of `body` that a human actually SEES rendered: fenced code,
+ * HTML comments, and indented code blocks are removed.
+ *
+ * Shared by both label extractors below. That sharing is the point rather than
+ * incidental tidiness -- the two extractors answer the same question ("does
+ * this body visibly declare an owner?") and any filter present in one but not
+ * the other is a hole in the weaker one. The house-reference tier originally
+ * scanned the raw Markdown, so `Issue: BLO-1` inside a fenced example, an HTML
+ * comment, or an indented block could route an author-directed
+ * "push a follow-up commit" wake to an issue that no reader of the PR would
+ * ever identify as its owner -- this module's founding defect, reached through
+ * the tier that was added last.
+ *
+ * Ambiguity fails CLOSED: an unterminated fence or `<!--` swallows the rest of
+ * the body, yielding no owner rather than a guess. The caller then drops the
+ * wake or sends it to the reviewer, which is the safe direction.
+ */
+function* visibleMarkdownLines(body: string): Generator<string> {
+  let fence: { marker: "`" | "~"; length: number; containerColumn: number } | null = null;
+  let htmlComment = false;
+  // Content columns of the currently-open list items, outermost first. Only
+  // purpose is to bound the closing fence: CommonMark measures a closing
+  // fence's three-space allowance from its CONTAINER, not from column zero.
+  const listContentColumns: number[] = [];
+  for (const line of body.split(/\r?\n/)) {
+    if (fence) {
+      // Fenced content is literal: no comment stripping, no label matching.
+      const closeMatch = line.match(MARKDOWN_FENCE_CLOSE_PATTERN);
+      const closer = closeMatch?.[2];
+      if (
+        closer &&
+        closer[0] === fence.marker &&
+        closer.length >= fence.length &&
+        expandedColumns(closeMatch?.[1] ?? "") <= fence.containerColumn + 3
+      ) {
+        fence = null;
+      }
+      continue;
+    }
+
+    // Indentation is read from the raw line because that is what determines
+    // CommonMark block structure, and checked before the fence so an indented
+    // ``` is code rather than a fence opener.
+    //
+    // Four columns makes an indented code block, but the threshold is measured
+    // from the enclosing CONTAINER rather than from column zero -- the same
+    // relativity the closing fence already honours. A list continuation like
+    // `- item` / ` \tRefs: BLO-1` expands to four raw columns while sitting only
+    // two columns inside the item's content, so measuring absolutely discarded
+    // an ordinary visible paragraph as code and lost the owner it declared.
+    const indent = leadingIndentColumns(line);
+    const indentContainerColumn = listContentColumns.filter((column) => column <= indent).pop() ?? 0;
+    // Indentation only opens a code block in a leaf-block position. Inside an
+    // open HTML comment there is no such position -- the block runs to its
+    // `-->` regardless of indentation -- so the check is suppressed there, and
+    // an indented `-->` still closes the comment.
+    if (!htmlComment && indent - indentContainerColumn >= 4) continue;
+
+    // Comment state is advanced before the fence early-out below, so a
+    // multi-line comment that opens on a skipped fence line still hides its own
+    // body. It is advanced AFTER the indented-code check above, though: `    <!--`
+    // is rendered literally in a code block, and opening a comment from it
+    // swallowed every following visible line up to the next `-->`, suppressing
+    // an owner a reader of the PR can plainly see.
+    const { visible, open } = stripHtmlComments(line, htmlComment);
+    htmlComment = open;
+
+    // Track list containers before reading the fence, so a fence opened on the
+    // same line as its marker (`- ```md`) sees its own item.
+    const listMatch = line.match(MARKDOWN_LIST_ITEM_PATTERN);
+    if (listMatch) {
+      const markerColumn = expandedColumns(listMatch[1] ?? "");
+      while (listContentColumns.length && listContentColumns[listContentColumns.length - 1]! > markerColumn) {
+        listContentColumns.pop();
+      }
+      listContentColumns.push(expandedColumns(`${listMatch[1] ?? ""}${listMatch[2] ?? ""}${listMatch[3] ?? ""}`));
+    } else if (line.trim()) {
+      // A non-blank line dedented past a container ends it. Blank lines do not:
+      // a list item may contain several blocks.
+      while (listContentColumns.length && listContentColumns[listContentColumns.length - 1]! > indent) {
+        listContentColumns.pop();
+      }
+    }
+
+    const fenceMatch = visible.match(MARKDOWN_FENCE_PATTERN);
+    if (fenceMatch?.[2]) {
+      const markerColumn = expandedColumns(fenceMatch[1] ?? "");
+      // The innermost container whose content this fence sits in.
+      const containerColumn = listContentColumns.filter((column) => column <= markerColumn).pop() ?? 0;
+      fence = {
+        marker: fenceMatch[2][0] as "`" | "~",
+        length: fenceMatch[2].length,
+        containerColumn,
+      };
+      continue;
+    }
+
+    yield visible;
+  }
+}
 
 /**
  * Remove HTML-comment spans from one line, carrying `inComment` across lines.
@@ -155,37 +328,8 @@ function stripHtmlComments(line: string, inComment: boolean): { visible: string;
 export function extractOwningLabeledIdentifiers(body: string | null | undefined): string[] {
   if (!body) return [];
   const found = new Set<string>();
-  let fence: { marker: "`" | "~"; length: number } | null = null;
-  let htmlComment = false;
-  for (const line of body.split(/\r?\n/)) {
-    if (fence) {
-      const closeMatch = line.match(MARKDOWN_FENCE_PATTERN);
-      const closer = closeMatch?.[1];
-      if (
-        closer &&
-        closer[0] === fence.marker &&
-        closer.length >= fence.length &&
-        (closeMatch?.[2] ?? "").trim() === ""
-      ) {
-        fence = null;
-      }
-      continue;
-    }
-
-    // Comments are stripped before anything else looks at the line, so a fence
-    // marker or a `Refs:` label that exists only inside a comment is invisible
-    // here exactly as it is on the rendered PR.
-    const { visible, open } = stripHtmlComments(line, htmlComment);
-    htmlComment = open;
-
-    const fenceMatch = visible.match(MARKDOWN_FENCE_PATTERN);
-    if (fenceMatch?.[1]) {
-      fence = { marker: fenceMatch[1][0] as "`" | "~", length: fenceMatch[1].length };
-      continue;
-    }
-    if (line.startsWith("\t") || line.startsWith("    ")) continue;
-
-    const match = visible.match(OWNING_REFERENCE_LABEL_PATTERN);
+  for (const line of visibleMarkdownLines(body)) {
+    const match = line.match(OWNING_REFERENCE_LABEL_PATTERN);
     const rest = match?.[1]?.split(TRAILING_NON_OWNING_LABEL_PATTERN, 1)[0];
     if (!rest) continue;
     for (const identifier of extractPaperclipIdentifiers(rest)) found.add(identifier);
@@ -224,8 +368,11 @@ export function extractOwningLabeledIdentifiers(body: string | null | undefined)
 // claimed ownership. Requiring the colon keeps this tier fail-closed on
 // prose while still matching every observed house-label shape, all of which
 // use a colon.
+// Matched per visible line (see visibleMarkdownLines), not against the raw
+// body: a house label inside a fenced example, an HTML comment, or an indented
+// code block declares nothing a reader can see, and must not claim ownership.
 const HOUSE_REFERENCE_LABEL_PATTERN =
-  /^[ \t]*(?:[-*+]|\d{1,3}[.)])?[ \t]*(?:paperclip[ \t]+qa[ \t]+task|paperclip[ \t]+task|paperclip[ \t]+issue|issue)[ \t]*:[ \t]+(.+)$/gim;
+  /^[ \t]*(?:[-*+]|\d{1,3}[.)])?[ \t]*(?:paperclip[ \t]+qa[ \t]+task|paperclip[ \t]+task|paperclip[ \t]+issue|issue)[ \t]*:[ \t]+(.+)$/i;
 
 // BLO-21312: a house-reference line can still carry a second, distinctly
 // labeled reference later on the SAME line -- `Issue: BLO-1; Related:
@@ -246,9 +393,8 @@ function stripTrailingLabelReference(text: string): string {
 export function extractHouseReferenceLabeledIdentifiers(body: string | null | undefined): string[] {
   if (!body) return [];
   const found = new Set<string>();
-  HOUSE_REFERENCE_LABEL_PATTERN.lastIndex = 0;
-  for (const match of body.matchAll(HOUSE_REFERENCE_LABEL_PATTERN)) {
-    const rest = match[1];
+  for (const line of visibleMarkdownLines(body)) {
+    const rest = line.match(HOUSE_REFERENCE_LABEL_PATTERN)?.[1];
     if (!rest) continue;
     const directValue = stripTrailingLabelReference(rest);
     if (!directValue) continue;
@@ -256,6 +402,82 @@ export function extractHouseReferenceLabeledIdentifiers(body: string | null | un
   }
   return Array.from(found);
 }
+
+/**
+ * Identifiers carried by a BRANCH name, matched case-insensitively but only at
+ * a path-segment boundary (branch start, or immediately after a `/`).
+ *
+ * Case-insensitivity is what makes the branch tier work at all: real branches
+ * are lowercase (`sre/blo-20886-...`) and PAPERCLIP_IDENTIFIER_PATTERN is
+ * uppercase-only. But uppercasing a whole branch and running the general
+ * pattern over it also MANUFACTURES identifiers out of ordinary branch words
+ * that happen to be followed by a number -- measured over the 200 most
+ * recently-updated PRs in this repo, that produced `UNDICI-7` from
+ * `blo-21612-undici-7.29.0`, `URI-3` from `fast-uri-3.1.5`, `ADDRESS-10` from
+ * `ip-address-10.3.1`, `PR-870`, `FOLD-977` and `EXPANSION-5`. A dependency
+ * bump's version number is not an ownership claim, and treating one as an
+ * owner hands an author-directed "push a follow-up commit" wake to whoever is
+ * assigned the same-named issue -- the exact misroute this module exists to
+ * prevent, arrived at from the branch tier instead of the body.
+ *
+ * Anchoring to a segment boundary discriminates cleanly because the ref is
+ * placed there by branchTemplate: `sre/blo-20886-...`, `kkroo/blo-19132-...`,
+ * `blo-21610-...`. Over those same 200 branches the anchored rule agrees with
+ * the unanchored one on 192, and on the 8 where they differ it drops ONLY the
+ * spurious identifier while keeping the real `BLO-` one -- 0 real refs lost,
+ * 0 gained.
+ */
+export function extractBranchIdentifiers(branch: string | null | undefined): string[] {
+  if (!branch) return [];
+  if (DEPENDENCY_BOT_BRANCH_PATTERN.test(branch)) return [];
+  const found = new Set<string>();
+  for (const match of branch.matchAll(BRANCH_IDENTIFIER_PATTERN)) {
+    const token = match[1];
+    if (!token) continue;
+    for (const identifier of expandPaperclipIdentifierToken(token.toUpperCase())) {
+      found.add(identifier);
+    }
+  }
+  return Array.from(found);
+}
+
+// A dependency bot names its branch after the PACKAGE it is bumping, never
+// after an issue, so nothing in one is an ownership claim. Skipping the two
+// reserved namespaces is exact rather than heuristic -- only the tools that own
+// these prefixes generate them.
+//
+// This is NOT redundant with the version guard below, and measurement is what
+// settles it: the guard can only reject a candidate whose digits continue into
+// a version, and the real branch shapes include plenty that carry no version
+// suffix at all. `renovate/node-20` yields `NODE-20` and
+// `dependabot/npm_and_yarn/undici-7` yields `UNDICI-7` with nothing for a
+// version guard to catch. Since ownership consults the branch when title and
+// labeled body are silent -- and a dependency-bump PR is silent in both -- that
+// manufactured token would be the SOLE owner of the PR.
+const DEPENDENCY_BOT_BRANCH_PATTERN = /^(?:dependabot|renovate)\//i;
+
+// The trailing `(?!\.\w)` rejects a VERSION CONTINUATION, and it is what makes
+// the segment anchor above actually hold. The anchor alone only helps when the
+// package name sits mid-segment (`blo-21612-undici-7.29.0`); it does nothing
+// when the package name STARTS a segment, which is exactly the shape Dependabot
+// emits: `dependabot/npm_and_yarn/undici-7.29.0` puts `undici` right after a
+// `/`, so `undici-7` clears the anchor and `\b` is satisfied by the following
+// `.`. Measured on the real branch shapes, that manufactured `UNDICI-7`,
+// `NODE-20` (`dependabot/npm_and_yarn/types/node-20.11.5`) and `CHECKOUT-4`
+// (`dependabot/github_actions/actions/checkout-4.2.0`).
+//
+// The guard rejects a dot followed by any word character, not just a digit.
+// `\d` alone left WILDCARD versions live -- `renovate/node-20.x` resolved
+// `NODE-20`, and a dependency update is exactly the kind of PR whose title and
+// body name no issue, so it would have owned whatever issue shares that name.
+// A dot never appears inside a real ref: conventional branches continue with
+// `-` (`blo-20886-round5`), `/` (`blo-20886/2`) or end (`sre/blo-20886`), so
+// none of them loses its ref here.
+//
+// The guard still earns its place alongside the namespace skip above, because
+// the same package-version shape occurs OUTSIDE those namespaces -- a hand-cut
+// `bump-undici-7.29.0`, or a fork whose automation uses a different prefix.
+const BRANCH_IDENTIFIER_PATTERN = /(?:^|\/)([A-Za-z][A-Za-z0-9]{1,9}-\d{1,6}(?:\/\d{1,6})*)\b(?!\.\w)/g;
 
 export interface OwningIdentifierResolution {
   // The PR's authoritative issue identifier(s) -- empty when none was found.
@@ -330,10 +552,11 @@ export function resolveOwningPaperclipIdentifiers(fields: {
   const tiers = [
     extractPaperclipIdentifiers(fields.title),
     extractOwningLabeledIdentifiers(fields.body),
-    // Uppercased so a conventional lowercase branch (`sre/blo-20886-fix`)
-    // matches the uppercase-only identifier pattern. Safe to normalize here
-    // because a branch ref carries no prose that case could disambiguate.
-    extractPaperclipIdentifiers(fields.branch?.toUpperCase()),
+    // Matched case-insensitively but only at a path-segment boundary, so a
+    // conventional lowercase branch (`sre/blo-20886-fix`) resolves while a
+    // version number or stray word-plus-digit (`...-undici-7.29.0`) does not
+    // manufacture a spurious owner. See extractBranchIdentifiers.
+    extractBranchIdentifiers(fields.branch),
     extractHouseReferenceLabeledIdentifiers(fields.body),
   ];
   for (const tier of tiers) {
