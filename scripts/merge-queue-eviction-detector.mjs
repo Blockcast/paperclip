@@ -146,6 +146,18 @@ export function buildRunSearchWindow({ enqueuedAt, dequeuedAt }, bufferMs = WIND
 }
 
 /**
+ * Deliberately takes no `mergeable`/`mergeStateStatus` input. On a `REBASE`
+ * merge queue (this repo's configuration: `mergeMethod: REBASE`), a PR can
+ * read `mergeable: CLEAN` throughout an eviction -- the final tree merges
+ * fine -- while one of its individual commits fails to *replay* onto a
+ * `master` that has moved on, which is exactly what evicts it. Classifying
+ * from `merge_group` run count sidesteps that trap entirely: a `REBASE`-
+ * unstageable eviction produces zero runs, same as a plain-conflict
+ * eviction, so both correctly resolve to `conflict_unstageable` without
+ * this function ever needing to know which one occurred. See
+ * runbooks/merge-queue-stalled-head.md ("A fourth eviction cause...",
+ * BLO-19566/#920) before adding a `mergeable`-based check here.
+ *
  * @param {{
  *   merged: boolean,
  *   mergeGroupRuns: Array<{ conclusion: string | null }>,

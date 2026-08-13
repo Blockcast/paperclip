@@ -123,6 +123,64 @@ recognizes that marker (from the `github-actions[bot]` login only — see
 directly rather than needing a human to notice a GitHub-side artifact. This
 closes the gap for an agent-authored PR, which has no human watching it.
 
+### A fourth eviction cause the detector already gets right, but a human probe won't: `REBASE`-unstageable history
+
+Source: CTO's evidence comment on
+[BLO-23395](/BLO/issues/BLO-23395), reproduced twice (98s apart) on
+[Blockcast/paperclip#920](https://github.com/Blockcast/paperclip/pull/920).
+This repo's merge queue configuration is
+`mergeMethod: REBASE, mergingStrategy: ALLGREEN` — confirmed live via
+`gh api graphql -f query='{ repository(owner:"Blockcast", name:"paperclip") {
+mergeQueue(branch:"master") { configuration { mergeMethod mergingStrategy } } } }'`.
+Under `REBASE`, the queue replays each of the PR's original commits onto the
+current base individually, rather than testing the merge of the final tree.
+A branch that has absorbed several `merge master into branch` commits (the
+standard remedy for "stay mergeable" advice) can have a **byte-identical,
+conflict-free final tree** while one of its individual commits — one authored
+against an older `master` — fails to replay cleanly onto today's `master`.
+
+**This is why `mergeable`/`mergeStateStatus` cannot be trusted as the probe
+for this eviction cause under a `REBASE` queue**: both read `CLEAN` before,
+during, and after the eviction in the #920 case (18/18 checks green, no
+`reviewDecision` block, `git merge-tree` against `origin/master` clean) — the
+PR *merges* fine, it just cannot be *rebased* commit-by-commit. The natural
+instinct — "the PR looks clean, this must be something else" — is wrong here
+specifically because `REBASE` is not `MERGE`; the failure mode does not exist
+under `mergeMethod: MERGE`.
+
+**The detector above is unaffected by this trap.** `classifyMergeQueueEviction`
+(`scripts/merge-queue-eviction-detector.mjs`) never reads `mergeable` or
+`mergeStateStatus` — it classifies purely from `merge_group` run count for
+the queue attempt's window, and a `REBASE`-unstageable eviction produces
+**zero** `merge_group` runs exactly like the plain-conflict shape above, so
+it already resolves to `conflict_unstageable` correctly. The risk is not in
+this detector; it is in a human (or an agent) manually diagnosing an eviction
+by checking `mergeable` first, the way the two-shape framing at the top of
+this doc might suggest, and concluding "clean, so it's not that."
+
+**The standard remedy is self-inflicted under `REBASE`.** "Merge `master`
+into your branch to stay mergeable" is correct advice under `mergeMethod:
+MERGE` and actively counterproductive under `mergeMethod: REBASE` — each
+absorbed merge commit is itself a commit the queue will later try to replay,
+and a merge commit's diff against its own first parent frequently touches
+files (lockfiles, generated journals, migration manifests) that a later
+`master` has since changed again. Prefer `git rebase origin/master` over
+`git merge origin/master` to keep a branch mergeable on a `REBASE` queue; if
+the branch already carries merge commits, a cheap structural precondition
+check is:
+
+```
+git rev-list --min-parents=2 --count origin/master..<head>
+```
+
+A nonzero count on a `REBASE` queue is a leading indicator of this risk, not
+a confirmed conflict — confirm with a throwaway rebase before concluding
+anything is actually unstageable:
+
+```
+git rebase --onto origin/master origin/master <head>   # in a throwaway worktree; abort after
+```
+
 **Manual diagnosis**, if you need to confirm or replay a specific eviction by
 hand — this is exactly what the detector automates:
 
