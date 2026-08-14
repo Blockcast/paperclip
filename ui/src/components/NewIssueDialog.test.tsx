@@ -1289,9 +1289,12 @@ describe("NewIssueDialog", () => {
     // The watchdog row is hidden until the menu item is toggled on.
     expect(container.querySelector('textarea[placeholder^="What should the watchdog"]')).toBeNull();
 
-    const watchdogMenuItem = Array.from(container.querySelectorAll("button"))
-      .find((button) => button.textContent?.trim() === "Watchdog");
-    expect(watchdogMenuItem).not.toBeUndefined();
+    let watchdogMenuItem: HTMLButtonElement | undefined;
+    await waitForAssertion(() => {
+      watchdogMenuItem = Array.from(container.querySelectorAll("button"))
+        .find((button) => button.textContent?.trim() === "Watchdog");
+      expect(watchdogMenuItem).not.toBeUndefined();
+    });
 
     await act(async () => {
       watchdogMenuItem!.dispatchEvent(new MouseEvent("click", { bubbles: true }));

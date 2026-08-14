@@ -23,6 +23,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { cleanupHeartbeatTestState } from "./helpers/cleanup-heartbeat-test-state.js";
 import { registerServerAdapter, runningProcesses, unregisterServerAdapter } from "../adapters/index.ts";
+import { subscribeCompanyLiveEvents } from "../services/live-events.js";
 import {
   BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS,
   CAPACITY_BLOCKED_HEARTBEAT_RETRY_MAX_ATTEMPTS,
@@ -38,6 +39,10 @@ import {
   SESSION_UNAVAILABLE_HEARTBEAT_RETRY_MAX_ATTEMPTS,
   shouldScheduleAutomaticRunRetry,
 } from "../services/heartbeat.js";
+import {
+  MAX_TRANSIENT_RETRY_HORIZON_MS,
+  TRANSIENT_HORIZON_CLAMP_MIN_ATTEMPTS,
+} from "../services/ccrotate-capacity-retry.js";
 
 const mockAdapterExecute = vi.hoisted(() =>
   vi.fn(async () => ({
@@ -72,7 +77,7 @@ vi.mock("../adapters/index.ts", async () => {
   return {
     ...actual,
     getServerAdapter: vi.fn((type: string) =>
-      type === "provider_quota_test"
+      type === "provider_quota_test" || type === "zero_turn_transient_test"
         ? actual.getServerAdapter(type)
         : {
             supportsLocalAgentJwt: false,
@@ -85,6 +90,11 @@ vi.mock("../adapters/index.ts", async () => {
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 const PROVIDER_QUOTA_TEST_ADAPTER = "provider_quota_test";
+// BLO-24166: an adapter that fails the way the 2026-08-08 streak did — a
+// transient upstream error that burned a whole run without producing a single
+// model token. Drives the real executeRun finalizer so the slot-release
+// ordering is observed on the production path, not hand-arranged by the test.
+const ZERO_TURN_TRANSIENT_ADAPTER = "zero_turn_transient_test";
 
 if (!embeddedPostgresSupport.supported) {
   console.warn(
@@ -138,6 +148,32 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         testedAt: new Date().toISOString(),
       }),
     });
+    registerServerAdapter({
+      type: ZERO_TURN_TRANSIENT_ADAPTER,
+      execute: async () => ({
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+        errorMessage: "upstream connection reset",
+        errorCode: "adapter_failed",
+        errorFamily: "transient_upstream",
+        summary: "failed",
+        // Zero model turns: the run held a slot and produced nothing.
+        usage: { inputTokens: 0, outputTokens: 0 },
+        resultJson: {
+          errorFamily: "transient_upstream",
+          usage: { inputTokens: 0, outputTokens: 0 },
+        },
+        provider: "test",
+        model: "test-model",
+      }),
+      testEnvironment: async () => ({
+        adapterType: ZERO_TURN_TRANSIENT_ADAPTER,
+        status: "pass",
+        checks: [],
+        testedAt: new Date().toISOString(),
+      }),
+    });
   }, 60_000);
 
   afterEach(async () => {
@@ -158,6 +194,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
 
   afterAll(async () => {
     unregisterServerAdapter(PROVIDER_QUOTA_TEST_ADAPTER);
+    unregisterServerAdapter(ZERO_TURN_TRANSIENT_ADAPTER);
     await tempDb?.cleanup();
   });
 
@@ -766,11 +803,297 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect(duePromotion).toEqual({ promoted: 1, runIds: [scheduled.run.id] });
 
     const promotedRun = await db
-      .select({ status: heartbeatRuns.status })
+      .select({ status: heartbeatRuns.status, queuedAt: heartbeatRuns.queuedAt, createdAt: heartbeatRuns.createdAt })
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, scheduled.run.id))
       .then((rows) => rows[0] ?? null);
     expect(promotedRun?.status).toBe("queued");
+    // BLO-21116 (Ally review, onprem-k8s#2013): promotion out of
+    // scheduled_retry must reset the queued-age clock to the promotion
+    // instant, not leave the gauge reading this row's original createdAt --
+    // otherwise the queued-run-age gauge reports this run's full retry
+    // backoff as dispatch-queue wait the moment it is promoted. (createdAt
+    // itself isn't compared here: this test's synthetic clock predates the
+    // sandbox's real wall clock, and the retry row's createdAt defaults to
+    // the latter at insert time -- an artifact of the test harness, not of
+    // the promotion logic under test.)
+    expect(promotedRun?.queuedAt?.toISOString()).toBe(expectedDueAt.toISOString());
+  });
+
+  // BLO-24166 (split from BLO-23699 AC3): a provider blip on 2026-08-08 burned
+  // 606 zero-model-turn runs on one agent, and the open question was whether
+  // each one kept holding its concurrency slot across its whole retry chain —
+  // which would convert a short upstream outage directly into hours of queue
+  // latency for unrelated work on that agent.
+  //
+  // It does not, and this test pins the two independent reasons so a refactor
+  // cannot silently reintroduce the double-count:
+  //
+  //   1. Ordering — the terminal compare-and-swap (`setRunStatusIfRunning`,
+  //      heartbeat.ts, which moves the row out of `running` and stamps
+  //      `finishedAt` in one UPDATE) runs BEFORE `scheduleBoundedRetryForRun`
+  //      on both finalize paths.
+  //   2. Structure — a retry row is inserted `scheduled_retry` and promoted to
+  //      `queued`, while a slot is counted ONLY for `status = 'running'`
+  //      (`countRunningRunsForAgent` / `listRunningRunsForAgent`). A retry
+  //      therefore holds no slot at any point before it wins one itself.
+  //
+  // Reason 2 is the load-bearing one: it holds even if reason 1 is violated,
+  // so the second half of this test deliberately enqueues a retry while the
+  // parent is still `running` and asserts the slot count still does not grow.
+  it("BLO-24166: a zero-model-turn liveness failure releases its concurrency slot before its retry is enqueued", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const failedRunId = randomUUID();
+    const now = new Date("2026-08-08T11:11:09.000Z");
+
+    const countSlotHoldingRuns = () =>
+      db
+        .select({ count: sql<number>`count(*)::int` })
+        .from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "running")))
+        .then((rows) => rows[0]?.count ?? 0);
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "PlatformSREEngineer",
+      role: "engineer",
+      status: "active",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {
+        heartbeat: {
+          wakeOnDemand: true,
+          maxConcurrentRuns: 3,
+          concurrencyEnabled: true,
+        },
+      },
+      permissions: {},
+    });
+
+    // The run as it looked while executing: occupying a slot, and — the case
+    // under test — having produced not a single model token.
+    await db.insert(heartbeatRuns).values({
+      id: failedRunId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "running",
+      startedAt: now,
+      usageJson: { inputTokens: 0, outputTokens: 0 },
+      contextSnapshot: {
+        issueId: randomUUID(),
+        wakeReason: "issue_assigned",
+      },
+      updatedAt: now,
+      createdAt: now,
+    });
+
+    expect(await countSlotHoldingRuns()).toBe(1);
+
+    // Production finalize order: terminal first, retry second.
+    await db
+      .update(heartbeatRuns)
+      .set({
+        status: "failed",
+        error: "upstream connection reset",
+        errorCode: "claude_transient_upstream",
+        finishedAt: now,
+        livenessState: "failed",
+        livenessReason: "Run ended with failed (claude_transient_upstream)",
+        updatedAt: now,
+      })
+      .where(and(eq(heartbeatRuns.id, failedRunId), eq(heartbeatRuns.status, "running")));
+
+    // The slot is already free at this point — before any retry exists.
+    expect(await countSlotHoldingRuns()).toBe(0);
+
+    const scheduled = await heartbeat.scheduleBoundedRetry(failedRunId, {
+      now,
+      random: () => 0.5,
+    });
+    expect(scheduled.outcome).toBe("scheduled");
+    if (scheduled.outcome !== "scheduled") return;
+
+    const retryRun = await db
+      .select({ status: heartbeatRuns.status, retryOfRunId: heartbeatRuns.retryOfRunId })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, scheduled.run.id))
+      .then((rows) => rows[0] ?? null);
+
+    // The retry is parked, not running: enqueuing it allocates no slot, so the
+    // agent's full concurrency is available to unrelated work immediately.
+    expect(retryRun).toMatchObject({ status: "scheduled_retry", retryOfRunId: failedRunId });
+    expect(await countSlotHoldingRuns()).toBe(0);
+
+    // Promotion moves it to `queued` — still not a slot. It must win one
+    // through the ordinary dispatch gate like any other queued run.
+    const promotion = await heartbeat.promoteDueScheduledRetries(
+      new Date(now.getTime() + BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS[0]),
+    );
+    expect(promotion).toEqual({ promoted: 1, runIds: [scheduled.run.id] });
+    expect(await countSlotHoldingRuns()).toBe(0);
+
+    // Structural guarantee, independent of ordering: even when a retry is
+    // enqueued against a parent that is STILL `running`, the retry does not
+    // add a slot-holding row. Only the parent's own single slot is counted.
+    const stillRunningId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: stillRunningId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "running",
+      startedAt: now,
+      usageJson: { inputTokens: 0, outputTokens: 0 },
+      contextSnapshot: {
+        issueId: randomUUID(),
+        wakeReason: "issue_assigned",
+      },
+      updatedAt: now,
+      createdAt: now,
+    });
+    expect(await countSlotHoldingRuns()).toBe(1);
+
+    const racedRetry = await heartbeat.scheduleBoundedRetry(stillRunningId, {
+      now,
+      random: () => 0.5,
+    });
+    expect(racedRetry.outcome).toBe("scheduled");
+    if (racedRetry.outcome !== "scheduled") return;
+
+    expect(await countSlotHoldingRuns()).toBe(1);
+  });
+
+  it("BLO-24166: the real zero-model-turn failure path leaves the parent terminal at the moment its retry row is inserted", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+
+    // The test above hand-performs the terminal transition, so it pins the
+    // structural guarantee (a retry row is never `running`) but CANNOT catch a
+    // regression that moves retry scheduling ahead of `setRunStatusIfRunning`
+    // in executeRun — it would observe the pre-arranged terminal row and pass.
+    // This one drives the genuine failure through the production finalizer and
+    // observes the ordering from inside the retry INSERT itself, via an AFTER
+    // INSERT trigger that records the parent's status at that instant. That is
+    // the invariant stated in the issue title, asserted causally rather than by
+    // comparing timestamps written by two different clocks.
+    await db.execute(sql`
+      create table if not exists blo24166_retry_insert_observations (
+        retry_run_id uuid primary key,
+        parent_run_id uuid not null,
+        parent_status text not null,
+        retry_status text not null
+      )
+    `);
+    await db.execute(sql`
+      create or replace function blo24166_observe_retry_insert() returns trigger as $$
+      begin
+        insert into blo24166_retry_insert_observations
+          (retry_run_id, parent_run_id, parent_status, retry_status)
+        select new.id, new.retry_of_run_id, parent.status, new.status
+        from heartbeat_runs parent
+        where parent.id = new.retry_of_run_id
+        on conflict (retry_run_id) do nothing;
+        return null;
+      end;
+      $$ language plpgsql
+    `);
+    // `retry_of_run_id <> id` excludes the in-place process_lost retry, which
+    // points at its own row and is not a parent/child pair at all.
+    await db.execute(sql`
+      create or replace trigger blo24166_observe_retry_insert
+      after insert on heartbeat_runs
+      for each row when (new.retry_of_run_id is not null and new.retry_of_run_id <> new.id)
+      execute function blo24166_observe_retry_insert()
+    `);
+
+    try {
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+        defaultResponsibleUserId: "responsible-user",
+      });
+
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: "PlatformSREEngineer",
+        role: "engineer",
+        status: "idle",
+        adapterType: ZERO_TURN_TRANSIENT_ADAPTER,
+        adapterConfig: {},
+        runtimeConfig: {
+          heartbeat: {
+            wakeOnDemand: true,
+            maxConcurrentRuns: 3,
+            concurrencyEnabled: true,
+          },
+        },
+        permissions: {},
+      });
+
+      const run = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
+      expect(run).not.toBeNull();
+
+      const failedRun = await waitForRunToFinish(heartbeat, run!.id);
+      expect(failedRun?.status).toBe("failed");
+      // The case under test: a full run consumed, not one model token produced.
+      const usage = (failedRun?.usageJson as Record<string, unknown> | null) ?? {};
+      expect(Number(usage.outputTokens ?? 0)).toBe(0);
+
+      await expect
+        .poll(
+          () =>
+            db
+              .select({ id: heartbeatRuns.id })
+              .from(heartbeatRuns)
+              .where(eq(heartbeatRuns.retryOfRunId, run!.id))
+              .then((rows) => rows.length),
+          { timeout: 10_000, interval: 50 },
+        )
+        .toBe(1);
+
+      const observations = await db
+        .execute(
+          sql`select parent_run_id, parent_status, retry_status
+              from blo24166_retry_insert_observations
+              where parent_run_id = ${run!.id}`,
+        )
+        .then((result) => (result as unknown as { rows?: Record<string, unknown>[] }).rows ?? result);
+
+      const rows = observations as Record<string, unknown>[];
+      expect(rows).toHaveLength(1);
+      // The assertion that the hand-arranged test cannot make: when the retry
+      // row came into existence, the parent had ALREADY left `running`, so its
+      // slot was free. Reordering executeRun to schedule the retry before
+      // setRunStatusIfRunning turns this into "running" and fails the test.
+      expect(rows[0].parent_status).not.toBe("running");
+      expect(rows[0].parent_status).toBe("failed");
+      expect(rows[0].retry_status).toBe("scheduled_retry");
+
+      const slotHolders = await db
+        .select({ count: sql<number>`count(*)::int` })
+        .from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "running")))
+        .then((r) => r[0]?.count ?? 0);
+      expect(slotHolders).toBe(0);
+    } finally {
+      await db.execute(sql`drop trigger if exists blo24166_observe_retry_insert on heartbeat_runs`);
+      await db.execute(sql`drop function if exists blo24166_observe_retry_insert()`);
+      await db.execute(sql`drop table if exists blo24166_retry_insert_observations`);
+    }
   });
 
   it("treats idempotent GitHub PR-review adapter failures as retry-eligible", () => {
@@ -1154,6 +1477,192 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       .where(eq(agents.id, agentId))
       .then((rows) => rows[0] ?? null);
     expect(agent?.id).toBe(agentId);
+  });
+
+  // BLO-21605: the workspace-quarantine branch of `scheduleBoundedRetry` used
+  // to fire `logActivity` from inside its `db.transaction` callback, so a
+  // consumer could receive `activity.logged` before the workspace's
+  // `archived` status committed, and a rolled-back transaction still emitted
+  // an event for a quarantine that never took effect.
+  async function seedQuarantineFixture(workspaceId: string, workspaceName: string) {
+    const { companyId, agentId, issueId, runId, now } = await seedMaxTurnFixture({ issueStatus: "in_review" });
+    const projectId = randomUUID();
+    const validation = {
+      reason: "git_worktree_branch_incoherence",
+      fingerprint: `workspace_incoherence:v1:sha256:${workspaceName}`,
+      executionWorkspaceId: workspaceId,
+      expectedBranch: workspaceName,
+      actualBranch: "feat/skill-studio-test-runs",
+      cleanliness: "clean" as const,
+    };
+
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Paperclip App",
+      status: "in_progress",
+    });
+    await db.insert(executionWorkspaces).values({
+      id: workspaceId,
+      companyId,
+      projectId,
+      sourceIssueId: issueId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: workspaceName,
+      status: "active",
+      cwd: `/workspace/${workspaceName}`,
+      baseRef: "origin/master",
+      branchName: workspaceName,
+      providerType: "git_worktree",
+      providerRef: `/workspace/${workspaceName}`,
+      metadata: { existing: true },
+    });
+    await db
+      .update(issues)
+      .set({
+        projectId,
+        executionWorkspaceId: workspaceId,
+        executionWorkspacePreference: "reuse_existing",
+        executionWorkspaceSettings: { mode: "isolated_workspace" },
+      })
+      .where(eq(issues.id, issueId));
+
+    const interactionId = randomUUID();
+    await db
+      .update(heartbeatRuns)
+      .set({
+        error: "workspace validation failed before dispatch",
+        errorCode: "workspace_validation_failed",
+        resultJson: { workspaceValidation: validation },
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "issue_commented",
+          mutation: "interaction",
+          interactionId,
+          interactionKind: "request_confirmation",
+          interactionStatus: "accepted",
+        },
+      })
+      .where(eq(heartbeatRuns.id, runId));
+
+    return { companyId, agentId, issueId, runId, now };
+  }
+
+  // Subscribes to `activity.logged` for the given action and, at the moment
+  // each event fires, kicks off a `snapshot()` read on a connection outside
+  // the transaction that logged it. Whether that read observes the committed
+  // effect is what distinguishes "published after commit" from "published
+  // from inside the transaction".
+  function captureActivityEvents<T>(companyId: string, action: string, snapshot: () => Promise<T>) {
+    const seen: { valueAtPublish: Promise<T> }[] = [];
+    const unsubscribe = subscribeCompanyLiveEvents(companyId, (event) => {
+      if (event.type !== "activity.logged") return;
+      const payload = event.payload as Record<string, unknown>;
+      if (payload.action !== action) return;
+      seen.push({ valueAtPublish: snapshot() });
+    });
+    return { seen, stop: unsubscribe };
+  }
+
+  it("emits no activity.logged event when the workspace-quarantine transaction fails to commit", async () => {
+    const workspaceId = randomUUID();
+    const { companyId, runId, now } = await seedQuarantineFixture(workspaceId, "rollback-workspace");
+
+    // Runs the real transaction -- workspace archival and the activity_log
+    // insert both succeed -- then aborts it, standing in for a commit-time
+    // failure.
+    const rollbackDb = new Proxy(db, {
+      get(target, property, receiver) {
+        if (property === "transaction") {
+          return (callback: (tx: unknown) => Promise<unknown>, ...rest: unknown[]) =>
+            (target.transaction as unknown as (
+              cb: (tx: unknown) => Promise<unknown>,
+              ...args: unknown[]
+            ) => Promise<unknown>)(async (tx) => {
+              await callback(tx);
+              throw new Error("simulated commit failure after insert");
+            }, ...rest);
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    }) as typeof db;
+    const rollbackHeartbeat = heartbeatService(rollbackDb);
+
+    const events = captureActivityEvents(
+      companyId,
+      "execution_workspace.workspace_validation_quarantined",
+      () => db
+        .select({ status: executionWorkspaces.status })
+        .from(executionWorkspaces)
+        .where(eq(executionWorkspaces.id, workspaceId))
+        .then((rows) => rows[0]?.status ?? null),
+    );
+    try {
+      await expect(rollbackHeartbeat.scheduleBoundedRetry(runId, {
+        now,
+        random: () => 0.5,
+        retryReason: INTERACTION_CONTINUATION_INFRA_RETRY_REASON,
+        wakeReason: INTERACTION_CONTINUATION_INFRA_WAKE_REASON,
+        maxAttempts: 3,
+      })).rejects.toBeDefined();
+    } finally {
+      events.stop();
+    }
+
+    expect(
+      events.seen,
+      "a rolled-back quarantine must not publish a phantom activity event",
+    ).toHaveLength(0);
+    const workspace = await db
+      .select({ status: executionWorkspaces.status })
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, workspaceId))
+      .then((rows) => rows[0] ?? null);
+    expect(workspace?.status).toBe("active");
+    const activity = await db
+      .select({ id: activityLog.id })
+      .from(activityLog)
+      .where(eq(activityLog.entityId, workspaceId));
+    expect(activity).toHaveLength(0);
+  });
+
+  it("publishes execution_workspace.workspace_validation_quarantined only once the archived status is visible", async () => {
+    const workspaceId = randomUUID();
+    const { companyId, runId, now } = await seedQuarantineFixture(workspaceId, "visible-workspace");
+
+    const events = captureActivityEvents(
+      companyId,
+      "execution_workspace.workspace_validation_quarantined",
+      () => db
+        .select({ status: executionWorkspaces.status })
+        .from(executionWorkspaces)
+        .where(eq(executionWorkspaces.id, workspaceId))
+        .then((rows) => rows[0]?.status ?? null),
+    );
+    try {
+      const scheduled = await heartbeat.scheduleBoundedRetry(runId, {
+        now,
+        random: () => 0.5,
+        retryReason: INTERACTION_CONTINUATION_INFRA_RETRY_REASON,
+        wakeReason: INTERACTION_CONTINUATION_INFRA_WAKE_REASON,
+        maxAttempts: 3,
+      });
+      expect(scheduled.outcome).toBe("scheduled");
+    } finally {
+      events.stop();
+    }
+
+    expect(events.seen).toHaveLength(1);
+    // Read taken from inside the event listener, on a connection outside the
+    // quarantining transaction: the "archived" status is only visible there
+    // after commit, so a pre-commit publication would observe the stale
+    // "active" status instead.
+    await expect(
+      events.seen[0]!.valueAtPublish,
+      "the archived status must already be visible to other connections when the event fires",
+    ).resolves.toBe("archived");
   });
 
   it("does not quarantine another issue's workspace when validation payload is stale", async () => {
@@ -3525,5 +4034,144 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect((wakeupRequest?.payload as Record<string, unknown> | null)?.transientRetryNotBefore).toBe(
       retryNotBefore.toISOString(),
     );
+  });
+
+  // BLO-23525: the prose-parser path (parseProviderCapacityResetHorizon ->
+  // resultJson.retryNotBefore -> this scheduler's transientRetryNotBefore
+  // override) used to honor an advertised horizon verbatim. It now shares
+  // clampTransientRetryHorizon with the capacity-gate path (BLO-23438), with
+  // its own attempt ceiling raised so the clamp cannot silently reintroduce
+  // BLO-23438's exhaustion trap on this route.
+  it("BLO-23525: clamps a transient_upstream retry-not-before beyond the horizon ceiling instead of parking for the full advertised window", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const now = new Date("2026-08-09T00:00:00.000Z");
+    // 130h out: beyond both the 24h per-attempt cap and BLO-22844's 124.8h
+    // worst case, so a single attempt must not be able to honor it verbatim.
+    const advertisedRetryNotBefore = new Date(now.getTime() + 130 * 60 * 60 * 1000);
+
+    await seedRetryFixture({
+      runId,
+      companyId,
+      agentId,
+      now,
+      errorCode: "adapter_failed",
+      errorFamily: "transient_upstream",
+      retryNotBefore: advertisedRetryNotBefore.toISOString(),
+    });
+
+    const scheduled = await heartbeat.scheduleBoundedRetry(runId, {
+      now,
+      random: () => 0.5,
+    });
+
+    expect(scheduled.outcome).toBe("scheduled");
+    if (scheduled.outcome !== "scheduled") return;
+    // Clamped to the ceiling, not the (later) advertised horizon.
+    expect(scheduled.dueAt.getTime()).toBe(now.getTime() + MAX_TRANSIENT_RETRY_HORIZON_MS);
+    expect(scheduled.attempt).toBe(1);
+    // The family's ceiling was raised so 24h-per-attempt re-probing has
+    // enough attempts left to reach BLO-22844's 124.8h worst case.
+    expect(scheduled.maxAttempts).toBe(TRANSIENT_HORIZON_CLAMP_MIN_ATTEMPTS);
+    expect(scheduled.maxAttempts).toBeGreaterThan(BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length);
+
+    const retryRun = await db
+      .select({ contextSnapshot: heartbeatRuns.contextSnapshot, scheduledRetryAt: heartbeatRuns.scheduledRetryAt })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, scheduled.run.id))
+      .then((rows) => rows[0] ?? null);
+
+    expect(retryRun?.scheduledRetryAt?.getTime()).toBe(now.getTime() + MAX_TRANSIENT_RETRY_HORIZON_MS);
+    const contextSnapshot = (retryRun?.contextSnapshot as Record<string, unknown> | null) ?? {};
+    // The clamped instant is what downstream retry logic acts on...
+    expect(contextSnapshot.transientRetryNotBefore).toBe(advertisedRetryNotBefore.toISOString());
+    // ...but the declined advertised horizon stays legible on the row.
+    expect(contextSnapshot.transientRetryHorizonClampedFrom).toBe(advertisedRetryNotBefore.toISOString());
+  });
+
+  it("BLO-23525: keeps re-probing a clamped transient_upstream horizon across attempts, and only exhausts past the raised ceiling", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const now = new Date("2026-08-09T00:00:00.000Z");
+    const advertisedRetryNotBefore = new Date(now.getTime() + 200 * 60 * 60 * 1000);
+
+    // Seed as the run that just failed on the *last* attempt the raised
+    // ceiling allows, still carrying the same far-future advertised horizon
+    // (the provider outage has not resolved).
+    await seedRetryFixture({
+      runId,
+      companyId,
+      agentId,
+      now,
+      errorCode: "adapter_failed",
+      errorFamily: "transient_upstream",
+      retryNotBefore: advertisedRetryNotBefore.toISOString(),
+      scheduledRetryAttempt: TRANSIENT_HORIZON_CLAMP_MIN_ATTEMPTS - 1,
+    });
+
+    const lastAllowedAttempt = await heartbeat.scheduleBoundedRetry(runId, {
+      now,
+      random: () => 0.5,
+    });
+
+    expect(lastAllowedAttempt.outcome).toBe("scheduled");
+    if (lastAllowedAttempt.outcome !== "scheduled") return;
+    expect(lastAllowedAttempt.attempt).toBe(TRANSIENT_HORIZON_CLAMP_MIN_ATTEMPTS);
+    expect(lastAllowedAttempt.dueAt.getTime()).toBe(now.getTime() + MAX_TRANSIENT_RETRY_HORIZON_MS);
+
+    await cleanupRetryFixture();
+
+    // One attempt further — still the same unresolved outage — must exhaust
+    // rather than clamp-and-park again indefinitely.
+    const exhaustedRunId = randomUUID();
+    await seedRetryFixture({
+      runId: exhaustedRunId,
+      companyId: randomUUID(),
+      agentId: randomUUID(),
+      now,
+      errorCode: "adapter_failed",
+      errorFamily: "transient_upstream",
+      retryNotBefore: advertisedRetryNotBefore.toISOString(),
+      scheduledRetryAttempt: TRANSIENT_HORIZON_CLAMP_MIN_ATTEMPTS,
+    });
+
+    const exhausted = await heartbeat.scheduleBoundedRetry(exhaustedRunId, {
+      now,
+      random: () => 0.5,
+    });
+
+    expect(exhausted).toEqual({
+      outcome: "retry_exhausted",
+      attempt: TRANSIENT_HORIZON_CLAMP_MIN_ATTEMPTS + 1,
+      maxAttempts: TRANSIENT_HORIZON_CLAMP_MIN_ATTEMPTS,
+    });
+  });
+
+  it("BLO-23525: leaves the ordinary hintless transient_upstream ceiling (no retry-not-before) untouched at 4 attempts", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const now = new Date("2026-08-09T00:00:00.000Z");
+
+    await seedRetryFixture({
+      runId,
+      companyId,
+      agentId,
+      now,
+      errorCode: "adapter_failed",
+      errorFamily: "transient_upstream",
+      scheduledRetryAttempt: BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length - 1,
+    });
+
+    const lastHintlessAttempt = await heartbeat.scheduleBoundedRetry(runId, {
+      now,
+      random: () => 0.5,
+    });
+
+    expect(lastHintlessAttempt.outcome).toBe("scheduled");
+    if (lastHintlessAttempt.outcome !== "scheduled") return;
+    expect(lastHintlessAttempt.maxAttempts).toBe(BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length);
   });
 });

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, asc, desc, eq, gt, gte, inArray, isNull, lt, lte, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, inArray, isNotNull, isNull, lt, lte, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { clampIssueRequestDepth } from "@paperclipai/shared";
 import {
@@ -14,6 +14,7 @@ import {
   issueApprovals,
   issueComments,
   issueRelations,
+  issueWorkProducts,
   issues,
   linearIssueLinks,
   projects,
@@ -35,6 +36,10 @@ import {
   withRecoveryModelProfileHint,
 } from "./recovery/model-profile-hint.js";
 import { RECOVERY_ORIGIN_KINDS } from "./recovery/origins.js";
+import {
+  PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE,
+  PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID,
+} from "./pull-request-work-products.js";
 import { extractNextActionFromText } from "./run-liveness.js";
 import { runUsageTokenCounts } from "./recovery/zero-token-startup-failure.js";
 
@@ -66,7 +71,18 @@ export const DEFAULT_PRODUCTIVITY_REVIEW_MONITOR_LAPSE_SERVICE_GRACE_MS =
   DEFAULT_HEARTBEAT_SCHEDULER_INTERVAL_MS + ISSUE_MONITOR_WAKE_CLAIM_TTL_MS;
 
 const PRODUCTIVITY_REVIEW_RESERVATION_STALE_MS = 5 * 60 * 1000;
+/**
+ * Window in which a linked PR counts as a non-stale progress signal, matching
+ * the "created or updated in the last 24h" wording in the Manager Decision
+ * block below (BLO-19566 AC4).
+ */
+export const PRODUCTIVITY_REVIEW_PR_FRESH_MS = 24 * 60 * 60 * 1000;
 const TERMINAL_RUN_STATUSES = ["succeeded", "interrupted", "failed", "cancelled", "timed_out"] as const;
+// BLO-25410: NOT a lock predicate — this only counts recent runs for the review
+// narrative (`activeRunCount`), and never decides whether an issue is
+// checkoutable. Enumeration is fine here because an unknown status simply goes
+// uncounted in a report. Checkoutability and `activeRun` hydration use the
+// terminal complement instead — see `issue-execution-lock.ts`.
 const ACTIVE_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const MAX_CANDIDATE_ISSUES = 250;
 const MAX_RUNS_FOR_STREAK = 100;
@@ -106,6 +122,17 @@ const CAPACITY_RETRY_ERROR_CODE = "rate_limit_exhausted";
 // while an episode that was already long *before* the retry started still
 // fires on its own unattended time.
 const CAPACITY_STALL_DOMINANT_SHARE = 0.5;
+// BLO-26165: `heartbeatRuns.issueCommentStatus` defaults to (and is explicitly
+// re-stamped) `not_applicable` by `finalizeIssueCommentPolicy` (heartbeat.ts)
+// for any run whose wake reason never required a comment in the first place —
+// including a run whose adapter container was never created at all (a
+// pre-adapter setup failure such as `preferred_workspace_unrealizable`; see
+// BLO-23096). That subsystem is authoritative on "was a comment ever
+// expected here" independent of whether `classifyAndPersistRunLiveness`
+// managed to run, which is the axis `isNeverExecutedRun` depends on. Runs
+// this excludes are reported separately as `neverInvokedRunCount` rather than
+// folded into `runtimeFailureStreak`, since the two signals can disagree.
+const NEVER_INVOKED_ISSUE_COMMENT_STATUS = "not_applicable";
 export const PRODUCTIVITY_REVIEW_REFRESH_COMMENT_PREFIX = "Productivity review evidence refreshed.";
 const PRODUCTIVITY_REVIEW_CREATED_ACTION = "issue.productivity_review_created";
 const PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_STARTED_ACTION =
@@ -162,6 +189,45 @@ type ProductivityReviewThresholds = {
   monitorDispatchBatchSize: number;
 };
 
+type PullRequestEvidence = {
+  title: string;
+  url: string | null;
+  status: string;
+  externalId: string | null;
+  /** GitHub event time of the newest PR event (not DB receipt time). */
+  updatedAt: Date;
+  /** Age of the newest PR event at evidence-collection time. */
+  ageMs: number;
+};
+
+const PRODUCTIVITY_REVIEW_PROGRESS_PR_STATUS_VALUES = ["ready_for_review", "draft", "merged"] as const;
+const PRODUCTIVITY_REVIEW_PROGRESS_PR_STATUSES = new Set<string>(PRODUCTIVITY_REVIEW_PROGRESS_PR_STATUS_VALUES);
+const PRODUCTIVITY_REVIEW_WEBHOOK_PR_METADATA_SOURCE = PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE;
+
+/**
+ * Effective chronology for a PR work product: the GitHub event time the row was
+ * built from, falling back to DB receipt time only when the row predates that
+ * field. Used for both "which PR is newest" and "how old is it" so a delayed
+ * delivery cannot present a stale PR as fresh (BLO-19566).
+ */
+const pullRequestEffectiveEventAtSql = sql`coalesce(
+  case
+    when ${issueWorkProducts.metadata}->>'sourceEventTimestampMs' ~ '^[0-9]+$'
+      then to_timestamp((${issueWorkProducts.metadata}->>'sourceEventTimestampMs')::bigint / 1000.0)
+    else null
+  end,
+  ${issueWorkProducts.updatedAt}
+)`;
+
+type PullRequestEvidenceRow = {
+  title: string;
+  url: string | null;
+  status: string;
+  externalId: string | null;
+  updatedAt: Date;
+  sourceEventTimestampMs: string | number | null;
+};
+
 type ProductivityReviewEvidence = {
   trigger: ProductivityReviewTrigger;
   triggerReasons: string[];
@@ -175,6 +241,15 @@ type ProductivityReviewEvidence = {
   // `isNeverExecutedRun`. Evidence text must not claim "0 input/output
   // tokens" for a run where usage was never recorded at all.
   runtimeFailureUsageBasis: "measured" | "inferred" | "mixed" | null;
+  // BLO-26165: count of terminal runs excluded from the `noCommentStreak` walk
+  // because `issueCommentStatus === "not_applicable"` — the comment-requirement
+  // subsystem (`finalizeIssueCommentPolicy` in heartbeat.ts) already determined
+  // no comment was ever expected from them. Distinct from `runtimeFailureStreak`
+  // (a heuristic over `livenessState`/`usageJson`/`logBytes` that can miss a
+  // pre-adapter setup failure whose liveness classification never ran) so the
+  // evidence block can tell a reviewer "this many runs never had a chance to
+  // comment" apart from "this many runs executed and stayed silent."
+  neverInvokedRunCount: number;
   totalRunCount: number;
   terminalRunCount: number;
   activeRunCount: number;
@@ -195,6 +270,13 @@ type ProductivityReviewEvidence = {
     priorLapseAt: Date | null;
     armedUntil: Date | null;
     gatedIsUpperBound: boolean;
+    // BLO-25877: set (to the same instant as `lapsedAt`) only when the row's
+    // *current* `monitorNextCheckAt` is null at `lapsedAt` — i.e. the monitor's
+    // last transition was a fire, not an abandoned schedule. Distinguishes
+    // "did its job, nothing has re-armed it since" from a genuinely stuck
+    // monitor so `formatMonitorGating` doesn't blame the wrong thing.
+    firedAt: Date | null;
+    successorRunId: string | null;
   } | null;
   // BLO-23248: elapsed time attributable to the issue's current run sitting
   // in a capacity-class `scheduled_retry` (fleet model-provider exhaustion) —
@@ -213,6 +295,14 @@ type ProductivityReviewEvidence = {
   costCents: number;
   usageSamples: Array<{ runId: string; usageJson: Record<string, unknown> | null }>;
   nextAction: string | null;
+  /**
+   * Newest `pull_request` work product on the source issue, or null when the
+   * issue carries none (BLO-19566 AC4). The reviewer's verdict criteria ask for
+   * "a non-stale PR/MR link in the source issue's evidence"; before this the
+   * evidence pack had no PR field at all, so an assignee pushing commits to an
+   * open PR was indistinguishable from one doing nothing.
+   */
+  latestPullRequest: PullRequestEvidence | null;
   queuedUndispatchedRunCount: number;
   oldestQueuedUndispatchedRunAgeMs: number | null;
   thresholds: ProductivityReviewThresholds;
@@ -236,17 +326,23 @@ type MonitorScheduledSuppression = {
   sourceIssue: IssueRow;
   sourceAgent: AgentRow;
   elapsedMs: number | null;
-  monitorNextCheckAt: Date;
+  // BLO-25877: null in the just-fired branch — firing clears `monitorNextCheckAt`
+  // atomically with `monitorLastTriggeredAt` (buildIssueMonitorTriggeredPatch), so a
+  // suppression raised on that branch has no future check to report. See
+  // `monitorLastTriggeredAt` below for the timestamp that branch does carry.
+  monitorNextCheckAt: Date | null;
   monitorScheduledBy: string;
   monitorWakeRequestedAt: Date | null;
+  monitorLastTriggeredAt: Date | null;
   thresholds: ProductivityReviewThresholds;
   generatedAt: Date;
 };
 
 type PendingMonitorForReviewSuppression = {
-  monitorNextCheckAt: Date;
+  monitorNextCheckAt: Date | null;
   monitorScheduledBy: string;
   monitorWakeRequestedAt: Date | null;
+  monitorLastTriggeredAt: Date | null;
 };
 
 type ApprovalGatedSuppression = {
@@ -568,11 +664,42 @@ function deliberatePendingMonitor(
   backlogGraceMs = 0,
 ): PendingMonitorForReviewSuppression | null {
   const future = strictFutureMonitor(issue, now);
-  if (future) return { ...future, monitorWakeRequestedAt: null };
+  if (future) return { ...future, monitorWakeRequestedAt: null, monitorLastTriggeredAt: null };
 
-  const monitorNextCheckAt = coerceDate(issue.monitorNextCheckAt);
   const monitorScheduledBy = issue.monitorScheduledBy;
-  if (!monitorNextCheckAt || !isMonitorSuppressionActor(monitorScheduledBy)) return null;
+  const effectiveGraceMs = Math.max(thresholds.monitorLapseServiceGraceMs, backlogGraceMs);
+  const monitorNextCheckAt = coerceDate(issue.monitorNextCheckAt);
+
+  if (!monitorNextCheckAt) {
+    // BLO-25877: firing clears `monitorNextCheckAt` atomically with
+    // `monitorLastTriggeredAt` (buildIssueMonitorTriggeredPatch). A caller here
+    // reads its own fresh copy of the issue (`getCurrentIssue`), taken *after*
+    // this evidence pass's issue snapshot — a monitor that fires in that gap
+    // reads as "nothing pending" on the first guard below even though the fire
+    // itself, by construction, enqueued a successor run: the strongest
+    // available evidence the issue is attended. Cover that just-fired window on
+    // the same grace footing as a lapsed-but-unserviced monitor below, and
+    // symmetric with `monitorHasFreshWakeClaim`'s claimed-but-not-yet-dispatched
+    // window. This is a tolerate-the-transition fix, not a snapshot-consistent
+    // read: it does not make the evidence read and this read atomic, it makes
+    // "fired since the evidence read" its own recognized state instead of an
+    // absence.
+    const monitorLastTriggeredAt = coerceDate(issue.monitorLastTriggeredAt);
+    if (
+      monitorLastTriggeredAt &&
+      isMonitorSuppressionActor(monitorScheduledBy) &&
+      now.getTime() - monitorLastTriggeredAt.getTime() <= effectiveGraceMs
+    ) {
+      return {
+        monitorNextCheckAt: null,
+        monitorScheduledBy,
+        monitorWakeRequestedAt: null,
+        monitorLastTriggeredAt,
+      };
+    }
+    return null;
+  }
+  if (!isMonitorSuppressionActor(monitorScheduledBy)) return null;
 
   // BLO-21003: `monitorNextCheckAt` lapsing is not proof its wake has been
   // serviced. For new-review suppression, keep treating it as pending while
@@ -582,9 +709,8 @@ function deliberatePendingMonitor(
   // open review would start the resolved-review snooze before dispatch succeeds.
   const dueAgeMs = now.getTime() - monitorNextCheckAt.getTime();
   const monitorWakeRequestedAt = monitorHasFreshWakeClaim(issue, now);
-  const effectiveGraceMs = Math.max(thresholds.monitorLapseServiceGraceMs, backlogGraceMs);
   if (dueAgeMs > effectiveGraceMs && !monitorWakeRequestedAt) return null;
-  return { monitorNextCheckAt, monitorScheduledBy, monitorWakeRequestedAt };
+  return { monitorNextCheckAt, monitorScheduledBy, monitorWakeRequestedAt, monitorLastTriggeredAt: null };
 }
 
 /**
@@ -600,7 +726,13 @@ function deliberatePendingMonitor(
  * `gatedIsUpperBound` so the manager-facing line carries the qualifier too.
  * This is reporting only — it does not gate whether the review fires.
  */
-function monitorGatingBreakdown(issue: IssueRow, activeStartedAt: Date | null, elapsedMs: number | null, now: Date) {
+function monitorGatingBreakdown(
+  issue: IssueRow,
+  activeStartedAt: Date | null,
+  elapsedMs: number | null,
+  now: Date,
+  latestRuns: HeartbeatRunRow[],
+) {
   if (elapsedMs === null || !activeStartedAt) return null;
   const armedUntil = coerceDate(issue.monitorNextCheckAt);
   const lastTriggeredAt = coerceDate(issue.monitorLastTriggeredAt);
@@ -618,6 +750,8 @@ function monitorGatingBreakdown(issue: IssueRow, activeStartedAt: Date | null, e
       priorLapseAt: null,
       armedUntil,
       gatedIsUpperBound: true,
+      firedAt: null,
+      successorRunId: null,
     };
   }
 
@@ -632,6 +766,8 @@ function monitorGatingBreakdown(issue: IssueRow, activeStartedAt: Date | null, e
       priorLapseAt: null,
       armedUntil: null,
       gatedIsUpperBound: false,
+      firedAt: null,
+      successorRunId: null,
     };
   }
   const lapsedAt = new Date(Math.max(...lapseCandidates.map((d) => d.getTime())));
@@ -647,8 +783,24 @@ function monitorGatingBreakdown(issue: IssueRow, activeStartedAt: Date | null, e
       priorLapseAt: lapsedAt,
       armedUntil: null,
       gatedIsUpperBound: false,
+      firedAt: null,
+      successorRunId: null,
     };
   }
+
+  // BLO-25877: a null `armedUntil` at this point means the row's *current*
+  // `monitorNextCheckAt` is null — the monitor's last transition was a fire
+  // (which clears it atomically with `monitorLastTriggeredAt`,
+  // `buildIssueMonitorTriggeredPatch`), not an abandoned schedule that a
+  // non-null, past `armedUntil` would represent. Firing enqueues a successor
+  // run by construction, so name it when it's still within the runs sampled
+  // for this evidence pass; a null `successorRunId` here just means the run
+  // fell outside that sample, not that one doesn't exist.
+  const successorRunId = armedUntil === null
+    ? (latestRuns
+        .filter((run) => run.createdAt.getTime() >= lapsedAt.getTime())
+        .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())[0]?.id ?? null)
+    : null;
 
   const gatedMs = Math.min(elapsedMs, lapsedAt.getTime() - activeStartedAt.getTime());
   return {
@@ -658,6 +810,8 @@ function monitorGatingBreakdown(issue: IssueRow, activeStartedAt: Date | null, e
     priorLapseAt: null,
     armedUntil: null,
     gatedIsUpperBound: false,
+    firedAt: armedUntil === null ? lapsedAt : null,
+    successorRunId,
   };
 }
 
@@ -670,11 +824,59 @@ function formatMonitorGating(gating: NonNullable<ProductivityReviewEvidence["mon
   if (gating.armedUntil) {
     return `${split} (monitor armed until ${gating.armedUntil.toISOString()}; arm time is not recorded, so monitor-gated time is an upper bound)`;
   }
+  // BLO-25877: a monitor that fired at its scheduled check and enqueued a
+  // successor demands the opposite reader action from one that silently
+  // stopped — do not collapse the two into "never re-armed".
+  if (gating.firedAt) {
+    const successor = gating.successorRunId ? ` (run \`${gating.successorRunId}\`)` : "";
+    return `${split} (monitor fired on schedule at ${gating.firedAt.toISOString()} and enqueued a successor run${successor}; nothing has re-armed it since)`;
+  }
   if (gating.lapsedAt) return `${split} (monitor lapsed at ${gating.lapsedAt.toISOString()}, never re-armed)`;
   if (gating.priorLapseAt) {
     return `${split} (no monitor armed during this episode; previous monitor lapsed at ${gating.priorLapseAt.toISOString()}, before it began)`;
   }
   return `${split} (no monitor armed during this episode)`;
+}
+
+function isFreshPullRequest(pr: PullRequestEvidence | null): pr is PullRequestEvidence {
+  return pr !== null && pr.ageMs <= PRODUCTIVITY_REVIEW_PR_FRESH_MS;
+}
+
+function isProgressPullRequest(pr: PullRequestEvidence | null): pr is PullRequestEvidence {
+  return isFreshPullRequest(pr) && PRODUCTIVITY_REVIEW_PROGRESS_PR_STATUSES.has(pr.status);
+}
+
+function toPullRequestEvidence(row: PullRequestEvidenceRow | null, now: Date): PullRequestEvidence | null {
+  if (!row) return null;
+  // Prefer the GitHub event time; `updatedAt` is only a fallback for rows
+  // written before the source timestamp was recorded.
+  const sourceMs = Number(row.sourceEventTimestampMs);
+  const eventAt = Number.isFinite(sourceMs) && row.sourceEventTimestampMs !== null
+    ? new Date(sourceMs)
+    : row.updatedAt;
+  return {
+    title: row.title,
+    url: row.url ?? null,
+    status: row.status,
+    externalId: row.externalId ?? null,
+    updatedAt: eventAt,
+    ageMs: Math.max(0, now.getTime() - eventAt.getTime()),
+  };
+}
+
+/**
+ * Render the linked PR for the evidence pack (BLO-19566 AC4). Reads "none
+ * recorded" only when the issue genuinely has no PR work product -- which is
+ * now a real signal rather than, as before, the only possible output.
+ */
+function formatPullRequestEvidence(pr: PullRequestEvidence | null) {
+  if (!pr) return "none recorded";
+  const ref = pr.url ?? pr.externalId ?? pr.title;
+  const freshness = isFreshPullRequest(pr) ? "non-stale" : "stale";
+  const progress = PRODUCTIVITY_REVIEW_PROGRESS_PR_STATUSES.has(pr.status)
+    ? "progress-eligible"
+    : "not progress-eligible";
+  return `${ref} \`${pr.status}\`, last activity ${pr.updatedAt.toISOString()} (${msToHuman(pr.ageMs)} ago, ${freshness}, ${progress})`;
 }
 
 function formatCapacityGating(gating: NonNullable<ProductivityReviewEvidence["capacityGating"]>) {
@@ -796,9 +998,10 @@ function choosePrimaryTrigger(input: {
   // runs that never got a model turn, that is the root cause worth surfacing
   // first — an agent that never executed cannot also be judged unproductive
   // (BLO-21769). `no_comment_streak` only ever counts turn-executing runs
-  // (see `isNeverExecutedRun` filtering in `collectEvidence`), so the two
-  // streaks are drawn from disjoint run sets and can coexist without this
-  // ordering being arbitrary.
+  // that were actually expected to comment (see `isNeverExecutedRun` and the
+  // `NEVER_INVOKED_ISSUE_COMMENT_STATUS` filtering in `collectEvidence`,
+  // BLO-26165), so the two streaks are drawn from disjoint run sets and can
+  // coexist without this ordering being arbitrary.
   if (input.runtimeFailure) return "runtime_failure_streak";
   if (input.noComment) return "no_comment_streak";
   if (input.highChurn) return "high_churn";
@@ -1904,9 +2107,10 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       sourceIssueId: suppression.sourceIssue.id,
       trigger: suppression.trigger,
       suppressedBy: "monitor_scheduled",
-      monitorNextCheckAt: suppression.monitorNextCheckAt.toISOString(),
+      monitorNextCheckAt: suppression.monitorNextCheckAt?.toISOString() ?? null,
       monitorScheduledBy: suppression.monitorScheduledBy,
       monitorWakeRequestedAt: suppression.monitorWakeRequestedAt?.toISOString() ?? null,
+      monitorLastTriggeredAt: suppression.monitorLastTriggeredAt?.toISOString() ?? null,
       elapsedMs: suppression.elapsedMs,
     };
     await logActivity(db, {
@@ -2303,11 +2507,54 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
             ? "inferred"
             : "measured";
     const executedTerminalRuns = terminalRuns.filter((run) => !isNeverExecutedRun(run));
+    // BLO-26165: a run stamped `issueCommentStatus: "not_applicable"` was
+    // never expected to comment in the first place — either because its
+    // adapter container was never created (BLO-23096: `preferred_workspace_
+    // unrealizable` / `adapter_failed` setup failures, where `usageJson`,
+    // `logBytes`, and `logStore`/`logRef` all stay null) or because
+    // `finalizeIssueCommentPolicy` classified its wake reason as one that
+    // never required a comment. Either way, counting it as a silent run
+    // misattributes an infrastructure or policy fact to the assignee.
+    // Excluded here rather than folded into `isNeverExecutedRun` because the
+    // two signals are independent and can disagree — `issueCommentStatus` is
+    // written by a separate subsystem that does not depend on
+    // `classifyAndPersistRunLiveness` having successfully run.
+    const neverInvokedRunCount = terminalRuns.filter(
+      (run) => run.issueCommentStatus === NEVER_INVOKED_ISSUE_COMMENT_STATUS,
+    ).length;
+    const noCommentEligibleRuns = executedTerminalRuns.filter(
+      (run) => run.issueCommentStatus !== NEVER_INVOKED_ISSUE_COMMENT_STATUS,
+    );
     let noCommentStreak = 0;
-    for (const run of executedTerminalRuns) {
+    for (const run of noCommentEligibleRuns) {
       if (commentRunIds.has(run.id)) break;
       noCommentStreak += 1;
     }
+
+    const pullRequestFreshCutoff = new Date(now.getTime() - PRODUCTIVITY_REVIEW_PR_FRESH_MS);
+    const pullRequestEvidenceSelect = {
+      title: issueWorkProducts.title,
+      url: issueWorkProducts.url,
+      status: issueWorkProducts.status,
+      externalId: issueWorkProducts.externalId,
+      updatedAt: issueWorkProducts.updatedAt,
+      sourceEventTimestampMs: sql<string | number | null>`case
+        when ${issueWorkProducts.metadata}->>'sourceEventTimestampMs' ~ '^[0-9]+$'
+          then (${issueWorkProducts.metadata}->>'sourceEventTimestampMs')::bigint
+        else null
+      end`,
+    };
+    const trustedPullRequestEvidenceWhere = and(
+      eq(issueWorkProducts.companyId, sourceIssue.companyId),
+      eq(issueWorkProducts.issueId, sourceIssue.id),
+      eq(issueWorkProducts.provider, "github"),
+      eq(issueWorkProducts.type, "pull_request"),
+      isNotNull(issueWorkProducts.externalId),
+      isNotNull(issueWorkProducts.url),
+      sql`${issueWorkProducts.metadata}->>'source' = ${PRODUCTIVITY_REVIEW_WEBHOOK_PR_METADATA_SOURCE}`,
+      sql`${issueWorkProducts.sourceTrust}->>'promotedByActorType' = 'system'`,
+      sql`${issueWorkProducts.sourceTrust}->>'promotedByActorId' = ${PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID}`,
+    );
 
     const [
       runCountLastHour,
@@ -2318,6 +2565,8 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       latestComments,
       mostRecentDispatchAt,
       costRow,
+      latestPullRequestRow,
+      progressPullRequestRow,
     ] = await Promise.all([
       countIssueRunsSince(sourceIssue.companyId, sourceAgent.id, sourceIssue.id, oneHourAgo),
       countIssueRunsSince(sourceIssue.companyId, sourceAgent.id, sourceIssue.id, sixHoursAgo),
@@ -2362,6 +2611,37 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         .from(costEvents)
         .where(and(eq(costEvents.companyId, sourceIssue.companyId), eq(costEvents.issueId, sourceIssue.id)))
         .then((rows) => rows[0] ?? { costCents: 0 }),
+      // BLO-19566 AC4: newest PR linked to this issue. Written by the GitHub
+      // webhook on every pull_request event.
+      //
+      // Ordered and aged by the *GitHub* event time, not `updatedAt`. The row's
+      // `updatedAt` is DB receipt time, so a first delivery that arrives late
+      // (retry, backfill, outage drain) inserts with `updatedAt = now` and would
+      // advertise an already-stale PR as fresh progress for another day. Falls
+      // back to `updatedAt` only for rows with no recorded source timestamp.
+      db
+        .select(pullRequestEvidenceSelect)
+        .from(issueWorkProducts)
+        .where(trustedPullRequestEvidenceWhere)
+        .orderBy(desc(pullRequestEffectiveEventAtSql))
+        .limit(1)
+        .then((rows) => rows[0] ?? null),
+      // The verdict criterion is satisfied by any fresh progress-eligible PR,
+      // not necessarily the newest PR overall. A newer closed-unmerged PR must
+      // not hide an older open/draft/merged PR that is still fresh.
+      db
+        .select(pullRequestEvidenceSelect)
+        .from(issueWorkProducts)
+        .where(
+          and(
+            trustedPullRequestEvidenceWhere,
+            inArray(issueWorkProducts.status, [...PRODUCTIVITY_REVIEW_PROGRESS_PR_STATUS_VALUES]),
+            sql`${pullRequestEffectiveEventAtSql} >= ${pullRequestFreshCutoff.toISOString()}::timestamptz`,
+          ),
+        )
+        .orderBy(desc(pullRequestEffectiveEventAtSql))
+        .limit(1)
+        .then((rows) => rows[0] ?? null),
     ]);
 
     const activeRunCount = latestRuns.filter((run) =>
@@ -2447,6 +2727,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       ? trailingHoldMs
       : Math.min(episodeMs, leadingParkMs + trailingHoldMs);
 
+    const latestPullRequest = toPullRequestEvidence(progressPullRequestRow ?? latestPullRequestRow, now);
     // BLO-23248: the portion of elapsedMs attributable to the current run
     // sitting in a capacity-class scheduled_retry, reported as its own
     // evidence bucket distinct from monitor-gated/unattended (BLO-22331).
@@ -2498,6 +2779,18 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     // trigger below, just folded into the boolean rather than a parallel gate
     // object, since (like those gates) this only ever affects
     // `long_active_duration` specifically and never the other triggers.
+    //
+    // BLO-25877: deliberately raw `elapsedMs` here, not the monitor-gated split.
+    // Trigger selection (and therefore every other trigger's suppression
+    // bookkeeping) must stay exactly as it was — the monitor-gated subtraction
+    // below is an *additional*, later gate on whether a `long_active_duration`
+    // review actually gets created, not a change to what counts as long-active
+    // in the first place. Folding the subtraction in here made the predicate
+    // itself go false for issues whose monitor is still safely inside
+    // `currentPendingMonitorForReviewSuppression`'s grace/backlog window — that
+    // bypassed the suppression bookkeeping (and its `monitorScheduledSuppressed`
+    // accounting) for dozens of already-covered backlog-grace scenarios instead
+    // of just narrowing the small genuinely-new case this issue targets.
     const longActive = elapsedMs !== null && elapsedMs >= thresholds.longActiveMs && !capacityDominantAndDue;
     const highChurn =
       runCountLastHour >= thresholds.highChurnHourly ||
@@ -2511,7 +2804,12 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     if (runtimeFailure) {
       triggerReasons.push(formatRuntimeFailureTriggerClaim(runtimeFailureStreak, runtimeFailureUsageBasis));
     }
-    if (noComment) triggerReasons.push(`${noCommentStreak} consecutive terminal, turn-executing issue-linked runs had no run-created issue comment`);
+    if (noComment) {
+      const neverInvokedNote = neverInvokedRunCount > 0
+        ? ` (${neverInvokedRunCount} additional never-invoked run(s) in the sampled window excluded, not counted toward this streak)`
+        : "";
+      triggerReasons.push(`${noCommentStreak} consecutive terminal, turn-executing issue-linked runs had no run-created issue comment${neverInvokedNote}`);
+    }
     if (longActive) {
       // BLO-23248: this only fires while capacity-dominant when the retry is
       // *overdue* (capacityDominantAndDue already excluded the still-backing-off
@@ -2574,9 +2872,38 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         monitorNextCheckAt: monitor.monitorNextCheckAt,
         monitorScheduledBy: monitor.monitorScheduledBy,
         monitorWakeRequestedAt: monitor.monitorWakeRequestedAt,
+        monitorLastTriggeredAt: monitor.monitorLastTriggeredAt,
         thresholds,
         generatedAt: now,
       };
+    }
+
+    // BLO-25877: computed once here — after both suppression gates above have had
+    // their chance to hold this review back — and reused as-is for the report-text
+    // field further down, rather than recomputed there.
+    const monitorGating = monitorGatingBreakdown(sourceIssue, attributableStartAt, elapsedMs, now, latestRuns);
+    // Neither suppression gate above catches every "monitor accounted for most of
+    // this episode" case: `currentPendingMonitorForReviewSuppression` only covers a
+    // monitor that is still armed or within its lapse grace, not one that lapsed a
+    // long time ago and was never re-armed. For that remaining case, only the
+    // *measured* gated component (`gatedIsUpperBound === false`) is safe to subtract
+    // from the elapsed time before comparing to the threshold — the still-armed
+    // branch reports `gatedMs: elapsedMs` as a deliberate upper bound (no column
+    // records monitor arm time), so treating its `unattendedMs: 0` as authoritative
+    // would make `long_active_duration` structurally unfireable for any issue with a
+    // monitor armed however briefly, which is the indefinite-suppression hazard
+    // BLO-22331 AC2 forbids — and that branch is already fully suppressed above
+    // anyway, so it never reaches this check with anything but `gatedIsUpperBound:
+    // true`. Checked here rather than folded into `longActive` above so trigger
+    // selection and the other three triggers' suppression bookkeeping are
+    // unaffected — see the comment on `longActive`.
+    if (
+      trigger === "long_active_duration" &&
+      monitorGating &&
+      !monitorGating.gatedIsUpperBound &&
+      monitorGating.unattendedMs < thresholds.longActiveMs
+    ) {
+      return null;
     }
 
     // BLO-19604: `run.nextAction` is only populated when that specific run's own
@@ -2616,6 +2943,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       noCommentStreak,
       runtimeFailureStreak,
       runtimeFailureUsageBasis,
+      neverInvokedRunCount,
       totalRunCount: latestRuns.length,
       terminalRunCount: terminalRuns.length,
       activeRunCount,
@@ -2626,7 +2954,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       commentCountLastSixHours: assigneeRunCommentCountLastSixHours,
       elapsedMs,
       nonLiveHoldMs,
-      monitorGating: monitorGatingBreakdown(sourceIssue, attributableStartAt, elapsedMs, now),
+      monitorGating,
       capacityGating,
       latestRuns: latestRuns.slice(0, 5),
       latestComments,
@@ -2636,6 +2964,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         .slice(0, 3)
         .map((run) => ({ runId: run.id, usageJson: run.usageJson ?? null })),
       nextAction,
+      latestPullRequest,
       queuedUndispatchedRunCount: queuedUndispatchedRuns.length,
       oldestQueuedUndispatchedRunAgeMs: oldestQueuedUndispatchedRun
         ? Math.max(0, now.getTime() - oldestQueuedUndispatchedRun.createdAt.getTime())
@@ -2740,6 +3069,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       `- Active queued/running/scheduled runs: ${evidence.activeRunCount}`,
       `- No-comment streak (terminal, turn-executing runs): ${evidence.noCommentStreak}`,
       `- Runtime-failure streak (terminal, never-executed runs): ${evidence.runtimeFailureStreak}`,
+      `- Never-invoked runs excluded (terminal, \`issueCommentStatus: not_applicable\`, BLO-26165): ${evidence.neverInvokedRunCount}`,
       `- Current active elapsed time: ${msToHuman(evidence.elapsedMs)}`,
       ...(evidence.nonLiveHoldMs > 0
         ? [
@@ -2755,6 +3085,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       `- Runs in rolling windows: ${evidence.runCountLastHour}/1h, ${evidence.runCountLastSixHours}/6h`,
       `- Assignee run-linked comments total/window: ${evidence.commentCount} total, ${evidence.commentCountLastHour}/1h, ${evidence.commentCountLastSixHours}/6h`,
       `- Cost events total: ${evidence.costCents} cents`,
+      `- Linked pull request: ${formatPullRequestEvidence(evidence.latestPullRequest)}`,
       ...(evidence.queuedUndispatchedRunCount > 0
         ? [
           `- Queued, never-dispatched runs in sample: ${evidence.queuedUndispatchedRunCount} (oldest ${msToHuman(evidence.oldestQueuedUndispatchedRunAgeMs)} old) — excluded from the elapsed-time figure above; a run stuck in \`queued\` is a dispatch problem, not evidence of a long-running episode`,
@@ -2797,6 +3128,14 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           "- An assignee run-linked comment in the last 6h that contains a `Next action:` line",
           "- A non-stale PR/MR link in the source issue's evidence (created or updated in the last 24h)",
           "- A recent test result, artifact commit, or workspace deliverable in the last 6h",
+          ...(isProgressPullRequest(evidence.latestPullRequest)
+            ? [
+              "",
+              `> The second signal is already present: ${formatPullRequestEvidence(evidence.latestPullRequest)}.`,
+              "> PR activity is recorded from the GitHub webhook, so this is deliverable progress even",
+              "> when the run/comment counters above read zero.",
+            ]
+            : []),
           "",
           "If none of these signals is present, the correct verdict is one of:",
           "- Request decomposition (the work is too large for a single heartbeat issue and needs to be split)",
@@ -2818,6 +3157,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       `- Reasons: ${evidence.triggerReasons.join("; ")}`,
       `- No-comment streak: ${evidence.noCommentStreak}`,
       `- Runtime-failure streak: ${evidence.runtimeFailureStreak}`,
+      `- Never-invoked runs excluded: ${evidence.neverInvokedRunCount}`,
       `- Runs/assignee comments: ${evidence.runCountLastHour}/${evidence.commentCountLastHour} in 1h, ${evidence.runCountLastSixHours}/${evidence.commentCountLastSixHours} in 6h`,
       ...(evidence.monitorGating
         ? [`- Elapsed accounting: ${formatMonitorGating(evidence.monitorGating)}`]
@@ -2826,6 +3166,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         ? [`- Capacity-stall accounting: ${formatCapacityGating(evidence.capacityGating)}`]
         : []),
       `- Next action: ${evidence.nextAction ? truncateInline(evidence.nextAction, 300) : "none recorded"}`,
+      `- Linked pull request: ${formatPullRequestEvidence(evidence.latestPullRequest)}`,
     ].join("\n");
   }
 
@@ -3095,6 +3436,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           monitorNextCheckAt: monitor.monitorNextCheckAt,
           monitorScheduledBy: monitor.monitorScheduledBy,
           monitorWakeRequestedAt: monitor.monitorWakeRequestedAt,
+          monitorLastTriggeredAt: monitor.monitorLastTriggeredAt,
           thresholds: evidence.thresholds,
           generatedAt: evidence.generatedAt,
         });
@@ -3157,6 +3499,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           monitorNextCheckAt: monitor.monitorNextCheckAt,
           monitorScheduledBy: monitor.monitorScheduledBy,
           monitorWakeRequestedAt: monitor.monitorWakeRequestedAt,
+          monitorLastTriggeredAt: monitor.monitorLastTriggeredAt,
           thresholds: evidence.thresholds,
           generatedAt: evidence.generatedAt,
         });

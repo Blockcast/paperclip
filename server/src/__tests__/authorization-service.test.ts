@@ -2427,6 +2427,61 @@ describeEmbeddedPostgres("authorization service", () => {
     expect(decision.allowed, decision.explanation).toBe(true);
   });
 
+  // BLO-19951: the recovery-guard carve-out in the issue PATCH handler skips
+  // assertRecoveryActionAuthority whenever a coordination-metadata decision is
+  // in hand. That is only safe because the two authorities are currently the
+  // same predicate: issue:coordination_metadata allows solely via
+  // isManagerOf(actor, assignee), and tasks:manage_active_checkouts allows on
+  // that same relation — which assertRecoveryActionAuthority consults, and
+  // returns true on, before it can 403. So today the carve-out cannot change
+  // any outcome; it fires only where the guard would already have passed.
+  //
+  // Pinned here against the real service rather than in the route tests,
+  // because those stub access.decide and a stub can express
+  // coordination_metadata=allow together with manage_active_checkouts=deny —
+  // a pair this service cannot emit. If coordination metadata is ever
+  // decoupled from the manager-chain requirement, this fails, and the
+  // carve-out has to be re-reviewed as a live bypass of the recovery-owner
+  // check instead of being inherited silently.
+  it("couples coordination-metadata authority to active-checkout management", async () => {
+    const company = await createCompany(db, "CoordCheckoutCoupling");
+    // Deliberately not a ceo/cto-tier role: canCreateAgentsLegacy would allow
+    // tasks:manage_active_checkouts on its own and mask the coupling.
+    const managerAgent = await createAgent(db, company.id, { role: "engineer" });
+    const reportAgent = await createAgent(db, company.id, { role: "engineer", reportsTo: managerAgent.id });
+    const peerAgent = await createAgent(db, company.id, { role: "engineer" });
+    await grantAgentPermission(db, company.id, managerAgent.id, "tasks:assign");
+    await grantAgentPermission(db, company.id, peerAgent.id, "tasks:assign");
+
+    const decideFor = (agentId: string, action: "issue:coordination_metadata" | "tasks:manage_active_checkouts") =>
+      authorizationService(db).decide({
+        actor: { type: "agent", agentId, companyId: company.id, source: "agent_jwt" },
+        action,
+        resource: { type: "issue", companyId: company.id, assigneeAgentId: reportAgent.id },
+      });
+
+    // Half 1 — the allow set for coordination metadata is confined to managers
+    // of the assignee. Without this, the implication below is vacuous: widening
+    // coordination metadata to grant-only would admit actors that hold no
+    // checkout-management authority, and a manager-only assertion would not
+    // notice.
+    const peerCoordination = await decideFor(peerAgent.id, "issue:coordination_metadata");
+    expect(peerCoordination.allowed, peerCoordination.explanation).toBe(false);
+
+    // Half 2 — every actor in that set also clears the recovery guard, via
+    // allow_manager_chain specifically. That is the shared isManagerOf branch
+    // which makes the carve-out redundant; a different allow reason here would
+    // mean the coupling no longer holds for the reason documented above.
+    const managerCoordination = await decideFor(managerAgent.id, "issue:coordination_metadata");
+    const managerCheckouts = await decideFor(managerAgent.id, "tasks:manage_active_checkouts");
+
+    expect(managerCoordination.allowed, managerCoordination.explanation).toBe(true);
+    expect(managerCheckouts, managerCheckouts.explanation).toMatchObject({
+      allowed: true,
+      reason: "allow_manager_chain",
+    });
+  });
+
   it("denies coordination metadata to a tasks:assign holder who does not manage the assignee", async () => {
     const company = await createCompany(db, "CoordPeer");
     const actorAgent = await createAgent(db, company.id, { role: "engineer" });

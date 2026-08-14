@@ -69,6 +69,7 @@ import {
   isUuidLike,
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
   SYSTEM_ISSUE_DOCUMENT_KEYS,
+  ISSUE_STATUS_ADJUDICATION_DOCUMENT_KEY,
 } from "@paperclipai/shared";
 import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
 import { incrementBlockerResolvedWakeMetric } from "./blocker-resolved-wake-metrics.js";
@@ -80,6 +81,7 @@ import { logger } from "../middleware/logger.js";
 import { parseObject } from "../adapters/utils.js";
 import {
   hydrateSuccessfulRunHandoffLiveness,
+  resolveSuccessfulRunHandoffForTerminalIssues,
   SUCCESSFUL_RUN_HANDOFF_LIVE_WAKE_STATUSES,
 } from "./successful-run-handoff-state.js";
 import {
@@ -101,8 +103,8 @@ import {
 import { mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
 import { buildInitialIssueMonitorFields, normalizeIssueExecutionPolicy } from "./issue-execution-policy.js";
 import {
-  ISSUE_EXECUTION_LOCK_HOLDING_RUN_STATUSES,
   ISSUE_EXECUTION_LOCK_REAPABLE_NEVER_STARTED_RUN_STATUSES,
+  TERMINAL_HEARTBEAT_RUN_STATUS_VALUES,
   TERMINAL_HEARTBEAT_RUN_STATUSES,
 } from "./issue-execution-lock.js";
 import { instanceSettingsService } from "./instance-settings.js";
@@ -2337,13 +2339,22 @@ async function watchdogMapForIssues(dbOrTx: any, rows: IssueRow[]): Promise<Map<
   return map;
 }
 
-// BLO-19749: the set of statuses whose runs hold an issue's execution lock, so
-// `activeRun` reports exactly what `checkout()` would 409 on. This used to be a
-// local ["queued", "running"] literal, which silently omitted `scheduled_retry`
-// and made `GET /issues/{id}` return `activeRun: null` for an issue whose
-// checkout simultaneously 409'd naming the parked retry run. See
-// `issue-execution-lock.ts` for the full drift table.
-const ACTIVE_RUN_STATUSES = [...ISSUE_EXECUTION_LOCK_HOLDING_RUN_STATUSES];
+// BLO-25410: NOT a lock predicate, and deliberately narrower than the terminal
+// complement used by the `activeRun` hydration in `activeRunMapForIssues`. A run
+// listed here marks its issue "covered" — actively being worked, so the
+// blocker-attention signal is suppressed. `scheduled_retry` is excluded on
+// purpose: a run parked on the retry ladder holds the lock but is not making
+// progress, and treating it as coverage would hide exactly the stalled blocker
+// this computation exists to surface.
+//
+// Enumeration is therefore the correct form here, because the two predicates
+// must fail in OPPOSITE directions. The lock predicate fails toward "held" (an
+// unknown status defers, and being wrong costs one deferral instead of two runs
+// in one worktree). This one fails toward "not covered" (an unknown status
+// raises attention, and being wrong costs a spurious nudge instead of silently
+// swallowing a stuck issue). Converting it to `notInArray(TERMINAL)` would flip
+// that safety direction and make every future non-terminal status suppress
+// attention by default.
 const BLOCKER_ATTENTION_ACTIVE_RUN_STATUSES = ["queued", "running"];
 const BLOCKER_ATTENTION_ACTIVE_WAKE_STATUSES = ["queued", "deferred_issue_execution"];
 const BLOCKER_ATTENTION_PENDING_INTERACTION_STATUSES = ["pending"];
@@ -2485,7 +2496,27 @@ async function activeRunMapForIssues(
         and(
           inArray(heartbeatRuns.id, runIdChunk),
           inArray(heartbeatRuns.companyId, companyIds),
-          inArray(heartbeatRuns.status, ACTIVE_RUN_STATUSES),
+          // BLO-19749 / BLO-25410: `activeRun` must report exactly what
+          // `checkout()` would 409 on, which is the complement of terminal — so
+          // express it AS the terminal complement, not as an enumeration of the
+          // holding statuses.
+          //
+          // `inArray(status, [...ISSUE_EXECUTION_LOCK_HOLDING_RUN_STATUSES])`
+          // looks equivalent and is not. That constant is built by filtering
+          // `HEARTBEAT_RUN_STATUSES`, so it can only ever list statuses inside
+          // the canonical union, while `heartbeat_runs.status` is a plain `text`
+          // column with no enum or check constraint — `issue-execution-lock.ts`
+          // records that `error` and `adapter_failed` already occur in it
+          // without being in the union. A future out-of-union status that is
+          // *non-terminal* would be absent from the enumeration while
+          // `runStatusHoldsIssueExecutionLock` (`!TERMINAL.has(status)`) still
+          // counted it as holding, reopening the exact defect BLO-19749 closed:
+          // `GET /issues/{id}` reporting `activeRun: null` on an issue whose
+          // `POST /checkout` simultaneously 409s naming that run.
+          //
+          // The two forms agree on every status in the union, so this is a no-op
+          // today and a guard against the next status added to the column.
+          notInArray(heartbeatRuns.status, TERMINAL_HEARTBEAT_RUN_STATUS_VALUES),
         ),
       );
 
@@ -3852,6 +3883,11 @@ export async function listBlockedIssueAutoResumeSuppressions(
 }
 
 const BLOCKED_INBOX_TERMINAL_STATUSES = ["done", "cancelled"] as const;
+// BLO-25410: NOT a lock predicate. Same reasoning as
+// BLOCKER_ATTENTION_ACTIVE_RUN_STATUSES — a run here suppresses the blocked-inbox
+// entry as "someone is on it", so `scheduled_retry` is excluded on purpose and
+// enumeration is the safe form: an unknown status leaves the entry visible
+// rather than silently hiding it. Do not convert to the terminal complement.
 const BLOCKED_INBOX_ACTIVE_RUN_STATUSES = ["queued", "running"] as const;
 const BLOCKED_INBOX_ACTIVE_WAKE_STATUSES = SUCCESSFUL_RUN_HANDOFF_LIVE_WAKE_STATUSES;
 const BLOCKED_INBOX_PENDING_INTERACTION_STATUSES = ["pending"] as const;
@@ -4043,6 +4079,11 @@ async function listSuccessfulRunHandoffMapForIssues(
     }
   }
 
+  // Before liveness: a handoff on a closed issue is moot regardless of whether
+  // this caller wants liveness hydrated (BLO-16074). Unconditional here because
+  // every caller of this helper is a read path; the route-side twin takes a
+  // `foldTerminal` opt-out because one of its callers gates an activity-row write.
+  await resolveSuccessfulRunHandoffForTerminalIssues(dbOrTx, companyId, states);
   return options?.hydrateLiveness === false
     ? states
     : hydrateSuccessfulRunHandoffLiveness(dbOrTx, companyId, states);
@@ -7036,7 +7077,7 @@ export function issueService(db: Db) {
      * Null covers "no run recorded", "the recorded run belongs to another
      * company", and "the recorded run has already
      * terminalized" — `activeRunMapForIssues` only returns rows whose status is
-     * in ACTIVE_RUN_STATUSES. That is the distinction a caller needs: a stale
+     * non-terminal. That is the distinction a caller needs: a stale
      * `executionRunId` left behind by a finished run reads as not-held, while a
      * live sibling run reads as present. A queued or `scheduled_retry` run is
      * present but does not yet hold a worktree; callers should use
@@ -9624,8 +9665,14 @@ export function issueService(db: Db) {
             })
           ) {
             throw unprocessable(
-              "Issue cannot be marked done without execution evidence (no execution run, no pr-link evidence, and no run-attributed durable artifact). Attach a PR link, or write the deliverable to an issue document (PUT /api/issues/:id/documents/:key) before closing — a comment body is not sufficient.",
-              { reason: "no_execution_run_and_no_pr_evidence", issueId: id },
+              "Issue cannot be marked done without execution evidence (no execution run, no pr-link evidence, and no run-attributed durable artifact). " +
+                "Attach a PR link, or write the deliverable to an issue document (PUT /api/issues/:id/documents/:key) before closing — a comment body is not sufficient. " +
+                `A cheap status-only recovery run, which may not author deliverables, records its verdict at PUT /api/issues/:id/documents/${ISSUE_STATUS_ADJUDICATION_DOCUMENT_KEY} instead.`,
+              {
+                reason: "no_execution_run_and_no_pr_evidence",
+                issueId: id,
+                statusOnlyDocumentKey: ISSUE_STATUS_ADJUDICATION_DOCUMENT_KEY,
+              },
             );
           }
         }

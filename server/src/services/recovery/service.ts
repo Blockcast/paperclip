@@ -7,6 +7,7 @@ import {
   PROVIDER_QUOTA_MONITOR_SERVICE_NAME,
   type IssueGraphLivenessAutoRecoveryPreview,
   type IssueGraphLivenessAutoRecoveryPreviewItem,
+  type IssueStatus,
 } from "@paperclipai/shared";
 import {
   agents,
@@ -26,6 +27,8 @@ import {
   issueRelations,
   issueThreadInteractions,
   issues,
+  routineRuns,
+  routines,
   workspaceOperations,
 } from "@paperclipai/db";
 import { loadConfig } from "../../config.js";
@@ -75,6 +78,7 @@ import {
 import {
   RECOVERY_ORIGIN_KINDS,
   buildIssueGraphLivenessLeafKey,
+  buildSchedulerFailureHeartbeatKey,
   isStrandedIssueRecoveryOriginKind,
   parseIssueGraphLivenessIncidentKey,
 } from "./origins.js";
@@ -241,6 +245,46 @@ const STRANDED_RECOVERY_WAKE_BACKSTOP_CANDIDATE_LIMIT = 500;
 // bounded retry lease. It deliberately does not spend another recovery-action attempt: that
 // attempt was already reserved by the escalation which failed to dispatch its wake.
 const STRANDED_RECOVERY_WAKE_BACKSTOP_COOLDOWN_MS = 30 * 60 * 1000;
+
+/**
+ * Issue statuses whose active recovery actions `reconcileStrandedAssignedIssues` can select.
+ * These are the dispatchable ones: the repair is to re-drive the owner.
+ */
+export const STRANDED_ASSIGNED_ISSUE_STATUSES = [
+  "todo",
+  "in_progress",
+  "in_review",
+] as const satisfies readonly IssueStatus[];
+
+/**
+ * Issue statuses whose active recovery actions `reconcileStrandedRecoveryWakeBackstop` can
+ * select. `blocked` is woken; `backlog` is folded (see the sweep's doc comment, BLO-25907).
+ */
+export const STRANDED_RECOVERY_WAKE_BACKSTOP_ISSUE_STATUSES = [
+  "blocked",
+  "backlog",
+] as const satisfies readonly IssueStatus[];
+
+/**
+ * Statuses the backstop resolves rather than wakes. Kept separate from the candidate list so
+ * the coverage-union invariant can distinguish "selected and woken" from "selected and folded"
+ * — both count as covered, but only the former may enqueue a wake.
+ */
+export const STRANDED_RECOVERY_WAKE_BACKSTOP_FOLD_ONLY_STATUSES = [
+  "backlog",
+] as const satisfies readonly IssueStatus[];
+
+/**
+ * Every non-terminal issue status must be selectable by at least one recovery sweep, or an
+ * active recovery action on it is a zombie no reconciler can service (BLO-25907, BLO-16074
+ * gap 3). `issue-recovery-actions.test.ts` asserts this union covers
+ * `ISSUE_STATUSES` minus the terminal ones, so adding a status without routing it to a sweep
+ * fails the suite instead of silently reopening the hole.
+ */
+export const RECOVERY_SWEEP_COVERED_ISSUE_STATUSES = [
+  ...STRANDED_ASSIGNED_ISSUE_STATUSES,
+  ...STRANDED_RECOVERY_WAKE_BACKSTOP_ISSUE_STATUSES,
+] as const satisfies readonly IssueStatus[];
 const SESSIONED_LOCAL_ADAPTERS = new Set([
   "claude_local",
   "codex_local",
@@ -822,6 +866,7 @@ function isCheckoutAdoptionCancelledRun(
 // `cancelClaimedRunForRoutineExecutionDuplicate` (heartbeat.ts) for where the
 // run itself is cancelled with this code.
 const ROUTINE_EXECUTION_DUPLICATE_SUPPRESSED_ERROR_CODE = "routine_execution_duplicate_suppressed";
+const ISSUE_TERMINAL_STATUS_ERROR_CODE = "issue_terminal_status";
 
 function isRoutineExecutionDuplicateSuppressedRun(
   latestRun: LatestIssueRun,
@@ -829,6 +874,15 @@ function isRoutineExecutionDuplicateSuppressedRun(
   return (
     latestRun?.status === "cancelled" &&
     readNonEmptyString(latestRun.errorCode) === ROUTINE_EXECUTION_DUPLICATE_SUPPRESSED_ERROR_CODE
+  );
+}
+
+function isTerminalDispatchRaceRun(
+  latestRun: LatestIssueRun,
+): latestRun is NonNullable<LatestIssueRun> {
+  return (
+    latestRun?.status === "cancelled" &&
+    readNonEmptyString(latestRun.errorCode) === ISSUE_TERMINAL_STATUS_ERROR_CODE
   );
 }
 
@@ -1046,6 +1100,18 @@ const PROVIDER_QUOTA_ERROR_RE =
   /(?:you(?:'|’)ve hit your usage limit|usage limit(?: reached| exceeded)?|provider quota|quota (?:limit )?exceeded|model (?:is )?at capacity)/i;
 const CONFIGURATION_INCOMPLETE_ERROR_RE =
   /(?:model_not_found|model [^\n]{0,120} not found|missing (?:api )?(?:key|credentials?)|credentials? (?:are |is )?missing|no (?:api )?(?:key|credentials?) (?:was |were )?(?:found|configured|provided)|api key (?:is )?(?:not set|unavailable))/i;
+// BLO-21116: a truncated/malformed adapter response is a transport-level parse
+// fault, not evidence about credentials. Before this guard, the config-incomplete
+// regex ran against `errorCode + error + JSON.stringify(resultJson)` — the FULL
+// raw (possibly truncated) response payload — so an unparseable blob could
+// false-positive match one of the config phrases via unrelated substring content
+// (e.g. a partial JSON fragment that happens to contain "model ... not found").
+// A match here permanently latches the issue into `manual_repair_required`
+// (service.ts enqueueSourceScopedStrandedRecoveryWake) telling the owner to bind
+// a secret that was never actually missing — an unperformable repair with no
+// automatic retry path. Observed live on BLO-18991: `adapter_failed` — "JSON
+// parsing failed: Text: {"type":"response.completed","response":{..." (truncated).
+const ADAPTER_RESPONSE_PARSE_FAILURE_RE = /json parsing failed/i;
 
 export type AdapterFailureRecoveryClassification =
   | { kind: "provider_quota"; retryAt: Date; parsedResetTime: boolean }
@@ -1132,10 +1198,26 @@ export function classifyAdapterFailureForRecovery(
     return null;
   }
   const resultJson = parseObject(latestRun.resultJson);
-  const error = [latestRun.errorCode ?? "", latestRun.error ?? "", JSON.stringify(resultJson)].join("\n");
-  if (latestRun.errorCode === "configuration_incomplete" || CONFIGURATION_INCOMPLETE_ERROR_RE.test(error)) {
+  const rawError = latestRun.error ?? "";
+  // An `adapter_failed` whose own message names a response-parse failure means
+  // resultJson is an untrusted/truncated payload, not classification evidence.
+  // Keep the guard scoped to that durable error code: provider_quota and
+  // configuration_incomplete are authoritative classifications and must not be
+  // discarded merely because their human-readable message contains the same
+  // phrase.
+  const isResponseParseFailure =
+    latestRun.errorCode === "adapter_failed" && ADAPTER_RESPONSE_PARSE_FAILURE_RE.test(rawError);
+  const error = [latestRun.errorCode ?? "", rawError, isResponseParseFailure ? "" : JSON.stringify(resultJson)]
+    .join("\n");
+  if (
+    !isResponseParseFailure &&
+    (latestRun.errorCode === "configuration_incomplete" || CONFIGURATION_INCOMPLETE_ERROR_RE.test(error))
+  ) {
     return { kind: "configuration_incomplete" };
   }
+  // The raw parse-failure text can itself contain quota-like words, so do not
+  // let an adapter_failed transport fault enter the provider-quota path.
+  if (isResponseParseFailure) return null;
   if (latestRun.errorCode !== "provider_quota" && !PROVIDER_QUOTA_ERROR_RE.test(error)) return null;
 
   const persistedRetryAt = readNonEmptyString(resultJson.retryNotBefore) ??
@@ -5387,6 +5469,87 @@ export function recoveryService(
     });
   }
 
+  // BLO-21395: cross-post a deduplicated failure receipt to the routine's alert
+  // surface (`routines.parentIssueId`) when a scheduled window strands before
+  // user code ever ran. The in-run pre-flight heartbeat lives inside the
+  // runbook itself and cannot fire for this class of failure -- capacity waits,
+  // stale-kills, and other pre-execution lifecycle failures never hand control
+  // to user code at all -- so silence here is otherwise indistinguishable from
+  // health on the routine's tracking issue. Scoped strictly to `originKind ===
+  // "routine_execution"`; every other stranded-issue escalation path is
+  // unaffected.
+  //
+  // "Never ran user code" is evidenced by the absence of ANY `heartbeat_runs`
+  // row for this issue with `lastUsefulActionAt` set. That is also the reason
+  // this never double-posts for a normal completion or for a runbook-emitted
+  // failure heartbeat: both require the agent to have actually produced output,
+  // which sets `lastUsefulActionAt` on at least one run.
+  async function postRoutineSchedulerFailureHeartbeat(input: {
+    issue: typeof issues.$inferSelect;
+    recoveryCause: StrandedRecoveryCause;
+    latestRun: LatestIssueRun;
+    prefix: string;
+  }) {
+    const { issue, recoveryCause, latestRun, prefix } = input;
+    if (issue.originKind !== "routine_execution" || !issue.originId) return;
+
+    try {
+      const routine = await db
+        .select({ id: routines.id, parentIssueId: routines.parentIssueId, title: routines.title })
+        .from(routines)
+        .where(and(eq(routines.companyId, issue.companyId), eq(routines.id, issue.originId)))
+        .then((rows) => rows[0] ?? null);
+      // No configured alert surface -- nothing to cross-post to. Not an error:
+      // most routines don't parent their executions under a tracking issue.
+      if (!routine || !routine.parentIssueId) return;
+
+      const ranUserCode = await db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(and(
+          eq(heartbeatRuns.contextIssueId, issue.id),
+          sql`${heartbeatRuns.lastUsefulActionAt} IS NOT NULL`,
+        ))
+        .limit(1)
+        .then((rows) => rows.length > 0);
+      if (ranUserCode) return;
+
+      const run = issue.originRunId
+        ? await db
+          .select({ triggeredAt: routineRuns.triggeredAt })
+          .from(routineRuns)
+          .where(eq(routineRuns.id, issue.originRunId))
+          .then((rows) => rows[0] ?? null)
+        : null;
+      const windowKey = (run?.triggeredAt ?? issue.createdAt).toISOString();
+      const idempotencyKey = buildSchedulerFailureHeartbeatKey({ routineId: routine.id, windowKey });
+      const failureClass = latestRun?.errorCode ?? recoveryCause;
+
+      await issuesSvc.addComment(
+        routine.parentIssueId,
+        [
+          `**Scheduler-side failure heartbeat.** Routine \`${routine.title}\` (\`${routine.id}\`) window ` +
+            `\`${windowKey}\` reached \`issue_created\` but never executed user code, so the runbook's own ` +
+            "pre-flight heartbeat could not run for this window.",
+          "",
+          `- Execution issue: ${issueUiLink(issue, prefix)}`,
+          `- Routine run: \`${issue.originRunId ?? "unknown"}\``,
+          `- Failure class: \`${failureClass}\``,
+          `- Idempotency key: \`${idempotencyKey}\``,
+        ].join("\n"),
+        {},
+        { authorType: "system", idempotencyKey },
+      );
+    } catch (err) {
+      // Never let a missing/renamed alert surface or a transient DB error break
+      // the stranded-issue escalation this heartbeat rides along with.
+      logger.warn(
+        { err, issueId: issue.id, routineId: issue.originId },
+        "failed to post scheduler-side failure heartbeat",
+      );
+    }
+  }
+
   async function escalateStrandedAssignedIssue(input: {
     issue: typeof issues.$inferSelect;
     previousStatus: StrandedPreviousStatus;
@@ -5538,6 +5701,11 @@ export function recoveryService(
           hasNewActivitySinceLastAttempt,
           needsHumanDecision,
           blockerIds,
+          // BLO-21395: `null` suppresses the scheduler-side failure heartbeat. A provider
+          // capacity park is not a strand the system has committed to — it may still
+          // self-heal on retry — so emitting here would post a dark-window receipt about a
+          // window that is very likely still live. Non-null on the stranding path below.
+          schedulerFailureHeartbeat: null,
         };
       }
 
@@ -5781,6 +5949,11 @@ export function recoveryService(
         needsHumanDecision,
         blockerIds,
         publishEscalationActivity,
+        // BLO-21395: the scheduler-side failure heartbeat is cross-posted after this
+        // transaction commits, and `prefix` is only derived in here — threading it out
+        // beats a second `getCompanyIssuePrefix` round trip on the same company. Non-null
+        // marks this as a real strand, distinguishing it from the provider-quota park above.
+        schedulerFailureHeartbeat: { prefix },
       };
     });
     if (!escalation) return null;
@@ -5828,6 +6001,22 @@ export function recoveryService(
         blockedByIssueIds: escalation.blockerIds,
       });
     }
+
+    // BLO-21395: cross-post the scheduler-side failure heartbeat to the routine's alert
+    // surface, so a window that stranded before its runbook could emit is never silent.
+    // Deliberately after commit, next to the other deferred side-effects: this writes a
+    // comment to a *different* issue, and inside the transaction a failure to post would
+    // roll back an escalation that is otherwise correct and already decided. `null` means
+    // the provider-quota park path, which must not emit — see the early return above.
+    if (escalation.schedulerFailureHeartbeat) {
+      await postRoutineSchedulerFailureHeartbeat({
+        issue: escalation.fresh,
+        recoveryCause: escalation.recoveryCause,
+        latestRun: input.latestRun,
+        prefix: escalation.schedulerFailureHeartbeat.prefix,
+      });
+    }
+
     return escalation.updated;
   }
 
@@ -6171,7 +6360,7 @@ export function recoveryService(
       .where(
         and(
           isNull(issues.assigneeUserId),
-          inArray(issues.status, ["todo", "in_progress", "in_review"]),
+          inArray(issues.status, STRANDED_ASSIGNED_ISSUE_STATUSES),
           or(
             sql`${issues.assigneeAgentId} is not null`,
             eq(issues.status, "in_review"),
@@ -6253,6 +6442,15 @@ export function recoveryService(
       }
 
       let latestRun = await getLatestIssueRun(issue.companyId, issue.id);
+      // `issue_terminal_status` means this queued dispatch was correctly
+      // cancelled while the issue was terminal. The candidate query above has
+      // already established that the issue is non-terminal now, so this is
+      // stale lifecycle evidence rather than a failure to escalate or a reason
+      // to keep skipping the issue forever. Clear it before classification,
+      // but retain the flag so an `in_progress` issue reaches the normal
+      // continuation re-dispatch below instead of the generic no-run skip.
+      const reopenedAfterTerminalDispatchRace = isTerminalDispatchRaceRun(latestRun);
+      if (reopenedAfterTerminalDispatchRace) latestRun = null;
       // Set when this issue's newest run is a handover marker whose successor
       // can no longer be identified. Distinguishes "adopted, then the lock was
       // cleaned up" from "this issue genuinely has no run history at all" —
@@ -6924,7 +7122,8 @@ export function recoveryService(
         !latestRun &&
         !issue.checkoutRunId &&
         !issue.executionRunId &&
-        !adoptionHandoverLostSuccessor
+        !adoptionHandoverLostSuccessor &&
+        !reopenedAfterTerminalDispatchRace
       ) {
         result.skipped += 1;
         continue;
@@ -8611,6 +8810,19 @@ export function recoveryService(
    * `reconcileStrandedAssignedIssues`'s status filter. Some blocked issues are deliberately
    * terminal from the ordinary stranded-work sweep; only an active recovery action proves
    * that an owner wake is still the intended next step.
+   *
+   * `backlog` is also selected here, but is *folded* rather than woken (BLO-25907). It used
+   * to be selected by nothing: `reconcileStrandedAssignedIssues` covers
+   * todo/in_progress/in_review and this sweep covered only blocked, so an assigned backlog
+   * issue carrying an active action was invisible to both and nothing ever re-drove it —
+   * BLO-16074 sat that way for 27 days with `updatedAt == createdAt`. Waking is the wrong
+   * repair because backlog deliberately means "not dispatchable", so re-delivering an owner
+   * wake would contradict the status. Resolving the action is the honest repair: it keeps
+   * the active set truthful without claiming a backlog issue is schedulable. Selecting it
+   * here rather than relying only on the write-time fold in
+   * `classifySourceRecoveryRevalidation` is what heals rows that are *already* parked, since
+   * that classifier only runs when something writes to the issue and the failure mode is
+   * that nothing does.
    */
   async function reconcileStrandedRecoveryWakeBackstop(opts?: {
     runId?: string | null;
@@ -8621,6 +8833,7 @@ export function recoveryService(
     const result = {
       checked: 0,
       healed: 0,
+      backlogParkedResolved: 0,
       noOwnerSkipped: 0,
       causeSkipped: 0,
       exhaustedSkipped: 0,
@@ -8644,7 +8857,7 @@ export function recoveryService(
     const queryCandidates = (afterActionId: string | null) => {
       const filters = [
         inArray(issueRecoveryActions.status, ["active", "escalated"]),
-        eq(issues.status, "blocked"),
+        inArray(issues.status, STRANDED_RECOVERY_WAKE_BACKSTOP_ISSUE_STATUSES),
         visibleIssueCondition(),
         sql`${issues.assigneeAgentId} is not null`,
       ];
@@ -8661,6 +8874,7 @@ export function recoveryService(
           actionTimeoutAt: issueRecoveryActions.timeoutAt,
           actionLastAttemptAt: issueRecoveryActions.lastAttemptAt,
           issueId: issues.id,
+          issueStatus: issues.status,
           identifier: issues.identifier,
           totalCount: sql<number>`count(*) over()::int`,
         })
@@ -8697,6 +8911,55 @@ export function recoveryService(
     }
 
     for (const candidate of candidates) {
+      // `backlog` is selected so the action cannot become a zombie, but it is folded rather
+      // than woken: the status means "deliberately not dispatchable", so re-delivering an
+      // owner wake would contradict the park. Resolving keeps the active set honest. This
+      // runs ahead of the owner/cause/cooldown gates on purpose — those gates decide whether
+      // a *wake* is worth attempting, and none of them apply to an action that is never
+      // going to be serviced at all.
+      if ((STRANDED_RECOVERY_WAKE_BACKSTOP_FOLD_ONLY_STATUSES as readonly string[])
+        .includes(candidate.issueStatus)) {
+        const resolutionNote =
+          `Recovery action became stale because the source issue is parked in ${candidate.issueStatus}, `
+          + "which is not dispatchable, so no sweep will re-drive its owner.";
+        const resolved = await recoveryActionsSvc.resolveActiveForIssue({
+          companyId: candidate.companyId,
+          sourceIssueId: candidate.issueId,
+          actionId: candidate.actionId,
+          status: "cancelled",
+          outcome: "cancelled",
+          resolutionNote,
+        });
+        if (!resolved) {
+          result.claimLost += 1;
+          continue;
+        }
+        result.backlogParkedResolved += 1;
+        result.issueIds.push(candidate.issueId);
+        await logActivity(db, {
+          companyId: candidate.companyId,
+          actorType: "system",
+          actorId: "stranded_recovery_wake_backstop",
+          agentId: candidate.actionOwnerAgentId,
+          runId: opts?.runId ?? null,
+          action: "issue.recovery_action_resolved",
+          entityType: "issue",
+          entityId: candidate.issueId,
+          details: {
+            source: "recovery.stranded_recovery_wake_backstop",
+            identifier: candidate.identifier,
+            status: candidate.issueStatus,
+            recoveryActionId: resolved.id,
+            recoveryActionStatus: resolved.status,
+            outcome: resolved.outcome,
+            resolutionNote: resolved.resolutionNote,
+            recoveryCause: candidate.actionCause,
+            recoveryOwnerAgentId: candidate.actionOwnerAgentId,
+          },
+        });
+        continue;
+      }
+
       const ownerAgentId = candidate.actionOwnerAgentId;
       if (!ownerAgentId) {
         result.noOwnerSkipped += 1;
@@ -8810,7 +9073,7 @@ export function recoveryService(
           details: {
             source: "recovery.stranded_recovery_wake_backstop",
             identifier: candidate.identifier,
-            status: "blocked",
+            status: candidate.issueStatus,
             wakeupRunId: wake.id,
             recoveryActionId: candidate.actionId,
             recoveryCause: candidate.actionCause,
