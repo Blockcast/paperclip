@@ -63,8 +63,17 @@ const apiPrefixes: Record<string, string> = {
   "workspace-scan.ts": "/api",
 };
 
-const ROUTE_LITERAL_PATTERN = /router\.(get|post|put|patch|delete)\(\s*["'`]([^"'`]+)["'`]/g;
+// Captures the first argument of every route registration, whatever form it takes:
+// a quoted literal, a path constant, or something this scanner cannot resolve. The
+// unresolved case is surfaced rather than skipped — a silently-dropped registration
+// would leave the guard audit below with a blind spot that its vacuity check, which
+// only counts what the scanner did find, cannot detect.
+const ROUTE_REGISTRATION_PATTERN = /router\.(get|post|put|patch|delete)\(\s*([^,)\s]+)/g;
 const ROUTER_METHOD_PATTERN = /router\.(get|post|put|patch|delete)\(/;
+// `export const SOME_PATH = "/literal"` in the routes directory. Deliberately
+// excludes template literals, which can interpolate and so have no static value.
+const EXPORTED_PATH_CONSTANT_PATTERN = /export const ([A-Za-z_$][\w$]*)\s*=\s*["']([^"'`]+)["']/g;
+const QUOTED_LITERAL_PATTERN = /^["'`]([^"'`]*)["'`]$/;
 const HTTP_METHODS = new Set(["get", "put", "post", "delete", "options", "head", "patch", "trace"]);
 const explicitOpenApiCoverageExclusions = new Set([
   // Pipeline routes are experimental and not yet represented in the public OpenAPI document.
@@ -105,11 +114,56 @@ function resolveMountedPath(file: string, prefix: string, routePath: string) {
   return `${prefix}${routePath}`;
 }
 
-function loadActualRoutes() {
-  const routes = new Set<string>();
+function routeSourceFiles() {
+  return fs.readdirSync(ROUTES_DIR).filter((entry) => entry.endsWith(".ts"));
+}
+
+// `IDENT -> "/literal"` for every statically-valued path constant exported from the
+// routes directory, so `router.post(COMPANY_IMPORT_ROUTE_PATH, ...)` resolves without
+// a hand-maintained special case. Excluded files are still scanned for constants —
+// a constant may live in a file whose own routes are out of OpenAPI scope.
+function loadExportedPathConstants() {
+  const constants = new Map<string, string>();
+
+  for (const file of routeSourceFiles()) {
+    const source = fs.readFileSync(path.join(ROUTES_DIR, file), "utf8");
+    for (const match of source.matchAll(EXPORTED_PATH_CONSTANT_PATTERN)) {
+      constants.set(match[1], match[2]);
+    }
+  }
+
+  return constants;
+}
+
+function resolveRouteArgument(rawArgument: string, constants: Map<string, string>) {
+  const literal = QUOTED_LITERAL_PATTERN.exec(rawArgument);
+  if (literal) return literal[1];
+  return constants.get(rawArgument) ?? null;
+}
+
+type RouteRegistration = {
+  key: string;
+  /**
+   * Source from this registration to the next one in the same file. Used to attribute
+   * guard calls to a route; a helper declared between two registrations would attach
+   * to the preceding one, which shows up as a false positive (a loud failure) rather
+   * than a silent miss.
+   */
+  segment: string;
+};
+
+/**
+ * Single inventory of the route registrations found in the route sources, shared by
+ * the OpenAPI coverage test and the instance-admin guard audit so both see exactly
+ * the same set of routes.
+ */
+function loadRouteRegistrations() {
+  const constants = loadExportedPathConstants();
+  const registrations: RouteRegistration[] = [];
+  const unresolvedRegistrations: string[] = [];
   const unknownRouteFiles: string[] = [];
 
-  for (const file of fs.readdirSync(ROUTES_DIR).filter((entry) => entry.endsWith(".ts"))) {
+  for (const file of routeSourceFiles()) {
     if (explicitOpenApiCoverageExclusions.has(file)) continue;
     const prefix = apiPrefixes[file];
     const source = fs.readFileSync(path.join(ROUTES_DIR, file), "utf8");
@@ -120,18 +174,34 @@ function loadActualRoutes() {
       continue;
     }
 
-    for (const match of source.matchAll(ROUTE_LITERAL_PATTERN)) {
-      const method = match[1].toUpperCase();
-      const routePath = match[2];
-      routes.add(`${method} ${normalizeExpressPath(resolveMountedPath(file, prefix, routePath))}`);
-    }
+    const matches = [...source.matchAll(ROUTE_REGISTRATION_PATTERN)];
+    matches.forEach((match, index) => {
+      const start = match.index ?? 0;
+      const end = index + 1 < matches.length ? (matches[index + 1].index ?? source.length) : source.length;
+      const routePath = resolveRouteArgument(match[2], constants);
+      if (routePath === null) {
+        unresolvedRegistrations.push(`${file}: router.${match[1]}(${match[2]}`);
+        return;
+      }
 
-    if (file === "companies.ts" && source.includes("router.post(COMPANY_IMPORT_ROUTE_PATH")) {
-      routes.add("POST /api/companies/import");
-    }
+      const method = match[1].toUpperCase();
+      registrations.push({
+        key: `${method} ${normalizeExpressPath(resolveMountedPath(file, prefix, routePath))}`,
+        segment: source.slice(start, end),
+      });
+    });
   }
 
-  return { routes, unknownRouteFiles: unknownRouteFiles.sort() };
+  return {
+    registrations,
+    unresolvedRegistrations: unresolvedRegistrations.sort(),
+    unknownRouteFiles: unknownRouteFiles.sort(),
+  };
+}
+
+function loadActualRoutes() {
+  const { registrations, unknownRouteFiles } = loadRouteRegistrations();
+  return { routes: new Set(registrations.map((registration) => registration.key)), unknownRouteFiles };
 }
 
 function loadSpecRoutes() {
@@ -163,34 +233,23 @@ const CONDITIONAL_INSTANCE_ADMIN_OPERATIONS = new Set([
   "POST /api/invites/{inviteId}/revoke",
 ]);
 
-// Route handlers that enforce instance admin, derived from the route sources.
-// Segments run from one `router.<method>(` literal to the next, so a helper
-// defined between two route registrations would attach to the preceding route;
-// no such helper exists today, and the assertion below fails loudly if one lands.
+// Route handlers that enforce instance admin, derived from the shared registration
+// inventory so a route registered through a path constant is audited too.
 function loadInstanceAdminGuardedRoutes() {
-  const routes = new Set<string>();
+  const { registrations } = loadRouteRegistrations();
+  const guarded = new Set<string>();
+  const exempted = new Set<string>();
 
-  for (const file of fs.readdirSync(ROUTES_DIR).filter((entry) => entry.endsWith(".ts"))) {
-    if (explicitOpenApiCoverageExclusions.has(file)) continue;
-    const prefix = apiPrefixes[file];
-    if (!prefix) continue;
-
-    const source = fs.readFileSync(path.join(ROUTES_DIR, file), "utf8");
-    const matches = [...source.matchAll(ROUTE_LITERAL_PATTERN)];
-
-    matches.forEach((match, index) => {
-      const start = match.index ?? 0;
-      const end = index + 1 < matches.length ? (matches[index + 1].index ?? source.length) : source.length;
-      if (!INSTANCE_ADMIN_GUARD_PATTERN.test(source.slice(start, end))) return;
-
-      const method = match[1].toUpperCase();
-      const key = `${method} ${normalizeExpressPath(resolveMountedPath(file, prefix, match[2]))}`;
-      if (CONDITIONAL_INSTANCE_ADMIN_OPERATIONS.has(key)) return;
-      routes.add(key);
-    });
+  for (const registration of registrations) {
+    if (!INSTANCE_ADMIN_GUARD_PATTERN.test(registration.segment)) continue;
+    if (CONDITIONAL_INSTANCE_ADMIN_OPERATIONS.has(registration.key)) {
+      exempted.add(registration.key);
+      continue;
+    }
+    guarded.add(registration.key);
   }
 
-  return routes;
+  return { guarded, exempted };
 }
 
 describe("openapi routes", () => {
@@ -292,9 +351,23 @@ describe("openapi routes", () => {
     expect(spec.paths["/api/companies/import"].post.responses["202"]).toBeDefined();
   });
 
+  it("resolves every route registration form in the route sources", () => {
+    // The guard audit below can only classify routes this scanner resolved, and its
+    // vacuity check counts only what was found — so an unresolvable registration form
+    // (a builder call, or an interpolated template path) would create a silent blind
+    // spot. Fail explicitly instead, naming the registration that needs support.
+    const { unresolvedRegistrations, registrations } = loadRouteRegistrations();
+
+    expect(unresolvedRegistrations).toEqual([]);
+    expect(registrations.length).toBeGreaterThan(100);
+    // Registered as `router.post(COMPANY_IMPORT_ROUTE_PATH, ...)`, so this passes only
+    // while path constants really are being resolved rather than skipped.
+    expect(registrations.map((registration) => registration.key)).toContain("POST /api/companies/import");
+  });
+
   it("classifies every instance-admin-guarded route as instance_admin", () => {
     const { spec } = loadSpecRoutes();
-    const guarded = [...loadInstanceAdminGuardedRoutes()].sort();
+    const guarded = [...loadInstanceAdminGuardedRoutes().guarded].sort();
 
     // Guards against the parser silently matching nothing and passing vacuously.
     expect(guarded.length).toBeGreaterThan(10);
@@ -339,5 +412,16 @@ describe("openapi routes", () => {
     expect(spec.paths["/api/invites/{inviteId}/revoke"].post["x-paperclip-authorization"]).not.toHaveProperty(
       "instanceAdmin",
     );
+  });
+
+  it("keeps every conditional-guard exemption backed by a real route and a real guard", () => {
+    // The exemption set is the one way this audit can be weakened, so each entry has
+    // to earn its place: it must match a route the scanner actually found, and that
+    // route's handler must actually reach `assertInstanceAdmin`. A stale or mistyped
+    // key would otherwise sit here silently exempting nothing — or worse, keep
+    // exempting a route whose guard has since become unconditional.
+    const { exempted } = loadInstanceAdminGuardedRoutes();
+
+    expect([...exempted].sort()).toEqual([...CONDITIONAL_INSTANCE_ADMIN_OPERATIONS].sort());
   });
 });
