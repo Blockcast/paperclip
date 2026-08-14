@@ -58,9 +58,17 @@ export type ReferencedRepo = {
 export type IssueRepoBindingSignal = {
   /**
    * `bound_mismatch` — bound to A, description names only repos other than A.
-   * `unbound_issue` — the issue has no repo binding at all, yet names one.
+   * `no_binding` — no workspace resolves for this issue at all, yet it names
+   *   a repo. Arguably BLO-18760's defect (born workspace-less) rather than
+   *   this guard's, so it is reported separately and not as a mis-homing.
+   * `binding_without_repo_url` — a workspace DOES resolve, but its `repoUrl`
+   *   is null or unparseable, so there is nothing to compare against.
+   *   `project_workspaces.repo_url` is nullable and `source_type` defaults to
+   *   `local_path`, so this is an ordinary shape, not an edge case. The fix is
+   *   to populate that workspace's `repoUrl` — a different action from
+   *   re-homing the issue — so it names the workspace.
    */
-  kind: "bound_mismatch" | "unbound_issue";
+  kind: "bound_mismatch" | "no_binding" | "binding_without_repo_url";
   boundRepoSlug: string | null;
   /** Bound `owner/repo` in its original casing, for display. */
   boundRepoDisplay: string | null;
@@ -168,8 +176,17 @@ export async function evaluateIssueRepoBinding(
     };
   });
 
+  // Three distinct states, and they take three different fixes. `bound` null
+  // means no workspace row resolved; `bound` non-null with a null identityKey
+  // means a workspace resolved but carries no parseable repoUrl.
+  const kind = bound?.identityKey
+    ? ("bound_mismatch" as const)
+    : bound
+      ? ("binding_without_repo_url" as const)
+      : ("no_binding" as const);
+
   return {
-    kind: bound?.identityKey ? "bound_mismatch" : "unbound_issue",
+    kind,
     boundRepoSlug: bound?.slug ?? null,
     boundRepoDisplay: bound?.display ?? null,
     boundWorkspaceName: bound?.workspaceName ?? null,
@@ -209,6 +226,12 @@ async function resolveBoundRepo(
       )
       .then((rows) => rows[0] ?? null);
     if (row) {
+      // Deliberately returns even when repoUrl is null/unparseable rather than
+      // falling through to the project workspace: a pinned execution workspace
+      // IS the binding, and comparing against a different workspace's repo
+      // would report a mismatch the run would never actually hit. The
+      // unparseable case surfaces as `binding_without_repo_url` naming this
+      // workspace, which is the actionable signal.
       const identity = parseRepoIdentity(row.repoUrl);
       return {
         identityKey: identity?.key ?? null,
@@ -259,6 +282,23 @@ const BOUND_SOURCE_LABEL: Record<IssueRepoBindingSource, string> = {
   project_primary: "project's primary workspace",
 };
 
+/**
+ * Render a value inside a Markdown code span. Workspace and project names are
+ * user-set, so a backtick in one would otherwise close the span early and
+ * garble the rest of the line. Fenced with the shortest run of backticks that
+ * does not occur in the value, per CommonMark.
+ */
+function codeSpan(value: string): string {
+  const longestRun = [...value.matchAll(/`+/g)].reduce(
+    (max, match) => Math.max(max, match[0].length),
+    0,
+  );
+  const fence = "`".repeat(longestRun + 1);
+  // A code span whose content starts or ends with a backtick needs padding.
+  const pad = value.startsWith("`") || value.endsWith("`") ? " " : "";
+  return `${fence}${pad}${value}${pad}${fence}`;
+}
+
 /** Render the advisory comment. Names both sides, recommends nothing automatic. */
 export function formatIssueRepoBindingComment(signal: IssueRepoBindingSignal): string {
   const lines: string[] = [];
@@ -271,27 +311,40 @@ export function formatIssueRepoBindingComment(signal: IssueRepoBindingSignal): s
   );
   lines.push("");
 
-  if (signal.kind === "unbound_issue") {
+  const sourceLabel = signal.boundSource ? BOUND_SOURCE_LABEL[signal.boundSource] : "workspace";
+  const workspace = signal.boundWorkspaceName ? ` ${codeSpan(signal.boundWorkspaceName)}` : "";
+
+  if (signal.kind === "no_binding") {
     lines.push("- **Bound to:** *no workspace at all* — this issue has no repo binding.");
+  } else if (signal.kind === "binding_without_repo_url") {
+    // Distinct fix from re-homing: populate the workspace, don't move the issue.
+    lines.push(
+      `- **Bound to:** ${sourceLabel}${workspace}, which has **no \`repoUrl\` set** — ` +
+        "so there is nothing to compare the description against.",
+    );
   } else {
-    const workspace = signal.boundWorkspaceName ? ` \`${signal.boundWorkspaceName}\`` : "";
-    const source = signal.boundSource ? BOUND_SOURCE_LABEL[signal.boundSource] : "workspace";
-    lines.push(`- **Bound to:** \`${signal.boundRepoDisplay ?? signal.boundRepoSlug}\` (${source}${workspace})`);
+    lines.push(
+      `- **Bound to:** ${codeSpan(signal.boundRepoDisplay ?? signal.boundRepoSlug ?? "")} ` +
+        `(${sourceLabel}${workspace})`,
+    );
   }
 
   for (const ref of signal.references) {
     const where =
       ref.resolution.kind === "other_workspace"
         ? `bound in project **${ref.resolution.projectName}**` +
-          (ref.resolution.workspaceName ? ` (workspace \`${ref.resolution.workspaceName}\`)` : "")
+          (ref.resolution.workspaceName ? ` (workspace ${codeSpan(ref.resolution.workspaceName)})` : "")
         : "**no workspace in this company binds this repo**";
-    lines.push(`- **Description names:** \`${ref.display}\` — ${where}`);
+    lines.push(`- **Description names:** ${codeSpan(ref.display)} — ${where}`);
   }
 
   lines.push("");
   lines.push(
-    "If the description is right, move this issue to the project whose workspace is that repo. " +
-      "If the binding is right, ignore this comment.",
+    signal.kind === "binding_without_repo_url"
+      ? "If the description is right, set that workspace's `repoUrl` — or move this issue to " +
+          "the project whose workspace is that repo. If the binding is right, ignore this comment."
+      : "If the description is right, move this issue to the project whose workspace is that repo. " +
+          "If the binding is right, ignore this comment.",
   );
   return lines.join("\n");
 }

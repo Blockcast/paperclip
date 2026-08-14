@@ -212,6 +212,56 @@ describe("extractRepoReferences — branch names are not repos", () => {
   });
 });
 
+describe("extractRepoReferences — the host must actually be github.com", () => {
+  // Ally review on PR #1323: an unanchored host pattern matched any host
+  // *ending* in github.com and read the next two path segments as owner/repo.
+  // These land in the `url` tier, which no denylist or cue rule filters, so
+  // each one used to fire an advisory naming a repository that does not exist.
+  const notGithub = [
+    "https://api.github.com/repos/Blockcast/paperclip/pulls/1323",
+    "https://docs.github.com/en/actions/using-workflows",
+    "https://gist.github.com/someuser/2f00e557e1da40262556496b5501fc6f4f9ec658",
+    "https://raw.githubusercontent.com/Blockcast/paperclip/master/README.md",
+    "mirror at notgithub.com/Blockcast/paperclip",
+    "our fork at evilgithub.com/Blockcast/paperclip",
+  ];
+  for (const text of notGithub) {
+    it(`ignores a non-github.com host: ${text}`, () => {
+      expect(extractRepoReferences(text)).toEqual([]);
+    });
+  }
+
+  it("still matches the real host in the shapes that occur in prose", () => {
+    const cases: Array<[string, string]> = [
+      ["https://github.com/Blockcast/paperclip", "blockcast/paperclip"],
+      ["see github.com/Blockcast/magma for context", "blockcast/magma"],
+      ["[the fix](https://github.com/Blockcast/frr)", "blockcast/frr"],
+      ["<https://www.github.com/Blockcast/hindsight>", "blockcast/hindsight"],
+      ["clone git@github.com:Blockcast/onprem-k8s.git", "blockcast/onprem-k8s"],
+      ["repo:github.com/Blockcast/trafficcontrol", "blockcast/trafficcontrol"],
+    ];
+    for (const [text, slug] of cases) {
+      expect(extractRepoReferences(text).map((r) => r.slug), text).toEqual([slug]);
+    }
+  });
+
+  it("does not treat the REST `repos` prefix as an owner", () => {
+    expect(
+      extractRepoReferences("call github.com/repos/Blockcast/paperclip/pulls"),
+    ).toEqual([]);
+  });
+
+  it("PCL-601: the `organizations` site route is not an owner", () => {
+    // Found by the post-fix sweep: a runbook step linking the GitHub App
+    // creation page read as owner `organizations`, repo `Blockcast`.
+    expect(
+      extractRepoReferences(
+        "Browse to **<https://github.com/organizations/Blockcast/settings/apps/new>** and fill in:",
+      ),
+    ).toEqual([]);
+  });
+});
+
 describe("parseRepoIdentity", () => {
   it("normalizes an https workspace repoUrl", () => {
     expect(parseRepoIdentity("https://github.com/Blockcast/paperclip.git")).toMatchObject({
