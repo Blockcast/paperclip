@@ -1046,6 +1046,34 @@ describe("github-webhook pure helpers", () => {
     expect(__test_shouldFirePrReviewerWake(ctx)).toBe(true);
   });
 
+  // Review finding (PR #1125): the reviewed-head provenance must be the
+  // review's own immutable `commit_id`, not `pull_request.head.sha` -- the
+  // latter reflects whatever the branch is at NOW, which can have advanced
+  // past what the review actually looked at by the time this webhook is
+  // processed.
+  it("prefers review.commit_id over pull_request.head.sha for headSha when the branch has since advanced (PR #1125 review finding)", () => {
+    const ctx = __test_resolveEventContext("pull_request_review", {
+      action: "submitted",
+      pull_request: {
+        number: 953,
+        title: "feat(cdn): BLO-5269 aggregator",
+        body: null,
+        html_url: "https://github.com/Blockcast/magma/pull/953",
+        // The branch has advanced past what this review actually reviewed.
+        head: { ref: "feat/BLO-5269", sha: "advanced-after-review" },
+      },
+      review: {
+        body: "Critical: PushExtCDNCacheHitRates POSTs to a read-only serializer.",
+        state: "commented",
+        html_url: "https://github.com/Blockcast/magma/pull/953#pullrequestreview-99",
+        user: { login: "ally" },
+        commit_id: "reviewed-this-commit",
+      },
+      repository: { full_name: "Blockcast/magma" },
+    });
+    expect(ctx).toMatchObject({ headSha: "reviewed-this-commit" });
+  });
+
   it("flags the reviewer's own pull_request_review.submitted as a self-echo (BLO-15799)", () => {
     const reviewCtx = (login: string) =>
       __test_resolveEventContext("pull_request_review", {
@@ -5496,6 +5524,746 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(authorWakes).toEqual([]);
   });
 
+  // BLO-19497: second and later Ally reviews on the same PR must still
+  // produce a Changes-Requested comment. Before this fix,
+  // reopenInReviewIssueForActionablePrFeedback short-circuited the ENTIRE
+  // write -- comment included -- unless `issue.status === "in_review"`.
+  // Review #1 flips status to `in_progress` as part of handing the PR back to
+  // its author, so review #2+ on the same PR always found a non-`in_review`
+  // status and silently produced zero comment, forever.
+  function reviewSubmittedFeedbackPayload(input: {
+    prNumber: number;
+    reviewId: number;
+    state: string;
+    headSha: string;
+    identifier: string;
+    reviewAuthorLogin?: string;
+    body?: string;
+  }) {
+    return {
+      action: "submitted",
+      pull_request: {
+        number: input.prNumber,
+        title: `Fix hosted vault onboarding (${input.identifier})`,
+        body: null,
+        html_url: `https://github.com/Blockcast/paperclip/pull/${input.prNumber}`,
+        head: { ref: "codex/fix-vault", sha: input.headSha },
+        user: { login: "codex-bot" },
+      },
+      review: {
+        id: input.reviewId,
+        body: input.body ?? "Please fix before merge.",
+        state: input.state,
+        html_url: `https://github.com/Blockcast/paperclip/pull/${input.prNumber}#pullrequestreview-${input.reviewId}`,
+        user: { login: input.reviewAuthorLogin ?? "allyblockcast[bot]" },
+      },
+      repository: { full_name: "Blockcast/paperclip" },
+    };
+  }
+
+  async function sendReviewSubmitted(
+    app: ReturnType<typeof buildApp>,
+    payload: Record<string, unknown>,
+    deliveryId: string,
+  ) {
+    const { body, signature } = signedRequest(payload);
+    return request(app)
+      .post("/api/webhooks/github")
+      .set("x-github-event", "pull_request_review")
+      .set("x-hub-signature-256", signature)
+      .set("x-github-delivery", deliveryId)
+      .set("content-type", "application/json")
+      .send(body);
+  }
+
+  it("emits a Changes-Requested comment for every distinct review on a PR, not just the first, and dedupes redelivery of one review id (BLO-19497)", async () => {
+    const { agentId, issueId } = await seedIssueWithIdentifier("PEN-1126", { status: "in_review" });
+    const app = buildApp({ prReviewerBotLogin: "allyblockcast[bot]" });
+
+    const review1 = reviewSubmittedFeedbackPayload({
+      prNumber: 850,
+      reviewId: 111,
+      state: "changes_requested",
+      headSha: "sha-one",
+      identifier: "PEN-1126",
+    });
+    const res1 = await sendReviewSubmitted(app, review1, "delivery-review-1");
+    expect(res1.status).toBe(200);
+    expect(res1.body.reopened).toEqual([{ issueIdentifier: "PEN-1126", commentId: expect.any(String) }]);
+
+    const [afterFirst] = await db.select({ status: issues.status }).from(issues).where(eq(issues.id, issueId));
+    expect(afterFirst?.status).toBe("in_progress");
+
+    // Review #2: a genuinely new review (distinct review id, distinct head
+    // sha) lands while the issue is still `in_progress` -- nothing moved it
+    // back to `in_review` between the two reviews, which is the normal case
+    // when the author hasn't resubmitted for review yet.
+    const review2 = reviewSubmittedFeedbackPayload({
+      prNumber: 850,
+      reviewId: 222,
+      state: "changes_requested",
+      headSha: "sha-two",
+      identifier: "PEN-1126",
+    });
+    const res2 = await sendReviewSubmitted(app, review2, "delivery-review-2");
+    expect(res2.status).toBe(200);
+    expect(res2.body.reopened).toEqual([]);
+    expect(res2.body.skipped).not.toContainEqual(
+      expect.objectContaining({ issueIdentifier: "PEN-1126" }),
+    );
+
+    const comments = await db
+      .select({ body: issueComments.body, metadata: issueComments.metadata })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    const feedbackComments = comments.filter(
+      (c) => (c.metadata as Record<string, unknown> | null)?.kind === "github_pr_review_feedback",
+    );
+    expect(feedbackComments).toHaveLength(2);
+    expect(feedbackComments.some((c) => c.body.includes("Reviewed head SHA: `sha-one`"))).toBe(true);
+    expect(feedbackComments.some((c) => c.body.includes("Reviewed head SHA: `sha-two`"))).toBe(true);
+
+    const wakes = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakes).toHaveLength(2);
+
+    // Redelivery of the exact same review id must still dedupe to one comment.
+    const res1Replay = await sendReviewSubmitted(app, review1, "delivery-review-1-replay");
+    expect(res1Replay.status).toBe(200);
+    const commentsAfterReplay = await db
+      .select({ id: issueComments.id, metadata: issueComments.metadata })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    expect(
+      commentsAfterReplay.filter(
+        (c) => (c.metadata as Record<string, unknown> | null)?.kind === "github_pr_review_feedback",
+      ),
+    ).toHaveLength(2);
+  });
+
+  // BLO-23267: real-world reproduction of the same defect via the
+  // COMMENT-shaped path (issue_comment, not pull_request_review.submitted) --
+  // the shape Ally's consolidated review actually takes. Payload bodies and
+  // comment ids are taken verbatim from Blockcast/paperclip#1123: round 1
+  // (5211484248) posted "## Changes Requested" 2s later; round 2 (5221029179,
+  // ~16.5h later) re-reported the same unresolved finding as still-present
+  // under a "### Prior Findings Dispositioned" heading, alongside its own
+  // non-zero "### Important Issues (1)" bucket, and produced nothing before
+  // this fix -- BLO-20775 sat unattended for 13h46m as a result.
+  it("wakes the author again on a second comment-shaped Ally review that re-reports an unresolved finding as still-present (BLO-23267 / #1123)", async () => {
+    const { agentId, issueId } = await seedIssueWithIdentifier("PEN-1126", { status: "in_review" });
+    const app = buildApp({ prReviewerBotLogin: "allyblockcast[bot]" });
+    const issuePayload = {
+      number: 269,
+      title: "Fix hosted vault onboarding",
+      body: "Closes PEN-1126",
+      html_url: "https://github.com/Blockcast/penstock-llm-proxy-core/pull/269",
+      pull_request: { url: "https://api.github.com/repos/Blockcast/penstock-llm-proxy-core/pulls/269" },
+      user: { login: "codex-bot" },
+    };
+
+    const round1Payload = {
+      action: "created",
+      issue: issuePayload,
+      comment: {
+        id: 5211484248,
+        body: [
+          "## Ally — Consolidated PR Review",
+          "",
+          "Reviewed head: eb12af73f34d0d9735148505d2f338dfe5de42a2",
+          "",
+          "### Critical Issues (0)",
+          "",
+          "### Important Issues (1)",
+          "- **[tests/code]** The asserted stale-useful/fresh-output state is not produced by the current running-output path.",
+          "",
+          "### Recommended Action",
+          "1. Address the Important issue this cycle before merge.",
+        ].join("\n"),
+        html_url: "https://github.com/Blockcast/penstock-llm-proxy-core/pull/269#issuecomment-5211484248",
+        user: { login: "allyblockcast[bot]" },
+      },
+      repository: { full_name: "Blockcast/penstock-llm-proxy-core" },
+    };
+    const round1 = signedRequest(round1Payload);
+    const round1Res = await request(app)
+      .post("/api/webhooks/github")
+      .set("x-github-event", "issue_comment")
+      .set("x-hub-signature-256", round1.signature)
+      .set("x-github-delivery", "delivery-blo23267-round1")
+      .set("content-type", "application/json")
+      .send(round1.body);
+    expect(round1Res.status).toBe(200);
+    expect(round1Res.body.reopened).toEqual([{ issueIdentifier: "PEN-1126", commentId: expect.any(String) }]);
+    expect(round1Res.body.wakes).toEqual([{ issueIdentifier: "PEN-1126", agentId }]);
+
+    const [afterRound1] = await db.select({ status: issues.status }).from(issues).where(eq(issues.id, issueId));
+    expect(afterRound1?.status).toBe("in_progress");
+
+    const round2Payload = {
+      action: "created",
+      issue: issuePayload,
+      comment: {
+        id: 5221029179,
+        body: [
+          "## Ally — Consolidated PR Review",
+          "",
+          "Reviewed head: ed97d2530c67a12a3c2e8bd9c33cb73eb2b8acbc",
+          "",
+          "### Prior Findings Dispositioned (1)",
+          "- **prior:eb12af7 important 1** — still-present — the replacement reachability rationale is still not valid.",
+          "",
+          "### Critical Issues (0)",
+          "",
+          "### Important Issues (1)",
+          "- **[prior:eb12af7 important 1]** The source comment and external-Job test still imply an unreachable claim.",
+          "",
+          "### Recommended Action",
+          "1. Correct the remaining cross-adapter reachability claim before merge.",
+        ].join("\n"),
+        html_url: "https://github.com/Blockcast/penstock-llm-proxy-core/pull/269#issuecomment-5221029179",
+        user: { login: "allyblockcast[bot]" },
+      },
+      repository: { full_name: "Blockcast/penstock-llm-proxy-core" },
+    };
+    const round2 = signedRequest(round2Payload);
+    const round2Res = await request(app)
+      .post("/api/webhooks/github")
+      .set("x-github-event", "issue_comment")
+      .set("x-hub-signature-256", round2.signature)
+      .set("x-github-delivery", "delivery-blo23267-round2")
+      .set("content-type", "application/json")
+      .send(round2.body);
+
+    expect(round2Res.status).toBe(200);
+    expect(round2Res.body.skipped ?? []).not.toContainEqual(
+      expect.objectContaining({ issueIdentifier: "PEN-1126" }),
+    );
+    expect(round2Res.body.wakes).toEqual([{ issueIdentifier: "PEN-1126", agentId }]);
+
+    const commentsAfterRound2 = await db
+      .select({ body: issueComments.body, metadata: issueComments.metadata })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    const feedbackCommentsAfterRound2 = commentsAfterRound2.filter(
+      (c) => (c.metadata as Record<string, unknown> | null)?.kind === "github_pr_review_feedback",
+    );
+    expect(feedbackCommentsAfterRound2).toHaveLength(2);
+    expect(feedbackCommentsAfterRound2.some((c) => c.body.includes("issuecomment-5211484248"))).toBe(true);
+    expect(feedbackCommentsAfterRound2.some((c) => c.body.includes("issuecomment-5221029179"))).toBe(true);
+
+    const wakesAfterRound2 = await db
+      .select({ id: agentWakeupRequests.id, reason: agentWakeupRequests.reason })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakesAfterRound2).toHaveLength(2);
+    expect(wakesAfterRound2.some((w) => w.reason === "github_pr_review_feedback")).toBe(true);
+  });
+
+  // BLO-23267 (CEO follow-up, #1125 live specimen): an issue identifier that
+  // appears ONLY in the review's narrative prose -- not in the reviewed PR's
+  // own title/body -- must not attribute a Changes-Requested wake to that
+  // issue. Live case: a comment-shaped Ally review on Blockcast/paperclip#1125
+  // (which is actually bound to BLO-20775's sibling PEN-1126) narrated the
+  // unrelated BLO-20775 stall as motivation; the substring match alone fired
+  // a wake on BLO-20775 within 246ms even though #1125 has no relationship
+  // to it -- its own PR was #1123 (a different PR entirely). ACM-9099 here
+  // stands in for that unrelated issue: it exists (different company/prefix
+  // so it can't collide with PEN-1126 in the seed helper), it is bound to a
+  // DIFFERENT PR, and its identifier shows up only inside this review's prose.
+  it("does not wake an issue whose identifier appears only in the review's narrative prose, not the reviewed PR's own title/body (BLO-23267 / #1125)", async () => {
+    const { agentId, issueId } = await seedIssueWithIdentifier("PEN-1126", { status: "in_review" });
+    const { agentId: unrelatedAgentId, issueId: unrelatedIssueId } = await seedIssueWithIdentifier("ACM-9099", {
+      status: "in_review",
+    });
+    const app = buildApp({ prReviewerBotLogin: "allyblockcast[bot]" });
+
+    const payload = {
+      action: "created",
+      issue: {
+        number: 269,
+        title: "Fix hosted vault onboarding",
+        // The PR's own binding -- this is the only issue this review should
+        // be able to affect.
+        body: "Closes PEN-1126",
+        html_url: "https://github.com/Blockcast/penstock-llm-proxy-core/pull/269",
+        pull_request: { url: "https://api.github.com/repos/Blockcast/penstock-llm-proxy-core/pulls/269" },
+        user: { login: "codex-bot" },
+      },
+      comment: {
+        id: 5231388259,
+        body: [
+          "## Ally — Consolidated PR Review",
+          "",
+          "Reviewed head: 3cb288e711d900283d3562b3adc9431f1a206a5f",
+          "",
+          "### Critical Issues (0)",
+          "",
+          "### Important Issues (1)",
+          // ACM-9099 appears here ONLY as background narrative about a
+          // different incident -- never in this PR's own title/body.
+          "- **[docs]** Note: this fix is motivated by the ACM-9099 stall this cycle, which sat unattended for hours.",
+          "",
+          "### Recommended Action",
+          "1. Tighten the wording of the motivation paragraph.",
+        ].join("\n"),
+        html_url: "https://github.com/Blockcast/penstock-llm-proxy-core/pull/269#issuecomment-5231388259",
+        user: { login: "allyblockcast[bot]" },
+      },
+      repository: { full_name: "Blockcast/penstock-llm-proxy-core" },
+    };
+    const signed = signedRequest(payload);
+    const res = await request(app)
+      .post("/api/webhooks/github")
+      .set("x-github-event", "issue_comment")
+      .set("x-hub-signature-256", signed.signature)
+      .set("x-github-delivery", "delivery-blo23267-prose-mention")
+      .set("content-type", "application/json")
+      .send(signed.body);
+
+    expect(res.status).toBe(200);
+    // The PR's own bound issue still gets its legitimate wake...
+    expect(res.body.reopened).toEqual([{ issueIdentifier: "PEN-1126", commentId: expect.any(String) }]);
+    expect(res.body.wakes).toEqual([{ issueIdentifier: "PEN-1126", agentId }]);
+    // ...but the issue mentioned only in prose must not appear anywhere in
+    // the response: not reopened, not woken, not even "skipped" (skipped
+    // implies it was matched and then deliberately passed over -- it must
+    // never have been matched at all).
+    expect(res.body.reopened).not.toContainEqual(expect.objectContaining({ issueIdentifier: "ACM-9099" }));
+    expect(res.body.wakes).not.toContainEqual(expect.objectContaining({ issueIdentifier: "ACM-9099" }));
+    expect(res.body.skipped ?? []).not.toContainEqual(expect.objectContaining({ issueIdentifier: "ACM-9099" }));
+
+    const unrelatedComments = await db
+      .select({ id: issueComments.id })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, unrelatedIssueId));
+    expect(unrelatedComments).toEqual([]);
+
+    const unrelatedWakes = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, unrelatedAgentId));
+    expect(unrelatedWakes).toEqual([]);
+  });
+
+  it("still emits the review-feedback comment and escalates to the manager when the assignee's monitor is triggered with no scheduled re-check (BLO-19497 AC #5)", async () => {
+    const companyId = randomUUID();
+    const managerId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Test",
+      issuePrefix: "PEN",
+      defaultResponsibleUserId: "test-board-user",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: managerId,
+      companyId,
+      name: "Manager",
+      role: "engineer",
+      status: "running",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "TestAgent",
+      role: "engineer",
+      status: "idle",
+      reportsTo: managerId,
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    // Monitor left `triggered` -- no scheduled nextCheckAt, but it has fired
+    // before -- exactly the wedge BLO-19497 describes: nothing re-arms it but
+    // the assignee, and the assignee isn't awake to do so.
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Test issue",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      issueNumber: 1126,
+      identifier: "PEN-1126",
+      monitorNextCheckAt: null,
+      monitorLastTriggeredAt: new Date(),
+      monitorAttemptCount: 1,
+    });
+
+    const app = buildApp({ prReviewerBotLogin: "allyblockcast[bot]" });
+    const blockingReview = reviewSubmittedFeedbackPayload({
+      prNumber: 850,
+      reviewId: 333,
+      state: "changes_requested",
+      headSha: "sha-triggered",
+      identifier: "PEN-1126",
+    });
+    const res = await sendReviewSubmitted(app, blockingReview, "delivery-monitor-triggered");
+
+    expect(res.status).toBe(200);
+    expect(res.body.reopened).toEqual([]);
+    expect(res.body.escalated).toEqual([
+      { issueIdentifier: "PEN-1126", ownerAgentId: managerId, ownerType: "agent", cycles: 0 },
+    ]);
+
+    const comments = await db
+      .select({ body: issueComments.body, metadata: issueComments.metadata })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    const feedbackComment = comments.find(
+      (c) => (c.metadata as Record<string, unknown> | null)?.kind === "github_pr_review_feedback",
+    );
+    expect(feedbackComment?.body).toContain("Reviewed head SHA: `sha-triggered`");
+    const escalationComment = comments.find(
+      (c) => (c.metadata as Record<string, unknown> | null)?.kind === "github_pr_review_feedback_escalation",
+    );
+    expect(escalationComment).toBeTruthy();
+    expect(escalationComment?.body).toContain("Manager");
+
+    const managerWakes = await db
+      .select({ reason: agentWakeupRequests.reason })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, managerId));
+    expect(managerWakes).toEqual([{ reason: "unseen_blocking_review_feedback" }]);
+
+    // A non-blocking review (formal state "commented", but with body
+    // findings that still make it actionable) landing on the same wedged
+    // monitor must not escalate -- AC #5 is scoped to blocking severity
+    // (`changes_requested`), not every actionable review.
+    const nonBlockingReview = reviewSubmittedFeedbackPayload({
+      prNumber: 850,
+      reviewId: 334,
+      state: "commented",
+      headSha: "sha-triggered-2",
+      identifier: "PEN-1126",
+      body: "### Important Issues (1)\n\nWorth a look when convenient, not blocking.",
+    });
+    const res2 = await sendReviewSubmitted(app, nonBlockingReview, "delivery-monitor-triggered-non-blocking");
+    expect(res2.status).toBe(200);
+    expect(res2.body.escalated).toBeUndefined();
+
+    const commentsAfterNonBlocking = await db
+      .select({ metadata: issueComments.metadata })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    expect(
+      commentsAfterNonBlocking.filter(
+        (c) => (c.metadata as Record<string, unknown> | null)?.kind === "github_pr_review_feedback",
+      ),
+    ).toHaveLength(2);
+    expect(
+      commentsAfterNonBlocking.filter(
+        (c) => (c.metadata as Record<string, unknown> | null)?.kind === "github_pr_review_feedback_escalation",
+      ),
+    ).toHaveLength(1);
+  });
+
+  // Review finding (PR #1125): isIssueMonitorTriggered used to infer
+  // "triggered" from the historical columns alone (monitorLastTriggeredAt /
+  // monitorAttemptCount), which stay populated forever once a monitor has
+  // ever fired -- even after it was later explicitly cleared. A cleared
+  // monitor has a live wake path again (whatever cleared it re-armed or
+  // resolved the issue's execution), so escalating past it is a false
+  // escalation, exactly the noise AC #5's manager-wake exists to avoid
+  // manufacturing.
+  it("does not escalate when the assignee's monitor was explicitly cleared, even though historical trigger columns are still set (PR #1125 review finding)", async () => {
+    const companyId = randomUUID();
+    const managerId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Test",
+      issuePrefix: "PEN",
+      defaultResponsibleUserId: "test-board-user",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: managerId,
+      companyId,
+      name: "Manager",
+      role: "engineer",
+      status: "running",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "TestAgent",
+      role: "engineer",
+      status: "idle",
+      reportsTo: managerId,
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Test issue",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      issueNumber: 1126,
+      identifier: "PEN-1126",
+      // Historical columns still carry a prior trigger -- exactly as they
+      // would right after a monitor was cleared, since nothing zeroes them.
+      monitorNextCheckAt: null,
+      monitorLastTriggeredAt: new Date(),
+      monitorAttemptCount: 1,
+      executionState: { monitor: { status: "cleared", clearedAt: new Date().toISOString(), clearReason: "resolved" } },
+    });
+
+    const app = buildApp({ prReviewerBotLogin: "allyblockcast[bot]" });
+    const blockingReview = reviewSubmittedFeedbackPayload({
+      prNumber: 850,
+      reviewId: 335,
+      state: "changes_requested",
+      headSha: "sha-cleared",
+      identifier: "PEN-1126",
+    });
+    const res = await sendReviewSubmitted(app, blockingReview, "delivery-monitor-cleared");
+
+    expect(res.status).toBe(200);
+    expect(res.body.escalated ?? []).toEqual([]);
+
+    const commentsAfterCleared = await db
+      .select({ metadata: issueComments.metadata })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    expect(
+      commentsAfterCleared.filter(
+        (c) => (c.metadata as Record<string, unknown> | null)?.kind === "github_pr_review_feedback_escalation",
+      ),
+    ).toHaveLength(0);
+
+    const managerWakes = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, managerId));
+    expect(managerWakes).toEqual([]);
+  });
+
+  // Review finding (PR #1125): escalation used to be gated on the outer
+  // caller's reopen.commentInserted, so once the feedback comment for a
+  // review existed (including from a first, otherwise-successful delivery),
+  // no later redelivery could ever retry a failed escalation -- a transient
+  // failure between the escalation comment write and the manager wakeup
+  // permanently dropped the manager wake. This reproduces that exact window:
+  // the escalation comment exists but the manager was never woken (the
+  // simulated failure point), then a redelivery of the same review must
+  // complete the wake without double-posting the escalation comment.
+  it("retries a stalled manager escalation on redelivery without duplicating the escalation comment (PR #1125 review finding)", async () => {
+    const companyId = randomUUID();
+    const managerId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Test",
+      issuePrefix: "PEN",
+      defaultResponsibleUserId: "test-board-user",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: managerId,
+      companyId,
+      name: "Manager",
+      role: "engineer",
+      status: "running",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "TestAgent",
+      role: "engineer",
+      status: "idle",
+      reportsTo: managerId,
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Test issue",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      issueNumber: 1126,
+      identifier: "PEN-1126",
+      monitorNextCheckAt: null,
+      monitorLastTriggeredAt: new Date(),
+      monitorAttemptCount: 1,
+    });
+
+    const app = buildApp({ prReviewerBotLogin: "allyblockcast[bot]" });
+    const blockingReview = reviewSubmittedFeedbackPayload({
+      prNumber: 850,
+      reviewId: 336,
+      state: "changes_requested",
+      headSha: "sha-stalled",
+      identifier: "PEN-1126",
+    });
+    const firstRes = await sendReviewSubmitted(app, blockingReview, "delivery-escalation-stall-1");
+    expect(firstRes.status).toBe(200);
+    expect(firstRes.body.escalated).toEqual([
+      { issueIdentifier: "PEN-1126", ownerAgentId: managerId, ownerType: "agent", cycles: 0 },
+    ]);
+
+    // Simulate the failure window this finding is about: the escalation
+    // comment landed, but the manager wake did not (e.g. heartbeat.wakeup
+    // threw after the comment insert committed). Mutate the recorded wake's
+    // idempotency key rather than deleting the row -- a heartbeat run FKs to
+    // it -- so the retry's idempotency lookup finds nothing, exactly as it
+    // would if the wake had never been recorded.
+    await db
+      .update(agentWakeupRequests)
+      .set({ idempotencyKey: "consumed-by-test-simulated-failure" })
+      .where(eq(agentWakeupRequests.agentId, managerId));
+
+    // GitHub redelivers the identical review (new delivery id, same review
+    // id -- the feedback comment already exists and dedupes).
+    const secondRes = await sendReviewSubmitted(app, blockingReview, "delivery-escalation-stall-2");
+    expect(secondRes.status).toBe(200);
+    expect(secondRes.body.escalated).toEqual([
+      { issueIdentifier: "PEN-1126", ownerAgentId: managerId, ownerType: "agent", cycles: 0 },
+    ]);
+
+    const escalationOnly = (
+      await db
+        .select({ metadata: issueComments.metadata })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, issueId))
+    ).filter((r) => (r.metadata as Record<string, unknown> | null)?.kind === "github_pr_review_feedback_escalation");
+    // The comment was NOT duplicated even though escalation ran twice.
+    expect(escalationOnly).toHaveLength(1);
+
+
+    // The wake, however, was successfully redriven on retry: the original
+    // (idempotency-key-mutated) row is still there, plus a fresh one from
+    // the retry with the real idempotency key restored.
+    const managerWakes = await db
+      .select({ idempotencyKey: agentWakeupRequests.idempotencyKey })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, managerId));
+    expect(managerWakes).toHaveLength(2);
+    expect(managerWakes.some((w) => w.idempotencyKey === "consumed-by-test-simulated-failure")).toBe(true);
+    expect(
+      managerWakes.some(
+        (w) => w.idempotencyKey?.startsWith("unseen_blocking_review_escalation:") && w.idempotencyKey !== "consumed-by-test-simulated-failure",
+      ),
+    ).toBe(true);
+  });
+
+  // Ally review on PR #1125: escalateUnseenBlockingReviewFeedback's comment
+  // write was a read-then-insert (SELECT by metadata.externalKey, then
+  // INSERT if none found) -- the same check-then-write race BLO-19037 fixed
+  // for the dependabot receipt path above. Two concurrent redeliveries of the
+  // identical review can both observe "no existing escalation comment"
+  // before either commits, double-posting the escalation. Firing both
+  // requests through `Promise.all` interleaves them at the same await
+  // boundaries a second paperclip-api replica would race across.
+  it("dedupes concurrent redeliveries of the same blocking review to a single escalation comment", async () => {
+    const companyId = randomUUID();
+    const managerId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Test",
+      issuePrefix: "PEN",
+      defaultResponsibleUserId: "test-board-user",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: managerId,
+      companyId,
+      name: "Manager",
+      role: "engineer",
+      status: "running",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "TestAgent",
+      role: "engineer",
+      status: "idle",
+      reportsTo: managerId,
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Test issue",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      issueNumber: 1127,
+      identifier: "PEN-1127",
+      monitorNextCheckAt: null,
+      monitorLastTriggeredAt: new Date(),
+      monitorAttemptCount: 1,
+    });
+
+    const app = buildApp({ prReviewerBotLogin: "allyblockcast[bot]" });
+    const blockingReview = reviewSubmittedFeedbackPayload({
+      prNumber: 851,
+      reviewId: 337,
+      state: "changes_requested",
+      headSha: "sha-race",
+      identifier: "PEN-1127",
+    });
+
+    // Warm the connection pool to >=2 physical connections before racing --
+    // see the dependabot concurrency test above for why this is necessary.
+    await Promise.all(Array.from({ length: 4 }, () => db.execute(sql`select 1`)));
+
+    const [first, second] = await Promise.all([
+      sendReviewSubmitted(app, blockingReview, "delivery-escalation-race"),
+      sendReviewSubmitted(app, blockingReview, "delivery-escalation-race"),
+    ]);
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+
+    const escalationComments = await db
+      .select()
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.issueId, issueId),
+          sql`${issueComments.metadata}->>'kind' = 'github_pr_review_feedback_escalation'`,
+        ),
+      );
+    expect(escalationComments).toHaveLength(1);
+  });
+
   function dependabotPayload(severity: string, action = "created", alertNumber = 58) {
     return {
       action,
@@ -6294,6 +7062,9 @@ describe("PR review feedback comment heading (BLO-19067)", () => {
     expect(comment).toContain("## Changes Requested");
     expect(comment).toContain("requires another implementation pass");
     expect(comment).not.toContain("Review Approved");
+    // BLO-19497 AC: the reviewed head SHA is recorded so a reader can tell a
+    // stale review from a current one.
+    expect(comment).toContain("Reviewed head SHA: `1db166824d532cda20e321ebb26c6e4702e0dd32`");
   });
 
   it("distinguishes a COMMENTED review from both other states", () => {
