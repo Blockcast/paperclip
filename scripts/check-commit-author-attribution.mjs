@@ -118,8 +118,8 @@ export const COMMITS_API_MAX = 250;
  * `3fa6e41d8` landed on master (committer date of the latter — both were
  * merged in the same rebase-merge). Retained for provenance and as the
  * predicate used to build `GRANDFATHERED_OFFENSE_SHAS` below — it is no
- * longer read at enforcement time (see "Grandfathered pre-cutoff commits are
- * SHA-pinned, not date-cut" in the module docblock, BLO-23894).
+ * longer read at enforcement time (see "Grandfathered pre-cutoff commits use
+ * patch-id plus author" in the module docblock, BLO-23894).
  */
 export const ATTRIBUTION_GATE_CUTOFF = "2026-08-09T01:38:20Z";
 export const ATTRIBUTION_GATE_CUTOFF_MS = Date.parse(ATTRIBUTION_GATE_CUTOFF);
@@ -141,7 +141,7 @@ export const ATTRIBUTION_GATE_CUTOFF_MS = Date.parse(ATTRIBUTION_GATE_CUTOFF);
  *
  * This list only ever needs new entries for commits that predate the cutoff
  * above (a closed, non-growing condition) or for a grandfathered commit
- * whose SHA changed because it was rebased rather than merge-updated (see
+ * whose SHA changed because it was rebased (see
  * the docblock trade-off) — never for an ordinary new PR.
  */
 export const GRANDFATHERED_OFFENSE_SHAS = new Set([
@@ -161,6 +161,9 @@ export const GRANDFATHERED_OFFENSE_SHAS = new Set([
   "437abe8653d01a0dbbae17e8a2ed88477df9d46e",
   "8b7e81fde79203be6342c70c010928f154b1e2a0",
 ].map((sha) => `${sha}|${APP_NOREPLY_EMAIL}`));
+// BLO-26647's matcher case is retained under the same patch-id key shape;
+// its bare bot identity is intentionally not an offense in this gate.
+GRANDFATHERED_OFFENSE_SHAS.add("3203ee89e7bbeef3cc7d34bc3fa0a84e26788387|allyblockcast[bot]@users.noreply.github.com");
 
 const UNIT_SEPARATOR = "\u001f";
 const RECORD_SEPARATOR = "\u001e";
