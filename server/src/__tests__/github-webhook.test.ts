@@ -48,6 +48,7 @@ import {
   __test_verifyGithubSignature,
   __resetWorkflowRunSupersessionTrackingForTest,
   githubWebhookRoutes,
+  reconcileContendedPrReviewerWakes,
   type GithubWebhookConfig,
 } from "../routes/github-webhook.js";
 import {
@@ -2741,7 +2742,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(runs).toHaveLength(1);
   });
 
-  it("returns a retryable error instead of bypassing an issue-create PR lock", async () => {
+  it("records a durable retry instead of bypassing an issue-create PR lock", async () => {
     const { companyId, agentId: reviewerId } = await seedCompanyAndAgent({ agentName: "Ally" });
     const app = buildApp({ prReviewerAgentIds: [reviewerId] });
     const taskKey = "pr_review:blockcast/paperclip:20526";
@@ -2793,10 +2794,22 @@ describeEmbeddedPostgres("github-webhook route", () => {
         .set("content-type", "application/json")
         .send(body);
 
-      expect(contended.status).toBe(503);
-      expect(contended.body).toMatchObject({
-        code: "pr_reviewer_dispatch_contended",
-      });
+      // The invariant this test exists for: the webhook must never dispatch
+      // outside the lock while issue-create holds the PR scope. That is
+      // asserted by the zero-runs check below and is unchanged.
+      //
+      // What changed (BLO-21995): losing the scope no longer costs the wake, so
+      // the response is no longer a 503 asking GitHub to redeliver. It is a 200
+      // plus a durable retry record the reconciler owns. Answering 503 here now
+      // would be worse than useless — GitHub does not auto-redeliver, and a
+      // manual redelivery would race our own replay.
+      expect(contended.status).toBe(200);
+      expect(contended.body.reviewerWakeFired).toBe(false);
+      expect(await db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.status, "pr_reviewer_dispatch_contended")))
+        .toHaveLength(1);
       expect(await db
         .select({ contextTaskKey: heartbeatRuns.contextTaskKey })
         .from(heartbeatRuns)
@@ -2872,6 +2885,324 @@ describeEmbeddedPostgres("github-webhook route", () => {
     // permanent received/queued gap on a healthy fleet.
     expect(await deliveryCount("received")).toBe(1);
     expect(await deliveryCount("queued")).toBe(1);
+  });
+
+  // BLO-21995: a sanctioned review request that loses the PR-scope advisory
+  // lock used to be dropped silently — the route answered 200 with
+  // reviewerWakeFired:false and wrote nothing, and GitHub only redelivers what
+  // it recorded as failed. These pin the durable-retry path that replaces it.
+  describe("contended PR-reviewer wake durable retry (BLO-21995)", () => {
+    const REPO = "Blockcast/paperclip";
+
+    function reviewerConfig(reviewerId: string): GithubWebhookConfig {
+      return {
+        webhookSecret,
+        prReviewerAgentIds: [reviewerId],
+        heartbeatOptions: {
+          penstockAvailabilityGate: allowPenstockGate,
+          skipQueuedRunDispatch: true,
+        },
+      };
+    }
+
+    async function runsForTask(taskKey: string) {
+      return await db
+        .select({ id: heartbeatRuns.id, agentId: heartbeatRuns.agentId })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.contextTaskKey, taskKey));
+    }
+
+    function openedPayload(prNumber: number) {
+      return {
+        action: "opened",
+        pull_request: {
+          number: prNumber,
+          title: "Durable retry for contended reviewer wakes",
+          body: null,
+          head: { ref: "cto/blo-21995-durable-pr-review-retry" },
+        },
+        repository: { full_name: REPO },
+      };
+    }
+
+    it("persists a durable record when the PR scope is contended, then dispatches exactly one wake", async () => {
+      __resetMetricsForTest();
+      const { agentId: reviewerId } = await seedCompanyAndAgent({ agentName: "Ally" });
+      const app = buildApp({ prReviewerAgentIds: [reviewerId] });
+      const prNumber = 21995;
+      const taskKey = `pr_review:${REPO}:${prNumber}`;
+
+      // Hold the PR scope in a competing transaction for longer than
+      // PR_REVIEWER_TASK_LOCK_TIMEOUT_MS (2s) so the delivery provably loses
+      // the race rather than merely racing it.
+      let releaseScope: (() => void) | null = null;
+      const scopeReleased = new Promise<void>((resolve) => {
+        releaseScope = resolve;
+      });
+      const scopeHolder = db.transaction(async (tx) => {
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${taskKey}, 0))`);
+        await scopeReleased;
+      });
+      // Let the holder actually acquire before the delivery arrives.
+      await new Promise((resolve) => setTimeout(resolve, 250));
+
+      const { body, signature } = signedRequest(openedPayload(prNumber));
+      const res = await request(app)
+        .post("/api/webhooks/github")
+        .set("x-github-event", "pull_request")
+        .set("x-hub-signature-256", signature)
+        .set("x-github-delivery", "delivery-blo-21995-contended")
+        .set("content-type", "application/json")
+        .send(body);
+
+      expect(res.status).toBe(200);
+      // Not fired *yet* — the response must never claim a run that only the
+      // reconciler will enqueue.
+      expect(res.body.reviewerWakeFired).toBe(false);
+      // Nothing reached heartbeat while the scope was held.
+      expect(await runsForTask(taskKey)).toHaveLength(0);
+
+      // ...but the delivery is durably recorded rather than lost.
+      const contended = await db
+        .select({ id: agentWakeupRequests.id, payload: agentWakeupRequests.payload })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.status, "pr_reviewer_dispatch_contended"));
+      expect(contended).toHaveLength(1);
+      expect(await deliveryCount("received")).toBe(1);
+      expect(await deliveryCount("deferred")).toBe(1);
+      expect(await deliveryCount("queued")).toBe(0);
+
+      releaseScope!();
+      await scopeHolder;
+
+      // Drive the worker with a clock past the first backoff so the record is due.
+      const reconciled = await reconcileContendedPrReviewerWakes(
+        db,
+        reviewerConfig(reviewerId),
+        new Date(Date.now() + 10_000),
+      );
+      expect(reconciled.recovered).toBe(1);
+      expect(reconciled.exhausted).toBe(0);
+
+      const runs = await runsForTask(taskKey);
+      expect(runs).toHaveLength(1);
+      expect(runs[0]!.agentId).toBe(reviewerId);
+
+      // Funnel arithmetic stays balanced across the deferral: each *attempt* is
+      // one intent-to-wake that ends in exactly one terminal arm, so the
+      // contended attempt lands on `deferred` and the replay on `queued` —
+      // received(2) == queued(1) + deferred(1). Nothing is dead-lettered.
+      expect(await deliveryCount("received")).toBe(2);
+      expect(await deliveryCount("deferred")).toBe(1);
+      expect(await deliveryCount("queued")).toBe(1);
+      expect(await deliveryCount("retried")).toBe(1);
+      expect(await deliveryCount("dead_lettered")).toBe(0);
+    }, 30_000);
+
+    it("keeps a redelivered contended event to exactly one wake", async () => {
+      __resetMetricsForTest();
+      const { agentId: reviewerId } = await seedCompanyAndAgent({ agentName: "Ally" });
+      const app = buildApp({ prReviewerAgentIds: [reviewerId] });
+      const prNumber = 21996;
+      const taskKey = `pr_review:${REPO}:${prNumber}`;
+
+      let releaseScope: (() => void) | null = null;
+      const scopeReleased = new Promise<void>((resolve) => {
+        releaseScope = resolve;
+      });
+      const scopeHolder = db.transaction(async (tx) => {
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${taskKey}, 0))`);
+        await scopeReleased;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 250));
+
+      const { body, signature } = signedRequest(openedPayload(prNumber));
+      const send = () =>
+        request(app)
+          .post("/api/webhooks/github")
+          .set("x-github-event", "pull_request")
+          .set("x-hub-signature-256", signature)
+          .set("x-github-delivery", "delivery-blo-21995-redelivered")
+          .set("content-type", "application/json")
+          .send(body);
+
+      // GitHub redelivers the same delivery id while the scope is still held.
+      // Concurrently, not sequentially: a sequential pair is satisfied by a
+      // plain select-then-insert and would not catch the race where both
+      // arrivals observe no row and both write one.
+      await Promise.all([send(), send()]);
+
+      // One retry record per delivery id, not one per arrival.
+      const contended = await db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.status, "pr_reviewer_dispatch_contended"));
+      expect(contended).toHaveLength(1);
+
+      releaseScope!();
+      await scopeHolder;
+
+      // Two reconciler passes must not double-wake either.
+      await reconcileContendedPrReviewerWakes(db, reviewerConfig(reviewerId), new Date(Date.now() + 10_000));
+      await reconcileContendedPrReviewerWakes(db, reviewerConfig(reviewerId), new Date(Date.now() + 20_000));
+
+      expect(await runsForTask(taskKey)).toHaveLength(1);
+      expect(await deliveryCount("queued")).toBe(1);
+    }, 40_000);
+
+    it("records a contended wake even when the reviewer is paused at persistence time", async () => {
+      __resetMetricsForTest();
+      const { agentId: reviewerId } = await seedCompanyAndAgent({ agentName: "Ally" });
+      const app = buildApp({ prReviewerAgentIds: [reviewerId] });
+      const prNumber = 21997;
+      const taskKey = `pr_review:${REPO}:${prNumber}`;
+
+      // The reviewer is configured but not invokable right now — a config push,
+      // a restart, a transient pause. This must NOT make the contended delivery
+      // unrecordable: availability is transient and the durable record exists
+      // precisely to outlive it.
+      await db.update(agents).set({ status: "paused" }).where(eq(agents.id, reviewerId));
+
+      let releaseScope: (() => void) | null = null;
+      const scopeReleased = new Promise<void>((resolve) => {
+        releaseScope = resolve;
+      });
+      const scopeHolder = db.transaction(async (tx) => {
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${taskKey}, 0))`);
+        await scopeReleased;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 250));
+
+      const { body, signature } = signedRequest(openedPayload(prNumber));
+      const res = await request(app)
+        .post("/api/webhooks/github")
+        .set("x-github-event", "pull_request")
+        .set("x-hub-signature-256", signature)
+        .set("x-github-delivery", "delivery-blo-21995-paused-at-persist")
+        .set("content-type", "application/json")
+        .send(body);
+
+      // 200, not 503: the delivery is durable, so GitHub must not also hold it
+      // for manual redelivery.
+      expect(res.status).toBe(200);
+      expect(res.body.reviewerWakeFired).toBe(false);
+      const contended = await db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.status, "pr_reviewer_dispatch_contended"));
+      expect(contended).toHaveLength(1);
+
+      releaseScope!();
+      await scopeHolder;
+
+      // The reviewer comes back, and the recorded wake is still dispatchable.
+      await db.update(agents).set({ status: "idle" }).where(eq(agents.id, reviewerId));
+      const reconciled = await reconcileContendedPrReviewerWakes(
+        db,
+        reviewerConfig(reviewerId),
+        new Date(Date.now() + 10_000),
+      );
+      expect(reconciled.recovered).toBe(1);
+
+      const runs = await runsForTask(taskKey);
+      expect(runs).toHaveLength(1);
+      expect(runs[0]!.agentId).toBe(reviewerId);
+      expect(await deliveryCount("dead_lettered")).toBe(0);
+    }, 40_000);
+
+    it("re-arms rather than retiring when the reviewer is paused at reconcile time", async () => {
+      __resetMetricsForTest();
+      const { agentId: reviewerId } = await seedCompanyAndAgent({ agentName: "Ally" });
+      const app = buildApp({ prReviewerAgentIds: [reviewerId] });
+      const prNumber = 21998;
+      const taskKey = `pr_review:${REPO}:${prNumber}`;
+
+      let releaseScope: (() => void) | null = null;
+      const scopeReleased = new Promise<void>((resolve) => {
+        releaseScope = resolve;
+      });
+      const scopeHolder = db.transaction(async (tx) => {
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${taskKey}, 0))`);
+        await scopeReleased;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 250));
+
+      const { body, signature } = signedRequest(openedPayload(prNumber));
+      await request(app)
+        .post("/api/webhooks/github")
+        .set("x-github-event", "pull_request")
+        .set("x-hub-signature-256", signature)
+        .set("x-github-delivery", "delivery-blo-21995-paused-at-reconcile")
+        .set("content-type", "application/json")
+        .send(body);
+
+      releaseScope!();
+      await scopeHolder;
+
+      // The reviewer goes down between persistence and the first retry.
+      await db.update(agents).set({ status: "paused" }).where(eq(agents.id, reviewerId));
+      const firstPass = await reconcileContendedPrReviewerWakes(
+        db,
+        reviewerConfig(reviewerId),
+        new Date(Date.now() + 10_000),
+      );
+      // The critical assertion: a transiently unavailable reviewer must not
+      // retire the record. Retiring here would drop a sanctioned review request
+      // because the reviewer happened to be down for the seconds this pass ran.
+      expect(firstPass.recovered).toBe(0);
+      expect(firstPass.superseded).toBe(0);
+      expect(firstPass.exhausted).toBe(0);
+      expect(firstPass.stillContended).toBe(1);
+      expect(await runsForTask(taskKey)).toHaveLength(0);
+      const stillArmed = await db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.status, "pr_reviewer_dispatch_contended"));
+      expect(stillArmed).toHaveLength(1);
+
+      // It comes back, and the next due pass dispatches exactly one wake.
+      await db.update(agents).set({ status: "idle" }).where(eq(agents.id, reviewerId));
+      const secondPass = await reconcileContendedPrReviewerWakes(
+        db,
+        reviewerConfig(reviewerId),
+        new Date(Date.now() + 60_000),
+      );
+      expect(secondPass.recovered).toBe(1);
+
+      const runs = await runsForTask(taskKey);
+      expect(runs).toHaveLength(1);
+      expect(runs[0]!.agentId).toBe(reviewerId);
+      expect(await deliveryCount("dead_lettered")).toBe(0);
+    }, 40_000);
+
+    it("completes rather than deadlocking when concurrent distinct-PR deliveries saturate the pool", async () => {
+      const { agentId: reviewerId } = await seedCompanyAndAgent({ agentName: "Ally" });
+      const app = buildApp({ prReviewerAgentIds: [reviewerId] });
+
+      // createDb's pool defaults to 10 connections. Each lock winner holds one
+      // for its lock-owning transaction while heartbeat's enqueue checks out a
+      // second, so >pool/2 concurrent winners on *distinct* scopes (which never
+      // block each other on the advisory lock) is the saturation shape.
+      const deliveries = Array.from({ length: 12 }, (_, index) => {
+        const prNumber = 21_100 + index;
+        const { body, signature } = signedRequest(openedPayload(prNumber));
+        return request(app)
+          .post("/api/webhooks/github")
+          .set("x-github-event", "pull_request")
+          .set("x-hub-signature-256", signature)
+          .set("x-github-delivery", `delivery-blo-21995-pool-${prNumber}`)
+          .set("content-type", "application/json")
+          .send(body);
+      });
+
+      const responses = await Promise.all(deliveries);
+      for (const res of responses) {
+        expect(res.status).toBe(200);
+      }
+      // Every distinct scope is uncontended, so each delivery must produce its
+      // own wake — none may be lost to pool starvation.
+      expect(responses.filter((res) => res.body.reviewerWakeFired === true)).toHaveLength(12);
+    }, 60_000);
   });
 
   it("counts a scheduling-gate-declined wake as suppressed, not queued, and does not claim reviewerWakeFired (BLO-18859)", async () => {
