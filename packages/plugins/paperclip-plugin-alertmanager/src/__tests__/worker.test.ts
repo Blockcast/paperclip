@@ -1158,12 +1158,27 @@ describe("handleWebhook — severity → priority", () => {
     const { ctx, mocks } = mkCtx();
     const config = baseConfig();
     const alert = baseAlert({
-      labels: { alertname: "X", severity: "page" },
+      labels: { alertname: "X", severity: "nonsense" },
     });
     const envelope = baseEnvelope({ alerts: [alert] });
     await handleWebhook(ctx, config, TOKEN, baseInput({ parsedBody: envelope }));
     const createArgs = mocks.issues.create.mock.calls[0][0];
     expect(createArgs.priority).toBe("medium");
+  });
+
+  // BLO-27018: `page` is a real emitted severity, not an unknown one. It used
+  // to be this suite's example of an unknown value, which pinned the defect
+  // end-to-end: a page alert was created at `medium`.
+  it("files severity=page at critical priority", async () => {
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig();
+    const alert = baseAlert({
+      labels: { alertname: "LLMProxyHighErrorRate", severity: "page", team: "devops" },
+    });
+    const envelope = baseEnvelope({ alerts: [alert] });
+    await handleWebhook(ctx, config, TOKEN, baseInput({ parsedBody: envelope }));
+    const createArgs = mocks.issues.create.mock.calls[0][0];
+    expect(createArgs.priority).toBe("critical");
   });
 });
 

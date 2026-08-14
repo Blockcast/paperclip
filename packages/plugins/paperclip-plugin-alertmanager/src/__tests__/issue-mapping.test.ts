@@ -35,10 +35,16 @@ describe("severityToPriority", () => {
     expect(severityToPriority("critical")).toBe("critical");
     expect(severityToPriority("warning")).toBe("high");
     expect(severityToPriority("info")).toBe("medium");
+    // BLO-27018: `page` and `ticket` are part of the emitted vocabulary, not
+    // unknown values. `page` previously appeared in the "unknown severities"
+    // case below, which pinned the defect: the fleet's highest-urgency alert
+    // was mapped to `medium`.
+    expect(severityToPriority("page")).toBe("critical");
+    expect(severityToPriority("ticket")).toBe("low");
   });
 
   it("falls back to medium for unknown severities", () => {
-    expect(severityToPriority("page")).toBe("medium");
+    expect(severityToPriority("nonsense")).toBe("medium");
     expect(severityToPriority(undefined)).toBe("medium");
     expect(severityToPriority("")).toBe("medium");
   });
